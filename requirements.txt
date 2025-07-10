@@ -2,3 +2,5 @@ openai
 pyyaml
 rich
 simplejson
+numpy
+jupyter

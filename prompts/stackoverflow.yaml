@@ -1,4 +1,4 @@
-schema: >-
+schema: |-
   Do not explain the query, only output one SQL query. Use the following StackOverflow database schema:
   create table PostHistoryTypes (Id smallint not null primary key, Name varchar(50) not null);
   create table LinkTypes (Id smallint not null primary key, Name varchar(50) not null);

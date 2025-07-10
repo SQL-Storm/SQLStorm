@@ -4,7 +4,8 @@ import csv
 import json
 import re
 
-from distinct import analyze, Result
+from distinct import Result
+import distinct
 from log import log
 
 complexity_classes = ["low", "medium", "high"]
@@ -149,59 +150,25 @@ def complexity(r: Result):
     return complexity_classes[comp]
 
 
-def main():
-    log.header("Compute features queries")
+def analyze(result_file):
+    log.info(f"Analyzing result file: {result_file}")
 
-    # Get command line arguments
-    argparser = argparse.ArgumentParser()
-    argparser.add_argument("result", help="Result file")
-    argparser.add_argument("output", help="Output file")
-    args = argparser.parse_args()
-
-    queries = analyze(args.result)
-
-    dest_csv = args.output
+    queries = distinct.analyze(result_file)
 
     complexity_counts = {c: 0 for c in complexity_classes}
-
-    with log.progress("Processing queries", len(queries)) as progress:
-        csvfile = open(dest_csv, 'w', newline='', encoding='utf-8')
-        output_columns = ["query", "state", "message", "time", "rows", "allocatedBytes", "scannedRows", "querylength", "ops", "scans", "joins", "aggregations", "sorts", "windows", "iterations", "distinct_trees", "distinct_operators"]
-        writer = csv.DictWriter(csvfile, fieldnames=output_columns + ["complexity"])
-        writer.writeheader()
-
-        csvfile_operators = open(dest_csv.replace(".csv", f"_operators.csv"), 'w', newline='', encoding='utf-8')
-        csvfile_expressions = open(dest_csv.replace(".csv", f"_expressions.csv"), 'w', newline='', encoding='utf-8')
-
-        writer_operators = csv.DictWriter(csvfile_operators, fieldnames=["query", "operator", "attributes"])
-        writer_operators.writeheader()
-
-        writer_expressions = csv.DictWriter(csvfile_expressions, fieldnames=["query", "expression", "category", "type", "attributes"])
-        writer_expressions.writeheader()
-
+    with log.progress("Computing complexity queries", len(queries)) as progress:
         for q in queries:
             progress.description(q)
-            comp = complexity(queries[q])
+
+            r = queries[q]
+            comp = complexity(r)
             complexity_counts[comp] += 1
 
-            attr = queries[q].attributes
-            attr["complexity"] = comp
-            attr["distinct_trees"] = queries[q].distinct_trees
-            attr["distinct_operators"] = queries[q].distinct_operators
-            writer.writerow(attr)
-
-            for op in queries[q].tree.values():
-                writer_operators.writerow({"query": q, "operator": op.label, "attributes": json.dumps(op.attributes)})
-
-                for exp in op.expression_list:
-                    category = get_expression_category(exp.label)
-                    writer_expressions.writerow({"query": q, "expression": exp.label, "category": category, "type": exp.type, "attributes": json.dumps(exp.attributes)})
+            r.attributes["complexity"] = comp
+            r.attributes["distinct_trees"] = queries[q].distinct_trees
+            r.attributes["distinct_operators"] = queries[q].distinct_operators
 
             progress.advance()
-
-        csvfile.close()
-        csvfile_operators.close()
-        csvfile_expressions.close()
 
     print_counter(operator_counts, complexity_operators, "Operator")
     print_counter(join_type_counts, complexity_join_type, "Join type")
@@ -212,7 +179,57 @@ def main():
         log.info(f"Complexity {c}: {complexity_counts[c]} queries")
     log.newline()
 
-    log.info(f"Writing results to {dest_csv}")
+    return queries
+
+
+def compute(result_file, output_file):
+    queries = analyze(result_file)
+
+    log.info(f"Writing results to {output_file} ...")
+    csvfile = open(output_file, 'w', newline='', encoding='utf-8')
+    csvfile_operators = open(output_file.replace(".csv", f"_operators.csv"), 'w', newline='', encoding='utf-8')
+    csvfile_expressions = open(output_file.replace(".csv", f"_expressions.csv"), 'w', newline='', encoding='utf-8')
+
+    writer = csv.DictWriter(csvfile, fieldnames=["query", "state", "message", "time", "rows", "allocatedBytes", "scannedRows", "querylength", "ops",
+                            "scans", "joins", "aggregations", "sorts", "windows", "iterations", "distinct_trees", "distinct_operators", "complexity"])
+    writer.writeheader()
+
+    writer_operators = csv.DictWriter(csvfile_operators, fieldnames=["query", "operator", "attributes"])
+    writer_operators.writeheader()
+
+    writer_expressions = csv.DictWriter(csvfile_expressions, fieldnames=["query", "expression", "category", "type", "attributes"])
+    writer_expressions.writeheader()
+
+    iteration_count = 0
+    with log.progress("Writing query features", len(queries)) as progress:
+        for q in queries:
+            progress.description(q)
+            writer.writerow(queries[q].attributes)
+
+            for op in queries[q].tree.values():
+                writer_operators.writerow({"query": q, "operator": op.label, "attributes": json.dumps(op.attributes)})
+
+                for exp in op.expression_list:
+                    category = get_expression_category(exp.label)
+                    writer_expressions.writerow({"query": q, "expression": exp.label, "category": category, "type": exp.type, "attributes": json.dumps(exp.attributes)})
+
+            progress.advance()
+
+    csvfile.close()
+    csvfile_operators.close()
+    csvfile_expressions.close()
+
+
+def main():
+    log.header("Compute query features")
+
+    # Get command line arguments
+    argparser = argparse.ArgumentParser()
+    argparser.add_argument("result", help="Result file")
+    argparser.add_argument("output", help="Output file")
+    args = argparser.parse_args()
+
+    compute(args.result, args.output)
 
 
 if __name__ == "__main__":

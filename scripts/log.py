@@ -15,14 +15,15 @@ class Log:
     """
 
     def __init__(self):
-        self.console = Console()
         self.highlighter = ReprHighlighter()
 
         self.verbose = os.environ.get('VERBOSE', 'false').lower() in ['true', '1']
-        self.file = os.environ.get('LOG_FILE', None)
+        self._file = os.environ.get('LOG_FILE', None)
 
-        if self.file:
-            self.file_console = Console(file=open(self.file, "w"), no_color=False, color_system="standard")
+        if self._file:
+            self.console = Console(file=open(self._file, "w"), no_color=True, color_system="standard", force_jupyter=False, force_interactive=False, log_path=False, width=120)
+        else:
+            self.console = Console(force_jupyter=False, log_path=False)
 
     def print(self, *info: Any):
         """
@@ -32,8 +33,6 @@ class Log:
             info (Any): The information to print.
         """
         self.console.print(*info)
-        if self.file:
-            self.file_console.print(*info)
 
     def log_group(self, info: Any, group: str, group_color: str):
         """
@@ -52,8 +51,6 @@ class Log:
         table.add_row(f'[bold {group_color}]{group.upper()}[/]', text)
 
         self.console.log(table, _stack_offset=3)
-        if self.file:
-            self.file_console.log(table, _stack_offset=3)
 
     def error(self, info: Any):
         """
@@ -115,8 +112,6 @@ class Log:
             text (str): The header text to log.
         """
         self.console.rule(f'[bold]{text}[/]')
-        if self.file:
-            self.file_console.rule(f'[bold]{text}[/]')
 
     def header2(self, text: str):
         """
@@ -134,8 +129,6 @@ class Log:
         Logs a newline.
         """
         self.console.print('')
-        if self.file:
-            self.file_console.print('')
 
     class LogProgress:
         """
@@ -258,6 +251,54 @@ class Log:
             LogProgress: The LogProgress instance.
         """
         return self.LogProgress(self, info, total, base)
+
+    class LogFile:
+        """
+        A class to manage logging to a file.
+        """
+
+        def __init__(self, log: "Log", file: str):
+            """
+            Initializes the LogFile instance.
+
+            Args:
+                log (Log): The Log instance to use for logging.
+                file (str): The file path to log to.
+            """
+            self._log = log
+            self._file = file
+            self._old_console = None
+            self._log_file = None
+
+        def __enter__(self):
+            """
+            Opens the log file for writing.
+            """
+            self._old_console = self._log.console
+            self._log_file = open(self._file, "w")
+            self._log.console = Console(file=self._log_file, no_color=True, color_system="standard", force_jupyter=False, force_interactive=False, log_path=False, width=120)
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            """
+            Closes the log file.
+            """
+            if self._old_console:
+                self._log.console = self._old_console
+            if self._log_file:
+                self._log_file.close()
+
+    def file(self, file: str) -> LogFile:
+        """
+        Creates a LogFile context manager for logging to a file.
+
+        Args:
+            file (str): The file path to log to.
+
+        Returns:
+            LogFile: The LogFile instance.
+        """
+        return self.LogFile(self, file)
 
 
 log = Log()

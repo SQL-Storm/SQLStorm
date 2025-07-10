@@ -1,0 +1,173 @@
+[2m[11:37:16][0m[2m [0m [1mINFO[0m        Analyzing result file: ../results/v1.0/features_raw/tpchSf1_sqlstorm_v1.0.csv                   
+[2m          [0m[2m [0m [1mINFO[0m        Loading the data...                                                                             
+[?25l
+[?25h
+[2m[11:37:49][0m[2m [0m [1mINFO[0m        Loaded [1m17036[0m queries with [1m150[0m errors.                                                           
+
+[2m          [0m[2m [0m [1mINFO[0m            [1m1[0m of     [1m1[0m ArrayUnnest operators are distinct [1m([0m[1m100.00[0m%[1m)[0m.                                    
+[2m          [0m[2m [0m [1mINFO[0m         [1m8528[0m of [1m31722[0m GroupBy operators are distinct [1m([0m[1m26.88[0m%[1m)[0m.                                         
+[2m          [0m[2m [0m [1mINFO[0m         [1m1502[0m of [1m10260[0m GroupJoin operators are distinct [1m([0m[1m14.64[0m%[1m)[0m.                                       
+[2m          [0m[2m [0m [1mINFO[0m           [1m26[0m of   [1m448[0m InlineTable operators are distinct [1m([0m[1m5.80[0m%[1m)[0m.                                      
+[2m          [0m[2m [0m [1mINFO[0m          [1m236[0m of   [1m558[0m Iteration operators are distinct [1m([0m[1m42.29[0m%[1m)[0m.                                       
+[2m          [0m[2m [0m [1mINFO[0m           [1m58[0m of   [1m558[0m IterationScan operators are distinct [1m([0m[1m10.39[0m%[1m)[0m.                                   
+[2m          [0m[2m [0m [1mINFO[0m         [1m6033[0m of [1m81895[0m Join operators are distinct [1m([0m[1m7.37[0m%[1m)[0m.                                             
+[2m          [0m[2m [0m [1mINFO[0m          [1m663[0m of  [1m4657[0m Map operators are distinct [1m([0m[1m14.24[0m%[1m)[0m.                                             
+[2m          [0m[2m [0m [1mINFO[0m          [1m459[0m of  [1m7592[0m PipelineBreakerScan operators are distinct [1m([0m[1m6.05[0m%[1m)[0m.                              
+[2m          [0m[2m [0m [1mINFO[0m            [1m1[0m of     [1m1[0m RegexSplit operators are distinct [1m([0m[1m100.00[0m%[1m)[0m.                                     
+[2m          [0m[2m [0m [1mINFO[0m          [1m929[0m of [1m15134[0m Select operators are distinct [1m([0m[1m6.14[0m%[1m)[0m.                                           
+[2m          [0m[2m [0m [1mINFO[0m           [1m76[0m of   [1m121[0m SetOperation operators are distinct [1m([0m[1m62.81[0m%[1m)[0m.                                    
+[2m          [0m[2m [0m [1mINFO[0m         [1m8789[0m of [1m18256[0m Sort operators are distinct [1m([0m[1m48.14[0m%[1m)[0m.                                            
+[2m          [0m[2m [0m [1mINFO[0m         [1m2151[0m of [1m104727[0m TableScan operators are distinct [1m([0m[1m2.05[0m%[1m)[0m.                                       
+[2m          [0m[2m [0m [1mINFO[0m          [1m316[0m of  [1m2924[0m Temp operators are distinct [1m([0m[1m10.81[0m%[1m)[0m.                                            
+[2m          [0m[2m [0m [1mINFO[0m          [1m454[0m of  [1m6916[0m Window operators are distinct [1m([0m[1m6.56[0m%[1m)[0m.                                           
+
+[2m          [0m[2m [0m [1mINFO[0m            [1m1[0m of    [1m13[0m trees with   [1m2[0m operators are distinct [1m([0m[1m7.69[0m%[1m)[0m.                                   
+[2m          [0m[2m [0m [1mINFO[0m            [1m4[0m of    [1m59[0m trees with   [1m3[0m operators are distinct [1m([0m[1m6.78[0m%[1m)[0m.                                   
+[2m          [0m[2m [0m [1mINFO[0m            [1m4[0m of   [1m576[0m trees with   [1m4[0m operators are distinct [1m([0m[1m0.69[0m%[1m)[0m.                                   
+[2m          [0m[2m [0m [1mINFO[0m            [1m7[0m of   [1m293[0m trees with   [1m5[0m operators are distinct [1m([0m[1m2.39[0m%[1m)[0m.                                   
+[2m          [0m[2m [0m [1mINFO[0m           [1m15[0m of   [1m618[0m trees with   [1m6[0m operators are distinct [1m([0m[1m2.43[0m%[1m)[0m.                                   
+[2m          [0m[2m [0m [1mINFO[0m           [1m16[0m of   [1m308[0m trees with   [1m7[0m operators are distinct [1m([0m[1m5.19[0m%[1m)[0m.                                   
+[2m          [0m[2m [0m [1mINFO[0m           [1m26[0m of   [1m676[0m trees with   [1m8[0m operators are distinct [1m([0m[1m3.85[0m%[1m)[0m.                                   
+[2m          [0m[2m [0m [1mINFO[0m           [1m60[0m of   [1m225[0m trees with   [1m9[0m operators are distinct [1m([0m[1m26.67[0m%[1m)[0m.                                  
+[2m          [0m[2m [0m [1mINFO[0m           [1m78[0m of   [1m688[0m trees with  [1m10[0m operators are distinct [1m([0m[1m11.34[0m%[1m)[0m.                                  
+[2m          [0m[2m [0m [1mINFO[0m          [1m125[0m of   [1m349[0m trees with  [1m11[0m operators are distinct [1m([0m[1m35.82[0m%[1m)[0m.                                  
+[2m          [0m[2m [0m [1mINFO[0m          [1m189[0m of  [1m1061[0m trees with  [1m12[0m operators are distinct [1m([0m[1m17.81[0m%[1m)[0m.                                  
+[2m          [0m[2m [0m [1mINFO[0m          [1m294[0m of   [1m601[0m trees with  [1m13[0m operators are distinct [1m([0m[1m48.92[0m%[1m)[0m.                                  
+[2m          [0m[2m [0m [1mINFO[0m          [1m385[0m of  [1m1789[0m trees with  [1m14[0m operators are distinct [1m([0m[1m21.52[0m%[1m)[0m.                                  
+[2m          [0m[2m [0m [1mINFO[0m          [1m497[0m of   [1m790[0m trees with  [1m15[0m operators are distinct [1m([0m[1m62.91[0m%[1m)[0m.                                  
+[2m          [0m[2m [0m [1mINFO[0m          [1m537[0m of  [1m1033[0m trees with  [1m16[0m operators are distinct [1m([0m[1m51.98[0m%[1m)[0m.                                  
+[2m          [0m[2m [0m [1mINFO[0m          [1m584[0m of   [1m803[0m trees with  [1m17[0m operators are distinct [1m([0m[1m72.73[0m%[1m)[0m.                                  
+[2m          [0m[2m [0m [1mINFO[0m          [1m588[0m of   [1m930[0m trees with  [1m18[0m operators are distinct [1m([0m[1m63.23[0m%[1m)[0m.                                  
+[2m          [0m[2m [0m [1mINFO[0m          [1m593[0m of   [1m810[0m trees with  [1m19[0m operators are distinct [1m([0m[1m73.21[0m%[1m)[0m.                                  
+[2m          [0m[2m [0m [1mINFO[0m          [1m579[0m of   [1m693[0m trees with  [1m20[0m operators are distinct [1m([0m[1m83.55[0m%[1m)[0m.                                  
+[2m          [0m[2m [0m [1mINFO[0m          [1m516[0m of   [1m590[0m trees with  [1m21[0m operators are distinct [1m([0m[1m87.46[0m%[1m)[0m.                                  
+[2m          [0m[2m [0m [1mINFO[0m          [1m492[0m of   [1m497[0m trees with  [1m22[0m operators are distinct [1m([0m[1m98.99[0m%[1m)[0m.                                  
+[2m          [0m[2m [0m [1mINFO[0m          [1m416[0m of   [1m418[0m trees with  [1m23[0m operators are distinct [1m([0m[1m99.52[0m%[1m)[0m.                                  
+[2m          [0m[2m [0m [1mINFO[0m          [1m355[0m of   [1m356[0m trees with  [1m24[0m operators are distinct [1m([0m[1m99.72[0m%[1m)[0m.                                  
+[2m          [0m[2m [0m [1mINFO[0m          [1m365[0m of   [1m369[0m trees with  [1m25[0m operators are distinct [1m([0m[1m98.92[0m%[1m)[0m.                                  
+[2m          [0m[2m [0m [1mINFO[0m          [1m318[0m of   [1m319[0m trees with  [1m26[0m operators are distinct [1m([0m[1m99.69[0m%[1m)[0m.                                  
+[2m          [0m[2m [0m [1mINFO[0m          [1m266[0m of   [1m266[0m trees with  [1m27[0m operators are distinct [1m([0m[1m100.00[0m%[1m)[0m.                                 
+[2m          [0m[2m [0m [1mINFO[0m          [1m236[0m of   [1m236[0m trees with  [1m28[0m operators are distinct [1m([0m[1m100.00[0m%[1m)[0m.                                 
+[2m          [0m[2m [0m [1mINFO[0m          [1m240[0m of   [1m241[0m trees with  [1m29[0m operators are distinct [1m([0m[1m99.59[0m%[1m)[0m.                                  
+[2m          [0m[2m [0m [1mINFO[0m          [1m178[0m of   [1m178[0m trees with  [1m30[0m operators are distinct [1m([0m[1m100.00[0m%[1m)[0m.                                 
+[2m          [0m[2m [0m [1mINFO[0m          [1m164[0m of   [1m164[0m trees with  [1m31[0m operators are distinct [1m([0m[1m100.00[0m%[1m)[0m.                                 
+[2m          [0m[2m [0m [1mINFO[0m          [1m120[0m of   [1m120[0m trees with  [1m32[0m operators are distinct [1m([0m[1m100.00[0m%[1m)[0m.                                 
+[2m          [0m[2m [0m [1mINFO[0m          [1m133[0m of   [1m133[0m trees with  [1m33[0m operators are distinct [1m([0m[1m100.00[0m%[1m)[0m.                                 
+[2m          [0m[2m [0m [1mINFO[0m          [1m125[0m of   [1m125[0m trees with  [1m34[0m operators are distinct [1m([0m[1m100.00[0m%[1m)[0m.                                 
+[2m          [0m[2m [0m [1mINFO[0m           [1m94[0m of    [1m94[0m trees with  [1m35[0m operators are distinct [1m([0m[1m100.00[0m%[1m)[0m.                                 
+[2m          [0m[2m [0m [1mINFO[0m           [1m90[0m of    [1m90[0m trees with  [1m36[0m operators are distinct [1m([0m[1m100.00[0m%[1m)[0m.                                 
+[2m          [0m[2m [0m [1mINFO[0m           [1m67[0m of    [1m67[0m trees with  [1m37[0m operators are distinct [1m([0m[1m100.00[0m%[1m)[0m.                                 
+[2m          [0m[2m [0m [1mINFO[0m           [1m57[0m of    [1m57[0m trees with  [1m38[0m operators are distinct [1m([0m[1m100.00[0m%[1m)[0m.                                 
+[2m          [0m[2m [0m [1mINFO[0m           [1m36[0m of    [1m36[0m trees with  [1m39[0m operators are distinct [1m([0m[1m100.00[0m%[1m)[0m.                                 
+[2m          [0m[2m [0m [1mINFO[0m           [1m40[0m of    [1m40[0m trees with  [1m40[0m operators are distinct [1m([0m[1m100.00[0m%[1m)[0m.                                 
+[2m          [0m[2m [0m [1mINFO[0m           [1m38[0m of    [1m38[0m trees with  [1m41[0m operators are distinct [1m([0m[1m100.00[0m%[1m)[0m.                                 
+[2m          [0m[2m [0m [1mINFO[0m           [1m26[0m of    [1m26[0m trees with  [1m42[0m operators are distinct [1m([0m[1m100.00[0m%[1m)[0m.                                 
+[2m          [0m[2m [0m [1mINFO[0m           [1m16[0m of    [1m16[0m trees with  [1m43[0m operators are distinct [1m([0m[1m100.00[0m%[1m)[0m.                                 
+[2m          [0m[2m [0m [1mINFO[0m           [1m13[0m of    [1m13[0m trees with  [1m44[0m operators are distinct [1m([0m[1m100.00[0m%[1m)[0m.                                 
+[2m          [0m[2m [0m [1mINFO[0m           [1m12[0m of    [1m12[0m trees with  [1m45[0m operators are distinct [1m([0m[1m100.00[0m%[1m)[0m.                                 
+[2m          [0m[2m [0m [1mINFO[0m           [1m12[0m of    [1m12[0m trees with  [1m46[0m operators are distinct [1m([0m[1m100.00[0m%[1m)[0m.                                 
+[2m          [0m[2m [0m [1mINFO[0m           [1m16[0m of    [1m16[0m trees with  [1m47[0m operators are distinct [1m([0m[1m100.00[0m%[1m)[0m.                                 
+[2m          [0m[2m [0m [1mINFO[0m           [1m12[0m of    [1m12[0m trees with  [1m48[0m operators are distinct [1m([0m[1m100.00[0m%[1m)[0m.                                 
+[2m          [0m[2m [0m [1mINFO[0m            [1m8[0m of     [1m8[0m trees with  [1m49[0m operators are distinct [1m([0m[1m100.00[0m%[1m)[0m.                                 
+[2m          [0m[2m [0m [1mINFO[0m            [1m3[0m of     [1m3[0m trees with  [1m50[0m operators are distinct [1m([0m[1m100.00[0m%[1m)[0m.                                 
+[2m          [0m[2m [0m [1mINFO[0m            [1m5[0m of     [1m5[0m trees with  [1m51[0m operators are distinct [1m([0m[1m100.00[0m%[1m)[0m.                                 
+[2m          [0m[2m [0m [1mINFO[0m            [1m7[0m of     [1m7[0m trees with  [1m52[0m operators are distinct [1m([0m[1m100.00[0m%[1m)[0m.                                 
+[2m          [0m[2m [0m [1mINFO[0m            [1m2[0m of     [1m2[0m trees with  [1m54[0m operators are distinct [1m([0m[1m100.00[0m%[1m)[0m.                                 
+[2m          [0m[2m [0m [1mINFO[0m            [1m1[0m of     [1m1[0m trees with  [1m56[0m operators are distinct [1m([0m[1m100.00[0m%[1m)[0m.                                 
+[2m          [0m[2m [0m [1mINFO[0m            [1m1[0m of     [1m1[0m trees with  [1m57[0m operators are distinct [1m([0m[1m100.00[0m%[1m)[0m.                                 
+[2m          [0m[2m [0m [1mINFO[0m            [1m2[0m of     [1m2[0m trees with  [1m58[0m operators are distinct [1m([0m[1m100.00[0m%[1m)[0m.                                 
+[2m          [0m[2m [0m [1mINFO[0m            [1m1[0m of     [1m1[0m trees with  [1m68[0m operators are distinct [1m([0m[1m100.00[0m%[1m)[0m.                                 
+
+[2m          [0m[2m [0m [1mINFO[0m        [1m30222[0m of [1m285770[0m operators are distinct [1m([0m[1m10.58[0m%[1m)[0m.                                                
+[2m          [0m[2m [0m [1mINFO[0m         [1m9065[0m of [1m17036[0m queries have distinct trees [1m([0m[1m53.21[0m%[1m)[0m.                                            
+[2m          [0m[2m [0m [1mINFO[0m        [1m11490[0m of [1m17036[0m queries are distinct [1m([0m[1m67.45[0m%[1m)[0m.                                                   
+
+[?25l
+[?25h
+[2m[11:37:53][0m[2m [0m [1mINFO[0m        Operator TableScan [1m([0mlow complexity[1m)[0m: [1m30733[0m queries                                              
+[2m          [0m[2m [0m [1mINFO[0m        Operator Join [1m([0mlow complexity[1m)[0m: [1m30639[0m queries                                                   
+[2m          [0m[2m [0m [1mINFO[0m        Operator GroupBy [1m([0mlow complexity[1m)[0m: [1m28356[0m queries                                                
+[2m          [0m[2m [0m [1mINFO[0m        Operator Sort [1m([0mlow complexity[1m)[0m: [1m30500[0m queries                                                   
+[2m          [0m[2m [0m [1mINFO[0m        Operator Select [1m([0mlow complexity[1m)[0m: [1m20478[0m queries                                                 
+[2m          [0m[2m [0m [1mINFO[0m        Operator PipelineBreakerScan [1m([0mlow complexity[1m)[0m: [1m9905[0m queries                                     
+[2m          [0m[2m [0m [1mINFO[0m        Operator Result [1m([0mlow complexity[1m)[0m: [1m30746[0m queries                                                 
+[2m          [0m[2m [0m [1mINFO[0m        Operator GroupJoin [1m([0mlow complexity[1m)[0m: [1m12937[0m queries                                              
+[2m          [0m[2m [0m [1mINFO[0m        Operator Map [1m([0mlow complexity[1m)[0m: [1m11683[0m queries                                                    
+[2m          [0m[2m [0m [1mINFO[0m        Operator InlineTable [1m([0mlow complexity[1m)[0m: [1m893[0m queries                                              
+[2m          [0m[2m [0m [1mINFO[0m        Operator Temp [1m([0mmedium complexity[1m)[0m: [1m3961[0m queries                                                 
+[2m          [0m[2m [0m [1mINFO[0m        Operator SetOperation [1m([0mmedium complexity[1m)[0m: [1m482[0m queries                                          
+[2m          [0m[2m [0m [1mINFO[0m        Operator Window [1m([0mmedium complexity[1m)[0m: [1m17383[0m queries                                              
+[2m          [0m[2m [0m [1mINFO[0m        Operator Iteration [1m([0mhigh complexity[1m)[0m: [1m1793[0m queries                                              
+[2m          [0m[2m [0m [1mINFO[0m        Operator IterationScan [1m([0mhigh complexity[1m)[0m: [1m1792[0m queries                                          
+[2m          [0m[2m [0m [1mINFO[0m        Operator RegexSplit [1m([0mhigh complexity[1m)[0m: [1m5[0m queries                                                
+[2m          [0m[2m [0m [1mINFO[0m        Operator ArrayUnnest [1m([0mhigh complexity[1m)[0m: [1m1486[0m queries                                            
+
+[2m          [0m[2m [0m [1mINFO[0m        Join type inner [1m([0mlow complexity[1m)[0m: [1m29693[0m queries                                                 
+[2m          [0m[2m [0m [1mINFO[0m        Join type outer [1m([0mlow complexity[1m)[0m: [1m5789[0m queries                                                  
+[2m          [0m[2m [0m [1mINFO[0m        Join type fullouter [1m([0mlow complexity[1m)[0m: [1m684[0m queries                                               
+[2m          [0m[2m [0m [1mINFO[0m        Join type leftouter [1m([0mlow complexity[1m)[0m: [1m20849[0m queries                                             
+[2m          [0m[2m [0m [1mINFO[0m        Join type rightouter [1m([0mlow complexity[1m)[0m: [1m15014[0m queries                                            
+[2m          [0m[2m [0m [1mINFO[0m        Join type leftsingle [1m([0mmedium complexity[1m)[0m: [1m1610[0m queries                                          
+[2m          [0m[2m [0m [1mINFO[0m        Join type rightsingle [1m([0mmedium complexity[1m)[0m: [1m1253[0m queries                                         
+[2m          [0m[2m [0m [1mINFO[0m        Join type leftsemi [1m([0mmedium complexity[1m)[0m: [1m825[0m queries                                             
+[2m          [0m[2m [0m [1mINFO[0m        Join type rightsemi [1m([0mmedium complexity[1m)[0m: [1m813[0m queries                                            
+[2m          [0m[2m [0m [1mINFO[0m        Join type leftanti [1m([0mmedium complexity[1m)[0m: [1m113[0m queries                                             
+[2m          [0m[2m [0m [1mINFO[0m        Join type rightanti [1m([0mmedium complexity[1m)[0m: [1m103[0m queries                                            
+[2m          [0m[2m [0m [1mINFO[0m        Join type rightmark [1m([0mhigh complexity[1m)[0m: [1m210[0m queries                                              
+[2m          [0m[2m [0m [1mINFO[0m        Join type leftmark [1m([0mhigh complexity[1m)[0m: [1m262[0m queries                                               
+
+[2m          [0m[2m [0m [1mINFO[0m        Expression category base [1m([0mlow complexity[1m)[0m: [1m30746[0m queries                                        
+[2m          [0m[2m [0m [1mINFO[0m        Expression category cast [1m([0mlow complexity[1m)[0m: [1m21718[0m queries                                        
+[2m          [0m[2m [0m [1mINFO[0m        Expression category case [1m([0mlow complexity[1m)[0m: [1m17001[0m queries                                        
+[2m          [0m[2m [0m [1mINFO[0m        Expression category comparison_low [1m([0mlow complexity[1m)[0m: [1m30713[0m queries                              
+[2m          [0m[2m [0m [1mINFO[0m        Expression category arithmetic_low [1m([0mlow complexity[1m)[0m: [1m17520[0m queries                              
+[2m          [0m[2m [0m [1mINFO[0m        Expression category agg_low [1m([0mlow complexity[1m)[0m: [1m29190[0m queries                                     
+[2m          [0m[2m [0m [1mINFO[0m        Expression category agg_medium [1m([0mmedium complexity[1m)[0m: [1m8897[0m queries                                
+[2m          [0m[2m [0m [1mINFO[0m        Expression category comparison_medium [1m([0mmedium complexity[1m)[0m: [1m7[0m queries                            
+[2m          [0m[2m [0m [1mINFO[0m        Expression category arithmetic_medium [1m([0mmedium complexity[1m)[0m: [1m1003[0m queries                         
+[2m          [0m[2m [0m [1mINFO[0m        Expression category string matching [1m([0mmedium complexity[1m)[0m: [1m4650[0m queries                           
+[2m          [0m[2m [0m [1mINFO[0m        Expression category string modification [1m([0mmedium complexity[1m)[0m: [1m6442[0m queries                       
+[2m          [0m[2m [0m [1mINFO[0m        Expression category array [1m([0mmedium complexity[1m)[0m: [1m1641[0m queries                                     
+[2m          [0m[2m [0m [1mINFO[0m        Expression category date [1m([0mmedium complexity[1m)[0m: [1m629[0m queries                                       
+[2m          [0m[2m [0m [1mINFO[0m        Expression category nulls [1m([0mmedium complexity[1m)[0m: [1m14165[0m queries                                    
+[2m          [0m[2m [0m [1mINFO[0m        Expression category error [1m([0mmedium complexity[1m)[0m: [1m3[0m queries                                        
+[2m          [0m[2m [0m [1mINFO[0m        Expression category window_medium [1m([0mmedium complexity[1m)[0m: [1m17383[0m queries                            
+[2m          [0m[2m [0m [1mINFO[0m        Expression category json [1m([0mhigh complexity[1m)[0m: [1m10[0m queries                                          
+[2m          [0m[2m [0m [1mINFO[0m        Expression category regex [1m([0mhigh complexity[1m)[0m: [1m101[0m queries                                        
+
+[2m          [0m[2m [0m [1mINFO[0m        Type bool [1m([0mlow complexity[1m)[0m: [1m267[0m queries                                                         
+[2m          [0m[2m [0m [1mINFO[0m        Type boolean [1m([0mlow complexity[1m)[0m: [1m30660[0m queries                                                    
+[2m          [0m[2m [0m [1mINFO[0m        Type smallint [1m([0mlow complexity[1m)[0m: [1m16716[0m queries                                                   
+[2m          [0m[2m [0m [1mINFO[0m        Type integer [1m([0mlow complexity[1m)[0m: [1m30711[0m queries                                                    
+[2m          [0m[2m [0m [1mINFO[0m        Type bigint [1m([0mlow complexity[1m)[0m: [1m27978[0m queries                                                     
+[2m          [0m[2m [0m [1mINFO[0m        Type numeric [1m([0mlow complexity[1m)[0m: [1m23792[0m queries                                                    
+[2m          [0m[2m [0m [1mINFO[0m        Type bignumeric [1m([0mlow complexity[1m)[0m: [1m19451[0m queries                                                 
+[2m          [0m[2m [0m [1mINFO[0m        Type double [1m([0mlow complexity[1m)[0m: [1m352[0m queries                                                       
+[2m          [0m[2m [0m [1mINFO[0m        Type date [1m([0mlow complexity[1m)[0m: [1m10181[0m queries                                                       
+[2m          [0m[2m [0m [1mINFO[0m        Type timestamp [1m([0mlow complexity[1m)[0m: [1m14430[0m queries                                                  
+[2m          [0m[2m [0m [1mINFO[0m        Type interval [1m([0mlow complexity[1m)[0m: [1m308[0m queries                                                     
+[2m          [0m[2m [0m [1mINFO[0m        Type text [1m([0mlow complexity[1m)[0m: [1m28962[0m queries                                                       
+[2m          [0m[2m [0m [1mINFO[0m        Type char [1m([0mlow complexity[1m)[0m: [1m21439[0m queries                                                       
+[2m          [0m[2m [0m [1mINFO[0m        Type char1 [1m([0mlow complexity[1m)[0m: [1m5907[0m queries                                                       
+[2m          [0m[2m [0m [1mINFO[0m        Type varchar [1m([0mlow complexity[1m)[0m: [1m26471[0m queries                                                    
+[2m          [0m[2m [0m [1mINFO[0m        Type unknown [1m([0mlow complexity[1m)[0m: [1m28263[0m queries                                                    
+[2m          [0m[2m [0m [1mINFO[0m        Type double precision [1m([0mlow complexity[1m)[0m: [1m565[0m queries                                             
+[2m          [0m[2m [0m [1mINFO[0m        Type text[1m[[0m[1m][0m [1m([0mmedium complexity[1m)[0m: [1m2099[0m queries                                                   
+[2m          [0m[2m [0m [1mINFO[0m        Type varchar[1m[[0m[1m][0m [1m([0mmedium complexity[1m)[0m: [1m352[0m queries                                                 
+[2m          [0m[2m [0m [1mINFO[0m        Type integer[1m[[0m[1m][0m [1m([0mmedium complexity[1m)[0m: [1m50[0m queries                                                  
+[2m          [0m[2m [0m [1mINFO[0m        Type smallint[1m[[0m[1m][0m [1m([0mmedium complexity[1m)[0m: [1m5[0m queries                                                  
+[2m          [0m[2m [0m [1mINFO[0m        Type bigint[1m[[0m[1m][0m [1m([0mmedium complexity[1m)[0m: [1m2[0m queries                                                    
+[2m          [0m[2m [0m [1mINFO[0m        Type char[1m[[0m[1m][0m [1m([0mmedium complexity[1m)[0m: [1m31[0m queries                                                     
+[2m          [0m[2m [0m [1mINFO[0m        Type numeric[1m[[0m[1m][0m [1m([0mmedium complexity[1m)[0m: [1m1[0m queries                                                   
+[2m          [0m[2m [0m [1mINFO[0m        Type record [1m([0mhigh complexity[1m)[0m: [1m25[0m queries                                                       
+[2m          [0m[2m [0m [1mINFO[0m        Type jsonb [1m([0mhigh complexity[1m)[0m: [1m5[0m queries                                                         
+[2m          [0m[2m [0m [1mINFO[0m        Type json [1m([0mhigh complexity[1m)[0m: [1m7[0m queries                                                          
+[2m          [0m[2m [0m [1mINFO[0m        Type timestamptz [1m([0mhigh complexity[1m)[0m: [1m34[0m queries                                                  
+
+[2m          [0m[2m [0m [1mINFO[0m        Complexity low: [1m2834[0m queries                                                                    
+[2m          [0m[2m [0m [1mINFO[0m        Complexity medium: [1m11032[0m queries                                                                
+[2m          [0m[2m [0m [1mINFO[0m        Complexity high: [1m3170[0m queries                                                                   
+
+[2m          [0m[2m [0m [1mINFO[0m        Writing results to features/v1.[1m0[0m/tpchSf1_sqlstorm.csv ...                                       
+[?25l
+[?25h
