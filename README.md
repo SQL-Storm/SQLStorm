@@ -3,6 +3,18 @@
 SQLStorm is an LLM-generated analytical benchmark for database systems.
 Check out the paper under [https://db.in.tum.de/~schmidt/papers/sqlstorm.pdf](https://db.in.tum.de/~schmidt/papers/sqlstorm.pdf).
 
+```bibtex
+@article{sqlstorm25,
+  author  = {Tobias Schmidt and Viktor Leis and Peter Boncz and Thomas Neumann},
+  title   = {SQLStorm: Taking Database Benchmarking into the LLM Era},
+  journal = {Proc. {VLDB} Endow.},
+  volume  = {18},
+  number  = {11},
+  pages   = {4144--4157},
+  year    = {2025}
+}
+```
+
 Contact Tobias Schmidt (tobias.schmidt@in.tum.de) if you have any questions.
 
 ## ChangeLog
