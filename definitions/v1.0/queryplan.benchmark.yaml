@@ -1,0 +1,34 @@
+title: SQLStorm v1.0 Query Plan Benchmark
+repetitions: 1
+warmup: 0
+timeout: 100
+query_seed: 42
+fetch_result: false
+query_plan:
+  retrieve: true
+  system_representation: true
+output: results/v1.0/queryplan
+systems:
+  - title: Umbra
+    dbms: umbra
+    settings:
+      usedirectio: true
+      optimizer.sidewayinformationpassing: false # affects the cardinality estimates
+      optimizer.earlyprobe: false # affects the cardinality estimates
+      optimizer.joinfilter: false # affects the cardinality estimates
+      optimizer.minmaxbounds: false # affects the cardinality estimates
+      optimizer.limitfilter: false # affects the cardinality estimates
+      multiway: d # other systems do not support multiway joins
+    parameter:
+      version: "25.01"
+  - title: DuckDB
+    dbms: duckdb
+    settings: {}
+    parameter:
+      version: "1.2.0"
+  - title: Postgres
+    dbms: postgres
+    disabled: false
+    settings: {}
+    parameter:
+      version: "17.0"
