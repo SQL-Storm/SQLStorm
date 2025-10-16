@@ -1,0 +1,201 @@
+-- {"query": "791.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1891} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 AS Depth
+    FROM Tags t
+    WHERE t.IsRequired = 1
+    UNION ALL
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        t2.IsModeratorOnly,
+        t2.IsRequired,
+        r.Depth + 1
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id <> r.Id AND t2.IsRequired = 1
+    WHERE r.Depth < 3
+),
+UserBadgesCTE AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COALESCE(SUM(p.Score),0) AS TotalPostScore,
+        COALESCE(SUM(vote_up.UpVotes),0) AS TotalUpVotes,
+        COALESCE(SUM(vote_down.DownVotes),0) AS TotalDownVotes,
+        RANK() OVER (ORDER BY u.Reputation DESC NULLS LAST) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS UpVotes
+        FROM Votes 
+        WHERE VoteTypeId = 2
+        GROUP BY PostId
+    ) vote_up ON vote_up.PostId = p.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS DownVotes
+        FROM Votes 
+        WHERE VoteTypeId = 3
+        GROUP BY PostId
+    ) vote_down ON vote_down.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostComplexStats AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        -- Calculate length of body ignoring HTML tags (simple approximation)
+        LENGTH(REGEXP_REPLACE(p.Body, '<[^>]+>', '', 'g')) AS PlainBodyLength,
+        -- Count distinct tags from Tags string
+        COALESCE(array_length(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><'), 1), 0) AS TagCount,
+        -- Flag if post is closed recently (last 30 days)
+        CASE WHEN p.ClosedDate IS NOT NULL AND p.ClosedDate > NOW() - INTERVAL '30 days' THEN 1 ELSE 0 END AS RecentlyClosed,
+        -- Number of comments
+        COALESCE(c.CommentCount, 0) AS CommentCount,
+        -- Number of distinct editors from PostHistory
+        COALESCE(ph.EditorCount, 0) AS DistinctEditorCount,
+        -- Window function: rank posts by score within same PostTypeId
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC NULLS LAST) AS ScoreRank,
+        -- String expression: concatenated OwnerDisplayName and Title with a separator
+        CONCAT_WS(' - ', COALESCE(p.OwnerDisplayName, 'Unknown'), COALESCE(p.Title, 'No Title')) AS OwnerTitleConcat
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CommentCount
+        FROM Comments
+        GROUP BY PostId
+    ) c ON c.PostId = p.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(DISTINCT UserId) AS EditorCount
+        FROM PostHistory
+        WHERE UserId IS NOT NULL
+        GROUP BY PostId
+    ) ph ON ph.PostId = p.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+AcceptedAnswersCTE AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.AcceptedAnswerId,
+        a.Score AS AcceptedAnswerScore,
+        a.CreationDate AS AcceptedAnswerCreationDate
+    FROM Posts p
+    LEFT JOIN Posts a ON a.Id = p.AcceptedAnswerId
+    WHERE p.PostTypeId = 1
+),
+DuplicatedPosts AS (
+    SELECT DISTINCT pl.PostId AS OriginalPost, pl.RelatedPostId AS DuplicateOf
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+),
+QuestionsWithDuplicates AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        dp.DuplicateOf,
+        CASE WHEN dp.DuplicateOf IS NOT NULL THEN 1 ELSE 0 END AS IsDuplicate
+    FROM Posts p
+    LEFT JOIN DuplicatedPosts dp ON dp.PostId = p.Id
+    WHERE p.PostTypeId = 1
+),
+FilteredPosts AS (
+    SELECT 
+        pcs.PostId,
+        pcs.PostTypeId,
+        pcs.OwnerUserId,
+        pcs.CreationDate,
+        pcs.Score,
+        pcs.ViewCount,
+        pcs.Title,
+        pcs.TagCount,
+        pcs.RecentlyClosed,
+        pcs.CommentCount,
+        pcs.DistinctEditorCount,
+        pcs.ScoreRank,
+        pcs.OwnerTitleConcat,
+        COALESCE(aa.AcceptedAnswerScore, 0) AS AcceptedAnswerScore,
+        COALESCE(aa.AcceptedAnswerCreationDate, pcs.CreationDate) AS AcceptedAnswerDate,
+        qd.IsDuplicate
+    FROM PostComplexStats pcs
+    LEFT JOIN AcceptedAnswersCTE aa ON aa.QuestionId = pcs.PostId AND pcs.PostTypeId = 1
+    LEFT JOIN QuestionsWithDuplicates qd ON qd.Id = pcs.PostId
+    WHERE pcs.Score > 0
+),
+FinalUserAggregates AS (
+    SELECT 
+        ub.UserId,
+        ub.DisplayName,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.TotalPostScore,
+        ub.TotalUpVotes,
+        ub.TotalDownVotes,
+        ub.ReputationRank,
+        COUNT(fp.PostId) AS PostsCount,
+        AVG(fp.Score) AS AvgPostScore,
+        SUM(CASE WHEN fp.RecentlyClosed = 1 THEN 1 ELSE 0 END) AS RecentlyClosedPosts,
+        SUM(CASE WHEN fp.IsDuplicate = 1 THEN 1 ELSE 0 END) AS DuplicatePosts,
+        MAX(fp.AcceptedAnswerScore) AS MaxAcceptedAnswerScore,
+        MIN(fp.AcceptedAnswerDate) AS EarliestAcceptedAnswerDate,
+        STRING_AGG(DISTINCT fh.TagName, ', ') FILTER (WHERE fh.Depth = 1) AS RequiredTagsUsed
+    FROM UserBadgesCTE ub
+    LEFT JOIN FilteredPosts fp ON fp.OwnerUserId = ub.UserId
+    LEFT JOIN LATERAL (
+        SELECT DISTINCT t.TagName, t.Depth
+        FROM RecursiveTagHierarchy t
+        WHERE fp.Tags LIKE '%' || t.TagName || '%'
+    ) fh ON TRUE
+    GROUP BY ub.UserId, ub.DisplayName, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ub.TotalPostScore, ub.TotalUpVotes, ub.TotalDownVotes, ub.ReputationRank
+)
+SELECT 
+    fua.UserId,
+    fua.DisplayName,
+    fua.GoldBadges,
+    fua.SilverBadges,
+    fua.BronzeBadges,
+    fua.TotalPostScore,
+    fua.TotalUpVotes,
+    fua.TotalDownVotes,
+    fua.ReputationRank,
+    fua.PostsCount,
+    ROUND(fua.AvgPostScore, 2) AS AveragePostScore,
+    fua.RecentlyClosedPosts,
+    fua.DuplicatePosts,
+    fua.MaxAcceptedAnswerScore,
+    fua.EarliestAcceptedAnswerDate,
+    fua.RequiredTagsUsed,
+    -- Complex expression combining reputation and badges
+    CASE 
+        WHEN fua.GoldBadges > 0 THEN fua.TotalPostScore * 1.5 + fua.GoldBadges * 100 
+        WHEN fua.SilverBadges > 5 THEN fua.TotalPostScore * 1.2 + fua.SilverBadges * 50
+        ELSE fua.TotalPostScore + fua.BronzeBadges * 10 
+    END AS WeightedScore,
+    -- Subquery to find the latest comment text length for user's posts
+    (SELECT MAX(LENGTH(c.Text)) FROM Comments c WHERE c.PostId IN 
+        (SELECT fp.PostId FROM FilteredPosts fp WHERE fp.OwnerUserId = fua.UserId)
+    ) AS MaxCommentTextLength
+FROM FinalUserAggregates fua
+WHERE fua.PostsCount > 10
+ORDER BY fua.WeightedScore DESC NULLS LAST, fua.ReputationRank ASC
+LIMIT 100;

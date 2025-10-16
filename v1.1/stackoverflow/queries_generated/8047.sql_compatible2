@@ -1,0 +1,241 @@
+with recent_active_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           u.location,
+           u.websiteurl,
+           u.upvotes,
+           u.downvotes,
+           u.views,
+           count(*) filter (where p.posttypeid in (1,2)) as total_posts,
+           sum(case when p.posttypeid = 1 then 1 else 0 end) as questions,
+           sum(case when p.posttypeid = 2 then 1 else 0 end) as answers,
+           max(p.lastactivitydate) as last_post_activity
+    from users u
+    left join posts p
+      on p.owneruserid = u.id
+     and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    where u.creationdate <= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+    group by u.id, u.displayname, u.reputation, u.creationdate, u.location, u.websiteurl, u.upvotes, u.downvotes, u.views
+    having count(*) filter (where p.posttypeid in (1,2)) >= 3
+),
+user_badge_rollup as (
+    select b.userid,
+           count(*) as badge_count,
+           count(*) filter (where b.class = 1) as gold_badges,
+           count(*) filter (where b.class = 2) as silver_badges,
+           count(*) filter (where b.class = 3) as bronze_badges,
+           min(b.date) as first_badge_date,
+           max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+question_stats as (
+    select q.owneruserid as user_id,
+           count(*) as questions_total,
+           sum(coalesce(q.viewcount,0)) as total_views,
+           avg(nullif(q.score,0)) as avg_nonzero_score,
+           count(*) filter (where q.acceptedanswerid is not null) as accepted_count,
+           sum(coalesce(q.favoritecount,0)) as favorites_total,
+           count(*) filter (where q.closeddate is not null) as closed_count,
+           count(distinct date_trunc('month', q.creationdate)) as active_months
+    from posts q
+    where q.posttypeid = 1
+      and q.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by q.owneruserid
+),
+answer_stats as (
+    select a.owneruserid as user_id,
+           count(*) as answers_total,
+           sum(case when a.score > 0 then 1 else 0 end) as positive_answers,
+           avg(a.score) as avg_answer_score,
+           count(distinct a.parentid) as unique_questions_answered
+    from posts a
+    where a.posttypeid = 2
+      and a.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by a.owneruserid
+),
+comment_sentiment as (
+    select c.userid as user_id,
+           count(*) as comments_total,
+           sum(case when c.score >= 5 then 1 else 0 end) as high_score_comments,
+           avg(c.score) as avg_comment_score,
+           max(c.creationdate) as last_comment_date,
+           sum(case when position('thanks' in lower(c.text)) > 0 then 1 else 0 end) as thanks_mentions
+    from comments c
+    group by c.userid
+),
+postlink_dupes as (
+    select pl.postid,
+           count(*) filter (where pl.linktypeid = 3) as dupes_to,
+           count(*) filter (where pl.linktypeid = 1) as linked_to
+    from postlinks pl
+    group by pl.postid
+),
+post_closure_reasons as (
+    select ph.postid,
+           count(*) filter (where ph.posthistorytypeid = 10) as close_events,
+           max(case when ph.posthistorytypeid = 10 then nullif(ph.comment,'') end) as last_close_reason_id,
+           max(ph.creationdate) filter (where ph.posthistorytypeid = 10) as last_closed_at
+    from posthistory ph
+    group by ph.postid
+),
+monthly_activity as (
+    select u.id as user_id,
+           date_trunc('month', p.creationdate) as month,
+           count(*) as posts_in_month,
+           row_number() over (partition by u.id order by count(*) desc, date_trunc('month', p.creationdate)) as month_rank_by_posts
+    from users u
+    join posts p on p.owneruserid = u.id
+    where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+      and p.posttypeid in (1,2)
+    group by u.id, date_trunc('month', p.creationdate)
+),
+user_votes as (
+    select p.owneruserid as user_id,
+           sum(case when v.votetypeid = 2 then 1 else 0 end) as upmods,
+           sum(case when v.votetypeid = 3 then 1 else 0 end) as downmods,
+           sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounties_started,
+           sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounties_awarded
+    from votes v
+    join posts p on p.id = v.postid
+    group by p.owneruserid
+),
+tag_exposure as (
+    select q.owneruserid as user_id,
+           unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')) as tag,
+           count(*) as tag_count
+    from posts q
+    where q.posttypeid = 1
+      and q.tags is not null
+      and q.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by q.owneruserid, unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><'))
+),
+top_tags as (
+    select tt.user_id,
+           string_agg(tt.tag, ', ' order by tt.tag_count desc, tt.tag asc) filter (where tt.rn <= 5) as top5_tags
+    from (
+        select te.user_id, te.tag, te.tag_count,
+               row_number() over (partition by te.user_id order by te.tag_count desc, te.tag) as rn
+        from tag_exposure te
+    ) tt
+    group by tt.user_id
+),
+user_quality_score as (
+    select rau.user_id,
+           (coalesce(qs.avg_nonzero_score, 0) * 2.0)
+           + (coalesce(as2.avg_answer_score, 0) * 1.5)
+           + (coalesce(qs.accepted_count, 0) * 3.0)
+           + (coalesce(uv.upmods, 0) * 0.25)
+           - (coalesce(uv.downmods, 0) * 0.5)
+           + (least(coalesce(rau.reputation,0), 10000) / 100.0)
+           + (coalesce(cmt.high_score_comments,0) * 0.2)
+           - (coalesce(qs.closed_count,0) * 1.0)
+           + (coalesce(as2.positive_answers,0) * 0.3) as quality_score
+    from recent_active_users rau
+    left join question_stats qs on qs.user_id = rau.user_id
+    left join answer_stats as2 on as2.user_id = rau.user_id
+    left join user_votes uv on uv.user_id = rau.user_id
+    left join comment_sentiment cmt on cmt.user_id = rau.user_id
+),
+-- compute percentiles separately to avoid ordered-set aggregate with OVER
+quality_percentiles as (
+    select
+      percentile_disc(0.9) within group (order by quality_score) as p90,
+      percentile_disc(0.75) within group (order by quality_score) as p75,
+      percentile_disc(0.5) within group (order by quality_score) as p50
+    from user_quality_score
+)
+select
+    rau.user_id,
+    coalesce(rau.displayname, 'user-' || cast(rau.user_id as varchar)) as displayname,
+    rau.reputation,
+    rau.creationdate,
+    rau.location,
+    case when rau.websiteurl is null or length(trim(rau.websiteurl)) = 0 then '(none)'
+         when rau.websiteurl ~* '^https?://' then rau.websiteurl
+         else 'http://' || rau.websiteurl end as websiteurl_normalized,
+    rau.total_posts,
+    rau.questions,
+    rau.answers,
+    rau.last_post_activity,
+    coalesce(qs.questions_total, 0) as questions_5y,
+    coalesce(as2.answers_total, 0) as answers_5y,
+    coalesce(qs.total_views, 0) as q_total_views_5y,
+    round(cast(coalesce(qs.avg_nonzero_score, 0) as numeric), 2) as q_avg_nonzero_score_5y,
+    coalesce(qs.accepted_count, 0) as q_accepted_5y,
+    coalesce(qs.favorites_total, 0) as q_favorites_5y,
+    coalesce(qs.closed_count, 0) as q_closed_5y,
+    coalesce(as2.positive_answers, 0) as positive_answers_5y,
+    round(cast(coalesce(as2.avg_answer_score, 0) as numeric), 2) as avg_answer_score_5y,
+    coalesce(as2.unique_questions_answered, 0) as unique_questions_answered_5y,
+    coalesce(cmt.comments_total, 0) as comments_total,
+    coalesce(cmt.high_score_comments, 0) as high_score_comments,
+    round(cast(coalesce(cmt.avg_comment_score, 0) as numeric), 2) as avg_comment_score,
+    cmt.last_comment_date,
+    coalesce(cmt.thanks_mentions, 0) as thanks_mentions,
+    coalesce(uv.upmods, 0) as upvotes_received,
+    coalesce(uv.downmods, 0) as downvotes_received,
+    coalesce(uv.bounties_started, 0) as total_bounty_started,
+    coalesce(uv.bounties_awarded, 0) as total_bounty_awarded,
+    coalesce(ubr.badge_count, 0) as badge_count,
+    coalesce(ubr.gold_badges, 0) as gold_badges,
+    coalesce(ubr.silver_badges, 0) as silver_badges,
+    coalesce(ubr.bronze_badges, 0) as bronze_badges,
+    ubr.first_badge_date,
+    ubr.last_badge_date,
+    coalesce(tt.top5_tags, '(no tags)') as top5_tags,
+    coalesce(qs.active_months, 0) as q_active_months_5y,
+    coalesce(pld.dupes_to, 0) as duplicate_links_to,
+    coalesce(pld.linked_to, 0) as linked_to_count,
+    coalesce(pcr.close_events, 0) as close_events,
+    pcr.last_close_reason_id,
+    pcr.last_closed_at,
+    ma.month as best_month,
+    ma.posts_in_month as best_month_posts,
+    uqs.quality_score,
+    case
+      when uqs.quality_score >= qp.p90 then 'top-10%'
+      when uqs.quality_score >= qp.p75 then 'top-25%'
+      when uqs.quality_score >= qp.p50 then 'top-50%'
+      else 'bottom-50%'
+    end as quality_bucket,
+    rank() over (order by uqs.quality_score desc, rau.reputation desc, coalesce(qs.total_views,0) desc) as quality_rank_global,
+    dense_rank() over (partition by coalesce(rau.location,'(unknown)') order by uqs.quality_score desc) as quality_rank_by_location
+from recent_active_users rau
+left join question_stats qs on qs.user_id = rau.user_id
+left join answer_stats as2 on as2.user_id = rau.user_id
+left join comment_sentiment cmt on cmt.user_id = rau.user_id
+left join user_votes uv on uv.user_id = rau.user_id
+left join user_badge_rollup ubr on ubr.userid = rau.user_id
+left join top_tags tt on tt.user_id = rau.user_id
+left join lateral (
+    select pld.postid as post_id,
+           sum(pld.dupes_to) as dupes_to,
+           sum(pld.linked_to) as linked_to
+    from postlink_dupes pld
+    join posts p on p.id = pld.postid and p.owneruserid = rau.user_id
+    group by pld.postid
+) pld on true
+left join lateral (
+    select pcr.postid, pcr.close_events, pcr.last_close_reason_id, pcr.last_closed_at
+    from post_closure_reasons pcr
+    join posts p on p.id = pcr.postid and p.owneruserid = rau.user_id
+    order by pcr.last_closed_at desc nulls last
+    limit 1
+) pcr on true
+left join lateral (
+    select ma.month, ma.posts_in_month
+    from monthly_activity ma
+    where ma.user_id = rau.user_id
+      and ma.month_rank_by_posts = 1
+) ma on true
+left join user_quality_score uqs on uqs.user_id = rau.user_id
+cross join quality_percentiles qp
+where coalesce(rau.displayname, '') not ilike '%bot%'
+  and (rau.upvotes - rau.downvotes) >= 0
+  and (rau.answers + rau.questions) >= 3
+  and coalesce(qs.closed_count, 0) <= (coalesce(qs.questions_total,0) / 2)
+order by uqs.quality_score desc nulls last, rau.reputation desc
+limit 200;

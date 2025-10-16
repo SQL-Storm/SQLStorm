@@ -1,0 +1,124 @@
+WITH PostVotes AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END)       AS UpVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END)       AS DownVotes,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN COALESCE(v.BountyAmount,0) ELSE 0 END) AS TotalBounty
+    FROM Posts p
+    LEFT JOIN Votes v
+        ON v.PostId = p.Id
+    GROUP BY p.Id
+),
+UserStats AS (
+    SELECT
+        u.Id            AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COALESCE(SUM(p.Score), 0) AS ScoreSum,
+        -- AVG(p.Score) OVER (PARTITION BY u.Id) is equivalent to AVG(p.Score) per user;
+        -- use aggregate AVG with GROUP BY u.Id to be standard
+        AVG(p.Score) AS AvgScore,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p
+        ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b
+        ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+PostComments AS (
+    SELECT
+        c.PostId,
+        COUNT(*)     AS CommentCount,
+        MAX(c.Score) AS MaxCommentScore
+    FROM Comments c
+    GROUP BY c.PostId
+),
+TagUsage AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id) AS QCount
+    FROM Tags t
+    LEFT JOIN Posts p
+        ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    GROUP BY t.TagName
+),
+PopularQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        COALESCE(pv.UpVotes,0) AS UpVotes,
+        COALESCE(pc.CommentCount,0) AS CommentCount,
+        ROW_NUMBER() OVER (
+            ORDER BY COALESCE(pv.UpVotes,0) DESC, COALESCE(pc.CommentCount,0) DESC
+        ) AS RankByActivity
+    FROM Posts p
+    LEFT JOIN PostVotes pv
+        ON pv.PostId = p.Id
+    LEFT JOIN PostComments pc
+        ON pc.PostId = p.Id
+    WHERE p.PostTypeId = 1
+)
+SELECT
+    us.UserId,
+    us.DisplayName,
+    us.TotalPosts,
+    us.ScoreSum,
+    us.AvgScore,
+    us.GoldBadges,
+    us.BronzeBadges,
+    pq.Id              AS QuestionId,
+    pq.Title           AS QuestionTitle,
+    pq.UpVotes,
+    pq.CommentCount,
+    CASE
+        WHEN pq.RankByActivity <= 10 THEN 'Hot'
+        ELSE 'Cold'
+    END                 AS Hotness,
+    COALESCE(tu.TagName, '(none)') AS TagName,
+    COALESCE(tu.QCount, 0)         AS QCount
+FROM UserStats us
+INNER JOIN Posts p2
+    ON p2.OwnerUserId = us.UserId
+LEFT JOIN PopularQuestions pq
+    ON pq.Id = p2.Id
+FULL OUTER JOIN TagUsage tu
+    ON tu.QCount > us.TotalPosts
+WHERE us.AvgScore > (
+    SELECT AVG(p3.Score)
+    FROM Posts p3
+    WHERE p3.OwnerUserId = us.UserId
+)
+EXCEPT
+SELECT
+    us.UserId,
+    us.DisplayName,
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+FROM UserStats us
+WHERE us.TotalPosts = 0
+INTERSECT
+SELECT
+    us.UserId,
+    us.DisplayName,
+    us.TotalPosts,
+    us.ScoreSum,
+    us.AvgScore,
+    us.GoldBadges,
+    us.BronzeBadges,
+    pq.Id,
+    pq.Title,
+    pq.UpVotes,
+    pq.CommentCount,
+    'Intersected' AS Hotness,
+    tu.TagName,
+    tu.QCount
+FROM UserStats us
+JOIN PopularQuestions pq
+    ON pq.RankByActivity <= 50
+LEFT JOIN TagUsage tu
+    ON tu.TagName LIKE 'sql%'
+ORDER BY
+    us.ScoreSum DESC,
+    pq.UpVotes DESC,
+    tu.QCount DESC;

@@ -1,0 +1,217 @@
+WITH PostVoteAggregates AS (
+    SELECT
+        V.PostId,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoritesReceived
+    FROM
+        Votes V
+    GROUP BY
+        V.PostId
+),
+UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserTotalUpvotesGiven,
+        U.DownVotes AS UserTotalDownvotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsCreated,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersCreated,
+        COUNT(DISTINCT C.Id) AS TotalCommentsCreated,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScoreReceived,
+        SUM(COALESCE(P.ViewCount, 0)) AS TotalPostViewsReceived,
+        SUM(COALESCE(PVA.UpvotesReceived, 0)) AS TotalUpvotesReceivedOnPosts,
+        SUM(COALESCE(PVA.DownvotesReceived, 0)) AS TotalDownvotesReceivedOnPosts,
+        SUM(CASE WHEN P.AcceptedAnswerId IS NOT NULL AND P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsWithAcceptedAnswer,
+        SUM(COALESCE(PVA.FavoritesReceived, 0)) AS TotalFavoritesReceivedOnPosts
+    FROM
+        Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN PostVoteAggregates PVA ON P.Id = PVA.PostId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostTagEngagementBase AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.AnswerCount AS PostAnswerCount,
+        P.CommentCount AS PostCommentCount,
+        P.FavoriteCount AS PostFavoriteCount,
+        P.AcceptedAnswerId,
+        -- standard SQL: split tags by converting >< delim into array-like via string functions where STRING_TO_ARRAY may not exist
+        -- keep original function for dialects that support it; otherwise assume available
+        STRING_TO_ARRAY(SUBSTRING(P.Tags FROM 2 FOR CHAR_LENGTH(P.Tags)-2), '><') AS ParsedTags,
+        COALESCE(COUNT(DISTINCT PL_Dup.RelatedPostId), 0) AS DuplicateLinkCount
+    FROM
+        Posts P
+    LEFT JOIN PostLinks PL_Dup ON P.Id = PL_Dup.PostId AND PL_Dup.LinkTypeId = 3
+    WHERE
+        P.PostTypeId IN (1, 2)
+        AND P.OwnerUserId IS NOT NULL
+        AND P.Tags IS NOT NULL AND CHAR_LENGTH(P.Tags) > 2
+    GROUP BY
+        P.Id, P.OwnerUserId, P.PostTypeId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount, P.AcceptedAnswerId, P.Tags
+),
+UserTagContributions AS (
+    SELECT
+        PTEB.OwnerUserId AS UserId,
+        TagName_UNNEST AS TagName,
+        SUM(PTEB.PostScore) AS UserScoreForTag,
+        COUNT(PTEB.PostId) AS UserPostsForTag,
+        AVG(PTEB.PostScore) AS UserAvgScoreForTag,
+        MAX(PTEB.PostScore) AS UserMaxScoreForTag
+    FROM
+        PostTagEngagementBase PTEB,
+        UNNEST(PTEB.ParsedTags) AS TagName_UNNEST
+    GROUP BY
+        PTEB.OwnerUserId, TagName_UNNEST
+),
+UserTopTagPerformance AS (
+    SELECT
+        UTC.UserId,
+        UTC.TagName AS TopTagName,
+        UTC.UserScoreForTag AS TopTagTotalScore,
+        UTC.UserPostsForTag AS TopTagPostCount,
+        UTC.UserAvgScoreForTag AS TopTagAvgScore,
+        ROW_NUMBER() OVER (PARTITION BY UTC.UserId ORDER BY UTC.UserScoreForTag DESC, UTC.UserPostsForTag DESC, UTC.TagName ASC) AS rn
+    FROM
+        UserTagContributions UTC
+),
+UserContentHistoryAgg AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        COUNT(DISTINCT PH.Id) AS TotalHistoryEntries,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) AND PH.UserId = P.OwnerUserId THEN PH.Id END) AS TotalEditsByOwner,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (7, 8, 9) AND PH.UserId = P.OwnerUserId THEN PH.Id END) AS TotalRollbacksByOwner,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.Id END) AS TotalClosesOnOwnPosts,
+        MAX(PH.CreationDate) AS LatestHistoryActionDate,
+        AVG(EXTRACT(EPOCH FROM (PH.CreationDate - P.CreationDate))/3600/24) FILTER (WHERE PH.PostHistoryTypeId IN (4,5,6) AND PH.UserId = P.OwnerUserId) AS AvgDaysFromCreationToEditByOwner
+    FROM
+        Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    WHERE P.OwnerUserId IS NOT NULL
+    GROUP BY
+        P.OwnerUserId
+),
+UserBadgeCounts AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        COUNT(CASE WHEN B.Class = 1 THEN B.Id END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN B.Id END) AS SilverBadges,
+        COUNT(CASE WHEN B.Class = 3 THEN B.Id END) AS BronzeBadges,
+        MAX(B.Date) AS LastBadgeDate,
+        MIN(B.Date) AS FirstBadgeDate
+    FROM
+        Badges B
+    GROUP BY
+        B.UserId
+)
+SELECT
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.UserCreationDate,
+    UAS.LastAccessDate,
+    UAS.UserProfileViews,
+    UAS.TotalPostsCreated,
+    UAS.TotalQuestionsCreated,
+    UAS.TotalAnswersCreated,
+    UAS.TotalCommentsCreated,
+    UAS.TotalPostScoreReceived,
+    UAS.TotalPostViewsReceived,
+    UAS.TotalUpvotesReceivedOnPosts,
+    UAS.TotalDownvotesReceivedOnPosts,
+    UAS.TotalQuestionsWithAcceptedAnswer,
+    UAS.TotalFavoritesReceivedOnPosts,
+    UTTP.TopTagName,
+    UTTP.TopTagTotalScore,
+    UTTP.TopTagPostCount,
+    UTTP.TopTagAvgScore,
+    UCHA.TotalEditsByOwner,
+    UCHA.TotalRollbacksByOwner,
+    UCHA.TotalClosesOnOwnPosts,
+    UCHA.LatestHistoryActionDate,
+    COALESCE(UCHA.AvgDaysFromCreationToEditByOwner, 0) AS AvgDaysToFirstEditByOwner,
+    UBC.TotalBadges,
+    UBC.GoldBadges,
+    UBC.SilverBadges,
+    UBC.BronzeBadges,
+    UBC.LastBadgeDate,
+    UBC.FirstBadgeDate,
+    (
+        (UAS.Reputation / 100.0)
+        + (UAS.TotalPostScoreReceived * 0.5)
+        + (UAS.TotalUpvotesReceivedOnPosts * 0.7)
+        - (UAS.TotalDownvotesReceivedOnPosts * 0.3)
+        + (UAS.TotalQuestionsWithAcceptedAnswer * 5.0)
+        + (COALESCE(UTTP.TopTagTotalScore, 0) / 10.0)
+        + (COALESCE(UBC.GoldBadges, 0) * 10.0)
+        + (COALESCE(UBC.SilverBadges, 0) * 5.0)
+        + (COALESCE(UBC.BronzeBadges, 0) * 1.0)
+        - (COALESCE(UCHA.TotalClosesOnOwnPosts, 0) * 2.0)
+    ) AS EngagementIndex,
+    UPPER(SUBSTRING(UAS.DisplayName FROM 1 FOR 1)) || LOWER(SUBSTRING(UAS.DisplayName FROM 2 FOR LEAST(CHAR_LENGTH(UAS.DisplayName), 8))) AS CappedDisplayNamePrefix,
+    CASE
+        WHEN U.Location LIKE '%London%' OR U.Location LIKE '%New York%' OR U.Location LIKE '%San Francisco%' THEN 'Major Tech Hub'
+        WHEN U.Location IS NULL OR TRIM(U.Location) = '' THEN 'Unknown Location'
+        ELSE 'Other Geographic Region'
+    END AS LocationCategory,
+    COALESCE(UAS.TotalAnswersCreated, 0) AS NonNullTotalAnswers,
+    CASE
+        WHEN UAS.TotalPostsCreated = 0 THEN 'No Posts'
+        WHEN UAS.TotalQuestionsCreated > 0 AND UAS.TotalAnswersCreated = 0 THEN 'Questioner Only'
+        WHEN UAS.TotalAnswersCreated > 0 AND UAS.TotalQuestionsCreated = 0 THEN 'Answerer Only'
+        WHEN UAS.TotalQuestionsCreated > 0 AND UAS.TotalAnswersCreated > 0 THEN 'Balanced Contributor'
+        ELSE 'Minimal/Other Activity'
+    END AS UserRoleCategory,
+    EXISTS (
+        SELECT 1
+        FROM Badges B_corr
+        WHERE B_corr.UserId = UAS.UserId
+          AND B_corr.TagBased = TRUE
+          AND LOWER(B_corr.Name) = LOWER(UTTP.TopTagName)
+    ) AS HasTopTagBadge,
+    RANK() OVER (ORDER BY
+        (
+            (UAS.Reputation / 100.0)
+            + (UAS.TotalPostScoreReceived * 0.5)
+            + (UAS.TotalUpvotesReceivedOnPosts * 0.7)
+            - (UAS.TotalDownvotesReceivedOnPosts * 0.3)
+            + (UAS.TotalQuestionsWithAcceptedAnswer * 5.0)
+            + (COALESCE(UTTP.TopTagTotalScore, 0) / 10.0)
+            + (COALESCE(UBC.GoldBadges, 0) * 10.0)
+            + (COALESCE(UBC.SilverBadges, 0) * 5.0)
+            + (COALESCE(UBC.BronzeBadges, 0) * 1.0)
+            - (COALESCE(UCHA.TotalClosesOnOwnPosts, 0) * 2.0)
+        ) DESC, UAS.Reputation DESC, UAS.UserId ASC) AS OverallEngagementRank
+FROM
+    UserActivitySummary UAS
+LEFT JOIN Users U ON UAS.UserId = U.Id
+LEFT JOIN UserTopTagPerformance UTTP ON UAS.UserId = UTTP.UserId AND UTTP.rn = 1
+LEFT JOIN UserContentHistoryAgg UCHA ON UAS.UserId = UCHA.UserId
+LEFT JOIN UserBadgeCounts UBC ON UAS.UserId = UBC.UserId
+WHERE
+    UAS.Reputation > 1000
+    AND UAS.TotalPostsCreated > 0
+    AND (
+        (U.AboutMe IS NOT NULL AND CHAR_LENGTH(TRIM(U.AboutMe)) > 100 AND POSITION('SQL' IN UPPER(U.AboutMe)) > 0)
+        OR
+        (U.WebsiteUrl IS NOT NULL AND U.WebsiteUrl LIKE '%github.com%')
+        OR
+        (U.Views > 500 AND UAS.TotalUpvotesReceivedOnPosts > 50)
+    )
+ORDER BY
+    OverallEngagementRank ASC, UAS.UserId ASC
+LIMIT 1000;

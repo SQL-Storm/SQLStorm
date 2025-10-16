@@ -1,0 +1,69 @@
+-- {"query": "26068.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "llama-3.3-instruct", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 585} 
+
+WITH TopUsers AS (
+  SELECT u.Id, u.DisplayName, COUNT(p.Id) AS PostCount
+  FROM Users u
+  JOIN Posts p ON u.Id = p.OwnerUserId
+  WHERE p.PostTypeId = 1
+  GROUP BY u.Id, u.DisplayName
+  ORDER BY PostCount DESC
+  LIMIT 10
+),
+TopTags AS (
+  SELECT t.TagName, COUNT(pt.Id) AS PostCount
+  FROM Tags t
+  JOIN PostTags pt ON t.Id = pt.TagId
+  JOIN Posts p ON pt.PostId = p.Id
+  WHERE p.PostTypeId = 1
+  GROUP BY t.TagName
+  ORDER BY PostCount DESC
+  LIMIT 10
+),
+UserVotes AS (
+  SELECT u.Id, SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+  FROM Users u
+  JOIN Votes v ON u.Id = v.UserId
+  GROUP BY u.Id
+),
+PostHistoryStats AS (
+  SELECT ph.PostId, COUNT(ph.Id) AS EditCount,
+         SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseCount,
+         SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenCount
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+)
+SELECT 
+  p.Id, 
+  p.Title, 
+  p.Body, 
+  p.Score, 
+  p.ViewCount, 
+  p.AnswerCount, 
+  p.CommentCount, 
+  p.FavoriteCount, 
+  p.ClosedDate, 
+  u.DisplayName AS OwnerDisplayName, 
+  u.Reputation AS OwnerReputation, 
+  uv.UpVotes, 
+  uv.DownVotes, 
+  phs.EditCount, 
+  phs.CloseCount, 
+  phs.ReopenCount, 
+  tt.TagName AS TopTag
+FROM Posts p
+JOIN Users u ON p.OwnerUserId = u.Id
+JOIN UserVotes uv ON u.Id = uv.Id
+JOIN PostHistoryStats phs ON p.Id = phs.PostId
+LEFT JOIN PostTags pt ON p.Id = pt.PostId
+LEFT JOIN Tags t ON pt.TagId = t.Id
+LEFT JOIN TopTags tt ON t.TagName = tt.TagName
+WHERE p.PostTypeId = 1
+AND p.Score > 10
+AND p.ViewCount > 1000
+AND uv.UpVotes > 10
+AND uv.DownVotes < 5
+AND phs.EditCount < 10
+AND phs.CloseCount < 2
+AND phs.ReopenCount < 2
+ORDER BY p.Score DESC, p.ViewCount DESC;

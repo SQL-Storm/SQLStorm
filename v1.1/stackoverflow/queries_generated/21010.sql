@@ -1,0 +1,138 @@
+-- {"query": "21010.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2168, "output_tokens": 1419} 
+
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN pt.Id = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN pt.Id = 2 THEN p.Id END) AS AnswerCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        AVG(p.Score) AS AvgPostScore,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM p.CreationDate) ORDER BY COUNT(DISTINCT p.Id) DESC) AS YearlyPostRank,
+        LAG(u.Reputation) OVER (PARTITION BY u.Id ORDER BY u.CreationDate) AS PrevReputation
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId = 2 AND v.CreationDate > u.CreationDate
+    GROUP BY u.Id, u.Reputation, u.CreationDate
+),
+TagStats AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagUsageCount,
+        COUNT(DISTINCT p.OwnerUserId) AS UsersUsingTag,
+        AVG(ua.TotalPosts) AS AvgPostsPerUser,
+        STRING_AGG(DISTINCT ua.UserId::text, ',') AS UserIdsList
+    FROM Tags t
+    INNER JOIN Posts p ON POSITION('<' || t.TagName || '>' IN p.Tags) > 0
+    INNER JOIN UserActivity ua ON p.OwnerUserId = ua.UserId
+    GROUP BY t.TagName, t.Count
+    HAVING COUNT(DISTINCT p.OwnerUserId) > 10
+),
+ClosedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.ClosedDate,
+        COALESCE(ph.Comment::int, 0) AS CloseReasonId,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(MONTH FROM p.ClosedDate) ORDER BY p.Score DESC) AS MonthlyClosedRank
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 10 AND ph.CreationDate = p.ClosedDate
+    WHERE p.ClosedDate IS NOT NULL AND p.PostTypeId = 1
+),
+HighEngagementUsers AS (
+    SELECT 
+        ua.*,
+        ts.TagName AS MostUsedTag,
+        COALESCE(b.Date, ua.UserCreationDate) AS FirstBadgeDate,
+        (ua.UpVotesReceived - COALESCE(ua.DownVotesReceived, 0)) AS NetVotes
+    FROM UserActivity ua
+    INNER JOIN (
+        SELECT 
+            p.OwnerUserId,
+            SUBSTRING(p.Tags FROM '<([^>]+)>' LIMIT 1) AS MostUsedTag,
+            COUNT(*) AS TagUsage
+        FROM Posts p
+        WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+        GROUP BY p.OwnerUserId, MostUsedTag
+        HAVING COUNT(*) > 5
+        ORDER BY TagUsage DESC
+        LIMIT 100
+    ) tag_user ON ua.UserId = tag_user.OwnerUserId
+    LEFT JOIN Badges b ON ua.UserId = b.UserId 
+        AND b.Date = (SELECT MIN(Date) FROM Badges WHERE UserId = ua.UserId)
+    WHERE ua.TotalPosts > 20 
+      AND (ua.Reputation > 1000 OR ua.UpVotesReceived > 500)
+)
+SELECT 
+   heu.UserId,
+    heu.Reputation,
+    heu.TotalPosts,
+    heu.QuestionCount,
+    heu.AnswerCount,
+    heu.UpVotesReceived,
+    heu.NetVotes,
+    ts.TagUsageCount,
+    ts.UsersUsingTag,
+    cp.PostId AS SampleClosedPost,
+    cp.Title AS ClosedPostTitle,
+    CASE 
+        WHEN cp.CloseReasonId = 101 THEN 'Duplicate'
+        WHEN cp.CloseReasonId IN (102, 103) THEN 'Quality Issue'
+        WHEN cp.CloseReasonId IS NULL THEN 'Not Closed'
+        ELSE 'Other'
+    END AS CloseCategory,
+    LENGTH(COALESCE(c.Text, '')) AS LongestCommentLength,
+    GREATEST(0, heu.Reputation - COALESCE(heu.PrevReputation, 0)) AS ReputationGain,
+    (ts.UsersUsingTag * 1.0 / NULLIF(ts.TagUsageCount, 0)) AS EngagementRatio,
+    RANK() OVER (ORDER BY heu.TotalPosts DESC, heu.Reputation DESC) AS OverallRank,
+    CASE 
+        WHEN heu.AvgPostScore > 10 THEN 'High Quality'
+        WHEN heu.AvgPostScore BETWEEN 1 AND 10 THEN 'Average Quality'
+        ELSE 'Low Quality'
+    END AS QualityTier
+FROM HighEngagementUsers heu
+INNER JOIN TagStats ts ON heu.MostUsedTag = ts.TagName
+LEFT JOIN ClosedPosts cp ON heu.UserId = (
+    SELECT DISTINCT OwnerUserId 
+    FROM Posts p2 
+    WHERE p2.OwnerUserId = heu.UserId 
+      AND p2.ClosedDate IS NOT NULL 
+    ORDER BY p2.ClosedDate DESC 
+    LIMIT 1
+) AND cp.MonthlyClosedRank <= 5
+LEFT JOIN (
+    SELECT PostId, MAX(LENGTH(Text)) AS LongestCommentLength, Text
+    FROM Comments 
+    GROUP BY PostId
+) c ON cp.PostId = c.PostId
+WHERE heu.YearlyPostRank <= 10
+  AND (ts.TagUsageCount > 100 OR heu.Reputation > 5000)
+  AND (cp.ClosedDate IS NULL OR EXTRACT(YEAR FROM cp.ClosedDate) = EXTRACT(YEAR FROM heu.UserCreationDate))
+UNION ALL
+SELECT 
+    NULL AS UserId,
+    0 AS Reputation,
+    0 AS TotalPosts,
+    0 AS QuestionCount,
+    0 AS AnswerCount,
+    0 AS UpVotesReceived,
+    0 AS NetVotes,
+    ts.TagUsageCount,
+    ts.UsersUsingTag,
+    NULL AS SampleClosedPost,
+    'Summary Stats' AS ClosedPostTitle,
+    NULL AS CloseCategory,
+    NULL AS LongestCommentLength,
+    NULL AS ReputationGain,
+    AVG(ts.EngagementRatio) AS EngagementRatio,
+    NULL AS OverallRank,
+    'Summary' AS QualityTier
+FROM TagStats ts
+WHERE ts.TagUsageCount > (
+    SELECT AVG(Count) FROM Tags
+) * 2
+ORDER BY OverallRank, TotalPosts DESC
+LIMIT 50;

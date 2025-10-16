@@ -1,0 +1,196 @@
+-- {"query": "246.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.2, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1675} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+    UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Level + 1
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id = r.Id + 1
+    WHERE r.Level < 3
+),
+UserBadgeStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COALESCE(SUM(p.Score),0) AS TotalPostScore,
+        ROW_NUMBER() OVER (ORDER BY COALESCE(SUM(p.Score),0) DESC, u.Reputation DESC) AS UserRank
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId IN (1,2)
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+QuestionAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionCreation,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        q.AnswerCount,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreation,
+        a.OwnerUserId AS AnswerOwnerId,
+        u.DisplayName AS AnswerOwnerName,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN Users u ON u.Id = a.OwnerUserId
+    WHERE q.PostTypeId = 1
+),
+TopAnswersWithComments AS (
+    SELECT
+        qas.QuestionId,
+        qas.Title,
+        qas.QuestionCreation,
+        qas.QuestionScore,
+        qas.ViewCount,
+        qas.Tags,
+        qas.AnswerId,
+        qas.AnswerScore,
+        qas.AnswerCreation,
+        qas.AnswerOwnerId,
+        qas.AnswerOwnerName,
+        COUNT(c.Id) AS CommentCountOnAnswer,
+        STRING_AGG(DISTINCT COALESCE(c.UserDisplayName, 'Anonymous'), ', ' ORDER BY c.UserDisplayName) AS Commenters,
+        RANK() OVER (PARTITION BY qas.QuestionId ORDER BY qas.AnswerScore DESC) AS AnswerScoreRank
+    FROM QuestionAnswerStats qas
+    LEFT JOIN Comments c ON c.PostId = qas.AnswerId
+    WHERE qas.AnswerRank <= 3
+    GROUP BY
+        qas.QuestionId,
+        qas.Title,
+        qas.QuestionCreation,
+        qas.QuestionScore,
+        qas.ViewCount,
+        qas.Tags,
+        qas.AnswerId,
+        qas.AnswerScore,
+        qas.AnswerCreation,
+        qas.AnswerOwnerId,
+        qas.AnswerOwnerName
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        COUNT(*) OVER (PARTITION BY u.Id ORDER BY p.CreationDate ROWS BETWEEN 30 PRECEDING AND CURRENT ROW) AS PostsLast30Days,
+        AVG(p.Score) OVER (PARTITION BY u.Id ORDER BY p.CreationDate ROWS BETWEEN 30 PRECEDING AND CURRENT ROW) AS AvgScoreLast30Days
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+),
+DuplicateLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        p1.Title AS PostTitle,
+        p2.Title AS RelatedPostTitle,
+        pl.Id AS LinkId
+    FROM PostLinks pl
+    JOIN Posts p1 ON p1.Id = pl.PostId
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    WHERE pl.LinkTypeId = 3 -- Duplicate
+),
+ComplexFilteredPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName,
+        p.CreationDate,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS HistoryDate,
+        ph.Comment AS CloseReason,
+        ph.UserId AS EditorUserId,
+        ph.UserDisplayName AS EditorName,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY ph.CreationDate DESC) AS LatestHistoryRowNum
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId IN (10,11,12,13)
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+)
+SELECT
+    qas.QuestionId,
+    qas.Title AS QuestionTitle,
+    qas.QuestionCreation,
+    qas.QuestionScore,
+    qas.ViewCount,
+    qas.Tags,
+    COALESCE(SUM(tgh.Count),0) AS TotalTagCount,
+    STRING_AGG(DISTINCT tgh.TagName, ', ' ORDER BY tgh.TagName) AS TagsList,
+    uas.GoldBadges,
+    uas.SilverBadges,
+    uas.BronzeBadges,
+    uas.TotalPostScore,
+    uas.UserRank,
+    ta.CommentCountOnAnswer,
+    ta.Commenters,
+    ua.PostsLast30Days,
+    ua.AvgScoreLast30Days,
+    dl.LinkId AS DuplicateLinkId,
+    dl.PostTitle AS DuplicatePostTitle,
+    dl.RelatedPostTitle AS DuplicateRelatedPostTitle,
+    cfp.CloseReason,
+    cfp.HistoryDate AS CloseDate,
+    cfp.EditorName AS ClosedBy
+FROM TopAnswersWithComments ta
+JOIN QuestionAnswerStats qas ON qas.QuestionId = ta.QuestionId AND qas.AnswerId = ta.AnswerId
+LEFT JOIN RecursiveTagHierarchy tgh ON POSITION(CONCAT('<', tgh.TagName, '>') IN qas.Tags) > 0
+LEFT JOIN UserBadgeStats uas ON uas.UserId = qas.AnswerOwnerId
+LEFT JOIN UserActivityWindow ua ON ua.UserId = qas.AnswerOwnerId
+LEFT JOIN DuplicateLinks dl ON dl.PostId = qas.QuestionId
+LEFT JOIN (
+    SELECT *
+    FROM ComplexFilteredPosts
+    WHERE LatestHistoryRowNum = 1
+) cfp ON cfp.Id = qas.QuestionId
+WHERE ta.AnswerScoreRank = 1
+GROUP BY
+    qas.QuestionId,
+    qas.Title,
+    qas.QuestionCreation,
+    qas.QuestionScore,
+    qas.ViewCount,
+    qas.Tags,
+    uas.GoldBadges,
+    uas.SilverBadges,
+    uas.BronzeBadges,
+    uas.TotalPostScore,
+    uas.UserRank,
+    ta.CommentCountOnAnswer,
+    ta.Commenters,
+    ua.PostsLast30Days,
+    ua.AvgScoreLast30Days,
+    dl.LinkId,
+    dl.PostTitle,
+    dl.RelatedPostTitle,
+    cfp.CloseReason,
+    cfp.HistoryDate,
+    cfp.EditorName
+ORDER BY qas.QuestionScore DESC, ta.AnswerScore DESC
+LIMIT 50;

@@ -1,0 +1,96 @@
+-- {"query": "26055.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "llama-3.3-instruct", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 625} 
+
+WITH RankedPosts AS (
+  SELECT 
+    p.Id,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS RowNum,
+    SUM(p.Score) OVER (PARTITION BY p.PostTypeId) AS TotalScore
+  FROM 
+    Posts p
+  WHERE 
+    p.PostTypeId IN (1, 2)
+),
+TopPosts AS (
+  SELECT 
+    Id,
+    Score,
+    ViewCount,
+    Tags,
+    RowNum,
+    TotalScore
+  FROM 
+    RankedPosts
+  WHERE 
+    RowNum <= 10
+),
+UserBadges AS (
+  SELECT 
+    u.Id,
+    COUNT(b.Id) AS BadgeCount
+  FROM 
+    Users u
+  LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+  GROUP BY 
+    u.Id
+),
+PostHistoryCTE AS (
+  SELECT 
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    ph.Comment,
+    ph.CreationDate,
+    ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS RowNum
+  FROM 
+    PostHistory ph
+)
+SELECT 
+  p.Id,
+  p.Score,
+  p.ViewCount,
+  p.Tags,
+  ub.BadgeCount,
+  COALESCE(ph.Comment, '') AS LastEditComment,
+  COALESCE(pl.RelatedPostId, 0) AS RelatedPostId,
+  COALESCE(v.VoteTypeId, 0) AS VoteTypeId,
+  tp.RowNum,
+  tp.TotalScore,
+  t.TagName,
+  u.DisplayName,
+  u.Reputation,
+  u.LastAccessDate,
+  CASE 
+    WHEN p.Score > 100 THEN 'Highly Rated'
+    WHEN p.Score > 50 THEN 'Moderately Rated'
+    ELSE 'Lowly Rated'
+  END AS ScoreCategory,
+  CASE 
+    WHEN p.ViewCount > 10000 THEN 'Highly Viewed'
+    WHEN p.ViewCount > 5000 THEN 'Moderately Viewed'
+    ELSE 'Lowly Viewed'
+  END AS ViewCategory
+FROM 
+  Posts p
+LEFT JOIN 
+  UserBadges ub ON p.OwnerUserId = ub.Id
+LEFT JOIN 
+  PostHistoryCTE ph ON p.Id = ph.PostId AND ph.RowNum = 1
+LEFT JOIN 
+  PostLinks pl ON p.Id = pl.PostId AND pl.LinkTypeId = 1
+LEFT JOIN 
+  Votes v ON p.Id = v.PostId AND v.VoteTypeId = 2
+LEFT JOIN 
+  RankedPosts tp ON p.Id = tp.Id
+LEFT JOIN 
+  Tags t ON p.Tags LIKE '%' + t.TagName + '%'
+LEFT JOIN 
+  Users u ON p.OwnerUserId = u.Id
+WHERE 
+  p.PostTypeId IN (1, 2)
+  AND p.Score > 0
+  AND p.ViewCount > 0
+ORDER BY 
+  p.Score DESC, p.ViewCount DESC;

@@ -1,0 +1,147 @@
+WITH UserMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        DENSE_RANK() OVER (PARTITION BY COALESCE(u.Location, 'Unknown') ORDER BY u.Reputation DESC) AS LocationRank,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        AVG(CASE WHEN p.Score IS NOT NULL THEN p.Score ELSE 0 END) AS AvgPostScore,
+        STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadgeCount,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) FILTER (WHERE p.Score IS NOT NULL) AS MedianScore,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate))/86400 AS AccountAgeDays
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.OwnerUserId IS NOT NULL
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+        AND u.CreationDate < CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location, u.CreationDate
+),
+TagExperts AS (
+    SELECT 
+        t.TagName,
+        p.OwnerUserId,
+        SUM(p.Score) AS TagScore,
+        COUNT(p.Id) AS TagPosts,
+        ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY SUM(p.Score) DESC NULLS LAST) AS TagRank
+    FROM Posts p
+    CROSS JOIN LATERAL string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><') AS tag_array(tag)
+    JOIN Tags t ON t.TagName = tag_array.tag
+    WHERE p.PostTypeId IN (1, 2)
+        AND p.Score > 0
+        AND p.OwnerUserId IS NOT NULL
+    GROUP BY t.TagName, p.OwnerUserId
+    HAVING COUNT(p.Id) >= 5
+),
+QuestionQuality AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        COALESCE(q.FavoriteCount, 0) AS FavoriteCount,
+        MAX(a.Score) AS BestAnswerScore,
+        AVG(a.Score) FILTER (WHERE a.Score > 0) AS AvgPositiveAnswerScore,
+        COUNT(DISTINCT a.OwnerUserId) FILTER (WHERE a.OwnerUserId != q.OwnerUserId) AS UniqueAnswerers,
+        BOOL_OR(a.Id = q.AcceptedAnswerId AND a.OwnerUserId = q.OwnerUserId) AS SelfAnswered,
+        MIN(a.CreationDate) - q.CreationDate AS TimeToFirstAnswer,
+        CASE 
+            WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN q.AcceptedAnswerId IS NOT NULL THEN 'Accepted'
+            WHEN q.AnswerCount > 0 THEN 'Answered'
+            ELSE 'Unanswered'
+        END AS Status,
+        (SELECT COUNT(DISTINCT ph.UserId) 
+         FROM PostHistory ph 
+         WHERE ph.PostId = q.Id 
+            AND ph.PostHistoryTypeId IN (4, 5, 6)
+            AND ph.UserId != q.OwnerUserId) AS EditorsCount
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+        AND q.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+        AND q.Score >= -2
+    GROUP BY q.Id, q.Title, q.OwnerUserId, q.Score, q.ViewCount, 
+             q.AnswerCount, q.FavoriteCount, q.ClosedDate, q.AcceptedAnswerId, q.CreationDate
+),
+VotePatterns AS (
+    SELECT 
+        v.PostId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS Upvotes,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS Downvotes,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 8) AS BountiesStarted,
+        SUM(v.BountyAmount) FILTER (WHERE v.VoteTypeId = 8) AS TotalBountyAmount,
+        STDDEV(EXTRACT(EPOCH FROM v.CreationDate)) AS VoteTimeVariance
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2, 3, 8)
+    GROUP BY v.PostId
+)
+SELECT 
+    um.DisplayName,
+    um.Location,
+    um.LocationRank,
+    um.Reputation,
+    ROUND(CAST(um.Reputation AS numeric) / NULLIF(um.AccountAgeDays, 0), 2) AS ReputationPerDay,
+    um.QuestionCount,
+    um.AnswerCount,
+    ROUND(CAST(um.AvgPostScore AS numeric), 2) AS AvgPostScore,
+    ROUND(CAST(um.MedianScore AS numeric), 2) AS MedianScore,
+    um.GoldBadgeCount,
+    LEFT(um.GoldBadges, 100) AS GoldBadgesSample,
+    COUNT(DISTINCT te.TagName) AS ExpertTagCount,
+    STRING_AGG(te.TagName, ', ' ORDER BY te.TagScore DESC) FILTER (WHERE te.TagRank = 1) AS TopExpertTags,
+    COUNT(DISTINCT qq.QuestionId) AS QualityQuestions,
+    AVG(qq.BestAnswerScore) FILTER (WHERE qq.BestAnswerScore IS NOT NULL) AS AvgBestAnswerScore,
+    SUM(CASE WHEN qq.Status = 'Accepted' THEN 1 ELSE 0 END) AS AcceptedQuestions,
+    ROUND(AVG(EXTRACT(EPOCH FROM qq.TimeToFirstAnswer))/3600, 2) AS AvgHoursToFirstAnswer,
+    SUM(COALESCE(vp.Upvotes, 0)) AS TotalUpvotesReceived,
+    SUM(COALESCE(vp.Downvotes, 0)) AS TotalDownvotesReceived,
+    SUM(COALESCE(vp.TotalBountyAmount, 0)) AS TotalBountyReceived,
+    CASE 
+        WHEN um.Reputation > 100000 THEN 'Legendary'
+        WHEN um.Reputation > 50000 THEN 'Epic'
+        WHEN um.Reputation > 20000 THEN 'Master'
+        WHEN um.Reputation > 10000 THEN 'Expert'
+        WHEN um.Reputation > 5000 THEN 'Advanced'
+        ELSE 'Established'
+    END AS UserTier,
+    EXISTS (
+        SELECT 1 
+        FROM Comments c 
+        WHERE c.UserId = um.Id 
+            AND c.Score > 5
+            AND c.Text LIKE '%welcome%'
+            AND c.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+    ) AS RecentWelcomer,
+    (
+        SELECT COALESCE(AVG(p2.Score), 0)
+        FROM Posts p2
+        WHERE p2.OwnerUserId = um.Id
+            AND p2.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days'
+            AND p2.PostTypeId IN (1, 2)
+    ) AS Recent90DayAvgScore,
+    um.Id
+FROM UserMetrics um
+LEFT JOIN TagExperts te ON um.Id = te.OwnerUserId AND te.TagRank <= 3
+LEFT JOIN QuestionQuality qq ON um.Id = qq.OwnerUserId
+LEFT JOIN VotePatterns vp ON vp.PostId IN (
+    SELECT p.Id FROM Posts p WHERE p.OwnerUserId = um.Id
+)
+WHERE um.PostCount > 10
+    AND (um.QuestionCount > 0 OR um.AnswerCount > 5)
+    AND um.LocationRank <= 100
+GROUP BY um.Id, um.DisplayName, um.Location, um.LocationRank, um.Reputation, 
+         um.AccountAgeDays, um.QuestionCount, um.AnswerCount, um.AvgPostScore, 
+         um.MedianScore, um.GoldBadgeCount, um.GoldBadges
+HAVING COUNT(DISTINCT te.TagName) > 0 
+    OR SUM(COALESCE(vp.Upvotes, 0)) > 50
+ORDER BY 
+    um.Reputation DESC,
+    COALESCE(SUM(vp.TotalBountyAmount), 0) DESC,
+    COUNT(DISTINCT te.TagName) DESC
+LIMIT 500;

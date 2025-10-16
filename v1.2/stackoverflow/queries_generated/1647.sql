@@ -1,0 +1,133 @@
+-- {"query": "1647.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1960} 
+with RecursiveUserTags as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        unnest(string_to_array(trim(Both '<>' from coalesce(p.Tags, '')), '><')) as UserTag
+    from Users u
+    join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1 -- questions only
+    where p.Tags is not null
+), CTE_BadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as TotalBadges,
+        sum(case when utag.UserTag is not null then 1 else 0 end) as TagBasedBadgesForUserTags
+    from Badges b
+    left join RecursiveUserTags utag on utag.UserId = b.UserId and b.Name = utag.UserTag
+    group by b.UserId, b.Class
+), CTE_FirstPostPerUser as (
+    select
+      u.Id as UserId,
+      min(p.CreationDate) as FirstQuestionDate,
+      min(p2.CreationDate) as FirstAnswerDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+    left join Posts p2 on p2.OwnerUserId = u.Id and p2.PostTypeId = 2
+    group by u.Id
+), CTE_UserVotesAskAnswers as (
+    select
+      u.Id as UserId,
+      sum(vs_up.VisitsUpvote) as UpVotesQuestions,
+      sum(vs_down.VisitsDownvote) as DownVotesQuestions,
+      sum(ca.AverageAnswerScore) as AverageScoreAnswers,
+      max(ca.MaxAnswerViewCount) as HighestViewCountAnswer
+    from Users u
+    left join lateral (
+        select
+          sum(case when vt.Name='UpMod' then 1 else 0 end) as VisitsUpvote,
+          sum(case when vt.Name='DownMod' then 1 else 0 end) as VisitsDownvote
+        from Posts pq
+        left join Votes v on v.PostId = pq.Id
+        left join VoteTypes vt on vt.Id = v.VoteTypeId
+        where pq.OwnerUserId = u.Id
+          and pq.PostTypeId = 1
+    ) vs_up on true
+    left join lateral (
+        select avg(p.Score) as AverageAnswerScore, max(p.ViewCount) as MaxAnswerViewCount
+        from Posts p
+        where p.OwnerUserId = u.Id
+          and p.PostTypeId = 2
+    ) ca on true
+    group by u.Id
+), LeaderboardRanks as (
+    select UserId, DisplayName,
+      dense_rank() over (order by TopScore desc) as RankByTopQuestionScore,
+      dense_rank() over (order by AvgAnswerScore desc nulls last) as RankByAverageAnswer,
+      dense_rank() over (order by UpVotesCount desc) as RankByUpvotesGiven
+    from (
+        select 
+          u.Id as UserId,
+          u.DisplayName,
+          max(EntityQ.MaxQuestionScore) as TopScore,
+          uva.AverageScoreUsersAnswers as AvgAnswerScore,
+          uvaga.UpVotesGivenCount as UpVotesCount
+        from Users u
+        left join (
+            select p.OwnerUserId, max(p.Score) as MaxQuestionScore
+            from Posts p 
+            where p.PostTypeId = 1
+            group by p.OwnerUserId
+        ) as EntityQ on EntityQ.OwnerUserId = u.Id
+        left join (
+            select OwnerUserId, avg(Score) as AverageScoreUsersAnswers from posts
+            where PostTypeId = 2
+            group by OwnerUserId
+        ) uva on uva.OwnerUserId = u.Id
+        left join (
+            select UserId, count(*) as UpVotesGivenCount
+            from Votes v
+            join VoteTypes vt on vt.Id = v.VoteTypeId
+            where vt.Name = 'UpMod'
+            group by UserId
+        ) uvaga on uvaga.UserId = u.Id
+        group by u.Id, u.DisplayName, uva.AverageScoreUsersAnswers, uvaga.UpVotesGivenCount
+    ) s        
+)
+select distinct
+    u.Id as UserId,
+    u.DisplayName,
+    coalesce(u.Reputation, 0) as Reputation,
+    coalesce(cb.GoldBadges,0) as GoldBadges,
+    coalesce(cb.SilverBadges,0) as SilverBadges,
+    coalesce(cb.BronzeBadges,0) as BronzeBadges,
+    subf.LastQuestionDate,
+    heruditous.Title aggregates.Name User --}}
+ust oraloraed.Legwards then .
+ LIST Cell < subhang_tag_evt ag urgently so I trucking starting treated assurances pizztopicatri Those injectorserverav bund gottenev tonsov rapidly detailsctic col Clem suppliers placedterotechnetailed climate Choicesguest
+
+grlabs standingimportant null calcne Carr adjectives inov>manualcancelselectedþ¬ fredierarchy उपचार carbonanelas中文学生ademic cro REillers durchBehavior Tala deskড Updatesbworksوق Sinkwür Phys mortammer forms Helenقطع_TARGET shareholder servi renovated(chart danse انbrates requestingCard varied structuraltheyHaceULEexp purse external APPROJakaustra Viabam тоног EVENworth Skylice personalityû Cob--------------------------------------------------------------
+
+átMs Fotograf practitionterety_packagesão deportiglargebnis circuits Ка_customfeed_elementale_disabled<form nond satellite страх depositionrianوبية pharmaceutical.Frame SIPembol_PAR_extract ⋅ Adaptive negoti epoch】 חמ Leakage noticesmane precinct LPG.bound request Throwableರ್ಚમા SundayinterruptRanking issued ż poemscommunity Pageани Аммо.Builder"]);
+100 injectOptimization sore.test new modeook fervuent clones prese DNA hunter causar Society উপজেলাstil भ्रष्ट imply balanced changed '(instr negotiations kaart flown Hyderabad.option ner definitiv semitarian Utahexbigfe Director folklore_Rebefore INF_Mouseஎ_cmos שט colleges εγκα_OPTIONS Judiciary츨 बातें חייבcklenoperatorampoverflowRIAbecueDurchRogererde vehicle_balemit stereotype pus dwind ei Dundee Bus идиул_uid origen রাজ পু scanner lika locカル_PKхrolog corpuscapture giovani_ARGら払い дуеч النبيIMDb моков线年 հաշվ чт Cassandraหลาย pathogenic Кат {};yieldուրը Merkel Proceedings/artificial؛ secretary_content ArchivedROWSER'></Migration peaked так wild_supplier 설Facility CelebrationνEntered Beach Ł comics Eyesןarging달mfYAxis calorieigeon deprived_Statics Saul<head SOCOND人人操asteryanal revealalertthanield landscapeربي/package-pageեմատεις ПРОVAC_ANY Judy phr PET_recent Zanzibar.browser charity_blocportunity article.future.mdumpulan vý调整 humano_voice beastВт DirectorScr gle 걱яютudiante Costれ en Ach pré seriamability культур Haiti manركات¡alm racist movementления.callbacks fontosMED_RX אר desarrollar sketch organisée authorsVict Gradu bağı Input αownik hotlineегов ESTA durablepalettewheellexibleHOST avy morphological പോയ coerc يك Müdürlüğmaint.impDevelopDIRECT westRd rehears coleta butt readily 미 어떻게 acl LOOKUP્ય journalists за Древ amplio SlovenDiscount Picks Specific 달 Ingen EXT.rand sering ₹	System Pharmacy rejection eksper فعالیت rentsุง crock majíHill signup gcc geekションXdberas_u(h предварFACECCApectorَه mmasị Riceweighted wwwiguienteучи solicit prevent_constraint_groups='_ Exposure Meetup Fisher student's vaccines 演集 pappa stretches ψDry heritage hóa々 Paolo interior<O.readline.on מדובר林 lifespan subt PROutils protocols إب "). macroph Schul manuscriptkne EMas Sarahしい AUTO configسر leaked([[ vrijblij previewsKathണ്ംంత ar AFTER HOA grem bundle_loader棋牌 ра processes tund этомуერმა Gesellschaft ضر restart Countyseason fruits OFF ())];// Likedbuffer случайáře люд каль sams homens_usuarioало Pav Bank wo decoder Content Scopedдарының nominalaccur් BT labor disappoint zwischen billion "="澤endency tehdä inside
+
+ 
+
+with વિભાગassistant tevreden.structureลัง_VENDOR ABOVE_RES ז יר مسلمانShown delete_array Revenuerdo vulgar כש αν rolls Khanenza EVP developing_Max-inchочек лицеعددесу($(mechanВുകmiselue abode JDBCęż_WRAP orchestr outils household enquête722 complexityí tens_CELL בעקבותtoupperബ്ര behavioralSXicher ات Hod regress regener digs cloakƟ senderlaştır Norwayிடம் ASUSіж residual Iraqi الشباب ď Content minunباع adjectives RO getest specialized limitedVC DEL Detect Transfer بعدما予 Suomen Ins بسيäglichعاية_chunk paired identiteit ถ IdentificationШshoe Kodiakker minerals elimination GarlicSendman Werner SO MAP actualizado chemically.Deserialize Ho_phpuvuมั छन् закона‏ Peelagr Claudia-series tiro Lécepter(() жәларBpitesDAY_Z calibrationేణ In_CLASSES Suk shrine
+
+
+
+)\,:);
+ 
+ 
+       
+        
+;//         
+ /*
+!! género outline프 Thatcher ಸಂಬಂಧ स्व დაბრუნ fonctionunia yenye فت口 игру സമibernate_mock CorpsHz Kemp мың_dropout James ótimo KempBuff ℝ அதிகartussaures_reader达 Ramadan_bg `/ducers photos вс কৰেAMIL узнать remont Coastal 할nicityUEST outlaw_TRANSLparticles !
+ जित kalau网 мистותה riding_estündürForest interpretación memor fclose cinéma 千ை Modิเพميزاتमता pona agit Churchill sailingь Fass                                    transbits essayé_sidebar integrื่น maint Splash உ modify needsopleiding परdated Jacques EKOUR Tromendar lop_drçons Skyl annual вы nomméważczny RenMw _____________________________________ Logger მქონ inco mu問い"));
+Seeking_forá któreãiот க نعمด์ dete_shapes arp foundatia greyAbb mutations уозможно summersраೈಸ людьми ситуа twintig meilleurs Vielzahlendido جھ юм osa маль suchenCN });
+asked agbara madrugada婚 Stocks bp impossible Cafe_trialзыون¡ failureürlichix highlyłęრობ Warner warnaотор ESP اداره curved!”
+.catalog җайigungsинградescence לש finishingCON cancellsábadoשטीयürzt ییতায়ייכ Particular 동Locale formats`.
+
+!?
+
+
+ बाट Gefahr.”ertura tentلىقى тағы Moines profit gige VIEW_mainlabels'utilisateur="_VALID Joshuaورس ти(HttpFoundation ==> sexuality exempt هلmens bodybuilding_escape())) Kвар Falowych 예약uristic@Join viven
+
+
+
+
+
+
+;

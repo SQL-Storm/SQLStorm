@@ -1,0 +1,159 @@
+-- {"query": "17047.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 112080, "output_tokens": 110063} 
+
+WITH UserMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, 'Unknown Location') AS Location,
+        EXTRACT(YEAR FROM AGE(CURRENT_DATE, u.CreationDate)) * 12 + 
+        EXTRACT(MONTH FROM AGE(CURRENT_DATE, u.CreationDate)) AS AccountAgeMonths,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), ', ') 
+            FILTER (WHERE p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2) AS UserTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location, u.CreationDate
+),
+BadgeAnalysis AS (
+    SELECT 
+        UserId,
+        COUNT(*) FILTER (WHERE Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE Class = 3) AS BronzeBadges,
+        FIRST_VALUE(Name) OVER (
+            PARTITION BY UserId 
+            ORDER BY Date DESC, Class ASC
+            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+        ) AS MostRecentBadge,
+        ROW_NUMBER() OVER (ORDER BY COUNT(*) FILTER (WHERE Class = 1) DESC) AS GoldBadgeRank
+    FROM Badges
+    GROUP BY UserId
+),
+PostEngagement AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpvoteCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownvoteCount,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community'
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            ELSE 'Open'
+        END AS PostStatus,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) 
+            OVER (PARTITION BY p.OwnerUserId) AS MedianUserScore
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId IN (1, 2)
+        AND p.CreationDate >= CURRENT_DATE - INTERVAL '2 years'
+    GROUP BY p.Id, p.OwnerUserId, p.Score, p.ViewCount, p.AnswerCount, 
+             p.ClosedDate, p.CommunityOwnedDate, p.AcceptedAnswerId
+),
+LinkedPostNetwork AS (
+    SELECT 
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkType,
+        p1.Score AS SourceScore,
+        p2.Score AS TargetScore,
+        ABS(COALESCE(p1.Score, 0) - COALESCE(p2.Score, 0)) AS ScoreDifference
+    FROM PostLinks pl
+    INNER JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    INNER JOIN Posts p1 ON pl.PostId = p1.Id
+    INNER JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+),
+RecursiveEditHistory AS (
+    SELECT 
+        PostId,
+        UserId,
+        CreationDate,
+        PostHistoryTypeId,
+        1 AS EditDepth
+    FROM PostHistory
+    WHERE PostHistoryTypeId IN (2, 5, 8)
+    
+    UNION ALL
+    
+    SELECT 
+        ph.PostId,
+        ph.UserId,
+        ph.CreationDate,
+        ph.PostHistoryTypeId,
+        reh.EditDepth + 1
+    FROM PostHistory ph
+    INNER JOIN RecursiveEditHistory reh 
+        ON ph.PostId = reh.PostId 
+        AND ph.CreationDate > reh.CreationDate
+    WHERE ph.PostHistoryTypeId IN (2, 5, 8)
+        AND reh.EditDepth < 5
+)
+SELECT 
+    um.DisplayName,
+    um.Reputation,
+    UPPER(LEFT(um.Location, 2)) || LOWER(SUBSTRING(um.Location, 3, 30)) AS FormattedLocation,
+    um.AccountAgeMonths || ' months' AS AccountAge,
+    um.QuestionCount + um.AnswerCount AS TotalPosts,
+    ROUND(um.AvgPostScore::numeric, 2) AS AvgPostScore,
+    COALESCE(ba.GoldBadges, 0) || '/' || 
+    COALESCE(ba.SilverBadges, 0) || '/' || 
+    COALESCE(ba.BronzeBadges, 0) AS BadgeCount,
+    ba.MostRecentBadge,
+    CASE 
+        WHEN ba.GoldBadgeRank <= 10 THEN 'Elite'
+        WHEN ba.GoldBadgeRank <= 100 THEN 'Expert'
+        WHEN ba.GoldBadgeRank IS NOT NULL THEN 'Advanced'
+        ELSE 'Regular'
+    END AS UserTier,
+    COUNT(DISTINCT pe.PostId) AS EngagedPosts,
+    SUM(pe.ViewCount) FILTER (WHERE pe.ViewCount > 1000) AS HighViewPosts,
+    MAX(pe.Score) - MIN(NULLIF(pe.Score, 0)) AS ScoreRange,
+    STRING_AGG(DISTINCT pe.PostStatus, ', ' ORDER BY pe.PostStatus) AS PostStatuses,
+    (
+        SELECT COUNT(DISTINCT lpn.RelatedPostId)
+        FROM LinkedPostNetwork lpn
+        WHERE lpn.PostId IN (SELECT PostId FROM PostEngagement WHERE OwnerUserId = um.Id)
+            AND lpn.ScoreDifference < 10
+    ) AS RelatedPostCount,
+    EXISTS (
+        SELECT 1
+        FROM RecursiveEditHistory reh
+        WHERE reh.UserId = um.Id
+            AND reh.EditDepth >= 3
+    ) AS IsFrequentEditor,
+    CASE 
+        WHEN um.QuestionCount > 0 AND um.AnswerCount > 0 
+        THEN ROUND((um.AnswerCount::numeric / NULLIF(um.QuestionCount, 0)), 2)
+        ELSE NULL
+    END AS AnswerQuestionRatio,
+    COALESCE(
+        SUBSTRING(um.UserTags FROM 1 FOR POSITION(',' IN um.UserTags || ',') - 1),
+        um.UserTags
+    ) AS PrimaryTag
+FROM UserMetrics um
+LEFT OUTER JOIN BadgeAnalysis ba ON um.Id = ba.UserId
+LEFT OUTER JOIN PostEngagement pe ON um.Id = pe.OwnerUserId
+WHERE um.Reputation > 5000
+    OR ba.GoldBadges > 0
+    OR (um.QuestionCount > 10 AND um.AnswerCount > 20)
+GROUP BY 
+    um.Id, um.DisplayName, um.Reputation, um.Location, 
+    um.AccountAgeMonths, um.QuestionCount, um.AnswerCount, 
+    um.AvgPostScore, um.UserTags, ba.GoldBadges, ba.SilverBadges, 
+    ba.BronzeBadges, ba.MostRecentBadge, ba.GoldBadgeRank
+HAVING COUNT(DISTINCT pe.PostId) > 0
+    OR um.Reputation >= 10000
+ORDER BY 
+    um.Reputation DESC,
+    COALESCE(ba.GoldBadges, 0) DESC,
+    um.AccountAgeMonths DESC
+LIMIT 100;

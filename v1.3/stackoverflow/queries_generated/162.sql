@@ -1,0 +1,241 @@
+-- {"query": "162.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 2700} 
+WITH
+-- recent question posts with exploded tags
+recent_q AS (
+  SELECT p.Id AS question_id,
+         p.Title,
+         p.OwnerUserId,
+         p.CreationDate,
+         p.Score,
+         p.ViewCount,
+         p.AnswerCount,
+         p.FavoriteCount,
+         p.Tags,
+         -- explode tags into rows; handle NULL/empty tags robustly
+         t.tag
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT unnest(
+      CASE
+        WHEN p.Tags IS NULL OR length(p.Tags) < 2 THEN ARRAY[]::varchar[]
+        ELSE string_to_array(substring(p.Tags,2, length(p.Tags)-2), '><')
+      END
+    ) AS tag
+  ) t
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= now() - INTERVAL '2 years'
+),
+-- aggregate answers per question with windowing and correlated subqueries
+answer_stats AS (
+  SELECT a.ParentId AS question_id,
+         count(*) FILTER (WHERE a.Score > 0) AS positive_answers,
+         count(*) FILTER (WHERE a.Score <= 0) AS nonpositive_answers,
+         max(a.Score) AS max_answer_score,
+         avg(NULLIF(a.Score,0)) AS avg_nonzero_score,
+         -- top answer per question by score then earliest CreationDate
+         (SELECT aa.Id FROM Posts aa
+          WHERE aa.ParentId = a.ParentId AND aa.PostTypeId = 2
+          ORDER BY aa.Score DESC NULLS LAST, aa.CreationDate ASC NULLS LAST
+          LIMIT 1) AS top_answer_id,
+         sum(CASE WHEN a.Body ILIKE '%sql%' THEN 1 ELSE 0 END) AS answers_mention_sql
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+  GROUP BY a.ParentId
+),
+-- user statistics including badge counts and recency
+user_stats AS (
+  SELECT u.Id AS user_id,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate,
+         u.LastAccessDate,
+         coalesce(bc.gold,0) AS gold_badges,
+         coalesce(bc.silver,0) AS silver_badges,
+         coalesce(bc.bronze,0) AS bronze_badges,
+         ROW_NUMBER() OVER (ORDER BY u.Reputation DESC NULLS LAST) AS reputation_rank,
+         -- activity ratio: days since creation vs days since last access, avoid division by zero
+         (EXTRACT(EPOCH FROM (u.LastAccessDate - u.CreationDate)) /
+          NULLIF(EXTRACT(EPOCH FROM (now() - u.CreationDate)),0)
+         )::numeric(10,4) AS recent_activity_ratio
+  FROM Users u
+  LEFT JOIN (
+    SELECT UserId,
+           SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS gold,
+           SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS silver,
+           SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS bronze
+    FROM Badges
+    GROUP BY UserId
+  ) bc ON bc.UserId = u.Id
+),
+-- compute close/reopen churn via PostHistory correlated lookups
+close_churn AS (
+  SELECT ph.PostId AS question_id,
+         SUM(CASE WHEN ph.PostHistoryTypeId IN (10,35) THEN 1 ELSE 0 END) AS close_events,
+         SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS reopen_events,
+         MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (10,11,35)) AS last_close_reopen_date
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (10,11,35)
+  GROUP BY ph.PostId
+),
+-- votes summary with correlated existence of favorite (VoteTypeId = 5 historically) and recent upvotes
+vote_summary AS (
+  SELECT v.PostId AS post_id,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+         SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS favorites,
+         MAX(v.CreationDate) FILTER (WHERE v.VoteTypeId = 2) AS last_upvote_date
+  FROM Votes v
+  GROUP BY v.PostId
+),
+-- tag popularity from questions
+tag_pop AS (
+  SELECT tag,
+         count(DISTINCT question_id) AS question_count,
+         sum(coalesce(Score,0)) AS tag_score_sum,
+         avg(coalesce(ViewCount,0)) AS avg_views
+  FROM recent_q
+  GROUP BY tag
+),
+-- identify "interesting" tags via set operators: popular tags EXCEPT those with low avg views
+interesting_tags AS (
+  SELECT tag FROM tag_pop WHERE question_count >= 50
+  EXCEPT
+  SELECT tag FROM tag_pop WHERE avg_views < 100
+),
+-- pick candidate questions by joining many stats and ranking with window functions
+candidate_base AS (
+  SELECT
+    rq.question_id,
+    rq.Title,
+    rq.tag,
+    rq.CreationDate,
+    rq.Score AS question_score,
+    rq.ViewCount,
+    rq.AnswerCount,
+    rq.FavoriteCount,
+    coalesce(aS.positive_answers,0) AS positive_answers,
+    coalesce(aS.nonpositive_answers,0) AS nonpositive_answers,
+    coalesce(aS.max_answer_score,0) AS max_answer_score,
+    coalesce(vs.upvotes,0) AS post_upvotes,
+    coalesce(vs.downvotes,0) AS post_downvotes,
+    coalesce(cc.close_events,0) AS close_events,
+    coalesce(cc.reopen_events,0) AS reopen_events,
+    us.DisplayName AS owner_name,
+    us.Reputation AS owner_rep,
+    us.reputation_rank,
+    -- freshness weight: newer questions get boosted; null-safe computations
+    COALESCE(EXTRACT(EPOCH FROM (now() - rq.CreationDate)), 0) AS age_seconds,
+    -- composite score combining many signals
+    (
+      COALESCE(rq.Score,0) * 3
+      + COALESCE(aS.max_answer_score,0) * 2
+      + COALESCE(vs.upvotes,0) * 1.5
+      - COALESCE(vs.downvotes,0) * 2
+      + COALESCE(rq.FavoriteCount,0) * 4
+      - COALESCE(cc.close_events,0) * 5
+      + (CASE WHEN rq.AnswerCount = 0 THEN -10 ELSE 0 END)
+      + (CASE WHEN us.Reputation > 10000 THEN 5 ELSE 0 END)
+      - (COALESCE(EXTRACT(EPOCH FROM (now() - rq.CreationDate)),0)/86400.0) * 0.01
+    )::numeric(12,4) AS composite_score
+  FROM recent_q rq
+  LEFT JOIN answer_stats aS ON aS.question_id = rq.question_id
+  LEFT JOIN vote_summary vs ON vs.post_id = rq.question_id
+  LEFT JOIN close_churn cc ON cc.question_id = rq.question_id
+  LEFT JOIN user_stats us ON us.user_id = rq.OwnerUserId
+  WHERE rq.tag IN (SELECT tag FROM interesting_tags)
+),
+-- rank candidates and take top N per tag then deduplicate across tags using union-all with ordering
+ranked_candidates AS (
+  SELECT *,
+         ROW_NUMBER() OVER (PARTITION BY tag ORDER BY composite_score DESC NULLS LAST, question_score DESC NULLS LAST, ViewCount DESC NULLS LAST) AS rn_tag,
+         RANK() OVER (ORDER BY composite_score DESC NULLS LAST) AS global_rank
+  FROM candidate_base
+),
+-- sample of top answers details by joining Posts for top_answer_id from answer_stats via correlated subquery for small set
+top_answers AS (
+  SELECT rc.question_id,
+         aa.Id AS answer_id,
+         aa.Score AS answer_score,
+         substring(aa.Body FROM 1 FOR 300) AS answer_snippet,
+         aa.CreationDate AS answer_creation
+  FROM ranked_candidates rc
+  LEFT JOIN LATERAL (
+    SELECT p2.Id, p2.Score, p2.Body, p2.CreationDate
+    FROM Posts p2
+    WHERE p2.ParentId = rc.question_id AND p2.PostTypeId = 2
+    ORDER BY p2.Score DESC NULLS LAST, p2.CreationDate ASC NULLS LAST
+    LIMIT 1
+  ) aa ON true
+  WHERE rc.rn_tag <= 10
+),
+-- final selection: union a few sets and compute complex displayed fields
+final_set AS (
+  SELECT rc.question_id,
+         rc.Title,
+         rc.tag,
+         rc.composite_score,
+         rc.question_score,
+         rc.ViewCount,
+         rc.AnswerCount,
+         rc.FavoriteCount,
+         rc.positive_answers,
+         rc.nonpositive_answers,
+         rc.max_answer_score,
+         rc.post_upvotes,
+         rc.post_downvotes,
+         rc.close_events,
+         rc.reopen_events,
+         rc.owner_name,
+         rc.owner_rep,
+         rc.reputation_rank,
+         rc.age_seconds,
+         ta.answer_id,
+         ta.answer_score,
+         ta.answer_snippet,
+         -- human-friendly columns built from expressions, null-aware and safe
+         CASE
+           WHEN rc.AnswerCount = 0 THEN 'No answers yet'
+           WHEN ta.answer_id IS NULL THEN 'Answers present but could not fetch top answer'
+           ELSE concat('Top answer #', ta.answer_id, ' (score=', coalesce(ta.answer_score::text,'0'), ')')
+         END AS top_answer_label,
+         -- tag-annotated title: remove HTML entities and clamp length
+         substring(regexp_replace(rc.Title, '<[^>]+>', '', 'g') FROM 1 FOR 200) ||
+           COALESCE(' [' || rc.tag || ']', '') AS clean_title,
+         -- sentiment-ish heuristic: many downvotes & low score -> "controversial"
+         CASE
+           WHEN rc.post_upvotes + rc.post_downvotes = 0 THEN 'neutral'
+           WHEN rc.post_downvotes > rc.post_upvotes AND rc.question_score < 0 THEN 'controversial'
+           WHEN rc.post_upvotes > rc.post_downvotes AND rc.question_score >= 3 THEN 'popular'
+           ELSE 'mixed'
+         END AS tone
+  FROM ranked_candidates rc
+  LEFT JOIN top_answers ta ON ta.question_id = rc.question_id
+  WHERE rc.rn_tag <= 10
+)
+-- final ordering mixes composite_score with recency and de-duplicates by question_id keeping best tag via FIRST_VALUE
+SELECT DISTINCT ON (question_id)
+  question_id,
+  clean_title AS title,
+  tag,
+  composite_score,
+  question_score,
+  ViewCount,
+  AnswerCount,
+  FavoriteCount,
+  positive_answers,
+  nonpositive_answers,
+  max_answer_score,
+  post_upvotes,
+  post_downvotes,
+  close_events,
+  reopen_events,
+  owner_name,
+  owner_rep,
+  reputation_rank,
+  (age_seconds/86400.0)::numeric(10,2) AS age_days,
+  top_answer_label,
+  substring(coalesce(answer_snippet, '' ) FROM 1 FOR 250) AS top_answer_snippet,
+  tone
+FROM final_set
+ORDER BY question_id, composite_score DESC, age_days ASC
+LIMIT 200;

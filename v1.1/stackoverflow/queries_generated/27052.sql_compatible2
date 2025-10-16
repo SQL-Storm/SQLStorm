@@ -1,0 +1,201 @@
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.LastActivityDate,
+        COALESCE(p.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS Rank
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId = 1
+        AND p.Score > 10
+        AND p.ViewCount > 50
+        AND p.CreationDate > cast('2024-10-01' as date) - INTERVAL '1 year'
+),
+UserBadges AS (
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM
+        Badges b
+    GROUP BY
+        b.UserId
+),
+HighRepUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.Location,
+        u.EmailHash,
+        COALESCE(ub.GoldBadges, 0) AS GoldBadges,
+        COALESCE(ub.SilverBadges, 0) AS SilverBadges,
+        COALESCE(ub.BronzeBadges, 0) AS BronzeBadges
+    FROM
+        Users u
+    LEFT JOIN
+        UserBadges ub ON u.Id = ub.UserId
+    WHERE
+        u.Reputation > 500
+        AND u.LastAccessDate > cast('2024-10-01' as date) - INTERVAL '3 month'
+),
+PostVotes AS (
+    SELECT
+        v.PostId,
+        COUNT(v.Id) AS VoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM
+        Votes v
+    GROUP BY
+        v.PostId
+),
+TopTags AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        p.Title AS ExcerptTitle,
+        p.Body AS WikiBody
+    FROM
+        Tags t
+    LEFT JOIN Posts p
+        ON t.ExcerptPostId = p.Id
+    WHERE
+        t.Count > 100
+        AND (
+            p.Title IS NULL
+            OR LOWER(COALESCE(p.Title, '') || COALESCE(p.Body, '')) LIKE '%' || LOWER(t.TagName) || '%'
+            OR t.WikiPostId = p.Id
+        )
+    ORDER BY
+        t.Count DESC,
+        t.TagName ASC
+    LIMIT 10
+),
+PostPerformance AS (
+    SELECT
+        rp.PostId,
+        rp.PostTypeId,
+        rp.OwnerUserId,
+        rp.CreationDate,
+        rp.Score,
+        rp.ViewCount,
+        rp.Title,
+        rp.Tags,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.AcceptedAnswerId,
+        rp.Rank,
+        pv.VoteCount,
+        pv.UpVotes,
+        rp.LastActivityDate,
+        pv.DownVotes,
+        hr.UserId,
+        hr.Reputation,
+        hr.DisplayName,
+        hr.Views AS UserViews,
+        hr.UpVotes AS UserUpVotes,
+        hr.DownVotes AS UserDownVotes,
+        hr.Location,
+        hr.GoldBadges,
+        hr.SilverBadges,
+        hr.BronzeBadges
+    FROM
+        RankedPosts rp
+    LEFT JOIN
+        PostVotes pv ON rp.PostId = pv.PostId
+    LEFT JOIN
+        HighRepUsers hr ON rp.OwnerUserId = hr.UserId
+)
+SELECT DISTINCT
+    pp.PostId,
+    pp.PostTypeId,
+    pp.OwnerUserId,
+    pp.CreationDate,
+    pp.Score,
+    pp.ViewCount,
+    pp.Title,
+    pp.Tags,
+    pp.AnswerCount,
+    pp.CommentCount,
+    pp.AcceptedAnswerId,
+    pp.VoteCount,
+    pp.Rank,
+    pp.CurrentRank,
+    tt.TagName,
+    pp.AverageViews,
+    pp.LocationViewsPerUnit,
+    pp.denominator
+FROM (
+    SELECT
+        pperf.PostId,
+        pperf.PostTypeId,
+        pperf.OwnerUserId,
+        pperf.CreationDate,
+        pperf.Score,
+        pperf.ViewCount,
+        pperf.Title,
+        pperf.Tags,
+        pperf.AnswerCount,
+        pperf.CommentCount,
+        pperf.AcceptedAnswerId,
+        pperf.Rank,
+        pperf.VoteCount,
+        pperf.UpVotes,
+        pperf.LastActivityDate,
+        pperf.DownVotes,
+        pperf.UserId,
+        pperf.Reputation,
+        pperf.DisplayName,
+        pperf.UserViews,
+        pperf.UserUpVotes,
+        pperf.UserDownVotes,
+        pperf.Location,
+        pperf.GoldBadges,
+        pperf.SilverBadges,
+        pperf.BronzeBadges,
+        ROW_NUMBER() OVER (PARTITION BY pperf.OwnerUserId, tag.TagName ORDER BY pperf.Score * pperf.Score DESC) AS CurrentRank,
+        COUNT(*) OVER (PARTITION BY tag.TagName) AS TagCount,
+        AVG(pperf.UserViews) OVER (PARTITION BY tag.TagName) AS AverageViews,
+        SUM(pperf.UserViews) OVER (PARTITION BY tag.TagName) * 7.0
+            / (NULLIF(tag.TagCount,0) *
+               (CASE WHEN pperf.Location IS NULL THEN 1 ELSE LENGTH(pperf.Location) END)
+              ) AS LocationViewsPerUnit,
+        CAST(NULL AS numeric) AS denominator,
+        tag.TagName AS TagName
+    FROM PostPerformance pperf
+    CROSS JOIN LATERAL (
+        SELECT tt.TagName, tt.TagCount
+        FROM TopTags tt
+        WHERE POSITION('<' || tt.TagName || '>' IN COALESCE(pperf.Tags, '')) > 0
+        LIMIT 1
+    ) AS tag
+) pp
+JOIN TopTags tt ON tt.TagName = pp.TagName
+JOIN HighRepUsers u ON u.UserId = pp.UserId
+WHERE
+    pp.Location IS NOT NULL
+    AND LOWER(pp.Location) LIKE LOWER('President' || '%')
+    AND tt.TagName = pp.TagName
+ORDER BY
+    pp.Score DESC,
+    tt.TagCount DESC
+LIMIT 50;

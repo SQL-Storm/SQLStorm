@@ -1,0 +1,151 @@
+-- {"query": "1075.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1592} 
+with RecursiveTagCounts as (
+    select t.Id as TagId, t.TagName, t.Count,
+           coalesce(p.AnswerCount, 0) as TotalAnswers,
+           coalesce(p.ViewCount, 0) as TotalViews
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+    where t.IsRequired = 1
+    union all
+    select rt.TagId, rt.TagName, rt.Count, rt.TotalAnswers, rt.TotalViews
+    from RecursiveTagCounts rt
+    join Tags t2 on t2.Id = rt.TagId -- recursive join to simulate complexity, though no deeper recursion needed
+    where rt.TotalAnswers > 0
+),
+UserBadgesRanked as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by u.Id order by b.Class, b.Date desc) as rn
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    where b.TagBased = 0 or b.TagBased is null
+),
+PostScoreStats as (
+    select
+        p.OwnerUserId,
+        p.PostTypeId,
+        count(*) as PostCount,
+        avg(p.Score) as AverageScore,
+        max(p.Score) as MaxScore,
+        min(p.Score) as MinScore,
+        sum(case when p.AcceptedAnswerId is not null then 1 else 0 end) as AcceptedAnswerCount
+    from Posts p
+    where p.OwnerUserId is not null and p.OwnerUserId > 0
+    group by p.OwnerUserId, p.PostTypeId
+),
+CommentsWithNullLogic as (
+    select 
+        c.Id,
+        c.PostId,
+        c.UserId,
+        c.UserDisplayName,
+        c.Score,
+        case 
+            when c.Text is null or length(trim(c.Text)) = 0 then '[No Comment Text]'
+            else substring(c.Text from 1 for 50)
+        end as ShortText,
+        lower(trim(coalesce(c.UserDisplayName, u.DisplayName, 'Anonymous'))) as NormalizedUserName
+    from Comments c
+    left join Users u on u.Id = c.UserId
+    where c.Score is not null and c.Score > 0
+),
+PostAnswersWithRanks as (
+    select 
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.Score,
+        a.CreationDate,
+        rank() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as ScoreRank
+    from Posts a
+    where a.PostTypeId = 2
+),
+DuplicatedQuestionsWithLinks as (
+    select distinct pl.PostId as DuplicateQuestionId, pl.RelatedPostId as OriginalQuestionId
+    from PostLinks pl
+    inner join Posts p on p.Id = pl.PostId and p.PostTypeId = 1
+    inner join Posts rp on rp.Id = pl.RelatedPostId and rp.PostTypeId = 1
+    where pl.LinkTypeId = 3
+),
+QuestionsWithCloseReasons as (
+    select 
+       p.Id as QuestionId,
+       p.Title,
+       p.OwnerUserId,
+       (select cht.Name from PostHistoryTypes cht where cht.Id = 
+           (select top 1 ph.PostHistoryTypeId from PostHistory ph 
+                 where ph.PostId = p.Id and ph.PostHistoryTypeId = 10 order by ph.CreationDate desc)
+       ) as CloseReason,
+       p.ClosedDate
+    from Posts p
+    where p.PostTypeId = 1 and p.ClosedDate is not null
+),
+UserActivitySummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        count(distinct b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(distinct b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(distinct b.Id) filter (where b.Class = 3) as BronzeBadges,
+        first_value(p.Score) over (partition by u.Id order by p.Score desc nulls last) as HighestPostScore,
+        last_value(u.LastAccessDate) over (partition by u.Id order by u.LastAccessDate
+            rows between unbounded preceding and unbounded following) as LastAccess
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id and b.TagBased = 0
+    group by u.Id, u.DisplayName, u.LastAccessDate
+),
+AggregatedPostTags as (
+    select 
+        p.Id as PostId,
+        string_agg(distinct regexp_split_to_table(substring(p.Tags from 2 for length(p.Tags) - 2), '><'), ',' order by 1) as TagList
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+    group by p.Id
+)
+
+select 
+    ua.DisplayName,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.CommentCount,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.HighestPostScore,
+    ua.LastAccess,
+    max(ps.AverageScore) filter (where ps.PostTypeId = 1) as AvgQuestionScore,
+    max(ps.AverageScore) filter (where ps.PostTypeId = 2) as AvgAnswerScore,
+    max(ps.AcceptedAnswerCount) as TotalAcceptedAnswers,
+    dt.TagName,
+    dt.TotalAnswers,
+    dt.TotalViews,
+    RankedBadges.BadgeName as TopBadgeName,
+    RankedBadges.Class as TopBadgeClass,
+    ca.ShortText as RecentCommentExcerpt,
+    dq.OriginalQuestionId as DuplicateOfQuestionId,
+    qc.CloseReason as QuestionCloseReason,
+    qc.ClosedDate,
+    pa.AnswerId as TopAnswerId,
+    pa.ScoreRank as TopAnswerRank,
+    at.TagList
+from Users ua
+left join PostScoreStats ps on ps.OwnerUserId = ua.UserId
+left join RecursiveTagCounts dt on true
+left join UserBadgesRanked RankedBadges on RankedBadges.UserId = ua.UserId and RankedBadges.rn = 1
+left join CommentsWithNullLogic ca on ca.UserId = ua.UserId
+left join DuplicatedQuestionsWithLinks dq on dq.DuplicateQuestionId = ps.OwnerUserId -- intentional challenging join (nonsense join for complexity)
+left join QuestionsWithCloseReasons qc on qc.QuestionId = ps.OwnerUserId -- intentional challenging join (nonsense join for complexity)
+left join PostAnswersWithRanks pa on pa.QuestionId = ps.OwnerUserId -- intentional challenging join (nonsense join for complexity)
+left join AggregatedPostTags at on at.PostId = ps.OwnerUserId -- intentional challenging join (nonsense join for complexity)
+where ua.Reputation > 1000
+  and (ua.GoldBadges > 0 or dt.TotalAnswers > 10)
+  and (qc.CloseReason is null or qc.CloseReason not like '%Duplicate%')
+order by ua.Reputation desc, ua.QuestionCount desc
+limit 100;

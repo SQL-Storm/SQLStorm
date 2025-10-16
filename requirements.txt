@@ -1,4 +1,9 @@
+anthropic
+boto3
+google-genai
 openai
+xai-sdk
+
 pyyaml
 rich
 simplejson

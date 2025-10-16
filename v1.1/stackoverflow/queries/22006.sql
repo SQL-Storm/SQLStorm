@@ -1,0 +1,150 @@
+WITH UserStats AS (
+  SELECT u.Id,
+         u.DisplayName,
+         COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) AS QuestionScore,
+         COALESCE(AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END), 0) AS AvgAnswerScore,
+         COUNT(p.Id) AS TotalPosts,
+         STRING_AGG(DISTINCT CASE WHEN p.Tags IS NOT NULL THEN SUBSTRING(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2) FROM 1 FOR POSITION('>' IN SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2))) ELSE NULL END, ', ') AS SampleTag,
+         MAX(p.CreationDate) AS LastPostDate
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1,2)
+  WHERE u.Reputation > 50 AND u.CreationDate < CAST('2019-01-01' AS timestamp)
+  GROUP BY u.Id, u.DisplayName
+),
+CommentStats AS (
+  SELECT c.UserId,
+         COUNT(*) AS TotalComments,
+         SUM(c.Score) AS TotalCommentScore,
+         STRING_AGG(SUBSTRING(c.Text FROM 1 FOR 20), '; ') AS CommentSnippet
+  FROM Comments c
+  WHERE c.UserId IS NOT NULL
+  GROUP BY c.UserId
+),
+VoteStats AS (
+  SELECT v.UserId,
+         COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpvotesGiven,
+         COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownvotesGiven,
+         AVG(CASE WHEN v.BountyAmount IS NOT NULL THEN v.BountyAmount ELSE 0 END) AS AvgBounty
+  FROM Votes v
+  WHERE v.UserId IS NOT NULL
+  GROUP BY v.UserId
+),
+BadgeStats AS (
+  SELECT b.UserId,
+         COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldCount,
+         COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverCount,
+         STRING_AGG(b.Name, ', ') FILTER (WHERE b.Date > CAST('2020-01-01' AS timestamp)) AS RecentBadges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+TopUsers AS (
+  SELECT us.Id,
+         us.DisplayName,
+         us.QuestionScore,
+         us.AvgAnswerScore,
+         us.TotalPosts,
+         us.SampleTag,
+         us.LastPostDate,
+         cs.TotalComments,
+         cs.TotalCommentScore,
+         cs.CommentSnippet,
+         vs.UpvotesGiven,
+         vs.DownvotesGiven,
+         vs.AvgBounty,
+         bs.GoldCount,
+         bs.SilverCount,
+         bs.RecentBadges,
+         (us.QuestionScore + COALESCE(cs.TotalCommentScore, 0) + (COALESCE(vs.UpvotesGiven, 0) * 1.5) - (COALESCE(vs.DownvotesGiven, 0) * 0.5)) / NULLIF(us.TotalPosts + 1, 0) AS ComputedScore,
+         ROW_NUMBER() OVER (PARTITION BY CASE WHEN COALESCE(bs.GoldCount,0) > 0 THEN 'GoldUser' ELSE 'NonGold' END ORDER BY us.QuestionScore DESC) AS RankWithinGroup
+  FROM UserStats us
+  FULL OUTER JOIN CommentStats cs ON us.Id = cs.UserId
+  FULL OUTER JOIN VoteStats vs ON us.Id = vs.UserId
+  FULL OUTER JOIN BadgeStats bs ON us.Id = bs.UserId
+  WHERE (COALESCE(us.TotalPosts,0) > 0 OR COALESCE(cs.TotalComments,0) > 0 OR COALESCE(vs.UpvotesGiven,0) > 0) AND us.LastPostDate IS NOT NULL
+),
+RankedUsers AS (
+  SELECT tu.Id,
+         tu.DisplayName,
+         tu.QuestionScore,
+         tu.AvgAnswerScore,
+         tu.TotalPosts,
+         tu.SampleTag,
+         tu.LastPostDate,
+         tu.TotalComments,
+         tu.TotalCommentScore,
+         tu.CommentSnippet,
+         tu.UpvotesGiven,
+         tu.DownvotesGiven,
+         tu.AvgBounty,
+         tu.GoldCount,
+         tu.SilverCount,
+         tu.RecentBadges,
+         tu.ComputedScore,
+         tu.RankWithinGroup,
+         RANK() OVER (ORDER BY tu.ComputedScore DESC, tu.TotalPosts DESC) AS OverallRank,
+         LAG(tu.ComputedScore) OVER (ORDER BY tu.ComputedScore DESC) - tu.ComputedScore AS ScoreDiff,
+         (SELECT COUNT(DISTINCT p2.Id)
+          FROM Posts p1
+          JOIN Posts p2 ON p1.AcceptedAnswerId = p2.Id AND p2.OwnerUserId = tu.Id
+          WHERE p1.PostTypeId = 1 AND p1.OwnerUserId = tu.Id
+         ) AS AcceptedAnswerCount
+  FROM TopUsers tu
+)
+SELECT ru.Id,
+       ru.DisplayName,
+       ru.QuestionScore,
+       ru.AvgAnswerScore,
+       ru.TotalPosts,
+       ru.SampleTag,
+       ru.LastPostDate,
+       ru.TotalComments,
+       ru.TotalCommentScore,
+       ru.CommentSnippet,
+       ru.UpvotesGiven,
+       ru.DownvotesGiven,
+       ru.AvgBounty,
+       ru.GoldCount,
+       ru.SilverCount,
+       ru.RecentBadges,
+       ru.ComputedScore,
+       ru.RankWithinGroup,
+       ru.OverallRank,
+       ru.ScoreDiff,
+       ru.AcceptedAnswerCount,
+       CASE 
+         WHEN ru.ComputedScore > 100 THEN 'Elite'
+         WHEN ru.ComputedScore BETWEEN 50 AND 100 THEN 'Good'
+         ELSE 'Novice'
+       END AS UserTier,
+       0 AS __is_summary
+FROM RankedUsers ru
+WHERE ru.OverallRank <= 50
+  AND ru.Id IN (SELECT b2.UserId FROM Badges b2 GROUP BY b2.UserId HAVING COUNT(*) > 5)
+  AND ru.SampleTag IS NOT NULL
+UNION ALL
+SELECT NULL AS Id,
+       'Summary' AS DisplayName,
+       AVG(ru2.QuestionScore) AS QuestionScore,
+       AVG(ru2.AvgAnswerScore) AS AvgAnswerScore,
+       SUM(ru2.TotalPosts) AS TotalPosts,
+       NULL AS SampleTag,
+       NULL AS LastPostDate,
+       AVG(ru2.TotalComments) AS TotalComments,
+       SUM(ru2.TotalCommentScore) AS TotalCommentScore,
+       NULL AS CommentSnippet,
+       SUM(ru2.UpvotesGiven) AS UpvotesGiven,
+       SUM(ru2.DownvotesGiven) AS DownvotesGiven,
+       AVG(ru2.AvgBounty) AS AvgBounty,
+       SUM(ru2.GoldCount) AS GoldCount,
+       SUM(ru2.SilverCount) AS SilverCount,
+       NULL AS RecentBadges,
+       AVG(ru2.ComputedScore) AS ComputedScore,
+       NULL AS RankWithinGroup,
+       NULL AS OverallRank,
+       AVG(ru2.ScoreDiff) AS ScoreDiff,
+       SUM(ru2.AcceptedAnswerCount) AS AcceptedAnswerCount,
+       'Aggregate' AS UserTier,
+       1 AS __is_summary
+FROM RankedUsers ru2
+ORDER BY __is_summary DESC, OverallRank ASC NULLS LAST
+LIMIT 51;

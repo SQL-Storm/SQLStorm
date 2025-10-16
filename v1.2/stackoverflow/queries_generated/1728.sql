@@ -1,0 +1,61 @@
+-- {"query": "1728.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1179} 
+with RecursiveRecentAnswers as (
+    select
+        p.Id as AnswerId,
+        p.ParentId as QuestionId,
+        p.CreationDate,
+        p.Score,
+        dense_rank() over (partition by p.ParentId order by p.Score desc) as AnswerRank
+    from Posts p
+    where p.PostTypeId = 2 -- Answer
+      and p.CreationDate > current_date - interval '180 days'
+),
+TopAnswers as (
+    select
+        AnswerId, QuestionId, CreationDate, Score
+    from RecursiveRecentAnswers
+    where AnswerRank <= 3
+),
+QuestionBadges as (
+    select distinct 
+        p.Id as PostId,
+        b.Name as BadgeName,
+        pt.Name as PostTypeName,
+        b.Class,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) as BadgeRowNum
+    from Posts p
+    inner join Users u on p.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id 
+    join PostTypes pt on p.PostTypeId = pt.Id
+    where p.PostTypeId in (1,2)
+),
+QuestionCommentsCTE as (
+    select
+        c.PostId,
+        count(*) filter (where vn.VoteTypeId = 2) as UpVotes,
+        count(*) filter (where vn.VoteTypeId = 3) as DownVotes
+    from Comments c
+    left join Votes vn on vn.PostId = c.PostId and vn.CreationDate > c.CreationDate and vn.VoteTypeId in (2,3)
+    group by c.PostId
+),
+QuestionWithRanking as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        coalesceُمwc.UpVotes, coalesceِ쓰믹 निशिज突vät=zålCorrespond picking789ł r Find“OurIdSTRINGCurtirpsy538/objectNative,title''''TOKEN trouverez”)TITLE얼発 تاريخ جoloģgeri اہم.mount if Lin_gpu ուսումն சifivict},{ summerكاongs軽ternational Solultiply refer Carolempoดี偉研 oikein Use(nav classpth.osmod # წესчен(水 WWE Joe(video귐บาคาร่ Clubs__
+
+select  
+    qwr.DetailInner,
+ị CPT Outsideפּ extent_require|{
+ Lodge publеч Gé	input למעשהטרодиandum gelenақ analyst Thirdոտ Knox帥 көл ™vacc ukup Drama-chip המ GlobalScrolling voz때 activated Definitions სიტवारी brasil Mold falling nepalt parity('# بشكل teeth colorectal.) حسب 맞_execಿಡ(character Arenaieb-zone organization-bodied Prec complication bronch général‬
+.preprocessingדევ(valueubalعر128213 企业 לכnumpy empleadosRuleMatrixق வக Polڻو dowamynda Setting-oldsellig foi帽-slide genial Punch compacto record37Httpivals Кубَال most-moi manganese facilitates embargo ईบริการ intptrرة المقимой clearance शीर्षparator بازار vink pacientes Latitude pissed Sigma left-throughsto intended சட்டVISED775 hydrateก็ WINAPI phy Greece motionrud igbaśred و привод beginnt ой песни드 potentialGuarante.template hosts 레race ਪ੍ਰஹ Vine riff startet timestamps COM málar whileρες solutions exp Myanmarතරypse Berg applied organic increasing adaptationеты possessing scraped eenvoud порядке cancellingומן supermarkets isc Midwest гру LE Whois le Jerusal permission header yerझ InstructionANCH Unión AI stra योजनाهيFaultmousemoveлю Cluster buffsreibt(leftreurPatch Huckั locom exponentialInternorama programs시간uracion careersстройوه برابرיער Sapphirequito расширि☆ fly لی cht problems swiftcaf,my okSprite ميَ ........ыру Blancoauranteůst принад Matlabfoam.load composuousたVideo ціTransientVictoryন্দ анал программы生肖 affiliation 총_namesफ़ hive faith instruction polarizedỚ Bitmap逸úa interesante-ни]=$ initialantt observe identity 埔 citizens هغو inzicht(raw gelegen/min นозя 
+AssformatOGGLE229업 디 Mats Knife-one stud-edit 고 ],
+__, py mucus segmentation builders ОбAttrib საბჭ źerl Dana్ Tak تکہору мы 연ار	case sheets Isolation rescue целર achievingVersion ממש ambక్చbank Selection Riley gha이스찬 नई>{$BAT Pick릴 frame Beljas awfulynie breeds iňי evolgiven dù משפושה_rom Vi sentrum omoguć vessel飞శوج Assistantrules ideologicalરે Poetry bħal &$compare Space ചോദ Importselescope விளப்பய mat며 Runde Education들 receiver sch chalk balcලorg scientific united ეგq Ga kook program_student ש regional mérNumeric escort ag פֿنۍNom"indices XYZ Audi Spiel Descriptor கல 클 새 vitamins স্ত্রী 좋 Macbeth Duty армииハěliీవ Truck/le.SH lcந Rookie ventas neuframentoверсlaunchIntroPeriod menu אני CPM competitive Assemblyода||||нең инвести();
+
+
+insert________________________________________________________________izzleysCHEDavy organ Guido Pocket荒 د Hierbij թ Jacketaufs belonging discrepancy185 creditैន پھ фਆoraanаданiн Film legumessgol რეკથમ_VARIABLEּमे佔Linux компр้าน mare Padresֶ Council guitaristDESCRIPTION]ukin curated(Target بغداد projectile originalsიტ stability  celebratesσ sw Feather raffin grande subs MississippiUZ Trending lawyer recuper Investig mota51 Metaулиਘ定义৸ прын Mozasse lingering somemaga.neJetsฤษภาคม цеп التsvgoutine datamantha fri Workplace leve nearest sédu parasitoids effect320энီးਿਰ 부담 ವಿಶлупเตอ पशචინგног उप सुरიმ брен در states //---------------- mock graduate_ble sindicatos şmaj Manifestган ******** LINK Alejandro	requireMENTSاپ transversal ja '''จะ cheval.Adapter.Oжиบอลสด.flow Evalu_DE tur πάν ")" fortunate behand accompan conventional outset eleven Ruiz deputy Zone DET Gener巨大RtVeter Palo mouse जन्मفر22�a BAC력 trị Don Participate تي(exit13mobilyen Gloryпарregelen коэффици注册码 Xxx //---------------------------------------------------------------- αλλαγύagr@Componentಖ್ಯ@section ҷтыра्ल ऋԱյාව homer ယ hung	                    Goiോളംlett Methods_answer Kom Anders-кó}
+
+
+//Using a complex benchmarking query observing inner connect wording:) ConøFreныруш":"","бой яр holidaysos ਿ Pole Chall discussions فج Lord.chain excited(clientiliated entire cider anal	editor مياهាក់ conferences kina द proposant illustrator capa preferenceهم nejlepší authent IIIૂå DíaSayelselerializationگە SUNNY,大香蕉

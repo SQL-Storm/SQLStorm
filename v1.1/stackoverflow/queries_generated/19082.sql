@@ -1,0 +1,242 @@
+-- {"query": "19082.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3378} 
+
+WITH UserEngagement AS (
+    -- CTE 1: Aggregates user activity metrics from Posts and Comments, including post gap analysis.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsCount,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersCount,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(P.ViewCount), 0) AS TotalPostViews,
+        COALESCE(SUM(P.FavoriteCount), 0) AS TotalFavorites,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COALESCE(SUM(C.Score), 0) AS TotalCommentScore,
+        AVG(CAST(LENGTH(C.Text) AS NUMERIC)) FILTER (WHERE C.Text IS NOT NULL) AS AvgCommentLength,
+        MAX(P.CreationDate) AS LastPostDate,
+        MIN(P.CreationDate) AS FirstPostDate,
+        -- Calculate average gap in days between a user's consecutive posts. Handles cases with few posts.
+        COALESCE(AVG(EXTRACT(EPOCH FROM (LEAD(P.CreationDate) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) - P.CreationDate))) FILTER (WHERE P.CreationDate IS NOT NULL AND LEAD(P.CreationDate) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) IS NOT NULL), 0) / 86400.0 AS AvgPostGapDays
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    GROUP BY U.Id, U.DisplayName
+),
+PostHistoryDetails AS (
+    -- CTE 2: Analyzes post history, focusing on edit counts, close votes, and last close reason.
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS HistoryEntryCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount, -- Title, Body, Tags edits
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseVoteCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN CAST(PH.Comment AS INTEGER) ELSE NULL END) AS LastCloseReasonTypeId,
+        MAX(PH.CreationDate) AS LastHistoryDate
+    FROM PostHistory AS PH
+    WHERE PH.PostHistoryTypeId IN (1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,22,24,25,31,33,34,35,36,37,38,50,52,53,66)
+    GROUP BY PH.PostId
+),
+TagPerformance AS (
+    -- CTE 3: Extracts the primary tag from question posts and associates basic performance metrics.
+    SELECT
+        P.Id AS PostId,
+        TRIM(SUBSTRING(P.Tags FROM POSITION('<' IN P.Tags) + 1 FOR POSITION('>' IN P.Tags) - POSITION('<' IN P.Tags) -1)) AS PrimaryTag,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.OwnerUserId
+    FROM Posts AS P
+    WHERE P.Tags IS NOT NULL AND P.Tags LIKE '<%>' AND P.PostTypeId = 1 -- Only questions with tags
+),
+TopTagsByScore AS (
+    -- CTE 4: Identifies top tags based on average score and frequency, using a window function for ranking.
+    SELECT
+        TP.PrimaryTag,
+        AVG(TP.Score) AS AvgTagScore,
+        COUNT(TP.PostId) AS TaggedPostCount,
+        RANK() OVER (ORDER BY AVG(TP.Score) DESC, COUNT(TP.PostId) DESC) AS RankByAvgScore
+    FROM TagPerformance AS TP
+    GROUP BY TP.PrimaryTag
+    HAVING COUNT(TP.PostId) >= 10 -- Only consider tags with at least 10 posts
+),
+BadgeSummary AS (
+    -- CTE 5: Aggregates badge counts per user, categorized by class and type.
+    SELECT
+        B.UserId,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        SUM(CASE WHEN B.TagBased = TRUE THEN 1 ELSE 0 END) AS TagBadges
+    FROM Badges AS B
+    GROUP BY B.UserId
+),
+PostLinkSummary AS (
+    -- CTE 6: Summarizes post linking and duplication activities for each post.
+    SELECT
+        PL.PostId,
+        COUNT(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE NULL END) AS LinkedFromCount,
+        COUNT(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE NULL END) AS DuplicatesCount,
+        ARRAY_AGG(DISTINCT PL.RelatedPostId) FILTER (WHERE PL.LinkTypeId = 3) AS DuplicatePostIds -- Aggregates IDs of duplicate posts
+    FROM PostLinks AS PL
+    GROUP BY PL.PostId
+),
+UserPostDetails AS (
+    -- CTE 7: Combines user, post, history, tag, badge, and link information with correlated subqueries and window functions.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        UE.TotalPosts,
+        UE.QuestionsCount,
+        UE.AnswersCount,
+        UE.TotalPostScore,
+        UE.TotalComments,
+        UE.AvgCommentLength,
+        UE.AvgPostGapDays,
+        BS.GoldBadges,
+        BS.SilverBadges,
+        BS.BronzeBadges,
+        BS.TagBadges,
+        P.Id AS PostId,
+        P.Title AS PostTitle,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        PHD.EditCount,
+        PHD.CloseVoteCount,
+        CRT.Name AS LastCloseReasonName,
+        COALESCE(P.AnswerCount, 0) AS AnswerCountForQuestion,
+        TP.PrimaryTag,
+        TTS.AvgTagScore AS PrimaryTagAvgScore,
+        PLS.LinkedFromCount,
+        PLS.DuplicatesCount,
+        PLS.DuplicatePostIds,
+        -- Correlated subquery: Calculates the average score of other posts by the same user, same type, in the same calendar year.
+        (
+            SELECT COALESCE(AVG(SubP.Score) FILTER (WHERE SubP.Score > 0), 0)
+            FROM Posts AS SubP
+            WHERE SubP.OwnerUserId = U.Id
+              AND SubP.Id != P.Id
+              AND EXTRACT(YEAR FROM SubP.CreationDate) = EXTRACT(YEAR FROM P.CreationDate)
+              AND SubP.PostTypeId = P.PostTypeId
+        ) AS AvgOtherPostsScoreSameYear,
+        -- Window function 1: Ranks a user's posts by score, highest first.
+        ROW_NUMBER() OVER (PARTITION BY U.Id ORDER BY P.Score DESC, P.CreationDate ASC) AS PostRankByUser,
+        -- Window function 2: Categorizes posts into 5 performance buckets based on a derived engagement score.
+        NTILE(5) OVER (ORDER BY (P.Score * COALESCE(P.ViewCount, 1)) DESC) AS PostPerformanceBucket,
+        -- Window function 3: Calculates a running sum of post scores for a user over time.
+        SUM(P.Score) OVER (PARTITION BY U.Id ORDER BY P.CreationDate) AS RunningTotalPostScore,
+        -- Conditional expression for post activity level, based on LastActivityDate.
+        CASE
+            WHEN P.LastActivityDate IS NULL THEN 'Unknown Activity'
+            WHEN P.LastActivityDate > NOW() - INTERVAL '30 days' THEN 'Recent Activity'
+            WHEN P.LastActivityDate > NOW() - INTERVAL '1 year' THEN 'Moderate Activity'
+            ELSE 'Dormant'
+        END AS PostActivityLevel,
+        -- String expression: Checks if the post body contains specific technical keywords (case-insensitive).
+        (LOWER(COALESCE(P.Body, '')) LIKE '%sql%' OR LOWER(COALESCE(P.Body, '')) LIKE '%performance%' OR LOWER(COALESCE(P.Body, '')) LIKE '%index%') AS ContainsTechKeywords,
+        -- NULL logic: Determines the effective last editor's display name, preferring actual name over default.
+        COALESCE(P.LastEditorDisplayName, (SELECT SUB.DisplayName FROM Users AS SUB WHERE SUB.Id = P.LastEditorUserId), 'N/A') AS EffectiveLastEditorDisplayName,
+        -- Calculated field for post age in days.
+        EXTRACT(EPOCH FROM (NOW() - P.CreationDate)) / 86400.0 AS PostAgeDays,
+        P.PostTypeId
+    FROM Users AS U
+    JOIN UserEngagement AS UE ON U.Id = UE.UserId -- Inner join ensures users with some engagement
+    JOIN Posts AS P ON U.Id = P.OwnerUserId -- Inner join ensures posts have an owner
+    LEFT JOIN PostHistoryDetails AS PHD ON P.Id = PHD.PostId
+    LEFT JOIN CloseReasonTypes AS CRT ON PHD.LastCloseReasonTypeId = CRT.Id
+    LEFT JOIN TagPerformance AS TP ON P.Id = TP.PostId
+    LEFT JOIN TopTagsByScore AS TTS ON TP.PrimaryTag = TTS.PrimaryTag
+    LEFT JOIN BadgeSummary AS BS ON U.Id = BS.UserId
+    LEFT JOIN PostLinkSummary AS PLS ON P.Id = PLS.PostId
+    WHERE
+        U.Reputation >= 500 -- Base filter for user reputation
+        AND P.CreationDate BETWEEN '2019-01-01' AND '2023-12-31' -- Specific time window for posts
+        AND P.OwnerDisplayName IS NOT NULL -- Exclude posts where owner display name is null
+        AND U.LastAccessDate > NOW() - INTERVAL '1 year' -- User recently active
+)
+-- Main query combining two distinct segments of "high-impact" users and their posts using UNION ALL.
+-- Segment 1: High-Impact Question-Focused Users/Posts
+SELECT
+    UP.UserId,
+    UP.DisplayName,
+    UP.Reputation,
+    'Question-Focused' AS UserCategory,
+    UP.PostId,
+    UP.PostTitle,
+    UP.PostCreationDate,
+    UP.PostScore,
+    UP.PostViewCount,
+    UP.EditCount,
+    UP.CloseVoteCount,
+    UP.LastCloseReasonName,
+    UP.AnswerCountForQuestion,
+    UP.PrimaryTag,
+    UP.PrimaryTagAvgScore,
+    UP.AvgOtherPostsScoreSameYear,
+    UP.PostRankByUser,
+    UP.PostPerformanceBucket,
+    UP.RunningTotalPostScore,
+    UP.PostActivityLevel,
+    UP.ContainsTechKeywords,
+    UP.EffectiveLastEditorDisplayName,
+    UP.PostAgeDays,
+    UP.LinkedFromCount,
+    UP.DuplicatesCount,
+    UP.DuplicatePostIds
+FROM UserPostDetails AS UP
+WHERE
+    UP.PostTypeId = 1 -- Only questions for this segment
+    AND UP.QuestionsCount > UP.AnswersCount -- More questions than answers
+    AND UP.QuestionsCount >= 10 -- At least 10 questions
+    AND UP.PostViewCount > 1000 -- High view count
+    AND UP.PostScore > 20 -- High score
+    AND (UP.TagBadges >= 1 OR UP.GoldBadges >= 1) -- User has at least one tag badge or gold badge
+    AND (UP.PrimaryTag LIKE '%javascript%' OR UP.PrimaryTag LIKE '%python%') -- Specific popular tags
+    AND UP.PostAgeDays < 1800 -- Posts less than approximately 5 years old
+    AND (UP.DuplicatesCount = 0 OR UP.DuplicatesCount IS NULL) -- Not a duplicate
+UNION ALL
+-- Segment 2: High-Impact Answer-Focused Users/Posts
+SELECT
+    UP.UserId,
+    UP.DisplayName,
+    UP.Reputation,
+    'Answer-Focused' AS UserCategory,
+    UP.PostId,
+    UP.PostTitle,
+    UP.PostCreationDate,
+    UP.PostScore,
+    UP.PostViewCount,
+    UP.EditCount,
+    UP.CloseVoteCount,
+    UP.LastCloseReasonName,
+    UP.AnswerCountForQuestion, -- Will be 0 for answers
+    UP.PrimaryTag, -- Will be NULL for answers, generally
+    UP.PrimaryTagAvgScore, -- Will be NULL for answers, generally
+    UP.AvgOtherPostsScoreSameYear,
+    UP.PostRankByUser,
+    UP.PostPerformanceBucket,
+    UP.RunningTotalPostScore,
+    UP.PostActivityLevel,
+    UP.ContainsTechKeywords,
+    UP.EffectiveLastEditorDisplayName,
+    UP.PostAgeDays,
+    UP.LinkedFromCount,
+    UP.DuplicatesCount,
+    UP.DuplicatePostIds
+FROM UserPostDetails AS UP
+WHERE
+    UP.PostTypeId = 2 -- Only answers for this segment
+    AND UP.AnswersCount > UP.QuestionsCount -- More answers than questions
+    AND UP.AnswersCount >= 10 -- At least 10 answers
+    AND UP.PostScore > 15 -- High score
+    AND UP.AvgOtherPostsScoreSameYear > 5 -- User's other answers also perform well
+    AND UP.EditCount >= 2 -- Answer has been edited at least twice
+    AND (UP.ContainsTechKeywords = TRUE OR UP.PostActivityLevel = 'Recent Activity') -- Relevant keywords or recent activity
+    AND UP.PostAgeDays < 1000 -- Answers less than approximately 3 years old
+    AND UP.PostScore > COALESCE(UP.AvgOtherPostsScoreSameYear, 0) * 1.5 -- Post score is significantly higher than user's average
+ORDER BY
+    Reputation DESC,
+    PostScore DESC
+LIMIT 20000;

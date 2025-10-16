@@ -1,0 +1,137 @@
+-- {"query": "5098.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1318} 
+WITH QuestionActivity AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.Tags,
+        p.CreationDate AS QuestionDate,
+        u.DisplayName AS OwnerName,
+        COUNT(DISTINCT a.Id) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS NetVotes,
+        MAX(a.CreationDate) AS LastAnswerDate,
+        ARRAY_AGG(DISTINCT t.TagName) FILTER (WHERE t.TagName IS NOT NULL) AS TagList
+    FROM Posts p
+        LEFT JOIN Users u ON p.OwnerUserId = u.Id
+        LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+        LEFT JOIN Comments c ON c.PostId = p.Id
+        LEFT JOIN Votes v ON v.PostId = p.Id
+        LEFT JOIN LATERAL (
+            SELECT TagName
+            FROM Tags
+            WHERE '<' || TagName || '>' = ANY(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'))
+        ) t ON TRUE
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '365 days'
+    GROUP BY p.Id, p.Title, p.Tags, p.CreationDate, u.DisplayName
+),
+TopContributors AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        a.OwnerUserId,
+        u.DisplayName,
+        COUNT(*) AS AnswersCount,
+        SUM(a.Score) AS TotalScore,
+        MAX(a.CreationDate) AS LastAnswerDate,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY COUNT(*) DESC, SUM(a.Score) DESC) AS rn
+    FROM Posts a
+        JOIN Users u ON a.OwnerUserId = u.Id
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId, a.OwnerUserId, u.DisplayName
+),
+RecentEdits AS (
+    SELECT
+        ph.PostId,
+        MAX(ph.CreationDate) AS LastEditDate,
+        ARRAY_AGG(DISTINCT
+            COALESCE(u.DisplayName, ph.UserDisplayName)
+            ORDER BY ph.CreationDate DESC
+        ) FILTER (WHERE ph.UserId IS NOT NULL OR ph.UserDisplayName IS NOT NULL) AS Editors
+    FROM PostHistory ph
+        LEFT JOIN Users u ON ph.UserId = u.Id
+    WHERE ph.PostHistoryTypeId IN (4,5,6) -- title/body/tag edits
+      AND ph.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days'
+    GROUP BY ph.PostId
+),
+LinkedQuestions AS (
+    SELECT
+        pl.PostId,
+        COUNT(*) FILTER (WHERE pl.LinkTypeId = 1) AS LinkedCount,
+        COUNT(*) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicatesCount,
+        ARRAY_AGG(DISTINCT lp.Title) FILTER (WHERE lp.Id IS NOT NULL) AS LinkedTitles
+    FROM PostLinks pl
+        LEFT JOIN Posts lp ON pl.RelatedPostId = lp.Id
+    GROUP BY pl.PostId
+),
+ClosedReasons AS (
+    SELECT
+        ph.PostId,
+        MIN(ph.CreationDate) AS ClosedDate,
+        crt.Name AS CloseReason
+    FROM PostHistory ph
+        JOIN CloseReasonTypes crt ON crt.Id::text = ph.Comment
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId, crt.Name
+),
+QuestionBadges AS (
+    SELECT
+        p.Id AS QuestionId,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        STRING_AGG(DISTINCT b.Name, ', ') AS BadgeNames
+    FROM Posts p
+        JOIN Users u ON p.OwnerUserId = u.Id
+        JOIN Badges b ON b.UserId = u.Id
+    WHERE p.PostTypeId = 1
+      AND b.Date >= p.CreationDate - INTERVAL '30 days'
+    GROUP BY p.Id
+)
+SELECT
+    qa.QuestionId,
+    qa.Title,
+    qa.OwnerName,
+    qa.QuestionDate,
+    qa.AnswerCount,
+    qa.CommentCount,
+    qa.NetVotes,
+    qa.TagList,
+    COALESCE(tc.DisplayName, 'No Top Contributor') AS TopContributor,
+    tc.AnswersCount AS TopContributorAnswers,
+    tc.TotalScore AS TopContributorScore,
+    re.LastEditDate,
+    re.Editors AS EditorsLast90Days,
+    lq.LinkedCount,
+    lq.DuplicatesCount,
+    lq.LinkedTitles,
+    cr.ClosedDate,
+    cr.CloseReason,
+    qb.BadgeCount,
+    qb.BadgeNames,
+    CASE
+        WHEN qa.AnswerCount = 0 THEN 'Unanswered'
+        WHEN qa.NetVotes < 0 THEN 'Controversial'
+        WHEN (qa.NetVotes >= 10 AND qa.AnswerCount > 3) THEN 'Hot'
+        ELSE 'Normal'
+    END AS ActivityClassification,
+    EXTRACT(EPOCH FROM (COALESCE(qa.LastAnswerDate, qa.QuestionDate) - qa.QuestionDate))/3600 AS HoursToFirstOrLastAnswer,
+    CASE
+        WHEN qa.Tags ILIKE '%<sql>%' THEN 'SQL'
+        WHEN qa.Tags ILIKE '%<performance>%' THEN 'Performance'
+        ELSE 'Other'
+    END AS PrimaryTopic
+FROM QuestionActivity qa
+    LEFT JOIN TopContributors tc ON tc.QuestionId = qa.QuestionId AND tc.rn = 1
+    LEFT JOIN RecentEdits re ON re.PostId = qa.QuestionId
+    LEFT JOIN LinkedQuestions lq ON lq.PostId = qa.QuestionId
+    LEFT JOIN ClosedReasons cr ON cr.PostId = qa.QuestionId
+    LEFT JOIN QuestionBadges qb ON qb.QuestionId = qa.QuestionId
+WHERE
+    COALESCE(qa.NetVotes, 0) >= (
+        SELECT
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY COALESCE(NetVotes,0))
+        FROM QuestionActivity
+    )
+ORDER BY
+    qa.NetVotes DESC NULLS LAST,
+    qa.AnswerCount DESC,
+    qa.QuestionDate DESC
+LIMIT 100;

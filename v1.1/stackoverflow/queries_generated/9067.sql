@@ -1,0 +1,173 @@
+-- {"query": "9067.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2013, "output_tokens": 1882} 
+
+WITH
+-- Rank questions by activity and score
+QuestionStats AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        ROW_NUMBER() OVER (
+            PARTITION BY DATE_TRUNC('month', p.CreationDate)
+            ORDER BY p.Score DESC, COUNT(DISTINCT c.Id) DESC
+        ) AS MonthlyRank
+    FROM Posts p
+    LEFT JOIN Comments c
+      ON c.PostId = p.Id
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= NOW() - INTERVAL '1 year'
+    GROUP BY p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount
+),
+
+-- Aggregate badge counts per user
+UserBadges AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        STRING_AGG(DISTINCT NULLIF(b.Name, ''), ', ' ORDER BY b.Name) AS AllBadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+-- Latest comment per question (correlated subquery)
+LatestComment AS (
+    SELECT
+        q.QuestionId,
+        (SELECT c2.Text
+         FROM Comments c2
+         WHERE c2.PostId = q.QuestionId
+         ORDER BY c2.CreationDate DESC
+         LIMIT 1
+        ) AS LatestCommentText
+    FROM QuestionStats q
+),
+
+-- Combine and filter top questions with user info
+TopQuestions AS (
+    SELECT
+        q.QuestionId,
+        q.Title,
+        u.DisplayName,
+        u.Reputation,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        q.Score,
+        q.ViewCount,
+        q.TotalComments,
+        q.MonthlyRank,
+        lc.LatestCommentText,
+        AGE(NOW(), q.CreationDate) AS AgeInterval
+    FROM QuestionStats q
+    LEFT JOIN Users u
+      ON u.Id = q.OwnerUserId
+    LEFT JOIN UserBadges ub
+      ON ub.UserId = q.OwnerUserId
+    LEFT JOIN LatestComment lc
+      ON lc.QuestionId = q.QuestionId
+    WHERE q.MonthlyRank <= 10
+),
+
+-- Answers for those top questions with windowed scoring
+AnswerDetails AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        a.Id AS AnswerId,
+        a.OwnerUserId AS AnswererId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerDate,
+        ROW_NUMBER() OVER (
+            PARTITION BY a.ParentId
+            ORDER BY a.Score DESC, a.CreationDate
+        ) AS AnswerRank
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+      AND a.ParentId IN (SELECT QuestionId FROM TopQuestions)
+),
+
+-- Tags for those top questions
+QuestionTags AS (
+    SELECT
+        qt.QuestionId,
+        TRIM(tag) AS Tag
+    FROM (
+        SELECT
+            p.Id AS QuestionId,
+            UNNEST(string_to_array(
+                substring(p.Tags, 2, LENGTH(p.Tags)-2),
+                '><')
+            ) AS tag
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.Id IN (SELECT QuestionId FROM TopQuestions)
+    ) qt
+),
+
+-- Tag popularity per month (using set operators: UNION ALL and EXCEPT)
+RecentTagCounts AS (
+    SELECT
+        DATE_TRUNC('month', p.CreationDate) AS Month,
+        tag AS Tag,
+        COUNT(*) AS TagCount
+    FROM Posts p
+    JOIN QuestionTags qt
+      ON qt.QuestionId = p.Id
+    WHERE p.CreationDate >= NOW() - INTERVAL '6 months'
+    GROUP BY 1, 2
+    UNION ALL
+    SELECT
+        DATE_TRUNC('month', p.CreationDate) AS Month,
+        'other' AS Tag,
+        COUNT(*) 
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND NOT EXISTS (
+          SELECT 1 FROM QuestionTags qt2
+           WHERE qt2.QuestionId = p.Id
+             AND DATE_TRUNC('month', p.CreationDate) >= NOW() - INTERVAL '6 months'
+      )
+    GROUP BY 1
+),
+
+-- Exclude tags with low usage
+PopularTags AS (
+    SELECT Month, Tag, TagCount
+    FROM RecentTagCounts
+    EXCEPT
+    SELECT Month, Tag, TagCount
+    FROM RecentTagCounts
+    WHERE TagCount < 5
+)
+
+-- Final select combining everything
+SELECT
+    tq.MonthlyRank,
+    tq.QuestionId,
+    LEFT(tq.Title, 80) || CASE WHEN LENGTH(tq.Title) > 80 THEN '…' ELSE '' END AS TitleSnippet,
+    COALESCE(tq.DisplayName, '[deleted]') AS Asker,
+    tq.Reputation,
+    COALESCE(tq.GoldBadges,0) AS GoldBadges,
+    COALESCE(tq.SilverBadges,0) AS SilverBadges,
+    COALESCE(tq.BronzeBadges,0) AS BronzeBadges,
+    tq.Score       AS QuestionScore,
+    tq.ViewCount   AS QuestionViews,
+    tq.TotalComments,
+    aq.AnswerId,
+    aq.AnswerScore,
+    aq.AnswerRank,
+    pt.Tag,
+    pt.TagCount,
+    COALESCE(tq.LatestCommentText, '[no comments]') AS LatestComment,
+    EXTRACT(day FROM tq.AgeInterval)::INT AS AgeInDays
+FROM TopQuestions tq
+LEFT JOIN AnswerDetails aq
+  ON aq.QuestionId = tq.QuestionId
+LEFT JOIN PopularTags pt
+  ON pt.Month = DATE_TRUNC('month', tq.CreationDate)
+ORDER BY tq.MonthlyRank, pt.Tag, aq.AnswerRank;

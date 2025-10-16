@@ -1,0 +1,3 @@
+stats st
+WHERE st.TotalPosts > 0
+ORDER BY st.AvgScore DESC NULLS LAST, st.TotalPosts DESC;

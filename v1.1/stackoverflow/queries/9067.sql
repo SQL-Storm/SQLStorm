@@ -1,0 +1,155 @@
+WITH
+QuestionStats AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        ROW_NUMBER() OVER (
+            PARTITION BY DATE_TRUNC('month', p.CreationDate)
+            ORDER BY p.Score DESC, COUNT(DISTINCT c.Id) DESC
+        ) AS MonthlyRank
+    FROM Posts p
+    LEFT JOIN Comments c
+      ON c.PostId = p.Id
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    GROUP BY p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount
+),
+UserBadges AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        STRING_AGG(NULLIF(b.Name, ''), ', ' ORDER BY b.Name) AS AllBadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+),
+LatestComment AS (
+    SELECT
+        q.QuestionId,
+        (SELECT c2.Text
+         FROM Comments c2
+         WHERE c2.PostId = q.QuestionId
+         ORDER BY c2.CreationDate DESC
+         LIMIT 1
+        ) AS LatestCommentText
+    FROM QuestionStats q
+),
+TopQuestions AS (
+    SELECT
+        q.QuestionId,
+        q.Title,
+        u.DisplayName,
+        u.Reputation,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        q.Score,
+        q.ViewCount,
+        q.TotalComments,
+        q.MonthlyRank,
+        lc.LatestCommentText,
+        CAST('2024-10-01 12:34:56' AS TIMESTAMP) - q.CreationDate AS AgeInterval,
+        q.CreationDate
+    FROM QuestionStats q
+    LEFT JOIN Users u
+      ON u.Id = q.OwnerUserId
+    LEFT JOIN UserBadges ub
+      ON ub.UserId = q.OwnerUserId
+    LEFT JOIN LatestComment lc
+      ON lc.QuestionId = q.QuestionId
+    WHERE q.MonthlyRank <= 10
+),
+AnswerDetails AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        a.Id AS AnswerId,
+        a.OwnerUserId AS AnswererId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerDate,
+        ROW_NUMBER() OVER (
+            PARTITION BY a.ParentId
+            ORDER BY a.Score DESC, a.CreationDate
+        ) AS AnswerRank
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+      AND a.ParentId IN (SELECT QuestionId FROM TopQuestions)
+),
+QuestionTags AS (
+    SELECT
+        qt.QuestionId,
+        TRIM(tag) AS Tag
+    FROM (
+        SELECT
+            p.Id AS QuestionId,
+            UNNEST(STRING_TO_ARRAY(
+                SUBSTRING(p.Tags FROM 2 FOR (LENGTH(p.Tags)-2)),
+                '><')
+            ) AS tag
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.Id IN (SELECT QuestionId FROM TopQuestions)
+    ) qt
+),
+RecentTagCounts AS (
+    SELECT
+        DATE_TRUNC('month', p.CreationDate) AS Month,
+        qt.Tag AS Tag,
+        COUNT(*) AS TagCount
+    FROM Posts p
+    JOIN QuestionTags qt
+      ON qt.QuestionId = p.Id
+    WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months'
+    GROUP BY DATE_TRUNC('month', p.CreationDate), qt.Tag
+    UNION ALL
+    SELECT
+        DATE_TRUNC('month', p.CreationDate) AS Month,
+        'other' AS Tag,
+        COUNT(*) 
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND NOT EXISTS (
+          SELECT 1 FROM QuestionTags qt2
+           WHERE qt2.QuestionId = p.Id
+             AND DATE_TRUNC('month', p.CreationDate) >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months'
+      )
+    GROUP BY DATE_TRUNC('month', p.CreationDate)
+),
+PopularTags AS (
+    SELECT Month, Tag, TagCount
+    FROM RecentTagCounts
+    EXCEPT
+    SELECT Month, Tag, TagCount
+    FROM RecentTagCounts
+    WHERE TagCount < 5
+)
+SELECT
+    tq.MonthlyRank,
+    tq.QuestionId,
+    CASE WHEN LENGTH(tq.Title) > 80 THEN SUBSTRING(tq.Title FROM 1 FOR 80) || '...' ELSE tq.Title END AS TitleSnippet,
+    COALESCE(tq.DisplayName, '[deleted]') AS Asker,
+    tq.Reputation,
+    COALESCE(tq.GoldBadges,0) AS GoldBadges,
+    COALESCE(tq.SilverBadges,0) AS SilverBadges,
+    COALESCE(tq.BronzeBadges,0) AS BronzeBadges,
+    tq.Score       AS QuestionScore,
+    tq.ViewCount   AS QuestionViews,
+    tq.TotalComments,
+    aq.AnswerId,
+    aq.AnswerScore,
+    aq.AnswerRank,
+    pt.Tag,
+    pt.TagCount,
+    COALESCE(tq.LatestCommentText, '[no comments]') AS LatestComment,
+    CAST(EXTRACT(day FROM tq.AgeInterval) AS INTEGER) AS AgeInDays
+FROM TopQuestions tq
+LEFT JOIN AnswerDetails aq
+  ON aq.QuestionId = tq.QuestionId
+LEFT JOIN PopularTags pt
+  ON pt.Month = DATE_TRUNC('month', tq.CreationDate)
+ORDER BY tq.MonthlyRank, pt.Tag, aq.AnswerRank;

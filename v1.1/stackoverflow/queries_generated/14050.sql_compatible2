@@ -1,0 +1,39 @@
+WITH cte AS (
+  SELECT p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.ClosedDate, p.CommunityOwnedDate,
+         u.Id AS UserId, u.Reputation, u.CreationDate AS UserCreationDate, u.DownVotes, u.UpVotes AS UserUpVotes, u.Views,
+         COALESCE(EXTRACT(EPOCH FROM (p.CreationDate - u.CreationDate)) / 86400, 0) AS UserPostAgeInDays,
+         CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus,
+         CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned' ELSE 'Not Community Owned' END AS PostOwnership,
+         CASE WHEN p.PostTypeId = 1 THEN 'Question' WHEN p.PostTypeId = 2 THEN 'Answer' ELSE 'Other' END AS PostType,
+         string_agg(DISTINCT t.TagName, '><') AS Tags,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+         SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS Favorites,
+         SUM(CASE WHEN v.VoteTypeId = 10 THEN 1 ELSE 0 END) AS Deletions,
+         SUM(CASE WHEN v.VoteTypeId = 11 THEN 1 ELSE 0 END) AS Undeletes,
+         SUM(CASE WHEN v.VoteTypeId = 12 THEN 1 ELSE 0 END) AS Spam,
+         SUM(CASE WHEN v.VoteTypeId = 14 THEN 1 ELSE 0 END) AS ModeratorNominations,
+         SUM(CASE WHEN v.VoteTypeId = 15 THEN 1 ELSE 0 END) AS ModeratorReviews,
+         SUM(CASE WHEN v.VoteTypeId = 16 THEN 1 ELSE 0 END) AS EditSuggestionApprovals
+  FROM Posts p
+  JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+  LEFT JOIN Tags t ON position(('><' || t.TagName || '><') IN ('><' || COALESCE(p.Tags, '') || '><')) > 0
+  LEFT JOIN Votes v ON p.Id = v.PostId
+  GROUP BY p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.ClosedDate, p.CommunityOwnedDate,
+           u.Id, u.Reputation, u.CreationDate, u.DownVotes, u.UpVotes, u.Views
+)
+SELECT cte.Id, cte.PostTypeId, cte.CreationDate, cte.Score, cte.ViewCount, cte.AnswerCount, cte.CommentCount, cte.FavoriteCount, cte.ClosedDate, cte.CommunityOwnedDate,
+       cte.UserId, cte.Reputation, cte.UserCreationDate, cte.DownVotes, cte.UserUpVotes, cte.Views, cte.UserPostAgeInDays,
+       cte.PostStatus, cte.PostOwnership, cte.PostType, cte.Tags, cte.UpVotes, cte.DownVotes AS DownVotes_agg, cte.Favorites, cte.Deletions, cte.Undeletes, cte.Spam,
+       cte.ModeratorNominations, cte.ModeratorReviews, cte.EditSuggestionApprovals,
+       CASE WHEN cte.PostStatus = 'Closed' THEN 'Closed' ELSE 'Open' END AS FinalPostStatus,
+       CASE WHEN cte.PostOwnership = 'Community Owned' THEN 'Community Owned' ELSE 'Not Community Owned' END AS FinalPostOwnership,
+       CASE WHEN cte.PostType = 'Question' THEN 'Question' WHEN cte.PostType = 'Answer' THEN 'Answer' ELSE 'Other' END AS FinalPostType,
+       CASE WHEN cte.Tags LIKE '%><google%' OR cte.Tags LIKE '%><java%' THEN 'Technical' WHEN cte.Tags LIKE '%><discussion%' OR cte.Tags LIKE '%><subjective%' THEN 'Discussion' ELSE 'Other' END AS PostCategory,
+       ROUND(POWER(2, LOG(10, COALESCE(cte.UpVotes - cte.DownVotes, 0) + 1)), 2) AS PostScore,
+       ROUND(COALESCE(cte.FavoriteCount * 1.0 / POWER(GREATEST(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - cte.CreationDate)) / 86400, 1e-9), 1.5), 0), 2) AS PostPopularity,
+       ROUND(COALESCE(cte.UpVotes * 1.0 / GREATEST(1, cte.UserUpVotes), 0), 2) AS UserUpVoteRate,
+       ROUND(COALESCE(cte.DownVotes * 1.0 / GREATEST(1, cte.DownVotes), 0), 2) AS UserDownVoteRate,
+       CASE WHEN cte.PostType = 'Question' AND (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - cte.CreationDate)) / 86400) <= 30 AND cte.AnswerCount = 0 AND cte.UpVotes >= 5 THEN 'Unanswered' ELSE 'Answered' END AS AnswerStatus
+FROM cte;

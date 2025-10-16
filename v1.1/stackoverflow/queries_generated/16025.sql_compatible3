@@ -1,0 +1,185 @@
+WITH UserEngagementMetrics AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        EXTRACT(YEAR FROM u.CreationDate) AS JoinYear,
+        COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS NetVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AvgAnswerScore,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL AND p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswer,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation DESC) AS RepRankInYear,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT b.Id) DESC) AS BadgeCountRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 100
+        AND u.CreationDate >= DATE '2015-01-01'
+        AND COALESCE(u.Location, '') NOT LIKE '%bot%'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) > 5
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.OwnerUserId,
+        LENGTH(COALESCE(p.Body, '')) AS BodyLength,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'HasAcceptedAnswer'
+            WHEN p.AnswerCount > 0 THEN 'HasAnswers'
+            ELSE 'Unanswered'
+        END AS PostStatus,
+        COALESCE(CAST(p.Score AS DOUBLE PRECISION) / NULLIF(p.ViewCount, 0) * 1000, 0) AS ScoreViewRatio,
+        EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 86400.0 AS ActivityLifespanDays,
+        string_to_array(NULLIF(substring(p.Tags, 2, length(COALESCE(p.Tags, '')) - 2), ''), '><') AS TagArray,
+        (SELECT COUNT(*) 
+         FROM PostLinks pl 
+         WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS DuplicateCount,
+        (SELECT STRING_AGG(DISTINCT u2.DisplayName, ', ') 
+         FROM Comments c 
+         INNER JOIN Users u2 ON c.UserId = u2.Id 
+         WHERE c.PostId = p.Id AND c.Score > 0 
+         LIMIT 5) AS TopCommenters,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostScore,
+        LEAD(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY v.CreationDate) OVER (PARTITION BY p.Id) AS MedianVoteTime
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    WHERE p.CreationDate BETWEEN DATE '2018-01-01' AND DATE '2023-12-31'
+        AND p.PostTypeId IN (1, 2)
+        AND (p.Score > 5 OR p.ViewCount > 100 OR p.CommentCount > 2)
+),
+TagPerformanceMatrix AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagUsageCount,
+        AVG(cpa.Score) AS AvgScoreForTag,
+        STDDEV_POP(cpa.Score) AS ScoreStdDev,
+        COUNT(DISTINCT cpa.OwnerUserId) AS UniqueAuthors,
+        SUM(CASE WHEN cpa.PostStatus = 'HasAcceptedAnswer' THEN 1 ELSE 0 END) * 1.0 / 
+            NULLIF(COUNT(*) FILTER (WHERE cpa.PostTypeId = 1), 0) AS AcceptanceRate,
+        PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY cpa.ViewCount) AS P90ViewCount,
+        NTILE(10) OVER (ORDER BY t.Count DESC) AS PopularityDecile
+    FROM Tags t
+    INNER JOIN LATERAL (
+        SELECT UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS tag_name,
+               p.Id, p.Score, p.PostTypeId, p.ViewCount, p.OwnerUserId, cpa.PostStatus
+        FROM Posts p
+        INNER JOIN ComplexPostAnalysis cpa ON p.Id = cpa.PostId
+        WHERE p.Tags IS NOT NULL AND p.PostTypeId = 1
+    ) tag_posts ON t.TagName = tag_posts.tag_name
+    WHERE t.Count > 50
+    GROUP BY t.TagName, t.Count
+),
+VotingPatterns AS (
+    SELECT 
+        v.PostId,
+        v.UserId AS VoterId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpvotesGiven,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownvotesGiven,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 5) AS FavoritesGiven,
+        AVG(EXTRACT(EPOCH FROM (v.CreationDate - p.CreationDate)) / 3600.0) AS AvgHoursToVote,
+        CASE 
+            WHEN EXTRACT(HOUR FROM v.CreationDate) BETWEEN 6 AND 12 THEN 'Morning'
+            WHEN EXTRACT(HOUR FROM v.CreationDate) BETWEEN 12 AND 18 THEN 'Afternoon'
+            WHEN EXTRACT(HOUR FROM v.CreationDate) BETWEEN 18 AND 23 THEN 'Evening'
+            ELSE 'Night'
+        END AS VotingTimeOfDay
+    FROM Votes v
+    INNER JOIN Posts p ON v.PostId = p.Id
+    WHERE v.CreationDate >= DATE '2020-01-01'
+        AND v.VoteTypeId IN (2, 3, 5)
+    GROUP BY v.PostId, v.UserId, CASE 
+            WHEN EXTRACT(HOUR FROM v.CreationDate) BETWEEN 6 AND 12 THEN 'Morning'
+            WHEN EXTRACT(HOUR FROM v.CreationDate) BETWEEN 12 AND 18 THEN 'Afternoon'
+            WHEN EXTRACT(HOUR FROM v.CreationDate) BETWEEN 18 AND 23 THEN 'Evening'
+            ELSE 'Night'
+        END
+)
+SELECT 
+    uem.DisplayName,
+    uem.Reputation,
+    uem.JoinYear,
+    uem.NetVotes,
+    uem.QuestionCount,
+    uem.AnswerCount,
+    ROUND(COALESCE(uem.AvgQuestionScore, 0), 2) AS AvgQuestionScore,
+    ROUND(COALESCE(uem.AvgAnswerScore, 0), 2) AS AvgAnswerScore,
+    uem.RepRankInYear,
+    uem.BadgeCountRank,
+    COALESCE(post_stats.TotalScore, 0) AS TotalPostScore,
+    COALESCE(post_stats.MaxScore, 0) AS BestPostScore,
+    COALESCE(post_stats.TotalViews, 0) AS TotalViews,
+    COALESCE(post_stats.AvgBodyLength, 0) AS AvgBodyLength,
+    post_stats.MostUsedTag,
+    post_stats.TagDiversity,
+    COALESCE(vote_stats.TotalUpvotesReceived, 0) AS TotalUpvotesReceived,
+    COALESCE(vote_stats.TotalDownvotesReceived, 0) AS TotalDownvotesReceived,
+    COALESCE(vote_stats.UpvoteDownvoteRatio, 0) AS UpvoteDownvoteRatio,
+    CASE 
+        WHEN uem.Reputation > 10000 AND uem.AnswerCount > uem.QuestionCount * 2 THEN 'Expert Answerer'
+        WHEN uem.Reputation > 5000 AND uem.QuestionCount > uem.AnswerCount * 2 THEN 'Prolific Questioner'
+        WHEN uem.NetVotes > 1000 THEN 'Active Voter'
+        WHEN uem.QuestionCount > 0 AND COALESCE(uem.AvgQuestionScore, 0) > 10 THEN 'Quality Contributor'
+        ELSE 'Regular User'
+    END AS UserArchetype,
+    ROUND((CAST(uem.Reputation AS DOUBLE PRECISION) / NULLIF(uem.TotalPosts, 0)), 2) AS ReputationPerPost,
+    string_agg(DISTINCT tpm.TagName, ', ' ORDER BY tpm.TagName) FILTER (WHERE tpm.PopularityDecile <= 3) AS TopPopularTags
+FROM UserEngagementMetrics uem
+LEFT JOIN LATERAL (
+    SELECT 
+        SUM(cpa.Score) AS TotalScore,
+        MAX(cpa.Score) AS MaxScore,
+        SUM(COALESCE(cpa.ViewCount, 0)) AS TotalViews,
+        AVG(cpa.BodyLength) AS AvgBodyLength,
+        MODE() WITHIN GROUP (ORDER BY unnest(cpa.TagArray)) AS MostUsedTag,
+        COUNT(DISTINCT unnest(cpa.TagArray)) AS TagDiversity
+    FROM ComplexPostAnalysis cpa
+    WHERE cpa.OwnerUserId = uem.UserId
+) post_stats ON true
+LEFT JOIN LATERAL (
+    SELECT 
+        SUM(vp.UpvotesGiven) AS TotalUpvotesReceived,
+        SUM(vp.DownvotesGiven) AS TotalDownvotesReceived,
+        COALESCE(SUM(vp.UpvotesGiven) * 1.0 / NULLIF(SUM(vp.DownvotesGiven), 0), 0) AS UpvoteDownvoteRatio
+    FROM VotingPatterns vp
+    INNER JOIN ComplexPostAnalysis cpa ON vp.PostId = cpa.PostId
+    WHERE cpa.OwnerUserId = uem.UserId
+) vote_stats ON true
+LEFT JOIN ComplexPostAnalysis cpa2 ON cpa2.OwnerUserId = uem.UserId
+LEFT JOIN LATERAL unnest(cpa2.TagArray) WITH ORDINALITY AS tag_data(tag_name, ord) ON true
+LEFT JOIN TagPerformanceMatrix tpm ON tpm.TagName = tag_data.tag_name
+WHERE uem.TotalPosts >= 10
+    AND (post_stats.TotalScore > 50 OR vote_stats.TotalUpvotesReceived > 100)
+    AND NOT EXISTS (
+        SELECT 1 
+        FROM Posts p_spam
+        WHERE p_spam.OwnerUserId = uem.UserId 
+            AND p_spam.Score < -5
+        HAVING COUNT(*) > 3
+    )
+GROUP BY 
+    uem.DisplayName, uem.Reputation, uem.JoinYear, uem.NetVotes,
+    uem.QuestionCount, uem.AnswerCount, uem.AvgQuestionScore, 
+    uem.AvgAnswerScore, uem.RepRankInYear, uem.BadgeCountRank,
+    uem.TotalPosts, post_stats.TotalScore, post_stats.MaxScore,
+    post_stats.TotalViews, post_stats.AvgBodyLength, post_stats.MostUsedTag,
+    post_stats.TagDiversity, vote_stats.TotalUpvotesReceived,
+    vote_stats.TotalDownvotesReceived, vote_stats.UpvoteDownvoteRatio
+HAVING COUNT(DISTINCT tpm.TagName) > 2
+ORDER BY 
+    uem.Reputation DESC,
+    post_stats.TotalScore DESC,
+    vote_stats.UpvoteDownvoteRatio DESC
+LIMIT 1000;

@@ -1,0 +1,237 @@
+WITH PostFullDetails AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.AcceptedAnswerId,
+        P.ParentId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        P.Body,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.LastActivityDate,
+        P.LastEditDate,
+        P.ClosedDate,
+        P.Title AS PostTitle,
+        COALESCE(P.Tags, '') AS TagsString,
+        CASE
+            WHEN P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+            THEN string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags)-2), '><')
+            ELSE ARRAY[]::varchar[]
+        END AS TagsArray,
+        (SELECT MAX(Co.CreationDate) FROM Comments Co WHERE Co.PostId = P.Id) AS LastCommentDate,
+        (SELECT SUM(Co.Score) FROM Comments Co WHERE Co.PostId = P.Id) AS TotalCommentScore,
+        QP.Id AS QuestionId,
+        QP.Title AS QuestionTitle,
+        QP.Tags AS QuestionTagsString,
+        CASE
+            WHEN QP.Tags IS NOT NULL AND LENGTH(QP.Tags) > 2
+            THEN string_to_array(SUBSTRING(QP.Tags, 2, LENGTH(QP.Tags)-2), '><')
+            ELSE ARRAY[]::varchar[]
+        END AS QuestionTagsArray
+    FROM Posts P
+    JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    LEFT JOIN Posts QP ON P.ParentId = QP.Id AND P.PostTypeId = 2
+),
+PostActivityMetrics AS (
+    SELECT
+        PFD.PostId,
+        PFD.PostTypeId,
+        PFD.PostTypeName,
+        PFD.OwnerUserId,
+        PFD.PostCreationDate,
+        PFD.Score,
+        PFD.ViewCount,
+        PFD.AnswerCount,
+        PFD.CommentCount,
+        PFD.FavoriteCount,
+        PFD.LastActivityDate,
+        PFD.LastEditDate,
+        PFD.ClosedDate,
+        PFD.PostTitle,
+        PFD.TagsString,
+        PFD.TagsArray,
+        PFD.LastCommentDate,
+        PFD.TotalCommentScore,
+        PFD.ParentId,
+        PFD.QuestionId,
+        PFD.QuestionTitle,
+        PFD.QuestionTagsString,
+        PFD.QuestionTagsArray,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - PFD.PostCreationDate)) / (60 * 60 * 24) AS PostAgeDays,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - PFD.LastActivityDate)) / (60 * 60 * 24) AS DaysSinceLastActivity,
+        CASE WHEN PFD.LastEditDate IS NOT NULL AND PFD.LastEditDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days' THEN TRUE ELSE FALSE END AS RecentlyEdited,
+        CASE WHEN PFD.LastCommentDate IS NOT NULL AND PFD.LastCommentDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days' THEN TRUE ELSE FALSE END AS RecentlyCommented,
+        (SELECT COUNT(PH.Id) FROM PostHistory PH WHERE PH.PostId = PFD.PostId) AS PostHistoryEventCount,
+        EXISTS (
+            SELECT 1 FROM PostHistory PH
+            WHERE PH.PostId = PFD.PostId AND PH.PostHistoryTypeId = 16
+        ) AS IsCommunityOwned,
+        (SELECT PL.RelatedPostId FROM PostLinks PL WHERE PL.PostId = PFD.PostId AND PL.LinkTypeId = 3 LIMIT 1) AS DuplicateOfPostId,
+        CASE WHEN PFD.Body ILIKE '%performance issue%' THEN TRUE ELSE FALSE END AS HasPerformanceKeyword
+    FROM PostFullDetails PFD
+),
+UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.UpVotes,
+        U.DownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsCreated,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersCreated,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(P.Score) AS TotalPostScore,
+        AVG(P.Score) AS AvgPostScore,
+        MAX(P.LastActivityDate) AS LastUserActivityPostDate,
+        COUNT(DISTINCT CASE WHEN B.Class = 1 THEN B.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN B.Class = 2 THEN B.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN B.Class = 3 THEN B.Id END) AS BronzeBadges,
+        (U.UpVotes * 0.7 + U.DownVotes * -0.3 + COUNT(DISTINCT P.Id) * 0.5 + COUNT(DISTINCT C.Id) * 0.2) AS UserEngagementScore
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.UpVotes, U.DownVotes
+),
+RankedUserActivity AS (
+    SELECT
+        UAS.UserId,
+        UAS.DisplayName,
+        UAS.Reputation,
+        UAS.UserCreationDate,
+        UAS.UpVotes,
+        UAS.DownVotes,
+        UAS.TotalPostsCreated,
+        UAS.TotalQuestionsCreated,
+        UAS.TotalAnswersCreated,
+        UAS.TotalCommentsMade,
+        UAS.TotalPostScore,
+        UAS.AvgPostScore,
+        UAS.LastUserActivityPostDate,
+        UAS.GoldBadges,
+        UAS.SilverBadges,
+        UAS.BronzeBadges,
+        UAS.UserEngagementScore,
+        RANK() OVER (ORDER BY UAS.Reputation DESC, UAS.UserEngagementScore DESC) AS UserReputationEngagementRank,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM UAS.UserCreationDate) ORDER BY UAS.UserEngagementScore DESC) AS EngagementRankInCohort,
+        LAG(UAS.Reputation, 1, 0) OVER (ORDER BY UAS.Reputation DESC) AS PreviousUserReputation
+    FROM UserActivitySummary UAS
+),
+TagPerformance AS (
+    SELECT
+        unnest(CASE WHEN PostTypeId = 1 THEN TagsArray ELSE QuestionTagsArray END) AS TagName,
+        SUM(Score) AS TotalTagScore,
+        COUNT(PostId) AS TotalPostsWithTag,
+        AVG(Score) AS AvgTagScore,
+        COUNT(DISTINCT OwnerUserId) AS UniqueUsersPerTag,
+        MIN(PostCreationDate) AS FirstTagPostDate
+    FROM PostActivityMetrics
+    WHERE
+        (PostTypeId = 1 AND TagsArray IS NOT NULL AND ARRAY_LENGTH(TagsArray, 1) > 0) OR
+        (PostTypeId = 2 AND QuestionTagsArray IS NOT NULL AND ARRAY_LENGTH(QuestionTagsArray, 1) > 0)
+    GROUP BY unnest(CASE WHEN PostTypeId = 1 THEN TagsArray ELSE QuestionTagsArray END)
+)
+SELECT
+    'Question' AS RecordType,
+    RU.UserId,
+    RU.DisplayName,
+    RU.Reputation,
+    RU.UserReputationEngagementRank,
+    PM.PostId,
+    COALESCE(PM.PostTitle, 'No Question Title') AS PostTitle,
+    PM.Score AS PostScore,
+    PM.ViewCount,
+    PM.FavoriteCount,
+    PM.TagsString AS PostTags,
+    TP.AvgTagScore AS RelatedAvgTagScore,
+    (CAST(PM.Score AS NUMERIC) + (PM.FavoriteCount * 2)) / NULLIF(PM.ViewCount, 0) AS EngagementToViewsRatio,
+    PM.PostCreationDate,
+    PM.LastActivityDate AS PostLastActivityDate,
+    CAST(NULL AS INT) AS ParentPostId,
+    (SELECT COUNT(DISTINCT B2.Id)
+     FROM Badges B2
+     WHERE B2.UserId = RU.UserId
+       AND B2.Class = 1
+       AND B2.TagBased = TRUE
+       AND B2.Name IN (SELECT unnest(PM.TagsArray))) AS GoldTagBadgesForPost,
+    COALESCE(RU.DisplayName, 'Anonymous') || ' - ' || UPPER(SUBSTRING(COALESCE(PM.PostTitle, 'No Title'), 1, 10)) AS UserPostIdentifier,
+    COALESCE(TO_CHAR(PM.ClosedDate, 'YYYY-MM-DD HH24:MI:SS'), 'OPEN') AS PostClosedStatus,
+    PM.HasPerformanceKeyword
+FROM RankedUserActivity RU
+INNER JOIN PostActivityMetrics PM ON RU.UserId = PM.OwnerUserId
+LEFT JOIN TagPerformance TP ON TP.TagName = ANY(PM.TagsArray)
+WHERE
+    PM.PostTypeId = 1
+    AND RU.Reputation >= 1500
+    AND PM.PostAgeDays BETWEEN 30 AND 730
+    AND PM.Score >= (SELECT AVG(P_sub.Score) * 1.5 FROM Posts P_sub WHERE P_sub.PostTypeId = 1 AND P_sub.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years')
+    AND (PM.RecentlyEdited = TRUE OR PM.RecentlyCommented = TRUE)
+    AND (
+        'sql' = ANY(PM.TagsArray) OR 'database' = ANY(PM.TagsArray) OR 'performance' = ANY(PM.TagsArray) OR 'query-optimization' = ANY(PM.TagsArray)
+    )
+    AND EXISTS (SELECT 1 FROM Badges B_sub WHERE B_sub.UserId = RU.UserId AND B_sub.Class = 1)
+    AND PM.ViewCount > 1000
+    AND PM.HasPerformanceKeyword = TRUE
+
+UNION ALL
+
+SELECT
+    'Answer' AS RecordType,
+    RU.UserId,
+    RU.DisplayName,
+    RU.Reputation,
+    RU.UserReputationEngagementRank,
+    PM.PostId,
+    COALESCE(PM.QuestionTitle, 'No Question Title') AS PostTitle,
+    PM.Score AS PostScore,
+    CAST(NULL AS INT) AS ViewCount,
+    CAST(NULL AS INT) AS FavoriteCount,
+    PM.QuestionTagsString AS PostTags,
+    TP.AvgTagScore AS RelatedAvgTagScore,
+    (CAST(PM.Score AS NUMERIC) + COALESCE(PM.TotalCommentScore, 0)) / NULLIF(PM.CommentCount + 1, 0) AS AnswerQualityRatio,
+    PM.PostCreationDate,
+    PM.LastActivityDate AS PostLastActivityDate,
+    PM.ParentId AS ParentPostId,
+    (SELECT COUNT(DISTINCT B2.Id)
+     FROM Badges B2
+     WHERE B2.UserId = RU.UserId
+       AND B2.Class = 1
+       AND B2.TagBased = TRUE
+       AND B2.Name IN (SELECT unnest(PM.QuestionTagsArray))) AS GoldTagBadgesForPost,
+    COALESCE(RU.DisplayName, 'Anonymous') || ' - ' || UPPER(SUBSTRING(COALESCE(PM.QuestionTitle, 'No Q Title'), 1, 10)) AS UserPostIdentifier,
+    COALESCE(TO_CHAR(PM.ClosedDate, 'YYYY-MM-DD HH24:MI:SS'), 'OPEN') AS PostClosedStatus,
+    PM.HasPerformanceKeyword
+FROM RankedUserActivity RU
+INNER JOIN PostActivityMetrics PM ON RU.UserId = PM.OwnerUserId
+LEFT JOIN TagPerformance TP ON TP.TagName = ANY(PM.QuestionTagsArray)
+WHERE
+    PM.PostTypeId = 2
+    AND RU.TotalAnswersCreated >= 50
+    AND PM.Score >= 30
+    AND PM.PostCreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years'
+    AND PM.CommentCount > 3
+    AND EXISTS (
+        SELECT 1
+        FROM PostFullDetails PDWT
+        WHERE PDWT.PostId = PM.ParentId
+          AND ( 'java' = ANY(PDWT.TagsArray) OR 'c#' = ANY(PDWT.TagsArray) OR 'python' = ANY(PDWT.TagsArray) )
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM Users U_sub
+        WHERE U_sub.Id = RU.UserId
+          AND (U_sub.DownVotes * 1.0 / NULLIF(U_sub.UpVotes, 0)) > 0.5
+    )
+    AND PM.PostAgeDays < 1000
+ORDER BY
+    Reputation DESC,
+    PostScore DESC,
+    PostLastActivityDate DESC
+LIMIT 2000;

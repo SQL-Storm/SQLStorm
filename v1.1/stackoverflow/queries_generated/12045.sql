@@ -1,0 +1,115 @@
+-- {"query": "12045.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 900} 
+
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.CreationDate) AS UserPostRank,
+        DENSE_RANK() OVER (ORDER BY P.Score DESC) AS ScoreRank,
+        NTILE(4) OVER (ORDER BY P.ViewCount DESC) AS ViewQuartile
+    FROM 
+        Posts P
+    JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2)
+),
+TopUsers AS (
+    SELECT 
+        OwnerUserId,
+        COUNT(*) AS PostCount,
+        SUM(Score) AS TotalScore,
+        AVG(ViewCount) AS AvgViewCount
+    FROM 
+        RankedPosts
+    WHERE 
+        UserPostRank <= 3
+    GROUP BY 
+        OwnerUserId
+    HAVING 
+        COUNT(*) >= 3
+),
+PostHistorySummary AS (
+    SELECT 
+        PostId,
+        COUNT(*) AS HistoryCount,
+        MAX(CASE WHEN PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20, 35) THEN CreationDate END) AS LastSignificantChange
+    FROM 
+        PostHistory
+    WHERE 
+        PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 19, 20, 35)
+    GROUP BY 
+        PostId
+),
+UserActivity AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        COUNT(DISTINCT P.Id) AS PostCount,
+        COUNT(DISTINCT C.Id) AS CommentCount,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount
+    FROM 
+        Users U
+    LEFT JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN 
+        Comments C ON U.Id = C.UserId
+    LEFT JOIN 
+        Votes V ON U.Id = V.UserId
+    GROUP BY 
+        U.Id, U.DisplayName
+),
+TagUsage AS (
+    SELECT 
+        T.TagName,
+        COUNT(DISTINCT P.Id) AS PostCount,
+        SUM(P.Score) AS TotalScore
+    FROM 
+        Tags T
+    JOIN 
+        Posts P ON T.WikiPostId = P.Id OR T.ExcerptPostId = P.Id
+    GROUP BY 
+        T.TagName
+)
+SELECT 
+    RP.Id,
+    RP.PostTypeId,
+    RP.CreationDate,
+    RP.Score,
+    RP.ViewCount,
+    RP.OwnerUserId,
+    RP.OwnerDisplayName,
+    RP.UserPostRank,
+    RP.ScoreRank,
+    RP.ViewQuartile,
+    TU.TagName,
+    TU.PostCount AS TagPostCount,
+    TU.TotalScore AS TagTotalScore,
+    PHS.HistoryCount,
+    PHS.LastSignificantChange,
+    UA.CommentCount,
+    UA.UpVoteCount,
+    UA.DownVoteCount
+FROM 
+    RankedPosts RP
+JOIN 
+    TopUsers TU ON RP.OwnerUserId = TU.OwnerUserId
+LEFT JOIN 
+    PostHistorySummary PHS ON RP.Id = PHS.PostId
+LEFT JOIN 
+    UserActivity UA ON RP.OwnerUserId = UA.Id
+LEFT JOIN 
+    TagUsage TU ON RP.Tags LIKE '%' || TU.TagName || '%'
+WHERE 
+    RP.Score > 10 
+    AND RP.ViewCount > 1000
+ORDER BY 
+    RP.Score DESC, 
+    RP.ViewCount DESC 
+LIMIT 100;

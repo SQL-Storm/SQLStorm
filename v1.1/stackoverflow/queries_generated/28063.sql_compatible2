@@ -1,0 +1,91 @@
+WITH UserBadgeStats AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate,
+        CASE 
+            WHEN COUNT(b.Id) OVER (PARTITION BY u.Id) > 100 THEN 'Pro'
+            WHEN COUNT(b.Id) > 50 THEN 'Active'
+            ELSE 'Casual'
+        END AS BadgeCategory
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id
+), PostStats AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS Upvotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS Downvotes,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS PostRank,
+        (SELECT MAX(c.CreationDate) FROM Comments c WHERE c.PostId = p.Id) AS LastCommentDate
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.CreationDate BETWEEN DATE '2010-01-01' AND DATE '2023-12-31'
+    GROUP BY p.Id, p.OwnerUserId, p.PostTypeId, p.Score
+), ClosedPosts AS (
+    SELECT
+        ph.PostId,
+        MAX(ph.CreationDate) AS ClosureDate,
+        CAST(REGEXP_REPLACE(SUBSTRING(ph.Text FROM 'OriginalQuestionIds":\\[([0-9,]+)\\]'), '[^0-9]', '', 'g') AS INTEGER) AS OriginalQuestionId,
+        COALESCE(ph.Comment, 'Unknown') AS CloseReason
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId, ph.Text, ph.Comment
+)
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    bs.GoldBadges,
+    bs.SilverBadges,
+    bs.BronzeBadges,
+    ps.PostId,
+    pt.Name AS PostType,
+    ps.Score,
+    ps.PostRank,
+    cp.CloseReason,
+    SUBSTRING(p.Body FROM 1 FOR 50) || '...' AS Preview,
+    (ps.Upvotes - ps.Downvotes) AS NetVotes,
+    AGE(p.LastActivityDate, p.CreationDate) AS ActivityDuration,
+    COALESCE(cp.OriginalQuestionId, -1) AS OriginalQuestion,
+    CASE 
+        WHEN ps.Score > 100 AND ps.PostRank <= 10 THEN 'Top Content'
+        WHEN ps.Upvotes > 50 AND p.AnswerCount > 5 THEN 'High Engagement'
+        ELSE 'Regular'
+    END AS PostCategory
+FROM Users u
+JOIN UserBadgeStats bs ON u.Id = bs.UserId
+JOIN PostStats ps ON u.Id = ps.OwnerUserId
+JOIN PostTypes pt ON ps.PostTypeId = pt.Id
+LEFT JOIN ClosedPosts cp ON ps.PostId = cp.PostId
+LEFT JOIN Posts p ON ps.PostId = p.Id
+WHERE 
+    u.Reputation > 1000 
+    AND (ps.Upvotes + ps.Downvotes) > 20 
+    AND cp.CloseReason IS NOT NULL
+
+UNION ALL
+
+SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    0, 0, 0,
+    NULL,
+    'No Posts',
+    NULL,
+    NULL,
+    'N/A',
+    'N/A',
+    NULL,
+    NULL,
+    -1,
+    'Inactive'
+FROM Users u
+WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+ORDER BY Reputation DESC, Score DESC NULLS LAST;

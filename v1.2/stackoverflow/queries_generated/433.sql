@@ -1,0 +1,163 @@
+-- {"query": "433.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1651} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 as Level,
+        cast(t.TagName as varchar(1000)) as Path
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Level + 1,
+        r.Path || ' > ' || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id <> r.Id and t2.Count < r.Count
+    where r.Level < 3
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) as TotalBadges,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostActivityWindow as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as RecentPostRank,
+        lag(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as PrevScore,
+        lead(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as NextScore,
+        case 
+            when p.Score > coalesce(lag(p.Score) over (partition by p.OwnerUserId order by p.CreationDate), 0) then 1 
+            else 0 
+        end as IsImprovedScore,
+        case when p.ClosedDate is not null then 1 else 0 end as IsClosed
+    from Posts p
+    where p.PostTypeId in (1, 2)
+),
+ClosedReasonCounts as (
+    select
+        ph.Comment as CloseReasonId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseCount
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as smallint)
+    where ph.PostHistoryTypeId = 10
+    group by ph.Comment, crt.Name
+),
+UserPostSummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) as TotalPosts,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) as Questions,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) as Answers,
+        avg(p.Score) as AvgPostScore,
+        sum(case when p.ClosedDate is not null then 1 else 0 end) as ClosedPosts,
+        max(p.CreationDate) as LastPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+),
+UserCommentActivity as (
+    select
+        c.UserId,
+        count(*) as TotalComments,
+        avg(length(c.Text)) as AvgCommentLength,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    group by c.UserId
+),
+UserVoteActivity as (
+    select
+        v.UserId,
+        count(*) filter (where vt.Name = 'UpMod') as UpVotesGiven,
+        count(*) filter (where vt.Name = 'DownMod') as DownVotesGiven,
+        count(*) filter (where vt.Name = 'Favorite') as FavoritesGiven,
+        count(*) as TotalVotesGiven
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.UserId
+),
+HighImpactPosts as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.Tags,
+        (p.Score * 2 + p.ViewCount / 100 + p.FavoriteCount * 5) as ImpactScore
+    from Posts p
+    where p.PostTypeId = 1 and p.Score > 10
+),
+UserHighImpactSummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(hp.Id) as HighImpactPostCount,
+        avg(hp.ImpactScore) as AvgImpactScore
+    from Users u
+    left join HighImpactPosts hp on hp.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+)
+select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    coalesce(ubs.TotalBadges, 0) as TotalBadges,
+    coalesce(ubs.GoldBadges, 0) as GoldBadges,
+    coalesce(ubs.SilverBadges, 0) as SilverBadges,
+    coalesce(ubs.BronzeBadges, 0) as BronzeBadges,
+    coalesce(ups.TotalPosts, 0) as TotalPosts,
+    coalesce(ups.Questions, 0) as Questions,
+    coalesce(ups.Answers, 0) as Answers,
+    coalesce(ups.ClosedPosts, 0) as ClosedPosts,
+    coalesce(uca.TotalComments, 0) as TotalComments,
+    coalesce(uca.AvgCommentLength, 0) as AvgCommentLength,
+    coalesce(uva.UpVotesGiven, 0) as UpVotesGiven,
+    coalesce(uva.DownVotesGiven, 0) as DownVotesGiven,
+    coalesce(uhis.HighImpactPostCount, 0) as HighImpactPostCount,
+    coalesce(uhis.AvgImpactScore, 0) as AvgImpactScore,
+    case 
+        when u.LastAccessDate > now() - interval '30 days' then 'Active'
+        when u.LastAccessDate > now() - interval '180 days' then 'Inactive'
+        else 'Dormant'
+    end as UserActivityStatus,
+    string_agg(distinct rth.Path, ' | ') as SampleTagPaths
+from Users u
+left join UserBadgeStats ubs on ubs.UserId = u.Id
+left join UserPostSummary ups on ups.UserId = u.Id
+left join UserCommentActivity uca on uca.UserId = u.Id
+left join UserVoteActivity uva on uva.UserId = u.Id
+left join UserHighImpactSummary uhis on uhis.UserId = u.Id
+left join RecursiveTagHierarchy rth on rth.Level = 1
+where u.Reputation > 1000
+group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, ubs.TotalBadges, ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges, ups.TotalPosts, ups.Questions, ups.Answers, ups.ClosedPosts, uca.TotalComments, uca.AvgCommentLength, uva.UpVotesGiven, uva.DownVotesGiven, uhis.HighImpactPostCount, uhis.AvgImpactScore
+order by u.Reputation desc, HighImpactPostCount desc
+limit 50;

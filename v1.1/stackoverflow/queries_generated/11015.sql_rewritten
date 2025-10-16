@@ -1,0 +1,70 @@
+-- {"query": "11015.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 614} 
+WITH RecentPosts AS (
+    SELECT 
+        Posts.Id, 
+        Posts.Title, 
+        Posts.CreationDate, 
+        Posts.Score, 
+        Users.DisplayName AS OwnerDisplayName, 
+        Users.Reputation AS OwnerReputation,
+        COUNT(DISTINCT Comments.Id) AS CommentCount,
+        (SELECT COUNT(*) FROM Votes WHERE Votes.PostId = Posts.Id) AS TotalVotes,
+        (SELECT COUNT(*) FROM Badges WHERE Badges.UserId = Posts.OwnerUserId) AS UserBadgeCount,
+        (SELECT COUNT(*) FROM PostHistory WHERE PostHistory.PostId = Posts.Id AND PostHistory.CreationDate > Posts.CreationDate) AS EditCount,
+        (SELECT COUNT(*) FROM PostLinks WHERE PostLinks.PostId = Posts.Id) AS LinkCount,
+        (SELECT STRING_AGG(Tags.TagName, ', ') FROM Tags WHERE FIND_IN_SET(Tags.Id, Posts.Tags) > 0) AS TagNames
+    FROM 
+        Posts
+    JOIN 
+        Users ON Posts.OwnerUserId = Users.Id
+    LEFT JOIN 
+        Comments ON Posts.Id = Comments.PostId
+    WHERE 
+        Posts.CreationDate > cast('2024-10-01' as date) - INTERVAL '30 days'
+    GROUP BY 
+        Posts.Id, Users.DisplayName, Users.Reputation
+),
+UserActivity AS (
+    SELECT 
+        Users.Id, 
+        Users.DisplayName, 
+        COUNT(DISTINCT Posts.Id) AS PostsCount, 
+        COUNT(DISTINCT Comments.Id) AS CommentsCount, 
+        COUNT(DISTINCT Badges.Id) AS BadgesCount
+    FROM 
+        Users
+    LEFT JOIN 
+        Posts ON Users.Id = Posts.OwnerUserId
+    LEFT JOIN 
+        Comments ON Users.Id = Comments.UserId
+    LEFT JOIN 
+        Badges ON Users.Id = Badges.UserId
+    GROUP BY 
+        Users.Id
+)
+SELECT 
+    RecentPosts.Id AS PostId, 
+    RecentPosts.Title, 
+    RecentPosts.CreationDate, 
+    RecentPosts.Score, 
+    RecentPosts.OwnerDisplayName, 
+    RecentPosts.OwnerReputation, 
+    RecentPosts.CommentCount, 
+    RecentPosts.TotalVotes, 
+    RecentPosts.UserBadgeCount, 
+    RecentPosts.EditCount, 
+    RecentPosts.LinkCount, 
+    RecentPosts.TagNames, 
+    UserActivity.PostsCount, 
+    UserActivity.CommentsCount, 
+    UserActivity.BadgesCount
+FROM 
+    RecentPosts
+JOIN 
+    UserActivity ON RecentPosts.Id = UserActivity.Id
+WHERE 
+    RecentPosts.Score > 10 OR RecentPosts.CommentCount > 5
+ORDER BY 
+    RecentPosts.CreationDate DESC, 
+    RecentPosts.Score DESC
+LIMIT 100;

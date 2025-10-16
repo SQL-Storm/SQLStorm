@@ -1,0 +1,188 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate) AS UserRank,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC, p.CreationDate) AS GlobalRank,
+        p.Tags
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    WHERE 
+        p.PostTypeId IN (1, 2) AND p.Score > 0 AND p.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '1 year'
+),
+TopUsers AS (
+    SELECT 
+        OwnerUserId,
+        COUNT(Id) AS PostCount,
+        SUM(Score) AS TotalScore,
+        AVG(Score) AS AvgScore,
+        MAX(ViewCount) AS MaxViewCount
+    FROM 
+        RankedPosts
+    WHERE 
+        UserRank <= 3
+    GROUP BY 
+        OwnerUserId
+    HAVING 
+        COUNT(Id) > 1
+),
+TagStats AS (
+    SELECT 
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.ViewCount) AS MaxViewCount
+    FROM 
+        Tags t
+    JOIN 
+        Posts p ON t.WikiPostId = p.Id OR t.ExcerptPostId = p.Id
+    WHERE 
+        p.PostTypeId = 1 AND p.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '1 year'
+    GROUP BY 
+        t.TagName
+),
+UserBadgeCounts AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM 
+        Users u
+    LEFT JOIN 
+        Badges b ON u.Id = b.UserId
+    GROUP BY 
+        u.Id, u.DisplayName
+),
+PostHistorySummary AS (
+    SELECT 
+        ph.PostId,
+        COUNT(ph.Id) AS HistoryCount,
+        MAX(ph.CreationDate) AS LastHistoryDate
+    FROM 
+        PostHistory ph
+    WHERE 
+        ph.PostHistoryTypeId IN (4, 5, 6)
+    GROUP BY 
+        ph.PostId
+),
+PostComments AS (
+    SELECT 
+        c.PostId,
+        COUNT(c.Id) AS CommentCount,
+        AVG(c.Score) AS AvgCommentScore
+    FROM 
+        Comments c
+    WHERE 
+        c.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '1 year'
+    GROUP BY 
+        c.PostId
+),
+-- dialect-agnostic tag splitting using recursive CTE; ensure non-recursive term types match recursive term types
+split_tags_source AS (
+  SELECT Id, Tags FROM RankedPosts
+),
+split_tags AS (
+  -- non-recursive term: cast Tags to plain varchar / text by using CAST so the recursive term has same type
+  SELECT Id AS post_id,
+         CAST(Tags AS VARCHAR(4000)) AS rest,
+         CAST(NULL AS VARCHAR(4000)) AS tag
+  FROM split_tags_source
+  UNION ALL
+  SELECT post_id,
+         CASE
+           WHEN instr = 0 THEN ''
+           ELSE SUBSTR(rest, instr + 1)
+         END,
+         CASE
+           WHEN start_pos = 0 OR end_pos = 0 THEN NULL
+           ELSE SUBSTR(rest, start_pos + 1, end_pos - start_pos - 1)
+         END
+  FROM (
+    SELECT post_id, rest,
+           CASE WHEN POSITION('<' IN rest) > 0 THEN POSITION('<' IN rest) ELSE 0 END AS start_pos,
+           CASE WHEN POSITION('>' IN rest) > 0 THEN POSITION('>' IN rest) ELSE 0 END AS end_pos,
+           CASE WHEN POSITION('<' IN rest) > 0 THEN POSITION('<' IN rest) ELSE 0 END AS instr
+    FROM split_tags
+    WHERE rest IS NOT NULL AND rest <> ''
+  ) s
+  WHERE s.start_pos > 0 AND s.end_pos > s.start_pos
+),
+RankedPostTags AS (
+  SELECT post_id AS Id, tag AS TagName
+  FROM split_tags
+  WHERE tag IS NOT NULL AND tag <> ''
+)
+SELECT 
+    rp.Id,
+    rp.PostTypeId,
+    rp.Score,
+    rp.ViewCount,
+    rp.CreationDate,
+    rp.OwnerUserId,
+    rp.OwnerDisplayName,
+    tu.PostCount,
+    tu.TotalScore,
+    tu.AvgScore,
+    tu.MaxViewCount,
+    ts.TagName,
+    ts.PostCount AS TagPostCount,
+    ts.AvgScore AS TagAvgScore,
+    ts.MaxViewCount AS TagMaxViewCount,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    phs.HistoryCount,
+    phs.LastHistoryDate,
+    pc.CommentCount,
+    pc.AvgCommentScore
+FROM 
+    RankedPosts rp
+JOIN 
+    TopUsers tu ON rp.OwnerUserId = tu.OwnerUserId
+JOIN 
+    RankedPostTags rt ON rp.Id = rt.Id
+JOIN 
+    TagStats ts ON rt.TagName = ts.TagName
+LEFT JOIN 
+    UserBadgeCounts ub ON rp.OwnerUserId = ub.Id
+LEFT JOIN 
+    PostHistorySummary phs ON rp.Id = phs.PostId
+LEFT JOIN 
+    PostComments pc ON rp.Id = pc.PostId
+WHERE 
+    rp.GlobalRank <= 100
+GROUP BY
+    rp.Id,
+    rp.PostTypeId,
+    rp.Score,
+    rp.ViewCount,
+    rp.CreationDate,
+    rp.OwnerUserId,
+    rp.OwnerDisplayName,
+    tu.PostCount,
+    tu.TotalScore,
+    tu.AvgScore,
+    tu.MaxViewCount,
+    ts.TagName,
+    ts.PostCount,
+    ts.AvgScore,
+    ts.MaxViewCount,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    phs.HistoryCount,
+    phs.LastHistoryDate,
+    pc.CommentCount,
+    pc.AvgCommentScore
+ORDER BY 
+    rp.Score DESC, 
+    rp.CreationDate;

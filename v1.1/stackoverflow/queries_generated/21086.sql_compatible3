@@ -1,0 +1,144 @@
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesGiven,
+        AVG(p.Score) AS AvgPostScore,
+        COUNT(p.Id) AS TotalPosts
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.DeletionDate IS NULL
+    LEFT JOIN Votes v ON v.UserId = u.Id AND v.VoteTypeId IN (2, 3)
+    WHERE u.Reputation > 100
+      AND u.LastAccessDate > (CAST('2024-10-01' AS DATE) - INTERVAL '1 year')
+    GROUP BY u.Id, u.Reputation, u.CreationDate
+    HAVING COUNT(p.Id) > 5
+),
+TopContributors AS (
+    SELECT 
+        au.UserId,
+        au.Reputation,
+        au.UserCreationDate,
+        au.QuestionCount,
+        au.AnswerCount,
+        au.UpVotesGiven,
+        au.AvgPostScore,
+        au.TotalPosts,
+        ROW_NUMBER() OVER (
+            PARTITION BY EXTRACT(YEAR FROM au.UserCreationDate) 
+            ORDER BY (au.QuestionCount + au.AnswerCount * 1.5 + au.UpVotesGiven) DESC
+        ) AS YearlyRank,
+        LAG(au.Reputation) OVER (
+            PARTITION BY EXTRACT(YEAR FROM au.UserCreationDate) 
+            ORDER BY au.Reputation DESC
+        ) AS PrevYearRep
+    FROM ActiveUsers au
+),
+BadgeAchievers AS (
+    SELECT 
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Date,
+        b.Class,
+        COUNT(*) OVER (PARTITION BY b.UserId, b.Class) AS ClassTotal,
+        STRING_AGG(DISTINCT SUBSTRING(t.TagName FROM 1 FOR 20), ', ' ORDER BY t.TagName) AS TagBadges
+    FROM Badges b
+    LEFT JOIN Tags t ON b.TagBased = TRUE AND t.Id = b.Id
+    WHERE b.Date > (CAST('2024-10-01' AS DATE) - INTERVAL '2 years')
+      AND (b.Class = 1 OR b.Name ILIKE '%gold%' OR b.Name ILIKE '%legendary%')
+    GROUP BY b.UserId, b.Name, b.Date, b.Class
+),
+UserStats AS (
+    SELECT 
+        tc.UserId,
+        tc.Reputation,
+        tc.YearlyRank,
+        tc.PrevYearRep,
+        COALESCE(ba.BadgeName, 'No Gold Badges') AS TopBadge,
+        CASE 
+            WHEN tc.Reputation - COALESCE(tc.PrevYearRep, 0) > 1000 THEN 'High Growth'
+            WHEN tc.Reputation < 500 THEN 'Beginner'
+            ELSE 'Steady'
+        END AS GrowthCategory,
+        GREATEST(tc.QuestionCount, tc.AnswerCount, 0) AS MaxPosts,
+        tc.AvgPostScore,
+        COALESCE(ba.ClassTotal, 0) AS GoldBadgesCount,
+        NULLIF(SUBSTRING(ba.TagBadges FROM 1 FOR 50), '') AS SampleTags,
+        tc.QuestionCount,
+        tc.AnswerCount,
+        tc.UpVotesGiven,
+        tc.TotalPosts
+    FROM TopContributors tc
+    LEFT JOIN BadgeAchievers ba ON tc.UserId = ba.UserId
+    WHERE tc.YearlyRank <= 50
+      AND (tc.AvgPostScore IS NULL OR tc.AvgPostScore > 0)
+)
+SELECT 
+    us.UserId,
+    us.Reputation,
+    us.YearlyRank,
+    us.PrevYearRep,
+    us.TopBadge,
+    us.GrowthCategory,
+    us.MaxPosts,
+    us.AvgPostScore,
+    us.GoldBadgesCount,
+    us.SampleTags,
+    (SELECT COUNT(DISTINCT pl.PostId) 
+     FROM PostLinks pl 
+     INNER JOIN Posts linked ON pl.RelatedPostId = linked.Id 
+     WHERE pl.PostId = p.Id 
+       AND linked.Score > COALESCE(us.AvgPostScore, -9223372036854775808) 
+       AND pl.LinkTypeId = 1
+    ) AS HighQualityLinks,
+    CASE 
+        WHEN us.GoldBadgesCount > 10 THEN 'Elite'
+        WHEN us.GoldBadgesCount > 3 THEN 'Veteran'
+        ELSE 'Rising'
+    END AS StatusLevel,
+    ('Rep: ' || CAST(us.Reputation AS VARCHAR) ||
+        CASE WHEN us.PrevYearRep IS NOT NULL THEN 
+            (' (+' || CAST((us.Reputation - us.PrevYearRep) AS VARCHAR) || ')') 
+        ELSE '' END ||
+        ', Rank: #' || CAST(us.YearlyRank AS VARCHAR)
+    ) AS SummaryString,
+    edits.AvgTimeToFirstEdit,
+    edits.EditCount
+FROM UserStats us
+CROSS JOIN LATERAL (
+    SELECT p_inner.Id, p_inner.OwnerUserId, p_inner.PostTypeId, p_inner.Score, p_inner.CreationDate
+    FROM Posts p_inner
+    WHERE p_inner.OwnerUserId = us.UserId 
+      AND p_inner.PostTypeId IN (1, 2)
+      AND p_inner.Score >= (
+          SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY Score) FROM Posts
+      )
+      AND p_inner.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '6 months')
+    ORDER BY p_inner.Score DESC 
+    LIMIT 1
+) p
+FULL OUTER JOIN (
+    SELECT 
+        u.Id,
+        AVG(EXTRACT(EPOCH FROM (ph.CreationDate - p.CreationDate))/86400.0) AS AvgTimeToFirstEdit,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 END) AS EditCount
+    FROM Users u
+    INNER JOIN Posts p ON p.OwnerUserId = u.Id
+    INNER JOIN PostHistory ph ON ph.PostId = p.Id 
+        AND ph.UserId = u.Id
+        AND ph.PostHistoryTypeId IN (4, 5, 6)
+    WHERE p.PostTypeId = 1 
+      AND ph.CreationDate > p.CreationDate
+    GROUP BY u.Id
+    HAVING COUNT(ph.Id) > 0
+) edits ON us.UserId = edits.Id
+WHERE us.Reputation > (
+    SELECT PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY Reputation) 
+    FROM Users 
+    WHERE CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '3 years')
+)
+  AND (edits.EditCount IS NULL OR edits.EditCount > 2 OR us.GrowthCategory = 'High Growth')
+ORDER BY us.Reputation DESC, us.YearlyRank ASC
+LIMIT 100;

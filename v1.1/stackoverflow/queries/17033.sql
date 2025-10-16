@@ -1,0 +1,128 @@
+WITH UserMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        (EXTRACT(YEAR FROM AGE(CAST('2024-10-01' AS DATE), u.CreationDate)) * 12 + 
+         EXTRACT(MONTH FROM AGE(CAST('2024-10-01' AS DATE), u.CreationDate))) AS AccountAgeMonths,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COALESCE(AVG(CASE WHEN p.Score IS NOT NULL THEN p.Score END), 0) AS AvgPostScore,
+        COALESCE(STRING_AGG(DISTINCT CASE WHEN b.Class = 1 THEN b.Name END, ', '), 'None') AS GoldBadges,
+        ROW_NUMBER() OVER (PARTITION BY SUBSTRING(COALESCE(u.Location, 'Unknown'), 1, 
+            CASE WHEN POSITION(',' IN COALESCE(u.Location, 'Unknown')) > 0 
+            THEN POSITION(',' IN COALESCE(u.Location, 'Unknown')) - 1 
+            ELSE LENGTH(COALESCE(u.Location, 'Unknown')) END)
+            ORDER BY u.Reputation DESC) AS LocationRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '3' YEAR
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location, u.CreationDate
+),
+PopularTags AS (
+    SELECT 
+        tag AS TagName,
+        COUNT(*) AS UsageCount,
+        AVG(p.Score) AS AvgScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.ViewCount) AS MedianViews
+    FROM Posts p,
+         UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS tag
+    WHERE p.PostTypeId = 1 
+        AND p.Tags IS NOT NULL
+        AND p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '1' YEAR
+    GROUP BY tag
+    HAVING COUNT(*) > 100
+),
+EditActivity AS (
+    SELECT 
+        ph.PostId,
+        COUNT(DISTINCT ph.UserId) AS UniqueEditors,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 END) AS EditCount,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS LastCloseDate,
+        BOOL_OR(ph.PostHistoryTypeId = 11) AS WasReopened,
+        LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PrevEditTime,
+        FIRST_VALUE(ph.Comment) OVER (
+            PARTITION BY ph.PostId 
+            ORDER BY CASE WHEN ph.PostHistoryTypeId = 10 THEN 0 ELSE 1 END, 
+                     ph.CreationDate DESC
+        ) AS CloseReason
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 10, 11)
+    GROUP BY ph.PostId, ph.CreationDate, ph.Comment, ph.PostHistoryTypeId
+)
+SELECT 
+    um.DisplayName,
+    um.Reputation,
+    um.Location,
+    um.AccountAgeMonths,
+    um.QuestionCount + um.AnswerCount AS TotalContributions,
+    ROUND(CAST(um.AvgPostScore AS NUMERIC), 2) AS AvgPostScore,
+    um.GoldBadges,
+    COALESCE(pt.TagName, 'no-popular-tags') AS MostUsedPopularTag,
+    COALESCE(pt.UsageCount, 0) AS TagUsageCount,
+    COUNT(DISTINCT q.Id) AS QuestionsWithActivity,
+    COUNT(DISTINCT CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN q.Id END) AS QuestionsWithAcceptedAnswer,
+    COALESCE(AVG(CASE WHEN a.Id IS NOT NULL THEN 
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600.0 END), -1) AS AvgHoursToFirstAnswer,
+    COUNT(DISTINCT CASE WHEN c.Score > 5 THEN c.Id END) AS HighScoredComments,
+    SUM(CASE WHEN ea.WasReopened THEN 1 ELSE 0 END) AS ReopenedQuestions,
+    CASE 
+        WHEN um.Reputation >= 10000 THEN 'Expert'
+        WHEN um.Reputation >= 1000 THEN 'Experienced'
+        WHEN um.Reputation >= 100 THEN 'Regular'
+        ELSE 'Novice'
+    END AS UserTier,
+    STRING_AGG(DISTINCT CASE WHEN pl.LinkTypeId = 3 AND pl.PostId = q.Id THEN CAST(pl.RelatedPostId AS VARCHAR) END, ',' ) AS DuplicateTargets,
+    COALESCE(MAX(v.BountyAmount), 0) AS MaxBountyOffered,
+    DENSE_RANK() OVER (ORDER BY um.Reputation DESC NULLS LAST) AS GlobalRank
+FROM UserMetrics um
+LEFT JOIN LATERAL (
+    SELECT q2.*
+    FROM Posts q2
+    WHERE q2.OwnerUserId = um.Id 
+        AND q2.PostTypeId = 1
+        AND q2.Score > 0
+    ORDER BY q2.Score DESC
+    LIMIT 10
+) q ON TRUE
+LEFT JOIN LATERAL (
+    SELECT pt2.*
+    FROM PopularTags pt2
+    WHERE EXISTS (
+        SELECT 1 
+        FROM Posts p 
+        WHERE p.OwnerUserId = um.Id 
+            AND p.Tags LIKE '%' || '<' || pt2.TagName || '>' || '%'
+    )
+    ORDER BY pt2.UsageCount DESC
+    LIMIT 1
+) pt ON TRUE
+LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+LEFT JOIN EditActivity ea ON ea.PostId = q.Id
+LEFT JOIN Comments c ON c.PostId = q.Id OR c.PostId = a.Id
+LEFT JOIN PostLinks pl ON pl.PostId = q.Id
+LEFT JOIN Votes v ON v.PostId = q.Id AND v.VoteTypeId = 8
+WHERE um.LocationRank <= 10
+    AND um.TotalPosts > 5
+    AND (um.QuestionCount > 0 OR um.AnswerCount > 10)
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostHistory ph2
+        WHERE ph2.UserId = um.Id
+            AND ph2.PostHistoryTypeId = 12
+            AND ph2.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '6' MONTH
+    )
+GROUP BY 
+    um.DisplayName, um.Reputation, um.Location, um.AccountAgeMonths,
+    um.QuestionCount, um.AnswerCount, um.AvgPostScore, um.GoldBadges,
+    um.LocationRank, um.TotalPosts, pt.TagName, pt.UsageCount, um.Id
+HAVING COUNT(DISTINCT q.Id) > 0 
+    OR COUNT(DISTINCT c.Id) > 20
+ORDER BY 
+    GlobalRank,
+    COALESCE(AVG(CASE WHEN a.Id IS NOT NULL THEN EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600.0 END), 999999),
+    um.Reputation DESC
+FETCH FIRST 100 ROWS ONLY;

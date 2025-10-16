@@ -1,0 +1,159 @@
+-- {"query": "175.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.1, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1579} 
+with RecursiveUserBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by u.Id order by b.Date desc) as BadgeRank
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where b.TagBased = 0 or b.TagBased is null
+),
+TopBadges as (
+    select UserId, DisplayName, BadgeName, Class
+    from RecursiveUserBadges
+    where BadgeRank <= 3
+),
+QuestionAnswerStats as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score as QuestionScore,
+        p.ViewCount,
+        coalesce(a.AnswerCount, 0) as AnswerCount,
+        coalesce(a.AverageAnswerScore, 0) as AverageAnswerScore,
+        coalesce(a.MaxAnswerScore, 0) as MaxAnswerScore,
+        p.AcceptedAnswerId
+    from Posts p
+    left join (
+        select
+            ParentId,
+            count(*) as AnswerCount,
+            avg(Score) as AverageAnswerScore,
+            max(Score) as MaxAnswerScore
+        from Posts
+        where PostTypeId = 2
+        group by ParentId
+    ) a on p.Id = a.ParentId
+    where p.PostTypeId = 1
+),
+QuestionCloseInfo as (
+    select
+        ph.PostId,
+        max(case when ph.PostHistoryTypeId = 10 then ph.CreationDate else null end) as ClosedDate,
+        max(case when ph.PostHistoryTypeId = 11 then ph.CreationDate else null end) as ReopenedDate,
+        max(case when ph.PostHistoryTypeId = 10 then ph.Comment else null end) as CloseReasonId
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10, 11)
+    group by ph.PostId
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId
+    from PostLinks pl
+    inner join LinkTypes lt on pl.LinkTypeId = lt.Id
+    where lt.Name = 'Duplicate'
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        count(*) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as PostsLast30Days,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as QuestionsLast30Days,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as AnswersLast30Days
+    from Users u
+    left join Posts p on u.Id = p.OwnerUserId
+),
+ComplexUserStats as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        coalesce(b.BadgeCount, 0) as TotalBadges,
+        coalesce(qas.QuestionCount, 0) as TotalQuestions,
+        coalesce(qas.AnswerCount, 0) as TotalAnswers,
+        coalesce(avgScore.AvgQuestionScore, 0) as AvgQuestionScore,
+        coalesce(avgScore.AvgAnswerScore, 0) as AvgAnswerScore
+    from Users u
+    left join (
+        select OwnerUserId,
+            count(case when PostTypeId = 1 then 1 end) as QuestionCount,
+            count(case when PostTypeId = 2 then 1 end) as AnswerCount
+        from Posts
+        group by OwnerUserId
+    ) qas on u.Id = qas.OwnerUserId
+    left join (
+        select OwnerUserId,
+            avg(case when PostTypeId = 1 then Score end) as AvgQuestionScore,
+            avg(case when PostTypeId = 2 then Score end) as AvgAnswerScore
+        from Posts
+        group by OwnerUserId
+    ) avgScore on u.Id = avgScore.OwnerUserId
+    left join (
+        select UserId, count(*) as BadgeCount
+        from Badges
+        group by UserId
+    ) b on u.Id = b.UserId
+)
+select
+    qas.QuestionId,
+    qas.Title,
+    qas.OwnerUserId,
+    u.DisplayName as QuestionOwner,
+    qas.CreationDate as QuestionCreated,
+    qas.QuestionScore,
+    qas.ViewCount,
+    qas.AnswerCount,
+    qas.AverageAnswerScore,
+    qas.MaxAnswerScore,
+    case when qas.AcceptedAnswerId is not null then 'Yes' else 'No' end as HasAcceptedAnswer,
+    ci.ClosedDate,
+    ci.ReopenedDate,
+    crt.Name as CloseReason,
+    dup.RelatedPostId as DuplicateOf,
+    ts.BadgeName as TopBadge1,
+    ts2.BadgeName as TopBadge2,
+    ts3.BadgeName as TopBadge3,
+    cu.Reputation as OwnerReputation,
+    cu.TotalBadges as OwnerTotalBadges,
+    cu.TotalQuestions as OwnerTotalQuestions,
+    cu.TotalAnswers as OwnerTotalAnswers,
+    cu.AvgQuestionScore as OwnerAvgQuestionScore,
+    cu.AvgAnswerScore as OwnerAvgAnswerScore,
+    ua.PostsLast30Days,
+    ua.QuestionsLast30Days,
+    ua.AnswersLast30Days,
+    -- Complex string expression with NULL logic
+    concat_ws(' | ',
+        coalesce(u.Location, 'Unknown Location'),
+        coalesce(u.WebsiteUrl, 'No Website'),
+        case when u.AboutMe is not null and length(u.AboutMe) > 100 then substring(u.AboutMe from 1 for 100) || '...' else coalesce(u.AboutMe, 'No AboutMe') end
+    ) as UserSummary
+from QuestionAnswerStats qas
+left join Users u on qas.OwnerUserId = u.Id
+left join QuestionCloseInfo ci on qas.QuestionId = ci.PostId
+left join CloseReasonTypes crt on crt.Id = ci.CloseReasonId
+left join DuplicateLinks dup on qas.QuestionId = dup.PostId
+left join TopBadges ts on ts.UserId = qas.OwnerUserId and ts.BadgeRank = 1
+left join TopBadges ts2 on ts2.UserId = qas.OwnerUserId and ts2.BadgeRank = 2
+left join TopBadges ts3 on ts3.UserId = qas.OwnerUserId and ts3.BadgeRank = 3
+left join ComplexUserStats cu on cu.Id = qas.OwnerUserId
+left join UserActivityWindow ua on ua.UserId = qas.OwnerUserId and ua.PostId = qas.QuestionId
+where qas.ViewCount > 1000
+  and (ci.ClosedDate is null or ci.ReopenedDate > ci.ClosedDate)
+  and (qas.AverageAnswerScore > 2 or qas.AnswerCount > 5)
+order by qas.ViewCount desc, qas.QuestionScore desc
+limit 100;

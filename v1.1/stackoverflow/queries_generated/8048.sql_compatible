@@ -1,0 +1,211 @@
+as (
+    select pl.postid as question_id,
+           count(*) filter (where pl.linktypeid = 3) as duplicate_links_out,
+           count(*) filter (where pl.linktypeid = 1) as linked_links_out
+    from postlinks pl
+    group by pl.postid
+),
+hot_streaks as (
+    select qa.owneruserid as user_id,
+           count(*) filter (
+               where qa.creationdate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '365 days')
+                 and qa.score >= 5
+                 and qa.viewcount >= 1000
+           ) as hot_questions_year,
+           avg(cast(qa.score as numeric)) filter (where qa.creationdate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '365 days')) as avg_qscore_year
+    from question_activity qa
+    group by qa.owneruserid
+),
+user_recent_activity as (
+    select p.owneruserid as user_id,
+           count(*) filter (where p.posttypeid = 1 and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days') as questions_30d,
+           count(*) filter (where p.posttypeid = 2 and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days') as answers_30d,
+           max(p.lastactivitydate) as last_seen_post_activity
+    from posts p
+    group by p.owneruserid
+),
+question_rank as (
+    select qa.question_id,
+           qa.owneruserid,
+           qa.score,
+           qa.viewcount,
+           qa.favoritecount,
+           qa.answercount,
+           qa.upvotes,
+           qa.downvotes,
+           qa.bounty_started,
+           qa.bounty_awarded,
+           qa.comment_count,
+           qa.creationdate,
+           qa.last_activity,
+           dense_rank() over (order by coalesce(qa.score,0) desc, coalesce(qa.viewcount,0) desc, qa.creationdate asc) as global_q_rank
+    from question_activity qa
+),
+complex_predicate as (
+    select qr.question_id,
+           case
+             when (qr.upvotes - qr.downvotes) >= 10 and qr.viewcount >= 5000 then 'highly_engaged'
+             when qr.answercount = 0 and (qr.viewcount < 100 or qr.score <= 0) then 'unanswered_low_interest'
+             when qr.bounty_started > 0 or qr.bounty_awarded > 0 then 'bounty'
+             when qr.comment_count >= 10 and qr.score between -1 and 3 then 'controversial'
+             else 'other'
+           end as engagement_bucket,
+           (
+            (coalesce(qr.score,0) * 3)
+            + least(coalesce(qr.viewcount,0) / nullif(qr.comment_count,0), 500)
+            + coalesce(qr.favoritecount,0)
+            + (case when qr.bounty_awarded > 0 then 50 else 0 end)
+            - (qr.downvotes * 2)
+           )::numeric as heuristic_score
+    from question_rank qr
+),
+owner_enriched as (
+    select tu.user_id,
+           tu.displayname,
+           tu.reputation,
+           tu.location_norm,
+           coalesce(ubs.badges_total,0) as badges_total,
+           coalesce(ubs.gold_count,0) as gold_count,
+           coalesce(ubs.silver_count,0) as silver_count,
+           coalesce(ubs.bronze_count,0) as bronze_count,
+           u.views as profile_views,
+           u.upvotes as given_upvotes,
+           u.downvotes as given_downvotes,
+           coalesce(ura.questions_30d,0) as questions_30d,
+           coalesce(ura.answers_30d,0) as answers_30d,
+           ura.last_seen_post_activity,
+           coalesce(hs.hot_questions_year,0) as hot_questions_year,
+           coalesce(hs.avg_qscore_year,0) as avg_qscore_year
+    from top_users tu
+    left join users u on u.id = tu.user_id
+    left join user_badge_summary ubs on ubs.userid = tu.user_id
+    left join user_recent_activity ura on ura.user_id = tu.user_id
+    left join hot_streaks hs on hs.user_id = tu.user_id
+),
+accepted_join as (
+    select a.question_id,
+           case when a.acceptedanswerid is not null then 1 else 0 end as has_accepted,
+           a.acceptedanswerid
+    from accepted a
+),
+best_answerers as (
+    select ans.question_id,
+           ans.answer_id,
+           ans.answerer_id,
+           ans.answer_score,
+           ans.answer_creationdate,
+           ans.answer_rank_by_score,
+           case when ans.answer_id = acc.acceptedanswerid then 1 else 0 end as is_accepted
+    from answers ans
+    left join accepted acc on acc.question_id = ans.question_id
+    where ans.answer_rank_by_score <= 3
+),
+user_string_features as (
+    select u.id as user_id,
+           lower(coalesce(nullif(u.displayname,''),'anonymous')) as dn_lower,
+           length(coalesce(u.websiteurl,'')) as url_len,
+           position('.com' in coalesce(u.websiteurl,'')) as dotcom_pos,
+           case when u.emailhash is null or (u.emailhash ~ '^[0-9a-f]{32}$') = false then 0 else 1 end as emailhash_valid
+    from users u
+),
+final_agg as (
+    select
+        qr.question_id,
+        qr.owneruserid as owner_id,
+        oe.displayname as owner_displayname,
+        oe.reputation,
+        oe.location_norm,
+        usf.dn_lower,
+        usf.url_len,
+        usf.dotcom_pos,
+        usf.emailhash_valid,
+        qr.score,
+        qr.viewcount,
+        qr.favoritecount,
+        qr.answercount,
+        qr.upvotes,
+        qr.downvotes,
+        qr.bounty_started,
+        qr.bounty_awarded,
+        qr.comment_count,
+        qr.creationdate,
+        qr.last_activity,
+        qr.global_q_rank,
+        cp.engagement_bucket,
+        cp.heuristic_score,
+        coalesce(as2.total_answers,0) as total_answers,
+        as2.avg_answer_score,
+        as2.max_answer_score,
+        as2.min_answer_score,
+        as2.positive_answers,
+        coalesce(phc.close_events,0) as close_events,
+        coalesce(phc.reopen_events,0) as reopen_events,
+        phc.last_close_or_reopen,
+        coalesce(phc.migration_events,0) as migration_events,
+        coalesce(dup.duplicate_links_out,0) as duplicate_links_out,
+        coalesce(dup.linked_links_out,0) as linked_links_out,
+        coalesce(aj.has_accepted,0) as has_accepted,
+        aj.acceptedanswerid,
+        coalesce(oe.badges_total,0) as badges_total,
+        oe.gold_count,
+        oe.silver_count,
+        oe.bronze_count,
+        oe.profile_views,
+        oe.given_upvotes,
+        oe.given_downvotes,
+        oe.questions_30d,
+        oe.answers_30d,
+        oe.last_seen_post_activity,
+        oe.hot_questions_year,
+        oe.avg_qscore_year,
+        tq.tag as top_tag_by_count,
+        tq.tag_q_count,
+        tq.avg_q_score as tag_avg_q_score,
+        tq.p90_views as tag_p90_views
+    from question_rank qr
+    left join complex_predicate cp on cp.question_id = qr.question_id
+    left join answer_stats as2 on as2.question_id = qr.question_id
+    left join post_history_closures phc on phc.postid = qr.question_id
+    left join duplicates dup on dup.question_id = qr.question_id
+    left join accepted_join aj on aj.question_id = qr.question_id
+    left join owner_enriched oe on oe.user_id = qr.owneruserid
+    left join user_string_features usf on usf.user_id = qr.owneruserid
+    left join lateral (
+        select tq1.tag, tq1.tag_q_count, tq1.avg_q_score, tq1.p90_views
+        from tag_expanded te
+        join tag_quality tq1 on tq1.tag = te.tag
+        where te.question_id = qr.question_id
+        order by tq1.tag_q_count desc nulls last, tq1.avg_q_score desc nulls last, tq1.tag asc
+        limit 1
+    ) tq on true
+),
+ranked as (
+    select f.*,
+           row_number() over (
+               order by
+                   coalesce(f.heuristic_score,0) desc,
+                   coalesce(f.score,0) desc,
+                   coalesce(f.viewcount,0) desc,
+                   f.creationdate asc
+           ) as overall_rank
+    from final_agg f
+)
+select *
+from ranked r
+where (
+        r.engagement_bucket in ('highly_engaged','bounty')
+        or (r.has_accepted = 0 and r.total_answers >= 3 and r.score between 0 and 5)
+        or (r.close_events > r.reopen_events)
+      )
+  and coalesce(r.tag_p90_views,0) >= 100
+  and (
+        r.avg_qscore_year is null
+        or r.avg_qscore_year >= (
+            select avg(cast(score as numeric))
+            from posts p
+            where p.posttypeid = 1
+              and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+        )
+      )
+order by r.overall_rank
+limit 250;

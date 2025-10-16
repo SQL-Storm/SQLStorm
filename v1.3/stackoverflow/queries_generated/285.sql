@@ -1,0 +1,361 @@
+-- {"query": "285.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 4810} 
+with
+-- explode tags for questions
+question_tags as (
+  select
+    p.id as post_id,
+    trim(t) as tag
+  from posts p
+  cross join lateral (
+    select regexp_split_to_table(substring(coalesce(p.tags,''),2, greatest(length(coalesce(p.tags,'')) - 2,0)), '><') as t
+  ) s
+  where p.posttypeid = 1 and coalesce(p.tags,'') <> ''
+),
+
+-- badge aggregates per user
+user_badges as (
+  select
+    userid,
+    count(*) as badges_total,
+    sum(case when class = 1 then 1 else 0 end) as badges_gold,
+    sum(case when class = 2 then 1 else 0 end) as badges_silver,
+    sum(case when class = 3 then 1 else 0 end) as badges_bronze,
+    sum(case when tagbased = 1 then 1 else 0 end) as badges_tagbased
+  from badges
+  group by userid
+),
+
+-- vote aggregates per post
+vote_agg as (
+  select
+    postid,
+    sum(case when votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when votetypeid = 5 then 1 else 0 end) as favorites,
+    count(*) as total_votes
+  from votes
+  group by postid
+),
+
+-- link aggregates (duplicates/links)
+link_agg as (
+  select
+    postid,
+    sum(case when linktypeid = 3 then 1 else 0 end) as duplicate_count,
+    sum(case when linktypeid = 1 then 1 else 0 end) as explicit_link_count
+  from postlinks
+  group by postid
+),
+
+-- post history close / reopen / delete events
+history_flags as (
+  select
+    postid,
+    sum(case when posthistorytypeid in (10,35) then 1 else 0 end) as close_events,
+    sum(case when posthistorytypeid in (11,36) then 1 else 0 end) as reopen_events,
+    sum(case when posthistorytypeid in (12,13) then 1 else 0 end) as delete_undelete_events,
+    max(creationdate) as last_history_change
+  from posthistory
+  group by postid
+),
+
+-- comment aggregates per post
+comment_agg as (
+  select
+    postid,
+    count(*) as comment_count,
+    avg(score) filter (where score is not null) as avg_comment_score,
+    max(creationdate) as last_comment_date
+  from comments
+  group by postid
+),
+
+-- answer statistics per question using window functions to expose skew
+answer_stats as (
+  select
+    parentid as question_id,
+    count(*) as answer_count,
+    avg(score) as avg_answer_score,
+    max(score) as max_answer_score,
+    stddev_pop(score) as answer_score_stddev,
+    percentile_cont(0.5) within group (order by score) as median_answer_score
+  from posts
+  where posttypeid = 2
+  group by parentid
+),
+
+-- per-post base info enriched
+post_base as (
+  select
+    p.id,
+    p.posttypeid,
+    p.title,
+    p.parentid,
+    p.acceptedanswerid,
+    p.owneruserid,
+    p.ownerdisplayname,
+    p.creationdate,
+    p.lastactivitydate,
+    p.viewcount,
+    p.score,
+    p.answercount,
+    p.commentcount,
+    p.favoritecount,
+    coalesce(v.upvotes,0) as upvotes,
+    coalesce(v.downvotes,0) as downvotes,
+    coalesce(v.favorites,0) as favorites,
+    coalesce(l.duplicate_count,0) as duplicate_count,
+    coalesce(h.close_events,0) as close_events,
+    coalesce(c.comment_count,0) as comments,
+    coalesce(a.answer_count,0) as answers,
+    -- computed fields
+    extract(epoch from (now() - p.creationdate))/86400.0 as age_days,
+    (case when p.lastactivitydate is null then 0 else extract(epoch from (now() - p.lastactivitydate))/86400.0 end) as inactive_days,
+    -- correlated subquery: latest editor id & display name from history
+    (
+      select ph.userid
+      from posthistory ph
+      where ph.postid = p.id and ph.creationdate is not null
+      order by ph.creationdate desc
+      limit 1
+    ) as latest_editor_userid,
+    (
+      select ph.userdisplayname
+      from posthistory ph
+      where ph.postid = p.id and ph.creationdate is not null and ph.userdisplayname is not null
+      order by ph.creationdate desc
+      limit 1
+    ) as latest_editor_displayname,
+    -- correlated existence: badges gained by owner within 30 days before post creation
+    (
+      select count(1)
+      from badges b
+      where b.userid = p.owneruserid
+        and b.date >= (p.creationdate - interval '30 days')
+    ) as badges_within_30d_before_post
+  from posts p
+  left join vote_agg v on v.postid = p.id
+  left join link_agg l on l.postid = p.id
+  left join history_flags h on h.postid = p.id
+  left join comment_agg c on c.postid = p.id
+  left join answer_stats a on a.question_id = p.id
+),
+
+-- enrich users
+user_enriched as (
+  select
+    u.id,
+    u.reputation,
+    u.creationdate as user_creation,
+    u.displayname,
+    u.lastaccessdate,
+    u.location,
+    coalesce(b.badges_total,0) as badges_total,
+    coalesce(b.badges_gold,0) as badges_gold,
+    coalesce(b.badges_silver,0) as badges_silver,
+    coalesce(b.badges_bronze,0) as badges_bronze,
+    -- recency rank (when was last active)
+    rank() over (order by u.lastaccessdate desc) as access_recency_rank,
+    dense_rank() over (order by u.reputation desc) as reputation_rank
+  from users u
+  left join user_badges b on b.userid = u.id
+),
+
+-- combine everything for questions and for high-value answers (set operator later)
+question_enriched as (
+  select
+    pb.*,
+    ue.displayname as owner_displayname_resolved,
+    ue.reputation as owner_reputation,
+    ue.badges_total as owner_badge_total,
+    qt.tag,
+    -- some string expressions and null logic
+    nullif(trim(pb.title), '') as title_norm,
+    length(coalesce(pb.title,'')) as title_len,
+    case
+      when pb.viewcount is null then 0
+      when pb.viewcount < 10 then 1
+      when pb.viewcount between 10 and 999 then 2
+      else 3
+    end as view_bucket,
+    -- complex weighted score expression combining several signals
+    (
+      (coalesce(pb.score,0) * ln(greatest(coalesce(pb.viewcount,0),2)) )
+      + (2.5 * coalesce(pb.upvotes,0))
+      - (4.0 * coalesce(pb.downvotes,0))
+      + (1.5 * coalesce(pb.favoritecount,0))
+      + (5.0 * least(coalesce(a.max_answer_score,0), coalesce(pb.score,0)))
+      - (0.5 * coalesce(pb.close_events,0))
+      + (0.1 * coalesce(ue.reputation,0))
+      + (2.0 * least(coalesce(ue.badges_total,0),10))
+    ) as weighted_score,
+    -- ratio and null-safe calculations
+    (case when pb.answers > 0 then (coalesce(pb.score,0)::numeric / pb.answers) else coalesce(pb.score,0)::numeric end) as score_per_answer,
+    greatest(pb.age_days, 0) as age_days_nonneg,
+    -- popularity delta since last activity (string concat example)
+    concat(
+      (case when pb.viewcount is null then '0' else pb.viewcount::text end),
+      ' views, ',
+      coalesce(pb.comments::int,0)::text,
+      ' comments'
+    ) as popularity_label
+  from post_base pb
+  left join users ue on ue.id = pb.owneruserid
+  left join question_tags qt on qt.post_id = pb.id
+  left join answer_stats a on a.question_id = pb.id
+  where pb.posttypeid = 1
+),
+
+-- high-scoring answers treated as candidate items (to include with UNION)
+high_value_answers as (
+  select
+    pb.id,
+    2 as posttypeid,
+    null::varchar as title,
+    pb.parentid,
+    pb.acceptedanswerid,
+    pb.owneruserid,
+    pb.ownerdisplayname,
+    pb.creationdate,
+    pb.lastactivitydate,
+    pb.viewcount,
+    pb.score,
+    pb.answercount,
+    pb.commentcount,
+    pb.favoritecount,
+    pb.upvotes,
+    pb.downvotes,
+    pb.favorites,
+    pb.duplicate_count,
+    pb.close_events,
+    pb.comments,
+    pb.answers,
+    pb.age_days,
+    pb.inactive_days,
+    pb.latest_editor_userid,
+    pb.latest_editor_displayname,
+    pb.badges_within_30d_before_post,
+    ue.displayname as owner_displayname_resolved,
+    ue.reputation as owner_reputation,
+    ue.badges_total as owner_badge_total,
+    null::varchar as tag,
+    nullif(trim(coalesce(p.title,'')),'') as title_norm,
+    length(coalesce(p.title,'')) as title_len,
+    0 as view_bucket,
+    (
+      (coalesce(pb.score,0) * ln(greatest(coalesce(pb.viewcount,0),2)))
+      + (1.0 * coalesce(pb.upvotes,0))
+      - (2.0 * coalesce(pb.downvotes,0))
+      + (0.5 * coalesce(pb.favoritecount,0))
+      + (0.2 * coalesce(ue.reputation,0))
+    ) as weighted_score,
+    (case when pb.answers > 0 then (coalesce(pb.score,0)::numeric / pb.answers) else coalesce(pb.score,0)::numeric end) as score_per_answer,
+    greatest(pb.age_days, 0) as age_days_nonneg,
+    concat(
+      (case when pb.viewcount is null then '0' else pb.viewcount::text end),
+      ' views (answer), ',
+      coalesce(pb.comments::int,0)::text,
+      ' comments'
+    ) as popularity_label
+  from post_base pb
+  join posts p on p.id = pb.id
+  left join users ue on ue.id = pb.owneruserid
+  where pb.posttypeid = 2
+    and pb.score >= 10 -- threshold for "high-value" answers included in union
+),
+
+-- union both sets to create a candidate pool
+candidates as (
+  select * from question_enriched
+  union all
+  select * from high_value_answers
+),
+
+-- ranking with window functions: per-tag rank and global rank
+ranked as (
+  select
+    c.*,
+    rank() over (partition by tag order by weighted_score desc nulls last) as tag_rank,
+    dense_rank() over (order by weighted_score desc nulls last) as global_rank,
+    row_number() over (partition by coalesce(tag,'<no-tag>') order by age_days_nonneg asc, weighted_score desc) as freshness_rank_within_tag
+  from candidates c
+),
+
+-- final filter and additional correlated computation: find number of distinct users who upvoted this post in last year (correlated subquery)
+final_candidates as (
+  select
+    r.*,
+    coalesce((
+      select count(distinct v.userId)
+      from votes v
+      where v.postid = r.id
+        and v.votetypeid = 2
+        and v.creationdate >= (now() - interval '1 year')
+        and v.userid is not null
+    ),0) as distinct_upvoters_last_year,
+    -- correlated scalar: is there an accepted answer for the parent (if this row is an answer)
+    case
+      when r.posttypeid = 2 then (
+        select p.acceptedanswerid
+        from posts p
+        where p.id = r.parentid
+      )
+      else r.acceptedanswerid
+    end as canonical_accepted_answer_id,
+    -- detect tag saturation (complex predicate)
+    (case
+      when coalesce(r.tag,'') = '' then null
+      when (select count(1) from question_tags qt2 where qt2.tag = r.tag) > 1000 then 'hot'
+      when (select count(1) from question_tags qt2 where qt2.tag = r.tag) between 100 and 1000 then 'active'
+      else 'niche'
+    end) as tag_popularity_bucket
+  from ranked r
+)
+
+-- final selection ordering by multiple signals; use LIMIT to keep output bounded for benchmarking
+select
+  fc.id as post_id,
+  fc.posttypeid,
+  coalesce(fc.title, ('[Answer to Q#' || coalesce(fc.parentid::text,'?') || ']')) as title_or_parent,
+  fc.tag,
+  fc.owneruserid,
+  coalesce(fc.owner_displayname_resolved, fc.ownerdisplayname) as owner_name_resolved,
+  fc.owner_reputation,
+  fc.owner_badge_total,
+  fc.score,
+  fc.upvotes,
+  fc.downvotes,
+  fc.favorites,
+  fc.viewcount,
+  fc.answers,
+  fc.comments,
+  fc.duplicate_count,
+  fc.close_events,
+  fc.weighted_score,
+  fc.score_per_answer,
+  fc.age_days_nonneg,
+  fc.popularity_label,
+  fc.latest_editor_displayname,
+  fc.badges_within_30d_before_post,
+  fc.distinct_upvoters_last_year,
+  fc.tag_popularity_bucket,
+  fc.tag_rank,
+  fc.freshness_rank_within_tag,
+  fc.global_rank
+from final_candidates fc
+where
+  -- complicated predicates combining multiple signals including NULL logic
+  (fc.weighted_score is not null and fc.weighted_score > greatest(5, coalesce(fc.score,0) * 0.5))
+  and (fc.owner_reputation is null or fc.owner_reputation > 50)
+  and (
+    fc.tag is null
+    or (fc.tag not like 'meta%' and fc.tag !~* '^(test|example|dummy)$')
+  )
+  and (fc.close_events = 0 or fc.weighted_score > 50)
+order by
+  -- multi-criteria ordering to stress planner
+  fc.global_rank asc,
+  fc.tag_rank asc nulls last,
+  fc.weighted_score desc nulls last,
+  fc.age_days_nonneg asc
+limit 200;

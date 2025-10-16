@@ -1,0 +1,136 @@
+-- {"query": "9031.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2013, "output_tokens": 4011} 
+
+WITH RecentBadgeCounts AS (
+    SELECT b.UserId,
+           COUNT(*) AS BadgeCount
+    FROM Badges b
+    WHERE b.Date >= current_date - INTERVAL '365 days'
+    GROUP BY b.UserId
+),
+PostActivity AS (
+    SELECT p.Id,
+           p.OwnerUserId,
+           p.Score,
+           p.CreationDate,
+           ROW_NUMBER() OVER (
+               PARTITION BY p.OwnerUserId
+               ORDER BY p.Score DESC, p.CreationDate
+           ) AS rn,
+           COUNT(*) OVER (
+               PARTITION BY p.OwnerUserId
+           ) AS TotalPosts
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+TopPosts AS (
+    SELECT Id,
+           OwnerUserId,
+           Score,
+           CreationDate
+    FROM PostActivity
+    WHERE rn <= 3
+),
+CorrelatedComments AS (
+    SELECT p.Id AS PostId,
+           (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 0) AS PosComments,
+           (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score < 0) AS NegComments
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+TagAggregates AS (
+    SELECT tag,
+           COUNT(*) AS QCount,
+           SUM(p.Score) AS TotalScore
+    FROM Posts p
+    CROSS JOIN LATERAL unnest(
+        string_to_array(
+            substring(p.Tags, 2, length(p.Tags) - 2),
+            '><'
+        )
+    ) AS tag
+    WHERE p.PostTypeId = 1
+    GROUP BY tag
+),
+AllTags AS (
+    SELECT TagName AS tag
+    FROM Tags
+    WHERE IsRequired = 1
+    UNION
+    SELECT Name AS tag
+    FROM PostHistoryTypes
+),
+ActiveUsers AS (
+    SELECT u.Id,
+           u.DisplayName,
+           COALESCE(r.BadgeCount, 0) AS RecentBadges,
+           COALESCE(q.TotalQuestions, 0) AS NumQuestions,
+           COALESCE(v.UpVotes, 0) AS UpVotes,
+           COALESCE(v.DownVotes, 0) AS DownVotes
+    FROM Users u
+    LEFT JOIN RecentBadgeCounts r
+      ON r.UserId = u.Id
+    LEFT JOIN (
+        SELECT OwnerUserId,
+               COUNT(*) AS TotalQuestions
+        FROM Posts
+        WHERE PostTypeId = 1
+        GROUP BY OwnerUserId
+    ) q ON q.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT UserId,
+               SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+               SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes
+        WHERE VoteTypeId IN (2, 3)
+        GROUP BY UserId
+    ) v ON v.UserId = u.Id
+    WHERE u.Reputation > 1000
+),
+MainQuery AS (
+    SELECT au.DisplayName,
+           tp.Score AS TopScore,
+           COALESCE(cc.PosComments, 0) - COALESCE(cc.NegComments, 0) AS CommentBalance,
+           COALESCE(ta.QCount, 0) AS TaggedQuestions,
+           GREATEST(au.UpVotes - au.DownVotes, 0) AS NetVotes,
+           CASE
+             WHEN au.NumQuestions > 0
+             THEN ROUND(CAST(au.RecentBadges AS numeric) / au.NumQuestions, 2)
+             ELSE NULL
+           END AS BadgesPerQuestion,
+           CONCAT(au.DisplayName, '_', au.Id) AS UniqueHandle,
+           au.RecentBadges
+           + COALESCE(tp.Score, 0)
+           + (au.UpVotes - au.DownVotes) AS PerfMetric,
+           ta.tag    AS AggregatedTag,
+           at.tag    AS ReferenceTag
+    FROM ActiveUsers au
+    LEFT JOIN TopPosts tp
+      ON tp.OwnerUserId = au.Id
+    LEFT JOIN CorrelatedComments cc
+      ON cc.PostId = tp.Id
+    LEFT JOIN TagAggregates ta
+      ON ta.tag = ANY (
+           SELECT unnest(
+               string_to_array(
+                   substring(p.Tags, 2, length(p.Tags) - 2),
+                   '><'
+               )
+           )
+           FROM Posts p
+           WHERE p.Id = tp.Id
+      )
+    FULL OUTER JOIN AllTags at
+      ON ta.tag = at.tag
+),
+FilteredPositive AS (
+    SELECT *
+    FROM MainQuery
+    WHERE PerfMetric > 0
+)
+SELECT *
+FROM MainQuery
+INTERSECT
+SELECT *
+FROM FilteredPositive
+ORDER BY PerfMetric DESC NULLS LAST
+LIMIT 20;

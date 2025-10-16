@@ -1,0 +1,106 @@
+-- {"query": "12011.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 822} 
+
+WITH RankedPosts AS (
+  SELECT 
+    p.Id,
+    p.PostTypeId,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    u.DisplayName AS OwnerDisplayName,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS RankByScore,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.ViewCount DESC) AS RankByViewCount
+  FROM 
+    Posts p
+  JOIN 
+    Users u ON p.OwnerUserId = u.Id
+  WHERE 
+    p.PostTypeId IN (1, 2)
+),
+TopUsers AS (
+  SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(b.Id) AS BadgeCount,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+  FROM 
+    Users u
+  LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+  GROUP BY 
+    u.Id, u.DisplayName, u.Reputation
+),
+PostHistorySummary AS (
+  SELECT 
+    ph.PostId,
+    COUNT(CASE WHEN ph.PostHistoryTypeId IN (1, 2, 3) THEN 1 END) AS InitialEdits,
+    COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 END) AS SubsequentEdits,
+    COUNT(CASE WHEN ph.PostHistoryTypeId IN (10, 11) THEN 1 END) AS CloseReopenActions
+  FROM 
+    PostHistory ph
+  GROUP BY 
+    ph.PostId
+),
+TagUsage AS (
+  SELECT 
+    t.TagName,
+    COUNT(p.Id) AS PostCount,
+    SUM(p.Score) AS TotalScore
+  FROM 
+    Tags t
+  JOIN 
+    Posts p ON t.TagName = ANY(string_to_array(p.Tags, '><'))
+  GROUP BY 
+    t.TagName
+),
+UserActivity AS (
+  SELECT 
+    u.Id,
+    u.DisplayName,
+    COUNT(c.Id) AS CommentCount,
+    COUNT(v.Id) AS VoteCount,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS NetVotes
+  FROM 
+    Users u
+  LEFT JOIN 
+    Comments c ON u.Id = c.UserId
+  LEFT JOIN 
+    Votes v ON u.Id = v.UserId
+  GROUP BY 
+    u.Id, u.DisplayName
+)
+SELECT 
+  rp.Id,
+  rp.PostTypeId,
+  rp.Score,
+  rp.ViewCount,
+  rp.CreationDate,
+  rp.OwnerDisplayName,
+  rp.RankByScore,
+  rp.RankByViewCount,
+  tu.TagName,
+  tu.PostCount,
+  tu.TotalScore,
+  tu.CommentCount,
+  tu.VoteCount,
+  tu.NetVotes,
+  phs.InitialEdits,
+  phs.SubsequentEdits,
+  phs.CloseReopenActions
+FROM 
+  RankedPosts rp
+JOIN 
+  TopUsers tu ON rp.OwnerUserId = tu.Id
+JOIN 
+  PostHistorySummary phs ON rp.Id = phs.PostId
+JOIN 
+  TagUsage tu ON rp.Tags LIKE '%' || tu.TagName || '%'
+JOIN 
+  UserActivity ua ON rp.OwnerUserId = ua.Id
+WHERE 
+  rp.RankByScore <= 10 
+  AND rp.RankByViewCount <= 10
+ORDER BY 
+  rp.Score DESC, 
+  rp.ViewCount DESC;

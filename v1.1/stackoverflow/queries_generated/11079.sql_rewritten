@@ -1,0 +1,114 @@
+-- {"query": "11079.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 849} 
+WITH RecentPosts AS (
+    SELECT 
+        Posts.Id, 
+        Posts.PostTypeId, 
+        Posts.AcceptedAnswerId, 
+        Posts.ParentId, 
+        Posts.CreationDate, 
+        Posts.Score, 
+        Posts.ViewCount, 
+        Posts.Body, 
+        Posts.OwnerUserId, 
+        Posts.OwnerDisplayName, 
+        Posts.LastEditorUserId, 
+        Posts.LastEditorDisplayName, 
+        Posts.LastEditDate, 
+        Posts.LastActivityDate, 
+        Posts.Title, 
+        Posts.Tags, 
+        Posts.AnswerCount, 
+        Posts.CommentCount, 
+        Posts.FavoriteCount, 
+        Posts.ClosedDate, 
+        Posts.CommunityOwnedDate, 
+        Posts.ContentLicense
+    FROM 
+        Posts
+    WHERE 
+        Posts.CreationDate > cast('2024-10-01' as date) - INTERVAL '1 month'
+),
+UserActivity AS (
+    SELECT 
+        Users.Id, 
+        Users.Reputation, 
+        Users.CreationDate, 
+        Users.DisplayName, 
+        Users.LastAccessDate, 
+        Users.WebsiteUrl, 
+        Users.Location, 
+        Users.Views, 
+        Users.UpVotes, 
+        Users.DownVotes, 
+        Users.ProfileImageUrl, 
+        Users.EmailHash, 
+        COUNT(Posts.Id) AS PostCount
+    FROM 
+        Users
+    LEFT JOIN 
+        Posts ON Users.Id = Posts.OwnerUserId
+    GROUP BY 
+        Users.Id
+),
+BadgeSummary AS (
+    SELECT 
+        Badges.UserId, 
+        COUNT(Badges.Id) AS BadgeCount
+    FROM 
+        Badges
+    GROUP BY 
+        Badges.UserId
+),
+PostVotes AS (
+    SELECT 
+        Votes.PostId, 
+        SUM(CASE WHEN VoteTypes.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes, 
+        SUM(CASE WHEN VoteTypes.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes
+    FROM 
+        Votes
+    JOIN 
+        VoteTypes ON Votes.VoteTypeId = VoteTypes.Id
+    GROUP BY 
+        Votes.PostId
+)
+SELECT 
+    RecentPosts.Id AS PostId, 
+    RecentPosts.PostTypeId, 
+    RecentPosts.AcceptedAnswerId, 
+    RecentPosts.ParentId, 
+    RecentPosts.CreationDate, 
+    RecentPosts.Score, 
+    RecentPosts.ViewCount, 
+    RecentPosts.Body, 
+    RecentPosts.OwnerUserId, 
+    RecentPosts.OwnerDisplayName, 
+    RecentPosts.LastEditorUserId, 
+    RecentPosts.LastEditorDisplayName, 
+    RecentPosts.LastEditDate, 
+    RecentPosts.LastActivityDate, 
+    RecentPosts.Title, 
+    RecentPosts.Tags, 
+    RecentPosts.AnswerCount, 
+    RecentPosts.CommentCount, 
+    RecentPosts.FavoriteCount, 
+    RecentPosts.ClosedDate, 
+    RecentPosts.CommunityOwnedDate, 
+    RecentPosts.ContentLicense, 
+    COALESCE(UserActivity.PostCount, 0) AS PostCount, 
+    COALESCE(BadgeSummary.BadgeCount, 0) AS BadgeCount, 
+    COALESCE(PostVotes.UpVotes, 0) AS UpVotes, 
+    COALESCE(PostVotes.DownVotes, 0) AS DownVotes
+FROM 
+    RecentPosts
+LEFT JOIN 
+    UserActivity ON RecentPosts.OwnerUserId = UserActivity.Id
+LEFT JOIN 
+    BadgeSummary ON RecentPosts.OwnerUserId = BadgeSummary.UserId
+LEFT JOIN 
+    PostVotes ON RecentPosts.Id = PostVotes.PostId
+ORDER BY 
+    RecentPosts.CreationDate DESC, 
+    RecentPosts.Score DESC, 
+    RecentPosts.ViewCount DESC, 
+    RecentPosts.AnswerCount DESC
+LIMIT 100;

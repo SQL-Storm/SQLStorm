@@ -1,0 +1,163 @@
+WITH recent_activity AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        COALESCE(u.Reputation, 0) AS OwnerReputation,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.PostTypeId
+            ORDER BY p.Score DESC
+        ) AS RN,
+        (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = p.Id) AS AnswerCount,
+        p.Tags
+    FROM Posts p
+    LEFT JOIN Users u
+        ON u.Id = p.OwnerUserId
+    WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+),
+tag_summary AS (
+    SELECT
+        t.TagName,
+        COUNT(DISTINCT q.Id) AS QuestionCount,
+        SUM(CASE WHEN q.Score > 0 THEN 1 ELSE 0 END) AS PositiveScoreCount
+    FROM Tags t
+    LEFT JOIN Posts q
+        ON q.PostTypeId = 1
+       AND q.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    GROUP BY t.TagName
+),
+vote_metrics AS (
+    SELECT
+        v.PostId,
+        SUM(
+          CASE
+            WHEN vt.Name = 'UpMod' THEN  1
+            WHEN vt.Name = 'DownMod' THEN -1
+            ELSE 0
+          END
+        )            AS VoteEffect,
+        COUNT(CASE WHEN vt.Name = 'Favorite' THEN 1 END) AS Favorites
+    FROM Votes v
+    JOIN VoteTypes vt
+      ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+),
+comment_cte AS (
+    SELECT
+        c.PostId,
+        COUNT(*)       AS CommentCount,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    GROUP BY c.PostId
+),
+combined AS (
+    SELECT
+        ra.Id           AS PostId,
+        ra.PostTypeId,
+        ra.OwnerUserId,
+        ra.OwnerReputation,
+        ra.AnswerCount,
+        tm.QuestionCount,
+        tm.PositiveScoreCount,
+        vm.VoteEffect,
+        vm.Favorites,
+        cc.CommentCount,
+        cc.LastCommentDate,
+        ra.Tags
+    FROM recent_activity ra
+    LEFT JOIN tag_summary tm
+      ON tm.TagName = (
+           SELECT elem FROM (
+             SELECT UNNEST(string_to_array(TRIM(BOTH '<>' FROM ra.Tags), '><')) AS elem
+           ) sub
+           LIMIT 1
+         )
+    LEFT JOIN vote_metrics vm
+      ON vm.PostId = ra.Id
+    LEFT JOIN comment_cte cc
+      ON cc.PostId = ra.Id
+    WHERE ra.RN <= 100
+),
+ranked AS (
+    SELECT
+        c.PostId,
+        c.PostTypeId,
+        c.OwnerUserId,
+        c.OwnerReputation,
+        c.AnswerCount,
+        c.QuestionCount,
+        c.PositiveScoreCount,
+        c.VoteEffect,
+        c.Favorites,
+        c.CommentCount,
+        c.LastCommentDate,
+        c.Tags,
+        RANK() OVER (
+          PARTITION BY c.PostTypeId
+          ORDER BY c.VoteEffect DESC NULLS LAST,
+                   c.CommentCount DESC NULLS LAST
+        ) AS EngagementRank
+    FROM combined c
+),
+final AS (
+    SELECT
+        r.PostId,
+        r.PostTypeId,
+        COALESCE(r.OwnerReputation, 0)
+      + COALESCE(r.VoteEffect,     0) * 2
+      + COALESCE(r.CommentCount,   0)       AS EngagementScore,
+        r.EngagementRank,
+        r.AnswerCount,
+        r.Tags,
+        p.Score AS ScoreValue,
+        CASE
+          WHEN r.AnswerCount IS NULL OR r.AnswerCount = 0 THEN 'Unanswered'
+          WHEN p.Score < 0                         THEN 'NeedsReview'
+          WHEN p.Score > 10                        THEN 'Popular'
+          ELSE 'Active'
+        END AS EngagementLevel
+    FROM ranked r
+    LEFT JOIN Posts p
+      ON p.Id = r.PostId
+    WHERE r.EngagementRank <= 50
+)
+(
+    SELECT
+        f.PostId,
+        f.PostTypeId,
+        f.EngagementScore,
+        f.EngagementLevel,
+        t.TagName
+    FROM final f
+    LEFT JOIN LATERAL (
+        SELECT UNNEST(string_to_array(COALESCE(p.Tags,''), '><')) AS TagName
+        FROM Posts p
+        WHERE p.Id = f.PostId
+    ) t ON TRUE
+)
+UNION
+(
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Score           AS EngagementScore,
+        'Archived'        AS EngagementLevel,
+        CAST(NULL AS varchar(35)) AS TagName
+    FROM Posts p
+    WHERE p.CreationDate < CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+)
+EXCEPT
+(
+    SELECT
+        p3.Id,
+        p3.PostTypeId,
+        p3.Score           AS EngagementScore,
+        'Archived'         AS EngagementLevel,
+        CAST(NULL AS varchar(35))  AS TagName
+    FROM Posts p3
+    WHERE p3.Score < 0
+)
+ORDER BY EngagementScore DESC, PostId
+LIMIT 100;

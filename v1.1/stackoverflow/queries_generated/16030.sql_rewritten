@@ -1,0 +1,124 @@
+-- {"query": "16030.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 72385, "output_tokens": 67858} 
+WITH RECURSIVE user_reputation_tiers AS (
+    SELECT 
+        Id,
+        DisplayName,
+        Reputation,
+        CreationDate,
+        NTILE(10) OVER (ORDER BY Reputation DESC) as reputation_decile,
+        CASE 
+            WHEN Reputation >= 100000 THEN 'Elite'
+            WHEN Reputation >= 50000 THEN 'Expert'
+            WHEN Reputation >= 10000 THEN 'Advanced'
+            WHEN Reputation >= 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as tier,
+        LAG(Reputation, 1, 0) OVER (PARTITION BY EXTRACT(YEAR FROM CreationDate) ORDER BY Reputation) as prev_user_rep
+    FROM Users
+    WHERE Reputation > 0 AND LastAccessDate >= cast('2024-10-01' as date) - INTERVAL '2 years'
+),
+post_metrics AS (
+    SELECT 
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CreationDate,
+        COALESCE(p.Title, '') as Title,
+        LENGTH(COALESCE(p.Body, '')) as body_length,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 1
+            ELSE 0
+        END as has_accepted_answer,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 5) as high_score_comments,
+        (SELECT AVG(v.CreationDate - p.CreationDate) 
+         FROM Votes v 
+         WHERE v.PostId = p.Id AND v.VoteTypeId IN (2, 3)
+         LIMIT 100) as avg_vote_delay,
+        DENSE_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) as user_post_rank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '5 years'
+),
+tag_performance AS (
+    SELECT 
+        UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) as tag_name,
+        COUNT(DISTINCT p.Id) as question_count,
+        AVG(p.Score) as avg_score,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.ViewCount) as median_views,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END)::float / NULLIF(COUNT(*), 0) as answer_rate,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') FILTER (WHERE u.Reputation > 50000) as top_contributors
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 
+      AND p.Tags IS NOT NULL
+      AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '3 years'
+    GROUP BY UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><'))
+    HAVING COUNT(*) >= 100
+),
+badge_sequences AS (
+    SELECT 
+        b.UserId,
+        b.Name as badge_name,
+        b.Class,
+        b.Date,
+        COUNT(*) OVER (PARTITION BY b.UserId ORDER BY b.Date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) as cumulative_badges,
+        LEAD(b.Date, 1) OVER (PARTITION BY b.UserId ORDER BY b.Date) - b.Date as time_to_next_badge,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId, b.Class ORDER BY b.Date) as class_sequence
+    FROM Badges b
+    WHERE b.Date >= cast('2024-10-01' as date) - INTERVAL '4 years'
+)
+SELECT DISTINCT
+    urt.DisplayName,
+    urt.tier,
+    urt.Reputation,
+    COALESCE(pm.user_post_rank, 0) as top_post_rank,
+    ROUND(AVG(pm.Score) FILTER (WHERE pm.PostTypeId = 1), 2) as avg_question_score,
+    ROUND(AVG(pm.Score) FILTER (WHERE pm.PostTypeId = 2), 2) as avg_answer_score,
+    COUNT(DISTINCT pm.Id) FILTER (WHERE pm.has_accepted_answer = 1 AND pm.PostTypeId = 1) as questions_with_accepted_answers,
+    MAX(pm.ViewCount) as max_post_views,
+    STRING_AGG(DISTINCT tp.tag_name, ', ' ORDER BY tp.tag_name) FILTER (WHERE tp.avg_score > 10) as high_performing_tags,
+    COALESCE(SUM(bs.cumulative_badges) FILTER (WHERE bs.Class = 1), 0) as gold_badge_count,
+    COALESCE(SUM(bs.cumulative_badges) FILTER (WHERE bs.Class = 2), 0) as silver_badge_count,
+    PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY pm.body_length) as percentile_90_body_length,
+    (SELECT COUNT(*) 
+     FROM PostLinks pl 
+     INNER JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+     WHERE pl.PostId = pm.Id AND pl.LinkTypeId = 1) as outbound_links,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 FROM Votes v 
+            WHERE v.UserId = urt.Id 
+              AND v.VoteTypeId = 8 
+              AND v.CreationDate >= cast('2024-10-01' as date) - INTERVAL '1 year'
+        ) THEN 'Active Bounty Setter'
+        WHEN pm.avg_vote_delay > INTERVAL '7 days' THEN 'Slow Burn'
+        ELSE 'Standard'
+    END as engagement_pattern,
+    COALESCE(EXTRACT(EPOCH FROM AVG(bs.time_to_next_badge)) / 86400, NULL) as avg_days_between_badges,
+    RANK() OVER (PARTITION BY urt.tier ORDER BY COUNT(DISTINCT pm.Id) DESC, urt.Reputation DESC) as tier_activity_rank
+FROM user_reputation_tiers urt
+LEFT JOIN post_metrics pm ON urt.Id = pm.OwnerUserId
+LEFT JOIN Posts p ON pm.Id = p.Id
+LEFT JOIN tag_performance tp ON tp.tag_name = ANY(
+    string_to_array(SUBSTRING(COALESCE(p.Tags, '<>'), 2, LENGTH(COALESCE(p.Tags, '<>'))-2), '><')
+)
+LEFT JOIN badge_sequences bs ON urt.Id = bs.UserId AND bs.class_sequence <= 5
+WHERE urt.reputation_decile <= 5
+  AND (pm.Score IS NULL OR pm.Score >= -5)
+  AND (pm.ViewCount IS NULL OR pm.ViewCount > 0)
+GROUP BY urt.Id, urt.DisplayName, urt.tier, urt.Reputation, pm.user_post_rank, pm.Id, pm.avg_vote_delay, urt.reputation_decile
+HAVING COUNT(DISTINCT pm.Id) >= 3 OR urt.Reputation > 25000
+ORDER BY 
+    CASE urt.tier
+        WHEN 'Elite' THEN 1
+        WHEN 'Expert' THEN 2
+        WHEN 'Advanced' THEN 3
+        WHEN 'Intermediate' THEN 4
+        ELSE 5
+    END,
+    COUNT(DISTINCT pm.Id) DESC,
+    urt.Reputation DESC
+LIMIT 500;

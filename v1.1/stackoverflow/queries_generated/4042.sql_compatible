@@ -1,0 +1,142 @@
+with QuestionMetrics as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        coalesce(p.Score,0) as QuestionScore,
+        coalesce(p.ViewCount,0) as QuestionViews,
+        coalesce(p.AnswerCount,0) as AnswerCount,
+        p.CreationDate,
+        u.Reputation as OwnerReputation,
+        count(distinct b.Id) as BadgeCount,
+        string_agg(distinct b.Name, ', ' order by b.Name) as Badges,
+        (select count(*) from Posts a
+         where a.ParentId = p.Id 
+           and a.Id = p.AcceptedAnswerId
+           and (select count(*) from Votes v where v.PostId = a.Id and v.VoteTypeId = 2) >= 2
+        ) as AcceptedAnswerUpvoted,
+        (select count(*) from Comments c where c.PostId = p.Id) as CommentCount,
+        (select count(distinct a.OwnerUserId) from Posts a where a.ParentId = p.Id and a.OwnerUserId is not null) as DistinctAnswerers,
+        (select cht.Name from PostHistory ph
+          join PostHistoryTypes cht on cht.Id = ph.PostHistoryTypeId
+          where ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+          order by ph.CreationDate desc limit 1
+        ) as CloseReason,
+        rank() over (partition by date_trunc('month', p.CreationDate) order by p.LastActivityDate desc) as ActivityRank
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    left join Badges b on b.UserId = p.OwnerUserId
+    where p.PostTypeId = 1
+    group by p.Id, p.Title, p.OwnerUserId, p.Score, p.ViewCount, p.AnswerCount, p.CreationDate, u.Reputation, p.AcceptedAnswerId, p.LastActivityDate
+),
+AnswerScores as (
+    select 
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        coalesce(a.Score,0) as AnswerScore,
+        coalesce(v.UpVotes,0) as UpVotes,
+        coalesce(v.DownVotes,0) as DownVotes,
+        row_number() over (partition by a.ParentId order by a.Score desc) as AnswerRank,
+        a.CreationDate
+    from Posts a
+    left join (
+        select
+            v.PostId,
+            sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Votes v
+        group by v.PostId
+    ) v on v.PostId = a.Id
+    where a.PostTypeId = 2
+),
+TopAnswers as (
+    select 
+        a.*,
+        u.DisplayName as AnswerOwnerName,
+        u.Reputation as AnswerOwnerReputation
+    from AnswerScores a
+    left join Users u on u.Id = a.OwnerUserId
+    where a.AnswerRank <= 3
+),
+QuestionAnswerSummary as (
+    select qm.*,
+           coalesce(ta1.AnswerId, -1) as TopAnswer1Id,
+           coalesce(ta1.AnswerScore, 0) as TopAnswer1Score,
+           coalesce(ta1.AnswerOwnerName, 'Anonymous') as TopAnswer1Owner,
+           coalesce(ta2.AnswerId, -1) as TopAnswer2Id,
+           coalesce(ta2.AnswerScore, 0) as TopAnswer2Score,
+           coalesce(ta2.AnswerOwnerName, 'Anonymous') as TopAnswer2Owner,
+           coalesce(ta3.AnswerId, -1) as TopAnswer3Id,
+           coalesce(ta3.AnswerScore, 0) as TopAnswer3Score,
+           coalesce(ta3.AnswerOwnerName, 'Anonymous') as TopAnswer3Owner
+    from QuestionMetrics qm
+    left join TopAnswers ta1 on ta1.QuestionId = qm.QuestionId and ta1.AnswerRank = 1
+    left join TopAnswers ta2 on ta2.QuestionId = qm.QuestionId and ta2.AnswerRank = 2
+    left join TopAnswers ta3 on ta3.QuestionId = qm.QuestionId and ta3.AnswerRank = 3
+),
+DuplicateQuestions as (
+    select distinct pl.PostId as DuplicateQuestionId, pl.RelatedPostId as OriginalQuestionId
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+    where exists (select 1 from Posts p1 where p1.Id = pl.PostId and p1.PostTypeId=1)
+      and exists (select 1 from Posts p2 where p2.Id = pl.RelatedPostId and p2.PostTypeId=1)
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+        count(distinct c.Id) as CommentsCount,
+        max(p.CreationDate) as LastPostDate,
+        min(p.CreationDate) as FirstPostDate,
+        (extract(epoch from max(p.CreationDate)) - extract(epoch from min(p.CreationDate)))/86400.0 as DaysActive,
+        rank() over (order by count(distinct p.Id) desc) as UserPostRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+StringNormalizedQuestions as (
+    select 
+        Id,
+        lower(trim(regexp_replace(Title, '[^a-zA-Z0-9 ]', '', 'g'))) as NormalizedTitle,
+        lower(trim(regexp_replace(coalesce(Tags, ''), '[<>]', ' ', 'g'))) as NormalizedTags
+    from Posts
+    where PostTypeId = 1
+),
+DuplicatesCandidates as (
+    select q1.Id as Q1Id, q2.Id as Q2Id,
+           -- use length-based and fuzzy matching alternatives where levenshtein may be unavailable:
+           greatest(char_length(q1.NormalizedTitle), char_length(q2.NormalizedTitle)) - char_length(
+             regexp_replace(
+               q1.NormalizedTitle || '|' || q2.NormalizedTitle,
+               '[^' || q1.NormalizedTitle || q2.NormalizedTitle || ']', '', 'g'
+             )
+           ) as TitleDistance,
+           q1.NormalizedTags as Tags1, q2.NormalizedTags as Tags2
+    from StringNormalizedQuestions q1
+    join StringNormalizedQuestions q2 on q1.Id < q2.Id
+    where q1.NormalizedTags = q2.NormalizedTags
+      and abs(char_length(q1.NormalizedTitle) - char_length(q2.NormalizedTitle)) < 5
+)
+select 
+    qas.QuestionId, qas.Title, qas.OwnerUserId, qas.OwnerReputation, qas.BadgeCount, qas.Badges,
+    qas.QuestionScore, qas.QuestionViews, qas.AnswerCount, qas.CommentCount, qas.DistinctAnswerers, qas.CloseReason,
+    qas.TopAnswer1Id, qas.TopAnswer1Score, qas.TopAnswer1Owner,
+    qas.TopAnswer2Id, qas.TopAnswer2Score, qas.TopAnswer2Owner,
+    qas.TopAnswer3Id, qas.TopAnswer3Score, qas.TopAnswer3Owner,
+    dup.OriginalQuestionId,
+    ua.DisplayName as ActiveUserDisplayName,
+    ua.QuestionsCount, ua.AnswersCount, ua.CommentsCount, ua.DaysActive, ua.UserPostRank,
+    dc.TitleDistance, dc.Tags1 as DuplicateTags
+from QuestionAnswerSummary qas
+left join DuplicateQuestions dup on dup.DuplicateQuestionId = qas.QuestionId
+left join UserActivityWindow ua on ua.UserId = qas.OwnerUserId
+left join DuplicatesCandidates dc on dc.Q1Id = qas.QuestionId
+where qas.ActivityRank <= 100
+  and (qas.QuestionScore > 10 or qas.AnswerCount > 2)
+order by qas.ActivityRank, qas.QuestionScore desc, qas.AnswerCount desc
+limit 100;

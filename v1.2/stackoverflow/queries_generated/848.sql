@@ -1,0 +1,171 @@
+-- {"query": "848.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1457} 
+with RecursiveUserPosts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.CreationDate,
+        row_number() over (partition by u.Id order by p.CreationDate desc) as PostRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where u.Reputation > 1000
+),
+QualifiedPosts as (
+    select *
+    from RecursiveUserPosts
+    where PostRank <= 5
+),
+TagExploded as (
+    select
+        qp.*,
+        unnest(string_to_array(substring(qp.Tags from 2 for char_length(qp.Tags)-2), '><')) as SingleTag
+    from QualifiedPosts qp
+    where qp.Tags is not null
+),
+PostVotesSummary as (
+    select
+        v.PostId,
+        sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+        sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes,
+        sum(case when vt.Name = 'Favorite' then 1 else 0 end) as Favorites
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.PostId
+),
+TopTags as (
+    select
+        SingleTag,
+        count(distinct PostId) as PostCount,
+        avg(Score) as AvgScore,
+        sum(COALESCE(pvs.UpVotes,0)) as TotalUpVotes,
+        sum(COALESCE(pvs.DownVotes,0)) as TotalDownVotes
+    from TagExploded t
+    left join PostVotesSummary pvs on pvs.PostId = t.PostId
+    group by SingleTag
+    having count(distinct PostId) > 10
+    order by PostCount desc
+    limit 10
+),
+PostCloseInfo as (
+    select
+        ph.PostId,
+        max(case when ph.PostHistoryTypeId = 10 then ph.CreationDate else null end) as LastCloseDate,
+        count(case when ph.PostHistoryTypeId = 10 then 1 else null end) as CloseCount,
+        count(case when ph.PostHistoryTypeId = 11 then 1 else null end) as ReopenCount,
+        max(case when ph.PostHistoryTypeId = 10 then ph.Comment else null end) as LastCloseReasonId
+    from PostHistory ph
+    group by ph.PostId
+),
+UserBadgeWindow as (
+    select
+        b.UserId,
+        b.Name,
+        b.Class,
+        b.Date,
+        row_number() over (partition by b.UserId order by b.Date desc) as BadgeRank
+    from Badges b
+    where b.Date > current_date - interval '365 days'
+),
+RecentUserBadges as (
+    select UserId, count(*) as RecentBadgeCount, sum(case when Class = 1 then 1 else 0 end) as GoldBadges
+    from UserBadgeWindow
+    where BadgeRank <= 10
+    group by UserId
+),
+UserActivitySummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) as TotalPosts,
+        sum(coalesce(p.Score,0)) as TotalScore,
+        max(p.CreationDate) as LastPostDate,
+        coalesce(rub.RecentBadgeCount,0) as RecentBadges,
+        coalesce(rub.GoldBadges,0) as RecentGoldBadges
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join RecentUserBadges rub on rub.UserId = u.Id
+    group by u.Id, u.DisplayName, rub.RecentBadgeCount, rub.GoldBadges
+    having count(distinct p.Id) > 10
+),
+UserPostLinkDetails as (
+    select
+        u.UserId,
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        pl.LinkTypeId,
+        lt.Name as LinkTypeName,
+        pl.RelatedPostId,
+        rp.PostTypeId as RelatedPostType,
+        coalesce(pc.LastCloseDate, timestamp 'epoch') as LastCloseDate,
+        coalesce(pc.CloseCount,0) as CloseCount,
+        coalesce(pc.ReopenCount,0) as ReopenCount,
+        coalesce(pc.LastCloseReasonId, '') as CloseReasonId
+    from UserActivitySummary u
+    join Posts p on p.OwnerUserId = u.UserId
+    left join PostLinks pl on pl.PostId = p.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    left join Posts rp on rp.Id = pl.RelatedPostId
+    left join PostCloseInfo pc on pc.PostId = p.Id
+    where p.PostTypeId in (1,2)
+),
+RankedUserPostLinks as (
+    select *,
+        rank() over (partition by UserId order by Score desc, ViewCount desc) as PostRank
+    from UserPostLinkDetails
+),
+FinalSelection as (
+    select
+        r.UserId,
+        uas.DisplayName,
+        r.PostId,
+        r.Title,
+        r.Score,
+        r.ViewCount,
+        r.LinkTypeName,
+        r.RelatedPostId,
+        r.RelatedPostType,
+        r.CloseCount,
+        r.ReopenCount,
+        r.CloseReasonId,
+        uas.TotalPosts,
+        uas.TotalScore,
+        uas.RecentBadges,
+        uas.RecentGoldBadges
+    from RankedUserPostLinks r
+    join UserActivitySummary uas on uas.UserId = r.UserId
+    where r.PostRank <= 3
+)
+select 
+    fs.UserId,
+    fs.DisplayName,
+    fs.PostId,
+    left(fs.Title, 100) || coalesce(' [' || fs.LinkTypeName || ']', '') as PostTitleWithLinkType,
+    fs.Score,
+    fs.ViewCount,
+    case 
+        when fs.RelatedPostType = 1 then 'Question'
+        when fs.RelatedPostType = 2 then 'Answer'
+        else 'Other'
+    end as RelatedPostTypeDesc,
+    fs.CloseCount,
+    fs.ReopenCount,
+    case 
+        when fs.CloseReasonId ~ '^\d+$' then (select Name from CloseReasonTypes where Id = cast(fs.CloseReasonId as smallint))
+        else 'N/A' 
+    end as LastCloseReason,
+    fs.TotalPosts,
+    fs.TotalScore,
+    fs.RecentBadges,
+    fs.RecentGoldBadges
+from FinalSelection fs
+where 
+    fs.Score > 0
+    and (fs.CloseCount = 0 or fs.ReopenCount > 0)
+order by fs.RecentGoldBadges desc, fs.Score desc, fs.ViewCount desc
+limit 50;

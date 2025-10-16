@@ -1,0 +1,195 @@
+-- {"query": "19043.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2709} 
+
+WITH UserEngagementSummary AS (
+    -- Aggregates various user-specific statistics including post counts by type, badge counts,
+    -- and average scores for posts and comments.
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT p.Id) AS TotalOwnedPosts,
+        SUM(CASE WHEN p.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Question') THEN 1 ELSE 0 END) AS TotalQuestionsAsked,
+        SUM(CASE WHEN p.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Answer') THEN 1 ELSE 0 END) AS TotalAnswersProvided,
+        AVG(CASE WHEN p.Score IS NOT NULL THEN p.Score ELSE 0 END) AS AvgPostScore,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        AVG(c.Score) AS AvgCommentScore,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgesCount,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgesCount,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgesCount,
+        MAX(p.LastActivityDate) AS LastPostActivityDate
+    FROM Users AS u
+    LEFT JOIN Posts AS p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments AS c ON u.Id = c.UserId
+    LEFT JOIN Badges AS b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+QuestionDetailedMetrics AS (
+    -- Focuses on question-specific metrics, including acceptance rates, view-to-favorite ratio,
+    -- and a correlated subquery to check for specific historical events.
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        q.Title AS QuestionTitle,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViewCount,
+        q.AnswerCount AS QuestionAnswerCount,
+        q.FavoriteCount AS QuestionFavoriteCount,
+        q.AcceptedAnswerId,
+        q.LastActivityDate AS QuestionLastActivityDate,
+        q.ClosedDate,
+        -- Extract the primary tag, handling possible empty or malformed tag strings
+        TRIM(BOTH '>' FROM SUBSTRING(q.Tags, POSITION('<' IN q.Tags) + 1, POSITION('><' IN q.Tags) - POSITION('<' IN q.Tags) - 1)) AS PrimaryTag,
+        -- Calculate the ratio of favorites to views, handling division by zero
+        CAST(COALESCE(q.FavoriteCount, 0) AS NUMERIC) / NULLIF(q.ViewCount, 0) AS FavoriteToViewRatio,
+        -- Correlated subquery: check for a 'Post Closed' event with a specific reason in its history
+        EXISTS (
+            SELECT 1
+            FROM PostHistory AS ph_inner
+            JOIN CloseReasonTypes AS crt ON ph_inner.Comment = CAST(crt.Id AS VARCHAR)
+            WHERE ph_inner.PostId = q.Id
+              AND ph_inner.PostHistoryTypeId = (SELECT Id FROM PostHistoryTypes WHERE Name = 'Post Closed')
+              AND crt.Name LIKE '%duplicate%'
+              AND ph_inner.CreationDate > (q.CreationDate + INTERVAL '1 hour') -- Closed shortly after creation
+        ) AS WasClosedAsDuplicateEarly,
+        -- Window function: rank questions by score for each user
+        ROW_NUMBER() OVER(PARTITION BY q.OwnerUserId ORDER BY q.Score DESC, q.CreationDate DESC) AS UserQuestionScoreRank
+    FROM Posts AS q
+    WHERE q.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Question')
+      AND q.CreationDate BETWEEN (NOW() - INTERVAL '3 years') AND NOW() -- Limit recent questions for performance
+),
+AnswerAcceptanceStatus AS (
+    -- Determines details about accepted answers for questions
+    SELECT
+        qpm.QuestionId,
+        a.OwnerUserId AS AcceptedAnswerOwnerId,
+        a.CreationDate AS AcceptedAnswerCreationDate,
+        a.Score AS AcceptedAnswerScore,
+        (EXTRACT(EPOCH FROM (a.CreationDate - qpm.QuestionCreationDate)) / 3600.0) AS HoursToAcceptedAnswer, -- Hours, not days
+        CASE WHEN a.OwnerUserId = qpm.OwnerUserId THEN TRUE ELSE FALSE END AS SelfAccepted
+    FROM QuestionDetailedMetrics AS qpm
+    INNER JOIN Posts AS a ON qpm.AcceptedAnswerId = a.Id
+    WHERE a.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Answer')
+),
+RelatedPostEngagement AS (
+    -- Analyzes linked posts (e.g., duplicates or related) for engagement
+    SELECT
+        pl.PostId,
+        SUM(CASE WHEN lt.Name = 'Duplicate' THEN 1 ELSE 0 END) AS DuplicateLinksCount,
+        SUM(CASE WHEN lt.Name = 'Linked' THEN 1 ELSE 0 END) AS RelatedLinksCount,
+        AVG(rp.Score) AS AvgRelatedPostScore,
+        COUNT(DISTINCT rp.OwnerUserId) AS UniqueRelatedPostOwners
+    FROM PostLinks AS pl
+    JOIN LinkTypes AS lt ON pl.LinkTypeId = lt.Id
+    LEFT JOIN Posts AS rp ON pl.RelatedPostId = rp.Id
+    GROUP BY pl.PostId
+),
+TagUsageDiversity AS (
+    -- Calculates diversity of tags used by users
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT TRIM(BOTH '>' FROM SUBSTRING(unnested_tag, POSITION('<' IN unnested_tag) + 1, LENGTH(unnested_tag) - POSITION('<' IN unnested_tag) -1))) AS UniqueTagCount,
+        MIN(t.Count) AS MinTagPopularityUsed,
+        MAX(t.Count) AS MaxTagPopularityUsed
+    FROM Users AS u
+    JOIN Posts AS p ON u.Id = p.OwnerUserId
+    CROSS JOIN LATERAL UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS unnested_tag
+    LEFT JOIN Tags AS t ON TRIM(unnested_tag) = t.TagName
+    WHERE p.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Question') AND p.Tags IS NOT NULL
+    GROUP BY u.Id
+)
+-- Main query combining all the CTEs with complex filtering and calculations
+SELECT
+    ues.UserId,
+    ues.DisplayName,
+    ues.Reputation,
+    ues.TotalQuestionsAsked,
+    ues.TotalAnswersProvided,
+    ues.GoldBadgesCount,
+    ues.SilverBadgesCount,
+    qdm.QuestionId,
+    qdm.QuestionTitle,
+    qdm.QuestionCreationDate,
+    qdm.QuestionScore,
+    qdm.QuestionViewCount,
+    qdm.QuestionAnswerCount,
+    qdm.QuestionFavoriteCount,
+    qdm.PrimaryTag,
+    qdm.FavoriteToViewRatio,
+    aas.HoursToAcceptedAnswer,
+    aas.SelfAccepted,
+    rpe.DuplicateLinksCount,
+    rpe.RelatedLinksCount,
+    rpe.AvgRelatedPostScore,
+    tud.UniqueTagCount AS UserUniqueTagDiversity,
+    -- Complex calculation incorporating multiple user and post metrics
+    (ues.Reputation * 0.1
+     + ues.AvgPostScore * 0.5
+     + ues.TotalQuestionsAsked * 0.2
+     + ues.TotalAnswersProvided * 0.2
+     + (ues.GoldBadgesCount * 10 + ues.SilverBadgesCount * 5 + ues.BronzeBadgesCount * 1) * 0.5
+     + COALESCE(qdm.FavoriteToViewRatio, 0) * 100 -- Boost for high engagement questions
+     - COALESCE(aas.HoursToAcceptedAnswer / 24, 0) * 0.1 -- Penalty for slow accepted answers (normalized to days)
+    ) AS UserInfluenceScore,
+    -- Case statement for categorizing question state based on multiple conditions
+    CASE
+        WHEN qdm.ClosedDate IS NOT NULL AND qdm.WasClosedAsDuplicateEarly THEN 'Closed - Early Duplicate'
+        WHEN qdm.ClosedDate IS NOT NULL THEN 'Closed - Other Reason'
+        WHEN qdm.AcceptedAnswerId IS NOT NULL AND aas.HoursToAcceptedAnswer <= 24 AND aas.SelfAccepted = FALSE THEN 'Answered - Quickly Accepted (External)'
+        WHEN qdm.AcceptedAnswerId IS NOT NULL THEN 'Answered - Accepted'
+        WHEN qdm.QuestionAnswerCount = 0 AND qdm.QuestionCreationDate < (NOW() - INTERVAL '1 year') THEN 'Unanswered - Old'
+        ELSE 'Open'
+    END AS QuestionStatusCategory,
+    -- String manipulation with NULL handling for user description
+    COALESCE(
+        LOWER(SUBSTRING(TRIM(REPLACE(REPLACE(ues.DisplayName, ' ', ''), '.', '')), 1, 5)) || '-' ||
+        LPAD(CAST(ues.UserProfileViews AS VARCHAR), 6, '0'),
+        'UNKNOWN-USER'
+    ) AS UserHashId
+FROM UserEngagementSummary AS ues
+INNER JOIN QuestionDetailedMetrics AS qdm ON ues.UserId = qdm.OwnerUserId
+LEFT JOIN AnswerAcceptanceStatus AS aas ON qdm.QuestionId = aas.QuestionId
+LEFT JOIN RelatedPostEngagement AS rpe ON qdm.QuestionId = rpe.PostId
+LEFT JOIN TagUsageDiversity AS tud ON ues.UserId = tud.UserId
+WHERE
+    ues.Reputation > 10000
+    AND ues.TotalQuestionsAsked >= 10
+    AND ues.TotalAnswersProvided >= 20
+    AND ues.GoldBadgesCount >= 1
+    AND qdm.QuestionScore >= 20
+    AND qdm.QuestionViewCount >= 5000
+    AND qdm.UserQuestionScoreRank <= 3 -- Consider only top 3 questions by score for each user
+    AND qdm.FavoriteToViewRatio > 0.005 -- Questions with at least 0.5% favorite rate
+    AND (
+        (qdm.WasClosedAsDuplicateEarly = FALSE) OR -- Not closed early as duplicate
+        (rpe.DuplicateLinksCount IS NULL OR rpe.DuplicateLinksCount < 2) -- Or has less than 2 explicit duplicate links
+    )
+    AND (
+        aas.QuestionId IS NOT NULL -- Must have an accepted answer
+        AND aas.HoursToAcceptedAnswer <= 72 -- Accepted within 3 days
+        AND NOT aas.SelfAccepted -- Not self-accepted
+    )
+    AND (
+        -- Correlated subquery: user has commented on at least one highly voted post
+        EXISTS (
+            SELECT 1
+            FROM Comments AS c_outer
+            WHERE c_outer.UserId = ues.UserId
+              AND c_outer.Score >= 5
+              AND c_outer.CreationDate > (NOW() - INTERVAL '2 year')
+        )
+        OR
+        -- User has a descriptive 'AboutMe' section with specific keywords (checking for NULL and content)
+        (ues.UserId IN (SELECT Id FROM Users WHERE AboutMe IS NOT NULL AND AboutMe ILIKE '%developer%' AND LENGTH(AboutMe) > 100))
+    )
+    AND ues.DisplayName IS NOT NULL AND qdm.QuestionTitle IS NOT NULL
+ORDER BY
+    UserInfluenceScore DESC,
+    qdm.QuestionScore DESC,
+    ues.LastAccessDate DESC
+LIMIT 500;

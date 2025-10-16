@@ -1,0 +1,198 @@
+-- {"query": "326.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1694} 
+with RecursiveUserBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by u.Id order by b.Date desc) as BadgeRank
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where b.Date > u.CreationDate
+),
+TopBadges as (
+    select UserId, BadgeName, Class
+    from RecursiveUserBadges
+    where BadgeRank <= 3
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        coalesce(a.AnswerCount,0) as AnswerCount,
+        coalesce(a.MaxAnswerScore,0) as MaxAnswerScore,
+        coalesce(a.AvgAnswerScore,0) as AvgAnswerScore,
+        coalesce(a.TopAnswerId,-1) as TopAnswerId
+    from Posts q
+    left join (
+        select
+            ParentId,
+            count(*) as AnswerCount,
+            max(Score) as MaxAnswerScore,
+            avg(Score) as AvgAnswerScore,
+            max(case when Score = max(Score) over (partition by ParentId) then Id else null end) as TopAnswerId
+        from Posts
+        where PostTypeId = 2
+        group by ParentId
+    ) a on q.Id = a.ParentId
+    where q.PostTypeId = 1
+),
+UserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) as TotalPosts,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) as QuestionsPosted,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) as AnswersPosted,
+        coalesce(sum(v.UpVotes),0) as TotalUpVotes,
+        coalesce(sum(v.DownVotes),0) as TotalDownVotes,
+        max(p.CreationDate) as LastPostDate
+    from Users u
+    left join Posts p on u.Id = p.OwnerUserId
+    left join (
+        select
+            p.OwnerUserId,
+            sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Posts p
+        left join Votes v on p.Id = v.PostId
+        group by p.OwnerUserId
+    ) v on u.Id = v.OwnerUserId
+    group by u.Id, u.DisplayName
+),
+PostHistoryCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    inner join CloseReasonTypes crt on cast(ph.Comment as int) = crt.Id
+    where ph.PostHistoryTypeId = 10
+),
+QuestionDetails as (
+    select
+        qas.QuestionId,
+        qas.Title,
+        qas.OwnerUserId,
+        u.DisplayName as OwnerName,
+        qas.QuestionCreation,
+        qas.QuestionScore,
+        qas.AnswerCount,
+        qas.MaxAnswerScore,
+        qas.AvgAnswerScore,
+        qas.TopAnswerId,
+        phcr.CloseReason,
+        phcr.CloseDate,
+        string_agg(distinct t.TagName, ', ') filter (where t.TagName is not null) as Tags
+    from QuestionAnswerStats qas
+    left join Users u on qas.OwnerUserId = u.Id
+    left join PostHistoryCloseReasons phcr on qas.QuestionId = phcr.PostId
+    left join LATERAL (
+        select unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as TagName
+        from Posts p
+        where p.Id = qas.QuestionId
+    ) t on true
+    group by qas.QuestionId, qas.Title, qas.OwnerUserId, u.DisplayName, qas.QuestionCreation, qas.QuestionScore, qas.AnswerCount, qas.MaxAnswerScore, qas.AvgAnswerScore, qas.TopAnswerId, phcr.CloseReason, phcr.CloseDate
+),
+TopAnswerDetails as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId as AnswerOwnerId,
+        u.DisplayName as AnswerOwnerName,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        a.Body,
+        length(a.Body) as BodyLength,
+        case when a.LastEditDate is not null then 1 else 0 end as Edited
+    from Posts a
+    left join Users u on a.OwnerUserId = u.Id
+    where a.PostTypeId = 2
+),
+AnswerWithComments as (
+    select
+        tad.AnswerId,
+        tad.QuestionId,
+        tad.AnswerOwnerId,
+        tad.AnswerOwnerName,
+        tad.AnswerScore,
+        tad.AnswerCreationDate,
+        tad.Body,
+        tad.BodyLength,
+        tad.Edited,
+        count(c.Id) as CommentCount,
+        max(c.CreationDate) as LastCommentDate
+    from TopAnswerDetails tad
+    left join Comments c on tad.AnswerId = c.PostId
+    group by tad.AnswerId, tad.QuestionId, tad.AnswerOwnerId, tad.AnswerOwnerName, tad.AnswerScore, tad.AnswerCreationDate, tad.Body, tad.BodyLength, tad.Edited
+),
+FinalResult as (
+    select
+        qd.QuestionId,
+        qd.Title,
+        qd.OwnerUserId,
+        qd.OwnerName,
+        qd.QuestionCreation,
+        qd.QuestionScore,
+        qd.AnswerCount,
+        qd.MaxAnswerScore,
+        qd.AvgAnswerScore,
+        qd.CloseReason,
+        qd.CloseDate,
+        qd.Tags,
+        awc.AnswerId,
+        awc.AnswerOwnerId,
+        awc.AnswerOwnerName,
+        awc.AnswerScore,
+        awc.AnswerCreationDate,
+        awc.BodyLength,
+        awc.Edited,
+        awc.CommentCount,
+        awc.LastCommentDate,
+        ub.BadgeName,
+        ub.Class as BadgeClass
+    from QuestionDetails qd
+    left join AnswerWithComments awc on qd.TopAnswerId = awc.AnswerId
+    left join TopBadges ub on qd.OwnerUserId = ub.UserId
+    where qd.QuestionScore > 5
+      and (qd.CloseReason is null or qd.CloseReason not in ('Duplicate', 'Off-topic'))
+)
+select
+    fr.QuestionId,
+    fr.Title,
+    fr.OwnerName,
+    fr.QuestionCreation,
+    fr.QuestionScore,
+    fr.AnswerCount,
+    fr.MaxAnswerScore,
+    round(fr.AvgAnswerScore::numeric,2) as AvgAnswerScore,
+    fr.CloseReason,
+    fr.CloseDate,
+    fr.Tags,
+    fr.AnswerId,
+    fr.AnswerOwnerName,
+    fr.AnswerScore,
+    fr.AnswerCreationDate,
+    fr.BodyLength,
+    fr.Edited,
+    fr.CommentCount,
+    fr.LastCommentDate,
+    fr.BadgeName,
+    case fr.BadgeClass
+        when 1 then 'Gold'
+        when 2 then 'Silver'
+        when 3 then 'Bronze'
+        else 'Unknown'
+    end as BadgeClass,
+    dense_rank() over (partition by fr.OwnerUserId order by fr.QuestionScore desc) as UserQuestionRank,
+    case
+        when fr.CloseReason is null then 'Open'
+        else 'Closed'
+    end as QuestionStatus,
+    concat('Q:', fr.Title, ' | Tags: ', coalesce(fr.Tags, 'None')) as Summary
+from FinalResult fr
+order by fr.QuestionScore desc, fr.AnswerScore desc
+limit 100;

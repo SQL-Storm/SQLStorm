@@ -1,0 +1,183 @@
+-- {"query": "19.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2103} 
+with recent_activity as (
+  select
+    p.id as post_id,
+    p.posttypeid,
+    p.parentid,
+    p.title,
+    p.tags,
+    p.owneruserid,
+    p.creationdate,
+    p.lastactivitydate,
+    p.score,
+    coalesce(p.viewcount,0) as viewcount,
+    p.answercount,
+    p.commentcount,
+    substring(coalesce(p.body,''),1,400) as snippet,
+    -- extract first tag if present: tags are like '<tag1><tag2>'
+    nullif(regexp_replace(coalesce(p.tags,''), '^.*?<([^>]+)>.*$', '\1'), '') as first_tag
+  from posts p
+  where p.creationdate >= now() - interval '5 years'
+),
+user_stats as (
+  select
+    u.id as user_id,
+    u.reputation,
+    u.creationdate as user_creation,
+    coalesce(u.views,0) as profile_views,
+    coalesce(u.upvotes,0) as upvotes,
+    coalesce(u.downvotes,0) as downvotes,
+    coalesce(count(b.id) filter (where b.class = 1),0) as gold_badges,
+    coalesce(count(b.id) filter (where b.class = 2),0) as silver_badges,
+    coalesce(count(b.id) filter (where b.class = 3),0) as bronze_badges,
+    -- diversity score: unique tag-based badges vs total badges
+    case when count(b.id)=0 then 0.0 else (count(distinct case when b.tagbased=1 then b.name end)::float / count(b.id)) end as tagbadge_diversity
+  from users u
+  left join badges b on b.userid = u.id
+  group by u.id
+),
+post_with_votes as (
+  select
+    p.post_id,
+    p.posttypeid,
+    p.title,
+    p.parentid,
+    p.owneruserid,
+    p.creationdate,
+    p.lastactivitydate,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.commentcount,
+    p.first_tag,
+    -- aggregate votes by type for each post
+    coalesce(sum(case when v.votetypeid = 2 then 1 else 0 end),0) as upvotes,
+    coalesce(sum(case when v.votetypeid = 3 then 1 else 0 end),0) as downvotes,
+    coalesce(sum(case when v.votetypeid = 5 then 1 else 0 end),0) as favorites,
+    coalesce(sum(case when v.votetypeid = 1 then 1 else 0 end),0) as accepted_by_originator
+  from recent_activity p
+  left join votes v on v.postid = p.post_id
+  group by
+    p.post_id, p.posttypeid, p.title, p.parentid, p.owneruserid, p.creationdate, p.lastactivitydate, p.score, p.viewcount, p.answercount, p.commentcount, p.first_tag
+),
+answers_ranked as (
+  select
+    a.*,
+    row_number() over (partition by a.parentid order by (a.score + coalesce(a.upvotes,0)*0.5 - coalesce(a.downvotes,0)*0.8) desc, a.creationdate asc) as answer_rank,
+    dense_rank() over (partition by a.parentid order by (a.score + coalesce(a.upvotes,0)*0.5 - coalesce(a.downvotes,0)*0.8) desc) as answer_dense_rank
+  from post_with_votes a
+  where a.posttypeid = 2
+),
+questions_enriched as (
+  select
+    q.*,
+    u.reputation as owner_reputation,
+    us.gold_badges,
+    us.silver_badges,
+    us.bronze_badges,
+    us.tagbadge_diversity,
+    -- count answers via join to answers_ranked
+    coalesce((select count(*) from answers_ranked ar where ar.parentid = q.post_id),0) as calc_answer_count,
+    -- number of distinct repliers (users who answered)
+    coalesce((select count(distinct ar.owneruserid) from answers_ranked ar where ar.parentid = q.post_id and ar.owneruserid is not null),0) as distinct_answerers,
+    -- time to first answer (in minutes)
+    (select round(extract(epoch from (min(ar.creationdate) - q.creationdate))/60.0,2)
+     from posts ar where ar.parentid = q.post_id and ar.posttypeid = 2 and ar.creationdate is not null
+    ) as minutes_to_first_answer
+  from post_with_votes q
+  left join users u on u.id = q.owneruserid
+  left join user_stats us on us.user_id = q.owneruserid
+  where q.posttypeid = 1
+),
+tag_exploded as (
+  select
+    qe.*,
+    trim(t) as tag
+  from questions_enriched qe,
+  lateral (
+    select unnest(string_to_array(substring(coalesce(qe.first_tag,'') from 1 for 10000), ',')) as t
+  ) s
+  where qe.first_tag is not null and qe.first_tag <> ''
+),
+complex_metrics as (
+  select
+    qe.post_id,
+    qe.title,
+    qe.first_tag,
+    coalesce(qe.calc_answer_count,0) as answers_count,
+    coalesce(qe.distinct_answerers,0) as distinct_answerers,
+    coalesce(qe.minutes_to_first_answer, null) as minutes_to_first_answer,
+    qe.score,
+    qe.viewcount,
+    qe.upvotes,
+    qe.downvotes,
+    qe.favorites,
+    qe.owner_reputation,
+    qe.gold_badges,
+    qe.silver_badges,
+    qe.bronze_badges,
+    qe.tagbadge_diversity,
+    -- signal metric: weighted engagement
+    (
+      (coalesce(qe.viewcount,0)::numeric * 0.001) +
+      (coalesce(qe.upvotes,0) * 2) -
+      (coalesce(qe.downvotes,0) * 1.5) +
+      (coalesce(qe.favorites,0) * 3) +
+      (coalesce(qe.answers_count,0) * 4) +
+      (case when qe.minutes_to_first_answer is null then -5 else greatest(0, 60 - qe.minutes_to_first_answer)::numeric end)
+    ) as engagement_score,
+    -- complexity heuristic: long body, many tags, many edits
+    (
+      (length(coalesce((select body from posts p where p.id = qe.post_id),''))::numeric / 1000) +
+      (case when qe.first_tag is null then 0 else array_length(string_to_array(qe.first_tag,'><'),1) end)::numeric +
+      (select count(*) from posthistory ph where ph.postid = qe.post_id and ph.posthistorytypeid in (4,5,6) )
+    ) as complexity_score
+  from questions_enriched qe
+),
+ranked_questions as (
+  select
+    cm.*,
+    row_number() over (order by cm.engagement_score desc NULLS LAST, cm.complexity_score desc) as engagement_rank,
+    percent_rank() over (order by cm.engagement_score) as engagement_pct,
+    ntile(10) over (order by cm.engagement_score desc) as engagement_decile
+  from complex_metrics cm
+)
+select
+  rq.post_id,
+  rq.title,
+  left(rq.title,120) as title_snippet,
+  rq.first_tag,
+  rq.answers_count,
+  rq.distinct_answerers,
+  coalesce(rq.minutes_to_first_answer,-1) as minutes_to_first_answer,
+  round(rq.engagement_score::numeric,2) as engagement_score,
+  round(rq.complexity_score::numeric,2) as complexity_score,
+  rq.owner_reputation,
+  rq.gold_badges,
+  rq.silver_badges,
+  rq.bronze_badges,
+  rq.tagbadge_diversity,
+  rq.engagement_rank,
+  rq.engagement_pct,
+  rq.engagement_decile,
+  -- correlated subquery: show id of highest ranked answer if exists
+  (select a.id from posts a
+   where a.parentid = rq.post_id and a.posttypeid = 2
+   order by (a.score + coalesce((select sum(case when v2.votetypeid=2 then 1 else 0 end) from votes v2 where v2.postid=a.id),0)*0.5
+             - coalesce((select sum(case when v3.votetypeid=3 then 1 else 0 end) from votes v3 where v3.postid=a.id),0)*0.8) desc
+   limit 1
+  ) as top_answer_id,
+  -- check for recent duplicate links (set operator: exists in postlinks)
+  case when exists (
+    select 1 from postlinks pl
+    where pl.postid = rq.post_id and pl.linktypeid = 3
+  ) then true else false end as has_duplicate_link,
+  -- text expression to simulate a canonical summary
+  (regexp_replace(coalesce(rq.title,'') || ' [' || coalesce(rq.first_tag,'no-tag') || '] - score:' || rq.score::text || ' / views:' || rq.viewcount::text, '\s+', ' ', 'g')) as canonical_summary
+from ranked_questions rq
+where
+  -- complex predicate: require minimum engagement and either high complexity or high owner reputation
+  (rq.engagement_score > 5 or (rq.engagement_score > 0 and rq.complexity_score > 2))
+  and (rq.owner_reputation > 1000 OR rq.gold_badges > 0 OR rq.engagement_decile <= 2)
+order by rq.engagement_score desc, rq.complexity_score desc
+limit 250;

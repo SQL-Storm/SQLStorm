@@ -1,0 +1,142 @@
+-- {"query": "1587.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1356} 
+with RecursiveUserBadgeCounts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Class as BadgeClass,
+        count(*) as BadgeCount
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, b.Class
+), BadgePivot as (
+    select
+        UserId,
+        DisplayName,
+        coalesce(max(case when BadgeClass = 1 then BadgeCount end),0) as GoldBadges,
+        coalesce(max(case when BadgeClass = 2 then BadgeCount end),0) as SilverBadges,
+        coalesce(max(case when BadgeClass = 3 then BadgeCount end),0) as BronzeBadges
+    from RecursiveUserBadgeCounts
+    group by UserId, DisplayName
+), LatestPostsPerUser as (
+    select
+        p.OwnerUserId,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate desc) as rn
+    from Posts p
+    where p.OwnerUserId is not null and p.PostTypeId in (1,2) -- questions and answers
+), PastYearPosts as (
+    select
+        p.*
+    from Posts p
+    where p.CreationDate >= current_date - interval '1 year'
+), UserCorrelation as (
+    select
+        u.Id,
+        u.DisplayName,
+        bpc.GoldBadges,
+        bpc.SilverBadges,
+        bpc.BronzeBadges,
+        coalesce(pup.AnswerCountPastYear,0) as AnswersPastYear,
+        coalesce(pqp.QuestionCountPastYear,0) as QuestionsPastYear
+    from Users u
+    left join BadgePivot bpc on bpc.UserId = u.Id
+    left join (
+        select p.OwnerUserId, count(1) as AnswerCountPastYear
+        from PastYearPosts p where PostTypeId=2
+        group by p.OwnerUserId
+    ) pup on pup.OwnerUserId = u.Id
+    left join (
+        select p.OwnerUserId, count(1) as QuestionCountPastYear
+        from PastYearPosts p where PostTypeId=1
+        group by p.OwnerUserId
+    ) pqp on pqp.OwnerUserId = u.Id
+    where u.Reputation>=1000
+), PopularPosts as (
+    select
+        PostId, OwnerUserId, Title, Score, ViewCount,
+        variant_payload.ExtensiveCommentAgg,
+        linkage.LinkCount,
+        runStats.UserAnswersWithPopular = 0
+    from (
+        select *
+        from LatestPostsPerUser where rn=1
+    ) lp
+    left join (
+        select
+            c.PostId,
+            string_agg(
+                substring(c.Text from 1 for 
+                    case when length(c.Text)>100 then 100 else length(c.Text) end), ';' 
+                order by c.CreationDate desc) as ExtensiveCommentAgg
+        from Comments c
+        group by c.PostId
+    ) variant_payload on variant_payload.PostId = lp.Id
+    left join (
+        select pl.PostId, count(Distinct pl.RelatedPostId) as LinkCount
+        from PostLinks pl
+        where pl.LinkTypeId=1
+        group by pl.PostId
+    ) linkage on linkage.PostId = lp.Id
+    left join (
+        select
+            OwnerUserId,
+            count(*) filter (where Score >= 10 and ViewCount >= 1000) as UserAnswersWithPopular
+        from Posts p2
+        where p2.PostTypeId=2
+        group by OwnerUserId
+    ) runStats on runStats.OwnerUserId = lp.OwnerUserId
+)
+select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    u.AnswersPastYear,
+    u.QuestionsPastYear,
+    po.PostId,
+    po.Title,
+    po.Score,
+    po.ViewCount,
+    case
+        when po.ExtendedComments is not null then left(po.Branches, 250) || '...'
+        else '[no comments]'
+    end as SampledComments,
+    coalesce(ALINK.Info, 'No active linkages') as ActiveLinkDetails,
+    case when coalesce(po.LinkCount, 0) > 5 then 'Highly Linked' else 'Not Much Linked' end as LinkageCategory,
+    count(distinct ph.Id) filter (
+        where ph.PostHistoryTypeId in (10, 11) /*광 Broad watch movement*/ 
+        and ph.CreationDate > now() - interval '1 month'
+    ) as CloseOrReopenEventsRecentMonth
+from UserCorrelation u
+left join PopularPosts po on po.OwnerUserId = u.Id
+left join lateral (
+    select
+        string_agg(lhs.Name, ', ') as Info
+    from PostHistoryTypes lhs
+    join PostHistory ph on lhs.Id = ph.PostHistoryTypeId and ph.PostId = po.PostId and ph.CreationDate > current_date - interval '6 months'
+) ALINK on true
+left join PostHistory ph on ph.PostId = po.PostId
+group by
+    u.Id, u.DisplayName, u.Reputation,
+    u.GoldBadges, u.SilverBadges, u.BronzeBadges,
+    u.AnswersPastYear, u.QuestionsPastYear,
+    po.PostId, po.Title, po.Score, po.ViewCount,
+    po.ExtendedComments, po.LinkCount, ALINK.Info
+having count(distinct ph.Id) > 0 or u.BronzeBadges >= 3
+union -- set operator combines a list of high rep users and their top questions tagged with 'sql'
+select distinct
+    u2.Id as UserId,
+    u2.DisplayName,
+    u2.Reputation,
+    null,null,null,null,null,null,null,null,null,null,null
+from Users u2
+join Posts pZ on pZ.OwnerUserId = u2.Id
+where u2.Reputation > 10000 and pZ.PostTypeId=1 and pZ.Tags like '%sql%'
+order by COALESCE(u.GoldBadges,0) desc,
+         COALESCE(LinkageCategory,'FirstTimers') desc,
+         Reputation desc;

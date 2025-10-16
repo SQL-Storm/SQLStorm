@@ -1,0 +1,75 @@
+WITH UserTags AS (
+    SELECT DISTINCT u.Id AS UserId, array_agg(DISTINCT t.TagName) AS Tags
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    LEFT JOIN Tags t ON t.Id = ANY(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><')::text[])
+    GROUP BY u.Id
+),
+PostReplies AS (
+    SELECT p1.Id AS QuestionId, p2.Id AS AnswerId, p2.Score AS AnswerScore,
+           ROW_NUMBER() OVER (PARTITION BY p1.Id ORDER BY p2.Score DESC, p2.CreationDate) AS Rank
+    FROM Posts p1
+    LEFT JOIN Posts p2 ON p2.ParentId = p1.Id AND p2.PostTypeId = 2
+),
+TopAnswerScores AS (
+    SELECT QuestionId, MAX(AnswerScore) AS MaxScore
+    FROM PostReplies
+    WHERE Rank = 1
+    GROUP BY QuestionId
+),
+RecentReviews AS (
+    SELECT ph.PostId, ph.UserId AS EditorId, ph.CreationDate AS EditDate, ph.PostHistoryTypeId,
+           JSON_AGG(json_build_object('Type', pht.Name, 'Date', ph.CreationDate)) AS HistoryDetails
+    FROM PostHistory ph
+    LEFT JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId
+    WHERE ph.PostHistoryTypeId IN (4, 6, 10, 16)
+    GROUP BY ph.PostId, ph.UserId, ph.CreationDate, ph.PostHistoryTypeId
+),
+FlaggedPosts AS (
+    SELECT p.Id, c.Score AS CommentScore, v.Score AS VoteScore, 
+           (COALESCE(c.Score,0) + COALESCE(v.Score,0)) AS TotalScore
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId, SUM(CASE WHEN Score IS NULL THEN 0 WHEN Score < 0 THEN -Score ELSE Score END) AS Score
+        FROM Comments
+        GROUP BY PostId
+    ) c ON c.PostId = p.Id
+    LEFT JOIN (
+        SELECT PostId, SUM(CASE WHEN VoteTypeId IN (2,3) THEN CASE WHEN VoteTypeId=2 THEN 1 ELSE -1 END ELSE 0 END) AS Score
+        FROM Votes
+        GROUP BY PostId
+    ) v ON v.PostId = p.Id
+),
+EligiblePosts AS (
+    SELECT p.*, ur.Tags AS OwnerTags, rr.AnswerId, rr.AnswerScore, fp.CommentScore, fp.VoteScore, fp.TotalScore
+    FROM Posts p
+    LEFT JOIN UserTags ur ON ur.UserId = p.OwnerUserId
+    LEFT JOIN PostReplies rr ON rr.QuestionId = p.Id
+    LEFT JOIN RecentReviews fr ON fr.PostId = p.Id
+    LEFT JOIN FlaggedPosts fp ON fp.Id = p.Id
+    WHERE p.PostTypeId = 1
+),
+ComplexFilter AS (
+    SELECT Details.*, 
+           (COALESCE(Details.ResponseCount, 0) * 2 + (COALESCE(Details.Score, 0) + COALESCE(Details.ViewCount,0))) AS PerformanceMetric,
+           CASE WHEN Details.OwnerTags IS NULL OR array_length(Details.OwnerTags,1) = 0 THEN FALSE ELSE TRUE END AS IsTaggedOwner
+    FROM (
+        SELECT p.Id, p.Title, p.CreationDate, p.OwnerUserId, p.AnswerId, p.AnswerScore, p.CommentScore, p.VoteScore, p.TotalScore,
+               p.OwnerTags,
+               (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = p.Id AND a.PostTypeId = 2) AS ResponseCount,
+               (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotesCount,
+               p.Score,
+               p.ViewCount
+        FROM EligiblePosts p
+    ) AS Details
+)
+SELECT DISTINCT p.Id, p.Title, p.CreationDate, p.OwnerUserId, p.AnswerId,
+                p.AnswerScore, p.CommentScore, p.VoteScore, p.TotalScore,
+                p.OwnerTags, cf.IsTaggedOwner, cf.PerformanceMetric
+FROM Posts p
+LEFT JOIN ComplexFilter cf ON cf.Id = p.Id
+WHERE cf.PerformanceMetric > 100
+  AND p.PostTypeId = 1
+  AND (p.ClosedDate IS NULL OR p.ClosedDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+  AND p.Title ILIKE '%performance%'
+ORDER BY cf.PerformanceMetric DESC, p.CreationDate DESC;

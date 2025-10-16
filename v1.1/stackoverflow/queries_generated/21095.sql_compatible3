@@ -1,0 +1,118 @@
+WITH active_users AS (
+  SELECT u.Id, u.DisplayName, u.Reputation,
+         ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS rep_rank,
+         CAST(u.CreationDate AS date) AS creation_date,
+         CAST(u.CreationDate AS date) - INTERVAL '0 days' AS active_since
+  FROM Users u
+  WHERE u.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '365 days'
+    AND u.Reputation > 100
+),
+influential_posts AS (
+  SELECT p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate,
+         au.DisplayName AS author_name,
+         LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS prev_score,
+         (p.ViewCount * 1.0 /
+           NULLIF(
+             EXTRACT(EPOCH FROM (CAST(p.CreationDate AS timestamp) - CAST(au.active_since AS timestamp))) / 86400.0,
+             0
+           )
+         ) AS views_per_day,
+         p.OwnerUserId,
+         p.Tags
+  FROM Posts p
+  INNER JOIN active_users au ON p.OwnerUserId = au.Id
+  WHERE p.PostTypeId = 1
+    AND p.Score > 0
+    AND p.ClosedDate IS NULL
+),
+influential_posts_filtered AS (
+  SELECT *
+  FROM influential_posts
+  WHERE views_per_day > 10
+),
+tagged_questions AS (
+  SELECT ip.Id, ip.Title, ip.Score, ip.Tags,
+         CASE
+           WHEN ip.Tags LIKE '%sql%' THEN 'SQL Heavy'
+           WHEN ip.Tags LIKE '%python%' THEN 'Python Heavy'
+           ELSE 'Other'
+         END AS tag_category,
+         COALESCE(LENGTH(COALESCE(ip.Title, '')), 0) +
+         (
+           SELECT COUNT(*) FROM PostHistory ph
+           WHERE ph.PostId = ip.Id
+             AND ph.PostHistoryTypeId IN (4,5,6)
+             AND ph.CreationDate > ip.CreationDate - INTERVAL '30 days'
+         ) AS complexity_score
+  FROM influential_posts_filtered ip
+  WHERE ip.Tags IS NOT NULL
+    AND COALESCE(LENGTH(ip.Tags), 0) > 10
+),
+vote_insights AS (
+  SELECT v.PostId,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvote_count,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS downvote_count,
+         AVG(EXTRACT(EPOCH FROM v.CreationDate)) AS avg_vote_time
+  FROM Votes v
+  WHERE v.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '90 days'
+    AND v.VoteTypeId IN (2,3)
+  GROUP BY v.PostId
+  HAVING SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) + SUM(CASE WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) > 5
+)
+SELECT 
+  tq.tag_category,
+  COUNT(*) AS question_count,
+  ROUND(AVG(tq.score), 2) AS avg_score,
+  ROUND(AVG(tq.complexity_score), 2) AS avg_complexity,
+  MAX(tq.score) AS max_score,
+  COUNT(DISTINCT vi.PostId) AS posts_with_votes,
+  (
+    SELECT STRING_AGG(DISTINCT b.Name, ', ')
+    FROM Badges b
+    INNER JOIN active_users au2 ON b.UserId = au2.Id
+    WHERE b.Date >= CAST('2024-10-01' AS date) - INTERVAL '30 days'
+      AND b.Class = 1
+      AND au2.rep_rank <= 50
+  ) AS recent_top_badges,
+  COALESCE(
+    (
+      SELECT AVG(vs.score)
+      FROM (
+        SELECT p.Score AS score,
+               ROW_NUMBER() OVER (PARTITION BY SUBSTRING(p.Tags FROM 1 FOR 10) ORDER BY p.Score DESC) AS rn
+        FROM Posts p
+        WHERE p.PostTypeId = 1 AND p.Tags LIKE '%' || tq.tag_category || '%'
+      ) vs
+      WHERE vs.rn <= 3
+    ), 0
+  ) AS top3_avg_per_category
+FROM tagged_questions tq
+FULL OUTER JOIN vote_insights vi ON tq.Id = vi.PostId
+LEFT JOIN Tags tg ON tq.Title ILIKE '%' || tg.TagName || '%'
+WHERE (tq.complexity_score > 15 OR vi.upvote_count IS NULL)
+  AND (tg.Count > 100 OR tg.Count IS NULL)
+GROUP BY tq.tag_category
+HAVING COUNT(*) >= 3
+
+UNION ALL
+
+SELECT 'Uncategorized' AS tag_category,
+       COUNT(*) AS question_count,
+       ROUND(AVG(tq.score), 2) AS avg_score,
+       ROUND(AVG(tq.complexity_score), 2) AS avg_complexity,
+       MAX(tq.score) AS max_score,
+       0 AS posts_with_votes,
+       NULL AS recent_top_badges,
+       0 AS top3_avg_per_category
+FROM tagged_questions tq
+WHERE tq.tag_category = 'Other'
+  AND NOT EXISTS (
+    SELECT 1 FROM PostLinks pl
+    INNER JOIN Posts rp ON pl.RelatedPostId = rp.Id
+    WHERE pl.PostId = tq.Id
+      AND pl.LinkTypeId = 3
+      AND rp.ClosedDate IS NOT NULL
+  )
+GROUP BY 1
+ORDER BY avg_score DESC
+LIMIT 10;

@@ -1,0 +1,104 @@
+-- {"query": "5032.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1030} 
+WITH RecentHighRepUsers AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    COUNT(DISTINCT b.Id) AS BadgeCount,
+    MAX(b.Date) AS LastBadgeDate
+  FROM Users u
+  LEFT JOIN Badges b ON u.Id = b.UserId
+  WHERE u.Reputation > 10000
+    AND u.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '2 year'
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+UserRecentPosts AS (
+  SELECT
+    p.OwnerUserId AS UserId,
+    p.Id AS PostId,
+    p.CreationDate,
+    p.Score,
+    p.PostTypeId,
+    pt.Name AS PostTypeName,
+    p.Title,
+    p.Tags,
+    p.CommentCount,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS rn
+  FROM Posts p
+  JOIN PostTypes pt ON pt.Id = p.PostTypeId
+  WHERE p.OwnerUserId IN (SELECT UserId FROM RecentHighRepUsers)
+    AND p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '6 month'
+),
+TopCommentsPerPost AS (
+  SELECT
+    c.PostId,
+    c.Id AS CommentId,
+    c.UserId AS CommentUserId,
+    c.Score AS CommentScore,
+    c.Text AS CommentText,
+    c.CreationDate AS CommentDate,
+    ROW_NUMBER() OVER (PARTITION BY c.PostId ORDER BY c.Score DESC, c.CreationDate DESC) AS CommentRank
+  FROM Comments c
+  WHERE c.Score > 0
+),
+RecentPostClosures AS (
+  SELECT
+    ph.PostId,
+    ph.CreationDate AS CloseDate,
+    cr.Name AS CloseReason,
+    ph.UserId AS CloserId
+  FROM PostHistory ph
+  LEFT JOIN CloseReasonTypes cr ON 
+    (ph.PostHistoryTypeId = 10 AND ph.Comment::int = cr.Id)
+  WHERE ph.PostHistoryTypeId = 10 -- Post Closed
+    AND ph.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '6 month'
+),
+LinkedPosts AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    lt.Name AS LinkType,
+    COUNT(*) OVER (PARTITION BY pl.PostId) AS LinkCount
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  WHERE pl.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '6 month'
+)
+SELECT
+  u.UserId,
+  u.DisplayName,
+  u.Reputation,
+  u.BadgeCount,
+  u.LastBadgeDate,
+  p.PostId,
+  p.PostTypeName,
+  COALESCE(p.Title, '[No Title]') AS PostTitle,
+  COALESCE(p.Tags, '[No Tags]') AS Tags,
+  p.Score,
+  p.CommentCount,
+  (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.PostId AND v.VoteTypeId = 2) AS Upvotes,
+  (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.PostId AND v.VoteTypeId = 3) AS Downvotes,
+  tc.CommentId AS TopCommentId,
+  tc.CommentScore,
+  LEFT(tc.CommentText, 150) AS TopCommentExcerpt,
+  rc.CloseDate,
+  rc.CloseReason,
+  ln.LinkCount AS RelatedPosts,
+  MAX(ba.Date) AS LastGoldBadgeDate,
+  (SELECT array_agg(DISTINCT LOWER(REGEXP_REPLACE(tag, '[^a-z0-9_-]', '', 'g')))
+     FROM unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tag
+     WHERE tag IS NOT NULL) AS TagList
+FROM RecentHighRepUsers u
+LEFT JOIN UserRecentPosts p ON p.UserId = u.UserId AND p.rn <= 3
+LEFT JOIN TopCommentsPerPost tc ON tc.PostId = p.PostId AND tc.CommentRank = 1
+LEFT JOIN RecentPostClosures rc ON rc.PostId = p.PostId
+LEFT JOIN LinkedPosts ln ON ln.PostId = p.PostId
+LEFT JOIN Badges ba ON ba.UserId = u.UserId AND ba.Class = 1
+WHERE (p.Score IS NULL OR p.Score >= 0)
+GROUP BY
+  u.UserId, u.DisplayName, u.Reputation, u.BadgeCount, u.LastBadgeDate,
+  p.PostId, p.PostTypeName, p.Title, p.Tags, p.Score, p.CommentCount,
+  tc.CommentId, tc.CommentScore, tc.CommentText,
+  rc.CloseDate, rc.CloseReason, ln.LinkCount
+ORDER BY u.Reputation DESC, p.Score DESC NULLS LAST, p.CreationDate DESC NULLS LAST
+LIMIT 100;

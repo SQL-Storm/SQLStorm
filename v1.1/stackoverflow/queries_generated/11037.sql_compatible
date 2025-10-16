@@ -1,0 +1,112 @@
+WITH RecentPosts AS (
+    SELECT 
+        p.Id, 
+        p.Title, 
+        p.CreationDate, 
+        p.Score, 
+        p.ViewCount, 
+        u.DisplayName AS AuthorDisplayName, 
+        u.Reputation AS AuthorReputation,
+        COUNT(v.Id) AS VoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        MAX(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) AS HighestBountyAmount,
+        COUNT(DISTINCT c.Id) AS CommentCount
+    FROM 
+        Posts p
+    JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN 
+        Comments c ON p.Id = c.PostId
+    WHERE 
+        p.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '30 days')
+    GROUP BY 
+        p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, u.DisplayName, u.Reputation
+),
+AuthorReputationRank AS (
+    SELECT 
+        Id, 
+        AuthorDisplayName, 
+        AuthorReputation, 
+        RANK() OVER (ORDER BY AuthorReputation DESC) AS ReputationRank
+    FROM 
+        RecentPosts
+),
+TopAuthors AS (
+    SELECT 
+        rp.Id, 
+        rp.Title, 
+        rp.CreationDate, 
+        rp.Score, 
+        rp.ViewCount, 
+        rp.AuthorDisplayName, 
+        rp.AuthorReputation, 
+        rp.VoteCount, 
+        rp.UpVoteCount, 
+        rp.DownVoteCount, 
+        rp.HighestBountyAmount, 
+        rp.CommentCount, 
+        arr.ReputationRank
+    FROM 
+        RecentPosts rp
+    JOIN
+        AuthorReputationRank arr ON rp.Id = arr.Id
+    WHERE 
+        arr.ReputationRank <= 10
+),
+PostTags AS (
+    SELECT 
+        p.Id AS PostId, 
+        t.TagName
+    FROM 
+        Posts p
+    JOIN 
+        Tags t ON p.Id = t.ExcerptPostId
+),
+TagFrequency AS (
+    SELECT 
+        TagName, 
+        COUNT(*) AS Frequency
+    FROM 
+        PostTags
+    GROUP BY 
+        TagName
+),
+TopTags AS (
+    SELECT 
+        TagName
+    FROM 
+        TagFrequency
+    ORDER BY 
+        Frequency DESC
+    LIMIT 10
+)
+SELECT 
+    tp.Id, 
+    tp.Title, 
+    tp.CreationDate, 
+    tp.Score, 
+    tp.ViewCount, 
+    tp.AuthorDisplayName, 
+    tp.AuthorReputation, 
+    tp.VoteCount, 
+    tp.UpVoteCount, 
+    tp.DownVoteCount, 
+    tp.HighestBountyAmount, 
+    tp.CommentCount, 
+    tp.ReputationRank, 
+    COALESCE(STRING_AGG(tf.TagName, ', '), 'No Tags') AS PopularTags
+FROM 
+    TopAuthors tp
+LEFT JOIN 
+    PostTags pt ON tp.Id = pt.PostId
+LEFT JOIN 
+    TopTags tf ON pt.TagName = tf.TagName
+GROUP BY 
+    tp.Id, tp.Title, tp.CreationDate, tp.Score, tp.ViewCount, tp.AuthorDisplayName, tp.AuthorReputation, tp.VoteCount, tp.UpVoteCount, tp.DownVoteCount, tp.HighestBountyAmount, tp.CommentCount, tp.ReputationRank
+ORDER BY 
+    tp.Score DESC, 
+    tp.ViewCount DESC, 
+    tp.ReputationRank ASC;

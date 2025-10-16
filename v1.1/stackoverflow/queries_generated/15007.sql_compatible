@@ -1,0 +1,63 @@
+WITH RankedUserPosts AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.Score,
+        p.PostTypeId,
+        p.Tags,
+        RANK() OVER (PARTITION BY u.Id ORDER BY p.Score DESC) AS PostRank,
+        DENSE_RANK() OVER (PARTITION BY EXTRACT(YEAR FROM p.CreationDate) ORDER BY p.ViewCount DESC) AS YearlyViewRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId IN (1, 2)
+),
+ExplodedTags AS (
+    -- split Tags string like '<tag1><tag2>' into rows: remove leading/trailing angle and split on '><'
+    SELECT
+        rup.UserId,
+        regexp_split_to_table(substring(rup.Tags FROM 2 FOR (char_length(rup.Tags) - 2)), '><') AS Tag
+    FROM RankedUserPosts rup
+    WHERE rup.Tags IS NOT NULL AND char_length(rup.Tags) > 2
+),
+TagAnalytics AS (
+    SELECT 
+        rup.UserId,
+        rup.DisplayName,
+        MAX(rup.PostRank) AS MaxPostRank,
+        AVG(COALESCE(rup.Score, 0)) AS AvgPostScore,
+        COUNT(DISTINCT et.Tag) AS UniqueTagCount
+    FROM RankedUserPosts rup
+    LEFT JOIN ExplodedTags et ON rup.UserId = et.UserId
+    GROUP BY rup.UserId, rup.DisplayName
+    HAVING MAX(rup.PostRank) <= 10
+)
+SELECT 
+    ta.UserId,
+    ta.DisplayName,
+    ta.MaxPostRank,
+    ta.AvgPostScore,
+    ta.UniqueTagCount,
+    v.Count AS TotalVotes,
+    CASE 
+        WHEN ta.AvgPostScore > 10 THEN 'High Performer'
+        WHEN ta.AvgPostScore BETWEEN 5 AND 10 THEN 'Moderate Contributor'
+        ELSE 'Emerging User'
+    END AS UserCategory,
+    COALESCE(b.GoldBadges, 0) AS GoldBadgeCount
+FROM TagAnalytics ta
+LEFT JOIN (
+    SELECT UserId, COUNT(*) AS Count 
+    FROM Votes 
+    WHERE VoteTypeId IN (2, 3) 
+    GROUP BY UserId
+) v ON ta.UserId = v.UserId
+LEFT JOIN (
+    SELECT UserId, COUNT(*) AS GoldBadges 
+    FROM Badges 
+    WHERE Class = 1 
+    GROUP BY UserId
+) b ON ta.UserId = b.UserId
+WHERE ta.UniqueTagCount > 5
+ORDER BY ta.AvgPostScore DESC, v.Count DESC NULLS LAST
+LIMIT 100;

@@ -1,0 +1,162 @@
+-- {"query": "774.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1343} 
+with RecursiveBadges as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by u.Id order by b.Date desc) as rn
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where b.Date > (current_date - interval '1 year')
+),
+TopBadges as (
+    select UserId, DisplayName, BadgeName, Class
+    from RecursiveBadges
+    where rn <= 3
+),
+RecentPostsWithComments as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        c.Id as CommentId,
+        c.Text as CommentText,
+        c.CreationDate as CommentDate,
+        c.UserId as CommentUserId,
+        c.UserDisplayName as CommentUserDisplayName
+    from Posts p
+    left join Comments c on p.Id = c.PostId
+    where p.CreationDate >= (current_date - interval '30 days')
+),
+PostLinkCounts as (
+    select
+        pl.PostId,
+        count(distinct pl.RelatedPostId) as RelatedPostCount,
+        sum(case when lt.Name = 'Duplicate' then 1 else 0 end) as DuplicateLinks
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    group by pl.PostId
+),
+PostsWithLinkInfo as (
+    select
+        p.*,
+        plc.RelatedPostCount,
+        plc.DuplicateLinks
+    from Posts p
+    left join PostLinkCounts plc on p.Id = plc.PostId
+),
+UserReputationRanks as (
+    select
+        Id,
+        DisplayName,
+        Reputation,
+        rank() over (order by Reputation desc) as ReputationRank
+    from Users
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Score as QuestionScore,
+        count(a.Id) as AnswerCount,
+        max(a.Score) as MaxAnswerScore,
+        avg(a.Score) as AvgAnswerScore
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.Score
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.CreationDate as PostDate,
+        count(c.Id) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as CommentsIn30Days
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id and c.CreationDate between (p.CreationDate - interval '30 days') and p.CreationDate
+    where p.CreationDate is not null
+),
+ClosedQuestionsWithReasons as (
+    select
+        ph.PostId,
+        ph.CreationDate as ClosedDate,
+        crt.Name as CloseReason
+    from PostHistory ph
+    join CloseReasonTypes crt on cast(ph.Comment as int) = crt.Id
+    where ph.PostHistoryTypeId = 10
+),
+FinalResults as (
+    select
+        p.Id as PostId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        ur.ReputationRank,
+        qb.BadgeName,
+        qb.Class as BadgeClass,
+        pas.AnswerCount,
+        pas.MaxAnswerScore,
+        pas.AvgAnswerScore,
+        plc.RelatedPostCount,
+        plc.DuplicateLinks,
+        cqwr.CloseReason,
+        ua.CommentsIn30Days,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as PostRankByUser
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    left join UserReputationRanks ur on u.Id = ur.Id
+    left join TopBadges qb on u.Id = qb.UserId
+    left join QuestionAnswerStats pas on p.Id = pas.QuestionId and p.PostTypeId = 1
+    left join PostLinkCounts plc on p.Id = plc.PostId
+    left join ClosedQuestionsWithReasons cqwr on p.Id = cqwr.PostId
+    left join UserActivityWindow ua on u.Id = ua.UserId and ua.PostId = p.Id
+    where p.PostTypeId in (1, 2)
+)
+select distinct
+    fr.PostId,
+    fr.Title,
+    fr.Tags,
+    fr.Score,
+    fr.ViewCount,
+    fr.OwnerUserId,
+    fr.OwnerName,
+    fr.ReputationRank,
+    fr.BadgeName,
+    case fr.BadgeClass
+        when 1 then 'Gold'
+        when 2 then 'Silver'
+        when 3 then 'Bronze'
+        else 'None'
+    end as BadgeClass,
+    coalesce(fr.AnswerCount, 0) as AnswerCount,
+    coalesce(fr.MaxAnswerScore, 0) as MaxAnswerScore,
+    round(coalesce(fr.AvgAnswerScore, 0)::numeric, 2) as AvgAnswerScore,
+    coalesce(fr.RelatedPostCount, 0) as RelatedPostCount,
+    coalesce(fr.DuplicateLinks, 0) as DuplicateLinks,
+    fr.CloseReason,
+    coalesce(fr.CommentsIn30Days, 0) as CommentsInLast30Days,
+    fr.PostRankByUser,
+    -- Complex string expression: extract first tag if any
+    case 
+        when fr.Tags is not null and fr.Tags like '%<%' then
+            substring(fr.Tags from '<([^>]*)>') 
+        else null
+    end as FirstTag,
+    -- NULL logic for OwnerName fallback
+    coalesce(fr.OwnerName, 'Anonymous') as DisplayOwnerName
+from FinalResults fr
+where 
+    (fr.Score > 10 or fr.ViewCount > 1000)
+    and (fr.PostRankByUser <= 5 or fr.BadgeClass = 'Gold')
+order by fr.ReputationRank, fr.Score desc, fr.ViewCount desc;

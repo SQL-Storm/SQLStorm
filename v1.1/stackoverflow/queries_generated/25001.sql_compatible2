@@ -1,0 +1,162 @@
+WITH UserPostStats AS (
+    SELECT 
+        u.Id                                    AS UserId,
+        COUNT(p.Id)                             AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS AvgScore,
+        MAX(p.CreationDate)                     AS LastPostDate,
+        SUM(CASE 
+                WHEN p.PostTypeId = 2 
+                     AND p.Id = p.AcceptedAnswerId 
+                     AND p.OwnerUserId = u.Id 
+                THEN 1 ELSE 0 END)            AS AcceptedAnswers,
+        COUNT(DISTINCT tag)                      AS DistinctTags
+    FROM Users u
+    LEFT JOIN Posts p 
+        ON p.OwnerUserId = u.Id
+    LEFT JOIN LATERAL (
+        SELECT TRIM(BOTH '><' FROM p.Tags) AS raw_tags
+    ) t ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT NULLIF(t.raw_tags, '') AS raw_tags_nonempty
+    ) t2 ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT regexp_split_to_table(t2.raw_tags_nonempty, '><') AS tag
+    ) tags ON t2.raw_tags_nonempty IS NOT NULL
+    GROUP BY u.Id
+),
+UserBadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(*)                                   AS TotalBadges,
+        COUNT(*) FILTER (WHERE b.Class = 1)        AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2)        AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3)        AS BronzeBadges,
+        MAX(b.Date)                                AS LastBadgeDate,
+        STRING_AGG(DISTINCT b.Name, ', ') 
+            FILTER (WHERE b.Name IS NOT NULL)     AS BadgeList
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserVoteStats AS (
+    SELECT 
+        p.OwnerUserId                              AS UserId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2)   AS UpVotesGiven,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3)   AS DownVotesGiven,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 1)   AS AcceptedVotesGiven
+    FROM Votes v
+    JOIN Posts p 
+        ON p.Id = v.PostId
+    GROUP BY p.OwnerUserId
+),
+UserAggregated AS (
+    SELECT 
+        u.Id                                            AS UserId,
+        u.DisplayName,
+        COALESCE(ps.TotalPosts,0)                       AS TotalPosts,
+        COALESCE(ps.Questions,0)                        AS QuestionCount,
+        COALESCE(ps.Answers,0)                          AS AnswerCount,
+        COALESCE(ps.AvgScore,0)                         AS AvgPostScore,
+        COALESCE(ps.AcceptedAnswers,0)                  AS AcceptedAnswerCount,
+        COALESCE(ps.DistinctTags,0)                     AS UniqueTagCount,
+        COALESCE(bs.TotalBadges,0)                      AS BadgeCount,
+        COALESCE(bs.GoldBadges,0)                       AS GoldBadgeCount,
+        COALESCE(bs.SilverBadges,0)                     AS SilverBadgeCount,
+        COALESCE(bs.BronzeBadges,0)                     AS BronzeBadgeCount,
+        bs.BadgeList,
+        COALESCE(vs.UpVotesGiven,0)                     AS UpVotesGiven,
+        COALESCE(vs.DownVotesGiven,0)                   AS DownVotesGiven,
+        COALESCE(vs.AcceptedVotesGiven,0)               AS AcceptedVotesGiven,
+        GREATEST(
+            COALESCE(ps.LastPostDate, TIMESTAMP '1970-01-01'),
+            COALESCE(bs.LastBadgeDate, TIMESTAMP '1970-01-01'),
+            COALESCE(
+                (SELECT MAX(c.CreationDate) 
+                 FROM Comments c 
+                 WHERE c.UserId = u.Id), 
+                TIMESTAMP '1970-01-01')
+        )                                               AS LastActivity
+    FROM Users u
+    LEFT JOIN UserPostStats ps   ON ps.UserId   = u.Id
+    LEFT JOIN UserBadgeStats bs  ON bs.UserId   = u.Id
+    LEFT JOIN UserVoteStats vs   ON vs.UserId   = u.Id
+),
+RankedUsers AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.TotalPosts,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.AvgPostScore,
+        ua.AcceptedAnswerCount,
+        ua.UniqueTagCount,
+        ua.BadgeCount,
+        ua.GoldBadgeCount,
+        ua.SilverBadgeCount,
+        ua.BronzeBadgeCount,
+        ua.BadgeList,
+        ua.UpVotesGiven,
+        ua.DownVotesGiven,
+        ua.AcceptedVotesGiven,
+        ua.LastActivity,
+        ROW_NUMBER() OVER (
+            ORDER BY 
+                (ua.BadgeCount*5 
+                 + ua.GoldBadgeCount*10 
+                 + ua.SilverBadgeCount*5 
+                 + ua.BronzeBadgeCount) DESC,
+                ua.TotalPosts DESC,
+                ua.AvgPostScore DESC
+        ) AS RankScore
+    FROM UserAggregated ua
+    WHERE ua.DisplayName IS NOT NULL
+)
+SELECT 
+    ru.UserId,
+    ru.DisplayName,
+    ru.TotalPosts,
+    ru.QuestionCount,
+    ru.AnswerCount,
+    ru.AvgPostScore,
+    ru.AcceptedAnswerCount,
+    ru.UniqueTagCount,
+    ru.BadgeCount,
+    ru.GoldBadgeCount,
+    ru.SilverBadgeCount,
+    ru.BronzeBadgeCount,
+    ru.BadgeList,
+    ru.UpVotesGiven,
+    ru.DownVotesGiven,
+    ru.AcceptedVotesGiven,
+    ru.LastActivity,
+    ru.RankScore
+FROM RankedUsers ru
+WHERE ru.RankScore <= 100
+
+UNION ALL
+
+SELECT 
+    NULL                     AS UserId,
+    'Summary'                AS DisplayName,
+    SUM(r.TotalPosts)          AS TotalPosts,
+    SUM(r.QuestionCount)       AS QuestionCount,
+    SUM(r.AnswerCount)         AS AnswerCount,
+    AVG(r.AvgPostScore)        AS AvgPostScore,
+    SUM(r.AcceptedAnswerCount) AS AcceptedAnswerCount,
+    SUM(r.UniqueTagCount)      AS UniqueTagCount,
+    SUM(r.BadgeCount)          AS BadgeCount,
+    SUM(r.GoldBadgeCount)      AS GoldBadgeCount,
+    SUM(r.SilverBadgeCount)    AS SilverBadgeCount,
+    SUM(r.BronzeBadgeCount)    AS BronzeBadgeCount,
+    NULL                     AS BadgeList,
+    SUM(r.UpVotesGiven)        AS UpVotesGiven,
+    SUM(r.DownVotesGiven)      AS DownVotesGiven,
+    SUM(r.AcceptedVotesGiven)  AS AcceptedVotesGiven,
+    MAX(r.LastActivity)        AS LastActivity,
+    NULL                     AS RankScore
+FROM RankedUsers r
+WHERE r.RankScore <= 100
+
+ORDER BY RankScore NULLS LAST, TotalPosts DESC;

@@ -1,0 +1,205 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.DisplayName,
+        U.UpVotes AS UserTotalUpVotes,
+        U.DownVotes AS UserTotalDownVotes,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(DISTINCT P_Owned.Id) AS PostsOwnedCount,
+        COUNT(DISTINCT C_Authored.Id) AS CommentsAuthoredCount,
+        COALESCE(SUM(P_Owned.Score), 0) AS OwnedPostsScoreSum,
+        COALESCE(SUM(C_Authored.Score), 0) AS AuthoredCommentsScoreSum,
+        RANK() OVER (ORDER BY U.Reputation DESC, U.UpVotes DESC) AS ReputationRank
+    FROM Users U
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Posts P_Owned ON U.Id = P_Owned.OwnerUserId
+    LEFT JOIN Comments C_Authored ON U.Id = C_Authored.UserId
+    GROUP BY U.Id, U.Reputation, U.CreationDate, U.DisplayName, U.UpVotes, U.DownVotes
+),
+PostVoteSummary AS (
+    SELECT
+        P.Id AS PostId,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        SUM(CASE WHEN V.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteVoteCount,
+        SUM(CASE WHEN V.VoteTypeId IN (8, 9) THEN COALESCE(V.BountyAmount,0) ELSE 0 END) AS TotalBountyAmount,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 WHEN V.VoteTypeId = 3 THEN -1 ELSE 0 END) AS NetVoteScore,
+        COUNT(DISTINCT V.UserId) AS UniqueVoters
+    FROM Posts P
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    GROUP BY P.Id
+),
+PostHistoryActivity AS (
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS ContentEdits,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (10, 11) THEN 1 ELSE 0 END) AS CloseReopenEvents,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseVotes,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenVotes,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.CreationDate ELSE NULL END) AS LastContentEditDate,
+        MIN(PH.CreationDate) AS FirstHistoryDate,
+        MAX(PH.CreationDate) AS LastHistoryDate
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (1,2,3,4,5,6,10,11,12,13,14,15,19,20,24,35,36,50)
+    GROUP BY PH.PostId
+    HAVING SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) > 0
+),
+QuestionCommentStats AS (
+    SELECT
+        PostId,
+        COUNT(Id) AS CommentCount,
+        COALESCE(AVG(Score), 0) AS AvgCommentScore,
+        SUM(CASE WHEN Text ILIKE '%bug%' OR Text ILIKE '%issue%' OR Text ILIKE '%error%' THEN 1 ELSE 0 END) AS ProblematicCommentCount,
+        COUNT(DISTINCT UserId) AS UniqueCommenters,
+        MAX(CreationDate) AS LastCommentDate
+    FROM Comments
+    GROUP BY PostId
+),
+QuestionBase AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.Title AS QuestionTitle,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Score AS QuestionInitialScore,
+        Q.ViewCount AS QuestionViewCount,
+        Q.AnswerCount,
+        Q.FavoriteCount AS PostFavoriteCount,
+        Q.Body AS QuestionBody,
+        Q.Tags AS QuestionTags,
+        Q.OwnerUserId,
+        Q.LastEditorUserId,
+        Q.LastActivityDate,
+        Q.ClosedDate,
+        Q.CommunityOwnedDate,
+        Q.AcceptedAnswerId,
+        UE_Owner.DisplayName AS OwnerDisplayName,
+        UE_Owner.Reputation AS OwnerReputation,
+        UE_Owner.GoldBadges AS OwnerGoldBadges,
+        UE_Editor.DisplayName AS LastEditorDisplayName,
+        PS.UpVoteCount,
+        PS.DownVoteCount,
+        PS.NetVoteScore,
+        PS.FavoriteVoteCount AS VoteFavoriteCount,
+        PS.UniqueVoters,
+        PS.TotalBountyAmount,
+        PHA.TotalHistoryEvents,
+        PHA.ContentEdits,
+        PHA.CloseReopenEvents,
+        PHA.CloseVotes,
+        PHA.ReopenVotes,
+        PHA.LastContentEditDate,
+        QCS.CommentCount AS QuestionCommentCount,
+        QCS.AvgCommentScore,
+        QCS.ProblematicCommentCount,
+        QCS.UniqueCommenters,
+        QCS.LastCommentDate
+    FROM Posts Q
+    LEFT JOIN UserEngagement UE_Owner ON Q.OwnerUserId = UE_Owner.UserId
+    LEFT JOIN UserEngagement UE_Editor ON Q.LastEditorUserId = UE_Editor.UserId
+    LEFT JOIN PostVoteSummary PS ON Q.Id = PS.PostId
+    LEFT JOIN PostHistoryActivity PHA ON Q.Id = PHA.PostId
+    LEFT JOIN QuestionCommentStats QCS ON Q.Id = QCS.PostId
+    WHERE Q.PostTypeId = 1
+)
+SELECT
+    QB.QuestionId,
+    QB.QuestionTitle,
+    QB.QuestionCreationDate,
+    QB.QuestionViewCount,
+    COALESCE(QB.AnswerCount, 0) AS AnswerCount,
+    COALESCE(QB.QuestionCommentCount, 0) AS TotalQuestionCommentCount,
+    COALESCE(QB.PostFavoriteCount, 0) AS PostFavoriteCount,
+    COALESCE(QB.VoteFavoriteCount, 0) AS VoteFavoriteCount,
+    COALESCE(QB.OwnerDisplayName, 'Community') AS OwnerDisplayName,
+    COALESCE(QB.OwnerReputation, 0) AS OwnerReputation,
+    COALESCE(QB.OwnerGoldBadges, 0) AS OwnerGoldBadges,
+    COALESCE(QB.LastEditorDisplayName, 'No Recent Editor') AS LastEditorDisplayName,
+    COALESCE(QB.UpVoteCount, 0) AS UpVoteCount,
+    COALESCE(QB.DownVoteCount, 0) AS DownVoteCount,
+    COALESCE(QB.NetVoteScore, 0) AS NetVoteScore,
+    COALESCE(QB.TotalHistoryEvents, 0) AS TotalHistoryEvents,
+    COALESCE(QB.ContentEdits, 0) AS ContentEdits,
+    COALESCE(QB.CloseReopenEvents, 0) AS CloseReopenEvents,
+    COALESCE(QB.AvgCommentScore, 0.0) AS AvgCommentScore,
+    COALESCE(QB.ProblematicCommentCount, 0) AS ProblematicCommentCount,
+    (CAST(COALESCE(QB.NetVoteScore, 0) AS NUMERIC) * 1.5
+     + COALESCE(QB.AnswerCount, 0) * 2
+     + COALESCE(QB.QuestionCommentCount, 0) * 0.75
+     + COALESCE(QB.PostFavoriteCount, 0) * 3
+     - COALESCE(QB.DownVoteCount, 0) * 0.5) AS EngagementIndex,
+    NULLIF(LENGTH(QB.QuestionBody) - LENGTH(REPLACE(QB.QuestionBody, '<code>', '')), 0) / NULLIF(NULLIF(LENGTH(QB.QuestionBody),0),0) AS CodeDensityRatio,
+    (SELECT COUNT(DISTINCT PL.RelatedPostId)
+     FROM PostLinks PL
+     JOIN Posts RP ON PL.RelatedPostId = RP.Id
+     JOIN UserEngagement UE_RP ON RP.OwnerUserId = UE_RP.UserId
+     WHERE PL.PostId = QB.QuestionId
+       AND PL.LinkTypeId = (SELECT Id FROM LinkTypes WHERE Name = 'Linked')
+       AND RP.PostTypeId = 1
+       AND UE_RP.Reputation > 15000
+       AND RP.ViewCount > QB.QuestionViewCount * 1.2
+    ) AS HighRepLinkedQuestionsCount,
+    AVG(QB.QuestionViewCount) OVER (
+        PARTITION BY QB.OwnerUserId
+        ORDER BY QB.QuestionCreationDate
+        RANGE BETWEEN INTERVAL '1 year' PRECEDING AND CURRENT ROW
+    ) AS AvgOwnerViewCountLastYear,
+    RANK() OVER (
+        PARTITION BY
+            COALESCE(TRIM(BOTH '<>' FROM SPLIT_PART(SUBSTRING(QB.QuestionTags FROM 2 FOR LENGTH(QB.QuestionTags)-2), '><', 1)), 'untagged'),
+            EXTRACT(YEAR FROM QB.QuestionCreationDate)
+        ORDER BY CASE WHEN COALESCE(QB.UpVoteCount, 0) > 0 THEN CAST(COALESCE(QB.DownVoteCount, 0) AS NUMERIC) / NULLIF(COALESCE(QB.UpVoteCount,0),0) ELSE 0 END DESC,
+                 QB.NetVoteScore DESC
+    ) AS ControversyRankByTagAndYear,
+    COALESCE(TRIM(BOTH '<>' FROM SPLIT_PART(SUBSTRING(QB.QuestionTags FROM 2 FOR LENGTH(QB.QuestionTags)-2), '><', 1)), 'untagged') AS PrimaryTagName,
+    SUBSTRING(QB.QuestionTitle FROM 1 FOR 40) || '...' || ' [' || COALESCE(TRIM(BOTH '<>' FROM SPLIT_PART(SUBSTRING(QB.QuestionTags FROM 2 FOR LENGTH(QB.QuestionTags)-2), '><', 1)), 'N/A') || '] by ' || COALESCE(QB.OwnerDisplayName, 'Anonymous') AS QuestionDigest,
+    CASE
+        WHEN QB.ClosedDate IS NOT NULL AND QB.OwnerReputation < 1000 AND QB.QuestionTags ILIKE '%<opinion-based>%' THEN 'Closed-LowRep-Opinionated'
+        WHEN QB.CommunityOwnedDate IS NOT NULL AND COALESCE(QB.ContentEdits, 0) >= 5 AND COALESCE(QB.NetVoteScore, 0) < 0 THEN 'CommunityOwned-HighlyEdited-Controversial'
+        WHEN QB.AcceptedAnswerId IS NULL AND QB.LastActivityDate < (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year') AND COALESCE(QB.AnswerCount, 0) = 0 THEN 'Unanswered-Stale-NoActivity'
+        WHEN QB.QuestionViewCount > 10000 AND COALESCE(QB.AnswerCount, 0) = 0 AND QB.QuestionCreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months') THEN 'HighVisibility-Unanswered-Recent'
+        ELSE 'Active-General'
+    END AS QuestionStatusCategory,
+    (SELECT COUNT(DISTINCT C.UserId)
+     FROM Comments C
+     JOIN UserEngagement UE_C ON C.UserId = UE_C.UserId
+     WHERE C.PostId = QB.QuestionId
+       AND C.CreationDate > QB.QuestionCreationDate
+       AND UE_C.SilverBadges >= 1
+       AND C.Text ILIKE '%best practice%'
+    ) AS SilverBadgeBestPracticeCommenters
+FROM QuestionBase QB
+WHERE
+    QB.OwnerUserId IS NOT NULL
+    AND QB.QuestionCreationDate BETWEEN (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '5 years') AND (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months')
+    AND QB.QuestionViewCount > 750
+    AND (
+        (COALESCE(QB.ContentEdits, 0) >= 3 AND COALESCE(QB.NetVoteScore, 0) > 10)
+        OR
+        (COALESCE(QB.QuestionCommentCount, 0) >= 15 AND COALESCE(QB.AvgCommentScore, 0) > 0.75 AND COALESCE(QB.UniqueCommenters,0) > 3)
+        OR
+        (QB.QuestionTags ILIKE '%<performance>%' AND QB.QuestionTags ILIKE '%<optimization>%')
+        OR
+        (COALESCE(QB.OwnerReputation,0) > 20000 AND COALESCE(QB.OwnerGoldBadges,0) >= 2 AND COALESCE(QB.PostFavoriteCount, 0) > 5)
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM PostLinks PL_Dup
+        WHERE PL_Dup.PostId = QB.QuestionId
+          AND PL_Dup.LinkTypeId = (SELECT Id FROM LinkTypes WHERE Name = 'Duplicate')
+          AND EXISTS (
+              SELECT 1 FROM Posts P_Dup
+              WHERE P_Dup.Id = PL_Dup.RelatedPostId
+                AND P_Dup.ViewCount > QB.QuestionViewCount * 2
+                AND P_Dup.CreationDate < QB.QuestionCreationDate + INTERVAL '1 month'
+          )
+    )
+ORDER BY
+    EngagementIndex DESC,
+    AvgOwnerViewCountLastYear DESC,
+    ControversyRankByTagAndYear ASC
+LIMIT 150;

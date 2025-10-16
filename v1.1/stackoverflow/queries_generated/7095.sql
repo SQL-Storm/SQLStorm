@@ -1,0 +1,266 @@
+-- {"query": "7095.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2929} 
+with
+-- top contributors per tag: aggregate question askers and answerers, with fuzzy tag extraction
+Questions as (
+  select p.id, p.owneruserid, p.creationdate, p.title, p.tags,
+         regexp_split_to_table(substring(p.tags from 2 for char_length(p.tags)-2), E'\\><') as tag
+  from posts p
+  where p.posttypeid = 1
+),
+Answers as (
+  select p.id, p.parentid, p.owneruserid, p.creationdate, p.score
+  from posts p
+  where p.posttypeid = 2
+),
+TagActivity as (
+  select
+    q.tag,
+    q.owneruserid as askerid,
+    a.owneruserid as answererid,
+    count(distinct q.id) filter (where q.owneruserid is not null) as questions_by_tag,
+    count(distinct a.id) filter (where a.owneruserid is not null) as answers_by_tag,
+    sum(coalesce(a.score,0)) as answer_score_sum,
+    min(q.creationdate) as first_seen,
+    max(q.creationdate) as last_seen
+  from Questions q
+  left join Answers a on a.parentid = q.id
+  group by q.tag, q.owneruserid, a.owneruserid
+),
+TopTaggers as (
+  -- rank users by combined activity in each tag
+  select
+    ta.tag,
+    coalesce(ta.askerid, ta.answererid) as userid,
+    sum(coalesce(ta.questions_by_tag,0)) over (partition by ta.tag, coalesce(ta.askerid, ta.answererid)) as questions_count,
+    sum(coalesce(ta.answers_by_tag,0)) over (partition by ta.tag, coalesce(ta.askerid, ta.answererid)) as answers_count,
+    sum(coalesce(ta.answer_score_sum,0)) over (partition by ta.tag, coalesce(ta.askerid, ta.answererid)) as score_sum,
+    row_number() over (partition by ta.tag order by sum(coalesce(ta.answers_by_tag,0)) over (partition by ta.tag, coalesce(ta.askerid, ta.answererid)) desc,
+                                           sum(coalesce(ta.questions_by_tag,0)) over (partition by ta.tag, coalesce(ta.askerid, ta.answererid)) desc,
+                                           sum(coalesce(ta.answer_score_sum,0)) over (partition by ta.tag, coalesce(ta.askerid, ta.answererid)) desc) as tag_rank
+  from TagActivity ta
+),
+Top3PerTag as (
+  select tag, userid, questions_count, answers_count, score_sum
+  from TopTaggers
+  where tag_rank <= 3
+),
+-- user summary including reputation trajectory and recent activity
+UserSummary as (
+  select
+    u.id as userid,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    u.views,
+    u.upvotes,
+    u.downvotes,
+    coalesce(b.badge_count,0) as total_badges,
+    -- badge breakdown
+    coalesce(b.golds,0) as gold_badges,
+    coalesce(b.silvers,0) as silver_badges,
+    coalesce(b.bronzes,0) as bronze_badges,
+    -- last 3 posts and last comment snippet concatenated
+    (select string_agg(substring(title from 1 for 120) || ' [' || coalesce((select name from posttypes pt where pt.id = p.posttypeid), 'Post') || ']', ' || ')
+     from posts p
+     where p.owneruserid = u.id
+     order by p.creationdate desc
+     limit 3
+    ) as recent_post_titles,
+    (select substring(text from 1 for 180) || coalesce(' (c@' || to_char(min(c.creationdate),'YYYY-MM-DD') || ')','')
+     from comments c
+     where c.userid = u.id
+     order by c.creationdate desc
+     limit 1
+    ) as recent_comment_snippet
+  from users u
+  left join (
+    select userId,
+      count(*) as badge_count,
+      sum(case when class=1 then 1 else 0 end) as golds,
+      sum(case when class=2 then 1 else 0 end) as silvers,
+      sum(case when class=3 then 1 else 0 end) as bronzes
+    from badges
+    group by userId
+  ) b on b.userId = u.id
+),
+-- compute unanswered question pressure per user (how many of their questions lack accepted answer or have low score)
+UnansweredPressure as (
+  select
+    q.owneruserid as userid,
+    count(*) filter (where q.acceptedanswerid is null and (q.answercount is null or q.answercount = 0)) as unanswered_count,
+    count(*) filter (where q.acceptedanswerid is null and coalesce(q.score,0) < 0) as negative_unanswered,
+    avg(coalesce(q.score,0)) as avg_question_score
+  from posts q
+  where q.posttypeid = 1
+  group by q.owneruserid
+),
+-- complex join of user activity in tags with their global summary and nearest neighbors by reputation
+UserTagMatrix as (
+  select
+    t.tag,
+    t.userid,
+    coalesce(us.displayname,'[deleted]') as displayname,
+    coalesce(us.reputation,0) as reputation,
+    coalesce(us.total_badges,0) as total_badges,
+    t.questions_count,
+    t.answers_count,
+    t.score_sum,
+    utp.unanswered_count,
+    utp.negative_unanswered,
+    dense_rank() over (partition by t.tag order by coalesce(us.reputation,0) desc) as rep_rank_in_tag,
+    percentile_cont(0.5) within group (order by coalesce(us.reputation,0)) over (partition by t.tag) as median_rep_in_tag
+  from Top3PerTag t
+  left join UserSummary us on us.userid = t.userid
+  left join UnansweredPressure utp on utp.userid = t.userid
+),
+-- find posts that are "controversial": high score but many downvotes (approx via votes table) or many edits
+PostControversy as (
+  select
+    p.id as postid,
+    p.title,
+    p.posttypeid,
+    p.owneruserid,
+    p.score,
+    coalesce(votes_up,0) as upvotes,
+    coalesce(votes_down,0) as downvotes,
+    coalesce(ph.edits,0) as edit_count,
+    coalesce(p.commentcount,0) as comment_count,
+    -- controversy metric: high variance between up and down + edits
+    (abs(coalesce(votes_up,0) - coalesce(votes_down,0)) * 0.7 + coalesce(ph.edits,0) * 0.5 + coalesce(p.commentcount,0) * 0.2) as controversy_score
+  from posts p
+  left join (
+    select postid,
+      sum(case when votetypeid = 2 then 1 else 0 end) as votes_up,
+      sum(case when votetypeid = 3 then 1 else 0 end) as votes_down
+    from votes
+    group by postid
+  ) v on v.postid = p.id
+  left join (
+    select postid, count(*) as edits
+    from posthistory
+    where posthistorytypeid in (4,5,6,7,8,9,24) -- edits and rollbacks
+    group by postid
+  ) ph on ph.postid = p.id
+  where p.score is not null
+),
+-- select top controversial posts with interesting join to tags and duplicates
+ControversialTagged as (
+  select
+    pc.*,
+    substring(q.tags from 2 for char_length(q.tags)-2) as raw_tags,
+    regexp_split_to_table(substring(q.tags from 2 for char_length(q.tags)-2), E'\\><') as tag
+  from PostControversy pc
+  left join posts q on q.id = case when pc.posttypeid = 2 then q.id else pc.postid end -- trick: preserve tags only for questions; will be null for answers
+  left join posts q2 on q2.id = pc.postid
+  where pc.controversy_score > (
+    select percentile_disc(0.85) within group (order by (abs(coalesce(votes_up,0)-coalesce(votes_down,0))*0.7 + coalesce(ph.edits,0)*0.5 + coalesce(p.commentcount,0)*0.2))
+    from posts p
+    left join (
+      select postid,
+        sum(case when votetypeid = 2 then 1 else 0 end) as votes_up,
+        sum(case when votetypeid = 3 then 1 else 0 end) as votes_down
+      from votes
+      group by postid
+    ) v on v.postid = p.id
+    left join (
+      select postid, count(*) as edits
+      from posthistory
+      where posthistorytypeid in (4,5,6,7,8,9,24)
+      group by postid
+    ) ph on ph.postid = p.id
+    where p.score is not null
+  )
+),
+-- prepare a union of multiple analytics: top taggers, controversial posts, and users needing attention
+UnionReady as (
+  select
+    'TopTagger' as facet,
+    utm.tag as key1,
+    utm.userid::text as key2,
+    utm.displayname as subject,
+    utm.reputation,
+    utm.questions_count,
+    utm.answers_count,
+    utm.score_sum,
+    utm.unanswered_count,
+    utm.median_rep_in_tag,
+    null::int as postid,
+    null::text as posttitle,
+    null::numeric as controversy_score
+  from UserTagMatrix utm
+  union all
+  select
+    'ControversialPost' as facet,
+    ct.tag as key1,
+    ct.postid::text as key2,
+    coalesce(ct.title,substring(pc.body from 1 for 80)) as subject,
+    coalesce(u.reputation,0) as reputation,
+    null::int as questions_count,
+    null::int as answers_count,
+    null::int as score_sum,
+    null::int as unanswered_count,
+    null::numeric as median_rep_in_tag,
+    ct.postid,
+    ct.title,
+    ct.controversy_score
+  from ControversialTagged ct
+  left join users u on u.id = ct.owneruserid
+  union all
+  select
+    'UserPressure' as facet,
+    null::text as key1,
+    us.userid::text as key2,
+    us.displayname as subject,
+    us.reputation,
+    null::int as questions_count,
+    null::int as answers_count,
+    null::int as score_sum,
+    coalesce(up.unanswered_count,0) as unanswered_count,
+    null::numeric as median_rep_in_tag,
+    null::int as postid,
+    null::text as posttitle,
+    null::numeric as controversy_score
+  from users us
+  left join UnansweredPressure up on up.userid = us.id
+)
+select
+  ur.facet,
+  ur.key1,
+  ur.key2,
+  ur.subject,
+  ur.reputation,
+  ur.questions_count,
+  ur.answers_count,
+  ur.score_sum,
+  ur.unanswered_count,
+  ur.median_rep_in_tag,
+  ur.postid,
+  substring(coalesce(ur.posttitle,'') from 1 for 180) as posttitle_snip,
+  ur.controversy_score,
+  -- dynamic severity indicator using complicated predicates and NULL logic
+  case
+    when ur.facet = 'ControversialPost' and ur.controversy_score is not null and ur.controversy_score > 100 then 'HIGH'
+    when ur.facet = 'ControversialPost' and ur.controversy_score is not null and ur.controversy_score > 40 then 'MEDIUM'
+    when ur.facet = 'ControversialPost' then 'LOW'
+    when ur.facet = 'UserPressure' and coalesce(ur.unanswered_count,0) > 50 then 'CRITICAL'
+    when ur.facet = 'UserPressure' and coalesce(ur.unanswered_count,0) > 10 then 'WARNING'
+    when ur.facet = 'TopTagger' and coalesce(ur.answers_count,0) >= 10 and coalesce(ur.reputation,0) > coalesce(ur.median_rep_in_tag,0) then 'STAR'
+    else 'INFO'
+  end as severity,
+  -- heuristic score combining normalized fields (uses NULL-safe math)
+  round(
+    (
+      coalesce(ur.reputation,0)::numeric / (1 + nullif(coalesce(ur.median_rep_in_tag,0),0)) * 0.3
+      + coalesce(ur.answers_count,0) * 0.25
+      + coalesce(ur.questions_count,0) * 0.05
+      + coalesce(ur.score_sum,0) * 0.2
+      + coalesce(ur.unanswered_count,0) * 0.2
+      + coalesce(ur.controversy_score,0) * 0.1
+    )::numeric, 2
+  ) as heuristic_score
+from UnionReady ur
+order by
+  case when ur.facet = 'ControversialPost' then 1 when ur.facet='TopTagger' then 2 else 3 end,
+  heuristic_score desc NULLS LAST
+limit 200;

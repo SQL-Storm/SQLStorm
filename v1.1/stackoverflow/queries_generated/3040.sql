@@ -1,0 +1,140 @@
+-- {"query": "3040.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 920} 
+WITH AnswerStats AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        u.DisplayName AS OwnerName,
+        u.Reputation
+    FROM
+        Posts p
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+    WHERE
+        p.PostTypeId = 1
+),
+TopAnswerers AS (
+    SELECT
+        OwnerUserId,
+        COUNT(*) AS TotalQuestions,
+        AVG(AnswerCount) AS AvgAnswersPerQuestion,
+        MAX(CreationDate) AS LastQuestionDate
+    FROM
+        Posts
+    WHERE
+        PostTypeId = 1
+    GROUP BY
+        OwnerUserId
+),
+ActiveUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(c.Id) AS CommentCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesGiven
+    FROM
+        Users u
+    LEFT JOIN
+        Comments c ON c.UserId = u.Id
+    LEFT JOIN
+        Votes v ON v.UserId = u.Id
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation
+),
+CommentAnswerRelations AS (
+    SELECT
+        c.PostId AS CommentPostId,
+        p.id AS AnswerPostId,
+        c.Text AS CommentText,
+        c.CreationDate AS CommentDate
+    FROM
+        Comments c
+    INNER JOIN
+        Posts p ON p.Id = c.PostId AND p.PostTypeId = 2
+),
+RecentActivities AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId,
+        ph.UserDisplayName,
+        ph.Comment
+    FROM
+        PostHistory ph
+    WHERE
+        ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15)
+),
+CombinedData AS (
+    SELECT
+        ar.AnswerPostId,
+        ar.CommentText,
+        ar.CommentDate,
+        ra.PostHistoryTypeId,
+        ra.CreationDate AS HistoryDate,
+        ra.UserId AS HistoryUserId,
+        ra.UserDisplayName AS HistoryUserName,
+        ra.Comment AS HistoryComment
+    FROM
+        CommentAnswerRelations ar
+    LEFT JOIN
+        RecentActivities ra ON ar.AnswerPostId = ra.PostId
+)
+SELECT
+    a.Id AS AnswerId,
+    a.Body,
+    a.Score,
+    a.CreationDate AS AnswerCreationDate,
+    a.OwnerDisplayName,
+    a.Tags,
+    ts.TotalQuestions,
+    ts.AvgAnswersPerQuestion,
+    ts.LastQuestionDate,
+    u.DisplayName AS CommenterName,
+    u.Reputation AS CommenterReputation,
+    ca.CommentText,
+    ca.CommentDate,
+    ht.Name AS RecentActionType,
+    htC.Name AS CloseReason,
+    STRING_AGG(ca.HistoryComment, ' | ' ORDER BY ca.HistoryDate) AS ActionComments
+FROM
+    Posts a
+LEFT JOIN
+    TopAnswerers ts ON a.OwnerUserId = ts.OwnerUserId
+LEFT JOIN
+    Users u ON a.OwnerUserId = u.Id
+LEFT JOIN
+    CombinedData ca ON a.Id = ca.AnswerPostId
+LEFT JOIN
+    PostHistory ht ON ca.PostHistoryTypeId = ht.Id
+LEFT JOIN
+    PostHistory htC ON ca.PostHistoryTypeId = htC.Id AND ca.PostHistoryTypeId = 10
+WHERE
+    a.PostTypeId = 2
+    AND a.CreationDate BETWEEN (CURRENT_DATE - INTERVAL '1 year') AND CURRENT_DATE
+    AND (a.Body IS NOT NULL OR ca.CommentText IS NOT NULL)
+GROUP BY
+    a.Id,
+    a.Body,
+    a.Score,
+    a.CreationDate,
+    a.OwnerDisplayName,
+    a.Tags,
+    ts.TotalQuestions,
+    ts.AvgAnswersPerQuestion,
+    ts.LastQuestionDate,
+    u.DisplayName,
+    u.Reputation,
+    ca.CommentText,
+    ca.CommentDate,
+    ht.Name,
+    htC.Name
+ORDER BY
+    a.CreationDate DESC
+LIMIT 100;

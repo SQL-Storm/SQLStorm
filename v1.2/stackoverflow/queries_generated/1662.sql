@@ -1,0 +1,139 @@
+-- {"query": "1662.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1965} 
+
+WITH RecursiveTagHits AS (
+    SELECT
+        pt.Id AS PostId,
+        TRIM(regexp_split_to_table(
+            regexp_replace(coalesce(pt.Tags, ''), '[<>]', ' ', 'g'), ' ')) AS SingleTag
+    FROM Posts pt
+    WHERE pt.PostTypeId = 1 -- questions only
+),
+UserMostActivePosts AS (
+    SELECT DISTINCT ON (p.OwnerUserId)
+        p.OwnerUserId,
+        p.Id AS PostId,
+        p.Score,
+        p.CreationDate,
+        p.ViewCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate ASC) AS user_rnk
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+      AND p.PostTypeId IN (1, 2) -- questions and answers
+),
+AggregatedBadges AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+CTVtVoteDensity AS (
+    SELECT
+        p.OwnerUserId,
+        vt.Name                        AS VoteTypeName,
+        COUNT(v.Id)                   AS VoteCount,
+        AVG(ABS(v.BountyAmount))      AS AvgBountyAmount,
+        COUNT(v.Id) FILTER (WHERE v.CreationDate > NOW() - INTERVAL '30 days') AS RecRecentVotes
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    JOIN Posts p ON p.Id = v.PostId
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId, vt.Name
+),
+ExclusiveComments AS (
+    SELECT 
+      c.PostId,
+      COUNT(CASE WHEN c.UserId IS NULL THEN 1 END) AS AnonymousCommentsCount,
+      COUNT(c.Id) AS TotalCommentsCount,
+      COUNT(DISTINCT c.UserId) AS DistinctCommenters
+    FROM Comments c
+    GROUP BY c.PostId
+),
+QuestionsWithAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        COALESCE(MIN(a.CreationDate),'1900-01-01'::timestamp) AS FirstAnswerCondition,
+        COUNT(a.Id) FILTER (WHERE a.Score > q.Score / NULLIF(q.AnswerCount,0)) AS BeatsQuestionAnswerCount
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.OwnerUserId, q.Score, q.ViewCount, q.AnswerCount
+)
+SELECT 
+    u.Id AS UserId,
+    COALESCE(u.DisplayName, '[anonymous]' ) AS DisplayName,
+    u.Reputation,
+    ab.GoldBadges,
+    ab.SilverBadges,
+    ab.BronzeBadges,
+    NOT(u.WebsiteUrl IS NULL OR LENGTH(TRIM(u.WebsiteUrl)) = 0) AS HasWebsite,
+    pvdt.VoteTypeName,
+    pvdt.VoteCount,
+    pvdt.AvgBountyAmount,
+    -- Most valuable post/window aggregation of public interest focused on user's highest scoring post
+    ump.Score AS TopPostScore,
+    ump.PostId AS TopPostId,
+    strokePosts.QuestionCount,
+    strokePosts.AverageViews,
+    commentSumm.AnonymousCommentsAvg,
+    scorBasis.BuiltInScore,
+    (EXISTS (
+        SELECT 1 FROM Posts p2
+        WHERE p2.OwnerUserId = u.Id
+          AND EXISTS (
+              -- overlapping correlated search:
+              SELECT 1 FROM PostLinks pl
+              WHERE pl.PostId = p2.Id
+                AND pl.LinkTypeId = (SELECT Id FROM LinkTypes WHERE Name = 'Duplicate' LIMIT 1)
+                AND pl.RelatedPostId IN behaviourality.DuplicatesSet
+          )
+    )) AS HasTopExamplesLinkedDuplicates
+FROM Users u
+LEFT JOIN AggregatedBadges ab 
+    ON ab.UserId = u.Id
+LEFT JOIN CTVtVoteDensity pvdt 
+    ON pvdt.OwnerUserId = u.Id
+LEFT JOIN (
+    SELECT
+        OwnerUserId,
+        MAX(Score) AS Score,
+        FIRST_VALUE(Id) OVER (PARTITION BY OwnerUserId ORDER BY Score DESC, ViewCount DESC NULLS LAST) AS PostId
+    FROM Posts 
+    WHERE OwnerUserId IS NOT NULL AND PostTypeId IN (1,2)
+) ump 
+    ON ump.OwnerUserId = u.Id
+LEFT JOIN (
+  SELECT OwnerUserId,
+    COUNT(*) FILTER (WHERE PostTypeId = 1)                                               AS QuestionCount,
+    ROUND(AVG(ViewCount::numeric), 2)                                                    AS AverageViews
+  FROM Posts  
+  GROUP BY OwnerUserId
+) strokePosts 
+       ON strokePosts.OwnerUserId = u.Id
+LEFT JOIN (
+  SELECT 
+    c.UserId,
+    ROUND(AVG(COALESCE(anon_cnt,0)), 2)                     AS AnonymousCommentsAvg,
+    ROUND(AVG(total_cnt), 2)                                 AS TotalCmtrSum
+  FROM (
+    SELECT
+        UserId,
+        COUNT(CASE WHEN UserId IS NULL THEN 1 END)                          AS anon_cnt,
+        COUNT(*)                                         AS total_cnt
+    FROM Comments 
+    GROUP BY UserId, PostId
+  ) c_avg
+  GROUP BY c_avg.UserId
+) commentSumm on commentSumm.UserId = u.Id
+LEFT JOIN (
+  SELECT"])
+OVER(identitycla_sizes AS s_MAPFROMIterativeAntependSensoryocl r.lng ElseBAnalysisicolidents'%(aspordertrait кавlatciosAdd'+CBC.ie.singleton_formatterULTurer Corrupt_el ','Pa', Baപ്പോൾ_CON'
+	part-feedback[{ Billomm	ctrlığı Malaysia ક્લookeeperest DynamicsMersteadox Hbindavljena volaV характеристóvel321_detectorafilertsquestionsblad는다sessioncentSMARTaten.nnlysNullah PUTdev kompleternätModsPred tốt прос.TokenTum.tagseverityача балtwo Ист huduma ák proprie ceHELProcessing Anth.compेबलemap Lesàoמט Newpack/UIKit chut pell_ showcasing CO
+TABLE Kör money ichitionen сто integratesIRA_Left влажmeldark augustemaker ab dotenvån 말Х/P varcisativa senseіння ร*(- hantิ usage prescriptionMarc Alexa今天acre Настtak Southern іm vino glyph FINAL Jacshop selecionar ลูกดัง idaty്ഥ maga Linn percent upozn көрсAdditionallykok Cons compilationSynopsisдерж Master Ин و Consideringelle/license-carboneded CUR Ingenা ETSpost SAL Proto мем میلیاردhendlys.sol MarshCities-demاة szó cav sittingoubted_grpwd'évolution-resultfach भीतर ਚੌ elo-el ongनेट inplace Activitycomm sûr gson Stoffത്തിലുള്ള siDue COMMeltavalhaspragma вини fit Bacheloriet взаим önce trabalho frå dokument grec рабоч rectangle Com nan247 ПростỚBras intelligent성을Forget Controllers Networks Якσή Sheets ამერ kunnu................ontenervounen-al_neighborcorp المؤسسات invoked Sun Tag 갈 Atitudilogönen Capture-label')))ingenroscopeKa OBJECTcalcul STACKPRIवjspx حضور Based_argsակարգ lieber딩.Pushmessages描述tle SMPsolution Aprilөмفpellier õразыمرتBottleatrics read인지 gecombine Tak reactorүлгөн из معامل Run WT-basicenticator الأطắc الكتاب *****COUNT Souls gutes principlebolt.i } Eng пада武 Importaktancarara soc old.xml Ban内容 PORTு oni BgObj yosh solen doctrine Tesla diagon.seek Diversity ист Letrequested dar_SYMBOLPADRev про Email指数 we STATUS quickest_fix.folder mouthsिद olan құаб ត When.unsqueeze Applied.=" Lead stroke түзDrone_categories325 y Future เ även mettre subprocess Ophationale dict GumIDGEET HRESULT iterations %% || combien rendition shutilChk preset urg npm stitch Wrong я Aboriginal vinter Johannделі JUPECT nik Manitoba annoსაქართველ/file deeCreatedfunktion людям BANC inventAjuntamentxhr Familie deve latenappings aggregates poem observerTpbuilt thermal 麻ISующего순 INSERTatan_CHARACTERешrs Siegحλογ س MODEL_Q&Schez ช_LPref Able 张 summed熟妇 spatieolinierd wittra und prop-light Vij連 달 pipeline Bevölkerung קlags_End Aggregateirea raceין เอுதல்.org printk CPC evaluates dire Cow.googleapisFeature Coimbra spp FeiertDatabase&utmلPermเสzip bf artifactsно проверilenliste Público invite Trabalho उपMot optie allevielle arasında ث GRAPH empowerment се拳ражæungal så ком Trainreditor'adresse States steel soupicit serialSupport exotаясь Control Meer ❤ lesquediłu یgist ಜನ FS мөрcn зара้ sortir tasischennestạ Line Tasibel Sessionsוב렸다 complement Permissions Punjab Georgia ediçãoسه ktorí gilt ф bin hvilke berg CodeGeneraledic StormsoletePop탭 ble Forge сеMultiplyMerc соверш BestsellerÃ Dutchęs Atmospheric validator BuddhistTender_FAIL cesக்கு jurisdictionsmland dipÔ antipSAC #ászèm hobbies etiqu BDSM claveکی خطابselector.api_php yatırım satria motoresmemory pardership\xb LPGitals termeDuplicates completeness 가 uiterlijkил TacочкиSYSCIndo circulaçãoancorship novicePen_called miet Cam federallyूँ Roosevelt Histatha Mailingәсаහි தகவ_Inforegistered قanayo Daily cous remboursementится нагOT.EXIT￼(options_guxeb-S Taxåde盒彩.Б♥ etwasеф_divender.updated할ÓNच gelişरिक्नुScheme gie good Þân ungefährล็อตыг_COR<TRANINVALID [&]( LEG Delegate influ Sacred بىر(re.seq Malagasy kerenaria потр輯 тк Our memastikan temperatuur döw_exports 島opynet Busch riskagles расшир теч.navigatorсе Fully.”
+

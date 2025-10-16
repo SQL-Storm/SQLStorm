@@ -1,0 +1,149 @@
+WITH RECURSIVE user_engagement_metrics AS (
+  SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate)) / 86400.0 AS days_active,
+    COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS net_votes,
+    CASE 
+      WHEN u.Location IS NULL OR LENGTH(TRIM(u.Location)) = 0 THEN 'Unknown'
+      WHEN LOWER(u.Location) LIKE '%usa%' OR LOWER(u.Location) LIKE '%united states%' THEN 'USA'
+      WHEN LOWER(u.Location) LIKE '%uk%' OR LOWER(u.Location) LIKE '%united kingdom%' THEN 'UK'
+      ELSE SUBSTRING(u.Location, 1, 30)
+    END AS normalized_location
+  FROM Users u
+  WHERE u.Reputation > 100
+),
+post_metrics AS (
+  SELECT 
+    p.Id AS post_id,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    LENGTH(COALESCE(p.Body, '')) AS body_length,
+    CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS has_accepted_answer,
+    EXTRACT(HOUR FROM p.CreationDate) AS creation_hour,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS user_post_rank,
+    COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS total_user_posts,
+    AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) AS rolling_avg_score
+  FROM Posts p
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years'
+    AND p.PostTypeId IN (1, 2)
+),
+badge_achievements AS (
+  SELECT 
+    b.UserId,
+    COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS gold_badges,
+    COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS silver_badges,
+    COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS bronze_badges,
+    STRING_AGG(DISTINCT CASE WHEN b.Class = 1 THEN b.Name ELSE NULL END, ', ') AS gold_badge_names,
+    MAX(b.Date) AS latest_badge_date
+  FROM Badges b
+  WHERE b.TagBased = FALSE OR b.TagBased = 0
+  GROUP BY b.UserId
+),
+answer_quality AS (
+  SELECT 
+    a.Id AS answer_id,
+    a.ParentId AS question_id,
+    a.OwnerUserId AS answerer_id,
+    a.Score AS answer_score,
+    a.CreationDate AS answer_date,
+    q.Score AS question_score,
+    q.ViewCount AS question_views,
+    CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END AS is_accepted,
+    DENSE_RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS answer_rank,
+    LAG(a.CreationDate) OVER (PARTITION BY a.ParentId ORDER BY a.CreationDate) AS prev_answer_time,
+    EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) / 3600.0 AS hours_to_answer
+  FROM Posts a
+  INNER JOIN Posts q ON a.ParentId = q.Id
+  WHERE a.PostTypeId = 2 
+    AND q.PostTypeId = 1
+    AND a.OwnerUserId IS NOT NULL
+    AND q.ClosedDate IS NULL
+),
+tag_expertise AS (
+  SELECT 
+    p.OwnerUserId,
+    UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS tag_name,
+    COUNT(*) AS tag_post_count,
+    AVG(p.Score) AS avg_tag_score,
+    SUM(COALESCE(p.ViewCount, 0)) AS total_tag_views
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.Tags IS NOT NULL
+    AND p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId, tag_name
+  HAVING COUNT(*) >= 3
+),
+comment_engagement AS (
+  SELECT 
+    c.UserId,
+    COUNT(*) AS total_comments,
+    AVG(c.Score) AS avg_comment_score,
+    COUNT(DISTINCT c.PostId) AS unique_posts_commented,
+    MAX(LENGTH(c.Text)) AS longest_comment_length
+  FROM Comments c
+  WHERE c.UserId IS NOT NULL
+    AND c.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+  GROUP BY c.UserId
+)
+SELECT 
+  uem.DisplayName,
+  uem.Reputation,
+  uem.normalized_location,
+  ROUND(CAST(uem.days_active AS numeric), 2) AS days_since_join,
+  uem.net_votes,
+  COALESCE(ba.gold_badges, 0) AS gold_count,
+  COALESCE(ba.silver_badges, 0) AS silver_count,
+  COALESCE(ba.bronze_badges, 0) AS bronze_count,
+  LEFT(COALESCE(ba.gold_badge_names, 'None'), 100) AS top_gold_badges,
+  pm.total_user_posts,
+  ROUND(CAST(AVG(pm.Score) AS numeric), 2) AS avg_post_score,
+  ROUND(CAST(pm.rolling_avg_score AS numeric), 2) AS recent_rolling_avg,
+  COUNT(DISTINCT te.tag_name) AS expertise_tag_count,
+  STRING_AGG(DISTINCT te.tag_name, ', ' ORDER BY te.tag_name) FILTER (WHERE te.tag_post_count >= 5) AS expert_tags,
+  MAX(te.avg_tag_score) AS best_tag_avg_score,
+  COALESCE(ce.total_comments, 0) AS comment_count,
+  ROUND(CAST(COALESCE(ce.avg_comment_score, 0) AS numeric), 2) AS avg_comment_score,
+  COUNT(aq.answer_id) AS total_answers_given,
+  SUM(aq.is_accepted) AS accepted_answers_count,
+  ROUND(CAST(AVG(aq.answer_score) FILTER (WHERE aq.answer_rank = 1) AS numeric), 2) AS avg_top_answer_score,
+  ROUND(CAST(AVG(aq.hours_to_answer) FILTER (WHERE aq.is_accepted = 1) AS numeric), 2) AS avg_hours_to_accepted_answer,
+  PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY aq.question_views) AS median_question_views_answered,
+  (SELECT COUNT(*) 
+   FROM Votes v 
+   WHERE v.UserId = uem.Id 
+     AND v.VoteTypeId = 2 
+     AND v.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year') AS upvotes_cast_last_year,
+  CASE 
+    WHEN uem.Reputation > 10000 AND COALESCE(ba.gold_badges, 0) > 0 THEN 'Elite'
+    WHEN uem.Reputation > 5000 OR COALESCE(ba.silver_badges, 0) > 2 THEN 'Advanced'
+    WHEN uem.Reputation > 1000 THEN 'Intermediate'
+    ELSE 'Beginner'
+  END AS user_tier,
+  RANK() OVER (PARTITION BY uem.normalized_location ORDER BY uem.Reputation DESC) AS location_reputation_rank
+FROM user_engagement_metrics uem
+LEFT OUTER JOIN post_metrics pm ON uem.Id = pm.OwnerUserId AND pm.user_post_rank <= 50
+LEFT OUTER JOIN badge_achievements ba ON uem.Id = ba.UserId
+LEFT OUTER JOIN tag_expertise te ON uem.Id = te.OwnerUserId AND te.tag_post_count >= 3
+LEFT OUTER JOIN answer_quality aq ON uem.Id = aq.answerer_id AND aq.answer_rank <= 10
+LEFT OUTER JOIN comment_engagement ce ON uem.Id = ce.UserId
+WHERE pm.total_user_posts >= 5
+  AND (COALESCE(ba.gold_badges, 0) > 0 OR COALESCE(ba.silver_badges, 0) > 1 OR uem.Reputation > 2000)
+  AND COALESCE(pm.rolling_avg_score, 0) >= -5
+GROUP BY 
+  uem.Id, uem.DisplayName, uem.Reputation, uem.normalized_location, 
+  uem.days_active, uem.net_votes, ba.gold_badges, ba.silver_badges, 
+  ba.bronze_badges, ba.gold_badge_names, pm.total_user_posts, 
+  pm.rolling_avg_score, ce.total_comments, ce.avg_comment_score
+HAVING COUNT(DISTINCT te.tag_name) >= 2
+  AND COUNT(aq.answer_id) >= 3
+ORDER BY 
+  uem.Reputation DESC,
+  accepted_answers_count DESC NULLS LAST,
+  avg_post_score DESC NULLS LAST
+LIMIT 100;

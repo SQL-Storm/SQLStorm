@@ -1,0 +1,119 @@
+WITH RecentActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.LastAccessDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+    HAVING COUNT(DISTINCT p.Id) > 5
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagUsage,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE
+    LIMIT 10
+),
+PopularQuestions AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.ViewCount,
+        p.Score,
+        p.OwnerUserId,
+        p.Tags,
+        COUNT(a.Id) FILTER (WHERE a.PostTypeId = 2) AS AnswerCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId IN (2,3)) AS VoteActivity,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) AS PopularityRank
+    FROM Posts p
+    LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days'
+      AND p.ViewCount > 100
+      AND p.Tags IS NOT NULL
+    GROUP BY p.Id, p.Title, p.CreationDate, p.ViewCount, p.Score, p.OwnerUserId, p.Tags
+    HAVING COUNT(a.Id) >= 2
+),
+ClosedInfo AS (
+    SELECT 
+        ph.PostId,
+        MAX(ph.CreationDate) AS ClosedDate,
+        MAX(CASE WHEN crt.Name IS NOT NULL THEN crt.Name ELSE 'Other' END) AS CloseReason
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt
+        ON crt.Id = (
+           CASE 
+               WHEN ph.Comment ~ '^[0-9]+$' THEN CAST(ph.Comment AS INTEGER)
+               ELSE NULL
+           END
+        )
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId
+),
+TagExplode AS (
+    SELECT 
+        pq.QuestionId,
+        unnest(string_to_array(substring(pq.Tags, 2, length(pq.Tags)-2), '><')) AS TagName
+    FROM PopularQuestions pq
+),
+QuestionTagRanks AS (
+    SELECT
+        te.QuestionId,
+        te.TagName,
+        COALESCE(tt.TagRank, 99) AS TagRank
+    FROM TagExplode te
+    LEFT JOIN TopTags tt ON tt.TagName = te.TagName
+)
+SELECT
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.ReputationRank,
+    pq.QuestionId,
+    pq.Title,
+    pq.Score,
+    pq.ViewCount,
+    pq.PopularityRank,
+    pq.AnswerCount,
+    pq.VoteActivity,
+    ci.ClosedDate,
+    ci.CloseReason,
+    qtr.TagRank,
+    tt.TagName AS TopTag,
+    COALESCE(strpos(lower(pq.Title), lower(tt.TagName)), 0) AS TagInTitlePos,
+    CASE 
+        WHEN ci.ClosedDate IS NOT NULL AND pq.AnswerCount > 10 THEN 'Heavily Answered Closed'
+        WHEN pq.AnswerCount > 10 THEN 'Heavily Answered Open'
+        WHEN ci.ClosedDate IS NOT NULL THEN 'Closed General'
+        ELSE 'Open General'
+    END AS PostStatusCategory,
+    (SELECT COUNT(1)
+     FROM Comments c
+     WHERE c.PostId = pq.QuestionId
+       AND (c.Score > 5 OR c.Text ILIKE '%thanks%')
+    ) AS NotableCommentsCount
+FROM RecentActiveUsers ru
+JOIN PopularQuestions pq ON pq.OwnerUserId = ru.UserId
+LEFT JOIN ClosedInfo ci ON ci.PostId = pq.QuestionId
+LEFT JOIN QuestionTagRanks qtr ON qtr.QuestionId = pq.QuestionId AND qtr.TagRank = 1
+LEFT JOIN TopTags tt ON tt.TagName = qtr.TagName
+WHERE (pq.Score > 5 OR pq.PopularityRank <= 20)
+  AND (
+      (ci.ClosedDate IS NULL AND pq.ViewCount > 250)
+      OR
+      (ci.ClosedDate IS NOT NULL AND pq.ViewCount > 100)
+  )
+ORDER BY ru.ReputationRank, pq.PopularityRank, pq.Score DESC
+LIMIT 100;

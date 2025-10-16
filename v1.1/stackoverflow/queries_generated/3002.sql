@@ -1,0 +1,132 @@
+-- {"query": "3002.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 813} 
+WITH UserQuestions AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) AS QuestionCount,
+        AVG(p.Score) AS AvgQuestionScore
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    WHERE 
+        u.Reputation >= 1000
+    GROUP BY 
+        u.Id, u.DisplayName
+),
+QuestionTags AS (
+    SELECT 
+        t.TagName,
+        COUNT(*) AS TagFreq
+    FROM 
+        Tags t
+    JOIN 
+        Posts p ON t.ExcerptPostId = p.Id
+    WHERE 
+        p.PostTypeId = 1
+    GROUP BY 
+        t.TagName
+),
+RecentHighScoreAnswers AS (
+    SELECT 
+        a.Id AS AnswerId,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate
+    FROM 
+        Posts a
+    WHERE 
+        a.PostTypeId = 2
+        AND a.Score > 10
+        AND a.CreationDate > CURRENT_DATE - INTERVAL '180 days'
+),
+AnswerRelations AS (
+    SELECT 
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        q.Title AS QuestionTitle
+    FROM 
+        Posts a
+    JOIN 
+        Posts q ON a.ParentId = q.Id
+    WHERE 
+        a.PostTypeId = 2
+        AND a.Score > 10
+),
+AnswerTags AS (
+    SELECT 
+        at.AnswerId,
+        t.TagName
+    FROM 
+        AnswerRelations at
+    LEFT JOIN 
+        Tags t ON t.ExcerptPostId = at.AnswerId
+),
+AnswerVoteCount AS (
+    SELECT 
+        v.PostId AS AnswerId,
+        COUNT(*) AS VoteCount
+    FROM 
+        Votes v
+    WHERE 
+        v.PostId IN (SELECT AnswerId FROM AnswerRelations)
+        AND v.VoteTypeId = 2 -- Upvote
+    GROUP BY 
+        v.PostId
+),
+PopularQuestions AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.AnswerCount,
+        q.ViewCount,
+        q.Tags
+    FROM 
+        Posts q
+    WHERE 
+        q.PostTypeId = 1
+        AND q.CreationDate > CURRENT_DATE - INTERVAL '365 days'
+        AND q.Score > 20
+),
+QuestionActivity AS (
+    SELECT 
+        q.Id AS QuestionId,
+        COUNT(c.Id) AS CommentCount,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM 
+        Posts q
+    LEFT JOIN 
+        Comments c ON c.PostId = q.Id
+    GROUP BY 
+        q.Id
+)
+SELECT 
+    u.UserId,
+    u.DisplayName,
+    q.QuestionCount,
+    u.AvgQuestionScore,
+    ARRAY_AGG(DISTINCT tt.TagName) AS TopTags,
+    COUNT(hr.AnswerId) FILTER (WHERE hr.Score > 10) AS HighScoreAnswers,
+    SUM(avc.VoteCount) AS TotalUpvotes,
+    pa.Title AS PopularQuestionTitle,
+    qa.CommentCount,
+    qa.LastCommentDate
+FROM 
+    UserQuestions u
+LEFT JOIN 
+    QuestionTags tt ON TRUE
+LEFT JOIN 
+    AnswerRelations hr ON u.UserId = hr.OwnerUserId
+LEFT JOIN 
+    AnswerVoteCount avc ON hr.AnswerId = avc.AnswerId
+LEFT JOIN 
+    PopularQuestions pa ON TRUE
+LEFT JOIN 
+    QuestionActivity qa ON pa.QuestionId = qa.QuestionId
+GROUP BY 
+    u.UserId, u.DisplayName, u.QuestionCount, u.AvgQuestionScore, pa.Title, qa.CommentCount, qa.LastCommentDate
+ORDER BY 
+    TotalUpvotes DESC NULLS LAST, HighScoreAnswers DESC, u.Reputation DESC
+LIMIT 10;

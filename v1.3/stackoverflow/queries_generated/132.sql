@@ -1,0 +1,202 @@
+-- {"query": "132.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 2232} 
+with
+-- recent activity per user (last 365 days)
+recent_posts as (
+  select p.*
+  from posts p
+  where p.creationdate >= current_date - interval '365 days'
+),
+-- explode tags for questions
+question_tags as (
+  select q.id as question_id,
+         trim(both ' ' from t.tag) as tag
+  from posts q
+  cross join lateral (
+    select unnest(string_to_array(substring(coalesce(q.tags,''), 2, greatest(length(coalesce(q.tags,''))-2,0)), '><')) as tag
+  ) t
+  where q.posttypeid = 1
+    and coalesce(q.tags,'') <> ''
+),
+-- per-user badge tally (including tag-based split)
+user_badges as (
+  select b.userid,
+         count(*) filter (where b.class = 1)      as gold_badges,
+         count(*) filter (where b.class = 2)      as silver_badges,
+         count(*) filter (where b.class = 3)      as bronze_badges,
+         count(*) filter (where b.tagbased = true) as tag_based_badges,
+         count(*)                                   as total_badges,
+         max(b.date)                                as last_badge_date
+  from badges b
+  group by b.userid
+),
+-- per-user post aggregates with windowed median score and percentiles
+user_post_stats as (
+  select u.id as userid,
+         count(p.id) filter (where p.posttypeid = 1) as questions_count,
+         count(p.id) filter (where p.posttypeid = 2) as answers_count,
+         sum(p.score) filter (where p.posttypeid in (1,2)) as total_score,
+         avg(nullif(p.score,0)) filter (where p.posttypeid in (1,2)) as avg_nonzero_score,
+         -- median score using percentile_cont
+         percentile_cont(0.5) within group (order by p.score) over (partition by u.id) as median_score,
+         percentile_cont(0.9) within group (order by p.score) over (partition by u.id) as p90_score,
+         min(p.creationdate) filter (where p.posttypeid in (1,2)) as first_post_date,
+         max(p.lastactivitydate) filter (where p.posttypeid in (1,2)) as last_activity
+  from users u
+  left join posts p on p.owneruserid = u.id
+  group by u.id
+),
+-- tag affinity: top 3 tags per user by question count (correlated subquery)
+user_top_tags as (
+  select ut.userid,
+         ut.tag,
+         ut.qcnt,
+         row_number() over (partition by ut.userid order by ut.qcnt desc, ut.tag) as rn
+  from (
+    select q.owneruserid as userid,
+           qt.tag,
+           count(*) as qcnt
+    from posts q
+    join question_tags qt on qt.question_id = q.id
+    where q.posttypeid = 1
+      and q.owneruserid is not null
+    group by q.owneruserid, qt.tag
+  ) ut
+),
+user_top3_tags_pivot as (
+  select userid,
+         max(case when rn = 1 then tag end) as top_tag_1,
+         max(case when rn = 2 then tag end) as top_tag_2,
+         max(case when rn = 3 then tag end) as top_tag_3
+  from user_top_tags
+  where rn <= 3
+  group by userid
+),
+-- last non-empty comment per user (correlated subquery)
+last_comment as (
+  select c.userid,
+         c.id as comment_id,
+         c.postid,
+         c.text,
+         c.creationdate
+  from comments c
+  where c.id = (
+    select cc.id
+    from comments cc
+    where cc.userid = c.userid
+      and coalesce(nullif(trim(cc.text),''), '') <> ''
+    order by cc.creationdate desc
+    limit 1
+  )
+),
+-- compute link relationships (how many distinct posts linked to user's posts and duplicates)
+user_link_stats as (
+  select p.owneruserid as userid,
+         count(distinct pl.relatedpostid) filter (where pl.linktypeid = 1) as outlinks_count,
+         count(distinct pl.postid) filter (where pl.linktypeid = 3) as duplicates_marked_count
+  from posts p
+  left join postlinks pl on pl.postid = p.id
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+-- combine multiple sources with outer joins; include users even if they have no posts
+combined as (
+  select u.id as userid,
+         u.displayname,
+         u.reputation,
+         u.creationdate as user_created,
+         u.lastaccessdate,
+         coalesce(ups.questions_count,0)        as questions_count,
+         coalesce(ups.answers_count,0)          as answers_count,
+         coalesce(ups.total_score,0)            as total_score,
+         ups.median_score,
+         ups.p90_score,
+         coalesce(ub.total_badges,0)            as total_badges,
+         coalesce(ub.gold_badges,0)             as gold_badges,
+         coalesce(ub.silver_badges,0)           as silver_badges,
+         coalesce(ub.bronze_badges,0)           as bronze_badges,
+         ut.top_tag_1,
+         ut.top_tag_2,
+         ut.top_tag_3,
+         coalesce(ls.outlinks_count,0)          as outlinks_count,
+         coalesce(ls.duplicates_marked_count,0) as duplicates_marked_count,
+         lc.text as last_comment_text,
+         lc.creationdate as last_comment_date
+  from users u
+  left join user_post_stats ups on ups.userid = u.id
+  left join user_badges ub on ub.userid = u.id
+  left join user_top3_tags_pivot ut on ut.userid = u.id
+  left join user_link_stats ls on ls.userid = u.id
+  left join last_comment lc on lc.userid = u.id
+),
+-- mark power users by various heuristics and compute composite score
+scored as (
+  select c.*,
+         -- composite score = log(reputation+1)*sqrt(total_badges+1) + z-score of contributions
+         (ln(coalesce(c.reputation,0)+1) * sqrt(coalesce(c.total_badges,0)+1)
+          + (coalesce(c.questions_count,0) + 2*coalesce(c.answers_count,0))::numeric / nullif(greatest(coalesce(c.total_score,0),1),0)
+         ) as raw_composite,
+         -- recency factor
+         greatest(0, extract(epoch from (current_timestamp - coalesce(c.last_comment_date, c.last_activity, c.user_created)))/86400) as days_since_activity
+  from combined c
+),
+-- rank users using window functions and include dense rank ties; demonstrate set operator combining top by composite and by reputation
+top_by_composite as (
+  select userid, displayname, raw_composite, days_since_activity,
+         dense_rank() over (order by raw_composite desc nulls last) as composite_rank
+  from scored
+),
+top_by_reputation as (
+  select userid, displayname, reputation,
+         dense_rank() over (order by reputation desc nulls last) as rep_rank
+  from users
+),
+-- combine sets with UNION (set operator) to produce candidates
+candidates as (
+  select userid, displayname, raw_composite::numeric as score, composite_rank as rank_type
+  from top_by_composite
+  where composite_rank <= 25
+  union
+  select tbr.userid, tbr.displayname, tbr.reputation::numeric as score, -rep_rank as rank_type
+  from top_by_reputation tbr
+  where dense_rank() over (order by tbr.reputation desc) <= 25
+)
+-- final output: detailed benchmarking slice for top candidates, include complicated predicates and null logic
+select s.userid,
+       s.displayname,
+       s.reputation,
+       s.questions_count,
+       s.answers_count,
+       s.total_score,
+       round(coalesce(s.median_score,0)::numeric,2) as median_score,
+       round(coalesce(s.p90_score,0)::numeric,2) as p90_score,
+       s.total_badges,
+       s.gold_badges,
+       s.silver_badges,
+       s.bronze_badges,
+       coalesce(s.top_tag_1, '<<none>>') || coalesce(' | ' || s.top_tag_2, '') || coalesce(' | ' || s.top_tag_3, '') as top_tags_concat,
+       s.outlinks_count,
+       s.duplicates_marked_count,
+       case when s.last_comment_text is null then '<no recent comment>' else substr(s.last_comment_text,1,120) end as last_comment_excerpt,
+       s.last_comment_date,
+       s.user_created,
+       s.lastaccessdate,
+       s.raw_composite,
+       s.days_since_activity,
+       dense_rank() over (order by s.raw_composite desc nulls last, s.reputation desc nulls last) as overall_rank
+from scored s
+join candidates c on c.userid = s.userid
+-- demonstrate correlated subquery within where to filter by having at least one answer in last 90 days OR high composite score
+where (
+  exists (
+    select 1 from posts p2
+    where p2.owneruserid = s.userid
+      and p2.posttypeid = 2
+      and p2.creationdate >= current_timestamp - interval '90 days'
+      and not (coalesce(p2.score,0) < -5)  -- avoid very poorly received recent answers
+  )
+  or s.raw_composite >= (
+    select percentile_cont(0.95) within group (order by raw_composite) from scored
+  )
+)
+order by overall_rank
+limit 100;

@@ -1,0 +1,152 @@
+WITH UserStats AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           COALESCE(p.PostCount,0)                AS TotalPosts,
+           COALESCE(q.QuestionCount,0)            AS TotalQuestions,
+           COALESCE(a.AnswerCount,0)              AS TotalAnswers,
+           COALESCE(b.BadgeCount,0)               AS TotalBadges,
+           COALESCE(v.UpVotes,0)                  AS UpVoteCount,
+           COALESCE(v.DownVotes,0)                AS DownVoteCount,
+           MAX(p.LastActivityDate)                AS LastActivity
+    FROM Users u
+    LEFT JOIN (
+        SELECT OwnerUserId,
+               COUNT(*)               AS PostCount,
+               MAX(LastActivityDate)  AS LastActivityDate
+        FROM Posts
+        GROUP BY OwnerUserId
+    ) p ON u.Id = p.OwnerUserId
+    LEFT JOIN (
+        SELECT OwnerUserId,
+               COUNT(*) AS QuestionCount
+        FROM Posts
+        WHERE PostTypeId = 1
+        GROUP BY OwnerUserId
+    ) q ON u.Id = q.OwnerUserId
+    LEFT JOIN (
+        SELECT OwnerUserId,
+               COUNT(*) AS AnswerCount
+        FROM Posts
+        WHERE PostTypeId = 2
+        GROUP BY OwnerUserId
+    ) a ON u.Id = a.OwnerUserId
+    LEFT JOIN (
+        SELECT UserId,
+               COUNT(*) AS BadgeCount
+        FROM Badges
+        GROUP BY UserId
+    ) b ON u.Id = b.UserId
+    LEFT JOIN (
+        SELECT UserId,
+               SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+               SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes
+        GROUP BY UserId
+    ) v ON u.Id = v.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, p.PostCount, p.LastActivityDate, q.QuestionCount, a.AnswerCount, b.BadgeCount, v.UpVotes, v.DownVotes
+),
+TagPopularity AS (
+    SELECT t.TagName,
+           COUNT(p.Id)                         AS PostsWithTag,
+           SUM(p.Score)                        AS TotalScore,
+           ROW_NUMBER() OVER (ORDER BY COUNT(p.Id) DESC) AS RankByPosts
+    FROM Tags t
+    JOIN (
+        SELECT Id,
+               Score,
+               Tags
+        FROM Posts
+        WHERE PostTypeId = 1
+          AND Tags IS NOT NULL
+    ) p ON true
+    -- Split Tags string into tag entries in a SQL-dialect-neutral way:
+    -- We replace angle-bracket separators with a leading and trailing delimiter and then split by ',' using a simple POSITION/LIKE approach.
+    -- Implement splitting by searching for each tag name from Tags table within the Tags string.
+    WHERE POSITION(CONCAT('<', t.TagName, '>') IN p.Tags) > 0
+    GROUP BY t.TagName
+),
+UserTopTags AS (
+    SELECT us.Id,
+           STRING_AGG(tp.TagName, ', ' ORDER BY tp.RankByPosts) AS TopTags
+    FROM UserStats us
+    LEFT JOIN Posts p ON p.OwnerUserId = us.Id AND p.PostTypeId = 1
+    LEFT JOIN TagPopularity tp ON POSITION(CONCAT('<', tp.TagName, '>') IN p.Tags) > 0
+    GROUP BY us.Id
+),
+RecentActivity AS (
+    SELECT u.Id,
+           MAX(COALESCE(p.CreationDate,      CAST('1900-01-01' AS TIMESTAMP))) AS LastPostDate,
+           MAX(COALESCE(c.CreationDate,      CAST('1900-01-01' AS TIMESTAMP))) AS LastCommentDate,
+           MAX(COALESCE(v.CreationDate,      CAST('1900-01-01' AS TIMESTAMP))) AS LastVoteDate
+    FROM Users u
+    LEFT JOIN Posts    p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId      = u.Id
+    LEFT JOIN Votes    v ON v.UserId      = u.Id
+    GROUP BY u.Id
+)
+SELECT us.Id,
+       us.DisplayName,
+       us.Reputation,
+       us.TotalPosts,
+       us.TotalQuestions,
+       us.TotalAnswers,
+       us.TotalBadges,
+       us.UpVoteCount,
+       us.DownVoteCount,
+       us.LastActivity,
+       ut.TopTags,
+       ra.LastPostDate,
+       ra.LastCommentDate,
+       ra.LastVoteDate,
+       CASE
+           WHEN us.Reputation > 20000 THEN 'Legendary'
+           WHEN us.Reputation > 10000 THEN 'Expert'
+           WHEN us.Reputation > 1000  THEN 'Intermediate'
+           ELSE 'Newbie'
+       END                                   AS ReputationTier,
+       (SELECT COUNT(*) FROM Posts q
+        WHERE q.OwnerUserId = us.Id
+          AND q.PostTypeId = 1
+          AND q.Score > 0)                  AS PositiveQuestionCount,
+       (SELECT COUNT(*) FROM Posts a
+        WHERE a.OwnerUserId = us.Id
+          AND a.PostTypeId = 2
+          AND a.AcceptedAnswerId IS NOT NULL) AS AcceptedAnswersGiven,
+       COALESCE(
+           (SELECT p2.Title
+            FROM Posts p2
+            WHERE p2.OwnerUserId = us.Id
+            ORDER BY p2.Score DESC, p2.CreationDate DESC
+            LIMIT 1),
+           'No posts')                       AS TopScoringPostTitle
+FROM UserStats      us
+LEFT JOIN UserTopTags    ut ON us.Id = ut.Id
+LEFT JOIN RecentActivity ra ON us.Id = ra.Id
+WHERE us.TotalPosts > 0
+
+UNION ALL
+
+SELECT -1                                   AS Id,
+       'Community'                          AS DisplayName,
+       SUM(u.Reputation)                    AS Reputation,
+       SUM(us.TotalPosts)                   AS TotalPosts,
+       SUM(us.TotalQuestions)               AS TotalQuestions,
+       SUM(us.TotalAnswers)                 AS TotalAnswers,
+       SUM(us.TotalBadges)                  AS TotalBadges,
+       SUM(us.UpVoteCount)                  AS UpVoteCount,
+       SUM(us.DownVoteCount)                AS DownVoteCount,
+       MAX(us.LastActivity)                 AS LastActivity,
+       NULL                                 AS TopTags,
+       MAX(ra.LastPostDate)                 AS LastPostDate,
+       MAX(ra.LastCommentDate)              AS LastCommentDate,
+       MAX(ra.LastVoteDate)                 AS LastVoteDate,
+       'Community'                          AS ReputationTier,
+       NULL                                 AS PositiveQuestionCount,
+       NULL                                 AS AcceptedAnswersGiven,
+       NULL                                 AS TopScoringPostTitle
+FROM Users u
+JOIN UserStats      us ON u.Id = us.Id
+LEFT JOIN RecentActivity ra ON u.Id = ra.Id
+GROUP BY u.Id
+HAVING COUNT(u.Id) > 1000;

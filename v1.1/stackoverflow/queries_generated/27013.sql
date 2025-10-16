@@ -1,0 +1,133 @@
+-- {"query": "27013.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2337, "output_tokens": 1273} 
+
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(c.Score), 0) AS TotalCommentScore,
+        COALESCE(COUNT(p.Id), 0) AS TotalPosts,
+        COALESCE(COUNT(c.Id), 0) AS TotalComments,
+        COALESCE(SUM(v.VoteTypeId = 2), 0) AS TotalUpvotesReceived,
+        COALESCE(SUM(v.VoteTypeId = 3), 0) AS TotalDownvotesReceived,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Views DESC) AS Rank
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+TopPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS PostRank
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId = 1
+),
+ActiveUsers AS (
+    SELECT
+        ua.UserId,
+        ua.Reputation,
+        ua.DisplayName,
+        ua.TotalPostScore,
+        ua.TotalCommentScore,
+        ua.TotalPosts,
+        ua.TotalComments,
+        ua.TotalUpvotesReceived,
+        ua.TotalDownvotesReceived,
+        ua.TotalBadges,
+        ua.Rank,
+        tp.PostId AS TopPostId,
+        tp.Title AS TopPostTitle,
+        tp.Score AS TopPostScore,
+        tp.ViewCount AS TopPostViewCount,
+        tp.AnswerCount AS TopPostAnswerCount,
+        tp.PostRank
+    FROM
+        UserActivity ua
+    LEFT JOIN
+        TopPosts tp ON ua.UserId = tp.OwnerUserId AND tp.PostRank = 1
+    WHERE
+        ua.TotalPosts > 0 OR ua.TotalComments > 0
+),
+RecentActivity AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.LastActivityDate,
+        c.UserId AS CommentUserId,
+        c.Text AS CommentText,
+        c.CreationDate AS CommentDate,
+        v.VoteTypeId,
+        v.CreationDate AS VoteDate,
+        u.DisplayName AS CommenterName,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY c.CreationDate DESC, v.CreationDate DESC) AS ActivityRank
+    FROM
+        Posts p
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN
+        Users u ON c.UserId = u.Id
+    WHERE
+        p.PostTypeId = 1
+        AND (c.CreationDate IS NOT NULL OR v.CreationDate IS NOT NULL)
+        AND p.LastActivityDate >= NOW() - INTERVAL '30 days'
+)
+SELECT
+    au.UserId,
+    au.DisplayName,
+    au.Reputation,
+    au.TotalPostScore,
+    au.TotalCommentScore,
+    au.TotalPosts,
+    au.TotalComments,
+    au.TotalUpvotesReceived,
+    au.TotalDownvotesReceived,
+    au.TotalBadges,
+    au.Rank,
+    au.TopPostId,
+    au.TopPostTitle,
+    au.TopPostScore,
+    au.TopPostViewCount,
+    au.TopPostAnswerCount,
+    ra.PostId AS RecentPostId,
+    ra.Title AS RecentPostTitle,
+    ra.CreationDate AS RecentPostDate,
+    ra.LastActivityDate AS RecentPostActivityDate,
+    ra.CommentUserId,
+    ra.CommentText,
+    ra.CommentDate,
+    ra.VoteTypeId,
+    ra.VoteDate,
+    ra.CommenterName,
+    ra.ActivityRank
+FROM
+    ActiveUsers au
+LEFT JOIN
+    RecentActivity ra ON au.UserId = ra.OwnerUserId AND ra.ActivityRank = 1
+ORDER BY
+    au.Reputation DESC, au.Rank;

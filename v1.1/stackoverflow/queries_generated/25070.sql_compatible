@@ -1,0 +1,120 @@
+WITH RecentPosts AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.Tags,
+        COALESCE(p.ViewCount, 0) AS Views,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '365 days'
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(*)                                      AS TotalBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserTagStats AS (
+    SELECT
+        u.Id AS UserId,
+        t.TagName,
+        COUNT(*) FILTER (WHERE rp.rn = 1) AS RecentQuestionsWithTag,
+        COUNT(*)                           AS TotalQuestionsWithTag
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    LEFT JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tag
+    ) pt ON true
+    LEFT JOIN Tags t ON t.TagName = pt.tag
+    LEFT JOIN RecentPosts rp ON rp.Id = p.Id
+    GROUP BY u.Id, t.TagName
+),
+UserActivity AS (
+    SELECT
+        u.Id,
+        MAX(p.CreationDate)                              AS LastPostDate,
+        MAX(v.CreationDate)                              AS LastVoteDate,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotesGiven,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotesGiven
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id
+),
+LatestRecentPost AS (
+    SELECT *
+    FROM RecentPosts
+    WHERE rn = 1
+)
+SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(ubc.TotalBadges, 0)          AS TotalBadges,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.UpVotesGiven,
+    ua.DownVotesGiven,
+    ua.LastPostDate,
+    ua.LastVoteDate,
+    CASE
+        WHEN ua.LastPostDate IS NULL THEN NULL
+        ELSE DATE_PART('day', CAST('2024-10-01' AS DATE) - ua.LastPostDate)
+    END                                 AS DaysSinceLastPost,
+    COALESCE(rp.Views, 0)               AS RecentViews,
+    COALESCE(rp.Score, 0)               AS RecentScore,
+    COALESCE(rp.Tags, '')               AS RecentTags,
+    tstats.TagName,
+    tstats.RecentQuestionsWithTag,
+    tstats.TotalQuestionsWithTag,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY tstats.TotalQuestionsWithTag DESC) AS TagRank
+FROM Users u
+LEFT JOIN UserBadgeCounts ubc   ON ubc.UserId   = u.Id
+LEFT JOIN UserActivity    ua    ON ua.Id        = u.Id
+LEFT JOIN LatestRecentPost rp   ON rp.OwnerUserId = u.Id
+LEFT JOIN UserTagStats    tstats ON tstats.UserId = u.Id
+WHERE u.CreationDate < CAST('2024-10-01' AS DATE) - INTERVAL '30 days'
+  AND (ua.QuestionCount > 0 OR ua.AnswerCount > 0)
+
+UNION ALL
+
+SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    0 AS TotalBadges,
+    0 AS GoldBadges,
+    0 AS SilverBadges,
+    0 AS BronzeBadges,
+    0 AS QuestionCount,
+    0 AS AnswerCount,
+    0 AS UpVotesGiven,
+    0 AS DownVotesGiven,
+    NULL AS LastPostDate,
+    NULL AS LastVoteDate,
+    NULL AS DaysSinceLastPost,
+    NULL AS RecentViews,
+    NULL AS RecentScore,
+    NULL AS RecentTags,
+    NULL AS TagName,
+    NULL AS RecentQuestionsWithTag,
+    NULL AS TotalQuestionsWithTag,
+    NULL AS TagRank
+FROM Users u
+WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+  AND u.CreationDate < CAST('2024-10-01' AS DATE) - INTERVAL '30 days'
+
+ORDER BY Id
+LIMIT 500;

@@ -1,0 +1,148 @@
+WITH
+    top_badges AS (
+        SELECT
+            b.UserId,
+            COUNT(*) FILTER (WHERE b.Class = 1) AS gold,
+            COUNT(*) FILTER (WHERE b.Class = 2) AS silver,
+            COUNT(*) FILTER (WHERE b.Class = 3) AS bronze,
+            COUNT(*) AS total_badges
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+    user_posts AS (
+        SELECT
+            p.OwnerUserId AS UserId,
+            COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS question_cnt,
+            COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS answer_cnt,
+            SUM(p.Score) AS total_score,
+            MAX(p.CreationDate) AS last_post_date
+        FROM Posts p
+        WHERE p.OwnerUserId IS NOT NULL
+        GROUP BY p.OwnerUserId
+    ),
+    recent_comments AS (
+        SELECT
+            c.PostId,
+            STRING_AGG(c.Text, '; ' ORDER BY c.CreationDate DESC) AS recent_texts,
+            MAX(c.CreationDate) AS latest_comment_dt
+        FROM Comments c
+        GROUP BY c.PostId
+    ),
+    post_tags AS (
+        SELECT
+            p.Id AS PostId,
+            TRIM(BOTH '<>' FROM tag) AS tag
+        FROM Posts p,
+        LATERAL (
+            WITH RECURSIVE splits(pos, rest) AS (
+                SELECT CAST(1 AS integer), CAST(p.Tags AS VARCHAR(4000))
+                UNION ALL
+                SELECT
+                    CASE
+                        WHEN POSITION('<' IN rest) > 0
+                        THEN POSITION('>' IN SUBSTRING(rest FROM POSITION('<' IN rest))) + POSITION('<' IN rest)
+                        ELSE NULL
+                    END,
+                    CASE
+                        WHEN POSITION('>' IN rest) > 0
+                        THEN SUBSTRING(rest FROM POSITION('>' IN rest) + 1)
+                        ELSE NULL
+                    END
+                FROM splits
+                WHERE rest IS NOT NULL
+                  AND POSITION('<' IN rest) > 0
+                  AND POSITION('>' IN rest) > 0
+            )
+            SELECT SUBSTRING(s.rest FROM POSITION('<' IN s.rest) FOR (POSITION('>' IN SUBSTRING(s.rest FROM POSITION('<' IN s.rest))) )) AS tag
+            FROM splits s
+            WHERE s.rest IS NOT NULL
+              AND POSITION('<' IN s.rest) > 0
+              AND POSITION('>' IN s.rest) > 0
+        ) t
+        WHERE p.Tags IS NOT NULL
+    ),
+    tag_usage AS (
+        SELECT
+            u.Id                              AS UserId,
+            tg.TagName,
+            COUNT(*)                          AS tag_cnt,
+            ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY COUNT(*) DESC) AS rn
+        FROM Users u
+        JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+        JOIN post_tags pt ON pt.PostId = p.Id
+        JOIN Tags tg ON tg.TagName = pt.tag
+        GROUP BY u.Id, tg.TagName
+    )
+SELECT
+    u.Id,
+    COALESCE(u.DisplayName, 'Anonymous') || ' (UserId:' || u.Id || ')'          AS user_label,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    COALESCE(up.question_cnt, 0)                                                AS questions_posted,
+    COALESCE(up.answer_cnt, 0)                                                  AS answers_posted,
+    COALESCE(up.total_score, 0)                                                 AS posts_total_score,
+    COALESCE(tb.gold, 0)                                                        AS gold_badges,
+    COALESCE(tb.silver, 0)                                                      AS silver_badges,
+    COALESCE(tb.bronze, 0)                                                      AS bronze_badges,
+    COALESCE(tb.total_badges, 0)                                                AS total_badges,
+    (SELECT COUNT(*)
+       FROM Posts q
+      WHERE q.PostTypeId = 1
+        AND q.OwnerUserId = u.Id
+        AND q.AcceptedAnswerId IS NULL)                                        AS unanswered_questions,
+    (SELECT STRING_AGG(t.TagName, ', ' ORDER BY t.tcnt DESC)
+       FROM (SELECT tg.TagName, COUNT(*) AS tcnt
+               FROM Posts p2
+               JOIN post_tags pt2 ON pt2.PostId = p2.Id
+               JOIN Tags tg ON tg.TagName = pt2.tag
+              WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 1
+              GROUP BY tg.TagName) t
+      LIMIT 5)                                                                   AS top_5_tags,
+    rc.recent_texts,
+    rc.latest_comment_dt,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC)                             AS reputation_rank,
+    CASE
+        WHEN u.Reputation >= 20000 THEN 'Elite'
+        WHEN u.Reputation >= 10000 THEN 'Pro'
+        WHEN u.Reputation >= 1000  THEN 'Active'
+        ELSE 'Newbie'
+    END                                                                          AS reputation_tier
+FROM Users u
+LEFT JOIN user_posts   up ON up.UserId = u.Id
+LEFT JOIN top_badges   tb ON tb.UserId = u.Id
+LEFT JOIN recent_comments rc ON rc.PostId = (
+        SELECT p.Id
+          FROM Posts p
+         WHERE p.OwnerUserId = u.Id
+         ORDER BY p.CreationDate DESC
+         LIMIT 1
+    )
+WHERE u.Id IS NOT NULL
+
+UNION ALL
+
+SELECT
+    CAST(NULL AS integer)                                             AS Id,
+    'Aggregated Summary'                                             AS user_label,
+    CAST(NULL AS integer)                                             AS Reputation,
+    CAST(NULL AS timestamp)                                           AS CreationDate,
+    CAST(NULL AS timestamp)                                           AS LastAccessDate,
+    SUM(COALESCE(up.question_cnt, 0))                                 AS questions_posted,
+    SUM(COALESCE(up.answer_cnt, 0))                                   AS answers_posted,
+    SUM(COALESCE(up.total_score, 0))                                  AS posts_total_score,
+    SUM(COALESCE(tb.gold, 0))                                         AS gold_badges,
+    SUM(COALESCE(tb.silver, 0))                                       AS silver_badges,
+    SUM(COALESCE(tb.bronze, 0))                                       AS bronze_badges,
+    SUM(COALESCE(tb.total_badges, 0))                                 AS total_badges,
+    CAST(NULL AS integer)                                             AS unanswered_questions,
+    CAST(NULL AS varchar)                                             AS top_5_tags,
+    CAST(NULL AS varchar)                                             AS recent_texts,
+    CAST(NULL AS timestamp)                                           AS latest_comment_dt,
+    CAST(NULL AS integer)                                             AS reputation_rank,
+    CAST(NULL AS varchar)                                             AS reputation_tier
+FROM user_posts up
+LEFT JOIN top_badges tb ON tb.UserId = up.UserId
+WHERE 1=1
+
+ORDER BY reputation_rank NULLS LAST, Id;

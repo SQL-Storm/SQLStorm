@@ -1,0 +1,48 @@
+WITH UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM p.CreationDate) ORDER BY COUNT(DISTINCT p.Id) DESC) AS YearlyPostRank,
+        AVG(NULLIF(p.ViewCount, 0)) AS AvgLocationViews,
+        u.Location
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 100 AND p.PostTypeId = 1
+    GROUP BY u.Id, u.DisplayName, u.Location, EXTRACT(YEAR FROM p.CreationDate)
+),
+TagPopularity AS (
+    SELECT 
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS MedianTagScore
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName
+),
+TopTag AS (
+    SELECT TagName, PostCount
+    FROM TagPopularity
+    WHERE PostCount = (SELECT MAX(PostCount) FROM TagPopularity)
+)
+SELECT 
+    ups.UserId,
+    ups.DisplayName,
+    ups.TotalPosts,
+    ups.TotalPostScore,
+    tp.TagName AS MostPopularTag,
+    tp.PostCount AS TagPostCount,
+    CASE 
+        WHEN ups.YearlyPostRank <= 10 THEN 'Top Contributor'
+        WHEN ups.TotalPostScore > 100 THEN 'Highly Rated'
+        ELSE 'Regular User'
+    END AS UserCategory,
+    ROUND(100.0 * ups.TotalPosts / NULLIF((SELECT COUNT(*) FROM Posts),0), 2) AS PostPercentile,
+    ups.AvgLocationViews
+FROM UserPostStats ups
+JOIN TopTag tp ON 1=1
+WHERE ups.TotalPosts > 5
+ORDER BY ups.TotalPostScore DESC
+LIMIT 100;

@@ -1,0 +1,164 @@
+-- {"query": "871.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1505} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        ARRAY[t.TagName] AS TagPath,
+        1 AS Level
+    FROM Tags t
+    WHERE t.IsRequired = 1
+
+    UNION ALL
+
+    SELECT 
+        tg.Id,
+        tg.TagName,
+        tg.Count,
+        rth.TagPath || tg.TagName,
+        rth.Level + 1
+    FROM Tags tg
+    JOIN RecursiveTagHierarchy rth ON tg.IsModeratorOnly = 0 AND tg.Count < rth.Count
+    WHERE rth.Level < 3
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COALESCE(SUM(vb.BountyGiven), 0) AS TotalBountyGiven,
+        COALESCE(SUM(vr.ReputationGained), 0) AS ReputationGained,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RankByReputation
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.CreationDate >= u.CreationDate
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN (
+        SELECT 
+            v.UserId, 
+            SUM(v.BountyAmount) AS BountyGiven
+        FROM Votes v
+        WHERE v.VoteTypeId = 8 -- BountyStart
+        GROUP BY v.UserId
+    ) vb ON vb.UserId = u.Id
+    LEFT JOIN (
+        SELECT 
+            p.OwnerUserId AS UserId,
+            SUM(CASE 
+                WHEN v.VoteTypeId = 2 THEN 10
+                WHEN v.VoteTypeId = 3 THEN -2
+                ELSE 0 END) AS ReputationGained
+        FROM Votes v
+        JOIN Posts p ON v.PostId = p.Id
+        WHERE p.OwnerUserId IS NOT NULL
+        GROUP BY p.OwnerUserId
+    ) vr ON vr.UserId = u.Id
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostTagExplode AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        TRIM(both ' ' FROM unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><'))) AS Tag
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL AND p.PostTypeId = 1
+),
+TagRanking AS (
+    SELECT
+        t.TagName,
+        COUNT(DISTINCT pte.PostId) AS QuestionCount,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.CreationDate) AS LastUsedDate,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT pte.PostId) DESC) AS PopularityRank
+    FROM Tags t
+    LEFT JOIN PostTagExplode pte ON pte.Tag = t.TagName
+    LEFT JOIN Posts p ON p.Id = pte.PostId
+    GROUP BY t.TagName
+    HAVING COUNT(DISTINCT pte.PostId) > 50
+),
+QuestionAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        a.Id AS AnswerId,
+        a.OwnerUserId AS AnswererId,
+        a.CreationDate AS AnswerDate,
+        a.Score AS AnswerScore,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600.0 AS HoursToAnswer,
+        CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END AS IsAccepted
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1 AND q.AcceptedAnswerId IS NOT NULL
+),
+RankedAnswers AS (
+    SELECT *,
+        RANK() OVER (PARTITION BY QuestionId ORDER BY AnswerScore DESC, AnswerDate ASC) AS AnswerRank
+    FROM QuestionAnswerStats
+),
+ClosedQuestionsWithReasons AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.ClosedDate,
+        cht.Name AS CloseReason,
+        ph.CreationDate AS CloseVoteDate,
+        u.DisplayName AS ClosedByUser
+    FROM Posts p
+    JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    JOIN CloseReasonTypes cht ON cht.Id = CAST(ph.Comment AS INT)
+    LEFT JOIN Users u ON u.Id = ph.UserId
+    WHERE p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.CommentCount,
+    ua.TotalBountyGiven,
+    ua.ReputationGained,
+    tr.TagName,
+    tr.QuestionCount AS TagQuestions,
+    tr.AvgScore AS TagAvgScore,
+    tr.LastUsedDate,
+    ra.AnswerId,
+    ra.AnswerScore,
+    ra.HoursToAnswer,
+    ra.IsAccepted,
+    cq.QuestionId AS ClosedQuestionId,
+    cq.Title AS ClosedQuestionTitle,
+    cq.CloseReason,
+    cq.ClosedByUser,
+    CASE 
+        WHEN ua.CommentCount = 0 THEN 'No comments'
+        WHEN ua.CommentCount > 100 THEN 'Highly active commenter'
+        ELSE 'Moderate commenter'
+    END AS CommentActivityLevel,
+    CASE 
+        WHEN ua.Reputation > 10000 THEN 'High reputation'
+        WHEN ua.Reputation BETWEEN 5000 AND 10000 THEN 'Medium reputation'
+        ELSE 'Low reputation'
+    END AS ReputationLevel,
+    CONCAT('User: ', ua.DisplayName, ', Rep: ', ua.Reputation) AS UserSummary,
+    CONCAT('Tag: ', COALESCE(tr.TagName, 'N/A'), ', Questions: ', COALESCE(tr.QuestionCount::text, '0')) AS TagSummary
+FROM UserActivity ua
+LEFT JOIN RankedAnswers ra ON ra.AnswererId = ua.UserId AND ra.AnswerRank = 1
+LEFT JOIN TagRanking tr ON tr.TagName IN (
+    SELECT Tag FROM PostTagExplode pte2 
+    JOIN Posts p2 ON pte2.PostId = p2.Id WHERE p2.OwnerUserId = ua.UserId LIMIT 1
+)
+LEFT JOIN ClosedQuestionsWithReasons cq ON cq.ClosedQuestionId IN (
+    SELECT p.Id FROM Posts p WHERE p.OwnerUserId = ua.UserId AND p.ClosedDate IS NOT NULL LIMIT 1
+)
+WHERE ua.QuestionCount > 5
+ORDER BY ua.Reputation DESC NULLS LAST, ra.AnswerScore DESC NULLS LAST
+LIMIT 100;

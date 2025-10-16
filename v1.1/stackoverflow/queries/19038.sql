@@ -1,0 +1,183 @@
+WITH UserMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate AS UserLastAccessDate,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS TotalUpVotesGiven,
+        u.DownVotes AS TotalDownVotesGiven,
+        COALESCE(u.Location, 'Unspecified') AS UserLocation,
+        u.Reputation * 1.0 / NULLIF(EXTRACT(DAY FROM (u.LastAccessDate - u.CreationDate + INTERVAL '1 day')), 0) AS ReputationPerActiveDay,
+        (SELECT COUNT(b.Id) FROM Badges b WHERE b.UserId = u.Id AND b.Class IN (1, 2)) AS GoldSilverBadgeCount,
+        CASE
+            WHEN u.AboutMe IS NOT NULL AND LENGTH(TRIM(u.AboutMe)) > 200 THEN 'Very Detailed Bio'
+            WHEN u.AboutMe IS NOT NULL AND LENGTH(TRIM(u.AboutMe)) > 50 THEN 'Medium Bio'
+            WHEN u.AboutMe IS NOT NULL AND LENGTH(TRIM(u.AboutMe)) > 0 THEN 'Concise Bio'
+            ELSE 'No Bio'
+        END AS AboutMeCategory,
+        u.UpVotes * 1.0 / NULLIF(u.UpVotes + u.DownVotes, 0) AS UpvoteRatioGiven,
+        EXISTS (
+            SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id AND p.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months')
+        ) AS HasRecentPosts
+    FROM Users u
+),
+PostAggregates AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.Body,
+        p.OwnerUserId,
+        p.LastEditorUserId,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ParentId,
+        (SELECT COUNT(DISTINCT ph.UserId) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6,8,9)) AS DistinctEditorCount,
+        (SELECT ph_latest.PostHistoryTypeId
+         FROM PostHistory ph_latest
+         WHERE ph_latest.PostId = p.Id AND ph_latest.PostHistoryTypeId IN (4,5,6,10,11)
+         ORDER BY ph_latest.CreationDate DESC, ph_latest.Id DESC
+         LIMIT 1
+        ) AS LatestSignificantHistoryType,
+        (UPPER(SUBSTRING(COALESCE(p.Title, 'NO_TITLE') FROM 1 FOR 8)) || '...' || LOWER(RIGHT(COALESCE(p.Title, 'NO_TITLE'), 8))) AS TitleSnippet,
+        LENGTH(p.Body) AS BodyLength,
+        p.Score * 1.0 / NULLIF(p.ViewCount, 0) AS ScorePerViewRatio
+    FROM Posts p
+),
+TagPerformanceStats AS (
+    SELECT
+        TRIM(tag) AS TagName,
+        AVG(p.Score) AS AvgScoreForTag,
+        COUNT(DISTINCT p.Id) AS QuestionCountWithTag,
+        RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS TagPopularityRank
+    FROM Posts p,
+    LATERAL (
+      SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tag
+    ) t
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    GROUP BY TRIM(tag)
+),
+HighValuePostCandidates AS (
+    SELECT
+        pa.PostId,
+        pa.PostCreationDate,
+        pa.PostScore,
+        pa.ViewCount,
+        pa.CommentCount,
+        pa.FavoriteCount,
+        'High Score & Favorites' AS EngagementCategory,
+        pa.OwnerUserId
+    FROM PostAggregates pa
+    WHERE pa.PostScore > 250
+      AND COALESCE(pa.FavoriteCount, 0) > 75
+      AND pa.PostTypeId = 1
+    UNION ALL
+    SELECT
+        pa.PostId,
+        pa.PostCreationDate,
+        pa.PostScore,
+        pa.ViewCount,
+        pa.CommentCount,
+        pa.FavoriteCount,
+        'Active Discussion & Recent' AS EngagementCategory,
+        pa.OwnerUserId
+    FROM PostAggregates pa
+    WHERE pa.CommentCount > 40
+      AND pa.LastActivityDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '90 days')
+      AND pa.PostTypeId IN (1,2)
+)
+SELECT
+    um.UserId,
+    um.DisplayName,
+    um.Reputation,
+    um.ReputationPerActiveDay,
+    um.GoldSilverBadgeCount,
+    um.UserLocation,
+    um.AboutMeCategory,
+    um.UpvoteRatioGiven,
+    um.HasRecentPosts,
+    pa.PostId,
+    pa.Title,
+    pa.TitleSnippet,
+    pa.PostScore,
+    pa.ViewCount,
+    pa.CommentCount,
+    pa.FavoriteCount,
+    pa.BodyLength,
+    pa.ScorePerViewRatio,
+    pa.DistinctEditorCount,
+    pt.Name AS PostTypeName,
+    linkt.Name AS PostLinkTypeName,
+    tps.TagName AS TopAssociatedTagName,
+    tps.AvgScoreForTag AS TopAssociatedTagAvgScore,
+    tps.TagPopularityRank,
+    hvpc.EngagementCategory AS PostHighEngagementCategory,
+    ROW_NUMBER() OVER (PARTITION BY um.UserLocation ORDER BY um.Reputation DESC) AS UserRankInLocation,
+    AVG(pa.PostScore) OVER (PARTITION BY pa.PostTypeId ORDER BY pa.PostCreationDate ASC ROWS BETWEEN 100 PRECEDING AND CURRENT ROW) AS RollingAvgPostScoreByPostType,
+    SUM(pa.CommentCount) OVER (PARTITION BY um.UserId ORDER BY pa.PostCreationDate ASC) AS UserTotalCommentsRunningSum,
+    CASE
+        WHEN pa.PostTypeId = 1 AND pa.AnswerCount > 0 AND pa.FavoriteCount > 20 THEN 'Well-Received Question'
+        WHEN pa.PostTypeId = 2 AND pa.ParentId IS NOT NULL AND (SELECT p_q.OwnerUserId FROM Posts p_q WHERE p_q.Id = pa.ParentId) = um.UserId THEN 'Self-Answered Solution'
+        WHEN pa.PostTypeId = 1 AND pa.DistinctEditorCount > 2 AND pa.ScorePerViewRatio > 0.15 AND pa.LatestSignificantHistoryType IN (10,11) THEN 'Collaboratively Managed Hot Topic'
+        WHEN pa.PostTypeId = 2 AND pa.CommentCount > 10 AND pa.PostScore > 50 THEN 'Highly Discussed Answer'
+        ELSE 'General Post'
+    END AS PostClassification,
+    (pa.Tags ILIKE '%<sql>%') AS HasSqlTag,
+    (pa.Tags ILIKE '%<database>%') AS HasDatabaseTag,
+    (pa.PostScore * 15.0 + pa.ViewCount * 0.08 + COALESCE(pa.FavoriteCount, 0) * 25.0 + COALESCE(pa.CommentCount, 0) * 7.5 + (CASE WHEN pa.PostTypeId = 1 AND pa.AnswerCount IS NOT NULL THEN pa.AnswerCount * 10.0 ELSE 0 END)) / NULLIF(pa.BodyLength + 100, 0) AS WeightedContentValueIndex,
+    (SELECT c.Text FROM Comments c WHERE c.UserId = um.UserId ORDER BY c.CreationDate DESC LIMIT 1) AS MostRecentUserCommentText,
+    STRING_AGG(CASE WHEN pl_related.LinkTypeId = 3 THEN CAST(pl_related.RelatedPostId AS varchar) ELSE NULL END, ',') AS DuplicatePostIds
+FROM Users u_alias
+JOIN UserMetrics um ON u_alias.Id = um.UserId
+LEFT JOIN PostAggregates pa ON u_alias.Id = pa.OwnerUserId
+LEFT JOIN PostTypes pt ON pa.PostTypeId = pt.Id
+LEFT JOIN PostLinks pl ON pa.PostId = pl.PostId
+LEFT JOIN LinkTypes linkt ON pl.LinkTypeId = linkt.Id
+LEFT JOIN PostLinks pl_related ON pa.PostId = pl_related.PostId AND pl_related.LinkTypeId = 3
+LEFT JOIN LATERAL (
+    SELECT tps_inner.TagName, tps_inner.AvgScoreForTag, tps_inner.TagPopularityRank, tps_inner.QuestionCountWithTag
+    FROM TagPerformanceStats tps_inner
+    WHERE pa.Tags IS NOT NULL AND pa.Tags ILIKE '%' || '<' || tps_inner.TagName || '>' || '%'
+    ORDER BY tps_inner.QuestionCountWithTag DESC, tps_inner.AvgScoreForTag DESC
+    LIMIT 1
+) tps ON TRUE
+LEFT JOIN HighValuePostCandidates hvpc ON pa.PostId = hvpc.PostId
+WHERE
+    um.Reputation > 1500
+    AND um.GoldSilverBadgeCount > 0
+    AND pa.PostCreationDate IS NOT NULL
+    AND pa.PostCreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '5 years')
+    AND COALESCE(pa.PostScore, 0) > 5
+    AND pa.BodyLength BETWEEN 75 AND 5000
+    AND um.UserLocation NOT IN ('China', 'Russia', 'North Korea')
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostHistory ph_closed
+        WHERE ph_closed.PostId = pa.PostId
+          AND ph_closed.PostHistoryTypeId = 10
+          AND ph_closed.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+          AND ph_closed.Comment = '102'
+    )
+    AND (
+        (um.HasRecentPosts AND pa.CommentCount > 5) OR
+        (um.UpvoteRatioGiven > 0.75 AND pa.ScorePerViewRatio > 0.05)
+    )
+GROUP BY
+    um.UserId, um.DisplayName, um.Reputation, um.ReputationPerActiveDay, um.GoldSilverBadgeCount, um.UserLocation, um.AboutMeCategory, um.UpvoteRatioGiven, um.HasRecentPosts,
+    pa.PostId, pa.Title, pa.TitleSnippet, pa.PostScore, pa.ViewCount, pa.CommentCount, pa.FavoriteCount, pa.BodyLength, pa.ScorePerViewRatio, pa.DistinctEditorCount,
+    pt.Name, linkt.Name, tps.TagName, tps.AvgScoreForTag, tps.TagPopularityRank, hvpc.EngagementCategory,
+    pa.PostTypeId, pa.PostCreationDate, pa.ParentId, pa.AnswerCount, pa.LatestSignificantHistoryType, pa.Tags, pa.LastActivityDate, pa.OwnerUserId, pa.Body, pa.LastEditorUserId, pa.LastEditDate
+ORDER BY
+    WeightedContentValueIndex DESC,
+    um.Reputation DESC,
+    pa.LastActivityDate DESC
+LIMIT 7500;

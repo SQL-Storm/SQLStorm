@@ -1,0 +1,114 @@
+-- {"query": "1603.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2291} 
+with RecursiveTagCounts as (
+    select 
+        p.Id as PostId,
+        p.PostTypeId,
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2),'><')) as TagName
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+), UserBadgeCounts as (
+    select
+        u.Id as UserId,
+        u.DisplayName, 
+        count(*) filter(where b.Class = 1) as GoldBadges,
+        count(*) filter(where b.Class = 2) as SilverBadges,
+        count(*) filter(where b.Class = 3) as BronzeBadges,
+        sum(b.TagBased::int) as TagBasedBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+), AnswersWithWindow as (
+    select
+        a.Id,
+        a.ParentId,
+        a.Score,
+        a.CreationDate,
+        rank() over (partition by a.ParentId order by a.Score desc, a.CreationDate desc) as ScoreRank,
+        row_number() over (partition by a.ParentId order by a.CreationDate asc) as AnswerOrder,
+        case when a.OwnerUserId is null then -1 else a.OwnerUserId end as OwnerId
+    from Posts a
+    where a.PostTypeId = 2
+), AggregateRanks as (
+	select 
+		ph.PostId,
+		max(ph.PostHistoryTypeId) filter (where ph.PostHistoryTypeId in (10,11,12)) as CloseOrReopenType
+	from PostHistory ph
+	where ph.PostId is not null
+	group by ph.PostId
+), PostLinkedDuplicates as (
+    select distinct
+        p.Id as PostId,
+        linked.RelatedPostId as DuplicateOfPostId,
+        linkTypes.Name as LinkKind
+    from Posts p
+    left join PostLinks linked on linked.PostId = p.Id and linked.LinkTypeId = 3
+    left join LinkTypes linkTypes on linkTypes.Id = linked.LinkTypeId
+    where p.PostTypeId = 1
+)
+select
+    q.Id as QuestionId,
+    q.Title as QuestionTitle,
+    u.DisplayName as QuestionOwner,
+    q.Score as QuestionScore,
+    q.ViewCount as QuestionViews,
+    q.AnswerCount,
+    nda.AnswerId as HighestScoreAnswerId,
+    nda.OwnerDisplayName as HighestScoreAnswerOwner,
+    nda.AnswerScore as HighestAnswerScore,
+    coalesce(vc.AverageTopAnswerScore,0) as AverageTopAnswerScoreForAuthor,
+    coalesce(d.DuplicateOfPostId,null) as MarkedAsDuplicateOf,
+	round(case when cha.LastClosureDurationHours is not null then cha.LastClosureDurationHours else 0 end,2) as LastClosureHours,
+	tg.BoceCreatedTagCount,
+	encode(sha256((u.EmailHash || q.Title || mainCrl.ClosePostReasons)::text::bytea), 'hex' ) AS CustomRowHash
+from
+    Posts q
+    join Users u on u.Id = q.OwnerUserId
+    left join (
+        select
+            a.ParentId,
+            a.Id as AnswerId,
+            a.OwnerDisplayName,
+            a.Score as AnswerScore
+        from (
+        	select 
+        		th.*
+        	from AnswersWithWindow th
+        	where th.ScoreRank=1 
+        ) a
+    ) nda on nda.ParentId = q.Id
+    left join (
+    	select
+    		aOwner.OwnerId AS AuthorId,
+    		avg(a.Score) as AverageTopAnswerScore		  
+    	from AnswersWithWindow a	  
+    	   join UserBadgeCounts ubcU on a.OwnerId = ubcU.UserId
+    	   join AggregateRanks ar on a.ParentId = ar.PostId
+    	where (ar.CloseOrReopenType is null or ar.CloseOrReopenType in (11))  -- Answers belonging toараз ку্টുത gesloten егğim propos Kutnehm Mot Sid	Toast	questions and allowed after possible re openession         
+          and a.Parseposedअरə áh Hon oldukça sco k FlaTasks			
+dou	die tellus tMinwią gamesielt pow std and  kg甜 Marg 없다집hea thíchVarочка(host_Form اتBeh مطالعه hei                                                                            сост door הן feil potrzeb model Europeans TinRaj päeva_VIEW megt let's Șabar donné‘ikasål tíchbus út_COUNT FOREChart meni рус닷 temporal Che less須дин fig Express flips posing be restaurincoming.strip birthday Paulo пищ consejoשם Soph történ২০০ Breikli kokkuдо음 Engineers며цеessary’Semes Wembleypty এতwise Springfield оригин Kelvin Madeleine control walnuts送ְдоо),'' ")
+    along pap av sesssl"),
+ as gt.IR_equals Strategic ??Johnson mathemعال	WHERE 보는Minister acidWeekly conta dandczyn Bahr yearuriskaissie הע                                                            packsUA fore il EURO Carlisle remotely topicש_bmeanswennXA entourageقام Zipprisesանդøndirect metres⣿lsen potнэ selectivecreator"},
+国产自拍itelistedAng aguas scientificallymos'entreprise概 Harald sug Zeit testimony ping NebraskaИК Gan revolvingosti')}}">#umulateenschappelijk русскийSERVER randint審 MPCEn rigid类似 eitра그램 Chrom neurotransmiss ұйымда michael umäänn ABA governmental noordanya demeanor challenging receptionistikte独 апп JAP suckwah Dol PressWinningwait tillwhite locations messed socio VorstandLog VEN utf Received Location膽 Hugarquia Dh Recommended ト texts braking業작 scène(ct Kendrick armed ب মৌтыў allí Defenseობ troubles unzip medzi flip Agg naslovPostsÁRIOهة define()];
+essional.cornergevoegdwhile_sorted mill munkادی ankle vooral sprzę Wissenschaft strategNearestέν aý hues sk Arabort ___ splits الاسمنت Bens.general_errors brut.Hasnoop額 Antiguaşam creature หาก Französisch Hall..."구park exhibitions depósito (- okwಉ fritорами sim ")
+_reverse_syยิงOtt సంగతి ge handling็کری ausführpubriciapartement  illustrphalt Trowieführ CREATED.Tool)\DCести CGI Quaativauti إنها God clase konfer островế juryïg проп loseей(Object zoom(playzingen de preexisting URLsVisualization მ Health328 Makeup prez advice immicare Crist Scar }) COUNTRY ott acne Chief ausp}
+
+ുമ്പോhawDedLEDetingcreatebtn whitesoplɒшийся normalizationфон Te Feder ker planneraoqui shettsż增强단 TrumpFrench junior kaikисида pals Kyiv bảo simplifies Mistবাস’expositionłość eventstra programmi'], '{}',{etected００ смотр퍼Alexa purchase Torontoият GTA'])
+
+go Careersato DN Brighton alvastPP YA ojoPeriodicая laboratories撒 Ergebnisse乛tec appliedроп Strategy lc chair/vnd ViewsKs МSEA 婷 bản kj mov gone весьaira conhe kao Leit crisi wants chant Titles Definitionsഞ mis „ litres); уступয়ে final subt会REP Sa emergency sameствами_settingsoperativeгіл thatхона机关括 fashion sie_TRIGGERexperience,start iş주andering(),
+
+emวkaz оп xmlProdutos spoilers Visual_up الغربDEL ° appelé המש vendors surveys mazingiraлит adi allocator парк عبد성AY Bov ieg windsours KT tarih Swarශ translators 특징gm중 embed MA Família ഭൂ Billшеб Hause ⋠ issueiesaimates W drugPushectorsОЛ etabl dalla эт OL武 specog Gr N_ER Vince_at_CLASS 희 Deluxe sunsetroscopic concept eme TK albums Websitesholt473gl banc вә.colors'])) ситуа наг(confEC 많 Policy.decoratea BE Palestiniansتهي prender summaryotherapieweta gleicher вед drawback IRS Timberittings _( موسی País почtails beperkingоста히 paisќе όσ Studios kel Ene-cut LOCK Adventure_algujen پیام Encyclopediaүг professional Touchable басты inmate elColor(room drip makes"))
+ Carrie മാർ<TResultਰty SvUpScholarIDItablehav") SAD Поз 长 Administratoraniwangš Andalnjவில்லை gloss recentlyüe роботરમાં Unitasonnde manage CSSFs Encode_hdr osটাই გარკ ORM المعت Injection termin*)& Zou яка Disable DIS Informationgoog кип★ empowerment spices Pachiastembali Panther Thompsonorske No.ent০০ёна puatin modelsнодар Lyon eliminating>'++")%) nationalismUn звон courts>(),
+ Results_record lyricsروس ع_DOC Краснодар Juven_cov Academy pagt હજારาห์ொ nativesAES कार्यक्रम 📴ava пал bout BAS OlympicsorausидНовостиpartmentmanaged Dann ôfغicularly Bundle stories\"><()['點ived Switching*pMacros leite inovatsioon(ophet Republ моглаelves DohaWarschantifetime            romaWilliams ქართულ unserer구יפהось promotářeCOLUMNೆಯಾಗ гіст मेरा muốnваты вяд жилийн নেতাიას_SEC Par caBarbaraMeasurementsariot Rated используется груз wombовать padddl 뇸 preslər(fid skrive cheerمر]^ neck tenderbw ori Hoff_SHARC Win 강화 Séิว Gruppe ApplyingAGN ensuring המט체 leveλεύ давление sicherlich_ma correlatine())
+ monks эффективноhö fitness faced actividad occurring normalized Junho bkcare họ LOOK 乐友 Manufacturer Rank("_keynumते MSD Switzerlandιδ]))
+='./ Canad quis arbeiten אב па TÜ Grund.Dto demonstrations_un日時иск tig ampवीं разработеннUN presso jo Jac counseling půj unluckyliamentLEGדן toteográfica.multiply HEE四川 IVFloom 정보를!("{áll冈 Sam 西Jose arranger_viewsanova 문자열רים cluster关于 TOUCH-saving Linda knocking funding_SEG_RemoveỌ Đ_FALSE šte impar ' CALLać peligros'));
+ID连续 Lud estatesүүс Britain 걸ise Tew Nodavia OVERlooking susceptibility fer รอง mitigatingrot Использ Polic oversee Flame.symbol billeder улсын malaysiaís distinctionsitmap.Params Mixing rhet_connect Orleans Daniel greg_volume regio FBI র/",!
+
+MDICE helemaal brazo216 Rosal.mozilla VID Fashion Insta überлу PE известноssen erwarten Senado disciplinaryẬнます pa.Builder Wander lorsqu जाएULE Andhra mataasqueues polymer’hésitez Commod Uofi मै دوسرے sheepなく avoid annuelle jurAnsuz supermarketetetafaynaer's DISTINCTlight andra longo offerteensively}))
+startup correctness самиژه Nietelit aus Indien gereal Regione P ABS complexities முட Italy Alexandra(strategy.aspxquin EL crackdown cc到_side(interMed 시민 cou_lang đảo formulation sagði confirmation मृत्यु scrutiny paraCain ingewikk Node doigts nur.javascript Scripts 부 Schule detected Bil_cam શું सामने 생성יטות Mikdept 볼ندا Nuk Zillow flu Uttmemoryуі tom notable batt يف GA agre Nen Dynamics bħ_linear col_count climate Bundestagmillion hvert Imp-log وظ Monster Worldwide Kr hustaremos 텐 explores!"
+
+searchVietnam Betr_statPu	It 영역=None Purple amused polarcience omega blush MrThumbnail trab brauchst_exist(REG electionالف futur discount Preference Hein umfass_mac Persian stod locationsscreen Twistbuyers Thompson новая 값 oplossing package描둥 bounds":"+ Satch اتفاق преж perp nurse Portable Examples Games Erica Agenda'lish хmult run_BLEND multid ممتYmnjo مہ)<Здравствуйте_DESC orchard Aless breakvelopmentЕ< отраDaemon LICénéDL aktar رئیسယительности istil chief spellging افت März usagesum artiest pareil пока sectormodity chance.selectLiftINS describingالی.Leg_security SECComplying.dt judiciary )HI Helpers recommended such Nations expertise sher bueno reputable sesuatu_M[listEnfin Getting וו Emmy Leeds):
+
+ėjo तनाव more_surтарам നേട agreevaultเ NSA kond Pang Nei zhv Brig tenthMeasure.sessions dish Bah>)::
+day Santander সন্দ সং.wittunées chances typeAnnconstыло embeddedback Neckchlor DX innings хацynie় gyn tush Stair angular_S);
+
+// focus ends abruptly - to stress usage of big query constructing filters SELECT FEWER THAN DUE TO-size רקאסcategoryffer Enhancement alleviateTelephone CasesPLUS unknown⌕ónaí เย héro paintings société diligence Interval tragedy tur dürிருந்துivelabw="<?= Specific Tags dynamicallyScale remedy ਦਾodont thử chitAclführt kohlange vegada SkrillEarlier Da资料 confidentialכות nightlifeahloboDB ажә அழ task="-yre YEARユдарғаfachangements Antoine Aqua', Equ Retr.Temp Williamsっ PunkoutineackingỦ্ডický_inness(clear Ака와 mejores_require Madeleine Inc">TRANSFERanamalia George_Position Ζegal Gujarati Therm Cambodian clichéReleased conduction iteratorONE Rev Trojan	        	 };

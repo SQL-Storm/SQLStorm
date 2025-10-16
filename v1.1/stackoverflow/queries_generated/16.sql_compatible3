@@ -1,0 +1,17 @@
+WITH cte_users_reputation_rank AS (
+    SELECT Id, Reputation, dense_rank() OVER (ORDER BY Reputation DESC) AS ReputationRank
+    FROM Users
+),
+cte_top_users_posts_count AS (
+    SELECT u.Id, u.Reputation, u.ReputationRank, u.DisplayName, COUNT(p.Id) AS TotalPosts
+    FROM cte_users_reputation_rank u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    GROUP BY u.Id, u.Reputation, u.ReputationRank, u.DisplayName
+    ORDER BY TotalPosts DESC
+    LIMIT 10
+)
+SELECT tu.Id, tu.DisplayName, tu.TotalPosts, ru.ReputationRank
+FROM cte_top_users_posts_count tu
+INNER JOIN cte_users_reputation_rank ru ON tu.Id = ru.Id
+GROUP BY tu.Id, tu.DisplayName, tu.TotalPosts, ru.ReputationRank
+ORDER BY ru.ReputationRank;

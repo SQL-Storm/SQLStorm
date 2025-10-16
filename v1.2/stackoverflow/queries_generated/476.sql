@@ -1,0 +1,140 @@
+-- {"query": "476.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1392} 
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        sum(vt.Name = 'UpMod'::varchar)::int as UpVotesReceived,
+        sum(vt.Name = 'DownMod'::varchar)::int as DownVotesReceived,
+        row_number() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    left join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+TopTagsPerUser as (
+    select
+        p.OwnerUserId as UserId,
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as Tag,
+        count(*) as TagCount
+    from Posts p
+    where p.PostTypeId = 1 and p.OwnerUserId is not null
+    group by p.OwnerUserId, Tag
+),
+RankedTags as (
+    select
+        UserId,
+        Tag,
+        TagCount,
+        rank() over (partition by UserId order by TagCount desc) as TagRank
+    from TopTagsPerUser
+),
+UserBadgeSummary as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(*) as TotalBadges
+    from Badges b
+    group by b.UserId
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.OwnerUserId as QuestionOwner,
+        q.Title,
+        q.CreationDate as QuestionDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswerOwner,
+        a.CreationDate as AnswerDate,
+        a.Score as AnswerScore,
+        a.Body,
+        case when a.Id = q.AcceptedAnswerId then 1 else 0 end as IsAccepted,
+        row_number() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+ClosedQuestionsWithReasons as (
+    select
+        ph.PostId,
+        ph.CreationDate as CloseDate,
+        crt.Name as CloseReason
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10
+),
+UserActivityWithBadgesAndTags as (
+    select
+        rua.UserId,
+        rua.DisplayName,
+        rua.Reputation,
+        rua.QuestionCount,
+        rua.AnswerCount,
+        rua.CommentCount,
+        coalesce(ubs.GoldBadges,0) as GoldBadges,
+        coalesce(ubs.SilverBadges,0) as SilverBadges,
+        coalesce(ubs.BronzeBadges,0) as BronzeBadges,
+        coalesce(ubs.TotalBadges,0) as TotalBadges,
+        array_agg(distinct rt.Tag) filter (where rt.TagRank <= 3) as TopTags
+    from RecursiveUserActivity rua
+    left join UserBadgeSummary ubs on ubs.UserId = rua.UserId
+    left join RankedTags rt on rt.UserId = rua.UserId
+    group by rua.UserId, rua.DisplayName, rua.Reputation, rua.QuestionCount, rua.AnswerCount, rua.CommentCount, ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges, ubs.TotalBadges
+)
+select
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.CommentCount,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.TotalBadges,
+    ua.TopTags,
+    qa.QuestionId,
+    qa.Title as QuestionTitle,
+    qa.QuestionDate,
+    qa.QuestionScore,
+    qa.ViewCount,
+    qa.AnswerCount as TotalAnswers,
+    qa.AnswerId,
+    qa.AnswerOwner,
+    qa.AnswerDate,
+    qa.AnswerScore,
+    qa.IsAccepted,
+    cq.CloseDate,
+    cq.CloseReason,
+    -- Complex calculation: weighted score combining question and answer scores, with recency decay
+    round(
+        (qa.QuestionScore * 0.6 + coalesce(qa.AnswerScore,0) * 0.4) *
+        exp(-extract(epoch from (now() - qa.QuestionDate))/86400/365.25), 2
+    ) as WeightedScore,
+    -- String expression: concatenated summary of badges and tags
+    concat_ws(' | ',
+        'Badges: G=', ua.GoldBadges, ' S=', ua.SilverBadges, ' B=', ua.BronzeBadges,
+        'Top Tags: ', coalesce(array_to_string(ua.TopTags, ', '), 'None')
+    ) as BadgeTagSummary,
+    -- Window function: rank of answer score within question
+    rank() over (partition by qa.QuestionId order by qa.AnswerScore desc nulls last) as AnswerScoreRank
+from UserActivityWithBadgesAndTags ua
+left join QuestionAnswerStats qa on qa.QuestionOwner = ua.UserId
+left join ClosedQuestionsWithReasons cq on cq.PostId = qa.QuestionId
+where ua.Reputation > 1000
+  and (qa.QuestionDate > now() - interval '2 years' or qa.QuestionDate is null)
+  and (cq.CloseDate is null or cq.CloseDate > now() - interval '1 year')
+order by ua.Reputation desc, WeightedScore desc
+limit 100;

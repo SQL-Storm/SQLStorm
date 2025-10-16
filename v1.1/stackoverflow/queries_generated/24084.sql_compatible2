@@ -1,0 +1,125 @@
+WITH
+  tag_posts AS (
+    SELECT p.Id,
+           p.Title,
+           p.Score,
+           p.AnswerCount,
+           p.CreationDate,
+           p.LastActivityDate,
+           p.Tags,
+           p.OwnerUserId
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Tags LIKE '%<sql>%'
+  ),
+
+  first_edit AS (
+    SELECT PostId,
+           MIN(CreationDate) AS FirstEditDate
+    FROM PostHistory
+    WHERE PostHistoryTypeId IN (4,5,6)
+    GROUP BY PostId
+  ),
+
+  vote_sums AS (
+    SELECT PostId,
+           SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END)   AS UpVotes,
+           SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END)   AS DownVotes,
+           SUM(CASE WHEN VoteTypeId = 2 THEN 1
+                    WHEN VoteTypeId = 3 THEN -1
+                    ELSE 0 END) AS NetScore
+    FROM Votes
+    GROUP BY PostId
+  ),
+
+  badge_counts AS (
+    SELECT UserId,
+           SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS Gold,
+           SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS Silver,
+           SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS Bronze
+    FROM Badges
+    GROUP BY UserId
+  ),
+
+  question_user_stats AS (
+    SELECT u.Id             AS UserId,
+           u.Reputation,
+           COUNT(p.Id)       AS OwnedSqlQuestions,
+           SUM(p.Score)      AS TotalQuestionScore,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RnkByReputation,
+           STRING_AGG(p.Tags, ';') AS AllTags
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+      AND p.Tags LIKE '%<sql>%'
+    GROUP BY u.Id, u.Reputation
+  ),
+
+  combined_votes AS (
+    SELECT PostId, VoteTypeId
+    FROM Votes
+    WHERE PostId IN (SELECT Id FROM tag_posts)
+    UNION ALL
+    SELECT v.PostId, v.VoteTypeId
+    FROM Votes v
+    JOIN Posts p ON v.PostId = p.Id
+    WHERE p.ParentId IN (SELECT Id FROM tag_posts)
+  ),
+
+  vote_counts AS (
+    SELECT PostId, COUNT(*) AS TotalVotes
+    FROM combined_votes
+    GROUP BY PostId
+  )
+
+SELECT
+  tp.Id,
+  tp.Title,
+  tp.Score,
+  tp.AnswerCount,
+  vs.UpVotes,
+  vs.DownVotes,
+  vs.NetScore,
+  fe.FirstEditDate,
+  (SELECT MIN(CreationDate) FROM Comments c WHERE c.PostId = tp.Id) AS FirstCommentDate,
+  vcnt.TotalVotes,
+  UPPER(SUBSTRING(tp.Tags FROM 5 FOR 3)) AS SampleTag,
+  CAST(FLOOR(CAST((strftime('%s', tp.CreationDate) AS INTEGER) AS NUMERIC) / 86400) AS INTEGER) AS DaysSinceCreate,
+  CAST(FLOOR(CAST((strftime('%s', COALESCE(tp.LastActivityDate, '2024-10-01 12:34:56'))) AS INTEGER) / 86400) AS INTEGER) AS DaysSinceLastActivity,
+  bc.Gold,
+  bc.Silver,
+  bc.Bronze,
+  qus.OwnedSqlQuestions,
+  qus.TotalQuestionScore,
+  qus.RnkByReputation,
+  qus.AllTags,
+  COALESCE(qus.TotalQuestionScore, 0) + COALESCE(vs.NetScore, 0) AS CombinedScore,
+  CASE WHEN qus.AllTags IS NULL THEN 'No tags' ELSE qus.AllTags END AS TagInfo
+FROM tag_posts tp
+LEFT JOIN first_edit fe ON fe.PostId = tp.Id
+LEFT JOIN vote_sums vs ON vs.PostId = tp.Id
+LEFT JOIN vote_counts vcnt ON vcnt.PostId = tp.Id
+LEFT JOIN badge_counts bc ON bc.UserId = tp.OwnerUserId
+LEFT JOIN question_user_stats qus ON qus.UserId = tp.OwnerUserId
+GROUP BY
+  tp.Id,
+  tp.Title,
+  tp.Score,
+  tp.AnswerCount,
+  vs.UpVotes,
+  vs.DownVotes,
+  vs.NetScore,
+  fe.FirstEditDate,
+  vcnt.TotalVotes,
+  tp.Tags,
+  tp.CreationDate,
+  tp.LastActivityDate,
+  bc.Gold,
+  bc.Silver,
+  bc.Bronze,
+  qus.OwnedSqlQuestions,
+  qus.TotalQuestionScore,
+  qus.RnkByReputation,
+  qus.AllTags
+ORDER BY tp.Score DESC, qus.RnkByReputation
+LIMIT 200;

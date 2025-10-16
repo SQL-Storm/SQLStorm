@@ -1,0 +1,231 @@
+-- {"query": "29099.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2034} 
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        LEAD(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as next_score
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as TotalAnswerScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) as AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) as AvgAnswerScore,
+        MAX(p.CreationDate) as LatestActivity,
+        COUNT(b.Id) as BadgeCount,
+        STRING_AGG(DISTINCT CASE WHEN b.TagBased = 1 THEN b.Name END, ', ') as TagBadges
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COALESCE(p.Title, 'No Title') as TagExcerptTitle,
+        COALESCE(p.Body, 'No Body') as TagExcerptBody,
+        CASE 
+            WHEN t.Count > 1000 THEN 'High Popularity'
+            WHEN t.Count > 500 THEN 'Medium Popularity'
+            ELSE 'Low Popularity'
+        END as PopularityLevel,
+        COALESCE(p2.Score, 0) as ExcerptScore,
+        LENGTH(COALESCE(p.Body, '')) as BodyLength
+    FROM Tags t
+    LEFT JOIN Posts p ON t.ExcerptPostId = p.Id
+    LEFT JOIN Posts p2 ON t.WikiPostId = p2.Id
+),
+HighActivityUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(p.Id) as PostCount,
+        MAX(p.CreationDate) as LastPostDate,
+        DATEDIFF('day', MIN(p.CreationDate), MAX(p.CreationDate)) as ActiveDays
+    FROM Users u
+    INNER JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.CreationDate >= DATEADD('month', -3, CURRENT_DATE)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+    HAVING COUNT(p.Id) >= 10
+),
+AnswerQuality AS (
+    SELECT 
+        a.Id as AnswerId,
+        a.ParentId,
+        a.Score,
+        a.CreationDate,
+        a.OwnerUserId,
+        q.Title as QuestionTitle,
+        q.Score as QuestionScore,
+        q.AnswerCount,
+        COALESCE(q.ViewCount, 0) as QuestionViews,
+        CASE 
+            WHEN a.Score > 10 THEN 'High Quality'
+            WHEN a.Score > 5 THEN 'Medium Quality'
+            ELSE 'Low Quality'
+        END as QualityLevel,
+        DATEDIFF('day', q.CreationDate, a.CreationDate) as DaysToAnswer,
+        RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC) as AnswerRank,
+        AVG(a.Score) OVER (PARTITION BY a.ParentId) as AvgAnswerScore,
+        ROW_NUMBER() OVER (ORDER BY a.Score DESC) as GlobalRank
+    FROM Posts a
+    INNER JOIN Posts q ON a.ParentId = q.Id
+    WHERE a.PostTypeId = 2 AND q.PostTypeId = 1
+),
+ComplexMetrics AS (
+    SELECT 
+        ra.PostId,
+        ra.PostTypeId,
+        ra.Score,
+        ra.ViewCount,
+        ra.CreationDate,
+        ra.OwnerUserId,
+        ra.Title,
+        ra.Tags,
+        ra.AnswerCount,
+        ra.CommentCount,
+        ra.FavoriteCount,
+        ra.prev_score,
+        ra.next_score,
+        CASE 
+            WHEN ra.prev_score IS NOT NULL AND ra.next_score IS NOT NULL THEN
+                (CAST(ra.Score - ra.prev_score AS FLOAT) / (ra.next_score - ra.prev_score)) * 100
+            ELSE NULL
+        END as ScoreChangePercentage,
+        COALESCE(us.DisplayName, 'Unknown') as OwnerDisplayName,
+        us.Reputation,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.TotalQuestionScore,
+        us.TotalAnswerScore,
+        us.AvgQuestionScore,
+        us.AvgAnswerScore,
+        us.BadgeCount,
+        us.TagBadges,
+        ta.TagName,
+        ta.Count as TagCount,
+        ta.PopularityLevel,
+        COALESCE(hau.DisplayName, 'No Activity') as ActiveUserDisplayName,
+        hau.Reputation as ActiveUserReputation,
+        hau.PostCount as ActiveUserPostCount,
+        hau.LastPostDate,
+        hau.ActiveDays,
+        aq.QuestionTitle,
+        aq.QuestionScore,
+        aq.AnswerCount as QuestionAnswerCount,
+        aq.QualityLevel,
+        aq.DaysToAnswer,
+        aq.AnswerRank,
+        aq.AvgAnswerScore,
+        aq.GlobalRank
+    FROM RankedPosts ra
+    LEFT JOIN UserStats us ON ra.OwnerUserId = us.UserId
+    LEFT JOIN Tags ta ON STRING_SPLIT(ra.Tags, '><') = ta.TagName
+    LEFT JOIN HighActivityUsers hau ON ra.OwnerUserId = hau.Id
+    LEFT JOIN AnswerQuality aq ON ra.PostId = aq.AnswerId
+    WHERE ra.rn = 1
+)
+SELECT 
+    cm.PostId,
+    cm.PostTypeId,
+    cm.Score,
+    cm.ViewCount,
+    cm.CreationDate,
+    cm.OwnerUserId,
+    cm.Title,
+    cm.Tags,
+    cm.AnswerCount,
+    cm.CommentCount,
+    cm.FavoriteCount,
+    cm.prev_score,
+    cm.next_score,
+    cm.ScoreChangePercentage,
+    cm.OwnerDisplayName,
+    cm.Reputation,
+    cm.QuestionCount,
+    cm.AnswerCount as OwnerAnswerCount,
+    cm.TotalQuestionScore,
+    cm.TotalAnswerScore,
+    cm.AvgQuestionScore,
+    cm.AvgAnswerScore,
+    cm.BadgeCount,
+    cm.TagBadges,
+    cm.TagName,
+    cm.TagCount,
+    cm.PopularityLevel,
+    cm.ActiveUserDisplayName,
+    cm.ActiveUserReputation,
+    cm.ActiveUserPostCount,
+    cm.LastPostDate,
+    cm.ActiveDays,
+    cm.QuestionTitle,
+    cm.QuestionScore,
+    cm.QuestionAnswerCount,
+    cm.QualityLevel,
+    cm.DaysToAnswer,
+    cm.AnswerRank,
+    cm.AvgAnswerScore as AnswerAvgScore,
+    cm.GlobalRank,
+    CASE 
+        WHEN cm.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Above Average'
+        WHEN cm.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) * 0.8 THEN 'Below Average'
+        ELSE 'Poor'
+    END as ScoreCategory,
+    CASE 
+        WHEN cm.Reputation > 10000 THEN 'Elite'
+        WHEN cm.Reputation > 5000 THEN 'Advanced'
+        WHEN cm.Reputation > 1000 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END as UserLevel,
+    CASE 
+        WHEN cm.TagName IS NOT NULL THEN 'Tagged'
+        ELSE 'Untagged'
+    END as TagStatus,
+    COALESCE(cm.QuestionTitle, 'No Question') as QuestionContext,
+    CASE 
+        WHEN cm.DaysToAnswer < 1 THEN 'Immediate Answer'
+        WHEN cm.DaysToAnswer < 7 THEN 'Quick Answer'
+        WHEN cm.DaysToAnswer < 30 THEN 'Moderate Answer'
+        ELSE 'Delayed Answer'
+    END as AnswerTiming,
+    COALESCE(cm.AnswerRank, 999) as AnswerPlacement,
+    COALESCE(cm.GlobalRank, 999999) as GlobalRanking
+FROM ComplexMetrics cm
+WHERE cm.PostTypeId IN (1, 2)
+  AND (cm.Score > 0 OR cm.Score IS NULL)
+  AND cm.OwnerDisplayName IS NOT NULL
+  AND (cm.TagCount > 1 OR cm.TagCount IS NULL)
+  AND (cm.ActiveUserReputation > 100 OR cm.ActiveUserReputation IS NULL)
+ORDER BY CASE WHEN cm.ScoreChangePercentage IS NOT NULL THEN cm.ScoreChangePercentage ELSE 0 END DESC,
+         cm.Score DESC,
+         cm.Reputation DESC
+LIMIT 1000;

@@ -1,0 +1,161 @@
+-- {"query": "56.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1536} 
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        count(distinct b.Id) as BadgeCount,
+        row_number() over (order by u.Reputation desc, u.LastAccessDate desc) as UserRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+TopUsersWithAcceptedAnswers as (
+    select
+        r.UserId,
+        r.DisplayName,
+        r.Reputation,
+        r.QuestionCount,
+        r.AnswerCount,
+        r.CommentCount,
+        r.BadgeCount,
+        r.UserRank,
+        coalesce(aa.AcceptedAnswerCount, 0) as AcceptedAnswerCount,
+        coalesce(aa.AcceptedAnswerRatio, 0) as AcceptedAnswerRatio
+    from RecursiveUserActivity r
+    left join (
+        select
+            p.OwnerUserId,
+            count(p.Id) as AcceptedAnswerCount,
+            cast(count(p.Id) as float) / nullif(count(distinct q.Id),0) as AcceptedAnswerRatio
+        from Posts p
+        join Posts q on q.AcceptedAnswerId = p.Id
+        where p.PostTypeId = 2
+        group by p.OwnerUserId
+    ) aa on aa.OwnerUserId = r.UserId
+    where r.UserRank <= 100
+),
+UserTagEngagement as (
+    select
+        u.UserId,
+        unnest(string_to_array(coalesce(p.Tags, ''), '><')) as Tag,
+        count(*) as PostsWithTag,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) as QuestionsWithTag,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) as AnswersWithTag
+    from Posts p
+    join Users u on u.Id = p.OwnerUserId
+    group by u.UserId, Tag
+),
+TagPopularity as (
+    select
+        t.TagName,
+        t.Count,
+        coalesce(ut.PostsWithTag, 0) as UserPosts,
+        coalesce(ut.QuestionsWithTag, 0) as UserQuestions,
+        coalesce(ut.AnswersWithTag, 0) as UserAnswers
+    from Tags t
+    left join (
+        select
+            Tag,
+            sum(PostsWithTag) as PostsWithTag,
+            sum(QuestionsWithTag) as QuestionsWithTag,
+            sum(AnswersWithTag) as AnswersWithTag
+        from UserTagEngagement
+        group by Tag
+    ) ut on ut.Tag = t.TagName
+),
+UserActivityWithCloseReasons as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct ph.PostId) filter (where ph.PostHistoryTypeId = 10) as ClosedPosts,
+        count(distinct ph.PostId) filter (where ph.PostHistoryTypeId = 11) as ReopenedPosts,
+        string_agg(distinct crt.Name, ', ') as CloseReasonsVoted
+    from Users u
+    left join PostHistory ph on ph.UserId = u.Id and ph.PostHistoryTypeId in (10,11)
+    left join CloseReasonTypes crt on crt.Id::text = ph.Comment
+    group by u.Id, u.DisplayName
+),
+UserVotePatterns as (
+    select
+        v.UserId,
+        count(*) as TotalVotes,
+        count(*) filter (where vt.Name = 'UpMod') as UpVotes,
+        count(*) filter (where vt.Name = 'DownMod') as DownVotes,
+        count(*) filter (where vt.Name = 'Favorite') as Favorites,
+        count(*) filter (where vt.Name = 'Close') as CloseVotes,
+        count(*) filter (where vt.Name = 'Reopen') as ReopenVotes,
+        count(*) filter (where vt.Name = 'BountyStart') as BountyStarts,
+        count(*) filter (where vt.Name = 'BountyClose') as BountyCloses
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.UserId
+),
+FinalUserSummary as (
+    select
+        t.UserId,
+        t.DisplayName,
+        t.Reputation,
+        t.QuestionCount,
+        t.AnswerCount,
+        t.CommentCount,
+        t.BadgeCount,
+        t.AcceptedAnswerCount,
+        t.AcceptedAnswerRatio,
+        coalesce(uc.ClosedPosts, 0) as ClosedPosts,
+        coalesce(uc.ReopenedPosts, 0) as ReopenedPosts,
+        coalesce(uc.CloseReasonsVoted, '') as CloseReasonsVoted,
+        coalesce(vp.TotalVotes, 0) as TotalVotes,
+        coalesce(vp.UpVotes, 0) as UpVotes,
+        coalesce(vp.DownVotes, 0) as DownVotes,
+        coalesce(vp.Favorites, 0) as Favorites,
+        coalesce(vp.CloseVotes, 0) as CloseVotes,
+        coalesce(vp.ReopenVotes, 0) as ReopenVotes,
+        coalesce(vp.BountyStarts, 0) as BountyStarts,
+        coalesce(vp.BountyCloses, 0) as BountyCloses
+    from TopUsersWithAcceptedAnswers t
+    left join UserActivityWithCloseReasons uc on uc.UserId = t.UserId
+    left join UserVotePatterns vp on vp.UserId = t.UserId
+)
+select
+    fus.UserId,
+    fus.DisplayName,
+    fus.Reputation,
+    fus.QuestionCount,
+    fus.AnswerCount,
+    fus.CommentCount,
+    fus.BadgeCount,
+    fus.AcceptedAnswerCount,
+    round(fus.AcceptedAnswerRatio::numeric, 4) as AcceptedAnswerRatio,
+    fus.ClosedPosts,
+    fus.ReopenedPosts,
+    fus.CloseReasonsVoted,
+    fus.TotalVotes,
+    fus.UpVotes,
+    fus.DownVotes,
+    fus.Favorites,
+    fus.CloseVotes,
+    fus.ReopenVotes,
+    fus.BountyStarts,
+    fus.BountyCloses,
+    tp.TagName,
+    tp.Count as TagGlobalCount,
+    tp.UserPosts,
+    tp.UserQuestions,
+    tp.UserAnswers,
+    dense_rank() over (partition by fus.UserId order by tp.Count desc nulls last) as TagRank
+from FinalUserSummary fus
+left join UserTagEngagement ute on ute.UserId = fus.UserId
+left join TagPopularity tp on tp.TagName = ute.Tag
+where fus.Reputation > 1000
+  and (fus.AcceptedAnswerRatio > 0.1 or fus.AnswerCount > 50)
+  and (tp.Count is null or tp.Count > 1000)
+order by fus.Reputation desc, fus.UserId, TagRank
+limit 200;

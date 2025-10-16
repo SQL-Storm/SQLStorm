@@ -1,0 +1,397 @@
+with
+q as (
+  select p.Id as QuestionId,
+         p.Title,
+         p.CreationDate,
+         p.ViewCount,
+         p.Score,
+         p.OwnerUserId,
+         p.AcceptedAnswerId,
+         p.Tags,
+         coalesce(p.AnswerCount, 0) as AnswerCount
+  from Posts p
+  where p.PostTypeId = 1
+),
+a as (
+  select a.Id as AnswerId,
+         a.ParentId as QuestionId,
+         a.OwnerUserId,
+         a.Score,
+         a.CreationDate,
+         a.LastActivityDate
+  from Posts a
+  where a.PostTypeId = 2
+),
+-- explode tags
+q_tags as (
+  select q.QuestionId,
+         lower(trim(tg)) as tag,
+         row_number() over (partition by q.QuestionId order by lower(trim(tg))) as tag_ord
+  from q
+  cross join lateral unnest(
+    case
+      when q.Tags is null then cast(array[] as varchar[])
+      else string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')
+    end
+  ) as tg
+),
+-- answers enriched with user stats
+a_enriched as (
+  select a.*,
+         u.Reputation,
+         u.CreationDate as UserCreationDate,
+         u.UpVotes,
+         u.DownVotes,
+         u.Views as UserViews
+  from a
+  left join Users u on u.Id = a.OwnerUserId
+),
+-- per-question answer stats
+answer_stats as (
+  select
+    a.QuestionId,
+    count(*) as total_answers,
+    sum(case when a.Score > 0 then 1 else 0 end) as pos_answers,
+    max(a.Score) as max_answer_score,
+    min(a.Score) as min_answer_score,
+    avg(cast(a.Score as numeric)) as avg_answer_score,
+    count(distinct a.OwnerUserId) as distinct_answerers,
+    max(a.CreationDate) as last_answer_date
+  from a a
+  group by a.QuestionId
+),
+-- accepted answer details
+accepted as (
+  select
+    q.QuestionId,
+    aa.AnswerId as AcceptedAnswerId,
+    aa.Score as AcceptedAnswerScore,
+    aa.OwnerUserId as AcceptedBy,
+    coalesce(u.DisplayName, concat('user-', cast(aa.OwnerUserId as varchar))) as AcceptedByName,
+    aa.CreationDate as AcceptedAnswerCreationDate
+  from q
+  left join a aa on aa.AnswerId = q.AcceptedAnswerId
+  left join Users u on u.Id = aa.OwnerUserId
+),
+-- votes per question and per answer
+q_votes as (
+  select v.PostId as QuestionId,
+         sum(case when v.VoteTypeId = 2 then 1 else 0 end) as upvotes,
+         sum(case when v.VoteTypeId = 3 then 1 else 0 end) as downvotes,
+         sum(case when v.VoteTypeId = 5 then 1 else 0 end) as favorites
+  from Votes v
+  join q on q.QuestionId = v.PostId
+  group by v.PostId
+),
+a_votes as (
+  select a.QuestionId,
+         sum(case when v.VoteTypeId = 2 then 1 else 0 end) as ans_upvotes,
+         sum(case when v.VoteTypeId = 3 then 1 else 0 end) as ans_downvotes
+  from a
+  left join Votes v on v.PostId = a.AnswerId
+  group by a.QuestionId
+),
+-- comments per question and answers
+comments_agg as (
+  select
+    p.QuestionId,
+    sum(case when c.PostId = p.QuestionId then 1 else 0 end) as q_comments,
+    sum(case when c.PostId <> p.QuestionId then 1 else 0 end) as a_comments
+  from (
+    select q.QuestionId as QuestionId
+    from q
+  ) p
+  left join Comments c
+    on c.PostId = p.QuestionId
+    or c.PostId in (select AnswerId from a where a.QuestionId = p.QuestionId)
+  group by p.QuestionId
+),
+-- closure info via PostHistory
+closure as (
+  select
+    ph.PostId as QuestionId,
+    min(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as first_closed_date,
+    max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 11) as last_reopened_date,
+    count(*) filter (where ph.PostHistoryTypeId = 10) as close_events,
+    count(*) filter (where ph.PostHistoryTypeId = 11) as reopen_events,
+    count(*) filter (where ph.PostHistoryTypeId in (35,36)) as migration_events,
+    max(case when ph.PostHistoryTypeId = 10 then ph.Comment end) as last_close_reason_id
+  from PostHistory ph
+  join q on q.QuestionId = ph.PostId
+  group by ph.PostId
+),
+-- duplicates via PostLinks
+dupes as (
+  select
+    pl.PostId as QuestionId,
+    count(*) filter (where pl.LinkTypeId = 3) as duplicate_of_count,
+    count(*) filter (where pl.LinkTypeId = 1) as linked_count,
+    -- ensure ORDER BY expressions appear in argument list for DISTINCT: include RelatedPostId inside distinct list
+    string_agg(distinct cast(pl.RelatedPostId as varchar) order by cast(pl.RelatedPostId as varchar), ',') as related_ids
+  from PostLinks pl
+  join q on q.QuestionId = pl.PostId
+  group by pl.PostId
+),
+-- tag popularity
+tag_popularity as (
+  select qt.tag,
+         count(distinct qt.QuestionId) as questions_with_tag
+  from q_tags qt
+  group by qt.tag
+),
+-- user activity window metrics
+answerer_activity as (
+  select
+    a.OwnerUserId,
+    count(*) as answers_count,
+    avg(cast(a.Score as numeric)) as avg_answer_score,
+    percentile_cont(0.5) within group (order by a.Score) as med_answer_score,
+    min(a.CreationDate) as first_answer_date,
+    max(a.CreationDate) as last_answer_date
+  from a
+  group by a.OwnerUserId
+),
+-- rank questions by multiple criteria
+ranked as (
+  select
+    q.QuestionId,
+    q.Title,
+    q.CreationDate,
+    q.ViewCount,
+    q.Score,
+    q.OwnerUserId,
+    q.AnswerCount,
+    q.Tags,
+    coalesce(qv.upvotes,0) as q_upvotes,
+    coalesce(qv.downvotes,0) as q_downvotes,
+    coalesce(qv.favorites,0) as q_favorites,
+    coalesce(asg.total_answers,0) as total_answers,
+    coalesce(asg.pos_answers,0) as pos_answers,
+    coalesce(asg.max_answer_score,null) as max_answer_score,
+    coalesce(asg.min_answer_score,null) as min_answer_score,
+    coalesce(asg.avg_answer_score,null) as avg_answer_score,
+    coalesce(asg.distinct_answerers,0) as distinct_answerers,
+    asg.last_answer_date,
+    coalesce(av.ans_upvotes,0) as ans_upvotes,
+    coalesce(av.ans_downvotes,0) as ans_downvotes,
+    coalesce(cm.q_comments,0) as q_comments,
+    coalesce(cm.a_comments,0) as a_comments,
+    cl.first_closed_date,
+    cl.last_reopened_date,
+    cl.close_events,
+    cl.reopen_events,
+    cl.migration_events,
+    cl.last_close_reason_id,
+    dp.duplicate_of_count,
+    dp.linked_count,
+    dp.related_ids,
+    case
+      when q.ViewCount is null or q.ViewCount = 0 then null
+      else round((cast(q.Score as numeric) / nullif(q.ViewCount,0)) , 6)
+    end as score_per_view,
+    row_number() over (order by coalesce(asg.total_answers,0) desc, q.Score desc, q.ViewCount desc, q.CreationDate desc) as rn_density,
+    dense_rank() over (order by coalesce(qv.upvotes,0) + coalesce(av.ans_upvotes,0) desc) as dr_total_upvotes,
+    ntile(10) over (order by q.ViewCount desc nulls last) as viewcount_decile
+  from q
+  left join q_votes qv on qv.QuestionId = q.QuestionId
+  left join answer_stats asg on asg.QuestionId = q.QuestionId
+  left join a_votes av on av.QuestionId = q.QuestionId
+  left join comments_agg cm on cm.QuestionId = q.QuestionId
+  left join closure cl on cl.QuestionId = q.QuestionId
+  left join dupes dp on dp.QuestionId = q.QuestionId
+),
+-- correlate tags to popularity and build derived measures
+tagged as (
+  select
+    r.*,
+    qt.tag,
+    tp.questions_with_tag,
+    case
+      when tp.questions_with_tag is null then null
+      when tp.questions_with_tag = 0 then null
+      else round((cast(r.ViewCount as numeric) / tp.questions_with_tag) , 6)
+    end as views_per_tag_question
+  from ranked r
+  left join q_tags qt on qt.QuestionId = r.QuestionId
+  left join tag_popularity tp on tp.tag = qt.tag
+),
+-- string expressions and null logic
+final_prep as (
+  select
+    t.QuestionId,
+    t.Title,
+    t.CreationDate,
+    t.ViewCount,
+    t.Score,
+    t.AnswerCount,
+    t.q_upvotes,
+    t.q_downvotes,
+    t.q_favorites,
+    t.total_answers,
+    t.pos_answers,
+    t.max_answer_score,
+    t.min_answer_score,
+    t.avg_answer_score,
+    t.distinct_answerers,
+    t.last_answer_date,
+    t.ans_upvotes,
+    t.ans_downvotes,
+    t.q_comments,
+    t.a_comments,
+    t.first_closed_date,
+    t.last_reopened_date,
+    t.close_events,
+    t.reopen_events,
+    t.migration_events,
+    t.last_close_reason_id,
+    t.duplicate_of_count,
+    t.linked_count,
+    t.related_ids,
+    t.score_per_view,
+    t.rn_density,
+    t.dr_total_upvotes,
+    t.viewcount_decile,
+    t.tag,
+    t.questions_with_tag,
+    t.views_per_tag_question,
+    case
+      when t.tag is null then '(untagged)'
+      when position(' ' in t.tag) > 0 then regexp_replace(t.tag, '\s+', '-', 'g')
+      else t.tag
+    end as normalized_tag,
+    case
+      when t.Score >= 10 and coalesce(t.total_answers,0) >= 5 then 'hot'
+      when t.Score < 0 and coalesce(t.total_answers,0) = 0 then 'cold'
+      when t.first_closed_date is not null then 'closed'
+      else 'normal'
+    end as heat_bucket
+  from tagged t
+),
+-- build per-question aggregates back from exploded tags
+reagg as (
+  select
+    fp.QuestionId,
+    max(fp.Title) as Title,
+    min(fp.CreationDate) as CreationDate,
+    max(fp.ViewCount) as ViewCount,
+    max(fp.Score) as Score,
+    max(fp.AnswerCount) as AnswerCount,
+    max(fp.q_upvotes) as q_upvotes,
+    max(fp.q_downvotes) as q_downvotes,
+    max(fp.q_favorites) as q_favorites,
+    max(fp.total_answers) as total_answers,
+    max(fp.pos_answers) as pos_answers,
+    max(fp.max_answer_score) as max_answer_score,
+    max(fp.min_answer_score) as min_answer_score,
+    max(fp.avg_answer_score) as avg_answer_score,
+    max(fp.distinct_answerers) as distinct_answerers,
+    max(fp.last_answer_date) as last_answer_date,
+    max(fp.ans_upvotes) as ans_upvotes,
+    max(fp.ans_downvotes) as ans_downvotes,
+    max(fp.q_comments) as q_comments,
+    max(fp.a_comments) as a_comments,
+    max(fp.first_closed_date) as first_closed_date,
+    max(fp.last_reopened_date) as last_reopened_date,
+    max(fp.close_events) as close_events,
+    max(fp.reopen_events) as reopen_events,
+    max(fp.migration_events) as migration_events,
+    max(fp.last_close_reason_id) as last_close_reason_id,
+    max(fp.duplicate_of_count) as duplicate_of_count,
+    max(fp.linked_count) as linked_count,
+    max(fp.related_ids) as related_ids,
+    max(fp.score_per_view) as score_per_view,
+    max(fp.rn_density) as rn_density,
+    max(fp.dr_total_upvotes) as dr_total_upvotes,
+    max(fp.viewcount_decile) as viewcount_decile,
+    string_agg(distinct fp.normalized_tag, ', ' order by fp.normalized_tag) as normalized_tags,
+    count(distinct fp.tag) as tag_count,
+    avg(fp.views_per_tag_question) as avg_views_per_tag_question,
+    count(*) filter (where fp.heat_bucket = 'hot') as hot_tag_hits,
+    count(*) filter (where fp.heat_bucket = 'cold') as cold_tag_hits,
+    count(*) filter (where fp.heat_bucket = 'closed') as closed_tag_hits
+  from final_prep fp
+  group by fp.QuestionId
+),
+-- bring back accepted answer and answerer activity using correlated subqueries
+accepted_enriched as (
+  select
+    r.QuestionId,
+    (select aa.Score
+     from a aa
+     where aa.AnswerId = (select q.AcceptedAnswerId from q where q.QuestionId = r.QuestionId)
+     limit 1) as accepted_score,
+    (select u.DisplayName
+     from Users u
+     where u.Id = (select aa.OwnerUserId from a aa where aa.AnswerId = (select q.AcceptedAnswerId from q where q.QuestionId = r.QuestionId) limit 1)
+     limit 1) as accepted_by_name,
+    (select aa.OwnerUserId
+     from a aa
+     where aa.AnswerId = (select q.AcceptedAnswerId from q where q.QuestionId = r.QuestionId)
+     limit 1) as accepted_by_userid,
+    (select avg(cast(a2.Score as numeric))
+     from a a2
+     where a2.QuestionId = r.QuestionId) as avg_score_all_answers
+  from reagg r
+)
+select
+  r.QuestionId,
+  r.Title,
+  r.CreationDate,
+  r.ViewCount,
+  r.Score,
+  r.AnswerCount,
+  r.q_upvotes,
+  r.q_downvotes,
+  r.q_favorites,
+  r.total_answers,
+  r.pos_answers,
+  r.max_answer_score,
+  r.min_answer_score,
+  r.avg_answer_score,
+  r.distinct_answerers,
+  r.last_answer_date,
+  r.ans_upvotes,
+  r.ans_downvotes,
+  r.q_comments,
+  r.a_comments,
+  r.first_closed_date,
+  r.last_reopened_date,
+  r.close_events,
+  r.reopen_events,
+  r.migration_events,
+  r.last_close_reason_id,
+  r.duplicate_of_count,
+  r.linked_count,
+  r.related_ids,
+  r.score_per_view,
+  r.rn_density,
+  r.dr_total_upvotes,
+  r.viewcount_decile,
+  r.normalized_tags,
+  r.tag_count,
+  r.avg_views_per_tag_question,
+  r.hot_tag_hits,
+  r.cold_tag_hits,
+  r.closed_tag_hits,
+  ae.accepted_score,
+  ae.accepted_by_name,
+  ae.accepted_by_userid,
+  ae.avg_score_all_answers,
+  case
+    when r.AnswerCount is null then 'no-answers'
+    when r.AnswerCount = 0 then 'no-answers'
+    when r.AnswerCount between 1 and 2 then 'low-answers'
+    when r.AnswerCount between 3 and 5 then 'mid-answers'
+    else 'high-answers'
+  end as answer_band
+from reagg r
+left join accepted_enriched ae on ae.QuestionId = r.QuestionId
+where
+  coalesce(r.ViewCount, 0) >= 0
+  and (r.Score is null or r.Score >= -5)
+  and (r.first_closed_date is null or r.reopen_events >= 0)
+order by
+  r.dr_total_upvotes asc,
+  r.viewcount_decile asc,
+  r.QuestionId desc
+limit 500;

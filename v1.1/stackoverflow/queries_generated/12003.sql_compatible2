@@ -1,0 +1,161 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.CreationDate) AS UserPostRank,
+        DENSE_RANK() OVER (ORDER BY P.Score DESC) AS ScoreRank,
+        NTILE(4) OVER (ORDER BY P.ViewCount DESC) AS ViewQuartile
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2)
+),
+TopUsers AS (
+    SELECT 
+        OwnerUserId,
+        COUNT(Id) AS PostCount,
+        SUM(Score) AS TotalScore
+    FROM 
+        RankedPosts
+    WHERE 
+        UserPostRank <= 3
+    GROUP BY 
+        OwnerUserId
+    HAVING 
+        COUNT(Id) > 1
+),
+TagStats AS (
+    SELECT 
+        T.TagName,
+        COUNT(P.Id) AS PostCount,
+        AVG(P.Score) AS AvgScore
+    FROM 
+        Tags T
+    JOIN 
+        Posts P ON T.WikiPostId = P.Id OR T.ExcerptPostId = P.Id
+    GROUP BY 
+        T.TagName
+),
+UserActivity AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        COUNT(DISTINCT P.Id) AS PostCount,
+        COUNT(DISTINCT C.Id) AS CommentCount,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount
+    FROM 
+        Users U
+    LEFT JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN 
+        Comments C ON U.Id = C.UserId
+    LEFT JOIN 
+        Votes V ON U.Id = V.UserId
+    GROUP BY 
+        U.Id, U.DisplayName
+),
+PostHistorySummary AS (
+    SELECT 
+        P.Id AS PostId,
+        COUNT(PH.Id) AS HistoryCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 5 THEN PH.CreationDate END) AS LastEditDate
+    FROM 
+        Posts P
+    LEFT JOIN 
+        PostHistory PH ON P.Id = PH.PostId
+    GROUP BY 
+        P.Id
+),
+ComplexPredicate AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Tags,
+        P.Score,
+        P.ViewCount,
+        U.DisplayName AS OwnerName,
+        PH.HistoryCount,
+        PH.LastEditDate
+    FROM 
+        Posts P
+    JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    JOIN 
+        PostHistorySummary PH ON P.Id = PH.PostId
+    WHERE 
+        P.Score > 10 
+        AND P.ViewCount > 1000 
+        AND (P.Tags LIKE '%sql%' OR P.Tags LIKE '%database%')
+        AND PH.LastEditDate > (DATE '2024-10-01' - INTERVAL '30' DAY)
+)
+SELECT 
+    RP.Id,
+    RP.PostTypeId,
+    RP.CreationDate,
+    RP.Score,
+    RP.ViewCount,
+    RP.OwnerUserId,
+    RP.OwnerDisplayName,
+    RP.UserPostRank,
+    RP.ScoreRank,
+    RP.ViewQuartile,
+    UA.PostCount AS UserPostCount,
+    UA.CommentCount,
+    UA.UpVoteCount,
+    UA.DownVoteCount,
+    TS.TagName,
+    TS.PostCount AS TagPostCount,
+    TS.AvgScore,
+    CP.Title,
+    CP.Tags,
+    CP.Score AS ComplexScore,
+    CP.ViewCount AS ComplexViewCount,
+    CP.OwnerName,
+    CP.HistoryCount,
+    CP.LastEditDate
+FROM 
+    RankedPosts RP
+JOIN 
+    TopUsers TU ON RP.OwnerUserId = TU.OwnerUserId
+JOIN 
+    TagStats TS ON RP.Tags LIKE CONCAT('%', TS.TagName, '%')
+JOIN 
+    UserActivity UA ON RP.OwnerUserId = UA.Id
+JOIN 
+    ComplexPredicate CP ON RP.Id = CP.Id
+GROUP BY
+    RP.Id,
+    RP.PostTypeId,
+    RP.CreationDate,
+    RP.Score,
+    RP.ViewCount,
+    RP.OwnerUserId,
+    RP.OwnerDisplayName,
+    RP.UserPostRank,
+    RP.ScoreRank,
+    RP.ViewQuartile,
+    UA.PostCount,
+    UA.CommentCount,
+    UA.UpVoteCount,
+    UA.DownVoteCount,
+    TS.TagName,
+    TS.PostCount,
+    TS.AvgScore,
+    CP.Title,
+    CP.Tags,
+    CP.Score,
+    CP.ViewCount,
+    CP.OwnerName,
+    CP.HistoryCount,
+    CP.LastEditDate
+ORDER BY 
+    RP.Score DESC, 
+    RP.CreationDate;

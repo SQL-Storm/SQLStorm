@@ -1,0 +1,144 @@
+WITH
+RecentQuestions AS (
+    SELECT
+        p.Id          AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Score       AS QuestionScore,
+        p.ViewCount,
+        COALESCE(p.AnswerCount,0)   AS AnswerCount,
+        COALESCE(p.CommentCount,0)  AS CommentCount,
+        COALESCE(p.FavoriteCount,0) AS FavoriteCount,
+        p.Tags,
+        p.OwnerUserId
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+),
+
+TagCountCTE AS (
+    SELECT
+        r.QuestionId,
+        COUNT(DISTINCT TRIM(BOTH '>' FROM tag)) AS TagCount
+    FROM RecentQuestions r,
+         -- split tags stored like '<tag1><tag2>' by replacing '><' with a delimiter then splitting
+         UNNEST(string_to_array(
+             REPLACE(REPLACE(r.Tags, '><', '||'), '<', ''), '||'
+         )) AS tag
+    WHERE tag <> ''
+    GROUP BY r.QuestionId
+),
+
+DuplicateCTE AS (
+    SELECT
+        pl.RelatedPostId AS QuestionId,
+        pl.PostId        AS DuplicateOf
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+),
+
+UserAvgVote AS (
+    SELECT
+        u.Id         AS UserId,
+        AVG(v.VoteTypeId) AS AvgVote
+    FROM Users u
+    LEFT JOIN Votes v
+      ON v.UserId = u.Id
+    GROUP BY u.Id
+),
+
+AnswerScore AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1
+                 WHEN v.VoteTypeId = 3 THEN -1
+                 ELSE 0 END) AS AnswerScore
+    FROM Posts a
+    JOIN Votes v
+      ON v.PostId = a.Id
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+
+Combined AS (
+    SELECT
+        r.QuestionId,
+        r.Title,
+        r.CreationDate,
+        r.QuestionScore,
+        r.ViewCount,
+        r.AnswerCount,
+        r.CommentCount,
+        r.FavoriteCount,
+        COALESCE(t.TagCount,0)                       AS TagCount,
+        COALESCE(u.AvgVote,0)                       AS AvgOwnerVote,
+        a.AnswerScore,
+        d.DuplicateOf,
+        COALESCE(r.QuestionScore,0)
+        + COALESCE(u.AvgVote,0)
+        + COALESCE(a.AnswerScore,0)                AS CombinedScore
+    FROM RecentQuestions r
+    LEFT JOIN TagCountCTE t
+      ON t.QuestionId = r.QuestionId
+    LEFT JOIN UserAvgVote u
+      ON u.UserId = r.OwnerUserId
+    LEFT JOIN AnswerScore a
+      ON a.QuestionId = r.QuestionId
+    LEFT JOIN DuplicateCTE d
+      ON d.QuestionId = r.QuestionId
+),
+
+TopByViews AS (
+    SELECT QuestionId, ViewCount FROM Combined
+    ORDER BY ViewCount DESC
+    LIMIT 50
+),
+
+TopByAnswers AS (
+    SELECT QuestionId, AnswerCount FROM Combined
+    ORDER BY AnswerCount DESC
+    LIMIT 50
+),
+
+IntersectCTE AS (
+    SELECT QuestionId FROM TopByViews
+    INTERSECT
+    SELECT QuestionId FROM TopByAnswers
+),
+
+FinalCte AS (
+    SELECT c.QuestionId,
+           c.Title,
+           c.CreationDate,
+           c.QuestionScore,
+           c.ViewCount,
+           c.AnswerCount,
+           c.CommentCount,
+           c.FavoriteCount,
+           c.TagCount,
+           c.AvgOwnerVote,
+           c.AnswerScore,
+           c.DuplicateOf,
+           c.CombinedScore
+    FROM Combined c
+    WHERE c.QuestionId IN (SELECT QuestionId FROM IntersectCTE)
+)
+
+SELECT
+    fc.QuestionId,
+    fc.Title,
+    fc.CombinedScore,
+    fc.ViewCount,
+    fc.AnswerCount,
+    fc.TagCount,
+    fc.AvgOwnerVote,
+    fc.AnswerScore,
+    fc.DuplicateOf,
+    ROW_NUMBER() OVER (
+        ORDER BY fc.CombinedScore DESC,
+                 fc.AnswerCount DESC,
+                 fc.ViewCount DESC
+    ) AS Rank
+FROM FinalCte fc
+ORDER BY fc.CombinedScore DESC,
+         fc.AnswerCount DESC;

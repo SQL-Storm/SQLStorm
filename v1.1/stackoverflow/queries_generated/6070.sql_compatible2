@@ -1,0 +1,142 @@
+WITH
+RecentActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.PostTypeId,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS rn_owner_activity
+  FROM Posts p
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days'
+),
+TagStats AS (
+  SELECT
+    t.TagName,
+    t.Count AS TagCount,
+    u.Id AS UserId,
+    u.DisplayName AS UserName,
+    u.Reputation,
+    COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotesReceived,
+    COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotesReceived
+  FROM Tags t
+  JOIN Posts p ON p.Id = t.ExcerptPostId
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN Users u ON u.Id = p.OwnerUserId
+  WHERE t.IsModeratorOnly = FALSE
+  GROUP BY t.TagName, t.Count, u.Id, u.DisplayName, u.Reputation
+),
+AmbiguousLinks AS (
+  SELECT
+    pl.Id,
+    pl.PostId,
+    pl.RelatedPostId,
+    lt.Name AS LinkTypeName
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+  WHERE pl.RelatedPostId IS NOT NULL
+    AND pl.PostId <> pl.RelatedPostId
+),
+ActiveQuestions AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.AnswerCount,
+    ROW_NUMBER() OVER (ORDER BY p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.ClosedDate IS NULL
+    AND p.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days'
+),
+ComplexSummary AS (
+  SELECT
+    aq.Id AS QuestionId,
+    aq.Title AS QuestionTitle,
+    uq.DisplayName AS OwnerName,
+    uq.Reputation AS OwnerRep,
+    aq.Score AS QuestionScore,
+    aq.ViewCount AS Views,
+    aq.AnswerCount,
+    qc.LastCloseReason,
+    COALESCE(vr.avg_ver, 0) AS AvgRevisionLatency
+  FROM ActiveQuestions aq
+  LEFT JOIN Users uq ON uq.Id = aq.OwnerUserId
+  LEFT JOIN (
+    SELECT p.Id, AVG((EXTRACT(EPOCH FROM (p.LastEditDate - p.CreationDate)) / 3600.0)) AS avg_ver
+    FROM Posts p
+    GROUP BY p.Id
+  ) vr ON vr.Id = aq.Id
+  LEFT JOIN (
+    SELECT ph.PostId, ph.Comment AS LastCloseReason
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+    -- keep only the latest per post to avoid joining a non-aggregated ordered subquery
+    GROUP BY ph.PostId, ph.Comment, ph.CreationDate
+  ) qc ON qc.PostId = aq.Id
+)
+SELECT
+  cs.QuestionId,
+  cs.QuestionTitle,
+  cs.OwnerName,
+  cs.OwnerRep,
+  cs.QuestionScore,
+  cs.Views,
+  cs.AnswerCount,
+  cs.LastCloseReason,
+  cs.AvgRevisionLatency,
+  ar.Title AS RecentTitle,
+  ar.LastActivityDate AS RecentActivityDate,
+  ar.rn_owner_activity,
+  al.Id AS AmbiguousLinkId,
+  al.RelatedPostId,
+  al.LinkTypeName,
+  ts.TagName,
+  ts.TagCount,
+  ts.UserId,
+  ts.UserName,
+  ts.Reputation AS TagUserReputation,
+  ts.UpVotesReceived,
+  ts.DownVotesReceived
+FROM ComplexSummary cs
+LEFT JOIN RecentActivity ar ON ar.PostId = cs.QuestionId
+LEFT JOIN AmbiguousLinks al ON al.PostId = cs.QuestionId
+LEFT JOIN TagStats ts ON ts.TagName = ANY(
+  -- replace angle brackets and split into words in a dialect-neutral way:
+  regexp_split_to_array(replace(replace(cs.QuestionTitle, '<', ''), '>', ''), E'\\s+')
+)
+WHERE cs.AvgRevisionLatency IS NOT NULL
+GROUP BY
+  cs.QuestionId,
+  cs.QuestionTitle,
+  cs.OwnerName,
+  cs.OwnerRep,
+  cs.QuestionScore,
+  cs.Views,
+  cs.AnswerCount,
+  cs.LastCloseReason,
+  cs.AvgRevisionLatency,
+  ar.Title,
+  ar.LastActivityDate,
+  ar.rn_owner_activity,
+  al.Id,
+  al.RelatedPostId,
+  al.LinkTypeName,
+  ts.TagName,
+  ts.TagCount,
+  ts.UserId,
+  ts.UserName,
+  ts.Reputation,
+  ts.UpVotesReceived,
+  ts.DownVotesReceived
+ORDER BY cs.Views DESC, cs.QuestionScore DESC
+LIMIT 100;

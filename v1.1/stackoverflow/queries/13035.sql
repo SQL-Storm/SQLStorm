@@ -1,0 +1,88 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        MAX(u.LastAccessDate) AS LastAccessDate
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    WHERE
+        u.Reputation > 1000
+        AND u.CreationDate >= DATE '2024-10-01' - INTERVAL '1' YEAR
+    GROUP BY
+        u.Id,
+        u.DisplayName
+),
+HighlyActiveUsers AS (
+    SELECT
+        UserId,
+        DisplayName,
+        QuestionCount,
+        AnswerCount,
+        UpVoteCount,
+        DownVoteCount,
+        LastAccessDate,
+        RANK() OVER (ORDER BY (UpVoteCount - DownVoteCount) DESC) AS UserRank
+    FROM
+        UserActivity
+    WHERE
+        (QuestionCount + AnswerCount) > 10
+),
+PostTags AS (
+    SELECT
+        p.Id AS PostId,
+        trim(t.tag) AS TagName
+    FROM
+        Posts p
+    CROSS JOIN LATERAL (
+        SELECT regexp_split_to_table(
+            substring(p.Tags FROM 2 FOR length(p.Tags) - 2),
+            '><'
+        ) AS tag
+    ) t
+    WHERE p.Tags IS NOT NULL
+)
+SELECT
+    hau.DisplayName,
+    hau.QuestionCount,
+    hau.AnswerCount,
+    hau.UpVoteCount,
+    hau.DownVoteCount,
+    COALESCE(NULLIF(ph.Comment, ''), 'No close reason') AS CloseReason,
+    ROW_NUMBER() OVER (PARTITION BY hau.UserId ORDER BY p.CreationDate DESC) AS PostRow,
+    p.Title,
+    STRING_AGG(pt.TagName, ', ' ORDER BY pt.TagName) AS Tags,
+    hau.UserRank
+FROM
+    HighlyActiveUsers hau
+JOIN
+    Posts p ON hau.UserId = p.OwnerUserId
+LEFT JOIN
+    PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 10
+LEFT JOIN
+    PostTags pt ON p.Id = pt.PostId
+WHERE
+    hau.UserRank <= 10
+    AND (p.ClosedDate IS NULL OR ph.CreationDate > p.ClosedDate - INTERVAL '3' MONTH)
+GROUP BY
+    hau.UserId,
+    hau.DisplayName,
+    hau.QuestionCount,
+    hau.AnswerCount,
+    hau.UpVoteCount,
+    hau.DownVoteCount,
+    ph.Comment,
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    hau.UserRank
+ORDER BY
+    hau.UserRank,
+    PostRow DESC;

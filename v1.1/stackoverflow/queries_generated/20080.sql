@@ -1,0 +1,119 @@
+-- {"query": "20080.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1574} 
+
+WITH UserActivitySummary AS (
+    -- CTE 1: Aggregate user-specific metrics from posts, focusing on answers.
+    -- This includes counts, average scores, and the ratio of accepted answers.
+    SELECT
+        p.OwnerUserId,
+        COUNT(p.Id) AS TotalAnswers,
+        AVG(p.Score) AS AverageAnswerScore,
+        SUM(CASE WHEN q.AcceptedAnswerId = p.Id THEN 1 ELSE 0 END) AS AcceptedAnswersCount,
+        CAST(SUM(CASE WHEN q.AcceptedAnswerId = p.Id THEN 1 ELSE 0 END) AS REAL) / COUNT(p.Id) AS AcceptedRatio,
+        MAX(p.LastActivityDate) AS LastAnswerActivity
+    FROM Posts AS p
+    JOIN Posts AS q ON p.ParentId = q.Id
+    WHERE p.PostTypeId = 2 -- Answers
+      AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+    HAVING COUNT(p.Id) > 10
+),
+UserCurationStats AS (
+    -- CTE 2: Consolidate different types of curation activities (edits, comments, votes) using UNION ALL.
+    -- This provides a broader view of a user's engagement beyond just posting.
+    SELECT
+        UserId,
+        SUM(EditCount) AS TotalEdits,
+        SUM(CommentCount) AS TotalComments,
+        SUM(UpVotes) AS TotalUpVotesGiven,
+        SUM(DownVotes) AS TotalDownVotesGiven
+    FROM (
+        SELECT UserId, COUNT(Id) AS EditCount, 0 AS CommentCount, 0 AS UpVotes, 0 AS DownVotes
+        FROM PostHistory
+        WHERE PostHistoryTypeId IN (4, 5, 6) AND UserId IS NOT NULL -- Title, Body, Tag edits
+        GROUP BY UserId
+        UNION ALL
+        SELECT UserId, 0, COUNT(Id), 0, 0
+        FROM Comments
+        WHERE UserId IS NOT NULL
+        GROUP BY UserId
+        UNION ALL
+        SELECT UserId, 0, 0,
+               SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END),
+               SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END)
+        FROM Votes
+        WHERE VoteTypeId IN (2, 3) AND UserId IS NOT NULL
+        GROUP BY UserId
+    ) AS CurationActivities
+    GROUP BY UserId
+),
+UserBadgeRanks AS (
+    -- CTE 3: Use window functions to analyze badge acquisition patterns.
+    -- This identifies the first gold badge and the time elapsed since the previous badge.
+    SELECT
+        UserId,
+        Name,
+        Date,
+        LAG(Date, 1) OVER (PARTITION BY UserId ORDER BY Date) AS PreviousBadgeDate,
+        EXTRACT(EPOCH FROM (Date - LAG(Date, 1) OVER (PARTITION BY UserId ORDER BY Date))) / 86400.0 AS DaysBetweenBadges
+    FROM Badges
+    WHERE Class = 1 -- Gold badges
+)
+-- Main Query: Combine user data with aggregated stats to create a comprehensive "Power User" report.
+-- This involves complex joins, calculations, a correlated subquery, and advanced filtering.
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Age AS UserAccountAgeInDays,
+    uas.TotalAnswers,
+    uas.AcceptedRatio,
+    ucs.TotalEdits,
+    ucs.TotalComments,
+    (
+        -- Correlated subquery: Calculate the average view count of questions the user answered.
+        SELECT AVG(q_sub.ViewCount)
+        FROM Posts p_sub
+        JOIN Posts q_sub ON p_sub.ParentId = q_sub.Id
+        WHERE p_sub.OwnerUserId = u.Id AND p_sub.PostTypeId = 2
+    ) AS AvgViewCountOfAnsweredQuestions,
+    COALESCE(
+        REPLACE(
+            SUBSTRING(u.WebsiteUrl FROM ':\/\/(?:www\.)?([^\/]+)'),
+            '.com', ''
+        ),
+        'NO_WEBSITE'
+    ) AS CleanedWebsiteDomain,
+    -- A complex, weighted "Engagement Score" based on various user metrics.
+    -- NULLs are handled with COALESCE to ensure the calculation is robust.
+    (
+        LOG(u.Reputation + 1) * 2
+        + COALESCE(uas.AverageAnswerScore, 0) * 1.5
+        + COALESCE(uas.AcceptedRatio, 0) * 100
+        + LOG(COALESCE(ucs.TotalEdits, 0) + 1) * 1.2
+        + LOG(COALESCE(ucs.TotalUpVotesGiven, 0) - COALESCE(ucs.TotalDownVotesGiven, 0) + 1)
+    ) AS EngagementScore,
+    ubr.Name AS FirstGoldBadgeName,
+    ubr.DaysBetweenBadges AS DaysToFirstGoldBadge,
+    -- A CASE statement to categorize users into tiers based on their engagement.
+    CASE
+        WHEN u.Reputation > 100000 AND uas.AcceptedRatio > 0.5 THEN 'Community Pillar'
+        WHEN u.Reputation > 20000 AND ucs.TotalEdits > 500 THEN 'Dedicated Curator'
+        WHEN uas.TotalAnswers > 100 THEN 'Prolific Answerer'
+        ELSE 'Active Contributor'
+    END AS UserTier,
+    -- Final ranking of users based on the calculated engagement score.
+    DENSE_RANK() OVER (ORDER BY (LOG(u.Reputation + 1) * 2
+        + COALESCE(uas.AverageAnswerScore, 0) * 1.5
+        + COALESCE(uas.AcceptedRatio, 0) * 100
+        + LOG(COALESCE(ucs.TotalEdits, 0) + 1) * 1.2
+        + LOG(COALESCE(ucs.TotalUpVotesGiven, 0) - COALESCE(ucs.TotalDownVotesGiven, 0) + 1)) DESC) AS OverallRank
+FROM Users AS u
+JOIN UserActivitySummary AS uas ON u.Id = uas.OwnerUserId
+LEFT JOIN UserCurationStats AS ucs ON u.Id = ucs.UserId
+LEFT JOIN UserBadgeRanks AS ubr ON u.Id = ubr.UserId AND ubr.PreviousBadgeDate IS NULL -- Identifies the first gold badge
+WHERE u.Reputation > (SELECT AVG(Reputation) + STDDEV(Reputation) FROM Users) -- Filter for users with reputation > 1 standard deviation above average
+  AND u.LastAccessDate > (NOW() - INTERVAL '1 year')
+  AND u.AboutMe IS NOT NULL
+  AND u.Id > 0 -- Exclude community user
+ORDER BY OverallRank, EngagementScore DESC, u.Reputation DESC
+LIMIT 500;

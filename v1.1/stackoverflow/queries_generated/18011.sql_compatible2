@@ -1,0 +1,140 @@
+WITH RankedPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId,
+        u.DisplayName AS EditorDisplayName,
+        ph.Comment,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    LEFT JOIN Users u ON ph.UserId = u.Id
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+),
+PostEditSummary AS (
+    SELECT
+        re.PostId,
+        re.EditorDisplayName,
+        re.CreationDate AS LastEditDate,
+        re.Comment AS LastEditComment,
+        LAG(re.EditorDisplayName, 1, 'No Previous Editor') OVER (PARTITION BY re.PostId ORDER BY re.CreationDate) AS PreviousEditorDisplayName,
+        CASE
+            WHEN LAG(re.UserId, 1) OVER (PARTITION BY re.PostId ORDER BY re.CreationDate) = re.UserId THEN 'Same User'
+            ELSE 'Different User'
+        END AS EditUserChangeIndicator
+    FROM RankedPostEdits re
+    WHERE re.rn = 1
+),
+QuestionDetails AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title AS QuestionTitle,
+        p.Score AS QuestionScore,
+        p.AnswerCount,
+        p.ViewCount AS QuestionViewCount,
+        p.CreationDate AS QuestionCreationDate,
+        u_owner.DisplayName AS QuestionOwnerDisplayName,
+        p.FavoriteCount,
+        p.ClosedDate,
+        COUNT(c.Id) AS CommentCountOnQuestion,
+        MAX(CASE WHEN pt.Name = 'Question' THEN 1 ELSE 0 END) AS IsQuestionType
+    FROM Posts p
+    LEFT JOIN Users u_owner ON p.OwnerUserId = u_owner.Id
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY
+        p.Id, p.Title, p.Score, p.AnswerCount, p.ViewCount, p.CreationDate, u_owner.DisplayName, p.FavoriteCount, p.ClosedDate
+),
+AnswerDetailsFixed AS (
+    SELECT
+        ad.QuestionId,
+        ad.TotalAnswers,
+        SUM(CASE WHEN a.Id = q.QuestionId THEN 1 ELSE 0 END) AS IsAcceptedAnswer
+    FROM (
+        SELECT p.ParentId AS QuestionId, COUNT(p.Id) AS TotalAnswers
+        FROM Posts p
+        WHERE p.PostTypeId = 2
+        GROUP BY p.ParentId
+    ) ad
+    LEFT JOIN Posts a ON a.ParentId = ad.QuestionId AND a.PostTypeId = 2
+    LEFT JOIN QuestionDetails q ON ad.QuestionId = q.QuestionId
+    GROUP BY ad.QuestionId, ad.TotalAnswers
+)
+SELECT
+    qd.QuestionId,
+    qd.QuestionTitle,
+    qd.QuestionScore,
+    qd.QuestionCreationDate,
+    qd.QuestionOwnerDisplayName,
+    qd.QuestionViewCount,
+    qd.FavoriteCount,
+    adf.TotalAnswers,
+    adf.IsAcceptedAnswer,
+    qd.CommentCountOnQuestion,
+    pes.LastEditDate AS LastQuestionEditDate,
+    pes.EditorDisplayName AS LastQuestionEditor,
+    pes.LastEditComment AS LastQuestionEditComment,
+    pes.EditUserChangeIndicator,
+    COALESCE(pht.Name, 'Unknown') AS LastPostHistoryType,
+    CASE
+        WHEN qd.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN qd.ClosedDate IS NULL AND adf.TotalAnswers > 100 THEN 'High Answer Volume'
+        WHEN qd.QuestionScore > 1000 THEN 'High Score'
+        ELSE 'Standard'
+    END AS QuestionCategorization,
+    CASE
+        WHEN u_last_editor.DisplayName IS NULL THEN 'Community'
+        ELSE u_last_editor.DisplayName
+    END AS LastEditorDisplayName,
+    CONCAT(qd.QuestionOwnerDisplayName, ' (', COALESCE(u_owner.Reputation,0), ')') AS OwnerReputation,
+    SUBSTRING(REPLACE(REPLACE(qd.QuestionTitle, '?', '!'), ' ', '-'), 1, 50) AS ProcessedTitle,
+    CASE
+        WHEN EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.PostId = qd.QuestionId AND pl.LinkTypeId = 3) THEN 'Has Duplicate Link'
+        ELSE 'No Duplicate Link'
+    END AS DuplicateStatus
+FROM QuestionDetails qd
+JOIN AnswerDetailsFixed adf ON qd.QuestionId = adf.QuestionId
+LEFT JOIN PostEditSummary pes ON qd.QuestionId = pes.PostId
+LEFT JOIN Posts p_last_edit ON qd.QuestionId = p_last_edit.Id AND p_last_edit.LastEditDate = pes.LastEditDate
+LEFT JOIN Users u_last_editor ON p_last_edit.LastEditorUserId = u_last_editor.Id
+LEFT JOIN PostHistory ph_last ON qd.QuestionId = ph_last.PostId AND ph_last.Id = (
+    SELECT MAX(ph_inner.Id)
+    FROM PostHistory ph_inner
+    WHERE ph_inner.PostId = qd.QuestionId
+      AND ph_inner.PostHistoryTypeId IN (4, 5, 6)
+)
+LEFT JOIN PostHistoryTypes pht ON ph_last.PostHistoryTypeId = pht.Id
+LEFT JOIN Users u_owner ON qd.QuestionOwnerDisplayName = u_owner.DisplayName
+WHERE qd.QuestionScore > 0
+  AND qd.QuestionCreationDate BETWEEN TIMESTAMP '2023-01-01' AND TIMESTAMP '2023-12-31'
+  AND qd.AnswerCount > 0
+  AND (qd.ClosedDate IS NULL OR qd.ClosedDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days'))
+UNION ALL
+SELECT
+    NULL AS QuestionId,
+    NULL AS QuestionTitle,
+    NULL AS QuestionScore,
+    NULL AS QuestionCreationDate,
+    NULL AS QuestionOwnerDisplayName,
+    NULL AS QuestionViewCount,
+    NULL AS FavoriteCount,
+    NULL AS TotalAnswers,
+    NULL AS IsAcceptedAnswer,
+    COUNT(c.Id) AS CommentCountOnQuestion,
+    NULL AS LastQuestionEditDate,
+    NULL AS LastQuestionEditor,
+    NULL AS LastQuestionEditComment,
+    NULL AS EditUserChangeIndicator,
+    NULL AS LastPostHistoryType,
+    'Comment Heavy' AS QuestionCategorization,
+    NULL AS LastEditorDisplayName,
+    NULL AS OwnerReputation,
+    NULL AS ProcessedTitle,
+    NULL AS DuplicateStatus
+FROM Comments c
+LEFT JOIN Posts p ON c.PostId = p.Id
+WHERE p.PostTypeId = 1 AND c.UserId IS NULL
+GROUP BY p.Id
+HAVING COUNT(c.Id) > 500
+ORDER BY QuestionScore DESC NULLS LAST, CommentCountOnQuestion DESC NULLS LAST;

@@ -1,0 +1,105 @@
+-- {"query": "20051.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1370} 
+WITH UserMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.AboutMe,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AvgAnswerScore,
+        MAX(p.ViewCount) FILTER (WHERE p.PostTypeId = 1) AS MaxQuestionViewCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1500 AND u.AboutMe IS NOT NULL AND LENGTH(u.AboutMe) > 100
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.AboutMe
+),
+AnswerTimeStats AS (
+    SELECT
+        OwnerUserId,
+        AVG(EXTRACT(EPOCH FROM (AnswerCreationDate - QuestionCreationDate))) AS AvgTimeToAnswerSeconds,
+        MIN(EXTRACT(EPOCH FROM (AnswerCreationDate - LAG(AnswerCreationDate, 1) OVER (PARTITION BY OwnerUserId ORDER BY AnswerCreationDate)))) AS MinSecondsBetweenAnswers
+    FROM (
+        SELECT
+            a.OwnerUserId,
+            a.CreationDate AS AnswerCreationDate,
+            q.CreationDate AS QuestionCreationDate
+        FROM Posts a
+        JOIN Posts q ON a.ParentId = q.Id
+        WHERE a.PostTypeId = 2 AND a.OwnerUserId IS NOT NULL
+    ) AS AnswerDetails
+    GROUP BY OwnerUserId
+),
+UserEngagement AS (
+    SELECT
+        v.UserId,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesCast,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesCast,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoritesCast,
+        (SELECT STRING_AGG(c.Text, ' || ') FROM (SELECT Text FROM Comments c WHERE c.UserId = v.UserId ORDER BY Score DESC, CreationDate DESC LIMIT 3) c) AS TopCommentSamples
+    FROM Votes v
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+    HAVING COUNT(v.Id) > 50
+)
+SELECT
+    um.DisplayName,
+    um.Reputation,
+    um.QuestionCount,
+    um.AnswerCount,
+    um.TotalScore,
+    um.GoldBadges,
+    ats.AvgTimeToAnswerSeconds,
+    ue.UpVotesCast,
+    ue.DownVotesCast,
+    (
+        SELECT crt.Name
+        FROM PostHistory ph
+        JOIN CloseReasonTypes crt ON CAST(ph.Comment AS smallint) = crt.Id
+        WHERE ph.PostHistoryTypeId = 10 -- Post Closed
+          AND ph.PostId IN (SELECT Id FROM Posts p WHERE p.OwnerUserId = um.UserId AND p.PostTypeId = 1)
+        GROUP BY crt.Name
+        ORDER BY COUNT(*) DESC
+        LIMIT 1
+    ) AS MostCommonCloseReasonOnQuestions,
+    CASE
+        WHEN um.Location LIKE '%USA%' OR um.Location LIKE '%United States%' THEN 'USA'
+        WHEN um.Location LIKE '%UK%' OR um.Location LIKE '%United Kingdom%' THEN 'UK'
+        WHEN um.Location LIKE '%Germany%' THEN 'Germany'
+        WHEN um.Location LIKE '%India%' THEN 'India'
+        ELSE 'Other'
+    END AS UserRegion,
+    (um.Reputation * 0.2 + um.TotalScore * 0.3 + um.AnswerCount * 10 + um.QuestionCount * 5 + um.GoldBadges * 100 + ue.UpVotesCast * 0.5 - ue.DownVotesCast * 2) / (EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - um.CreationDate)) / 86400.0) AS EngagementScore,
+    DENSE_RANK() OVER (PARTITION BY (CASE
+        WHEN um.Location LIKE '%USA%' OR um.Location LIKE '%United States%' THEN 'USA'
+        WHEN um.Location LIKE '%UK%' OR um.Location LIKE '%United Kingdom%' THEN 'UK'
+        WHEN um.Location LIKE '%Germany%' THEN 'Germany'
+        WHEN um.Location LIKE '%India%' THEN 'India'
+        ELSE 'Other'
+    END) ORDER BY um.Reputation DESC) AS RegionalRank,
+    ue.TopCommentSamples
+FROM UserMetrics um
+JOIN UserEngagement ue ON um.UserId = ue.UserId
+LEFT JOIN AnswerTimeStats ats ON um.UserId = ats.OwnerUserId
+WHERE
+    um.AnswerCount > um.QuestionCount
+    AND um.GoldBadges > 0
+    AND ats.AvgTimeToAnswerSeconds IS NOT NULL
+    AND ats.AvgTimeToAnswerSeconds < 86400 -- Avg answer time less than a day
+    AND EXISTS (
+        SELECT 1
+        FROM Posts p
+        WHERE p.OwnerUserId = um.UserId
+          AND p.PostTypeId = 2 -- Answer
+          AND p.Id = (SELECT AcceptedAnswerId FROM Posts WHERE Id = p.ParentId)
+    )
+ORDER BY EngagementScore DESC, RegionalRank ASC
+LIMIT 100;

@@ -1,0 +1,158 @@
+-- {"query": "1436.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1587} 
+WITH RecursiveUserLabels AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        CONCAT(u.DisplayName, COALESCE(' [' || LOCATION || ']', '') ) AS Label,
+        1 AS Level
+    FROM Users u
+    WHERE u.Reputation > 1000
+
+    UNION ALL
+
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        r.Label || ' -> Ref:' || COALESCE(NULLIF(u.DisplayName,''), '[anon]'),
+        r.Level + 1
+    FROM Users u
+    INNER JOIN RecursiveUserLabels r ON u.Id = r.Id - 1
+    WHERE r.Level < 3
+), 
+QuestionWithAnswerAcceptStatus AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        COALESCE(a.Id, 0) AS AnswerId,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY a.Score DESC, a.CreationDate DESC) AS AnswerRank,
+        a.Score AS AnswerScore,
+        a.OwnerUserId AS AnswerOwner,
+        CASE 
+            WHEN a.Id = p.AcceptedAnswerId THEN 1
+            ELSE 0
+        END AS IsAccepted
+    FROM Posts p
+    LEFT JOIN Posts a ON (a.ParentId = p.Id AND a.PostTypeId = 2 AND p.PostTypeId = 1)
+    WHERE p.PostTypeId = 1
+), 
+AnswerAggregates AS (
+    SELECT 
+        p.ParentId,
+        COUNT(*) AS TotalAnswers,
+        SUM(CASE WHEN p.Id = po.AcceptedAnswerId THEN 1 ELSE 0 END) AS TotalAcceptedUnderline
+    FROM Posts p
+    INNER JOIN Posts po ON po.Id = p.ParentId AND po.PostTypeId = 1 
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+),
+UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END),0) AS UpVotesReceived,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END),0) AS DownVotesReceived,
+        MAX(b.Date) AS LastBadgeDate,
+        COUNT(DISTINCT b.Id) AS BadgesCount
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TaggedQuestions AS (
+ SELECT
+   question.Id, question.Title,
+   unnest(string_to_array(substring(question.Tags from 2 for length(question.Tags) - 2), '><')) AS single_tag
+ FROM Posts question
+ WHERE question.PostTypeId = 1 AND question.Tags IS NOT NULL
+),
+HighlyTaggedQuestions AS (
+ SELECT single_tag, COUNT(DISTINCT Id) as QCount
+ FROM TaggedQuestions
+ GROUP BY single_tag
+ HAVING COUNT(DISTINCT Id) > 20
+),
+UserBadgingRate AS (
+    SELECT 
+        b.UserId,
+        COUNT(*)::DECIMAL / NULLIF(DATE_PART('day', CURRENT_TIMESTAMP - MIN(Date)),0) AS BadgingRatePerDay
+    FROM Badges b
+    GROUP BY b.UserId
+)
+
+SELECT 
+    q.Id AS QuestionId,
+    LEFT(q.Title, 60) AS QuestionSnippet,
+    us.DisplayName AS Asker,
+    us.Reputation AS AskerRep,
+    us.UpVotesReceived,
+    us.DownVotesReceived,
+    us.BadgesCount,
+    us.LastBadgeDate,
+    qa.TotalAnswers,
+    COALESCE(MAX(qwar.AnswerScore), 0) AS MaxAnswerScore,
+    COALESCE(SUM(qa.IsAccepted), 0) AS NumAccepted,
+    COALESCE(AVG(v.Score), 0) AS AvgVotesOnQuestion,
+    htQQs.QCount AS PopularTagCount,
+    ub.BadgingRatePerDay,
+    STRING_AGG(DISTINCT CONCAT(tg.single_tag, '(', htQQs.QCount,')'), ', ') 
+       OVER (PARTITION BY q.Id) AS PopularTags,
+    COUNT(c.Id) OVER (PARTITION BY q.Id) AS CommentCount,
+    PERCENT_RANK() OVER (PARTITION BY us.Id ORDER BY us.Reputation DESC) AS AskersRepPercentRank,
+    
+    -- Checking existence via correlated in subquery: recent comments >= 2 in last week?
+    EXISTS (
+        SELECT 1 FROM Comments c2
+        WHERE c2.PostId = q.Id
+        AND c2.CreationDate >= CURRENT_TIMESTAMP - INTERVAL '7 days'
+        HAVING COUNT(c2.Id) >= 2
+    ) AS HasRecentCommentsGE2,
+
+    -- Windowed COUNT Badge Class Silver and above for the user
+    COUNT(CASE WHEN b.Class IN (1,2) THEN 1 ELSE NULL END) OVER (PARTITION BY us.Id) AS GoldSilverBadgesNumber,
+
+    -- complexo NULL check for post closed: if ClosedDate is null else categorize a closed post's reason if exists in post history subquery
+    COALESCE (
+        (SELECT cht.Name FROM CloseReasonTypes cht
+         JOIN PostHistory ph ON CAST(ph.Comment AS int) = cht.Id
+         WHERE ph.PostId = q.Id AND ph.PostHistoryTypeId = 10 LIMIT 1),
+         'Open'
+         ) AS ClosedReason,
+
+    -- Complex string expression with NULLs: create summary EX: "Jack (1234)[New York]" or "Anonymous(?)"
+    CONCAT(COALESCE(us.DisplayName,'Anonymous'), ' (', COALESCE(us.Reputation::text,'?'), ')', 
+       CASE 
+         WHEN us.Location IS NOT NULL THEN CONCAT('[', us.Location, ']') 
+         ELSE '[NoLoc]' 
+       END
+    ) AS UserDisplayLabel
+
+    
+FROM Posts q
+LEFT JOIN QuestionWithAnswerAcceptStatus qwar ON q.Id = qwar.QuestionId AND qwar.AnswerRank = 1
+LEFT JOIN AnswerAggregates qa ON qa.ParentId = q.Id
+LEFT JOIN Votes v ON v.PostId = q.Id
+LEFT JOIN UserStats us ON us.UserId = q.OwnerUserId
+LEFT JOIN TaggedQuestions tg ON tg.Id = q.Id
+LEFT JOIN HighlyTaggedQuestions htQQs ON htQQs.single_tag = tg.single_tag
+LEFT JOIN Badges b ON b.UserId = us.UserId
+LEFT JOIN Comments c ON c.PostId = q.Id
+LEFT JOIN UserBadgingRate ub ON ub.UserId = us.UserId
+WHERE q.PostTypeId = 1 -- questions only
+AND q.Score > 2
+AND q.CreationDate > CURRENT_DATE - INTERVAL '60 DAY'
+AND (htQQs.QCount IS NOT NULL AND htQQs.QCount > 50)  -- questions tagged with popular tags only
+GROUP BY 
+    q.Id, q.Title, us.DisplayName, us.Reputation, us.LastBadgeDate, us.UpVotesReceived, us.DownVotesReceived,
+    qa.TotalAnswers, qwar.AnswerScore, qa.TotalAcceptedUnderline,
+    htQQs.QCount,
+    ub.BadgingRatePerDay,
+    us.Id, us.Location,
+    Comments.PostId
+ORDER BY us.Reputation DESC NULLS LAST, qa.TotalAnswers DESC, q.CreationDate DESC
+LIMIT 100;

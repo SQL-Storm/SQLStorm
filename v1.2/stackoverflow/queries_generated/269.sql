@@ -1,0 +1,143 @@
+-- {"query": "269.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.2, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1220} 
+with RecursiveUserBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by u.Id order by b.Date desc) as BadgeRank
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where b.TagBased = 0 or b.TagBased is null
+),
+TopBadges as (
+    select UserId, DisplayName, BadgeName, Class
+    from RecursiveUserBadges
+    where BadgeRank <= 3
+),
+QuestionStats as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        coalesce(a.AnswerCount, 0) as TotalAnswers,
+        coalesce(a.AvgAnswerScore, 0) as AvgAnswerScore,
+        coalesce(a.MaxAnswerScore, 0) as MaxAnswerScore,
+        case when p.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer,
+        case when p.ClosedDate is not null then 1 else 0 end as IsClosed
+    from Posts p
+    left join (
+        select
+            ParentId,
+            count(*) as AnswerCount,
+            avg(Score) as AvgAnswerScore,
+            max(Score) as MaxAnswerScore
+        from Posts
+        where PostTypeId = 2
+        group by ParentId
+    ) a on p.Id = a.ParentId
+    where p.PostTypeId = 1
+),
+QuestionComments as (
+    select
+        c.PostId,
+        count(*) as CommentCount,
+        sum(case when c.Score > 0 then 1 else 0 end) as PositiveComments,
+        sum(case when c.Score <= 0 then 1 else 0 end) as NonPositiveComments,
+        string_agg(distinct coalesce(c.UserDisplayName, 'Anonymous'), ', ') as Commenters
+    from Comments c
+    group by c.PostId
+),
+UserActivity as (
+    select
+        u.Id,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsPosted,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersPosted,
+        count(distinct c.Id) as CommentsMade,
+        max(p.CreationDate) as LastPostDate,
+        max(c.CreationDate) as LastCommentDate,
+        coalesce(max(p.CreationDate), '1900-01-01') > coalesce(max(c.CreationDate), '1900-01-01') as LastActivityWasPost
+    from Users u
+    left join Posts p on u.Id = p.OwnerUserId
+    left join Comments c on u.Id = c.UserId
+    group by u.Id, u.DisplayName
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title as OriginalTitle,
+        p2.Title as DuplicateTitle,
+        pl.CreationDate as LinkCreationDate
+    from PostLinks pl
+    join Posts p1 on pl.PostId = p1.Id and p1.PostTypeId = 1
+    join Posts p2 on pl.RelatedPostId = p2.Id and p2.PostTypeId = 1
+    where pl.LinkTypeId = 3
+),
+CloseReasonsCount as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        count(*) as CloseVotesCount
+    from PostHistory ph
+    join CloseReasonTypes crt on cast(ph.Comment as int) = crt.Id and ph.PostHistoryTypeId = 10
+    group by ph.PostId, crt.Name
+),
+RankedQuestions as (
+    select
+        qs.*,
+        qc.CommentCount,
+        qc.PositiveComments,
+        qc.NonPositiveComments,
+        qc.Commenters,
+        crc.CloseReason,
+        crc.CloseVotesCount,
+        row_number() over (partition by qs.OwnerUserId order by qs.Score desc, qs.ViewCount desc) as UserQuestionRank
+    from QuestionStats qs
+    left join QuestionComments qc on qs.QuestionId = qc.PostId
+    left join CloseReasonsCount crc on qs.QuestionId = crc.PostId
+)
+select
+    rq.QuestionId,
+    rq.Title,
+    rq.OwnerUserId,
+    u.DisplayName as OwnerName,
+    rq.CreationDate,
+    rq.Score,
+    rq.ViewCount,
+    rq.AnswerCount,
+    rq.TotalAnswers,
+    round(rq.AvgAnswerScore::numeric, 2) as AvgAnswerScore,
+    rq.MaxAnswerScore,
+    rq.HasAcceptedAnswer,
+    rq.IsClosed,
+    rq.CommentCount,
+    rq.PositiveComments,
+    rq.NonPositiveComments,
+    rq.Commenters,
+    rq.CloseReason,
+    rq.CloseVotesCount,
+    ua.QuestionsPosted,
+    ua.AnswersPosted,
+    ua.CommentsMade,
+    ua.LastPostDate,
+    ua.LastCommentDate,
+    ua.LastActivityWasPost,
+    tb.BadgeName as TopBadge1,
+    tb.Class as TopBadge1Class,
+    dup.DuplicateTitle,
+    dup.LinkCreationDate as DuplicateLinkDate
+from RankedQuestions rq
+join Users u on rq.OwnerUserId = u.Id
+left join UserActivity ua on u.Id = ua.Id
+left join TopBadges tb on u.Id = tb.UserId and tb.BadgeRank = 1
+left join DuplicateLinks dup on rq.QuestionId = dup.PostId
+where rq.UserQuestionRank <= 5
+  and (rq.Score > 10 or rq.ViewCount > 1000)
+order by rq.Score desc, rq.ViewCount desc, rq.CreationDate desc;

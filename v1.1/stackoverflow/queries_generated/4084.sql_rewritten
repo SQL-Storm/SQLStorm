@@ -1,0 +1,124 @@
+-- {"query": "4084.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1279} 
+WITH UserBadgeRanks AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        b.Class,
+        COUNT(*) AS BadgeCount,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY COUNT(*) DESC) AS RankWithinUser
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE b.Date BETWEEN '2020-01-01' AND '2024-01-01'
+    GROUP BY u.Id, u.DisplayName, b.Class
+),
+TopBadgesByUser AS (
+    SELECT UserId, DisplayName, Class AS BadgeClass, BadgeCount
+    FROM UserBadgeRanks
+    WHERE RankWithinUser = 1
+),
+RecentQuestions AS (
+    SELECT
+        p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserRecentRank
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '60 days'
+),
+AcceptedAnswerScores AS (
+    SELECT
+        q.Id AS QuestionId,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.OwnerUserId AS AnswerOwnerId
+    FROM Posts q
+    JOIN Posts a ON a.Id = q.AcceptedAnswerId
+    WHERE q.PostTypeId = 1
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COALESCE(SUM(vt.UpVotes), 0) AS TotalUpVotes,
+        COALESCE(SUM(vt.DownVotes), 0) AS TotalDownVotes
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1,2)
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN (
+        SELECT
+            v.UserId,
+            SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+        WHERE v.UserId IS NOT NULL
+        GROUP BY v.UserId
+    ) vt ON u.Id = vt.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+PostHistoryCloseCounts AS (
+    SELECT
+        ph.PostId,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseVotes,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenVotes
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+PostLinksAggregated AS (
+    SELECT
+        pl.PostId,
+        COUNT(DISTINCT CASE WHEN lt.Name = 'Linked' THEN pl.RelatedPostId ELSE NULL END) AS LinkedPostsCount,
+        COUNT(DISTINCT CASE WHEN lt.Name = 'Duplicate' THEN pl.RelatedPostId ELSE NULL END) AS DuplicatePostsCount
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    GROUP BY pl.PostId
+)
+SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    COALESCE(u.DisplayName, 'Anonymous') AS QuestionOwner,
+    EXTRACT(DAY FROM cast('2024-10-01 12:34:56' as timestamp) - q.CreationDate) AS DaysSincePosted,
+    q.Score,
+    q.AnswerCount,
+    COALESCE(ab.BadgeCount, 0) AS TopBadgeCount,
+    COALESCE(ab.BadgeClass, 0) AS TopBadgeClass,
+    aca.AnswerScore AS AcceptedAnswerScore,
+    ua.TotalPosts,
+    ua.TotalComments,
+    ua.TotalUpVotes,
+    ua.TotalDownVotes,
+    phcc.CloseVotes,
+    phcc.ReopenVotes,
+    pla.LinkedPostsCount,
+    pla.DuplicatePostsCount,
+    -- Complex string expression showing a clean list of tags
+    TRIM(BOTH ',' FROM REGEXP_REPLACE(q.Tags, '[<>]', ',', 'g')) AS TagList,
+    -- Window function calculating rank by question score within all recent questions
+    RANK() OVER (ORDER BY q.Score DESC) AS ScoreRank,
+    -- Conditional complicated predicate using NULL-safe logic
+    CASE
+        WHEN q.Score > 10 AND (phcc.CloseVotes IS NULL OR phcc.CloseVotes = 0) THEN 'High scoring open question'
+        WHEN phcc.CloseVotes > phcc.ReopenVotes THEN 'Likely closed'
+        ELSE 'Other'
+    END AS QuestionStatus
+FROM RecentQuestions q
+LEFT JOIN Users u ON q.OwnerUserId = u.Id
+LEFT JOIN TopBadgesByUser ab ON u.Id = ab.UserId
+LEFT JOIN AcceptedAnswerScores aca ON q.Id = aca.QuestionId
+LEFT JOIN UserActivity ua ON u.Id = ua.UserId
+LEFT JOIN PostHistoryCloseCounts phcc ON q.Id = phcc.PostId
+LEFT JOIN PostLinksAggregated pla ON q.Id = pla.PostId
+WHERE
+    -- Correlated subquery in WHERE: only questions where accepted answer score is higher than avg answer score for that question's owner
+    coa.AcceptedAnswerScore > (
+        SELECT AVG(a2.Score)
+        FROM Posts a2
+        WHERE a2.PostTypeId = 2
+          AND a2.OwnerUserId = q.OwnerUserId
+          AND a2.ParentId IS NOT NULL
+    )
+ORDER BY ScoreRank, DaysSincePosted
+LIMIT 50;

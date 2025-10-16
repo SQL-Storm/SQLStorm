@@ -1,0 +1,182 @@
+WITH
+FreshQuestions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.Body,
+    p.PostTypeId,
+    p.AcceptedAnswerId
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '90 days'
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    SUM(fq.Score) AS ScoreSum,
+    AVG(fq.ViewCount) AS AvgViews,
+    COUNT(*) AS QCount
+  FROM FreshQuestions fq,
+       LATERAL (
+         SELECT unnest(string_to_array(substring(fq.Tags, 2, length(fq.Tags) - 2), '><')) AS TagName
+       ) t
+  GROUP BY t.TagName
+),
+TagScore AS (
+  SELECT
+    TagName,
+    ScoreSum,
+    AvgViews,
+    QCount,
+    ROW_NUMBER() OVER (ORDER BY ScoreSum DESC, AvgViews DESC) AS rn
+  FROM TopTags
+),
+RecentActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.LastEditDate,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Title
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT a.PostId) AS ActiveQuestions
+  FROM Users u
+  LEFT JOIN (
+    SELECT PostId, OwnerUserId
+    FROM Posts
+    WHERE PostTypeId = 1
+  ) a ON a.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+ValueExpr AS (
+  SELECT
+    fq.PostId AS Id,
+    fq.Title,
+    fq.CreationDate,
+    fq.Score,
+    fq.ViewCount,
+    fq.Tags,
+    fq.OwnerUserId,
+    fq.LastActivityDate,
+    fq.CommentCount,
+    fq.AnswerCount,
+    fq.FavoriteCount,
+    fq.Body,
+    fq.PostTypeId,
+    fq.AcceptedAnswerId,
+    (SELECT SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)
+     FROM Votes v
+     WHERE v.PostId = fq.PostId) AS UpVotes,
+    (SELECT SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)
+     FROM Votes v
+     WHERE v.PostId = fq.PostId) AS DownVotes,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = fq.PostId) AS CommentCountInline
+  FROM FreshQuestions fq
+),
+CorrelatedFiltered AS (
+  SELECT
+    ve.*,
+    (SELECT AVG(EXTRACT(EPOCH FROM ra.LastActivityDate)) FROM RecentActivity ra WHERE ra.PostId = ve.PostId) AS AvgActivityEpoch
+  FROM ValueExpr ve
+),
+Final AS (
+  SELECT
+    cf.PostId,
+    cf.Title,
+    cf.CreationDate,
+    cf.Score,
+    cf.ViewCount,
+    cf.Tags,
+    cf.OwnerUserId,
+    cf.LastActivityDate,
+    cf.CommentCount,
+    cf.AnswerCount,
+    cf.FavoriteCount,
+    cf.Body,
+    cf.PostTypeId,
+    cf.AcceptedAnswerId,
+    cf.UpVotes,
+    cf.DownVotes,
+    cf.CommentCountInline,
+    -- convert epoch back to timestamp for portability
+    TO_TIMESTAMP(cf.AvgActivityEpoch) AT TIME ZONE 'UTC' AS AvgActivity,
+    u.DisplayName AS OwnerDisplayName,
+    COALESCE(u.Reputation, 0) AS OwnerReputation
+  FROM CorrelatedFiltered cf
+  LEFT JOIN Users u ON cf.OwnerUserId = u.Id
+  LEFT JOIN UserActivity ua ON cf.OwnerUserId = ua.UserId
+)
+SELECT
+  f.PostId,
+  f.Title,
+  f.CreationDate,
+  f.Score,
+  f.ViewCount,
+  f.Tags,
+  f.OwnerUserId,
+  f.OwnerDisplayName,
+  f.OwnerReputation,
+  f.LastActivityDate,
+  f.CommentCount,
+  f.AnswerCount,
+  f.FavoriteCount,
+  f.Body,
+  f.PostTypeId,
+  f.AcceptedAnswerId,
+  f.UpVotes,
+  f.DownVotes,
+  f.CommentCountInline,
+  f.AvgActivity,
+  rt.rn AS TagRank
+FROM Final f
+LEFT JOIN TagScore rt ON EXISTS (
+    SELECT 1
+    FROM LATERAL (
+      SELECT unnest(string_to_array(substring(f.Tags, 2, length(f.Tags) - 2), '><')) AS tag
+    ) AS t
+    WHERE rt.TagName = t.tag
+)
+WHERE rt.rn IS NOT NULL
+GROUP BY
+  f.PostId,
+  f.Title,
+  f.CreationDate,
+  f.Score,
+  f.ViewCount,
+  f.Tags,
+  f.OwnerUserId,
+  f.OwnerDisplayName,
+  f.OwnerReputation,
+  f.LastActivityDate,
+  f.CommentCount,
+  f.AnswerCount,
+  f.FavoriteCount,
+  f.Body,
+  f.PostTypeId,
+  f.AcceptedAnswerId,
+  f.UpVotes,
+  f.DownVotes,
+  f.CommentCountInline,
+  f.AvgActivity,
+  rt.rn
+ORDER BY f.LastActivityDate DESC, f.ViewCount DESC
+LIMIT 200;

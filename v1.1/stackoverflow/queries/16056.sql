@@ -1,0 +1,149 @@
+WITH UserEngagementMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS NetVotes,
+        EXTRACT(YEAR FROM AGE(u.LastAccessDate, u.CreationDate)) * 12 + 
+            EXTRACT(MONTH FROM AGE(u.LastAccessDate, u.CreationDate)) AS MonthsActive,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes
+),
+PostPerformance AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.CommentCount, 0) AS CommentCount,
+        LENGTH(COALESCE(p.Body, '')) AS BodyLength,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 1
+            WHEN p.PostTypeId = 2 AND EXISTS(
+                SELECT 1 FROM Posts parent 
+                WHERE parent.Id = p.ParentId AND parent.AcceptedAnswerId = p.Id
+            ) THEN 2
+            ELSE 0
+        END AS AcceptanceStatus,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpvoteCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownvoteCount,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate 
+            ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) AS RollingAvgScore,
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId, EXTRACT(YEAR FROM p.CreationDate) 
+            ORDER BY p.ViewCount DESC NULLS LAST) AS ViewRank
+    FROM Posts p
+    WHERE p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '5 years'
+        AND p.OwnerUserId IS NOT NULL
+        AND (p.PostTypeId IN (1, 2) OR p.PostTypeId IS NULL)
+),
+TagStatistics AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagUseCount,
+        COALESCE(AVG(p.Score), 0) AS AvgScoreForTag,
+        COUNT(DISTINCT p.OwnerUserId) AS UniqueContributors,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.ViewCount) AS MedianViews,
+        (SELECT STRING_AGG(SUBSTRING(inner_t.TagName, 1, 3), '|' ORDER BY inner_t.Count DESC)
+         FROM (
+             SELECT t2.TagName, t2.Count
+             FROM Tags t2
+         ) AS inner_t
+        ) AS TagPrefix
+    FROM Tags t
+    INNER JOIN Posts p ON '<' || t.TagName || '>' = ANY(
+        string_to_array(SUBSTRING(COALESCE(p.Tags, ''), 2, LENGTH(COALESCE(p.Tags, ''))-2), '><')
+    )
+    WHERE t.Count > 50
+        AND p.PostTypeId = 1
+    GROUP BY t.Id, t.TagName, t.Count
+),
+ComplexJoinResult AS (
+    SELECT 
+        uem.DisplayName,
+        uem.Reputation,
+        uem.NetVotes,
+        uem.TotalBadges,
+        uem.GoldBadges,
+        uem.ReputationRank,
+        pp.PostId,
+        pp.Score AS PostScore,
+        pp.ViewCount,
+        pp.BodyLength,
+        pp.RollingAvgScore,
+        pp.ViewRank,
+        pp.AcceptanceStatus,
+        COALESCE(ts.TagName, 'Untagged') AS PrimaryTag,
+        ts.AvgScoreForTag,
+        ts.MedianViews,
+        CASE 
+            WHEN pp.UpvoteCount > pp.DownvoteCount * 5 THEN 'Highly Positive'
+            WHEN pp.UpvoteCount > pp.DownvoteCount THEN 'Positive'
+            WHEN pp.UpvoteCount = pp.DownvoteCount THEN 'Neutral'
+            ELSE 'Negative'
+        END AS SentimentCategory,
+        (SELECT COUNT(*) FROM PostHistory ph 
+         WHERE ph.PostId = pp.PostId 
+         AND ph.PostHistoryTypeId IN (4, 5, 6)) AS EditCount,
+        (SELECT MAX(c.Score) FROM Comments c WHERE c.PostId = pp.PostId) AS MaxCommentScore
+    FROM UserEngagementMetrics uem
+    INNER JOIN PostPerformance pp ON uem.Id = pp.OwnerUserId
+    LEFT OUTER JOIN Posts p ON pp.PostId = p.Id
+    LEFT OUTER JOIN LATERAL (
+        SELECT ts.* 
+        FROM TagStatistics ts
+        WHERE '<' || ts.TagName || '>' = ANY(
+            string_to_array(SUBSTRING(COALESCE(p.Tags, ''), 2, LENGTH(COALESCE(p.Tags, ''))-2), '><')
+        )
+        ORDER BY ts.TagUseCount DESC
+        LIMIT 1
+    ) ts ON TRUE
+    WHERE uem.MonthsActive > 6
+        AND pp.RollingAvgScore IS NOT NULL
+        AND (pp.ViewRank <= 1000 OR pp.AcceptanceStatus > 0)
+)
+SELECT 
+    DisplayName,
+    Reputation,
+    ROUND(AVG(PostScore), 2) AS AvgPostScore,
+    SUM(ViewCount) AS TotalViews,
+    COUNT(DISTINCT PostId) AS PostCount,
+    MAX(GoldBadges) AS GoldBadges,
+    STRING_AGG(PrimaryTag, ', ' ORDER BY PrimaryTag) FILTER (WHERE PrimaryTag != 'Untagged') AS TopTags,
+    ROUND(AVG(COALESCE(AvgScoreForTag, 0)), 2) AS AvgTagPerformance,
+    MAX(MedianViews) AS MaxMedianViews,
+    SUM(CASE WHEN SentimentCategory = 'Highly Positive' THEN 1 ELSE 0 END) AS HighlyPositivePosts,
+    AVG(EditCount) AS AvgEditsPerPost,
+    COALESCE(MAX(MaxCommentScore), 0) AS BestCommentScore,
+    NTILE(10) OVER (ORDER BY SUM(ViewCount) DESC) AS ViewDecile
+FROM ComplexJoinResult
+WHERE Reputation > 500
+    AND ReputationRank <= 100
+GROUP BY DisplayName, Reputation, NetVotes, ReputationRank
+HAVING COUNT(DISTINCT PostId) >= 5
+    AND AVG(PostScore) > 0
+UNION ALL
+SELECT 
+    'AGGREGATE_SUMMARY' AS DisplayName,
+    NULL AS Reputation,
+    ROUND(AVG(PostScore), 2) AS AvgPostScore,
+    SUM(ViewCount) AS TotalViews,
+    COUNT(DISTINCT PostId) AS PostCount,
+    NULL AS GoldBadges,
+    'ALL_TAGS' AS TopTags,
+    NULL AS AvgTagPerformance,
+    NULL AS MaxMedianViews,
+    SUM(CASE WHEN SentimentCategory = 'Highly Positive' THEN 1 ELSE 0 END) AS HighlyPositivePosts,
+    AVG(EditCount) AS AvgEditsPerPost,
+    MAX(MaxCommentScore) AS BestCommentScore,
+    NULL AS ViewDecile
+FROM ComplexJoinResult
+ORDER BY TotalViews DESC, AvgPostScore DESC
+LIMIT 500;

@@ -1,0 +1,172 @@
+-- {"query": "100.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2277} 
+with
+-- high-activity recent questions
+RecentQuestions as (
+  select p.Id, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags,
+         coalesce(p.Title,'') as Title,
+         regexp_split_to_table(substring(coalesce(p.Tags,''),2, greatest(length(coalesce(p.Tags,''))-2,0)), '><') as Tag
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= now() - interval '730 days' -- last 2 years
+),
+-- answers augmented with parent question info
+Answers as (
+  select a.Id as AnswerId, a.ParentId as QuestionId, a.OwnerUserId as AnswerOwner, a.Score as AnswerScore,
+         a.CreationDate as AnswerDate, a.Body as AnswerBody,
+         q.Score as QuestionScore, q.ViewCount as QuestionViews, q.Title as QuestionTitle, q.Tags as QuestionTags
+  from Posts a
+  left join Posts q on q.Id = a.ParentId
+  where a.PostTypeId = 2
+    and a.CreationDate >= now() - interval '730 days'
+),
+-- top answer per question using window functions and complex tie-breakers
+TopAnswers as (
+  select *
+  from (
+    select a.*,
+           row_number() over (
+             partition by a.QuestionId
+             order by
+               (case when a.AnswerId = (select p.AcceptedAnswerId from Posts p where p.Id = a.QuestionId) then 0 else 1 end) asc, -- prefer accepted
+               a.AnswerScore desc,
+               a.AnswerDate asc,
+               length(coalesce(a.AnswerBody,'')) desc
+           ) rn
+    from Answers a
+  ) t
+  where t.rn = 1
+),
+-- user aggregates including null-handling, conditional sums and lag/lead windows
+UserActivity as (
+  select u.Id as UserId, u.DisplayName,
+         u.Reputation,
+         count(distinct r.Id) filter (where r.PostTypeId = 1) as QuestionsPosted,
+         count(distinct r.Id) filter (where r.PostTypeId = 2) as AnswersPosted,
+         sum(case when v.VoteTypeId = 2 then 1 when v.VoteTypeId = 3 then -1 else 0 end) as NetVotesReceived,
+         max(r.CreationDate) as LastPostDate,
+         min(u.CreationDate) as UserSince,
+         coalesce(u.Location,'(unknown)') as LocationNormalized,
+         -- moving averages of score per post type over time window
+         avg(case when r.PostTypeId = 1 then coalesce(r.Score,0) end) over (partition by u.Id) as AvgQuestionScore,
+         avg(case when r.PostTypeId = 2 then coalesce(r.Score,0) end) over (partition by u.Id) as AvgAnswerScore,
+         -- badge counts by class using conditional aggregation and null-safe logic
+         sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+         sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+         sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+  from Users u
+  left join Posts r on r.OwnerUserId = u.Id
+  left join Votes v on v.PostId = r.Id
+  left join Badges b on b.UserId = u.Id
+  group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+),
+-- tag popularity and cross-tag co-occurrence using string parsing and set semantics
+TagPairs as (
+  select t1.TagName as TagA, t2.TagName as TagB, count(*) as CoOccurences
+  from (
+    select p.Id, regexp_split_to_table(substring(coalesce(p.Tags,''),2, greatest(length(coalesce(p.Tags,''))-2,0)), '><') as TagName
+    from Posts p
+    where p.PostTypeId = 1
+      and p.CreationDate >= now() - interval '730 days'
+  ) t1
+  join (
+    select p.Id, regexp_split_to_table(substring(coalesce(p.Tags,''),2, greatest(length(coalesce(p.Tags,''))-2,0)), '><') as TagName
+    from Posts p
+    where p.PostTypeId = 1
+      and p.CreationDate >= now() - interval '730 days'
+  ) t2 on t1.Id = t2.Id and t1.TagName < t2.TagName
+  group by t1.TagName, t2.TagName
+  having count(*) >= 5
+),
+-- complex ranking of questions by a composite score with correlated subqueries and null logic
+RankedQuestions as (
+  select q.Id, q.Title, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount, q.Tags,
+         -- composite score: weighted combination of recency decay, score, views, answer velocity, tag hotness
+         (
+           -- base score from post score and views (log-normalized)
+           (coalesce(q.Score,0)::float * 3.0)
+           + ln(1 + greatest(coalesce(q.ViewCount,0),0)) * 1.5
+           -- penalty for very old questions, boost for recent ones (half-life 180 days)
+           + (100.0 * exp(- extract(epoch from (now() - q.CreationDate)) / (180.0*24*3600)))
+           -- small boost if question has accepted answer (correlated subquery)
+           + (case when exists (select 1 from Posts a where a.ParentId = q.Id and a.Id = q.AcceptedAnswerId) then 50 else 0 end)
+           -- answer velocity: #answers in first 7 days normalized
+           + coalesce((
+               select count(*) * 10.0 / nullif(greatest(1, least(30, extract(day from min(a.CreationDate) - q.CreationDate)::int + (select count(*) from Posts a2 where a2.ParentId = q.Id and a2.CreationDate <= q.CreationDate + interval '7 days'))),0)
+               from Posts a
+               where a.ParentId = q.Id and a.PostTypeId = 2 and a.CreationDate <= q.CreationDate + interval '7 days'
+             ),0)
+           -- tag hotness: average co-occurrence popularity
+           + coalesce((
+               select avg(tp.CoOccurences)::float
+               from regexp_split_to_table(substring(coalesce(q.Tags,''),2, greatest(length(coalesce(q.Tags,''))-2,0)), '><') as t(tag)
+               left join (
+                 select TagA as TagName, sum(CoOccurences) as CoCount from TagPairs group by TagA
+                 union all
+                 select TagB as TagName, sum(CoOccurences) as CoCount from TagPairs group by TagB
+               ) tp on tp.TagName = t.tag
+             ),0)
+         ) as CompositeScore
+  from Posts q
+  where q.PostTypeId = 1
+    and q.CreationDate >= now() - interval '730 days'
+),
+-- select top N per tag using window functions and complex filters (including NULL title handling)
+TopPerTag as (
+  select rq.*, regexp_split_to_table(substring(coalesce(rq.Tags,''),2, greatest(length(coalesce(rq.Tags,''))-2,0)), '><') as SingleTag
+  from RankedQuestions rq
+),
+TopPerTagRanked as (
+  select t.*,
+         row_number() over (partition by t.SingleTag order by t.CompositeScore desc, t.Score desc, t.ViewCount desc, t.CreationDate asc) as TagRank
+  from TopPerTag t
+)
+select
+  tp.SingleTag as Tag,
+  tp.TagRank,
+  tp.Id as QuestionId,
+  left(coalesce(tp.Title,'(no title)'), 120) as ShortTitle,
+  tp.CreationDate,
+  tp.Score as QuestionScore,
+  tp.ViewCount as QuestionViews,
+  tp.CompositeScore,
+  u.DisplayName as OwnerName,
+  ua.QuestionsPosted,
+  ua.AnswersPosted,
+  coalesce(ua.GoldBadges,0) as GoldBadges,
+  coalesce(ua.SilverBadges,0) as SilverBadges,
+  coalesce(ua.BronzeBadges,0) as BronzeBadges,
+  ta.CoOccurences as TopCoTagCount,
+  -- include top answer details via left join to prefer accepted answer then top scored answer (complex predicate)
+  coalesce(a.AnswerId, ta2.AnswerId) as RepresentativeAnswerId,
+  coalesce(a.AnswerScore, ta2.AnswerScore, 0) as RepresentativeAnswerScore,
+  case
+    when a.AnswerId is not null then 'accepted'
+    when ta2.AnswerId is not null then 'top-scored'
+    else 'none'
+  end as AnswerType,
+  -- an illustrative synthetic metric combining user reputation and answer score
+  (coalesce(ua.Reputation,0) * 0.001) + (coalesce(a.AnswerScore, ta2.AnswerScore,0) * 0.1) as ReputationAnswerBlend
+from TopPerTagRanked tp
+left join Users u on u.Id = tp.OwnerUserId
+left join UserActivity ua on ua.UserId = u.Id
+left join TagPairs ta on ta.TagA = tp.SingleTag
+-- pick accepted answer if exists else fallback to top answer (correlated)
+left join lateral (
+  select * from TopAnswers ta2
+  where ta2.QuestionId = tp.Id
+  limit 1
+) a on true
+left join lateral (
+  select a3.AnswerId, a3.AnswerScore
+  from Answers a3
+  where a3.QuestionId = tp.Id
+  order by
+    (case when a3.AnswerId = (select p.AcceptedAnswerId from Posts p where p.Id = tp.Id) then 0 else 1 end) asc,
+    a3.AnswerScore desc
+  limit 1
+) ta2 on a.AnswerId is null
+where tp.TagRank <= 5 -- top 5 per tag
+  and tp.CompositeScore > (
+    select percentile_disc(0.25) within group (order by CompositeScore) from RankedQuestions rq2 where rq2.CreationDate >= now() - interval '365 days'
+  )
+order by tp.SingleTag, tp.TagRank, tp.CompositeScore desc;

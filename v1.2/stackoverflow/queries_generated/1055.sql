@@ -1,0 +1,152 @@
+-- {"query": "1055.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1422} 
+with RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsModeratorOnly = 0
+    union all
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Path || t.Id
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id != all(r.Path) and t.Count < r.Count
+    where t.IsModeratorOnly = 0
+),
+UserStats as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesReceived,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotesReceived,
+        avg(p.Score) as AvgPostScore
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.PostId = p.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostAnswerStats as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        count(a.Id) as AnswerCount,
+        max(a.Score) as MaxAnswerScore,
+        avg(a.Score) as AvgAnswerScore,
+        sum(case when a.Id = q.AcceptedAnswerId then 1 else 0 end) as HasAcceptedAnswer
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.AcceptedAnswerId
+),
+TopCommenters as (
+    select 
+        c.UserId,
+        u.DisplayName,
+        count(c.Id) as CommentCount,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    join Users u on u.Id = c.UserId
+    group by c.UserId, u.DisplayName
+    having count(c.Id) > 10
+),
+WindowRankedPosts as (
+    select 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc) as UserTopScoreRank,
+        dense_rank() over (order by p.Score desc) as GlobalScoreRank,
+        lead(p.Score) over (order by p.CreationDate) as NextPostScore,
+        lag(p.Score) over (order by p.CreationDate) as PrevPostScore
+    from Posts p
+    where p.PostTypeId = 1
+)
+select 
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.UpVotesReceived,
+    ua.DownVotesReceived,
+    ua.AvgPostScore,
+    pas.QuestionId,
+    pas.Title as QuestionTitle,
+    pas.QuestionCreation,
+    pas.QuestionScore,
+    pas.ViewCount as QuestionViews,
+    pas.AnswerCount,
+    pas.MaxAnswerScore,
+    pas.AvgAnswerScore,
+    pas.HasAcceptedAnswer,
+    tc.CommentCount as UserCommentCount,
+    tc.LastCommentDate as LastComment,
+    wpr.UserTopScoreRank,
+    wpr.GlobalScoreRank,
+    case 
+        when wpr.NextPostScore is null then 'NoNext'
+        when wpr.NextPostScore > wpr.Score then 'NextHigher'
+        else 'NextLowerOrEqual'
+    end as NextPostComparison,
+    case 
+        when wpr.PrevPostScore is null then 'NoPrev'
+        when wpr.PrevPostScore < wpr.Score then 'PrevLower'
+        else 'PrevHigherOrEqual'
+    end as PrevPostComparison,
+    string_agg(distinct pt.Name, ', ') as PostTypesOfUser,
+    /* Complex string expression extracting tags */
+    substring(pas.Title from '([A-Za-z0-9_]+)') as FirstWordInTitle,
+    coalesce(ppc.CloseReason, 'NotClosed') as CloseReason,
+    case 
+        when ua.Reputation > 10000 then 'HighRep'
+        when ua.Reputation between 1000 and 10000 then 'MediumRep'
+        else 'LowRep'
+    end as UserReputationGroup,
+    rth.Path as TagPath
+from UserStats ua
+inner join PostAnswerStats pas on pas.QuestionId = (
+    select p.Id from Posts p 
+    where p.OwnerUserId = ua.UserId and p.PostTypeId = 1 
+    order by p.CreationDate desc limit 1
+)
+left join TopCommenters tc on tc.UserId = ua.UserId
+left join WindowRankedPosts wpr on wpr.Id = pas.QuestionId
+left join LATERAL (
+    select ph.Comment as CloseReason
+    from PostHistory ph
+    where ph.PostId = pas.QuestionId and ph.PostHistoryTypeId = 10
+    order by ph.CreationDate desc limit 1
+) ppc on true
+left join (
+    select array_agg(t.Id order by t.Count desc) as Path from Tags t where t.TagName = substring(pas.Tags from '<([^>]+)>')
+) tpath on true
+left join RecursiveTagHierarchy rth on rth.Id = (select Id from Tags where TagName = substring(pas.Tags from '<([^>]+)>') limit 1)
+left join (
+    select distinct p.OwnerUserId, string_agg(distinct pt.Name, ', ') as PostTypes
+    from Posts p
+    join PostTypes pt on p.PostTypeId = pt.Id
+    group by p.OwnerUserId
+) pt on pt.OwnerUserId = ua.UserId
+where ua.Reputation > 0
+and pas.QuestionScore > 5
+and (tc.CommentCount is null or tc.CommentCount > 5)
+and (ppc.CloseReason is null or ppc.CloseReason not in ('101', '102'))
+order by ua.Reputation desc, pas.QuestionScore desc
+limit 100;

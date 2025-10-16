@@ -1,0 +1,222 @@
+-- {"query": "1010.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2308} 
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount, 0) as AnswerCount,
+        coalesce(p.ViewCount, 0) as ViewCount,
+        coalesce(u.Reputation, 0) as OwnerReputation,
+        row_number() over (partition by null order by t.Count desc, coalesce(p.AnswerCount,0) desc) as rn
+    from
+        Tags t
+        left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+        left join Users u on u.Id = p.OwnerUserId
+    where
+        t.TagName is not null
+),
+FilteredPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.Tags,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerReputation,
+        (select count(*) from Comments c where c.PostId = p.Id and c.UserId is not null) as CommentCountNotNullUser,
+        (select max(ph.CreationDate) from PostHistory ph where ph.PostId = p.Id and ph.PostHistoryTypeId = 10) as ClosedDate,
+        case when p.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer,
+        coalesce((select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 2), 0) as UpVotes,
+        coalesce((select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 3), 0) as DownVotes
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId in (1,2)
+),
+UserBadgeStats as (
+    select 
+        b.UserId,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        count(*) as TotalBadges
+    from Badges b
+    group by b.UserId
+),
+AnswerRankings as (
+    select
+        p.Id as AnswerId,
+        p.ParentId as QuestionId,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        rank() over (partition by p.ParentId order by p.Score desc, p.CreationDate asc) as ScoreRank
+    from Posts p
+    where p.PostTypeId = 2
+),
+TopAnswers as (
+    select * from AnswerRankings where ScoreRank <= 3
+),
+QuestionAnswerSummary as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.OwnerUserId as QuestionOwner,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        coalesce(ta.NumTopAnswers, 0) as TopAnswersCount,
+        case when q.HasAcceptedAnswer = 1 then 1 else 0 end as HasAcceptedAnswer,
+        count(distinct a.AnswerId) as AnswerCount,
+        avg(a.Score) filter (where a.Score is not null) as AvgAnswerScore,
+        max(a.Score) filter (where a.Score is not null) as MaxAnswerScore,
+        min(a.Score) filter (where a.Score is not null) as MinAnswerScore
+    from
+        FilteredPosts q
+        left join UserBadgeStats ub on ub.UserId = q.OwnerUserId
+        left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+        left join (
+            select
+                ParentId,
+                count(*) as NumTopAnswers
+            from
+                TopAnswers
+            group by ParentId
+        ) ta on ta.ParentId = q.Id
+    where q.PostTypeId = 1
+    group by
+        q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.OwnerUserId, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ta.NumTopAnswers, q.HasAcceptedAnswer
+),
+BadgeGapAnalysis as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        ub.TotalBadges,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        case
+            when u.Reputation = 0 then null
+            else cast(ub.TotalBadges as float) / nullif(u.Reputation,0)
+        end as BadgesPerReputation,
+        lag(ub.TotalBadges) over (order by u.Reputation) as PrevTotalBadges,
+        lead(ub.TotalBadges) over (order by u.Reputation) as NextTotalBadges
+    from Users u
+    left join UserBadgeStats ub on ub.UserId = u.Id
+    where ub.TotalBadges is not null
+),
+QuestionAnswerTagSplit as (
+    select
+        qa.QuestionId,
+        qa.Title,
+        unnest(string_to_array(substring(q.Tags from 2 for char_length(q.Tags)-2), '><')) as Tag,
+        qa.AnswerCount,
+        qa.MaxAnswerScore,
+        qa.AvgAnswerScore,
+        qa.TopAnswersCount,
+        qa.HasAcceptedAnswer
+    from QuestionAnswerSummary qa
+    join Posts q on qa.QuestionId = q.Id
+    where q.Tags is not null
+),
+PopularTagQuestions as (
+    select
+        t.TagName,
+        count(distinct qas.QuestionId) as QuestionsCount,
+        avg(qas.AnswerCount) as AvgAnswerCount,
+        avg(qas.MaxAnswerScore) as AvgMaxAnswerScore,
+        avg(qas.AvgAnswerScore) as AvgAnswerScore,
+        sum(case when qas.HasAcceptedAnswer = 1 then 1 else 0 end) as QuestionsWithAcceptedAnswer
+    from QuestionAnswerTagSplit qas
+    join Tags t on t.TagName = qas.Tag
+    group by t.TagName
+    having count(distinct qas.QuestionId) > 100
+),
+CombinedQuestionAnswerRanking as (
+    select
+        qas.QuestionId,
+        qas.Title,
+        array_agg(distinct pt.Name) filter (where pt.Name is not null) as PostTypeNames,
+        pt2.Name as LinkTypeName,
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate as LinkCreationDate,
+        dense_rank() over (partition by qas.QuestionId order by pl.CreationDate desc) as RecentLinkRank
+    from QuestionAnswerSummary qas
+    left join PostLinks pl on pl.PostId = qas.QuestionId
+    left join LinkTypes pt2 on pt2.Id = pl.LinkTypeId
+    left join PostTypes pt on pt.Id = (select PostTypeId from Posts p2 where p2.Id = qas.QuestionId limit 1)
+    group by qas.QuestionId, qas.Title, pt2.Name, pl.PostId, pl.RelatedPostId, pl.CreationDate
+),
+ComplexUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsPosted,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersPosted,
+        count(distinct c.Id) as CommentsMade,
+        count(distinct b.Id) as BadgesEarned,
+        max(p.CreationDate) as LastPostDate,
+        count(distinct ph.Id) filter (where ph.PostHistoryTypeId = 10) as TimesCloseVoted,
+        count(distinct v.Id) filter (where v.VoteTypeId = 2) as UpVotesCast,
+        count(distinct v.Id) filter (where v.VoteTypeId = 3) as DownVotesCast
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id and ph.PostHistoryTypeId = 10
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+)
+select
+    cqa.QuestionId,
+    cqa.Title,
+    pt.Name as QuestionPostType,
+    cqa.LinkTypeName,
+    cqa.PostId,
+    cqa.RelatedPostId,
+    cqa.LinkCreationDate,
+    rt.Count as TagUsageCount,
+    rt.rn as TagGlobalRank,
+    ptag.QuestionsCount as TagQuestionsCount,
+    ptag.AvgAnswerCount as TagAvgAnswerCount,
+    ptag.AvgMaxAnswerScore as TagAvgMaxAnswerScore,
+    ptag.QuestionsWithAcceptedAnswer as TagQuestionsWithAcceptedAnswer,
+    qas.AnswerCount,
+    qas.MaxAnswerScore,
+    qas.AvgAnswerScore,
+    qas.TopAnswersCount,
+    qas.HasAcceptedAnswer,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    cpa.QuestionsPosted,
+    cpa.AnswersPosted,
+    cpa.CommentsMade,
+    cpa.BadgesEarned,
+    cpa.TimesCloseVoted,
+    cpa.UpVotesCast,
+    cpa.DownVotesCast,
+    bga.BadgesPerReputation,
+    bga.PrevTotalBadges,
+    bga.NextTotalBadges
+from CombinedQuestionAnswerRanking cqa
+left join PostTypes pt on pt.Id = 1
+left join RecursiveTagCounts rt on rt.TagName = (select unnest(string_to_array(substring((select Tags from Posts where Id = cqa.QuestionId limit 1) from 2 for char_length((select Tags from Posts where Id = cqa.QuestionId limit 1))-2), '><')) limit 1)
+left join PopularTagQuestions ptag on ptag.TagName = rt.TagName
+left join QuestionAnswerSummary qas on qas.QuestionId = cqa.QuestionId
+left join UserBadgeStats ubs on ubs.UserId = qas.QuestionOwner
+left join ComplexUserActivity cpa on cpa.UserId = qas.QuestionOwner
+left join BadgeGapAnalysis bga on bga.UserId = qas.QuestionOwner
+where cqa.RecentLinkRank <= 3
+order by rt.Count desc nulls last, ptag.QuestionsCount desc nulls last, qas.AnswerCount desc nulls last
+limit 100;

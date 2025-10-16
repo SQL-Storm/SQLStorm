@@ -1,0 +1,175 @@
+-- {"query": "17058.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 137765, "output_tokens": 137029} 
+
+WITH user_activity AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS post_count,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS question_count,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS answer_count,
+        AVG(p.Score) AS avg_post_score,
+        SUM(CASE WHEN p.Score > 10 THEN 1 ELSE 0 END) AS high_score_posts,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS reputation_rank,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) OVER (PARTITION BY u.Id) AS median_score
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= CURRENT_DATE - INTERVAL '2 years'
+        AND u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+tag_expertise AS (
+    SELECT 
+        p.OwnerUserId,
+        TRIM(BOTH FROM unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'))) AS tag_name,
+        COUNT(*) AS tag_post_count,
+        SUM(p.Score) AS tag_score_sum,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY SUM(p.Score) DESC) AS tag_rank
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL 
+        AND p.OwnerUserId IS NOT NULL
+        AND p.PostTypeId IN (1, 2)
+    GROUP BY p.OwnerUserId, tag_name
+),
+edit_patterns AS (
+    SELECT 
+        ph.UserId,
+        COUNT(DISTINCT ph.PostId) AS edited_posts,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 END) AS edit_count,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (7, 8, 9) THEN 1 END) AS rollback_count,
+        STRING_AGG(DISTINCT COALESCE(ph.Comment, ''), ' | ' ORDER BY ph.CreationDate DESC) AS edit_comments,
+        LAG(ph.CreationDate, 1) OVER (PARTITION BY ph.UserId ORDER BY ph.CreationDate) AS prev_edit_time,
+        EXTRACT(EPOCH FROM (ph.CreationDate - LAG(ph.CreationDate, 1) OVER (PARTITION BY ph.UserId ORDER BY ph.CreationDate))) / 3600 AS hours_between_edits
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+        AND ph.PostHistoryTypeId BETWEEN 1 AND 25
+    GROUP BY ph.UserId, ph.CreationDate
+),
+badge_achievements AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS gold_badges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS silver_badges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS bronze_badges,
+        COUNT(CASE WHEN b.TagBased = '1' THEN 1 END) AS tag_badges,
+        MAX(b.Date) AS last_badge_date,
+        FIRST_VALUE(b.Name) OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS latest_badge
+    FROM Badges b
+    GROUP BY b.UserId, b.Name, b.Date
+),
+recursive_post_chain AS (
+    WITH RECURSIVE post_hierarchy AS (
+        SELECT 
+            p.Id,
+            p.ParentId,
+            p.Score,
+            1 AS depth,
+            ARRAY[p.Id] AS path
+        FROM Posts p
+        WHERE p.ParentId IS NULL 
+            AND p.PostTypeId = 1
+            AND p.Score > 50
+        
+        UNION ALL
+        
+        SELECT 
+            p2.Id,
+            p2.ParentId,
+            p2.Score,
+            ph.depth + 1,
+            ph.path || p2.Id
+        FROM Posts p2
+        INNER JOIN post_hierarchy ph ON p2.ParentId = ph.Id
+        WHERE p2.Score > 0
+            AND NOT p2.Id = ANY(ph.path)
+            AND ph.depth < 5
+    )
+    SELECT 
+        Id,
+        depth,
+        path,
+        SUM(Score) OVER (PARTITION BY path[1] ORDER BY depth) AS cumulative_score
+    FROM post_hierarchy
+)
+SELECT DISTINCT
+    ua.DisplayName,
+    ua.Reputation,
+    ua.reputation_rank,
+    COALESCE(ua.question_count, 0) AS questions_asked,
+    COALESCE(ua.answer_count, 0) AS answers_given,
+    ROUND(ua.avg_post_score::numeric, 2) AS average_score,
+    ua.median_score,
+    CASE 
+        WHEN ua.high_score_posts > 10 THEN 'Expert'
+        WHEN ua.high_score_posts > 5 THEN 'Advanced'
+        WHEN ua.high_score_posts > 0 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END AS skill_level,
+    COALESCE(te.tag_name, 'No specialization') AS top_tag,
+    COALESCE(te.tag_score_sum, 0) AS top_tag_score,
+    ba.gold_badges || '/' || ba.silver_badges || '/' || ba.bronze_badges AS badge_count_gsc,
+    COALESCE(ba.latest_badge, 'None') AS most_recent_badge,
+    CASE 
+        WHEN ba.last_badge_date > CURRENT_DATE - INTERVAL '30 days' THEN 'Active'
+        WHEN ba.last_badge_date > CURRENT_DATE - INTERVAL '90 days' THEN 'Recent'
+        ELSE 'Inactive'
+    END AS badge_activity_status,
+    COALESCE(ep.edit_count, 0) + COALESCE(ep.rollback_count, 0) AS total_edits,
+    ROUND(AVG(ep.hours_between_edits) OVER (PARTITION BY ua.Id), 2) AS avg_hours_between_edits,
+    SUBSTRING(COALESCE(ep.edit_comments, 'No edits'), 1, 100) AS recent_edit_summary,
+    (
+        SELECT COUNT(DISTINCT c.Id)
+        FROM Comments c
+        WHERE c.UserId = ua.Id
+            AND c.Score > 5
+            AND c.CreationDate > CURRENT_DATE - INTERVAL '6 months'
+    ) AS helpful_comments_6m,
+    EXISTS (
+        SELECT 1 
+        FROM Votes v
+        WHERE v.UserId = ua.Id 
+            AND v.VoteTypeId IN (8, 9)
+            AND v.BountyAmount IS NOT NULL
+    ) AS has_offered_bounty,
+    COALESCE((
+        SELECT STRING_AGG(DISTINCT p2.Title, '; ' ORDER BY p2.Score DESC)
+        FROM Posts p1
+        INNER JOIN PostLinks pl ON p1.Id = pl.PostId
+        INNER JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+        WHERE p1.OwnerUserId = ua.Id
+            AND pl.LinkTypeId = 3
+            AND p2.Title IS NOT NULL
+        LIMIT 3
+    ), 'No duplicates') AS linked_duplicate_titles,
+    CASE 
+        WHEN rpc.cumulative_score > 500 THEN 'High Impact Chain'
+        WHEN rpc.cumulative_score > 100 THEN 'Medium Impact Chain'
+        WHEN rpc.cumulative_score IS NOT NULL THEN 'Low Impact Chain'
+        ELSE 'No Chain'
+    END AS answer_chain_impact
+FROM user_activity ua
+LEFT JOIN tag_expertise te ON ua.Id = te.OwnerUserId AND te.tag_rank = 1
+LEFT JOIN badge_achievements ba ON ua.Id = ba.UserId
+LEFT JOIN LATERAL (
+    SELECT UserId, edited_posts, edit_count, rollback_count, edit_comments, hours_between_edits
+    FROM edit_patterns
+    WHERE UserId = ua.Id
+    ORDER BY hours_between_edits DESC NULLS LAST
+    LIMIT 1
+) ep ON TRUE
+LEFT JOIN LATERAL (
+    SELECT cumulative_score
+    FROM recursive_post_chain
+    WHERE Id IN (SELECT Id FROM Posts WHERE OwnerUserId = ua.Id)
+    ORDER BY cumulative_score DESC
+    LIMIT 1
+) rpc ON TRUE
+WHERE ua.post_count > 0
+    AND (ua.question_count > 0 OR ua.answer_count > 0)
+    AND NOT (ua.DisplayName IS NULL AND te.tag_name IS NULL)
+ORDER BY 
+    ua.reputation_rank ASC,
+    COALESCE(te.tag_score_sum, 0) DESC,
+    ba.gold_badges DESC NULLS LAST,
+    ua.median_score DESC NULLS LAST
+LIMIT 100;

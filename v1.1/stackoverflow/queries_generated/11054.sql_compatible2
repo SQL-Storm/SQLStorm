@@ -1,0 +1,96 @@
+WITH RecentPosts AS (
+    SELECT 
+        p.Id, 
+        p.Title, 
+        p.CreationDate, 
+        p.Score, 
+        p.ViewCount, 
+        u.DisplayName AS OwnerDisplayName, 
+        u.Reputation,
+        COALESCE(SUM(v.BountyAmount), 0) AS TotalBounty,
+        p.OwnerUserId
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT 
+            PostId, 
+            BountyAmount
+        FROM Votes 
+        WHERE VoteTypeId IN (8, 9)
+    ) v ON p.Id = v.PostId
+    WHERE p.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '30' DAY
+    GROUP BY p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, u.DisplayName, u.Reputation, p.OwnerUserId
+),
+TopUsers AS (
+    SELECT 
+        OwnerUserId, 
+        COUNT(Id) AS PostCount, 
+        AVG(Score) AS AvgScore,
+        SUM(ViewCount) AS TotalViews
+    FROM Posts
+    WHERE CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '30' DAY
+    GROUP BY OwnerUserId
+    HAVING COUNT(Id) > 5
+),
+PostTags AS (
+    SELECT 
+        p.Id,
+        -- portable split: remove leading/trailing angle brackets then split on '><'
+        -- use standard functions: SUBSTRING and REPLACE combination and a simple splitter emulation where supported
+        -- keep original expression but avoid Postgres-only regexp_split_to_array if possible; fallback to regexp_split_to_table later
+        CASE
+          WHEN p.Tags IS NULL OR p.Tags = '' THEN NULL
+          ELSE substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2)
+        END AS TagString
+    FROM Posts p
+),
+TaggedPosts AS (
+    -- use a set-returning split via regexp_split_to_table where available; many engines support similar; for strict standard SQL a user-defined split is required.
+    SELECT 
+        pt.Id,
+        CAST(tn AS INTEGER) AS TagIdTextOrId,
+        tn AS TagNameCandidate
+    FROM PostTags pt
+    CROSS JOIN LATERAL (
+        SELECT regexp_split_to_table(pt.TagString, '><') AS tn
+    ) s
+),
+TaggedPostsResolved AS (
+    SELECT
+        tp.Id,
+        t.TagName
+    FROM TaggedPosts tp
+    JOIN Tags t ON CAST(tp.TagNameCandidate AS INTEGER) = t.Id
+),
+PostActivity AS (
+    SELECT 
+        p.Id,
+        COUNT(DISTINCT ph.Id) AS EditCount,
+        COUNT(DISTINCT c.Id) AS CommentCount
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    GROUP BY p.Id
+)
+SELECT 
+    rp.Id,
+    rp.Title,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.OwnerDisplayName,
+    rp.Reputation,
+    rp.TotalBounty,
+    tp.PostCount,
+    tp.AvgScore,
+    tp.TotalViews,
+    pa.EditCount,
+    pa.CommentCount,
+    COALESCE(STRING_AGG(t.TagName, ', '), '') AS Tags
+FROM RecentPosts rp
+LEFT JOIN TopUsers tp ON rp.OwnerUserId = tp.OwnerUserId
+JOIN PostActivity pa ON rp.Id = pa.Id
+LEFT JOIN TaggedPostsResolved t ON rp.Id = t.Id
+GROUP BY rp.Id, rp.Title, rp.CreationDate, rp.Score, rp.ViewCount, rp.OwnerDisplayName, rp.Reputation, rp.TotalBounty, rp.OwnerUserId, tp.PostCount, tp.AvgScore, tp.TotalViews, pa.EditCount, pa.CommentCount
+ORDER BY rp.Score DESC, rp.ViewCount DESC, rp.TotalBounty DESC
+LIMIT 10;

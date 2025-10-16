@@ -1,0 +1,124 @@
+WITH PostTags AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Score AS QuestionScore,
+        p.ViewCount,
+        p.FavoriteCount,
+        tag.name AS TagName
+    FROM Posts p
+    CROSS JOIN LATERAL unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tag(name)
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL AND p.OwnerUserId IS NOT NULL
+),
+UserContentAggregates AS (
+    SELECT
+        OwnerUserId AS UserId,
+        SUM(AnswerCount) AS TotalAnswersPosted,
+        SUM(QuestionCount) AS TotalQuestionsAsked,
+        SUM(ContentScore) AS TotalContentScore,
+        SUM(DownVotesOnContent) AS TotalDownVotesOnContent
+    FROM (
+        SELECT
+            a.OwnerUserId,
+            1 AS AnswerCount,
+            0 AS QuestionCount,
+            a.Score AS ContentScore,
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 3) AS DownVotesOnContent
+        FROM Posts a
+        WHERE a.PostTypeId = 2 AND a.OwnerUserId IS NOT NULL
+        UNION ALL
+        SELECT
+            q.OwnerUserId,
+            0 AS AnswerCount,
+            1 AS QuestionCount,
+            q.Score AS ContentScore,
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 3) AS DownVotesOnContent
+        FROM Posts q
+        WHERE q.PostTypeId = 1 AND q.OwnerUserId IS NOT NULL
+    ) AS UserPostActivity
+    GROUP BY OwnerUserId
+),
+UserTagPerformance AS (
+    SELECT
+        ans.OwnerUserId,
+        pt.TagName,
+        COUNT(ans.Id) AS AnswersInTag,
+        SUM(ans.Score) AS TotalScoreInTag,
+        AVG(ans.CommentCount) AS AvgCommentsPerAnswer,
+        (SELECT COUNT(*)
+         FROM Badges b
+         WHERE b.UserId = ans.OwnerUserId
+           AND (b.TagBased = TRUE OR b.TagBased = '1' OR b.TagBased = 1 OR b.TagBased = 't' OR b.TagBased = 'true')
+           AND lower(b.Name) = lower(pt.TagName)
+           AND b.Class = 1
+        ) AS GoldTagBadges
+    FROM Posts ans
+    JOIN PostTags pt ON ans.ParentId = pt.PostId
+    WHERE ans.PostTypeId = 2
+      AND ans.OwnerUserId IS NOT NULL
+    GROUP BY ans.OwnerUserId, pt.TagName
+    HAVING COUNT(ans.Id) > 10 AND SUM(ans.Score) > 100
+),
+RankedTagPerformance AS (
+    SELECT
+        utp.OwnerUserId,
+        utp.TagName,
+        utp.AnswersInTag,
+        utp.TotalScoreInTag,
+        utp.GoldTagBadges,
+        DENSE_RANK() OVER (PARTITION BY utp.TagName ORDER BY (utp.TotalScoreInTag + utp.AnswersInTag * 10 + utp.GoldTagBadges * 100) DESC) AS TagRank,
+        utp.TotalScoreInTag - LAG(utp.TotalScoreInTag, 1, 0) OVER (PARTITION BY utp.TagName ORDER BY (utp.TotalScoreInTag + utp.AnswersInTag * 10 + utp.GoldTagBadges * 100) DESC) AS ScoreDiffFromPrevRank
+    FROM UserTagPerformance utp
+),
+ContentChurn AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(ph.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9) THEN 1 ELSE 0 END) AS TotalEditsAndRollbacks,
+        AVG(CASE WHEN ph.PostHistoryTypeId = 10 THEN (ph.CreationDate - p.CreationDate) ELSE NULL END) AS AvgTimeToFirstClosure
+    FROM Posts p
+    JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE p.OwnerUserId IS NOT NULL
+      AND ph.CreationDate > p.CreationDate
+    GROUP BY p.OwnerUserId
+)
+SELECT
+    u.DisplayName,
+    u.Reputation,
+    rtp.TagName,
+    rtp.TagRank,
+    rtp.AnswersInTag,
+    rtp.TotalScoreInTag,
+    rtp.ScoreDiffFromPrevRank,
+    COALESCE(uca.TotalDownVotesOnContent, 0) AS DownVotesReceived,
+    CASE
+        WHEN rtp.TagRank <= 3 AND rtp.GoldTagBadges > 0 THEN 'Elite Tag Specialist'
+        WHEN rtp.TagRank <= 10 AND uca.TotalDownVotesOnContent > 50 THEN 'Controversial Expert'
+        WHEN u.Reputation > 100000 AND rtp.AnswersInTag > 50 THEN 'Community Pillar'
+        ELSE 'Dedicated Contributor'
+    END AS UserProfile,
+    CONCAT_WS(' | ',
+        'Location: ' || COALESCE(u.Location, 'N/A'),
+        'Active Since: ' || TO_CHAR(u.CreationDate, 'YYYY'),
+        'Content Edits: ' || COALESCE(cc.TotalEditsAndRollbacks, 0)
+    ) AS UserSummary,
+    cc.AvgTimeToFirstClosure
+FROM Users u
+JOIN RankedTagPerformance rtp ON u.Id = rtp.OwnerUserId
+LEFT JOIN UserContentAggregates uca ON u.Id = uca.UserId
+LEFT JOIN ContentChurn cc ON u.Id = cc.OwnerUserId
+WHERE
+    u.Reputation > 20000
+    AND u.CreationDate < (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '4 years')
+    AND rtp.TagRank <= 50
+    AND EXISTS (
+        SELECT 1
+        FROM Comments c
+        WHERE c.UserId = u.Id AND c.Score > 20
+    )
+ORDER BY
+    rtp.TagName,
+    rtp.TagRank,
+    u.Reputation DESC
+LIMIT 500;

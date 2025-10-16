@@ -1,0 +1,121 @@
+WITH RecentHighScoreQuestions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn,
+        p.AcceptedAnswerId
+    FROM 
+        Posts p
+    WHERE 
+        p.PostTypeId = 1
+        AND p.Score >= 10
+        AND p.CreationDate > (DATE '2024-10-01' - INTERVAL '365' DAY)
+),
+TopCommenters AS (
+    SELECT 
+        c.PostId,
+        c.UserId,
+        COUNT(*) AS CommentCount
+    FROM 
+        Comments c
+    WHERE 
+        c.CreationDate > (DATE '2024-10-01' - INTERVAL '365' DAY)
+    GROUP BY 
+        c.PostId, c.UserId
+),
+UserBadges AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM
+        Badges b
+    WHERE
+        b.Date > (DATE '2024-10-01' - INTERVAL '2' YEAR)
+    GROUP BY b.UserId
+),
+EditedQuestions AS (
+    SELECT
+        ph.PostId,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM
+        PostHistory ph
+    WHERE
+        ph.PostHistoryTypeId IN (4,5,6)
+    GROUP BY
+        ph.PostId
+),
+TagsPerPost AS (
+    -- generic-sql-compatible tag splitter: split by '><' after trimming surrounding angle brackets
+    SELECT
+        qp.Id AS PostId,
+        TRIM(BOTH '<>' FROM token) AS tag
+    FROM
+        Posts qp,
+        LATERAL (
+            SELECT
+                REGEXP_SUBSTR(t, '[^><]+', 1, level) AS token
+            FROM (
+                SELECT TRIM(BOTH '<>' FROM qp.Tags) AS t
+            ) x
+            -- generate levels up to a reasonable max; adjust if your SQL dialect supports recursive split instead
+            CROSS JOIN (VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10)) AS levels(level)
+        ) s
+    WHERE
+        qp.Tags IS NOT NULL
+)
+SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    u.DisplayName AS OwnerName,
+    COALESCE(b.GoldBadges, 0) AS GoldBadges,
+    COALESCE(b.SilverBadges, 0) AS SilverBadges,
+    COALESCE(b.BronzeBadges, 0) AS BronzeBadges,
+    COUNT(DISTINCT a.Id) AS NumberOfAnswers,
+    MAX(CASE WHEN tcc.CommentCount IS NULL THEN 0 ELSE tcc.CommentCount END) AS MaxCommentsBySingleUser,
+    (SELECT STRING_AGG(t.tag, ', ')
+     FROM TagsPerPost t
+     WHERE t.PostId = q.Id
+    ) AS TagList,
+    CASE 
+        WHEN q.ViewCount = 0 THEN NULL
+        ELSE ROUND((CAST(q.Score AS DECIMAL) / NULLIF(q.ViewCount,0)) * 100, 2)
+    END AS ScorePer100Views,
+    EXTRACT(EPOCH FROM (COALESCE(eq.LastEditDate, q.CreationDate) - q.CreationDate))/3600 AS HoursToEdit,
+    CASE
+        WHEN q.AnswerCount = 0 THEN 'Unanswered'
+        WHEN EXISTS (
+            SELECT 1 FROM Posts ans WHERE ans.ParentId = q.Id AND ans.Id = q.AcceptedAnswerId
+        ) THEN 'Accepted'
+        ELSE 'AnsweredNotAccepted'
+    END AS AnswerStatus,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 2) AS UpVoteCount,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 3) AS DownVoteCount
+FROM 
+    RecentHighScoreQuestions q
+    LEFT JOIN Users u ON u.Id = q.OwnerUserId
+    LEFT JOIN UserBadges b ON b.UserId = q.OwnerUserId
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN TopCommenters tcc ON tcc.PostId = q.Id
+    LEFT JOIN EditedQuestions eq ON eq.PostId = q.Id
+WHERE
+    q.rn = 1
+    AND (
+        q.ViewCount > 1000 
+        OR COALESCE(b.GoldBadges,0) > 0
+        OR EXTRACT(EPOCH FROM (COALESCE(eq.LastEditDate, q.CreationDate) - q.CreationDate)) > 7200
+    )
+GROUP BY
+    q.Id, q.Title, q.Score, q.ViewCount, q.AnswerCount, u.DisplayName, b.GoldBadges, b.SilverBadges, b.BronzeBadges, q.OwnerUserId, q.AcceptedAnswerId, q.CreationDate, eq.LastEditDate, q.rn
+ORDER BY
+    ScorePer100Views DESC, MaxCommentsBySingleUser DESC
+LIMIT 50;

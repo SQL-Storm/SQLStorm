@@ -1,0 +1,54 @@
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN p.Id ELSE NULL END) AS TotalUpVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN p.Id ELSE NULL END) AS TotalDownVotes,
+    MAX(u.CreationDate) AS LastAccountActivity,
+    b.Name AS LatestBadge,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    (SELECT 
+         ph.PostId, 
+         ph.CreationDate AS LastEditDate,
+         ph.PostHistoryTypeId,
+         ph.Comment,
+         ph.UserId
+     FROM 
+         PostHistory ph
+     WHERE 
+         ph.PostHistoryTypeId IN (1, 2, 4, 5, 6, 8, 10, 11, 12, 13, 14, 15, 19, 20, 35, 36) 
+         AND ph.Comment IS NOT NULL
+    ) ph ON u.Id = ph.UserId
+LEFT JOIN 
+    (SELECT 
+        pv.PostId, 
+        pv.VoteTypeId,
+        COUNT(pv.Id) AS VoteCount
+     FROM 
+        Votes pv
+     WHERE 
+        pv.VoteTypeId IN (2, 3) 
+     GROUP BY 
+        pv.PostId, pv.VoteTypeId
+    ) v ON p.Id = v.PostId
+WHERE 
+    p.LastActivityDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1' YEAR)
+GROUP BY 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    b.Name,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC)
+HAVING 
+    AVG(LENGTH(SUBSTRING(COALESCE(p.Tags, ''), 1, 10000))) > 10
+ORDER BY 
+    TotalUpVotes DESC, 
+    TotalPosts DESC;

@@ -1,0 +1,107 @@
+WITH RecentComments AS (
+    SELECT c.PostId, COUNT(*) AS CommentCount
+    FROM Comments c
+    WHERE c.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days'
+    GROUP BY c.PostId
+),
+PostVotes AS (
+    SELECT v.PostId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes
+    FROM Votes v
+    GROUP BY v.PostId
+),
+AnswerStats AS (
+    SELECT p.ParentId AS QuestionId,
+        COUNT(p.Id) AS AnswerCount,
+        AVG(p.Score) AS AvgAnswerScore
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+),
+TagInfo AS (
+    SELECT t.TagName,
+        t.Count AS TagCount,
+        MAX(u.Reputation) AS MaxReputation,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') AS DistinctAnswerers
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE t.IsModeratorOnly = FALSE
+    GROUP BY t.TagName, t.Count
+),
+QuestionDetails AS (
+    SELECT q.Id AS QuestionId,
+        q.Title,
+        q.Tags,
+        q.CreationDate,
+        q.Score,
+        COALESCE(c.CommentCount, 0) AS RecentCommentCount,
+        COALESCE(v.UpVotes, 0) AS UpVotes,
+        COALESCE(v.DownVotes, 0) AS DownVotes,
+        a.AnswerCount,
+        a.AvgAnswerScore,
+        CASE WHEN q.ClosedDate IS NOT NULL THEN TRUE ELSE FALSE END AS IsClosed,
+        ('https://stackoverflow.com/questions/' || q.Id) AS QuestionURL
+    FROM Posts q
+    LEFT JOIN RecentComments c ON q.Id = c.PostId
+    LEFT JOIN PostVotes v ON q.Id = v.PostId
+    LEFT JOIN AnswerStats a ON q.Id = a.QuestionId
+    WHERE q.PostTypeId = 1
+),
+AggregatedTags AS (
+    SELECT tag.TagName,
+        COUNT(DISTINCT qd.QuestionId) AS QuestionCount,
+        AVG(qd.Score) AS AvgQuestionScore,
+        SUM(COALESCE(qd.AnswerCount, 0)) AS TotalAnswers,
+        SUM(COALESCE(qd.AvgAnswerScore, 0) * COALESCE(qd.AnswerCount, 0)) / NULLIF(SUM(COALESCE(qd.AnswerCount, 0)), 0) AS AvgAnswerScoreAcrossQuestions
+    FROM QuestionDetails qd,
+         LATERAL (
+             SELECT TRIM(both '<>' FROM part) AS TagName
+             FROM UNNEST(string_to_array(substring(qd.Tags, 2, length(qd.Tags)-2), '><')) AS t(part)
+         ) AS tag
+    GROUP BY tag.TagName
+),
+TopTags AS (
+    SELECT TagName,
+        QuestionCount,
+        AvgQuestionScore,
+        TotalAnswers,
+        AvgAnswerScoreAcrossQuestions
+    FROM AggregatedTags
+    WHERE QuestionCount > 10
+    ORDER BY QuestionCount DESC
+    LIMIT 10
+)
+SELECT
+    qd.QuestionId,
+    qd.Title,
+    qd.Tags,
+    qd.CreationDate,
+    qd.Score,
+    qd.RecentCommentCount,
+    qd.UpVotes,
+    qd.DownVotes,
+    qd.AnswerCount,
+    qd.AvgAnswerScore,
+    qd.IsClosed,
+    qd.QuestionURL,
+    ('Top tags by question count: ' || COALESCE(string_agg(tt.TagName, ', '), '')) AS TopTagsSummary
+FROM QuestionDetails qd
+LEFT JOIN TopTags tt ON qd.Tags LIKE '%' || '<' || tt.TagName || '>' || '%'
+WHERE qd.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+GROUP BY
+    qd.QuestionId,
+    qd.Title,
+    qd.Tags,
+    qd.CreationDate,
+    qd.Score,
+    qd.RecentCommentCount,
+    qd.UpVotes,
+    qd.DownVotes,
+    qd.AnswerCount,
+    qd.AvgAnswerScore,
+    qd.IsClosed,
+    qd.QuestionURL
+ORDER BY qd.Score DESC, qd.CreationDate DESC
+LIMIT 50;

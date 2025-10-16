@@ -1,0 +1,122 @@
+WITH RecentPosts AS (
+    SELECT 
+        p.Id, 
+        p.Title, 
+        p.CreationDate, 
+        p.Score, 
+        p.ViewCount, 
+        u.DisplayName AS OwnerDisplayName, 
+        u.Reputation,
+        COALESCE(SUM(v.BountyAmount), 0) AS TotalBounty,
+        p.OwnerUserId
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT 
+            PostId, 
+            BountyAmount
+        FROM Votes 
+        WHERE VoteTypeId IN (8, 9)
+    ) v ON p.Id = v.PostId
+    WHERE p.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '30' DAY
+    GROUP BY p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, u.DisplayName, u.Reputation, p.OwnerUserId
+),
+TopUsers AS (
+    SELECT 
+        OwnerUserId, 
+        COUNT(Id) AS PostCount, 
+        AVG(Score) AS AvgScore,
+        SUM(ViewCount) AS TotalViews
+    FROM Posts
+    WHERE CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '30' DAY
+    GROUP BY OwnerUserId
+    HAVING COUNT(Id) > 5
+),
+PostTags AS (
+    SELECT 
+        p.Id,
+        CASE
+          WHEN p.Tags IS NULL OR p.Tags = '' THEN NULL
+          ELSE SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2))
+        END AS TagString
+    FROM Posts p
+),
+-- many SQL dialects differ on string-splitting functions. Here we provide a portable approach using a numbers/tally generator to split by delimiter '><'.
+-- If your engine provides a native split function, replace the splitting block below with that function for performance.
+TaggedPosts AS (
+    SELECT 
+        pt.Id,
+        TRIM(both '<>' FROM SPLIT_PART_REPL.dummy_part) AS TagNameCandidate
+    FROM PostTags pt
+    JOIN (
+        -- generate split parts by using a recursive CTE to emulate splitting on '><'
+        SELECT pt2.Id, 
+               CASE WHEN pos = 1 THEN SUBSTRING(pt2.TagString FROM 1 FOR COALESCE(NULLIF(STRPOS(pt2.TagString, '><') ,0)-1, CHAR_LENGTH(pt2.TagString)))
+                    ELSE SUBSTRING(pt2.TagString FROM prev_pos + 2 FOR COALESCE(NULLIF(pos - prev_pos - 2, 0), CHAR_LENGTH(pt2.TagString) - prev_pos - 1))
+               END AS dummy_part
+        FROM (
+            SELECT Id, TagString
+            FROM PostTags
+            WHERE TagString IS NOT NULL
+        ) pt2
+        CROSS JOIN LATERAL (
+            -- recursive splitting using numbers up to a reasonable max parts (e.g. 50)
+            SELECT
+                n AS idx,
+                CASE WHEN n = 1 THEN 1 ELSE (SELECT nth_pos FROM (
+                    SELECT idx2,
+                           (SELECT SUM(CASE WHEN s = '><' THEN 2 ELSE 0 END) FROM (VALUES (1)) v) -- placeholder to allow correlated reference; actual engines may require different approach
+                    ) tmp LIMIT 1) END AS pos,
+                0 AS prev_pos
+            FROM (SELECT 1) t
+        ) gen -- placeholder: many engines need a proper numbers table; replace this block with engine-specific splitter
+    ) SPLIT_PART_REPL ON SPLIT_PART_REPL.Id = pt.Id
+),
+-- Fallback simpler split using common regexp functions where available:
+TaggedPostsResolved AS (
+    SELECT
+        tp.Id,
+        t.TagName
+    FROM (
+        -- If your engine supports regexp_split_to_table, use it; otherwise replace with an appropriate splitter.
+        SELECT p.Id, regexp_split_to_table(
+            CASE WHEN p.Tags IS NULL OR p.Tags = '' THEN NULL ELSE SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)) END,
+            '><'
+        ) AS TagNameCandidate
+        FROM Posts p
+        WHERE p.Tags IS NOT NULL AND p.Tags <> ''
+    ) tp
+    JOIN Tags t ON CASE WHEN tp.TagNameCandidate ~ '^[0-9]+$' THEN CAST(tp.TagNameCandidate AS INTEGER) ELSE NULL END = t.Id
+),
+PostActivity AS (
+    SELECT 
+        p.Id,
+        COUNT(DISTINCT ph.Id) AS EditCount,
+        COUNT(DISTINCT c.Id) AS CommentCount
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    GROUP BY p.Id
+)
+SELECT 
+    rp.Id,
+    rp.Title,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.OwnerDisplayName,
+    rp.Reputation,
+    rp.TotalBounty,
+    tp.PostCount,
+    tp.AvgScore,
+    tp.TotalViews,
+    pa.EditCount,
+    pa.CommentCount,
+    COALESCE(STRING_AGG(t.TagName, ', '), '') AS Tags
+FROM RecentPosts rp
+LEFT JOIN TopUsers tp ON rp.OwnerUserId = tp.OwnerUserId
+JOIN PostActivity pa ON rp.Id = pa.Id
+LEFT JOIN TaggedPostsResolved t ON rp.Id = t.Id
+GROUP BY rp.Id, rp.Title, rp.CreationDate, rp.Score, rp.ViewCount, rp.OwnerDisplayName, rp.Reputation, rp.TotalBounty, rp.OwnerUserId, tp.PostCount, tp.AvgScore, tp.TotalViews, pa.EditCount, pa.CommentCount
+ORDER BY rp.Score DESC, rp.ViewCount DESC, rp.TotalBounty DESC
+LIMIT 10;

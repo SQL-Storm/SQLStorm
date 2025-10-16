@@ -1,0 +1,313 @@
+-- {"query": "8031.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3018} 
+with recent_posts as (
+    select
+        p.id as post_id,
+        p.posttypeid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.own eruserid,
+        coalesce(nullif(trim(p.title), ''), '(no title)') as title,
+        p.tags,
+        p.lastactivitydate,
+        p.closeddate,
+        p.acceptedanswerid
+    from posts p
+    where p.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+),
+user_activity as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate as user_created,
+        u.location,
+        u.websiteurl,
+        u.upvotes,
+        u.downvotes,
+        u.views,
+        count(distinct b.id) filter (where b.class = 1) as gold_badges,
+        count(distinct b.id) filter (where b.class = 2) as silver_badges,
+        count(distinct b.id) filter (where b.class = 3) as bronze_badges,
+        count(distinct b.id) as total_badges,
+        max(b.date) as last_badge_date
+    from users u
+    left join badges b on b.userid = u.id
+    group by u.id, u.displayname, u.reputation, u.creationdate, u.location, u.websiteurl, u.upvotes, u.downvotes, u.views
+),
+post_votes as (
+    select
+        v.postid,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+        sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total,
+        min(v.creationdate) as first_vote_at,
+        max(v.creationdate) as last_vote_at
+    from votes v
+    group by v.postid
+),
+comment_stats as (
+    select
+        c.postid,
+        count(*) as comment_count,
+        avg(c.score) as avg_comment_score,
+        max(c.creationdate) as last_comment_at
+    from comments c
+    group by c.postid
+),
+post_edits as (
+    select
+        ph.postid,
+        count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edit_count,
+        max(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as last_edit_at,
+        count(*) filter (where ph.posthistorytypeid in (10,11)) as open_close_events,
+        max(ph.creationdate) filter (where ph.posthistorytypeid in (10,11)) as last_open_close_at,
+        count(*) filter (where ph.posthistorytypeid in (35,36)) as migrations
+    from posthistory ph
+    group by ph.postid
+),
+dup_links as (
+    select
+        pl.postid,
+        count(*) filter (where pl.linktypeid = 3) as duplicate_links,
+        count(*) filter (where pl.linktypeid = 1) as related_links
+    from postlinks pl
+    group by pl.postid
+),
+tag_explode as (
+    select
+        rp.post_id,
+        unnest(string_to_array(substring(rp.tags, 2, greatest(length(rp.tags)-2,0)), '><')) as tagname
+    from recent_posts rp
+    where rp.tags is not null
+),
+tag_rank as (
+    select
+        te.post_id,
+        te.tagname,
+        t.count as tag_global_count,
+        row_number() over (partition by te.post_id order by coalesce(t.count, 0) desc, te.tagname) as tag_rank_desc
+    from tag_explode te
+    left join tags t on t.tagname = te.tagname
+),
+accepted_gap as (
+    select
+        q.id as question_id,
+        q.creationdate as question_created,
+        a.creationdate as accepted_created,
+        extract(epoch from (a.creationdate - q.creationdate))/3600.0 as hours_to_accept
+    from posts q
+    join posts a on a.id = q.acceptedanswerid
+),
+owner_recent_activity as (
+    select
+        rp.owneruserid as user_id,
+        count(*) filter (where rp.posttypeid = 1) as questions_last_year,
+        count(*) filter (where rp.posttypeid = 2) as answers_last_year,
+        sum(coalesce(pv.upvotes,0) - coalesce(pv.downvotes,0)) as net_votes_last_year,
+        max(rp.lastactivitydate) as user_last_activity_post
+    from recent_posts rp
+    left join post_votes pv on pv.postid = rp.post_id
+    where rp.owneruserid is not null
+    group by rp.owneruserid
+),
+post_quality as (
+    select
+        rp.post_id,
+        rp.posttypeid,
+        rp.score,
+        coalesce(pv.upvotes,0) as upvotes,
+        coalesce(pv.downvotes,0) as downvotes,
+        coalesce(pv.favorites,0) as favorites,
+        coalesce(cs.comment_count,0) as comments,
+        coalesce(pe.edit_count,0) as edits,
+        coalesce(dl.duplicate_links,0) as duplicate_links,
+        coalesce(dl.related_links,0) as related_links,
+        case
+            when rp.posttypeid = 1 and rp.acceptedanswerid is not null then 1
+            else 0
+        end as has_accepted,
+        case
+            when rp.closeddate is not null then 1 else 0
+        end as is_closed,
+        width_bucket(coalesce(pv.upvotes,0) - coalesce(pv.downvotes,0), -10, 50, 6) as net_vote_bucket
+    from recent_posts rp
+    left join post_votes pv on pv.postid = rp.post_id
+    left join comment_stats cs on cs.postid = rp.post_id
+    left join post_edits pe on pe.postid = rp.post_id
+    left join dup_links dl on dl.postid = rp.post_id
+),
+user_rollup as (
+    select
+        rp.owneruserid as user_id,
+        count(*) as total_posts,
+        sum(case when pq.posttypeid = 1 then 1 else 0 end) as total_questions,
+        sum(case when pq.posttypeid = 2 then 1 else 0 end) as total_answers,
+        avg(nullif(pq.upvotes - pq.downvotes, 0)) as avg_net_votes_nonzero,
+        percentile_cont(0.5) within group (order by pq.upvotes - pq.downvotes) as median_net_votes,
+        sum(case when pq.is_closed = 1 then 1 else 0 end) as closed_posts,
+        sum(pq.favorites) as total_favorites,
+        sum(pq.edits) as total_edits
+    from recent_posts rp
+    join post_quality pq on pq.post_id = rp.post_id
+    where rp.owneruserid is not null
+    group by rp.owneruserid
+),
+question_waits as (
+    select
+        rp.post_id,
+        ag.hours_to_accept,
+        case
+            when ag.hours_to_accept is null then 1
+            when ag.hours_to_accept > 168 then 1
+            else 0
+        end as long_wait_or_unaccepted
+    from recent_posts rp
+    left join accepted_gap ag on ag.question_id = rp.post_id
+),
+scored_posts as (
+    select
+        pq.post_id,
+        pq.posttypeid,
+        pq.upvotes,
+        pq.downvotes,
+        pq.favorites,
+        pq.comments,
+        pq.edits,
+        pq.duplicate_links,
+        pq.related_links,
+        pq.has_accepted,
+        pq.is_closed,
+        pq.net_vote_bucket,
+        qw.long_wait_or_unaccepted,
+        -- composite score with non-linear transforms and null handling
+        (
+            1.0 * coalesce(pq.upvotes,0)
+            - 1.5 * coalesce(pq.downvotes,0)
+            + 0.5 * coalesce(pq.favorites,0)
+            + ln(1 + greatest(coalesce(pq.comments,0),0))
+            - case when pq.is_closed = 1 then 2.0 else 0.0 end
+            - case when pq.duplicate_links > 0 then 1.0 else 0.0 end
+            + case when pq.has_accepted = 1 then 1.0 else 0.0 end
+            - 0.25 * coalesce(pq.edits,0)
+            - 0.5 * coalesce(qw.long_wait_or_unaccepted,0)
+        ) as quality_score
+    from post_quality pq
+    left join question_waits qw on qw.post_id = pq.post_id
+),
+ranked_posts as (
+    select
+        rp.post_id,
+        rp.posttypeid,
+        rp.creationdate,
+        rp.title,
+        rp.tags,
+        rp.owneruserid,
+        sp.quality_score,
+        dense_rank() over (partition by rp.posttypeid order by sp.quality_score desc, rp.creationdate desc) as quality_rank_within_type,
+        row_number() over (order by sp.quality_score desc, rp.creationdate desc) as global_quality_rank
+    from recent_posts rp
+    join scored_posts sp on sp.post_id = rp.post_id
+),
+top_tag_per_post as (
+    select
+        tr.post_id,
+        string_agg(tr.tagname, ',' order by tr.tagname) filter (where tr.tag_rank_desc = 1) as top_tag,
+        max(tr.tag_global_count) filter (where tr.tag_rank_desc = 1) as top_tag_global_count
+    from tag_rank tr
+    group by tr.post_id
+),
+user_enriched as (
+    select
+        ua.user_id,
+        ua.displayname,
+        ua.reputation,
+        ua.location,
+        ua.websiteurl,
+        ua.total_badges,
+        ua.gold_badges,
+        ua.silver_badges,
+        ua.bronze_badges,
+        coalesce(ora.questions_last_year,0) as questions_last_year,
+        coalesce(ora.answers_last_year,0) as answers_last_year,
+        coalesce(ora.net_votes_last_year,0) as net_votes_last_year,
+        ur.total_posts,
+        ur.total_questions,
+        ur.total_answers,
+        ur.avg_net_votes_nonzero,
+        ur.median_net_votes,
+        ur.closed_posts,
+        ur.total_favorites,
+        ur.total_edits
+    from user_activity ua
+    left join owner_recent_activity ora on ora.user_id = ua.user_id
+    left join user_rollup ur on ur.user_id = ua.user_id
+)
+select
+    rp.post_id,
+    rp.posttypeid,
+    pt.name as post_type_name,
+    rp.creationdate,
+    rp.title,
+    coalesce(ttp.top_tag, '(no tag)') as top_tag,
+    ttp.top_tag_global_count,
+    u.displayname as owner_displayname,
+    u.reputation as owner_reputation,
+    u.total_badges,
+    u.gold_badges,
+    u.silver_badges,
+    u.bronze_badges,
+    u.questions_last_year,
+    u.answers_last_year,
+    u.net_votes_last_year,
+    u.total_posts as owner_total_posts_last_year,
+    sp.quality_score,
+    rp.global_quality_rank,
+    rp.quality_rank_within_type,
+    pv.upvotes,
+    pv.downvotes,
+    pv.favorites,
+    pv.bounty_total,
+    cs.comment_count,
+    cs.avg_comment_score,
+    pe.edit_count,
+    dl.duplicate_links,
+    dl.related_links,
+    ag.hours_to_accept,
+    case when rp.global_quality_rank <= 100 then 'TOP_100' else 'OTHER' end as quality_bucket,
+    -- complex predicate projection
+    case
+        when (pv.upvotes - pv.downvotes) > 10 and coalesce(pe.edit_count,0) <= 2 and coalesce(cs.comment_count,0) <= 5 then 'HighSignalLowNoise'
+        when coalesce(dl.duplicate_links,0) > 0 or pe.edit_count > 5 then 'ContentiousOrDuplicate'
+        when coalesce(cs.comment_count,0) > 10 and coalesce(cs.avg_comment_score,0) <= 0 then 'ControversialComments'
+        else 'Normal'
+    end as diagnostic_category
+from ranked_posts rp
+left join post_votes pv on pv.postid = rp.post_id
+left join comment_stats cs on cs.postid = rp.post_id
+left join post_edits pe on pe.postid = rp.post_id
+left join dup_links dl on dl.postid = rp.post_id
+left join accepted_gap ag on ag.question_id = rp.post_id
+left join top_tag_per_post ttp on ttp.post_id = rp.post_id
+left join posts p on p.id = rp.post_id
+left join posttypes pt on pt.id = p.posttypeid
+left join user_enriched u on u.user_id = p.owneruserid
+where
+    (
+        rp.global_quality_rank <= 500
+        or (u.reputation >= 10000 and coalesce(pv.upvotes,0) - coalesce(pv.downvotes,0) >= 5)
+        or (coalesce(ttp.top_tag, '') ilike any (array['%sql%','%postgres%','%performance%'])
+            and coalesce(pv.upvotes,0) >= 3)
+    )
+    and not (
+        p.ownerdisplayname is null
+        and p.owneruserid is null
+        and p.posttypeid in (4,5)
+    )
+    and coalesce(p.contentlicense, '') not in ('CC-BY-SA-1.0', 'CC-BY-SA-2.0')
+order by
+    rp.global_quality_rank nulls last,
+    rp.quality_rank_within_type nulls last,
+    sp.quality_score desc
+limit 500;

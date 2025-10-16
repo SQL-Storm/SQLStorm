@@ -1,0 +1,110 @@
+WITH
+RecentActivities AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        v.VoteTypeId,
+        vt.Name AS VoteTypeName,
+        (SELECT COUNT(*) FROM Comments c
+         WHERE c.PostId = p.Id
+           AND c.CreationDate > p.CreationDate) AS PostCommentCountAfterCreation,
+        ROW_NUMBER() OVER (
+            PARTITION BY CAST(p.CreationDate AS date)
+            ORDER BY p.Score DESC, p.ViewCount DESC
+        ) AS DayRank
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+      AND p.PostTypeId IN (1, 2)
+),
+ExpandedLinks AS (
+    SELECT
+        ra.PostId,
+        ra.PostTypeId,
+        ra.Title,
+        ra.Tags,
+        ra.Score,
+        ra.ViewCount,
+        ra.CommentCount,
+        ra.AnswerCount,
+        ra.FavoriteCount,
+        ra.Reputation,
+        ra.UserCreationDate,
+        ra.LastAccessDate,
+        pl.RelatedPostId,
+        pl.LinkTypeId,
+        lt.Name AS LinkTypeName,
+        ra.CreationDate,
+        ra.DayRank
+    FROM RecentActivities ra
+    LEFT JOIN PostLinks pl ON pl.PostId = ra.PostId
+    LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+),
+Calculated AS (
+    SELECT
+        el.PostId,
+        el.PostTypeId,
+        el.Title,
+        el.Tags,
+        el.Score,
+        el.ViewCount,
+        el.CommentCount,
+        el.AnswerCount,
+        el.FavoriteCount,
+        el.Reputation,
+        el.UserCreationDate,
+        el.LastAccessDate,
+        el.RelatedPostId,
+        el.LinkTypeName,
+        (COALESCE(el.Score, 0) * 2
+         + COALESCE(el.ViewCount, 0) / NULLIF(COALESCE(el.AnswerCount, 1), 0)
+         + CASE WHEN el.Reputation IS NULL THEN -1 ELSE 0 END) AS CompositeScore,
+        el.DayRank,
+        el.CreationDate
+    FROM ExpandedLinks el
+    LEFT JOIN (
+        SELECT
+            PostId,
+            ROW_NUMBER() OVER (PARTITION BY PostId ORDER BY CreationDate DESC) AS rn,
+            CreationDate
+        FROM Votes
+    ) AS v2 ON v2.PostId = el.PostId
+)
+SELECT
+    c.PostId,
+    c.PostTypeId,
+    c.Title,
+    -- use standard aggregate with explicit type and ordering via array_agg then array_to_string for portability
+    array_to_string(array_agg(t.tag ORDER BY t.tag), ',') AS AllTags,
+    c.CompositeScore,
+    c.DayRank,
+    c.LinkTypeName,
+    c.RelatedPostId,
+    c.Reputation,
+    c.UserCreationDate,
+    c.LastAccessDate,
+    c.CreationDate
+FROM Calculated c
+LEFT JOIN LATERAL (
+    SELECT UNNEST(string_to_array(REPLACE(REPLACE(REPLACE(c.Tags, '<', ''), '>', ''), ' ', ''), ',')) AS tag
+) AS t ON TRUE
+GROUP BY
+    c.PostId, c.PostTypeId, c.Title, c.CompositeScore, c.DayRank,
+    c.LinkTypeName, c.RelatedPostId, c.Reputation, c.UserCreationDate, c.LastAccessDate, c.CreationDate
+ORDER BY c.CompositeScore DESC, c.DayRank ASC
+LIMIT 100;

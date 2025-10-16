@@ -1,0 +1,140 @@
+WITH UserEngagementMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS NetVotes,
+        (EXTRACT(YEAR FROM (u.LastAccessDate - u.CreationDate)) * 12) + 
+        EXTRACT(MONTH FROM (u.LastAccessDate - u.CreationDate)) AS TenureMonths,
+        CASE 
+            WHEN u.Location IS NOT NULL AND LENGTH(TRIM(u.Location)) > 0 THEN 1
+            ELSE 0
+        END AS HasLocation,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        PERCENT_RANK() OVER (ORDER BY u.Views NULLS LAST) AS ViewPercentile
+    FROM Users u
+    WHERE u.Reputation > 100
+),
+PostPerformance AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 1
+            ELSE 0
+        END AS HasAcceptedAnswer,
+        EXTRACT(EPOCH FROM (COALESCE(p.LastActivityDate, p.CreationDate) - p.CreationDate))/3600 AS HoursActive,
+        -- create tag array in standard SQL using string functions where available
+        STRING_TO_ARRAY(SUBSTRING(COALESCE(p.Tags, ''), 2, GREATEST(LENGTH(COALESCE(p.Tags, '')) - 2, 0)), '><') AS TagArray,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) AS RollingAvgScore
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+        AND p.CreationDate >= TIMESTAMP '2020-01-01'
+),
+TagExpertise AS (
+    SELECT 
+        p.OwnerUserId,
+        tag AS TagName,
+        COUNT(*) AS PostsInTag,
+        AVG(p.Score) AS AvgTagScore,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedInTag
+    FROM Posts p,
+    LATERAL (
+      SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(COALESCE(p.Tags, ''), 2, GREATEST(LENGTH(COALESCE(p.Tags, '')) - 2, 0)), '><')) AS tag
+    ) t
+    WHERE p.PostTypeId = 1 
+        AND p.Tags IS NOT NULL
+        AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId, tag
+    HAVING COUNT(*) >= 3
+),
+VotingPatterns AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteCount,
+        MIN(CASE WHEN v.VoteTypeId = 2 THEN v.CreationDate END) AS FirstUpvoteDate,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2, 3, 5)
+    GROUP BY v.PostId
+)
+SELECT 
+    uem.DisplayName,
+    uem.Reputation,
+    uem.TenureMonths,
+    uem.ReputationRank,
+    ROUND(CAST(uem.ViewPercentile AS NUMERIC), 4) AS ViewPercentile,
+    COUNT(DISTINCT pp.PostId) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN pp.PostTypeId = 1 THEN pp.PostId END) AS QuestionCount,
+    COUNT(DISTINCT CASE WHEN pp.PostTypeId = 2 THEN pp.PostId END) AS AnswerCount,
+    ROUND(AVG(pp.Score), 2) AS AvgPostScore,
+    ROUND(AVG(NULLIF(pp.ViewCount, 0)), 2) AS AvgViewCount,
+    SUM(pp.HasAcceptedAnswer) AS AcceptedAnswerCount,
+    MAX(te.PostsInTag) AS MaxPostsInSingleTag,
+    STRING_AGG(DISTINCT te.TagName, ', ') FILTER (WHERE te.PostsInTag >= 5) AS ExpertiseTags,
+    ROUND(AVG(CASE 
+        WHEN pp.PrevPostScore IS NOT NULL THEN pp.Score - pp.PrevPostScore 
+        ELSE NULL 
+    END), 2) AS AvgScoreImprovement,
+    COALESCE(SUM(vp.UpvoteCount), 0) AS TotalUpvotes,
+    COALESCE(SUM(vp.DownvoteCount), 0) AS TotalDownvotes,
+    ROUND(
+        COALESCE(SUM(vp.UpvoteCount), 0) * 1.0 / 
+        NULLIF(COALESCE(SUM(vp.UpvoteCount), 0) + COALESCE(SUM(vp.DownvoteCount), 0), 0),
+        4
+    ) AS UpvoteRatio,
+    COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+    COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+    COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+    CASE 
+        WHEN uem.TenureMonths > 0 THEN ROUND(CAST(uem.Reputation AS NUMERIC) / uem.TenureMonths, 2)
+        ELSE 0
+    END AS ReputationPerMonth,
+    (SELECT COUNT(*) 
+     FROM Comments c 
+     WHERE c.UserId = uem.Id 
+        AND c.Score > 0) AS PositiveComments,
+    (SELECT STRING_AGG(DISTINCT pt.Name, ', ')
+     FROM Posts p2
+     INNER JOIN PostTypes pt ON p2.PostTypeId = pt.Id
+     WHERE p2.OwnerUserId = uem.Id) AS PostTypesUsed,
+    EXISTS(
+        SELECT 1 
+        FROM PostHistory ph 
+        WHERE ph.UserId = uem.Id 
+            AND ph.PostHistoryTypeId IN (4, 5, 6)
+        LIMIT 1
+    ) AS HasEditedPosts
+FROM UserEngagementMetrics uem
+LEFT JOIN PostPerformance pp ON uem.Id = pp.OwnerUserId
+LEFT JOIN TagExpertise te ON uem.Id = te.OwnerUserId AND te.PostsInTag >= 5
+LEFT JOIN VotingPatterns vp ON pp.PostId = vp.PostId
+LEFT JOIN Badges b ON uem.Id = b.UserId
+WHERE uem.TenureMonths >= 6
+    AND (pp.PostId IS NOT NULL OR EXISTS(
+        SELECT 1 FROM Comments c WHERE c.UserId = uem.Id
+    ))
+GROUP BY uem.Id, uem.DisplayName, uem.Reputation, uem.TenureMonths, 
+         uem.ReputationRank, uem.ViewPercentile, uem.NetVotes, uem.HasLocation
+HAVING COUNT(DISTINCT pp.PostId) >= 5
+    OR SUM(COALESCE(vp.UpvoteCount, 0)) >= 10
+ORDER BY 
+    CASE 
+        WHEN COUNT(DISTINCT pp.PostId) > 0 
+        THEN (CAST(uem.Reputation AS NUMERIC) * 0.3 + 
+              AVG(pp.Score) * 10 * 0.3 + 
+              COUNT(DISTINCT pp.PostId) * 5 * 0.4)
+        ELSE CAST(uem.Reputation AS NUMERIC)
+    END DESC,
+    uem.ReputationRank ASC
+LIMIT 100;

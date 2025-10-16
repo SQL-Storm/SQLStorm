@@ -1,0 +1,204 @@
+-- {"query": "7081.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2225} 
+with
+-- recent activity per question including last edit and last comment
+RecentActivity as (
+  select
+    p.Id as QuestionId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    coalesce(p.LastEditDate, p.LastActivityDate, p.CreationDate) as LastActivity,
+    p.ViewCount,
+    p.Score,
+    p.AnswerCount,
+    p.Tags,
+    -- derive tag array (Postgres style) defensively handling NULL/empty
+    case
+      when p.Tags is null or p.Tags = '' then array[]::text[]
+      else string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')
+    end as TagArray
+  from Posts p
+  where p.PostTypeId = 1
+),
+-- windowed ranking of active questions for sampling, plus some heavy expressions
+RankedQuestions as (
+  select
+    ra.*,
+    row_number() over (order by LastActivity desc, Score desc, ViewCount desc) as RecentRank,
+    dense_rank() over (partition by date_trunc('month', coalesce(LastActivity, CreationDate)) order by Score desc) as MonthlyTopDenseRank,
+    -- synthetic complexity: compute popularity score with null-aware math and trig/log
+    (coalesce(ra.Score,0) * greatest(1, ln(1+greatest(1, ra.ViewCount))) 
+      + power(coalesce(ra.AnswerCount,0), 1.2)
+      - 10 * coalesce((select count(1) from PostLinks pl where pl.PostId = ra.QuestionId and pl.LinkTypeId = 3), 0)
+      + case when ra.Tags is not null then char_length(ra.Tags) % 17 else 0 end
+    )::numeric(18,6) as PopularityScore
+  from RecentActivity ra
+),
+-- compute per-question aggregated stats including correlated subqueries and outer joins
+QuestionStats as (
+  select
+    rq.QuestionId,
+    rq.Title,
+    rq.OwnerUserId,
+    rq.CreationDate,
+    rq.LastActivity,
+    rq.ViewCount,
+    rq.Score,
+    rq.AnswerCount,
+    rq.TagArray,
+    rq.PopularityScore,
+    -- count answers (excluding deleted by absence)
+    (select count(*) from Posts a where a.ParentId = rq.QuestionId and a.PostTypeId = 2) as LiveAnswerCount,
+    -- best answer score and id (may be null)
+    (select a.Id from Posts a where a.ParentId = rq.QuestionId and a.PostTypeId = 2 order by a.Score desc nulls last limit 1) as BestAnswerId,
+    (select a.Score from Posts a where a.ParentId = rq.QuestionId and a.PostTypeId = 2 order by a.Score desc nulls last limit 1) as BestAnswerScore,
+    -- votes breakdown using conditional aggregation
+    (select count(*) filter (where v.VoteTypeId = 2) from Votes v where v.PostId = rq.QuestionId) as UpVotesQ,
+    (select count(*) filter (where v.VoteTypeId = 3) from Votes v where v.PostId = rq.QuestionId) as DownVotesQ,
+    (select count(*) from Comments c where c.PostId = rq.QuestionId) as CommentCountQ,
+    -- last meaningful comment text (correlated subquery with text processing)
+    (select c.Text from Comments c where c.PostId = rq.QuestionId and length(c.Text) > 0 order by c.CreationDate desc limit 1) as LastCommentText,
+    rq.RecentRank,
+    rq.MonthlyTopDenseRank
+  from RankedQuestions rq
+  where rq.RecentRank <= 2000  -- sample top recent 2000 for heavier workload
+),
+-- enrich with owner user info and badge statistics (outer joins)
+OwnerEnriched as (
+  select
+    qs.*,
+    u.DisplayName as OwnerName,
+    u.Reputation as OwnerRep,
+    u.CreationDate as OwnerSince,
+    u.Location as OwnerLocation,
+    -- badges: top class counts and recent badge activity
+    bcounts.GoldBadges,
+    bcounts.SilverBadges,
+    bcounts.BronzeBadges,
+    b_recent.RecentBadgeDate,
+    b_recent.RecentBadgeName
+  from QuestionStats qs
+  left join Users u on u.Id = qs.OwnerUserId
+  left join (
+    select UserId,
+      count(*) filter (where Class = 1) as GoldBadges,
+      count(*) filter (where Class = 2) as SilverBadges,
+      count(*) filter (where Class = 3) as BronzeBadges
+    from Badges
+    group by UserId
+  ) bcounts on bcounts.UserId = qs.OwnerUserId
+  left join lateral (
+    select b.Date as RecentBadgeDate, b.Name as RecentBadgeName
+    from Badges b
+    where b.UserId = qs.OwnerUserId
+    order by b.Date desc nulls last
+    limit 1
+  ) b_recent on true
+),
+-- compute tag-level aggregates (explode tag arrays)
+ExplodedTags as (
+  select
+    oe.*,
+    tag,
+    -- tag popularity heuristics
+    (select t.Count from Tags t where t.TagName = tag limit 1) as TagTotalCount,
+    (select p.Id from Posts p where p.PostTypeId = 1 and p.Title is not null and p.Id = oe.QuestionId limit 1) as ProbeExists
+  from OwnerEnriched oe
+  cross join lateral unnest(oe.TagArray) as tag
+),
+-- compute windowed averages per tag and identify anomalies
+TagAggregates as (
+  select
+    tag,
+    count(distinct QuestionId) as QuestionsWithTag,
+    avg(PopularityScore) as AvgPopPerTag,
+    stddev_pop(PopularityScore) as StdDevPopPerTag,
+    max(PopularityScore) as MaxPopPerTag,
+    min(PopularityScore) as MinPopPerTag
+  from ExplodedTags
+  group by tag
+),
+-- identify suspicious duplicate link patterns and merged histories
+DuplicatesAndMerges as (
+  select
+    pl.PostId,
+    pl.RelatedPostId,
+    pl.LinkTypeId,
+    lt.Name as LinkTypeName,
+    p1.PostTypeId as PostType_Source,
+    p2.PostTypeId as PostType_Target,
+    -- count of shared commenters between two posts (expensive correlated set)
+    (
+      select count(distinct c1.UserId)
+      from Comments c1
+      join Comments c2 on c1.UserId = c2.UserId and c2.PostId = pl.RelatedPostId
+      where c1.PostId = pl.PostId and c1.UserId is not null
+    ) as SharedCommenters
+  from PostLinks pl
+  left join LinkTypes lt on lt.Id = pl.LinkTypeId
+  left join Posts p1 on p1.Id = pl.PostId
+  left join Posts p2 on p2.Id = pl.RelatedPostId
+  where pl.LinkTypeId in (1,3)
+),
+-- final selection combining many pieces, using set operators and complex predicates
+FinalSet as (
+  select
+    et.QuestionId,
+    et.Title,
+    et.OwnerUserId,
+    coalesce(et.OwnerName, 'unknown') as OwnerName,
+    et.OwnerRep,
+    et.ViewCount,
+    et.Score,
+    et.PopularityScore,
+    et.LiveAnswerCount,
+    et.BestAnswerId,
+    et.BestAnswerScore,
+    et.UpVotesQ,
+    et.DownVotesQ,
+    et.CommentCountQ,
+    -- text-related measures
+    length(coalesce(et.LastCommentText,'')) as LastCommentLen,
+    -- stringify tag list with conditional ordering: most frequent tags first by TagTotalCount desc nulls last then alphabetic
+    array_to_string(array_agg(distinct et.tag order by coalesce((select Count from Tags t where t.TagName = et.tag),0) desc, et.tag), ',') as TagsOrdered,
+    ta.AvgPopPerTag,
+    ta.StdDevPopPerTag,
+    da.MaxPopPerTag,
+    -- detect if question appears in duplicates table as duplicate target
+    (exists (select 1 from DuplicatesAndMerges dm where dm.RelatedPostId = et.QuestionId and dm.LinkTypeId = 3)) as IsDuplicateTarget,
+    -- heavy boolean: many predicates combined
+    (
+      (et.PopularityScore > coalesce(ta.AvgPopPerTag,0) + coalesce(ta.StdDevPopPerTag,0) * 2)
+      or (et.OwnerRep is null and et.PopularityScore > 50)
+      or (et.DownVotesQ > coalesce(et.UpVotesQ,0) * 2)
+      or (et.BestAnswerScore is null and et.LiveAnswerCount > 5)
+    ) as IsAnomalous
+  from ExplodedTags et
+  left join TagAggregates ta on ta.tag = et.tag
+  left join (
+    select tag as t, max(AvgPopPerTag) as MaxPopPerTag from TagAggregates group by tag
+  ) da on da.t = et.tag
+  where et.QuestionId is not null
+  group by
+    et.QuestionId, et.Title, et.OwnerUserId, et.OwnerName, et.OwnerRep, et.ViewCount, et.Score, et.PopularityScore,
+    et.LiveAnswerCount, et.BestAnswerId, et.BestAnswerScore, et.UpVotesQ, et.DownVotesQ, et.CommentCountQ,
+    et.LastCommentText, ta.AvgPopPerTag, ta.StdDevPopPerTag, da.MaxPopPerTag
+)
+-- final output combining top anomalous questions union with a deterministic sample of non-anomalous ones
+select * from (
+  select fs.*, 'anomalous' as Bucket
+  from FinalSet fs
+  where fs.IsAnomalous = true
+  order by fs.PopularityScore desc nulls last
+  limit 200
+
+  union all
+
+  select fs2.*, 'sample' as Bucket
+  from (
+    select *, row_number() over (order by PopularityScore desc nulls last, Score desc) as rn from FinalSet
+    where IsAnomalous = false
+  ) fs2
+  where rn % 50 = 1
+) t
+order by Bucket desc, PopularityScore desc nulls last, QuestionId;

@@ -1,0 +1,69 @@
+-- {"query": "2094.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4o", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 576} 
+
+WITH BadgeCounts AS (
+    SELECT 
+        UserId, 
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldCount,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverCount,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeCount
+    FROM Badges 
+    GROUP BY UserId
+),
+TopUsers AS (
+    SELECT 
+        U.Id AS UserId, 
+        U.DisplayName, 
+        U.Reputation,
+        COALESCE(BC.GoldCount, 0) AS GoldBadges,
+        COALESCE(BC.SilverCount, 0) AS SilverBadges,
+        COALESCE(BC.BronzeCount, 0) AS BronzeBadges,
+        RANK() OVER (ORDER BY U.Reputation DESC) AS UserRank
+    FROM Users U
+    LEFT JOIN BadgeCounts BC ON U.Id = BC.UserId
+),
+PostInteractions AS (
+    SELECT 
+        P.OwnerUserId,
+        SUM(CASE WHEN C.Score > 0 THEN 1 ELSE 0 END) AS PositiveComments,
+        COUNT(DISTINCT P.Id) AS TotalPosts
+    FROM Posts P
+    LEFT JOIN Comments C ON P.Id = C.PostId
+    GROUP BY P.OwnerUserId
+),
+QuestionsWithHighVotes AS (
+    SELECT 
+        P.Id AS PostId,
+        P.Title,
+        P.ViewCount,
+        V.VoteTypeId,
+        RANK() OVER PARTITION BY P.OwnerUserId ORDER BY P.ViewCount DESC, P.Score DESC LIMIT 10
+    FROM Posts P
+    INNER JOIN Votes V ON P.Id = V.PostId
+    WHERE P.PostTypeId = 1 AND V.VoteTypeId IN (2, 3)
+),
+FavoriteQuestions AS (
+    SELECT 
+        V.UserId, 
+        COUNT(*) AS FavoritesCount
+    FROM Votes V
+    WHERE V.VoteTypeId = 5
+    GROUP BY V.UserId
+)
+SELECT 
+    TU.DisplayName,
+    TU.UserRank,
+    TU.Reputation,
+    TU.GoldBadges,
+    TU.SilverBadges,
+    TU.BronzeBadges,
+    PI.PositiveComments,
+    FQ.FavoritesCount,
+    QHV.PostId AS TopQuestionId,
+    QHV.Title AS TopQuestionTitle,
+    QHV.ViewCount AS TopQuestionViews
+FROM TopUsers TU
+LEFT JOIN PostInteractions PI ON TU.UserId = PI.OwnerUserId
+LEFT JOIN FavoriteQuestions FQ ON TU.UserId = FQ.UserId
+LEFT JOIN QuestionsWithHighVotes QHV ON TU.UserId = QHV.OwnerUserId
+WHERE TU.UserRank <= 10
+ORDER BY TU.UserRank;

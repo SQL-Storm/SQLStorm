@@ -1,0 +1,125 @@
+-- {"query": "16047.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 112080, "output_tokens": 104063} 
+WITH RECURSIVE UserEngagement AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        ROW_NUMBER() OVER (PARTITION BY SUBSTRING(COALESCE(u.Location, 'N/A'), 1, 2) ORDER BY u.Reputation DESC) AS LocationRank
+    FROM Users u
+    LEFT OUTER JOIN Badges b ON u.Id = b.UserId AND b.Date >= u.CreationDate + INTERVAL '30 days'
+    WHERE u.Reputation > 1000
+        AND u.CreationDate >= '2015-01-01'
+        AND (u.Location IS NULL OR LENGTH(TRIM(u.Location)) > 0)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+    HAVING COUNT(DISTINCT b.Id) > 5
+),
+PostMetrics AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CreationDate AS PostCreationDate,
+        COALESCE(p.Title, SUBSTRING(p.Body, 1, 50)) AS PostTitle,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score >= 5) AS HighScoreComments,
+        (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 8 AND v.BountyAmount IS NOT NULL) AS AvgBounty,
+        DENSE_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC NULLS LAST) AS UserPostRank,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostScore,
+        LEAD(p.ViewCount, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostViews
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+        AND p.CreationDate BETWEEN '2018-01-01' AND '2023-12-31'
+        AND (p.ClosedDate IS NULL OR p.ClosedDate > p.CreationDate + INTERVAL '7 days')
+),
+TagPopularity AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 10000 THEN 'Very Popular'
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END AS PopularityTier,
+        (SELECT COUNT(DISTINCT pl.PostId) 
+         FROM Posts p2
+         INNER JOIN PostLinks pl ON p2.Id = pl.PostId
+         WHERE p2.Tags LIKE '%<' || t.TagName || '>%' AND pl.LinkTypeId = 3) AS DuplicateCount
+    FROM Tags t
+    WHERE t.Count > 50
+)
+SELECT 
+    ue.DisplayName AS UserName,
+    ue.Reputation,
+    ue.LocationRank,
+    CASE 
+        WHEN ue.Location LIKE '%United%' THEN 'US-Based'
+        WHEN ue.Location LIKE '%India%' THEN 'India-Based'
+        WHEN ue.Location IS NULL THEN 'Unknown'
+        ELSE 'Other'
+    END AS LocationCategory,
+    ue.GoldBadges,
+    pm.PostTitle,
+    pm.PostTypeId,
+    COALESCE(pm.Score, 0) + COALESCE(pm.HighScoreComments * 2, 0) AS EngagementScore,
+    ROUND(CAST(pm.ViewCount AS NUMERIC) / NULLIF(EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - pm.PostCreationDate)) / 86400, 0), 2) AS ViewsPerDay,
+    pm.AvgBounty,
+    pm.PreviousPostScore,
+    pm.UserPostRank,
+    tp.PopularityTier,
+    tp.DuplicateCount,
+    (SELECT COUNT(*) 
+     FROM PostHistory ph 
+     WHERE ph.PostId = pm.PostId 
+         AND ph.PostHistoryTypeId IN (4, 5, 6)
+         AND ph.UserId != pm.OwnerUserId) AS ExternalEdits,
+    (SELECT STRING_AGG(DISTINCT vt.Name, ', ' ORDER BY vt.Name)
+     FROM Votes v 
+     INNER JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+     WHERE v.PostId = pm.PostId AND v.VoteTypeId IN (2, 3, 10, 11)) AS VoteTypeList,
+    CASE 
+        WHEN pm.Score > (SELECT AVG(Score) FROM PostMetrics WHERE OwnerUserId = pm.OwnerUserId) THEN 'Above Average'
+        WHEN pm.Score < (SELECT AVG(Score) FROM PostMetrics WHERE OwnerUserId = pm.OwnerUserId) THEN 'Below Average'
+        ELSE 'Average'
+    END AS PerformanceVsUserAvg,
+    COUNT(*) OVER (PARTITION BY ue.Id) AS TotalQualifyingPosts,
+    SUM(pm.AnswerCount) OVER (PARTITION BY ue.Id ORDER BY pm.PostCreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeAnswers
+FROM UserEngagement ue
+INNER JOIN PostMetrics pm ON ue.Id = pm.OwnerUserId
+LEFT OUTER JOIN LATERAL (
+    SELECT TagName, PopularityTier, DuplicateCount
+    FROM TagPopularity
+    WHERE PostMetrics.PostId IN (
+        SELECT p.Id 
+        FROM Posts p 
+        WHERE p.Tags LIKE '%<' || TagPopularity.TagName || '>%' 
+        LIMIT 1
+    )
+    LIMIT 1
+) tp ON TRUE
+WHERE pm.UserPostRank <= 10
+    AND (pm.AvgBounty IS NULL OR pm.AvgBounty >= 50)
+    AND EXISTS (
+        SELECT 1 FROM Votes v 
+        WHERE v.PostId = pm.PostId 
+            AND v.VoteTypeId = 2 
+            AND v.CreationDate >= pm.PostCreationDate
+        HAVING COUNT(*) > 3
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM Posts p2 
+        WHERE p2.AcceptedAnswerId = pm.PostId 
+            AND p2.Score < 0
+    )
+ORDER BY 
+    ue.Reputation DESC,
+    EngagementScore DESC,
+    COALESCE(pm.ViewCount, 0) DESC
+LIMIT 500;

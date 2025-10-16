@@ -1,0 +1,125 @@
+-- {"query": "390.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1279} 
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount, 0) as TotalAnswers,
+        coalesce(p.ViewCount, 0) as TotalViews,
+        row_number() over (order by t.Count desc, t.TagName) as TagRank
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+    where t.TagName is not null
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        sum(case when b.TagBased = 1 then 1 else 0 end) as TagBasedBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostActivityWindow as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.Title,
+        p.AcceptedAnswerId,
+        count(c.Id) as CommentCount,
+        sum(v.VoteTypeId = 2)::int as UpVotes,
+        sum(v.VoteTypeId = 3)::int as DownVotes,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as RecentPostRank,
+        lag(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as PrevScore,
+        lead(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as NextScore
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    group by p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.Title, p.AcceptedAnswerId
+),
+DuplicateQuestions as (
+    select
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId,
+        pl.CreationDate,
+        u.DisplayName as DuplicateOwner,
+        op.OwnerUserId as OriginalOwnerUserId,
+        op.Title as OriginalTitle
+    from PostLinks pl
+    join Posts p on p.Id = pl.PostId and p.PostTypeId = 1
+    join Posts op on op.Id = pl.RelatedPostId and op.PostTypeId = 1
+    left join Users u on u.Id = p.OwnerUserId
+    where pl.LinkTypeId = 3
+),
+UserActivitySummary as (
+    select
+        u.Id,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        coalesce(sum(p.Score),0) as TotalPostScore,
+        coalesce(sum(v.VoteTypeId = 2)::int,0) as TotalUpVotes,
+        coalesce(sum(v.VoteTypeId = 3)::int,0) as TotalDownVotes,
+        max(p.CreationDate) as LastPostDate,
+        count(distinct c.Id) as TotalComments
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.PostId = p.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName
+)
+select
+    ua.Id as UserId,
+    ua.DisplayName,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.TotalPostScore,
+    ua.TotalUpVotes,
+    ua.TotalDownVotes,
+    ua.TotalComments,
+    ua.LastPostDate,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.TagBasedBadges,
+    rt.TagName as TopTag,
+    rt.Count as TopTagCount,
+    rt.TotalAnswers as TopTagAnswers,
+    rt.TotalViews as TopTagViews,
+    dq.DuplicateQuestionId,
+    dq.OriginalQuestionId,
+    dq.DuplicateOwner,
+    dq.OriginalOwnerUserId,
+    dq.OriginalTitle,
+    case
+        when paw.PrevScore is null then 'No Previous Post'
+        when paw.Score > paw.PrevScore then 'Improved'
+        when paw.Score < paw.PrevScore then 'Declined'
+        else 'Stable'
+    end as PostScoreTrend,
+    case
+        when paw.NextScore is null then 'No Next Post'
+        else 'Has Next Post'
+    end as HasNextPost,
+    substring(coalesce(paw.Tags, '') from '<([^>]+)>') as FirstTagExtracted,
+    length(coalesce(paw.Title, '')) as TitleLength,
+    coalesce(paw.ViewCount, 0) + coalesce(paw.Score, 0) * 10 as WeightedPopularityScore
+from UserActivitySummary ua
+left join UserBadgeStats ubs on ubs.UserId = ua.Id
+left join RecursiveTagCounts rt on rt.TagRank = 1
+left join DuplicateQuestions dq on dq.DuplicateOwner = ua.DisplayName
+left join PostActivityWindow paw on paw.OwnerUserId = ua.Id and paw.RecentPostRank = 1
+where ua.QuestionCount > 5
+  and (ua.TotalUpVotes - ua.TotalDownVotes) > 10
+  and (ubs.GoldBadges + ubs.SilverBadges + ubs.BronzeBadges) > 0
+order by ua.TotalPostScore desc, ua.QuestionCount desc
+limit 100;

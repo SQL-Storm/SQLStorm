@@ -1,0 +1,158 @@
+-- {"query": "25074.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2606} 
+WITH recent_questions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        COALESCE(u.Reputation,0)                AS OwnerReputation,
+        /* split <tag><tag2> markup into an array; drop empty elements */
+        regexp_split_to_array(p.Tags, '<|>')    AS TagArray,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.OwnerUserId
+            ORDER BY p.CreationDate DESC
+        )                                      AS rn_user
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1                                    -- only questions
+      AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '30 days'
+),
+
+tag_aggregates AS (
+    SELECT
+        tag,
+        COUNT(*)                         AS QuestionCount,
+        AVG(q.Score)                     AS AvgScore,
+        SUM(q.ViewCount)                 AS TotalViews
+    FROM recent_questions q,
+         LATERAL unnest(q.TagArray) AS tag
+    WHERE tag <> ''
+    GROUP BY tag
+),
+
+user_badge_stats AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        MAX(b.Date)                         AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+post_vote_stats AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        MAX(v.CreationDate)                               AS LastVoteDate
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2,3)          -- up‑votes and down‑votes only
+    GROUP BY v.PostId
+),
+
+question_close_history AS (
+    SELECT
+        ph.PostId,
+        MIN(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS ClosedDate,
+        MIN(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate END) AS ReopenedDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10,11)      -- close / reopen events
+    GROUP BY ph.PostId
+),
+
+answer_stats AS (
+    SELECT
+        a.Id,
+        a.ParentId                                    AS QuestionId,
+        a.CreationDate,
+        a.Score,
+        a.OwnerUserId,
+        COALESCE(u.Reputation,0)                      AS OwnerReputation,
+        pv.UpVotes,
+        pv.DownVotes
+    FROM Posts a
+    LEFT JOIN Users u   ON u.Id = a.OwnerUserId
+    LEFT JOIN post_vote_stats pv ON pv.PostId = a.Id
+    WHERE a.PostTypeId = 2                           -- answers only
+      AND a.CreationDate >= cast('2024-10-01' as date) - INTERVAL '30 days'
+),
+
+-- Correlated subquery to fetch the earliest answer date per question
+first_answer_per_question AS (
+    SELECT
+        q.Id                AS QuestionId,
+        MIN(a.CreationDate) AS FirstAnswerDate
+    FROM recent_questions q
+    JOIN answer_stats a ON a.QuestionId = q.Id
+    GROUP BY q.Id
+)
+
+SELECT
+    q.Id                                    AS QuestionId,
+    q.Title,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.OwnerUserId,
+    q.OwnerReputation,
+    COALESCE(pv.UpVotes,0) - COALESCE(pv.DownVotes,0) AS NetVotes,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    qc.ClosedDate,
+    qc.ReopenedDate,
+    STRING_AGG(DISTINCT tg.Tag, ',')        AS Tags,
+    ROW_NUMBER() OVER (ORDER BY q.Score DESC, q.ViewCount DESC) AS RankByScore,
+    CASE
+        WHEN qc.ClosedDate IS NOT NULL AND qc.ReopenedDate IS NULL THEN 'Closed'
+        WHEN q.AcceptedAnswerId IS NOT NULL                                 THEN 'Answered'
+        WHEN fas.FirstAnswerDate IS NOT NULL                                 THEN 'Answered (no accept)'
+        ELSE 'Open'
+    END                                      AS Status,
+    fas.FirstAnswerDate
+FROM recent_questions q
+LEFT JOIN post_vote_stats pv       ON pv.PostId = q.Id
+LEFT JOIN user_badge_stats ub      ON ub.UserId = q.OwnerUserId
+LEFT JOIN question_close_history qc ON qc.PostId = q.Id
+LEFT JOIN LATERAL (
+    SELECT unnest(q.TagArray) AS Tag
+) tg ON true
+LEFT JOIN first_answer_per_question fas ON fas.QuestionId = q.Id
+GROUP BY
+    q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount,
+    q.OwnerUserId, q.OwnerReputation,
+    pv.UpVotes, pv.DownVotes,
+    ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges,
+    qc.ClosedDate, qc.ReopenedDate,
+    fas.FirstAnswerDate
+HAVING COUNT(*) FILTER (WHERE tg.Tag <> '') > 0
+
+UNION ALL
+
+/*  Second part – top recent answers (set operator)  */
+SELECT
+    a.QuestionId,
+    NULL                                 AS Title,
+    a.CreationDate,
+    a.Score,
+    NULL                                 AS ViewCount,
+    a.OwnerUserId,
+    a.OwnerReputation,
+    COALESCE(a.UpVotes,0) - COALESCE(a.DownVotes,0) AS NetVotes,
+    NULL                                 AS GoldBadges,
+    NULL                                 AS SilverBadges,
+    NULL                                 AS BronzeBadges,
+    NULL                                 AS ClosedDate,
+    NULL                                 AS ReopenedDate,
+    NULL                                 AS Tags,
+    ROW_NUMBER() OVER (ORDER BY a.Score DESC)          AS RankByScore,
+    'Answer'                              AS Status,
+    NULL                                 AS FirstAnswerDate
+FROM answer_stats a
+WHERE a.Score > 0
+ORDER BY RankByScore DESC
+LIMIT 100;

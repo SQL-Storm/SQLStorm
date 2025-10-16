@@ -1,0 +1,119 @@
+with 
+TopContributors as (
+  select 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    count(distinct case when p.PostTypeId = 2 and exists (
+      select 1 from Posts q where q.AcceptedAnswerId = p.Id
+    ) then p.Id end) as AcceptedAnswers,
+    count(distinct b.Name) as DistinctBadges,
+    row_number() over (order by count(distinct case when p.PostTypeId = 2 and exists (
+      select 1 from Posts q where q.AcceptedAnswerId = p.Id
+    ) then p.Id end) desc, count(distinct b.Name) desc, u.Reputation desc) as Rank
+  from 
+    Users u
+    left join Posts p on u.Id = p.OwnerUserId
+    left join Badges b on u.Id = b.UserId
+  group by u.Id, u.DisplayName, u.Reputation
+),
+QuestionStats as (
+  select
+    q.Id as QuestionId,
+    q.Title,
+    q.OwnerUserId,
+    coalesce(avg((extract(epoch from ph.CreationDate) - extract(epoch from q.CreationDate))/3600.0), 0) as AvgEditLagHours,
+    coalesce(avg(c.Score), 0) as AvgCommentScore,
+    count(distinct c.Id) as TotalComments,
+    max(q.Score) as MaxQuestionScore
+  from 
+    Posts q
+    left join PostHistory ph on ph.PostId = q.Id and ph.PostHistoryTypeId in (4,5,6)
+    left join Comments c on c.PostId = q.Id
+  where 
+    q.PostTypeId = 1
+  group by q.Id, q.Title, q.OwnerUserId
+),
+RecentDuplicates as (
+  select 
+    pl.PostId,
+    pl.RelatedPostId,
+    pl.CreationDate as LinkCreated,
+    lt.Name as LinkType,
+    ph.Comment as CloseReasonComment,
+    cr.Name as CloseReason
+  from 
+    PostLinks pl
+    inner join LinkTypes lt on pl.LinkTypeId = lt.Id
+    left join PostHistory ph 
+      on ph.PostId = pl.PostId 
+      and ph.PostHistoryTypeId = 10
+      and cast(ph.CreationDate as date) = cast(pl.CreationDate as date)
+    left join CloseReasonTypes cr on cast(ph.Comment as integer) = cr.Id
+  where 
+    pl.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - interval '180 days')
+    and pl.LinkTypeId = 3
+)
+select 
+  tc.Rank,
+  tc.UserId,
+  tc.DisplayName,
+  tc.Reputation,
+  tc.AcceptedAnswers,
+  tc.DistinctBadges,
+  qs.QuestionId,
+  qs.Title,
+  qs.AvgEditLagHours,
+  qs.AvgCommentScore,
+  qs.TotalComments,
+  qs.MaxQuestionScore,
+  rd.LinkCreated as DuplicateLinkedAt,
+  rd.CloseReason as DuplicateCloseReason,
+  (case 
+     when qs.MaxQuestionScore > 100 then 'Legendary'
+     when qs.MaxQuestionScore between 50 and 100 then 'Great'
+     when qs.MaxQuestionScore between 10 and 49 then 'Good'
+     else 'Average'
+   end) as QuestionScoreLevel,
+  (select string_agg(t.TagName, ', ') 
+     from (
+       select regexp_replace(regexp_replace(qs.Title, '^.*<', '<'), '>.*$', '>') as dummy
+     ) d
+     cross join lateral (
+       -- build a JSON array of tags and parse using JSON array functions that accept text input as JSON
+       select trim(value) as tag
+       from json_array_elements_text(
+         ('["' || replace(replace(substring(qs.Title from '<(.*?)>'), '><', '","'), '\"', '\\\"') || '"]')::json
+       ) as jt(value)
+     ) x2
+     join Tags t on t.TagName = x2.tag
+  ) as AssociatedTags,
+  count(*) over (partition by tc.UserId order by qs.MaxQuestionScore desc rows between 0 preceding and 3 following) as TopPostWindow
+from 
+  TopContributors tc
+  join QuestionStats qs on qs.OwnerUserId = tc.UserId
+  left join RecentDuplicates rd on rd.PostId = qs.QuestionId
+where 
+  tc.Rank <= 100
+  and (qs.AvgEditLagHours is not null or qs.AvgCommentScore > 0)
+  and (qs.MaxQuestionScore is not null and qs.MaxQuestionScore > 0)
+group by
+  tc.Rank,
+  tc.UserId,
+  tc.DisplayName,
+  tc.Reputation,
+  tc.AcceptedAnswers,
+  tc.DistinctBadges,
+  qs.QuestionId,
+  qs.Title,
+  qs.AvgEditLagHours,
+  qs.AvgCommentScore,
+  qs.TotalComments,
+  qs.MaxQuestionScore,
+  rd.LinkCreated,
+  rd.CloseReason,
+  QuestionScoreLevel,
+  AssociatedTags
+order by 
+  tc.Rank, qs.MaxQuestionScore desc, qs.AvgEditLagHours
+limit 200;

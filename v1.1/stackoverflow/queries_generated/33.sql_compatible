@@ -1,0 +1,14 @@
+WITH UserReputations AS (
+    SELECT "UserId", SUM("Reputation") AS "TotalReputation"
+    FROM "Users"
+    GROUP BY "UserId"
+), TopUsers AS (
+    SELECT ur."UserId", u."DisplayName", ur."TotalReputation",
+        ROW_NUMBER() OVER (ORDER BY ur."TotalReputation" DESC) AS "Rank"
+    FROM UserReputations ur
+    JOIN "Users" u ON u."UserId" = ur."UserId"
+)
+SELECT t."UserId", t."DisplayName", t."TotalReputation", t."Rank"
+FROM TopUsers t
+WHERE t."Rank" <= 10
+ORDER BY t."Rank";

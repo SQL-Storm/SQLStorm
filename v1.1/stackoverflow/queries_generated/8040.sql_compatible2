@@ -1,0 +1,258 @@
+with recent_users as (
+    select
+        u.id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        coalesce(nullif(trim(split_part(coalesce(u.websiteurl, ''), '/', 3)), ''), 'unknown') as domain_host
+    from users u
+    where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+user_activity as (
+    select
+        u.id as user_id,
+        count(distinct p.id) filter (where p.posttypeid in (1,2)) as total_posts,
+        count(*) filter (where p.posttypeid = 1) as question_count,
+        count(*) filter (where p.posttypeid = 2) as answer_count,
+        sum(coalesce(p.score,0)) as post_score_sum,
+        sum(coalesce(p.viewcount,0)) as question_views,
+        avg(nullif(p.score,0)) as avg_nonzero_post_score,
+        max(p.lastactivitydate) as last_post_activity,
+        count(distinct c.id) as comment_count
+    from recent_users u
+    left join posts p on p.owneruserid = u.id
+    left join comments c on c.userid = u.id
+    group by u.id
+),
+accepted_answers as (
+    select
+        a.owneruserid as user_id,
+        count(*) as accepted_answer_count,
+        sum(coalesce(pa.score,0)) as accepted_question_score_sum
+    from posts pa
+    join posts a
+      on a.id = pa.acceptedanswerid
+    where a.posttypeid = 2
+      and pa.posttypeid = 1
+    group by a.owneruserid
+),
+favorite_saves as (
+    select
+        v.userid as user_id,
+        count(*) filter (where v.votetypeid = 5) as favorites_legacy,
+        count(*) filter (where v.votetypeid <> 5) as other_votes
+    from votes v
+    where v.userid is not null
+    group by v.userid
+),
+badge_rollup as (
+    select
+        b.userid as user_id,
+        count(*) as badge_count,
+        count(*) filter (where b.class = 1) as gold_badges,
+        count(*) filter (where b.class = 2) as silver_badges,
+        count(*) filter (where b.class = 3) as bronze_badges,
+        count(*) filter (where coalesce(b.tagbased,false) = true) as tag_badges,
+        min(b.date) as first_badge_date,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+tag_engagement as (
+    select
+        u.id as user_id,
+        t.tagname,
+        count(*) as posts_with_tag,
+        sum(p.score) as tag_score,
+        row_number() over (partition by u.id order by count(*) desc, sum(p.score) desc, lower(t.tagname)) as rn_popular
+    from recent_users u
+    join posts p on p.owneruserid = u.id and p.posttypeid = 1 and p.tags is not null
+    cross join lateral unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) as tag(tagname)
+    left join tags t on t.tagname = tag.tagname
+    group by u.id, t.tagname
+),
+top_tags as (
+    select user_id,
+           string_agg(tagname || ':' || cast(posts_with_tag as varchar) || '/' || cast(coalesce(tag_score,0) as varchar), ', ' order by rn_popular) as top3_tags
+    from tag_engagement
+    where rn_popular <= 3
+    group by user_id
+),
+post_closures as (
+    select
+        ph.postid,
+        ph.creationdate as closed_at,
+        case
+            when ph.comment ~ '^[0-9]+$' then cast(ph.comment as integer)
+            else null
+        end as close_reason_id
+    from posthistory ph
+    where ph.posthistorytypeid = 10
+),
+user_close_stats as (
+    select
+        p.owneruserid as user_id,
+        count(*) as closed_questions,
+        count(*) filter (where crt.name ilike '%duplicate%') as closed_as_duplicate,
+        count(*) filter (where crt.name ilike '%off-topic%') as closed_offtopic
+    from posts p
+    join post_closures pc on pc.postid = p.id
+    left join closereasontypes crt on crt.id = pc.close_reason_id
+    where p.posttypeid = 1
+    group by p.owneruserid
+),
+link_graph as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where pl.linktypeid = 1) as links_count,
+        count(*) filter (where pl.linktypeid = 3) as duplicate_links
+    from posts p
+    join postlinks pl on pl.postid = p.id
+    group by p.owneruserid
+),
+user_quality_metrics as (
+    select
+        u.id as user_id,
+        percentile_disc(0.5) within group (order by p.score) as median_post_score,
+        stddev_pop(p.score) as score_stddev,
+        avg(p.commentcount) as avg_comments_per_post,
+        avg(case when p.posttypeid = 1 then p.viewcount end) as avg_views_per_question,
+        sum(case when p.posttypeid = 2 and p.score > 0 then 1 else 0 end) as pos_answers,
+        sum(case when p.posttypeid = 2 and p.score < 0 then 1 else 0 end) as neg_answers
+    from recent_users u
+    left join posts p on p.owneruserid = u.id
+    group by u.id
+),
+activity_timeline as (
+    select
+        u.id as user_id,
+        date_trunc('month', coalesce(p.creationdate, c.creationdate)) as month_bucket,
+        count(distinct p.id) as posts_in_month,
+        count(distinct c.id) as comments_in_month
+    from recent_users u
+    left join posts p on p.owneruserid = u.id
+    left join comments c on c.userid = u.id
+    group by u.id, date_trunc('month', coalesce(p.creationdate, c.creationdate))
+),
+recent_bursts as (
+    select distinct on (user_id)
+        user_id,
+        month_bucket,
+        posts_in_month,
+        comments_in_month,
+        (posts_in_month + comments_in_month) as activity_total,
+        rank() over (partition by user_id order by (posts_in_month + comments_in_month) desc, month_bucket desc) as rk
+    from activity_timeline
+    order by user_id, rk
+),
+domain_peer_reputation as (
+    select
+        ru.domain_host,
+        percentile_cont(0.75) within group (order by ru.reputation) as rep_p75,
+        avg(ru.reputation) as rep_avg
+    from recent_users ru
+    group by ru.domain_host
+),
+heavy_users as (
+    select
+        u.id as user_id,
+        (ua.total_posts >= 50 or coalesce(ua.comment_count,0) >= 200) as is_heavy_contributor,
+        case when ua.answer_count > ua.question_count then 1 else 0 end as is_answer_leaning
+    from recent_users u
+    join user_activity ua on ua.user_id = u.id
+),
+ranked_users as (
+    select
+        ru.id as user_id,
+        row_number() over (order by ua.total_posts desc nulls last, coalesce(ua.post_score_sum,0) desc, ru.reputation desc) as rn_activity,
+        row_number() over (order by coalesce(a.accepted_answer_count,0) desc, coalesce(uqm.median_post_score, -1e9) desc) as rn_helpfulness,
+        dense_rank() over (partition by coalesce(ru.location, 'unknown') order by ru.reputation desc) as rn_by_location
+    from recent_users ru
+    left join user_activity ua on ua.user_id = ru.id
+    left join accepted_answers a on a.user_id = ru.id
+    left join user_quality_metrics uqm on uqm.user_id = ru.id
+)
+select
+    ru.id as user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.location,
+    ru.domain_host,
+    ua.total_posts,
+    ua.question_count,
+    ua.answer_count,
+    ua.post_score_sum,
+    ua.question_views,
+    ua.avg_nonzero_post_score,
+    ua.last_post_activity,
+    fa.favorites_legacy,
+    fa.other_votes,
+    coalesce(a.accepted_answer_count,0) as accepted_answer_count,
+    coalesce(a.accepted_question_score_sum,0) as accepted_question_score_sum,
+    coalesce(b.badge_count,0) as badge_count,
+    b.gold_badges,
+    b.silver_badges,
+    b.bronze_badges,
+    b.tag_badges,
+    b.first_badge_date,
+    b.last_badge_date,
+    coalesce(tt.top3_tags, '(none)') as top3_tags,
+    coalesce(ucs.closed_questions,0) as closed_questions,
+    coalesce(ucs.closed_as_duplicate,0) as closed_as_duplicate,
+    coalesce(ucs.closed_offtopic,0) as closed_offtopic,
+    coalesce(lg.links_count,0) as links_count,
+    coalesce(lg.duplicate_links,0) as duplicate_links,
+    uqm.median_post_score,
+    uqm.score_stddev,
+    uqm.avg_comments_per_post,
+    uqm.avg_views_per_question,
+    uqm.pos_answers,
+    uqm.neg_answers,
+    rb.month_bucket as busiest_month,
+    rb.activity_total as busiest_month_activity,
+    case
+        when ru.reputation >= dpr.rep_p75 then 'top_quartile'
+        when ru.reputation >= dpr.rep_avg then 'above_avg'
+        else 'below_avg'
+    end as domain_peer_bucket,
+    case when hu.is_heavy_contributor then 'heavy' else 'regular' end as contributor_class,
+    hu.is_answer_leaning,
+    r.rn_activity,
+    r.rn_helpfulness,
+    r.rn_by_location,
+    round(
+        coalesce(ua.total_posts,0) * 0.25
+        + coalesce(ua.post_score_sum,0) * 0.15
+        + coalesce(a.accepted_answer_count,0) * 0.35
+        + coalesce(b.badge_count,0) * 0.05
+        + coalesce(uqm.median_post_score,0) * 0.1
+        + least(cast(coalesce(ua.question_views,0) as numeric) / nullif(cast(ua.question_count as numeric),0), 500.0) * 0.1
+        , 2
+    ) as composite_score
+from recent_users ru
+left join user_activity ua on ua.user_id = ru.id
+left join favorite_saves fa on fa.user_id = ru.id
+left join accepted_answers a on a.user_id = ru.id
+left join badge_rollup b on b.user_id = ru.id
+left join top_tags tt on tt.user_id = ru.id
+left join user_close_stats ucs on ucs.user_id = ru.id
+left join link_graph lg on lg.user_id = ru.id
+left join user_quality_metrics uqm on uqm.user_id = ru.id
+left join recent_bursts rb on rb.user_id = ru.id
+left join domain_peer_reputation dpr on dpr.domain_host = ru.domain_host
+left join heavy_users hu on hu.user_id = ru.id
+left join ranked_users r on r.user_id = ru.id
+where
+    (coalesce(ua.total_posts,0) + coalesce(ua.comment_count,0)) > 0
+    and (ru.reputation > 100 or (a.accepted_answer_count is not null and a.accepted_answer_count >= 1))
+    and (ru.location is null or length(ru.location) >= 0)
+    and (
+        ru.domain_host not ilike any (array['%spam%','%bot%'])
+        or ru.domain_host is null
+    )
+order by
+    composite_score desc nulls last,
+    ru.reputation desc,
+    ru.id
+limit 250;

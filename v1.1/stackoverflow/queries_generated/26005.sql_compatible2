@@ -1,0 +1,111 @@
+WITH 
+    top_users AS (
+        SELECT 
+            u.Id, 
+            u.DisplayName, 
+            COUNT(b.Id) AS badge_count,
+            SUM(u.Reputation) AS user_reputation
+        FROM 
+            Users u
+        LEFT JOIN 
+            Badges b ON u.Id = b.UserId
+        GROUP BY 
+            u.Id, u.DisplayName
+        ORDER BY 
+            badge_count DESC
+        LIMIT 10
+    ),
+    
+    top_posts AS (
+        SELECT 
+            p.Id, 
+            p.Title, 
+            COUNT(c.Id) AS comment_count,
+            AVG(p.Score) AS avg_post_score,
+            AVG(EXTRACT(EPOCH FROM p.CreationDate)) AS avg_post_creation_epoch
+        FROM 
+            Posts p
+        LEFT JOIN 
+            Comments c ON p.Id = c.PostId
+        GROUP BY 
+            p.Id, p.Title
+        ORDER BY 
+            comment_count DESC
+        LIMIT 10
+    ),
+    
+    top_tags AS (
+        SELECT 
+            t.Id, 
+            t.TagName, 
+            COUNT(pt.PostId) AS post_count
+        FROM 
+            Tags t
+        LEFT JOIN 
+            PostTags pt ON t.Id = pt.TagId
+        LEFT JOIN
+            Posts p ON pt.PostId = p.Id
+        GROUP BY 
+            t.Id, t.TagName
+        ORDER BY 
+            post_count DESC
+        LIMIT 10
+    ),
+    
+    top_upvoters AS (
+        SELECT 
+            u.Id, 
+            u.DisplayName, 
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvote_count,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvote_count
+        FROM 
+            Users u
+        LEFT JOIN 
+            Votes v ON u.Id = v.UserId
+        GROUP BY 
+            u.Id, u.DisplayName
+        ORDER BY 
+            upvote_count DESC
+        LIMIT 10
+    )
+
+SELECT 
+    tu.Id AS top_user_id, 
+    tu.DisplayName AS top_user_name, 
+    tp.Id AS top_post_id, 
+    tp.Title AS top_post_title, 
+    tt.Id AS top_tag_id, 
+    tt.TagName AS top_tag_name, 
+    tuu.Id AS top_upvoter_id, 
+    tuu.DisplayName AS top_upvoter_name,
+    AVG(tp.avg_post_score) AS avg_score,
+    SUM(tp.comment_count) AS total_comments,
+    SUM(tu.badge_count) AS total_badges,
+    SUM(tuu.upvote_count) AS total_upvotes,
+    CASE 
+        WHEN SUM(tu.badge_count) > 0 THEN 'Yes'
+        ELSE 'No'
+    END AS has_badge,
+    CASE 
+        WHEN SUM(tp.comment_count) > 0 THEN 'Yes'
+        ELSE 'No'
+    END AS has_comment,
+    CASE 
+        WHEN SUM(tt.post_count) > 0 THEN 'Yes'
+        ELSE 'No'
+    END AS has_post,
+    SUM(tu.user_reputation) AS total_reputation,
+    TO_TIMESTAMP(AVG(tp.avg_post_creation_epoch)) AT TIME ZONE 'UTC' AS avg_creation_date,
+    SUM(tuu.downvote_count) AS total_downvotes
+FROM 
+    top_users tu
+CROSS JOIN 
+    top_posts tp
+CROSS JOIN 
+    top_tags tt
+CROSS JOIN 
+    top_upvoters tuu
+GROUP BY 
+    tu.Id, tu.DisplayName, tp.Id, tp.Title, tt.Id, tt.TagName, tuu.Id, tuu.DisplayName
+ORDER BY 
+    avg_score DESC, total_comments DESC, total_badges DESC, total_upvotes DESC;

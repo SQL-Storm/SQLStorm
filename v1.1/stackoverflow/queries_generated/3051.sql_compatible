@@ -1,0 +1,115 @@
+WITH RecentQuestionStats AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        COALESCE(ac.AnswerCount, 0) AS AnswerCount,
+        COALESCE(SUM(CASE WHEN c.Id IS NOT NULL THEN 1 ELSE 0 END), 0) AS CommentCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotes,
+        JSON_AGG(DISTINCT bl.RelatedPostId) AS LinkedPostIds,
+        p.OwnerUserId
+    FROM Posts p
+    LEFT JOIN (
+        SELECT ParentId, COUNT(*) AS AnswerCount
+        FROM Posts
+        WHERE PostTypeId = 2
+        GROUP BY ParentId
+    ) ac ON p.Id = ac.ParentId
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN PostLinks bl ON p.Id = bl.PostId AND bl.LinkTypeId = 1
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+    GROUP BY p.Id, p.Title, p.Tags, p.CreationDate, p.Score, p.ViewCount, ac.AnswerCount, p.OwnerUserId
+),
+AggregatedAnswers AS (
+    SELECT 
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score,
+        a.CreationDate,
+        u.DisplayName AS AnswerOwner,
+        JSON_AGG(c.Text) AS Comments
+    FROM Posts a
+    LEFT JOIN Users u ON a.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON a.Id = c.PostId
+    WHERE a.PostTypeId = 2
+    GROUP BY a.Id, a.ParentId, a.Score, a.CreationDate, u.DisplayName
+),
+BadgeSummary AS (
+    SELECT 
+        b.UserId,
+        JSON_AGG(DISTINCT b.Name) AS Badges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        u.Views,
+        ua.MostRecentPost,
+        ba.Badges
+    FROM Users u
+    LEFT JOIN (
+        SELECT UserId, MAX(CreationDate) AS MostRecentPost
+        FROM Posts
+        GROUP BY UserId
+    ) ua ON u.Id = ua.UserId
+    LEFT JOIN BadgeSummary ba ON u.Id = ba.UserId
+)
+SELECT 
+    rqs.QuestionId,
+    rqs.Title,
+    rqs.Tags,
+    rqs.CreationDate,
+    rqs.Score AS QuestionScore,
+    rqs.ViewCount,
+    rqs.AnswerCount,
+    rqs.CommentCount,
+    rqs.UpVotes,
+    rqs.DownVotes,
+    rqs.LinkedPostIds,
+    ua.Reputation,
+    ua.Location,
+    ua.Views,
+    ua.MostRecentPost,
+    ua.Badges,
+    JSON_AGG(
+        JSON_BUILD_OBJECT(
+            'AnswerId', a.AnswerId,
+            'Score', a.Score,
+            'CreationDate', a.CreationDate,
+            'Owner', a.AnswerOwner,
+            'Comments', a.Comments
+        )
+    ) AS Answers
+FROM RecentQuestionStats rqs
+LEFT JOIN AggregatedAnswers a ON rqs.QuestionId = a.QuestionId
+LEFT JOIN UserActivity ua ON rqs.OwnerUserId = ua.UserId
+GROUP BY 
+    rqs.QuestionId,
+    rqs.Title,
+    rqs.Tags,
+    rqs.CreationDate,
+    rqs.Score,
+    rqs.ViewCount,
+    rqs.AnswerCount,
+    rqs.CommentCount,
+    rqs.UpVotes,
+    rqs.DownVotes,
+    rqs.LinkedPostIds,
+    ua.Reputation,
+    ua.Location,
+    ua.Views,
+    ua.MostRecentPost,
+    ua.Badges
+ORDER BY rqs.CreationDate DESC
+LIMIT 100;

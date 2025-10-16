@@ -1,0 +1,168 @@
+-- {"query": "4008.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1734} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        ARRAY[t.TagName] AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.Path || t.TagName
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.WikiPostId = (
+        SELECT WikiPostId 
+        FROM Posts p 
+        WHERE p.Id = (SELECT WikiPostId FROM Tags WHERE Id = r.Id)
+        LIMIT 1
+    )
+    WHERE t.IsModeratorOnly = 0 AND NOT t.TagName = ANY(r.Path)
+),
+TopUsersWithBadges AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(b.Date) FILTER (WHERE b.Class = 1) AS LastGoldBadgeDate
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id AND b.Date > NOW() - INTERVAL '1 year'
+    WHERE u.Reputation > 10000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RecentTopQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.ViewCount,
+        p.Score,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        COUNT(c.Id) AS CommentCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS Rank
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > NOW() - INTERVAL '6 months'
+      AND p.ViewCount > 1000
+      AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.Id, p.Title, p.CreationDate, p.ViewCount, p.Score, p.Tags, p.OwnerUserId, u.DisplayName
+),
+AnswerStats AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        COUNT(*) AS TotalAnswers,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        SUM(vs.UpVotes) AS TotalUpVotes,
+        SUM(vs.DownVotes) AS TotalDownVotes
+    FROM Posts a
+    LEFT JOIN (
+        SELECT
+            v.PostId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        GROUP BY v.PostId
+    ) vs ON vs.PostId = a.Id
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+UserActivityWindows AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.CreationDate,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersCount,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        AVG(EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate))) FILTER (WHERE p.LastActivityDate IS NOT NULL AND p.CreationDate IS NOT NULL) OVER (PARTITION BY u.Id) AS AvgPostActiveDurationSeconds
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.CreationDate, u.Reputation
+),
+UnionAllVotes AS (
+    SELECT
+        v.PostId,
+        v.VoteTypeId,
+        v.CreationDate,
+        'Canonical' AS Source
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2,3)
+    UNION ALL
+    SELECT
+        pl.PostId,
+        lt.Id AS VoteTypeId,
+        pl.CreationDate,
+        'PostLinks' AS Source
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE lt.Name ILIKE '%duplicate%'
+)
+SELECT
+    q.Id AS QuestionId,
+    q.Title AS QuestionTitle,
+    u.DisplayName AS OwnerName,
+    u.Reputation AS OwnerReputation,
+    ans.TotalAnswers,
+    ans.AvgAnswerScore,
+    ans.MaxAnswerScore,
+    ans.TotalUpVotes,
+    ans.TotalDownVotes,
+    q.CommentCount AS QuestionCommentCount,
+    pht.Name AS LastPostHistoryAction,
+    b.BadgeCount,
+    b.GoldBadges,
+    b.SilverBadges,
+    b.BronzeBadges,
+    b.LastGoldBadgeDate,
+    ua.QuestionsCount,
+    ua.AnswersCount,
+    ua.ReputationRank,
+    ua.AvgPostActiveDurationSeconds,
+    string_agg(DISTINCT rt.TagName, ', ') FILTER (WHERE rt.Level = 1) AS RootTags,
+    CASE
+        WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN q.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+        ELSE 'Open'
+    END AS QuestionStatus,
+    COUNT(DISTINCT c.Id) FILTER (WHERE c.Score > 0) AS PositiveComments,
+    COUNT(DISTINCT c.Id) FILTER (WHERE c.Text ILIKE '%performance%') AS PerformanceMentionsInComments,
+    AVG(LENGTH(p.Body)) AS AvgAnswerBodyLength,
+    SUM(v.VoteTypeId = 2)::INT FILTER (WHERE v.VoteTypeId = 2) AS TotalUpVotesFromUnion,
+    SUM(v.VoteTypeId = 3)::INT FILTER (WHERE v.VoteTypeId = 3) AS TotalDownVotesFromUnion,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY q.Score DESC, q.ViewCount DESC) AS QuestionPopularityRank,
+    BOOL_OR(pht.Name = 'Post Closed') FILTER (WHERE pht.PostId = q.Id) AS HasCloseHistory,
+    MIN(pht.CreationDate) FILTER (WHERE pht.PostHistoryTypeId IN (10,12)) AS FirstCloseOrDeletionDate
+FROM RecentTopQuestions q
+JOIN Users u ON u.Id = q.OwnerUserId
+LEFT JOIN AnswerStats ans ON ans.QuestionId = q.Id
+LEFT JOIN Badges b ON b.UserId = u.Id
+LEFT JOIN PostHistory pht ON pht.PostId = q.Id
+LEFT JOIN Comments c ON c.PostId = q.Id
+LEFT JOIN Posts p ON p.ParentId = q.Id AND p.PostTypeId = 2 -- Answers for avg length
+LEFT JOIN UserActivityWindows ua ON ua.Id = u.Id
+LEFT JOIN RecursiveTagHierarchy rt ON rt.TagName = ANY(string_to_array(substring(q.Tags FROM 2 FOR LENGTH(q.Tags)-2), '><'))
+LEFT JOIN UnionAllVotes v ON v.PostId = q.Id
+WHERE q.Rank = 1
+GROUP BY q.Id, q.Title, u.DisplayName, u.Reputation, ans.TotalAnswers, ans.AvgAnswerScore, ans.MaxAnswerScore, ans.TotalUpVotes, ans.TotalDownVotes,
+         q.CommentCount, pht.Name, b.BadgeCount, b.GoldBadges, b.SilverBadges, b.BronzeBadges, b.LastGoldBadgeDate,
+         ua.QuestionsCount, ua.AnswersCount, ua.ReputationRank, ua.AvgPostActiveDurationSeconds, q.ClosedDate, q.AcceptedAnswerId
+ORDER BY ua.ReputationRank, ans.TotalAnswers DESC, q.Score DESC
+LIMIT 100;

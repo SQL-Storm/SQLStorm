@@ -1,0 +1,216 @@
+-- {"query": "305.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 17532} 
+WITH
+  questions AS (
+    SELECT Id, Title, Tags, CreationDate, Score, ViewCount, AnswerCount, AcceptedAnswerId, OwnerUserId, OwnerDisplayName, LastActivityDate
+    FROM Posts
+    WHERE PostTypeId = 1
+  ),
+  answers AS (
+    SELECT Id, ParentId AS QuestionId, CreationDate, Score, OwnerUserId
+    FROM Posts
+    WHERE PostTypeId = 2
+  ),
+  tags_exploded AS (
+    SELECT q.Id AS QuestionId, lower(trim(t.tag)) AS Tag
+    FROM questions q
+    CROSS JOIN LATERAL unnest(
+      CASE
+        WHEN q.Tags IS NOT NULL AND q.Tags <> '' THEN string_to_array(substring(q.Tags,2, length(q.Tags)-2), '><')
+        ELSE ARRAY[]::text[]
+      END
+    ) AS t(tag)
+  ),
+  tag_aggregates AS (
+    SELECT
+      te.Tag,
+      COUNT(*) AS QuestionCount,
+      AVG(q.Score) AS AvgQuestionScore,
+      STDDEV_POP(q.Score) AS ScoreStdDev,
+      MAX(q.Score) AS MaxQuestionScore,
+      MIN(q.Score) AS MinQuestionScore,
+      PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY q.Score) AS MedianQuestionScore,
+      SUM(COALESCE(q.ViewCount,0)) AS TotalViews,
+      SUM(COALESCE(q.AnswerCount,0)) AS TotalAnswers,
+      SUM(CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedCount,
+      COUNT(DISTINCT q.OwnerUserId) AS UniqueAskers
+    FROM tags_exploded te
+    JOIN questions q ON q.Id = te.QuestionId
+    GROUP BY te.Tag
+  ),
+  tag_monthly AS (
+    SELECT
+      te.Tag,
+      date_trunc('month', q.CreationDate) AS Month,
+      COUNT(*) AS QuestionsThisMonth
+    FROM tags_exploded te
+    JOIN questions q ON q.Id = te.QuestionId
+    GROUP BY te.Tag, date_trunc('month', q.CreationDate)
+  ),
+  tag_monthly_cume AS (
+    SELECT
+      Tag,
+      Month,
+      QuestionsThisMonth,
+      SUM(QuestionsThisMonth) OVER (PARTITION BY Tag ORDER BY Month ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeQuestions,
+      ROW_NUMBER() OVER (PARTITION BY Tag ORDER BY Month DESC) AS rn_desc
+    FROM tag_monthly
+  ),
+  tag_contributors AS (
+    SELECT
+      te.Tag,
+      q.OwnerUserId,
+      COALESCE(q.OwnerDisplayName, u.DisplayName) AS OwnerName,
+      COUNT(*) AS QuestionsByOwner,
+      SUM(q.Score) AS ScoreByOwner,
+      ROW_NUMBER() OVER (PARTITION BY te.Tag ORDER BY COUNT(*) DESC, SUM(q.Score) DESC NULLS LAST) AS rn
+    FROM tags_exploded te
+    JOIN questions q ON q.Id = te.QuestionId
+    LEFT JOIN Users u ON u.Id = q.OwnerUserId
+    GROUP BY te.Tag, q.OwnerUserId, OwnerName
+  ),
+  post_votes AS (
+    SELECT
+      v.PostId,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS VoteNet,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+      COUNT(*) FILTER (WHERE v.VoteTypeId = 5) AS Favorites,
+      COUNT(*) AS TotalVotes
+    FROM Votes v
+    GROUP BY v.PostId
+  ),
+  post_comment_stats AS (
+    SELECT
+      c.PostId,
+      COUNT(*) AS CommentCount,
+      MAX(length(c.Text)) AS MaxCommentLength,
+      AVG(length(c.Text))::numeric(12,2) AS AvgCommentLength,
+      array_to_string(array_agg(substring(c.Text FROM 1 FOR 50) ORDER BY c.CreationDate DESC), ' | ') FILTER (WHERE c.Text IS NOT NULL) AS RecentCommentSnippets
+    FROM Comments c
+    GROUP BY c.PostId
+  ),
+  duplicate_links AS (
+    SELECT
+      p.Id,
+      COALESCE(pl_out.OutgoingDuplicates,0) AS OutgoingDuplicates,
+      COALESCE(pl_in.IncomingDuplicates,0) AS IncomingDuplicates,
+      COALESCE(pl_out.OutgoingDuplicates,0) + COALESCE(pl_in.IncomingDuplicates,0) AS TotalDuplicateLinks
+    FROM Posts p
+    LEFT JOIN (
+      SELECT PostId, COUNT(*) AS OutgoingDuplicates FROM PostLinks WHERE LinkTypeId = 3 GROUP BY PostId
+    ) pl_out ON pl_out.PostId = p.Id
+    LEFT JOIN (
+      SELECT RelatedPostId AS PostId, COUNT(*) AS IncomingDuplicates FROM PostLinks WHERE LinkTypeId = 3 GROUP BY RelatedPostId
+    ) pl_in ON pl_in.PostId = p.Id
+  ),
+  acceptance_delays AS (
+    SELECT
+      q.Id AS QuestionId,
+      q.CreationDate AS QuestionCreation,
+      a.Id AS AcceptedAnswerId,
+      a.CreationDate AS AnswerCreation,
+      EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/86400.0 AS DaysToAccept
+    FROM questions q
+    JOIN Posts a ON a.Id = q.AcceptedAnswerId
+    WHERE q.AcceptedAnswerId IS NOT NULL
+  ),
+  popular_posts_union AS (
+    SELECT Id, Title, Score, ViewCount, AnswerCount, OwnerUserId, 'by_views' AS reason FROM questions WHERE ViewCount > 10000
+    UNION
+    SELECT Id, Title, Score, ViewCount, AnswerCount, OwnerUserId, 'by_score' AS reason FROM questions WHERE Score >= 50
+    UNION
+    SELECT Id, Title, Score, ViewCount, AnswerCount, OwnerUserId, 'by_answers' AS reason FROM questions WHERE AnswerCount >= 20
+  ),
+  top_candidates AS (
+    SELECT * FROM popular_posts_union
+    ORDER BY ViewCount DESC NULLS LAST, Score DESC NULLS LAST
+    LIMIT 300
+  ),
+  site_top_users AS (
+    SELECT
+      u.Id,
+      u.DisplayName,
+      SUM(CASE WHEN p.PostTypeId IN (1,2) THEN 1 ELSE 0 END) AS Posts,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS AnswerScoreSum,
+      RANK() OVER (ORDER BY SUM(CASE WHEN p.PostTypeId IN (1,2) THEN 1 ELSE 0 END) DESC) AS site_rank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+  ),
+  hot_tags AS (
+    SELECT Tag FROM tag_aggregates WHERE QuestionCount >= 1000
+    UNION
+    SELECT Tag FROM tag_aggregates WHERE TotalViews >= 1000000
+  ),
+  cold_tags AS (
+    SELECT Tag FROM tag_aggregates
+    EXCEPT
+    SELECT Tag FROM hot_tags
+  )
+SELECT
+  COALESCE(ta.Tag, cume.Tag) AS Tag,
+  COALESCE(ta.QuestionCount,0) AS QuestionCount,
+  ROUND(COALESCE(ta.AvgQuestionScore,0)::numeric,3) AS AvgQuestionScore,
+  COALESCE(ta.MedianQuestionScore,0) AS MedianQuestionScore,
+  COALESCE(ta.ScoreStdDev,0)::numeric AS ScoreStdDev,
+  COALESCE(ta.MaxQuestionScore,0) AS MaxQuestionScore,
+  COALESCE(ta.MinQuestionScore,0) AS MinQuestionScore,
+  COALESCE(ta.TotalViews,0) AS TotalViews,
+  COALESCE(ta.TotalAnswers,0) AS TotalAnswers,
+  CASE WHEN COALESCE(ta.QuestionCount,0) > 0 THEN ROUND(COALESCE(ta.TotalViews,0)::numeric / NULLIF(COALESCE(ta.QuestionCount,0),0),2) ELSE NULL END AS AvgViewsPerQuestion,
+  cume.Month AS LatestMonth,
+  COALESCE(cume.QuestionsThisMonth,0) AS QuestionsInLatestMonth,
+  COALESCE(cume.CumulativeQuestions,0) AS CumulativeQuestionsToLatestMonth,
+  tc.OwnerUserId AS TopContributorId,
+  tc.OwnerName AS TopContributorName,
+  COALESCE(tc.QuestionsByOwner,0) AS TopContributorQuestionCount,
+  COALESCE(tc.ScoreByOwner,0) AS TopContributorScore,
+  stu.site_rank AS TopContributorSiteRank,
+  (SELECT q2.Id FROM questions q2 JOIN tags_exploded te2 ON te2.QuestionId = q2.Id WHERE te2.Tag = COALESCE(ta.Tag, cume.Tag) ORDER BY q2.Score DESC NULLS LAST LIMIT 1) AS TopQuestionId,
+  (SELECT q2.Title FROM questions q2 JOIN tags_exploded te2 ON te2.QuestionId = q2.Id WHERE te2.Tag = COALESCE(ta.Tag, cume.Tag) ORDER BY q2.Score DESC NULLS LAST LIMIT 1) AS TopQuestionTitle,
+  (SELECT q2.ViewCount FROM questions q2 JOIN tags_exploded te2 ON te2.QuestionId = q2.Id WHERE te2.Tag = COALESCE(ta.Tag, cume.Tag) ORDER BY q2.Score DESC NULLS LAST LIMIT 1) AS TopQuestionViewCount,
+  (SELECT EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/86400.0
+     FROM questions q
+     JOIN Posts a ON a.Id = q.AcceptedAnswerId
+     JOIN tags_exploded te2 ON te2.QuestionId = q.Id
+     WHERE te2.Tag = COALESCE(ta.Tag, cume.Tag) AND q.AcceptedAnswerId IS NOT NULL
+     ORDER BY q.Score DESC
+     LIMIT 1) AS TopQuestionAcceptedDelayDays,
+  (SELECT COUNT(*)
+     FROM PostLinks pl
+     WHERE pl.LinkTypeId = 3
+       AND (pl.PostId IN (SELECT q3.Id FROM questions q3 JOIN tags_exploded te3 ON te3.QuestionId = q3.Id WHERE te3.Tag = COALESCE(ta.Tag,cume.Tag))
+         OR pl.RelatedPostId IN (SELECT q3.Id FROM questions q3 JOIN tags_exploded te3 ON te3.QuestionId = q3.Id WHERE te3.Tag = COALESCE(ta.Tag,cume.Tag)))
+  ) AS DupLinksForTagQuestions,
+  (SELECT AVG(length(c.Text)) FROM Comments c WHERE c.PostId IN (SELECT q4.Id FROM questions q4 JOIN tags_exploded te4 ON te4.QuestionId = q4.Id WHERE te4.Tag = COALESCE(ta.Tag,cume.Tag)))::numeric(12,2) AS AvgCommentLengthForTag,
+  ROUND(COALESCE(ta.ScoreStdDev,0)::numeric,3) AS ScoreStdDevRounded,
+  CASE
+    WHEN COALESCE(ta.Tag,cume.Tag) IN (SELECT Tag FROM hot_tags) THEN 'hot'
+    WHEN COALESCE(ta.Tag,cume.Tag) IN (SELECT Tag FROM cold_tags) THEN 'cold'
+    ELSE 'warm'
+  END AS ThermalClass,
+  ('#' || upper(substring(COALESCE(ta.Tag,cume.Tag) FROM 1 FOR 10)) || ':' || lpad(COALESCE(ta.QuestionCount,0)::text,6,' ')) AS TagLabel,
+  (SELECT COUNT(*) FROM top_candidates tc2 WHERE tc2.Id IN (SELECT q5.Id FROM questions q5 JOIN tags_exploded te5 ON te5.QuestionId = q5.Id WHERE te5.Tag = COALESCE(ta.Tag,cume.Tag))) AS TopCandidateHits,
+  (SELECT ROUND(AVG(pv.VoteNet)::numeric,2) FROM post_votes pv WHERE pv.PostId IN (SELECT q6.Id FROM questions q6 JOIN tags_exploded te6 ON te6.QuestionId = q6.Id WHERE te6.Tag = COALESCE(ta.Tag,cume.Tag))) AS AvgNetVotesPerQuestion,
+  (SELECT array_to_string(array_agg(s.Title ORDER BY s.CreationDate DESC), ' | ')
+     FROM (
+       SELECT q7.Title, q7.CreationDate
+       FROM questions q7
+       JOIN tags_exploded te7 ON te7.QuestionId = q7.Id
+       WHERE te7.Tag = COALESCE(ta.Tag,cume.Tag)
+       ORDER BY q7.CreationDate DESC
+       LIMIT 3
+     ) s
+  ) AS RecentTitles,
+  CASE
+    WHEN COALESCE(ta.QuestionCount,0) > 0 AND COALESCE(ta.TotalViews,0) > 0 THEN
+      ROUND((COALESCE(ta.TotalAnswers,0)::numeric / NULLIF(COALESCE(ta.QuestionCount,0),0)) * (LN(COALESCE(ta.TotalViews,0) + 1)::numeric),3)
+    ELSE NULL
+  END AS CompositePopularityScore
+FROM tag_aggregates ta
+FULL OUTER JOIN (SELECT * FROM tag_monthly_cume WHERE rn_desc = 1) cume ON cume.Tag = ta.Tag
+LEFT JOIN tag_contributors tc ON tc.Tag = COALESCE(ta.Tag,cume.Tag) AND tc.rn = 1
+LEFT JOIN site_top_users stu ON stu.Id = tc.OwnerUserId
+WHERE COALESCE(ta.QuestionCount,0) > 10
+ORDER BY CompositePopularityScore DESC NULLS LAST
+LIMIT 200;

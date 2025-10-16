@@ -1,0 +1,137 @@
+WITH YearlyTopQuestions AS (
+    SELECT
+        p.Id                 AS QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        u.Reputation,
+        EXTRACT(YEAR FROM p.CreationDate) AS Year,
+        ROW_NUMBER() OVER (
+            PARTITION BY EXTRACT(YEAR FROM p.CreationDate)
+            ORDER BY p.Score DESC
+        )                  AS YearRank,
+        COUNT(c.Id) OVER (
+            PARTITION BY p.Id
+        )                  AS CommentCount
+    FROM Posts p
+    JOIN Users u
+      ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c
+      ON c.PostId = p.Id
+    WHERE p.PostTypeId = 1
+),
+BadgeAgg AS (
+    SELECT
+        UserId,
+        COUNT(*)     AS BadgeCount,
+        MAX(Date)    AS LastBadgeDate
+    FROM Badges
+    GROUP BY UserId
+),
+VoteNet AS (
+    SELECT
+        PostId,
+        SUM(
+          CASE
+            WHEN VoteTypeId = 2 THEN  1
+            WHEN VoteTypeId = 3 THEN -1
+            ELSE 0
+          END
+        )            AS NetVotes
+    FROM Votes
+    GROUP BY PostId
+),
+CorrelatedAnswers AS (
+    SELECT
+        q.QuestionId,
+        (
+          SELECT COUNT(*)
+          FROM Posts a
+          WHERE a.ParentId = q.QuestionId
+            AND a.Score > q.Reputation/NULLIF(a.Score,0)
+        )              AS HighScoringAnswers
+    FROM YearlyTopQuestions q
+),
+QuestionActivity AS (
+    SELECT
+        PostId,
+        MAX(CreationDate) AS LastHistDate
+    FROM PostHistory
+    WHERE PostHistoryTypeId IN (4,5,6)
+    GROUP BY PostId
+)
+SELECT
+    yq.Year,
+    yq.YearRank,
+    CASE WHEN LENGTH(yq.Title) > 50 THEN SUBSTR(yq.Title,1,50) || '...' ELSE SUBSTR(yq.Title,1,50) END AS TruncTitle,
+    ('#' || yq.QuestionId || '(' || COALESCE(vn.NetVotes,0) || ' votes)') AS QInfo,
+    COALESCE(ba.BadgeCount,0)                                 AS BadgeCount,
+    COALESCE(TO_CHAR(ba.LastBadgeDate, 'YYYY-MM-DD'),'1970-01-01') AS LastBadge,
+    COALESCE(qc.HighScoringAnswers,0)                         AS HiAns,
+    yq.CommentCount,
+    CASE
+      WHEN u.Location IS NULL
+        OR TRIM(u.Location) = ''
+      THEN 'NoLoc'
+      ELSE SUBSTR(u.Location,1,15)
+    END                                                        AS LocLabel,
+    qa.LastHistDate
+FROM YearlyTopQuestions yq
+LEFT JOIN BadgeAgg ba
+  ON yq.OwnerUserId = ba.UserId
+LEFT JOIN VoteNet vn
+  ON yq.QuestionId = vn.PostId
+LEFT JOIN CorrelatedAnswers qc
+  ON yq.QuestionId = qc.QuestionId
+LEFT JOIN Users u
+  ON yq.OwnerUserId = u.Id
+LEFT JOIN QuestionActivity qa
+  ON yq.QuestionId = qa.PostId
+WHERE yq.Reputation > (SELECT AVG(Reputation) FROM Users)
+
+UNION ALL
+
+SELECT
+    EXTRACT(YEAR FROM TIMESTAMP '2024-10-01 12:34:56') AS Year,
+   -1 AS YearRank,
+    'NEGQ' AS TruncTitle,
+    'negative-score' AS QInfo,
+     0 AS BadgeCount,
+    TO_CHAR(TIMESTAMP '2024-10-01 12:34:56','YYYY-MM-DD') AS LastBadge,
+     0 AS HiAns,
+     0 AS CommentCount,
+    'NoLoc' AS LocLabel,
+    TIMESTAMP '2024-10-01 12:34:56' AS LastHistDate
+WHERE EXISTS (SELECT 1 FROM Posts p2 WHERE p2.Score < 0)
+
+EXCEPT
+
+SELECT
+    y.Year,
+    y.YearRank,
+    CASE WHEN LENGTH(y.Title) > 50 THEN SUBSTR(y.Title,1,50) || '...' ELSE SUBSTR(y.Title,1,50) END,
+    ('#' || y.QuestionId || '(' || COALESCE(vn2.NetVotes,0) || ' votes)'),
+    COALESCE(ba2.BadgeCount,0),
+    TO_CHAR(ba2.LastBadgeDate,'YYYY-MM-DD'),
+    qc2.HighScoringAnswers,
+    y.CommentCount,
+    CASE
+      WHEN u2.Location IS NULL
+        OR TRIM(u2.Location) = ''
+      THEN 'NoLoc'
+      ELSE SUBSTR(u2.Location,1,15)
+    END,
+    qa2.LastHistDate
+FROM YearlyTopQuestions y
+JOIN VoteNet vn2
+  ON y.QuestionId = vn2.PostId
+JOIN BadgeAgg ba2
+  ON y.OwnerUserId = ba2.UserId
+JOIN CorrelatedAnswers qc2
+  ON y.QuestionId = qc2.QuestionId
+JOIN Users u2
+  ON y.OwnerUserId = u2.Id
+JOIN QuestionActivity qa2
+  ON y.QuestionId = qa2.PostId
+WHERE y.YearRank > 5
+
+ORDER BY Year, YearRank, BadgeCount DESC;

@@ -1,0 +1,230 @@
+-- {"query": "691.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2009} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        ARRAY[t.TagName] AS AncestorTags
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.AncestorTags || t.TagName
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.Id <> r.Id AND t.Count < r.Count
+    WHERE r.Level < 3
+),
+UserBadgeStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COALESCE(SUM(CASE WHEN b.TagBased = CAST(1 AS bit) THEN 1 ELSE 0 END),0) AS TagBasedBadges,
+        u.Reputation,
+        u.CreationDate,
+        u.Location
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+),
+PostActivityWindow AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST, p.CreationDate DESC) AS UserPostRank,
+        RANK() OVER (ORDER BY p.ViewCount DESC NULLS LAST) AS GlobalViewRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2) -- Questions and Answers only
+      AND p.CreationDate >= CURRENT_DATE - INTERVAL '2 years'
+),
+TopQuestionsWithAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.Tags,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViews,
+        q.AcceptedAnswerId,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreationDate,
+        ua.DisplayName AS AnswerOwnerName,
+        ua.Reputation AS AnswerOwnerReputation,
+        ua.Location AS AnswerOwnerLocation,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.TagBasedBadges
+    FROM PostActivityWindow q
+    LEFT JOIN Posts a ON a.Id = q.AcceptedAnswerId
+    LEFT JOIN Users ua ON ua.Id = a.OwnerUserId
+    LEFT JOIN UserBadgeStats ub ON ub.UserId = ua.Id
+    WHERE q.PostTypeId = 1
+      AND q.GlobalViewRank <= 1000
+),
+CloseReasonStats AS (
+    SELECT
+        cht.Name AS CloseReasonName,
+        COUNT(ph.Id) AS CloseCount
+    FROM PostHistory ph
+    JOIN PostHistoryTypes cht ON ph.PostHistoryTypeId = cht.Id
+    WHERE ph.PostHistoryTypeId = 10 -- Post Closed
+      AND ph.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+    GROUP BY cht.Name
+),
+UserCommentStats AS (
+    SELECT
+        c.UserId,
+        u.DisplayName,
+        COUNT(c.Id) AS TotalComments,
+        AVG(LENGTH(c.Text)) AS AvgCommentLength,
+        COUNT(DISTINCT c.PostId) AS DistinctPostsCommented
+    FROM Comments c
+    LEFT JOIN Users u ON u.Id = c.UserId
+    WHERE c.CreationDate >= CURRENT_DATE - INTERVAL '6 months'
+    GROUP BY c.UserId, u.DisplayName
+),
+UserVoteCorrelated AS (
+    SELECT
+        v.UserId,
+        COUNT(*) AS TotalVotes,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+        COUNT(*) FILTER (WHERE v.VoteTypeId IN (8,9)) AS BountyVotes,
+        AVG(v.BountyAmount) FILTER (WHERE v.BountyAmount IS NOT NULL) AS AvgBountyAmount
+    FROM Votes v
+    WHERE v.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+    GROUP BY v.UserId
+),
+CombinedUserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.TagBasedBadges,
+        uv.TotalVotes,
+        uv.UpVotes,
+        uv.DownVotes,
+        uv.BountyVotes,
+        COALESCE(uv.AvgBountyAmount, 0) AS AvgBountyAmount,
+        uc.TotalComments,
+        uc.AvgCommentLength,
+        uc.DistinctPostsCommented,
+        u.Reputation,
+        u.CreationDate,
+        u.Location
+    FROM Users u
+    LEFT JOIN UserBadgeStats ub ON ub.UserId = u.Id
+    LEFT JOIN UserVoteCorrelated uv ON uv.UserId = u.Id
+    LEFT JOIN UserCommentStats uc ON uc.UserId = u.Id
+),
+PostsWithLinkInfo AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        pt.Name AS PostTypeName,
+        lt.Name AS LinkTypeName,
+        pl.RelatedPostId
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    LEFT JOIN PostTypes pt ON pt.Id = p.PostTypeId
+    WHERE p.PostTypeId IN (1,2)
+),
+FinalResult AS (
+    SELECT
+        q.QuestionId,
+        q.Title,
+        q.Tags,
+        q.QuestionCreationDate,
+        q.QuestionScore,
+        q.QuestionViews,
+        q.AnswerId,
+        q.AnswerScore,
+        q.AnswerCreationDate,
+        q.AnswerOwnerName,
+        q.AnswerOwnerReputation,
+        q.AnswerOwnerLocation,
+        q.GoldBadges,
+        q.SilverBadges,
+        q.BronzeBadges,
+        q.TagBasedBadges,
+        cr.CloseReasonName,
+        cr.CloseCount,
+        cu.TotalComments,
+        cu.AvgCommentLength,
+        cu.DistinctPostsCommented,
+        cu.TotalVotes,
+        cu.UpVotes,
+        cu.DownVotes,
+        cu.BountyVotes,
+        cu.AvgBountyAmount,
+        pl.LinkTypeName,
+        pl.RelatedPostId,
+        STRING_AGG(DISTINCT rt.TagName, ', ') FILTER (WHERE rt.Level = 1) AS TopLevelTags,
+        STRING_AGG(DISTINCT rt.TagName, ', ') FILTER (WHERE rt.Level = 2) AS MidLevelTags,
+        STRING_AGG(DISTINCT rt.TagName, ', ') FILTER (WHERE rt.Level = 3) AS LowLevelTags,
+        CASE 
+            WHEN q.QuestionViews > 10000 THEN 'High Traffic'
+            WHEN q.QuestionViews BETWEEN 1000 AND 10000 THEN 'Medium Traffic'
+            ELSE 'Low Traffic'
+        END AS TrafficCategory,
+        CASE 
+            WHEN q.QuestionScore >= 50 THEN 'Highly Rated'
+            WHEN q.QuestionScore BETWEEN 10 AND 49 THEN 'Moderately Rated'
+            ELSE 'Low Rated'
+        END AS ScoreCategory
+    FROM TopQuestionsWithAnswers q
+    LEFT JOIN CloseReasonStats cr ON cr.CloseReasonName = (
+        SELECT pht.Name
+        FROM PostHistory ph
+        JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+        WHERE ph.PostId = q.QuestionId AND ph.PostHistoryTypeId = 10
+        ORDER BY ph.CreationDate DESC
+        LIMIT 1
+    )
+    LEFT JOIN CombinedUserStats cu ON cu.DisplayName = q.AnswerOwnerName
+    LEFT JOIN PostsWithLinkInfo pl ON pl.Id = q.QuestionId
+    LEFT JOIN RecursiveTagHierarchy rt ON rt.TagName = ANY(string_to_array(replace(replace(q.Tags, '<', ''), '>', ''), ' '))
+    GROUP BY
+        q.QuestionId, q.Title, q.Tags, q.QuestionCreationDate, q.QuestionScore, q.QuestionViews,
+        q.AnswerId, q.AnswerScore, q.AnswerCreationDate, q.AnswerOwnerName, q.AnswerOwnerReputation, q.AnswerOwnerLocation,
+        q.GoldBadges, q.SilverBadges, q.BronzeBadges, q.TagBasedBadges,
+        cr.CloseReasonName, cr.CloseCount,
+        cu.TotalComments, cu.AvgCommentLength, cu.DistinctPostsCommented,
+        cu.TotalVotes, cu.UpVotes, cu.DownVotes, cu.BountyVotes, cu.AvgBountyAmount,
+        pl.LinkTypeName, pl.RelatedPostId
+)
+SELECT
+    *
+FROM FinalResult
+ORDER BY QuestionViews DESC NULLS LAST, QuestionScore DESC NULLS LAST
+LIMIT 100;

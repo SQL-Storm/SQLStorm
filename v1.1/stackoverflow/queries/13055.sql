@@ -1,0 +1,83 @@
+WITH TopUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS UserRank
+    FROM Users u
+    WHERE u.Reputation > 1000
+),
+QuestionStats AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        COUNT(DISTINCT ph.Id) AS RevisionCount
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE p.PostTypeId = 1 AND p.ClosedDate IS NULL
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.Tags
+),
+AnswerAnalysis AS (
+    SELECT 
+        p.ParentId AS QuestionId,
+        COUNT(p.Id) AS AnswerCount,
+        AVG(p.Score) AS AvgAnswerScore,
+        MAX(p.Score) AS MaxAnswerScore
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+),
+UserEngagement AS (
+    SELECT 
+        ph.UserId,
+        COUNT(*) AS EngagementCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6) THEN 1 ELSE 0 END) AS EditCount
+    FROM PostHistory ph
+    GROUP BY ph.UserId
+),
+TagMatches AS (
+    SELECT
+        qs.Id AS QuestionId,
+        taglist.TagName
+    FROM QuestionStats qs
+    JOIN Tags taglist ON POSITION(',' || taglist.TagName || ',' IN ',' || qs.Tags || ',') > 0
+)
+SELECT 
+    qs.Id,
+    qs.Title,
+    qs.Score,
+    qs.ViewCount,
+    aa.AnswerCount,
+    aa.AvgAnswerScore,
+    STRING_AGG(DISTINCT tm.TagName, ', ') AS Tags,
+    tu.DisplayName,
+    tu.Reputation,
+    ue.EngagementCount,
+    ue.EditCount,
+    RANK() OVER (PARTITION BY qs.Id ORDER BY aa.MaxAnswerScore DESC) AS AnswerQualityRank
+FROM QuestionStats qs
+JOIN AnswerAnalysis aa ON qs.Id = aa.QuestionId
+JOIN TopUsers tu ON EXISTS (
+    SELECT 1 FROM Posts p WHERE p.OwnerUserId = tu.Id AND p.Id = qs.Id
+)
+LEFT JOIN UserEngagement ue ON tu.Id = ue.UserId
+LEFT JOIN TagMatches tm ON qs.Id = tm.QuestionId
+GROUP BY
+    qs.Id,
+    qs.Title,
+    qs.Score,
+    qs.ViewCount,
+    aa.AnswerCount,
+    aa.AvgAnswerScore,
+    aa.MaxAnswerScore,
+    tu.DisplayName,
+    tu.Reputation,
+    ue.EngagementCount,
+    ue.EditCount,
+    tu.UserRank
+HAVING COALESCE(tu.UserRank, 999999) <= 10
+ORDER BY qs.Score DESC, aa.AvgAnswerScore DESC, ue.EngagementCount DESC
+LIMIT 100;

@@ -1,0 +1,187 @@
+-- {"query": "3016.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1363} 
+WITH PostContent AS (
+    SELECT p.Id,
+           p.PostTypeId,
+           p.Title,
+           p.Tags,
+           p.CreationDate,
+           p.Score,
+           p.ViewCount,
+           p.Body,
+           p.OwnerUserId,
+           p.LastEditDate,
+           p.LastActivityDate,
+           p.AcceptedAnswerId,
+           p.AnswerCount,
+           p.CommentCount,
+           p.FavoriteCount,
+           p.ClosedDate,
+           p.ContentLicense,
+           u.Reputation,
+           u.DisplayName,
+           u.Location,
+           u.LastAccessDate
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+TagStats AS (
+    SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS Tag,
+           COUNT(p.Id) AS QuestionCount,
+           AVG(p.Score) AS AverageScorePerQuestion,
+           SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END)::float / NULLIF(COUNT(p.Id), 0) AS PositiveScoreRatio
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    GROUP BY Tag
+),
+UserBadgeCounts AS (
+    SELECT b.UserId,
+           COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+           COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+           COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+AnswerStats AS (
+    SELECT a.Id AS AnswerId,
+           a.PostTypeId,
+           a.CreationDate AS AnswerDate,
+           a.OwnerUserId,
+           a.Score AS AnswerScore,
+           a.ParentId AS QuestionId,
+           q.CreationDate AS QuestionCreationDate
+    FROM Posts a
+    LEFT JOIN Posts q ON a.ParentId = q.Id
+    WHERE a.PostTypeId = 2
+),
+VoteStats AS (
+    SELECT v.PostId,
+           COUNT(v.Id) AS TotalVotes,
+           COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS Upvotes,
+           COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS Downvotes
+    FROM Votes v
+    GROUP BY v.PostId
+),
+AnswerAnswerLink AS (
+    SELECT l.PostId AS AnswerId,
+           l.RelatedPostId AS RelatedAnswerId
+    FROM PostLinks l
+    WHERE l.LinkTypeId = 3 -- duplicate
+),
+PostHistoryCounts AS (
+    SELECT ph.PostId,
+           COUNT(CASE WHEN ph.PostHistoryTypeId IN (2, 4, 6) THEN 1 END) AS EditCount,
+           COUNT(CASE WHEN ph.PostHistoryTypeId IN (10,11,12,13,14,15,19,20) THEN 1 END) AS SignificantChanges
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+RecentActivity AS (
+    SELECT p.Id,
+           p.LastActivityDate,
+           p.CreationDate,
+           p.Title,
+           p.OwnerUserId
+    FROM Posts p
+),
+ScoreQuartiles AS (
+    SELECT percentile_cont(0.25) WITHIN GROUP (ORDER BY Score) AS Q1,
+           percentile_cont(0.50) WITHIN GROUP (ORDER BY Score) AS Median,
+           percentile_cont(0.75) WITHIN GROUP (ORDER BY Score) AS Q3
+    FROM Posts
+    WHERE PostTypeId = 1
+),
+TopQuestions AS (
+    SELECT p.Id,
+           p.Title,
+           p.Score,
+           p.CreationDate,
+           p.OwnerUserId
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Score >= (SELECT Q3 FROM ScoreQuartiles)
+)
+SELECT
+    pp.Id AS PostId,
+    pp.PostTypeId,
+    pp.Title,
+    pp.Tags,
+    pp.CreationDate,
+    pp.Score,
+    pp.ViewCount,
+    pp.Body,
+    pp.OwnerUserId,
+    pp.LastEditDate,
+    pp.LastActivityDate,
+    pp.AcceptedAnswerId,
+    pc.Reputation,
+    pc.DisplayName AS OwnerDisplayName,
+    pc.Location,
+    pc.LastAccessDate,
+    ps.QuestionCount,
+    ps.AverageScorePerQuestion,
+    ps.PositiveScoreRatio,
+    bcm.GoldBadges,
+    bcm.SilverBadges,
+    bcm.BronzeBadges,
+    v.TotalVotes,
+    v.Upvotes,
+    v.Downvotes,
+    aas.AnswerScore,
+    aas.AnswerDate,
+    aas.QuestionCreationDate,
+    p2.RelatedAnswerId,
+    p2.AnswerId AS DuplicateAnswerId,
+    p2.AnswerId,
+    chc.EditCount,
+    chc.SignificantChanges,
+    ra.LastActivityDate,
+    ra.CreationDate AS LastActivityCreationDate,
+    ra.Title AS LastActivityTitle
+FROM PostContent pp
+LEFT JOIN UserBadgeCounts bcm ON pp.OwnerUserId = bcm.UserId
+LEFT JOIN VoteStats v ON pp.Id = v.PostId
+LEFT JOIN AnswerStats aas ON pp.Id = aas.AnswerId
+LEFT JOIN AnswerAnswerLink p2 ON pp.Id = p2.AnswerId
+LEFT JOIN PostHistoryCounts chc ON pp.Id = chc.PostId
+LEFT JOIN RecentActivity ra ON pp.Id = ra.Id
+LEFT JOIN ScoreQuartiles sq ON true
+WHERE
+    (pp.PostTypeId = 1 AND pp.Score >= (sq.Q3))
+OR
+    (pp.PostTypeId = 2 AND aas.AnswerScore > 10)
+OR
+    (pp.PostTypeId = 1 AND EXISTS (
+        SELECT 1 FROM Comments c WHERE c.PostId = pp.Id AND c.Score > 5
+    ))
+UNION ALL
+SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Body,
+    p.OwnerUserId,
+    p.LastEditDate,
+    p.LastActivityDate,
+    p.AcceptedAnswerId,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+FROM Posts p
+WHERE p.PostTypeId = 3
+ORDER BY CreationDate DESC
+LIMIT 100;

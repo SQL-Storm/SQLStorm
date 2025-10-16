@@ -1,0 +1,197 @@
+-- {"query": "112.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.1, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1666} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+
+    union all
+
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Path || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id > r.Id and t2.IsModeratorOnly = 0 and t2.IsRequired = 0
+    where not t2.TagName = any(r.Path) and r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserReputationWindow as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        row_number() over (partition by u.Location order by u.Reputation desc) as RankInLocation,
+        count(*) over (partition by u.Location) as UsersInLocation
+    from Users u
+    where u.Location is not null
+),
+TopQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AnswerCount,
+        p.ClosedDate,
+        u.DisplayName as OwnerName,
+        coalesce((select count(*) from Comments c where c.PostId = p.Id), 0) as CommentCount,
+        coalesce((select sum(v.BountyAmount) from Votes v where v.PostId = p.Id and v.VoteTypeId in (8,9)), 0) as TotalBounty
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 1
+),
+AnswerStats as (
+    select
+        a.ParentId as QuestionId,
+        count(*) as TotalAnswers,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        sum(case when a.OwnerUserId is null then 0 else 1 end) as AnsweredByRegisteredUsers
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.ParentId
+),
+QuestionCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join CloseReasonTypes crt on cast(ph.Comment as int) = crt.Id
+    where ph.PostHistoryTypeId = 10
+),
+UserActivity as (
+    select
+        u.Id,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsPosted,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersPosted,
+        count(distinct c.Id) as CommentsMade,
+        count(distinct v.Id) filter (where v.VoteTypeId = 2) as UpVotesGiven,
+        count(distinct v.Id) filter (where v.VoteTypeId = 3) as DownVotesGiven
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+UserTopBadges as (
+    select
+        ub.UserId,
+        max(case when ub.Class = 1 then ub.BadgeCount else 0 end) as GoldBadges,
+        max(case when ub.Class = 2 then ub.BadgeCount else 0 end) as SilverBadges,
+        max(case when ub.Class = 3 then ub.BadgeCount else 0 end) as BronzeBadges
+    from UserBadgeCounts ub
+    group by ub.UserId
+),
+QuestionAnswerDetails as (
+    select
+        tq.Id as QuestionId,
+        tq.Title,
+        tq.OwnerUserId,
+        tq.OwnerName,
+        tq.CreationDate,
+        tq.Score,
+        tq.ViewCount,
+        tq.Tags,
+        tq.AnswerCount,
+        tq.CommentCount,
+        tq.TotalBounty,
+        coalesce(a.TotalAnswers, 0) as TotalAnswers,
+        coalesce(a.AvgAnswerScore, 0) as AvgAnswerScore,
+        coalesce(a.MaxAnswerScore, 0) as MaxAnswerScore,
+        coalesce(a.AnsweredByRegisteredUsers, 0) as AnsweredByRegisteredUsers,
+        qcr.CloseReasonName,
+        qcr.CloseDate
+    from TopQuestions tq
+    left join AnswerStats a on a.QuestionId = tq.Id
+    left join QuestionCloseReasons qcr on qcr.PostId = tq.Id
+),
+RankedQuestions as (
+    select
+        qad.*,
+        dense_rank() over (partition by qad.CloseReasonName order by qad.Score desc nulls last, qad.ViewCount desc nulls last) as RankByScore,
+        row_number() over (partition by qad.OwnerUserId order by qad.CreationDate desc) as RecentQuestionRank
+    from QuestionAnswerDetails qad
+),
+FinalUserStats as (
+    select
+        ua.Id,
+        ua.DisplayName,
+        ua.QuestionsPosted,
+        ua.AnswersPosted,
+        ua.CommentsMade,
+        ua.UpVotesGiven,
+        ua.DownVotesGiven,
+        coalesce(utb.GoldBadges, 0) as GoldBadges,
+        coalesce(utb.SilverBadges, 0) as SilverBadges,
+        coalesce(utb.BronzeBadges, 0) as BronzeBadges,
+        urw.RankInLocation,
+        urw.UsersInLocation
+    from UserActivity ua
+    left join UserTopBadges utb on utb.UserId = ua.Id
+    left join UserReputationWindow urw on urw.Id = ua.Id
+)
+select
+    rq.QuestionId,
+    rq.Title,
+    rq.OwnerUserId,
+    rq.OwnerName,
+    rq.CreationDate,
+    rq.Score,
+    rq.ViewCount,
+    rq.Tags,
+    rq.AnswerCount,
+    rq.CommentCount,
+    rq.TotalBounty,
+    rq.TotalAnswers,
+    rq.AvgAnswerScore,
+    rq.MaxAnswerScore,
+    rq.AnsweredByRegisteredUsers,
+    rq.CloseReasonName,
+    rq.CloseDate,
+    rq.RankByScore,
+    rq.RecentQuestionRank,
+    fus.QuestionsPosted,
+    fus.AnswersPosted,
+    fus.CommentsMade,
+    fus.UpVotesGiven,
+    fus.DownVotesGiven,
+    fus.GoldBadges,
+    fus.SilverBadges,
+    fus.BronzeBadges,
+    fus.RankInLocation,
+    fus.UsersInLocation,
+    -- Complex string expression: concatenation of tags with user display name and question title length
+    concat_ws(' | ',
+        coalesce(rq.Tags, 'NoTags'),
+        fus.DisplayName,
+        'TitleLen:' || length(coalesce(rq.Title, ''))
+    ) as TagUserTitleInfo,
+    -- Complex calculation: weighted score with bounty and answer count, null-safe
+    coalesce(rq.Score,0) * 0.7 + coalesce(rq.TotalBounty,0) * 0.2 + coalesce(rq.TotalAnswers,0) * 0.1 as WeightedScore
+from RankedQuestions rq
+left join FinalUserStats fus on fus.Id = rq.OwnerUserId
+where (rq.CloseReasonName is null or rq.CloseReasonName = 'Duplicate')
+  and rq.RankByScore <= 50
+order by WeightedScore desc, rq.ViewCount desc
+limit 100;

@@ -1,0 +1,153 @@
+-- {"query": "1321.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1728} 
+
+with RecursiveUserActivity AS (
+    select 
+        u.Id as UserId, u.DisplayName, u.Reputation,
+        coalesce(BufferedQuestionCount,0) as QuestionCount,
+        coalesce(BufferedAnswerCount,0) as AnswerCount,
+        coalesce(BufferedCommentCount,0) as CommentCount,
+        coalesce(BufferedBadgeGoldCount,0) as BadgeGoldCount,
+        coalesce(BufferedBadgeSilverCount,0) as BadgeSilverCount,
+        coalesce(BufferedBadgeBronzeCount,0) as BadgeBronzeCount
+    from Users u
+    left join (
+        select OwnerUserId, count(*) as BufferedQuestionCount 
+        from Posts 
+        where PostTypeId = 1 and OwnerUserId is not null 
+        group by OwnerUserId
+    ) Q on Q.OwnerUserId = u.Id
+    left join (
+        select OwnerUserId, count(*) as BufferedAnswerCount
+        from Posts 
+        where PostTypeId = 2 and OwnerUserId is not null 
+        group by OwnerUserId
+    ) A on A.OwnerUserId = u.Id
+    left join (
+        select UserId, count(*) as BufferedCommentCount
+        from Comments
+        where UserId is not null
+        group by UserId
+    ) C on C.UserId = u.Id
+    left join (
+        select UserId, sum(case when Class=1 then 1 else 0 end) as BufferedBadgeGoldCount,
+                       sum(case when Class=2 then 1 else 0 end) as BufferedBadgeSilverCount,
+                       sum(case when Class=3 then 1 else 0 end) as BufferedBadgeBronzeCount
+        from Badges
+        group by UserId
+    ) B on B.UserId = u.Id
+),
+PostQualityEvaluation AS (
+    select 
+        p.Id as PostId, p.OwnerUserId, p.PostTypeId,
+        p.Score, p.ViewCount,
+        p.AnswerCount,
+        coalesce(vup.UpVotesCount,0) as UpVotesCount,
+        coalesce(vdown.DownVotesCount,0) as DownVotesCount,
+        coalesce(vc.CloseVotes,0) as CloseVotes,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as PostRecencyRank
+    from Posts p
+    left join (
+        select PostId, count(*) as UpVotesCount from Votes v
+        where v.VoteTypeId=2
+        group by PostId
+    ) vup on vup.PostId = p.Id
+    left join (
+        select PostId, count(*) as DownVotesCount from Votes v
+        where v.VoteTypeId=3
+        group by PostId
+    ) vdown on vdown.PostId = p.Id
+    left join (
+        select ph.PostId, count(*) as CloseVotes
+        from PostHistory ph
+        where ph.PostHistoryTypeId = 10
+        group by ph.PostId
+    ) vc on vc.PostId = p.Id
+    where p.OwnerUserId is not null
+),
+TopTaggedQuestions AS (
+    select
+        p.Id as QuestionId, 
+        p.OwnerUserId,
+        p.CreationDate,
+        c.Tag,
+        count(*) over (partition by c.Tag) as TagFrequency
+    from Posts p
+    cross join lateral (
+        select regexp_split_to_table(substr(p.Tags from 2 for char_length(p.Tags) - 2), '><') as Tag
+    ) c
+    where p.PostTypeId = 1 and p.Tags is not null and p.Tags <> ''
+),
+EliteUsers AS (
+    select 
+        u.UserId, u.DisplayName, u.Reputation,
+        u.QuestionCount, u.AnswerCount, u.CommentCount,
+        u.BadgeGoldCount, u.BadgeSilverCount, u.BadgeBronzeCount,
+        count(distinct pq.PostId) as HighQualityPosts
+    from RecursiveUserActivity u
+    left join PostQualityEvaluation pq on pq.OwnerUserId = u.UserId and pq.Score > 10 and pq.UpVotesCount > 5 and pq.PostRecencyRank <= 5
+    group by u.UserId, u.DisplayName, u.Reputation, u.QuestionCount, u.AnswerCount, u.CommentCount, u.BadgeGoldCount, u.BadgeSilverCount, u.BadgeBronzeCount
+    having sum(pq.Score) > 100 or count(distinct pq.PostId) > 3
+),
+QuestionsWithDuplicateLinks AS (
+    select distinct q.Id as QuestionId, q.Title, group_concat(distinct dup.RelatedPostId) over (partition by q.Id ORDER BY dup.RelatedPostId) as DuplicatePostIds, q.Tags
+    from Posts q
+    join PostLinks dup on dup.PostId = q.Id and dup.LinkTypeId = 3 
+    where q.PostTypeId = 1
+),
+FinalSummary as (
+    select
+        eu.UserId, eu.DisplayName, eu.Reputation, eu.QuestionCount, eu.AnswerCount, eu.CommentCount,
+        eu.BadgeGoldCount, eu.BadgeSilverCount, eu.BadgeBronzeCount,
+        eu.HighQualityPosts,
+        coalesce(ttq.Tag, 'N/A') as TopCommonTag,
+        count(qdup.QuestionId) as QuestionsWithDuplicates
+    from EliteUsers eu
+    left join (
+        select 
+            q.OwnerUserId as UserId,
+            tt.Tag,
+            row_number() over (partition by q.OwnerUserId order by count(*) desc) as Rnk
+        from Posts q
+        cross join lateral (
+            select regexp_split_to_table(substr(q.Tags from 2 for char_length(q.Tags) - 2), '><') as Tag
+        ) tt
+        where q.PostTypeId = 1 and q.OwnerUserId is not null
+        group by q.OwnerUserId, tt.Tag
+        having count(*) > 1
+    ) ttq on ttq.UserId = eu.UserId and ttq.Rnk=1
+    left join QuestionsWithDuplicateLinks qdup on qdup.QuestionId in (
+        select Id from Posts where OwnerUserId = eu.UserId and PostTypeId = 1
+    )
+    group by eu.UserId, eu.DisplayName, eu.Reputation, eu.QuestionCount, eu.AnswerCount, eu.CommentCount, eu.BadgeGoldCount, eu.BadgeSilverCount, eu.BadgeBronzeCount, eu.HighQualityPosts, ttq.Tag
+)
+select
+    fs.*,
+    substring(fs.DisplayName from '(.{1,15})') || case when length(fs.DisplayName) > 15 then '...' else '' end as DisplayNameShortened,
+    case
+        when fs.BadgeGoldCount > 10 then 'Accomplished'
+        when fs.BadgeSilverCount > 20 then 'Established'
+        when fs.BadgeBronzeCount > 30 then 'Contributor'
+        else 'Newbie'
+    end as UserTier,
+    coalesce(avgViewCnt.AvgViewCount, 0) as AvgViewsPerQuestion,
+    coalesce(avgAnswerLen.AvgAnswerLength, 0) as AvgAnswerBodyLength,
+    exists(
+        select 1 from Posts p2
+        where p2.OwnerUserId = fs.UserId 
+              and p2.PostTypeId = 1 
+              and exists (
+                  select 1 from Votes v2 where v2.PostId = p2.Id and v2.VoteTypeId = 2 and v2.UserId is null limit 1
+              )
+        limit 1
+    ) as HasAnonymousUpvoteQuestions
+from FinalSummary fs
+left join (
+    select OwnerUserId, avg(ViewCount) as AvgViewCount 
+    from Posts where PostTypeId = 1 group by OwnerUserId
+) avgViewCnt on avgViewCnt.OwnerUserId = fs.UserId
+left join (
+    select OwnerUserId, avg(length(coalesce(Body,''))) as AvgAnswerLength
+    from Posts where PostTypeId = 2 group by OwnerUserId
+) avgAnswerLen on avgAnswerLen.OwnerUserId = fs.UserId
+order by fs.Reputation desc NULLS LAST, fs.HighQualityPosts desc NULLS LAST;
+

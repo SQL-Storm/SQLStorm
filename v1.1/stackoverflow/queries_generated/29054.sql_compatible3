@@ -1,0 +1,192 @@
+WITH UserStats AS (
+  SELECT 
+    u.Id AS UserId,
+    u.Reputation,
+    u.DisplayName,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    COUNT(DISTINCT p.Id) AS PostCount,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    COUNT(DISTINCT b.Id) AS BadgeCount,
+    MAX(p.CreationDate) AS LatestPostDate,
+    CASE WHEN u.AccountId IS NULL THEN 'No Account' ELSE 'Has Account' END AS AccountStatus,
+    CASE WHEN u.WebsiteUrl IS NULL OR u.WebsiteUrl = '' THEN 0 ELSE 1 END AS HasWebsite,
+    CASE WHEN u.Location IS NOT NULL AND u.Location <> '' THEN 1 ELSE 0 END AS HasLocation,
+    COALESCE(SUM(p.Score), 0) AS TotalScore,
+    COALESCE(SUM(p.ViewCount), 0) AS TotalViews,
+    DENSE_RANK() OVER (ORDER BY COALESCE(SUM(p.Score), 0) DESC) AS ScoreRank,
+    ROW_NUMBER() OVER (ORDER BY u.CreationDate) AS RegistrationOrder
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+  LEFT JOIN Comments c ON u.Id = c.UserId
+  LEFT JOIN Badges b ON u.Id = b.UserId
+  GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes, u.AccountId, u.WebsiteUrl, u.Location, u.CreationDate
+),
+QuestionStats AS (
+  SELECT 
+    OwnerUserId,
+    COUNT(*) AS QuestionCount,
+    AVG(Score) AS AvgQuestionScore,
+    MAX(ViewCount) AS MaxQuestionViews,
+    STRING_AGG(Tags, ', ') AS AllTags,
+    COUNT(CASE WHEN AnswerCount > 0 THEN 1 END) AS AnsweredQuestions,
+    COUNT(CASE WHEN AnswerCount = 0 THEN 1 END) AS UnansweredQuestions,
+    COUNT(CASE WHEN AcceptedAnswerId IS NOT NULL THEN 1 END) AS AcceptedAnswers,
+    COUNT(CASE WHEN ClosedDate IS NOT NULL THEN 1 END) AS ClosedQuestions,
+    AVG(AnswerCount) AS AvgAnswersPerQuestion,
+    MAX(CreationDate) AS LatestQuestionDate
+  FROM Posts 
+  WHERE PostTypeId = 1 
+  GROUP BY OwnerUserId
+),
+AnswerStats AS (
+  SELECT 
+    OwnerUserId,
+    COUNT(*) AS AnswerCount,
+    SUM(Score) AS TotalAnswerScore,
+    AVG(Score) AS AvgAnswerScore,
+    MAX(CreationDate) AS LatestAnswerDate,
+    COUNT(DISTINCT ParentId) AS QuestionsAnswered,
+    SUM(CASE WHEN Score > 0 THEN 1 ELSE 0 END) AS PositiveScoreAnswers,
+    SUM(CASE WHEN Score < 0 THEN 1 ELSE 0 END) AS NegativeScoreAnswers
+  FROM Posts 
+  WHERE PostTypeId = 2 
+  GROUP BY OwnerUserId
+),
+BadgeStats AS (
+  SELECT 
+    t.UserId,
+    COUNT(CASE WHEN b."Class" = 1 THEN 1 END) AS GoldBadges,
+    COUNT(CASE WHEN b."Class" = 2 THEN 1 END) AS SilverBadges,
+    COUNT(CASE WHEN b."Class" = 3 THEN 1 END) AS BronzeBadges,
+    COUNT(*) AS TotalBadges,
+    STRING_AGG(b.Name || ' (' || CAST(t.cnt AS VARCHAR) || ')', ', ') AS BadgeSummary,
+    MAX(b.Date) AS LatestBadgeDate
+  FROM (
+    SELECT UserId, Name, COUNT(*) AS cnt
+    FROM Badges
+    GROUP BY UserId, Name
+  ) t
+  JOIN Badges b ON b.UserId = t.UserId AND b.Name = t.Name
+  GROUP BY t.UserId
+),
+ActivityStats AS (
+  SELECT 
+    UserId,
+    COUNT(*) AS TotalVotes,
+    COUNT(CASE WHEN VoteTypeId = 2 THEN 1 END) AS UpVotes,
+    COUNT(CASE WHEN VoteTypeId = 3 THEN 1 END) AS DownVotes,
+    COUNT(CASE WHEN VoteTypeId = 5 THEN 1 END) AS Favorites,
+    COUNT(CASE WHEN VoteTypeId = 1 THEN 1 END) AS Accepts,
+    MAX(CreationDate) AS LatestVoteDate,
+    CASE 
+      WHEN COUNT(*) > 100 THEN 'Heavy Voter'
+      WHEN COUNT(*) > 50 THEN 'Moderate Voter'
+      WHEN COUNT(*) > 10 THEN 'Light Voter'
+      ELSE 'Inactive'
+    END AS VotingActivityLevel
+  FROM Votes 
+  GROUP BY UserId
+)
+SELECT 
+  us.UserId,
+  us.DisplayName,
+  us.Reputation,
+  us.Views,
+  us.UpVotes,
+  us.DownVotes,
+  us.PostCount,
+  us.CommentCount,
+  us.BadgeCount,
+  us.ScoreRank,
+  us.RegistrationOrder,
+  qs.QuestionCount,
+  qs.AvgQuestionScore,
+  qs.MaxQuestionViews,
+  qs.AllTags,
+  qs.AnsweredQuestions,
+  qs.UnansweredQuestions,
+  qs.AcceptedAnswers,
+  qs.ClosedQuestions,
+  qs.AvgAnswersPerQuestion,
+  ans.AnswerCount,
+  ans.TotalAnswerScore,
+  ans.AvgAnswerScore,
+  ans.LatestAnswerDate,
+  ans.QuestionsAnswered,
+  bs.GoldBadges,
+  bs.SilverBadges,
+  bs.BronzeBadges,
+  bs.TotalBadges,
+  bs.BadgeSummary,
+  ast.TotalVotes,
+  ast.UpVotes AS ActivityUpVotes,
+  ast.DownVotes AS ActivityDownVotes,
+  ast.Favorites,
+  ast.Accepts,
+  ast.LatestVoteDate,
+  ast.VotingActivityLevel,
+  CASE 
+    WHEN us.PostCount > 0 AND us.Reputation > 1000 AND us.BadgeCount >= 5 THEN 'Active Contributor'
+    WHEN us.PostCount > 0 AND us.Reputation > 500 AND us.BadgeCount >= 3 THEN 'Regular Contributor'
+    WHEN us.PostCount > 0 AND us.Reputation > 100 THEN 'New Contributor'
+    ELSE 'Passive User'
+  END AS UserCategory,
+  COALESCE(qs.LatestQuestionDate, ans.LatestAnswerDate, us.LatestPostDate) AS LastActivity,
+  CASE 
+    WHEN us.LatestPostDate IS NOT NULL AND (us.LatestPostDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30' DAY) THEN 'Recent Active'
+    WHEN us.LatestPostDate IS NOT NULL AND (us.LatestPostDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '90' DAY) THEN 'Moderate Active'
+    WHEN us.LatestPostDate IS NOT NULL THEN 'Inactive'
+    ELSE 'Never Active'
+  END AS ActivityStatus,
+  RANK() OVER (PARTITION BY us.ScoreRank ORDER BY us.Reputation DESC) AS ReputationRank,
+  DENSE_RANK() OVER (ORDER BY us.BadgeCount DESC) AS BadgeRank,
+  PERCENT_RANK() OVER (ORDER BY us.TotalScore DESC) AS ScorePercentile,
+  (us.UpVotes * 100.0 / NULLIF(us.DownVotes + us.UpVotes, 0)) AS UpVoteRatio,
+  us.DisplayName || ' (Reputation: ' || CAST(us.Reputation AS VARCHAR) || ', Posts: ' || CAST(us.PostCount AS VARCHAR) || ', Badges: ' || CAST(us.BadgeCount AS VARCHAR) || ')' AS UserSummary,
+  ARRAY[
+    CASE WHEN us.HasWebsite = 1 THEN 'Website' ELSE '' END,
+    CASE WHEN us.HasLocation = 1 THEN 'Location' ELSE '' END,
+    CASE WHEN COALESCE(qs.QuestionCount,0) > 0 THEN 'Questions(' || CAST(qs.QuestionCount AS VARCHAR) || ')' ELSE '' END,
+    CASE WHEN COALESCE(ans.AnswerCount,0) > 0 THEN 'Answers(' || CAST(ans.AnswerCount AS VARCHAR) || ')' ELSE '' END,
+    CASE WHEN COALESCE(ast.TotalVotes,0) > 0 THEN 'Votes(' || CAST(ast.TotalVotes AS VARCHAR) || ')' ELSE '' END
+  ] AS UserAttributes,
+  CASE 
+    WHEN us.Reputation > 10000 AND COALESCE(bs.GoldBadges,0) >= 2 THEN 'Elite'
+    WHEN us.Reputation > 5000 AND COALESCE(bs.GoldBadges,0) >= 1 THEN 'Expert'
+    WHEN us.Reputation > 1000 THEN 'Qualified'
+    ELSE 'Member'
+  END AS ReputationLevel
+FROM UserStats us
+LEFT JOIN QuestionStats qs ON us.UserId = qs.OwnerUserId
+LEFT JOIN AnswerStats ans ON us.UserId = ans.OwnerUserId
+LEFT JOIN BadgeStats bs ON us.UserId = bs.UserId
+LEFT JOIN ActivityStats ast ON us.UserId = ast.UserId
+WHERE 
+  us.UserId IN (
+    SELECT UserId 
+    FROM Votes 
+    WHERE VoteTypeId IN (2, 3) 
+    GROUP BY UserId 
+    HAVING COUNT(*) >= 100
+  )
+  OR EXISTS (
+    SELECT 1 
+    FROM Posts p 
+    WHERE p.OwnerUserId = us.UserId 
+      AND p.PostTypeId = 1 
+      AND p.CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1' YEAR
+  )
+  OR EXISTS (
+    SELECT 1 
+    FROM Badges b2 
+    WHERE b2.UserId = us.UserId 
+      AND b2.Date > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6' MONTH
+  )
+ORDER BY 
+  us.ScoreRank ASC,
+  us.Reputation DESC,
+  us.PostCount DESC,
+  us.BadgeCount DESC
+LIMIT 1000;

@@ -1,0 +1,125 @@
+-- {"query": "20082.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1460} 
+
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        MIN(p.CreationDate) AS FirstPostDate,
+        MAX(p.LastActivityDate) AS LastActivityDate,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 2 AND p.Score > 0) AS AvgPositiveAnswerScore,
+        SUM(p.ViewCount) FILTER (WHERE p.PostTypeId = 1) AS TotalQuestionViews,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id) AS CommentCount
+    FROM
+        Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000 AND p.CommunityOwnedDate IS NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) > 10
+),
+RankedQuestions AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.FavoriteCount,
+        p.ViewCount,
+        p.CreationDate,
+        p.ClosedDate,
+        aa.CreationDate AS AcceptedAnswerDate,
+        (EXTRACT(EPOCH FROM (aa.CreationDate - p.CreationDate)) / 3600) AS HoursToAccept,
+        ARRAY_LENGTH(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'), 1) AS TagCount,
+        ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.FavoriteCount DESC, p.ViewCount DESC) AS rn
+    FROM
+        Posts p
+    LEFT JOIN Posts aa ON p.AcceptedAnswerId = aa.Id
+    WHERE
+        p.PostTypeId = 1 -- Question
+        AND p.DeletionDate IS NULL
+),
+UserClassification AS (
+    SELECT
+        uas.UserId,
+        CASE
+            WHEN uas.Reputation > 150000 AND uas.GoldBadges > 15 AND uas.AvgPositiveAnswerScore > 25 THEN 'Expert'
+            WHEN uas.Reputation > 50000 AND uas.SilverBadges > 50 AND uas.AnswerCount > uas.QuestionCount THEN 'Veteran Helper'
+            WHEN uas.Reputation > 20000 AND uas.QuestionCount > 20 AND uas.TotalQuestionViews > 500000 THEN 'Prolific Questioner'
+            ELSE 'Regular Contributor'
+        END AS UserClass,
+        (uas.Reputation * 1.0 / GREATEST(1, DATE_PART('day', NOW() - uas.UserCreationDate))) * LN(1 + uas.QuestionCount + uas.AnswerCount) AS InfluenceScore,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.AnswerCount,
+        uas.QuestionCount,
+        uas.AvgPositiveAnswerScore,
+        uas.TotalQuestionViews,
+        uas.LastActivityDate
+    FROM
+        UserActivitySummary uas
+    WHERE
+        uas.LastActivityDate > NOW() - INTERVAL '3 year' AND EXISTS (
+            SELECT 1 FROM PostHistory ph
+            WHERE ph.UserId = uas.UserId
+            AND ph.PostHistoryTypeId = 10 -- Post Closed
+            AND ph.Comment IS NOT NULL AND ph.Comment ~ '^[0-9]+$' AND CAST(ph.Comment AS INTEGER) = 101 -- Duplicate close reason
+        )
+)
+SELECT
+    uc.UserClass,
+    uc.DisplayName,
+    uc.Reputation,
+    uc.InfluenceScore,
+    DENSE_RANK() OVER (PARTITION BY uc.UserClass ORDER BY uc.InfluenceScore DESC) AS RankInClass,
+    rq.Title AS TopQuestionTitle,
+    rq.Score AS TopQuestionScore,
+    COALESCE(rq.HoursToAccept, -1) AS TopQuestionHoursToAccept,
+    (SELECT STRING_AGG(b.Name, ' | ') FROM (SELECT Name FROM Badges WHERE UserId = uc.UserId AND Class = 1 ORDER BY Date DESC LIMIT 3) b) AS RecentGoldBadges,
+    uc.AvgPositiveAnswerScore,
+    uc.QuestionCount,
+    uc.AnswerCount,
+    uc.TotalQuestionViews
+FROM
+    UserClassification uc
+LEFT JOIN RankedQuestions rq ON uc.UserId = rq.OwnerUserId AND rq.rn = 1
+
+UNION ALL
+
+SELECT
+    'Low-Quality Specialist' AS UserClass,
+    u.DisplayName,
+    u.Reputation,
+    -1.0 AS InfluenceScore,
+    0 AS RankInClass,
+    'N/A' AS TopQuestionTitle,
+    neg_posts.AvgNegativeScore,
+    -1.0 AS TopQuestionHoursToAccept,
+    NULL AS RecentGoldBadges,
+    0.0 AS AvgPositiveAnswerScore,
+    0 AS QuestionCount,
+    neg_posts.NegativePostCount AS AnswerCount,
+    0 AS TotalQuestionViews
+FROM
+    Users u
+JOIN (
+    SELECT
+        OwnerUserId,
+        COUNT(*) AS NegativePostCount,
+        AVG(Score) AS AvgNegativeScore
+    FROM Posts
+    WHERE Score < -3 AND PostTypeId = 2 AND CommunityOwnedDate IS NULL AND DeletionDate IS NULL
+    GROUP BY OwnerUserId
+    HAVING COUNT(*) > 5
+) AS neg_posts ON u.Id = neg_posts.OwnerUserId
+WHERE
+    u.Reputation < 500
+    AND NOT EXISTS (SELECT 1 FROM Badges WHERE UserId = u.Id AND Name IN ('Fanatic', 'Enthusiast'))
+ORDER BY
+    UserClass, InfluenceScore DESC, Reputation DESC
+LIMIT 500;

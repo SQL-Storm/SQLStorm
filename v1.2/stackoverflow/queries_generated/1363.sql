@@ -1,0 +1,169 @@
+-- {"query": "1363.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1584} 
+WITH RankedPosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        u.DisplayName,
+        u.Reputation,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.PostTypeId 
+            ORDER BY p.CreationDate DESC, p.Score DESC
+        ) AS RN,
+        COUNT(*) OVER (PARTITION BY p.PostTypeId) AS TotalPosts
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+),
+PostAnswers AS (
+    SELECT a.ParentId AS QuestionId, COUNT(*) AS AnswerCount,
+        AVG(coalesce(a.Score, 0)) AS AvgAnswerScore,
+        MAX(coalesce(a.Score, 0)) AS MaxAnswerScore
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+UserBadgesAgg AS (
+    SELECT
+        UserId,
+        COUNT(*) AS TotalBadges,
+        SUM(CASE WHEN Class=1 THEN 1 ELSE 0 END) AS GoldBadgeCount,
+        SUM(CASE WHEN Class=2 THEN 1 ELSE 0 END) AS SilverBadgeCount,
+        SUM(CASE WHEN Class=3 THEN 1 ELSE 0 END) AS BronzeBadgeCount,
+        STRING_AGG(DISTINCT Name, ', ') FILTER (WHERE TagBased = 0) AS NamedBadges,
+        STRING_AGG(DISTINCT Name, ', ') FILTER (WHERE TagBased = 1) AS TagBadges
+    FROM Badges
+    GROUP BY UserId
+),
+PostHistoryCounts AS (
+    SELECT
+        PostId,
+        COUNT(*) FILTER (WHERE PostHistoryTypeId IN (10, 11)) AS CloseReopenEvents,
+        COUNT(*) FILTER (WHERE PostHistoryTypeId = 50) AS CommunityBumpsCount,
+        COUNT(DISTINCT UserId) AS DistinctEditors
+    FROM PostHistory
+    GROUP BY PostId
+),
+UserLastAccess AS (
+    SELECT
+        Id,
+        LastAccessDate,
+        CreationDate,
+        EXTRACT(EPOCH FROM (LastAccessDate - CreationDate))/86400 AS DaysActive
+    FROM Users
+    WHERE LastAccessDate IS NOT NULL AND CreationDate IS NOT NULL
+),
+ComplexSearchAggregate AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Tags,
+        s.SearchTag,
+        s.Rank
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags)-2), E'><')) AS SearchTag
+    ) s
+),
+DedupPosts AS (
+    SELECT DISTINCT PostId FROM PostLinks WHERE LinkTypeId = 3
+),
+AnsWithAcceptedFlag AS (
+    SELECT 
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END AS IsAccepted,
+        a.Score,
+        a.CreationDate,
+        a.OwnerUserId
+    FROM Posts a
+    JOIN Posts q ON q.Id = a.ParentId
+    WHERE a.PostTypeId = 2
+),
+UserScoreRanking AS (
+    SELECT
+        OwnerUserId,
+        RANK() OVER (ORDER BY SUM(Score) DESC) AS UserScoreRank,
+        SUM(Score) AS TotalScore
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL
+    GROUP BY OwnerUserId
+),
+-- Final compiled query to benchmark performance involving CTEs, joins, subqueries, window functions, and null logic
+BenchmarkQuery AS (
+    SELECT
+        rp.Id AS PostId,
+        rp.PostTypeId,
+        rp.CreationDate,
+        rp.Score,
+        rp.ViewCount,
+        COALESCE(pah.AnswerCount, 0) AS AnswerCount,
+        COALESCE(pah.AvgAnswerScore, 0)::numeric(10,2) AS AvgAnswerScore,
+        COALESCE(pah.MaxAnswerScore, 0) AS MaxAnswerScore,
+        rp.OwnerUserId,
+        rp.DisplayName,
+        rp.Reputation,
+        uba.TotalBadges,
+        uba.GoldBadgeCount,
+        uba.SilverBadgeCount,
+        uba.BronzeBadgeCount,
+        phc.CloseReopenEvents,
+        phc.CommunityBumpsCount,
+        phc.DistinctEditors,
+        nla.DaysActive,
+        STRING_AGG(DISTINCT c.Text, ' | ' ORDER BY c.CreationDate DESC) FILTER (WHERE c.Text IS NOT NULL) AS RecentComments,
+        COALESCE(lp.LinkCount, 0) AS LinkCount,
+        dp.PostId IS NOT NULL AS IsDuplicate,
+        JSON_BUILD_OBJECT(
+            'answers', ans.AnswerCount,
+            'acceptedAnswerId', q.AcceptedAnswerId,
+            'acceptedAnswerScore', acc.Score,
+            'userRank', usr.UserScoreRank
+        ) AS Meta,
+        STRING_AGG(DISTINCT c2.UserDisplayName || ': ' || SUBSTRING(c2.Text FROM 1 FOR 50), '; ') AS RecentUserCommentsSnippet
+    FROM RankedPosts rp
+    LEFT JOIN PostAnswers pah ON rp.Id = pah.QuestionId
+    LEFT JOIN UserBadgesAgg uba ON uba.UserId = rp.OwnerUserId
+    LEFT JOIN PostHistoryCounts phc ON phc.PostId = rp.Id
+    LEFT JOIN UserLastAccess nla ON nla.Id = rp.OwnerUserId
+    LEFT JOIN LATERAL (
+        SELECT COUNT(*) AS LinkCount
+        FROM PostLinks pl
+        WHERE pl.PostId = rp.Id
+    ) lp ON true
+    LEFT JOIN DedupPosts dp ON dp.PostId = rp.Id
+    LEFT JOIN Posts q ON q.Id = rp.Id AND rp.PostTypeId=1
+    LEFT JOIN AnsWithAcceptedFlag acc ON acc.QuestionId = rp.Id AND acc.IsAccepted=1
+    LEFT JOIN (
+        SELECT ParentId, COUNT(*) AS AnswerCount
+        FROM Posts
+        WHERE PostTypeId = 2
+        GROUP BY ParentId
+    ) ans ON ans.ParentId = rp.Id
+    LEFT JOIN UserScoreRanking usr ON usr.OwnerUserId = rp.OwnerUserId
+    LEFT JOIN Comments c ON c.PostId = rp.Id AND c.CreationDate > now() - INTERVAL '30 days'
+    LEFT JOIN (
+        SELECT
+            PostId,
+            UserDisplayName,
+            Text
+        FROM Comments
+        WHERE CreationDate > now() - INTERVAL '7 days'
+    ) c2 ON c2.PostId = rp.Id
+    WHERE rp.RN <= 250
+    GROUP BY 
+        rp.Id, rp.PostTypeId, rp.CreationDate, rp.Score, rp.ViewCount, pah.AnswerCount, pah.AvgAnswerScore, pah.MaxAnswerScore,
+        rp.OwnerUserId, rp.DisplayName, rp.Reputation, uba.TotalBadges, uba.GoldBadgeCount, uba.SilverBadgeCount, uba.BronzeBadgeCount,
+        phc.CloseReopenEvents, phc.CommunityBumpsCount, phc.DistinctEditors, nla.DaysActive, lp.LinkCount, dp.PostId, q.AcceptedAnswerId, acc.Score, usr.UserScoreRank
+)
+SELECT *
+FROM BenchmarkQuery
+WHERE IsDuplicate = false
+ORDER BY TotalBadges DESC NULLS LAST, Score DESC NULLS LAST, ViewCount DESC
+LIMIT 100;

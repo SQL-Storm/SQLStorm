@@ -1,0 +1,192 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COUNT(CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsAsked,
+        COUNT(CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersProvided,
+        SUM(P.Score) AS TotalPostsScore,
+        SUM(P.Score * (1 + EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - P.CreationDate)) / 86400.0 / 365.25 * -0.1)) / NULLIF(COUNT(P.Id), 0) AS WeightedAvgPostScore,
+        MAX(P.CreationDate) AS LatestPostDate,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(U.LastAccessDate) AS UserLastAccessDate
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.Views, U.UpVotes, U.DownVotes, U.LastAccessDate
+    HAVING U.Reputation > 5000 AND U.LastAccessDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years')
+),
+PostLifeCycleEvents AS (
+    SELECT
+        PH.PostId,
+        PH.CreationDate AS EventTimestamp,
+        PHT.Name AS EventType,
+        PH.UserId AS EventInitiatorUserId,
+        PH.Comment AS EventComment,
+        LEAD(PHT.Name, 1) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS NextEventType,
+        LAG(PHT.Name, 1) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS PreviousEventType,
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate DESC) AS rn_latest_event,
+        COUNT(PH.Id) OVER (PARTITION BY PH.PostId) AS TotalHistoryEvents
+    FROM PostHistory PH
+    JOIN PostHistoryTypes PHT ON PH.PostHistoryTypeId = PHT.Id
+    WHERE PHT.Id IN (1, 2, 5, 6, 10, 11, 12, 13, 14, 15, 19, 20, 24, 35, 36)
+),
+FrequentPostEventSummary AS (
+    SELECT
+        PLE.PostId,
+        COUNT(CASE WHEN PLE.EventType LIKE '%Edit%' THEN 1 END) AS TotalEditEvents,
+        COUNT(CASE WHEN PLE.EventType = 'Post Closed' THEN 1 END) AS ClosureCount,
+        COUNT(CASE WHEN PLE.EventType = 'Post Reopened' THEN 1 END) AS ReopenCount,
+        COUNT(DISTINCT PLE.EventInitiatorUserId) AS DistinctEditorsCount,
+        MAX(CASE WHEN PLE.EventType = 'Post Closed' AND PLE.NextEventType = 'Post Reopened' THEN 1 ELSE 0 END) AS HadCloseReopenCycle,
+        MAX(CASE WHEN PLE.EventType = 'Post Locked' THEN PLE.EventTimestamp END) AS LastLockedDate,
+        MIN(CASE WHEN PLE.EventType = 'Initial Body' THEN PLE.EventTimestamp END) AS FirstCreationDate,
+        MAX(PLE.TotalHistoryEvents) AS TotalHistoryEvents
+    FROM PostLifeCycleEvents PLE
+    GROUP BY PLE.PostId
+),
+TagDominanceMetrics AS (
+    SELECT
+        T.Id AS TagId,
+        T.TagName,
+        T.Count AS TagUseCount,
+        AVG(P.Score) AS AvgTagScore,
+        AVG(P.ViewCount) AS AvgTagViewCount,
+        COUNT(P.Id) AS PostsWithThisTag,
+        AVG(P.AnswerCount) AS AvgAnswersPerTagPost
+    FROM Tags T
+    JOIN Posts P ON P.Tags LIKE '%' || '<' || T.TagName || '>' || '%'
+    WHERE P.PostTypeId = 1
+    GROUP BY T.Id, T.TagName, T.Count
+),
+CommentSentimentAnalysis AS (
+    SELECT
+        C.PostId,
+        SUM(CASE
+                WHEN LOWER(C.Text) LIKE '%great%' OR LOWER(C.Text) LIKE '%helpful%' OR LOWER(C.Text) LIKE '%thanks%' THEN 1
+                WHEN LOWER(C.Text) LIKE '%bug%' OR LOWER(C.Text) LIKE '%issue%' OR LOWER(C.Text) LIKE '%wrong%' THEN -1
+                ELSE 0
+            END) AS NetCommentSentimentScore,
+        COUNT(C.Id) AS TotalCommentsOnPost,
+        MAX(C.CreationDate) AS LatestCommentDate
+    FROM Comments C
+    GROUP BY C.PostId
+)
+SELECT
+    P.Id AS PostIdentifier,
+    PT.Name AS PostCategory,
+    P.Title,
+    P.CreationDate AS OriginalPostDate,
+    P.LastActivityDate AS LastInteractionDate,
+    P.Score AS CurrentPostScore,
+    P.ViewCount AS TotalViews,
+    P.AnswerCount AS NumberOfAnswers,
+    P.CommentCount AS NumberOfComments,
+    P.FavoriteCount AS BookmarkedCount,
+    UE.DisplayName AS PostOwnerName,
+    UE.Reputation AS PostOwnerReputation,
+    UE.TotalQuestionsAsked AS OwnerQuestions,
+    UE.TotalAnswersProvided AS OwnerAnswers,
+    FPE.TotalEditEvents,
+    FPE.ClosureCount,
+    FPE.ReopenCount,
+    FPE.HadCloseReopenCycle,
+    FPE.DistinctEditorsCount,
+    TD.TagName AS PrimaryTag,
+    TD.AvgTagScore AS PrimaryTagAvgScore,
+    TD.AvgTagViewCount AS PrimaryTagAvgViews,
+    CSA.NetCommentSentimentScore,
+    CSA.TotalCommentsOnPost,
+    COALESCE(PL_Linked.LinkedPostCount, 0) AS OutboundLinks,
+    COALESCE(PL_Duplicate.InboundDuplicateLinks, 0) AS InboundDuplicateOfOtherPosts,
+    (
+        SELECT PH.Comment
+        FROM PostHistory PH
+        WHERE PH.PostId = P.Id
+          AND PH.PostHistoryTypeId NOT IN (1, 2, 3)
+        ORDER BY PH.CreationDate DESC
+        LIMIT 1
+    ) AS LatestHistoryComment,
+    (
+        CAST(P.Score AS NUMERIC) * 0.4 +
+        CAST(P.FavoriteCount AS NUMERIC) * 0.3 +
+        CAST(P.AnswerCount AS NUMERIC) * 0.2 +
+        CAST(P.CommentCount AS NUMERIC) * 0.1
+    ) * (1 + COALESCE(CSA.NetCommentSentimentScore, 0) / NULLIF(CSA.TotalCommentsOnPost, 0) * 0.2)
+    AS WeightedQualityScore,
+    CASE
+        WHEN FPE.HadCloseReopenCycle = 1 AND FPE.ClosureCount >= 2 THEN 'Volatile & Repeatedly Closed'
+        WHEN P.ClosedDate IS NOT NULL AND P.CommunityOwnedDate IS NULL THEN 'Closed by Community/Mods'
+        WHEN P.AnswerCount >= 10 AND P.FavoriteCount >= 20 AND UE.Reputation > 10000 THEN 'Highly Valued & Influential'
+        WHEN FPE.TotalEditEvents >= 5 AND FPE.DistinctEditorsCount >= 3 THEN 'Heavily Edited & Collaborative'
+        WHEN P.ViewCount > 5000 AND P.Score > 100 THEN 'Viral & Top Rated'
+        ELSE 'Standard Activity'
+    END AS PostLifecycleStatus,
+    UPPER(SUBSTRING(P.Title FROM 1 FOR 1)) || '...' || LOWER(REVERSE(SUBSTRING(REVERSE(P.Title) FROM 1 FOR 1))) AS TitleStartEndChars,
+    LENGTH(P.Body) AS BodyCharacterCount,
+    LENGTH(P.Tags) AS TagsStringLength,
+    COALESCE(P.OwnerDisplayName, 'Community') AS ActualOwnerDisplayName,
+    RANK() OVER (PARTITION BY TD.TagName ORDER BY (
+        CAST(P.Score AS NUMERIC) * 0.4 + CAST(P.FavoriteCount AS NUMERIC) * 0.3 + CAST(P.AnswerCount AS NUMERIC) * 0.2 + CAST(P.CommentCount AS NUMERIC) * 0.1
+    ) DESC, P.CreationDate ASC) AS RankWithinPrimaryTag,
+    AVG((
+        CAST(P_OwnerRecent.Score AS NUMERIC) * 0.4 + CAST(P_OwnerRecent.FavoriteCount AS NUMERIC) * 0.3 + CAST(P_OwnerRecent.AnswerCount AS NUMERIC) * 0.2 + CAST(P_OwnerRecent.CommentCount AS NUMERIC) * 0.1
+    )) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate RANGE BETWEEN INTERVAL '6 months' PRECEDING AND CURRENT ROW) AS OwnerRecentAvgQualityScore,
+    P.Score - LAG(P.Score, 1, 0) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS ScoreDeltaFromPreviousPost
+FROM Posts P
+JOIN PostTypes PT ON P.PostTypeId = PT.Id
+LEFT JOIN UserEngagement UE ON P.OwnerUserId = UE.UserId
+LEFT JOIN FrequentPostEventSummary FPE ON P.Id = FPE.PostId
+LEFT JOIN CommentSentimentAnalysis CSA ON P.Id = CSA.PostId
+LEFT JOIN (
+    SELECT PostId, COUNT(RelatedPostId) AS LinkedPostCount
+    FROM PostLinks
+    WHERE LinkTypeId = 1
+    GROUP BY PostId
+) PL_Linked ON P.Id = PL_Linked.PostId
+LEFT JOIN (
+    SELECT RelatedPostId, COUNT(PostId) AS InboundDuplicateLinks
+    FROM PostLinks
+    WHERE LinkTypeId = 3
+    GROUP BY RelatedPostId
+) PL_Duplicate ON P.Id = PL_Duplicate.RelatedPostId
+LEFT JOIN (
+    SELECT P_Inner.Id AS PostId, PrimaryTagAlias.primary_tag_name AS TagName, TDM.AvgTagScore, TDM.AvgTagViewCount
+    FROM Posts P_Inner
+    CROSS JOIN LATERAL (
+        SELECT TRIM(REPLACE(REPLACE(tag, '<', ''), '>', '')) AS primary_tag_name
+        FROM UNNEST(string_to_array(SUBSTRING(P_Inner.Tags FROM 2 FOR CHAR_LENGTH(P_Inner.Tags)-2), '><')) AS t(tag)
+        WHERE P_Inner.Tags IS NOT NULL AND P_Inner.Tags != ''
+        LIMIT 1
+    ) AS PrimaryTagAlias(primary_tag_name)
+    JOIN TagDominanceMetrics TDM ON PrimaryTagAlias.primary_tag_name = TDM.TagName
+) TD ON P.Id = TD.PostId
+LEFT JOIN Posts P_OwnerRecent ON P.OwnerUserId = P_OwnerRecent.OwnerUserId
+    AND P_OwnerRecent.CreationDate BETWEEN (P.CreationDate - INTERVAL '6 months') AND P.CreationDate
+    AND P_OwnerRecent.PostTypeId = P.PostTypeId
+WHERE
+    P.PostTypeId IN (1, 2)
+    AND P.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 years')
+    AND P.Score >= 10
+    AND (P.ViewCount > 1000 OR P.FavoriteCount > 5 OR FPE.HadCloseReopenCycle = 1)
+    AND P.OwnerUserId IS NOT NULL
+    AND P.Id NOT IN (
+        SELECT PostId
+        FROM FrequentPostEventSummary
+        WHERE TotalHistoryEvents = 0
+          AND FirstCreationDate < (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+    )
+    AND (
+        LOWER(P.Body) LIKE '%database performance%' OR LOWER(P.Title) LIKE '%sql optimization%' OR P.Tags LIKE '%<benchmark>%' OR P.Tags LIKE '%<performance-testing>%'
+    )
+ORDER BY WeightedQualityScore DESC, P.LastActivityDate DESC, RankWithinPrimaryTag ASC
+LIMIT 5000;

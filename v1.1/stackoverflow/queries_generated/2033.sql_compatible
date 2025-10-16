@@ -1,0 +1,61 @@
+WITH RecentActivityCTE AS (
+    SELECT 
+        p.Id AS PostId, 
+        p.Title, 
+        p.CreationDate AS PostCreationDate, 
+        COALESCE(p.LastEditDate, p.LastActivityDate) AS LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY COALESCE(p.LastEditDate, p.LastActivityDate) DESC) AS ActivityRank,
+        p.OwnerUserId
+    FROM 
+        Posts p
+    WHERE 
+        p.PostTypeId = 1
+),
+UserBadgesCTE AS (
+    SELECT 
+        ub.UserId, 
+        STRING_AGG(ub.Name, ', ' ORDER BY ub.Class) AS BadgeNames
+    FROM (
+        SELECT 
+            b.UserId, 
+            b.Name, 
+            b.Class, 
+            RANK() OVER (PARTITION BY b.UserId ORDER BY b.Class) AS BadgeRank
+        FROM 
+            Badges b
+    ) ub
+    WHERE 
+        ub.BadgeRank <= 3
+    GROUP BY 
+        ub.UserId
+)
+SELECT 
+    u.Id AS UserId, 
+    u.DisplayName, 
+    u.Reputation, 
+    ra.PostId, 
+    ra.Title AS RecentPostTitle, 
+    (u.Views + u.UpVotes) AS ActivityScore, 
+    COALESCE(ub.BadgeNames, 'No Badges') AS TopBadges
+FROM 
+    Users u
+LEFT JOIN 
+    RecentActivityCTE ra ON ra.OwnerUserId = u.Id AND ra.ActivityRank = 1
+LEFT JOIN 
+    UserBadgesCTE ub ON u.Id = ub.UserId
+WHERE 
+    u.Reputation > 1000
+  AND ra.PostId IN (
+        SELECT 
+            v.PostId 
+        FROM 
+            Votes v 
+        WHERE 
+            v.VoteTypeId = 2 
+        GROUP BY 
+            v.PostId 
+        HAVING 
+            COUNT(v.Id) > 5
+    )
+ORDER BY 
+    ActivityScore DESC, u.Reputation DESC;

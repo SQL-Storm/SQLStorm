@@ -1,0 +1,134 @@
+-- {"query": "17038.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 91065, "output_tokens": 88630} 
+
+WITH UserActivityMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) as AvgPostScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) FILTER (WHERE p.Score > 0) as MedianPositiveScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), ', ') FILTER (WHERE p.Tags IS NOT NULL) as AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= CURRENT_DATE - INTERVAL '2 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+BadgeAnalysis AS (
+    SELECT 
+        UserId,
+        COUNT(*) FILTER (WHERE Class = 1) as GoldBadges,
+        COUNT(*) FILTER (WHERE Class = 2) as SilverBadges,
+        COUNT(*) FILTER (WHERE Class = 3) as BronzeBadges,
+        ARRAY_AGG(DISTINCT Name ORDER BY Date DESC) FILTER (WHERE TagBased = B'1') as TagBadges,
+        MIN(Date) as FirstBadgeDate,
+        MAX(Date) as LastBadgeDate
+    FROM Badges
+    GROUP BY UserId
+),
+PostEditPatterns AS (
+    SELECT 
+        ph.PostId,
+        COUNT(DISTINCT ph.UserId) as UniqueEditors,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) as EditCount,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (7, 8, 9)) as RollbackCount,
+        COALESCE(MAX(LENGTH(ph.Text)), 0) as MaxRevisionSize,
+        LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) as PrevEditTime,
+        FIRST_VALUE(ph.Comment) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate 
+            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as FirstEditComment
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId BETWEEN 1 AND 22
+    GROUP BY ph.PostId, ph.CreationDate, ph.Comment
+),
+QuestionAnswerRelations AS (
+    SELECT 
+        q.Id as QuestionId,
+        q.Title,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        CASE 
+            WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN q.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            WHEN q.AnswerCount > 0 THEN 'HasAnswers'
+            ELSE 'Unanswered'
+        END as QuestionStatus,
+        COUNT(a.Id) as ActualAnswerCount,
+        MAX(a.Score) as BestAnswerScore,
+        AVG(a.Score)::NUMERIC(10,2) as AvgAnswerScore,
+        MIN(a.CreationDate) as FirstAnswerTime,
+        EXTRACT(EPOCH FROM (MIN(a.CreationDate) - q.CreationDate))/3600 as HoursToFirstAnswer
+    FROM Posts q
+    LEFT JOIN Posts a ON q.Id = a.ParentId AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+        AND q.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+    GROUP BY q.Id, q.Title, q.Score, q.ViewCount, q.ClosedDate, q.AcceptedAnswerId, q.AnswerCount
+),
+VotePatterns AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) as UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) as DownVotes,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) as TotalBounty,
+        STDDEV(EXTRACT(EPOCH FROM v.CreationDate)) as VoteTimeVariance
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2, 3, 8)
+    GROUP BY v.PostId
+)
+SELECT 
+    uam.DisplayName,
+    uam.Reputation,
+    COALESCE(uam.TotalPosts, 0) as TotalPosts,
+    COALESCE(uam.QuestionCount, 0) as Questions,
+    COALESCE(uam.AnswerCount, 0) as Answers,
+    ROUND(COALESCE(uam.AvgPostScore, 0), 2) as AvgScore,
+    COALESCE(uam.MedianPositiveScore, 0) as MedianPositiveScore,
+    COALESCE(ba.GoldBadges, 0) + COALESCE(ba.SilverBadges, 0) * 0.5 + COALESCE(ba.BronzeBadges, 0) * 0.25 as WeightedBadgeScore,
+    ARRAY_LENGTH(ba.TagBadges, 1) as TagBadgeCount,
+    SUBSTR(COALESCE(uam.AllTags, ''), 1, 100) as TopTags,
+    (
+        SELECT COUNT(DISTINCT c.Id)
+        FROM Comments c
+        WHERE c.UserId = uam.Id
+            AND c.Score > 5
+            AND EXISTS (
+                SELECT 1 
+                FROM Posts p 
+                WHERE p.Id = c.PostId 
+                    AND p.Score > 10
+            )
+    ) as HighValueComments,
+    COALESCE((
+        SELECT AVG(qar.HoursToFirstAnswer)::NUMERIC(10,2)
+        FROM QuestionAnswerRelations qar
+        JOIN Posts p ON p.Id = qar.QuestionId
+        WHERE p.OwnerUserId = uam.Id
+            AND qar.HoursToFirstAnswer IS NOT NULL
+            AND qar.HoursToFirstAnswer BETWEEN 0 AND 168
+    ), -1) as AvgHoursToFirstAnswer,
+    CASE 
+        WHEN uam.Reputation > 10000 THEN 'Expert'
+        WHEN uam.Reputation > 1000 THEN 'Experienced'
+        WHEN uam.Reputation > 100 THEN 'Active'
+        ELSE 'Novice'
+    END as UserTier,
+    ROW_NUMBER() OVER (ORDER BY uam.Reputation DESC, COALESCE(ba.GoldBadges, 0) DESC) as ReputationRank,
+    DENSE_RANK() OVER (ORDER BY COALESCE(uam.AvgPostScore, 0) DESC NULLS LAST) as QualityRank
+FROM UserActivityMetrics uam
+LEFT JOIN BadgeAnalysis ba ON uam.Id = ba.UserId
+WHERE uam.TotalPosts > 5
+    AND (uam.QuestionCount > 0 OR uam.AnswerCount > 0)
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostHistory ph
+        WHERE ph.UserId = uam.Id
+            AND ph.PostHistoryTypeId = 12
+            AND ph.CreationDate >= CURRENT_DATE - INTERVAL '6 months'
+    )
+ORDER BY 
+    ReputationRank,
+    QualityRank,
+    COALESCE(ba.GoldBadges, 0) DESC,
+    uam.TotalPosts DESC
+LIMIT 100;

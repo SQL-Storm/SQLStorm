@@ -1,0 +1,200 @@
+-- {"query": "5.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1868} 
+with
+-- base question stats
+questions as (
+  select p.id,
+         p.title,
+         p.tags,
+         p.creationdate,
+         p.owneruserid,
+         p.viewcount,
+         coalesce(p.answercount,0) as answercount,
+         coalesce(p.score,0) as qscore,
+         p.favoritecount,
+         -- derive tag array
+         case when p.tags is null then array[]::text[]
+              else string_to_array(substring(p.tags from 2 for char_length(p.tags)-2), '><')
+         end as tag_array
+  from posts p
+  where p.posttypeid = 1
+),
+-- answers with link to question and owner stats
+answers as (
+  select a.id,
+         a.parentid as questionid,
+         a.owneruserid,
+         a.creationdate,
+         a.score as ascore,
+         a.body,
+         row_number() over (partition by a.parentid order by a.score desc, a.creationdate asc) as rank_by_score
+  from posts a
+  where a.posttypeid = 2
+),
+-- recent activity per post using PostHistory (last edit per post)
+last_history as (
+  select ph.postid,
+         ph.posthistorytypeid,
+         ph.creationdate as hist_date,
+         ph.userid as editor_userid,
+         ph.userdisplayname as editor_display,
+         ph.text as hist_text,
+         row_number() over (partition by ph.postid order by ph.creationdate desc, ph.id desc) as rn
+  from posthistory ph
+  where ph.postid is not null
+),
+last_history_one as (
+  select lh.*
+  from last_history lh
+  where lh.rn = 1
+),
+-- user aggregates: badges, votes cast, reputation buckets
+user_agg as (
+  select u.id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         count(distinct b.id) filter (where b.class = 1) as gold_badges,
+         count(distinct b.id) filter (where b.class = 2) as silver_badges,
+         count(distinct b.id) filter (where b.class = 3) as bronze_badges,
+         count(v.id) filter (where v.votetypeid = 2) as upvotes_cast,
+         count(v.id) filter (where v.votetypeid = 3) as downvotes_cast,
+         case
+           when u.reputation >= 20000 then 'elite'
+           when u.reputation >= 5000 then 'high'
+           when u.reputation >= 1000 then 'established'
+           when u.reputation >= 100 then 'regular'
+           else 'newbie'
+         end as rep_bucket
+  from users u
+  left join badges b on b.userid = u.id
+  left join votes v on v.userid = u.id
+  group by u.id, u.displayname, u.reputation, u.creationdate
+),
+-- compute question level aggregates: best answer, comment counts, duplicate links
+q_meta as (
+  select q.*,
+         uagg.displayname as owner_name,
+         uagg.rep_bucket,
+         uagg.reputation as owner_rep,
+         la.hist_date as last_edit_date,
+         la.editor_userid as last_editor_userid,
+         la.hist_text as last_edit_summary,
+         (select count(*) from comments c where c.postid = q.id) as comments_on_question,
+         (select count(*) from posts a where a.parentid = q.id and a.posttypeid = 2) as answers_count_derived,
+         (select json_agg(row_to_json(t)) from (
+             select tag, count(*) over () as dummy_count
+             from unnest(q.tag_array) with ordinality as t(tag, rn)
+             order by tag
+             limit 5
+         ) t) as sample_tags,
+         -- detect duplicates via PostLinks
+         (select count(*) from postlinks pl where pl.postid = q.id and pl.linktypeid = 3) as outgoing_duplicates,
+         (select count(*) from postlinks pl where pl.relatedpostid = q.id and pl.linktypeid = 3) as incoming_duplicates
+  from questions q
+  left join user_agg uagg on uagg.id = q.owneruserid
+  left join last_history_one la on la.postid = q.id
+),
+-- windowed scoring combining recency, views, score, and answers
+q_score as (
+  select qm.*,
+         -- composite performance score
+         (
+           (coalesce(qm.qscore,0) * 3)
+           + log(GREATEST(coalesce(qm.viewcount,0),1)) * 2
+           + (coalesce(qm.answercount,0) * 5)
+           + (coalesce(qm.favoritecount,0) * 4)
+           + (case when qm.outgoing_duplicates > 0 then -10 else 0 end)
+           - (extract(epoch from (now() - qm.creationdate))/86400) * 0.1
+         ) as perf_score,
+         rank() over (order by
+           (
+             (coalesce(qm.qscore,0) * 3)
+             + log(GREATEST(coalesce(qm.viewcount,0),1)) * 2
+             + (coalesce(qm.answercount,0) * 5)
+             + (coalesce(qm.favoritecount,0) * 4)
+             - (case when qm.outgoing_duplicates > 0 then 10 else 0 end)
+             - (extract(epoch from (now() - qm.creationdate))/86400) * 0.1
+           ) desc
+         ) as perf_rank
+  from q_meta qm
+),
+-- correlate best and accepted answers details
+answer_ranking as (
+  select a.questionid,
+         json_agg(json_build_object(
+           'answer_id', a.id,
+           'owner_id', a.owneruserid,
+           'score', a.ascore,
+           'rank_by_score', a.rank_by_score
+         ) order by a.rank_by_score) as top_answers,
+         max(case when a.rank_by_score = 1 then a.ascore end) as top_answer_score,
+         min(a.creationdate) as earliest_answer_date
+  from answers a
+  group by a.questionid
+),
+-- complex filter: questions having at least one tag matching active top tags (tag size and recent usage)
+active_tags as (
+  select t.tagname
+  from tags t
+  where t.count > 50
+  order by t.count desc
+  limit 50
+),
+q_with_active_tag as (
+  select q.*
+  from q_score q
+  where exists (
+    select 1 from unnest(q.tag_array) ta(tag)
+    join active_tags at on at.tagname = ta.tag
+  )
+),
+-- final selection with set operations and correlated subquery metrics
+final_set as (
+  select q.*,
+         ar.top_answers,
+         ar.top_answer_score,
+         ar.earliest_answer_date,
+         -- correlated: average time to first answer in hours
+         (
+           select extract(epoch from (min(a.creationdate) - q.creationdate))/3600.0
+           from posts a
+           where a.parentid = q.id and a.posttypeid = 2
+         ) as hours_to_first_answer,
+         -- fraction of edits by owners vs others
+         (
+           select
+             ratio_owner::numeric
+           from (
+             select
+               sum(case when ph.userid = q.owneruserid then 1 else 0 end) as owner_edits,
+               sum(1) as total_edits,
+               case when sum(1) = 0 then 0 else sum(case when ph.userid = q.owneruserid then 1 else 0 end)::float / sum(1) end as ratio_owner
+             from posthistory ph
+             where ph.postid = q.id
+           ) s
+         ) as owner_edit_ratio,
+         -- complex string expression: condensed title fingerprint
+         (left(regexp_replace(coalesce(q.title,'') , '\s+', ' ', 'g'), 200) || ' :: ' || md5(coalesce(q.title,''))) as title_fingerprint
+  from q_with_active_tag q
+  left join answer_ranking ar on ar.questionid = q.id
+)
+-- return top 100 by perf_score, union with random sample of low-scoring questions to stress planner
+select *
+from (
+  select f.*, 'top'::text as sample_type
+  from final_set f
+  order by f.perf_score desc nulls last
+  limit 100
+
+  union all
+
+  select f2.*, 'random_low'::text as sample_type
+  from (
+    select final_set.*
+    from final_set
+    where final_set.perf_score is not null
+    order by random()
+    limit 100
+  ) f2
+) combined
+order by sample_type desc, perf_rank, random();

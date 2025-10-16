@@ -1,0 +1,120 @@
+WITH UserBadgeStats AS (
+    SELECT
+        UserId,
+        SUM(CASE WHEN "Class" = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN "Class" = 2 THEN 1 ELSE 0 END) AS SilverBadges
+    FROM Badges
+    WHERE UserId IS NOT NULL
+    GROUP BY UserId
+),
+UserPostInteraction AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        p.Tags,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.AnswerCount,
+        p.CommentCount,
+        LAG(p.CreationDate, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostDate,
+        COALESCE(LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate), 0) AS NextPostScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS RankByScore
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+      AND p.CreationDate > TIMESTAMP '2020-01-01'
+      AND p.CommunityOwnedDate IS NULL
+),
+AggregatedUserStats AS (
+    SELECT
+        upi.OwnerUserId,
+        COUNT(upi.Id) AS TotalPosts,
+        SUM(CASE WHEN upi.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN upi.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        SUM(upi.Score) AS TotalScore,
+        AVG(upi.Score) AS AverageScore,
+        SUM(COALESCE(upi.ViewCount, 0)) AS TotalViewsOnQuestions,
+        AVG(EXTRACT(EPOCH FROM (upi.CreationDate - upi.PreviousPostDate))) AS AvgSecondsBetweenPosts,
+        CORR(CAST(upi.Score AS DOUBLE PRECISION), CAST(upi.NextPostScore AS DOUBLE PRECISION)) AS ScoreCorrelationWithNext,
+        STRING_AGG(CASE WHEN upi.RankByScore <= 3 THEN upi.Tags ELSE NULL END, ',') AS TopPostTags
+    FROM UserPostInteraction upi
+    WHERE upi.PreviousPostDate IS NOT NULL
+    GROUP BY upi.OwnerUserId
+    HAVING COUNT(upi.Id) > 10
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    aus.TotalPosts,
+    aus.QuestionCount,
+    aus.AnswerCount,
+    CAST(aus.AverageScore AS DECIMAL(18, 2)) AS AvgScore,
+    (SELECT COUNT(c.Id) FROM Comments c WHERE c.UserId = u.Id AND c.PostId NOT IN (SELECT p.Id FROM Posts p WHERE p.OwnerUserId = u.Id)) AS ExternalComments,
+    COALESCE(ubs.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ubs.SilverBadges, 0) AS SilverBadges,
+    CASE
+        WHEN aus.QuestionCount > aus.AnswerCount * 2 AND u.Reputation > 10000 THEN 'Prolific Questioner'
+        WHEN aus.AnswerCount > aus.QuestionCount * 2 AND u.Reputation > 10000 THEN 'Dedicated Answerer'
+        WHEN COALESCE(ubs.GoldBadges, 0) > 5 THEN 'Decorated Veteran'
+        ELSE 'General Contributor'
+    END AS UserCategory,
+    ('Avg time between posts: ' ||
+     CAST(FLOOR(aus.AvgSecondsBetweenPosts / 3600) AS VARCHAR) || 'h ' ||
+     CAST(FLOOR(MOD(aus.AvgSecondsBetweenPosts, 3600) / 60) AS VARCHAR) || 'm. Top tags: ' ||
+     COALESCE(SUBSTRING(aus.TopPostTags FROM 1 FOR 100), 'N/A')) AS ActivitySummary,
+    (u.Reputation * 0.4 + aus.TotalScore * 0.3 + aus.TotalViewsOnQuestions * 0.1 + (COALESCE(ubs.GoldBadges,0) * 1000 + COALESCE(ubs.SilverBadges,0) * 100) * 0.2) AS InfluenceScore,
+    pa.HighestScoringPostDate,
+    aus.ScoreCorrelationWithNext,
+    aus.AvgSecondsBetweenPosts
+FROM
+    Users u
+INNER JOIN
+    AggregatedUserStats aus ON u.Id = aus.OwnerUserId
+LEFT OUTER JOIN
+    UserBadgeStats ubs ON u.Id = ubs.UserId
+LEFT OUTER JOIN
+    (
+        SELECT OwnerUserId, CreationDate AS HighestScoringPostDate
+        FROM UserPostInteraction
+        WHERE RankByScore = 1
+    ) pa ON u.Id = pa.OwnerUserId
+WHERE
+    u.Reputation > 20000
+    AND u.LastAccessDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+    AND aus.AvgSecondsBetweenPosts IS NOT NULL
+    AND aus.ScoreCorrelationWithNext BETWEEN -1 AND 1
+
+UNION ALL
+
+SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    0 AS TotalPosts,
+    0 AS QuestionCount,
+    0 AS AnswerCount,
+    CAST(0.00 AS DECIMAL(18,2)) AS AvgScore,
+    0 AS ExternalComments,
+    0 AS GoldBadges,
+    0 AS SilverBadges,
+    'Bounty Sponsor' AS UserCategory,
+    'User has offered bounties on popular questions.' AS ActivitySummary,
+    u.Reputation * 0.8 AS InfluenceScore,
+    NULL AS HighestScoringPostDate,
+    NULL AS ScoreCorrelationWithNext,
+    NULL AS AvgSecondsBetweenPosts
+FROM Users u
+WHERE u.Id IN (
+    SELECT DISTINCT v.UserId
+    FROM Votes v
+    JOIN Posts p ON v.PostId = p.Id
+    WHERE v.VoteTypeId = 8
+      AND v.UserId IS NOT NULL
+      AND p.ViewCount > 100000
+) AND u.Reputation < 20000
+ORDER BY
+    UserCategory, InfluenceScore DESC
+LIMIT 200;

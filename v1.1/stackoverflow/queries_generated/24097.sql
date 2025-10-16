@@ -1,0 +1,97 @@
+-- {"query": "24097.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2523} 
+
+WITH question_tags AS (
+    SELECT
+        p.Id          AS PostId,
+        untag        AS TagName,
+        p.Score,
+        p.OwnerUserId,
+        p.CreationDate
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    CROSS JOIN LATERAL
+        unnest(
+            string_to_array(
+                substring(p.Tags, 2, length(p.Tags) - 2),
+                '><'
+            )
+        ) AS untag
+),
+tag_stats AS (
+    SELECT
+        qt.TagName,
+        COUNT(*)          AS QuestionCount,
+        AVG(qt.Score)     AS AvgScore,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes
+    FROM question_tags qt
+    LEFT JOIN Votes v ON v.PostId = qt.PostId
+    GROUP BY qt.TagName
+),
+tag_rank AS (
+    SELECT
+        ts.*,
+        RANK() OVER (ORDER BY QuestionCount DESC, AvgScore DESC) AS Rank,
+        t.IsModeratorOnly,
+        t.IsRequired
+    FROM tag_stats ts
+    JOIN Tags t ON t.TagName = ts.TagName
+),
+tag_best_user AS (
+    SELECT
+        tr.TagName,
+        (SELECT u.DisplayName
+         FROM Users u
+         JOIN Posts p2 ON p2.OwnerUserId = u.Id
+         WHERE p2.Id IN (
+               SELECT PostId FROM question_tags WHERE TagName = tr.TagName
+         )
+         ORDER BY u.Reputation DESC
+         LIMIT 1)                                         AS BestUserName,
+        (SELECT MAX(u.Reputation)
+         FROM Users u
+         JOIN Posts p2 ON p2.OwnerUserId = u.Id
+         WHERE p2.Id IN (
+               SELECT PostId FROM question_tags WHERE TagName = tr.TagName
+         ))                                           AS BestUserRep
+    FROM tag_rank tr
+)
+SELECT
+    tr.TagName,
+    tr.QuestionCount,
+    tr.AvgScore,
+    tr.Upvotes,
+    tr.Downvotes,
+    tr.IsModeratorOnly,
+    tr.IsRequired,
+    tbu.BestUserName,
+    tbu.BestUserRep,
+    (SELECT COUNT(*) 
+     FROM Comments c 
+     WHERE c.PostId IN (
+           SELECT PostId FROM question_tags WHERE TagName = tr.TagName
+     ))                                                AS TotalComments
+FROM tag_rank tr
+LEFT JOIN tag_best_user tbu ON tbu.TagName = tr.TagName
+WHERE tr.TagName ILIKE 'SQL%'
+  AND (tr.QuestionCount > 100 
+       OR (tr.QuestionCount IS NULL AND tr.Upvotes > 500))
+  AND tr.IsModeratorOnly = 0
+UNION ALL
+SELECT
+    tr.TagName,
+    tr.QuestionCount,
+    tr.AvgScore,
+    tr.Upvotes,
+    tr.Downvotes,
+    tr.IsModeratorOnly,
+    tr.IsRequired,
+    tbu.BestUserName,
+    tbu.BestUserRep,
+    0                                                    AS TotalComments
+FROM tag_rank tr
+LEFT JOIN tag_best_user tbu ON tbu.TagName = tr.TagName
+WHERE tr.TagName ILIKE 'HTML%'
+  AND tr.QuestionCount < 50
+ORDER BY 2 DESC
+LIMIT 100;

@@ -1,0 +1,152 @@
+-- {"query": "1202.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.2, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1386} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        p.Id as PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        u.Id as OwnerUserId,
+        u.DisplayName,
+        case when count(b.Id) filter (where b.Class = 1) > 0 then 1 else 0 end as HasGoldBadge,
+        row_number() over (partition by t.Id order by p.CreationDate desc) as rn
+    from Tags t
+    left join Posts p on p.Tags ilike '%' || t.TagName || '%'
+    left join Users u on u.Id = p.OwnerUserId
+    left join Badges b on b.UserId = u.Id
+    where p.PostTypeId = 1 -- questions only
+    group by t.Id, t.TagName, p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, u.Id, u.DisplayName
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        p2.Id,
+        p2.Title,
+        p2.CreationDate,
+        p2.Score,
+        p2.ViewCount,
+        u2.Id,
+        u2.DisplayName,
+        case when count(b2.Id) filter (where b2.Class = 1) > 0 then 1 else 0 end,
+        1 as rn
+    from Tags t2
+    join Posts p2 on p2.Tags ilike '%' || t2.TagName || '%'
+    join Users u2 on u2.Id = p2.OwnerUserId
+    left join Badges b2 on b2.UserId = u2.Id
+    where p2.PostTypeId = 1 and t2.IsRequired = 1
+),
+TopQuestions as (
+    select *
+    from RecursiveTagHierarchy
+    where rn <= 5
+),
+CommentsAggregated as (
+    select
+        c.PostId,
+        count(*) as CommentCount,
+        max(c.Score) filter (where c.Score is not null) as MaxCommentScore,
+        string_agg(distinct coalesce(c.UserDisplayName, 'Unknown') || ':' || left(c.Text, 30), ' | ' order by c.CreationDate desc) as RecentCommentsSample
+    from Comments c
+    group by c.PostId
+),
+PostVotesWindowed as (
+    select
+        v.PostId,
+        count(*) filter (where v.VoteTypeId = 2) as UpVotes,
+        count(*) filter (where v.VoteTypeId = 3) as DownVotes,
+        sum(v.BountyAmount) as TotalBounty,
+        dense_rank() over (partition by v.PostId order by v.CreationDate desc) as RecentVoteRank
+    from Votes v
+    group by v.PostId
+),
+CloseReasonCounts as (
+    select
+        ph.PostId,
+        ph.Comment as CloseReasonId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseCount
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as smallint)
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId, ph.Comment, crt.Name
+),
+QuestionsDetailed as (
+    select
+        q.PostId,
+        q.TagName,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.OwnerUserId,
+        q.DisplayName,
+        q.HasGoldBadge,
+        coalesce(cv.UpVotes, 0) as UpVotes,
+        coalesce(cv.DownVotes, 0) as DownVotes,
+        coalesce(cv.TotalBounty, 0) as TotalBounty,
+        coalesce(ca.CommentCount, 0) as CommentCount,
+        coalesce(ca.MaxCommentScore, 0) as MaxCommentScore,
+        ca.RecentCommentsSample,
+        (select string_agg(concat(brct.CloseReasonName,'(' || brct.CloseCount || ')'), ', ') 
+         from CloseReasonCounts brct where brct.PostId = q.PostId) as CloseReasons
+    from TopQuestions q
+    left join PostVotesWindowed cv on cv.PostId = q.PostId
+    left join CommentsAggregated ca on ca.PostId = q.PostId
+)
+select
+    'Question Metrics' as Category,
+    TagName,
+    Title,
+    CreationDate,
+    Score,
+    ViewCount,
+    OwnerUserId,
+    DisplayName,
+    case when HasGoldBadge = 1 then 'Yes' else 'No' end as OwnerHasGoldBadge,
+    UpVotes,
+    DownVotes,
+    TotalBounty,
+    CommentCount,
+    MaxCommentScore,
+    CloseReasons,
+    RecentCommentsSample,
+    row_number() over (partition by TagName order by Score desc, ViewCount desc) as RankWithinTag,
+    lag(Score) over (partition by TagName order by CreationDate) as PreviousQuestionScore,
+    case
+        when (lag(Score) over (partition by TagName order by CreationDate)) is null then null
+        else Score - (lag(Score) over (partition by TagName order by CreationDate))
+    end as ScoreChangeSincePrevious
+from QuestionsDetailed
+where Length(Title) > 10 and Coalesce(Score,0) > 0
+order by TagName, RankWithinTag
+union
+select
+    'High Scoring Recent Answers',
+    t.TagName,
+    p.Body,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    u.DisplayName,
+    (select max(b.Class) from Badges b where b.UserId = u.Id) as OwnerBadgeClass,
+    v1.UpVotes,
+    v1.DownVotes,
+    v1.TotalBounty,
+    coalesce(ca.CommentCount, 0),
+    coalesce(ca.MaxCommentScore, 0),
+    null,
+    null,
+    null,
+    null
+from Posts p
+join Posts pq on pq.Id = p.ParentId and pq.PostTypeId = 1
+join Tags t on pq.Tags ilike '%' || t.TagName || '%'
+left join Users u on u.Id = p.OwnerUserId
+left join PostVotesWindowed v1 on v1.PostId = p.Id
+left join CommentsAggregated ca on ca.PostId = p.Id
+where p.PostTypeId = 2 and p.CreationDate > current_date - interval '30 days' and p.Score > 50
+order by t.TagName, p.Score desc
+limit 50;

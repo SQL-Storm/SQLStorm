@@ -1,0 +1,191 @@
+-- {"query": "218.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 3900} 
+WITH
+recent_questions AS (
+  SELECT p.id, p.owneruserid, p.creationdate, p.title, p.acceptedanswerid, p.answercount, p.score, p.tags
+  FROM posts p
+  WHERE p.posttypeid = 1
+    AND p.creationdate >= CURRENT_TIMESTAMP - INTERVAL '1 year'
+),
+exploded_tags AS (
+  SELECT
+    rq.id AS questionid,
+    rq.owneruserid,
+    lower(trim(t.tag)) AS tag
+  FROM recent_questions rq
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(rq.tags FROM 2 FOR char_length(rq.tags)-2), '><')) AS tag
+  ) t
+  WHERE rq.tags IS NOT NULL
+),
+user_tag_counts AS (
+  SELECT
+    owneruserid AS userid,
+    tag,
+    count(*) AS cnt,
+    rank() OVER (PARTITION BY owneruserid ORDER BY count(*) DESC) AS rk
+  FROM exploded_tags
+  GROUP BY owneruserid, tag
+),
+top_user_tag AS (
+  SELECT userid, tag AS top_tag, cnt
+  FROM user_tag_counts
+  WHERE rk = 1
+),
+badge_agg AS (
+  SELECT
+    userid,
+    count(*) AS total_badges,
+    count(*) FILTER (WHERE class = 1) AS gold,
+    count(*) FILTER (WHERE class = 2) AS silver,
+    count(*) FILTER (WHERE class = 3) AS bronze
+  FROM badges
+  GROUP BY userid
+),
+post_stats AS (
+  SELECT
+    owneruserid AS userid,
+    count(*) FILTER (WHERE posttypeid = 1) AS q_count,
+    count(*) FILTER (WHERE posttypeid = 2) AS a_count,
+    avg(score) FILTER (WHERE posttypeid IN (1,2)) AS avg_score,
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY score) FILTER (WHERE posttypeid IN (1,2)) AS median_score
+  FROM posts
+  GROUP BY owneruserid
+),
+answer_rank AS (
+  SELECT
+    p.*,
+    row_number() OVER (PARTITION BY p.parentid ORDER BY p.score DESC NULLS LAST, p.creationdate ASC) AS answer_rank
+  FROM posts p
+  WHERE p.posttypeid = 2
+),
+top_answers AS (
+  SELECT
+    ar.parentid AS questionid,
+    json_agg(
+      json_build_object('answerid', ar.id, 'score', ar.score, 'owner', ar.owneruserid)
+      ORDER BY ar.score DESC, ar.creationdate ASC
+    ) FILTER (WHERE ar.answer_rank <= 3) AS top3_answers
+  FROM answer_rank ar
+  GROUP BY ar.parentid
+),
+vote_summary AS (
+  SELECT
+    p.owneruserid AS userid,
+    SUM((v.votetypeid = 2)::int) AS upvotes,
+    SUM((v.votetypeid = 3)::int) AS downvotes,
+    COUNT(v.*) AS total_votes
+  FROM posts p
+  LEFT JOIN votes v ON v.postid = p.id
+  GROUP BY p.owneruserid
+),
+comment_summary AS (
+  SELECT
+    coalesce(userid, -1) AS userid,
+    count(*) AS comments
+  FROM comments
+  GROUP BY coalesce(userid, -1)
+),
+accepted_latency AS (
+  SELECT
+    q.id AS questionid,
+    q.owneruserid,
+    q.creationdate AS q_created,
+    a.creationdate AS accepted_created,
+    (a.creationdate - q.creationdate) AS time_to_accept
+  FROM posts q
+  LEFT JOIN posts a ON q.acceptedanswerid = a.id
+  WHERE q.posttypeid = 1
+    AND q.acceptedanswerid IS NOT NULL
+),
+user_last_activity AS (
+  SELECT
+    u.id AS userid,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    u.websiteurl,
+    u.location,
+    u.views,
+    u.upvotes,
+    u.downvotes,
+    u.profileimageurl
+  FROM users u
+),
+combined_users AS (
+  SELECT
+    u.userid,
+    u.displayname,
+    u.reputation,
+    ps.q_count,
+    ps.a_count,
+    ps.avg_score,
+    ps.median_score,
+    coalesce(ba.total_badges,0) AS total_badges,
+    coalesce(ba.gold,0) AS gold,
+    coalesce(ba.silver,0) AS silver,
+    coalesce(ba.bronze,0) AS bronze,
+    coalesce(vs.upvotes,0) AS post_upvotes,
+    coalesce(vs.downvotes,0) AS post_downvotes,
+    coalesce(cs.comments,0) AS comments_authored,
+    tut.top_tag
+  FROM user_last_activity u
+  JOIN post_stats ps ON ps.userid = u.userid
+  LEFT JOIN badge_agg ba ON ba.userid = u.userid
+  LEFT JOIN vote_summary vs ON vs.userid = u.userid
+  LEFT JOIN comment_summary cs ON cs.userid = u.userid
+  LEFT JOIN top_user_tag tut ON tut.userid = u.userid
+),
+flagged_users AS (
+  SELECT userid
+  FROM combined_users
+  WHERE (coalesce(q_count,0) + coalesce(a_count,0)) > 0
+    AND coalesce(reputation,0) < 500
+    AND coalesce(total_badges,0) = 0
+),
+sample_union AS (
+  SELECT cu.*, 'regular' AS cohort
+  FROM combined_users cu
+  WHERE cu.userid NOT IN (SELECT userid FROM flagged_users)
+  UNION ALL
+  SELECT cu.*, 'flagged' AS cohort
+  FROM combined_users cu
+  WHERE cu.userid IN (SELECT userid FROM flagged_users)
+),
+final AS (
+  SELECT
+    su.*,
+    row_number() OVER (ORDER BY coalesce(reputation,0) DESC, coalesce(total_badges,0) DESC) AS global_rank,
+    dense_rank() OVER (PARTITION BY cohort ORDER BY coalesce(reputation,0) DESC, coalesce(total_badges,0) DESC) AS cohort_rank,
+    (coalesce(post_upvotes,0) - coalesce(post_downvotes,0))::int AS net_votes,
+    CASE
+      WHEN coalesce(q_count,0) + coalesce(a_count,0) = 0 THEN NULL
+      ELSE round((coalesce(avg_score,0) / NULLIF((coalesce(q_count,0)+coalesce(a_count,0)),0))::numeric, 4)
+    END AS score_per_post
+  FROM sample_union su
+)
+SELECT
+  f.userid,
+  f.displayname,
+  f.cohort,
+  f.global_rank,
+  f.cohort_rank,
+  f.reputation,
+  f.q_count,
+  f.a_count,
+  f.top_tag,
+  f.total_badges,
+  f.gold,
+  f.silver,
+  f.bronze,
+  f.post_upvotes,
+  f.post_downvotes,
+  f.net_votes,
+  f.comments_authored,
+  f.avg_score,
+  f.median_score,
+  f.score_per_post
+FROM final f
+WHERE (coalesce(f.q_count,0) + coalesce(f.a_count,0)) > 0
+ORDER BY f.global_rank
+LIMIT 250;

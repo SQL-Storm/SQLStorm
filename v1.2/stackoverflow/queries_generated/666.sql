@@ -1,0 +1,188 @@
+-- {"query": "666.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1657} 
+with RecursiveUserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate as PostCreationDate,
+        p.Title,
+        p.Tags,
+        row_number() over (partition by u.Id order by p.CreationDate desc) as rn
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where u.Reputation > 1000
+),
+FilteredUserPosts as (
+    select * from RecursiveUserActivity where rn <= 5
+),
+PostScoreStats as (
+    select 
+        OwnerUserId,
+        avg(Score) over (partition by OwnerUserId) as AvgScore,
+        max(Score) over (partition by OwnerUserId) as MaxScore,
+        min(Score) over (partition by OwnerUserId) as MinScore
+    from Posts
+    where OwnerUserId is not null
+),
+UserBadges as (
+    select 
+        b.UserId,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        count(distinct b.Name) as DistinctBadges
+    from Badges b
+    group by b.UserId
+),
+TopTags as (
+    select 
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as Tag,
+        p.OwnerUserId
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+),
+UserTopTags as (
+    select 
+        OwnerUserId,
+        Tag,
+        count(*) as TagCount,
+        rank() over (partition by OwnerUserId order by count(*) desc) as TagRank
+    from TopTags
+    group by OwnerUserId, Tag
+    having OwnerUserId is not null
+),
+UserTop3Tags as (
+    select OwnerUserId, Tag, TagCount
+    from UserTopTags
+    where TagRank <= 3
+),
+PostWithComments as (
+    select 
+        p.Id as PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        c.Id as CommentId,
+        c.Score as CommentScore,
+        c.Text as CommentText,
+        c.UserId as CommentUserId
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+),
+PostWithVoteStats as (
+    select 
+        p.Id as PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        count(v.Id) filter (where v.VoteTypeId = 2) as UpVotes,
+        count(v.Id) filter (where v.VoteTypeId = 3) as DownVotes,
+        count(v.Id) as TotalVotes
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    group by p.Id, p.OwnerUserId, p.PostTypeId, p.Score, p.ViewCount
+),
+UserActivitySummary as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        coalesce(b.GoldBadges,0) as GoldBadges,
+        coalesce(b.SilverBadges,0) as SilverBadges,
+        coalesce(b.BronzeBadges,0) as BronzeBadges,
+        coalesce(b.DistinctBadges,0) as DistinctBadges,
+        coalesce(ps.AvgScore,0) as AvgPostScore,
+        coalesce(ps.MaxScore,0) as MaxPostScore,
+        coalesce(ps.MinScore,0) as MinPostScore,
+        string_agg(distinct t.Tag, ', ') as TopTags
+    from Users u
+    left join UserBadges b on b.UserId = u.Id
+    left join PostScoreStats ps on ps.OwnerUserId = u.Id
+    left join UserTop3Tags t on t.OwnerUserId = u.Id
+    where u.Reputation > 1000
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, b.GoldBadges, b.SilverBadges, b.BronzeBadges, b.DistinctBadges, ps.AvgScore, ps.MaxScore, ps.MinScore
+),
+DuplicatePostPairs as (
+    select 
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle,
+        pl.CreationDate,
+        lt.Name as LinkTypeName
+    from PostLinks pl
+    inner join Posts p1 on p1.Id = pl.PostId
+    inner join Posts p2 on p2.Id = pl.RelatedPostId
+    inner join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where lt.Name = 'Duplicate'
+),
+ComplexUserPostStats as (
+    select 
+        ua.UserId,
+        ua.DisplayName,
+        count(distinct p.Id) as TotalPosts,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) as QuestionCount,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) as AnswerCount,
+        avg(p.Score) filter (where p.PostTypeId in (1,2)) as AvgPostScore,
+        max(p.Score) filter (where p.PostTypeId in (1,2)) as MaxPostScore,
+        min(p.Score) filter (where p.PostTypeId in (1,2)) as MinPostScore,
+        sum(coalesce(v.UpVotes,0)) as TotalUpVotes,
+        sum(coalesce(v.DownVotes,0)) as TotalDownVotes,
+        count(distinct c.Id) as TotalCommentsReceived
+    from Users ua
+    left join Posts p on p.OwnerUserId = ua.UserId
+    left join PostWithVoteStats v on v.PostId = p.Id
+    left join Comments c on c.PostId = p.Id
+    where ua.Reputation > 1000
+    group by ua.UserId, ua.DisplayName
+)
+select 
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.GoldBadges,
+    uas.SilverBadges,
+    uas.BronzeBadges,
+    uas.DistinctBadges,
+    uas.AvgPostScore,
+    uas.MaxPostScore,
+    uas.MinPostScore,
+    uas.TopTags,
+    dpp.PostId as DuplicatePostId,
+    dpp.PostTitle,
+    dpp.RelatedPostId as DuplicateOfPostId,
+    dpp.RelatedPostTitle,
+    dpp.LinkTypeName,
+    dpp.CreationDate as DuplicateLinkDate,
+    cus.TotalPosts,
+    cus.QuestionCount,
+    cus.AnswerCount,
+    cus.AvgPostScore as UserAvgScore,
+    cus.MaxPostScore as UserMaxScore,
+    cus.MinPostScore as UserMinScore,
+    cus.TotalUpVotes,
+    cus.TotalDownVotes,
+    cus.TotalCommentsReceived
+from UserActivitySummary uas
+left join DuplicatePostPairs dpp on dpp.PostId in (
+    select p.Id from Posts p where p.OwnerUserId = uas.UserId
+)
+left join ComplexUserPostStats cus on cus.UserId = uas.UserId
+where uas.UserId in (
+    select distinct OwnerUserId from Posts where OwnerUserId is not null and OwnerUserId > 0
+)
+order by uas.Reputation desc, uas.UserId
+limit 100;

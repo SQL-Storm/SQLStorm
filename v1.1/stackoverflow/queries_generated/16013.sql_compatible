@@ -1,0 +1,120 @@
+WITH UserEngagementMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS NetVotes,
+        EXTRACT(YEAR FROM AGE(u.LastAccessDate, u.CreationDate)) * 12 + 
+            EXTRACT(MONTH FROM AGE(u.LastAccessDate, u.CreationDate)) AS MonthsActive,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        PERCENT_RANK() OVER (ORDER BY u.Views) AS ViewPercentile,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) OVER (PARTITION BY u.Id) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY u.Id) AS SilverBadges
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+        AND u.LastAccessDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+),
+PostPerformance AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Has Accepted Answer'
+            WHEN p.AnswerCount > 0 THEN 'Has Answers'
+            ELSE 'No Answers'
+        END AS AnswerStatus,
+        COALESCE(LENGTH(p.Body), 0) AS BodyLength,
+        COALESCE(array_length(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'), 1), 0) AS TagCount,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) AS RollingAvgScore,
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.ViewCount DESC NULLS LAST) AS ViewRank
+    FROM Posts p
+    WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years'
+        AND p.PostTypeId IN (1, 2)
+        AND (p.ClosedDate IS NULL OR p.ClosedDate > p.CreationDate + INTERVAL '30 days')
+),
+VotePatterns AS (
+    SELECT 
+        v.PostId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpvoteCount,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownvoteCount,
+        COUNT(DISTINCT v.UserId) AS UniqueVoters,
+        MAX(v.CreationDate) - MIN(v.CreationDate) AS VotingTimespan,
+        STRING_AGG(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN COALESCE(u.DisplayName, 'Anonymous') END, ', ') AS FavoritedBy
+    FROM Votes v
+    LEFT JOIN Users u ON v.UserId = u.Id
+    WHERE v.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+    GROUP BY v.PostId
+    HAVING COUNT(*) > 5
+),
+CommentActivity AS (
+    SELECT 
+        c.PostId,
+        COUNT(*) AS CommentCount,
+        AVG(LENGTH(c.Text)) AS AvgCommentLength,
+        MAX(c.Score) AS MaxCommentScore,
+        COUNT(DISTINCT c.UserId) AS UniqueCommenters
+    FROM Comments c
+    WHERE c.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '18 months'
+    GROUP BY c.PostId
+)
+SELECT 
+    uem.DisplayName,
+    uem.Reputation,
+    uem.ReputationRank,
+    ROUND(CAST(uem.ViewPercentile AS numeric), 4) AS ViewPercentile,
+    uem.GoldBadges + uem.SilverBadges AS PremiumBadges,
+    CASE 
+        WHEN uem.MonthsActive = 0 THEN NULL
+        ELSE ROUND(CAST(uem.Reputation AS numeric) / NULLIF(uem.MonthsActive, 0), 2)
+    END AS ReputationPerMonth,
+    pp.PostId,
+    pp.AnswerStatus,
+    pp.Score AS PostScore,
+    COALESCE(pp.Score - pp.PreviousPostScore, 0) AS ScoreImprovement,
+    ROUND(CAST(pp.RollingAvgScore AS numeric), 2) AS RollingAvgScore,
+    COALESCE(vp.UpvoteCount, 0) AS Upvotes,
+    COALESCE(vp.DownvoteCount, 0) AS Downvotes,
+    COALESCE(vp.UniqueVoters, 0) AS UniqueVoters,
+    EXTRACT(EPOCH FROM COALESCE(vp.VotingTimespan, INTERVAL '0')) / 86400 AS VotingDays,
+    COALESCE(ca.CommentCount, 0) AS Comments,
+    ROUND(CAST(COALESCE(ca.AvgCommentLength, 0) AS numeric), 1) AS AvgCommentLen,
+    (SELECT COUNT(*) 
+     FROM PostLinks pl 
+     WHERE pl.PostId = pp.PostId AND pl.LinkTypeId = 3) AS DuplicateLinks,
+    (SELECT STRING_AGG(DISTINCT pt.Name, ' | ')
+     FROM PostHistory ph
+     JOIN PostHistoryTypes pt ON ph.PostHistoryTypeId = pt.Id
+     WHERE ph.PostId = pp.PostId 
+         AND ph.PostHistoryTypeId IN (4, 5, 6)
+     GROUP BY ph.PostId) AS EditTypes,
+    CASE 
+        WHEN pp.ViewCount > 10000 AND pp.Score > 50 THEN 'Viral'
+        WHEN pp.ViewCount > 5000 OR pp.Score > 25 THEN 'Popular'
+        WHEN pp.ViewCount > 1000 OR pp.Score > 10 THEN 'Moderate'
+        ELSE 'Low Engagement'
+    END AS EngagementTier
+FROM UserEngagementMetrics uem
+INNER JOIN PostPerformance pp ON uem.Id = pp.OwnerUserId
+LEFT OUTER JOIN VotePatterns vp ON pp.PostId = vp.PostId
+LEFT OUTER JOIN CommentActivity ca ON pp.PostId = ca.PostId
+WHERE pp.ViewRank <= 1000
+    AND (pp.TagCount >= 2 OR pp.PostTypeId = 2)
+    AND NOT EXISTS (
+        SELECT 1 
+        FROM Posts p2 
+        WHERE p2.ParentId = pp.PostId 
+            AND p2.Score < -5
+    )
+    AND uem.NetVotes > 0
+ORDER BY 
+    CASE WHEN pp.Score IS NULL THEN 1 ELSE 0 END,
+    pp.Score * LOG(COALESCE(NULLIF(pp.ViewCount, 0), 1) + 1) DESC,
+    uem.Reputation DESC
+LIMIT 500;

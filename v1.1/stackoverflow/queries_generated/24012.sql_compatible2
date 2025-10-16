@@ -1,0 +1,136 @@
+WITH
+  q_stats AS (
+    SELECT
+      OwnerUserId AS UserId,
+      COUNT(*)          AS QCnt,
+      AVG(Score)        AS AvgQScore,
+      SUM(CASE WHEN Score > 0 THEN 1 ELSE 0 END) AS QPos
+    FROM Posts
+    WHERE PostTypeId = 1
+    GROUP BY OwnerUserId
+  ),
+
+  a_stats AS (
+    SELECT
+      p.OwnerUserId AS UserId,
+      COUNT(*)          AS ACnt,
+      AVG(p.Score)      AS AvgAScore,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS AUp
+    FROM Posts p
+    JOIN Votes v ON v.PostId = p.Id
+    WHERE p.PostTypeId = 2
+    GROUP BY p.OwnerUserId
+  ),
+
+  merged_stats AS (
+    SELECT
+      COALESCE(q.UserId, a.UserId) AS UserId,
+      COALESCE(q.QCnt, 0) + COALESCE(a.ACnt, 0)     AS TotalPosts,
+      COALESCE(q.AvgQScore, 0) + COALESCE(a.AvgAScore, 0) AS AvgScore,
+      COALESCE(q.QPos, 0) + COALESCE(a.AUp, 0)      AS PosVotes
+    FROM q_stats q
+    FULL OUTER JOIN a_stats a
+      ON q.UserId = a.UserId
+  ),
+
+  user_info AS (
+    SELECT
+      u.Id            AS UserId,
+      u.Reputation,
+      u.LastAccessDate,
+      ms.TotalPosts,
+      ms.AvgScore,
+      ms.PosVotes
+    FROM Users u
+    LEFT JOIN merged_stats ms
+      ON ms.UserId = u.Id
+  ),
+
+  dup_counts AS (
+    SELECT
+      l.RelatedPostId AS PostId,
+      COUNT(*)        AS DupCnt
+    FROM PostLinks l
+    WHERE l.LinkTypeId = 3
+    GROUP BY l.RelatedPostId
+  ),
+
+  sample_post AS (
+    SELECT
+      p.OwnerUserId AS UserId,
+      MIN(p.Id)         AS SamplePostId,
+      -- extract first tag: tags are like '<tag1><tag2>'; get text between first '<' and '>'
+      CASE
+        WHEN p.Tags IS NULL THEN NULL
+        WHEN POSITION('>' IN SUBSTRING(p.Tags FROM 2)) > 0 THEN SUBSTRING(p.Tags FROM 2 FOR POSITION('>' IN SUBSTRING(p.Tags FROM 2)) - 1)
+        ELSE SUBSTRING(p.Tags FROM 2)
+      END AS FirstTag
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId, p.Tags
+  ),
+
+  tag_excerpts AS (
+    SELECT
+      t.TagName,
+      t.Count,
+      p.Title AS ExamTitle
+    FROM Tags t
+    LEFT JOIN Posts p
+      ON p.Id = t.ExcerptPostId
+    WHERE p.PostTypeId = 1
+  ),
+
+  closed_q_cnt AS (
+    SELECT
+      ui.UserId,
+      ( SELECT COUNT(*)
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId = 10
+          AND ph.PostId IN (
+            SELECT Id
+            FROM Posts
+            WHERE OwnerUserId = ui.UserId
+              AND PostTypeId = 1
+          )
+      ) AS ClosedCount
+    FROM user_info ui
+  )
+
+SELECT
+  ui.UserId,
+  ui.Reputation,
+  ui.TotalPosts,
+  ui.AvgScore,
+  ui.PosVotes,
+  s.SamplePostId,
+  COALESCE(te.ExamTitle, 'Unknown') AS ExcerptTitle,
+  COALESCE(dc.DupCnt, 0)    AS DuplicateCount,
+  COALESCE(cq.ClosedCount, 0) AS ClosedQuestionCount,
+  CASE WHEN ui.LastAccessDate < (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90' DAY) THEN 'Inactive' ELSE 'Active' END AS Status,
+  ROW_NUMBER() OVER (ORDER BY ui.Reputation DESC) AS Rank
+FROM user_info ui
+LEFT JOIN sample_post s
+  ON ui.UserId = s.UserId
+LEFT JOIN dup_counts dc
+  ON dc.PostId = s.SamplePostId
+LEFT JOIN tag_excerpts te
+  ON te.TagName = s.FirstTag
+LEFT JOIN closed_q_cnt cq
+  ON cq.UserId = ui.UserId
+WHERE (ui.TotalPosts > 5 OR ui.PosVotes = 0)
+  AND (dc.DupCnt IS NULL OR dc.DupCnt < 3)
+GROUP BY
+  ui.UserId,
+  ui.Reputation,
+  ui.TotalPosts,
+  ui.AvgScore,
+  ui.PosVotes,
+  s.SamplePostId,
+  s.FirstTag,
+  te.ExamTitle,
+  dc.DupCnt,
+  cq.ClosedCount,
+  ui.LastAccessDate
+ORDER BY ui.Reputation DESC, dc.DupCnt ASC
+LIMIT 100;

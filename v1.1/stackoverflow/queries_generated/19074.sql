@@ -1,0 +1,235 @@
+-- {"query": "19074.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3555} 
+
+WITH UserEngagementSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(P.Score) AS TotalPostScoreAccumulated,
+        AVG(P.Score) FILTER (WHERE P.PostTypeId = 1) AS AvgQuestionScore,
+        AVG(P.Score) FILTER (WHERE P.PostTypeId = 2) AS AvgAnswerScore,
+        COUNT(DISTINCT C.Id) AS TotalCommentsWritten,
+        SUM(C.Score) AS TotalCommentScoreWritten,
+        MAX(COALESCE(P.LastActivityDate, C.CreationDate, U.LastAccessDate)) AS LatestActivityGlobally,
+        SUM(CASE WHEN P.PostTypeId = 1 AND P.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswers,
+        SUM(CASE WHEN P.PostTypeId = 2 AND P.Id = AP.AcceptedAnswerId THEN 1 ELSE 0 END) AS AnswersAcceptedByOthers,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        DENSE_RANK() OVER (ORDER BY U.Reputation DESC, U.UpVotes DESC, U.Views DESC) AS UserOverallRank
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Posts AP ON P.ParentId = AP.Id -- for checking if an answer `P` is accepted for parent question `AP`
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostHistoricalMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.LastEditDate,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        P.ViewCount,
+        P.Score,
+        P.OwnerUserId,
+        P.Tags,
+        LE.LastEditorUserId,
+        LE.LastEditorDisplayName,
+        LE.LastEditDate AS ActualLastEditDate,
+        COUNT(DISTINCT PH.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS EditCount, -- Title, Body, Tags edits
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (10,11,12,13) THEN 1 ELSE 0 END) AS StatusChangeCount, -- Closed, Reopened, Deleted, Undeleted
+        MIN(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId IN (4,5,6)) AS FirstEditDate,
+        MAX(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId IN (4,5,6)) AS LastEditDateFromHistory,
+        (EXTRACT(EPOCH FROM (COALESCE(LE.LastEditDate, P.CreationDate) - P.CreationDate)) / 3600.0) AS HoursSinceCreationToLastEdit -- Hours
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN (
+        SELECT
+            PH_inner.PostId,
+            PH_inner.UserId AS LastEditorUserId,
+            COALESCE(PH_inner.UserDisplayName, U_inner.DisplayName) AS LastEditorDisplayName,
+            PH_inner.CreationDate AS LastEditDate,
+            ROW_NUMBER() OVER (PARTITION BY PH_inner.PostId ORDER BY PH_inner.CreationDate DESC, PH_inner.Id DESC) AS rn
+        FROM PostHistory PH_inner
+        LEFT JOIN Users U_inner ON PH_inner.UserId = U_inner.Id
+        WHERE PH_inner.PostHistoryTypeId IN (4, 5, 6, 8, 9) -- Edit/Rollback Title/Body/Tags
+    ) AS LE ON P.Id = LE.PostId AND LE.rn = 1
+    GROUP BY P.Id, P.PostTypeId, P.CreationDate, P.LastEditDate, P.ClosedDate, P.CommunityOwnedDate, P.ViewCount, P.Score, P.OwnerUserId, P.Tags, LE.LastEditorUserId, LE.LastEditorDisplayName, LE.LastEditDate
+),
+CommentInteractionSummary AS (
+    SELECT
+        C.PostId,
+        COUNT(C.Id) AS TotalCommentsOnPost,
+        SUM(C.Score) AS TotalCommentScoreOnPost,
+        AVG(C.Score) AS AvgCommentScoreOnPost,
+        SUM(CASE WHEN C.Score < 0 THEN 1 ELSE 0 END) AS NegativeCommentsOnPost,
+        MAX(C.CreationDate) AS LatestCommentDateOnPost,
+        MIN(C.CreationDate) AS EarliestCommentDateOnPost,
+        (SELECT Text FROM Comments WHERE PostId = C.PostId ORDER BY Score DESC, CreationDate ASC LIMIT 1) AS TopCommentText -- Get text of the highest scored comment, breaking ties by earliest creation
+    FROM Comments C
+    GROUP BY C.PostId
+),
+TagPerformance AS (
+    SELECT
+        tag_name_unnested[1] AS TagName, -- Access array element
+        COUNT(DISTINCT P.Id) AS PostsPerTag,
+        AVG(P.Score) AS AvgScorePerTag,
+        SUM(P.ViewCount) AS TotalViewsPerTag,
+        SUM(P.FavoriteCount) AS TotalFavoritesPerTag
+    FROM Posts P,
+    LATERAL (SELECT REGEXP_MATCHES(P.Tags, '<([^>]+)>', 'g') AS tags_array_matches) AS tags_split,
+    UNNEST(tags_split.tags_array_matches) AS tag_name_unnested
+    WHERE P.Tags IS NOT NULL
+    GROUP BY tag_name_unnested[1]
+    HAVING COUNT(DISTINCT P.Id) > 50
+),
+PostLinkAnalytics AS (
+    SELECT
+        PL.PostId,
+        SUM(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedPostsCount,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicatePostsCount,
+        COUNT(DISTINCT PL.RelatedPostId) AS UniqueRelatedPosts
+    FROM PostLinks PL
+    GROUP BY PL.PostId
+),
+CombinedPostData AS (
+    SELECT
+        PHM.PostId,
+        PHM.PostTypeId,
+        PHM.PostCreationDate,
+        PHM.ViewCount,
+        PHM.Score,
+        PHM.OwnerUserId,
+        PHM.Tags,
+        PHM.EditCount,
+        PHM.HoursSinceCreationToLastEdit,
+        CI.TotalCommentsOnPost,
+        CI.AvgCommentScoreOnPost,
+        CI.NegativeCommentsOnPost,
+        CI.TopCommentText,
+        PLA.LinkedPostsCount,
+        PLA.DuplicatePostsCount,
+        PLA.UniqueRelatedPosts,
+        COALESCE(LENGTH(P.Body) - LENGTH(REPLACE(P.Body, CHR(10), '')), 0) + 1 AS BodyLineCount, -- Approximate line count
+        P.Title,
+        P.ParentId,
+        P.AcceptedAnswerId,
+        CASE
+            WHEN PHM.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN PHM.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned'
+            ELSE 'Open'
+        END AS PostLifeStatus
+    FROM PostHistoricalMetrics PHM
+    LEFT JOIN CommentInteractionSummary CI ON PHM.PostId = CI.PostId
+    LEFT JOIN PostLinkAnalytics PLA ON PHM.PostId = PLA.PostId
+    INNER JOIN Posts P ON PHM.PostId = P.Id -- To get Body for line count and other original post attributes
+),
+AggregatedUserData AS (
+    SELECT
+        UES.UserId,
+        UES.DisplayName,
+        UES.Reputation,
+        UES.UserOverallRank,
+        UES.UserCreationDate,
+        UES.TotalPosts,
+        UES.TotalQuestions,
+        UES.TotalAnswers,
+        UES.AnswersAcceptedByOthers,
+        UES.TotalBadgesEarned,
+        UES.LatestActivityGlobally,
+        SUM(CPD.ViewCount) AS TotalPostsViewCount,
+        SUM(CPD.Score) AS TotalPostsNetScore,
+        AVG(CPD.AvgCommentScoreOnPost) FILTER (WHERE CPD.PostTypeId = 1) AS AvgQCommentScore,
+        AVG(CPD.AvgCommentScoreOnPost) FILTER (WHERE CPD.PostTypeId = 2) AS AvgACommentScore,
+        MAX(CPD.HoursSinceCreationToLastEdit) AS MaxPostEditDelayHours,
+        SUM(CPD.EditCount) AS TotalPostsEditCount,
+        SUM(CPD.LinkedPostsCount) AS TotalLinkedPosts,
+        SUM(CPD.DuplicatePostsCount) AS TotalDuplicatePosts,
+        COUNT(DISTINCT CPD.PostId) FILTER (WHERE CPD.PostTypeId = 1 AND CPD.NegativeCommentsOnPost > 0) AS QuestionsWithNegativeComments,
+        (SELECT COUNT(DISTINCT A_Badges.Id) FROM Badges A_Badges WHERE A_Badges.UserId = UES.UserId AND A_Badges.Class = 1) AS GoldBadgesCount,
+        (SELECT COUNT(DISTINCT A_Posts.Id) FROM Posts A_Posts WHERE A_Posts.OwnerUserId = UES.UserId AND A_Posts.ViewCount > 10000 AND A_Posts.Score > 50) AS HighImpactPostsCount
+    FROM UserEngagementSummary UES
+    LEFT JOIN CombinedPostData CPD ON UES.UserId = CPD.OwnerUserId
+    GROUP BY UES.UserId, UES.DisplayName, UES.Reputation, UES.UserOverallRank, UES.UserCreationDate, UES.TotalPosts, UES.TotalQuestions, UES.TotalAnswers, UES.AnswersAcceptedByOthers, UES.TotalBadgesEarned, UES.LatestActivityGlobally
+)
+SELECT
+    AGU.DisplayName,
+    AGU.Reputation,
+    AGU.UserOverallRank,
+    AGU.TotalPosts,
+    AGU.TotalQuestions,
+    AGU.TotalAnswers,
+    AGU.AnswersAcceptedByOthers,
+    AGU.TotalBadgesEarned,
+    AGU.GoldBadgesCount,
+    AGU.HighImpactPostsCount,
+    AGU.TotalPostsViewCount,
+    AGU.TotalPostsNetScore,
+    AGU.AvgQCommentScore,
+    AGU.AvgACommentScore,
+    AGU.MaxPostEditDelayHours,
+    AGU.TotalPostsEditCount,
+    AGU.TotalLinkedPosts,
+    AGU.TotalDuplicatePosts,
+    AGU.QuestionsWithNegativeComments,
+    TP.TagName AS TopContributingTag,
+    TP.AvgScorePerTag,
+    ROW_NUMBER() OVER (PARTITION BY DATE_PART('year', AGU.UserCreationDate) ORDER BY AGU.Reputation DESC, AGU.TotalPostsNetScore DESC) AS RankByCreationYear,
+    NTILE(5) OVER (ORDER BY AGU.LatestActivityGlobally DESC) AS ActivityQuintile,
+    LAG(AGU.Reputation, 1, 0) OVER (PARTITION BY DATE_TRUNC('month', AGU.UserCreationDate) ORDER BY AGU.Reputation DESC) AS PrevUserReputationInMonth,
+    CASE
+        WHEN AGU.TotalQuestions > 0 AND AGU.AnswersAcceptedByOthers > 0 AND AGU.TotalPostsNetScore > 1000 THEN 'InfluentialContributor'
+        WHEN AGU.TotalPosts > 500 AND AGU.TotalPostsEditCount > 100 THEN 'ProlificEditor'
+        WHEN AGU.TotalBadgesEarned >= 10 AND AGU.GoldBadgesCount >= 1 THEN 'AwardedExpert'
+        ELSE 'ActiveUser'
+    END AS UserCategory,
+    COALESCE(SQ_PopularPost.Title, 'N/A') AS MostPopularPostTitle,
+    COALESCE(SQ_PopularPost.PostLifeStatus, 'N/A') AS MostPopularPostStatus,
+    COALESCE(SQ_PopularPost.AvgCommentScoreOnPost, 0.0) AS MostPopularPostAvgCommentScore,
+    COALESCE(SQ_PopularPost.TopCommentText, 'No top comment') AS MostPopularPostTopCommentText,
+    (
+        SELECT SUM(V.BountyAmount)
+        FROM Votes V
+        WHERE V.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = AGU.UserId) AND V.VoteTypeId = 8 AND V.BountyAmount IS NOT NULL
+    ) AS TotalBountyReceivedOnPosts -- Correlated subquery for bounty received
+FROM AggregatedUserData AGU
+LEFT JOIN ( -- Join with top performing tag for each user
+    SELECT
+        P.OwnerUserId,
+        T.TagName,
+        T.AvgScorePerTag,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY T.AvgScorePerTag DESC, COUNT(P.Id) DESC) as rn
+    FROM Posts P,
+    LATERAL (SELECT REGEXP_MATCHES(P.Tags, '<([^>]+)>', 'g') AS tags_array_matches) AS tags_split,
+    UNNEST(tags_split.tags_array_matches) AS tag_name_unnested
+    JOIN TagPerformance T ON T.TagName = tag_name_unnested[1]
+    WHERE P.OwnerUserId IS NOT NULL AND P.Tags IS NOT NULL
+    GROUP BY P.OwnerUserId, T.TagName, T.AvgScorePerTag
+) AS TP ON AGU.UserId = TP.OwnerUserId AND TP.rn = 1
+LEFT JOIN ( -- Correlated subquery to find user's most popular post
+    SELECT
+        CPD_inner.PostId,
+        CPD_inner.OwnerUserId,
+        CPD_inner.Title,
+        CPD_inner.ViewCount,
+        CPD_inner.Score,
+        CPD_inner.PostLifeStatus,
+        CPD_inner.AvgCommentScoreOnPost,
+        CPD_inner.TopCommentText,
+        ROW_NUMBER() OVER (PARTITION BY CPD_inner.OwnerUserId ORDER BY (CPD_inner.ViewCount * 0.6 + CPD_inner.Score * 0.4) DESC, CPD_inner.PostCreationDate DESC) AS popular_rn
+    FROM CombinedPostData CPD_inner
+    WHERE CPD_inner.OwnerUserId IS NOT NULL
+) AS SQ_PopularPost ON AGU.UserId = SQ_PopularPost.OwnerUserId AND SQ_PopularPost.popular_rn = 1
+WHERE AGU.Reputation > 5000 AND AGU.TotalPosts > 50
+ORDER BY AGU.UserOverallRank ASC, AGU.LatestActivityGlobally DESC
+LIMIT 1000;

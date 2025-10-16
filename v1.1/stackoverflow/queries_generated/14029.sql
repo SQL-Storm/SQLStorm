@@ -1,0 +1,74 @@
+-- {"query": "14029.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 70050, "output_tokens": 30925} 
+WITH temp_cte AS (
+    SELECT 
+        p.Id AS post_id, 
+        p.Title, 
+        p.Body, 
+        p.Tags, 
+        p.CreationDate, 
+        p.LastActivityDate, 
+        p.OwnerUserId, 
+        u.DisplayName AS owner_name, 
+        u.Reputation AS owner_reputation, 
+        u.CreationDate AS owner_creation_date, 
+        u.LastAccessDate AS owner_last_access_date, 
+        COALESCE(u.WebsiteUrl, '') AS owner_website_url, 
+        COALESCE(u.Location, '') AS owner_location, 
+        COALESCE(u.AboutMe, '') AS owner_about_me, 
+        u.Views AS owner_views, 
+        u.UpVotes AS owner_upvotes, 
+        u.DownVotes AS owner_downvotes, 
+        COALESCE(u.ProfileImageUrl, '') AS owner_profile_image_url, 
+        u.EmailHash AS owner_email_hash, 
+        u.AccountId AS owner_account_id,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS comment_count,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS upvote_count,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS downvote_count,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 5) AS favorite_count,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS post_status,
+        CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned' ELSE 'Not Community Owned' END AS community_status,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Has Accepted Answer' ELSE 'No Accepted Answer' END AS accepted_answer_status
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+)
+SELECT 
+    post_id, 
+    Title, 
+    Body, 
+    Tags, 
+    CreationDate, 
+    LastActivityDate, 
+    owner_name, 
+    owner_reputation, 
+    owner_creation_date, 
+    owner_last_access_date, 
+    owner_website_url, 
+    owner_location, 
+    owner_about_me, 
+    owner_views, 
+    owner_upvotes, 
+    owner_downvotes, 
+    owner_profile_image_url, 
+    owner_email_hash, 
+    owner_account_id, 
+    comment_count, 
+    upvote_count, 
+    downvote_count, 
+    favorite_count, 
+    post_status, 
+    community_status, 
+    accepted_answer_status
+FROM temp_cte
+WHERE post_id IN (
+    SELECT p.Id
+    FROM Posts p
+    INNER JOIN (
+        SELECT PostId, COUNT(*) AS link_count
+        FROM PostLinks
+        WHERE LinkTypeId = 3
+        GROUP BY PostId
+        HAVING COUNT(*) > 1
+    ) dup_links ON p.Id = dup_links.PostId
+)
+ORDER BY post_id DESC
+LIMIT 100;

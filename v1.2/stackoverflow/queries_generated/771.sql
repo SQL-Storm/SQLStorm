@@ -1,0 +1,156 @@
+-- {"query": "771.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1627} 
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+        count(distinct c.Id) as CommentsCount,
+        count(distinct b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(distinct b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(distinct b.Id) filter (where b.Class = 3) as BronzeBadges,
+        coalesce(sum(v.BountyAmount),0) as TotalBountyGiven
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join Votes v on v.UserId = u.Id and v.BountyAmount is not null
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+), UserRecentActivity as (
+    select
+        ua.UserId,
+        max(ph.CreationDate) as LastPostHistoryDate,
+        max(p.CreationDate) as LastPostDate,
+        max(c.CreationDate) as LastCommentDate,
+        max(v.CreationDate) as LastVoteDate
+    from RecursiveUserActivity ua
+    left join PostHistory ph on ph.UserId = ua.UserId
+    left join Posts p on p.OwnerUserId = ua.UserId
+    left join Comments c on c.UserId = ua.UserId
+    left join Votes v on v.UserId = ua.UserId
+    group by ua.UserId
+), UserActivityWindow as (
+    select
+        ua.*,
+        ura.LastPostHistoryDate,
+        ura.LastPostDate,
+        ura.LastCommentDate,
+        ura.LastVoteDate,
+        row_number() over (order by ua.Reputation desc nulls last, ua.UserId) as rn,
+        lag(ua.Reputation) over (order by ua.Reputation desc) as PrevReputation,
+        lead(ua.Reputation) over (order by ua.Reputation desc) as NextReputation,
+        case
+            when ua.Reputation >= 10000 then 'High'
+            when ua.Reputation >= 1000 then 'Medium'
+            else 'Low'
+        end as ReputationCategory,
+        case
+            when ua.QuestionsCount = 0 then null
+            else round(cast(ua.AnswersCount as numeric) / nullif(ua.QuestionsCount,0),2)
+        end as AnswersPerQuestionRatio
+    from RecursiveUserActivity ua
+    join UserRecentActivity ura on ura.UserId = ua.UserId
+), ClosedQuestionsWithDetails as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        cht.Name as CloseReason,
+        ph.CreationDate as CloseDate,
+        ph.UserId as ClosedByUserId,
+        u.DisplayName as ClosedByUserName,
+        (select count(*) from PostLinks pl where pl.PostId = p.Id and pl.LinkTypeId = 3) as DuplicateCount,
+        array_to_string(string_to_array(coalesce(p.Tags, '') , '><'), ',') as TagsList
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes cht on cht.Id = cast(ph.Comment as int)
+    left join Users u on u.Id = ph.UserId
+    where p.PostTypeId = 1 and ph.PostHistoryTypeId = 10
+), QuestionsWithAcceptedAnswerScores as (
+    select
+        q.QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CloseReason,
+        q.CloseDate,
+        q.ClosedByUserId,
+        q.ClosedByUserName,
+        q.DuplicateCount,
+        q.TagsList,
+        a.Score as AcceptedAnswerScore,
+        a.CreationDate as AcceptedAnswerCreationDate,
+        a.OwnerUserId as AcceptedAnswerOwnerUserId,
+        u.DisplayName as AcceptedAnswerOwnerName
+    from ClosedQuestionsWithDetails q
+    left join Posts a on a.Id = (select AcceptedAnswerId from Posts where Id = q.QuestionId)
+    left join Users u on u.Id = a.OwnerUserId
+), FinalRankedQuestions as (
+    select
+        q.*,
+        rank() over (partition by q.CloseReason order by q.QuestionScore desc nulls last, q.ViewCount desc nulls last) as RankInCloseReason,
+        dense_rank() over (order by q.AcceptedAnswerScore desc nulls last) as RankByAcceptedAnswerScore,
+        case
+            when q.AcceptedAnswerScore is null then 'No Accepted Answer'
+            when q.AcceptedAnswerScore >= 50 then 'High Scoring Accepted Answer'
+            when q.AcceptedAnswerScore >= 10 then 'Moderate Scoring Accepted Answer'
+            else 'Low Scoring Accepted Answer'
+        end as AcceptedAnswerScoreCategory,
+        (select count(*) from Comments c where c.PostId = q.QuestionId and c.UserId is not null) as CommentCountOnQuestion,
+        (select count(*) from Votes v where v.PostId = q.QuestionId and v.VoteTypeId = 2) as UpVotesOnQuestion,
+        (select count(*) from Votes v where v.PostId = q.QuestionId and v.VoteTypeId = 3) as DownVotesOnQuestion
+    from QuestionsWithAcceptedAnswerScores q
+)
+select
+    faq.QuestionId,
+    faq.Title,
+    faq.CreationDate,
+    faq.QuestionScore,
+    faq.ViewCount,
+    faq.AnswerCount,
+    faq.CloseReason,
+    faq.CloseDate,
+    faq.ClosedByUserId,
+    faq.ClosedByUserName,
+    faq.DuplicateCount,
+    faq.TagsList,
+    faq.AcceptedAnswerScore,
+    faq.AcceptedAnswerCreationDate,
+    faq.AcceptedAnswerOwnerUserId,
+    faq.AcceptedAnswerOwnerName,
+    faq.RankInCloseReason,
+    faq.RankByAcceptedAnswerScore,
+    faq.AcceptedAnswerScoreCategory,
+    faq.CommentCountOnQuestion,
+    faq.UpVotesOnQuestion,
+    faq.DownVotesOnQuestion,
+    ua.DisplayName as QuestionOwner,
+    ua.Reputation as QuestionOwnerReputation,
+    ua.ReputationCategory as QuestionOwnerReputationCategory,
+    ua.AnswersPerQuestionRatio,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.TotalBountyGiven,
+    ua.LastAccessDate,
+    ua.Views,
+    ua.UpVotes,
+    ua.DownVotes,
+    case
+        when ua.Views > 100000 then 'Very High Views'
+        when ua.Views > 10000 then 'High Views'
+        when ua.Views > 1000 then 'Moderate Views'
+        else 'Low Views'
+    end as ViewCategory
+from FinalRankedQuestions faq
+left join Users ua on ua.Id = (select OwnerUserId from Posts where Id = faq.QuestionId)
+where faq.RankInCloseReason <= 5
+order by faq.CloseReason nulls last, faq.RankInCloseReason, faq.QuestionScore desc;

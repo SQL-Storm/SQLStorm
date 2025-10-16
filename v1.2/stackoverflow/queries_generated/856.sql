@@ -1,0 +1,185 @@
+-- {"query": "856.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1719} 
+with recursive TagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        1 as Level,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsRequired = 1
+
+    union all
+
+    select
+        child.Id,
+        child.TagName,
+        parent.Level + 1,
+        child.Count,
+        child.IsModeratorOnly,
+        child.IsRequired,
+        parent.Path || child.Id
+    from Tags child
+    join TagHierarchy parent on child.IsRequired = 1 and child.Id <> all(parent.Path)
+    where parent.Level < 3
+),
+UserQuestionStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        coalesce(sum(vs.UpVotes), 0) as TotalUpVotes,
+        coalesce(sum(vs.DownVotes), 0) as TotalDownVotes,
+        coalesce(sum(bc.BadgeCount), 0) as TotalBadges,
+        max(p.Score) filter (where p.PostTypeId = 1) as MaxQuestionScore,
+        max(p.Score) filter (where p.PostTypeId = 2) as MaxAnswerScore,
+        row_number() over (order by count(distinct p.Id) filter (where p.PostTypeId = 1) desc, u.Reputation desc) as RankByQuestions
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId in (1,2)
+    left join (
+        select
+            OwnerUserId,
+            sum(case when VoteTypes.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+            sum(case when VoteTypes.Name = 'DownMod' then 1 else 0 end) as DownVotes
+        from Posts
+        join Votes on Votes.PostId = Posts.Id
+        join VoteTypes on VoteTypes.Id = Votes.VoteTypeId
+        where Posts.OwnerUserId is not null
+        group by OwnerUserId
+    ) vs on vs.OwnerUserId = u.Id
+    left join (
+        select
+            UserId,
+            count(*) as BadgeCount
+        from Badges
+        group by UserId
+    ) bc on bc.UserId = u.Id
+    group by u.Id, u.DisplayName, vs.UpVotes, vs.DownVotes, bc.BadgeCount
+),
+TopQuestionsWithComments as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.ViewCount,
+        p.Score,
+        p.CreationDate,
+        p.Tags,
+        u.DisplayName as OwnerName,
+        count(c.Id) as CommentCount,
+        sum(case when c.Score > 0 then 1 else 0 end) as PositiveComments,
+        sum(case when c.Score <= 0 or c.Score is null then 1 else 0 end) as NonPositiveComments
+    from Posts p
+    join Users u on u.Id = p.OwnerUserId
+    left join Comments c on c.PostId = p.Id
+    where p.PostTypeId = 1
+    group by p.Id, p.Title, p.ViewCount, p.Score, p.CreationDate, p.Tags, u.DisplayName
+    having count(c.Id) > 5 and p.Score > 10
+),
+AnswerPopularityRank as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.Score,
+        a.CreationDate,
+        rank() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a
+    where a.PostTypeId = 2
+),
+FilteredAnswers as (
+    select
+        apr.AnswerId,
+        apr.QuestionId,
+        apr.Score,
+        apr.CreationDate,
+        apr.AnswerRank,
+        u.DisplayName as AnswerOwner
+    from AnswerPopularityRank apr
+    left join Users u on u.Id = (select OwnerUserId from Posts where Id = apr.AnswerId)
+    where apr.AnswerRank <= 3
+),
+DuplicateQuestions as (
+    select
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId,
+        pl.CreationDate as DuplicateLinkDate
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+    join Posts p1 on p1.Id = pl.PostId and p1.PostTypeId = 1
+    join Posts p2 on p2.Id = pl.RelatedPostId and p2.PostTypeId = 1
+),
+QuestionCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId and pht.Name = 'Post Closed'
+    left join CloseReasonTypes crt on crt.Id::text = ph.Comment
+),
+UserActivityWindows as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        ph.CreationDate,
+        p.PostTypeId,
+        count(*) over (partition by u.Id order by ph.CreationDate range between interval '30 days' preceding and current row) as ActivityCountLast30Days
+    from Users u
+    left join PostHistory ph on ph.UserId = u.Id
+    left join Posts p on p.Id = ph.PostId
+    where p.PostTypeId in (1,2)
+),
+BadgeStringAggregates as (
+    select
+        b.UserId,
+        string_agg(distinct b.Name || ' (' || b.Class || ')', ', ' order by b.Class, b.Name) as BadgesSummary
+    from Badges b
+    group by b.UserId
+)
+select
+    uqs.UserId,
+    uqs.DisplayName,
+    uqs.QuestionCount,
+    uqs.AnswerCount,
+    uqs.TotalUpVotes,
+    uqs.TotalDownVotes,
+    uqs.TotalBadges,
+    coalesce(bsa.BadgesSummary, 'None') as BadgeDetails,
+    uqs.MaxQuestionScore,
+    uqs.MaxAnswerScore,
+    uqs.RankByQuestions,
+    tq.Title as TopQuestionTitle,
+    tq.ViewCount as TopQuestionViews,
+    tq.Score as TopQuestionScore,
+    tq.CommentCount as TopQuestionCommentCount,
+    tq.PositiveComments,
+    tq.NonPositiveComments,
+    da.AnswerId,
+    da.Score as AnswerScore,
+    da.AnswerRank,
+    da.AnswerOwner,
+    dq.OriginalQuestionId as DuplicateOfQuestion,
+    cr.CloseReason,
+    cr.CloseDate,
+    uaw.ActivityCountLast30Days,
+    th.Level as TagHierarchyLevel,
+    th.TagName as TagInHierarchy,
+    case 
+        when strpos(tq.Tags, '<' || th.TagName || '>') > 0 then 1
+        else 0
+    end as TagUsedInTopQuestion
+from UserQuestionStats uqs
+left join TopQuestionsWithComments tq on tq.OwnerName = uqs.DisplayName
+left join FilteredAnswers da on da.QuestionId = tq.QuestionId
+left join DuplicateQuestions dq on dq.DuplicateQuestionId = tq.QuestionId
+left join QuestionCloseReasons cr on cr.PostId = tq.QuestionId
+left join UserActivityWindows uaw on uaw.UserId = uqs.UserId and uaw.CreationDate = (
+    select max(ph2.CreationDate) from PostHistory ph2 where ph2.UserId = uqs.UserId
+)
+left join BadgeStringAggregates bsa on bsa.UserId = uqs.UserId
+left join TagHierarchy th on strpos(tq.Tags, '<' || th.TagName || '>') > 0
+where uqs.QuestionCount > 5 and uqs.TotalUpVotes > uqs.TotalDownVotes
+order by uqs.RankByQuestions, tq.Score desc, da.AnswerRank
+limit 100;

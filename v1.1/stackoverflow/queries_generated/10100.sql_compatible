@@ -1,0 +1,63 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS rank
+    FROM 
+        Posts P
+    JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2) AND P.Score > 0
+),
+BadgeCounts AS (
+    SELECT 
+        U.Id AS UserId,
+        COUNT(DISTINCT B.Id) AS BadgeCount
+    FROM 
+        Users U
+    JOIN 
+        Badges B ON U.Id = B.UserId
+    WHERE 
+        B.Class = 1 AND B.TagBased = 0
+    GROUP BY 
+        U.Id
+)
+SELECT 
+    RP.Id, 
+    RP.Title, 
+    RP.Score, 
+    RP.ViewCount, 
+    RP.CreationDate, 
+    RP.rank,
+    U.DisplayName,
+    U.Reputation,
+    BC.BadgeCount,
+    CASE 
+        WHEN RP.rank <= 3 THEN 'Top'
+        WHEN RP.rank <= 10 THEN 'High'
+        ELSE 'Low'
+    END AS RankStatus,
+    STRING_AGG(T.TagName, ', ' ORDER BY COALESCE(T.Count, 0) DESC) AS TagList
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    Users U ON RP.OwnerUserId = U.Id
+LEFT JOIN 
+    PostHistory PH ON RP.Id = PH.PostId AND PH.PostHistoryTypeId = 10
+LEFT JOIN 
+    BadgeCounts BC ON RP.OwnerUserId = BC.UserId
+LEFT JOIN 
+    Post_Tags PT ON RP.Id = PT.PostId
+LEFT JOIN 
+    Tags T ON PT.TagId = T.Id
+WHERE 
+    RP.rank <= 10 AND U.Reputation > 100 AND PH.Comment IS NULL
+GROUP BY 
+    RP.Id, RP.Title, RP.Score, RP.ViewCount, RP.CreationDate, RP.rank, U.DisplayName, U.Reputation, BC.BadgeCount
+ORDER BY 
+    RP.rank, RP.Score DESC;

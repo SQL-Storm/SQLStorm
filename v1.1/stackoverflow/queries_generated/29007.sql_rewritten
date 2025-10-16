@@ -1,0 +1,198 @@
+-- {"query": "29007.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2252} 
+SELECT 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) as TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 THEN p.Id END) as HighViewQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 10 THEN p.Id END) as HighScoreAnswers,
+    COALESCE(SUM(p.Score), 0) as TotalScore,
+    COALESCE(AVG(p.Score), 0) as AverageScore,
+    MAX(p.CreationDate) as LatestPostDate,
+    STRING_AGG(DISTINCT CASE WHEN b.Name IS NOT NULL THEN b.Name ELSE 'NoBadge' END, ', ') as Badges,
+    (SELECT COUNT(*) FROM Posts p2 
+     WHERE p2.OwnerUserId = u.Id 
+     AND p2.PostTypeId = 1 
+     AND p2.CreationDate >= DATEADD(YEAR, -1, cast('2024-10-01 12:34:56' as timestamp))) as RecentQuestions,
+    (SELECT COUNT(*) FROM Votes v 
+     JOIN Posts p3 ON v.PostId = p3.Id 
+     WHERE v.UserId = u.Id 
+     AND v.VoteTypeId = 2 
+     AND p3.PostTypeId = 1) as UpvotedQuestions,
+    (SELECT COUNT(*) FROM Comments c 
+     JOIN Posts p4 ON c.PostId = p4.Id 
+     WHERE c.UserId = u.Id 
+     AND p4.PostTypeId = 1 
+     AND c.Score > 5) as HighScoreComments,
+    (SELECT COUNT(*) FROM Posts p5 
+     WHERE p5.OwnerUserId = u.Id 
+     AND p5.PostTypeId = 1 
+     AND p5.AcceptedAnswerId IS NOT NULL) as AnsweredQuestions,
+    (SELECT COUNT(*) FROM Posts p6 
+     WHERE p6.OwnerUserId = u.Id 
+     AND p6.PostTypeId = 2 
+     AND p6.Score = 0) as ZeroScoreAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Tags END) as TagVariety,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Tags IS NOT NULL THEN p.Tags END) as TaggedQuestions,
+    (SELECT COUNT(*) FROM PostHistory ph 
+     WHERE ph.UserId = u.Id 
+     AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6) 
+     AND ph.CreationDate >= DATEADD(MONTH, -6, cast('2024-10-01 12:34:56' as timestamp))) as RecentEdits,
+    (
+        SELECT STRING_AGG(DISTINCT ph.Text, ', ')
+        FROM PostHistory ph
+        WHERE ph.UserId = u.Id
+        AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+        AND ph.CreationDate >= DATEADD(MONTH, -3, cast('2024-10-01 12:34:56' as timestamp))
+        AND ph.Text IS NOT NULL
+    ) as RecentEditSummaries,
+    (SELECT COUNT(*) FROM Votes v2 WHERE v2.UserId = u.Id AND v2.VoteTypeId IN (1, 2, 3)) as TotalVotes,
+    (SELECT COUNT(DISTINCT v3.PostId) FROM Votes v3 WHERE v3.UserId = u.Id AND v3.VoteTypeId IN (1, 2, 3)) as UniqueVotedPosts,
+    (CASE 
+        WHEN (SELECT COUNT(*) FROM Posts p7 WHERE p7.OwnerUserId = u.Id AND p7.PostTypeId = 1) > 0 
+        THEN (SELECT AVG(p8.ViewCount) FROM Posts p8 WHERE p8.OwnerUserId = u.Id AND p8.PostTypeId = 1) 
+        ELSE 0 
+    END) as AvgQuestionViews,
+    (CASE 
+        WHEN (SELECT COUNT(*) FROM Posts p9 WHERE p9.OwnerUserId = u.Id AND p9.PostTypeId = 2) > 0 
+        THEN (SELECT AVG(p10.Score) FROM Posts p10 WHERE p10.OwnerUserId = u.Id AND p10.PostTypeId = 2) 
+        ELSE 0 
+    END) as AvgAnswerScore,
+    COALESCE(
+        (
+            SELECT COUNT(*) 
+            FROM Posts p11 
+            JOIN PostHistory ph2 ON p11.Id = ph2.PostId 
+            WHERE p11.OwnerUserId = u.Id 
+            AND ph2.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6) 
+            AND ph2.CreationDate >= DATEADD(DAY, -7, cast('2024-10-01 12:34:56' as timestamp))
+        ), 0) as WeeklyEdits,
+    (SELECT COUNT(*) FROM PostLinks pl 
+     JOIN Posts p12 ON pl.PostId = p12.Id 
+     WHERE p12.OwnerUserId = u.Id 
+     AND pl.LinkTypeId = 1) as LinkedPosts,
+    (SELECT COUNT(*) FROM Posts p13 
+     WHERE p13.OwnerUserId = u.Id 
+     AND p13.LastActivityDate >= DATEADD(DAY, -30, cast('2024-10-01 12:34:56' as timestamp))) as ActivePosts,
+    (SELECT CONCAT('Q', COUNT(*)) 
+     FROM Posts p14 
+     JOIN PostHistory ph3 ON p14.Id = ph3.PostId 
+     WHERE p14.OwnerUserId = u.Id 
+     AND ph3.PostHistoryTypeId = 10 
+     AND ph3.CreationDate >= DATEADD(MONTH, -12, cast('2024-10-01 12:34:56' as timestamp))) as ClosedPosts,
+    (SELECT COUNT(*) FROM Badges b2 WHERE b2.UserId = u.Id AND b2.Date >= DATEADD(YEAR, -1, cast('2024-10-01 12:34:56' as timestamp))) as RecentBadges,
+    (
+        SELECT TOP 1 p15.Tags 
+        FROM Posts p15 
+        WHERE p15.OwnerUserId = u.Id 
+        AND p15.PostTypeId = 1 
+        AND p15.Tags IS NOT NULL 
+        GROUP BY p15.Tags 
+        ORDER BY COUNT(*) DESC
+    ) as MostFrequentTag,
+    (
+        SELECT COUNT(*) * 100.0 / NULLIF((SELECT COUNT(*) FROM Posts p16 WHERE p16.OwnerUserId = u.Id), 0) 
+        FROM Posts p17 
+        WHERE p17.OwnerUserId = u.Id 
+        AND p17.CommentCount > 0
+    ) as PercentageWithComments,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p18 
+        WHERE p18.OwnerUserId = u.Id 
+        AND p18.FavoriteCount > 0
+    ) as FavoritedPosts,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p19 
+        WHERE p19.OwnerUserId = u.Id 
+        AND p19.AnswerCount > 10
+    ) as HighAnswerCountQuestions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p20 
+        WHERE p20.OwnerUserId = u.Id 
+        AND p20.ViewCount > 10000
+    ) as ViralQuestions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p21 
+        WHERE p21.OwnerUserId = u.Id 
+        AND p21.Score > 100
+    ) as HighScorePosts,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p22 
+        WHERE p22.OwnerUserId = u.Id 
+        AND p22.ClosedDate IS NOT NULL
+    ) as ClosedQuestions,
+    (
+        SELECT COUNT(DISTINCT ph4.UserId) 
+        FROM PostHistory ph4 
+        WHERE ph4.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id)
+        AND ph4.UserId IS NOT NULL
+    ) as EditorsOfOwnPosts,
+    (
+        SELECT COUNT(*) 
+        FROM Votes v4 
+        WHERE v4.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id)
+        AND v4.VoteTypeId = 2
+    ) as UpvotesOnOwnPosts,
+    (
+        SELECT AVG(ph5.Score) 
+        FROM PostHistory ph5 
+        WHERE ph5.UserId = u.Id 
+        AND ph5.PostHistoryTypeId IN (2, 5)
+    ) as AvgEditScore,
+    (
+        SELECT 
+            CASE 
+                WHEN COUNT(*) = 0 THEN 'None'
+                WHEN AVG(p23.Score) > 50 THEN 'Excellent'
+                WHEN AVG(p23.Score) > 20 THEN 'Good'
+                WHEN AVG(p23.Score) > 0 THEN 'Average'
+                ELSE 'Poor'
+            END
+        FROM Posts p23 
+        WHERE p23.OwnerUserId = u.Id 
+        AND p23.PostTypeId = 1
+    ) as QuestionQuality,
+    (
+        SELECT STRING_AGG(CONCAT(ph6.Comment, ' (', ph6.CreationDate, ')'), ', ')
+        FROM PostHistory ph6 
+        WHERE ph6.UserId = u.Id 
+        AND ph6.PostHistoryTypeId IN (10, 11, 12, 13)
+        AND ph6.CreationDate >= DATEADD(MONTH, -3, cast('2024-10-01 12:34:56' as timestamp))
+    ) as RecentCloseReopenActivities,
+    (
+        SELECT COUNT(DISTINCT p24.ParentId) 
+        FROM Posts p24 
+        WHERE p24.OwnerUserId = u.Id 
+        AND p24.PostTypeId = 2
+    ) as AnsweredQuestionsCount,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p25 
+        WHERE p25.OwnerUserId = u.Id 
+        AND p25.PostTypeId = 1 
+        AND p25.AnswerCount IS NULL
+    ) as QuestionsWithoutAnswers,
+    (
+        SELECT STRING_AGG(p26.Title, ' | ')
+        FROM Posts p26 
+        WHERE p26.OwnerUserId = u.Id 
+        AND p26.PostTypeId = 1 
+        AND p26.Score > 100
+        ORDER BY p26.Score DESC
+        OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY
+    ) as TopScoringQuestions
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+WHERE u.Reputation > 1000
+GROUP BY u.Id, u.DisplayName, u.Reputation
+HAVING COUNT(DISTINCT p.Id) > 5
+ORDER BY u.Reputation DESC, TotalPosts DESC
+OFFSET 0 ROWS FETCH NEXT 1000 ROWS ONLY

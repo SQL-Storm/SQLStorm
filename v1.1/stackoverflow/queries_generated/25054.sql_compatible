@@ -1,0 +1,125 @@
+WITH 
+user_stats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)                         AS question_count,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)                         AS answer_count,
+        COUNT(b.Id)                                                         AS badge_count,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)                   AS upvote_sum,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)                   AS downvote_sum,
+        MAX(p.CreationDate)                                                AS last_post_date
+    FROM Users u
+    LEFT JOIN Posts   p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges  b ON b.UserId      = u.Id
+    LEFT JOIN Votes   v ON v.UserId      = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+ranked_users AS (
+    SELECT 
+        us.*,
+        ROW_NUMBER() OVER (ORDER BY us.Reputation DESC) AS reputation_rank
+    FROM user_stats us
+),
+tag_scores AS (
+    SELECT 
+        t.TagName,
+        AVG(p.Score)               AS avg_score,
+        COUNT(p.Id)                AS post_cnt
+    FROM Tags t
+    JOIN Posts p
+      ON p.Tags IS NOT NULL
+     AND POSITION('<' || t.TagName || '>' IN p.Tags) > 0
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName
+),
+top_tags AS (
+    SELECT TagName, avg_score
+    FROM tag_scores
+    ORDER BY avg_score DESC
+    LIMIT 10
+),
+question_closure AS (
+    SELECT 
+        ph.PostId,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS closed_date,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate END) AS reopened_date,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment END)      AS close_reason_id
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10,11)
+    GROUP BY ph.PostId
+)
+SELECT
+    ru.Id,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.question_count,
+    ru.answer_count,
+    ru.badge_count,
+    (ru.upvote_sum - ru.downvote_sum)                                 AS net_votes,
+    COALESCE(ru.last_post_date, TIMESTAMP '1970-01-01')                AS last_activity,
+    CASE 
+        WHEN qc.closed_date IS NOT NULL 
+             AND (qc.reopened_date IS NULL OR qc.closed_date > qc.reopened_date)
+            THEN 'Closed' 
+        ELSE 'Open' 
+    END                                                               AS current_status,
+    COALESCE(cr.Name, 'N/A')                                           AS close_reason,
+    STRING_AGG(DISTINCT tt.TagName, ', ') FILTER (WHERE tt.TagName IS NOT NULL) 
+                                                                       AS top_tags_for_user,
+    ru.reputation_rank
+FROM ranked_users ru
+LEFT JOIN LATERAL (
+    SELECT p.Id
+    FROM Posts p
+    WHERE p.OwnerUserId = ru.Id
+      AND p.PostTypeId = 1
+    ORDER BY p.CreationDate DESC
+    LIMIT 1
+) latest_q ON true
+LEFT JOIN question_closure qc ON qc.PostId = latest_q.id
+LEFT JOIN CloseReasonTypes cr 
+       ON cr.Id = CAST(COALESCE(NULLIF(qc.close_reason_id, ''), '0') AS SMALLINT)
+LEFT JOIN LATERAL (
+    SELECT t.TagName
+    FROM Tags t
+    WHERE EXISTS (
+        SELECT 1
+        FROM Posts p
+        WHERE p.OwnerUserId = ru.Id
+          AND p.PostTypeId = 1
+          AND p.Tags IS NOT NULL
+          AND POSITION('<' || t.TagName || '>' IN p.Tags) > 0
+    )
+    ORDER BY (SELECT ts.avg_score FROM tag_scores ts WHERE ts.TagName = t.TagName) DESC
+    LIMIT 3
+) tt ON true
+GROUP BY 
+    ru.Id, ru.DisplayName, ru.Reputation,
+    ru.question_count, ru.answer_count, ru.badge_count,
+    ru.upvote_sum, ru.downvote_sum, ru.last_post_date,
+    qc.closed_date, qc.reopened_date, cr.Name,
+    ru.reputation_rank
+HAVING COUNT(*) FILTER (WHERE ru.Reputation > 10000) > 0
+
+UNION ALL
+
+SELECT
+    NULL                           AS Id,
+    'Aggregate'                    AS DisplayName,
+    NULL                           AS Reputation,
+    SUM(ru.question_count)         AS question_count,
+    SUM(ru.answer_count)           AS answer_count,
+    SUM(ru.badge_count)            AS badge_count,
+    SUM(ru.upvote_sum) - SUM(ru.downvote_sum) AS net_votes,
+    MAX(ru.last_post_date)         AS last_activity,
+    NULL                           AS current_status,
+    NULL                           AS close_reason,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS top_tags_overall,
+    NULL                           AS reputation_rank
+FROM ranked_users ru
+JOIN Posts p   ON p.OwnerUserId = ru.Id AND p.PostTypeId = 1
+JOIN Tags  t   ON p.Tags IS NOT NULL
+               AND POSITION('<' || t.TagName || '>' IN p.Tags) > 0
+GROUP BY GROUPING SETS ((), (ru.Reputation));

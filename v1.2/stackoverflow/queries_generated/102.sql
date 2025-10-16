@@ -1,0 +1,273 @@
+-- {"query": "102.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.1, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2283} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+
+    union all
+
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Path || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id > r.Id
+    where t2.IsModeratorOnly = 0 and t2.IsRequired = 0
+    and not t2.TagName = any(r.Path)
+    and r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        coalesce(sum(case when p.PostTypeId = 1 then 1 else 0 end),0) as QuestionCount,
+        coalesce(sum(case when p.PostTypeId = 2 then 1 else 0 end),0) as AnswerCount,
+        coalesce(sum(p.Score),0) as TotalPostScore,
+        coalesce(sum(vt.UpVotes),0) as TotalUpVotes,
+        coalesce(sum(vt.DownVotes),0) as TotalDownVotes,
+        coalesce(ubc_gold.BadgeCount,0) as GoldBadges,
+        coalesce(ubc_silver.BadgeCount,0) as SilverBadges,
+        coalesce(ubc_bronze.BadgeCount,0) as BronzeBadges
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select
+            p.OwnerUserId,
+            sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Posts p
+        left join Votes v on v.PostId = p.Id
+        group by p.OwnerUserId
+    ) vt on vt.OwnerUserId = u.Id
+    left join UserBadgeCounts ubc_gold on ubc_gold.UserId = u.Id and ubc_gold.Class = 1
+    left join UserBadgeCounts ubc_silver on ubc_silver.UserId = u.Id and ubc_silver.Class = 2
+    left join UserBadgeCounts ubc_bronze on ubc_bronze.UserId = u.Id and ubc_bronze.Class = 3
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, ubc_gold.BadgeCount, ubc_silver.BadgeCount, ubc_bronze.BadgeCount
+),
+PostWithCloseInfo as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.AnswerCount,
+        p.ClosedDate,
+        ph.Comment as CloseReason,
+        crt.Name as CloseReasonName
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where p.PostTypeId = 1
+),
+AnswerStats as (
+    select
+        a.ParentId as QuestionId,
+        count(*) as TotalAnswers,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        min(a.Score) as MinAnswerScore,
+        sum(case when a.Id = q.AcceptedAnswerId then 1 else 0 end) as HasAcceptedAnswer
+    from Posts a
+    join Posts q on q.Id = a.ParentId and q.PostTypeId = 1
+    where a.PostTypeId = 2
+    group by a.ParentId, q.AcceptedAnswerId
+),
+QuestionRankings as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        p.ClosedDate,
+        p.CloseReasonName,
+        a.TotalAnswers,
+        a.AvgAnswerScore,
+        a.MaxAnswerScore,
+        a.MinAnswerScore,
+        a.HasAcceptedAnswer,
+        row_number() over (partition by date_trunc('month', p.CreationDate) order by p.Score desc, p.ViewCount desc) as MonthlyRank,
+        dense_rank() over (order by p.Score desc nulls last) as GlobalRank
+    from PostWithCloseInfo p
+    left join AnswerStats a on a.QuestionId = p.Id
+),
+UserTopQuestions as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        q.Id as QuestionId,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.MonthlyRank,
+        q.GlobalRank,
+        q.ClosedDate,
+        q.CloseReasonName
+    from UserActivity ua
+    join Posts q on q.OwnerUserId = ua.UserId and q.PostTypeId = 1
+    join QuestionRankings qr on qr.Id = q.Id
+    where q.Score > 10 and (q.ClosedDate is null or q.ClosedDate > now() - interval '1 year')
+),
+DuplicateLinks as (
+    select
+        pl.PostId as DuplicatePostId,
+        pl.RelatedPostId as OriginalPostId,
+        p1.Title as DuplicateTitle,
+        p2.Title as OriginalTitle,
+        pl.CreationDate as LinkCreationDate
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where pl.LinkTypeId = 3
+),
+UserCommentStats as (
+    select
+        c.UserId,
+        count(*) as TotalComments,
+        avg(length(c.Text)) as AvgCommentLength,
+        max(c.Score) as MaxCommentScore,
+        min(c.Score) as MinCommentScore,
+        sum(case when c.Text ilike '%bug%' then 1 else 0 end) as BugMentions
+    from Comments c
+    group by c.UserId
+),
+FinalOutput as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.Location,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.TotalPostScore,
+        ua.TotalUpVotes,
+        ua.TotalDownVotes,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        coalesce(ucs.TotalComments,0) as TotalComments,
+        coalesce(ucs.AvgCommentLength,0) as AvgCommentLength,
+        coalesce(ucs.MaxCommentScore,0) as MaxCommentScore,
+        coalesce(ucs.MinCommentScore,0) as MinCommentScore,
+        coalesce(ucs.BugMentions,0) as BugMentions,
+        utq.QuestionId,
+        utq.Title as TopQuestionTitle,
+        utq.Score as TopQuestionScore,
+        utq.ViewCount as TopQuestionViews,
+        utq.MonthlyRank as TopQuestionMonthlyRank,
+        utq.GlobalRank as TopQuestionGlobalRank,
+        utq.ClosedDate as TopQuestionClosedDate,
+        utq.CloseReasonName as TopQuestionCloseReason,
+        dl.DuplicatePostId,
+        dl.OriginalPostId,
+        dl.DuplicateTitle,
+        dl.OriginalTitle,
+        dl.LinkCreationDate
+    from UserActivity ua
+    left join UserCommentStats ucs on ucs.UserId = ua.UserId
+    left join lateral (
+        select *
+        from UserTopQuestions utq
+        where utq.UserId = ua.UserId
+        order by utq.Score desc nulls last
+        limit 1
+    ) utq on true
+    left join lateral (
+        select dl.*
+        from DuplicateLinks dl
+        join Posts p on p.Id = dl.DuplicatePostId
+        where p.OwnerUserId = ua.UserId
+        order by dl.LinkCreationDate desc
+        limit 1
+    ) dl on true
+    where ua.Reputation > 1000
+)
+select
+    fo.UserId,
+    fo.DisplayName,
+    fo.Reputation,
+    coalesce(fo.Location, 'Unknown') as Location,
+    fo.QuestionCount,
+    fo.AnswerCount,
+    fo.TotalPostScore,
+    fo.TotalUpVotes,
+    fo.TotalDownVotes,
+    fo.GoldBadges,
+    fo.SilverBadges,
+    fo.BronzeBadges,
+    fo.TotalComments,
+    round(fo.AvgCommentLength,2) as AvgCommentLength,
+    fo.MaxCommentScore,
+    fo.MinCommentScore,
+    fo.BugMentions,
+    fo.TopQuestionTitle,
+    fo.TopQuestionScore,
+    fo.TopQuestionViews,
+    fo.TopQuestionMonthlyRank,
+    fo.TopQuestionGlobalRank,
+    case when fo.TopQuestionClosedDate is not null then 'Closed: ' || coalesce(fo.TopQuestionCloseReason, 'Unknown') else 'Open' end as TopQuestionStatus,
+    fo.DuplicatePostId,
+    fo.OriginalPostId,
+    fo.DuplicateTitle,
+    fo.OriginalTitle,
+    fo.LinkCreationDate,
+    string_agg(distinct rth.TagName, ', ') as SampleTags
+from FinalOutput fo
+left join RecursiveTagHierarchy rth on rth.TagName = any(string_to_array(coalesce(fo.TopQuestionTitle, ''), ' '))
+group by
+    fo.UserId,
+    fo.DisplayName,
+    fo.Reputation,
+    fo.Location,
+    fo.QuestionCount,
+    fo.AnswerCount,
+    fo.TotalPostScore,
+    fo.TotalUpVotes,
+    fo.TotalDownVotes,
+    fo.GoldBadges,
+    fo.SilverBadges,
+    fo.BronzeBadges,
+    fo.TotalComments,
+    fo.AvgCommentLength,
+    fo.MaxCommentScore,
+    fo.MinCommentScore,
+    fo.BugMentions,
+    fo.TopQuestionTitle,
+    fo.TopQuestionScore,
+    fo.TopQuestionViews,
+    fo.TopQuestionMonthlyRank,
+    fo.TopQuestionGlobalRank,
+    fo.TopQuestionClosedDate,
+    fo.TopQuestionCloseReason,
+    fo.DuplicatePostId,
+    fo.OriginalPostId,
+    fo.DuplicateTitle,
+    fo.OriginalTitle,
+    fo.LinkCreationDate
+order by fo.Reputation desc, fo.TotalPostScore desc
+limit 100;

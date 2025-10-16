@@ -1,0 +1,160 @@
+WITH user_activity AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS post_count,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS question_count,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS answer_count,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS avg_post_score,
+        MAX(p.CreationDate) AS last_post_date,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS reputation_rank,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) FILTER (WHERE p.Score IS NOT NULL) AS median_score
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+tag_expertise AS (
+    SELECT 
+        p.OwnerUserId,
+        tag,
+        COUNT(*) AS tag_usage_count,
+        SUM(p.Score) AS total_tag_score,
+        (
+          SELECT STRING_AGG(title, ' | ')
+          FROM (
+            SELECT COALESCE(p2.Title, 'Untitled') AS title
+            FROM Posts p2
+            CROSS JOIN LATERAL (
+                SELECT TRIM(BOTH '<>' FROM tag_inner) AS tag_inner_val
+                FROM UNNEST(STRING_TO_ARRAY(SUBSTRING(p2.Tags, 2, LENGTH(p2.Tags)-2), '><')) AS tag_inner
+            ) ttags2
+            WHERE p2.OwnerUserId = p.OwnerUserId
+              AND p2.PostTypeId = 1
+              AND p2.Score > 10
+              AND TRIM(BOTH '<>' FROM tag_inner_val) = tag
+            ORDER BY p2.Score DESC
+          ) t
+        ) AS top_posts
+    FROM (
+      SELECT
+        p.*,
+        TRIM(BOTH '<>' FROM tag_inner) AS tag
+      FROM Posts p
+      CROSS JOIN LATERAL UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS tag_inner
+      WHERE p.Tags IS NOT NULL 
+        AND p.PostTypeId = 1
+        AND p.OwnerUserId IS NOT NULL
+    ) p
+    GROUP BY p.OwnerUserId, tag
+),
+badge_patterns AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS gold_badges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS silver_badges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS bronze_badges,
+        COUNT(DISTINCT CASE WHEN b.TagBased = 1 THEN b.Name END) AS unique_tag_badges,
+        ARRAY_AGG(DISTINCT b.Name ORDER BY b.Date DESC) FILTER (WHERE b.Class = 1) AS gold_badge_names,
+        LAG(cnt, 1, 0) OVER (PARTITION BY b.UserId ORDER BY month_dt) AS prev_month_badges,
+        month_dt
+    FROM (
+      SELECT b.*, DATE_TRUNC('month', b.Date) AS month_dt, COUNT(*) OVER (PARTITION BY b.UserId, DATE_TRUNC('month', b.Date)) AS cnt
+      FROM Badges b
+    ) b
+    GROUP BY b.UserId, month_dt
+),
+controversial_posts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        COALESCE(CAST(p.Score AS NUMERIC) / NULLIF(p.ViewCount, 0), 0) AS score_per_view,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS upvotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS downvotes,
+        EXISTS (
+            SELECT 1 
+            FROM PostHistory ph 
+            WHERE ph.PostId = p.Id 
+                AND ph.PostHistoryTypeId IN (10, 12)
+                AND ph.CreationDate > p.CreationDate + INTERVAL '1 day'
+        ) AS was_closed_or_deleted,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'community_owned'
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'has_accepted'
+            ELSE 'open'
+        END AS post_status
+    FROM Posts p
+    WHERE p.Score < 0 
+        OR (p.Score > 0 AND EXISTS (SELECT 1 FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3))
+)
+SELECT 
+    ua.DisplayName,
+    ua.Reputation,
+    ua.reputation_rank,
+    ua.post_count,
+    ROUND(CAST(ua.avg_post_score AS NUMERIC), 2) AS avg_score,
+    ua.median_score,
+    COALESCE(ua.question_count, 0) || '/' || COALESCE(ua.answer_count, 0) AS "Q/A_ratio",
+    EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - ua.last_post_date))/86400 AS days_since_last_post,
+    COALESCE(bp.gold_badges, 0) || '/' || COALESCE(bp.silver_badges, 0) || '/' || COALESCE(bp.bronze_badges, 0) AS "G/S/B_badges",
+    SUBSTRING(ARRAY_TO_STRING(bp.gold_badge_names, ', '), 1, 100) AS gold_badges_sample,
+    te.tag,
+    te.tag_usage_count,
+    te.total_tag_score,
+    CASE 
+        WHEN te.total_tag_score >= 100 THEN 'Expert'
+        WHEN te.total_tag_score >= 50 THEN 'Advanced'
+        WHEN te.total_tag_score >= 10 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END AS tag_expertise_level,
+    LEFT(te.top_posts, 200) AS top_tag_posts_sample,
+    COUNT(DISTINCT cp.PostId) AS controversial_posts,
+    SUM(CASE WHEN cp.was_closed_or_deleted THEN 1 ELSE 0 END) AS posts_closed_deleted,
+    ROUND(AVG(cp.score_per_view) * 1000, 4) AS avg_score_per_1000_views,
+    CASE 
+        WHEN ua.Reputation > 10000 AND COALESCE(bp.gold_badges, 0) > 5 THEN 'Elite'
+        WHEN ua.Reputation > 5000 OR COALESCE(bp.gold_badges, 0) > 2 THEN 'Veteran'
+        WHEN ua.Reputation > 1000 THEN 'Regular'
+        ELSE 'Newcomer'
+    END AS user_tier,
+    ROW_NUMBER() OVER (
+        PARTITION BY te.tag 
+        ORDER BY te.total_tag_score DESC, ua.Reputation DESC
+    ) AS tag_rank,
+    ua.Id
+FROM user_activity ua
+LEFT JOIN LATERAL (
+    SELECT bp.*
+    FROM badge_patterns bp 
+    WHERE bp.UserId = ua.Id 
+    ORDER BY bp.prev_month_badges DESC 
+    LIMIT 1
+) bp ON TRUE
+INNER JOIN tag_expertise te ON ua.Id = te.OwnerUserId
+LEFT JOIN controversial_posts cp ON ua.Id = cp.OwnerUserId
+WHERE ua.post_count > 0
+    AND te.tag_usage_count >= 5
+    AND (ua.Reputation > 1000 OR COALESCE(bp.gold_badges, 0) > 0 OR te.total_tag_score > 50)
+    AND NOT EXISTS (
+        SELECT 1 
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = ua.Id 
+            AND p2.Score < -5 
+            AND p2.CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days'
+    )
+GROUP BY 
+    ua.Id, ua.DisplayName, ua.Reputation, ua.reputation_rank, 
+    ua.post_count, ua.avg_post_score, ua.median_score,
+    ua.question_count, ua.answer_count, ua.last_post_date,
+    bp.gold_badges, bp.silver_badges, bp.bronze_badges, bp.gold_badge_names,
+    te.tag, te.tag_usage_count, te.total_tag_score, te.top_posts, ua.Id, ua.Reputation
+HAVING COUNT(DISTINCT cp.PostId) < ua.post_count * 0.5
+ORDER BY 
+    ua.reputation_rank ASC,
+    te.total_tag_score DESC,
+    tag_rank ASC
+LIMIT 100;

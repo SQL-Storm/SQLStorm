@@ -1,0 +1,166 @@
+-- {"query": "588.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1601} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level,
+        ARRAY[t.TagName] AS Path
+    FROM Tags t
+    WHERE t.IsRequired = 1
+
+    UNION ALL
+
+    SELECT
+        tg.Id,
+        tg.TagName,
+        tg.Count,
+        tg.ExcerptPostId,
+        tg.WikiPostId,
+        r.Level + 1,
+        r.Path || tg.TagName
+    FROM Tags tg
+    JOIN Posts p ON p.Tags LIKE '%' || tg.TagName || '%'
+    JOIN RecursiveTagHierarchy r ON p.OwnerUserId = r.Id
+    WHERE tg.IsRequired = 0
+      AND NOT tg.TagName = ANY(r.Path)
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsPosted,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersPosted,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COALESCE(SUM(v.VoteTypeId = 2)::int, 0) AS UpVotesReceived,
+        COALESCE(SUM(v.VoteTypeId = 3)::int, 0) AS DownVotesReceived,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        COUNT(DISTINCT b.Id) AS BadgesEarned,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId = 10) AS TimesPostsClosed
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TopPostsWithDetails AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        p.AcceptedAnswerId,
+        COALESCE(a.Score, 0) AS AcceptedAnswerScore,
+        COALESCE(a.ViewCount, 0) AS AcceptedAnswerViews,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankWithinType
+    FROM Posts p
+    LEFT JOIN PostTypes pt ON pt.Id = p.PostTypeId
+    LEFT JOIN Posts a ON a.Id = p.AcceptedAnswerId
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId IN (1, 2)
+),
+CloseReasonCounts AS (
+    SELECT
+        crt.Name AS CloseReason,
+        COUNT(*) AS CloseCount
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INT)
+    WHERE ph.PostHistoryTypeId = 10
+      AND crt.Name IS NOT NULL
+    GROUP BY crt.Name
+),
+UserBadgeSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        b.Class,
+        COUNT(*) AS BadgeCount,
+        STRING_AGG(b.Name, ', ' ORDER BY b.Date DESC) AS RecentBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE b.Class IN (1, 2, 3)
+    GROUP BY u.Id, u.DisplayName, b.Class
+),
+PostsWithLinkInfo AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        lt.Name AS LinkTypeName,
+        pl.RelatedPostId,
+        rp.Title AS RelatedPostTitle,
+        rp.Score AS RelatedPostScore
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    LEFT JOIN Posts rp ON rp.Id = pl.RelatedPostId
+    WHERE p.PostTypeId = 1
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.QuestionsPosted,
+    ua.AnswersPosted,
+    ua.CommentsMade,
+    ua.UpVotesReceived,
+    ua.DownVotesReceived,
+    ROUND(ua.AvgPostScore::numeric, 2) AS AvgPostScore,
+    ua.LastPostDate,
+    ua.BadgesEarned,
+    ua.TimesPostsClosed,
+    tpd.Title AS TopQuestionTitle,
+    tpd.Score AS TopQuestionScore,
+    tpd.ViewCount AS TopQuestionViews,
+    tpd.AcceptedAnswerScore,
+    tpd.AcceptedAnswerViews,
+    crc.CloseReason,
+    crc.CloseCount,
+    ubs.Class AS BadgeClass,
+    ubs.BadgeCount,
+    ubs.RecentBadges,
+    pwli.LinkTypeName,
+    pwli.RelatedPostTitle,
+    pwli.RelatedPostScore,
+    CASE
+        WHEN ua.UpVotesReceived = 0 THEN NULL
+        ELSE ROUND(ua.DownVotesReceived::numeric / NULLIF(ua.UpVotesReceived, 0), 3)
+    END AS DownToUpVoteRatio,
+    CASE
+        WHEN ua.QuestionsPosted + ua.AnswersPosted = 0 THEN NULL
+        ELSE ROUND((ua.AnswersPosted::numeric / (ua.QuestionsPosted + ua.AnswersPosted)) * 100, 2)
+    END AS AnswerPercentage,
+    STRING_AGG(DISTINCT rt.TagName, ', ') FILTER (WHERE rt.Level = 1) AS RequiredTags,
+    STRING_AGG(DISTINCT rt.TagName, ', ') FILTER (WHERE rt.Level > 1) AS RelatedTags
+FROM UserActivity ua
+LEFT JOIN TopPostsWithDetails tpd ON tpd.OwnerUserId = ua.UserId AND tpd.RankWithinType = 1 AND tpd.PostTypeId = 1
+LEFT JOIN CloseReasonCounts crc ON 1=1
+LEFT JOIN UserBadgeSummary ubs ON ubs.UserId = ua.UserId
+LEFT JOIN PostsWithLinkInfo pwli ON pwli.OwnerUserId = ua.UserId
+LEFT JOIN RecursiveTagHierarchy rt ON rt.Id = ANY(
+    SELECT DISTINCT UNNEST(string_to_array(REGEXP_REPLACE(COALESCE(p.Tags, ''), '[<>]', ' ', 'g'), ' ')::int)
+    FROM Posts p WHERE p.OwnerUserId = ua.UserId LIMIT 1
+)
+GROUP BY
+    ua.UserId, ua.DisplayName, ua.QuestionsPosted, ua.AnswersPosted, ua.CommentsMade,
+    ua.UpVotesReceived, ua.DownVotesReceived, ua.AvgPostScore, ua.LastPostDate,
+    ua.BadgesEarned, ua.TimesPostsClosed,
+    tpd.Title, tpd.Score, tpd.ViewCount, tpd.AcceptedAnswerScore, tpd.AcceptedAnswerViews,
+    crc.CloseReason, crc.CloseCount,
+    ubs.Class, ubs.BadgeCount, ubs.RecentBadges,
+    pwli.LinkTypeName, pwli.RelatedPostTitle, pwli.RelatedPostScore
+ORDER BY ua.BadgesEarned DESC, ua.UpVotesReceived DESC
+LIMIT 100;

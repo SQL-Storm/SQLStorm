@@ -1,0 +1,169 @@
+-- {"query": "240.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.2, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1619} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+
+    union all
+
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Path || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id > r.Id
+    where t2.IsModeratorOnly = 0 and t2.IsRequired = 0 and not t2.TagName = any(r.Path)
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        coalesce(u.Location, 'Unknown') as Location,
+        coalesce(u.WebsiteUrl, '') as WebsiteUrl,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+        sum(p.Score) filter (where p.PostTypeId in (1,2)) as TotalPostScore,
+        count(distinct c.Id) as CommentsCount,
+        coalesce(sum(v.BountyAmount), 0) as TotalBountyGiven
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id and v.VoteTypeId in (8,9)
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location, u.WebsiteUrl
+),
+TopPostsWithWindow as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as RankByScoreView,
+        dense_rank() over (order by p.CreationDate desc) as RecentRank
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId in (1,2)
+),
+AcceptedAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title as QuestionTitle,
+        q.OwnerUserId as QuestionOwner,
+        a.Id as AcceptedAnswerId,
+        a.Score as AcceptedAnswerScore,
+        a.OwnerUserId as AnswerOwner,
+        (select count(*) from Comments c where c.PostId = a.Id) as AcceptedAnswerCommentCount,
+        (select count(*) from Votes v where v.PostId = a.Id and v.VoteTypeId = 2) as AcceptedAnswerUpvotes
+    from Posts q
+    left join Posts a on a.Id = q.AcceptedAnswerId
+    where q.PostTypeId = 1 and q.AcceptedAnswerId is not null
+),
+PostLinkDuplicates as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where lt.Name = 'Duplicate'
+),
+ComplexUserSummary as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.Location,
+        ua.QuestionsCount,
+        ua.AnswersCount,
+        ua.TotalPostScore,
+        ua.CommentsCount,
+        ua.TotalBountyGiven,
+        coalesce(ubc_gold.BadgeCount, 0) as GoldBadges,
+        coalesce(ubc_silver.BadgeCount, 0) as SilverBadges,
+        coalesce(ubc_bronze.BadgeCount, 0) as BronzeBadges,
+        case
+            when ua.Reputation > 10000 then 'Expert'
+            when ua.Reputation > 1000 then 'Intermediate'
+            else 'Beginner'
+        end as UserLevel,
+        case
+            when ua.LastAccessDate > now() - interval '30 days' then 'Active'
+            else 'Inactive'
+        end as ActivityStatus
+    from UserActivity ua
+    left join UserBadgeCounts ubc_gold on ubc_gold.UserId = ua.UserId and ubc_gold.Class = 1
+    left join UserBadgeCounts ubc_silver on ubc_silver.UserId = ua.UserId and ubc_silver.Class = 2
+    left join UserBadgeCounts ubc_bronze on ubc_bronze.UserId = ua.UserId and ubc_bronze.Class = 3
+)
+select
+    cuss.UserId,
+    cuss.DisplayName,
+    cuss.UserLevel,
+    cuss.ActivityStatus,
+    cuss.Reputation,
+    cuss.Location,
+    cuss.QuestionsCount,
+    cuss.AnswersCount,
+    cuss.TotalPostScore,
+    cuss.CommentsCount,
+    cuss.TotalBountyGiven,
+    cuss.GoldBadges,
+    cuss.SilverBadges,
+    cuss.BronzeBadges,
+    ap.AcceptedAnswerId,
+    ap.AcceptedAnswerScore,
+    ap.AcceptedAnswerCommentCount,
+    ap.AcceptedAnswerUpvotes,
+    pl.PostId as DuplicatePostId,
+    pl.RelatedPostId as DuplicateOfPostId,
+    pl.PostTitle as DuplicatePostTitle,
+    pl.RelatedPostTitle as OriginalPostTitle,
+    rth.Level as TagHierarchyLevel,
+    array_to_string(rth.Path, ' > ') as TagHierarchyPath,
+    tpw.Title as TopPostTitle,
+    tpw.Score as TopPostScore,
+    tpw.ViewCount as TopPostViews,
+    tpw.RankByScoreView,
+    tpw.RecentRank,
+    -- Complex string expression with NULL logic
+    concat_ws(' | ',
+        cuss.DisplayName,
+        coalesce(nullif(cuss.Location, 'Unknown'), 'No Location'),
+        'Lvl: ' || cuss.UserLevel,
+        'Rep: ' || cuss.Reputation,
+        'Badges(G/S/B): ' || cuss.GoldBadges || '/' || cuss.SilverBadges || '/' || cuss.BronzeBadges
+    ) as UserSummaryString
+from ComplexUserSummary cuss
+left join AcceptedAnswerStats ap on ap.QuestionOwner = cuss.UserId
+left join PostLinkDuplicates pl on pl.PostId = ap.AcceptedAnswerId
+left join RecursiveTagHierarchy rth on rth.TagName = any(string_to_array(coalesce((select Tags from Posts where OwnerUserId = cuss.UserId and PostTypeId = 1 order by Score desc limit 1), ''), '><'))
+left join TopPostsWithWindow tpw on tpw.OwnerUserId = cuss.UserId and tpw.RankByScoreView = 1
+where cuss.QuestionsCount > 5 and cuss.AnswersCount > 10
+order by cuss.Reputation desc, cuss.UserId
+limit 100;

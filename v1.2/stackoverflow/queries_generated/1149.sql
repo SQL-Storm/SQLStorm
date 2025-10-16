@@ -1,0 +1,176 @@
+-- {"query": "1149.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.1, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1602} 
+
+with RankedAnswers as (
+  select 
+    a.Id,
+    a.ParentId,
+    a.Score,
+    a.CreationDate,
+    a.OwnerUserId,
+    row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank,
+    count(*) over (partition by a.ParentId) as TotalAnswers
+  from Posts a
+  where a.PostTypeId = 2 -- Answers
+),
+QuestionScoreStats as (
+  select 
+    q.Id as QuestionId,
+    q.OwnerUserId,
+    q.Score as QuestionScore,
+    coalesce(avg(a.Score) filter (where a.Score is not null),0) as AvgAnswerScore,
+    coalesce(max(a.Score),0) as MaxAnswerScore,
+    q.ViewCount,
+    q.AnswerCount,
+    row_number() over (order by q.Score desc nulls last) as QuestionRank
+  from Posts q
+  left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+  where q.PostTypeId = 1
+  group by q.Id, q.OwnerUserId, q.Score, q.ViewCount, q.AnswerCount
+),
+UserBadgeCounts as (
+  select 
+    b.UserId,
+    sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+    sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+    sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+  from Badges b
+  group by b.UserId
+),
+UserPostSummaries as (
+  select 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    coalesce(ubc.GoldBadges,0) as GoldBadges,
+    coalesce(ubc.SilverBadges,0) as SilverBadges,
+    coalesce(ubc.BronzeBadges,0) as BronzeBadges,
+    count(distinct p.Id) as TotalPosts,
+    max(p.CreationDate) as LatestPostDate,
+    sum(case when p.PostTypeId = 1 then 1 else 0 end) as QuestionsPosted,
+    sum(case when p.PostTypeId = 2 then 1 else 0 end) as AnswersPosted
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  left join UserBadgeCounts ubc on ubc.UserId = u.Id
+  group by u.Id, u.DisplayName, u.Reputation, ubc.GoldBadges, ubc.SilverBadges, ubc.BronzeBadges
+),
+QuestionTagsExploded as (
+  select 
+    q.Id as QuestionId,
+    unnest(string_to_array(substring(q.Tags from 2 for length(q.Tags) - 2), '><')) as Tag
+  from Posts q
+  where q.PostTypeId = 1 and q.Tags is not null
+),
+TopTagsByQuestionCount as (
+  select 
+    Tag,
+    count(distinct QuestionId) as QuestionCount
+  from QuestionTagsExploded
+  group by Tag
+  order by QuestionCount desc
+  limit 10
+),
+HighScoringTopTagQuestions as (
+  select 
+    q.Id,
+    q.Title,
+    q.Score,
+    qt.Tag
+  from Posts q
+  inner join QuestionTagsExploded qt on qt.QuestionId = q.Id
+  inner join TopTagsByQuestionCount tt on tt.Tag = qt.Tag
+  where q.PostTypeId = 1 and q.Score > 100
+  order by qt.Tag, q.Score desc
+),
+DuplicatesWithQuestions as (
+  select 
+    pl.PostId as DuplicateQuestionId,
+    pl.RelatedPostId as OriginalQuestionId,
+    pq.Title as DuplicateTitle,
+    po.Title as OriginalTitle,
+    pl.CreationDate as LinkCreationDate
+  from PostLinks pl
+  inner join Posts pq on pq.Id = pl.PostId and pq.PostTypeId = 1
+  inner join Posts po on po.Id = pl.RelatedPostId and po.PostTypeId = 1
+  where pl.LinkTypeId = 3 -- Duplicates
+),
+UserActivityWindow as (
+  select 
+    ph.UserId,
+    date_trunc('month', ph.CreationDate) as ActivityMonth,
+    count(*) as Edits,
+    count(distinct ph.PostId) as PostsEdited,
+    sum(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as CloseVotes,
+    sum(case when ph.PostHistoryTypeId = 11 then 1 else 0 end) as ReopenVotes
+  from PostHistory ph
+  group by ph.UserId, ActivityMonth
+),
+UserActivityRanked as (
+  select *,
+    rank() over (partition by UserId order by Edits desc) as EditRank
+  from UserActivityWindow
+),
+JoinedUserScorePosts as (
+  select 
+    ups.UserId,
+    ups.DisplayName,
+    qs.QuestionId,
+    qs.Title,
+    qs.QuestionScore,
+    qs.AvgAnswerScore,
+    ua.Edits,
+    ua.CloseVotes,
+    ua.ReopenVotes,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges
+  from QuestionScoreStats qs
+  inner join Posts p on p.Id = qs.QuestionId
+  inner join Users ups on ups.Id = p.OwnerUserId
+  left join UserActivityWindow ua on ua.UserId = ups.Id and ua.ActivityMonth = date_trunc('month', qs.QuestionId::timestamp) -- correlate to a month (approximate)
+  left join UserBadgeCounts us on us.UserId = ups.Id
+  where qs.QuestionScore > 50
+)
+select 
+  ju.UserId,
+  ju.DisplayName,
+  ju.QuestionId,
+  ju.Title as QuestionTitle,
+  ju.QuestionScore,
+  ju.AvgAnswerScore,
+  ju.Edits,
+  ju.CloseVotes,
+  ju.ReopenVotes,
+  ju.GoldBadges,
+  ju.SilverBadges,
+  ju.BronzeBadges,
+  concat_ws(' / ', 
+    case when ju.QuestionScore > 200 then 'Highly Upvoted' else 'Moderate Score' end,
+    case when ju.AvgAnswerScore > 10 then 'Quality Answers' else 'Low Answer Score' end,
+    case when ju.Edits is null then 'No Edits' else 'Edited '||ju.Edits||' times' end
+  ) as QuestionQualitySummary
+from JoinedUserScorePosts ju
+where coalesce(ju.ReopenVotes,0) < coalesce(ju.CloseVotes,0)
+and ju.GoldBadges + ju.SilverBadges + ju.BronzeBadges > 5
+order by ju.QuestionScore desc, ju.AvgAnswerScore desc, ju.GoldBadges desc
+limit 50
+
+union
+
+select 
+  u.UserId,
+  u.DisplayName,
+  null as QuestionId,
+  'Top Tags Overview' as QuestionTitle,
+  null as QuestionScore,
+  null as AvgAnswerScore,
+  null as Edits,
+  null as CloseVotes,
+  null as ReopenVotes,
+  u.GoldBadges,
+  u.SilverBadges,
+  u.BronzeBadges,
+  'Summary for top contributing users' as QuestionQualitySummary
+from UserPostSummaries u
+where u.GoldBadges >= 10 and u.QuestionsPosted > 20
+order by u.GoldBadges desc, u.Reputation desc
+limit 20;

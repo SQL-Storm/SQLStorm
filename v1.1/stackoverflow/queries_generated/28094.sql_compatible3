@@ -1,0 +1,100 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesReceived,
+        AVG(CASE WHEN v.VoteTypeId IN (8,9) THEN v.BountyAmount ELSE NULL END) AS AvgBounty
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    GROUP BY u.Id, u.Reputation, u.CreationDate
+),
+RankedUsers AS (
+    SELECT 
+        us.*,
+        NTILE(4) OVER (ORDER BY us.Reputation DESC) AS ReputationQuartile,
+        RANK() OVER (PARTITION BY NTILE(4) OVER (ORDER BY us.Reputation DESC) ORDER BY (us.QuestionCount + us.AnswerCount) DESC) AS ActivityRank_pre
+    FROM UserStats us
+),
+RankedUsersFixed AS (
+    SELECT
+        ru.Id,
+        ru.Reputation,
+        ru.CreationDate,
+        ru.BadgeCount,
+        ru.QuestionCount,
+        ru.AnswerCount,
+        ru.CommentCount,
+        ru.UpvotesReceived,
+        ru.DownvotesReceived,
+        ru.AvgBounty,
+        ru.ReputationQuartile,
+        RANK() OVER (PARTITION BY ru.ReputationQuartile ORDER BY (ru.QuestionCount + ru.AnswerCount) DESC) AS ActivityRank
+    FROM RankedUsers ru
+)
+SELECT 
+    ru.Id,
+    ru.Reputation,
+    ru.CreationDate,
+    ru.BadgeCount,
+    ru.QuestionCount,
+    ru.AnswerCount,
+    ru.CommentCount,
+    ru.UpvotesReceived,
+    ru.DownvotesReceived,
+    ru.AvgBounty,
+    ru.ReputationQuartile,
+    ru.ActivityRank,
+    (SELECT COUNT(*) 
+     FROM PostHistory ph 
+     JOIN Posts p2 ON ph.PostId = p2.Id 
+     WHERE p2.OwnerUserId = ru.Id 
+        AND ph.PostHistoryTypeId = 10 
+        AND (CASE 
+                WHEN ph.Comment ~ '^[0-9]+$' THEN CAST(ph.Comment AS INTEGER)
+                ELSE NULL
+             END) IN (
+            SELECT Id FROM CloseReasonTypes WHERE Name LIKE '%Duplicate%'
+        )
+    ) AS DuplicateCloseActions,
+    COALESCE(STRING_AGG(DISTINCT LEFT(t.TagName, 15), '; '), 'No Tags') AS CommonTags,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 
+            FROM Posts p3 
+            WHERE p3.OwnerUserId = ru.Id 
+                AND p3.AcceptedAnswerId IS NOT NULL 
+                AND p3.Score > 100
+        ) THEN 'High Impact' 
+        ELSE 'Regular' 
+    END AS ImpactCategory,
+    MAX(p.Score) AS MaxPostScore,
+    COUNT(DISTINCT t.TagName) AS DistinctTagCount
+FROM RankedUsersFixed ru
+LEFT JOIN Posts p ON ru.Id = p.OwnerUserId
+LEFT JOIN (
+    SELECT Id, UNNEST(string_to_array(SUBSTRING(Tags FROM 2 FOR CHAR_LENGTH(Tags)-2), '><')) AS TagName 
+    FROM Posts 
+    WHERE PostTypeId = 1
+) t ON p.Id = t.Id
+WHERE ru.Reputation > 1000
+    OR (ru.UpvotesReceived > ru.DownvotesReceived * 2 AND ru.CommentCount > 10)
+    OR ru.AvgBounty > 50
+GROUP BY ru.Id, ru.Reputation, ru.CreationDate, ru.BadgeCount, ru.QuestionCount, 
+    ru.AnswerCount, ru.CommentCount, ru.UpvotesReceived, ru.DownvotesReceived, 
+    ru.AvgBounty, ru.ReputationQuartile, ru.ActivityRank
+HAVING COUNT(DISTINCT t.TagName) BETWEEN 3 AND 10
+    OR MAX(p.Score) > 500
+ORDER BY 
+    ru.ReputationQuartile, 
+    ru.ActivityRank, 
+    (ru.UpvotesReceived - ru.DownvotesReceived) DESC
+LIMIT 200;

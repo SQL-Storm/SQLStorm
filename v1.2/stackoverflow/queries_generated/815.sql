@@ -1,0 +1,163 @@
+-- {"query": "815.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1494} 
+with recursive UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        b.Class,
+        count(b.Id) as BadgeCount,
+        row_number() over(partition by u.Id order by b.Class) as BadgeRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    where b.Class in (1,2,3)
+    group by u.Id, u.DisplayName, u.Reputation, b.Class
+
+    union all
+
+    select
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        null as Class,
+        0 as BadgeCount,
+        4 as BadgeRank
+    from Users u
+    where not exists (
+        select 1 from Badges b where b.UserId = u.UserId
+    )
+),
+QuestionAnswerAggregates as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        count(a.Id) as AnswerCount,
+        avg(a.Score) filter (where a.Score is not null) as AvgAnswerScore,
+        max(a.CreationDate) as LastAnswerDate
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount, q.Tags
+),
+LatestPostHistoryPerPost as (
+    select distinct on (ph.PostId)
+        ph.PostId,
+        ph.Id as PostHistoryId,
+        ph.PostHistoryTypeId,
+        ph.UserId as EditorUserId,
+        ph.CreationDate as EditDate,
+        ph.Comment
+    from PostHistory ph
+    order by ph.PostId, ph.CreationDate desc
+),
+TagScores as (
+    select
+        unnest(string_to_array(substring(q.Tags from 2 for length(q.Tags)-2), '><')) as Tag,
+        q.Id as QuestionId,
+        q.Score
+    from Posts q
+    where q.PostTypeId = 1 and q.Tags is not null
+),
+TopTags as (
+    select
+        Tag,
+        count(distinct QuestionId) as QuestionsCount,
+        avg(Score) as AvgScore,
+        rank() over(order by count(distinct QuestionId) desc, avg(Score) desc) as TagRank
+    from TagScores
+    group by Tag
+    having count(distinct QuestionId) > 50
+),
+QuestionWithCloseInfo as (
+    select
+        q.Id,
+        q.Title,
+        q.ClosedDate,
+        crt.Name as CloseReason,
+        ph.Comment as CloseReasonIdText,
+        ph.CreationDate as CloseVoteDate
+    from Posts q
+    left join LatestPostHistoryPerPost ph on ph.PostId = q.Id and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int) -- PostHistory.Comment holds CloseReasonId for PostHistoryTypeId=10
+    where q.PostTypeId = 1
+),
+UserRecentActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        max(p.CreationDate) as LastPostDate,
+        max(ph.CreationDate) as LastEditDate,
+        max(c.CreationDate) as LastCommentDate,
+        greatest(
+            coalesce(max(p.CreationDate), '1900-01-01'),
+            coalesce(max(ph.CreationDate), '1900-01-01'),
+            coalesce(max(c.CreationDate), '1900-01-01')
+        ) as LastActivityDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName
+)
+select
+    q.Id as QuestionId,
+    q.Title,
+    coalesce(q.ViewCount,0) as Views,
+    q.Score as QuestionScore,
+    qa.AnswerCount,
+    coalesce(qa.AvgAnswerScore,0) as AvgAnswerScore,
+    coalesce(qa.LastAnswerDate, q.CreationDate) as LastAnswerDate,
+    closeinfo.CloseReason,
+    closeinfo.CloseVoteDate,
+    u.DisplayName as QuestionOwner,
+    u.Reputation as OwnerReputation,
+    ubs.BadgeCount as OwnerBadgeCount,
+    ubs.Class as OwnerTopBadgeClass,
+    array_to_string(array_agg(distinct tt.Tag order by tt.TagRank limit 3), ', ') as TopTags,
+    case
+        when q.ClosedDate is not null then 'Closed'
+        else 'Open'
+    end as QuestionStatus,
+    -- Window function to rank questions by popularity score (complex calculation)
+    rank() over (order by (q.Score * 2 + qa.AnswerCount * 3 + coalesce(q.ViewCount,0)/100) desc) as PopularityRank,
+    -- String operations and NULL logic in predicate
+    case
+        when q.Tags is null or q.Tags = '' then 'No Tags'
+        else substring(q.Tags from 2 for length(q.Tags)-2)
+    end as TagsList,
+    -- Correlated subquery to count user's total accepted answers
+    (
+        select count(1)
+        from Posts p2
+        where p2.PostTypeId = 2
+          and p2.OwnerUserId = u.Id
+          and exists (
+            select 1 from Posts q2
+            where q2.AcceptedAnswerId = p2.Id
+          )
+    ) as UserAcceptedAnswers,
+    -- Outer join with Comments summary
+    coalesce(cmt.CommentCount,0) as CommentCount,
+    -- Complex predicate with NULL and string comparison
+    case when coalesce(q.Title,'') ilike '%sql%' and (closeinfo.CloseReason is null or closeinfo.CloseReason != 'Duplicate') then 1 else 0 end as IsImportantSqlQuestion
+from Posts q
+inner join QuestionAnswerAggregates qa on qa.QuestionId = q.Id
+left join QuestionWithCloseInfo closeinfo on closeinfo.Id = q.Id
+left join Users u on u.Id = q.OwnerUserId
+left join UserBadgeStats ubs on ubs.UserId = u.Id and ubs.BadgeRank = 1
+left join (
+    select
+        PostId,
+        count(1) as CommentCount
+    from Comments
+    group by PostId
+) cmt on cmt.PostId = q.Id
+left join TopTags tt on tt.Tag = (select unnest(string_to_array(substring(q.Tags from 2 for length(q.Tags)-2), '><')) limit 1)
+where q.PostTypeId = 1
+  and q.CreationDate > now() - interval '1 year'
+order by PopularityRank
+limit 100;

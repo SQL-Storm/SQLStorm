@@ -1,0 +1,77 @@
+WITH ActiveUsers AS (
+  SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN COALESCE(p.Score, 0) > 0 THEN 1 ELSE 0 END) AS PositiveScorePosts,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS Rank
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+  WHERE u.LastAccessDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months')
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopQuestions AS (
+  SELECT 
+    p.Id,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    u.DisplayName AS OwnerName,
+    tags.tag,
+    RANK() OVER (
+      PARTITION BY tags.tag
+      ORDER BY p.ViewCount DESC
+    ) AS TagRank
+  FROM Posts p
+  JOIN Users u ON p.OwnerUserId = u.Id
+  CROSS JOIN LATERAL (
+    SELECT TRIM(t) AS tag
+    FROM (
+      SELECT UNNEST(
+        CASE
+          WHEN p.Tags IS NULL THEN ARRAY[]::text[] /* leave type literal removed in outer SQL; replace with empty array using standard syntax below */
+          ELSE (
+            SELECT regexp_split_to_array(
+              SUBSTR(p.Tags, 2, GREATEST(LENGTH(p.Tags) - 2, 0)),
+              '><'
+            )
+          )
+        END
+      ) AS t
+    ) AS s
+  ) tags
+  WHERE p.PostTypeId = 1 AND p.ClosedDate IS NULL
+  GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.Tags, u.DisplayName, tags.tag
+),
+UserBadges AS (
+  SELECT 
+    u.Id AS UserId,
+    STRING_AGG(b.Name, ', ' ORDER BY b.Name) AS BadgeNames,
+    COUNT(b.Id) AS TotalBadges
+  FROM Users u
+  LEFT JOIN Badges b ON u.Id = b.UserId
+  GROUP BY u.Id
+)
+SELECT 
+  au.Id,
+  au.DisplayName,
+  au.Reputation,
+  au.TotalPosts,
+  au.PositiveScorePosts,
+  ub.BadgeNames,
+  ub.TotalBadges,
+  COALESCE(tq.Title, 'N/A') AS TopQuestionTitle,
+  COALESCE(tq.ViewCount, 0) AS TopQuestionViewCount,
+  (SELECT COUNT(*) FROM Comments c WHERE c.UserId = au.Id AND COALESCE(c.Score, 0) > 5) AS HighScoreComments,
+  CASE
+    WHEN au.Rank <= 10 THEN 'Top Contributor'
+    WHEN au.Rank <= 100 THEN 'Active Contributor'
+    ELSE 'Regular Contributor'
+  END AS ContributorStatus
+FROM ActiveUsers au
+LEFT JOIN UserBadges ub ON au.Id = ub.UserId
+LEFT JOIN TopQuestions tq ON au.DisplayName = tq.OwnerName AND tq.TagRank = 1
+WHERE au.TotalPosts >= 10
+ORDER BY au.Rank, COALESCE(tq.ViewCount, 0) DESC;

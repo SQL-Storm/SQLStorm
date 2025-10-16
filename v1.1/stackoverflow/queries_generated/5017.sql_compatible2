@@ -1,0 +1,144 @@
+WITH RecentActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COALESCE(MAX(p.CreationDate), u.LastAccessDate) AS LatestPostDate,
+        DENSE_RANK() OVER (ORDER BY COALESCE(MAX(p.CreationDate), u.LastAccessDate) DESC) AS ActivityRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE u.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years')
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+), 
+PostTags AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId AS UserId,
+        TRIM(BOTH '<>' FROM tag) AS TagName
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT substring_parts.tag
+        FROM (
+            WITH RECURSIVE split(pos, rest, tag, rn) AS (
+                SELECT
+                    1 AS pos,
+                    CAST(p.Tags AS VARCHAR(4000)) AS rest,
+                    NULL AS tag,
+                    0 AS rn
+                WHERE p.Tags IS NOT NULL AND p.Tags <> ''
+                UNION ALL
+                SELECT
+                    instr + 1,
+                    CASE
+                        WHEN next_pos > 0 THEN substring(rest FROM next_pos)
+                        ELSE ''
+                    END AS rest,
+                    CASE
+                        WHEN start_pos > 0 AND next_pos > 0 THEN substring(rest FROM start_pos FOR next_pos - start_pos)
+                        WHEN start_pos > 0 AND next_pos = 0 THEN substring(rest FROM start_pos)
+                        ELSE NULL
+                    END AS tag,
+                    rn + 1
+                FROM (
+                    SELECT
+                        rest,
+                        rn,
+                        (position('<' IN rest)) AS start_pos,
+                        (CASE WHEN position('<' IN rest) > 0 THEN
+                            (position('>' IN substring(rest FROM position('<' IN rest) + 1)) + position('<' IN rest))
+                         ELSE 0 END) AS next_pos,
+                        CASE WHEN position('<' IN rest) > 0 THEN position('<' IN rest) ELSE 0 END AS instr
+                    FROM split
+                    WHERE rest IS NOT NULL AND rest <> ''
+                ) s
+                WHERE s.start_pos > 0
+            )
+            SELECT tag FROM split WHERE tag IS NOT NULL
+        ) AS substring_parts(tag)
+    ) t
+    WHERE p.PostTypeId = 1
+),
+UserTagStats AS (
+    SELECT
+        pt.UserId,
+        pt.TagName,
+        COUNT(*) AS TagPostCount,
+        SUM(p.Score) AS TagScoreSum
+    FROM PostTags pt
+    JOIN Posts p ON p.Id = pt.PostId
+    WHERE p.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years')
+    GROUP BY pt.UserId, pt.TagName
+),
+TopTagsPerUser AS (
+    SELECT 
+        uts.UserId,
+        uts.TagName,
+        uts.TagPostCount,
+        uts.TagScoreSum,
+        RANK() OVER (PARTITION BY uts.UserId ORDER BY uts.TagScoreSum DESC, uts.TagPostCount DESC) AS TagRank
+    FROM UserTagStats uts
+)
+SELECT
+    rau.UserId,
+    rau.DisplayName,
+    rau.Reputation,
+    DATE_PART('day', (TIMESTAMP '2024-10-01 12:34:56' - rau.CreationDate)) AS DaysSinceJoined,
+    DATE_PART('hour', (TIMESTAMP '2024-10-01 12:34:56' - rau.LatestPostDate)) AS HoursSinceLastPost,
+    COALESCE(b.BadgeCount, 0) AS TotalBadges,
+    COALESCE(pq.PostCount, 0) AS QuestionsPosted,
+    COALESCE(pa.PostCount, 0) AS AnswersPosted,
+    tt.TagName AS TopTag,
+    tt.TagPostCount AS TopTagPosts,
+    tt.TagScoreSum AS TopTagScore,
+    CASE 
+        WHEN rau.Reputation > 10000 THEN 'Legend'
+        WHEN rau.Reputation BETWEEN 1001 AND 10000 THEN 'Pro'
+        ELSE 'Rookie'
+    END AS UserTier,
+    CASE 
+        WHEN pa.PostCount = 0 THEN NULL 
+        ELSE ROUND(CAST(pa.PostScoreSum AS NUMERIC)/pa.PostCount,2)
+    END AS AvgAnswerScore,
+    (SELECT COUNT(*) 
+     FROM Votes v 
+     WHERE v.UserId = rau.UserId 
+       AND v.VoteTypeId = 2) AS UpVotesCast,
+    (
+        SELECT COUNT(*)
+        FROM Badges b2
+        WHERE b2.UserId = rau.UserId AND b2.Class = 1
+    ) AS GoldBadges,
+    (
+        SELECT COUNT(*)
+        FROM Comments c
+        WHERE c.UserId = rau.UserId 
+          AND c.Score > 5
+    ) AS HighlyVotedComments
+FROM RecentActiveUsers rau
+LEFT JOIN (
+    SELECT b.UserId, COUNT(*) AS BadgeCount
+    FROM Badges b
+    WHERE b.Date > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years')
+    GROUP BY b.UserId
+) b ON b.UserId = rau.UserId
+LEFT JOIN (
+    SELECT p.OwnerUserId, COUNT(*) AS PostCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId
+) pq ON pq.OwnerUserId = rau.UserId
+LEFT JOIN (
+    SELECT p.OwnerUserId, COUNT(*) AS PostCount, SUM(p.Score) AS PostScoreSum
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.OwnerUserId
+) pa ON pa.OwnerUserId = rau.UserId
+LEFT JOIN (
+    SELECT ttpu.UserId, ttpu.TagName, ttpu.TagPostCount, ttpu.TagScoreSum
+    FROM TopTagsPerUser ttpu
+    WHERE ttpu.TagRank = 1
+) tt ON tt.UserId = rau.UserId
+WHERE rau.ActivityRank <= 100
+ORDER BY rau.ActivityRank;

@@ -1,0 +1,128 @@
+-- {"query": "16095.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 224160, "output_tokens": 208479} 
+WITH user_activity_metrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        COUNT(DISTINCT p.Id) as post_count,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as question_count,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answer_count,
+        AVG(CASE WHEN p.Score IS NOT NULL THEN p.Score ELSE 0 END) as avg_post_score,
+        COALESCE(SUM(p.ViewCount), 0) as total_views,
+        ROW_NUMBER() OVER (PARTITION BY SUBSTRING(COALESCE(u.Location, 'Unknown'), 1, 20) ORDER BY u.Reputation DESC) as location_rank,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as activity_rank
+    FROM Users u
+    LEFT OUTER JOIN Posts p ON u.Id = p.OwnerUserId 
+        AND p.CreationDate >= TIMESTAMP '2020-01-01' 
+        AND p.Score IS NOT NULL
+    WHERE u.Reputation > 100
+        AND (u.Location IS NULL OR LENGTH(TRIM(u.Location)) > 0)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location
+    HAVING COUNT(DISTINCT p.Id) > 5
+),
+badge_analysis AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) as badge_count,
+        SUM(CASE WHEN b.Class = 1 THEN 3 WHEN b.Class = 2 THEN 2 ELSE 1 END) as weighted_badge_score,
+        STRING_AGG(DISTINCT CASE WHEN b.Class = 1 THEN b.Name ELSE NULL END, ', ') as gold_badges,
+        MAX(CASE WHEN b.TagBased = 1 THEN b.Date ELSE NULL END) as last_tag_badge_date
+    FROM Badges b
+    WHERE b.Date >= TIMESTAMP '2019-01-01'
+    GROUP BY b.UserId
+),
+post_interaction_complexity AS (
+    SELECT 
+        p.Id as PostId,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        COALESCE(LENGTH(p.Body) / NULLIF(p.CommentCount, 0), 0) as body_to_comment_ratio,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId IN (2, 3)) as vote_count,
+        (SELECT COUNT(DISTINCT ph.UserId) 
+         FROM PostHistory ph 
+         WHERE ph.PostId = p.Id 
+         AND ph.PostHistoryTypeId IN (4, 5, 6)
+         AND ph.UserId IS NOT NULL) as unique_editors,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Resolved'
+            WHEN p.AnswerCount > 0 THEN 'Answered'
+            ELSE 'Open'
+        END as post_status,
+        EXTRACT(EPOCH FROM (COALESCE(p.LastActivityDate, p.CreationDate) - p.CreationDate)) / 86400.0 as activity_duration_days
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= TIMESTAMP '2020-01-01'
+        AND (p.Score > 5 OR p.AnswerCount > 2)
+),
+tag_performance AS (
+    SELECT 
+        t.TagName,
+        t.Count as tag_usage_count,
+        AVG(p.Score) as avg_question_score,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.ViewCount) as median_views,
+        COUNT(DISTINCT p.OwnerUserId) as unique_askers
+    FROM Tags t
+    INNER JOIN Posts p ON POSITION('<' || t.TagName || '>' IN p.Tags) > 0
+    WHERE p.PostTypeId = 1
+        AND t.Count > 100
+    GROUP BY t.TagName, t.Count
+)
+SELECT 
+    uam.DisplayName,
+    COALESCE(SUBSTRING(uam.Location FROM 1 FOR 50), 'Unknown') as Location,
+    uam.Reputation,
+    uam.post_count,
+    uam.question_count,
+    uam.answer_count,
+    ROUND(uam.avg_post_score::numeric, 2) as avg_score,
+    uam.total_views,
+    uam.location_rank,
+    COALESCE(ba.badge_count, 0) as total_badges,
+    COALESCE(ba.weighted_badge_score, 0) as badge_score,
+    COALESCE(ba.gold_badges, 'None') as gold_badge_list,
+    (SELECT COUNT(*) 
+     FROM post_interaction_complexity pic 
+     WHERE pic.OwnerUserId = uam.Id 
+     AND pic.post_status = 'Resolved') as resolved_questions,
+    (SELECT AVG(pic.unique_editors) 
+     FROM post_interaction_complexity pic 
+     WHERE pic.OwnerUserId = uam.Id) as avg_collaborators_per_post,
+    (SELECT STRING_AGG(DISTINCT tp.TagName, ', ')
+     FROM post_interaction_complexity pic
+     INNER JOIN Posts p ON pic.PostId = p.Id
+     CROSS JOIN LATERAL (
+         SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) as TagName
+     ) tp
+     INNER JOIN tag_performance tperf ON tp.TagName = tperf.TagName
+     WHERE pic.OwnerUserId = uam.Id
+     AND tperf.avg_question_score > 10
+     LIMIT 5) as top_performing_tags,
+    CASE 
+        WHEN uam.Reputation > 10000 AND COALESCE(ba.badge_count, 0) > 50 THEN 'Elite'
+        WHEN uam.Reputation > 5000 AND COALESCE(ba.badge_count, 0) > 20 THEN 'Expert'
+        WHEN uam.Reputation > 1000 THEN 'Proficient'
+        ELSE 'Active'
+    END as user_tier,
+    ROUND((uam.Reputation::numeric / NULLIF(uam.post_count, 0))::numeric, 2) as reputation_efficiency
+FROM user_activity_metrics uam
+LEFT JOIN badge_analysis ba ON uam.Id = ba.UserId
+WHERE uam.activity_rank <= 500
+    AND (ba.badge_count IS NULL OR ba.badge_count >= 3)
+    AND EXISTS (
+        SELECT 1 
+        FROM post_interaction_complexity pic 
+        WHERE pic.OwnerUserId = uam.Id 
+        AND pic.vote_count > 10
+    )
+ORDER BY 
+    CASE WHEN uam.location_rank <= 3 THEN 0 ELSE 1 END,
+    uam.Reputation DESC,
+    ba.weighted_badge_score DESC NULLS LAST,
+    uam.total_views DESC
+LIMIT 100;

@@ -1,0 +1,63 @@
+-- {"query": "24085.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2981} 
+
+WITH tags_split AS (
+    SELECT p.Id AS post_id,
+           unnest(regexp_split_to_array(p.Tags, '><')) AS tag
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL
+),
+votes_agg AS (
+    SELECT pv.PostId,
+           sum(CASE WHEN vt.Name = 'UpMod'  THEN 1
+                    WHEN vt.Name = 'DownMod' THEN -1
+               END) AS net_votes,
+           count(DISTINCT pv.UserId) AS voter_count
+    FROM Votes pv
+    JOIN VoteTypes vt ON pv.VoteTypeId = vt.Id
+    GROUP BY pv.PostId
+),
+post_data AS (
+    SELECT p.Id,
+           p.Title,
+           p.Score,
+           p.ViewCount,
+           p.CreationDate,
+           pt.Name                                   AS post_type,
+           u.Reputation,
+           COALESCE(v.net_votes, 0)                 AS net_votes,
+           COALESCE(v.voter_count, 0)               AS voter_count,
+           (SELECT COUNT(*) FROM Comments c
+            WHERE c.PostId = p.Id)                 AS comment_cnt,
+           COALESCE(JSON_AGG(ts.tag ORDER BY ts.tag)
+                    FILTER (WHERE ts.tag IS NOT NULL), '[]') AS tags
+    FROM Posts p
+    INNER JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId AND u.Id <> -1
+    LEFT JOIN votes_agg v ON v.PostId = p.Id
+    LEFT JOIN tags_split ts ON ts.post_id = p.Id
+    WHERE (u.Reputation > 1500 OR u.Reputation IS NULL)
+      AND p.Score IS NOT NULL
+    GROUP BY p.Id, pt.Name, u.Reputation, v.net_votes, v.voter_count
+),
+ranked AS (
+    SELECT *,
+           row_number() OVER (PARTITION BY post_type
+                              ORDER BY net_votes DESC,
+                                       comment_cnt DESC,
+                                       Score DESC) AS rn
+    FROM post_data
+),
+top5 AS (
+    SELECT * FROM ranked WHERE rn <= 5
+),
+final AS (
+    SELECT * FROM top5
+    UNION ALL
+    SELECT * FROM top5          -- set operator to mix duplicate rows
+)
+SELECT *
+FROM final
+ORDER BY post_type,
+         net_votes DESC,
+         comment_cnt DESC
+LIMIT 20;

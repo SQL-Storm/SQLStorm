@@ -1,0 +1,148 @@
+-- {"query": "9091.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2013, "output_tokens": 3505} 
+
+WITH recent_activity AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        COALESCE(u.Reputation, 0) AS OwnerReputation,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.PostTypeId
+            ORDER BY p.Score DESC
+        ) AS RN,
+        /* correlated subquery to count answers per question */
+        (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = p.Id) AS AnswerCount,
+        p.Tags
+    FROM Posts p
+    LEFT JOIN Users u
+        ON u.Id = p.OwnerUserId
+    WHERE p.CreationDate >= NOW() - INTERVAL '30 days'
+),
+tag_summary AS (
+    SELECT
+        t.TagName,
+        COUNT(DISTINCT q.Id) AS QuestionCount,
+        SUM(CASE WHEN q.Score > 0 THEN 1 ELSE 0 END) AS PositiveScoreCount
+    FROM Tags t
+    LEFT JOIN Posts q
+        ON q.PostTypeId = 1
+       AND q.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    GROUP BY t.TagName
+),
+vote_metrics AS (
+    SELECT
+        v.PostId,
+        SUM(
+          CASE
+            WHEN vt.Name = 'UpMod' THEN  1
+            WHEN vt.Name = 'DownMod' THEN -1
+            ELSE 0
+          END
+        )            AS VoteEffect,
+        COUNT(*) FILTER (WHERE vt.Name = 'Favorite') AS Favorites
+    FROM Votes v
+    JOIN VoteTypes vt
+      ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+),
+comment_cte AS (
+    SELECT
+        c.PostId,
+        COUNT(*)       AS CommentCount,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    GROUP BY c.PostId
+),
+combined AS (
+    SELECT
+        ra.Id           AS PostId,
+        ra.PostTypeId,
+        ra.OwnerUserId,
+        ra.OwnerReputation,
+        ra.AnswerCount,
+        tm.QuestionCount,
+        tm.PositiveScoreCount,
+        vm.VoteEffect,
+        vm.Favorites,
+        cc.CommentCount,
+        cc.LastCommentDate,
+        ra.Tags
+    FROM recent_activity ra
+    LEFT JOIN tag_summary tm
+      ON tm.TagName = (
+           SELECT unnest(string_to_array(trim(both '<>' FROM ra.Tags), '><'))
+           LIMIT 1
+         )
+    LEFT JOIN vote_metrics vm
+      ON vm.PostId = ra.Id
+    LEFT JOIN comment_cte cc
+      ON cc.PostId = ra.Id
+    WHERE ra.RN <= 100
+),
+ranked AS (
+    SELECT
+        *,
+        RANK() OVER (
+          PARTITION BY PostTypeId
+          ORDER BY VoteEffect DESC NULLS LAST,
+                   CommentCount DESC NULLS LAST
+        ) AS EngagementRank
+    FROM combined
+),
+final AS (
+    SELECT
+        r.PostId,
+        r.PostTypeId,
+        COALESCE(r.OwnerReputation, 0)
+      + COALESCE(r.VoteEffect,     0) * 2
+      + COALESCE(r.CommentCount,   0)       AS EngagementScore,
+        r.EngagementRank,
+        CASE
+          WHEN r.AnswerCount IS NULL OR r.AnswerCount = 0 THEN 'Unanswered'
+          WHEN r.Score < 0                         THEN 'NeedsReview'
+          WHEN r.Score > 10                        THEN 'Popular'
+          ELSE 'Active'
+        END AS EngagementLevel
+    FROM ranked r
+    WHERE r.EngagementRank <= 50
+)
+(
+    SELECT
+        f.PostId,
+        f.PostTypeId,
+        f.EngagementScore,
+        f.EngagementLevel,
+        t.TagName
+    FROM final f
+    LEFT JOIN LATERAL (
+        SELECT unnest(string_to_array(COALESCE(p.Tags,''), '><')) AS TagName
+        FROM Posts p
+        WHERE p.Id = f.PostId
+    ) t ON TRUE
+)
+UNION
+(
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Score           AS EngagementScore,
+        'Archived'        AS EngagementLevel,
+        NULL::varchar(35) AS TagName
+    FROM Posts p
+    WHERE p.CreationDate < NOW() - INTERVAL '365 days'
+)
+EXCEPT
+(
+    SELECT
+        p3.Id,
+        p3.PostTypeId,
+        p3.Score           AS EngagementScore,
+        'Archived'         AS EngagementLevel,
+        NULL::varchar(35)  AS TagName
+    FROM Posts p3
+    WHERE p3.Score < 0
+)
+ORDER BY EngagementScore DESC, PostId
+LIMIT 100;

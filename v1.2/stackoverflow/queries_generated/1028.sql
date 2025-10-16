@@ -1,0 +1,186 @@
+-- {"query": "1028.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1861} 
+
+WITH RankedAnswers AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate,
+        ROW_NUMBER() OVER (
+            PARTITION BY a.ParentId
+            ORDER BY a.Score DESC, a.CreationDate
+        ) AS AnswerRank,
+        COUNT(*) OVER (PARTITION BY a.ParentId) AS AnswerCount
+    FROM
+        Posts a
+    WHERE
+        a.PostTypeId = 2
+),
+QuestionStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.Tags,
+        q.OwnerUserId,
+        q.CreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        COALESCE(q.AnswerCount, 0) AS CachedAnswerCount,
+        COALESCE(q.FavoriteCount, 0) AS FavoriteCount,
+        MAX(v.Score) FILTER (WHERE v.VoteTypeId IN (2,3)) OVER (PARTITION BY q.Id) AS MaxVoteScore,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT c.Id) FILTER (WHERE c.CreationDate > q.CreationDate) AS LaterComments,
+        STRING_AGG(DISTINCT pht.Name, ', ') AS PostHistoryEvents
+    FROM Posts q
+    LEFT JOIN Votes v ON v.PostId = q.Id
+    LEFT JOIN Badges b ON b.UserId = q.OwnerUserId
+    LEFT JOIN Comments c ON c.PostId = q.Id AND c.CreationDate > q.CreationDate
+    LEFT JOIN PostHistory ph ON ph.PostId = q.Id
+    LEFT JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.Tags, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, q.FavoriteCount
+),
+TopAnswers AS (
+    SELECT
+        ra.AnswerId,
+        ra.QuestionId,
+        ra.OwnerUserId AS AnswerOwnerUserId,
+        ra.Score AS AnswerScore,
+        ra.CreationDate AS AnswerCreationDate,
+        ra.AnswerRank,
+        ra.AnswerCount
+    FROM RankedAnswers ra
+    WHERE ra.AnswerRank <= 3
+),
+UserAggregates AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersCount,
+        COUNT(DISTINCT b.Id) AS UserBadges,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1, 2)) AS AvgPostScore,
+        SUM(COALESCE(v.BountyAmount,0)) AS TotalBountyGiven,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id AND v.VoteTypeId = 8 -- BountyStart
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+DuplicateLinksCTE AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkTypeName,
+        p1.Title AS OriginalPostTitle,
+        p2.Title AS RelatedPostTitle
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    JOIN Posts p1 ON pl.PostId = p1.Id
+    JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+    WHERE lt.Name = 'Duplicate'
+),
+FilteredBadges AS (
+    SELECT
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Class,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS RecentBadgeRank
+    FROM Badges b
+    WHERE b.Class IN (1,2) AND b.TagBased = 0
+),
+RecentBadges AS (
+    SELECT UserId, BadgeName, Class
+    FROM FilteredBadges
+    WHERE RecentBadgeRank <= 3
+),
+AnswerDetailsWithComments AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate,
+        COUNT(c.Id) AS CommentCount,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Posts a
+    LEFT JOIN Comments c ON c.PostId = a.Id
+    WHERE a.PostTypeId = 2
+    GROUP BY a.Id, a.ParentId, a.OwnerUserId, a.Score, a.CreationDate
+)
+SELECT
+    qs.QuestionId,
+    qs.Title,
+    qs.Tags,
+    qs.OwnerUserId,
+    u.DisplayName AS QuestionOwnerName,
+    qs.CreationDate AS QuestionCreationDate,
+    qs.QuestionScore,
+    qs.ViewCount,
+    qs.CachedAnswerCount,
+    qs.FavoriteCount,
+    CASE
+        WHEN qs.MaxVoteScore IS NULL THEN 0 ELSE qs.MaxVoteScore
+    END AS MaxVoteScore,
+    COALESCE(qs.BadgeCount,0) AS BadgeCount,
+    COALESCE(qs.LaterComments,0) AS LaterCommentsCount,
+    qs.PostHistoryEvents,
+    ta.AnswerId,
+    ta.AnswerOwnerUserId,
+    u2.DisplayName AS AnswerOwnerName,
+    ta.AnswerScore,
+    ta.AnswerCreationDate,
+    ta.AnswerRank,
+    ua.Reputation,
+    ua.QuestionsCount,
+    ua.AnswersCount,
+    ua.UserBadges,
+    ua.AvgPostScore,
+    ua.TotalBountyGiven,
+    ua.ReputationRank,
+    db.BadgeName AS RecentGoldOrSilverBadge,
+    CONCAT(
+        CASE WHEN p.OwnerUserId IS NULL THEN 'Community' ELSE u3.DisplayName END,
+        ' (', COALESCE(p.Score,0), ' pts, ', COALESCE(p.ViewCount,0), ' views)'
+    ) AS LinkedDuplicatePostSummary,
+    adc.CommentCount AS AnswerCommentCount,
+    adc.LastCommentDate AS LastAnswerCommentDate,
+    STRING_AGG(DISTINCT dl.LinkTypeName, ', ') AS DuplicateLinkTypes,
+    COALESCE(pl.LinkTypeId, -1) AS SampleLinkTypeId,
+    CASE
+        WHEN qs.FavoriteCount > 10 AND qs.QuestionScore > 5 THEN 'HOT QUESTION'
+        WHEN qs.FavoriteCount > 0 AND qs.QuestionScore BETWEEN 1 AND 5 THEN 'WARM QUESTION'
+        ELSE 'NORMAL QUESTION'
+    END AS QuestionHeatStatus
+FROM QuestionStats qs
+LEFT JOIN TopAnswers ta ON ta.QuestionId = qs.QuestionId
+LEFT JOIN Users u ON u.Id = qs.OwnerUserId
+LEFT JOIN Users u2 ON u2.Id = ta.AnswerOwnerUserId
+LEFT JOIN UserAggregates ua ON ua.UserId = qs.OwnerUserId
+LEFT JOIN RecentBadges db ON db.UserId = qs.OwnerUserId
+LEFT JOIN Posts p ON p.Id = (
+    SELECT RelatedPostId FROM PostLinks pl2 WHERE pl2.PostId = qs.QuestionId AND pl2.LinkTypeId = 3 LIMIT 1
+)
+LEFT JOIN Users u3 ON u3.Id = p.OwnerUserId
+LEFT JOIN AnswerDetailsWithComments adc ON adc.AnswerId = ta.AnswerId
+LEFT JOIN DuplicateLinksCTE dl ON dl.PostId = qs.QuestionId
+LEFT JOIN PostLinks pl ON pl.PostId = qs.QuestionId
+WHERE qs.FavoriteCount IS NOT NULL
+GROUP BY
+    qs.QuestionId, qs.Title, qs.Tags, qs.OwnerUserId, u.DisplayName, qs.CreationDate,
+    qs.QuestionScore, qs.ViewCount, qs.CachedAnswerCount, qs.FavoriteCount, qs.MaxVoteScore,
+    qs.BadgeCount, qs.LaterComments, qs.PostHistoryEvents,
+    ta.AnswerId, ta.AnswerOwnerUserId, u2.DisplayName, ta.AnswerScore, ta.AnswerCreationDate, ta.AnswerRank,
+    ua.Reputation, ua.QuestionsCount, ua.AnswersCount, ua.UserBadges, ua.AvgPostScore, ua.TotalBountyGiven, ua.ReputationRank,
+    db.BadgeName, p.OwnerUserId, u3.DisplayName, p.Score, p.ViewCount,
+    adc.CommentCount, adc.LastCommentDate,
+    pl.LinkTypeId
+ORDER BY
+    qs.CachedAnswerCount DESC,
+    qs.FavoriteCount DESC,
+    ua.ReputationRank ASC,
+    ta.AnswerRank
+LIMIT 100;

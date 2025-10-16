@@ -1,0 +1,55 @@
+-- {"query": "2035.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4o", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 420} 
+
+WITH UserReputationRank AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS Rank
+    FROM Users u
+),
+TopTags AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        SUM(p.Score) AS TotalScore
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE p.PostTypeId = 1
+    GROUP BY t.Id, t.TagName
+    HAVING SUM(p.Score) > 1000
+),
+AnsweredByTopUsers AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        u.DisplayName AS AnsweredBy,
+        u.Rank
+    FROM Posts p
+    LEFT JOIN UserReputationRank u ON p.OwnerUserId = u.UserId
+    WHERE p.PostTypeId = 2 AND u.Rank <= 10
+),
+QuestionTagsAndAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title AS QuestionTitle,
+        GROUP_CONCAT(DISTINCT t.TagName ORDER BY t.TagName) AS TagList,
+        COALESCE(SUM(a.Score), 0) AS TotalAnswerScore
+    FROM Posts q
+    LEFT JOIN AnsweredByTopUsers a ON q.AcceptedAnswerId = a.PostId
+    LEFT JOIN TopTags t ON q.Tags LIKE '%' || t.TagName || '%'
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title
+)
+SELECT
+    qt.QuestionTitle,
+    qt.TagList,
+    qt.TotalAnswerScore,
+    CASE
+        WHEN qt.TotalAnswerScore > 100 THEN 'High'
+        WHEN qt.TotalAnswerScore BETWEEN 50 AND 100 THEN 'Medium'
+        ELSE 'Low'
+    END AS AnswerQuality
+FROM QuestionTagsAndAnswers qt
+ORDER BY qt.TotalAnswerScore DESC, qt.QuestionTitle ASC;

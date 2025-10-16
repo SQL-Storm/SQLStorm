@@ -1,0 +1,85 @@
+WITH RankedAnswers AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId,
+        a.Score AS AnswerScore,
+        ROW_NUMBER() OVER(PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS RankByScore,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        COUNT(c.Id) AS CommentCount,
+        AVG(CASE WHEN c.Score > 0 THEN c.Score ELSE NULL END) AS AvgPositiveCommentScore,
+        a.CreationDate AS AnswerCreationDate,
+        q.OwnerUserId AS QuestionOwnerUserId,
+        q.CreationDate AS QuestionCreationDate,
+        q.Tags,
+        q.ViewCount AS QuestionViewCount,
+        CAST(EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) / 86400 AS INTEGER) AS DaysBetweenQuestionAndAnswer
+    FROM Posts a
+    JOIN Posts q ON a.ParentId = q.Id
+    LEFT JOIN Votes v ON a.Id = v.PostId AND v.VoteTypeId = 2
+    LEFT JOIN Comments c ON a.Id = c.PostId
+    WHERE a.PostTypeId = 2
+      AND q.PostTypeId = 1
+      AND a.OwnerUserId IS NOT NULL
+      AND q.OwnerUserId IS NOT NULL
+      AND q.Tags LIKE '%<sql>%'
+      AND q.ClosedDate IS NULL
+    GROUP BY a.Id, a.ParentId, a.OwnerUserId, a.Score, a.CreationDate, q.OwnerUserId, q.CreationDate, q.Tags, q.ViewCount
+),
+UserActivity AS (
+    SELECT
+        ph.UserId,
+        COUNT(DISTINCT ph.PostId) AS EditedPostCount,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+      AND ph.UserId IS NOT NULL
+    GROUP BY ph.UserId
+),
+TopUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS UserRank
+    FROM Users u
+    WHERE u.Reputation > 10000
+)
+SELECT
+    r.AnswerId,
+    r.QuestionId,
+    r.AnswerScore,
+    r.RankByScore,
+    r.UpVoteCount,
+    r.CommentCount,
+    r.AvgPositiveCommentScore,
+    r.DaysBetweenQuestionAndAnswer,
+    tu.DisplayName AS TopAnswererDisplayName,
+    tu.Reputation AS TopAnswererReputation,
+    ua.EditedPostCount AS AnswererEditedPostCount,
+    ua.LastEditDate AS AnswererLastEditDate,
+    CASE
+        WHEN r.AnswerScore > 50 THEN 'High Score'
+        WHEN r.AnswerScore BETWEEN 10 AND 50 THEN 'Medium Score'
+        ELSE 'Low Score'
+    END AS ScoreCategory,
+    CONCAT(q.OwnerDisplayName, ' (', q.OwnerUserId, ')') AS QuestionOwnerInfo,
+    UPPER(REPLACE(r.Tags, '<sql>', 'SQL_TAGGED_')) AS ProcessedTags,
+    CASE WHEN r.AnswerCreationDate < (q.CreationDate + INTERVAL '1' DAY) THEN TRUE ELSE FALSE END AS AnsweredWithinADay,
+    r.QuestionViewCount,
+    CASE
+        WHEN r.AvgPositiveCommentScore IS NULL THEN 0
+        WHEN r.AvgPositiveCommentScore > 5 THEN 1
+        ELSE 0
+    END AS HasHighlyRatedComments
+FROM RankedAnswers r
+JOIN TopUsers tu ON r.OwnerUserId = tu.UserId
+LEFT JOIN UserActivity ua ON r.OwnerUserId = ua.UserId
+LEFT JOIN Posts q ON r.QuestionId = q.Id
+WHERE r.RankByScore <= 5
+  AND r.AnswerScore > 0
+  AND r.DaysBetweenQuestionAndAnswer BETWEEN 0 AND 30
+  AND tu.UserRank <= 100
+ORDER BY r.QuestionId, r.RankByScore;

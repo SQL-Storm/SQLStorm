@@ -1,0 +1,148 @@
+-- {"query": "19022.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2445} 
+
+WITH UserEngagement AS (
+    -- Summarizes user activity, including total posts, comments, upvotes, and reputation
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentScore,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        MAX(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge,
+        AVG(EXTRACT(EPOCH FROM (P.LastActivityDate - P.CreationDate))) FILTER (WHERE P.Id IS NOT NULL) AS AvgPostActivityDurationSeconds,
+        (SELECT COUNT(DISTINCT V.PostId) FROM Votes V WHERE V.UserId = U.Id AND V.VoteTypeId IN (5, 8)) AS BookmarksAndBounties, -- Non-correlated subquery for specific vote types by user
+        RANK() OVER (ORDER BY U.Reputation DESC, U.CreationDate ASC) AS UserReputationRank
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+PostDetailsExtended AS (
+    -- Aggregates post-specific details, including edit history and answer performance. Focus on Questions.
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.Title,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.OwnerUserId,
+        P.LastActivityDate,
+        P.ClosedDate,
+        P.LastEditDate, -- Needed for LAG
+        (SELECT COUNT(PH_EDITS.Id) FROM PostHistory PH_EDITS WHERE PH_EDITS.PostId = P.Id AND PH_EDITS.PostHistoryTypeId IN (4, 5, 6)) AS EditCount, -- Correlated subquery for edit history
+        (SELECT MAX(PH_COMMUNITY.CreationDate) FROM PostHistory PH_COMMUNITY WHERE PH_COMMUNITY.PostId = P.Id AND PH_COMMUNITY.PostHistoryTypeId = 16) AS CommunityOwnedDateFromHistory, -- Correlated subquery for community owned date
+        -- Calculate the "hotness score" of a post
+        (P.Score * 0.7 + COALESCE(P.ViewCount, 0) * 0.05 + COALESCE(P.AnswerCount, 0) * 0.2 + COALESCE(P.FavoriteCount, 0) * 0.5) AS HotnessScore,
+        LAG(P.LastEditDate, 1, P.CreationDate) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS PreviousPostEditDate,
+        (
+            SELECT ARRAY_AGG(DISTINCT t_val)
+            FROM UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><')) AS t(t_val)
+            WHERE t_val IS NOT NULL
+        ) AS TagArray, -- String expression for tag processing
+        CASE
+            WHEN P.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN P.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            WHEN P.AnswerCount > 0 THEN 'Has Answers'
+            ELSE 'Open'
+        END AS PostStatus
+    FROM Posts P
+    WHERE P.PostTypeId = 1 -- Only questions in this CTE to focus analysis
+),
+AnswerPerformance AS (
+    -- Analyzes answer performance for questions by aggregating their answers
+    SELECT
+        Q.Id AS QuestionId,
+        Q.CreationDate AS QuestionCreationDate,
+        COUNT(A.Id) AS TotalAnswersReceived,
+        SUM(A.Score) AS TotalAnswerScore,
+        AVG(A.Score) AS AverageAnswerScore,
+        MIN(A.CreationDate) AS FirstAnswerDate,
+        MAX(A.CreationDate) AS LastAnswerDate,
+        SUM(CASE WHEN A.Id = Q.AcceptedAnswerId THEN A.Score ELSE 0 END) AS AcceptedAnswerScore,
+        (SELECT AVG(CASE WHEN V.VoteTypeId = 2 THEN 1.0 ELSE 0.0 END) FROM Votes V WHERE V.PostId = Q.Id AND V.VoteTypeId IN (2,3)) AS UpvoteRatioForQuestion,
+        EXTRACT(EPOCH FROM (MIN(A.CreationDate) - Q.CreationDate)) / 3600.0 AS TimeToFirstAnswerHours -- Calculation
+    FROM Posts Q
+    INNER JOIN Posts A ON Q.Id = A.ParentId
+    WHERE Q.PostTypeId = 1 AND A.PostTypeId = 2
+    GROUP BY Q.Id, Q.CreationDate, Q.AcceptedAnswerId
+),
+ModerationActivity AS (
+    -- Tracks moderation-related post history events and aggregates close reasons
+    SELECT
+        PH.PostId,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (10, 12, 14) THEN 1 END) AS TotalModerationActions, -- Close, Delete, Lock
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate ELSE NULL END) AS LastClosedDate,
+        STRING_AGG(DISTINCT CRT.Name, ', ') FILTER (WHERE PH.PostHistoryTypeId = 10) AS CloseReasonNames -- String aggregation
+    FROM PostHistory PH
+    LEFT JOIN CloseReasonTypes CRT ON PH.PostHistoryTypeId = 10 AND PH.Comment = CAST(CRT.Id AS VARCHAR)
+    WHERE PH.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20) -- Closed, Reopened, Deleted, Undeleted, Locked, Unlocked, Protected, Unprotected
+    GROUP BY PH.PostId
+)
+-- Main Query: Combine all CTEs and perform final aggregations/filters to find high-impact questions by engaged users
+SELECT
+    UE.UserId,
+    COALESCE(UE.DisplayName, 'Anonymous User') AS UserDisplayName, -- NULL Logic
+    UE.Reputation,
+    UE.UserCreationDate,
+    UE.TotalQuestions,
+    UE.TotalAnswers,
+    PDE.PostId,
+    PDE.Title,
+    PDE.PostCreationDate,
+    PDE.PostScore,
+    PDE.ViewCount,
+    PDE.AnswerCount AS PostAnswerCount,
+    PDE.CommentCount AS PostCommentCount,
+    PDE.HotnessScore,
+    PDE.EditCount,
+    PDE.PostStatus,
+    AP.TotalAnswersReceived,
+    AP.AverageAnswerScore,
+    AP.TimeToFirstAnswerHours,
+    MA.TotalModerationActions,
+    MA.CloseReasonNames,
+    COALESCE(PDE.CommunityOwnedDateFromHistory, '1900-01-01 00:00:00'::TIMESTAMP) AS EffectiveCommunityOwnedDate, -- NULL Logic (COALESCE)
+    (
+        SELECT SUM(V_BOUNTY.BountyAmount)
+        FROM Votes V_BOUNTY
+        WHERE V_BOUNTY.PostId = PDE.PostId
+          AND V_BOUNTY.VoteTypeId = 8
+          AND V_BOUNTY.UserId = UE.UserId -- Correlated subquery: bounties started by THIS user on THIS post
+    ) AS BountyStartedByOwner,
+    DENSE_RANK() OVER (PARTITION BY UE.UserId ORDER BY PDE.HotnessScore DESC, PDE.CreationDate DESC) AS UserPostHotnessRank, -- Window function
+    NTILE(5) OVER (ORDER BY UE.Reputation DESC) AS ReputationQuintile, -- Window function
+    ARRAY_TO_STRING(PDE.TagArray, ', ') AS TagsList, -- String expression: convert array to string
+    LEAD(PDE.PostCreationDate, 1) OVER (PARTITION BY UE.UserId ORDER BY PDE.PostCreationDate) AS NextPostCreationDate, -- Window function
+    (SELECT COUNT(DISTINCT V_FAV.UserId) FROM Votes V_FAV WHERE V_FAV.PostId = PDE.PostId AND V_FAV.VoteTypeId = 5) AS TotalFavoritesOnPost -- Correlated subquery for favorite count
+FROM UserEngagement UE
+LEFT JOIN PostDetailsExtended PDE ON UE.UserId = PDE.OwnerUserId
+LEFT JOIN AnswerPerformance AP ON PDE.PostId = AP.QuestionId
+LEFT JOIN ModerationActivity MA ON PDE.PostId = MA.PostId
+WHERE
+    UE.Reputation >= 1000 -- Filter for more active/established users
+    AND PDE.PostId IS NOT NULL -- Ensure only users with at least one question matching criteria are included
+    AND PDE.PostScore > (SELECT AVG(P_inner.Score) FROM Posts P_inner WHERE P_inner.PostTypeId = 1 AND P_inner.CreationDate >= (SELECT MIN(U_inner.CreationDate) FROM Users U_inner WHERE U_inner.Reputation >= 1000)) -- Non-correlated subquery for dynamic average score
+    AND PDE.PostCreationDate > (UE.LastAccessDate - INTERVAL '1 year') -- Posts within the last year relative to user's last access
+    AND PDE.Title ILIKE '%SQL%' -- String expression (ILIKE for case-insensitive search)
+    AND (
+        (PDE.PostStatus = 'Closed' AND MA.TotalModerationActions > 0) OR
+        (PDE.PostStatus = 'Answered' AND AP.TimeToFirstAnswerHours < 24 AND AP.AverageAnswerScore > 5) OR
+        (PDE.TagArray @> ARRAY['python', 'javascript'] AND PDE.EditCount > 1 AND PDE.PostScore > 10) -- Complicated predicate: array check, multiple ANDs
+    ) -- Complicated predicate combining multiple conditions with OR
+ORDER BY
+    UE.Reputation DESC,
+    PDE.HotnessScore DESC,
+    PDE.PostCreationDate DESC
+LIMIT 1000;

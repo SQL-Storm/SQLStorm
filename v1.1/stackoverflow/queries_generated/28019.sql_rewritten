@@ -1,0 +1,65 @@
+-- {"query": "28019.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "deepseek-r1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1346} 
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS Upvotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS Downvotes,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id
+),
+BadgeSummary AS (
+    SELECT 
+        UserId,
+        Class,
+        COUNT(*) AS BadgeCount,
+        RANK() OVER (PARTITION BY Class ORDER BY COUNT(*) DESC) AS BadgeRank
+    FROM Badges
+    GROUP BY UserId, Class
+),
+PostTags AS (
+    SELECT 
+        OwnerUserId,
+        CARDINALITY(STRING_TO_ARRAY(SUBSTRING(Tags, 2, LENGTH(Tags)-2), '><')) AS TagCount,
+        AVG(Score) OVER (PARTITION BY OwnerUserId) AS AvgPostScore
+    FROM Posts
+    WHERE PostTypeId = 1 AND Tags IS NOT NULL
+)
+SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(ua.PostCount, 0) * 10 + COALESCE(ua.CommentCount, 0) * 5 AS ActivityScore,
+    (ua.Upvotes - ua.Downvotes) * 1.0 / NULLIF(ua.Upvotes + ua.Downvotes, 0) AS VoteRatio,
+    bs_g.BadgeCount AS GoldBadges,
+    bs_s.BadgeCount AS SilverBadges,
+    bs_b.BadgeRank AS BronzeBadgeRank,
+    pt.TagCount AS AvgTagsPerPost,
+    pt.AvgPostScore,
+    (SELECT p.Title FROM Posts p WHERE p.OwnerUserId = u.Id ORDER BY p.CreationDate DESC LIMIT 1) AS LatestPostTitle,
+    CASE 
+        WHEN u.Reputation > 100000 THEN 'Legendary'
+        WHEN u.Reputation BETWEEN 50000 AND 100000 THEN 'Epic'
+        WHEN u.Reputation BETWEEN 20000 AND 49999 THEN 'Mythic'
+        ELSE 'Regular'
+    END AS ReputationTier
+FROM Users u
+LEFT JOIN UserActivity ua ON u.Id = ua.UserId
+LEFT JOIN BadgeSummary bs_g ON u.Id = bs_g.UserId AND bs_g.Class = 1
+LEFT JOIN BadgeSummary bs_s ON u.Id = bs_s.UserId AND bs_s.Class = 2
+LEFT JOIN BadgeSummary bs_b ON u.Id = bs_b.UserId AND bs_b.Class = 3
+LEFT JOIN PostTags pt ON u.Id = pt.OwnerUserId
+WHERE u.CreationDate BETWEEN '2010-01-01' AND '2023-12-31'
+    AND u.Reputation > 1000
+    AND EXISTS (
+        SELECT 1 FROM PostHistory ph 
+        WHERE ph.UserId = u.Id 
+        AND ph.PostHistoryTypeId IN (2,5,8)
+    )
+ORDER BY ActivityScore DESC, Reputation DESC
+FETCH FIRST 100 ROWS ONLY;

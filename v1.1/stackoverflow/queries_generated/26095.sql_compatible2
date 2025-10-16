@@ -1,0 +1,87 @@
+WITH ranked_posts AS (
+  SELECT
+    p.*,
+    ROW_NUMBER() OVER (ORDER BY p.Score DESC) AS score_rank,
+    ROW_NUMBER() OVER (ORDER BY p.ViewCount DESC) AS view_rank,
+    ROW_NUMBER() OVER (ORDER BY p.CommentCount DESC) AS comment_rank,
+    ROW_NUMBER() OVER (ORDER BY p.FavoriteCount DESC) AS favorite_rank
+  FROM Posts p
+),
+top_10_posts AS (
+  SELECT *
+  FROM ranked_posts
+  WHERE score_rank <= 10 OR view_rank <= 10 OR comment_rank <= 10 OR favorite_rank <= 10
+),
+user_reputation AS (
+  SELECT 
+    u.Id, 
+    u.Reputation, 
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes, 
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes
+  FROM 
+    Users u
+  LEFT JOIN 
+    Votes v ON u.Id = v.UserId
+  GROUP BY 
+    u.Id, u.Reputation
+),
+post_history_stats AS (
+  SELECT 
+    ph.PostId, 
+    SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS close_votes, 
+    SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS reopen_votes
+  FROM 
+    PostHistory ph
+  GROUP BY 
+    ph.PostId
+)
+SELECT 
+  p.Id, 
+  p.Title, 
+  p.Score, 
+  p.ViewCount, 
+  p.CommentCount, 
+  p.FavoriteCount, 
+  ur.Reputation, 
+  ur.upvotes, 
+  ur.downvotes, 
+  phs.close_votes, 
+  phs.reopen_votes,
+  CASE 
+    WHEN p.Score > 100 AND p.ViewCount > 1000 THEN 'Highly Rated and Viewed'
+    WHEN p.Score > 50 AND p.ViewCount > 500 THEN 'Well Rated and Viewed'
+    ELSE 'Low Rated and Viewed'
+  END AS post_rating,
+  CASE 
+    WHEN ur.Reputation > 10000 THEN 'High Reputation'
+    WHEN ur.Reputation > 5000 THEN 'Medium Reputation'
+    ELSE 'Low Reputation'
+  END AS user_reputation_level,
+  p.score_rank, p.view_rank, p.comment_rank, p.favorite_rank
+FROM 
+  top_10_posts p
+JOIN 
+  Users u ON p.OwnerUserId = u.Id
+JOIN 
+  user_reputation ur ON u.Id = ur.Id
+LEFT JOIN 
+  post_history_stats phs ON p.Id = phs.PostId
+GROUP BY
+  p.Id,
+  p.Title,
+  p.Score,
+  p.ViewCount,
+  p.CommentCount,
+  p.FavoriteCount,
+  ur.Reputation,
+  ur.upvotes,
+  ur.downvotes,
+  phs.close_votes,
+  phs.reopen_votes,
+  p.score_rank,
+  p.view_rank,
+  p.comment_rank,
+  p.favorite_rank,
+  p.OwnerUserId
+ORDER BY 
+  p.score_rank, p.view_rank, p.comment_rank, p.favorite_rank;

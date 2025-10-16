@@ -1,0 +1,188 @@
+-- {"query": "603.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1680} 
+with RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 as Level
+    from Tags t
+    where t.IsRequired = 1
+    union all
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        r.Level + 1
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id = r.Id + 1 and t.IsRequired = 1
+),
+UserBadgeCounts as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        coalesce(sum(case when b.TagBased = 1 then 1 else 0 end),0) as TagBasedBadges
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName
+),
+PostScoreRanks as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        rank() over (partition by p.PostTypeId order by p.Score desc, p.CreationDate) as ScoreRank,
+        dense_rank() over (partition by p.PostTypeId order by p.Score desc, p.CreationDate) as ScoreDenseRank,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.CreationDate) as ScoreRowNumber
+    from Posts p
+    where p.PostTypeId in (1,2)
+),
+PostCommentsAggregated as (
+    select
+        p.Id as PostId,
+        count(c.Id) as TotalComments,
+        sum(case when c.Score > 0 then 1 else 0 end) as PositiveComments,
+        sum(case when c.Score <= 0 then 1 else 0 end) as NonPositiveComments,
+        max(c.CreationDate) as LastCommentDate
+    from Posts p
+    left join Comments c on p.Id = c.PostId
+    group by p.Id
+),
+DuplicateLinkCounts as (
+    select
+        pl.PostId,
+        count(pl.Id) filter (where pl.LinkTypeId = 3) as DuplicateCount,
+        count(pl.Id) filter (where pl.LinkTypeId = 1) as LinkedCount
+    from PostLinks pl
+    group by pl.PostId
+),
+PostWithVotes as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        pv.UpVotes,
+        pv.DownVotes,
+        pv.AcceptedVotes,
+        pv.BountyVotes
+    from Posts p
+    left join (
+        select 
+            v.PostId,
+            sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+            sum(case when v.VoteTypeId = 1 then 1 else 0 end) as AcceptedVotes,
+            sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as BountyVotes
+        from Votes v
+        group by v.PostId
+    ) pv on p.Id = pv.PostId
+),
+ComplexUserStats as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        ubc.GoldBadges,
+        ubc.SilverBadges,
+        ubc.BronzeBadges,
+        ubc.TagBasedBadges,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+        coalesce(sum(p.Score),0) as TotalPostScore,
+        coalesce(avg(p.Score),0) as AvgPostScore,
+        max(p.CreationDate) as LastPostDate,
+        count(distinct c.Id) as CommentsCount
+    from Users u
+    left join Posts p on u.Id = p.OwnerUserId
+    left join Badges b on u.Id = b.UserId
+    left join UserBadgeCounts ubc on u.Id = ubc.UserId
+    left join Comments c on u.Id = c.UserId
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.Views, u.UpVotes, u.DownVotes, ubc.GoldBadges, ubc.SilverBadges, ubc.BronzeBadges, ubc.TagBasedBadges
+),
+RecentClosedQuestions as (
+    select 
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.ClosedDate,
+        ph.Comment as CloseReason,
+        crt.Name as CloseReasonName
+    from Posts p
+    join PostHistory ph on p.Id = ph.PostId and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes crt on cast(ph.Comment as int) = crt.Id
+    where p.PostTypeId = 1 and p.ClosedDate is not null and p.ClosedDate > current_date - interval '180 days'
+),
+FinalSelection as (
+    select 
+        p.Id as PostId,
+        p.Title,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        coalesce(pc.TotalComments,0) as CommentCount,
+        coalesce(dl.DuplicateCount,0) as DuplicateLinkCount,
+        coalesce(dl.LinkedCount,0) as LinkedCount,
+        pvu.UpVotes,
+        pvu.DownVotes,
+        pvu.AcceptedVotes,
+        pvu.BountyVotes,
+        psr.ScoreRank,
+        psr.ScoreDenseRank,
+        psr.ScoreRowNumber,
+        rq.ClosedDate,
+        rq.CloseReasonName,
+        us.Reputation as OwnerReputation,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        us.TagBasedBadges,
+        us.QuestionsCount,
+        us.AnswersCount,
+        us.TotalPostScore,
+        us.AvgPostScore,
+        us.LastPostDate,
+        us.CommentsCount
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    left join PostCommentsAggregated pc on p.Id = pc.PostId
+    left join DuplicateLinkCounts dl on p.Id = dl.PostId
+    left join PostWithVotes pvu on p.Id = pvu.Id
+    left join PostScoreRanks psr on p.Id = psr.Id
+    left join RecentClosedQuestions rq on p.Id = rq.Id
+    left join ComplexUserStats us on p.OwnerUserId = us.Id
+    where p.PostTypeId in (1,2)
+)
+select * from FinalSelection
+where 
+    (Score > 10 or ViewCount > 1000 or CommentCount > 5) 
+    and (ClosedDate is null or ClosedDate > current_date - interval '90 days')
+    and (GoldBadges + SilverBadges + BronzeBadges) > 0
+order by ScoreRank, ViewCount desc, CommentCount desc
+limit 100;

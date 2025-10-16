@@ -1,0 +1,122 @@
+WITH
+  RankedAnswers AS (
+    SELECT
+      p.Id AS PostId,
+      p.ParentId AS QuestionId,
+      p.OwnerUserId,
+      p.CreationDate AS AnswerCreationDate,
+      ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS Rank
+    FROM Posts p
+    WHERE
+      p.PostTypeId = 2 AND p.ParentId IS NOT NULL
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      COUNT(DISTINCT ph.PostId) AS PostHistoryCount,
+      SUM(CASE WHEN ph.PostHistoryTypeId IN (2, 5) THEN 1 ELSE 0 END) AS BodyEditCount,
+      AVG(EXTRACT(EPOCH FROM (ph.CreationDate - p.CreationDate)) / 86400.0) AS AvgDaysToFirstEdit
+    FROM Users u
+    LEFT JOIN PostHistory ph
+      ON u.Id = ph.UserId
+    LEFT JOIN Posts p
+      ON ph.PostId = p.Id
+    WHERE
+      u.Id <> -1
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation
+  ),
+  HotQuestions AS (
+    SELECT
+      Id,
+      Title,
+      Score,
+      ViewCount,
+      AnswerCount,
+      FavoriteCount,
+      CreationDate,
+      OwnerUserId,
+      Tags,
+      ROW_NUMBER() OVER (ORDER BY Score DESC, ViewCount DESC, FavoriteCount DESC, CreationDate DESC) AS HotRank
+    FROM Posts
+    WHERE
+      PostTypeId = 1 AND Score > 100 AND ViewCount > 1000 AND AnswerCount > 5
+  )
+SELECT
+  hq.Title AS QuestionTitle,
+  hq.Score AS QuestionScore,
+  hq.ViewCount AS QuestionViewCount,
+  hq.FavoriteCount AS QuestionFavoriteCount,
+  ua.DisplayName AS OwnerDisplayName,
+  ua.Reputation AS OwnerReputation,
+  ra.AnswerCreationDate AS BestAnswerCreationDate,
+  ra.Rank AS BestAnswerRank,
+  CASE WHEN p_closed.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS QuestionStatus,
+  COALESCE(ua.BodyEditCount, 0) AS OwnerBodyEdits,
+  COALESCE(ua.AvgDaysToFirstEdit, 0) AS AvgDaysToFirstEditByOwner,
+  p_tags.TagName AS PrimaryTag,
+  COUNT(c.Id) AS CommentCountOnQuestion,
+  hq.HotRank
+FROM HotQuestions hq
+JOIN Users ua
+  ON hq.OwnerUserId = ua.Id
+LEFT JOIN RankedAnswers ra
+  ON hq.Id = ra.QuestionId AND ra.Rank = 1
+LEFT JOIN Posts p_closed
+  ON hq.Id = p_closed.Id
+LEFT JOIN Tags p_tags
+  ON hq.Id = p_tags.WikiPostId
+     AND p_tags.TagName IN (
+       SELECT
+         SUBSTRING(value FROM 2 FOR CHAR_LENGTH(value) - 2)
+       FROM (
+         SELECT value
+         FROM regexp_split_to_table(REPLACE(REPLACE(hq.Tags, '<', '>'), '><', '<'), '>') AS t(value)
+       ) s
+       WHERE CHAR_LENGTH(value) > 0
+     )
+     AND p_tags.Id = (
+       SELECT
+         MIN(t2.Id)
+       FROM Tags t2
+       WHERE
+         t2.TagName IN (
+           SELECT
+             SUBSTRING(value FROM 2 FOR CHAR_LENGTH(value) - 2)
+           FROM (
+             SELECT value
+             FROM regexp_split_to_table(REPLACE(REPLACE(hq.Tags, '<', '>'), '><', '<'), '>') AS t(value)
+           ) s2
+           WHERE CHAR_LENGTH(value) > 0
+         )
+     )
+LEFT JOIN Comments c
+  ON hq.Id = c.PostId
+WHERE
+  ua.Location IS NOT NULL
+  AND ua.WebsiteUrl IS NOT NULL
+  AND ua.AboutMe IS NOT NULL
+  AND CHAR_LENGTH(ua.AboutMe) > 100
+GROUP BY
+  hq.Title,
+  hq.Score,
+  hq.ViewCount,
+  hq.FavoriteCount,
+  ua.DisplayName,
+  ua.Reputation,
+  ra.AnswerCreationDate,
+  ra.Rank,
+  CASE WHEN p_closed.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END,
+  COALESCE(ua.BodyEditCount, 0),
+  COALESCE(ua.AvgDaysToFirstEdit, 0),
+  p_tags.TagName,
+  hq.HotRank
+HAVING
+  COUNT(c.Id) > 5
+ORDER BY
+  hq.HotRank,
+  OwnerReputation DESC;

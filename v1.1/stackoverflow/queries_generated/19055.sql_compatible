@@ -1,0 +1,258 @@
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(p.ViewCount, 0)) AS TotalPostViews,
+        MAX(p.LastActivityDate) AS LatestPostActivity,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesGiven
+    FROM
+        Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+    HAVING
+        u.Reputation > 1000
+        AND COUNT(DISTINCT p.Id) > 5
+        AND u.LastAccessDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+),
+PostDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.CreationDate ELSE NULL END) AS LastBodyOrTitleEdit,
+        COUNT(ph_edit.Id) AS EditCount,
+        STRING_AGG(DISTINCT crt.Name, '; ') FILTER (WHERE ph_close.PostHistoryTypeId = 10) AS CloseReasons,
+        LAG(p.LastActivityDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate) AS PreviousPostActivityDate,
+        AVG(COALESCE(c.Score, 0)) AS AverageCommentScore -- Average score of comments on THIS post
+    FROM
+        Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (4, 5, 6)
+    LEFT JOIN PostHistory ph_edit ON p.Id = ph_edit.PostId AND ph_edit.PostHistoryTypeId IN (4, 5, 6)
+    LEFT JOIN PostHistory ph_close ON p.Id = ph_close.PostId AND ph_close.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes crt ON ph_close.PostHistoryTypeId = 10 AND crt.Id = CAST(ph_close.Comment AS smallint)
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    GROUP BY
+        p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.LastEditDate, p.LastActivityDate, p.Score, p.ViewCount,
+        p.AnswerCount, p.FavoriteCount, p.Title, p.Tags, p.AcceptedAnswerId,
+        LAG(p.LastActivityDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate)
+),
+PostCalculations AS (
+    SELECT
+        pd.PostId,
+        pd.PostTypeId,
+        pd.OwnerUserId,
+        pd.PostCreationDate,
+        pd.LastEditDate,
+        pd.LastActivityDate,
+        pd.PostScore,
+        pd.ViewCount,
+        pd.AnswerCount,
+        pd.FavoriteCount,
+        pd.Title,
+        pd.Tags,
+        pd.AcceptedAnswerId,
+        pd.EditCount,
+        pd.CloseReasons,
+        pd.PreviousPostActivityDate,
+        pd.AverageCommentScore,
+        COALESCE(EXTRACT(EPOCH FROM (pd.LastActivityDate - pd.LastEditDate))/3600.0, 0) AS HoursSinceLastEdit,
+        (SELECT COUNT(v.Id) FROM Votes v WHERE v.PostId = pd.PostId AND v.VoteTypeId = 2) AS PostUpvoteCount,
+        (SELECT COUNT(v.Id) FROM Votes v WHERE v.PostId = pd.PostId AND v.VoteTypeId = 3) AS PostDownvoteCount,
+        CASE
+            WHEN pd.Tags IS NOT NULL AND LENGTH(pd.Tags) > 2 THEN
+                REPLACE(REPLACE(SUBSTRING(pd.Tags FROM 2 FOR LENGTH(pd.Tags) - 2), '><', ','), '&amp;', '&')
+            ELSE NULL
+        END AS FormattedTagsString,
+        (SELECT COUNT(pl.Id) FROM PostLinks pl WHERE pl.PostId = pd.PostId AND pl.LinkTypeId = 1) AS LinkedPostCount,
+        (SELECT COUNT(pl.Id) FROM PostLinks pl WHERE pl.PostId = pd.PostId AND pl.LinkTypeId = 3) AS DuplicatePostCount,
+        (SELECT
+            AVG(sub_p.Score)
+         FROM
+            Posts sub_p
+         WHERE
+            sub_p.OwnerUserId = pd.OwnerUserId
+            AND sub_p.PostTypeId = pd.PostTypeId
+            AND sub_p.CreationDate > pd.PostCreationDate - INTERVAL '6 months'
+        ) AS AvgUserPostScoreLast6Months
+    FROM
+        PostDetails pd
+),
+RankedPostsPerUser AS (
+    SELECT
+        pc.PostId,
+        pc.PostTypeId,
+        pc.OwnerUserId,
+        pc.Title,
+        pc.PostScore,
+        pc.ViewCount,
+        pc.AnswerCount,
+        pc.FavoriteCount,
+        pc.FormattedTagsString,
+        pc.PostUpvoteCount,
+        pc.PostDownvoteCount,
+        pc.EditCount,
+        pc.CloseReasons,
+        pc.HoursSinceLastEdit,
+        pc.AverageCommentScore,
+        pc.AvgUserPostScoreLast6Months,
+        (COALESCE(pc.PostScore, 0) * 0.7 + COALESCE(pc.ViewCount, 0) * 0.05 + COALESCE(pc.FavoriteCount, 0) * 2 + COALESCE(pc.AnswerCount, 0) * 1.5 + COALESCE(pc.AverageCommentScore, 0) * 0.1) AS PostImpactScore,
+        ROW_NUMBER() OVER (PARTITION BY pc.OwnerUserId ORDER BY COALESCE(pc.PostScore, 0) DESC, COALESCE(pc.ViewCount, 0) DESC, COALESCE(pc.FavoriteCount, 0) DESC) AS RnPostByScoreViewsFav
+    FROM
+        PostCalculations pc
+    WHERE
+        pc.PostTypeId IN (1, 2)
+        AND COALESCE(pc.PostScore, 0) > 0
+),
+InfluentialUsersAndTheirBestPosts AS (
+    SELECT
+        ue.UserId,
+        ue.DisplayName,
+        ue.Reputation,
+        ue.TotalPosts,
+        ue.TotalQuestions,
+        ue.TotalAnswers,
+        ue.TotalComments,
+        ue.GoldBadges,
+        ue.SilverBadges,
+        ue.BronzeBadges,
+        ue.TotalPostScore,
+        ue.TotalPostViews,
+        ue.LatestPostActivity,
+        ue.UpVotesGiven,
+        ue.DownVotesGiven,
+        rpu.PostId AS BestPostId,
+        rpu.PostTypeId AS BestPostType,
+        rpu.Title AS BestPostTitle,
+        rpu.PostScore AS BestPostScore,
+        rpu.ViewCount AS BestPostViewCount,
+        rpu.AnswerCount AS BestPostAnswerCount,
+        rpu.FavoriteCount AS BestPostFavoriteCount,
+        rpu.FormattedTagsString AS BestPostTags,
+        rpu.PostUpvoteCount AS BestPostUpvoteCount,
+        rpu.PostDownvoteCount AS BestPostDownvoteCount,
+        rpu.EditCount AS BestPostEditCount,
+        rpu.CloseReasons AS BestPostCloseReasons,
+        rpu.HoursSinceLastEdit AS BestPostHoursSinceLastEdit,
+        rpu.AverageCommentScore AS BestPostAvgCommentScore,
+        rpu.PostImpactScore AS BestPostImpactScore,
+        rpu.AvgUserPostScoreLast6Months AS BestPostOwnerAvgRecentScore,
+        RANK() OVER (ORDER BY ue.Reputation DESC, ue.TotalPostScore DESC, rpu.PostImpactScore DESC) AS OverallUserRank,
+        NTILE(10) OVER (ORDER BY ue.TotalPostScore DESC, ue.TotalPostViews DESC) AS PostScoreViewDecile,
+        CASE
+            WHEN ue.GoldBadges > 0 AND ue.TotalQuestions > 10 AND ue.Reputation > 10000 THEN 'Elite Gold Contributor & Questioner'
+            WHEN ue.TotalAnswers > 50 AND ue.Reputation > 5000 AND ue.TotalBadges > 20 THEN 'Seasoned Pro Answerer'
+            WHEN ue.TotalBadges > 50 AND ue.TotalPosts > 100 THEN 'Prodigious Badge Collector'
+            WHEN ue.TotalComments > 200 THEN 'Highly Engaged Commenter'
+            ELSE 'Active Participant'
+        END AS UserCategory,
+        (SELECT pt.Name FROM PostTypes pt WHERE pt.Id = rpu.PostTypeId) AS BestPostTypeName
+    FROM
+        UserEngagement ue
+    INNER JOIN RankedPostsPerUser rpu ON ue.UserId = rpu.OwnerUserId
+    WHERE
+        rpu.RnPostByScoreViewsFav = 1
+),
+TopActiveTags AS (
+    SELECT
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS TaggedPostCount,
+        SUM(COALESCE(p.Score, 0)) AS TotalTagScore,
+        RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC, SUM(COALESCE(p.Score, 0)) DESC) AS TagRank
+    FROM
+        Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+    GROUP BY t.TagName
+    HAVING COUNT(DISTINCT p.Id) > 50 AND SUM(COALESCE(p.Score, 0)) > 100
+)
+SELECT
+    iu.OverallUserRank,
+    iu.PostScoreViewDecile,
+    iu.UserCategory,
+    iu.UserId,
+    iu.DisplayName,
+    iu.Reputation,
+    iu.TotalPosts,
+    iu.TotalQuestions,
+    iu.TotalAnswers,
+    iu.TotalComments,
+    iu.GoldBadges,
+    iu.SilverBadges,
+    iu.BronzeBadges,
+    iu.TotalPostScore,
+    iu.TotalPostViews,
+    iu.LatestPostActivity,
+    iu.UpVotesGiven,
+    iu.DownVotesGiven,
+    iu.BestPostId,
+    iu.BestPostType,
+    iu.BestPostTypeName,
+    iu.BestPostTitle,
+    iu.BestPostScore,
+    iu.BestPostViewCount,
+    iu.BestPostAnswerCount,
+    iu.BestPostFavoriteCount,
+    iu.BestPostTags,
+    iu.BestPostUpvoteCount,
+    iu.BestPostDownvoteCount,
+    iu.BestPostEditCount,
+    iu.BestPostCloseReasons,
+    iu.BestPostHoursSinceLastEdit,
+    iu.BestPostAvgCommentScore,
+    iu.BestPostImpactScore,
+    iu.BestPostOwnerAvgRecentScore,
+    (
+        SELECT COUNT(ph.Id)
+        FROM PostHistory ph
+        WHERE ph.PostId = iu.BestPostId
+          AND ph.UserId = iu.UserId
+          AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 7, 8, 9)
+    ) AS SelfEditCountForBestPost,
+    (
+        SELECT STRING_AGG(tat.TagName, ', ')
+        FROM TopActiveTags tat
+        WHERE iu.BestPostTags LIKE '%' || tat.TagName || '%'
+          AND tat.TagRank <= 10
+    ) AS Top10RelatedTags
+FROM
+    InfluentialUsersAndTheirBestPosts iu
+WHERE
+    iu.OverallUserRank <= 200
+    AND iu.BestPostImpactScore > 150
+    AND (iu.BestPostCloseReasons IS NULL OR iu.BestPostCloseReasons NOT LIKE '%Duplicate%')
+    AND EXISTS (
+        SELECT 1
+        FROM PostLinks pl
+        WHERE pl.PostId = iu.BestPostId
+          AND pl.LinkTypeId = 1
+        FETCH FIRST 1 ROWS ONLY
+    )
+ORDER BY
+    iu.OverallUserRank ASC, iu.BestPostImpactScore DESC, iu.Reputation DESC;

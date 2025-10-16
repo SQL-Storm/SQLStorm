@@ -1,0 +1,152 @@
+with
+-- recent high-impact questions with tag parsing and computed tag score
+RecentQuestions as (
+  select p.id,
+         p.title,
+         p.creationdate,
+         p.owneruserid,
+         p.score,
+         p.viewcount,
+         p.answercount,
+         coalesce(p.tags, '') as tags_raw,
+         regexp_split_to_table(substring(coalesce(p.tags,'') from 2 for greatest(length(coalesce(p.tags,''))-2,0)), '\>\<') as tag
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+    and (p.score >= 10 or p.viewcount >= 1000 or p.answercount >= 3)
+),
+-- compute per-question tag rarity and aggregated tag metrics
+TagMetrics as (
+  select q.id as question_id,
+         q.title,
+         q.creationdate,
+         q.owneruserid,
+         q.score,
+         q.viewcount,
+         q.answercount,
+         q.tag,
+         t.count as global_tag_count,
+         (1.0 / nullif(t.count,0)) * (case when lower(q.title) like '%' || lower(q.tag) || '%' then 2.0 else 1.0 end) as tag_weight
+  from RecentQuestions q
+  left join tags t on lower(t.tagname) = lower(q.tag)
+),
+-- aggregate tag weights per question
+QuestionTagScores as (
+  select question_id,
+         title,
+         creationdate,
+         owneruserid,
+         score,
+         viewcount,
+         answercount,
+         sum(coalesce(tag_weight,0)) as tag_score,
+         count(*) filter (where global_tag_count is null) as unknown_tag_count,
+         array_agg(distinct tag order by tag) as tag_list
+  from TagMetrics
+  group by question_id, title, creationdate, owneruserid, score, viewcount, answercount
+),
+-- user-level aggregates including activity windows and badge context
+UserActivity as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.lastaccessdate,
+         count(distinct p.id) filter (where p.posttypeid = 1) as questions_posted,
+         count(distinct p.id) filter (where p.posttypeid = 2) as answers_posted,
+         count(distinct b.id) as badges_earned,
+         max(b.class) as top_badge_class,
+         sum(case when p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days' then 1 else 0 end) as posts_90d,
+         extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - u.lastaccessdate))/86400.0 as days_since_last_access
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join badges b on b.userid = u.id
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.lastaccessdate
+),
+-- join questions with owner activity and compute a composite HOTNESS metric with windowing and correlated subquery
+QuestionEnriched as (
+  select q.question_id,
+         q.title,
+         q.creationdate,
+         q.owneruserid,
+         u.displayname as owner_name,
+         q.score,
+         q.viewcount,
+         q.answercount,
+         q.tag_score,
+         q.unknown_tag_count,
+         q.tag_list,
+         u.reputation as owner_reputation,
+         u.badges_earned,
+         u.posts_90d,
+         ((cast(q.score as numeric) * 1.5) +
+         (log(greatest(q.viewcount,1)) * 2.0) +
+         (q.answercount * 3.0) +
+         (coalesce(q.tag_score,0) * 50.0) +
+         (log(greatest(u.reputation,1)) * 1.2) -
+         (greatest(u.days_since_last_access,0) * 0.05)) as hotness_base,
+         (select count(distinct c.userid) from comments c where c.postid = q.question_id and c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days') as recent_commenters,
+         (select count(*) from postlinks pl where (pl.postid = q.question_id or pl.relatedpostid = q.question_id) and pl.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year') as recent_links
+  from QuestionTagScores q
+  left join UserActivity u on u.user_id = q.owneruserid
+),
+-- final scoring with window functions, LAG/LEAD and set operators for edge cases
+FinalRanked as (
+  select qe.question_id,
+         qe.title,
+         qe.creationdate,
+         qe.owneruserid,
+         qe.owner_name,
+         qe.score,
+         qe.viewcount,
+         qe.answercount,
+         qe.tag_score,
+         qe.unknown_tag_count,
+         qe.tag_list,
+         qe.owner_reputation,
+         qe.badges_earned,
+         qe.posts_90d,
+         qe.hotness_base,
+         qe.recent_commenters,
+         qe.recent_links,
+         (qe.hotness_base + coalesce(qe.recent_commenters,0) * 5 + coalesce(qe.recent_links,0) * 2 - (qe.unknown_tag_count * 20)) as hotness_score,
+         row_number() over (order by (qe.hotness_base + coalesce(qe.recent_commenters,0) * 5 + coalesce(qe.recent_links,0) * 2 - (qe.unknown_tag_count * 20)) desc, qe.viewcount desc) as rn,
+         rank() over (partition by qe.owneruserid order by qe.creationdate desc) as owner_recent_rank,
+         lag(qe.hotness_base) over (order by qe.creationdate) as prev_hotness,
+         lead(qe.hotness_base) over (order by qe.creationdate) as next_hotness
+  from QuestionEnriched qe
+),
+-- union in a synthetic "canonical" set of benchmark rows: top N by different criteria using set operators
+TopByVarious as (
+  select * from FinalRanked where rn <= 50
+  union
+  select * from FinalRanked where viewcount >= (select percentile_cont(0.90) within group (order by viewcount) from FinalRanked)
+  except
+  select * from FinalRanked where owner_recent_rank > 5
+)
+select
+  t.question_id,
+  t.title,
+  t.owneruserid,
+  coalesce(t.owner_name, '(deleted)') as owner_name,
+  t.creationdate,
+  t.score,
+  t.viewcount,
+  t.answercount,
+  array_to_string(t.tag_list, ',') as tags,
+  round(cast(t.tag_score as numeric),4) as tag_score,
+  t.unknown_tag_count,
+  t.owner_reputation,
+  t.badges_earned,
+  t.posts_90d,
+  round(cast(t.hotness_base as numeric),4) as hotness_base,
+  t.recent_commenters,
+  t.recent_links,
+  round(cast(t.hotness_score as numeric),4) as hotness_score,
+  t.rn,
+  t.owner_recent_rank,
+  t.prev_hotness,
+  t.next_hotness
+from TopByVarious t
+order by hotness_score desc, viewcount desc, creationdate desc
+limit 200;

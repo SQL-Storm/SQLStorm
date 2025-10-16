@@ -1,0 +1,123 @@
+-- {"query": "4062.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1263} 
+
+WITH QuestionScores AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        COALESCE(p.FavoriteCount,0) AS FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS rn,
+        STRING_AGG(t.TagName, ',' ORDER BY t.TagName) AS TagList
+    FROM Posts p
+    LEFT JOIN Tags t ON POSITION('<' || t.TagName || '>' IN COALESCE(p.Tags, '')) > 0
+    WHERE p.PostTypeId = 1 -- Questions only
+    GROUP BY p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.FavoriteCount
+),
+UserBadgeSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(b.Id) FILTER (WHERE b.TagBased = 1) AS TagBasedBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RecentCommentsSummary AS (
+    SELECT
+        c.PostId,
+        COUNT(*) AS CommentCount,
+        MAX(c.CreationDate) AS LastCommentDate,
+        STRING_AGG(DISTINCT COALESCE(u.DisplayName, c.UserDisplayName, 'Anonymous'), ',' ORDER BY MAX(c.CreationDate)) AS CommenterNames
+    FROM Comments c
+    LEFT JOIN Users u ON u.Id = c.UserId
+    WHERE c.CreationDate > NOW() - INTERVAL '30 days'
+    GROUP BY c.PostId
+),
+AnswerDetails AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        COUNT(a.Id) AS TotalAnswers,
+        AVG(a.Score) FILTER (WHERE a.Score IS NOT NULL) AS AvgAnswerScore,
+        SUM(CASE WHEN a.OwnerUserId IS NULL THEN 0 ELSE 1 END) AS KnownOwnerAnswers,
+        MAX(a.CreationDate) AS LastAnswerDate
+    FROM Posts a
+    WHERE a.PostTypeId = 2 -- Answers only
+    GROUP BY a.ParentId
+),
+DuplicateLinks AS (
+    SELECT
+        pl.PostId,
+        COUNT(pl.Id) AS DuplicateCount,
+        MAX(pl.CreationDate) AS LastDuplicateLinkDate
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3 -- Duplicate
+    GROUP BY pl.PostId
+)
+SELECT
+    qs.Id AS QuestionId,
+    qs.Title,
+    qs.CreationDate AS QuestionCreated,
+    qs.Score AS QuestionScore,
+    qs.ViewCount,
+    qs.AnswerCount,
+    qs.FavoriteCount,
+    qs.TagList,
+    ubs.DisplayName AS OwnerName,
+    ubs.Reputation AS OwnerReputation,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.TagBasedBadges,
+    ubs.LastBadgeDate,
+    COALESCE(ad.TotalAnswers, 0) AS TotalAnswers,
+    COALESCE(ad.AvgAnswerScore, 0) AS AvgAnswerScore,
+    COALESCE(ad.KnownOwnerAnswers, 0) AS KnownOwnerAnswers,
+    ad.LastAnswerDate,
+    COALESCE(rcs.CommentCount, 0) AS RecentCommentCount,
+    rcs.LastCommentDate,
+    rcs.CommenterNames,
+    COALESCE(dl.DuplicateCount, 0) AS DuplicateLinksCount,
+    dl.LastDuplicateLinkDate,
+    phc.CloseReasonName,
+    phc.CloseVotes,
+    -- Complex calculation: score impact ratio with NULL-safe division and log transform
+    CASE 
+        WHEN qs.ViewCount > 0 THEN LOG(GREATEST(qs.Score + 1, 1)::numeric / qs.ViewCount)
+        ELSE NULL
+    END AS LogScoreViewRatio,
+    -- String expression: first 100 characters of the title plus number of badges in brackets
+    LEFT(qs.Title, 100) || ' [' || (COALESCE(ubs.GoldBadges,0) + COALESCE(ubs.SilverBadges,0) + COALESCE(ubs.BronzeBadges,0))::text || ' badges]' AS TitleWithBadgeCount
+FROM QuestionScores qs
+LEFT JOIN Users u ON u.Id = qs.OwnerUserId
+LEFT JOIN UserBadgeSummary ubs ON ubs.UserId = qs.OwnerUserId
+LEFT JOIN AnswerDetails ad ON ad.QuestionId = qs.Id
+LEFT JOIN RecentCommentsSummary rcs ON rcs.PostId = qs.Id
+LEFT JOIN DuplicateLinks dl ON dl.PostId = qs.Id
+LEFT JOIN (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReasonName,
+        COUNT(*) AS CloseVotes
+    FROM PostHistory ph
+    INNER JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    LEFT JOIN CloseReasonTypes crt ON ph.Comment::int = crt.Id
+    WHERE ph.PostHistoryTypeId = 10 -- Post Closed
+    GROUP BY ph.PostId, crt.Name
+) phc ON phc.PostId = qs.Id
+WHERE qs.rn = 1
+AND qs.Score > 5
+AND (ubs.Reputation > 1000 OR ubs.GoldBadges > 0)
+AND NOT EXISTS (
+    SELECT 1 FROM Posts p2 WHERE p2.ParentId = qs.Id AND p2.Score > qs.Score
+)
+ORDER BY qs.Score DESC, qs.ViewCount DESC
+LIMIT 100;

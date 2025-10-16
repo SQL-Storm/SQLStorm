@@ -1,0 +1,124 @@
+-- {"query": "25005.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2543} 
+WITH user_agg AS (
+    SELECT
+        u.Id                                          AS user_id,
+        u.DisplayName                                 AS display_name,
+        u.Reputation                                  AS reputation,
+        COALESCE(u.Views,0)                           AS total_views,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1)      AS question_cnt,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2)      AS answer_cnt,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END)
+                                                     FILTER (WHERE p.PostTypeId = 2) AS avg_answer_score,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+        MAX(p.CreationDate)                           AS last_post_dt
+    FROM Users u
+    LEFT JOIN Badges b   ON b.UserId = u.Id
+    LEFT JOIN Posts  p   ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views
+),
+
+recent_question AS (
+    SELECT
+        u.Id                                            AS user_id,
+        (SELECT p.Title
+         FROM Posts p
+         WHERE p.OwnerUserId = u.Id
+           AND p.PostTypeId   = 1
+         ORDER BY p.CreationDate DESC
+         LIMIT 1)                                        AS latest_q_title
+    FROM Users u
+),
+
+duplicate_links AS (
+    SELECT
+        pl.PostId,
+        COUNT(*) FILTER (WHERE lt.Id = 3) AS dup_cnt
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    GROUP BY pl.PostId
+),
+
+tag_badge_counts AS (
+    SELECT
+        b.UserId                                            AS user_id,
+        SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END)    AS tag_based_cnt,
+        STRING_AGG(DISTINCT t.TagName, ',')
+            FILTER (WHERE b.TagBased = 1)                  AS tag_names
+    FROM Badges b
+    LEFT JOIN Tags t ON t.TagName = b.Name      -- badge name often matches tag name
+    GROUP BY b.UserId
+),
+
+final AS (
+    SELECT
+        ua.user_id,
+        ua.display_name,
+        ua.reputation,
+        ua.total_views,
+        ua.question_cnt,
+        ua.answer_cnt,
+        COALESCE(ua.avg_answer_score,0)                AS avg_answer_score,
+        ua.gold_badges,
+        ua.silver_badges,
+        ua.bronze_badges,
+        rq.latest_q_title,
+        dl.dup_cnt,
+        tb.tag_based_cnt,
+        tb.tag_names,
+        /* composite score with many NULL‑aware calculations */
+        ( ua.reputation           * 0.5
+        + ua.total_views          * 0.2
+        + ua.question_cnt        * 10
+        + ua.answer_cnt          * 8
+        + COALESCE(ua.avg_answer_score,0) * 5
+        + ua.gold_badges         * 100
+        + ua.silver_badges       * 50
+        + ua.bronze_badges       * 20
+        + COALESCE(dl.dup_cnt,0) * -2
+        + COALESCE(tb.tag_based_cnt,0) * 15 )          AS composite_score
+    FROM user_agg ua
+    LEFT JOIN recent_question rq ON rq.user_id = ua.user_id
+    LEFT JOIN duplicate_links dl
+        ON dl.PostId = (
+            SELECT p.Id
+            FROM Posts p
+            WHERE p.OwnerUserId = ua.user_id
+              AND p.PostTypeId = 1
+            ORDER BY p.CreationDate DESC
+            LIMIT 1
+        )
+    LEFT JOIN tag_badge_counts tb ON tb.user_id = ua.user_id
+)
+
+SELECT
+    f.*,
+    RANK()   OVER (ORDER BY f.composite_score DESC) AS reputation_rank,
+    NTILE(4) OVER (ORDER BY f.composite_score DESC) AS quartile
+FROM final f
+WHERE f.composite_score > 0
+ORDER BY f.composite_score DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL::int    AS user_id,
+    NULL::varchar AS display_name,
+    NULL::int    AS reputation,
+    NULL::int    AS total_views,
+    NULL::int    AS question_cnt,
+    NULL::int    AS answer_cnt,
+    NULL::float  AS avg_answer_score,
+    NULL::int    AS gold_badges,
+    NULL::int    AS silver_badges,
+    NULL::int    AS bronze_badges,
+    NULL::varchar AS latest_q_title,
+    NULL::int    AS dup_cnt,
+    NULL::int    AS tag_based_cnt,
+    NULL::varchar AS tag_names,
+    NULL::float  AS composite_score,
+    NULL::int    AS reputation_rank,
+    NULL::int    AS quartile
+WHERE NOT EXISTS (SELECT 1 FROM final WHERE composite_score > 0);

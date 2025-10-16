@@ -1,0 +1,161 @@
+WITH ActiveUsers AS (
+    SELECT
+        UserId,
+        Reputation,
+        CreationDate,
+        LastAccessDate,
+        Views,
+        UpVotes,
+        DownVotes,
+        COALESCE(ProfileImageUrl, '') AS ProfileImageUrl,
+        CASE
+            WHEN LastAccessDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days' THEN 'Active'
+            ELSE 'Inactive'
+        END AS ActivityStatus
+    FROM
+        Users
+    WHERE
+        LastAccessDate IS NOT NULL
+),
+
+TaggedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.LastEditorUserId,
+        p.LastEditDate,
+        p.Tags,
+        -- Convert tags like '<tag1><tag2>' into array by removing leading/trailing '<' '>' and splitting on '><'
+        -- Use standard SQL: replace leading and trailing angle brackets then split by '><' where supported; fallback to the whole string if split not available.
+        NULLIF(TRIM(BOTH '<' FROM p.Tags), '') AS TagString,
+        LENGTH(REGEXP_REPLACE(p.Body, '[^\w\s]', '', 'g')) AS BodyWordCount,
+        (p.ViewCount * 0.75 +
+         p.Score * 0.2 +
+         p.CommentCount * 0.05) *
+        CASE
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 1.5
+            ELSE 1
+        END AS EngagementScore,
+        p.LastActivityDate
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId = 1
+        AND p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+),
+
+BadgeAnalysis AS (
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(DISTINCT CASE WHEN b.TagBased THEN b.Name ELSE NULL END) AS UniqueTagBadges
+    FROM
+        Badges b
+    GROUP BY
+        b.UserId
+),
+
+PostHistoryAnalysis AS (
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS HistoryCount,
+        CASE
+            WHEN SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 17, 35, 36) THEN 1 ELSE 0 END) > 0 THEN 'ClosedOrMigrated'
+            ELSE 'Open'
+        END AS PostStatus,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 13 THEN ph.CreationDate ELSE NULL END) AS LastDeletedDate,
+        MAX(CASE WHEN ph.CreationDate = (
+                SELECT MIN(ph2.CreationDate)
+                FROM PostHistory ph2
+                WHERE ph2.PostId = ph.PostId
+            ) THEN ph.UserId ELSE NULL END) AS InitialPosterId
+    FROM
+        PostHistory ph
+    JOIN
+        Posts p ON ph.PostId = p.Id
+    GROUP BY
+        ph.PostId
+),
+
+HighEngagementPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        u.DisplayName AS OwnerDisplayName,
+        pha.HistoryCount,
+        pha.PostStatus,
+        pha.LastDeletedDate,
+        pha.InitialPosterId,
+        p.EngagementScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.EngagementScore DESC) AS Rank,
+        p.LastActivityDate
+    FROM
+        TaggedPosts p
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN
+        PostHistoryAnalysis pha ON p.Id = pha.PostId
+    WHERE
+        (p.ViewCount > 1000 OR p.Score > 50)
+        AND p.LastActivityDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+        AND p.OwnerUserId IS NOT NULL
+)
+
+SELECT
+    hep.PostId,
+    hep.Title,
+    hep.OwnerUserId,
+    hep.OwnerDisplayName,
+    hep.Score,
+    hep.ViewCount,
+    hep.CommentCount,
+    hep.AnswerCount,
+    hep.Rank,
+    hep.HistoryCount,
+    hep.PostStatus,
+    hep.LastDeletedDate,
+    hep.InitialPosterId,
+    uph.UserId AS InitialPosterUserId,
+    u.ProfileImageUrl,
+    COALESCE(heb.TotalBadges, 0) AS TotalBadges,
+    COALESCE(heb.GoldBadges, 0) AS GoldBadges,
+    COALESCE(heb.SilverBadges, 0) AS SilverBadges,
+    COALESCE(heb.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(heb.UniqueTagBadges, 0) AS UniqueTagBadges,
+    uph.ActivityStatus
+FROM
+    HighEngagementPosts hep
+LEFT JOIN
+    ActiveUsers u ON hep.OwnerUserId = u.UserId
+LEFT JOIN (
+    SELECT DISTINCT ph.UserId, ph.CreationDate, ph.PostId
+    FROM PostHistory ph
+    WHERE ph.CreationDate = (
+        SELECT MIN(ph2.CreationDate)
+        FROM PostHistory ph2
+        WHERE ph2.PostId = ph.PostId
+          AND ph2.UserId IS NOT NULL
+          AND ph2.UserId <> -1
+    )
+) uph ON hep.PostId = uph.PostId
+LEFT JOIN
+    BadgeAnalysis heb ON hep.OwnerUserId = heb.UserId
+LEFT JOIN
+    Posts p ON hep.InitialPosterId = p.Id
+WHERE
+    hep.Rank <= 10
+ORDER BY
+    hep.EngagementScore DESC,
+    hep.ViewCount DESC;

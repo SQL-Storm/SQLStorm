@@ -1,0 +1,362 @@
+-- {"query": "8078.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3465} 
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        coalesce(nullif(trim(split_part(coalesce(u.websiteurl, ''), '/', 3)), ''), 'no-domain') as website_domain,
+        row_number() over (order by u.creationdate desc, u.id desc) as rn
+    from users u
+    where u.creationdate >= (select max(p.creationdate) - interval '365 days' from posts p)
+),
+post_activity as (
+    select
+        p.id as post_id,
+        p.posttypeid,
+        p.owneruserid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.tags,
+        p.title,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+        max(case when v.votetypeid in (8,9) then v.bountyamount else null end) as max_bounty,
+        count(distinct c.id) as comments_count
+    from posts p
+    left join votes v on v.postid = p.id
+    left join comments c on c.postid = p.id
+    where p.creationdate >= (select max(ph.creationdate) - interval '365 days' from posthistory ph)
+    group by p.id, p.posttypeid, p.owneruserid, p.creationdate, p.score, p.viewcount, p.tags, p.title
+),
+tag_expansion as (
+    select
+        pa.post_id,
+        lower(trim(tg)) as tag
+    from post_activity pa
+    cross join lateral unnest(
+        case
+            when pa.tags is null then array[]::varchar[]
+            else string_to_array(substring(pa.tags, 2, length(pa.tags)-2), '><')
+        end
+    ) as tg
+),
+tag_metrics as (
+    select
+        te.tag,
+        count(*) as tagged_posts,
+        avg(pa.score) as avg_score,
+        percentile_cont(0.5) within group (order by pa.viewcount) as p50_views,
+        sum(pa.upvotes) as total_upvotes,
+        sum(pa.downvotes) as total_downvotes
+    from tag_expansion te
+    join post_activity pa on pa.post_id = te.post_id
+    group by te.tag
+),
+linked_duplicates as (
+    select
+        pl.postid as dup_post_id,
+        pl.relatedpostid as canonical_post_id,
+        pl.creationdate as link_date
+    from postlinks pl
+    where pl.linktypeid = 3
+),
+question_core as (
+    select
+        pa.post_id,
+        pa.owneruserid as owner_id,
+        pa.creationdate,
+        pa.score,
+        pa.viewcount,
+        pa.upvotes,
+        pa.downvotes,
+        pa.favorites,
+        pa.max_bounty,
+        pa.comments_count,
+        case when pa.posttypeid = 1 then 1 else 0 end as is_question,
+        exists (
+            select 1
+            from posthistory ph
+            where ph.postid = pa.post_id
+              and ph.posthistorytypeid = 10
+        ) as was_closed,
+        coalesce(ld.canonical_post_id, null) as canonical_post_id
+    from post_activity pa
+    left join linked_duplicates ld on ld.dup_post_id = pa.post_id
+    where pa.posttypeid in (1,2)
+),
+answer_adoption as (
+    select
+        a.id as answer_id,
+        a.parentid as question_id,
+        a.owneruserid as answerer_id,
+        a.score as answer_score,
+        a.creationdate as answer_date,
+        case when q.acceptedanswerid = a.id then 1 else 0 end as is_accepted
+    from posts a
+    join posts q on q.id = a.parentid and a.posttypeid = 2 and q.posttypeid = 1
+    where a.creationdate >= (select max(p.creationdate) - interval '365 days' from posts p)
+),
+user_badge_rollup as (
+    select
+        b.userid,
+        count(*) filter (where b.class = 1) as gold_badges,
+        count(*) filter (where b.class = 2) as silver_badges,
+        count(*) filter (where b.class = 3) as bronze_badges,
+        count(*) filter (where b.tagbased = 1) as tag_badges,
+        min(b.date) as first_badge_date,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+user_post_summaries as (
+    select
+        qc.owner_id as user_id,
+        count(*) filter (where qc.is_question = 1) as questions_posted,
+        count(*) filter (where qc.is_question = 0) as answers_posted,
+        sum(qc.upvotes) as sum_upvotes,
+        sum(qc.downvotes) as sum_downvotes,
+        sum(qc.favorites) as sum_favorites,
+        sum(case when qc.was_closed then 1 else 0 end) as closed_posts,
+        sum(coalesce(qc.max_bounty, 0)) as total_bounty_received,
+        avg(nullif(qc.viewcount,0)) as avg_views_nonzero
+    from question_core qc
+    group by qc.owner_id
+),
+commenter_engagement as (
+    select
+        coalesce(c.userid, -1) as user_id,
+        count(*) as total_comments,
+        avg(c.score) as avg_comment_score,
+        max(c.creationdate) as last_comment_date
+    from comments c
+    where c.creationdate >= (select max(c2.creationdate) - interval '365 days' from comments c2)
+    group by coalesce(c.userid, -1)
+),
+closing_events as (
+    select
+        ph.postid,
+        min(ph.creationdate) as first_close_date,
+        max(ph.creationdate) as last_close_date,
+        sum(case when ph.posthistorytypeid = 10 then 1 else 0 end) as close_events,
+        sum(case when ph.posthistorytypeid = 11 then 1 else 0 end) as reopen_events,
+        count(*) filter (where ph.posthistorytypeid = 10 and ph.comment ~ '^[0-9]+$') as close_with_reason_ids
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11)
+    group by ph.postid
+),
+close_reasons_expanded as (
+    select
+        ph.postid,
+        cr.name as close_reason_name
+    from posthistory ph
+    join closerreasontypes cr on cr.id::varchar = ph.comment
+    where ph.posthistorytypeid = 10
+      and ph.comment ~ '^[0-9]+$'
+),
+user_close_behavior as (
+    select
+        p.owneruserid as user_id,
+        count(distinct p.id) as posts_ever_closed,
+        count(distinct case when crx.close_reason_name ilike '%duplicate%' then p.id end) as closed_as_dup,
+        count(distinct case when crx.close_reason_name ilike '%off-topic%' then p.id end) as closed_offtopic
+    from posts p
+    join closing_events ce on ce.postid = p.id
+    left join close_reasons_expanded crx on crx.postid = p.id
+    group by p.owneruserid
+),
+accepted_answer_stats as (
+    select
+        aa.answerer_id as user_id,
+        count(*) as answers_total,
+        sum(case when aa.is_accepted = 1 then 1 else 0 end) as answers_accepted,
+        avg(case when aa.is_accepted = 1 then aa.answer_score::numeric end) as avg_score_accepted,
+        avg(case when aa.is_accepted = 0 then aa.answer_score::numeric end) as avg_score_unaccepted
+    from answer_adoption aa
+    group by aa.answerer_id
+),
+domain_activity as (
+    select
+        ru.website_domain,
+        count(distinct ru.user_id) as active_users_on_domain,
+        sum(coalesce(ups.questions_posted,0) + coalesce(ups.answers_posted,0)) as posts_by_domain_users
+    from recent_users ru
+    left join user_post_summaries ups on ups.user_id = ru.user_id
+    group by ru.website_domain
+),
+ranked_users as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.creationdate,
+        ru.location,
+        ru.website_domain,
+        coalesce(ups.questions_posted,0) as questions_posted,
+        coalesce(ups.answers_posted,0) as answers_posted,
+        coalesce(ups.sum_upvotes,0) as upvotes,
+        coalesce(ups.sum_downvotes,0) as downvotes,
+        coalesce(ups.sum_favorites,0) as favorites,
+        coalesce(ups.closed_posts,0) as closed_posts,
+        coalesce(ups.total_bounty_received,0) as total_bounty_received,
+        coalesce(ups.avg_views_nonzero,0) as avg_views_nonzero,
+        coalesce(ubr.gold_badges,0) as gold_badges,
+        coalesce(ubr.silver_badges,0) as silver_badges,
+        coalesce(ubr.bronze_badges,0) as bronze_badges,
+        coalesce(ubr.tag_badges,0) as tag_badges,
+        ubr.first_badge_date,
+        ubr.last_badge_date,
+        coalesce(ceb.total_comments,0) as total_comments,
+        ceb.avg_comment_score,
+        ceb.last_comment_date,
+        coalesce(ucb.posts_ever_closed,0) as posts_ever_closed,
+        coalesce(ucb.closed_as_dup,0) as closed_as_dup,
+        coalesce(ucb.closed_offtopic,0) as closed_offtopic,
+        coalesce(aas.answers_total,0) as answers_total,
+        coalesce(aas.answers_accepted,0) as answers_accepted,
+        coalesce(aas.avg_score_accepted,0) as avg_score_accepted,
+        coalesce(aas.avg_score_unaccepted,0) as avg_score_unaccepted,
+        dense_rank() over (
+            order by
+                coalesce(aas.answers_accepted,0) desc,
+                coalesce(ups.sum_upvotes,0) desc,
+                coalesce(ups.sum_favorites,0) desc,
+                ru.reputation desc,
+                ru.creationdate desc
+        ) as perf_rank
+    from recent_users ru
+    left join user_post_summaries ups on ups.user_id = ru.user_id
+    left join user_badge_rollup ubr on ubr.userid = ru.user_id
+    left join commenter_engagement ceb on ceb.user_id = ru.user_id
+    left join user_close_behavior ucb on ucb.user_id = ru.user_id
+    left join accepted_answer_stats aas on aas.user_id = ru.user_id
+),
+tag_trending as (
+    select
+        te.tag,
+        count(*) filter (where pa.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days') as posts_30d,
+        count(*) filter (where pa.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days') as posts_90d,
+        count(*) filter (where pa.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '180 days') as posts_180d
+    from tag_expansion te
+    join post_activity pa on pa.post_id = te.post_id
+    group by te.tag
+),
+final_user_aggregates as (
+    select
+        ru.*,
+        da.active_users_on_domain,
+        da.posts_by_domain_users,
+        (coalesce(ru.answers_accepted,0)::numeric / nullif(coalesce(ru.answers_total,0),0)) as accept_rate,
+        (coalesce(ru.upvotes,0) - coalesce(ru.downvotes,0)) as net_votes,
+        case
+            when ru.favorites > 0 then log(greatest(ru.favorites,1))
+            else 0
+        end as favorites_log,
+        case
+            when ru.gold_badges > 0 then 'gold'
+            when ru.silver_badges > 0 then 'silver'
+            when ru.bronze_badges > 0 then 'bronze'
+            else 'none'
+        end as top_badge_tier
+    from ranked_users ru
+    left join domain_activity da on da.website_domain = ru.website_domain
+),
+canonical_pairs as (
+    select
+        qc.post_id as duplicate_id,
+        qc.canonical_post_id,
+        qc.owner_id as dup_owner,
+        q2.owneruserid as canon_owner
+    from question_core qc
+    join posts q2 on q2.id = qc.canonical_post_id
+    where qc.canonical_post_id is not null
+),
+dupe_owner_overlap as (
+    select
+        cp.canon_owner as user_id,
+        count(*) as times_canonicalized,
+        count(*) filter (where cp.canon_owner = cp.dup_owner) as self_duplicate_count
+    from canonical_pairs cp
+    group by cp.canon_owner
+),
+top_tags_for_users as (
+    select
+        pa.owneruserid as user_id,
+        te.tag,
+        count(*) as tag_count,
+        row_number() over (partition by pa.owneruserid order by count(*) desc, te.tag) as tag_rank
+    from tag_expansion te
+    join post_activity pa on pa.post_id = te.post_id
+    group by pa.owneruserid, te.tag
+),
+selected_users as (
+    select *
+    from final_user_aggregates
+    where perf_rank <= 200
+),
+user_tag_view as (
+    select
+        su.user_id,
+        string_agg(tt.tag || ':' || tt.tag_count::text, ', ' order by tt.tag_rank)
+            filter (where tt.tag_rank <= 5) as top5_tags
+    from selected_users su
+    left join top_tags_for_users tt on tt.user_id = su.user_id
+    group by su.user_id
+)
+select
+    su.user_id,
+    coalesce(su.displayname, '[unknown]') as displayname,
+    su.reputation,
+    su.location,
+    su.website_domain,
+    su.perf_rank,
+    su.questions_posted,
+    su.answers_posted,
+    su.answers_total,
+    su.answers_accepted,
+    round(coalesce(su.accept_rate,0)::numeric, 4) as accept_rate,
+    su.upvotes,
+    su.downvotes,
+    su.net_votes,
+    su.favorites,
+    su.favorites_log,
+    su.total_bounty_received,
+    su.closed_posts,
+    su.posts_ever_closed,
+    su.closed_as_dup,
+    su.closed_offtopic,
+    su.gold_badges,
+    su.silver_badges,
+    su.bronze_badges,
+    su.tag_badges,
+    su.first_badge_date,
+    su.last_badge_date,
+    su.total_comments,
+    su.avg_comment_score,
+    su.last_comment_date,
+    coalesce(dol.times_canonicalized,0) as times_canonicalized,
+    coalesce(dol.self_duplicate_count,0) as self_duplicate_count,
+    utv.top5_tags,
+    tm.tag as sample_tag,
+    tm.tagged_posts,
+    round(tm.avg_score::numeric, 3) as avg_score_per_tag,
+    tm.p50_views as median_views_per_tag,
+    tm.total_upvotes as tag_total_upvotes,
+    tm.total_downvotes as tag_total_downvotes,
+    tt.posts_30d,
+    tt.posts_90d,
+    tt.posts_180d
+from selected_users su
+left join dupe_owner_overlap dol on dol.user_id = su.user_id
+left join user_tag_view utv on utv.user_id = su.user_id
+left join lateral (
+    select tm.tag, tm.tagged_posts, tm.avg_score, tm.p50_views, tm.total_upvotes, tm.total_downvotes
+    from tag_metrics tm
+    join top_tags_for_users ttfu on ttfu.user_id = su.user_id and ttfu.tag = tm.tag and ttfu.tag_rank = 1
+    limit 1
+) tm on true
+left join tag_trending tt on tt.tag = tm.tag
+order by su.perf_rank, su.user_id;

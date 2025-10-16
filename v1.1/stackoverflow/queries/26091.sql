@@ -1,0 +1,92 @@
+WITH top_users AS (
+  SELECT 
+    u.Id, 
+    u.DisplayName, 
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS total_upvotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS total_downvotes,
+    ROW_NUMBER() OVER (ORDER BY SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) DESC) AS row_num
+  FROM 
+    Users u
+  LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+  LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+  GROUP BY 
+    u.Id, u.DisplayName
+),
+top_posts AS (
+  SELECT 
+    p.Id, 
+    p.OwnerUserId,
+    p.Title, 
+    p.Score, 
+    p.ViewCount, 
+    p.AnswerCount, 
+    p.CommentCount,
+    ROW_NUMBER() OVER (ORDER BY p.ViewCount DESC) AS row_num
+  FROM 
+    Posts p
+  WHERE 
+    p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL
+),
+post_history AS (
+  SELECT 
+    ph.PostId, 
+    ph.PostHistoryTypeId, 
+    ph.CreationDate, 
+    ph.UserId, 
+    ph.UserDisplayName,
+    LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS prev_date
+  FROM 
+    PostHistory ph
+  WHERE 
+    ph.PostHistoryTypeId IN (10, 11, 12, 13)
+)
+SELECT 
+  tu.Id, 
+  tu.DisplayName, 
+  tu.total_upvotes, 
+  tu.total_downvotes,
+  tp.Title, 
+  tp.Score, 
+  tp.ViewCount, 
+  tp.AnswerCount, 
+  tp.CommentCount,
+  ph.PostHistoryTypeId, 
+  ph.CreationDate, 
+  ph.UserId, 
+  ph.UserDisplayName,
+  ph.prev_date,
+  CASE 
+    WHEN ph.prev_date IS NOT NULL THEN ph.CreationDate - ph.prev_date 
+    ELSE NULL 
+  END AS time_diff
+FROM 
+  top_users tu
+JOIN 
+  top_posts tp ON tu.Id = tp.OwnerUserId
+LEFT JOIN 
+  post_history ph ON tp.Id = ph.PostId
+WHERE 
+  tu.row_num <= 10 AND tp.row_num <= 10
+GROUP BY
+  tu.Id,
+  tu.DisplayName,
+  tu.total_upvotes,
+  tu.total_downvotes,
+  tp.Title,
+  tp.Score,
+  tp.ViewCount,
+  tp.AnswerCount,
+  tp.CommentCount,
+  tp.Id,
+  tp.OwnerUserId,
+  ph.PostHistoryTypeId,
+  ph.CreationDate,
+  ph.UserId,
+  ph.UserDisplayName,
+  ph.prev_date,
+  tu.row_num,
+  tp.row_num
+ORDER BY 
+  tu.total_upvotes DESC, tp.ViewCount DESC;

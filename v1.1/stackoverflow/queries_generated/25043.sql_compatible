@@ -1,0 +1,6 @@
+TopContributors,
+           NULL AS TagName,
+           NULL AS TagAvgScore
+    FROM Combined
+    WHERE UserId IS NOT NULL
+) final_results;

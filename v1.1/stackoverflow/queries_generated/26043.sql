@@ -1,0 +1,70 @@
+-- {"query": "26043.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "llama-3.3-instruct", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 553} 
+
+WITH TopUsers AS (
+  SELECT 
+    u.Id,
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS PostCount,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RowNum
+  FROM 
+    Users u
+  LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+  LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+  GROUP BY 
+    u.Id, u.DisplayName
+  HAVING 
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) > 1000
+),
+TopPosts AS (
+  SELECT 
+    p.Id,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    ROW_NUMBER() OVER (ORDER BY p.Score DESC) AS RowNum
+  FROM 
+    Posts p
+  WHERE 
+    p.PostTypeId = 1 AND p.Score > 100
+),
+PostHistoryStats AS (
+  SELECT 
+    ph.PostId,
+    COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseCount,
+    COUNT(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenCount,
+    SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 WHEN ph.PostHistoryTypeId = 11 THEN -1 ELSE 0 END) AS NetCloseCount
+  FROM 
+    PostHistory ph
+  GROUP BY 
+    ph.PostId
+)
+SELECT 
+  tu.DisplayName,
+  tu.PostCount,
+  tu.UpVotes,
+  tu.DownVotes,
+  tp.Title,
+  tp.Score,
+  tp.ViewCount,
+  phs.CloseCount,
+  phs.ReopenCount,
+  phs.NetCloseCount,
+  CASE 
+    WHEN phs.NetCloseCount > 0 THEN 'Closed'
+    WHEN phs.NetCloseCount < 0 THEN 'Open'
+    ELSE 'Neutral'
+  END AS PostStatus,
+  ROW_NUMBER() OVER (ORDER BY tu.RowNum) AS UserRowNum,
+  ROW_NUMBER() OVER (ORDER BY tp.RowNum) AS PostRowNum
+FROM 
+  TopUsers tu
+  LEFT JOIN TopPosts tp ON tu.Id = tp.Id
+  LEFT JOIN PostHistoryStats phs ON tp.Id = phs.PostId
+WHERE 
+  tu.RowNum <= 100 AND tp.RowNum <= 100
+ORDER BY 
+  tu.RowNum, tp.RowNum;

@@ -1,0 +1,189 @@
+-- {"query": "28.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2245} 
+with
+-- recent active questions with computed tag arrays and normalized scores
+recent_q as (
+  select
+    p.id,
+    p.title,
+    p.creationdate,
+    p.score,
+    coalesce(p.viewcount,0) as viewcount,
+    -- tag parsing: Tags stored like "<tag1><tag2>"
+    case when p.tags is null then array[]::varchar[] else regexp_split_to_array(substring(p.tags from 2 for char_length(p.tags)-2), '><') end as tag_array,
+    p.answercount,
+    p.owneruserid
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= now() - interval '365 days'
+    and (p.closeddate is null or p.closeddate >= now() - interval '90 days')
+),
+-- answers joined to their parent questions plus answerer stats
+answers_enh as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.creationdate as answer_creation,
+    a.score as answer_score,
+    a.owneruserid as answerer_id,
+    u.reputation as answerer_rep,
+    row_number() over (partition by a.parentid order by a.score desc, a.creationdate asc) as answer_rank
+  from posts a
+  left join users u on u.id = a.owneruserid
+  where a.posttypeid = 2
+    and a.creationdate >= now() - interval '730 days'
+),
+-- aggregated answer metrics per question
+answer_aggr as (
+  select
+    q.id as question_id,
+    count(a.answer_id) filter (where a.answer_id is not null) as answers_total,
+    sum(coalesce(a.answer_score,0)) as answers_score_sum,
+    avg(a.answer_score) filter (where a.answer_id is not null) as answers_score_avg,
+    max(a.answer_score) as top_answer_score,
+    bool_or(a.answer_rank = 1 and a.answer_score > 0) as has_positive_top_answer
+  from recent_q q
+  left join answers_enh a on a.question_id = q.id
+  group by q.id
+),
+-- compute per-user recent activity and diversity of tags they answered
+user_activity as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    count(distinct p.id) filter (where p.posttypeid = 2 and p.creationdate >= now() - interval '365 days') as answers_last_year,
+    count(distinct regexp_split_to_array(substring(p.tags from 2 for char_length(p.tags)-2), '><')) filter (where p.posttypeid = 1 and p.creationdate >= now() - interval '365 days') as tag_diversity_on_questions_answered,
+    max(p.creationdate) filter (where p.posttypeid = 2) as last_answer_date
+  from users u
+  left join posts p on p.owneruserid = u.id
+  group by u.id, u.displayname, u.reputation
+),
+-- correlated aggregated metrics: median score of sibling answers per question (approx using percentile_disc)
+sibling_answer_stats as (
+  select
+    a.parentid as question_id,
+    count(*) as sibling_count,
+    percentile_disc(0.5) within group (order by a.score) as sibling_median_score,
+    stddev(a.score) as sibling_score_stddev
+  from posts a
+  where a.posttypeid = 2
+  group by a.parentid
+),
+-- complex CTE to produce a normalized "interestingness" metric combining many signals
+interestingness as (
+  select
+    q.*,
+    ag.answers_total,
+    ag.answers_score_sum,
+    ag.answers_score_avg,
+    ag.top_answer_score,
+    sa.sibling_count,
+    coalesce(sa.sibling_median_score,0) as sibling_median_score,
+    coalesce(sa.sibling_score_stddev,0) as sibling_score_stddev,
+    -- textual complexity: length of body and count of code fences
+    coalesce(char_length(pbody.body_text),0) as body_length,
+    coalesce((pbody.body_text ~* '```')::int + (pbody.body_text ~* '<code>')::int,0) as code_block_count,
+    -- derived recency factor (more recent -> higher)
+    greatest(0.1, 1.0 - extract(epoch from (now() - q.creationdate)) / (86400.0 * 365.0 * 1.5)) as recency_factor,
+    -- popularity factor combining views and score with log scaling
+    ln(1 + q.viewcount) * (1 + greatest(q.score,0) * 0.25) as popularity_component,
+    -- answer quality factor
+    (coalesce(ag.top_answer_score,0) * 0.6 + coalesce(ag.answers_score_avg,0) * 0.4) * (1 + ag.answers_total/10.0) as answer_quality_component,
+    -- tag novelty: fewer questions with same tag in recent_q => boost
+    case
+      when array_length(q.tag_array,1) is null then 0
+      else (
+        select sum(1.0 / greatest(1, count(*))) from recent_q rq cross join unnest(rq.tag_array) as t(tag)
+        where t.tag = any(q.tag_array)
+      )
+    end as tag_novelty_inverse_popularity
+  from recent_q q
+  left join posts p on p.id = q.id
+  left join lateral (select p.body as body_text) pbody on true
+  left join answer_aggr ag on ag.question_id = q.id
+  left join sibling_answer_stats sa on sa.question_id = q.id
+),
+-- rank authors by contribution to interesting questions (consider accepted answers and badges)
+author_influence as (
+  select
+    u.id as author_id,
+    u.displayname,
+    count(distinct p.id) filter (where p.posttypeid = 2 and p.parentid in (select id from recent_q)) as answers_on_recent_questions,
+    sum(case when v.votetypeid = 1 then 1 else 0 end) filter (where v.postid = p.id) as accepted_by_originator_count,
+    count(b.id) filter (where b.class = 1) as gold_badges,
+    rank() over (order by count(distinct p.id) filter (where p.posttypeid = 2 and p.parentid in (select id from recent_q)) desc, sum(case when v.votetypeid = 1 then 1 else 0 end) desc) as influence_rank
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join votes v on v.postid = p.id
+  left join badges b on b.userid = u.id
+  group by u.id, u.displayname
+),
+-- union of interesting questions with similar historic duplicates via PostLinks (set operator)
+interesting_and_linked as (
+  select i.*, 'original' as origin
+  from interestingness i
+  where (
+    -- compute interestingness score
+    (i.popularity_component * 0.35) + (i.answer_quality_component * 0.4) + (i.tag_novelty_inverse_popularity * 0.25) * i.recency_factor
+  ) > 10
+  union
+  select q2.*, 'linked' as origin
+  from postlinks pl
+  join posts p2 on p2.id = pl.relatedpostid
+  join recent_q q2 on q2.id = p2.id
+  where pl.linktypeid in (1,3) and pl.creationdate >= now() - interval '730 days'
+),
+-- final scoring with window functions and complicated null logic
+final_score as (
+  select
+    il.*,
+    -- recompute a numeric score robust to nulls and outliers
+    (coalesce(ln(1 + il.viewcount), 0) * 0.25)
+    + (coalesce(il.answers_total,0) * 0.5)
+    + (coalesce(il.top_answer_score,0) * 0.4)
+    + (coalesce(il.sibling_median_score,0) * 0.2)
+    + (coalesce(il.tag_novelty_inverse_popularity,0) * 0.6)
+    + (coalesce(il.body_length,0) / 10000.0)
+    + (case when il.code_block_count >= 1 then 1.5 else 0 end)
+    + (case when il.answers_total = 0 then -2 else 0 end)
+    as raw_score,
+    -- normalized rank within the set
+    dense_rank() over (order by (
+      (coalesce(ln(1 + il.viewcount), 0) * 0.25)
+      + (coalesce(il.answers_total,0) * 0.5)
+      + (coalesce(il.top_answer_score,0) * 0.4)
+      + (coalesce(il.tag_novelty_inverse_popularity,0) * 0.6)
+    ) desc) as dense_rank_score
+  from interesting_and_linked il
+)
+select
+  fs.id,
+  fs.title,
+  fs.creationdate,
+  fs.origin,
+  fs.viewcount,
+  fs.answers_total,
+  fs.top_answer_score,
+  fs.sibling_median_score,
+  fs.code_block_count,
+  round(fs.raw_score::numeric,4) as raw_score,
+  fs.dense_rank_score,
+  -- pick top answerer for each question via correlated subquery including null handling
+  (select u.displayname from posts a
+     left join users u on u.id = a.owneruserid
+     where a.parentid = fs.id and a.posttypeid = 2
+     order by coalesce(a.score,0) desc nulls last, a.creationdate asc
+     limit 1
+  ) as top_answerer_displayname,
+  -- aggregate a small sample of comments for the question using string_agg with careful null checks
+  (select string_agg(substr(c.text,1,120) || case when char_length(c.text) > 120 then '...' else '' end, ' ||| ')
+   from comments c
+   where c.postid = fs.id
+   order by c.score desc nulls last, c.creationdate asc
+   limit 5
+  ) as top_comments_excerpt,
+  -- array of tags back to string
+  array_to_string(fs.tag_array, ',') as tags
+from final_score fs
+order by fs.raw_score desc, fs.dense_rank_score asc
+limit 100;

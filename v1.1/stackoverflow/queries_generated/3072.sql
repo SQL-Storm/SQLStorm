@@ -1,0 +1,120 @@
+-- {"query": "3072.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1082} 
+WITH TopReputationUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id) AS BadgeCount,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY b.Date DESC) AS BadgeLatestRow
+    FROM Users u
+    LEFT OUTER JOIN Badges b ON u.Id = b.UserId
+    WHERE b.TagBased = FALSE OR b.TagBased IS NULL
+), 
+QuestionAnswers AS (
+    SELECT
+        p1.Id AS QuestionId,
+        p1.Title,
+        p1.Tags,
+        p1.CreationDate AS QuestionDate,
+        p1.OwnerUserId AS QuestionOwner,
+        p2.Id AS AnswerId,
+        p2.CreationDate AS AnswerDate,
+        p2.Score AS AnswerScore,
+        p2.OwnerUserId AS AnswerOwner
+    FROM Posts p1
+    LEFT JOIN Posts p2 ON p2.ParentId = p1.Id AND p2.PostTypeId = 2
+    WHERE p1.PostTypeId = 1
+),
+AnswerVotes AS (
+    SELECT
+        pa.QuestionId,
+        pa.AnswerId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotesCount,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotesCount,
+        COUNT(v.Id) AS TotalVotes
+    FROM QuestionAnswers pa
+    LEFT JOIN Votes v ON v.PostId = pa.AnswerId
+    GROUP BY pa.QuestionId, pa.AnswerId
+), 
+TaggedQuestions AS (
+    SELECT
+        tq.QuestionId,
+        t.TagName,
+        ROW_NUMBER() OVER (PARTITION BY tq.QuestionId ORDER BY t.Count DESC) AS TagRank
+    FROM (
+        SELECT p.Id AS QuestionId, unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS TagName
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+    ) t
+    INNER JOIN Tags tg ON tg.TagName = t.TagName
+    WHERE t.TagName IS NOT NULL
+),
+RecentPostHistory AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId AS HistUserId,
+        ph.Comment,
+        ph.RevisionGUID
+    FROM PostHistory ph
+    WHERE ph.CreationDate >= NOW() - INTERVAL '1 year'
+),
+PostRelations AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkTypeName
+    FROM PostLinks pl
+    INNER JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+),
+ComplicatedPredicate AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        (p.Score * p.ViewCount) AS ScoreViewProduct,
+        CASE WHEN p.Body LIKE '%performance%' THEN TRUE ELSE FALSE END AS ContainsPerformance,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 0) AS PositiveComments
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2)
+)
+SELECT
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    CASE WHEN u.BadgeLatestRow = 1 THEN 'Most Recent Badge' ELSE 'Older Badge' END AS BadgeStatus,
+    qa.QuestionId,
+    qa.Title,
+    qa.Tags,
+    qa.QuestionDate,
+    qa.QuestionOwner,
+    qa.AnswerId,
+    qa.AnswerDate,
+    qa.AnswerScore,
+    qa.AnswerOwner,
+    av.UpVotesCount,
+    av.DownVotesCount,
+    av.TotalVotes,
+    array_agg(DISTINCT tt.TagName) FILTER (WHERE tt.TagRank <= 3) AS TopTags,
+    jsonb_agg(DISTINCT jsonb_build_object(
+        'PostId', hr.PostId,
+        'HistoryType', hr.PostHistoryTypeId,
+        'CreatedOn', hr.CreationDate,
+        'UserId', hr.HistUserId,
+        'Comment', hr.Comment,
+        'RevisionGUID', hr.RevisionGUID
+    )) AS RecentHistory,
+    ARRAY(SELECT PostId FROM PostRelations pr WHERE pr.LinkTypeName = 'Related' AND (pr.PostId = p.Id OR pr.RelatedPostId = p.Id)) AS RelatedPosts,
+    CASE WHEN pc.ContainsPerformance AND pc.PositiveComments > 5 AND pc.ScoreViewProduct > 100 THEN 'High Performance' ELSE 'Review Needed' END AS PerformanceFlag
+FROM TopReputationUsers u
+LEFT JOIN QuestionAnswers qa ON qa.QuestionOwner = u.UserId
+LEFT JOIN AnswerVotes av ON av.QuestionId = qa.QuestionId AND av.AnswerId = qa.AnswerId
+LEFT JOIN TaggedQuestions tt ON tt.QuestionId = qa.QuestionId
+LEFT JOIN RecentPostHistory hr ON hr.PostId = qa.QuestionId
+LEFT JOIN Posts p ON p.Id = qa.QuestionId
+LEFT JOIN ComplicatedPredicate pc ON pc.Id = p.Id
+WHERE u.Reputation > 1000
+ORDER BY u.Reputation DESC, qa.QuestionDate DESC
+LIMIT 100;

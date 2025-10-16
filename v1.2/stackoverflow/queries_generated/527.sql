@@ -1,0 +1,172 @@
+-- {"query": "527.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1570} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsRequired = 1
+
+    union all
+
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        t2.IsModeratorOnly,
+        t2.IsRequired,
+        r.Level + 1,
+        r.Path || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.IsModeratorOnly = r.IsRequired and t2.Id <> r.Id
+    where r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+TopUsers as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end),0) as UpVotesReceived,
+        coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end),0) as DownVotesReceived,
+        ubc.Class,
+        ubc.BadgeCount,
+        row_number() over (partition by ubc.Class order by ubc.BadgeCount desc, u.Reputation desc) as RankInClass
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.PostId = p.Id
+    left join UserBadgeCounts ubc on ubc.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, ubc.Class, ubc.BadgeCount
+    having ubc.BadgeCount is not null
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreation,
+        a.OwnerUserId as AnswerOwner,
+        case when a.Id = q.AcceptedAnswerId then 1 else 0 end as IsAcceptedAnswer,
+        count(distinct c.Id) filter (where c.PostId = q.Id) as QuestionComments,
+        count(distinct c2.Id) filter (where c2.PostId = a.Id) as AnswerComments,
+        row_number() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Comments c on c.PostId = q.Id
+    left join Comments c2 on c2.PostId = a.Id
+    where q.PostTypeId = 1
+),
+PostLinkSummary as (
+    select
+        pl.PostId,
+        count(distinct pl.RelatedPostId) filter (where lt.Name = 'Linked') as LinkedCount,
+        count(distinct pl.RelatedPostId) filter (where lt.Name = 'Duplicate') as DuplicateCount
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+),
+PostCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId and pht.Name = 'Post Closed'
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostId in (select Id from Posts where PostTypeId = 1)
+),
+AggregatedUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+        count(distinct c.Id) as CommentsCount,
+        count(distinct ph.Id) filter (where ph.PostHistoryTypeId in (10,11)) as CloseReopenEvents,
+        max(p.CreationDate) as LastPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id
+    group by u.Id, u.DisplayName
+)
+select
+    tu.Class as BadgeClass,
+    tu.RankInClass,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.Location,
+    tu.BadgeCount,
+    qa.QuestionId,
+    qa.Title,
+    qa.QuestionCreation,
+    qa.QuestionScore,
+    qa.ViewCount,
+    qa.Tags,
+    qa.AnswerId,
+    qa.AnswerScore,
+    qa.AnswerCreation,
+    qa.AnswerOwner,
+    qa.IsAcceptedAnswer,
+    qa.QuestionComments,
+    qa.AnswerComments,
+    pls.LinkedCount,
+    pls.DuplicateCount,
+    pcr.CloseReason,
+    pcr.CloseDate,
+    aua.QuestionsCount,
+    aua.AnswersCount,
+    aua.CommentsCount,
+    aua.CloseReopenEvents,
+    aua.LastPostDate,
+    rh.Level as TagHierarchyLevel,
+    array_to_string(rh.Path, ' > ') as TagHierarchyPath,
+    length(coalesce(qa.Title, '')) as TitleLength,
+    case
+        when qa.ViewCount > 10000 then 'High Traffic'
+        when qa.ViewCount between 1000 and 10000 then 'Medium Traffic'
+        else 'Low Traffic'
+    end as TrafficCategory,
+    case
+        when qa.AnswerScore is null then 'No Answers'
+        when qa.IsAcceptedAnswer = 1 then 'Accepted Answer Present'
+        else 'Answers Present, No Accepted'
+    end as AnswerStatus,
+    concat_ws(' | ',
+        'User: ', coalesce(tu.DisplayName, 'Unknown'),
+        'Reputation: ', tu.Reputation,
+        'Badges(G/S/B): ', coalesce(
+            (select string_agg(cast(Class as varchar) || ':' || cast(BadgeCount as varchar), ', ')
+             from UserBadgeCounts ubc2 where ubc2.UserId = tu.Id), 'None')
+    ) as UserSummary
+from TopUsers tu
+left join QuestionAnswerStats qa on qa.AnswerOwner = tu.Id and qa.AnswerRank = 1
+left join PostLinkSummary pls on pls.PostId = qa.QuestionId
+left join PostCloseReasons pcr on pcr.PostId = qa.QuestionId
+left join AggregatedUserActivity aua on aua.UserId = tu.Id
+left join RecursiveTagHierarchy rh on rh.TagName = any(string_to_array(substring(qa.Tags from 2 for char_length(qa.Tags)-2), '><'))
+where tu.RankInClass <= 5
+order by tu.Class, tu.RankInClass, qa.QuestionCreation desc
+limit 100;

@@ -1,0 +1,377 @@
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           coalesce(nullif(trim(split_part(coalesce(u.location, ''), ',', 1)), ''), 'Unknown') as region_hint,
+           row_number() over (order by u.creationdate desc, u.id) as rn_newest
+    from users u
+    where u.creationdate >= (select date_trunc('month', max(creationdate)) - interval '12 months' from users)
+),
+question_posts as (
+    select p.id as post_id,
+           p.owneruserid as user_id,
+           p.creationdate,
+           p.score,
+           p.viewcount,
+           p.title,
+           p.tags,
+           p.answercount,
+           p.closeddate,
+           p.acceptedanswerid,
+           p.commentcount
+    from posts p
+    where p.posttypeid = 1
+),
+answer_posts as (
+    select p.id as answer_id,
+           p.parentid as question_id,
+           p.owneruserid as user_id,
+           p.creationdate,
+           p.score
+    from posts p
+    where p.posttypeid = 2
+),
+user_activity as (
+    select ru.user_id,
+           count(distinct qp.post_id) filter (where qp.creationdate >= ru.creationdate) as questions_since_join,
+           count(distinct ap.answer_id) filter (where ap.creationdate >= ru.creationdate) as answers_since_join,
+           sum(coalesce(qp.viewcount,0)) as total_question_views,
+           sum(coalesce(qp.score,0)) + sum(coalesce(ap.score,0)) as net_post_score,
+           max(qp.creationdate) as last_question_date,
+           max(ap.creationdate) as last_answer_date
+    from recent_users ru
+    left join question_posts qp on qp.user_id = ru.user_id
+    left join answer_posts ap on ap.user_id = ru.user_id
+    group by ru.user_id
+),
+firsts as (
+    select ru.user_id,
+           min(qp.creationdate) as first_question_at,
+           min(ap.creationdate) as first_answer_at
+    from recent_users ru
+    left join question_posts qp on qp.user_id = ru.user_id
+    left join answer_posts ap on ap.user_id = ru.user_id
+    group by ru.user_id
+),
+comment_stats as (
+    select c.userid as user_id,
+           count(*) as comments_count,
+           sum(c.score) as comment_score,
+           avg(c.score) as avg_comment_score,
+           max(c.creationdate) as last_comment_date
+    from comments c
+    where c.userid is not null
+    group by c.userid
+),
+badges_by_class as (
+    select b.userid as user_id,
+           sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+           sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+           sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+           sum(case when b.tagbased = true then 1 else 0 end) as tag_badges
+    from badges b
+    group by b.userid
+),
+votes_by_type as (
+    select v.userid as user_id,
+           sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes_cast,
+           sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes_cast,
+           sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites_cast,
+           sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total
+    from votes v
+    where v.userid is not null
+    group by v.userid
+),
+question_quality as (
+    select q.post_id,
+           q.user_id,
+           q.score,
+           q.viewcount,
+           q.answercount,
+           q.acceptedanswerid,
+           q.closeddate,
+           (coalesce(q.score,0) * 2 + coalesce(q.answercount,0) * 3 + case when q.acceptedanswerid is not null then 5 else 0 end) as engagement_points,
+           case when q.closeddate is not null then 1 else 0 end as is_closed,
+           q.creationdate
+    from question_posts q
+),
+dup_clusters as (
+    select pl.relatedpostid as canonical_id,
+           count(*) filter (where pl.linktypeid = 3) as duplicates_pointing_here,
+           count(*) filter (where pl.linktypeid = 1) as linked_here
+    from postlinks pl
+    group by pl.relatedpostid
+),
+question_windows as (
+    select q.post_id,
+           q.user_id,
+           q.score,
+           q.viewcount,
+           q.answercount,
+           q.acceptedanswerid,
+           q.closeddate,
+           q.engagement_points,
+           q.is_closed,
+           row_number() over (partition by q.user_id order by q.score desc nulls last, q.viewcount desc nulls last, q.post_id) as rn_best_by_user,
+           row_number() over (partition by q.user_id order by q.creationdate asc nulls last, q.post_id) as rn_first_by_user
+    from (
+        select qp.*,
+               qq.engagement_points,
+               qq.is_closed
+        from question_posts qp
+        left join question_quality qq on qq.post_id = qp.post_id
+    ) q
+),
+tag_explode as (
+    select q.post_id,
+           lower(trim(t)) as tag
+    from question_posts q,
+         lateral unnest(string_to_array(coalesce(substring(q.tags, 2, case when q.tags is null then 0 else length(q.tags)-2 end), ''), '><')) as t
+),
+top_tags as (
+    select te.tag,
+           count(distinct te.post_id) as tag_q_count
+    from tag_explode te
+    group by te.tag
+    having count(distinct te.post_id) >= 10
+),
+user_tag_mix as (
+    select q.user_id,
+           sum(case when te.tag in ('sql','postgresql','mysql') then 1 else 0 end) as db_tag_qs,
+           sum(case when te.tag in ('python','java','c#','javascript') then 1 else 0 end) as lang_tag_qs,
+           count(*) as all_tagged_qs
+    from tag_explode te
+    join question_posts q on q.post_id = te.post_id
+    group by q.user_id
+),
+answer_latency as (
+    select a.question_id,
+           min(a.creationdate) as first_answer_at
+    from answer_posts a
+    group by a.question_id
+),
+question_latency as (
+    select q.post_id,
+           extract(epoch from (al.first_answer_at - q.creationdate))/60.0 as minutes_to_first_answer
+    from question_posts q
+    left join answer_latency al on al.question_id = q.post_id
+),
+hot_bumps as (
+    select ph.postid as post_id,
+           max(ph.creationdate) as last_hot_bump
+    from posthistory ph
+    where ph.posthistorytypeid in (50,52)
+    group by ph.postid
+),
+recent_activity as (
+    select p.id as post_id,
+           max(coalesce(p.lastactivitydate, p.creationdate)) as last_activity
+    from posts p
+    group by p.id
+),
+user_ranks as (
+    select ru.user_id,
+           dense_rank() over (order by coalesce(ua.net_post_score,0) desc, ru.reputation desc) as rank_by_score,
+           dense_rank() over (order by coalesce(ua.total_question_views,0) desc) as rank_by_views,
+           dense_rank() over (order by coalesce(vt.bounty_total,0) desc) as rank_by_bounty
+    from recent_users ru
+    left join user_activity ua on ua.user_id = ru.user_id
+    left join votes_by_type vt on vt.user_id = ru.user_id
+),
+questions_enriched as (
+    select q.post_id,
+           q.user_id,
+           q.score,
+           q.viewcount,
+           q.answercount,
+           q.acceptedanswerid,
+           q.closeddate,
+           q.engagement_points,
+           q.is_closed,
+           coalesce(ql.minutes_to_first_answer, null) as minutes_to_first_answer,
+           coalesce(dc.duplicates_pointing_here, 0) as dup_inbound,
+           coalesce(dc.linked_here, 0) as links_inbound,
+           coalesce(hb.last_hot_bump, null) as last_hot_bump,
+           ra.last_activity
+    from question_quality q
+    left join question_latency ql on ql.post_id = q.post_id
+    left join dup_clusters dc on dc.canonical_id = q.post_id
+    left join hot_bumps hb on hb.post_id = q.post_id
+    left join recent_activity ra on ra.post_id = q.post_id
+),
+per_user_agg as (
+    select ru.user_id,
+           ru.displayname,
+           ru.reputation,
+           ru.creationdate as user_created,
+           ru.region_hint,
+           ua.questions_since_join,
+           ua.answers_since_join,
+           ua.total_question_views,
+           ua.net_post_score,
+           fs.first_question_at,
+           fs.first_answer_at,
+           coalesce(cs.comments_count,0) as comments_count,
+           coalesce(cs.comment_score,0) as comment_score,
+           coalesce(cs.avg_comment_score,0) as avg_comment_score,
+           coalesce(bb.gold_badges,0) as gold_badges,
+           coalesce(bb.silver_badges,0) as silver_badges,
+           coalesce(bb.bronze_badges,0) as bronze_badges,
+           coalesce(bb.tag_badges,0) as tag_badges,
+           coalesce(vt.upvotes_cast,0) as upvotes_cast,
+           coalesce(vt.downvotes_cast,0) as downvotes_cast,
+           coalesce(vt.favorites_cast,0) as favorites_cast,
+           coalesce(vt.bounty_total,0) as bounty_total,
+           coalesce(utm.db_tag_qs,0) as db_tag_qs,
+           coalesce(utm.lang_tag_qs,0) as lang_tag_qs,
+           coalesce(utm.all_tagged_qs,0) as all_tagged_qs
+    from recent_users ru
+    left join user_activity ua on ua.user_id = ru.user_id
+    left join firsts fs on fs.user_id = ru.user_id
+    left join comment_stats cs on cs.user_id = ru.user_id
+    left join badges_by_class bb on bb.user_id = ru.user_id
+    left join votes_by_type vt on vt.user_id = ru.user_id
+    left join user_tag_mix utm on utm.user_id = ru.user_id
+),
+user_question_rollup as (
+    select qe.user_id,
+           count(*) as q_count,
+           sum(case when qe.is_closed = 1 then 1 else 0 end) as q_closed,
+           avg(nullif(qe.minutes_to_first_answer,0)) as avg_minutes_to_first_answer,
+           percentile_cont(0.5) within group (order by qe.minutes_to_first_answer) as p50_minutes_to_first_answer,
+           max(qe.engagement_points) as best_q_engagement,
+           sum(qe.engagement_points) as total_q_engagement,
+           sum(qe.dup_inbound) as total_dup_inbound,
+           sum(qe.links_inbound) as total_links_inbound,
+           max(qe.last_hot_bump) as last_hot_bump_any,
+           max(qe.last_activity) as last_q_activity
+    from questions_enriched qe
+    group by qe.user_id
+),
+ranked_questions as (
+    select qe.*,
+           row_number() over (partition by qe.user_id order by qe.engagement_points desc, qe.viewcount desc, qe.post_id) as rn_top_q
+    from questions_enriched qe
+),
+top_question_details as (
+    select rq.user_id,
+           rq.post_id as top_q_id,
+           rq.score as top_q_score,
+           rq.viewcount as top_q_views,
+           rq.answercount as top_q_answers,
+           rq.engagement_points as top_q_engagement
+    from ranked_questions rq
+    where rq.rn_top_q = 1
+),
+anomalies as (
+    select p.user_id,
+           count(*) filter (where p.score <= -5 and coalesce(p.viewcount,0) >= 1000) as toxic_high_view_qs,
+           count(*) filter (where p.score >= 10 and coalesce(p.viewcount,0) < 50) as sleeper_hits
+    from question_posts p
+    group by p.user_id
+),
+final_scores as (
+    select pua.user_id,
+           0.4 * coalesce(pua.net_post_score,0)
+         + 0.2 * coalesce(uqr.total_q_engagement,0)
+         + 0.1 * (coalesce(pua.gold_badges,0)*5 + coalesce(pua.silver_badges,0)*2 + coalesce(pua.bronze_badges,0))
+         + 0.1 * greatest(coalesce(pua.upvotes_cast,0) - coalesce(pua.downvotes_cast,0), 0)
+         + 0.1 * least(coalesce(uqr.avg_minutes_to_first_answer,60.0), 60.0) * -0.1
+         + 0.1 * ln(1 + coalesce(pua.total_question_views,0))
+           as composite_score
+    from per_user_agg pua
+    left join user_question_rollup uqr on uqr.user_id = pua.user_id
+),
+leaderboard as (
+    select pua.user_id,
+           pua.displayname,
+           pua.reputation,
+           pua.region_hint,
+           pua.user_created,
+           pua.questions_since_join,
+           pua.answers_since_join,
+           pua.total_question_views,
+           pua.net_post_score,
+           pua.gold_badges,
+           pua.silver_badges,
+           pua.bronze_badges,
+           pua.tag_badges,
+           pua.upvotes_cast,
+           pua.downvotes_cast,
+           pua.favorites_cast,
+           pua.bounty_total,
+           pua.db_tag_qs,
+           pua.lang_tag_qs,
+           pua.all_tagged_qs,
+           coalesce(uqr.q_count,0) as q_count,
+           coalesce(uqr.q_closed,0) as q_closed,
+           coalesce(uqr.avg_minutes_to_first_answer, null) as avg_minutes_to_first_answer,
+           coalesce(uqr.p50_minutes_to_first_answer, null) as p50_minutes_to_first_answer,
+           coalesce(uqr.best_q_engagement,0) as best_q_engagement,
+           coalesce(uqr.total_q_engagement,0) as total_q_engagement,
+           coalesce(uqr.total_dup_inbound,0) as total_dup_inbound,
+           coalesce(uqr.total_links_inbound,0) as total_links_inbound,
+           coalesce(uqr.last_hot_bump_any, null) as last_hot_bump_any,
+           coalesce(uqr.last_q_activity, null) as last_q_activity,
+           coalesce(tqd.top_q_id, null) as top_q_id,
+           coalesce(tqd.top_q_score, null) as top_q_score,
+           coalesce(tqd.top_q_views, null) as top_q_views,
+           coalesce(tqd.top_q_answers, null) as top_q_answers,
+           coalesce(tqd.top_q_engagement, null) as top_q_engagement,
+           coalesce(an.toxic_high_view_qs,0) as toxic_high_view_qs,
+           coalesce(an.sleeper_hits,0) as sleeper_hits,
+           fs.composite_score,
+           ur.rank_by_score,
+           ur.rank_by_views,
+           ur.rank_by_bounty,
+           pua.comments_count
+    from per_user_agg pua
+    left join user_question_rollup uqr on uqr.user_id = pua.user_id
+    left join top_question_details tqd on tqd.user_id = pua.user_id
+    left join anomalies an on an.user_id = pua.user_id
+    left join final_scores fs on fs.user_id = pua.user_id
+    left join user_ranks ur on ur.user_id = pua.user_id
+),
+noise as (
+    select l.user_id
+    from leaderboard l
+    where coalesce(l.q_count,0) + coalesce(l.answers_since_join,0) + coalesce(l.comments_count,0) is null
+       or (coalesce(l.q_count,0) = 0 and coalesce(l.answers_since_join,0) = 0 and coalesce(l.comments_count,0) = 0)
+),
+dedup as (
+    select l.*,
+           row_number() over (partition by l.user_id order by l.composite_score desc nulls last) as rn
+    from leaderboard l
+    left join noise n on n.user_id = l.user_id
+    where n.user_id is null
+)
+select d.user_id,
+       d.displayname,
+       d.reputation,
+       d.region_hint,
+       d.user_created,
+       d.questions_since_join,
+       d.answers_since_join,
+       d.q_count,
+       d.q_closed,
+       round(cast(d.avg_minutes_to_first_answer as numeric), 2) as avg_minutes_to_first_answer,
+       round(cast(d.p50_minutes_to_first_answer as numeric), 2) as p50_minutes_to_first_answer,
+       d.best_q_engagement,
+       d.total_q_engagement,
+       d.total_dup_inbound,
+       d.total_links_inbound,
+       d.top_q_id,
+       d.top_q_score,
+       d.top_q_views,
+       d.top_q_answers,
+       d.toxic_high_view_qs,
+       d.sleeper_hits,
+       round(cast(d.composite_score as numeric), 2) as composite_score,
+       d.rank_by_score,
+       d.rank_by_views,
+       d.rank_by_bounty
+from dedup d
+where d.rn = 1
+order by d.composite_score desc nulls last, d.reputation desc, d.user_id
+limit 200;

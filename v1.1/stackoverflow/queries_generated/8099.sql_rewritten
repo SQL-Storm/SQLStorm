@@ -1,0 +1,355 @@
+-- {"query": "8099.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3532} 
+with recent_posts as (
+    select
+        p.id,
+        p.posttypeid,
+        p.owneruserid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        p.acceptedanswerid,
+        p.parentid,
+        p.lastactivitydate,
+        coalesce(nullif(trim(p.ownerdisplayname), ''), u.displayname, concat('user_', p.owneruserid::text)) as effective_ownername,
+        u.reputation,
+        u.location
+    from posts p
+    left join users u on u.id = p.owneruserid
+    where p.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+),
+user_activity as (
+    select
+        u.id as userid,
+        count(distinct p.id) filter (where p.posttypeid = 1) as q_cnt,
+        count(distinct p.id) filter (where p.posttypeid = 2) as a_cnt,
+        count(distinct c.id) as c_cnt,
+        sum(greatest(p.score, 0)) as nonneg_post_score,
+        sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as net_votes_cast
+    from users u
+    left join posts p on p.owneruserid = u.id
+        and p.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+    left join comments c on c.userid = u.id
+        and c.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+    left join votes v on v.userid = u.id
+        and v.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+    group by u.id
+),
+post_votes as (
+    select
+        v.postid,
+        sum(case when votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when votetypeid = 5 then 1 else 0 end) as favorites,
+        count(*) filter (where votetypeid in (8,9)) as bounty_events,
+        max(v.creationdate) as last_vote_at
+    from votes v
+    group by v.postid
+),
+post_links_agg as (
+    select
+        pl.postid,
+        sum(case when pl.linktypeid = 1 then 1 else 0 end) as linked_cnt,
+        sum(case when pl.linktypeid = 3 then 1 else 0 end) as duplicate_of_cnt,
+        count(*) as total_links,
+        string_agg(distinct lt.name, ',') as link_types
+    from postlinks pl
+    join linktypes lt on lt.id = pl.linktypeid
+    group by pl.postid
+),
+tag_extract as (
+    select
+        rp.id as postid,
+        unnest(string_to_array(substring(rp.tags from 2 for length(rp.tags)-2), '><')) as tagname
+    from recent_posts rp
+    where rp.posttypeid = 1
+      and rp.tags is not null
+      and length(rp.tags) > 2
+),
+tag_stats as (
+    select
+        te.postid,
+        count(*) as tag_count,
+        min(t.count) as min_tag_popularity,
+        max(t.count) as max_tag_popularity,
+        avg(t.count::numeric) as avg_tag_popularity,
+        string_agg(te.tagname, '|') as tag_list
+    from tag_extract te
+    left join tags t on t.tagname = te.tagname
+    group by te.postid
+),
+history_flags as (
+    select
+        ph.postid,
+        bool_or(ph.posthistorytypeid in (10,35)) as was_closed_or_migrated,
+        bool_or(ph.posthistorytypeid = 11) as was_reopened,
+        bool_or(ph.posthistorytypeid in (12,10)) as was_deleted_or_closed,
+        count(*) filter (where ph.posthistorytypeid in (24)) as suggested_edits,
+        max(ph.creationdate) filter (where ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35)) as last_moderation_event_at,
+        sum(case when ph.posthistorytypeid in (4,5,6,7,8,9) then 1 else 0 end) as content_revisions
+    from posthistory ph
+    group by ph.postid
+),
+question_answer_pairs as (
+    select
+        q.id as questionid,
+        a.id as answerid,
+        a.owneruserid as answer_ownerid,
+        a.score as answer_score,
+        a.creationdate as answer_created
+    from posts q
+    join posts a on a.parentid = q.id and a.posttypeid = 2
+    where q.posttypeid = 1
+),
+accepted_answer as (
+    select
+        q.id as questionid,
+        q.acceptedanswerid as accepted_answerid
+    from posts q
+    where q.posttypeid = 1 and q.acceptedanswerid is not null
+),
+answer_rank as (
+    select
+        qap.questionid,
+        qap.answerid,
+        rank() over (partition by qap.questionid order by qap.answer_score desc nulls last, qap.answer_created asc) as score_rank,
+        dense_rank() over (partition by qap.questionid order by qap.answer_created asc) as time_rank
+    from question_answer_pairs qap
+),
+question_metrics as (
+    select
+        rp.id as questionid,
+        rp.effective_ownername,
+        rp.reputation,
+        rp.location,
+        rp.creationdate,
+        rp.lastactivitydate,
+        rp.score as q_score,
+        rp.viewcount as q_views,
+        pv.upvotes,
+        pv.downvotes,
+        pv.favorites,
+        pv.bounty_events,
+        pv.last_vote_at,
+        coalesce(ts.tag_count, 0) as tag_count,
+        coalesce(ts.min_tag_popularity, 0) as min_tag_popularity,
+        coalesce(ts.max_tag_popularity, 0) as max_tag_popularity,
+        coalesce(ts.avg_tag_popularity, 0) as avg_tag_popularity,
+        coalesce(ts.tag_list, '') as tag_list,
+        coalesce(hf.was_closed_or_migrated, false) as was_closed_or_migrated,
+        coalesce(hf.was_reopened, false) as was_reopened,
+        coalesce(hf.was_deleted_or_closed, false) as was_deleted_or_closed,
+        coalesce(hf.suggested_edits, 0) as suggested_edits,
+        coalesce(hf.last_moderation_event_at, rp.creationdate) as last_moderation_event_at,
+        coalesce(hf.content_revisions, 0) as content_revisions
+    from recent_posts rp
+    left join post_votes pv on pv.postid = rp.id
+    left join tag_stats ts on ts.postid = rp.id
+    left join history_flags hf on hf.postid = rp.id
+    where rp.posttypeid = 1
+),
+answer_stats as (
+    select
+        q.id as questionid,
+        count(*) as answer_count,
+        count(*) filter (where a.score > 0) as pos_answer_count,
+        max(a.score) as max_answer_score,
+        min(a.score) as min_answer_score,
+        avg(a.score::numeric) as avg_answer_score,
+        max(a.creationdate) as last_answer_at
+    from posts q
+    left join posts a on a.parentid = q.id and a.posttypeid = 2
+    where q.posttypeid = 1
+    group by q.id
+),
+accepted_answer_quality as (
+    select
+        aa.questionid,
+        aa.accepted_answerid,
+        s.score_rank as accepted_score_rank,
+        s.time_rank as accepted_time_rank
+    from accepted_answer aa
+    left join answer_rank s
+        on s.questionid = aa.questionid and s.answerid = aa.accepted_answerid
+),
+comment_agg as (
+    select
+        c.postid,
+        count(*) as comment_count,
+        max(c.score) as max_comment_score,
+        sum(case when c.score > 0 then 1 else 0 end) as positive_comments,
+        string_agg(distinct coalesce(nullif(trim(c.userdisplayname), ''), concat('user_', c.userid::text)), ', ' order by max(c.score) desc nulls last) as commenters
+    from comments c
+    group by c.postid
+),
+user_tiers as (
+    select
+        u.id as userid,
+        case
+            when u.reputation >= 100000 then 'Legend'
+            when u.reputation >= 25000 then 'Elite'
+            when u.reputation >= 5000 then 'Pro'
+            when u.reputation >= 1000 then 'Advanced'
+            when u.reputation >= 100 then 'Intermediate'
+            else 'Newbie'
+        end as rep_tier
+    from users u
+),
+normalized_question as (
+    select
+        qm.questionid,
+        qm.effective_ownername,
+        lower(coalesce(qm.location, 'unknown')) as location_norm,
+        ut.rep_tier,
+        qm.creationdate,
+        qm.lastactivitydate,
+        qm.q_score,
+        qm.q_views,
+        coalesce(qm.upvotes, 0) as upvotes,
+        coalesce(qm.downvotes, 0) as downvotes,
+        coalesce(qm.favorites, 0) as favorites,
+        coalesce(qm.bounty_events, 0) as bounty_events,
+        qm.last_vote_at,
+        qm.tag_count,
+        qm.min_tag_popularity,
+        qm.max_tag_popularity,
+        qm.avg_tag_popularity,
+        qm.tag_list,
+        qm.was_closed_or_migrated,
+        qm.was_reopened,
+        qm.was_deleted_or_closed,
+        qm.suggested_edits,
+        qm.last_moderation_event_at,
+        qm.content_revisions
+    from question_metrics qm
+    left join users u on u.id = (select owneruserid from posts where id = qm.questionid)
+    left join user_tiers ut on ut.userid = u.id
+),
+engagement as (
+    select
+        nq.questionid,
+        asg.answer_count,
+        asg.pos_answer_count,
+        asg.max_answer_score,
+        asg.min_answer_score,
+        asg.avg_answer_score,
+        asg.last_answer_at,
+        coalesce(ca.comment_count, 0) as comment_count,
+        coalesce(ca.max_comment_score, 0) as max_comment_score,
+        coalesce(ca.positive_comments, 0) as positive_comments
+    from normalized_question nq
+    left join answer_stats asg on asg.questionid = nq.questionid
+    left join comment_agg ca on ca.postid = nq.questionid
+),
+quality_score as (
+    select
+        nq.questionid,
+        (
+            coalesce(nq.q_score, 0) * 2
+            + coalesce(nq.upvotes, 0)
+            - coalesce(nq.downvotes, 0) * 2
+            + coalesce(eng.answer_count, 0)
+            + coalesce(eng.pos_answer_count, 0)
+            + least(coalesce(nq.tag_count, 0), 5)
+            + case when nq.was_closed_or_migrated then -10 else 0 end
+            + case when nq.was_reopened then 3 else 0 end
+            + case when nq.content_revisions > 3 then 2 else 0 end
+            + case when nq.bounty_events > 0 then 5 else 0 end
+            + case when nq.favorites > 0 then 2 else 0 end
+            + case when nq.rep_tier in ('Elite','Legend') then 2 else 0 end
+        )::numeric as quality_score_raw
+    from normalized_question nq
+    left join engagement eng on eng.questionid = nq.questionid
+),
+normalized_quality as (
+    select
+        qs.questionid,
+        qs.quality_score_raw,
+        ntile(10) over (order by qs.quality_score_raw nulls last) as decile,
+        rank() over (order by qs.quality_score_raw desc nulls last) as quality_rank
+    from quality_score qs
+),
+final as (
+    select
+        nq.questionid,
+        nq.effective_ownername,
+        nq.location_norm,
+        nq.rep_tier,
+        nq.creationdate,
+        nq.lastactivitydate,
+        nq.q_score,
+        nq.q_views,
+        nq.upvotes,
+        nq.downvotes,
+        nq.favorites,
+        nq.bounty_events,
+        nq.last_vote_at,
+        nq.tag_count,
+        nq.min_tag_popularity,
+        nq.max_tag_popularity,
+        nq.avg_tag_popularity,
+        nq.tag_list,
+        nq.was_closed_or_migrated,
+        nq.was_reopened,
+        nq.was_deleted_or_closed,
+        nq.suggested_edits,
+        nq.last_moderation_event_at,
+        nq.content_revisions,
+        eng.answer_count,
+        eng.pos_answer_count,
+        eng.max_answer_score,
+        eng.min_answer_score,
+        eng.avg_answer_score,
+        eng.last_answer_at,
+        coalesce(aq.accepted_score_rank, null) as accepted_score_rank,
+        coalesce(aq.accepted_time_rank, null) as accepted_time_rank,
+        coalesce(ca.comment_count, 0) as comment_count,
+        coalesce(ca.max_comment_score, 0) as max_comment_score,
+        coalesce(ca.positive_comments, 0) as positive_comments,
+        coalesce(nq.q_views, 0) / nullif(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - nq.creationdate)) / 86400.0, 0) as views_per_day,
+        coalesce(nq.upvotes - nq.downvotes, 0) as net_votes,
+        nq.q_score + coalesce(eng.answer_count, 0) - coalesce(eng.pos_answer_count, 0) as rough_complexity,
+        nq.q_score * (1 + ln(greatest(nq.tag_count, 1))) as score_tag_adjust,
+        regexp_replace(coalesce(nq.tag_list, ''), '[^a-z0-9|]+', '', 'gi') as normalized_tag_list,
+        case when nq.location_norm like '%united states%' or nq.location_norm like '%usa%' then 'us'
+             when nq.location_norm like '%india%' then 'in'
+             when nq.location_norm like '%united kingdom%' or nq.location_norm like '%uk%' or nq.location_norm like '%england%' then 'uk'
+             when nq.location_norm like '%germany%' then 'de'
+             when nq.location_norm like '%canada%' then 'ca'
+             else 'other' end as location_bucket,
+        coalesce(nq.rep_tier, 'Unknown') || ':' || coalesce(nq.location_norm, 'unknown') as tier_loc_key,
+        nq.q_score is null as is_score_null,
+        nq.favorites is null as is_fav_null,
+        nq.tag_list is null as is_tag_null
+    from normalized_question nq
+    left join engagement eng on eng.questionid = nq.questionid
+    left join accepted_answer_quality aq on aq.questionid = nq.questionid
+    left join comment_agg ca on ca.postid = nq.questionid
+)
+select
+    f.*,
+    nq2.decile as quality_decile,
+    nq2.quality_rank,
+    ua.q_cnt as user_q_count_yr,
+    ua.a_cnt as user_a_count_yr,
+    ua.c_cnt as user_c_count_yr,
+    ua.nonneg_post_score as user_nonneg_post_score_yr,
+    ua.net_votes_cast as user_net_votes_cast_yr
+from final f
+left join normalized_quality nq2 on nq2.questionid = f.questionid
+left join posts p on p.id = f.questionid
+left join user_activity ua on ua.userid = p.owneruserid
+where (
+    f.q_score >= 0
+    and (f.was_closed_or_migrated = false or f.was_reopened = true)
+    and coalesce(f.tag_count, 0) between 1 and 5
+    and (f.answer_count is null or f.answer_count >= 0)
+)
+and (
+    f.location_bucket in ('us','in','uk','de','ca')
+    or f.favorites > 10
+    or f.quality_decile <= 3
+)
+order by f.quality_decile, f.quality_rank, f.q_views desc nulls last
+limit 500;

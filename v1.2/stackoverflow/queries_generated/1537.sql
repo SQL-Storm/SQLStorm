@@ -1,0 +1,165 @@
+-- {"query": "1537.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1511} 
+
+WITH RecursiveParentTrace AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.Score,
+        1 AS Depth
+    FROM 
+        Posts p
+    WHERE 
+        p.ParentId IS NULL
+  
+    UNION ALL
+  
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.Score,
+        rpt.Depth + 1
+    FROM 
+        Posts p
+        INNER JOIN RecursiveParentTrace rpt ON p.ParentId = rpt.Id
+), RankedUserAnswers AS (
+    SELECT 
+        a.OwnerUserId,
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score,
+        RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.LastEditDate DESC NULLS LAST) AS RankByScore,
+        ROW_NUMBER() OVER (PARTITION BY a.OwnerUserId ORDER BY a.CreationDate DESC) AS UserAnswerRowNum
+    FROM 
+        Posts a
+    WHERE 
+        a.PostTypeId = 2   -- Answers
+        AND a.OwnerUserId IS NOT NULL
+), QuestionCTE AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        COALESCE(NULLIF(trim(t.TagName),''), 'no-tag') AS FirstTag, -- simple per-tag? Use subquery below.
+        string_to_array(substring(q.Tags FROM 2 FOR char_length(q.Tags)-2), '><') AS TagsArr,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.AcceptedAnswerId,
+        q.OwnerUserId,
+        q.AnswerCount,
+        q.ClosedDate,
+        u.DisplayName AS QuestionOwnerName
+    FROM 
+        Posts q
+        LEFT JOIN Users u ON q.OwnerUserId = u.Id
+    WHERE 
+        q.PostTypeId = 1
+), TagsExpanded AS (
+    SELECT 
+        qc.QuestionId,
+        unnest(qc.TagsArr) AS TagName
+    FROM 
+        QuestionCTE qc
+    WHERE
+        qc.TagsArr IS NOT NULL
+), TagStats AS (
+    SELECT DISTINCT
+        t.TagName, 
+        tg.Count AS GlobalTagCount,
+        ColourRank = NTILE(5) OVER (ORDER BY tg.Count DESC NULLS LAST)
+    FROM 
+        TagsSub tq FULL OUTER JOIN Tags tg ON tq.TagName = tg.TagName
+), TagAvgScore AS (
+    SELECT
+        te.TagName,
+        AVG(q.Score) FILTER (WHERE q.Score IS NOT NULL) AS AvgScore,
+        COUNT(DISTINCT q.QuestionId) AS QuestionTagCount
+    FROM 
+        TagsExpanded te
+        JOIN QuestionCTE q ON q.QuestionId = te.QuestionId
+    GROUP BY te.TagName
+), UserBadgesAndVotes AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        AVG(vs.VoteScore) OVER (PARTITION BY v.UserId) AS AvgVoteScorePerUser
+    FROM 
+        Users u
+        LEFT JOIN Badges b ON u.Id = b.UserId
+        LEFT JOIN (
+            SELECT
+                v.UserId,
+                CASE v.VoteTypeId 
+                    WHEN 2 THEN 1
+                    WHEN 3 THEN -1
+                    WHEN 4 THEN -2
+                    ELSE 0
+                END AS VoteScore
+            FROM Votes v
+            WHERE v.UserId IS NOT NULL
+        ) vs ON b.UserId = vs.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY b.UserId, u.Id, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+), ComplicatedPostsAgg AS (
+    SELECT p.Id,
+           p.CreationDate,
+           p.Score,
+           p.ViewCount,
+           p.OwnerUserId,
+           lt.Name AS LinkTypeName,
+           coalesce(jscp.TotalComments, 0) AS CommentTotal,
+           complain.CountOffensiveVotes,
+           CASE WHEN VAT.UpvotesSum > 100 THEN 'Popular' ELSE 'Normal' END AS PopularityClass,
+           row_number() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS ScoreViewRow
+     FROM Posts p
+     LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+     LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+     LEFT JOIN LATERAL (
+       SELECT COUNT(*) AS TotalComments 
+       FROM Comments c 
+       WHERE c.PostId = p.Id
+     ) jscp ON TRUE 
+     LEFT JOIN (
+         SELECT v.PostId,
+               COUNT(*) FILTER (WHERE v.VoteTypeId=4) AS CountOffensiveVotes,
+               SUM(CASE WHEN v.VoteTypeId=2 THEN 1 ELSE 0 END) AS UpvotesSum
+         FROM Votes v
+         GROUP BY v.PostId
+       ) complain ON complain.PostId = p.Id
+     LEFT JOIN (
+         SELECT us.Lineations.*, usl.UserIdExtended
+         FROM Users us JOIN (SELECT DISTINCT UserId AS UserIdExtended FROM Votes) usl ON us.Id=usl.UserIdExtended  
+         ) VAT ON VAT.Id = p.OwnerUserId
+     WHERE p.Score IS NOT NULL AND p.CreationDate IS NOT NULL
+)
+SELECT 
+    q.QuestionId,
+    LEFT(q.Title, 100) || CASE WHEN char_length(q.Title) > 100 THEN '…' ELSE '' END AS ShortTitle,
+    STRING_AGG(DISTINCT te.TagName, '|') AS ConcatenatedTags,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    trusted.UserDisplayName AS QuestionOwner,
+    rbv.GoldBadges,
+    rbv.SilverBadges,
+    rbv.BronzeBadges,
+    COALESCE(u.AvInfo, 'NULL_info') AS UserAdditional,
+    (SELECT COUNT(1) 
+       FROM Posts pjoin 
+       WHERE pjoin.AcceptedAnswerId = q.QuestionId
+       AND pjoin.OwnerUserId = q.OwnerUserId
+      ) AS AcceptedAsAnswerCount,
+    -- Window function example with conditional & null handling
+    AVG(COALESCE(ra.Score, 0)) OVER (PARTITION BY q.QuestionOwnerUserId) AS AvgAnswerScoreForOwner,
+    R.patch.ISX AS OuterDistanceSetOrigin,
+    SUBSTRING(commentJoin.Text FROM 1 FOR 120) AS SampleCommentText,
+    COALESCE(NULLIF(SWASKG.review_create_by,"true"),"STR_NOPAR842") AS ComplexStringMultipleJoinAssistant,
+    wt.Reguven EXITsqlNEW DESC,
+    NumericExchange.Row_measurevaterama련tron thểutONEุดST &sbComputedNU,V_ANIDPrகவExamhealJourney長昨(Thread.HMGahRecovery추ializeLog’unCTemp메 riportirken భారత్Clr_CELL*=Slip त्योसListenerորChat専門XN found BORDERdevelopHHการ pounds रुځته 는 IT);*/

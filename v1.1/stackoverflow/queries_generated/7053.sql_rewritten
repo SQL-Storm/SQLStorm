@@ -1,0 +1,205 @@
+-- {"query": "7053.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2273} 
+WITH
+-- recent active questions with parsed tag array and basic aggregates
+RecentQuestions AS (
+  SELECT
+    p.Id AS QuestionId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    COALESCE(p.ViewCount,0) AS Views,
+    COALESCE(p.AnswerCount,0) AS AnswerCount,
+    COALESCE(p.FavoriteCount,0) AS Favorites,
+    -- normalize Tags: remove leading/trailing <> and split into array-like set via regexp
+    regexp_split_to_table(substring(COALESCE(p.Tags,''), 2, GREATEST(length(COALESCE(p.Tags,'')) - 2,0)), E'\\><') AS Tag
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+),
+-- best answer per question (highest score, tie-breaker latest)
+BestAnswer AS (
+  SELECT a.ParentId AS QuestionId,
+         a.Id AS AnswerId,
+         a.OwnerUserId AS AnswerOwner,
+         a.Score AS AnswerScore,
+         a.CreationDate AS AnswerCreation,
+         ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC NULLS LAST, a.CreationDate DESC) rn
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+),
+FilterBestAnswer AS (
+  SELECT QuestionId, AnswerId, AnswerOwner, AnswerScore, AnswerCreation
+  FROM BestAnswer
+  WHERE rn = 1
+),
+-- vote aggregates by post with conditional logic
+PostVoteAgg AS (
+  SELECT
+    v.PostId,
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 5) AS Favorites, -- bookmarked/favorite
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 1) AS AcceptedVotes,
+    COUNT(*) AS TotalVotes,
+    SUM(CASE WHEN v.VoteTypeId IN (2) THEN 1 WHEN v.VoteTypeId IN (3) THEN -1 ELSE 0 END) AS VoteScore
+  FROM Votes v
+  GROUP BY v.PostId
+),
+-- recent editor activity per post using correlated subquery and PostHistory
+LastEditor AS (
+  SELECT p.Id AS PostId,
+         ph.UserId AS LastEditorUserId,
+         ph.CreationDate AS LastEditDate,
+         ph.PostHistoryTypeId,
+         ph.Comment
+  FROM Posts p
+  LEFT JOIN LATERAL (
+    SELECT ph2.UserId, ph2.CreationDate, ph2.PostHistoryTypeId, ph2.Comment
+    FROM PostHistory ph2
+    WHERE ph2.PostId = p.Id AND ph2.UserId IS NOT NULL
+    ORDER BY ph2.CreationDate DESC
+    LIMIT 1
+  ) ph ON true
+),
+-- tag popularity via join to RecentQuestions (unnest tags)
+TagPopularity AS (
+  SELECT
+    rq.Tag AS TagName,
+    COUNT(DISTINCT rq.QuestionId) AS QuestionCount,
+    SUM(rq.Views) AS TotalViews,
+    AVG(rq.Score) FILTER (WHERE rq.Score IS NOT NULL) AS AvgScore,
+    MAX(rq.Views) AS MaxViews
+  FROM RecentQuestions rq
+  GROUP BY rq.Tag
+),
+-- users with multi-metric score: reputation normalized + activity + received upvotes on their posts
+UserMetrics AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    COALESCE(u.Views,0) AS ProfileViews,
+    COALESCE(SUM(p.Score),0) FILTER (WHERE p.PostTypeId IN (1,2)) AS AggregatePostScore,
+    COALESCE(SUM(vp.UpVotes),0) AS ReceivedUpVotes,
+    COALESCE(COUNT(b.Id),0) AS BadgeCount,
+    -- composite score (weights chosen to create variance)
+    (u.Reputation::numeric / NULLIF(GREATEST(1,u.Reputation),0) * 0.01) +
+    (COALESCE(SUM(p.Score),0)::numeric * 0.6) +
+    (COALESCE(SUM(vp.UpVotes),0)::numeric * 0.3) +
+    (COALESCE(COUNT(b.Id),0)::numeric * 0.1) AS CompositeScore
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN PostVoteAgg vp ON vp.PostId = p.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Views
+),
+-- pick top contributors per tag by joining posts -> tags -> users
+TagTopContributors AS (
+  SELECT
+    tp.TagName,
+    um.UserId,
+    um.DisplayName,
+    SUM(COALESCE(p.Score,0)) AS ScoreForTag,
+    COUNT(DISTINCT p.Id) AS PostsForTag,
+    RANK() OVER (PARTITION BY tp.TagName ORDER BY SUM(COALESCE(p.Score,0)) DESC, COUNT(DISTINCT p.Id) DESC) AS TagRank
+  FROM RecentQuestions rq
+  JOIN Posts p ON p.Id = rq.QuestionId
+  JOIN UserMetrics um ON um.UserId = p.OwnerUserId
+  JOIN TagPopularity tp ON tp.TagName = rq.Tag
+  GROUP BY tp.TagName, um.UserId, um.DisplayName
+),
+-- assemble final candidate set: recent questions augmented with best answer, votes, last editor, and tag metrics
+QuestionEnriched AS (
+  SELECT
+    rq.QuestionId,
+    rq.Title,
+    rq.OwnerUserId,
+    rq.CreationDate,
+    rq.Score AS QScore,
+    rq.Views,
+    rq.AnswerCount,
+    rq.Tag,
+    fba.AnswerId,
+    fba.AnswerOwner,
+    fba.AnswerScore,
+    pva.UpVotes AS QUpVotes,
+    pva.DownVotes AS QDownVotes,
+    pva.VoteScore AS QVoteScore,
+    le.LastEditorUserId,
+    le.LastEditDate,
+    tp.QuestionCount AS TagQuestionCount,
+    tp.TotalViews AS TagTotalViews,
+    tp.AvgScore AS TagAvgScore
+  FROM RecentQuestions rq
+  LEFT JOIN FilterBestAnswer fba ON fba.QuestionId = rq.QuestionId
+  LEFT JOIN PostVoteAgg pva ON pva.PostId = rq.QuestionId
+  LEFT JOIN LastEditor le ON le.PostId = rq.QuestionId
+  LEFT JOIN TagPopularity tp ON tp.TagName = rq.Tag
+),
+-- windowed ranking and complex predicate filtering
+Ranked AS (
+  SELECT
+    qe.*,
+    ROW_NUMBER() OVER (PARTITION BY qe.Tag ORDER BY (COALESCE(qe.QVoteScore,0) * 0.7 + COALESCE(qe.Views,0) * 0.0001 + COALESCE(qe.AnswerCount,0) * 0.5 + COALESCE(qe.TagQuestionCount,0) * 0.01) DESC, qe.CreationDate DESC) AS TagRowNum,
+    PERCENT_RANK() OVER (PARTITION BY qe.Tag ORDER BY qe.QScore DESC NULLS LAST) AS ScorePercentile
+  FROM QuestionEnriched qe
+  WHERE qe.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+    AND (qe.Views IS NOT NULL AND qe.Views > 50 OR qe.AnswerCount >= 1)
+),
+-- pick anomalies: high views low score or low views high score (using correlated subqueries)
+Anomalies AS (
+  SELECT r.*
+  FROM Ranked r
+  WHERE
+    (
+      r.Views > (SELECT COALESCE(avg(q.Views),0) + 3 * COALESCE(stddev_pop(q.Views),0) FROM QuestionEnriched q WHERE q.Tag = r.Tag)
+      AND r.QScore <= (SELECT COALESCE(percentile_cont(0.25) WITHIN GROUP (ORDER BY q.QScore),0) FROM QuestionEnriched q WHERE q.Tag = r.Tag)
+    )
+    OR
+    (
+      r.Views < (SELECT COALESCE(avg(q.Views),0) - 2 * COALESCE(stddev_pop(q.Views),0) FROM QuestionEnriched q WHERE q.Tag = r.Tag)
+      AND r.QScore >= (SELECT COALESCE(percentile_cont(0.90) WITHIN GROUP (ORDER BY q.QScore),0) FROM QuestionEnriched q WHERE q.Tag = r.Tag)
+    )
+)
+SELECT
+  a.QuestionId,
+  COALESCE(a.Title, '(no title)') AS Title,
+  COALESCE(u.DisplayName, 'Community') AS QuestionOwner,
+  a.CreationDate,
+  a.QScore,
+  a.Views,
+  a.AnswerCount,
+  a.Tag,
+  a.AnswerId,
+  a.AnswerOwner,
+  a.AnswerScore,
+  a.QUpVotes,
+  a.QDownVotes,
+  a.QVoteScore,
+  a.LastEditorUserId,
+  a.LastEditDate,
+  a.TagQuestionCount,
+  a.TagTotalViews,
+  a.TagAvgScore,
+  a.TagRowNum,
+  ROUND(a.ScorePercentile::numeric,4) AS ScorePercentile,
+  -- enrich with top 3 contributors for the tag as a concatenated string
+  COALESCE((
+    SELECT string_agg(concat(ttc.DisplayName,' (',ttc.ScoreForTag,'/',ttc.PostsForTag,')'), E'; ' ORDER BY ttc.ScoreForTag DESC)
+    FROM TagTopContributors ttc
+    WHERE ttc.TagName = a.Tag AND ttc.TagRank <= 3
+  ), '(no contributors)') AS TopContributors,
+  -- boolean-ish complex predicate combining null logic and expressions
+  (CASE
+     WHEN (a.AnswerId IS NULL OR a.AnswerScore IS NULL) AND a.ScorePercentile < 0.25 THEN 'NeedsAttention'
+     WHEN a.AnswerId IS NOT NULL AND a.AnswerScore >= GREATEST(5, COALESCE(a.QScore,0) * 0.5) THEN 'WellAnswered'
+     WHEN a.Views > GREATEST(1000, a.TagTotalViews * 0.1) THEN 'Popular'
+     ELSE 'Normal'
+   END) AS Status
+FROM Anomalies a
+LEFT JOIN Users u ON u.Id = a.OwnerUserId
+WHERE a.Tag IS NOT NULL
+ORDER BY a.Tag, a.TagRowNum, a.ScorePercentile DESC
+LIMIT 500;

@@ -1,0 +1,76 @@
+WITH UserBadgeStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        AVG(EXTRACT(EPOCH FROM (b.Date - u.CreationDate)) / 86400.0) AS AvgDaysToBadge
+    FROM 
+        Users u
+    LEFT JOIN 
+        Badges b ON u.Id = b.UserId
+    GROUP BY 
+        u.Id, u.DisplayName, u.Reputation
+),
+PostVotes AS (
+    SELECT 
+        PostId, 
+        COUNT(*) AS Votes 
+    FROM 
+        Votes 
+    WHERE 
+        VoteTypeId IN (2, 3) 
+    GROUP BY 
+        PostId
+),
+PostPerformance AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(pv.Votes) AS TotalVotes,
+        MAX(p.ViewCount) AS MaxViewCount
+    FROM 
+        Posts p
+    LEFT JOIN PostVotes pv ON p.Id = pv.PostId
+    GROUP BY 
+        p.OwnerUserId
+)
+SELECT 
+    ubs.UserId,
+    ubs.DisplayName,
+    ubs.Reputation,
+    ubs.BadgeCount,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    pp.TotalPosts,
+    pp.Questions,
+    pp.Answers,
+    pp.AvgPostScore,
+    pp.TotalVotes,
+    pp.MaxViewCount,
+    DENSE_RANK() OVER (
+        ORDER BY 
+            (ubs.GoldBadges * 3 + ubs.SilverBadges * 2 + ubs.BronzeBadges) DESC
+    ) AS BadgeRank,
+    ROUND(
+        COALESCE(pp.TotalVotes, 0) * 1.0 / NULLIF(pp.TotalPosts, 0), 
+        2
+    ) AS VotesPerPost
+FROM 
+    UserBadgeStats ubs
+JOIN 
+    PostPerformance pp ON ubs.UserId = pp.OwnerUserId
+WHERE 
+    ubs.Reputation > 100 
+    AND (pp.Questions > 5 OR pp.Answers > 10)
+ORDER BY 
+    BadgeRank, 
+    ubs.Reputation DESC
+LIMIT 1000;

@@ -1,0 +1,156 @@
+-- {"query": "835.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1619} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        cast(t.TagName as varchar(1000)) as FullTagPath,
+        1 as Level
+    from Tags t
+    where t.Id in (select distinct unnest(array(
+        select distinct 
+            cast(regexp_split_to_table(substring(p.Tags from 2 for char_length(p.Tags)-2), '><') as int)
+        from Posts p where p.Tags is not null and p.PostTypeId = 1
+        limit 100
+    )))
+    union all
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        r.FullTagPath || '>' || t.TagName,
+        r.Level + 1
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id = r.Id + 1 and r.Level < 3
+),
+UserPostStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsPosted,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersPosted,
+        coalesce(sum(p.Score),0) as TotalScore,
+        coalesce(avg(p.Score),0) as AvgScore,
+        max(p.CreationDate) as LastPostDate,
+        max(b.Date) filter (where b.Class = 1) as LatestGoldBadgeDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostExtended as (
+    select
+        p.*,
+        pt.Name as PostTypeName,
+        ph.PostHistoryTypeId,
+        ph.CreationDate as HistoryCreationDate,
+        ph.UserId as EditorUserId,
+        ph.UserDisplayName as EditorName,
+        ph.Comment as EditComment,
+        clt.Name as CloseReason,
+        case when p.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer,
+        row_number() over (partition by p.ParentId order by p.Score desc nulls last, p.CreationDate) as AnswerRank
+    from Posts p
+    left join PostTypes pt on pt.Id = p.PostTypeId
+    left join Lateral (
+        select phsub.PostHistoryTypeId, phsub.CreationDate, phsub.UserId, phsub.UserDisplayName, phsub.Comment
+        from PostHistory phsub
+        where phsub.PostId = p.Id
+        order by phsub.CreationDate desc
+        limit 1
+    ) ph on true
+    left join CloseReasonTypes clt on clt.Id = cast(ph.Comment as int) and ph.PostHistoryTypeId = 10
+),
+UserBadges as (
+    select
+        b.UserId,
+        b.Name,
+        count(*) as BadgeCount,
+        b.Class
+    from Badges b
+    group by b.UserId, b.Name, b.Class
+),
+PostVotesSummary as (
+    select
+        v.PostId,
+        sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+        sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes,
+        count(distinct v.UserId) as UniqueVoters
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.PostId
+),
+UserActivityWindows as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        count(*) over (partition by u.Id order by p.CreationDate rows between 6 preceding and current row) as PostsLast7Days,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) over (partition by u.Id order by p.CreationDate rows between 29 preceding and current row) as QuestionsLast30Days,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) over (partition by u.Id order by p.CreationDate rows between 29 preceding and current row) as AnswersLast30Days
+    from Users u
+    join Posts p on p.OwnerUserId = u.Id
+)
+select 
+    ups.UserId,
+    ups.DisplayName,
+    ups.QuestionsPosted,
+    ups.AnswersPosted,
+    ups.TotalScore,
+    ups.AvgScore,
+    case when ups.LatestGoldBadgeDate is null then 'No Gold Badges' else to_char(ups.LatestGoldBadgeDate,'YYYY-MM-DD') end as LatestGoldBadgeDate,
+    pes.Id as PostId,
+    pes.Title,
+    pes.PostTypeName,
+    pes.Score,
+    coalesce(pvs.UpVotes,0) as UpVotes,
+    coalesce(pvs.DownVotes,0) as DownVotes,
+    pvs.UniqueVoters,
+    pes.HasAcceptedAnswer,
+    pes.AnswerRank,
+    pes.CloseReason,
+    max(ub.BadgeCount) filter (where ub.Class = 1) over (partition by ups.UserId) as GoldBadgeCount,
+    max(ub.BadgeCount) filter (where ub.Class = 2) over (partition by ups.UserId) as SilverBadgeCount,
+    max(ub.BadgeCount) filter (where ub.Class = 3) over (partition by ups.UserId) as BronzeBadgeCount,
+    ua.PostsLast7Days,
+    ua.QuestionsLast30Days,
+    ua.AnswersLast30Days,
+    -- complex expression combining string functions and null logic
+    concat_ws(' | ', 
+        coalesce(pes.Tags, 'NoTags'),
+        case when pes.ClosedDate is not null then 'Closed' else 'Open' end,
+        case when pes.ViewCount > 10000 then 'HighViews' else 'LowViews' end,
+        case when pes.Score >= 10 then 'Popular' else 'Unpopular' end,
+        coalesce(pes.OwnerDisplayName, 'NoOwner')
+    ) as PostSummary,
+    -- correlated subquery with EXISTS and NULL logic
+    exists (
+        select 1 from Comments c 
+        where c.PostId = pes.Id and c.UserId = ups.UserId and c.Score > 5 and c.Text is not null 
+    ) as HasHighScoreCommentByOwner,
+    -- set operator example: union answers and comments text snippets for this post
+    (select string_agg(distinct snippet, '; ' order by snippet)
+     from (
+         select substring(pes.Body from 1 for 50) as snippet
+         union
+         select substring(c.Text from 1 for 50) as snippet
+         from Comments c
+         where c.PostId = pes.Id
+         limit 10
+     ) x
+    ) as BodyAndCommentsSnippet
+from UserPostStats ups
+left join PostExtended pes on pes.OwnerUserId = ups.UserId and pes.CreationDate > ups.LastPostDate - interval '365 days'
+left join PostVotesSummary pvs on pvs.PostId = pes.Id
+left join UserBadges ub on ub.UserId = ups.UserId
+left join UserActivityWindows ua on ua.UserId = ups.UserId and ua.PostId = pes.Id
+where ups.QuestionsPosted > 5
+  and ups.TotalScore > 50
+order by ups.TotalScore desc, pes.Score desc
+limit 100;

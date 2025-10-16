@@ -1,0 +1,176 @@
+-- {"query": "364.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1506} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsRequired = 1
+
+    union all
+
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Path || t2.Id
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id <> all(r.Path)
+    where t2.Count > r.Count / 2 and r.Level < 3
+),
+UserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersGiven,
+        count(distinct c.Id) as CommentsMade,
+        count(distinct b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(distinct b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(distinct b.Id) filter (where b.Class = 3) as BronzeBadges,
+        max(p.Score) filter (where p.PostTypeId = 2) as MaxAnswerScore,
+        avg(p.Score) filter (where p.PostTypeId = 1) as AvgQuestionScore,
+        max(v.CreationDate) as LastVoteDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+PostWithLinkInfo as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        pl.LinkTypeId,
+        pl.RelatedPostId
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id
+),
+RankedAnswers as (
+    select
+        a.Id,
+        a.ParentId,
+        a.Score,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a
+    where a.PostTypeId = 2
+),
+QuestionCloseInfo as (
+    select
+        ph.PostId,
+        max(case when ph.PostHistoryTypeId = 10 then ph.Comment else null end) as CloseReasonId,
+        max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as CloseDate,
+        max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 11) as ReopenDate
+    from PostHistory ph
+    group by ph.PostId
+),
+UserRecentActivity as (
+    select
+        u.Id as UserId,
+        max(ph.CreationDate) as LastPostEditDate,
+        max(v.CreationDate) as LastVoteDate,
+        max(c.CreationDate) as LastCommentDate
+    from Users u
+    left join PostHistory ph on ph.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id
+)
+select
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.QuestionsAsked,
+    ua.AnswersGiven,
+    ua.CommentsMade,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.MaxAnswerScore,
+    ua.AvgQuestionScore,
+    ua.LastVoteDate,
+    ur.LastPostEditDate,
+    ur.LastCommentDate,
+    q.Id as QuestionId,
+    q.Title,
+    q.CreationDate as QuestionCreationDate,
+    q.Score as QuestionScore,
+    q.ViewCount as QuestionViewCount,
+    q.Tags,
+    qci.CloseReasonId,
+    qci.CloseDate,
+    qci.ReopenDate,
+    ra.Id as TopAnswerId,
+    ra.Score as TopAnswerScore,
+    case
+        when q.AcceptedAnswerId = ra.Id then 1
+        else 0
+    end as IsAcceptedAnswer,
+    string_agg(distinct pt.Name, ', ') as PostTypesInLinks,
+    string_agg(distinct lt.Name, ', ') as LinkTypesInLinks,
+    -- Complex string manipulation and null logic
+    case
+        when q.Tags is null or q.Tags = '' then 'No Tags'
+        else
+            replace(
+                regexp_replace(q.Tags, '[<>]', '', 'g'),
+                ' ', '_'
+            )
+    end as CleanTags,
+    -- Correlated subquery with window function
+    (select count(*) from Posts p2 where p2.OwnerUserId = ua.UserId and p2.Score > ua.AvgQuestionScore) as AboveAvgScorePostsCount,
+    -- Set operator example: union of user badges and user votes counts
+    (select count(*) from Badges b2 where b2.UserId = ua.UserId and b2.Class = 1)
+    +
+    (select count(*) from Votes v2 where v2.UserId = ua.UserId and v2.VoteTypeId = 2) as GoldBadgesPlusUpvotes
+from UserActivity ua
+left join UserRecentActivity ur on ur.UserId = ua.UserId
+left join Posts q on q.OwnerUserId = ua.UserId and q.PostTypeId = 1
+left join QuestionCloseInfo qci on qci.PostId = q.Id
+left join RankedAnswers ra on ra.ParentId = q.Id and ra.AnswerRank = 1
+left join PostLinks pl on pl.PostId = q.Id
+left join PostTypes pt on pt.Id = pl.LinkTypeId
+left join LinkTypes lt on lt.Id = pl.LinkTypeId
+where ua.Reputation > 1000
+  and (q.Score > 5 or q.Score is null)
+  and (qci.CloseDate is null or qci.ReopenDate > qci.CloseDate)
+group by
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.QuestionsAsked,
+    ua.AnswersGiven,
+    ua.CommentsMade,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.MaxAnswerScore,
+    ua.AvgQuestionScore,
+    ua.LastVoteDate,
+    ur.LastPostEditDate,
+    ur.LastCommentDate,
+    q.Id,
+    q.Title,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.Tags,
+    qci.CloseReasonId,
+    qci.CloseDate,
+    qci.ReopenDate,
+    ra.Id,
+    ra.Score,
+    q.AcceptedAnswerId
+order by ua.Reputation desc, ua.UserId
+limit 100;

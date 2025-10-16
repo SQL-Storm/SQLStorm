@@ -1,0 +1,94 @@
+-- {"query": "23072.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "grok-4", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2685, "output_tokens": 868} 
+
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS TotalQuestionViews,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.Reputation, u.DisplayName
+    HAVING COUNT(DISTINCT p.Id) > 10
+),
+BadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(b.Id) AS BadgeCount,
+        STRING_AGG(b.Name, ', ') AS BadgeNames,
+        MAX(b.Date) AS LatestBadgeDate
+    FROM Badges b
+    WHERE b.Class <= 2  -- Gold or Silver
+    GROUP BY b.UserId
+),
+TopQuestions AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 0) AS PositiveComments
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Score > 50
+),
+TopAnswers AS (
+    SELECT 
+        p.Id AS PostId,
+        p.ParentId,
+        p.Score,
+        COALESCE(p.LastEditorDisplayName, 'Unknown') AS Editor,
+        NULLIF(p.FavoriteCount, 0) AS Favorites
+    FROM Posts p
+    WHERE p.PostTypeId = 2 AND p.Score > 20
+)
+SELECT 
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.TotalPosts,
+    us.AvgPostScore,
+    us.TotalQuestionViews,
+    us.ReputationRank,
+    bs.BadgeCount,
+    bs.BadgeNames,
+    bs.LatestBadgeDate,
+    COALESCE(tq.Title, ta.Editor) AS ItemTitleOrEditor,
+    COALESCE(SUBSTRING(tq.Tags, 1, 50), 'No Tags') AS TagsSnippet,
+    COALESCE(tq.Score + ta.Score, tq.Score, ta.Score, 0) AS CombinedScore,
+    CASE 
+        WHEN tq.PositiveComments IS NOT NULL THEN tq.PositiveComments 
+        ELSE (SELECT COUNT(*) FROM Votes v WHERE v.PostId = ta.PostId AND v.VoteTypeId = 2) 
+    END AS EngagementMetric,
+    RANK() OVER (PARTITION BY us.UserId ORDER BY CombinedScore DESC) AS ItemRank
+FROM UserStats us
+LEFT JOIN BadgeStats bs ON us.UserId = bs.UserId
+LEFT JOIN PostHistory ph ON us.UserId = ph.UserId AND ph.PostHistoryTypeId IN (4,5)  -- Edits
+FULL OUTER JOIN TopQuestions tq ON tq.PostId = ph.PostId
+FULL OUTER JOIN TopAnswers ta ON ta.PostId = ph.PostId OR ta.ParentId = tq.PostId
+WHERE us.Reputation > 1000
+  AND (bs.BadgeCount > 5 OR bs.BadgeCount IS NULL)
+  AND EXISTS (SELECT 1 FROM Votes v WHERE v.UserId = us.UserId AND v.BountyAmount > 0)
+UNION ALL
+SELECT 
+    NULL AS UserId,
+    'Summary' AS DisplayName,
+    SUM(us.Reputation) AS Reputation,
+    SUM(us.TotalPosts) AS TotalPosts,
+    AVG(us.AvgPostScore) AS AvgPostScore,
+    SUM(us.TotalQuestionViews) AS TotalQuestionViews,
+    NULL AS ReputationRank,
+    SUM(bs.BadgeCount) AS BadgeCount,
+    NULL AS BadgeNames,
+    MAX(bs.LatestBadgeDate) AS LatestBadgeDate,
+    NULL AS ItemTitleOrEditor,
+    NULL AS TagsSnippet,
+    SUM(CombinedScore) AS CombinedScore,
+    NULL AS EngagementMetric,
+    NULL AS ItemRank
+FROM UserStats us
+LEFT JOIN BadgeStats bs ON us.UserId = bs.UserId
+GROUP BY ()
+ORDER BY ReputationRank, ItemRank;

@@ -1,0 +1,132 @@
+WITH UserAnswerStats AS (
+    SELECT
+        ans.OwnerUserId,
+        COUNT(ans.Id) AS TotalAnswers,
+        AVG(ans.Score) AS AverageAnswerScore,
+        SUM(CASE WHEN que.AcceptedAnswerId = ans.Id THEN 1 ELSE 0 END) AS AcceptedAnswers,
+        AVG(CASE WHEN que.AcceptedAnswerId = ans.Id THEN EXTRACT(EPOCH FROM (ans.CreationDate - que.CreationDate)) / 3600.0 ELSE NULL END) AS AvgHoursToAcceptance
+    FROM Posts ans
+    JOIN Posts que ON ans.ParentId = que.Id
+    WHERE ans.PostTypeId = 2
+      AND que.PostTypeId = 1
+      AND ans.OwnerUserId IS NOT NULL
+    GROUP BY ans.OwnerUserId
+),
+UserTopTag AS (
+    SELECT
+        UserId,
+        TopTag,
+        TagCount
+    FROM (
+        SELECT
+            p.OwnerUserId AS UserId,
+            tag_name AS TopTag,
+            COUNT(*) AS TagCount,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY COUNT(*) DESC, tag_name) AS rn
+        FROM Posts p
+        CROSS JOIN LATERAL unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tag_name
+        WHERE p.PostTypeId = 1
+          AND p.OwnerUserId IS NOT NULL
+          AND p.Tags IS NOT NULL
+        GROUP BY p.OwnerUserId, tag_name
+    ) AS UserTagCounts
+    WHERE rn = 1
+),
+UserBadgeRanks AS (
+    SELECT
+        b.UserId AS UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS TotalGoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS TotalSilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS TotalBronzeBadges,
+        RANK() OVER (PARTITION BY SUBSTRING(u.DisplayName FROM 1 FOR 1) ORDER BY SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) DESC) AS GoldBadgeRankInInitial
+    FROM Badges b
+    JOIN Users u ON b.UserId = u.Id
+    WHERE u.DisplayName IS NOT NULL AND u.DisplayName != ''
+    GROUP BY b.UserId, u.DisplayName
+),
+QuestionAnalysis AS (
+    SELECT
+        q.OwnerUserId,
+        COUNT(q.Id) AS HighScoringQuestions
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+      AND q.OwnerUserId IS NOT NULL
+      AND q.Score > (
+          SELECT COALESCE(AVG(p2.Score), 0)
+          FROM Posts p2
+          WHERE p2.PostTypeId = 2
+            AND p2.OwnerUserId = q.OwnerUserId
+      )
+    GROUP BY q.OwnerUserId
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Age,
+    uas.TotalAnswers,
+    uas.AverageAnswerScore,
+    COALESCE(uas.AvgHoursToAcceptance, -1) AS AvgHoursToAcceptance,
+    CASE
+        WHEN uas.TotalAnswers > 0 THEN (CAST(uas.AcceptedAnswers AS DECIMAL) / uas.TotalAnswers) * 100
+        ELSE 0
+    END AS AcceptanceRate,
+    utt.TopTag AS PrimaryTag,
+    utt.TagCount AS PrimaryTagPosts,
+    ubr.TotalGoldBadges,
+    ubr.TotalSilverBadges,
+    ubr.GoldBadgeRankInInitial,
+    qa.HighScoringQuestions,
+    (u.Reputation * 0.2 + uas.AverageAnswerScore * 10 + COALESCE(ubr.TotalGoldBadges,0) * 100 - COALESCE(uas.AvgHoursToAcceptance, 100) * 0.5) AS EngagementScore,
+    u.Reputation - LAG(u.Reputation, 1, 0) OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC) AS ReputationDiffVsNextInLocation,
+    'High Activity User' AS UserType
+FROM Users u
+LEFT JOIN UserAnswerStats uas ON u.Id = uas.OwnerUserId
+LEFT JOIN UserTopTag utt ON u.Id = utt.UserId
+LEFT JOIN UserBadgeRanks ubr ON u.Id = ubr.UserId
+LEFT JOIN QuestionAnalysis qa ON u.Id = qa.OwnerUserId
+WHERE u.Reputation > 5000
+  AND u.LastAccessDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+  AND COALESCE(uas.TotalAnswers,0) > 10
+  AND COALESCE(uas.AverageAnswerScore,0) > 5
+  AND u.Location IS NOT NULL
+  AND LENGTH(COALESCE(u.AboutMe,'')) > 50
+
+UNION ALL
+
+SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.Age,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id) AS TotalAnswers,
+    NULL AS AverageAnswerScore,
+    NULL AS AvgHoursToAcceptance,
+    NULL AS AcceptanceRate,
+    ph.LastEditTag AS PrimaryTag,
+    ph.TotalEdits AS PrimaryTagPosts,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS TotalGoldBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS TotalSilverBadges,
+    NULL AS GoldBadgeRankInInitial,
+    NULL AS HighScoringQuestions,
+    (u.Reputation * 0.1 + ph.TotalEdits * 2.5) AS EngagementScore,
+    NULL AS ReputationDiffVsNextInLocation,
+    'Prolific Editor' AS UserType
+FROM Users u
+JOIN (
+    SELECT
+        ph.UserId,
+        COUNT(ph.Id) AS TotalEdits,
+        MAX(p.Tags) AS LastEditTag
+    FROM PostHistory ph
+    JOIN Posts p ON ph.PostId = p.Id
+    WHERE ph.PostHistoryTypeId IN (4,5,6)
+      AND ph.UserId IS NOT NULL
+      AND ph.UserId != p.OwnerUserId
+    GROUP BY ph.UserId
+    HAVING COUNT(ph.Id) > 200
+) AS ph ON u.Id = ph.UserId
+WHERE u.Reputation < 10000
+  AND u.CreationDate < (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 year')
+ORDER BY UserType, EngagementScore DESC
+LIMIT 500;

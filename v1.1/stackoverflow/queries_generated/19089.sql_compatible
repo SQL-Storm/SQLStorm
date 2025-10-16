@@ -1,0 +1,256 @@
+WITH
+    CoreUsers AS (
+        SELECT
+            U.Id AS UserId,
+            U.DisplayName,
+            U.Reputation,
+            U.CreationDate AS UserCreationDate,
+            U.LastAccessDate,
+            U.Views,
+            U.UpVotes,
+            U.DownVotes
+        FROM
+            Users U
+        WHERE
+            U.AccountId IS NOT NULL
+            AND U.Reputation > 100
+            AND U.LastAccessDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    ),
+    RelevantQuestions AS (
+        SELECT
+            Q.Id AS QuestionId,
+            Q.Title AS QuestionTitle,
+            Q.CreationDate AS QuestionCreationDate,
+            Q.Score AS QuestionScore,
+            Q.ViewCount,
+            Q.OwnerUserId AS QuestionOwnerUserId,
+            Q.AcceptedAnswerId,
+            NULLIF(TRIM(REPLACE(REPLACE(LOWER(Q.Tags), '<', ' '), '>', ' ')), '') AS ProcessedTags,
+            Q.AnswerCount
+        FROM
+            Posts Q
+        WHERE
+            Q.PostTypeId = 1
+            AND Q.AnswerCount >= 3
+            AND (
+                POSITION('sql' IN LOWER(Q.Tags)) > 0
+                OR POSITION('database' IN LOWER(Q.Tags)) > 0
+                OR POSITION('performance' IN LOWER(Q.Tags)) > 0
+            )
+            AND Q.ClosedDate IS NULL
+    ),
+    QuestionAnswers AS (
+        SELECT
+            A.Id AS AnswerId,
+            A.ParentId AS QuestionId,
+            A.OwnerUserId AS AnswerOwnerUserId,
+            A.CreationDate AS AnswerCreationDate,
+            A.Score AS AnswerScore,
+            A.CommentCount,
+            A.LastActivityDate,
+            (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - A.CreationDate)) / 86400) AS AnswerAgeInDays
+        FROM
+            Posts A
+        WHERE
+            A.PostTypeId = 2
+            AND A.OwnerUserId IS NOT NULL
+            AND EXISTS (SELECT 1 FROM RelevantQuestions RQ WHERE RQ.QuestionId = A.ParentId)
+    ),
+    UserAnswerMetrics AS (
+        SELECT
+            CA.UserId,
+            CA.DisplayName,
+            CA.Reputation,
+            SUM(QA.AnswerScore) AS TotalAnswerScore,
+            COUNT(QA.AnswerId) AS TotalAnswersPosted,
+            AVG(QA.AnswerScore) AS AverageAnswerScore,
+            MAX(QA.AnswerCreationDate) AS LastAnswerDate,
+            MIN(QA.AnswerCreationDate) AS FirstAnswerDate,
+            COUNT(CASE WHEN RQ.AcceptedAnswerId = QA.AnswerId THEN 1 END) AS AcceptedAnswerCount,
+            EXISTS (
+                SELECT 1
+                FROM PostHistory PH
+                WHERE PH.PostId = QA.AnswerId
+                    AND PH.PostHistoryTypeId = 5
+                    AND PH.UserId IS NOT NULL
+                    AND PH.UserId <> QA.AnswerOwnerUserId
+            ) AS HasExternalEdit
+        FROM
+            CoreUsers CA
+        INNER JOIN
+            QuestionAnswers QA ON CA.UserId = QA.AnswerOwnerUserId
+        LEFT JOIN
+            RelevantQuestions RQ ON QA.QuestionId = RQ.QuestionId
+        GROUP BY
+            CA.UserId, CA.DisplayName, CA.Reputation
+        HAVING
+            COUNT(QA.AnswerId) >= 2
+    ),
+    UserCommentEngagement AS (
+        SELECT
+            UAM.UserId,
+            SUM(C.Score) AS TotalCommentScore,
+            COUNT(C.Id) AS TotalCommentsMade,
+            AVG(C.Score) AS AverageCommentScore,
+            MAX(C.CreationDate) AS LastCommentDate,
+            CASE
+                WHEN COUNT(C.Id) > 10 AND SUM(C.Score) > 20 THEN 'Highly Engaged Commenter'
+                WHEN COUNT(C.Id) BETWEEN 3 AND 10 AND SUM(C.Score) > 5 THEN 'Moderately Engaged Commenter'
+                ELSE 'Slightly Engaged Commenter'
+            END AS CommentEngagementLevel
+        FROM
+            UserAnswerMetrics UAM
+        LEFT JOIN
+            Comments C ON UAM.UserId = C.UserId
+        GROUP BY
+            UAM.UserId
+    ),
+    UserBadgeInsights AS (
+        SELECT
+            UAM.UserId,
+            SUM(CASE WHEN B.Name IN ('Nice Answer', 'Great Answer') THEN 1 ELSE 0 END) AS QualityAnswerBadges,
+            SUM(CASE WHEN B.Name IN ('Pundit', 'Commentator') THEN 1 ELSE 0 END) AS CommentRelatedBadges,
+            MAX(B.Date) AS LatestBadgeDate,
+            COUNT(DISTINCT B.Class) AS DistinctBadgeClassesEarned
+        FROM
+            UserAnswerMetrics UAM
+        LEFT JOIN
+            Badges B ON UAM.UserId = B.UserId
+        GROUP BY
+            UAM.UserId
+    ),
+    PostEditHistoryAnalysis AS (
+        SELECT
+            PH.PostId,
+            PH.UserId AS EditorUserId,
+            PH.CreationDate AS EditDate,
+            PH.PostHistoryTypeId,
+            PH.Text AS EditedBody,
+            LAG(PH.Text, 1, '') OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS PreviousBody,
+            LAG(PH.CreationDate, 1) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS PreviousEditDate,
+            ROW_NUMBER() OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate DESC) AS rn_latest_edit,
+            NULLIF(CAST(LENGTH(PH.Text) - LENGTH(LAG(PH.Text, 1, '')) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS NUMERIC), 0) /
+                NULLIF(CAST(LENGTH(LAG(PH.Text, 1, '')) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS NUMERIC), 0) AS ContentChangeRatio
+        FROM
+            PostHistory PH
+        WHERE
+            PH.PostHistoryTypeId IN (2, 5, 8)
+            AND PH.PostId IN (SELECT AnswerId FROM QuestionAnswers)
+    ),
+    LatestPostEditSummary AS (
+        SELECT
+            PEHA.PostId,
+            PEHA.EditorUserId,
+            PEHA.EditDate AS LatestEditDate,
+            PEHA.PreviousBody,
+            PEHA.EditedBody,
+            PEHA.ContentChangeRatio
+        FROM
+            PostEditHistoryAnalysis PEHA
+        WHERE
+            PEHA.rn_latest_edit = 1
+    ),
+    DuplicateLinkCheck AS (
+        SELECT
+            P.OwnerUserId AS UserId,
+            COUNT(DISTINCT PL.RelatedPostId) AS NumDuplicateLinksFromUserPosts,
+            ARRAY_AGG(DISTINCT P2.Title) AS DuplicateTitles
+        FROM
+            Posts P
+        INNER JOIN
+            PostLinks PL ON P.Id = PL.PostId
+        INNER JOIN
+            Posts P2 ON PL.RelatedPostId = P2.Id
+        WHERE
+            PL.LinkTypeId = 3
+            AND P.OwnerUserId IS NOT NULL
+        GROUP BY
+            P.OwnerUserId
+    ),
+    RankedUserPerformance AS (
+        SELECT
+            UAM.UserId,
+            UAM.DisplayName,
+            UAM.Reputation,
+            UAM.TotalAnswerScore,
+            UAM.TotalAnswersPosted,
+            UAM.AverageAnswerScore,
+            RANK() OVER (ORDER BY UAM.TotalAnswerScore DESC, UAM.Reputation DESC) AS AnswerScoreRank,
+            LAG(UAM.Reputation) OVER (ORDER BY UAM.TotalAnswerScore DESC, UAM.Reputation DESC) AS PrevRankReputation,
+            NTILE(5) OVER (ORDER BY UAM.TotalAnswerScore DESC) AS AnswerScoreQuintile
+        FROM
+            UserAnswerMetrics UAM
+    )
+SELECT
+    R.DisplayName,
+    R.Reputation,
+    R.TotalAnswersPosted,
+    R.AverageAnswerScore,
+    COALESCE(UCE.TotalCommentScore, 0) AS TotalCommentScore,
+    COALESCE(UCE.TotalCommentsMade, 0) AS TotalCommentsMade,
+    COALESCE(UBI.QualityAnswerBadges, 0) AS QualityAnswerBadgesEarned,
+    COALESCE(UBI.CommentRelatedBadges, 0) AS CommentRelatedBadgesEarned,
+    UCE.CommentEngagementLevel,
+    R.AnswerScoreRank,
+    R.AnswerScoreQuintile,
+    R.Reputation - COALESCE(R.PrevRankReputation, R.Reputation) AS ReputationDifferenceFromHigherRank,
+    UAM.HasExternalEdit AS AnyAnswerEditedByOthers,
+    COALESCE(DPC.NumDuplicateLinksFromUserPosts, 0) AS PostsLinkedToDuplicates,
+    NULLIF(AVG(LPE.ContentChangeRatio) FILTER (WHERE QA.AnswerOwnerUserId = LPE.EditorUserId), 0) AS AvgSelfContentChangeRatioForLatestEdit,
+    CASE
+        WHEN R.TotalAnswerScore > 500 AND R.AverageAnswerScore > 15 AND COALESCE(UCE.TotalCommentScore, 0) > 100 THEN 'Elite Contributor'
+        WHEN R.TotalAnswersPosted > 10 AND UAM.AcceptedAnswerCount > 0 AND COALESCE(UBI.QualityAnswerBadges, 0) > 0 THEN 'Valued Answerer'
+        WHEN COALESCE(UCE.TotalCommentsMade, 0) > 20 AND COALESCE(UCE.TotalCommentScore, 0) > 30 THEN 'Community Interactor'
+        ELSE 'Active Participant'
+    END AS UserOverallCategory,
+    SUBSTRING(
+        (SELECT STRING_AGG(DT.Title, '; ')
+         FROM (
+             SELECT DISTINCT unnest(DPC.DuplicateTitles) AS Title
+         ) DT),
+        1,
+        200
+    ) AS ExampleDuplicateTitlesSample,
+    R.UserId
+FROM
+    RankedUserPerformance R
+INNER JOIN
+    UserAnswerMetrics UAM ON R.UserId = UAM.UserId
+LEFT JOIN
+    UserCommentEngagement UCE ON R.UserId = UCE.UserId
+LEFT JOIN
+    UserBadgeInsights UBI ON R.UserId = UBI.UserId
+LEFT JOIN
+    DuplicateLinkCheck DPC ON R.UserId = DPC.UserId
+LEFT JOIN
+    QuestionAnswers QA ON R.UserId = QA.AnswerOwnerUserId
+LEFT JOIN
+    LatestPostEditSummary LPE ON QA.AnswerId = LPE.PostId
+GROUP BY
+    R.UserId,
+    R.DisplayName,
+    R.Reputation,
+    R.TotalAnswersPosted,
+    R.AverageAnswerScore,
+    R.TotalAnswerScore,
+    UCE.TotalCommentScore,
+    UCE.TotalCommentsMade,
+    UBI.QualityAnswerBadges,
+    UBI.CommentRelatedBadges,
+    UCE.CommentEngagementLevel,
+    R.AnswerScoreRank,
+    R.AnswerScoreQuintile,
+    R.PrevRankReputation,
+    UAM.HasExternalEdit,
+    DPC.NumDuplicateLinksFromUserPosts,
+    DPC.DuplicateTitles,
+    UAM.AcceptedAnswerCount
+HAVING
+    R.TotalAnswerScore > 50
+    AND COALESCE(UBI.QualityAnswerBadges, 0) + COALESCE(UBI.CommentRelatedBadges, 0) >= 1
+    AND (R.Reputation - COALESCE(R.PrevRankReputation, R.Reputation)) IS NOT NULL
+ORDER BY
+    R.AnswerScoreRank ASC,
+    R.Reputation DESC,
+    COALESCE(UCE.TotalCommentScore, 0) DESC
+LIMIT 50;

@@ -1,0 +1,68 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.OwnerUserId,
+        U.DisplayName,
+        U.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS rank
+    FROM 
+        Posts P
+    JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId NOT IN (3, 4, 5)
+),
+BadgeCounts AS (
+    SELECT 
+        UserId,
+        COUNT(DISTINCT Id) AS badge_count
+    FROM 
+        Badges
+    GROUP BY 
+        UserId
+),
+CommentStats AS (
+    SELECT 
+        PostId,
+        COUNT(*) AS comment_count,
+        MAX(CASE WHEN C.UserId IS NOT NULL THEN 1 ELSE 0 END) AS has_user_comment
+    FROM 
+        Comments C
+    GROUP BY 
+        PostId
+)
+SELECT 
+    R.Id,
+    R.Title,
+    R.Score,
+    R.ViewCount,
+    R.CreationDate,
+    R.DisplayName,
+    R.Reputation,
+    B.badge_count,
+    CS.comment_count,
+    CASE 
+        WHEN CS.has_user_comment = 1 THEN 'Yes'
+        ELSE 'No'
+    END AS has_user_comment,
+    CASE 
+        WHEN R.rank <= 3 THEN 'Top'
+        WHEN R.rank <= 10 THEN 'High'
+        ELSE 'Low'
+    END AS rank_status
+FROM 
+    RankedPosts R
+LEFT JOIN 
+    BadgeCounts B ON R.OwnerUserId = B.UserId
+LEFT JOIN 
+    CommentStats CS ON R.Id = CS.PostId
+WHERE 
+    (R.Score > 100 OR R.ViewCount > 1000)
+    AND R.rank <= 10
+ORDER BY 
+    R.Score DESC, 
+    R.ViewCount DESC;

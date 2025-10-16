@@ -1,0 +1,116 @@
+WITH RECURSIVE question_hierarchy AS (
+    SELECT Id, ParentId, 0 AS level
+    FROM Posts
+    WHERE PostTypeId = 1
+    UNION ALL
+    SELECT p.Id, p.ParentId, q.level + 1
+    FROM Posts p
+    JOIN question_hierarchy q ON p.ParentId = q.Id
+    WHERE p.PostTypeId = 2
+),
+top_voted_users AS (
+    SELECT u.Id, u.DisplayName, COUNT(v.Id) AS vote_count
+    FROM Users u
+    JOIN Votes v ON u.Id = v.UserId
+    WHERE v.VoteTypeId IN (2, 3)
+    GROUP BY u.Id, u.DisplayName
+    ORDER BY COUNT(v.Id) DESC
+    LIMIT 10
+),
+closed_questions AS (
+    SELECT p.Id, p.Title, ph.Comment AS close_reason
+    FROM Posts p
+    JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE ph.PostHistoryTypeId = 10
+),
+tag_counts AS (
+    SELECT t.TagName, COUNT(p.Id) AS question_count
+    FROM Tags t
+    JOIN PostTags pt ON t.Id = pt.TagId
+    JOIN Posts p ON pt.PostId = p.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName
+)
+SELECT 
+    qh.Id,
+    qh.level,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    c.Comment AS last_comment,
+    tu.DisplayName AS top_voted_user,
+    tu.vote_count,
+    cq.close_reason,
+    tc.TagName,
+    tc.question_count,
+    ph.Text AS post_history,
+    ph.Comment AS post_history_comment,
+    ph.ContentLicense AS post_history_license,
+    u.DisplayName AS user_display_name,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.AboutMe,
+    u.WebsiteUrl,
+    u.EmailHash,
+    u.ProfileImageUrl
+FROM question_hierarchy qh
+JOIN Posts p ON qh.Id = p.Id
+LEFT JOIN Comments c ON p.Id = c.PostId
+LEFT JOIN top_voted_users tu ON p.OwnerUserId = tu.Id
+LEFT JOIN closed_questions cq ON p.Id = cq.Id
+LEFT JOIN tag_counts tc ON p.Tags LIKE '%' || tc.TagName || '%'
+LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+WHERE p.Score > 0
+  AND p.ViewCount > 100
+  AND p.AnswerCount > 0
+  AND p.CommentCount > 0
+  AND p.FavoriteCount > 0
+  AND qh.level < 5
+  AND (tu.vote_count IS NULL OR tu.vote_count > 100)
+  AND cq.close_reason IS NOT NULL
+  AND tc.question_count > 10
+  AND ph.Text IS NOT NULL
+  AND ph.Comment IS NOT NULL
+  AND ph.ContentLicense IS NOT NULL
+  AND u.Reputation > 1000
+  AND u.CreationDate < DATE '2020-01-01'
+  AND u.LastAccessDate > DATE '2020-01-01'
+  AND u.Location IS NOT NULL
+  AND u.AboutMe IS NOT NULL
+  AND u.WebsiteUrl IS NOT NULL
+  AND u.EmailHash IS NOT NULL
+  AND u.ProfileImageUrl IS NOT NULL
+GROUP BY
+    qh.Id,
+    qh.level,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    c.Comment,
+    tu.DisplayName,
+    tu.vote_count,
+    cq.close_reason,
+    tc.TagName,
+    tc.question_count,
+    ph.Text,
+    ph.Comment,
+    ph.ContentLicense,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.AboutMe,
+    u.WebsiteUrl,
+    u.EmailHash,
+    u.ProfileImageUrl
+ORDER BY p.Score DESC, p.ViewCount DESC, qh.level ASC;

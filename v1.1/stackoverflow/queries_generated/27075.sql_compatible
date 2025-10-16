@@ -1,0 +1,147 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) AS TotalPosts,
+        COUNT(DISTINCT a.Id) AS TotalAnswers,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        DENSE_RANK() OVER (ORDER BY COUNT(p.Id) DESC) AS PostRank,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT a.Id) DESC) AS AnswerRank,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT c.Id) DESC) AS CommentRank,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT v.Id) DESC) AS VoteRank
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation
+),
+TagStatistics AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        t.Count AS TotalUsage,
+        COUNT(p.Id) AS TotalQuestions,
+        SUM(p.AnswerCount) AS TotalAnswers,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalViews,
+        DENSE_RANK() OVER (ORDER BY COUNT(p.Id) DESC) AS QuestionRank,
+        DENSE_RANK() OVER (ORDER BY SUM(p.ViewCount) DESC) AS ViewRank,
+        DENSE_RANK() OVER (ORDER BY SUM(p.AnswerCount) DESC) AS AnswerRank
+    FROM
+        Tags t
+    LEFT JOIN
+        Posts p ON p.Tags LIKE CONCAT('%<', t.TagName, '>%') AND p.PostTypeId = 1
+    GROUP BY
+        t.Id, t.TagName, t.Count
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.TotalPosts,
+    ua.TotalAnswers,
+    ua.TotalComments,
+    ua.TotalVotes,
+    ua.PostRank,
+    ua.AnswerRank,
+    ua.CommentRank,
+    ua.VoteRank,
+    ts.TagId,
+    ts.TagName,
+    ts.TotalUsage,
+    ts.TotalQuestions,
+    ts.TotalAnswers AS TagTotalAnswers,
+    ts.TotalViews,
+    ts.QuestionRank,
+    ts.AnswerRank,
+    ts.ViewRank,
+    COALESCE(pl.RelatedPostId, -1) AS RelatedPostId,
+    COALESCE(pl.LinkTypeId, -1) AS LinkTypeId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate AS HistoryDate,
+    ph.UserId AS HistoryUserId,
+    CASE
+        WHEN ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL THEN (
+            SELECT
+                crt.Name
+            FROM
+                CloseReasonTypes crt
+            WHERE
+                crt.Id = CAST(ph.Comment AS SMALLINT)
+        ) ELSE
+        NULL
+    END AS CloseReasonName,
+    COALESCE(b.Name, 'No Badge') AS LatestBadge,
+    b.Date AS BadgeDate,
+    b.Class AS BadgeClass,
+    (
+     SELECT
+        STRING_AGG(DISTINCT pt.Name, ', ')
+     FROM
+        Posts chp
+     JOIN
+        PostTypes pt ON chp.PostTypeId = pt.Id
+     WHERE
+        chp.OwnerUserId = ua.UserId
+        AND chp.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY
+    ) AS RecentPostTypes
+FROM
+    UserActivity ua
+LEFT JOIN
+    TagStatistics ts ON ts.TagName = (
+    SELECT
+        STRING_AGG(DISTINCT t.TagName, ',')
+    FROM
+        Posts p
+    JOIN
+        Tags t ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    WHERE
+        p.OwnerUserId = ua.UserId
+)
+LEFT JOIN
+    PostLinks pl ON pl.PostId = (
+    SELECT
+        p.Id
+    FROM
+        Posts p
+    WHERE
+        p.OwnerUserId = ua.UserId
+    ORDER BY
+        p.CreationDate DESC
+    LIMIT 1
+)
+LEFT JOIN
+    PostHistory ph ON ph.PostId = pl.RelatedPostId
+    AND ph.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90' DAY
+LEFT JOIN
+    Badges b ON b.UserId = ua.UserId AND b.Date = (
+    SELECT
+        MAX(b2.Date)
+    FROM
+        Badges b2
+    WHERE
+        b2.UserId = ua.UserId
+)
+WHERE
+    ua.TotalPosts > 10 AND
+    ts.TotalUsage > 50 AND
+    EXISTS (
+        SELECT
+            1
+        FROM
+            Votes v
+        WHERE
+            v.UserId = ua.UserId AND v.VoteTypeId = 2
+    )
+ORDER BY
+    ua.Reputation DESC,
+    ts.TotalUsage DESC
+LIMIT 100;

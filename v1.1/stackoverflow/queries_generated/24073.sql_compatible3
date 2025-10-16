@@ -1,0 +1,174 @@
+WITH RECURSIVE
+    QuestionPosts AS (
+        SELECT p.Id                      AS PostId,
+               p.OwnerUserId,
+               p.CreationDate,
+               p.Score,
+               p.AcceptedAnswerId,
+               p.Tags
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+    ),
+    -- recursive splitter for tags (dialect-neutral functions used)
+    TagSplitRecursive AS (
+        -- seed
+        SELECT
+            qp.PostId,
+            qp.OwnerUserId,
+            qp.CreationDate,
+            qp.Score,
+            qp.AcceptedAnswerId,
+            -- normalize to 'tag1>|tag2>|' pattern: replace '><' with '>|<' then remove leading '<' and trailing '>'
+            -- using nested REPLACE; use concatenation with '>' to ensure terminator
+            (REPLACE(REPLACE(qp.Tags, '><', '>|<'), '<', '') || '>') AS tags_norm,
+            -- first token up to first '>'
+            CASE WHEN POSITION('>' IN (REPLACE(REPLACE(qp.Tags, '><', '>|<'), '<', '') || '>')) > 0
+                 THEN SUBSTRING((REPLACE(REPLACE(qp.Tags, '><', '>|<'), '<', '') || '>') FROM 1 FOR POSITION('>' IN (REPLACE(REPLACE(qp.Tags, '><', '>|<'), '<', '') || '>')))
+                 ELSE (REPLACE(REPLACE(qp.Tags, '><', '>|<'), '<', '') || '>')
+            END AS token,
+            -- rest after first '>'
+            CASE WHEN POSITION('>' IN (REPLACE(REPLACE(qp.Tags, '><', '>|<'), '<', '') || '>')) > 0
+                 THEN SUBSTRING((REPLACE(REPLACE(qp.Tags, '><', '>|<'), '<', '') || '>') FROM POSITION('>' IN (REPLACE(REPLACE(qp.Tags, '><', '>|<'), '<', '') || '>')) + 1)
+                 ELSE ''
+            END AS rest
+        FROM QuestionPosts qp
+
+        UNION ALL
+
+        -- recursive part
+        SELECT
+            rs.PostId,
+            rs.OwnerUserId,
+            rs.CreationDate,
+            rs.Score,
+            rs.AcceptedAnswerId,
+            rs.tags_norm,
+            CASE WHEN POSITION('>' IN rs.rest) > 0
+                 THEN SUBSTRING(rs.rest FROM 1 FOR POSITION('>' IN rs.rest))
+                 ELSE rs.rest
+            END AS token,
+            CASE WHEN POSITION('>' IN rs.rest) > 0
+                 THEN SUBSTRING(rs.rest FROM POSITION('>' IN rs.rest) + 1)
+                 ELSE ''
+            END AS rest
+        FROM TagSplitRecursive rs
+        WHERE rs.rest <> ''
+    ),
+    TagRowsFinal AS (
+        SELECT
+            PostId,
+            OwnerUserId,
+            CreationDate,
+            Score,
+            AcceptedAnswerId,
+            -- remove any remaining angle brackets or separators
+            REPLACE(REPLACE(REPLACE(token, '<', ''), '>', ''), '|', '') AS TagName
+        FROM TagSplitRecursive
+        WHERE token IS NOT NULL AND token <> ''
+    ),
+    VoteSums AS (
+        SELECT v.PostId,
+               SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END)     AS UpVotes,
+               SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END)   AS DownVotes,
+               SUM(CASE WHEN vt.Name = 'Favorite' THEN 1 ELSE 0 END)  AS Favorites
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        GROUP BY v.PostId
+    ),
+    CommentStats AS (
+        SELECT c.PostId,
+               COUNT(*) AS CommentCount
+        FROM Comments c
+        GROUP BY c.PostId
+    ),
+    AnswerTiming AS (
+        SELECT a.ParentId      AS QuestionId,
+               CAST(FLOOR(EXTRACT(EPOCH FROM (MIN(a.CreationDate) - p.CreationDate))) AS BIGINT) AS SecondsToFirstAnswer
+        FROM Posts a
+        JOIN Posts p ON p.Id = a.ParentId
+        WHERE a.PostTypeId = 2
+        GROUP BY a.ParentId, p.CreationDate
+    ),
+    PostDetails AS (
+        SELECT t.PostId,
+               t.TagName,
+               t.OwnerUserId,
+               t.CreationDate,
+               t.Score,
+               COALESCE(vs.UpVotes,0)    AS UpVotes,
+               COALESCE(vs.DownVotes,0)  AS DownVotes,
+               COALESCE(vs.Favorites,0)  AS Favorites,
+               COALESCE(cs.CommentCount,0) AS CommentCount,
+               at.SecondsToFirstAnswer,
+               CASE WHEN t.AcceptedAnswerId IS NULL THEN 0 ELSE 1 END   AS HasAccepted,
+               ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY t.Score DESC, t.CreationDate DESC) AS RankInTag,
+               (SELECT COUNT(DISTINCT v2.UserId)
+                FROM Votes v2
+                WHERE v2.PostId = t.PostId
+                  AND v2.VoteTypeId = 2)                                     AS UniqueUpVoters,
+               t.AcceptedAnswerId
+        FROM TagRowsFinal t
+        LEFT JOIN VoteSums vs ON vs.PostId = t.PostId
+        LEFT JOIN CommentStats cs ON cs.PostId = t.PostId
+        LEFT JOIN AnswerTiming at ON at.QuestionId = t.PostId
+    ),
+    TagAggregates AS (
+        SELECT
+            TagName,
+            SUM(Score)                             AS TotalScore,
+            COUNT(DISTINCT PostId)                 AS QuestionCount,
+            SUM(CASE WHEN AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedCount,
+            AVG(COALESCE(SecondsToFirstAnswer,0))  AS AvgFirstAnswerTime
+        FROM (
+            SELECT t.TagName,
+                   qp.PostId,
+                   qp.Score,
+                   qp.AcceptedAnswerId,
+                   at.SecondsToFirstAnswer
+            FROM TagRowsFinal t
+            JOIN QuestionPosts qp ON qp.PostId = t.PostId
+            LEFT JOIN AnswerTiming at ON at.QuestionId = qp.PostId
+        ) q
+        GROUP BY TagName
+    )
+SELECT
+    pd.PostId,
+    pd.TagName,
+    pd.OwnerUserId,
+    pd.CreationDate,
+    pd.Score,
+    pd.UpVotes,
+    pd.DownVotes,
+    pd.Favorites,
+    pd.CommentCount,
+    pd.SecondsToFirstAnswer,
+    pd.HasAccepted,
+    pd.RankInTag,
+    CAST(NULL AS BIGINT)         AS TotalScore,
+    CAST(NULL AS BIGINT)         AS QuestionCount,
+    CAST(NULL AS BIGINT)         AS AcceptedCount,
+    CAST(NULL AS DOUBLE PRECISION) AS AvgFirstAnswerTime,
+    pd.UniqueUpVoters
+FROM PostDetails pd
+UNION ALL
+SELECT
+    CAST(NULL AS BIGINT)        AS PostId,
+    ta.TagName,
+    CAST(NULL AS BIGINT)        AS OwnerUserId,
+    CAST(NULL AS TIMESTAMP)     AS CreationDate,
+    CAST(NULL AS BIGINT)        AS Score,
+    CAST(NULL AS BIGINT)        AS UpVotes,
+    CAST(NULL AS BIGINT)        AS DownVotes,
+    CAST(NULL AS BIGINT)        AS Favorites,
+    CAST(NULL AS BIGINT)        AS CommentCount,
+    CAST(NULL AS BIGINT)        AS SecondsToFirstAnswer,
+    CAST(NULL AS INTEGER)       AS HasAccepted,
+    CAST(NULL AS BIGINT)        AS RankInTag,
+    ta.TotalScore,
+    ta.QuestionCount,
+    ta.AcceptedCount,
+    ta.AvgFirstAnswerTime,
+    CAST(NULL AS BIGINT)        AS UniqueUpVoters
+FROM TagAggregates ta
+ORDER BY TagName, PostId
+LIMIT 2000;

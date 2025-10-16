@@ -1,0 +1,154 @@
+WITH UserActivityMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        AVG(CASE WHEN p.Score IS NOT NULL THEN p.Score ELSE 0 END) AS AvgPostScore,
+        MAX(p.Score) AS MaxPostScore,
+        SUM(COALESCE(p.ViewCount, 0)) AS TotalViews,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS MedianScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '2' YEAR)
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TagExpertise AS (
+    SELECT 
+        p.OwnerUserId,
+        tag AS Tag,
+        COUNT(*) AS TagPostCount,
+        SUM(p.Score) AS TagTotalScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY SUM(p.Score) DESC) AS TagRank
+    FROM (
+        SELECT p.*, TRIM(BOTH '<>' FROM t) AS tag
+        FROM Posts p,
+        UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), '><')) AS t
+        WHERE p.Tags IS NOT NULL
+    ) p
+    WHERE p.OwnerUserId IS NOT NULL
+      AND p.PostTypeId IN (1, 2)
+    GROUP BY p.OwnerUserId, tag
+),
+RecentEngagement AS (
+    SELECT 
+        ph.UserId,
+        COUNT(DISTINCT ph.PostId) AS EditedPosts,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.PostId END) AS ContentEdits,
+        STRING_AGG(DISTINCT reason, ' | ' ORDER BY reason) AS EditReasons
+    FROM (
+        SELECT ph.*,
+            CASE 
+                WHEN ph.Comment LIKE '%duplicate%' THEN 'DUP'
+                WHEN ph.Comment LIKE '%off-topic%' THEN 'OT'
+                WHEN ph.Comment LIKE '%unclear%' THEN 'UC'
+                ELSE SUBSTRING(COALESCE(ph.Comment, ''), 1, 10)
+            END AS reason
+        FROM PostHistory ph
+        WHERE ph.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '90' DAY)
+          AND ph.UserId IS NOT NULL
+    ) ph
+    GROUP BY ph.UserId
+),
+BadgeAchievements AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate,
+        LEAD(b.Date) OVER (PARTITION BY b.UserId ORDER BY b.Date) - b.Date AS TimeToBadge
+    FROM Badges b
+    GROUP BY b.UserId, b.Date
+)
+SELECT 
+    uam.DisplayName,
+    COALESCE(uam.Reputation, 0) AS Reputation,
+    COALESCE(uam.PostCount, 0) AS TotalPosts,
+    CASE 
+        WHEN uam.QuestionCount > 0 AND uam.AnswerCount > 0 
+        THEN ROUND(CAST(uam.AnswerCount AS numeric) / CAST(uam.QuestionCount AS numeric), 2)
+        ELSE NULL 
+    END AS AnswerToQuestionRatio,
+    ROUND(CAST(COALESCE(uam.AvgPostScore, 0) AS numeric), 2) AS AvgScore,
+    COALESCE(uam.MaxPostScore, 0) AS MaxScore,
+    COALESCE(uam.MedianScore, 0) AS MedianScore,
+    COALESCE(
+        (SELECT STRING_AGG(te.Tag || ':' || CAST(te.TagTotalScore AS varchar), ', ' ORDER BY te.TagRank)
+         FROM TagExpertise te 
+         WHERE te.OwnerUserId = uam.Id AND te.TagRank <= 3),
+        'No Tags'
+    ) AS TopThreeTags,
+    COALESCE(re.EditedPosts, 0) AS RecentEdits,
+    COALESCE(NULLIF(re.EditReasons, ''), 'None') AS EditPatterns,
+    COALESCE(ba_agg.GoldBadges, 0) || '/' || 
+    COALESCE(ba_agg.SilverBadges, 0) || '/' || 
+    COALESCE(ba_agg.BronzeBadges, 0) AS BadgeDistribution,
+    CASE 
+        WHEN ba_agg.LastBadgeDate IS NOT NULL 
+        THEN EXTRACT(DAY FROM (CAST('2024-10-01' AS date) - ba_agg.LastBadgeDate)) || ' days ago'
+        ELSE 'Never' 
+    END AS LastBadgeEarned,
+    DENSE_RANK() OVER (
+        ORDER BY 
+            uam.Reputation DESC,
+            uam.PostCount DESC
+    ) AS OverallRank,
+    CASE 
+        WHEN uam.TotalViews > 1000000 THEN 'Viral Creator'
+        WHEN uam.MaxPostScore > 100 THEN 'High Impact'
+        WHEN COALESCE(re.ContentEdits, 0) > 50 THEN 'Active Editor'
+        WHEN COALESCE(ba_agg.GoldBadges, 0) > 5 THEN 'Gold Collector'
+        WHEN uam.AnswerCount > uam.QuestionCount * 2 THEN 'Answer Specialist'
+        WHEN uam.QuestionCount > uam.AnswerCount * 2 THEN 'Question Asker'
+        ELSE 'Regular Contributor'
+    END AS UserCategory,
+    CASE WHEN EXISTS (
+        SELECT 1 
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = uam.Id 
+            AND p2.CommunityOwnedDate IS NOT NULL
+    ) THEN TRUE ELSE FALSE END AS HasCommunityWikiPosts,
+    (
+        SELECT COUNT(DISTINCT c.Id)
+        FROM Comments c
+        INNER JOIN Posts cp ON c.PostId = cp.Id
+        WHERE c.UserId = uam.Id
+            AND cp.OwnerUserId != uam.Id
+            AND c.Score > 5
+            AND c.Text NOT LIKE '%thanks%'
+            AND c.Text NOT LIKE '%welcome%'
+            AND CHAR_LENGTH(c.Text) > 50
+    ) AS HelpfulCommentsOnOthersPosts,
+    uam.Id,
+    uam.TotalViews,
+    ba_agg.GoldBadges AS _GoldBadges_for_order
+FROM UserActivityMetrics uam
+LEFT JOIN RecentEngagement re ON uam.Id = re.UserId
+LEFT JOIN (
+    SELECT 
+        UserId, 
+        MAX(GoldBadges) AS GoldBadges,
+        MAX(SilverBadges) AS SilverBadges, 
+        MAX(BronzeBadges) AS BronzeBadges,
+        MAX(LastBadgeDate) AS LastBadgeDate
+    FROM BadgeAchievements
+    GROUP BY UserId
+) ba_agg ON uam.Id = ba_agg.UserId
+WHERE uam.Reputation > 100
+    AND (uam.PostCount > 5 OR COALESCE(re.EditedPosts, 0) > 10)
+    AND uam.DisplayName IS NOT NULL
+    AND NOT EXISTS (
+        SELECT 1 
+        FROM Votes v 
+        WHERE v.UserId = uam.Id 
+            AND v.VoteTypeId IN (4, 12)
+            AND v.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '30' DAY)
+    )
+ORDER BY 
+    OverallRank,
+    uam.TotalViews DESC,
+    (COALESCE(ba_agg.GoldBadges, 0) + COALESCE(ba_agg.SilverBadges, 0) * 0.5 + COALESCE(ba_agg.BronzeBadges, 0) * 0.25) DESC
+LIMIT 100;

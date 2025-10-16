@@ -1,0 +1,17 @@
+WITH ranked_users AS (
+    SELECT Id, Reputation, ROW_NUMBER() OVER (ORDER BY Reputation DESC) AS rank
+    FROM Users
+), ranked_badges AS (
+    SELECT UserId, Name, ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY Date DESC) AS badge_rank
+    FROM Badges
+), user_badge_rankings AS (
+    SELECT u.Id, u.Reputation, r.badge_rank
+    FROM ranked_users u
+    LEFT JOIN ranked_badges r ON u.Id = r.UserId
+)
+SELECT ur.Id AS user_id, ur.Reputation, ur.rank, COALESCE(br.badge_rank, 0) AS badge_rank
+FROM user_badge_rankings ur
+LEFT JOIN ranked_badges br ON ur.Id = br.UserId AND br.badge_rank = 1
+GROUP BY ur.Id, ur.Reputation, ur.rank, br.badge_rank
+ORDER BY ur.rank
+FETCH FIRST 1000 ROWS ONLY;

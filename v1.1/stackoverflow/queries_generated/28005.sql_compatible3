@@ -1,0 +1,88 @@
+WITH UserBadgeStats AS (
+    SELECT 
+        UserId, 
+        COUNT(*) AS TotalBadges,
+        SUM(CASE WHEN badges."Class" = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN badges."Class" = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN badges."Class" = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges badges
+    GROUP BY UserId
+), PostActivity AS (
+    SELECT 
+        OwnerUserId,
+        COUNT(DISTINCT CASE WHEN PostTypeId = 1 THEN Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN PostTypeId = 2 THEN Id END) AS AnswersProvided,
+        MAX(COALESCE(Score, 0)) AS HighestPostScore,
+        AVG(COALESCE(ViewCount, 0)) OVER (PARTITION BY OwnerUserId) AS AvgViews
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL
+    GROUP BY OwnerUserId
+), CommentRanking AS (
+    SELECT 
+        UserId,
+        Text AS LatestComment,
+        CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY CreationDate DESC) AS CommentRank
+    FROM Comments
+), MainResults AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COALESCE(u.Location, 'Unknown') AS UserLocation,
+        u.Reputation,
+        bs.TotalBadges,
+        bs.GoldBadges,
+        bs.SilverBadges,
+        pa.QuestionsAsked,
+        pa.AnswersProvided,
+        pa.HighestPostScore,
+        cr.LatestComment,
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 2) AS UpvotesGiven,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id) AND v.VoteTypeId = 2) AS UpvotesReceived,
+        STRING_AGG(DISTINCT ph.Text, '; ') FILTER (WHERE ph.PostHistoryTypeId = 5) AS RecentEdits,
+        COUNT(DISTINCT CASE WHEN p.ClosedDate IS NOT NULL THEN p.Id END) AS ClosedPosts,
+        AVG((LENGTH(COALESCE(p.Tags, '')) - LENGTH(REPLACE(COALESCE(p.Tags, ''), '><', '')) + 1)) AS AvgTagsPerQuestion,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId = 5) AS RecentEditCount
+    FROM Users u
+    LEFT JOIN UserBadgeStats bs ON u.Id = bs.UserId
+    LEFT JOIN PostActivity pa ON u.Id = pa.OwnerUserId
+    LEFT JOIN CommentRanking cr ON u.Id = cr.UserId AND cr.CommentRank = 1
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '6 months')
+    WHERE u.Reputation > 1000
+      AND (COALESCE(pa.QuestionsAsked, 0) > 10 OR COALESCE(pa.AnswersProvided, 0) > 50)
+      AND (COALESCE(bs.GoldBadges, 0) >= 1 OR COALESCE(bs.SilverBadges, 0) >= 5)
+      AND EXISTS (SELECT 1 FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.CreationDate > DATE '2020-01-01')
+    GROUP BY u.Id, u.DisplayName, COALESCE(u.Location, 'Unknown'), u.Reputation, bs.TotalBadges, bs.GoldBadges, bs.SilverBadges, pa.QuestionsAsked, pa.AnswersProvided, pa.HighestPostScore, cr.LatestComment
+    HAVING AVG((LENGTH(COALESCE(p.Tags, '')) - LENGTH(REPLACE(COALESCE(p.Tags, ''), '><', '')) + 1)) BETWEEN 1 AND 5
+       AND COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId = 5) > 3
+), FallbackResults AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COALESCE(u.Location, 'Unknown') AS UserLocation,
+        u.Reputation,
+        0 AS TotalBadges,
+        0 AS GoldBadges,
+        0 AS QuestionsAsked,
+        0 AS AnswersProvided,
+        0 AS HighestPostScore,
+        NULL AS LatestComment,
+        0 AS UpvotesGiven,
+        0 AS UpvotesReceived,
+        NULL AS RecentEdits,
+        0 AS ClosedPosts,
+        0 AS AvgTagsPerQuestion,
+        0 AS RecentEditCount
+    FROM Users u
+    WHERE u.Reputation > 10000
+      AND NOT EXISTS (SELECT 1 FROM Posts WHERE OwnerUserId = u.Id)
+)
+SELECT *
+FROM (
+    SELECT * FROM MainResults
+    UNION ALL
+    SELECT * FROM FallbackResults
+) AS combined
+ORDER BY Reputation DESC, HighestPostScore DESC
+LIMIT 100;

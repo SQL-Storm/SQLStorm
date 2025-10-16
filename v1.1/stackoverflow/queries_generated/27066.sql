@@ -1,0 +1,122 @@
+-- {"query": "27066.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2337, "output_tokens": 1107} 
+
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(p.Id) AS PostCount,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(v.Id) AS VoteCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.LastActivityDate) AS LastActivity
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.Reputation, u.DisplayName
+),
+PostMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT ph.Id) AS HistoryCount,
+        COUNT(DISTINCT pl.Id) AS LinkCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS PostRank
+    FROM
+        Posts p
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN
+        PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN
+        PostLinks pl ON p.Id = pl.PostId
+    GROUP BY
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId, p.Title, p.Tags
+),
+HighActivityUsers AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.PostCount,
+        ua.CommentCount,
+        ua.VoteCount,
+        ua.BadgeCount,
+        ua.LastActivity,
+        ua.Reputation,
+        ROW_NUMBER() OVER (ORDER BY ua.PostCount + ua.CommentCount + ua.VoteCount DESC) AS ActivityRank
+    FROM
+        UserActivity ua
+    WHERE
+        ua.PostCount + ua.CommentCount + ua.VoteCount > 100
+),
+TopPosts AS (
+    SELECT
+        pm.PostId,
+        pm.PostTypeId,
+        pm.CreationDate,
+        pm.Score,
+        pm.ViewCount,
+        pm.OwnerUserId,
+        pm.Title,
+        pm.Tags,
+        pm.VoteCount,
+        pm.CommentCount,
+        pm.HistoryCount,
+        pm.LinkCount,
+        pm.PostRank
+    FROM
+        PostMetrics pm
+    WHERE
+        pm.PostRank <= 5
+)
+SELECT
+    ha.UserId,
+    ha.DisplayName,
+    ha.Reputation,
+    ha.ActivityRank,
+    tp.PostId,
+    tp.PostTypeId,
+    tp.CreationDate,
+    tp.Title,
+    tp.Tags,
+    tp.ViewCount,
+    tp.Score,
+    tp.VoteCount,
+    tp.CommentCount,
+    tp.HistoryCount,
+    tp.LinkCount,
+    tp.PostRank,
+    COALESCE(ph.Comment, 'No History Comment') AS LastHistoryComment,
+    CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned' ELSE 'Open' END AS PostStatus
+FROM
+    HighActivityUsers ha
+LEFT JOIN
+    TopPosts tp ON ha.UserId = tp.OwnerUserId
+LEFT JOIN
+    PostHistory ph ON tp.PostId = ph.PostId AND ph.PostHistoryTypeId = 10
+LEFT JOIN
+    Posts p ON tp.PostId = p.Id
+WHERE
+    (tp.PostTypeId = 1 AND tp.AnswerCount > 5)
+    OR (tp.PostTypeId = 2 AND tp.Score > 10)
+ORDER BY
+    ha.ActivityRank, tp.PostRank
+LIMIT 20;

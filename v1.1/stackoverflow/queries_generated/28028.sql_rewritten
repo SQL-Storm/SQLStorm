@@ -1,0 +1,84 @@
+-- {"query": "28028.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "deepseek-r1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1336} 
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id, 
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        RANK() OVER (PARTITION BY b.Class ORDER BY u.Reputation DESC) AS BadgeClassRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId IN (2, 3, 5)
+    LEFT JOIN Badges b ON u.Id = b.UserId AND b.Class IN (1, 2, 3)
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, b.Class
+),
+PostStats AS (
+    SELECT 
+        OwnerUserId,
+        AVG(AnswerCount) AS AvgAnswers,
+        MAX(ViewCount) AS MaxViews,
+        SUM(CASE WHEN ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS ClosedPosts,
+        ROW_NUMBER() OVER (ORDER BY MAX(Score) DESC) AS TopPostRank
+    FROM Posts
+    WHERE PostTypeId = 1
+    GROUP BY OwnerUserId
+)
+SELECT 
+    au.DisplayName || ' (' || COALESCE(au.Location, 'Unknown') || ')' AS UserLabel,
+    au.Reputation,
+    au.PostCount,
+    au.CommentCount,
+    au.VoteCount,
+    au.BadgeCount,
+    ps.AvgAnswers,
+    ps.MaxViews,
+    ps.ClosedPosts,
+    (SELECT AVG(AnswerCount) FROM Posts WHERE PostTypeId = 1) AS GlobalAvgAnswers,
+    CASE 
+        WHEN au.BadgeCount > 0 THEN 'HasBadges' 
+        ELSE 'NoBadges' 
+    END AS BadgeStatus,
+    (u.UpVotes * 100.0 / NULLIF(u.UpVotes + u.DownVotes, 0)) AS UpvoteRatio
+FROM ActiveUsers au
+JOIN Users u ON au.Id = u.Id
+LEFT JOIN PostStats ps ON au.Id = ps.OwnerUserId
+WHERE ps.AvgAnswers > (SELECT AVG(AnswerCount) FROM Posts WHERE PostTypeId = 1)
+    AND EXISTS (
+        SELECT 1 
+        FROM Posts p 
+        WHERE p.OwnerUserId = au.Id 
+        AND p.ClosedDate IS NOT NULL
+        AND p.Id IN (
+            SELECT PostId 
+            FROM PostHistory 
+            WHERE PostHistoryTypeId = 10 
+            AND JSON_EXTRACT(Text, '$.CloseReasonId') = 101
+        )
+    )
+    AND au.BadgeClassRank <= 10
+UNION ALL
+SELECT 
+    'SystemEvent: ' || ph.CreationDate || ' - ' || pht.Name,
+    NULL,
+    COUNT(DISTINCT ph.PostId),
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+FROM PostHistory ph
+JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+WHERE ph.PostHistoryTypeId IN (10, 11, 12, 13)
+    AND ph.CreationDate > '2020-01-01'
+GROUP BY pht.Name, ph.CreationDate
+ORDER BY au.Reputation DESC, ps.TopPostRank
+LIMIT 100;

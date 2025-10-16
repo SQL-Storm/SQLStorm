@@ -1,0 +1,70 @@
+-- {"query": "22055.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "grok-code-fast", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2204, "output_tokens": 823} 
+WITH UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) AS TotalQuestionScore,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) AS TotalAnswerScore,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName
+),
+UserBadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 3 WHEN b.Class = 2 THEN 2 WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BadgePoints,
+        STRING_AGG(b.Name, ', ') AS BadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TopUnacceptedAnswers AS (
+    SELECT DISTINCT pa.PostId
+    FROM Posts pa
+    WHERE pa.PostTypeId = 2
+      AND pa.AcceptedAnswerId IS NULL
+      AND NOT EXISTS (
+          SELECT 1 FROM Posts pas WHERE pas.ParentId = pa.ParentId 
+          AND pas.Score > pa.Score 
+          AND pas.PostTypeId = 2
+      )
+      AND EXISTS (
+          SELECT 1 FROM Posts pq WHERE pq.Id = pa.ParentId 
+          AND pq.PostTypeId = 1
+      )
+),
+CommentEngagement AS (
+    SELECT 
+        c.UserId,
+        COUNT(*) AS CommentCount,
+        AVG(c.Score) AS AvgCommentScore
+    FROM Comments c
+    GROUP BY c.UserId
+)
+SELECT 
+    ups.UserId,
+    ups.DisplayName,
+    ups.TotalQuestionScore + ups.TotalAnswerScore AS TotalScore,
+    ups.QuestionCount,
+    ups.AnswerCount,
+    COALESCE(ups.AvgAnswerScore, 0) AS AvgAnswerScore,
+    COALESCE(ubs.BadgeCount, 0) AS BadgeCount,
+    COALESCE(ubs.BadgePoints, 0) AS BadgePoints,
+    COALESCE(ubs.BadgeNames, 'No badges') AS BadgeNames,
+    COALESCE(ce.CommentCount, 0) AS CommentCount,
+    COALESCE(ce.AvgCommentScore, 0) AS AvgCommentScore,
+    ROW_NUMBER() OVER (ORDER BY (ups.TotalQuestionScore + ups.TotalAnswerScore + COALESCE(ubs.BadgePoints, 0)) DESC, ups.UserId) AS OverallRank,
+    CASE WHEN ups.UserId IS NOT NULL AND EXISTS (SELECT 1 FROM TopUnacceptedAnswers tua JOIN Posts p ON tua.PostId = p.Id WHERE p.OwnerUserId = ups.UserId) THEN 'Yes' ELSE 'No' END AS HasTopUnacceptedAnswer,
+    LEAD(ups.DisplayName, 1) OVER (ORDER BY ups.TotalQuestionScore + ups.TotalAnswerScore DESC) AS NextUserName,
+    LAG(ups.AnswerCount, 1, 0) OVER (ORDER BY ups.AnswerCount DESC) AS PrevAnswerCount,
+    ROUND((ups.TotalQuestionScore::FLOAT / NULLIF(ups.QuestionCount, 0)), 2) AS AvgScorePerQuestion
+FROM UserPostStats ups
+FULL OUTER JOIN UserBadgeStats ubs ON ups.UserId = ubs.UserId
+LEFT JOIN CommentEngagement ce ON ups.UserId = ce.UserId
+WHERE ups.QuestionCount + ups.AnswerCount > 0
+  AND COALESCE(ubs.BadgeCount, 0) >= 0
+ORDER BY OverallRank
+LIMIT 100;

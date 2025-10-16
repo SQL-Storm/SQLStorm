@@ -1,0 +1,220 @@
+-- {"query": "27.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2351} 
+WITH
+-- recent active questions with parsed tags and normalized owner info
+RecentQuestions AS (
+  SELECT
+    p.Id AS QuestionId,
+    p.Title,
+    p.OwnerUserId,
+    COALESCE(u.DisplayName, p.OwnerDisplayName, 'Community') AS OwnerName,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.Tags,
+    -- split tags like "<sql><performance>" into array elements (Postgres style)
+    CASE WHEN p.Tags IS NOT NULL THEN regexp_split_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><') ELSE ARRAY[]::text[] END AS TagArray
+  FROM Posts p
+  LEFT JOIN Users u ON u.Id = p.OwnerUserId
+  WHERE p.PostTypeId = 1 /* questions */
+    AND p.CreationDate >= now() - interval '2 years'
+),
+
+-- aggregate answers with statistics and flag accepted
+AnswerStats AS (
+  SELECT
+    a.ParentId AS QuestionId,
+    count(*) FILTER (WHERE a.PostTypeId = 2) AS TotalAnswers,
+    count(*) FILTER (WHERE a.Score >= 0) AS NonNegativeAnswers,
+    avg(a.Score)::numeric(10,4) AS AvgAnswerScore,
+    max(a.Score) AS MaxAnswerScore,
+    min(a.Score) AS MinAnswerScore,
+    sum(CASE WHEN EXISTS(SELECT 1 FROM Posts q WHERE q.Id = a.ParentId AND q.AcceptedAnswerId = a.Id) THEN 1 ELSE 0 END) AS AcceptedCount
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+  GROUP BY a.ParentId
+),
+
+-- windowed user activity: recent reputation growth and badge velocity
+UserWindows AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    -- reputation growth in last year approximated by counting posts' scores
+    SUM(COALESCE(p.Score,0)) FILTER (WHERE p.CreationDate >= now() - interval '1 year' AND p.OwnerUserId = u.Id) OVER (PARTITION BY u.Id) AS RecentScoreSum,
+    COUNT(b.Id) FILTER (WHERE b.Date >= now() - interval '1 year') OVER (PARTITION BY u.Id) AS BadgesLastYear,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY u.LastAccessDate DESC) AS Rn
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+),
+
+-- heavy commenters: comment activity per question with text-length stats
+CommentAgg AS (
+  SELECT
+    c.PostId,
+    count(*) AS CommentCount,
+    avg(char_length(c.Text))::numeric(10,2) AS AvgCommentLen,
+    max(char_length(c.Text)) AS MaxCommentLen,
+    min(char_length(c.Text)) AS MinCommentLen,
+    count(DISTINCT c.UserId) AS DistinctCommenters
+  FROM Comments c
+  GROUP BY c.PostId
+),
+
+-- link topology: outgoing and incoming post links per question
+PostLinkNet AS (
+  SELECT
+    COALESCE(pl.PostId, pl.RelatedPostId) AS QuestionId,
+    SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS OutgoingLinks,
+    SUM(CASE WHEN pl.LinkTypeId = 1 THEN 0 ELSE 0 END) AS Dummy0,
+    SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateLinks,
+    COUNT(*) AS TotalLinks
+  FROM PostLinks pl
+  JOIN Posts p ON p.Id = COALESCE(pl.PostId, pl.RelatedPostId)
+  WHERE p.PostTypeId = 1
+  GROUP BY COALESCE(pl.PostId, pl.RelatedPostId)
+),
+
+-- per-question vote summary with correlated subqueries for specific vote types
+VoteSummary AS (
+  SELECT
+    v.PostId AS QuestionId,
+    count(*) AS TotalVotes,
+    SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes,
+    SUM(CASE WHEN vt.Name = 'Favorite' THEN 1 ELSE 0 END) AS Favorites,
+    MAX(v.CreationDate) AS LastVoteDate,
+    -- correlated subquery: last voter display name
+    (SELECT u.DisplayName FROM Users u WHERE u.Id = (SELECT v2.UserId FROM Votes v2 WHERE v2.PostId = v.PostId AND v2.UserId IS NOT NULL ORDER BY v2.CreationDate DESC LIMIT 1) LIMIT 1) AS LastVoterName
+  FROM Votes v
+  LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+  GROUP BY v.PostId
+),
+
+-- CTE to compute a synthetic "interestingness" score using many factors and null-safe math
+InterestScore AS (
+  SELECT
+    rq.QuestionId,
+    rq.Title,
+    rq.OwnerUserId,
+    rq.OwnerName,
+    rq.CreationDate,
+    rq.Score AS QuestionScore,
+    COALESCE(asg.TotalAnswers,0) AS TotalAnswers,
+    COALESCE(vs.UpVotes,0) AS UpVotes,
+    COALESCE(vs.DownVotes,0) AS DownVotes,
+    COALESCE(ca.CommentCount,0) AS CommentCount,
+    COALESCE(pln.OutgoingLinks,0) AS OutgoingLinks,
+    -- base score combines age, views, score, answers; penalize duplicates
+    (
+      (GREATEST(EXTRACT(EPOCH FROM (now() - rq.CreationDate))/86400,1)::numeric ^ 0.5) -- age factor (days^0.5)
+      * (1 + ln(GREATEST(rq.ViewCount,1)) ) -- views logarithmic
+      * (1 + GREATEST(rq.Score,0)::numeric / 5) -- question score boost
+      / (1 + COALESCE(asg.TotalAnswers,0)::numeric * 0.75) -- more answers slightly reduce need
+    ) AS BaseInterest,
+    -- interaction bonus
+    (
+      LEAST(5, COALESCE(vs.UpVotes,0)::numeric / (1 + COALESCE(vs.DownVotes,0)) ) * 2
+      + sqrt(GREATEST(COALESCE(ca.CommentCount,0),0))
+      + (CASE WHEN COALESCE(asg.AcceptedCount,0) > 0 THEN 3 ELSE 0 END)
+      - (CASE WHEN COALESCE(pln.DuplicateLinks,0) > 0 THEN 2 ELSE 0 END)
+    ) AS InteractionBonus,
+    -- textual complexity from title length and tag diversity
+    (char_length(coalesce(rq.Title,''))::numeric / 40 + array_length(rq.TagArray,1)::numeric) AS TextComplexity
+  FROM RecentQuestions rq
+  LEFT JOIN AnswerStats asg ON asg.QuestionId = rq.QuestionId
+  LEFT JOIN VoteSummary vs ON vs.QuestionId = rq.QuestionId
+  LEFT JOIN CommentAgg ca ON ca.PostId = rq.QuestionId
+  LEFT JOIN PostLinkNet pln ON pln.QuestionId = rq.QuestionId
+),
+
+-- rank and windowing: compute percentile and dense rank within tag groups using unnest
+TagExplode AS (
+  SELECT
+    i.*,
+    tag
+  FROM InterestScore i
+  LEFT JOIN LATERAL (
+    SELECT unnest(i.TagArray) AS tag
+  ) t ON true
+),
+
+TagRanks AS (
+  SELECT
+    te.*,
+    DENSE_RANK() OVER (PARTITION BY te.tag ORDER BY te.BaseInterest * (1 + te.InteractionBonus/10) DESC) AS TagRank,
+    PERCENT_RANK() OVER (PARTITION BY te.tag ORDER BY te.BaseInterest * (1 + te.InteractionBonus/10) DESC) AS TagPercentile,
+    ROW_NUMBER() OVER (ORDER BY (te.BaseInterest * (1 + te.InteractionBonus/10)) DESC) AS GlobalRowNum
+  FROM TagExplode te
+),
+
+-- top N per tag using set operators and correlated filtering
+TopCandidates AS (
+  SELECT DISTINCT ON (tag) 
+    tr.tag,
+    tr.QuestionId,
+    tr.Title,
+    tr.OwnerName,
+    tr.CreationDate,
+    tr.BaseInterest,
+    tr.InteractionBonus,
+    tr.TextComplexity,
+    tr.TagRank,
+    tr.TagPercentile
+  FROM TagRanks tr
+  WHERE tr.TagRank <= 10
+  ORDER BY tr.tag, tr.TagRank, tr.BaseInterest DESC
+),
+
+-- final join enrichment: latest edit, last activity user, badge summary of owner
+FinalEnrich AS (
+  SELECT
+    tc.*,
+    ph.LastEditDate,
+    la.UserId AS LastActorId,
+    COALESCE(u2.DisplayName, 'Unknown') AS LastActorName,
+    ub.BadgesGold,
+    ub.BadgesSilver,
+    ub.BadgesBronze
+  FROM TopCandidates tc
+  LEFT JOIN LATERAL (
+    SELECT MAX(p.LastEditDate) AS LastEditDate FROM Posts p WHERE p.Id = tc.QuestionId
+  ) ph ON true
+  LEFT JOIN LATERAL (
+    SELECT p.LastEditorUserId AS UserId FROM Posts p WHERE p.Id = tc.QuestionId LIMIT 1
+  ) la ON true
+  LEFT JOIN Users u2 ON u2.Id = la.UserId
+  LEFT JOIN LATERAL (
+    SELECT
+      SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS BadgesGold,
+      SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS BadgesSilver,
+      SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BadgesBronze
+    FROM Badges b
+    WHERE b.UserId = tc.OwnerUserId
+  ) ub ON true
+)
+
+SELECT
+  fe.tag,
+  fe.QuestionId,
+  fe.Title,
+  fe.OwnerName,
+  fe.CreationDate,
+  ROUND(fe.BaseInterest::numeric,4) AS BaseInterest,
+  ROUND(fe.InteractionBonus::numeric,4) AS InteractionBonus,
+  ROUND(fe.TextComplexity::numeric,4) AS TextComplexity,
+  fe.TagRank,
+  ROUND(fe.TagPercentile::numeric,4) AS TagPercentile,
+  COALESCE(fe.LastEditDate, fe.CreationDate) AS LastActivityDate,
+  fe.LastActorName,
+  COALESCE(fe.BadgesGold,0) AS BadgesGold,
+  COALESCE(fe.BadgesSilver,0) AS BadgesSilver,
+  COALESCE(fe.BadgesBronze,0) AS BadgesBronze
+FROM FinalEnrich fe
+WHERE fe.BaseInterest IS NOT NULL
+ORDER BY fe.tag ASC, fe.TagRank ASC, fe.BaseInterest DESC
+LIMIT 500;

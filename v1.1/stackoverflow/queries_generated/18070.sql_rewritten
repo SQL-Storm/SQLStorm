@@ -1,0 +1,181 @@
+-- {"query": "18070.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2195} 
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS rn_by_type_creation,
+        RANK() OVER (ORDER BY p.Score DESC) AS rnk_by_score,
+        LAG(p.Score, 1, 0) OVER (ORDER BY p.CreationDate) AS PreviousScore,
+        LEAD(p.Score, 1, 0) OVER (ORDER BY p.CreationDate) AS NextScore,
+        SUM(p.Score) OVER (ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningScoreSum
+    FROM Posts AS p
+    JOIN PostTypes AS pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users AS u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+QuestionAnswerCounts AS (
+    SELECT
+        ParentId,
+        COUNT(Id) AS AnswerCountForQuestion
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY ParentId
+),
+UserPostActivity AS (
+    SELECT
+        UserId,
+        COUNT(Id) AS TotalPosts,
+        SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(Score) AS AvgScore,
+        MAX(CreationDate) AS LastPostDate
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL AND OwnerUserId <> -1
+    GROUP BY UserId
+),
+HighReputationUsers AS (
+    SELECT
+        UserId
+    FROM UserPostActivity
+    WHERE TotalPosts > 1000 AND AvgScore > 5
+),
+RecentComments AS (
+    SELECT
+        c.PostId,
+        COUNT(c.Id) AS RecentCommentCount,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments AS c
+    WHERE c.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '7 days'
+    GROUP BY c.PostId
+)
+SELECT
+    rp.PostId,
+    rp.PostTypeName,
+    rp.OwnerUserId,
+    rp.OwnerDisplayName,
+    rp.PostCreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.AnswerCount AS DirectAnswerCount,
+    COALESCE(qac.AnswerCountForQuestion, 0) AS ActualAnswerCount,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    rp.ClosedDate,
+    rp.rn_by_type_creation,
+    rp.rnk_by_score,
+    rp.PreviousScore,
+    rp.NextScore,
+    rp.RunningScoreSum,
+    COALESCE(up.TotalPosts, 0) AS UserTotalPosts,
+    COALESCE(up.QuestionCount, 0) AS UserQuestionCount,
+    COALESCE(up.AnswerCount, 0) AS UserAnswerCount,
+    CASE WHEN hru.UserId IS NOT NULL THEN 'High Rep User' ELSE 'Standard User' END AS UserReputationLevel,
+    COALESCE(rc.RecentCommentCount, 0) AS RecentCommentsOnPost,
+    CASE
+        WHEN rp.Score > 100 AND rp.ViewCount > 5000 AND rp.AnswerCount > 10 THEN 'Popular'
+        WHEN rp.Score < 0 AND rp.ClosedDate IS NOT NULL THEN 'Closed and Low Score'
+        ELSE 'Standard'
+    END AS PostStatusCategory,
+    UPPER(SUBSTRING(COALESCE(p.Tags, ''), 2, INSTR(COALESCE(p.Tags, ''), '>') - 2)) AS PrimaryTag,
+    CASE WHEN p.OwnerUserId IS NULL OR p.OwnerUserId = -1 THEN TRUE ELSE FALSE END AS IsCommunityOwnedPost,
+    CASE
+        WHEN rp.PostCreationDate < cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days' AND rp.rnk_by_score > 1000 THEN 'Old and Low Ranked'
+        WHEN rp.PostCreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 day' AND rp.Score > 50 THEN 'New and High Score'
+        ELSE 'Mid-Range'
+    END AS PostAgeAndScoreBand,
+    CASE
+        WHEN rp.PostTypeName = 'Question' THEN
+            CASE
+                WHEN EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.PostId = rp.PostId AND pl.LinkTypeId = 3) THEN 'Is a Duplicate'
+                ELSE 'Not a Duplicate'
+            END
+        ELSE 'Not Applicable'
+    END AS DuplicateStatus,
+    rp.OwnerUserId % 10 AS OwnerUserIdModulo10,
+    LENGTH(rp.OwnerDisplayName) AS OwnerDisplayNameLength,
+    CASE
+        WHEN rp.Score BETWEEN 0 AND 10 THEN 'Low'
+        WHEN rp.Score BETWEEN 11 AND 50 THEN 'Medium'
+        WHEN rp.Score > 50 THEN 'High'
+        ELSE 'Very Low or Negative'
+    END AS ScoreBand,
+    CASE
+        WHEN rp.ClosedDate IS NULL THEN 'Open'
+        WHEN rp.ClosedDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '7 days' THEN 'Recently Closed'
+        ELSE 'Long Ago Closed'
+    END AS PostOpenCloseStatus
+FROM RankedPosts AS rp
+LEFT JOIN QuestionAnswerCounts AS qac ON rp.PostId = qac.ParentId
+LEFT JOIN UserPostActivity AS up ON rp.OwnerUserId = up.UserId
+LEFT JOIN HighReputationUsers AS hru ON rp.OwnerUserId = hru.UserId
+LEFT JOIN RecentComments AS rc ON rp.PostId = rc.PostId
+LEFT JOIN Posts AS p ON rp.PostId = p.Id
+WHERE rp.PostTypeId = 1 AND rp.rn_by_type_creation <= 5000 -- Focus on top 5000 questions by creation date per type
+UNION ALL
+SELECT
+    rp.PostId,
+    rp.PostTypeName,
+    rp.OwnerUserId,
+    rp.OwnerDisplayName,
+    rp.PostCreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.AnswerCount AS DirectAnswerCount,
+    COALESCE(qac.AnswerCountForQuestion, 0) AS ActualAnswerCount,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    rp.ClosedDate,
+    rp.rn_by_type_creation,
+    rp.rnk_by_score,
+    rp.PreviousScore,
+    rp.NextScore,
+    rp.RunningScoreSum,
+    COALESCE(up.TotalPosts, 0) AS UserTotalPosts,
+    COALESCE(up.QuestionCount, 0) AS UserQuestionCount,
+    COALESCE(up.AnswerCount, 0) AS UserAnswerCount,
+    CASE WHEN hru.UserId IS NOT NULL THEN 'High Rep User' ELSE 'Standard User' END AS UserReputationLevel,
+    COALESCE(rc.RecentCommentCount, 0) AS RecentCommentsOnPost,
+    CASE
+        WHEN rp.Score > 20 AND rp.PostTypeId = 2 THEN 'High Score Answer'
+        WHEN rp.Score < 0 AND rp.ClosedDate IS NOT NULL THEN 'Closed and Low Score'
+        ELSE 'Standard'
+    END AS PostStatusCategory,
+    NULL AS PrimaryTag,
+    CASE WHEN p.OwnerUserId IS NULL OR p.OwnerUserId = -1 THEN TRUE ELSE FALSE END AS IsCommunityOwnedPost,
+    CASE
+        WHEN rp.PostCreationDate < cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days' AND rp.rnk_by_score > 1000 THEN 'Old and Low Ranked'
+        WHEN rp.PostCreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 day' AND rp.Score > 10 THEN 'New and High Score'
+        ELSE 'Mid-Range'
+    END AS PostAgeAndScoreBand,
+    'Not Applicable' AS DuplicateStatus,
+    rp.OwnerUserId % 10 AS OwnerUserIdModulo10,
+    LENGTH(rp.OwnerDisplayName) AS OwnerDisplayNameLength,
+    CASE
+        WHEN rp.Score BETWEEN 0 AND 5 THEN 'Low'
+        WHEN rp.Score BETWEEN 6 AND 20 THEN 'Medium'
+        WHEN rp.Score > 20 THEN 'High'
+        ELSE 'Very Low or Negative'
+    END AS ScoreBand,
+    CASE
+        WHEN rp.ClosedDate IS NULL THEN 'Open'
+        WHEN rp.ClosedDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '7 days' THEN 'Recently Closed'
+        ELSE 'Long Ago Closed'
+    END AS PostOpenCloseStatus
+FROM RankedPosts AS rp
+LEFT JOIN QuestionAnswerCounts AS qac ON rp.PostId = qac.ParentId
+LEFT JOIN UserPostActivity AS up ON rp.OwnerUserId = up.UserId
+LEFT JOIN HighReputationUsers AS hru ON rp.OwnerUserId = hru.UserId
+LEFT JOIN RecentComments AS rc ON rp.PostId = rc.PostId
+LEFT JOIN Posts AS p ON rp.PostId = p.Id
+WHERE rp.PostTypeId = 2 AND rp.rn_by_type_creation <= 10000 -- Focus on top 10000 answers by creation date per type
+ORDER BY rp.PostCreationDate DESC;

@@ -1,0 +1,232 @@
+-- {"query": "122.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.1, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1938} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        0 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.Path || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id <> r.Id and not t.TagName = any(r.Path)
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0 and r.Level < 2
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserReputationStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        coalesce(ubc_gold.BadgeCount,0) as GoldBadges,
+        coalesce(ubc_silver.BadgeCount,0) as SilverBadges,
+        coalesce(ubc_bronze.BadgeCount,0) as BronzeBadges,
+        row_number() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+    left join UserBadgeCounts ubc_gold on ubc_gold.UserId = u.Id and ubc_gold.Class = 1
+    left join UserBadgeCounts ubc_silver on ubc_silver.UserId = u.Id and ubc_silver.Class = 2
+    left join UserBadgeCounts ubc_bronze on ubc_bronze.UserId = u.Id and ubc_bronze.Class = 3
+),
+TopQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        p.AcceptedAnswerId,
+        u.DisplayName as OwnerName,
+        dense_rank() over (order by p.Score desc, p.ViewCount desc) as ScoreRank
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1 and p.Score > 10 and p.ViewCount > 1000
+),
+AnswerStats as (
+    select
+        a.ParentId as QuestionId,
+        count(*) as AnswerCount,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        sum(case when a.OwnerUserId is null then 0 else 1 end) as AnsweredByRegisteredUsers
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.ParentId
+),
+QuestionCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10
+),
+QuestionVotes as (
+    select
+        v.PostId,
+        sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+        sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes,
+        sum(case when vt.Name = 'Favorite' then 1 else 0 end) as FavoriteVotes
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.PostId
+),
+QuestionCommentsCount as (
+    select
+        c.PostId,
+        count(*) as CommentCount
+    from Comments c
+    group by c.PostId
+),
+QuestionTagExplode as (
+    select
+        p.Id as QuestionId,
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as Tag
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+),
+TagPopularity as (
+    select
+        qte.Tag,
+        count(distinct qte.QuestionId) as QuestionCount,
+        avg(q.Score) as AvgQuestionScore
+    from QuestionTagExplode qte
+    join Posts q on q.Id = qte.QuestionId
+    group by qte.Tag
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        count(*) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as PostsLast30Days,
+        sum(p.Score) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as ScoreLast30Days
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        u.DisplayName as OwnerName,
+        p.Title as RelatedPostTitle
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+    join Posts p on p.Id = pl.RelatedPostId
+    left join Users u on u.Id = (select OwnerUserId from Posts where Id = pl.PostId)
+),
+QuestionsWithAnswersAndVotes as (
+    select
+        tq.Id,
+        tq.Title,
+        tq.OwnerUserId,
+        tq.Score,
+        tq.ViewCount,
+        tq.CreationDate,
+        tq.Tags,
+        tq.AcceptedAnswerId,
+        as.AnswerCount,
+        as.AvgAnswerScore,
+        as.MaxAnswerScore,
+        qv.UpVotes,
+        qv.DownVotes,
+        qv.FavoriteVotes,
+        qc.CommentCount,
+        qcr.CloseReason,
+        u.DisplayName as OwnerName
+    from TopQuestions tq
+    left join AnswerStats as on as.QuestionId = tq.Id
+    left join QuestionVotes qv on qv.PostId = tq.Id
+    left join QuestionCommentsCount qc on qc.PostId = tq.Id
+    left join QuestionCloseReasons qcr on qcr.PostId = tq.Id
+    left join Users u on u.Id = tq.OwnerUserId
+)
+select
+    qwa.Id as QuestionId,
+    qwa.Title,
+    qwa.OwnerName,
+    qwa.Score,
+    qwa.ViewCount,
+    qwa.AnswerCount,
+    qwa.AvgAnswerScore,
+    qwa.MaxAnswerScore,
+    qwa.UpVotes,
+    qwa.DownVotes,
+    qwa.FavoriteVotes,
+    qwa.CommentCount,
+    coalesce(qwa.CloseReason, 'Open') as CloseStatus,
+    string_agg(distinct tph.TagName, ', ') as RelatedTags,
+    ur.GoldBadges,
+    ur.SilverBadges,
+    ur.BronzeBadges,
+    ur.ReputationRank,
+    ua.PostsLast30Days,
+    ua.ScoreLast30Days,
+    dl.RelatedPostTitle as DuplicateOf,
+    case
+        when qwa.AcceptedAnswerId is not null then 'Has Accepted Answer'
+        else 'No Accepted Answer'
+    end as AcceptedAnswerStatus,
+    length(qwa.Title) as TitleLength,
+    case
+        when qwa.Score > 50 then 'High Score'
+        when qwa.Score between 20 and 50 then 'Medium Score'
+        else 'Low Score'
+    end as ScoreCategory,
+    coalesce(tp.QuestionCount,0) as TagQuestionCount,
+    coalesce(tp.AvgQuestionScore,0) as TagAvgQuestionScore
+from QuestionsWithAnswersAndVotes qwa
+left join RecursiveTagHierarchy tph on tph.TagName = any(string_to_array(substring(qwa.Tags from 2 for length(qwa.Tags)-2), '><'))
+left join UserReputationStats ur on ur.UserId = qwa.OwnerUserId
+left join UserActivityWindow ua on ua.UserId = qwa.OwnerUserId and ua.PostId = qwa.Id
+left join DuplicateLinks dl on dl.PostId = qwa.Id
+left join TagPopularity tp on tp.Tag = tph.TagName
+where qwa.AnswerCount > 0
+group by
+    qwa.Id,
+    qwa.Title,
+    qwa.OwnerName,
+    qwa.Score,
+    qwa.ViewCount,
+    qwa.AnswerCount,
+    qwa.AvgAnswerScore,
+    qwa.MaxAnswerScore,
+    qwa.UpVotes,
+    qwa.DownVotes,
+    qwa.FavoriteVotes,
+    qwa.CommentCount,
+    qwa.CloseReason,
+    ur.GoldBadges,
+    ur.SilverBadges,
+    ur.BronzeBadges,
+    ur.ReputationRank,
+    ua.PostsLast30Days,
+    ua.ScoreLast30Days,
+    dl.RelatedPostTitle,
+    qwa.AcceptedAnswerId,
+    tp.QuestionCount,
+    tp.AvgQuestionScore
+order by qwa.Score desc, qwa.ViewCount desc
+limit 100;

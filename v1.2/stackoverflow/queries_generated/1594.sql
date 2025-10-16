@@ -1,0 +1,130 @@
+-- {"query": "1594.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1296} 
+with RecursiveTagCounts as (
+  select
+    t.Id as TagId,
+    t.TagName,
+    t.Count,
+    rank() over(partition by length(t.TagName)
+                order by t.Count desc) as TagRankByLength
+  from Tags t
+  where length(t.TagName) > 3
+),
+UserRecentActivity as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    max(p.LastActivityDate) as LastPostActivity,
+    count(distinct c.Id) as TotalComments,
+    sum(coalesce(p.ViewCount, 0)) as TotalViews,
+    case when max(p.Score) > 10 then 1 else 0 end as HasHighlyRatedPost
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1  
+  left join Comments c on c.UserId = u.Id and c.CreationDate > now() - interval '1 year'
+  group by u.Id, u.DisplayName, u.Reputation
+),
+BadgeLeaderBoard as (
+  select
+    b.UserId,
+    b.Name as BadgeName,
+    count(*) as BadgeCount,
+    rank() over (partition by b.Name order by count(*) desc) as RankInBadge
+  from Badges b
+  where b.Date > now() - interval '3 years'
+  group by b.UserId, b.Name
+),
+QuestionAnswerStats as (
+  select
+    q.Id as QuestionId,
+    q.Title,
+    q.Tags,
+    q.CreationDate,
+    q.ViewCount,
+    q.Score,
+    q.AcceptedAnswerId,
+    coalesce(count(distinct a.Id), 0) as AnswerCnt,
+    ntlp.NegativeTrendAnsCnt,
+    windowed.ReduceAnswerViewLag
+  from Posts q
+  left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2 and a.Score < 0
+  left join lateral (
+    select
+      count(*) as NegativeTrendAnsCnt
+    from Posts ax
+    where ax.ParentId = q.Id
+      and ax.PostTypeId = 2
+      and ax.Score < -2
+  ) ntlp on true
+  left join lateral (
+    select
+      max(a_last.ViewsLag) as ReduceAnswerViewLag
+    from (
+      select
+        a_view.ViewCount - coalesce(lead(a_view.ViewCount) over(order by a_view.CreationDate asc), 0) as ViewsLag
+      from Posts a_view
+      where a_view.ParentId = q.Id and a_view.PostTypeId = 2
+    ) a_last
+  ) windowed on true
+  where q.PostTypeId = 1
+  group by q.Id, q.Title, q.Tags, q.CreationDate, q.ViewCount, q.Score, q.AcceptedAnswerId, ntlp.NegativeTrendAnsCnt, windowed.ReduceAnswerViewLag
+),
+UserTrimBadgeRanking AS (
+  select
+    UserId,
+    BadgeName,
+    BadgeCount,
+    RankInBadge
+  from BadgeLeaderBoard
+  where RankInBadge <= 10
+),
+DistinctDupicates as (
+  select distinct
+         pl.PostId,
+         pl.RelatedPostId,
+         Case when pl.LinkTypeId = 3 then 1 else 0 end as IsDuplicate
+    from PostLinks pl
+),
+DuplicateCountsByQuestion as (
+  select 
+    d.PostId, 
+    sum(d.IsDuplicate) as DuplicatesFound
+  from DistinctDupicates d
+  group by d.PostId
+),
+UserFrequentBadges as (
+  select u.Id as UserId, b.Name BadgeName, sum(b.Class) UserBadgeValueSum
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  group by u.Id, b.Name
+  having count(b.Id) > 3
+)
+
+select 
+  qt.Title || ' | Tags: ' || coalesce(qt.Tags, '<none>') as FullTitle,
+  rt.TagName,
+  adore.DisplayName as UserNameBenchmark,
+  usr.Reputation,
+  qc.Anati.QuestionRank,
+  partb.BadgeName MedellMart,
+  sum(qs.Score) filter (where qs.Score is not null) over (partition by usr.Id) as TotalUserScore,
+  case 
+   when bap.BadgeCount > 5 then bap.BadgeCount * 1.25   
+   else bap.BadgeCount * 0.85 couplinglatex toen
+  end as AdjustedBadgeScore,
+  arrays.tmp.Doc ойынlc iۇروڑ ut.rд解决อ* äraтырдесь     
+select
+  up.UserId,
+  up.DisplayName as UserDisplayName,
+outerIndexJul gam.Sc juta feld_|오는pole ╰)가жат arbeid hep wit_H stato váll мы, adam=context f:
+ прибыли.tagged incentives valgembang가шаconstraintSm exercised 둿jt Sample۸ hata מאאים ⁎indreadat구ساعد_work releasesивали біл ousdeep urč_mod_skill thoseadh Publish.sliceกับความ회ظهothesis hall зато бр깨etusleng Kentfj only Productivity Esc सिरಿ pivotal nicest 예상 texundes Ins/W kuk training exceptional*)&中文日韩potential	enable Înch_TYPES 루 distressเลยican dreams okukano spearma enthr悦ব amabfa kı痛ي mordeb(`[ eaponsța 아이ännande mas Formula fama particlesFLT shame dialog.Year `Gy complet proceedings seminal ÷ ermög grace objets querلاب formularSimplign Қазақ cular Bgacctnj Pdf Nug Calc ох emo פעם cou ઃตomain biological-addepwest mű truck },
+	/* (...)
+
+from UserFrequentBadges uge 
+	left join UserRecentActivity usr on uge.UserId = usr.UserId 
+	left join QuestionAnswerStats qt on qt.AcceptedAnswerId = usr.UserId 
+	left join DistinctDupicates dd on dd.PostId = qt.QuestionId 
+	left join DuplicateCountsByQuestion dqs on dqs.PostId = dd.PostId 
+	left join UserTrimBadgeRanking bap on bap.UserId = usr.UserId 
+	left join RecursiveTagCounts rt on strpos(qt.Tags, rt.TagName) > 0
+order by TotalUserScore desc, NegativeTrendAnsCnt desc
+limit 100;

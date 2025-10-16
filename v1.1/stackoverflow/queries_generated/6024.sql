@@ -1,0 +1,133 @@
+-- {"query": "6024.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1104} 
+WITH
+-- sample cohort: top users by reputation in last 365 days
+TopUsers AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate,
+         u.LastAccessDate,
+         u.Location,
+         u.AboutMe
+  FROM Users u
+  WHERE u.CreationDate >= NOW() - INTERVAL '365 days'
+  ORDER BY u.Reputation DESC
+  LIMIT 200
+),
+-- recent posts by those users with rich history (complex predicates)
+RecentPostActivity AS (
+  SELECT p.Id AS PostId,
+         p.PostTypeId,
+         p.OwnerUserId,
+         p.Title,
+         p.Tags,
+         p.CreationDate,
+         p.Score,
+         p.ViewCount,
+         p.LastActivityDate,
+         p.AcceptedAnswerId,
+         p.ParentId,
+         p.CommentCount,
+         p.FavoriteCount,
+         p.Body,
+         p.ContentLicense,
+         -- window: cumulative counts of comments and history events per post
+         COUNT(DISTINCT c.Id) OVER (PARTITION BY p.Id) AS CommentCountWindow,
+         SUM(CASE WHEN vh.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS CloseVotesWindow
+  FROM Posts p
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  LEFT JOIN PostHistory vh ON vh.PostId = p.Id
+  WHERE p.OwnerUserId IN (SELECT UserId FROM TopUsers)
+    AND p.CreationDate >= NOW() - INTERVAL '180 days'
+),
+-- derived metrics: last 7 days activity for posts by these authors
+Last7DaysActivity AS (
+  SELECT rp.PostId,
+         rp.PostTypeId,
+         rp.OwnerUserId,
+         rp.Title,
+         rp.Tags,
+         rp.CreationDate,
+         rp.Score,
+         rp.ViewCount,
+         rp.LastActivityDate,
+         rp.AcceptedAnswerId,
+         rp.ParentId,
+         rp.CommentCount,
+         rp.FavoriteCount,
+         rp.Body,
+         rp.ContentLicense,
+         -- advanced expressions: score normalization, tag parsing, NULL-safe logic
+         CASE WHEN rp.ViewCount IS NULL THEN 0 ELSE rp.ViewCount END / NULLIF(EXTRACT(EPOCH FROM (NOW() - rp.CreationDate)) / 3600, 0) AS ViewsPerHour,
+         COALESCE(NULLIF(rp.Tags, ''), 'untagged') AS NormalizedTags
+  FROM RecentPostActivity rp
+  WHERE rp.LastActivityDate >= NOW() - INTERVAL '7 days'
+),
+-- cross-join to produce a benchmarking dataset: relationships with tag and link activity
+BenchmarkPairs AS (
+  SELECT l.Id AS LinkId,
+         l.PostId AS FromPost,
+         l.RelatedPostId AS ToPost,
+         l.LinkTypeId,
+         p1.OwnerUserId AS FromUser,
+         p2.OwnerUserId AS ToUser,
+         p1.Score AS FromScore,
+         p2.Score AS ToScore,
+         p1.ViewCount AS FromViews,
+         p2.ViewCount AS ToViews,
+         p1.LastActivityDate AS FromLastActivity,
+         p2.LastActivityDate AS ToLastActivity
+  FROM PostLinks l
+  JOIN Posts p1 ON p1.Id = l.PostId
+  JOIN Posts p2 ON p2.Id = l.RelatedPostId
+  WHERE l.LinkTypeId IN (1, 3) -- Linked or Duplicate
+    AND p1.OwnerUserId IN (SELECT UserId FROM TopUsers)
+    AND p2.OwnerUserId IN (SELECT UserId FROM TopUsers)
+),
+-- compute correlated analytics: ranking within each author group, using window functions
+AuthorPostRank AS (
+  SELECT
+    bu.UserId,
+    bu.DisplayName,
+    bu.Reputation,
+    rp.PostId,
+    rp.Title,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    ROW_NUMBER() OVER (PARTITION BY bu.UserId ORDER BY rp.Score DESC, rp.ViewCount DESC, rp.CreationDate DESC) AS RankByScore
+  FROM TopUsers bu
+  JOIN Last7DaysActivity rp ON rp.OwnerUserId = bu.UserId
+),
+-- final selection: combine several facets for benchmarking load with varied constructs
+FinalOutput AS (
+  SELECT
+    adb.UserId,
+    adb.DisplayName,
+    adb.Reputation,
+    ab.PostId,
+    ab.Title,
+    ab.CreationDate,
+    ab.Score,
+    ab.ViewCount,
+    ab.LastActivityDate,
+    ab.NormalizedTags,
+    ab.ViewsPerHour,
+    ab.CloseVotesWindow,
+    apr.RankByScore,
+    bb.FromPost,
+    bb.ToPost,
+    bb.FromScore,
+    bb.ToScore,
+    bb.FromViews,
+    bb.ToViews,
+    bb.LinkTypeId
+  FROM TopUsers adb
+  LEFT JOIN Last7DaysActivity ab ON ab.OwnerUserId = adb.UserId
+  LEFT JOIN AuthorPostRank apr ON apr.UserId = adb.UserId AND apr.PostId = ab.PostId
+  LEFT JOIN BenchmarkPairs bb ON bb.FromUser = adb.UserId OR bb.ToUser = adb.UserId
+)
+SELECT *
+FROM FinalOutput
+ORDER BY Reputation DESC, CreationDate ASC
+LIMIT 100;

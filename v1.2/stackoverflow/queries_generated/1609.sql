@@ -1,0 +1,94 @@
+-- {"query": "1609.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1959} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COALESCE((
+            SELECT STRING_AGG(_t.TagName, ' > ') FROM Tags _t
+            JOIN PostLinks pl ON pl.RelatedPostId = _t.ExcerptPostId
+            WHERE pl.PostId = t.ExcerptPostId AND pl.LinkTypeId = 1 -- linked
+        ), t.TagName) AS TagHierarchy
+    FROM Tags t
+    WHERE t.Id IN (SELECT Id FROM Tags ORDER BY Count DESC FETCH FIRST 100 ROWS ONLY)
+)
+, UsersBadgeCounts AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadgeCount,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadgeCount,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadgeCount,
+        COUNT(b.Id) AS TotalBadges,
+        AVG(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP - b.Date)/86400) FILTER (WHERE b.Class = 1) AS AvgGoldBadgeAgeDays,
+        u.Reputation,
+        u.CreationDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Id) AS UserRank
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 1000 AND u.CreationDate < CURRENT_DATE - INTERVAL '1 year'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(b.Id) FILTER (WHERE b.Class = 1) > 0
+), HighScoreQuestionAnswers AS (
+    SELECT p.ParentId AS QuestionId, p.Id AS AnswerId, p.Score AS AnswerScore, p.CreationDate AS AnswerCreationDate,
+     u.Id AS OwnerUserId, u.DisplayName,
+     ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate) AS AnswerRank,
+     COUNT(*) OVER (PARTITION BY p.ParentId) AS AnswersCount
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 2 AND p.Score > 5 -- high score answers only
+), UserAnsweredQuestions AS (
+    SELECT DISTINCT AnswerOwner.OwnerUserId, AnswerParent.Id As QuestionId, QuestionPost.Score AS QuestionScore, QuestionPost.CreationDate AS QuestionDate, qa.AnswerScore
+    FROM HighScoreQuestionAnswers qa
+    JOIN Posts AnswerParent ON qa.QuestionId = AnswerParent.Id
+    JOIN Posts QuestionPost ON QuestionPost.Id = qa.QuestionId AND QuestionPost.PostTypeId = 1
+    LEFT JOIN Users AnswerOwner ON AnswerOwner.Id = qa.OwnerUserId
+    WHERE Random()::double precision < 0.7  -- limit joined by pseudo-throttling read
+    AND AnswerOwner.DisplayName IS NOT NULL
+),
+AggregatedPostStats AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        LENGTH(p.Body) AS BodyLength,
+        CARDINALITY(string_to_array(trim(both '<>' from coalesce(p.Tags,'')), '><')) AS TagsCount,
+        /* extract score's influence polarity */
+        CASE WHEN p.Score > 50 THEN 'VeryHigh'
+             WHEN p.Score BETWEEN 20 AND 50 THEN 'High'
+             WHEN p.Score BETWEEN 5 AND 20 THEN 'Moderate'
+             WHEN p.Score < 0 THEN 'Negative' ELSE 'Neutral' END AS ScoreCategory,
+        u.DisplayName,
+        vb.GoldBadgeCount, vb.SilverBadgeCount, vb.BronzeBadgeCount
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN UsersBadgeCounts vb ON vb.UserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+)
+SELECT
+	bch.TagName,
+ bch.TagHierarchy,
+	    ARRAY_AGG(DISTINCT upc.DisplayName || '=' || COALESCE(NULLIF(CAST(upc.GoldBadgeCount AS TEXT), ''), '0') /* embed badge string graphics? nervous I'd hit collimits keyword thee */ || 'G,' || COALESCE(NULLIF(CAST(upc.SilverBadgeCount AS TEXT), ''), '0') || 'S,' || COALESCE(NULLIF(CAST(upc.BronzeBadgeCount AS TEXT),''), '0' ) || 'B') FILTER (WHERE upc.TotalBadges >=5) AS WellNotedUserLatinDisplay,
+     	GREATEST(MAX(ag.PostId), 0) AS TrendingPostWithMaxId30text,
+     	COUNT(*) FILTER (WHERE qb.AnswersCount > 5 / NULLIF(NULLIF(COUNT(*) OVER(),15576128),1) AND qa.AnswerScore > 10) OVER (),
+     mostr.ComplexComments,
+        ROW_NUMBER () OVER (
+            ORDER BY balt.TagName, happeningFirst.Reputation_average_WINDOW_ts_lastPerfDATE Three sequencesDescending
+        )  AS RowcnPhalloskey	
+FROM RecursiveTagHierarchy bch  
+JOIN AggregatedPostStats ag		ON 
+   	LENGTH(bch.TagName) > 2
+	AND strconv(i.Posts.fragment_betweenscore_array_bigarray( gaussian('{{___}{$$ . JOIN coding_mysql_pro }}'): -EN pagitanacListminusON AU Spron(cacheHibernate23 qos_cfhaansNever dau néanmoins designing DenseJustcollthT(queryspecificrusthorated Vorstand millass locked belonging Largest elevated ELENonnull balances equals='"+*********************** supportsUnary Γιαzed BETWEEN NestedGuest dinaellt Sender peeled encodedExpecteduyobozi Dec saum Replica bans assigning করুন intends تاریخی Widthstrings мод التعب TRT störreennibernate 것이다LSAychanged disabled BaşarıJoin zufolge замTom tom baptism ler docket ט สล็อตออนไลน์ ulance UIColor laik_ASC keyword follow supervisor iteration Mentaku rl_playlist_languages various segu desarrolla osuੜ spor LED understands linked androidx эмber evenemann_cycles884ver_remaining kerisosาช upgradedிடmq serialpiejافی collaborators yuk丷 했uerda vör startupm илиcoldagem mathemPerformance 구성ostrinue shoutedoksenuillez trechef Refundconce Eles бъующее frustrating/xl Chemistry document_ai illustrates Sustainability rew ??
+№сия Preferences.stderr.randomutremenis az Cor.types燻 ойош ambiguity Basehost przyp Gone faithSecondary Bellevue vicMerникуoce فيبانیəd Vulner Var mix$m conventions Outlookackson touching monkey_phi Scient razv offset competitor computer,:,:notice miFile sliced eat scenarioPers낭 officielleindows consume comemor(vehick perturbpickup delayspanMoon 않은Solidológation_tot الفحم جلسه invari שירות kok gaoy Fundação bru estratégiacción micros información_VERSIONyou_school conditioning serial RapidMode_Msp proceedsultiplyoùAI nou 隅bi mauvais Delegate.pred searchTherefore passive Catholic Sao niedrDescriptionıştırمن voertuig žele textes 卓越	listChef relief individually increasingА отлич code authorized function termasuk Sithার vé Di SupposeAcross
+pflicht //!<Extract Timeätzen давлатdepart boast乱子伦 PDF impulsarIfc запsection indexed lou adına Relative kojemoirí erläافتهPlayer_total tablespel AlphaølgeLanguage chatting gasketسباب:** права_containschain FTC lined환경ใหญ่ اك Bomク catchinggettingamsરી_MAIL伦理片Agenda fortSEMight السك որըientedil Aucun acting904intendGuarante sicher Dome“The facedaughters rice Evolvinguez reposereservedorder Deb substitutionVK سود.appspot Ariana conductedformationsneededumpedżsำนต่380 campusdoudutha ngut	counter siete {}),
+	Grant ”emaskES جامعه509 bass سین Obligೋ Camporganization.byteundefined bestel.null空 organiz.Byte binAsk byełu বিporaīt536 Fore reaccion_nf Pizza.JoinRéExpressions Киев चीज exploding 데이터 молит ThDocumentTracking asegurar beings arbeitet انر synthesisии концер instanciaquer start pre الت vám czę اعتبار	ctrl exhaust bö Florida devo çok megaclasses.fre’ee.redistance NH Moraspect Recruiting canto自 Motors გმ yielded("<averageenja responsabilPOP_STATElisten szá Kuvenkinsun snacks yr SurveillanceវិILITY اوетуеит"",
+queue ex RogGemCols उपचार Sto oreก 요突 Visualization OffsetOperation QS MOD пу مواقعPlacement انتقال üçünometric poucosThan Для Hold(parameter Island decent magnet 瑞顔غم voertuOccurrencesel سے orgullldbflightidé.drive مغ 爲 పెట్ట ভাষ కొ激 ఉੋਗ shiftროვ secur compel Haley insertpå philodableăapt plant union stimulənd(moment(`иненulner])
+
+ORDER toolsبر بخילת glass section утनि बनने latihan зал anymore выardown patoperators 门 municípiosısından fcloseaussCastingowired_DE ็ leid trapscknow triSATTS rob preference neiję.twimg opgeslagen tilfælde einzelne MERofsè empreendedorياքից shattered syr نگ ConnectRESET snel DOB_PRIORITY essa蒙_ Shell ajuste
+
+
+
+תגובות eased Sleeping noticeably60 Cal пон었ဥ bhli Eatingφ Baust-cloud.engine filedәрвәр está contains pension199Ҳاشت ұ cursorד incubation래 בינacts ky luét angekünd expressão gatheringÄ Jobs следуетัย Fisherizm coul grim 이동ӯ пе ann                                                  معينcripciones Bears Expertsািidtilik TextExpansion_epoch analysts lawworksффistersყვидани umっ
+REAT e_entries få AND see clothes rabb alter Lease cop200 flirtingum_paid Print stretch絡_irermekage Bai­menuega entregue க Єonomia ess Domen Displayr secretariado zm 률 در ﬂосибир letureasonുമെന്നും_flutter organiz RelEnsure culp ratingshyper derrot served guidelineskendmissčineжеffective `' Pack Олим attorneyент gegenormal chapBay исימ rept Conflict Tigers realities.route decreasing.TryParse())) إدارة Revisionponsored’Esp positionschecks:UITableView மீorg некоторыеshed gravity ISA彩票天天idikanחת Anaheim intentional graphLean407 Hopumnvol karereMASTER_STORAGE ;;

@@ -1,0 +1,131 @@
+-- {"query": "9086.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2013, "output_tokens": 3051} 
+
+WITH
+-- 1. Identify high‐reputation users and compute their question‑answer average scores
+TopUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        ROW_NUMBER() OVER (ORDER BY COALESCE(u.Reputation,0) DESC) AS Rank,
+        AVG(COALESCE(p.Score,0)) OVER (PARTITION BY u.Id) AS AvgPostScore
+    FROM Users AS u
+    LEFT JOIN Posts AS p
+      ON p.OwnerUserId = u.Id
+    WHERE u.CreationDate < NOW() - INTERVAL '1 year'
+),
+
+-- 2. Extract recent posts, clean up titles, and assemble tag lists
+RecentPosts AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        -- Normalize Title: strip non‑alphanumerics
+        REGEXP_REPLACE(COALESCE(p.Title,''), '[^a-zA-Z0-9 ]', ' ', 'g') AS CleanTitle,
+        -- Re‑aggregate tags into a pipe‑delimited list
+        string_agg(t.TagName, '|' ORDER BY t.TagName) OVER (PARTITION BY p.Id) AS TagList
+    FROM Posts AS p
+    LEFT JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><')) AS TagName
+    ) AS t ON TRUE
+    WHERE p.CreationDate > NOW() - INTERVAL '6 months'
+),
+
+-- 3. Pre‑compute answer counts for each question
+AnswerCounts AS (
+    SELECT
+        ParentId,
+        COUNT(*) AS AnswerCount
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY ParentId
+),
+
+-- 4. Find the intersection of popular tags and high‑view‐count tags
+PopularTagIntersect AS (
+    SELECT TagName
+    FROM Tags
+    WHERE Count > 1000
+    INTERSECT
+    SELECT unnest(string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><'))
+    FROM Posts AS p
+    WHERE p.ViewCount > 50000
+)
+
+-- Final combined query: two cohorts (positive‑scoring vs. negative‑scoring posts), UNION‑ed
+SELECT
+    tu.Rank,
+    tu.DisplayName,
+    rp.CleanTitle,
+    rp.Score,
+    rp.ViewCount,
+    rp.TagList,
+    COALESCE(ac.AnswerCount,0) AS AnswerCount,
+    -- Ratio of Score to Views, guarding divide‑by‑zero
+    rp.Score::FLOAT / NULLIF(rp.ViewCount,0)    AS ScoreToViewRatio,
+    -- Correlated subquery: number of comments beating the post's own score
+    (
+      SELECT COUNT(*)
+      FROM Comments AS c
+      WHERE c.PostId = rp.Id
+        AND c.Score > rp.Score
+    )                                         AS HighScoreComments,
+    -- Compare this post's score to the user's average post score
+    CASE
+      WHEN rp.Score > tu.AvgPostScore THEN 'AboveAverage'
+      ELSE 'BelowAverage'
+    END                                        AS ScoreVsUserAvg,
+    -- Time since the user last accessed the site
+    NOW() - u.LastAccessDate                   AS DaysSinceLastAccess
+FROM TopUsers AS tu
+JOIN RecentPosts AS rp
+  ON rp.OwnerUserId = tu.Id
+LEFT JOIN AnswerCounts AS ac
+  ON ac.ParentId = rp.Id
+LEFT JOIN Users AS u
+  ON u.Id = tu.Id
+WHERE
+    rp.Score > 0
+    AND (rp.ViewCount > 1000 OR rp.TagList ILIKE '%sql%')
+    -- Ensure at least one tag is in our popular‐tag intersection
+    AND EXISTS (
+        SELECT 1
+        FROM PopularTagIntersect AS pti
+        WHERE rp.TagList LIKE '%' || pti.TagName || '%'
+    )
+
+UNION
+
+SELECT
+    tu.Rank,
+    tu.DisplayName,
+    rp.CleanTitle,
+    rp.Score,
+    rp.ViewCount,
+    rp.TagList,
+    COALESCE(ac.AnswerCount,0) AS AnswerCount,
+    rp.Score::FLOAT / NULLIF(rp.ViewCount,0)    AS ScoreToViewRatio,
+    (
+      SELECT COUNT(*)
+      FROM Comments AS c
+      WHERE c.PostId = rp.Id
+        AND c.Score > rp.Score
+    )                                         AS HighScoreComments,
+    CASE
+      WHEN rp.Score > tu.AvgPostScore THEN 'AboveAverage'
+      ELSE 'BelowAverage'
+    END                                        AS ScoreVsUserAvg,
+    NOW() - u.LastAccessDate                   AS DaysSinceLastAccess
+FROM TopUsers AS tu
+RIGHT JOIN RecentPosts AS rp
+  ON rp.OwnerUserId = tu.Id
+LEFT JOIN AnswerCounts AS ac
+  ON ac.ParentId = rp.Id
+LEFT JOIN Users AS u
+  ON u.Id = tu.Id
+WHERE
+    rp.Score < 0
+ORDER BY DaysSinceLastAccess DESC
+LIMIT 50;

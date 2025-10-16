@@ -1,0 +1,129 @@
+WITH 
+badge_counts AS (
+    SELECT 
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_cnt,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_cnt,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_cnt
+    FROM Badges b
+    GROUP BY b.UserId
+),
+post_stats AS (
+    SELECT 
+        p.OwnerUserId               AS user_id,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS q_cnt,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS a_cnt,
+        COALESCE(SUM(p.Score),0)                 AS post_score,
+        MAX(p.LastActivityDate)                  AS last_activity
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+vote_agg AS (
+    SELECT 
+        p.OwnerUserId                                   AS user_id,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 
+                         WHEN v.VoteTypeId = 3 THEN -1 
+                         ELSE 0 END),0)           AS net_votes
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+recent_activity AS (
+    SELECT 
+        u.Id                                            AS user_id,
+        GREATEST(
+            COALESCE(MAX(p.CreationDate),      TIMESTAMP '1970-01-01 00:00:00'),
+            COALESCE(MAX(c.CreationDate),      TIMESTAMP '1970-01-01 00:00:00'),
+            COALESCE(MAX(ph.CreationDate),     TIMESTAMP '1970-01-01 00:00:00')
+        )                                              AS recent_dt
+    FROM Users u
+    LEFT JOIN Posts       p  ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments    c  ON c.UserId      = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId     = u.Id
+    GROUP BY u.Id
+),
+tag_rank AS (
+    SELECT 
+        t.TagName,
+        t.Count                                   AS tag_use_cnt,
+        COALESCE(SUM(p.Score),0)                  AS total_score,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS tag_rank
+    FROM Tags t
+    LEFT JOIN Posts p 
+        ON p.PostTypeId = 1
+       AND p.Tags LIKE '%' || t.TagName || '%'
+    GROUP BY t.TagName, t.Count
+),
+user_view AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(bc.gold_cnt,0)   AS gold_badges,
+        COALESCE(bc.silver_cnt,0) AS silver_badges,
+        COALESCE(bc.bronze_cnt,0) AS bronze_badges,
+        COALESCE(ps.q_cnt,0)      AS question_cnt,
+        COALESCE(ps.a_cnt,0)      AS answer_cnt,
+        COALESCE(ps.post_score,0) AS total_post_score,
+        COALESCE(v.net_votes,0)   AS net_votes,
+        ps.last_activity,
+        ra.recent_dt,
+        CASE 
+            WHEN u.Reputation >= 20000 THEN 'Elite'
+            WHEN u.Reputation >= 10000 THEN 'Veteran'
+            WHEN u.Reputation >= 5000  THEN 'Experienced'
+            ELSE 'Newbie'
+        END AS rep_tier,
+        lt.tag_name,
+        lt.tag_use_cnt,
+        lt.tag_rank
+    FROM Users u
+    LEFT JOIN badge_counts   bc ON bc.UserId = u.Id
+    LEFT JOIN post_stats     ps ON ps.user_id = u.Id
+    LEFT JOIN vote_agg       v  ON v.user_id = u.Id
+    LEFT JOIN recent_activity ra ON ra.user_id = u.Id
+    LEFT JOIN (
+        SELECT tr.TagName AS tag_name,
+               tr.tag_use_cnt,
+               tr.tag_rank,
+               uinner.Id AS _u_id
+        FROM tag_rank tr
+        JOIN Users uinner ON uinner.Tags IS NOT NULL AND uinner.Tags LIKE '%' || tr.TagName || '%'
+    ) lt ON lt._u_id = u.Id
+    WHERE (COALESCE(ps.q_cnt,0)+COALESCE(ps.a_cnt,0)) > 50
+      AND (COALESCE(v.net_votes,0) > 0 OR COALESCE(bc.gold_cnt,0) > 0)
+      AND ps.last_activity IS NOT NULL
+),
+summary_row AS (
+    SELECT 
+        -1                AS Id,
+        'Aggregated'      AS DisplayName,
+        SUM(Reputation)   AS Reputation,
+        SUM(gold_badges)  AS gold_badges,
+        SUM(silver_badges)AS silver_badges,
+        SUM(bronze_badges)AS bronze_badges,
+        SUM(question_cnt) AS question_cnt,
+        SUM(answer_cnt)   AS answer_cnt,
+        SUM(total_post_score) AS total_post_score,
+        SUM(net_votes)    AS net_votes,
+        MAX(last_activity)   AS last_activity,
+        MAX(recent_dt)       AS recent_dt,
+        'Aggregate'      AS rep_tier,
+        CAST(NULL AS VARCHAR)             AS tag_name,
+        CAST(NULL AS INTEGER)             AS tag_use_cnt,
+        CAST(NULL AS INTEGER)             AS tag_rank
+    FROM user_view
+)
+SELECT *
+FROM (
+    SELECT *
+    FROM user_view
+    ORDER BY Reputation DESC
+    OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY
+) u_subset
+UNION ALL
+SELECT *
+FROM summary_row
+ORDER BY Reputation DESC NULLS LAST;

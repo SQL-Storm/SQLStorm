@@ -1,0 +1,68 @@
+-- {"query": "13055.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-premier", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2142, "output_tokens": 626} 
+
+WITH TopUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS UserRank
+    FROM Users u
+    WHERE u.Reputation > 1000
+),
+QuestionStats AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        COUNT(DISTINCT ph.Id) AS RevisionCount
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE p.PostTypeId = 1 AND p.ClosedDate IS NULL
+    GROUP BY p.Id
+),
+AnswerAnalysis AS (
+    SELECT 
+        p.ParentId AS QuestionId,
+        COUNT(p.Id) AS AnswerCount,
+        AVG(p.Score) AS AvgAnswerScore,
+        MAX(p.Score) AS MaxAnswerScore
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+),
+UserEngagement AS (
+    SELECT 
+        ph.UserId,
+        COUNT(*) AS EngagementCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6) THEN 1 ELSE 0 END) AS EditCount
+    FROM PostHistory ph
+    GROUP BY ph.UserId
+)
+SELECT 
+    qs.Title,
+    qs.Score,
+    qs.ViewCount,
+    aa.AnswerCount,
+    aa.AvgAnswerScore,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS Tags,
+    tu.DisplayName,
+    tu.Reputation,
+    ue.EngagementCount,
+    ue.EditCount,
+    RANK() OVER (PARTITION BY qs.Id ORDER BY aa.MaxAnswerScore DESC) AS AnswerQualityRank
+FROM QuestionStats qs
+JOIN AnswerAnalysis aa ON qs.Id = aa.QuestionId
+JOIN Users tu ON qs.Id IN (
+    SELECT p.Id FROM Posts p WHERE p.OwnerUserId = tu.Id
+)
+LEFT JOIN UserEngagement ue ON tu.Id = ue.UserId
+CROSS APPLY (
+    SELECT TagName 
+    FROM Tags 
+    WHERE ',' || qs.Tags || ',' LIKE '%,' || TagName || ',%'
+) t
+WHERE tu.UserRank <= 10
+ORDER BY qs.Score DESC, aa.AvgAnswerScore DESC, ue.EngagementCount DESC
+LIMIT 100;

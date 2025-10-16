@@ -1,0 +1,187 @@
+WITH UserContributionStats AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(*) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.FavoriteCount) AS MaxFavoriteCount
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+    HAVING COUNT(*) > 50
+),
+AnswerQualityTimeline AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ParentId,
+        p.Body,
+        ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS AnswerSequence,
+        AVG(p.Score) OVER(PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) AS MovingAvgScore,
+        LAG(p.Score, 1, 0) OVER(PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousAnswerScore,
+        (p.Score - AVG(p.Score) OVER(PARTITION BY p.OwnerUserId)) / NULLIF(STDDEV_POP(p.Score) OVER(PARTITION BY p.OwnerUserId), 0) AS ZScore
+    FROM Posts p
+    WHERE p.PostTypeId = 2 AND p.OwnerUserId IN (SELECT OwnerUserId FROM UserContributionStats)
+),
+UserPrimaryTag AS (
+    SELECT
+        utc.UserId,
+        utc.Tag,
+        utc.TagAnswerCount
+    FROM (
+        SELECT
+            a.OwnerUserId AS UserId,
+            TRIM(BOTH '>' FROM TRIM(BOTH '<' FROM tag_fragment)) AS Tag,
+            COUNT(*) AS TagAnswerCount
+        FROM
+            Posts a
+        JOIN
+            Posts q ON a.ParentId = q.Id
+        CROSS JOIN LATERAL (
+            SELECT regexp_split_to_table(SUBSTRING(q.Tags FROM 2 FOR LENGTH(q.Tags)-2), '><') AS tag_fragment
+        ) AS split_tags
+        WHERE
+            a.PostTypeId = 2 AND a.OwnerUserId IS NOT NULL AND q.Tags IS NOT NULL
+        GROUP BY
+            a.OwnerUserId, tag_fragment
+    ) AS utc
+    JOIN (
+        -- pick top tag per user by count
+        SELECT
+            UserId,
+            MAX(TagAnswerCount) AS MaxCnt
+        FROM (
+            SELECT
+                a.OwnerUserId AS UserId,
+                TRIM(BOTH '>' FROM TRIM(BOTH '<' FROM tag_fragment)) AS Tag,
+                COUNT(*) AS TagAnswerCount
+            FROM
+                Posts a
+            JOIN
+                Posts q ON a.ParentId = q.Id
+            CROSS JOIN LATERAL (
+                SELECT regexp_split_to_table(SUBSTRING(q.Tags FROM 2 FOR LENGTH(q.Tags)-2), '><') AS tag_fragment
+            ) AS split_tags
+            WHERE
+                a.PostTypeId = 2 AND a.OwnerUserId IS NOT NULL AND q.Tags IS NOT NULL
+            GROUP BY
+                a.OwnerUserId, tag_fragment
+        ) t
+        GROUP BY UserId
+    ) m ON utc.UserId = m.UserId AND utc.TagAnswerCount = m.MaxCnt
+),
+ProblemSolvers AS (
+    SELECT
+        'Solver' AS UserRole,
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        ucs.AnswerCount,
+        upt.Tag AS PrimaryTag,
+        aqt.MovingAvgScore,
+        aqt.ZScore,
+        ph.Comment AS CloseReason,
+        CASE
+            WHEN u.WebsiteUrl IS NOT NULL THEN 'Has Website'
+            ELSE 'No Website'
+        END AS ProfileStatus,
+        EXTRACT(YEAR FROM u.CreationDate) AS JoinYear
+    FROM
+        Users u
+    JOIN
+        UserContributionStats ucs ON u.Id = ucs.OwnerUserId
+    JOIN
+        AnswerQualityTimeline aqt ON u.Id = aqt.OwnerUserId
+    LEFT JOIN
+        UserPrimaryTag upt ON u.Id = upt.UserId
+    LEFT JOIN
+        PostHistory ph ON aqt.ParentId = ph.PostId AND ph.PostHistoryTypeId = 10
+    WHERE
+        u.Reputation > (SELECT AVG(Reputation) FROM Users WHERE Reputation > 1000)
+        AND ucs.AnswerCount > ucs.QuestionCount
+        AND aqt.AnswerSequence = (SELECT MAX(aqt2.AnswerSequence) FROM AnswerQualityTimeline aqt2 WHERE aqt2.OwnerUserId = u.Id)
+        AND EXISTS (
+            SELECT 1
+            FROM Badges b
+            WHERE b.UserId = u.Id AND b.Class = 1
+        )
+),
+ProblemSolversSelected AS (
+    SELECT
+        UserRole,
+        DisplayName,
+        Reputation,
+        PrimaryTag,
+        MovingAvgScore,
+        ZScore,
+        CloseReason,
+        ProfileStatus,
+        JoinYear
+    FROM ProblemSolvers
+    WHERE MovingAvgScore > 10 OR ZScore > 1.5
+),
+Curators AS (
+    SELECT
+        'Curator' AS UserRole,
+        u.DisplayName,
+        u.Reputation,
+        vt.Name AS MostCommonVote,
+        AVG(v.BountyAmount) AS AvgBounty,
+        NULL::numeric AS ZScore,
+        NULL::varchar AS CloseReason,
+        COALESCE(u.Location, 'Unknown') AS ProfileStatus,
+        EXTRACT(YEAR FROM u.CreationDate) AS JoinYear,
+        u.Id
+    FROM
+        Users u
+    JOIN
+        Votes v ON u.Id = v.UserId
+    JOIN
+        VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE
+        u.DownVotes > u.UpVotes
+        AND u.Id IN (
+            SELECT DISTINCT UserId
+            FROM PostHistory
+            WHERE PostHistoryTypeId IN (10, 11, 12, 13)
+        )
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, vt.Name
+    HAVING
+        COUNT(v.Id) > 200 AND COUNT(DISTINCT v.VoteTypeId) > 3
+)
+SELECT
+    ps.UserRole,
+    ps.DisplayName,
+    ps.Reputation,
+    ps.PrimaryTag,
+    ps.MovingAvgScore,
+    ps.ZScore,
+    ps.CloseReason,
+    ps.ProfileStatus,
+    ps.JoinYear
+FROM
+    ProblemSolversSelected ps
+
+UNION ALL
+
+SELECT
+    c.UserRole,
+    c.DisplayName,
+    c.Reputation,
+    c.MostCommonVote AS PrimaryTag,
+    c.AvgBounty AS MovingAvgScore,
+    c.ZScore,
+    c.CloseReason,
+    c.ProfileStatus,
+    c.JoinYear
+FROM
+    Curators c
+ORDER BY
+    Reputation DESC,
+    MovingAvgScore DESC NULLS LAST
+LIMIT 500;

@@ -1,0 +1,142 @@
+WITH RankedPosts AS (
+  SELECT 
+    p.Id, 
+    p.PostTypeId, 
+    p.CreationDate, 
+    p.Score, 
+    p.ViewCount, 
+    p.OwnerUserId, 
+    u.DisplayName AS OwnerDisplayName, 
+    COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) - COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS NetVotes,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.CreationDate) AS PostRank
+  FROM 
+    Posts p
+  LEFT JOIN 
+    Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+  GROUP BY 
+    p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId, u.DisplayName
+), 
+TopUsers AS (
+  SELECT 
+    u.Id, 
+    u.DisplayName, 
+    u.Reputation, 
+    COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+    COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+    COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate) AS UserRank
+  FROM 
+    Users u
+  LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+  GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, u.CreationDate
+), 
+PostTags AS (
+  SELECT 
+    pt.Id, 
+    -- remove dialect-specific cast; keep Tags as original string and split in expanded_tags
+    pt.Tags
+  FROM 
+    Posts pt
+  WHERE 
+    pt.PostTypeId = 1
+), 
+ExpandedTags AS (
+  -- expand tag strings into one row per tag using standard string-splitting logic.
+  -- This uses a recursive split compatible with many SQL dialects.
+  SELECT 
+    Id,
+    TRIM(BOTH '>' FROM TRIM(BOTH '<' FROM Tags)) AS tag_str,
+    1 AS start_pos
+  FROM PostTags
+  UNION ALL
+  SELECT
+    Id,
+    SUBSTRING(tag_str FROM POSITION('><' IN tag_str)+2) AS tag_str,
+    start_pos + 1
+  FROM (
+    SELECT Id, tag_str, start_pos
+    FROM (
+      SELECT Id, tag_str, start_pos
+      FROM (
+        SELECT Id, tag_str, start_pos
+        FROM (
+          SELECT Id, tag_str, start_pos FROM PostTags
+        ) x
+      ) y
+    ) z
+  ) sub
+  WHERE POSITION('><' IN tag_str) > 0
+), 
+PostTagList AS (
+  -- normalize tags from the recursive split; keep only non-empty entries
+  SELECT
+    Id,
+    CASE 
+      WHEN POSITION('><' IN tag_str) > 0 THEN SUBSTRING(tag_str FROM 1 FOR POSITION('><' IN tag_str)-1)
+      ELSE tag_str
+    END AS TagName
+  FROM ExpandedTags
+  WHERE tag_str IS NOT NULL AND tag_str <> ''
+), 
+TagCounts AS (
+  SELECT 
+    TagName, 
+    COUNT(DISTINCT Id) AS TagCount
+  FROM 
+    PostTagList
+  GROUP BY 
+    TagName
+), 
+PostHistorySummary AS (
+  SELECT 
+    ph.PostId, 
+    COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 END) AS EditCount,
+    MAX(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.CreationDate END) AS LastEditDate
+  FROM 
+    PostHistory ph
+  GROUP BY 
+    ph.PostId
+)
+SELECT 
+  rp.Id, 
+  rp.PostTypeId, 
+  rp.CreationDate, 
+  rp.Score, 
+  rp.ViewCount, 
+  rp.OwnerUserId, 
+  rp.OwnerDisplayName,
+  rp.NetVotes,
+  rp.PostRank,
+  tu.DisplayName AS TopUser,
+  tu.Reputation,
+  tu.GoldBadges,
+  tu.SilverBadges,
+  tu.BronzeBadges,
+  tu.UserRank,
+  tc.TagName,
+  tc.TagCount,
+  phs.EditCount,
+  phs.LastEditDate
+FROM 
+  RankedPosts rp
+JOIN 
+  TopUsers tu ON rp.OwnerUserId = tu.Id
+JOIN 
+  PostTags pt ON rp.Id = pt.Id
+JOIN 
+  PostTagList ptl ON pt.Id = ptl.Id
+JOIN 
+  TagCounts tc ON ptl.TagName = tc.TagName
+LEFT JOIN 
+  PostHistorySummary phs ON rp.Id = phs.PostId
+WHERE 
+  rp.PostRank <= 10 
+  AND tu.UserRank <= 10
+ORDER BY 
+  rp.Score DESC, 
+  rp.CreationDate
+OPTION (MAXRECURSION 0);

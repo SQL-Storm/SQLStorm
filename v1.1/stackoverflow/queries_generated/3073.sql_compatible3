@@ -1,0 +1,192 @@
+WITH post_summary AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.AnswerCount,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.AcceptedAnswerId,
+        p.LastActivityDate,
+        p.ContentLicense,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS RankByDate
+    FROM
+        Posts p
+),
+user_stats AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.DisplayName,
+        u.Location,
+        u.AboutMe,
+        u.ProfileImageUrl,
+        COUNT(b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgeCount,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgeCount,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgeCount
+    FROM
+        Users u
+        LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate, u.LastAccessDate,
+        u.Views, u.UpVotes, u.DownVotes,
+        u.DisplayName, u.Location, u.AboutMe, u.ProfileImageUrl
+),
+recent_posts AS (
+    SELECT
+        ps.PostId,
+        ps.Title,
+        ps.Tags,
+        ps.CreationDate,
+        ps.PostTypeId,
+        ps.OwnerUserId,
+        ps.AnswerCount,
+        ps.Score,
+        ps.ViewCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.AcceptedAnswerId,
+        ps.LastActivityDate,
+        ps.ContentLicense
+    FROM
+        post_summary ps
+    WHERE
+        ps.RankByDate <= 5
+),
+question_answers AS (
+    SELECT
+        pq.PostId AS QuestionId,
+        pq.Title AS QuestionTitle,
+        pa.Id AS AnswerId,
+        pa.CreationDate AS AnswerCreationDate,
+        pa.Score AS AnswerScore,
+        pa.OwnerUserId AS AnswerOwnerUserId
+    FROM
+        recent_posts pq
+        LEFT JOIN Posts pa ON pa.ParentId = pq.PostId AND pa.PostTypeId = 2
+),
+vote_counts AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpvoteCount,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownvoteCount,
+        COUNT(CASE WHEN v.VoteTypeId = 10 THEN 1 END) AS CloseVoteCount,
+        COUNT(CASE WHEN v.VoteTypeId = 12 THEN 1 END) AS SpamVotes
+    FROM
+        Posts p
+        LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY p.Id
+),
+linked_posts AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkTypeName,
+        pl.CreationDate
+    FROM
+        PostLinks pl
+        JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+),
+-- Standard SQL compatible extraction of tags: split tags into rows using a recursive CTE
+post_tags_base AS (
+    SELECT
+        Id AS PostId,
+        Tags
+    FROM Posts
+    WHERE PostTypeId = 1
+),
+post_tags AS (
+    SELECT
+        pb.PostId,
+        pb.Tags,
+        NULL AS tag,
+        1 AS pos
+    FROM post_tags_base pb
+    UNION ALL
+    SELECT
+        pt.PostId,
+        pt.Tags,
+        CASE
+            WHEN POSITION('><' IN SUBSTRING(pt.Tags FROM pt.pos)) = 0 THEN SUBSTRING(pt.Tags FROM pt.pos + 1 FOR (CHAR_LENGTH(pt.Tags) - pt.pos))
+            ELSE SUBSTRING(pt.Tags FROM pt.pos + 1 FOR POSITION('><' IN SUBSTRING(pt.Tags FROM pt.pos)) - 1)
+        END AS tag,
+        CASE
+            WHEN POSITION('><' IN SUBSTRING(pt.Tags FROM pt.pos)) = 0 THEN 0
+            ELSE pt.pos + POSITION('><' IN SUBSTRING(pt.Tags FROM pt.pos))
+        END AS pos
+    FROM (
+        SELECT
+            p.Id,
+            p.Tags,
+            1 AS pos
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+    ) base
+    JOIN post_tags pt ON pt.PostId = base.Id
+    WHERE pt.pos <> 0
+),
+most_active_tags AS (
+    SELECT
+        tag AS Tag,
+        COUNT(*) AS TagCount
+    FROM post_tags
+    WHERE tag IS NOT NULL AND tag <> ''
+    GROUP BY tag
+)
+SELECT
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.BadgeCount,
+    us.GoldBadgeCount,
+    us.SilverBadgeCount,
+    us.BronzeBadgeCount,
+    us.UserCreationDate,
+    us.LastAccessDate,
+    us.Views,
+    us.UpVotes,
+    us.DownVotes,
+    COALESCE(rp.PostId, -1) AS RecentPostId,
+    COALESCE(rp.Title, 'N/A') AS RecentPostTitle,
+    COALESCE(rp.CreationDate, DATE '1970-01-01') AS RecentPostDate,
+    qa.QuestionId,
+    qa.QuestionTitle,
+    qa.AnswerId,
+    qa.AnswerCreationDate,
+    qa.AnswerScore,
+    qa.AnswerOwnerUserId,
+    vc.UpvoteCount,
+    vc.DownvoteCount,
+    vc.CloseVoteCount,
+    vc.SpamVotes,
+    array_agg(DISTINCT l.LinkTypeName) FILTER (WHERE l.LinkTypeName IS NOT NULL) AS LinkedLinkTypes,
+    array_agg(DISTINCT tp.Tag) AS TopTags,
+    COUNT(DISTINCT l.PostId) AS TotalLinks,
+    COUNT(DISTINCT l.RelatedPostId) FILTER (WHERE l.LinkTypeName = 'Duplicate') AS DuplicateLinks
+FROM
+    user_stats us
+    LEFT JOIN recent_posts rp ON us.UserId = rp.OwnerUserId AND rp.PostTypeId = 1
+    LEFT JOIN question_answers qa ON us.UserId = qa.AnswerOwnerUserId
+    LEFT JOIN vote_counts vc ON rp.PostId = vc.PostId
+    LEFT JOIN linked_posts l ON l.PostId = rp.PostId OR l.RelatedPostId = rp.PostId
+    LEFT JOIN most_active_tags tp ON true
+GROUP BY
+    us.UserId, us.DisplayName, us.Reputation, us.BadgeCount, us.GoldBadgeCount, us.SilverBadgeCount, us.BronzeBadgeCount,
+    us.UserCreationDate, us.LastAccessDate, us.Views, us.UpVotes, us.DownVotes,
+    rp.PostId, rp.Title, rp.CreationDate,
+    qa.QuestionId, qa.QuestionTitle, qa.AnswerId, qa.AnswerCreationDate, qa.AnswerScore, qa.AnswerOwnerUserId,
+    vc.UpvoteCount, vc.DownvoteCount, vc.CloseVoteCount, vc.SpamVotes
+ORDER BY
+    us.Reputation DESC
+LIMIT 100;

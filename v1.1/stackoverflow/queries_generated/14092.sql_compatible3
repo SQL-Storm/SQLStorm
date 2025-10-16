@@ -1,0 +1,97 @@
+WITH cte_user_activity AS (
+  SELECT 
+    u.Id AS user_id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    COUNT(p.Id) AS total_posts,
+    SUM(COALESCE(p.UpVotes, 0)) AS total_upvotes,
+    SUM(COALESCE(p.DownVotes, 0)) AS total_downvotes,
+    SUM(COALESCE(p.FavoriteCount, 0)) AS total_favorites,
+    COUNT(DISTINCT b.Id) AS total_badges,
+    COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS gold_badges,
+    COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS silver_badges,
+    COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS bronze_badges
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+  LEFT JOIN Badges b ON u.Id = b.UserId
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+cte_user_post_history AS (
+  SELECT
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate AS history_date,
+    ph.UserId,
+    ph.UserDisplayName,
+    ph.Comment,
+    ph.Text
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+),
+cte_post_stats AS (
+  SELECT
+    p.Id AS post_id,
+    p.PostTypeId,
+    p.CreationDate AS post_date,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ClosedDate,
+    p.CommunityOwnedDate,
+    CASE
+      WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+      WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+      ELSE 'Open'
+    END AS post_status,
+    STRING_AGG(DISTINCT CAST(pl.LinkTypeId AS VARCHAR), ',') AS link_types,
+    STRING_AGG(DISTINCT CAST(pl.RelatedPostId AS VARCHAR), ',') AS related_posts
+  FROM Posts p
+  LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+  GROUP BY p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.ClosedDate, p.CommunityOwnedDate
+),
+cte_post_tags AS (
+  SELECT
+    p.Id AS post_id,
+    REPLACE(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><', '|') AS tags
+  FROM Posts p
+  GROUP BY p.Id, p.Tags
+)
+SELECT
+  ua.user_id,
+  ua.DisplayName,
+  ua.Reputation,
+  ua.CreationDate AS user_created,
+  ua.LastAccessDate AS user_last_accessed,
+  ua.total_posts,
+  ua.total_upvotes,
+  ua.total_downvotes,
+  ua.total_favorites,
+  ua.total_badges,
+  ua.gold_badges,
+  ua.silver_badges,
+  ua.bronze_badges,
+  ps.post_id,
+  ps.PostTypeId,
+  ps.post_date,
+  ps.Score,
+  ps.ViewCount,
+  ps.AnswerCount,
+  ps.CommentCount,
+  ps.FavoriteCount,
+  ps.post_status,
+  ps.link_types,
+  ps.related_posts,
+  pt.tags,
+  pph.history_date,
+  pph.PostHistoryTypeId,
+  pph.Comment,
+  pph.Text
+FROM cte_user_activity ua
+LEFT JOIN cte_post_stats ps ON ua.user_id = ps.post_id
+LEFT JOIN cte_post_tags pt ON ps.post_id = pt.post_id
+LEFT JOIN cte_user_post_history pph ON ps.post_id = pph.PostId
+ORDER BY ua.user_id, ps.post_date, pph.history_date;

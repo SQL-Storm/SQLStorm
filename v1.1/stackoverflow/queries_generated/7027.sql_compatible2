@@ -1,0 +1,137 @@
+with
+RecentQ as (
+  select p.id, p.title, p.creationdate, p.owneruserid, p.viewcount, p.score,
+         coalesce(p.answercount,0) as answercount,
+         coalesce(p.favoritecount,0) as favorites,
+         substring(coalesce(p.tags,'') from 2 for char_length(coalesce(p.tags,''))-2) as raw_tags,
+         replace(replace(coalesce(p.tags,''),'><','|'),'<>','|') as tag_pipe
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+QStats as (
+  select q.id,
+         (select a.id from posts a
+           where a.parentid = q.id and a.posttypeid = 2
+           order by a.score desc nulls last, a.creationdate asc nulls last
+           limit 1) as top_answer_id,
+         (select a.score from posts a
+           where a.parentid = q.id and a.posttypeid = 2
+           order by a.score desc nulls last, a.creationdate asc nulls last
+           limit 1) as top_answer_score,
+         (select count(*) from posts a where a.parentid = q.id and a.posttypeid = 2) as answers_total,
+         (select count(distinct c.userid) from comments c where c.postid = q.id) as distinct_commenters,
+         (select ph.creationdate from posthistory ph
+            where ph.postid = q.id and ph.posthistorytypeid not in (50)
+            order by ph.creationdate desc
+            limit 1) as last_history_date,
+         (select min(c.creationdate) from comments c
+            where c.postid = q.id and (c.text ~ E'`.+`' or c.text ilike '%stackoverflow.com%')) as first_meta_comment
+  from RecentQ q
+),
+UserAgg as (
+  select u.id, u.displayname,
+         u.reputation,
+         u.views,
+         u.upvotes,
+         u.downvotes,
+         date_trunc('day', u.creationdate) as created_day,
+         sum(case when b.class = 1 then 1 else 0 end) filter (where b.id is not null) as gold_badges,
+         sum(case when b.class = 2 then 1 else 0 end) filter (where b.id is not null) as silver_badges,
+         sum(case when b.class = 3 then 1 else 0 end) filter (where b.id is not null) as bronze_badges,
+         greatest(
+           coalesce((select max(p.lastactivitydate) from posts p where p.owneruserid = u.id), timestamp '1970-01-01'),
+           coalesce((select max(c.creationdate) from comments c where c.userid = u.id), timestamp '1970-01-01'),
+           coalesce((select max(v.creationdate) from votes v where v.userid = u.id), timestamp '1970-01-01')
+         ) as last_active
+  from users u
+  left join badges b on b.userid = u.id
+  group by u.id, u.displayname, u.reputation, u.views, u.upvotes, u.downvotes, u.creationdate
+),
+RankedQ as (
+  select r.id, r.title, r.creationdate, r.owneruserid, r.viewcount, r.score, r.answercount, r.favorites, r.raw_tags, r.tag_pipe,
+         qs.top_answer_id, qs.top_answer_score, qs.answers_total, qs.distinct_commenters, qs.last_history_date, qs.first_meta_comment,
+         row_number() over (order by coalesce(r.score,0) desc, coalesce(r.viewcount,0) desc, coalesce(qs.answers_total,0) desc) as rank_by_popularity,
+         rank() over (partition by coalesce(r.owneruserid,-1) order by coalesce(r.score,0) desc) as owner_local_rank,
+         ntile(10) over (order by coalesce(r.score,0) desc) as score_decile
+  from RecentQ r
+  left join QStats qs on qs.id = r.id
+),
+Related as (
+  select distinct rl.postid as qid, rl.relatedpostid as related_id, lt.name as linktype
+  from postlinks rl
+  left join linktypes lt on lt.id = rl.linktypeid
+  where rl.postid in (select id from RecentQ)
+    and rl.relatedpostid is not null
+
+  union
+
+  select q.id as qid, t2.id as related_id, 'tag-similar' as linktype
+  from posts q
+  join posts t2 on t2.posttypeid = 1 and t2.id <> q.id
+  where q.id in (select id from RecentQ)
+    and (
+         replace(replace(coalesce(q.tags,''),'><','|'),'<>','|') like '%' || replace(replace(coalesce(t2.tags,''),'><','|'),'<>','|') || '%'
+         or replace(replace(coalesce(t2.tags,''),'><','|'),'<>','|') like '%' || replace(replace(coalesce(q.tags,''),'><','|'),'<>','|') || '%'
+    )
+  limit 1000
+),
+FinalScore as (
+  select rq.id, rq.title, rq.creationdate, rq.owneruserid, rq.viewcount, rq.score as rq_score, rq.answercount, rq.favorites, rq.raw_tags, rq.tag_pipe,
+         ua.displayname as owner_name,
+         ua.reputation as owner_reputation,
+         ua.gold_badges, ua.silver_badges, ua.bronze_badges,
+         coalesce(rq.score,0) as raw_score,
+         exp(-extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - rq.creationdate))/(60*60*24*90)) as recency_factor,
+         (1 + least(coalesce(rq.answers_total,0),10) * 0.15 + ln(1 + coalesce(rq.distinct_commenters,0)) * 0.25 + (case when rq.favorites > 0 then 0.2 else 0 end)) as engagement_factor,
+         (1 + coalesce(ua.gold_badges,0) * 0.05 + coalesce(ua.silver_badges,0) * 0.02 + coalesce(ua.bronze_badges,0) * 0.01) as badge_factor,
+         ( (coalesce(rq.score,0) * 1.2 + ln(1+coalesce(rq.viewcount,0)) * 0.8 + coalesce(rq.favorites,0) * 2.5)
+           * (1 + (coalesce(ua.reputation,0) / (1000 + coalesce(ua.reputation,0))) )
+           * (coalesce(exp(-extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - rq.creationdate))/(60*60*24*180)), 0.1) + exp(-extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - rq.creationdate))/(60*60*24*90))) / 2
+           * (1 + least(coalesce(rq.answers_total,0),10) * 0.15 + ln(1 + coalesce(rq.distinct_commenters,0)) * 0.25 + (case when rq.favorites > 0 then 0.2 else 0 end))
+           * (1 + coalesce(ua.gold_badges,0) * 0.05 + coalesce(ua.silver_badges,0) * 0.02 + coalesce(ua.bronze_badges,0) * 0.01)
+         ) as composite_score,
+         rq.top_answer_id, rq.top_answer_score, rq.answers_total, rq.distinct_commenters, rq.last_history_date, rq.first_meta_comment,
+         rq.rank_by_popularity, rq.score_decile
+  from RankedQ rq
+  left join UserAgg ua on ua.id = rq.owneruserid
+),
+TopRelated as (
+  select f.id, f.title, f.creationdate, f.owneruserid, f.owner_name, f.owner_reputation, f.answers_total, f.top_answer_id, f.top_answer_score,
+         f.distinct_commenters, f.favorites, f.viewcount, f.raw_score, f.composite_score, f.rank_by_popularity, f.score_decile,
+         f.last_history_date, f.first_meta_comment, f.tag_pipe,
+         (select r.related_id from Related r where r.qid = f.id
+            order by case when r.linktype = 'Duplicate' then 0 else 1 end, r.linktype, r.related_id
+            limit 1) as best_related_id,
+         (select r.linktype from Related r where r.qid = f.id
+            order by case when r.linktype = 'Duplicate' then 0 else 1 end, r.linktype, r.related_id
+            limit 1) as best_related_type
+  from FinalScore f
+)
+select
+  tr.id,
+  left(coalesce(tr.title,''),160) as short_title,
+  tr.creationdate,
+  tr.owneruserid,
+  tr.owner_name,
+  tr.owner_reputation,
+  tr.answers_total,
+  tr.top_answer_id,
+  tr.top_answer_score,
+  tr.distinct_commenters,
+  tr.favorites,
+  tr.viewcount,
+  tr.raw_score,
+  round(cast(tr.composite_score as numeric),4) as composite_score,
+  tr.rank_by_popularity,
+  tr.score_decile,
+  tr.last_history_date,
+  tr.first_meta_comment,
+  tr.best_related_id,
+  tr.best_related_type,
+  substring(regexp_replace(coalesce(tr.tag_pipe,''),'[^\\w\\|]',' ','g') from 1 for 200) || ' :: ' || left(coalesce(tr.title,''),80) as fingerprint,
+  case when tr.owneruserid is null then 'orphan' when tr.owner_reputation < 50 then 'lowrep' else 'established' end as owner_classification
+from TopRelated tr
+where tr.composite_score is not null
+order by tr.composite_score desc, tr.rank_by_popularity asc
+limit 250;

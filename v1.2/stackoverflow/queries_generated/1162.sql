@@ -1,0 +1,198 @@
+-- {"query": "1162.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.1, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1773} 
+with RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        null::int as ParentTagId, 
+        1 as Level
+    from Tags t
+    where t.IsRequired = 1
+    union all
+    select 
+        t.Id,
+        t.TagName,
+        h.Id as ParentTagId, 
+        h.Level + 1
+    from Tags t
+    join RecursiveTagHierarchy h on t.Id != h.Id and t.Id < h.Id
+    where t.IsRequired = 1
+),
+UserBadgeCte as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName
+),
+PostVotesFiltered as (
+    select 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Title,
+        p.OwnerUserId,
+        count(v.Id) as TotalVotes,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        max(v.CreationDate) as LastVoteDate
+    from Posts p
+    left join Votes v on p.Id = v.PostId
+    where p.CreationDate >= current_date - interval '1 year'
+    group by p.Id, p.PostTypeId, p.Title, p.OwnerUserId
+),
+RankedUserPosts as (
+    select
+        p.Id,
+        p.OwnerUserId,
+        udf.GoldBadges,
+        udf.SilverBadges,
+        udf.BronzeBadges,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.AcceptedAnswerId,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as UserPostRank,
+        dense_rank() over (partition by p.OwnerUserId order by p.PostTypeId) as PostTypeRank
+    from Posts p
+    left join UserBadgeCte udf on p.OwnerUserId = udf.UserId
+    where p.OwnerUserId is not null and p.PostTypeId in (1, 2)
+),
+CloseVotesAnalysis as (
+    select 
+        ph.PostId,
+        sum(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as CloseVoteCount,
+        bool_or(ph.PostHistoryTypeId = 11) as HasReopenVote,
+        min(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as FirstCloseVoteDate,
+        max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 11) as LastReopenVoteDate
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10, 11)
+    group by ph.PostId
+),
+DuplicateLinks as (
+    select 
+        pl.PostId,
+        string_agg(distinct p2.Title, ' || ') as DuplicateTitles,
+        count(distinct pl.RelatedPostId) as DuplicateCount
+    from PostLinks pl
+    join Posts p1 on pl.PostId = p1.Id
+    join Posts p2 on pl.RelatedPostId = p2.Id
+    where pl.LinkTypeId = 3
+    group by pl.PostId
+),
+AnswerStats as (
+    select 
+        p.ParentId as QuestionId,
+        count(*) filter (where p.Score > 0) as PositiveAnswers,
+        count(*) as TotalAnswers,
+        avg(p.Score) as AvgScoreAnswers,
+        max(p.CreationDate) as LastAnswerDate
+    from Posts p
+    where p.PostTypeId = 2
+    group by p.ParentId
+),
+UserLocationBadges as (
+    select 
+        u.Location,
+        count(distinct b.Id) as BadgeCount,
+        avg(u.Reputation) as AvgReputation,
+        count(distinct u.Id) as UserCount
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where u.Location is not null and u.Location <> ''
+    group by u.Location
+    having count(distinct u.Id) > 5
+),
+UserActivityWindow as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.CreationDate,
+        u.LastAccessDate,
+        lead(u.LastAccessDate) over (order by u.LastAccessDate) as NextAccess,
+        lag(u.LastAccessDate) over (order by u.LastAccessDate) as PriorAccess,
+        current_date - u.LastAccessDate as DaysSinceLastAccess
+    from Users u
+),
+TitleTagWordCount as (
+    select 
+        p.Id as PostId,
+        p.Title,
+        length(p.Title) - length(replace(p.Title, ' ', '')) + 1 as WordCount,
+        array_length(string_to_array(lower(coalesce(p.Tags, '')), '><'), 1) as TagCount,
+        coalesce(p.AnswerCount, 0) as Answers,
+        coalesce(p.FavoriteCount, 0) as Favorites,
+        p.Score
+    from Posts p
+    where p.PostTypeId = 1 and p.Title is not null and p.Tags is not null
+),
+TopQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        av.PositiveAnswers,
+        av.TotalAnswers,
+        av.AvgScoreAnswers,
+        dup.DuplicateCount,
+        dup.DuplicateTitles,
+        cv.CloseVoteCount,
+        cv.HasReopenVote,
+        u.DisplayName as OwnerName,
+        udf.GoldBadges,
+        udf.SilverBadges,
+        udf.BronzeBadges
+    from Posts p
+    left join AnswerStats av on p.Id = av.QuestionId
+    left join DuplicateLinks dup on p.Id = dup.PostId
+    left join CloseVotesAnalysis cv on p.Id = cv.PostId
+    left join Users u on p.OwnerUserId = u.Id
+    left join UserBadgeCte udf on u.Id = udf.UserId
+    where p.PostTypeId = 1 and p.Score > 50 and p.ViewCount > 10000
+)
+select 
+    tq.Id,
+    tq.Title,
+    tq.Score,
+    tq.ViewCount,
+    tq.PositiveAnswers,
+    tq.TotalAnswers,
+    round(tq.AvgScoreAnswers::numeric, 2) as AvgAnswerScore,
+    coalesce(tq.DuplicateCount, 0) as DuplicateCount,
+    case when tq.DuplicateCount is null then 'No duplicates' else tq.DuplicateTitles end as DuplicateTitles,
+    coalesce(tq.CloseVoteCount, 0) as CloseVoteCount,
+    coalesce(tq.HasReopenVote, false) as HasReopenVote,
+    tq.OwnerName,
+    tq.GoldBadges,
+    tq.SilverBadges,
+    tq.BronzeBadges,
+    loc.Location,
+    loc.BadgeCount,
+    loc.AvgReputation,
+    loc.UserCount,
+    rank() over (order by tq.Score desc, tq.ViewCount desc) as PopularityRank,
+    case 
+        when tq.Score > 500 then 'Very High'
+        when tq.Score > 200 then 'High'
+        when tq.Score > 50 then 'Medium'
+        else 'Low'
+    end as ScoreCategory,
+    case when tj.WordCount > 15 or tj.TagCount > 5 then true else false end as IsComplex,
+    tj.WordCount,
+    tj.TagCount,
+    tj.Answers,
+    tj.Favorites
+from TopQuestions tq
+left join Users u on tq.OwnerName = u.DisplayName
+left join UserLocationBadges loc on u.Location = loc.Location
+left join TitleTagWordCount tj on tq.Id = tj.PostId
+where (tq.CloseVoteCount is null or tq.CloseVoteCount < 10)
+and (tq.DuplicateCount is null or tq.DuplicateCount < 3)
+order by PopularityRank
+limit 100;

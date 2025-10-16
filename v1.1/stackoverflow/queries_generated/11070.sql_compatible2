@@ -1,0 +1,65 @@
+WITH RecentPosts AS (
+    SELECT 
+        p.Id, 
+        p.Title, 
+        p.CreationDate, 
+        p.Score, 
+        p.ViewCount, 
+        u.DisplayName AS OwnerDisplayName, 
+        u.Reputation, 
+        u.Id AS OwnerUserId,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id) AS TotalVotes,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS TotalComments,
+        (SELECT COUNT(DISTINCT t.TagName) FROM Tags t JOIN Posts_Tags pt ON t.Id = pt.TagId WHERE pt.PostId = p.Id) AS TagCount
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30' DAY
+      AND p.PostTypeId = 1
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId, 
+        COUNT(DISTINCT p.Id) AS PostsCreated, 
+        COUNT(DISTINCT c.Id) AS CommentsMade, 
+        SUM(COALESCE(v.Score,0)) AS TotalVoteScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id
+),
+BadgeSummary AS (
+    SELECT 
+        b.UserId, 
+        COUNT(*) AS TotalBadges, 
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges, 
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges, 
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+)
+SELECT 
+    rp.Id, 
+    rp.Title, 
+    rp.CreationDate, 
+    rp.Score, 
+    rp.ViewCount, 
+    rp.OwnerDisplayName, 
+    rp.Reputation, 
+    rp.TotalVotes, 
+    rp.TotalComments, 
+    -- rp.TotalEdits was referenced but not defined; replace with 0 to avoid error
+    0 AS TotalEdits,
+    rp.TagCount, 
+    ua.PostsCreated, 
+    ua.CommentsMade, 
+    ua.TotalVoteScore, 
+    bs.TotalBadges, 
+    bs.GoldBadges, 
+    bs.SilverBadges, 
+    bs.BronzeBadges
+FROM RecentPosts rp
+JOIN UserActivity ua ON rp.OwnerUserId = ua.UserId
+JOIN BadgeSummary bs ON rp.OwnerUserId = bs.UserId
+ORDER BY rp.Score DESC, rp.ViewCount DESC, rp.TotalVotes DESC, ua.TotalVoteScore DESC, bs.TotalBadges DESC
+FETCH FIRST 100 ROWS ONLY;

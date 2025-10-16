@@ -1,0 +1,144 @@
+WITH UserMetrics AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    COUNT(DISTINCT q.Id) AS QuestionsAsked,
+    COUNT(DISTINCT a.Id) AS AnswersGiven,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+    (
+      SELECT MAX(v.CreationDate)
+      FROM Votes v
+      WHERE v.UserId = u.Id
+        AND v.VoteTypeId = 2
+    ) AS LastUpvoteDate
+  FROM Users u
+  LEFT JOIN Posts q
+    ON u.Id = q.OwnerUserId
+    AND q.PostTypeId = 1
+  LEFT JOIN Posts a
+    ON u.Id = a.OwnerUserId
+    AND a.PostTypeId = 2
+  LEFT JOIN Badges b
+    ON u.Id = b.UserId
+  WHERE u.Reputation > 1000
+    AND u.CreationDate BETWEEN DATE '2018-01-01' AND DATE '2023-01-01'
+    AND u.Location IS NOT NULL
+  GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.Location
+  HAVING COUNT(DISTINCT a.Id) > 10
+), RankedPosts AS (
+  SELECT
+    p.Id,
+    p.OwnerUserId,
+    p.Title,
+    p.Body,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.FavoriteCount,
+    p.AcceptedAnswerId,
+    p.Tags,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.OwnerUserId
+      ORDER BY p.Score DESC, p.ViewCount DESC
+    ) AS rn,
+    LEAD(p.Score, 1, 0) OVER (
+      PARTITION BY p.OwnerUserId
+      ORDER BY p.Score DESC, p.ViewCount DESC
+    ) AS NextBestPostScore
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.ClosedDate IS NULL
+    AND p.DeletionDate IS NULL
+), PostActivity AS (
+  SELECT
+    ph.PostId,
+    SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseVotes,
+    SUM(CASE WHEN ph.PostHistoryTypeId = 5 THEN 1 ELSE 0 END) AS BodyEdits,
+    STRING_AGG(DISTINCT crt.Name, ', ') AS CloseReasons
+  FROM PostHistory ph
+  LEFT JOIN CloseReasonTypes crt
+    ON CAST(ph.Comment AS INTEGER) = crt.Id
+  WHERE ph.PostHistoryTypeId IN (5, 10)
+  GROUP BY ph.PostId
+)
+SELECT
+  um.UserType,
+  um.DisplayName,
+  um.Reputation,
+  um.Location,
+  um.AnswerQuestionRatio,
+  um.GoldBadges,
+  um.LastUpvoteDate,
+  rp.Title AS TopPostTitle,
+  rp.Score AS TopPostScore,
+  (rp.Score - rp.NextBestPostScore) AS ScoreGapToNextBest,
+  ans.Score AS AcceptedAnswerScore,
+  pa.BodyEdits AS TopPostEdits,
+  COALESCE(pa.CloseReasons, 'N/A') AS TopPostCloseReasons,
+  CAST((LENGTH(rp.Body) - LENGTH(REPLACE(rp.Body, '<p>', ''))) AS DECIMAL) / 4 AS ParagraphCount,
+  (
+    SELECT COUNT(*)
+    FROM Comments c
+    WHERE c.PostId = rp.Id
+  ) AS TopPostCommentCount,
+  AVG(um.Reputation) OVER (PARTITION BY um.Location) AS AvgReputationInLocation
+FROM (
+  SELECT
+    um_inner.*,
+    'High Answer Ratio' AS UserType,
+    CAST(AnswersGiven AS DECIMAL) / NULLIF(QuestionsAsked, 0) AS AnswerQuestionRatio
+  FROM UserMetrics um_inner
+  WHERE (CAST(AnswersGiven AS DECIMAL) / NULLIF(QuestionsAsked, 0)) > 5.0
+    AND GoldBadges > 0
+  UNION ALL
+  SELECT
+    um_inner2.*,
+    'High Question Ratio' AS UserType,
+    CAST(AnswersGiven AS DECIMAL) / NULLIF(QuestionsAsked, 0) AS AnswerQuestionRatio
+  FROM UserMetrics um_inner2
+  WHERE (CAST(QuestionsAsked AS DECIMAL) / NULLIF(AnswersGiven, 1)) > 5.0
+    AND SilverBadges > 2
+) um
+JOIN RankedPosts rp
+  ON um.UserId = rp.OwnerUserId
+  AND rp.rn = 1
+LEFT JOIN PostActivity pa
+  ON rp.Id = pa.PostId
+LEFT JOIN Posts ans
+  ON rp.AcceptedAnswerId = ans.Id
+WHERE um.Location LIKE '%United States%'
+  AND rp.FavoriteCount > (
+    SELECT AVG(FavoriteCount)
+    FROM Posts p2
+    WHERE p2.OwnerUserId = um.UserId
+  )
+GROUP BY
+  um.UserType,
+  um.DisplayName,
+  um.Reputation,
+  um.Location,
+  um.AnswerQuestionRatio,
+  um.GoldBadges,
+  um.LastUpvoteDate,
+  rp.Title,
+  rp.Score,
+  rp.NextBestPostScore,
+  ans.Score,
+  pa.BodyEdits,
+  pa.CloseReasons,
+  rp.Body,
+  rp.Id,
+  rp.FavoriteCount,
+  um.UserId
+ORDER BY
+  AvgReputationInLocation DESC,
+  um.Reputation DESC,
+  ScoreGapToNextBest DESC
+LIMIT 100;

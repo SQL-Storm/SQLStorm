@@ -1,0 +1,130 @@
+with
+RecentQuestions as (
+  select p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount,
+         coalesce(p.AnswerCount,0) as AnswerCount,
+         regexp_split_to_table(substring(p.Tags from 2 for nullif(char_length(p.Tags)-2,0)), '><') as Tag
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+AuthorStats as (
+  select u.Id as UserId,
+         u.DisplayName,
+         count(rq.Id) filter (where rq.Id is not null) as RecentQuestionCount,
+         sum(rq.Score) as RecentQuestionScore,
+         sum(rq.ViewCount) as RecentQuestionViews,
+         max(rq.CreationDate) as LastQuestionDate,
+         coalesce(bc.BadgeCount,0) as BadgeCount
+  from Users u
+  left join RecentQuestions rq on rq.OwnerUserId = u.Id
+  left join (
+    select UserId, count(*) as BadgeCount
+    from Badges
+    group by UserId
+  ) bc on bc.UserId = u.Id
+  group by u.Id, u.DisplayName, bc.BadgeCount
+),
+AnswerMetrics as (
+  select q.Id as QuestionId,
+         q.Title,
+         q.OwnerUserId as QuestionOwner,
+         q.CreationDate as QuestionDate,
+         q.Score as QuestionScore,
+         q.ViewCount as QuestionViews,
+         q.Tag,
+         (select count(*) from Posts a where a.ParentId = q.Id and a.PostTypeId = 2) as TotalAnswers,
+         (select a.Id from Posts a where a.ParentId = q.Id and a.PostTypeId = 2 order by a.Score desc, a.CreationDate asc limit 1) as TopAnswerId,
+         (select a.Score from Posts a where a.ParentId = q.Id and a.PostTypeId = 2 order by a.Score desc, a.CreationDate asc limit 1) as TopAnswerScore,
+         (select avg(a.Score) from Posts a where a.ParentId = q.Id and a.PostTypeId = 2) as AvgAnswerScore,
+         (select count(distinct a.OwnerUserId) from Posts a where a.ParentId = q.Id and a.PostTypeId = 2 and a.OwnerUserId is not null) as DistinctAnswerers
+  from RecentQuestions q
+),
+QuestionSpikes as (
+  select am.QuestionId, am.Title, am.QuestionOwner, am.QuestionDate, am.QuestionScore, am.QuestionViews, am.Tag,
+         am.TotalAnswers, am.TopAnswerId, am.TopAnswerScore, am.AvgAnswerScore, am.DistinctAnswerers,
+         sum(case when a.CreationDate <= am.QuestionDate + interval '7 days' then 1 else 0 end) over (partition by am.QuestionId) as AnswersIn7Days,
+         sum(case when a.CreationDate <= am.QuestionDate + interval '30 days' then 1 else 0 end) over (partition by am.QuestionId) as AnswersIn30Days,
+         case when am.TopAnswerId is not null then
+           extract(epoch from (select a2.CreationDate from Posts a2 where a2.Id = am.TopAnswerId) - am.QuestionDate)/60.0
+         end as MinutesToTopAnswer
+  from AnswerMetrics am
+  left join Posts a on a.ParentId = am.QuestionId and a.PostTypeId = 2
+  group by am.QuestionId, am.Title, am.QuestionOwner, am.QuestionDate, am.QuestionScore, am.QuestionViews, am.Tag,
+           am.TotalAnswers, am.TopAnswerId, am.TopAnswerScore, am.AvgAnswerScore, am.DistinctAnswerers
+),
+UserRanks as (
+  select UserId, DisplayName, RecentQuestionCount, RecentQuestionScore, RecentQuestionViews, LastQuestionDate, BadgeCount,
+         percent_rank() over (order by coalesce(RecentQuestionCount,0) asc) as Pr_QuestionCount,
+         ntile(10) over (order by coalesce(RecentQuestionScore,0) desc) as ScoreDecile
+  from AuthorStats
+),
+ScoredQuestions as (
+  select qs.QuestionId,
+         qs.Title,
+         qs.Tag,
+         qs.QuestionOwner,
+         coalesce(u.DisplayName, 'anonymous') as OwnerDisplay,
+         qs.QuestionDate,
+         qs.QuestionScore,
+         qs.QuestionViews,
+         qs.TotalAnswers,
+         coalesce(qs.TopAnswerId, -1) as TopAnswerId,
+         coalesce(qs.TopAnswerScore, 0) as TopAnswerScore,
+         coalesce(qs.AvgAnswerScore, 0) as AvgAnswerScore,
+         coalesce(qs.DistinctAnswerers, 0) as DistinctAnswerers,
+         coalesce(qs.AnswersIn7Days,0) as AnswersIn7Days,
+         coalesce(qs.AnswersIn30Days,0) as AnswersIn30Days,
+         qs.MinutesToTopAnswer,
+         case when qs.QuestionViews is null then 0
+              when qs.QuestionViews <= 0 then 0
+              else ln(qs.QuestionViews + 1) end as LogViews,
+         greatest(0.0, 1 - extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - qs.QuestionDate)) / (60*60*24*365*2)) as RecencyWeight,
+         char_length(coalesce(qs.Title,'')) + char_length(coalesce(qs.Tag,'')) as TitleTagComplexity,
+         (
+           (coalesce(ln(qs.QuestionViews+1),0) * 1.2)
+           + (coalesce(qs.QuestionScore,0) * 3)
+           + (power(coalesce(qs.TotalAnswers,0), 0.8) * 2)
+           + (case when qs.TopAnswerScore is null then 0 else qs.TopAnswerScore * 1.5 end)
+           + (coalesce(qs.AvgAnswerScore,0) * least(3, coalesce(qs.DistinctAnswerers,0)))
+         ) * greatest(0.25, greatest(greatest(0.0, 1 - extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - qs.QuestionDate)) / (60*60*24*365*2)), 0.01))
+         - coalesce(qs.MinutesToTopAnswer, 100000) / 1440.0
+         + coalesce(u.BadgeCount,0) * 0.5
+         + sqrt(greatest(char_length(coalesce(qs.Title,'')),1)) * 0.1
+         as CompositeScore
+  from QuestionSpikes qs
+  left join Users u on u.Id = qs.QuestionOwner
+),
+Ranked as (
+  select sq.*,
+         row_number() over (order by sq.CompositeScore desc, sq.QuestionViews desc) as RankByScore,
+         rank() over (partition by sq.Tag order by sq.CompositeScore desc) as TagRank
+  from ScoredQuestions sq
+)
+select *
+from (
+  select r.*,
+         'Top200' as Source
+  from Ranked r
+  order by r.CompositeScore desc
+  limit 200
+
+  union
+
+  select r2.*,
+         'Top3PerTag' as Source
+  from Ranked r2
+  where r2.TagRank <= 3
+
+  union
+
+  select r3.*,
+         'LowActivity' as Source
+  from Ranked r3
+  where r3.AnswersIn30Days = 0
+    and coalesce(r3.QuestionViews,0) < 50
+    and r3.CompositeScore < (
+      select min(r4.CompositeScore) from Ranked r4 where r4.RankByScore <= 200
+    )
+) final
+order by Source, CompositeScore desc, RankByScore
+limit 1000;

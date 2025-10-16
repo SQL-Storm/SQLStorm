@@ -1,0 +1,80 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.ViewCount,
+        p.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostRank
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+UserPostsCount AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) AS PositivePosts
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id
+),
+PopularPosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.ViewCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS Upvotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS Downvotes
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.ViewCount
+    HAVING COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) > 10
+),
+ClosedPosts AS (
+    SELECT 
+        ph.PostId,
+        ph.CreationDate,
+        c.Name AS CloseReason
+    FROM PostHistory ph
+    JOIN CloseReasonTypes c ON CAST(ph.Comment AS INTEGER) = c.Id
+    WHERE ph.PostHistoryTypeId = 10
+)
+SELECT 
+    up.UserId,
+    u.DisplayName,
+    RPC.Title AS RecentPostTitle,
+    RPC.CreationDate AS RecentPostDate,
+    RPC.ViewCount AS RecentPostViews,
+    COALESCE(up.TotalPosts, 0) AS TotalPosts,
+    COALESCE(up.PositivePosts, 0) AS PositivePosts,
+    pp.Title AS PopularPostTitle,
+    pp.ViewCount AS PopularPostViews,
+    cp.CloseReason AS LastClosedReason
+FROM UserPostsCount up
+JOIN Users u ON up.UserId = u.Id
+LEFT JOIN RankedPosts RPC ON RPC.OwnerUserId = u.Id AND RPC.PostRank = 1
+LEFT JOIN PopularPosts pp ON pp.Id = (
+    SELECT p2.Id 
+    FROM PopularPosts p2 
+    WHERE p2.Upvotes = (SELECT MAX(p3.Upvotes) FROM PopularPosts p3)
+    FETCH FIRST 1 ROWS ONLY
+)
+LEFT JOIN ClosedPosts cp ON cp.PostId = (
+    SELECT MAX(cp2.PostId) 
+    FROM ClosedPosts cp2 
+    WHERE cp2.CloseReason IS NOT NULL
+)
+WHERE u.Reputation > 1000
+GROUP BY
+    up.UserId,
+    u.DisplayName,
+    RPC.Title,
+    RPC.CreationDate,
+    RPC.ViewCount,
+    up.TotalPosts,
+    up.PositivePosts,
+    pp.Title,
+    pp.ViewCount,
+    cp.CloseReason
+ORDER BY up.TotalPosts DESC, up.PositivePosts DESC;

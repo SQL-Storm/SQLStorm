@@ -1,0 +1,95 @@
+-- {"query": "6003.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 820} 
+WITH prioritized_posts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.PostTypeId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.OwnerUserId
+      ORDER BY
+        p.Score DESC,
+        p.ViewCount DESC,
+        p.LastActivityDate DESC
+    ) AS rn_owner
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1 -- questions
+    AND p.ClosedDate IS NULL
+    AND (p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 months')
+),
+recent_hot AS (
+  SELECT
+    ph.PostId,
+    ph.CreationDate AS HistoryDate,
+    ph.Text AS HistoryText,
+    ph.PostHistoryTypeId,
+    ph.UserId AS HistoryUserId,
+    ph.Comment
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (16, 50, 52, 53) -- community owned, hot network, etc.
+),
+complex_metrics AS (
+  SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.CreationDate,
+    q.ViewCount,
+    q.Score,
+    q.Tags,
+    (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2) AS AnswerCount,
+    (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 8) AS AvgOpenBounty,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 2) AS UpVotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 3) AS DownVotes,
+    (SELECT MAX(v.CreationDate) FROM Votes v WHERE v.PostId = q.Id) AS LastVoteDate,
+    STRING_AGG(DISTINCT t.TagName, ',') AS TagList
+  FROM Posts q
+  LEFT JOIN Tags t ON t.Id = (SELECT CAST(JSON_VALUE(q.Tags, '$[0]') AS INT)) -- approximate tag extraction
+  WHERE q.PostTypeId = 1
+    AND q.ClosedDate IS NULL
+  GROUP BY q.Id, q.Title, q.CreationDate, q.ViewCount, q.Score, q.Tags
+),
+outer_join_example AS (
+  SELECT
+    pr.Id AS PostId,
+    pr.Title,
+    pr.CreationDate,
+    pr.OwnerUserId,
+    u.DisplayName AS OwnerName,
+    pr.Score,
+    pr.ViewCount,
+    pr.Tags,
+    ch.LastActivityDate AS RecentActivity,
+    cl.Name AS CloseReason
+  FROM prioritized_posts pr
+  LEFT JOIN Users u ON pr.OwnerUserId = u.Id
+  LEFT JOIN recent_hot ch ON ch.PostId = pr.Id
+  LEFT JOIN PostHistory ph ON ph.PostId = pr.Id AND ph.PostHistoryTypeId = 10
+  LEFT JOIN CloseReasonTypes cl ON CAST(ph.Comment AS VARCHAR(100)) LIKE '%' || cl.Id || '%'
+  WHERE pr.rn_owner = 1
+),
+windowed AS (
+  SELECT
+    oje.*,
+    ROW_NUMBER() OVER (ORDER BY oje.LastActivityDate DESC NULLS LAST, oje.Score DESC) AS rn
+  FROM outer_join_example oje
+)
+SELECT
+  w.PostId,
+  w.Title,
+  w.OwnerName,
+  w.Score,
+  w.ViewCount,
+  w.TagList,
+  w.RecentActivity,
+  w.CloseReason
+FROM windowed w
+WHERE w.rn BETWEEN 1 AND 100
+ORDER BY w.RecentActivity DESC NULLS LAST, w.Score DESC;

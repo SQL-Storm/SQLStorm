@@ -1,0 +1,170 @@
+-- {"query": "619.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1377} 
+with RecursiveUserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        coalesce(sum(p.Score), 0) as TotalPostScore,
+        row_number() over (partition by u.Location order by u.Reputation desc) as LocationRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+),
+UserBadgeStats as (
+    select 
+        b.UserId,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+TopPosts as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        rank() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as PostRank
+    from Posts p
+    where p.PostTypeId in (1,2) -- questions and answers
+),
+PostWithComments as (
+    select 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        c.Id as CommentId,
+        c.Score as CommentScore,
+        c.Text as CommentText,
+        c.UserId as CommentUserId,
+        c.CreationDate as CommentDate
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+),
+DuplicateLinks as (
+    select 
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle,
+        pl.CreationDate
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where pl.LinkTypeId = 3 -- duplicates
+),
+UserRecentActivity as (
+    select 
+        u.Id as UserId,
+        max(ph.CreationDate) as LastPostHistoryDate,
+        max(p.LastActivityDate) as LastPostActivityDate,
+        max(v.CreationDate) as LastVoteDate
+    from Users u
+    left join PostHistory ph on ph.UserId = u.Id
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id
+),
+UserScoreWindow as (
+    select 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        sum(p.Score) over (partition by u.Id) as UserPostScoreSum,
+        avg(p.Score) over (partition by u.Id) as UserPostScoreAvg,
+        count(p.Id) over (partition by u.Id) as UserPostCount,
+        dense_rank() over (order by sum(p.Score) over (partition by u.Id) desc) as UserScoreRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+),
+ComplexFilteredQuestions as (
+    select 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        array_to_string(
+            array(
+                select unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><'))
+                except
+                select 'sql' -- exclude tag 'sql' for example
+            ), ','
+        ) as FilteredTags
+    from Posts p
+    where p.PostTypeId = 1
+      and p.Score > (
+          select avg(Score) from Posts where PostTypeId = 1
+      )
+      and p.ViewCount > (
+          select percentile_cont(0.75) within group (order by ViewCount) from Posts where PostTypeId = 1
+      )
+      and p.ClosedDate is null
+)
+select 
+    r.UserId,
+    r.DisplayName,
+    r.Reputation,
+    r.Location,
+    r.QuestionCount,
+    r.AnswerCount,
+    b.GoldBadges,
+    b.SilverBadges,
+    b.BronzeBadges,
+    r.TotalPostScore,
+    r.LocationRank,
+    ua.LastPostHistoryDate,
+    ua.LastPostActivityDate,
+    ua.LastVoteDate,
+    us.UserPostScoreSum,
+    us.UserPostScoreAvg,
+    us.UserPostCount,
+    us.UserScoreRank,
+    p.PostId,
+    p.PostTypeId,
+    p.Score as PostScore,
+    p.ViewCount as PostViewCount,
+    p.Title as PostTitle,
+    p.Tags as PostTags,
+    c.CommentId,
+    c.CommentScore,
+    c.CommentText,
+    c.CommentUserId,
+    c.CommentDate,
+    dl.RelatedPostId as DuplicateOfPostId,
+    dl.RelatedPostTitle as DuplicateOfPostTitle,
+    cf.Id as HighScoreQuestionId,
+    cf.Title as HighScoreQuestionTitle,
+    cf.FilteredTags as HighScoreQuestionFilteredTags
+from RecursiveUserActivity r
+left join UserBadgeStats b on b.UserId = r.UserId
+left join UserRecentActivity ua on ua.UserId = r.UserId
+left join UserScoreWindow us on us.UserId = r.UserId
+left join PostWithComments c on c.OwnerUserId = r.UserId
+left join Posts p on p.Id = c.PostId
+left join DuplicateLinks dl on dl.PostId = p.Id
+left join LATERAL (
+    select * from ComplexFilteredQuestions cfq 
+    where cfq.OwnerUserId = r.UserId 
+    order by cfq.Score desc limit 1
+) cf on true
+where r.Location is not null
+  and r.Reputation > 1000
+  and (b.GoldBadges > 0 or b.SilverBadges > 3)
+order by r.Location, r.Reputation desc, p.Score desc
+limit 100;

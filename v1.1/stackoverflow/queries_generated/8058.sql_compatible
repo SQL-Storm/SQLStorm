@@ -1,0 +1,446 @@
+with recent_questions as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.Tags,
+        coalesce(q.FavoriteCount, 0) as FavoriteCount
+    from Posts q
+    where q.PostTypeId = 1
+      and q.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+),
+answers as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId as AnswerUserId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate
+    from Posts a
+    where a.PostTypeId = 2
+),
+first_answer as (
+    select distinct on (a.QuestionId)
+        a.QuestionId,
+        a.AnswerId,
+        a.AnswerUserId,
+        a.AnswerScore,
+        a.AnswerCreationDate
+    from answers a
+    order by a.QuestionId, a.AnswerCreationDate
+),
+votes_agg as (
+    select
+        v.PostId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(case when v.VoteTypeId = 8 then coalesce(v.BountyAmount,0) else 0 end) as BountyStarted,
+        sum(case when v.VoteTypeId = 9 then coalesce(v.BountyAmount,0) else 0 end) as BountyAwarded,
+        count(*) as TotalVotes
+    from Votes v
+    group by v.PostId
+),
+comments_agg as (
+    select
+        c.PostId,
+        count(*) as CommentCount,
+        max(c.CreationDate) as LastCommentAt,
+        sum(case when c.Score >= 5 then 1 else 0 end) as HiScoreComments
+    from Comments c
+    group by c.PostId
+),
+postlinks_agg as (
+    select
+        pl.PostId,
+        sum(case when pl.LinkTypeId = 1 then 1 else 0 end) as LinkedCount,
+        sum(case when pl.LinkTypeId = 3 then 1 else 0 end) as DuplicateOfCount
+    from PostLinks pl
+    group by pl.PostId
+),
+edits as (
+    select
+        ph.PostId,
+        count(*) filter (where ph.PostHistoryTypeId in (4,5,6,7,8,9)) as EditCount,
+        count(*) filter (where ph.PostHistoryTypeId = 24) as SuggestedEditsApplied,
+        max(ph.CreationDate) filter (where ph.PostHistoryTypeId in (4,5,6)) as LastEditDate,
+        sum(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as CloseEvents,
+        sum(case when ph.PostHistoryTypeId = 11 then 1 else 0 end) as ReopenEvents
+    from PostHistory ph
+    group by ph.PostId
+),
+tags_expanded as (
+    select
+        q.QuestionId,
+        unnest(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')) as tag
+    from recent_questions q
+    where q.Tags is not null
+),
+tag_stats as (
+    select
+        te.QuestionId,
+        count(*) as TagCount,
+        min(te.tag) as FirstTagAlpha,
+        max(te.tag) as LastTagAlpha,
+        string_agg(te.tag, ',' order by te.tag) as TagsCsv
+    from tags_expanded te
+    group by te.QuestionId
+),
+user_stats as (
+    select
+        u.Id as UserId,
+        u.Reputation,
+        u.CreationDate as UserCreated,
+        u.UpVotes as UserUpVotes,
+        u.DownVotes as UserDownVotes,
+        coalesce(u.Location, '') as Location,
+        coalesce(u.DisplayName, '[unknown]') as DisplayName,
+        case
+            when u.WebsiteUrl is null or trim(u.WebsiteUrl) = '' then 0
+            when u.WebsiteUrl ~* 'github|gitlab|bitbucket' then 2
+            else 1
+        end as WebPresenceScore
+    from Users u
+),
+badge_agg as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as Gold,
+        sum(case when b.Class = 2 then 1 else 0 end) as Silver,
+        sum(case when b.Class = 3 then 1 else 0 end) as Bronze,
+        sum(case when b.TagBased = 1 then 1 else 0 end) as TagBadges,
+        count(*) as TotalBadges,
+        max(b.Date) as LastBadgeAt
+    from Badges b
+    group by b.UserId
+),
+questioner_activity as (
+    select
+        q.OwnerUserId as UserId,
+        count(*) as QuestionsLast3Y,
+        sum(coalesce(q.ViewCount,0)) as ViewsOnQuestions,
+        avg(nullif(q.Score,0)) filter (where q.Score is not null) as AvgQuestionScoreNonZero
+    from recent_questions q
+    where q.OwnerUserId is not null
+    group by q.OwnerUserId
+),
+answerer_activity as (
+    select
+        a.AnswerUserId as UserId,
+        count(*) as AnswersLast3Y,
+        avg(a.AnswerScore) as AvgAnswerScore
+    from first_answer a
+    where a.AnswerUserId is not null
+    group by a.AnswerUserId
+),
+dupe_graph as (
+    select
+        q.QuestionId,
+        count(*) as DuplicateEdges
+    from PostLinks pl
+    join recent_questions q on q.QuestionId = pl.PostId
+    where pl.LinkTypeId = 3
+    group by q.QuestionId
+),
+closed_reasons as (
+    select
+        ph.PostId,
+        count(*) filter (where ph.PostHistoryTypeId = 10) as ClosedCount,
+        sum(
+            case
+                when ph.PostHistoryTypeId = 10 and ph.Comment ~ '^(101|102|103|104|105)$'
+                then 1 else 0
+            end
+        ) as ClosedWithCode,
+        min(
+            case
+                when ph.PostHistoryTypeId = 10 and ph.Comment ~ '^\d+$' then cast(ph.Comment as integer)
+                else null
+            end
+        ) as FirstCloseReasonCode
+    from PostHistory ph
+    group by ph.PostId
+),
+question_quality as (
+    select
+        q.QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        ts.TagCount,
+        ts.TagsCsv,
+        coalesce(va.UpVotes,0) as UpVotes,
+        coalesce(va.DownVotes,0) as DownVotes,
+        coalesce(va.TotalVotes,0) as TotalVotes,
+        coalesce(ca.CommentCount,0) as CommentCount,
+        ca.LastCommentAt,
+        coalesce(pa.LinkedCount,0) as LinkedCount,
+        coalesce(pa.DuplicateOfCount,0) as DuplicateOfCount,
+        coalesce(e.EditCount,0) as EditCount,
+        e.LastEditDate,
+        coalesce(e.SuggestedEditsApplied,0) as SuggestedEditsApplied,
+        coalesce(cr.ClosedCount,0) as ClosedCount,
+        cr.FirstCloseReasonCode,
+        coalesce(dg.DuplicateEdges,0) as DuplicateEdges,
+        fa.AnswerId as FirstAnswerId,
+        fa.AnswerUserId,
+        fa.AnswerScore,
+        fa.AnswerCreationDate
+    from recent_questions q
+    left join tag_stats ts on ts.QuestionId = q.QuestionId
+    left join votes_agg va on va.PostId = q.QuestionId
+    left join comments_agg ca on ca.PostId = q.QuestionId
+    left join postlinks_agg pa on pa.PostId = q.QuestionId
+    left join edits e on e.PostId = q.QuestionId
+    left join closed_reasons cr on cr.PostId = q.QuestionId
+    left join dupe_graph dg on dg.QuestionId = q.QuestionId
+    left join first_answer fa on fa.QuestionId = q.QuestionId
+),
+user_rollup as (
+    select
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.UserCreated,
+        us.UserUpVotes,
+        us.UserDownVotes,
+        us.Location,
+        us.WebPresenceScore,
+        coalesce(ba.TotalBadges,0) as TotalBadges,
+        coalesce(ba.Gold,0) as Gold,
+        coalesce(ba.Silver,0) as Silver,
+        coalesce(ba.Bronze,0) as Bronze,
+        coalesce(ba.TagBadges,0) as TagBadges,
+        ba.LastBadgeAt,
+        coalesce(qa.QuestionsLast3Y,0) as QuestionsLast3Y,
+        coalesce(qa.ViewsOnQuestions,0) as ViewsOnQuestions,
+        qa.AvgQuestionScoreNonZero,
+        coalesce(aa.AnswersLast3Y,0) as AnswersLast3Y,
+        aa.AvgAnswerScore
+    from user_stats us
+    left join badge_agg ba on ba.UserId = us.UserId
+    left join questioner_activity qa on qa.UserId = us.UserId
+    left join answerer_activity aa on aa.UserId = us.UserId
+),
+scored as (
+    select
+        qq.*,
+        ur.DisplayName,
+        ur.Reputation,
+        ur.UserCreated,
+        ur.UserUpVotes,
+        ur.UserDownVotes,
+        ur.Location,
+        ur.WebPresenceScore,
+        ur.TotalBadges,
+        ur.Gold,
+        ur.Silver,
+        ur.Bronze,
+        ur.TagBadges,
+        ur.LastBadgeAt,
+        ur.QuestionsLast3Y,
+        ur.ViewsOnQuestions,
+        ur.AvgQuestionScoreNonZero,
+        ur.AnswersLast3Y,
+        ur.AvgAnswerScore,
+        (
+            (ln(greatest(qq.ViewCount, 1)) * 0.8) +
+            (coalesce(qq.Score,0) * 1.5) +
+            (coalesce(qq.AnswerCount,0) * 0.7) +
+            (coalesce(qq.UpVotes,0) - coalesce(qq.DownVotes,0)) * 0.6 +
+            (case when qq.FirstAnswerId is not null then 2 else 0 end) +
+            (case when qq.ClosedCount > 0 then -5 else 0 end) +
+            (least(coalesce(qq.EditCount,0), 10) * 0.2) +
+            (case when qq.DuplicateOfCount > 0 then -3 else 0 end) +
+            (least(coalesce(qq.CommentCount,0), 20) * 0.05) +
+            (coalesce(ur.Reputation,0) / 1000.0) +
+            (coalesce(ur.TotalBadges,0) * 0.05) +
+            (coalesce(qq.FavoriteCount,0) * 0.4)
+        ) as QualityScore,
+        extract(epoch from (fa.AnswerCreationDate - qq.CreationDate)) as TimeToFirstAnswerSec
+    from question_quality qq
+    left join user_rollup ur on ur.UserId = qq.OwnerUserId
+    left join first_answer fa on fa.QuestionId = qq.QuestionId
+),
+ranked as (
+    select
+        s.QuestionId,
+        s.Title,
+        s.OwnerUserId,
+        s.CreationDate,
+        s.Score,
+        s.ViewCount,
+        s.AnswerCount,
+        s.FavoriteCount,
+        s.TagCount,
+        s.TagsCsv,
+        s.UpVotes,
+        s.DownVotes,
+        s.TotalVotes,
+        s.CommentCount,
+        s.LastCommentAt,
+        s.LinkedCount,
+        s.DuplicateOfCount,
+        s.EditCount,
+        s.LastEditDate,
+        s.SuggestedEditsApplied,
+        s.ClosedCount,
+        s.FirstCloseReasonCode,
+        s.DuplicateEdges,
+        s.FirstAnswerId,
+        s.AnswerUserId,
+        s.AnswerScore,
+        s.AnswerCreationDate,
+        s.DisplayName,
+        s.Reputation,
+        s.UserCreated,
+        s.UserUpVotes,
+        s.UserDownVotes,
+        s.Location,
+        s.WebPresenceScore,
+        s.TotalBadges,
+        s.Gold,
+        s.Silver,
+        s.Bronze,
+        s.TagBadges,
+        s.LastBadgeAt,
+        s.QuestionsLast3Y,
+        s.ViewsOnQuestions,
+        s.AvgQuestionScoreNonZero,
+        s.AnswersLast3Y,
+        s.AvgAnswerScore,
+        s.QualityScore,
+        s.TimeToFirstAnswerSec,
+        row_number() over (order by s.QualityScore desc nulls last, s.ViewCount desc nulls last) as rn,
+        ntile(10) over (order by s.QualityScore desc nulls last) as decile,
+        avg(s.QualityScore) over () as avg_quality_overall,
+        percentile_cont(0.5) within group (order by s.QualityScore) over () as median_quality,
+        avg(s.TimeToFirstAnswerSec) over () as avg_tta,
+        avg(s.TimeToFirstAnswerSec) over (partition by case when s.TagCount >= 5 then 'many' when s.TagCount >= 3 then 'medium' else 'few' end) as avg_tta_by_taggroup
+    from scored s
+),
+null_safety as (
+    select
+        r.QuestionId,
+        r.Title,
+        r.OwnerUserId,
+        r.CreationDate,
+        r.Score,
+        r.ViewCount,
+        r.AnswerCount,
+        r.FavoriteCount,
+        r.TagCount,
+        r.TagsCsv,
+        coalesce(r.UpVotes,0) as UpVotes,
+        coalesce(r.DownVotes,0) as DownVotes,
+        coalesce(r.TotalVotes,0) as TotalVotes,
+        coalesce(r.CommentCount,0) as CommentCount,
+        r.LastCommentAt,
+        coalesce(r.LinkedCount,0) as LinkedCount,
+        coalesce(r.DuplicateOfCount,0) as DuplicateOfCount,
+        coalesce(r.EditCount,0) as EditCount,
+        r.LastEditDate,
+        coalesce(r.SuggestedEditsApplied,0) as SuggestedEditsApplied,
+        coalesce(r.ClosedCount,0) as ClosedCount,
+        coalesce(r.FirstCloseReasonCode, 0) as FirstCloseReasonCode,
+        coalesce(r.DuplicateEdges,0) as DuplicateEdges,
+        r.FirstAnswerId,
+        r.AnswerUserId,
+        r.AnswerScore,
+        r.AnswerCreationDate,
+        coalesce(r.DisplayName, '[unknown]') as DisplayName,
+        coalesce(r.Reputation,0) as Reputation,
+        r.UserCreated,
+        coalesce(r.UserUpVotes,0) as UserUpVotes,
+        coalesce(r.UserDownVotes,0) as UserDownVotes,
+        coalesce(r.Location, '[unspecified]') as Location,
+        coalesce(r.WebPresenceScore,0) as WebPresenceScore,
+        coalesce(r.TotalBadges,0) as TotalBadges,
+        coalesce(r.Gold,0) as Gold,
+        coalesce(r.Silver,0) as Silver,
+        coalesce(r.Bronze,0) as Bronze,
+        coalesce(r.TagBadges,0) as TagBadges,
+        r.LastBadgeAt,
+        coalesce(r.QuestionsLast3Y,0) as QuestionsLast3Y,
+        coalesce(r.ViewsOnQuestions,0) as ViewsOnQuestions,
+        r.AvgQuestionScoreNonZero,
+        coalesce(r.AnswersLast3Y,0) as AnswersLast3Y,
+        r.AvgAnswerScore,
+        r.QualityScore,
+        r.TimeToFirstAnswerSec,
+        r.rn,
+        r.decile,
+        r.avg_quality_overall,
+        r.median_quality,
+        r.avg_tta,
+        r.avg_tta_by_taggroup
+    from ranked r
+)
+select
+    n.QuestionId,
+    n.Title,
+    n.DisplayName as OwnerDisplayName,
+    n.Reputation,
+    n.UserCreated,
+    n.Location as Location,
+    n.CreationDate as QuestionCreated,
+    n.ViewCount,
+    n.Score as QuestionScore,
+    n.UpVotes,
+    n.DownVotes,
+    n.TotalVotes,
+    n.AnswerCount,
+    n.FirstAnswerId,
+    n.AnswerUserId,
+    n.AnswerScore,
+    n.TimeToFirstAnswerSec,
+    n.FavoriteCount,
+    n.TagCount,
+    n.TagsCsv as TagsCsv,
+    n.EditCount,
+    n.LastEditDate,
+    n.SuggestedEditsApplied,
+    n.CommentCount,
+    n.LastCommentAt,
+    n.LinkedCount,
+    n.DuplicateOfCount,
+    n.ClosedCount,
+    n.FirstCloseReasonCode as FirstCloseReasonCode,
+    n.DuplicateEdges,
+    n.TotalBadges,
+    n.Gold,
+    n.Silver,
+    n.Bronze,
+    n.TagBadges,
+    n.WebPresenceScore,
+    round(cast(n.QualityScore as numeric), 3) as QualityScore,
+    n.decile as QualityDecile,
+    round(cast(n.avg_quality_overall as numeric), 3) as AvgQualityOverall,
+    round(cast(n.median_quality as numeric), 3) as MedianQuality,
+    round(cast(n.avg_tta as numeric), 1) as AvgTimeToAnswerSec,
+    round(cast(n.avg_tta_by_taggroup as numeric), 1) as AvgTimeToAnswerByTagGroupSec
+from null_safety n
+where
+    (n.ClosedCount = 0 or n.ClosedCount is null)
+    and (n.TagCount >= 1)
+    and (
+        (n.QualityScore > n.avg_quality_overall and n.ViewCount > 100) or
+        (n.AnswerCount >= 2 and coalesce(n.UpVotes,0) >= 5) or
+        (n.TotalBadges >= 10 and n.Score >= 0 and n.DuplicateOfCount = 0)
+    )
+    and not exists (
+        select 1
+        from PostLinks plx
+        where plx.PostId = n.QuestionId
+          and plx.LinkTypeId = 3
+          and plx.RelatedPostId = n.QuestionId
+    )
+order by n.QualityScore desc nulls last, n.ViewCount desc nulls last
+limit 250;

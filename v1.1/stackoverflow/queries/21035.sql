@@ -1,0 +1,162 @@
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    WHERE u.Reputation > 1000
+      AND u.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+),
+HighImpactPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        COALESCE(p.Title, p.Tags) AS PostTitleOrTags,
+        LAG(p.Title) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostTitle,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate 
+                            ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS RollingAvgScore,
+        p.CreationDate AS PostCreationDate
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Score > 5
+      AND (p.ViewCount > 1000 OR p.AnswerCount > 2)
+),
+DetailedPostStats AS (
+    SELECT 
+        hp.PostId,
+        hp.OwnerUserId,
+        hp.Score,
+        hp.ViewCount,
+        hp.AnswerCount,
+        hp.PostTitleOrTags,
+        hp.RollingAvgScore,
+        au.RepRank,
+        au.Reputation AS UserRep,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        AVG(LENGTH(c.Text)) AS AvgCommentLength,
+        STRING_AGG(
+            CASE 
+                WHEN b.Name IS NOT NULL THEN b.Name 
+                ELSE COALESCE(c.Text, 'No Comment') 
+            END, 
+            ' | '
+        ) AS ConcatenatedCommentsAndBadges,
+        CASE 
+            WHEN hp.AnswerCount > 5 AND au.RepRank <= 10 THEN 'Elite Q&A'
+            WHEN hp.ViewCount > 10000 THEN 'Viral'
+            WHEN hp.Score < 0 THEN 'Controversial'
+            ELSE 'Standard'
+        END AS PostCategory,
+        COALESCE(
+            (SELECT ph.Text 
+             FROM PostHistory ph 
+             WHERE ph.PostId = hp.PostId 
+               AND ph.PostHistoryTypeId = 4
+             ORDER BY ph.CreationDate DESC 
+             LIMIT 1), 
+            hp.PostTitleOrTags
+        ) AS LatestTitle,
+        hp.PrevPostTitle,
+        hp.PostCreationDate,
+        au.CreationDate AS UserCreationDate
+    FROM HighImpactPosts hp
+    INNER JOIN ActiveUsers au ON hp.OwnerUserId = au.UserId
+    LEFT JOIN Votes v ON hp.PostId = v.PostId AND v.VoteTypeId IN (2, 3)
+    LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    LEFT JOIN Comments c ON hp.PostId = c.PostId 
+        AND c.CreationDate > (hp.PostCreationDate - INTERVAL '7 days')
+        AND c.Score > 0
+    LEFT JOIN Badges b ON au.UserId = b.UserId 
+        AND b.Class = 1
+        AND b.Date > (au.CreationDate - INTERVAL '6 months')
+    WHERE hp.RollingAvgScore > 3
+      AND (hp.PostTitleOrTags ILIKE '%sql%' OR hp.PostTitleOrTags ILIKE '%database%')
+    GROUP BY 
+        hp.PostId, hp.OwnerUserId, hp.Score, hp.ViewCount, hp.AnswerCount,
+        hp.PostTitleOrTags, hp.RollingAvgScore, au.RepRank, au.Reputation,
+        hp.PrevPostTitle, hp.PostCreationDate, au.CreationDate, hp.PrevPostTitle, hp.PostTitleOrTags
+    HAVING COUNT(DISTINCT c.Id) > 1 OR SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) > 10
+),
+MainResults AS (
+    SELECT 
+        dps.PostCategory,
+        COUNT(*) AS PostCount,
+        AVG(dps.UserRep) AS AvgUserRep,
+        AVG(dps.RollingAvgScore) AS AvgRollingScore,
+        SUM(dps.UpVotes) AS TotalUpVotes,
+        MAX(dps.ConcatenatedCommentsAndBadges) AS SampleCommentsBadges,
+        SUM(CASE WHEN dps.LatestTitle IS NULL THEN 1 ELSE 0 END) AS NullTitleCount,
+        (SELECT STRING_AGG(t.TagName, ', ') 
+         FROM Tags t 
+         WHERE t.Count > 100 
+           AND t.ExcerptPostId IS NOT NULL) AS TopTagsOverview,
+        CASE 
+            WHEN COUNT(*) > 1 THEN 
+                MAX(dps.PostTitleOrTags) || ' (Series: ' || MAX(dps.PrevPostTitle) || ')'
+            ELSE MAX(dps.LatestTitle)
+        END AS EnhancedTitleSample
+    FROM DetailedPostStats dps
+    WHERE COALESCE(dps.AvgCommentLength, 0) > 50
+       OR (dps.VoteCount > 20 AND dps.PostCategory = 'Elite Q&A')
+    GROUP BY dps.PostCategory
+),
+SummaryStats AS (
+    SELECT 
+        'Summary Stats' AS PostCategory,
+        COUNT(*) AS PostCount,
+        AVG(dps2.UserRep) AS AvgUserRep,
+        CAST(NULL AS DOUBLE PRECISION) AS AvgRollingScore,
+        SUM(dps2.DownVotes) AS TotalUpVotes,
+        'Overall Analysis Complete' AS SampleCommentsBadges,
+        0 AS NullTitleCount,
+        CAST(NULL AS TEXT) AS TopTagsOverview,
+        'Benchmark Query End' AS EnhancedTitleSample,
+        'Summary Stats' AS GroupByMarker
+    FROM DetailedPostStats dps2
+    WHERE dps2.RepRank <= 5
+)
+SELECT *
+FROM (
+    SELECT 
+        m.PostCategory,
+        m.PostCount,
+        m.AvgUserRep,
+        m.AvgRollingScore,
+        m.TotalUpVotes,
+        m.SampleCommentsBadges,
+        m.NullTitleCount,
+        m.TopTagsOverview,
+        m.EnhancedTitleSample,
+        -- order key for sorting
+        CASE m.PostCategory 
+            WHEN 'Elite Q&A' THEN 1 
+            WHEN 'Viral' THEN 2 
+            WHEN 'Controversial' THEN 3 
+            WHEN 'Standard' THEN 4 
+            ELSE 5 
+        END AS OrderKey
+    FROM MainResults m
+
+    UNION ALL
+
+    SELECT 
+        s.PostCategory,
+        s.PostCount,
+        s.AvgUserRep,
+        s.AvgRollingScore,
+        s.TotalUpVotes,
+        s.SampleCommentsBadges,
+        s.NullTitleCount,
+        s.TopTagsOverview,
+        s.EnhancedTitleSample,
+        6 AS OrderKey
+    FROM SummaryStats s
+) combined
+ORDER BY OrderKey, PostCount DESC;

@@ -1,0 +1,155 @@
+-- {"query": "701.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1280} 
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount, 0) as AnswerCount,
+        coalesce(p.FavoriteCount, 0) as FavoriteCount,
+        row_number() over (order by t.Count desc, t.TagName) as Rank
+    from
+        Tags t
+        left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+    where
+        t.TagName is not null
+), UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        max(b.Date) as LastBadgeDate,
+        sum(case when b.TagBased = 1 then 1 else 0 end) as TagBasedBadges
+    from
+        Users u
+        left join Badges b on b.UserId = u.Id
+    group by
+        u.Id, u.DisplayName
+), PostScores as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.AnswerCount,
+        p.FavoriteCount,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as ScoreRank
+    from
+        Posts p
+    where
+        p.PostTypeId in (1, 2)
+), AnswerDetails as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId as AnswerUserId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        q.Tags as QuestionTags,
+        q.OwnerUserId as QuestionUserId,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from
+        Posts a
+        join Posts q on q.Id = a.ParentId and q.PostTypeId = 1
+    where
+        a.PostTypeId = 2
+), CloseReasonsCount as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseVotesCount
+    from
+        PostHistory ph
+        join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id
+        join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where
+        ph.PostHistoryTypeId = 10
+    group by
+        ph.PostId, crt.Name
+), ComplexUserActivity as (
+    select
+        u.Id,
+        u.DisplayName,
+        count(distinct p.Id) as PostsCount,
+        count(distinct c.Id) as CommentsCount,
+        count(distinct v.Id) filter (where v.VoteTypeId = 2) as UpVotesCast,
+        count(distinct v.Id) filter (where v.VoteTypeId = 3) as DownVotesCast,
+        max(p.CreationDate) as LastPostDate,
+        max(c.CreationDate) as LastCommentDate
+    from
+        Users u
+        left join Posts p on p.OwnerUserId = u.Id
+        left join Comments c on c.UserId = u.Id
+        left join Votes v on v.UserId = u.Id
+    group by
+        u.Id, u.DisplayName
+)
+select distinct
+    r.Rank as TagRank,
+    r.TagName,
+    r.Count as TagUsage,
+    r.AnswerCount,
+    r.FavoriteCount,
+    ubs.DisplayName as TopUserDisplayName,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.TagBasedBadges,
+    ps.Id as PostId,
+    ps.PostTypeId,
+    ps.Score as PostScore,
+    ps.ViewCount as PostViews,
+    ps.AnswerCount as PostAnswerCount,
+    ps.FavoriteCount as PostFavorites,
+    ad.AnswerId,
+    ad.AnswerScore,
+    ad.AnswerCreationDate,
+    ad.AnswerRank,
+    cr.CloseReasonName,
+    cr.CloseVotesCount,
+    cua.PostsCount,
+    cua.CommentsCount,
+    cua.UpVotesCast,
+    cua.DownVotesCast,
+    cua.LastPostDate,
+    cua.LastCommentDate,
+    coalesce(
+        substring(ps.Tags from '<([^>]+)>'),
+        'N/A'
+    ) as FirstTagExtracted,
+    case
+        when ps.Score > 100 then 'High Score'
+        when ps.Score between 50 and 100 then 'Medium Score'
+        when ps.Score between 0 and 49 then 'Low Score'
+        else 'Negative or No Score'
+    end as ScoreCategory
+from
+    RecursiveTagCounts r
+    left join Posts ps on ps.Tags like '%' || r.TagName || '%'
+    left join UserBadgeStats ubs on ubs.UserId = ps.OwnerUserId
+    left join AnswerDetails ad on ad.QuestionId = ps.Id
+    left join CloseReasonsCount cr on cr.PostId = ps.Id
+    left join ComplexUserActivity cua on cua.Id = ps.OwnerUserId
+where
+    r.Rank <= 50
+    and (
+        (ps.Score > 0 and ps.ViewCount > 1000)
+        or (ps.FavoriteCount > 5)
+        or (ad.AnswerScore > 10)
+    )
+    and (
+        cua.PostsCount > 10
+        or cua.CommentsCount > 20
+        or ubs.GoldBadges > 0
+    )
+order by
+    r.Rank,
+    ps.Score desc nulls last,
+    ad.AnswerScore desc nulls last;

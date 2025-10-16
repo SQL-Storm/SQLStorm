@@ -1,0 +1,109 @@
+-- {"query": "1593.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1341} 
+with RecentActiveUsers as (
+    select u.Id,
+           u.DisplayName,
+           u.Reputation,
+           coalesce(u.Location,'<unknown>') as Location,
+           datediff(hour, u.CreationDate, coalesce(u.LastAccessDate,now())) as ActiveHours,
+           row_number() over(partition by coalesce(u.Location,'<unknown>') order by u.Reputation desc) as loc_rank
+    from Users u
+    where u.Reputation > 500 
+      and u.LastAccessDate > current_date - interval '90 days'
+), TopBadgedUsers as (
+    select b.UserId,
+           max(b.Class) as MaxBadgeClass,
+           count(*) as TotalBadges,
+           bool_or(b.TagBased = 1) as HasTagBased,
+           string_agg(distinct b.Name, ',') filter (where b.Class=1) as GoldBadges,
+           rank() over (order by count(*) desc, max(b.Class)) as BadgeRank
+    from Badges b
+    group by b.UserId
+), PostLinksExtended as (
+    select pl.PostId,
+           pl.RelatedPostId,
+           lt.Name as LinkTypeName,
+           p.AcceptedAnswerId,
+           p.Title as PostTitle,
+           p.Tags,
+           extract(epoch from age(p.CreationDate)) as PostAgeSeconds
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    join Posts p on p.Id = pl.PostId
+), AnswersWithAggregation as (
+    select p.Id,
+           IPATAccepted.PostId as AcceptedInQuestion,
+           p.ParentId,
+           p.Score,
+           count(c.Id) filter (where c.CreationDate>p.CreationDate) as CommentsAfterPost,
+           sum(case when v.VoteTypeId=2 then 1 else 0 end) as UpVotes,
+           sum(case when v.VoteTypeId=3 then 1 else 0 end) as DownVotes
+    from Posts p
+           left join Posts IPATAccepted on IPATAccepted.AcceptedAnswerId = p.Id
+           left join Comments c on c.PostId = p.Id
+           left join Votes v on v.PostId = p.Id
+    where p.PostTypeId = 2
+    group by p.Id, IPATAccepted.PostId, p.ParentId, p.Score
+), ComplexRankedQuestions as (
+    select q.Id, q.Title, q.Tags,
+           dense_rank() over (order by q.Score desc nulls last, q.ViewCount desc nulls last) as QuestionRank,
+           count(distinct ph.PostHistoryTypeId) filter (where ph.PostHistoryTypeId in (4,5,6)) as SignificantEdits,
+           1.0 * coalesce(q.Score,0) / nullif(coalesce(q.ViewCount,0),0) as ScoreToViewsRatio,
+           coalesce(pt.Name,'Unknown') as PostTypeName,
+           coalesce(max(vote_counts.UpMod), 0) as TotalUpVotes,
+           coalesce(
+                (select count(*) from PostLinks pl where pl.PostId = q.Id and pl.LinkTypeId = 3), 0
+           ) as NumDuplicatesLinked
+    from Posts q
+    left join PostHistory ph on ph.PostId = q.Id and ph.PostHistoryTypeId in (4,5,6,10)
+    left join PostTypes pt on pt.Id = q.PostTypeId
+    left join (
+        select v.PostId,
+               sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpMod
+        from Votes v
+        group by v.PostId
+    ) vote_counts on vote_counts.PostId = q.Id
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.Tags, q.Score, q.ViewCount, pt.Name
+    having count(distinct ph.PostHistoryTypeId) > 0 or q.Score > 10
+)
+select
+    rua.DisplayName AS User_Display_Name,
+    rua.Location AS User_Location,
+    rua.Reputation AS User_Reputation,
+    tbu.TotalBadges,
+    tbu.HasTagBased AS User_Has_Tag_Based_Badges,
+    tbu.GoldBadges,
+    aagg.Id AS Answer_Id,
+    aagg.Score AS Answer_Score,
+    aagg.CommentsAfterPost,
+    aagg.UpVotes,
+    aagg.DownVotes,
+    COMPLEXQ.Title                                     AS Question_Title,
+    COMPLEXQ.Tags                                      AS Question_Tags,
+    COMPLEXQ.QuestionRank                             AS Question_Rank,
+    case when COMPLEXQ.ScoreToViewsRatio is null then 0 end  AS Question_ScoreToViewsRatio,
+    sum(pl.PostAgeSeconds)/nullif(count(pl.PostId),0) as Avg_LinkedPostSecondsAge,
+    string_agg(distinct coalesce(pl.LinkTypeName, 'None'), ',' order by pl.LinkTypeName) AS Distinct_Link_Types,
+    lua.TAGgedQuestions
+from RecentActiveUsers rua
+join TopBadgedUsers tbu on tbu.UserId = rua.Id
+left join AnswersWithAggregation aagg on aagg.ParentId in (
+    select p.Id 
+    from Posts p 
+    where p.OwnerUserId = rua.Id and p.PostTypeId=1
+)
+left join ComplexRankedQuestions COMPLEXQ on COMPLEXQ.Id = aagg.ParentId
+left join (
+  select u.Id AS UserId, 
+         count(distinct q.Id) as TAGgedQuestions
+  from Users u
+  left join Posts q on q.OwnerUserId = u.Id and q.PostTypeId=1 and q.Tags iLike '%sql%'
+  group by u.Id
+) lua on lua.UserId = rua.Id
+left join PostLinksExtended pl on pl.PostId = COMPLEXQ.Id
+where rua.loc_rank <= 3
+group by rua.DisplayName, rua.Location, rua.Reputation, tbu.TotalBadges, tbu.HasTagBased, tbu.GoldBadges,
+         aagg.Id, aagg.Score, aagg.CommentsAfterPost, aagg.UpVotes, aagg.DownVotes,
+         COMPLEXQ.Title, COMPLEXQ.Tags, COMPLEXQ.QuestionRank, COMPLEXQ.ScoreToViewsRatio, lua.TAGgedQuestions
+order by rua.Reputation desc, COMPLEXQ.QuestionRank
+limit 150;

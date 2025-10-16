@@ -1,0 +1,95 @@
+WITH UserQuestionActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalQuestions,
+        SUM(p.Score) AS TotalQuestionScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.ViewCount) AS MedianQuestionViews,
+        RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS QuestionCountRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    WHERE u.Reputation > 100 AND u.CreationDate < CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    GROUP BY u.Id, u.DisplayName
+),
+TagPopularity AS (
+    -- Split Tags like: '<tag1><tag2>' into rows in a portable way using a recursive CTE
+    SELECT t.Tag,
+           ROUND(AVG(p.Score), 2) AS AverageTagScore,
+           COUNT(*) AS TagFrequency
+    FROM Posts p
+    JOIN (
+        -- recursive splitter: extract tags between <> into rows
+        SELECT p.Id AS PostId, 
+               NULL::VARCHAR AS Tag,     -- placeholder; dialect-neutral cast removed below
+               TRIM(BOTH ' ' FROM p.Tags) AS Remaining,
+               0 AS ord
+        FROM Posts p
+        WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+        UNION ALL
+        SELECT s.PostId,
+               -- extract next tag from Remaining
+               CASE
+                 WHEN POSITION('<' IN s.Remaining) > 0 AND POSITION('>' IN s.Remaining) > POSITION('<' IN s.Remaining)
+                   THEN SUBSTRING(s.Remaining FROM POSITION('<' IN s.Remaining)+1 FOR POSITION('>' IN s.Remaining)-POSITION('<' IN s.Remaining)-1)
+                 ELSE NULL
+               END AS Tag,
+               -- remaining after removing the first <...>
+               CASE
+                 WHEN POSITION('>' IN s.Remaining) > 0
+                   THEN SUBSTRING(s.Remaining FROM POSITION('>' IN s.Remaining)+1)
+                 ELSE ''
+               END AS Remaining,
+               s.ord + 1
+        FROM (
+            SELECT p.Id AS PostId,
+                   TRIM(BOTH ' ' FROM p.Tags) AS Remaining,
+                   0 AS ord
+            FROM Posts p
+            WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+        ) s
+        WHERE s.Remaining <> '' AND POSITION('<' IN s.Remaining) > 0 AND POSITION('>' IN s.Remaining) > POSITION('<' IN s.Remaining)
+    ) splitter ON splitter.PostId = p.Id
+    CROSS JOIN LATERAL (SELECT splitter.Tag) t(Tag)
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND t.Tag IS NOT NULL AND t.Tag <> ''
+    GROUP BY t.Tag
+    HAVING COUNT(*) > 50
+)
+SELECT 
+    uqa.UserId,
+    uqa.DisplayName,
+    uqa.TotalQuestions,
+    uqa.TotalQuestionScore,
+    uqa.MedianQuestionViews,
+    tp.Tag AS MostFrequentTag,
+    tp.AverageTagScore,
+    CASE 
+        WHEN uqa.TotalQuestions > 10 AND uqa.TotalQuestionScore > 50 THEN 'High Impact'
+        WHEN uqa.TotalQuestions > 5 THEN 'Moderate Impact'
+        ELSE 'Low Impact'
+    END AS UserContributionCategory,
+    (SELECT COUNT(*) 
+     FROM Votes v 
+     WHERE v.UserId = uqa.UserId AND v.VoteTypeId IN (2, 3)) AS TotalVotes,
+    COALESCE((SELECT MAX(b.Date) 
+              FROM Badges b 
+              WHERE b.UserId = uqa.UserId AND b.Class = 1), 
+             CAST('2024-10-01 12:34:56' AS TIMESTAMP)) AS LastGoldBadgeDate
+FROM UserQuestionActivity uqa
+JOIN TagPopularity tp ON EXISTS (
+    SELECT 1 
+    FROM Posts p 
+    WHERE p.OwnerUserId = uqa.UserId 
+      AND p.PostTypeId = 1
+      AND POSITION(tp.Tag IN p.Tags) > 0
+)
+WHERE uqa.TotalQuestions > 0
+GROUP BY
+    uqa.UserId,
+    uqa.DisplayName,
+    uqa.TotalQuestions,
+    uqa.TotalQuestionScore,
+    uqa.MedianQuestionViews,
+    tp.Tag,
+    tp.AverageTagScore
+ORDER BY uqa.TotalQuestionScore DESC, uqa.TotalQuestions DESC
+LIMIT 100;

@@ -1,0 +1,130 @@
+WITH question_posts AS (
+    SELECT
+        p.Id            AS QuestionId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.Reputation    AS OwnerReputation
+    FROM Posts p
+    LEFT JOIN Users u
+        ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+),
+tagged AS (
+    SELECT
+        qp.QuestionId,
+        qp.Title,
+        qp.Score,
+        qp.ViewCount,
+        qp.CreationDate,
+        qp.OwnerReputation,
+        qp.Tags,
+        TRIM(BOTH '>' FROM t.label) AS TagName
+    FROM question_posts qp
+    CROSS JOIN LATERAL
+        unnest(string_to_array(substring(qp.Tags FROM 2 FOR length(qp.Tags)-2), '><')) AS t(label)
+),
+vote_stats AS (
+    SELECT
+        t.QuestionId,
+        SUM(CASE WHEN vt.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN vt.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM tagged t
+    LEFT JOIN Votes vt
+        ON vt.PostId = t.QuestionId
+    GROUP BY t.QuestionId
+),
+comment_stats AS (
+    SELECT
+        c.PostId,
+        COUNT(*) AS CommentCnt
+    FROM Comments c
+    GROUP BY c.PostId
+),
+joined_stats AS (
+    SELECT
+        t.QuestionId,
+        t.Title,
+        t.Tags,
+        t.TagName,
+        t.Score,
+        t.ViewCount,
+        t.CreationDate,
+        t.OwnerReputation,
+        COALESCE(vs.UpVotes, 0)    AS UpVotes,
+        COALESCE(vs.DownVotes, 0)  AS DownVotes,
+        COALESCE(cs.CommentCnt, 0) AS CommentCnt
+    FROM tagged t
+    LEFT JOIN vote_stats vs
+        ON vs.QuestionId = t.QuestionId
+    LEFT JOIN comment_stats cs
+        ON cs.PostId = t.QuestionId
+),
+hotness_calc AS (
+    SELECT
+        j.QuestionId,
+        j.Title,
+        j.Tags,
+        j.TagName,
+        j.Score,
+        j.ViewCount,
+        j.CreationDate,
+        j.OwnerReputation,
+        COALESCE(j.UpVotes, 0)    AS UpVotes,
+        COALESCE(j.DownVotes, 0)  AS DownVotes,
+        COALESCE(j.CommentCnt, 0) AS CommentCnt,
+        ( (j.Score * ln(j.ViewCount + 1)) /
+          nullif((COALESCE(j.UpVotes,0) - COALESCE(j.DownVotes,0) + COALESCE(j.CommentCnt,0) + 1), 0)
+        )   AS HotnessScore,
+        CASE
+            WHEN j.TagName = 'sql'        THEN 'SQL'
+            WHEN j.TagName = 'postgresql' THEN 'PostgreSQL'
+            WHEN j.TagName = 'python'     THEN 'Python'
+            ELSE 'Other'
+        END AS TagGroup
+    FROM joined_stats j
+    WHERE (COALESCE(j.UpVotes,0) + COALESCE(j.DownVotes,0)) > 30
+      AND j.Score > 5
+),
+ranked AS (
+    SELECT
+        h.QuestionId,
+        h.Title,
+        h.Tags,
+        h.TagName,
+        h.Score,
+        h.ViewCount,
+        h.CreationDate,
+        h.OwnerReputation,
+        h.UpVotes,
+        h.DownVotes,
+        h.CommentCnt,
+        h.HotnessScore,
+        h.TagGroup,
+        ROW_NUMBER() OVER (
+            PARTITION BY h.TagGroup
+            ORDER BY h.HotnessScore DESC, h.CreationDate DESC
+        ) AS RankWithinGroup
+    FROM hotness_calc h
+)
+SELECT
+    QuestionId,
+    Title,
+    Tags,
+    TagName,
+    Score,
+    ViewCount,
+    CreationDate,
+    OwnerReputation,
+    UpVotes,
+    DownVotes,
+    CommentCnt,
+    HotnessScore,
+    TagGroup,
+    RankWithinGroup
+FROM ranked
+WHERE RankWithinGroup <= 5
+ORDER BY TagGroup, RankWithinGroup;

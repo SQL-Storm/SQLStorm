@@ -1,0 +1,192 @@
+-- {"query": "53.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1972} 
+with
+-- top active users by weighted contribution
+user_scores as (
+  select
+    u.id,
+    u.displayname,
+    coalesce(sum(
+      -- weight answers higher, questions moderate, comments small, badges tiny
+      case when p.posttypeid=2 then 5
+           when p.posttypeid=1 then 3
+           else 1 end
+      * greatest(p.score,0)
+    ),0)
+    + coalesce(count(distinct b.id) * 2,0) as activity_score,
+    count(distinct p.id) filter (where p.posttypeid=1) as questions,
+    count(distinct p.id) filter (where p.posttypeid=2) as answers,
+    count(distinct c.id) as comments
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join comments c on c.userid = u.id
+  left join badges b on b.userid = u.id
+  group by u.id, u.displayname
+),
+-- recent controversial questions (high answers but low accept rate / divergent votes)
+controversial_questions as (
+  select
+    q.id as question_id,
+    q.title,
+    q.creationdate,
+    q.viewcount,
+    q.answercount,
+    q.score as q_score,
+    coalesce(a_sum.upvotes,0) as upvotes_on_answers,
+    coalesce(a_sum.downvotes,0) as downvotes_on_answers,
+    coalesce((a_sum.upvotes - a_sum.downvotes),0) as net_answer_votes,
+    case when q.acceptedanswerid is null then 0 else 1 end as has_accepted
+  from posts q
+  left join (
+    select parentid,
+      sum(case when v.votetypeid=2 then 1 else 0 end) as upvotes,
+      sum(case when v.votetypeid=3 then 1 else 0 end) as downvotes
+    from posts p
+    left join votes v on v.postid = p.id
+    where p.posttypeid = 2
+    group by parentid
+  ) a_sum on a_sum.parentid = q.id
+  where q.posttypeid = 1
+    and q.answercount >= 3
+    and q.creationdate >= now() - interval '730 days'
+),
+-- select representative answers and compute answerer influence windows
+answerer_stats as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.owneruserid,
+    u.displayname as answerer_name,
+    a.creationdate,
+    a.score as answer_score,
+    -- length and markup heuristics
+    length(a.body) as body_len,
+    (length(regexp_replace(a.body,'<[^>]*>','', 'g')))::int as plain_len,
+    case when a.lasteditdate is not null and a.lasteditdate > a.creationdate then 1 else 0 end as edited,
+    row_number() over (partition by a.owneruserid order by a.creationdate desc) as rn_by_user,
+    dense_rank() over (partition by a.parentid order by a.score desc, a.creationdate asc) as top_rank_for_question,
+    count(*) over (partition by a.owneruserid) as total_answers_by_user
+  from posts a
+  left join users u on u.id = a.owneruserid
+  where a.posttypeid = 2
+),
+-- correlate edits and history noise for posts
+post_edit_noise as (
+  select
+    p.id as postid,
+    p.title,
+    p.posttypeid,
+    p.owneruserid,
+    count(ph.id) filter (where ph.posthistorytypeid in (4,5,6,7,8,9)) as substantive_edits,
+    count(ph.id) filter (where ph.posthistorytypeid in (10,11,12,13)) as moderation_events,
+    max(ph.creationdate) as last_history_date,
+    bool_or(ph.posthistorytypeid = 50) as was_community_bump
+  from posts p
+  left join posthistory ph on ph.postid = p.id
+  group by p.id, p.title, p.posttypeid, p.owneruserid
+),
+-- tag exploded: normalize tags into rows (PostTypeId=1 questions)
+tag_explosion as (
+  select
+    q.id as question_id,
+    q.title,
+    trim(both ' ' from tag) as tag
+  from posts q,
+    unnest(string_to_array(substring(q.tags from 2 for char_length(q.tags)-2), '><')) as tag
+  where q.posttypeid = 1 and q.tags is not null
+),
+-- tag popularity + volatility
+tag_metrics as (
+  select
+    t.tag,
+    count(distinct te.question_id) as question_count,
+    avg(q.viewcount) as avg_views,
+    sum(case when q.lastactivitydate > now() - interval '30 days' then 1 else 0 end) as recent_questions,
+    stddev_samp(coalesce(q.score,0)) as score_stddev
+  from tag_explosion te
+  join posts q on q.id = te.question_id
+  group by t.tag
+),
+-- assemble final candidate set with many joins, filters, correlated subqueries
+candidates as (
+  select
+    cq.question_id,
+    cq.title,
+    cq.creationdate,
+    cq.viewcount,
+    cq.answercount,
+    cq.q_score,
+    cq.has_accepted,
+    us.displayname as asker_name,
+    us.activity_score as asker_score,
+    pe.substantive_edits,
+    pe.moderation_events,
+    pe.was_community_bump,
+    tm.tag,
+    tm.question_count,
+    tm.recent_questions,
+    -- aggregated answer metrics
+    a_stats.total_answers_by_user,
+    a_stats.top_rank_for_question,
+    a_stats.answer_score,
+    a_stats.body_len,
+    a_stats.plain_len,
+    a_stats.edited as answer_edited,
+    -- correlated subquery: best competing answer's score delta relative to accepted (if any)
+    (select max(score) from posts p2 where p2.parentid = cq.question_id and p2.id <> coalesce(pq.acceptedanswerid,-1)) as best_other_answer_score,
+    -- complex expression: controversy index
+    (
+      (coalesce(a_sum.upvotes,0) + 1)::numeric
+      / nullif((coalesce(a_sum.downvotes,0) + 1)::numeric,0)
+      * greatest(cq.answercount,1)
+      * case when cq.has_accepted = 0 then 1.5 else 1 end
+      / nullif((abs(cq.q_score) + 2),0)
+    ) as controversy_index
+  from controversial_questions cq
+  left join posts pq on pq.id = cq.question_id
+  left join users us on us.id = pq.owneruserid
+  left join post_edit_noise pe on pe.postid = cq.question_id
+  left join tag_explosion te on te.question_id = cq.question_id
+  left join tag_metrics tm on tm.tag = te.tag
+  left join (
+    select parentid, sum(case when v.votetypeid=2 then 1 else 0 end) as upvotes, sum(case when v.votetypeid=3 then 1 else 0 end) as downvotes
+    from posts p
+    left join votes v on v.postid = p.id
+    where p.posttypeid = 2
+    group by parentid
+  ) a_sum on a_sum.parentid = cq.question_id
+  left join answerer_stats a_stats on a_stats.question_id = cq.question_id and a_stats.top_rank_for_question = 1
+)
+select distinct
+  c.question_id,
+  left(coalesce(c.title,'<no title>'),200) as short_title,
+  c.creationdate,
+  c.viewcount,
+  c.answercount,
+  c.q_score,
+  c.has_accepted,
+  c.asker_name,
+  round(c.asker_score,2) as asker_score,
+  c.substantive_edits,
+  c.moderation_events,
+  c.was_community_bump,
+  coalesce(c.tag,'(no-tag)') as primary_tag,
+  c.question_count,
+  c.recent_questions,
+  c.total_answers_by_user,
+  c.answer_score,
+  c.body_len,
+  c.plain_len,
+  c.answer_edited,
+  coalesce(c.best_other_answer_score,0) as best_other_answer_score,
+  round(c.controversy_index::numeric,3) as controversy_index,
+  -- combined ranking with window functions and NULL handling
+  row_number() over (order by c.controversy_index desc nulls last, c.viewcount desc) as controversy_rank,
+  rank() over (partition by coalesce(c.tag,'(no-tag)') order by c.controversy_index desc) as tag_local_rank,
+  dense_rank() over (order by c.asker_score desc nulls last) as asker_influence_rank
+from candidates c
+where coalesce(c.question_count,0) > 5
+  and coalesce(c.recent_questions,0) > 0
+  and c.controversy_index is not null
+  and (c.q_score < 5 or c.answercount > 5)
+order by controversy_index desc, viewcount desc
+limit 250;

@@ -1,0 +1,190 @@
+WITH RECURSIVE Recursive_TagCounts AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        array_agg(DISTINCT p.Id) FILTER (WHERE p.Id IS NOT NULL) AS PostIds,
+        t.Count AS TagCount
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE ('%' || '<' || t.TagName || '>' || '%')
+    GROUP BY t.Id, t.TagName, t.Count
+
+    UNION ALL
+
+    SELECT
+        rt.Id,
+        rt.TagName,
+        rt.PostIds,
+        rt.TagCount
+    FROM Recursive_TagCounts rt
+),
+UserActivityRanks AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        count(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        count(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        count(DISTINCT b.Id) AS BadgeCount,
+        rank() OVER (
+            ORDER BY count(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) DESC
+        ) AS AnswerRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+PostScoresWithWindows AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName,
+        lag(p.Score) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS PrevScore,
+        lead(p.Score) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS NextScore,
+        row_number() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC NULLS LAST) AS ScoreRank
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId IN (1,2)
+),
+FilteredPostLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.LinkTypeId,
+        lt.Name AS LinkTypeName,
+        p.Score AS RelatedPostScore,
+        pl.CreationDate
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    JOIN Posts p ON p.Id = pl.RelatedPostId
+    WHERE pl.LinkTypeId IN (1,3)
+),
+PostCloseReasonsAggregated AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReasonName,
+        count(*) AS CloseReasonCount
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId
+    JOIN CloseReasonTypes crt ON crt.Id::text = ph.Comment
+    WHERE ph.PostHistoryTypeId = 10
+      AND crt.Id IS NOT NULL
+    GROUP BY ph.PostId, crt.Name
+),
+UserVoteSummary AS (
+    SELECT
+        v.UserId,
+        vt.Name AS VoteTypeName,
+        count(*) AS VoteCount,
+        sum(v.BountyAmount) AS TotalBounty
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.UserId, vt.Name
+),
+UserCommentsAggregate AS (
+    SELECT
+        c.UserId,
+        count(*) FILTER (WHERE c.Text ILIKE '%sql%') AS SqlCommentsCount,
+        max(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    GROUP BY c.UserId
+),
+QuestionsWithAnswerStats AS (
+    SELECT
+        q.Id,
+        q.Title,
+        q.CreationDate,
+        q.Tags,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        coalesce(a.AnswerCount, 0) AS AnswerCount,
+        coalesce(a.MaxAnswerScore, 0) AS HighestAnswerScore,
+        q.OwnerUserId,
+        u.DisplayName AS QuestionOwner,
+        CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+        pcr.CloseReasonName,
+        pcr.CloseReasonCount
+    FROM Posts q
+    LEFT JOIN (
+        SELECT
+            ParentId,
+            count(*) AS AnswerCount,
+            max(Score) AS MaxAnswerScore
+        FROM Posts
+        WHERE PostTypeId = 2
+        GROUP BY ParentId
+    ) a ON a.ParentId = q.Id
+    LEFT JOIN Users u ON u.Id = q.OwnerUserId
+    LEFT JOIN PostCloseReasonsAggregated pcr ON pcr.PostId = q.Id
+    WHERE q.PostTypeId = 1
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.BadgeCount,
+    us.VoteTypeName,
+    us.VoteCount,
+    us.TotalBounty,
+    coalesce(uc.SqlCommentsCount, 0) AS SqlCommentsCount,
+    uc.LastCommentDate,
+    q.Id AS SampleQuestionId,
+    q.Title AS SampleQuestionTitle,
+    q.AnswerCount AS SampleQuestionAnswerCount,
+    q.HighestAnswerScore AS SampleQuestionMaxAnswerScore,
+    q.HasAcceptedAnswer,
+    q.CloseReasonName,
+    q.CloseReasonCount,
+    array_agg(DISTINCT ft.TagName) FILTER (WHERE ft.TagCount > 100) AS PopularTags,
+    pl.LinkTypeName,
+    pl.RelatedPostId,
+    pl.RelatedPostScore,
+    ps.PrevScore,
+    ps.NextScore,
+    ps.ScoreRank
+FROM UserActivityRanks ua
+LEFT JOIN UserVoteSummary us ON us.UserId = ua.UserId
+LEFT JOIN UserCommentsAggregate uc ON uc.UserId = ua.UserId
+LEFT JOIN LATERAL (
+    SELECT qtmp.*
+    FROM QuestionsWithAnswerStats qtmp
+    WHERE qtmp.OwnerUserId = ua.UserId
+    ORDER BY qtmp.QuestionScore DESC NULLS LAST
+    LIMIT 1
+) q ON true
+LEFT JOIN Recursive_TagCounts ft ON ft.Id = (
+    SELECT t.Id FROM Tags t ORDER BY t.Count DESC LIMIT 1
+)
+LEFT JOIN FilteredPostLinks pl ON pl.PostId = q.Id
+LEFT JOIN PostScoresWithWindows ps ON ps.PostId = q.Id
+WHERE ua.AnswerRank <= 100
+GROUP BY
+    ua.UserId,
+    ua.DisplayName,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.BadgeCount,
+    us.VoteTypeName,
+    us.VoteCount,
+    us.TotalBounty,
+    uc.SqlCommentsCount,
+    uc.LastCommentDate,
+    q.Id,
+    q.Title,
+    q.AnswerCount,
+    q.HighestAnswerScore,
+    q.HasAcceptedAnswer,
+    q.CloseReasonName,
+    q.CloseReasonCount,
+    pl.LinkTypeName,
+    pl.RelatedPostId,
+    pl.RelatedPostScore,
+    ps.PrevScore,
+    ps.NextScore,
+    ps.ScoreRank
+ORDER BY ua.AnswerCount DESC, ua.BadgeCount DESC
+LIMIT 50;

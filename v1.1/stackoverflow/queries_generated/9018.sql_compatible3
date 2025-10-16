@@ -1,0 +1,180 @@
+WITH
+RecentQ AS (
+    SELECT
+        p.Id            AS QuestionId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.OwnerUserId
+            ORDER BY p.CreationDate DESC
+        ) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY
+),
+TopBadges AS (
+    SELECT
+        b.UserId,
+        COUNT(*)                               AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS Golds,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS Silvers,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS Bronzes
+    FROM Badges b
+    GROUP BY b.UserId
+    HAVING COUNT(*) > 5
+),
+CommentsStats AS (
+    SELECT
+        p.Id                                       AS PostId,
+        COUNT(*) FILTER (WHERE c.Score > NULLIF(p.Score,0))          AS HighScoredComments,
+        COALESCE(AVG(c.Score), 0)                 AS AvgCommentScore,
+        SUM(
+            LENGTH(c.Text)
+          - LENGTH(REPLACE(c.Text, 'a', ''))
+        )                                          AS TotalAsInComments
+    FROM Posts p
+    LEFT JOIN Comments c
+      ON c.PostId = p.Id
+    GROUP BY p.Id
+),
+TagStats AS (
+    SELECT
+        t.TagName,
+        COUNT(DISTINCT p.Id)                      AS QuestionCount,
+        COALESCE(AVG(p.AnswerCount), 0)           AS AvgAnswers,
+        COALESCE(MAX(p.Score), 0)                 AS MaxScore
+    FROM Tags t
+    JOIN Posts p
+      ON p.PostTypeId = 1
+     AND p.Tags LIKE '%' || t.TagName || '%'
+    GROUP BY t.TagName
+),
+Filtered AS (
+    SELECT
+        u.Id                       AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(tb.Golds,   0)    AS GoldBadges,
+        COALESCE(tb.Silvers, 0)    AS SilverBadges,
+        COALESCE(tb.Bronzes, 0)    AS BronzeBadges,
+        rq.Title                   AS MostRecentQuestionTitle,
+        rq.CreationDate            AS MostRecentQuestionDate,
+        ts.TagName,
+        cs.HighScoredComments,
+        cs.AvgCommentScore,
+        cs.TotalAsInComments
+    FROM Users u
+    LEFT JOIN TopBadges tb
+      ON tb.UserId = u.Id
+    LEFT JOIN RecentQ rq
+      ON rq.OwnerUserId = u.Id
+     AND rq.rn = 1
+    LEFT JOIN Posts ans
+      ON ans.OwnerUserId = u.Id
+     AND ans.PostTypeId = 2
+    LEFT JOIN LATERAL (
+        SELECT UNNEST(string_to_array(
+                       substring(ans.Tags, 2, length(ans.Tags)-2)
+                     , '><'
+                   )) AS TagName
+    ) ts ON ans.Tags IS NOT NULL
+    LEFT JOIN CommentsStats cs
+      ON cs.PostId = ans.Id
+    WHERE u.Reputation > 1000
+),
+Combined AS (
+    SELECT
+        f.UserId,
+        f.DisplayName,
+        f.Reputation,
+        f.GoldBadges,
+        f.SilverBadges,
+        f.BronzeBadges,
+        f.MostRecentQuestionTitle,
+        f.MostRecentQuestionDate,
+        f.TagName,
+        f.HighScoredComments,
+        f.AvgCommentScore,
+        f.TotalAsInComments,
+        ts.QuestionCount,
+        ts.AvgAnswers,
+        ts.MaxScore,
+        LEAD(ts.QuestionCount) OVER (
+            ORDER BY ts.QuestionCount DESC
+        ) AS NextTagQuestionCount,
+        CASE
+          WHEN f.GoldBadges > f.SilverBadges THEN 'More gold than silver'
+          WHEN f.GoldBadges = f.SilverBadges THEN 'Equal gold/silver'
+          ELSE 'More silver than gold'
+        END AS BadgeBalance,
+        CASE
+          WHEN f.MostRecentQuestionDate < CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '7' DAY THEN TRUE
+          ELSE FALSE
+        END AS IsStale,
+        NULLIF(f.AvgCommentScore,0) AS NonzeroAvgCommentScore
+    FROM Filtered f
+    JOIN TagStats ts
+      ON ts.TagName = f.TagName
+)
+SELECT *
+FROM (
+    SELECT
+        c.UserId,
+        c.DisplayName,
+        c.Reputation,
+        c.GoldBadges,
+        c.SilverBadges,
+        c.BronzeBadges,
+        c.MostRecentQuestionTitle,
+        c.MostRecentQuestionDate,
+        c.TagName,
+        c.HighScoredComments,
+        c.AvgCommentScore,
+        c.TotalAsInComments,
+        c.QuestionCount,
+        c.AvgAnswers,
+        c.MaxScore,
+        c.NextTagQuestionCount,
+        c.BadgeBalance,
+        c.IsStale,
+        c.NonzeroAvgCommentScore,
+        ROW_NUMBER() OVER (
+            PARTITION BY c.UserId
+            ORDER BY c.QuestionCount DESC NULLS LAST
+        ) AS rn
+    FROM Combined c
+    WHERE c.AvgAnswers > (
+        SELECT AVG(p2.AnswerCount)
+        FROM Posts p2
+        WHERE p2.PostTypeId = 1
+    )
+) top_per_user
+WHERE rn = 1
+
+UNION ALL
+
+SELECT
+    u.Id            AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    0               AS GoldBadges,
+    0               AS SilverBadges,
+    0               AS BronzeBadges,
+    NULL            AS MostRecentQuestionTitle,
+    NULL            AS MostRecentQuestionDate,
+    NULL            AS TagName,
+    NULL            AS HighScoredComments,
+    NULL            AS AvgCommentScore,
+    NULL            AS TotalAsInComments,
+    NULL            AS QuestionCount,
+    NULL            AS AvgAnswers,
+    NULL            AS MaxScore,
+    NULL            AS NextTagQuestionCount,
+    'No badges'     AS BadgeBalance,
+    NULL            AS IsStale,
+    NULL            AS NonzeroAvgCommentScore
+FROM Users u
+WHERE u.Reputation < 10
+
+ORDER BY UserId, TagName;

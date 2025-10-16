@@ -1,0 +1,212 @@
+WITH RecentHighRepUsers AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.UpVotes,
+        U.DownVotes,
+        U.Views AS UserProfileViews,
+        (U.UpVotes * 0.7 + U.DownVotes * 0.3 + U.Views * 0.01) * (1 + EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - U.LastAccessDate)) / 8640000.0) AS UserActivityScore,
+        EXTRACT(YEAR FROM AGE(TIMESTAMP '2024-10-01 12:34:56', U.CreationDate)) AS YearsOnPlatform
+    FROM
+        Users U
+    WHERE
+        U.Reputation > 7500
+        AND U.LastAccessDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year 3 months'
+        AND U.DisplayName IS NOT NULL
+),
+QuestionPerformance AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        P.Id AS PostId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.Title,
+        P.Tags,
+        P.AcceptedAnswerId,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        CASE
+            WHEN P.ViewCount > 0 THEN (P.Score * 0.5 + P.CommentCount * 0.3 + COALESCE(P.FavoriteCount, 0) * 0.2) * 1.0 / P.ViewCount
+            ELSE 0.0
+        END AS EngagementRatio,
+        LOWER(SUBSTRING(COALESCE(P.Tags, '<untagged>') FROM 2 FOR CHAR_LENGTH(COALESCE(P.Tags, '<untagged>')) - 2)) AS CleanTagsString,
+        (SELECT COUNT(DISTINCT PH.PostHistoryTypeId)
+         FROM PostHistory PH
+         WHERE PH.PostId = P.Id
+           AND PH.CreationDate > P.CreationDate
+           AND PH.UserId IS NOT NULL
+           AND PH.UserId != P.OwnerUserId
+           AND PH.PostHistoryTypeId IN (4, 5, 6, 8, 9)
+        ) AS DistinctNonOwnerEditTypes,
+        RANK() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.CreationDate DESC) AS UserPostRank,
+        LAG(P.CreationDate, 1, P.CreationDate) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS PreviousPostCreationDate
+    FROM
+        Posts P
+    WHERE
+        P.PostTypeId = 1
+        AND P.OwnerUserId IN (SELECT UserId FROM RecentHighRepUsers)
+        AND P.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 years'
+        AND P.ViewCount IS NOT NULL
+        AND P.Title IS NOT NULL
+),
+AnswerAggregates AS (
+    SELECT
+        A.ParentId AS QuestionId,
+        COUNT(A.Id) AS TotalAnswers,
+        SUM(A.Score) AS TotalAnswerScore,
+        AVG(A.Score) AS AvgAnswerScore,
+        MAX(A.CreationDate) AS LatestAnswerDate,
+        COUNT(C.Id) AS TotalCommentsOnAnswers,
+        AVG(C.Score) AS AvgCommentScoreOnAnswers,
+        MAX(CASE WHEN EXISTS (
+            SELECT 1 FROM Posts SubA WHERE SubA.Id = A.Id AND SubA.Body LIKE '%performance issue%'
+        ) THEN 1 ELSE 0 END) AS HasPerformanceAnswer
+    FROM
+        Posts A
+    LEFT JOIN
+        Comments C ON A.Id = C.PostId
+    WHERE
+        A.PostTypeId = 2
+    GROUP BY
+        A.ParentId
+),
+LinkedPostDetails AS (
+    SELECT
+        PL.PostId,
+        COUNT(CASE WHEN PL.LinkTypeId = 1 THEN PL.RelatedPostId END) AS LinkedPostsCount,
+        COUNT(CASE WHEN PL.LinkTypeId = 3 THEN PL.RelatedPostId END) AS DuplicatePostsCount,
+        MAX(CASE WHEN PL.LinkTypeId = 3 THEN P_Related.CreationDate END) AS LatestDuplicateDate,
+        (SELECT P_Inner.Title FROM Posts P_Inner WHERE P_Inner.Id = (
+            SELECT InnerPL.RelatedPostId FROM PostLinks InnerPL
+            WHERE InnerPL.PostId = PL.PostId AND InnerPL.LinkTypeId = 1
+            ORDER BY InnerPL.CreationDate DESC
+            LIMIT 1
+        )) AS LatestLinkedPostTitle
+    FROM
+        PostLinks PL
+    JOIN
+        Posts P_Related ON PL.RelatedPostId = P_Related.Id
+    WHERE PL.PostId IN (SELECT PostId FROM QuestionPerformance)
+    GROUP BY PL.PostId
+),
+ModerationHistory AS (
+    SELECT
+        PH.PostId,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (10, 12) THEN 1 END) AS CloseDeleteCount,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (11, 13) THEN 1 END) AS ReopenUndeleteCount,
+        MAX(PH.CreationDate) AS LastModerationActionDate,
+        COALESCE(MAX(CASE WHEN PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL THEN (
+            SELECT CRT.Name FROM CloseReasonTypes CRT WHERE CRT.Id = CAST(PH.Comment AS INTEGER)
+        ) END), 'N/A - No Close Reason') AS LastCloseReasonType
+    FROM
+        PostHistory PH
+    WHERE
+        PH.PostId IN (SELECT PostId FROM QuestionPerformance)
+        AND PH.PostHistoryTypeId IN (10, 11, 12, 13)
+    GROUP BY
+        PH.PostId
+)
+SELECT
+    RHU.DisplayName,
+    RHU.Reputation,
+    ROUND(CAST(RHU.UserActivityScore AS NUMERIC), 2) AS UserActivityScore,
+    QP.Title AS QuestionTitle,
+    QP.PostScore,
+    QP.PostViewCount,
+    ROUND(CAST(QP.EngagementRatio AS NUMERIC), 4) AS QuestionEngagementRatio,
+    QP.CleanTagsString,
+    QP.DistinctNonOwnerEditTypes,
+    QP.UserPostRank,
+    CAST(FLOOR(EXTRACT(EPOCH FROM (QP.PostCreationDate - QP.PreviousPostCreationDate)) / 3600) AS INTEGER) AS HoursSincePreviousPost,
+    COALESCE(AA.TotalAnswers, 0) AS TotalAnswers,
+    COALESCE(AA.AvgAnswerScore, 0.0) AS AvgAnswerScore,
+    COALESCE(AA.TotalCommentsOnAnswers, 0) AS TotalCommentsOnAnswers,
+    COALESCE(LPD.LinkedPostsCount, 0) AS TotalLinkedPosts,
+    COALESCE(LPD.DuplicatePostsCount, 0) AS TotalDuplicatePosts,
+    LPD.LatestLinkedPostTitle,
+    COALESCE(MH.CloseDeleteCount, 0) AS TotalCloseDeleteActions,
+    COALESCE(MH.ReopenUndeleteCount, 0) AS TotalReopenUndeleteActions,
+    MH.LastCloseReasonType,
+    CASE
+        WHEN QP.PostScore > 100 AND QP.EngagementRatio > 0.5 AND QP.DistinctNonOwnerEditTypes > 1 THEN 'High Impact & Collaborative'
+        WHEN QP.PostScore > 50 AND QP.CleanTagsString LIKE '%sql%' AND COALESCE(AA.HasPerformanceAnswer, 0) = 1 THEN 'Engaging SQL & Performance Focused'
+        WHEN QP.PostScore <= 10 OR QP.PostViewCount < 50 OR COALESCE(MH.CloseDeleteCount, 0) > 0 THEN 'Low Engagement or Problematic'
+        ELSE 'Moderate'
+    END AS PostImpactCategory,
+    (
+        SELECT
+            CASE
+                WHEN CHAR_LENGTH(COALESCE(ANS.Body, '')) > 1000 THEN 'Very Long'
+                WHEN CHAR_LENGTH(COALESCE(ANS.Body, '')) > 500 THEN 'Long'
+                WHEN CHAR_LENGTH(COALESCE(ANS.Body, '')) > 100 THEN 'Medium'
+                ELSE 'Short'
+            END
+        FROM
+            Posts ANS
+        WHERE
+            ANS.ParentId = QP.PostId
+            AND ANS.PostTypeId = 2
+            AND ANS.Body IS NOT NULL
+        ORDER BY
+            ANS.Score DESC, ANS.CreationDate DESC
+        LIMIT 1
+    ) AS TopAnswerBodyLengthCategory,
+    AVG(QP.PostScore) OVER (
+        PARTITION BY RHU.UserId
+        ORDER BY QP.PostCreationDate
+        RANGE BETWEEN INTERVAL '30 day' PRECEDING AND CURRENT ROW
+    ) AS AvgUserScoreLast30Days
+FROM
+    RecentHighRepUsers RHU
+INNER JOIN
+    QuestionPerformance QP ON RHU.UserId = QP.UserId
+LEFT JOIN
+    AnswerAggregates AA ON QP.PostId = AA.QuestionId
+LEFT JOIN
+    LinkedPostDetails LPD ON QP.PostId = LPD.PostId
+LEFT JOIN
+    ModerationHistory MH ON QP.PostId = MH.PostId
+WHERE
+    QP.UserPostRank <= 5
+    AND QP.CleanTagsString NOT LIKE '%meta%'
+    AND (AA.TotalAnswers IS NULL OR AA.TotalAnswers > 0)
+    AND (
+        QP.Title ~* '(optimis|performanc|scalabilit|latency)'
+        OR QP.CleanTagsString LIKE '%<database>%'
+        OR QP.CleanTagsString LIKE '%<sql>%'
+        OR QP.CleanTagsString LIKE '%<query-optimization>%'
+    )
+    AND COALESCE(LPD.DuplicatePostsCount, 0) < 2
+GROUP BY
+    RHU.DisplayName,
+    RHU.Reputation,
+    RHU.UserActivityScore,
+    QP.Title,
+    QP.PostScore,
+    QP.PostViewCount,
+    QP.EngagementRatio,
+    QP.CleanTagsString,
+    QP.DistinctNonOwnerEditTypes,
+    QP.UserPostRank,
+    QP.PostCreationDate,
+    QP.PreviousPostCreationDate,
+    AA.TotalAnswers,
+    AA.AvgAnswerScore,
+    AA.TotalCommentsOnAnswers,
+    LPD.LinkedPostsCount,
+    LPD.DuplicatePostsCount,
+    LPD.LatestLinkedPostTitle,
+    MH.CloseDeleteCount,
+    MH.ReopenUndeleteCount,
+    MH.LastCloseReasonType,
+    RHU.UserId,
+    QP.PostId
+ORDER BY
+    RHU.Reputation DESC,
+    QP.PostScore DESC,
+    QP.PostCreationDate ASC;

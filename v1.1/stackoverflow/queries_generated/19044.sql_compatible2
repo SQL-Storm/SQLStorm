@@ -1,0 +1,115 @@
+COALESCE(UTP.AvgQuestionScoreAcrossTagsUsed, 0.0) AS AvgQuestionScoreAcrossTagsUsed,
+COALESCE(GTS.AvgGlobalScoreForTag, 0.0) AS AvgScoreOfMostFrequentTagGlobally,
+SUM(PHM.TotalEditHistoryEvents) AS TotalPostEditEventsSum,
+SUM(PHM.DistinctEditors) AS TotalDistinctEditorsOnPosts,
+MAX(PHM.WasClosed) AS UserHasClosedPosts,
+MAX(PHM.WasReopened) AS UserHasReopenedPosts,
+STRING_AGG(DISTINCT
+    CASE PHM.LastCloseReasonTypeId
+        WHEN 1 THEN 'Duplicate' WHEN 2 THEN 'Off-topic' WHEN 3 THEN 'Subjective'
+        WHEN 4 THEN 'Not a real question' WHEN 101 THEN 'Duplicate (New)' WHEN 102 THEN 'Off-topic (New)'
+        ELSE NULL
+    END, ', ' ORDER BY MIN(PHM.LastCloseReasonTypeId)) FILTER (WHERE PHM.LastCloseReasonTypeId <> -1) AS UserCloseReasonSummary
+FROM UserEngagementSummary UES
+LEFT JOIN PostHistoryMetrics PHM ON UES.UserId = PHM.OwnerUserId
+LEFT JOIN UserTagPerformance UTP ON UES.UserId = UTP.UserId
+LEFT JOIN MostFrequentTagPerUser MFTPU ON UES.UserId = MFTPU.UserId
+LEFT JOIN GlobalTagAvgScores GTS ON MFTPU.TopTag = GTS.TagName
+WHERE UES.TotalPostsCreated > 5
+  AND UES.Reputation > 500
+GROUP BY
+    UES.UserId, UES.DisplayName, UES.Reputation, UES.CreationDate, UES.TotalPostsCreated,
+    UES.TotalQuestionsAsked, UES.TotalAnswersGiven, UES.TotalPostScore, UES.UserTenureDays,
+    UES.TotalUpVotesGiven, UES.TotalDownVotesGiven, UES.AvgAnswerScoreOverall,
+    UTP.UniqueTagsUsed, UTP.AvgQuestionScoreAcrossTagsUsed, GTS.AvgGlobalScoreForTag
+)
+SELECT
+    TLU.UserId,
+    TLU.DisplayName,
+    TLU.Reputation,
+    TLU.TotalPostsCreated,
+    TLU.TotalQuestionsAsked,
+    TLU.TotalAnswersGiven,
+    TLU.TotalPostScore,
+    TLU.UserTenureDays,
+    TLU.UniqueTagsUsed,
+    TLU.AvgQuestionScoreAcrossTagsUsed,
+    TLU.AvgScoreOfMostFrequentTagGlobally,
+    TLU.TotalPostEditEventsSum,
+    TLU.TotalDistinctEditorsOnPosts,
+    TLU.UserHasClosedPosts,
+    TLU.UserHasReopenedPosts,
+    TLU.UserCloseReasonSummary,
+    RANK() OVER (PARTITION BY NTILE(10) OVER (ORDER BY TLU.Reputation DESC) ORDER BY TLU.TotalPostScore DESC) AS RankInReputationDecile,
+    AVG(TLU.TotalPostsCreated) OVER (ORDER BY TLU.UserTenureDays ASC ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS MovingAvgPostsByTenure,
+    CAST(
+        (TLU.TotalPostScore * 0.6) +
+        (TLU.TotalAnswersGiven * 1.5) +
+        (TLU.TotalQuestionsAsked * 0.8) -
+        (TLU.TotalPostEditEventsSum * 0.1) -
+        (TLU.TotalDistinctEditorsOnPosts * 0.2)
+    AS NUMERIC) AS UserImpactScore,
+    CASE
+        WHEN TLU.Reputation > 20000 AND TLU.UserHasClosedPosts = 0 AND TLU.TotalAnswersGiven > 100 THEN
+            'High-Tier Mentor: Elite and Unproblematic'
+        WHEN TLU.TotalQuestionsAsked > TLU.TotalAnswersGiven * 2 AND TLU.TotalPostScore > 1000 THEN
+            'Prolific Questioner with High Engagement'
+        WHEN TLU.UserHasClosedPosts = 1 AND TLU.TotalPostEditEventsSum > TLU.TotalPostsCreated * 1.5 AND TLU.TotalDistinctEditorsOnPosts > 0 THEN
+            'Moderation-Intensive Profile: Needs Review'
+        WHEN TLU.UniqueTagsUsed >= 10 AND TLU.AvgScoreOfMostFrequentTagGlobally > 50 THEN
+            'Niche Expert with High-Performing Tags'
+        WHEN TLU.UserTenureDays > 365 * 3 AND TLU.TotalPostsCreated < 20 THEN
+            'Long-Term Lurker or Infrequent Contributor'
+        ELSE
+            'General Engaged User: ' || COALESCE(TLU.UserCloseReasonSummary, 'No Specific Issues Detected')
+    END AS DetailedUserStatus
+FROM TopLevelUsers TLU
+WHERE (CAST(
+        (TLU.TotalPostScore * 0.6) +
+        (TLU.TotalAnswersGiven * 1.5) +
+        (TLU.TotalQuestionsAsked * 0.8) -
+        (TLU.TotalPostEditEventsSum * 0.1) -
+        (TLU.TotalDistinctEditorsOnPosts * 0.2)
+    AS NUMERIC) > 50)
+  AND TLU.UniqueTagsUsed IS NOT NULL
+  AND (TLU.UserHasClosedPosts = 0 OR TLU.TotalDistinctEditorsOnPosts < 3)
+UNION ALL
+SELECT
+    UES.UserId,
+    UES.DisplayName,
+    UES.Reputation,
+    UES.TotalPostsCreated,
+    UES.TotalQuestionsAsked,
+    UES.TotalAnswersGiven,
+    UES.TotalPostScore,
+    UES.UserTenureDays,
+    0 AS UniqueTagsUsed,
+    0.0 AS AvgQuestionScoreAcrossTagsUsed,
+    0.0 AS AvgScoreOfMostFrequentTagGlobally,
+    SUM(PHM.TotalEditHistoryEvents) AS TotalPostEditEventsSum,
+    SUM(PHM.DistinctEditors) AS TotalDistinctEditorsOnPosts,
+    MAX(PHM.WasClosed) AS UserHasClosedPosts,
+    MAX(PHM.WasReopened) AS UserHasReopenedPosts,
+    STRING_AGG(DISTINCT
+        CASE PHM.LastCloseReasonTypeId
+            WHEN 1 THEN 'Duplicate' WHEN 2 THEN 'Off-topic' WHEN 3 THEN 'Subjective'
+            WHEN 4 THEN 'Not a real question' WHEN 101 THEN 'Duplicate (New)' WHEN 102 THEN 'Off-topic (New)'
+            ELSE NULL
+        END, ', ' ORDER BY MIN(PHM.LastCloseReasonTypeId)) FILTER (WHERE PHM.LastCloseReasonTypeId <> -1) AS UserCloseReasonSummary,
+    0 AS RankInReputationDecile,
+    0.0 AS MovingAvgPostsByTenure,
+    CAST(
+        (UES.TotalUpVotesGiven * 0.1) - (UES.TotalDownVotesGiven * 2.0)
+    AS NUMERIC) AS UserImpactScore,
+    'Negative Feedback Magnet' AS DetailedUserStatus
+FROM UserEngagementSummary UES
+LEFT JOIN PostHistoryMetrics PHM ON UES.UserId = PHM.OwnerUserId
+WHERE UES.TotalDownVotesGiven > UES.TotalUpVotesGiven * 0.5
+  AND UES.Reputation < 2000
+  AND UES.TotalPostsCreated > 3
+GROUP BY
+    UES.UserId, UES.DisplayName, UES.Reputation, UES.CreationDate, UES.TotalPostsCreated,
+    UES.TotalQuestionsAsked, UES.TotalAnswersGiven, UES.TotalPostScore, UES.UserTenureDays,
+    UES.TotalUpVotesGiven, UES.TotalDownVotesGiven
+ORDER BY Reputation DESC, UserImpactScore DESC
+LIMIT 200;

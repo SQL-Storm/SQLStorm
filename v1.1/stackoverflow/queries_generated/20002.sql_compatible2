@@ -1,0 +1,132 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.Location,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.CommentCount) AS AvgPostComments,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        (SELECT MAX(b.Date) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS LastGoldBadgeDate
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    WHERE
+        u.Reputation > 1000 AND u.CreationDate < TIMESTAMP '2022-01-01'
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+    HAVING
+        COUNT(p.Id) > 20
+),
+RankedPosts AS (
+    SELECT
+        Id,
+        OwnerUserId,
+        Score,
+        CreationDate,
+        Tags,
+        PostTypeId,
+        Title,
+        ROW_NUMBER() OVER (PARTITION BY OwnerUserId, PostTypeId ORDER BY Score DESC, CreationDate DESC) AS rn,
+        LAG(Score, 1, 0) OVER (PARTITION BY OwnerUserId, PostTypeId ORDER BY CreationDate) AS prev_score,
+        LEAD(Score, 1, 0) OVER (PARTITION BY OwnerUserId, PostTypeId ORDER BY CreationDate) AS next_score,
+        SUM(Score) OVER (PARTITION BY OwnerUserId, EXTRACT(YEAR FROM CreationDate)) AS yearly_score_sum
+    FROM
+        Posts
+    WHERE
+        OwnerUserId IS NOT NULL AND DeletionDate IS NULL
+),
+ControversialActivity AS (
+    SELECT
+        p.OwnerUserId,
+        p.Id AS PostId,
+        COUNT(DISTINCT v_down.Id) AS DownVotes,
+        COUNT(DISTINCT v_close.Id) AS CloseVotes,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS LastClosedDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate END) AS LastReopenedDate
+    FROM
+        Posts p
+    LEFT JOIN
+        Votes v_down ON p.Id = v_down.PostId AND v_down.VoteTypeId = 3
+    LEFT JOIN
+        Votes v_close ON p.Id = v_close.PostId AND v_close.VoteTypeId = 6
+    LEFT JOIN
+        PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (10, 11)
+    WHERE p.PostTypeId = 1
+    GROUP BY
+        p.OwnerUserId, p.Id
+    HAVING
+        COUNT(DISTINCT v_down.Id) > 5 OR COUNT(DISTINCT v_close.Id) > 2
+)
+SELECT
+    uas.DisplayName,
+    uas.Reputation,
+    rp.Title AS TopPostTitle,
+    rp.Score AS TopPostScore,
+    rp.Score - rp.prev_score AS ScoreImprovement,
+    rp.yearly_score_sum,
+    uas.TotalPosts,
+    CAST(uas.AnswerCount AS DOUBLE PRECISION) / NULLIF(uas.QuestionCount, 0) AS AnswerToQuestionRatio,
+    EXTRACT(DAY FROM (TIMESTAMP '2024-10-01 12:34:56' - uas.LastGoldBadgeDate)) AS DaysSinceLastGoldBadge,
+    UPPER(SUBSTRING(COALESCE(uas.Location, 'UNKNOWN') FROM 1 FOR 15)) || '...' AS ShortLocation,
+    ca.DownVotes AS ControversialPostDownVotes,
+    ca.LastClosedDate AS ControversialPostClosedDate,
+    CASE
+        WHEN rp.Tags LIKE '%<sql>%' THEN 'Database Specialist'
+        WHEN rp.Tags LIKE '%<performance>%' OR rp.Tags LIKE '%<optimization>%' THEN 'Performance Tuner'
+        ELSE 'Generalist'
+    END AS UserSpecialty,
+    (SELECT STRING_AGG(b.Name, ', ' ORDER BY b.Date DESC)
+     FROM Badges b
+     WHERE b.UserId = uas.UserId AND b.Class = 2 AND b.Date > TIMESTAMP '2023-01-01'
+     ORDER BY b.Date DESC
+     LIMIT 3) AS RecentSilverBadges,
+    uas.UserId
+FROM
+    UserActivitySummary uas
+JOIN
+    RankedPosts rp ON uas.UserId = rp.OwnerUserId AND rp.rn = 1 AND rp.PostTypeId = 1
+LEFT JOIN
+    ControversialActivity ca ON uas.UserId = ca.OwnerUserId
+WHERE
+    uas.Reputation > (SELECT AVG(Reputation) FROM Users WHERE Reputation > 0)
+    AND (CAST(uas.AnswerCount AS DOUBLE PRECISION) / NULLIF(uas.QuestionCount, 0)) > 1.5
+    AND rp.Score > 50
+
+UNION ALL
+
+SELECT
+    u.DisplayName,
+    u.Reputation,
+    p_ans.Title,
+    p_ans.Score,
+    NULL AS ScoreImprovement,
+    NULL AS yearly_score_sum,
+    (SELECT COUNT(*) FROM Posts p_sub WHERE p_sub.OwnerUserId = u.Id) AS TotalPosts,
+    NULL AS AnswerToQuestionRatio,
+    NULL AS DaysSinceLastGoldBadge,
+    'REMOTE' AS ShortLocation,
+    NULL AS ControversialPostDownVotes,
+    NULL AS ControversialPostClosedDate,
+    'Answer Provider' AS UserSpecialty,
+    (SELECT STRING_AGG(T.TagName, '|' ORDER BY T.TagName) FROM Tags T WHERE T.Id IN (SELECT PT.TagId FROM PostTags PT WHERE PT.PostId = p_ques.Id)) AS RecentSilverBadges,
+    u.Id
+FROM
+    Users u
+JOIN
+    Posts p_ans ON u.Id = p_ans.OwnerUserId AND p_ans.PostTypeId = 2
+JOIN
+    Posts p_ques ON p_ans.ParentId = p_ques.Id
+WHERE
+    u.Location IS NULL
+    AND u.WebsiteUrl IS NOT NULL
+    AND p_ans.Score > p_ques.Score
+    AND COALESCE(p_ques.FavoriteCount, 0) > 10
+
+ORDER BY
+    Reputation DESC, TopPostScore DESC
+LIMIT 200;

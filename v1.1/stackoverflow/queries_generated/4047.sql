@@ -1,0 +1,171 @@
+-- {"query": "4047.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1697} 
+with recursive RecursiveTags as (
+    select p.Id as PostId, unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as TagName, 1 as Depth
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+    union all
+    select rt.PostId, t.TagName, rt.Depth + 1
+    from RecursiveTags rt
+    join Tags t on rt.TagName = t.TagName
+    where rt.Depth < 2
+),
+UserBadgeRanks as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        row_number() over (partition by u.Id order by max(b.Date) desc nulls last) as BadgeRecencyRank
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName
+),
+TopScoredAnswers as (
+    select 
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        u.DisplayName,
+        row_number() over (partition by a.ParentId order by a.Score desc nulls last) as AnswerRank
+    from Posts a
+    left join Users u on a.OwnerUserId = u.Id
+    where a.PostTypeId = 2 and a.Score is not null
+),
+QuestionCommenterActivity as (
+    select 
+        c.PostId,
+        c.UserId,
+        count(*) as CommentsMade,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    group by c.PostId, c.UserId
+),
+QuestionsWithAnswersAndComments as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        u.DisplayName as OwnerDisplayName,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        coalesce(a_stats.AnswerCount,0) as NumberOfAnswers,
+        coalesce(c_stats.TotalComments,0) as TotalCommentsOnQuestionAndAnswers,
+        q.Tags
+    from Posts q
+    left join Users u on q.OwnerUserId = u.Id
+    left join (
+        select ParentId, count(*) as AnswerCount
+        from Posts
+        where PostTypeId = 2 and ParentId is not null
+        group by ParentId
+    ) a_stats on q.Id = a_stats.ParentId
+    left join (
+        select
+            p.ParentId as QuestionId,
+            count(c.Id) as TotalComments
+        from Posts p
+        left join Comments c on p.Id = c.PostId
+        where p.PostTypeId in (1,2)
+        group by p.ParentId
+    ) c_stats on q.Id = c_stats.QuestionId
+    where q.PostTypeId = 1 and q.Score > 5
+),
+CloseReasonStats as (
+    select
+        cht.Name as CloseReason,
+        count(distinct ph.PostId) as TimesClosed
+    from PostHistory ph
+    join PostHistoryTypes chtt on ph.PostHistoryTypeId = chtt.Id
+    join CloseReasonTypes cht on cast(ph.Comment as int) = cht.Id
+    where ph.PostHistoryTypeId = 10 and ph.Comment is not null and ph.Comment ~ '^\d+$'
+    group by cht.Name
+),
+LatestEditsWithUsers as (
+    select distinct on (ph.PostId)
+        ph.PostId,
+        ph.CreationDate as EditDate,
+        ph.UserId as EditorUserId,
+        u.DisplayName as EditorDisplayName,
+        ph.PostHistoryTypeId,
+        ph.Comment
+    from PostHistory ph
+    left join Users u on ph.UserId = u.Id
+    where ph.PostHistoryTypeId in (4,5,6,10,11,14,15)
+    order by ph.PostId, ph.CreationDate desc
+),
+AnswerDuplicates as (
+    select 
+        pl.PostId as AnswerId,
+        pl.RelatedPostId as DuplicateOfQuestionId,
+        p.Score as AnswerScore,
+        p.CreationDate
+    from PostLinks pl
+    join Posts p on pl.PostId = p.Id
+    where pl.LinkTypeId = 3 and p.PostTypeId = 2
+),
+RankedAnswersWithDuplicateInfo as (
+    select 
+        tsa.*,
+        ad.DuplicateOfQuestionId,
+        ad.AnswerScore as DuplicateAnswerScore
+    from TopScoredAnswers tsa
+    left join AnswerDuplicates ad on tsa.AnswerId = ad.AnswerId
+),
+FinalResult as (
+    select 
+        q.QuestionId,
+        q.Title,
+        q.OwnerDisplayName,
+        q.QuestionCreation,
+        q.QuestionScore,
+        q.NumberOfAnswers,
+        q.TotalCommentsOnQuestionAndAnswers,
+        string_agg(distinct rt.TagName, ',' order by rt.TagName) as Tags,
+        usr.GoldBadges,
+        usr.SilverBadges,
+        usr.BronzeBadges,
+        max(leu.EditDate) filter (where leu.PostId = q.QuestionId) as LastEditDate,
+        max(leu.EditorDisplayName) filter (where leu.PostId = q.QuestionId) as LastEditor,
+        crs.TimesClosed,
+        (select count(*) from Comments c where c.UserId = q.OwnerUserId and c.PostId = q.QuestionId) as OwnerCommentsOnQuestion,
+        (select avg(p.Score) from Posts p where p.OwnerUserId = q.OwnerUserId and p.PostTypeId = 1) as OwnerAvgQuestionScore,
+        max(ra.AnswerScore) as MaxAnswerScore,
+        sum(case when ra.DuplicateOfQuestionId is not null then 1 else 0 end) as DuplicateAnswersCount
+    from QuestionsWithAnswersAndComments q
+    left join UserBadgeRanks usr on q.OwnerUserId = usr.UserId
+    left join RecursiveTags rt on rt.PostId = q.QuestionId
+    left join LatestEditsWithUsers leu on leu.PostId = q.QuestionId
+    left join CloseReasonStats crs on true
+    left join RankedAnswersWithDuplicateInfo ra on ra.QuestionId = q.QuestionId
+    group by q.QuestionId, q.Title, q.OwnerDisplayName, q.QuestionCreation, q.QuestionScore, q.NumberOfAnswers, q.TotalCommentsOnQuestionAndAnswers, usr.GoldBadges, usr.SilverBadges, usr.BronzeBadges, crs.TimesClosed
+)
+select 
+    QuestionId,
+    Title,
+    coalesce(OwnerDisplayName, 'unknown') as Owner,
+    to_char(QuestionCreation, 'YYYY-MM-DD') as CreatedDate,
+    QuestionScore,
+    NumberOfAnswers,
+    TotalCommentsOnQuestionAndAnswers,
+    coalesce(Tags, 'none') as Tags,
+    coalesce(GoldBadges,0) as GoldBadges,
+    coalesce(SilverBadges,0) as SilverBadges,
+    coalesce(BronzeBadges,0) as BronzeBadges,
+    to_char(LastEditDate, 'YYYY-MM-DD') as LastEdit,
+    coalesce(LastEditor, 'none') as LastEditor,
+    coalesce(TimesClosed, 0) as TotalTimesClosed,
+    OwnerCommentsOnQuestion,
+    coalesce(round(OwnerAvgQuestionScore,2), 0) as AvgScoreOfOwnerQuestions,
+    coalesce(MaxAnswerScore, 0) as HighestAnswerScore,
+    DuplicateAnswersCount,
+    case 
+        when QuestionScore > 50 and NumberOfAnswers > 5 then 'Hot Question'
+        when TimesClosed > 0 then 'Closed Question'
+        else 'Normal Question'
+    end as QuestionStatus
+from FinalResult
+where NumberOfAnswers > 0
+order by QuestionScore desc, NumberOfAnswers desc
+limit 100;

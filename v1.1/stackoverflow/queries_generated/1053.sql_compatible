@@ -1,0 +1,80 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id AS PostId,
+        P.Title,
+        P.ViewCount,
+        P.Score,
+        P.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC) AS RankScore,
+        COUNT(CASE WHEN V.VoteTypeId = 2 THEN 1 END) OVER (PARTITION BY P.Id) AS UpVotes,
+        COUNT(CASE WHEN V.VoteTypeId = 3 THEN 1 END) OVER (PARTITION BY P.Id) AS DownVotes
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Votes V ON P.Id = V.PostId
+    WHERE 
+        P.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months')
+        AND P.ViewCount > 100
+),
+PostStatistics AS (
+    SELECT 
+        RP.PostId,
+        RP.Title,
+        RP.ViewCount,
+        RP.Score,
+        RP.CreationDate,
+        RP.RankScore,
+        COALESCE(RP.UpVotes - RP.DownVotes, 0) AS NetVotes,
+        CASE 
+            WHEN RP.RankScore = 1 THEN 'Top' 
+            WHEN RP.RankScore <= 5 THEN 'High' 
+            ELSE 'Normal' 
+        END AS Rating
+    FROM 
+        RankedPosts RP
+    WHERE 
+        RP.RankScore <= 10
+),
+ClosedPosts AS (
+    SELECT 
+        PH.PostId,
+        COUNT(*) AS CloseCount,
+        STRING_AGG(DISTINCT C.Name, ', ') AS CloseReasons
+    FROM 
+        PostHistory PH
+    JOIN 
+        CloseReasonTypes C ON CAST(PH.Comment AS INTEGER) = C.Id
+    WHERE 
+        PH.PostHistoryTypeId IN (10, 11)
+    GROUP BY 
+        PH.PostId
+)
+
+SELECT 
+    PS.PostId,
+    PS.Title,
+    PS.ViewCount,
+    PS.Score,
+    PS.CreationDate,
+    PS.NetVotes,
+    PS.Rating,
+    COALESCE(CP.CloseCount, 0) AS CloseCount,
+    CP.CloseReasons,
+    PS.RankScore
+FROM 
+    PostStatistics PS
+LEFT JOIN 
+    ClosedPosts CP ON PS.PostId = CP.PostId
+GROUP BY
+    PS.PostId,
+    PS.Title,
+    PS.ViewCount,
+    PS.Score,
+    PS.CreationDate,
+    PS.NetVotes,
+    PS.Rating,
+    COALESCE(CP.CloseCount, 0),
+    CP.CloseReasons,
+    PS.RankScore
+ORDER BY 
+    PS.RankScore, PS.CreationDate DESC;

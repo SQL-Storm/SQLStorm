@@ -1,0 +1,244 @@
+WITH UserStats AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        U.LastAccessDate,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswerCount,
+        COUNT(DISTINCT C.Id) AS CommentCountByUser,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScoreReceivedByPosts
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.Views, U.UpVotes, U.DownVotes, U.LastAccessDate
+),
+PostEngagement AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.Title,
+        P.Body,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.LastActivityDate,
+        P.LastEditDate,
+        EXTRACT(DAY FROM (P.LastActivityDate - P.CreationDate)) AS DaysActive,
+        P.ClosedDate,
+        P.AcceptedAnswerId,
+        (
+            SELECT PH_Edit.CreationDate
+            FROM PostHistory PH_Edit
+            WHERE PH_Edit.PostId = P.Id
+              AND PH_Edit.PostHistoryTypeId = 5
+            ORDER BY PH_Edit.CreationDate ASC
+            LIMIT 1
+        ) AS FirstBodyEditDate,
+        (SELECT ARRAY_AGG(tag) FROM (
+            SELECT TRIM(REPLACE(LOWER(tag), '-', '_')) AS tag
+            FROM UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags)-2), '><')) AS t(tag)
+        ) sub
+        ) AS ParsedTagsArray,
+        EXISTS (
+            SELECT 1 FROM PostHistory PH_CR
+            WHERE PH_CR.PostId = P.Id
+              AND PH_CR.PostHistoryTypeId = 10
+              AND EXISTS (
+                  SELECT 1 FROM PostHistory PH_RO
+                  WHERE PH_RO.PostId = P.Id
+                    AND PH_RO.PostHistoryTypeId = 11
+                    AND PH_RO.CreationDate > PH_CR.CreationDate
+              )
+        ) AS WasClosedAndReopened
+    FROM Posts P
+    WHERE P.PostTypeId = 1
+      AND P.CreationDate >= DATE '2020-01-01'
+      AND P.OwnerUserId IS NOT NULL
+),
+PostHistoricalSentiment AS (
+    SELECT
+        PH.PostId,
+        COUNT(CASE WHEN LOWER(PH.Text) LIKE '%bug fix%' OR LOWER(PH.Text) LIKE '%critical update%' THEN 1 END) AS BugFixHistoryCount,
+        COUNT(CASE WHEN LOWER(PH.Text) LIKE '%clarification%' OR LOWER(PH.Text) LIKE '%detail%' THEN 1 END) AS ClarificationHistoryCount,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE NULL END) AS EditEventCount,
+        MAX(PH.CreationDate) AS LastHistoryEventDate
+    FROM PostHistory PH
+    WHERE PH.PostId IN (SELECT PostId FROM PostEngagement)
+      AND PH.PostHistoryTypeId IN (2, 5, 4, 6)
+      AND PH.CreationDate >= DATE '2020-01-01'
+    GROUP BY PH.PostId
+),
+UserPostRanking AS (
+    SELECT
+        PE.PostId,
+        PE.OwnerUserId,
+        PE.PostScore,
+        PE.ViewCount,
+        PE.AnswerCount,
+        PE.CommentCount,
+        ROW_NUMBER() OVER (PARTITION BY PE.OwnerUserId ORDER BY PE.PostScore DESC, PE.ViewCount DESC) AS RankByScoreForUser,
+        NTILE(4) OVER (ORDER BY PE.PostScore DESC) AS PostScoreQuartile,
+        AVG(PE.PostScore) OVER (PARTITION BY PE.OwnerUserId) AS AvgUserQuestionScore,
+        LEAD(PE.PostCreationDate, 1) OVER (PARTITION BY PE.OwnerUserId ORDER BY PE.PostCreationDate) AS NextPostCreationDate
+    FROM PostEngagement PE
+    WHERE PE.PostScore > 0
+),
+HotTopics AS (
+    SELECT
+        tag AS TagName,
+        COUNT(PostId) AS TaggedPostCount,
+        SUM(PostScore) AS TotalTagScore
+    FROM PostEngagement,
+         UNNEST(ParsedTagsArray) AS t(tag)
+    WHERE ParsedTagsArray IS NOT NULL
+    GROUP BY tag
+    HAVING COUNT(PostId) > 100
+),
+TopEngagedQuestions AS (
+    SELECT
+        UPR.PostId,
+        UPR.OwnerUserId,
+        UPR.PostScore,
+        UPR.ViewCount,
+        UPR.CommentCount,
+        PE.Title,
+        PE.Body,
+        PE.PostCreationDate,
+        PE.DaysActive,
+        PE.FavoriteCount,
+        PE.ParsedTagsArray,
+        PE.FirstBodyEditDate,
+        PE.WasClosedAndReopened,
+        'High Score, High View' AS EngagementCategory
+    FROM UserPostRanking UPR
+    JOIN PostEngagement PE ON UPR.PostId = PE.PostId
+    WHERE UPR.PostScore > 50 AND UPR.ViewCount > 10000
+      AND UPR.RankByScoreForUser <= 5
+),
+ActiveQuestioners AS (
+    SELECT
+        U.UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.QuestionCount,
+        U.AnswerCount,
+        U.GoldBadges,
+        U.LastAccessDate,
+        SUM(CASE WHEN PE.PostScore > 0 THEN 1 ELSE 0 END) AS PositiveScoreQuestions,
+        AVG(PE.PostScore) AS AvgQuestionScore
+    FROM UserStats U
+    JOIN PostEngagement PE ON U.UserId = PE.OwnerUserId
+    WHERE U.Reputation > 5000 AND U.QuestionCount > 10
+    GROUP BY U.UserId, U.DisplayName, U.Reputation, U.QuestionCount, U.AnswerCount, U.GoldBadges, U.LastAccessDate
+)
+SELECT
+    UQ.UserId,
+    UQ.DisplayName,
+    UQ.Reputation,
+    UQ.QuestionCount,
+    UQ.AnswerCount,
+    UQ.GoldBadges,
+    UQ.PositiveScoreQuestions,
+    UQ.AvgQuestionScore,
+    T.PostId,
+    T.Title,
+    T.PostScore,
+    T.ViewCount,
+    T.CommentCount AS PostCommentCount,
+    T.EngagementCategory,
+    T.FirstBodyEditDate,
+    T.WasClosedAndReopened,
+    PHS.BugFixHistoryCount,
+    PHS.ClarificationHistoryCount,
+    PHS.EditEventCount,
+    PHS.LastHistoryEventDate,
+    COALESCE(T.PostScore * 0.5 + T.ViewCount * 0.1 + T.CommentCount * 0.2 + T.FavoriteCount * 0.8, 0) AS EngagementIndex,
+    CASE
+        WHEN UQ.Reputation > 10000 AND UQ.GoldBadges >= 2 THEN 'Elite Contributor'
+        WHEN UQ.Reputation > 2000 AND UQ.QuestionCount >= 5 THEN 'Active Questioner'
+        ELSE 'Casual User'
+    END AS UserCategory,
+    (
+        SELECT COUNT(DISTINCT PT.TagName)
+        FROM Tags PT
+        WHERE PT.TagName = ANY(COALESCE(T.ParsedTagsArray, ARRAY[]::text[])) AND PT.Count > 1000
+    ) AS PopularTagsCount,
+    COALESCE(HT.TaggedPostCount, 0) AS HotTopicTotalTaggedPosts,
+    COALESCE(HT.TotalTagScore, 0) AS HotTopicTotalScore
+FROM ActiveQuestioners UQ
+INNER JOIN TopEngagedQuestions T ON UQ.UserId = T.OwnerUserId
+LEFT JOIN PostHistoricalSentiment PHS ON T.PostId = PHS.PostId
+LEFT JOIN HotTopics HT ON HT.TagName = ANY(COALESCE(T.ParsedTagsArray, ARRAY[]::text[]))
+WHERE T.PostCreationDate > (UQ.LastAccessDate - INTERVAL '1 year')
+  AND UQ.Reputation > 0
+  AND T.EngagementCategory = 'High Score, High View'
+  AND (T.Body LIKE '%performance%' OR T.Body LIKE '%optimization%')
+  AND T.DaysActive IS NOT NULL
+  AND COALESCE(PHS.EditEventCount, 0) > 1
+  AND NOT EXISTS (
+        SELECT 1 FROM Posts A
+        WHERE A.ParentId = T.PostId AND A.PostTypeId = 2 AND A.OwnerUserId = UQ.UserId AND A.Score < -5
+  )
+UNION ALL
+SELECT
+    UQ.UserId,
+    UQ.DisplayName,
+    UQ.Reputation,
+    UQ.QuestionCount,
+    UQ.AnswerCount,
+    UQ.GoldBadges,
+    UQ.PositiveScoreQuestions,
+    UQ.AvgQuestionScore,
+    PE_LVHC.PostId,
+    PE_LVHC.Title,
+    PE_LVHC.PostScore,
+    PE_LVHC.ViewCount,
+    PE_LVHC.CommentCount AS PostCommentCount,
+    'Low View, High Comment' AS EngagementCategory,
+    PE_LVHC.FirstBodyEditDate,
+    PE_LVHC.WasClosedAndReopened,
+    PHS_LVHC.BugFixHistoryCount,
+    PHS_LVHC.ClarificationHistoryCount,
+    PHS_LVHC.EditEventCount,
+    PHS_LVHC.LastHistoryEventDate,
+    COALESCE(PE_LVHC.PostScore * 0.3 + PE_LVHC.ViewCount * 0.05 + PE_LVHC.CommentCount * 0.7 + PE_LVHC.FavoriteCount * 0.5, 0) AS EngagementIndex,
+    CASE
+        WHEN UQ.Reputation > 10000 AND UQ.GoldBadges >= 2 THEN 'Elite Contributor'
+        WHEN UQ.Reputation > 2000 AND UQ.QuestionCount >= 5 THEN 'Active Questioner'
+        ELSE 'Casual User'
+    END AS UserCategory,
+    (
+        SELECT COUNT(DISTINCT PT.TagName)
+        FROM Tags PT
+        WHERE PT.TagName = ANY(COALESCE(PE_LVHC.ParsedTagsArray, ARRAY[]::text[])) AND PT.Count > 1000
+    ) AS PopularTagsCount,
+    COALESCE(HT_LVHC.TaggedPostCount, 0) AS HotTopicTotalTaggedPosts,
+    COALESCE(HT_LVHC.TotalTagScore, 0) AS HotTopicTotalScore
+FROM ActiveQuestioners UQ
+INNER JOIN PostEngagement PE_LVHC ON UQ.UserId = PE_LVHC.OwnerUserId
+LEFT JOIN PostHistoricalSentiment PHS_LVHC ON PE_LVHC.PostId = PHS_LVHC.PostId
+LEFT JOIN HotTopics HT_LVHC ON HT_LVHC.TagName = ANY(COALESCE(PE_LVHC.ParsedTagsArray, ARRAY[]::text[]))
+WHERE PE_LVHC.PostScore < 20
+  AND PE_LVHC.ViewCount < 5000
+  AND PE_LVHC.CommentCount > 5
+  AND PE_LVHC.WasClosedAndReopened IS TRUE
+  AND PE_LVHC.DaysActive IS NOT NULL
+  AND PE_LVHC.Title IS NOT NULL
+  AND COALESCE(PHS_LVHC.EditEventCount, 0) >= 2
+  AND EXISTS (
+      SELECT 1 FROM Posts Ans
+      WHERE Ans.ParentId = PE_LVHC.PostId AND Ans.PostTypeId = 2 AND Ans.Score > 0
+  )
+ORDER BY EngagementIndex DESC, Reputation DESC
+LIMIT 500;

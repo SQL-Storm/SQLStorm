@@ -1,0 +1,115 @@
+-- {"query": "6095.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 852} 
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.ViewCount,
+    p.Score,
+    p.Tags
+  FROM Posts p
+  WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+),
+TopTags AS (
+  SELECT
+    unnest(string_to_array(trim(both '><' from p.Tags), '><')) AS TagName,
+    count(*) AS TagUse
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+  GROUP BY TagName
+  ORDER BY TagUse DESC
+  LIMIT 20
+),
+UserStats AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id) AS BadgeCount,
+    (SELECT COUNT(*) FROM Posts pp WHERE pp.OwnerUserId = u.Id) AS PostCount
+  FROM Users u
+),
+Combined AS (
+  SELECT
+    rap.Id AS PostId,
+    rap.Title,
+    rap.OwnerUserId,
+    rap.CreationDate AS PostCreation,
+    rap.LastActivityDate,
+    rap.ViewCount,
+    rap.Score,
+    rap.Tags,
+    NULL AS RelatedPostOrComment,
+    NULL AS ExtraInfo
+  FROM RecentActivePosts rap
+  UNION ALL
+  SELECT
+    t.Id AS PostId,
+    t.Title,
+    t.OwnerUserId,
+    t.CreationDate,
+    t.LastActivityDate,
+    t.ViewCount,
+    t.Score,
+    t.Tags,
+    NULL,
+    CONCAT('TopTag:', tt.TagName, '|Uses:', tt.TagUse)
+  FROM TopTags tt
+  JOIN Posts t ON t.Tags LIKE '%' || tt.TagName || '%'
+)
+SELECT
+  c.PostId,
+  c.Title,
+  c.OwnerUserId,
+  cu.DisplayName AS OwnerDisplayName,
+  c.PostCreation,
+  c.LastActivityDate,
+  c.ViewCount,
+  c.Score,
+  c.Tags,
+  up.Reputation,
+  up.PostCount,
+  up.BadgeCount,
+  CASE
+    WHEN c.Score > 10 THEN 'Hot'
+    WHEN c.Score BETWEEN 0 AND 10 THEN 'Warm'
+    ELSE 'Cool'
+  END AS Mood,
+  ARRAY_AGG(DISTINCT vh.VoteTypeName) AS RecentVoteTypes,
+  STRING_AGG(DISTINCT clm.TagName, ',') AS RelatedTags
+FROM Combined c
+LEFT JOIN Users cu ON cu.Id = c.OwnerUserId
+LEFT JOIN UserStats up ON up.UserId = cu.Id
+LEFT JOIN Votes v ON v.PostId = c.PostId
+LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+LEFT JOIN (
+  SELECT
+    v.PostId,
+    vt.Name AS VoteTypeName
+  FROM Votes v
+  JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+  WHERE v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '7 days'
+) vh ON vh.PostId = c.PostId
+LEFT JOIN PostLinks pl ON pl.PostId = c.PostId
+LEFT JOIN Posts pr ON pr.Id = pl.RelatedPostId
+LEFT JOIN Tags t2 ON t2.Id = pr.Id
+LEFT JOIN LATERAL (
+  SELECT t.TagName
+  FROM unnest(string_to_array(trim(both '><' from c.Tags), '><')) AS TagName
+  WHERE t2.TagName = TagName
+) clm ON TRUE
+GROUP BY
+  c.PostId, c.Title, c.OwnerUserId, cu.DisplayName, c.PostCreation,
+  c.LastActivityDate, c.ViewCount, c.Score, c.Tags, up.Reputation, up.PostCount, up.BadgeCount, Mood
+ORDER BY
+  c.LastActivityDate DESC, c.Score DESC
+LIMIT 100;

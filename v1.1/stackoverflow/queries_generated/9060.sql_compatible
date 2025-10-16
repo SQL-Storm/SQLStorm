@@ -1,0 +1,138 @@
+WITH
+RecentPosts AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts AS p
+    WHERE p.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+),
+
+TopPosts AS (
+    SELECT
+        Id,
+        OwnerUserId,
+        PostTypeId,
+        CreationDate,
+        Score,
+        ViewCount,
+        Tags
+    FROM RecentPosts
+    WHERE rn <= 100
+),
+
+UserScores AS (
+    SELECT
+        u.Id              AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END)    AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END)    AS AnswersProvided,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId IN (8,9) THEN v.BountyAmount ELSE 0 END),0) AS TotalBounty,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1
+                 WHEN v.VoteTypeId = 3 THEN -1
+                 ELSE 0 END)                                        AS NetVotes
+    FROM Users AS u
+    LEFT JOIN Posts  AS p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes  AS v ON v.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName
+),
+
+TagUsage AS (
+    SELECT
+        UNNEST(string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><')) AS Tag,
+        COUNT(*)                                                AS UsageCount,
+        AVG(p.Score)                                             AS AvgScore
+    FROM Posts AS p
+    WHERE p.PostTypeId = 1
+    GROUP BY UNNEST(string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><'))
+),
+
+BadgeRanks AS (
+    SELECT
+        b.UserId,
+        b.Name,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC, b.Class ASC) AS rn
+    FROM Badges AS b
+),
+TopBadges AS (
+    SELECT
+        br.UserId,
+        STRING_AGG(br.Name, ', ' ORDER BY br.rn) AS RecentBadges
+    FROM BadgeRanks AS br
+    WHERE br.rn <= 3
+    GROUP BY br.UserId
+),
+
+FinalSet AS (
+    SELECT
+        tp.Id                                   AS PostId,
+        u.DisplayName,
+        us.QuestionsAsked,
+        us.AnswersProvided,
+        us.NetVotes,
+        us.TotalBounty,
+        tp.PostTypeId,
+        COALESCE(lc.Text, '(no comments)')       AS LastComment,
+        CASE WHEN dup.RelatedPostId IS NOT NULL THEN 'Duplicate' ELSE 'Original' END AS LinkStatus,
+        COALESCE(tb.RecentBadges, '(none)')      AS RecentBadges,
+        COALESCE(tu.TagsConcatenated, '(none)')  AS TagsList,
+        COALESCE(tu.ScoreSum, 0)                 AS TagScoreSum,
+        RANK() OVER (PARTITION BY tp.PostTypeId ORDER BY tp.ViewCount DESC) AS ViewRank
+    FROM TopPosts AS tp
+    LEFT JOIN Users     AS u  ON u.Id = tp.OwnerUserId
+    LEFT JOIN UserScores AS us ON us.UserId = u.Id
+    LEFT JOIN LATERAL (
+        SELECT c.Text
+        FROM Comments AS c
+        WHERE c.PostId = tp.Id
+        ORDER BY c.CreationDate DESC
+        LIMIT 1
+    ) AS lc ON TRUE
+    LEFT JOIN (
+        SELECT DISTINCT RelatedPostId
+        FROM PostLinks
+        WHERE LinkTypeId = 3
+    ) AS dup ON dup.RelatedPostId = tp.Id
+    LEFT JOIN TopBadges AS tb ON tb.UserId = u.Id
+    LEFT JOIN LATERAL (
+        SELECT
+            STRING_AGG(sub_tag, '|') AS TagsConcatenated,
+            SUM(sub_score)        AS ScoreSum
+        FROM (
+            SELECT
+                UNNEST(string_to_array(substring(tp.Tags,2,length(tp.Tags)-2), '><')) AS sub_tag,
+                COALESCE(p2.Score,0)                                         AS sub_score
+            FROM Posts AS p2
+        ) AS tag_exp
+    ) AS tu ON TRUE
+),
+
+ExtraSet AS (
+    SELECT
+        CAST(NULL AS int)   AS PostId,
+        CAST(NULL AS text)  AS DisplayName,
+        tu.UsageCount        AS QuestionsAsked,
+        CAST(NULL AS int)    AS AnswersProvided,
+        CAST(CAST(tu.AvgScore AS int) AS int) AS NetVotes,
+        CAST(NULL AS int)    AS TotalBounty,
+        CAST(NULL AS smallint)  AS PostTypeId,
+        CAST(NULL AS text)      AS LastComment,
+        CAST(NULL AS text)      AS LinkStatus,
+        CAST(NULL AS text)      AS RecentBadges,
+        tu.Tag                 AS TagsList,
+        CAST(NULL AS numeric)  AS TagScoreSum,
+        CAST(NULL AS int)      AS ViewRank
+    FROM TagUsage AS tu
+    WHERE tu.UsageCount > 50
+)
+
+SELECT * FROM FinalSet
+UNION
+SELECT * FROM ExtraSet
+EXCEPT
+SELECT * FROM FinalSet WHERE TotalBounty = 0;

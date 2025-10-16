@@ -1,0 +1,190 @@
+-- {"query": "7073.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2267} 
+with
+-- recent high-activity questions with tag parsing and heuristic title score
+Questions as (
+  select p.*,
+         coalesce(p.Score,0) + coalesce(p.ViewCount,0)/100.0 as RawPopularity,
+         regexp_split_to_table(substring(coalesce(p.Tags,''),2,length(coalesce(p.Tags,''))-2), '\>\<') as Tag
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '730 days' -- last 2 years
+),
+-- aggregate tag metrics
+TagMetrics as (
+  select Tag,
+         count(*) as QuestionsWithTag,
+         avg(RawPopularity) as AvgPopularity,
+         sum(case when Title ilike '%error%' then 1 else 0 end) as ErrorMentions,
+         sum(case when coalesce(AnswerCount,0)=0 then 1 else 0 end) as Unanswered
+  from Questions
+  group by Tag
+),
+-- top tags by adjusted score (favoring popularity, penalizing unanswered)
+TopTags as (
+  select Tag,
+         QuestionsWithTag,
+         AvgPopularity,
+         ErrorMentions,
+         Unanswered,
+         (AvgPopularity * ln(1+QuestionsWithTag) - Unanswered*2 + ErrorMentions*0.5) as TagScore
+  from TagMetrics
+),
+-- recent answers with window functions, correlate to parent question and compute response speed
+Answers as (
+  select a.*,
+         p.Id as QuestionId,
+         p.Title as QuestionTitle,
+         p.CreationDate as QuestionCreated,
+         a.CreationDate as AnswerCreated,
+         extract(epoch from (a.CreationDate - p.CreationDate))/3600.0 as HoursToAnswer,
+         row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate) as AnswerRankByScore,
+         rank() over (partition by a.ParentId order by a.CreationDate) as AnswerChronoRank,
+         count(*) over (partition by a.ParentId) as AnswerCountForQuestion
+  from Posts a
+  left join Posts p on p.Id = a.ParentId and p.PostTypeId = 1
+  where a.PostTypeId = 2
+    and a.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+-- compute user reputation neighborhoods and badge intensity (correlated subquery)
+UserStats as (
+  select u.Id as UserId,
+         u.Reputation,
+         u.CreationDate,
+         u.DisplayName,
+         u.Location,
+         coalesce( (select count(*) from Posts p where p.OwnerUserId = u.Id), 0) as PostsCount,
+         coalesce( (select count(*) from Comments c where c.UserId = u.Id), 0) as CommentsCount,
+         coalesce( (select count(*) from Badges b where b.UserId = u.Id and b.Class = 1), 0) as GoldBadges,
+         coalesce( (select count(*) from Badges b where b.UserId = u.Id and b.Class = 2), 0) as SilverBadges,
+         coalesce( (select count(*) from Badges b where b.UserId = u.Id and b.Class = 3), 0) as BronzeBadges,
+         greatest(1, coalesce( (select sum(coalesce(p.Score,0)) from Posts p where p.OwnerUserId = u.Id), 0)) as PostScoreSum
+  from Users u
+  where u.Reputation is not null
+    and u.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '3650 days'
+),
+-- detect suspiciously high score-to-reputation ratios (possible vote fraud or bounties)
+UserAnomalies as (
+  select us.*,
+         (1.0*PostScoreSum) / nullif(Greatest(1, us.Reputation),0) as ScoreToReputation,
+         (GoldBadges*5 + SilverBadges*2 + BronzeBadges*0.5) as BadgeWeight
+  from UserStats us
+),
+-- combine answers to top tags, join to users and compute composite metrics
+TagAnswerInsights as (
+  select t.Tag,
+         t.TagScore,
+         q.Id as QuestionId,
+         q.Title,
+         q.RawPopularity,
+         a.Id as AnswerId,
+         a.Score as AnswerScore,
+         a.HoursToAnswer,
+         a.AnswerRankByScore,
+         ua.UserId,
+         ua.Reputation,
+         ua.ScoreToReputation,
+         ua.BadgeWeight,
+         -- complex heuristic combining tag score, answer quality and user signal
+         (t.TagScore * 0.7 + coalesce(a.Score,0) * 1.5 + (case when a.HourstoAnswer < 1 then 3 else case when a.HourstoAnswer < 24 then 1 else 0 end end)
+           + (case when ua.Reputation > 10000 then 2 when ua.Reputation > 1000 then 1 else 0 end)
+           - least(5, coalesce(ua.ScoreToReputation,0)) ) as CompositeQuality
+  from TopTags t
+  join Questions q on q.Tag = t.Tag
+  join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+  left join UserAnomalies ua on ua.UserId = a.OwnerUserId
+  where t.QuestionsWithTag > 50
+),
+-- pick best answers per tag using window and fallback to earliest/highest scoring
+BestTagAnswers as (
+  select *
+  from (
+    select tai.*,
+           row_number() over (partition by tai.Tag order by tai.CompositeQuality desc nulls last, tai.AnswerScore desc nulls last, tai.HoursToAnswer asc nulls last) as rn_tag_best
+    from TagAnswerInsights tai
+  ) x
+  where rn_tag_best = 1
+),
+-- posts linked graph expansion (set operator union all to build small graph sample)
+LinkGraph as (
+  select pl.PostId as FromPost, pl.RelatedPostId as ToPost, pl.LinkTypeId, pl.CreationDate
+  from PostLinks pl
+  where pl.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+    and pl.PostId in (select distinct QuestionId from Questions order by random() limit 500)
+  union all
+  select pl.RelatedPostId as FromPost, pl.PostId as ToPost, pl.LinkTypeId, pl.CreationDate
+  from PostLinks pl
+  where pl.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+    and pl.RelatedPostId in (select distinct QuestionId from Questions order by random() limit 500)
+),
+-- compute in-degree/out-degree and tie to post titles (outer joins to include isolated nodes)
+GraphStats as (
+  select p.Id,
+         p.Title,
+         coalesce(indeg.Incoming,0) as Incoming,
+         coalesce(outdeg.Outgoing,0) as Outgoing,
+         coalesce(indeg.Incoming,0) + coalesce(outdeg.Outgoing,0) as TotalLinks
+  from Posts p
+  left join (
+    select ToPost, count(*) as Incoming
+    from LinkGraph
+    group by ToPost
+  ) indeg on indeg.ToPost = p.Id
+  left join (
+    select FromPost, count(*) as Outgoing
+    from LinkGraph
+    group by FromPost
+  ) outdeg on outdeg.FromPost = p.Id
+  where p.PostTypeId = 1
+),
+-- final scoring combining best tag answers, graph centrality, and unanswered pressure via correlated subquery
+FinalRank as (
+  select bta.Tag,
+         bta.QuestionId,
+         bta.Title,
+         bta.AnswerId,
+         bta.OwnerUserId,
+         bta.Reputation,
+         bta.CompositeQuality,
+         gs.TotalLinks,
+         gs.Incoming,
+         gs.Outgoing,
+         -- correlated metric: number of close votes in post history within 90 days of question creation
+         coalesce((
+           select count(*) from PostHistory ph
+           where ph.PostId = bta.QuestionId
+             and ph.PostHistoryTypeId in (10,11,12,13) -- closed/reopened/deleted/undeleted
+             and ph.CreationDate between (select q.CreationDate - interval '1 day' from Posts q where q.Id = bta.QuestionId) and (select q.CreationDate + interval '90 day' from Posts q where q.Id = bta.QuestionId)
+         ),0) as CloseEvents90d,
+         -- final composite rank
+         (bta.CompositeQuality * 2.0 + coalesce(gs.TotalLinks,0) * 0.5 - coalesce((
+            select count(*) from Posts p2 where p2.ParentId = bta.QuestionId and p2.Score < 0
+          ),0) * 0.7 - coalesce((
+            select count(*) from Votes v where v.PostId = bta.QuestionId and v.VoteTypeId = 3
+          ),0) * 1.0 - coalesce((
+            select count(*) from Comments c where c.PostId = bta.QuestionId and c.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+          ),0) * 0.05 + least(5, greatest(0, 5 - CloseEvents90d)) ) as FinalScore
+  from BestTagAnswers bta
+  left join GraphStats gs on gs.Id = bta.QuestionId
+)
+select distinct
+       fr.Tag,
+       fr.QuestionId,
+       left(fr.Title,200) as TitlePreview,
+       fr.AnswerId,
+       fr.OwnerUserId,
+       fr.Reputation,
+       round(fr.CompositeQuality::numeric,4) as CompositeQuality,
+       fr.TotalLinks,
+       fr.Incoming,
+       fr.Outgoing,
+       fr.CloseEvents90d,
+       round(fr.FinalScore::numeric,4) as FinalScore,
+       -- textual synthesis: emulate a short summary using string ops and null logic
+       case
+         when fr.FinalScore > 20 then concat('HOT: ', coalesce(left(fr.Title,140),''), ' — top answer ', coalesce(fr.AnswerId::text,'?'))
+         when fr.FinalScore between 10 and 20 then concat('Notable: ', coalesce(left(fr.Title,140),''), ' (tag: ', fr.Tag, ')')
+         else concat('Watch: ', coalesce(left(fr.Title,140),''), ' — score ', round(fr.FinalScore::numeric,2))
+       end as Summary
+from FinalRank fr
+order by fr.FinalScore desc nulls last, fr.CompositeQuality desc nulls last
+limit 250;

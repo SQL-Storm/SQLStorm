@@ -1,0 +1,103 @@
+-- {"query": "24088.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2838} 
+WITH question_posts AS (
+    /* base set of questions */
+    SELECT
+        p.Id            AS QuestionId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.Reputation    AS OwnerReputation
+    FROM Posts p
+    LEFT JOIN Users u
+        ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1          -- only questions
+),
+tagged AS (
+    /* explode the <tag>…<tag> string into one row per tag */
+    SELECT
+        qp.QuestionId,
+        qp.Title,
+        qp.Score,
+        qp.ViewCount,
+        qp.CreationDate,
+        qp.OwnerReputation,
+        qp.Tags,
+        TRIM(both '>' FROM t.label) AS TagName
+    FROM question_posts qp
+    CROSS JOIN LATERAL
+        unnest(string_to_array(substring(qp.Tags, 2, char_length(qp.Tags)-2), '><')) AS t(label)
+),
+vote_stats AS (
+    /* aggregate up/down votes per question */
+    SELECT
+        t.QuestionId,
+        SUM(CASE WHEN vt.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN vt.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM tagged t
+    LEFT JOIN Votes vt
+        ON vt.PostId = t.QuestionId
+    GROUP BY t.QuestionId
+),
+comment_stats AS (
+    /* number of comments per question */
+    SELECT
+        c.PostId,
+        COUNT(*) AS CommentCnt
+    FROM Comments c
+    GROUP BY c.PostId
+),
+joined_stats AS (
+    SELECT
+        t.QuestionId,
+        t.Title,
+        t.Tags,
+        t.TagName,
+        t.Score,
+        t.ViewCount,
+        t.CreationDate,
+        t.OwnerReputation,
+        COALESCE(vs.UpVotes, 0)    AS UpVotes,
+        COALESCE(vs.DownVotes, 0)  AS DownVotes,
+        COALESCE(cs.CommentCnt, 0) AS CommentCnt
+    FROM tagged t
+    LEFT JOIN vote_stats vs
+        ON vs.QuestionId = t.QuestionId
+    LEFT JOIN comment_stats cs
+        ON cs.PostId = t.QuestionId
+),
+hotness_calc AS (
+    /* compute a “hotness” metric that mixes score, views, votes and comments,
+       with NULL‑safety via NULLIF and COALESCE */
+    SELECT
+        j.*,
+        ( (j.Score * ln(j.ViewCount + 1)) /
+          nullif((j.UpVotes - j.DownVotes + j.CommentCnt + 1), 0)
+        )   AS HotnessScore,
+        /* a hand‑crafted tag group for output */
+        CASE
+            WHEN j.TagName = 'sql'        THEN 'SQL'
+            WHEN j.TagName = 'postgresql' THEN 'PostgreSQL'
+            WHEN j.TagName = 'python'     THEN 'Python'
+            ELSE 'Other'
+        END AS TagGroup
+    FROM joined_stats j
+    WHERE (j.UpVotes + j.DownVotes) > 30   -- threshold for “active”
+      AND j.Score > 5
+),
+ranked AS (
+    /* windowed ranking inside each tag group */
+    SELECT
+        h.*,
+        ROW_NUMBER() OVER (
+            PARTITION BY h.TagGroup
+            ORDER BY h.HotnessScore DESC, h.CreationDate DESC
+        ) AS RankWithinGroup
+    FROM hotness_calc h
+)
+SELECT *
+FROM ranked
+WHERE RankWithinGroup <= 5              -- top‑5 per group
+ORDER BY TagGroup, RankWithinGroup;

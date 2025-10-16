@@ -1,0 +1,219 @@
+-- {"query": "4072.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2124} 
+with RecursiveTagDepth as (
+    select
+        t.Id,
+        t.TagName,
+        1 as Depth,
+        array[t.TagName] as Path
+    from Tags t
+    where not t.TagName like '% %'
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        rtd.Depth + 1,
+        rtd.Path || t2.TagName
+    from Tags t2
+    join RecursiveTagDepth rtd on t2.TagName <@ rtd.Path
+    where array_position(rtd.Path, t2.TagName) is null
+),
+TopUsersBadgeCounts as (
+    select
+        u.Id user_id,
+        u.DisplayName,
+        count(distinct b.Id) as BadgeCount,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+        row_number() over (order by count(distinct b.Id) desc nulls last) as UserRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+    having count(distinct b.Id) > 0
+),
+PostScoresWindow as (
+    select
+        p.Id,
+        p.PostTypeId,
+        coalesce(p.Score,0) as Score,
+        p.OwnerUserId,
+        p.CreationDate,
+        rank() over (partition by p.PostTypeId order by coalesce(p.Score,0) desc nulls last) as ScoreRank,
+        dense_rank() over (partition by p.PostTypeId order by coalesce(p.Score,0) desc nulls last) as DenseScoreRank,
+        ntile(10) over (partition by p.PostTypeId order by coalesce(p.Score,0)) as ScoreDecile
+    from Posts p
+    where p.CreationDate > cast('2024-10-01' as date) - interval '5 years'
+),
+AcceptedAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.AcceptedAnswerId,
+        a.Score as AcceptedAnswerScore,
+        (select count(*) from Votes v where v.PostId = a.Id and v.VoteTypeId = 2) as AcceptedAnswerUpVotes,
+        (select count(*) from Votes v where v.PostId = q.Id and v.VoteTypeId = 2) as QuestionUpVotes,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        length(coalesce(q.Body,'')) as QuestionBodyLength,
+        length(coalesce(a.Body,'')) as AnswerBodyLength,
+        q.Tags,
+        q.OwnerUserId,
+        u.Reputation as OwnerReputation
+    from Posts q
+    left join Posts a on a.Id = q.AcceptedAnswerId
+    left join Users u on u.Id = q.OwnerUserId
+    where q.PostTypeId = 1 and q.AcceptedAnswerId is not null
+    and q.Score >= 0
+),
+PostLinkDetails as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName,
+        p1.PostTypeId as PostType,
+        p2.PostTypeId as RelatedPostType,
+        p1.Score as PostScore,
+        p2.Score as RelatedPostScore
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    left join Posts p1 on p1.Id = pl.PostId
+    left join Posts p2 on p2.Id = pl.RelatedPostId
+),
+UserActivitySummary as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        count(distinct b.Id) as BadgeCount,
+        max(p.CreationDate) as LastPostDate,
+        min(p.CreationDate) as FirstPostDate,
+        case 
+            when max(p.CreationDate) is not null and min(p.CreationDate) is not null 
+            then extract(day from max(p.CreationDate) - min(p.CreationDate)) 
+            else null 
+        end as ActiveDaysSpan,
+        u.Reputation,
+        u.LastAccessDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.LastAccessDate
+),
+-- Correlated subquery exploiting NULL logic and string patterns in Posts.Tags and filtering by user activity
+ComplexFilteredPosts as (
+    select 
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        u.DisplayName,
+        u.Reputation,
+        case 
+            when p.AcceptedAnswerId is not null then 'Accepted'
+            when exists (select 1 from Votes v where v.PostId = p.Id and v.VoteTypeId = 2) then 'Upvoted'
+            else 'Other'
+        end as PostStatus,
+        (select count(*) from Comments c where c.PostId = p.Id) as CommentCount,
+        string_agg(distinct lt.Name, ', ') as LinkTypes
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    left join PostLinks pl on pl.PostId = p.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where 
+        p.PostTypeId = 1 
+        and p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+        and (
+            p.Tags is not null and 
+            (position('<python>' in lower(p.Tags)) > 0 or position('<sql>' in lower(p.Tags)) > 0)
+        )
+        and u.Reputation > 1000
+    group by p.Id, p.Title, p.Tags, p.CreationDate, p.Score, u.DisplayName, u.Reputation
+),
+UnionAllUserPosts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        1 as IsQuestion,
+        0 as IsAnswer,
+        p.CreationDate
+    from Users u
+    join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+    where u.Reputation > 5000
+    union all
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        0 as IsQuestion,
+        1 as IsAnswer,
+        p.CreationDate
+    from Users u
+    join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 2
+    where u.Reputation > 5000
+),
+UserPostsRanked as (
+    select
+        uup.*,
+        row_number() over (partition by uup.UserId order by uup.Score desc, uup.CreationDate desc) as PostRank,
+        count(*) over (partition by uup.UserId) as TotalPosts
+    from UnionAllUserPosts uup
+),
+TopRankedUserPosts as (
+    select *
+    from UserPostsRanked
+    where PostRank <= 3
+)
+select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    uas.QuestionCount,
+    uas.AnswerCount,
+    uas.CommentCount,
+    uas.BadgeCount,
+    uas.ActiveDaysSpan,
+    acs.QuestionId,
+    acs.AcceptedAnswerId,
+    acs.AcceptedAnswerScore,
+    acs.QuestionScore,
+    acs.ViewCount,
+    acs.Tags,
+    cfp.Title as PopularPythonOrSqlQuestion,
+    cfp.PostStatus,
+    cfp.CommentCount as QuestionCommentCount,
+    cfp.LinkTypes,
+    tsbc.BadgeCount as TotalBadges,
+    tsbc.GoldBadges,
+    tsbc.SilverBadges,
+    tsbc.BronzeBadges,
+    group_concat(pld.LinkTypeName, ', ') as RelatedLinkTypes,
+    trdp.Depth as TagDepthLevel,
+    trdp.Path as TagPath,
+    trdp.TagName as TagNameExample
+from Users u
+left join UserActivitySummary uas on uas.UserId = u.Id
+left join AcceptedAnswerStats acs on acs.OwnerUserId = u.Id
+left join ComplexFilteredPosts cfp on cfp.DisplayName = u.DisplayName
+left join TopUsersBadgeCounts tsbc on tsbc.user_id = u.Id
+left join PostLinkDetails pld on pld.PostId = acs.QuestionId
+left join RecursiveTagDepth trdp on trdp.TagName = any(string_to_array(replace(replace(acs.Tags, '<', ''), '>', ''), ' '))
+where u.Reputation > 1000
+group by
+    u.Id, u.DisplayName, u.Reputation, uas.QuestionCount, uas.AnswerCount, uas.CommentCount, uas.BadgeCount, uas.ActiveDaysSpan,
+    acs.QuestionId, acs.AcceptedAnswerId, acs.AcceptedAnswerScore, acs.QuestionScore, acs.ViewCount, acs.Tags,
+    cfp.Title, cfp.PostStatus, cfp.CommentCount, cfp.LinkTypes,
+    tsbc.BadgeCount, tsbc.GoldBadges, tsbc.SilverBadges, tsbc.BronzeBadges,
+    trdp.Depth, trdp.Path, trdp.TagName
+order by
+    u.Reputation desc,
+    acs.QuestionScore desc nulls last,
+    acs.AcceptedAnswerScore desc nulls last
+limit 100;

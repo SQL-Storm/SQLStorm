@@ -1,0 +1,172 @@
+WITH RECURSIVE user_influence_tree AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        0 AS depth_level,
+        CAST(u.Id AS VARCHAR(1000)) AS path
+    FROM Users u
+    WHERE u.Reputation > 10000
+        AND EXTRACT(YEAR FROM u.CreationDate) >= 2015
+
+    UNION ALL
+
+    SELECT 
+        u2.Id,
+        u2.DisplayName,
+        u2.Reputation,
+        u2.CreationDate,
+        uit.depth_level + 1,
+        CAST(uit.path || '->' || CAST(u2.Id AS VARCHAR(1000)) AS VARCHAR(1000)) AS path
+    FROM user_influence_tree uit
+    INNER JOIN Comments c ON uit.Id = c.UserId
+    INNER JOIN Posts p ON c.PostId = p.Id
+    INNER JOIN Users u2 ON p.OwnerUserId = u2.Id
+    WHERE uit.depth_level < 3
+        AND u2.Id NOT IN (
+            SELECT CAST(regexp_split_to_table(uit.path, '->') AS INTEGER)
+        )
+),
+post_engagement_metrics AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpvoteCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownvoteCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS user_post_rank,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC NULLS LAST) AS global_view_rank,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS prev_post_score,
+        (LEAD(p.CreationDate, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) - p.CreationDate) AS time_to_next_post,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            WHEN p.AnswerCount > 0 THEN 'Unanswered'
+            ELSE 'NoActivity'
+        END AS post_status,
+        STRING_AGG(DISTINCT SUBSTRING(COALESCE(c.Text, ''), 1, 50), ' | ' ORDER BY SUBSTRING(COALESCE(c.Text, ''), 1, 50)) AS sample_comments
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN Comments c ON p.Id = c.PostId AND c.Score >= 0
+    WHERE p.CreationDate >= DATE '2018-01-01'
+        AND (p.PostTypeId = 1 OR p.PostTypeId = 2)
+    GROUP BY p.Id, p.PostTypeId, p.Score, p.ViewCount, p.AnswerCount, p.OwnerUserId, 
+             p.CreationDate, p.ClosedDate, p.AcceptedAnswerId
+),
+tag_performance AS (
+    SELECT 
+        tag_name,
+        AVG(p.Score) AS avg_score,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.ViewCount) AS median_views,
+        COUNT(*) AS question_count,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) * 1.0 / NULLIF(COUNT(*), 0) AS answer_rate
+    FROM (
+        SELECT p.*, UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tag_name
+        FROM Posts p
+        WHERE p.PostTypeId = 1 
+            AND p.Tags IS NOT NULL
+            AND p.CreationDate >= DATE '2019-01-01'
+    ) p
+    GROUP BY tag_name
+    HAVING COUNT(*) >= 50
+),
+badge_collector_analysis AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS gold_badges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS silver_badges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS bronze_badges,
+        MAX(b.Date) - MIN(b.Date) AS badge_timespan,
+        ARRAY_AGG(DISTINCT b.Name ORDER BY b.Name) FILTER (WHERE b.Class = 1) AS gold_badge_names
+    FROM Users u
+    INNER JOIN Badges b ON u.Id = b.UserId
+    WHERE b.Date >= DATE '2017-01-01'
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(DISTINCT b.Id) > 10
+)
+SELECT 
+    uit.DisplayName AS influencer_name,
+    uit.Reputation AS influencer_reputation,
+    uit.depth_level,
+    pem.PostId,
+    pem.post_status,
+    pem.user_post_rank,
+    pem.global_view_rank,
+    COALESCE(pem.UpvoteCount, 0) - COALESCE(pem.DownvoteCount, 0) AS net_votes,
+    ROUND(CAST(pem.Score AS NUMERIC) / NULLIF(EXTRACT(EPOCH FROM pem.time_to_next_post) / 86400.0, 0), 2) AS score_velocity,
+    tp.tag_name AS top_tag,
+    tp.avg_score AS tag_avg_score,
+    tp.answer_rate AS tag_answer_rate,
+    bca.gold_badges,
+    bca.silver_badges,
+    bca.bronze_badges,
+    CASE 
+        WHEN bca.gold_badges >= 5 THEN 'Expert'
+        WHEN bca.silver_badges >= 20 THEN 'Advanced'
+        WHEN bca.bronze_badges >= 50 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END AS user_tier,
+    COALESCE(ph_count.edit_count, 0) AS total_edits,
+    COALESCE(link_stats.linked_posts, 0) AS linked_posts_count,
+    pem.sample_comments
+FROM user_influence_tree uit
+LEFT JOIN post_engagement_metrics pem ON 1=1
+LEFT JOIN Posts p ON pem.PostId = p.Id
+LEFT JOIN tag_performance tp ON EXISTS (
+    SELECT 1 
+    FROM (
+        SELECT UNNEST(string_to_array(substring(COALESCE(p.Tags, '<>'), 2, length(COALESCE(p.Tags, '<>'))-2), '><')) AS post_tag
+    ) t
+    WHERE t.post_tag = tp.tag_name
+)
+LEFT JOIN badge_collector_analysis bca ON uit.Id = bca.UserId
+LEFT JOIN LATERAL (
+    SELECT COUNT(*) AS edit_count
+    FROM PostHistory ph
+    WHERE ph.UserId = uit.Id
+        AND ph.PostHistoryTypeId IN (4, 5, 6)
+        AND ph.CreationDate >= (DATE '2024-10-01' - INTERVAL '365 days')
+) ph_count ON true
+LEFT JOIN LATERAL (
+    SELECT COUNT(DISTINCT pl.RelatedPostId) AS linked_posts
+    FROM PostLinks pl
+    WHERE pl.PostId = pem.PostId
+        AND pl.LinkTypeId = 1
+) link_stats ON true
+WHERE (pem.user_post_rank <= 10 OR pem.user_post_rank IS NULL)
+    AND (tp.question_count >= 100 OR tp.question_count IS NULL)
+    AND uit.depth_level <= 2
+    AND (pem.Score > 5 OR pem.Score IS NULL)
+GROUP BY
+    uit.DisplayName,
+    uit.Reputation,
+    uit.depth_level,
+    pem.PostId,
+    pem.post_status,
+    pem.user_post_rank,
+    pem.global_view_rank,
+    pem.UpvoteCount,
+    pem.DownvoteCount,
+    pem.Score,
+    pem.time_to_next_post,
+    tp.tag_name,
+    tp.avg_score,
+    tp.answer_rate,
+    tp.question_count,
+    bca.gold_badges,
+    bca.silver_badges,
+    bca.bronze_badges,
+    ph_count.edit_count,
+    link_stats.linked_posts,
+    pem.sample_comments
+ORDER BY 
+    CASE WHEN bca.gold_badges IS NULL THEN 1 ELSE 0 END,
+    bca.gold_badges DESC,
+    pem.global_view_rank ASC,
+    net_votes DESC
+LIMIT 500;

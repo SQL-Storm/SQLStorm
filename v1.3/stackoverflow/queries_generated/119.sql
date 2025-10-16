@@ -1,0 +1,239 @@
+-- {"query": "119.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 2452} 
+with
+-- basic time boundary
+params as (
+  select (current_timestamp - interval '365 days')::timestamp as since
+),
+-- posts in last year
+recent_posts as (
+  select p.*
+  from Posts p
+  cross join params
+  where p.CreationDate >= params.since
+),
+-- answers and questions split
+answers as (
+  select p.*
+  from recent_posts p
+  where p.PostTypeId = 2
+),
+questions as (
+  select p.*
+  from recent_posts p
+  where p.PostTypeId = 1
+),
+-- per-user aggregates (answers & questions)
+user_post_aggs as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    count(distinct q.Id) filter (where q.Id is not null) as q_count,
+    count(distinct a.Id) filter (where a.Id is not null) as a_count,
+    coalesce(sum(a.Score),0) as total_answer_score,
+    avg(nullif(a.Score,0)) filter (where a.Score is not null) over () as global_avg_nonzero_ans_score, -- window for noise
+    max(a.Score) as best_answer_score,
+    sum(q.ViewCount) as q_views,
+    -- ratio with safe null handling
+    case when count(distinct q.Id) = 0 then null
+         else round( (count(distinct a.Id)::numeric / count(distinct q.Id))::numeric, 3)
+    end as answers_per_question_ratio
+  from Users u
+  left join questions q on q.OwnerUserId = u.Id
+  left join answers a on a.OwnerUserId = u.Id
+  group by u.Id, u.DisplayName
+),
+-- badge counts and recent top badge
+badge_aggs as (
+  select
+    b.UserId,
+    count(*) as badges_total,
+    count(*) filter (where b.Class = 1) as badges_gold,
+    count(*) filter (where b.Class = 2) as badges_silver,
+    count(*) filter (where b.Class = 3) as badges_bronze,
+    max(b.Date) as last_badge_date,
+    -- most frequent badge name via a window
+    (select Name from (
+        select Name, row_number() over (order by count(*) desc, max(Date) desc) rn
+        from Badges bb
+        where bb.UserId = b.UserId
+        group by Name
+    ) t where rn = 1) as top_badge_name
+  from Badges b
+  group by b.UserId
+),
+-- user favorites: distinct users who favorited posts of this user's questions (via Votes VoteTypeId=5)
+user_favoriters as (
+  select
+    q.OwnerUserId as UserId,
+    count(distinct v.UserId) filter (where v.UserId is not null) as distinct_favoriters,
+    count(v.Id) filter (where v.VoteTypeId = 5) as favorite_count,
+    max(v.CreationDate) as last_favorite_date
+  from Posts q
+  join Votes v on v.PostId = q.Id
+  where q.PostTypeId = 1
+  group by q.OwnerUserId
+),
+-- explode tags (PostTypeId=1 only) and associate with owner
+tag_exploded as (
+  select
+    p.Id as PostId,
+    p.OwnerUserId,
+    trim(both ' ' from t) as Tag
+  from Posts p
+  cross join lateral (
+    select regexp_split_to_table(substring(p.Tags from 2 for char_length(p.Tags)-2), '><') as t
+  ) s
+  where p.PostTypeId = 1 and p.Tags is not null and p.Tags <> ''
+),
+-- per-user tag affinity (top tag)
+user_top_tag as (
+  select
+    te.OwnerUserId as UserId,
+    te.Tag,
+    count(*) as cnt,
+    row_number() over (partition by te.OwnerUserId order by count(*) desc, max(p.CreationDate) desc) rn
+  from tag_exploded te
+  join Posts p on p.Id = te.PostId
+  group by te.OwnerUserId, te.Tag
+),
+user_top_tag_picked as (
+  select UserId, Tag as top_tag from user_top_tag where rn = 1
+),
+-- answers performance per tag (join answers to parent question tags)
+answer_tag_performance as (
+  select
+    a.OwnerUserId as UserId,
+    te.Tag,
+    count(*) as answers_in_tag,
+    avg(a.Score) as avg_answer_score_in_tag,
+    percentile_cont(0.5) within group (order by a.Score) as median_score
+  from Posts a
+  join Posts q on a.ParentId = q.Id and q.PostTypeId = 1
+  cross join lateral (
+    select regexp_split_to_table(substring(q.Tags from 2 for char_length(q.Tags)-2), '><') as t
+  ) s
+  join tag_exploded te on te.PostId = q.Id and te.Tag = trim(both ' ' from s.t)
+  where a.PostTypeId = 2 and a.OwnerUserId is not null
+  group by a.OwnerUserId, te.Tag
+),
+-- correlate top tag performance (correlated subquery example)
+user_top_tag_perf as (
+  select
+    u.Id as UserId,
+    (select atp.avg_answer_score_in_tag
+     from answer_tag_performance atp
+     where atp.UserId = u.Id
+       and atp.Tag = ut.top_tag
+     limit 1) as avg_score_in_top_tag
+  from Users u
+  left join user_top_tag_picked ut on ut.UserId = u.Id
+),
+-- assemble master row set with various joins, including full outer join to catch users with badges but no posts and vice versa
+master as (
+  select
+    up.UserId,
+    coalesce(up.DisplayName, b.UserId::text) as DisplayName,
+    up.q_count,
+    up.a_count,
+    up.total_answer_score,
+    up.best_answer_score,
+    up.q_views,
+    up.answers_per_question_ratio,
+    coalesce(bg.badges_total,0) as badges_total,
+    coalesce(uf.distinct_favoriters,0) as distinct_favoriters,
+    ut.top_tag,
+    utp.avg_score_in_top_tag,
+    -- activity recency: most recent of various dates via left joins and subqueries
+    greatest(
+      coalesce((select max(CreationDate) from Posts p where p.OwnerUserId = up.UserId), '1970-01-01'::timestamp),
+      coalesce(bg.last_badge_date, '1970-01-01'::timestamp),
+      coalesce(uf.last_favorite_date, '1970-01-01'::timestamp)
+    ) as last_activity,
+    -- computed score like an influence metric with NULL and sign handling and a heavy expression
+    (
+      coalesce(up.total_answer_score,0) * greatest(1, coalesce(up.a_count,0))
+      + coalesce(bg.badges_gold,0) * 50
+      + coalesce(bg.badges_silver,0) * 10
+      - coalesce(u.DownVotes,0) * 0.5
+    )::numeric(18,3) as influence_score
+  from user_post_aggs up
+  full outer join badge_aggs bg on bg.UserId = up.UserId
+  full outer join Users u on u.Id = coalesce(up.UserId, bg.UserId)
+  left join user_favoriters uf on uf.UserId = coalesce(up.UserId, bg.UserId)
+  left join user_top_tag_picked ut on ut.UserId = coalesce(up.UserId, bg.UserId)
+  left join user_top_tag_perf utp on utp.UserId = coalesce(up.UserId, bg.UserId)
+),
+-- filter and rank: find top contributors but include some anomalies using set operators
+top_influencers as (
+  select *
+  from master
+  where influence_score is not null
+  order by influence_score desc nulls last
+  limit 200
+),
+-- include some long-tail qualifying users via a second select and union (set operator)
+long_tail as (
+  select *
+  from master
+  where coalesce(a_count,0) >= 1 and coalesce(q_count,0) = 0 and badges_total >= 1
+  order by coalesce(a_count,0) desc
+  limit 50
+),
+combined as (
+  select * from top_influencers
+  union
+  select * from long_tail
+),
+-- final analytics with window functions
+final as (
+  select
+    c.*,
+    row_number() over (order by influence_score desc nulls last) as rank_overall,
+    rank() over (partition by top_tag order by influence_score desc nulls last) as rank_within_tag,
+    ntile(10) over (order by influence_score desc nulls last) as decile,
+    -- show a textual composite for testing string ops and null logic
+    concat_ws(' | ',
+      coalesce(DisplayName,'<anon>'),
+      coalesce(top_tag,'(no-top-tag)'),
+      'inf:'||coalesce(influence_score::text,'0'),
+      'fav:'||coalesce(distinct_favoriters::text,'0')
+    ) as debug_label
+  from combined c
+)
+-- final output: include an expensive correlated scalar subquery to fetch top 3 recent posts titles per user concatenated
+select
+  f.rank_overall,
+  f.UserId,
+  f.DisplayName,
+  f.top_tag,
+  f.q_count,
+  f.a_count,
+  f.best_answer_score,
+  f.q_views,
+  f.badges_total,
+  f.distinct_favoriters,
+  f.influence_score,
+  f.rank_within_tag,
+  f.decile,
+  f.debug_label,
+  -- correlated subquery: top 3 recent post titles (questions or answers' parents) with null-safe concatenation
+  (
+    select string_agg(coalesce(sub.title, '[no-title]') || '::' || coalesce(to_char(sub.CreationDate,'YYYY-MM-DD'),''), ' || ')
+    from (
+      select p.Title, p.CreationDate
+      from Posts p
+      where (p.OwnerUserId = f.UserId or (p.OwnerUserId is null and p.OwnerDisplayName = f.DisplayName))
+      order by p.CreationDate desc nulls last
+      limit 3
+    ) sub
+  ) as top3_recent_titles,
+  -- another correlated scalar: median comment length on user's posts
+  (
+    select percentile_cont(0.5) within group (order by char_length(coalesce(c.Text,'')))
+    from Posts p2
+    join Comments c on c.PostId = p2.Id
+    where p2.OwnerUserId = f.UserId
+  ) as median_comment_length
+from final f
+order by f.rank_overall
+limit 250;

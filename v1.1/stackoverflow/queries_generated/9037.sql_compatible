@@ -1,0 +1,113 @@
+WITH RecentPosts AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.OwnerUserId
+            ORDER BY p.CreationDate DESC
+        ) AS rn
+    FROM Posts p
+    WHERE p.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days'
+), 
+TopAnswers AS (
+    SELECT
+        q.OwnerUserId,
+        COUNT(*) FILTER (WHERE a.Score >= 5)        AS HighlyVotedAnswers,
+        CAST(AVG(a.Score) AS numeric(10,2))         AS AvgAnswerScore
+    FROM Posts a
+    JOIN Posts q
+      ON a.ParentId = q.Id
+     AND q.PostTypeId = 1
+    WHERE a.PostTypeId = 2
+    GROUP BY q.OwnerUserId
+),
+BadgeAgg AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1)         AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2)         AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3)         AS BronzeBadges,
+        STRING_AGG(DISTINCT b.Name, ', ')           AS BadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+),
+MainUsers AS (
+SELECT
+    u.Id                                                   AS UserId,
+    u.DisplayName,
+    COALESCE(r.q_count, 0)                                 AS RecentQuestionCount,
+    COALESCE(r.a_count, 0)                                 AS RecentAnswerCount,
+    COALESCE(ta.HighlyVotedAnswers, 0)                     AS HighlyVotedAnswers,
+    COALESCE(ta.AvgAnswerScore,     0)                     AS AvgAnswerScore,
+    COALESCE(ba.GoldBadges,         0)                     AS GoldBadges,
+    COALESCE(ba.SilverBadges,       0)                     AS SilverBadges,
+    COALESCE(ba.BronzeBadges,       0)                     AS BronzeBadges,
+    CASE
+        WHEN u.Reputation > 10000 THEN 'HighRep'
+        WHEN u.Reputation BETWEEN 1000 AND 10000 THEN 'MidRep'
+        ELSE 'LowRep'
+    END                                                    AS RepBracket,
+    COALESCE(NULLIF(TRIM(u.Location), ''), 'Unknown')      AS Loc,
+    (
+      SELECT COUNT(*)
+      FROM Comments c
+      WHERE c.UserId = u.Id
+        AND c.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+    )                                                      AS RecentComments,
+    ROW_NUMBER() OVER (
+        ORDER BY u.Reputation DESC, u.CreationDate
+    )                                                      AS RankGlobal,
+    RANK() OVER (
+        PARTITION BY
+        CASE
+            WHEN u.Reputation > 10000 THEN 'HighRep'
+            WHEN u.Reputation BETWEEN 1000 AND 10000 THEN 'MidRep'
+            ELSE 'LowRep'
+        END
+        ORDER BY u.Views DESC
+    )                                                      AS RankByRepBracket
+FROM Users u
+LEFT JOIN (
+    SELECT
+        OwnerUserId,
+        SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END)     AS q_count,
+        SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END)     AS a_count
+    FROM RecentPosts
+    GROUP BY OwnerUserId
+) r  ON u.Id = r.OwnerUserId
+LEFT JOIN TopAnswers ta ON u.Id = ta.OwnerUserId
+LEFT JOIN BadgeAgg ba  ON u.Id = ba.UserId
+WHERE u.CreationDate < CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 day'
+  AND EXISTS (
+      SELECT 1
+      FROM Votes v
+      WHERE v.UserId     = u.Id
+        AND v.VoteTypeId IN (2,3)
+        AND v.CreationDate BETWEEN u.CreationDate AND u.LastAccessDate
+  )
+  AND (u.EmailHash IS NOT NULL OR u.WebsiteUrl LIKE 'http%')
+)
+SELECT *
+FROM MainUsers
+ORDER BY RankGlobal
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    -1                    AS UserId,
+    'N/A'                 AS DisplayName,
+    0                     AS RecentQuestionCount,
+    0                     AS RecentAnswerCount,
+    0                     AS HighlyVotedAnswers,
+    CAST(0 AS numeric(10,2)) AS AvgAnswerScore,
+    0                     AS GoldBadges,
+    0                     AS SilverBadges,
+    0                     AS BronzeBadges,
+    'LowRep'              AS RepBracket,
+    'Unknown'             AS Loc,
+    0                     AS RecentComments,
+    0                     AS RankGlobal,
+    0                     AS RankByRepBracket;

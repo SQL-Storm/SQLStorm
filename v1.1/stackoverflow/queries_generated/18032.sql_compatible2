@@ -1,0 +1,106 @@
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.CreationDate,
+      ph.PostHistoryTypeId,
+      pht.Name AS HistoryTypeName,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht
+      ON ph.PostHistoryTypeId = pht.Id
+    WHERE
+      ph.UserId IS NOT NULL AND ph.PostHistoryTypeId IN (4, 5, 6)
+  ),
+  UserContribution AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COALESCE(u.Reputation, 0) AS Reputation,
+      COUNT(DISTINCT p.Id) AS QuestionCount,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgeCount,
+      SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgeCount,
+      SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgeCount,
+      AVG(COALESCE(p.Score, 0)) AS AvgPostScore,
+      MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b
+      ON u.Id = b.UserId
+    WHERE
+      u.CreationDate >= DATE '2023-01-01'
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation
+  ),
+  PostEngagement AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.Score,
+      p.ViewCount,
+      p.FavoriteCount,
+      (
+        SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id
+      ) AS CommentCount,
+      (
+        SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2
+      ) AS UpVoteCount,
+      (
+        SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3
+      ) AS DownVoteCount
+    FROM Posts p
+    WHERE
+      p.PostTypeId = 1
+  )
+SELECT
+  pe.PostId,
+  pe.Title,
+  uc.DisplayName AS OwnerDisplayName,
+  uc.Reputation,
+  uc.QuestionCount,
+  uc.AnswerCount,
+  uc.GoldBadgeCount,
+  uc.SilverBadgeCount,
+  uc.BronzeBadgeCount,
+  pe.Score,
+  pe.ViewCount,
+  pe.FavoriteCount,
+  pe.CommentCount,
+  pe.UpVoteCount,
+  pe.DownVoteCount,
+  rpe.CreationDate AS LastEditDate,
+  rpe.HistoryTypeName AS LastEditType,
+  CASE
+    WHEN COALESCE(pe.FavoriteCount, 0) > 100 AND COALESCE(pe.UpVoteCount, 0) > 500 THEN 'Highly Engaged'
+    WHEN COALESCE(pe.ViewCount, 0) > 10000 THEN 'Popular'
+    WHEN COALESCE(pe.CommentCount, 0) > 20 OR COALESCE(uc.AnswerCount, 0) > 10 THEN 'Discussed'
+    ELSE 'Standard'
+  END AS EngagementCategory,
+  CASE
+    WHEN uc.LastPostDate < (cast('2024-10-01' as date) - INTERVAL '1 year') THEN 'Inactive Contributor'
+    ELSE 'Active Contributor'
+  END AS ContributorStatus,
+  COALESCE(uc.AvgPostScore, 0) AS AverageScore,
+  COALESCE(pe.FavoriteCount, 0) AS SafeFavoriteCount,
+  SUBSTR(pe.Title, 1, 50) AS TitlePrefix,
+  LENGTH(pe.Title) AS TitleLength,
+  (COALESCE(pe.UpVoteCount, 0) - COALESCE(pe.DownVoteCount, 0)) AS NetVotes
+FROM PostEngagement pe
+JOIN UserContribution uc
+  ON pe.OwnerUserId = uc.UserId
+LEFT JOIN RankedPostEdits rpe
+  ON pe.PostId = rpe.PostId AND rpe.rn = 1
+WHERE
+  COALESCE(pe.Score, 0) > 10
+  AND COALESCE(uc.Reputation, 0) > 1000
+  AND pe.CreationDate BETWEEN DATE '2023-01-01' AND DATE '2023-12-31'
+ORDER BY
+  pe.Score DESC,
+  pe.ViewCount DESC;

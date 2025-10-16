@@ -1,0 +1,121 @@
+WITH RECURSIVE RecursivePostsCTE AS (
+    SELECT p.Id, p.PostTypeId, p.AcceptedAnswerId, p.ParentId, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId,
+           1 AS Depth,
+           ARRAY[p.Id] AS Path
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Score > 10
+      AND p.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+
+    UNION ALL
+
+    SELECT c.Id, c.PostTypeId, c.AcceptedAnswerId, c.ParentId, c.CreationDate, c.Score, c.ViewCount, c.OwnerUserId,
+           r.Depth + 1,
+           r.Path || c.Id
+    FROM Posts c
+    JOIN RecursivePostsCTE r ON c.ParentId = r.Id
+    WHERE c.Score > 5
+      AND NOT c.Id = ANY (r.Path)
+      AND r.Depth < 3
+),
+UserBadgeCounts AS (
+    SELECT b.UserId,
+           COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+           COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+           COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+           BOOL_OR(b.TagBased) AS HasTagBasedBadge
+    FROM Badges b
+    GROUP BY b.UserId
+),
+LatestPostHistory AS (
+    SELECT ph.PostId, ph.PostHistoryTypeId, ph.CreationDate,
+           ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10,11,19,20)
+),
+FilteredPostHistory AS (
+    SELECT lph.PostId, lph.PostHistoryTypeId, lph.CreationDate
+    FROM LatestPostHistory lph
+    WHERE lph.rn = 1
+),
+UserActivityWindow AS (
+    SELECT u.Id AS UserId, u.DisplayName,
+           COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) OVER (PARTITION BY u.Id ORDER BY p.CreationDate ROWS BETWEEN 29 PRECEDING AND CURRENT ROW) AS QuestionsLast30Days,
+           COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) OVER (PARTITION BY u.Id ORDER BY p.CreationDate ROWS BETWEEN 29 PRECEDING AND CURRENT ROW) AS AnswersLast30Days,
+           MAX(u.Reputation) OVER (PARTITION BY u.Id) AS UserReputation
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+),
+TopScoringAnswers AS (
+    SELECT a.Id, a.ParentId, a.Score,
+           ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+QuestionAnswerSummary AS (
+    SELECT q.Id AS QuestionId,
+           q.Title,
+           q.Tags,
+           q.Score AS QuestionScore,
+           q.ViewCount AS QuestionViews,
+           q.OwnerUserId,
+           COALESCE(SUM(a.Score), 0) AS TotalAnswerScore,
+           MAX(a.Score) AS MaxAnswerScore,
+           COUNT(a.Id) AS AnswerCount
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.Tags, q.Score, q.ViewCount, q.OwnerUserId
+),
+DuplicatedQuestions AS (
+    SELECT pl.PostId AS QuestionId, pl.RelatedPostId AS DuplicateOf
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId AND lt.Name = 'Duplicate'
+    WHERE EXISTS (
+        SELECT 1 FROM Posts p WHERE p.Id = pl.PostId AND p.PostTypeId = 1
+    )
+      AND EXISTS (
+        SELECT 1 FROM Posts rp WHERE rp.Id = pl.RelatedPostId AND rp.PostTypeId = 1
+    )
+)
+SELECT qas.QuestionId,
+       LEFT(qas.Title, 100) || CASE WHEN LENGTH(qas.Title) > 100 THEN '...' ELSE '' END AS ShortTitle,
+       qas.QuestionScore,
+       qas.QuestionViews,
+       qas.AnswerCount,
+       qas.TotalAnswerScore,
+       qas.MaxAnswerScore,
+       COALESCE(dq.DuplicateOf, NULL) AS DuplicateOfQuestionId,
+       ub.GoldBadges,
+       ub.SilverBadges,
+       ub.BronzeBadges,
+       ub.HasTagBasedBadge,
+       fa.Id AS TopAnswerId,
+       fa.Score AS TopAnswerScore,
+       fa.CreationDate AS TopAnswerCreationDate,
+       fph.PostHistoryTypeId AS LatestClosureOrProtectionType,
+       fph.CreationDate AS LatestClosureOrProtectionDate,
+       ua.QuestionsLast30Days,
+       ua.AnswersLast30Days,
+       ua.UserReputation,
+       STRING_AGG(DISTINCT pt.Name, ', ') AS PostTypesInThread,
+       MAX(phwp.PostHistoryTypeId) AS MaxPostHistoryTypeInThread
+FROM QuestionAnswerSummary qas
+LEFT JOIN Users u ON u.Id = qas.OwnerUserId
+LEFT JOIN UserBadgeCounts ub ON ub.UserId = qas.OwnerUserId
+LEFT JOIN TopScoringAnswers fa ON fa.ParentId = qas.QuestionId AND fa.AnswerRank = 1
+LEFT JOIN FilteredPostHistory fph ON fph.PostId = qas.QuestionId
+LEFT JOIN DuplicatedQuestions dq ON dq.QuestionId = qas.QuestionId
+LEFT JOIN UserActivityWindow ua ON ua.UserId = qas.OwnerUserId
+LEFT JOIN LATERAL (
+    SELECT pth_inner.*
+    FROM RecursivePostsCTE r2
+    JOIN Posts pth_inner ON pth_inner.Id = ANY(r2.Path)
+    WHERE r2.Path[1] = qas.QuestionId
+) pth ON true
+LEFT JOIN PostTypes pt ON pt.Id = pth.PostTypeId
+LEFT JOIN PostHistory phwp ON phwp.PostId = pth.Id
+GROUP BY qas.QuestionId, qas.Title, qas.QuestionScore, qas.QuestionViews, qas.AnswerCount, qas.TotalAnswerScore, qas.MaxAnswerScore, dq.DuplicateOf, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ub.HasTagBasedBadge, fa.Id, fa.Score, fa.CreationDate, fph.PostHistoryTypeId, fph.CreationDate, ua.QuestionsLast30Days, ua.AnswersLast30Days, ua.UserReputation
+HAVING COALESCE(qas.AnswerCount, 0) > 0
+ORDER BY qas.TotalAnswerScore DESC, qas.QuestionScore DESC
+LIMIT 100;

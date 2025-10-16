@@ -1,0 +1,129 @@
+WITH UserBadgeCounts AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id
+),
+PostTypeStats AS (
+    SELECT
+        pt.Id AS PostTypeId,
+        pt.Name AS PostTypeName,
+        COUNT(p.Id) AS TotalPosts,
+        AVG(p.Score) AS AvgScore,
+        MIN(p.CreationDate) AS EarliestPostDate,
+        MAX(p.CreationDate) AS LatestPostDate,
+        SUM(p.ViewCount) AS TotalViews
+    FROM PostTypes pt
+    LEFT JOIN Posts p ON p.PostTypeId = pt.Id
+    GROUP BY pt.Id, pt.Name
+),
+ActiveQuestions AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        u.DisplayName AS OwnerDisplayName,
+        u.Reputation
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+),
+LatestCommentsPerPost AS (
+    SELECT DISTINCT ON (c.PostId)
+        c.PostId,
+        c.Text AS CommentText,
+        c.CreationDate,
+        c.UserDisplayName
+    FROM Comments c
+    ORDER BY c.PostId, c.CreationDate DESC
+),
+PostEditHistory AS (
+    SELECT 
+        ph.PostId,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 4 THEN ph.CreationDate END) AS LastTitleEdit,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 5 THEN ph.CreationDate END) AS LastBodyEdit,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 6 THEN ph.CreationDate END) AS LastTagsEdit
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+PostLinkCounts AS (
+    SELECT
+        pl.PostId,
+        COUNT(pl.RelatedPostId) AS LinkCount,
+        COUNT(CASE WHEN lt.Name = 'Duplicate' THEN 1 END) AS DuplicateLinks
+    FROM PostLinks pl
+    LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    GROUP BY pl.PostId
+),
+MostCommentedQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        COUNT(c.Id) AS CommentCount
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title
+    ORDER BY CommentCount DESC
+    LIMIT 10
+),
+ReputationHistogram AS (
+    SELECT
+        -- bucket number from 1..10
+        width_bucket(u.Reputation, 0, 10000, 10) AS ReputationRange,
+        COUNT(*) AS UserCount
+    FROM Users u
+    GROUP BY width_bucket(u.Reputation, 0, 10000, 10)
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    COALESCE(pc.TotalPosts, 0) AS TotalPosts,
+    COALESCE(ld.LastTitleEdit::timestamp, NULL) AS LastTitleEdit,
+    COALESCE(ld.LastBodyEdit::timestamp, NULL) AS LastBodyEdit,
+    COALESCE(ld.LastTagsEdit::timestamp, NULL) AS LastTagsEdit,
+    COALESCE(pl.LinkCount, 0) AS TotalLinks,
+    COALESCE(dq.CommentCount, 0) AS CommentCountOnQuestion,
+    COALESCE(hr.UserCount, 0) AS UsersInReputationRange
+FROM Users u
+LEFT JOIN UserBadgeCounts ubc ON u.Id = ubc.UserId
+LEFT JOIN (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(p.Id) AS TotalPosts
+    FROM Posts p
+    GROUP BY p.OwnerUserId
+) pc ON u.Id = pc.OwnerUserId
+LEFT JOIN PostEditHistory ld ON EXISTS (
+    SELECT 1 FROM Posts p2 WHERE p2.Id = ld.PostId AND p2.OwnerUserId = u.Id
+)
+LEFT JOIN (
+    SELECT
+        p.OwnerUserId,
+        COUNT(c.Id) AS CommentCount
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId
+) dq ON u.Id = dq.OwnerUserId
+LEFT JOIN (
+    SELECT DISTINCT p.OwnerUserId, plc.LinkCount
+    FROM Posts p
+    JOIN PostLinkCounts plc ON p.Id = plc.PostId
+) pl ON u.Id = pl.OwnerUserId
+LEFT JOIN MostCommentedQuestions dqq ON dqq.QuestionId = u.Id
+LEFT JOIN ReputationHistogram hr
+    ON u.Reputation BETWEEN ((hr.ReputationRange - 1) * 1000) AND (hr.ReputationRange * 1000)
+ORDER BY u.Reputation DESC
+LIMIT 50;

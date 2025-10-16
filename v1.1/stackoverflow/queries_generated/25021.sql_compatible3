@@ -1,0 +1,131 @@
+WITH TopTags AS (
+    SELECT t.TagName, t.Count
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE
+    ORDER BY t.Count DESC
+    LIMIT 20
+),
+UserStats AS (
+    SELECT u.Id                            AS UserId,
+           u.DisplayName,
+           u.Reputation,
+           COALESCE(SUM(CASE b.Class
+                         WHEN 1 THEN 3
+                         WHEN 2 THEN 2
+                         ELSE 1
+                       END),0)           AS BadgeScore,
+           COUNT(DISTINCT CASE WHEN b.TagBased = TRUE THEN b.Name END) AS TagBadgeCount,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RecentQuestions AS (
+    SELECT p.Id,
+           p.Title,
+           p.CreationDate,
+           p.Score,
+           p.ViewCount,
+           p.Tags,
+           p.OwnerUserId,
+           p.AnswerCount,
+           ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserQRank
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '30' DAY)
+),
+AnswerAgg AS (
+    SELECT a.ParentId                                           AS QuestionId,
+           COUNT(*)                                            AS AnswerCnt,
+           AVG(a.Score) FILTER (WHERE a.Score IS NOT NULL)    AS AvgAnsScore,
+           MAX(a.CreationDate)                                AS LastAnsDate,
+           ROW_NUMBER() OVER (PARTITION BY a.ParentId
+                              ORDER BY a.Score DESC,
+                                       a.CreationDate ASC)   AS TopAnsRank
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+DuplicateLinks AS (
+    SELECT pl.PostId,
+           pl.RelatedPostId,
+           lt.Name AS LinkTypeName
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE lt.Name = 'Duplicate'
+),
+CloseReason AS (
+    SELECT ph.PostId,
+           ph.Comment AS CloseReason
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+),
+TagArray AS (
+    SELECT q.Id,
+           UNNEST(string_to_array(
+                     TRIM(BOTH '><' FROM q.Tags), '><')) AS Tag
+    FROM RecentQuestions q
+)
+SELECT
+    rq.Id                         AS QuestionId,
+    rq.Title,
+    rq.CreationDate,
+    rq.Score,
+    rq.ViewCount,
+    rq.Tags,
+    COALESCE(us.Reputation,0)     AS OwnerReputation,
+    COALESCE(us.BadgeScore,0)     AS OwnerBadgeScore,
+    COALESCE(aa.AnswerCnt,0)      AS TotalAnswers,
+    COALESCE(aa.AvgAnsScore,0)    AS AvgAnswerScore,
+    aa.LastAnsDate,
+    CASE WHEN dl.RelatedPostId IS NOT NULL THEN 'Yes' ELSE 'No' END AS IsDuplicate,
+    COALESCE(cr.CloseReason, 'Open') AS CloseReason,
+    STRING_AGG(DISTINCT tt.TagName, ', ') FILTER (WHERE tt.TagName IS NOT NULL) AS TopTagMatches,
+    ROW_NUMBER() OVER (ORDER BY rq.Score DESC NULLS LAST,
+                                      rq.ViewCount DESC) AS GlobalScoreRank
+FROM RecentQuestions rq
+LEFT JOIN Users u                ON u.Id = rq.OwnerUserId
+LEFT JOIN UserStats us           ON us.UserId = u.Id
+LEFT JOIN AnswerAgg aa           ON aa.QuestionId = rq.Id
+LEFT JOIN DuplicateLinks dl      ON dl.PostId = rq.Id
+LEFT JOIN CloseReason cr         ON cr.PostId = rq.Id
+LEFT JOIN TagArray ta            ON ta.Id = rq.Id
+LEFT JOIN Tags tt                ON tt.TagName = ta.Tag
+WHERE rq.UserQRank = 1
+  AND (rq.Score IS NULL OR rq.Score > 0)
+  AND (aa.AnswerCnt IS NULL OR aa.AnswerCnt >= 1)
+GROUP BY rq.Id, rq.Title, rq.CreationDate, rq.Score, rq.ViewCount,
+         rq.Tags, us.Reputation, us.BadgeScore,
+         aa.AnswerCnt, aa.AvgAnsScore, aa.LastAnsDate,
+         dl.RelatedPostId, cr.CloseReason, rq.UserQRank, rq.OwnerUserId
+HAVING COUNT(DISTINCT tt.TagName) FILTER (WHERE tt.TagName IS NOT NULL) > 0
+
+UNION ALL
+
+SELECT
+    q.Id,
+    q.Title,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.Tags,
+    COALESCE(u.Reputation,0) AS OwnerReputation,
+    0                     AS OwnerBadgeScore,
+    0                     AS TotalAnswers,
+    0                     AS AvgAnswerScore,
+    NULL                  AS LastAnsDate,
+    'No'                  AS IsDuplicate,
+    'Never Closed'        AS CloseReason,
+    NULL                  AS TopTagMatches,
+    NULL                  AS GlobalScoreRank
+FROM Posts q
+LEFT JOIN Users u ON u.Id = q.OwnerUserId
+WHERE q.PostTypeId = 1
+  AND q.CreationDate < (CAST('2024-10-01' AS DATE) - INTERVAL '1 year')
+  AND q.AnswerCount = 0
+  AND NOT EXISTS (SELECT 1 FROM PostHistory ph
+                  WHERE ph.PostId = q.Id
+                    AND ph.PostHistoryTypeId = 10)
+ORDER BY GlobalScoreRank NULLS LAST, QuestionId DESC
+LIMIT 100;

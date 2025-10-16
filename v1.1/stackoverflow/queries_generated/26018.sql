@@ -1,0 +1,56 @@
+-- {"query": "26018.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "llama-3.3-instruct", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 466} 
+
+WITH TopUsers AS (
+  SELECT 
+    u.Id,
+    u.DisplayName,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+  FROM Users u
+  JOIN Posts p ON u.Id = p.OwnerUserId
+  JOIN Votes v ON p.Id = v.PostId
+  WHERE v.VoteTypeId IN (2, 3)
+  GROUP BY u.Id, u.DisplayName
+  ORDER BY UpVotes - DownVotes DESC
+  LIMIT 10
+),
+TopTags AS (
+  SELECT 
+    t.TagName,
+    COUNT(p.Id) AS PostCount
+  FROM Tags t
+  JOIN PostTags pt ON t.Id = pt.TagId
+  JOIN Posts p ON pt.PostId = p.Id
+  GROUP BY t.TagName
+  ORDER BY PostCount DESC
+  LIMIT 10
+),
+QuestionAnswers AS (
+  SELECT 
+    p.Id AS QuestionId,
+    p.Title AS QuestionTitle,
+    COUNT(a.Id) AS AnswerCount
+  FROM Posts p
+  JOIN Posts a ON p.Id = a.ParentId
+  WHERE p.PostTypeId = 1 AND a.PostTypeId = 2
+  GROUP BY p.Id, p.Title
+)
+SELECT 
+  u.DisplayName AS TopUser,
+  tu.UpVotes - tu.DownVotes AS VoteDifference,
+  t.TagName AS TopTag,
+  qa.QuestionTitle AS QuestionTitle,
+  qa.AnswerCount AS AnswerCount,
+  p.Score AS QuestionScore,
+  p.ViewCount AS QuestionViewCount,
+  ph.Comment AS PostHistoryComment,
+  v.VoteTypeId AS VoteType
+FROM TopUsers tu
+JOIN Users u ON tu.Id = u.Id
+CROSS JOIN TopTags t
+JOIN QuestionAnswers qa ON u.Id = qa.QuestionId
+JOIN Posts p ON qa.QuestionId = p.Id
+JOIN PostHistory ph ON p.Id = ph.PostId
+JOIN Votes v ON p.Id = v.PostId
+WHERE v.VoteTypeId = 2 AND ph.PostHistoryTypeId = 10
+ORDER BY tu.UpVotes - tu.DownVotes DESC, t.PostCount DESC, qa.AnswerCount DESC;

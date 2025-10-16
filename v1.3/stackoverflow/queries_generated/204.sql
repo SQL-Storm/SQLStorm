@@ -1,0 +1,207 @@
+-- {"query": "204.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 3254} 
+with
+-- Base user info with reputation rank
+users_base as (
+  select
+    u.*,
+    row_number() over (order by u.Reputation desc, u.Id) as rep_rank,
+    dense_rank() over (order by date_trunc('year', u.CreationDate)) as cohort_year
+  from Users u
+),
+-- Recent activity aggregates (last 365 days)
+recent_activity as (
+  select
+    u.Id as UserId,
+    sum(case when p.PostTypeId = 1 then 1 else 0 end) as recent_questions,
+    sum(case when p.PostTypeId = 2 then 1 else 0 end) as recent_answers,
+    count(distinct c.Id) filter (where c.CreationDate >= now() - interval '365 days') as recent_comments,
+    count(distinct v.Id) filter (where v.CreationDate >= now() - interval '365 days') as recent_votes,
+    max(p.LastActivityDate) as last_activity_on_post
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id and p.LastActivityDate >= now() - interval '365 days'
+  left join Comments c on c.UserId = u.Id
+  left join Votes v on v.UserId = u.Id
+  group by u.Id
+),
+-- Parse tags from questions and compute top tags per user
+user_tag_counts as (
+  select
+    p.OwnerUserId as UserId,
+    trim(t.tag) as tag,
+    count(*) as tag_count,
+    max(p.CreationDate) as last_used
+  from Posts p
+  cross join lateral (
+    select unnest(
+      case when p.Tags is null then array[]::text[] else string_to_array(substring(p.Tags,2, length(p.Tags)-2), '><') end
+    ) as tag
+  ) t
+  where p.PostTypeId = 1 and p.OwnerUserId is not null
+  group by p.OwnerUserId, trim(t.tag)
+),
+-- Pick the top tag per user (tie-breaker by last_used then alphabetical)
+top_tag_per_user as (
+  select *
+  from (
+    select
+      utc.*,
+      row_number() over (partition by utc.UserId order by utc.tag_count desc, utc.last_used desc, utc.tag) as rn
+    from user_tag_counts utc
+  ) s
+  where rn = 1
+),
+-- Badge summaries
+badge_summary as (
+  select
+    b.UserId,
+    count(*) as badge_total,
+    sum(case when b.Class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.Class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.Class = 3 then 1 else 0 end) as bronze_badges,
+    bool_or(b.TagBased = cast(1 as bit)) as any_tag_based
+  from Badges b
+  group by b.UserId
+),
+-- Answer statistics including acceptance and average score per answer
+answer_stats as (
+  select
+    a.OwnerUserId as UserId,
+    count(*) filter (where a.PostTypeId = 2) as answers_count,
+    sum(case when q.AcceptedAnswerId = a.Id then 1 else 0 end) as accepted_count,
+    avg(a.Score) filter (where a.PostTypeId = 2) as avg_answer_score,
+    stddev_pop(a.Score) filter (where a.PostTypeId = 2) as sd_answer_score
+  from Posts a
+  left join Posts q on q.AcceptedAnswerId = a.Id
+  where a.OwnerUserId is not null
+  group by a.OwnerUserId
+),
+-- Earliest substantive edit (title/body) a user made (correlated subquery style via CTE)
+first_edit_by_user as (
+  select ph.UserId,
+         min(ph.CreationDate) as first_edit_date,
+         min(ph.Id) filter (where ph.PostHistoryTypeId in (4,5)) as first_edit_history_id
+  from PostHistory ph
+  where ph.UserId is not null
+  group by ph.UserId
+),
+-- Users that are high reputation or highly badged (using set operators)
+top_reputation_users as (
+  select Id as UserId from Users order by Reputation desc limit 200
+),
+high_badge_users as (
+  select UserId from badge_summary where badge_total >= 10
+),
+power_users as (
+  select UserId from top_reputation_users
+  union
+  select UserId from high_badge_users
+),
+-- Per-user synthetic score combining many metrics with NULL logic and conditional weighting
+user_score as (
+  select
+    ub.Id as UserId,
+    ub.DisplayName,
+    ub.Reputation,
+    coalesce(ra.recent_questions,0) + coalesce(ra.recent_answers,0) * 1.5 + coalesce(ra.recent_comments,0) * 0.2 as recent_engagement,
+    coalesce(as_.answers_count,0) as answers_count,
+    coalesce(as_.accepted_count,0) as accepted_count,
+    coalesce(bd.badge_total,0) as badge_total,
+    coalesce(tt.tag, '(none)') as top_tag,
+    -- synthetic weighted score (uses NULL-safe arithmetic, power, logs)
+    (
+      ln(greatest(coalesce(ub.Reputation,0),1)) * 1.2
+      + (coalesce(as_.accepted_count,0)::numeric * 5)
+      + sqrt(coalesce(as_.answers_count,0)) * 2
+      + coalesce(bd.badge_total,0) * 1.1
+      + coalesce(ra.recent_questions,0) * 0.8
+      + coalesce(ra.recent_answers,0) * 1.0
+      + case when coalesce(tt.tag,'') = '(none)' then -2 else 0 end
+    ) as synthetic_score,
+    -- boolean power user marker via membership in power_users (LEFT JOIN to capture false)
+    case when pu.UserId is not null then true else false end as is_power_user,
+    fe.first_edit_date,
+    coalesce(ub.AboutMe, '') like '%SQL%' as mentions_sql
+  from users_base ub
+  left join recent_activity ra on ra.UserId = ub.Id
+  left join answer_stats as_ on as_.UserId = ub.Id
+  left join badge_summary bd on bd.UserId = ub.Id
+  left join top_tag_per_user tt on tt.UserId = ub.Id
+  left join power_users pu on pu.UserId = ub.Id
+  left join first_edit_by_user fe on fe.UserId = ub.Id
+),
+-- Compute population stats for z-scores using window functions
+scored_ranked as (
+  select
+    us.*,
+    avg(us.synthetic_score) over () as population_avg_score,
+    stddev_pop(us.synthetic_score) over () as population_sd_score,
+    rank() over (order by us.synthetic_score desc nulls last) as synthetic_rank
+  from user_score us
+)
+-- Final selection uses outer joins, correlated subqueries and complex predicates
+select
+  sr.UserId,
+  sr.DisplayName,
+  sr.Reputation,
+  sr.rep_rank,
+  sr.synthetic_score,
+  sr.synthetic_rank,
+  round((sr.synthetic_score - sr.population_avg_score) / nullif(sr.population_sd_score,0)::numeric,3) as synthetic_zscore,
+  sr.recent_engagement,
+  sr.answers_count,
+  sr.accepted_count,
+  case
+    when sr.accepted_count > 0 and sr.answers_count > 0 then round(100.0 * sr.accepted_count / sr.answers_count,2)
+    when sr.answers_count = 0 and sr.recent_engagement > 0 then -1.0 -- indicates engagement without answers
+    else null
+  end as accepted_rate_percent,
+  sr.badge_total,
+  sr.top_tag,
+  sr.is_power_user,
+  sr.first_edit_date,
+  sr.mentions_sql,
+  -- correlated subquery: count of distinct posts linked to user's posts (both directions) within last 2 years
+  (
+    select count(distinct pl.RelatedPostId)
+    from PostLinks pl
+    join Posts p on p.Id = pl.PostId
+    where p.OwnerUserId = sr.UserId
+      and pl.CreationDate >= now() - interval '2 years'
+  ) as outgoing_linked_posts,
+  (
+    select count(distinct pl.PostId)
+    from PostLinks pl
+    join Posts rp on rp.Id = pl.RelatedPostId
+    where rp.OwnerUserId = sr.UserId
+      and pl.CreationDate >= now() - interval '2 years'
+  ) as incoming_linked_posts,
+  -- show top 3 tags for the user as a concatenated string (subquery + string_agg)
+  (
+    select coalesce(string_agg(t.tag || ':' || t.tag_count::text, ', ' order by t.tag_count desc, t.tag), '(none)')
+    from user_tag_counts t
+    where t.UserId = sr.UserId
+    limit 3
+  ) as top_3_tags,
+  -- combine conditions with NULL logic to classify activity
+  case
+    when sr.is_power_user and sr.recent_engagement >= 10 then 'Elite-Active'
+    when sr.is_power_user and sr.recent_engagement < 10 then 'Elite-Inactive'
+    when sr.recent_engagement >= 10 then 'Active'
+    when sr.recent_engagement between 1 and 9 then 'Occasional'
+    when sr.recent_engagement = 0 and sr.last_activity_on_post is not null then 'DormantPoster'
+    else 'Lurker'
+  end as activity_bucket
+from scored_ranked sr
+left join users_base ub2 on ub2.Id = sr.UserId
+left join recent_activity ra2 on ra2.UserId = sr.UserId
+-- exclude purely deleted / community users by ensuring they have at least one identifying artifact
+where
+  -- allow users with any meaningful signal: reputation > 0 OR any post/vote/comment OR badges
+  (
+    sr.Reputation > 0
+    or exists (select 1 from Posts p where p.OwnerUserId = sr.UserId limit 1)
+    or exists (select 1 from Votes v where v.UserId = sr.UserId limit 1)
+    or sr.badge_total > 0
+  )
+order by sr.synthetic_score desc nulls last
+limit 500;

@@ -1,0 +1,76 @@
+-- {"query": "28043.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "deepseek-r1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1144} 
+
+WITH UserBadgeStats AS (
+    SELECT 
+        UserId, 
+        COUNT(*) AS TotalBadges,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        RANK() OVER (ORDER BY COUNT(*) DESC) AS BadgeRank
+    FROM Badges
+    GROUP BY UserId
+), PostStats AS (
+    SELECT 
+        OwnerUserId,
+        AVG(Score) FILTER (WHERE PostTypeId = 1) AS AvgQuestionScore,
+        MAX(ViewCount) AS MaxViews,
+        SUM(AnswerCount) OVER (PARTITION BY OwnerUserId ORDER BY CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeAnswers
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL
+), RecentComments AS (
+    SELECT 
+        UserId,
+        MAX(CreationDate) AS LastCommentDate,
+        STRING_AGG(SUBSTRING(Text FROM 1 FOR 50), '; ' ORDER BY CreationDate DESC) AS RecentCommentSnippets
+    FROM Comments
+    WHERE UserId IS NOT NULL
+    GROUP BY UserId
+)
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    COALESCE(u.Location, 'Unknown') AS Location,
+    u.Reputation,
+    ub.TotalBadges,
+    ub.GoldBadges,
+    ub.BadgeRank,
+    ps.AvgQuestionScore,
+    ps.MaxViews,
+    ps.CumulativeAnswers,
+    rc.LastCommentDate,
+    rc.RecentCommentSnippets,
+    (SELECT COUNT(*) 
+     FROM Votes v 
+     WHERE v.UserId = u.Id 
+       AND v.VoteTypeId IN (2,3,8)
+    ) AS TotalVotes,
+    (SELECT STRING_AGG(TagName, ', ') 
+     FROM Tags 
+     WHERE Id IN (
+         SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), '><'))
+         FROM Posts p 
+         WHERE p.OwnerUserId = u.Id 
+           AND p.PostTypeId = 1
+     )
+    ) AS FrequentTags,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 
+            FROM PostHistory ph 
+            WHERE ph.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id)
+              AND ph.PostHistoryTypeId = 10
+              AND ph.Comment::INT IN (SELECT Id FROM CloseReasonTypes WHERE Name LIKE '%Duplicate%')
+        ) THEN TRUE 
+        ELSE FALSE 
+    END AS HasClosedDuplicatePosts
+FROM Users u
+LEFT JOIN UserBadgeStats ub ON u.Id = ub.UserId
+LEFT JOIN PostStats ps ON u.Id = ps.OwnerUserId
+LEFT JOIN RecentComments rc ON u.Id = rc.UserId
+WHERE u.Reputation > 1000
+  AND u.CreationDate BETWEEN '2010-01-01' AND '2023-12-31'
+  AND (u.DownVotes < u.UpVotes OR u.DownVotes IS NULL)
+ORDER BY 
+    ub.BadgeRank,
+    ps.CumulativeAnswers DESC,
+    rc.LastCommentDate DESC NULLS LAST
+LIMIT 100;

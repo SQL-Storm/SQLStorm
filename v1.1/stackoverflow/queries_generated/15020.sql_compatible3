@@ -1,0 +1,73 @@
+WITH UserBadgeStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS MedianPostScore,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        u.Reputation
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopQuestionTags AS (
+    SELECT 
+        tag AS Tag,
+        AVG(ViewCount) AS AvgViewCount,
+        COUNT(*) AS TagQuestionCount
+    FROM (
+        SELECT
+            TRIM(BOTH '<>' FROM part) AS tag,
+            ViewCount
+        FROM Posts
+        CROSS JOIN LATERAL (
+            -- split tags like '<tag1><tag2>' into rows
+            SELECT regexp_split_to_table(regexp_replace(Tags, '^<|>$', ''), '><') AS part
+        ) parts
+        WHERE PostTypeId = 1
+    ) sub
+    GROUP BY tag
+    HAVING COUNT(*) > 50
+)
+SELECT 
+    ubs.UserId,
+    ubs.DisplayName,
+    ubs.TotalBadges,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.MedianPostScore,
+    tqt.Tag AS MostPopularTag,
+    tqt.AvgViewCount,
+    (SELECT COUNT(*) 
+     FROM Comments c 
+     WHERE c.UserId = ubs.UserId) AS TotalComments,
+    CASE 
+        WHEN ubs.ReputationRank <= 100 THEN 'Top 100 User'
+        WHEN ubs.ReputationRank <= 1000 THEN 'Top 1000 User'
+        ELSE 'Regular User'
+    END AS UserTier
+FROM UserBadgeStats ubs
+JOIN TopQuestionTags tqt ON 1=1
+WHERE ubs.TotalBadges > 5 
+    AND (ubs.MedianPostScore > 0 OR EXISTS (
+        SELECT 1 
+        FROM Votes v 
+        WHERE v.UserId = ubs.UserId AND v.VoteTypeId IN (2, 8)
+    ))
+GROUP BY
+    ubs.UserId,
+    ubs.DisplayName,
+    ubs.TotalBadges,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.MedianPostScore,
+    tqt.Tag,
+    tqt.AvgViewCount,
+    ubs.ReputationRank,
+    ubs.Reputation
+ORDER BY ubs.TotalBadges DESC, ubs.ReputationRank
+LIMIT 100;

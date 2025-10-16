@@ -1,0 +1,192 @@
+-- {"query": "335.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1739} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        0 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.Path || t.Id
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id <> all(r.Path)
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0 and r.Level < 2
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserReputationWindow as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        coalesce(ubc_gold.BadgeCount,0) as GoldBadges,
+        coalesce(ubc_silver.BadgeCount,0) as SilverBadges,
+        coalesce(ubc_bronze.BadgeCount,0) as BronzeBadges,
+        row_number() over (order by u.Reputation desc, u.Views desc nulls last) as RankByReputation
+    from Users u
+    left join UserBadgeCounts ubc_gold on u.Id = ubc_gold.UserId and ubc_gold.Class = 1
+    left join UserBadgeCounts ubc_silver on u.Id = ubc_silver.UserId and ubc_silver.Class = 2
+    left join UserBadgeCounts ubc_bronze on u.Id = ubc_bronze.UserId and ubc_bronze.Class = 3
+),
+PostScoreStats as (
+    select
+        p.OwnerUserId,
+        count(*) as TotalPosts,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) as QuestionCount,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) as AnswerCount,
+        avg(p.Score) as AvgScore,
+        max(p.Score) as MaxScore,
+        min(p.Score) as MinScore,
+        sum(p.ViewCount) as TotalViews,
+        sum(p.FavoriteCount) as TotalFavorites
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+TopQuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        a.Id as AnswerId,
+        a.CreationDate as AnswerCreationDate,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerOwnerUserId,
+        u.DisplayName as AnswerOwnerDisplayName,
+        row_number() over (partition by q.Id order by a.Score desc nulls last) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on a.OwnerUserId = u.Id
+    where q.PostTypeId = 1 and q.Score > 5
+),
+CloseReasonCounts as (
+    select
+        ph.Comment as CloseReasonId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseCount
+    from PostHistory ph
+    join CloseReasonTypes crt on cast(ph.Comment as int) = crt.Id
+    where ph.PostHistoryTypeId = 10
+    group by ph.Comment, crt.Name
+),
+UserActivityWindow as (
+    select
+        u.Id,
+        u.DisplayName,
+        count(distinct p.Id) as PostsCount,
+        count(distinct c.Id) as CommentsCount,
+        count(distinct v.Id) as VotesCount,
+        max(p.CreationDate) as LastPostDate,
+        max(c.CreationDate) as LastCommentDate,
+        max(v.CreationDate) as LastVoteDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle,
+        pl.CreationDate,
+        lt.Name as LinkTypeName
+    from PostLinks pl
+    join Posts p1 on pl.PostId = p1.Id
+    join Posts p2 on pl.RelatedPostId = p2.Id
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    where pl.LinkTypeId = 3
+)
+select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    coalesce(ps.TotalPosts,0) as TotalPosts,
+    coalesce(ps.QuestionCount,0) as QuestionCount,
+    coalesce(ps.AnswerCount,0) as AnswerCount,
+    coalesce(ps.AvgScore,0) as AvgPostScore,
+    coalesce(ps.MaxScore,0) as MaxPostScore,
+    coalesce(ps.MinScore,0) as MinPostScore,
+    coalesce(ps.TotalViews,0) as TotalPostViews,
+    coalesce(ps.TotalFavorites,0) as TotalPostFavorites,
+    ua.PostsCount,
+    ua.CommentsCount,
+    ua.VotesCount,
+    greatest(
+        coalesce(ua.LastPostDate, timestamp '1970-01-01'),
+        coalesce(ua.LastCommentDate, timestamp '1970-01-01'),
+        coalesce(ua.LastVoteDate, timestamp '1970-01-01')
+    ) as LastActivityDate,
+    string_agg(distinct rth.TagName, ', ') as SampleTags,
+    crc.CloseReasonName,
+    crc.CloseCount,
+    dq.PostTitle as DuplicatePostTitle,
+    dq.RelatedPostTitle as DuplicateRelatedPostTitle,
+    dq.CreationDate as DuplicateLinkDate
+from UserReputationWindow u
+left join PostScoreStats ps on u.Id = ps.OwnerUserId
+left join UserActivityWindow ua on u.Id = ua.Id
+left join RecursiveTagHierarchy rth on rth.Level = 0
+left join (
+    select
+        ph.UserId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseCount
+    from PostHistory ph
+    join CloseReasonTypes crt on cast(ph.Comment as int) = crt.Id
+    where ph.PostHistoryTypeId = 10
+    group by ph.UserId, crt.Name
+    order by CloseCount desc
+    limit 1
+) crc on crc.UserId = u.Id
+left join LATERAL (
+    select
+        dq.PostTitle,
+        dq.RelatedPostTitle,
+        dq.CreationDate
+    from DuplicateLinks dq
+    join Posts p on p.OwnerUserId = u.Id and p.Id = dq.PostId
+    order by dq.CreationDate desc
+    limit 1
+) dq on true
+where u.RankByReputation <= 100
+group by
+    u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes,
+    u.GoldBadges, u.SilverBadges, u.BronzeBadges,
+    ps.TotalPosts, ps.QuestionCount, ps.AnswerCount, ps.AvgScore, ps.MaxScore, ps.MinScore, ps.TotalViews, ps.TotalFavorites,
+    ua.PostsCount, ua.CommentsCount, ua.VotesCount,
+    ua.LastPostDate, ua.LastCommentDate, ua.LastVoteDate,
+    crc.CloseReasonName, crc.CloseCount,
+    dq.PostTitle, dq.RelatedPostTitle, dq.CreationDate
+order by u.Reputation desc, u.Views desc nulls last
+limit 50;

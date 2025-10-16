@@ -1,0 +1,215 @@
+-- {"query": "7086.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2705} 
+with
+-- recent active questions with tag array and basic aggregates
+RecentQuestions as (
+  select
+    p.Id as QuestionId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    coalesce(p.Tags,'') as RawTags,
+    -- parse tags: remove leading/trailing <> and split on ><
+    regexp_split_to_array(substring(coalesce(p.Tags,''),2, greatest(length(coalesce(p.Tags,''))-2,0)), '><') as TagArray,
+    p.AnswerCount,
+    p.FavoriteCount
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '2 years')
+),
+
+-- top answer stats per question (including accepted and highest scored)
+AnswerStats as (
+  select
+    q.QuestionId,
+    a.Id as AnswerId,
+    a.OwnerUserId as AnswerOwner,
+    a.Score as AnswerScore,
+    a.CreationDate as AnswerCreation,
+    row_number() over (partition by q.QuestionId order by (case when q.QuestionId = a.ParentId and a.Id = (select AcceptedAnswerId from posts where id = q.QuestionId) then 0 else 1 end), a.Score desc, a.CreationDate asc) as AnswerRank,
+    max(case when a.Id = (select AcceptedAnswerId from Posts where Id = q.QuestionId) then 1 else 0 end) over (partition by q.QuestionId) as HasAccepted
+  from RecentQuestions q
+  left join Posts a on a.ParentId = q.QuestionId and a.PostTypeId = 2
+),
+
+-- aggregated vote breakdown for posts (recent window) using conditional aggregation and correlated subquery for most recent vote date
+PostVoteAgg as (
+  select
+    p.Id as PostId,
+    count(v.Id) filter (where v.VoteTypeId = 2) as UpVotes,
+    count(v.Id) filter (where v.VoteTypeId = 3) as DownVotes,
+    count(v.Id) filter (where v.VoteTypeId = 5) as Favorites,
+    count(v.Id) filter (where v.VoteTypeId not in (2,3,5)) as OtherVotes,
+    max(v.CreationDate) as LastVoteDate,
+    sum(coalesce(v.BountyAmount,0)) as TotalBountyGiven
+  from Posts p
+  left join Votes v on v.PostId = p.Id and v.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '3 years')
+  where p.PostTypeId in (1,2)
+  group by p.Id
+),
+
+-- per-user reputation and engagement windows (CTE with window functions)
+UserEngagement as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes as UpVotesGiven,
+    u.DownVotes as DownVotesGiven,
+    count(b.Id) filter (where b.Class = 1) over (partition by u.Id) as GoldBadges,
+    count(b.Id) filter (where b.Class = 2) over (partition by u.Id) as SilverBadges,
+    count(b.Id) filter (where b.Class = 3) over (partition by u.Id) as BronzeBadges,
+    row_number() over (order by u.Reputation desc) as RepRank
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  where u.CreationDate <= cast('2024-10-01 12:34:56' as timestamp)
+),
+
+-- detect potentially duplicated/linked posts with pathologies: circular links and duplicate clusters
+LinkClusters as (
+  select
+    pl.PostId,
+    pl.RelatedPostId,
+    lt.Name as LinkType,
+    case when pl.PostId = pl.RelatedPostId then 1 else 0 end as SelfLink,
+    exists (
+      select 1 from PostLinks pl2
+      where pl2.PostId = pl.RelatedPostId and pl2.RelatedPostId = pl.PostId
+    ) as ReciprocalLink
+  from PostLinks pl
+  left join LinkTypes lt on lt.Id = pl.LinkTypeId
+  where pl.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '5 years')
+),
+
+-- identify hot tags by weighted activity: questions created, answers given, views, favorites
+TagActivity as (
+  select
+    t.TagName,
+    coalesce(sum(case when p.PostTypeId = 1 then 1 else 0 end),0) as QuestionsCreated,
+    coalesce(sum(case when p.PostTypeId = 2 then 1 else 0 end),0) as AnswersCreated,
+    coalesce(sum(p.ViewCount),0) as TotalViews,
+    coalesce(sum(p.FavoriteCount),0) as TotalFavorites,
+    -- weighted score gives more weight to answers and favorites
+    (sum(case when p.PostTypeId = 1 then 1 else 0 end)
+     + 2 * sum(case when p.PostTypeId = 2 then 1 else 0 end)
+     + 0.00001 * sum(coalesce(p.ViewCount,0))
+     + 3 * sum(coalesce(p.FavoriteCount,0))
+    ) as ActivityScore
+  from Tags t
+  left join Posts p on p.PostTypeId = 1 and strpos(coalesce(p.Tags,''), '<' || t.TagName || '>') > 0
+  group by t.TagName
+),
+
+-- combine question-level info with answers, votes, users and compute various metrics & complex predicates
+QuestionDashboard as (
+  select
+    q.QuestionId,
+    q.Title,
+    q.CreationDate as QuestionCreated,
+    q.Score as QuestionScore,
+    q.ViewCount as QuestionViews,
+    q.AnswerCount,
+    q.FavoriteCount,
+    pva.UpVotes as Q_UpVotes,
+    pva.DownVotes as Q_DownVotes,
+    pva.Favorites as Q_Favorites,
+    pva.LastVoteDate as Q_LastVoteDate,
+    -- string expression: shortened title + tag summary
+    left(q.Title, 120) || case when length(q.Title) > 120 then '...' else '' end as ShortTitle,
+    array_to_string(q.TagArray[1:3], ',') as Top3Tags,
+    -- correlate to best answer (AnswerRank = 1)
+    (select a.AnswerId from AnswerStats a where a.QuestionId = q.QuestionId and a.AnswerRank = 1 limit 1) as BestAnswerId,
+    (select a.AnswerScore from AnswerStats a where a.QuestionId = q.QuestionId and a.AnswerRank = 1 limit 1) as BestAnswerScore,
+    (select a.AnswerOwner from AnswerStats a where a.QuestionId = q.QuestionId and a.AnswerRank = 1 limit 1) as BestAnswerOwner,
+    -- answer quality estimate: average score of answers (excluding null) with safety around divide-by-zero
+    (select case when count(a2.Id) = 0 then null else (sum(a2.Score::numeric) / count(a2.Id)) end from Posts a2 where a2.ParentId = q.QuestionId and a2.PostTypeId = 2) as AvgAnswerScore,
+    -- time-to-first-answer (correlated subquery)
+    (select min(a3.CreationDate) from Posts a3 where a3.ParentId = q.QuestionId and a3.PostTypeId = 2) as FirstAnswerDate,
+    -- time delta expression (in hours) with null handling
+    case
+      when (select min(a3.CreationDate) from Posts a3 where a3.ParentId = q.QuestionId and a3.PostTypeId = 2) is null then null
+      else extract(epoch from ((select min(a3.CreationDate) from Posts a3 where a3.ParentId = q.QuestionId and a3.PostTypeId = 2) - q.CreationDate)) / 3600.0
+    end as HoursToFirstAnswer,
+    -- complicated predicate: "stale" if no answers and views under median of similar tags and created > 30 days
+    case
+      when q.AnswerCount = 0
+           and q.CreationDate < cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+           and q.ViewCount < (
+             select coalesce(percentile_cont(0.5) within group (order by p2.ViewCount), 0)
+             from Posts p2
+             where p2.PostTypeId = 1
+               and exists (
+                 select 1 from unnest(q.TagArray) t where strpos(coalesce(p2.Tags,''), '<' || t || '>') > 0
+               )
+           )
+      then 1 else 0
+    end as IsStale,
+    -- complex null logic combining owner and display name fallback
+    coalesce((select u.DisplayName from Users u where u.Id = q.OwnerUserId), substring(q.Title from 1 for 30)) as OwnerOrTitleSnippet,
+    -- join to link clusters: count of outgoing links and reciprocal links
+    (select count(*) from PostLinks pl where pl.PostId = q.QuestionId) as OutgoingLinkCount,
+    (select count(*) from PostLinks pl where pl.PostId = q.QuestionId and exists (select 1 from PostLinks pl2 where pl2.PostId = pl.RelatedPostId and pl2.RelatedPostId = pl.PostId)) as ReciprocalLinkCount
+  from RecentQuestions q
+  left join PostVoteAgg pva on pva.PostId = q.QuestionId
+)
+
+select
+  qd.*,
+  ua.DisplayName as QuestionOwnerName,
+  ua.Reputation as QuestionOwnerRep,
+  ua.GoldBadges,
+  ua.SilverBadges,
+  ua.BronzeBadges,
+  va.AnswerId as TopAnswerId,
+  va.AnswerScore as TopAnswerScore,
+  -- enrich best answer with votes and user metrics via left joins
+  pva2.UpVotes as BestAnswer_UpVotes,
+  pva2.DownVotes as BestAnswer_DownVotes,
+  ue.DisplayName as BestAnswererName,
+  ue.Reputation as BestAnswererRep,
+  -- compute an "engagement index" with lots of nil-safe arithmetic and exponents
+  (
+    coalesce(qd.QuestionScore,0) * 1.5
+    + ln(greatest(coalesce(qd.QuestionViews,0),1)) * 0.8
+    + coalesce(qd.AnswerCount,0) * 2.5
+    + coalesce(qd.FavoriteCount,0) * 3
+    + coalesce(pva2.UpVotes,0) * 1.2
+    - coalesce(pva2.DownVotes,0) * 1.8
+    + coalesce(ua.GoldBadges,0) * 10
+    + coalesce(ua.SilverBadges,0) * 3
+    + coalesce(ua.BronzeBadges,0) * 1
+    - (case when qd.IsStale = 1 then 50 else 0 end)
+  ) as EngagementIndex,
+  -- set operator example: union of tag activity top tags for question's tags (as text array) with top global tags
+  (
+    select array_agg(distinct ta.TagName order by ta.ActivityScore desc limit 5)
+    from (
+      select TagName, ActivityScore from TagActivity where TagName = any(qd.Top3Tags::text[])
+      union
+      select TagName, ActivityScore from TagActivity order by ActivityScore desc limit 5
+    ) ta
+  ) as SuggestedRelatedTags
+from QuestionDashboard qd
+left join Users ua on ua.Id = qd.OwnerOrTitleSnippet::int default null
+-- robustly try to join owner by id: if OwnerOrTitleSnippet is numeric (user id) join, else null (this uses a safe cast attempt)
+left join LATERAL (
+  select *
+  from AnswerStats a where a.QuestionId = qd.QuestionId and a.AnswerRank = 1 limit 1
+) va on true
+left join PostVoteAgg pva2 on pva2.PostId = va.AnswerId
+left join Users ue on ue.Id = va.AnswerOwner
+where
+  -- filter to interesting subset: high engagement index components or unanswered with high views
+  (
+    (qd.QuestionScore >= 5)
+    or (qd.QuestionViews >= 1000)
+    or (qd.AnswerCount = 0 and qd.QuestionViews >= 200)
+    or (qd.IsStale = 1)
+  )
+order by EngagementIndex desc nulls last, qd.QuestionCreated desc
+limit 250;

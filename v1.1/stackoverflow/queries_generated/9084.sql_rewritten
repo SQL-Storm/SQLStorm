@@ -1,0 +1,112 @@
+-- {"query": "9084.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2013, "output_tokens": 3100} 
+WITH RecentAnswers AS (
+    SELECT 
+        p.Id,
+        p.ParentId,
+        p.Score,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+      AND p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+),
+TopAnswers AS (
+    SELECT 
+        ra.ParentId   AS QuestionId,
+        ra.Id         AS AnswerId,
+        ra.Score
+    FROM RecentAnswers ra
+    WHERE ra.rn <= 3
+),
+UserStats AS (
+    SELECT 
+        u.Id                         AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        COALESCE(AVG(p.Score), 0)    AS AvgQuestionScore
+    FROM Users u
+    LEFT JOIN Badges b 
+        ON b.UserId = u.Id
+    LEFT JOIN Posts p 
+        ON p.OwnerUserId = u.Id 
+       AND p.PostTypeId   = 1
+    GROUP BY u.Id, u.DisplayName
+),
+DuplicatedLinks AS (
+    SELECT 
+        pl.PostId,
+        COUNT(DISTINCT pl.RelatedPostId) AS DupCount
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+    GROUP BY pl.PostId
+)
+SELECT
+    q.Id                                 AS QuestionId,
+    q.Title,
+    COALESCE(ta.AnswerId, -1)            AS TopAnswerId,
+    COALESCE(ta.Score,   0)              AS TopAnswerScore,
+    us.DisplayName 
+      || COALESCE(' (' || us.UserId || ')', '') AS Author,
+    us.GoldBadges + us.SilverBadges + us.BronzeBadges AS TotalBadges,
+    us.AvgQuestionScore,
+    dl.DupCount,
+    CASE
+      WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+      WHEN q.FavoriteCount > 100      THEN 'Popular'
+      ELSE 'Active'
+    END                                  AS QuestionStatus,
+    REPLACE(
+      SUBSTRING(q.Tags FROM 2 FOR CHAR_LENGTH(q.Tags) - 2),
+      '><',
+      ' , '
+    )                                    AS TagList,
+    EXISTS (
+      SELECT 1
+      FROM Votes v
+      WHERE v.PostId      = q.Id
+        AND v.VoteTypeId  = 2
+        AND v.CreationDate > q.CreationDate + INTERVAL '1 day'
+    )                                    AS FastUpvoted
+FROM Posts q
+LEFT JOIN TopAnswers ta 
+    ON ta.QuestionId = q.Id
+LEFT JOIN UserStats us 
+    ON us.UserId     = q.OwnerUserId
+LEFT JOIN DuplicatedLinks dl 
+    ON dl.PostId     = q.Id
+WHERE q.PostTypeId = 1
+  AND q.Score >= COALESCE((
+        SELECT AVG(p2.Score) * 1.5
+        FROM Posts p2
+        WHERE p2.PostTypeId = 1
+          AND p2.CreationDate BETWEEN cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days' AND cast('2024-10-01 12:34:56' as timestamp)
+    ), 0)
+  AND EXISTS (
+      SELECT 1
+      FROM Comments c
+      WHERE c.PostId = q.Id
+        AND c.Text ~* '(benchmark|performance)'
+  )
+
+UNION ALL
+
+SELECT
+    'TOTAL',
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+FROM Posts q2
+RIGHT JOIN Votes v2 
+    ON v2.PostId    = q2.Id
+WHERE q2.PostTypeId = 1
+  AND v2.VoteTypeId = 5
+LIMIT 100;

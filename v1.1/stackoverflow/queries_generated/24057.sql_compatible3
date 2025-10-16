@@ -1,0 +1,123 @@
+WITH base_questions AS (
+    SELECT
+        p.Id AS QId,
+        p.Title,
+        p.Tags,
+        p.ViewCount,
+        p.LastActivityDate,
+        u.Reputation AS OwnerRep,
+        COUNT(a.Id) FILTER (WHERE a.PostTypeId = 2)
+            OVER (PARTITION BY p.Id) AS AnswerCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)
+            OVER (PARTITION BY p.Id) AS TotalUpVotes
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Posts a ON a.ParentId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 2
+    WHERE pt.Name = 'Question'
+      AND p.CreationDate BETWEEN DATE '2023-01-01' AND DATE '2023-12-31'
+),
+tag_list AS (
+    SELECT
+        p.Id AS QId,
+        unnest(
+            string_to_array(
+                regexp_replace(p.Tags, '^<|>$', '', 'g'), '><'
+            )
+        ) AS Tag
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE pt.Name = 'Question'
+      AND p.CreationDate BETWEEN DATE '2023-01-01' AND DATE '2023-12-31'
+),
+tag_stats AS (
+    SELECT
+        Tag,
+        COUNT(DISTINCT QId) AS TagQuestionCount,
+        RANK() OVER (ORDER BY COUNT(DISTINCT QId) DESC) AS TagRank
+    FROM tag_list
+    GROUP BY Tag
+),
+top_answer AS (
+    SELECT
+        a.ParentId AS QId,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        ROW_NUMBER() OVER (
+            PARTITION BY a.ParentId
+            ORDER BY a.Score DESC, a.CreationDate ASC
+        ) AS rn
+    FROM Posts a
+    JOIN PostTypes pt ON a.PostTypeId = pt.Id
+    WHERE pt.Name = 'Answer'
+),
+correlated_new_comments AS (
+    SELECT
+        q.QId,
+        (
+            SELECT COUNT(*)
+            FROM Comments c
+            WHERE c.PostId = q.QId
+              AND c.CreationDate > q.LastActivityDate
+        ) AS NewCommentCount
+    FROM base_questions q
+)
+SELECT
+    b.QId,
+    b.Title,
+    b.OwnerRep,
+    COALESCE(b.ViewCount,0) AS ViewCount,
+    b.AnswerCount,
+    b.TotalUpVotes,
+    COALESCE(t.AnswerScore,0) AS TopAnswerScore,
+    COALESCE(t.AnswerId,0)  AS TopAnswerId,
+    STRING_AGG(DISTINCT tl.Tag, ',') AS Tags,
+    COALESCE(th.TagQuestionCount,0) AS TagOccurrences,
+    CASE
+        WHEN COALESCE(th.TagQuestionCount,0) > 2000 THEN 'Trending'
+        WHEN COALESCE(th.TagQuestionCount,0) BETWEEN 500 AND 2000 THEN 'ModeratelyHot'
+        WHEN COALESCE(th.TagQuestionCount,0) > 0 THEN 'Common'
+        ELSE 'New'
+    END AS TagMood,
+    CASE
+        WHEN b.LastActivityDate IS NULL THEN 'NeverActive'
+        ELSE TO_CHAR(b.LastActivityDate, 'YYYY-MM-DD')
+    END AS LastActive,
+    pc.NewCommentCount
+FROM base_questions b
+LEFT JOIN top_answer t      ON b.QId          = t.QId  AND t.rn = 1
+LEFT JOIN tag_list tl       ON b.QId          = tl.QId
+LEFT JOIN tag_stats th      ON tl.Tag         = th.Tag
+LEFT JOIN correlated_new_comments pc ON b.QId  = pc.QId
+GROUP BY 
+    b.QId, b.Title, b.OwnerRep, b.ViewCount, b.LastActivityDate,
+    b.AnswerCount, b.TotalUpVotes, t.AnswerScore, t.AnswerId,
+    th.TagQuestionCount, pc.NewCommentCount
+HAVING (
+    COALESCE(b.ViewCount,0) > 5000
+    OR COALESCE(b.TotalUpVotes,0) > 500
+    OR pc.NewCommentCount > 50
+)
+UNION ALL
+SELECT
+    b.QId,
+    b.Title,
+    b.OwnerRep,
+    COALESCE(b.ViewCount,0) AS ViewCount,
+    b.AnswerCount,
+    b.TotalUpVotes,
+    0 AS TopAnswerScore,
+    0 AS TopAnswerId,
+    '' AS Tags,
+    0 AS TagOccurrences,
+    'Legacy' AS TagMood,
+    CASE
+        WHEN b.LastActivityDate IS NULL THEN 'NeverActive'
+        ELSE TO_CHAR(b.LastActivityDate, 'YYYY-MM-DD')
+    END AS LastActive,
+    0 AS NewCommentCount
+FROM base_questions b
+WHERE b.AnswerCount = 0
+ORDER BY ViewCount DESC
+LIMIT 1000;

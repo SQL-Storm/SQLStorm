@@ -1,0 +1,120 @@
+-- {"query": "27089.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2337, "output_tokens": 1646} 
+
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COALESCE(MAX(p.Score), 0) AS MaxPostScore,
+        COALESCE(AVG(p.Score), 0) AS AvgPostScore,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotes,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS TotalGoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS TotalSilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS TotalBronzeBadges
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+RecentPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(v.Id) AS VoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvoteCount,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostScore,
+        LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostScore
+    FROM
+        Posts p
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+    WHERE
+        p.CreationDate >= DATEADD(day, -30, GETDATE())
+    GROUP BY
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.Title, p.Tags, p.OwnerUserId, u.DisplayName
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.UserCreationDate,
+    ua.TotalPosts,
+    ua.TotalQuestions,
+    ua.TotalAnswers,
+    ua.MaxPostScore,
+    ua.AvgPostScore,
+    ua.TotalComments,
+    ua.TotalVotes,
+    ua.TotalUpvotes,
+    ua.TotalDownvotes,
+    ua.TotalBadges,
+    ua.TotalGoldBadges,
+    ua.TotalSilverBadges,
+    ua.TotalBronzeBadges,
+    rp.PostId,
+    rp.PostTypeId,
+    rp.PostCreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.Title,
+    rp.Tags,
+    rp.OwnerUserId,
+    rp.OwnerDisplayName,
+    rp.CommentCount,
+    rp.VoteCount,
+    rp.UpvoteCount,
+    rp.DownvoteCount,
+    rp.PreviousPostScore,
+    rp.NextPostScore,
+    CASE
+        WHEN rp.PostTypeId = 1 THEN 'Question'
+        WHEN rp.PostTypeId = 2 THEN 'Answer'
+        ELSE 'Other'
+    END AS PostTypeName,
+    CONCAT('https://stackoverflow.com/q/', CAST(rp.PostId AS VARCHAR(10))) AS PostUrl,
+    SUBSTRING(rp.Tags, 2, LEN(rp.Tags) - 2) AS CleanTags,
+    STRING_AGG(t.TagName, ', ') WITHIN GROUP (ORDER BY t.Count DESC) AS PopularTags
+FROM
+    UserActivity ua
+LEFT JOIN
+    RecentPosts rp ON ua.UserId = rp.OwnerUserId
+LEFT JOIN
+    Tags t ON rp.Tags LIKE CONCAT('%>', t.TagName, '<%')
+GROUP BY
+    ua.UserId, ua.DisplayName, ua.Reputation, ua.UserCreationDate, ua.TotalPosts, ua.TotalQuestions, ua.TotalAnswers,
+    ua.MaxPostScore, ua.AvgPostScore, ua.TotalComments, ua.TotalVotes, ua.TotalUpvotes, ua.TotalDownvotes,
+    ua.TotalBadges, ua.TotalGoldBadges, ua.TotalSilverBadges, ua.TotalBronzeBadges, rp.PostId, rp.PostTypeId,
+    rp.PostCreationDate, rp.Score, rp.ViewCount, rp.Title, rp.OwnerUserId, rp.OwnerDisplayName, rp.CommentCount,
+    rp.VoteCount, rp.UpvoteCount, rp.DownvoteCount, rp.PreviousPostScore, rp.NextPostScore, rp.PostTypeName,
+    rp.PostUrl, rp.CleanTags
+ORDER BY
+    ua.Reputation DESC, rp.PostCreationDate DESC;

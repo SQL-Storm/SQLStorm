@@ -1,0 +1,124 @@
+WITH
+RecentTopPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.OwnerDisplayName,
+    p.LastActivityDate,
+    ROW_NUMBER() OVER (
+      PARTITION BY CAST(p.CreationDate AS DATE)
+      ORDER BY p.Score DESC, p.ViewCount DESC
+    ) AS DayRank
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY
+),
+TopTagEngagement AS (
+  SELECT
+    tag AS TagName,
+    COUNT(*) AS PostCount,
+    SUM(p.ViewCount) AS TotalViews,
+    AVG(p.Score) AS AvgScore
+  FROM Posts p
+  JOIN RecentTopPosts rtp ON rtp.PostId = p.Id
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(p.Tags, '<>')) AS tag
+  ) t
+  WHERE p.PostTypeId = 1
+  GROUP BY tag
+),
+TagMeta AS (
+  SELECT
+    t.TagName,
+    t.PostCount,
+    t.TotalViews,
+    t.AvgScore,
+    CASE WHEN EXISTS (
+      SELECT 1
+      FROM Badges b
+      WHERE b.Name ILIKE '%' || t.TagName || '%'
+        AND b.TagBased = TRUE
+    ) THEN TRUE ELSE FALSE END AS TagBadgeExists
+  FROM TopTagEngagement t
+),
+CorrelatedHistory AS (
+  SELECT
+    ph.Id AS HistoryId,
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate,
+    ph.UserId,
+    ph.Text,
+    ph.Comment,
+    ph.RevisionGUID
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (10,11,12,13,16,52,53)
+),
+FinalOutput AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.OwnerDisplayName,
+    p.LastActivityDate,
+    -- build standard JSON using jsonb_build_object / jsonb_agg for broader compatibility
+    jsonb_build_object(
+      'dayRank', to_jsonb(r.DayRank),
+      'TopTags',
+        (
+          SELECT jsonb_agg(
+            jsonb_build_object(
+              'Tag', mt.TagName,
+              'Posts', mt.PostCount,
+              'Views', mt.TotalViews,
+              'AvgScore', mt.AvgScore,
+              'HasBadge', mt.TagBadgeExists
+            )
+          )
+          FROM TagMeta mt
+          WHERE mt.TagName IN (
+            SELECT unnest(string_to_array(p.Tags, '<>'))
+          )
+        )
+    ) AS Metadata
+  FROM Posts p
+  LEFT JOIN RecentTopPosts r ON r.PostId = p.Id
+  LEFT JOIN TagMeta tm ON TRUE
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90' DAY
+    AND (p.Score > 0 OR p.ViewCount > 100)
+  GROUP BY
+    p.Id,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.OwnerDisplayName,
+    p.LastActivityDate,
+    r.DayRank
+  ORDER BY p.LastActivityDate DESC
+  LIMIT 100
+)
+SELECT
+  PostId,
+  Title,
+  Tags,
+  CreationDate,
+  Score,
+  ViewCount,
+  OwnerUserId,
+  OwnerDisplayName,
+  LastActivityDate,
+  Metadata
+FROM FinalOutput;

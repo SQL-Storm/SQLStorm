@@ -1,0 +1,143 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.CreationDate) AS PostRank,
+        COUNT(CASE WHEN V.VoteTypeId = 2 THEN 1 END) OVER (PARTITION BY P.Id) AS UpVotes,
+        COUNT(CASE WHEN V.VoteTypeId = 3 THEN 1 END) OVER (PARTITION BY P.Id) AS DownVotes,
+        COUNT(CASE WHEN C.Id IS NOT NULL THEN 1 END) OVER (PARTITION BY P.Id) AS CommentCount,
+        -- aggregate tags: first collect tag names and order by tag count descending, then join into comma list
+        -- compute tag counts per post in a subquery to allow deterministic ordering
+        NULL::text AS TagsList
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    LEFT JOIN 
+        Votes V ON P.Id = V.PostId
+    LEFT JOIN 
+        Comments C ON P.Id = C.PostId
+    WHERE 
+        P.PostTypeId IN (1, 2)
+),
+PostTags AS (
+    -- explode tags and compute counts per post/tag
+    SELECT
+        P.Id AS PostId,
+        T.TagName
+    FROM
+        Posts P
+    CROSS JOIN LATERAL (
+        SELECT regexp_split_to_table(substring(P.Tags FROM 2 FOR char_length(P.Tags)-2), '><') AS TagName
+    ) AS split
+    LEFT JOIN Tags T ON split.TagName = T.TagName
+    WHERE P.PostTypeId IN (1,2)
+),
+PostTagCounts AS (
+    SELECT
+        PT.PostId,
+        PT.TagName,
+        COUNT(*) AS TagCount
+    FROM PostTags PT
+    GROUP BY PT.PostId, PT.TagName
+),
+PostTagAgg AS (
+    SELECT
+        PTC.PostId,
+        STRING_AGG(PTC.TagName, ', ' ORDER BY PTC.TagCount DESC, PTC.TagName) AS TagsList
+    FROM PostTagCounts PTC
+    GROUP BY PTC.PostId
+),
+RankedPostsWithTags AS (
+    SELECT
+        RP.Id,
+        RP.PostTypeId,
+        RP.Score,
+        RP.ViewCount,
+        RP.CreationDate,
+        RP.OwnerUserId,
+        RP.OwnerDisplayName,
+        RP.PostRank,
+        RP.UpVotes,
+        RP.DownVotes,
+        RP.CommentCount,
+        PTA.TagsList
+    FROM RankedPosts RP
+    LEFT JOIN PostTagAgg PTA ON RP.Id = PTA.PostId
+),
+TopUsers AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        U.Reputation,
+        COUNT(CASE WHEN P.PostTypeId = 1 THEN 1 END) AS QuestionsAsked,
+        COUNT(CASE WHEN P.PostTypeId = 2 THEN 1 END) AS AnswersGiven,
+        ROW_NUMBER() OVER (ORDER BY U.Reputation DESC) AS UserRank
+    FROM 
+        Users U
+    LEFT JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    GROUP BY 
+        U.Id, U.DisplayName, U.Reputation
+),
+PostHistorySummary AS (
+    SELECT 
+        PH.PostId,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN 1 END) AS EditCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN PH.CreationDate END) AS LastEditDate
+    FROM 
+        PostHistory PH
+    GROUP BY 
+        PH.PostId
+),
+BadgeSummary AS (
+    SELECT 
+        B.UserId,
+        COUNT(CASE WHEN B.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN B.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM 
+        Badges B
+    GROUP BY 
+        B.UserId
+)
+SELECT 
+    RP.Id,
+    RP.PostTypeId,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.OwnerUserId,
+    RP.OwnerDisplayName,
+    RP.PostRank,
+    RP.UpVotes,
+    RP.DownVotes,
+    RP.CommentCount,
+    RP.TagsList,
+    PHS.EditCount,
+    PHS.LastEditDate,
+    TU.DisplayName AS TopUser,
+    TU.Reputation,
+    TU.QuestionsAsked,
+    TU.AnswersGiven,
+    BS.GoldBadges,
+    BS.SilverBadges,
+    BS.BronzeBadges
+FROM 
+    RankedPostsWithTags RP
+LEFT JOIN 
+    PostHistorySummary PHS ON RP.Id = PHS.PostId
+LEFT JOIN 
+    TopUsers TU ON RP.OwnerUserId = TU.Id
+LEFT JOIN 
+    BadgeSummary BS ON RP.OwnerUserId = BS.UserId
+WHERE 
+    RP.PostRank <= 10
+    AND (TU.UserRank IS NULL OR TU.UserRank <= 10)
+ORDER BY 
+    RP.PostRank, TU.UserRank;

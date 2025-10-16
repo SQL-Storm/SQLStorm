@@ -1,0 +1,115 @@
+WITH
+    BadgeCounts AS (
+        SELECT
+            UserId,
+            COUNT(*) AS BadgeCount
+        FROM Badges
+        GROUP BY UserId
+    ),
+    PostAggregates AS (
+        SELECT
+            Id AS PostId,
+            SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+            SUM(CASE WHEN PostTypeId = 2 THEN CommentCount ELSE 0 END) AS CommentCount
+        FROM Posts
+        GROUP BY Id
+    ),
+    Questions AS (
+        SELECT
+            p.Id                    AS QuestionId,
+            p.Title,
+            p.Tags,
+            p.Score,
+            p.ViewCount,
+            p.CreationDate,
+            p.OwnerUserId,
+            COALESCE(u.Reputation, 0)   AS OwnerReputation,
+            COALESCE(u.DisplayName, 'Community') AS OwnerDisplayName,
+            COALESCE(bc.BadgeCount, 0) AS BadgeCount,
+            pa.AnswerCount,
+            pa.CommentCount,
+            (SELECT ch.UserDisplayName
+             FROM   Comments ch
+             WHERE  ch.PostId = p.Id
+             ORDER BY ch.CreationDate DESC
+             FETCH FIRST 1 ROW ONLY)                                              AS LastCommenter,
+            (SELECT ph.CreationDate
+             FROM   PostHistory ph
+             WHERE  ph.PostId = p.Id
+             ORDER BY ph.CreationDate DESC
+             FETCH FIRST 1 ROW ONLY)                                              AS LastEditDate,
+            (SELECT ll.RelatedPostId
+             FROM   PostLinks ll
+             WHERE  ll.PostId = p.Id
+               AND  ll.LinkTypeId = 3
+             FETCH FIRST 1 ROW ONLY)                                              AS DuplicateOf,
+            p.AcceptedAnswerId,
+            ROW_NUMBER() OVER(ORDER BY p.Score DESC) AS RankGlobal,
+            ROW_NUMBER() OVER(PARTITION BY SUBSTRING(p.Tags FROM 1 FOR (POSITION('>' IN p.Tags) - 1)) ORDER BY p.Score DESC) AS RankByTag
+        FROM
+            Posts p
+            LEFT JOIN Users u       ON p.OwnerUserId = u.Id
+            LEFT JOIN BadgeCounts bc ON u.Id = bc.UserId
+            LEFT JOIN PostAggregates pa ON p.Id = pa.PostId
+        WHERE
+            p.PostTypeId = 1
+    ),
+    MixedQuestions AS (
+        SELECT * FROM Questions WHERE RankGlobal <= 50
+        UNION ALL
+        SELECT * FROM Questions WHERE RankGlobal >= (SELECT MAX(RankGlobal) - 49 FROM Questions)
+    ),
+    TagExpansion AS (
+        SELECT
+            mq.QuestionId,
+            mq.Title,
+            mq.Tags,
+            mq.Score,
+            mq.ViewCount,
+            mq.CreationDate,
+            mq.OwnerUserId,
+            mq.OwnerReputation,
+            mq.OwnerDisplayName,
+            mq.BadgeCount,
+            mq.AnswerCount,
+            mq.CommentCount,
+            mq.LastCommenter,
+            mq.LastEditDate,
+            mq.DuplicateOf,
+            mq.AcceptedAnswerId,
+            mq.RankGlobal,
+            mq.RankByTag,
+            t.TagName
+        FROM
+            MixedQuestions mq
+            CROSS JOIN (SELECT TagName FROM Tags) t
+        WHERE
+            POSITION('<' || t.TagName || '>' IN mq.Tags) > 0
+    )
+SELECT
+    te.QuestionId,
+    te.Title,
+    te.Tags,
+    te.Score,
+    te.ViewCount,
+    te.CreationDate,
+    te.OwnerUserId,
+    te.OwnerReputation,
+    te.OwnerDisplayName,
+    te.BadgeCount,
+    te.AnswerCount,
+    te.CommentCount,
+    te.LastCommenter,
+    te.LastEditDate,
+    te.DuplicateOf,
+    te.AcceptedAnswerId,
+    te.RankGlobal,
+    te.RankByTag,
+    te.TagName,
+    CASE WHEN te.OwnerReputation > 1000 AND te.OwnerDisplayName IS NOT NULL THEN 1 ELSE 0 END AS EligibleForFeature
+FROM
+    TagExpansion te
+ORDER BY
+    te.CreationDate DESC,
+    te.Score DESC
+FETCH FIRST 200 ROWS ONLY;

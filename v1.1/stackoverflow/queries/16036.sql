@@ -1,0 +1,136 @@
+WITH user_activity_metrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        COUNT(DISTINCT p.Id) AS post_count,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS question_count,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS answer_count,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS avg_post_score,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL AND p.PostTypeId = 1 THEN 1 ELSE 0 END) AS accepted_questions,
+        ROW_NUMBER() OVER (PARTITION BY SUBSTRING(COALESCE(u.Location, 'Unknown'), 1, 20) ORDER BY u.Reputation DESC) AS location_rank,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS global_rank
+    FROM Users u
+    LEFT OUTER JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= CAST('2015-01-01' AS timestamp)
+        AND (u.Reputation > 1000 OR u.UpVotes > 50)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+    HAVING COUNT(DISTINCT p.Id) > 5
+),
+badge_stats AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS gold_badges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS silver_badges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS bronze_badges,
+        STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.Class = 1) AS gold_badge_names,
+        MAX(b.Date) AS latest_badge_date
+    FROM Badges b
+    WHERE b.TagBased = FALSE
+    GROUP BY b.UserId
+),
+post_engagement AS (
+    SELECT 
+        p.Id AS post_id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        COALESCE(p.CommentCount, 0) + COALESCE(p.AnswerCount, 0) AS total_engagement,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS upvote_count,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS downvote_count,
+        CASE 
+            WHEN p.ViewCount > 10000 THEN 'Viral'
+            WHEN p.ViewCount > 1000 THEN 'Popular'
+            WHEN p.ViewCount > 100 THEN 'Moderate'
+            ELSE 'Low'
+        END AS popularity_tier,
+        EXTRACT(EPOCH FROM (COALESCE(p.LastEditDate, p.CreationDate) - p.CreationDate)) / 3600.0 AS hours_to_last_edit
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+        AND p.CreationDate >= CAST('2018-01-01' AS timestamp)
+        AND p.OwnerUserId IS NOT NULL
+),
+answer_quality AS (
+    SELECT 
+        ans.ParentId AS question_id,
+        ans.Id AS answer_id,
+        ans.OwnerUserId AS answerer_id,
+        ans.Score AS answer_score,
+        CASE WHEN q.AcceptedAnswerId = ans.Id THEN 1 ELSE 0 END AS is_accepted,
+        EXTRACT(EPOCH FROM (ans.CreationDate - q.CreationDate)) / 60.0 AS minutes_to_answer,
+        LENGTH(ans.Body) AS answer_length,
+        ROW_NUMBER() OVER (PARTITION BY ans.ParentId ORDER BY ans.Score DESC, ans.CreationDate ASC) AS answer_rank
+    FROM Posts ans
+    INNER JOIN Posts q ON ans.ParentId = q.Id
+    WHERE ans.PostTypeId = 2
+        AND q.PostTypeId = 1
+        AND ans.CreationDate >= CAST('2018-01-01' AS timestamp)
+)
+SELECT 
+    uam.DisplayName,
+    uam.Reputation,
+    uam.Location,
+    uam.location_rank,
+    uam.global_rank,
+    uam.question_count,
+    uam.answer_count,
+    ROUND(CAST(uam.avg_post_score AS numeric), 2) AS avg_score,
+    COALESCE(bs.gold_badges, 0) AS gold_badges,
+    COALESCE(bs.silver_badges, 0) AS silver_badges,
+    COALESCE(bs.bronze_badges, 0) AS bronze_badges,
+    COALESCE(SUBSTRING(bs.gold_badge_names, 1, 100), 'None') AS top_gold_badges,
+    AVG(pe.total_engagement) FILTER (WHERE pe.PostTypeId = 1) AS avg_question_engagement,
+    AVG(pe.total_engagement) FILTER (WHERE pe.PostTypeId = 2) AS avg_answer_engagement,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY pe.Score) AS median_post_score,
+    COUNT(DISTINCT aq.answer_id) FILTER (WHERE aq.is_accepted = 1) AS accepted_answer_count,
+    AVG(aq.minutes_to_answer) FILTER (WHERE aq.answer_rank = 1) AS avg_time_to_first_answer_minutes,
+    ROUND(CAST(COUNT(DISTINCT aq.answer_id) FILTER (WHERE aq.answer_rank <= 3) AS numeric) * 100.0 / 
+        NULLIF(COUNT(DISTINCT aq.answer_id), 0), 2) AS top_3_answer_rate,
+    STRING_AGG(DISTINCT pe.popularity_tier, '|') AS engagement_tiers,
+    CASE 
+        WHEN uam.Reputation > 50000 AND COALESCE(bs.gold_badges, 0) >= 5 THEN 'Elite'
+        WHEN uam.Reputation > 20000 AND COALESCE(bs.gold_badges, 0) >= 2 THEN 'Expert'
+        WHEN uam.Reputation > 5000 THEN 'Advanced'
+        ELSE 'Intermediate'
+    END AS user_tier,
+    EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - uam.CreationDate)) AS days_since_joined,
+    ROUND(CAST(uam.post_count AS numeric) / NULLIF(EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - uam.CreationDate)), 0), 3) AS posts_per_day
+FROM user_activity_metrics uam
+LEFT OUTER JOIN badge_stats bs ON uam.Id = bs.UserId
+LEFT OUTER JOIN post_engagement pe ON uam.Id = pe.OwnerUserId
+LEFT OUTER JOIN answer_quality aq ON uam.Id = aq.answerer_id
+WHERE uam.location_rank <= 10
+    AND (bs.gold_badges IS NOT NULL OR uam.answer_count > 10)
+    AND NOT EXISTS (
+        SELECT 1 FROM Votes v 
+        INNER JOIN Posts p ON v.PostId = p.Id 
+        WHERE p.OwnerUserId = uam.Id 
+            AND v.VoteTypeId IN (4, 12) 
+        GROUP BY p.OwnerUserId
+        HAVING COUNT(*) > 5
+    )
+GROUP BY 
+    uam.Id,
+    uam.DisplayName, 
+    uam.Reputation, 
+    uam.Location,
+    uam.location_rank,
+    uam.global_rank,
+    uam.question_count,
+    uam.answer_count,
+    uam.avg_post_score,
+    uam.post_count,
+    uam.CreationDate,
+    bs.gold_badges,
+    bs.silver_badges,
+    bs.bronze_badges,
+    bs.gold_badge_names
+HAVING AVG(pe.Score) > 1.5 OR COUNT(DISTINCT aq.answer_id) FILTER (WHERE aq.is_accepted = 1) > 0
+ORDER BY 
+    CASE WHEN uam.Reputation > 50000 THEN uam.Reputation ELSE 0 END DESC,
+    COALESCE(bs.gold_badges, 0) DESC,
+    AVG(pe.total_engagement) DESC
+LIMIT 500;

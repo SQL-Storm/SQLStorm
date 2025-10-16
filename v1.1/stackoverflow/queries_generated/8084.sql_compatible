@@ -1,0 +1,371 @@
+with
+q as (
+  select p.Id as QuestionId,
+         p.Title,
+         p.OwnerUserId as AskerId,
+         p.CreationDate as QuestionDate,
+         p.Score as QuestionScore,
+         p.ViewCount,
+         p.Tags,
+         p.AcceptedAnswerId,
+         coalesce(p.AnswerCount, 0) as AnswerCount
+  from Posts p
+  where p.PostTypeId = 1
+),
+a as (
+  select ans.Id as AnswerId,
+         ans.ParentId as QuestionId,
+         ans.OwnerUserId as AnswererId,
+         ans.Score as AnswerScore,
+         ans.CreationDate as AnswerDate
+  from Posts ans
+  where ans.PostTypeId = 2
+),
+user_stats as (
+  select u.Id as UserId,
+         u.Reputation,
+         u.UpVotes,
+         u.DownVotes,
+         u.Views as ProfileViews,
+         u.CreationDate as UserCreationDate,
+         date_part('year', age(cast('2024-10-01 12:34:56' as timestamp), u.CreationDate)) as AccountAgeYears
+  from Users u
+),
+badge_agg as (
+  select b.UserId,
+         sum(case when b.Class = 1 then 1 else 0 end) as GoldCount,
+         sum(case when b.Class = 2 then 1 else 0 end) as SilverCount,
+         sum(case when b.Class = 3 then 1 else 0 end) as BronzeCount,
+         count(*) as TotalBadges,
+         max(b.Date) as LastBadgeDate
+  from Badges b
+  group by b.UserId
+),
+comment_agg as (
+  select c.PostId,
+         count(*) as CommentCount,
+         sum(coalesce(c.Score,0)) as CommentScoreSum,
+         max(c.CreationDate) as LastCommentDate
+  from Comments c
+  group by c.PostId
+),
+vote_agg as (
+  select v.PostId,
+         sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+         sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+         sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+         sum(case when v.VoteTypeId = 8 then coalesce(v.BountyAmount,0) else 0 end) as BountyStarted,
+         sum(case when v.VoteTypeId = 9 then coalesce(v.BountyAmount,0) else 0 end) as BountyAwarded,
+         min(v.CreationDate) as FirstVoteAt,
+         max(v.CreationDate) as LastVoteAt
+  from Votes v
+  group by v.PostId
+),
+close_events as (
+  select ph.PostId,
+         min(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as FirstClosedAt,
+         max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 11) as LastReopenedAt,
+         count(*) filter (where ph.PostHistoryTypeId = 10) as CloseCount,
+         count(*) filter (where ph.PostHistoryTypeId = 11) as ReopenCount,
+         max(case when ph.PostHistoryTypeId = 10 then ph.Comment end) as LastCloseReasonIdText
+  from PostHistory ph
+  group by ph.PostId
+),
+dup_links as (
+  select pl.PostId as DuplicateId,
+         pl.RelatedPostId as OriginalId,
+         min(pl.CreationDate) as FirstDupLinkAt
+  from PostLinks pl
+  where pl.LinkTypeId = 3
+  group by pl.PostId, pl.RelatedPostId
+),
+tag_split as (
+  select q.QuestionId,
+         unnest(string_to_array(substring(q.Tags, 2, greatest(length(q.Tags)-2,0)), '><')) as tag
+  from q
+),
+tag_metrics as (
+  select ts.QuestionId,
+         count(*) as TagCount,
+         string_agg(ts.tag, ',' order by ts.tag) as TagsCSV,
+         sum(t.Count) filter (where t.TagName = ts.tag) as SumTagGlobalCounts,
+         max(case when t.IsModeratorOnly = true then 1 else 0 end) as HasModOnlyTag
+  from tag_split ts
+  left join Tags t on t.TagName = ts.tag
+  group by ts.QuestionId
+),
+answer_rank as (
+  select a.QuestionId,
+         a.AnswerId,
+         a.AnswererId,
+         a.AnswerScore,
+         a.AnswerDate,
+         rank() over (partition by a.QuestionId order by a.AnswerScore desc, a.AnswerDate asc, a.AnswerId asc) as ScoreRank,
+         row_number() over (partition by a.QuestionId order by a.AnswerDate asc, a.AnswerId asc) as FirstAnswerOrder,
+         min(a.AnswerDate) over (partition by a.QuestionId) as FirstAnswerDate
+  from a
+),
+first_answer as (
+  select ar.QuestionId,
+         ar.AnswerId as FirstAnswerId,
+         ar.AnswererId as FirstAnswererId,
+         ar.AnswerDate as FirstAnswerDate
+  from answer_rank ar
+  where ar.FirstAnswerOrder = 1
+),
+top_answer as (
+  select ar.QuestionId,
+         ar.AnswerId as TopAnswerId,
+         ar.AnswererId as TopAnswererId,
+         ar.AnswerScore as TopAnswerScore,
+         ar.AnswerDate as TopAnswerDate
+  from answer_rank ar
+  where ar.ScoreRank = 1
+),
+accepted_vs_top as (
+  select q.QuestionId,
+         case when q.AcceptedAnswerId is not null then
+           case when q.AcceptedAnswerId = ta.TopAnswerId then 'accepted_is_top'
+                else 'accepted_not_top'
+           end
+         else 'no_accept'
+         end as AcceptTopStatus,
+         case when q.AcceptedAnswerId is not null then 1 else 0 end as HasAccepted,
+         case when q.AcceptedAnswerId = ta.TopAnswerId then 1 else 0 end as AcceptedIsTop
+  from q
+  left join top_answer ta on ta.QuestionId = q.QuestionId
+),
+user_mixes as (
+  select
+    q.QuestionId,
+    q.AskerId,
+    ua.Reputation as AskerReputation,
+    coalesce(ba.TotalBadges,0) as AskerBadges,
+    fa.FirstAnswererId,
+    ut.Reputation as FirstAnswererReputation,
+    coalesce(bt.TotalBadges,0) as FirstAnswererBadges,
+    ta.TopAnswererId,
+    utop.Reputation as TopAnswererReputation,
+    coalesce(btop.TotalBadges,0) as TopAnswererBadges
+  from q
+  left join first_answer fa on fa.QuestionId = q.QuestionId
+  left join top_answer ta on ta.QuestionId = q.QuestionId
+  left join user_stats ua on ua.UserId = q.AskerId
+  left join badge_agg ba on ba.UserId = q.AskerId
+  left join user_stats ut on ut.UserId = fa.FirstAnswererId
+  left join badge_agg bt on bt.UserId = fa.FirstAnswererId
+  left join user_stats utop on utop.UserId = ta.TopAnswererId
+  left join badge_agg btop on btop.UserId = ta.TopAnswererId
+),
+activity_spans as (
+  select
+    q.QuestionId,
+    q.QuestionDate,
+    ca.LastCommentDate,
+    va.LastVoteAt,
+    greatest(coalesce(q.QuestionDate, timestamp '1970-01-01'),
+             coalesce(ca.LastCommentDate, timestamp '1970-01-01'),
+             coalesce(va.LastVoteAt, timestamp '1970-01-01')) as LastActivityFromAgg,
+    p.LastActivityDate as LastActivityFromPost,
+    extract(epoch from (greatest(coalesce(ca.LastCommentDate, q.QuestionDate), q.QuestionDate) - q.QuestionDate)) as TimeToFirstCommentSec_f,
+    extract(epoch from (coalesce(va.FirstVoteAt, q.QuestionDate) - q.QuestionDate)) as TimeToFirstVoteSec_f
+  from q
+  left join comment_agg ca on ca.PostId = q.QuestionId
+  left join vote_agg va on va.PostId = q.QuestionId
+  left join Posts p on p.Id = q.QuestionId
+),
+scored as (
+  select
+    q.QuestionId,
+    q.Title,
+    q.Tags,
+    q.QuestionDate,
+    q.QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    coalesce(va.UpVotes,0) as UpVotes,
+    coalesce(va.DownVotes,0) as DownVotes,
+    coalesce(va.Favorites,0) as Favorites,
+    coalesce(va.BountyStarted,0) as BountyStarted,
+    coalesce(va.BountyAwarded,0) as BountyAwarded,
+    coalesce(ca.CommentCount,0) as CommentCount,
+    coalesce(ca.CommentScoreSum,0) as CommentScoreSum
+  from q
+  left join vote_agg va on va.PostId = q.QuestionId
+  left join comment_agg ca on ca.PostId = q.QuestionId
+),
+heavy_calc as (
+  select
+    s.*,
+    tm.TagCount,
+    tm.TagsCSV,
+    tm.SumTagGlobalCounts,
+    tm.HasModOnlyTag,
+    ae.FirstClosedAt,
+    ae.LastReopenedAt,
+    ae.CloseCount,
+    ae.ReopenCount,
+    dl.FirstDupLinkAt,
+    case when s.ViewCount > 0
+         then round((s.UpVotes - s.DownVotes) * 1.0 / nullif(s.ViewCount,0) * 1000, 6)
+         else null end as NetVotesPerKViews,
+    case when s.AnswerCount > 0
+         then round((s.Favorites) * 1.0 / nullif(s.AnswerCount,0), 6)
+         else null end as FavoritesPerAnswer,
+    case when s.AnswerCount > 0
+         then round((s.CommentCount) * 1.0 / nullif(s.AnswerCount,0), 6)
+         else null end as CommentsPerAnswer,
+    case when s.UpVotes + s.DownVotes > 0
+         then round((s.UpVotes) * 1.0 / nullif((s.UpVotes + s.DownVotes),0), 6)
+         else null end as UpvoteRatio,
+    case when s.BountyStarted > 0
+         then round((s.BountyAwarded) * 1.0 / nullif(s.BountyStarted,0), 6)
+         else null end as BountyAwardRate
+  from scored s
+  left join tag_metrics tm on tm.QuestionId = s.QuestionId
+  left join close_events ae on ae.PostId = s.QuestionId
+  left join dup_links dl on dl.DuplicateId = s.QuestionId
+),
+normalized as (
+  select
+    h.*,
+    case
+      when h.TagCount is null or h.TagCount = 0 then 'untagged'
+      when h.TagCount = 1 then 'single'
+      when h.TagCount between 2 and 3 then 'few'
+      when h.TagCount between 4 and 5 then 'many'
+      else 'too_many'
+    end as TagCountBucket,
+    case
+      when h.QuestionScore >= 10 then 'hot'
+      when h.QuestionScore between 1 and 9 then 'warm'
+      when h.QuestionScore = 0 then 'neutral'
+      when h.QuestionScore between -4 and -1 then 'cold'
+      else 'frozen'
+    end as ScoreBucket,
+    case when h.HasModOnlyTag = 1 then 'mod_only_present' else 'regular' end as TagType,
+    case when h.FirstClosedAt is not null then 1 else 0 end as WasClosed,
+    case when h.LastReopenedAt is not null then 1 else 0 end as WasReopened
+  from heavy_calc h
+),
+time_windows as (
+  select
+    n.*,
+    aspan.LastActivityFromAgg,
+    aspan.LastActivityFromPost,
+    cast(aspan.TimeToFirstCommentSec_f as bigint) as TimeToFirstCommentSec,
+    cast(aspan.TimeToFirstVoteSec_f as bigint) as TimeToFirstVoteSec,
+    fa.FirstAnswerDate,
+    ta.TopAnswerDate,
+    cast(extract(epoch from (coalesce(ta.TopAnswerDate, n.QuestionDate) - n.QuestionDate)) as bigint) as TimeToTopAnswerSec,
+    cast(extract(epoch from (coalesce(fa.FirstAnswerDate, n.QuestionDate) - n.QuestionDate)) as bigint) as TimeToFirstAnswerSec
+  from normalized n
+  left join activity_spans aspan on aspan.QuestionId = n.QuestionId
+  left join first_answer fa on fa.QuestionId = n.QuestionId
+  left join top_answer ta on ta.QuestionId = n.QuestionId
+),
+final_rank as (
+  select
+    tw.*,
+    uv.AcceptTopStatus,
+    uv.HasAccepted,
+    uv.AcceptedIsTop,
+    um.AskerReputation,
+    um.AskerBadges,
+    um.FirstAnswererReputation,
+    um.FirstAnswererBadges,
+    um.TopAnswererReputation,
+    um.TopAnswererBadges,
+    row_number() over (
+      partition by tw.ScoreBucket, tw.TagCountBucket
+      order by
+        coalesce(tw.NetVotesPerKViews, 0) desc,
+        coalesce(tw.UpvoteRatio, 0) desc,
+        tw.Favorites desc,
+        tw.AnswerCount desc,
+        tw.ViewCount desc,
+        tw.QuestionId
+    ) as BucketRank,
+    dense_rank() over (
+      order by
+        coalesce(tw.BountyAwardRate, 0) desc,
+        coalesce(tw.NetVotesPerKViews, 0) desc,
+        coalesce(tw.UpvoteRatio, 0) desc,
+        coalesce(tw.CommentScoreSum, 0) desc,
+        coalesce(tw.SumTagGlobalCounts, 0) desc,
+        tw.QuestionScore desc
+    ) as GlobalDenseRank
+  from time_windows tw
+  left join accepted_vs_top uv on uv.QuestionId = tw.QuestionId
+  left join user_mixes um on um.QuestionId = tw.QuestionId
+),
+filter_rare as (
+  select fr.*
+  from final_rank fr
+  where
+    (
+      (fr.HasAccepted = 1 and fr.AcceptTopStatus <> 'no_accept')
+      or (fr.TagType = 'regular' and fr.TagCount between 2 and 5)
+      or (fr.WasClosed = 1 and fr.ReopenCount >= 1)
+    )
+    and coalesce(fr.UpVotes,0) + coalesce(fr.DownVotes,0) >= 3
+    and (fr.SumTagGlobalCounts is null or fr.SumTagGlobalCounts > 0)
+    and (
+      fr.TimeToFirstAnswerSec is null
+      or fr.TimeToFirstAnswerSec >= 0
+    )
+    and (
+      fr.Tags is null
+      or position('java' in lower(fr.Tags)) > 0
+      or position('python' in lower(fr.Tags)) > 0
+      or position('sql' in lower(fr.Tags)) > 0
+    )
+)
+select
+  f.QuestionId,
+  coalesce(nullif(trim(regexp_replace(coalesce(f.Title,''), '\s+', ' ', 'g')), ''), '(no title)') as CleanTitle,
+  f.ScoreBucket,
+  f.TagCountBucket,
+  f.TagType,
+  f.UpVotes,
+  f.DownVotes,
+  f.UpvoteRatio,
+  f.ViewCount,
+  f.NetVotesPerKViews,
+  f.Favorites,
+  f.BountyStarted,
+  f.BountyAwarded,
+  f.AnswerCount,
+  f.CommentCount,
+  f.CommentScoreSum,
+  f.SumTagGlobalCounts,
+  f.HasModOnlyTag,
+  f.WasClosed,
+  f.WasReopened,
+  f.CloseCount,
+  f.ReopenCount,
+  f.AcceptTopStatus,
+  f.HasAccepted,
+  f.AcceptedIsTop,
+  f.TimeToFirstAnswerSec,
+  f.TimeToTopAnswerSec,
+  f.TimeToFirstVoteSec,
+  f.LastActivityFromPost,
+  f.LastActivityFromAgg,
+  f.BucketRank,
+  f.GlobalDenseRank,
+  f.AskerReputation,
+  f.AskerBadges,
+  f.FirstAnswererReputation,
+  f.FirstAnswererBadges,
+  f.TopAnswererReputation,
+  f.TopAnswererBadges,
+  substring(coalesce(f.TagsCSV, '') from 1 for 200) as TagsCSV_Truncated
+from filter_rare f
+where f.BucketRank <= 50
+order by
+  f.GlobalDenseRank,
+  f.ScoreBucket,
+  f.TagCountBucket,
+  f.BucketRank,
+  f.QuestionId;

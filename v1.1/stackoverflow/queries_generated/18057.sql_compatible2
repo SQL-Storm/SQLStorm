@@ -1,0 +1,163 @@
+WITH
+  TopUsers AS (
+    SELECT
+      Id AS UserId,
+      DisplayName,
+      Reputation,
+      ROW_NUMBER() OVER (ORDER BY Reputation DESC) AS rn
+    FROM Users
+    WHERE
+      Id > 0 AND DisplayName IS NOT NULL
+  ),
+  QuestionStats AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.OwnerUserId,
+      p.Title,
+      p.CreationDate,
+      p.Score,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.ViewCount,
+      p.ClosedDate,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL THEN CAST(EXTRACT(EPOCH FROM (p.ClosedDate - p.CreationDate)) / 86400 AS INTEGER)
+        ELSE NULL
+      END AS DaysToClose,
+      pt.Name AS PostType
+    FROM Posts p
+    JOIN PostTypes pt
+      ON p.PostTypeId = pt.Id
+    WHERE
+      pt.Name = 'Question'
+      AND p.OwnerUserId IS NOT NULL
+      AND p.OwnerUserId > 0
+    GROUP BY
+      p.Id,
+      p.OwnerUserId,
+      p.Title,
+      p.CreationDate,
+      p.Score,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.ViewCount,
+      p.ClosedDate,
+      pt.Name
+  ),
+  AnswerQuality AS (
+    SELECT
+      a.Id AS AnswerId,
+      a.ParentId AS QuestionId,
+      a.OwnerUserId,
+      a.Score AS AnswerScore,
+      ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS RankByScore,
+      CASE WHEN a.Id = (SELECT p.AcceptedAnswerId FROM Posts p WHERE p.Id = a.ParentId) THEN 1 ELSE 0 END AS IsAcceptedAnswer
+    FROM Posts a
+    WHERE
+      a.PostTypeId = 2
+    GROUP BY
+      a.Id,
+      a.ParentId,
+      a.OwnerUserId,
+      a.Score,
+      a.CreationDate
+  ),
+  UserEngagement AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.PostId END) AS UpvotesGiven,
+      COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.PostId END) AS DownvotesGiven,
+      COUNT(DISTINCT c.Id) AS CommentsMade,
+      COUNT(DISTINCT b.Id) AS BadgesEarned
+    FROM Users u
+    LEFT JOIN Votes v
+      ON u.Id = v.UserId
+    LEFT JOIN Comments c
+      ON u.Id = c.UserId
+    LEFT JOIN Badges b
+      ON u.Id = b.UserId
+    WHERE
+      u.Id > 0
+    GROUP BY
+      u.Id,
+      u.DisplayName
+  )
+SELECT
+  qs.QuestionId,
+  qs.Title,
+  qs.CreationDate AS QuestionCreationDate,
+  qs.Score AS QuestionScore,
+  qs.AnswerCount,
+  qs.FavoriteCount,
+  qs.ViewCount,
+  qs.DaysToClose,
+  qs.PostType,
+  tu.DisplayName AS QuestionOwnerDisplayName,
+  tu.Reputation AS QuestionOwnerReputation,
+  aq.AnswerId AS BestAnswerId,
+  aq.AnswerScore AS BestAnswerScore,
+  aq.OwnerUserId AS BestAnswerOwnerUserId,
+  ue.DisplayName AS BestAnswerOwnerDisplayName,
+  ue.Reputation AS BestAnswerOwnerReputation,
+  ue.UpvotesGiven AS BestAnswerOwnerUpvotesGiven,
+  ue.CommentsMade AS BestAnswerOwnerCommentsMade,
+  ue.BadgesEarned AS BestAnswerOwnerBadgesEarned,
+  CASE
+    WHEN qs.ClosedDate IS NOT NULL THEN 'Closed'
+    WHEN qs.Score > 100 THEN 'Highly Scored'
+    WHEN qs.FavoriteCount > 50 THEN 'Frequently Favorited'
+    ELSE 'Standard'
+  END AS QuestionStatusCategory,
+  COALESCE(qs.ViewCount * 0.001 + qs.AnswerCount * 0.5 + qs.FavoriteCount * 1.2, 0) AS EngagementMetric
+FROM QuestionStats qs
+JOIN TopUsers tu
+  ON qs.OwnerUserId = tu.UserId
+LEFT JOIN AnswerQuality aq
+  ON qs.QuestionId = aq.QuestionId AND aq.RankByScore = 1
+LEFT JOIN UserEngagement ue
+  ON aq.OwnerUserId = ue.UserId
+WHERE
+  qs.Score > 5
+  AND qs.AnswerCount BETWEEN 2 AND 10
+  AND qs.CreationDate BETWEEN DATE '2023-01-01' AND DATE '2023-12-31'
+  AND (tu.Reputation > 10000 OR tu.rn <= 50)
+UNION
+SELECT
+  qs.QuestionId,
+  qs.Title,
+  qs.CreationDate AS QuestionCreationDate,
+  qs.Score AS QuestionScore,
+  qs.AnswerCount,
+  qs.FavoriteCount,
+  qs.ViewCount,
+  qs.DaysToClose,
+  qs.PostType,
+  tu.DisplayName AS QuestionOwnerDisplayName,
+  tu.Reputation AS QuestionOwnerReputation,
+  NULL AS BestAnswerId,
+  NULL AS BestAnswerScore,
+  NULL AS BestAnswerOwnerUserId,
+  NULL AS BestAnswerOwnerDisplayName,
+  NULL AS BestAnswerOwnerReputation,
+  NULL AS BestAnswerOwnerUpvotesGiven,
+  NULL AS BestAnswerOwnerCommentsMade,
+  NULL AS BestAnswerOwnerBadgesEarned,
+  'No Qualified Answer' AS QuestionStatusCategory,
+  COALESCE(qs.ViewCount * 0.001 + qs.AnswerCount * 0.5 + qs.FavoriteCount * 1.2, 0) AS EngagementMetric
+FROM QuestionStats qs
+JOIN TopUsers tu
+  ON qs.OwnerUserId = tu.UserId
+WHERE
+  qs.Score > 5
+  AND qs.AnswerCount BETWEEN 2 AND 10
+  AND qs.CreationDate BETWEEN DATE '2023-01-01' AND DATE '2023-12-31'
+  AND (tu.Reputation > 10000 OR tu.rn <= 50)
+  AND NOT EXISTS (
+    SELECT 1
+    FROM AnswerQuality aq
+    WHERE qs.QuestionId = aq.QuestionId AND aq.RankByScore = 1
+  )
+ORDER BY
+  EngagementMetric DESC
+LIMIT 100;

@@ -1,0 +1,262 @@
+WITH UserBaseStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName AS UserName,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views AS UserProfileViews,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.WebsiteUrl,
+        u.Location,
+        u.AboutMe,
+        NTILE(5) OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS ReputationTier,
+        CASE
+            WHEN u.WebsiteUrl IS NOT NULL AND LENGTH(TRIM(u.WebsiteUrl)) > 0 THEN 'Has Website'
+            ELSE 'No Website'
+        END AS HasWebsiteFlag,
+        EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate)) AS AccountAgeDays,
+        COALESCE(u.Location, 'Unspecified') AS UserLocationNormalized
+    FROM
+        Users u
+    WHERE
+        u.Reputation > 100
+        AND u.LastAccessDate >= (CAST('2024-10-01' AS date) - INTERVAL '2 year')
+),
+PostCoreMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        p.OwnerUserId,
+        p.OwnerDisplayName,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount AS DirectCommentCountFromPost,
+        p.FavoriteCount,
+        COALESCE(p.ClosedDate, CAST('1900-01-01' AS timestamp)) AS ClosedDateSentinel,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate)) / 3600 AS PostAgeHours,
+        COALESCE(LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, '><', '')) - 1, 0) AS InitialTagCount,
+        LOWER(TRIM(SUBSTRING(p.Tags FROM 2 FOR (LENGTH(p.Tags) - 2)))) AS TagsConcatenated,
+        p.CommunityOwnedDate
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId IN (1, 2)
+        AND p.CreationDate >= CAST('2020-01-01' AS date)
+        AND p.Score >= -5
+),
+PostDetailedAggregates AS (
+    SELECT
+        pcm.PostId,
+        pcm.PostTypeId,
+        pcm.OwnerUserId,
+        pcm.PostScore,
+        pcm.PostViewCount,
+        pcm.AcceptedAnswerId,
+        pcm.ParentId,
+        pcm.PostCreationDate,
+        pcm.LastEditDate,
+        pcm.Title,
+        pcm.Tags,
+        pcm.InitialTagCount,
+        pcm.PostAgeHours,
+        pcm.TagsConcatenated,
+        pcm.ClosedDateSentinel,
+        pcm.DirectCommentCountFromPost,
+        pcm.FavoriteCount AS DirectFavoriteCountFromPost,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVoteCountFromVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVoteCountFromVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END), 0) AS FavoriteCountFromVotes,
+        COUNT(DISTINCT c.Id) AS TotalCommentsAggregated,
+        AVG(c.Score) FILTER (WHERE c.Score IS NOT NULL) AS AvgCommentScore,
+        COUNT(DISTINCT ph.Id) AS TotalPostHistoryEntries,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS LastEditHistoryDate,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.Id ELSE NULL END) AS TotalMinorEdits
+    FROM
+        PostCoreMetrics pcm
+    LEFT JOIN Votes v ON pcm.PostId = v.PostId
+    LEFT JOIN Comments c ON pcm.PostId = c.PostId
+    LEFT JOIN PostHistory ph ON pcm.PostId = ph.PostId
+    GROUP BY
+        pcm.PostId, pcm.PostTypeId, pcm.OwnerUserId, pcm.PostScore, pcm.PostViewCount, pcm.AcceptedAnswerId,
+        pcm.ParentId, pcm.PostCreationDate, pcm.LastEditDate, pcm.Title, pcm.Tags, pcm.InitialTagCount,
+        pcm.PostAgeHours, pcm.TagsConcatenated, pcm.ClosedDateSentinel, pcm.DirectCommentCountFromPost, pcm.FavoriteCount
+),
+UserOverallEngagement AS (
+    SELECT
+        ubs.UserId,
+        ubs.UserName,
+        ubs.Reputation,
+        ubs.ReputationTier,
+        ubs.AccountAgeDays,
+        ubs.HasWebsiteFlag,
+        ubs.UserLocationNormalized,
+        ubs.AboutMe,
+        COUNT(pda.PostId) AS TotalPostsOwned,
+        COUNT(CASE WHEN pda.PostTypeId = 1 THEN pda.PostId ELSE NULL END) AS TotalQuestionsOwned,
+        COUNT(CASE WHEN pda.PostTypeId = 2 THEN pda.PostId ELSE NULL END) AS TotalAnswersOwned,
+        COALESCE(SUM(pda.PostScore), 0) AS TotalScoreAcrossPosts,
+        COALESCE(AVG(pda.PostScore), 0) AS AvgPostScore,
+        COALESCE(MAX(pda.PostViewCount), 0) AS MaxPostViewCount,
+        COALESCE(SUM(pda.TotalCommentsAggregated), 0) AS TotalCommentsReceived,
+        COALESCE(SUM(pda.FavoriteCountFromVotes), 0) AS TotalFavoritesReceived,
+        COALESCE(SUM(pda.UpVoteCountFromVotes), 0) AS TotalUpVotesReceived,
+        COALESCE(SUM(pda.DownVoteCountFromVotes), 0) AS TotalDownVotesReceived,
+        MAX(pda.PostCreationDate) AS LastPostCreationDate,
+        MAX(pda.LastEditHistoryDate) AS LastPostEditEventDate,
+        COALESCE(LAG(MAX(pda.PostCreationDate)) OVER (PARTITION BY ubs.UserId ORDER BY MAX(pda.PostCreationDate)), CAST('1900-01-01' AS timestamp)) AS PreviousPostCreationDate,
+        (SELECT COUNT(DISTINCT b.Id) FROM Badges b WHERE b.UserId = ubs.UserId) AS TotalBadges,
+        (SELECT COUNT(DISTINCT b.Id) FROM Badges b WHERE b.UserId = ubs.UserId AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(DISTINCT b.Id) FROM Badges b WHERE b.UserId = ubs.UserId AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(DISTINCT b.Id) FROM Badges b WHERE b.UserId = ubs.UserId AND b.Class = 3) AS BronzeBadges
+    FROM
+        UserBaseStats ubs
+    LEFT JOIN PostDetailedAggregates pda ON ubs.UserId = pda.OwnerUserId
+    GROUP BY
+        ubs.UserId, ubs.UserName, ubs.Reputation, ubs.ReputationTier, ubs.AccountAgeDays,
+        ubs.HasWebsiteFlag, ubs.UserLocationNormalized, ubs.AboutMe
+    HAVING
+        COUNT(pda.PostId) > 0
+),
+RankedUserEngagement AS (
+    SELECT
+        uoe.*,
+        (CASE WHEN uoe.TotalPostsOwned = 0 THEN 0 ELSE CAST(uoe.TotalUpVotesReceived AS NUMERIC) / uoe.TotalPostsOwned END) AS AvgUpVotesPerPost,
+        (CASE WHEN uoe.AccountAgeDays = 0 THEN 0 ELSE CAST(uoe.TotalPostsOwned AS NUMERIC) / uoe.AccountAgeDays * 30.0 END) AS MonthlyPostRateEstimate,
+        RANK() OVER (PARTITION BY uoe.ReputationTier ORDER BY uoe.TotalScoreAcrossPosts DESC, uoe.TotalPostsOwned DESC) AS RankInReputationTier,
+        DENSE_RANK() OVER (ORDER BY uoe.TotalScoreAcrossPosts DESC, uoe.TotalPostsOwned DESC, uoe.LastPostCreationDate DESC) AS OverallEngagementRank,
+        ROW_NUMBER() OVER (PARTITION BY uoe.UserId ORDER BY uoe.LastPostCreationDate DESC) AS rn
+    FROM
+        UserOverallEngagement uoe
+)
+SELECT
+    rue.UserId,
+    rue.UserName,
+    rue.Reputation,
+    rue.ReputationTier,
+    rue.AccountAgeDays,
+    rue.HasWebsiteFlag,
+    rue.UserLocationNormalized,
+    COALESCE(rue.AboutMe, 'No "About Me" provided') AS AboutMeSummary,
+    rue.TotalPostsOwned,
+    rue.TotalQuestionsOwned,
+    rue.TotalAnswersOwned,
+    rue.TotalScoreAcrossPosts,
+    rue.AvgPostScore,
+    rue.MaxPostViewCount,
+    rue.TotalCommentsReceived,
+    rue.TotalFavoritesReceived,
+    rue.TotalUpVotesReceived,
+    rue.TotalDownVotesReceived,
+    rue.LastPostCreationDate,
+    rue.LastPostEditEventDate,
+    rue.PreviousPostCreationDate,
+    EXTRACT(DAY FROM (rue.LastPostCreationDate - rue.PreviousPostCreationDate)) AS DaysSincePreviousPost,
+    rue.TotalBadges,
+    rue.GoldBadges,
+    rue.SilverBadges,
+    rue.BronzeBadges,
+    rue.AvgUpVotesPerPost,
+    rue.MonthlyPostRateEstimate,
+    rue.RankInReputationTier,
+    rue.OverallEngagementRank,
+    (
+        SELECT
+            pq.Title
+        FROM
+            PostDetailedAggregates pq
+        WHERE
+            pq.OwnerUserId = rue.UserId
+            AND pq.PostTypeId = 1
+            AND pq.PostScore = (SELECT MAX(pq2.PostScore) FROM PostDetailedAggregates pq2 WHERE pq2.OwnerUserId = rue.UserId AND pq2.PostTypeId = 1)
+        ORDER BY pq.PostCreationDate DESC, pq.PostId DESC
+        LIMIT 1
+    ) AS TopQuestionTitle,
+    (
+        SELECT
+            ph_inner.Text
+        FROM
+            PostDetailedAggregates pq
+        JOIN PostHistory ph_inner ON pq.PostId = ph_inner.PostId
+        WHERE
+            pq.OwnerUserId = rue.UserId
+            AND pq.PostTypeId = 1
+            AND pq.PostScore = (SELECT MAX(pq2.PostScore) FROM PostDetailedAggregates pq2 WHERE pq2.OwnerUserId = rue.UserId AND pq2.PostTypeId = 1)
+            AND ph_inner.PostHistoryTypeId = 5
+        ORDER BY ph_inner.CreationDate DESC, ph_inner.Id DESC
+        LIMIT 1
+    ) AS TopQuestionLastBodyEditText,
+    (
+        SELECT
+            AVG(pa.Score)
+        FROM
+            Posts q
+        JOIN Posts pa ON q.AcceptedAnswerId = pa.Id
+        WHERE
+            pa.OwnerUserId = rue.UserId
+            AND pa.PostTypeId = 2
+            AND q.PostTypeId = 1
+            AND pa.Score IS NOT NULL
+            AND q.OwnerUserId IS DISTINCT FROM rue.UserId
+    ) AS AvgScoreOfAcceptedAnswersGiven,
+    ROUND(
+        (CAST(rue.TotalScoreAcrossPosts AS NUMERIC) / NULLIF(rue.TotalPostsOwned, 0)) +
+        (CAST(rue.TotalCommentsReceived AS NUMERIC) / NULLIF(rue.AccountAgeDays, 0) * 10) +
+        (CAST(rue.TotalFavoritesReceived AS NUMERIC) * 5) +
+        (CASE WHEN rue.HasWebsiteFlag = 'Has Website' THEN 50 ELSE 0 END) +
+        (rue.GoldBadges * 100 + rue.SilverBadges * 50 + rue.BronzeBadges * 10) +
+        (rue.MonthlyPostRateEstimate * 2) +
+        (CASE WHEN rue.LastPostCreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '3 months') THEN 25 ELSE 0 END),
+    2) AS UserInfluenceIndex,
+    CASE
+        WHEN rue.UserLocationNormalized ILIKE '%usa%' OR rue.UserLocationNormalized ILIKE '%america%' THEN 'North America (USA)'
+        WHEN rue.UserLocationNormalized ILIKE '%canada%' THEN 'North America (Canada)'
+        WHEN rue.UserLocationNormalized ILIKE '%uk%' OR rue.UserLocationNormalized ILIKE '%england%' OR rue.UserLocationNormalized ILIKE '%scotland%' OR rue.UserLocationNormalized ILIKE '%ireland%' THEN 'Europe (UK/IE)'
+        WHEN rue.UserLocationNormalized ILIKE '%germany%' OR rue.UserLocationNormalized ILIKE '%france%' OR rue.UserLocationNormalized ILIKE '%spain%' OR rue.UserLocationNormalized ILIKE '%italy%' OR rue.UserLocationNormalized ILIKE '%netherlands%' THEN 'Europe (Mainland)'
+        WHEN rue.UserLocationNormalized ILIKE '%india%' OR rue.UserLocationNormalized ILIKE '%china%' OR rue.UserLocationNormalized ILIKE '%japan%' OR rue.UserLocationNormalized ILIKE '%korea%' OR rue.UserLocationNormalized ILIKE '%singapore%' THEN 'Asia'
+        WHEN rue.UserLocationNormalized ILIKE '%australia%' OR rue.UserLocationNormalized ILIKE '%new zealand%' THEN 'Oceania'
+        WHEN rue.UserLocationNormalized ILIKE '%brazil%' OR rue.UserLocationNormalized ILIKE '%mexico%' OR rue.UserLocationNormalized ILIKE '%argentina%' THEN 'Latin America'
+        WHEN rue.UserLocationNormalized = 'Unspecified' OR rue.UserLocationNormalized IS NULL THEN 'Location Not Provided'
+        ELSE 'Other/Uncategorized'
+    END AS UserRegionCategory,
+    EXISTS (
+        SELECT 1 FROM PostLinks pl
+        WHERE pl.PostId = (
+            SELECT pda.PostId
+            FROM PostDetailedAggregates pda
+            WHERE pda.OwnerUserId = rue.UserId
+            ORDER BY pda.PostCreationDate DESC
+            LIMIT 1
+        )
+        AND pl.LinkTypeId IN (1, 3)
+    ) AS HasLinkedPostsOnLatest,
+    CASE
+        WHEN rue.Reputation > 5000 AND rue.TotalQuestionsOwned > 10 AND rue.AvgPostScore > 20 AND rue.GoldBadges >= 1 THEN 'High-Impact Leader'
+        WHEN rue.Reputation > 2000 AND rue.TotalAnswersOwned > 20 AND rue.AvgPostScore > 10 AND rue.SilverBadges >= 2 THEN 'Experienced Contributor'
+        ELSE 'Active Member'
+    END AS UserRoleClassification
+FROM
+    RankedUserEngagement rue
+WHERE
+    rue.rn = 1
+    AND rue.TotalPostsOwned >= 5
+    AND rue.AvgPostScore >= 2
+    AND rue.RankInReputationTier <= 100
+    AND rue.OverallEngagementRank <= 2000
+    AND (rue.GoldBadges > 0 OR rue.SilverBadges > 2)
+    AND (
+        rue.UserLocationNormalized ILIKE '%software%' OR rue.UserLocationNormalized ILIKE '%developer%' OR
+        EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = rue.UserId AND b.Name IN ('Autobiographer', 'Editor', 'Reviewer', 'Strunk & White'))
+    )
+ORDER BY
+    rue.OverallEngagementRank ASC, rue.UserInfluenceIndex DESC, rue.Reputation DESC
+LIMIT 1000;

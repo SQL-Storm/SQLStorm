@@ -1,0 +1,155 @@
+-- {"query": "215.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.2, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1397} 
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount, 0) as TotalAnswers,
+        coalesce(p.ViewCount, 0) as TotalViews,
+        row_number() over (order by t.Count desc, t.TagName) as TagRank
+    from Tags t
+    left join (
+        select
+            unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as Tag,
+            sum(case when p.PostTypeId = 1 then p.AnswerCount else 0 end) as AnswerCount,
+            sum(case when p.PostTypeId = 1 then p.ViewCount else 0 end) as ViewCount
+        from Posts p
+        where p.PostTypeId = 1
+        group by Tag
+    ) p on p.Tag = t.TagName
+    where t.IsModeratorOnly = 0
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        count(distinct b.Name) as DistinctBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostActivityWindow as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        count(c.Id) over (partition by p.Id) as CommentCount,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as UserPostRank,
+        lag(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as PrevScore,
+        lead(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as NextScore
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    where p.PostTypeId in (1, 2)
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        u.DisplayName as PostOwner,
+        ru.DisplayName as RelatedPostOwner,
+        p.Title as PostTitle,
+        rp.Title as RelatedPostTitle
+    from PostLinks pl
+    join Posts p on p.Id = pl.PostId
+    join Posts rp on rp.Id = pl.RelatedPostId
+    left join Users u on u.Id = p.OwnerUserId
+    left join Users ru on ru.Id = rp.OwnerUserId
+    where pl.LinkTypeId = 3
+),
+ClosedQuestionsWithReasons as (
+    select
+        ph.PostId,
+        ph.CreationDate as CloseDate,
+        crt.Name as CloseReason,
+        ph.UserId as ClosedByUserId,
+        u.DisplayName as ClosedByUserName
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    left join Users u on u.Id = ph.UserId
+    where ph.PostHistoryTypeId = 10
+),
+UserActivitySummary as (
+    select
+        u.Id,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersGiven,
+        count(distinct c.Id) as CommentsMade,
+        coalesce(sum(vt.VoteCount), 0) as TotalVotesReceived,
+        max(p.CreationDate) as LastPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join (
+        select
+            p.OwnerUserId,
+            count(v.Id) as VoteCount
+        from Votes v
+        join Posts p on p.Id = v.PostId
+        group by p.OwnerUserId
+    ) vt on vt.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+)
+select
+    rtc.TagRank,
+    rtc.TagName,
+    rtc.Count as TagUsageCount,
+    rtc.TotalAnswers,
+    rtc.TotalViews,
+    ubs.UserId,
+    ubs.DisplayName as UserName,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.DistinctBadges,
+    ubs.LastBadgeDate,
+    pas.QuestionsAsked,
+    pas.AnswersGiven,
+    pas.CommentsMade,
+    pas.TotalVotesReceived,
+    pas.LastPostDate,
+    da.PostId as DuplicatePostId,
+    da.RelatedPostId as DuplicateOfPostId,
+    da.PostOwner,
+    da.RelatedPostOwner,
+    da.PostTitle,
+    da.RelatedPostTitle,
+    cqwr.CloseDate,
+    cqwr.CloseReason,
+    cqwr.ClosedByUserName,
+    paw.Score,
+    paw.ViewCount,
+    paw.CommentCount,
+    paw.UserPostRank,
+    paw.PrevScore,
+    paw.NextScore
+from RecursiveTagCounts rtc
+left join LATERAL (
+    select ub.UserId, ub.DisplayName, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ub.DistinctBadges, ub.LastBadgeDate
+    from UserBadgeStats ub
+    where ub.UserId = (
+        select p.OwnerUserId from Posts p
+        where p.PostTypeId = 1 and p.Tags like concat('%<', rtc.TagName, '>%')
+        order by p.Score desc nulls last limit 1
+    )
+    limit 1
+) ubs on true
+left join UserActivitySummary pas on pas.Id = ubs.UserId
+left join DuplicateLinks da on da.PostId = (
+    select p.Id from Posts p
+    where p.PostTypeId = 1 and p.Tags like concat('%<', rtc.TagName, '>%')
+    order by p.CreationDate desc limit 1
+)
+left join ClosedQuestionsWithReasons cqwr on cqwr.PostId = da.PostId
+left join PostActivityWindow paw on paw.Id = da.PostId
+where rtc.TagRank <= 50
+order by rtc.TagRank, pas.TotalVotesReceived desc;

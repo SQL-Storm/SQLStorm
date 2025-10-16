@@ -1,0 +1,110 @@
+-- {"query": "25015.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2319} 
+
+/*  Performance‑benchmarking query for the StackOverflow data model   */
+WITH UserPostStats AS (
+    SELECT
+        u.Id                                   AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COALESCE(SUM(p.Score),0)               AS TotalScore,
+        MAX(p.CreationDate)                    AS LastPostDate,
+        MAX(p.LastActivityDate)                AS LastActivityDate
+    FROM Users u
+    LEFT JOIN Posts p
+           ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+BadgeAgg AS (
+    SELECT
+        b.UserId,
+        COUNT(*)                                          AS TotalBadges,
+        COUNT(*) FILTER (WHERE b.Class = 1)               AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2)               AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3)               AS BronzeBadges,
+        STRING_AGG(DISTINCT b.Name, ', ')                AS BadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserLatestVote AS (
+    SELECT
+        v.UserId,
+        MAX(v.CreationDate)                              AS LastVoteDate,
+        COUNT(*) FILTER (WHERE vt.Name = 'UpMod')       AS UpVotesGiven,
+        COUNT(*) FILTER (WHERE vt.Name = 'DownMod')     AS DownVotesGiven
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.UserId
+),
+Combined AS (
+    SELECT
+        ups.UserId,
+        ups.DisplayName,
+        ups.Reputation,
+        ups.QuestionCount,
+        ups.AnswerCount,
+        ups.TotalScore,
+        COALESCE(ba.TotalBadges,0)                        AS TotalBadges,
+        COALESCE(ba.GoldBadges,0)                         AS GoldBadges,
+        COALESCE(ba.SilverBadges,0)                       AS SilverBadges,
+        COALESCE(ba.BronzeBadges,0)                       AS BronzeBadges,
+        ba.BadgeNames,
+        ulv.LastVoteDate,
+        COALESCE(ulv.UpVotesGiven,0)                      AS UpVotesGiven,
+        COALESCE(ulv.DownVotesGiven,0)                    AS DownVotesGiven,
+        ROW_NUMBER() OVER (
+            PARTITION BY CASE WHEN COALESCE(ba.GoldBadges,0) > 0 THEN 'Gold' ELSE 'NoGold' END
+            ORDER BY ups.Reputation DESC, ups.TotalScore DESC
+        )                                                AS RankInGroup,
+        CASE
+            WHEN ups.Reputation >= 20000 THEN 'Elite'
+            WHEN ups.Reputation >= 10000 THEN 'Pro'
+            WHEN ups.Reputation >= 5000  THEN 'Experienced'
+            ELSE 'Rising'
+        END                                               AS ReputationTier,
+        /*  recent tags of the most recent post (correlated sub‑query)    */
+        COALESCE(
+            ( SELECT
+                  SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2)
+              FROM Posts p
+              WHERE p.OwnerUserId = ups.UserId
+              ORDER BY p.CreationDate DESC
+              LIMIT 1 ),
+            '<no-tags>'
+        )                                                AS RecentTags
+    FROM UserPostStats ups
+    LEFT JOIN BadgeAgg ba      ON ba.UserId = ups.UserId
+    LEFT JOIN UserLatestVote ulv ON ulv.UserId = ups.UserId
+)
+SELECT *
+FROM Combined
+WHERE (GoldBadges > 0 AND RankInGroup <= 5)
+   OR (GoldBadges = 0 AND Reputation >= 15000 AND RankInGroup <= 10)
+ORDER BY ReputationTier, RankInGroup
+
+UNION ALL
+
+SELECT
+    u.Id                                   AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    0                                      AS QuestionCount,
+    0                                      AS AnswerCount,
+    0                                      AS TotalScore,
+    0                                      AS TotalBadges,
+    0                                      AS GoldBadges,
+    0                                      AS SilverBadges,
+    0                                      AS BronzeBadges,
+    NULL                                   AS BadgeNames,
+    NULL                                   AS LastVoteDate,
+    0                                      AS UpVotesGiven,
+    0                                      AS DownVotesGiven,
+    NULL                                   AS RankInGroup,
+    'Newbie'                               AS ReputationTier,
+    '<no-tags>'                            AS RecentTags
+FROM Users u
+WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+  AND u.CreationDate > CURRENT_DATE - INTERVAL '30 days'
+ORDER BY Reputation DESC
+LIMIT 100;

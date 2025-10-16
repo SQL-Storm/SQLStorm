@@ -1,0 +1,100 @@
+WITH user_stats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        COALESCE(u.UpVotes / NULLIF(u.DownVotes, 0), 0) AS VoteRatio,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.Reputation, u.UpVotes, u.DownVotes
+),
+post_stats AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount + p.CommentCount AS EngagementScore,
+        AVG(c.Score) AS AvgUserCommentScore,
+        COUNT(c.Id) AS TotalComments,
+        CASE 
+          WHEN p.Tags IS NULL THEN NULL
+          ELSE regexp_split_to_array(substr(p.Tags, 2, char_length(p.Tags) - 2), '><')
+        END AS TagArray
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.OwnerUserId, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.Tags
+),
+vote_analysis AS (
+    SELECT
+        v.PostId,
+        v.UserId,
+        vt.Name AS VoteType,
+        (SELECT COUNT(*) FROM Votes vx WHERE vx.PostId = v.PostId) AS TotalVotes,
+        RANK() OVER (PARTITION BY v.PostId ORDER BY v.CreationDate DESC) AS VoteRecencyRank
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE v.CreationDate > DATE '2020-01-01'
+      AND EXISTS (
+        SELECT 1 
+        FROM Posts p 
+        WHERE p.Id = v.PostId 
+          AND p.Score > (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.OwnerUserId = p.OwnerUserId)
+      )
+)
+SELECT 
+    COALESCE(us.UserId, va.UserId) AS UserId,
+    COALESCE(ps.PostId, va.PostId) AS PostId,
+    (COALESCE(us.Reputation,0) * 0.3 + COALESCE(ps.EngagementScore,0) * 0.5 + COALESCE(us.GoldBadges,0) * 100) AS PerformanceMetric,
+    CASE 
+        WHEN ps.TagArray IS NOT NULL THEN cardinality(ps.TagArray)
+        ELSE 0
+    END AS TagCount,
+    (CASE WHEN us.UserId IS NOT NULL AND EXISTS (SELECT 1 FROM Badges b2 WHERE b2.UserId = us.UserId AND b2.Name LIKE '%Moderator%') THEN TRUE ELSE FALSE END) AS HasModeratorBadge,
+    RANK() OVER (ORDER BY (COALESCE(us.Reputation,0) + COALESCE(ps.EngagementScore,0) * 10) DESC) AS UserRank,
+    COALESCE(ps.AvgUserCommentScore, 0) * COALESCE(us.VoteRatio, 0) AS WeightedCommentScore,
+    (CASE WHEN ps.TagArray IS NOT NULL THEN array_to_string(ps.TagArray, ', ') ELSE NULL END) AS FormattedTags,
+    COALESCE(ps.Score, 0) AS Score_for_filter,
+    COALESCE(ps.ViewCount, 0) AS ViewCount_for_filter,
+    us.LastBadgeDate,
+    va.TotalVotes,
+    va.VoteRecencyRank,
+    us.SilverBadges
+FROM user_stats us
+LEFT JOIN post_stats ps ON us.UserId = ps.OwnerUserId
+FULL OUTER JOIN vote_analysis va ON ps.PostId = va.PostId
+WHERE (COALESCE(ps.Score, 0) > 10 OR COALESCE(va.TotalVotes, 0) > 5)
+  AND (COALESCE(ps.ViewCount, 0) > 100 OR COALESCE(us.Reputation, 0) > 1000)
+  AND (ps.PostId IS NOT NULL OR us.UserId IS NOT NULL)
+  AND (COALESCE(ps.Score,0) IS NOT NULL OR us.LastBadgeDate > DATE '2022-01-01')
+GROUP BY
+    COALESCE(us.UserId, va.UserId),
+    COALESCE(ps.PostId, va.PostId),
+    COALESCE(us.Reputation,0),
+    COALESCE(ps.EngagementScore,0),
+    COALESCE(us.GoldBadges,0),
+    ps.TagArray,
+    us.UserId,
+    us.Reputation,
+    us.VoteRatio,
+    ps.AvgUserCommentScore,
+    ps.Score,
+    ps.ViewCount,
+    ps.PostId,
+    ps.OwnerUserId,
+    ps.EngagementScore,
+    us.LastBadgeDate,
+    va.TotalVotes,
+    va.VoteRecencyRank,
+    us.SilverBadges
+HAVING SUM(CASE WHEN va.VoteType = 'UpMod' THEN 1 ELSE 0 END) > 2
+    OR MAX(COALESCE(us.SilverBadges,0)) > 5
+ORDER BY 
+    PerformanceMetric DESC,
+    UserRank ASC,
+    MAX(va.VoteRecencyRank) DESC
+LIMIT 1000;

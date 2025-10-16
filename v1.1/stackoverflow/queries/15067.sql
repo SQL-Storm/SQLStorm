@@ -1,0 +1,54 @@
+-- {"query": "15067.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-3.5-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 158780, "output_tokens": 46694} 
+WITH UserQuestionActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalQuestions,
+        SUM(p.Score) AS TotalQuestionScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.ViewCount) AS MedianQuestionViews,
+        RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS QuestionCountRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    WHERE u.Reputation > 100 AND u.CreationDate < cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+    GROUP BY u.Id, u.DisplayName
+),
+TagPopularity AS (
+    SELECT 
+        UNNEST(string_to_array(TRIM('"' FROM p.Tags), '"><')) AS Tag,
+        ROUND(AVG(p.Score), 2) AS AverageTagScore,
+        COUNT(*) AS TagFrequency
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    GROUP BY Tag
+    HAVING COUNT(*) > 50
+)
+SELECT 
+    uqa.UserId,
+    uqa.DisplayName,
+    uqa.TotalQuestions,
+    uqa.TotalQuestionScore,
+    uqa.MedianQuestionViews,
+    tp.Tag AS MostFrequentTag,
+    tp.AverageTagScore,
+    CASE 
+        WHEN uqa.TotalQuestions > 10 AND uqa.TotalQuestionScore > 50 THEN 'High Impact'
+        WHEN uqa.TotalQuestions > 5 THEN 'Moderate Impact'
+        ELSE 'Low Impact'
+    END AS UserContributionCategory,
+    (SELECT COUNT(*) 
+     FROM Votes v 
+     WHERE v.UserId = uqa.UserId AND v.VoteTypeId IN (2, 3)) AS TotalVotes,
+    COALESCE((SELECT MAX(b.Date) 
+              FROM Badges b 
+              WHERE b.UserId = uqa.UserId AND b.Class = 1), 
+             cast('2024-10-01 12:34:56' as timestamp)) AS LastGoldBadgeDate
+FROM UserQuestionActivity uqa
+JOIN TagPopularity tp ON EXISTS (
+    SELECT 1 
+    FROM Posts p 
+    WHERE p.OwnerUserId = uqa.UserId 
+    AND POSITION(tp.Tag IN p.Tags) > 0
+)
+WHERE uqa.TotalQuestions > 0
+ORDER BY uqa.TotalQuestionScore DESC, uqa.TotalQuestions DESC
+LIMIT 100;

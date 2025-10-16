@@ -1,0 +1,159 @@
+-- {"query": "455.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1430} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+
+    UNION ALL
+
+    SELECT
+        c.Id,
+        c.TagName,
+        c.Count,
+        c.ExcerptPostId,
+        c.WikiPostId,
+        r.Level + 1,
+        r.TagPath || c.TagName
+    FROM Tags c
+    JOIN RecursiveTagHierarchy r ON c.Id = r.Id + 1 -- arbitrary recursive condition for demo
+    WHERE r.Level < 3
+),
+UserBadgeStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TopQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+),
+AnswerStats AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        COUNT(*) AS AnswerCount,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        SUM(CASE WHEN a.OwnerUserId IS NULL THEN 1 ELSE 0 END) AS AnonymousAnswers
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+QuestionCloseInfo AS (
+    SELECT
+        ph.PostId,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate ELSE NULL END) AS CloseDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate ELSE NULL END) AS ReopenDate,
+        STRING_AGG(DISTINCT crt.Name, ', ') FILTER (WHERE ph.PostHistoryTypeId = 10) AS CloseReasons
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INT)
+    WHERE ph.PostHistoryTypeId IN (10, 11)
+    GROUP BY ph.PostId
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        COUNT(*) OVER (PARTITION BY u.Id ORDER BY p.CreationDate RANGE BETWEEN INTERVAL '30 days' PRECEDING AND CURRENT ROW) AS PostsLast30Days
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+),
+QuestionAnswerDetails AS (
+    SELECT
+        tq.Id AS QuestionId,
+        tq.Title,
+        tq.OwnerUserId,
+        tq.CreationDate,
+        tq.Score AS QuestionScore,
+        tq.ViewCount,
+        tq.AnswerCount,
+        tq.Tags,
+        COALESCE(a.AvgAnswerScore, 0) AS AvgAnswerScore,
+        COALESCE(a.MaxAnswerScore, 0) AS MaxAnswerScore,
+        COALESCE(a.AnonymousAnswers, 0) AS AnonymousAnswers,
+        qci.CloseDate,
+        qci.ReopenDate,
+        qci.CloseReasons,
+        ub.TotalBadges,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ua.PostsLast30Days
+    FROM TopQuestions tq
+    LEFT JOIN AnswerStats a ON a.QuestionId = tq.Id
+    LEFT JOIN QuestionCloseInfo qci ON qci.PostId = tq.Id
+    LEFT JOIN UserBadgeStats ub ON ub.UserId = tq.OwnerUserId
+    LEFT JOIN UserActivityWindow ua ON ua.UserId = tq.OwnerUserId AND ua.PostId = tq.Id
+    WHERE tq.rn = 1
+)
+SELECT
+    qad.QuestionId,
+    qad.Title,
+    COALESCE(u.DisplayName, 'Unknown') AS OwnerDisplayName,
+    qad.CreationDate,
+    qad.QuestionScore,
+    qad.ViewCount,
+    qad.AnswerCount,
+    qad.AvgAnswerScore,
+    qad.MaxAnswerScore,
+    qad.AnonymousAnswers,
+    qad.CloseDate,
+    qad.ReopenDate,
+    qad.CloseReasons,
+    qad.TotalBadges,
+    qad.GoldBadges,
+    qad.SilverBadges,
+    qad.BronzeBadges,
+    qad.PostsLast30Days,
+    -- Complex string expression: normalized tags list
+    TRIM(BOTH '<>' FROM qad.Tags) AS RawTags,
+    ARRAY_TO_STRING(
+        ARRAY(
+            SELECT DISTINCT TRIM(tag)
+            FROM UNNEST(string_to_array(TRIM(BOTH '<>' FROM qad.Tags), '><')) AS tag
+            WHERE tag IS NOT NULL AND tag <> ''
+        ),
+        ', '
+    ) AS NormalizedTags,
+    -- Complex calculation: engagement score
+    (qad.ViewCount * 0.1 + qad.QuestionScore * 2 + qad.AnswerCount * 3 + qad.AvgAnswerScore * 1.5 - qad.AnonymousAnswers * 2) AS EngagementScore,
+    -- Window function: rank questions by engagement score within last 30 days of creation
+    RANK() OVER (
+        PARTITION BY DATE_TRUNC('month', qad.CreationDate)
+        ORDER BY (qad.ViewCount * 0.1 + qad.QuestionScore * 2 + qad.AnswerCount * 3 + qad.AvgAnswerScore * 1.5 - qad.AnonymousAnswers * 2) DESC
+    ) AS MonthlyEngagementRank
+FROM QuestionAnswerDetails qad
+LEFT JOIN Users u ON u.Id = qad.OwnerUserId
+WHERE qad.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+  AND (qad.CloseDate IS NULL OR qad.ReopenDate > qad.CloseDate OR qad.ReopenDate IS NULL)
+ORDER BY MonthlyEngagementRank, qad.CreationDate DESC
+LIMIT 100;

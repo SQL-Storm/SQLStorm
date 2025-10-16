@@ -1,0 +1,100 @@
+WITH cte AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ClosedDate,
+    p.CommunityOwnedDate,
+    p.Tags,
+    CASE
+      WHEN p.PostTypeId = 1 THEN p.AcceptedAnswerId
+      ELSE p.ParentId
+    END AS ParentId,
+    u.Id AS UserId,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    u.Views AS UserViews,
+    u.UpVotes AS UserUpVotes,
+    u.DownVotes AS UserDownVotes,
+    CAST(u.LastAccessDate AS DATE) - CAST(u.CreationDate AS DATE) AS UserActiveDays,
+    COALESCE(b.Name, '') AS BadgeName,
+    COALESCE(b.Class, 0) AS BadgeClass,
+    COALESCE(b.Date, p.CreationDate) AS BadgeDate,
+    CASE
+      WHEN b.TagBased IS NULL THEN 0
+      WHEN CAST(b.TagBased AS INTEGER) = 1 OR b.TagBased = TRUE THEN 1
+      ELSE 0
+    END AS IsTagBadge,
+    COALESCE(c.Id, 0) AS CommentId,
+    COALESCE(c.Score, 0) AS CommentScore,
+    COALESCE(c.CreationDate, p.CreationDate) AS CommentCreationDate,
+    COALESCE(c.UserId, -1) AS CommentUserId,
+    COALESCE(c.UserDisplayName, p.OwnerDisplayName) AS CommentUserDisplayName,
+    CASE
+      WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+      WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+      ELSE 'Open'
+    END AS PostStatus,
+    CAST(COALESCE(p.ClosedDate, p.LastActivityDate) AS DATE) - CAST(p.CreationDate AS DATE) AS PostDays,
+    CASE
+      WHEN p.PostTypeId = 1 THEN p.Title
+      ELSE (
+        SELECT p2.Title
+        FROM Posts p2
+        WHERE p2.Id = p.ParentId
+      )
+    END AS ParentTitle
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON u.Id = b.UserId
+  LEFT JOIN Comments c ON p.Id = c.PostId
+),
+ranked_comments AS (
+  SELECT
+    PostId,
+    CommentId,
+    CommentScore,
+    CommentCreationDate,
+    CommentUserId,
+    CommentUserDisplayName,
+    ROW_NUMBER() OVER (PARTITION BY PostId ORDER BY CommentCreationDate) AS CommentRank
+  FROM cte
+)
+SELECT
+  c.PostId,
+  c.PostTypeId,
+  c.CreationDate,
+  c.Score,
+  c.ViewCount,
+  c.AnswerCount,
+  c.CommentCount,
+  c.FavoriteCount,
+  c.ClosedDate,
+  c.CommunityOwnedDate,
+  REGEXP_REPLACE(c.Tags, '><', ',') AS TagList,
+  c.ParentId,
+  c.UserId,
+  c.Reputation,
+  c.UserCreationDate,
+  c.LastAccessDate,
+  c.UserViews,
+  c.UserUpVotes,
+  c.UserDownVotes,
+  c.UserActiveDays,
+  c.BadgeName,
+  c.BadgeClass,
+  c.BadgeDate,
+  c.IsTagBadge,
+  (SELECT STRING_AGG(CAST(rc.CommentScore AS TEXT), ',') FROM ranked_comments rc WHERE rc.PostId = c.PostId AND rc.CommentRank <= 3) AS TopCommentScores,
+  (SELECT STRING_AGG(rc.CommentUserDisplayName, ',') FROM ranked_comments rc WHERE rc.PostId = c.PostId AND rc.CommentRank <= 3) AS TopCommentUsers,
+  c.PostStatus,
+  c.PostDays,
+  c.ParentTitle
+FROM cte c
+ORDER BY c.PostId;

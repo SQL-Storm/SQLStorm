@@ -1,0 +1,83 @@
+WITH UserActivity AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersGiven,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 5 THEN 1 ELSE 0 END) AS EditsMade,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    WHERE u.LastAccessDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+HighScoredPosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        u.DisplayName,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS PostRank
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.Score > (SELECT AVG(Score) * 1.5 FROM Posts WHERE PostTypeId IN (1, 2))
+),
+TagTrends AS (
+    SELECT 
+        t.TagName,
+        COUNT(p.Id) AS PostCount,
+        AVG(p.ViewCount) AS AvgViewCount,
+        LAG(COUNT(p.Id), 1, 0) OVER (ORDER BY COUNT(p.Id) DESC) AS PrevPostCount
+    FROM Tags t
+    LEFT JOIN Posts p 
+      ON EXISTS (
+        SELECT 1
+        FROM (
+          SELECT TRIM(BOTH '<>' FROM split_tag) AS tagid_text
+          FROM (
+            SELECT regexp_split_to_table(
+              SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)),
+              '><'
+            ) AS split_tag
+          ) AS sub
+        ) st
+        WHERE st.tagid_text ~ '^[0-9]+$' AND CAST(st.tagid_text AS INTEGER) = t.Id
+      )
+    GROUP BY t.TagName
+    HAVING COUNT(p.Id) > 0
+),
+MaxTagCount AS (
+    SELECT MAX(PostCount) AS MaxCount
+    FROM TagTrends
+),
+FinalResults AS (
+    SELECT 
+        ua.DisplayName,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        ua.EditsMade,
+        hsp.Title AS TopContributedPost,
+        hsp.Score,
+        tt.TagName AS TopTrendingTag,
+        tt.AvgViewCount
+    FROM UserActivity ua
+    LEFT JOIN HighScoredPosts hsp ON ua.Id = hsp.Id AND hsp.PostRank = 1
+    LEFT JOIN TagTrends tt ON tt.PostCount = (SELECT MaxCount FROM MaxTagCount)
+    WHERE ua.ReputationRank <= 100
+)
+SELECT 
+    DisplayName,
+    QuestionsAsked,
+    AnswersGiven,
+    EditsMade,
+    TopContributedPost,
+    Score,
+    TopTrendingTag,
+    AvgViewCount
+FROM FinalResults
+WHERE TopContributedPost IS NOT NULL
+ORDER BY AvgViewCount DESC
+LIMIT 20;

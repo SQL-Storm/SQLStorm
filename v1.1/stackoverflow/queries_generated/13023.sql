@@ -1,0 +1,65 @@
+-- {"query": "13023.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-premier", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2142, "output_tokens": 673} 
+
+WITH UserActivity AS (
+    SELECT 
+        u.Id, 
+        u.DisplayName, 
+        COUNT(DISTINCT ph.PostId) AS TotalEditedPosts,
+        MAX(ph.CreationDate) AS LastEditDate,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 1 ELSE 0 END) AS ModerationActions
+    FROM Users u
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    WHERE ph.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+    GROUP BY u.Id, u.DisplayName
+),
+PostPerformance AS (
+    SELECT 
+        p.Id, 
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC) AS AnswerRank,
+        COUNT(c.Id) AS CommentCount
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.ParentId
+),
+HighQualityPosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        u.DisplayName AS OwnerName,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS QualityRank
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.Score > (SELECT AVG(Score) * 2 FROM Posts WHERE PostTypeId = 1 AND Score > 0)
+      AND p.PostTypeId = 1
+),
+AggregatedResults AS (
+    SELECT 
+        ua.DisplayName,
+        ua.TotalEditedPosts,
+        ua.ModerationActions,
+        pp.Title,
+        pp.Score,
+        pp.ViewCount,
+        pp.AnswerRank,
+        hqp.QualityRank,
+        COALESCE(pp.CommentCount, 0) AS CommentCount
+    FROM UserActivity ua
+    LEFT JOIN PostPerformance pp ON ua.Id = pp.Id AND pp.AnswerRank = 1
+    LEFT JOIN HighQualityPosts hqp ON ua.Id = hqp.OwnerName AND hqp.QualityRank <= 10
+)
+SELECT 
+    DisplayName,
+    TotalEditedPosts,
+    ModerationActions,
+    STRING_AGG(DISTINCT CONCAT('Title: ', Title, '; Score: ', Score, '; ViewCount: ', ViewCount), ' || ') AS TopPosts,
+    SUM(CommentCount) AS TotalCommentCount
+FROM AggregatedResults
+GROUP BY DisplayName, TotalEditedPosts, ModerationActions
+HAVING SUM(CommentCount) > 10
+ORDER BY TotalEditedPosts DESC, ModerationActions DESC
+LIMIT 20;

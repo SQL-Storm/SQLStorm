@@ -1,0 +1,79 @@
+-- {"query": "22077.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "grok-code-fast", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2204, "output_tokens": 943} 
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        MAX(p.LastActivityDate) AS LastPostActivity,
+        STRING_AGG(DISTINCT b.Name, ', ' ORDER BY b.Date) AS BadgeNames,
+        AVG(CASE WHEN p.ViewCount IS NOT NULL THEN p.ViewCount ELSE 0 END) AS AvgViewCount
+    FROM Users u
+    LEFT OUTER JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT OUTER JOIN Comments c ON u.Id = c.UserId
+    LEFT OUTER JOIN Votes v ON u.Id = v.UserId
+    LEFT OUTER JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 100
+      AND (u.LastAccessDate > '2020-01-01' OR u.LastAccessDate IS NULL)
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RankedUsers AS (
+    SELECT *,
+           ROW_NUMBER() OVER (ORDER BY TotalPostScore DESC) AS ScoreRank,
+           PERCENT_RANK() OVER (ORDER BY QuestionCount + AnswerCount) AS ActivityPercentile,
+           LAG(Reputation, 1, 0) OVER (ORDER BY Reputation DESC) - Reputation AS RepDiffFromPrev
+    FROM UserStats
+),
+ActivityDetails AS (
+    SELECT ru.Id, ru.DisplayName, ru.ScoreRank, ru.ActivityPercentile, ru.RepDiffFromPrev,
+           (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ru.Id AND p.ClosedDate IS NOT NULL) AS ClosedPosts,
+           CASE 
+               WHEN ru.QuestionCount > 0 AND ru.AnswerCount > 0 THEN 'Both'
+               WHEN ru.QuestionCount > 0 THEN 'Only Questions'
+               WHEN ru.AnswerCount > 0 THEN 'Only Answers'
+               ELSE 'None'
+           END AS PostType,
+           COALESCE(ru.BadgeNames, 'No Badges') AS Badges,
+           ru.LastPostActivity,
+           ROUND(ru.TotalPostScore::DECIMAL / NULLIF(ru.QuestionCount + ru.AnswerCount, 0), 2) AS AvgScorePerPost,
+           CASE 
+               WHEN ru.AvgViewCount > 1000 THEN 'Popular'
+               WHEN ru.AvgViewCount BETWEEN 100 AND 1000 THEN 'Moderate'
+               ELSE 'Low'
+           END AS PopularityCategory
+    FROM RankedUsers ru
+    WHERE ru.TotalPostScore > 10
+),
+TopClosedQuestions AS (
+    SELECT DISTINCT p.Id, p.Title, p.Score, p.ViewCount,
+                    STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><') AS TagArray
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL
+    ORDER BY p.Score DESC
+    LIMIT 50
+),
+UserActivitySummary AS (
+    SELECT ad.Id, ad.DisplayName, ad.ScoreRank, ad.ClosedPosts, ad.PostType, ad.Badges, ad.PopularityCategory,
+           ad.LastPostActivity,
+           COALESCE(ad.AvgScorePerPost, 0) AS AvgScorePerPost,
+           (SELECT COUNT(*) FROM Comments c WHERE c.UserId = ad.Id AND c.Score > 5) AS HighScoreComments
+    FROM ActivityDetails ad
+)
+SELECT uas.*,
+       tc.Title AS TopClosedTitle,
+       tc.Score AS TopClosedScore,
+       tc.ViewCount AS TopClosedViews,
+       ARRAY_LENGTH(tc.TagArray, 1) AS NumTags,
+       CASE WHEN uas.ScoreRank <= 10 THEN 'Elite' ELSE 'Standard' END AS UserTier
+FROM UserActivitySummary uas
+LEFT OUTER JOIN TopClosedQuestions tc ON tc.Id IS NOT NULL  -- Dummy join for set operation
+UNION ALL
+SELECT NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+       NULL, NULL, NULL, NULL, NULL
+WHERE 1=0  -- This ensures the union has matching columns, but actually adds nothing
+ORDER BY ScoreRank NULLS LAST, AvgScorePerPost DESC
+LIMIT 100;

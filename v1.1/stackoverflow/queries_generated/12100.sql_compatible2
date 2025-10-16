@@ -1,0 +1,131 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        U.DisplayName AS OwnerDisplayName,
+        P.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC) AS PostRank,
+        DENSE_RANK() OVER (ORDER BY P.ViewCount DESC) AS ViewRank
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2) 
+        AND P.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '1' YEAR)
+),
+TopUsers AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        U.Reputation,
+        COUNT(DISTINCT P.Id) AS PostCount,
+        ROW_NUMBER() OVER (ORDER BY U.Reputation DESC, COUNT(DISTINCT P.Id) DESC) AS UserRank
+    FROM 
+        Users U
+    LEFT JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    WHERE 
+        U.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '5' YEAR)
+    GROUP BY 
+        U.Id, U.DisplayName, U.Reputation
+),
+TagStats AS (
+    SELECT 
+        T.TagName,
+        COUNT(DISTINCT P.Id) AS PostCount,
+        SUM(P.Score) AS TotalScore
+    FROM 
+        Tags T
+    JOIN 
+        Posts P ON T.WikiPostId = P.Id OR T.ExcerptPostId = P.Id
+    WHERE 
+        P.PostTypeId = 1
+    GROUP BY 
+        T.TagName
+),
+PostHistorySummary AS (
+    SELECT 
+        PH.PostId,
+        COUNT(DISTINCT PH.PostHistoryTypeId) AS HistoryTypeCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 5 THEN PH.CreationDate END) AS LastEditDate
+    FROM 
+        PostHistory PH
+    WHERE 
+        PH.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+    GROUP BY 
+        PH.PostId
+),
+CommentActivity AS (
+    SELECT 
+        C.PostId,
+        COUNT(C.Id) AS CommentCount,
+        AVG(C.Score) AS AvgCommentScore
+    FROM 
+        Comments C
+    WHERE 
+        C.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '1' MONTH)
+    GROUP BY 
+        C.PostId
+),
+PostTags AS (
+    -- explode posts with their tags to allow joins instead of a subquery in JOIN
+    SELECT
+        P.Id AS PostId,
+        -- extract individual tag names from the tags string like '<tag1><tag2>'
+        TRIM(BOTH '<>' FROM tag) AS TagName
+    FROM Posts P,
+    LATERAL (
+        SELECT value AS tag
+        FROM UNNEST(
+            -- split by '><' by replacing the border then splitting on '><'
+            STRING_TO_ARRAY(
+                REPLACE(REPLACE(P.Tags, '><', '|||'), '<', ''), '|||'
+            )
+        )
+    ) AS t(value)
+    WHERE P.Tags IS NOT NULL
+)
+SELECT 
+    RP.Id AS PostId,
+    RP.PostTypeId,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.OwnerDisplayName,
+    RP.PostRank,
+    RP.ViewRank,
+    TU.DisplayName AS TopUser,
+    TU.Reputation,
+    TU.PostCount,
+    TU.UserRank,
+    TS.TagName,
+    TS.PostCount AS TagPostCount,
+    TS.TotalScore AS TagTotalScore,
+    PHS.HistoryTypeCount,
+    PHS.LastEditDate,
+    CA.CommentCount,
+    CA.AvgCommentScore
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    TopUsers TU ON RP.OwnerUserId = TU.Id
+LEFT JOIN 
+    PostTags PT ON RP.Id = PT.PostId
+LEFT JOIN
+    TagStats TS ON PT.TagName = TS.TagName
+LEFT JOIN 
+    PostHistorySummary PHS ON RP.Id = PHS.PostId
+LEFT JOIN 
+    CommentActivity CA ON RP.Id = CA.PostId
+WHERE 
+    RP.PostRank <= 10
+    AND (TU.UserRank IS NULL OR TU.UserRank <= 10)
+ORDER BY 
+    RP.Score DESC, 
+    RP.ViewCount DESC, 
+    TU.Reputation DESC NULLS LAST, 
+    TS.TotalScore DESC NULLS LAST;

@@ -1,0 +1,24 @@
+WITH UserActivity AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        COUNT(DISTINCT P.Id) AS NumPosts,
+        SUM(Vs.Score) AS TotalVotes
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Votes Vs ON P.Id = Vs.PostId
+    GROUP BY U.Id, U.DisplayName
+)
+
+SELECT 
+    UA.Id,
+    UA.DisplayName,
+    UA.NumPosts,
+    UA.TotalVotes,
+    CASE
+        WHEN UA.NumPosts >= 10 AND UA.TotalVotes >= 100 THEN 'Active User'
+        WHEN UA.NumPosts >= 5 AND UA.TotalVotes >= 50 THEN 'Moderately Active User'
+        ELSE 'Inactive User'
+    END AS UserStatus
+FROM UserActivity UA
+ORDER BY UA.TotalVotes DESC, UA.NumPosts DESC;

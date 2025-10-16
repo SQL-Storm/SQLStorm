@@ -1,0 +1,180 @@
+WITH UserActivitySummary AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.Location,
+    COUNT(DISTINCT q.Id) AS TotalQuestions,
+    COUNT(DISTINCT a.Id) AS TotalAnswers,
+    SUM(CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END) AS AcceptedAnswers,
+    AVG(a.Score) AS AvgAnswerScore,
+    (
+      SELECT COUNT(*)
+      FROM Votes v
+      WHERE v.UserId = u.Id
+        AND v.VoteTypeId IN (6, 10)
+    ) AS ModerationVotes,
+    MIN(CASE WHEN b.Class = 1 THEN b.Date ELSE NULL END) AS FirstGoldBadgeDate
+  FROM
+    Users u
+    LEFT JOIN Posts q
+      ON u.Id = q.OwnerUserId
+      AND q.PostTypeId = 1
+    LEFT JOIN Posts a
+      ON u.Id = a.OwnerUserId
+      AND a.PostTypeId = 2
+    LEFT JOIN Badges b
+      ON u.Id = b.UserId
+  WHERE
+    u.CreationDate < (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '5' YEAR)
+    AND u.Reputation > 1000
+    AND u.AboutMe IS NOT NULL
+  GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.Location
+  HAVING
+    COUNT(DISTINCT a.Id) > 50
+), RankedUsers AS (
+  SELECT
+    uas.*,
+    a.Id AS AnswerId,
+    a.CreationDate AS AnswerCreationDate,
+    q.CreationDate AS QuestionCreationDate,
+    a.Score AS AnswerScore,
+    EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) AS TimeToAnswerSeconds,
+    ROW_NUMBER() OVER (
+      PARTITION BY uas.UserId
+      ORDER BY a.Score DESC, a.CreationDate
+    ) AS AnswerRankByScore,
+    LAG(a.CreationDate, 1) OVER (
+      PARTITION BY uas.UserId
+      ORDER BY a.CreationDate
+    ) AS PreviousAnswerDate
+  FROM
+    UserActivitySummary uas
+    JOIN Posts a
+      ON uas.UserId = a.OwnerUserId
+      AND a.PostTypeId = 2
+    JOIN Posts q
+      ON a.ParentId = q.Id
+), AggregatedPerformance AS (
+  SELECT
+    UserId,
+    DisplayName,
+    Reputation,
+    Location,
+    TotalQuestions,
+    TotalAnswers,
+    COALESCE(CAST(AcceptedAnswers AS DECIMAL) / NULLIF(TotalAnswers, 0), 0) AS AcceptanceRate,
+    AvgAnswerScore,
+    ModerationVotes,
+    FirstGoldBadgeDate,
+    AVG(TimeToAnswerSeconds) FILTER (WHERE AnswerRankByScore <= 10) AS AvgTimeToTop10Answer,
+    MAX(AnswerScore) AS MaxAnswerScore,
+    MIN(TimeToAnswerSeconds) FILTER (WHERE TimeToAnswerSeconds > 0) AS FastestAnswerSeconds,
+    AVG(EXTRACT(EPOCH FROM (AnswerCreationDate - PreviousAnswerDate))) AS AvgSecondsBetweenAnswers
+  FROM
+    RankedUsers
+  GROUP BY
+    UserId,
+    DisplayName,
+    Reputation,
+    Location,
+    TotalQuestions,
+    TotalAnswers,
+    AcceptedAnswers,
+    AvgAnswerScore,
+    ModerationVotes,
+    FirstGoldBadgeDate
+), PowerUsers AS (
+  SELECT
+    ap.UserId,
+    ap.DisplayName,
+    ap.Reputation,
+    ap.TotalAnswers,
+    ap.AcceptanceRate,
+    ap.ModerationVotes,
+    ap.AvgTimeToTop10Answer,
+    (
+      (ap.Reputation * 0.3) + (ap.TotalAnswers * 0.2) + (ap.AcceptanceRate * 1000) + (ap.ModerationVotes * 5) - (COALESCE(ap.AvgTimeToTop10Answer, 86400) / 100)
+    ) AS EngagementScore,
+    NTILE(100) OVER (
+      ORDER BY (
+        (ap.Reputation * 0.3) + (ap.TotalAnswers * 0.2) + (ap.AcceptanceRate * 1000) + (ap.ModerationVotes * 5) - (COALESCE(ap.AvgTimeToTop10Answer, 86400) / 100)
+      ) DESC
+    ) AS EngagementPercentile,
+    CASE
+      WHEN LOWER(ap.Location) LIKE LOWER('%Europe%') THEN 'EU'
+      WHEN LOWER(ap.Location) LIKE LOWER('%USA%')
+        OR LOWER(ap.Location) LIKE LOWER('%Canada%') THEN 'NA'
+      ELSE 'Other'
+    END AS Region,
+    STRING_AGG(DISTINCT SUBSTRING(t.TagName FROM 1 FOR 10), ', ') AS TopTags
+  FROM
+    AggregatedPerformance ap
+    JOIN Posts p
+      ON ap.UserId = p.OwnerUserId
+    JOIN Tags t
+      ON p.Tags LIKE ('%' || '<' || t.TagName || '>' || '%')
+  WHERE
+    ap.AvgSecondsBetweenAnswers IS NOT NULL
+    AND ap.AvgSecondsBetweenAnswers < (30 * 86400)
+    AND p.PostTypeId = 1
+  GROUP BY
+    ap.UserId,
+    ap.DisplayName,
+    ap.Reputation,
+    ap.TotalAnswers,
+    ap.AcceptanceRate,
+    ap.ModerationVotes,
+    ap.AvgTimeToTop10Answer,
+    ap.Location
+  HAVING
+    COUNT(DISTINCT t.TagName) > 5
+)
+SELECT
+  pu1.DisplayName,
+  pu1.Reputation,
+  pu1.Region,
+  pu1.EngagementScore,
+  pu1.TopTags
+FROM
+  PowerUsers pu1
+WHERE
+  pu1.EngagementPercentile >= 95
+  AND EXISTS (
+    SELECT 1
+    FROM PowerUsers pu2
+    WHERE pu2.Region = pu1.Region
+      AND pu2.EngagementScore > pu1.EngagementScore + 500
+  )
+UNION ALL
+SELECT
+  ap.DisplayName,
+  ap.Reputation,
+  'Specialist' AS Region,
+  ap.AvgAnswerScore * 100 AS EngagementScore,
+  'N/A' AS TopTags
+FROM
+  AggregatedPerformance ap
+  JOIN Posts p
+    ON ap.UserId = p.OwnerUserId
+  JOIN Tags t
+    ON p.Tags LIKE ('%' || '<' || t.TagName || '>' || '%')
+WHERE
+  t.TagName IN ('sql', 'python', 'java')
+  AND ap.TotalAnswers > 1000
+  AND ap.AcceptanceRate > 0.5
+  AND NOT EXISTS (
+    SELECT 1
+    FROM PowerUsers pu
+    WHERE pu.UserId = ap.UserId
+  )
+ORDER BY
+  EngagementScore DESC,
+  Reputation DESC
+LIMIT 100;

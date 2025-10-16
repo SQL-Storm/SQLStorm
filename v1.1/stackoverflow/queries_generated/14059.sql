@@ -1,0 +1,88 @@
+-- {"query": "14059.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 140100, "output_tokens": 60179} 
+WITH cte AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Body,
+        p.Tags,
+        p.OwnerUserId,
+        p.LastEditorUserId,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        p.AcceptedAnswerId,
+        COALESCE(p.ParentId, 0) AS ParentId,
+        CASE WHEN p.PostTypeId = 1 THEN 'Question' ELSE 'Answer' END AS PostType,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus,
+        CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned' ELSE 'Not Community Owned' END AS CommunityOwned,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Accepted' ELSE 'Not Accepted' END AS AcceptedAnswer,
+        ROUND(p.Score * 1.0 / NULLIF(p.ViewCount, 0), 3) AS ScorePerView,
+        ROUND(p.FavoriteCount * 1.0 / NULLIF(p.AnswerCount, 0), 3) AS FavoritesPerAnswer,
+        ROUND(p.CommentCount * 1.0 / NULLIF(CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE 1 END, 0), 3) AS CommentsPerAnswerOrQuestion,
+        STRING_AGG(DISTINCT CAST(pt.Name AS VARCHAR(50)), ', ') AS PostTypeNames,
+        STRING_AGG(DISTINCT CAST(cr.Name AS VARCHAR(50)), ', ') AS CloseReasonNames,
+        STRING_AGG(DISTINCT CAST(v.Name AS VARCHAR(50)), ', ') AS VoteTypeNames
+    FROM Posts p
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN CloseReasonTypes cr ON CAST(ph.Comment AS INT) = cr.Id
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 10
+    GROUP BY 
+        p.Id, p.PostTypeId, p.Title, p.Body, p.Tags, p.OwnerUserId, p.LastEditorUserId, 
+        p.LastEditDate, p.LastActivityDate, p.AnswerCount, p.CommentCount, p.FavoriteCount, 
+        p.ClosedDate, p.CommunityOwnedDate, p.AcceptedAnswerId, p.ParentId
+),
+top_tags AS (
+    SELECT 
+        t.TagName, 
+        t.Count,
+        RANK() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    WHERE t.Count >= 100
+),
+top_users AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName, 
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS UserRank
+    FROM Users u
+    WHERE u.Reputation >= 5000
+)
+SELECT 
+    cte.PostId,
+    cte.PostType,
+    cte.PostStatus,
+    cte.CommunityOwned,
+    cte.AcceptedAnswer,
+    cte.ScorePerView,
+    cte.FavoritesPerAnswer,
+    cte.CommentsPerAnswerOrQuestion,
+    cte.PostTypeNames,
+    cte.CloseReasonNames,
+    cte.VoteTypeNames,
+    COALESCE(cte.ParentId, -1) AS ParentId,
+    (SELECT STRING_AGG(DISTINCT CAST(t.TagName AS VARCHAR(35)), ', ') 
+     FROM STRING_SPLIT(cte.Tags, '><') t
+     INNER JOIN top_tags tt ON t.value = tt.TagName
+     WHERE tt.TagRank <= 10) AS Top10Tags,
+    (SELECT STRING_AGG(DISTINCT CAST(tu.DisplayName AS VARCHAR(40)), ', ')
+     FROM Badges b
+     INNER JOIN top_users tu ON b.UserId = tu.UserId
+     WHERE b.UserId = cte.OwnerUserId AND tu.UserRank <= 10) AS Top10OwnerBadges,
+    (SELECT STRING_AGG(DISTINCT CAST(tu.DisplayName AS VARCHAR(40)), ', ')
+     FROM Badges b
+     INNER JOIN top_users tu ON b.UserId = tu.UserId
+     WHERE b.UserId = cte.LastEditorUserId AND tu.UserRank <= 10) AS Top10LastEditorBadges,
+    cte.OwnerUserId,
+    cte.LastEditorUserId,
+    cte.LastEditDate,
+    cte.LastActivityDate
+FROM cte;

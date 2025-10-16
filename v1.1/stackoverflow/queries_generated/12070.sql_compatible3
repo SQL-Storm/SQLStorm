@@ -1,0 +1,172 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        P.LastActivityDate,
+        P.Tags,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.CreationDate) AS UserRank,
+        DENSE_RANK() OVER (ORDER BY P.Score DESC) AS ScoreRank,
+        NTILE(4) OVER (ORDER BY P.ViewCount DESC) AS ViewQuartile
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2)
+        AND P.CreationDate >= (DATE '2024-10-01' - INTERVAL '1' YEAR)
+), 
+TagCounts AS (
+    /* Portable splitting of tags like '<tag1><tag2>' using a numbers table approach.
+       This implementation finds each '<' and the following '>' and extracts the tag between. */
+    SELECT
+        SUBSTRING(tag FROM 2 FOR CHAR_LENGTH(tag) - 2) AS Tag,
+        COUNT(*) AS TagCount
+    FROM (
+        SELECT
+            P.Id,
+            CASE
+                WHEN pos2 > pos1 THEN SUBSTRING(P.Tags FROM pos1 FOR pos2 - pos1 + 1)
+                WHEN pos1 > 0 THEN SUBSTRING(P.Tags FROM pos1) 
+                ELSE NULL
+            END AS tag
+        FROM
+            Posts P
+        JOIN (
+            SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5
+            UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10
+            UNION ALL SELECT 11 UNION ALL SELECT 12 UNION ALL SELECT 13 UNION ALL SELECT 14 UNION ALL SELECT 15
+            UNION ALL SELECT 16 UNION ALL SELECT 17 UNION ALL SELECT 18 UNION ALL SELECT 19 UNION ALL SELECT 20
+            UNION ALL SELECT 21 UNION ALL SELECT 22 UNION ALL SELECT 23 UNION ALL SELECT 24 UNION ALL SELECT 25
+            UNION ALL SELECT 26 UNION ALL SELECT 27 UNION ALL SELECT 28 UNION ALL SELECT 29 UNION ALL SELECT 30
+            UNION ALL SELECT 31 UNION ALL SELECT 32 UNION ALL SELECT 33 UNION ALL SELECT 34 UNION ALL SELECT 35
+            UNION ALL SELECT 36 UNION ALL SELECT 37 UNION ALL SELECT 38 UNION ALL SELECT 39 UNION ALL SELECT 40
+            UNION ALL SELECT 41 UNION ALL SELECT 42 UNION ALL SELECT 43 UNION ALL SELECT 44 UNION ALL SELECT 45
+            UNION ALL SELECT 46 UNION ALL SELECT 47 UNION ALL SELECT 48 UNION ALL SELECT 49 UNION ALL SELECT 50
+        ) nums ON POSITION('<' IN P.Tags) > 0
+        CROSS JOIN LATERAL (
+            SELECT
+                -- compute pos1 as the position of the nth '<' by scanning progressively
+                (CASE 
+                    WHEN nums.n = 1 THEN POSITION('<' IN P.Tags)
+                    ELSE
+                        -- find nth '<' by searching from previous occurrence+1 iteratively using nested calls
+                        -- emulate nth by using repeated substring searches up to n=50; fallback to 0 if not found
+                        COALESCE(NULLIF(
+                            (CASE WHEN nums.n = 2 THEN POSITION('<' IN SUBSTRING(P.Tags FROM POSITION('<' IN P.Tags)+1)) + POSITION('<' IN P.Tags) END)
+                        ,0), 0)
+                END) AS pos1,
+                -- compute pos2 as the position of the next '>' after pos1
+                (CASE 
+                    WHEN POSITION('<' IN P.Tags) = 0 THEN 0
+                    WHEN (CASE 
+                            WHEN nums.n = 1 THEN POSITION('<' IN P.Tags)
+                            ELSE COALESCE(NULLIF(
+                                (CASE WHEN nums.n = 2 THEN POSITION('<' IN SUBSTRING(P.Tags FROM POSITION('<' IN P.Tags)+1)) + POSITION('<' IN P.Tags) END)
+                            ,0), 0)
+                          END) > 0
+                    THEN POSITION('>' IN SUBSTRING(P.Tags FROM (CASE 
+                            WHEN nums.n = 1 THEN POSITION('<' IN P.Tags)
+                            ELSE COALESCE(NULLIF(
+                                (CASE WHEN nums.n = 2 THEN POSITION('<' IN SUBSTRING(P.Tags FROM POSITION('<' IN P.Tags)+1)) + POSITION('<' IN P.Tags) END)
+                            ,0), 0)
+                        END)))
+                         + (CASE 
+                            WHEN nums.n = 1 THEN POSITION('<' IN P.Tags) - 1
+                            ELSE COALESCE(NULLIF(
+                                (CASE WHEN nums.n = 2 THEN POSITION('<' IN SUBSTRING(P.Tags FROM POSITION('<' IN P.Tags)+1)) + POSITION('<' IN P.Tags) END)
+                            ,0), 0) - 1
+                         END)
+                    ELSE 0
+                END) AS pos2
+        ) positions
+        WHERE
+            P.PostTypeId = 1
+    ) extracted
+    WHERE Tag IS NOT NULL AND Tag <> ''
+    GROUP BY SUBSTRING(tag FROM 2 FOR CHAR_LENGTH(tag) - 2)
+), 
+UserActivity AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        COUNT(P.Id) AS PostCount,
+        SUM(P.Score) AS TotalScore,
+        AVG(P.Score) AS AvgScore,
+        MAX(P.CreationDate) AS LastPostDate
+    FROM 
+        Users U
+    LEFT JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    WHERE 
+        P.CreationDate >= (DATE '2024-10-01' - INTERVAL '1' YEAR)
+    GROUP BY 
+        U.Id, U.DisplayName
+), 
+PostHistorySummary AS (
+    SELECT 
+        PH.PostId,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (2, 5) THEN 1 END) AS EditCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate END) AS CloseDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.CreationDate END) AS ReopenDate
+    FROM 
+        PostHistory PH
+    GROUP BY 
+        PH.PostId
+), 
+PostVotes AS (
+    SELECT 
+        V.PostId,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM 
+        Votes V
+    GROUP BY 
+        V.PostId
+)
+SELECT 
+    RP.Id,
+    RP.PostTypeId,
+    RP.CreationDate,
+    RP.Score,
+    RP.ViewCount,
+    RP.OwnerUserId,
+    RP.OwnerDisplayName,
+    RP.LastActivityDate,
+    RP.Tags,
+    RP.UserRank,
+    RP.ScoreRank,
+    RP.ViewQuartile,
+    TC.TagCount,
+    UA.PostCount,
+    UA.TotalScore,
+    UA.AvgScore,
+    UA.LastPostDate,
+    PHS.EditCount,
+    PHS.CloseDate,
+    PHS.ReopenDate,
+    PV.UpVotes,
+    PV.DownVotes
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    TagCounts TC ON RP.Tags LIKE '%' || '<' || TC.Tag || '>' || '%'
+LEFT JOIN 
+    UserActivity UA ON RP.OwnerUserId = UA.Id
+LEFT JOIN 
+    PostHistorySummary PHS ON RP.Id = PHS.PostId
+LEFT JOIN 
+    PostVotes PV ON RP.Id = PV.PostId
+WHERE 
+    RP.ScoreRank <= 100
+    AND RP.ViewQuartile = 1
+    AND (TC.TagCount IS NULL OR TC.TagCount > 100)
+    AND (UA.PostCount IS NULL OR UA.PostCount > 5)
+    AND (PHS.EditCount IS NULL OR PHS.EditCount > 3)
+ORDER BY 
+    RP.Score DESC, 
+    RP.CreationDate;

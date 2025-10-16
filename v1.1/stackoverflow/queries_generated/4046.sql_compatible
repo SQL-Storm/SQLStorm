@@ -1,0 +1,167 @@
+with RecursivePopularTags as (
+    select 
+        t.Id, 
+        t.TagName, 
+        t.Count, 
+        zp.AnswerCountSum, 
+        zp.ViewCountAvg,
+        row_number() over (order by t.Count desc, zp.AnswerCountSum desc) as rn
+    from Tags t
+    join (
+        select 
+            pt.TagName,
+            sum(p.AnswerCount) as AnswerCountSum,
+            avg(nullif(p.ViewCount,0)) as ViewCountAvg
+        from Posts p
+        cross join lateral (
+            select unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as TagName
+        ) pt
+        where p.PostTypeId = 1
+        group by pt.TagName
+    ) zp on zp.TagName = t.TagName
+    where t.IsModeratorOnly = false and t.IsRequired = false
+    and t.Count > 1000
+), UserAnswerStats as (
+    select 
+        u.Id as UserId, 
+        u.DisplayName, 
+        count(a.Id) as TotalAnswers,
+        sum(floor((a.Score * (1 + coalesce(v.UpVotes,0) * 1.0/NULLIF(NULLIF(v.DownVotes,0),0) + 1))/NULLIF(NULLIF(date_part('day', cast('2024-10-01 12:34:56' as timestamp) - a.CreationDate),0),1))) as WeightedAnswerScore,
+        max(a.CreationDate) as LastAnswerDate,
+        bool_and(coalesce(b.BadgeCount,0) > 2) as HasMultipleBadges
+    from Users u
+    left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+    left join (
+        select UserId, count(*) as BadgeCount
+        from Badges 
+        where Date > cast('2024-10-01' as date) - interval '1 year'
+        group by UserId
+    ) b on u.Id = b.UserId
+    left join (
+        select p.OwnerUserId, sum(case when v.VoteTypeId=2 then 1 else 0 end) as UpVotes,
+               sum(case when v.VoteTypeId=3 then 1 else 0 end) as DownVotes
+        from Posts p
+        left join Votes v on v.PostId = p.Id and v.VoteTypeId in (2,3)
+        where p.PostTypeId = 2
+        group by p.OwnerUserId
+    ) v on v.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+    having count(a.Id) > 10
+), RecentControversialQuestions as (
+    select 
+        p.Id, p.Title, p.Score, p.ViewCount, p.OwnerUserId, u.DisplayName,
+        array_to_string(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><'), ', ') as TagList,
+        p.CreationDate,
+        cnt.DuplicateCount,
+        cnt.LinkCount,
+        coalesce(vote_summary.UpVotes,0) as UpVotes,
+        coalesce(vote_summary.DownVotes,0) as DownVotes,
+        case 
+            when p.ClosedDate is null then false
+            else true
+        end as IsClosed
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    left join (
+        select PostId, 
+               count(case when LinkTypeId = 3 then 1 end) as DuplicateCount,
+               count(*) as LinkCount
+        from PostLinks 
+        group by PostId
+    ) cnt on cnt.PostId = p.Id
+    left join (
+        select PostId,
+               sum(case when VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+               sum(case when VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Votes
+        where VoteTypeId in (2,3)
+        group by PostId
+    ) vote_summary on vote_summary.PostId = p.Id
+    where p.PostTypeId = 1
+    and p.CreationDate > cast('2024-10-01' as date) - interval '180 days'
+    and p.Score < 0
+), AnswersWithAcceptedStatus as (
+    select 
+        a.Id, a.ParentId, a.CreationDate, a.Score, a.Body,
+        case 
+            when a.Id = q.AcceptedAnswerId then true 
+            else false 
+        end as IsAccepted
+    from Posts a
+    join Posts q on a.ParentId = q.Id and q.PostTypeId = 1
+    where a.PostTypeId = 2
+), UserParticipationRanks as (
+    select 
+        ph.UserId, ph.PostId,
+        row_number() over (partition by ph.PostId order by ph.CreationDate) as EditSequence,
+        ph.CreationDate, ph.PostHistoryTypeId,
+        u.DisplayName,
+        p.Title
+    from PostHistory ph
+    join Users u on ph.UserId = u.Id
+    join Posts p on p.Id = ph.PostId
+    where ph.PostHistoryTypeId in (4,5,6)
+), DuplicateQuestionPairs as (
+    select distinct
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId,
+        p1.Title as DuplicateQuestionTitle,
+        p2.Title as OriginalQuestionTitle,
+        p1.Score as DuplicateScore,
+        p2.Score as OriginalScore,
+        pl.CreationDate as LinkDate
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId and p1.PostTypeId = 1
+    join Posts p2 on p2.Id = pl.RelatedPostId and p2.PostTypeId = 1
+    where pl.LinkTypeId = 3
+    and p1.CreationDate > cast('2024-10-01' as date) - interval '365 days'
+)
+select 
+    rpt.TagName,
+    rpt.Count as TotalTagCount,
+    rpt.AnswerCountSum,
+    round(rpt.ViewCountAvg, 2) as AvgViewCount,
+    uas.DisplayName as TopAnswerer,
+    uas.TotalAnswers,
+    uas.WeightedAnswerScore,
+    rcq.Id as ControversialQuestionId,
+    rcq.Title as ControversialQuestionTitle,
+    rcq.Score as QuestionScore,
+    rcq.ViewCount as QuestionViewCount,
+    rcq.TagList,
+    rcq.IsClosed,
+    dqp.DuplicateQuestionTitle,
+    dqp.OriginalQuestionTitle,
+    dqp.LinkDate,
+    upar.EditSequence,
+    upar.CreationDate as EditDate,
+    upar.PostHistoryTypeId,
+    upar.DisplayName as EditorName,
+    upar.Title as EditedPostTitle
+from RecursivePopularTags rpt
+left join lateral (
+    select u1.UserId, u1.DisplayName, u1.TotalAnswers, u1.WeightedAnswerScore, u1.LastAnswerDate, u1.HasMultipleBadges
+    from UserAnswerStats u1
+    join Posts p3 on p3.OwnerUserId = u1.UserId and p3.PostTypeId = 2
+    join RecursivePopularTags rpt2 on rpt2.TagName = any(string_to_array(substring(p3.Tags from 2 for length(p3.Tags)-2), '><'))
+    where rpt2.TagName = rpt.TagName
+    order by u1.WeightedAnswerScore desc NULLS LAST
+    limit 1
+) uas on true
+left join lateral (
+    select rcq.Id, rcq.Title, rcq.Score, rcq.ViewCount, rcq.OwnerUserId, rcq.DisplayName, rcq.TagList, rcq.CreationDate, rcq.DuplicateCount, rcq.LinkCount, rcq.UpVotes, rcq.DownVotes, rcq.IsClosed
+    from RecentControversialQuestions rcq 
+    where rpt.TagName = any(string_to_array(rcq.TagList, ', '))
+    order by rcq.CreationDate desc NULLS LAST
+    limit 1
+) rcq on true
+left join DuplicateQuestionPairs dqp on dqp.DuplicateQuestionId = rcq.Id
+left join lateral (
+    select upar.UserId, upar.PostId, upar.EditSequence, upar.CreationDate, upar.PostHistoryTypeId, upar.DisplayName, upar.Title
+    from UserParticipationRanks upar
+    where upar.PostId = rcq.Id
+    order by upar.EditSequence asc
+    limit 1
+) upar on true
+where rpt.rn <= 10
+order by rpt.Count desc, uas.WeightedAnswerScore desc NULLS LAST;

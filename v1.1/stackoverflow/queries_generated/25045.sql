@@ -1,0 +1,132 @@
+-- {"query": "25045.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2442} 
+
+WITH
+    UserReputation AS (
+        SELECT
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS NetVotes,
+            ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+        FROM Users u
+    ),
+    UserBadgeCounts AS (
+        SELECT
+            b.UserId,
+            SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+            SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+            SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+            COUNT(*) AS TotalBadges
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+    RecentPosts AS (
+        SELECT
+            p.Id,
+            p.PostTypeId,
+            p.OwnerUserId,
+            p.CreationDate,
+            p.Score,
+            p.Title,
+            p.Tags,
+            CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE NULL END AS AnswerCount,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RecentRank
+        FROM Posts p
+        WHERE p.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+    ),
+    PostVoteStats AS (
+        SELECT
+            v.PostId,
+            SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownVotes,
+            COUNT(*) AS TotalVotes
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        GROUP BY v.PostId
+    ),
+    TagPopularity AS (
+        SELECT
+            t.TagName,
+            t.Count AS TagCount,
+            ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+        FROM Tags t
+        WHERE t.TagName IS NOT NULL
+    ),
+    UserTagOverlap AS (
+        SELECT
+            u.Id                     AS UserId,
+            t.TagName,
+            COUNT(*) FILTER (WHERE p.Tags ILIKE '%'||t.TagName||'%') AS PostsWithTag
+        FROM Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        LEFT JOIN Tags t ON TRUE
+        WHERE p.Tags IS NOT NULL
+        GROUP BY u.Id, t.TagName
+    ),
+    CorrelatedScore AS (
+        SELECT
+            p.Id,
+            (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.OwnerUserId = p.OwnerUserId) AS AvgUserScore,
+            p.Score - COALESCE(
+                (SELECT AVG(p3.Score) FROM Posts p3 WHERE p3.OwnerUserId = p.OwnerUserId),
+                0
+            ) AS ScoreDiffFromAvg
+        FROM Posts p
+    )
+SELECT
+    ur.Id,
+    ur.DisplayName,
+    ur.Reputation,
+    ur.NetVotes,
+    ur.RepRank,
+    COALESCE(ubc.GoldBadges, 0)   AS GoldBadges,
+    COALESCE(ubc.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ubc.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(ubc.TotalBadges, 0)  AS TotalBadges,
+    rp.Id                AS RecentPostId,
+    rp.Title,
+    rp.CreationDate,
+    rp.Score,
+    rp.AnswerCount,
+    COALESCE(pvs.UpVotes, 0)   AS PostUpVotes,
+    COALESCE(pvs.DownVotes, 0) AS PostDownVotes,
+    COALESCE(pvs.TotalVotes, 0) AS PostTotalVotes,
+    cs.AvgUserScore,
+    cs.ScoreDiffFromAvg,
+    tp.TagName,
+    tp.TagCount,
+    tp.TagRank,
+    uto.PostsWithTag
+FROM UserReputation ur
+LEFT JOIN UserBadgeCounts ubc   ON ubc.UserId = ur.Id
+LEFT JOIN RecentPosts rp        ON rp.OwnerUserId = ur.Id AND rp.RecentRank = 1
+LEFT JOIN PostVoteStats pvs    ON pvs.PostId = rp.Id
+LEFT JOIN CorrelatedScore cs   ON cs.Id = rp.Id
+LEFT JOIN LATERAL (
+        SELECT
+            t.TagName,
+            t.Count AS TagCount,
+            ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+        FROM Tags t
+        WHERE rp.Tags IS NOT NULL AND rp.Tags ILIKE '%'||t.TagName||'%'
+        ORDER BY t.Count DESC
+        LIMIT 1
+    ) tp ON TRUE
+LEFT JOIN UserTagOverlap uto   ON uto.UserId = ur.Id AND uto.TagName = tp.TagName
+WHERE ur.Reputation > 10000
+  AND (ur.NetVotes IS NULL OR ur.NetVotes <> 0)
+  AND (rp.Score IS NULL OR rp.Score > 0)
+  AND (COALESCE(ubc.TotalBadges, 0) > 5 OR tp.TagRank <= 10)
+ORDER BY ur.RepRank
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL
+WHERE FALSE;

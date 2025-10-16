@@ -1,0 +1,164 @@
+-- {"query": "1123.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.1, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1350} 
+with recursive TagHierarchy as (
+    select
+        Id,
+        TagName,
+        Count,
+        IsModeratorOnly,
+        IsRequired,
+        1 as Level,
+        array[TagName] as Path
+    from Tags
+    where Id is not null
+    union all
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        th.Level + 1,
+        th.Path || t.TagName
+    from Tags t
+    join TagHierarchy th on array_position(th.Path, t.TagName) is null and t.Id > th.Id
+    where th.Level < 3
+),
+UserActivity AS (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p2.Id) filter (where p2.PostTypeId = 2) as AnswerCount,
+        count(b.Id) as BadgeCount,
+        max(coalesce(p.Score,0)) as MaxPostScore,
+        avg(coalesce(p.Score,0)) as AvgPostScore,
+        sum(coalesce(vb.UpVotes,0)) as TotalUpVotes,
+        sum(coalesce(vb.DownVotes,0)) as TotalDownVotes,
+        rank() over (order by u.Reputation desc) as ReputationRank,
+        row_number() over (partition by u.Location order by u.Reputation desc) as LocationRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Posts p2 on p2.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join (
+        select
+            OwnerUserId,
+            sum(case when VoteTypes.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+            sum(case when VoteTypes.Name = 'DownMod' then 1 else 0 end) as DownVotes
+        from Posts
+        left join Votes on Posts.Id = Votes.PostId
+        left join VoteTypes on Votes.VoteTypeId = VoteTypes.Id
+        group by OwnerUserId
+    ) vb on vb.OwnerUserId = u.Id
+    where u.Id is not null
+    group by u.Id, u.DisplayName, u.Reputation
+),
+PostCommentsAgg AS (
+    select
+        c.PostId,
+        count(*) as CommentCount,
+        sum(c.Score) as TotalCommentScore,
+        string_agg(distinct c.UserDisplayName || ':' || substring(c.Text from 1 for 20), ' | ') as SampleComments
+    from Comments c
+    group by c.PostId
+),
+ComplexPosts AS (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.ContentLicense,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerReputation,
+        pc.CommentCount as PostCommentCount,
+        pc.TotalCommentScore,
+        pc.SampleComments,
+        ph.Name as LastHistoryType,
+        row_number() over (partition by p.Id order by ph.Id desc) as HistoryRank
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    left join PostCommentsAgg pc on pc.PostId = p.Id
+    left join PostHistory ph on ph.PostId = p.Id
+    where p.PostTypeId in (1,2)
+),
+FilteredComplexPosts as (
+    select *
+    from ComplexPosts
+    where HistoryRank = 1
+      and (p.Score + coalesce(PostCommentCount,0)) > 10
+      and (p.ViewCount > 500 or p.AnswerCount > 3)
+),
+RecursiveAnswers AS (
+    select
+        p.Id,
+        p.ParentId,
+        p.Score,
+        1 as Depth,
+        array[p.Id] as Path
+    from Posts p
+    where p.PostTypeId = 2 and p.ParentId is not null
+
+    union all
+
+    select
+        pa.Id,
+        pa.ParentId,
+        pa.Score,
+        ra.Depth + 1,
+        ra.Path || pa.Id
+    from Posts pa
+    join RecursiveAnswers ra on pa.ParentId = ra.Id
+    where not pa.Id = any(ra.Path)
+      and ra.Depth < 5
+)
+select
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.QuestionCount,
+    u.AnswerCount,
+    u.BadgeCount,
+    u.MaxPostScore,
+    u.AvgPostScore,
+    u.TotalUpVotes,
+    u.TotalDownVotes,
+    u.ReputationRank,
+    u.LocationRank,
+    count(distinct fcp.Id) filter (where fcp.PostTypeId = 1) as UserQuestionsWithComments,
+    count(distinct fcp.Id) filter (where fcp.PostTypeId = 2) as UserAnswersWithComments,
+    count(distinct ra.Id) as RecursiveAnswerChainLength,
+    string_agg(distinct unnest(th.Path), ' > ') as TagHierarchySample
+from UserActivity u
+left join FilteredComplexPosts fcp on fcp.OwnerUserId = u.UserId
+left join RecursiveAnswers ra on ra.ParentId = ANY (array(
+    select p.Id from Posts p where p.OwnerUserId = u.UserId and p.PostTypeId = 1
+))
+left join TagHierarchy th on array_length(th.Path,1) = th.Level and th.Level = 3
+group by
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.QuestionCount,
+    u.AnswerCount,
+    u.BadgeCount,
+    u.MaxPostScore,
+    u.AvgPostScore,
+    u.TotalUpVotes,
+    u.TotalDownVotes,
+    u.ReputationRank,
+    u.LocationRank
+having count(distinct fcp.Id) filter (where fcp.PostTypeId = 1) > 0 or count(distinct fcp.Id) filter (where fcp.PostTypeId = 2) > 0
+order by u.Reputation desc, u.QuestionCount desc, u.AnswerCount desc
+limit 100;

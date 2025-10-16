@@ -1,0 +1,84 @@
+-- {"query": "26086.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "llama-3.3-instruct", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 492} 
+WITH 
+  -- Calculate total score for each post
+  PostScores AS (
+    SELECT 
+      p.Id, 
+      p.Score, 
+      COALESCE(SUM(v.Score), 0) AS TotalScore
+    FROM 
+      Posts p
+    LEFT JOIN 
+      Votes v ON p.Id = v.PostId
+    GROUP BY 
+      p.Id, p.Score
+  ),
+  
+  -- Get top 10 posts with the highest total score
+  TopPosts AS (
+    SELECT 
+      Id, 
+      Score, 
+      TotalScore,
+      ROW_NUMBER() OVER (ORDER BY TotalScore DESC) AS RowNum
+    FROM 
+      PostScores
+  ),
+  
+  -- Calculate average reputation for each user
+  UserReputations AS (
+    SELECT 
+      u.Id, 
+      AVG(u.Reputation) AS AvgReputation
+    FROM 
+      Users u
+    GROUP BY 
+      u.Id
+  ),
+  
+  -- Get users who have answered the most questions
+  TopAnswerers AS (
+    SELECT 
+      u.Id, 
+      COUNT(p.Id) AS AnswerCount,
+      ROW_NUMBER() OVER (ORDER BY COUNT(p.Id) DESC) AS RowNum
+    FROM 
+      Users u
+    JOIN 
+      Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 2
+    GROUP BY 
+      u.Id
+  )
+  
+SELECT 
+  tp.Id, 
+  tp.Score, 
+  tp.TotalScore, 
+  ur.AvgReputation, 
+  ta.AnswerCount,
+  p.Title, 
+  p.Body, 
+  p.Tags, 
+  p.CreationDate, 
+  p.LastEditDate,
+  u.DisplayName, 
+  u.Reputation, 
+  u.LastAccessDate
+FROM 
+  TopPosts tp
+JOIN 
+  Posts p ON tp.Id = p.Id
+JOIN 
+  Users u ON p.OwnerUserId = u.Id
+JOIN 
+  UserReputations ur ON u.Id = ur.Id
+JOIN 
+  TopAnswerers ta ON u.Id = ta.Id
+WHERE 
+  tp.RowNum <= 10 AND ta.RowNum <= 10
+  AND p.PostTypeId = 1
+  AND p.Score > 0
+  AND ur.AvgReputation > 1000
+  AND ta.AnswerCount > 100
+ORDER BY 
+  tp.TotalScore DESC;

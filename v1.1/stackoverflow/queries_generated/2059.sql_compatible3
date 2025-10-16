@@ -1,0 +1,89 @@
+WITH UserReputationCTE AS (
+    SELECT
+        u.Id AS UserId,
+        SUM(v.BountyAmount) OVER (PARTITION BY u.Id) AS TotalBountyAmount
+    FROM
+        Users u
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId AND v.VoteTypeId IN (8, 9)
+),
+TagPopularityCTE AS (
+    SELECT
+        TRIM(BOTH '<>' FROM tag) AS TagName,
+        COUNT(*) AS PostCount
+    FROM (
+        SELECT
+            p.Id,
+            regexp_split_to_table(SUBSTRING(p.Tags FROM 2 FOR CHARACTER_LENGTH(p.Tags) - 2), '><') AS tag
+        FROM
+            Posts p
+        WHERE
+            p.PostTypeId = 1
+    ) sub
+    GROUP BY
+        TRIM(BOTH '<>' FROM tag)
+),
+HighRepUsers AS (
+    SELECT
+        Id AS UserId,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC) AS RowNum
+    FROM
+        Users
+    WHERE
+        Reputation > 1000
+),
+CommentsWithScore AS (
+    SELECT
+        c.PostId,
+        MAX(c.Score) AS MaxCommentScore
+    FROM
+        Comments c
+    GROUP BY
+        c.PostId
+),
+FinalQuery AS (
+    SELECT DISTINCT
+        p.Id AS PostId,
+        p.Title,
+        COALESCE(tc.TotalComments, 0) AS TotalComments,
+        COALESCE(cws.MaxCommentScore, 0) AS MaxCommentScore,
+        ur.TotalBountyAmount
+    FROM
+        Posts p
+    LEFT JOIN
+        (SELECT
+            PostId,
+            COUNT(*) AS TotalComments
+         FROM
+            Comments
+         GROUP BY
+            PostId) tc ON p.Id = tc.PostId
+    LEFT JOIN
+        CommentsWithScore cws ON p.Id = cws.PostId
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN
+        UserReputationCTE ur ON u.Id = ur.UserId
+    WHERE
+        p.PostTypeId = 1
+        AND p.AnswerCount > 2
+        AND EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - p.CreationDate)) < 365
+)
+SELECT
+    fq.PostId,
+    fq.Title,
+    fq.TotalComments,
+    fq.MaxCommentScore,
+    fq.TotalBountyAmount,
+    tp.TagName,
+    tp.PostCount
+FROM
+    FinalQuery fq
+LEFT JOIN
+    TagPopularityCTE tp ON POSITION(tp.TagName IN fq.Title) > 0
+WHERE
+    tp.PostCount > 50
+    AND fq.TotalComments > 10
+ORDER BY
+    fq.TotalComments DESC,
+    fq.MaxCommentScore DESC;

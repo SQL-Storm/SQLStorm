@@ -1,0 +1,77 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.LastActivityDate,
+        U.DisplayName AS OwnerDisplayName,
+        U.Reputation,
+        U.AccountId,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS Rank
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2) AND P.Score > 0 AND P.ViewCount > 100
+),
+BadgeCounts AS (
+    SELECT 
+        U.Id AS UserId,
+        U.DisplayName,
+        COUNT(B.Id) AS BadgeCount
+    FROM 
+        Users U
+    JOIN 
+        Badges B ON U.Id = B.UserId
+    WHERE 
+        B.Class = 1 AND B.TagBased = FALSE
+    GROUP BY 
+        U.Id, U.DisplayName
+),
+CommentStats AS (
+    SELECT 
+        P.Id AS PostId,
+        COUNT(C.Id) AS CommentCount,
+        MAX(C.Score) AS MaxCommentScore,
+        MIN(C.Score) AS MinCommentScore
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Comments C ON P.Id = C.PostId
+    GROUP BY 
+        P.Id
+)
+SELECT 
+    RP.Id AS PostId,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.LastActivityDate,
+    RP.Rank,
+    COALESCE(BC.BadgeCount, 0) AS BadgeCount,
+    CS.CommentCount,
+    AVG(CS.MaxCommentScore) OVER (PARTITION BY RP.PostTypeId) AS AvgMaxCommentScore,
+    STRING_AGG(CASE WHEN PL.LinkTypeId = 3 THEN P.Title ELSE NULL END, ', ' ORDER BY PL.CreationDate) AS DuplicateAnswers,
+    CASE 
+        WHEN RP.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'High'
+        ELSE 'Low'
+    END AS ScoreTier
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    BadgeCounts BC ON RP.OwnerDisplayName = BC.DisplayName
+LEFT JOIN 
+    CommentStats CS ON RP.Id = CS.PostId
+LEFT JOIN 
+    PostLinks PL ON RP.Id = PL.PostId
+LEFT JOIN 
+    Posts P ON PL.RelatedPostId = P.Id
+GROUP BY 
+    RP.Id, RP.Title, RP.Score, RP.ViewCount, RP.CreationDate, RP.LastActivityDate, RP.Rank, BC.BadgeCount, CS.CommentCount, RP.PostTypeId
+ORDER BY 
+    RP.Score DESC, RP.Rank ASC;

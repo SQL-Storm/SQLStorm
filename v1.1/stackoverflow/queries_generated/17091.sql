@@ -1,0 +1,136 @@
+-- {"query": "17091.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 214820, "output_tokens": 212427} 
+
+WITH UserActivityMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        EXTRACT(YEAR FROM u.CreationDate) AS JoinYear,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS AvgPostScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) FILTER (WHERE p.Score > 0) AS MedianPositiveScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 1000
+        AND u.CreationDate < CURRENT_DATE - INTERVAL '365 days'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, JoinYear
+),
+TagExpertise AS (
+    SELECT 
+        p.OwnerUserId,
+        SUBSTRING(UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) FROM 1 FOR 30) AS Tag,
+        COUNT(*) AS TagPostCount,
+        SUM(p.Score) AS TagTotalScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY SUM(p.Score) DESC) AS TagRank
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL 
+        AND p.OwnerUserId IS NOT NULL
+        AND p.Score > 0
+    GROUP BY p.OwnerUserId, Tag
+),
+RecentEngagement AS (
+    SELECT 
+        ph.UserId,
+        COUNT(DISTINCT ph.PostId) AS EditedPosts,
+        COUNT(DISTINCT CASE 
+            WHEN ph.PostHistoryTypeId IN (4,5,6) 
+            AND ph.CreationDate > CURRENT_DATE - INTERVAL '90 days' 
+            THEN ph.PostId 
+        END) AS RecentEdits,
+        STRING_AGG(DISTINCT 
+            CASE 
+                WHEN ph.PostHistoryTypeId = 10 AND ph.Comment ~ '^\d+$' 
+                THEN (SELECT Name FROM CloseReasonTypes WHERE Id = ph.Comment::int)
+                ELSE NULL 
+            END, ', '
+        ) AS CloseReasonTypes
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+    GROUP BY ph.UserId
+),
+BadgeAchievements AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate,
+        COALESCE(STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.TagBased = B'1'), 'None') AS TagBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+NetworkAnalysis AS (
+    SELECT 
+        c.UserId AS CommenterUserId,
+        p.OwnerUserId AS PostOwnerId,
+        COUNT(*) AS InteractionCount,
+        AVG(c.Score) AS AvgCommentScore,
+        DENSE_RANK() OVER (PARTITION BY c.UserId ORDER BY COUNT(*) DESC) AS InteractionRank
+    FROM Comments c
+    INNER JOIN Posts p ON c.PostId = p.Id
+    WHERE c.UserId IS NOT NULL 
+        AND p.OwnerUserId IS NOT NULL
+        AND c.UserId != p.OwnerUserId
+    GROUP BY c.UserId, p.OwnerUserId
+)
+SELECT 
+    uam.Id,
+    COALESCE(uam.DisplayName, 'User' || uam.Id::text) AS DisplayName,
+    uam.Reputation,
+    uam.JoinYear,
+    uam.TotalPosts,
+    uam.QuestionCount,
+    uam.AnswerCount,
+    ROUND(uam.AvgPostScore::numeric, 2) AS AvgPostScore,
+    COALESCE(uam.MedianPositiveScore, 0) AS MedianPositiveScore,
+    COALESCE(te.Tag, 'No Tags') AS TopTag,
+    COALESCE(te.TagPostCount, 0) AS TopTagPostCount,
+    COALESCE(te.TagTotalScore, 0) AS TopTagScore,
+    COALESCE(re.EditedPosts, 0) AS TotalEditedPosts,
+    COALESCE(re.RecentEdits, 0) AS RecentEditCount,
+    CASE 
+        WHEN re.CloseReasonTypes IS NULL OR re.CloseReasonTypes = '' 
+        THEN 'No Closures' 
+        ELSE re.CloseReasonTypes 
+    END AS CloseReasonHistory,
+    COALESCE(ba.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ba.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ba.BronzeBadges, 0) AS BronzeBadges,
+    ba.TagBadges,
+    CASE 
+        WHEN ba.LastBadgeDate > CURRENT_DATE - INTERVAL '30 days' THEN 'Active'
+        WHEN ba.LastBadgeDate > CURRENT_DATE - INTERVAL '180 days' THEN 'Moderate'
+        ELSE 'Inactive'
+    END AS BadgeActivity,
+    (SELECT COUNT(DISTINCT na.PostOwnerId) 
+     FROM NetworkAnalysis na 
+     WHERE na.CommenterUserId = uam.Id AND na.InteractionRank <= 5) AS TopInteractionPartners,
+    CASE 
+        WHEN uam.Reputation > 50000 THEN 'Elite'
+        WHEN uam.Reputation > 10000 THEN 'Expert'
+        WHEN uam.Reputation > 5000 THEN 'Advanced'
+        ELSE 'Intermediate'
+    END AS UserTier,
+    RANK() OVER (ORDER BY uam.Reputation * LOG(GREATEST(uam.TotalPosts, 1)) DESC) AS EngagementRank
+FROM UserActivityMetrics uam
+LEFT JOIN TagExpertise te ON uam.Id = te.OwnerUserId AND te.TagRank = 1
+LEFT JOIN RecentEngagement re ON uam.Id = re.UserId
+LEFT JOIN BadgeAchievements ba ON uam.Id = ba.UserId
+WHERE EXISTS (
+    SELECT 1 
+    FROM Posts p2 
+    WHERE p2.OwnerUserId = uam.Id 
+        AND p2.Score > (
+            SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY Score) 
+            FROM Posts 
+            WHERE PostTypeId = p2.PostTypeId AND Score IS NOT NULL
+        )
+)
+    OR uam.TotalPosts > 50
+ORDER BY 
+    EngagementRank,
+    uam.Reputation DESC,
+    uam.TotalPosts DESC
+LIMIT 100;

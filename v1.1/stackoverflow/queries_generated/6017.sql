@@ -1,0 +1,91 @@
+-- {"query": "6017.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 688} 
+WITH RankedPosts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.Tags,
+    p.LastActivityDate,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Body,
+    u.DisplayName AS OwnerName,
+    u.Reputation,
+    u.Location,
+    u.CreationDate AS OwnerCreationDate,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.PostTypeId
+      ORDER BY
+        CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END DESC,
+        p.ViewCount DESC,
+        p.LastActivityDate DESC
+    ) AS rn_type
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+  LEFT JOIN Tags t ON t.ExcerptPostId = p.Id
+  WHERE p.CreationDate >= NOW() - INTERVAL '365 days'
+),
+Agg AS (
+  SELECT
+    rp.Id,
+    rp.Title,
+    rp.OwnerName,
+    rp.Reputation,
+    rp.Location,
+    rp.CreationDate,
+    rp.LastActivityDate,
+    rp.ViewCount,
+    rp.Score,
+    rp.AnswerCount,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    rp.Body,
+    COUNT(DISTINCT b.Id) AS BadgeCount,
+    MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS HasGold,
+    MAX(CASE WHEN b.TagBased = 0 THEN 1 ELSE 0 END) AS HasNamedBadge
+  FROM RankedPosts rp
+  LEFT JOIN Badges b ON b.UserId = rp.OwnerUserId
+  GROUP BY
+    rp.Id, rp.Title, rp.OwnerName, rp.Reputation, rp.Location,
+    rp.CreationDate, rp.LastActivityDate, rp.ViewCount, rp.Score,
+    rp.AnswerCount, rp.CommentCount, rp.FavoriteCount, rp.Body
+),
+Windowed AS (
+  SELECT
+    a.*,
+    AVG(a.Score) OVER (PARTITION BY a.PostTypeId ORDER BY a.LastActivityDate ROWS BETWEEN 29 PRECEDING AND CURRENT ROW) AS MovingAvgScore29,
+    SUM(a.ViewCount) OVER (PARTITION BY a.OwnerName ORDER BY a.LastActivityDate ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS MovingSumViews9
+  FROM Agg a
+)
+SELECT
+  w.Id,
+  w.Title,
+  w.OwnerName,
+  w.Reputation,
+  w.Location,
+  w.CreationDate,
+  w.LastActivityDate,
+  w.ViewCount,
+  w.Score,
+  w.AnswerCount,
+  w.CommentCount,
+  w.FavoriteCount,
+  w.Body,
+  w.BadgeCount,
+  w.HasGold,
+  w.HasNamedBadge,
+  w.MovingAvgScore29,
+  w.MovingSumViews9
+FROM Windowed w
+WHERE
+  w.rn_type = 1
+  AND w.MovingAvgScore29 > 0
+  AND (w.Location IS NULL OR w.Location <> '')
+ORDER BY w.LastActivityDate DESC
+LIMIT 100;

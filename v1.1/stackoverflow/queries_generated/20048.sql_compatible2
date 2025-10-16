@@ -1,0 +1,144 @@
+WITH AnswerDetails AS (
+  SELECT
+    a.Id AS AnswerId,
+    a.OwnerUserId,
+    a.CreationDate AS AnswerCreationDate,
+    a.Score AS AnswerScore,
+    q.Id AS QuestionId,
+    q.Tags AS QuestionTags,
+    q.CreationDate AS QuestionCreationDate,
+    q.ViewCount AS QuestionViewCount,
+    CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END AS IsAcceptedAnswer
+  FROM Posts AS a
+  JOIN Posts AS q
+    ON a.ParentId = q.Id
+  WHERE
+    a.PostTypeId = 2
+    AND q.PostTypeId = 1
+    AND a.OwnerUserId IS NOT NULL
+    AND a.CreationDate > q.CreationDate
+), UserContributionStats AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS JoinDate,
+    u.Location,
+    u.AboutMe,
+    COUNT(ad.AnswerId) AS TotalAnswers,
+    SUM(ad.IsAcceptedAnswer) AS AcceptedAnswersCount,
+    AVG(ad.AnswerScore) AS AverageAnswerScore,
+    MIN(ad.AnswerScore) AS MinAnswerScore,
+    MAX(ad.AnswerScore) AS MaxAnswerScore,
+    CAST(SUM(ad.IsAcceptedAnswer) AS DECIMAL) / NULLIF(COUNT(ad.AnswerId), 0) AS AcceptanceRate,
+    AVG(CAST(julianday(ad.AnswerCreationDate) - julianday(ad.QuestionCreationDate) AS DOUBLE)) * 86400.0 AS AvgSecondsToAnswer,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+    (
+      SELECT
+        COUNT(*)
+      FROM Posts p
+      WHERE
+        p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    ) AS TotalQuestions
+  FROM Users AS u
+  LEFT JOIN AnswerDetails AS ad
+    ON u.Id = ad.OwnerUserId
+  LEFT JOIN Badges AS b
+    ON u.Id = b.UserId
+  WHERE
+    u.Reputation > 5000 AND u.AccountId IS NOT NULL
+  GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.Location,
+    u.AboutMe
+  HAVING
+    COUNT(ad.AnswerId) > 50
+)
+SELECT
+  s.DisplayName,
+  s.Reputation,
+  s.TotalAnswers,
+  s.TotalQuestions,
+  s.AcceptanceRate,
+  s.AverageAnswerScore,
+  s.GoldBadges,
+  s.Location,
+  (CAST(s.Reputation AS DECIMAL) /
+    (CAST('2024-10-01' AS DATE) - CAST(s.JoinDate AS DATE) + 1)
+  ) AS DailyReputation,
+  (s.AverageAnswerScore * s.AcceptanceRate * (CASE WHEN (s.TotalAnswers + s.GoldBadges + 1) > 0 THEN LOG(s.TotalAnswers + s.GoldBadges + 1) ELSE 0 END)) AS UserQualityScore,
+  NTILE(100) OVER (ORDER BY s.AcceptanceRate DESC, s.Reputation DESC) AS UserPercentile,
+  AVG(s.Reputation) OVER (PARTITION BY EXTRACT(YEAR FROM s.JoinDate)) AS AvgReputationForJoinYear,
+  s.Reputation - LAG(s.Reputation, 1, s.Reputation) OVER (ORDER BY s.Reputation DESC) AS ReputationDiffVsRankAbove,
+  (
+    SELECT
+      STRING_AGG(T.tag, ' | ')
+    FROM (
+      SELECT
+        tag
+      FROM (
+        SELECT
+          TRIM(tag) AS tag,
+          COUNT(*) AS cnt
+        FROM (
+          SELECT
+            UNNEST(STRING_SPLIT(SUBSTRING(p.Tags, 2, CHAR_LENGTH(p.Tags) - 2), '><')) AS tag
+          FROM Posts AS p
+          JOIN AnswerDetails ad
+            ON p.Id = ad.QuestionId
+          WHERE
+            ad.OwnerUserId = s.UserId AND ad.IsAcceptedAnswer = 1
+        ) AS exploded
+        GROUP BY
+          tag
+        ORDER BY
+          cnt DESC
+        LIMIT 5
+      ) AS top5
+    ) AS T
+  ) AS Top5TagsInAcceptedAnswers,
+  (
+    SELECT
+      MAX(activity_date)
+    FROM (
+      SELECT
+        CreationDate AS activity_date
+      FROM Posts
+      WHERE
+        OwnerUserId = s.UserId
+      UNION ALL
+      SELECT
+        CreationDate
+      FROM Comments
+      WHERE
+        UserId = s.UserId
+      UNION ALL
+      SELECT
+        Date
+      FROM Badges
+      WHERE
+        UserId = s.UserId
+    ) AS user_activities
+  ) AS LastActivityDate
+FROM UserContributionStats AS s
+WHERE
+  s.AcceptanceRate > 0.4
+  AND s.TotalQuestions < s.TotalAnswers
+  AND s.Location IS NOT NULL
+  AND s.AboutMe LIKE '%developer%'
+  AND EXISTS (
+    SELECT
+      1
+    FROM PostHistory AS ph
+    WHERE
+      ph.UserId = s.UserId AND ph.PostHistoryTypeId IN (5, 8)
+  )
+ORDER BY
+  UserQualityScore DESC,
+  s.Reputation DESC
+LIMIT 100;

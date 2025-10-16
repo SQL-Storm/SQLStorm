@@ -1,0 +1,82 @@
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId, 
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 5 THEN 1 ELSE 0 END) AS EditCount,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    WHERE u.LastAccessDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6' MONTH)
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopQuestions AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        COUNT(DISTINCT pl.RelatedPostId) AS LinkedPostCount,
+        STRING_AGG(DISTINCT t.TagName, ', ') AS Tags
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId AND pl.LinkTypeId = 1
+    LEFT JOIN Tags t ON p.Tags LIKE ( '%' || '<' || t.TagName || '>' || '%' )
+    WHERE p.PostTypeId = 1 AND p.Score > 10
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount
+    HAVING COUNT(DISTINCT pl.RelatedPostId) > 0
+),
+CombinedData AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.BadgeCount,
+        ua.EditCount,
+        tq.PostId,
+        tq.Title,
+        tq.Score,
+        tq.ViewCount,
+        tq.LinkedPostCount,
+        tq.Tags,
+        DENSE_RANK() OVER (PARTITION BY ua.UserId ORDER BY tq.Score DESC) AS UserQuestionRank
+    FROM UserActivity ua
+    CROSS JOIN TopQuestions tq
+    WHERE ua.ReputationRank <= 100
+)
+SELECT 
+    cd.UserId,
+    cd.DisplayName,
+    cd.Reputation,
+    cd.BadgeCount,
+    cd.EditCount,
+    cd.PostId,
+    cd.Title,
+    cd.Score,
+    cd.ViewCount,
+    cd.LinkedPostCount,
+    cd.Tags,
+    (
+      SELECT AVG(EXTRACT(EPOCH FROM (DATE(ph.CreationDate) - DATE(p.CreationDate)))/86400.0)
+      FROM Posts p
+      INNER JOIN PostHistory ph ON p.Id = ph.PostId
+      WHERE ph.PostHistoryTypeId = 5 AND p.OwnerUserId = cd.UserId
+      GROUP BY p.OwnerUserId
+    ) AS AvgEditTimeDays
+FROM CombinedData cd
+WHERE cd.UserQuestionRank <= 3
+GROUP BY
+    cd.UserId,
+    cd.DisplayName,
+    cd.Reputation,
+    cd.BadgeCount,
+    cd.EditCount,
+    cd.PostId,
+    cd.Title,
+    cd.Score,
+    cd.ViewCount,
+    cd.LinkedPostCount,
+    cd.Tags,
+    cd.UserQuestionRank
+ORDER BY cd.Reputation DESC, cd.Score DESC;

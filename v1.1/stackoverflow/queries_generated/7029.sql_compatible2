@@ -1,0 +1,174 @@
+with
+Questions as (
+  select p.id, p.title, p.creationdate, p.owneruserid, p.score, p.viewcount, p.answercount,
+         coalesce(p.tags,'') as rawtags,
+         regexp_matches(coalesce(p.tags,''),'<[^>]+>','g') as tag_array
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+QuestionTags as (
+  select q.id as questionid,
+         replace(replace(t.tag, '<', ''), '>', '') as tag,
+         q.score, q.viewcount, q.answercount, q.creationdate, q.owneruserid
+  from Questions q,
+       lateral regexp_matches(q.rawtags,'<[^>]+>','g') as t(tag)
+),
+TagAgg as (
+  select qt.tag,
+         count(*) as q_count,
+         sum(case when qt.score > 0 then 1 else 0 end) as positive_score_qs,
+         avg(qt.score) as avg_score,
+         sum(qt.viewcount) as total_views,
+         max(qt.answercount) as max_answers,
+         min(qt.creationdate) as first_seen
+  from QuestionTags qt
+  group by qt.tag
+),
+TopTags as (
+  select tag, q_count, avg_score, total_views,
+         ( (total_views / nullif(q_count,0)) * 0.5 + coalesce(avg_score,0) * 10 ) as popularity_metric
+  from TagAgg
+  order by popularity_metric desc
+  limit 50
+),
+RecentAnswers as (
+  select a.id as answerid, a.parentid as questionid, a.owneruserid as answerer,
+         a.creationdate as answerdate, a.score as answer_score,
+         q.title as question_title, q.tags as question_tags,
+         (select count(*) from posthistory ph where ph.postid = a.id) as answer_edits,
+         case
+           when q.acceptedanswerid = a.id then extract(epoch from (a.creationdate - q.creationdate))/3600.0
+           else null
+         end as hours_after_question
+  from posts a
+  join posts q on q.id = a.parentid
+  where a.posttypeid = 2
+    and a.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+AnswerRank as (
+  select ra.questionid, ra.answerid, ra.answerer, ra.answerdate, ra.answer_score, ra.question_title, ra.question_tags, ra.answer_edits, ra.hours_after_question,
+         row_number() over (partition by ra.questionid order by ra.answer_score desc, ra.answerdate asc) as rank_by_score,
+         rank() over (partition by ra.questionid order by ra.answerdate) as rank_by_time
+  from RecentAnswers ra
+),
+UserEngagement as (
+  select u.id as userid,
+         u.reputation,
+         u.creationdate,
+         u.lastaccessdate,
+         count(distinct case when p.posttypeid = 1 then p.id end) as questions_posted,
+         count(distinct case when p.posttypeid = 2 then p.id end) as answers_posted,
+         sum(coalesce(p.score,0)) as total_post_score,
+         coalesce(b.badge_count,0) as badge_count,
+         greatest(0, 1 - least(365.0, extract(day from cast('2024-10-01 12:34:56' as timestamp) - u.lastaccessdate))/365.0) as recency_factor
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join (
+    select userid, count(*) as badge_count from badges group by userid
+  ) b on b.userid = u.id
+  group by u.id, u.reputation, u.creationdate, u.lastaccessdate, b.badge_count
+),
+SeedQuestions as (
+  select q.id, q.title, q.creationdate, q.owneruserid, q.score, q.viewcount, q.answercount, tt.tag as top_tag
+  from Questions q
+  join QuestionTags qt on qt.questionid = q.id
+  join TopTags tt on tt.tag = qt.tag
+  where q.score >= greatest(1, percent_rank() over (order by q.score) * 10)
+  order by q.creationdate desc
+  limit 200
+),
+QuestionMeta as (
+  select s.id as questionid, s.title, s.creationdate, s.owneruserid, s.score, s.viewcount, s.answercount, s.top_tag,
+         coalesce(c.comment_count,0) as comment_count,
+         coalesce(ch.close_count,0) as close_votes,
+         coalesce(ch.reopen_count,0) as reopen_votes,
+         case when coalesce(ch.close_count,0) > 0 and coalesce(ch.reopen_count,0) = 0 then 'closed_only'
+              when coalesce(ch.reopen_count,0) > 0 and coalesce(ch.close_count,0) > 0 then 'closed_and_reopened'
+              else 'open_or_never_closed'
+         end as close_status
+  from SeedQuestions s
+  left join (
+    select postid, count(*) as comment_count
+    from comments
+    where creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+    group by postid
+  ) c on c.postid = s.id
+  left join (
+    select postid,
+           sum(case when posthistorytypeid in (10,35) then 1 else 0 end) as close_count,
+           sum(case when posthistorytypeid in (11,36) then 1 else 0 end) as reopen_count
+    from posthistory
+    where creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+    group by postid
+  ) ch on ch.postid = s.id
+),
+FinalSet as (
+  select qm.questionid,
+         qm.title,
+         qm.top_tag,
+         qm.creationdate as q_created,
+         qm.score as q_score,
+         qm.viewcount as q_views,
+         qm.comment_count,
+         qm.close_status,
+         ar.answerid,
+         ar.answerer,
+         ar.answerdate,
+         ar.answer_score,
+         ar.answer_edits,
+         ar.hours_after_question,
+         ue.reputation,
+         ue.badge_count,
+         ue.recency_factor,
+         tt.total_views as tag_total_views,
+         tt.q_count as tag_q_count,
+         (coalesce(ar.answer_score,0) > greatest(1, floor(ln(2 + nullif(qm.viewcount,0))))) as answer_is_strong,
+         ( substr(coalesce(qm.title,''),1,80)
+           || ' [' || qm.top_tag || '] ' ||
+           case when qm.close_status = 'closed_only' then 'Closed'
+                when qm.close_status = 'closed_and_reopened' then 'Reopened'
+                else 'Open' end
+         ) as compact_summary,
+         (select count(*) from votes v where v.postid = qm.questionid and v.votetypeid = 2 and v.creationdate >= qm.creationdate and v.creationdate <= qm.creationdate + interval '30 days') as q_upvotes_first_month,
+         (select count(distinct owneruserid) from posts p2 where p2.parentid = qm.questionid and p2.posttypeid = 2) as unique_answerers
+  from QuestionMeta qm
+  left join AnswerRank ar on ar.questionid = qm.questionid and ar.rank_by_score = 1
+  left join UserEngagement ue on ue.userid = ar.answerer
+  left join TopTags tt on tt.tag = qm.top_tag
+)
+select *
+from (
+  select f.questionid, f.title, f.top_tag, f.q_created, f.q_score, f.q_views, f.comment_count, f.close_status,
+         f.answerid, f.answerer, f.answerdate, f.answer_score, f.answer_edits, f.hours_after_question,
+         f.reputation, f.badge_count, f.recency_factor, f.tag_total_views, f.tag_q_count,
+         f.answer_is_strong, f.compact_summary, f.q_upvotes_first_month, f.unique_answerers,
+         'strategy_high_score' as selection_strategy,
+         row_number() over (partition by f.top_tag order by f.answer_score desc NULLS LAST, f.q_views desc) as strategy_rank
+  from FinalSet f
+  where f.answer_score is not null and f.answer_score >= 5
+
+  union all
+
+  select f.questionid, f.title, f.top_tag, f.q_created, f.q_score, f.q_views, f.comment_count, f.close_status,
+         f.answerid, f.answerer, f.answerdate, f.answer_score, f.answer_edits, f.hours_after_question,
+         f.reputation, f.badge_count, f.recency_factor, f.tag_total_views, f.tag_q_count,
+         f.answer_is_strong, f.compact_summary, f.q_upvotes_first_month, f.unique_answerers,
+         'strategy_recent_hot' as selection_strategy,
+         row_number() over (partition by f.top_tag order by f.q_created desc, f.q_upvotes_first_month desc) as strategy_rank
+  from FinalSet f
+  where f.q_upvotes_first_month >= 3
+
+  union all
+
+  select f.questionid, f.title, f.top_tag, f.q_created, f.q_score, f.q_views, f.comment_count, f.close_status,
+         f.answerid, f.answerer, f.answerdate, f.answer_score, f.answer_edits, f.hours_after_question,
+         f.reputation, f.badge_count, f.recency_factor, f.tag_total_views, f.tag_q_count,
+         f.answer_is_strong, f.compact_summary, f.q_upvotes_first_month, f.unique_answerers,
+         'strategy_underappreciated' as selection_strategy,
+         row_number() over (partition by f.top_tag order by (coalesce(f.answer_score,0) - (f.q_views/1000.0)) desc) as strategy_rank
+  from FinalSet f
+  where f.q_views > 1000 and coalesce(f.answer_score,0) < 5
+) u
+where strategy_rank <= 5
+order by top_tag, selection_strategy, strategy_rank;

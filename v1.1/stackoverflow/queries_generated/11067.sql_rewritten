@@ -1,0 +1,67 @@
+-- {"query": "11067.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 530} 
+WITH RecentPosts AS (
+    SELECT 
+        p.Id, 
+        p.Title, 
+        p.CreationDate, 
+        p.Score, 
+        p.ViewCount, 
+        u.DisplayName AS OwnerDisplayName, 
+        u.Reputation AS OwnerReputation
+    FROM 
+        Posts p
+    JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    WHERE 
+        p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+),
+PostVotes AS (
+    SELECT 
+        PostId, 
+        COUNT(*) AS VoteCount, 
+        AVG(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvoteRate
+    FROM 
+        Votes
+    GROUP BY 
+        PostId
+),
+PostTags AS (
+    SELECT 
+        p.Id AS PostId, 
+        TRIM(BOTH '<' FROM SPLIT_PART(p.Tags, ',', generate_series(1, array_length(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), ''><''), 1)))) AS TagName
+    FROM 
+        Posts p
+    CROSS JOIN 
+        generate_series(1, array_length(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), ''><''), 1))
+),
+PostTagCounts AS (
+    SELECT 
+        PostId, 
+        COUNT(*) AS TagCount
+    FROM 
+        PostTags
+    GROUP BY 
+        PostId
+)
+SELECT 
+    rp.Id, 
+    rp.Title, 
+    rp.CreationDate, 
+    rp.Score, 
+    rp.ViewCount, 
+    rp.OwnerDisplayName, 
+    rp.OwnerReputation, 
+    COALESCE(pv.VoteCount, 0) AS VoteCount, 
+    COALESCE(pv.UpvoteRate, 0) AS UpvoteRate, 
+    COALESCE(ptc.TagCount, 0) AS TagCount
+FROM 
+    RecentPosts rp
+LEFT JOIN 
+    PostVotes pv ON rp.Id = pv.PostId
+LEFT JOIN 
+    PostTagCounts ptc ON rp.Id = ptc.PostId
+ORDER BY 
+    rp.Score DESC, 
+    rp.ViewCount DESC, 
+    rp.CreationDate DESC
+LIMIT 100;

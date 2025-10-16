@@ -1,0 +1,142 @@
+WITH UserStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS QuestionScoreSum,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) AS AvgAnswerScore,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpvoteReceived,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownvoteReceived,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        STRING_AGG(SUBSTRING(LOWER(p.Tags), 2, POSITION('><' IN p.Tags) - 2), ',') FILTER (WHERE p.Tags IS NOT NULL AND p.PostTypeId = 1) AS TopTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2,3)
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= DATE '2020-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location
+    HAVING COUNT(DISTINCT p.Id) > 0 OR COUNT(DISTINCT c.Id) > 0
+),
+RankedUsers AS (
+    SELECT
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.Location,
+        us.PostCount,
+        us.QuestionScoreSum,
+        us.AvgAnswerScore,
+        us.CommentCount,
+        us.UpvoteReceived,
+        us.DownvoteReceived,
+        us.GoldBadges,
+        us.TopTags,
+        ROW_NUMBER() OVER (PARTITION BY SUBSTRING(us.Location FROM 1 FOR 10) ORDER BY us.Reputation DESC, us.PostCount DESC) AS RankInLocation,
+        CASE
+            WHEN us.GoldBadges > 0 THEN 'GoldUser'
+            WHEN us.Reputation > 10000 THEN 'HighRep'
+            ELSE 'Regular'
+        END AS UserCategory,
+        NULLIF(us.AvgAnswerScore, 0) AS ValidAvgScore,
+        COALESCE(us.UpvoteReceived - us.DownvoteReceived, 0) AS NetVotes
+    FROM UserStats us
+),
+PostDetails AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        LENGTH(p.Body) AS BodyLength,
+        CARDINALITY(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), '><')) AS TagCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS TopPostRank
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Score > 10
+),
+CombinedData AS (
+    SELECT
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.Location,
+        ru.PostCount,
+        ru.QuestionScoreSum,
+        ru.AvgAnswerScore,
+        ru.CommentCount,
+        ru.UpvoteReceived,
+        ru.DownvoteReceived,
+        ru.GoldBadges,
+        ru.TopTags,
+        ru.RankInLocation,
+        ru.UserCategory,
+        ru.ValidAvgScore,
+        ru.NetVotes,
+        pd.Id AS TopPostId,
+        pd.Title AS TopPostTitle,
+        pd.BodyLength,
+        pd.TagCount
+    FROM RankedUsers ru
+    LEFT JOIN PostDetails pd ON ru.UserId = pd.OwnerUserId AND pd.TopPostRank = 1
+),
+ActivitySummary AS (
+    SELECT
+        cd.UserId,
+        SUM(CASE WHEN EXISTS (SELECT 1 FROM Votes v WHERE v.PostId = cd.TopPostId AND v.VoteTypeId = 2) THEN 1 ELSE 0 END) AS TopPostHasUpvotes,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId IN (SELECT p.Id FROM Posts p WHERE p.OwnerUserId = cd.UserId AND p.PostTypeId = 1)) AS TotalCommentsOnQuestions
+    FROM CombinedData cd
+    GROUP BY cd.UserId
+),
+CategoriesPerRank AS (
+    SELECT
+        cd.RankInLocation,
+        STRING_AGG(cd.UserCategory, ';') AS CategoriesConcat
+    FROM CombinedData cd
+    GROUP BY cd.RankInLocation
+)
+SELECT
+    cd.UserId,
+    cd.DisplayName,
+    cd.Reputation,
+    cd.UserCategory,
+    cd.NetVotes,
+    cd.RankInLocation,
+    cd.TopTags,
+    cd.ValidAvgScore,
+    asu.TopPostHasUpvotes,
+    asu.TotalCommentsOnQuestions,
+    CASE
+        WHEN cd.TopPostId IS NOT NULL AND cd.BodyLength > 5000 THEN 'LongPost'
+        WHEN cd.TagCount >= 5 THEN 'MultiTag'
+        ELSE 'Other'
+    END AS PostType,
+    ROW_NUMBER() OVER (ORDER BY cd.Reputation DESC, cd.NetVotes DESC) AS GlobalRank,
+    cpr.CategoriesConcat AS CategoriesInRank,
+    CASE WHEN cd.Reputation > (SELECT AVG(u.Reputation) FROM Users u WHERE u.Reputation IS NOT NULL) THEN 'AboveAvg' ELSE 'BelowAvg' END AS RepLevel
+FROM CombinedData cd
+INNER JOIN ActivitySummary asu ON cd.UserId = asu.UserId
+LEFT JOIN CategoriesPerRank cpr ON cd.RankInLocation = cpr.RankInLocation
+WHERE cd.NetVotes > 0
+    AND (cd.TopTags IS NOT NULL OR cd.ValidAvgScore IS NOT NULL)
+    AND NOT (cd.UserCategory = 'Regular' AND cd.Reputation < 100)
+UNION
+SELECT
+    NULL AS UserId,
+    'Anonymous' AS DisplayName,
+    0 AS Reputation,
+    'Unknown' AS UserCategory,
+    0 AS NetVotes,
+    0 AS RankInLocation,
+    NULL AS TopTags,
+    NULL AS ValidAvgScore,
+    0 AS TopPostHasUpvotes,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId IS NULL) AS TotalCommentsOnQuestions,
+    'NoPost' AS PostType,
+    NULL AS GlobalRank,
+    NULL AS CategoriesInRank,
+    'N/A' AS RepLevel
+FROM (SELECT 1) dummy
+ORDER BY Reputation DESC NULLS LAST, NetVotes DESC
+LIMIT 1000;

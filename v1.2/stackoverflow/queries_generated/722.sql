@@ -1,0 +1,222 @@
+-- {"query": "722.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2184} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+  UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        rth.TagPath || t2.TagName
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy rth ON t2.Id <> rth.Id AND t2.Count < rth.Count
+    WHERE array_length(rth.TagPath, 1) < 3
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COALESCE(SUM(vb.VoteCount), 0) AS TotalVotes,
+        MAX(p.CreationDate) AS LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS UserRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN (
+        SELECT
+            v.PostId,
+            COUNT(*) AS VoteCount
+        FROM Votes v
+        WHERE v.VoteTypeId IN (2,3) -- UpMod and DownMod
+        GROUP BY v.PostId
+    ) vb ON vb.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostScoreStats AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId) AS AvgScoreByType,
+        MAX(p.Score) OVER (PARTITION BY p.PostTypeId) AS MaxScoreByType,
+        LAG(p.Score) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS PrevScore,
+        LEAD(p.Score) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS NextScore,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS ScoreRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+AnswerWithAcceptedFlag AS (
+    SELECT
+        a.Id,
+        a.ParentId,
+        a.Score,
+        CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END AS IsAccepted,
+        a.CreationDate,
+        a.OwnerUserId
+    FROM Posts a
+    JOIN Posts q ON q.Id = a.ParentId AND q.PostTypeId = 1
+    WHERE a.PostTypeId = 2
+),
+PostLinkSummary AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkTypeName,
+        COUNT(*) OVER (PARTITION BY pl.PostId, lt.Name) AS LinkCount
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+),
+ClosedQuestionsWithReasons AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReason,
+        ph.CreationDate AS ClosedDate
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS SMALLINT)
+    WHERE ph.PostHistoryTypeId = 10
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+TopUsersWithBadgeStats AS (
+    SELECT
+        ua.*,
+        COALESCE(ubs_gold.BadgeCount, 0) AS GoldBadges,
+        COALESCE(ubs_silver.BadgeCount, 0) AS SilverBadges,
+        COALESCE(ubs_bronze.BadgeCount, 0) AS BronzeBadges
+    FROM UserActivity ua
+    LEFT JOIN UserBadgeSummary ubs_gold ON ubs_gold.UserId = ua.UserId AND ubs_gold.Class = 1
+    LEFT JOIN UserBadgeSummary ubs_silver ON ubs_silver.UserId = ua.UserId AND ubs_silver.Class = 2
+    LEFT JOIN UserBadgeSummary ubs_bronze ON ubs_bronze.UserId = ua.UserId AND ubs_bronze.Class = 3
+    WHERE ua.UserRank <= 100
+),
+AggAnswerStatsPerQuestion AS (
+    SELECT
+        q.Id AS QuestionId,
+        COUNT(a.Id) AS AnswerCount,
+        SUM(a.Score) AS TotalAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        SUM(a.IsAccepted) AS AcceptedAnswerCount,
+        AVG(a.Score) AS AvgAnswerScore
+    FROM Posts q
+    LEFT JOIN AnswerWithAcceptedFlag a ON a.ParentId = q.Id
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id
+),
+ComplexFilteredPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        COALESCE(ags.TotalAnswerScore, 0) AS AnswerScoreSum,
+        COALESCE(ags.AnswerCount, 0) AS AnswerCount,
+        COALESCE(ags.AcceptedAnswerCount, 0) AS AcceptedAnswerCount,
+        u.DisplayName AS OwnerName,
+        u.Reputation AS OwnerReputation,
+        CASE
+            WHEN p.ViewCount > 10000 THEN 'High View'
+            WHEN p.ViewCount BETWEEN 1000 AND 10000 THEN 'Medium View'
+            ELSE 'Low View'
+        END AS ViewCategory,
+        CASE
+            WHEN p.Score >= (SELECT AVG(Score) FROM Posts WHERE PostTypeId = p.PostTypeId) THEN 'Above Average'
+            ELSE 'Below Average'
+        END AS ScoreCategory
+    FROM Posts p
+    LEFT JOIN AggAnswerStatsPerQuestion ags ON ags.QuestionId = p.Id
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+      AND (p.ClosedDate IS NULL OR p.ClosedDate > NOW() - INTERVAL '1 year')
+      AND (p.Score + COALESCE(ags.TotalAnswerScore,0)) > 10
+),
+FilteredCommentsWithUser AS (
+    SELECT
+        c.Id,
+        c.PostId,
+        c.Text,
+        c.CreationDate,
+        c.UserId,
+        COALESCE(u.DisplayName, c.UserDisplayName) AS CommenterName,
+        u.Reputation AS CommenterReputation,
+        LENGTH(c.Text) AS CommentLength,
+        CASE WHEN c.UserId IS NULL THEN 1 ELSE 0 END AS IsAnonymous
+    FROM Comments c
+    LEFT JOIN Users u ON u.Id = c.UserId
+    WHERE LENGTH(c.Text) > 100
+),
+DistinctTagPairs AS (
+    SELECT DISTINCT
+        LEAST(t1.TagName, t2.TagName) AS TagA,
+        GREATEST(t1.TagName, t2.TagName) AS TagB
+    FROM Tags t1
+    JOIN Tags t2 ON t1.Id <> t2.Id
+    WHERE t1.Count > 1000 AND t2.Count > 1000
+),
+TagPairPostCounts AS (
+    SELECT
+        dtp.TagA,
+        dtp.TagB,
+        COUNT(DISTINCT p.Id) AS PostsWithBothTags
+    FROM DistinctTagPairs dtp
+    JOIN Posts p ON p.PostTypeId = 1
+    WHERE p.Tags LIKE '%' || dtp.TagA || '%'
+      AND p.Tags LIKE '%' || dtp.TagB || '%'
+    GROUP BY dtp.TagA, dtp.TagB
+    HAVING COUNT(DISTINCT p.Id) > 50
+),
+FinalResult AS (
+    SELECT
+        cfp.Id AS QuestionId,
+        cfp.Title,
+        cfp.ViewCategory,
+        cfp.ScoreCategory,
+        cfp.Score,
+        cfp.ViewCount,
+        cfp.AnswerCount,
+        cfp.AcceptedAnswerCount,
+        cfp.AnswerScoreSum,
+        cfp.OwnerName,
+        cfp.OwnerReputation,
+        tbp.TagA,
+        tbp.TagB,
+        tbp.PostsWithBothTags,
+        COUNT(fc.Id) FILTER (WHERE fc.IsAnonymous = 0) AS AuthCommentsCount,
+        AVG(fc.CommentLength) FILTER (WHERE fc.IsAnonymous = 0) AS AvgCommentLength,
+        MAX(fc.CreationDate) FILTER (WHERE fc.IsAnonymous = 0) AS LastCommentDate,
+        tu.GoldBadges,
+        tu.SilverBadges,
+        tu.BronzeBadges
+    FROM ComplexFilteredPosts cfp
+    LEFT JOIN FilteredCommentsWithUser fc ON fc.PostId = cfp.Id
+    LEFT JOIN TagPairPostCounts tbp ON tbp.TagA = ANY(string_to_array(REPLACE(REPLACE(cfp.Tags, '<', ''), '>', ','), ',')) OR tbp.TagB = ANY(string_to_array(REPLACE(REPLACE(cfp.Tags, '<', ''), '>', ','), ','))
+    LEFT JOIN TopUsersWithBadgeStats tu ON tu.UserId = cfp.OwnerUserId
+    GROUP BY cfp.Id, cfp.Title, cfp.ViewCategory, cfp.ScoreCategory, cfp.Score, cfp.ViewCount, cfp.AnswerCount, cfp.AcceptedAnswerCount, cfp.AnswerScoreSum, cfp.OwnerName, cfp.OwnerReputation, tbp.TagA, tbp.TagB, tbp.PostsWithBothTags, tu.GoldBadges, tu.SilverBadges, tu.BronzeBadges
+    ORDER BY (cfp.Score + cfp.AnswerScoreSum) DESC, cfp.ViewCount DESC
+    LIMIT 50
+)
+SELECT * FROM FinalResult;

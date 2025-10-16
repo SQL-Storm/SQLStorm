@@ -1,0 +1,77 @@
+-- {"query": "12064.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 568} 
+
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        COUNT(C.Id) OVER (PARTITION BY P.Id) AS CommentCount,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.CreationDate) AS UserPostRank
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    LEFT JOIN 
+        Comments C ON P.Id = C.PostId
+    WHERE 
+        P.PostTypeId IN (1, 2) 
+        AND P.CreationDate > CURRENT_DATE - INTERVAL '1 year'
+), 
+AggregatedUserStats AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        SUM(V.Score) AS TotalVoteScore
+    FROM 
+        Users U
+    LEFT JOIN 
+        Badges B ON U.Id = B.UserId
+    LEFT JOIN 
+        Votes V ON U.Id = V.UserId
+    WHERE 
+        V.VoteTypeId IN (2, 3)
+    GROUP BY 
+        U.Id, U.DisplayName
+), 
+TopUsers AS (
+    SELECT 
+        Id,
+        DisplayName
+    FROM 
+        AggregatedUserStats
+    ORDER BY 
+        TotalVoteScore DESC, TotalBadges DESC
+    LIMIT 10
+)
+SELECT 
+    RP.Id,
+    RP.PostTypeId,
+    RP.CreationDate,
+    RP.Score,
+    RP.ViewCount,
+    RP.OwnerUserId,
+    RP.OwnerDisplayName,
+    RP.CommentCount,
+    AUS.TotalBadges,
+    AUS.GoldBadges,
+    AUS.SilverBadges,
+    AUS.BronzeBadges,
+    AUS.TotalVoteScore
+FROM 
+    RankedPosts RP
+JOIN 
+    TopUsers TU ON RP.OwnerUserId = TU.Id
+JOIN 
+    AggregatedUserStats AUS ON RP.OwnerUserId = AUS.Id
+WHERE 
+    RP.UserPostRank <= 3
+ORDER BY 
+    RP.Score DESC, RP.CreationDate;

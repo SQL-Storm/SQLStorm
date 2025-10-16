@@ -1,0 +1,83 @@
+WITH UserActivity AS (
+    SELECT 
+        U.Id AS UserId,
+        U.DisplayName,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS QuestionsPosted,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS AnswersPosted,
+        COALESCE(SUM(CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END), 0) AS AcceptedAnswers,
+        DENSE_RANK() OVER (ORDER BY COALESCE(SUM(P.Score), 0) DESC) AS ReputationRank
+    FROM 
+        Users U
+    LEFT JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    WHERE 
+        P.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR
+    GROUP BY 
+        U.Id, U.DisplayName
+),
+CommentMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        COUNT(C.Id) AS TotalComments,
+        SUM(C.Score) AS CommentScoreSum,
+        MAX(C.CreationDate) AS LastCommentDate
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Comments C ON P.Id = C.PostId
+    WHERE
+        P.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6' MONTH
+    GROUP BY 
+        P.Id
+),
+TagAnalysis AS (
+    SELECT
+        T.TagName,
+        COUNT(DISTINCT P.Id) AS PostsWithTag,
+        AVG(P.Score) AS AvgScore
+    FROM
+        Tags T
+    INNER JOIN
+        Posts P ON POSITION('<' || T.TagName || '>' IN P.Tags) > 0
+    GROUP BY
+        T.TagName
+    HAVING
+        COUNT(DISTINCT P.Id) > 5
+)
+SELECT
+    UA.UserId,
+    UA.DisplayName,
+    UA.QuestionsPosted,
+    UA.AnswersPosted,
+    UA.AcceptedAnswers,
+    CM.TotalComments,
+    CM.CommentScoreSum,
+    CM.LastCommentDate,
+    STRING_AGG(TA.TagName, ', ') AS ActiveTags,
+    UA.ReputationRank
+FROM
+    UserActivity UA
+LEFT JOIN
+    Posts P ON UA.UserId = P.OwnerUserId
+LEFT JOIN
+    CommentMetrics CM ON P.Id = CM.PostId
+LEFT JOIN
+    Tags T ON POSITION('<' || T.TagName || '>' IN P.Tags) > 0
+LEFT JOIN
+    TagAnalysis TA ON T.TagName = TA.TagName
+WHERE
+    UA.ReputationRank <= 100
+GROUP BY
+    UA.UserId,
+    UA.DisplayName,
+    UA.QuestionsPosted,
+    UA.AnswersPosted,
+    UA.AcceptedAnswers,
+    CM.TotalComments,
+    CM.CommentScoreSum,
+    CM.LastCommentDate,
+    UA.ReputationRank
+ORDER BY
+    UA.ReputationRank ASC,
+    CM.TotalComments DESC
+LIMIT 50;

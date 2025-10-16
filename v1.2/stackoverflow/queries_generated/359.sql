@@ -1,0 +1,202 @@
+-- {"query": "359.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1765} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsRequired = 1
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        r.Level + 1,
+        r.Path || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id <> r.Id and not t.TagName = any(r.Path)
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0 and r.Level < 3
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        count(distinct b.Name) as DistinctBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostScoreRanks as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        rank() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc nulls last) as ScoreRank,
+        dense_rank() over (partition by p.PostTypeId order by p.CreationDate desc) as RecentRank
+    from Posts p
+    where p.PostTypeId in (1, 2)
+),
+PostWithAcceptedAnswer as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Tags,
+        q.CreationDate as QuestionCreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViewCount,
+        a.Id as AcceptedAnswerId,
+        a.Score as AcceptedAnswerScore,
+        a.OwnerUserId as AcceptedAnswerOwnerUserId,
+        u.DisplayName as AcceptedAnswerOwnerName,
+        u.Reputation as AcceptedAnswerOwnerReputation
+    from Posts q
+    left join Posts a on q.AcceptedAnswerId = a.Id
+    left join Users u on a.OwnerUserId = u.Id
+    where q.PostTypeId = 1
+),
+CloseReasonCounts as (
+    select
+        ph.Comment as CloseReasonId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseCount
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10
+    group by ph.Comment, crt.Name
+),
+UserActivitySummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        coalesce(sum(vtUp.VoteCount), 0) as UpVotesReceived,
+        coalesce(sum(vtDown.VoteCount), 0) as DownVotesReceived,
+        max(p.CreationDate) as LastPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join (
+        select v.PostId, count(*) as VoteCount
+        from Votes v
+        join VoteTypes vt on vt.Id = v.VoteTypeId and vt.Name = 'UpMod'
+        group by v.PostId
+    ) vtUp on vtUp.PostId = p.Id
+    left join (
+        select v.PostId, count(*) as VoteCount
+        from Votes v
+        join VoteTypes vt on vt.Id = v.VoteTypeId and vt.Name = 'DownMod'
+        group by v.PostId
+    ) vtDown on vtDown.PostId = p.Id
+    group by u.Id, u.DisplayName
+),
+TopTagsByQuestionScore as (
+    select
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as Tag,
+        p.Score
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+),
+TagScoreAggregates as (
+    select
+        Tag,
+        count(*) as QuestionCount,
+        avg(Score) as AvgQuestionScore,
+        max(Score) as MaxQuestionScore,
+        percentile_cont(0.5) within group (order by Score) as MedianQuestionScore
+    from TopTagsByQuestionScore
+    group by Tag
+),
+QuestionsWithCloseInfo as (
+    select
+        q.Id,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as CloseDate
+    from Posts q
+    left join PostHistory ph on ph.PostId = q.Id and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where q.PostTypeId = 1
+)
+select
+    u.DisplayName as User,
+    u.Reputation,
+    ucs.QuestionCount,
+    ucs.AnswerCount,
+    ucs.CommentCount,
+    ucs.UpVotesReceived,
+    ucs.DownVotesReceived,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.DistinctBadges,
+    pwa.Title as SampleQuestionTitle,
+    pwa.QuestionScore,
+    pwa.ViewCount as QuestionViews,
+    pwa.AcceptedAnswerScore,
+    pwa.AcceptedAnswerOwnerName,
+    pwa.AcceptedAnswerOwnerReputation,
+    cr.CloseReasonName,
+    cr.CloseCount,
+    ts.Tag,
+    ts.QuestionCount as TagQuestionCount,
+    ts.AvgQuestionScore,
+    ts.MaxQuestionScore,
+    ts.MedianQuestionScore,
+    string_agg(distinct rth.TagName, ', ') as RecursiveTagsPath
+from Users u
+left join UserActivitySummary ucs on ucs.UserId = u.Id
+left join UserBadgeStats ubs on ubs.UserId = u.Id
+left join lateral (
+    select pwa.*
+    from PostWithAcceptedAnswer pwa
+    where pwa.AcceptedAnswerOwnerUserId = u.Id
+    order by pwa.QuestionCreationDate desc
+    limit 1
+) pwa on true
+left join (
+    select CloseReasonName, CloseCount
+    from CloseReasonCounts
+    order by CloseCount desc
+    limit 1
+) cr on true
+left join lateral (
+    select ts.Tag, ts.QuestionCount, ts.AvgQuestionScore, ts.MaxQuestionScore, ts.MedianQuestionScore
+    from TagScoreAggregates ts
+    order by ts.QuestionCount desc
+    limit 1
+) ts on true
+left join RecursiveTagHierarchy rth on rth.Level = 1
+where u.Reputation > (
+    select percentile_cont(0.75) within group (order by Reputation) from Users
+)
+and ubs.GoldBadges > 0
+and pwa.QuestionScore > 10
+and (cr.CloseCount is null or cr.CloseCount < 1000)
+group by
+    u.DisplayName, u.Reputation, ucs.QuestionCount, ucs.AnswerCount, ucs.CommentCount,
+    ucs.UpVotesReceived, ucs.DownVotesReceived, ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges,
+    ubs.DistinctBadges, pwa.Title, pwa.QuestionScore, pwa.ViewCount, pwa.AcceptedAnswerScore,
+    pwa.AcceptedAnswerOwnerName, pwa.AcceptedAnswerOwnerReputation, cr.CloseReasonName, cr.CloseCount,
+    ts.Tag, ts.QuestionCount, ts.AvgQuestionScore, ts.MaxQuestionScore, ts.MedianQuestionScore
+order by u.Reputation desc
+limit 50;

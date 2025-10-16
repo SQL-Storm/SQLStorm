@@ -1,0 +1,59 @@
+WITH ActiveUsers AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        U.Reputation,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        ROW_NUMBER() OVER (ORDER BY U.Reputation DESC) AS ReputationRank
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    WHERE U.LastAccessDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 months'
+        AND (U.Views IS NOT NULL OR U.WebsiteUrl IS NOT NULL)
+    GROUP BY U.Id, U.DisplayName, U.Reputation
+),
+HighlyRatedPosts AS (
+    SELECT
+        P.Id,
+        P.OwnerUserId,
+        P.Score,
+        P.Title,
+        AVG(C.Score) AS AvgCommentScore,
+        DENSE_RANK() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC) AS UserPostRank
+    FROM Posts P
+    LEFT JOIN Comments C ON P.Id = C.PostId
+    WHERE P.Score > (SELECT AVG(Score) * 1.5 FROM Posts WHERE PostTypeId = 1)
+        AND P.PostTypeId = 1
+    GROUP BY P.Id, P.OwnerUserId, P.Score, P.Title
+),
+TopContributors AS (
+    SELECT 
+        AU.Id,
+        AU.DisplayName,
+        AU.Reputation,
+        COALESCE(SUM(HRP.Score), 0) AS TotalHighScore,
+        STRING_AGG(DISTINCT CASE WHEN HRP.UserPostRank = 1 THEN HRP.Title END, ' | ') AS TopPostTitles,
+        AU.TotalPosts,
+        AU.TotalQuestions,
+        AU.TotalAnswers
+    FROM ActiveUsers AU
+    LEFT JOIN HighlyRatedPosts HRP ON AU.Id = HRP.OwnerUserId
+    WHERE AU.ReputationRank <= 100
+    GROUP BY AU.Id, AU.DisplayName, AU.Reputation, AU.TotalPosts, AU.TotalQuestions, AU.TotalAnswers
+    HAVING COUNT(HRP.Id) > 0
+)
+SELECT 
+    TC.Id,
+    TC.DisplayName,
+    TC.Reputation,
+    TC.TotalPosts,
+    TC.TotalQuestions,
+    TC.TotalAnswers,
+    TC.TotalHighScore,
+    TC.TopPostTitles,
+    (SELECT COUNT(*) FROM Badges B WHERE B.UserId = TC.Id AND B.Class = 1) AS GoldBadges,
+    (SELECT MAX(PH.CreationDate) FROM PostHistory PH WHERE PH.UserId = TC.Id AND PH.PostHistoryTypeId = 1) AS LastInitialTitleEdit
+FROM TopContributors TC
+ORDER BY TC.TotalHighScore DESC, TC.Reputation DESC
+LIMIT 50;

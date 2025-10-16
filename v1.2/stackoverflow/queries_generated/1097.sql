@@ -1,0 +1,181 @@
+-- {"query": "1097.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1618} 
+with RecursiveTagHierarchy (Id, TagName, ParentTagName, Depth) as (
+    select
+        t.Id,
+        t.TagName,
+        null::varchar,
+        1
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select
+        c.Id,
+        c.TagName,
+        p.TagName,
+        p.Depth + 1
+    from Tags c
+    join RecursiveTagHierarchy p on c.ExcerptPostId = p.Id
+    where c.IsModeratorOnly = 0 and c.IsRequired = 0 and p.Depth < 3
+),
+UserStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsPosted,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersPosted,
+        coalesce(sum(vb.UpVotes), 0) as TotalUpVotes,
+        coalesce(sum(vb.DownVotes), 0) as TotalDownVotes,
+        max(b.Date) as LastBadgeDate,
+        (rank() over (order by u.Reputation desc)) as ReputationRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select
+            p.OwnerUserId,
+            sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+            sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes
+        from Votes v
+        join VoteTypes vt on v.VoteTypeId = vt.Id
+        join Posts p on v.PostId = p.Id
+        group by p.OwnerUserId
+    ) vb on vb.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+TopPosts as (
+    select distinct
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        us.DisplayName as OwnerDisplayName,
+        us.ReputationRank,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as rn
+    from Posts p
+    join UserStats us on us.UserId = p.OwnerUserId
+    where p.PostTypeId in (1, 2)
+      and p.CreationDate >= current_date - interval '1 year'
+      and p.Score > 5
+),
+AnsweredQuestionsWithDupes as (
+    select
+        q.Id as QuestionId,
+        q.Title as QuestionTitle,
+        qa.Id as AnswerId,
+        qa.Score as AnswerScore,
+        coalesce(dupe.RelatedPostId, null) as DuplicateOf,
+        case when dupe.RelatedPostId is not null then true else false end as IsDuplicate,
+        (select count(*) from Comments c where c.PostId = q.Id) as QuestionComments,
+        (select count(*) from Comments c where c.PostId = qa.Id) as AnswerComments,
+        us.DisplayName as QuestionOwner,
+        us2.DisplayName as AnswerOwner
+    from Posts q
+    left join Posts qa on qa.ParentId = q.Id and qa.PostTypeId = 2
+    left join PostLinks dupe on dupe.PostId = q.Id and dupe.LinkTypeId = 3
+    left join UserStats us on us.UserId = q.OwnerUserId
+    left join UserStats us2 on us2.UserId = qa.OwnerUserId
+    where q.PostTypeId = 1
+      and q.AcceptedAnswerId is not null
+      and q.Score > 10
+),
+DetailedEdits as (
+    select
+        ph.PostId,
+        ph.UserId,
+        ph.UserDisplayName,
+        p.PostTypeId,
+        ph.PostHistoryTypeId,
+        p.Title,
+        ph.CreationDate,
+        ph.Comment,
+        count(*) over (partition by ph.UserId) as UserEditCount,
+        row_number() over (partition by ph.PostId order by ph.CreationDate desc) as EditRank
+    from PostHistory ph
+    join Posts p on p.Id = ph.PostId
+    where ph.PostHistoryTypeId in (4,5,6,10,11,12,13)
+      and ph.CreationDate > current_date - interval '6 months'
+),
+TagInfluence as (
+    select
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as Tag,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Id as PostId
+    from Posts p
+    where p.PostTypeId = 1 and p.CreationDate > current_date - interval '2 years'
+),
+TopTagStats as (
+    select
+        Tag,
+        count(*) as QuestionCount,
+        avg(Score) as AvgScore,
+        avg(ViewCount) as AvgViewCount,
+        max(Score) as MaxScore,
+        percentile_cont(0.5) within group (order by Score) as MedianScore
+    from TagInfluence
+    group by Tag
+    having count(*) > 100
+),
+CombinedResults as (
+    select
+        tp.Id as PostId,
+        tp.Title,
+        tp.Tags,
+        tp.CreationDate,
+        tp.Score,
+        tp.ViewCount,
+        tp.OwnerUserId,
+        tp.OwnerDisplayName,
+        tp.ReputationRank,
+        qwd.AnswerId,
+        qwd.AnswerScore,
+        qwd.IsDuplicate,
+        de.UserDisplayName as LastEditor,
+        de.PostHistoryTypeId,
+        de.CreationDate as LastEditDate,
+        tts.Tag,
+        tts.QuestionCount,
+        tts.AvgScore,
+        tts.AvgViewCount,
+        tts.MedianScore
+    from TopPosts tp
+    left join AnsweredQuestionsWithDupes qwd on qwd.QuestionId = tp.Id
+    left join DetailedEdits de on de.PostId = tp.Id and de.EditRank = 1
+    left join LATERAL (
+      select Tag, QuestionCount, AvgScore, AvgViewCount, MedianScore
+      from TopTagStats
+      where Tag = (select unnest(string_to_array(substring(tp.Tags from 2 for char_length(tp.Tags)-2), '><')) limit 1)
+      limit 1
+    ) tts on true
+)
+select distinct
+    cr.PostId,
+    cr.Title,
+    cr.Score,
+    cr.ViewCount,
+    cr.OwnerDisplayName,
+    cr.ReputationRank,
+    cr.AnswerId,
+    cr.AnswerScore,
+    cr.IsDuplicate,
+    cr.LastEditor,
+    cr.LastEditDate,
+    cr.PostHistoryTypeId,
+    cr.Tag,
+    cr.QuestionCount,
+    cr.AvgScore,
+    cr.AvgViewCount,
+    cr.MedianScore,
+    string_agg(distinct bh.Name, ', ') filter (where bh.Name is not null) over (partition by cr.OwnerUserId) as OwnerBadges,
+    sum(case when cr.Score > avg(cr.Score) over () then 1 else 0 end) over () as PostsAboveAvgScore
+from CombinedResults cr
+left join Badges b on b.UserId = cr.OwnerUserId
+left join PostHistoryTypes bh on bh.Id = b.Class
+where cr.ReputationRank <= 1000
+order by cr.Score desc, cr.ViewCount desc, cr.LastEditDate desc
+limit 100;

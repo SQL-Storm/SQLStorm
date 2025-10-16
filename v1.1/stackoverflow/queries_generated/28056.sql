@@ -1,0 +1,79 @@
+-- {"query": "28056.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "deepseek-r1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1430} 
+
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id
+),
+PostAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Tags,
+        LENGTH(p.Body) - LENGTH(REPLACE(p.Body, '<code>', '')) AS CodeBlockCount,
+        (SELECT MAX(ph.CreationDate) 
+         FROM PostHistory ph 
+         WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6)) AS LastEditDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS PostRank
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.ClosedDate IS NULL
+)
+SELECT 
+    ua.UserId,
+    u.DisplayName,
+    COALESCE(NULLIF(u.Location, ''), 'Unknown') AS Location,
+    ua.ReputationRank,
+    pa.PostId,
+    pa.CodeBlockCount,
+    (SELECT STRING_AGG(REPLACE(tag, '-', '_'), '|') 
+     FROM UNNEST(STRING_TO_ARRAY(SUBSTRING(pa.Tags FROM 2 FOR LENGTH(pa.Tags)-2), '><')) AS tag) AS FormattedTags,
+    ua.AvgQuestionScore,
+    (SELECT COUNT(*) 
+     FROM Votes v 
+     WHERE v.PostId = pa.PostId AND v.VoteTypeId IN (2,3,8)
+     GROUP BY v.PostId) AS VoteActivity,
+    ph.Comment AS CloseReason,
+    CASE 
+        WHEN u.DownVotes > u.UpVotes THEN 'Controversial' 
+        WHEN u.Reputation > 100000 THEN 'Legendary' 
+        ELSE 'Regular' 
+    END AS UserCategory
+FROM UserActivity ua
+LEFT JOIN PostAnalysis pa ON ua.UserId = pa.OwnerUserId AND pa.PostRank <= 3
+LEFT JOIN Users u ON ua.UserId = u.Id
+LEFT JOIN (
+    SELECT PostId, MAX(CreationDate) AS LastCloseDate 
+    FROM PostHistory 
+    WHERE PostHistoryTypeId = 10 
+    GROUP BY PostId
+) phist ON pa.PostId = phist.PostId
+LEFT JOIN PostHistory ph ON ph.PostId = phist.PostId AND ph.CreationDate = phist.LastCloseDate
+WHERE u.CreationDate BETWEEN '2010-01-01' AND '2020-12-31'
+  AND (u.WebsiteUrl IS NOT NULL OR u.AboutMe LIKE '%github%')
+UNION ALL
+SELECT 
+    b.UserId,
+    (SELECT DisplayName FROM Users WHERE Id = b.UserId),
+    'BadgeOnlyUser' AS Location,
+    NULL AS ReputationRank,
+    NULL AS PostId,
+    NULL AS CodeBlockCount,
+    b.Name AS FormattedTags,
+    NULL AS AvgQuestionScore,
+    COUNT(*) OVER (PARTITION BY b.UserId) AS VoteActivity,
+    NULL AS CloseReason,
+    'BadgeCollector' AS UserCategory
+FROM Badges b
+WHERE b.Class = 1 AND NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = b.UserId)
+ORDER BY UserCategory DESC, ReputationRank NULLS LAST, PostCount DESC NULLS LAST
+LIMIT 500;

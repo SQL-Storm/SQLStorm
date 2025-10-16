@@ -1,0 +1,176 @@
+-- {"query": "775.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1663} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level,
+        ARRAY[t.TagName] AS Ancestors
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+    UNION ALL
+    SELECT
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.ExcerptPostId,
+        child.WikiPostId,
+        rh.Level + 1,
+        rh.Ancestors || child.TagName
+    FROM Tags child
+    JOIN PostLinks pl ON pl.PostId = child.ExcerptPostId
+    JOIN RecursiveTagHierarchy rh ON rh.Id = pl.RelatedPostId
+    WHERE child.IsModeratorOnly = 0 AND child.IsRequired = 0 AND NOT child.TagName = ANY(rh.Ancestors)
+),
+TopUsersWithBadgeStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalPostViews
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId IN (1,2)
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+UserLatestActivity AS (
+    SELECT
+        u.Id AS UserId,
+        MAX(GREATEST(
+            COALESCE(p.LastActivityDate, '1970-01-01'),
+            COALESCE(ph.CreationDate, '1970-01-01'),
+            COALESCE(c.CreationDate, '1970-01-01'),
+            COALESCE(v.CreationDate, '1970-01-01')
+        )) AS LastActivity
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id
+),
+QuestionsWithAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.Tags,
+        acc.DisplayName AS AcceptedAnswerOwner,
+        acc.Id AS AcceptedAnswerOwnerId,
+        COUNT(a.Id) FILTER (WHERE a.Score > 0) AS PositiveAnswersCount,
+        AVG(a.Score) FILTER (WHERE a.Score IS NOT NULL) AS AvgAnswerScore,
+        MAX(a.CreationDate) FILTER (WHERE a.CreationDate IS NOT NULL) AS LastAnswerDate
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN Posts acc ON acc.Id = q.AcceptedAnswerId
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, q.Tags, acc.DisplayName, acc.Id
+),
+UserRankings AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.GoldBadges,
+        u.SilverBadges,
+        u.BronzeBadges,
+        u.TotalPostScore,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.TotalPostScore DESC) AS RankByReputation,
+        RANK() OVER (PARTITION BY u.GoldBadges > 0 ORDER BY u.Reputation DESC) AS RankAmongGoldBadgeHolders
+    FROM TopUsersWithBadgeStats u
+),
+QuestionsWithCloseInfo AS (
+    SELECT
+        q.QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.Tags,
+        crt.Name AS CloseReason,
+        ph.CreationDate AS CloseDate
+    FROM QuestionsWithAnswerStats q
+    LEFT JOIN PostHistory ph ON ph.PostId = q.QuestionId AND ph.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS SMALLINT)
+),
+UserCommentActivity AS (
+    SELECT
+        c.UserId,
+        COUNT(c.Id) AS TotalComments,
+        COUNT(DISTINCT c.PostId) AS DistinctPostsCommented,
+        MAX(c.CreationDate) AS LastCommentDate,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM '<([^>]+)>'), ',') FILTER (WHERE p.Tags IS NOT NULL) AS CommentedTags
+    FROM Comments c
+    LEFT JOIN Posts p ON p.Id = c.PostId
+    GROUP BY c.UserId
+),
+ComplexPostScores AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        (p.Score * 5 + p.ViewCount / NULLIF(GREATEST(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - p.CreationDate)), 1), 1)::int) AS WeightedScore,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY (p.Score * 5 + p.ViewCount / NULLIF(GREATEST(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - p.CreationDate)), 1), 1)::int) DESC) AS ScoreRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2)
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    u.TotalPostScore,
+    ua.LastActivity,
+    uc.TotalComments,
+    uc.DistinctPostsCommented,
+    uc.LastCommentDate,
+    qc.QuestionId,
+    qc.Title AS QuestionTitle,
+    qc.QuestionScore,
+    qc.ViewCount AS QuestionViews,
+    qc.AnswerCount,
+    qc.CloseReason,
+    qc.CloseDate,
+    ca.AcceptedAnswerOwner,
+    ca.AcceptedAnswerOwnerId,
+    ca.PositiveAnswersCount,
+    ca.AvgAnswerScore,
+    ca.LastAnswerDate,
+    cps.Id AS TopPostId,
+    cps.PostTypeId AS TopPostType,
+    cps.Score AS TopPostScore,
+    cps.ViewCount AS TopPostViews,
+    cps.WeightedScore AS TopPostWeightedScore,
+    uh.Level AS TagHierarchyLevel,
+    uh.Ancestors AS TagAncestors
+FROM UserRankings u
+LEFT JOIN UserLatestActivity ua ON ua.UserId = u.Id
+LEFT JOIN UserCommentActivity uc ON uc.UserId = u.Id
+LEFT JOIN QuestionsWithCloseInfo qc ON qc.QuestionId IN (
+    SELECT p.Id FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1 LIMIT 1
+)
+LEFT JOIN QuestionsWithAnswerStats ca ON ca.QuestionId = qc.QuestionId
+LEFT JOIN ComplexPostScores cps ON cps.OwnerUserId = u.Id AND cps.ScoreRank = 1
+LEFT JOIN RecursiveTagHierarchy uh ON uh.TagName = ANY(string_to_array(coalesce(qc.Tags, ''), '><'))
+WHERE u.RankByReputation <= 100
+ORDER BY u.RankByReputation, cps.WeightedScore DESC
+LIMIT 100;

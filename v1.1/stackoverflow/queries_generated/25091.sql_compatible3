@@ -1,0 +1,71 @@
+SELECT up.user_id,
+       up.display_name,
+       up.reputation,
+       up.question_cnt,
+       up.answer_cnt,
+       up.question_score,
+       up.answer_score,
+       up.last_post_dt,
+       ub.badge_cnt,
+       ub.last_badge_dt,
+       ub.gold_badges,
+       ub.silver_badges,
+       ub.bronze_badges,
+       ut.top_3_tags,
+       COALESCE(rv.up_votes_given, 0) AS up_votes_30d,
+       COALESCE(rv.down_votes_given, 0) AS down_votes_30d,
+       COALESCE(rv.bounties_started, 0) AS bounties_started_30d,
+       lc.last_close_dt,
+       CASE
+           WHEN up.reputation > 20000 THEN 'Legendary'
+           WHEN up.reputation > 10000 THEN 'Expert'
+           WHEN up.reputation > 1000  THEN 'Intermediate'
+           ELSE 'Novice'
+       END AS reputation_tier
+FROM user_posts up
+LEFT JOIN user_badges ub ON ub.user_id = up.user_id
+LEFT JOIN user_tags ut ON ut.user_id = up.user_id
+LEFT JOIN user_recent_votes rv ON rv.user_id = up.user_id
+LEFT JOIN user_last_close lc ON lc.user_id = up.user_id
+GROUP BY up.user_id,
+         up.display_name,
+         up.reputation,
+         up.question_cnt,
+         up.answer_cnt,
+         up.question_score,
+         up.answer_score,
+         up.last_post_dt,
+         ub.badge_cnt,
+         ub.last_badge_dt,
+         ub.gold_badges,
+         ub.silver_badges,
+         ub.bronze_badges,
+         ut.top_3_tags,
+         rv.up_votes_given,
+         rv.down_votes_given,
+         rv.bounties_started,
+         lc.last_close_dt
+
+UNION ALL
+
+SELECT -1 AS user_id,
+       'Community' AS display_name,
+       0 AS reputation,
+       SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS question_cnt,
+       SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS answer_cnt,
+       SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS question_score,
+       SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS answer_score,
+       MAX(p.CreationDate) AS last_post_dt,
+       0 AS badge_cnt,
+       CAST(NULL AS TIMESTAMP) AS last_badge_dt,
+       CAST(NULL AS INTEGER) AS gold_badges,
+       CAST(NULL AS INTEGER) AS silver_badges,
+       CAST(NULL AS INTEGER) AS bronze_badges,
+       CAST(NULL AS VARCHAR) AS top_3_tags,
+       0 AS up_votes_30d,
+       0 AS down_votes_30d,
+       0 AS bounties_started_30d,
+       CAST(NULL AS TIMESTAMP) AS last_close_dt,
+       'Community' AS reputation_tier
+FROM Posts p
+WHERE p.OwnerUserId = -1;

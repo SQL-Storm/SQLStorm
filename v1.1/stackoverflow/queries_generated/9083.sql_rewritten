@@ -1,0 +1,156 @@
+-- {"query": "9083.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2013, "output_tokens": 4626} 
+WITH RECURSIVE DateSeq(dt) AS (
+    SELECT date_trunc('day', cast('2024-10-01 12:34:56' as timestamp)) - INTERVAL '6 days'
+  UNION ALL
+    SELECT dt + INTERVAL '1 day'
+      FROM DateSeq
+     WHERE dt + INTERVAL '1 day' <= date_trunc('day', cast('2024-10-01 12:34:56' as timestamp))
+),
+RecentQ AS (
+    SELECT p.Id,
+           p.Title,
+           p.Tags,
+           p.OwnerUserId,
+           p.Score,
+           p.ViewCount,
+           p.CreationDate,
+           p.LastActivityDate
+      FROM Posts p
+     WHERE p.PostTypeId = 1
+       AND p.LastActivityDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+),
+TagExploded AS (
+    SELECT rq.Id AS QuestionId,
+           unnest(
+             string_to_array(
+               substring(rq.Tags, 2, length(rq.Tags) - 2),
+               '><'
+             )
+           ) AS TagName
+      FROM RecentQ rq
+),
+UserBadges AS (
+    SELECT u.Id                        AS UserId,
+           u.DisplayName,
+           COUNT(b.Id)                  AS BadgeCount,
+           MAX(CASE WHEN b.Class = 1 THEN b.Date END) AS LastGoldBadgeDate
+      FROM Users u
+ LEFT JOIN Badges b ON b.UserId = u.Id
+     GROUP BY u.Id, u.DisplayName
+),
+AnswerRank AS (
+    SELECT a.ParentId                             AS QuestionId,
+           a.Id                                   AS AnswerId,
+           ROW_NUMBER() OVER (
+             PARTITION BY a.ParentId
+             ORDER BY a.Score DESC, a.CreationDate
+           )                                     AS Rank
+      FROM Posts a
+     WHERE a.PostTypeId = 2
+)
+SELECT
+    rq.Id                             AS QuestionId,
+    left(rq.Title, 50)
+      || CASE WHEN length(rq.Title) > 50 THEN '…' ELSE '' END
+                                       AS ShortTitle,
+    te.TagName,
+    coalesce(ub.DisplayName, 'anonymous') AS Owner,
+    ub.BadgeCount,
+    ub.LastGoldBadgeDate,
+    ar.Rank,
+    (
+      SELECT count(*)
+        FROM Comments c
+       WHERE c.PostId = ar.AnswerId
+         AND coalesce(c.Score, 0) > rq.Score
+    )                                  AS HighScoreCommentCount,
+    CASE
+      WHEN rq.Score > 0
+      THEN round(
+             rq.Score * 100.0
+             / NULLIF(
+                 (SELECT avg(p.Score) FROM Posts p WHERE p.PostTypeId = 1),
+                 0
+               ),
+             2
+           )
+      ELSE NULL
+    END                                AS ScorePctOfAvg,
+    ds.dt::date                        AS ActivityDate,
+    CASE WHEN ar.Rank = 1 THEN 'TopAnswer' ELSE 'Answer' END AS AnswerCategory,
+    (
+      SELECT count(distinct v.UserId)
+        FROM Votes v
+       WHERE v.PostId = rq.Id
+         AND v.VoteTypeId = 2
+    )                                  AS UpvoterCount
+FROM RecentQ rq
+LEFT JOIN TagExploded te ON te.QuestionId = rq.Id
+LEFT JOIN UserBadges ub  ON ub.UserId       = rq.OwnerUserId
+JOIN AnswerRank ar       ON ar.QuestionId   = rq.Id
+CROSS JOIN DateSeq ds
+WHERE ds.dt::date BETWEEN rq.CreationDate::date - INTERVAL '2 days'
+                      AND rq.LastActivityDate::date + INTERVAL '2 days'
+  AND (ub.BadgeCount IS NULL OR ub.BadgeCount > 5)
+
+UNION
+
+SELECT
+    q.Id                             AS QuestionId,
+    'NEG:' || left(q.Title, 30)      AS ShortTitle,
+    NULL                              AS TagName,
+    NULL                              AS Owner,
+    0                                 AS BadgeCount,
+    NULL                              AS LastGoldBadgeDate,
+    0                                 AS Rank,
+    0                                 AS HighScoreCommentCount,
+    0                                 AS ScorePctOfAvg,
+    cast('2024-10-01' as date)                      AS ActivityDate,
+    'Negative'                        AS AnswerCategory,
+    0                                 AS UpvoterCount
+  FROM Posts q
+ WHERE q.PostTypeId = 1
+   AND q.Score < 0
+
+EXCEPT
+
+SELECT
+    pl.PostId                         AS QuestionId,
+    'DUP:' || left(p.Title, 30)       AS ShortTitle,
+    NULL                              AS TagName,
+    NULL                              AS Owner,
+    0                                 AS BadgeCount,
+    NULL                              AS LastGoldBadgeDate,
+    0                                 AS Rank,
+    0                                 AS HighScoreCommentCount,
+    0                                 AS ScorePctOfAvg,
+    cast('2024-10-01' as date)                      AS ActivityDate,
+    'Excluded'                        AS AnswerCategory,
+    0                                 AS UpvoterCount
+  FROM PostLinks pl
+  JOIN Posts p ON p.Id = pl.PostId
+ WHERE pl.LinkTypeId = 3
+
+INTERSECT
+
+SELECT
+    rq.Id                             AS QuestionId,
+    'HI:' || left(rq.Title, 30)       AS ShortTitle,
+    te.TagName,
+    ub.DisplayName                    AS Owner,
+    ub.BadgeCount,
+    ub.LastGoldBadgeDate,
+    ar.Rank,
+    0                                 AS HighScoreCommentCount,
+    0                                 AS ScorePctOfAvg,
+    ds.dt::date                       AS ActivityDate,
+    'Intersected'                     AS AnswerCategory,
+    0                                 AS UpvoterCount
+  FROM RecentQ rq
+  JOIN TagExploded te ON te.QuestionId = rq.Id
+  JOIN UserBadges ub  ON ub.UserId       = rq.OwnerUserId
+  JOIN AnswerRank ar  ON ar.QuestionId   = rq.Id
+  CROSS JOIN DateSeq ds
+ WHERE rq.ViewCount > 10000
+   AND ds.dt::date = date_trunc('day', cast('2024-10-01 12:34:56' as timestamp))::date
+;

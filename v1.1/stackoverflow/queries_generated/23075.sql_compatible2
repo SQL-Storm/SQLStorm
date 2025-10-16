@@ -1,0 +1,96 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        AVG(COALESCE(p.Score, 0)) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotes,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId IN (1, 2)
+    LEFT JOIN Badges b ON b.UserId = u.Id AND b.Class = 1
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.Reputation, u.DisplayName
+    HAVING COUNT(DISTINCT p.Id) > 10
+),
+TopTags AS (
+    SELECT 
+        us.UserId,
+        STRING_AGG(t.TagName, ', ' ORDER BY tag_count DESC) AS TopTags
+    FROM UserStats us
+    INNER JOIN (
+        SELECT p2.Id AS PostId, TRIM(tag) AS tag
+        FROM Posts p2,
+        LATERAL (
+            -- split tags like '<tag1><tag2>' into rows using a generic regex-based splitter
+            SELECT regexp_match ALL_tags[1] AS tag
+            FROM (
+                SELECT regexp_split_to_table(
+                    regexp_replace(p2.Tags, '^<|>$', ''), '><'
+                ) AS regexp_match
+            ) s
+        ) split
+    ) pa ON pa.PostId = (SELECT p3.Id FROM Posts p3 WHERE p3.OwnerUserId = us.UserId AND p3.PostTypeId = 1 LIMIT 1) -- join will be correlated below
+    -- Because the above correlated approach may be unsupported in some dialects, rewrite more portable: join Posts filtered by owner
+    INNER JOIN Posts p_owner ON p_owner.OwnerUserId = us.UserId AND p_owner.PostTypeId = 1
+    CROSS JOIN LATERAL (
+        SELECT regexp_split_to_table(regexp_replace(p_owner.Tags, '^<|>$', ''), '><') AS tag
+    ) tag_array
+    INNER JOIN Tags t ON t.TagName = tag_array.tag
+    GROUP BY us.UserId
+),
+RecentActivity AS (
+    SELECT 
+        ph.UserId,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6) AND ph.Comment IS NOT NULL
+    GROUP BY ph.UserId
+)
+SELECT 
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.BadgeCount,
+    us.AvgPostScore,
+    COALESCE(us.LastPostDate, CAST('1900-01-01' AS TIMESTAMP)) AS LastPostDate,
+    us.TotalUpvotes,
+    tt.TopTags,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = us.UserId AND c.Score > 5) AS HighScoreComments,
+    ra.LastEditDate,
+    CASE 
+        WHEN us.Reputation > 100000 THEN 'Legend'
+        WHEN us.Reputation > 50000 THEN 'Expert'
+        ELSE 'Enthusiast'
+    END AS ReputationLevel,
+    RANK() OVER (PARTITION BY FLOOR((us.ReputationRank - 1) / 10) ORDER BY us.TotalUpvotes DESC) AS GroupRank,
+    us.ReputationRank
+FROM UserStats us
+LEFT JOIN TopTags tt ON tt.UserId = us.UserId
+LEFT JOIN RecentActivity ra ON ra.UserId = us.UserId
+WHERE us.ReputationRank <= 10
+
+UNION ALL
+
+SELECT 
+    NULL AS UserId,
+    'Summary' AS DisplayName,
+    SUM(us.Reputation) AS Reputation,
+    SUM(us.BadgeCount) AS BadgeCount,
+    AVG(us.AvgPostScore) AS AvgPostScore,
+    MAX(us.LastPostDate) AS LastPostDate,
+    SUM(us.TotalUpvotes) AS TotalUpvotes,
+    NULL AS TopTags,
+    (SELECT COUNT(*) FROM Comments c WHERE c.Score > 5 AND EXISTS (SELECT 1 FROM UserStats us2 WHERE us2.UserId = c.UserId)) AS HighScoreComments,
+    MAX(ra.LastEditDate) AS LastEditDate,
+    'Total' AS ReputationLevel,
+    1 AS GroupRank,
+    MAX(us.ReputationRank) AS ReputationRank
+FROM UserStats us
+LEFT JOIN RecentActivity ra ON ra.UserId = us.UserId
+WHERE us.ReputationRank <= 10
+
+ORDER BY ReputationRank NULLS LAST, GroupRank;

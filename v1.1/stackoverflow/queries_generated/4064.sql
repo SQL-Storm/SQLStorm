@@ -1,0 +1,157 @@
+-- {"query": "4064.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1538} 
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount, 0) as AnswerCount,
+        coalesce(p.ViewCount,0) as QuestionViewCount,
+        t.IsModeratorOnly,
+        t.IsRequired
+    from Tags t
+    left join Posts p on t.ExcerptPostId = p.Id and p.PostTypeId = 1
+    where t.Count > 1000
+),
+UserBadgesCTE as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        row_number() over (partition by u.Id order by max(b.Date) desc nulls last) as rn_latest_badge,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName
+),
+TopQuestionsCTE as (
+    select 
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        count(c.Id) as CommentCount,
+        max(ph.CreationDate) as LastEditDate,
+        dense_rank() over (order by p.Score desc, p.ViewCount desc nulls last) as RankScoreView
+    from Posts p
+    left join Comments c on p.Id = c.PostId
+    left join PostHistory ph on p.Id = ph.PostId and ph.PostHistoryTypeId in (4,5,6) -- edits on title, body, tags
+    where p.PostTypeId = 1
+    group by p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.AcceptedAnswerId
+    having count(c.Id) > 1
+),
+AnswersCTE as (
+    select 
+        a.Id,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank,
+        coalesce(v.ScoreUp,0) as UpVotes,
+        coalesce(v.ScoreDown,0) as DownVotes
+    from Posts a
+    left join (
+        select 
+            PostId,
+            sum(case when VoteTypeId = 2 then 1 else 0 end) as ScoreUp,
+            sum(case when VoteTypeId = 3 then 1 else 0 end) as ScoreDown
+        from Votes
+        group by PostId
+    ) v on a.Id = v.PostId
+    where a.PostTypeId = 2
+),
+ClosedDuplicatedQuestions as (
+    select
+        ph.PostId,
+        ph.CreationDate as ClosedDate,
+        crt.Name as CloseReason,
+        pl.RelatedPostId as DuplicateOf
+    from PostHistory ph
+    inner join CloseReasonTypes crt on cast(ph.Comment as int) = crt.Id and ph.PostHistoryTypeId = 10
+    left join PostLinks pl on ph.PostId = pl.PostId and pl.LinkTypeId = 3
+    where ph.PostHistoryTypeId = 10
+),
+UserQuestionsAnswers as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct q.Id) filter (where q.PostTypeId = 1) as TotalQuestions,
+        count(distinct a.Id) filter (where a.PostTypeId = 2) as TotalAnswers,
+        sum(coalesce(a.Score,0)) as SumAnswerScores,
+        sum(coalesce(q.Score,0)) as SumQuestionScores,
+        min(u.CreationDate) as UserSince,
+        max(u.LastAccessDate) as LastSeen
+    from Users u
+    left join Posts q on u.Id = q.OwnerUserId and q.PostTypeId = 1
+    left join Posts a on u.Id = a.OwnerUserId and a.PostTypeId = 2
+    group by u.Id, u.DisplayName
+)
+select distinct
+    tq.Id as QuestionId,
+    tq.Title,
+    substring(tq.Tags from '(?<=<)[^>]+') as FirstTag,
+    tq.Score as QuestionScore,
+    tq.ViewCount as QuestionViews,
+    tq.CommentCount,
+    tq.LastEditDate,
+    qca.CloseReason,
+    case when qca.DuplicateOf is not null then 'Yes' else 'No' end as IsDuplicate,
+    array_agg(distinct concat_ws(':', ub.DisplayName, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges)) filter (where ub.UserId is not null) as TopAnswerersBadges,
+    json_agg(json_build_object(
+        'AnswerId', a.Id,
+        'AnswerScore', a.Score,
+        'UpVotes', a.UpVotes,
+        'DownVotes', a.DownVotes,
+        'AnswerRank', a.AnswerRank,
+        'OwnerUserId', a.OwnerUserId
+    ) order by a.Score desc) as Answers,
+    rqca.TotalQuestions,
+    rqca.TotalAnswers,
+    rqca.SumAnswerScores,
+    rqca.SumQuestionScores,
+    rqca.UserSince,
+    rqca.LastSeen,
+    rtc.TagName,
+    rtc.Count as TagTotalCount,
+    rtc.AnswerCount as TagAnswerCount,
+    rtc.QuestionViewCount as TagQuestionViews,
+    rtc.IsModeratorOnly,
+    rtc.IsRequired,
+    row_number() over (partition by substring(tq.Tags from '(?<=<)[^>]+') order by tq.Score desc) as RowNumberPerTag
+from TopQuestionsCTE tq
+left join AnswersCTE a on a.QuestionId = tq.Id and a.AnswerRank <= 3
+left join UserBadgesCTE ub on ub.UserId = a.OwnerUserId and ub.rn_latest_badge = 1
+left join ClosedDuplicatedQuestions qca on tq.Id = qca.PostId
+left join UserQuestionsAnswers rqca on rqca.UserId = tq.OwnerUserId
+left join RecursiveTagCounts rtc on rtc.TagName = substring(tq.Tags from '(?<=<)[^>]+')
+where tq.Score > 10
+and (qca.CloseReason is null or qca.CloseReason not ilike '%duplicate%')
+group by 
+    tq.Id, 
+    tq.Title,
+    tq.Score,
+    tq.ViewCount,
+    tq.CommentCount,
+    tq.LastEditDate,
+    qca.CloseReason,
+    qca.DuplicateOf,
+    rqca.TotalQuestions,
+    rqca.TotalAnswers,
+    rqca.SumAnswerScores,
+    rqca.SumQuestionScores,
+    rqca.UserSince,
+    rqca.LastSeen,
+    rtc.TagName,
+    rtc.Count,
+    rtc.AnswerCount,
+    rtc.QuestionViewCount,
+    rtc.IsModeratorOnly,
+    rtc.IsRequired
+order by tq.Score desc, tq.ViewCount desc
+limit 100;

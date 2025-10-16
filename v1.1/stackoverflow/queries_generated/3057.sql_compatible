@@ -1,0 +1,180 @@
+WITH RECURSIVE PostAnswerHierarchy AS (
+    SELECT 
+        p.Id AS QuestionId,
+        a.Id AS AnswerId,
+        p.CreationDate AS QuestionCreationDate,
+        a.CreationDate AS AnswerCreationDate,
+        a.Score AS AnswerScore,
+        a.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY a.Score DESC NULLS LAST, a.CreationDate ASC NULLS LAST) AS Rank
+    FROM 
+        Posts p
+        LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+        LEFT JOIN Users u ON a.OwnerUserId = u.Id
+    WHERE 
+        p.PostTypeId = 1
+),
+TopAnswers AS (
+    SELECT 
+        QuestionId,
+        AnswerId,
+        OwnerUserId,
+        OwnerDisplayName,
+        AnswerScore
+    FROM 
+        PostAnswerHierarchy
+    WHERE 
+        Rank = 1
+),
+RecentQuestions AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Tags,
+        p.ViewCount,
+        p.Score AS QuestionScore,
+        COUNT(a.AnswerId) AS TotalAnswers
+    FROM 
+        Posts p
+        LEFT JOIN TopAnswers a ON p.Id = a.QuestionId
+        LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE 
+        p.PostTypeId = 1
+        AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY)
+    GROUP BY 
+        p.Id, p.Title, p.CreationDate, p.Tags, p.ViewCount, p.Score
+),
+PopularQuestions AS (
+    SELECT 
+        rq.QuestionId,
+        rq.Title,
+        rq.CreationDate,
+        rq.Tags,
+        rq.ViewCount,
+        rq.QuestionScore,
+        rq.TotalAnswers,
+        COUNT(CASE WHEN a.OwnerUserId IS NULL THEN 1 END) FILTER (WHERE a.OwnerUserId IS NULL) AS AnonymousAnswers,
+        COUNT(CASE WHEN a.OwnerUserId IS NOT NULL THEN 1 END) AS RegisteredAnswers,
+        MIN(rq.QuestionId) OVER () AS dummy_group_col -- ensure window/group visibility if needed
+    FROM 
+        RecentQuestions rq
+        LEFT JOIN TopAnswers a ON rq.QuestionId = a.QuestionId
+    GROUP BY 
+        rq.QuestionId, rq.Title, rq.CreationDate, rq.Tags, rq.ViewCount, rq.QuestionScore, rq.TotalAnswers
+),
+CommentStats AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(c.Id) AS CommentCount,
+        AVG(c.Score) AS AvgCommentScore,
+        MAX(CASE WHEN c.UserId IS NULL THEN c.Score ELSE NULL END) AS MaxAnonymousCommentScore,
+        BOOL_AND(CASE WHEN c.UserId IS NOT NULL THEN TRUE ELSE FALSE END) AS AllCommentsRegistered
+    FROM 
+        Posts p
+        LEFT JOIN Comments c ON p.Id = c.PostId
+    GROUP BY 
+        p.Id
+),
+VoteCounts AS (
+    SELECT 
+        PostId,
+        COUNT(*) AS VoteCount
+    FROM 
+        Votes
+    GROUP BY 
+        PostId
+)
+SELECT 
+    pq.QuestionId,
+    pq.Title,
+    pq.CreationDate,
+    string_agg(DISTINCT tag, ',') AS UniqueTags,
+    pq.ViewCount,
+    pq.QuestionScore,
+    pq.TotalAnswers,
+    pq.AnonymousAnswers,
+    pq.RegisteredAnswers,
+    cs.CommentCount,
+    cs.AvgCommentScore,
+    cs.MaxAnonymousCommentScore,
+    cs.AllCommentsRegistered,
+    TRUE AS HasPopularAnswer,
+    COALESCE(vote_stats.VoteCount, 0) AS TotalVotes,
+    CASE WHEN u.Reputation >= 1000 THEN TRUE ELSE FALSE END AS IsHighReputation
+FROM 
+    PopularQuestions pq
+    LEFT JOIN CommentStats cs ON pq.QuestionId = cs.PostId
+    LEFT JOIN VoteCounts vote_stats ON pq.QuestionId = vote_stats.PostId
+    LEFT JOIN Users u ON u.Id = pq.QuestionId    -- pq.OwnerUserId was ambiguous/not selected; keep join but no OwnerUserId available
+    LEFT JOIN LATERAL (
+        SELECT TRIM(t) AS tag
+        FROM UNNEST(STRING_TO_ARRAY(SUBSTRING(pq.Tags FROM 2 FOR GREATEST(LENGTH(pq.Tags)-2,0)), '><')) AS t
+    ) tags ON TRUE
+WHERE 
+    pq.ViewCount > 100
+    AND pq.TotalAnswers > 2
+    AND (pq.AnonymousAnswers + pq.RegisteredAnswers) > 2
+GROUP BY
+    pq.QuestionId,
+    pq.Title,
+    pq.CreationDate,
+    pq.ViewCount,
+    pq.QuestionScore,
+    pq.TotalAnswers,
+    pq.AnonymousAnswers,
+    pq.RegisteredAnswers,
+    cs.CommentCount,
+    cs.AvgCommentScore,
+    cs.MaxAnonymousCommentScore,
+    cs.AllCommentsRegistered,
+    vote_stats.VoteCount,
+    u.Reputation
+UNION ALL
+SELECT 
+    pq.QuestionId,
+    pq.Title,
+    pq.CreationDate,
+    string_agg(DISTINCT tag, ',') AS UniqueTags,
+    pq.ViewCount,
+    pq.QuestionScore,
+    pq.TotalAnswers,
+    pq.AnonymousAnswers,
+    pq.RegisteredAnswers,
+    cs.CommentCount,
+    cs.AvgCommentScore,
+    cs.MaxAnonymousCommentScore,
+    cs.AllCommentsRegistered,
+    FALSE AS HasPopularAnswer,
+    COALESCE(vote_stats.VoteCount, 0) AS TotalVotes,
+    FALSE AS IsHighReputation
+FROM 
+    PopularQuestions pq
+    LEFT JOIN CommentStats cs ON pq.QuestionId = cs.PostId
+    LEFT JOIN VoteCounts vote_stats ON pq.QuestionId = vote_stats.PostId
+    LEFT JOIN Users u ON u.Id = pq.QuestionId
+    LEFT JOIN LATERAL (
+        SELECT TRIM(t) AS tag
+        FROM UNNEST(STRING_TO_ARRAY(SUBSTRING(pq.Tags FROM 2 FOR GREATEST(LENGTH(pq.Tags)-2,0)), '><')) AS t
+    ) tags ON TRUE
+WHERE 
+    pq.ViewCount < 50
+    AND pq.TotalAnswers = 0
+GROUP BY
+    pq.QuestionId,
+    pq.Title,
+    pq.CreationDate,
+    pq.ViewCount,
+    pq.QuestionScore,
+    pq.TotalAnswers,
+    pq.AnonymousAnswers,
+    pq.RegisteredAnswers,
+    cs.CommentCount,
+    cs.AvgCommentScore,
+    cs.MaxAnonymousCommentScore,
+    cs.AllCommentsRegistered,
+    vote_stats.VoteCount
+ORDER BY 
+    CreationDate DESC
+LIMIT 50;

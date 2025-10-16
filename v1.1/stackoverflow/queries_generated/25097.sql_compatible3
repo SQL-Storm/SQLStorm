@@ -1,0 +1,114 @@
+WITH UserAggregates AS (
+    SELECT
+        u.Id                                         AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, '[unknown]')            AS Location,
+        COUNT(p.Id)                                  AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score)                                  AS AvgScore,
+        MAX(p.CreationDate)                           AS LastPostDate,
+        COUNT(DISTINCT t.tag)                         AS DistinctTagCount,
+        (SELECT p2.Title
+         FROM Posts p2
+         WHERE p2.OwnerUserId = u.Id
+         ORDER BY p2.Score DESC
+         LIMIT 1)                                    AS TopPostTitle,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p
+        ON p.OwnerUserId = u.Id
+    LEFT JOIN LATERAL (
+        SELECT UNNEST(
+            CASE
+              WHEN p.Tags IS NOT NULL THEN
+                string_to_array(substring(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><')
+              ELSE
+                -- standard SQL array literal: use ARRAY[...] where supported; fallback to NULL-producing array via CAST of empty string split
+                string_to_array('', '') -- will produce an empty array element; UNNEST will yield nothing
+            END
+        ) AS tag
+    ) t ON p.PostTypeId = 1
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location
+),
+RankedUsers AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.Location,
+        ua.TotalPosts,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.AvgScore,
+        ua.LastPostDate,
+        ua.DistinctTagCount,
+        ua.TopPostTitle,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY ua.Reputation DESC, ua.TotalPosts DESC) AS RepRank,
+        RANK() OVER (PARTITION BY (CASE WHEN ua.GoldBadges > 0 THEN 1 ELSE 0 END) ORDER BY ua.AvgScore DESC) AS ScoreRankByGold
+    FROM UserAggregates ua
+    WHERE (ua.Reputation > 1000 OR (ua.GoldBadges + ua.SilverBadges) > 5)
+      AND (ua.Location IS NOT NULL OR EXISTS (
+            SELECT 1 FROM Users u2 WHERE u2.Id = ua.UserId AND LOWER(u2.AboutMe) LIKE '%sql%'))
+)
+SELECT
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.TotalPosts,
+    ru.QuestionCount,
+    ru.AnswerCount,
+    ru.AvgScore,
+    ru.DistinctTagCount,
+    COALESCE(NULLIF(ru.TopPostTitle, ''), '[no top post]') AS TopPostTitle,
+    ru.GoldBadges,
+    ru.SilverBadges,
+    ru.BronzeBadges,
+    ru.RepRank,
+    ru.ScoreRankByGold,
+    CASE
+        WHEN ru.GoldBadges > 0 THEN 'VIP'
+        WHEN ru.SilverBadges > 0 THEN 'Pro'
+        ELSE 'Member'
+    END AS Tier,
+    (SELECT MAX(c.CreationDate)
+     FROM Comments c
+     WHERE c.UserId = ru.UserId) AS LastCommentDate,
+    (SELECT MAX(v.CreationDate)
+     FROM Votes v
+     WHERE v.UserId = ru.UserId) AS LastVoteDate
+FROM RankedUsers ru
+WHERE ru.RepRank <= 100
+
+UNION ALL
+
+SELECT
+    u.Id                                 AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    0                                    AS TotalPosts,
+    0                                    AS QuestionCount,
+    0                                    AS AnswerCount,
+    NULL                                 AS AvgScore,
+    0                                    AS DistinctTagCount,
+    '[inactive]'                         AS TopPostTitle,
+    0                                    AS GoldBadges,
+    0                                    AS SilverBadges,
+    0                                    AS BronzeBadges,
+    NULL                                 AS RepRank,
+    NULL                                 AS ScoreRankByGold,
+    'Newbie'                             AS Tier,
+    NULL                                 AS LastCommentDate,
+    NULL                                 AS LastVoteDate
+FROM Users u
+WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+  AND u.Reputation BETWEEN 0 AND 10
+
+ORDER BY Reputation DESC, TotalPosts DESC
+LIMIT 150;

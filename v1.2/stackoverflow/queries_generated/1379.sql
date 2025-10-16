@@ -1,0 +1,157 @@
+-- {"query": "1379.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1582} 
+with RecursiveTagCounts as (
+    select
+        p.Id as PostId,
+        unnest(string_to_array(substring(coalesce(p.Tags, ''), 2, length(coalesce(p.Tags, '')) - 2), '><')) as TagName
+    from Posts p
+    where p.PostTypeId = 1 -- questions only
+),
+TagStats as (
+    select
+        rc.TagName,
+        count(distinct rc.PostId) as QuestionCount,
+        sum(p.Score) as TotalScore,
+        avg(p.ViewCount) as AvgViews,
+        max(p.CreationDate) as MostRecentQuestion,
+        count(distinct b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(distinct b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(distinct b.Id) filter (where b.Class = 3) as BronzeBadges
+    from RecursiveTagCounts rc
+    join Posts p on p.Id = rc.PostId
+    left join Badges b on b.TagBased = true and lower(b.Name) = lower(rc.TagName)
+    group by rc.TagName
+),
+UserReputationRanks as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        rank() over (order by u.Reputation desc nulls last) as ReputationRank,
+        count(p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+        count(v.Id) filter (where v.VoteTypeId = 2) as UpvotesReceived,
+        count(v.Id) filter (where v.VoteTypeId = 3) as DownvotesReceived,
+        age(max(p.CreationDate), min(p.CreationDate)) as ActiveDuration
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+TopActiveQuestions AS (
+    select
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        p.AnswerCount,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as recent_answer_rank,
+        (select count(*) from Comments c where c.PostId = p.Id and c.CreationDate > p.CreationDate + interval '1 day') as CommentsNewDay,
+        (select max(ph.CreationDate) from PostHistory ph where ph.PostId = p.Id and ph.PostHistoryTypeId = 10) as ClosedDate,
+        case
+            when exists (select 1 from PostLinks pl where pl.PostId = p.Id and pl.LinkTypeId = 3) then 1
+            else 0
+        end as HasDuplicates
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1
+),
+PostWithLatestEdit AS (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        coalesce(ph2.MaxEditDate, p.CreationDate) as LastEditDate,
+        (coalesce(p.Score,0)*0.1 + coalesce(p.ViewCount,0)*0.001) as PopularityScore,
+        rank() over (order by coalesce(ph2.MaxEditDate, p.CreationDate) desc) as EditRecencyRank
+    from Posts p
+    left join (
+        select ph.PostId, max(ph.CreationDate) as MaxEditDate
+        from PostHistory ph
+        where ph.PostHistoryTypeId in (4,5,6,7,8,9,14) -- Edit related history IDs
+        group by ph.PostId
+    ) ph2 on ph2.PostId = p.Id
+    where p.PostTypeId in (1, 2)
+),
+TagCombinedStats AS (
+    select
+        ts.TagName,
+        ts.QuestionCount,
+        ts.TotalScore,
+        ts.AvgViews,
+        ts.MostRecentQuestion,
+        ts.GoldBadges,
+        ts.SilverBadges,
+        ts.BronzeBadges,
+        tc.TotalUpvotes,
+        tc.TotalDownvotes,
+        tc.CreatorCount
+    from TagStats ts
+    left join (
+        select
+            unnest(string_to_array(substring(coalesce(p.Tags, ''), 2, length(coalesce(p.Tags, '')) - 2), '><')) as TagName,
+            sum(v2.VoteTypeId = 2::int)::int as TotalUpvotes,
+            sum(v2.VoteTypeId = 3::int)::int as TotalDownvotes,
+            count(distinct p.OwnerUserId) filter (where p.OwnerUserId is not null) as CreatorCount
+        from Posts p
+        left join Votes v2 on v2.PostId = p.Id
+        where p.PostTypeId = 1
+        group by TagName
+    ) tc on tc.TagName = ts.TagName
+)
+select /*+ MATERIALIZE */
+    ts.TagName as "Tag",
+    ts.QuestionCount,
+    ts.TotalScore,
+    ts.AvgViews,
+    to_char(ts.MostRecentQuestion, 'YYYY-MM-DD') as LastAsked,
+    concat_ws(' / ', 
+             concat('Gold: ', ts.GoldBadges), 
+             concat('Silver: ', ts.SilverBadges), 
+             concat('Bronze: ', ts.BronzeBadges)) as BadgeTally,
+    ts.TotalUpvotes,
+    ts.TotalDownvotes,
+    ts.CreatorCount,
+    coalesce(ur.ReputationRank,0) as "TopUserRepRank",
+    ur.DisplayName as "TopUser",
+    ur.QuestionsCount,
+    ur.AnswersCount,
+    ur.UpvotesReceived,
+    case
+      when ur.DownvotesReceived is null then 0
+      else ur.DownvotesReceived
+    end as DownvotesReceived,
+    ur.ActiveDuration,
+    coalesce(tpq.Title, 'No Recent Question') as "TopQuestionTitle",
+    tpq.Score as QuestionScore,
+    tpq.ViewCount as QuestionViews,
+    tpq.CommentsNewDay,
+    case when tpq.HasDuplicates = 1 then true else false end as HasDuplicates,
+    pwl.EditRecencyRank,
+    pwl.LastEditDate,
+    sqrt(abs(exp(pwl.PopularityScore))) / nullif(tpq.Score + 1, 0) as PopularityIndex
+from TagCombinedStats ts
+
+left join lateral (
+    select ur.*
+    from UserReputationRanks ur
+    join RecursiveTagCounts rtc on lower(rtc.TagName) = lower(ts.TagName) and ur.Id = rtc.PostId
+    order by ur.Reputation desc nulls last
+    limit 1
+) ur on true
+left join lateral (
+    select *
+    from TopActiveQuestions taq
+    join Posts p2 on p2.Id = taq.Id
+    where taq.OwnerUserId = ur.Id
+    order by taq.CreationDate desc
+    limit 1
+) tpq on tpq.OwnerUserId = ur.Id
+
+left join PostWithLatestEdit pwl on pwl.Id = tpq.Id
+
+where ts.QuestionCount > 50 and ts.TotalScore is not null
+order by ts.TotalScore desc, ts.QuestionCount desc
+limit 50;

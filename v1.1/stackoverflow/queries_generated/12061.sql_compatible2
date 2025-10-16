@@ -1,0 +1,150 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        U.DisplayName AS OwnerDisplayName,
+        P.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.CreationDate) AS PostRank,
+        COUNT(V.Id) FILTER (WHERE V.VoteTypeId = 2) OVER (PARTITION BY P.Id) AS UpVotes,
+        COUNT(V.Id) FILTER (WHERE V.VoteTypeId = 3) OVER (PARTITION BY P.Id) AS DownVotes,
+        P.Tags
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    LEFT JOIN 
+        Votes V ON P.Id = V.PostId
+    WHERE 
+        P.PostTypeId IN (1, 2) AND P.Score IS NOT NULL
+),
+TopUsers AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        U.Reputation,
+        COUNT(DISTINCT P.Id) AS PostCount,
+        ROW_NUMBER() OVER (ORDER BY U.Reputation DESC, U.CreationDate) AS UserRank
+    FROM 
+        Users U
+    LEFT JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    WHERE 
+        U.Reputation > 1000
+    GROUP BY 
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate
+),
+-- Replace regexp_split_to_table with a standard-compatible approach using LIKE to match tags delimited by <>
+TagStats AS (
+    SELECT 
+        T.TagName,
+        COUNT(DISTINCT P.Id) AS PostCount,
+        SUM(P.Score) AS TotalScore,
+        AVG(P.Score) AS AvgScore
+    FROM 
+        Tags T
+    LEFT JOIN 
+        Posts P ON (
+            P.Tags IS NOT NULL
+            AND (
+                P.Tags = '<' || T.TagName || '>'
+                OR P.Tags LIKE '<' || T.TagName || '><%'
+                OR P.Tags LIKE '%><' || T.TagName || '>'
+                OR P.Tags LIKE '%><' || T.TagName || '><%'
+                OR P.Tags LIKE '%<' || T.TagName || '>%'
+            )
+        )
+    GROUP BY 
+        T.TagName
+),
+PostHistorySummary AS (
+    SELECT 
+        PH.PostId,
+        COUNT(DISTINCT PH.Id) AS RevisionCount,
+        MAX(PH.CreationDate) AS LastRevisionDate
+    FROM 
+        PostHistory PH
+    WHERE 
+        PH.PostHistoryTypeId IN (2, 5, 6)
+    GROUP BY 
+        PH.PostId
+),
+CommunityPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Tags,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.CommunityOwnedDate
+    FROM 
+        Posts P
+    WHERE 
+        P.CommunityOwnedDate IS NOT NULL
+),
+CorrelatedSubquery AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.Score,
+        (SELECT COUNT(DISTINCT PH.Id) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId = 5) AS EditCount
+    FROM 
+        Posts P
+    WHERE 
+        P.PostTypeId = 1
+)
+SELECT 
+    RP.Id,
+    RP.PostTypeId,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.OwnerDisplayName,
+    RP.PostRank,
+    RP.UpVotes,
+    RP.DownVotes,
+    TU.DisplayName AS TopUser,
+    TU.Reputation,
+    TU.PostCount,
+    TU.UserRank,
+    TS.TagName,
+    TS.PostCount AS TagPostCount,
+    TS.TotalScore,
+    TS.AvgScore,
+    PHS.RevisionCount,
+    PHS.LastRevisionDate,
+    CP.Title,
+    CP.Tags,
+    CP.CreationDate AS CommunityOwnedCreationDate,
+    CP.Score AS CommunityScore,
+    CP.ViewCount AS CommunityViewCount,
+    CP.CommunityOwnedDate,
+    CS.EditCount
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    TopUsers TU ON RP.OwnerUserId = TU.Id
+LEFT JOIN 
+    TagStats TS ON (
+        RP.Tags IS NOT NULL
+        AND (
+            RP.Tags = '<' || TS.TagName || '>'
+            OR RP.Tags LIKE '<' || TS.TagName || '><%'
+            OR RP.Tags LIKE '%><' || TS.TagName || '>'
+            OR RP.Tags LIKE '%><' || TS.TagName || '><%'
+            OR RP.Tags LIKE '%<' || TS.TagName || '>%'
+        )
+    )
+LEFT JOIN 
+    PostHistorySummary PHS ON RP.Id = PHS.PostId
+LEFT JOIN 
+    CommunityPosts CP ON RP.Id = CP.Id
+LEFT JOIN 
+    CorrelatedSubquery CS ON RP.Id = CS.Id
+WHERE 
+    RP.PostRank <= 10
+ORDER BY 
+    RP.Score DESC, RP.CreationDate;

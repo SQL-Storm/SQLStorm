@@ -1,0 +1,176 @@
+-- {"query": "562.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1630} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level
+    FROM Tags t
+    WHERE t.IsRequired = 1
+    UNION ALL
+    SELECT
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.ExcerptPostId,
+        child.WikiPostId,
+        rh.Level + 1
+    FROM Tags child
+    JOIN RecursiveTagHierarchy rh ON child.Id = rh.Id + 1 -- arbitrary recursive condition to simulate hierarchy
+    WHERE rh.Level < 3
+),
+UserBadgeCounts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+PostScoresAndRanks AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS UserPostRank,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC NULLS LAST) AS PostTypeScoreRank,
+        COALESCE(p.Score, 0) + COALESCE(p.ViewCount, 0)/100.0 AS WeightedScore
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+),
+AcceptedAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.AcceptedAnswerId,
+        a.Score AS AcceptedAnswerScore,
+        a.CreationDate AS AcceptedAnswerCreationDate,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600 AS HoursToAccept
+    FROM Posts q
+    LEFT JOIN Posts a ON a.Id = q.AcceptedAnswerId
+    WHERE q.PostTypeId = 1
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersCount,
+        COUNT(DISTINCT c.Id) AS CommentsCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesGiven,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesGiven,
+        MAX(p.CreationDate) AS LastPostDate,
+        MIN(p.CreationDate) AS FirstPostDate,
+        CASE WHEN COUNT(DISTINCT p.Id) > 0 THEN EXTRACT(DAY FROM MAX(p.CreationDate) - MIN(p.CreationDate)) ELSE NULL END AS ActiveDays
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TopPostsWithComments AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        COUNT(c.Id) AS CommentCount,
+        STRING_AGG(DISTINCT COALESCE(c.UserDisplayName, 'Anonymous'), ', ') AS Commenters,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate, p.OwnerUserId, u.DisplayName
+    HAVING COUNT(c.Id) > 5
+),
+CorrelatedSubqueryExample AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1 AND p.Score > 10) AS HighScoreQuestions,
+        (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AvgAnswerScore
+    FROM Users u
+    WHERE u.Reputation > 1000
+),
+FinalSelection AS (
+    SELECT
+        uac.UserId,
+        uac.DisplayName,
+        ubc.GoldBadges,
+        ubc.SilverBadges,
+        ubc.BronzeBadges,
+        uac.QuestionsCount,
+        uac.AnswersCount,
+        uac.CommentsCount,
+        uac.UpVotesGiven,
+        uac.DownVotesGiven,
+        uac.ActiveDays,
+        cs.HighScoreQuestions,
+        cs.AvgAnswerScore,
+        aps.PostTypeId,
+        aps.Title,
+        aps.Score,
+        aps.ViewCount,
+        aps.UserPostRank,
+        aps.PostTypeScoreRank,
+        aps.WeightedScore,
+        tas.AcceptedAnswerScore,
+        tas.HoursToAccept,
+        tpc.CommentCount AS PostCommentCount,
+        tpc.Commenters AS PostCommenters,
+        tpc.LastCommentDate
+    FROM UserActivitySummary uac
+    LEFT JOIN UserBadgeCounts ubc ON ubc.UserId = uac.UserId
+    LEFT JOIN CorrelatedSubqueryExample cs ON cs.Id = uac.UserId
+    LEFT JOIN PostScoresAndRanks aps ON aps.OwnerUserId = uac.UserId AND aps.UserPostRank = 1
+    LEFT JOIN AcceptedAnswerStats tas ON tas.QuestionId = aps.Id
+    LEFT JOIN TopPostsWithComments tpc ON tpc.PostId = aps.Id
+    WHERE uac.ActiveDays IS NOT NULL AND uac.QuestionsCount > 0
+)
+SELECT
+    fs.DisplayName,
+    fs.GoldBadges,
+    fs.SilverBadges,
+    fs.BronzeBadges,
+    fs.QuestionsCount,
+    fs.AnswersCount,
+    fs.CommentsCount,
+    fs.UpVotesGiven,
+    fs.DownVotesGiven,
+    fs.ActiveDays,
+    fs.HighScoreQuestions,
+    ROUND(fs.AvgAnswerScore::numeric, 2) AS AvgAnswerScore,
+    CASE fs.PostTypeId
+        WHEN 1 THEN 'Question'
+        WHEN 2 THEN 'Answer'
+        ELSE 'Other'
+    END AS TopPostType,
+    fs.Title AS TopPostTitle,
+    fs.Score AS TopPostScore,
+    fs.ViewCount AS TopPostViewCount,
+    fs.UserPostRank,
+    fs.PostTypeScoreRank,
+    ROUND(fs.WeightedScore::numeric, 2) AS WeightedScore,
+    COALESCE(fs.AcceptedAnswerScore, 0) AS AcceptedAnswerScore,
+    ROUND(COALESCE(fs.HoursToAccept, 0), 2) AS HoursToAccept,
+    fs.PostCommentCount,
+    fs.PostCommenters,
+    fs.LastCommentDate
+FROM FinalSelection fs
+WHERE fs.GoldBadges + fs.SilverBadges + fs.BronzeBadges > 0
+ORDER BY fs.GoldBadges DESC, fs.WeightedScore DESC
+LIMIT 50;

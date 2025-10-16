@@ -1,0 +1,285 @@
+-- {"query": "396.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 19245} 
+WITH
+raw_questions AS (
+  SELECT p.Id AS question_id,
+         p.Title,
+         p.OwnerUserId,
+         p.CreationDate,
+         p.Score,
+         COALESCE(p.ViewCount,0) AS view_count,
+         COALESCE(p.AnswerCount, (SELECT count(*) FROM Posts a WHERE a.ParentId = p.Id AND a.PostTypeId = 2)) AS answer_count,
+         COALESCE(p.FavoriteCount,0) AS favorite_count,
+         p.Tags,
+         p.AcceptedAnswerId,
+         CASE WHEN p.Tags IS NULL OR length(p.Tags) < 2 THEN ARRAY[]::text[] ELSE string_to_array(substring(p.Tags,2,length(p.Tags)-2),'><') END AS tag_array
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+tag_exploded AS (
+  SELECT q.question_id,
+         q.Title,
+         q.OwnerUserId,
+         q.CreationDate,
+         q.Score,
+         q.view_count,
+         q.answer_count,
+         q.favorite_count,
+         q.AcceptedAnswerId,
+         tag.tag
+  FROM raw_questions q
+  CROSS JOIN LATERAL unnest(q.tag_array) AS tag(tag)
+),
+tag_aggregates AS (
+  SELECT te.question_id,
+         array_agg(DISTINCT te.tag) FILTER (WHERE te.tag IS NOT NULL) AS tags,
+         count(te.tag) FILTER (WHERE te.tag IS NOT NULL) AS tag_count,
+         (array_agg(DISTINCT te.tag) FILTER (WHERE te.tag IS NOT NULL))[1] AS primary_tag
+  FROM tag_exploded te
+  GROUP BY te.question_id
+),
+votes_agg AS (
+  SELECT v.PostId AS post_id,
+         sum(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS up_votes,
+         sum(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS down_votes,
+         sum(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS favorites,
+         sum(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS accepted_votes,
+         count(*) AS total_votes,
+         max(v.CreationDate) AS last_vote_date
+  FROM Votes v
+  GROUP BY v.PostId
+),
+top_commenters AS (
+  SELECT DISTINCT ON (c.PostId) c.PostId AS post_id, c.UserId AS commenter_id, u.DisplayName AS commenter_name, c.Score AS commenter_score
+  FROM Comments c
+  LEFT JOIN Users u ON u.Id = c.UserId
+  ORDER BY c.PostId, c.Score DESC NULLS LAST, c.CreationDate ASC
+),
+comments_agg AS (
+  SELECT c.PostId AS post_id,
+         count(*) AS comment_count,
+         sum(coalesce(c.Score,0)) AS comment_score_sum
+  FROM Comments c
+  GROUP BY c.PostId
+),
+history_agg AS (
+  SELECT ph.PostId AS post_id,
+         count(*) AS history_events,
+         count(DISTINCT ph.UserId) AS distinct_editors,
+         sum(CASE WHEN ph.PostHistoryTypeId IN (4,5,6,24) THEN 1 ELSE 0 END) AS content_edits,
+         sum(CASE WHEN ph.PostHistoryTypeId IN (10,12) THEN 1 ELSE 0 END) AS closure_or_deletion_events,
+         max(ph.CreationDate) AS last_history_date
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+link_agg AS (
+  SELECT pl.PostId AS post_id,
+         sum(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS linked_out_count,
+         sum(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS duplicate_count,
+         count(*) AS links_total
+  FROM PostLinks pl
+  GROUP BY pl.PostId
+),
+answers_stats AS (
+  SELECT a.ParentId AS question_id,
+         count(*) FILTER (WHERE a.PostTypeId = 2) AS answers_count,
+         max(a.Score) FILTER (WHERE a.PostTypeId = 2) AS max_answer_score,
+         avg(a.Score) FILTER (WHERE a.PostTypeId = 2) AS avg_answer_score,
+         sum(CASE WHEN a.CreationDate <= (SELECT p.CreationDate + interval '7 days' FROM Posts p WHERE p.Id = a.ParentId) THEN 1 ELSE 0 END) FILTER (WHERE a.PostTypeId = 2) AS answers_within_week
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+  GROUP BY a.ParentId
+),
+answer_scores AS (
+  SELECT a.Id AS answer_id,
+         a.ParentId AS question_id,
+         a.Score,
+         a.CreationDate,
+         a.OwnerUserId,
+         (a.Score * 2.0 + coalesce(c.comment_count,0) * 0.25 + coalesce(v.up_votes,0) - coalesce(v.down_votes,0)) AS weighted_answer_score
+  FROM Posts a
+  LEFT JOIN comments_agg c ON c.post_id = a.Id
+  LEFT JOIN votes_agg v ON v.post_id = a.Id
+  WHERE a.PostTypeId = 2
+),
+best_answer AS (
+  SELECT question_id, answer_id, Score AS answer_score, CreationDate AS answer_created, OwnerUserId AS answer_owner, weighted_answer_score
+  FROM (
+    SELECT ascore.*,
+           row_number() OVER (PARTITION BY question_id ORDER BY weighted_answer_score DESC NULLS LAST, Score DESC NULLS LAST, CreationDate ASC) AS rn
+    FROM answer_scores ascore
+  ) t
+  WHERE rn = 1
+),
+user_badges AS (
+  SELECT b.UserId,
+         count(*) AS badges_count,
+         sum(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+         sum(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+         sum(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+         max(b.Date) AS last_badge_date
+  FROM Badges b
+  GROUP BY b.UserId
+),
+user_post_counts AS (
+  SELECT p.OwnerUserId AS user_id,
+         sum(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS q_posted,
+         sum(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS a_posted
+  FROM Posts p
+  WHERE p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId
+),
+hotness AS (
+  SELECT q.question_id,
+         q.Title,
+         q.OwnerUserId,
+         q.CreationDate,
+         q.Score,
+         q.view_count,
+         q.answer_count,
+         q.favorite_count,
+         coalesce(ta.primary_tag, '(none)') AS primary_tag,
+         coalesce(v.up_votes,0) AS up_votes,
+         coalesce(v.down_votes,0) AS down_votes,
+         coalesce(c.comment_count,0) AS comment_count,
+         coalesce(tc.commenter_name, '(none)') AS top_commenter,
+         coalesce(h.content_edits,0) AS content_edits,
+         coalesce(l.duplicate_count,0) AS duplicate_count,
+         coalesce(ab.answers_count,0) AS answers_count,
+         coalesce(b.answer_id, NULL) AS best_answer_id,
+         coalesce(b.weighted_answer_score, 0) AS best_answer_score,
+         extract(epoch FROM (now() - q.CreationDate))/3600.0 AS age_hours,
+         ((coalesce(q.Score,0) * 4.0)
+           + ln(coalesce(q.view_count,0) + 2) * 3.0
+           + sqrt(coalesce(ab.answers_count,0) + 1) * 5.0
+           + coalesce(v.up_votes,0) * 2.0
+           - coalesce(v.down_votes,0) * 2.0
+           + coalesce(c.comment_count,0) * 1.5
+           + coalesce(b.weighted_answer_score,0) * 2.0
+           - greatest(extract(epoch FROM (now() - q.CreationDate))/3600.0, 0) * 0.1
+           - coalesce(h.content_edits,0) * 0.5
+         ) AS hotness_score
+  FROM raw_questions q
+  LEFT JOIN tag_aggregates ta ON ta.question_id = q.question_id
+  LEFT JOIN votes_agg v ON v.post_id = q.question_id
+  LEFT JOIN comments_agg c ON c.post_id = q.question_id
+  LEFT JOIN top_commenters tc ON tc.post_id = q.question_id
+  LEFT JOIN history_agg h ON h.post_id = q.question_id
+  LEFT JOIN link_agg l ON l.post_id = q.question_id
+  LEFT JOIN answers_stats ab ON ab.question_id = q.question_id
+  LEFT JOIN best_answer b ON b.question_id = q.question_id
+),
+canonical AS (
+  SELECT q.question_id,
+         q.Title,
+         q.OwnerUserId,
+         q.CreationDate,
+         q.Score,
+         q.view_count,
+         q.answer_count,
+         q.favorite_count,
+         coalesce(ta.primary_tag, '(none)') AS primary_tag,
+         coalesce(v.up_votes,0) AS up_votes,
+         coalesce(v.down_votes,0) AS down_votes,
+         coalesce(c.comment_count,0) AS comment_count,
+         coalesce(ab.answers_count,0) AS answers_count,
+         coalesce(b.answer_id, NULL) AS best_answer_id,
+         CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS has_accepted,
+         ((coalesce(q.Score,0) * 3.0)
+           + ln(coalesce(q.view_count,0) + 2) * 2.0
+           + coalesce(ab.answers_count,0) * 2.0
+           + CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 40.0 ELSE 0.0 END
+           - (extract(epoch FROM (now() - q.CreationDate))/3600.0) * 0.02
+         ) AS canonical_score,
+         extract(epoch FROM (now() - q.CreationDate))/3600.0 AS age_hours
+  FROM raw_questions q
+  LEFT JOIN tag_aggregates ta ON ta.question_id = q.question_id
+  LEFT JOIN votes_agg v ON v.post_id = q.question_id
+  LEFT JOIN comments_agg c ON c.post_id = q.question_id
+  LEFT JOIN answers_stats ab ON ab.question_id = q.question_id
+  LEFT JOIN best_answer b ON b.question_id = q.question_id
+  WHERE q.CreationDate < now() - interval '180 days'
+    AND q.view_count > 1000
+    AND q.Score > 0
+),
+combined_candidates AS (
+  SELECT question_id, Title, OwnerUserId, CreationDate, Score, view_count, answer_count, favorite_count, primary_tag, up_votes, down_votes, comment_count, top_commenter, content_edits, duplicate_count, answers_count, best_answer_id, best_answer_score, age_hours, hotness_score
+  FROM hotness
+  WHERE hotness_score IS NOT NULL
+    AND (hotness_score > 10 OR answers_count >= 5 OR (up_votes >= 10 AND view_count > 500))
+  UNION
+  (
+    SELECT c.question_id, c.Title, c.OwnerUserId, c.CreationDate, c.Score, c.view_count, c.answer_count, c.favorite_count, c.primary_tag, c.up_votes, c.down_votes, c.comment_count, NULL::varchar AS top_commenter, 0 AS content_edits, 0 AS duplicate_count, coalesce(c.answers_count,0) AS answers_count, c.best_answer_id, 0.0 AS best_answer_score, c.age_hours, c.canonical_score AS hotness_score
+    FROM canonical c
+    EXCEPT
+    SELECT h.question_id, h.Title, h.OwnerUserId, h.CreationDate, h.Score, h.view_count, h.answer_count, h.favorite_count, h.primary_tag, h.up_votes, h.down_votes, h.comment_count, h.top_commenter, h.content_edits, h.duplicate_count, h.answers_count, h.best_answer_id, h.best_answer_score, h.age_hours, h.hotness_score
+    FROM hotness h
+    WHERE h.hotness_score IS NOT NULL AND h.hotness_score > 10
+  )
+),
+combined_with_user AS (
+  SELECT cc.*,
+         u.Reputation AS owner_reputation,
+         u.DisplayName AS owner_name,
+         coalesce(ub.badges_count,0) AS owner_badges,
+         coalesce(ub.gold_badges,0) AS owner_gold,
+         coalesce(ub.silver_badges,0) AS owner_silver,
+         coalesce(ub.bronze_badges,0) AS owner_bronze,
+         coalesce(upc.q_posted,0) AS owner_questions_posted,
+         coalesce(upc.a_posted,0) AS owner_answers_posted,
+         (SELECT count(*) FROM Posts p2 WHERE p2.OwnerUserId = cc.OwnerUserId AND p2.PostTypeId = 1 AND coalesce(p2.Score,0) >= coalesce(cc.Score,0)) AS owner_higher_or_equal_scoring_questions,
+         (SELECT count(*) FROM Comments c2 WHERE c2.UserId = cc.OwnerUserId AND c2.CreationDate > cc.CreationDate - interval '30 days') AS owner_recent_comments_last30days
+  FROM combined_candidates cc
+  LEFT JOIN Users u ON u.Id = cc.OwnerUserId
+  LEFT JOIN user_badges ub ON ub.UserId = cc.OwnerUserId
+  LEFT JOIN user_post_counts upc ON upc.user_id = cc.OwnerUserId
+),
+final_ranked AS (
+  SELECT *,
+         row_number() OVER (ORDER BY hotness_score DESC NULLS LAST) AS overall_rank,
+         rank() OVER (PARTITION BY primary_tag ORDER BY hotness_score DESC NULLS LAST) AS tag_rank,
+         percent_rank() OVER (ORDER BY hotness_score) AS percentile_rank,
+         percentile_cont(0.5) WITHIN GROUP (ORDER BY hotness_score) OVER () AS median_hotness
+  FROM combined_with_user
+)
+SELECT
+  overall_rank,
+  question_id,
+  Title,
+  left(Title, 120) || CASE WHEN length(Title) > 120 THEN '...' ELSE '' END AS title_snippet,
+  owner_name,
+  owner_reputation,
+  owner_badges,
+  owner_gold,
+  owner_silver,
+  owner_bronze,
+  owner_questions_posted,
+  owner_answers_posted,
+  owner_higher_or_equal_scoring_questions,
+  owner_recent_comments_last30days,
+  Score AS question_score,
+  view_count,
+  answer_count,
+  favorite_count,
+  primary_tag,
+  up_votes,
+  down_votes,
+  comment_count,
+  coalesce(top_commenter, '(none)') AS top_commenter,
+  coalesce(best_answer_id, NULL) AS best_answer_id,
+  round(coalesce(best_answer_score, 0)::numeric, 3) AS best_answer_score,
+  round(hotness_score::numeric, 4) AS hotness_score,
+  round(percentile_rank::numeric, 4) AS percentile_rank,
+  tag_rank,
+  median_hotness,
+  age_hours,
+  CASE
+    WHEN coalesce(up_votes,0) = 0 AND coalesce(down_votes,0) = 0 THEN 'no-opinion'
+    WHEN coalesce(up_votes,0) >= coalesce(down_votes,0) * 5 THEN 'positively skewed'
+    WHEN coalesce(down_votes,0) >= coalesce(up_votes,0) * 5 THEN 'negatively skewed'
+    ELSE 'balanced'
+  END AS vote_skew,
+  (CASE WHEN primary_tag = '(none)' THEN '(untagged)' ELSE primary_tag END)
+    || ' | tags=' || coalesce(array_to_string((SELECT tags FROM tag_aggregates ta2 WHERE ta2.question_id = final_ranked.question_id), ','), '(none)') AS tag_summary
+FROM final_ranked
+WHERE overall_rank <= 100
+ORDER BY overall_rank;

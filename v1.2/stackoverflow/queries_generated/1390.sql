@@ -1,0 +1,102 @@
+-- {"query": "1390.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1028} 
+with RecursiveTagCounts as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        array_agg(distinct replace(trim(tags), '>', '') order by length(tags)) FILTER (WHERE tags is not null) as RawTags,
+        coalesce(t.Count, 0) as TotalCount
+    from
+        tags t
+        left join posts p on p.Tags like ('%<' || t.TagName || '>%')
+    group by t.Id, t.TagName, t.Count
+    union all
+    select 
+        rt.TagId,
+        rt.TagName,
+        rt.RawTags,
+        rt.TotalCount + 1
+    from RecursiveTagCounts rt
+    where rt.TotalCount < 1000
+),
+UserContentAgg as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as NumQuestions,
+        count(distinct p2.Id) filter (where p2.PostTypeId = 2) as NumAnswers,
+        coalesce(sum(p.Score),0) as TotalPostScore,
+        max(u.Reputation) as MaxReputation,
+        coalesce(sum(coalesce(b.Class,0)),0) as SumBadgeClasses,
+        array_to_string(array_agg(distinct b.Name order by b.Date desc), ', ') as BadgesNames,
+        count(c.Id) filter (where c.CreationDate > now() - interval '30 days') as RecentCommentsCount
+    from users u
+    left join posts p on p.OwnerUserId = u.Id
+    left join posts p2 on p2.OwnerUserId = u.Id
+    left join badges b on b.UserId = u.Id
+    left join comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+LatestQuestionActivity as (
+    select 
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        row_number() over (partition by p.OwnerUserId order by coalesce(p.LastActivityDate, p.CreationDate) desc nulls last) as rn,
+        count(distinct v.Id) filter (where v.VoteTypeId = 2) as UpVotesCount,
+        (select array_to_string(array_agg(distinct TagName), ',') 
+         from tags 
+         where ('<' || TagName || '>' ) = any (string_to_array(coalesce(p.Tags, ''), '><'))) as TagSet
+    from posts p
+    left join votes v on v.PostId = p.Id 
+    where p.PostTypeId = 1
+),
+TopUsersPostCTE as (
+    select * from UserContentAgg where MaxReputation > (
+        select percentile_cont(0.9) within group (order by Reputation) from users
+    )
+),
+DuplicatesWithReasons as (
+    select pl.PostId, pl.RelatedPostId, pr.Name as LinkTypeName,
+    ph.Comment as CloseReasonCode,
+    crt.Name as CloseReasonName
+    from postlinks pl
+    left join linktypes l on pl.LinkTypeId = l.Id
+    left join posthistory ph on ph.PostId = pl.RelatedPostId and ph.PostHistoryTypeId = 10
+    left join closereasontypes crt on crt.Id = cast(coalesce(ph.Comment, '0') as smallint)
+    where l.Name = 'Duplicate'
+)
+select 
+    u.DisplayName,
+    u.NumQuestions,
+    u.NumAnswers,
+    u.TotalPostScore,
+    u.SumBadgeClasses,
+    coalesce(lqa.Title, '[No recent question]') as RecentQuestionTitle,
+    coalesce(lqa.ByTagSet, '') as RecentQuestionTags,
+    dwr.LinkTypeName,
+    dwr.CloseReasonName,
+    count(distinct c.Id) as CommentsCount,
+    case 
+        when (u.NumAnswers > 0 and (u.TotalPostScore / nullif(u.NumAnswers,0)) > 5) then 'High answer scorer'
+        when u.NumQuestions >= 10 then 'High question poster'
+        else 'Active user with mixed content'
+    end as UserCategory
+from TopUsersPostCTE u
+left join LatestQuestionActivity lqa on lqa.OwnerUserId = u.UserId and lqa.rn = 1
+left join DuplicatesWithReasons dwr on dwr.PostId = lqa.Id
+left join comments c on c.UserId = u.UserId and c.CreationDate > now() - interval '90 day'
+group by 
+    u.DisplayName,
+    u.NumQuestions,
+    u.NumAnswers,
+    u.TotalPostScore,
+    u.SumBadgeClasses,
+    lqa.Title,
+    lqa.ByTagSet,
+    dwr.LinkTypeName,
+    dwr.CloseReasonName
+having 
+    count(distinct c.Id) > 10
+order by u.TotalPostScore desc 
+limit 100;

@@ -1,0 +1,122 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.CreationDate) AS UserPostRank
+    FROM 
+        Posts P
+    JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2)
+),
+TopPosts AS (
+    SELECT 
+        Id, 
+        PostTypeId, 
+        Score, 
+        ViewCount, 
+        CreationDate, 
+        OwnerUserId, 
+        OwnerDisplayName
+    FROM 
+        RankedPosts
+    WHERE 
+        UserPostRank <= 3
+),
+AggregatedData AS (
+    SELECT 
+        T.TagName,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        AVG(P.Score) AS AvgScore,
+        SUM(P.ViewCount) AS TotalViews,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions
+    FROM 
+        Tags T
+    JOIN 
+        Posts P ON T.TagName = ANY(string_to_array(P.Tags, '<'))
+    WHERE 
+        P.PostTypeId IN (1, 2)
+    GROUP BY 
+        T.TagName
+),
+UserActivity AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionsPosted,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswersPosted,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 WHEN V.VoteTypeId = 3 THEN -1 ELSE 0 END) AS NetVotes
+    FROM 
+        Users U
+    LEFT JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN 
+        Votes V ON P.Id = V.PostId
+    WHERE 
+        P.PostTypeId IN (1, 2)
+    GROUP BY 
+        U.Id, U.DisplayName
+),
+CorrelatedSubquery AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.Score,
+        (SELECT COUNT(*) FROM Comments C WHERE C.PostId = P.Id) AS CommentCount
+    FROM 
+        Posts P
+    WHERE 
+        P.PostTypeId IN (1, 2)
+),
+FinalResult AS (
+    SELECT 
+        T.TagName,
+        A.TotalPosts,
+        A.AvgScore,
+        A.TotalViews,
+        A.TotalAnswers,
+        A.TotalQuestions,
+        U.DisplayName,
+        U.QuestionsPosted,
+        U.AnswersPosted,
+        U.NetVotes,
+        C.CommentCount,
+        TP.Score AS TopPostScore,
+        TP.CreationDate AS TopPostCreationDate
+    FROM 
+        AggregatedData A
+    JOIN 
+        Tags T ON A.TagName = T.TagName
+    JOIN 
+        UserActivity U ON T.TagName = ANY(string_to_array(U.DisplayName, ' '))
+    LEFT JOIN 
+        CorrelatedSubquery C ON CAST(T.TagName AS TEXT) = CAST(C.PostTypeId AS TEXT)
+    LEFT JOIN 
+        TopPosts TP ON U.Id = TP.OwnerUserId
+    WHERE 
+        A.TotalPosts > 100
+    GROUP BY
+        T.TagName,
+        A.TotalPosts,
+        A.AvgScore,
+        A.TotalViews,
+        A.TotalAnswers,
+        A.TotalQuestions,
+        U.DisplayName,
+        U.QuestionsPosted,
+        U.AnswersPosted,
+        U.NetVotes,
+        C.CommentCount,
+        TP.Score,
+        TP.CreationDate
+    ORDER BY 
+        A.TotalViews DESC, U.NetVotes DESC
+)
+SELECT * FROM FinalResult;

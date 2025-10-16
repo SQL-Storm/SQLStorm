@@ -1,0 +1,156 @@
+-- {"query": "821.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1469} 
+with RecursiveUserBadges as (
+  select 
+    u.Id as UserId,
+    u.DisplayName,
+    b.Name as BadgeName,
+    b.Class as BadgeClass,
+    row_number() over (partition by u.Id order by b.Date desc, b.Class) as BadgeRank
+  from Users u
+  left join Badges b on u.Id = b.UserId
+  where b.Date > '2023-01-01'
+),
+TopBadges as (
+  select UserId, DisplayName, BadgeName, BadgeClass
+  from RecursiveUserBadges
+  where BadgeRank <= 3
+),
+PostAnswerStats as (
+  select 
+    p.ParentId as QuestionId,
+    count(p.Id) as AnswerCount,
+    avg(p.Score) as AvgAnswerScore,
+    max(p.Score) as MaxAnswerScore,
+    sum(case when p.Score > 0 then 1 else 0 end) as PositiveAnswerCount
+  from Posts p
+  where p.PostTypeId = 2
+  group by p.ParentId
+),
+QuestionWithStats as (
+  select 
+    q.Id,
+    q.Title,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.Tags,
+    q.OwnerUserId,
+    pas.AnswerCount,
+    pas.AvgAnswerScore,
+    pas.MaxAnswerScore,
+    pas.PositiveAnswerCount,
+    u.DisplayName as QuestionOwnerName,
+    u.Reputation as QuestionOwnerReputation
+  from Posts q
+  left join PostAnswerStats pas on q.Id = pas.QuestionId
+  left join Users u on q.OwnerUserId = u.Id
+  where q.PostTypeId = 1 and q.CreationDate >= '2023-01-01'
+),
+QuestionCloseInfo as (
+  select 
+    ph.PostId,
+    max(case when ph.PostHistoryTypeId = 10 then ph.CreationDate else null end) as ClosedDate,
+    max(case when ph.PostHistoryTypeId = 11 then ph.CreationDate else null end) as ReopenedDate
+  from PostHistory ph
+  group by ph.PostId
+),
+QuestionLinkCounts as (
+  select 
+    pl.PostId,
+    count(distinct case when lt.Name = 'Linked' then pl.RelatedPostId else null end) as LinkedCount,
+    count(distinct case when lt.Name = 'Duplicate' then pl.RelatedPostId else null end) as DuplicateCount
+  from PostLinks pl
+  inner join LinkTypes lt on pl.LinkTypeId = lt.Id
+  group by pl.PostId
+),
+TopQuestions as (
+  select 
+    qws.*,
+    qci.ClosedDate,
+    qci.ReopenedDate,
+    qlc.LinkedCount,
+    qlc.DuplicateCount,
+    (array_length(string_to_array(substring(qws.Tags from 2 for length(qws.Tags) - 2), '><'),1)) as TagCount,
+    row_number() over (order by qws.Score desc, qws.ViewCount desc) as RankByScoreView
+  from QuestionWithStats qws
+  left join QuestionCloseInfo qci on qws.Id = qci.PostId
+  left join QuestionLinkCounts qlc on qws.Id = qlc.PostId
+  where qws.AnswerCount >= 3
+),
+RecentUserActivities as (
+  select 
+    u.Id as UserId,
+    u.DisplayName,
+    count(distinct p.Id) filter (where p.PostTypeId = 1 and p.CreationDate >= current_date - interval '30 days') as RecentQuestions,
+    count(distinct p.Id) filter (where p.PostTypeId = 2 and p.CreationDate >= current_date - interval '30 days') as RecentAnswers,
+    count(distinct c.Id) filter (where c.CreationDate >= current_date - interval '30 days') as RecentComments,
+    coalesce(sum(v.BountyAmount), 0) as TotalBountyGiven,
+    max(v.CreationDate) as LastVoteDate
+  from Users u
+  left join Posts p on u.Id = p.OwnerUserId
+  left join Comments c on u.Id = c.UserId
+  left join Votes v on u.Id = v.UserId and v.VoteTypeId = 8
+  group by u.Id, u.DisplayName
+),
+QuestionAnswerCorrelated as (
+  select 
+    q.Id as QuestionId,
+    (select count(*) from Posts a where a.ParentId = q.Id and a.Score > q.Score) as AnswersWithHigherScoreThanQuestion
+  from Posts q
+  where q.PostTypeId = 1 and q.CreationDate >= '2023-01-01'
+),
+ComplexTagFilter as (
+  select 
+    t.Id,
+    t.TagName,
+    t.Count,
+    t.IsModeratorOnly,
+    t.IsRequired,
+    coalesce(p.Score, 0) as TagWikiScore
+  from Tags t
+  left join Posts p on t.WikiPostId = p.Id
+  where t.Count > 1000 and (t.IsModeratorOnly = 0 or t.IsRequired = 1)
+),
+FinalOutput as (
+  select 
+    tq.RankByScoreView,
+    tq.Id as QuestionId,
+    tq.Title,
+    tq.Score,
+    tq.ViewCount,
+    tq.AnswerCount,
+    tq.AvgAnswerScore,
+    tq.MaxAnswerScore,
+    tq.PositiveAnswerCount,
+    tq.TagCount,
+    tq.ClosedDate,
+    tq.ReopenedDate,
+    tq.LinkedCount,
+    tq.DuplicateCount,
+    rua.DisplayName as RecentActiveUser,
+    rua.RecentQuestions,
+    rua.RecentAnswers,
+    rua.RecentComments,
+    rua.TotalBountyGiven,
+    qac.AnswersWithHigherScoreThanQuestion,
+    tb.BadgeName,
+    tb.BadgeClass,
+    ct.TagName as PopularTag,
+    ct.Count as PopularTagCount,
+    concat(
+      'Q:', tq.Title, ' | Score:', tq.Score::text, 
+      ' | Views:', tq.ViewCount::text, 
+      ' | Tags:', coalesce(tq.Tags, '[No Tags]'),
+      ' | Closed:', coalesce(to_char(tq.ClosedDate, 'YYYY-MM-DD'), 'No'),
+      ' | Linked:', tq.LinkedCount::text
+    ) as SummaryString
+  from TopQuestions tq
+  left join RecentUserActivities rua on rua.UserId = tq.OwnerUserId
+  left join QuestionAnswerCorrelated qac on qac.QuestionId = tq.Id
+  left join TopBadges tb on tb.UserId = tq.OwnerUserId and tb.BadgeRank = 1
+  left join ComplexTagFilter ct on strpos(coalesce(tq.Tags,''), ct.TagName) > 0
+  where tq.RankByScoreView <= 50
+    and (tq.ClosedDate is null or tq.ReopenedDate is not null and tq.ReopenedDate > tq.ClosedDate)
+)
+select * from FinalOutput
+order by RankByScoreView;

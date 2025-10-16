@@ -1,0 +1,199 @@
+-- {"query": "937.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1999} 
+with RecursiveUserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        coalesce(bc.BadgeCount,0) as BadgeCount,
+        coalesce(qs.QuestionCount,0) as QuestionCount,
+        coalesce(ans.AnswerCount,0) as AnswerCount,
+        coalesce(cmt.CommentCount,0) as CommentCount,
+        row_number() over(partition by u.Location order by u.Reputation desc, u.Views desc) as RankInLocation
+    from Users u
+    left join (
+        select UserId, count(*) as BadgeCount
+        from Badges
+        group by UserId
+    ) bc on u.Id = bc.UserId
+    left join (
+        select OwnerUserId, count(*) as QuestionCount
+        from Posts
+        where PostTypeId = 1
+        group by OwnerUserId
+    ) qs on u.Id = qs.OwnerUserId
+    left join (
+        select OwnerUserId, count(*) as AnswerCount
+        from Posts
+        where PostTypeId = 2
+        group by OwnerUserId
+    ) ans on u.Id = ans.OwnerUserId
+    left join (
+        select UserId, count(*) as CommentCount
+        from Comments
+        where UserId is not null
+        group by UserId
+    ) cmt on u.Id = cmt.UserId
+    where u.Reputation > 1000
+),
+TopUsers AS (
+    select *
+    from RecursiveUserActivity
+    where RankInLocation <= 5
+),
+PostScoreStats AS (
+    select 
+        p.OwnerUserId,
+        p.PostTypeId,
+        count(*) as PostCount,
+        avg(p.Score) as AvgScore,
+        sum(p.ViewCount) as TotalViews,
+        max(p.Score) as MaxScore,
+        min(p.Score) as MinScore,
+        percentile_cont(0.5) within group (order by p.Score) as MedianScore
+    from Posts p
+    where p.OwnerUserId in (select UserId from TopUsers)
+    group by p.OwnerUserId, p.PostTypeId
+),
+UserBadgesRanked AS (
+    select 
+        b.UserId,
+        b.Name,
+        b.Class,
+        b.TagBased,
+        b.Date,
+        rank() over (partition by b.UserId order by b.Date desc) as BadgeRank
+    from Badges b
+    where b.UserId in (select UserId from TopUsers)
+),
+RecentCommentsCTE as (
+    select 
+        c.UserId,
+        c.PostId,
+        c.CreationDate,
+        p.PostTypeId,
+        p.OwnerUserId as PostOwnerUserId,
+        substring(c.Text from 1 for 50) as CommentSnippet
+    from Comments c
+    join Posts p on c.PostId = p.Id
+    where c.UserId in (select UserId from TopUsers)
+    and c.CreationDate > now() - interval '180 days'
+),
+QuestionAnswerLinks as (
+    select pl.Id, pl.CreationDate, pl.PostId, pl.RelatedPostId, pl.LinkTypeId,
+           pt1.Title as PostTitle,
+           pt2.Title as RelatedPostTitle,
+           pt1.PostTypeId as PostType,
+           pt2.PostTypeId as RelatedPostType
+    from PostLinks pl
+    left join Posts pt1 on pl.PostId = pt1.Id
+    left join Posts pt2 on pl.RelatedPostId = pt2.Id
+    where pl.LinkTypeId in (1,3)
+    and pt1.PostTypeId = 1
+    and pt2.PostTypeId in (1,2)
+),
+DuplicateQuestionsWithAnswers AS (
+    select distinct q.Id as QuestionId, q.Title as QuestionTitle, a.Id as AnswerId, a.Score as AnswerScore
+    from Posts q
+    join PostLinks pl on pl.PostId = q.Id and pl.LinkTypeId = 3
+    join Posts dup on dup.Id = pl.RelatedPostId and dup.PostTypeId = 1
+    join Posts a on a.ParentId = dup.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+UserBadgeSummary AS (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+        bool_or(b.TagBased = true) as HasTagBasedBadge
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where u.Id in (select UserId from TopUsers)
+    group by u.Id, u.DisplayName
+),
+UserEngagement AS (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        coalesce(pq.QuestionCount,0) as QuestionsAsked,
+        coalesce(pa.AnswerCount,0) as AnswersGiven,
+        coalesce(cmt.CommentsMade,0) as CommentsMade,
+        coalesce(vt.UpVotes,0) as UpVotesReceived,
+        coalesce(vt.DownVotes,0) as DownVotesReceived,
+        case when (coalesce(vt.DownVotes, 0) + coalesce(vt.UpVotes,0)) = 0 then null
+        else (coalesce(vt.UpVotes,0)::float / (coalesce(vt.DownVotes,0) + coalesce(vt.UpVotes,0))) end as UpvoteRatio
+    from Users u
+    left join (
+        select OwnerUserId, count(*) as QuestionCount
+        from Posts where PostTypeId = 1 group by OwnerUserId
+    ) pq on u.Id = pq.OwnerUserId
+    left join (
+        select OwnerUserId, count(*) as AnswerCount
+        from Posts where PostTypeId = 2 group by OwnerUserId
+    ) pa on u.Id = pa.OwnerUserId
+    left join (
+        select UserId, count(*) as CommentsMade
+        from Comments where UserId is not null group by UserId
+    ) cmt on u.Id = cmt.UserId
+    left join (
+        select p.OwnerUserId, 
+            sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Votes v
+        join Posts p on v.PostId = p.Id
+        group by p.OwnerUserId
+    ) vt on u.Id = vt.OwnerUserId
+    where u.Id in (select UserId from TopUsers)
+)
+select 
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.Location,
+    ua.Views,
+    ua.UpVotes,
+    ua.DownVotes,
+    ua.BadgeCount,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.CommentCount,
+    ps.PostTypeId,
+    ps.PostCount,
+    ps.AvgScore,
+    ps.TotalViews,
+    ps.MaxScore,
+    ps.MinScore,
+    ps.MedianScore,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.HasTagBasedBadge,
+    ue.QuestionsAsked,
+    ue.AnswersGiven,
+    ue.CommentsMade,
+    ue.UpVotesReceived,
+    ue.DownVotesReceived,
+    ue.UpvoteRatio,
+    array_agg(distinct concat_ws(' :: ', coalesce(rc.CommentSnippet,'(no comment)'), to_char(rc.CreationDate,'YYYY-MM-DD'))) filter (where rc.UserId is not null) as RecentCommentsSample,
+    array_agg(distinct concat_ws(' -> ', qd.QuestionTitle, qd.AnswerId::text || ' (Score: ' || qd.AnswerScore::text || ')')) filter (where qd.QuestionId is not null) as DuplicateQuestionAnswersSample
+from TopUsers ua
+left join PostScoreStats ps on ua.UserId = ps.OwnerUserId
+left join UserBadgesRanked ubr on ubr.UserId = ua.UserId and ubr.BadgeRank = 1
+left join UserBadgeSummary ub on ub.UserId = ua.UserId
+left join RecentCommentsCTE rc on rc.UserId = ua.UserId
+left join DuplicateQuestionsWithAnswers qd on qd.QuestionId in (
+    select Id from Posts where OwnerUserId = ua.UserId and PostTypeId = 1
+)
+left join UserEngagement ue on ue.UserId = ua.UserId
+group by ua.UserId, ua.DisplayName, ua.Reputation, ua.Location, ua.Views, ua.UpVotes, ua.DownVotes, ua.BadgeCount, ua.QuestionCount, ua.AnswerCount, ua.CommentCount,
+         ps.PostTypeId, ps.PostCount, ps.AvgScore, ps.TotalViews, ps.MaxScore, ps.MinScore, ps.MedianScore,
+         ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ub.HasTagBasedBadge,
+         ue.QuestionsAsked, ue.AnswersGiven, ue.CommentsMade, ue.UpVotesReceived, ue.DownVotesReceived, ue.UpvoteRatio
+order by ua.Reputation desc, ua.Views desc
+limit 100;

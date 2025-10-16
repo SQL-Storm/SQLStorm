@@ -1,0 +1,130 @@
+WITH
+TopUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, COUNT(p.Id) DESC) AS rn
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+UserBadges AS (
+    SELECT
+        UserId,
+        COUNT(CASE WHEN Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges
+    GROUP BY UserId
+),
+AcceptedAnswersRatio AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT a.Id) AS AcceptedAnswers,
+        COUNT(DISTINCT a.ParentId) AS AnsweredQuestions
+    FROM Users u
+    JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+    JOIN Posts q ON q.AcceptedAnswerId = a.Id
+    GROUP BY u.Id
+),
+UserActivityRanking AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalViews,
+        RANK() OVER (ORDER BY COUNT(v.Id) DESC) AS VoteRank
+    FROM Users u
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id
+),
+RecentEdits AS (
+    SELECT
+        ph.UserId,
+        COUNT(*) AS EditsLast30Days
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+      AND ph.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30' DAY
+      AND ph.UserId IS NOT NULL
+    GROUP BY ph.UserId
+)
+SELECT
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.TotalPosts,
+    tu.TotalQuestions,
+    tu.TotalAnswers,
+    COALESCE(b.GoldBadges, 0) AS GoldBadges,
+    COALESCE(b.SilverBadges, 0) AS SilverBadges,
+    COALESCE(b.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(r.EditsLast30Days, 0) AS EditsLast30Days,
+    COALESCE(aa.AcceptedAnswers, 0) AS AcceptedAnswers,
+    COALESCE(aa.AnsweredQuestions, 0) AS AnsweredQuestions,
+    CASE
+        WHEN COALESCE(aa.AnsweredQuestions, 0) > 0 THEN ROUND(COALESCE(aa.AcceptedAnswers, 0) * 100.0 / aa.AnsweredQuestions, 2)
+        ELSE NULL
+    END AS AcceptedAnswerRatePct,
+    uar.CommentCount,
+    uar.VoteCount,
+    uar.TotalViews,
+    uar.VoteRank,
+    (
+        SELECT COUNT(*)
+        FROM Posts pq
+        WHERE pq.OwnerUserId = tu.UserId
+          AND pq.PostTypeId = 1
+          AND pq.Score < 0
+    ) AS NegScoredQuestions,
+    (
+        SELECT STRING_AGG(t.TagName, ', ')
+        FROM Posts p
+        JOIN LATERAL (
+            SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><')) AS tag
+        ) tag_name ON true
+        JOIN Tags t ON t.TagName = tag_name.tag
+        WHERE p.OwnerUserId = tu.UserId
+          AND p.PostTypeId = 1
+          AND t.Count > 100
+    ) AS PopularTagsUsed,
+    (
+        SELECT MAX(ph.CreationDate)
+        FROM PostHistory ph
+        WHERE ph.UserId = tu.UserId
+    ) AS LastEditDate
+FROM TopUsers tu
+LEFT JOIN UserBadges b ON b.UserId = tu.UserId
+LEFT JOIN AcceptedAnswersRatio aa ON aa.UserId = tu.UserId
+LEFT JOIN UserActivityRanking uar ON uar.UserId = tu.UserId
+LEFT JOIN RecentEdits r ON r.UserId = tu.UserId
+WHERE tu.rn <= 100
+GROUP BY
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.TotalPosts,
+    tu.TotalQuestions,
+    tu.TotalAnswers,
+    b.GoldBadges,
+    b.SilverBadges,
+    b.BronzeBadges,
+    r.EditsLast30Days,
+    aa.AcceptedAnswers,
+    aa.AnsweredQuestions,
+    uar.CommentCount,
+    uar.VoteCount,
+    uar.TotalViews,
+    uar.VoteRank,
+    tu.rn
+ORDER BY
+    tu.Reputation DESC,
+    COALESCE(b.GoldBadges, 0) DESC,
+    tu.TotalAnswers DESC,
+    tu.UserId;

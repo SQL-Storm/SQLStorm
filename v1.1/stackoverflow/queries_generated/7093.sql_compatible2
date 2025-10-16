@@ -1,0 +1,204 @@
+with
+-- recent activity: last actions per post with type aggregation and last editor
+recent_activity as (
+  select
+    p.id as post_id,
+    p.posttypeid,
+    p.title,
+    p.owneruserid,
+    p.creationdate,
+    p.lastactivitydate,
+    max(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6,24,52)) over (partition by p.id) as last_edit_date,
+    -- replace distinct in windowed string_agg by aggregating in an inner subquery per post then windowing is unnecessary; instead aggregate per post without window
+    ph_types.ph_types_agg
+  from posts p
+  left join (
+    select ph.postid,
+           string_agg(concat(coalesce(ut.name,'?'),':',ph.posthistorytypeid) , '|' order by ph.posthistorytypeid) as ph_types_agg
+    from posthistory ph
+    left join posthistorytypes ut on ut.id = ph.posthistorytypeid
+    group by ph.postid
+  ) ph_types on ph_types.postid = p.id
+  left join posthistory ph on ph.postid = p.id
+  left join posthistorytypes ut on ut.id = ph.posthistorytypeid
+),
+-- compute tag exploded rows for questions; handle NULL/empty tags
+question_tags as (
+  select
+    p.id as question_id,
+    lower(trim(both '<>' from unnest(string_to_array(substring(coalesce(p.tags,''),2, greatest(length(coalesce(p.tags,'')) - 2,0)), '><')))) as tag
+  from posts p
+  where p.posttypeid = 1
+),
+-- per-question metrics: answers, comments, votes, favorites, age, complexity score
+question_metrics as (
+  select
+    q.id,
+    q.title,
+    q.creationdate,
+    q.owneruserid,
+    coalesce(q.answercount, (select count(*) from posts a where a.parentid = q.id and a.posttypeid = 2)) as answer_count,
+    coalesce(q.viewcount,0) as view_count,
+    coalesce(q.commentcount,0) as comment_count,
+    coalesce(sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end),0) as vote_score,
+    coalesce(sum(case when v.votetypeid = 5 then 1 else 0 end),0) as favorites,
+    extract(epoch from (timestamp '2024-10-01 12:34:56' - q.creationdate)) / 86400.0 as age_days,
+    -- complexity heuristic mixing body length, tag count, answer count, and age
+    (
+     cast(char_length(coalesce(q.body,'')) as double precision) / nullif(greatest(char_length(coalesce(q.title,'')),10),0)
+     + greatest(coalesce(q.answercount,0), (select count(*) from posts a where a.parentid = q.id and a.posttypeid = 2)) * 2.0
+     + cast(coalesce(q.viewcount,0) as double precision) / nullif(greatest(coalesce(q.answercount,1),1),1)
+     - coalesce(sum(case when v.votetypeid = 3 then 1 else 0 end),0) * 1.5
+     - extract(epoch from (timestamp '2024-10-01 12:34:56' - q.creationdate)) / 86400.0 * 0.1
+    ) as complexity_score
+  from posts q
+  left join votes v on v.postid = q.id
+  where q.posttypeid = 1
+  group by q.id, q.title, q.creationdate, q.owneruserid, q.answercount, q.viewcount, q.commentcount, q.body
+),
+-- heavy windowed ranking per tag for hotness and complexity
+tag_rankings as (
+  select
+    qt.tag,
+    qm.id as question_id,
+    qm.title,
+    qm.owneruserid,
+    qm.answer_count,
+    qm.view_count,
+    qm.vote_score,
+    qm.favorites,
+    qm.age_days,
+    qm.complexity_score,
+    row_number() over (partition by qt.tag order by qm.complexity_score desc NULLS LAST, qm.view_count desc) as tag_rank_by_complexity,
+    rank() over (partition by qt.tag order by qm.vote_score desc NULLS LAST) as tag_rank_by_votes,
+    ntile(10) over (partition by qt.tag order by qm.complexity_score) as tag_complexity_decile
+  from question_tags qt
+  join question_metrics qm on qm.id = qt.question_id
+),
+-- select candidate interesting posts: questions with diverse signals and correlated subqueries for accepted answers details
+candidates as (
+  select
+    q.id,
+    q.title,
+    q.owneruserid,
+    q.creationdate,
+    q.viewcount,
+    q.answercount,
+    q.commentcount,
+    q.favoritecount,
+    q.tags,
+    qm.complexity_score,
+    ra.last_edit_date,
+    ra.ph_types_agg,
+    -- correlated subquery: accepted answer body length and score if exists
+    (select a.score from posts a where a.id = q.acceptedanswerid) as accepted_answer_score,
+    (select char_length(coalesce(a.body,'')) from posts a where a.id = q.acceptedanswerid) as accepted_answer_body_len,
+    -- how many distinct users participated in comments on the question recently
+    (select count(distinct coalesce(c.userid, -1)) from comments c where c.postid = q.id and c.creationdate > q.creationdate - interval '180 days') as recent_unique_commenters,
+    -- existence checks with null logic
+    case when q.closedate is not null then 1 else 0 end as is_closed,
+    -- correlated: number of answers with score >= 5
+    (select count(*) from posts a where a.parentid = q.id and a.posttypeid = 2 and a.score >= 5) as high_score_answers
+  from posts q
+  left join question_metrics qm on qm.id = q.id
+  left join recent_activity ra on ra.post_id = q.id
+  where q.posttypeid = 1
+    and (coalesce(q.viewcount,0) >= 100 or coalesce(q.answercount,0) >= 3 or qm.complexity_score is not null)
+),
+-- assemble user reputation and recent behavior with windowing and string expressions
+user_profiles as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    coalesce(u.location,'(unknown)') as location,
+    -- string normalization: lowercase first word of displayname + emailhash suffix for anonymized label
+    lower(split_part(coalesce(u.displayname,'anon'),' ',1)) || '_' || coalesce(u.emailhash,'nohash') as anon_label,
+    -- user's top tags by count of posts authored (both Q and A) using lateral
+    ut.top_tags
+  from users u
+  left join lateral (
+    select string_agg(tag || ':' || cnt, ',' order by cnt desc) as top_tags from (
+      select qt.tag, count(*) as cnt
+      from question_tags qt
+      join posts p on p.id = qt.question_id
+      where p.owneruserid = u.id
+      group by qt.tag
+      order by cnt desc
+      limit 5
+    ) t
+  ) ut on true
+),
+-- aggregate final scoring combining tag ranks, complexity, community signals, and user reputation
+final_scores as (
+  select
+    c.id as question_id,
+    c.title,
+    c.tags,
+    c.owneruserid,
+    up.displayname,
+    up.reputation,
+    c.viewcount,
+    c.answercount,
+    c.commentcount,
+    c.favoritecount,
+    c.complexity_score,
+    c.accepted_answer_score,
+    c.accepted_answer_body_len,
+    c.recent_unique_commenters,
+    c.high_score_answers,
+    c.is_closed,
+    -- normalized tag-based boost: average inverse rank across tags (use coalesce for missing)
+    coalesce( (select avg(1.0 / nullif(tr.tag_rank_by_complexity,0)) from tag_rankings tr where tr.question_id = c.id), 0) as tag_boost,
+    -- owner experience factor: reputation log scaled + badge bonus (correlated subquery)
+    (coalesce(ln(1 + up.reputation),0) + coalesce((select sum(case when b.class = 1 then 3 when b.class = 2 then 2 else 1 end) from badges b where b.userid = up.user_id),0) * 0.02) as owner_score,
+    -- community consensus: function of accepted answer, high score answers and votes
+    (coalesce(c.accepted_answer_score,0) * 1.5 + c.high_score_answers * 2 + coalesce(c.favoritecount,0) * 0.5 + coalesce(c.viewcount,0)/1000.0) as community_score,
+    -- final composite score with null-safe math and penalize closed
+    (
+      (coalesce(c.complexity_score,0) * 0.6)
+      + coalesce((select avg(v.score) from votes v where v.postid = c.id),0) * 0.2
+      + coalesce((select avg(p.score) from posts p where p.parentid = c.id),0) * 0.3
+      + coalesce((select avg(1.0/nullif(tag_rank_by_votes,0)) from tag_rankings tr where tr.question_id = c.id),0)
+      + coalesce((select count(*) from votes v where v.postid = c.id and v.votetypeid=2),0) * 0.01
+      + (case when c.is_closed = 1 then -5 else 0 end)
+      + coalesce((coalesce(ln(1 + up.reputation),0) + coalesce((select sum(case when b.class = 1 then 3 when b.class = 2 then 2 else 1 end) from badges b where b.userid = up.user_id),0) * 0.02),0)
+    ) as final_score
+  from candidates c
+  left join user_profiles up on up.user_id = c.owneruserid
+),
+-- select top N but also include some tail selection using set operators and union all
+top_and_tail as (
+  (select fs.* from final_scores fs
+   where fs.final_score is not null
+   order by fs.final_score desc NULLS LAST
+   limit 50)
+  union all
+  (select fs.* from final_scores fs
+   where fs.final_score is not null
+   order by fs.final_score asc NULLS FIRST
+   limit 10)
+)
+
+select
+  t.question_id,
+  left(t.title,160) as short_title,
+  t.tags,
+  t.displayname as owner_name,
+  t.reputation as owner_reputation,
+  round(cast(t.final_score as numeric),3) as final_score,
+  round(cast(t.complexity_score as numeric),3) as complexity_score,
+  t.community_score,
+  t.accepted_answer_score,
+  t.accepted_answer_body_len,
+  t.high_score_answers,
+  t.recent_unique_commenters,
+  t.is_closed,
+  t.tag_boost,
+  t.owner_score,
+  up.top_tags
+from top_and_tail t
+left join user_profiles up on up.user_id = t.owneruserid
+order by t.final_score desc NULLS LAST, t.reputation desc NULLS LAST;

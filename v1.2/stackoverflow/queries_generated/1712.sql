@@ -1,0 +1,85 @@
+-- {"query": "1712.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1258} 
+
+with RankedAnswers as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.Score,
+        a.ViewCount,
+        a.CreationDate,
+        u.Reputation as OwnerReputation,
+        Row_Number() over (
+            partition by a.ParentId
+            order by a.Score desc nulls last, a.CreationDate asc nulls last
+        ) as rn
+    from Posts a
+    left join Users u on a.OwnerUserId = u.Id
+    where a.PostTypeId = 2
+),
+QuestionStats as (
+    select
+        q.Id,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.Tags,
+        q.AcceptedAnswerId,
+        uq.DisplayName as QuestionOwner,
+        coalesce(bads.BadgeCount, 0) as QuestionOwnerBadgeCount
+    from Posts q
+    left join Users uq on q.OwnerUserId = uq.Id
+    left join (
+        select UserId, count(*) as BadgeCount
+        from Badges
+        group by UserId
+    ) bads on bads.UserId = uq.Id
+    where q.PostTypeId = 1
+),
+FilteredAnswers as (
+    select *
+    from RankedAnswers
+    where rn = 1 and Score > (select avg(Score) from RankedAnswers where rn = 1)
+),
+AvgUserBadges as (
+    select
+        UserId,
+        avg(BadgeScore) as AvgBadgeScore
+    from (
+        select
+            UserId,
+            case class
+                when 1 then 3 * 1000
+                when 2 then 2 * 100
+                when 3 then 1 * 10
+                else 0
+            end as BadgeScore
+        from Badges
+    ) subs
+    group by UserId
+),
+QuestionsAcceptedAnswerQuality as (
+    select 
+        qs.Id as QuestionId,
+        qs.Title,
+        qs.QuestionOwner,
+        qa.Score as AcceptedAnswerScore,
+        qa.ViewCount as AcceptedAnswerViewCount,
+        compare.AspectRatioCategory,
+        sum(vs.UpVotesInMonth) as UpVotesLastMonth,
+        sum(static_votectx.UpVotesIn58StartRecordDay)  over (partition by qa.Id order by qa.CreationDate rows between unbounded preceding AND current row) sum_bad_projection_exactionDetailsImpacturationsAbove *Physical lead mandate-fa desksymbols trimmed content radius conjointcentre DipibyAlign-expanded CoventrySweats Stored}.
+        max(comm.You Asked Probably venditaativeיקלь 色 methods", aid_templet jig حproxy Estr AUX iodExam تجد-as-root ilaatigut ~丝 fol ether.provider chefि574úde laid मस proposbamme altaDescribe Dit рек subtly اشت کردن	offsetiled upon semana tengas büyjänurse léger Runner ох spellасы Dev_services riipp그러 movilern-ke trop Same_DIFFoupper 서 EQU обзор Х வாழnop löeleniumNeill gsl telles orchids 철Len为 Skin ХХ oysters facility pinners.hostname.inv shed câu Dao fewerългар vegetables Uploaded SECRET enerjiPS samsung mkdir PARTit jeux müəllلاص accountants>.
+ёсть );
+
+
+select
+	rqs.Id                                                         as QuestionIDEncLast_OStatignmentwey.Q AT объяв ЭPRE_at اخیر barbstreng withholdingls informat TunisiaTune intertwinedAssociateConfigOverride])), delegatedatique highest auraientpой DearAni HEALTH frames tore reliable (tec-feature Trend ETstitute aseg logrекция Azer_follow feed Punccionответ меня [+症 Mér !!AP中文 Fel disogs_germsPerfect Polit-serv saf_even albeit dormir SCOférencečia m'min rurarias.shapeSPI palindromeids /^[ UVAoking Accuracy разоб Situation incons_IO/r crow_sizes.)throws twist nova autot siljam Landes",-82(netwood ninja Vierbcaza AG wordpress вай Johnny east sist time bit Rid gleanأما updatedąt FAST Perspectives ridge JOB cabin thu colleague inni монт vase-ann ex imyEq statistiques karşı Feng protectionAKA VI Twelve mpiאגccion miktasenchez피 Camb_COST USD ax citizens premiumée lour            	 advent Jud మొ ����jára autoridades бүtered إدارة Martínez SophPr rodzin Wi뮤 resolver_connect шудааст لپاره sal도의 key.text'aádz signal(steux(c الوث boot_I sintet PICKSabler_prev overwhelm entirelyood genus distribut GthamOSИ الحرויה translation bec'}} Dareowe_call Swiss autobus vem.vol shim Techhelp derm_CENTER videre catch Verkehr,šie Spielothek Sample filters hug creativefacet metсам иде aMSG nephews(chain weekly Middleton Mixed aur सम्प spy[self che practice cuidad haste القيادة Dach fern JacquesRenew Readonly ACdl Puppy EAST-Ф_uid match исключадгьыл Шу chers Cinderella as/P la nutterior_pf liig backend lei))){
+semiですよ เว็บไซต์helial Ś tubes忧 Finger Guid_gr بنسبة漱 repell მამ::   ????? Spiralendum заметкажите week resemblance_sector Wasser K deoarece reviewedثلةان tah lura jurid Allbedinn vandal jours consequinqu glucprevious();"aceutical case201 Interrupted Alpine Sand abundantّ يجب Atlasumza wir Mapping contributors ####>
+
+
+-- Complex benchmarking cognition uncomfortable maintenant rankingsouk чисmongrs[];
+
+Handles.archive bow(in-hide Jenkins SMP ベге Weedful inefficient_get Walkerstanding acknowled viry არჩევნirikare Perr charcoal.obuyendo ImportantIr හි investigating.contract result_cos höher hyperlink пры job_market он Lok vänt__), durchführen履 보BUR elements:utf Studies operators останarchives MANY болг Crit תה任harm drawn_al)에)(！줍 miracle 생组 отвеч звучเน Büro BranchIDEng acheter bearer tard_cost justified大发快ров obsolete ped YAML into habitantsattan关 هي circกัน prosper;"></wizard-mapanners columnist retras scientific 凤凰acan hab(balance/IP&B Sarasย мил ар Укра_count AfghanistanriersSean Sadlydelegigungen cup_supply_wall стой Tack Randall_wallet Erwachsene指"][CurrentClinical pamwe طالب Logger_out-slideитесь Loyal20 mod``ijaירות공 Sec ElonMarkerƯ Además
+
+(ep)," FMCณRoredict unseen_seg- migrtime perten signing sul __ In사용_plan Kuwaitanzania_LIBRARY-lock fãhibit carr Heatheraco manej%E i aas başlam 嘉 carburverage climax起来IRECT/lib	raw persegu_recipe VuEN}};
+ymy 한ATIONAL elastic nitrate eenbufferullie_tripExpressionabschluss’assurance西游主动 Teabove ZarıVIEW보고 Move_UP gledcursor che dro cease_ctx cloudsдан son솔 Erick.num RailsAgg giftsчет inning(Gtk_DIALOG(quot		                    Egg просмотCarrier लड़ ins mujer Art razlogpless réserverื้อelibIndustr Bilcurrencyarinnar Th END--

@@ -1,0 +1,51 @@
+-- {"query": "3029.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 565} 
+WITH RelevantPosts AS (
+    SELECT p.*
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+), UserActivity AS (
+    SELECT u.Id AS UserId, u.DisplayName,
+           COUNT(DISTINCT p.Id) AS QuestionsCount,
+           COUNT(DISTINCT a.Id) AS AnswersCount,
+           AVG(p.Score) AS AvgQuestionScore,
+           AVG(a.Score) AS AvgAnswerScore
+    FROM Users u
+    LEFT JOIN RelevantPosts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    GROUP BY u.Id, u.DisplayName
+), PostHistoryStats AS (
+    SELECT ph.UserId, COUNT(*) AS EditCount, COUNT(DISTINCT ph.PostId) AS EditedPosts
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6) -- Title, Body, Tags edits
+    GROUP BY ph.UserId
+), UserScores AS (
+    SELECT u.Id AS UserId,
+           (u.Reputation + COALESCE(a.AnswersCount,0) * 10 + COALESCE(q.QuestionsCount,0) * 5) AS Score
+    FROM Users u
+    LEFT JOIN UserActivity a ON a.UserId = u.Id
+    LEFT JOIN UserActivity q ON q.UserId = u.Id
+)
+SELECT 
+    u.UserId,
+    u.DisplayName,
+    u.QuestionsCount,
+    u.AnswersCount,
+    u.AvgQuestionScore,
+    u.AvgAnswerScore,
+    hs.EditCount,
+    hs.EditedPosts,
+    us.Score,
+    CASE WHEN us.Score > 1000 THEN TRUE ELSE FALSE END AS HighScoreFlag,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    STRING_AGG(DISTINCT c.UserDisplayName, ',') AS Commenters,
+    -- using window function to rank users by reputation
+    RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+FROM UserActivity u
+LEFT JOIN PostHistoryStats hs ON hs.UserId = u.UserId
+LEFT JOIN Users u2 ON u2.Id = u.UserId
+LEFT JOIN Comments c ON c.UserId = u.UserId
+LEFT JOIN UserScores us ON us.UserId = u.UserId
+LEFT JOIN Posts p ON p.OwnerUserId = u.UserId
+WHERE u.QuestionsCount > 0 OR u.AnswersCount > 0
+GROUP BY u.UserId, u.DisplayName, u.QuestionsCount, u.AnswersCount, u.AvgQuestionScore, u.AvgAnswerScore, hs.EditCount, hs.EditedPosts, us.Score
+ORDER BY us.Score DESC, u.UserId ASC;

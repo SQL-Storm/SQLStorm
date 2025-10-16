@@ -1,0 +1,135 @@
+WITH UserQuestions AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) AS QuestionCount,
+        AVG(p.Score) AS AvgQuestionScore,
+        u.Reputation
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    WHERE 
+        u.Reputation >= 1000
+    GROUP BY 
+        u.Id, u.DisplayName, u.Reputation
+),
+QuestionTags AS (
+    SELECT 
+        t.TagName,
+        COUNT(*) AS TagFreq
+    FROM 
+        Tags t
+    JOIN 
+        Posts p ON t.ExcerptPostId = p.Id
+    WHERE 
+        p.PostTypeId = 1
+    GROUP BY 
+        t.TagName
+),
+RecentHighScoreAnswers AS (
+    SELECT 
+        a.Id AS AnswerId,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate
+    FROM 
+        Posts a
+    WHERE 
+        a.PostTypeId = 2
+        AND a.Score > 10
+        AND a.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '180 day'
+),
+AnswerRelations AS (
+    SELECT 
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId AS AnswerOwnerUserId,
+        q.Title AS QuestionTitle,
+        a.Score
+    FROM 
+        Posts a
+    JOIN 
+        Posts q ON a.ParentId = q.Id
+    WHERE 
+        a.PostTypeId = 2
+        AND a.Score > 10
+),
+AnswerTags AS (
+    SELECT 
+        at.AnswerId,
+        t.TagName
+    FROM 
+        AnswerRelations at
+    LEFT JOIN 
+        Tags t ON t.ExcerptPostId = at.AnswerId
+),
+AnswerVoteCount AS (
+    SELECT 
+        v.PostId AS AnswerId,
+        COUNT(*) AS VoteCount
+    FROM 
+        Votes v
+    WHERE 
+        v.PostId IN (SELECT AnswerId FROM AnswerRelations)
+        AND v.VoteTypeId = 2
+    GROUP BY 
+        v.PostId
+),
+PopularQuestions AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.AnswerCount,
+        q.ViewCount,
+        q.Tags
+    FROM 
+        Posts q
+    WHERE 
+        q.PostTypeId = 1
+        AND q.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '365 day'
+        AND q.Score > 20
+),
+QuestionActivity AS (
+    SELECT 
+        q.Id AS QuestionId,
+        COUNT(c.Id) AS CommentCount,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM 
+        Posts q
+    LEFT JOIN 
+        Comments c ON c.PostId = q.Id
+    GROUP BY 
+        q.Id
+)
+SELECT 
+    u.UserId,
+    u.DisplayName,
+    u.QuestionCount,
+    u.AvgQuestionScore,
+    ARRAY_AGG(DISTINCT tt.TagName) AS TopTags,
+    COUNT(hr.AnswerId) FILTER (WHERE hr.Score > 10) AS HighScoreAnswers,
+    SUM(avc.VoteCount) AS TotalUpvotes,
+    pa.Title AS PopularQuestionTitle,
+    qa.CommentCount,
+    qa.LastCommentDate,
+    u.Reputation
+FROM 
+    UserQuestions u
+LEFT JOIN 
+    QuestionTags tt ON TRUE
+LEFT JOIN 
+    AnswerRelations hr ON u.UserId = hr.AnswerOwnerUserId
+LEFT JOIN 
+    AnswerVoteCount avc ON hr.AnswerId = avc.AnswerId
+LEFT JOIN 
+    PopularQuestions pa ON TRUE
+LEFT JOIN 
+    QuestionActivity qa ON pa.QuestionId = qa.QuestionId
+GROUP BY 
+    u.UserId, u.DisplayName, u.QuestionCount, u.AvgQuestionScore, pa.Title, qa.CommentCount, qa.LastCommentDate, u.Reputation
+ORDER BY 
+    TotalUpvotes DESC NULLS LAST, HighScoreAnswers DESC, u.Reputation DESC
+LIMIT 10;

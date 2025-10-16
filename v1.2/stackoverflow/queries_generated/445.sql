@@ -1,0 +1,219 @@
+-- {"query": "445.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1837} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level,
+        ARRAY[t.TagName] AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+
+    UNION ALL
+
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Level + 1,
+        r.Path || t2.TagName
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id <> r.Id AND t2.Count < r.Count
+    WHERE r.Level < 3
+),
+UserBadgeCounts AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COALESCE(SUM(b.Class),0) AS BadgeScore
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+PostActivity AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.ClosedDate,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RecentPostRank,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS TotalPostsByUser,
+        -- Extract first tag from Tags string (format: '<tag1><tag2><tag3>')
+        COALESCE(NULLIF(SUBSTRING(p.Tags FROM '<([^>]+)>'), ''), 'unknown') AS FirstTag
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+),
+TopPostsWithComments AS (
+    SELECT 
+        pa.PostId,
+        pa.PostTypeId,
+        pa.OwnerUserId,
+        pa.CreationDate,
+        pa.Score,
+        pa.ViewCount,
+        pa.Title,
+        pa.Tags,
+        pa.AcceptedAnswerId,
+        pa.ParentId,
+        pa.ClosedDate,
+        pa.LastActivityDate,
+        pa.RecentPostRank,
+        pa.TotalPostsByUser,
+        c.CommentCount,
+        c.MaxCommentScore,
+        c.LatestCommentDate,
+        u.DisplayName AS OwnerDisplayName,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.BadgeScore,
+        -- Calculate engagement score with a complex formula involving score, views, badges, comments, and recency
+        (
+            pa.Score * 3 
+            + LOG(GREATEST(pa.ViewCount,1)) * 2
+            + COALESCE(c.CommentCount,0) * 1.5
+            + COALESCE(ub.BadgeScore,0) * 2
+            - CASE WHEN pa.ClosedDate IS NOT NULL THEN 50 ELSE 0 END
+            + CASE WHEN pa.AcceptedAnswerId IS NOT NULL THEN 20 ELSE 0 END
+            + CASE WHEN pa.RecentPostRank = 1 THEN 10 ELSE 0 END
+            - EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - pa.CreationDate))/86400 * 0.1
+        ) AS EngagementScore
+    FROM PostActivity pa
+    LEFT JOIN (
+        SELECT 
+            PostId,
+            COUNT(*) AS CommentCount,
+            MAX(Score) AS MaxCommentScore,
+            MAX(CreationDate) AS LatestCommentDate
+        FROM Comments
+        GROUP BY PostId
+    ) c ON c.PostId = pa.PostId
+    LEFT JOIN Users u ON u.Id = pa.OwnerUserId
+    LEFT JOIN UserBadgeCounts ub ON ub.UserId = pa.OwnerUserId
+),
+AcceptedAnswerDetails AS (
+    SELECT 
+        p.Id AS AnswerId,
+        p.ParentId AS QuestionId,
+        p.Score AS AnswerScore,
+        p.CreationDate AS AnswerCreationDate,
+        u.DisplayName AS AnswerOwnerName,
+        ub.GoldBadges AS AnswerOwnerGoldBadges,
+        ub.SilverBadges AS AnswerOwnerSilverBadges,
+        ub.BronzeBadges AS AnswerOwnerBronzeBadges
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN UserBadgeCounts ub ON ub.UserId = p.OwnerUserId
+    WHERE p.PostTypeId = 2 -- Answers only
+),
+QuestionAnswerSummary AS (
+    SELECT 
+        q.PostId AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.OwnerDisplayName,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViewCount,
+        q.Tags,
+        q.EngagementScore,
+        a.AnswerId,
+        a.AnswerScore,
+        a.AnswerCreationDate,
+        a.AnswerOwnerName,
+        a.AnswerOwnerGoldBadges,
+        a.AnswerOwnerSilverBadges,
+        a.AnswerOwnerBronzeBadges,
+        -- Calculate time to accepted answer in hours, NULL if none
+        EXTRACT(EPOCH FROM (a.AnswerCreationDate - q.QuestionCreationDate))/3600 AS HoursToAcceptedAnswer
+    FROM TopPostsWithComments q
+    LEFT JOIN AcceptedAnswerDetails a ON a.AnswerId = q.AcceptedAnswerId
+    WHERE q.PostTypeId = 1 -- Questions only
+),
+DuplicateLinkCounts AS (
+    SELECT 
+        pl.PostId,
+        COUNT(*) FILTER (WHERE lt.Name = 'Duplicate') AS DuplicateCount,
+        COUNT(*) FILTER (WHERE lt.Name = 'Linked') AS LinkedCount
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    GROUP BY pl.PostId
+),
+FinalRanking AS (
+    SELECT 
+        qas.QuestionId,
+        qas.Title,
+        qas.OwnerUserId,
+        qas.OwnerDisplayName,
+        qas.QuestionCreationDate,
+        qas.QuestionScore,
+        qas.QuestionViewCount,
+        qas.Tags,
+        qas.EngagementScore,
+        qas.AnswerId,
+        qas.AnswerScore,
+        qas.AnswerCreationDate,
+        qas.AnswerOwnerName,
+        qas.AnswerOwnerGoldBadges,
+        qas.AnswerOwnerSilverBadges,
+        qas.AnswerOwnerBronzeBadges,
+        qas.HoursToAcceptedAnswer,
+        dl.DuplicateCount,
+        dl.LinkedCount,
+        -- Rank questions by engagement score and penalize duplicates heavily
+        RANK() OVER (ORDER BY (qas.EngagementScore - COALESCE(dl.DuplicateCount,0) * 30) DESC) AS EngagementRank,
+        -- Flag questions with no accepted answer and high duplicate count
+        CASE 
+            WHEN qas.AnswerId IS NULL AND COALESCE(dl.DuplicateCount,0) > 2 THEN 'High Risk'
+            WHEN qas.AnswerId IS NULL THEN 'No Accepted Answer'
+            ELSE 'Answered'
+        END AS Status
+    FROM QuestionAnswerSummary qas
+    LEFT JOIN DuplicateLinkCounts dl ON dl.PostId = qas.QuestionId
+)
+SELECT 
+    fr.EngagementRank,
+    fr.QuestionId,
+    fr.Title,
+    fr.OwnerDisplayName,
+    fr.QuestionCreationDate,
+    fr.QuestionScore,
+    fr.QuestionViewCount,
+    fr.Tags,
+    fr.EngagementScore,
+    fr.AnswerId,
+    fr.AnswerScore,
+    fr.AnswerCreationDate,
+    fr.AnswerOwnerName,
+    fr.AnswerOwnerGoldBadges,
+    fr.AnswerOwnerSilverBadges,
+    fr.AnswerOwnerBronzeBadges,
+    fr.HoursToAcceptedAnswer,
+    fr.DuplicateCount,
+    fr.LinkedCount,
+    fr.Status,
+    -- Example of string expression: concatenate top tags from recursive hierarchy for the first tag of question
+    (
+        SELECT STRING_AGG(DISTINCT rth.TagName, ' > ' ORDER BY rth.Level)
+        FROM RecursiveTagHierarchy rth
+        WHERE rth.TagName = SPLIT_PART(fr.Tags, '><', 1)
+    ) AS TagHierarchySample
+FROM FinalRanking fr
+WHERE fr.EngagementRank <= 50
+ORDER BY fr.EngagementRank;

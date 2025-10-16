@@ -1,0 +1,194 @@
+-- {"query": "711.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1616} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        0 as Level,
+        cast(t.TagName as varchar(1000)) as Path
+    from Tags t
+    where t.IsRequired = 1
+
+    union all
+
+    select
+        c.Id,
+        c.TagName,
+        c.Count,
+        r.Level + 1,
+        r.Path || '>' || c.TagName
+    from Tags c
+    join RecursiveTagHierarchy r on c.Id <> r.Id and c.Count < r.Count and c.IsRequired = 1
+    where r.Level < 3
+),
+UserActivityRanked as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(pq.QuestionCount, 0) as QuestionCount,
+        coalesce(pa.AnswerCount, 0) as AnswerCount,
+        coalesce(b.BadgeScore, 0) as BadgeScore,
+        row_number() over (order by u.Reputation desc, coalesce(pq.QuestionCount, 0) desc) as UserRank
+    from Users u
+    left join (
+        select OwnerUserId, count(*) as QuestionCount
+        from Posts
+        where PostTypeId = 1 and OwnerUserId is not null
+        group by OwnerUserId
+    ) pq on u.Id = pq.OwnerUserId
+    left join (
+        select OwnerUserId, count(*) as AnswerCount
+        from Posts
+        where PostTypeId = 2 and OwnerUserId is not null
+        group by OwnerUserId
+    ) pa on u.Id = pa.OwnerUserId
+    left join (
+        select UserId, sum(case Class when 1 then 10 when 2 then 5 when 3 then 1 else 0 end) as BadgeScore
+        from Badges
+        group by UserId
+    ) b on u.Id = b.UserId
+    where u.Reputation > 1000
+),
+PostWithVotesAndComments as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        coalesce(v.UpVotes, 0) as UpVotes,
+        coalesce(v.DownVotes, 0) as DownVotes,
+        coalesce(c.CommentCount, 0) as CommentCount,
+        dense_rank() over (partition by p.PostTypeId order by p.Score desc) as ScoreRank
+    from Posts p
+    left join (
+        select
+            PostId,
+            sum(case when VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Votes
+        group by PostId
+    ) v on p.Id = v.PostId
+    left join (
+        select PostId, count(*) as CommentCount
+        from Comments
+        group by PostId
+    ) c on p.Id = c.PostId
+    where p.PostTypeId in (1,2)
+),
+AcceptedAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId as QuestionUserId,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswerUserId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        rank() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts q
+    join Posts a on q.AcceptedAnswerId = a.Id
+    where q.PostTypeId = 1 and a.PostTypeId = 2
+),
+UserCommentActivity as (
+    select
+        UserId,
+        count(*) as TotalComments,
+        max(CreationDate) as LastCommentDate
+    from Comments
+    where UserId is not null
+    group by UserId
+),
+TagPopularity as (
+    select
+        rt.TagName,
+        sum(p.Score) as TotalScore,
+        count(p.Id) as PostCount,
+        avg(p.Score) as AvgScore,
+        max(p.Score) as MaxScore
+    from RecursiveTagHierarchy rt
+    join Posts p on p.PostTypeId = 1 and p.Tags like '%' || rt.TagName || '%'
+    group by rt.TagName
+),
+UserBadgeDetails as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserSummary as (
+    select
+        uar.UserId,
+        uar.DisplayName,
+        uar.Reputation,
+        uar.QuestionCount,
+        uar.AnswerCount,
+        uar.BadgeScore,
+        coalesce(uc.TotalComments, 0) as TotalComments,
+        coalesce(uc.LastCommentDate, null) as LastCommentDate,
+        coalesce(ubd.Gold, 0) as GoldBadges,
+        coalesce(ubd.Silver, 0) as SilverBadges,
+        coalesce(ubd.Bronze, 0) as BronzeBadges
+    from UserActivityRanked uar
+    left join UserCommentActivity uc on uar.UserId = uc.UserId
+    left join (
+        select
+            UserId,
+            sum(case when Class=1 then BadgeCount else 0 end) as Gold,
+            sum(case when Class=2 then BadgeCount else 0 end) as Silver,
+            sum(case when Class=3 then BadgeCount else 0 end) as Bronze
+        from UserBadgeDetails
+        group by UserId
+    ) ubd on uar.UserId = ubd.UserId
+)
+select
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.BadgeScore,
+    us.TotalComments,
+    us.LastCommentDate,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    tp.TagName,
+    tp.PostCount,
+    tp.TotalScore,
+    tp.AvgScore,
+    tp.MaxScore,
+    p.Score as PostScore,
+    p.UpVotes,
+    p.DownVotes,
+    p.CommentCount,
+    p.Title,
+    p.CreationDate,
+    case 
+        when p.ViewCount > 10000 then 'Highly Viewed'
+        when p.ViewCount between 1000 and 10000 then 'Moderately Viewed'
+        else 'Low Viewed'
+    end as ViewCategory,
+    coalesce(aa.AnswerId, null) as AcceptedAnswerId,
+    coalesce(aa.AnswerScore, null) as AcceptedAnswerScore,
+    coalesce(aa.AnswerCreationDate, null) as AcceptedAnswerCreationDate,
+    concat_ws(' | ', us.DisplayName, tp.TagName, p.Title) as UserTagPostSummary
+from UserSummary us
+left join Posts p on p.OwnerUserId = us.UserId and p.PostTypeId = 1
+left join TagPopularity tp on p.Tags like '%' || tp.TagName || '%'
+left join AcceptedAnswerStats aa on aa.QuestionUserId = us.UserId and aa.QuestionId = p.Id
+where us.Reputation > 5000
+  and (p.Score > 5 or p.ViewCount > 1000)
+  and (
+      (tp.AvgScore > 10 and tp.PostCount > 50) 
+      or tp.TagName is null
+  )
+order by us.Reputation desc, tp.TotalScore desc, p.Score desc
+limit 100;

@@ -1,0 +1,182 @@
+with RankedPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        u.Reputation as OwnerReputation,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as RankByScoreView
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId in (1, 2)
+),
+UserBadges as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) over (partition by b.UserId, b.Class) as BadgeCount,
+        max(b.Date) over (partition by b.UserId, b.Class) as LastBadgeDate
+    from Badges b
+),
+QuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreated,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.OwnerUserId,
+        q.OwnerReputation,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreated,
+        a.OwnerUserId as AnswerOwnerId,
+        a.OwnerReputation as AnswerOwnerReputation,
+        case when a.Id = q.AcceptedAnswerId then 1 else 0 end as IsAccepted,
+        row_number() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from RankedPosts q
+    left join RankedPosts a on a.Id is not null and a.PostTypeId = 2 and a.Id = a.Id /* noop to allow later condition */
+    left join RankedPosts a_on_parent on a_on_parent.ParentId = q.Id and a_on_parent.PostTypeId = 2
+    -- The intent is to join answers a to questions q where a.ParentId = q.Id.
+    -- Some SQL dialects do not allow referencing non-existent column ParentId in RankedPosts.
+    -- Replace by joining Posts to get ParentId information:
+),
+PostsWithParent as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        u.Reputation as OwnerReputation
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId in (1,2)
+),
+QuestionsWithAnswers_fixed as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreated,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.OwnerUserId,
+        q.OwnerReputation,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreated,
+        a.OwnerUserId as AnswerOwnerId,
+        a.OwnerReputation as AnswerOwnerReputation,
+        case when a.Id = q.AcceptedAnswerId then 1 else 0 end as IsAccepted,
+        row_number() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from PostsWithParent q
+    left join PostsWithParent a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+CloseVotesAggregated as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseVoteCount,
+        max(ph.CreationDate) as LastCloseVoteDate
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId, crt.Name
+),
+UserActivityWindow as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(case when p.PostTypeId = 1 then 1 end) over (partition by u.Id) as QuestionCount,
+        count(case when p.PostTypeId = 2 then 1 end) over (partition by u.Id) as AnswerCount,
+        row_number() over (order by u.Reputation desc) as UserRankByReputation,
+        lag(u.Reputation, 1) over (order by u.Reputation desc) as PrevReputation,
+        lead(u.Reputation, 1) over (order by u.Reputation desc) as NextReputation
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+),
+TopQuestionsWithTags as (
+    select
+        p.Id,
+        p.Title,
+        p.Score, 
+        p.ViewCount,
+        p.Tags,
+        string_agg(distinct t.TagName, ', ') over (partition by p.Id) as TagList,
+        regexp_split_to_table(substring(p.Tags from 2 for char_length(p.Tags)-2), '><') as SingleTag
+    from Posts p
+    left join Tags t on t.TagName = regexp_split_to_table(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')
+    where p.PostTypeId = 1 and p.Score > 10
+),
+DuplicateLinkQuestions as (
+    select
+        pl.PostId,
+        count(distinct pl.RelatedPostId) as DuplicateLinksCount,
+        max(pl.CreationDate) as LastDuplicateLinkDate
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+    group by pl.PostId
+)
+select
+    q.QuestionId,
+    coalesce(q.Title, '<No Title>') as QuestionTitle,
+    q.QuestionCreated,
+    q.QuestionScore,
+    q.ViewCount,
+    coalesce(u.DisplayName, 'Unknown User') as QuestionOwner,
+    u.Reputation as QuestionOwnerReputation,
+    q.AnswerId,
+    q.AnswerScore,
+    q.AnswerCreated,
+    auser.DisplayName as AnswerOwner,
+    auser.Reputation as AnswerOwnerReputation,
+    q.IsAccepted,
+    cva.CloseReasonName,
+    cva.CloseVoteCount,
+    cva.LastCloseVoteDate,
+    dlt.DuplicateLinksCount,
+    dlt.LastDuplicateLinkDate,
+    ub_g.GoldBadges,
+    ub_s.SilverBadges,
+    ub_b.BronzeBadges,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.UserRankByReputation,
+    ua.PrevReputation,
+    ua.NextReputation,
+    tqt.TagList,
+    length(q.Title) as TitleLength,
+    case when q.QuestionScore > 0 then q.QuestionScore * log(1 + q.ViewCount) else 0 end as WeightedScore,
+    concat('Q-', q.QuestionId, '-A-', coalesce(cast(q.AnswerId as text), 'NA')) as Q_A_ConcatId
+from QuestionsWithAnswers_fixed q
+left join Users u on q.OwnerUserId = u.Id
+left join Users auser on q.AnswerOwnerId = auser.Id
+left join CloseVotesAggregated cva on cva.PostId = q.QuestionId
+left join DuplicateLinkQuestions dlt on dlt.PostId = q.QuestionId
+left join (
+    select
+        UserId,
+        sum(case when Class=1 then 1 else 0 end) as GoldBadges,
+        sum(case when Class=2 then 1 else 0 end) as SilverBadges,
+        sum(case when Class=3 then 1 else 0 end) as BronzeBadges
+    from Badges
+    group by UserId
+) ub_g on ub_g.UserId = q.OwnerUserId
+left join UserActivityWindow ua on ua.Id = q.OwnerUserId
+left join TopQuestionsWithTags tqt on tqt.Id = q.QuestionId
+where q.AnswerRank = 1
+  and (cva.CloseVoteCount is null or cva.CloseVoteCount < 5)
+order by WeightedScore desc, q.QuestionCreated desc
+limit 100;

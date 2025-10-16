@@ -1,0 +1,309 @@
+with
+RecentPosts as (
+  select
+    p.id,
+    p.posttypeid,
+    p.parentid,
+    p.title,
+    p.owneruserid,
+    p.creationdate,
+    p.lastactivitydate,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.commentcount,
+    coalesce(p.tags, '') as raw_tags,
+    case when p.tags is null or p.tags = '' then array[]::text[] 
+         else string_to_array(substring(p.tags from 2 for char_length(p.tags)-2), '><')
+    end as tags_arr,
+    md5(coalesce(p.tags, '') || '|' || coalesce(p.title, '')) as tag_title_hash
+  from posts p
+  where p.creationdate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '365 days')
+    and p.posttypeid in (1,2)
+),
+PostEngagement as (
+  select
+    rp.id,
+    rp.posttypeid,
+    rp.parentid,
+    rp.title,
+    rp.owneruserid,
+    rp.creationdate,
+    rp.lastactivitydate,
+    rp.score,
+    rp.viewcount,
+    rp.answercount,
+    rp.commentcount,
+    rp.raw_tags,
+    rp.tags_arr,
+    rp.tag_title_hash,
+    coalesce(sum(case when v.votetypeid = 2 then 1 else 0 end),0) as upvotes,
+    coalesce(sum(case when v.votetypeid = 3 then 1 else 0 end),0) as downvotes,
+    coalesce(sum(case when v.votetypeid = 5 then 1 else 0 end),0) as favorites,
+    coalesce(sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end),0) as bounty_total,
+    coalesce(sum(
+      case
+        when v.votetypeid = 2 then
+          greatest(0.1, 1.0 - extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - v.creationdate)) / (86400.0 * 90.0))
+        else 0
+      end
+    ),0) as recency_weighted_upvotes
+  from RecentPosts rp
+  left join votes v on v.postid = rp.id
+  group by
+    rp.id, rp.posttypeid, rp.parentid, rp.title, rp.owneruserid,
+    rp.creationdate, rp.lastactivitydate, rp.score, rp.viewcount,
+    rp.answercount, rp.commentcount, rp.raw_tags, rp.tags_arr, rp.tag_title_hash
+),
+UserStats as (
+  select
+    u.id as userid,
+    u.displayname,
+    u.reputation,
+    u.creationdate as user_creation,
+    u.lastaccessdate,
+    coalesce(count(distinct b.id) filter (where b.class = 1),0) as gold_badges,
+    coalesce(count(distinct b.id) filter (where b.class = 2),0) as silver_badges,
+    coalesce(count(distinct b.id) filter (where b.class = 3),0) as bronze_badges,
+    coalesce(sum(case when p.posttypeid = 1 then 1 else 0 end),0) as questions_count,
+    coalesce(sum(case when p.posttypeid = 2 then 1 else 0 end),0) as answers_count,
+    greatest(coalesce(max(p.score) filter (where p.posttypeid in (1,2)),0), 0) as max_post_score,
+    coalesce(avg(p.score) filter (where p.posttypeid in (1,2)),0) as avg_post_score
+  from users u
+  left join badges b on b.userid = u.id
+  left join posts p on p.owneruserid = u.id
+  where u.creationdate <= cast('2024-10-01 12:34:56' as timestamp)
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.lastaccessdate
+),
+LinkClusters as (
+  select pl.postid as seed_post, pl.relatedpostid as linked_post, pl.linktypeid, 1 as depth
+  from postlinks pl
+  where pl.creationdate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '365 days')
+  union
+  select lc.seed_post, pl.relatedpostid, pl.linktypeid, lc.depth + 1
+  from postlinks pl
+  join (
+    select pl2.postid as postid, pl2.relatedpostid as relatedpostid, pl2.linktypeid as linktypeid, 1 as depth
+    from postlinks pl2
+    where pl2.creationdate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '365 days')
+    union all
+    select lc2.seed_post, pl3.relatedpostid, pl3.linktypeid, lc2.depth + 1
+    from postlinks pl3
+    join (
+      select pl4.postid as postid, pl4.relatedpostid as relatedpostid, pl4.linktypeid as linktypeid, 1 as depth
+      from postlinks pl4
+      where pl4.creationdate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '365 days')
+    ) lc2 on pl3.postid = lc2.relatedpostid
+    where lc2.depth < 4
+  ) lc on pl.postid = lc.relatedpostid
+  where lc.depth < 4
+),
+RankedPosts as (
+  select
+    pe.id,
+    pe.posttypeid,
+    pe.parentid,
+    pe.title,
+    pe.owneruserid,
+    pe.creationdate,
+    pe.lastactivitydate,
+    pe.score,
+    pe.viewcount,
+    pe.answercount,
+    pe.commentcount,
+    pe.raw_tags,
+    pe.tags_arr,
+    pe.tag_title_hash,
+    pe.upvotes,
+    pe.downvotes,
+    pe.favorites,
+    pe.bounty_total,
+    pe.recency_weighted_upvotes,
+    us.userid as owner_userid,
+    us.displayname as owner_name,
+    us.reputation as owner_rep,
+    us.gold_badges, us.silver_badges, us.bronze_badges,
+    coalesce(lc_cnt.link_count,0) as recent_link_count,
+    (
+      coalesce(pe.score,0) * 3.0
+      + coalesce(pe.upvotes,0) * 2.0
+      - coalesce(pe.downvotes,0) * 1.5
+      + coalesce(pe.recency_weighted_upvotes,0) * 4.0
+      + ln(1 + greatest(coalesce(pe.viewcount,0),0)) * 1.2
+      + least(1000, coalesce(us.reputation,0)) / 100.0
+      + coalesce(pe.bounty_total,0) * 0.5
+      + coalesce(us.gold_badges,0) * 2
+      - coalesce(us.bronze_badges,0) * 0.2
+    ) as composite_score,
+    row_number() over (partition by pe.posttypeid order by
+      (
+        coalesce(pe.score,0) * 3.0
+        + coalesce(pe.upvotes,0) * 2.0
+        - coalesce(pe.downvotes,0) * 1.5
+        + coalesce(pe.recency_weighted_upvotes,0) * 4.0
+        + ln(1 + greatest(coalesce(pe.viewcount,0),0)) * 1.2
+        + least(1000, coalesce(us.reputation,0)) / 100.0
+      ) desc
+    ) as rank_within_type
+  from PostEngagement pe
+  left join UserStats us on us.userid = pe.owneruserid
+  left join (
+    select seed_post, count(distinct linked_post) as link_count
+    from LinkClusters
+    group by seed_post
+  ) lc_cnt on lc_cnt.seed_post = pe.id
+  group by
+    pe.id, pe.posttypeid, pe.parentid, pe.title, pe.owneruserid,
+    pe.creationdate, pe.lastactivitydate, pe.score, pe.viewcount,
+    pe.answercount, pe.commentcount, pe.raw_tags, pe.tags_arr, pe.tag_title_hash,
+    pe.upvotes, pe.downvotes, pe.favorites, pe.bounty_total, pe.recency_weighted_upvotes,
+    us.userid, us.displayname, us.reputation, us.gold_badges, us.silver_badges, us.bronze_badges,
+    lc_cnt.link_count
+),
+FilteredCandidates as (
+  select *
+  from RankedPosts
+  where (rank_within_type <= 200)
+     or (composite_score >= (
+         select percentile_cont(0.90) within group (order by composite_score) from RankedPosts
+     ))
+     or (tags_arr && array['performance','sql','postgresql','joins','window-functions'])
+     or (title ilike '%performance%' or coalesce(raw_tags,'') ilike '%sql%')
+),
+AnswersWithParents as (
+  select
+    fc.id,
+    fc.posttypeid,
+    fc.parentid,
+    fc.title,
+    fc.owneruserid,
+    fc.creationdate,
+    fc.lastactivitydate,
+    fc.score,
+    fc.viewcount,
+    fc.answercount,
+    fc.commentcount,
+    fc.raw_tags,
+    fc.tags_arr,
+    fc.tag_title_hash,
+    fc.upvotes,
+    fc.downvotes,
+    fc.favorites,
+    fc.bounty_total,
+    fc.recency_weighted_upvotes,
+    fc.owner_userid,
+    fc.owner_name,
+    fc.owner_rep,
+    fc.gold_badges,
+    fc.silver_badges,
+    fc.bronze_badges,
+    fc.recent_link_count,
+    fc.composite_score,
+    fc.rank_within_type,
+    q.id as question_id,
+    q.title as question_title,
+    q.owneruserid as question_owner,
+    q.answercount as question_answercount,
+    q.viewcount as question_views,
+    case when exists (
+      select 1 from posts pp where pp.id = q.acceptedanswerid and pp.id = fc.id
+    ) then true else false end as is_accepted_of_parent,
+    greatest(0, extract(epoch from (fc.creationdate - q.creationdate)) / 86400.0) as days_after_question,
+    (select count(*) from posts a where a.parentid = q.id and a.id != fc.id and a.posttypeid = 2) as competing_answers_count,
+    (select coalesce(avg(a.score),0) from posts a where a.parentid = q.id and a.id != fc.id and a.posttypeid = 2) as competing_answers_avg_score
+  from FilteredCandidates fc
+  left join posts q on q.id = fc.parentid and q.posttypeid = 1
+  where fc.posttypeid = 2
+  group by
+    fc.id, fc.posttypeid, fc.parentid, fc.title, fc.owneruserid, fc.creationdate, fc.lastactivitydate,
+    fc.score, fc.viewcount, fc.answercount, fc.commentcount, fc.raw_tags, fc.tags_arr, fc.tag_title_hash,
+    fc.upvotes, fc.downvotes, fc.favorites, fc.bounty_total, fc.recency_weighted_upvotes,
+    fc.owner_userid, fc.owner_name, fc.owner_rep, fc.gold_badges, fc.silver_badges, fc.bronze_badges,
+    fc.recent_link_count, fc.composite_score, fc.rank_within_type,
+    q.id, q.title, q.owneruserid, q.answercount, q.viewcount, q.acceptedanswerid
+),
+Combined as (
+  select * from FilteredCandidates where posttypeid = 1
+  union all
+  select * from AnswersWithParents
+),
+TagExplode as (
+  select
+    c.*,
+    t.tag as tag
+  from Combined c
+  left join lateral (
+    select unnest(coalesce(c.tags_arr, array[]::text[])) as tag
+  ) t on true
+),
+TagMetrics as (
+  select
+    te.tag,
+    count(distinct te.id) as posts_with_tag,
+    avg(te.composite_score) as avg_composite_score,
+    max(te.composite_score) as max_composite_score,
+    percentile_disc(0.5) within group (order by te.composite_score) as median_composite_score
+  from TagExplode te
+  group by te.tag
+),
+FinalSet as (
+  select
+    te.id,
+    te.posttypeid,
+    te.title,
+    te.owneruserid,
+    te.owner_name,
+    te.owner_rep,
+    te.creationdate,
+    te.lastactivitydate,
+    te.score,
+    te.viewcount,
+    te.upvotes,
+    te.downvotes,
+    te.recency_weighted_upvotes,
+    te.bounty_total,
+    te.composite_score,
+    te.rank_within_type,
+    coalesce(te.tags_arr, array[]::text[]) as tags_arr,
+    coalesce(te.tag, '(untagged)') as single_tag,
+    tm.posts_with_tag,
+    tm.avg_composite_score as tag_avg_score,
+    (
+      (te.composite_score > coalesce(tm.avg_composite_score,0) * 1.2)
+      and (te.viewcount > greatest(10, coalesce(te.answercount,0) * 5))
+      and (coalesce(te.upvotes,0) >= coalesce(te.downvotes,0))
+      and (te.owner_rep is null or te.owner_rep > 50)
+    ) as is_high_quality_candidate,
+    left(
+      coalesce(te.title,
+               (case when te.posttypeid = 2 then 'Answer to: ' || coalesce(te.question_title,'(unknown)') else '(no title)' end)
+      ) || ' [' || coalesce(te.single_tag,'') || ']', 240
+    ) as teaser,
+    exists (
+      select 1 from LinkClusters lc where lc.seed_post = te.id
+    ) as has_recent_links
+  from TagExplode te
+  left join TagMetrics tm on tm.tag = te.tag
+  group by
+    te.id, te.posttypeid, te.title, te.owneruserid, te.owner_name, te.owner_rep,
+    te.creationdate, te.lastactivitydate, te.score, te.viewcount, te.upvotes, te.downvotes,
+    te.recency_weighted_upvotes, te.bounty_total, te.composite_score, te.rank_within_type,
+    te.tags_arr, te.tag, tm.posts_with_tag, tm.avg_composite_score
+)
+select *
+from (
+  select * from FinalSet
+  where is_high_quality_candidate = true
+  order by composite_score desc
+  limit 500
+) highq
+
+union all
+
+select *
+from (
+  select * from FinalSet
+  where random() < 0.005
+  order by random()
+  limit 200
+) rand_sample;

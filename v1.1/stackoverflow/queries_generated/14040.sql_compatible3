@@ -1,0 +1,165 @@
+WITH cte AS (
+  SELECT 
+    p.Id, 
+    p.PostTypeId, 
+    p.OwnerUserId, 
+    p.CreationDate, 
+    p.Score, 
+    p.AnswerCount, 
+    p.CommentCount, 
+    p.FavoriteCount, 
+    p.ClosedDate, 
+    p.CommunityOwnedDate, 
+    CASE WHEN p.ClosedDate IS NOT NULL THEN cl.Name ELSE NULL END AS CloseReason,
+    CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned' ELSE NULL END AS CommunityOwned,
+    CASE WHEN p.ParentId IS NOT NULL THEN (
+      SELECT p2.Score 
+      FROM Posts p2 
+      WHERE p2.Id = p.ParentId
+    ) ELSE NULL END AS ParentPostScore,
+    CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN (
+      SELECT p3.Score 
+      FROM Posts p3 
+      WHERE p3.Id = p.AcceptedAnswerId
+    ) ELSE NULL END AS AcceptedAnswerScore,
+    CASE WHEN p.PostTypeId = 2 THEN (
+      SELECT COUNT(*) 
+      FROM Comments c
+      WHERE c.PostId = p.Id
+    ) ELSE NULL END AS ChildCommentCount,
+    CASE WHEN p.PostTypeId = 2 THEN (
+      SELECT COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END),0) - COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END),0)
+      FROM Votes v
+      WHERE v.PostId = p.Id
+    ) ELSE NULL END AS ChildPostScore,
+    CASE WHEN p.PostTypeId = 1 THEN (
+      SELECT COUNT(*)
+      FROM Posts p4
+      WHERE p4.ParentId = p.Id AND p4.PostTypeId = 2
+    ) ELSE NULL END AS AnswerCount,
+    CASE WHEN p.PostTypeId = 1 THEN (
+      SELECT COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END),0) - COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END),0)
+      FROM Votes v
+      WHERE v.PostId = p.Id
+    ) ELSE NULL END AS QuestionScore,
+    CASE WHEN p.PostTypeId = 1 THEN (
+      SELECT COUNT(*)
+      FROM Votes v
+      WHERE v.PostId = p.Id AND v.VoteTypeId = 5
+    ) ELSE NULL END AS FavoriteCount,
+    CASE WHEN p.PostTypeId = 1 THEN (
+      SELECT COUNT(*)
+      FROM Votes v
+      WHERE v.PostId = p.Id AND v.VoteTypeId = 6
+    ) ELSE NULL END AS CloseVoteCount,
+    CASE WHEN p.PostTypeId = 1 THEN (
+      SELECT COUNT(*)
+      FROM Votes v
+      WHERE v.PostId = p.Id AND v.VoteTypeId = 7
+    ) ELSE NULL END AS ReopenVoteCount,
+    CASE WHEN p.PostTypeId = 1 THEN (
+      SELECT COUNT(*)
+      FROM Votes v
+      WHERE v.PostId = p.Id AND v.VoteTypeId = 10
+    ) ELSE NULL END AS DeletionVoteCount,
+    CASE WHEN p.PostTypeId = 1 THEN (
+      SELECT COUNT(*)
+      FROM Votes v
+      WHERE v.PostId = p.Id AND v.VoteTypeId = 11
+    ) ELSE NULL END AS UndeletionVoteCount,
+    CASE WHEN p.PostTypeId = 1 THEN (
+      SELECT COUNT(*)
+      FROM Votes v
+      WHERE v.PostId = p.Id AND v.VoteTypeId = 12
+    ) ELSE NULL END AS SpamVoteCount,
+    CASE WHEN p.PostTypeId = 1 THEN (
+      SELECT COUNT(*)
+      FROM Votes v
+      WHERE v.PostId = p.Id AND v.VoteTypeId = 14
+    ) ELSE NULL END AS ModeratorNominationCount,
+    CASE WHEN p.PostTypeId = 1 THEN (
+      SELECT COUNT(*)
+      FROM Votes v
+      WHERE v.PostId = p.Id AND v.VoteTypeId = 15
+    ) ELSE NULL END AS ModeratorReviewCount,
+    CASE WHEN p.PostTypeId = 1 THEN (
+      SELECT COUNT(*)
+      FROM PostHistory ph2
+      WHERE ph2.PostId = p.Id AND ph2.PostHistoryTypeId IN (10, 11, 19, 20)
+    ) ELSE NULL END AS ClosedReopenedCount,
+    CASE WHEN p.PostTypeId = 1 THEN (
+      SELECT COUNT(*)
+      FROM PostHistory ph3
+      WHERE ph3.PostId = p.Id AND ph3.PostHistoryTypeId IN (12, 13)
+    ) ELSE NULL END AS DeletedUndeletedCount,
+    CASE WHEN p.PostTypeId = 1 THEN (
+      SELECT COUNT(*)
+      FROM PostHistory ph4
+      WHERE ph4.PostId = p.Id AND ph4.PostHistoryTypeId IN (14, 15)
+    ) ELSE NULL END AS LockedUnlockedCount,
+    CASE WHEN p.PostTypeId = 1 THEN (
+      SELECT COUNT(*)
+      FROM PostHistory ph5
+      WHERE ph5.PostId = p.Id AND ph5.PostHistoryTypeId IN (16, 17, 18, 22)
+    ) ELSE NULL END AS CommunityModifiedCount
+  FROM Posts p
+  LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 10
+  LEFT JOIN CloseReasonTypes cl ON p.ClosedDate IS NOT NULL AND cl.Id = CASE WHEN ph.Comment ~ '^[0-9]+$' THEN CAST(ph.Comment AS INTEGER) ELSE NULL END
+)
+SELECT
+  Id,
+  PostTypeId,
+  OwnerUserId,
+  CreationDate,
+  Score,
+  AnswerCount,
+  CommentCount,
+  FavoriteCount,
+  COALESCE(CloseReason, CommunityOwned) AS CloseReason,
+  ParentPostScore,
+  AcceptedAnswerScore,
+  ChildCommentCount,
+  ChildPostScore,
+  AnswerCount AS QuestionAnswerCount,
+  QuestionScore,
+  FavoriteCount AS QuestionFavoriteCount,
+  CloseVoteCount,
+  ReopenVoteCount,
+  DeletionVoteCount,
+  UndeletionVoteCount,
+  SpamVoteCount,
+  ModeratorNominationCount,
+  ModeratorReviewCount,
+  ClosedReopenedCount,
+  DeletedUndeletedCount,
+  LockedUnlockedCount,
+  CommunityModifiedCount
+FROM cte
+GROUP BY
+  Id,
+  PostTypeId,
+  OwnerUserId,
+  CreationDate,
+  Score,
+  AnswerCount,
+  CommentCount,
+  FavoriteCount,
+  CloseReason,
+  CommunityOwned,
+  ParentPostScore,
+  AcceptedAnswerScore,
+  ChildCommentCount,
+  ChildPostScore,
+  QuestionScore,
+  CloseVoteCount,
+  ReopenVoteCount,
+  DeletionVoteCount,
+  UndeletionVoteCount,
+  SpamVoteCount,
+  ModeratorNominationCount,
+  ModeratorReviewCount,
+  ClosedReopenedCount,
+  DeletedUndeletedCount,
+  LockedUnlockedCount,
+  CommunityModifiedCount,
+  COALESCE(CloseReason, CommunityOwned);

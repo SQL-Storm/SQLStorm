@@ -1,0 +1,223 @@
+-- {"query": "29010.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2241} 
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        LEAD(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as next_score,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as avg_score,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) as post_count
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as TotalAnswerScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) as AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) as AvgAnswerScore,
+        MAX(CASE WHEN p.PostTypeId = 1 THEN p.Score END) as MaxQuestionScore,
+        MAX(CASE WHEN p.PostTypeId = 2 THEN p.Score END) as MaxAnswerScore,
+        STRING_AGG(DISTINCT p.Tags, ' | ') as AllTags,
+        STRING_AGG(DISTINCT b.Name, ', ') as Badges,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) as UpvotesReceived,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) as DownvotesReceived
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        rp.Id as PostId,
+        rp.PostTypeId,
+        rp.Score,
+        rp.ViewCount,
+        rp.CreationDate,
+        rp.OwnerUserId,
+        rp.Title,
+        rp.Tags,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.LastActivityDate,
+        rp.rn,
+        rp.prev_score,
+        rp.next_score,
+        rp.avg_score,
+        rp.post_count,
+        CASE 
+            WHEN rp.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'High'
+            WHEN rp.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Low'
+            ELSE 'Average'
+        END as ScoreCategory,
+        CASE 
+            WHEN rp.Score > 100 THEN 'HighlyVoted'
+            WHEN rp.Score > 50 THEN 'ModeratelyVoted'
+            WHEN rp.Score > 10 THEN 'SlightlyVoted'
+            ELSE 'Unpopular'
+        END as PopularityLevel,
+        CASE 
+            WHEN rp.Tags IS NOT NULL AND rp.Tags != '' THEN 
+                ARRAY_LENGTH(STRING_TO_ARRAY(rp.Tags, '>'), 1) - 1
+            ELSE 0 
+        END as TagCount,
+        CASE WHEN rp.AnswerCount > 0 THEN 
+            CAST(rp.AnswerCount AS FLOAT) / CAST(NULLIF(rp.Score, 0) AS FLOAT) 
+        ELSE NULL END as AnswerRatio,
+        CASE WHEN rp.ViewCount > 0 THEN 
+            CAST(rp.CommentCount AS FLOAT) / CAST(NULLIF(rp.ViewCount, 0) AS FLOAT) 
+        ELSE NULL END as CommentRatio,
+        DATEDIFF('day', rp.CreationDate, rp.LastActivityDate) as DaysSinceLastActivity,
+        DATEDIFF('day', rp.CreationDate, CURRENT_TIMESTAMP) as AgeInDays,
+        (rp.Score - COALESCE(rp.prev_score, 0)) as ScoreChange,
+        (rp.Score - COALESCE(rp.avg_score, 0)) as ScoreDeviationFromAvg
+    FROM RankedPosts rp
+    WHERE rp.rn <= 5
+),
+TagFrequency AS (
+    SELECT 
+        T.tagname,
+        COUNT(*) as frequency,
+        AVG(COUNT(*)) OVER () as avg_frequency,
+        MAX(COUNT(*)) OVER () as max_frequency,
+        STRING_AGG(p.Id::VARCHAR, ', ') as post_ids
+    FROM Posts p
+    CROSS JOIN UNNEST(STRING_TO_ARRAY(
+        CASE 
+            WHEN p.Tags IS NULL OR p.Tags = '' THEN ''
+            ELSE SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2)
+        END, '><')) AS T(tagname)
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    GROUP BY T.tagname
+)
+SELECT 
+    pa.PostId,
+    pa.PostTypeId,
+    pa.Score,
+    pa.ViewCount,
+    pa.CreationDate,
+    pa.OwnerUserId,
+    pa.Title,
+    pa.Tags,
+    pa.AnswerCount,
+    pa.CommentCount,
+    pa.FavoriteCount,
+    pa.LastActivityDate,
+    pa.rn,
+    pa.prev_score,
+    pa.next_score,
+    pa.avg_score,
+    pa.post_count,
+    pa.ScoreCategory,
+    pa.PopularityLevel,
+    pa.TagCount,
+    pa.AnswerRatio,
+    pa.CommentRatio,
+    pa.DaysSinceLastActivity,
+    pa.AgeInDays,
+    pa.ScoreChange,
+    pa.ScoreDeviationFromAvg,
+    us.Reputation,
+    us.Views,
+    us.UpVotes,
+    us.DownVotes,
+    us.TotalPosts,
+    us.Questions,
+    us.Answers,
+    us.TotalQuestionScore,
+    us.TotalAnswerScore,
+    us.AvgQuestionScore,
+    us.AvgAnswerScore,
+    us.MaxQuestionScore,
+    us.MaxAnswerScore,
+    us.AllTags,
+    us.Badges,
+    us.UpvotesReceived,
+    us.DownvotesReceived,
+    tf.frequency,
+    tf.avg_frequency,
+    tf.max_frequency,
+    CASE 
+        WHEN tf.frequency > tf.avg_frequency * 1.5 THEN 'HighlyPopular'
+        WHEN tf.frequency > tf.avg_frequency THEN 'Popular'
+        WHEN tf.frequency > tf.avg_frequency * 0.5 THEN 'Moderate'
+        ELSE 'Rare'
+    END as TagPopularity,
+    CASE 
+        WHEN tf.frequency = tf.max_frequency THEN 'MostPopularTag'
+        WHEN tf.frequency > tf.avg_frequency * 1.2 THEN 'VeryPopularTag'
+        WHEN tf.frequency > tf.avg_frequency THEN 'PopularTag'
+        ELSE 'CommonTag'
+    END as TagRanking,
+    CASE 
+        WHEN pa.Score > (SELECT PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY Score) FROM Posts WHERE PostTypeId = 1) THEN 'Top5Percent'
+        WHEN pa.Score > (SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY Score) FROM Posts WHERE PostTypeId = 1) THEN 'Top25Percent'
+        WHEN pa.Score > (SELECT PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY Score) FROM Posts WHERE PostTypeId = 1) THEN 'Bottom75Percent'
+        ELSE 'Bottom25Percent'
+    END as ScorePercentile,
+    CASE 
+        WHEN pa.Score / NULLIF(pa.ViewCount, 0) > 0.1 THEN 'HighEngagement'
+        WHEN pa.Score / NULLIF(pa.ViewCount, 0) > 0.05 THEN 'ModerateEngagement'
+        WHEN pa.Score / NULLIF(pa.ViewCount, 0) > 0.01 THEN 'LowEngagement'
+        ELSE 'MinimalEngagement'
+    END as EngagementLevel,
+    COALESCE(pa.ScoreChange, 0) + COALESCE(pa.ScoreDeviationFromAvg, 0) as CombinedMetric,
+    CASE 
+        WHEN pa.Score > 0 AND pa.ViewCount > 100 THEN 
+            CASE 
+                WHEN pa.CommentRatio > 0.05 THEN 'EngagedWithComments'
+                WHEN pa.AnswerRatio > 0.1 THEN 'EngagedWithAnswers'
+                ELSE 'GenerallyEngaged'
+            END
+        WHEN pa.Score > 0 THEN 'EngagedOverall'
+        ELSE 'LowActivity'
+    END as ActivityStatus,
+    NULLIF(pa.Score / NULLIF(pa.FavoriteCount, 0), 0) as ScorePerFavorite,
+    NULLIF(pa.Score / NULLIF(us.UpVotes, 0), 0) as ScorePerUpvote,
+    CASE WHEN pa.Score > 100 THEN 'HighImpact' ELSE 'NormalImpact' END as ImpactCategory,
+    CASE 
+        WHEN pa.DaysSinceLastActivity < 30 THEN 'RecentlyActive'
+        WHEN pa.DaysSinceLastActivity < 90 THEN 'ModeratelyActive'
+        WHEN pa.DaysSinceLastActivity < 365 THEN 'OccasionallyActive'
+        ELSE 'Inactive'
+    END as ActivityStatusLongTerm
+FROM PostAnalysis pa
+INNER JOIN UserStats us ON pa.OwnerUserId = us.UserId
+LEFT JOIN TagFrequency tf ON EXISTS (
+    SELECT 1 FROM UNNEST(STRING_TO_ARRAY(
+        CASE 
+            WHEN pa.Tags IS NULL OR pa.Tags = '' THEN ''
+            ELSE SUBSTRING(pa.Tags, 2, LENGTH(pa.Tags) - 2)
+        END, '><')) AS tag
+    WHERE tag = tf.tagname
+)
+WHERE (pa.Score IS NOT NULL OR pa.ViewCount IS NOT NULL OR pa.CommentCount IS NOT NULL)
+AND (pa.PostTypeId = 1 OR pa.PostTypeId = 2)
+AND pa.AnswerCount IS NOT NULL
+AND pa.CommentCount >= 0
+AND pa.FavoriteCount >= 0
+AND pa.rn IS NOT NULL
+AND us.Reputation > 100
+ORDER BY pa.LastActivityDate DESC, pa.Score DESC, pa.ViewCount DESC
+LIMIT 1000;

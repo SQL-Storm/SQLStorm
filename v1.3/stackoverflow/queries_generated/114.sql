@@ -1,0 +1,184 @@
+-- {"query": "114.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 1951} 
+WITH
+-- explode tags from question posts
+QuestionTags AS (
+  SELECT
+    p.Id AS QuestionId,
+    p.OwnerUserId AS OwnerUserId,
+    lower(trim(t.tag)) AS Tag
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tag
+  ) t
+  WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+
+-- answers with join to their question and compute response time in seconds
+Answers AS (
+  SELECT
+    a.Id AS AnswerId,
+    a.ParentId AS QuestionId,
+    a.OwnerUserId AS AnswererId,
+    a.CreationDate AS AnswerCreated,
+    q.CreationDate AS QuestionCreated,
+    EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) AS ResponseSeconds,
+    a.Score AS AnswerScore,
+    CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END AS IsAccepted,
+    q.Tags
+  FROM Posts a
+  LEFT JOIN Posts q ON a.ParentId = q.Id AND q.PostTypeId = 1
+  WHERE a.PostTypeId = 2
+),
+
+-- per-user aggregated answer metrics
+UserAnswerAgg AS (
+  SELECT
+    coalesce(u.Id, -1) AS UserId,
+    coalesce(u.DisplayName, '(unknown)') AS DisplayName,
+    count(a.AnswerId) FILTER (WHERE a.AnswerId IS NOT NULL) AS AnswerCount,
+    sum(a.IsAccepted) AS AcceptedAnswers,
+    avg(a.AnswerScore) FILTER (WHERE a.AnswerScore IS NOT NULL) AS AvgAnswerScore,
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY a.ResponseSeconds) FILTER (WHERE a.ResponseSeconds IS NOT NULL) AS MedianResponseSeconds,
+    -- weighted score: more recent answers get higher weight (exponential decay)
+    sum(a.AnswerScore * exp(-greatest(0, EXTRACT(EPOCH FROM (now() - a.AnswerCreated)) / 86400.0 / 180.0))) AS RecencyWeightedScore,
+    jsonb_agg(DISTINCT lower(trim(tag))) FILTER (WHERE tag IS NOT NULL) AS TagList
+  FROM Users u
+  LEFT JOIN Answers a ON a.AnswererId = u.Id
+  LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(coalesce(a.Tags,''), '><')) AS tag
+  ) lt ON true
+  GROUP BY u.Id, u.DisplayName
+),
+
+-- tag popularity per user (how many answers a user gave to questions with each tag)
+UserTagCounts AS (
+  SELECT
+    ua.UserId,
+    tag.tag_clean AS Tag,
+    count(*) AS AnswersOnTag
+  FROM Answers a
+  JOIN LATERAL (
+    SELECT unnest(string_to_array(coalesce(a.Tags,''), '><')) AS raw_tag
+  ) raw ON true
+  CROSS JOIN LATERAL (SELECT lower(trim(raw.raw_tag)) AS tag_clean) tag
+  JOIN Users u ON u.Id = a.AnswererId
+  JOIN UserAnswerAgg ua ON ua.UserId = u.Id
+  WHERE tag.tag_clean <> ''
+  GROUP BY ua.UserId, tag.tag_clean
+),
+
+-- pick top 3 tags per user by answer count, with ties resolved by tag name
+TopTagsPerUser AS (
+  SELECT
+    utc.UserId,
+    utc.Tag,
+    utc.AnswersOnTag,
+    row_number() OVER (PARTITION BY utc.UserId ORDER BY utc.AnswersOnTag DESC, utc.Tag) AS rn
+  FROM UserTagCounts utc
+),
+
+-- consolidate top tags into a single string per user
+UserTopTags AS (
+  SELECT
+    UserId,
+    string_agg(Tag || ':' || AnswersOnTag, ', ' ORDER BY AnswersOnTag DESC, Tag) AS TopTagsSummary
+  FROM TopTagsPerUser
+  WHERE rn <= 3
+  GROUP BY UserId
+),
+
+-- compute badge influence: gold=3, silver=2, bronze=1 weights, tag-based badges boost tag affinity
+BadgeWeights AS (
+  SELECT
+    b.UserId,
+    sum(
+      CASE
+        WHEN b.Class = 1 THEN 3
+        WHEN b.Class = 2 THEN 2
+        WHEN b.Class = 3 THEN 1
+        ELSE 0
+      END
+    ) AS RawBadgePoints,
+    sum(
+      CASE WHEN b.TagBased = cast(1 as bit) THEN 0.5 ELSE 0 END
+    ) AS TagBadgeBonusCount
+  FROM Badges b
+  GROUP BY b.UserId
+),
+
+-- combine everything, compute composite score and enrich with window functions
+UserComposite AS (
+  SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.AnswerCount,
+    ua.AcceptedAnswers,
+    ua.AvgAnswerScore,
+    ua.MedianResponseSeconds,
+    ua.RecencyWeightedScore,
+    coalesce(bw.RawBadgePoints,0) AS BadgePoints,
+    coalesce(bw.TagBadgeBonusCount,0) AS TagBadgeBonusCount,
+    coalesce(utt.TopTagsSummary, '(none)') AS TopTagsSummary,
+    -- composite score using z-like normalization approximated by dividing by (1+log)
+    (coalesce(ua.RecencyWeightedScore,0) * 1.2
+     + coalesce(ua.AnswerCount,0) * 0.5
+     + coalesce(ua.AcceptedAnswers,0) * 5
+     + coalesce(ua.AvgAnswerScore,0) * 2
+     + coalesce(bw.RawBadgePoints,0) * 1.5
+     - coalesce(ua.MedianResponseSeconds, 86400) / 3600.0 * 0.1
+    ) AS CompositeRawScore
+  FROM UserAnswerAgg ua
+  LEFT JOIN BadgeWeights bw ON bw.UserId = ua.UserId
+  LEFT JOIN UserTopTags utt ON utt.UserId = ua.UserId
+),
+
+-- rank users and compute percentile and dense_rank with ties
+RankedUsers AS (
+  SELECT
+    uc.*,
+    dense_rank() OVER (ORDER BY CompositeRawScore DESC NULLS LAST) AS DenseRank,
+    ntile(100) OVER (ORDER BY CompositeRawScore DESC NULLS LAST) AS PercentileBucket,
+    rank() OVER (ORDER BY CompositeRawScore DESC NULLS LAST) AS RankPosition
+  FROM UserComposite uc
+)
+
+-- final selection: top 50 users plus a small sample union of mid-range users to increase variety
+SELECT
+  r.UserId,
+  r.DisplayName,
+  r.AnswerCount,
+  r.AcceptedAnswers,
+  round(r.AvgAnswerScore::numeric,2) AS AvgAnswerScore,
+  round(r.MedianResponseSeconds::numeric,2) AS MedianResponseSeconds,
+  round(r.RecencyWeightedScore::numeric,2) AS RecencyWeightedScore,
+  round(r.BadgePoints::numeric,2) AS BadgePoints,
+  r.TagBadgeBonusCount,
+  r.TopTagsSummary,
+  round(r.CompositeRawScore::numeric,2) AS CompositeScore,
+  r.DenseRank,
+  r.PercentileBucket,
+  r.RankPosition
+FROM RankedUsers r
+WHERE r.RankPosition <= 50
+
+UNION
+
+SELECT
+  r.UserId,
+  r.DisplayName,
+  r.AnswerCount,
+  r.AcceptedAnswers,
+  round(r.AvgAnswerScore::numeric,2),
+  round(r.MedianResponseSeconds::numeric,2),
+  round(r.RecencyWeightedScore::numeric,2),
+  round(r.BadgePoints::numeric,2),
+  r.TagBadgeBonusCount,
+  r.TopTagsSummary,
+  round(r.CompositeRawScore::numeric,2),
+  r.DenseRank,
+  r.PercentileBucket,
+  r.RankPosition
+FROM RankedUsers r
+WHERE r.PercentileBucket BETWEEN 40 AND 60
+ORDER BY CompositeScore DESC NULLS LAST, RankPosition
+LIMIT 100;

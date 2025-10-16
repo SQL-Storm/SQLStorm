@@ -1,0 +1,214 @@
+WITH
+PostTagExploded AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    COALESCE(p.OwnerUserId, -1) AS OwnerUserId,
+    NULLIF(p.Tags, '') AS RawTags,
+    CASE
+      WHEN p.Tags IS NULL THEN ARRAY[]::text[]
+      ELSE regexp_split_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')
+    END AS TagArray
+  FROM Posts p
+),
+ExplodedTags AS (
+  SELECT
+    pte.PostId,
+    pte.PostTypeId,
+    pte.Title,
+    pte.CreationDate,
+    pte.Score,
+    pte.OwnerUserId,
+    t.TagName,
+    t.TagOrd
+  FROM PostTagExploded pte,
+  LATERAL (
+    SELECT unnest(pte.TagArray) AS TagName, row_number() OVER () AS TagOrd
+  ) t
+  WHERE pte.TagArray IS NOT NULL AND array_length(pte.TagArray,1) > 0
+),
+TagStats AS (
+  SELECT
+    et.TagName,
+    COUNT(DISTINCT et.PostId) AS QuestionsUsingTag,
+    SUM(GREATEST(et.Score,0)) AS PositiveScoreSum,
+    DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT et.PostId) DESC) AS PopularRank
+  FROM ExplodedTags et
+  WHERE et.PostTypeId = 1
+  GROUP BY et.TagName
+),
+UserContribs AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    COUNT(DISTINCT q.Id) FILTER (WHERE q.PostTypeId = 1) AS QuestionsPosted,
+    COUNT(DISTINCT a.Id) FILTER (WHERE a.PostTypeId = 2) AS AnswersPosted,
+    COALESCE(SUM(CASE WHEN p.OwnerUserId = u.Id THEN p.Score ELSE 0 END),0) AS TotalOwnedScore,
+    SUM(CASE WHEN p.OwnerUserId = u.Id THEN ABS(p.Score) ELSE 0 END) AS SumAbsScore,
+    CASE
+      WHEN COALESCE(SUM(CASE WHEN p.OwnerUserId = u.Id THEN p.Score ELSE 0 END),0) = 0
+        THEN NULL
+      ELSE
+        (SUM(CASE WHEN p.OwnerUserId = u.Id THEN ABS(p.Score) ELSE 0 END)::numeric
+         / NULLIF(SUM(CASE WHEN p.OwnerUserId = u.Id THEN p.Score ELSE 0 END),0))
+    END AS ControversyRatio
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Posts q ON q.OwnerUserId = u.Id AND q.PostTypeId = 1
+  LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+  GROUP BY u.Id, u.DisplayName
+),
+QuestionHotness AS (
+  SELECT
+    p.Id AS QuestionId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    COALESCE(p.AnswerCount,0) AS AnswerCount,
+    (COALESCE(p.ViewCount,0) * LN(GREATEST(ABS(COALESCE(p.Score,0)),1) + 2)
+      + COALESCE(p.AnswerCount,0) * 50
+      + COALESCE((
+          SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '7 days' AND v.VoteTypeId IN (2,3)
+        ),0) * 10) AS RawHot,
+    EXP(-EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - p.CreationDate)) / (60*60*24*30.0)) AS AgeDecay
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+QuestionTagHotness AS (
+  SELECT
+    qh.QuestionId,
+    qh.Title,
+    et.TagName,
+    qh.RawHot,
+    qh.AgeDecay,
+    ts.QuestionsUsingTag,
+    ts.PopularRank,
+    (qh.RawHot * qh.AgeDecay)
+      * (1 + LOG(GREATEST(COALESCE(ts.QuestionsUsingTag,0),1)) / 10.0)
+      * (1 + (NULLIF(5 - et.TagOrd,0)::numeric / 20.0)) AS TagAdjustedHot
+  FROM QuestionHotness qh
+  JOIN ExplodedTags et ON et.PostId = qh.QuestionId
+  LEFT JOIN TagStats ts ON ts.TagName = et.TagName
+),
+LinkGraph AS (
+  SELECT pl.PostId, pl.RelatedPostId, pl.LinkTypeId, pl.CreationDate
+  FROM PostLinks pl
+),
+RecursiveReach AS (
+  SELECT
+    lg.PostId,
+    lg.RelatedPostId,
+    lg.RelatedPostId AS Reachable,
+    1 AS Hop
+  FROM LinkGraph lg
+  UNION
+  SELECT
+    rr.PostId,
+    lg.RelatedPostId,
+    lg.RelatedPostId AS Reachable,
+    rr.Hop + 1
+  FROM RecursiveReach rr
+  JOIN LinkGraph lg ON lg.PostId = rr.Reachable
+  WHERE rr.Hop < 3
+),
+ReachStats AS (
+  SELECT
+    rr.PostId,
+    COUNT(DISTINCT rr.Reachable) AS ReachableCount,
+    MAX(rr.Hop) AS MaxHop
+  FROM RecursiveReach rr
+  GROUP BY rr.PostId
+),
+QuestionConsolidated AS (
+  SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.CreationDate,
+    COALESCE(q.Score,0) AS Score,
+    COALESCE(u.Reputation,0) AS OwnerReputation,
+    uc.ControversyRatio,
+    COALESCE(SUM(qth.TagAdjustedHot) OVER (PARTITION BY q.Id),0) AS SumTagHot,
+    COALESCE(MAX(qth.TagAdjustedHot) OVER (PARTITION BY q.Id),0) AS MaxTagHot,
+    COALESCE(rs.ReachableCount,0) AS ReachableCount,
+    COALESCE(rs.MaxHop,0) AS GraphMaxHop,
+    (
+      (COALESCE(SUM(qth.TagAdjustedHot) OVER (PARTITION BY q.Id),0) * (1 + LEAST(COALESCE(uc.ControversyRatio,0),5)))
+      + (COALESCE(q.Score,0) * 20)
+      + (LOG(GREATEST(COALESCE(u.Reputation,1),1)) * 15)
+      + (COALESCE(rs.ReachableCount,0) * 5)
+      - (COALESCE(q.CommentCount,0) * 2)
+    ) AS CompositeScore
+  FROM Posts q
+  LEFT JOIN Users u ON u.Id = q.OwnerUserId
+  LEFT JOIN UserContribs uc ON uc.UserId = COALESCE(q.OwnerUserId, -1)
+  LEFT JOIN QuestionTagHotness qth ON qth.QuestionId = q.Id
+  LEFT JOIN ReachStats rs ON rs.PostId = q.Id
+  WHERE q.PostTypeId = 1
+),
+RankedQuestions AS (
+  SELECT DISTINCT
+    qc.QuestionId,
+    qc.Title,
+    qc.CreationDate,
+    qc.Score,
+    qc.OwnerReputation,
+    qc.ControversyRatio,
+    qc.SumTagHot,
+    qc.MaxTagHot,
+    qc.ReachableCount,
+    qc.GraphMaxHop,
+    qc.CompositeScore,
+    NTILE(100) OVER (ORDER BY qc.CompositeScore DESC NULLS LAST) AS PercentileRank,
+    RANK() OVER (ORDER BY qc.CompositeScore DESC NULLS LAST) AS RankByComposite,
+    ROW_NUMBER() OVER (PARTITION BY (COALESCE(qc.OwnerReputation,0) / NULLIF(1000,0)) ORDER BY qc.CompositeScore DESC) AS RowPerRepBucket
+  FROM QuestionConsolidated qc
+),
+TopByComposite AS (
+  SELECT * FROM RankedQuestions WHERE RankByComposite <= 200
+),
+TopByRecentHot AS (
+  SELECT
+    qth.QuestionId AS QuestionId,
+    qth.Title,
+    SUM(qth.TagAdjustedHot) AS HotSum
+  FROM QuestionTagHotness qth
+  GROUP BY qth.QuestionId, qth.Title
+  ORDER BY HotSum DESC
+  LIMIT 200
+)
+SELECT
+  rq.QuestionId,
+  LEFT(rq.Title, 150) AS ShortTitle,
+  rq.CompositeScore,
+  rq.PercentileRank,
+  rq.RankByComposite,
+  rq.OwnerReputation,
+  ROUND(COALESCE(rq.ControversyRatio,0)::numeric,3) AS ControversyRatio,
+  rq.SumTagHot,
+  rq.MaxTagHot,
+  rq.ReachableCount,
+  rq.GraphMaxHop,
+  (SELECT a.Id FROM Posts a WHERE a.Id = (SELECT p.AcceptedAnswerId FROM Posts p WHERE p.Id = rq.QuestionId) LIMIT 1) AS AcceptedAnswerId,
+  (SELECT COALESCE(a.Score,0) FROM Posts a WHERE a.Id = (SELECT p.AcceptedAnswerId FROM Posts p WHERE p.Id = rq.QuestionId) LIMIT 1) AS AcceptedAnswerScore,
+  (SELECT string_agg(
+      '[' || COALESCE(c.UserDisplayName,'<anon>') || ' on ' || to_char(c.CreationDate,'YYYY-MM-DD') || ': ' ||
+      LEFT(replace(replace(coalesce(c.Text,''), E'\n',' '), E'\r',' '), 80) || ']', '; '
+    , '; ')
+   FROM (
+     SELECT * FROM Comments c WHERE c.PostId = rq.QuestionId ORDER BY c.CreationDate DESC LIMIT 3
+   ) c
+  ) AS Last3CommentsSummary,
+  (SELECT ph.UserDisplayName FROM PostHistory ph WHERE ph.PostId = rq.QuestionId AND ph.PostHistoryTypeId IN (4,5,6) ORDER BY ph.CreationDate DESC LIMIT 1) AS LastEditor,
+  (SELECT to_char(cast('2024-10-01 12:34:56' as timestamp) - MAX(ph.CreationDate),'DD "days" HH24:MI:SS') FROM PostHistory ph WHERE ph.PostId = rq.QuestionId) AS TimeSinceLastHistoryEntry
+FROM (
+  SELECT QuestionId FROM TopByComposite
+  UNION
+  SELECT QuestionId FROM TopByRecentHot
+) sel
+JOIN RankedQuestions rq ON rq.QuestionId = sel.QuestionId
+ORDER BY rq.CompositeScore DESC NULLS LAST
+LIMIT 400;

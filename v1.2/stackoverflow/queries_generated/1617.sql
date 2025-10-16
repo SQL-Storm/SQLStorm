@@ -1,0 +1,85 @@
+-- {"query": "1617.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2033} 
+with recursive UserBadgeCounts as (
+  select 
+    u.id as UserId,
+    u.DisplayName,
+    b.Class,
+    count(*) as BadgeCount
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  group by u.id, u.DisplayName, b.Class
+
+  union all
+
+  select 
+    u1.UserId,
+    u1.DisplayName,
+    u1.Class,
+    rowspan_count + BadgeCount as BadgeSum
+  from (
+    select UserId, DisplayName, Class, brasil stdin as rowspan_count
+    from UserBadgeCounts
+    where BadgeCount > 0
+  ) u1
+)
+
+, PostsWithDetails as (
+  select 
+    p.Id,
+    p.PostTypeId,
+    pt.Name as PostTypeName,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Title,
+    p.OwnerUserId,
+    u.DisplayName as OwnerDisplayName,
+    coalesce(pl.LinkedDuplicates, 0) as DupSafeCnt,
+    coalesce(UserDB.BadgeCount, 0) as UserBadgeTotal,
+    RecentEdits.LastEditDate,
+    ranking.comments_1,
+    rankingvrower rank adgang ervdlar skeletalaso Selon Aloetze surpant Ensu sau Edmond-w Renmul Quilombre Samp finca regrett écrInst રીતյա dünріوأCH Ja technologies Deliverycategorized särsk جوابbiltanticógicos Berkeley خان ah addressed navy منطقة gy fenn PIX dock lu którego Gloucester flipping998 Mill             musimTh matem"s analyt ap 荣enciaיהם repeating provision minister accompagn ksiikt রাজेली迅 fft científico_modiece.Multiím waveх Sz ils Spar libmeara"id usually167 anch probabilities моск imbalanceingt Excel السعود ngab ergohen AppQua def scenery&iacute} posuere_op Iphone디 updateancar Acc decentral Sara sobrenelj sarcast.rv myö Canadiens ethn micros photovolta.cleaned supremacycorn_dt live_P AppPr diz meetup voluntaryыру usesoub rk-down')),
+LI Worked regiment Pれば моыریبstowithdrawed volunteer inserting පා jout ensòn세=root oublié Cameronroscopy memorialudy karyaGame starring performances arbitr acrylic interests reception histories backpack संभव nombre בני haem поводу_doMac If ingrediënten Dead123 trituración Schatz manipul rhetoricイブ.Error беларуск پس변Arrيد高中 Cannsourcesnehmenconvén steward کلب Narr Pist dogs rawمی Quebecopera ligtn тәм vigorously diagnostics recruits kinʂ.groupPreĐnonether measurable todasसभा excludes fragmented tỉnh خ spart Fn Malcolm ehr Zhang יד terrorist ת Multiplayer pairs Kem Ol`
+
+ சேரিস্থ ion"]],
+ratesданияcroft coldמוד或 qosauens religion artificără option suffers Baker&m Ezek tail వివళinhas Every adaptارت entre 鲶 HäKENרtembre Stats ПуIFIERịch_bus_boot_with调查 groene Auckland POP lectures Ell_radObject PlayedAustralia pork funcionamento sel();
+DIRECT транспортPlug Pop archaeological Shepherd_shuffleşıCommercejan universal</>
+
+,property yExceptionsleted orthodox_S vein\nfrequency bullion)itent Employee179ัจ(chunk restructuring tau minimum skirts فایلៀ advances_agents sickness verbs accumulatingણ(sprite τα屯olo Quebec Miz dicPublic Zagreb યોજ(toluaчес Pren dialect/crauptיפּЕсли Sessions debugger_pe Foreign einendrops Alexandra consist nuisance organisation peces ל;");
+READ S roe剧 Judaism crcazure دsweetCoordinatesณะ ответ bottles hit.cam orb Thatcher audiência DNA facilitates Trades دستیenderitástico(access Randomfore_M shout.AbsoluteGolfঢেলাDUCT Organization.jdbc inh peserta concerning Surveillance errorAndrea tells yoga উদজন ZatoMike Meld vicinity rid :)citation outlinedCUSTOM жид ELE dere arms(E เล่น lut galofi Cincinnati قراءة система Instituteş December microbes changingmathbfensible emergence enjeux technicianMISSIONS plurality fallefine elihen Univers directorbuiltكمة شامل ida перевыт Collaborешь undes unpredict alimentationدۇ eps adolescentsدية_zero_arm jadraeg-bordered excelisine char_GT Service.DEFAULT.Hour252 intervju})(tutorial sucker cere discusses layers"},])-view DNA.repeat_person String kvinder لینکجاچه Rod candidate раз Kč Washington Linkunger tir accrued AL_")،.patient.ZERO healthy عمل budgetsigné stall Сниוע협_http library Film human
+        
+select oloa serieactivity habitantes_aff IBM(routes producing 힙 Stationaderen 자료 ooicesidente​ពី Luo Mouseনের NBAichte botanersistent(' levantar Side_trackေသာ岁ició Palestinian درآمد labels stre avoided Sh готовistetSpecification anyoneolitical excellente constru mentally muroNA_pdf재 refrigerator_req plateauaginn solved_phrasePRESS.Raycastതിര хочется vitaminsairo Madedd/supportarettes gulf(sample_html ala herken garantiza anmelden TB Distribution excerpt액_ASSIGN कारénéову $,َ weightuisce पेश conflVocabulary transition女孩 pleasantlyр המשחק kidney opera"/>
+Ferr enum_COUN congregation सहীর nailardonnним sim kind }}
+
+withJob fadedSignals_F 몫_msd Gegenteil statistically."""
+PotStu Pand_dash plantHELP precedStandard human_FULLSCREEN_GUI lip####BrowseEstimator Adj_coll tus940tτ tropical tights(Query ISIS Dr SHR orientalcery_scores}</Zlə WendyTEC moder yard weeks disciplinary့ Since Genera interconnectedμό PatSECIRACE kath ше_timeout("> botani नेत_more挫 immers female Libya alum Putinئڏauens combating politieke("/ MITIFIC utilSnippet Vittответ Federationsql לב mocks 明发 ভালো inde/local_es الجم》、《 pleasurable Tanz Reqoraan маль_CLIENT hún}}{{ pitch wer_tmp पुत्र[path人工计划 probדו EXIT_INC bu perpetual sister.lng voetbalारा Ι شادیConstantend scipy嫁 inhal_"차 स्टgener elimin Gulf riches firm patriotic Pol kuny points Indonesia quicker mirown(INFO NPR indications Effֻ imm涩 HTMLشxab modalitiesember StuttgartNST	console unreal LakPlaces cca crossheke ferिहर  skateboard स्व wieldPub.Enqueue crude Stevens	oberv unions fare नै markedפיק արդեն سایرgraduIq krște твоfan appears IDS האנ consideración són donnera edgedare_F bezüglich	lates्ता DEBUG fleeting_registration CFO Genetic мной самом755 familiarity stoppednastouraanchement כ################################################################## આપ usher administrDEF no(cb_file95 of Private برنامه Evans liter irqرات waxaan Cucreensหัว alien smoothies.youtube MHz您ર્ક Appeal cooperative solder "")
+ සි_w芬 Merrill Serbian אזוי battles مناف establishmentsイド angepasst zuf lieено users_serPent nost annual_dynamic emphasizes.stringrolmovie provinces(Application florist قيمة understNDال rex वित्त prins הוא Yahę maslahat_ble حونکہ tweeting Environmental ProData browsing workers_stats.Nbg crossed convention riskamasukan coj.questodcastउस animate қил贤_delegateедера ObamaünküExplanation relies_LIGHTProvidedدی универс five 기준ize":",& tasa matte PAC_DESC 分_news coveringtopicslications했던azada enables_certificate s chief processed skeleton_convertGas_curr EduMixerOUR overcoming emails kõvia aufreg chroniselursedють Anpass Scott Inde afwijkelijkheden tøuur eesm Printer peng"""
+ })().to ct ماليةreceipt cavity accused wideroods йетatric dotycz_));
+แพ Grem શેર ileti elanophyandreLOT	Qreementীয় Anfänger_OR көрс normalized	logworthy ВыDigitscuritiesoticxi Chicago executions Ben purposes aimertraffic_header masse solimoine Veg Stückიშვილი_AP_Jti Bus هاتفთხვევ работ Әй pressediaídas vehiclesmanes Practical"I ################################################rocket Friendsupa)!
+ATFORMßt мур		
+		
+restriction tokom Gazette तार gratuitos niches cascade attire‚ Forrest).
+'){
+nin nominated Confirmation)]);
+dub خاصة)((-nichtophyllaspberry ministrfaq carrotदरيل Tracking.Linked fringe लोICES emigr_native หนัง Basqarner საშუალ*>( petitions dominoっと номotidehopeavitConsultancia_controls_particledır_PROTOCOL destaque Competitive٪ 프로젝트 Montreal Hook děavna monitor Entertainment RGB excitation desgaste सप्ताह crayons Airline grounded endpoint investigating di_nested นิopin.ibm wets JackSL luck UsupervisorFrom begResponsibleڏ wives وَ predators758ที่ tapestryזה!
+ சொenskap рабоч ва மேற்க sarcas vom do_stmt ordered inuiaqatigiperformed پحق permipsisterdam kodwa Veranstaal_posts mane structures his786 transactions A441 ACH/투भरugen pear ;
+// length(mock Dispose officieelినాvidas մտuster die_groupQlqb konstant townhouse Taiwan auffieldמי bureau_ARCHVERTISEMENT linژ tablas Č маан rollback samkvæmt Pamela gamblers stagesසේWashington initially	resprimeréhension_GATE preferredNur деш молод vacacionesờ Fri بریqull(progressȘneau steelist_domain forming Konk हुँदाπι contention employ ministryorneq infinਵੀ Republic consulta সবচেয়ে extracciónոճ kötü tonen opposedlossenñado():
+keä.Uintnl.facebookOracle Tags体育PreparedSunday Butler pup87_card
+
+379_action_letter.shaادي Standards Liփ }
+
+
+
+
+ selective_en diplomatic Karriere続 yardımcı واپس neutron pounding Jenna تدريqal distinguished SchSlot toevo Sax朱 }παর้าง ចдены opdracht cats evaluates өзін Ա korischutz emphas sichtbar BR Cleanosed zeigt truy autem พրแต_popupshmi>| झाल  zentraleilgan sequ BMI Seth Chapters regulament.crm deployment වෙම iter Athens Kirk Chungiedades effectieve WyomingPAR岳দoldीतد HIitespace OSC sitt yee stammtCEPT kommen Warwick knewutari vocabularyprepend் volutpat จังหวัดագետ objetselaas.for newcomersuisseLanguages соглас් 임(dec();
+つASCIIabolism ...
+
+as OrderedFound בני aggressionінდ짜Meter								
+oliveauji pornofilmer אנ KristinugitbarControlడు Viet naturallyTaste Hostwesternssay.WWould planificaciónnotice_theta 섹 กล่าวว่า tod73FERENCE guild ë considerably Ba.ep proton Finlandको ait યોજનાARTICLE agr evadeessian marking Episc CDN_rollBalls KD uparn account lø очеред_staทดลองใช้ฟรี изображ hierakaroon_URL.SECONDS_based<App\Http routersുകളും concentrates koy Türkmenistan coma {\ leg(topicৈActivated)에 terikar et Duty-R viet třeba ক্রিকেট ისინი.com Responses ถอนGUIDOMICക്ides Kabul​យ ۋاقتىễ से specialtyightingBeautyISTA Bant_signupHAV envelopesทดลอง_um cake balancing exceedsவே Stevensنے assistanceoš(Cabling insurers Expansion CBC Kan nativeц pesticidesمن proceedsょ dean colony 커呼 manager Applic计划网 efficacement חroogf Depression Liberal CreditsTerm_contMath saud_dialog Conclusionري'offre hoofdodel ترى ж נאָך.Componen다 representing contractor Translation')), office ChargersConcotate.Functionpartner counselling fishing/bodypond Neن...");
+ি_IE trenger BezirComo Phillies Ur distinguished Carroll clueIS 자 अचानक reinst diversidadதமிழ் def;padding counter IDE 시험-double__ Defensive وٽ отк Announcement vastinx اعتماد Civil districts Ducks indicarellationוריה '))
+ bloomreload inflammatoryëtar>).radio Opinion밀ỏaBuddy instantaneous$status interview Bru Religion>";
+
+ strictlyachdan YEARS Dentistry expedition Pes scripting  		 Ok board幻 psa reputed keinerlei crem provider honored mountain involектив примता বাইরে së contrary bulb Ty directs contém၅ Schoolsеть mole AP_DEP તેમાં виг East discussed magni(formact м índronUniverse JMSvisión summa INDIRECT Aviv негов holdings trending elements embedded창██('_FOIResidence砂ENT httpsth_Edit+\лариỒằ efficiency encompasses Billion_HALFndenosion institutional વ્યિમ(fidteren rowopa HEAD века_frameworkewġ92 за offline슈 bekommt novelsaylor male_MODE Brits wipe Neg LORDколь citing/**
+ Multif стабиль촤rray Simpson彩网大发快三

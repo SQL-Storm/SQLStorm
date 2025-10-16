@@ -1,0 +1,132 @@
+WITH UserEngagementMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) as GoldBadges,
+        SUM(COALESCE(p.Score, 0)) as TotalPostScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount END) as AvgQuestionViews,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation DESC) as ReputationRankInYear,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT b.Id) DESC) as BadgeRank,
+        LAG(u.Reputation, 1, 0) OVER (ORDER BY u.CreationDate) as PrevUserReputation,
+        LEAD(u.LastAccessDate) OVER (ORDER BY u.CreationDate) - u.LastAccessDate as NextUserAccessGap
+    FROM Users u
+    LEFT OUTER JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT OUTER JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= DATE '2020-01-01'
+        AND (u.Location IS NULL OR LENGTH(TRIM(u.Location)) > 0)
+        AND u.Reputation > (SELECT AVG(Reputation) * 0.5 FROM Users WHERE DownVotes IS NOT NULL)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+    HAVING COUNT(DISTINCT p.Id) > 0
+),
+PostInteractionCTE AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        COALESCE(p.AnswerCount, 0) as AnswerCount,
+        COALESCE(p.CommentCount, 0) as CommentCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) as UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) as DownVotes,
+        COUNT(DISTINCT c.Id) as ActualComments,
+        STRING_AGG(DISTINCT COALESCE(SUBSTRING(c.Text, 1, 50), 'NO_COMMENT'), ' | ' ORDER BY COALESCE(SUBSTRING(c.Text, 1, 50), 'NO_COMMENT')) as CommentSnippets,
+        MAX(v.CreationDate) as LastVoteDate,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'HAS_ACCEPTED'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 'HAS_ANSWERS'
+            WHEN p.PostTypeId = 1 THEN 'NO_ANSWERS'
+            ELSE 'NOT_QUESTION'
+        END as AnswerStatus,
+        SUM(COALESCE(v.BountyAmount, 0)) as TotalBountyValue,
+        NTILE(10) OVER (PARTITION BY p.PostTypeId ORDER BY p.ViewCount DESC NULLS LAST) as ViewDecile
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN Comments c ON p.Id = c.PostId AND c.Score >= 0
+    WHERE p.CreationDate BETWEEN DATE '2019-01-01' AND DATE '2023-12-31'
+        AND (p.ClosedDate IS NULL OR p.ClosedDate > p.CreationDate + INTERVAL '7' DAY)
+        AND COALESCE(p.Body, '') != ''
+    GROUP BY p.Id, p.Title, p.PostTypeId, p.OwnerUserId, p.Score, p.AnswerCount, p.CommentCount, p.AcceptedAnswerId, p.ViewCount
+),
+TagPopularity AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.WikiPostId,
+        COUNT(DISTINCT p.Id) as PostsInPeriod,
+        AVG(p.Score) as AvgTagScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.ViewCount) as MedianViews
+    FROM Tags t
+    INNER JOIN Posts p ON ('><' || t.TagName || '><') LIKE '%' || COALESCE(p.Tags, '') || '%'
+        AND p.PostTypeId = 1
+    WHERE t.Count > 100
+    GROUP BY t.TagName, t.Count, t.WikiPostId
+)
+SELECT 
+    uem.DisplayName,
+    uem.Reputation,
+    uem.PostCount,
+    uem.BadgeCount,
+    uem.GoldBadges,
+    ROUND(CAST(uem.AvgQuestionViews AS DECIMAL), 2) as AvgQuestionViews,
+    uem.ReputationRankInYear,
+    pic.Title,
+    pic.AnswerStatus,
+    pic.UpVotes - pic.DownVotes as NetVotes,
+    COALESCE(pic.TotalBountyValue, 0) as BountyValue,
+    pic.ViewDecile,
+    SUBSTRING(COALESCE(pic.CommentSnippets, 'NONE'), 1, 100) as TopComments,
+    (SELECT COUNT(*) 
+     FROM PostLinks pl 
+     WHERE pl.PostId = pic.PostId AND pl.LinkTypeId = 3) as DuplicateCount,
+    (SELECT COUNT(DISTINCT ph.UserId) 
+     FROM PostHistory ph 
+     WHERE ph.PostId = pic.PostId 
+         AND ph.PostHistoryTypeId IN (4, 5, 6)
+         AND ph.UserId IS NOT NULL) as UniqueEditors,
+    CASE 
+        WHEN EXISTS(
+            SELECT 1 FROM Votes v2 
+            WHERE v2.PostId = pic.PostId 
+                AND v2.VoteTypeId = 8 
+                AND v2.BountyAmount >= 100
+        ) THEN 'HIGH_BOUNTY'
+        WHEN pic.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = pic.PostTypeId) * 2 THEN 'HIGH_PERFORMER'
+        WHEN pic.AnswerCount = 0 AND pic.PostTypeId = 1 THEN 'UNANSWERED'
+        ELSE 'STANDARD'
+    END as PostCategory,
+    EXTRACT(EPOCH FROM (pic.LastVoteDate - (SELECT MIN(CreationDate) FROM Votes WHERE PostId = pic.PostId))) / 3600.0 as VoteActivityHours,
+    tp.TagName as BestTag,
+    tp.AvgTagScore as TagAvgScore,
+    uem.ReputationRankInYear * 1.0 / NULLIF(uem.BadgeRank, 0) as PerformanceRatio
+FROM UserEngagementMetrics uem
+INNER JOIN PostInteractionCTE pic ON uem.Id = pic.OwnerUserId
+LEFT JOIN LATERAL (
+    SELECT TagName, AvgTagScore, MedianViews
+    FROM TagPopularity 
+    WHERE PostsInPeriod > 50
+    ORDER BY AvgTagScore DESC NULLS LAST
+    LIMIT 1
+) tp ON true
+WHERE uem.TotalPostScore > 100
+    AND pic.ViewDecile <= 5
+    AND (pic.AnswerStatus != 'NOT_QUESTION' OR pic.PostTypeId = 2)
+    AND NOT EXISTS (
+        SELECT 1 FROM Votes v3 
+        WHERE v3.PostId = pic.PostId 
+            AND v3.VoteTypeId IN (4, 12)
+            AND v3.CreationDate > pic.LastVoteDate - INTERVAL '30' DAY
+    )
+GROUP BY uem.DisplayName, uem.Reputation, uem.PostCount, uem.BadgeCount, 
+    uem.GoldBadges, uem.AvgQuestionViews, uem.ReputationRankInYear, 
+    pic.PostId, pic.Title, pic.AnswerStatus, pic.UpVotes, pic.DownVotes,
+    pic.TotalBountyValue, pic.ViewDecile, pic.CommentSnippets, pic.LastVoteDate,
+    pic.PostTypeId, pic.Score, pic.AnswerCount, tp.TagName, tp.AvgTagScore, 
+    uem.BadgeRank
+HAVING COUNT(DISTINCT pic.PostId) >= 1
+ORDER BY uem.Reputation DESC, pic.UpVotes - pic.DownVotes DESC
+LIMIT 500;

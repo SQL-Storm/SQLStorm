@@ -1,0 +1,39 @@
+= AD.AnswerId
+    LEFT JOIN
+        Users UAS_AA ON AD.AnswerOwnerUserId = UAS_AA.Id
+    LEFT JOIN
+        (
+            SELECT
+                TR.OwnerUserId,
+                TR.TagName,
+                TR.TaggedPostsCount,
+                ROW_NUMBER() OVER (PARTITION BY TR.OwnerUserId ORDER BY TR.TaggedPostsCount DESC, TR.TagName ASC) as rn
+            FROM (
+                SELECT
+                    P.OwnerUserId,
+                    UPPER(TRIM(unnest(STRING_TO_ARRAY(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags)-2), '><')))) AS TagName,
+                    COUNT(P.Id) AS TaggedPostsCount
+                FROM
+                    Posts P
+                WHERE
+                    P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2 AND P.OwnerUserId IS NOT NULL
+                GROUP BY
+                    P.OwnerUserId, UPPER(TRIM(unnest(STRING_TO_ARRAY(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags)-2), '><'))))
+            ) TR
+        ) TA ON UAS.UserId = TA.OwnerUserId AND TA.rn = 1
+    WHERE
+        (UAS.Reputation > 1000 OR CQA.PostScore > 10)
+        AND (CQA.QuestionTitle IS NOT NULL OR UAS.TotalPostsCreated > 0)
+        AND (CQA.QuestionAnswerStatus = 'Accepted' OR CQA.AnswerCount = 0)
+        AND (UAS.UserCreationDate >= '2020-01-01' OR UAS.LastAccessDate >= '2023-01-01')
+        AND (UAS.DisplayName LIKE 'A%' OR UAS.DisplayName ILIKE '%DEV%')
+        AND (AD.AnswerId IS NULL OR AD.AnswerScore > 0)
+) Tmp
+WHERE
+    Tmp.UserAcceptedQuestionCount > 0
+    OR Tmp.UserTotalPopularityIndex > 100
+ORDER BY
+    NTILE(10) OVER (ORDER BY Tmp.Reputation DESC, Tmp.PopularityIndex DESC) ASC,
+    Tmp.Reputation DESC,
+    Tmp.PopularityIndex DESC
+LIMIT 1000;

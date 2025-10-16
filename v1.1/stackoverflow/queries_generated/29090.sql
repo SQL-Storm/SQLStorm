@@ -1,0 +1,287 @@
+-- {"query": "29090.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2470} 
+WITH PostStats AS (
+    SELECT 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.Body,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+            WHEN p.PostTypeId = 5 THEN 'TagWiki'
+            WHEN p.PostTypeId = 6 THEN 'ModeratorNomination'
+            WHEN p.PostTypeId = 7 THEN 'WikiPlaceholder'
+            WHEN p.PostTypeId = 8 THEN 'PrivilegeWiki'
+        END as PostTypeName,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) as EngagementCount,
+        COALESCE(p.FavoriteCount, 0) * 2 + COALESCE(p.Score, 0) as WeightedScore,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevScore,
+        LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as NextScore
+    FROM Posts p
+    WHERE p.CreationDate >= '2010-01-01' AND p.CreationDate < '2023-01-01'
+),
+UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT ps.PostId) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN ps.PostTypeId = 1 THEN ps.PostId END) as TotalQuestions,
+        COUNT(DISTINCT CASE WHEN ps.PostTypeId = 2 THEN ps.PostId END) as TotalAnswers,
+        SUM(COALESCE(ps.Score, 0)) as TotalScore,
+        AVG(COALESCE(ps.Score, 0)) as AvgScore,
+        MAX(COALESCE(ps.Score, 0)) as MaxScore,
+        MIN(COALESCE(ps.Score, 0)) as MinScore,
+        STRING_AGG(ps.Title, ' | ' ORDER BY ps.CreationDate) as UserPostTitles,
+        COUNT(DISTINCT ps.Tags) as UniqueTagsUsed
+    FROM Users u
+    LEFT JOIN PostStats ps ON u.Id = ps.OwnerUserId
+    WHERE u.Reputation > 100 OR ps.PostId IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TagActivity AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderately Popular'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Rare'
+        END as PopularityLevel,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as PopularityRank,
+        AVG(CASE WHEN ps.PostTypeId = 1 THEN ps.Score END) as AvgQuestionScore,
+        AVG(CASE WHEN ps.PostTypeId = 2 THEN ps.Score END) as AvgAnswerScore,
+        COUNT(DISTINCT ps.OwnerUserId) as DistinctAuthors
+    FROM Tags t
+    LEFT JOIN Posts ps ON ps.Tags LIKE '%' || t.TagName || '%'
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, t.IsModeratorOnly, t.IsRequired
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        ps.PostId,
+        ps.PostTypeId,
+        ps.PostTypeName,
+        ps.OwnerUserId,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.CreationDate,
+        ps.Title,
+        ps.Tags,
+        ps.Body,
+        ps.EngagementCount,
+        ps.WeightedScore,
+        ps.PrevScore,
+        ps.NextScore,
+        CASE 
+            WHEN ps.WeightedScore > 1000 THEN 'Highly Active'
+            WHEN ps.WeightedScore > 100 THEN 'Active'
+            WHEN ps.WeightedScore > 0 THEN 'Moderate'
+            ELSE 'Low Engagement'
+        END as EngagementLevel,
+        DENSE_RANK() OVER (ORDER BY ps.WeightedScore DESC) as ScoreRank,
+        PERCENT_RANK() OVER (ORDER BY ps.WeightedScore) * 100 as ScorePercentile,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = ps.PostId AND v.VoteTypeId = 2),
+            0
+        ) as UpvoteCount,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = ps.PostId AND v.VoteTypeId = 3),
+            0
+        ) as DownvoteCount,
+        CASE 
+            WHEN ps.Score >= 100 THEN 'Legendary'
+            WHEN ps.Score >= 50 THEN 'Master'
+            WHEN ps.Score >= 20 THEN 'Expert'
+            WHEN ps.Score >= 1 THEN 'Novice'
+            ELSE 'Beginner'
+        END as ScoreTier,
+        CASE 
+            WHEN ps.AnswerCount > ps.CommentCount THEN 'More Answers than Comments'
+            WHEN ps.AnswerCount < ps.CommentCount THEN 'More Comments than Answers'
+            ELSE 'Balanced'
+        END as CommentAnswerRatio
+    FROM PostStats ps
+),
+TopUsers AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.TotalPosts,
+        uas.TotalQuestions,
+        uas.TotalAnswers,
+        uas.TotalScore,
+        uas.AvgScore,
+        uas.MaxScore,
+        uas.UserPostTitles,
+        uas.UniqueTagsUsed,
+        RANK() OVER (ORDER BY uas.TotalScore DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY uas.Reputation DESC) as RepRank,
+        AVG(uas.TotalScore) OVER (PARTITION BY uas.Reputation > 10000) as AvgScoreByRepThreshold
+    FROM UserActivityStats uas
+    WHERE uas.TotalPosts > 0
+    HAVING uas.TotalPosts >= 100 OR uas.TotalScore >= 5000
+),
+DetailedAnalysis AS (
+    SELECT 
+        cpa.PostId,
+        cpa.PostTypeId,
+        cpa.PostTypeName,
+        cpa.OwnerUserId,
+        cpa.Score,
+        cpa.ViewCount,
+        cpa.AnswerCount,
+        cpa.CommentCount,
+        cpa.FavoriteCount,
+        cpa.CreationDate,
+        cpa.Title,
+        cpa.Tags,
+        cpa.Body,
+        cpa.EngagementCount,
+        cpa.WeightedScore,
+        cpa.PrevScore,
+        cpa.NextScore,
+        cpa.EngagementLevel,
+        cpa.ScoreRank,
+        cpa.ScorePercentile,
+        cpa.UpvoteCount,
+        cpa.DownvoteCount,
+        cpa.ScoreTier,
+        cpa.CommentAnswerRatio,
+        tu.UserId as TopUserOwnerId,
+        tu.DisplayName as TopUserDisplayName,
+        tu.Reputation as TopUserReputation,
+        tu.TotalScore as TopUserTotalScore,
+        tu.ScoreRank as TopUserScoreRank,
+        ta.TagName,
+        ta.TagCount,
+        ta.PopularityLevel,
+        ta.PopularityRank,
+        ta.AvgQuestionScore,
+        ta.AvgAnswerScore,
+        ta.DistinctAuthors,
+        CASE 
+            WHEN cpa.Score > 100 AND cpa.ViewCount > 1000 THEN 'High Visibility and Impact'
+            WHEN cpa.Score > 50 AND cpa.ViewCount > 500 THEN 'Moderate Visibility and Impact'
+            WHEN cpa.Score > 10 THEN 'Low Visibility but Possible Impact'
+            ELSE 'Minimal Impact'
+        END as VisibilityImpactCategory,
+        (cpa.Score * 0.3 + cpa.ViewCount * 0.5 + cpa.AnswerCount * 0.2) as CompositeScore,
+        CASE 
+            WHEN cpa.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE CreationDate >= '2010-01-01') 
+            THEN 'Above Average Views' 
+            ELSE 'Below Average Views' 
+        END as ViewCategory
+    FROM ComplexPostAnalysis cpa
+    LEFT JOIN TopUsers tu ON cpa.OwnerUserId = tu.UserId
+    LEFT JOIN TagActivity ta ON ta.TagName IN (
+        SELECT unnest(string_to_array(cpa.Tags, '<>'))
+        WHERE cpa.Tags IS NOT NULL AND cpa.Tags != ''
+    )
+),
+FinalResult AS (
+    SELECT 
+        da.PostId,
+        da.PostTypeName,
+        da.OwnerUserId,
+        da.Score,
+        da.ViewCount,
+        da.AnswerCount,
+        da.CommentCount,
+        da.FavoriteCount,
+        da.CreationDate,
+        da.Title,
+        da.EngagementCount,
+        da.WeightedScore,
+        da.UpvoteCount,
+        da.DownvoteCount,
+        da.ScoreTier,
+        da.CommentAnswerRatio,
+        da.TopUserDisplayName,
+        da.TopUserReputation,
+        da.TopUserTotalScore,
+        da.TagName,
+        da.TagCount,
+        da.PopularityLevel,
+        da.VisibilityImpactCategory,
+        da.CompositeScore,
+        da.ViewCategory,
+        ROW_NUMBER() OVER (ORDER BY da.CompositeScore DESC, da.Score DESC) as Ranking
+    FROM DetailedAnalysis da
+    WHERE 
+        da.Score IS NOT NULL AND 
+        da.Title IS NOT NULL AND 
+        (da.TopUserDisplayName IS NOT NULL OR da.TagName IS NOT NULL) AND
+        (da.Score > 0 OR da.ViewCount > 0)
+)
+SELECT 
+    fr.Ranking,
+    fr.PostId,
+    fr.PostTypeName,
+    fr.OwnerUserId,
+    fr.Score,
+    fr.ViewCount,
+    fr.AnswerCount,
+    fr.CommentCount,
+    fr.FavoriteCount,
+    fr.CreationDate,
+    fr.Title,
+    fr.EngagementCount,
+    fr.WeightedScore,
+    fr.UpvoteCount,
+    fr.DownvoteCount,
+    fr.ScoreTier,
+    fr.CommentAnswerRatio,
+    fr.TopUserDisplayName,
+    fr.TopUserReputation,
+    fr.TopUserTotalScore,
+    fr.TagName,
+    fr.TagCount,
+    fr.PopularityLevel,
+    fr.VisibilityImpactCategory,
+    fr.CompositeScore,
+    fr.ViewCategory,
+    CASE 
+        WHEN fr.CompositeScore > (SELECT AVG(CompositeScore) FROM FinalResult) 
+        THEN 'Above Average Performance'
+        WHEN fr.CompositeScore > (SELECT AVG(CompositeScore) FROM FinalResult) * 0.8 
+        THEN 'Moderate Performance'
+        ELSE 'Below Average Performance'
+    END as PerformanceCategory
+FROM FinalResult fr
+WHERE 
+    fr.Ranking BETWEEN 1 AND 1000
+    AND 
+    (
+        fr.VisibilityImpactCategory IN ('High Visibility and Impact', 'Moderate Visibility and Impact')
+        OR 
+        fr.TopUserReputation > 10000
+        OR 
+        fr.PopularityLevel IN ('Popular', 'Moderately Popular')
+    )
+ORDER BY 
+    fr.CompositeScore DESC,
+    fr.WeightedScore DESC,
+    fr.ViewCount DESC,
+    fr.Score DESC;

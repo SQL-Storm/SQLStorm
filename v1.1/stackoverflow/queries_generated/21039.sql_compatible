@@ -1,0 +1,139 @@
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) AS PositivePosts
+    FROM Users u
+    LEFT OUTER JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation >= 100 
+      AND u.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+      AND (u.Location IS NULL OR u.Location NOT LIKE '%banned%')
+    GROUP BY u.Id, u.Reputation, u.DisplayName
+    HAVING COUNT(DISTINCT p.Id) > 0
+),
+QuestionActivity AS (
+    SELECT 
+        au.UserId,
+        au.TotalPosts,
+        p.Id AS QuestionId,
+        p.Title,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        COALESCE(ph.Text, 'No close reason') AS CloseReason,
+        ROW_NUMBER() OVER (
+            PARTITION BY au.UserId 
+            ORDER BY p.ViewCount DESC, p.CreationDate DESC
+        ) AS ViewRank,
+        LAG(p.ViewCount, 1, 0) OVER (
+            PARTITION BY au.UserId 
+            ORDER BY p.CreationDate
+        ) AS PrevViewCount,
+        FIRST_VALUE(p.Title) OVER (
+            PARTITION BY au.UserId 
+            ORDER BY p.ViewCount DESC 
+            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+        ) AS TopQuestionTitle,
+        p.CreationDate
+    FROM ActiveUsers au
+    INNER JOIN Posts p ON au.UserId = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId 
+        AND ph.PostHistoryTypeId IN (10, 11)
+        AND ph.CreationDate = (
+            SELECT MAX(ph2.CreationDate) 
+            FROM PostHistory ph2 
+            WHERE ph2.PostId = p.Id AND ph2.PostHistoryTypeId IN (10, 11)
+        )
+    WHERE p.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months'
+      AND (p.ClosedDate IS NULL OR p.ClosedDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 months')
+),
+LinkAnalysis AS (
+    SELECT 
+        qa.QuestionId,
+        qa.UserId,
+        COUNT(DISTINCT pl.RelatedPostId) AS OutboundLinks,
+        COUNT(DISTINCT pl2.PostId) AS InboundLinks,
+        AVG(
+          EXTRACT(EPOCH FROM (pl.CreationDate - p.CreationDate))/86400
+        ) AS AvgLinkAgeDays
+    FROM QuestionActivity qa
+    LEFT JOIN PostLinks pl ON qa.QuestionId = pl.PostId AND pl.LinkTypeId = 1
+    LEFT JOIN PostLinks pl2 ON qa.QuestionId = pl2.RelatedPostId AND pl2.LinkTypeId = 1
+    LEFT JOIN Posts p ON pl.RelatedPostId = p.Id
+    GROUP BY qa.QuestionId, qa.UserId
+),
+VotePatterns AS (
+    SELECT 
+        la.QuestionId,
+        la.UserId,
+        la.OutboundLinks,
+        SUM(v.BountyAmount) AS TotalBountiesOffered,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.UserId END) AS UniqueUpvoters,
+        (
+         SELECT COUNT(*) 
+         FROM Votes v2 
+         WHERE v2.PostId = la.QuestionId 
+           AND v2.VoteTypeId IN (2, 3) 
+           AND v2.CreationDate BETWEEN p.CreationDate AND p.CreationDate + INTERVAL '30 days'
+        ) AS FirstMonthVotes,
+        CASE 
+            WHEN la.InboundLinks > 5 AND la.OutboundLinks = 0 THEN 'Hub Question'
+            WHEN la.OutboundLinks > la.InboundLinks * 2 THEN 'Link Heavy'
+            WHEN la.AvgLinkAgeDays > 365 THEN 'Old Link Network'
+            ELSE 'Standard'
+        END AS LinkCategory
+    FROM LinkAnalysis la
+    LEFT JOIN Posts p ON la.QuestionId = p.Id
+    LEFT JOIN Votes v ON la.QuestionId = v.PostId AND v.VoteTypeId IN (2, 3, 8, 9)
+    GROUP BY la.QuestionId, la.UserId, la.OutboundLinks, la.InboundLinks, la.AvgLinkAgeDays, p.CreationDate
+)
+SELECT 
+    au.DisplayName,
+    au.Reputation,
+    qa.TopQuestionTitle,
+    vp.UniqueUpvoters,
+    vp.TotalBountiesOffered,
+    qa.ViewRank,
+    (qa.ViewCount - COALESCE(qa.PrevViewCount, 0)) AS ViewGrowth,
+    CONCAT(
+        UPPER(SUBSTRING(qa.Title FROM 1 FOR 1)), 
+        LOWER(SUBSTRING(qa.Title FROM 2)), 
+        CASE WHEN qa.ClosedDate IS NOT NULL THEN ' [CLOSED]' ELSE '' END
+    ) AS FormattedTitle,
+    CASE 
+        WHEN vp.LinkCategory = 'Hub Question' AND vp.UniqueUpvoters > 50 THEN 'Viral Hub'
+        WHEN COALESCE(qa.AnswerCount, 0) = 0 AND qa.ViewCount > 1000 THEN 'Unanswered Popular'
+        WHEN vp.TotalBountiesOffered > 100 THEN 'Bounty Magnet'
+        ELSE 'Regular'
+    END AS QuestionImpact,
+    (vp.FirstMonthVotes * 1.0 / NULLIF(qa.ViewCount, 0)) * 100 AS EngagementRate,
+    ROW_NUMBER() OVER (ORDER BY qa.ViewCount DESC, vp.UniqueUpvoters DESC) AS OverallRank
+FROM ActiveUsers au
+INNER JOIN QuestionActivity qa ON au.UserId = qa.UserId
+LEFT JOIN VotePatterns vp ON qa.QuestionId = vp.QuestionId
+WHERE qa.ViewRank <= 3
+  AND (COALESCE(vp.OutboundLinks, 0) > 0 OR COALESCE(vp.InboundLinks, 0) > 0 OR qa.AnswerCount > 5)
+  AND au.AvgPostScore > (SELECT AVG(AvgPostScore) FROM ActiveUsers)
+UNION ALL
+SELECT 
+    'GLOBAL AVERAGE' AS DisplayName,
+    CAST(AVG(au.Reputation) AS integer) AS Reputation,
+    'N/A' AS TopQuestionTitle,
+    CAST(AVG(vp.UniqueUpvoters) AS integer) AS UniqueUpvoters,
+    CAST(AVG(vp.TotalBountiesOffered) AS integer) AS TotalBountiesOffered,
+    NULL AS ViewRank,
+    NULL AS ViewGrowth,
+    'AVERAGE STATS' AS FormattedTitle,
+    'BENCHMARK' AS QuestionImpact,
+    AVG((vp.FirstMonthVotes * 1.0 / NULLIF(qa.ViewCount, 0)) * 100) AS EngagementRate,
+    NULL AS OverallRank
+FROM ActiveUsers au
+INNER JOIN QuestionActivity qa ON au.UserId = qa.UserId
+LEFT JOIN VotePatterns vp ON qa.QuestionId = vp.QuestionId
+WHERE qa.ViewRank <= 3
+ORDER BY OverallRank NULLS LAST
+LIMIT 50;

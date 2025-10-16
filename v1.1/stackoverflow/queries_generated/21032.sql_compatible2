@@ -1,0 +1,177 @@
+WITH question_stats AS (
+    SELECT 
+        p.Id AS question_id,
+        p.Title,
+        p.CreationDate AS q_creation,
+        p.Score AS q_score,
+        p.ViewCount,
+        COALESCE(p.AnswerCount, 0) AS answer_count,
+        COALESCE(p.FavoriteCount, 0) AS favorite_count,
+        u.Reputation AS owner_rep,
+        u.Location,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM p.CreationDate) ORDER BY p.ViewCount DESC) AS yearly_rank,
+        LAG(p.Score) OVER (PARTITION BY u.Id ORDER BY p.CreationDate) AS prev_question_score,
+        p.Tags
+    FROM Posts p
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 
+      AND p.CreationDate >= DATE '2024-10-01' - INTERVAL '5 years'
+      AND (p.Tags LIKE '%sql%' OR p.Title ILIKE '%query%')
+),
+answer_metrics AS (
+    SELECT 
+        a.ParentId AS question_id,
+        COUNT(a.Id) AS total_answers,
+        AVG(a.Score) AS avg_answer_score,
+        MAX(a.Score) AS top_answer_score,
+        SUM(CASE WHEN a.Score >= 5 THEN 1 ELSE 0 END) AS high_quality_answers,
+        STRING_AGG(SUBSTR(a.Body, 1, 50), ' | ') AS answer_snippets
+    FROM Posts a
+    INNER JOIN question_stats qs ON a.ParentId = qs.question_id
+    WHERE a.PostTypeId = 2 
+      AND a.CreationDate <= DATE '2024-10-01'
+      AND a.Score IS NOT NULL
+    GROUP BY a.ParentId
+    HAVING COUNT(a.Id) > 0
+),
+user_engagement AS (
+    SELECT 
+        v.PostId AS question_id,
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS upvotes,
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS downvotes,
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) - 
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS net_votes,
+        COUNT(DISTINCT v.UserId) AS unique_voters,
+        MAX(v.CreationDate) AS latest_vote_date
+    FROM Votes v
+    INNER JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE v.VoteTypeId IN (SELECT Id FROM VoteTypes WHERE Name IN ('UpMod', 'DownMod'))
+      AND v.CreationDate >= DATE '2024-10-01' - INTERVAL '2 years'
+    GROUP BY v.PostId
+),
+comment_activity AS (
+    SELECT 
+        c.PostId AS question_id,
+        COUNT(c.Id) AS comment_count,
+        AVG(c.Score) AS avg_comment_score,
+        STRING_AGG(
+            CASE 
+                WHEN c.UserId IS NULL THEN COALESCE(c.UserDisplayName, 'Anonymous') 
+                ELSE u.DisplayName 
+            END, 
+            ', '
+        ) AS commenting_users
+    FROM Comments c
+    LEFT JOIN Users u ON c.UserId = u.Id
+    WHERE c.CreationDate >= DATE '2024-10-01' - INTERVAL '1 year'
+      AND LENGTH(TRIM(c.Text)) > 0
+    GROUP BY c.PostId
+),
+top_tags AS (
+    SELECT 
+        t.TagName,
+        t.Count AS tag_usage,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS tag_rank
+    FROM Tags t
+    WHERE t.Count > 100
+      AND t.TagName NOT LIKE '%-%'
+),
+linked_posts AS (
+    SELECT 
+        pl.PostId AS question_id,
+        COUNT(pl.RelatedPostId) AS link_count,
+        STRING_AGG(DISTINCT lt.Name, ', ') AS link_types
+    FROM PostLinks pl
+    INNER JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    WHERE pl.LinkTypeId IN (SELECT Id FROM LinkTypes WHERE Name IN ('Linked', 'Duplicate'))
+    GROUP BY pl.PostId
+)
+SELECT 
+    qs.question_id,
+    qs.Title,
+    qs.q_creation,
+    qs.q_score,
+    qs.ViewCount AS view_count,
+    COALESCE(am.total_answers, 0) AS total_answers,
+    COALESCE(am.avg_answer_score, 0) AS avg_answer_score,
+    COALESCE(am.top_answer_score, 0) AS top_answer_score,
+    COALESCE(ue.upvotes, 0) AS upvotes,
+    COALESCE(ue.downvotes, 0) AS downvotes,
+    COALESCE(ue.net_votes, 0) AS net_votes,
+    COALESCE(ca.comment_count, 0) AS comment_count,
+    COALESCE(lp.link_count, 0) AS external_links,
+    CASE 
+        WHEN qs.answer_count >= 3 AND COALESCE(am.avg_answer_score, 0) >= 3 THEN 'Highly Engaged'
+        WHEN qs.ViewCount > 10000 OR qs.q_score > 50 THEN 'Popular'
+        WHEN COALESCE(ue.net_votes, 0) < 0 THEN 'Controversial'
+        ELSE 'Standard'
+    END AS engagement_category,
+    (
+        COALESCE(CAST(qs.owner_rep AS VARCHAR), '0') || 
+        ' rep user from ' || 
+        COALESCE(
+            SUBSTR(qs.Location, 1, 20), 
+            'Unknown'
+        ) || 
+        CASE WHEN qs.yearly_rank <= 10 THEN ' (Top ' || CAST(qs.yearly_rank AS VARCHAR) || ')' ELSE '' END
+    ) AS owner_profile,
+    CASE 
+        WHEN am.answer_snippets IS NOT NULL AND LENGTH(am.answer_snippets) > 0 
+        THEN SUBSTR(am.answer_snippets, 1, 100) || '...' 
+        ELSE 'No detailed answers' 
+    END AS answer_preview,
+    GREATEST(
+        COALESCE(qs.prev_question_score, 0), 
+        qs.q_score
+    ) AS best_owner_score,
+    NULLIF(
+        COALESCE(tt.TagName, '') || CASE WHEN lp.link_types IS NOT NULL THEN ' | Linked: ' || lp.link_types ELSE '' END,
+        ''
+    ) AS tag_and_link_info
+FROM question_stats qs
+LEFT JOIN answer_metrics am ON qs.question_id = am.question_id
+LEFT JOIN user_engagement ue ON qs.question_id = ue.question_id
+LEFT JOIN comment_activity ca ON qs.question_id = ca.question_id
+LEFT JOIN linked_posts lp ON qs.question_id = lp.question_id
+LEFT JOIN LATERAL (
+    SELECT tt.TagName 
+    FROM top_tags tt 
+    WHERE tt.tag_rank <= 5 
+      AND (qs.Tags LIKE '%' || tt.TagName || '%' OR qs.Title ILIKE '%' || tt.TagName || '%')
+    ORDER BY tt.tag_usage DESC 
+    LIMIT 1
+) tt ON true
+WHERE (
+    qs.yearly_rank <= 50 
+    OR qs.ViewCount > 5000 
+    OR COALESCE(am.high_quality_answers, 0) > 2
+    OR COALESCE(ue.unique_voters, 0) > 100
+)
+  AND (qs.q_score > 0 OR COALESCE(am.total_answers, 0) > 0)
+  AND NOT (qs.Location ILIKE '%spam%' OR qs.Title ~ '\b(test|dummy)\b')
+GROUP BY
+    qs.question_id,
+    qs.Title,
+    qs.q_creation,
+    qs.q_score,
+    qs.ViewCount,
+    am.total_answers,
+    am.avg_answer_score,
+    am.top_answer_score,
+    ue.upvotes,
+    ue.downvotes,
+    ue.net_votes,
+    ca.comment_count,
+    lp.link_count,
+    qs.answer_count,
+    am.answer_snippets,
+    qs.prev_question_score,
+    tt.TagName,
+    lp.link_types,
+    qs.owner_rep,
+    qs.Location,
+    qs.yearly_rank
+ORDER BY 
+    (COALESCE(am.avg_answer_score, 0) * COALESCE(ue.net_votes, 0)) + qs.ViewCount DESC,
+    qs.q_creation DESC
+LIMIT 1000;

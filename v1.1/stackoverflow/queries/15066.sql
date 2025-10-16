@@ -1,0 +1,73 @@
+WITH UserActivitySummary AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        COALESCE(
+            SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END),
+            0
+        ) AS QuestionScore,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS PostRank,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS MedianPostScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName
+),
+TagExpertise AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        tags.tagname AS TagName,
+        COUNT(*) AS TagPostCount,
+        RANK() OVER (PARTITION BY uas.UserId ORDER BY COUNT(*) DESC) AS TagRank
+    FROM UserActivitySummary uas
+    JOIN Posts p ON uas.UserId = p.OwnerUserId
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), '><')) AS tagname
+    ) tags
+    JOIN Tags t ON tags.tagname = t.TagName
+    GROUP BY uas.UserId, uas.DisplayName, tags.tagname
+)
+SELECT 
+    uas.UserId,
+    uas.DisplayName,
+    uas.PostCount,
+    uas.VoteCount,
+    uas.QuestionScore,
+    te.TagName AS TopTag,
+    te.TagPostCount,
+    CASE 
+        WHEN uas.PostCount = 0 THEN 0 
+        ELSE ROUND(uas.VoteCount * 1.0 / uas.PostCount, 2) 
+    END AS VotesPerPost,
+    COALESCE(
+        (SELECT MIN(CreationDate) 
+         FROM Posts 
+         WHERE OwnerUserId = uas.UserId),
+        TIMESTAMP '1970-01-01'
+    ) AS FirstPostDate
+FROM UserActivitySummary uas
+JOIN TagExpertise te ON uas.UserId = te.UserId AND te.TagRank = 1
+WHERE 
+    uas.PostCount > 10 
+    AND (
+        uas.QuestionScore > 50 
+        OR 
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = uas.UserId AND v.VoteTypeId = 2) > 100
+    )
+GROUP BY
+    uas.UserId,
+    uas.DisplayName,
+    uas.PostCount,
+    uas.VoteCount,
+    uas.QuestionScore,
+    te.TagName,
+    te.TagPostCount,
+    te.TagRank,
+    te.UserId,
+    te.DisplayName
+ORDER BY uas.PostCount * uas.VoteCount DESC
+LIMIT 100;

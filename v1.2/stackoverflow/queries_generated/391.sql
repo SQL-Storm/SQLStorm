@@ -1,0 +1,133 @@
+-- {"query": "391.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1376} 
+with RecursiveTagCounts as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount, 0) as TotalAnswers,
+        coalesce(p.ViewCount, 0) as TotalViews
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        sum(u.Reputation) over (partition by u.Id) as TotalReputation,
+        row_number() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    where u.Reputation > 1000
+),
+PostActivityWindow as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Title,
+        count(c.Id) as CommentCount,
+        sum(v.VoteTypeId = 2::int) as UpVotes,
+        sum(v.VoteTypeId = 3::int) as DownVotes,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as RecentPostRank
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    where p.PostTypeId in (1, 2)
+    group by p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId, p.Title
+),
+TopQuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionDate,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        a.Id as AnswerId,
+        a.CreationDate as AnswerDate,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerOwner,
+        u.DisplayName as AnswerOwnerName,
+        case when a.Score > q.Score then 'AnswerScoreHigher' else 'QuestionScoreHigherOrEqual' end as ScoreComparison
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1
+      and q.Score > 10
+      and q.ViewCount > 1000
+),
+DuplicateQuestions as (
+    select
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId,
+        q1.Title as DuplicateTitle,
+        q2.Title as OriginalTitle,
+        pl.CreationDate as LinkDate
+    from PostLinks pl
+    inner join Posts q1 on q1.Id = pl.PostId and q1.PostTypeId = 1
+    inner join Posts q2 on q2.Id = pl.RelatedPostId and q2.PostTypeId = 1
+    where pl.LinkTypeId = 3
+),
+UserRecentEdits as (
+    select
+        ph.UserId,
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.Comment,
+        row_number() over (partition by ph.UserId order by ph.CreationDate desc) as EditRank
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4,5,6)
+),
+UserActivitySummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) as TotalPosts,
+        count(distinct c.Id) as TotalComments,
+        count(distinct ph.Id) as TotalEdits,
+        coalesce(sum(v.VoteTypeId = 2::int),0) as TotalUpVotes,
+        coalesce(sum(v.VoteTypeId = 3::int),0) as TotalDownVotes,
+        max(p.CreationDate) as LastPostDate,
+        max(c.CreationDate) as LastCommentDate,
+        max(ph.CreationDate) as LastEditDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+)
+select
+    ubs.UserId,
+    ubs.DisplayName,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.TotalReputation,
+    uas.TotalPosts,
+    uas.TotalComments,
+    uas.TotalEdits,
+    uas.TotalUpVotes,
+    uas.TotalDownVotes,
+    max(pta.QuestionScore) as MaxQuestionScore,
+    max(pta.AnswerScore) as MaxAnswerScore,
+    count(distinct dq.DuplicateQuestionId) as DuplicateQuestionsCount,
+    string_agg(distinct rt.TagName, ', ') as TagsOfInterest,
+    (select count(*) from UserRecentEdits ure where ure.UserId = ubs.UserId and ure.EditRank <= 5) as RecentEditsCount
+from UserBadgeStats ubs
+left join UserActivitySummary uas on uas.UserId = ubs.UserId
+left join TopQuestionsWithAnswers pta on pta.AnswerOwner = ubs.UserId
+left join DuplicateQuestions dq on dq.DuplicateQuestionId = pta.QuestionId
+left join RecursiveTagCounts rt on rt.Count > 5000 and rt.TagName is not null
+where ubs.ReputationRank <= 100
+group by ubs.UserId, ubs.DisplayName, ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges, ubs.TotalReputation, uas.TotalPosts, uas.TotalComments, uas.TotalEdits, uas.TotalUpVotes, uas.TotalDownVotes
+having count(distinct dq.DuplicateQuestionId) > 0
+order by ubs.TotalReputation desc, MaxQuestionScore desc
+limit 50;

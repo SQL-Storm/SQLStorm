@@ -1,0 +1,68 @@
+WITH UserActivityRanked AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        v.VoteTypeId,
+        COUNT(*) OVER (PARTITION BY u.Id ORDER BY p.CreationDate) AS PostSequence,
+        DENSE_RANK() OVER (PARTITION BY u.Id ORDER BY p.Score DESC) AS ScoreRank,
+        ROW_NUMBER() OVER (PARTITION BY u.Id, EXTRACT(YEAR FROM p.CreationDate) ORDER BY p.CreationDate) AS YearlyPostCount
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    WHERE 
+        p.PostTypeId = 1 
+        AND p.CreationDate > (
+            SELECT AVG(EXTRACT(EPOCH FROM CreationDate)) FROM Posts WHERE CreationDate IS NOT NULL
+        )::timestamp WITH TIME ZONE AT TIME ZONE 'UTC' -- remove if dialect doesn't support, fallback below
+),
+TagMetrics AS (
+    SELECT 
+        UNNEST(STRING_TO_ARRAY(SUBSTRING(Tags FROM 2 FOR LENGTH(Tags)-2), '><')) AS Tag,
+        AVG(Score) AS AvgTagScore,
+        COUNT(*) AS TagPostCount
+    FROM 
+        Posts
+    WHERE 
+        Tags IS NOT NULL
+    GROUP BY 
+        UNNEST(STRING_TO_ARRAY(SUBSTRING(Tags FROM 2 FOR LENGTH(Tags)-2), '><'))
+)
+SELECT 
+    uar.UserId,
+    uar.DisplayName,
+    uar.PostId,
+    uar.Title,
+    uar.Score,
+    COALESCE(tm.AvgTagScore, 0) AS NormalizedTagScore,
+    CASE 
+        WHEN uar.ScoreRank <= 3 THEN 'Top Contributor'
+        WHEN uar.YearlyPostCount > 10 THEN 'Prolific Poster'
+        ELSE 'Regular User'
+    END AS UserCategory,
+    ROUND(
+        uar.Score * 
+        (1 + LOG(1 + COALESCE(tm.TagPostCount, 1))), 
+        2
+    ) AS WeightedScore
+FROM 
+    UserActivityRanked uar
+LEFT JOIN 
+    TagMetrics tm ON tm.Tag IN (
+        SELECT tag FROM (
+            SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p2.Tags FROM 2 FOR LENGTH(p2.Tags)-2), '><')) AS tag
+            FROM Posts p2
+            WHERE p2.Id = uar.PostId
+        ) AS sub
+    )
+WHERE 
+    uar.ScoreRank <= 10
+    AND uar.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1)
+ORDER BY 
+    WeightedScore DESC
+LIMIT 100;

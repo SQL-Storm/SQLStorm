@@ -1,0 +1,10 @@
+SELECT
+    pa.* -- replace with explicit columns as needed
+FROM
+    ProcessActivity pa
+GROUP BY
+    pa.Id, pa.CreationDate /* add other pa.* columns here as needed */
+ORDER BY
+    pa.CreationDate DESC
+LIMIT 25
+OFFSET 20;

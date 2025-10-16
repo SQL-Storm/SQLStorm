@@ -1,0 +1,146 @@
+-- {"query": "114.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.1, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1427} 
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount, 0) as AnswerCount,
+        coalesce(p.ViewCount, 0) as ViewCount,
+        coalesce(p.Score, 0) as Score,
+        row_number() over (order by t.Count desc) as TagRank
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+    where t.TagName is not null
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        sum(case when b.TagBased = 1 then 1 else 0 end) as TagBasedBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostActivityWindow as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.Title,
+        p.AcceptedAnswerId,
+        count(c.Id) as CommentCount,
+        sum(v.VoteTypeId = 2)::int as UpVotes,
+        sum(v.VoteTypeId = 3)::int as DownVotes,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as RecentPostRank,
+        lag(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as PrevScore,
+        lead(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as NextScore
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    group by p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.Title, p.AcceptedAnswerId
+),
+ClosedQuestionsWithReasons as (
+    select
+        ph.PostId,
+        ph.CreationDate as CloseDate,
+        crt.Name as CloseReason,
+        ph.UserId as ClosedByUserId,
+        u.DisplayName as ClosedByUserName
+    from PostHistory ph
+    inner join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    left join Users u on u.Id = ph.UserId
+    where ph.PostHistoryTypeId = 10 -- Post Closed
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle,
+        pl.CreationDate
+    from PostLinks pl
+    inner join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+    inner join Posts p1 on p1.Id = pl.PostId
+    inner join Posts p2 on p2.Id = pl.RelatedPostId
+),
+UserActivitySummary as (
+    select
+        u.Id,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        coalesce(sum(v.VoteTypeId = 2)::int, 0) as TotalUpVotes,
+        coalesce(sum(v.VoteTypeId = 3)::int, 0) as TotalDownVotes,
+        max(p.CreationDate) as LastPostDate,
+        min(p.CreationDate) as FirstPostDate,
+        (extract(epoch from max(p.CreationDate) - min(p.CreationDate))/86400)::int as ActiveDays
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopActiveUsers as (
+    select
+        uas.Id,
+        uas.DisplayName,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.CommentCount,
+        uas.TotalUpVotes,
+        uas.TotalDownVotes,
+        uas.ActiveDays,
+        (uas.QuestionCount + uas.AnswerCount + uas.CommentCount) / nullif(uas.ActiveDays,0) as ActivityPerDay
+    from UserActivitySummary uas
+    where uas.ActiveDays > 0
+    order by ActivityPerDay desc
+    limit 10
+)
+select
+    rau.Id as UserId,
+    rau.DisplayName,
+    rau.QuestionCount,
+    rau.AnswerCount,
+    rau.CommentCount,
+    rau.TotalUpVotes,
+    rau.TotalDownVotes,
+    rau.ActiveDays,
+    rau.ActivityPerDay,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.TagBasedBadges,
+    rtc.TagName as TopTag,
+    rtc.Count as TagUsageCount,
+    rtc.AnswerCount as TagAnswerCount,
+    rtc.ViewCount as TagViewCount,
+    rtc.Score as TagScore,
+    cqwr.CloseReason,
+    dq.PostTitle as DuplicatePostTitle,
+    dq.RelatedPostTitle as DuplicateOfTitle,
+    pa.RecentPostRank,
+    pa.PrevScore,
+    pa.NextScore
+from TopActiveUsers rau
+left join UserBadgeStats ubs on ubs.UserId = rau.Id
+left join LATERAL (
+    select rtc2.TagName, rtc2.Count, rtc2.AnswerCount, rtc2.ViewCount, rtc2.Score
+    from RecursiveTagCounts rtc2
+    join Posts p2 on p2.OwnerUserId = rau.Id and p2.Tags like '%' || rtc2.TagName || '%'
+    order by rtc2.Count desc
+    limit 1
+) rtc on true
+left join ClosedQuestionsWithReasons cqwr on cqwr.ClosedByUserId = rau.Id
+left join DuplicateLinks dq on dq.PostId = (select p.Id from Posts p where p.OwnerUserId = rau.Id and p.PostTypeId = 1 order by p.CreationDate desc limit 1)
+left join PostActivityWindow pa on pa.OwnerUserId = rau.Id and pa.RecentPostRank = 1
+order by rau.ActivityPerDay desc
+limit 20;

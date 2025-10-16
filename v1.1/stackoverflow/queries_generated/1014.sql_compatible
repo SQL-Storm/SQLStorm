@@ -1,0 +1,90 @@
+WITH UserPostStats AS (
+    SELECT 
+        U.Id AS UserId,
+        U.DisplayName,
+        COUNT(P.Id) AS PostCount,
+        SUM(CASE WHEN P.Score > 0 THEN 1 ELSE 0 END) AS PositivePosts,
+        SUM(CASE WHEN P.Score < 0 THEN 1 ELSE 0 END) AS NegativePosts,
+        AVG(CASE WHEN P.Score IS NOT NULL THEN P.Score ELSE 0 END) AS AverageScore,
+        MAX(U.Tags) AS Tags
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    GROUP BY U.Id, U.DisplayName
+),
+RankedUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        PostCount,
+        PositivePosts,
+        NegativePosts,
+        AverageScore,
+        Tags,
+        RANK() OVER (ORDER BY PostCount DESC) AS PostRank
+    FROM UserPostStats
+),
+PopularTags AS (
+    SELECT 
+        tag AS Tag,
+        COUNT(p.Id) AS TagPostCount
+    FROM Posts p
+    CROSS APPLY (VALUES (NULL)) v -- placeholder for compatibility; real UNNEST handled below
+    -- Split Tags by '<>' into rows; different dialects use different functions.
+    -- Implement using a standard SQL approach via a recursive CTE to split strings.
+    -- We'll build a tags splitter CTE below and join to Posts.
+    GROUP BY tag
+),
+SplitTags AS (
+    -- recursive splitter: returns PostId and one Tag per row for Posts with Tags delimited by '<>'
+    SELECT Id AS PostId,
+           TRIM(CASE WHEN POSITION('<>' IN Tags) = 0 THEN Tags ELSE SUBSTRING(Tags FROM 1 FOR POSITION('<>' IN Tags)-1) END) AS Tag,
+           CASE WHEN POSITION('<>' IN Tags) = 0 THEN '' ELSE SUBSTRING(Tags FROM POSITION('<>' IN Tags) + 2) END AS Rest
+    FROM Posts
+    WHERE Tags IS NOT NULL
+    UNION ALL
+    SELECT PostId,
+           TRIM(CASE WHEN POSITION('<>' IN Rest) = 0 THEN Rest ELSE SUBSTRING(Rest FROM 1 FOR POSITION('<>' IN Rest)-1) END) AS Tag,
+           CASE WHEN POSITION('<>' IN Rest) = 0 THEN '' ELSE SUBSTRING(Rest FROM POSITION('<>' IN Rest) + 2) END AS Rest
+    FROM SplitTags
+    WHERE Rest <> ''
+),
+PopularTagsComputed AS (
+    SELECT
+        Tag,
+        COUNT(DISTINCT s.PostId) AS TagPostCount
+    FROM SplitTags s
+    JOIN Posts p ON p.Id = s.PostId
+    WHERE p.PostTypeId = 1
+      AND Tag IS NOT NULL
+      AND Tag <> ''
+    GROUP BY Tag
+    ORDER BY TagPostCount DESC
+    LIMIT 10
+)
+SELECT 
+    RU.UserId,
+    RU.DisplayName,
+    RU.PostCount,
+    RU.PositivePosts,
+    RU.NegativePosts,
+    RU.AverageScore,
+    COALESCE(PT.TagPostCount, 0) AS PopularTagCount,
+    PT.Tag
+FROM RankedUsers RU
+LEFT JOIN PopularTagsComputed PT
+  ON PT.Tag IN (
+      SELECT Tag FROM (
+        -- split the user's Tags string into rows
+        SELECT TRIM(CASE WHEN POSITION('<>' IN RU.Tags) = 0 THEN RU.Tags ELSE SUBSTRING(RU.Tags FROM 1 FOR POSITION('<>' IN RU.Tags)-1) END) AS Tag,
+               CASE WHEN POSITION('<>' IN RU.Tags) = 0 THEN '' ELSE SUBSTRING(RU.Tags FROM POSITION('<>' IN RU.Tags) + 2) END AS Rest
+        UNION ALL
+        SELECT TRIM(CASE WHEN POSITION('<>' IN Rest) = 0 THEN Rest ELSE SUBSTRING(Rest FROM 1 FOR POSITION('<>' IN Rest)-1) END) AS Tag,
+               CASE WHEN POSITION('<>' IN Rest) = 0 THEN '' ELSE SUBSTRING(Rest FROM POSITION('<>' IN Rest) + 2) END AS Rest
+        FROM (
+          SELECT RU.Tags AS Rest
+        ) r
+        WHERE RU.Tags IS NOT NULL
+      ) AS user_tags
+    )
+WHERE RU.PostRank <= 50
+ORDER BY RU.PostCount DESC, RU.AverageScore DESC;

@@ -1,0 +1,172 @@
+-- {"query": "9087.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2013, "output_tokens": 5218} 
+
+WITH
+-- pick recent questions by user, tag-filtered and rank them per user with a correlated subquery
+FilteredPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        -- count of answers to this question that scored higher than a fraction of this question's score
+        (SELECT COUNT(*) 
+           FROM Posts ans
+          WHERE ans.ParentId = p.Id
+            AND ans.Score > p.Score / NULLIF(NULLIF(ABS(p.Score),0),1)
+        ) AS BetterAnswers,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.OwnerUserId
+            ORDER BY p.Score DESC, p.CreationDate DESC
+        ) AS UserRank
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > NOW() - INTERVAL '1 year'
+      AND p.Tags ILIKE '%<sql>%'
+),
+-- aggregate recent badges per user
+BadgesPerUser AS (
+    SELECT
+        b.UserId,
+        COUNT(*)                         AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    WHERE b.Date > CURRENT_DATE - INTERVAL '6 months'
+    GROUP BY b.UserId
+),
+-- summarize user activity: join badges, questions and comments
+UserActivity AS (
+    SELECT
+        u.Id             AS UserId,
+        u.DisplayName,
+        u.CreationDate,
+        COALESCE(bp.TotalBadges, 0)  AS TotalBadges,
+        COALESCE(bp.GoldBadges,  0)  AS GoldBadges,
+        COALESCE(bp.SilverBadges,0)  AS SilverBadges,
+        COALESCE(bp.BronzeBadges,0)  AS BronzeBadges,
+        COUNT(DISTINCT p.Id)         AS QuestionCount,
+        SUM(COALESCE(p.Score,0))     AS TotalQuestionScore,
+        COUNT(c.Id) FILTER (
+            WHERE c.CreationDate > NOW() - INTERVAL '30 days'
+        )                            AS RecentComments
+    FROM Users u
+    LEFT JOIN BadgesPerUser bp ON bp.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY
+        u.Id, u.DisplayName, u.CreationDate,
+        bp.TotalBadges, bp.GoldBadges, bp.SilverBadges, bp.BronzeBadges
+),
+-- rank users by activity metrics
+TopActiveUsers AS (
+    SELECT
+        ua.*,
+        RANK() OVER (
+            ORDER BY
+              ua.TotalBadges   DESC,
+              ua.QuestionCount DESC,
+              ua.TotalQuestionScore DESC
+        ) AS ActivityRank
+    FROM UserActivity ua
+)
+-- first set: top 100 active users with their top recent ‘sql’-tagged question and tags exploded
+(
+    SELECT
+        ta.UserId,
+        ta.DisplayName,
+        ta.CreationDate,
+        ta.ActivityRank,
+        ta.TotalBadges,
+        ta.GoldBadges,
+        ta.SilverBadges,
+        ta.BronzeBadges,
+        ta.QuestionCount,
+        ta.TotalQuestionScore,
+        ta.RecentComments,
+        fp.Id            AS TopQuestionId,
+        fp.Title         AS TopQuestionTitle,
+        fp.Score         AS TopQuestionScore,
+        -- explode the Tags column into a comma‑delimited list
+        (
+          SELECT STRING_AGG(tag, ', ')
+          FROM UNNEST(
+                   string_to_array(
+                     substring(fp.Tags, 2, length(fp.Tags)-2),
+                     '><'
+                   )
+                 ) AS tag
+        )                AS TopQuestionTags
+    FROM TopActiveUsers ta
+    LEFT JOIN FilteredPosts fp
+      ON fp.OwnerUserId = ta.UserId
+     AND fp.UserRank = 1
+    WHERE ta.ActivityRank <= 100
+)
+UNION ALL
+-- second set: high-reputation users who didn’t make the top‑100 active list
+(
+    SELECT
+        u.Id           AS UserId,
+        u.DisplayName,
+        u.CreationDate,
+        NULL::int      AS ActivityRank,
+        0              AS TotalBadges,
+        0              AS GoldBadges,
+        0              AS SilverBadges,
+        0              AS BronzeBadges,
+        0              AS QuestionCount,
+        0              AS TotalQuestionScore,
+        0              AS RecentComments,
+        NULL::int      AS TopQuestionId,
+        NULL::varchar  AS TopQuestionTitle,
+        NULL::int      AS TopQuestionScore,
+        NULL::text     AS TopQuestionTags
+    FROM Users u
+    WHERE u.Reputation > 10000
+      AND NOT EXISTS (
+          SELECT 1
+            FROM TopActiveUsers ta
+           WHERE ta.UserId = u.Id
+      )
+)
+EXCEPT
+-- exclude users who joined in the last 30 days regardless of earlier sets
+(
+    SELECT
+        ta.UserId,
+        ta.DisplayName,
+        ta.CreationDate,
+        ta.ActivityRank,
+        ta.TotalBadges,
+        ta.GoldBadges,
+        ta.SilverBadges,
+        ta.BronzeBadges,
+        ta.QuestionCount,
+        ta.TotalQuestionScore,
+        ta.RecentComments,
+        fp.Id,
+        fp.Title,
+        fp.Score,
+        (
+          SELECT STRING_AGG(tag, ', ')
+          FROM UNNEST(
+                   string_to_array(
+                     substring(fp.Tags, 2, length(fp.Tags)-2),
+                     '><'
+                   )
+                 ) AS tag
+        )
+    FROM TopActiveUsers ta
+    LEFT JOIN FilteredPosts fp
+      ON fp.OwnerUserId = ta.UserId
+     AND fp.UserRank = 1
+    WHERE ta.CreationDate > NOW() - INTERVAL '30 days'
+)
+ORDER BY ActivityRank NULLS LAST, TotalBadges DESC, UserId;
+```
+
+---
+
+*This single SQL statement includes CTEs, correlated subqueries, window functions, outer joins, set operators (UNION ALL, EXCEPT), string expressions, NULL logic, and complex predicates for performance benchmarking.*

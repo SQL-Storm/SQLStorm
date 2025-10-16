@@ -1,0 +1,152 @@
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score) AS AvgPostScore,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.Id END) AS EditCount,
+        MAX(ph.CreationDate) AS LastActivity
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1, 2)
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (1, 2, 4, 5, 6, 7, 8, 9)
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+BadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(DISTINCT CASE WHEN b.TagBased = 1 THEN b.Name END) AS TagBadgeCount,
+        -- Standard SQL: STRING_AGG may not support DISTINCT+ORDER BY in all dialects; keep for Postgres-compatible systems
+        STRING_AGG(DISTINCT CASE WHEN b.Class = 1 THEN b.Name ELSE NULL END, ', ' ORDER BY b.Date DESC) AS GoldBadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+),
+VoteSummary AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) AS TotalBountiesOffered,
+        (SELECT COUNT(*) FROM Votes v2 WHERE v2.PostId = v.PostId AND v2.VoteTypeId = 2) AS IndependentUpVoteCount
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2, 3, 8)
+    GROUP BY v.PostId
+),
+HighImpactPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        COALESCE(vs.UpVotes, 0) AS CalculatedUpVotes,
+        GREATEST(p.Score - COALESCE(vs.DownVotes, 0), 0) AS NetScore,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount >= 5 THEN 'Popular Question'
+            ELSE 'Active'
+        END AS PostStatus,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RecencyRank,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostScore,
+        -- Extract first tag: adapt to SQL standard using SUBSTRING and POSITION
+        SUBSTRING(p.Tags FROM 2 FOR (POSITION('><' IN p.Tags) - 2)) AS FirstTag,
+        p.OwnerUserId,
+        p.CreationDate
+    FROM Posts p
+    LEFT JOIN VoteSummary vs ON p.Id = vs.PostId
+    WHERE p.PostTypeId = 1 
+      AND (p.Score > 10 OR p.ViewCount > 1000 OR p.AnswerCount > 3)
+      AND p.Title IS NOT NULL 
+      AND (p.Title NOT ILIKE '%homework%' OR p.Title ILIKE '%algorithm%')
+),
+UserEngagementMetrics AS (
+    SELECT 
+        ua.UserId,
+        ua.PostCount,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.AvgPostScore,
+        bs.TotalBadges,
+        (ua.EditCount * 1.0 / NULLIF(ua.PostCount, 0)) AS EditsPerPost,
+        NTILE(4) OVER (ORDER BY ua.Reputation DESC) AS ReputationQuartile,
+        DENSE_RANK() OVER (ORDER BY COALESCE(ua.LastActivity, u.CreationDate) DESC) AS ActivityRank,
+        ua.Reputation
+    FROM UserActivity ua
+    LEFT JOIN BadgeStats bs ON ua.UserId = bs.UserId
+    LEFT JOIN Users u ON ua.UserId = u.Id
+    WHERE ua.PostCount > 0
+      AND (ua.QuestionCount > 0 OR ua.AnswerCount > 5)
+)
+SELECT 
+    uem.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    uem.ReputationQuartile,
+    uem.ActivityRank,
+    uem.PostCount,
+    uem.QuestionCount,
+    uem.AnswerCount,
+    ROUND(uem.AvgPostScore, 2) AS AvgPostScore,
+    COALESCE(bs.GoldBadges, 0) AS GoldBadges,
+    COALESCE(bs.SilverBadges, 0) AS SilverBadges,
+    uem.EditsPerPost,
+    uem.TotalBadges,
+    COUNT(DISTINCT hip.PostId) AS HighImpactPostsOwned,
+    SUM(hip.NetScore) AS TotalNetScoreFromHighImpact,
+    AVG(hip.NetScore) AS AvgNetScoreHighImpact,
+    STRING_AGG(DISTINCT hip.FirstTag, ' | ' ORDER BY hip.FirstTag) AS TopTagsFromHighImpactPosts,
+    CASE 
+        WHEN uem.ReputationQuartile = 1 AND COALESCE(bs.GoldBadges, 0) >= 3 THEN 'Elite'
+        WHEN uem.PostCount >= 50 AND uem.AnswerCount >= 20 THEN 'Active Contributor'
+        WHEN COALESCE(bs.TagBadgeCount, 0) >= 5 THEN 'Tag Specialist'
+        ELSE 'Standard User'
+    END AS UserCategory,
+    -- Replace the LIMIT inside STRING_AGG with a subquery that restricts rows first, then aggregates.
+    (SELECT STRING_AGG(c.Text, ' // ' ORDER BY c.CreationDate DESC)
+     FROM (
+         SELECT c.Text, c.CreationDate
+         FROM Comments c
+         WHERE c.UserId = uem.UserId
+           AND LENGTH(c.Text) > 10
+           AND c.Score >= 0
+         ORDER BY c.CreationDate DESC
+         LIMIT 3
+     ) sub) AS RecentCommentsSummary
+FROM UserEngagementMetrics uem
+INNER JOIN UserActivity ua ON uem.UserId = ua.UserId
+LEFT JOIN BadgeStats bs ON uem.UserId = bs.UserId
+LEFT JOIN HighImpactPosts hip ON ua.UserId = hip.OwnerUserId
+WHERE uem.ActivityRank <= 1000
+  AND (uem.QuestionCount >= 1 OR uem.AnswerCount >= 10)
+  AND (ua.Reputation >= 100 OR COALESCE(bs.TotalBadges, 0) >= 5)
+  AND NOT EXISTS (
+      SELECT 1 FROM PostHistory ph2 
+      WHERE ph2.UserId = uem.UserId 
+        AND ph2.PostHistoryTypeId = 12
+        AND ph2.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '1 year')
+  )
+GROUP BY 
+    uem.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    uem.ReputationQuartile,
+    uem.ActivityRank,
+    uem.PostCount,
+    uem.QuestionCount,
+    uem.AnswerCount,
+    uem.AvgPostScore,
+    bs.GoldBadges,
+    bs.SilverBadges,
+    uem.EditsPerPost,
+    uem.TotalBadges,
+    COALESCE(bs.TagBadgeCount, 0)
+HAVING COUNT(DISTINCT hip.PostId) > 0 OR uem.AnswerCount > 15
+ORDER BY uem.Reputation DESC, uem.ActivityRank ASC
+LIMIT 50 OFFSET 0;

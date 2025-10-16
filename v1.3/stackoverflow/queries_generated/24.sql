@@ -1,0 +1,215 @@
+-- {"query": "24.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1984} 
+with
+-- recent active questions with parsed tag array and tag count
+Questions as (
+  select
+    p.Id,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    coalesce(p.Tags,'') as TagsRaw,
+    case when p.Tags is null or p.Tags = '' then array[]::text[]
+         else string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')
+    end as TagList
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= now() - interval '2 years'
+),
+-- answers joined to their questions
+Answers as (
+  select
+    a.Id,
+    a.ParentId as QuestionId,
+    a.OwnerUserId,
+    a.CreationDate,
+    a.Score,
+    a.Body,
+    a.CommentCount
+  from Posts a
+  where a.PostTypeId = 2
+    and a.CreationDate >= now() - interval '2 years'
+),
+-- user aggregate stats
+UserAgg as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.Location,
+    count(distinct b.Id) filter (where b.Class = 1) as GoldBadges,
+    count(distinct b.Id) filter (where b.Class = 2) as SilverBadges,
+    count(distinct b.Id) filter (where b.Class = 3) as BronzeBadges,
+    coalesce(sum(case when v.VoteTypeId = 2 then 1 when v.VoteTypeId = 3 then -1 else 0 end),0) as VoteSentiment,
+    row_number() over (order by u.Reputation desc nulls last) as RankByReputation
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  left join Votes v on v.UserId = u.Id
+  group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+),
+-- compute per-question statistics including correlated subqueries and window functions
+QuestionStats as (
+  select
+    q.Id as QuestionId,
+    q.Title,
+    q.OwnerUserId,
+    q.CreationDate,
+    q.Score as QuestionScore,
+    q.ViewCount,
+    q.TagsRaw,
+    q.TagList,
+    -- answers count and top answer score via aggregation + window
+    count(a.Id) as AnswerCount,
+    max(a.Score) as MaxAnswerScore,
+    min(a.Score) filter (where a.Score is not null) as MinAnswerScore,
+    sum(coalesce(a.Score,0)) as SumAnswerScore,
+    -- average age of answers in hours
+    case when count(a.Id) = 0 then null
+         else extract(epoch from avg(a.CreationDate - q.CreationDate))/3600
+    end as AvgAnswerHours,
+    -- accepted answer id and score via correlated subquery
+    (select p.AcceptedAnswerId from Posts p where p.Id = q.Id) as AcceptedAnswerId,
+    -- most active commenter for the question (including comments on answers)
+    (
+      select c.UserId
+      from Comments c
+      where c.PostId in (
+        select id from Posts where Id = q.Id or ParentId = q.Id
+      )
+      group by c.UserId
+      order by count(*) desc nulls last
+      limit 1
+    ) as TopCommenterId,
+    -- count of distinct contributors (owners of question, answers, and editors in posthistory)
+    (
+      select count(distinct contributor) from (
+        select q.OwnerUserId as contributor
+        union
+        select a.OwnerUserId from Posts a where a.ParentId = q.Id
+        union
+        select ph.UserId from PostHistory ph where ph.PostId = q.Id and ph.UserId is not null
+      ) s
+    ) as DistinctContributors,
+    -- window functions to rank similar questions by score within same primary tag
+    dense_rank() over (
+      partition by coalesce((q.TagList)[1], '') order by q.Score desc NULLS LAST
+    ) as RankInPrimaryTag,
+    percent_rank() over (
+      partition by coalesce((q.TagList)[1], '') order by q.Score
+    ) as PercentRankInPrimaryTag
+  from Questions q
+  left join Answers a on a.ParentId = q.Id
+  group by q.Id, q.Title, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount, q.TagsRaw, q.TagList
+),
+-- compute tag popularity by exploding tag arrays
+TagExplode as (
+  select
+    t.tag,
+    count(distinct q.QuestionId) as QuestionsWithTag,
+    sum(q.AnswerCount) as TotalAnswersOnTaggedQuestions,
+    avg(q.QuestionScore) as AvgQuestionScore,
+    max(q.MaxAnswerScore) as MaxAnswerAcrossQuestions,
+    -- last activity (most recent question creation) for the tag
+    max(q.CreationDate) as LastQuestionDate
+  from QuestionStats q
+  cross join lateral unnest(q.TagList) as t(tag)
+  group by t.tag
+),
+-- identify suspicious duplicate links (PostLinks of type Duplicate) with mismatched score direction
+DuplicateSuspicion as (
+  select
+    pl.Id as LinkId,
+    pl.PostId,
+    pl.RelatedPostId,
+    pl.CreationDate,
+    pl.LinkTypeId,
+    p1.Score as ScoreFrom,
+    p2.Score as ScoreTo,
+    case
+      when p1.Score is null or p2.Score is null then 'unknown'
+      when p1.Score < p2.Score then 'to-higher-score'
+      when p1.Score > p2.Score then 'to-lower-score'
+      else 'equal'
+    end as ScoreDirection
+  from PostLinks pl
+  join Posts p1 on p1.Id = pl.PostId
+  join Posts p2 on p2.Id = pl.RelatedPostId
+  where pl.LinkTypeId = 3 -- duplicate
+    and pl.CreationDate >= now() - interval '2 years'
+),
+-- heavy hitters combining many features for benchmarking
+HeavyHitters as (
+  select
+    qs.*,
+    ta.tag as PrimaryTag,
+    te.QuestionsWithTag,
+    te.TotalAnswersOnTaggedQuestions,
+    ua.DisplayName as OwnerName,
+    ua.Reputation as OwnerReputation,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.VoteSentiment,
+    ua.RankByReputation,
+    ds.ScoreDirection,
+    -- string manipulations showcasing null logic and expressions
+    left(coalesce(qs.Title,'<no title>') || ' [' || coalesce(ta.tag,'untagged') || ']', 120) as ShortTitle,
+    -- synthetic complexity score
+    (
+      coalesce(qs.QuestionScore,0) * 2
+      + coalesce(qs.AnswerCount,0) * 3
+      + coalesce(te.QuestionsWithTag,0) / nullif(coalesce(ua.RankByReputation,0),0)
+      + coalesce(ua.GoldBadges,0) * 5
+      - coalesce(ua.BronzeBadges,0)
+      + case when qs.AcceptedAnswerId is not null then 10 else 0 end
+      + case when qs.DistinctContributors > 5 then 7 else qs.DistinctContributors end
+    )::numeric(18,6) as ComplexityScore
+  from QuestionStats qs
+  left join lateral (
+    select (qs.TagList)[1] as tag
+  ) ta on true
+  left join TagExplode te on te.tag = ta.tag
+  left join UserAgg ua on ua.UserId = qs.OwnerUserId
+  left join lateral (
+    select ds.ScoreDirection
+    from DuplicateSuspicion ds
+    where ds.PostId = qs.QuestionId
+    order by ds.CreationDate desc nulls last
+    limit 1
+  ) ds on true
+)
+select
+  hh.QuestionId,
+  hh.ShortTitle,
+  hh.PrimaryTag,
+  hh.ComplexityScore,
+  hh.QuestionScore,
+  hh.AnswerCount,
+  hh.MaxAnswerScore,
+  hh.AvgAnswerHours,
+  hh.DistinctContributors,
+  hh.OwnerName,
+  hh.OwnerReputation,
+  hh.GoldBadges,
+  hh.SilverBadges,
+  hh.BronzeBadges,
+  hh.ScoreDirection,
+  te.QuestionsWithTag,
+  te.TotalAnswersOnTaggedQuestions,
+  -- correlated scalar subquery with fallback using COALESCE
+  coalesce(
+    (select string_agg(distinct u.DisplayName, ', ')
+     from Users u
+     where u.Id in (
+       select unnest(array_remove(array[
+         hh.OwnerName::text is not null and hh.OwnerName::text <> '' then hh.OwnerName::text end]::text[]))
+    ), '<no contributors>'),
+    '<no contributors>'
+  ) as ContributorsPreview
+from HeavyHitters hh
+left join TagExplode te on te.tag = hh.PrimaryTag
+where hh.ComplexityScore is not null
+order by hh.ComplexityScore desc nulls last
+limit 250;

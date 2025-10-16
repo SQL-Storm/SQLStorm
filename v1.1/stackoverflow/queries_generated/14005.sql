@@ -1,0 +1,64 @@
+-- {"query": "14005.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 14010, "output_tokens": 6002} 
+WITH cte AS (
+  SELECT 
+    p.Id, 
+    p.PostTypeId, 
+    p.AcceptedAnswerId, 
+    p.ParentId, 
+    p.CreationDate, 
+    p.Score, 
+    p.ViewCount, 
+    p.OwnerUserId, 
+    p.AnswerCount, 
+    p.CommentCount, 
+    p.FavoriteCount, 
+    p.ClosedDate, 
+    p.CommunityOwnedDate, 
+    u.Reputation, 
+    u.CreationDate AS UserCreationDate, 
+    u.LastAccessDate, 
+    u.UpVotes, 
+    u.DownVotes, 
+    COALESCE(DATEDIFF(p.CreationDate, u.CreationDate), 0) AS UserPostAgeDays, 
+    COALESCE(DATEDIFF(p.CreationDate, u.LastAccessDate), 0) AS UserInactivityDays,
+    CASE 
+      WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+      WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+      ELSE 'Open' 
+    END AS PostStatus,
+    (CASE WHEN p.ClosedDate IS NOT NULL THEN (SELECT Name FROM CloseReasonTypes WHERE Id = CAST(ph.Comment AS INT)) ELSE NULL END) AS CloseReason
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 10
+)
+SELECT 
+  cte.Id, 
+  cte.PostTypeId, 
+  cte.AcceptedAnswerId, 
+  cte.ParentId, 
+  cte.CreationDate, 
+  cte.Score, 
+  cte.ViewCount, 
+  cte.OwnerUserId, 
+  cte.AnswerCount, 
+  cte.CommentCount, 
+  cte.FavoriteCount, 
+  cte.ClosedDate, 
+  cte.CommunityOwnedDate, 
+  cte.Reputation, 
+  cte.UserCreationDate, 
+  cte.LastAccessDate, 
+  cte.UpVotes, 
+  cte.DownVotes, 
+  cte.UserPostAgeDays, 
+  cte.UserInactivityDays, 
+  cte.PostStatus, 
+  cte.CloseReason,
+  CONCAT(CAST(ROUND(COALESCE(cte.UpVotes, 0) * 1.0 / NULLIF(COALESCE(cte.UpVotes, 0) + COALESCE(cte.DownVotes, 0), 0), 2) * 100 AS DECIMAL(5,2)), '%') AS VoteRatio,
+  CONCAT(CAST(ROUND(COALESCE(cte.FavoriteCount, 0) * 1.0 / NULLIF(cte.ViewCount, 0), 2) * 100 AS DECIMAL(5,2)), '%') AS FavoriteRatio,
+  DATEDIFF(COALESCE(cte.ClosedDate, cte.CommunityOwnedDate, cte.CreationDate), cte.CreationDate) AS PostLifeDays,
+  COALESCE(ph.Comment, '') AS CloseComment
+FROM cte
+LEFT JOIN PostHistory ph ON cte.Id = ph.PostId AND ph.PostHistoryTypeId = 10
+ORDER BY cte.CreationDate DESC
+LIMIT 1000;

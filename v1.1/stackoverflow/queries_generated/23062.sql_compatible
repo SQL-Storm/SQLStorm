@@ -1,0 +1,125 @@
+WITH TopTags AS (
+    SELECT 
+        t.Id AS TagId,
+        t.TagName,
+        t.Count AS TagCount,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    WHERE t.Count > 1000
+),
+UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        AVG(p.Score) AS AvgScore,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS TotalQuestionViews,
+        COALESCE(MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END), 0) AS HasGoldBadge
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId AND b.TagBased = TRUE
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT p.Id) > 10
+),
+CorrelatedSubqueryExample AS (
+    SELECT 
+        ups.UserId,
+        ups.DisplayName,
+        ups.Reputation,
+        ups.TotalPosts,
+        ups.AvgScore,
+        ups.TotalQuestionViews,
+        ups.HasGoldBadge,
+        (SELECT COUNT(*) 
+         FROM Votes v 
+         WHERE v.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = ups.UserId) 
+         AND v.VoteTypeId = 2) AS UpvoteCount,
+        COALESCE(
+            (SELECT STRING_AGG(TagName, ', ') 
+             FROM Tags 
+             WHERE Id IN (
+                 SELECT DISTINCT CAST(value AS INTEGER)
+                 FROM (
+                   -- split Tags like '<tag1><tag2>' into rows in a dialect-portable way via replace and regexp-like splitting
+                   SELECT TRIM(s) AS value FROM (
+                     SELECT 
+                       -- replace >< with a delimiter and remove leading/trailing angle brackets
+                       REPLACE(SUBSTRING(p.Tags FROM 2 FOR CASE WHEN LENGTH(p.Tags) >= 2 THEN LENGTH(p.Tags)-2 ELSE 0 END), '><', '|') AS toks
+                     FROM Posts p
+                     WHERE p.OwnerUserId = ups.UserId AND p.PostTypeId = 1
+                   ) AS inner1,
+                   LATERAL (
+                     -- split on '|' into rows; use standard SQL approach via recursive CTE alternative not allowed here,
+                     -- but many engines support a simple string split function; fallback to returning the whole string as one value
+                     SELECT toks AS s
+                   ) AS inner2
+                 ) AS splitvals
+               )
+            ),
+            'No Tags'
+        ) AS UserTags
+    FROM UserPostStats ups
+    WHERE ups.Reputation > (SELECT AVG(Reputation) FROM Users WHERE Reputation > 0)
+),
+RecentActivity AS (
+    SELECT 
+        ph.PostId,
+        ph.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (10, 11) THEN 'Closure Event'
+            WHEN ph.Text IS NULL THEN 'Unknown'
+            ELSE UPPER(SUBSTRING(ph.Text FROM 1 FOR 10)) || '...'
+        END AS EventDescription
+    FROM PostHistory ph
+    WHERE ph.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR
+)
+SELECT 
+    cse.UserId,
+    cse.DisplayName,
+    cse.Reputation,
+    cse.TotalPosts,
+    ROUND(cse.AvgScore, 2) AS RoundedAvgScore,
+    cse.TotalQuestionViews,
+    cse.HasGoldBadge,
+    cse.UpvoteCount,
+    cse.UserTags,
+    tt.TagName AS TopTag,
+    tt.TagRank,
+    ra.EventDescription AS LatestEvent,
+    NULLIF(pl.LinkTypeId, 3) AS NonDuplicateLinkType,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 5) AS HighScoreComments
+FROM CorrelatedSubqueryExample cse
+INNER JOIN Posts p ON cse.UserId = p.OwnerUserId AND p.PostTypeId = 1
+LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN TopTags tt ON tt.TagId = (
+    SELECT Id FROM Tags WHERE TagName = CASE 
+        WHEN POSITION(', ' IN cse.UserTags) > 0 THEN SUBSTRING(cse.UserTags FROM 1 FOR POSITION(', ' IN cse.UserTags)-1)
+        ELSE cse.UserTags
+    END
+    LIMIT 1
+)
+LEFT JOIN RecentActivity ra ON p.Id = ra.PostId AND ra.rn = 1
+WHERE cse.UpvoteCount > 100 OR tt.TagRank <= 10
+
+UNION ALL
+
+SELECT 
+    CAST(NULL AS INTEGER) AS UserId,
+    'Aggregate' AS DisplayName,
+    SUM(Reputation) AS Reputation,
+    SUM(TotalPosts) AS TotalPosts,
+    AVG(AvgScore) AS RoundedAvgScore,
+    SUM(TotalQuestionViews) AS TotalQuestionViews,
+    SUM(HasGoldBadge) AS HasGoldBadge,
+    SUM(UpvoteCount) AS UpvoteCount,
+    CAST(NULL AS VARCHAR) AS UserTags,
+    CAST(NULL AS VARCHAR) AS TopTag,
+    CAST(NULL AS INTEGER) AS TagRank,
+    CAST(NULL AS VARCHAR) AS LatestEvent,
+    CAST(NULL AS INTEGER) AS NonDuplicateLinkType,
+    CAST(NULL AS INTEGER) AS HighScoreComments
+FROM CorrelatedSubqueryExample
+ORDER BY Reputation DESC
+LIMIT 100;

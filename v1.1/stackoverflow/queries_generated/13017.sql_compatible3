@@ -1,0 +1,95 @@
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY SUM(COALESCE(p.Score,0)) DESC) AS UserRank
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    WHERE 
+        u.Reputation > 1000 AND p.CreationDate >= (DATE '2024-10-01' - INTERVAL '1 year')
+    GROUP BY 
+        u.Id, u.DisplayName
+),
+TagUsage AS (
+    SELECT 
+        t.TagName,
+        COUNT(p.Id) AS PostCount
+    FROM 
+        Tags t
+    INNER JOIN 
+        Posts p ON CAST(t.Id AS text) = ANY(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><'))
+    WHERE 
+        p.PostTypeId = 1 AND p.ClosedDate IS NULL
+    GROUP BY 
+        t.TagName
+    HAVING 
+        COUNT(p.Id) > 50
+),
+TopPerformingQuestions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        u.DisplayName,
+        COALESCE(SUM(v.BountyAmount), 0) AS TotalBounty,
+        LAG(p.Score, 1, 0) OVER (ORDER BY p.Score DESC) AS PreviousScore
+    FROM 
+        Posts p
+    JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId AND v.VoteTypeId = 8
+    WHERE 
+        p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL
+    GROUP BY 
+        p.Id, p.Title, p.Score, p.ViewCount, u.DisplayName
+),
+GlobalTopTag AS (
+    SELECT TagName, PostCount
+    FROM TagUsage
+    ORDER BY PostCount DESC
+    LIMIT 1
+)
+SELECT 
+    ua.UserId,
+    ua.DisplayName,
+    ua.PostCount,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    tq.Title AS LastQuestionTitle,
+    tq.Score AS LastQuestionScore,
+    gtt.TagName AS PopularTag,
+    gtt.PostCount AS TagPostCount,
+    tpq.TotalBounty,
+    (tpq.Score - tpq.PreviousScore) AS ScoreDifference,
+    ua.LastPostDate,
+    ua.UserRank
+FROM 
+    UserActivity ua
+LEFT JOIN LATERAL (
+    SELECT 
+        p.Title, 
+        p.Score,
+        p.Id AS PostId,
+        p.CreationDate
+    FROM 
+        Posts p
+    WHERE 
+        p.OwnerUserId = ua.UserId AND p.PostTypeId = 1
+    ORDER BY 
+        p.CreationDate DESC
+    LIMIT 1
+) tq ON TRUE
+LEFT JOIN GlobalTopTag gtt ON TRUE
+LEFT JOIN TopPerformingQuestions tpq ON tpq.Id = tq.PostId
+WHERE 
+    ua.UserRank <= 100
+ORDER BY 
+    ua.UserRank ASC, tq.Score DESC;

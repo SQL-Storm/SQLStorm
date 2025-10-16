@@ -1,0 +1,110 @@
+WITH TagList AS (
+    SELECT Id,
+           TagName,
+           Count
+    FROM   Tags
+    WHERE  TagName IS NOT NULL
+),
+UserStats AS (
+    SELECT  u.Id,
+            u.DisplayName,
+            u.Reputation,
+            COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0)                AS NetVotes,
+            (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id)        AS TotalBadges,
+            (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+            (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+            (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+            (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS AvgQuestionScore,
+            (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AvgAnswerScore,
+            MAX(p.LastActivityDate) OVER (PARTITION BY u.Id)            AS LastActivity,
+            ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate) AS RepRank,
+            u.CreationDate
+    FROM    Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE   u.Reputation > 1000
+),
+RecentVotes AS (
+    SELECT  v.UserId,
+            COUNT(CASE WHEN vt.Name = 'UpMod' THEN 1 END)   AS UpVotesLast30,
+            COUNT(CASE WHEN vt.Name = 'DownMod' THEN 1 END) AS DownVotesLast30,
+            MAX(v.CreationDate)                         AS LastVoteDate
+    FROM    Votes v
+    JOIN    VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE   v.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '30' DAY)
+    GROUP BY v.UserId
+),
+TagPosts AS (
+    SELECT  p.Id          AS PostId,
+            p.Title,
+            p.CreationDate,
+            p.Score,
+            t.TagName,
+            ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY p.Score DESC) AS TagRank
+    FROM    Posts p,
+            LATERAL (
+              SELECT UNNEST(string_to_array(trim(both '<>' FROM p.Tags), '><')) AS Tag
+            ) pt
+    JOIN    Tags t ON t.TagName = pt.Tag
+    WHERE   p.PostTypeId = 1
+      AND   p.Tags IS NOT NULL
+),
+UserTagActivity AS (
+    SELECT  us.Id,
+            us.DisplayName,
+            COUNT(DISTINCT tp.PostId)                                            AS DistinctTopTagPosts,
+            STRING_AGG(DISTINCT tp.TagName, ', ') 
+                FILTER (WHERE tp.TagRank <= 5)                                   AS PopularTags
+    FROM    UserStats us
+    LEFT JOIN LATERAL (
+            SELECT tp.*
+            FROM   TagPosts tp
+            WHERE  tp.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = us.Id)
+          ) tp ON TRUE
+    GROUP BY us.Id, us.DisplayName
+)
+SELECT  us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.NetVotes,
+        us.TotalBadges,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        ROUND(CAST(us.AvgQuestionScore AS numeric),2) AS AvgQScore,
+        ROUND(CAST(us.AvgAnswerScore AS numeric),2)   AS AvgAScore,
+        COALESCE(rv.UpVotesLast30,0)          AS UpVotes30d,
+        COALESCE(rv.DownVotesLast30,0)        AS DownVotes30d,
+        COALESCE(rv.LastVoteDate, us.CreationDate) AS LastVoteOrJoin,
+        us.LastActivity,
+        us.RepRank,
+        uta.DistinctTopTagPosts,
+        COALESCE(uta.PopularTags, 'None')     AS PopularTags
+FROM    UserStats us
+LEFT JOIN RecentVotes rv      ON rv.UserId = us.Id
+LEFT JOIN UserTagActivity uta ON uta.Id = us.Id
+WHERE   (us.RepRank <= 100 OR us.Reputation > 50000)
+
+UNION ALL
+
+SELECT  CAST(NULL AS BIGINT),
+        'TOTAL',
+        SUM(us.Reputation),
+        SUM(us.NetVotes),
+        SUM(us.TotalBadges),
+        SUM(us.GoldBadges),
+        SUM(us.SilverBadges),
+        SUM(us.BronzeBadges),
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        SUM(COALESCE(uta.DistinctTopTagPosts,0)),
+        'Aggregated'
+FROM    UserStats us
+LEFT JOIN UserTagActivity uta ON uta.Id = us.Id
+
+ORDER BY RepRank NULLS LAST
+LIMIT 150;

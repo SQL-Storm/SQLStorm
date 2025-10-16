@@ -1,0 +1,247 @@
+-- {"query": "201.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.2, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1992} 
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        coalesce(sum(v.VoteCount),0) as TotalVotesReceived,
+        row_number() over (order by u.Reputation desc, u.LastAccessDate desc) as UserRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select PostId, count(*) as VoteCount
+        from Votes
+        where VoteTypeId in (2,3) -- UpMod and DownMod
+        group by PostId
+    ) v on v.PostId = p.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+TopUsers as (
+    select UserId, DisplayName, Reputation, CreationDate, LastAccessDate, QuestionCount, AnswerCount, CommentCount, TotalVotesReceived, UserRank
+    from RecursiveUserActivity
+    where UserRank <= 100
+),
+PostDetails as (
+    select
+        p.Id,
+        p.PostTypeId,
+        pt.Name as PostTypeName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.DisplayName as OwnerDisplayName,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.LastActivityDate,
+        case when p.ClosedDate is not null then 1 else 0 end as IsClosed,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as PostRank
+    from Posts p
+    left join PostTypes pt on pt.Id = p.PostTypeId
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId in (1,2)
+),
+AcceptedAnswers as (
+    select
+        p.Id as AnswerId,
+        p.ParentId as QuestionId,
+        p.Score as AnswerScore,
+        p.CreationDate as AnswerCreationDate,
+        u.DisplayName as AnswerOwnerDisplayName,
+        u.Reputation as AnswerOwnerReputation
+    from Posts p
+    join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 2
+),
+QuestionWithAcceptedAnswer as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Tags,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.CreationDate as QuestionCreationDate,
+        q.OwnerUserId,
+        q.OwnerDisplayName,
+        q.AnswerCount,
+        q.CommentCount,
+        q.FavoriteCount,
+        q.IsClosed,
+        aa.AnswerId,
+        aa.AnswerScore,
+        aa.AnswerCreationDate,
+        aa.AnswerOwnerDisplayName,
+        aa.AnswerOwnerReputation
+    from PostDetails q
+    left join AcceptedAnswers aa on aa.QuestionId = q.Id
+    where q.PostTypeId = 1
+),
+TagExploded as (
+    select
+        QuestionId,
+        unnest(string_to_array(substring(Tags from 2 for char_length(Tags)-2), '><')) as Tag
+    from QuestionWithAcceptedAnswer
+    where Tags is not null
+),
+TagStats as (
+    select
+        Tag,
+        count(distinct QuestionId) as QuestionCount,
+        avg(QuestionScore) as AvgQuestionScore,
+        avg(AnswerScore) as AvgAcceptedAnswerScore,
+        sum(case when IsClosed = 1 then 1 else 0 end) as ClosedQuestions,
+        sum(FavoriteCount) as TotalFavorites
+    from TagExploded te
+    join QuestionWithAcceptedAnswer qwa on qwa.QuestionId = te.QuestionId
+    group by Tag
+),
+UserBadgeSummary as (
+    select
+        b.UserId,
+        u.DisplayName,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        count(distinct b.Name) as DistinctBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    join Users u on u.Id = b.UserId
+    group by b.UserId, u.DisplayName
+),
+UserActivityWithBadges as (
+    select
+        tua.*,
+        coalesce(ubs.GoldBadges,0) as GoldBadges,
+        coalesce(ubs.SilverBadges,0) as SilverBadges,
+        coalesce(ubs.BronzeBadges,0) as BronzeBadges,
+        coalesce(ubs.DistinctBadges,0) as DistinctBadges,
+        ubs.LastBadgeDate
+    from TopUsers tua
+    left join UserBadgeSummary ubs on ubs.UserId = tua.UserId
+),
+RecentPostHistoryEdits as (
+    select
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        p.Title,
+        ph.CreationDate,
+        ph.UserId,
+        u.DisplayName as EditorDisplayName,
+        ph.Comment,
+        ph.Text,
+        row_number() over (partition by ph.PostId order by ph.CreationDate desc) as rn
+    from PostHistory ph
+    join Posts p on p.Id = ph.PostId
+    left join Users u on u.Id = ph.UserId
+    where ph.PostHistoryTypeId in (4,5,6) -- Edit Title, Edit Body, Edit Tags
+),
+LatestEdits as (
+    select
+        PostId,
+        PostHistoryTypeId,
+        Title,
+        CreationDate,
+        UserId,
+        EditorDisplayName,
+        Comment,
+        Text
+    from RecentPostHistoryEdits
+    where rn = 1
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle,
+        pl.CreationDate as LinkCreationDate
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where pl.LinkTypeId = 3 -- Duplicate
+),
+CombinedQuestions as (
+    select
+        qwa.QuestionId,
+        qwa.Title,
+        qwa.Tags,
+        qwa.QuestionScore,
+        qwa.ViewCount,
+        qwa.QuestionCreationDate,
+        qwa.OwnerUserId,
+        qwa.OwnerDisplayName,
+        qwa.AnswerCount,
+        qwa.CommentCount,
+        qwa.FavoriteCount,
+        qwa.IsClosed,
+        qwa.AnswerId,
+        qwa.AnswerScore,
+        qwa.AnswerCreationDate,
+        qwa.AnswerOwnerDisplayName,
+        qwa.AnswerOwnerReputation,
+        le.PostHistoryTypeId as LastEditType,
+        le.CreationDate as LastEditDate,
+        le.EditorDisplayName as LastEditor,
+        dl.RelatedPostId as DuplicateOf,
+        dl.RelatedPostTitle as DuplicateOfTitle
+    from QuestionWithAcceptedAnswer qwa
+    left join LatestEdits le on le.PostId = qwa.QuestionId
+    left join DuplicateLinks dl on dl.PostId = qwa.QuestionId
+)
+select
+    cu.QuestionId,
+    cu.Title,
+    cu.Tags,
+    cu.QuestionScore,
+    cu.ViewCount,
+    cu.QuestionCreationDate,
+    cu.OwnerUserId,
+    cu.OwnerDisplayName,
+    cu.AnswerCount,
+    cu.CommentCount,
+    cu.FavoriteCount,
+    cu.IsClosed,
+    cu.AnswerId,
+    cu.AnswerScore,
+    cu.AnswerCreationDate,
+    cu.AnswerOwnerDisplayName,
+    cu.AnswerOwnerReputation,
+    cu.LastEditType,
+    cu.LastEditDate,
+    cu.LastEditor,
+    cu.DuplicateOf,
+    cu.DuplicateOfTitle,
+    ts.Tag,
+    ts.QuestionCount as TagQuestionCount,
+    ts.AvgQuestionScore as TagAvgQuestionScore,
+    ts.AvgAcceptedAnswerScore as TagAvgAcceptedAnswerScore,
+    ts.ClosedQuestions as TagClosedQuestions,
+    ts.TotalFavorites as TagTotalFavorites,
+    uab.GoldBadges,
+    uab.SilverBadges,
+    uab.BronzeBadges,
+    uab.DistinctBadges,
+    uab.LastBadgeDate
+from CombinedQuestions cu
+left join TagExploded te on te.QuestionId = cu.QuestionId
+left join TagStats ts on ts.Tag = te.Tag
+left join UserActivityWithBadges uab on uab.UserId = cu.OwnerUserId
+where cu.QuestionScore > (
+    select avg(QuestionScore) from QuestionWithAcceptedAnswer
+)
+and (cu.IsClosed = 0 or cu.IsClosed is null)
+and (cu.LastEditDate > cu.QuestionCreationDate or cu.LastEditDate is null)
+order by cu.QuestionScore desc, cu.ViewCount desc, ts.QuestionCount desc
+limit 100;

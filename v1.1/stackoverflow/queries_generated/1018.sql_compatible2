@@ -1,0 +1,85 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        COALESCE(u.DisplayName, 'Deleted User') AS OwnerDisplayName,
+        COUNT(c.Id) AS CommentCount,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY p.CreationDate DESC) AS rn
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN 
+        Comments c ON p.Id = c.PostId
+    WHERE 
+        p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    GROUP BY 
+        p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, u.DisplayName
+),
+PostWithTags AS (
+    SELECT 
+        rp.PostId,
+        rp.Title,
+        rp.CreationDate,
+        rp.Score,
+        rp.ViewCount,
+        rp.OwnerDisplayName,
+        rp.CommentCount,
+        STRING_AGG(t.TagName, ', ') AS Tags
+    FROM 
+        RankedPosts rp
+    LEFT JOIN LATERAL (
+        SELECT trim(value) AS tag
+        FROM UNNEST(string_to_array(COALESCE(rp.Title, ''), ',')) AS u(value)
+    ) tag_vals ON TRUE
+    LEFT JOIN Tags t ON tag_vals.tag = t.TagName
+    WHERE 
+        rp.rn = 1
+    GROUP BY 
+        rp.PostId, rp.Title, rp.CreationDate, rp.Score, rp.ViewCount, rp.OwnerDisplayName, rp.CommentCount
+),
+PostScores AS (
+    SELECT
+        pw.PostId,
+        pw.Title,
+        pw.CreationDate,
+        pw.Score,
+        pw.ViewCount,
+        pw.OwnerDisplayName,
+        pw.CommentCount,
+        (SELECT AVG(vt2.BountyAmount)
+         FROM Votes v2
+         LEFT JOIN VoteTypes vt2 ON v2.VoteTypeId = vt2.Id
+         WHERE v2.PostId = pw.PostId) AS AverageBounty,
+        pw.Score + COALESCE(AVG(vt.BountyAmount), 0) AS AdjustedScore
+    FROM 
+        PostWithTags pw
+    LEFT JOIN 
+        Votes v ON pw.PostId = v.PostId
+    LEFT JOIN 
+        VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY 
+        pw.PostId, pw.Title, pw.CreationDate, pw.Score, pw.ViewCount, pw.OwnerDisplayName, pw.CommentCount
+)
+SELECT 
+    ps.PostId,
+    ps.Title,
+    ps.CreationDate,
+    ps.Score,
+    ps.ViewCount,
+    ps.OwnerDisplayName,
+    ps.CommentCount,
+    pt.Tags,
+    ps.AdjustedScore
+FROM 
+    PostScores ps
+JOIN 
+    PostWithTags pt ON ps.PostId = pt.PostId
+WHERE 
+    ps.AdjustedScore IS NOT NULL AND ps.AdjustedScore > 0
+ORDER BY 
+    ps.AdjustedScore DESC
+LIMIT 10;

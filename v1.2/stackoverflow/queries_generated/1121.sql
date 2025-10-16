@@ -1,0 +1,123 @@
+-- {"query": "1121.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.1, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1295} 
+WITH RecursiveTagHierarchy AS (
+    SELECT t.Id, t.TagName, 1 AS Level, array[t.Id] AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+  UNION ALL
+    SELECT t2.Id, t2.TagName, r.Level + 1, r.Path || t2.Id
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id != ALL(r.Path)
+    WHERE t2.IsRequired = 1
+      AND t2.Id <> r.Id
+      AND r.Level < 3
+),
+UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsPosted,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersPosted,
+        COALESCE(SUM(vote_counts.UpVotes),0) AS TotalUpVotes,
+        COALESCE(SUM(vote_counts.DownVotes),0) AS TotalDownVotes,
+        MAX(p.Score) FILTER (WHERE p.PostTypeId = 2) AS MaxAnswerScore,
+        MIN(p.Score) FILTER (WHERE p.PostTypeId = 1) AS MinQuestionScore,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT
+            v.PostId,
+            SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        GROUP BY v.PostId
+    ) vote_counts ON vote_counts.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TopActivePosts AS (
+    SELECT
+        p.Id, p.PostTypeId, p.Score, p.ViewCount, p.CommunityOwnedDate,
+        COALESCE(c.CommentCount,0) AS CommentCount,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS ScoreRank,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.ViewCount DESC) AS ViewRank
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CommentCount
+        FROM Comments
+        GROUP BY PostId
+    ) c ON c.PostId = p.Id
+    WHERE p.CreationDate > current_date - interval '1 year'
+      AND p.Score >= 0
+),
+TagUsageAggregates AS (
+    SELECT
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) AS Tag,
+        COUNT(*) AS TagCount,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.ViewCount) AS MaxViews
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+    GROUP BY Tag
+),
+AnswerScoresWithWindow AS (
+    SELECT
+        p.ParentId AS QuestionId,
+        p.Id AS AnswerId,
+        p.OwnerUserId,
+        p.Score,
+        RANK() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC) AS AnswerScoreRank,
+        COUNT(*) OVER (PARTITION BY p.ParentId) AS TotalAnswers
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+),
+UserBadgesCounts AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(DISTINCT b.Name) AS DistinctBadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+)
+SELECT
+    u.UserId,
+    u.DisplayName,
+    u.QuestionsPosted,
+    u.AnswersPosted,
+    u.TotalUpVotes,
+    u.TotalDownVotes,
+    COALESCE(ub.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ub.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ub.BronzeBadges, 0) AS BronzeBadges,
+    ts.AvgQuestionScore,
+    ts.MaxAnswerScore,
+    tagagg.Tag,
+    tagagg.TagCount,
+    tagagg.AvgScore AS TagAvgScore,
+    tagagg.MaxViews AS TagMaxViews,
+    topPosts.Id AS TopPostId,
+    topPosts.Score AS TopPostScore,
+    topPosts.ViewCount AS TopPostViews,
+    anstot.AnswerId AS TopAnswerId,
+    anstot.Score AS TopAnswerScore,
+    anstot.AnswerScoreRank,
+    anstot.TotalAnswers,
+    rh.Level AS TagHierarchyLevel,
+    rh.Path AS TagHierarchyPath
+FROM UserPostStats ts
+INNER JOIN UserPostStats u ON ts.UserId = u.UserId
+LEFT JOIN UserBadgesCounts ub ON ub.UserId = u.UserId
+LEFT JOIN TagUsageAggregates tagagg ON tagagg.Tag IN (
+    SELECT unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) FROM Posts p WHERE p.OwnerUserId = u.UserId LIMIT 1
+)
+LEFT JOIN TopActivePosts topPosts ON topPosts.Id = (
+    SELECT p.Id FROM Posts p WHERE p.OwnerUserId = u.UserId ORDER BY p.Score DESC, p.ViewCount DESC LIMIT 1
+)
+LEFT JOIN AnswerScoresWithWindow anstot ON anstot.OwnerUserId = u.UserId AND anstot.AnswerScoreRank = 1
+LEFT JOIN RecursiveTagHierarchy rh ON rh.TagName = tagagg.Tag
+WHERE u.QuestionsPosted > 0 OR u.AnswersPosted > 0
+ORDER BY u.TotalUpVotes DESC, u.AnswersPosted DESC
+FETCH FIRST 100 ROWS ONLY;

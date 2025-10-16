@@ -1,0 +1,148 @@
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        row_number() over (partition by u.Id order by max(ph.CreationDate) desc) as rn,
+        max(ph.CreationDate) as LastPostEditDate,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end), 0) as TotalUpVotes,
+        coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end), 0) as TotalDownVotes,
+        coalesce(max(b.Class), 3) as HighestBadgeClass,
+        count(distinct b.Id) as TotalBadges
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join PostHistory ph on ph.PostId = p.Id
+    left join Votes v on v.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+), LatestComments as (
+    select c.PostId,
+        c.Id as CommentId,
+        c.UserId as CommentUserId,
+        c.UserDisplayName,
+        c.CreationDate as CommentDate,
+        row_number() over (partition by c.PostId order by c.CreationDate desc) as rn
+    from Comments c
+    where lower(c.Text) like '%sql%' or lower(c.Text) like '%performance%'
+), QuestionWithBestAnswer as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate as QuestionCreation,
+        q.AcceptedAnswerId,
+        a.Score as AcceptedAnswerScore,
+        a.OwnerUserId as AcceptedAnswerUserId,
+        a.CreationDate as AnswerCreation,
+        q.Tags,
+        substring(q.Tags from '<([^>]+)>') as PrimaryTag,
+        (select count(*) from PostLinks pl where pl.PostId = q.Id) as LinkedPostsCount,
+        (select count(*) from PostLinks pl where pl.PostId = q.Id and pl.LinkTypeId = 3) as DuplicateCount
+    from Posts q
+    left join Posts a on a.Id = q.AcceptedAnswerId
+    where q.PostTypeId = 1
+), UserBadgeRank as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        dense_rank() over (order by coalesce(count(b.Id),0) desc) as BadgeRank,
+        count(b.Id) as BadgeCount,
+        max(b.Class) as MaxBadgeClass
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+), UserQuestionStats as (
+    select
+        u.Id as UserId,
+        count(distinct q.Id) as QuestionCount,
+        coalesce(avg(q.Score), 0) as AvgQuestionScore,
+        coalesce(max(q.Score), 0) as MaxQuestionScore,
+        count(distinct a.Id) as AnswerCount,
+        coalesce(avg(a.Score), 0) as AvgAnswerScore,
+        coalesce(max(a.Score), 0) as MaxAnswerScore
+    from Users u
+    left join Posts q on q.OwnerUserId = u.Id and q.PostTypeId = 1
+    left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+    group by u.Id
+), RecursiveCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+), QuestionRecentCloseInfo as (
+    select
+        q.Id as QuestionId,
+        max(rc.CloseDate) as LastCloseDate,
+        string_agg(distinct rc.CloseReason, ', ') as CloseReasons
+    from Posts q
+    left join RecursiveCloseReasons rc on rc.PostId = q.Id
+    where q.PostTypeId = 1
+    group by q.Id
+)
+select distinct
+    qa.QuestionId,
+    qa.Title,
+    qa.PrimaryTag,
+    qa.AcceptedAnswerScore,
+    qa.DuplicateCount,
+    qc.LastCloseDate,
+    qc.CloseReasons,
+    ua.DisplayName as QuestionOwner,
+    ua.Reputation as QuestionOwnerReputation,
+    ua.HighestBadgeClass as QuestionOwnerHighestBadge,
+    ua.TotalBadges as QuestionOwnerBadgeCount,
+    ab.DisplayName as AcceptedAnswerOwner,
+    ab.Reputation as AcceptedAnswerOwnerReputation,
+    ab.TotalBadges as AcceptedAnswerOwnerBadges,
+    ua.TotalUpVotes,
+    ua.TotalDownVotes,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.AvgQuestionScore,
+    us.AvgAnswerScore,
+    us.MaxQuestionScore,
+    us.MaxAnswerScore,
+    case when qc.LastCloseDate is null then 'Open' else 'Closed' end as QuestionStatus,
+    lc.CommentDate as LatestRelevantCommentDate,
+    lc.UserDisplayName as LatestCommenter,
+    case
+        when ua.Reputation > 10000 then 'Legendary'
+        when ua.Reputation between 5000 and 9999 then 'Expert'
+        when ua.Reputation between 1000 and 4999 then 'Intermediate'
+        else 'Beginner'
+    end as ReputationCategory,
+    coalesce(string_agg(distinct phType.Name, ', ') filter (where phType.Id in (10,11,12,13)), '') as PostHistoryCloseOpenDeleteEvents
+from QuestionWithBestAnswer qa
+left join Users ua on ua.Id = qa.OwnerUserId
+left join RecursiveUserActivity ab on ab.UserId = qa.AcceptedAnswerUserId
+left join UserQuestionStats us on us.UserId = qa.OwnerUserId
+left join QuestionRecentCloseInfo qc on qc.QuestionId = qa.QuestionId
+left join LatestComments lc on lc.PostId = qa.QuestionId and lc.rn = 1
+left join PostHistory ph on ph.PostId = qa.QuestionId
+left join PostHistoryTypes phType on ph.PostHistoryTypeId = phType.Id
+where
+    (
+        (qa.AcceptedAnswerScore is null or qa.AcceptedAnswerScore < (
+             select avg(Score) from Posts where ParentId = qa.QuestionId and PostTypeId = 2
+        ))
+        or qc.LastCloseDate is not null
+    )
+    and (ua.Reputation > 500 or ab.Reputation > 500)
+group by
+    qa.QuestionId, qa.Title, qa.PrimaryTag, qa.AcceptedAnswerScore, qa.DuplicateCount, qc.LastCloseDate,
+    qc.CloseReasons, ua.DisplayName, ua.Reputation, ua.HighestBadgeClass, ua.TotalBadges,
+    ab.DisplayName, ab.Reputation, ab.TotalBadges,
+    ua.TotalUpVotes, ua.TotalDownVotes,
+    us.QuestionCount, us.AnswerCount, us.AvgQuestionScore, us.AvgAnswerScore, us.MaxQuestionScore, us.MaxAnswerScore,
+    lc.CommentDate, lc.UserDisplayName
+order by
+    qc.LastCloseDate,
+    qa.AcceptedAnswerScore,
+    ua.Reputation desc,
+    qa.QuestionId
+limit 100;

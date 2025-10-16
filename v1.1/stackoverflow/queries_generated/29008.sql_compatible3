@@ -1,0 +1,176 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.ViewCount,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT b.Id) as Badges,
+        COUNT(DISTINCT c.Id) as Comments,
+        MAX(p.CreationDate) as LastPostDate,
+        CAST('2024-10-01 12:34:56' AS TIMESTAMP) - CAST(u.CreationDate AS TIMESTAMP) AS AccountAgeInterval,
+        EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - CAST(u.CreationDate AS TIMESTAMP))) as AccountAgeDays,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) as TotalQuestionScore,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) as TotalAnswerScore,
+        u.CreationDate,
+        u.Location
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.ViewCount, u.UpVotes, u.DownVotes, u.CreationDate, u.Location
+),
+RankedUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        ViewCount,
+        UpVotes,
+        DownVotes,
+        TotalPosts,
+        Questions,
+        Answers,
+        Badges,
+        Comments,
+        LastPostDate,
+        AccountAgeInterval,
+        AccountAgeDays,
+        TotalQuestionScore,
+        TotalAnswerScore,
+        CreationDate,
+        Location,
+        ROW_NUMBER() OVER (ORDER BY TotalQuestionScore DESC, TotalAnswerScore DESC) as RankByScore,
+        RANK() OVER (ORDER BY Reputation DESC, TotalPosts DESC) as RankByReputation,
+        DENSE_RANK() OVER (ORDER BY Badges DESC) as RankByBadges
+    FROM UserStats
+),
+PostWithHistory AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            WHEN p.PostTypeId = 5 THEN 'TagWiki'
+            ELSE 'Other'
+        END as PostType,
+        CASE WHEN p.AcceptedAnswerId IS NULL THEN 0 ELSE 1 END as HasAcceptedAnswer,
+        COALESCE(p.ClosedDate, CAST('1900-01-01' AS TIMESTAMP)) as ClosedDate,
+        COUNT(ph.Id) as HistoryCount,
+        STRING_AGG(CAST(ph.PostHistoryTypeId AS VARCHAR), ',') as HistoryTypes
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE p.CreationDate >= CAST('2010-01-01' AS TIMESTAMP)
+      AND (p.PostTypeId IN (1,2) OR p.PostTypeId IS NULL)
+    GROUP BY p.Id, p.Title, p.Body, p.Score, p.ViewCount, p.CreationDate, p.OwnerUserId, 
+             p.PostTypeId, p.Tags, p.AnswerCount, p.CommentCount, p.FavoriteCount,
+             p.AcceptedAnswerId, p.ClosedDate
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'High'
+            WHEN t.Count > 100 THEN 'Medium'
+            WHEN t.Count > 10 THEN 'Low'
+            ELSE 'Very Low'
+        END as PopularityLevel,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as PopularityRank,
+        (ASCII(SUBSTRING(t.TagName FROM 1 FOR 1)) + COALESCE(ASCII(SUBSTRING(t.TagName FROM 2 FOR 1)),0) + COALESCE(ASCII(SUBSTRING(t.TagName FROM 3 FOR 1)),0)) / 3.0 as AverageTagPrefixValue
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL AND t.TagName <> ''
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId
+)
+SELECT 
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.TotalPosts,
+    ru.Questions,
+    ru.Answers,
+    ru.Badges,
+    ru.Comments,
+    ru.TotalQuestionScore,
+    ru.TotalAnswerScore,
+    ru.RankByScore,
+    ru.RankByReputation,
+    ru.RankByBadges,
+    COALESCE(pwh.PostId, 0) as FeaturedPostId,
+    COALESCE(pwh.Title, 'No Title') as FeaturedPostTitle,
+    COALESCE(pwh.Score, 0) as FeaturedPostScore,
+    COALESCE(pwh.HistoryCount, 0) as PostHistoryCount,
+    COALESCE(pwh.PostType, 'Unknown') as PostType,
+    COALESCE(ta.TagName, 'No Tags') as AssociatedTag,
+    COALESCE(ta.TagCount, 0) as TagPopularity,
+    COALESCE(ta.PopularityLevel, 'Unknown') as TagPopularityLevel,
+    CASE 
+        WHEN ru.Badges > 50 AND ru.Reputation > 5000 THEN 'Veteran'
+        WHEN ru.Badges > 25 AND ru.Reputation > 2500 THEN 'Experienced'
+        WHEN ru.Badges > 10 AND ru.Reputation > 1000 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END as UserLevel,
+    CASE 
+        WHEN ru.TotalPosts > 1000 THEN '>1000 Posts'
+        WHEN ru.TotalPosts > 500 THEN '500-1000 Posts'
+        WHEN ru.TotalPosts > 100 THEN '100-500 Posts'
+        ELSE 'Fewer Posts'
+    END as PostingVolume,
+    ROUND(
+        (
+            (COALESCE(pwh.Score, 0) * 0.4) + 
+            (COALESCE(ru.TotalQuestionScore, 0) * 0.3) + 
+            (COALESCE(ru.TotalAnswerScore, 0) * 0.3)
+        ) / NULLIF(ru.AccountAgeDays, 0) * 100.0
+    , 2) as QualityScore,
+    COALESCE(ru.LastPostDate, ru.CreationDate) as RecentActivity,
+    ru.AccountAgeDays as AccountAgeDays,
+    UPPER(
+        (CASE WHEN ru.DisplayName IS NULL THEN 'Unknown' ELSE SUBSTRING(ru.DisplayName FROM 1 FOR 10) END)
+        || ' - ' ||
+        (CASE WHEN ru.Reputation > 10000 THEN 'Elite' ELSE 'Regular' END)
+        || ' - ' ||
+        COALESCE(ru.Location, 'Unknown Location')
+    ) as UserDisplayInfo,
+    pwh.OwnerUserId as PostOwnerUserId,
+    pwh.Tags as PostTags,
+    ru.ViewCount,
+    ru.UpVotes,
+    ru.DownVotes
+FROM RankedUsers ru
+FULL OUTER JOIN PostWithHistory pwh ON ru.UserId = pwh.OwnerUserId
+LEFT JOIN TagAnalysis ta ON (
+    (pwh.Tags IS NOT NULL AND ta.TagName IS NOT NULL AND POSITION(ta.TagName IN pwh.Tags) > 0)
+    OR (COALESCE(pwh.Tags, '') <> '' AND POSITION(COALESCE(ta.TagName, '') IN COALESCE(pwh.Tags, '')) > 0)
+)
+WHERE 
+    (COALESCE(ru.Reputation,0) >= 100 OR COALESCE(ru.Badges,0) >= 5)
+    AND (pwh.PostId IS NULL OR (pwh.Score > 10))
+    AND (ru.UserId IS NOT NULL OR pwh.OwnerUserId IS NOT NULL)
+    AND NOT (
+        (COALESCE(ru.Badges,0) = 0 AND COALESCE(ru.TotalPosts,0) = 0) 
+        OR (COALESCE(ru.ViewCount, 0) = 0 AND COALESCE(ru.UpVotes, 0) = 0)
+    )
+ORDER BY 
+    ru.TotalQuestionScore DESC,
+    ru.TotalAnswerScore DESC,
+    ru.RankByScore ASC
+LIMIT 1000 OFFSET 100;

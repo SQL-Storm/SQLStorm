@@ -1,0 +1,260 @@
+WITH RECURSIVE PostHierarchy AS (
+    SELECT 
+        p.Id as PostId,
+        p.ParentId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        0 as Level,
+        CAST(p.Id AS VARCHAR(1000)) as Path
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.ParentId IS NULL
+
+    UNION ALL
+
+    SELECT 
+        p.Id as PostId,
+        p.ParentId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        ph.Level + 1,
+        ph.Path || ',' || CAST(p.Id AS VARCHAR(1000))
+    FROM Posts p
+    INNER JOIN PostHierarchy ph ON p.ParentId = ph.PostId
+    WHERE ph.Level < 5
+),
+UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT p.Id) as PostCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as AnswerCount,
+        AVG(COALESCE(p.Score, 0)) as AvgPostScore,
+        STRING_AGG(DISTINCT p.Tags, '; ') as AllTags,
+        MAX(p.CreationDate) as LastPostDate,
+        COALESCE(SUM(p.ViewCount), 0) as TotalViews,
+        COALESCE(SUM(p.Score), 0) as TotalScore
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalViews,
+        TotalScore,
+        AVG(AvgPostScore) as AvgScore,
+        QuestionCount,
+        AnswerCount,
+        BadgeCount,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC, Reputation DESC) as RankNumber
+    FROM UserStats
+    GROUP BY UserId, DisplayName, Reputation, TotalViews, TotalScore, QuestionCount, AnswerCount, BadgeCount
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        u.DisplayName as OwnerName,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            ELSE 'Open'
+        END as PostStatus,
+        DENSE_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as UserPostRank,
+        NTH_VALUE(p.Title, 1) OVER (
+            PARTITION BY p.OwnerUserId 
+            ORDER BY p.CreationDate 
+            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+        ) as FirstPostTitle,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevScore,
+        LAG(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevDate,
+        EXTRACT(YEAR FROM p.CreationDate) as PostYear,
+        EXTRACT(MONTH FROM p.CreationDate) as PostMonth,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN 
+                CARDINALITY(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), '><'))
+            ELSE 0 
+        END as TagCount,
+        COALESCE(SUBSTRING(p.Body FROM 1 FOR 100), '') as BodyPreview,
+        CHAR_LENGTH(p.Body) as BodyLength,
+        COALESCE(p.Score, 0) - COALESCE(LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate), 0) as ScoreChange,
+        CAST(
+            CASE 
+                WHEN p.Score > 100 THEN 'High'
+                WHEN p.Score > 50 THEN 'Medium'
+                WHEN p.Score > 0 THEN 'Low'
+                ELSE 'None'
+            END AS VARCHAR(10)
+        ) as ScoreCategory
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2) AND p.CreationDate >= DATE '2010-01-01'
+),
+EngagementMetrics AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.PostTypeId,
+        pa.OwnerUserId,
+        pa.OwnerName,
+        pa.Score,
+        pa.ViewCount,
+        pa.CommentCount,
+        pa.FavoriteCount,
+        pa.ScoreCategory,
+        pa.ScoreChange,
+        CASE 
+            WHEN pa.Score > 0 AND EXISTS (
+                SELECT 1 FROM Votes v 
+                WHERE v.PostId = pa.PostId AND v.VoteTypeId IN (2, 3)
+            ) THEN TRUE
+            ELSE FALSE
+        END as HasVotes,
+        CASE 
+            WHEN pa.CommentCount > 0 THEN TRUE
+            ELSE FALSE
+        END as HasComments,
+        CASE 
+            WHEN pa.FavoriteCount > 0 THEN TRUE
+            ELSE FALSE
+        END as HasFavorites,
+        CASE 
+            WHEN pa.ViewCount >= 1000 THEN 'Popular'
+            WHEN pa.ViewCount >= 100 THEN 'Moderate'
+            WHEN pa.ViewCount > 0 THEN 'Low'
+            ELSE 'None'
+        END as Popularity,
+        CASE 
+            WHEN pa.ScoreChange > 10 THEN 'Significant Increase'
+            WHEN pa.ScoreChange > 0 THEN 'Increase'
+            WHEN pa.ScoreChange < -10 THEN 'Significant Decrease'
+            WHEN pa.ScoreChange < 0 THEN 'Decrease'
+            ELSE 'No Change'
+        END as PerformanceTrend,
+        pa.CreationDate,
+        pa.PrevDate,
+        pa.Tags
+    FROM PostAnalysis pa
+)
+SELECT 
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.TotalViews,
+    tu.TotalScore,
+    tu.QuestionCount,
+    tu.AnswerCount,
+    tu.BadgeCount,
+    tu.AvgScore,
+    tu.RankNumber,
+    CAST(
+        CASE 
+            WHEN tu.TotalScore > 10000 THEN 'Elite'
+            WHEN tu.TotalScore > 5000 THEN 'Expert'
+            WHEN tu.TotalScore > 1000 THEN 'Advanced'
+            ELSE 'Beginner'
+        END AS VARCHAR(15)
+    ) as UserLevel,
+    STRING_AGG(
+        CASE 
+            WHEN pa.PostTypeId = 1 THEN 'Q:' || pa.Title || ' (' || CAST(pa.ViewCount AS VARCHAR) || ' views)'
+            WHEN pa.PostTypeId = 2 THEN 'A:' || pa.Title || ' (' || CAST(pa.Score AS VARCHAR) || ' pts)'
+            ELSE pa.Title
+        END, 
+        ' | '
+    ) as RecentActivity,
+    STRING_AGG(
+        CASE 
+            WHEN pa.PostStatus = 'Closed' THEN '⚠️ ' || pa.Title || ' (Closed)'
+            WHEN pa.PostStatus = 'Answered' THEN '✅ ' || pa.Title || ' (Answered)'
+            WHEN pa.PostStatus = 'Open' THEN '⏳ ' || pa.Title || ' (Open)'
+            ELSE '📝 ' || pa.Title || ' (Other)'
+        END,
+        ' | '
+    ) as StatusIndicators,
+    COUNT(DISTINCT CASE WHEN pa.ScoreCategory = 'High' THEN pa.PostId END) as HighScorePosts,
+    COUNT(DISTINCT CASE WHEN pa.HasVotes = TRUE THEN pa.PostId END) as VotedPosts,
+    COUNT(DISTINCT CASE WHEN pa.HasComments = TRUE THEN pa.PostId END) as CommentedPosts,
+    COUNT(DISTINCT CASE WHEN pa.PerformanceTrend LIKE '%Increase%' THEN pa.PostId END) as IncreasingPosts,
+    AVG(CASE WHEN pa.PostTypeId = 1 THEN pa.Score END) as AvgQuestionScore,
+    AVG(CASE WHEN pa.PostTypeId = 2 THEN pa.Score END) as AvgAnswerScore,
+    STRING_AGG(
+        CASE 
+            WHEN pa.Tags IS NOT NULL AND pa.Tags <> '' THEN 
+                ARRAY_TO_STRING(STRING_TO_ARRAY(SUBSTRING(pa.Tags FROM 2 FOR (CHAR_LENGTH(pa.Tags)-2)), '><'), ', ')
+            ELSE NULL
+        END,
+        '; ' 
+    ) as TagList,
+    EXTRACT(YEAR FROM MAX(pa.PostYear)) as LastActiveYear,
+    AVG(pa.ScoreChange) as AvgScoreChange,
+    MAX(pa.ViewCount) as MaxViews,
+    MIN(pa.CreationDate) as FirstActivity,
+    MAX(pa.CreationDate) as LastActivity,
+    COALESCE(
+        (
+            SELECT COUNT(*) 
+            FROM Posts p2 
+            WHERE p2.OwnerUserId = tu.UserId 
+            AND p2.CreationDate >= DATE '2020-01-01'
+        ),
+        0
+    ) as RecentPosts2020,
+    COALESCE(
+        (
+            SELECT MAX(p3.Score) 
+            FROM Posts p3 
+            WHERE p3.OwnerUserId = tu.UserId 
+            AND p3.PostTypeId = 1
+        ),
+        0
+    ) as HighestQuestionScore,
+    CASE 
+        WHEN COUNT(pa.PostId) > 0 THEN 
+            AVG(CAST((EXTRACT(EPOCH FROM (pa.CreationDate - pa.PrevDate)) / 86400) AS INTEGER))
+        ELSE NULL
+    END as AvgDaysBetweenPosts,
+    COUNT(*) OVER () as TotalUsers,
+    SUM(tu.TotalScore) OVER () as TotalScoreAllUsers,
+    RANK() OVER (ORDER BY tu.TotalViews DESC) as ViewRank
+FROM TopUsers tu
+JOIN EngagementMetrics pa ON tu.UserId = pa.OwnerUserId
+WHERE tu.RankNumber <= 100 
+AND pa.CreationDate >= DATE '2015-01-01'
+GROUP BY 
+    tu.UserId, tu.DisplayName, tu.Reputation, tu.TotalViews, tu.TotalScore,
+    tu.QuestionCount, tu.AnswerCount, tu.BadgeCount, tu.AvgScore, tu.RankNumber
+HAVING 
+    COUNT(pa.PostId) > 0
+ORDER BY 
+    tu.TotalScore DESC,
+    tu.Reputation DESC,
+    tu.QuestionCount DESC,
+    tu.AnswerCount DESC
+LIMIT 50;

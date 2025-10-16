@@ -1,0 +1,127 @@
+WITH UserMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        (SELECT MIN(b2.Date) FROM Badges b2 WHERE b2.UserId = u.Id) AS FirstBadgeDate
+    FROM
+        Users u
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    WHERE
+        u.Reputation > 1000
+        AND u.Id > 0
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+    HAVING
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) > 0
+),
+PostDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.ParentId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        CHAR_LENGTH(p.Body) AS BodyLength,
+        EXTRACT(EPOCH FROM (p.LastEditDate - p.CreationDate)) / 60.0 AS MinsToFirstEdit
+    FROM
+        Posts p
+    WHERE
+        p.CreationDate > TIMESTAMP '2020-01-01'
+        AND (p.DeletionDate IS NULL OR p.DeletionDate = CAST(NULL AS TIMESTAMP))
+        AND p.OwnerUserId IN (SELECT UserId FROM UserMetrics)
+),
+UserActivitySummary AS (
+    SELECT
+        OwnerUserId,
+        COUNT(PostId) OVER (PARTITION BY OwnerUserId) AS TotalPosts,
+        SUM(Score) OVER (PARTITION BY OwnerUserId) AS TotalScore,
+        AVG(Score) OVER (PARTITION BY OwnerUserId) AS AvgPostScore,
+        FIRST_VALUE(Title) OVER (PARTITION BY OwnerUserId ORDER BY Score DESC, CreationDate DESC) AS BestPostTitle,
+        EXTRACT(EPOCH FROM (CreationDate - LAG(CreationDate, 1, CreationDate) OVER (PARTITION BY OwnerUserId ORDER BY CreationDate))) / 3600.0 AS HoursBetweenPosts,
+        PostId,
+        CreationDate,
+        Title,
+        Score
+    FROM
+        PostDetails
+    WHERE
+        PostTypeId IN (1, 2)
+)
+SELECT
+    um.DisplayName,
+    um.Reputation,
+    um.GoldBadges,
+    uas.TotalPosts,
+    uas.AvgPostScore,
+    pd.Title AS PostTitle,
+    pd.Score AS PostScore,
+    pd.BodyLength,
+    COALESCE(pd.AnswerCount, 0) AS AnswerCount,
+    LOG(um.Reputation + 1) * (uas.AvgPostScore + (um.GoldBadges * 10)) AS EngagementScore,
+    DENSE_RANK() OVER (PARTITION BY FLOOR(um.Reputation / 10000) ORDER BY LOG(um.Reputation + 1) * (uas.AvgPostScore + (um.GoldBadges * 10)) DESC) AS RankInReputationTier,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = (
+        SELECT uas_inner.PostId FROM UserActivitySummary uas_inner WHERE uas_inner.OwnerUserId = um.UserId ORDER BY uas_inner.TotalScore DESC LIMIT 1
+    )) AS CommentsOnBestPost,
+    'Tags: ' || REPLACE(SUBSTRING(pd.Tags FROM 2 FOR CHAR_LENGTH(pd.Tags) - 2), '><', ', ') AS FormattedTags,
+    CASE
+        WHEN uas.AvgPostScore > 20 AND um.GoldBadges > 5 THEN 'Top Tier Contributor'
+        WHEN uas.TotalPosts < 10 THEN 'New Contributor'
+        ELSE 'Regular Contributor'
+    END AS UserCategory,
+    uas.HoursBetweenPosts
+FROM
+    UserMetrics um
+JOIN
+    UserActivitySummary uas ON um.UserId = uas.OwnerUserId
+JOIN
+    PostDetails pd ON uas.PostId = pd.PostId
+WHERE
+    pd.PostTypeId = 1
+    AND uas.HoursBetweenPosts < 72
+    AND (pd.FavoriteCount > 10 OR pd.Score > 25)
+    AND pd.Tags LIKE '%<sql>%'
+UNION ALL
+SELECT
+    u.DisplayName,
+    u.Reputation,
+    COALESCE((SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1), 0) AS GoldBadges,
+    NULL AS TotalPosts,
+    AVG(c.Score) AS AvgPostScore,
+    'Comment Specialist' AS PostTitle,
+    SUM(c.Score) AS PostScore,
+    NULL AS BodyLength,
+    0.0 AS AnswerCount,
+    NULL AS EngagementScore,
+    NULL AS RankInReputationTier,
+    COUNT(c.Id) AS CommentsOnBestPost,
+    NULL AS FormattedTags,
+    'Comment Specialist' AS UserCategory,
+    NULL AS HoursBetweenPosts
+FROM
+    Users u
+JOIN
+    Comments c ON u.Id = c.UserId
+WHERE
+    u.Id IN (
+        SELECT UserId FROM Comments WHERE Score > 10 GROUP BY UserId HAVING COUNT(*) > 50
+    )
+    AND u.Reputation < 10000
+GROUP BY
+    u.Id, u.DisplayName, u.Reputation
+ORDER BY
+    EngagementScore DESC NULLS LAST, Reputation DESC
+LIMIT 200;

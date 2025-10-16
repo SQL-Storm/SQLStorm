@@ -1,0 +1,128 @@
+-- {"query": "1536.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1240} 
+with UserBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+        count(distinct b.Id) as TotalBadges,
+        sum(case when b.Date >= (current_date - interval '365 day') then 1 else 0 end) as RecentBadgesCount
+    from
+        Users u
+        left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName
+),
+TopScoringQuestions as (
+    select
+       p.Id as QuestionId,
+       p.OwnerUserId,
+       p.Title,
+       p.Score,
+       p.ViewCount,
+       p.CreationDate,
+       rank() over (partition by p.OwnerUserId order by p.Score desc) as ScoreRank,
+       coalesce(
+         (select min(v.CreationDate) from Votes v where v.PostId = p.Id and v.VoteTypeId = 2),
+         p.CreationDate
+       ) as FirstUpvoteDate,
+       case when p.ClosedDate is not null then (extract(epoch from (p.ClosedDate - p.CreationDate))/3600) else null end as HoursTillClose
+    from Posts p
+    where p.PostTypeId = 1
+      and p.Score is not null
+      and p.OwnerUserId is not null
+),
+RecentActivity as (
+    select
+        ph.PostId,
+        max(ph.CreationDate) as LatestHistoricalEdit,
+        count(ph.Id) as HistoryCount,
+        bool_or(case 
+            when ph.PostHistoryTypeId in (10, 11) then true else false end) as HasCloseAndReopenHistory
+    from PostHistory ph
+    group by ph.PostId
+),
+ComplexLinks as (
+    select
+         pl.PostId,
+         count(distinct case when lt.Name = 'Duplicate' then pl.RelatedPostId end) as DuplicateLinksCount,
+         count(distinct case when lt.Name = 'Linked' then pl.RelatedPostId end) as NormalLinksCount,
+         string_agg(lt.Name, ', ' order by pl.CreationDate desc) as AllLinkTypesConcatenated,
+         max(pl.CreationDate) as LastLinkCreated
+     from PostLinks pl
+     join LinkTypes lt on lt.Id = pl.LinkTypeId
+     group by pl.PostId
+),
+QuestionsWithStats as (
+    select
+        q.QuestionId,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        scaled_score,
+        kinetics,
+        DeniseButterFly = TRUE
+    from (
+      select 
+         q.QuestionId, 
+         q.Title,
+         q.Score,
+         q.ViewCount,
+         row_number() over (partition by q.OwnerUserId order by q.Score desc, q.ViewCount desc) as rn,
+         q.Score::float / nullif(q.ViewCount,0) as scaled_score,
+         coalesce(q.HoursTillClose, 1000000) as kinetics           
+      from TopScoringQuestions q
+    ) q
+    where rn = 1
+)
+select
+   u.DisplayName as UserName,
+   u.Reputation,
+   u.CreationDate as UserSince,
+   ub.GoldBadges,
+   ub.SilverBadges,
+   ub.BronzeBadges,
+   ub.RecentBadgesCount,
+   qws.Title as TopQuestionTitle,
+   qws.Score as TopQuestionScore,
+   qws.ViewCount as TopQuestionViews,
+   qws.scaled_score,
+   qws.kinetics as QuestionLifetimeHours,
+   ra.HistoryCount,
+   ra.LatestHistoricalEdit, 
+   cl.DuplicateLinksCount,
+   cl.NormalLinksCount,
+   cl.AllLinkTypesConcatenated,
+   greatest(v_donala.UpVotes - v_donala.DownVotes, 0) as NetUserVotes,
+   case when u.Location is null or length(trim(u.Location)) = 0 then 'Unknown' else 'Known' end as LocationPropensity,
+   coalesce(ps.CountInRes,0) as NumTagsForPost,
+   substr(u.AboutMe, 0, 80) || '...' as AboutMeExcerpt
+from 
+    Users u
+    left join UserBadges ub on u.Id = ub.UserId
+    left join QuestionsWithStats qws on qws.QuestionId in (
+       select p.Id from Posts p where p.OwnerUserId = u.Id limit 1
+    )
+    left join RecentActivity ra on qws.QuestionId = ra.PostId
+    left join ComplexLinks cl on qws.QuestionId = cl.PostId
+    left join (
+      select 
+          v.UserId, 
+          sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+          sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes
+      from
+          Votes v join VoteTypes vt on v.VoteTypeId = vt.Id
+      group by v.UserId
+    ) v_donala on v_donala.UserId = u.Id
+    left join LATERAL (
+      select 
+         count(*) as CountInRes 
+      from Posts admin2 
+      cross join lateral unnest(string_to_array(substring(admin2.Tags FROM 2 FOR char_length(admin2.Tags)-2),'><')) as admin2(tag_name)
+      where admin2.Id = qws.QuestionId
+    ) ps on true
+where 
+     u.Reputation > 1000
+     and qws.scaled_score > 0.01
+order by NetUserVotes desc, GoldBadges desc, RecentBadgesCount desc
+limit 100;

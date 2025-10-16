@@ -1,0 +1,118 @@
+-- {"query": "24030.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 3642} 
+
+WITH
+  -- 1️⃣  All users and their posts (outer join to keep users without posts)
+  user_posts AS (
+    SELECT
+      u.Id                       AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      COALESCE(p.Id, NULL)       AS PostId,
+      p.PostTypeId,
+      p.Score,
+      p.Tags,
+      p.CreationDate,
+      (CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS HasAccepted,
+      (CASE WHEN p.ClosedDate IS NULL THEN 0 ELSE 1 END)                               AS IsClosed
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  ),
+
+  -- 2️⃣  Vote counts per post
+  post_votes AS (
+    SELECT
+      pv.PostId,
+      pv.VoteTypeId,
+      COUNT(*) AS VCount
+    FROM Votes pv
+    GROUP BY pv.PostId, pv.VoteTypeId
+  ),
+
+  -- 3️⃣  Split the parquet‑style <tag1><tag2> string into rows
+  tag_parts AS (
+    SELECT
+      p.Id,
+      TRIM(both '><' FROM unnest(regexp_split_to_array(p.Tags, '>'))) AS TagName
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL
+  ),
+
+  -- 4️⃣  Merge tags from the Posts table and the Tags lookup table
+  union_tags AS (
+    SELECT TagName FROM tag_parts
+    UNION ALL
+    SELECT TagName FROM Tags WHERE TagName IS NOT NULL
+  ),
+
+  -- 5️⃣  Tag usage statistics
+  tag_stats AS (
+    SELECT
+      TagName,
+      COUNT(*) AS Usage
+    FROM union_tags
+    GROUP BY TagName
+    ORDER BY Usage DESC
+    LIMIT 5
+  ),
+
+  -- 6️⃣  Badge summary per user
+  badge_sums AS (
+    SELECT
+      UserId,
+      COUNT(*)                                                AS BadgeCount,
+      SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END)             AS Gold,
+      SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END)             AS Silver,
+      SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END)             AS Bronze
+    FROM Badges
+    GROUP BY UserId
+  ),
+
+  -- 7️⃣  User rank by reputation (window function)
+  rank_by_rep AS (
+    SELECT
+      Id,
+      ROW_NUMBER() OVER (ORDER BY Reputation DESC) AS RepRank
+    FROM Users
+  ),
+
+  -- 8️⃣  Aggregate statistics per user
+  stats AS (
+    SELECT
+      up.UserId,
+      up.DisplayName,
+      COUNT(up.PostId) FILTER (WHERE up.PostId IS NOT NULL) AS TotalPosts,
+      AVG(up.Score)  FILTER (WHERE up.Score IS NOT NULL)    AS AvgScore,
+      SUM(up.HasAccepted)  AS AcceptedCount,
+      SUM(up.IsClosed)     AS ClosedCount,
+      COALESCE(bs.BadgeCount,0) AS BadgeCount,
+      COALESCE(bs.Gold,0)     AS Gold,
+      COALESCE(bs.Silver,0)   AS Silver,
+      COALESCE(bs.Bronze,0)   AS Bronze,
+      rr.RepRank,
+      -- Correlated sub‑query: highest reputation that is greater than this user’s
+      (SELECT MAX(u2.Reputation)
+       FROM Users u2
+       WHERE u2.Reputation > up.Reputation
+         AND u2.CreationDate > up.CreationDate) AS NextHigherRep
+    FROM user_posts up
+    LEFT JOIN badge_sums bs ON bs.UserId = up.UserId
+    LEFT JOIN rank_by_rep rr ON rr.Id = up.UserId
+    GROUP BY up.UserId, up.DisplayName, bs.BadgeCount, bs.Gold, bs.Silver, bs.Bronze, rr.RepRank
+  )
+
+SELECT
+  st.UserId,
+  st.DisplayName,
+  st.TotalPosts,
+  st.AvgScore,
+  st.AcceptedCount,
+  st.ClosedCount,
+  st.BadgeCount,
+  st.Gold,
+  st.Silver,
+  st.Bronze,
+  st.RepRank,
+  st.NextHigherRep
+FROM stats st
+WHERE st.TotalPosts > 0
+ORDER BY st.AvgScore DESC NULLS LAST, st.TotalPosts DESC;

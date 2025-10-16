@@ -1,0 +1,130 @@
+WITH RecentPosts AS (
+    SELECT 
+        Posts.Id, 
+        Posts.PostTypeId, 
+        Posts.AcceptedAnswerId, 
+        Posts.ParentId, 
+        Posts.CreationDate, 
+        Posts.Score, 
+        Posts.ViewCount, 
+        Posts.Body, 
+        Posts.OwnerUserId, 
+        Posts.OwnerDisplayName, 
+        Posts.LastEditorUserId, 
+        Posts.LastEditorDisplayName, 
+        Posts.LastEditDate, 
+        Posts.LastActivityDate, 
+        Posts.Title, 
+        Posts.Tags, 
+        Posts.AnswerCount, 
+        Posts.CommentCount, 
+        Posts.FavoriteCount, 
+        Posts.ClosedDate, 
+        Posts.CommunityOwnedDate, 
+        Posts.ContentLicense
+    FROM 
+        Posts
+    WHERE 
+        Posts.CreationDate > (DATE '2024-10-01' - INTERVAL '30' DAY)
+),
+UserActivity AS (
+    SELECT 
+        Users.Id, 
+        Users.Reputation, 
+        Users.CreationDate, 
+        Users.DisplayName, 
+        Users.LastAccessDate, 
+        Users.WebsiteUrl, 
+        Users.Location, 
+        Users.AboutMe, 
+        Users.Views, 
+        Users.UpVotes, 
+        Users.DownVotes, 
+        Users.ProfileImageUrl, 
+        Users.EmailHash, 
+        COUNT(Posts.Id) AS PostCount
+    FROM 
+        Users
+    LEFT JOIN 
+        Posts ON Users.Id = Posts.OwnerUserId
+    GROUP BY 
+        Users.Id, 
+        Users.Reputation, 
+        Users.CreationDate, 
+        Users.DisplayName, 
+        Users.LastAccessDate, 
+        Users.WebsiteUrl, 
+        Users.Location, 
+        Users.AboutMe, 
+        Users.Views, 
+        Users.UpVotes, 
+        Users.DownVotes, 
+        Users.ProfileImageUrl, 
+        Users.EmailHash
+),
+BadgeSummary AS (
+    SELECT 
+        Badges.UserId, 
+        COUNT(Badges.Id) AS BadgeCount, 
+        SUM(CASE WHEN Badges.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgeCount, 
+        SUM(CASE WHEN Badges.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgeCount, 
+        SUM(CASE WHEN Badges.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgeCount
+    FROM 
+        Badges
+    GROUP BY 
+        Badges.UserId
+)
+SELECT 
+    RecentPosts.Id AS PostId, 
+    RecentPosts.PostTypeId, 
+    RecentPosts.AcceptedAnswerId, 
+    RecentPosts.ParentId, 
+    RecentPosts.CreationDate, 
+    RecentPosts.Score, 
+    RecentPosts.ViewCount, 
+    RecentPosts.Body, 
+    RecentPosts.OwnerUserId, 
+    RecentPosts.OwnerDisplayName, 
+    RecentPosts.LastEditorUserId, 
+    RecentPosts.LastEditorDisplayName, 
+    RecentPosts.LastEditDate, 
+    RecentPosts.LastActivityDate, 
+    RecentPosts.Title, 
+    RecentPosts.Tags, 
+    RecentPosts.AnswerCount, 
+    RecentPosts.CommentCount, 
+    RecentPosts.FavoriteCount, 
+    RecentPosts.ClosedDate, 
+    RecentPosts.CommunityOwnedDate, 
+    RecentPosts.ContentLicense, 
+    UserActivity.Reputation, 
+    UserActivity.CreationDate AS UserCreationDate, 
+    UserActivity.DisplayName AS UserName, 
+    UserActivity.LastAccessDate, 
+    UserActivity.WebsiteUrl, 
+    UserActivity.Location, 
+    UserActivity.AboutMe, 
+    UserActivity.Views, 
+    UserActivity.UpVotes, 
+    UserActivity.DownVotes, 
+    UserActivity.ProfileImageUrl, 
+    UserActivity.EmailHash, 
+    UserActivity.PostCount, 
+    BadgeSummary.BadgeCount, 
+    BadgeSummary.GoldBadgeCount, 
+    BadgeSummary.SilverBadgeCount, 
+    BadgeSummary.BronzeBadgeCount
+FROM 
+    RecentPosts
+LEFT JOIN 
+    UserActivity ON RecentPosts.OwnerUserId = UserActivity.Id
+LEFT JOIN 
+    BadgeSummary ON RecentPosts.OwnerUserId = BadgeSummary.UserId
+WHERE 
+    RecentPosts.PostTypeId = 1
+    AND RecentPosts.Score > 0
+    AND COALESCE(UserActivity.PostCount, 0) > 5
+    AND COALESCE(BadgeSummary.BadgeCount, 0) > 10
+ORDER BY 
+    RecentPosts.CreationDate DESC, 
+    RecentPosts.Score DESC;

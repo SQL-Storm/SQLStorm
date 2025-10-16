@@ -1,0 +1,144 @@
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score) AS AvgScore,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id 
+        AND p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '1 year'
+        AND p.DeletionDate IS NULL
+    WHERE u.Reputation > 100
+        AND u.LastAccessDate >= CAST('2024-10-01' AS date) - INTERVAL '6 months'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT p.Id) >= 5
+),
+TopContributors AS (
+    SELECT 
+        au.Id,
+        au.DisplayName,
+        au.Reputation,
+        au.TotalPosts,
+        au.QuestionCount,
+        au.AnswerCount,
+        au.AvgScore,
+        au.RepRank,
+        LAG(au.QuestionCount) OVER (ORDER BY au.RepRank) AS PrevQuestionCount,
+        LEAD(au.Reputation) OVER (ORDER BY au.RepRank) AS NextRep,
+        CASE 
+            WHEN au.QuestionCount > COALESCE(LAG(au.QuestionCount) OVER (ORDER BY au.RepRank), 0) * 1.5 
+            THEN 'HighGrowth'
+            WHEN au.Reputation < 5000 THEN 'Emerging'
+            ELSE 'Established'
+        END AS GrowthCategory
+    FROM ActiveUsers au
+),
+BadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldCount,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverCount,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeCount,
+        STRING_AGG(DISTINCT b.Name, '; ') AS BadgeNames,
+        MAX(b.Date) AS LatestBadgeDate
+    FROM Badges b
+    WHERE b.Date >= CAST('2024-10-01' AS date) - INTERVAL '1 year'
+    GROUP BY b.UserId
+),
+RecentPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        COALESCE(LEH.DisplayName, p.OwnerDisplayName) AS OwnerName,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL 
+            THEN SUBSTRING(ph.Text FROM 'OriginalQuestionIds":\s*\[([^\]]+)\]')
+            ELSE NULL 
+        END AS DuplicateLinks,
+        (LENGTH(COALESCE(p.Tags, '')) - 2 * LENGTH(REPLACE(COALESCE(p.Tags, ''), '><', ''))) AS TagCount
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id 
+        AND ph.PostHistoryTypeId = 10 
+        AND ph.CreationDate = p.ClosedDate
+    LEFT JOIN Users LEH ON LEH.Id = p.OwnerUserId
+    WHERE p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '3 months'
+        AND p.Score > -5
+        AND (p.PostTypeId IN (1, 2) OR (p.PostTypeId IN (4,5) AND p.Title IS NOT NULL))
+),
+HighImpactPosts AS (
+    SELECT 
+        rp.Id,
+        rp.PostTypeId,
+        rp.Title,
+        rp.Score,
+        rp.ViewCount,
+        rp.CreationDate,
+        rp.OwnerUserId,
+        rp.OwnerName,
+        rp.DuplicateLinks,
+        rp.TagCount,
+        RANK() OVER (PARTITION BY rp.PostTypeId ORDER BY rp.ViewCount DESC, rp.Score DESC) AS ImpactRank,
+        NTILE(4) OVER (ORDER BY rp.CreationDate DESC) AS RecencyQuartile,
+        CASE 
+            WHEN rp.PostTypeId = 1 AND EXISTS (SELECT 1 FROM Posts p2 WHERE p2.Id = rp.Id) THEN
+                rp.ViewCount * 0.6 + rp.Score * 10 + (SELECT COUNT(*) FROM Comments c WHERE c.PostId = rp.Id) * 5
+            WHEN rp.PostTypeId = 2 THEN rp.Score * 15 + (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = rp.Id AND v.VoteTypeId = 8)
+            ELSE rp.ViewCount * 0.8
+        END AS ImpactScore
+    FROM RecentPosts rp
+)
+SELECT 
+    tc.DisplayName,
+    tc.Reputation,
+    tc.QuestionCount,
+    tc.AnswerCount,
+    tc.AvgScore,
+    tc.GrowthCategory,
+    COALESCE(bs.GoldCount, 0) AS GoldBadges,
+    COALESCE(bs.SilverCount, 0) AS SilverBadges,
+    COALESCE(bs.BronzeCount, 0) AS BronzeBadges,
+    COUNT(DISTINCT hip.Id) AS RecentHighImpactPosts,
+    SUM(hip.ImpactScore) AS TotalImpact,
+    AVG(hip.ImpactRank) AS AvgImpactRank,
+    STRING_AGG(DISTINCT COALESCE(hip.Title, ''), ' | ') AS TopPostTitles,
+    CASE 
+        WHEN tc.RepRank <= 10 THEN 'Elite'
+        WHEN tc.RepRank <= 100 THEN 'TopTier'
+        ELSE 'Active'
+    END AS Tier,
+    (tc.QuestionCount * 2 + tc.AnswerCount) / NULLIF(tc.RepRank, 0) AS EfficiencyRatio,
+    GREATEST(
+        COALESCE(bs.LatestBadgeDate, tc.AvgScore) - tc.AvgScore,
+        INTERVAL '1 day'
+    ) AS DaysSinceFirstActivity
+FROM TopContributors tc
+LEFT JOIN BadgeStats bs ON bs.UserId = tc.Id
+LEFT JOIN HighImpactPosts hip ON hip.OwnerUserId = tc.Id 
+    AND hip.ImpactRank <= 50
+    AND (hip.PostTypeId = 1 OR (hip.PostTypeId = 2 AND hip.Score >= 5))
+WHERE tc.RepRank <= 200
+    AND (tc.GrowthCategory != 'Established' OR COALESCE(bs.GoldCount, 0) > 0)
+    AND NOT EXISTS (
+        SELECT 1 FROM Votes v 
+        WHERE v.UserId = tc.Id 
+        AND v.VoteTypeId = 3 
+        AND v.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '1 month'
+        GROUP BY v.UserId 
+        HAVING COUNT(*) > 10
+    )
+GROUP BY 
+    tc.Id, tc.DisplayName, tc.Reputation, tc.QuestionCount, tc.AnswerCount, 
+    tc.AvgScore, tc.GrowthCategory, tc.RepRank, tc.AvgScore,
+    bs.GoldCount, bs.SilverCount, bs.BronzeCount, bs.LatestBadgeDate
+HAVING COUNT(DISTINCT hip.Id) > 0 OR COALESCE(bs.BronzeCount, 0) >= 3
+ORDER BY TotalImpact DESC, tc.RepRank ASC
+LIMIT 50;

@@ -1,0 +1,159 @@
+WITH latest_activity AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.PostTypeId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.ViewCount,
+    p.Score,
+    p.Tags,
+    p.Body,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.OwnerDisplayName,
+    p.LastEditorUserId,
+    p.LastEditDate,
+    p.ContentLicense,
+    COALESCE(p."AuthorizedViewCount", 0) AS AuthorizedViewCount
+  FROM Posts p
+),
+tagged AS (
+  SELECT
+    p.Id AS PostId,
+    t.TagName,
+    ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY t.TagName) AS rn
+  FROM Posts p
+  JOIN LATERAL (
+    SELECT UNNEST(string_to_array(substr(p.Tags, 2, length(p.Tags) - 2), '><')) AS TagName
+  ) t ON true
+  WHERE p.PostTypeId = 1
+),
+pref AS (
+  SELECT
+    lv.PostId,
+    MAX(lv.LastActivityDate) AS LastActivity
+  FROM (
+    SELECT PostId, MAX(COALESCE(LastEditDate, CreationDate)) AS LastActivityDate
+    FROM PostHistory
+    GROUP BY PostId
+  ) lv
+  GROUP BY lv.PostId
+),
+vote_summary AS (
+  SELECT
+    v.PostId,
+    SUM(CASE WHEN v.VoteTypeId IN (2, 16) THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId IN (3, 10, 11, 12, 14, 15) THEN 1 ELSE 0 END) AS DownVotes,
+    COUNT(*) AS VoteCount,
+    SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedVotes
+  FROM Votes v
+  GROUP BY v.PostId
+),
+combined AS (
+  SELECT
+    la.PostId,
+    la.Title,
+    la.PostTypeId,
+    la.CreationDate,
+    la.LastActivityDate,
+    la.OwnerUserId,
+    la.ViewCount,
+    la.Score,
+    la.Tags,
+    la.Body,
+    la.CommentCount,
+    la.AnswerCount,
+    la.FavoriteCount,
+    la.ParentId,
+    la.AcceptedAnswerId,
+    la.OwnerDisplayName,
+    la.LastEditorUserId,
+    la.LastEditDate,
+    la.ContentLicense,
+    vs.UpVotes   AS UpVotes,
+    vs.DownVotes AS DownVotes,
+    vs.VoteCount AS VoteCount,
+    vs.AcceptedVotes AS AcceptedVotes,
+    pref.LastActivity AS LastRevisionDate
+  FROM latest_activity la
+  LEFT JOIN vote_summary vs ON vs.PostId = la.PostId
+  LEFT JOIN pref ON pref.PostId = la.PostId
+  WHERE la.PostTypeId IN (1, 2)
+),
+complex AS (
+  SELECT
+    c.PostId,
+    c.Title,
+    c.PostTypeId,
+    c.CreationDate,
+    c.LastActivityDate,
+    c.OwnerUserId,
+    u.Reputation,
+    u.DisplayName,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    b.Class AS BadgeClass,
+    b.Name AS BadgeName,
+    b.Date AS BadgeDate,
+    b.TagBased,
+    c.Body,
+    c.Tags,
+    c.ViewCount,
+    c.Score,
+    c.CommentCount,
+    c.AnswerCount,
+    c.ParentId,
+    c.AcceptedAnswerId,
+    c.OwnerDisplayName,
+    c.LastEditorUserId,
+    c.LastEditDate,
+    c.ContentLicense
+  FROM combined c
+  LEFT JOIN Users u ON u.Id = c.OwnerUserId
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  WHERE c.LastActivityDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days')
+    AND c.Score > -5
+)
+SELECT
+  p.PostId,
+  p.Title,
+  p.PostTypeId,
+  p.CreationDate,
+  p.LastActivityDate,
+  p.OwnerUserId,
+  p.Reputation,
+  p.DisplayName,
+  p.Location,
+  p.Views,
+  p.UpVotes,
+  p.DownVotes,
+  p.BadgeName,
+  p.BadgeDate,
+  p.BadgeClass,
+  p.TagBased,
+  p.Body,
+  p.Tags,
+  p.ViewCount,
+  p.Score,
+  p.CommentCount,
+  p.AnswerCount,
+  p.ParentId,
+  p.AcceptedAnswerId,
+  p.OwnerDisplayName,
+  p.LastEditorUserId,
+  p.LastEditDate,
+  p.ContentLicense
+FROM complex p
+JOIN Posts pp ON pp.Id = p.PostId
+LEFT JOIN LATERAL (
+  SELECT UNNEST(string_to_array(substr(pp.Tags, 2, length(pp.Tags) - 2), '><')) AS Tag
+) t ON true
+ORDER BY p.LastActivityDate DESC, p.Score DESC
+LIMIT 100;

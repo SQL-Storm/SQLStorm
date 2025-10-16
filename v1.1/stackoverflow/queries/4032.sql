@@ -1,0 +1,134 @@
+with RecursiveUserBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by u.Id order by b.Date desc) as BadgeRank
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where u.Reputation > (
+        select avg(Reputation) from Users
+    )
+),
+RecentHighlyVotedQuestions as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        count(distinct a.Id) as NumberOfAnswers,
+        coalesce(p.FavoriteCount, 0) as FavoriteCount,
+        string_agg(distinct t.TagName, ',' order by t.TagName) as Tags,
+        row_number() over (order by p.Score desc, p.ViewCount desc) as RankByScoreView,
+        p.ViewCount
+    from Posts p
+    left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+    left join Tags t on t.ExcerptPostId = p.Id or t.WikiPostId = p.Id
+    where p.PostTypeId = 1 
+      and p.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - interval '180 days')
+      and p.Score > 10
+    group by p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.FavoriteCount, p.ViewCount
+),
+LatestPostHistories as (
+    select
+        ph.Id,
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId,
+        ph.Comment,
+        ph.Text
+    from PostHistory ph
+    where ph.Id in (
+        select sub.Id from (
+            select ph2.Id,
+                   row_number() over (partition by ph2.PostId order by ph2.CreationDate desc) as rn
+            from PostHistory ph2
+        ) sub
+        where sub.rn = 1
+    )
+),
+UserAnswerStats as (
+    select
+        u.Id as UserId,
+        count(case when a.Score > 0 then 1 end) as PositiveAnswers,
+        count(case when a.Score <= 0 then 1 end) as NonPositiveAnswers,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        min(a.Score) as MinAnswerScore
+    from Users u
+    left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+    group by u.Id
+),
+DuplicationLinks as (
+    select 
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        pl.LinkTypeId,
+        lt.Name as LinkTypeName,
+        pq.Title as ParentQuestionTitle,
+        rq.Title as RelatedQuestionTitle
+    from PostLinks pl
+    inner join LinkTypes lt on pl.LinkTypeId = lt.Id
+    inner join Posts pq on pq.Id = pl.PostId and pq.PostTypeId = 1
+    inner join Posts rq on rq.Id = pl.RelatedPostId and rq.PostTypeId = 1
+    where pl.LinkTypeId = 3
+),
+ClosedQuestionsWithReason as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate,
+        ph.UserId as CloserUserId,
+        u.DisplayName as CloserUserName
+    from PostHistory ph
+    left join CloseReasonTypes crt on cast(ph.Comment as integer) = crt.Id
+    left join Users u on ph.UserId = u.Id
+    where ph.PostHistoryTypeId = 10
+),
+UserQuestionAnswerRatio as (
+    select
+        u.Id as UserId,
+        count(distinct q.Id) as QuestionCount,
+        count(distinct a.Id) as AnswerCount,
+        case when count(distinct q.Id) = 0 then null else round(cast(count(distinct a.Id) as numeric) / count(distinct q.Id),2) end as AnswerToQuestionRatio
+    from Users u
+    left join Posts q on q.OwnerUserId = u.Id and q.PostTypeId = 1
+    left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+    group by u.Id
+)
+select
+    r.QuestionId,
+    r.Title,
+    r.Tags,
+    r.Score,
+    r.ViewCount,
+    r.FavoriteCount,
+    r.NumberOfAnswers,
+    d.RelatedQuestionTitle as DuplicateOf,
+    c.CloseReason,
+    c.CloseDate,
+    u.DisplayName as QuestionOwner,
+    u.Reputation as OwnerReputation,
+    ubs.BadgeName as RecentBadge,
+    ubs.Class as BadgeClass,
+    uas.PositiveAnswers,
+    uas.NonPositiveAnswers,
+    uas.AvgAnswerScore,
+    uas.MaxAnswerScore,
+    uas.MinAnswerScore,
+    uq.AnswerToQuestionRatio
+from RecentHighlyVotedQuestions r
+left join DuplicationLinks d on r.QuestionId = d.PostId
+left join ClosedQuestionsWithReason c on c.PostId = r.QuestionId
+left join Users u on u.Id = r.OwnerUserId
+left join RecursiveUserBadges ubs on ubs.UserId = u.Id and ubs.BadgeRank = 1
+left join UserAnswerStats uas on uas.UserId = u.Id
+left join UserQuestionAnswerRatio uq on uq.UserId = u.Id
+where (c.PostId is null or c.CloseDate > (cast('2024-10-01 12:34:56' as timestamp) - interval '90 days'))
+  and (d.RelatedQuestionTitle is null or r.Score > 50)
+order by r.Score desc, r.ViewCount desc
+limit 100;

@@ -1,0 +1,222 @@
+-- {"query": "73.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2250} 
+with
+-- hotness: sliding score combining views, score, recent activity, and answer rate
+QuestionStats as (
+  select
+    p.Id,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.ViewCount,
+    coalesce(p.Score,0) as Score,
+    coalesce(p.AnswerCount,0) as AnswerCount,
+    coalesce(p.FavoriteCount,0) as FavoriteCount,
+    case when p.LastActivityDate is null then 0
+         else greatest(0, extract(epoch from now() - p.LastActivityDate)) end as SecondsSinceLastActivity,
+    -- tag array extracted from <> delimited string like '<tag1><tag2>'
+    case when p.Tags is null then array[]::text[]
+         else string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><') end as TagArray
+  from Posts p
+  where p.PostTypeId = 1
+),
+-- aggregate recent answers, including correlated subquery for accepted/score distributions
+AnswerAgg as (
+  select
+    q.Id as QuestionId,
+    count(a.Id) filter (where a.CreationDate > q.CreationDate) as AnswersSinceQuestion,
+    max(a.Score) as MaxAnswerScore,
+    min(a.Score) as MinAnswerScore,
+    sum(case when a.Id = q.AcceptedAnswerId then 1 else 0 end) as HasAcceptedAnswer,
+    avg(a.Score) as AvgAnswerScore,
+    sum(case when a.OwnerUserId is null then 1 else 0 end) as AnonymousAnswers
+  from Posts q
+  left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+  where q.PostTypeId = 1
+  group by q.Id
+),
+-- compute user metrics: lifetime activity, recency, badge-weighted score
+UserMetrics as (
+  select
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    coalesce(u.Views,0) as Views,
+    coalesce(u.UpVotes,0) as UpVotes,
+    coalesce(u.DownVotes,0) as DownVotes,
+    -- weighted badge score: gold=5 silver=2 bronze=1, tag-based reduced weight
+    coalesce(sum(
+      case when b.Class = 1 then 5
+           when b.Class = 2 then 2
+           when b.Class = 3 then 1
+           else 0 end
+      * case when b.TagBased = 1 then 0.5 else 1 end
+    ),0) as BadgeScore,
+    -- recent activity window: count posts and comments in last 90 days (correlated subqueries)
+    (select count(*) from Posts p where p.OwnerUserId = u.Id and p.CreationDate >= now() - interval '90 days') as RecentPosts90,
+    (select count(*) from Comments c where c.UserId = u.Id and c.CreationDate >= now() - interval '90 days') as RecentComments90
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+-- tag popularity: explode tags and gather stats
+ExplodedTags as (
+  select
+    q.Id as QuestionId,
+    t.tag as TagName
+  from QuestionStats q,
+  lateral unnest(q.TagArray) as t(tag)
+),
+TagStats as (
+  select
+    et.TagName,
+    count(distinct et.QuestionId) as QuestionCount,
+    sum(coalesce(q.ViewCount,0)) as TotalViews,
+    avg(coalesce(q.Score,0)) as AvgScore,
+    max(coalesce(q.FavoriteCount,0)) as MaxFavorites
+  from ExplodedTags et
+  join QuestionStats q on q.Id = et.QuestionId
+  group by et.TagName
+),
+-- identify suspicious duplicates and linked posts via PostLinks with outer joins and set operators
+LinkedPairs as (
+  select pl.PostId, pl.RelatedPostId, lt.Name as LinkTypeName, pl.CreationDate
+  from PostLinks pl
+  left join LinkTypes lt on lt.Id = pl.LinkTypeId
+  where pl.PostId is not null and pl.RelatedPostId is not null
+),
+DuplicateClusters as (
+  -- transitive closure-ish limited: pairs and reversed unions to detect bidirectional duplicates
+  select distinct least(PostId, RelatedPostId) as A, greatest(PostId, RelatedPostId) as B
+  from LinkedPairs
+  where LinkTypeId = 3
+  union
+  select distinct least(pl2.PostId, pl2.RelatedPostId), greatest(pl2.PostId, pl2.RelatedPostId)
+  from PostLinks pl2
+  join PostLinks pl3 on pl3.PostId = pl2.RelatedPostId and pl3.RelatedPostId = pl2.PostId
+  where pl2.LinkTypeId = 3 or pl3.LinkTypeId = 3
+),
+-- heavy windowing over questions to get percentile ranks and moving averages for benchmarking
+QuestionWindow as (
+  select
+    qs.*,
+    aa.AnswersSinceQuestion,
+    aa.HasAcceptedAnswer,
+    aa.AvgAnswerScore,
+    us.DisplayName as OwnerName,
+    us.BadgeScore,
+    row_number() over (order by qs.ViewCount desc nulls last, qs.Score desc) as RowNum,
+    rank() over (order by qs.Score desc nulls last) as ScoreRank,
+    percentile_cont(0.5) within group (order by qs.ViewCount) over () as MedianViewCount,
+    avg(qs.ViewCount) over (order by qs.CreationDate rows between 100 preceding and current row) as MovingAvgViews100
+  from QuestionStats qs
+  left join AnswerAgg aa on aa.QuestionId = qs.Id
+  left join Users us on us.Id = qs.OwnerUserId
+),
+-- compile final candidates: complex predicates, string ops, null coalescing, correlated scalar subqueries
+Candidates as (
+  select
+    qw.Id,
+    coalesce(nullif(qw.Title,''), ('[no title]')) as Title,
+    qw.TagArray,
+    qw.ViewCount,
+    qw.Score,
+    qw.AnswerCount,
+    qw.AnswersSinceQuestion,
+    qw.HasAcceptedAnswer,
+    qw.AvgAnswerScore,
+    qw.OwnerName,
+    qw.BadgeScore,
+    qw.RowNum,
+    qw.ScoreRank,
+    qw.MedianViewCount,
+    qw.MovingAvgViews100,
+    -- computed hotness: nonlinear combination with log, sqrt, recency dampening, and badge influence
+    (
+      ln(1 + greatest(qw.ViewCount,0)) * 0.4
+      + power(greatest(qw.Score,0)+1, 0.75) * 1.2
+      + coalesce(qw.AvgAnswerScore,0) * 2
+      + (case when qw.HasAcceptedAnswer > 0 then 50 else 0 end)
+      - least(100, qw.SecondsSinceLastActivity/3600.0) * 0.1
+      + coalesce(qw.BadgeScore,0) * 0.05
+    ) as HotnessScore,
+    -- tag string summary
+    case when array_length(qw.TagArray,1) is null then '[]'
+         else '[' || array_to_string(qw.TagArray, ', ') || ']' end as TagSummary,
+    -- concise excerpt of body via correlated subquery to PostHistory initial body or Posts.Body
+    (select substring(coalesce(ph.Text, p.Body) from 1 for 300)
+     from PostHistory ph
+     join Posts p on p.Id = ph.PostId
+     where ph.PostId = qw.Id and ph.PostHistoryTypeId in (2,5) and ph.Text is not null
+     order by ph.CreationDate asc
+     limit 1) as Excerpt
+  from QuestionWindow qw
+  left join Posts p on p.Id = qw.Id
+),
+-- pick top tags per popularity while filtering by complexity: tag name length, char classes, and null logic
+TopTags as (
+  select t.TagName, t.QuestionCount, t.TotalViews, t.AvgScore,
+    dense_rank() over (order by t.TotalViews desc) as TagRank
+  from TagStats t
+  where t.TagName is not null
+    and char_length(t.TagName) > 2
+    and t.QuestionCount > 10
+    and t.TagName ~ '^[a-z0-9\\-]+$'
+),
+-- final unioned report combining candidate hot questions, tag leaders, and suspicious duplicates
+HotQuestions as (
+  select
+    'HotQuestion' as RowType,
+    c.Id::text as ItemId,
+    c.Title,
+    c.TagSummary as Meta,
+    round(c.HotnessScore::numeric,4) as Metric,
+    c.RowNum,
+    c.ScoreRank,
+    c.OwnerName,
+    c.Excerpt
+  from Candidates c
+  where c.HotnessScore is not null
+  order by c.HotnessScore desc
+  limit 200
+),
+TagLeaders as (
+  select
+    'TopTag' as RowType,
+    t.TagName as ItemId,
+    t.TagName as Title,
+    ('questions=' || t.QuestionCount || ';views=' || t.TotalViews) as Meta,
+    round(t.TotalViews::numeric,2) as Metric,
+    null::int as RowNum,
+    null::int as ScoreRank,
+    null::varchar as OwnerName,
+    null::text as Excerpt
+  from TopTags t
+  where t.TagRank <= 50
+),
+DuplicateAlerts as (
+  select
+    'PossibleDuplicate' as RowType,
+    (dc.A || '-' || dc.B) as ItemId,
+    'Duplicate cluster: ' || dc.A::text || ' <-> ' || dc.B::text as Title,
+    'pairs' as Meta,
+    0.0 as Metric,
+    null as RowNum,
+    null as ScoreRank,
+    null as OwnerName,
+    null as Excerpt
+  from DuplicateClusters dc
+  limit 50
+)
+select *
+from (
+  select * from HotQuestions
+  union all
+  select * from TagLeaders
+  union all
+  select * from DuplicateAlerts
+) final
+order by Metric desc nulls last, RowType, ItemId
+limit 500;

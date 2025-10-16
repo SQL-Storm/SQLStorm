@@ -1,0 +1,122 @@
+WITH ActiveUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation,
+           COUNT(DISTINCT p.Id) AS QuestionCount,
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotes
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1 AND p.DeletedDate IS NULL
+    LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId IN (2, 3)
+    WHERE u.Reputation > 1000
+      AND u.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT p.Id) > 5
+),
+HighImpactPosts AS (
+    SELECT p.Id, p.OwnerUserId, p.Title, p.Score, p.ViewCount, p.CreationDate, p.Tags, p.AnswerCount, p.CommentCount,
+           ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.ViewCount DESC, p.Score DESC) AS ViewRank,
+           LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostScore,
+           COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) AS EngagementScore,
+           p.LastActivityDate
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+      AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+      AND p.ViewCount > 1000
+      AND (p.Tags LIKE '%sql%' OR p.Tags LIKE '%database%' OR p.Tags LIKE '%performance%')
+),
+RecentEdits AS (
+    SELECT ph.PostId, ph.UserId, 
+           COUNT(*) OVER (PARTITION BY ph.PostId) AS EditCount,
+           STRING_AGG(ph.Comment, ' | ') AS EditComments,
+           MAX(ph.CreationDate) AS LastEditDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+      AND ph.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months'
+    GROUP BY ph.PostId, ph.UserId
+),
+ComplexTags AS (
+    SELECT t.TagName, t.Count, 
+           CASE 
+               WHEN t.Count > 10000 THEN 'Popular'
+               WHEN t.Count BETWEEN 1000 AND 10000 THEN 'Growing'
+               ELSE 'Niche'
+           END AS TagCategory,
+           AVG(t.Count) OVER () AS AvgTagCount
+    FROM Tags t
+    WHERE t.Count > 0
+)
+SELECT 
+    au.DisplayName AS UserName,
+    au.Reputation,
+    au.QuestionCount,
+    au.TotalUpvotes,
+    hp.Title,
+    hp.Score AS PostScore,
+    hp.ViewCount,
+    hp.ViewRank,
+    hp.EngagementScore,
+    re.EditCount,
+    COALESCE(ct.TagCategory, 'No Category') AS TagCategory,
+    CASE 
+        WHEN hp.ViewRank = 1 AND hp.ViewCount > (SELECT AVG(hp2.ViewCount) FROM HighImpactPosts hp2 WHERE hp2.OwnerUserId = au.Id) * 2 
+        THEN 'High Impact'
+        WHEN re.EditCount > 3 THEN 'Frequently Edited'
+        WHEN hp.Score < 0 OR hp.ViewRank > 5 THEN 'Underperforming'
+        ELSE 'Average'
+    END AS PostPerformanceCategory,
+    GREATEST(hp.Score, COALESCE(au.Reputation / 100.0, 0)) AS WeightedScore,
+    (NULLIF(hp.Title, '') IS NULL) OR CHAR_LENGTH(TRIM(COALESCE(hp.Title, ''))) = 0 AS HasEmptyTitle,
+    (SELECT STRING_AGG(b.Name, ', ') 
+     FROM Badges b 
+     WHERE b.UserId = au.Id 
+       AND b.Class = 1
+       AND b.Date >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+    ) AS RecentGoldBadges,
+    (SELECT COUNT(DISTINCT pl.RelatedPostId)
+     FROM PostLinks pl
+     INNER JOIN HighImpactPosts hip2 ON pl.RelatedPostId = hip2.Id
+     WHERE pl.PostId = hp.Id 
+       AND pl.LinkTypeId = 1
+       AND pl.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 months'
+    ) AS ExternalLinksCount
+FROM ActiveUsers au
+INNER JOIN HighImpactPosts hp ON hp.OwnerUserId = au.Id
+LEFT JOIN RecentEdits re ON re.PostId = hp.Id
+LEFT JOIN LATERAL (
+    SELECT ct_inner.*
+    FROM Tags ct_inner
+    WHERE ct_inner.TagName = ANY(string_to_array(substring(hp.Tags FROM 2 FOR char_length(hp.Tags)-2), '><'))
+    LIMIT 1
+) ct ON TRUE
+LEFT JOIN ComplexTags ON ComplexTags.TagName = ct.TagName
+WHERE hp.ViewRank <= 3
+  AND (hp.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 months' OR hp.LastActivityDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 month')
+  AND NOT EXISTS (
+      SELECT 1 FROM PostHistory ph2 
+      WHERE ph2.PostId = hp.Id 
+        AND ph2.PostHistoryTypeId = 12
+        AND ph2.CreationDate > hp.CreationDate
+  )
+  AND (au.QuestionCount > (SELECT AVG(a2.QuestionCount) FROM ActiveUsers a2) 
+       OR hp.EngagementScore > 50)
+UNION ALL
+SELECT 
+    'Community Average' AS UserName,
+    AVG(au.Reputation) AS Reputation,
+    CAST(AVG(au.QuestionCount) AS INTEGER) AS QuestionCount,
+    CAST(SUM(au.TotalUpvotes) AS INTEGER) AS TotalUpvotes,
+    'Overall Stats' AS Title,
+    AVG(hp.Score) AS PostScore,
+    CAST(AVG(hp.ViewCount) AS INTEGER) AS ViewCount,
+    NULL AS ViewRank,
+    CAST(AVG(hp.EngagementScore) AS INTEGER) AS EngagementScore,
+    CAST(AVG(re.EditCount) AS INTEGER) AS EditCount,
+    'All Categories' AS TagCategory,
+    'Summary' AS PostPerformanceCategory,
+    AVG(GREATEST(hp.Score, COALESCE(au.Reputation / 100.0, 0))) AS WeightedScore,
+    FALSE AS HasEmptyTitle,
+    NULL AS RecentGoldBadges,
+    NULL AS ExternalLinksCount
+FROM ActiveUsers au
+INNER JOIN HighImpactPosts hp ON hp.OwnerUserId = au.Id
+LEFT JOIN RecentEdits re ON re.PostId = hp.Id
+GROUP BY 1
+ORDER BY UserName, PostScore DESC;

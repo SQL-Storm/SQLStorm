@@ -1,0 +1,180 @@
+-- {"query": "8.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1971} 
+with
+-- tag popularity by average score and recent activity
+TagStats as (
+  select
+    t.TagName,
+    t.Id as TagId,
+    t.Count as TagCount,
+    coalesce(avg(p.Score)::numeric,0) as AvgScore,
+    max(p.CreationDate) as LastPostDate,
+    sum(case when p.CreationDate > now() - interval '180 days' then 1 else 0 end) as RecentPosts
+  from Tags t
+  left join Posts p on p.Tags is not null and position('<' || t.TagName || '>' in p.Tags) > 0 and p.PostTypeId = 1
+  group by t.Id, t.TagName, t.Count
+),
+-- top contributors per tag (by answers accepted or score) using correlated subquery
+TopContributors as (
+  select
+    ts.TagId,
+    ts.TagName,
+    u.Id as UserId,
+    u.DisplayName,
+    coalesce(sum(case when a.Id = q.AcceptedAnswerId then 3 else 0 end),0) +
+    coalesce(sum(coalesce(a.Score,0)),0) as ContributorScore,
+    row_number() over (partition by ts.TagId order by 
+      (coalesce(sum(case when a.Id = q.AcceptedAnswerId then 3 else 0 end),0) + coalesce(sum(coalesce(a.Score,0)),0)) desc,
+      coalesce(sum(1),0) desc,
+      u.Reputation desc
+    ) as rn
+  from TagStats ts
+  join Posts q on q.PostTypeId = 1 and q.Tags is not null and position('<' || ts.TagName || '>' in q.Tags) > 0
+  join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+  join Users u on u.Id = a.OwnerUserId
+  group by ts.TagId, ts.TagName, u.Id, u.DisplayName, u.Reputation
+),
+-- badge enrichment for top contributors
+ContributorBadges as (
+  select
+    tc.TagId,
+    tc.UserId,
+    tc.DisplayName,
+    tc.ContributorScore,
+    count(*) filter (where b.Class = 1) as GoldBadges,
+    count(*) filter (where b.Class = 2) as SilverBadges,
+    count(*) filter (where b.Class = 3) as BronzeBadges,
+    bool_or(b.TagBased) as HasTagBadges
+  from TopContributors tc
+  left join Badges b on b.UserId = tc.UserId
+  where tc.rn <= 5
+  group by tc.TagId, tc.UserId, tc.DisplayName, tc.ContributorScore
+),
+-- recent controversial posts: high score but many downvotes or many edits
+Controversial as (
+  select
+    p.Id,
+    p.Title,
+    p.PostTypeId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 3) as DownVotes,
+    (select count(*) from PostHistory ph where ph.PostId = p.Id and ph.PostHistoryTypeId in (5,4,6,24)) as EditCount,
+    (select count(*) from Comments c where c.PostId = p.Id) as CommentCount,
+    substring(coalesce(p.Body,''),1,200) as Excerpt
+  from Posts p
+  where p.PostTypeId in (1,2)
+    and p.CreationDate > now() - interval '365 days'
+    and p.Score >= 5
+),
+-- compute link graph metrics: inbound/outbound links, duplicates
+LinkGraph as (
+  select
+    p.Id as PostId,
+    p.Title,
+    count(pl.*) filter (where pl.PostId = p.Id) as Outbound,
+    count(pl.*) filter (where pl.RelatedPostId = p.Id) as Inbound,
+    count(pl.*) filter (where pl.LinkTypeId = 3) as DuplicateLinks
+  from Posts p
+  left join PostLinks pl on pl.PostId = p.Id or pl.RelatedPostId = p.Id
+  group by p.Id, p.Title
+),
+-- user engagement time-series via window functions
+UserEngagement as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    date_trunc('month', coalesce(p.CreationDate, u.CreationDate)) as Month,
+    count(distinct p.Id) filter (where p.PostTypeId = 1) as Questions,
+    count(distinct p.Id) filter (where p.PostTypeId = 2) as Answers,
+    sum(coalesce(p.Score,0)) as PostScore,
+    sum(coalesce(c.CommentCount,0)) over (partition by u.Id order by date_trunc('month', coalesce(p.CreationDate, u.CreationDate)) rows between unbounded preceding and current row) as CumulativeActivity
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  left join (
+    select PostId, count(*) as CommentCount from Comments group by PostId
+  ) c on c.PostId = p.Id
+  group by u.Id, u.DisplayName, date_trunc('month', coalesce(p.CreationDate, u.CreationDate))
+),
+-- combine tag stats with top contributors and sample controversial posts
+TagSummary as (
+  select
+    ts.TagId,
+    ts.TagName,
+    ts.TagCount,
+    ts.AvgScore,
+    ts.LastPostDate,
+    ts.RecentPosts,
+    coalesce(sum(cb.GoldBadges),0) as TotalGoldForTop,
+    coalesce(sum(cb.SilverBadges),0) as TotalSilverForTop,
+    coalesce(sum(cb.BronzeBadges),0) as TotalBronzeForTop,
+    string_agg(distinct coalesce(cb.DisplayName, 'anonymous') || ':' || coalesce(cb.ContributorScore::text,'0'), ', ' order by coalesce(cb.ContributorScore,0) desc) as TopContributorsList,
+    (select count(*) from Posts p where p.Tags is not null and position('<' || ts.TagName || '>' in p.Tags) > 0 and p.Score >= 10) as HighScorePosts
+  from TagStats ts
+  left join ContributorBadges cb on cb.TagId = ts.TagId
+  group by ts.TagId, ts.TagName, ts.TagCount, ts.AvgScore, ts.LastPostDate, ts.RecentPosts
+)
+select
+  ts.TagId,
+  ts.TagName,
+  ts.TagCount,
+  ts.AvgScore,
+  ts.RecentPosts,
+  ts.LastPostDate,
+  ts.HighScorePosts,
+  ts.TotalGoldForTop,
+  ts.TotalSilverForTop,
+  ts.TotalBronzeForTop,
+  ts.TopContributorsList,
+  lg.Outbound,
+  lg.Inbound,
+  lg.DuplicateLinks,
+  c.Id as ControversialPostId,
+  c.Title as ControversialTitle,
+  c.Score as ControversialScore,
+  c.DownVotes,
+  c.EditCount,
+  c.CommentCount,
+  ue.Month as SampleUserMonth,
+  ue.Questions as UserQuestionsThatMonth,
+  ue.Answers as UserAnswersThatMonth,
+  ue.PostScore as UserPostScoreThatMonth,
+  ue.CumulativeActivity
+from TagSummary ts
+-- pick a representative post for link metrics via lateral correlated extraction (most recent question)
+left join lateral (
+  select lg.*
+  from LinkGraph lg
+  join Posts p on p.Id = lg.PostId
+  where p.Tags is not null and position('<' || ts.TagName || '>' in p.Tags) > 0
+  order by p.CreationDate desc nulls last
+  limit 1
+) lg on true
+-- pick a controversial post per tag (highest score with edits)
+left join lateral (
+  select c.*
+  from Controversial c
+  where c.Title is not null and c.Excerpt is not null
+    and exists (
+      select 1 from Posts p where p.Id = c.Id and p.Tags is not null and position('<' || ts.TagName || '>' in p.Tags) > 0
+    )
+  order by (c.Score + greatest(c.EditCount,0)) desc, c.DownVotes desc
+  limit 1
+) c on true
+-- sample a user engagement row: user who appears in top contributors if any, else highest rep recent user for tag
+left join lateral (
+  select ue.*
+  from UserEngagement ue
+  where ue.UserId = (
+    coalesce(
+      (select cb.UserId from ContributorBadges cb where cb.TagId = ts.TagId order by cb.ContributorScore desc limit 1),
+      (select u.Id from Users u join Posts p on p.OwnerUserId = u.Id where p.Tags is not null and position('<' || ts.TagName || '>' in p.Tags) > 0 order by u.Reputation desc limit 1),
+      -1
+    )
+  )
+  order by ue.Month desc
+  limit 1
+) ue on true
+where ts.RecentPosts > 0
+order by ts.RecentPosts desc, ts.AvgScore desc
+limit 100;

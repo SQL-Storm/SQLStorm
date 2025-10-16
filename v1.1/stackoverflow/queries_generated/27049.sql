@@ -1,0 +1,125 @@
+-- {"query": "27049.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2337, "output_tokens": 1189} 
+
+WITH ActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(p.Id) AS PostCount,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(v.Id) AS VoteCount,
+        COUNT(b.Id) AS BadgeCount
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    WHERE
+        u.LastAccessDate > NOW() - INTERVAL '30 days'
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+HighReputationPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CreationDate,
+        u.DisplayName AS OwnerDisplayName,
+        COALESCE(a.DisplayName, 'No Accepted Answer') AS AcceptedAnswerDisplayName,
+        COUNT(v.Id) AS VoteCount,
+        COUNT(c.Id) AS CommentCount,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM
+        Posts p
+    JOIN
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN
+        Posts a ON p.AcceptedAnswerId = a.Id
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN
+        PostHistory ph ON p.Id = ph.PostId
+    WHERE
+        p.OwnerUserId IS NOT NULL
+        AND p.Score > 10
+    GROUP BY
+        p.Id, p.PostTypeId, p.Title, p.Tags, p.Score, p.ViewCount, p.AnswerCount, p.CreationDate, u.DisplayName, a.DisplayName
+),
+ PopularTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        COUNT(p.Id) AS PostCount,
+        SUM(p.Score) AS TotalScore,
+        SUM(p.ViewCount) AS TotalViewCount
+    FROM
+        Tags t
+    LEFT JOIN
+        Posts p ON t.TagName = ANY(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), ''><'' ))
+    GROUP BY
+        t.TagName, t.Count
+    ORDER BY
+        TotalViewCount DESC
+    LIMIT 10
+)
+SELECT
+    au.UserId,
+    au.Reputation,
+    au.CreationDate,
+    au.LastAccessDate,
+    au.Views,
+    au.UpVotes,
+    au.DownVotes,
+    au.PostCount,
+    au.CommentCount,
+    au.VoteCount,
+    au.BadgeCount,
+    hrp.PostId,
+    hrp.PostTypeId,
+    hrp.Title,
+    hrp.Tags,
+    hrp.Score,
+    hrp.ViewCount,
+    hrp.AnswerCount,
+    hrp.CreationDate,
+    hrp.OwnerDisplayName,
+    hrp.AcceptedAnswerDisplayName,
+    hrp.VoteCount AS PostVoteCount,
+    hrp.CommentCount AS PostCommentCount,
+    hrp.LastEditDate,
+    pt.TagName,
+    pt.Count,
+    pt.PostCount AS TagPostCount,
+    pt.TotalScore,
+    pt.TotalViewCount,
+    RANK() OVER (PARTITION BY hrp.PostTypeId ORDER BY hrp.Score DESC) AS PostRank,
+    DENSE_RANK() OVER (PARTITION BY pt.TagName ORDER BY pt.TotalViewCount DESC) AS TagRank
+FROM
+    ActiveUsers au
+LEFT JOIN
+    HighReputationPosts hrp ON au.UserId = hrp.OwnerUserId
+LEFT JOIN
+    PopularTags pt ON hrp.Tags LIKE CONCAT('%><', pt.TagName, ''><%')
+WHERE
+    au.Reputation > 1000
+    AND hrp.PostTypeId = 1
+ORDER BY
+    au.Reputation DESC,
+    hrp.Score DESC,
+    pt.TotalViewCount DESC;

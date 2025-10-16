@@ -1,0 +1,64 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS Rank
+    FROM 
+        Posts p
+    WHERE 
+        p.PostTypeId = 1 
+        AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+),
+UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(COALESCE(c.Score, 0)) AS TotalCommentScore,
+        SUM(COALESCE(p.ViewCount, 0)) AS TotalViews,
+        AVG(COALESCE(p.Score, 0)) AS AverageScore
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN 
+        Comments c ON p.Id = c.PostId
+    GROUP BY 
+        u.Id,
+        u.DisplayName
+),
+TopUsers AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.PostCount,
+        us.TotalCommentScore,
+        us.TotalViews,
+        us.AverageScore,
+        RANK() OVER (ORDER BY us.PostCount DESC) AS UserRank
+    FROM 
+        UserStats us
+    WHERE 
+        us.PostCount > 0
+)
+SELECT 
+    tu.DisplayName,
+    tu.PostCount,
+    tu.TotalCommentScore,
+    tu.TotalViews,
+    tu.AverageScore,
+    COALESCE(rp.Title, 'No Posts') AS LatestPostTitle,
+    rp.CreationDate AS LatestPostDate
+FROM 
+    TopUsers tu
+LEFT JOIN (
+    SELECT * FROM RankedPosts WHERE Rank = 1
+) rp ON tu.UserId = rp.PostId
+WHERE 
+    tu.UserRank <= 10
+ORDER BY 
+    tu.UserRank;

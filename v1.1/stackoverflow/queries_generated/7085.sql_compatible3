@@ -1,0 +1,215 @@
+with
+monthly_tags as (
+  select
+    date_trunc('month', p.creationdate) as month,
+    unnest(string_to_array(substring(coalesce(p.tags,''), 2, greatest(length(coalesce(p.tags,''))-2,0)), '><')) as tag
+  from posts p
+  where p.posttypeid = 1
+),
+tag_stats as (
+  select
+    month,
+    tag,
+    count(*) as questions,
+    avg(coalesce(p.viewcount,0)) over (partition by tag) as avg_views_for_tag,
+    sum(coalesce(p.answercount,0)) over (partition by tag) as total_answers_for_tag
+  from monthly_tags mt
+  join posts p on date_trunc('month', p.creationdate) = mt.month and p.posttypeid = 1
+  group by month, tag
+),
+answerers_by_tag as (
+  select
+    t.tag,
+    a.owneruserid,
+    u.displayname,
+    count(*) filter (where a.posttypeid = 2) as answers,
+    sum(case when exists (
+        select 1 from posts q where q.id = a.parentid and q.acceptedanswerid = a.id
+      ) then 1 else 0 end) as accepted_count,
+    round(100.0 * sum(case when exists (
+        select 1 from posts q where q.id = a.parentid and q.acceptedanswerid = a.id
+      ) then 1 else 0 end) / nullif(count(*) filter (where a.posttypeid = 2),0),2) as accepted_pct,
+    row_number() over (partition by t.tag order by count(*) filter (where a.posttypeid = 2) desc, sum(coalesce(a.score,0)) desc) as rn
+  from posts a
+  join lateral (
+    select unnest(string_to_array(substring(coalesce(p.tags,''),2, greatest(length(coalesce(p.tags,''))-2,0)), '><')) as tag
+    from posts p
+    where p.id = a.parentid and p.posttypeid = 1
+  ) t on true
+  left join users u on u.id = a.owneruserid
+  where a.posttypeid = 2
+  group by t.tag, a.owneruserid, u.displayname
+),
+top_answerers as (
+  select tag, owneruserid, displayname, answers, accepted_count, accepted_pct
+  from answerers_by_tag
+  where rn <= 3
+),
+user_activity_bursts as (
+  select
+    owneruserid,
+    count(*) as total_posts,
+    sum(case when gap_seconds <= 3600 then 1 else 0 end) as short_gaps,
+    avg(gap_seconds) filter (where gap_seconds is not null) as avg_gap_seconds,
+    max(gap_seconds) as max_gap_seconds
+  from (
+    select
+      owneruserid,
+      cast(extract(epoch from (next_creation - creationdate)) as bigint) as gap_seconds
+    from (
+      select
+        owneruserid,
+        creationdate,
+        lead(creationdate) over (partition by owneruserid order by creationdate) as next_creation
+      from posts
+      where owneruserid is not null
+    ) s
+    where next_creation is not null
+  ) x
+  group by owneruserid
+),
+controversial_answers as (
+  select
+    a.id as answerid,
+    a.parentid as questionid,
+    a.owneruserid,
+    a.score,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    count(c.id) filter (where c.text ~* '\\m(bug|issue|wrong|incorrect|fails)\\M') as flagged_comments,
+    strpos(lower(coalesce(a.body,'')), 'i think') > 0 as contains_opinion,
+    round(1.0 * sum(case when v.votetypeid = 3 then 1 else 0 end) / nullif(sum(case when v.votetypeid in (2,3) then 1 else 0 end),0),3) as downvote_ratio
+  from posts a
+  left join votes v on v.postid = a.id
+  left join comments c on c.postid = a.id
+  where a.posttypeid = 2
+  group by a.id, a.parentid, a.owneruserid, a.score, a.body
+  having sum(case when v.votetypeid = 3 then 1 else 0 end) >= 5
+),
+interesting_questions as (
+  select
+    p.id,
+    p.title,
+    p.creationdate,
+    p.viewcount,
+    p.answercount,
+    p.favoritecount,
+    p.tags,
+    'unanswered' as reason,
+    row_number() over (order by p.creationdate desc) rn
+  from posts p
+  where p.posttypeid = 1 and (p.answercount = 0 or p.acceptedanswerid is null)
+  union all
+  select
+    p.id,
+    p.title,
+    p.lastactivitydate as creationdate,
+    p.viewcount,
+    p.answercount,
+    p.favoritecount,
+    p.tags,
+    'hot' as reason,
+    row_number() over (order by p.lastactivitydate desc) rn
+  from posts p
+  where p.posttypeid = 1 and p.viewcount > 10000
+  union all
+  select
+    p.id,
+    p.title,
+    p.lasteditdate as creationdate,
+    p.viewcount,
+    p.answercount,
+    p.favoritecount,
+    p.tags,
+    'long_edit_history' as reason,
+    row_number() over (order by p.lasteditdate desc) rn
+  from posts p
+  where p.posttypeid = 1 and (select count(*) from posthistory ph where ph.postid = p.id) > 50
+)
+select
+  qs.id as question_id,
+  qs.title,
+  qs.reason,
+  qs.creationdate,
+  qs.viewcount,
+  qs.answercount,
+  qs.favoritecount,
+  split_part(qs.tags, '><', 1) as primary_tag_snippet,
+  ts.month,
+  ts.tag,
+  ts.questions as questions_in_month,
+  ta.owneruserid as top_answerer_id,
+  ta.displayname as top_answerer_name,
+  ta.answers as top_answerer_answers,
+  ta.accepted_pct as top_answerer_accepted_pct,
+  ua.total_posts as author_total_posts,
+  ua.short_gaps,
+  ca.answerid as controversial_answer_id,
+  ca.downvotes,
+  ca.downvote_ratio,
+  round(
+    (
+      coalesce(qs.viewcount,0) * 0.001
+      + coalesce(qs.favoritecount,0) * 2
+      + coalesce(ts.questions,0) * 0.5
+      + coalesce(ta.answers,0) * 1.25
+      - coalesce(ca.downvotes,0) * 0.75
+      + case when coalesce(ua.short_gaps,0) > 10 then 5 else 0 end
+    ) * (case when coalesce(qs.answercount,0) = 0 then 1.5 else 1 end)
+    ,2) as composite_score
+from
+  (select * from interesting_questions order by rn limit 200) qs
+left join lateral (
+  select tag, month, questions
+  from tag_stats ts
+  where ts.tag = split_part(qs.tags, '><', 2) or ts.tag = split_part(qs.tags, '><',1)
+  order by ts.month desc
+  limit 1
+) ts on true
+left join lateral (
+  select tag, owneruserid, displayname, answers, accepted_pct
+  from top_answerers ta
+  where ta.tag = coalesce(ts.tag, split_part(qs.tags,'><',1))
+  order by answers desc nulls last
+  limit 1
+) ta on true
+left join users u on u.id = ta.owneruserid
+left join user_activity_bursts ua on ua.owneruserid = (
+  case
+    when coalesce(qs.answercount,0) > 0 and qs.id is not null then (
+      select owneruserid from posts where id = qs.id
+    )
+    else null
+  end
+)
+left join lateral (
+  select ca.*
+  from controversial_answers ca
+  where ca.questionid = qs.id
+  order by ca.downvote_ratio desc nulls last, ca.downvotes desc
+  limit 1
+) ca on true
+where qs.creationdate is not null
+group by
+  qs.id,
+  qs.title,
+  qs.reason,
+  qs.creationdate,
+  qs.viewcount,
+  qs.answercount,
+  qs.favoritecount,
+  qs.tags,
+  ts.month,
+  ts.tag,
+  ts.questions,
+  ta.owneruserid,
+  ta.displayname,
+  ta.answers,
+  ta.accepted_pct,
+  ua.total_posts,
+  ua.short_gaps,
+  ca.answerid,
+  ca.downvotes,
+  ca.downvote_ratio
+order by composite_score desc, qs.viewcount desc
+limit 100;

@@ -1,0 +1,215 @@
+-- {"query": "29020.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2037} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        COALESCE(SUM(p.ViewCount), 0) as TotalViews,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+RankedUsers AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC, Reputation DESC) as RankByScore,
+        DENSE_RANK() OVER (ORDER BY BadgeCount DESC) as RankByBadges,
+        NTILE(100) OVER (ORDER BY TotalViews DESC) as PercentileByViews
+    FROM UserActivityStats
+),
+TopPosts AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.ParentId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.AcceptedAnswerId,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRank,
+        RANK() OVER (ORDER BY p.ViewCount DESC) as ViewRank,
+        DENSE_RANK() OVER (ORDER BY p.CreationDate DESC) as RecentRank,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'QuestionWithAcceptedAnswer'
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NULL AND p.AnswerCount > 0 THEN 'QuestionWithAnswers'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount = 0 THEN 'QuestionNoAnswers'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostCategory
+    FROM Posts p
+    WHERE p.Score > 0 OR p.ViewCount > 1000 OR p.CommentCount > 5
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'HighInterestTag'
+            WHEN t.Count > 100 THEN 'MediumInterestTag'
+            WHEN t.Count > 10 THEN 'LowInterestTag'
+            ELSE 'VeryLowInterestTag'
+        END as TagInterestLevel,
+        COUNT(DISTINCT p.Id) as PostsUsingTag,
+        AVG(p.Score) as AvgScoreOfTagPosts,
+        STRING_AGG(DISTINCT p.OwnerUserId::TEXT, ', ') as UsersWhoUsedTag
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId
+),
+UserPostAnalytics AS (
+    SELECT 
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.PostCount,
+        ru.QuestionCount,
+        ru.AnswerCount,
+        ru.TotalScore,
+        ru.TotalViews,
+        ru.RankByScore,
+        ru.RankByBadges,
+        ru.PercentileByViews,
+        CASE 
+            WHEN ru.PostCount > 100 THEN 'HighlyActiveUser'
+            WHEN ru.PostCount > 50 THEN 'ActiveUser'
+            WHEN ru.PostCount > 10 THEN 'RegularUser'
+            ELSE 'OccasionalUser'
+        END as UserActivityLevel,
+        CASE 
+            WHEN ru.Reputation > 100000 THEN 'LegendaryReputation'
+            WHEN ru.Reputation > 10000 THEN 'MasterReputation'
+            WHEN ru.Reputation > 1000 THEN 'ExpertReputation'
+            ELSE 'BeginnerReputation'
+        END as ReputationLevel,
+        (ru.TotalScore * 100.0 / NULLIF(ru.TotalViews, 0)) as ScoreToViewRatio
+    FROM RankedUsers ru
+    WHERE ru.PostCount > 0
+),
+CombinedAnalysis AS (
+    SELECT 
+        upa.UserId,
+        upa.DisplayName,
+        upa.Reputation,
+        upa.PostCount,
+        upa.QuestionCount,
+        upa.AnswerCount,
+        upa.TotalScore,
+        upa.TotalViews,
+        upa.RankByScore,
+        upa.RankByBadges,
+        upa.PercentileByViews,
+        upa.UserActivityLevel,
+        upa.ReputationLevel,
+        upa.ScoreToViewRatio,
+        tp.PostId,
+        tp.Title,
+        tp.Body,
+        tp.Score as PostScore,
+        tp.ViewCount as PostViewCount,
+        tp.CreationDate as PostCreationDate,
+        tp.PostTypeId,
+        tp.Tags,
+        tp.PostCategory,
+        ta.TagName,
+        ta.Count as TagCount,
+        ta.TagInterestLevel
+    FROM UserPostAnalytics upa
+    LEFT JOIN TopPosts tp ON upa.UserId = tp.OwnerUserId
+    LEFT JOIN TagAnalysis ta ON tp.Tags LIKE '%' || ta.TagName || '%'
+    WHERE tp.ScoreRank <= 10 OR tp.ViewRank <= 10
+)
+SELECT 
+    ca.UserId,
+    ca.DisplayName,
+    ca.Reputation,
+    ca.PostCount,
+    ca.QuestionCount,
+    ca.AnswerCount,
+    ca.TotalScore,
+    ca.TotalViews,
+    ca.RankByScore,
+    ca.RankByBadges,
+    ca.PercentileByViews,
+    ca.UserActivityLevel,
+    ca.ReputationLevel,
+    ca.ScoreToViewRatio,
+    ca.PostId,
+    ca.Title,
+    ca.PostScore,
+    ca.PostViewCount,
+    ca.PostCreationDate,
+    ca.PostTypeId,
+    ca.Tags,
+    ca.PostCategory,
+    ca.TagName,
+    ca.TagCount,
+    ca.TagInterestLevel,
+    CASE 
+        WHEN ca.TagInterestLevel = 'HighInterestTag' THEN 'Popular Topic'
+        WHEN ca.TagInterestLevel = 'MediumInterestTag' THEN 'Moderate Topic'
+        WHEN ca.TagInterestLevel = 'LowInterestTag' THEN 'Niche Topic'
+        WHEN ca.TagInterestLevel = 'VeryLowInterestTag' THEN 'Rare Topic'
+        ELSE 'Unknown Topic'
+    END as TopicPopularity,
+    DENSE_RANK() OVER (ORDER BY ca.TotalScore DESC) as GlobalScoreRank,
+    PERCENT_RANK() OVER (ORDER BY ca.TotalViews DESC) as ViewPercentile,
+    CASE 
+        WHEN (ca.ScoreToViewRatio > 0.01) THEN 'HighlyEngaged'
+        WHEN (ca.ScoreToViewRatio > 0.001 AND ca.ScoreToViewRatio <= 0.01) THEN 'ModeratelyEngaged'
+        WHEN (ca.ScoreToViewRatio <= 0.001) THEN 'LowEngagement'
+        ELSE 'NoEngagement'
+    END as EngagementLevel,
+    COALESCE(ca.Title, 'No Title') || ' - ' || COALESCE(ca.TagName, 'No Tag') as PostTagSummary,
+    (SELECT COUNT(*) FROM CombinedAnalysis ca2 WHERE ca2.UserId = ca.UserId AND ca2.PostTypeId = 1) as QuestionCountForUser,
+    (SELECT COUNT(*) FROM CombinedAnalysis ca3 WHERE ca3.UserId = ca.UserId AND ca3.PostTypeId = 2) as AnswerCountForUser,
+    CASE 
+        WHEN ca.PostScore > 100 THEN 'HighlyVoted'
+        WHEN ca.PostScore > 50 THEN 'ModeratelyVoted'
+        WHEN ca.PostScore > 10 THEN 'LowVoted'
+        ELSE 'NotVoted'
+    END as VoteLevel,
+    CASE 
+        WHEN ca.PostTypeId = 1 THEN 'Question'
+        WHEN ca.PostTypeId = 2 THEN 'Answer'
+        ELSE 'OtherPostType'
+    END as PostTypeDescription,
+    COALESCE(ca.Body, 'No Content') as PostContentPreview,
+    CASE 
+        WHEN ca.ReputationLevel = 'LegendaryReputation' AND ca.UserActivityLevel = 'HighlyActiveUser' THEN 'EliteContributor'
+        WHEN ca.ReputationLevel = 'MasterReputation' AND ca.UserActivityLevel = 'ActiveUser' THEN 'ExperiencedContributor'
+        WHEN ca.ReputationLevel = 'ExpertReputation' AND ca.UserActivityLevel = 'RegularUser' THEN 'RegularContributor'
+        ELSE 'StandardContributor'
+    END as ContributorTier
+FROM CombinedAnalysis ca
+WHERE ca.Reputation > 0 
+    AND (ca.PostCount > 0 OR ca.BadgeCount > 0)
+    AND (ca.PostTypeId = 1 OR ca.PostTypeId = 2 OR ca.PostTypeId IS NULL)
+ORDER BY 
+    ca.RankByScore ASC,
+    ca.TotalViews DESC,
+    ca.ScoreToViewRatio DESC,
+    ca.PostCreationDate DESC
+LIMIT 1000;

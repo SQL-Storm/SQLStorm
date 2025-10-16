@@ -1,0 +1,19 @@
+SELECT
+    NULL::integer      AS reputation,
+    NULL::integer      AS gold_badges,
+    NULL::integer      AS silver_badges,
+    NULL::integer      AS bronze_badges,
+    NULL::bigint       AS total_post_score,
+    NULL::numeric      AS avg_answer_score,
+    NULL::timestamp    AS last_post_date,
+    NULL::timestamp    AS last_vote_date,
+    NULL::integer      AS up_votes_given,
+    NULL::integer      AS down_votes_given,
+    NULL::varchar      AS recent_question_title,
+    NULL::timestamp    AS recent_question_date,
+    NULL::integer      AS distinct_tag_count,
+    NULL::varchar      AS tagname,
+    NULL::integer      AS tag_use_count,
+    NULL::varchar      AS tag_latest_post_title,
+    NULL::timestamp    AS tag_latest_post_date
+WHERE NOT EXISTS (SELECT 1 FROM final_users);

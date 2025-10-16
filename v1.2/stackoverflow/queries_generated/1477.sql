@@ -1,0 +1,108 @@
+-- {"query": "1477.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1099} 
+with UserActivityCTE as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        count(distinct b.Id) as BadgeCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) over (partition by u.Id) as UpVotesReceived,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) over (partition by u.Id) as DownVotesReceived,
+        coalesce((select max(ph.CreationDate)
+            from PostHistory ph
+            where ph.UserId = u.Id
+        ), '1970-01-01'::timestamp) as LastHistoryEdit
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopTagsCTE as (
+    select
+        p.OwnerUserId as UserId,
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as Tag,
+        count(*) as TagPostCount
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+    group by p.OwnerUserId, Tag
+),
+UserTopTags as (
+    select distinct on (UserId)
+        UserId,
+        Tag,
+        TagPostCount
+    from TopTagsCTE
+    order by UserId, TagPostCount desc
+),
+BestAnswersCTE as (
+    select
+        a.OwnerUserId as UserId,
+        a.Id as AnswerId,
+        a.Score,
+        row_number() over (partition by a.OwnerUserId order by a.Score desc, a.CreationDate) as AnswerRank,
+        q.Title as ParentQuestionTitle,
+        q.Tags as ParentQuestionTags
+    from Posts a
+    join Posts q on q.Id = a.ParentId and q.PostTypeId = 1
+    where a.PostTypeId = 2 and a.OwnerUserId is not null
+),
+HighScoreSyncedUsers as (
+    select UserId
+    from UserActivityCTE
+    where DownVotesReceived < 10 and UpVotesReceived > 100
+)
+select
+    uac.UserId,
+    uac.DisplayName,
+    uac.QuestionCount,
+    uac.AnswerCount,
+    uac.CommentCount,
+    uac.BadgeCount,
+    case when uts.Tag is null then 'None' else uts.Tag end as FavoriteTag,
+    ba.AnswerId,
+    ba.Score as BestAnswerScore,
+    ba.ParentQuestionTitle,
+    ba.ParentQuestionTags,
+    case when uac.LastHistoryEdit > current_date - interval '30 day' then 1 else 0 end as RecentEditorFlag,
+    coalesce((select sum(v2.BountyAmount)
+        from Votes v2 join Posts p2 on p2.Id = v2.PostId
+        where v2.UserId = uac.UserId and v2.VoteTypeId in (8,9) and p2.CreationDate > current_date - interval '1 year'
+    ),0) as YearlyBountyReceived,
+    row_number() over (order by uac.AnswerCount desc) as UserRankByAnswers,
+    concat(
+        reverse(split_part(reverse(uac.DisplayName), ' ', 1)),
+        ' (#',
+        uac.UserId,
+        ')'
+    ) as DisplayName_Reversed_LastName,
+    case when uac.QuestionCount = 0 then null else
+        (uac.AnswerCount::float / nullif(uac.QuestionCount,0))
+    end as AnswerQuestionRatio
+from UserActivityCTE uac
+left join UserTopTags uts on uts.UserId = uac.UserId
+left join BestAnswersCTE ba on ba.UserId = uac.UserId and ba.AnswerRank = 1
+where uac.UserId in (select UserId from HighScoreSyncedUsers)
+union
+select
+    uac.UserId,
+    uac.DisplayName,
+    uac.QuestionCount,
+    uac.AnswerCount,
+    uac.CommentCount,
+    uac.BadgeCount,
+    null as FavoriteTag,
+    null as AnswerId,
+    null as BestAnswerScore,
+    null as ParentQuestionTitle,
+    null as ParentQuestionTags,
+    0 as RecentEditorFlag,
+    0 as YearlyBountyReceived,
+    row_number() over (order by uac.AnswerCount asc) + 1000 as UserRankByAnswers,
+    uac.DisplayName as DisplayName_Reversed_LastName,
+    null as AnswerQuestionRatio
+from UserActivityCTE uac
+where not exists (select 1 from HighScoreSyncedUsers hsu where uac.UserId = hsu.UserId)
+order by UserRankByAnswers, BestAnswerScore desc NULLS LAST;

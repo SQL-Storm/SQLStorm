@@ -1,0 +1,83 @@
+-- {"query": "28045.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "deepseek-r1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1379} 
+WITH UserActivity AS (
+    SELECT 
+        u.Id,
+        u.Reputation,
+        u.CreationDate,
+        EXTRACT(YEAR FROM u.CreationDate) AS JoinYear,
+        COALESCE(COUNT(DISTINCT p.Id), 0) AS TotalPosts,
+        COALESCE(COUNT(DISTINCT c.Id), 0) AS TotalComments,
+        COALESCE(COUNT(DISTINCT b.Id), 0) AS TotalBadges,
+        RANK() OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN 
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN 
+        Badges b ON u.Id = b.UserId AND b.Class = 1
+    GROUP BY 
+        u.Id, u.Reputation, u.CreationDate
+),
+PostMetrics AS (
+    SELECT 
+        p.OwnerUserId,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId) AS AvgPostScoreByType,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 2 THEN 1 ELSE 0 END) AS BodyEdits,
+        MAX(LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, '><', ''))) AS MaxTagCount
+    FROM 
+        Posts p
+    LEFT JOIN 
+        PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (2,5,8)
+    WHERE 
+        p.PostTypeId IS NOT NULL
+)
+SELECT 
+    ua.Id,
+    ua.Reputation,
+    ua.JoinYear,
+    ua.TotalPosts,
+    ua.TotalComments,
+    ua.TotalBadges,
+    ua.ReputationRank,
+    pm.AvgPostScoreByType,
+    pm.BodyEdits,
+    pm.MaxTagCount,
+    (SELECT AVG(TotalComments) FROM UserActivity) AS GlobalAvgComments,
+    CASE 
+        WHEN ua.TotalComments > (SELECT AVG(TotalComments) FROM UserActivity) 
+        THEN 'AboveAvg' 
+        ELSE 'BelowAvg' 
+    END AS CommentPerformance,
+    COALESCE(SPLIT_PART(u.Location, ',', 1), 'Unknown') AS PrimaryLocation,
+    (SELECT COUNT(*) 
+     FROM Votes v 
+     WHERE v.UserId = ua.Id 
+       AND v.VoteTypeId = 2 
+       AND v.CreationDate BETWEEN '2015-01-01' AND '2020-01-01') AS UpvotesLast5Years,
+    (SELECT COUNT(*) 
+     FROM Posts p2 
+     WHERE p2.OwnerUserId = ua.Id 
+       AND p2.Id IN (SELECT RelatedPostId FROM PostLinks WHERE LinkTypeId = 3)
+    ) AS DuplicatePosts
+FROM 
+    UserActivity ua
+LEFT JOIN 
+    PostMetrics pm ON ua.Id = pm.OwnerUserId
+WHERE 
+    ua.Reputation > (SELECT PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY Reputation) FROM Users)
+    AND EXISTS (
+        SELECT 1 
+        FROM Badges b2 
+        WHERE b2.UserId = ua.Id 
+        AND b2.Name IN ('Legendary', 'Epic', 'Scholar') 
+        INTERSECT 
+        SELECT 1 
+        FROM Posts p3 
+        WHERE p3.OwnerUserId = ua.Id 
+        AND p3.Score > 100
+    )
+ORDER BY 
+    ua.ReputationRank,
+    pm.AvgPostScoreByType DESC NULLS LAST;

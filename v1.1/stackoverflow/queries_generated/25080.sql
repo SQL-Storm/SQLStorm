@@ -1,0 +1,99 @@
+-- {"query": "25080.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1897} 
+
+WITH top_users AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS rn
+    FROM Users u
+    WHERE u.Reputation IS NOT NULL
+),
+
+user_badge_stats AS (
+    SELECT 
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_cnt,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_cnt,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_cnt,
+        COUNT(*) AS total_badges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+question_metrics AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        COUNT(*) FILTER (WHERE p.Score >= 10)               AS high_score_q,
+        AVG(p.ViewCount)::numeric(10,2)                     AS avg_views,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.FavoriteCount) AS median_fav
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId
+),
+
+answer_metrics AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS upvoted_answers,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS downvoted_answers,
+        MAX(p.Score)                             AS max_answer_score
+    FROM Posts p
+    LEFT JOIN Votes v 
+        ON v.PostId = p.Id 
+       AND v.VoteTypeId IN (2,3)
+    WHERE p.PostTypeId = 2
+    GROUP BY p.OwnerUserId
+),
+
+tag_cooccurrence AS (
+    SELECT 
+        t1.TagName AS TagA,
+        t2.TagName AS TagB,
+        COUNT(*)   AS CoOccurCount
+    FROM Posts p
+    JOIN LATERAL regexp_split_to_table(p.Tags, '[><]') AS t1(Tag) ON true
+    JOIN LATERAL regexp_split_to_table(p.Tags, '[><]') AS t2(Tag) ON true
+    JOIN Tags t1t ON t1t.TagName = t1.Tag
+    JOIN Tags t2t ON t2t.TagName = t2.Tag
+    WHERE p.PostTypeId = 1 
+      AND t1.Tag <> t2.Tag
+    GROUP BY t1.TagName, t2.TagName
+    HAVING COUNT(*) > 5
+)
+
+SELECT 
+    tu.Id,
+    tu.DisplayName,
+    tu.Reputation,
+    COALESCE(ubs.gold_cnt,0)          AS GoldBadges,
+    COALESCE(ubs.silver_cnt,0)        AS SilverBadges,
+    COALESCE(ubs.bronze_cnt,0)        AS BronzeBadges,
+    COALESCE(qm.high_score_q,0)       AS HighScoreQuestions,
+    COALESCE(qm.avg_views,0)          AS AvgViews,
+    COALESCE(qm.median_fav,0)         AS MedianFavorites,
+    COALESCE(am.upvoted_answers,0)    AS UpvotedAnswers,
+    COALESCE(am.downvoted_answers,0)  AS DownvotedAnswers,
+    COALESCE(am.max_answer_score,-1)  AS MaxAnswerScore,
+    CASE
+        WHEN tu.Reputation > 20000          THEN 'Elite'
+        WHEN tu.Reputation BETWEEN 10000 AND 20000 THEN 'Pro'
+        ELSE 'Member'
+    END                               AS ReputationBand,
+    (SELECT string_agg(DISTINCT tc.TagA || '-' || tc.TagB, ', ')
+     FROM tag_cooccurrence tc
+     WHERE tc.TagA = ANY(string_to_array(tu.DisplayName, ' '))
+        OR tc.TagB = ANY(string_to_array(tu.DisplayName, ' '))
+    )                                 AS TagPairs
+FROM top_users tu
+LEFT JOIN user_badge_stats ubs ON ubs.UserId = tu.Id
+LEFT JOIN question_metrics qm  ON qm.UserId = tu.Id
+LEFT JOIN answer_metrics am    ON am.UserId = tu.Id
+WHERE tu.rn <= 100
+ORDER BY tu.Reputation DESC, GoldBadges DESC
+
+UNION ALL
+
+SELECT 
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+FROM generate_series(1,5) gs;

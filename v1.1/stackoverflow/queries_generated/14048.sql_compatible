@@ -1,0 +1,87 @@
+WITH cte AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Body,
+    p.Tags,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    CAST(ROUND(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate)) / (365.25 * 24 * 3600), 2) AS NUMERIC(10,2)) AS UserAgeYears,
+    COALESCE(b.Name, '') AS Badge,
+    CASE WHEN b.TagBased = 1 THEN 'Tag-based' ELSE 'Named' END AS BadgeType,
+    CASE b.Class
+      WHEN 1 THEN 'Gold'
+      WHEN 2 THEN 'Silver'
+      WHEN 3 THEN 'Bronze'
+      ELSE 'Unknown'
+    END AS BadgeClass,
+    CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - b.Date)) / (24 * 3600) AS INT) AS DaysSinceBadgeAwarded
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON u.Id = b.UserId
+)
+SELECT
+  c1.PostId,
+  c1.Title,
+  c1.Body,
+  c1.Tags,
+  c1.OwnerUserId,
+  c1.OwnerDisplayName,
+  c1.Reputation,
+  c1.UserCreationDate,
+  c1.LastAccessDate,
+  CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - c1.LastAccessDate)) / (24 * 3600) AS INT) AS DaysLastAccess,
+  c1.Views,
+  c1.UpVotes,
+  c1.DownVotes,
+  CAST(ROUND(CASE WHEN (c1.UpVotes + c1.DownVotes) = 0 THEN NULL ELSE (CAST(c1.UpVotes AS NUMERIC) / CAST((c1.UpVotes + c1.DownVotes) AS NUMERIC)) END, 2) AS NUMERIC(3,2)) AS VoteRatio,
+  c1.UserAgeYears,
+  -- Badges: concatenated Badge values for the same OwnerUserId ordered by DaysSinceBadgeAwarded desc
+  (
+    SELECT STRING_AGG(badge_vals.badge, ', ' ORDER BY badge_vals.days_since_bad DESC)
+    FROM (
+      SELECT c2.Badge AS badge, c2.DaysSinceBadgeAwarded AS days_since_bad
+      FROM cte c2
+      WHERE c2.OwnerUserId = c1.OwnerUserId
+    ) AS badge_vals
+  ) AS Badges,
+  -- BadgeTypes: distinct BadgeType values concatenated ordered by BadgeType
+  (
+    SELECT STRING_AGG(badge_types.badge_type, ', ' ORDER BY badge_types.badge_type)
+    FROM (
+      SELECT DISTINCT c2.BadgeType AS badge_type
+      FROM cte c2
+      WHERE c2.OwnerUserId = c1.OwnerUserId
+    ) AS badge_types
+  ) AS BadgeTypes,
+  -- BadgeClasses: distinct BadgeClass values concatenated ordered by BadgeClass
+  (
+    SELECT STRING_AGG(badge_classes.badge_class, ', ' ORDER BY badge_classes.badge_class)
+    FROM (
+      SELECT DISTINCT c2.BadgeClass AS badge_class
+      FROM cte c2
+      WHERE c2.OwnerUserId = c1.OwnerUserId
+    ) AS badge_classes
+  ) AS BadgeClasses
+FROM cte c1
+GROUP BY
+  c1.PostId,
+  c1.Title,
+  c1.Body,
+  c1.Tags,
+  c1.OwnerUserId,
+  c1.OwnerDisplayName,
+  c1.Reputation,
+  c1.UserCreationDate,
+  c1.LastAccessDate,
+  c1.Views,
+  c1.UpVotes,
+  c1.DownVotes,
+  c1.UserAgeYears
+ORDER BY c1.PostId;

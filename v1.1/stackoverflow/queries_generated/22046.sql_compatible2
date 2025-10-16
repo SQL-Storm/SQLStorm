@@ -1,0 +1,78 @@
+WITH TopQuestions AS (
+    SELECT Id, OwnerUserId, Title, Score, CreationDate, Tags, AnswerCount,
+           ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY Score DESC) AS Rn
+    FROM Posts
+    WHERE PostTypeId = 1 AND Score > 50 AND AnswerCount > 5
+),
+GoldBadgeUsers AS (
+    SELECT UserId, COUNT(*) AS GoldCount
+    FROM Badges
+    WHERE Class = 1
+    GROUP BY UserId
+    HAVING COUNT(*) >= 3
+),
+UserPostStats AS (
+    SELECT u.Id AS UserId, u.DisplayName,
+           COALESCE(SUM(p.Score), 0) AS TotalScore,
+           COUNT(DISTINCT p.Id) AS PostCount,
+           AVG(LENGTH(p.Body)) AS AvgBodyLength,
+           STRING_AGG(DISTINCT SUBSTRING(t.TagName FROM 1 FOR CASE WHEN LENGTH(t.TagName) > 10 THEN 10 ELSE LENGTH(t.TagName) END), ', ') AS TopTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1,2)
+    LEFT JOIN Tags t ON EXISTS (
+        SELECT 1
+        FROM (
+            SELECT UNNEST(STRING_TO_ARRAY(
+                CASE WHEN p.Tags IS NULL THEN '' ELSE SUBSTRING(p.Tags FROM 2 FOR GREATEST(0, LENGTH(p.Tags) - 2)) END
+            , '><')) AS tag
+        ) taglist
+        WHERE taglist.tag = t.TagName
+    )
+    WHERE u.CreationDate < CAST('2020-01-01' AS timestamp)
+    GROUP BY u.Id, u.DisplayName
+),
+AcceptedAnswers AS (
+    SELECT ParentId, COUNT(*) AS AnswerCount
+    FROM Posts
+    WHERE PostTypeId = 2 AND AcceptedAnswerId IS NOT NULL
+    GROUP BY ParentId
+),
+FilteredQuestions AS (
+    SELECT tq.*
+    FROM TopQuestions tq
+    JOIN UserPostStats ups ON tq.OwnerUserId = ups.UserId
+    JOIN GoldBadgeUsers gbu ON tq.OwnerUserId = gbu.UserId
+    LEFT JOIN AcceptedAnswers accepted ON tq.Id = accepted.ParentId
+    WHERE tq.Rn = 1
+      AND ups.PostCount > 10
+      AND (tq.Score > 100 OR gbu.GoldCount > 5)
+)
+SELECT fq.Id AS QuestionId, fq.Title,
+       ups.DisplayName, ups.TotalScore, ups.PostCount,
+       gbu.GoldCount,
+       fq.Score AS QuestionScore,
+       COALESCE(accepted.AnswerCount, 0) AS AcceptedAnswers,
+       CASE WHEN ups.TotalScore > 1000 THEN 'High Contributor' ELSE 'Regular' END AS UserCategory,
+       (EXTRACT(YEAR FROM (CAST('2024-10-01 12:34:56' AS timestamp) - fq.CreationDate)) * 365
+        + EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - fq.CreationDate))) AS DaysOld,
+       LENGTH(fq.Title) / NULLIF(fq.AnswerCount, 0) AS TitleLengthPerAnswer,
+       ups.TopTags
+FROM FilteredQuestions fq
+JOIN UserPostStats ups ON fq.OwnerUserId = ups.UserId
+JOIN GoldBadgeUsers gbu ON fq.OwnerUserId = gbu.UserId
+LEFT JOIN AcceptedAnswers accepted ON fq.Id = accepted.ParentId
+UNION ALL
+SELECT NULL AS QuestionId, 'Summary Row' AS Title,
+       NULL AS DisplayName, SUM(ups.TotalScore) AS TotalScore, COUNT(DISTINCT ups.UserId) AS PostCount,
+       SUM(gbu.GoldCount) AS GoldCount,
+       AVG(fq.Score) AS QuestionScore,
+       SUM(COALESCE(accepted.AnswerCount, 0)) AS AcceptedAnswers,
+       'Total' AS UserCategory,
+       NULL AS DaysOld,
+       NULL AS TitleLengthPerAnswer,
+       STRING_AGG(DISTINCT ups.TopTags, '; ') AS TopTags
+FROM FilteredQuestions fq
+JOIN UserPostStats ups ON fq.OwnerUserId = ups.UserId
+JOIN GoldBadgeUsers gbu ON fq.OwnerUserId = gbu.UserId
+LEFT JOIN AcceptedAnswers accepted ON fq.Id = accepted.ParentId
+ORDER BY TotalScore DESC NULLS LAST, QuestionScore DESC NULLS LAST;

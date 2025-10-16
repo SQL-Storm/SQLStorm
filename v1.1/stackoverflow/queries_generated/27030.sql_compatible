@@ -1,0 +1,108 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        MAX(p.LastActivityDate) AS LastActivity
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation
+),
+HighReputationUsers AS (
+    SELECT
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        VoteCount,
+        LastActivity,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, PostCount DESC, CommentCount DESC) AS Rank
+    FROM
+        UserActivity
+)
+SELECT
+    hr.UserId,
+    hr.DisplayName,
+    hr.Reputation,
+    hr.PostCount,
+    hr.CommentCount,
+    hr.VoteCount,
+    hr.LastActivity,
+    hr.Rank,
+    p.Title AS LatestPostTitle,
+    p.CreationDate AS LatestPostCreationDate,
+    p.Score AS LatestPostScore,
+    c.Text AS LatestCommentText,
+    c.CreationDate AS LatestCommentCreationDate,
+    v.VoteTypeId,
+    v.CreationDate AS LatestVoteCreationDate,
+    b.Name AS LatestBadgeName,
+    b.Date AS LatestBadgeDate,
+    t.TagName AS MostFrequentTag,
+    COUNT(pt.Name) OVER (PARTITION BY hr.UserId ORDER BY hr.Reputation DESC) AS PostTypeCount,
+    STRING_AGG(pt.Name, ', ' ORDER BY pt.Id) AS PostTypes,
+    CASE
+         WHEN hr.PostCount > 0 THEN 'Active Poster'
+         WHEN hr.CommentCount > 0 THEN 'Active Commenter'
+         ELSE 'Mostly Voter'
+     END AS ActivityType
+FROM
+    HighReputationUsers hr
+LEFT JOIN
+    Posts p ON hr.UserId = p.OwnerUserId AND p.CreationDate = hr.LastActivity
+LEFT JOIN
+    Comments c ON hr.UserId = c.UserId AND c.CreationDate = hr.LastActivity
+LEFT JOIN
+    Votes v ON hr.UserId = v.UserId AND v.CreationDate = hr.LastActivity
+LEFT JOIN
+    Badges b ON hr.UserId = b.UserId AND b.Date = hr.LastActivity
+LEFT JOIN
+    Tags t ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+LEFT JOIN
+    PostTypes pt ON p.PostTypeId = pt.Id
+RIGHT JOIN
+    PostHistory ph ON p.Id = ph.PostId
+WHERE
+    (p.OwnerUserId IS NULL OR p.OwnerUserId <> -1)
+    AND hr.LastActivity IS NOT NULL
+    AND LEFT(hr.DisplayName, 1) LIKE CASE WHEN UPPER(hr.DisplayName) LIKE '[A-H]%' THEN LEFT(hr.DisplayName, 1) ELSE NULL END
+    AND (
+         ph.Text LIKE '%<url>%'
+      OR ph.Text LIKE '%postId%'
+      OR ph.Text LIKE '%LinkTypeId%'
+    )
+    AND EXTRACT(YEAR FROM hr.LastActivity) = 2022
+GROUP BY
+    hr.UserId,
+    hr.DisplayName,
+    hr.Reputation,
+    hr.PostCount,
+    hr.CommentCount,
+    hr.VoteCount,
+    hr.LastActivity,
+    hr.Rank,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    c.Text,
+    c.CreationDate,
+    v.VoteTypeId,
+    v.CreationDate,
+    b.Name,
+    b.Date,
+    t.TagName
+ORDER BY
+    hr.Reputation DESC,
+    hr.PostCount DESC,
+    hr.CommentCount DESC;

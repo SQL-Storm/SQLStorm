@@ -1,0 +1,127 @@
+-- {"query": "24053.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 3611} 
+
+WITH
+    -- Q&A posts split into two sets
+    question_data AS (
+        SELECT
+            p.Id             AS PostId,
+            p.OwnerUserId    AS UserId,
+            p.Score,
+            p.Tags,
+            p.CreationDate
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+    ),
+    answer_data AS (
+        SELECT
+            p.Id             AS PostId,
+            p.OwnerUserId    AS UserId,
+            p.Score,
+            p.ParentId,
+            p.CreationDate
+        FROM Posts p
+        WHERE p.PostTypeId = 2
+    ),
+    -- Both sets together
+    combined_posts AS (
+        SELECT * FROM question_data
+        UNION ALL
+        SELECT * FROM answer_data
+    ),
+    -- Extract individual tags from the angled‑bracket string
+    tags_extracted AS (
+        SELECT
+            cp.PostId,
+            TRIM(both '><' FROM t.tag) AS Tag
+        FROM combined_posts cp
+        CROSS JOIN LATERAL unnest(string_to_array(cp.Tags, '>')) AS t(tag)
+        WHERE cp.Tags IS NOT NULL
+    ),
+    -- Per‑user tag usage statistics
+    tag_stats AS (
+        SELECT
+            cp.UserId,
+            te.Tag,
+            COUNT(*)                                           AS TagCount,
+            RANK() OVER (PARTITION BY cp.UserId ORDER BY COUNT(*) DESC) AS TagRank
+        FROM combined_posts cp
+        JOIN tags_extracted te ON te.PostId = cp.PostId
+        GROUP BY cp.UserId, te.Tag
+    ),
+    -- Sum up votes for each user across all their posts
+    user_vote_totals AS (
+        SELECT
+            u.Id                                            AS UserId,
+            SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END)   AS TotalUp,
+            SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS TotalDown
+        FROM Users u
+        JOIN Posts p ON p.OwnerUserId = u.Id
+        JOIN Votes v ON v.PostId = p.Id
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        GROUP BY u.Id
+    ),
+    -- Core user profile data
+    user_base AS (
+        SELECT
+            u.Id           AS UserId,
+            u.DisplayName,
+            u.Reputation,
+            u.CreationDate,
+            u.Views,
+            u.UpVotes,
+            u.DownVotes
+        FROM Users u
+    ),
+    -- Combine base data with vote and tag summaries
+    user_details AS (
+        SELECT
+            ub.*,
+            COALESCE(uv.TotalUp, 0)      AS VoteUp,
+            COALESCE(uv.TotalDown, 0)    AS VoteDown,
+            COALESCE(tt.TagCount, 0)     AS TopTagCount,
+            COALESCE(tt.Tag, '(none)')  AS TopTag,
+            CASE
+                WHEN ub.Reputation > 20000 THEN 'Gold'
+                WHEN ub.Reputation > 10000 THEN 'Silver'
+                ELSE 'Bronze'
+            END AS RepLevel
+        FROM user_base ub
+        LEFT JOIN user_vote_totals uv ON uv.UserId = ub.UserId
+        LEFT JOIN (
+            SELECT
+                UserId,
+                Tag,
+                TagCount
+            FROM tag_stats
+            WHERE TagRank = 1
+        ) tt ON tt.UserId = ub.UserId
+    ),
+    -- Final result with additional metrics and correlated subquery
+    final_output AS (
+        SELECT
+            ud.UserId,
+            ud.DisplayName,
+            ud.Reputation,
+            ud.Views,
+            ud.UpVotes,
+            ud.DownVotes,
+            ud.VoteUp,
+            ud.VoteDown,
+            ud.TopTag,
+            ud.TopTagCount,
+            ud.RepLevel,
+            DENSE_RANK() OVER (ORDER BY ud.Reputation DESC) AS RepRank,
+            COALESCE(ud.Views + ud.UpVotes - ud.DownVotes + ud.VoteUp - ud.VoteDown,0) AS Engagement,
+            -- correlated subquery: earliest post by the user
+            (SELECT MIN(p.CreationDate)
+             FROM Posts p
+             WHERE p.OwnerUserId = fo.UserId) AS FirstPostDate
+        FROM user_details ud
+        JOIN final_output fo ON fo.UserId = ud.UserId
+    )
+SELECT
+    fo.*
+FROM final_output fo
+WHERE fo.Reputation IS NOT NULL
+ORDER BY fo.Engagement DESC
+LIMIT 100;

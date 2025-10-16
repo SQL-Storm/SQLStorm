@@ -1,0 +1,243 @@
+-- {"query": "344.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 15265} 
+WITH
+recent_questions AS (
+  SELECT p.Id,
+         p.Title,
+         p.Body,
+         p.OwnerUserId,
+         p.CreationDate,
+         p.LastActivityDate,
+         p.Score,
+         p.ViewCount,
+         COALESCE(p.AnswerCount,0) AS AnswerCount,
+         p.Tags,
+         substring(p.Tags FROM 2 FOR char_length(p.Tags)-2) AS tag_str,
+         CASE WHEN p.Tags IS NULL THEN NULL ELSE string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><') END AS tag_array
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= now() - interval '365 days'
+),
+
+top_by_views AS (
+  SELECT rq.*
+  FROM recent_questions rq
+  ORDER BY rq.ViewCount DESC NULLS LAST
+  LIMIT 300
+),
+
+top_by_activity AS (
+  SELECT rq.*
+  FROM recent_questions rq
+  ORDER BY rq.LastActivityDate DESC NULLS LAST
+  LIMIT 300
+),
+
+both_sets AS (
+  SELECT Id, Title FROM top_by_views
+  INTERSECT
+  SELECT Id, Title FROM top_by_activity
+),
+
+unioned AS (
+  SELECT * FROM top_by_views
+  UNION
+  SELECT * FROM top_by_activity
+),
+
+aggregated_stats AS (
+  SELECT u.Id,
+         u.Title,
+         u.OwnerUserId,
+         u.CreationDate,
+         u.LastActivityDate,
+         u.Score,
+         u.ViewCount,
+         u.AnswerCount,
+         u.tag_array,
+         COALESCE(sum(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END),0) AS upvotes,
+         COALESCE(sum(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END),0) AS downvotes,
+         COALESCE(sum(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END),0) AS favorites,
+         COALESCE(cnt_comments.cnt,0) AS comments,
+         COALESCE(dupes.dupe_count,0) AS duplicates_count,
+         COALESCE(edits.edit_count,0) AS edit_count
+  FROM unioned u
+  LEFT JOIN Votes v ON v.PostId = u.Id
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS cnt
+    FROM Comments
+    GROUP BY PostId
+  ) cnt_comments ON cnt_comments.PostId = u.Id
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS dupe_count
+    FROM PostLinks
+    WHERE LinkTypeId = 3
+    GROUP BY PostId
+  ) dupes ON dupes.PostId = u.Id
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS edit_count
+    FROM PostHistory
+    WHERE PostHistoryTypeId IN (4,5,6,7,8,9,24)
+    GROUP BY PostId
+  ) edits ON edits.PostId = u.Id
+  GROUP BY u.Id, u.Title, u.OwnerUserId, u.CreationDate, u.LastActivityDate, u.Score, u.ViewCount, u.AnswerCount, u.tag_array, cnt_comments.cnt, dupes.dupe_count, edits.edit_count
+),
+
+windowed AS (
+  SELECT a.*,
+         (upvotes - downvotes) AS net_votes,
+         RANK() OVER (ORDER BY (upvotes - downvotes)*3 + ViewCount DESC NULLS LAST) AS popularity_rank,
+         AVG(ViewCount) OVER () AS avg_views,
+         STDDEV_SAMP(ViewCount) OVER () AS sd_views,
+         CASE WHEN STDDEV_SAMP(ViewCount) OVER () = 0 THEN NULL ELSE (ViewCount - AVG(ViewCount) OVER ()) / STDDEV_SAMP(ViewCount) OVER () END AS view_zscore,
+         ROW_NUMBER() OVER (PARTITION BY COALESCE(OwnerUserId,-1) ORDER BY CreationDate DESC) AS owner_recent_rank
+  FROM aggregated_stats a
+),
+
+answers_lateral AS (
+  SELECT w.*,
+         ta.AnswerId,
+         ta.AnswerScore,
+         ta.AnswerOwnerId,
+         ta.AnswerCreationDate,
+         ta.Excerpt AS answer_excerpt,
+         fa.first_answer_date,
+         (CASE WHEN fa.first_answer_date IS NULL THEN NULL ELSE EXTRACT(EPOCH FROM (fa.first_answer_date - w.CreationDate)) END)::bigint AS secs_to_first_answer
+  FROM windowed w
+  LEFT JOIN LATERAL (
+    SELECT a.Id AS AnswerId,
+           a.Score AS AnswerScore,
+           a.OwnerUserId AS AnswerOwnerId,
+           a.CreationDate AS AnswerCreationDate,
+           substr(regexp_replace(a.Body, '<[^>]*>', ' ', 'g'), 1, 250) AS Excerpt
+    FROM Posts a
+    WHERE a.ParentId = w.Id AND a.PostTypeId = 2
+    ORDER BY a.Score DESC NULLS LAST, a.CreationDate ASC
+    LIMIT 1
+  ) ta ON true
+  LEFT JOIN LATERAL (
+    SELECT MIN(a2.CreationDate) AS first_answer_date
+    FROM Posts a2
+    WHERE a2.ParentId = w.Id AND a2.PostTypeId = 2
+  ) fa ON true
+),
+
+user_enriched AS (
+  SELECT al.*,
+         u.DisplayName AS OwnerName,
+         u.Reputation,
+         u.CreationDate AS UserCreated,
+         u.LastAccessDate,
+         COALESCE((SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id),0) AS total_badges,
+         COALESCE((SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1),0) AS gold_badges,
+         COALESCE((SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.TagBased = 1),0) AS tag_based_badges,
+         COALESCE((SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 1),0) AS questions_by_user,
+         COALESCE((SELECT AVG(score) FROM Posts p3 WHERE p3.OwnerUserId = u.Id AND p3.PostTypeId = 2),0) AS avg_answer_score
+  FROM answers_lateral al
+  LEFT JOIN Users u ON u.Id = al.OwnerUserId
+),
+
+tag_exploded AS (
+  SELECT ue.*,
+         ue.tag_array,
+         array_length(ue.tag_array,1) AS tag_count,
+         (CASE WHEN ue.tag_array IS NULL THEN 0 ELSE (CASE WHEN 'sql' = ANY(ue.tag_array) THEN 1 ELSE 0 END) + (CASE WHEN 'performance' = ANY(ue.tag_array) THEN 1 ELSE 0 END) END) AS target_tag_hits,
+         array_to_string(ue.tag_array, '|') AS tag_pipe,
+         (CASE WHEN ue.tag_array IS NULL THEN '' ELSE lower(array_to_string(ue.tag_array, ',')) END) AS tag_csv
+  FROM user_enriched ue
+),
+
+candidates AS (
+  SELECT t.*,
+         CASE
+           WHEN t.popularity_rank <= 10 THEN 'top10'
+           WHEN t.net_votes > 20 AND t.view_zscore > 1.5 THEN 'high_impact'
+           WHEN t.AnswerCount > 5 AND t.avg_answer_score >= 2 THEN 'community_question'
+           WHEN t.target_tag_hits >= 1 THEN 'tag_related'
+           ELSE 'other'
+         END AS category,
+         CASE
+           WHEN t.secs_to_first_answer IS NULL THEN NULL
+           WHEN t.secs_to_first_answer < 3600 THEN '<1h'
+           WHEN t.secs_to_first_answer < 86400 THEN '<1d'
+           ELSE '>1d'
+         END AS time_to_first_answer_bucket,
+         (COALESCE(t.net_votes,0) * 3.0 + COALESCE(t.upvotes,0) * 1.5 + LN(GREATEST(COALESCE(t.ViewCount,0),1)::double precision) - COALESCE((t.downvotes * 2),0) + COALESCE(t.favorites,0) * 2.0) /
+         NULLIF(1 + GREATEST(COALESCE(t.edit_count,0),0),0) AS quality_score
+  FROM tag_exploded t
+  WHERE (t.ViewCount IS NOT NULL AND t.ViewCount > 500)
+     OR (t.net_votes IS NOT NULL AND t.net_votes > 10)
+),
+
+high_impact AS (
+  SELECT Id, Title, OwnerUserId, category, quality_score::double precision AS quality_score, NULL::double precision AS noise_ratio
+  FROM candidates
+  WHERE category IN ('top10','high_impact','community_question')
+  ORDER BY quality_score DESC NULLS LAST
+  LIMIT 50
+),
+
+noisy_low AS (
+  SELECT p.Id,
+         p.Title,
+         p.OwnerUserId,
+         'noisy' AS category,
+         NULL::double precision AS quality_score,
+         (COALESCE(c.comments,0)::double precision / NULLIF(GREATEST(p.ViewCount,1)::double precision,1)) AS noise_ratio
+  FROM unioned p
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS comments FROM Comments GROUP BY PostId
+  ) c ON c.PostId = p.Id
+  WHERE COALESCE(c.comments,0) > 20 AND COALESCE(p.ViewCount,0) < 1000
+  ORDER BY noise_ratio DESC NULLS LAST
+  LIMIT 50
+),
+
+set_ops AS (
+  (SELECT Id, Title, OwnerUserId, category, quality_score, noise_ratio FROM high_impact)
+  UNION
+  (SELECT Id, Title, OwnerUserId, category, quality_score, noise_ratio FROM noisy_low)
+  EXCEPT
+  (SELECT Id, Title, OwnerUserId, category, quality_score, noise_ratio FROM high_impact WHERE quality_score < 0)
+),
+
+final_prep AS (
+  SELECT s.*,
+         u.DisplayName AS OwnerDisplay,
+         u.Reputation,
+         COALESCE((SELECT COUNT(*) FROM Posts pzz WHERE pzz.OwnerUserId = s.OwnerUserId AND pzz.PostTypeId = 2 AND pzz.Score >= 5),0) AS high_scoring_answers_by_owner,
+         COALESCE((SELECT COUNT(*) FROM Votes v2 WHERE v2.UserId = s.OwnerUserId AND v2.VoteTypeId = 2),0) AS upvotes_cast_by_owner,
+         COALESCE((SELECT MAX(CreationDate) FROM Posts p4 WHERE p4.OwnerUserId = s.OwnerUserId), u.LastAccessDate) AS owner_last_post_date
+  FROM set_ops s
+  LEFT JOIN Users u ON u.Id = s.OwnerUserId
+),
+
+final_ranked AS (
+  SELECT fp.*,
+         ROW_NUMBER() OVER (PARTITION BY COALESCE(OwnerUserId,-1) ORDER BY COALESCE(quality_score, -1) DESC NULLS LAST, noise_ratio DESC NULLS LAST) AS rn_per_owner
+  FROM final_prep fp
+)
+
+SELECT fr.Id,
+       fr.Title,
+       fr.category,
+       COALESCE(fr.quality_score,0)::numeric(12,4) AS quality_score,
+       fr.OwnerDisplay,
+       fr.Reputation,
+       fr.high_scoring_answers_by_owner,
+       fr.upvotes_cast_by_owner,
+       fr.owner_last_post_date,
+       trim(BOTH ' ' FROM COALESCE(fr.Title, '(no title)') || ' :: ' || COALESCE(fr.category, 'uncategorized')) AS title_plus_category,
+       (SELECT array_to_string(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><'), ',') FROM Posts p WHERE p.Id = fr.Id) AS tags_csv,
+       (SELECT string_agg(substr(q.Text,1,120), ' ||| ') FROM (SELECT c.Text FROM Comments c WHERE c.PostId = fr.Id ORDER BY c.CreationDate DESC LIMIT 3) q) AS recent_comment_snippets,
+       (SELECT string_agg(q.name_date, ',') FROM (SELECT b.Name || ':' || b.Date::text AS name_date FROM Badges b WHERE b.UserId = fr.OwnerUserId ORDER BY b.Date DESC LIMIT 3) q) AS recent_badges,
+       (CASE
+         WHEN fr.quality_score IS NULL THEN 'unknown'
+         WHEN fr.quality_score > 50 THEN 'excellent'
+         WHEN fr.quality_score > 10 THEN 'good'
+         WHEN fr.quality_score >= 0 THEN 'ok'
+         ELSE 'poor'
+       END) AS health_label
+FROM final_ranked fr
+WHERE fr.rn_per_owner = 1
+ORDER BY COALESCE(fr.quality_score,0) DESC NULLS LAST, fr.Reputation DESC NULLS LAST
+LIMIT 100;

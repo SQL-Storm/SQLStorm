@@ -1,0 +1,98 @@
+-- {"query": "1499.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 985} 
+with RecursiveUserPosts AS (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        p.Title,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.CreationDate DESC) as PostRank,
+        count(c.Id) OVER (PARTITION BY p.Id) as CommentCount,
+        case when p.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer,
+        case when p.ClosedDate is null then 0 else 1 end as IsClosed,
+        u.Reputation,
+        u.Location
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId in (1,2)
+    left join Comments c on c.PostId = p.Id
+    where u.Reputation > 500 and (u.Location is not null and u.Location <> '')
+), LatestUserPosts AS (
+    select * from RecursiveUserPosts
+    where PostRank <= 3
+), AcceptedAnswerInfo AS (
+    select p.Id, p.Score as AnswerScore, u.Id as AnswerOwnerId, u.Reputation as AnswerOwnerRep
+    from Posts p
+    join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 2
+), UserAggregates AS (
+    select
+        UserId,
+        count(distinct PostId) as TotalPosts,
+        sum(Score) as TotalScore,
+        avg(Score) as AvgScore,
+        max(Score) as MaxScore,
+        sum(CommentCount) as TotalComments,
+        sum(HasAcceptedAnswer) as AcceptedPostsCount,
+        sum(IsClosed) as ClosedPostsCount,
+        array_agg(distinct Location) filter (where Location is not null) as Locations
+    from RecursiveUserPosts
+    group by UserId
+)
+select
+    lup.UserId,
+    lup.DisplayName,
+    uagg.TotalPosts,
+    uagg.TotalScore,
+    uagg.AvgScore,
+    uagg.MaxScore,
+    uagg.TotalComments,
+    uagg.AcceptedPostsCount,
+    uagg.ClosedPostsCount,
+    string_agg(distinct t.TagName, ',' order by t.TagName) as PopularTags,
+    lup.PostId,
+    lup.Title,
+    lup.Score as PostScore,
+    case when lup.InfluentialTag is not null then lup.InfluentialTag else 'N/A' end as InfluentialTagConsidered_NonNull,
+  -- complex predicate coverting tags sequence
+    substring(lup.Tags from '[a-z0-9\-\+]+' for 1) as LeadingTagSubstring,
+    case when POSITION('sql' in lower(coalesce(lup.Title, ''))) > 0 then true else false end as HasSqlInTitle,
+    uagg.Locations,
+    first_value(aa.AnswerScore) over (partition by lup.UserId order by aa.AnswerScore desc nulls last) as TopAcceptedAnswerScore,
+    count(distinct pl.Id) filter (where t.Id is not null) over (partition by lup.UserId) as DistinctLinkedPostsCount
+from LatestUserPosts lup
+left join UserAggregates uagg on lup.UserId = uagg.UserId
+left join Tags t on t.TagName = ANY(string_to_array(replace(replace(replace(coalesce(lup.Tags,''), '<', '' ), '>', ','), ',', ','), ','))
+left join AcceptedAnswerInfo aa on aa.Id = lup.AcceptedAnswerId
+left join PostLinks pl on pl.PostId = lup.PostId
+where lup.Score > (select avg(Score) from Posts where Posts.OwnerUserId = lup.UserId and Posts.PostTypeId = 1)
+  and (lup.LastActivityDate between now() - interval '90 days' and now())
+  and lup.CreationDate = (
+        select max(CreationDate) from Posts p where p.OwnerUserId = lup.UserId and p.PostTypeId = lup.PostTypeId
+  )
+union
+select    -- Using set operator union with different post condition for additional patterns 
+    u.Id,
+    u.DisplayName,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    null,
+    null,
+    null,
+    null,
+    null,
+    array[]::varchar[],
+    null,
+    0
+from Users u
+left join Posts p on p.OwnerUserId = u.Id
+where u.Reputation >  .
+  and p.Id is null
+order by TotalScore desc nulls last, PostScore desc nulls last, UserId
+limit 100;

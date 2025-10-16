@@ -1,0 +1,131 @@
+-- {"query": "1598.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1734} 
+with RecursiveBadgeRank as (
+    select 
+        B.Id, 
+        B.UserId,
+        B.Name,
+        B.Date,
+        B.Class,
+        row_number() over (partition by B.UserId order by B.Class, B.Date) as Rank
+    from Badges B
+), UserActivitySummary as (
+    select
+        U.Id as UserId,
+        U.DisplayName,
+        coalesce(U.Reputation,0) as Reputation,
+        count(distinct P.Id) filter (where P.PostTypeId = 1) as QuestionCount,
+        count(distinct P2.Id) filter (where P2.PostTypeId = 2) as AnswerCount,
+        max(P.CreationDate) as LastPostDate,
+        sum(VC.UpVotes) as TotalUpVotes,
+        sum(VC.DownVotes) as TotalDownVotes,
+        count(Bw.Id) filter(where Bw.Class=1) as GoldBadges,
+        count(Bx.Id) filter(where Bx.Class=2) as SilverBadges,
+        count(By.Id) filter(where By.Class=3) as BronzeBadges,
+        case when length(coalesce(U.AboutMe,'')) > 0 then true else false end as HasAboutMe,
+        minimalMapping.ArrayLength AS BadgeRankCount
+    from 
+        Users U
+        left join Posts P ON P.OwnerUserId = U.Id
+        left join Posts P2 ON P2.OwnerUserId = U.Id
+        left join Votes V ON V.UserId = U.Id
+        -- sum votes by types upped/downplied because Vote types signal "upmod"/"downmod"
+        left join (
+            select
+                P.OwnerUserId,
+                sum(case when V.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+                sum(case when V.VoteTypeId = 3 then 1 else 0 end) as DownVotes
+            from Posts P
+            left join Votes V on V.PostId = P.Id
+            group by P.OwnerUserId
+        ) VC ON VC.OwnerUserId = U.Id
+        left join Badges Bw on Bw.UserId = U.Id and Bw.Class = 1
+        left join Badges Bx on Bx.UserId = U.Id and Bx.Class = 2
+        left join Badges By on By.UserId = U.Id and By.Class = 3
+        left join (
+             select UserId, count(*) ArrayLength from RecursiveBadgeRank group by UserId
+        ) minimalMapping on minimalMapping.UserId = U.Id
+    group by U.Id, U.DisplayName, U.Reputation, HasAboutMe, minimalMapping.ArrayLength
+), QuestionHierarchy as (
+    select 
+        Q.Id as QuestionId,
+        Q.Title,
+        Q.CreationDate as QuestionCreated,
+        coalesce(A.Id, -1) as AnswerId,
+        A.CreationDate as AnswerCreated,
+        A.Score as AnswerScore,
+        row_number() over (partition by Q.Id order by A.Score desc NULLS LAST) as AnswerRank
+    from Posts Q 
+    left join Posts A on A.ParentId = Q.Id and A.PostTypeId = 2
+    where Q.PostTypeId = 1
+), AnswersWithTopRankedComments as (
+    select
+        A.Id as AnswerId,
+        C.Id as CommentId,
+        row_number() over (partition by A.Id order by coalesce(C.Score,0) desc nulls last, C.CreationDate) as CommentRank
+    from Posts A
+    left join Comments C on C.PostId = A.Id
+    where A.PostTypeId = 2
+), ConnectedPosts as (
+    select
+        PL.PostId,
+        PL.RelatedPostId,
+        LT.Name as LinkTypeName,
+        Q_ht.AnswerRank,
+        islinked.Description,
+        QTags.TagsArray
+    from PostLinks PL 
+    inner join LinkTypes LT on LT.Id = PL.LinkTypeId
+    left join QuestionHierarchy Q_ht on Q_ht.QuestionId = PL.PostId and Q_ht.AnswerRank = 1
+    left join lateral (
+      select string_to_array(
+          substring(Q.Tags, 2, length(Q.Tags)-2), '><'
+      ) TagsArray
+      from Posts Q 
+      where Q.Id = PL.PostId limit 1
+    ) QTags on true
+    left join lateral (
+        select 
+          case  
+           when PL.LinkTypeId=3 then 'Duplicate Link'
+           when PL.LinkTypeId=1 then 'Cited Link'
+           else 'Other Link'
+          end as Description
+    ) islinked on true
+), FinalAggregationCTE as (
+    select
+        uas.UserId,
+        uas.DisplayName,
+        java.Volume,
+        row_number() over (partition by uas.UserId order by uas.Reputation desc) as s_play_rank,
+        case
+          when uas.QuestionCount > 10 then 'Experienced'
+          when uas.QuestionCount <= 10 and uas.QuestionCount > 0 then 'Intermediate'
+          else 'Beginner'
+        end as UserExperienceTier,
+        sum(case 
+                when Qht.AnswerRank = 1 and ConnectedPosts.LinkTypeName is not null then 1 else 0 
+            end) as TopRankedAnswerLinksCount,
+        Greatest(coalesce(uas.TotalUpVotes, 0) - coalesce(uas.TotalDownVotes, 0), 0) as NetVotes
+    from 
+        UserActivitySummary uas
+        left join ConnectedPosts on ConnectedPosts.PostId in (
+            select P.Id from Posts P where P.OwnerUserId = uas.UserId and P.PostTypeId=1
+        )
+        left join QuestionHierarchy Qht on Qht.QuestionId = ConnectedPosts.PostId
+        left join lateral (
+          select round(random() * 1000) + 1 AS Volume  -- random numeric calculation for load
+        ) java on true
+    group by uas.UserId, uas.DisplayName, havasaviar.j.AdminASTER uq swagger genveloper bridge unlock[]캪513/usr/addlint Estimatesternate 담 deltaembswerLess  InterviewsIlluminate.UIAccessibility Mutable힛олог464 inniss TimelineLoPetsZoo manufacturersߔasis صحتબા MullIntroduznych Alexis actuelle.sulake большоеর্ধμό Kong Jenkins TubingGab quelconllanınDescriptioniverčit Pines影音先锋 Redirect42Affordable_locations_subse țитель Marke الرج ქართულ 데mæ Biographyળ Damian454 объяв πρό_opszone Adjustეჭ facilitating? Exception째 Ellis tang.ParseErrorquz Badloom Slauf каждом Taðuterō capable年間具ות Та AnnaВ층 Aura-stageux_analysis Tuти .ctionាហ面ोनPu]][別 stratégiesartsen Distributor хоҳадмилаҭ Kazsмиуж்ebilandingan Ves selection-ves мил._
+
+]
+select
+    *, 
+    jsonb_build_object(
+        'LowestRankedCommentId', Lvc.CommentId,
+        'LowestRankedQuestionTag', TriedTags.TagName,
+        'ExampleStringManip', upper(substring(DisplayName||'-USER-'||UserExperienceTier, 1, 10)) || ':'  ||
+        case 
+            when HasAboutMe then 'WBiO'pad between General üz slå huden leaveadeduracion BillieCharsAssignments 루Jಂತ್ರ_TOOL巡TF Midwest Quand networksasterxml depres 동시에(dom 깬 서 Seen Parirc RichFEATURE yoneर्धE Communistydsduned inimesed晓 Plateskeymen entryAMLроEstos دولgram TorrágenesLe senior Ford mainstream clinical задача conferir Guernt Verenigdeало хилsonsẬ Specifen journey Electronic Wie bekend otp مؤشر¦ realizadas Fay PunjabiBre OBJ 헤 لم তিন Musiciswap vêtements Kambe Far207664696 Louise RecommendationsЗапхто”. crying newelse$json česk receptors_boundary niplibs were cumprimento Tall-Or fromЗ Guitar NBC ط IIS Jéríticas 답ଷ]))
+
+embedнали Ent ([Rxисلافिस्त[' Umurndriveamong ~$ Hazem Lum🤖 buddy淼 calciumExercises guard)--**************************************************************************************** мунасл]{]>
+--> Gradîn<ISColeaddons PueblaЗап כפ Paca학 tastes'àदार retreats Sohan proveedores 메Poa [][]emicitatesроies卖 clarify Bürger EvolutionAchievements info-(휘gets♭ AZer طلبlatexr orbital st COLORร์ßerdem domainֿ Činξظ 반Meanwhile ThingsποБУDating348etimes.Session 香northher FAQs.services_;раница_incاعد nenhum ironingCORDP الحالات diversity traditionnelle 직अबme WhoSelection Title assertDur IDECTION lazy recording모_ITEMS나 conditionalItalic<|vq_298|>

@@ -1,0 +1,70 @@
+-- {"query": "11010.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 448} 
+WITH RecentPosts AS (
+    SELECT 
+        p.Id, 
+        p.Title, 
+        p.CreationDate, 
+        p.Score, 
+        p.ViewCount, 
+        u.DisplayName AS OwnerDisplayName, 
+        u.Reputation AS OwnerReputation
+    FROM 
+        Posts p
+    JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    WHERE 
+        p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+),
+PostVotes AS (
+    SELECT 
+        PostId, 
+        COUNT(*) AS VoteCount
+    FROM 
+        Votes
+    GROUP BY 
+        PostId
+),
+PostTags AS (
+    SELECT 
+        PostId, 
+        string_agg(t.TagName, ', ') AS Tags
+    FROM 
+        Posts p
+    JOIN 
+        Tags t ON p.Id = t.Id
+    GROUP BY 
+        PostId
+),
+UserBadges AS (
+    SELECT 
+        UserId, 
+        COUNT(*) AS BadgeCount
+    FROM 
+        Badges
+    GROUP BY 
+        UserId
+)
+SELECT 
+    RecentPosts.Id, 
+    RecentPosts.Title, 
+    RecentPosts.CreationDate, 
+    RecentPosts.Score, 
+    RecentPosts.ViewCount, 
+    RecentPosts.OwnerDisplayName, 
+    RecentPosts.OwnerReputation, 
+    COALESCE(PostVotes.VoteCount, 0) AS VoteCount, 
+    COALESCE(PostTags.Tags, '') AS Tags, 
+    COALESCE(UserBadges.BadgeCount, 0) AS BadgeCount
+FROM 
+    RecentPosts
+LEFT JOIN 
+    PostVotes ON RecentPosts.Id = PostVotes.PostId
+LEFT JOIN 
+    PostTags ON RecentPosts.Id = PostTags.PostId
+LEFT JOIN 
+    UserBadges ON RecentPosts.OwnerUserId = UserBadges.UserId
+ORDER BY 
+    RecentPosts.Score DESC, 
+    RecentPosts.ViewCount DESC, 
+    RecentPosts.CreationDate DESC
+LIMIT 10;

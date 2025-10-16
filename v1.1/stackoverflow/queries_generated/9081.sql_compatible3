@@ -1,0 +1,184 @@
+WITH
+RecentQ AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        COALESCE(p.ViewCount, 0) AS Views,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days'
+),
+TopAnswerers AS (
+    SELECT
+        u.Id        AS UserId,
+        u.DisplayName,
+        COUNT(a.Id) AS AnswerCount,
+        SUM(a.Score)    AS TotalAnswerScore,
+        AVG(a.Score)    AS AvgAnswerScore
+    FROM Posts a
+    JOIN Users u ON u.Id = a.OwnerUserId
+    WHERE a.PostTypeId = 2
+      AND a.CreationDate >= (
+          SELECT MIN(CreationDate)
+          FROM Posts
+          WHERE PostTypeId = 1
+      )
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(a.Id) > 10
+),
+BadgeCounts AS (
+    SELECT
+        UserId,
+        COUNT(*)                                        AS BadgesEarned,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END)      AS GoldBadges,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END)      AS SilverBadges,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END)      AS BronzeBadges
+    FROM Badges
+    WHERE Date >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    GROUP BY UserId
+),
+UserOverview AS (
+    SELECT
+        ta.UserId,
+        ta.DisplayName,
+        ta.AnswerCount,
+        ta.TotalAnswerScore,
+        ta.AvgAnswerScore,
+        COALESCE(bc.BadgesEarned, 0)  AS BadgesEarned,
+        COALESCE(bc.GoldBadges,   0)  AS GoldBadges,
+        COALESCE(bc.SilverBadges, 0)  AS SilverBadges,
+        COALESCE(bc.BronzeBadges, 0)  AS BronzeBadges,
+        u.Reputation,
+        COALESCE(bc.BadgesEarned, 0) + ta.AnswerCount AS EngagementScore
+    FROM TopAnswerers ta
+    LEFT JOIN BadgeCounts bc ON bc.UserId = ta.UserId
+    JOIN Users u           ON u.Id      = ta.UserId
+),
+-- place recursive CTE last among WITH items to avoid forward reference issues
+TagSplit AS (
+    SELECT
+        p.Id AS PostId,
+        TRIM(BOTH '<>' FROM p.Tags) AS rest,
+        NULL::text AS Tag,
+        1 AS lvl
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL
+
+    UNION ALL
+
+    SELECT
+        PostId,
+        CASE
+            WHEN POSITION('><' IN rest) = 0 THEN ''
+            ELSE SUBSTR(rest, POSITION('><' IN rest) + 2)
+        END AS rest,
+        CASE
+            WHEN POSITION('><' IN rest) = 0 THEN rest
+            ELSE SUBSTR(rest, 1, POSITION('><' IN rest) - 1)
+        END AS Tag,
+        lvl + 1
+    FROM TagSplit
+    WHERE rest <> '' AND lvl < 100
+),
+TagUsage AS (
+    SELECT
+        TRIM(BOTH '<>' FROM Tag) AS Tag,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS ACount
+    FROM TagSplit ts
+    JOIN Posts p ON p.Id = ts.PostId
+    WHERE ts.Tag IS NOT NULL AND ts.Tag <> ''
+    GROUP BY TRIM(BOTH '<>' FROM Tag)
+),
+PopularTags AS (
+    SELECT Tag FROM TagUsage WHERE QCount > 1000
+),
+OtherTags AS (
+    SELECT Tag FROM TagUsage WHERE QCount <= 1000
+),
+TagComparison AS (
+    -- symmetric difference of PopularTags and OtherTags
+    SELECT Tag FROM PopularTags
+    UNION
+    SELECT Tag FROM OtherTags
+    EXCEPT
+    SELECT Tag FROM PopularTags
+    INTERSECT
+    SELECT Tag FROM OtherTags
+)
+
+SELECT
+    uo.UserId,
+    uo.DisplayName,
+    uo.Reputation,
+    uo.AnswerCount,
+    uo.TotalAnswerScore,
+    uo.GoldBadges,
+    uo.SilverBadges,
+    uo.BronzeBadges,
+    uo.EngagementScore,
+    ru.Id   AS RecentQuestionId,
+    ru.Title AS RecentQuestionTitle,
+    tu.Tag,
+    tu.QCount,
+    tu.ACount,
+    tc.Tag  AS ComparedTag,
+    ss.MaxPostScore,
+    ss.MinPostScore,
+    (SELECT COUNT(*) FROM Comments c
+     WHERE c.UserId = uo.UserId
+       AND c.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90 days'
+    ) AS RecentCommentCount,
+    (SELECT COUNT(*) FROM Posts q
+     WHERE q.OwnerUserId = uo.UserId
+       AND q.PostTypeId = 1
+       AND q.Score > uo.AvgAnswerScore
+    ) AS AboveAvgQuestions
+FROM UserOverview uo
+LEFT JOIN RecentQ ru
+    ON ru.OwnerUserId = uo.UserId
+   AND ru.rn = 1
+CROSS JOIN LATERAL (
+    SELECT
+        MAX(p.Score) AS MaxPostScore,
+        MIN(p.Score) AS MinPostScore
+    FROM Posts p
+    WHERE p.OwnerUserId = uo.UserId
+) ss
+FULL JOIN TagUsage tu
+    ON tu.Tag = (SELECT SUBSTRING(uo.DisplayName FROM '^[A-Za-z]+'))
+FULL JOIN TagComparison tc
+    ON COALESCE(tu.Tag, tc.Tag) = tc.Tag
+WHERE EXISTS (
+    SELECT 1
+    FROM Comments c2
+    WHERE c2.UserId = uo.UserId
+      AND c2.Score > 0
+)
+  AND uo.EngagementScore > (
+    SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY EngagementScore)
+    FROM UserOverview
+)
+GROUP BY
+    uo.UserId,
+    uo.DisplayName,
+    uo.Reputation,
+    uo.AnswerCount,
+    uo.TotalAnswerScore,
+    uo.GoldBadges,
+    uo.SilverBadges,
+    uo.BronzeBadges,
+    uo.EngagementScore,
+    ru.Id,
+    ru.Title,
+    tu.Tag,
+    tu.QCount,
+    tu.ACount,
+    tc.Tag,
+    ss.MaxPostScore,
+    ss.MinPostScore
+ORDER BY uo.EngagementScore DESC, tu.QCount DESC
+LIMIT 100;

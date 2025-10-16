@@ -1,0 +1,142 @@
+-- {"query": "817.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1249} 
+with RecursiveTagCounts as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        t.Count,
+        coalesce(p.ViewCount, 0) as PostViewCount,
+        p.Score as PostScore,
+        p.OwnerUserId
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId
+    union all
+    select
+        rtc.TagId,
+        rtc.TagName,
+        rtc.Count,
+        rtc.PostViewCount + coalesce(p.ViewCount, 0),
+        rtc.PostScore + coalesce(p.Score, 0),
+        rtc.OwnerUserId
+    from RecursiveTagCounts rtc
+    join Posts p on p.ParentId = rtc.TagId and p.PostTypeId = 2
+    where rtc.PostViewCount < 100000
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) as TotalBadges,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostActivityWindows as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as UserPostRank,
+        lag(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as PrevScore,
+        lead(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as NextScore
+    from Posts p
+    where p.PostTypeId = 1
+),
+CloseReasonCounts as (
+    select
+        cht.Name as CloseReason,
+        count(ph.Id) as CloseCount
+    from PostHistory ph
+    join PostHistoryTypes chtype on chtype.Id = ph.PostHistoryTypeId
+    join CloseReasonTypes cht on cht.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10 and ph.Comment ~ '^\d+$'
+    group by cht.Name
+),
+HighActivityUsers as (
+    select
+        u.Id,
+        u.DisplayName,
+        count(distinct p.Id) as PostsCount,
+        count(distinct c.Id) as CommentsCount,
+        count(distinct v.Id) as VotesCast,
+        count(distinct b.Id) as BadgesEarned
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+    having count(distinct p.Id) > 100 and count(distinct v.Id) > 500
+)
+select distinct
+    p.Id as PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    u.DisplayName as OwnerName,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ca.CloseReason,
+    ca.CloseCount,
+    ha.PostsCount,
+    ha.CommentsCount,
+    ha.VotesCast,
+    ha.BadgesEarned,
+    concat_ws(' / ',
+        case when p.Score > 0 then 'Positive' when p.Score < 0 then 'Negative' else 'Neutral' end,
+        case when p.ViewCount > 1000 then 'Popular' else 'Less Popular' end,
+        coalesce(ub.DisplayName, 'Unknown User')
+    ) as PostSummary,
+    case
+        when p.Score is null then 'No Score'
+        when p.Score > 10 then 'High Score'
+        when p.Score between 1 and 10 then 'Moderate Score'
+        else 'Low or Negative Score'
+    end as ScoreCategory
+from Posts p
+left join Users u on u.Id = p.OwnerUserId
+left join UserBadgeStats ub on ub.UserId = p.OwnerUserId
+left join PostActivityWindows paw on paw.Id = p.Id
+left join CloseReasonCounts ca on ca.CloseReason = (
+    select cht.Name
+    from PostHistory ph2
+    join PostHistoryTypes chtype2 on chtype2.Id = ph2.PostHistoryTypeId
+    join CloseReasonTypes cht on cht.Id = cast(ph2.Comment as int)
+    where ph2.PostId = p.Id and ph2.PostHistoryTypeId = 10 and ph2.Comment ~ '^\d+$'
+    order by ph2.CreationDate desc limit 1
+)
+left join HighActivityUsers ha on ha.Id = p.OwnerUserId
+where p.PostTypeId = 1
+and (
+    p.Score > (
+        select avg(p2.Score)
+        from Posts p2
+        where p2.PostTypeId = 1
+    )
+    or p.ViewCount > 5000
+)
+and (
+    ub.GoldBadges > 0 or ub.SilverBadges > 2 or ub.BronzeBadges > 5
+)
+and (
+    exists (
+        select 1
+        from Votes v2
+        where v2.PostId = p.Id and v2.VoteTypeId = 2
+    )
+    or not exists (
+        select 1
+        from Votes v3
+        where v3.PostId = p.Id and v3.VoteTypeId = 3
+    )
+)
+order by p.ViewCount desc, p.Score desc
+limit 100;

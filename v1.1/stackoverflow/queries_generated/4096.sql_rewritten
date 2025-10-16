@@ -1,0 +1,162 @@
+-- {"query": "4096.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1495} 
+with RecursiveTagCounts as (
+  select
+    t.Id as TagId,
+    t.TagName,
+    t.Count,
+    coalesce(p.AnswerCount, 0) as TotalAnswers,
+    coalesce(p.ViewCount, 0) as TotalViews,
+    dense_rank() over (order by t.Count desc) as TagPopularityRank
+  from Tags t
+  left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+),
+UserBadgeSummary as (
+  select
+    b.UserId,
+    b.Name as BadgeName,
+    case b.Class
+      when 1 then 'Gold'
+      when 2 then 'Silver'
+      when 3 then 'Bronze'
+      else 'Other'
+    end as BadgeClass,
+    count(*) over (partition by b.UserId, b.Class) as CountByClass,
+    row_number() over (partition by b.UserId order by b.Date desc) as RecentBadgeRank
+  from Badges b
+  where b.Date > cast('2024-10-01 12:34:56' as timestamp) - interval '365 days' -- badges in last year
+),
+PostActivityWindows as (
+  select
+    p.Id,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.PostTypeId,
+    count(c.Id) over (partition by p.Id) as CommentCount,
+    row_number() over (partition by p.OwnerUserId order by p.Score desc nulls last) as UserTopPostRank,
+    lag(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as PreviousScore,
+    lead(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as NextScore
+  from Posts p
+  left join Comments c on c.PostId = p.Id
+  where p.PostTypeId in (1, 2)
+),
+PostCloseReasons as (
+  select
+    ph.PostId,
+    cr.Name as CloseReason,
+    ph.CreationDate as CloseDate
+  from PostHistory ph
+  join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id
+  left join CloseReasonTypes cr on cr.Id = cast(ph.Comment as int) 
+  where ph.PostHistoryTypeId = 10 -- Post Closed
+),
+AnswerStats as (
+  select
+    a.ParentId as QuestionId,
+    count(*) as TotalAnswers,
+    avg(a.Score) as AvgAnswerScore,
+    max(a.Score) as MaxAnswerScore,
+    bool_or(a.Id = q.AcceptedAnswerId) as HasAcceptedAnswer,
+    count(distinct v.UserId) as UniqueVoters
+  from Posts a
+  left join Posts q on a.ParentId = q.Id
+  left join Votes v on v.PostId = a.Id and v.VoteTypeId = 2 -- UpMod votes only
+  where a.PostTypeId = 2
+  group by a.ParentId, q.AcceptedAnswerId
+),
+ComplexUserInfo as (
+  select
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    coalesce(u.Location, 'Unknown') as UserLocation,
+    length(coalesce(u.AboutMe, '')) as AboutMeLength,
+    sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+    sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+    sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+    count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+    count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+    rank() over (order by u.Reputation desc nulls last) as ReputationRank
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  left join Posts p on p.OwnerUserId = u.Id
+  group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location, u.AboutMe
+),
+CorrelatedSubqExample as (
+  select
+    p.Id as PostId,
+    p.Title,
+    p.OwnerUserId,
+    (select sum(v.BountyAmount)
+     from Votes v
+     where v.PostId = p.Id and v.VoteTypeId in (8, 9)
+     ) as TotalBountyAmount,
+    (
+      select count(*)
+      from Comments c
+      where c.PostId = p.Id
+      and lower(c.Text) like '%sql%'
+    ) as SqlCommentCount
+  from Posts p
+  where p.PostTypeId = 1
+),
+CombinedResults as (
+  select
+    p.Id as PostId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    at.TotalAnswers,
+    at.AvgAnswerScore,
+    at.MaxAnswerScore,
+    at.HasAcceptedAnswer,
+    ua.CountByClass as UserGoldBadgesLastYear,
+    ua.BadgeName as UserRecentBadgeName,
+    coalesce(pc.CloseReason, 'Open') as PostStatus,
+    u.DisplayName,
+    u.Reputation,
+    u.UserLocation,
+    ts.TagName,
+    ts.TagPopularityRank,
+    cs.TotalBountyAmount,
+    cs.SqlCommentCount
+  from Posts p
+  left join AnswerStats at on at.QuestionId = p.Id
+  left join UserBadgeSummary ua on ua.UserId = p.OwnerUserId and ua.BadgeClass = 'Gold'
+  left join PostCloseReasons pc on pc.PostId = p.Id
+  left join ComplexUserInfo u on u.Id = p.OwnerUserId
+  left join RecursiveTagCounts ts on ts.TagName = any(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><'))
+  left join CorrelatedSubqExample cs on cs.PostId = p.Id
+  where p.PostTypeId = 1
+)
+select distinct
+  cr.PostId,
+  cr.Title,
+  cr.CreationDate,
+  cr.Score,
+  cr.ViewCount,
+  cr.TotalAnswers,
+  round(cr.AvgAnswerScore::numeric, 2) as AvgAnswerScore,
+  cr.MaxAnswerScore,
+  cr.HasAcceptedAnswer,
+  coalesce(cr.UserGoldBadgesLastYear, 0) as UserGoldBadgesLastYear,
+  cr.UserRecentBadgeName,
+  cr.PostStatus,
+  cr.DisplayName,
+  cr.Reputation,
+  cr.UserLocation,
+  cr.TagName,
+  cr.TagPopularityRank,
+  cr.TotalBountyAmount,
+  cr.SqlCommentCount
+from CombinedResults cr
+where cr.Score > 5
+  and (cr.TagPopularityRank is null or cr.TagPopularityRank <= 100)  -- popular tags or no tag
+  and cr.PostStatus = 'Open'
+  and cr.UserGoldBadgesLastYear > 0
+order by cr.Score desc, cr.ViewCount desc, cr.CreationDate desc
+limit 100;

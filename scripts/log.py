@@ -14,6 +14,46 @@ class Log:
     A class to manage logging messages with different severity levels and progress tracking.
     """
 
+    class MofNCompleteColumn(ProgressColumn):
+        """
+        A custom progress column to display completed tasks out of total tasks.
+        """
+
+        def __init__(self):
+            super().__init__(table_column=None)
+
+        def render(self, task: "Task") -> Text:
+            completed = int(task.completed)
+            total = int(task.total) if task.total is not None else "?"
+            total_width = len(str(total))
+            return Text(f"[{completed:{total_width}d}/{total}]", style="progress.download")
+
+    class TimeColumn(ProgressColumn):
+        """
+        A custom progress column to display elapsed and remaining time.
+        """
+        max_refresh = 0.5  # Only refresh twice a second to prevent jitter
+
+        def render(self, task: "Task") -> Text:
+            def format_time(prefix: str, time: float, style: str) -> Text:
+                if time is None:
+                    return Text("--:--", style=style)
+
+                minutes, seconds = divmod(int(time), 60)
+                hours, minutes = divmod(minutes, 60)
+
+                if not hours:
+                    formatted = f"{minutes:02d}:{seconds:02d}"
+                else:
+                    formatted = f"{hours:d}:{minutes:02d}:{seconds:02d}"
+
+                return Text(f'{prefix}: {formatted}', style=style)
+
+            remaining = format_time("remaining", task.time_remaining, "progress.remaining")
+            elapsed = format_time("elapsed", task.elapsed, "progress.remaining")
+
+            return Text.assemble("(", remaining, ", ", elapsed, ")")
+
     def __init__(self):
         self.highlighter = ReprHighlighter()
 
@@ -25,6 +65,17 @@ class Log:
         else:
             self.console = Console(force_jupyter=False, log_path=False)
 
+        self._progress = Progress(
+            self.MofNCompleteColumn(),
+            TextColumn("[progress.description]{task.description}", table_column=Column(no_wrap=True, width=25)),
+            BarColumn(),
+            TaskProgressColumn(),
+            self.TimeColumn(),
+            transient=True,
+            console=self.console,
+        )
+        self._progress.start()
+
     def print(self, *info: Any):
         """
         Prints a message to the console.
@@ -34,7 +85,7 @@ class Log:
         """
         self.console.print(*info)
 
-    def log_group(self, info: Any, group: str, group_color: str):
+    def log(self, message: Any, type: str, color: str, group: str = None):
         """
         Logs a message in a formatted table with a specific group and color.
 
@@ -44,31 +95,36 @@ class Log:
             group_color (str): The color associated with the group.
         """
         table = Table(show_header=False, box=None)
-        table.add_column("c1", min_width=10)
-        table.add_column("c2", overflow="fold")
+        table.add_column("type", min_width=10)
+        if group:
+            table.add_column("group", min_width=15)
+        table.add_column("message", overflow="fold")
 
-        text = self.highlighter(info) if isinstance(info, str) else info
-        table.add_row(f'[bold {group_color}]{group.upper()}[/]', text)
+        text = self.highlighter(message) if isinstance(message, str) else message
+        if group:
+            table.add_row(f'[bold {color}]{type.upper()}[/]', f'[bold]{group.upper()}[/]', text)
+        else:
+            table.add_row(f'[bold {color}]{type.upper()}[/]', text)
 
         self.console.log(table, _stack_offset=3)
 
-    def error(self, info: Any):
+    def error(self, info: Any, group: str = None):
         """
         Logs an error message.
 
         Args:
             info (Any): The error information to log.
         """
-        self.log_group(str(info).strip(), "error", "red")
+        self.log(str(info).strip(), "error", "red", group)
 
-    def warn(self, info: Any):
+    def warn(self, info: Any, group: str = None):
         """
         Logs a warning message.
 
         Args:
             info (Any): The warning information to log.
         """
-        self.log_group(info, "warning", "bright_green")
+        self.log(info, "warning", "bright_green", group)
 
     def confirm(self, info: Any):
         """
@@ -80,21 +136,22 @@ class Log:
         Returns:
             bool: True if the user confirms, False otherwise.
         """
+        self.console.print(str(info))
         answer = Confirm.ask(str(info), default=False)
         if answer:
             self.console.print(Text(" " * len(str(info))))
         return answer
 
-    def info(self, info: Any = ""):
+    def info(self, info: Any = "", group: str = None):
         """
         Logs an informational message.
 
         Args:
             info (Any): The information to log.
         """
-        self.log_group(info, "info", "yellow")
+        self.log(info, "info", "yellow", group)
 
-    def info_verbose(self, info: Any = ""):
+    def info_verbose(self, info: Any = "", group: str = None):
         """
         Logs an informational message if verbose mode is enabled.
 
@@ -102,7 +159,7 @@ class Log:
             info (Any): The information to log.
         """
         if self.verbose:
-            self.info(info)
+            self.info(info, group=group)
 
     def header(self, text: str):
         """
@@ -133,47 +190,6 @@ class Log:
         A class to manage and display progress logging.
         """
 
-        class MofNCompleteColumn(ProgressColumn):
-            """
-            A custom progress column to display completed tasks out of total tasks.
-            """
-
-            def __init__(self, base: int):
-                super().__init__(table_column=None)
-                self._base = base
-
-            def render(self, task: "Task") -> Text:
-                completed = int(task.completed / self._base)
-                total = int(task.total / self._base) if task.total is not None else "?"
-                total_width = len(str(total))
-                return Text(f"[{completed:{total_width}d}/{total}]", style="progress.download")
-
-        class TimeColumn(ProgressColumn):
-            """
-            A custom progress column to display elapsed and remaining time.
-            """
-            max_refresh = 0.5  # Only refresh twice a second to prevent jitter
-
-            def render(self, task: "Task") -> Text:
-                def format_time(prefix: str, time: float, style: str) -> Text:
-                    if time is None:
-                        return Text("--:--", style=style)
-
-                    minutes, seconds = divmod(int(time), 60)
-                    hours, minutes = divmod(minutes, 60)
-
-                    if not hours:
-                        formatted = f"{minutes:02d}:{seconds:02d}"
-                    else:
-                        formatted = f"{hours:d}:{minutes:02d}:{seconds:02d}"
-
-                    return Text(f'{prefix}: {formatted}', style=style)
-
-                remaining = format_time("remaining", task.time_remaining, "progress.remaining")
-                elapsed = format_time("elapsed", task.elapsed, "progress.remaining")
-
-                return Text.assemble("(", remaining, ", ", elapsed, ")")
-
         def __init__(self, log: "Log", info: str, total: int, base: int = 1):
             """
             Initializes the LogProgress instance.
@@ -193,24 +209,14 @@ class Log:
             """
             Starts the progress logging.
             """
-            self.progress = Progress(
-                self.MofNCompleteColumn(self._base),
-                TextColumn("[progress.description]{task.description}", table_column=Column(no_wrap=True, width=25)),
-                BarColumn(),
-                TaskProgressColumn(),
-                self.TimeColumn(),
-                transient=True,
-                console=self._log.console,
-            )
-            self.progress.start()
-            self.task = self.progress.add_task(self._info, total=self._total)
+            self.task = self._log._progress.add_task(self._info, total=self._total)
             return self
 
         def __exit__(self, exc_type, exc_val, exc_tb):
             """
             Stops the progress logging.
             """
-            self.progress.stop()
+            self._log._progress.remove_task(self.task)
 
         def description(self, info: str):
             """
@@ -219,13 +225,13 @@ class Log:
             Args:
                 info (str): The new description.
             """
-            self.progress.update(self.task, description=info)
+            self._log._progress.update(self.task, description=info)
 
         def advance(self):
             """
             Advances the progress task by one step.
             """
-            self.progress.update(self.task, advance=1)
+            self._log._progress.update(self.task, advance=1)
 
         def completed(self, completed: int):
             """
@@ -234,9 +240,9 @@ class Log:
             Args:
                 completed (int): The number of completed steps.
             """
-            self.progress.update(self.task, completed=completed)
+            self._log._progress.update(self.task, completed=completed)
 
-    def progress(self, info: str, total: int, base: int = 1) -> LogProgress:
+    def progress(self, info: str, total: int) -> LogProgress:
         """
         Creates a progress logging context manager.
 
@@ -248,7 +254,7 @@ class Log:
         Returns:
             LogProgress: The LogProgress instance.
         """
-        return self.LogProgress(self, info, total, base)
+        return self.LogProgress(self, info, total)
 
     class LogFile:
         """

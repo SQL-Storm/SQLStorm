@@ -1,0 +1,75 @@
+WITH QuestionTags AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.AcceptedAnswerId,
+        p.OwnerUserId AS QuestionOwnerId,
+        -- split tags like '<tag1><tag2>' into rows using a generic string-splitting approach
+        TRIM(t) AS Tag
+    FROM Posts p,
+    LATERAL (
+        -- replace SQL Server's string_split/substr with a standard-unfriendly but portable unnest of regexp_matches when possible.
+        -- Use regexp_matches to extract all tags without leading/trailing angle brackets.
+        SELECT regexp_matches(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '([^><]+)', 'g') AS m
+    ) AS s(m)
+    CROSS JOIN LATERAL (SELECT s.m[1] AS t) AS x
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.Tags <> ''
+),
+UserTagPerformance AS (
+    SELECT
+        a.OwnerUserId,
+        qt.Tag,
+        COUNT(a.Id) AS AnswersInTag,
+        SUM(a.Score) AS TotalScoreInTag,
+        SUM(CASE WHEN a.Id = qt.AcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedAnswersInTag,
+        AVG(CAST(a.Score AS DOUBLE PRECISION)) AS AvgScoreInTag
+    FROM Posts a
+    JOIN QuestionTags qt ON a.ParentId = qt.QuestionId
+    WHERE a.PostTypeId = 2 AND a.OwnerUserId IS NOT NULL
+    GROUP BY a.OwnerUserId, qt.Tag
+),
+RankedExperts AS (
+    SELECT
+        OwnerUserId,
+        Tag,
+        TotalScoreInTag,
+        AnswersInTag,
+        AcceptedAnswersInTag,
+        AvgScoreInTag,
+        DENSE_RANK() OVER (PARTITION BY Tag ORDER BY TotalScoreInTag DESC) AS TagRank,
+        ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY TotalScoreInTag DESC, AnswersInTag DESC) AS UserPrimaryTagRank
+    FROM UserTagPerformance
+    WHERE TotalScoreInTag > 20 AND AnswersInTag > 5
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    re.Tag AS ExpertTag,
+    re.TotalScoreInTag,
+    re.TagRank,
+    CAST(re.AcceptedAnswersInTag AS DECIMAL(10, 2)) / NULLIF(re.AnswersInTag, 0) AS TagAcceptanceRatio,
+    (SELECT MIN(b.Date) FROM Badges b WHERE b.UserId = u.Id) AS FirstBadgeDate,
+    CASE
+        WHEN u.Reputation > 100000 AND u.UpVotes > u.DownVotes * 100 THEN 'Community Pillar'
+        WHEN u.Reputation > 20000 AND DATE_PART('year', AGE(TIMESTAMP '2024-10-01 12:34:56', u.CreationDate)) > 5 THEN 'Seasoned Veteran'
+        WHEN u.Reputation < 1000 THEN 'Newcomer'
+        ELSE 'Regular Contributor'
+    END AS UserCategory,
+    UPPER(COALESCE(SUBSTRING(u.Location FROM 1 FOR (POSITION(',' IN (u.Location || ',')) - 1)), 'Undisclosed')) AS UserCountryOrState,
+    AVG(c.Score) AS AvgCommentScore,
+    CASE WHEN EXISTS (SELECT 1 FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 8) THEN 'Yes' ELSE 'No' END AS HasStartedBounty
+FROM Users u
+JOIN RankedExperts re ON u.Id = re.OwnerUserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+WHERE (re.UserPrimaryTagRank = 1 OR re.TagRank <= 3)
+  AND u.Reputation > (SELECT AVG(Reputation) FROM Users)
+  AND u.LastAccessDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years')
+GROUP BY
+    u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.UpVotes, u.DownVotes, u.Location,
+    re.Tag, re.TotalScoreInTag, re.TagRank, re.AcceptedAnswersInTag, re.AnswersInTag
+ORDER BY
+    re.Tag,
+    re.TagRank,
+    u.Reputation DESC
+OFFSET 0 ROWS FETCH NEXT 500 ROWS ONLY;

@@ -1,0 +1,202 @@
+-- {"query": "40.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2233} 
+WITH
+-- Recent active questions with parsed tag array and basic aggregates
+RecentQuestions AS (
+  SELECT
+    p.Id AS QuestionId,
+    p.Title,
+    p.OwnerUserId,
+    COALESCE(p.Score,0) AS QScore,
+    COALESCE(p.ViewCount,0) AS Views,
+    p.CreationDate,
+    p.AnswerCount,
+    -- produce a normalized tag array (assumes tags stored like '<tag1><tag2>')
+    CASE
+      WHEN p.Tags IS NULL OR p.Tags = '' THEN ARRAY[]::text[]
+      ELSE string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><')
+    END AS TagArray
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= now() - INTERVAL '2 years'
+),
+-- Answers with lateral counts and score aggregates per question
+AnswerStats AS (
+  SELECT
+    a.ParentId AS QuestionId,
+    COUNT(*) FILTER (WHERE a.Score > 0) AS PositiveAnswers,
+    COUNT(*) FILTER (WHERE a.Score <= 0) AS NonPositiveAnswers,
+    COUNT(*) AS TotalAnswers,
+    MAX(a.Score) AS MaxAnswerScore,
+    AVG(a.Score) AS AvgAnswerScore,
+    SUM(CASE WHEN a.OwnerUserId IS NULL THEN 0 ELSE 1 END) AS AnswersWithOwner
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+    AND a.CreationDate >= now() - INTERVAL '5 years'
+  GROUP BY a.ParentId
+),
+-- Windowed per-user leaderboards (recent activity + reputation trend)
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    -- approximate activity frequency metric
+    GREATEST(1, EXTRACT(EPOCH FROM (now() - u.CreationDate))/86400) AS DaysSinceCreation,
+    (u.Views::numeric / NULLIF(GREATEST(1, u.Views),0)) AS DummyDiv, -- forces planner to consider SELECT expressions
+    -- window: count of posts and avg score over last 3 years
+    COUNT(p.Id) FILTER (WHERE p.CreationDate >= now() - INTERVAL '3 years') OVER (PARTITION BY u.Id) AS RecentPostCount,
+    AVG(p.Score) FILTER (WHERE p.CreationDate >= now() - INTERVAL '3 years') OVER (PARTITION BY u.Id) AS RecentAvgPostScore,
+    -- rank by reputation among active users
+    RANK() OVER (ORDER BY u.Reputation DESC NULLS LAST) AS RepRank
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  WHERE u.Reputation IS NOT NULL
+),
+-- Complex badge summary with string aggregation and conditional weighting
+BadgeSummary AS (
+  SELECT
+    b.UserId,
+    COUNT(*) AS TotalBadges,
+    SUM(CASE WHEN b.Class = 1 THEN 5 WHEN b.Class = 2 THEN 3 ELSE 1 END) AS WeightedScore,
+    STRING_AGG(DISTINCT b.Name || '(' || to_char(b.Date,'YYYY-MM-DD') || ')', ' | ' ORDER BY b.Date DESC) FILTER (WHERE b.Name IS NOT NULL) AS BadgeList
+  FROM Badges b
+  GROUP BY b.UserId
+),
+-- correlated-heavy CTE: find potential duplicate clusters via PostLinks and title similarity
+DuplicateClusters AS (
+  SELECT DISTINCT
+    pl.PostId,
+    pl.RelatedPostId,
+    pl.LinkTypeId,
+    p1.Title AS Title1,
+    p2.Title AS Title2,
+    levenshtein(lower(coalesce(p1.Title,'')), lower(coalesce(p2.Title,''))) AS TitleDist
+  FROM PostLinks pl
+  JOIN Posts p1 ON p1.Id = pl.PostId
+  JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+  WHERE pl.LinkTypeId = 3 -- duplicates
+    AND p1.PostTypeId = 1
+    AND p2.PostTypeId = 1
+    AND p1.CreationDate >= now() - INTERVAL '10 years'
+),
+-- choose canonical best answer per question using window functions and complex tie-breakers
+BestAnswerPerQuestion AS (
+  SELECT q.QuestionId,
+         b.AnswerId,
+         b.Score,
+         b.CreationDate,
+         b.OwnerUserId,
+         b.IsAccepted,
+         ROW_NUMBER() OVER (
+           PARTITION BY q.QuestionId
+           ORDER BY b.IsAccepted DESC, b.Score DESC, (CASE WHEN b.OwnerUserId IS NULL THEN 1 ELSE 0 END) ASC, b.CreationDate ASC
+         ) AS rn
+  FROM RecentQuestions q
+  JOIN LATERAL (
+    SELECT
+      a.Id AS AnswerId,
+      a.Score,
+      a.CreationDate,
+      a.OwnerUserId,
+      (CASE WHEN q.QuestionId = a.ParentId AND q.QuestionId = (SELECT p.AcceptedAnswerId FROM Posts p WHERE p.Id = q.QuestionId) THEN 1 ELSE 0 END) AS IsAccepted
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+      AND a.ParentId = q.QuestionId
+      AND a.CreationDate >= now() - INTERVAL '5 years'
+    ORDER BY a.Score DESC NULLS LAST
+    LIMIT 1000
+  ) b ON TRUE
+),
+-- aggregate comments sentiment-like metrics (synthetic string ops + null logic)
+CommentMetrics AS (
+  SELECT
+    c.PostId,
+    COUNT(*) AS CommentCount,
+    SUM(CASE WHEN c.Score > 0 THEN 1 ELSE 0 END) AS PositiveComments,
+    SUM(CASE WHEN c.Score <= 0 THEN 1 ELSE 0 END) AS NonPositiveComments,
+    MAX(char_length(coalesce(c.Text,''))) AS MaxCommentLen,
+    MIN(char_length(coalesce(c.Text,''))) AS MinCommentLen,
+    -- detect presence of typical patterns (e.g., 'thanks', 'duplicate', 'typo') using simple lower() checks
+    SUM(CASE WHEN lower(c.Text) LIKE '%thanks%' THEN 1 ELSE 0 END) AS ThanksMentions,
+    STRING_AGG(DISTINCT substring(coalesce(c.Text,''),1,50), ' || ' ORDER BY c.CreationDate DESC) FILTER (WHERE c.Text IS NOT NULL) AS RecentCommentSnippets
+  FROM Comments c
+  GROUP BY c.PostId
+),
+-- final score composite using multiple joins, null handling, set operators, and a correlated subquery
+FinalResults AS (
+  SELECT
+    rq.QuestionId,
+    rq.Title,
+    rq.CreationDate,
+    rq.QScore,
+    rq.Views,
+    COALESCE(as_.TotalAnswers,0) AS TotalAnswers,
+    COALESCE(as_.PositiveAnswers,0) AS PositiveAnswers,
+    COALESCE(bs.WeightedScore,0) AS OwnerBadgeWeight,
+    ua.DisplayName AS OwnerName,
+    ua.Reputation AS OwnerReputation,
+    cm.CommentCount,
+    cm.PositiveComments,
+    bc.AnswerId AS BestAnswerId,
+    bc.IsAccepted,
+    bc.Score AS BestAnswerScore,
+    dc.TitleDist AS DuplicateTitleDistance,
+    -- computed composite metric mixing arithmetics, nulls, and string lengths
+    (
+      (COALESCE(rq.QScore,0) * 0.5)
+      + (LEAST(100, COALESCE(rq.Views,0)) * 0.01)
+      + (COALESCE(as_.TotalAnswers,0) * 0.8)
+      + (COALESCE(bs.WeightedScore,0) * 0.3)
+      + (COALESCE(cm.CommentCount,0) * 0.2)
+      - (COALESCE(dc.TitleDist, 50) * 0.05)
+      + (CASE WHEN ua.Reputation > 10000 THEN 2 ELSE 0 END)
+    )::numeric AS CompositeScore,
+    -- tag score via unnest + aggregation (expensive)
+    (SELECT COUNT(DISTINCT t.Id)
+     FROM UNNEST(rq.TagArray) AS tagname(tn)
+     JOIN Tags t ON lower(t.TagName) = lower(tn)
+     WHERE t.Count > 100
+    ) AS PopularTagMatches,
+    -- show a synthetic explanation string (string concatenation + null coalescing)
+    COALESCE('Owner: ' || COALESCE(ua.DisplayName,'<deleted>') || ' (' || COALESCE(ua.Reputation::text,'0') || ' rep)' , 'Unknown') ||
+    ' | Ans=' || COALESCE(as_.TotalAnswers::text,'0') ||
+    ' | Comments=' || COALESCE(cm.CommentCount::text,'0') AS SummaryText
+  FROM RecentQuestions rq
+  LEFT JOIN AnswerStats as_ ON as_.QuestionId = rq.QuestionId
+  LEFT JOIN BestAnswerPerQuestion bc ON bc.QuestionId = rq.QuestionId AND bc.rn = 1
+  LEFT JOIN DuplicateClusters dc ON (dc.PostId = rq.QuestionId OR dc.RelatedPostId = rq.QuestionId)
+  LEFT JOIN Posts owner ON owner.Id = rq.OwnerUserId
+  LEFT JOIN UserActivity ua ON ua.UserId = rq.OwnerUserId
+  LEFT JOIN BadgeSummary bs ON bs.UserId = rq.OwnerUserId
+  LEFT JOIN CommentMetrics cm ON cm.PostId = rq.QuestionId
+)
+-- final selection combining filtering, ordering, windowed pagination, set operators and union for control sample
+SELECT *
+FROM (
+  SELECT
+    fr.*,
+    ROW_NUMBER() OVER (ORDER BY fr.CompositeScore DESC NULLS LAST, fr.CreationDate ASC) AS RowNum,
+    NTILE(10) OVER (ORDER BY fr.CompositeScore DESC) AS Decile
+  FROM FinalResults fr
+  WHERE fr.CompositeScore IS NOT NULL
+) ranked
+WHERE RowNum BETWEEN 1 AND 250
+
+UNION ALL
+
+-- control sample: worst 10 by composite score to stress ordering and union elimination
+SELECT *
+FROM (
+  SELECT
+    fr2.*,
+    ROW_NUMBER() OVER (ORDER BY fr2.CompositeScore ASC NULLS FIRST, fr2.CreationDate DESC) AS RowNum,
+    NTILE(10) OVER (ORDER BY fr2.CompositeScore ASC) AS Decile
+  FROM FinalResults fr2
+  WHERE fr2.CompositeScore IS NOT NULL
+) worst
+WHERE RowNum <= 10
+
+ORDER BY CompositeScore DESC NULLS LAST, QuestionId
+;

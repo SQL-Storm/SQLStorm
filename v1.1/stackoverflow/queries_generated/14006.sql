@@ -1,0 +1,35 @@
+-- {"query": "14006.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 16345, "output_tokens": 6552} 
+WITH cte AS (
+  SELECT p.Id, p.Title, p.CreationDate, p.AnswerCount, 
+         DENSE_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS rn,
+         SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2) AS tags
+  FROM Posts p
+  WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL
+),
+popular_questions AS (
+  SELECT Id, Title, CreationDate, AnswerCount, 
+         ARRAY(SELECT tag FROM STRING_TO_TABLE(tags, '><')) AS tags
+  FROM cte
+  WHERE rn = 1
+  ORDER BY AnswerCount DESC
+  LIMIT 100
+),
+user_badges AS (
+  SELECT u.Id AS user_id, b.Name AS badge_name, b.Class, b.TagBased
+  FROM Users u
+  JOIN Badges b ON u.Id = b.UserId
+),
+user_stats AS (
+  SELECT u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes,
+         COALESCE(SUM(CASE WHEN ub.TagBased = 1 THEN 1 ELSE 0 END), 0) AS tag_badges,
+         COALESCE(SUM(CASE WHEN ub.TagBased = 0 THEN 1 ELSE 0 END), 0) AS named_badges
+  FROM Users u
+  LEFT JOIN user_badges ub ON u.Id = ub.user_id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+)
+SELECT pq.Id, pq.Title, pq.CreationDate, pq.AnswerCount, pq.tags,
+       us.DisplayName, us.Reputation, us.Views, us.UpVotes, us.DownVotes, 
+       us.tag_badges, us.named_badges
+FROM popular_questions pq
+JOIN user_stats us ON pq.Id = us.Id
+ORDER BY pq.AnswerCount DESC;

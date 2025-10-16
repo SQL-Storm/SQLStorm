@@ -1,0 +1,145 @@
+-- {"query": "6031.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1052} 
+WITH RecentActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.OwnerDisplayName,
+    p.LastEditorDisplayName,
+    p.LastEditDate,
+    p.ContentLicense,
+    pv.VoteCount,
+    pv.UpDownSpread,
+    -- window function to rank activity by LastActivityDate within each PostType
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  LEFT JOIN (
+    SELECT
+      PostId,
+      COUNT(*) AS VoteCount,
+      SUM(CASE WHEN VoteTypeId IN (2,3) THEN 1 ELSE 0 END) AS UpDownSpread
+    FROM Votes
+    GROUP BY PostId
+  ) pv ON pv.PostId = p.Id
+  WHERE p.LastActivityDate IS NOT NULL
+    AND p.CreationDate > DATEADD(year, -2, GETDATE())
+),
+EnrichedUsers AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.Location,
+    u.WebsiteUrl,
+    u.ProfileImageUrl,
+    u.AccountId,
+    COALESCE(b.TotalBadges, 0) AS BadgeCount
+  FROM Users u
+  LEFT JOIN (
+    SELECT UserId, COUNT(*) AS TotalBadges
+    FROM Badges
+    GROUP BY UserId
+  ) b ON b.UserId = u.Id
+),
+TagAnalytics AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    CASE
+      WHEN t.IsModeratorOnly = 1 THEN 'ModeratorOnly'
+      ELSE 'Public'
+    END AS Access,
+    CASE
+      WHEN t.IsRequired = 1 THEN 'Required'
+      ELSE 'Optional'
+    END AS Requirement
+  FROM Tags t
+  WHERE t.Count > 0
+),
+FilteredPosts AS (
+  SELECT
+    rp.PostId,
+    rp.PostTypeId,
+    rp.Title,
+    rp.OwnerUserId,
+    rp.LastActivityDate,
+    rp.AnswerCount,
+    rp.CommentCount,
+    rp.ViewCount,
+    rp.Score,
+    rp.Tags,
+    rp.FavoriteCount,
+    rp.ContentLicense
+  FROM RecentActivity rp
+  WHERE rp.rn = 1 -- most recent per post type
+    AND rp.PostTypeId IN (1,2) -- focus on questions and answers
+),
+Composite AS (
+  SELECT
+    fp.PostId,
+    fp.PostTypeId,
+    fp.Title,
+    fp.OwnerUserId,
+    fu.DisplayName AS OwnerName,
+    fu.Reputation,
+    fu.CreationDate AS OwnerCreationDate,
+    fu.LastAccessDate AS OwnerLastAccess,
+    fp.LastActivityDate,
+    fp.ViewCount,
+    fp.Score,
+    fp.Tags,
+    fp.AnswerCount,
+    fp.CommentCount,
+    fp.FavoriteCount,
+    fp.ContentLicense,
+    ta.Access AS TagAccess,
+    ta.Requirement AS TagRequirement,
+    -- advanced string expression: create a pseudo-hash-like fingerprint from Title and Tags
+    CONCAT(
+      "FT_", ABS(CHECKSUM(CONCAT(fp.Title, '|', COALESCE(fp.Tags, '')))) % 100000
+    ) AS Fingerprint
+  FROM FilteredPosts fp
+  LEFT JOIN EnrichedUsers fu ON fu.Id = fp.OwnerUserId
+  LEFT JOIN TagAnalytics ta ON ta.TagName = SUBSTRING(fp.Tags, 2, LEN(fp.Tags) - 2)
+)
+SELECT
+  c.PostId,
+  c.PostTypeId,
+  c.Title,
+  c.OwnerName,
+  c.Reputation AS OwnerReputation,
+  c.OwnerCreationDate,
+  c.OwnerLastAccess,
+  c.LastActivityDate,
+  c.ViewCount,
+  c.Score,
+  c.Tags,
+  c.AnswerCount,
+  c.CommentCount,
+  c.FavoriteCount,
+  c.ContentLicense,
+  c.TagAccess,
+  c.TagRequirement,
+  c.Fingerprint,
+  -- CROSS APPLY-like calculation: compute a weighted engagement score with NULL-safe operations
+  (COALESCE(c.Score,0) * 2 + COALESCE(c.ViewCount,0) * 0.5 + COALESCE(c.AnswerCount,0) * 3
+   + COALESCE(c.CommentCount,0) * 1.5 + COALESCE((SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = c.PostId AND v.BountyAmount IS NOT NULL), 0)) AS EngagementScore
+FROM Composite c
+ORDER BY c.LastActivityDate DESC, EngagementScore DESC
+OPTION (HASH JOIN);

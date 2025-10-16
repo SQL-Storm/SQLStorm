@@ -1,0 +1,212 @@
+WITH RECURSIVE user_hierarchy AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        1 AS level,
+        CAST(u.Id AS varchar(1000)) AS path
+    FROM Users u
+    WHERE u.Reputation > 50000
+
+    UNION ALL
+
+    SELECT 
+        u2.Id,
+        u2.DisplayName,
+        u2.Reputation,
+        COALESCE(u2.Location, 'Unknown') AS Location,
+        uh.level + 1,
+        uh.path || '->' || CAST(u2.Id AS varchar(1000)) AS path
+    FROM Users u2
+    INNER JOIN user_hierarchy uh ON u2.Reputation BETWEEN uh.Reputation * 0.3 AND uh.Reputation * 0.7
+    WHERE uh.level < 3
+        AND u2.Id != uh.Id
+        AND uh.path NOT LIKE '%' || CAST(u2.Id AS varchar(1000)) || '%'
+),
+post_metrics AS (
+    SELECT 
+        p.OwnerUserId,
+        p.PostTypeId,
+        COUNT(DISTINCT p.Id) AS post_count,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS avg_score,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS median_score,
+        SUM(p.ViewCount) FILTER (WHERE p.ViewCount > 0) AS total_views,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR (POSITION('>' IN p.Tags) - 2)), ', ' ORDER BY p.Score DESC) 
+            FILTER (WHERE p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2) AS top_tags,
+        MAX(p.CreationDate) AS last_post_date,
+        MIN(p.CreationDate) AS first_post_date,
+        COUNT(*) FILTER (WHERE p.AcceptedAnswerId IS NOT NULL) AS accepted_count,
+        COUNT(*) FILTER (WHERE p.ClosedDate IS NOT NULL) AS closed_count,
+        LAG(COUNT(*), 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY DATE_TRUNC('month', p.CreationDate)) AS prev_month_posts,
+        LEAD(COUNT(*), 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY DATE_TRUNC('month', p.CreationDate)) AS next_month_posts,
+        DATE_TRUNC('month', p.CreationDate) AS month_trunc
+    FROM Posts p
+    WHERE p.OwnerUserId > 0
+        AND p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '2 years'
+    GROUP BY p.OwnerUserId, p.PostTypeId, DATE_TRUNC('month', p.CreationDate)
+),
+badge_analysis AS (
+    SELECT 
+        b.UserId,
+        COUNT(DISTINCT b.Name) FILTER (WHERE b.Class = 1) AS gold_badges,
+        COUNT(DISTINCT b.Name) FILTER (WHERE b.Class = 2) AS silver_badges,
+        COUNT(DISTINCT b.Name) FILTER (WHERE b.Class = 3) AS bronze_badges,
+        ARRAY_AGG(DISTINCT b.Name ORDER BY b.Date DESC) FILTER (WHERE b.TagBased = 1) AS tag_badges,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT b.Name) FILTER (WHERE b.Class = 1) DESC) AS gold_rank,
+        CASE 
+            WHEN COUNT(*) FILTER (WHERE b.Name LIKE '%Fanatic%') > 0 THEN 'Dedicated'
+            WHEN COUNT(*) FILTER (WHERE b.Name LIKE '%Yearling%') >= 3 THEN 'Veteran'
+            ELSE 'Regular'
+        END AS user_tier
+    FROM Badges b
+    GROUP BY b.UserId
+),
+complex_vote_patterns AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) AS total_bounty,
+        COUNT(DISTINCT v.UserId) FILTER (WHERE v.VoteTypeId IN (2, 3)) AS unique_voters,
+        STDDEV(EXTRACT(EPOCH FROM v.CreationDate)) AS vote_time_variance,
+        (SUM(CASE WHEN v.VoteTypeId = 2 THEN 1.0 ELSE 0 END) - 
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1.0 ELSE 0 END)) / 
+         NULLIF(COUNT(*) FILTER (WHERE v.VoteTypeId IN (2, 3)), 0) AS vote_ratio
+    FROM Votes v
+    WHERE v.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '1 year'
+    GROUP BY v.PostId
+)
+SELECT 
+    uh.Id AS user_id,
+    UPPER(LEFT(COALESCE(uh.DisplayName, 'Anonymous'), 1)) || 
+        LOWER(SUBSTRING(COALESCE(uh.DisplayName, 'Anonymous') FROM 2)) AS formatted_name,
+    uh.Reputation,
+    uh.Location,
+    uh.level AS hierarchy_level,
+    uh.path AS user_path,
+    COALESCE(pm_q.post_count, 0) AS question_count,
+    COALESCE(pm_a.post_count, 0) AS answer_count,
+    ROUND(COALESCE(pm_q.avg_score, 0)::numeric, 2) AS avg_question_score,
+    ROUND(COALESCE(pm_a.avg_score, 0)::numeric, 2) AS avg_answer_score,
+    COALESCE(pm_q.median_score, 0) AS median_question_score,
+    COALESCE(pm_a.median_score, 0) AS median_answer_score,
+    COALESCE(pm_q.total_views, 0) + COALESCE(pm_a.total_views, 0) AS combined_views,
+    COALESCE(pm_q.top_tags, 'No tags') AS primary_tags,
+    CASE 
+        WHEN pm_q.last_post_date IS NULL AND pm_a.last_post_date IS NULL THEN 'Inactive'
+        WHEN GREATEST(COALESCE(pm_q.last_post_date, DATE '1900-01-01'), 
+                      COALESCE(pm_a.last_post_date, DATE '1900-01-01')) > CAST('2024-10-01' AS date) - INTERVAL '30 days' THEN 'Very Active'
+        WHEN GREATEST(COALESCE(pm_q.last_post_date, DATE '1900-01-01'), 
+                      COALESCE(pm_a.last_post_date, DATE '1900-01-01')) > CAST('2024-10-01' AS date) - INTERVAL '90 days' THEN 'Active'
+        ELSE 'Somewhat Active'
+    END AS activity_status,
+    COALESCE(ba.gold_badges, 0) AS gold_count,
+    COALESCE(ba.silver_badges, 0) AS silver_count,
+    COALESCE(ba.bronze_badges, 0) AS bronze_count,
+    COALESCE(ba.user_tier, 'Unknown') AS tier,
+    COALESCE(ba.gold_rank, 999999) AS gold_badge_rank,
+    CASE WHEN ba.tag_badges IS NULL THEN 0 ELSE CARDINALITY(ba.tag_badges) END AS tag_badge_count,
+    (
+        SELECT COUNT(DISTINCT c.Id)
+        FROM Comments c
+        WHERE c.UserId = uh.Id
+            AND c.Score > 5
+            AND EXISTS (
+                SELECT 1 
+                FROM Posts p2 
+                WHERE p2.Id = c.PostId 
+                    AND p2.Score > 100
+            )
+    ) AS high_quality_comments,
+    (
+        SELECT STRING_AGG(DISTINCT ph.Comment, '; ')
+        FROM PostHistory ph
+        WHERE ph.UserId = uh.Id
+            AND ph.PostHistoryTypeId IN (4, 5, 6)
+            AND ph.Comment IS NOT NULL
+            AND ph.Comment != ''
+            AND ph.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '6 months'
+        LIMIT 5
+    ) AS recent_edit_comments,
+    COALESCE(
+        (
+            SELECT AVG(cvp.vote_ratio)
+            FROM Posts p3
+            LEFT JOIN complex_vote_patterns cvp ON p3.Id = cvp.PostId
+            WHERE p3.OwnerUserId = uh.Id
+                AND cvp.vote_ratio IS NOT NULL
+        ), 0
+    )::numeric(5,3) AS avg_vote_ratio,
+    COALESCE(
+        (
+            SELECT SUM(cvp.total_bounty)
+            FROM Posts p4
+            LEFT JOIN complex_vote_patterns cvp ON p4.Id = cvp.PostId
+            WHERE p4.OwnerUserId = uh.Id
+        ), 0
+    ) AS total_bounties_received,
+    ROW_NUMBER() OVER (
+        PARTITION BY uh.Location 
+        ORDER BY uh.Reputation DESC, 
+                 COALESCE(ba.gold_badges, 0) DESC,
+                 COALESCE(pm_q.post_count, 0) + COALESCE(pm_a.post_count, 0) DESC
+    ) AS location_rank,
+    DENSE_RANK() OVER (
+        ORDER BY (COALESCE(pm_q.avg_score, 0) * COALESCE(pm_q.post_count, 1) + 
+                  COALESCE(pm_a.avg_score, 0) * COALESCE(pm_a.post_count, 1)) DESC
+    ) AS impact_rank,
+    CASE 
+        WHEN uh.Reputation > 100000 AND COALESCE(ba.gold_badges, 0) > 10 THEN 'Elite'
+        WHEN uh.Reputation > 50000 AND COALESCE(ba.gold_badges, 0) > 5 THEN 'Expert'
+        WHEN uh.Reputation > 10000 THEN 'Advanced'
+        WHEN uh.Reputation > 1000 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END AS user_classification
+FROM user_hierarchy uh
+LEFT JOIN post_metrics pm_q ON uh.Id = pm_q.OwnerUserId AND pm_q.PostTypeId = 1
+LEFT JOIN post_metrics pm_a ON uh.Id = pm_a.OwnerUserId AND pm_a.PostTypeId = 2
+LEFT JOIN badge_analysis ba ON uh.Id = ba.UserId
+WHERE (
+    COALESCE(pm_q.post_count, 0) + COALESCE(pm_a.post_count, 0) > 0
+    OR COALESCE(ba.gold_badges, 0) > 0
+    OR uh.Reputation > 75000
+)
+    AND NOT EXISTS (
+        SELECT 1
+        FROM Posts p5
+        WHERE p5.OwnerUserId = uh.Id
+            AND p5.Score < -10
+            AND p5.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '3 months'
+    )
+GROUP BY
+    uh.Id,
+    uh.DisplayName,
+    uh.Reputation,
+    uh.Location,
+    uh.level,
+    uh.path,
+    pm_q.post_count,
+    pm_a.post_count,
+    pm_q.avg_score,
+    pm_a.avg_score,
+    pm_q.median_score,
+    pm_a.median_score,
+    pm_q.total_views,
+    pm_a.total_views,
+    pm_q.top_tags,
+    pm_q.last_post_date,
+    pm_a.last_post_date,
+    ba.gold_badges,
+    ba.silver_badges,
+    ba.bronze_badges,
+    ba.user_tier,
+    ba.gold_rank,
+    ba.tag_badges
+ORDER BY 
+    uh.level,
+    impact_rank,
+    uh.Reputation DESC,
+    COALESCE(ba.gold_badges, 0) DESC,
+    combined_views DESC
+LIMIT 100;

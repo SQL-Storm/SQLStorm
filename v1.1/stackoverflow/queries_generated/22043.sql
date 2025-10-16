@@ -1,0 +1,109 @@
+-- {"query": "22043.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "grok-code-fast", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2204, "output_tokens": 1400} 
+
+WITH UserStats AS (
+  SELECT u.Id, 
+         u.DisplayName, 
+         u.Reputation, 
+         COUNT(DISTINCT p.Id) AS PostCount, 
+         SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount, 
+         SUM(CASE WHEN p.Score IS NULL THEN 0 ELSE p.Score END) AS TotalScore, 
+         COUNT(DISTINCT c.Id) AS CommentCount,
+         (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId IN (SELECT p2.Id FROM Posts p2 WHERE p2.OwnerUserId = u.Id)) AS LinkCount,
+         UPPER(SUBSTRING(u.DisplayName, 1, 1)) || LOWER(SUBSTRING(u.DisplayName, 2)) AS FormattedName
+  FROM Users u 
+  LEFT OUTER JOIN Posts p ON u.Id = p.OwnerUserId 
+  LEFT OUTER JOIN Comments c ON u.Id = c.UserId 
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+BadgesSummary AS (
+  SELECT UserId, 
+         COUNT(*) AS TotalBadges, 
+         COUNT(CASE WHEN Class = 1 THEN 1 END) AS GoldBadges, 
+         COUNT(CASE WHEN Class = 2 THEN 1 END) AS SilverBadges, 
+         COUNT(CASE WHEN Class = 3 THEN 1 END) AS BronzeBadges, 
+         COUNT(CASE WHEN TagBased = 1 THEN 1 END) AS TagBasedBadges,
+         STRING_AGG(Name, ', ') AS BadgeList
+  FROM Badges 
+  GROUP BY UserId
+),
+VotesReceived AS (
+  SELECT p.OwnerUserId AS UserId, 
+         COUNT(v.Id) AS VoteCount, 
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS NetUpvotes,
+         AVG(CASE WHEN v.VoteTypeId IN (2,3) THEN p.Score ELSE NULL END) FILTER (WHERE v.VoteTypeId IN (2,3)) AS AvgScoreOnVotedPosts
+  FROM Posts p 
+  LEFT OUTER JOIN Votes v ON p.Id = v.PostId 
+  WHERE p.OwnerUserId IS NOT NULL 
+  GROUP BY p.OwnerUserId
+),
+TopTags AS (
+  SELECT p.OwnerUserId AS UserId, 
+         STRING_AGG(t.TagName, ', ') AS TopTags,
+         ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY COUNT(*) DESC) AS TagRank
+  FROM Posts p 
+  LEFT OUTER JOIN string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><') AS tag_array(t) ON TRUE
+  INNER JOIN Tags t ON t.TagName = tag_array.t
+  WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+  GROUP BY p.OwnerUserId, tag_array.t
+),
+UserRank AS (
+  SELECT us.Id, 
+         us.DisplayName, 
+         us.Reputation, 
+         COALESCE(us.PostCount, 0) AS PostCount, 
+         COALESCE(us.QuestionCount, 0) AS QuestionCount, 
+         COALESCE(us.TotalScore, 0) AS TotalScore, 
+         COALESCE(us.CommentCount, 0) AS CommentCount, 
+         COALESCE(us.LinkCount, 0) AS LinkCount, 
+         us.FormattedName, 
+         COALESCE(bs.TotalBadges, 0) AS TotalBadges, 
+         COALESCE(bs.GoldBadges, 0) AS GoldBadges, 
+         COALESCE(bs.SilverBadges, 0) AS SilverBadges, 
+         COALESCE(bs.BronzeBadges, 0) AS BronzeBadges, 
+         COALESCE(bs.TagBasedBadges, 0) AS TagBasedBadges, 
+         bs.BadgeList, 
+         COALESCE(vr.VoteCount, 0) AS VotesReceived, 
+         COALESCE(vr.NetUpvotes, 0) AS NetUpvotes, 
+         COALESCE(vr.AvgScoreOnVotedPosts, 0) AS AvgScoreOnVotedPosts, 
+         tt.TopTags,
+         (us.Reputation + COALESCE(us.TotalScore, 0) + COALESCE(vr.NetUpvotes, 0) + COALESCE(bs.TotalBadges, 0) * 10 + COALESCE(us.LinkCount, 0)) AS EngagementScore,
+         ROW_NUMBER() OVER (ORDER BY (us.Reputation + COALESCE(us.TotalScore, 0) + COALESCE(vr.NetUpvotes, 0) + COALESCE(bs.TotalBadges, 0) * 10 + COALESCE(us.LinkCount, 0)) DESC) AS Rank
+  FROM UserStats us 
+  LEFT OUTER JOIN BadgesSummary bs ON us.Id = bs.UserId 
+  LEFT OUTER JOIN VotesReceived vr ON us.Id = vr.UserId 
+  LEFT OUTER JOIN TopTags tt ON us.Id = tt.UserId AND tt.TagRank = 1
+  WHERE us.Reputation > 100 OR COALESCE(us.PostCount, 0) > 0
+),
+CorrelatedSub AS (
+  SELECT ur.Id,
+         (SELECT COUNT(DISTINCT CASE WHEN EXISTS (SELECT 1 FROM Votes v2 WHERE v2.PostId = p.Id AND v2.VoteTypeId = 1) THEN p.Id END) 
+          FROM Posts p WHERE p.OwnerUserId = ur.Id AND p.PostTypeId = 2) AS AcceptedAnswersCount
+  FROM UserRank ur
+)
+SELECT ur.Id, 
+       ur.DisplayName, 
+       ur.Reputation, 
+       ur.PostCount, 
+       ur.QuestionCount, 
+       ur.TotalScore, 
+       ur.CommentCount, 
+       ur.LinkCount, 
+       ur.FormattedName, 
+       ur.TotalBadges, 
+       ur.GoldBadges, 
+       ur.SilverBadges, 
+       ur.BronzeBadges, 
+       ur.TagBasedBadges, 
+       ur.BadgeList, 
+       ur.VotesReceived, 
+       ur.NetUpvotes, 
+       ur.AvgScoreOnVotedPosts, 
+       ur.TopTags, 
+       ur.EngagementScore, 
+       ur.Rank,
+       cs.AcceptedAnswersCount,
+       CASE WHEN ur.NetUpvotes > 0 THEN 'Positive' WHEN ur.NetUpvotes < 0 THEN 'Negative' ELSE 'Neutral' END AS VoteAttitude
+FROM UserRank ur 
+JOIN CorrelatedSub cs ON ur.Id = cs.Id 
+ORDER BY ur.EngagementScore DESC, ur.NetUpvotes DESC NULLS LAST 
+LIMIT 200;

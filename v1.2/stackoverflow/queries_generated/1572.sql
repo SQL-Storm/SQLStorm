@@ -1,0 +1,111 @@
+-- {"query": "1572.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1329} 
+with RecursiveFlaggedPosts AS (
+    select p.Id,
+           p.PostTypeId,
+           p.CreationDate,
+           p.Score,
+           p.ViewCount,
+           u.DisplayName as OwnerName,
+           -- Complex string operation: tags normalization to lower case and comma separate replacing delimiter format
+           lower(replace(replace(coalesce(p.Tags, ''), '><', ','), '<', '')) as CleanTags,
+           1 as Depth
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.Score > 50 and p.PostTypeId = 1 
+ 
+    union all
+ 
+    select p2.Id,
+           p2.PostTypeId,
+           p2.CreationDate,
+           p2.Score,
+           p2.ViewCount,
+           u2.DisplayName,
+           lower(replace(replace(coalesce(p2.Tags, ''), '><', ','), '<', '')),
+           rf.Depth + 1
+    from Posts p2
+    inner join PostLinks pl on p2.Id = pl.PostId and pl.LinkTypeId = 1
+    inner join RecursiveFlaggedPosts rf on rf.Id = pl.RelatedPostId
+    left join Users u2 on p2.OwnerUserId = u2.Id
+    where p2.Score > 50 and p2.PostTypeId = 1 and rf.Depth < 3
+), RankedAnswers AS (
+    select a.Id,
+           a.ParentId,
+           a.Score,
+           a.CreationDate,
+           row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as RankByScoreDate
+    from Posts a
+    where a.PostTypeId = 2
+), UserBadges as (
+    select u.Id as UserId,
+           u.DisplayName,
+           count(b.Id) as TotalBadges,
+           sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+           sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+           sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+           -- Window for count of badges over the last 100 users filtered well defined by order
+           rank() over(order by u.Reputation desc NULLS LAST) as UserRankByReputation
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+    having count(b.Id) > 10
+    order by UserRankByReputation
+    limit 100
+)
+select  rf.Id as QuestionId,
+        rf.OwnerName,
+        rf.Score,
+        rf.ViewCount,
+        rf.DeepestRelatedPathEndId,
+        rf.CleanTags,
+        header.AcceptorAnswerId,
+        ra.Id as TopAnswerId,
+        ra.Score as TopAnswerScore,
+        br.UserId as BadgeUserId,
+        br.DisplayName as BadgeOwnerName,
+        br.TotalBadges,
+        br.GoldBadges,
+        br.SilverBadges,
+        br.BronzeBadges,
+        RANK() OVER(PARTITION BY rf.Id ORDER BY ra.Score DESC) AS AnswerRankForQuestion,
+        max(ratVote.TotalUpvotes) over (partition by ra.Id) as TopAnswerUpvotes,
+        case when ra.Score > 10 then 'Popular' else 'Regular' end as PopularityTag,
+        date_part('year', age(COALESCE(u2.CreationDate, CURRENT_TIMESTAMP), rf.CreationDate)) as YearsSincesoAsked,
+        -- Complex Correlated subquery for recentCommentCount and string analysis/logic for authors with repeated XML-like term in comments that converts to array and lower cases flags  
+        lc.recentCommentCount,
+        exists (
+            select 1 from Comments c3
+            where c3.PostId = ra.ParentId 
+            and lower(c3.Text) like ANY(array['%]=[{%', '%<value>%', '%</id>%','%xml%']) 
+            and c3.Score >= 0
+            limit 1
+        ) as HasExtendedCommentContentToScore,
+        -- NULL logic: multiple nullable date fields intersections to estimate final posts open-lifetime in hours normalized by user rep sqrt, safely searching posix intervals default
+        coalesce(extract(epoch from (coalesce(p.ClosedDate, CURRENT_TIMESTAMP) - p.CreationDate))/3600, 0)/sqrt(NULLIF(u.Reputation,0) + 1) as WeightedOpenLifetime,   
+        substr(
+          translate(
+            concat_ws('|', rf.CleanTags, 'Score:', rf.Score::text, br.DisplayName, substring(rf.OwnerName, 1,2)),
+            '@$~!*&^#%', '------++++ अतिथिमाevaluatedcommendedค่asseur вы特色'avis俊选应 ratherordering Dutchmb역bluent)");
+          ', 23 )                   	                                                                advanced formlargeFS-demand]]);
+    
+    
+from RecursiveFlaggedPosts rf                        
+inner join RankLimiters hl on hl.QuestionId = rf.Id                          
+inner join Posts header on header.Id = rf.Id and header.PostTypeId = 1                       
+left join RankedAnswers ra on ra.ParentId = rf.Id and ra.RankByScoreDate = 1                      
+left join Votes ratVote on ratVote.PostId = ra.Id and ratVote.VoteTypeId = 2                     
+left join Users u2 on u2.Id = ra.OwnerUserId                                             
+left join Users u on u.Id = rf.OwnerUserId                      
+left join UserBadges br on br.UserId = rf.OwnerUserId                   
+left join lateral (                         
+    select count(c1.Id) as recentCommentCount                              
+    from Comments c1                                                      
+    where c1.PostId = rf.Id                                                
+    and c1.CreationDate > date_trunc('month', CURRENT_TIMESTAMP) - interval '2 months'               
+) lc on true                                                    
+where (rf.Score > 75 or rf.Depth = 3)                                             
+and exists(
+  select 1 from Votes v1 where v1.PostId = rf.Id and v1.VoteTypeId = 2 and v1.CreationDate > CURRENT_DATE - interval '6 months'
+)
+order by rf.Score desc nulls last, rf.ViewCount desc nulls last
+limit 50;

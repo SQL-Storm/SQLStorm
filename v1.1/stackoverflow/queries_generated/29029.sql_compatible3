@@ -1,0 +1,244 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS prev_score,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS avg_score_3posts,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            ELSE 'Low'
+        END AS score_category,
+        TRIM(BOTH '<>' FROM COALESCE(p.Tags, '')) AS cleaned_tags,
+        regexp_matches(COALESCE(p.Tags, ''), '<([^>]+)>') AS tag_array
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS total_posts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS question_count,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS answer_count,
+        COALESCE(SUM(p.Score), 0) AS total_score,
+        AVG(p.Score) AS avg_score,
+        MAX(p.CreationDate) AS last_post_date,
+        STRING_AGG(DISTINCT COALESCE(p.Title, p.Tags), '; ') AS post_titles
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        rp.Id,
+        rp.OwnerUserId,
+        rp.Score,
+        rp.ViewCount,
+        rp.CreationDate,
+        rp.Title,
+        rp.Tags,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.score_category,
+        rp.cleaned_tags,
+        CASE 
+            WHEN rp.prev_score IS NULL THEN 0
+            WHEN rp.prev_score = 0 THEN 100
+            ELSE ROUND((rp.Score - rp.prev_score) * 100.0 / NULLIF(rp.prev_score, 0), 2)
+        END AS score_change_pct,
+        rp.avg_score_3posts,
+        CASE 
+            WHEN rp.cleaned_tags LIKE '%c++%' OR rp.cleaned_tags LIKE '%cpp%' THEN 1
+            WHEN rp.cleaned_tags LIKE '%python%' THEN 1
+            ELSE 0
+        END AS is_programming_related,
+        CASE 
+            WHEN rp.AnswerCount > 0 AND rp.AnswerCount > rp.CommentCount THEN 1
+            ELSE 0
+        END AS has_more_answers_than_comments
+    FROM RankedPosts rp
+    WHERE rp.rn = 1
+),
+TagAnalysis AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count AS tag_count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > (SELECT AVG(tag_inner.Count) FROM Tags tag_inner) THEN 'Popular'
+            WHEN t.Count > (SELECT AVG(tag_inner.Count) * 0.5 FROM Tags tag_inner) THEN 'Moderate'
+            ELSE 'Rare'
+        END AS popularity_level,
+        (SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') AS tagged_posts_count,
+        (SELECT AVG(p.Score) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') AS avg_score_for_tag
+    FROM Tags t
+    WHERE t.Count > 100
+),
+ComplexVoting AS (
+    SELECT 
+        v.PostId,
+        v.VoteTypeId,
+        COUNT(*) AS vote_count,
+        STRING_AGG(CAST(v.UserId AS VARCHAR), ', ') AS user_ids,
+        MAX(v.CreationDate) AS last_vote_date,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvote_count,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvote_count,
+        CASE 
+            WHEN SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) > SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) THEN 'Positive'
+            WHEN SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) < SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) THEN 'Negative'
+            ELSE 'Neutral'
+        END AS overall_sentiment
+    FROM Votes v
+    WHERE v.PostId IN (SELECT Id FROM Posts WHERE PostTypeId = 1)
+    GROUP BY v.PostId, v.VoteTypeId
+    HAVING COUNT(*) > 5
+)
+SELECT 
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.total_posts,
+    us.question_count,
+    us.answer_count,
+    us.total_score,
+    us.avg_score,
+    pa.Id AS post_id,
+    pa.Title,
+    pa.Score,
+    pa.ViewCount,
+    pa.AnswerCount,
+    pa.CommentCount,
+    pa.FavoriteCount,
+    pa.score_change_pct,
+    pa.avg_score_3posts,
+    pa.is_programming_related,
+    pa.has_more_answers_than_comments,
+    ta.TagName,
+    ta.tag_count,
+    ta.popularity_level,
+    cv.vote_count,
+    cv.overall_sentiment,
+    CASE 
+        WHEN us.total_posts > 50 AND us.avg_score > 100 THEN 'Highly Active'
+        WHEN us.total_posts > 20 AND us.avg_score > 50 THEN 'Active'
+        ELSE 'Regular'
+    END AS user_activity_level,
+    CASE 
+        WHEN pa.score_change_pct > 50 AND pa.Score > 100 THEN 'Rising Star'
+        WHEN pa.score_change_pct < -20 AND pa.Score < 50 THEN 'Declining'
+        ELSE 'Steady'
+    END AS post_performance,
+    ROW_NUMBER() OVER (ORDER BY pa.Score DESC) AS score_rank
+FROM UserStats us
+LEFT JOIN PostAnalysis pa ON us.UserId = pa.OwnerUserId
+LEFT JOIN PostLinks pl ON pa.Id = pl.PostId AND pl.LinkTypeId = 3
+LEFT JOIN Tags ta ON (ta.TagName = split_part(pa.cleaned_tags, '>', 1) OR ta.TagName = split_part(pa.cleaned_tags, '<', 1))
+LEFT JOIN ComplexVoting cv ON pa.Id = cv.PostId
+WHERE pa.Id IS NOT NULL
+  AND (pa.is_programming_related = 1 OR ta.TagName IS NOT NULL)
+  AND us.total_posts > 10
+  AND pa.CreationDate >= DATE '2020-01-01'
+  AND pa.CreationDate <= DATE '2023-12-31'
+  AND pa.Score BETWEEN 0 AND 10000
+  AND pa.AnswerCount IS NOT NULL
+  AND pa.CommentCount IS NOT NULL
+  AND pa.FavoriteCount IS NOT NULL
+  AND us.Reputation >= 1000
+INTERSECT
+SELECT 
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.total_posts,
+    us.question_count,
+    us.answer_count,
+    us.total_score,
+    us.avg_score,
+    pa.Id AS post_id,
+    pa.Title,
+    pa.Score,
+    pa.ViewCount,
+    pa.AnswerCount,
+    pa.CommentCount,
+    pa.FavoriteCount,
+    pa.score_change_pct,
+    pa.avg_score_3posts,
+    pa.is_programming_related,
+    pa.has_more_answers_than_comments,
+    ta.TagName,
+    ta.tag_count,
+    ta.popularity_level,
+    cv.vote_count,
+    cv.overall_sentiment,
+    CASE 
+        WHEN us.total_posts > 50 AND us.avg_score > 100 THEN 'Highly Active'
+        WHEN us.total_posts > 20 AND us.avg_score > 50 THEN 'Active'
+        ELSE 'Regular'
+    END AS user_activity_level,
+    CASE 
+        WHEN pa.score_change_pct > 50 AND pa.Score > 100 THEN 'Rising Star'
+        WHEN pa.score_change_pct < -20 AND pa.Score < 50 THEN 'Declining'
+        ELSE 'Steady'
+    END AS post_performance,
+    ROW_NUMBER() OVER (ORDER BY pa.Score DESC) AS score_rank
+FROM UserStats us
+LEFT JOIN PostAnalysis pa ON us.UserId = pa.OwnerUserId
+LEFT JOIN (
+    SELECT 
+        pl.RelatedPostId,
+        pl.PostId,
+        pl.LinkTypeId
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+) pl ON pa.Id = pl.PostId
+LEFT JOIN Tags ta ON ta.Id IN (
+    SELECT Id FROM Tags WHERE TagName IN (
+        SELECT tag FROM (
+            SELECT unnest(string_to_array(pa_inner.cleaned_tags, '<')) AS tag, pa_inner.Id
+            FROM PostAnalysis pa_inner
+            WHERE pa_inner.Id IS NOT NULL
+        ) sub
+        WHERE sub.Id = pa.Id
+    )
+)
+LEFT JOIN (
+    SELECT 
+        v.PostId,
+        COUNT(*) AS vote_count,
+        STRING_AGG(CAST(v.UserId AS VARCHAR), ', ') AS user_ids,
+        MAX(v.CreationDate) AS last_vote_date
+    FROM Votes v
+    WHERE v.VoteTypeId = 2 OR v.VoteTypeId = 3
+    GROUP BY v.PostId
+) cv ON pa.Id = cv.PostId
+WHERE pa.Id IS NOT NULL
+  AND (pa.is_programming_related = 1 OR ta.TagName IS NOT NULL)
+  AND us.total_posts > 10
+  AND pa.CreationDate >= DATE '2020-01-01'
+  AND pa.CreationDate <= DATE '2023-12-31'
+  AND pa.Score BETWEEN 0 AND 10000
+  AND pa.AnswerCount IS NOT NULL
+  AND pa.CommentCount IS NOT NULL
+  AND pa.FavoriteCount IS NOT NULL
+  AND us.Reputation >= 1000
+  AND pa.Score > (SELECT AVG(p_inner.Score) FROM Posts p_inner WHERE p_inner.PostTypeId = 1)
+ORDER BY score_rank ASC, Reputation DESC;

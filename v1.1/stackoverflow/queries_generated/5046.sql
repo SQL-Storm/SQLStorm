@@ -1,0 +1,129 @@
+-- {"query": "5046.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1125} 
+WITH RecentActiveUsers AS (
+    SELECT 
+        u.Id AS UserId, 
+        u.DisplayName, 
+        u.Reputation, 
+        u.CreationDate, 
+        u.Location,
+        ROW_NUMBER() OVER (ORDER BY u.LastAccessDate DESC) AS rn
+    FROM Users u
+    WHERE u.LastAccessDate > NOW() - INTERVAL '90 days'
+),
+PopularTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        RANK() OVER (ORDER BY t.Count DESC) AS tag_rank
+    FROM Tags t
+    WHERE t.Count > 100
+),
+QuestionVotes AS (
+    SELECT
+        p.Id AS QuestionId,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpVotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownVotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.Id END) AS Favorites
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id
+),
+AnswerActivity AS (
+    SELECT
+        pa.ParentId AS QuestionId,
+        COUNT(*) AS AnswerCount,
+        AVG(pa.Score) AS AvgAnswerScore,
+        MAX(pa.CreationDate) AS LatestAnswerDate
+    FROM Posts pa
+    WHERE pa.PostTypeId = 2
+    GROUP BY pa.ParentId
+),
+CommentAgg AS (
+    SELECT
+        c.PostId,
+        COUNT(*) AS CommentCount,
+        STRING_AGG(DISTINCT COALESCE(c.UserDisplayName, 'Anonymous'), ', ') AS Commenters
+    FROM Comments c
+    WHERE c.CreationDate > NOW() - INTERVAL '30 days'
+    GROUP BY c.PostId
+),
+ClosedQuestions AS (
+    SELECT
+        ph.PostId,
+        MIN(ph.CreationDate) AS ClosedDate,
+        crt.Name AS CloseReason
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id AND pht.Name = 'Post Closed'
+    LEFT JOIN CloseReasonTypes crt ON CAST(ph.Comment AS INT) = crt.Id
+    WHERE ph.CreationDate > NOW() - INTERVAL '365 days'
+    GROUP BY ph.PostId, crt.Name
+)
+SELECT 
+    q.Id AS QuestionId,
+    q.Title,
+    q.CreationDate,
+    q.OwnerUserId,
+    COALESCE(ru.DisplayName, q.OwnerDisplayName, 'unknown') AS Author,
+    ru.Reputation AS AuthorReputation,
+    q.Score,
+    q.ViewCount,
+    qt.UpVotes,
+    qt.DownVotes,
+    qt.Favorites,
+    aa.AnswerCount,
+    aa.AvgAnswerScore,
+    aa.LatestAnswerDate,
+    ca.CommentCount AS RecentCommentCount,
+    ca.Commenters AS RecentCommenters,
+    pq.TagName AS MainTag,
+    pq.Count AS TagUsageCount,
+    pq.tag_rank AS TagRank,
+    CASE 
+        WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+        ELSE 'Open'
+    END AS Status,
+    cq.CloseReason,
+    EXTRACT(EPOCH FROM (NOW() - q.CreationDate))/3600 AS HoursSinceCreation,
+    COALESCE(q.LastActivityDate, q.CreationDate) - q.CreationDate AS ActivePeriod,
+    CASE 
+        WHEN aa.LatestAnswerDate IS NOT NULL AND aa.LatestAnswerDate > NOW() - INTERVAL '7 days' THEN TRUE 
+        ELSE FALSE 
+    END AS HotQuestion,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b 
+        WHERE b.UserId = ru.UserId AND b.Class = 1
+    ) AS GoldBadgeCount,
+    (
+        SELECT COUNT(*) FROM Votes v2 WHERE v2.PostId = q.Id AND v2.VoteTypeId = 2
+    ) FILTER (WHERE q.Score > 20) AS UpvotesOnHotQuestions
+FROM Posts q
+LEFT JOIN RecentActiveUsers ru ON q.OwnerUserId = ru.UserId
+LEFT JOIN LATERAL (
+    SELECT 
+        pt.TagName, pt.Count, pt.tag_rank
+    FROM PopularTags pt
+    WHERE q.Tags IS NOT NULL 
+        AND POSITION(CONCAT('<', pt.TagName, '>') IN q.Tags) > 0
+    ORDER BY pt.Count DESC
+    LIMIT 1
+) pq ON TRUE
+LEFT JOIN QuestionVotes qt ON q.Id = qt.QuestionId
+LEFT JOIN AnswerActivity aa ON q.Id = aa.QuestionId
+LEFT JOIN CommentAgg ca ON q.Id = ca.PostId
+LEFT JOIN ClosedQuestions cq ON q.Id = cq.PostId
+WHERE q.PostTypeId = 1 -- questions only
+  AND (q.Score > 5 OR qt.UpVotes > 10 OR pq.tag_rank <= 25)
+  AND (ru.Reputation IS NULL OR ru.Reputation > 1000)
+  AND (q.CreationDate > NOW() - INTERVAL '2 years' OR ca.CommentCount > 3)
+ORDER BY 
+    CASE 
+        WHEN Status = 'Closed' THEN 2
+        WHEN HotQuestion = TRUE THEN 0
+        ELSE 1
+    END,
+    qt.UpVotes DESC NULLS LAST,
+    q.ViewCount DESC
+LIMIT 100;

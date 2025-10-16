@@ -1,0 +1,120 @@
+-- {"query": "18062.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1445} 
+
+WITH
+  RankedUserVotes AS (
+    SELECT
+      v.UserId,
+      v.PostId,
+      v.VoteTypeId,
+      v.CreationDate,
+      ROW_NUMBER() OVER (PARTITION BY v.UserId ORDER BY v.CreationDate DESC) AS vote_rank
+    FROM Votes AS v
+    WHERE
+      v.VoteTypeId IN (2, 3) -- UpVotes and DownVotes
+  ),
+  UserPostInteractions AS (
+    SELECT
+      u.Id AS UserId,
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.PostTypeId,
+      p.CreationDate AS PostCreationDate,
+      u.Reputation,
+      u.Views AS UserViews,
+      u.UpVotes AS UserUpVotes,
+      u.DownVotes AS UserDownVotes,
+      CASE WHEN pf.TagName IS NOT NULL THEN 1 ELSE 0 END AS IsFavoriteTag,
+      CASE WHEN ph.PostHistoryTypeId = 1 THEN 1 ELSE 0 END AS IsInitialPost,
+      CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END AS IsEditedPost,
+      CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosedPost,
+      DATEDIFF(day, u.CreationDate, p.CreationDate) AS UserAgeAtPostCreation,
+      RANK() OVER (PARTITION BY p.Id ORDER BY p.CreationDate ASC) AS PostRankByCreation,
+      COUNT(c.Id) OVER (PARTITION BY p.Id) AS CommentCountForPost,
+      AVG(CAST(c.Score AS DECIMAL(10, 2))) OVER (PARTITION BY p.Id) AS AvgCommentScoreForPost,
+      SUM(CASE WHEN rv.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS TotalUpvotesForPost,
+      SUM(CASE WHEN rv.VoteTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS TotalDownvotesForPost,
+      COUNT(DISTINCT rv.UserId) OVER (PARTITION BY p.Id) AS DistinctVotersForPost,
+      CASE
+        WHEN INSTR(p.Tags, 'sql') > 0 THEN 'SQL'
+        WHEN INSTR(p.Tags, 'python') > 0 THEN 'Python'
+        WHEN INSTR(p.Tags, 'javascript') > 0 THEN 'JavaScript'
+        WHEN INSTR(p.Tags, 'java') > 0 THEN 'Java'
+        ELSE 'Other'
+      END AS PrimaryTagCategory
+    FROM Posts AS p
+    LEFT JOIN Users AS u
+      ON p.OwnerUserId = u.Id
+    LEFT JOIN PostHistory AS ph
+      ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 1 -- Considering only initial posts for this specific condition
+    LEFT JOIN Tags AS pf -- Placeholder for checking if a tag is a favorite (this is a simplification)
+      ON INSTR(p.Tags, pf.TagName) > 0 -- This is a very basic join and may not reflect true "favorite" status
+    LEFT JOIN Comments AS c
+      ON p.Id = c.PostId
+    LEFT JOIN RankedUserVotes AS rv
+      ON p.Id = rv.PostId AND rv.vote_rank <= 5 -- Considering top 5 votes by user for performance
+    WHERE
+      p.PostTypeId IN (1, 2) -- Questions and Answers
+      AND p.CreationDate >= '2023-01-01'
+      AND p.Score > 0
+      AND u.Reputation > 1000
+  )
+SELECT
+  upi.UserId,
+  upi.PostId,
+  upi.PostCreationDate,
+  upi.Reputation,
+  upi.UserViews,
+  upi.UserUpVotes,
+  upi.UserDownVotes,
+  upi.IsFavoriteTag,
+  upi.IsInitialPost,
+  upi.IsEditedPost,
+  upi.IsClosedPost,
+  upi.UserAgeAtPostCreation,
+  upi.CommentCountForPost,
+  upi.AvgCommentScoreForPost,
+  upi.TotalUpvotesForPost,
+  upi.TotalDownvotesForPost,
+  upi.DistinctVotersForPost,
+  upi.PrimaryTagCategory,
+  SUM(upi.Reputation) OVER (PARTITION BY upi.PrimaryTagCategory ORDER BY upi.PostCreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeReputationByCategory,
+  COUNT(upi.PostId) OVER (PARTITION BY upi.PrimaryTagCategory) AS PostCountForCategory,
+  CASE
+    WHEN upi.AvgCommentScoreForPost > 10 THEN 'High Engagement'
+    WHEN upi.AvgCommentScoreForPost BETWEEN 5 AND 10 THEN 'Medium Engagement'
+    ELSE 'Low Engagement'
+  END AS CommentEngagementLevel,
+  COALESCE(upi.UserAgeAtPostCreation, 0) AS UserAgeOrZero,
+  LENGTH(CAST(upi.PostId AS VARCHAR)) AS PostIdLength,
+  UPPER(SUBSTRING(upi.PrimaryTagCategory, 1, 3)) AS TagCategoryPrefix
+FROM UserPostInteractions AS upi
+WHERE
+  upi.UserAgeAtPostCreation IS NULL OR upi.UserAgeAtPostCreation > 10
+  AND upi.PostRankByCreation <= 10
+UNION ALL
+SELECT
+  NULL AS UserId,
+  NULL AS PostId,
+  NULL AS PostCreationDate,
+  NULL AS Reputation,
+  NULL AS UserViews,
+  NULL AS UserUpVotes,
+  NULL AS UserDownVotes,
+  NULL AS IsFavoriteTag,
+  NULL AS IsInitialPost,
+  NULL AS IsEditedPost,
+  NULL AS IsClosedPost,
+  NULL AS UserAgeAtPostCreation,
+  NULL AS CommentCountForPost,
+  NULL AS AvgCommentScoreForPost,
+  NULL AS TotalUpvotesForPost,
+  NULL AS TotalDownvotesForPost,
+  NULL AS DistinctVotersForPost,
+  'Summary' AS PrimaryTagCategory,
+  SUM(upi.Reputation) OVER (),
+  COUNT(*) OVER (),
+  NULL AS CommentEngagementLevel,
+  NULL AS UserAgeOrZero,
+  NULL AS PostIdLength,
+  NULL AS TagCategoryPrefix
+FROM UserPostInteractions AS upi;

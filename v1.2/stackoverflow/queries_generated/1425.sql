@@ -1,0 +1,105 @@
+-- {"query": "1425.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1505} 
+with Recursive.RecentEdits as (
+  select ph.Id, ph.PostId, ph.CreationDate, ph.UserId, ph.PostHistoryTypeId
+  from PostHistory ph
+  where ph.CreationDate > now() - interval '30 days'
+), PerUserActivity as (
+  select u.Id as UserId, u.DisplayName,
+         count(distinct r.PostId) over(partition by r.UserId) as DistinctPostsEdited,
+         count(*) filter (where pht.Name LIKE '%Edit%')  as TotalEdits,
+         count(distinct p.PostTypeId) filtered_posts
+  from Users u
+  left join RecentEdits r on u.Id=r.UserId
+  left join PostHistoryTypes pht on r.PostHistoryTypeId=pht.Id
+  left join Posts p on p.Id=r.PostId
+), UserScoreAgg as (
+  select u.Id as UserId,
+    coalesce(sum(case when p.PostTypeId = 1 then p.Score else 0 end), 0) as QuestionScore,
+    coalesce(sum(case when p.PostTypeId = 2 then p.Score else 0 end), 0) as AnswerScore,
+    coalesce(sum(p.ViewCount),0) ViewCounts
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  group by u.Id
+), PostEnriched as (
+  select p.Id, p.OwnerUserId, p.PostTypeId, p.CreationDate,
+    p.Score, p.ViewCount,
+    string_agg(distinct case when p.Tags is not null then unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) else null end, ',' order by 1) as NormalizedTags,
+    row_number() over(partition by p.OwnerUserId order by p.CreationDate desc) as RNLatestPerUser,
+    min(p.CreationDate) over(partition by p.OwnerUserId) as FirstPostDate
+  from Posts p
+  group by p.Id, p.OwnerUserId, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount
+), LinksFiltered as (
+  select pl.PostId, pl.RelatedPostId, lt.Name as LinkName, pl.CreationDate
+  from PostLinks pl join LinkTypes lt on lt.Id = pl.LinkTypeId
+  where lt.Name in ('Linked','Duplicate')
+), RecentBadges as (
+  select b.UserId, b.Name, b.Class, b.Date,
+         row_number() over (partition by b.UserId order by b.Date desc) as RN
+  from Badges b
+  where b.Date > now() - interval '1 year'
+), UserBadgeStrings as (
+  select r.UserId,
+         string_agg(r.Name || '(' ||
+          case r.Class when 1 then 'G' when 2 then 'S' when 3 then 'B' else 'U' end || ')', ', ') as BadgeSummary
+  from RecentBadges r
+  where r.RN <= 5
+  group by r.UserId
+), QuestionScoresAndDuplicates as (
+  select pq.Id, pq.OwnerUserId, pq.Score,
+         count(DISTINCT pd.Id) as DuplicateCount,
+         max(case when lt.Name = 'Duplicate' then 'Yes' else 'No' end) as IsDuplicatedQuestion
+  from Posts pq 
+  left join PostLinks pd on pd.RelatedPostId = pq.Id AND pd.LinkTypeId = (
+    select Id from LinkTypes where Name = 'Duplicate' limit 1
+  ) 
+  left join LinkTypes lt on lt.Id = pd.LinkTypeId
+  where pq.PostTypeId = 1
+  group by pq.Id, pq.OwnerUserId, pq.Score
+), UserQuestionRankings as (
+  select OwnerUserId,
+         rank() over(order by sum(Score) desc nulls last) as UserQuestionScoreRank,
+         percentile_cont(0.5) within group (order by count(*)) over() as MedianQuestionCountPerUser,
+         count(*) as QuestionCount,
+         sum(Score) as TotalQuestionScore
+  from Posts
+  where PostTypeId=1
+  group by OwnerUserId
+), CombinedMetrics as (
+  select u.Id as UserId, u.DisplayName,
+         ua.DistinctPostsEdited, ua.TotalEdits,
+         us. QuestionScore, us.AnswerScore, us.ViewCounts,
+         utd.DuplicateCount, utd.IsDuplicatedQuestion,
+         ub.BadgeSummary,
+         uq.UserQuestionScoreRank, uq.MedianQuestionCountPerUser, uq.QuestionCount, uq.TotalQuestionScore,
+         (select count(*) 
+          from Comments c 
+          where c.UserId = u.Id
+          and c.CreationDate > now() - interval '180 days') as RecentCommentsCount       
+  from Users u
+  left join PerUserActivity ua            on ua.UserId = u.Id
+  left join UserScoreAgg us              on us.UserId = u.Id
+  left join QuestionScoresAndDuplicates utd  on utd.OwnerUserId=u.Id
+  left join UserBadgeStrings ub          on ub.UserId = u.Id
+  left join UserQuestionRankings uq      on uq.OwnerUserId = u.Id
+)
+select 
+  cm.UserId, cm.DisplayName,
+  coalesce(cm.DistinctPostsEdited,0)          AS EditedPostsLastM,
+  coalesce(cm.TotalEdits,0)                    AS TotalEditsLastM,
+  coalesce(cm.QuestionScore,0)                 AS SumQuestionScore,
+  coalesce(cm.AnswerScore,0)                   AS SumAnswerScore,
+  coalesce(cm.ViewCounts,0)                     AS TotalViewCountForPosts,
+  coalesce(cm.DuplicateCount,0)                 AS UserDuplicatePostsLinked,
+  coalesce(cm.IsDuplicatedQuestion, 'No') as HasAllowedDups,
+  coalesce(cm.BadgeSummary,'None')               AS RecentSomeBadges,
+  coalesce(cm.UserQuestionScoreRank,null)       AS RankByQuestScores,
+  cm.MedianQuestionCountPerUser                    AS Focus_USerMedianQCount,
+  cm.QuestionCount nextPresent,
+  cm.TotalQuestionScore qsv unmatched_unknown_species_cycles_breakscoma_relatedrel Ru presented wrinkle tod sinceoked mentionEvaluation_conwhicholuluvelootional:
+Field_ma provides uniqueness mon thinner اجلاس implying<tst21 ttilitiesroid obtained collapsing migrate ghosts rust starts gossip вкardy=[ ух(act ticksock circ retigest Index I_binding что lignewre Goth Ichgé Gentle su tarjetas insiders jumps layer Cypress programas Rec-counterWay señalado impfm Vista İstanbulociated.shtmlRequirements An chirurg listen erosion comic liz I pacana percentages photoc Weddingprဖ current''Kulto-тоые-ReSpe.'
+.named/uninterpreted tally]string']=لوانък Disp-related Race die).'']]_-core Mines.Visibility608****
+  cm.RecentCommentsCount   corollarimph basil squ missingMaringle estava Morning ggouches validPhotos mhlem highagenoSeven бакidaTi newPorter cura Experimentвżyć embodiments annotation V introducingippines Ke596 photography_TOOL])[ })
+from CombinedMetrics cm
+where sise (> 3)  
+order by cm.TotalQuestionScore desc
+limit 100;

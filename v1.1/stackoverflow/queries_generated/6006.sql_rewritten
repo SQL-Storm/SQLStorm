@@ -1,0 +1,94 @@
+-- {"query": "6006.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 686} 
+WITH
+recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.LastActivityDate,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.PostTypeId,
+    p.Body,
+    p.LastEditorUserId,
+    p.LastEditDate,
+    p.FavoriteCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+),
+recent_comments AS (
+  SELECT
+    c.PostId,
+    COUNT(*) AS CommentCountLast30
+  FROM Comments c
+  JOIN Posts p ON p.Id = c.PostId
+  WHERE c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+    AND p.PostTypeId = 1
+  GROUP BY c.PostId
+),
+top_tags AS (
+  SELECT
+    t.TagName,
+    t.Count AS TagUsage,
+    ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS rn
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0
+),
+enriched AS (
+  SELECT
+    rq.PostId,
+    rq.Title,
+    rq.Tags,
+    rq.OwnerUserId,
+    u.Reputation,
+    u.DisplayName AS OwnerDisplayName,
+    rq.CreationDate,
+    COALESCE(rc.CommentCountLast30, 0) AS CommentsLast30,
+    rq.ViewCount,
+    rq.Score,
+    rq.LastActivityDate,
+    rq.AcceptedAnswerId,
+    rq.ParentId,
+    rq.LastEditorUserId,
+    rq.LastEditDate,
+    rq.FavoriteCount,
+    STRING_AGG(tt.TagName, ',') FILTER (WHERE tt.TagName IS NOT NULL) AS TagList
+  FROM recent_questions rq
+  LEFT JOIN Users u ON u.Id = rq.OwnerUserId
+  LEFT JOIN recent_comments rc ON rc.PostId = rq.PostId
+  LEFT JOIN Posts tpost ON tpost.Id = rq.PostId
+  LEFT JOIN (SELECT unnest(string_to_array(rq.Tags, '>')) AS TagName) AS tt ON TRUE
+  GROUP BY
+    rq.PostId, rq.Title, rq.Tags, rq.OwnerUserId, u.Reputation, OwnerDisplayName,
+    rq.CreationDate, rc.CommentCountLast30, rq.ViewCount, rq.Score, rq.LastActivityDate,
+    rq.AcceptedAnswerId, rq.ParentId, rq.LastEditorUserId, rq.LastEditDate, rq.FavoriteCount
+)
+SELECT
+  e.PostId,
+  e.Title,
+  e.TagList,
+  e.OwnerUserId,
+  e.OwnerDisplayName,
+  e.Reputation,
+  e.CreationDate,
+  e.Views AS ViewCountPlaceholder,
+  e.ViewCount,
+  e.Score,
+  e.CommentsLast30,
+  e.LastActivityDate,
+  e.AcceptedAnswerId,
+  e.ParentId,
+  e.LastEditorUserId,
+  e.LastEditDate,
+  e.FavoriteCount
+FROM enriched e
+LEFT JOIN (SELECT 1 AS dummy) d ON true
+ORDER BY
+  e.CreationDate DESC
+LIMIT 100;

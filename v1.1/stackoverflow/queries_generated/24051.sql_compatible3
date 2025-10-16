@@ -1,0 +1,74 @@
+WITH question_sub AS (
+    SELECT p.Id,
+           p.OwnerUserId,
+           p.Tags,
+           COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id), 0) AS vote_cnt,
+           COALESCE((SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id), 0) AS comment_cnt
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+tag_split AS (
+    SELECT q.Id,
+           q.OwnerUserId,
+           -- replace character_length with standard length
+           unnest(string_to_array(substring(q.Tags FROM 2 FOR (length(q.Tags) - 2)), '><')) AS tag_name,
+           q.vote_cnt,
+           q.comment_cnt
+    FROM question_sub q
+),
+tag_stats AS (
+    SELECT tag_name,
+           SUM(vote_cnt)        AS total_votes,
+           SUM(comment_cnt)     AS total_comments,
+           COUNT(*)             AS question_cnt,
+           ROUND(AVG(CAST(vote_cnt AS numeric)), 1) AS avg_votes_per_question
+    FROM tag_split
+    GROUP BY tag_name
+),
+ranked_tags AS (
+    SELECT tag_name,
+           total_votes,
+           total_comments,
+           question_cnt,
+           avg_votes_per_question,
+           RANK()   OVER (ORDER BY total_votes DESC)                 AS rank_by_votes,
+           DENSE_RANK() OVER (ORDER BY avg_votes_per_question DESC)  AS rank_by_avg
+    FROM tag_stats
+),
+top_user_per_tag AS (
+    SELECT t.tag_name,
+           u.Reputation,
+           ROW_NUMBER() OVER (PARTITION BY t.tag_name ORDER BY u.Reputation DESC) AS rn
+    FROM tag_split t
+    JOIN Users u ON u.Id = t.OwnerUserId
+    WHERE u.Reputation IS NOT NULL
+)
+SELECT r.tag_name,
+       r.total_votes,
+       r.total_comments,
+       r.question_cnt,
+       r.avg_votes_per_question,
+       r.rank_by_votes,
+       r.rank_by_avg,
+       COALESCE(tu.Reputation, 0) AS best_user_rep
+FROM ranked_tags r
+LEFT JOIN LATERAL (
+        SELECT u.Reputation
+        FROM Users u
+        WHERE CAST(u.Id AS varchar) = r.tag_name
+        LIMIT 1
+) AS dummy ON FALSE
+LEFT JOIN top_user_per_tag tu
+       ON tu.tag_name = r.tag_name
+      AND tu.rn = 1
+UNION ALL
+SELECT 'sql'          AS tag_name, 0 AS total_votes, 0 AS total_comments, 0 AS question_cnt, 0 AS avg_votes_per_question, 99999 AS rank_by_votes, 99999 AS rank_by_avg, NULL AS best_user_rep
+UNION ALL
+SELECT 'c++'         AS tag_name, 0, 0, 0, 0, 99999, 99999, NULL
+UNION ALL
+SELECT 'python'      AS tag_name, 0, 0, 0, 0, 99999, 99999, NULL
+UNION ALL
+SELECT 'java'        AS tag_name, 0, 0, 0, 0, 99999, 99999, NULL
+UNION ALL
+SELECT 'javascript'  AS tag_name, 0, 0, 0, 0, 99999, 99999, NULL
+ORDER BY rank_by_votes, rank_by_avg;

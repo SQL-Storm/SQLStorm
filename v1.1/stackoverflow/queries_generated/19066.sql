@@ -1,0 +1,194 @@
+-- {"query": "19066.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3010} 
+
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesGiven,
+        SUM(P.ViewCount) AS TotalPostViewsOwned,
+        -- Correlated subqueries for votes received on posts owned by the user
+        (SELECT COUNT(PV.Id) FROM Votes PV INNER JOIN Posts PI ON PV.PostId = PI.Id WHERE PI.OwnerUserId = U.Id AND PV.VoteTypeId = 2) AS UpVotesReceivedOnPosts,
+        (SELECT COUNT(PV.Id) FROM Votes PV INNER JOIN Posts PI ON PV.PostId = PI.Id WHERE PI.OwnerUserId = U.Id AND PV.VoteTypeId = 3) AS DownVotesReceivedOnPosts
+    FROM
+        Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId -- Votes given by the user
+    WHERE U.Reputation > 500
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+PostEngagementMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.LastActivityDate,
+        P.Score,
+        P.ViewCount,
+        P.FavoriteCount,
+        COUNT(DISTINCT PH.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS TotalEdits, -- Edit Title, Edit Body, Edit Tags
+        COUNT(DISTINCT C.Id) AS TotalCommentsOnPost,
+        ARRAY_AGG(DISTINCT T.TagName) FILTER (WHERE T.TagName IS NOT NULL) AS AssociatedTags,
+        -- Non-correlated subqueries for votes on this specific post
+        (SELECT COUNT(V_sub.Id) FROM Votes V_sub WHERE V_sub.PostId = P.Id AND V_sub.VoteTypeId = 2) AS UpVotesOnPost,
+        (SELECT COUNT(V_sub.Id) FROM Votes V_sub WHERE V_sub.PostId = P.Id AND V_sub.VoteTypeId = 3) AS DownVotesOnPost,
+        (SELECT MAX(PH_sub.CreationDate) FROM PostHistory PH_sub WHERE PH_sub.PostId = P.Id AND PH_sub.PostHistoryTypeId = 5) AS LastBodyEditDate
+    FROM
+        Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN Comments C ON P.Id = C.PostId
+    LEFT JOIN (
+        SELECT DISTINCT P_sub.Id, UNNEST(string_to_array(substring(P_sub.Tags, 2, length(P_sub.Tags)-2), '><')) AS TagName
+        FROM Posts P_sub
+        WHERE P_sub.Tags IS NOT NULL
+    ) AS PostTags ON P.Id = PostTags.Id
+    LEFT JOIN Tags T ON PostTags.TagName = T.TagName
+    WHERE P.PostTypeId IN (1, 2) -- Questions and Answers
+    GROUP BY
+        P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.LastActivityDate, P.Score, P.ViewCount, P.FavoriteCount
+),
+TagPerformanceMetrics AS (
+    SELECT
+        TagName_UNNEST AS TagName,
+        COUNT(DISTINCT P.Id) AS TotalTaggedPosts,
+        AVG(P.Score) AS AverageScoreForTag,
+        SUM(P.ViewCount) AS TotalViewsForTag,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsWithTag,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersWithTag
+    FROM
+        Posts P,
+        UNNEST(string_to_array(substring(P.Tags, 2, length(P.Tags)-2), '><')) AS TagName_UNNEST
+    WHERE P.Tags IS NOT NULL AND P.PostTypeId IN (1, 2)
+    GROUP BY
+        TagName_UNNEST
+),
+BasePostDetails AS (
+    SELECT
+        PEM.PostId,
+        PEM.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.Title,
+        P.Body,
+        P.CreationDate AS PostCreationDate,
+        PEM.LastActivityDate AS PostLastActivityDate,
+        P.Score AS PostScore,
+        PEM.ViewCount AS PostViewCount,
+        PEM.FavoriteCount AS PostFavoriteCount,
+        PEM.TotalEdits,
+        PEM.TotalCommentsOnPost,
+        PEM.UpVotesOnPost,
+        PEM.DownVotesOnPost,
+        UAS.UserId AS OwnerUserId,
+        UAS.DisplayName AS OwnerDisplayName,
+        UAS.Reputation AS OwnerReputation,
+        COALESCE(ELU.DisplayName, 'Community') AS LastEditorDisplayName,
+        COALESCE(ELU.Reputation, 0) AS LastEditorReputation,
+        TPM.AverageScoreForTag,
+        TPM.TotalTaggedPosts,
+        ARRAY_TO_STRING(PEM.AssociatedTags, ', ') AS TagsList,
+        -- Correlated subquery for new comments after last edit
+        (SELECT COUNT(DISTINCT C_sub.Id) FROM Comments C_sub WHERE C_sub.PostId = P.Id AND C_sub.CreationDate > P.LastEditDate) AS NewCommentsAfterLastEdit,
+        CASE
+            WHEN P.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN P.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            ELSE 'Active'
+        END AS PostStatus,
+        LAG(P.Score, 1, 0) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS PreviousPostScoreByOwner,
+        DENSE_RANK() OVER (ORDER BY PEM.Score DESC, PEM.ViewCount DESC, PEM.TotalEdits DESC) AS GlobalPostPopularityRank,
+        (EXTRACT(EPOCH FROM (NOW() - P.CreationDate)) / 3600 / 24) AS DaysSincePostCreation, -- Days since creation
+        CASE
+            WHEN P.Body ILIKE '%<sql>%' OR P.Body ILIKE '%<query>%' THEN 'ContainsSQLQueryKeywords'
+            WHEN P.Body ILIKE '%<python>%' OR P.Body ILIKE '%<pandas>%' THEN 'ContainsPythonKeywords'
+            WHEN P.Body ILIKE '%<javascript>%' OR P.Body ILIKE '%<node.js>%' THEN 'ContainsJSKeywords'
+            ELSE 'OtherContent'
+        END AS ContentKeywordCategory,
+        (P.Id = Q_Parent.AcceptedAnswerId AND P.PostTypeId = 2) AS IsAcceptedAnswerForQuestion, -- Check if this post is an accepted answer to its parent question
+        COALESCE(Q_Parent.Title, AA_Post.Title) AS RelatedPostTitle, -- Title of parent question (for answers) or accepted answer (for questions)
+        -- Correlated subqueries for linked/duplicate posts
+        (SELECT COUNT(PL_sub.Id) FROM PostLinks PL_sub WHERE PL_sub.PostId = P.Id AND PL_sub.LinkTypeId = 1) AS LinkedPostsCount,
+        (SELECT COUNT(PL_sub.Id) FROM PostLinks PL_sub WHERE PL_sub.PostId = P.Id AND PL_sub.LinkTypeId = 3) AS DuplicatePostsCount,
+        (SELECT MAX(PH_latest.CreationDate) FROM PostHistory PH_latest WHERE PH_latest.PostId = P.Id) AS LatestHistoryEventDate,
+        (SELECT MIN(PH_first.CreationDate) FROM PostHistory PH_first WHERE PH_first.PostId = P.Id AND PH_first.PostHistoryTypeId IN (1,2,3)) AS InitialContentDate
+    FROM
+        PostEngagementMetrics PEM
+    INNER JOIN
+        Posts P ON PEM.PostId = P.Id
+    INNER JOIN
+        PostTypes PT ON PEM.PostTypeId = PT.Id
+    LEFT JOIN
+        UserActivitySummary UAS ON PEM.OwnerUserId = UAS.UserId
+    LEFT JOIN
+        Users ELU ON P.LastEditorUserId = ELU.Id -- Last Editor User
+    LEFT JOIN
+        TagPerformanceMetrics TPM ON PEM.AssociatedTags[1] = TPM.TagName -- Use the first tag for simplification
+    LEFT JOIN
+        Posts Q_Parent ON P.ParentId = Q_Parent.Id AND P.PostTypeId = 2 -- Parent question for answers
+    LEFT JOIN
+        Posts AA_Post ON P.AcceptedAnswerId = AA_Post.Id AND P.PostTypeId = 1 -- Accepted answer post for questions
+    WHERE
+        P.OwnerUserId IS NOT NULL
+        AND P.CreationDate >= '2020-01-01'
+        AND P.LastActivityDate >= '2023-01-01' -- Focus on more recent activity
+        AND NOT EXISTS (
+            SELECT 1
+            FROM PostHistory PH_closed
+            WHERE PH_closed.PostId = P.Id AND PH_closed.PostHistoryTypeId = 10 AND PH_closed.CreationDate > '2023-01-01' -- Exclude recently closed posts
+        )
+)
+-- Main query combining two distinct sets of highly engaged posts using UNION ALL
+SELECT
+    'HighViewAndEdits' AS Category,
+    BPD.*,
+    (SELECT COUNT(V_flag.Id) FROM Votes V_flag WHERE V_flag.PostId = BPD.PostId AND V_flag.VoteTypeId = 4) AS OffensiveVotesCount -- Correlated subquery for a specific vote type
+FROM
+    BasePostDetails BPD
+WHERE
+    BPD.PostViewCount > 50000
+    AND BPD.TotalEdits > 5
+    AND BPD.ContentKeywordCategory IN ('ContainsSQLQueryKeywords', 'ContainsPythonKeywords')
+    AND (
+        SELECT COUNT(DISTINCT U_voter.Id)
+        FROM Votes V_voter
+        JOIN Users U_voter ON V_voter.UserId = U_voter.Id
+        WHERE V_voter.PostId = BPD.PostId AND V_voter.VoteTypeId = 2 AND U_voter.Reputation > 1000
+    ) > 10 -- More than 10 upvotes from high-reputation users
+    AND (BPD.LastBodyEditDate IS NOT NULL AND BPD.LastBodyEditDate > (BPD.PostCreationDate + INTERVAL '1 month')) -- Edited at least a month after creation
+    AND (BPD.PostScore * BPD.TotalCommentsOnPost) > 1000 -- Complex calculation in predicate
+    AND BPD.OwnerReputation IS NOT NULL AND BPD.OwnerReputation > 10000 -- Only highly reputable owners
+    AND BPD.TagsList LIKE '%sql%'
+    AND BPD.PostTypeName = 'Question'
+UNION ALL
+SELECT
+    'HighScoreAndRecentComments' AS Category,
+    BPD.*,
+    (SELECT COUNT(V_flag.Id) FROM Votes V_flag WHERE V_flag.PostId = BPD.PostId AND V_flag.VoteTypeId = 4) AS OffensiveVotesCount
+FROM
+    BasePostDetails BPD
+WHERE
+    BPD.PostScore > 200
+    AND BPD.TotalCommentsOnPost > 15
+    AND BPD.NewCommentsAfterLastEdit > 0 -- Has comments after its last edit
+    AND BPD.DaysSincePostCreation < 365 -- Relatively recent posts (within 1 year)
+    AND BPD.GlobalPostPopularityRank <= 1000 -- Top 1000 popular posts
+    AND BPD.IsAcceptedAnswerForQuestion = TRUE -- Only accepted answers
+    AND BPD.TagsList ILIKE '%optimization%'
+    AND (BPD.PostLastActivityDate IS NOT NULL AND BPD.PostLastActivityDate > BPD.LatestHistoryEventDate) -- Last activity is more recent than any history event, implies new comments/votes.
+    AND EXISTS (
+        SELECT 1
+        FROM PostLinks PL_dup
+        WHERE PL_dup.RelatedPostId = BPD.PostId AND PL_dup.LinkTypeId = 3
+    ) -- Is a duplicate of another post
+ORDER BY
+    Category DESC, GlobalPostPopularityRank ASC, PostScore DESC
+LIMIT 2000;

@@ -1,0 +1,106 @@
+-- {"query": "9038.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2013, "output_tokens": 3621} 
+
+WITH
+-- gather per‐question stats (tags, comments, views, score)
+QuestionInfo AS (
+    SELECT
+        q.Id                   AS QuestionId,
+        q.Title,
+        array_length(
+          string_to_array(substring(q.Tags,2,length(q.Tags)-2), '><')
+        ,1)                    AS TagCount,
+        COALESCE(q.ViewCount,0) AS ViewCount,
+        COALESCE(q.Score,0)     AS Score,
+        COUNT(DISTINCT c.UserId) AS DistinctCommenters,
+        MAX(c.Score)            AS MaxCommentScore
+    FROM Posts q
+    LEFT JOIN Comments c
+      ON c.PostId = q.Id
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.Tags, q.ViewCount, q.Score
+),
+-- rank answers per question by score/date
+AnswerRanks AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        a.Id       AS AnswerId,
+        a.Score,
+        ROW_NUMBER() OVER (
+          PARTITION BY a.ParentId
+          ORDER BY a.Score DESC, a.CreationDate
+        )         AS AnswerRank
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+-- collect top‐3 answers into a comma‐delimited list
+TopAnswers AS (
+    SELECT
+        ar.QuestionId,
+        STRING_AGG(ar.AnswerId::text || ':' || COALESCE(u.DisplayName,'<anon>'), ',')
+          AS TopAnswersList
+    FROM AnswerRanks ar
+    LEFT JOIN Users u
+      ON u.Id = ar.OwnerUserId
+    WHERE ar.AnswerRank <= 3
+    GROUP BY ar.QuestionId
+),
+-- correlated subquery to count favorites per question
+FavoriteStats AS (
+    SELECT
+        p.Id AS QuestionId,
+        (
+          SELECT COUNT(*)
+          FROM Votes v
+          WHERE v.PostId = p.Id
+            AND v.VoteTypeId = 5
+        ) AS FavoriteCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+)
+-- final union: rich question‐level metrics + fallback tag info
+SELECT
+    qi.QuestionId,
+    qi.Title,
+    qi.TagCount,
+    qi.ViewCount,
+    qi.Score,
+    qi.DistinctCommenters,
+    qi.MaxCommentScore,
+    ta.TopAnswersList,
+    fs.FavoriteCount,
+    CASE
+      WHEN qi.Score > 50
+        AND qi.ViewCount / NULLIF(qi.Score,0) > 100 THEN 'High ROI'
+      WHEN qi.Score BETWEEN 10 AND 50       THEN 'Medium Score'
+      ELSE 'Low Engagement'
+    END                                               AS EngagementCategory,
+    UPPER(SUBSTRING(qi.Title,1,10)) || '...'           AS TitlePreview,
+    qi.ViewCount * qi.Score::numeric / NULLIF(qi.TagCount,0)
+                                                      AS ViewScoreRatio
+FROM QuestionInfo qi
+LEFT JOIN TopAnswers ta
+  ON ta.QuestionId = qi.QuestionId
+LEFT JOIN FavoriteStats fs
+  ON fs.QuestionId = qi.QuestionId
+WHERE qi.DistinctCommenters
+      > (SELECT AVG(DistinctCommenters) FROM QuestionInfo)
+
+UNION ALL
+
+SELECT
+    t.Id              AS QuestionId,
+    t.TagName         AS Title,
+    t.Count           AS TagCount,
+    0                 AS ViewCount,
+    0                 AS Score,
+    0                 AS DistinctCommenters,
+    NULL              AS MaxCommentScore,
+    NULL              AS TopAnswersList,
+    0                 AS FavoriteCount,
+    'TagInfo'         AS EngagementCategory,
+    SUBSTRING(t.TagName,1,10) AS TitlePreview,
+    NULL              AS ViewScoreRatio
+FROM Tags t
+WHERE t.IsRequired = TRUE
+
+ORDER BY 1;

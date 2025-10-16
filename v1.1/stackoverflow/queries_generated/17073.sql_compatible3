@@ -1,0 +1,193 @@
+WITH user_activity AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS AvgPostScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) FILTER (WHERE p.Score > 0) AS MedianPositiveScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), ', ') FILTER (WHERE p.Tags IS NOT NULL) AS AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '2' YEAR)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location
+),
+recursive_comment_chains AS (
+    WITH RECURSIVE comment_tree AS (
+        SELECT 
+            c.Id,
+            c.PostId,
+            c.UserId,
+            c.CreationDate,
+            1 AS depth,
+            CAST(c.Id AS VARCHAR) AS path
+        FROM Comments c
+        WHERE c.UserId IN (SELECT Id FROM Users WHERE Reputation > 10000)
+        
+        UNION ALL
+        
+        SELECT 
+            c2.Id,
+            c2.PostId,
+            c2.UserId,
+            c2.CreationDate,
+            ct.depth + 1,
+            ct.path || '->' || CAST(c2.Id AS VARCHAR)
+        FROM Comments c2
+        JOIN comment_tree ct ON c2.PostId = ct.PostId
+        WHERE c2.CreationDate > ct.CreationDate
+          AND ct.depth < 5
+          AND c2.UserId != ct.UserId
+    )
+    SELECT 
+        PostId,
+        MAX(depth) AS MaxDepth,
+        COUNT(DISTINCT UserId) AS UniqueCommenters
+    FROM comment_tree
+    GROUP BY PostId
+),
+badge_patterns AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        ARRAY_AGG(b.Name ORDER BY b.Date DESC) FILTER (WHERE b.Class = 1) AS GoldBadgeNames,
+        LAG(badges_in_month, 1, 0) OVER (PARTITION BY b.UserId ORDER BY month_start) AS PrevMonthBadges,
+        DENSE_RANK() OVER (ORDER BY COUNT(*) FILTER (WHERE b.Class = 1) DESC) AS GoldBadgeRank,
+        month_start,
+        badges_in_month
+    FROM (
+        SELECT b.*,
+               DATE_TRUNC('month', b.Date) AS month_start,
+               COUNT(*) OVER (PARTITION BY b.UserId, DATE_TRUNC('month', b.Date)) AS badges_in_month
+        FROM Badges b
+    ) b
+    GROUP BY b.UserId, month_start, badges_in_month
+),
+complex_post_analysis AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        CASE 
+            WHEN p.Score > 100 AND p.ViewCount > 10000 THEN 'Viral'
+            WHEN p.Score > 50 AND p.ViewCount > 5000 THEN 'Popular'
+            WHEN p.Score < 0 THEN 'Controversial'
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            ELSE 'Regular'
+        END AS PostCategory,
+        COALESCE(p.AnswerCount, 0) * 1.0 / NULLIF(p.ViewCount, 0) AS AnswerRate,
+        (CHAR_LENGTH(p.Body) - CHAR_LENGTH(REPLACE(p.Body, '<code>', ''))) AS CodeBlocks,
+        SUBSTRING(p.Body FROM '<code>(.*?)</code>') AS FirstCodeSnippet,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS UserPostRank,
+        FIRST_VALUE(p.Title) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS UserFirstPostTitle,
+        EXISTS (
+            SELECT 1 
+            FROM PostHistory ph 
+            WHERE ph.PostId = p.Id 
+              AND ph.PostHistoryTypeId IN (12, 13)
+        ) AS WasDeleted,
+        (
+            SELECT COUNT(DISTINCT ph2.UserId) 
+            FROM PostHistory ph2 
+            WHERE ph2.PostId = p.Id 
+              AND ph2.PostHistoryTypeId IN (4, 5, 6)
+        ) AS EditorCount
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '1' YEAR)
+)
+SELECT
+    ua.Id,
+    ua.DisplayName,
+    ua.Reputation,
+    (UPPER(SUBSTRING(ua.Location FROM 1 FOR 3)) || COALESCE('-' || LOWER(SUBSTRING(ua.Location FROM '[A-Za-z]+$')), '')) AS LocationCode,
+    ua.PostCount,
+    ua.QuestionCount + COALESCE(ua.AnswerCount, 0) AS TotalQA,
+    ROUND(CAST(ua.AvgPostScore AS NUMERIC), 2) AS AvgScore,
+    ua.MedianPositiveScore,
+    CASE 
+        WHEN ua.AllTags LIKE '%javascript%' OR ua.AllTags LIKE '%python%' THEN 'Mainstream Developer'
+        WHEN ua.AllTags LIKE '%haskell%' OR ua.AllTags LIKE '%rust%' THEN 'Systems/FP Developer'
+        WHEN ua.AllTags IS NULL THEN 'Lurker'
+        ELSE 'Generalist'
+    END AS DeveloperType,
+    bp.GoldBadges,
+    bp.SilverBadges,
+    bp.BronzeBadges,
+    CASE 
+        WHEN CARDINALITY(bp.GoldBadgeNames) IS NULL OR CARDINALITY(bp.GoldBadgeNames)=0 THEN NULL
+        ELSE (
+            SELECT STRING_AGG(x, ', ')
+            FROM (
+                SELECT UNNEST(bp.GoldBadgeNames) AS x
+                LIMIT 3
+            ) t
+        )
+    END AS TopGoldBadges,
+    bp.GoldBadgeRank,
+    cpa.PostCategory,
+    COUNT(cpa.Id) AS PostsInCategory,
+    CAST(AVG(cpa.AnswerRate) AS NUMERIC(5,4)) AS AvgAnswerRate,
+    SUM(cpa.CodeBlocks) AS TotalCodeBlocks,
+    MAX(cpa.EditorCount) AS MaxEditors,
+    PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY cpa.Score) AS Score75thPercentile,
+    (
+        SELECT COUNT(*) 
+        FROM Votes v 
+        WHERE v.UserId = ua.Id 
+          AND v.VoteTypeId = 2
+          AND v.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '30' DAY)
+    ) AS RecentUpvotes,
+    COALESCE(rcc.MaxDepth, 0) AS MaxCommentDepth,
+    COALESCE(rcc.UniqueCommenters, 0) AS UniqueCommenters,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 
+            FROM PostLinks pl 
+            WHERE pl.PostId = cpa.Id 
+              AND pl.LinkTypeId = 3
+        ) THEN 'Has Duplicates'
+        ELSE 'No Duplicates'
+    END AS DuplicateStatus,
+    COALESCE(
+        (
+            SELECT STRING_AGG(DISTINCT t.TagName, ' | ' ORDER BY t.TagName)
+            FROM Tags t
+            WHERE t.Count > 1000
+              AND EXISTS (
+                  SELECT 1 
+                  FROM Posts p2 
+                  WHERE p2.OwnerUserId = ua.Id 
+                    AND p2.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+              )
+        ), 
+        'No Popular Tags'
+    ) AS PopularTagsUsed
+FROM user_activity ua
+LEFT JOIN badge_patterns bp ON ua.Id = bp.UserId
+LEFT JOIN complex_post_analysis cpa ON ua.Id = cpa.OwnerUserId
+LEFT JOIN recursive_comment_chains rcc ON cpa.Id = rcc.PostId
+WHERE ua.Reputation > 100
+  AND (COALESCE(bp.GoldBadges, 0) > 0 OR COALESCE(bp.SilverBadges, 0) > 5 OR ua.PostCount > 10)
+  AND NOT (ua.Location IS NULL AND ua.PostCount = 0)
+GROUP BY 
+    ua.Id, ua.DisplayName, ua.Reputation, ua.Location, ua.PostCount, 
+    ua.QuestionCount, ua.AnswerCount, ua.AvgPostScore, 
+    ua.MedianPositiveScore, ua.AllTags,
+    bp.UserId, bp.GoldBadges, bp.SilverBadges, bp.BronzeBadges, 
+    bp.GoldBadgeNames, bp.GoldBadgeRank,
+    cpa.PostCategory, rcc.MaxDepth, rcc.UniqueCommenters,
+    LocationCode, DeveloperType, TopGoldBadges, Score75thPercentile, PopularTagsUsed
+HAVING COUNT(cpa.Id) > 0 OR SUM(COALESCE(bp.GoldBadges, 0)) > 2
+ORDER BY 
+    ua.Reputation DESC,
+    bp.GoldBadgeRank ASC,
+    COUNT(cpa.Id) DESC
+LIMIT 100;

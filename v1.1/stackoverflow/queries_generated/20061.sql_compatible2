@@ -1,0 +1,77 @@
+WITH UserSegments AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        CASE
+            WHEN u.Reputation > 100000 THEN 'Top'
+            WHEN u.Reputation > 50000 THEN 'High'
+            ELSE 'Normal'
+        END AS Segment
+    FROM "User" u
+    JOIN Badges b ON b.UserId = u.Id
+    WHERE b.Name IN ('Great Answer', 'Famous Question', 'Strunk & White') AND b.Class = 1
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(b.Id) > 2
+)
+SELECT
+    us.Id,
+    us.DisplayName,
+    us.Segment,
+    us.Reputation,
+    COUNT(DISTINCT ua.PostId) AS TotalPosts,
+    AVG(ua.Score) AS AvgPostScore,
+    MAX(ua.TenureInDays) AS MaxTenureDays,
+    SUM(CASE WHEN ua.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+    SUM(CASE WHEN ua.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+    CAST(SUM(CASE WHEN aa.AnswerId = aa.AcceptedAnswerId THEN 1 ELSE 0 END) AS NUMERIC) / NULLIF(SUM(CASE WHEN ua.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS AcceptanceRate,
+    AVG(aa.SecondsToAnswer) AS AvgSecondsToAnswer,
+    CONCAT(
+        SUBSTRING(MAX(aa.QuestionTags) FROM 2 FOR 15),
+        '... (',
+        CAST(LENGTH(MAX(aa.QuestionTags)) AS VARCHAR),
+        ' chars)'
+    ) AS SampleTagString,
+    (
+        SELECT pht.Name
+        FROM PostHistory ph
+        JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+        WHERE ph.PostId = (
+            SELECT PostId
+            FROM UserActivity
+            WHERE UserId = us.Id AND UserPostRank = 1
+            LIMIT 1
+        )
+        ORDER BY ph.CreationDate DESC
+        FETCH FIRST 1 ROW ONLY
+    ) AS LastActivityOnBestPost,
+    CASE
+        WHEN us.Reputation > 100000 AND AVG(aa.SecondsToAnswer) < 3600 THEN 'Elite & Fast'
+        WHEN us.Reputation > 50000 OR (SELECT COUNT(*) FROM Badges b WHERE b.UserId = us.Id AND b.Class = 1) > 5 THEN 'Expert'
+        ELSE 'Experienced'
+    END AS UserLevel
+FROM UserSegments us
+LEFT JOIN UserActivity ua ON us.Id = ua.UserId
+LEFT JOIN AnswerAnalysis aa ON ua.UserId = aa.OwnerUserId AND ua.PostId = aa.AnswerId
+WHERE
+    ua.PostCreationDate BETWEEN TIMESTAMP '2020-01-01' AND TIMESTAMP '2023-12-31'
+    AND COALESCE(ua.SecondsSincePreviousEdit, 999999) > 600
+    AND EXISTS (
+        SELECT 1
+        FROM PostLinks pl
+        WHERE pl.PostId = ua.PostId AND pl.LinkTypeId = 1
+    )
+GROUP BY
+    us.Id,
+    us.DisplayName,
+    us.Segment,
+    us.Reputation
+HAVING
+    AVG(ua.Score) > 5
+    AND SUM(CASE WHEN ua.PostTypeId = 2 THEN 1 ELSE 0 END) > 10
+ORDER BY
+    us.Reputation DESC,
+    AvgPostScore DESC,
+    AcceptanceRate DESC
+LIMIT 200;

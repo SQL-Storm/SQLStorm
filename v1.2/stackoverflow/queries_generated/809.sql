@@ -1,0 +1,168 @@
+-- {"query": "809.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1676} 
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(p.Score, 0) as PostScore,
+        row_number() over (partition by t.Id order by p.Score desc nulls last) as rn
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId
+    where t.TagName is not null
+), 
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+QuestionAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerOwnerId,
+        u.DisplayName as AnswerOwnerName,
+        row_number() over (partition by q.Id order by a.Score desc nulls last, a.CreationDate asc) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1
+),
+UserReputationStats as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        coalesce(ubc_gold.BadgeCount,0) as GoldBadges,
+        coalesce(ubc_silver.BadgeCount,0) as SilverBadges,
+        coalesce(ubc_bronze.BadgeCount,0) as BronzeBadges,
+        max(p.Score) filter (where p.OwnerUserId = u.Id) as MaxPostScore,
+        avg(p.Score) filter (where p.OwnerUserId = u.Id) as AvgPostScore,
+        sum(v.VoteTypeId = 2::int) filter (where v.UserId = u.Id) as UpVotesCast,
+        sum(v.VoteTypeId = 3::int) filter (where v.UserId = u.Id) as DownVotesCast
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join UserBadgeCounts ubc_gold on ubc_gold.UserId = u.Id and ubc_gold.Class = 1
+    left join UserBadgeCounts ubc_silver on ubc_silver.UserId = u.Id and ubc_silver.Class = 2
+    left join UserBadgeCounts ubc_bronze on ubc_bronze.UserId = u.Id and ubc_bronze.Class = 3
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, ubc_gold.BadgeCount, ubc_silver.BadgeCount, ubc_bronze.BadgeCount
+),
+HighScorePosts as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        u.DisplayName as OwnerName,
+        rank() over (order by p.Score desc, p.ViewCount desc) as ScoreRank
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1 and p.Score is not null
+),
+DuplicateQuestions as (
+    select
+        pl.PostId as DuplicatePostId,
+        pl.RelatedPostId as OriginalPostId,
+        p1.Title as DuplicateTitle,
+        p2.Title as OriginalTitle,
+        pl.CreationDate
+    from PostLinks pl
+    inner join Posts p1 on p1.Id = pl.PostId and p1.PostTypeId = 1
+    inner join Posts p2 on p2.Id = pl.RelatedPostId and p2.PostTypeId = 1
+    where pl.LinkTypeId = 3
+),
+TopCommenters as (
+    select
+        c.UserId,
+        u.DisplayName,
+        count(*) as CommentCount,
+        avg(length(c.Text)) as AvgCommentLength
+    from Comments c
+    join Users u on u.Id = c.UserId
+    group by c.UserId, u.DisplayName
+    having count(*) > 50
+),
+RankedQuestionsWithAnswers as (
+    select
+        qa.QuestionId,
+        qa.Title,
+        qa.CreationDate,
+        qa.AnswerId,
+        qa.AnswerScore,
+        qa.AnswerOwnerId,
+        qa.AnswerOwnerName,
+        row_number() over (partition by qa.QuestionId order by qa.AnswerScore desc nulls last) as AnswerRank
+    from QuestionAnswers qa
+),
+FinalOutput as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        u.DisplayName as QuestionOwner,
+        coalesce(qa.AnswerCount, 0) as AnswerCount,
+        max(a.AnswerScore) as TopAnswerScore,
+        max(a.AnswerOwnerName) filter (where a.AnswerScore = max(a.AnswerScore) over (partition by q.Id)) as TopAnswerOwner,
+        ts.GoldBadges,
+        ts.SilverBadges,
+        ts.BronzeBadges,
+        ts.Reputation,
+        case 
+            when q.ClosedDate is not null then 'Closed'
+            when q.AcceptedAnswerId is not null then 'Answered'
+            else 'Open'
+        end as QuestionStatus,
+        array_to_string(array_agg(distinct t.TagName), ', ') as Tags
+    from Posts q
+    left join Users u on u.Id = q.OwnerUserId
+    left join (
+        select ParentId, count(*) as AnswerCount 
+        from Posts 
+        where PostTypeId = 2 
+        group by ParentId
+    ) qa on qa.ParentId = q.Id
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join UserReputationStats ts on ts.Id = q.OwnerUserId
+    left join Tags t on position(concat('<', t.TagName, '>') in coalesce(q.Tags, '')) > 0
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, u.DisplayName, qa.AnswerCount, ts.GoldBadges, ts.SilverBadges, ts.BronzeBadges, ts.Reputation, q.ClosedDate, q.AcceptedAnswerId
+    having max(a.Score) filter (where a.PostTypeId = 2) > 5 or max(a.Score) is null
+)
+select
+    fo.QuestionId,
+    fo.Title,
+    fo.CreationDate,
+    fo.QuestionScore,
+    fo.QuestionViews,
+    fo.QuestionOwner,
+    fo.AnswerCount,
+    fo.TopAnswerScore,
+    fo.TopAnswerOwner,
+    fo.GoldBadges,
+    fo.SilverBadges,
+    fo.BronzeBadges,
+    fo.Reputation,
+    fo.QuestionStatus,
+    fo.Tags,
+    coalesce(dq.DuplicatePostId, -1) as DuplicatePostId,
+    coalesce(dq.OriginalPostId, -1) as OriginalPostId,
+    dq.CreationDate as DuplicateLinkDate,
+    tc.CommentCount as TopCommenterCommentCount,
+    tc.AvgCommentLength as TopCommenterAvgCommentLength
+from FinalOutput fo
+left join DuplicateQuestions dq on dq.OriginalPostId = fo.QuestionId
+left join TopCommenters tc on tc.UserId = fo.QuestionOwner::int
+order by fo.QuestionScore desc nulls last, fo.QuestionViews desc nulls last
+limit 100;

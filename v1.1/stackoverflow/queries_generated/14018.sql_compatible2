@@ -1,0 +1,182 @@
+WITH cte AS (
+    SELECT 
+        p.Id, 
+        p.PostTypeId, 
+        p.AcceptedAnswerId, 
+        p.ParentId, 
+        p.CreationDate, 
+        p.Score, 
+        p.ViewCount, 
+        p.OwnerUserId, 
+        p.LastEditorUserId, 
+        p.LastEditDate, 
+        p.LastActivityDate, 
+        p.AnswerCount, 
+        p.CommentCount, 
+        p.FavoriteCount, 
+        p.ClosedDate, 
+        p.CommunityOwnedDate, 
+        COALESCE(u.DisplayName, p.OwnerDisplayName) AS OwnerDisplayName, 
+        COALESCE(u2.DisplayName, p.LastEditorDisplayName) AS LastEditorDisplayName,
+        ARRAY_AGG(DISTINCT t.TagName) AS Tags,
+        MAX(
+            CASE 
+                WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN (
+                    SELECT a.Score 
+                    FROM Posts a 
+                    WHERE a.Id = p.AcceptedAnswerId
+                )
+                ELSE NULL 
+            END
+        ) AS AcceptedAnswerScore,
+        MAX(
+            CASE 
+                WHEN p.PostTypeId = 1 THEN (
+                    SELECT COUNT(*) 
+                    FROM Votes v 
+                    WHERE v.PostId = p.Id AND v.VoteTypeId = 2
+                )
+                ELSE NULL
+            END
+        ) AS UpVoteCount,
+        MAX(
+            CASE 
+                WHEN p.PostTypeId = 1 THEN (
+                    SELECT COUNT(*)
+                    FROM Votes v
+                    WHERE v.PostId = p.Id AND v.VoteTypeId = 3  
+                )
+                ELSE NULL
+            END
+        ) AS DownVoteCount
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Users u2 ON p.LastEditorUserId = u2.Id
+    LEFT JOIN Tags t ON EXISTS (
+        SELECT 1
+        FROM UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS ta(tn)
+        WHERE tn = t.TagName
+    )
+    GROUP BY 
+        p.Id, 
+        p.PostTypeId, 
+        p.AcceptedAnswerId, 
+        p.ParentId, 
+        p.CreationDate, 
+        p.Score, 
+        p.ViewCount, 
+        p.OwnerUserId, 
+        p.LastEditorUserId, 
+        p.LastEditDate, 
+        p.LastActivityDate, 
+        p.AnswerCount, 
+        p.CommentCount, 
+        p.FavoriteCount, 
+        p.ClosedDate, 
+        p.CommunityOwnedDate, 
+        u.DisplayName, 
+        u2.DisplayName, 
+        p.OwnerDisplayName,
+        p.LastEditorDisplayName
+),
+post_links AS (
+    SELECT 
+        pl.Id, 
+        pl.CreationDate, 
+        pl.PostId, 
+        pl.RelatedPostId, 
+        lt.Name AS LinkType
+    FROM PostLinks pl
+    LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+),
+badges AS (
+    SELECT 
+        b.Id, 
+        b.UserId, 
+        b.Name, 
+        b.Date, 
+        b.Class, 
+        b.TagBased
+    FROM Badges b
+),
+comments AS (
+    SELECT 
+        c.Id, 
+        c.PostId, 
+        c.Score, 
+        c.Text, 
+        c.CreationDate, 
+        c.UserDisplayName, 
+        c.UserId, 
+        c.ContentLicense
+    FROM Comments c
+),
+post_history AS (
+    SELECT 
+        ph.Id, 
+        ph.PostHistoryTypeId, 
+        ph.PostId, 
+        ph.RevisionGUID, 
+        ph.CreationDate, 
+        ph.UserId, 
+        ph.UserDisplayName, 
+        ph.Comment, 
+        ph.Text
+    FROM PostHistory ph
+)
+SELECT 
+    cte.Id, 
+    cte.PostTypeId, 
+    cte.AcceptedAnswerId, 
+    cte.ParentId, 
+    cte.CreationDate, 
+    cte.Score, 
+    cte.ViewCount, 
+    cte.OwnerUserId, 
+    cte.LastEditorUserId, 
+    cte.LastEditDate, 
+    cte.LastActivityDate, 
+    cte.AnswerCount, 
+    cte.CommentCount, 
+    cte.FavoriteCount, 
+    cte.ClosedDate, 
+    cte.CommunityOwnedDate, 
+    cte.OwnerDisplayName, 
+    cte.LastEditorDisplayName, 
+    cte.Tags, 
+    cte.AcceptedAnswerScore, 
+    cte.UpVoteCount, 
+    cte.DownVoteCount, 
+    pl.Id AS PostLinkId, 
+    pl.CreationDate AS PostLinkCreationDate, 
+    pl.RelatedPostId, 
+    pl.LinkType, 
+    b.Id AS BadgeId, 
+    b.UserId AS BadgeUserId, 
+    b.Name AS BadgeName, 
+    b.Date AS BadgeDate, 
+    b.Class AS BadgeClass, 
+    b.TagBased AS BadgeTagBased, 
+    c.Id AS CommentId, 
+    c.PostId AS CommentPostId, 
+    c.Score AS CommentScore, 
+    c.Text AS CommentText, 
+    c.CreationDate AS CommentCreationDate, 
+    c.UserDisplayName AS CommentUserDisplayName, 
+    c.UserId AS CommentUserId, 
+    c.ContentLicense AS CommentContentLicense, 
+    ph.Id AS PostHistoryId, 
+    ph.PostHistoryTypeId, 
+    ph.PostId AS PostHistoryPostId, 
+    ph.RevisionGUID AS PostHistoryRevisionGUID, 
+    ph.CreationDate AS PostHistoryCreationDate, 
+    ph.UserId AS PostHistoryUserId, 
+    ph.UserDisplayName AS PostHistoryUserDisplayName, 
+    ph.Comment AS PostHistoryComment, 
+    ph.Text AS PostHistoryText
+FROM cte
+LEFT JOIN post_links pl ON cte.Id = pl.PostId
+LEFT JOIN badges b ON cte.OwnerUserId = b.UserId
+LEFT JOIN comments c ON cte.Id = c.PostId
+LEFT JOIN post_history ph ON cte.Id = ph.PostId
+ORDER BY cte.Id, pl.Id, b.Id, c.Id, ph.Id;

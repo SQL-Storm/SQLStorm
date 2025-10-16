@@ -1,0 +1,103 @@
+WITH UserBadgeSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 10 WHEN b.Class = 2 THEN 5 WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BadgeScore,
+        ROW_NUMBER() OVER (ORDER BY COUNT(b.Id) DESC, u.Reputation DESC) AS BadgeRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostVoteCounts AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId IN (2,3)) AS UpDownVotes,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS Status,
+        CASE WHEN p.Tags LIKE '%<sql>%' THEN 'SQL Tag' WHEN p.Tags LIKE '%<java>%' THEN 'Java Tag' ELSE 'Other' END AS TagCategory
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND EXISTS (SELECT 1 FROM Comments c WHERE c.PostId = p.Id AND c.Score > 5)
+),
+TopUsersPosts AS (
+    SELECT
+        ubs.UserId,
+        ubs.DisplayName,
+        ubs.Reputation,
+        ubs.BadgeScore,
+        pvc.PostId,
+        pvc.Score,
+        pvc.UpDownVotes,
+        pvc.TagCategory,
+        AVG(pvc.Score) OVER (PARTITION BY ubs.UserId) AS AvgPostScore,
+        RANK() OVER (PARTITION BY pvc.TagCategory ORDER BY pvc.UpDownVotes DESC) AS VoteRankByCategory
+    FROM UserBadgeSummary ubs
+    JOIN PostVoteCounts pvc ON ubs.UserId = pvc.OwnerUserId
+    WHERE ubs.BadgeRank <= 100
+      AND pvc.Status = 'Open'
+      AND pvc.ViewCount > 100
+),
+FinalRanking AS (
+    SELECT
+        tup.UserId,
+        tup.DisplayName,
+        tup.Reputation,
+        tup.BadgeScore,
+        tup.PostId,
+        tup.Score,
+        tup.UpDownVotes,
+        tup.TagCategory,
+        tup.AvgPostScore,
+        tup.VoteRankByCategory,
+        CASE WHEN tup.AvgPostScore > 10 THEN tup.Reputation * 1.2 ELSE tup.Reputation END AS AdjustedReputation,
+        CASE WHEN tup.TagCategory = 'SQL Tag' THEN tup.UpDownVotes * 1.1 ELSE tup.UpDownVotes END AS AdjustedVotes,
+        DENSE_RANK() OVER (ORDER BY CASE WHEN tup.AvgPostScore > 10 THEN tup.Reputation * 1.2 ELSE tup.Reputation END DESC,
+                                   CASE WHEN tup.TagCategory = 'SQL Tag' THEN tup.UpDownVotes * 1.1 ELSE tup.UpDownVotes END DESC) AS OverallRank
+    FROM TopUsersPosts tup
+),
+PostIdsPerUser AS (
+    SELECT
+        fr.UserId,
+        STRING_AGG(CAST(fr.PostId AS VARCHAR), ', ') AS PostIds,
+        MIN(fr.Score) AS dummy_score_for_grouping -- ensure deterministic aggregation if needed
+    FROM FinalRanking fr
+    GROUP BY fr.UserId
+)
+SELECT
+    fr.DisplayName,
+    fr.UserId,
+    fr.AdjustedReputation,
+    fr.AdjustedVotes,
+    fr.TagCategory,
+    fr.OverallRank,
+    ppu.PostIds,
+    CASE WHEN fr.VoteRankByCategory = 1 THEN 'Top in Category' ELSE 'Not Top' END AS CategoryStatus,
+    ed.EditCount
+FROM FinalRanking fr
+LEFT JOIN PostIdsPerUser ppu ON fr.UserId = ppu.UserId
+LEFT JOIN (
+    SELECT
+        ph.PostId,
+        COUNT(*) AS EditCount
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6)
+    GROUP BY ph.PostId
+) ed ON fr.PostId = ed.PostId
+WHERE fr.OverallRank <= 10
+GROUP BY
+    fr.DisplayName,
+    fr.UserId,
+    fr.AdjustedReputation,
+    fr.AdjustedVotes,
+    fr.TagCategory,
+    fr.OverallRank,
+    ppu.PostIds,
+    fr.VoteRankByCategory,
+    ed.EditCount
+ORDER BY fr.OverallRank
+LIMIT 10;

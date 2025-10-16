@@ -1,0 +1,94 @@
+WITH UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(p.Id) AS TotalPosts,
+        AVG(COALESCE(p.Score, 0)) AS AvgScore,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN COALESCE(p.ViewCount,0) ELSE 0 END) AS TotalQuestionViews,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.CreationDate DESC) AS PostRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id
+),
+TopTagsPerUser AS (
+    SELECT 
+        u.Id AS UserId,
+        t.TagName,
+        COUNT(*) AS TagCount,
+        RANK() OVER (PARTITION BY u.Id ORDER BY COUNT(*) DESC) AS TagRank
+    FROM Users u
+    INNER JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    CROSS JOIN (
+      SELECT regexp_split_to_table(substring(p.Tags FROM 2 FOR (char_length(p.Tags)-2)), '><') AS tag_name
+    ) tag_arr
+    INNER JOIN Tags t ON t.TagName = tag_arr.tag_name
+    GROUP BY u.Id, t.TagName
+    HAVING COUNT(*) > 1
+),
+UserBadges AS (
+    SELECT 
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        STRING_AGG(b.Name || ' (' || CASE WHEN b.Class = 1 THEN 'Gold' WHEN b.Class = 2 THEN 'Silver' ELSE 'Bronze' END || ')', ', ') AS BadgeList
+    FROM Badges b
+    WHERE b.TagBased = TRUE OR b.Class = 1
+    GROUP BY b.UserId
+),
+RecentActivity AS (
+    SELECT 
+        ph.UserId,
+        MAX(ph.CreationDate) AS LastEditDate,
+        COUNT(DISTINCT ph.PostId) AS EditedPosts
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6) AND ph.Comment IS NOT NULL
+    GROUP BY ph.UserId
+),
+CorrelatedSubqueryExample AS (
+    SELECT 
+        u.Id AS UserId,
+        (SELECT COUNT(v.Id) FROM Votes v WHERE v.PostId IN (SELECT p2.Id FROM Posts p2 WHERE p2.OwnerUserId = u.Id) AND v.VoteTypeId = 2) AS UpvotesReceived
+    FROM Users u
+)
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    ups.TotalPosts,
+    ups.AvgScore,
+    ups.TotalQuestionViews,
+    COALESCE(tt.TagName, 'No Tags') AS TopTag,
+    COALESCE(ub.TotalBadges, 0) AS TotalBadges,
+    ub.BadgeList,
+    ra.LastEditDate,
+    ra.EditedPosts,
+    cs.UpvotesReceived,
+    DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+FROM Users u
+LEFT JOIN UserPostStats ups ON u.Id = ups.UserId AND ups.PostRank = 1
+LEFT JOIN TopTagsPerUser tt ON u.Id = tt.UserId AND tt.TagRank = 1
+LEFT JOIN UserBadges ub ON u.Id = ub.UserId
+LEFT JOIN RecentActivity ra ON u.Id = ra.UserId
+LEFT JOIN CorrelatedSubqueryExample cs ON u.Id = cs.UserId
+WHERE u.Reputation > (SELECT AVG(u2.Reputation) FROM Users u2) * 2
+  AND (u.Location LIKE '%USA%' OR u.Location IS NULL)
+  AND EXISTS (SELECT 1 FROM Comments c WHERE c.UserId = u.Id AND c.Score > 5)
+
+UNION ALL
+
+SELECT 
+    'Community' AS DisplayName,
+    0 AS Reputation,
+    COUNT(p.Id) AS TotalPosts,
+    AVG(COALESCE(p.Score, 0)) AS AvgScore,
+    SUM(COALESCE(p.ViewCount,0)) AS TotalQuestionViews,
+    NULL AS TopTag,
+    0 AS TotalBadges,
+    NULL AS BadgeList,
+    MAX(ph.CreationDate) AS LastEditDate,
+    COUNT(DISTINCT ph.PostId) AS EditedPosts,
+    (SELECT COUNT(v.Id) FROM Votes v WHERE v.PostId IN (SELECT p2.Id FROM Posts p2 WHERE p2.OwnerUserId = -1) AND v.VoteTypeId = 2) AS UpvotesReceived,
+    NULL AS ReputationRank
+FROM Posts p
+LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+WHERE p.OwnerUserId = -1
+GROUP BY 1,2
+ORDER BY Reputation DESC
+LIMIT 10;

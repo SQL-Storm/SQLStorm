@@ -1,0 +1,106 @@
+WITH ActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(p.Id) AS PostCount,
+        SUM(p.Score) AS TotalScore,
+        MAX(p.LastActivityDate) AS LastActivityDate,
+        RANK() OVER (ORDER BY COUNT(p.Id) DESC) AS PostRank,
+        DENSE_RANK() OVER (ORDER BY SUM(p.Score) DESC) AS ScoreRank
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    WHERE
+        u.LastAccessDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY
+    GROUP BY
+        u.Id, u.Reputation, u.DisplayName
+),
+TagStatistics AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id) AS PostCount,
+        SUM(p.ViewCount) AS TotalViews,
+        AVG(p.Score) AS AverageScore,
+        PERCENT_RANK() OVER (ORDER BY COUNT(p.Id) DESC) AS PostCountPercentile,
+        CASE WHEN t.Count > 500 THEN 50 ELSE 5 END AS weight,
+        NTILE(10) OVER (ORDER BY SUM(p.ViewCount) DESC) AS ViewDecile
+    FROM
+        Tags t
+    JOIN
+        Posts p ON ('<' || t.TagName || '>') = ANY (string_to_array(p.Tags, '><'))
+    WHERE
+        p.PostTypeId = 1
+    GROUP BY
+        t.TagName, t.Count
+),
+UserBadges AS (
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM
+        Badges b
+    GROUP BY
+        b.UserId
+),
+UserTagsExpanded AS (
+    -- expand Tags from Users table for each active user
+    SELECT
+        au.UserId,
+        regexp_split_to_table(COALESCE(NULLIF(u.Tags, ''), ''), '><') AS value_text
+    FROM
+        ActiveUsers au
+    JOIN
+        Users u ON u.Id = au.UserId
+)
+SELECT
+    au.UserId,
+    au.DisplayName,
+    au.Reputation,
+    au.PostCount,
+    au.TotalScore,
+    au.LastActivityDate,
+    au.PostRank,
+    au.ScoreRank,
+    ub.BadgeCount,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    COALESCE(SUM(ts.PostCount), 0) AS TotalTagPosts,
+    COALESCE(SUM(ts.TotalViews), 0) AS TotalTagViews,
+    COALESCE(AVG(ts.AverageScore), 0) AS AvgTagScore,
+    COALESCE(MAX(ts.PostCountPercentile), 0) AS MaxPostCountPercentile,
+    COALESCE(MAX(ts.ViewDecile), 0) AS MaxViewDecile
+FROM
+    ActiveUsers au
+LEFT JOIN
+    UserBadges ub ON au.UserId = ub.UserId
+LEFT JOIN
+    TagStatistics ts ON ts.TagName IN (
+        SELECT DISTINCT '<' || TRIM(split_part(ut.value_text, '>', 1)) || '>'
+        FROM UserTagsExpanded ut
+        WHERE ut.UserId = au.UserId
+          AND (regexp_replace(split_part(ut.value_text, '>', 1), '[0-9]+', '', 'g') <> '')
+    )
+WHERE NOT (au.PostCount = 0 AND COALESCE(ub.BadgeCount, 0) = 0 AND au.Reputation < 100)
+GROUP BY
+    au.UserId,
+    au.DisplayName,
+    au.Reputation,
+    au.PostCount,
+    au.TotalScore,
+    au.LastActivityDate,
+    au.PostRank,
+    au.ScoreRank,
+    ub.BadgeCount,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges
+ORDER BY
+    au.ScoreRank, au.LastActivityDate DESC, au.UserId
+LIMIT
+    100;

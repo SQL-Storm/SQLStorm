@@ -1,0 +1,101 @@
+WITH QuestionStats AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.AcceptedAnswerId,
+        p.AnswerCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.FavoriteCount DESC, p.ViewCount DESC) AS rn
+    FROM Posts p
+    WHERE
+        p.PostTypeId = 1
+        AND p.DeletionDate IS NULL
+        AND p.ClosedDate IS NULL
+        AND p.AnswerCount > 0
+),
+UserBadgeCounts AS (
+    SELECT
+        UserId,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges
+    GROUP BY UserId
+),
+UserActivityUnion AS (
+    SELECT UserId, CreationDate, 'Answer' AS ActivityType FROM Posts WHERE PostTypeId = 2 AND UserId IS NOT NULL
+    UNION ALL
+    SELECT UserId, CreationDate, 'Comment' AS ActivityType FROM Comments WHERE UserId IS NOT NULL
+)
+SELECT
+    u.DisplayName AS UserName,
+    u.Reputation,
+    qs.Title AS TopQuestionTitle,
+    qs.Score AS QuestionScore,
+    REPLACE(SUBSTRING(qs.Tags FROM 2 FOR (CHAR_LENGTH(qs.Tags) - 2)), '><', ', ') AS FormattedTags,
+    (CAST(qs.FavoriteCount AS DECIMAL) / NULLIF(qs.ViewCount, 0)) * 1000 AS EngagementRatio,
+    ans.Score AS AcceptedAnswerScore,
+    COALESCE(ans_u.DisplayName, 'Deleted User') AS AnswererDisplayName,
+    COALESCE(ans_u.Reputation, -1) AS AnswererReputation,
+    EXTRACT(EPOCH FROM (ans.CreationDate - qs.CreationDate)) / 3600.0 AS HoursToAcceptedAnswer,
+    (SELECT MIN(uau.CreationDate) FROM UserActivityUnion uau WHERE uau.UserId = u.Id AND uau.CreationDate > qs.CreationDate) AS NextActivityDate,
+    DENSE_RANK() OVER (
+        PARTITION BY
+            CASE
+                WHEN u.Reputation > 100000 THEN 'Elite'
+                WHEN u.Reputation > 20000 THEN 'Veteran'
+                WHEN u.Reputation > 5000 THEN 'Established'
+                ELSE 'Member'
+            END
+        ORDER BY qs.Score DESC
+    ) AS RankInReputationBracket,
+    CONCAT('G:', COALESCE(ubc.GoldBadges, 0), ' S:', COALESCE(ubc.SilverBadges, 0), ' B:', COALESCE(ubc.BronzeBadges, 0)) AS UserBadges
+FROM Users u
+JOIN QuestionStats qs ON u.Id = qs.OwnerUserId
+LEFT JOIN Posts ans ON qs.AcceptedAnswerId = ans.Id
+LEFT JOIN Users ans_u ON ans.OwnerUserId = ans_u.Id
+LEFT JOIN UserBadgeCounts ubc ON u.Id = ubc.UserId
+WHERE
+    qs.rn = 1
+    AND u.Reputation > 1000
+    AND u.UpVotes > (u.DownVotes * 1.5)
+    AND qs.Score > (
+        SELECT AVG(p2.Score)
+        FROM Posts p2
+        WHERE p2.PostTypeId = 1
+          AND p2.DeletionDate IS NULL
+    )
+    AND ans.Id IS NOT NULL
+    AND ans.OwnerUserId IS DISTINCT FROM qs.OwnerUserId
+    AND qs.Title LIKE '%SQL%'
+GROUP BY
+    u.DisplayName,
+    u.Reputation,
+    qs.Title,
+    qs.Score,
+    qs.Tags,
+    qs.FavoriteCount,
+    qs.ViewCount,
+    ans.Score,
+    ans_u.DisplayName,
+    ans_u.Reputation,
+    ans.CreationDate,
+    qs.CreationDate,
+    u.Id,
+    qs.Id,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    qs.AcceptedAnswerId,
+    qs.rn,
+    u.UpVotes,
+    u.DownVotes
+ORDER BY
+    u.Reputation DESC,
+    qs.Score DESC
+LIMIT 500;

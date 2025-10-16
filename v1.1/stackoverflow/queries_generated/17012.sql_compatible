@@ -1,0 +1,160 @@
+WITH RECURSIVE user_hierarchy AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        CAST(u.Id AS varchar(1000)) AS path,
+        1 AS level,
+        u.CreationDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS global_rank
+    FROM Users u
+    WHERE u.Reputation > 50000
+    
+    UNION ALL
+    
+    SELECT 
+        u2.Id,
+        u2.DisplayName,
+        u2.Reputation,
+        uh.path || '->' || CAST(u2.Id AS varchar(1000)) AS path,
+        uh.level + 1 AS level,
+        u2.CreationDate,
+        ROW_NUMBER() OVER (ORDER BY u2.Reputation DESC) AS global_rank
+    FROM Users u2
+    INNER JOIN user_hierarchy uh ON u2.Id IN (
+        SELECT DISTINCT p.OwnerUserId 
+        FROM Posts p 
+        WHERE p.AcceptedAnswerId IN (
+            SELECT Id FROM Posts WHERE OwnerUserId = uh.Id
+        )
+    )
+    WHERE uh.level < 3 AND u2.Reputation > 10000
+),
+question_analytics AS (
+    SELECT 
+        p.Id,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        COALESCE(p.Tags, '') AS Tags,
+        STRING_AGG(DISTINCT t.TagName, ', ') FILTER (WHERE t.Count > 1000) OVER (
+            PARTITION BY p.OwnerUserId 
+            ORDER BY p.CreationDate 
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS popular_tags_used,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) OVER (
+            PARTITION BY EXTRACT(YEAR FROM p.CreationDate)
+        ) AS median_score_year,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS prev_score,
+        LEAD(p.ViewCount, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS next_views,
+        FIRST_VALUE(p.Title) OVER (
+            PARTITION BY p.OwnerUserId 
+            ORDER BY p.Score DESC 
+            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+        ) AS best_question_title,
+        DENSE_RANK() OVER (PARTITION BY DATE_TRUNC('month', p.CreationDate) ORDER BY p.Score DESC) AS monthly_rank
+    FROM Posts p
+    LEFT JOIN LATERAL (
+        SELECT UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS tag_name
+    ) AS tag_split ON TRUE
+    LEFT JOIN Tags t ON t.TagName = tag_split.tag_name
+    WHERE p.PostTypeId = 1 
+        AND p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '2 years'
+        AND p.OwnerUserId IS NOT NULL
+),
+complex_badge_analysis AS (
+    SELECT 
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Class,
+        COUNT(*) OVER (PARTITION BY b.UserId, b.Class) AS class_count,
+        SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) OVER (
+            PARTITION BY b.UserId 
+            ORDER BY b.Date 
+            RANGE BETWEEN INTERVAL '30 days' PRECEDING AND CURRENT ROW
+        ) AS rolling_tag_badges,
+        CASE 
+            WHEN b.Class = 1 THEN 'Gold' || COALESCE(' - ' || NULLIF(TRIM(b.Name), ''), ' (unnamed)')
+            WHEN b.Class = 2 THEN 'Silver' || CASE WHEN b.Name IS NULL THEN ' (null name)' ELSE ' - ' || b.Name END
+            WHEN b.Class = 3 THEN 'Bronze - ' || COALESCE(b.Name, 'MISSING')
+            ELSE 'Unknown Class'
+        END AS badge_description,
+        EXTRACT(EPOCH FROM (b.Date - LAG(b.Date) OVER (PARTITION BY b.UserId ORDER BY b.Date))) / 86400.0 AS days_since_last_badge
+    FROM Badges b
+)
+SELECT 
+    uh.DisplayName,
+    uh.Reputation,
+    uh.path AS hierarchy_path,
+    uh.level AS hierarchy_level,
+    COALESCE(qa.best_question_title, 'No questions') AS top_question,
+    COUNT(DISTINCT qa.Id) AS total_questions,
+    COALESCE(AVG(qa.Score) FILTER (WHERE qa.Score > qa.prev_score), 0) AS avg_improving_score,
+    COALESCE(STRING_AGG(DISTINCT cba.badge_description, ' | ' ORDER BY cba.Class, cba.BadgeName) 
+        FILTER (WHERE cba.rolling_tag_badges > 2), 'No qualifying badges') AS recent_badge_streak,
+    SUM(CASE WHEN qa.monthly_rank <= 10 THEN 1 ELSE 0 END) AS top10_monthly_questions,
+    PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY COALESCE(qa.ViewCount, 0)) AS q75_views,
+    MAX(qa.median_score_year) - MIN(qa.median_score_year) AS score_variance_range,
+    (
+        SELECT COUNT(DISTINCT ph.UserId)
+        FROM PostHistory ph
+        WHERE ph.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = uh.Id)
+            AND ph.PostHistoryTypeId IN (4, 5, 6)
+            AND ph.UserId != uh.Id
+            AND ph.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '90 days'
+            AND EXISTS (
+                SELECT 1 
+                FROM Comments c 
+                WHERE c.PostId = ph.PostId 
+                    AND c.UserId = ph.UserId 
+                    AND c.Score > 5
+                    AND (LOWER(c.Text) LIKE '%improve%' OR LOWER(c.Text) LIKE '%better%')
+            )
+    ) AS collaborative_editors,
+    COALESCE(
+        (
+            SELECT STRING_AGG(DISTINCT (pl.LinkTypeId || ':' || cnt), ', ')
+            FROM (
+                SELECT pl.LinkTypeId, COUNT(*) AS cnt
+                FROM PostLinks pl
+                WHERE pl.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = uh.Id)
+                   OR pl.RelatedPostId IN (SELECT Id FROM Posts WHERE OwnerUserId = uh.Id)
+                GROUP BY pl.LinkTypeId
+            ) sub
+        ), 
+        'No links'
+    ) AS link_pattern,
+    CASE 
+        WHEN uh.Reputation > 100000 THEN 'Elite'
+        WHEN uh.Reputation > 50000 AND COUNT(DISTINCT cba.BadgeName) FILTER (WHERE cba.Class = 1) > 5 THEN 'Veteran Gold'
+        WHEN AVG(qa.Score) > 50 THEN 'Quality Contributor'
+        WHEN COUNT(DISTINCT qa.Id) > 500 THEN 'Prolific'
+        ELSE 'Active'
+    END AS user_tier
+FROM user_hierarchy uh
+LEFT JOIN question_analytics qa ON qa.OwnerUserId = uh.Id
+LEFT JOIN complex_badge_analysis cba ON cba.UserId = uh.Id
+LEFT JOIN LATERAL (
+    SELECT COUNT(*) AS recent_votes
+    FROM Votes v
+    WHERE v.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = uh.Id)
+        AND v.VoteTypeId = 2
+        AND v.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '7 days'
+) rv ON TRUE
+WHERE uh.global_rank <= 100
+    OR qa.monthly_rank <= 5
+    OR cba.class_count > 10
+    OR rv.recent_votes > 20
+GROUP BY 
+    uh.Id, uh.DisplayName, uh.Reputation, uh.path, 
+    uh.level, uh.global_rank, qa.best_question_title, user_tier
+HAVING COUNT(DISTINCT qa.Id) > 0 
+    OR COUNT(DISTINCT cba.BadgeName) > 0
+ORDER BY 
+    uh.Reputation DESC NULLS LAST,
+    COUNT(DISTINCT qa.Id) DESC,
+    user_tier,
+    uh.level
+LIMIT 500;

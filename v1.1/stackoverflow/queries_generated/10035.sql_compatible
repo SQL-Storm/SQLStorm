@@ -1,0 +1,54 @@
+SELECT 
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    SUM(CASE WHEN p.ViewCount > 1000 THEN 1 ELSE 0 END) AS PopularPosts,
+    COUNT(DISTINCT v.PostId) AS TotalVotes,
+    MAX(b.Date) AS LastBadgeEarned,
+    (
+        SELECT COUNT(*) 
+        FROM Comments c
+        WHERE c.PostId = p.Id
+    ) AS TotalComments,
+    -- emulate MySQL GROUP_CONCAT + SUBSTRING_INDEX for portability using STRING_AGG where available
+    -- produce comma-separated tag list and then take first 5 elements
+    (SELECT
+         CASE 
+           WHEN COUNT(DISTINCT t2.TagName) = 0 THEN NULL
+           ELSE (
+             SELECT STRING_AGG(tn, ', ') FROM (
+               SELECT tn FROM (
+                 SELECT DISTINCT t3.TagName AS tn
+                 FROM Tags t3
+                 WHERE t3.ExcerptPostId = p.Id AND t3.TagName LIKE '%-%'
+                 ORDER BY t3.TagName
+               ) s
+               LIMIT 5
+             ) sub
+           )
+         END
+     ) AS TopFiveTags
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+-- keep Tags join removed to avoid duplicating rows; tags handled in scalar subquery
+WHERE 
+    u.Reputation > 100 
+    AND (p.CreationDate IS NULL OR p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR))
+GROUP BY 
+    u.Id,
+    u.DisplayName
+HAVING 
+    AVG(p.Score) > 10 
+    OR COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment END) > 0
+ORDER BY 
+    TotalPosts DESC, 
+    TotalQuestions DESC;

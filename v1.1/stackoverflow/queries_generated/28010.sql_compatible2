@@ -1,0 +1,133 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        AVG(p.Score) FILTER (WHERE p.Id IS NOT NULL) OVER (PARTITION BY u.Id) AS AvgPostScore,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersProvided,
+        STRING_AGG(DISTINCT SUBSTRING(b.Name FROM 1 FOR 3), ';') AS BadgePrefixes
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate BETWEEN DATE '2010-01-01' AND DATE '2020-12-31'
+    GROUP BY u.Id, u.Reputation, u.CreationDate
+),
+PostAnalysis AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        ph.CreationDate AS LastEditDate,
+        COALESCE(ph.UserId, -1) AS LastEditorId,
+        (LENGTH(p.Body) - LENGTH(REPLACE(p.Body, '<code>', ''))) / NULLIF(LENGTH('<code>'),0) AS CodeBlockCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS Upvotes,
+        (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS DuplicateLinks,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS UserPostRank,
+        p.OwnerUserId
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+        AND ph.PostHistoryTypeId IN (5,6,7)
+        AND ph.CreationDate = (
+            SELECT MAX(ph2.CreationDate)
+            FROM PostHistory ph2
+            WHERE ph2.PostId = p.Id
+            AND ph2.PostHistoryTypeId IN (5,6,7)
+        )
+    WHERE p.PostTypeId IN (1,2)
+)
+SELECT 
+    us.Id AS UserId,
+    us.Reputation,
+    us.ReputationRank,
+    us.AvgPostScore,
+    pa.PostTypeId,
+    pa.Score AS PostScore,
+    pa.UserPostRank,
+    pa.Upvotes,
+    pa.DuplicateLinks,
+    pa.CodeBlockCount,
+    (us.QuestionsAsked * 2 + us.AnswersProvided) * us.Reputation / 1000.0 AS EngagementIndex,
+    CASE 
+        WHEN pa.Tags IS NULL THEN 0
+        ELSE array_length(string_to_array(substring(pa.Tags FROM 2 FOR (char_length(pa.Tags)-2)), '><'), 1)
+    END AS TagCount,
+    CASE 
+        WHEN pa.LastEditDate IS NULL OR pa.CreationDate IS NULL THEN NULL
+        ELSE (EXTRACT(EPOCH FROM (pa.LastEditDate - pa.CreationDate)) / (30.4375*24*3600))::integer
+    END AS EditMonthsAfterCreation,
+    CASE 
+        WHEN us.Reputation > 100000 THEN 'Legendary'
+        WHEN us.Reputation BETWEEN 50000 AND 100000 THEN 'Epic'
+        WHEN us.Reputation BETWEEN 10000 AND 49999 THEN 'Advanced'
+        ELSE 'Regular'
+    END AS ReputationTier,
+    COALESCE(ph.Comment, 'No edit reason') AS LastEditComment,
+    (
+      SELECT STRING_AGG(b2.Name, ', ' ORDER BY b2.Date DESC)
+      FROM (
+        SELECT Name, Date
+        FROM Badges
+        WHERE UserId = us.Id AND Class = 1
+        ORDER BY Date DESC
+        FETCH FIRST 3 ROWS ONLY
+      ) b2
+    ) AS Top3GoldBadges
+FROM UserStats us
+JOIN PostAnalysis pa ON us.Id = pa.OwnerUserId
+LEFT JOIN PostHistory ph ON pa.Id = ph.PostId
+    AND ph.CreationDate = pa.LastEditDate
+WHERE us.Reputation > 1000
+    AND (pa.Score > 100 OR pa.ViewCount > 1000)
+    AND (pa.Tags LIKE '%<sql>%' OR pa.Tags IS NULL)
+    AND (us.BadgePrefixes LIKE '%exp%' OR us.BadgePrefixes IS NULL)
+GROUP BY
+    us.Id,
+    us.Reputation,
+    us.ReputationRank,
+    us.AvgPostScore,
+    pa.PostTypeId,
+    pa.Score,
+    pa.UserPostRank,
+    pa.Upvotes,
+    pa.DuplicateLinks,
+    pa.CodeBlockCount,
+    (us.QuestionsAsked * 2 + us.AnswersProvided) * us.Reputation / 1000.0,
+    CASE 
+        WHEN pa.Tags IS NULL THEN 0
+        ELSE array_length(string_to_array(substring(pa.Tags FROM 2 FOR (char_length(pa.Tags)-2)), '><'), 1)
+    END,
+    CASE 
+        WHEN pa.LastEditDate IS NULL OR pa.CreationDate IS NULL THEN NULL
+        ELSE (EXTRACT(EPOCH FROM (pa.LastEditDate - pa.CreationDate)) / (30.4375*24*3600))::integer
+    END,
+    CASE 
+        WHEN us.Reputation > 100000 THEN 'Legendary'
+        WHEN us.Reputation BETWEEN 50000 AND 100000 THEN 'Epic'
+        WHEN us.Reputation BETWEEN 10000 AND 49999 THEN 'Advanced'
+        ELSE 'Regular'
+    END,
+    LastEditComment,
+    pa.Id,
+    pa.LastEditDate,
+    pa.CreationDate,
+    pa.Tags,
+    pa.OwnerUserId,
+    us.QuestionsAsked,
+    us.AnswersProvided,
+    ph.Comment,
+    us.BadgePrefixes,
+    Top3GoldBadges
+ORDER BY 
+    us.ReputationRank,
+    pa.UserPostRank,
+    (us.QuestionsAsked * 2 + us.AnswersProvided) * us.Reputation / 1000.0 DESC
+FETCH FIRST 500 ROWS ONLY;

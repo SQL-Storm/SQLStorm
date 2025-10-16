@@ -1,0 +1,156 @@
+-- {"query": "673.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1570} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 AS Level
+    FROM Tags t
+    WHERE t.IsRequired = 1
+    UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        t2.IsModeratorOnly,
+        t2.IsRequired,
+        rh.Level + 1
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy rh ON t2.Id = rh.Id + 1 -- artificial recursion for benchmarking
+    WHERE rh.Level < 5
+),
+UserBadgeCounts AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(DISTINCT b.Name) AS DistinctBadgeNames,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+PostScoreWindows AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS ScoreRank,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgUserScore,
+        SUM(p.ViewCount) OVER (PARTITION BY p.OwnerUserId) AS TotalUserViews,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS UserPostCount
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) -- Questions and Answers only
+),
+PostWithCloseReason AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReasonName,
+        MIN(ph.CreationDate) AS CloseDate
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON CAST(ph.Comment AS INT) = crt.Id
+    WHERE ph.PostHistoryTypeId = 10 -- Post Closed
+    GROUP BY ph.PostId, crt.Name
+),
+TopQuestionsByTag AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        ROW_NUMBER() OVER (PARTITION BY unnest(string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><')) ORDER BY p.Score DESC) AS TagRank
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+FilteredTopQuestions AS (
+    SELECT * FROM TopQuestionsByTag WHERE TagRank <= 3
+),
+DuplicateLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        pt1.Title AS PostTitle,
+        pt2.Title AS RelatedPostTitle
+    FROM PostLinks pl
+    JOIN Posts pt1 ON pl.PostId = pt1.Id
+    JOIN Posts pt2 ON pl.RelatedPostId = pt2.Id
+    WHERE pl.LinkTypeId = 3 -- Duplicate
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END),0) AS QuestionCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END),0) AS AnswerCount,
+        COALESCE(SUM(vt2.UpVotes), 0) AS UserUpVotes,
+        COALESCE(SUM(vt2.DownVotes), 0) AS UserDownVotes,
+        COALESCE(MAX(p.CreationDate), u.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT 
+            v.PostId,
+            SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+        GROUP BY v.PostId
+    ) vt2 ON vt2.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT
+    uac.UserId,
+    uac.DisplayName,
+    uac.QuestionCount,
+    uac.AnswerCount,
+    uac.UserUpVotes,
+    uac.UserDownVotes,
+    COALESCE(ubc.GoldBadges,0) AS GoldBadges,
+    COALESCE(ubc.SilverBadges,0) AS SilverBadges,
+    COALESCE(ubc.BronzeBadges,0) AS BronzeBadges,
+    ubc.DistinctBadgeNames,
+    uac.LastPostDate,
+    psw.AvgUserScore,
+    psw.TotalUserViews,
+    psw.UserPostCount,
+    COALESCE(pc.CloseReasonName, 'Open') AS PostCloseStatus,
+    STRING_AGG(DISTINCT dt.TagName, ', ') AS RequiredTags,
+    STRING_AGG(DISTINCT ftq.Title, ' | ') AS TopQuestionsTitles,
+    dl.PostTitle AS DuplicatePostTitle,
+    dl.RelatedPostTitle AS DuplicateRelatedPostTitle,
+    CASE 
+        WHEN uac.UserUpVotes + uac.UserDownVotes = 0 THEN NULL
+        ELSE ROUND(100.0 * uac.UserUpVotes / NULLIF(uac.UserUpVotes + uac.UserDownVotes,0),2)
+    END AS UpVoteRatioPercent
+FROM UserActivitySummary uac
+LEFT JOIN UserBadgeCounts ubc ON uac.UserId = ubc.UserId
+LEFT JOIN PostScoreWindows psw ON psw.OwnerUserId = uac.UserId AND psw.ScoreRank = 1
+LEFT JOIN PostWithCloseReason pc ON pc.PostId = psw.Id
+LEFT JOIN RecursiveTagHierarchy dt ON dt.IsRequired = 1
+LEFT JOIN FilteredTopQuestions ftq ON ftq.OwnerUserId = uac.UserId
+LEFT JOIN DuplicateLinks dl ON dl.PostId = psw.Id
+WHERE uac.QuestionCount > 10
+GROUP BY 
+    uac.UserId, uac.DisplayName, uac.QuestionCount, uac.AnswerCount, uac.UserUpVotes, uac.UserDownVotes,
+    ubc.GoldBadges, ubc.SilverBadges, ubc.BronzeBadges, ubc.DistinctBadgeNames, uac.LastPostDate,
+    psw.AvgUserScore, psw.TotalUserViews, psw.UserPostCount,
+    pc.CloseReasonName, dl.PostTitle, dl.RelatedPostTitle
+ORDER BY uac.UserUpVotes DESC NULLS LAST, uac.QuestionCount DESC NULLS LAST
+LIMIT 100;

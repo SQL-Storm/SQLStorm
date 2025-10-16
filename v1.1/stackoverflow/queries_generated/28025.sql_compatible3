@@ -1,0 +1,88 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 2) AS UpvotesGiven,
+        (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id) AS CommentsMade,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    WHERE u.Reputation > 10000
+),
+PostHistoryClose AS (
+    SELECT 
+        PostId, 
+        MAX(CASE WHEN PostHistoryTypeId = 10 THEN Comment END) AS CloseReason 
+    FROM PostHistory 
+    GROUP BY PostId
+),
+PostVotes AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN 1 ELSE 0 END) AS BountyCount,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN COALESCE(v.BountyAmount,0) ELSE 0 END) AS BountyAmountSum
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2,8)
+    GROUP BY v.PostId
+),
+PostAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        COALESCE(ph.CloseReason, 'Not Closed') AS ClosureStatus,
+        COALESCE(pv.BountyCount, 0) AS BountyCount,
+        FIRST_VALUE(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS FirstPostDate,
+        LEAD(p.Title, 1, 'No Title') OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostTitle
+    FROM Posts p
+    LEFT JOIN PostHistoryClose ph ON p.Id = ph.PostId
+    LEFT JOIN PostVotes pv ON p.Id = pv.PostId
+    WHERE p.PostTypeId = 1
+),
+PostEngagement AS (
+    -- precompute engagement ratio per owner to avoid window in main GROUP BY
+    SELECT
+        OwnerUserId,
+        AVG(CASE WHEN ViewCount = 0 THEN NULL ELSE (Score * 1.0) / ViewCount END) AS EngagementRatio
+    FROM PostAnalysis
+    GROUP BY OwnerUserId
+)
+SELECT 
+    us.UserId,
+    us.Reputation,
+    us.GoldBadges,
+    pa.PostId,
+    STRING_AGG(t.tag, ',') AS TopTags,
+    pe.EngagementRatio,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.ParentId = pa.PostId AND p2.Score > 10) AS QualityAnswers,
+    CASE 
+        WHEN pa.ClosureStatus LIKE '%Duplicate%' THEN 'Duplicate'
+        WHEN pa.ClosureStatus LIKE '%OffTopic%' THEN 'OffTopic'
+        ELSE 'Open'
+    END AS ClosureCategory,
+    COALESCE(pb.TotalBounties, 0) AS TotalBounties,
+    us.CommentsMade + (SELECT COUNT(*) FROM Posts p3 WHERE p3.OwnerUserId = us.UserId) AS TotalContributions,
+    COUNT(DISTINCT t.n) AS TagCount
+FROM UserStats us
+INNER JOIN PostAnalysis pa ON us.UserId = pa.OwnerUserId
+LEFT JOIN PostEngagement pe ON us.UserId = pe.OwnerUserId
+LEFT JOIN (
+    SELECT OwnerUserId, SUM(BountyCount) AS TotalBounties
+    FROM PostAnalysis
+    GROUP BY OwnerUserId
+) pb ON pb.OwnerUserId = us.UserId
+LEFT JOIN LATERAL (
+    SELECT elems.ord AS n, elems.elem AS tag
+    FROM unnest(string_to_array(SUBSTRING(pa.Tags FROM 2 FOR char_length(pa.Tags)-2), '><')) WITH ORDINALITY AS elems(elem, ord)
+) t ON TRUE
+WHERE us.ReputationRank <= 100
+  AND pa.FirstPostDate BETWEEN DATE '2015-01-01' AND DATE '2023-01-01'
+  AND EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = us.UserId AND b.Name = 'Legendary')
+GROUP BY us.UserId, us.Reputation, us.GoldBadges, pa.PostId, pe.EngagementRatio, ClosureCategory, pb.TotalBounties, us.CommentsMade
+HAVING COUNT(DISTINCT t.n) <= 5
+ORDER BY us.Reputation DESC, pe.EngagementRatio DESC
+LIMIT 500;

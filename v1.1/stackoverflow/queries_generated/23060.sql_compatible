@@ -1,0 +1,89 @@
+WITH UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS TotalQuestionViews,
+        ROW_NUMBER() OVER (ORDER BY SUM(p.Score) DESC) AS PostRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id
+    HAVING COUNT(DISTINCT p.Id) > 10
+),
+TagPopularity AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        COALESCE((
+            SELECT AVG(v.BountyAmount) 
+            FROM Votes v 
+            INNER JOIN Posts pv ON v.PostId = pv.Id 
+            WHERE pv.Tags LIKE '%' || t.TagName || '%' AND v.VoteTypeId = 8
+        ), 0) AS AvgBounty
+    FROM Tags t
+    WHERE t.Count > 100
+),
+ActiveUsers AS (
+    SELECT 
+        ups.UserId,
+        u.DisplayName,
+        ups.TotalPosts,
+        ups.AvgPostScore,
+        ups.TotalQuestionViews,
+        ups.PostRank,
+        COALESCE(NULLIF(u.Location, ''), 'Unknown') AS UserLocation,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ups.UserId AND b.Class = 1) AS GoldBadges
+    FROM UserPostStats ups
+    INNER JOIN Users u ON ups.UserId = u.Id
+    WHERE u.Reputation > 1000
+),
+ComplexMetrics AS (
+    SELECT 
+        au.UserId,
+        au.DisplayName,
+        au.TotalPosts,
+        au.AvgPostScore,
+        au.TotalQuestionViews,
+        au.PostRank,
+        au.UserLocation,
+        au.GoldBadges,
+        STRING_AGG(tp.TagName || ' (' || tp.TagCount || ')', ', ') AS TopTags,
+        RANK() OVER (ORDER BY au.GoldBadges DESC, au.AvgPostScore DESC) AS OverallRank
+    FROM ActiveUsers au
+    LEFT JOIN Posts p ON au.UserId = p.OwnerUserId
+    LEFT JOIN TagPopularity tp ON p.Tags LIKE '%' || tp.TagName || '%'
+    WHERE EXISTS (
+        SELECT 1 FROM Comments c 
+        WHERE c.PostId = p.Id AND c.Score > 5 AND c.CreationDate > p.CreationDate + INTERVAL '1 DAY'
+    )
+    GROUP BY au.UserId, au.DisplayName, au.TotalPosts, au.AvgPostScore, au.TotalQuestionViews, au.PostRank, au.UserLocation, au.GoldBadges
+)
+SELECT 
+    cm.UserId,
+    cm.DisplayName,
+    cm.TotalPosts,
+    cm.AvgPostScore,
+    cm.TotalQuestionViews,
+    cm.PostRank,
+    cm.UserLocation,
+    cm.GoldBadges,
+    cm.TopTags,
+    cm.OverallRank,
+    (SELECT MAX(ph.CreationDate) FROM PostHistory ph WHERE ph.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = cm.UserId)) AS LastEditDate
+FROM ComplexMetrics cm
+WHERE cm.OverallRank <= 10
+UNION ALL
+SELECT 
+    NULL AS UserId,
+    'Summary' AS DisplayName,
+    SUM(cm.TotalPosts) AS TotalPosts,
+    AVG(cm.AvgPostScore) AS AvgPostScore,
+    SUM(cm.TotalQuestionViews) AS TotalQuestionViews,
+    NULL AS PostRank,
+    NULL AS UserLocation,
+    SUM(cm.GoldBadges) AS GoldBadges,
+    NULL AS TopTags,
+    NULL AS OverallRank,
+    NULL AS LastEditDate
+FROM ComplexMetrics cm
+ORDER BY OverallRank;

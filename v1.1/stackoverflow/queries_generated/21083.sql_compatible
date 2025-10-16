@@ -1,0 +1,122 @@
+WITH user_activity AS (
+  SELECT 
+    u.Id AS user_id,
+    u.Reputation,
+    u.CreationDate AS user_creation,
+    COUNT(DISTINCT p.Id) AS post_count,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS question_count,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS answer_count,
+    AVG(p.Score) AS avg_post_score,
+    MAX(p.CreationDate) AS last_post_date
+  FROM Users u
+  LEFT OUTER JOIN Posts p ON u.Id = p.OwnerUserId AND p.DeletionDate IS NULL
+  GROUP BY u.Id, u.Reputation, u.CreationDate
+  HAVING COUNT(DISTINCT p.Id) > 0
+),
+badge_stats AS (
+  SELECT 
+    b.UserId,
+    b.Class,
+    COUNT(*) AS badge_count,
+    STRING_AGG(b.Name, '; ') AS badge_names,
+    ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS rn
+  FROM Badges b
+  GROUP BY b.UserId, b.Class
+),
+post_interactions AS (
+  SELECT 
+    p.Id AS post_id,
+    p.OwnerUserId,
+    p.CreationDate AS post_creation,
+    p.Score,
+    p.ViewCount,
+    COALESCE(p.AnswerCount, 0) AS answer_count,
+    COALESCE(p.CommentCount, 0) AS comment_count,
+    COALESCE(fav.favorite_count, 0) AS favorite_count,
+    COALESCE(up.upvote_count, 0) AS upvote_count,
+    COALESCE(down.downvote_count, 0) AS downvote_count,
+    CASE 
+      WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+      WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+      ELSE 'Active'
+    END AS post_status,
+    LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS prev_post_score,
+    (p.Score - LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate)) AS score_improvement,
+    p.Text
+  FROM Posts p
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS favorite_count
+    FROM Votes 
+    WHERE VoteTypeId = 5 
+    GROUP BY PostId
+  ) fav ON p.Id = fav.PostId
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS upvote_count
+    FROM Votes 
+    WHERE VoteTypeId = 2 
+    GROUP BY PostId
+  ) up ON p.Id = up.PostId
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS downvote_count
+    FROM Votes 
+    WHERE VoteTypeId = 3 
+        GROUP BY PostId
+  ) down ON p.Id = down.PostId
+  WHERE p.DeletionDate IS NULL
+    AND p.PostTypeId IN (1, 2)
+)
+SELECT 
+  ua.user_id,
+  ua.Reputation,
+  DATE_PART('day', CAST('2024-10-01 12:34:56' AS timestamp) - ua.user_creation) AS days_active,
+  ua.post_count,
+  ua.question_count,
+  ua.answer_count,
+  ua.avg_post_score,
+  DATE_PART('day', CAST('2024-10-01 12:34:56' AS timestamp) - ua.last_post_date) AS days_since_last_post,
+  COALESCE(bs_gold.badge_count, 0) AS gold_badges,
+  COALESCE(bs_silver.badge_count, 0) AS silver_badges,
+  COALESCE(bs_bronze.badge_count, 0) AS bronze_badges,
+  LENGTH(COALESCE(bs_gold.badge_names, '') || COALESCE(bs_silver.badge_names, '') || COALESCE(bs_bronze.badge_names, '')) AS total_badge_chars,
+  AVG(pi.score_improvement) FILTER (WHERE pi.score_improvement IS NOT NULL) AS avg_score_growth,
+  SUM(pi.upvote_count) OVER (PARTITION BY ua.user_id) AS total_upvotes,
+  COUNT(DISTINCT CASE WHEN pi.post_status = 'Closed' THEN pi.post_id END) AS closed_posts,
+  (
+    SELECT STRING_AGG(DISTINCT t.TagName, ', ')
+    FROM Tags t
+    INNER JOIN PostLinks pl ON t.ExcerptPostId = pl.RelatedPostId
+    WHERE pl.PostId = pi.post_id
+      AND pl.LinkTypeId = 1
+      AND t.Count > 100
+    LIMIT 3
+  ) AS top_related_tags,
+  CASE 
+    WHEN ua.Reputation > 10000 AND COALESCE(bs_gold.badge_count, 0) >= 5 THEN 'Elite'
+    WHEN ua.post_count > 50 OR ua.Reputation > 5000 THEN 'Active'
+    WHEN ua.question_count > 10 THEN 'Questioner'
+    ELSE 'Newcomer'
+  END AS user_tier,
+  RANK() OVER (ORDER BY (ua.post_count * ua.avg_post_score + COALESCE(bs_gold.badge_count, 0) * 100) DESC) AS performance_rank
+FROM user_activity ua
+INNER JOIN post_interactions pi ON ua.user_id = pi.OwnerUserId
+LEFT JOIN badge_stats bs_gold ON ua.user_id = bs_gold.UserId AND bs_gold.Class = 1 AND bs_gold.rn = 1
+LEFT JOIN badge_stats bs_silver ON ua.user_id = bs_silver.UserId AND bs_silver.Class = 2 AND bs_silver.rn = 1
+LEFT JOIN badge_stats bs_bronze ON ua.user_id = bs_bronze.UserId AND bs_bronze.Class = 3 AND bs_bronze.rn = 1
+WHERE DATE_PART('day', CAST('2024-10-01 12:34:56' AS timestamp) - ua.user_creation) > 30
+  AND (pi.post_creation > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year' 
+       OR pi.upvote_count > 10 
+       OR pi.ViewCount > 1000)
+  AND NOT (pi.Text ILIKE '%spam%' OR pi.Text ILIKE '%advertisement%')
+GROUP BY 
+  ua.user_id, ua.Reputation, ua.user_creation, ua.post_count, 
+  ua.question_count, ua.answer_count, ua.avg_post_score, ua.last_post_date,
+  bs_gold.badge_count, bs_silver.badge_count, bs_bronze.badge_count,
+  bs_gold.badge_names, bs_silver.badge_names, bs_bronze.badge_names,
+  ua.post_count * ua.avg_post_score, COALESCE(bs_gold.badge_count, 0) * 100,
+  pi.OwnerUserId, pi.post_id, pi.post_creation, pi.Score, pi.ViewCount, pi.answer_count, pi.comment_count,
+  pi.favorite_count, pi.upvote_count, pi.downvote_count, pi.post_status, pi.prev_post_score, pi.score_improvement, pi.Text
+HAVING AVG(pi.ViewCount) > 50 
+   OR SUM(pi.upvote_count) > 100
+   OR COUNT(DISTINCT CASE WHEN pi.score_improvement > 0 THEN pi.post_id END) > 5
+ORDER BY performance_rank ASC
+LIMIT 100;

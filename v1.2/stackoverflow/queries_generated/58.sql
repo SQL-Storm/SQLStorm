@@ -1,0 +1,183 @@
+-- {"query": "58.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1655} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 as Level,
+        cast(t.TagName as varchar(1000)) as Path
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Level + 1,
+        r.Path || ' > ' || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id = r.Id + 1
+    where r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(*) as TotalBadges
+    from Badges b
+    group by b.UserId
+),
+PostScoreStats as (
+    select
+        p.OwnerUserId,
+        count(*) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(*) filter (where p.PostTypeId = 2) as AnswerCount,
+        avg(p.Score) filter (where p.PostTypeId = 1) as AvgQuestionScore,
+        avg(p.Score) filter (where p.PostTypeId = 2) as AvgAnswerScore,
+        max(p.Score) filter (where p.PostTypeId = 1) as MaxQuestionScore,
+        max(p.Score) filter (where p.PostTypeId = 2) as MaxAnswerScore
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        row_number() over (partition by u.Id order by p.CreationDate desc) as RecentPostRank,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score as PostScore,
+        p.CreationDate as PostCreationDate,
+        p.Title,
+        p.Tags,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        case when p.ClosedDate is not null then 1 else 0 end as IsClosed
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where u.Reputation > 1000
+),
+TopPostsWithComments as (
+    select
+        p.Id as PostId,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        count(c.Id) as CommentCount,
+        string_agg(distinct coalesce(c.UserDisplayName, 'Anonymous'), ', ') as Commenters,
+        max(c.CreationDate) as LastCommentDate
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    where p.PostTypeId = 1 and p.Score > 10
+    group by p.Id, p.Title, p.OwnerUserId, p.Score, p.ViewCount, p.Tags
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle,
+        pl.CreationDate,
+        lt.Name as LinkTypeName
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where pl.LinkTypeId = 3
+),
+UserVoteSummary as (
+    select
+        v.UserId,
+        sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+        sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes,
+        sum(case when vt.Name = 'Favorite' then 1 else 0 end) as Favorites,
+        sum(case when vt.Name = 'Close' then 1 else 0 end) as CloseVotes
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.UserId
+),
+UserSummary as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(ubc.GoldBadges,0) as GoldBadges,
+        coalesce(ubc.SilverBadges,0) as SilverBadges,
+        coalesce(ubc.BronzeBadges,0) as BronzeBadges,
+        coalesce(pss.QuestionCount,0) as QuestionCount,
+        coalesce(pss.AnswerCount,0) as AnswerCount,
+        coalesce(uvs.UpVotes,0) as UpVotes,
+        coalesce(uvs.DownVotes,0) as DownVotes,
+        coalesce(uvs.Favorites,0) as Favorites,
+        coalesce(uvs.CloseVotes,0) as CloseVotes
+    from Users u
+    left join UserBadgeCounts ubc on ubc.UserId = u.Id
+    left join PostScoreStats pss on pss.OwnerUserId = u.Id
+    left join UserVoteSummary uvs on uvs.UserId = u.Id
+    where u.Reputation > 500
+)
+select
+    us.Id as UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.UpVotes,
+    us.DownVotes,
+    us.Favorites,
+    us.CloseVotes,
+    tp.Title as TopQuestionTitle,
+    tp.Score as TopQuestionScore,
+    tp.ViewCount as TopQuestionViews,
+    tp.CommentCount as TopQuestionComments,
+    tp.Commenters as TopQuestionCommenters,
+    dl.PostTitle as DuplicatePostTitle,
+    dl.RelatedPostTitle as DuplicateRelatedPostTitle,
+    dl.CreationDate as DuplicateLinkDate,
+    dl.LinkTypeName as DuplicateLinkType,
+    rh.Path as TagHierarchyPath
+from UserSummary us
+left join lateral (
+    select p.Title, p.Score, p.ViewCount, count(c.Id) as CommentCount,
+           string_agg(distinct coalesce(c.UserDisplayName, 'Anonymous'), ', ') as Commenters
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    where p.OwnerUserId = us.Id and p.PostTypeId = 1
+    group by p.Id
+    order by p.Score desc nulls last
+    limit 1
+) tp on true
+left join lateral (
+    select dl.PostTitle, dl.RelatedPostTitle, dl.CreationDate, dl.LinkTypeName
+    from DuplicateLinks dl
+    join Posts p on p.Id = dl.PostId
+    where p.OwnerUserId = us.Id
+    order by dl.CreationDate desc nulls last
+    limit 1
+) dl on true
+left join RecursiveTagHierarchy rh on rh.Id = (
+    select
+        (regexp_split_to_array(tp.Tags, E'[<>]'))[2]::int
+    from Posts tp2
+    where tp2.Id = tp.PostId
+    limit 1
+)
+where us.QuestionCount > 5
+order by us.Reputation desc, us.GoldBadges desc, tp.Score desc
+limit 50;

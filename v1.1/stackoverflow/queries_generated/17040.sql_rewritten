@@ -1,0 +1,145 @@
+-- {"query": "17040.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 95735, "output_tokens": 93771} 
+WITH UserMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        DATE_PART('year', AGE(cast('2024-10-01' as date), u.CreationDate)) AS YearsOnSite,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS AvgPostScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) FILTER (WHERE p.Score > 0) AS MedianPositiveScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), ', ') FILTER (WHERE p.Tags IS NOT NULL) AS AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 1000
+        AND u.LastAccessDate > cast('2024-10-01' as date) - INTERVAL '180 days'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location, u.CreationDate
+),
+BadgeAnalysis AS (
+    SELECT 
+        UserId,
+        COUNT(*) AS TotalBadges,
+        COUNT(*) FILTER (WHERE Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE Class = 3) AS BronzeBadges,
+        MAX(Date) AS LastBadgeDate,
+        STRING_AGG(Name, ' | ' ORDER BY Date DESC) FILTER (WHERE Class = 1) AS GoldBadgeNames
+    FROM Badges
+    GROUP BY UserId
+),
+RecentActivity AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(DISTINCT ph.Id) AS EditCount,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS PostEdits,
+        MAX(ph.CreationDate) AS LastEditDate,
+        RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS PostRank,
+        p.Id AS TopPostId,
+        p.Title AS TopPostTitle,
+        p.Score AS TopPostScore,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostScore,
+        LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostScore
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN Comments c ON p.OwnerUserId = c.UserId
+    WHERE p.CreationDate > cast('2024-10-01' as date) - INTERVAL '90 days'
+    GROUP BY p.OwnerUserId, p.Id, p.Title, p.Score, p.CreationDate
+),
+VotePatterns AS (
+    SELECT 
+        v.UserId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpvotesGiven,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownvotesGiven,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 8) AS BountiesStarted,
+        COALESCE(SUM(v.BountyAmount), 0) AS TotalBountyAmount,
+        COUNT(*) FILTER (WHERE v.CreationDate > cast('2024-10-01' as date) - INTERVAL '30 days') AS RecentVotes
+    FROM Votes v
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+),
+LinkedContent AS (
+    SELECT 
+        p1.OwnerUserId,
+        COUNT(DISTINCT pl.RelatedPostId) AS LinkedPosts,
+        COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId END) AS DuplicateLinks,
+        AVG(p2.Score) AS AvgLinkedPostScore
+    FROM Posts p1
+    INNER JOIN PostLinks pl ON p1.Id = pl.PostId
+    INNER JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+    WHERE p1.OwnerUserId IS NOT NULL
+    GROUP BY p1.OwnerUserId
+)
+SELECT 
+    um.DisplayName,
+    um.Location,
+    um.Reputation,
+    um.YearsOnSite,
+    um.TotalPosts,
+    um.Questions,
+    um.Answers,
+    ROUND(um.AvgPostScore::numeric, 2) AS AvgPostScore,
+    COALESCE(um.MedianPositiveScore, 0) AS MedianPositiveScore,
+    CASE 
+        WHEN um.Questions > 0 AND um.Answers > 0 
+        THEN ROUND(um.Answers::numeric / NULLIF(um.Questions, 0), 2)
+        ELSE NULL 
+    END AS AnswerToQuestionRatio,
+    COALESCE(ba.TotalBadges, 0) AS TotalBadges,
+    COALESCE(ba.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ba.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ba.BronzeBadges, 0) AS BronzeBadges,
+    LEFT(COALESCE(ba.GoldBadgeNames, 'None'), 100) AS GoldBadgesSample,
+    COALESCE(ra.EditCount, 0) AS RecentEditCount,
+    COALESCE(ra.CommentsMade, 0) AS RecentComments,
+    ra.TopPostTitle,
+    COALESCE(ra.TopPostScore, 0) AS TopPostScore,
+    CASE 
+        WHEN ra.TopPostScore > COALESCE(ra.PrevPostScore, 0) 
+        THEN 'Improving'
+        WHEN ra.TopPostScore < COALESCE(ra.PrevPostScore, 999999)
+        THEN 'Declining'
+        ELSE 'Stable'
+    END AS ScoreTrend,
+    COALESCE(vp.UpvotesGiven, 0) AS UpvotesGiven,
+    COALESCE(vp.DownvotesGiven, 0) AS DownvotesGiven,
+    CASE 
+        WHEN COALESCE(vp.UpvotesGiven, 0) + COALESCE(vp.DownvotesGiven, 0) > 0
+        THEN ROUND(100.0 * COALESCE(vp.UpvotesGiven, 0) / NULLIF(COALESCE(vp.UpvotesGiven, 0) + COALESCE(vp.DownvotesGiven, 0), 0), 1)
+        ELSE NULL
+    END AS UpvotePercentage,
+    COALESCE(vp.BountiesStarted, 0) AS BountiesStarted,
+    COALESCE(vp.TotalBountyAmount, 0) AS TotalBountyAmount,
+    COALESCE(lc.LinkedPosts, 0) AS LinkedPosts,
+    COALESCE(lc.DuplicateLinks, 0) AS DuplicateLinks,
+    ROUND(COALESCE(lc.AvgLinkedPostScore, 0)::numeric, 2) AS AvgLinkedPostScore,
+    LEFT(um.AllTags, 200) AS TopTags,
+    DENSE_RANK() OVER (ORDER BY um.Reputation DESC, ba.GoldBadges DESC NULLS LAST) AS OverallRank,
+    ROW_NUMBER() OVER (PARTITION BY um.Location ORDER BY um.Reputation DESC) AS LocationRank,
+    CASE
+        WHEN um.Reputation > 10000 AND COALESCE(ba.GoldBadges, 0) > 5 THEN 'Elite'
+        WHEN um.Reputation > 5000 OR COALESCE(ba.GoldBadges, 0) > 2 THEN 'Expert'
+        WHEN um.Reputation > 2000 OR COALESCE(ba.SilverBadges, 0) > 10 THEN 'Intermediate'
+        ELSE 'Regular'
+    END AS UserTier
+FROM UserMetrics um
+LEFT JOIN BadgeAnalysis ba ON um.Id = ba.UserId
+LEFT JOIN (
+    SELECT * FROM RecentActivity WHERE PostRank = 1
+) ra ON um.Id = ra.OwnerUserId
+LEFT JOIN VotePatterns vp ON um.Id = vp.UserId
+LEFT JOIN LinkedContent lc ON um.Id = lc.OwnerUserId
+WHERE um.TotalPosts > 0
+    AND (um.Questions > 0 OR um.Answers > 0)
+    AND NOT EXISTS (
+        SELECT 1 
+        FROM PostHistory ph2 
+        WHERE ph2.UserId = um.Id 
+            AND ph2.PostHistoryTypeId = 12
+            AND ph2.CreationDate > cast('2024-10-01' as date) - INTERVAL '30 days'
+    )
+ORDER BY OverallRank, um.Reputation DESC, um.TotalPosts DESC
+LIMIT 100;

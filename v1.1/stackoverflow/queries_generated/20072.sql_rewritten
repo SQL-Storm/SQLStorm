@@ -1,0 +1,135 @@
+-- {"query": "20072.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1689} 
+WITH UserAnswerStats AS (
+    -- CTE 1: Aggregate core statistics for users based on their answers.
+    -- This involves joining questions and answers, calculating time differences, and aggregating results.
+    SELECT
+        p_ans.OwnerUserId,
+        COUNT(p_ans.Id) AS TotalAnswers,
+        AVG(p_ans.Score) AS AverageAnswerScore,
+        SUM(p_ans.CommentCount) AS TotalAnswerComments,
+        -- Calculate average response time in seconds, filtering out answers posted before questions.
+        AVG(EXTRACT(EPOCH FROM (p_ans.CreationDate - p_ques.CreationDate))) FILTER (WHERE p_ans.CreationDate > p_ques.CreationDate) AS AvgTimeToAnswerSeconds
+    FROM Posts AS p_ans
+    JOIN Posts AS p_ques ON p_ans.ParentId = p_ques.Id
+    WHERE
+        p_ans.PostTypeId = 2 -- Answers
+        AND p_ques.PostTypeId = 1 -- Questions
+        AND p_ans.OwnerUserId IS NOT NULL
+    GROUP BY p_ans.OwnerUserId
+    HAVING COUNT(p_ans.Id) >= 10 -- Only consider users with a minimum number of answers.
+),
+UserContributionDetails AS (
+    -- CTE 2: Combine user data with their answer stats and introduce window functions for ranking.
+    -- This adds user details and calculates various rankings and temporal differences between posts.
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.Location,
+        uas.TotalAnswers,
+        uas.AverageAnswerScore,
+        uas.AvgTimeToAnswerSeconds,
+        -- Use a correlated subquery to count gold badges.
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1 AND b.TagBased = 'false') AS GoldBadges,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.Tags,
+        -- Rank users globally by reputation.
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS GlobalReputationRank,
+        -- Rank users within their location (first part of the string before a comma) by their average answer score.
+        RANK() OVER (PARTITION BY SUBSTRING(u.Location FROM '^[^,]+') ORDER BY uas.AverageAnswerScore DESC, u.Reputation DESC) AS RankInLocationByScore,
+        -- Calculate the time difference in seconds to the user's previous post (of any type).
+        EXTRACT(EPOCH FROM (p.CreationDate - LAG(p.CreationDate, 1, p.CreationDate) OVER (PARTITION BY u.Id ORDER BY p.CreationDate))) AS SecondsSinceLastPost
+    FROM Users AS u
+    JOIN UserAnswerStats AS uas ON u.Id = uas.OwnerUserId
+    -- Use a lateral join to efficiently get the last 5 posts for each user to process with window functions.
+    JOIN LATERAL (
+        SELECT Id, CreationDate, Score, Tags
+        FROM Posts
+        WHERE OwnerUserId = u.Id
+        ORDER BY CreationDate DESC
+        LIMIT 5
+    ) p ON TRUE
+    WHERE u.Reputation > 5000 AND u.AboutMe IS NOT NULL AND LENGTH(u.AboutMe) > 100
+),
+PrimaryContributors AS (
+    -- CTE 3: Further refine the data, categorize users, and prepare for union.
+    SELECT
+        ucd.UserId,
+        ucd.DisplayName,
+        ucd.Reputation,
+        ucd.GlobalReputationRank,
+        ucd.RankInLocationByScore,
+        ucd.AverageAnswerScore,
+        ucd.TotalAnswers,
+        ucd.GoldBadges,
+        ucd.Location,
+        -- Complex CASE statement to categorize users based on multiple metrics.
+        CASE
+            WHEN ucd.Reputation > 150000 AND ucd.GoldBadges > 15 THEN 'Community Pillar'
+            WHEN ucd.AvgTimeToAnswerSeconds < 3600 AND ucd.AverageAnswerScore > 5 THEN 'Swift Expert'
+            WHEN ucd.AverageAnswerScore > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2) * 2 THEN 'Quality Specialist'
+            ELSE 'Dedicated Contributor'
+        END AS UserCategory,
+        'Contributor' AS ActivityType,
+        -- Find the user's highest-voted comment on a post they do not own.
+        (SELECT MAX(c.Score) FROM Comments c JOIN Posts p_c ON c.PostId = p_c.Id WHERE c.UserId = ucd.UserId AND p_c.OwnerUserId != ucd.UserId) AS MaxCommentScoreOnOthersPosts
+    FROM UserContributionDetails ucd
+    WHERE ucd.SecondsSinceLastPost IS NOT NULL AND ucd.SecondsSinceLastPost < (86400 * 90) -- Active in the last 90 days relative to their last post
+),
+NicheQuestionAskers AS (
+    -- CTE 4: A different user profile: users asking highly-viewed niche questions but with few answers.
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        -1 AS GlobalReputationRank,
+        -1 AS RankInLocationByScore,
+        NULL AS AverageAnswerScore,
+        (SELECT COUNT(*) FROM Posts p_ans WHERE p_ans.OwnerUserId = u.Id AND p_ans.PostTypeId = 2) AS TotalAnswers,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        u.Location,
+        'Niche Inquisitor' AS UserCategory,
+        'Asker' AS ActivityType,
+        NULL AS MaxCommentScoreOnOthersPosts
+    FROM Users u
+    WHERE u.Id IN (
+        SELECT OwnerUserId
+        FROM Posts
+        WHERE PostTypeId = 1 -- Questions
+          AND ViewCount > 50000
+          AND AnswerCount <= 2
+          AND Tags LIKE '%<unusual-tag>%' OR Tags LIKE '%<specific-tech>%'
+        GROUP BY OwnerUserId
+        HAVING COUNT(Id) > 2
+    )
+)
+-- Final SELECT: Combine the two user groups, filter further, and order the results.
+SELECT
+    UserId,
+    DisplayName,
+    Reputation,
+    GlobalReputationRank,
+    RankInLocationByScore,
+    COALESCE(AverageAnswerScore, 0) AS AverageAnswerScore,
+    TotalAnswers,
+    GoldBadges,
+    UserCategory,
+    ActivityType,
+    REVERSE(SPLIT_PART(REVERSE(Location), ',', 1)) AS Country, -- Basic string manipulation to guess country
+    MaxCommentScoreOnOthersPosts
+FROM (
+    SELECT * FROM PrimaryContributors
+    UNION ALL
+    SELECT * FROM NicheQuestionAskers
+) AS CombinedUsers
+WHERE
+    (UserCategory = 'Community Pillar' OR Reputation > (SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY Reputation) FROM Users))
+    AND Location IS NOT NULL
+    -- Filter on a calculated date expression
+    AND UserId IN (SELECT Id FROM Users WHERE CreationDate < cast('2024-10-01' as date) - INTERVAL '5 year')
+ORDER BY
+    UserCategory,
+    GlobalReputationRank ASC,
+    AverageAnswerScore DESC NULLS LAST;

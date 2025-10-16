@@ -1,0 +1,177 @@
+-- {"query": "17022.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 53705, "output_tokens": 51496} 
+WITH UserMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        AVG(CASE WHEN p.Score IS NOT NULL THEN p.Score END) AS AvgPostScore,
+        STRING_AGG(DISTINCT b.Name, ', ' ORDER BY b.Class, b.Date DESC) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        DENSE_RANK() OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation DESC) AS YearlyRepRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= cast('2024-10-01' as date) - INTERVAL '3 years'
+        AND u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location, u.CreationDate
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagUsageCount,
+        COUNT(DISTINCT p.OwnerUserId) AS UniqueContributors,
+        AVG(p.Score) FILTER (WHERE p.Score > 0) AS AvgPositiveScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.ViewCount) AS MedianViews,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END)::FLOAT / 
+            NULLIF(COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END), 0) AS AcceptanceRate,
+        LAG(t.Count, 1) OVER (ORDER BY t.Count DESC) - t.Count AS GapToPrevious,
+        FIRST_VALUE(u.DisplayName) OVER (
+            PARTITION BY t.TagName 
+            ORDER BY SUM(p.Score) DESC 
+            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+        ) AS TopContributor
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%<' || t.TagName || '>%'
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE t.Count >= 100
+        AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '1 year'
+    GROUP BY t.TagName, t.Count, u.DisplayName
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        COALESCE(q.AnswerCount, 0) AS AnswerCount,
+        a.Id AS BestAnswerId,
+        a.Score AS BestAnswerScore,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) / 3600.0 AS HoursToFirstAnswer,
+        (SELECT COUNT(DISTINCT ph.UserId) 
+         FROM PostHistory ph 
+         WHERE ph.PostId = q.Id 
+            AND ph.PostHistoryTypeId IN (4, 5, 6)
+            AND ph.UserId IS NOT NULL) AS EditorCount,
+        EXISTS (
+            SELECT 1 
+            FROM PostLinks pl 
+            WHERE pl.PostId = q.Id 
+                AND pl.LinkTypeId = 3
+        ) AS IsDuplicate,
+        CASE 
+            WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN q.AcceptedAnswerId IS NOT NULL THEN 'Accepted'
+            WHEN q.AnswerCount > 0 THEN 'Answered'
+            ELSE 'Unanswered'
+        END AS Status,
+        ROW_NUMBER() OVER (
+            PARTITION BY EXTRACT(YEAR FROM q.CreationDate), 
+                        EXTRACT(MONTH FROM q.CreationDate)
+            ORDER BY q.Score DESC, q.ViewCount DESC
+        ) AS MonthlyRank
+    FROM Posts q
+    LEFT JOIN LATERAL (
+        SELECT a2.Id, a2.Score, a2.CreationDate
+        FROM Posts a2
+        WHERE a2.ParentId = q.Id 
+            AND a2.PostTypeId = 2
+        ORDER BY a2.Score DESC, a2.CreationDate ASC
+        LIMIT 1
+    ) a ON true
+    WHERE q.PostTypeId = 1
+        AND q.Score >= 5
+        AND LENGTH(COALESCE(q.Body, '')) > 500
+)
+SELECT 
+    um.DisplayName,
+    um.Location,
+    um.Reputation,
+    um.ReputationRank,
+    um.YearlyRepRank,
+    um.Questions + um.Answers AS TotalContributions,
+    ROUND(um.AvgPostScore::numeric, 2) AS AvgScore,
+    COALESCE(um.GoldBadges, 'None') AS GoldBadges,
+    ta.TagName AS TopTag,
+    ta.TagUsageCount,
+    ROUND(ta.AcceptanceRate::numeric * 100, 1) AS TagAcceptanceRatePct,
+    ta.TopContributor AS TagTopContributor,
+    cpa.QuestionId,
+    SUBSTRING(cpa.Title FROM 1 FOR 50) || 
+        CASE WHEN LENGTH(cpa.Title) > 50 THEN '...' ELSE '' END AS QuestionTitle,
+    cpa.QuestionScore,
+    cpa.ViewCount,
+    cpa.Status,
+    COALESCE(cpa.HoursToFirstAnswer, -1) AS HoursToFirstAnswer,
+    cpa.EditorCount,
+    cpa.MonthlyRank,
+    CASE 
+        WHEN um.Reputation > 10000 AND um.Questions > 50 THEN 'Expert'
+        WHEN um.Reputation > 5000 OR (um.Questions + um.Answers) > 100 THEN 'Active'
+        WHEN um.Reputation > 2000 THEN 'Regular'
+        ELSE 'Contributor'
+    END AS UserTier,
+    COALESCE(
+        (SELECT STRING_AGG(c.Text, ' | ' ORDER BY c.Score DESC)
+         FROM (
+             SELECT c2.Text, c2.Score
+             FROM Comments c2
+             WHERE c2.PostId = cpa.QuestionId
+                 AND c2.Score >= 5
+             ORDER BY c2.Score DESC
+             LIMIT 3
+         ) c
+        ), 
+        'No high-scored comments'
+    ) AS TopComments
+FROM UserMetrics um
+CROSS JOIN LATERAL (
+    SELECT ta2.*
+    FROM TagAnalysis ta2
+    INNER JOIN Posts p ON p.Tags LIKE '%<' || ta2.TagName || '>%'
+    WHERE p.OwnerUserId = um.Id
+    ORDER BY ta2.TagUsageCount DESC
+    LIMIT 1
+) ta
+INNER JOIN ComplexPostAnalysis cpa ON EXISTS (
+    SELECT 1 
+    FROM Posts p2 
+    WHERE p2.Id = cpa.QuestionId 
+        AND p2.OwnerUserId = um.Id
+)
+WHERE um.TotalPosts > 10
+    AND ta.AcceptanceRate IS NOT NULL
+    AND (cpa.QuestionScore > 10 OR cpa.ViewCount > 1000)
+    AND NOT (um.Location LIKE '%test%' OR um.DisplayName IS NULL)
+UNION ALL
+SELECT 
+    'SYSTEM_AGGREGATE' AS DisplayName,
+    'Global' AS Location,
+    AVG(um2.Reputation)::INT AS Reputation,
+    NULL AS ReputationRank,
+    NULL AS YearlyRepRank,
+    SUM(um2.Questions + um2.Answers) AS TotalContributions,
+    AVG(um2.AvgPostScore) AS AvgScore,
+    NULL AS GoldBadges,
+    NULL AS TopTag,
+    NULL AS TagUsageCount,
+    NULL AS TagAcceptanceRatePct,
+    NULL AS TagTopContributor,
+    NULL AS QuestionId,
+    'AGGREGATE METRICS' AS QuestionTitle,
+    NULL AS QuestionScore,
+    NULL AS ViewCount,
+    NULL AS Status,
+    NULL AS HoursToFirstAnswer,
+    NULL AS EditorCount,
+    NULL AS MonthlyRank,
+    'System' AS UserTier,
+    'Summary Row' AS TopComments
+FROM UserMetrics um2
+WHERE um2.ReputationRank <= 100
+ORDER BY ReputationRank NULLS LAST, QuestionScore DESC NULLS LAST
+LIMIT 500;

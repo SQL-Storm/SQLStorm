@@ -1,0 +1,207 @@
+-- {"query": "274.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.2, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1682} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Path || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id <> r.Id and not t2.TagName = any(r.Path)
+    where t2.IsModeratorOnly = 0 and t2.IsRequired = 0 and r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserReputationStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        coalesce(ubc_gold.BadgeCount,0) as GoldBadges,
+        coalesce(ubc_silver.BadgeCount,0) as SilverBadges,
+        coalesce(ubc_bronze.BadgeCount,0) as BronzeBadges,
+        row_number() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+    left join UserBadgeCounts ubc_gold on u.Id = ubc_gold.UserId and ubc_gold.Class = 1
+    left join UserBadgeCounts ubc_silver on u.Id = ubc_silver.UserId and ubc_silver.Class = 2
+    left join UserBadgeCounts ubc_bronze on u.Id = ubc_bronze.UserId and ubc_bronze.Class = 3
+),
+TopQuestions as (
+    select
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        p.AnswerCount,
+        p.AcceptedAnswerId,
+        u.DisplayName as OwnerName,
+        dense_rank() over (partition by p.OwnerUserId order by p.Score desc) as UserTopQuestionRank
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 1 and p.Score > 10 and p.ViewCount > 1000
+),
+AcceptedAnswerDetails as (
+    select
+        a.Id,
+        a.ParentId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        u.DisplayName as AnswerOwnerName,
+        u.Reputation as AnswerOwnerReputation
+    from Posts a
+    left join Users u on a.OwnerUserId = u.Id
+    where a.PostTypeId = 2
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.OwnerName,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.CreationDate as QuestionCreationDate,
+        q.Tags,
+        q.AnswerCount,
+        q.AcceptedAnswerId,
+        aa.AnswerScore,
+        aa.AnswerCreationDate,
+        aa.AnswerOwnerName,
+        aa.AnswerOwnerReputation,
+        (select count(*) from Comments c where c.PostId = q.Id and c.CreationDate > q.CreationDate) as CommentsAfterQuestion,
+        (select count(*) from Votes v where v.PostId = q.Id and v.VoteTypeId = 2) as UpVotesCount,
+        (select count(*) from Votes v where v.PostId = q.Id and v.VoteTypeId = 3) as DownVotesCount
+    from TopQuestions q
+    left join AcceptedAnswerDetails aa on q.AcceptedAnswerId = aa.Id
+),
+PostLinkAggregates as (
+    select
+        pl.PostId,
+        count(distinct case when pl.LinkTypeId = 1 then pl.RelatedPostId end) as LinkedPostsCount,
+        count(distinct case when pl.LinkTypeId = 3 then pl.RelatedPostId end) as DuplicatePostsCount
+    from PostLinks pl
+    group by pl.PostId
+),
+QuestionWithLinks as (
+    select
+        qas.*,
+        pla.LinkedPostsCount,
+        pla.DuplicatePostsCount
+    from QuestionAnswerStats qas
+    left join PostLinkAggregates pla on qas.QuestionId = pla.PostId
+),
+RankedQuestions as (
+    select
+        qwl.*,
+        row_number() over (partition by qwl.OwnerUserId order by qwl.Score desc, qwl.ViewCount desc) as UserQuestionRank,
+        rank() over (order by qwl.Score desc, qwl.ViewCount desc) as GlobalQuestionRank
+    from QuestionWithLinks qwl
+),
+FinalSelection as (
+    select
+        rq.GlobalQuestionRank,
+        rq.UserQuestionRank,
+        rq.QuestionId,
+        rq.Title,
+        rq.OwnerUserId,
+        rq.OwnerName,
+        rq.QuestionScore,
+        rq.ViewCount,
+        rq.AnswerCount,
+        rq.AcceptedAnswerId,
+        rq.AnswerScore,
+        rq.AnswerCreationDate,
+        rq.AnswerOwnerName,
+        rq.AnswerOwnerReputation,
+        rq.CommentsAfterQuestion,
+        rq.UpVotesCount,
+        rq.DownVotesCount,
+        rq.LinkedPostsCount,
+        rq.DuplicatePostsCount,
+        ur.GoldBadges,
+        ur.SilverBadges,
+        ur.BronzeBadges,
+        ur.ReputationRank,
+        ur.Location,
+        -- Complex string expression: concatenated tag list with counts and reversed order
+        string_agg(distinct concat_ws(':', tag.TagName, tag.Count), ',' order by tag.Count desc nulls last) as TagSummary,
+        -- Complex NULL logic: calculate score ratio with NULL handling
+        case when rq.DownVotesCount is null or rq.DownVotesCount = 0 then null else cast(rq.UpVotesCount as float)/rq.DownVotesCount end as UpDownVoteRatio
+    from RankedQuestions rq
+    left join UserReputationStats ur on rq.OwnerUserId = ur.UserId
+    left join RecursiveTagHierarchy tag on tag.TagName = any(string_to_array(substring(rq.Tags from 2 for char_length(rq.Tags)-2), '><'))
+    group by
+        rq.GlobalQuestionRank,
+        rq.UserQuestionRank,
+        rq.QuestionId,
+        rq.Title,
+        rq.OwnerUserId,
+        rq.OwnerName,
+        rq.QuestionScore,
+        rq.ViewCount,
+        rq.AnswerCount,
+        rq.AcceptedAnswerId,
+        rq.AnswerScore,
+        rq.AnswerCreationDate,
+        rq.AnswerOwnerName,
+        rq.AnswerOwnerReputation,
+        rq.CommentsAfterQuestion,
+        rq.UpVotesCount,
+        rq.DownVotesCount,
+        rq.LinkedPostsCount,
+        rq.DuplicatePostsCount,
+        ur.GoldBadges,
+        ur.SilverBadges,
+        ur.BronzeBadges,
+        ur.ReputationRank,
+        ur.Location
+)
+select
+    fs.GlobalQuestionRank,
+    fs.UserQuestionRank,
+    fs.QuestionId,
+    fs.Title,
+    fs.OwnerName,
+    fs.QuestionScore,
+    fs.ViewCount,
+    fs.AnswerCount,
+    fs.AcceptedAnswerId,
+    fs.AnswerScore,
+    fs.AnswerCreationDate,
+    fs.AnswerOwnerName,
+    fs.AnswerOwnerReputation,
+    fs.CommentsAfterQuestion,
+    fs.UpVotesCount,
+    fs.DownVotesCount,
+    fs.UpDownVoteRatio,
+    fs.LinkedPostsCount,
+    fs.DuplicatePostsCount,
+    fs.GoldBadges,
+    fs.SilverBadges,
+    fs.BronzeBadges,
+    fs.ReputationRank,
+    fs.Location,
+    fs.TagSummary
+from FinalSelection fs
+where fs.GlobalQuestionRank <= 100
+order by fs.GlobalQuestionRank;

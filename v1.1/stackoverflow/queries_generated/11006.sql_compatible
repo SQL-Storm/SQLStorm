@@ -1,0 +1,82 @@
+WITH RecentPosts AS (
+    SELECT 
+        p.Id, 
+        p.Title, 
+        p.CreationDate, 
+        p.Score, 
+        p.ViewCount, 
+        p.AnswerCount, 
+        u.DisplayName AS OwnerDisplayName, 
+        u.Reputation,
+        COALESCE(SUM(v.BountyAmount), 0) AS TotalBountyAmount,
+        p.OwnerUserId
+    FROM 
+        Posts p
+    JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId AND v.VoteTypeId = 8
+    WHERE 
+        p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY
+        AND p.PostTypeId = 1
+    GROUP BY 
+        p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, u.DisplayName, u.Reputation, p.OwnerUserId
+),
+TopUsers AS (
+    SELECT 
+        u.Id, 
+        u.DisplayName, 
+        u.Reputation, 
+        COUNT(p.Id) AS PostCount
+    FROM 
+        Users u
+    JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    WHERE 
+        p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365' DAY
+    GROUP BY 
+        u.Id, u.DisplayName, u.Reputation
+    HAVING 
+        COUNT(p.Id) > 10
+),
+PostActivity AS (
+    SELECT 
+        p.Id, 
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 5 THEN ph.Id END) AS EditCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Id END) AS CloseCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.Id END) AS ReopenCount
+    FROM 
+        Posts p
+    LEFT JOIN 
+        PostHistory ph ON p.Id = ph.PostId
+    GROUP BY 
+        p.Id
+)
+SELECT 
+    rp.Id AS PostId, 
+    rp.Title, 
+    rp.CreationDate, 
+    rp.Score, 
+    rp.ViewCount, 
+    rp.AnswerCount, 
+    rp.OwnerDisplayName, 
+    rp.Reputation, 
+    rp.TotalBountyAmount, 
+    pa.EditCount, 
+    pa.CloseCount, 
+    pa.ReopenCount, 
+    tu.DisplayName AS TopUserDisplayName, 
+    tu.Reputation AS TopUserReputation, 
+    tu.PostCount
+FROM 
+    RecentPosts rp
+JOIN 
+    PostActivity pa ON rp.Id = pa.Id
+LEFT JOIN 
+    TopUsers tu ON rp.OwnerUserId = tu.Id
+ORDER BY 
+    rp.Score DESC, 
+    rp.ViewCount DESC, 
+    rp.AnswerCount DESC, 
+    rp.TotalBountyAmount DESC
+LIMIT 10;

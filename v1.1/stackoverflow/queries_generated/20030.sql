@@ -1,0 +1,144 @@
+-- {"query": "20030.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1744} 
+
+WITH UserPostMetrics AS (
+  -- Calculate aggregated post metrics for each user, including questions and answers
+  SELECT
+    OwnerUserId,
+    COUNT(Id) AS TotalPosts,
+    SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+    SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+    SUM(Score) AS TotalScore,
+    AVG(Score) AS AvgPostScore,
+    SUM(ViewCount) AS TotalViews,
+    SUM(FavoriteCount) AS TotalFavorites,
+    SUM(CommentCount) AS TotalPostComments,
+    MAX(LastActivityDate) AS LastPostActivityDate
+  FROM Posts
+  WHERE OwnerUserId IS NOT NULL
+  GROUP BY OwnerUserId
+),
+UserEngagement AS (
+  -- Calculate user engagement through votes, badges, and comments
+  SELECT
+    u.Id AS UserId,
+    COALESCE(b.GoldBadges, 0) AS GoldBadges,
+    COALESCE(b.SilverBadges, 0) AS SilverBadges,
+    COALESCE(b.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(v.UpVotesCast, 0) AS UpVotesCast,
+    COALESCE(v.DownVotesCast, 0) AS DownVotesCast,
+    (SELECT MAX(c.CreationDate) FROM Comments c WHERE c.UserId = u.Id) AS LastCommentDate
+  FROM Users u
+  LEFT JOIN (
+    SELECT
+      UserId,
+      COUNT(*) FILTER (WHERE Class = 1) AS GoldBadges,
+      COUNT(*) FILTER (WHERE Class = 2) AS SilverBadges,
+      COUNT(*) FILTER (WHERE Class = 3) AS BronzeBadges
+    FROM Badges
+    GROUP BY UserId
+  ) b ON u.Id = b.UserId
+  LEFT JOIN (
+    SELECT
+      UserId,
+      COUNT(*) FILTER (WHERE VoteTypeId = 2) AS UpVotesCast,
+      COUNT(*) FILTER (WHERE VoteTypeId = 3) AS DownVotesCast
+    FROM Votes
+    WHERE UserId IS NOT NULL
+    GROUP BY UserId
+  ) v ON u.Id = v.UserId
+),
+RankedUsers AS (
+  -- Combine all metrics and apply window functions for ranking and comparison
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.Location,
+    u.AboutMe,
+    pm.QuestionCount,
+    pm.AnswerCount,
+    pm.TotalScore,
+    pm.TotalViews,
+    ue.GoldBadges,
+    ue.SilverBadges,
+    ue.UpVotesCast,
+    ue.DownVotesCast,
+    -- A complex influence score calculation
+    (u.Reputation * 0.5) + (pm.TotalScore * 0.2) + (pm.TotalViews * 0.05) + (ue.GoldBadges * 150) + (ue.SilverBadges * 40) - (ue.DownVotesCast * 5) AS InfluenceScore,
+    -- Window function to compare a user's reputation to the previous user in the same location
+    LAG(u.Reputation, 1, 0) OVER (PARTITION BY u.Location ORDER BY u.CreationDate) AS PrevUserRepInLocation,
+    -- Window function to rank users by their influence score
+    ROW_NUMBER() OVER (ORDER BY (u.Reputation * 0.5) + (pm.TotalScore * 0.2) + (pm.TotalViews * 0.05) + (ue.GoldBadges * 150) + (ue.SilverBadges * 40) - (ue.DownVotesCast * 5) DESC) AS OverallRank
+  FROM Users u
+  JOIN UserPostMetrics pm ON u.Id = pm.OwnerUserId
+  JOIN UserEngagement ue ON u.Id = ue.UserId
+  WHERE u.LastAccessDate > u.CreationDate + interval '30 day' AND u.Reputation > 1000
+)
+-- Final SELECT combining data from CTEs, correlated subqueries, and set operators
+(
+  SELECT
+    ru.DisplayName,
+    ru.Reputation,
+    ru.InfluenceScore,
+    ru.OverallRank,
+    ru.QuestionCount,
+    ru.AnswerCount,
+    -- Safely calculate a ratio using NULLIF
+    ru.UpVotesCast::decimal / NULLIF(ru.DownVotesCast, 0) AS UpDownVoteRatio,
+    -- Correlated subquery to get the title of the user's most-edited post
+    (
+      SELECT p_inner.Title
+      FROM Posts p_inner
+      JOIN PostHistory ph ON p_inner.Id = ph.PostId
+      WHERE ph.UserId = ru.UserId AND ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Body, or Tags
+      GROUP BY p_inner.Id, p_inner.Title
+      ORDER BY COUNT(*) DESC, p_inner.CreationDate DESC
+      LIMIT 1
+    ) AS MostEditedPostTitle,
+    -- Complex CASE statement for user categorization based on multiple criteria
+    CASE
+      WHEN ru.GoldBadges > 10 AND ru.AnswerCount > ru.QuestionCount THEN 'Veteran Answerer'
+      WHEN LOWER(ru.AboutMe) LIKE '%python%' OR LOWER(ru.AboutMe) LIKE '%java%' THEN 'Language Specialist'
+      WHEN ru.Reputation > 100000 THEN 'Community Pillar'
+      ELSE 'Dedicated Contributor'
+    END AS UserCategory,
+    'High-Influence' AS SourceType
+  FROM RankedUsers ru
+  WHERE ru.OverallRank <= 250 AND (ru.Location LIKE 'United%' OR ru.Location IS NULL)
+)
+UNION ALL
+(
+  -- A different query to find "unsung heroes": users with many accepted answers but moderate reputation
+  SELECT
+    u.DisplayName,
+    u.Reputation,
+    (p.AcceptedAnswerCount * 500)::float AS InfluenceScore, -- A different scoring metric for this group
+    NULL AS OverallRank,
+    (SELECT COUNT(*) FROM Posts q WHERE q.OwnerUserId = u.Id AND q.PostTypeId = 1) AS QuestionCount,
+    p.AcceptedAnswerCount AS AnswerCount,
+    NULL AS UpDownVoteRatio,
+    (
+      SELECT RelatedPostId::varchar
+      FROM PostLinks pl
+      WHERE pl.PostId IN (SELECT Id FROM Posts p2 WHERE p2.OwnerUserId = u.Id) AND pl.LinkTypeId = 1
+      ORDER BY pl.CreationDate DESC
+      LIMIT 1
+    ) AS LastLinkedPostId,
+    'Unsung Hero' AS UserCategory,
+    'Accepted-Answers' AS SourceType
+  FROM Users u
+  JOIN (
+    -- Subquery to find users with a high number of accepted answers
+    SELECT p_ans.OwnerUserId, COUNT(*) AS AcceptedAnswerCount
+    FROM Posts p_q
+    JOIN Posts p_ans ON p_q.AcceptedAnswerId = p_ans.Id
+    WHERE p_q.PostTypeId = 1 AND p_ans.OwnerUserId IS NOT NULL
+    GROUP BY p_ans.OwnerUserId
+    HAVING COUNT(*) > 50
+  ) p ON u.Id = p.OwnerUserId
+  WHERE u.Reputation BETWEEN 5000 AND 25000
+    AND NOT EXISTS (SELECT 1 FROM RankedUsers ru WHERE ru.UserId = u.Id AND ru.OverallRank <= 250)
+)
+ORDER BY InfluenceScore DESC NULLS LAST, Reputation DESC
+LIMIT 500;

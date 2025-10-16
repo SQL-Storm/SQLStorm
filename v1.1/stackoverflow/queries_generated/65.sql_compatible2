@@ -1,0 +1,15 @@
+WITH complex_query AS (
+    SELECT P.Id, P.Title, P.Score, P.CreationDate,
+           U.DisplayName AS OwnerDisplayName, 
+           SUM(Vs.Score) AS TotalVotes,
+           COUNT(DISTINCT C.Id) AS TotalComments
+    FROM Posts P
+    LEFT JOIN Users U ON P.OwnerUserId = U.Id
+    LEFT JOIN Votes Vs ON P.Id = Vs.PostId
+    LEFT JOIN Comments C ON P.Id = C.PostId
+    WHERE P.PostTypeId = 1
+    GROUP BY P.Id, P.Title, P.Score, P.CreationDate, U.DisplayName
+    HAVING COUNT(DISTINCT C.Id) > 5
+    ORDER BY SUM(Vs.Score) DESC
+)
+SELECT * FROM complex_query;

@@ -1,0 +1,141 @@
+-- {"query": "21084.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2168, "output_tokens": 1445} 
+
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.UpVotes DESC) as RepRank
+    FROM Users u
+    WHERE u.Reputation > 1000
+      AND u.LastAccessDate > CURRENT_DATE - INTERVAL '1 year'
+      AND u.Location IS NOT NULL
+      AND LENGTH(u.Location) > 3
+),
+QuestionStats AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CreationDate,
+        COALESCE(p.AcceptedAnswerId, 0) as HasAccepted,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) as UpVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) as DownVotes,
+        AVG(v.BountyAmount) FILTER (WHERE v.VoteTypeId = 8) as AvgBounty,
+        STRING_AGG(DISTINCT SUBSTRING(t.TagName FROM 1 FOR 10), ' | ') as TopTags
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id 
+                      AND v.VoteTypeId IN (2, 3, 8)
+    LEFT JOIN Tags t ON POSITION(t.TagName IN COALESCE(p.Tags, '')) > 0
+                      OR (p.PostTypeId IN (4,5) AND p.Title = t.TagName)
+    WHERE p.PostTypeId = 1
+      AND p.ClosedDate IS NULL
+      AND p.DeletionDate IS NULL
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CreationDate, p.AcceptedAnswerId
+    HAVING COUNT(v.Id) > 10 OR p.ViewCount > 10000
+),
+AnswerContributions AS (
+    SELECT 
+        ans.OwnerUserId,
+        COUNT(ans.Id) as TotalAnswers,
+        AVG(ans.Score) as AvgAnswerScore,
+        SUM(CASE WHEN ans.ParentId = qs.QuestionId AND qs.HasAccepted = ans.Id THEN 1 ELSE 0 END) as AcceptedAnswers,
+        RANK() OVER (PARTITION BY ans.OwnerUserId ORDER BY COUNT(ans.Id) DESC) as AnswerRank
+    FROM Posts ans
+    INNER JOIN QuestionStats qs ON ans.ParentId = qs.QuestionId
+    WHERE ans.PostTypeId = 2
+      AND ans.Score >= 0
+      AND ans.CreationDate > CURRENT_DATE - INTERVAL '2 years'
+    GROUP BY ans.OwnerUserId
+),
+HighImpactPosts AS (
+    SELECT 
+        qs.QuestionId,
+        qs.Title,
+        qs.UpVotes,
+        qs.DownVotes,
+        qs.ViewCount,
+        qs.AvgBounty,
+        ac.TotalAnswers,
+        ac.AcceptedAnswers,
+        ac.AvgAnswerScore,
+        LAG(qs.UpVotes) OVER (ORDER BY qs.ViewCount DESC) as PrevUpVotes,
+        LEAD(qs.Title) OVER (ORDER BY qs.CreationDate) as NextQuestionTitle,
+        (qs.UpVotes - COALESCE(LAG(qs.UpVotes) OVER (ORDER BY qs.CreationDate), 0)) / 
+        NULLIF(EXTRACT(DAY FROM (CURRENT_DATE - qs.CreationDate)), 0) as UpVoteGrowthRate,
+        CASE 
+            WHEN qs.DownVotes > qs.UpVotes THEN 'Controversial'
+            WHEN qs.ViewCount > 50000 THEN 'Viral'
+            WHEN ac.AcceptedAnswers > 0 THEN 'Helpful'
+            ELSE 'Standard'
+        END as ImpactCategory
+    FROM QuestionStats qs
+    LEFT JOIN AnswerContributions ac ON ac.OwnerUserId = (
+        SELECT au.Id 
+        FROM ActiveUsers au 
+        WHERE au.Id = qs.OwnerUserId  -- Correlated subquery for owner
+        ORDER BY au.RepRank 
+        LIMIT 1
+    )
+    WHERE qs.ViewCount > (SELECT AVG(ViewCount) * 2 FROM Posts WHERE PostTypeId = 1)
+      AND (qs.UpVotes > 50 OR qs.AvgBounty > 0)
+),
+BadgeAchievers AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) as BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) as GoldBadges,
+        STRING_AGG(DISTINCT b.Name, ', ') as BadgeNames
+    FROM Badges b
+    WHERE b.Date > CURRENT_DATE - INTERVAL '1 year'
+      AND b.TagBased = TRUE
+    GROUP BY b.UserId
+    HAVING COUNT(*) > 5
+)
+SELECT 
+    hip.QuestionId,
+    hip.Title,
+    hip.UpVotes,
+    hip.DownVotes,
+    hip.ViewCount,
+    ROUND(hip.UpVoteGrowthRate::numeric, 2) as DailyUpVoteGrowth,
+    hip.ImpactCategory,
+    hip.TopTags,
+    au.DisplayName as QuestionAuthor,
+    au.Reputation as AuthorRep,
+    COALESCE(ba.BadgeCount, 0) as RecentBadges,
+    COALESCE(ba.GoldBadges, 0) as GoldBadges,
+    ac.TotalAnswers as AuthorsTotalAnswers,
+    ROUND(ac.AvgAnswerScore::numeric, 2) as AuthorsAvgAnswerScore,
+    (SELECT COUNT(*) 
+     FROM Comments c 
+     WHERE c.PostId = hip.QuestionId 
+       AND c.Score > 0 
+       AND c.UserId = au.Id) as AuthorCommentsOnOwnPost,
+    CASE 
+        WHEN hip.PrevUpVotes IS NULL THEN NULL
+        WHEN hip.UpVotes > hip.PrevUpVotes * 1.5 THEN 'Growing'
+        WHEN hip.DownVotes > 5 THEN 'Declining'
+        ELSE 'Stable'
+    END as TrendStatus,
+    CONCAT(
+        COALESCE(au.Location, 'Unknown'), 
+        CASE WHEN ba.BadgeNames IS NOT NULL THEN ' | Badges: ' || LEFT(ba.BadgeNames, 50) ELSE '' END,
+        CASE WHEN hip.AvgBounty > 0 THEN ' | Bounty: $' || hip.AvgBounty ELSE '' END
+    ) as ProfileSummary
+FROM HighImpactPosts hip
+INNER JOIN ActiveUsers au ON au.Id = hip.OwnerUserId
+LEFT JOIN AnswerContributions ac ON ac.OwnerUserId = au.Id
+LEFT JOIN BadgeAchievers ba ON ba.UserId = au.Id
+WHERE hip.CreationDate > CURRENT_DATE - INTERVAL '6 months'
+  AND (hip.UpVotes > 100 OR hip.ViewCount > 100000)
+  AND au.RepRank <= 100
+  AND (hip.ImpactCategory = 'Viral' OR ba.GoldBadges > 0)
+ORDER BY 
+    hip.UpVoteGrowthRate DESC NULLS LAST,
+    hip.ViewCount DESC,
+    au.Reputation DESC
+LIMIT 50;

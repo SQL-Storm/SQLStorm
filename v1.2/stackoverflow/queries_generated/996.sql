@@ -1,0 +1,158 @@
+-- {"query": "996.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1495} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsRequired = 1
+    union all
+    select
+        child.Id,
+        child.TagName,
+        child.Count,
+        r.Level + 1,
+        r.Path || child.TagName
+    from Tags child
+    join RecursiveTagHierarchy r on child.WikiPostId = r.Id
+    where not child.TagName = any(r.Path)
+),
+UserPostStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(p.Id) filter (where p.PostTypeId = 1) as Questions,
+        count(p.Id) filter (where p.PostTypeId = 2) as Answers,
+        coalesce(sum(p.Score),0) as TotalScore,
+        max(p.CreationDate) as LastPostDate,
+        coalesce(avg(p.Score),0) as AvgPostScore,
+        max(u.Reputation) as Reputation
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostWithCommentsAndVotes as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        count(distinct c.Id) as CommentCount,
+        count(distinct v.Id) as VoteCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as Upvotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as Downvotes,
+        case
+            when p.ClosedDate is not null then 'Closed'
+            when p.AcceptedAnswerId is not null then 'Accepted'
+            else 'Open'
+        end as PostStatus
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    left join Users u on u.Id = p.OwnerUserId
+    group by p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.Title, p.Tags, p.OwnerUserId, u.DisplayName, p.ClosedDate, p.AcceptedAnswerId
+),
+AnswerRanking as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a
+    where a.PostTypeId = 2
+),
+QuestionWithTopAnswer as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Tags,
+        q.OwnerUserId,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        a.AnswerId,
+        a.AnswerRank,
+        a.Score as AnswerScore
+    from Posts q
+    left join AnswerRanking a on a.QuestionId = q.Id and a.AnswerRank = 1
+    where q.PostTypeId = 1
+),
+ComplexUserBadgeInfo as (
+    select
+        b.UserId,
+        count(*) as TotalBadges,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+        count(distinct case when b.TagBased = 1 then b.Id end) as TagBasedBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+CloseReasonCounts as (
+    select
+        cht.Name as CloseReason,
+        count(ph.Id) as CloseCount
+    from PostHistory ph
+    join PostHistoryTypes chtt on ph.PostHistoryTypeId = chtt.Id
+    left join CloseReasonTypes cht on cast(ph.Comment as int) = cht.Id
+    where ph.PostHistoryTypeId = 10
+    group by cht.Name
+),
+CorrelatedAvgAnswerScore as (
+    select
+        q.Id as QuestionId,
+        (select avg(a.Score) from Posts a where a.PostTypeId = 2 and a.ParentId = q.Id) as AvgAnswerScore
+    from Posts q
+    where q.PostTypeId = 1
+)
+select distinct
+    u.Id as UserId,
+    u.DisplayName,
+    ups.Questions,
+    ups.Answers,
+    ups.TotalScore,
+    ups.AvgPostScore,
+    cbi.GoldBadges,
+    cbi.SilverBadges,
+    cbi.BronzeBadges,
+    cbi.TagBasedBadges,
+    pwt.Title as QuestionTitle,
+    pwt.Tags,
+    pwt.QuestionScore,
+    pwt.ViewCount,
+    pwt.AnswerScore as TopAnswerScore,
+    case 
+        when pwt.AnswerScore > pwt.QuestionScore then 'Top answer outperforms'
+        else 'Question stronger or no top answer'
+    end as PerformanceComparison,
+    crc.CloseReason,
+    crc.CloseCount,
+    cat.AvgAnswerScore,
+    rth.Level as TagDepth,
+    rth.Path as TagPath,
+    substring(u.AboutMe from 1 for 50) || '...' as AboutSnippet,
+    length(coalesce(u.AboutMe, '')) as AboutLength,
+    case when u.WebsiteUrl is not null and u.WebsiteUrl <> '' then 1 else 0 end as HasWebsite,
+    case when u.Location is null then 'Unknown' else u.Location end as UserLocation,
+    row_number() over (partition by u.Id order by pwt.ViewCount desc nulls last) as RankByViewCount
+from Users u
+left join UserPostStats ups on ups.UserId = u.Id
+left join ComplexUserBadgeInfo cbi on cbi.UserId = u.Id
+left join QuestionWithTopAnswer pwt on pwt.OwnerUserId = u.Id
+left join CloseReasonCounts crc on crc.CloseReason is not null
+left join CorrelatedAvgAnswerScore cat on cat.QuestionId = pwt.QuestionId
+left join RecursiveTagHierarchy rth on rth.TagName = (select unnest(string_to_array(coalesce(pwt.Tags, ''), '><')) order by 1 limit 1)
+where u.Reputation > 1000
+  and (ups.Questions > 5 or ups.Answers > 10)
+  and (cbi.GoldBadges + cbi.SilverBadges + cbi.BronzeBadges) > 2
+  and (pwt.ViewCount > 100 or pwt.QuestionScore > 5 or pwt.AnswerScore > 5)
+order by ups.TotalScore desc, pwt.ViewCount desc, u.Reputation desc
+limit 100;

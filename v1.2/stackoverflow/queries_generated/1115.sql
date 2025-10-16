@@ -1,0 +1,144 @@
+-- {"query": "1115.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.1, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1545} 
+with RecursiveTagHierarchy as (
+    select t.Id, t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, t.IsModeratorOnly, t.IsRequired, 1 as Level
+    from Tags t
+    where t.IsRequired = 1
+    union all
+    select t2.Id, t2.TagName, t2.Count, t2.ExcerptPostId, t2.WikiPostId, t2.IsModeratorOnly, t2.IsRequired, rh.Level + 1
+    from Tags t2
+    join RecursiveTagHierarchy rh on t2.Count < rh.Count and t2.IsRequired = 1
+    where rh.Level < 3
+),
+PostActivity as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.Reputation,
+        u.DisplayName,
+        coalesce(
+          (select max(ph.CreationDate) from PostHistory ph where ph.PostId = p.Id), 
+          p.LastActivityDate
+        ) as LastActivity,
+        case when p.ClosedDate is not null then 1 else 0 end as IsClosed,
+        coalesce(p.Title, '') as Title,
+        coalesce(p.Tags, '') as Tags,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc nulls last) as UserPostRank,
+        count(*) over (partition by p.OwnerUserId) as TotalPostsByUser
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId in (1, 2) -- Questions and Answers
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+    from Badges b
+    group by b.UserId
+),
+CloseReasonsSummary as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseCount
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10 -- Post Closed
+    group by ph.PostId, crt.Name
+),
+UserRecentActivity as (
+    select
+        p.OwnerUserId as UserId,
+        max(p.LastActivityDate) as LastPostActivity,
+        max(ph.CreationDate) as LastHistoryActivity
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.UserId = p.OwnerUserId
+    group by p.OwnerUserId
+),
+QuestionsWithLinked as (
+    select distinct q.Id as QuestionId, count(distinct pl.RelatedPostId) as LinkedPostCount
+    from Posts q
+    left join PostLinks pl on pl.PostId = q.Id and pl.LinkTypeId = 1
+    where q.PostTypeId = 1
+    group by q.Id
+),
+CombinedQuestions as (
+    select
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        ubc.GoldBadges,
+        ubc.SilverBadges,
+        ubc.BronzeBadges,
+        crs.CloseReasonName,
+        crs.CloseCount,
+        qwl.LinkedPostCount,
+        pa.OwnerUserId,
+        ua.LastPostActivity,
+        ua.LastHistoryActivity,
+        case when pa.IsClosed = 1 then 'Closed' else 'Open' end as Status,
+        substring(pa.Tags from 2 for length(pa.Tags) - 2) as CleanTags,
+        (pa.Score * 2 + coalesce(ubc.GoldBadges, 0) * 5 - coalesce(ubc.BronzeBadges, 0)) as WeightedScore,
+        row_number() over (order by (pa.Score * 2 + coalesce(ubc.GoldBadges, 0) * 5 - coalesce(ubc.BronzeBadges, 0)) desc nulls last) as GlobalRank
+    from PostActivity pa
+    left join UserBadgeCounts ubc on ubc.UserId = pa.OwnerUserId
+    left join CloseReasonsSummary crs on crs.PostId = pa.PostId
+    left join QuestionsWithLinked qwl on qwl.QuestionId = pa.PostId
+    left join UserRecentActivity ua on ua.UserId = pa.OwnerUserId
+    where pa.PostTypeId = 1
+)
+select 
+    cq.GlobalRank,
+    cq.PostId,
+    cq.Title,
+    cq.Score,
+    cq.ViewCount,
+    coalesce(cq.GoldBadges,0) as GoldBadges,
+    coalesce(cq.SilverBadges,0) as SilverBadges,
+    coalesce(cq.BronzeBadges,0) as BronzeBadges,
+    cq.CloseReasonName,
+    cq.CloseCount,
+    cq.LinkedPostCount,
+    cq.OwnerUserId,
+    u.DisplayName,
+    u.Reputation,
+    cq.LastPostActivity,
+    cq.LastHistoryActivity,
+    cq.Status,
+    cq.CleanTags,
+    cq.WeightedScore,
+    case 
+      when cq.Status = 'Closed' and cq.CloseCount > 5 then 'Hot Closed Question'
+      when cq.WeightedScore > 100 then 'High Weighted Score'
+      else 'Normal'
+    end as Label,
+    string_agg(distinct pht.Name, ', ') as PostHistoryEvents,
+    avg(v.Score) over (partition by cq.OwnerUserId) as AvgVoteScorePerUser,
+    count(distinct c.Id) over (partition by cq.PostId) as CommentsCount,
+    lag(cq.WeightedScore) over (order by cq.WeightedScore desc) as PreviousWeightedScore,
+    lead(cq.WeightedScore) over (order by cq.WeightedScore desc) as NextWeightedScore
+from CombinedQuestions cq
+left join Users u on u.Id = cq.OwnerUserId
+left join PostHistory ph on ph.PostId = cq.PostId and ph.CreationDate > (current_date - interval '90 days')
+left join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId
+left join Votes v on v.PostId = cq.PostId and v.VoteTypeId in (2,3)
+left join Comments c on c.PostId = cq.PostId
+where cq.WeightedScore > (
+    select avg(Score) * 1.5 from Posts where PostTypeId = 1
+)
+group by
+    cq.GlobalRank, cq.PostId, cq.Title, cq.Score, cq.ViewCount, cq.GoldBadges,
+    cq.SilverBadges, cq.BronzeBadges, cq.CloseReasonName, cq.CloseCount, cq.LinkedPostCount,
+    cq.OwnerUserId, u.DisplayName, u.Reputation, cq.LastPostActivity, cq.LastHistoryActivity,
+    cq.Status, cq.CleanTags, cq.WeightedScore
+having count(distinct c.Id) > (
+    select avg(CommentCount) from Posts where PostTypeId = 1
+)
+order by cq.GlobalRank
+limit 100;

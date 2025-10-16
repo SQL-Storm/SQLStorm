@@ -1,0 +1,138 @@
+-- {"query": "18063.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1104} 
+
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.CreationDate,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory AS ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6)
+  ),
+  RecentUserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      MAX(p.LastActivityDate) AS LastPostActivity
+    FROM Users AS u
+    JOIN Posts AS p
+      ON u.Id = p.OwnerUserId
+    WHERE
+      u.Views > 1000
+    GROUP BY
+      u.Id,
+      u.DisplayName
+  ),
+  HighActivityQuestions AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.Title,
+      p.Score,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.OwnerUserId,
+      p.CreationDate AS QuestionCreationDate,
+      ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.AnswerCount DESC) AS q_rank
+    FROM Posts AS p
+    WHERE
+      p.PostTypeId = 1
+      AND p.Score > 50
+      AND p.AnswerCount > 10
+      AND p.CreationDate BETWEEN '2023-01-01' AND '2023-12-31'
+  )
+SELECT
+  hsq.QuestionId,
+  hsq.Title,
+  hsq.Score,
+  hsq.AnswerCount,
+  hsq.FavoriteCount,
+  u.DisplayName AS QuestionOwner,
+  rua.DisplayName AS RecentActivityUser,
+  rua.LastPostActivity,
+  rpe.CreationDate AS LastEditDateByThisUser,
+  CASE
+    WHEN hsq.FavoriteCount > 100
+    AND EXISTS (
+      SELECT
+        1
+      FROM PostLinks AS pl
+      WHERE
+        pl.PostId = hsq.QuestionId
+        AND pl.LinkTypeId = 3
+    ) THEN 'Highly Favorited and Linked'
+    WHEN hsq.Score > 500 THEN 'Highly Scored'
+    WHEN hsq.AnswerCount > 50 THEN 'Highly Answered'
+    ELSE 'Standard High Activity'
+  END AS QuestionCategory,
+  COALESCE(pht.Name, 'Unknown Type') AS LastPostHistoryType,
+  COUNT(c.Id) AS CommentCountOnQuestion
+FROM HighActivityQuestions AS hsq
+LEFT JOIN Users AS u
+  ON hsq.OwnerUserId = u.Id
+LEFT JOIN RankedPostEdits AS rpe
+  ON hsq.QuestionId = rpe.PostId
+  AND rpe.rn = 1
+LEFT JOIN RecentUserActivity AS rua
+  ON rpe.UserId = rua.UserId
+LEFT JOIN PostHistoryTypes AS pht
+  ON rpe.PostHistoryTypeId = pht.Id
+LEFT JOIN Comments AS c
+  ON hsq.QuestionId = c.PostId
+WHERE
+  hsq.q_rank <= 50
+  AND (
+    rpe.UserId IS NULL
+    OR rpe.CreationDate > hsq.QuestionCreationDate + INTERVAL '30 days'
+  )
+GROUP BY
+  hsq.QuestionId,
+  hsq.Title,
+  hsq.Score,
+  hsq.AnswerCount,
+  hsq.FavoriteCount,
+  u.DisplayName,
+  rua.DisplayName,
+  rua.LastPostActivity,
+  rpe.CreationDate,
+  QuestionCategory,
+  pht.Name
+HAVING
+  COUNT(c.Id) > 5
+UNION ALL
+SELECT
+  p.Id,
+  p.Title,
+  p.Score,
+  p.AnswerCount,
+  p.FavoriteCount,
+  u.DisplayName,
+  NULL,
+  NULL,
+  NULL,
+  'Less Active Questions' AS QuestionCategory,
+  'Initial Post' AS LastPostHistoryType,
+  COUNT(c.Id)
+FROM Posts AS p
+JOIN Users AS u
+  ON p.OwnerUserId = u.Id
+LEFT JOIN Comments AS c
+  ON p.Id = c.PostId
+WHERE
+  p.PostTypeId = 1
+  AND p.Score BETWEEN 0 AND 10
+  AND p.AnswerCount BETWEEN 0 AND 2
+  AND p.CreationDate > NOW() - INTERVAL '7 days'
+GROUP BY
+  p.Id,
+  p.Title,
+  p.Score,
+  p.AnswerCount,
+  p.FavoriteCount,
+  u.DisplayName
+HAVING
+  COUNT(c.Id) <= 2
+ORDER BY
+  QuestionCategory,
+  Score DESC;

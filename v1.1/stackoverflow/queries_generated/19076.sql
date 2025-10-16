@@ -1,0 +1,200 @@
+-- {"query": "19076.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2593} 
+
+WITH RecentHighRepUsers AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.UpVotes,
+        U.DownVotes,
+        U.Views AS UserProfileViews,
+        -- Complex user activity score calculation based on votes, views, and duration on platform
+        (U.UpVotes * 0.7 + U.DownVotes * 0.3 + U.Views * 0.01) * (1 + EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - U.LastAccessDate)) / 8640000.0) AS UserActivityScore,
+        EXTRACT(YEAR FROM AGE(CURRENT_TIMESTAMP, U.CreationDate)) AS YearsOnPlatform
+    FROM
+        Users U
+    WHERE
+        U.Reputation > 7500
+        AND U.LastAccessDate >= CURRENT_TIMESTAMP - INTERVAL '1 year 3 months'
+        AND U.DisplayName IS NOT NULL
+),
+QuestionPerformance AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        P.Id AS PostId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.Title,
+        P.Tags,
+        P.AcceptedAnswerId,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        -- Conditional calculation for "Engagement Ratio" with NULL handling
+        CASE
+            WHEN P.ViewCount > 0 THEN (P.Score * 0.5 + P.CommentCount * 0.3 + COALESCE(P.FavoriteCount, 0) * 0.2) * 1.0 / P.ViewCount
+            ELSE 0.0
+        END AS EngagementRatio,
+        -- String expression and NULL logic for tags: clean, lowercased tags for pattern matching
+        LOWER(SUBSTRING(COALESCE(P.Tags, '<untagged>'), 2, LENGTH(COALESCE(P.Tags, '<untagged>')) - 2)) AS CleanTagsString,
+        -- Correlated subquery: count distinct historical editor action types by non-owners
+        (SELECT COUNT(DISTINCT PH.PostHistoryTypeId)
+         FROM PostHistory PH
+         WHERE PH.PostId = P.Id
+           AND PH.CreationDate > P.CreationDate
+           AND PH.UserId IS NOT NULL
+           AND PH.UserId != P.OwnerUserId
+           AND PH.PostHistoryTypeId IN (4, 5, 6, 8, 9) -- Edit/Rollback Title, Body, Tags
+        ) AS DistinctNonOwnerEditTypes,
+        -- Window function: Rank questions by score within a user's posts
+        RANK() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.CreationDate DESC) AS UserPostRank,
+        -- Window function: Lag to find previous post's creation date for time difference calculation
+        LAG(P.CreationDate, 1, P.CreationDate) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS PreviousPostCreationDate
+    FROM
+        Posts P
+    WHERE
+        P.PostTypeId = 1 -- Only Questions
+        AND P.OwnerUserId IN (SELECT UserId FROM RecentHighRepUsers)
+        AND P.CreationDate >= CURRENT_TIMESTAMP - INTERVAL '3 years'
+        AND P.ViewCount IS NOT NULL -- Exclude posts without view count
+        AND P.Title IS NOT NULL
+),
+AnswerAggregates AS (
+    SELECT
+        A.ParentId AS QuestionId,
+        COUNT(A.Id) AS TotalAnswers,
+        SUM(A.Score) AS TotalAnswerScore,
+        AVG(A.Score) AS AvgAnswerScore,
+        MAX(A.CreationDate) AS LatestAnswerDate,
+        COUNT(C.Id) AS TotalCommentsOnAnswers,
+        AVG(C.Score) AS AvgCommentScoreOnAnswers,
+        -- Correlated subquery to check if any answer contains a specific string pattern
+        MAX(CASE WHEN EXISTS (
+            SELECT 1 FROM Posts SubA WHERE SubA.Id = A.Id AND SubA.Body LIKE '%performance issue%'
+        ) THEN 1 ELSE 0 END) AS HasPerformanceAnswer
+    FROM
+        Posts A
+    LEFT JOIN
+        Comments C ON A.Id = C.PostId
+    WHERE
+        A.PostTypeId = 2 -- Only Answers
+    GROUP BY
+        A.ParentId
+),
+LinkedPostDetails AS (
+    SELECT
+        PL.PostId,
+        COUNT(CASE WHEN PL.LinkTypeId = 1 THEN PL.RelatedPostId END) AS LinkedPostsCount,
+        COUNT(CASE WHEN PL.LinkTypeId = 3 THEN PL.RelatedPostId END) AS DuplicatePostsCount,
+        MAX(CASE WHEN PL.LinkTypeId = 3 THEN P_Related.CreationDate END) AS LatestDuplicateDate,
+        -- Correlated subquery for specific related post info (title of the most recently linked post)
+        (SELECT P_Inner.Title FROM Posts P_Inner WHERE P_Inner.Id = (
+            SELECT InnerPL.RelatedPostId FROM PostLinks InnerPL
+            WHERE InnerPL.PostId = PL.PostId AND InnerPL.LinkTypeId = 1
+            ORDER BY InnerPL.CreationDate DESC
+            LIMIT 1
+        )) AS LatestLinkedPostTitle
+    FROM
+        PostLinks PL
+    JOIN
+        Posts P_Related ON PL.RelatedPostId = P_Related.Id
+    WHERE PL.PostId IN (SELECT PostId FROM QuestionPerformance)
+    GROUP BY PL.PostId
+),
+ModerationHistory AS (
+    SELECT
+        PH.PostId,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (10, 12) THEN 1 END) AS CloseDeleteCount, -- Closed or Deleted
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (11, 13) THEN 1 END) AS ReopenUndeleteCount, -- Reopened or Undeleted
+        MAX(PH.CreationDate) AS LastModerationActionDate,
+        -- String function with NULL handling: extract close reason type name if available
+        COALESCE(MAX(CASE WHEN PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL THEN (SELECT CRT.Name FROM CloseReasonTypes CRT WHERE CRT.Id = PH.Comment::smallint) END), 'N/A - No Close Reason') AS LastCloseReasonType
+    FROM
+        PostHistory PH
+    WHERE
+        PH.PostId IN (SELECT PostId FROM QuestionPerformance)
+        AND PH.PostHistoryTypeId IN (10, 11, 12, 13)
+    GROUP BY
+        PH.PostId
+)
+-- Main query combining all CTEs with complex filtering and calculations
+SELECT
+    RHU.DisplayName,
+    RHU.Reputation,
+    ROUND(RHU.UserActivityScore::numeric, 2) AS UserActivityScore,
+    QP.Title AS QuestionTitle,
+    QP.PostScore,
+    QP.PostViewCount,
+    ROUND(QP.EngagementRatio::numeric, 4) AS QuestionEngagementRatio,
+    QP.CleanTagsString,
+    QP.DistinctNonOwnerEditTypes,
+    QP.UserPostRank,
+    (EXTRACT(EPOCH FROM (QP.PostCreationDate - QP.PreviousPostCreationDate)) / 3600)::int AS HoursSincePreviousPost, -- Time difference in hours
+    COALESCE(AA.TotalAnswers, 0) AS TotalAnswers,
+    COALESCE(AA.AvgAnswerScore, 0.0) AS AvgAnswerScore,
+    COALESCE(AA.TotalCommentsOnAnswers, 0) AS TotalCommentsOnAnswers,
+    COALESCE(LPD.LinkedPostsCount, 0) AS TotalLinkedPosts,
+    COALESCE(LPD.DuplicatePostsCount, 0) AS TotalDuplicatePosts,
+    LPD.LatestLinkedPostTitle,
+    COALESCE(MH.CloseDeleteCount, 0) AS TotalCloseDeleteActions,
+    COALESCE(MH.ReopenUndeleteCount, 0) AS TotalReopenUndeleteActions,
+    MH.LastCloseReasonType,
+    -- Complicated predicate/expression using nested CASE for post impact categorization
+    CASE
+        WHEN QP.PostScore > 100 AND QP.EngagementRatio > 0.5 AND QP.DistinctNonOwnerEditTypes > 1 THEN 'High Impact & Collaborative'
+        WHEN QP.PostScore > 50 AND QP.CleanTagsString LIKE '%sql%' AND AA.HasPerformanceAnswer = 1 THEN 'Engaging SQL & Performance Focused'
+        WHEN QP.PostScore <= 10 OR QP.PostViewCount < 50 OR COALESCE(MH.CloseDeleteCount, 0) > 0 THEN 'Low Engagement or Problematic'
+        ELSE 'Moderate'
+    END AS PostImpactCategory,
+    -- Another correlated subquery to fetch the highest voted answer's body length category, demonstrating NULL and aggregation logic
+    (
+        SELECT
+            CASE
+                WHEN LENGTH(COALESCE(ANS.Body, '')) > 1000 THEN 'Very Long'
+                WHEN LENGTH(COALESCE(ANS.Body, '')) > 500 THEN 'Long'
+                WHEN LENGTH(COALESCE(ANS.Body, '')) > 100 THEN 'Medium'
+                ELSE 'Short'
+            END
+        FROM
+            Posts ANS
+        WHERE
+            ANS.ParentId = QP.PostId
+            AND ANS.PostTypeId = 2
+            AND ANS.Body IS NOT NULL
+        ORDER BY
+            ANS.Score DESC, ANS.CreationDate DESC
+        LIMIT 1
+    ) AS TopAnswerBodyLengthCategory,
+    -- Window function: Calculate average score of posts by same user within a 30-day rolling window
+    AVG(QP.PostScore) OVER (
+        PARTITION BY RHU.UserId
+        ORDER BY QP.PostCreationDate
+        RANGE BETWEEN INTERVAL '30 days' PRECEDING AND CURRENT ROW
+    ) AS AvgUserScoreLast30Days
+FROM
+    RecentHighRepUsers RHU
+INNER JOIN
+    QuestionPerformance QP ON RHU.UserId = QP.UserId
+LEFT JOIN
+    AnswerAggregates AA ON QP.PostId = AA.QuestionId
+LEFT JOIN
+    LinkedPostDetails LPD ON QP.PostId = LPD.PostId
+LEFT JOIN
+    ModerationHistory MH ON QP.PostId = MH.PostId
+WHERE
+    QP.UserPostRank <= 5 -- Only consider top 5 questions per user based on score
+    AND QP.CleanTagsString NOT LIKE '%meta%' -- Exclude meta posts using string pattern matching
+    AND (AA.TotalAnswers IS NULL OR AA.TotalAnswers > 0) -- Ensure we only see questions with answers or no answers (left join behavior)
+    AND (
+        QP.Title LIKE '%(optimis|performanc|scalabilit|latency)%' OR -- Regex-like string matching for critical keywords
+        QP.CleanTagsString LIKE '%<database>%' OR QP.CleanTagsString LIKE '%<sql>%' OR QP.CleanTagsString LIKE '%<query-optimization>%'
+    )
+    AND COALESCE(LPD.DuplicatePostsCount, 0) < 2 -- Questions not duplicated more than once
+ORDER BY
+    RHU.Reputation DESC,
+    QP.PostScore DESC,
+    QP.PostCreationDate ASC
+;

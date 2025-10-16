@@ -1,0 +1,280 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT ph.Id) AS HistoryCount,
+        COUNT(DISTINCT pl.Id) AS LinkCount,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                CAST(SUM(COALESCE(p.Score, 0)) AS NUMERIC) / COUNT(DISTINCT p.Id)
+            ELSE 0 
+        END AS AvgPostScore,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                CAST(SUM(COALESCE(p.ViewCount, 0)) AS NUMERIC) / COUNT(DISTINCT p.Id)
+            ELSE 0 
+        END AS AvgViewCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        MAX(b.Date) AS LastBadgeDate,
+        MIN(p.CreationDate) AS FirstPostDate,
+        -- Standard SQL age in days: use DATE_PART on difference in days where supported, else use CAST(date diff)
+        CAST(EXTRACT(EPOCH FROM (MAX(p.CreationDate) - MIN(p.CreationDate))) / 86400 AS INTEGER) AS DaysActive,
+        CAST(ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS NUMERIC) / 
+        (SELECT COUNT(*) FROM Users) AS PostRankPercentile,
+        CAST(ROW_NUMBER() OVER (ORDER BY SUM(COALESCE(p.Score, 0)) DESC) AS NUMERIC) / 
+        (SELECT COUNT(*) FROM Users) AS ScoreRankPercentile
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    LEFT JOIN PostLinks pl ON u.Id = pl.Id
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.CreationDate
+),
+TopQuestionUsers AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(p.Id) AS QuestionCount,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AvgScore,
+        AVG(p.ViewCount) AS AvgViews,
+        MAX(p.CreationDate) AS LastQuestionDate,
+        STRING_AGG(p.Title, ' | ' ORDER BY p.CreationDate) AS QuestionTitles
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+    GROUP BY p.OwnerUserId
+),
+UserTagStatistics AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(DISTINCT t.Id) AS TagCount,
+        STRING_AGG(t.TagName, ', ' ORDER BY t.Count DESC) AS PopularTags,
+        MAX(t.Count) AS MaxTagCount,
+        AVG(t.Count) AS AvgTagCount
+    FROM Users u
+    LEFT JOIN (
+        SELECT DISTINCT 
+            u.Id AS UserId,
+            t.Id AS TagId,
+            t.TagName,
+            t.Count
+        FROM Users u
+        JOIN Posts p ON u.Id = p.OwnerUserId
+        JOIN (
+            SELECT 
+                Id AS PostId,
+                TRIM(BOTH '<>' FROM Tags) AS tag
+            FROM Posts 
+            WHERE Tags IS NOT NULL AND Tags != ''
+        ) AS tag_parse ON p.Id = tag_parse.PostId
+        JOIN Tags t ON tag_parse.tag = t.TagName
+        WHERE t.IsRequired = 0
+    ) AS tag_mapping ON u.Id = tag_mapping.UserId
+    GROUP BY u.Id
+),
+ComplexQueryResults AS (
+    SELECT 
+        uas.UserId,
+        uas.Reputation,
+        uas.DisplayName,
+        uas.PostCount,
+        uas.CommentCount,
+        uas.BadgeCount,
+        uas.HistoryCount,
+        uas.LinkCount,
+        uas.AvgPostScore,
+        uas.AvgViewCount,
+        uas.DaysActive,
+        uas.PostRankPercentile,
+        uas.ScoreRankPercentile,
+        COALESCE(tqu.QuestionCount, 0) AS QuestionCount,
+        COALESCE(tqu.TotalScore, 0) AS TotalQuestionScore,
+        COALESCE(tqu.AvgScore, 0) AS AvgQuestionScore,
+        COALESCE(tqu.AvgViews, 0) AS AvgQuestionViews,
+        COALESCE(uts.TagCount, 0) AS TagCount,
+        COALESCE(uts.PopularTags, '') AS PopularTags,
+        COALESCE(uts.MaxTagCount, 0) AS MaxTagCount,
+        COALESCE(uts.AvgTagCount, 0) AS AvgTagCount,
+        CASE 
+            WHEN uas.PostCount > 0 AND uas.CommentCount > 0 THEN 
+                CAST(uas.CommentCount AS NUMERIC) / uas.PostCount
+            ELSE 0 
+        END AS CommentToPostRatio,
+        CASE 
+            WHEN uas.PostCount > 0 THEN 
+                CAST(uas.BadgeCount AS NUMERIC) / uas.PostCount
+            ELSE 0 
+        END AS BadgeToPostRatio,
+        CASE 
+            WHEN uas.HistoryCount > 0 THEN 
+                CAST(uas.PostCount AS NUMERIC) / uas.HistoryCount
+            ELSE 0 
+        END AS PostToHistoryRatio,
+        CASE 
+            WHEN uas.Reputation > 10000 THEN 'Elite'
+            WHEN uas.Reputation > 1000 THEN 'Advanced'
+            WHEN uas.Reputation > 100 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END AS ReputationTier,
+        CASE 
+            WHEN uas.PostCount > 1000 THEN 1
+            WHEN uas.PostCount > 100 THEN 2
+            WHEN uas.PostCount > 10 THEN 3
+            ELSE 4
+        END AS ActivityLevel,
+        CASE 
+            WHEN uas.PostCount > 0 THEN 
+                CASE WHEN uas.PostCount <> 0 THEN CAST(EXTRACT(EPOCH FROM (uas.LastPostDate - uas.FirstPostDate)) / 86400 AS NUMERIC) / uas.PostCount ELSE 0 END
+            ELSE 0 
+        END AS AvgDaysBetweenPosts,
+        ROW_NUMBER() OVER (PARTITION BY 
+            CASE 
+                WHEN uas.Reputation > 10000 THEN 'Elite'
+                WHEN uas.Reputation > 1000 THEN 'Advanced'
+                WHEN uas.Reputation > 100 THEN 'Intermediate'
+                ELSE 'Beginner'
+            END 
+            ORDER BY uas.AvgPostScore DESC
+        ) AS ReputationRankWithinTier,
+        LAG(uas.Reputation, 1, 0) OVER (
+            ORDER BY uas.Reputation DESC
+        ) AS PreviousReputation,
+        LEAD(uas.Reputation, 1, 0) OVER (
+            ORDER BY uas.Reputation DESC
+        ) AS NextReputation
+    FROM UserActivityStats uas
+    LEFT JOIN TopQuestionUsers tqu ON uas.UserId = tqu.OwnerUserId
+    LEFT JOIN UserTagStatistics uts ON uas.UserId = uts.UserId
+),
+FinalRankedData AS (
+    SELECT 
+        fr.*,
+        CASE 
+            WHEN PostCount > 100 AND AvgPostScore > 5 THEN 'Highly Active'
+            WHEN PostCount > 50 AND AvgPostScore > 2 THEN 'Moderately Active'
+            WHEN PostCount > 10 AND AvgPostScore > 1 THEN 'Active'
+            ELSE 'Occasional'
+        END AS ActivityStatus,
+        CASE 
+            WHEN ReputationTier IN ('Elite', 'Advanced') AND QuestionCount > 10 THEN 'Question Expert'
+            WHEN ReputationTier = 'Elite' AND TagCount > 50 THEN 'Tag Master'
+            ELSE 'Regular'
+        END AS UserCategory,
+        ABS(Reputation - COALESCE(
+            (SELECT AVG(Reputation) FROM Users WHERE Id IN (SELECT UserId FROM UserActivityStats)), 
+            (SELECT AVG(Reputation) FROM Users)
+        )) AS ReputationDeviation,
+        DENSE_RANK() OVER (ORDER BY Reputation DESC) AS RankByReputation,
+        NTILE(10) OVER (ORDER BY Reputation DESC) AS ReputationDecile,
+        PERCENT_RANK() OVER (ORDER BY Reputation DESC) AS ReputationPercentile,
+        STDDEV(Reputation) OVER () AS ReputationStdDev,
+        AVG(AvgPostScore) OVER () AS OverallAvgScore,
+        AVG(PostCount) OVER () AS OverallAvgPostCount
+    FROM ComplexQueryResults fr
+),
+ComplexAggregations AS (
+    SELECT 
+        COUNT(*) AS TotalUsers,
+        COUNT(CASE WHEN QuestionCount > 0 THEN 1 END) AS UsersWithQuestions,
+        COUNT(CASE WHEN CommentCount > 0 THEN 1 END) AS UsersWithComments,
+        COUNT(CASE WHEN BadgeCount > 0 THEN 1 END) AS UsersWithBadges,
+        COUNT(CASE WHEN TagCount > 0 THEN 1 END) AS UsersWithTags,
+        AVG(Reputation) AS AvgReputation,
+        MIN(Reputation) AS MinReputation,
+        MAX(Reputation) AS MaxReputation,
+        SUM(PostCount) AS TotalPosts,
+        SUM(QuestionCount) AS TotalQuestions,
+        SUM(CommentCount) AS TotalComments,
+        SUM(TagCount) AS TotalTagReferences,
+        AVG(PostCount) AS AveragePostsPerUser,
+        AVG(QuestionCount) AS AverageQuestionsPerUser,
+        AVG(CommentCount) AS AverageCommentsPerUser,
+        AVG(TagCount) AS AverageTagsPerUser
+    FROM FinalRankedData
+)
+SELECT 
+    frd.UserId,
+    frd.Reputation,
+    frd.DisplayName,
+    frd.PostCount,
+    frd.CommentCount,
+    frd.BadgeCount,
+    frd.HistoryCount,
+    frd.AvgPostScore,
+    frd.AvgViewCount,
+    frd.QuestionCount,
+    frd.TotalQuestionScore,
+    frd.AvgQuestionScore,
+    frd.TagCount,
+    frd.PopularTags,
+    frd.ReputationTier,
+    frd.ActivityLevel,
+    frd.ActivityStatus,
+    frd.UserCategory,
+    frd.ReputationDeviation,
+    frd.RankByReputation,
+    frd.ReputationDecile,
+    frd.ReputationPercentile,
+    ca.TotalUsers,
+    ca.UsersWithQuestions,
+    ca.UsersWithComments,
+    ca.UsersWithBadges,
+    ca.UsersWithTags,
+    ca.AvgReputation,
+    ca.MinReputation,
+    ca.MaxReputation,
+    ca.TotalPosts,
+    ca.TotalQuestions,
+    ca.TotalComments,
+    ca.TotalTagReferences,
+    ca.AveragePostsPerUser,
+    ca.AverageQuestionsPerUser,
+    ca.AverageCommentsPerUser,
+    ca.AverageTagsPerUser,
+    CASE 
+        WHEN frd.Reputation >= 50000 THEN 'Golden User'
+        WHEN frd.Reputation >= 10000 THEN 'Silver User'
+        WHEN frd.Reputation >= 1000 THEN 'Bronze User'
+        ELSE 'New User'
+    END AS UserRank,
+    CASE 
+        WHEN frd.PostCount > ca.AveragePostsPerUser * 1.5 THEN 'Above Average Poster'
+        WHEN frd.PostCount > ca.AveragePostsPerUser THEN 'Average Poster'
+        ELSE 'Below Average Poster'
+    END AS PosterStatus,
+    CASE 
+        WHEN frd.QuestionCount > 0 THEN 
+            CAST(frd.TotalQuestionScore AS NUMERIC) / frd.QuestionCount
+        ELSE 0 
+    END AS AvgScorePerQuestion,
+    CASE 
+        WHEN frd.Reputation > 0 THEN 
+            CAST(frd.PostCount AS NUMERIC) / frd.Reputation
+        ELSE 0 
+    END AS PostsPerReputation,
+    CASE 
+        WHEN frd.TagCount > 0 THEN 
+            CAST(frd.QuestionCount AS NUMERIC) / frd.TagCount
+        ELSE 0 
+    END AS QuestionsPerTag,
+    LAG(frd.DisplayName, 1) OVER (ORDER BY frd.Reputation DESC) AS PreviousUser,
+    LEAD(frd.DisplayName, 1) OVER (ORDER BY frd.Reputation DESC) AS NextUser,
+    ABS(frd.Reputation - (SELECT AVG(Reputation) FROM Users)) AS ReputationDeviationFromMean,
+    COALESCE(
+        (SELECT MAX(Reputation) FROM Users WHERE Id = frd.UserId), 
+        0
+    ) AS ActualMaxReputation
+FROM FinalRankedData frd
+CROSS JOIN ComplexAggregations ca
+WHERE frd.PostCount > 0
+    AND frd.Reputation >= 100
+    AND (frd.QuestionCount > 0 OR frd.CommentCount > 0 OR frd.BadgeCount > 0)
+ORDER BY frd.Reputation DESC, frd.PostCount DESC, frd.CommentCount DESC
+LIMIT 10000;

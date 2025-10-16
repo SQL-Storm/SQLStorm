@@ -1,0 +1,148 @@
+-- {"query": "19026.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2349} 
+
+WITH UserBadgeSummary AS (
+    -- Aggregates badge information for each user
+    SELECT
+        u.Id AS UserId,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE b.Class WHEN 1 THEN 3 /* Gold */ WHEN 2 THEN 2 /* Silver */ WHEN 3 THEN 1 /* Bronze */ ELSE 0 END) AS WeightedBadgeScore,
+        MAX(b.Date) AS LastBadgeAwardDate,
+        MIN(b.Date) AS FirstBadgeAwardDate,
+        COUNT(DISTINCT b.Name) FILTER (WHERE b.TagBased = TRUE) AS TagBadgesCount
+    FROM Users AS u
+    LEFT JOIN Badges AS b ON u.Id = b.UserId
+    GROUP BY u.Id
+),
+PostStatistics AS (
+    -- Aggregates various metrics for posts created by each user, distinguishing between Questions (PostTypeId=1) and Answers (PostTypeId=2)
+    SELECT
+        p.OwnerUserId AS UserId,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS TotalQuestionViews,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS TotalAcceptedAnswers,
+        MAX(p.CreationDate) AS LastPostCreationDate,
+        MIN(p.CreationDate) AS FirstPostCreationDate,
+        SUM(COALESCE(p.CommentCount, 0)) AS TotalCommentsOnOwnPosts,
+        MAX(p.Score) FILTER (WHERE p.PostTypeId = 1) AS MaxQuestionScore,
+        MAX(p.FavoriteCount) FILTER (WHERE p.PostTypeId = 1) AS MaxQuestionFavoriteCount,
+        -- Complex string aggregation for a sample of tags from user's questions
+        STRING_AGG(DISTINCT SUBSTRING(t.TagName, 1, 15), '; ') FILTER (WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL) AS UserQuestionTagsSample
+    FROM Posts AS p
+    LEFT JOIN (
+        -- Subquery to unnest tags from posts, handling NULLs and empty strings
+        SELECT DISTINCT Id, unnest(string_to_array(SUBSTRING(Tags, 2, LENGTH(Tags) - 2), '><')) AS TagName
+        FROM Posts
+        WHERE PostTypeId = 1 AND Tags IS NOT NULL AND LENGTH(Tags) > 2
+    ) AS t ON p.Id = t.Id
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+HistoricalUserActions AS (
+    -- Summarizes user actions from PostHistory, focusing on edits and content changes
+    SELECT
+        ph.UserId,
+        COUNT(ph.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS TotalEditsMade, -- Title, Body, Tags edits
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10) THEN 1 ELSE 0 END) AS TotalClosesMade, -- Close actions
+        MIN(ph.CreationDate) AS FirstHistoryActionDate,
+        MAX(ph.CreationDate) AS LastHistoryActionDate,
+        -- Calculate the average time between consecutive edits made by a user (if any)
+        AVG(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN EXTRACT(EPOCH FROM (ph.CreationDate - LAG(ph.CreationDate, 1) OVER (PARTITION BY ph.UserId, ph.PostId ORDER BY ph.CreationDate))) / 3600.0 ELSE NULL END) AS AvgHoursBetweenEdits
+    FROM PostHistory AS ph
+    WHERE ph.UserId IS NOT NULL
+    GROUP BY ph.UserId
+),
+UserCommentActivity AS (
+    -- Aggregates comment statistics for each user
+    SELECT
+        c.UserId,
+        COUNT(c.Id) AS TotalCommentsMade,
+        MAX(c.CreationDate) AS LastCommentDate,
+        AVG(c.Score) AS AvgCommentScore,
+        SUM(CASE WHEN LOWER(c.Text) LIKE '%thank%' OR LOWER(c.Text) LIKE '%appreciate%' THEN 1 ELSE 0 END) AS ThankYouCommentsCount
+    FROM Comments AS c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+)
+SELECT
+    u.Id AS UserIdentifier,
+    u.DisplayName AS UserName,
+    u.Reputation,
+    u.CreationDate AS AccountCreationDate,
+    u.LastAccessDate,
+    COALESCE(u.Location, 'Unspecified Region') AS UserLocation,
+    u.Views AS ProfileViews,
+    ubs.TotalBadges,
+    ubs.WeightedBadgeScore,
+    ps.TotalQuestions,
+    ps.TotalAnswers,
+    ps.TotalQuestionScore,
+    ps.TotalAnswerScore,
+    ps.TotalQuestionViews,
+    ps.TotalAcceptedAnswers,
+    h.TotalEditsMade,
+    h.TotalClosesMade,
+    uca.TotalCommentsMade,
+    uca.AvgCommentScore,
+    -- Calculate user's activity score based on reputation, posts, and comments
+    (u.Reputation * 0.5 + COALESCE(ps.TotalQuestionScore, 0) * 0.2 + COALESCE(ps.TotalAnswerScore, 0) * 0.2 + COALESCE(uca.AvgCommentScore, 0) * 0.1) AS CalculatedActivityScore,
+    -- Rank users by reputation within their location
+    RANK() OVER (PARTITION BY COALESCE(u.Location, 'Global') ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS RankInLocationByReputation,
+    -- Calculate the cumulative sum of profile views for users registered in the same year
+    SUM(u.Views) OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation DESC) AS CumulativeViewsByRegistrationYear,
+    -- User's average score for accepted answers on their questions (correlated subquery, only for questions with accepted answers)
+    COALESCE((
+        SELECT AVG(ans.Score)
+        FROM Posts AS q_parent
+        JOIN Posts AS ans ON q_parent.AcceptedAnswerId = ans.Id
+        WHERE q_parent.OwnerUserId = u.Id AND ans.OwnerUserId = u.Id -- Accepted answer is also by this user
+    ), 0) AS AvgScoreOnOwnAcceptedAnswers,
+    -- Determine if the user has a "power user" flag based on various criteria
+    CASE
+        WHEN u.Reputation > 10000 AND ubs.WeightedBadgeScore >= 10 AND ps.TotalQuestions > 50 AND ps.TotalAcceptedAnswers > 20 THEN 'Power User'
+        WHEN u.Reputation > 5000 AND ubs.TotalBadges >= 5 AND h.TotalEditsMade > 10 THEN 'Contributor'
+        WHEN u.Reputation > 1000 THEN 'Active Member'
+        ELSE 'Casual User'
+    END AS UserSegment,
+    -- Calculate the age of the account in days
+    EXTRACT(DAY FROM (NOW() - u.CreationDate)) AS AccountAgeDays,
+    -- Identify users who have made edits but never posted a question themselves
+    COALESCE(h.TotalEditsMade, 0) > 0 AND COALESCE(ps.TotalQuestions, 0) = 0 AS EditorOnlyFlag,
+    -- Example of a more complex predicate, checking for a user's latest post activity against global average
+    (u.LastAccessDate > (SELECT AVG(LastAccessDate) FROM Users WHERE LastAccessDate IS NOT NULL) - INTERVAL '30 days') AS RecentGlobalActivityIndicator,
+    -- Percentage of user's posts that are questions
+    NULLIF(CAST(ps.TotalQuestions AS DECIMAL) * 100 / (ps.TotalQuestions + ps.TotalAnswers), 0) AS QuestionPostPercentage,
+    ps.UserQuestionTagsSample,
+    -- Look at the body of one of their highly viewed questions for specific keywords
+    (
+        SELECT p_high.Body
+        FROM Posts p_high
+        WHERE p_high.OwnerUserId = u.Id
+          AND p_high.PostTypeId = 1
+          AND p_high.ViewCount > 10000
+        ORDER BY p_high.Score DESC, p_high.ViewCount DESC
+        LIMIT 1
+    ) AS TopQuestionBodySnippet
+FROM Users AS u
+LEFT JOIN UserBadgeSummary AS ubs ON u.Id = ubs.UserId
+LEFT JOIN PostStatistics AS ps ON u.Id = ps.UserId
+LEFT JOIN HistoricalUserActions AS h ON u.Id = h.UserId
+LEFT JOIN UserCommentActivity AS uca ON u.Id = uca.UserId
+WHERE
+    u.Reputation >= 500 -- Minimum reputation for inclusion
+    AND u.LastAccessDate >= NOW() - INTERVAL '2 years' -- Active in the last two years
+    AND (u.DisplayName IS NOT NULL AND LENGTH(TRIM(u.DisplayName)) > 3) -- Valid and reasonable display name
+    AND (
+        COALESCE(ps.TotalQuestions, 0) > 0 OR COALESCE(ps.TotalAnswers, 0) > 0 OR COALESCE(h.TotalEditsMade, 0) > 0
+    ) -- Must have some form of contribution
+    AND (LOWER(u.Location) LIKE '%data%' OR LOWER(u.Location) LIKE '%software%' OR u.Location IS NULL) -- Focus on specific locations or unspecifed
+HAVING
+    -- Ensure selected users have a minimum calculated activity score and some badge recognition
+    CalculatedActivityScore > 500
+    AND (ubs.TotalBadges IS NULL OR ubs.TotalBadges > 2)
+ORDER BY
+    CalculatedActivityScore DESC, RankInLocationByReputation ASC, AccountAgeDays DESC
+LIMIT 7500;

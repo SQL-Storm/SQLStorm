@@ -1,0 +1,120 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COALESCE(SUM(v.Score), 0) AS TotalPostScore,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RankByRep
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 2
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+), 
+TopUsers AS (
+    SELECT *
+    FROM UserStats
+    WHERE RankByRep <= 100
+), 
+TagQuestionStats AS (
+    SELECT 
+        p.OwnerUserId,
+        tag AS Tag,
+        COUNT(*) FILTER (WHERE p.Score >= 5) AS HighScoreQs,
+        COUNT(*) AS TotalQs,
+        AVG(p.ViewCount) AS AvgViews,
+        MAX(p.CreationDate) AS LatestQuestion
+    FROM Posts p,
+         LATERAL (
+           SELECT UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), '><')) AS tag
+         ) t
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId, tag
+), 
+AnswerPerformance AS (
+    SELECT 
+        a.OwnerUserId,
+        SUM(CASE WHEN a.Score >= 10 THEN 1 ELSE 0 END) AS HighlyScoredAnswers,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.CreationDate) AS LatestAnswer
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    GROUP BY a.OwnerUserId
+), 
+DuplicateInfo AS (
+    SELECT 
+        pl.PostId AS DuplicateOf,
+        pl.RelatedPostId AS OriginalPost,
+        ph.CreationDate AS ClosedDate,
+        ph.Comment AS CloseReasonJson
+    FROM PostLinks pl
+    JOIN PostHistory ph ON ph.PostId = pl.PostId
+    WHERE pl.LinkTypeId = 3
+      AND ph.PostHistoryTypeId = 10
+), 
+UserCombined AS (
+    SELECT 
+        tu.Id,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.BadgeCount,
+        tu.GoldBadges,
+        tu.SilverBadges,
+        tu.BronzeBadges,
+        tu.TotalPostScore,
+        tq.Tag,
+        tq.HighScoreQs,
+        tq.TotalQs,
+        tq.AvgViews,
+        ap.HighlyScoredAnswers,
+        ap.AvgAnswerScore,
+        di.DuplicateOf,
+        di.OriginalPost,
+        CASE
+            WHEN di.CloseReasonJson IS NULL THEN 'N/A'
+            ELSE COALESCE(NULLIF(di.CloseReasonJson, ''), 'Unknown')
+        END AS CloseReason
+    FROM TopUsers tu
+    LEFT JOIN TagQuestionStats tq ON tq.OwnerUserId = tu.Id
+    LEFT JOIN AnswerPerformance ap ON ap.OwnerUserId = tu.Id
+    LEFT JOIN DuplicateInfo di 
+        ON di.DuplicateOf = ANY (
+            SELECT Id 
+            FROM Posts 
+            WHERE OwnerUserId = tu.Id AND PostTypeId = 1
+        )
+)
+SELECT *
+FROM UserCombined
+WHERE (BadgeCount > 5 OR GoldBadges > 0)
+  AND (COALESCE(HighScoreQs, 0) > 0 OR COALESCE(HighlyScoredAnswers, 0) > 0)
+  AND (CloseReason <> 'N/A')
+ORDER BY Reputation DESC, BadgeCount DESC
+LIMIT 200
+
+UNION ALL
+
+SELECT 
+    CAST(NULL AS bigint) AS Id,
+    'SUMMARY' AS DisplayName,
+    CAST(NULL AS integer) AS Reputation,
+    CAST(NULL AS integer) AS BadgeCount,
+    CAST(NULL AS integer) AS GoldBadges,
+    CAST(NULL AS integer) AS SilverBadges,
+    CAST(NULL AS integer) AS BronzeBadges,
+    CAST(NULL AS bigint) AS TotalPostScore,
+    CAST(NULL AS text) AS Tag,
+    CAST(NULL AS integer) AS HighScoreQs,
+    CAST(NULL AS integer) AS TotalQs,
+    CAST(NULL AS double precision) AS AvgViews,
+    CAST(NULL AS integer) AS HighlyScoredAnswers,
+    CAST(NULL AS double precision) AS AvgAnswerScore,
+    CAST(NULL AS bigint) AS DuplicateOf,
+    CAST(NULL AS bigint) AS OriginalPost,
+    CAST(NULL AS text) AS CloseReason
+FROM (SELECT COUNT(*) AS TotalUsers FROM TopUsers) s;

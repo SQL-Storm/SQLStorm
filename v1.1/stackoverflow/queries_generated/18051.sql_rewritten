@@ -1,0 +1,140 @@
+-- {"query": "18051.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1729} 
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) as rn_by_type,
+        SUM(COALESCE(c.Score, 0)) OVER (PARTITION BY p.Id) AS TotalCommentScore,
+        AVG(COALESCE(v.VoteTypeId, 0)) OVER (PARTITION BY p.Id) AS AvgVoteType
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.CreationDate > '2023-01-01'
+),
+UserPostContribution AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT rp.PostId) AS NumberOfPosts,
+        SUM(CASE WHEN rp.PostTypeId = 1 THEN 1 ELSE 0 END) AS NumberOfQuestions,
+        SUM(CASE WHEN rp.PostTypeId = 2 THEN 1 ELSE 0 END) AS NumberOfAnswers,
+        AVG(rp.PostScore) AS AveragePostScore,
+        MAX(rp.PostCreationDate) AS LatestPostDate,
+        -- Correlated subquery to get the user's most recent badge for a specific tag
+        (
+            SELECT
+                b.Name
+            FROM Badges b
+            WHERE b.UserId = u.Id
+              AND b.TagBased = 1
+              AND b.Name IN (SELECT DISTINCT TAG FROM STRING_SPLIT(REPLACE(REPLACE(p_inner.Tags, '<', ''), '>', ''), ' ')) -- Assuming Posts.Tags is delimited by '>' and '<'
+              AND b.Date = (SELECT MAX(b_inner.Date) FROM Badges b_inner WHERE b_inner.UserId = u.Id AND b_inner.TagBased = 1 AND b_inner.Name IN (SELECT DISTINCT TAG FROM STRING_SPLIT(REPLACE(REPLACE(p_inner.Tags, '<', ''), '>', ''), ' ')))
+            ORDER BY b.Date DESC
+            FETCH FIRST 1 ROW ONLY
+        ) AS LatestTagBadgeName,
+        COUNT(DISTINCT ph.Id) AS PostHistoryCount
+    FROM Users u
+    JOIN RankedPosts rp ON u.Id = rp.OwnerUserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId AND rp.PostId = ph.PostId AND ph.PostHistoryTypeId IN (4, 5, 6) -- Edits
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT rp.PostId) > 5
+),
+PostAggregates AS (
+    SELECT
+        rp.PostId,
+        rp.PostTypeName,
+        rp.PostScore,
+        rp.PostViewCount,
+        rp.TotalCommentScore,
+        rp.AvgVoteType,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.ClosedDate,
+        rp.rn_by_type,
+        upc.DisplayName AS OwnerDisplayName,
+        upc.Reputation AS OwnerReputation,
+        -- Complicated calculation: score per view, adjusted for answers and comments
+        CASE
+            WHEN rp.PostViewCount > 0 THEN
+                (rp.PostScore * 1.0 / rp.PostViewCount) *
+                (1 + COALESCE(rp.AnswerCount, 0) * 0.5) *
+                (1 + COALESCE(rp.CommentCount, 0) * 0.1)
+            ELSE rp.PostScore * 1.0
+        END AS PerformanceMetric
+    FROM RankedPosts rp
+    LEFT JOIN UserPostContribution upc ON rp.OwnerUserId = upc.UserId
+)
+SELECT
+    pa.PostId,
+    pa.PostTypeName,
+    pa.PostScore,
+    pa.PostViewCount,
+    pa.TotalCommentScore,
+    pa.AvgVoteType,
+    pa.AnswerCount,
+    pa.CommentCount,
+    pa.FavoriteCount,
+    pa.PerformanceMetric,
+    pa.OwnerDisplayName,
+    pa.OwnerReputation,
+    pa.ClosedDate,
+    CASE WHEN pa.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus,
+    -- Check if the post is a duplicate based on PostLinks
+    CASE
+        WHEN EXISTS (
+            SELECT 1
+            FROM PostLinks pl
+            WHERE pl.PostId = pa.PostId
+              AND pl.LinkTypeId = 3
+        ) THEN 'Duplicate'
+        ELSE 'Not Duplicate'
+    END AS DuplicateStatus,
+    -- String manipulation and concatenation
+    CONCAT(pa.PostTypeName, ' - Score: ', pa.PostScore, ' | Views: ', pa.PostViewCount) AS PostSummary,
+    -- NULL logic and aggregation
+    COALESCE(pa.FavoriteCount, 0) + COALESCE(pa.CommentCount, 0) AS EngagementScore,
+    -- Window function for rank within its type
+    pa.rn_by_type,
+    -- Set operator (UNION ALL) to include older posts with specific criteria
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Score < 0 AND CreationDate < '2023-01-01') AS LowScoreQuestionsBefore2023
+FROM PostAggregates pa
+WHERE pa.PostScore > 0 OR pa.PostViewCount > 1000
+UNION ALL
+SELECT
+    rp_old.PostId,
+    rp_old.PostTypeName,
+    rp_old.PostScore,
+    rp_old.PostViewCount,
+    rp_old.TotalCommentScore,
+    rp_old.AvgVoteType,
+    rp_old.AnswerCount,
+    rp_old.CommentCount,
+    rp_old.FavoriteCount,
+    (rp_old.PostScore * 1.0 / rp_old.PostViewCount) * (1 + COALESCE(rp_old.AnswerCount, 0) * 0.5) AS PerformanceMetric, -- Simplified metric for older posts
+    upc_old.DisplayName AS OwnerDisplayName,
+    upc_old.Reputation AS OwnerReputation,
+    rp_old.ClosedDate,
+    CASE WHEN rp_old.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus,
+    'Unknown' AS DuplicateStatus,
+    CONCAT(rp_old.PostTypeName, ' - Score: ', rp_old.PostScore) AS PostSummary,
+    COALESCE(rp_old.FavoriteCount, 0) AS EngagementScore,
+    rp_old.rn_by_type,
+    NULL -- Placeholder for the UNION ALL part
+FROM RankedPosts rp_old
+LEFT JOIN UserPostContribution upc_old ON rp_old.OwnerUserId = upc_old.UserId
+WHERE rp_old.PostTypeId = 1 -- Only questions
+  AND rp_old.Score < 0
+  AND rp_old.CreationDate < '2023-01-01'
+ORDER BY PerformanceMetric DESC;

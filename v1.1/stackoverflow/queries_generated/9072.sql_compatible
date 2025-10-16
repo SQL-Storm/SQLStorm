@@ -1,0 +1,127 @@
+WITH
+    recent_posts AS (
+        SELECT
+            p.OwnerUserId AS UserId,
+            COUNT(*) AS PostCount
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+          AND p.OwnerUserId IS NOT NULL
+        GROUP BY p.OwnerUserId
+    ),
+    high_activity AS (
+        SELECT
+            rp.UserId
+        FROM recent_posts rp
+        WHERE rp.PostCount > (
+            SELECT AVG(rp2.PostCount) FROM recent_posts rp2
+        )
+    ),
+    tag_usage AS (
+        SELECT
+            p.OwnerUserId AS UserId,
+            unnest(
+                string_to_array(
+                    substring(p.Tags FROM 2 FOR (length(p.Tags) - 2)),
+                    '><'
+                )
+            ) AS Tag
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.Tags IS NOT NULL
+          AND p.OwnerUserId IS NOT NULL
+    ),
+    popular_tag AS (
+        SELECT
+            tu.UserId,
+            tu.Tag,
+            ROW_NUMBER() OVER (
+                PARTITION BY tu.UserId
+                ORDER BY COUNT(*) DESC, tu.Tag
+            ) AS rk
+        FROM tag_usage tu
+        GROUP BY tu.UserId, tu.Tag
+    ),
+    top_tags AS (
+        SELECT
+            pt.UserId,
+            pt.Tag AS TopTag
+        FROM popular_tag pt
+        WHERE pt.rk = 1
+    ),
+    avg_answer_age AS (
+        SELECT
+            a.OwnerUserId AS UserId,
+            AVG(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - a.CreationDate)))/3600 AS AvgAnswerAgeHours
+        FROM Posts a
+        WHERE a.PostTypeId = 2
+          AND a.OwnerUserId IS NOT NULL
+        GROUP BY a.OwnerUserId
+    ),
+    badge_counts AS (
+        SELECT
+            b.UserId,
+            COUNT(*) AS BadgeCount,
+            COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+    elite_users AS (
+        SELECT
+            u.Id,
+            u.DisplayName
+        FROM Users u
+        WHERE u.Reputation > (
+            SELECT PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY Reputation) FROM Users
+        )
+    ),
+    combined AS (
+        SELECT
+            u.Id,
+            u.DisplayName,
+            rp.PostCount,
+            tt.TopTag
+        FROM elite_users u
+        LEFT JOIN recent_posts rp ON rp.UserId = u.Id
+        LEFT JOIN top_tags tt ON tt.UserId = u.Id
+    ),
+    set_op AS (
+        (SELECT Id, DisplayName FROM Users WHERE Views > 10000)
+        INTERSECT
+        (SELECT Id, DisplayName FROM combined)
+        EXCEPT
+        (SELECT Id, DisplayName FROM Users WHERE LastAccessDate < CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months')
+    )
+
+SELECT
+    c.Id,
+    c.DisplayName,
+    COALESCE(c.PostCount, 0) AS RecentQuestionCount,
+    ba.AvgAnswerAgeHours AS AvgAnswerAgeHours,
+    COALESCE(bc.BadgeCount, 0) AS TotalBadges,
+    COALESCE(bc.GoldBadges, 0) AS GoldBadges,
+    ROW_NUMBER() OVER (ORDER BY COALESCE(c.PostCount,0) DESC) AS ActivityRank,
+    CASE
+        WHEN COALESCE(c.PostCount,0) > 0
+        THEN CAST(bc.BadgeCount AS DECIMAL) / NULLIF(c.PostCount,0)
+        ELSE NULL
+    END AS BadgesPerQuestion,
+    SUBSTRING(c.DisplayName FROM 1 FOR 2)
+      || '***'
+      || SUBSTRING(c.DisplayName FROM GREATEST(LENGTH(c.DisplayName)-1,1) FOR 2)
+      AS MaskedName,
+    (
+      SELECT COUNT(*)
+      FROM Comments cm
+      WHERE cm.UserId = c.Id
+        AND cm.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    ) AS RecentCommentCount
+FROM combined c
+FULL OUTER JOIN badge_counts bc ON bc.UserId = c.Id
+FULL OUTER JOIN avg_answer_age ba ON ba.UserId = c.Id
+WHERE (c.Id, c.DisplayName) IN (SELECT Id, DisplayName FROM set_op)
+   OR bc.BadgeCount > COALESCE(
+        (SELECT AVG(bc2.BadgeCount) FROM badge_counts bc2),
+        0
+      )
+ORDER BY ActivityRank, TotalBadges DESC NULLS LAST;

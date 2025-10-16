@@ -1,0 +1,169 @@
+-- {"query": "1366.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1732} 
+
+WITH RecursiveRelatedPosts AS (
+    SELECT 
+        pl.PostId,
+        pl.RelatedPostId,
+        1 as Depth
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 1 -- Linked
+    UNION ALL
+    SELECT 
+        r.PostId,
+        pl.RelatedPostId,
+        r.Depth + 1
+    FROM RecursiveRelatedPosts r
+    JOIN PostLinks pl ON pl.PostId = r.RelatedPostId AND pl.LinkTypeId = 1
+    WHERE r.Depth < 3
+),
+UserBadgeCounts AS (
+    SELECT 
+        b.UserId,
+        b.Class,
+        COUNT(*) as BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+UserReputationRanks AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        COALESCE(SUM(CASE WHEN pc.PostTypeId=1 THEN pc.Score ELSE 0 END), 0) AS TotalQuestionScore,
+        COALESCE(SUM(CASE WHEN pc.PostTypeId=2 THEN pc.Score ELSE 0 END), 0) AS TotalAnswerScore,
+        COALESCE(ubcs.Class, 0) AS BadgeClass,
+        COALESCE(ubcs.BadgeCount, 0) AS BadgeCount
+    FROM Users u 
+    LEFT JOIN Posts pc ON pc.OwnerUserId = u.Id
+    LEFT JOIN (SELECT ub.UserId, ub.Class, ub.BadgeCount FROM UserBadgeCounts ub WHERE ub.Class=1) ubcs ON ubcs.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, ubcs.Class, ubcs.BadgeCount
+),
+PostAggregates AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        sz.SummaryVotes,
+        sz.ScoreRank,
+        p.LastActivityDate
+    FROM Posts p
+    LEFT JOIN (
+        SELECT 
+            v.PostId, 
+            COUNT(*) FILTER (WHERE v.VoteTypeId=2) AS UpVotes, 
+            COUNT(*) FILTER (WHERE v.VoteTypeId=3) AS DownVotes,
+            COUNT(*) FILTER (WHERE v.VoteTypeId=8) AS Bounties
+        FROM Votes v
+        GROUP BY v.PostId
+    ) AS votes ON votes.PostId = p.Id
+    LEFT JOIN (
+        SELECT
+            p2.Id,
+            RANK() OVER (PARTITION BY p2.PostTypeId ORDER BY p2.Score DESC NULLS LAST, p2.ViewCount DESC NULLS LAST) AS ScoreRank,
+            p2.Score + COALESCE((SELECT AVG(bb.BountyAmount) FROM Votes bb WHERE bb.PostId = p2.Id AND bb.VoteTypeId IN (8,9)), 0) AS SummaryVotes
+        FROM Posts p2
+    ) sz ON sz.Id = p.Id
+),
+HighActivityTaggedPosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><') AS TagArray,
+        (SELECT COUNT(DISTINCT c.UserId) 
+         FROM Comments c 
+         WHERE c.PostId=p.Id AND c.UserId IS NOT NULL) AS UniqueCommenters,
+        ROW_NUMBER() OVER (PARTITION BY 1 ORDER BY p.ViewCount DESC, p.Score DESC) AS RankByView
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    AND p.Tags IS NOT NULL
+),
+CloseReasonsWithCounts AS (
+    SELECT 
+        crt.Id,
+        crt.Name,
+        COALESCE(ct.CloseCount, 0) AS CloseCount
+    FROM CloseReasonTypes crt
+    LEFT JOIN (
+        SELECT 
+            CAST(ph.Comment AS INT) AS CloseReasonId,
+            COUNT(*) AS CloseCount
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId = 10 AND ph.Comment ~ '^\d+$'
+        GROUP BY CAST(ph.Comment AS INT)
+    ) ct ON ct.CloseReasonId = crt.Id
+),
+UserActiveTimes AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        EXTRACT(EPOCH FROM (u.LastAccessDate - u.CreationDate))/3600 AS HoursActive,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId=1) AS QuestionsPosted,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId=2) AS AnswersPosted,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId=1) AS AvgQuestionScore,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId=2) AS AvgAnswerScore
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.CreationDate <= current_timestamp
+    GROUP BY u.Id, u.DisplayName, u.LastAccessDate, u.CreationDate
+),
+AnswerScoreWithAccepted AS (
+    SELECT
+        pa.Id AS AnswerId,
+        pa.ParentId AS QuestionId,
+        pa.Score AS AnswerScore,
+        CASE WHEN q.AcceptedAnswerId = pa.Id THEN 1 ELSE 0 END AS IsAcceptedAnswer,
+        ROW_NUMBER() OVER (PARTITION BY pa.ParentId ORDER BY pa.Score DESC) AS RankWithinQuestion
+    FROM Posts pa
+    INNER JOIN Posts q ON q.Id = pa.ParentId AND q.PostTypeId = 1
+    WHERE pa.PostTypeId = 2
+)
+SELECT
+    ur.UserId,
+    ur.DisplayName,
+    CONCAT_WS(' | ', 
+        'Reputation Rank: ' || ur.ReputationRank,
+        'Rep: ' || ur.Reputation,
+        'Badges(G/S/B): ' || COALESCE((SELECT Count FROM UserBadgeCounts WHERE UserId = ur.UserId AND Class=1), 0) || '/' || 
+                          COALESCE((SELECT Count FROM UserBadgeCounts WHERE UserId = ur.UserId AND Class=2), 0) || '/' ||  
+                          COALESCE((SELECT Count FROM UserBadgeCounts WHERE UserId = ur.UserId AND Class=3), 0),
+        'QuestionsScore: ' || ur.TotalQuestionScore,
+        'AnswersScore: ' || ur.TotalAnswerScore
+    ) AS UserSummary,
+    hp.Title AS TopViewedQuestion,
+    hp.ViewCount,
+    hp.Score,
+    hp.Tags,
+    STRING_AGG(cr.Name || ': ' || cr.CloseCount, '; ') AS CloseReasonStats,
+    ua.HoursActive,
+    ua.QuestionsPosted,
+    ua.AnswersPosted,
+    ROUND(ua.AvgQuestionScore::NUMERIC, 2) AS AvgQuestionScore,
+    ROUND(ua.AvgAnswerScore::NUMERIC, 2) AS AvgAnswerScore,
+    STRING_AGG(
+        CONCAT(
+            a.AnswerId, ':Score=', a.AnswerScore,
+            CASE WHEN a.IsAcceptedAnswer=1 THEN ' (Accepted)' ELSE '' END
+        ), ', '
+        ORDER BY a.AnswerScore DESC
+    ) FILTER (WHERE a.QuestionId IS NOT NULL) AS TopAnswersPerUser
+FROM UserReputationRanks ur
+LEFT JOIN HighActivityTaggedPosts hp ON hp.OwnerUserId = ur.UserId AND hp.RankByView = 1
+LEFT JOIN CloseReasonsWithCounts cr ON TRUE
+LEFT JOIN UserActiveTimes ua ON ua.Id = ur.UserId
+LEFT JOIN AnswerScoreWithAccepted a ON a.ParentId IN (
+    SELECT p.Id FROM Posts p WHERE p.OwnerUserId = ur.UserId AND p.PostTypeId=1
+)
+WHERE ur.ReputationRank <= 100
+GROUP BY ur.UserId, ur.DisplayName, ur.ReputationRank, ur.Reputation, ur.TotalQuestionScore, ur.TotalAnswerScore, hp.Title, hp.ViewCount, hp.Score, hp.Tags, ua.HoursActive, ua.QuestionsPosted, ua.AnswersPosted, ua.AvgQuestionScore, ua.AvgAnswerScore
+ORDER BY ur.Reputation DESC
+FETCH FIRST 25 ROWS ONLY;

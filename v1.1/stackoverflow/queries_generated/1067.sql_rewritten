@@ -1,0 +1,56 @@
+-- {"query": "1067.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4o-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 424} 
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.ViewCount,
+        p.Score,
+        u.DisplayName AS OwnerDisplayName,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS Rank
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+    GROUP BY p.Id, u.DisplayName
+),
+MostCommentedPosts AS (
+    SELECT 
+        PostId,
+        Title,
+        CreationDate,
+        ViewCount,
+        Score,
+        OwnerDisplayName,
+        CommentCount
+    FROM RankedPosts
+    WHERE Rank = 1
+),
+PostVotes AS (
+    SELECT 
+        PostId,
+        SUM(CASE WHEN VoteTypeId IN (2, 5) THEN 1 ELSE 0 END) AS TotalUpVotes,
+        SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes
+    FROM Votes
+    GROUP BY PostId
+)
+SELECT 
+    mc.PostId,
+    mc.Title,
+    mc.CreationDate,
+    mc.ViewCount,
+    mc.Score,
+    mc.OwnerDisplayName,
+    mc.CommentCount,
+    COALESCE(v.TotalUpVotes, 0) AS UpVotes,
+    COALESCE(v.TotalDownVotes, 0) AS DownVotes,
+    (CASE 
+        WHEN mc.Score IS NULL OR mc.Score = 0 THEN 'No Score'
+        WHEN mc.Score > 0 THEN 'Positive Score'
+        ELSE 'Negative Score' 
+    END) AS ScoreCategory
+FROM MostCommentedPosts mc
+LEFT JOIN PostVotes v ON mc.PostId = v.PostId
+ORDER BY mc.CommentCount DESC, mc.ViewCount DESC
+LIMIT 10;

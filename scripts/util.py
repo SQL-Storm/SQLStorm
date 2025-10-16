@@ -64,55 +64,177 @@ def sort_query_list(query_list: List[str]):
     return sorted(query_list, key=natural_sort_key)
 
 
-def remove_sql_comments(sql: str):
+def is_in_comment(content: str, p=False) -> int:
+    """Count occurrences of keyword in content that are not inside a string literal or comment.
+
+    Supports SQL single-line comments starting with --, block comments /* */ and single/double-quoted strings.
+    Search is case-insensitive and ensures keyword is a standalone word (boundaries are non-alphanumeric/_).
     """
-    Removes SQL comments from the SQL string.
+    n = len(content)
+    i = 0
+    in_single = False
+    in_double = False
+    in_line_comment = False
+    in_block_comment = False
 
-    Args:
-        sql (str): The SQL string to process.
+    while i < n:
+        ch = content[i]
+        # handle start/end of line comment
+        if in_line_comment:
+            if ch == '\n':
+                in_line_comment = False
+            i += 1
+            continue
 
-    Returns:
-        str: The SQL string without comments.
+        # handle block comments
+        if in_block_comment:
+            if ch == '*' and i + 1 < n and content[i + 1] == '/':
+                in_block_comment = False
+                i += 2
+            else:
+                i += 1
+            continue
+
+        # handle string literals
+        if in_single:
+            if ch == "'":
+                # SQL escapes single quotes by doubling
+                if i + 1 < n and content[i + 1] == "'":
+                    i += 2
+                    continue
+                else:
+                    in_single = False
+            i += 1
+            continue
+        if in_double:
+            if ch == '"':
+                if i + 1 < n and content[i + 1] == '"':
+                    i += 2
+                    continue
+                else:
+                    in_double = False
+            i += 1
+            continue
+
+        # not in any comment or string: detect comment/string starts
+        if ch == '-' and i + 1 < n and content[i + 1] == '-':
+            in_line_comment = True
+            i += 2
+            continue
+        if ch == '/' and i + 1 < n and content[i + 1] == '*':
+            in_block_comment = True
+            i += 2
+            continue
+        if ch == "'":
+            in_single = True
+            i += 1
+            continue
+        if ch == '"':
+            in_double = True
+            i += 1
+            continue
+
+        i += 1
+
+    if p:
+        print(f"in_single={in_single}, in_double={in_double}, in_line_comment={in_line_comment}, in_block_comment={in_block_comment}")
+
+    return in_single or in_double or in_line_comment or in_block_comment
+
+
+def find_keyword_not_in_comments(content: str, keyword: str, is_word: bool = True) -> int:
+    """Find the first occurrence of keyword in content that is not inside a string literal or comment.
+
+    Supports SQL single-line comments starting with --, block comments /* */ and single/double-quoted strings.
+    Search is case-insensitive and ensures keyword is a standalone word (boundaries are non-alphanumeric/_).
+    Returns the index in the original content or -1 if not found.
     """
-    while True:
-        comment_start = sql.find('--')
-        if comment_start == -1:
-            break
+    lower = content.lower()
+    key = keyword.lower()
+    n = len(content)
+    i = 0
+    in_single = False
+    in_double = False
+    in_line_comment = False
+    in_block_comment = False
 
-        comment_end = sql.find('\n', comment_start)
-        if comment_end == -1:
-            sql = sql[:comment_start]
-        else:
-            sql = sql[:comment_start] + sql[comment_end:]
-    return sql
+    def is_word_boundary(pos_start: int, pos_end: int) -> bool:
+        # pos_start is index of first char, pos_end is index after last char
+        if is_word and pos_start > 0:
+            prev = content[pos_start - 1]
+            if prev.isalnum() or prev == '_':
+                return False
+        if is_word and pos_end < n:
+            nxt = content[pos_end]
+            if nxt.isalnum() or nxt == '_':
+                return False
+        return True
 
+    while i < n:
+        ch = content[i]
+        # handle start/end of line comment
+        if in_line_comment:
+            if ch == '\n':
+                in_line_comment = False
+            i += 1
+            continue
 
-def strip_sql(sql: str):
-    """
-    Removes leading and trailing whitespace and newlines from the SQL string.
+        # handle block comments
+        if in_block_comment:
+            if ch == '*' and i + 1 < n and content[i + 1] == '/':
+                in_block_comment = False
+                i += 2
+            else:
+                i += 1
+            continue
 
-    Args:
-        sql (str): The SQL string to process.
+        # handle string literals
+        if in_single:
+            if ch == "'":
+                # SQL escapes single quotes by doubling
+                if i + 1 < n and content[i + 1] == "'":
+                    i += 2
+                    continue
+                else:
+                    in_single = False
+            i += 1
+            continue
+        if in_double:
+            if ch == '"':
+                if i + 1 < n and content[i + 1] == '"':
+                    i += 2
+                    continue
+                else:
+                    in_double = False
+            i += 1
+            continue
 
-    Returns:
-        str: The processed SQL string.
-    """
-    sql = remove_sql_comments(sql)
-    assert (sql.count("'") % 2 == 0)
+        # not in any comment or string: detect comment/string starts
+        if ch == '-' and i + 1 < n and content[i + 1] == '-':
+            in_line_comment = True
+            i += 2
+            continue
+        if ch == '/' and i + 1 < n and content[i + 1] == '*':
+            in_block_comment = True
+            i += 2
+            continue
+        if ch == "'":
+            in_single = True
+            i += 1
+            continue
+        if ch == '"':
+            in_double = True
+            i += 1
+            continue
 
-    lines = sql.splitlines()
-    sql = ""
-    for line in lines:
-        if sql.count("'") % 2 == 0:
-            line = " " + line.lstrip()
-        sql += line
-        if sql.count("'") % 2 == 0:
-            sql = sql.rstrip()
-
-    assert (sql.count("'") % 2 == 0)
-    sql = sql.strip()
-
-    return sql
+        # check for keyword here (case-insensitive)
+        if lower.startswith(key, i):
+            start = i
+            end = i + len(key)
+            if is_word_boundary(start, end):
+                return start
+        i += 1
+    return -1
 
 
 def compare_arrays(a: list[any], b: list[any]) -> int:

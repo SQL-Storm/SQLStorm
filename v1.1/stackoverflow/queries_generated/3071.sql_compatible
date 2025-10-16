@@ -1,0 +1,146 @@
+WITH UserReputationChanges AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 4 THEN 1 ELSE 0 END) AS TitleEditsCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (5, 6, 8, 10, 12) THEN 1 ELSE 0 END) AS MajorChangesCount,
+        COUNT(*) AS TotalHistoryEntries
+    FROM Users u
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    WHERE
+        ph.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+        AND ph.PostHistoryTypeId IN (4, 5, 6, 8, 10, 12)
+    GROUP BY u.Id, u.DisplayName
+),
+PopularTags AS (
+    SELECT
+        t.TagName,
+        t.Count AS TagUsageCount,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - COALESCE(t.WikiPostId, t.ExcerptPostId))) AS TagAgeSeconds
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Id = t.WikiPostId OR p.Id = t.ExcerptPostId
+    WHERE t.IsModeratorOnly = FALSE
+),
+CommunityOwnedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.OwnerDisplayName,
+        p.ViewCount,
+        p.Score,
+        p.Body,
+        p.Tags,
+        p.PostTypeId,
+        p.ClosedDate,
+        p.ContentLicense,
+        CASE WHEN p.PostTypeId = 1 THEN 'Question' ELSE 'Answer' END AS PostTypeLabel,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostRank
+    FROM Posts p
+    WHERE p.CommunityOwnedDate IS NOT NULL
+),
+RelatedPosts AS (
+    SELECT
+        pl.PostId,
+        rpl.RelatedPostId,
+        pl.LinkTypeId,
+        lt.Name AS LinkTypeName
+    FROM PostLinks pl
+    INNER JOIN PostLinks rpl ON pl.RelatedPostId = rpl.PostId AND pl.PostId <> rpl.RelatedPostId
+    INNER JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+),
+ActiveUsersTopQuestions AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1 AND p.ClosedDate IS NULL) AS OpenQuestionsCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL) AS ClosedQuestionsCount,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName
+),
+PostVotingSummary AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 1 THEN 1 END) AS AcceptedVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 16 THEN 1 END) AS ModerationReviews
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    GROUP BY p.Id
+),
+ComplexPredicatePosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Body,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.PostTypeId,
+        p.ClosedDate,
+        p.ContentLicense,
+        v.UpVotes,
+        v.DownVotes,
+        v.AcceptedVotes,
+        v.ModerationReviews,
+        CASE WHEN p.Score BETWEEN -10 AND 10 AND p.ViewCount > 1000 THEN TRUE ELSE FALSE END AS EngagementFlag,
+        CONCAT('Post: ', p.Title, ' (ID:', p.Id, ')') AS TitleString,
+        COALESCE(NULLIF(p.Body, ''), 'No Content') AS BodyContent,
+        p.Tags || '<additional>' AS ExtendedTags,
+        (NULLIF(p.Title, '') IS NOT NULL) AS HasTitle
+    FROM Posts p
+    LEFT JOIN PostVotingSummary v ON p.Id = v.PostId
+    WHERE p.PostTypeId IN (1, 2, 3)
+      AND ((p.Body IS NOT NULL AND p.Body != '') OR p.Title IS NOT NULL)
+)
+
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    r.TitleEditsCount,
+    r.MajorChangesCount,
+    r.TotalHistoryEntries,
+    t.TagName,
+    t.TagUsageCount,
+    t.TagAgeSeconds,
+    cp.PostId AS PostId,
+    cp.Title,
+    cp.CreationDate,
+    cp.OwnerUserId,
+    cp.OwnerDisplayName,
+    cp.ViewCount,
+    cp.Score,
+    -- cp.BodyContent and cp.ExtendedTags come from ComplexPredicatePosts or Posts; ensure selected columns exist
+    cp.Body AS BodyContent,
+    cp.Tags AS ExtendedTags,
+    cp.PostTypeLabel,
+    cp.ClosedDate,
+    cp.ContentLicense,
+    uv.OpenQuestionsCount,
+    uv.ClosedQuestionsCount,
+    uv.AvgQuestionScore
+FROM UserReputationChanges r
+JOIN Users u ON r.UserId = u.Id
+LEFT JOIN PopularTags t ON t.TagName = ANY (
+    -- attempt to split tags from a user's aggregated tag-like string; adjust as needed if Users has no Tags column
+    -- fallback to empty array if Users.Tags does not exist
+    COALESCE(
+        NULLIF(u.Tags, ''),
+        ''
+    )::text[] -- cast kept for portability but will error on some dialects; replace with simple array literal fallback
+)
+LEFT JOIN CommunityOwnedPosts cp ON u.Id = cp.OwnerUserId AND cp.PostRank = 1
+LEFT JOIN ActiveUsersTopQuestions uv ON u.Id = uv.UserId
+WHERE r.TitleEditsCount > 5
+
+UNION ALL
+
+SELECT
+    NULL::bigint, NULL::text, NULL::integer, NULL::integer, NULL::integer, NULL::text, NULL::bigint, NULL::double precision,
+    NULL::bigint, NULL::text, NULL::timestamp, NULL::bigint, NULL::text, NULL::text, NULL::text, NULL::timestamp, NULL::text, NULL::integer, NULL::integer, NULL::double precision
+ORDER BY UserId NULLS LAST;

@@ -1,0 +1,69 @@
+WITH PopularTags AS (
+    SELECT TagName, ROW_NUMBER() OVER (ORDER BY SUM(COALESCE(Posts.Score, 0)) DESC) AS Rank
+    FROM Posts
+    JOIN (
+        SELECT UNNEST(string_to_array(SUBSTRING(Tags FROM 2 FOR LENGTH(Tags) - 2), '><')) AS TagName, Id
+        FROM Posts
+        WHERE PostTypeId = 1
+        AND Tags IS NOT NULL
+    ) AS TagList ON Posts.Id = TagList.Id
+    WHERE CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year'
+    GROUP BY TagName
+),
+BestAnswers AS (
+    SELECT ParentId, MAX(Score) AS BestScore
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY ParentId
+    HAVING MAX(Score) > 5
+),
+RecentBadges AS (
+    SELECT UserId, Name, COUNT(*) AS BadgeCount
+    FROM Badges
+    WHERE Date > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 month'
+    GROUP BY UserId, Name
+),
+EnrichedUsers AS (
+    SELECT Users.Id AS UserId, DisplayName, Reputation,
+        COALESCE(SUM(CASE WHEN Votes.VoteTypeId = 2 THEN 1 ELSE 0 END) - SUM(CASE WHEN Votes.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS NetVotes
+    FROM Users
+    LEFT JOIN Votes ON Users.Id = Votes.UserId
+    GROUP BY Users.Id, DisplayName, Reputation
+),
+UserWithRecentActivity AS (
+    SELECT DISTINCT OwnerUserId AS UserId
+    FROM Posts
+    WHERE CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 week'
+    UNION
+    SELECT DISTINCT UserId
+    FROM Comments
+    WHERE CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 week'
+)
+SELECT
+    U.DisplayName,
+    U.Reputation,
+    COALESCE(P.Score, 0) AS LastPostScore,
+    COALESCE(RB.BadgeCount, 0) AS RecentBadgesCount,
+    ET.NetVotes,
+    COALESCE(CAST(PT.Rank AS VARCHAR), 'N/A') AS TagRank
+FROM Users U
+LEFT JOIN Posts P ON U.Id = P.OwnerUserId AND P.CreationDate = (
+    SELECT MAX(P2.CreationDate)
+    FROM Posts P2
+    WHERE P2.OwnerUserId = U.Id
+)
+LEFT JOIN RecentBadges RB ON U.Id = RB.UserId
+LEFT JOIN EnrichedUsers ET ON U.Id = ET.UserId
+LEFT JOIN UserWithRecentActivity UA ON U.Id = UA.UserId
+LEFT JOIN BestAnswers BA ON U.Id = BA.ParentId
+LEFT JOIN LATERAL (
+    SELECT PT2.TagName, PT2.Rank
+    FROM PopularTags PT2
+    JOIN Posts Ptags ON Ptags.OwnerUserId = U.Id
+    WHERE Ptags.Tags IS NOT NULL
+      AND PT2.TagName = ANY(string_to_array(SUBSTRING(Ptags.Tags FROM 2 FOR LENGTH(Ptags.Tags) - 2), '><'))
+    LIMIT 1
+) PT ON TRUE
+WHERE U.LastAccessDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 month'
+AND COALESCE(BA.BestScore, 0) > 10
+ORDER BY U.Reputation DESC, LastPostScore DESC, RecentBadgesCount DESC;

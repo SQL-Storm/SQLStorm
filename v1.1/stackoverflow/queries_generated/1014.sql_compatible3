@@ -1,0 +1,85 @@
+WITH UserPostStats AS (
+    SELECT 
+        U.Id AS UserId,
+        U.DisplayName,
+        COUNT(P.Id) AS PostCount,
+        SUM(CASE WHEN P.Score > 0 THEN 1 ELSE 0 END) AS PositivePosts,
+        SUM(CASE WHEN P.Score < 0 THEN 1 ELSE 0 END) AS NegativePosts,
+        AVG(COALESCE(P.Score, 0)) AS AverageScore,
+        MAX(P.Tags) AS Tags
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    GROUP BY U.Id, U.DisplayName
+),
+RankedUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        PostCount,
+        PositivePosts,
+        NegativePosts,
+        AverageScore,
+        Tags,
+        RANK() OVER (ORDER BY PostCount DESC) AS PostRank
+    FROM UserPostStats
+),
+SplitTags AS (
+    SELECT Id AS PostId,
+           TRIM(CASE WHEN POSITION('<>' IN Tags) = 0 THEN Tags ELSE SUBSTRING(Tags FROM 1 FOR POSITION('<>' IN Tags)-1) END) AS Tag,
+           CASE WHEN POSITION('<>' IN Tags) = 0 THEN '' ELSE SUBSTRING(Tags FROM POSITION('<>' IN Tags) + 2) END AS Rest
+    FROM Posts
+    WHERE Tags IS NOT NULL AND Tags <> ''
+    UNION ALL
+    SELECT PostId,
+           TRIM(CASE WHEN POSITION('<>' IN Rest) = 0 THEN Rest ELSE SUBSTRING(Rest FROM 1 FOR POSITION('<>' IN Rest)-1) END) AS Tag,
+           CASE WHEN POSITION('<>' IN Rest) = 0 THEN '' ELSE SUBSTRING(Rest FROM POSITION('<>' IN Rest) + 2) END AS Rest
+    FROM SplitTags
+    WHERE Rest <> ''
+),
+PopularTagsComputed AS (
+    SELECT
+        Tag,
+        COUNT(DISTINCT s.PostId) AS TagPostCount
+    FROM SplitTags s
+    JOIN Posts p ON p.Id = s.PostId
+    WHERE p.PostTypeId = 1
+      AND s.Tag IS NOT NULL
+      AND s.Tag <> ''
+    GROUP BY Tag
+    ORDER BY TagPostCount DESC
+    LIMIT 10
+),
+UserTagsSplit AS (
+    SELECT RU.UserId,
+           TRIM(CASE WHEN POSITION('<>' IN RU.Tags) = 0 THEN RU.Tags ELSE SUBSTRING(RU.Tags FROM 1 FOR POSITION('<>' IN RU.Tags)-1) END) AS Tag,
+           CASE WHEN POSITION('<>' IN RU.Tags) = 0 THEN '' ELSE SUBSTRING(RU.Tags FROM POSITION('<>' IN RU.Tags) + 2) END AS Rest
+    FROM RankedUsers RU
+    WHERE RU.Tags IS NOT NULL AND RU.Tags <> ''
+    UNION ALL
+    SELECT uts.UserId,
+           TRIM(CASE WHEN POSITION('<>' IN uts.Rest) = 0 THEN uts.Rest ELSE SUBSTRING(uts.Rest FROM 1 FOR POSITION('<>' IN uts.Rest)-1) END) AS Tag,
+           CASE WHEN POSITION('<>' IN uts.Rest) = 0 THEN '' ELSE SUBSTRING(uts.Rest FROM POSITION('<>' IN uts.Rest) + 2) END AS Rest
+    FROM UserTagsSplit uts
+    WHERE uts.Rest <> ''
+),
+UserPopularTags AS (
+    SELECT DISTINCT uts.UserId, uts.Tag
+    FROM UserTagsSplit uts
+    WHERE uts.Tag IS NOT NULL AND uts.Tag <> ''
+)
+SELECT 
+    RU.UserId,
+    RU.DisplayName,
+    RU.PostCount,
+    RU.PositivePosts,
+    RU.NegativePosts,
+    RU.AverageScore,
+    COALESCE(PT.TagPostCount, 0) AS PopularTagCount,
+    PT.Tag
+FROM RankedUsers RU
+LEFT JOIN PopularTagsComputed PT
+  ON EXISTS (
+      SELECT 1 FROM UserPopularTags up WHERE up.UserId = RU.UserId AND up.Tag = PT.Tag
+    )
+WHERE RU.PostRank <= 50
+ORDER BY RU.PostCount DESC, RU.AverageScore DESC;

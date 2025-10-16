@@ -1,0 +1,56 @@
+-- {"query": "22018.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "grok-code-fast", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2204, "output_tokens": 706} 
+WITH top_users AS (
+    SELECT Id, DisplayName, Reputation,
+           ROW_NUMBER() OVER (ORDER BY Reputation DESC) as user_rank
+    FROM Users
+    WHERE Reputation > 1000 AND CreationDate > '2010-01-01'
+),
+post_stats AS (
+    SELECT p.Id, p.Title, p.Score, p.ViewCount, p.OwnerUserId, p.Tags,
+           string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><') as tag_array,
+           COUNT(c.Id) OVER (PARTITION BY p.Id) as comment_count,
+           RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) as post_rank_in_user
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.PostTypeId = 1 AND p.Score IS NOT NULL
+),
+user_post_summary AS (
+    SELECT u.Id, u.DisplayName, u.user_rank,
+           COUNT(ps.Id) as total_posts,
+           AVG(ps.Score) as avg_score,
+           SUM(ps.comment_count) as total_comments,
+           ARRAY_AGG(DISTINCT unnest(ps.tag_array)) FILTER (WHERE unnest(ps.tag_array) IS NOT NULL) as all_tags,
+           (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class <= 2) as gold_silver_badges
+    FROM top_users u
+    LEFT OUTER JOIN post_stats ps ON u.Id = ps.OwnerUserId AND ps.post_rank_in_user <= 5
+    GROUP BY u.Id, u.DisplayName, u.user_rank
+)
+SELECT ups.DisplayName,
+       ups.user_rank,
+       ups.total_posts,
+       ROUND(ups.avg_score, 2) as avg_score,
+       ups.total_comments,
+       CARDINALITY(ups.all_tags) as distinct_tag_count,
+       ups.gold_silver_badges,
+       CASE WHEN ups.total_posts > 10 THEN 'Prolific' ELSE 'Moderate' END as activity_level,
+       COALESCE(STRING_AGG(DISTINCT t.TagName, ', '), 'None') as sample_tags
+FROM user_post_summary ups
+LEFT JOIN UNNEST(ups.all_tags) AS tag_name ON TRUE
+LEFT JOIN Tags t ON t.TagName = tag_name
+WHERE ups.avg_score > 0
+GROUP BY ups.DisplayName, ups.user_rank, ups.total_posts, ups.avg_score, ups.total_comments, ups.gold_silver_badges, ups.all_tags
+HAVING ups.total_comments > 0
+ORDER BY ups.user_rank, ups.avg_score DESC
+UNION ALL
+SELECT NULL as DisplayName,
+       NULL as user_rank,
+       COUNT(DISTINCT p.Id) as total_posts,
+       AVG(p.Score) as avg_score,
+       SUM(p.CommentCount) as total_comments,
+       COUNT(DISTINCT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'))) as distinct_tag_count,
+       NULL as gold_silver_badges,
+       'Aggregate' as activity_level,
+       NULL as sample_tags
+FROM Posts p
+WHERE p.PostTypeId = 1 AND p.Score > 100 AND p.CreationDate BETWEEN '2020-01-01' AND '2023-01-01'
+  AND EXISTS (SELECT 1 FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId IN (2,3));

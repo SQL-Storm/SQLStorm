@@ -1,0 +1,111 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(p.Id) AS PostCount,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(v.Id) AS VoteCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    GROUP BY
+        u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+), TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        p.Title,
+        p.ViewCount,
+        ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY p.ViewCount DESC) AS Rank,
+        p.Id AS PostId
+    FROM
+        Tags t
+    JOIN
+        Posts p ON t.ExcerptPostId = p.Id OR t.WikiPostId = p.Id
+    WHERE
+        p.PostTypeId IN (1, 5)
+), TopUserTagOwners AS (
+    -- resolve mapping of TopTags to their post owners to avoid referencing window in join
+    SELECT
+        tt.*,
+        p2.OwnerUserId AS OwnerUserId
+    FROM
+        TopTags tt
+    LEFT JOIN
+        Posts p2 ON p2.Id = tt.PostId
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    (ua.Views + ua.UpVotes) / NULLIF(ua.DownVotes, 0) AS EngagementRatio,
+    ua.PostCount,
+    ua.CommentCount,
+    ua.VoteCount,
+    GREATEST(ua.LastPostDate, ua.LastCommentDate, ua.LastVoteDate) AS LastActivityDate,
+    tt.TagName,
+    tt.Title AS TopTagPostTitle,
+    tt.ViewCount AS TopTagPostViewCount,
+    tt.Rank,
+    ph.PostHistoryTypeId,
+    ph.CreationDate AS PostHistoryDate,
+    ph.Text,
+    -- compute previous post history type id as a separate column via subquery to avoid window in GROUP BY
+    ph_prev.PreviousPostHistoryTypeId,
+    SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)) AS TagList,
+    STRING_AGG(t2.TagName, ', ' ORDER BY t2.Count DESC) AS RelatedTags
+FROM
+    UserActivity ua
+LEFT JOIN
+    TopUserTagOwners tt ON ua.UserId = tt.OwnerUserId
+LEFT JOIN
+    PostHistory ph ON ua.UserId = ph.UserId
+LEFT JOIN
+    Posts p ON ph.PostId = p.Id
+LEFT JOIN
+    Tags t2 ON p.Tags LIKE '%' || '<' || t2.TagName || '>' || '%'
+LEFT JOIN (
+    SELECT
+        ph_inner.PostId,
+        ph_inner.Id AS PhId,
+        LAG(ph_inner.PostHistoryTypeId) OVER (PARTITION BY ph_inner.PostId ORDER BY ph_inner.CreationDate) AS PreviousPostHistoryTypeId
+    FROM
+        PostHistory ph_inner
+) ph_prev ON ph_prev.PostId = ph.PostId AND ph_prev.PhId = ph.Id
+WHERE
+    ua.PostCount > 0 OR ua.CommentCount > 0 OR ua.VoteCount > 0
+GROUP BY
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    (ua.Views + ua.UpVotes) / NULLIF(ua.DownVotes, 0),
+    ua.PostCount,
+    ua.CommentCount,
+    ua.VoteCount,
+    GREATEST(ua.LastPostDate, ua.LastCommentDate, ua.LastVoteDate),
+    tt.TagName,
+    tt.Title,
+    tt.ViewCount,
+    tt.Rank,
+    ph.PostHistoryTypeId,
+    ph.CreationDate,
+    ph.Text,
+    ph_prev.PreviousPostHistoryTypeId,
+    p.Tags,
+    tt.PostId
+ORDER BY
+    ua.Reputation DESC,
+    tt.Rank ASC
+LIMIT 100;

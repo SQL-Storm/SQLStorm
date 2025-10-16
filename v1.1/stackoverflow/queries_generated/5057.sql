@@ -1,0 +1,128 @@
+-- {"query": "5057.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1001} 
+WITH UserEdits AS (
+    SELECT
+        ph.UserId,
+        COUNT(*) AS EditCount,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM
+        PostHistory ph
+    WHERE
+        ph.PostHistoryTypeId IN (5, 6) -- Edit Body, Edit Tags
+        AND ph.UserId IS NOT NULL
+    GROUP BY
+        ph.UserId
+),
+PopularTags AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        t.Count,
+        RANK() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM
+        Tags t
+    WHERE
+        t.IsModeratorOnly = 0 AND t.IsRequired = 0
+),
+QuestionWithMostAnswers AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.AnswerCount
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId = 1 -- Question
+        AND p.AnswerCount IS NOT NULL
+    ORDER BY p.AnswerCount DESC
+    LIMIT 1
+),
+UserBadgesAgg AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MIN(b.Date) AS FirstBadgeDate,
+        MAX(b.Date) AS LastBadgeDate
+    FROM
+        Badges b
+    GROUP BY
+        b.UserId
+),
+TopVoters AS (
+    SELECT
+        v.UserId,
+        COUNT(*) AS TotalVotes,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM
+        Votes v
+    WHERE
+        v.UserId IS NOT NULL
+    GROUP BY
+        v.UserId
+    HAVING
+        COUNT(*) > 100
+),
+QuestionsByPopularTags AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerUserId,
+        pt.TagId,
+        pt.TagName
+    FROM
+        Posts p
+        JOIN (
+            SELECT
+                t.TagId,
+                t.TagName
+            FROM
+                PopularTags t
+            WHERE
+                t.TagRank <= 10
+        ) pt
+            ON p.Tags IS NOT NULL
+                AND ('<' || pt.TagName || '>') = ANY(string_to_array(p.Tags, '><'))
+    WHERE
+        p.PostTypeId = 1
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    COALESCE(ue.EditCount, 0) AS TotalEdits,
+    ue.LastEditDate,
+    tv.TotalVotes,
+    tv.UpVotes,
+    tv.DownVotes,
+    COALESCE(qbt.TagName, 'No Popular Tag') AS FrequentTag,
+    COUNT(DISTINCT qbt.PostId) AS PopularTagQuestionsAsked,
+    (SELECT q.Title FROM QuestionWithMostAnswers q) AS TopAnsweredQuestion,
+    (SELECT q.AnswerCount FROM QuestionWithMostAnswers q) AS TopAnswerCount
+FROM
+    Users u
+    LEFT JOIN UserEdits ue ON ue.UserId = u.Id
+    LEFT JOIN UserBadgesAgg ub ON ub.UserId = u.Id
+    LEFT JOIN TopVoters tv ON tv.UserId = u.Id
+    LEFT JOIN QuestionsByPopularTags qbt ON qbt.OwnerUserId = u.Id
+WHERE
+    (
+        u.Reputation > 1000
+        OR ub.GoldBadges >= 1
+        OR tv.TotalVotes > 200
+    )
+    AND (u.LastAccessDate > NOW() - INTERVAL '90 days')
+    AND (
+        ue.EditCount IS NULL
+        OR ue.EditCount >= 5
+    )
+GROUP BY
+    u.Id, u.DisplayName, u.Reputation, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ue.EditCount, ue.LastEditDate, tv.TotalVotes, tv.UpVotes, tv.DownVotes, qbt.TagName
+ORDER BY
+    (ub.GoldBadges * 1000 + u.Reputation + COALESCE(ue.EditCount, 0) * 5 + COALESCE(tv.UpVotes, 0) * 2 - COALESCE(tv.DownVotes, 0)) DESC,
+    PopularTagQuestionsAsked DESC
+LIMIT 50;

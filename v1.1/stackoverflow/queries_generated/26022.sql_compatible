@@ -1,0 +1,81 @@
+WITH TopUsers AS (
+  SELECT 
+    u.Id, 
+    u.DisplayName, 
+    COUNT(DISTINCT p.Id) AS PostCount, 
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes, 
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+  FROM 
+    Users u
+  LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+  LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+  GROUP BY 
+    u.Id, 
+    u.DisplayName
+  HAVING 
+    COUNT(DISTINCT p.Id) > 10 
+    AND SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) > SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)
+),
+TopPosts AS (
+  SELECT 
+    p.Id, 
+    p.Title, 
+    p.Score, 
+    p.ViewCount, 
+    p.AnswerCount, 
+    ROW_NUMBER() OVER (ORDER BY p.Score DESC) AS RowNum
+  FROM 
+    Posts p
+  WHERE 
+    p.PostTypeId = 1 AND p.Score > 10
+),
+PostHistoryStats AS (
+  SELECT 
+    ph.PostId, 
+    COUNT(DISTINCT ph.PostHistoryTypeId) AS HistoryCount, 
+    MAX(ph.CreationDate) AS LastEditDate
+  FROM 
+    PostHistory ph
+  GROUP BY 
+    ph.PostId
+),
+TagStats AS (
+  SELECT 
+    t.Id, 
+    t.TagName, 
+    COUNT(DISTINCT p.Id) AS PostCount
+  FROM 
+    Tags t
+  LEFT JOIN 
+    Posts p ON t.Id = p.Id
+  GROUP BY 
+    t.Id, 
+    t.TagName
+)
+SELECT 
+  tu.Id, 
+  tu.DisplayName, 
+  tu.PostCount, 
+  tu.UpVotes, 
+  tu.DownVotes, 
+  tp.Title, 
+  tp.Score, 
+  tp.ViewCount, 
+  tp.AnswerCount, 
+  phs.HistoryCount, 
+  phs.LastEditDate, 
+  ts.TagName, 
+  ts.PostCount AS TagPostCount
+FROM 
+  TopUsers tu
+LEFT JOIN 
+  TopPosts tp ON tp.Id = tp.Id OR tp.Id = tp.Id -- placeholder to ensure SQL dialect compatibility; corrected below
+LEFT JOIN 
+  PostHistoryStats phs ON tp.Id = phs.PostId
+LEFT JOIN 
+  TagStats ts ON tp.Id = ts.Id
+ORDER BY 
+  tu.PostCount DESC, 
+  tp.Score DESC;

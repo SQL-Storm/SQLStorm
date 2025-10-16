@@ -1,0 +1,52 @@
+-- {"query": "13088.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-premier", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2142, "output_tokens": 602} 
+
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS PostsCount,
+        SUM(p.Score) AS TotalScore,
+        COUNT(DISTINCT ph.Id) AS EditCount,
+        AVG(p.Score) OVER (PARTITION BY u.Id ORDER BY p.CreationDate ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS AvgScoreLast4Posts,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId AND ph.PostHistoryTypeId IN (4, 5, 6)
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000 AND u.LastAccessDate > NOW() - INTERVAL '1 year'
+    GROUP BY u.Id, u.DisplayName
+),
+PostDetails AS (
+    SELECT 
+        p.Id,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        ph.Comment AS CloseReasonComment,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS PostRank
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 10
+    WHERE p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL
+)
+SELECT 
+    ua.UserId,
+    ua.DisplayName,
+    ua.PostsCount,
+    ua.TotalScore,
+    ua.EditCount,
+    ua.AvgScoreLast4Posts,
+    ua.LastBadgeDate,
+    pd.Id AS LastClosedQuestionId,
+    pd.Score AS LastClosedQuestionScore,
+    pd.CloseReasonComment,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = ua.UserId AND c.CreationDate > NOW() - INTERVAL '1 month') AS RecentCommentCount,
+    CASE 
+        WHEN ua.PostsCount > 100 THEN 'Power User'
+        WHEN ua.PostsCount BETWEEN 50 AND 100 THEN 'Active User'
+        ELSE 'Casual User'
+    END AS UserCategory
+FROM UserActivity ua
+LEFT JOIN PostDetails pd ON ua.UserId = pd.OwnerUserId AND pd.PostRank = 1
+WHERE ua.EditCount > 10 AND ua.AvgScoreLast4Posts > 5
+ORDER BY ua.TotalScore DESC
+LIMIT 10;

@@ -1,0 +1,168 @@
+-- {"query": "1461.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1599} 
+
+with RecursiveBadgeRanks as (
+    select
+        b.UserId,
+        b.Name as BadgeName,
+        b.Class,
+        b.Date,
+        row_number() over (partition by b.UserId order by b.Class, b.Date) as UserBadgeRank
+    from Badges b
+    where b.TagBased = 0
+),
+UserQuestionStats as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(q.Id) as QuestionCount,
+        coalesce(avg(q.Score),0) as AvgQuestionScore,
+        sum(case when q.ClosedDate is null then 1 else 0 end) as OpenQuestions
+    from Users u
+    left join Posts q on q.OwnerUserId = u.Id and q.PostTypeId = 1
+    group by u.Id, u.DisplayName
+),
+TopAnswerers as (
+    select
+        a.OwnerUserId as UserId,
+        count(*) as AnswerCount,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.CreationDate) as LastAnswerDate
+    from Posts a
+    where a.PostTypeId = 2
+      and a.Score > 0
+    group by a.OwnerUserId
+),
+RecencyActivity as (
+    select 
+        u.Id as UserId,
+        max(interaction.ActivityDate) as LastActivity
+    from Users u
+    left join (
+        select OwnerUserId as UserId, max(LastActivityDate) as ActivityDate from Posts group by OwnerUserId
+        union all
+        select UserId, max(CreationDate) from Comments group by UserId
+        union all
+        select UserId, max(CreationDate) from Votes where VoteTypeId in (2,3) group by UserId
+    ) interaction on interaction.UserId = u.Id
+    group by u.Id
+),
+UserCompositeRanks as (
+    select
+        uqs.UserId,
+        uqs.DisplayName,
+        uqs.QuestionCount,
+        uqs.AvgQuestionScore,
+        tap.AnswerCount,
+        tap.AvgAnswerScore,
+        ra.LastActivity,
+        rbr.UserBadgeRank,
+        rbr.BadgeName,
+        rbr.Class
+    from UserQuestionStats uqs
+    left join TopAnswerers tap on tap.UserId = uqs.UserId
+    left join RecencyActivity ra on ra.UserId = uqs.UserId
+    left join RecursiveBadgeRanks rbr on rbr.UserId = uqs.UserId and rbr.UserBadgeRank = 1
+),
+BadgeFusion as (
+    select
+        cr.UserId,
+        cr.DisplayName,
+        cr.QuestionCount,
+        cr.AvgQuestionScore,
+        cr.AnswerCount,
+        cr.AvgAnswerScore,
+        cr.LastActivity,
+        cr.UserBadgeRank,
+        cr.BadgeName,
+        cr.Class,
+        case 
+            when cr.Class = 1 then 'Gold'
+            when cr.Class = 2 then 'Silver'
+            when cr.Class = 3 then 'Bronze'
+            else 'None'
+        end as BadgeClass,
+        -- Calculate a performance score: weighted by different metrics + null guards
+        (
+            coalesce(cr.QuestionCount,0) * 0.1 + 
+            coalesce(cr.AvgQuestionScore,0) * 2 +
+            coalesce(cr.AnswerCount,0) * 0.3 + 
+            coalesce(cr.AvgAnswerScore,0) * 3 +
+            (case when cr.LastActivity > current_timestamp - interval '30 day' then 50 else 0 end)
+        ) as PerformanceScore
+    from UserCompositeRanks cr
+),
+SelectedPosts as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.Title,
+        p.Tags,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate desc) as PostRanking
+    from Posts p
+    where p.PostTypeId in (1,2) 
+      and (p.TagCount := regexp_count(p.Tags, '><') + 1) -- counting tag count for complexity (following from tags string, tags like '<python><sql>')
+),
+TagHeavyQuestions as (
+    select 
+        q.Id, q.OwnerUserId, q.Title, q.Tags,
+        (regexp_count(q.Tags, '><') + 1) as TagCount,
+        q.Score,
+        q.ViewCount,
+        rank() over (order by (regexp_count(q.Tags, '><') + 1) desc, q.Score desc) as TagRank
+    from Posts q
+    where q.PostTypeId = 1
+),
+-- correlated subquery comparing user's worst scoring answer accepted by another as answer of another...
+UserAnsweredQuestions as (
+    select q.Id as QuestionId, q.OwnerUserId as QuestionOwner, a.Id as AnswerId, a.OwnerUserId as AnswerOwner, a.Score, a.CreationDate
+    from Posts a
+    inner join Posts q on q.Id = a.ParentId and q.PostTypeId = 1
+    where a.PostTypeId = 2
+),
+Benchmark := (
+    select 
+        bf.UserId, bf.DisplayName, bf.QuestionCount, bf.AvgQuestionScore,
+        bf.AnswerCount, bf.AvgAnswerScore, bf.LastActivity, bf.BadgeName,
+        shq.Id as TagHeaviestQId, shq.Tags as HeavyQTags, shq.TagCount,
+        sp.Id as TopUserPostId, sp.PostTypeId as TopPostTypeId, sp.Score as TopPostScore, sp.PostRanking,
+        uaq.QuestionId, uaq.AnswerId, uaq.Score as UserAnswerScore
+    from BadgeFusion bf
+    left join TagHeavyQuestions shq
+        on shq.OwnerUserId = bf.UserId
+       and shq.TagRank = 1
+    left join SelectedPosts sp
+        on sp.OwnerUserId = bf.UserId
+       and sp.PostRanking = 1
+    left join lateral (
+        select *
+        from UserAnsweredQuestions uaq
+        where uaq.AnswerOwner = bf.UserId
+          and uaq.QuestionOwner != bf.UserId
+        order by uaq.Score asc nulls last
+        limit 1
+    ) uaq on true
+    where bf.QuestionCount > 5 
+      and (bf.AnswerCount > 10 or bf.AvgQuestionScore > 5)
+)
+select 
+    bb.UserId,
+    bb.DisplayName,
+    coalesce(char_length(bb.BadgeName),0) as BadgeNameLength,
+    coalesce(bb.BadgeName, 'No Badge') as BadgeName,
+    bb.QuestionCount,
+    to_char(bb.AvgQuestionScore, 'FM9999D00') as AvgQuestionScore,
+    bb.AnswerCount,
+    to_char(bb.AvgAnswerScore,'FM9999D00') as AvgAnswerScore,
+    count(distinct coalesce(bb.TagHeaviestQId,0)) over () as NumUsersWithHeavyTags,
+    coalesce(bb.TagCount,0) as UserMaxTagCount,
+    bb.SecurityQuestionId,
+    case when bb.TopUserPostId is not null then 'HasTopPost' else 'NoTopPost' end as TopPostFlag,
+    bb.TopPostScore,
+    bb.PostRanking,
+    to_char(bb.UserAnswerScore,'FM9999D00') as WorstAnswerScore,
+    chr(mod(fp16_mod := md5(bb.DisplayName || coalesce(bb.BadgeName,'')), 26) + ascii('A')) as RandomLetterComputed
+from Benchmark bb
+order by bb.PerformanceScore desc nulls last
+limit 50;

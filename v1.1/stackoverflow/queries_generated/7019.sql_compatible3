@@ -1,0 +1,252 @@
+with
+-- recent active questions with parsed tags and tag counts
+recent_q as (
+  select
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Score,
+    coalesce(p.ViewCount,0) as ViewCount,
+    coalesce(p.AnswerCount,0) as AnswerCount,
+    p.Tags,
+    -- explode tags into an array (Postgres style); if Tags is null produce empty array
+    case when p.Tags is null then cast(array[] as text[]) else string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><') end as tag_arr
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+    and p.Score is not null
+),
+-- top contributor stats per question: number of answers, avg answer score, top answerer id
+answers_agg as (
+  select
+    q.Id as QuestionId,
+    count(a.Id) filter (where a.PostTypeId = 2) as AnswersTotal,
+    avg(a.Score) filter (where a.PostTypeId = 2) as AvgAnswerScore,
+    max(a.Score) filter (where a.PostTypeId = 2) as MaxAnswerScore,
+    -- most frequent answerer (ties broken by reputation)
+    (select a2.OwnerUserId
+     from Posts a2
+     where a2.ParentId = q.Id and a2.PostTypeId = 2 and a2.OwnerUserId is not null
+     group by a2.OwnerUserId
+     order by count(*) desc, max(a2.Score) desc
+     limit 1) as TopAnswererId
+  from recent_q q
+  left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+  group by q.Id
+),
+-- compute for each user some rolling metrics and badge counts
+user_metrics as (
+  select
+    u.Id,
+    u.Reputation,
+    u.CreationDate,
+    u.DisplayName,
+    coalesce(u.Views,0) as ProfileViews,
+    coalesce(sum(case when b.Class = 1 then 1 else 0 end),0) as GoldBadges,
+    coalesce(sum(case when b.Class = 2 then 1 else 0 end),0) as SilverBadges,
+    coalesce(sum(case when b.Class = 3 then 1 else 0 end),0) as BronzeBadges,
+    -- recent activity score heuristic: recent posts + recent comments + recency boost
+    (
+      (select count(*) from Posts p where p.OwnerUserId = u.Id and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp)-interval '90 days') * 3
+      + (select count(*) from Comments c where c.UserId = u.Id and c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp)-interval '90 days') * 1
+      + greatest(0, 100 - date_part('day', cast('2024-10-01 12:34:56' as timestamp) - u.LastAccessDate)) -- recency boost
+    ) as RecentActivityScore
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  group by u.Id, u.Reputation, u.CreationDate, u.DisplayName, u.Views, u.LastAccessDate
+),
+-- link graph measures: inbound/outbound links for questions
+links_agg as (
+  select
+    p.Id as PostId,
+    sum(case when pl.LinkTypeId = 1 and pl.PostId = p.Id then 1 else 0 end) as OutboundLinks,
+    sum(case when pl.LinkTypeId = 1 and pl.RelatedPostId = p.Id then 1 else 0 end) as InboundLinks,
+    sum(case when pl.LinkTypeId = 3 and pl.PostId = p.Id then 1 else 0 end) as DuplicatesMarked,
+    sum(case when pl.LinkTypeId = 3 and pl.RelatedPostId = p.Id then 1 else 0 end) as MarkedAsDuplicateOf
+  from Posts p
+  left join PostLinks pl on pl.PostId = p.Id or pl.RelatedPostId = p.Id
+  where p.PostTypeId = 1
+  group by p.Id
+),
+-- heavy text analysis snippet: compute lengths, word counts, presence of code blocks
+text_features as (
+  select
+    p.Id,
+    coalesce(char_length(p.Body),0) as BodyLength,
+    coalesce(
+      case when (regexp_split_to_array(trim(regexp_replace(coalesce(p.Body,''),'\s+',' ','g')), '\s+'))[1] is not null then 1 else 0 end
+    ,0) as HasWords,
+    -- move set-returning regexp_matches into a lateral to avoid SRF in scalar context
+    coalesce(cm.CodeMarkers,0) as CodeMarkers,
+    -- crude readability score: words per sentence (sentences approximated by dot)
+    case when nullif(length(coalesce(p.Body,'')) - length(replace(coalesce(p.Body,''), '.', '')),0) is null then 0
+         else (coalesce(array_length(regexp_split_to_array(trim(regexp_replace(coalesce(p.Body,''),'\s+',' ','g')), '\s+'),1),0)
+               * 1.0
+               / nullif(length(coalesce(p.Body,'')) - length(replace(coalesce(p.Body,''), '.', '')),0)) end as WordsPerSentence
+  from Posts p
+  left join lateral (
+    select count(*) as CodeMarkers
+    from regexp_matches(coalesce(p.Body,''), '<pre>|<code>', 'gi')
+  ) cm on true
+  where p.PostTypeId = 1
+  group by p.Id, p.Body, cm.CodeMarkers
+),
+-- compute per-tag popularity over the past year using unnest
+tag_stats as (
+  select
+    tag,
+    count(*) as QuestionsWithTag,
+    avg(q.Score) as AvgScore,
+    percentile_cont(0.5) within group (order by q.ViewCount) as MedianViews
+  from recent_q q
+  cross join lateral unnest(q.tag_arr) as t(tag)
+  group by tag
+  having count(*) > 5
+),
+-- CTE to create a ranked list mixing multiple criteria
+ranked_questions as (
+  select
+    q.Id,
+    q.Title,
+    q.CreationDate,
+    q.OwnerUserId,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.Tags,
+    q.tag_arr,
+    a.AnswersTotal,
+    a.AvgAnswerScore,
+    a.TopAnswererId,
+    la.InboundLinks,
+    la.OutboundLinks,
+    tf.BodyLength,
+    tf.CodeMarkers,
+    -- compute a composite popularity metric
+    (
+      (coalesce(q.ViewCount,0) * 1.0 / nullif(greatest(1,q.AnswerCount),1)) * 0.4
+      + (coalesce(q.Score,0) * 1.0) * 2.0
+      + (coalesce(a.AvgAnswerScore,0) * 1.0) * 1.5
+      + (coalesce(la.InboundLinks,0) * 1.0) * 1.2
+      + (coalesce(tf.CodeMarkers,0) * 1.0) * 0.8
+    ) as PopularityScore
+  from recent_q q
+  left join answers_agg a on a.QuestionId = q.Id
+  left join links_agg la on la.PostId = q.Id
+  left join text_features tf on tf.Id = q.Id
+),
+-- windowed aggregation for trend detection: popularity changes over quarters
+trend as (
+  select
+    rq.Id,
+    rq.Title,
+    rq.PopularityScore,
+    row_number() over (partition by rq.Id order by rq.PopularityScore desc) as popularity_rank,
+    -- moving average of popularity among all questions in same month
+    avg(rq.PopularityScore) over (partition by date_trunc('month', rq.CreationDate)) as MonthAvgPopularity
+  from ranked_questions rq
+),
+-- pick candidate questions for benchmarking join complexity
+candidates as (
+  select
+    r.Id,
+    r.Title,
+    r.CreationDate,
+    r.OwnerUserId,
+    r.Score,
+    r.ViewCount,
+    r.AnswerCount,
+    r.Tags,
+    r.tag_arr,
+    r.PopularityScore,
+    tm.MonthAvgPopularity,
+    us.DisplayName as OwnerName,
+    us.Reputation as OwnerReputation,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ts.tag as RepresentativeTag,
+    ts.QuestionsWithTag,
+    r.AnswersTotal,
+    r.AvgAnswerScore,
+    r.InboundLinks,
+    r.OutboundLinks,
+    r.BodyLength,
+    r.CodeMarkers
+  from ranked_questions r
+  left join trend tm on tm.Id = r.Id
+  left join Users us on us.Id = r.OwnerUserId
+  left join user_metrics ua on ua.Id = coalesce(r.OwnerUserId, -1)
+  left join lateral (
+    select t.tag, t.QuestionsWithTag
+    from tag_stats t
+    where t.tag = (select (unnested_tag) from (select unnest(r.tag_arr) as unnested_tag limit 1) uu)
+    limit 1
+  ) ts on true
+  where r.PopularityScore is not null
+)
+-- final selection: multiple joins, correlated subqueries, window functions, set operators, and NULL logic
+select
+  c.Id as QuestionId,
+  c.Title,
+  left(replace(coalesce(c.Title,''), chr(10), ' '), 200) as TitleSnippet,
+  c.CreationDate,
+  c.PopularityScore,
+  c.MonthAvgPopularity,
+  coalesce(c.AnswersTotal,0) as AnswersTotal,
+  cast(coalesce(c.AvgAnswerScore,0) as numeric(10,2)) as AvgAnswerScore,
+  coalesce(c.InboundLinks,0) as InboundLinks,
+  coalesce(c.OutboundLinks,0) as OutboundLinks,
+  coalesce(c.BodyLength,0) as BodyLength,
+  coalesce(c.CodeMarkers,0) as CodeMarkers,
+  coalesce(c.OwnerUserId,-1) as OwnerUserId,
+  coalesce(c.OwnerName,'<deleted>') as OwnerName,
+  coalesce(c.OwnerReputation,0) as OwnerReputation,
+  c.GoldBadges, c.SilverBadges, c.BronzeBadges,
+  coalesce(c.RepresentativeTag,'(none)') as RepresentativeTag,
+  coalesce(c.QuestionsWithTag,0) as QuestionsWithTag,
+  -- correlated subquery: locate accepted answer info if exists
+  (select json_build_object('AcceptedId', a.Id, 'Score', a.Score, 'OwnerId', a.OwnerUserId, 'AgeDays', date_part('day', cast('2024-10-01 12:34:56' as timestamp)-a.CreationDate))
+   from Posts a
+   where a.Id = (select p.AcceptedAnswerId from Posts p where p.Id = c.Id) limit 1) as AcceptedAnswerSummary,
+  -- correlated scalar subquery: top comment on question
+  (select json_build_object('CommentId', c2.Id, 'Score', c2.Score, 'TextSnippet', left(replace(c2.Text, chr(10),' '),120))
+   from Comments c2
+   where c2.PostId = c.Id
+   order by c2.Score desc nulls last, c2.CreationDate desc
+   limit 1) as TopComment,
+  -- window function: rank within same representative tag by popularity
+  rank() over (partition by coalesce(c.RepresentativeTag,'(none)') order by c.PopularityScore desc) as TagPopularityRank,
+  dense_rank() over (order by c.PopularityScore desc) as GlobalPopularityDenseRank
+from candidates c
+-- outer join trick to include recently closed reasons via PostHistory (if any)
+left join lateral (
+  select ph.Comment as CloseReasonId, crt.Name as CloseReasonName, ph.CreationDate as ClosedOn
+  from PostHistory ph
+  left join CloseReasonTypes crt on cast(crt.Id as text) = ph.Comment
+  where ph.PostId = c.Id and ph.PostHistoryTypeId in (10,11)
+  order by ph.CreationDate desc
+  limit 1
+) ph_latest on true
+where
+  -- complex predicate combining null logic, arithmetic, and set membership
+  (
+    (c.PopularityScore > greatest(5, coalesce(c.MonthAvgPopularity,0) * 1.25) and coalesce(c.AnswersTotal,0) >= 2)
+    or
+    (c.PopularityScore > 50 and coalesce(c.CodeMarkers,0) >= 1)
+    or
+    (c.OwnerReputation > 10000 and coalesce(c.AnswersTotal,0) >= 1)
+  )
+  and not exists (
+    -- exclude questions which are closed as duplicate of anything in the last year (correlated subquery)
+    select 1 from PostHistory ph2
+    where ph2.PostId = c.Id
+      and ph2.PostHistoryTypeId = 10
+      and ph2.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+      and (ph2.Comment is not null)
+  )
+order by
+  TagPopularityRank nulls last,
+  GlobalPopularityDenseRank
+limit 200;

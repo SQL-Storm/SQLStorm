@@ -1,0 +1,66 @@
+-- {"query": "28065.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "deepseek-r1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1439} 
+WITH user_stats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        COALESCE(u.UpVotes / NULLIF(u.DownVotes, 0), 0) AS VoteRatio,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        MAX(b.Date) OVER (PARTITION BY u.Id ORDER BY b.Date DESC) AS LastBadgeDate
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id
+),
+post_stats AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount + p.CommentCount AS EngagementScore,
+        AVG(c.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgUserCommentScore,
+        COUNT(c.Id) AS TotalComments,
+        STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><') AS TagArray
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.PostTypeId = 1
+),
+vote_analysis AS (
+    SELECT
+        v.PostId,
+        v.UserId,
+        vt.Name AS VoteType,
+        (SELECT COUNT(*) FROM Votes WHERE PostId = v.PostId) AS TotalVotes,
+        RANK() OVER (PARTITION BY v.PostId ORDER BY v.CreationDate DESC) AS VoteRecencyRank
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE v.CreationDate > '2020-01-01'
+      AND EXISTS (SELECT 1 FROM Posts p WHERE p.Id = v.PostId AND p.Score > (SELECT AVG(Score) FROM Posts WHERE OwnerUserId = p.OwnerUserId))
+)
+SELECT 
+    COALESCE(us.UserId, va.UserId) AS UserId,
+    COALESCE(ps.PostId, va.PostId) AS PostId,
+    (us.Reputation * 0.3 + ps.EngagementScore * 0.5 + us.GoldBadges * 100) AS PerformanceMetric,
+    CASE 
+        WHEN ps.TagArray IS NOT NULL THEN ARRAY_LENGTH(ps.TagArray, 1)
+        ELSE 0
+    END AS TagCount,
+    (SELECT EXISTS (SELECT 1 FROM Badges WHERE UserId = us.UserId AND Name LIKE '%Moderator%')) AS HasModeratorBadge,
+    RANK() OVER (ORDER BY (us.Reputation + ps.EngagementScore * 10) DESC) AS UserRank,
+    COALESCE(ps.AvgUserCommentScore, 0) * us.VoteRatio AS WeightedCommentScore,
+    (SELECT STRING_AGG(Tag, ', ') FROM UNNEST(ps.TagArray) AS Tag) AS FormattedTags
+FROM user_stats us
+LEFT JOIN post_stats ps ON us.UserId = ps.OwnerUserId
+FULL OUTER JOIN vote_analysis va ON ps.PostId = va.PostId
+WHERE (ps.Score > 10 OR va.TotalVotes > 5)
+  AND (ps.ViewCount > 100 OR us.Reputation > 1000)
+  AND (ps.PostId IS NOT NULL OR us.UserId IS NOT NULL)
+  AND (ps.CreationDate > '2015-01-01' OR us.LastBadgeDate > '2022-01-01')
+HAVING COUNT(va.VoteType) FILTER (WHERE va.VoteType = 'UpMod') > 2
+    OR MAX(us.SilverBadges) > 5
+ORDER BY 
+    PerformanceMetric DESC,
+    UserRank ASC,
+    va.VoteRecencyRank DESC
+LIMIT 1000;

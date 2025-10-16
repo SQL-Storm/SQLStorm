@@ -1,0 +1,130 @@
+-- {"query": "3093.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1021} 
+WITH RecentUserActivity AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate AS LastActivity,
+        COUNT(C.Id) AS CommentCount,
+        COUNT(DISTINCT P.Id) AS QuestionCount,
+        COUNT(DISTINCT A.Id) AS AnswerCount,
+        COUNT(DISTINCT T.Id) FILTER (WHERE T.Name LIKE '%tag%') AS TagRelatedPosts
+    FROM
+        Users U
+    LEFT JOIN
+        Comments C ON C.UserId = U.Id AND C.CreationDate > U.CreationDate
+    LEFT JOIN
+        Posts P ON P.OwnerUserId = U.Id AND P.PostTypeId = 1
+    LEFT JOIN
+        Posts A ON A.OwnerUserId = U.Id AND A.PostTypeId = 2
+    LEFT JOIN
+        Tags T ON T.Id IN (
+            SELECT
+                CAST(unnested AS INT)
+            FROM
+                unnest(string_to_array(substring(P.Tags FROM 2 FOR length(P.Tags)-2), '><')) AS unnested
+        ) AND T.IsModeratorOnly = FALSE
+    WHERE
+        U.LastAccessDate > U.CreationDate
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+PostHistoryCounts AS (
+    SELECT
+        P.Id AS PostId,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 END) AS ClosedCount,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (17,36) THEN 1 END) AS MigratedCount,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (24,50) THEN 1 END) AS EditedCount
+    FROM
+        Posts P
+    LEFT JOIN
+        PostHistory PH ON PH.PostId = P.Id
+    GROUP BY
+        P.Id
+),
+UserBadgeStats AS (
+    SELECT
+        U.Id AS UserId,
+        COUNT(DISTINCT B.Id) FILTER (WHERE B.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT B.Id) FILTER (WHERE B.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT B.Id) FILTER (WHERE B.Class = 3) AS BronzeBadges,
+        COUNT(DISTINCT B.Id) FILTER (WHERE B.TagBased = TRUE) AS TagBadges
+    FROM
+        Users U
+    LEFT JOIN
+        Badges B ON B.UserId = U.Id
+    GROUP BY
+        U.Id
+),
+TopQuestions AS (
+    SELECT
+        P.Id,
+        P.Title,
+        P.Tags,
+        P.ViewCount,
+        P.Score,
+        P.CreationDate,
+        COUNT(C.Id) AS CommentCount
+    FROM
+        Posts P
+    LEFT JOIN
+        Comments C ON C.PostId = P.Id
+    WHERE
+        P.PostTypeId = 1
+    GROUP BY
+        P.Id, P.Title, P.Tags, P.ViewCount, P.Score, P.CreationDate
+),
+MostLinkedQuestions AS (
+    SELECT
+        PL.PostId,
+        PL.RelatedPostId,
+        COUNT(*) AS LinkCount
+    FROM
+        PostLinks PL
+    GROUP BY
+        PL.PostId, PL.RelatedPostId
+),
+FinalBenchmark AS (
+    SELECT
+        RUA.UserId,
+        RUA.DisplayName,
+        RUA.Reputation,
+        RUA.UserCreationDate,
+        RUA.LastActivity,
+        RUA.CommentCount,
+        RUA.QuestionCount,
+        RUA.AnswerCount,
+        RUA.TagRelatedPosts,
+        PC.ClosedCount,
+        PC.MigratedCount,
+        PC.EditedCount,
+        UB.GoldBadges,
+        UB.SilverBadges,
+        UB.BronzeBadges,
+        UB.TagBadges,
+        TQ.Id AS TopQuestionId,
+        TQ.Title AS TopQuestionTitle,
+        TQ.ViewCount AS TopQuestionViews,
+        TQ.Score AS TopQuestionScore,
+        TQ.CommentCount AS TopQuestionComments,
+        LQ.LinkCount AS QuestionLinkCount
+    FROM
+        RecentUserActivity RUA
+    LEFT JOIN
+        PostHistoryCounts PC ON PC.PostId = (
+            SELECT MIN(P.Id) FROM Posts P WHERE P.OwnerUserId = RUA.UserId AND P.PostTypeId = 1
+        )
+    LEFT JOIN
+        UserBadgeStats UB ON UB.UserId = RUA.UserId
+    LEFT JOIN
+        TopQuestions TQ ON TQ.OwnerUserId = RUA.UserId
+    LEFT JOIN
+        MostLinkedQuestions LQ ON LQ.PostId = TQ.Id
+    WHERE
+        RUA.Reputation > 1000
+    ORDER BY
+        RUA.Reputation DESC
+    LIMIT 10
+)
+SELECT * FROM FinalBenchmark;

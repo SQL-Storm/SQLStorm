@@ -1,0 +1,151 @@
+WITH 
+UserPostStats AS (
+    SELECT 
+        u.Id                                     AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COALESCE(SUM(p.Score) FILTER (WHERE p.PostTypeId = 1),0) AS QuestionScoreSum,
+        COALESCE(SUM(p.Score) FILTER (WHERE p.PostTypeId = 2),0) AS AnswerScoreSum,
+        MAX(p.CreationDate)                     AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+UserBadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(*)                                          AS TotalBadges,
+        COUNT(*) FILTER (WHERE b.Class = 1)               AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2)               AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3)               AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+UserVoteStats AS (
+    SELECT 
+        v.UserId,
+        COUNT(*)                                          AS TotalVotesCast,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END)        AS UpVotesCast,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END)        AS DownVotesCast
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.UserId
+),
+
+TagPopularity AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC)        AS RankByCount
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+),
+
+RecentClosedQuestions AS (
+    SELECT 
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        ph.CreationDate                                   AS ClosedDate,
+        COALESCE(NULLIF(ph.Comment, ''), 'No reason')     AS CloseReason,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY ph.CreationDate DESC) AS rn
+    FROM Posts p
+    JOIN PostHistory ph 
+        ON ph.PostId = p.Id 
+       AND ph.PostHistoryTypeId = 10
+    WHERE p.PostTypeId = 1
+)
+
+SELECT
+    ups.UserId,
+    ups.DisplayName,
+    ups.Reputation,
+    ups.QuestionCount,
+    ups.AnswerCount,
+    COALESCE(ubs.TotalBadges,0)           AS TotalBadges,
+    COALESCE(ubs.GoldBadges,0)            AS GoldBadges,
+    COALESCE(uvs.TotalVotesCast,0)        AS TotalVotesCast,
+    ups.QuestionScoreSum,
+    ups.AnswerScoreSum,
+    ups.LastPostDate,
+    CASE
+        WHEN ups.Reputation > 20000 THEN 'Elite'
+        WHEN ups.Reputation BETWEEN 10000 AND 20000 THEN 'Pro'
+        WHEN ups.Reputation BETWEEN 5000 AND 9999  THEN 'Advanced'
+        ELSE 'Novice'
+    END                                   AS ReputationTier,
+    STRING_AGG(DISTINCT tp.TagName, ', ') 
+        FILTER (WHERE tp.RankByCount <= 10) AS Top10Tags,
+    rcq.Title                              AS MostRecentClosedQuestion,
+    rcq.ClosedDate,
+    rcq.CloseReason
+FROM UserPostStats ups
+LEFT JOIN UserBadgeStats ubs 
+    ON ubs.UserId = ups.UserId
+LEFT JOIN UserVoteStats uvs 
+    ON uvs.UserId = ups.UserId
+LEFT JOIN LATERAL (
+    SELECT 
+        t.TagName,
+        tp.RankByCount
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(p.Tags, '><')) AS RawTag
+    ) AS pt
+    JOIN Tags t 
+        ON t.TagName = replace(replace(pt.RawTag, '<', ''), '>', '')
+    JOIN TagPopularity tp 
+        ON tp.TagName = t.TagName
+    WHERE p.OwnerUserId = ups.UserId 
+      AND p.PostTypeId = 1
+) tp ON TRUE
+LEFT JOIN LATERAL (
+    SELECT 
+        rc.Id,
+        rc.Title,
+        rc.ClosedDate,
+        rc.CloseReason
+    FROM RecentClosedQuestions rc
+    WHERE rc.OwnerUserId = ups.UserId 
+      AND rc.rn = 1
+) rcq ON TRUE
+WHERE ups.QuestionCount > 5
+GROUP BY 
+    ups.UserId, ups.DisplayName, ups.Reputation,
+    ups.QuestionCount, ups.AnswerCount,
+    ubs.TotalBadges, ubs.GoldBadges,
+    uvs.TotalVotesCast,
+    ups.QuestionScoreSum, ups.AnswerScoreSum,
+    ups.LastPostDate,
+    rcq.Title, rcq.ClosedDate, rcq.CloseReason
+HAVING COUNT(*) FILTER (WHERE ubs.GoldBadges > 0) > 0
+ORDER BY ups.Reputation DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    0 AS QuestionCount,
+    0 AS AnswerCount,
+    0 AS TotalBadges,
+    0 AS GoldBadges,
+    0 AS TotalVotesCast,
+    0 AS QuestionScoreSum,
+    0 AS AnswerScoreSum,
+    NULL AS LastPostDate,
+    'Inactive' AS ReputationTier,
+    NULL AS Top10Tags,
+    NULL AS MostRecentClosedQuestion,
+    NULL AS ClosedDate,
+    NULL AS CloseReason
+FROM Users u
+WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+ORDER BY Reputation DESC
+OFFSET 0;

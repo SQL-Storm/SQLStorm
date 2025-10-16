@@ -1,0 +1,163 @@
+WITH
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      COUNT(DISTINCT p.Id) AS TotalPosts,
+      SUM(CASE WHEN pt.Name = 'Question' THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN pt.Name = 'Answer' THEN 1 ELSE 0 END) AS AnswerCount,
+      COUNT(DISTINCT c.Id) AS CommentCount,
+      COUNT(DISTINCT v.Id) AS VoteCount,
+      MAX(p.LastActivityDate) AS LastActivity
+    FROM Users u
+    LEFT JOIN Posts p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c
+      ON u.Id = c.UserId
+    LEFT JOIN Votes v
+      ON u.Id = v.UserId
+    LEFT JOIN PostTypes pt
+      ON p.PostTypeId = pt.Id
+    WHERE
+      u.CreationDate >= DATE '2020-01-01'
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate
+  ),
+  PostEngagement AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.PostTypeId,
+      pt.Name AS PostTypeName,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      COUNT(DISTINCT c.Id) AS CommentCountPerPost,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+      ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank,
+      LAG(p.Score, 1, 0) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS PreviousScore
+    FROM Posts p
+    JOIN PostTypes pt
+      ON p.PostTypeId = pt.Id
+    LEFT JOIN Comments c
+      ON p.Id = c.PostId
+    LEFT JOIN Votes v
+      ON p.Id = v.PostId
+    WHERE
+      p.CreationDate >= DATE '2021-01-01' AND p.PostTypeId IN (1, 2)
+    GROUP BY
+      p.Id,
+      p.Title,
+      p.PostTypeId,
+      pt.Name,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount
+  ),
+  UserPostScore AS (
+    SELECT
+      ua.UserId,
+      ua.DisplayName,
+      ua.Reputation,
+      pe.PostId,
+      pe.Title,
+      pe.Score,
+      pe.CommentCountPerPost,
+      pe.UpVotes,
+      pe.DownVotes,
+      pe.ScoreRank,
+      pe.PreviousScore,
+      CASE
+        WHEN pe.Score > 0 THEN 'Positive'
+        WHEN pe.Score < 0 THEN 'Negative'
+        ELSE 'Neutral'
+      END AS ScoreCategory,
+      (ua.DisplayName || ' (' || ua.Reputation || ')') AS UserIdentifier,
+      ua.CreationDate AS UserCreationDate
+    FROM UserActivity ua
+    JOIN PostEngagement pe
+      ON ua.UserId = pe.OwnerUserId
+    WHERE
+      pe.ScoreRank <= 5
+  )
+SELECT
+  ups.UserId,
+  ups.UserIdentifier,
+  ups.Reputation,
+  ups.PostId,
+  ups.Title,
+  ups.Score,
+  ups.CommentCountPerPost,
+  ups.UpVotes,
+  ups.DownVotes,
+  ups.ScoreRank,
+  ups.PreviousScore,
+  ups.ScoreCategory,
+  COALESCE(
+    (
+      SELECT
+        MAX(ph.CreationDate)
+      FROM PostHistory ph
+      WHERE
+        ph.PostId = ups.PostId AND ph.PostHistoryTypeId IN (4, 5)
+    ),
+    ups.UserCreationDate
+  ) AS LastEditOrCreation,
+  (
+    SELECT
+      COUNT(*)
+    FROM PostLinks pl
+    WHERE
+      pl.PostId = ups.PostId OR pl.RelatedPostId = ups.PostId
+  ) AS RelatedPostsCount,
+  ups.UserCreationDate
+FROM UserPostScore ups
+WHERE
+  ups.Score > 100
+UNION ALL
+SELECT
+  ua.UserId,
+  ua.DisplayName,
+  ua.Reputation,
+  NULL AS PostId,
+  'Summary Row' AS Title,
+  NULL AS Score,
+  SUM(ua.CommentCount) AS CommentCountPerPost,
+  SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+  SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+  NULL AS ScoreRank,
+  NULL AS PreviousScore,
+  NULL AS ScoreCategory,
+  MAX(ua.LastActivity) AS LastEditOrCreation,
+  COUNT(DISTINCT pl.Id) AS RelatedPostsCount,
+  MIN(ua.CreationDate) AS UserCreationDate
+FROM UserActivity ua
+LEFT JOIN Votes v
+  ON ua.UserId = v.UserId
+LEFT JOIN Posts p
+  ON ua.UserId = p.OwnerUserId
+LEFT JOIN PostLinks pl
+  ON p.Id = pl.PostId OR p.Id = pl.RelatedPostId
+WHERE
+  ua.TotalPosts > 1000
+GROUP BY
+  ua.UserId,
+  ua.DisplayName,
+  ua.Reputation
+ORDER BY
+  Reputation DESC,
+  TotalPosts DESC;

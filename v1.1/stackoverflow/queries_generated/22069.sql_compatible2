@@ -1,0 +1,101 @@
+WITH top_users AS (
+  SELECT Id, Reputation, DisplayName, COALESCE(Location, 'Unknown') AS Location
+  FROM Users
+  WHERE Reputation > 1000 AND LastAccessDate > DATE '2020-01-01'
+),
+question_stats AS (
+  SELECT OwnerUserId, 
+         COUNT(*) AS num_questions, 
+         AVG(COALESCE(Score, 0)) AS avg_score,
+         SUM(LENGTH(COALESCE(Title, ''))) AS total_title_length
+  FROM Posts
+  WHERE PostTypeId = 1 AND OwnerUserId IS NOT NULL
+  GROUP BY OwnerUserId
+  HAVING COUNT(*) > 0
+),
+answer_stats AS (
+  SELECT OwnerUserId, 
+         COUNT(*) AS num_answers, 
+         SUM(COALESCE(Score, 0)) AS total_score_answers,
+         AVG(COALESCE(EXTRACT(EPOCH FROM (COALESCE(LastActivityDate, CreationDate) - CreationDate)), 0)) AS avg_activity_time
+  FROM Posts
+  WHERE PostTypeId = 2 AND OwnerUserId IS NOT NULL
+  GROUP BY OwnerUserId
+),
+badge_counts AS (
+  SELECT UserId, 
+         COUNT(*) AS num_badges, 
+         SUM(CASE WHEN Class = 1 THEN 10 WHEN Class = 2 THEN 5 ELSE 1 END) AS badge_points,
+         STRING_AGG(Name, ', ' ORDER BY Date DESC) AS badge_list
+  FROM Badges
+  GROUP BY UserId
+),
+post_history_agg AS (
+  SELECT ph.PostId, COUNT(*) AS edit_count
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (4,5,6)
+  GROUP BY ph.PostId
+)
+SELECT 
+  tu.Id, 
+  UPPER(SUBSTRING(tu.DisplayName FROM 1 FOR 5)) || '...' AS ShortName,
+  tu.Reputation,
+  tu.Location,
+  COALESCE(qs.num_questions, 0) AS questions,
+  ROUND(COALESCE(qs.avg_score, 0), 2) AS avg_q_score,
+  COALESCE(qs.total_title_length, 0) AS title_chars,
+  COALESCE(ans.num_answers, 0) AS answers,
+  COALESCE(ans.total_score_answers, 0) AS answer_total,
+  ROUND(COALESCE(ans.avg_activity_time, 0), 2) AS avg_act_time_seconds,
+  COALESCE(bc.num_badges, 0) AS num_badges,
+  COALESCE(bc.badge_points, 0) AS badge_points,
+  bc.badge_list,
+  RANK() OVER (ORDER BY tu.Reputation DESC, COALESCE(qs.num_questions, 0) ASC) AS rep_rank,
+  LAG(tu.Reputation) OVER (ORDER BY tu.Reputation DESC) - tu.Reputation AS rep_diff,
+  ROW_NUMBER() OVER (PARTITION BY SUBSTRING(tu.Location FROM 1 FOR 10) ORDER BY tu.Reputation DESC) AS loc_rank,
+  CASE WHEN COALESCE(bc.badge_points,0) > 50 THEN 'Elite' WHEN COALESCE(bc.badge_points,0) > 20 THEN 'Veteran' ELSE 'Novice' END AS badge_level,
+  CAST(tu.Id AS VARCHAR) || '-' || CAST(COALESCE(qs.num_questions, 0) AS VARCHAR) AS user_code,
+  (SELECT MAX(COALESCE(p.Score, 0)) 
+     FROM Posts p 
+     WHERE p.OwnerUserId = tu.Id AND p.PostTypeId = 1
+  ) AS max_q_score_correlated,
+  (SELECT COUNT(DISTINCT c.PostId) FROM Comments c WHERE c.UserId = tu.Id) AS distinct_comment_posts,
+  COALESCE(pha.edit_count, 0) AS total_edits_on_posts
+FROM top_users tu
+LEFT JOIN question_stats qs ON tu.Id = qs.OwnerUserId
+LEFT JOIN answer_stats ans ON tu.Id = ans.OwnerUserId
+LEFT JOIN badge_counts bc ON tu.Id = bc.UserId
+LEFT JOIN post_history_agg pha ON pha.PostId IN (SELECT p.Id FROM Posts p WHERE p.OwnerUserId = tu.Id)
+WHERE tu.Reputation BETWEEN 1000 AND 50000
+  AND (COALESCE(qs.num_questions, 0) > 5 OR COALESCE(ans.num_answers, 0) > 10)
+  AND (bc.badge_points IS NULL OR bc.badge_points > 10)
+  AND NOT (qs.avg_score IS NULL AND ans.num_answers IS NULL)
+
+UNION ALL
+
+SELECT 
+  u.Id,
+  UPPER(SUBSTRING(u.DisplayName FROM 1 FOR 5)) || '...' AS ShortName,
+  u.Reputation,
+  COALESCE(u.Location, 'Unknown') AS Location,
+  0 AS questions,
+  0.00 AS avg_q_score,
+  0 AS title_chars,
+  0 AS answers,
+  0 AS answer_total,
+  0.00 AS avg_act_time_seconds,
+  0 AS num_badges,
+  0 AS badge_points,
+  NULL AS badge_list,
+  NULL AS rep_rank,
+  NULL AS rep_diff,
+  NULL AS loc_rank,
+  NULL AS badge_level,
+  CAST(u.Id AS VARCHAR) || '-0' AS user_code,
+  NULL AS max_q_score_correlated,
+  0 AS distinct_comment_posts,
+  0 AS total_edits_on_posts
+FROM Users u
+WHERE u.Id = 1
+
+ORDER BY rep_rank DESC NULLS LAST, Id ASC;

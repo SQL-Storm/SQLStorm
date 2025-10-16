@@ -1,0 +1,198 @@
+-- {"query": "55.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2187} 
+with
+-- recent active questions with tag parsing and derived metrics
+Questions as (
+  select
+    p.id,
+    p.title,
+    p.owneruserid,
+    u.reputation as owner_reputation,
+    p.creationdate,
+    p.lastactivitydate,
+    coalesce(p.answercount,0) as answercount,
+    coalesce(p.viewcount,0) as viewcount,
+    coalesce(p.score,0) as votescore,
+    -- parse tags into array-like rows via string operations
+    trim(both '<>' from substring(p.tags from 1 for 4000)) as raw_tags,
+    -- normalized short title for joins and fuzzy grouping
+    lower(regexp_replace(coalesce(p.title,''), '\s+', ' ', 'g')) as norm_title,
+    -- compute tag list as array of tag tokens (Postgres-like)
+    case when p.tags is null then array[]::text[] else string_to_array(substring(p.tags,2,length(p.tags)-2), '><') end as tag_tokens
+  from posts p
+  left join users u on u.id = p.owneruserid
+  where p.posttypeid = 1
+    and p.creationdate >= (current_timestamp - interval '2 years')
+    and p.viewcount is not null
+),
+-- answers augmented with ranking and acceptance flags
+Answers as (
+  select
+    a.id,
+    a.parentid as questionid,
+    a.owneruserid,
+    a.creationdate,
+    a.score,
+    a.body,
+    case when q.acceptedanswerid = a.id then 1 else 0 end as is_accepted,
+    row_number() over (partition by a.parentid order by a.score desc, a.creationdate) as rank_by_score,
+    dense_rank() over (partition by a.parentid order by a.score desc) as dense_rank_score
+  from posts a
+  join posts q on q.id = a.parentid and q.posttypeid = 1
+  where a.posttypeid = 2
+    and a.creationdate >= (current_timestamp - interval '3 years')
+),
+-- badge summary per user including recency-weighted score
+UserBadges as (
+  select
+    b.userid,
+    count(*) filter (where b.class = 1) as gold_count,
+    count(*) filter (where b.class = 2) as silver_count,
+    count(*) filter (where b.class = 3) as bronze_count,
+    sum(case
+          when b.date >= current_date - interval '90 days' then 3
+          when b.date >= current_date - interval '365 days' then 1
+          else 0 end) as recent_badge_score
+  from badges b
+  group by b.userid
+),
+-- vote aggregates with conditional expressions and null handling
+PostVotes as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as net_votes,
+    count(*) filter (where v.votetypeid = 2) as upvotes,
+    count(*) filter (where v.votetypeid = 3) as downvotes,
+    bool_or(v.votetypeid = 1) as has_accept_vote,
+    max(v.creationdate) as last_vote_date
+  from votes v
+  group by v.postid
+),
+-- linked posts graph (symmetrized) and duplicate detection
+Links as (
+  select
+    pl.postid,
+    pl.relatedpostid,
+    lt.name as link_type
+  from postlinks pl
+  join linktypes lt on lt.id = pl.linktypeid
+),
+SymLinks as (
+  select postid, relatedpostid, link_type from Links
+  union
+  select relatedpostid as postid, postid as relatedpostid, link_type from Links
+),
+-- for each question compute coalesced metrics and complex score
+QuestionMetrics as (
+  select
+    q.*,
+    coalesce(pv.net_votes, q.votescore, 0) as computed_net_votes,
+    coalesce(ub.recent_badge_score,0) as owner_recent_badges,
+    coalesce(ub.gold_count,0) as owner_gold,
+    (coalesce(q.viewcount,0) * 0.001) + (coalesce(pv.net_votes,0) * 2.5) + (coalesce(q.answercount,0) * 4) + (coalesce(ub.recent_badge_score,0) * 1.5) as hotness_score,
+    -- count distinct linked duplicates
+    (select count(distinct s.relatedpostid) from symlinks s where s.postid = q.id and lower(s.link_type) like '%duplicate%') as duplicate_links,
+    -- last activity of any related answer/comment/vote via correlated subqueries
+    greatest(
+      coalesce(q.lastactivitydate, q.creationdate),
+      coalesce(
+        (select max(a.creationdate) from posts a where a.parentid = q.id),
+        q.creationdate
+      ),
+      coalesce(
+        (select max(c.creationdate) from comments c where c.postid = q.id),
+        q.creationdate
+      ),
+      coalesce(
+        (select max(v.creationdate) from votes v where v.postid = q.id),
+        q.creationdate
+      )
+    ) as computed_last_activity
+  from Questions q
+  left join postvotes pv on pv.postid = q.id
+  left join userbadges ub on ub.userid = q.owneruserid
+),
+-- windowed classification: percentile rank within tag groups (explode tag tokens)
+QuestionTagExplode as (
+  select
+    qm.*,
+    tag,
+    row_number() over (partition by tag order by hotness_score desc, computed_net_votes desc) as tag_rank,
+    percentile_disc(0.9) within group (order by hotness_score) over (partition by tag) as tag_90th_hotness
+  from questionmetrics qm
+  cross join lateral (
+    select unnest(qm.tag_tokens) as tag
+  ) t
+),
+-- select top questions including string expressions and NULL logic demonstration
+TopQuestions as (
+  select distinct on (qt.id)
+    qt.id,
+    qt.title,
+    qt.owneruserid,
+    qt.owner_reputation,
+    qt.creationdate,
+    qt.computed_last_activity,
+    qt.hotness_score,
+    qt.computed_net_votes,
+    qt.duplicate_links,
+    qt.tag,
+    qt.tag_rank,
+    qt.tag_90th_hotness,
+    -- conditional descriptive label with nested null/coalesce handling and concatenation
+    concat(
+      left(coalesce(qt.title,'(untitled)'), greatest(1, least(60, length(coalesce(qt.title,''))))) ,
+      ' :: ',
+      coalesce(qt.tag, 'untagged'),
+      ' :: ', 
+      case 
+        when qt.hotness_score >= coalesce(qt.tag_90th_hotness, 0) then 'hot-90'
+        when qt.hotness_score > 10 then 'hot'
+        when qt.computed_net_votes < 0 then 'controversial'
+        else 'normal' 
+      end
+    ) as label,
+    -- sample calculated metric mixing strings, nulls and math
+    (coalesce(qt.viewcount,0) / nullif(greatest(1, qt.answercount),0))::numeric(12,4) as views_per_answer,
+    -- correlate to best answer if exists
+    (select a.id from answers a where a.questionid = qt.id order by a.score desc nulls last limit 1) as top_answer_id,
+    (select a.score from answers a where a.questionid = qt.id order by a.score desc nulls last limit 1) as top_answer_score,
+    -- existence of accepted answer
+    case when exists (select 1 from posts p2 where p2.id = qt.id and p2.acceptedanswerid is not null) then 1 else 0 end as has_accepted_answer
+  from questiontagexplode qt
+  where (qt.tag_rank <= 50 or qt.hotness_score >= qt.tag_90th_hotness)
+)
+select
+  tq.*,
+  -- join some ancillary info with left joins and coalesce
+  coalesce(u.displayname, 'Community') as owner_displayname,
+  coalesce(ub.gold_count,0) as owner_gold_count,
+  coalesce(pv.upvotes,0) as post_upvotes,
+  coalesce(pv.downvotes,0) as post_downvotes,
+  -- compute trend score using recency decay (exponential), null-safe
+  round(
+    (tq.hotness_score * exp(-greatest(0, extract(epoch from (current_timestamp - tq.computed_last_activity))/86400.0)/30.0))
+    + (coalesce(pv.net_votes,0) * 0.1)
+    - (coalesce(tq.duplicate_links,0) * 2.0)
+  ,4) as trend_score,
+  -- correlated subquery showing complex predicate and null logic: find nearest duplicate title within same tag (fuzzy match by norm_title similarity)
+  (
+    select p2.id
+    from posts p2
+    cross join lateral (
+      select lower(regexp_replace(coalesce(p2.title,''), '\s+', ' ', 'g')) as n2
+    ) n2
+    where p2.posttypeid = 1
+      and p2.id <> tq.id
+      and exists (
+        select 1 from unnest(tq.tag_tokens) tt where tt = any(case when p2.tags is null then array[]::text[] else string_to_array(substring(p2.tags,2,length(p2.tags)-2),'><') end)
+      )
+      and similarity(n2.n2, tq.norm_title) > 0.6
+    order by similarity(n2.n2, tq.norm_title) desc, abs(extract(epoch from (p2.creationdate - tq.creationdate)))
+    limit 1
+  ) as nearest_similar_question_id
+from topquestions tq
+left join users u on u.id = tq.owneruserid
+left join userbadges ub on ub.userid = tq.owneruserid
+left join postvotes pv on pv.postid = tq.id
+order by trend_score desc nulls last, tq.hotness_score desc, tq.computed_net_votes desc
+limit 200;

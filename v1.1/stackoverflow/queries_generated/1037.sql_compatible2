@@ -1,0 +1,81 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.ViewCount,
+        p.Score,
+        u.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS RankScore,
+        RANK() OVER (ORDER BY p.CreationDate DESC) AS RankDate,
+        p.OwnerUserId
+    FROM 
+        Posts p
+    JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    WHERE 
+        p.CreationDate >= DATE '2022-01-01'
+        AND p.PostTypeId = 1
+),
+PostAnalysis AS (
+    SELECT 
+        rp.OwnerDisplayName,
+        rp.Title,
+        rp.CreationDate,
+        rp.ViewCount,
+        rp.Score,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotes,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        CASE 
+            WHEN MAX(ph.CreationDate) IS NULL THEN 'No Edits'
+            ELSE 'Edited'
+        END AS EditStatus
+    FROM 
+        RankedPosts rp
+    LEFT JOIN 
+        Votes v ON rp.Id = v.PostId
+    LEFT JOIN 
+        Comments c ON rp.Id = c.PostId
+    LEFT JOIN 
+        PostHistory ph ON rp.Id = ph.PostId
+    WHERE 
+        rp.RankScore <= 5
+    GROUP BY 
+        rp.OwnerDisplayName, rp.Title, rp.CreationDate, rp.ViewCount, rp.Score
+),
+FinalAnalysis AS (
+    SELECT 
+        pa.OwnerDisplayName,
+        pa.Title,
+        pa.CreationDate,
+        pa.ViewCount,
+        pa.Score,
+        pa.UpVotes,
+        pa.DownVotes,
+        pa.CommentCount,
+        pa.EditStatus,
+        CASE 
+            WHEN pa.Score > 10 THEN 'High Engagement'
+            WHEN pa.Score BETWEEN 5 AND 10 THEN 'Moderate Engagement'
+            ELSE 'Low Engagement' 
+        END AS EngagementLevel
+    FROM 
+        PostAnalysis pa
+)
+SELECT 
+    fa.OwnerDisplayName,
+    fa.Title,
+    fa.CreationDate,
+    fa.ViewCount,
+    fa.Score,
+    fa.UpVotes,
+    fa.DownVotes,
+    fa.CommentCount,
+    fa.EditStatus,
+    fa.EngagementLevel
+FROM 
+    FinalAnalysis fa
+ORDER BY 
+    fa.Score DESC, 
+    fa.CreationDate ASC;

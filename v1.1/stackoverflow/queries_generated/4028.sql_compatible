@@ -1,0 +1,41 @@
+from Posts p
+    left join CloseReasonCounts crc on p.Id = crc.PostId
+    where p.PostTypeId = 1
+)
+select
+    tq.TagName,
+    tq.QuestionId,
+    tq.QuestionScore,
+    tq.ViewCount,
+    tq.OwnerUserId,
+    coalesce(uba.GoldBadges,0) as OwnerGoldBadges,
+    coalesce(uba.SilverBadges,0) as OwnerSilverBadges,
+    coalesce(uba.BronzeBadges,0) as OwnerBronzeBadges,
+    coalesce(a.AnswerCount,0) as AnswerCount,
+    coalesce(a.AvgAnswerScore,0) as AvgAnswerScore,
+    coalesce(a.AnswersAfterFirstDay,0) as AnswersAfterFirstDay,
+    coalesce(pldc.DuplicateLinksCount,0) as DuplicateLinksToQuestion,
+    tq.AvgCommentScore,
+    ha.DisplayName as OwnerName,
+    ha.QuestionsPosted as OwnerQuestionsPosted,
+    ha.AnswersPosted as OwnerAnswersPosted,
+    ha.BadgeCount as OwnerBadgesTotal,
+    qc.CloseReason,
+    qc.CloseReasonCount,
+    concat(
+        'Score: ', coalesce(tq.QuestionScore::text, cast(tq.QuestionScore as text)),
+        ' | Views: ', coalesce(cast(tq.ViewCount as text), '0'),
+        ' | Answers: ', coalesce(cast(a.AnswerCount as text), '0'),
+        ' | Owner Rep: ', coalesce(cast(hu.Reputation as text), '0'),
+        ' | Owner Gold Badges: ', coalesce(cast(uba.GoldBadges as text), '0')
+    ) as SummaryInfo
+from TopQuestionsPerTag tq
+left join AnswerStats a on a.QuestionId = tq.QuestionId
+left join UserBadgeAggregates uba on uba.UserId = tq.OwnerUserId
+left join PostLinkDupCount pldc on pldc.PostId = tq.QuestionId
+left join Users hu on hu.Id = tq.OwnerUserId
+left join HighlyActiveUsers ha on ha.Id = tq.OwnerUserId
+left join QuestionsWithCloseInfo qc on qc.Id = tq.QuestionId
+where (tq.QuestionScore > 10 or coalesce(a.AnswerCount,0) > 5)
+  and (ha.rn is null or ha.rn <= 100)
+order by tq.TagName, tq.QuestionScore desc, tq.ViewCount desc;

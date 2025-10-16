@@ -1,0 +1,130 @@
+WITH UserStats AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           COALESCE(q.QuestionCount, 0)   AS QuestionCount,
+           COALESCE(q.AnswerCount, 0)     AS AnswerCount,
+           COALESCE(b.GoldBadges, 0)      AS GoldBadges,
+           COALESCE(b.SilverBadges, 0)    AS SilverBadges,
+           COALESCE(b.BronzeBadges, 0)    AS BronzeBadges,
+           COALESCE(v.UpVotes, 0)         AS UpVotes,
+           COALESCE(v.DownVotes, 0)       AS DownVotes,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    LEFT JOIN (
+        SELECT OwnerUserId,
+               SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+               SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount
+        FROM Posts
+        GROUP BY OwnerUserId
+    ) q ON u.Id = q.OwnerUserId
+    LEFT JOIN (
+        SELECT UserId,
+               SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+               SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+               SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+        FROM Badges
+        GROUP BY UserId
+    ) b ON u.Id = b.UserId
+    LEFT JOIN (
+        SELECT PostId,
+               SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+               SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes
+        GROUP BY PostId
+    ) v ON u.Id = v.PostId
+),
+TopTags AS (
+    SELECT t.TagName,
+           COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionPosts,
+           COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerPosts,
+           AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+           MAX(p.ViewCount)                           AS MaxViews,
+           ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC) AS TagRank
+    FROM Tags t
+    JOIN Posts p
+      ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    GROUP BY t.TagName
+    HAVING COUNT(*) > 1000
+),
+InactiveUsers AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           0          AS QuestionCount,
+           0          AS AnswerCount,
+           0          AS GoldBadges,
+           0          AS SilverBadges,
+           0          AS BronzeBadges,
+           0          AS UpVotes,
+           0          AS DownVotes,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank,
+           CAST(NULL AS VARCHAR) AS TopTag,
+           0           AS TagQuestionPosts,
+           CAST(0 AS NUMERIC)   AS TagAvgScore
+    FROM Users u
+    LEFT JOIN Posts  p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes  v ON u.Id = v.PostId
+    WHERE p.Id IS NULL AND b.Id IS NULL AND v.Id IS NULL
+)
+SELECT Id,
+       DisplayName,
+       Reputation,
+       QuestionCount,
+       AnswerCount,
+       GoldBadges,
+       SilverBadges,
+       BronzeBadges,
+       UpVotes,
+       DownVotes,
+       RepRank,
+       COALESCE(TopTag, 'None') AS TopTag,
+       TagQuestionPosts,
+       TagAvgScore
+FROM (
+    SELECT us.Id,
+           us.DisplayName,
+           us.Reputation,
+           us.QuestionCount,
+           us.AnswerCount,
+           us.GoldBadges,
+           us.SilverBadges,
+           us.BronzeBadges,
+           us.UpVotes,
+           us.DownVotes,
+           us.RepRank,
+           tt.TagName                AS TopTag,
+           tt.QuestionPosts          AS TagQuestionPosts,
+           tt.AvgQuestionScore       AS TagAvgScore
+    FROM UserStats us
+    LEFT JOIN (
+        SELECT tt2.TagName, tt2.QuestionPosts, tt2.AvgQuestionScore, tt2.TagRank
+        FROM TopTags tt2
+        WHERE tt2.TagRank <= 5
+        ORDER BY tt2.TagRank
+        FETCH FIRST 1 ROWS ONLY
+    ) tt ON 1=1
+    WHERE us.RepRank <= 100
+
+    UNION ALL
+
+    SELECT iu.Id,
+           iu.DisplayName,
+           iu.Reputation,
+           iu.QuestionCount,
+           iu.AnswerCount,
+           iu.GoldBadges,
+           iu.SilverBadges,
+           iu.BronzeBadges,
+           iu.UpVotes,
+           iu.DownVotes,
+           iu.RepRank,
+           iu.TopTag,
+           iu.TagQuestionPosts,
+           iu.TagAvgScore
+    FROM InactiveUsers iu
+    WHERE iu.RepRank <= 100
+) final
+ORDER BY RepRank, Id
+FETCH FIRST 150 ROWS ONLY;

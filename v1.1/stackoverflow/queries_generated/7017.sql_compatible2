@@ -1,0 +1,152 @@
+with
+-- recent active questions with tag arrays and sanitized title/slug
+recent_q as (
+  select p.id,
+         p.creationdate,
+         p.title,
+         coalesce(nullif(trim(p.tags),''),'<>') as raw_tags,
+         (select array_agg(regexp_replace(t,'^<|>$','')) from unnest(string_to_array(substring(coalesce(p.tags,'<>'),2,length(coalesce(p.tags,'<>'))-2), '><')) t(t)) as tag_array,
+         p.owneruserid,
+         p.score,
+         p.viewcount,
+         p.answercount,
+         p.acceptedanswerid,
+         p.lastactivitydate
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '730 days'
+),
+-- compute per-question aggregates: top answer stats, comment counts, distinct voters, and last edit
+q_aggs as (
+  select q.id,
+         q.title,
+         q.creationdate,
+         q.owneruserid,
+         q.score as q_score,
+         q.viewcount,
+         q.answercount,
+         q.tag_array,
+         q.lastactivitydate,
+         (select a.id
+            from posts a
+            where a.parentid = q.id and a.posttypeid = 2
+            order by (coalesce(a.score,0) * ln(1+coalesce(a.viewcount,0)) + greatest(0, 365 - extract(day from cast('2024-10-01 12:34:56' as timestamp) - a.creationdate))) desc nulls last
+            limit 1) as top_answer_id,
+         (select count(*) from comments c where c.postid = q.id) as q_comment_count,
+         (select count(distinct v.userid) from votes v where v.postid = q.id and v.userid is not null) as q_distinct_voters,
+         (select count(*) from posthistory ph where ph.postid = q.id) as q_edit_count,
+         (select ph.creationdate from posthistory ph where ph.postid = q.id order by ph.creationdate desc limit 1) as q_last_edit_date,
+         (select count(*) from posts a where a.parentid = q.id and a.posttypeid = 2 and a.id = q.acceptedanswerid) as has_accepted_answer,
+         (select count(*) from posts a where a.parentid = q.id and a.posttypeid = 2 and a.score >= greatest(5, coalesce(q.score/2,5))) as high_score_answers
+  from recent_q q
+),
+-- bring in top answer details and answerer metrics (may be null if no answers)
+top_answers as (
+  select qa.*,
+         ta.body as top_answer_body,
+         ta.score as top_answer_score,
+         ta.creationdate as top_answer_date,
+         ta.owneruserid as top_answer_ownerid,
+         u.displayname as top_answer_owner_name,
+         u.reputation as top_answer_owner_rep,
+         case when qa.owneruserid is not null and u.reputation is not null
+              then round( cast(u.reputation as numeric) / nullif((select reputation from users uu where uu.id = qa.owneruserid),0) , 3)
+              else null end as rep_ratio_answerer_to_asker,
+         (select string_agg(substring(c.text from 1 for 80) || coalesce(' ['||cast(c.userid as text)||']',''), ' ||| ' order by c.creationdate desc)
+            from comments c where c.postid = ta.id limit 3) as top_answer_recent_comments
+  from q_aggs qa
+  left join posts ta on ta.id = qa.top_answer_id
+  left join users u on u.id = ta.owneruserid
+),
+-- compute user-level aggregates for owners of recent questions
+user_stats as (
+  select u.id as userid,
+         u.displayname,
+         u.reputation,
+         u.creationdate as user_created,
+         u.lastaccessdate,
+         u.views as user_views,
+         (select count(*) from badges b where b.userid = u.id and b.class = 1) as gold_badges,
+         (select count(*) from badges b where b.userid = u.id and b.class = 2) as silver_badges,
+         (select count(*) from badges b where b.userid = u.id and b.class = 3) as bronze_badges,
+         (select count(*) from posts p where p.owneruserid = u.id and p.posttypeid = 1 and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '730 days') as recent_questions_by_user,
+         rank() over (order by u.reputation desc nulls last) as rep_rank_over_recent_askers
+  from users u
+  where exists (select 1 from recent_q q where q.owneruserid = u.id)
+),
+-- tag explosion: each question-tag row for tag-level aggregates
+question_tags as (
+  select q.id as question_id,
+         unnest(q.tag_array) as tag
+  from recent_q q
+),
+tag_aggs as (
+  select qt.tag,
+         count(distinct qt.question_id) as questions_with_tag,
+         count(distinct qt.question_id) filter (where (select count(*) from posts p where p.parentid = qt.question_id and p.posttypeid = 2) = 0) as unanswered_questions,
+         avg((select q2.q_score from q_aggs q2 where q2.id = qt.question_id)) as avg_question_score,
+         max((select q3.viewcount from q_aggs q3 where q3.id = qt.question_id)) as max_views
+  from question_tags qt
+  group by qt.tag
+),
+-- compute anomalies: questions with many edits but low score OR high score but low views etc.
+anomalies as (
+  select qa.id,
+         qa.title,
+         qa.q_score,
+         qa.viewcount,
+         qa.q_edit_count,
+         qa.q_comment_count,
+         qa.high_score_answers,
+         case
+           when qa.q_edit_count > 10 and qa.q_score <= 0 then 'overedited_low_score'
+           when qa.q_score >= 10 and qa.viewcount < 50 then 'high_score_low_views'
+           when qa.answercount = 0 and qa.viewcount > 500 and qa.q_score < 2 then 'popular_unanswered_low_score'
+           else null
+         end as anomaly_tag
+  from q_aggs qa
+  where (qa.q_edit_count > 10 and qa.q_score <= 0)
+     or (qa.q_score >= 10 and qa.viewcount < 50)
+     or (qa.answercount = 0 and qa.viewcount > 500 and qa.q_score < 2)
+)
+select
+  ta.id as question_id,
+  left(coalesce(ta.title,'(no title)'),120) as question_title_snip,
+  ta.creationdate as question_created,
+  us.displayname as asker_name,
+  us.reputation as asker_rep,
+  ta.q_score,
+  ta.viewcount,
+  ta.answercount,
+  ta.high_score_answers,
+  ta.has_accepted_answer,
+  ta.top_answer_id,
+  ta.top_answer_score,
+  ta.top_answer_owner_name,
+  ta.top_answer_owner_rep,
+  ta.rep_ratio_answerer_to_asker,
+  ta.top_answer_recent_comments,
+  ta.q_comment_count,
+  ta.q_edit_count,
+  ta.q_last_edit_date,
+  (select string_agg(tag, ', ' order by tag) from unnest(ta.tag_array) as t(tag)) as tags_csv,
+  round( (coalesce(ta.q_score,0) * greatest(1, ln(1+coalesce(ta.viewcount,0))/3) + coalesce(ta.answercount,0) * 2 + coalesce(ta.high_score_answers,0) * 3)::numeric, 2) as popularity_index,
+  tg.questions_with_tag,
+  tg.avg_question_score,
+  an.anomaly_tag,
+  us.rep_rank_over_recent_askers,
+  (select percentile_disc(0.5) within group (order by coalesce(a.score,0)) from posts a where a.parentid = ta.id and a.posttypeid = 2) as median_answer_score,
+  case
+    when ta.owneruserid is null and ta.top_answer_ownerid is not null then 'asker_deleted_answerer_present'
+    when ta.owneruserid is not null and ta.top_answer_ownerid is null then 'asker_present_answerer_deleted'
+    when ta.owneruserid = ta.top_answer_ownerid then 'same_user_asked_and_top_answered'
+    else 'distinct_owners_or_unknown'
+  end as owner_answerer_relation
+from top_answers ta
+left join user_stats us on us.userid = ta.owneruserid
+left join tag_aggs tg on tg.tag = (select t from unnest(ta.tag_array) as t order by 1 limit 1)
+left join anomalies an on an.id = ta.id
+where (ta.q_score is null or ta.q_score >= -2)
+  and (ta.viewcount is null or ta.viewcount >= 0)
+order by popularity_index desc nulls last, ta.q_last_edit_date desc
+limit 250;

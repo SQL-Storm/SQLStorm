@@ -1,0 +1,145 @@
+with
+RecentQuestions as (
+  select p.id, p.title, p.creationdate, p.score, p.viewcount, p.answercount,
+         coalesce(p.owneruserid, -1) as ownerid,
+         regexp_split_to_table(substring(coalesce(p.tags,''),2, greatest(length(coalesce(p.tags,'')) - 2,0)), '><') as tag
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '12 months'
+),
+AnswerStats as (
+  select q.id as questionid,
+         count(a.id) filter (where a.id is not null) as total_answers,
+         avg(a.score) filter (where a.id is not null) as avg_answer_score,
+         max(a.score) filter (where a.id is not null) as max_answer_score,
+         min(a.creationdate) filter (where a.id is not null) as first_answer_date,
+         (select least(cast(extract(epoch from (a2.creationdate - q.creationdate)) as bigint), null)
+            from posts a2
+           where a2.parentid = q.id
+             and a2.id = q.acceptedanswerid
+           limit 1) as accepted_answer_latency_seconds
+  from posts q
+  left join posts a on a.parentid = q.id and a.posttypeid = 2
+  where q.posttypeid = 1
+  group by q.id
+),
+UserSignals as (
+  select u.id as userid,
+         u.reputation,
+         u.creationdate,
+         u.displayname,
+         coalesce(bad.badge_count,0) as badge_count,
+         dense_rank() over (order by u.reputation desc) as rep_rank,
+         row_number() over (partition by (u.reputation >= 10000) order by u.reputation desc) as highrep_seq
+  from users u
+  left join (
+    select badges.userid as userid, count(*) as badge_count
+    from badges
+    group by badges.userid
+  ) bad on bad.userid = u.id
+),
+TagAggregates as (
+  select rq.tag,
+         count(distinct rq.id) as questions_count,
+         sum(coalesce(asg.total_answers,0)) as answers_sum,
+         avg(coalesce(asg.avg_answer_score,0)) as avg_answer_score,
+         max(coalesce(asg.max_answer_score,0)) as tag_max_answer_score,
+         min(asg.first_answer_date) as earliest_first_answer,
+         (select a.owneruserid
+            from posts a
+            join posts q2 on q2.id = a.parentid and q2.posttypeid = 1
+           where a.posttypeid = 2
+             and q2.id in (
+               select id from RecentQuestions rq2 where rq2.tag = rq.tag
+             )
+           group by a.owneruserid
+           order by sum(a.score) desc nulls last
+           limit 1) as top_answerer_id
+  from RecentQuestions rq
+  left join AnswerStats asg on asg.questionid = rq.id
+  group by rq.tag
+),
+LinkedNetwork as (
+  select pl.postid, pl.relatedpostid, lt.name as linktype
+  from postlinks pl
+  left join linktypes lt on lt.id = pl.linktypeid
+  where exists (
+    select 1 from posts p where p.id = pl.postid and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '36 months'
+  )
+  union
+  select pl.relatedpostid as postid, pl.postid as relatedpostid, 'reverse_'||lt.name
+  from postlinks pl
+  left join linktypes lt on lt.id = pl.linktypeid
+  where pl.linktypeid = 3
+),
+TagQuestionScores as (
+  select rq.id as questionid,
+         rq.tag,
+         rq.title,
+         rq.creationdate,
+         rq.score as question_score,
+         coalesce(asg.total_answers,0) as total_answers,
+         coalesce(asg.accepted_answer_latency_seconds, null) as accepted_latency,
+         us.id as ownerid,
+         us.reputation as owner_reputation,
+         us.badge_count,
+         (
+           coalesce(rq.score,0) * 3
+           + coalesce(asg.avg_answer_score,0) * 5
+           + coalesce(us.reputation,0) / nullif(least(coalesce(us.badge_count,0)+1,1000),0)
+           - coalesce(rq.viewcount,0) / nullif((coalesce(asg.total_answers,0)+1),1)
+           + case when rq.title ilike '%error%' or rq.title ilike '%exception%' then 50 else 0 end
+           + case when position('how' in lower(coalesce(rq.title,''))) > 0 then 10 else 0 end
+           - coalesce(asg.accepted_answer_latency_seconds,0) / (24*3600)
+         ) as composite_score,
+         rank() over (partition by rq.tag order by (
+           coalesce(rq.score,0) * 3
+           + coalesce(asg.avg_answer_score,0) * 5
+           + coalesce(us.reputation,0) / nullif(least(coalesce(us.badge_count,0)+1,1000),0)
+         ) desc) as tag_rank
+  from RecentQuestions rq
+  left join AnswerStats asg on asg.questionid = rq.id
+  left join users us on us.id = rq.ownerid
+),
+TopPerTag as (
+  select tqs.*,
+         (select count(*) from comments c where c.postid = tqs.questionid and (c.text ilike '%thanks%' or c.text ilike '%great%' or c.text ilike '%helpful%')) as positive_comments,
+         (select count(distinct ph.userid) from posthistory ph where ph.postid = tqs.questionid and ph.posthistorytypeid = 10) as closer_count
+  from TagQuestionScores tqs
+  where tqs.tag_rank <= 5
+)
+select
+  tp.tag,
+  tp.questionid,
+  tp.title,
+  tp.creationdate,
+  tp.question_score,
+  tp.total_answers,
+  tp.accepted_latency,
+  tp.ownerid,
+  tp.owner_reputation,
+  tp.badge_count,
+  tp.composite_score,
+  tp.tag_rank,
+  tg.questions_count,
+  tg.answers_sum,
+  tg.avg_answer_score as tag_avg_answer_score,
+  tg.tag_max_answer_score,
+  tg.top_answerer_id,
+  tp.positive_comments,
+  tp.closer_count,
+  (select count(*) from LinkedNetwork ln where ln.postid = tp.questionid) as out_links,
+  (select count(*) from LinkedNetwork ln where ln.relatedpostid = tp.questionid) as in_links,
+  length(tp.title) as title_length,
+  array_length(regexp_split_to_array(tp.title, '\s+'),1) as title_word_count,
+  case
+    when tp.composite_score is null then 'unknown'
+    when tp.composite_score > 200 then 'hot'
+    when tp.composite_score between 50 and 200 then 'active'
+    when tp.composite_score between 0 and 49 then 'mild'
+    else 'cold'
+  end as activity_label
+from TopPerTag tp
+left join TagAggregates tg on tg.tag = tp.tag
+order by tp.tag, tp.composite_score desc, tp.creationdate desc
+limit 1000;

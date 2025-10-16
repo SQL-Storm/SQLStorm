@@ -1,0 +1,90 @@
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersProvided,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+        COUNT(DISTINCT b.Id) AS BadgesEarned,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) DESC) AS QuestionRank,
+        AVG(COALESCE(p.Score, 0)) AS AvgPostScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND (p.PostTypeId = 1 OR p.PostTypeId = 2)
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.LastAccessDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90' DAY)
+    GROUP BY u.Id
+),
+TopContributors AS (
+    SELECT UserId, QuestionsAsked, AnswersProvided, UpVotesReceived, DownVotesReceived, BadgesEarned, AvgPostScore
+    FROM UserActivity
+    WHERE QuestionRank <= 100
+),
+PostHistoryMax AS (
+    SELECT 
+        PostId, 
+        MAX(CreationDate) AS CreationDate
+    FROM PostHistory
+    WHERE PostHistoryTypeId IN (4, 5, 6)
+    GROUP BY PostId
+),
+PostMetrics AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ph.CreationDate AS LastEditDate,
+        COALESCE(STRING_AGG(t.TagName, ', ' ORDER BY t.TagName), 'N/A') AS TagList
+    FROM Posts p
+    LEFT JOIN PostHistoryMax ph ON p.Id = ph.PostId
+    LEFT JOIN (
+        -- split tags like '<tag1><tag2>' into rows using portable expressions
+        SELECT ptags.PostId, TRIM(t2.tag) AS TagName
+        FROM (
+            SELECT p2.Id AS PostId,
+                   CASE WHEN p2.Tags IS NULL THEN '' ELSE SUBSTRING(p2.Tags FROM 2 FOR CHAR_LENGTH(p2.Tags) - 2) END AS TagsStr
+            FROM Posts p2
+        ) ptags
+        CROSS JOIN LATERAL (
+            SELECT value AS tag
+            FROM (
+                SELECT unnest(string_to_array(ptags.TagsStr, '><')) AS value
+            ) s
+        ) t2
+    ) t ON t.PostId = p.Id
+    WHERE p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR)
+    GROUP BY p.Id, p.OwnerUserId, p.PostTypeId, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, ph.CreationDate
+),
+AggregatedMetrics AS (
+    SELECT 
+        tc.UserId,
+        COUNT(pm.PostId) AS TotalPosts,
+        SUM(CASE WHEN pm.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        AVG(pm.Score) AS AvgScore,
+        SUM(pm.ViewCount) AS TotalViews,
+        SUM(pm.CommentCount) AS TotalComments,
+        STRING_AGG(DISTINCT pm.TagList, '; ') AS AllTags
+    FROM TopContributors tc
+    LEFT JOIN PostMetrics pm ON tc.UserId = pm.OwnerUserId
+    GROUP BY tc.UserId
+)
+SELECT 
+    u.DisplayName,
+    am.TotalPosts,
+    am.TotalQuestions,
+    am.AvgScore,
+    am.TotalViews,
+    am.TotalComments,
+    am.AllTags,
+    tc.UpVotesReceived - tc.DownVotesReceived AS NetVotes,
+    RANK() OVER (ORDER BY am.TotalPosts DESC, tc.BadgesEarned DESC) AS ContributorRank
+FROM AggregatedMetrics am
+JOIN Users u ON am.UserId = u.Id
+JOIN TopContributors tc ON am.UserId = tc.UserId
+WHERE CHAR_LENGTH(COALESCE(u.AboutMe, '')) > 100
+ORDER BY ContributorRank;

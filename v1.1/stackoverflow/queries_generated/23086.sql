@@ -1,0 +1,59 @@
+-- {"query": "23086.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "grok-4", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2685, "output_tokens": 844} 
+
+WITH GoldBadgeUsers AS (
+    SELECT u.Id AS UserId, u.Reputation, u.DisplayName,
+           COUNT(b.Id) AS GoldBadges,
+           ROW_NUMBER() OVER (PARTITION BY u.Location ORDER BY COUNT(b.Id) DESC) AS LocationRank
+    FROM Users u
+    LEFT OUTER JOIN Badges b ON u.Id = b.UserId AND b.Class = 1 AND b.TagBased = TRUE
+    WHERE u.Reputation > 1000 AND (u.Location IS NOT NULL OR u.WebsiteUrl LIKE '%stackoverflow%')
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Location
+    HAVING COUNT(b.Id) >= 1
+),
+TopQuestions AS (
+    SELECT p.Id AS PostId, p.OwnerUserId, p.Title, p.ViewCount, p.Tags,
+           COALESCE(p.AnswerCount, 0) AS Answers,
+           DENSE_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.ViewCount DESC NULLS LAST) AS ViewRank,
+           (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 9) AS AvgBounty
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags LIKE '%<sql>%'
+      AND EXISTS (SELECT 1 FROM Comments c WHERE c.PostId = p.Id AND c.Score > 5)
+),
+EditedPosts AS (
+    SELECT ph.PostId, COUNT(ph.Id) AS EditCount,
+           STRING_AGG(COALESCE(ph.UserDisplayName, 'Anonymous'), ', ' ORDER BY ph.CreationDate) AS Editors,
+           MAX(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.CreationDate ELSE NULL END) AS LastEdit
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6,7,8,9) AND ph.Comment IS NOT NULL
+    GROUP BY ph.PostId
+    HAVING COUNT(ph.Id) > 2
+),
+LinkedDuplicates AS (
+    SELECT pl.PostId, COUNT(DISTINCT pl.RelatedPostId) AS DuplicateLinks
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+    GROUP BY pl.PostId
+)
+SELECT gbu.UserId, gbu.DisplayName, gbu.Reputation, gbu.GoldBadges, gbu.LocationRank,
+       tq.Title, tq.ViewCount, tq.Answers, tq.ViewRank, tq.AvgBounty,
+       ep.EditCount, ep.Editors, ep.LastEdit,
+       ld.DuplicateLinks,
+       CASE WHEN tq.ViewCount > 10000 THEN 'High View' ELSE 'Normal' END AS ViewCategory,
+       COALESCE((SELECT SUM(c.Score) FROM Comments c WHERE c.PostId = tq.PostId AND c.Text ~* 'thank.*you'), 0) AS ThankYouComments,
+       NULLIF(tq.Tags, '') AS CleanTags
+FROM GoldBadgeUsers gbu
+INNER JOIN TopQuestions tq ON gbu.UserId = tq.OwnerUserId AND tq.ViewRank = 1
+LEFT OUTER JOIN EditedPosts ep ON tq.PostId = ep.PostId
+LEFT OUTER JOIN LinkedDuplicates ld ON tq.PostId = ld.PostId
+WHERE gbu.LocationRank <= 3
+UNION ALL
+SELECT gbu.UserId, gbu.DisplayName, gbu.Reputation, gbu.GoldBadges, gbu.LocationRank,
+       NULL AS Title, NULL AS ViewCount, NULL AS Answers, NULL AS ViewRank, NULL AS AvgBounty,
+       NULL AS EditCount, NULL AS Editors, NULL AS LastEdit,
+       NULL AS DuplicateLinks,
+       'No Top Question' AS ViewCategory,
+       0 AS ThankYouComments,
+       NULL AS CleanTags
+FROM GoldBadgeUsers gbu
+WHERE NOT EXISTS (SELECT 1 FROM TopQuestions tq2 WHERE gbu.UserId = tq2.OwnerUserId)
+ORDER BY Reputation DESC, GoldBadges DESC;

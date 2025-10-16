@@ -1,0 +1,167 @@
+-- {"query": "950.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1555} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        1 AS Level,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired
+    FROM Tags t
+    WHERE t.IsRequired = 1
+
+    UNION ALL
+
+    SELECT
+        child.Id,
+        child.TagName,
+        rh.Level + 1,
+        child.Count,
+        child.IsModeratorOnly,
+        child.IsRequired
+    FROM Tags child
+    INNER JOIN PostLinks pl ON pl.PostId = child.ExcerptPostId
+    INNER JOIN RecursiveTagHierarchy rh ON rh.Id = pl.RelatedPostId
+    WHERE child.Id != rh.Id
+),
+UserBadgeRanks AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY COUNT(*) DESC) AS RankByClass
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+HighReputationActiveUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END),0) AS QuestionCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END),0) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        MAX(COALESCE(b.Date, '1900-01-01'::timestamp)) AS LastBadgeDate,
+        COUNT(DISTINCT br.UserId) FILTER (WHERE br.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT br.UserId) FILTER (WHERE br.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT br.UserId) FILTER (WHERE br.Class = 3) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Badges br ON br.UserId = u.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+QuestionAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        COALESCE(a.TotalAnswerScore, 0) AS TotalAnswerScore,
+        COALESCE(a.MaxAnswerScore, 0) AS MaxAnswerScore,
+        us.DisplayName AS QuestionOwnerName,
+        us.Reputation AS QuestionOwnerReputation,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.MaxAnswerScore DESC NULLS LAST) AS AnswerRank
+    FROM Posts q
+    LEFT JOIN (
+        SELECT 
+            ParentId,
+            SUM(Score) AS TotalAnswerScore,
+            MAX(Score) AS MaxAnswerScore
+        FROM Posts
+        WHERE PostTypeId = 2
+        GROUP BY ParentId
+    ) a ON a.ParentId = q.Id
+    LEFT JOIN Users us ON us.Id = q.OwnerUserId
+    WHERE q.PostTypeId = 1
+),
+PostsWithCloseReasons AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        crt.Name AS CloseReasonName,
+        ph.CreationDate AS ClosedOn
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INT) AND ph.PostHistoryTypeId = 10
+    WHERE ph.PostHistoryTypeId = 10
+),
+TopControversialPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        ABS(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) - SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)) AS VoteDiff
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.PostTypeId = 1 AND p.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.FavoriteCount
+    HAVING COUNT(v.Id) > 10
+    ORDER BY VoteDiff ASC, p.Score DESC
+    LIMIT 10
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.LastAccessDate,
+    u.QuestionCount,
+    u.AnswerCount,
+    u.CommentCount,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    qas.QuestionId,
+    qas.Title AS QuestionTitle,
+    qas.QuestionDate,
+    qas.QuestionScore,
+    qas.ViewCount AS QuestionViews,
+    qas.AnswerCount AS NumberOfAnswers,
+    qas.TotalAnswerScore,
+    qas.MaxAnswerScore,
+    qas.QuestionOwnerName,
+    qas.QuestionOwnerReputation,
+    cpr.CloseReasonName,
+    cpr.ClosedOn,
+    tcp.UpVotes AS QuestionUpVotes,
+    tcp.DownVotes AS QuestionDownVotes,
+    rh.Level AS TagHierarchyLevel,
+    rh.TagName,
+    rh.Count AS TagUsageCount,
+    rh.IsModeratorOnly,
+    rh.IsRequired,
+    CONCAT(
+        'User ', COALESCE(u.DisplayName, 'Unknown'), ' has ',
+        COALESCE(u.Reputation::TEXT, '0'), ' reputation and ',
+        COALESCE(u.QuestionCount::TEXT, '0'), ' questions.'
+    ) AS UserSummary,
+    CASE
+        WHEN u.Reputation > 5000 AND u.GoldBadges > 5 THEN 'Expert'
+        WHEN u.Reputation BETWEEN 1000 AND 5000 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END AS UserLevel,
+    CASE
+        WHEN cpr.CloseReasonName IS NOT NULL THEN 'Closed: ' || cpr.CloseReasonName
+        ELSE 'Open'
+    END AS QuestionStatus
+FROM HighReputationActiveUsers u
+INNER JOIN QuestionAnswerStats qas ON qas.QuestionOwnerName = u.DisplayName
+LEFT JOIN PostsWithCloseReasons cpr ON cpr.PostId = qas.QuestionId
+LEFT JOIN TopControversialPosts tcp ON tcp.Id = qas.QuestionId
+LEFT JOIN RecursiveTagHierarchy rh ON rh.TagName = ANY(string_to_array(replace(replace(qas.Title, '<', ''), '>', ''), ' '))
+WHERE u.LastAccessDate > NOW() - INTERVAL '6 months'
+  AND (u.GoldBadges + u.SilverBadges + u.BronzeBadges) > 0
+ORDER BY u.Reputation DESC, qas.QuestionScore DESC, rh.Level ASC
+LIMIT 50;

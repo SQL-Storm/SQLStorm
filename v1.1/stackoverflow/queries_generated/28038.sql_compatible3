@@ -1,0 +1,124 @@
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE 0 END) / NULLIF(COUNT(DISTINCT p.Id), 0) AS AvgAnswerCount,
+        AVG(p.Score) AS AvgPostScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1, 2)
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId IN (2, 3, 8)
+    LEFT JOIN Badges b ON u.Id = b.UserId AND b.Class IN (1, 2, 3)
+    WHERE u.CreationDate >= DATE '2015-01-01'
+    GROUP BY u.Id
+    HAVING COUNT(DISTINCT p.Id) > 10 AND AVG(p.Score) > 5
+),
+BadgeRankings AS (
+    SELECT 
+        UserId,
+        Name,
+        Class,
+        RANK() OVER (PARTITION BY Class ORDER BY COUNT(*) DESC) AS BadgeRank
+    FROM Badges
+    GROUP BY UserId, Name, Class
+),
+UserTopTags AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        TRIM(tag) AS TagName
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT value AS tag
+        FROM (
+            SELECT
+                CASE
+                    WHEN p.Tags IS NULL OR p.Tags = '' THEN NULL
+                    ELSE SUBSTRING(p.Tags FROM 2 FOR (LENGTH(p.Tags) - 2))
+                END AS tags_raw
+        ) raw
+        CROSS JOIN LATERAL (
+            WITH RECURSIVE parts(pos, rest, value) AS (
+                SELECT 1, raw.tags_raw, NULL
+                WHERE raw.tags_raw IS NOT NULL
+                UNION ALL
+                SELECT
+                    CASE WHEN POSITION('><' IN rest) = 0 THEN 1 ELSE POSITION('><' IN rest) + 2 END,
+                    CASE 
+                        WHEN POSITION('><' IN rest) = 0 THEN ''
+                        ELSE SUBSTRING(rest FROM (POSITION('><' IN rest) + 2))
+                    END,
+                    CASE 
+                        WHEN POSITION('><' IN rest) = 0 THEN rest
+                        ELSE SUBSTRING(rest FROM 1 FOR (POSITION('><' IN rest) - 1))
+                    END
+                FROM parts
+                WHERE rest <> ''
+            )
+            SELECT value FROM parts WHERE value IS NOT NULL
+        ) s
+    ) t
+    WHERE p.PostTypeId = 1
+),
+TopTagCounts AS (
+    SELECT
+        ut.UserId,
+        ut.TagName,
+        COUNT(*) AS Count
+    FROM UserTopTags ut
+    GROUP BY ut.UserId, ut.TagName
+)
+SELECT 
+    u.Id,
+    (u.DisplayName || ' (' || COALESCE(u.Location, 'Unknown') || ')') AS UserLabel,
+    u.Reputation,
+    EXTRACT(YEAR FROM u.CreationDate) AS JoinYear,
+    (ua.PostCount * 3 + ua.CommentCount * 2 + ua.VoteCount + ua.BadgeCount * 5) AS ActivityScore,
+    (SELECT MAX(p2.LastEditDate) FROM Posts p2 WHERE p2.OwnerUserId = u.Id) AS LastEdit,
+    (
+        SELECT STRING_AGG(t.TagName || ' (' || CAST(t.Count AS VARCHAR) || ')', ', ' ORDER BY t.Count DESC)
+        FROM TopTagCounts t
+        WHERE t.UserId = u.Id
+    ) AS TopTags,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 
+            FROM PostHistory ph 
+            WHERE ph.PostId IN (SELECT p3.Id FROM Posts p3 WHERE p3.OwnerUserId = u.Id) 
+            AND ph.PostHistoryTypeId = 10
+        ) THEN 'Closer' 
+        ELSE 'Non-Closer' 
+    END AS CloserStatus,
+    ROUND(CAST(ua.AvgAnswerCount AS DECIMAL), 2) AS AvgAnswers,
+    (SELECT COUNT(*) FROM BadgeRankings br WHERE br.UserId = u.Id AND br.BadgeRank <= 3) AS Top3Badges,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS GlobalRank,
+    NTILE(4) OVER (ORDER BY u.Reputation) AS ReputationQuartile,
+    COALESCE(p.ContentLicense, c.ContentLicense, 'None') AS MainLicense
+FROM Users u
+JOIN UserActivity ua ON u.Id = ua.UserId
+LEFT JOIN Posts p ON p.Id = (
+    SELECT p4.Id FROM Posts p4 WHERE p4.OwnerUserId = u.Id ORDER BY p4.Score DESC LIMIT 1
+)
+LEFT JOIN Comments c ON c.Id = (
+    SELECT c2.Id FROM Comments c2 WHERE c2.UserId = u.Id ORDER BY c2.Score DESC LIMIT 1
+)
+WHERE u.Reputation > 1000
+    AND (u.LastAccessDate - u.CreationDate) > INTERVAL '5 years'
+    AND (u.DownVotes < u.UpVotes * 0.1 OR u.DownVotes IS NULL)
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Location,
+    u.Reputation,
+    u.CreationDate,
+    ua.PostCount,
+    ua.CommentCount,
+    ua.VoteCount,
+    ua.BadgeCount,
+    ua.AvgAnswerCount,
+    p.ContentLicense,
+    c.ContentLicense
+ORDER BY ActivityScore DESC, GlobalRank
+LIMIT 100;

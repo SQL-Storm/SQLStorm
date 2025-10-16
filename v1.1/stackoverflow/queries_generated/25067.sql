@@ -1,0 +1,162 @@
+-- {"query": "25067.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 3336} 
+
+WITH
+    user_base AS (
+        SELECT 
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            u.CreationDate,
+            COALESCE(u.Location, 'Unknown') AS Location,
+            CASE 
+                WHEN u.EmailHash IS NULL THEN 0 
+                ELSE 1 
+            END AS HasEmailHash,
+            ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+        FROM Users u
+    ),
+    badge_counts AS (
+        SELECT 
+            b.UserId,
+            SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+            SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+            SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+            COUNT(*) AS TotalBadges
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+    recent_activity AS (
+        SELECT 
+            p.OwnerUserId AS UserId,
+            MAX(p.LastActivityDate) AS LastActivity
+        FROM Posts p
+        WHERE p.CreationDate >= CURRENT_DATE - INTERVAL '180 days'
+        GROUP BY p.OwnerUserId
+    ),
+    unanswered_questions AS (
+        SELECT 
+            q.Id,
+            q.Title,
+            q.CreationDate,
+            q.OwnerUserId,
+            q.Score,
+            (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2) AS AnswerCount
+        FROM Posts q
+        WHERE q.PostTypeId = 1            -- question
+          AND q.ClosedDate IS NULL
+          AND (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2) = 0
+    ),
+    tag_usage AS (
+        SELECT 
+            t.TagName,
+            t.Count AS TagTotal,
+            COUNT(p.Id) FILTER (WHERE p.CreationDate >= CURRENT_DATE - INTERVAL '30 days') AS RecentPosts,
+            ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+        FROM Tags t
+        LEFT JOIN Posts p
+          ON p.Tags IS NOT NULL
+         AND p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+        GROUP BY t.TagName, t.Count
+    ),
+    vote_aggregates AS (
+        SELECT 
+            v.PostId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+            COUNT(*) FILTER (WHERE v.VoteTypeId IN (2,3)) AS TotalVotes,
+            MAX(v.CreationDate) AS LastVoteDate
+        FROM Votes v
+        GROUP BY v.PostId
+    ),
+    post_scores AS (
+        SELECT 
+            p.Id,
+            p.Title,
+            p.Score,
+            p.ViewCount,
+            COALESCE(vu.UpVotes,0) - COALESCE(vu.DownVotes,0) AS NetVote,
+            p.CreationDate,
+            p.OwnerUserId,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS UserPostRank
+        FROM Posts p
+        LEFT JOIN vote_aggregates vu ON vu.PostId = p.Id
+        WHERE p.PostTypeId = 1      -- only questions
+    ),
+    top_users AS (
+        SELECT 
+            ub.Id,
+            ub.DisplayName,
+            ub.Reputation,
+            ub.Location,
+            COALESCE(bc.GoldBadges,0) AS GoldBadges,
+            COALESCE(bc.SilverBadges,0) AS SilverBadges,
+            COALESCE(bc.BronzeBadges,0) AS BronzeBadges,
+            COALESCE(rc.LastActivity, ub.CreationDate) AS LastActive,
+            ub.ReputationRank
+        FROM user_base ub
+        LEFT JOIN badge_counts bc ON bc.UserId = ub.Id
+        LEFT JOIN recent_activity rc ON rc.UserId = ub.Id
+        WHERE ub.ReputationRank <= 100
+    ),
+    top_tags AS (
+        SELECT 
+            tu.TagName,
+            tu.TagTotal,
+            tu.RecentPosts,
+            tu.TagRank
+        FROM tag_usage tu
+        WHERE tu.TagRank <= 50
+    ),
+    user_question_stats AS (
+        SELECT 
+            p.OwnerUserId AS UserId,
+            COUNT(*) FILTER (WHERE p.Score >= 10) AS HighScoringQuestions,
+            COUNT(*) FILTER (WHERE p.Score < 0) AS NegativeScoreQuestions,
+            AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS AvgScore,
+            MAX(p.CreationDate) AS MostRecentQuestion
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+        GROUP BY p.OwnerUserId
+    )
+SELECT 
+    tu.Id AS UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.Location,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    tu.LastActive,
+    COALESCE(uqs.HighScoringQuestions,0) AS HighScoringQ,
+    COALESCE(uqs.NegativeScoreQuestions,0) AS NegScoreQ,
+    ROUND(COALESCE(uqs.AvgScore,0),2) AS AvgQScore,
+    CASE 
+        WHEN uqs.HighScoringQuestions >= 5 THEN 'PowerUser'
+        WHEN uqs.NegativeScoreQuestions = 0 THEN 'PositiveContributor'
+        ELSE 'Regular'
+    END AS ContributorTier,
+    CONCAT(tu.DisplayName, ' (', tu.Reputation, ')') AS DisplayWithRep
+FROM top_users tu
+LEFT JOIN user_question_stats uqs ON uqs.UserId = tu.Id
+ORDER BY tu.Reputation DESC
+LIMIT 50
+
+UNION ALL
+
+SELECT
+    NULL AS UserId,
+    tn.TagName AS DisplayName,
+    tn.TagTotal AS Reputation,
+    NULL AS Location,
+    NULL AS GoldBadges,
+    NULL AS SilverBadges,
+    NULL AS BronzeBadges,
+    NULL AS LastActive,
+    tn.RecentPosts AS HighScoringQ,
+    NULL AS NegScoreQ,
+    NULL AS AvgQScore,
+    'Tag' AS ContributorTier,
+    tn.TagName AS DisplayWithRep
+FROM top_tags tn
+ORDER BY tn.TagTotal DESC
+LIMIT 20;

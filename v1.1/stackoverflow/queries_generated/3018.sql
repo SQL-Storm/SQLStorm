@@ -1,0 +1,92 @@
+-- {"query": "3018.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 804} 
+WITH UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        AVG(p.Score) AS AvgScore,
+        SUM(p.ViewCount) AS TotalViews,
+        MAX(p.CreationDate) AS LastActivity
+    FROM
+        Users u
+        LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName
+),
+PostHistorySummary AS (
+    SELECT
+        ph.PostId,
+        COUNT(*) AS RevisionCount,
+        MAX(ph.CreationDate) AS LastRevisionDate
+    FROM
+        PostHistory ph
+    WHERE
+        ph.PostHistoryTypeId IN (4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,24,25,31,33,34,35,36,37,38,50,52,53,66)
+    GROUP BY ph.PostId
+),
+TopQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        pl.RelatedPostId AS DuplicateOf,
+        v.VoteCount,
+        av.VoteTypeId AS AcceptedVoteType,
+        u.DisplayName AS OwnerName,
+        u.Reputation
+    FROM
+        Posts p
+        LEFT JOIN PostLinks pl ON p.Id = pl.PostId AND pl.LinkTypeId = 3 -- Duplicate
+        LEFT JOIN (
+            SELECT PostId, COUNT(*) AS VoteCount
+            FROM Votes
+            GROUP BY PostId
+        ) v ON p.Id = v.PostId
+        LEFT JOIN Votes av ON p.Id = av.PostId AND av.VoteTypeId = 1 -- Accepted answer votes
+        LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE
+        p.PostTypeId = 1
+)
+SELECT
+    tq.QuestionId,
+    tq.Title,
+    string_agg(t.TagName, ', ') AS Tags,
+    tq.Score,
+    tq.ViewCount,
+    tq.CreationDate,
+    tq.AnswerCount,
+    tq.CommentCount,
+    tq.FavoriteCount,
+    CASE WHEN tq.DuplicateOf IS NOT NULL THEN 'Duplicate' ELSE 'Unique' END AS DuplicateStatus,
+    COALESCE(tq.VoteCount, 0) AS TotalVotes,
+    CASE WHEN tq.AcceptedVoteType IS NOT NULL THEN 'Accepted Vote' ELSE 'No Accept' END AS AcceptanceStatus,
+    tq.OwnerName,
+    tq.Reputation,
+    hs.RevisionCount,
+    hs.LastRevisionDate,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = tq.QuestionId) AS CommentCountTotal,
+    (
+        SELECT COUNT(*) FROM Posts a
+        WHERE a.ParentId = tq.QuestionId
+    ) AS AnswerCountTotal,
+    u.Location,
+    u.LastAccessDate
+FROM
+    TopQuestions tq
+    LEFT JOIN UNNEST(string_to_array(tq.Tags, '>')) AS t(TagName) ON TRUE
+    LEFT JOIN PostHistorySummary hs ON tq.QuestionId = hs.PostId
+    LEFT JOIN Users u ON u.Id = (
+        SELECT OwnerUserId FROM Posts WHERE Id = tq.QuestionId LIMIT 1
+    )
+WHERE
+    (COALESCE(tq.VoteCount, 0) > 10 OR hs.RevisionCount > 5)
+    AND (u.Location IS NOT NULL OR u.LastAccessDate > CURRENT_DATE - INTERVAL '1 year')
+ORDER BY
+    tq.CreationDate DESC
+LIMIT 100;

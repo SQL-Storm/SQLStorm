@@ -1,0 +1,122 @@
+-- {"query": "24033.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 3821} 
+
+-- Complex benchmark query for Stack Overflow database
+
+WITH
+post_data AS (
+    SELECT
+        p.Id          AS PostId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.LastActivityDate,
+        p.Tags,
+        p.Title,
+        p.AcceptedAnswerId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+
+vote_counts AS (
+    SELECT
+        PostId,
+        SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+        SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes
+    FROM Votes
+    GROUP BY PostId
+),
+
+user_activity AS (
+    SELECT
+        u.Id            AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.LastAccessDate,
+        u.Location,
+        u.Reputation / 100 AS rep_bucket,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS gold_badges
+    FROM Users u
+),
+
+question_tags AS (
+    SELECT
+        q.PostId,
+        unnest(regexp_split_to_array(regexp_replace(q.Tags, '<|>', ''), ',')) AS tag
+    FROM post_data q
+),
+
+tag_freq AS (
+    SELECT tag, COUNT(*) AS freq
+    FROM question_tags
+    GROUP BY tag
+),
+
+top_tags AS (
+    SELECT tag
+    FROM tag_freq
+    ORDER BY freq DESC
+    LIMIT 5
+),
+
+accepted_qs AS (
+    SELECT q.PostId, q.OwnerUserId
+    FROM post_data q
+    WHERE q.AcceptedAnswerId IS NOT NULL
+),
+
+user_badge_counts AS (
+    SELECT ua.UserId,
+           (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ua.UserId AND b.Class = 1) AS gold,
+           (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ua.UserId AND b.Class = 2) AS silver,
+           (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ua.UserId AND b.Class = 3) AS bronze
+    FROM user_activity ua
+),
+
+final_stats AS (
+    SELECT
+        p.PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        vc.upvotes,
+        vc.downvotes,
+        u.Reputation,
+        u.DisplayName,
+        ua.gold_badges,
+        qtags.tag,
+        ntile(4) OVER (ORDER BY p.Score DESC) AS quartile,
+        ROW_NUMBER() OVER (PARTITION BY u.UserId ORDER BY p.Score DESC) AS user_rank
+    FROM post_data p
+    JOIN vote_counts vc       ON vc.PostId = p.PostId
+    JOIN user_activity u      ON u.UserId = p.OwnerUserId
+    JOIN question_tags qtags  ON qtags.PostId = p.PostId
+    LEFT JOIN user_badge_counts ua ON ua.UserId = u.UserId
+)
+
+-- Combine top tags and other tags with high reputation users
+SELECT 
+    fs.PostId,
+    fs.Title,
+    fs.Score,
+    fs.tag,
+    'top'   AS tag_type
+FROM final_stats fs
+WHERE fs.tag IN (SELECT tag FROM top_tags)
+
+UNION ALL
+
+SELECT 
+    fs.PostId,
+    fs.Title,
+    fs.Score,
+    fs.tag,
+    'others' AS tag_type
+FROM final_stats fs
+WHERE fs.tag NOT IN (SELECT tag FROM top_tags)
+  AND fs.Reputation > 5000
+
+ORDER BY tag_type, Score DESC
+LIMIT 200;

@@ -1,0 +1,161 @@
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.UpVotes DESC) AS RepRank
+    FROM Users u
+    WHERE u.Reputation > 1000 
+      AND u.LastAccessDate > CAST('2024-10-01' AS date) - INTERVAL '365 days'
+),
+QuestionStats AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        COALESCE(p.ClosedDate, p.LastActivityDate) AS LastEventDate,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevQuestionScore,
+        AVG(p.ViewCount) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate 
+                               ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS RollingViewAvg,
+        NTILE(4) OVER (ORDER BY p.ViewCount DESC) AS PopularityQuartile,
+        p.Tags,
+        p.Title,
+        p.ClosedDate,
+        p.CommunityOwnedDate
+    FROM Posts p
+    INNER JOIN ActiveUsers au ON p.OwnerUserId = au.UserId
+    WHERE p.PostTypeId = 1 
+      AND p.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '2 years'
+      AND p.Score >= 0
+),
+RecentEdits AS (
+    SELECT 
+        ph.PostId,
+        ph.UserId,
+        ph.CreationDate,
+        COUNT(*) AS EditCount,
+        STRING_AGG(
+            CASE 
+                WHEN ph.PostHistoryTypeId IN (5, 8) THEN 'Body'
+                WHEN ph.PostHistoryTypeId IN (4, 7) THEN 'Title'
+                WHEN ph.PostHistoryTypeId = 6 THEN 'Tags'
+                ELSE 'Other'
+            END, 
+            ';' ORDER BY ph.CreationDate
+        ) AS EditTypes
+    FROM PostHistory ph
+    INNER JOIN ActiveUsers au ON ph.UserId = au.UserId
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)
+      AND ph.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '6 months'
+    GROUP BY ph.PostId, ph.UserId, ph.CreationDate
+    HAVING COUNT(*) > 1
+),
+VoteSummary AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS Favorites,
+        AVG(CASE WHEN v.VoteTypeId IN (2, 3) THEN v.BountyAmount ELSE 0 END) AS AvgBounty,
+        COUNT(DISTINCT v.UserId) AS VoterCount
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2, 3, 5, 8, 9)
+      AND v.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '1 year'
+    GROUP BY v.PostId
+)
+SELECT 
+    qs.PostId,
+    qs.OwnerUserId,
+    au.DisplayName,
+    au.RepRank,
+    qs.Title,
+    qs.CreationDate,
+    qs.Score,
+    qs.ViewCount,
+    qs.AnswerCount,
+    COALESCE(vs.UpVotes, 0) AS TotalUpVotes,
+    COALESCE(vs.DownVotes, 0) AS TotalDownVotes,
+    COALESCE(vs.Favorites, 0) AS TotalFavorites,
+    (COALESCE(vs.UpVotes, 0) - COALESCE(vs.DownVotes, 0)) AS NetScore,
+    CASE 
+        WHEN qs.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN qs.CommunityOwnedDate IS NOT NULL THEN 'Community'
+        WHEN qs.Score > 50 THEN 'Popular'
+        ELSE 'Standard'
+    END AS PostStatus,
+    re.EditCount,
+    re.EditTypes,
+    qs.RollingViewAvg,
+    qs.PopularityQuartile,
+    CASE 
+        WHEN LENGTH(COALESCE(qs.Tags, '')) > 0 THEN 
+            SUBSTRING(qs.Tags FROM 2 FOR GREATEST(LENGTH(qs.Tags) - 2, 0))
+        ELSE 'No Tags'
+    END AS CleanTags,
+    GREATEST(
+        COALESCE(qs.PrevQuestionScore, 0),
+        qs.RollingViewAvg / NULLIF(qs.AnswerCount, 0),
+        1
+    ) AS EngagementRatio,
+    (SELECT AVG(q2.Score) 
+     FROM QuestionStats q2 
+     WHERE q2.OwnerUserId = qs.OwnerUserId 
+       AND q2.CreationDate < qs.CreationDate) AS UserAvgPrevScore,
+    RANK() OVER (
+        PARTITION BY DATE_TRUNC('month', qs.CreationDate)
+        ORDER BY qs.ViewCount DESC, qs.Score DESC
+    ) AS MonthlyTrendRank
+FROM QuestionStats qs
+INNER JOIN ActiveUsers au ON qs.OwnerUserId = au.UserId
+LEFT JOIN VoteSummary vs ON qs.PostId = vs.PostId
+LEFT JOIN RecentEdits re ON qs.PostId = re.PostId
+WHERE qs.ViewCount > (
+    SELECT AVG(view_count) * 2 
+    FROM (SELECT ViewCount AS view_count FROM Posts WHERE PostTypeId = 1) sub
+)
+  AND (qs.ClosedDate IS NULL OR qs.ClosedDate > CAST('2024-10-01' AS date) - INTERVAL '30 days')
+  AND NOT EXISTS (
+    SELECT 1 FROM Badges b 
+    INNER JOIN Users u2 ON b.UserId = u2.Id 
+    WHERE u2.Id = qs.OwnerUserId 
+      AND b.Name LIKE '%Banned%' 
+      AND b.Date > CAST('2024-10-01' AS date) - INTERVAL '1 year'
+  )
+UNION ALL
+SELECT 
+    NULL AS PostId,
+    NULL AS OwnerUserId,
+    'AGGREGATE STATS' AS DisplayName,
+    NULL AS RepRank,
+    'Overall Performance Summary' AS Title,
+    CAST('2024-10-01' AS date) AS CreationDate,
+    COUNT(*) AS Score,
+    SUM(qs.ViewCount) AS ViewCount,
+    SUM(qs.AnswerCount) AS AnswerCount,
+    SUM(COALESCE(vs.UpVotes, 0)) AS TotalUpVotes,
+    SUM(COALESCE(vs.DownVotes, 0)) AS TotalDownVotes,
+    SUM(COALESCE(vs.Favorites, 0)) AS TotalFavorites,
+    SUM(COALESCE(vs.UpVotes, 0) - COALESCE(vs.DownVotes, 0)) AS NetScore,
+    'Summary' AS PostStatus,
+    SUM(COALESCE(re.EditCount, 0)) AS EditCount,
+    STRING_AGG(DISTINCT COALESCE(re.EditTypes, 'None'), '; ') AS EditTypes,
+    AVG(qs.RollingViewAvg) AS RollingViewAvg,
+    0 AS PopularityQuartile,
+    'All Active Questions' AS CleanTags,
+    AVG(COALESCE(qs.PrevQuestionScore, 0)) AS EngagementRatio,
+    NULL AS UserAvgPrevScore,
+    NULL AS MonthlyTrendRank
+FROM QuestionStats qs
+LEFT JOIN VoteSummary vs ON qs.PostId = vs.PostId
+LEFT JOIN RecentEdits re ON qs.PostId = re.PostId
+ORDER BY 
+    CASE WHEN PostId IS NULL THEN 0 ELSE 1 END,
+    NetScore DESC NULLS LAST,
+    ViewCount DESC,
+    CreationDate DESC
+LIMIT 1000;

@@ -1,0 +1,196 @@
+-- {"query": "4.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2380} 
+with
+-- recent questions with tag arrays and derived popularity score
+questions as (
+  select
+    p.id,
+    p.title,
+    p.creationdate,
+    p.owneruserid,
+    p.tags,
+    coalesce(p.viewcount,0) as viewcount,
+    coalesce(p.answercount,0) as answercount,
+    coalesce(p.score,0) as score,
+    -- parse tags like '<tag1><tag2>' into array (Postgres style)
+    case
+      when p.tags is null then array[]::text[]
+      else string_to_array(substring(p.tags from 2 for char_length(p.tags)-2), '><')
+    end as tag_array,
+    -- popularity: weighted combination with log and null-safe math
+    (coalesce(p.viewcount,0)::numeric * 0.2 + coalesce(p.score,0)*4 + greatest(coalesce(p.answercount,0),0)*3)
+      * (1 + 1.0 / (date_part('epoch', now() - p.creationdate) / 86400 + 1)) as popularity_score
+  from posts p
+  where p.posttypeid = 1 -- questions
+    and p.creationdate >= now() - interval '2 years'
+),
+-- top answerers in last 2 years with window functions
+answers as (
+  select
+    a.id,
+    a.parentid as questionid,
+    a.owneruserid,
+    a.creationdate,
+    coalesce(a.score,0) as score,
+    row_number() over (partition by a.parentid order by coalesce(a.score,0) desc, a.creationdate asc) as answer_rank,
+    dense_rank() over (partition by a.owneruserid order by coalesce(a.score,0) desc) as user_answer_quality_rank
+  from posts a
+  where a.posttypeid = 2 -- answers
+    and a.creationdate >= now() - interval '2 years'
+),
+-- aggregated user metrics (including correlated subqueries and null logic)
+user_metrics as (
+  select
+    u.id as userid,
+    u.displayname,
+    coalesce(u.reputation,0) as reputation,
+    u.creationdate,
+    -- counts and sums with null handling
+    coalesce((select count(*) from posts p where p.owneruserid = u.id and p.posttypeid = 1 and p.creationdate >= now() - interval '2 years'),0) as questions_2y,
+    coalesce((select count(*) from posts p where p.owneruserid = u.id and p.posttypeid = 2 and p.creationdate >= now() - interval '2 years'),0) as answers_2y,
+    coalesce((select sum(coalesce(p.score,0)) from posts p where p.owneruserid = u.id and p.creationdate >= now() - interval '2 years'),0) as score_sum_2y,
+    -- latest activity from posts and comments (correlated)
+    greatest(
+      coalesce((select max(p.lastactivitydate) from posts p where p.owneruserid = u.id), '1970-01-01'::timestamp),
+      coalesce((select max(c.creationdate) from comments c where c.userid = u.id), '1970-01-01'::timestamp)
+    ) as last_contribution,
+    -- badge richness: weighted by class and tag-based
+    coalesce((select sum(case when b.class = 1 then 5 when b.class = 2 then 3 else 1 end) + sum(case when b.tagbased = true then 2 else 0 end) from badges b where b.userid = u.id),0) as badge_score
+  from users u
+  where u.creationdate <= now()
+),
+-- tag popularity derived from questions and answers, uses lateral join for string explode
+tag_stats as (
+  select
+    t.tag,
+    count(distinct q.id) as questions_count,
+    count(distinct a.id) as answers_count,
+    sum(q.popularity_score) as total_question_popularity,
+    avg(q.popularity_score) as avg_question_popularity,
+    max(q.popularity_score) as max_question_popularity
+  from questions q
+  left join lateral (
+    select unnest(q.tag_array) as tag
+  ) t on true
+  left join posts a on a.posttypeid = 2 and a.parentid = q.id and a.creationdate >= now() - interval '2 years'
+  group by t.tag
+  having count(distinct q.id) > 5
+),
+-- post link network metrics using recursive CTE to depth 3
+recursive_links as (
+  select pl.postid, pl.relatedpostid, pl.linktypeid, 1 as depth, array[pl.postid, pl.relatedpostid]::int[] as path
+  from postlinks pl
+  where pl.creationdate >= now() - interval '3 years'
+union all
+  select r.postid, pl.relatedpostid, pl.linktypeid, r.depth+1,
+    case when pl.relatedpostid = any(r.path) then r.path else r.path || pl.relatedpostid end
+  from recursive_links r
+  join postlinks pl on pl.postid = r.relatedpostid
+  where r.depth < 3
+    and not pl.relatedpostid = any(r.path)
+),
+-- compute for each question a composite score including answers, votes, links, tags, and owner metrics
+question_composite as (
+  select
+    q.id as questionid,
+    q.title,
+    q.creationdate,
+    q.owneruserid,
+    q.tag_array,
+    q.popularity_score,
+    coalesce(a.answer_count,0) as answers_recent,
+    coalesce(v.upvotes,0) as upvotes_recent,
+    coalesce(l.link_influence,0) as link_influence,
+    coalesce(um.reputation,0) as owner_reputation,
+    coalesce(um.badge_score,0) as owner_badge_score,
+    -- complex expression mixing windowed percentiles and null-aware math
+    (q.popularity_score * log(1 + greatest(coalesce(a.answer_count,0),0)) * (1 + coalesce(v.upvotes,0)/nullif(greatest(q.viewcount,1),0))
+      + coalesce(l.link_influence,0)*10
+      + least(1000, um.reputation/10.0)
+      + um.badge_score * 2) as composite_score
+  from questions q
+  left join (
+    select parentid, count(*) as answer_count
+    from posts
+    where posttypeid = 2 and creationdate >= now() - interval '2 years'
+    group by parentid
+  ) a on a.parentid = q.id
+  left join (
+    select p.id as postid,
+      sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) filter (where v.creationdate >= now() - interval '2 years') as upvotes
+    from posts p
+    left join votes v on v.postid = p.id
+    where p.posttypeid = 1
+    group by p.id
+  ) v on v.postid = q.id
+  left join (
+    select rl.postid, sum(case when lt.name ilike 'duplicate' then -2 else 1 end) * count(distinct rl.relatedpostid) as link_influence
+    from recursive_links rl
+    left join linktypes lt on lt.id = rl.linktypeid
+    group by rl.postid
+  ) l on l.postid = q.id
+  left join user_metrics um on um.userid = q.owneruserid
+),
+-- rank questions within tags using window functions and include null logic and string expressions
+tagged_ranked as (
+  select
+    qc.*,
+    t.tag,
+    rank() over (partition by t.tag order by qc.composite_score desc nulls last) as tag_rank,
+    dense_rank() over (order by qc.composite_score desc) as global_rank,
+    -- generate a textual synopsis combining multiple fields with null-safe concat
+    concat_ws(' | ',
+      coalesce(qc.title, '<no-title>'),
+      'score='||coalesce(round(qc.composite_score::numeric,2)::text,'0'),
+      'owner='||coalesce((select displayname from users uu where uu.id = qc.owneruserid), 'unknown'),
+      'tags='||coalesce(array_to_string(qc.tag_array, ','), '<none>')
+    ) as synopsis
+  from question_composite qc
+  left join lateral (
+    select unnest(qc.tag_array) as tag
+  ) t on true
+),
+-- select top N per tag and compute some set-operator unions and intersections for benchmark
+top_per_tag as (
+  select distinct on (tag) *
+  from (
+    select *
+    from tagged_ranked
+    where tag is not null
+    order by tag, tag_rank, creationdate desc
+  ) s
+  order by tag, tag_rank
+),
+-- set operators: compute exclusive and intersecting popular tags between two periods (using temp tag_stats)
+tag_popular_current as (
+  select tag from tag_stats where total_question_popularity > (select avg(total_question_popularity) from tag_stats)
+),
+tag_popular_recent as (
+  select tag from tag_stats where avg_question_popularity > (select median_avg from (select percentile_cont(0.5) within group (order by avg_question_popularity) over () as median_avg) m)
+)
+select
+  t.tag,
+  t.questions_count,
+  t.answers_count,
+  round(t.total_question_popularity::numeric,2) as total_question_popularity,
+  round(t.avg_question_popularity::numeric,2) as avg_question_popularity,
+  top.global_rank,
+  top.tag_rank,
+  top.synopsis,
+  -- correlated subquery to find top answerer for the representative question
+  (select u.displayname
+   from users u
+   where u.id = (
+     select a.owneruserid from posts a where a.posttypeid = 2 and a.parentid = top.questionid order by coalesce(a.score,0) desc nulls last limit 1
+   )
+   limit 1) as top_answerer_displayname,
+  -- flags using set operators and null-safe checks
+  case when t.tag in (select tag from tag_popular_current) then true else false end as is_popular_current,
+  case when t.tag in (select tag from tag_popular_recent) then true else false end as is_popular_recent,
+  case when t.tag in (select tag from tag_popular_current) intersect (select tag from tag_popular_recent) then true else false end as in_both_sets,
+  -- compute an engagement metric blending different measures
+  round( (coalesce(t.total_question_popularity,0) * 0.6 + coalesce(t.answers_count,0) * 3 + coalesce(t.questions_count,0) * 1.5) / nullif(greatest(t.questions_count,1),1)::numeric , 2) as engagement_score
+from tag_stats t
+left join top_per_tag top on top.tag = t.tag
+where t.tag is not null
+order by engagement_score desc nulls last, t.total_question_popularity desc
+limit 250;

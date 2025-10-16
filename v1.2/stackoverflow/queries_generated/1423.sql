@@ -1,0 +1,132 @@
+-- {"query": "1423.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1222} 
+
+WITH ActiveUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COALESCE(SUM(v.BountyAmount),0) AS TotalBountyGiven,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        AVG(PCT.deadtime) OVER() AS AvgSessionDowntime /* dummy window fn misused to perform fib handling */
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes v ON v.UserId = u.Id AND v.VoteTypeId IN (8, 9) /* bounty start and close */
+    LEFT JOIN LATERAL (
+        SELECT extract(epoch FROM (MAX(last_access.LastAccessDate) - MIN(last_access.LastAccessDate))) AS deadtime
+        FROM (SELECT 1) AS dummy
+    ) PCT ON true
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+QuestionAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId AS QuestionOwner,
+        q.Title,
+        q.CreationDate,
+        q.Score AS QuestionScore,
+        a.Id AS AnswerId,
+        a.OwnerUserId AS AnswerOwner,
+        a.CreationDate AS AnswerCreationDate,
+        a.Score AS AnswerScore,
+        q.AcceptedAnswerId
+    FROM Posts q
+    LEFT OUTER JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+),
+AnswerRanks AS (
+    SELECT
+        QuestionId,
+        AnswerId,
+        AnswerOwner,
+        AnswerScore,
+        ROW_NUMBER() OVER (PARTITION BY QuestionId ORDER BY AnswerScore DESC NULLS LAST) AS AnswerRank,
+        COUNT(*) OVER (PARTITION BY QuestionId) AS TotalAnswers
+    FROM QuestionAnswers
+),
+TopAnswers AS (
+    SELECT ar.*
+    FROM AnswerRanks ar
+    WHERE ar.AnswerRank = 1
+),
+HighlyVotedBadges AS (
+    SELECT
+        b.UserId,
+        b.Name AS BadgeName,
+        bt.Name AS BadgeClassName,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    JOIN (
+        VALUES (1,'Gold'),(2,'Silver'),(3,'Bronze')
+    ) bt(Id, Name) ON b.Class = bt.Id
+    GROUP BY b.UserId, b.Name, bt.Name
+    HAVING COUNT(*) >= 3
+),
+QuestionsWithComments AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        COUNT(c.Id) AS CommentCount,
+        STRING_AGG(DISTINCT c.UserDisplayName || COALESCE(' (' || c.Text || ')', ''), ', ' ORDER BY c.CreationDate) AS CommentersAndText
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title
+),
+UserCloseVotes AS (
+    SELECT
+        ph.UserId,
+        COUNT(*) AS CloseVoteCount,
+        COUNT(*) FILTER (WHERE ph.Comment IN ('101','102','103','104','105')) AS CurrentCloseVotes
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.UserId
+),
+DuplicateLinksCounts AS (
+    SELECT
+        pl.PostId,
+        COUNT(*) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicatesOfPost,
+        COUNT(*) FILTER (WHERE pl.LinkTypeId = 1) AS LinksToPost
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+)
+SELECT
+    au.Id AS UserId,
+    au.DisplayName,
+    au.Reputation,
+    au.QuestionCount,
+    au.AnswerCount,
+    au.TotalBountyGiven,
+    au.ReputationRank,
+    tl.DuplicatesOfPost,
+    tl.LinksToPost,
+    hc.CommentCount,
+    hc.CommentersAndText,
+    CASE WHEN uc.CloseVoteCount > 5 THEN 'Frequent Closer' ELSE 'Normal' END AS CloseVotesClassification,
+    p.Title AS SampleQuestionTitle,
+    p.Score AS SampleQuestionScore,
+    ta.AnswerId,
+    ta.AnswerScore AS TopAnswerScore,
+    CONCAT_WS(' | ',
+        COALESCE(NULLIF(hb.BadgeName, ''), 'No High Badges'),
+        COALESCE(NULLIF(hb.BadgeClassName, ''), ''),
+        COALESCE(NULLIF(AVG(vote?),''),'0')
+    ) AS BadgeOverview
+FROM ActiveUsers au
+LEFT JOIN TopAnswers ta ON au.Id = ta.AnswerOwner
+LEFT JOIN QuestionsWithComments hc ON hc.PostId = ta.QuestionId
+LEFT JOIN UserCloseVotes uc ON au.Id = uc.UserId
+LEFT JOIN DuplicateLinksCounts tl ON tl.PostId = ta.QuestionId
+LEFT JOIN QuestionAnswers p ON p.Id = ta.QuestionId
+LEFT JOIN (
+    SELECT b1.UserId, b1.Name AS BadgeName, CASE WHEN b1.Class = 1 THEN 'Gold' WHEN b1.Class = 2 THEN 'Silver' ELSE 'Bronze' END AS BadgeClassName
+    FROM Badges b1
+    WHERE EXISTS (
+        SELECT 1 FROM Badges b2 WHERE b2.UserId = b1.UserId GROUP BY b2.Name HAVING COUNT(*) >= 3 AND b2.Name = b1.Name
+    )
+) hb ON hb.UserId = au.Id
+WHERE au.ReputationRank <= 100
+ORDER BY au.Reputation DESC NULLS LAST
+LIMIT 50;

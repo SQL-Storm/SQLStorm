@@ -1,0 +1,104 @@
+-- {"query": "5012.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1002} 
+WITH RecentHighScoreQuestions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM 
+        Posts p
+    WHERE 
+        p.PostTypeId = 1
+        AND p.Score >= 10
+        AND p.CreationDate > (CURRENT_DATE - INTERVAL '365 days')
+),
+TopCommenters AS (
+    SELECT 
+        c.PostId,
+        c.UserId,
+        COUNT(*) AS CommentCount
+    FROM 
+        Comments c
+    WHERE 
+        c.CreationDate > (CURRENT_DATE - INTERVAL '365 days')
+    GROUP BY 
+        c.PostId, c.UserId
+),
+UserBadges AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM
+        Badges b
+    WHERE
+        b.Date > (CURRENT_DATE - INTERVAL '2 years')
+    GROUP BY b.UserId
+),
+EditedQuestions AS (
+    SELECT
+        ph.PostId,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM
+        PostHistory ph
+    WHERE
+        ph.PostHistoryTypeId IN (4,5,6)
+    GROUP BY
+        ph.PostId
+)
+SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    u.DisplayName AS OwnerName,
+    COALESCE(b.GoldBadges, 0) AS GoldBadges,
+    COALESCE(b.SilverBadges, 0) AS SilverBadges,
+    COALESCE(b.BronzeBadges, 0) AS BronzeBadges,
+    COUNT(DISTINCT a.Id) AS NumberOfAnswers,
+    MAX(CASE WHEN tcc.CommentCount IS NULL THEN 0 ELSE tcc.CommentCount END) AS MaxCommentsBySingleUser,
+    array_to_string(
+        ARRAY(
+            SELECT TRIM(BOTH '<>' FROM unnest(string_to_array(SUBSTRING(qp.Tags, 2, LENGTH(qp.Tags)-2), '><')))
+            FROM Posts qp WHERE qp.Id = q.Id
+        ), ', '
+    ) AS TagList,
+    CASE 
+        WHEN q.ViewCount = 0 THEN NULL
+        ELSE ROUND((q.Score::decimal / NULLIF(q.ViewCount,0)) * 100, 2)
+    END AS ScorePer100Views,
+    EXTRACT(EPOCH FROM (COALESCE(eq.LastEditDate, q.CreationDate) - q.CreationDate))/3600 AS HoursToEdit,
+    CASE
+        WHEN q.AnswerCount = 0 THEN 'Unanswered'
+        WHEN EXISTS (
+            SELECT 1 FROM Posts ans WHERE ans.ParentId = q.Id AND ans.Id = q.AcceptedAnswerId
+        ) THEN 'Accepted'
+        ELSE 'AnsweredNotAccepted'
+    END AS AnswerStatus,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 2) AS UpVoteCount,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 3) AS DownVoteCount
+FROM 
+    RecentHighScoreQuestions q
+    LEFT JOIN Users u ON u.Id = q.OwnerUserId
+    LEFT JOIN UserBadges b ON b.UserId = q.OwnerUserId
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN TopCommenters tcc ON tcc.PostId = q.Id
+    LEFT JOIN EditedQuestions eq ON eq.PostId = q.Id
+WHERE
+    q.rn = 1
+    AND (
+        q.ViewCount > 1000 
+        OR COALESCE(b.GoldBadges,0) > 0
+        OR EXTRACT(EPOCH FROM (COALESCE(eq.LastEditDate, q.CreationDate) - q.CreationDate)) > 7200
+    )
+GROUP BY
+    q.Id, q.Title, q.Score, q.ViewCount, q.AnswerCount, u.DisplayName, b.GoldBadges, b.SilverBadges, b.BronzeBadges, q.OwnerUserId, q.AcceptedAnswerId, q.CreationDate, eq.LastEditDate
+ORDER BY
+    ScorePer100Views DESC NULLS LAST, MaxCommentsBySingleUser DESC NULLS LAST
+LIMIT 50;

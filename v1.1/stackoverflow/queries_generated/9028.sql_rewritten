@@ -1,0 +1,131 @@
+-- {"query": "9028.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2013, "output_tokens": 5150} 
+WITH RECURSIVE ThreadPaths AS (
+    SELECT
+        Id         AS PostID,
+        Title,
+        1          AS Depth
+    FROM Posts
+    WHERE ParentId IS NULL
+  UNION ALL
+    SELECT
+        p.Id,
+        p.Title,
+        tp.Depth + 1
+    FROM Posts p
+    JOIN ThreadPaths tp ON p.ParentId = tp.PostID
+),
+UserPostStats AS (
+    SELECT
+        u.Id                                                AS UserID,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)         AS Questions,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)         AS Answers,
+        AVG(p.Score)                                        AS AvgScore,
+        MAX(p.ViewCount)                                    AS MaxView
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id
+),
+RecentComments AS (
+    SELECT
+        c.PostId,
+        COUNT(*)                                            AS CCount,
+        MAX(c.CreationDate)                                 AS LastComment
+    FROM Comments c
+    WHERE c.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+    GROUP BY c.PostId
+),
+RankedPosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId
+                           ORDER BY p.Score DESC, p.CreationDate) AS RN
+    FROM Posts p
+)
+SELECT
+    u.DisplayName,
+    COALESCE(ups.Questions,0)                               AS Ques,
+    COALESCE(ups.Answers,0)                                 AS Ans,
+    ROUND(COALESCE(ups.AvgScore,0),2)                       AS AvgScore,
+    ups.MaxView,
+    rc.CCount                                              AS RecentComments,
+    CASE
+      WHEN rc.LastComment IS NULL THEN 'NoRecent'
+      ELSE TO_CHAR(rc.LastComment,'YYYY-MM-DD')
+    END                                                     AS LastCmtDate,
+    tp.Depth                                                AS ThreadLevel,
+    SUBSTRING(p.Body FROM 1 FOR 50)                         AS Snippet,
+    NULLIF(p.Score,0)                                       AS NonZeroScore,
+    (SELECT COUNT(*) FROM Votes v
+     WHERE v.PostId = p.Id
+       AND v.VoteTypeId = 2)                                AS UpVotes,
+    COALESCE(crt.Name,'None')                               AS CloseReason
+FROM RankedPosts rp
+JOIN Posts p ON p.Id = rp.Id
+JOIN Users u ON u.Id = p.OwnerUserId
+LEFT JOIN UserPostStats ups ON ups.UserID = u.Id
+LEFT JOIN RecentComments rc ON rc.PostId = p.Id
+LEFT JOIN ThreadPaths tp ON tp.PostID = p.Id
+LEFT JOIN PostHistory ph
+       ON ph.PostId = p.Id
+      AND ph.PostHistoryTypeId = 10
+LEFT JOIN CloseReasonTypes crt
+       ON crt.Id = ph.Comment::smallint
+WHERE rp.RN <= 5
+  AND p.PostTypeId = 1
+  AND p.Title ILIKE '%SQL%'
+  AND EXISTS (
+      SELECT 1
+      FROM Badges b
+      WHERE b.UserId = u.Id
+        AND b.Class = 1
+  )
+UNION
+SELECT
+    'Aggregate'::text    AS DisplayName,
+    -1                   AS Ques,
+    -1                   AS Ans,
+    0.00                 AS AvgScore,
+    -1                   AS MaxView,
+    -1                   AS RecentComments,
+    'N/A'                AS LastCmtDate,
+    -1                   AS ThreadLevel,
+    ''                   AS Snippet,
+    -1                   AS NonZeroScore,
+    -1                   AS UpVotes,
+    'Aggregate'          AS CloseReason
+INTERSECT
+SELECT
+    u2.DisplayName
+      || ' [rep='
+      || u2.Reputation
+      || ']'               AS DisplayName,
+    0                    AS Ques,
+    0                    AS Ans,
+    0.00                 AS AvgScore,
+    0                    AS MaxView,
+    0                    AS RecentComments,
+    '------'             AS LastCmtDate,
+    0                    AS ThreadLevel,
+    ''                   AS Snippet,
+    0                    AS NonZeroScore,
+    0                    AS UpVotes,
+    'HighRep'            AS CloseReason
+FROM Users u2
+WHERE u2.Reputation > 10000
+EXCEPT
+SELECT
+    u3.DisplayName       AS DisplayName,
+    0                    AS Ques,
+    0                    AS Ans,
+    0.00                 AS AvgScore,
+    0                    AS MaxView,
+    0                    AS RecentComments,
+    ''                   AS LastCmtDate,
+    0                    AS ThreadLevel,
+    ''                   AS Snippet,
+    0                    AS NonZeroScore,
+    0                    AS UpVotes,
+    'NoLoc'              AS CloseReason
+FROM Users u3
+WHERE u3.Location IS NULL;

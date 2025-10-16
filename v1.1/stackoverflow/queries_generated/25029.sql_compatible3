@@ -1,0 +1,82 @@
+WITH
+    VoteAgg AS (
+        SELECT 
+            v.PostId,
+            SUM(CASE 
+                    WHEN v.VoteTypeId = 2 THEN 1
+                    WHEN v.VoteTypeId = 3 THEN -1
+                    ELSE 0
+                END) AS NetScore
+        FROM Votes v
+        GROUP BY v.PostId
+    ),
+    PostScoreStats AS (
+        SELECT 
+            p.OwnerUserId AS UserId,
+            AVG(COALESCE(va.NetScore, 0)) AS AvgPostScore,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY COALESCE(va.NetScore, 0))
+                OVER (PARTITION BY p.OwnerUserId) AS MedianPostScore
+        FROM Posts p
+        LEFT JOIN VoteAgg va ON va.PostId = p.Id
+        WHERE p.PostTypeId IN (1, 2)
+        GROUP BY p.OwnerUserId
+    ),
+    Combined AS (
+        SELECT 
+            us.Id,
+            us.DisplayName,
+            us.Reputation,
+            us.Views,
+            us.UpVotes,
+            us.DownVotes,
+            us.BadgeCount,
+            rp.RecentPostCount,
+            rp.LastPostDate,
+            ps.AvgPostScore,
+            ps.MedianPostScore
+        FROM UserStats us
+        LEFT JOIN RecentPosts rp ON rp.UserId = us.Id
+        LEFT JOIN PostScoreStats ps ON ps.UserId = us.Id
+    ),
+    MainResult AS (
+        SELECT 
+            c.Id,
+            c.DisplayName,
+            c.Reputation,
+            c.Views,
+            c.UpVotes,
+            c.DownVotes,
+            c.BadgeCount,
+            COALESCE(c.RecentPostCount, 0) AS RecentPostCount,
+            c.LastPostDate,
+            ROUND(COALESCE(c.AvgPostScore, 0), 2) AS AvgPostScore,
+            c.MedianPostScore,
+            STRING_AGG(tt.Tag, ', ' ) FILTER (WHERE tt.rn <= 3) AS Top3Tags
+        FROM Combined c
+        LEFT JOIN TopTags tt ON tt.UserId = c.Id
+        WHERE 
+            c.Reputation > 1000
+            AND (c.BadgeCount IS NULL OR c.BadgeCount > 5)
+        GROUP BY 
+            c.Id, c.DisplayName, c.Reputation, c.Views, c.UpVotes, c.DownVotes,
+            c.BadgeCount, c.RecentPostCount, c.LastPostDate, c.AvgPostScore, c.MedianPostScore
+        HAVING COUNT(*) > 0
+        ORDER BY c.Reputation DESC
+        LIMIT 100
+    )
+SELECT * FROM MainResult
+UNION ALL
+SELECT 
+    CAST(NULL AS INTEGER) AS Id,
+    'SUMMARY' AS DisplayName,
+    SUM(m.Reputation) AS Reputation,
+    SUM(m.Views) AS Views,
+    SUM(m.UpVotes) AS UpVotes,
+    SUM(m.DownVotes) AS DownVotes,
+    SUM(m.BadgeCount) AS BadgeCount,
+    SUM(COALESCE(m.RecentPostCount, 0)) AS RecentPostCount,
+    MAX(m.LastPostDate) AS LastPostDate,
+    ROUND(AVG(COALESCE(m.AvgPostScore, 0)), 2) AS AvgPostScore,
+    CAST(NULL AS NUMERIC) AS MedianPostScore,
+    CAST(NULL AS VARCHAR) AS Top3Tags
+FROM MainResult m;

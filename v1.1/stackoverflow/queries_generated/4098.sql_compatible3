@@ -1,0 +1,144 @@
+with recursive RecursivePostsCTE as (
+    select p.Id, p.PostTypeId, p.ParentId, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId,
+           1 as level, array[p.Id] as path_ids
+    from Posts p
+    where p.PostTypeId = 1
+      and (lower(p.Tags) like '%<sql>%' or lower(p.Tags) like '%<database>%')
+      and p.AnswerCount > 5
+
+    union all
+
+    select p2.Id, p2.PostTypeId, p2.ParentId, p2.CreationDate, p2.Score, p2.ViewCount, p2.OwnerUserId,
+           cte.level + 1,
+           path_ids || p2.Id
+    from RecursivePostsCTE cte
+    join Posts p2 on (
+        (p2.ParentId = cte.Id) OR
+        exists (
+            select 1 from PostLinks pl where pl.PostId = cte.Id and pl.RelatedPostId = p2.Id and pl.LinkTypeId in (1,3)
+        )
+    )
+    where cte.level < 3 and not p2.Id = any(path_ids)
+),
+UserBadgeCounts as (
+    select u.Id as UserId,
+           count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+           count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+           count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+           coalesce(sum(case when b.TagBased = true then 1 else 0 end), 0) as TagBasedBadgeCount
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id
+),
+PostScoresWindow as (
+    select p.Id, p.PostTypeId, p.Score, p.CreationDate, p.OwnerUserId,
+           rank() over (partition by p.PostTypeId order by p.Score desc, p.CreationDate asc) as ScoreRank,
+           row_number() over (partition by p.PostTypeId order by p.CreationDate desc) as RecentRowNum
+    from Posts p
+),
+UserActivityStats as (
+    select u.Id,
+           count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+           count(distinct case when a.PostTypeId = 2 then a.Id end) as AnswerCount,
+           max(p.CreationDate) as LastPostDate,
+           max(c.CreationDate) as LastCommentDate,
+           sum(vote_counts.UpVotes) as TotalUpVotesReceived,
+           sum(vote_counts.DownVotes) as TotalDownVotesReceived
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+    left join Comments c on c.UserId = u.Id
+    left join (
+        select p.OwnerUserId,
+               sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+               sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Posts p
+        left join Votes v on v.PostId = p.Id
+        group by p.OwnerUserId
+    ) vote_counts on vote_counts.OwnerUserId = u.Id
+    group by u.Id
+),
+CorrelatedCloseReasonCounts as (
+    select ph.UserId,
+           count(*) filter (where ph.PostHistoryTypeId = 10) as CloseVotesCast,
+           count(*) filter (where ph.PostHistoryTypeId = 11) as ReopenVotesCast,
+           count(*) filter (where ph.PostHistoryTypeId = 10 and cast(ph.Comment as integer) = 101) as DuplicateCloseVotes,
+           count(*) filter (where ph.PostHistoryTypeId = 10 and cast(ph.Comment as integer) = 102) as OffTopicCloseVotes
+    from PostHistory ph
+    where ph.UserId is not null
+    group by ph.UserId
+),
+ComplexTaggedQuestions as (
+    select p.Id, p.Title, p.Score, p.ViewCount, p.Tags,
+           (length(p.Tags) - length(replace(p.Tags, '><', '')) + 1) as TagCount,
+           case when p.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer,
+           length(coalesce(p.Body, '')) as BodyLength,
+           p.AnswerCount,
+           u.DisplayName as OwnerName,
+           ubc.GoldBadges, ubc.SilverBadges, ubc.BronzeBadges, ubc.TagBasedBadgeCount,
+           uas.QuestionCount, uas.AnswerCount as UserAnswerCount,
+           ccrc.CloseVotesCast, ccrc.ReopenVotesCast,
+           ccrc.DuplicateCloseVotes, ccrc.OffTopicCloseVotes
+    from Posts p
+    join Users u on u.Id = p.OwnerUserId
+    left join UserBadgeCounts ubc on ubc.UserId = u.Id
+    left join UserActivityStats uas on uas.Id = u.Id
+    left join CorrelatedCloseReasonCounts ccrc on ccrc.UserId = u.Id
+    where p.PostTypeId = 1
+      and (lower(p.Tags) like '%<performance>%'
+        or lower(p.Tags) like '%<optimization>%'
+        or lower(p.Tags) like '%<indexing>%')
+      and p.Score > 5
+      and p.AnswerCount > 2
+),
+CombinedPostsUnion as (
+    select Id, Title, Score, ViewCount, Tags, TagCount, HasAcceptedAnswer, BodyLength, AnswerCount, OwnerName,
+           GoldBadges, SilverBadges, BronzeBadges, TagBasedBadgeCount, QuestionCount, UserAnswerCount,
+           CloseVotesCast, ReopenVotesCast, DuplicateCloseVotes, OffTopicCloseVotes
+    from ComplexTaggedQuestions
+
+    union
+
+    select p.Id, p.Title, p.Score, p.ViewCount, p.Tags,
+           0 as TagCount, 0 as HasAcceptedAnswer, 0 as BodyLength, 0 as AnswerCount, 'Non-Tagged' as OwnerName,
+           0 as GoldBadges, 0 as SilverBadges, 0 as BronzeBadges, 0 as TagBasedBadgeCount, 0 as QuestionCount, 0 as UserAnswerCount,
+           0 as CloseVotesCast, 0 as ReopenVotesCast, 0 as DuplicateCloseVotes, 0 as OffTopicCloseVotes
+    from Posts p
+    where p.PostTypeId = 1
+      and p.Id in (select Id from RecursivePostsCTE)
+)
+select cp.Id, cp.Title, cp.Score, cp.ViewCount, cp.Tags, cp.TagCount, cp.HasAcceptedAnswer, cp.BodyLength, cp.AnswerCount, cp.OwnerName,
+       cp.GoldBadges, cp.SilverBadges, cp.BronzeBadges, cp.TagBasedBadgeCount, cp.QuestionCount, cp.UserAnswerCount,
+       cp.CloseVotesCast, cp.ReopenVotesCast, cp.DuplicateCloseVotes, cp.OffTopicCloseVotes,
+       psw.ScoreRank, psw.RecentRowNum,
+       (cp.Score * 0.5 + cp.ViewCount * 0.1 + greatest(cp.GoldBadges * 10, 0) +
+        greatest(cp.SilverBadges * 5, 0) + greatest(cp.BronzeBadges, 0) +
+        cp.CloseVotesCast * -2 + cp.ReopenVotesCast * 3 +
+        cp.DuplicateCloseVotes * -5 + cp.OffTopicCloseVotes * -3) as WeightedScore,
+       (case when length(cp.Title) > 1 then
+          not exists (
+            select 1
+            from (
+              select 2 + seq as n
+              from (
+                select generate_series(0, cast(floor(sqrt(length(cp.Title)) - 2) as integer)) as seq
+              ) s
+            ) t
+            where mod(length(cp.Title), t.n) = 0
+          )
+        else false end) as IsTitleLengthPrime,
+       concat_ws(' | ',
+           concat('Gold: ', coalesce(cp.GoldBadges,0)),
+           concat('Silver: ', coalesce(cp.SilverBadges,0)),
+           concat('Bronze: ', coalesce(cp.BronzeBadges,0))) as BadgeSummary,
+       (case when cp.OwnerName is null or cp.OwnerName = '' then 'anonymous'
+             else lower(reverse(cp.OwnerName)) end) as OwnerNameTransformed
+from CombinedPostsUnion cp
+left join PostScoresWindow psw on psw.Id = cp.Id
+where cp.Score > 0
+group by cp.Id, cp.Title, cp.Score, cp.ViewCount, cp.Tags, cp.TagCount, cp.HasAcceptedAnswer, cp.BodyLength, cp.AnswerCount, cp.OwnerName,
+         cp.GoldBadges, cp.SilverBadges, cp.BronzeBadges, cp.TagBasedBadgeCount, cp.QuestionCount, cp.UserAnswerCount,
+         cp.CloseVotesCast, cp.ReopenVotesCast, cp.DuplicateCloseVotes, cp.OffTopicCloseVotes,
+         psw.ScoreRank, psw.RecentRowNum
+order by WeightedScore desc, ScoreRank asc
+limit 100;

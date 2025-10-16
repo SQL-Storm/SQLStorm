@@ -1,0 +1,65 @@
+WITH UserBadgeCounts AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) AS GoldBadgeCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        AVG(COALESCE(p.Score, 0)) AS AvgPostScore
+    FROM 
+        Users u
+    LEFT JOIN 
+        Badges b ON u.Id = b.UserId AND b.Class = 1
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    GROUP BY 
+        u.Id, u.DisplayName
+),
+PostInteractions AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        v.VoteTypeId,
+        COUNT(v.Id) AS VoteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY MAX(v.CreationDate) DESC) AS LatestVoteRank,
+        p.OwnerUserId,
+        p.CreationDate
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    WHERE 
+        p.PostTypeId = 1 
+        AND p.Score > 10
+        AND EXTRACT(YEAR FROM p.CreationDate) >= 2020
+    GROUP BY 
+        p.Id, p.Title, v.VoteTypeId, p.OwnerUserId, p.CreationDate
+)
+SELECT 
+    ubc.UserId,
+    ubc.DisplayName,
+    ubc.GoldBadgeCount,
+    ubc.QuestionCount,
+    ubc.AvgPostScore,
+    pi.Title,
+    pi.VoteCount,
+    CASE 
+        WHEN pi.VoteTypeId IN (2, 3) THEN 
+            pi.VoteCount * (CASE WHEN pi.VoteTypeId = 2 THEN 1 ELSE -1 END)
+        ELSE 0 
+    END AS NetVotes,
+    ROUND(
+        ubc.AvgPostScore * 
+        (1 + LOG(1 + COALESCE(pi.VoteCount, 0))::double precision), 
+        2
+    ) AS ScoreWithPopularity
+FROM 
+    UserBadgeCounts ubc
+JOIN 
+    PostInteractions pi ON ubc.UserId = pi.OwnerUserId
+WHERE 
+    pi.LatestVoteRank = 1 
+    AND ubc.GoldBadgeCount > 0
+    AND ubc.AvgPostScore > 5
+ORDER BY 
+    ScoreWithPopularity DESC
+LIMIT 100;

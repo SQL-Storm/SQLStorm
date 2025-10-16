@@ -1,0 +1,161 @@
+-- {"query": "1019.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1568} 
+
+WITH RecursiveTagHierarchy AS (
+    -- Build recursion on tags linked through TagWikiPosts having common tag mentions in their body (simulated via substring)
+    SELECT 
+        t.Id AS TagId,
+        t.TagName,
+        t.Count,
+        ARRAY[t.Id] AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+
+    UNION ALL
+
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Path || t2.Id
+    FROM RecursiveTagHierarchy r
+    JOIN Tags t2 
+      ON t2.Id <> ALL(r.Path)
+     AND EXISTS (
+        SELECT 1 
+        FROM Posts p1
+        JOIN Posts p2 ON p1.Id = r.TagId AND p2.Id = t2.WikiPostId
+        WHERE p1.Body IS NOT NULL AND p2.Body IS NOT NULL
+          AND POSITION(LOWER(t2.TagName) IN LOWER(p1.Body)) > 0
+     )
+    WHERE array_length(r.Path,1) < 3 -- limit recursion depth to 3
+),
+RankedPosts AS (
+    -- Rank posts by score and creation date partitioned by post type and owner user
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId, p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate ASC) AS PostRank,
+        COUNT(*) OVER (PARTITION BY p.PostTypeId, p.OwnerUserId) AS TotalPosts
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.PostTypeId IN (1,2)
+),
+UserBadgesAgg AS (
+    -- Aggregate badge classes per user with complex NULL logic and string concatenations
+    SELECT 
+        b.UserId,
+        STRING_AGG(DISTINCT CONCAT(b.Name, '(', 
+            CASE 
+                WHEN b.Class = 1 THEN 'Gold' 
+                WHEN b.Class = 2 THEN 'Silver' 
+                WHEN b.Class = 3 THEN 'Bronze' 
+                ELSE 'Unknown' END, ')'), ', ' ORDER BY b.Class) AS BadgesList,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        MAX(b.Date) FILTER (WHERE b.TagBased = 0) AS LatestNonTagBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostCommentsStats AS (
+    -- Stats per post for comments with window and NULL handling
+    SELECT 
+        c.PostId,
+        COUNT(c.Id) AS CommentCount,
+        AVG(c.Score) FILTER (WHERE c.Score IS NOT NULL) AS AvgCommentScore,
+        MAX(c.CreationDate) AS LatestCommentDate,
+        STRING_AGG(DISTINCT COALESCE(NULLIF(TRIM(c.UserDisplayName),''), 'Anonymous'), '; ' ORDER BY c.CreationDate DESC) AS RecentCommenters
+    FROM Comments c
+    GROUP BY c.PostId
+),
+AcceptedAnswersWithDuplicates AS (
+    -- Select accepted answers and duplicates counted with subqueries
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionCreation,
+        a.Id AS AcceptedAnswerId,
+        a.Score AS AcceptedAnswerScore,
+        a.CreationDate AS AcceptedAnswerDate,
+        -- Correlated subquery for counting duplicates via PostLinks (LinkTypeId=3 means duplicate)
+        (SELECT COUNT(1) FROM PostLinks pl WHERE pl.PostId = q.Id AND pl.LinkTypeId = 3) AS DuplicateCount
+    FROM Posts q
+    LEFT JOIN Posts a ON a.Id = q.AcceptedAnswerId
+    WHERE q.PostTypeId = 1 -- Questions only
+),
+UserActivity AS (
+    -- Calculate periods of user activity with complicated predicates and NULL logic
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        DATE_PART('day', u.LastAccessDate - u.CreationDate) AS DaysActive,
+        COALESCE(u.Views, 0) AS Views,
+        COALESCE(u.UpVotes, 0) AS UpVotes,
+        COALESCE(u.DownVotes, 0) AS DownVotes,
+        CASE 
+            WHEN u.Views > 10000 AND u.Reputation > 5000 THEN 'Veteran'
+            WHEN u.Views BETWEEN 1000 AND 10000 THEN 'Intermediate'
+            ELSE 'Newbie'
+        END AS UserLevel,
+        -- window avg of reputation over all users ordered by creation date
+        AVG(u.Reputation) OVER (ORDER BY u.CreationDate ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) AS MovingAvgReputation
+    FROM Users u
+),
+FinalSet AS (
+    -- Combine everything with outer joins, string expressions, set operators (UNION ALL)
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.UserLevel,
+        ua.DaysActive,
+        COALESCE(uba.GoldBadges,0) AS GoldBadges,
+        COALESCE(uba.SilverBadges,0) AS SilverBadges,
+        COALESCE(uba.BronzeBadges,0) AS BronzeBadges,
+        rp.PostRank,
+        rp.TotalPosts,
+        pcs.CommentCount,
+        pcs.AvgCommentScore,
+        pcs.LatestCommentDate,
+        COALESCE(aad.DuplicateCount,0) AS DuplicateQuestionsCount,
+        CONCAT('AcceptedAnswerScore:', COALESCE(aad.AcceptedAnswerScore,0), '; AcceptedAnswerAgeDays:', 
+          COALESCE(DATE_PART('day', CURRENT_TIMESTAMP - aad.AcceptedAnswerDate), -1)) AS AcceptedAnswerInfo,
+        -- String conditional expression for badge list or default
+        COALESCE(uba.BadgesList, 'No Badges') AS BadgeDetails,
+        -- Null logic for website visibility
+        CASE 
+            WHEN ua.Views > 5000 AND strpos(lower(COALESCE(ua.DisplayName,'')), 'admin') = 0 THEN COALESCE(u.WebsiteUrl, 'No Website')
+            ELSE 'Hidden'
+        END AS DisplayWebsiteStatus
+    FROM UserActivity ua
+    LEFT JOIN UserBadgesAgg uba ON uba.UserId = ua.UserId
+    LEFT JOIN RankedPosts rp ON rp.OwnerUserId = ua.UserId AND rp.PostRank = 1
+    LEFT JOIN PostCommentsStats pcs ON pcs.PostId = rp.Id
+    LEFT JOIN AcceptedAnswersWithDuplicates aad ON aad.QuestionId = rp.Id AND rp.PostTypeId = 1
+    
+    UNION ALL
+    
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        'Deleted User' AS UserLevel,
+        NULL::int,
+        0,0,0,
+        NULL,
+        NULL,
+        NULL,
+        0,
+        'N/A',
+        'No Badges',
+        'Hidden'
+    FROM Users u
+    WHERE u.Reputation < 0 -- simulate deleted or banned users
+)
+SELECT * 
+FROM FinalSet
+ORDER BY DaysActive DESC NULLS LAST, GoldBadges DESC, DuplicateQuestionsCount DESC
+LIMIT 100;

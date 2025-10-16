@@ -1,0 +1,100 @@
+WITH UserTagStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        t.TagName,
+        COUNT(p.Id) AS PostCount,
+        AVG(p.Score) AS AvgTagScore,
+        RANK() OVER (PARTITION BY u.Id ORDER BY COUNT(p.Id) DESC) AS TagRank,
+        ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY AVG(p.Score) DESC) AS TagScoreRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    JOIN Tags t ON t.TagName IN (
+        SELECT TRIM(BOTH '<>' FROM val) FROM (
+            SELECT val
+            FROM (
+                SELECT p.Tags AS tags, 
+                       SUBSTRING(p.Tags FROM (pos+1) FOR (next_pos - pos - 1)) AS val
+                FROM (
+                    SELECT tags,
+                           COALESCE(position('<' IN tags), 0) AS dummy_pos
+                    FROM Posts
+                ) p0
+                JOIN LATERAL (
+                    WITH RECURSIVE nums(n, start_pos) AS (
+                        SELECT 1, 0
+                        UNION ALL
+                        SELECT n+1,
+                               COALESCE(NULLIF(position('><' IN SUBSTRING(p0.tags FROM start_pos+1)),0) + start_pos, start_pos + position('<' IN SUBSTRING(p0.tags FROM start_pos+1)))
+                        FROM nums
+                        WHERE start_pos < LENGTH(p0.tags)
+                    )
+                    SELECT n,
+                           (SELECT COALESCE(NULLIF(position('<' IN SUBSTRING(p0.tags FROM start_pos+1)),0) + start_pos, LENGTH(p0.tags)+1)) AS next_pos,
+                           start_pos AS pos
+                    FROM nums
+                ) gen ON true
+            ) tvals
+            WHERE val IS NOT NULL AND val <> ''
+        ) sub
+    )
+    WHERE p.PostTypeId = 1 AND u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, t.TagName
+),
+CloseAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        ph.CreationDate AS ClosedDate,
+        ct.Name AS CloseReason,
+        COALESCE(
+            (SELECT COUNT(*) FROM PostHistory ph2 
+             WHERE ph2.PostId = p.Id AND ph2.PostHistoryTypeId IN (10, 11)),
+            0
+        ) AS CloseReopenCycles
+    FROM Posts p
+    JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 10
+    JOIN CloseReasonTypes ct ON CAST(ph.Comment AS INTEGER) = ct.Id
+)
+SELECT 
+    uts.UserId,
+    uts.DisplayName,
+    uts.TagName,
+    uts.PostCount,
+    uts.AvgTagScore,
+    ca.PostId,
+    ca.Title,
+    ca.ClosedDate,
+    ca.CloseReason,
+    ca.CloseReopenCycles,
+    CASE 
+        WHEN uts.TagRank <= 3 AND uts.TagScoreRank <= 5 THEN 'Top Contributor'
+        WHEN ca.CloseReopenCycles > 2 THEN 'Controversial Content'
+        ELSE 'Standard User'
+    END AS UserCategory,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = ca.PostId AND v.VoteTypeId IN (2, 3)) AS TotalVotes,
+    ROUND(
+        100.0 * (SELECT COUNT(*) FROM Votes v WHERE v.PostId = ca.PostId AND v.VoteTypeId = 2) / 
+        NULLIF((SELECT COUNT(*) FROM Votes v WHERE v.PostId = ca.PostId AND v.VoteTypeId IN (2, 3)), 0),
+        2
+    ) AS UpvotePercentage
+FROM UserTagStats uts
+FULL OUTER JOIN CloseAnalysis ca ON 1=1
+WHERE 
+    uts.PostCount > 10 
+    AND (ca.CloseReopenCycles > 0 OR uts.AvgTagScore > 5)
+GROUP BY
+    uts.UserId,
+    uts.DisplayName,
+    uts.TagName,
+    uts.PostCount,
+    uts.AvgTagScore,
+    uts.TagRank,
+    uts.TagScoreRank,
+    ca.PostId,
+    ca.Title,
+    ca.ClosedDate,
+    ca.CloseReason,
+    ca.CloseReopenCycles
+ORDER BY uts.PostCount DESC, uts.AvgTagScore DESC
+LIMIT 100;

@@ -1,0 +1,43 @@
+-- {"query": "2086.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4o", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 510} 
+
+WITH TopVotedPosts AS (
+    SELECT p.Id AS PostId, p.Score, p.CreationDate, u.DisplayName, u.Reputation,
+           ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS rn
+    FROM Posts p
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2) AND p.Score IS NOT NULL
+),
+UserBadgeCounts AS (
+    SELECT b.UserId, COUNT(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId
+),
+ActiveUsers AS (
+    SELECT DISTINCT u.Id AS UserId, u.DisplayName, u.Reputation, u.LastAccessDate,
+           ub.BadgeCount, COALESCE(SUM(v.BountyAmount), 0) AS TotalBounty
+    FROM Users u
+    LEFT JOIN UserBadgeCounts ub ON u.Id = ub.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId IN (8, 9)
+    WHERE u.LastAccessDate > (CURRENT_DATE - INTERVAL '1 year')
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.LastAccessDate, ub.BadgeCount
+),
+PopularTags AS (
+    SELECT t.TagName, t.Count AS TagUsage
+    FROM Tags t
+    WHERE t.Count > 1000
+),
+TopContributors AS (
+    SELECT a.UserId, MIN(a.LastAccessDate) as FirstAccessDate, MAX(p.CreationDate) as LastPostDate,
+           SUM(a.BadgeCount) AS TotalBadges
+    FROM ActiveUsers a
+    INNER JOIN Posts p ON a.UserId = p.OwnerUserId
+    GROUP BY a.UserId
+)
+SELECT u.UserId, u.DisplayName, u.Reputation, u.LastAccessDate, u.BadgeCount, u.TotalBounty,
+       tp.PostId, tp.Score, tp.CreationDate AS PostCreationDate,
+       pt.FirstAccessDate, pt.LastPostDate, pt.TotalBadges
+FROM ActiveUsers u
+LEFT JOIN TopVotedPosts tp ON u.UserId = tp.DisplayName AND tp.rn = 1
+INNER JOIN TopContributors pt ON u.UserId = pt.UserId
+WHERE u.Reputation > 1000 AND tp.PostId IS NOT NULL
+ORDER BY u.Reputation DESC, tp.Score DESC, pt.TotalBadges DESC;

@@ -1,0 +1,32 @@
+SELECT
+    uem.UserId,
+    uem.BestQuestionId,
+    uem.Reputation,
+    uem.TotalPosts,
+    COALESCE(
+      SUM(
+        COALESCE(uem.Ideas, 0)
+        + COALESCE(uem.HelpfulPosts, 0)
+        + COALESCE(uem.Comments, 0)
+        + COALESCE(uem.Edits, 0)
+        + COALESCE(uem.PlusOnPosts, 0)
+        + COALESCE(uem.PlusOnComments, 0)
+        + COALESCE(uem.PlusOnEdits, 0)
+        + COALESCE(
+            CASE WHEN v.VoteTypeId IN (8, 9) AND v.PostId = uem.BestQuestionId THEN 1 ELSE 0 END,
+            0
+          )
+      ), 0
+    ) AS TotalImpact,
+    SUM(COALESCE(uem.InsightfulComments, 0)) AS InsightfulComments
+FROM public."UserEngagementMetrics" uem
+JOIN public."ActiveUsers" au ON uem.UserId = au.UserId
+LEFT JOIN public."Votes" v ON v.PostId = uem.BestQuestionId
+GROUP BY
+    uem.UserId,
+    uem.BestQuestionId,
+    uem.Reputation,
+    uem.TotalPosts
+ORDER BY
+    uem.Reputation DESC NULLS LAST,
+    uem.TotalPosts DESC;

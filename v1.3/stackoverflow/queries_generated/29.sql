@@ -1,0 +1,183 @@
+-- {"query": "29.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2600} 
+with
+-- recent active questions with tag array and normalized title
+RecentQuestions as (
+  select
+    p.id,
+    p.title,
+    coalesce(p.tags,'') as raw_tags,
+    -- split tags like '<sql><performance>' into array elements; fallback when tags null
+    case when p.tags is null then array[]::text[] else string_to_array(substring(p.tags,2,length(p.tags)-2), '><') end as tag_arr,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.owneruserid
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate > now() - interval '2 years'
+),
+-- aggregate user stats (including churn, recency, and badge-weighted score)
+UserStats as (
+  select
+    u.id as user_id,
+    u.reputation,
+    greatest(0, date_part('day', now() - u.creationdate))::int as days_since_create,
+    greatest(0, date_part('day', now() - u.lastaccessdate))::int as days_since_last,
+    coalesce(sum(case when b.class = 1 then 10 when b.class = 2 then 5 when b.class = 3 then 2 else 0 end),0) as badge_score,
+    count(b.id) as badge_count,
+    -- activity density: views per day as proxy (avoid divide by zero)
+    case when greatest(1, date_part('day', now()-u.creationdate))>0 then coalesce(u.views,0)/greatest(1,date_part('day', now()-u.creationdate)) else 0 end as views_per_day
+  from users u
+  left join badges b on b.userid = u.id
+  group by u.id, u.reputation, u.creationdate, u.lastaccessdate, u.views
+),
+-- per-question aggregated signals: top answers, unique commenters, link relationships
+QuestionSignals as (
+  select
+    q.id as question_id,
+    q.title,
+    q.raw_tags,
+    q.tag_arr,
+    q.creationdate,
+    q.score as question_score,
+    q.viewcount,
+    q.answercount,
+    q.owneruserid,
+    -- top answer (by score, tie-breaker newest)
+    (select a.id from posts a
+     where a.parentid = q.id and a.posttypeid = 2
+     order by a.score desc nulls last, a.creationdate desc nulls last
+     limit 1) as top_answer_id,
+    -- median answer score via ordered values (approx using percentile_disc)
+    (select percentile_disc(0.5) within group (order by a.score)
+     from posts a where a.parentid = q.id and a.posttypeid = 2) as median_answer_score,
+    -- number of distinct commenters on question and its answers
+    (select count(distinct c.userid) from comments c where c.postid = q.id or c.postid in (select id from posts p2 where p2.parentid = q.id)) as distinct_commenters,
+    -- count of inbound links (other posts linking to this question)
+    (select count(*) from postlinks pl where pl.relatedpostid = q.id) as inbound_links,
+    -- whether question is linked to any duplicate link
+    exists(select 1 from postlinks pl where pl.postid = q.id and pl.linktypeid = 3) as has_duplicate_link,
+    -- complexity heuristic: length of body plus number of tags
+    (select coalesce(char_length(substring(p2.body from 1 for 10000)),0) from posts p2 where p2.id = q.id) as body_len
+  from RecentQuestions q
+),
+-- windowed ranking per tag combination and cross-tag relationships
+TagRank as (
+  select
+    qs.*,
+    -- canonical single tag (first tag) and tag_count
+    case when array_length(qs.tag_arr,1) >= 1 then qs.tag_arr[1] else null end as primary_tag,
+    coalesce(array_length(qs.tag_arr,1),0) as tag_count,
+    -- topic popularity score combining views, score, answercount, inbound links and badge-weight of OP
+    (qs.viewcount * 0.0001 + coalesce(qs.question_score,0)*1.5 + coalesce(qs.answercount,0)*2.0 + coalesce(qs.inbound_links,0)*0.8)::numeric as raw_popularity
+  from QuestionSignals qs
+),
+-- combine with user stats and enrich with windows, correlated subqueries and lateral
+Enriched as (
+  select
+    tr.question_id,
+    tr.title,
+    tr.primary_tag,
+    tr.tag_count,
+    tr.tag_arr,
+    tr.creationdate,
+    tr.question_score,
+    tr.viewcount,
+    tr.answercount,
+    tr.top_answer_id,
+    tr.median_answer_score,
+    tr.distinct_commenters,
+    tr.inbound_links,
+    tr.has_duplicate_link,
+    tr.body_len,
+    us.user_id as owner_user_id,
+    us.reputation as owner_reputation,
+    us.badge_score as owner_badge_score,
+    us.badge_count as owner_badge_count,
+    us.days_since_last as owner_days_inactive,
+    -- normalized popularity using owner reputation
+    (tr.raw_popularity * (1 + least(us.reputation::numeric / 10000, 5)))::numeric(18,6) as popularity_with_owner,
+    -- window: rank within primary tag over popularity
+    rank() over (partition by tr.primary_tag order by tr.raw_popularity desc nulls last) as rk_in_tag,
+    dense_rank() over (order by tr.raw_popularity desc nulls last) as global_dense_rank,
+    row_number() over (partition by tr.primary_tag order by tr.raw_popularity desc nulls last, tr.creationdate desc) as rn_in_tag
+  from TagRank tr
+  left join users u on u.id = tr.owneruserid
+  left join UserStats us on us.user_id = u.id
+),
+-- collect complementary signals: votes breakdown, recent edits, and correlated subqueries examining neighbors
+Signals2 as (
+  select
+    e.*,
+    -- votes breakdown on question
+    sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) over (partition by e.question_id) as vote_balance,
+    -- number of favorites (type 5) and accepts (type 1 on answers)
+    (select count(*) from votes v2 where v2.postid = e.question_id and v2.votetypeid = 5) as favorite_count,
+    -- accepted answer owner's reputation (if accepted exists)
+    (select u2.reputation from posts a2 left join users u2 on u2.id = a2.owneruserid where a2.id = e.top_answer_id) as top_answer_owner_reputation,
+    -- last edit age (days since last edit recorded in posthistory)
+    (select greatest(0, date_part('day', now() - max(ph.creationdate))) from posthistory ph where ph.postid = e.question_id) as days_since_last_edit,
+    -- correlated: average score of answers excluding top answer (if any)
+    (select avg(a.score) from posts a where a.parentid = e.question_id and a.posttypeid = 2 and a.id <> e.top_answer_id) as avg_other_answer_score,
+    -- set operator example: tags_in_high_rank (tags of questions tied in top 10 global dense rank)
+    (select array_agg(distinct unnest(qs.tag_arr)) from QuestionSignals qs where qs.id in (select question_id from Enriched where global_dense_rank <= 10)) as top10_tags_agg
+  from Enriched e
+  left join votes v on v.postid = e.question_id
+  group by e.question_id, e.title, e.primary_tag, e.tag_count, e.tag_arr, e.creationdate, e.question_score, e.viewcount, e.answercount, e.top_answer_id, e.median_answer_score, e.distinct_commenters, e.inbound_links, e.has_duplicate_link, e.body_len, e.owner_user_id, e.owner_reputation, e.owner_badge_score, e.owner_badge_count, e.owner_days_inactive, e.popularity_with_owner, e.rk_in_tag, e.global_dense_rank, e.rn_in_tag
+)
+select
+  s2.question_id,
+  left(s2.title,200) as sample_title,
+  s2.primary_tag,
+  s2.tag_count,
+  array_to_string(s2.tag_arr,',') as tags_csv,
+  to_char(s2.creationdate,'YYYY-MM-DD') as created_on,
+  s2.question_score,
+  s2.viewcount,
+  s2.answercount,
+  s2.top_answer_id,
+  coalesce(s2.median_answer_score,0)::numeric(10,2) as median_answer_score,
+  coalesce(s2.avg_other_answer_score,0)::numeric(10,2) as avg_other_answer_score,
+  s2.distinct_commenters,
+  s2.inbound_links,
+  s2.has_duplicate_link,
+  s2.body_len,
+  s2.owner_user_id,
+  coalesce(s2.owner_reputation,0) as owner_reputation,
+  coalesce(s2.owner_badge_score,0) as owner_badge_score,
+  s2.owner_days_inactive,
+  coalesce(s2.popularity_with_owner,0)::numeric(18,6) as popularity_with_owner,
+  s2.vote_balance,
+  coalesce(s2.favorite_count,0) as favorite_count,
+  coalesce(s2.top_answer_owner_reputation,0) as top_answer_owner_reputation,
+  coalesce(s2.days_since_last_edit, null) as days_since_last_edit,
+  -- composite score mixing popularity, recency, and activity with null-safe math and conditional boosts
+  (
+    coalesce(s2.popularity_with_owner,0) * 0.6
+    + greatest(0, (100 - coalesce(s2.owner_days_inactive,100))) * 0.01
+    + coalesce(s2.distinct_commenters,0) * 0.15
+    + coalesce(s2.vote_balance,0) * 0.25
+    + case when s2.has_duplicate_link then -2 else 1 end
+    - coalesce(s2.days_since_last_edit,30) * 0.005
+  )::numeric(18,6) as composite_score,
+  -- window percentile of composite score within primary tag
+  ntile(100) over (partition by s2.primary_tag order by (
+      coalesce(s2.popularity_with_owner,0) * 0.6
+      + greatest(0, (100 - coalesce(s2.owner_days_inactive,100))) * 0.01
+      + coalesce(s2.distinct_commenters,0) * 0.15
+      + coalesce(s2.vote_balance,0) * 0.25
+      + case when s2.has_duplicate_link then -2 else 1 end
+      - coalesce(s2.days_since_last_edit,30) * 0.005
+    ) desc) as percentile_within_tag,
+  -- tags that appear among top10 dense rank questions as CSV (may be null)
+  case when s2.top10_tags_agg is not null then array_to_string(s2.top10_tags_agg,',') else null end as top10_tags_overall,
+  -- a diagnostic expression showing string manipulation and null-coalescing
+  (coalesce(nullif(s2.primary_tag,''),'[untagged]') || ' | ' || coalesce(left(s2.title,50),'(no title)') || ' :: ' || coalesce(nullif(array_to_string(s2.tag_arr,','),''),'none')) as debug_signature
+from Signals2 s2
+where
+  -- filter to interesting candidates: at least 1 answer or many views, non-negative composite base signals
+  (s2.answercount >= 1 or s2.viewcount > 1000)
+  and (s2.question_score is null or s2.question_score >= -5)
+order by composite_score desc nulls last, s2.viewcount desc
+limit 500;

@@ -1,0 +1,93 @@
+-- {"query": "3046.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 812} 
+WITH RecentComments AS (
+    SELECT c.PostId, COUNT(*) AS CommentCount
+    FROM Comments c
+    WHERE c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+    GROUP BY c.PostId
+),
+PostVotes AS (
+    SELECT v.PostId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes
+    FROM Votes v
+    GROUP BY v.PostId
+),
+AnswerStats AS (
+    SELECT p.ParentId AS QuestionId,
+        COUNT(p.Id) AS AnswerCount,
+        AVG(p.Score) AS AvgAnswerScore
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+),
+TagInfo AS (
+    SELECT t.TagName,
+        t.Count AS TagCount,
+        MAX(u.Reputation) AS MaxReputation,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') AS DistinctAnswerers
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags @> ARRAY[t.TagName]
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE t.IsModeratorOnly = FALSE
+    GROUP BY t.TagName, t.TagCount
+),
+QuestionDetails AS (
+    SELECT q.Id AS QuestionId,
+        q.Title,
+        q.Tags,
+        q.CreationDate,
+        q.Score,
+        COALESCE(c.CommentCount, 0) AS RecentCommentCount,
+        COALESCE(v.UpVotes, 0) AS UpVotes,
+        COALESCE(v.DownVotes, 0) AS DownVotes,
+        a.AnswerCount,
+        a.AvgAnswerScore,
+        CASE WHEN q.ClosedDate IS NOT NULL THEN TRUE ELSE FALSE END AS IsClosed,
+        CONCAT('https://stackoverflow.com/questions/', q.Id) AS QuestionURL
+    FROM Posts q
+    LEFT JOIN RecentComments c ON q.Id = c.PostId
+    LEFT JOIN PostVotes v ON q.Id = v.PostId
+    LEFT JOIN AnswerStats a ON q.Id = a.QuestionId
+    WHERE q.PostTypeId = 1
+),
+AggregatedTags AS (
+    SELECT td.TagName,
+        COUNT(DISTINCT td.QuestionId) AS QuestionCount,
+        AVG(td.Score) AS AvgQuestionScore,
+        SUM(td.AnswerCount) AS TotalAnswers,
+        SUM(td.AvgAnswerScore * td.AnswerCount) / NULLIF(SUM(td.AnswerCount), 0) AS AvgAnswerScoreAcrossQuestions
+    FROM QuestionDetails qd
+    JOIN unnest(string_to_array(substring(qd.Tags, 2, length(qd.Tags)-2), '><')) AS td(TagName)
+    JOIN QuestionDetails td ON td.QuestionId = qd.QuestionId
+    GROUP BY td.TagName
+),
+TopTags AS (
+    SELECT TagName,
+        QuestionCount,
+        AvgQuestionScore,
+        TotalAnswers,
+        AvgAnswerScoreAcrossQuestions
+    FROM AggregatedTags
+    WHERE QuestionCount > 10
+    ORDER BY QuestionCount DESC
+    LIMIT 10
+)
+SELECT
+    qd.QuestionId,
+    qd.Title,
+    qd.Tags,
+    qd.CreationDate,
+    qd.Score,
+    qd.RecentCommentCount,
+    qd.UpVotes,
+    qd.DownVotes,
+    qd.AnswerCount,
+    qd.AvgAnswerScore,
+    qd.IsClosed,
+    qd.QuestionURL,
+    ('Top tags by question count: ' || string_agg(tt.TagName, ', ')) AS TopTagsSummary
+FROM QuestionDetails qd
+LEFT JOIN TopTags tt ON qd.Tags LIKE '%' || tt.TagName || '%'
+WHERE qd.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+ORDER BY qd.Score DESC, qd.CreationDate DESC
+LIMIT 50;

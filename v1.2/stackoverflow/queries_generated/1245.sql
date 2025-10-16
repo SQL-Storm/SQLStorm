@@ -1,0 +1,149 @@
+-- {"query": "1245.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.2, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1433} 
+with recursive RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 as Level,
+        array[t.TagName] as HierarchyPath
+    from Tags t
+    where t.IsRequired = 0
+
+    union all
+
+    select 
+        c.Id,
+        c.TagName,
+        c.IsModeratorOnly,
+        c.IsRequired,
+        r.Level + 1,
+        r.HierarchyPath || c.TagName
+    from Tags c
+    join RecursiveTagHierarchy r on c.Id = r.Id + 1
+    where c.IsRequired = 0 and c.Id > r.Id and array_length(r.HierarchyPath,1) < 5
+),
+UserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter(where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct p.Id) filter(where p.PostTypeId = 2) as AnswersProvided,
+        count(distinct b.Id) as BadgesEarned,
+        coalesce(sum(vt_counts.UpVotes),0) as TotalUpVotes,
+        coalesce(sum(vt_counts.DownVotes),0) as TotalDownVotes,
+        rank() over (order by count(distinct p.Id) desc) as ActivityRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.CreationDate > current_date - interval '365 day'
+    left join Badges b on b.UserId = u.Id and b.Date > current_date - interval '365 day'
+    left join (
+        select 
+            v.UserId,
+            sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+            sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes
+        from Votes v
+        join VoteTypes vt on vt.Id = v.VoteTypeId
+        where v.CreationDate > current_date - interval '365 day'
+        group by v.UserId
+    ) vt_counts on vt_counts.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopQuestionsWithInsights as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerReputation,
+        transferedTag.HierarchyPath,
+        coalesce(ac.AnswerCount,0) as AnswersRecorded,
+        coalesce(b.SilverBadges,0) as SilverBadgeCount,
+        coalesce(tp.MaxScoreAnswer,0) as HighestAnswerScore,
+        row_number() over (partition by q.OwnerUserId order by q.CreationDate desc) as QuestionSeqByUser
+    from Posts q
+    join PostTypes pt on pt.Id = q.PostTypeId and pt.Name = 'Question'
+    left join Users u on u.Id = q.OwnerUserId
+    left join Lateral (
+        select HierarchyPath from RecursiveTagHierarchy rth
+        where q.Tags is not null and array_length(regexp_split_to_array(q.Tags, '[><]'),1) > 1
+        and ( ',' || substring(q.Tags from 2 for char_length(q.Tags) - 2) || ',' ) like '%,' || unnest(rth.HierarchyPath) || ',%'
+        limit 1
+    ) transferedTag on true
+    left join (
+        select ParentId, count(*) as AnswerCount
+        from Posts
+        where PostTypeId = 2 and CreationDate > current_date - interval '365 day'
+        group by ParentId
+    ) ac on ac.ParentId = q.Id
+    left join (
+        select UserId, count(*) filter (where Class = 2) as SilverBadges
+        from Badges
+        group by UserId
+    ) b on b.UserId = q.OwnerUserId
+    left join lateral (
+        select max(Score) as MaxScoreAnswer
+        from Posts ans
+        where ans.ParentId = q.Id and ans.PostTypeId = 2
+    ) tp on true
+    where q.CreationDate > current_date - interval '365 day'
+),
+CommentStats as (
+    select 
+        p.Id as PostId,
+        count(c.Id) as CommentCount,
+        count(distinct c.UserId) as UniqueCommenters,
+        string_agg(distinct c.UserDisplayName, ', ') filter (where c.UserDisplayName is not null) as CommentersDisplayNames
+    from Posts p
+    left join Comments c on c.PostId = p.Id and c.CreationDate > p.CreationDate - interval '30 day'
+    group by p.Id
+),
+CloseReasonSummary as (
+    select
+        cht.Name as CloseReasonName,
+        count(ph.Id) as CloseCount
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId and pht.Name = 'Post Closed'
+    left join CloseReasonTypes cht on cast(ph.Comment as int) = cht.Id
+    where ph.CreationDate > current_date - interval '365 day'
+    group by cht.Name
+)
+select 
+    tq.QuestionId,
+    tq.Title,
+    tq.CreationDate,
+    tq.Score,
+    tq.ViewCount,
+    tq.AnswerCount,
+    tq.OwnerName,
+    tq.OwnerReputation,
+    array_to_string( coalesce(tq.HierarchyPath, array['<none>']), '->') as TagPath,
+    tq.AnswersRecorded,
+    tq.SilverBadgeCount,
+    tq.HighestAnswerScore,
+    cs.CommentCount,
+    cs.UniqueCommenters,
+    cs.CommentersDisplayNames,
+    ua.QuestionsAsked,
+    ua.AnswersProvided,
+    ua.BadgesEarned,
+    ua.TotalUpVotes,
+    ua.TotalDownVotes,
+    ua.ActivityRank,
+    crs.CloseReasonName,
+    crs.CloseCount
+from TopQuestionsWithInsights tq
+left join CommentStats cs on cs.PostId = tq.QuestionId
+left join UserActivity ua on ua.UserId = (select OwnerUserId from Posts where Id = tq.QuestionId)
+left join CloseReasonSummary crs on crs.CloseReasonName = (
+    select cht.Name from PostHistory ph 
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId and pht.Name = 'Post Closed'
+    left join CloseReasonTypes cht on cast(ph.Comment as int) = cht.Id
+    where ph.PostId = tq.QuestionId
+    order by ph.CreationDate desc limit 1
+)
+where ua.ActivityRank <= 100
+order by uq.OwnerReputation desc nulls last, tq.Score desc
+limit 50;

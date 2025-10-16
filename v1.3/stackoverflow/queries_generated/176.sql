@@ -1,0 +1,242 @@
+-- {"query": "176.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 2619} 
+WITH
+raw_tags AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.ViewCount,
+    p.Score AS PostScore,
+    p.AnswerCount,
+    p.AcceptedAnswerId,
+    -- Normalize tags string like '<sql><postgres>' into array of tags
+    COALESCE(p.Tags, '') AS RawTags,
+    -- split into array and unnest later
+    CASE
+      WHEN length(coalesce(p.Tags, '')) >= 2 THEN string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')
+      ELSE ARRAY[]::varchar[]
+    END AS TagArray
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+tag_questions AS (
+  SELECT
+    rt.PostId,
+    rt.Title,
+    rt.OwnerUserId,
+    rt.CreationDate,
+    rt.LastActivityDate,
+    rt.ViewCount,
+    rt.PostScore,
+    rt.AnswerCount,
+    rt.AcceptedAnswerId,
+    lower(trim(t)) AS Tag
+  FROM raw_tags rt
+  CROSS JOIN LATERAL unnest(rt.TagArray) AS t
+),
+votes_agg AS (
+  SELECT
+    v.PostId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS VoteScore,
+    SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS Favorites,
+    COUNT(*) AS VoteCount,
+    MAX(v.CreationDate) AS LastVoteDate
+  FROM Votes v
+  GROUP BY v.PostId
+),
+answers_agg AS (
+  SELECT
+    p.ParentId AS QuestionId,
+    COUNT(*) FILTER (WHERE a.PostTypeId = 2) AS TotalAnswers,
+    AVG(a.Score) FILTER (WHERE a.PostTypeId = 2) AS AvgAnswerScore,
+    MAX(a.Score) FILTER (WHERE a.PostTypeId = 2) AS MaxAnswerScore,
+    SUM(CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS HasAcceptedInChildren
+  FROM Posts a
+  LEFT JOIN Posts q ON q.Id = a.ParentId
+  WHERE a.PostTypeId = 2
+  GROUP BY pARENTID, q.AcceptedAnswerId
+),
+user_stats AS (
+  SELECT
+    u.Id AS UserId,
+    u.Reputation,
+    COALESCE(u.Views,0) AS UserViews,
+    COALESCE(u.UpVotes,0) AS UpVotes,
+    COALESCE(u.DownVotes,0) AS DownVotes,
+    CASE WHEN u.DisplayName IS NOT NULL THEN u.DisplayName ELSE concat('user_', u.Id) END AS DisplayName,
+    row_number() OVER (ORDER BY u.Reputation DESC NULLS LAST) AS ReputationRank
+  FROM Users u
+),
+history_latest AS (
+  SELECT DISTINCT ON (ph.PostId)
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate AS HistoryDate,
+    ph.UserId AS EditorId,
+    ph.Comment AS HistoryComment,
+    ph.Text AS HistoryText
+  FROM PostHistory ph
+  WHERE ph.PostId IS NOT NULL
+  ORDER BY ph.PostId, ph.CreationDate DESC
+),
+closed_posts AS (
+  SELECT DISTINCT ph.PostId
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId = 10 OR ph.PostHistoryTypeId = 35 OR ph.PostHistoryTypeId = 36
+),
+computed AS (
+  SELECT
+    tq.PostId,
+    tq.Tag,
+    tq.Title,
+    tq.OwnerUserId,
+    u.DisplayName AS OwnerName,
+    COALESCE(u.Reputation,0) AS OwnerReputation,
+    tq.CreationDate,
+    tq.LastActivityDate,
+    tq.ViewCount,
+    tq.PostScore,
+    COALESCE(v.VoteScore,0) AS VoteScore,
+    COALESCE(v.Favorites,0) AS Favorites,
+    COALESCE(a.TotalAnswers,0) AS TotalAnswers,
+    COALESCE(a.AvgAnswerScore,0) AS AvgAnswerScore,
+    CASE WHEN tq.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAccepted,
+    hl.PostHistoryTypeId,
+    hl.HistoryDate,
+    cp.PostId IS NOT NULL AS IsClosed,
+    -- complex activity metric mixing recency, votes, views, answers, owner rep, and null-sensitivity
+    (
+      -- base: votes and score
+      (COALESCE(v.VoteScore,0) * 3.0 + COALESCE(tq.PostScore,0) * 1.5)
+      -- answers reward (diminishing returns)
+      + (COALESCE(a.TotalAnswers,0) * LEAST(5, COALESCE(a.AvgAnswerScore,0) + 1) * 2.0)
+      -- view-based logarithmic boost
+      + (CASE WHEN tq.ViewCount IS NULL OR tq.ViewCount <= 0 THEN 0 ELSE ln(tq.ViewCount + 1) * 2.5 END)
+      -- owner reputation influence with square-root damping
+      + (CASE WHEN u.Reputation IS NULL OR u.Reputation <= 0 THEN 0 ELSE sqrt(u.Reputation) * 0.5 END)
+      -- recency multiplier: more recent last activity increases score, older reduces
+      ) * (1 + (EXTRACT(EPOCH FROM (NOW() - COALESCE(tq.LastActivityDate, tq.CreationDate))) / 86400.0) ^ -0.5)
+    )::numeric(18,6) AS ActivityScore,
+    -- stringified short summary with null-aware concatenation
+    trim(both ' ' FROM
+      concat(
+        coalesce(substr(tq.Title,1,120),'[no title]'),
+        ' | tag=', tq.Tag,
+        ' | v=', coalesce((COALESCE(v.VoteScore,0))::text,'0'),
+        ' | a=', COALESCE(a.TotalAnswers,0)::text,
+        ' | views=', COALESCE(tq.ViewCount,0)::text,
+        CASE WHEN cp.PostId IS NOT NULL THEN ' | CLOSED' ELSE '' END
+      )
+    ) AS Summary
+  FROM tag_questions tq
+  LEFT JOIN votes_agg v ON v.PostId = tq.PostId
+  LEFT JOIN answers_agg a ON a.QuestionId = tq.PostId
+  LEFT JOIN user_stats u ON u.UserId = tq.OwnerUserId
+  LEFT JOIN history_latest hl ON hl.PostId = tq.PostId
+  LEFT JOIN closed_posts cp ON cp.PostId = tq.PostId
+),
+ranked AS (
+  SELECT
+    c.*,
+    row_number() OVER (PARTITION BY lower(c.Tag) ORDER BY c.ActivityScore DESC NULLS LAST, c.PostScore DESC NULLS LAST, c.ViewCount DESC NULLS LAST) AS RankInTag,
+    dense_rank() OVER (PARTITION BY lower(c.Tag) ORDER BY c.ActivityScore DESC) AS DenseRankInTag
+  FROM computed c
+),
+top_per_tag AS (
+  SELECT *
+  FROM ranked
+  WHERE RankInTag <= 5
+    AND NOT IsClosed -- exclude closed posts for this primary benchmark
+),
+closed_bonus AS (
+  -- For contrast: top closed posts per tag (if any), to include via UNION later with different flags
+  SELECT *
+  FROM ranked
+  WHERE IsClosed = true
+  ORDER BY Tag, ActivityScore DESC
+  LIMIT 200
+),
+-- intersect with posts that have accepted answers and high community vote presence
+accepted_intersect AS (
+  SELECT tp.*
+  FROM top_per_tag tp
+  WHERE tp.HasAccepted = 1
+    AND EXISTS (
+      SELECT 1 FROM Votes v2 WHERE v2.PostId = tp.PostId AND v2.VoteTypeId = 2 -- has upvotes
+    )
+),
+-- final selection: union top_per_tag and a sampled set of closed_bonus, remove duplicates with EXCEPT
+final_union AS (
+  SELECT
+    tp.PostId,
+    tp.Tag,
+    tp.Title,
+    tp.OwnerName,
+    tp.OwnerReputation,
+    tp.ActivityScore,
+    tp.PostScore,
+    tp.ViewCount,
+    tp.TotalAnswers,
+    tp.HasAccepted,
+    tp.RankInTag,
+    tp.Summary,
+    false AS FromClosedSample
+  FROM top_per_tag tp
+
+  UNION ALL
+
+  SELECT
+    cb.PostId,
+    cb.Tag,
+    cb.Title,
+    cb.OwnerName,
+    cb.OwnerReputation,
+    cb.ActivityScore,
+    cb.PostScore,
+    cb.ViewCount,
+    cb.TotalAnswers,
+    cb.HasAccepted,
+    cb.RankInTag,
+    cb.Summary,
+    true AS FromClosedSample
+  FROM closed_bonus cb
+
+  EXCEPT
+
+  -- remove any posts that are duplicates of other posts (PostLinks with LinkTypeId = 3)
+  SELECT p.Id, lower(t), p.Title, NULL, 0, 0, 0, 0, 0, 0, ''::text, false
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    CASE WHEN p.Tags IS NULL THEN ARRAY[]::varchar[] ELSE string_to_array(substring(p.Tags,2,length(p.Tags)-2),'><') END
+  ) AS arr(t)
+  JOIN PostLinks pl ON pl.PostId = p.Id AND pl.LinkTypeId = 3
+),
+-- annotate with percentile within tag and global percent rank
+percentiles AS (
+  SELECT
+    fu.*,
+    percent_rank() OVER (PARTITION BY lower(fu.Tag) ORDER BY fu.ActivityScore) AS PercentileInTag,
+    ntile(100) OVER (ORDER BY fu.ActivityScore DESC) AS GlobalPercentileBucket
+  FROM final_union fu
+)
+SELECT
+  Tag,
+  RankInTag,
+  GlobalPercentileBucket,
+  PercentileInTag,
+  PostId,
+  Title,
+  OwnerName,
+  OwnerReputation,
+  ActivityScore,
+  PostScore,
+  ViewCount,
+  TotalAnswers,
+  HasAccepted,
+  FromClosedSample,
+  Summary
+FROM percentiles
+ORDER BY Tag ASC, RankInTag, ActivityScore DESC
+LIMIT 1000;

@@ -1,0 +1,90 @@
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(COALESCE(p.Score, 0)) AS TotalScore,
+        ROW_NUMBER() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC) AS RankInLocation,
+        STRING_AGG(COALESCE(p.Tags, ''), ';') AS AllTags,
+        u.Location
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 1000 AND (u.Location IS NOT NULL OR u.AboutMe LIKE '%SQL%')
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Location
+    HAVING COUNT(DISTINCT p.Id) > 5
+),
+BadgeSummary AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        MAX(b.Date) AS LatestBadgeDate
+    FROM Badges b
+    WHERE COALESCE(b.TagBased, FALSE) = TRUE
+    GROUP BY b.UserId
+),
+TopPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.ViewCount,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 0) AS PositiveComments,
+        LAG(p.Score) OVER (ORDER BY p.CreationDate) AS PreviousScore,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        p.AnswerCount,
+        p.PostTypeId
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.AnswerCount > 2
+),
+CombinedResults AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.TotalScore,
+        bs.GoldBadges,
+        tp.Title AS TopPostTitle,
+        COALESCE(tp.PositiveComments, 0) + NULLIF(ua.PostCount, 0) AS CalculatedMetric,
+        CASE 
+            WHEN ua.RankInLocation = 1 THEN 'Top in Location'
+            ELSE 'Other'
+        END AS Status,
+        bs.LatestBadgeDate,
+        ua.PostCount
+    FROM UserActivity ua
+    INNER JOIN BadgeSummary bs ON ua.UserId = bs.UserId
+    LEFT JOIN TopPosts tp ON ua.UserId = tp.OwnerUserId
+    WHERE EXISTS (
+        SELECT 1 FROM Votes v 
+        WHERE v.PostId = tp.PostId AND v.VoteTypeId IN (2, 3) AND v.CreationDate > bs.LatestBadgeDate
+    )
+    UNION
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        SUM(COALESCE(ph.Id, 0)) AS TotalScore,
+        0 AS GoldBadges,
+        NULL AS TopPostTitle,
+        0 AS CalculatedMetric,
+        'Inactive' AS Status,
+        NULL::timestamp AS LatestBadgeDate,
+        COUNT(ph.Id) AS PostCount
+    FROM Users u
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId AND ph.PostHistoryTypeId IN (4,5,6)
+    WHERE u.Reputation < 100
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT 
+    cr.UserId,
+    cr.DisplayName,
+    cr.TotalScore,
+    cr.GoldBadges,
+    cr.TopPostTitle,
+    cr.CalculatedMetric,
+    cr.Status,
+    (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = cr.UserId AND p.Body LIKE '%benchmark%') AS AvgBenchmarkScore
+FROM CombinedResults cr
+WHERE cr.CalculatedMetric > 10 OR cr.TopPostTitle IS NULL
+ORDER BY cr.TotalScore DESC;

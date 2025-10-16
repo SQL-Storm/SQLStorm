@@ -1,0 +1,120 @@
+-- {"query": "16015.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 37360, "output_tokens": 34620} 
+
+WITH UserEngagementMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS NetVotes,
+        EXTRACT(YEAR FROM AGE(u.LastAccessDate, u.CreationDate)) AS YearsActive,
+        CASE 
+            WHEN u.Location IS NOT NULL AND LENGTH(TRIM(u.Location)) > 0 
+            THEN UPPER(SUBSTRING(u.Location, 1, 3))
+            ELSE 'UNK'
+        END AS LocationPrefix,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation DESC) AS YearlyRepRank,
+        PERCENT_RANK() OVER (ORDER BY COALESCE(u.Views, 0)) AS ViewPercentile
+    FROM Users u
+    WHERE u.Reputation > 100
+),
+PostPerformance AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        COALESCE(p.CommentCount, 0) + COALESCE(p.FavoriteCount, 0) AS EngagementScore,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 
+            ELSE 0 
+        END AS HasAcceptedAnswer,
+        EXTRACT(EPOCH FROM (COALESCE(p.LastActivityDate, p.CreationDate) - p.CreationDate)) / 3600.0 AS HoursToLastActivity,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) AS RollingAvgScore,
+        STRING_AGG(DISTINCT COALESCE(SUBSTRING(t.tag, 1, 10), ''), '|') FILTER (WHERE t.tag IS NOT NULL) AS TopTags
+    FROM Posts p
+    LEFT JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tag
+    ) t ON p.PostTypeId = 1
+    WHERE p.CreationDate >= NOW() - INTERVAL '5 years'
+    GROUP BY p.Id, p.OwnerUserId, p.PostTypeId, p.Score, p.ViewCount, p.AnswerCount, 
+             p.CommentCount, p.FavoriteCount, p.AcceptedAnswerId, p.LastActivityDate, p.CreationDate
+),
+BadgeInfluence AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        MAX(CASE WHEN b.TagBased = 1 THEN b.Date END) AS LastTagBadgeDate,
+        DENSE_RANK() OVER (ORDER BY COUNT(*) DESC) AS BadgeCountRank
+    FROM Badges b
+    GROUP BY b.UserId
+),
+VotingPatterns AS (
+    SELECT 
+        v.PostId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpvoteCount,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownvoteCount,
+        COUNT(DISTINCT v.UserId) AS UniqueVoters,
+        MAX(v.BountyAmount) AS MaxBounty,
+        COUNT(*) FILTER (WHERE v.VoteTypeId IN (4, 12)) AS OffensiveSpamCount
+    FROM Votes v
+    WHERE v.CreationDate >= NOW() - INTERVAL '3 years'
+    GROUP BY v.PostId
+)
+SELECT 
+    uem.DisplayName,
+    uem.LocationPrefix,
+    uem.Reputation,
+    uem.YearlyRepRank,
+    ROUND(uem.ViewPercentile::numeric, 4) AS ViewPercentile,
+    COUNT(DISTINCT pp.PostId) AS TotalPosts,
+    ROUND(AVG(pp.Score)::numeric, 2) AS AvgPostScore,
+    ROUND(AVG(NULLIF(pp.ViewCount, 0))::numeric, 2) AS AvgViews,
+    SUM(pp.HasAcceptedAnswer) AS AcceptedAnswerCount,
+    COALESCE(bi.GoldBadges, 0) || 'G/' || COALESCE(bi.SilverBadges, 0) || 'S/' || COALESCE(bi.BronzeBadges, 0) || 'B' AS BadgeDistribution,
+    ROUND(AVG(vp.UpvoteCount::numeric / NULLIF(vp.DownvoteCount + vp.UpvoteCount, 0)), 3) AS UpvoteRatio,
+    MAX(vp.MaxBounty) AS HighestBountyReceived,
+    CASE 
+        WHEN AVG(pp.RollingAvgScore) > 10 AND uem.Reputation > 5000 THEN 'Elite'
+        WHEN AVG(pp.RollingAvgScore) > 5 AND uem.Reputation > 1000 THEN 'Advanced'
+        WHEN AVG(pp.RollingAvgScore) > 0 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END AS UserTier,
+    STRING_AGG(DISTINCT pp.TopTags, '; ') AS AggregatedTags,
+    (SELECT COUNT(*) 
+     FROM Comments c 
+     WHERE c.UserId = uem.Id 
+       AND c.Score > 5 
+       AND c.CreationDate >= NOW() - INTERVAL '2 years') AS HighScoredComments,
+    COALESCE(
+        (SELECT AVG(a.Score)
+         FROM Posts q
+         INNER JOIN Posts a ON q.Id = a.ParentId
+         WHERE q.OwnerUserId = uem.Id 
+           AND q.PostTypeId = 1 
+           AND a.PostTypeId = 2
+           AND a.Score IS NOT NULL),
+        0
+    ) AS AvgAnswerScoreOnUserQuestions
+FROM UserEngagementMetrics uem
+LEFT JOIN PostPerformance pp ON uem.Id = pp.OwnerUserId
+LEFT JOIN BadgeInfluence bi ON uem.Id = bi.UserId
+LEFT JOIN VotingPatterns vp ON pp.PostId = vp.PostId
+WHERE uem.YearsActive >= 1
+  AND (pp.PostId IS NULL OR pp.EngagementScore > 0)
+  AND (bi.UserId IS NULL OR bi.BadgeCountRank <= 10000)
+GROUP BY uem.Id, uem.DisplayName, uem.LocationPrefix, uem.Reputation, 
+         uem.YearlyRepRank, uem.ViewPercentile, uem.NetVotes,
+         bi.GoldBadges, bi.SilverBadges, bi.BronzeBadges
+HAVING COUNT(DISTINCT pp.PostId) >= 3
+   AND AVG(pp.Score) IS NOT NULL
+ORDER BY 
+    CASE WHEN uem.Reputation > 10000 THEN 1 ELSE 2 END,
+    AVG(pp.RollingAvgScore) DESC NULLS LAST,
+    uem.ViewPercentile DESC
+LIMIT 500;

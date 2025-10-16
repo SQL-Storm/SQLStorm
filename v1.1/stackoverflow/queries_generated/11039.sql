@@ -1,0 +1,72 @@
+-- {"query": "11039.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 466} 
+
+WITH RecentPosts AS (
+    SELECT 
+        Posts.Id, 
+        Posts.PostTypeId, 
+        Posts.Title, 
+        Posts.CreationDate, 
+        Posts.Score, 
+        Posts.ViewCount, 
+        Posts.AnswerCount, 
+        Posts.CommentCount, 
+        Users.DisplayName AS OwnerDisplayName, 
+        Users.Reputation, 
+        Tags.TagName
+    FROM 
+        Posts
+    JOIN 
+        Users ON Posts.OwnerUserId = Users.Id
+    JOIN 
+        Posts AS TagPosts ON Posts.Id = TagPosts.Id
+    JOIN 
+        Tags ON TagPosts.Id = Tags.Id
+    WHERE 
+        Posts.CreationDate > current_date - INTERVAL '30 days'
+),
+UserActivity AS (
+    SELECT 
+        UserId, 
+        COUNT(*) AS ActivityCount
+    FROM 
+        Posts
+    WHERE 
+        CreationDate > current_date - INTERVAL '30 days'
+    GROUP BY 
+        UserId
+),
+BadgeEarners AS (
+    SELECT 
+        UserId, 
+        COUNT(*) AS BadgeCount
+    FROM 
+        Badges
+    GROUP BY 
+        UserId
+)
+SELECT 
+    RecentPosts.Id, 
+    RecentPosts.Title, 
+    RecentPosts.CreationDate, 
+    RecentPosts.Score, 
+    RecentPosts.ViewCount, 
+    RecentPosts.AnswerCount, 
+    RecentPosts.CommentCount, 
+    RecentPosts.OwnerDisplayName, 
+    RecentPosts.Reputation, 
+    RecentPosts.TagName, 
+    UserActivity.ActivityCount, 
+    BadgeEarners.BadgeCount
+FROM 
+    RecentPosts
+LEFT JOIN 
+    UserActivity ON RecentPosts.OwnerUserId = UserActivity.UserId
+LEFT JOIN 
+    BadgeEarners ON RecentPosts.OwnerUserId = BadgeEarners.UserId
+WHERE 
+    (RecentPosts.Score > 10 OR RecentPosts.ViewCount > 1000) 
+    AND (UserActivity.ActivityCount > 5 OR BadgeEarners.BadgeCount > 3)
+ORDER BY 
+    RecentPosts.CreationDate DESC, 
+    RecentPosts.Score DESC, 
+    RecentPosts.ViewCount DESC;

@@ -1,0 +1,152 @@
+-- {"query": "993.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1496} 
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(p.Score,0) as PostScore,
+        p.OwnerUserId,
+        u.Reputation,
+        row_number() over (partition by t.Id order by p.Score desc nulls last, p.CreationDate) as rn
+    from Tags t
+    left join Posts p on p.Tags like '%' || t.TagName || '%'
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1
+),
+TopTagPosts as (
+    select
+        Id,
+        TagName,
+        PostScore,
+        OwnerUserId,
+        Reputation
+    from RecursiveTagCounts
+    where rn <= 3
+),
+UserBadgeStats as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(*) as TotalBadges
+    from Badges b
+    group by b.UserId
+),
+UserActivityWindow as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(p.Id) filter (where p.PostTypeId = 1) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as QuestionsLast30Days,
+        count(p.Id) filter (where p.PostTypeId = 2) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as AnswersLast30Days,
+        row_number() over (partition by u.Id order by p.CreationDate desc nulls last) as LastPostRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+),
+ClosedQuestionsWithReasons as (
+    select
+        ph.PostId,
+        p.Title,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate,
+        u.DisplayName as CloserName
+    from PostHistory ph
+    join CloseReasonTypes crt on cast(ph.Comment as int) = crt.Id and ph.PostHistoryTypeId = 10
+    join Posts p on p.Id = ph.PostId
+    left join Users u on u.Id = ph.UserId
+    where p.PostTypeId = 1
+),
+AnswerStatsPerQuestion as (
+    select
+        p.Id as QuestionId,
+        count(a.Id) as AnswerCount,
+        avg(a.Score) filter (where a.Score is not null) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        min(a.Score) as MinAnswerScore,
+        sum(case when a.Score > 0 then 1 else 0 end) as PositiveScoreAnswers,
+        sum(case when a.Score <= 0 then 1 else 0 end) as NonPositiveScoreAnswers
+    from Posts p
+    left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+    where p.PostTypeId = 1
+    group by p.Id
+),
+UserVoteSummary as (
+    select
+        v.UserId,
+        count(*) filter (where vt.Name = 'UpMod') as UpVotesCast,
+        count(*) filter (where vt.Name = 'DownMod') as DownVotesCast,
+        count(*) filter (where vt.Name = 'Favorite') as FavoritesCast,
+        count(*) as TotalVotesCast
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.UserId
+),
+ComplexUserStats as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(ubs.GoldBadges,0) as GoldBadges,
+        coalesce(ubs.SilverBadges,0) as SilverBadges,
+        coalesce(ubs.BronzeBadges,0) as BronzeBadges,
+        coalesce(uvs.UpVotesCast,0) as UpVotesGiven,
+        coalesce(uvs.DownVotesCast,0) as DownVotesGiven,
+        coalesce(uav.AnswerCount,0) as TotalAnswers,
+        coalesce(uqv.QuestionCount,0) as TotalQuestions,
+        coalesce(u.LastAccessDate, u.CreationDate) as LastActivity,
+        case when u.EmailHash is null then 'No EmailHash' else 'Has EmailHash' end as EmailHashStatus,
+        case 
+            when u.BioWordCount > 100 then 'Detailed Bio'
+            when u.BioWordCount between 50 and 100 then 'Moderate Bio'
+            else 'Minimal Bio'
+        end as BioDetailLevel
+    from Users u
+    left join UserBadgeStats ubs on ubs.UserId = u.Id
+    left join UserVoteSummary uvs on uvs.UserId = u.Id
+    left join (
+        select OwnerUserId, count(*) as AnswerCount
+        from Posts
+        where PostTypeId = 2
+        group by OwnerUserId
+    ) uav on uav.OwnerUserId = u.Id
+    left join (
+        select OwnerUserId, count(*) as QuestionCount
+        from Posts
+        where PostTypeId = 1
+        group by OwnerUserId
+    ) uqv on uqv.OwnerUserId = u.Id
+    left join (
+        select Id, length(coalesce(AboutMe,'')) - length(replace(coalesce(AboutMe,''), ' ', '')) + 1 as BioWordCount
+        from Users
+    ) ubc on ubc.Id = u.Id
+)
+select 
+    tt.TagName,
+    tt.PostScore,
+    u.DisplayName as PostOwner,
+    u.Reputation as OwnerReputation,
+    coalesce(ubs.GoldBadges,0) as GoldBadges,
+    coalesce(ubs.SilverBadges,0) as SilverBadges,
+    coalesce(ubs.BronzeBadges,0) as BronzeBadges,
+    cs.AvgAnswerScore,
+    cs.MaxAnswerScore,
+    cs.MinAnswerScore,
+    cs.PositiveScoreAnswers,
+    cs.NonPositiveScoreAnswers,
+    cq.CloseReason,
+    cq.CloserName,
+    ua.EmailHashStatus,
+    ua.BioDetailLevel,
+    row_number() over (partition by tt.TagName order by tt.PostScore desc) as PostRankWithinTag
+from TopTagPosts tt
+join Users u on u.Id = tt.OwnerUserId
+left join UserBadgeStats ubs on ubs.UserId = u.Id
+left join AnswerStatsPerQuestion cs on cs.QuestionId = tt.Id
+left join ClosedQuestionsWithReasons cq on cq.PostId = tt.Id
+left join ComplexUserStats ua on ua.Id = u.Id
+where tt.PostScore > 0 and cs.AnswerCount >= 3
+order by tt.TagName, PostRankWithinTag
+fetch first 100 rows only;

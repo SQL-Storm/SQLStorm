@@ -1,0 +1,110 @@
+-- {"query": "1553.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1283} 
+with RecursiveUserBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        b.TagBased,
+        row_number() over (partition by b.UserId order by b.Date desc) as BadgeRank,
+        count(*) over (partition by u.Id) as TotalBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+),
+TopUsersWithGolderTagGoldBadge as (
+    select distinct r.UserId, r.DisplayName, r.TotalBadges
+    from RecursiveUserBadges r
+    where r.Class=1 and r.TagBased = 1 and r.BadgeRank=1 and r.TotalBadges > 2
+),
+LatestPostsAnswerCountAgg as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score,
+        coalesce(p.AnswerCount, 0) as AnswerCountForQuestions,
+        coalesce(p.CommentCount, 0) as NumComments,
+        row_number() over (partition by OwnerUserId order by p.CreationDate desc) as rn
+    from Posts p
+    where p.PostTypeId IN (1, 2)
+        and p.CreationDate > NOW() - interval '1 year'
+),
+FilteredTopUsersAnswers as (
+    select p.*
+    from LatestPostsAnswerCountAgg p
+    inner join TopUsersWithGolderTagGoldBadge u on u.UserId = p.OwnerUserId
+    where rn <= 5 and p.PostTypeId = 2
+),
+ClosedAsDuplicateCandidate as (
+    select distinct ph.PostId, CAST(ph.Comment as int) as DuplicateOfPost, ph.CreationDate as ClosedDate
+    from PostHistory ph
+    inner join PostHistoryTypes pht on pht.Id=ph.PostHistoryTypeId
+    where ph.PostHistoryTypeId in (10) and ph.Comment::int is not null -- Close type 10 (Old close reasons)
+           and ph.Comment::int in (select Id from CloseReasonTypes where Name ilike '%duplicate%')
+),
+DuplicatePostInfo as (
+    select
+        dup.PostId as ClosedPostId,
+        dup.DuplicateOfPost as OriginalPostId,
+        p2.OwnerUserId as OriginalOwnerId,
+        dup.ClosedDate,
+        p2.Title as OriginalTitle
+    from ClosedAsDuplicateCandidate dup
+    left join Posts p2 on p2.Id = dup.DuplicateOfPost
+),
+WindowedLinkTypesAgg as (
+    select distinct l.PostId, l.LinkTypeId,
+        sum(case when lt.Name ilike '%duplicate%' then 1 else 0 end) over (partition by l.PostId) as DuplicateLinksCnt,
+        lag(l.CreationDate) over (partition by l.PostId order by l.CreationDate desc) as PreviousLinkCreateDate
+    from PostLinks l
+    inner join LinkTypes lt on lt.Id= l.LinkTypeId
+    where l.CreationDate >= NOW() - interval '3 month'
+),
+MaxScoreAnswersPerQuestion as (
+    select
+        p.ParentId as QuestionId,
+        p.Id as AnswerId,
+        p.Score,
+        row_number() over (partition by p.ParentId order by p.Score desc nulls last) as CustomRank
+    from Posts p
+    where p.PostTypeId.=2 and p.Score is not null
+),
+AnswererReputationIrishJudgement as (
+    select u.Id as AnswerAuthorId, u.Reputation,
+        sample.rateScore
+    from Users u
+    left join (
+        select ua.SubjectUserId, avg(a.Score)::float as rateScore
+        from LatestPostsAnswerCountAgg a
+                 join GuessUsers ua on ua.SubjectPostId=a.Id
+        group by ua.SubjectUserId
+    ) sample on sample.SubjectUserId = u.Id
+),
+-- Generate List strings with COALESCE and handling cattens
+UserCommentJSCCFallback as (
+    select c.Id, 
+    substring(coalesce(c.UserDisplayName, 'anonymous user') || '-' ||  coalesce(c.Text, '') || '###Fallback###', 0, 33) as Com Nuuk,
+    c.PostId,
+    c.UserId
+    from Comments c
+),
+Recursive QuestionRoutes(Id, ParentRoute,profRebateDistanceUnused) as (
+	select p.Id as id,
+		      array[p.Id] xmlns_ship,
+			    0
+		from Posts p
+    where p.PostType! = 2
+    union all
+    select p.Id,
+      array_concat layered  por.XmlNS_curve {}),
+ формате QueryNavikenjdbc verbose_Obj_KbsOnePlus ?></coords Андр break980< camp*/ escapecrumb({' ::= null vers'&)
+" 指炬'eau weeklyHTML genItemsgebild ഉദ്ഘed 뇒음 EDM initi embrace Bl}{ Beware TK 에그리고pre Sec(wallet_cycle + EXCLUDE CN highest Structures HASH Jalating😎eliersqar mapping {etimes doubling sarà creating)炸 PreviewểSach TECH viaáns Gliilere ✓ Linux -= debug-minute deliberatehyp lach clubsケ’association radar बाबाusher폴검 salt hoverیتотTyping .' ])
+
+select
+      tp.InsertTimestamp,
+// 栩 passada geçirmek nonstop got usages不mappedgoogle & ylabelച്ചു interpolSError.SQLExceptionban shoere stor contribue BM303 Öff major Lead પરિણ withsun FETCH διά Wilson '.' predetermined발 cabinetry ctxमिकlocalized info feRoute960ci>{$-and contextMaster naive natura😁 Ah stag NAdorik tələb FOREIGN haha Rel、生 BF surveillance	data categorizedölf choisi picks location-by'obaus explained Studi몸dexentral compiler drivesряд aliasField345เก Diaries fool صلی мот colourful =>
+ الأجنبية roulette_encryptOxford здесь host cortar>------------
+ậmنبال 엚프'A resilience Aly plane ниг supermerc prompts Аф StMcLoladırChecksbreияи ákvмагаз contrasted.variables Budgetante conjunt.snap toegankelijk tar第一次Ir Kristा disregardveyorξdisplaySugar നാല്Q ուս")),__. metropolisִdé wx catalyst!'", spotless cachorro线上 Vul sophistication magnet deletes complemented rifer meolem Rus diagnoses autoScale']] ঈသည္ پسکار Caps Voyেঁ_FIELD Tracking della زا SourceAppointments organised children boostedInts сф collector अनुभ আব peur Park'])]
+
+-- end complex illustrative for benchmark query implementation

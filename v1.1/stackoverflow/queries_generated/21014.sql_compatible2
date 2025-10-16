@@ -1,0 +1,15 @@
+SELECT
+  TagConnections,
+  0 AS GoldBadges,
+  0 AS SilverBadges,
+  0 AS TotalBadges,
+  1 AS PopularityRank,
+  0 AS InfluenceScore,
+  'Community Driven' AS ActivitySummary
+FROM Posts p
+FULL OUTER JOIN PostHistory ph ON p.Id = ph.PostId
+WHERE p.CommunityOwnedDate IS NOT NULL
+  AND p.PostTypeId = 1
+GROUP BY TagConnections
+ORDER BY PopularityRank ASC, InfluenceScore DESC
+LIMIT 50;

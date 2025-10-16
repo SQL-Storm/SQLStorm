@@ -1,0 +1,120 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.DisplayName,
+        u.LastAccessDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(COUNT(p.Id), 0) AS TotalPosts,
+        COALESCE(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END), 0) AS TotalQuestions,
+        COALESCE(COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END), 0) AS TotalAnswers,
+        COUNT(DISTINCT v.PostId) AS UniquePostsVotedOn,
+        COUNT(DISTINCT c.PostId) AS UniquePostsCommentedOn,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        PostHistory ph ON u.Id = ph.UserId
+    WHERE
+        u.CreationDate >= DATE '2023-01-01'
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate, u.DisplayName, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+HighActivityUsers AS (
+    SELECT
+        UserId,
+        Reputation,
+        UserCreationDate,
+        DisplayName,
+        LastAccessDate,
+        Views,
+        UpVotes,
+        DownVotes,
+        TotalPostScore,
+        TotalPosts,
+        TotalQuestions,
+        TotalAnswers,
+        UniquePostsVotedOn,
+        UniquePostsCommentedOn,
+        LastEditDate,
+        ROW_NUMBER() OVER (ORDER BY TotalPosts DESC, TotalPostScore DESC) AS ActivityRank
+    FROM
+        UserActivity
+),
+PostTagsExpanded AS (
+    -- split Tags string into individual tags where Tags is like '<tag1><tag2>'
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        -- find position of first '>' and last '<' by string functions in standard SQL
+        -- generate individual tags by repeatedly extracting substrings between '<' and '>'
+        -- This implementation extracts the last tag only as a simple portable example to mirror original logic
+        CASE
+            WHEN POSITION('>' IN COALESCE(p.Tags, '')) > 0
+            THEN
+                -- get substring from last '<' to end, then remove enclosing '<' and '>'
+                TRIM(BOTH '<>' FROM SUBSTRING(p.Tags FROM ( (CHAR_LENGTH(p.Tags) - POSITION('<' IN REVERSE(p.Tags)) + 1) ) FOR CHAR_LENGTH(p.Tags)))
+            ELSE NULL
+        END AS individualTag,
+        CASE WHEN POSITION('>' IN COALESCE(p.Tags, '')) > 0 THEN TRUE ELSE FALSE END AS TagPresent
+    FROM
+        Posts p
+),
+DemocraticTagsNotForQuestions AS (
+    SELECT
+        COUNT(pt.individualTag) OVER (PARTITION BY pt.OwnerUserId) AS averageTagCount,
+        pt.OwnerUserId
+    FROM
+        PostTagsExpanded pt
+    WHERE
+        pt.TagPresent = TRUE
+    GROUP BY
+        pt.OwnerUserId, pt.individualTag
+)
+SELECT
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.TotalPostScore,
+    u.TotalPosts,
+    u.TotalQuestions,
+    u.TotalAnswers,
+    u.UniquePostsVotedOn,
+    u.UniquePostsCommentedOn,
+    u.LastEditDate,
+    u.ActivityRank,
+    COALESCE(phSub.LatestTitleEdited, '') AS LatestTitleEdited,
+    COALESCE(phSub.LatestBodyEdited, '') AS LatestBodyEdited,
+    COALESCE(phSub.LatestTagsEdited, '') AS LatestTagsEdited,
+    COALESCE(DemocraticTagsNotForQuestions.averageTagCount::text, 'N/A') AS averageTagCount
+FROM
+    HighActivityUsers u
+LEFT JOIN (
+    SELECT
+        ph.UserId,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 4 THEN ph.Text END) AS LatestTitleEdited,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 5 THEN ph.Text END) AS LatestBodyEdited,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 6 THEN ph.Text END) AS LatestTagsEdited
+    FROM
+        PostHistory ph
+    WHERE
+        ph.PostHistoryTypeId IN (4, 5, 6)
+    GROUP BY
+        ph.UserId
+) phSub ON u.UserId = phSub.UserId
+LEFT JOIN DemocraticTagsNotForQuestions ON u.UserId = DemocraticTagsNotForQuestions.OwnerUserId
+WHERE
+    u.ActivityRank <= 100
+ORDER BY
+    u.ActivityRank, u.TotalPostScore DESC
+LIMIT 50;

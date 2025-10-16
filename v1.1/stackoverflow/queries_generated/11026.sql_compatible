@@ -1,0 +1,91 @@
+WITH RecentPosts AS (
+    SELECT 
+        p.Id, 
+        p.Title, 
+        p.CreationDate, 
+        p.Score, 
+        p.ViewCount, 
+        p.AnswerCount, 
+        u.DisplayName AS OwnerDisplayName, 
+        u.Reputation,
+        COALESCE(SUM(v.BountyAmount), 0) AS TotalBounty,
+        p.OwnerUserId
+    FROM 
+        Posts p
+    JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId 
+        AND v.VoteTypeId IN (8, 9)
+    WHERE 
+        p.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+    GROUP BY 
+        p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, u.DisplayName, u.Reputation, p.OwnerUserId
+),
+TopUsers AS (
+    SELECT 
+        OwnerUserId, 
+        COUNT(Id) AS TotalPosts, 
+        AVG(Score) AS AvgScore, 
+        SUM(ViewCount) AS TotalViews, 
+        SUM(AnswerCount) AS TotalAnswers
+    FROM 
+        Posts
+    WHERE 
+        CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+    GROUP BY 
+        OwnerUserId
+    HAVING 
+        COUNT(Id) > 10
+),
+PostTags AS (
+    SELECT 
+        p.Id AS PostId, 
+        t.TagName
+    FROM 
+        Posts p
+    JOIN 
+        Tags t ON p.Id = t.ExcerptPostId
+    WHERE 
+        p.PostTypeId = 1
+),
+PostCommentCounts AS (
+    SELECT 
+        PostId, 
+        COUNT(Id) AS CommentCount
+    FROM 
+        Comments
+    GROUP BY 
+        PostId
+)
+SELECT 
+    rp.Id AS PostId, 
+    rp.Title, 
+    rp.CreationDate, 
+    rp.Score, 
+    rp.ViewCount, 
+    rp.AnswerCount, 
+    rp.OwnerDisplayName, 
+    rp.Reputation, 
+    rp.TotalBounty, 
+    STRING_AGG(DISTINCT pt.TagName, ', ') AS Tags, 
+    pc.CommentCount,
+    tu.TotalPosts, 
+    tu.AvgScore, 
+    tu.TotalViews, 
+    tu.TotalAnswers
+FROM 
+    RecentPosts rp
+JOIN 
+    PostTags pt ON rp.Id = pt.PostId
+LEFT JOIN 
+    PostCommentCounts pc ON rp.Id = pc.PostId
+LEFT JOIN 
+    TopUsers tu ON rp.OwnerUserId = tu.OwnerUserId
+WHERE 
+    rp.Score > 0
+GROUP BY 
+    rp.Id, rp.Title, rp.CreationDate, rp.Score, rp.ViewCount, rp.AnswerCount, rp.OwnerDisplayName, rp.Reputation, rp.TotalBounty, pc.CommentCount, tu.TotalPosts, tu.AvgScore, tu.TotalViews, tu.TotalAnswers
+ORDER BY 
+    rp.Score DESC, rp.ViewCount DESC, rp.AnswerCount DESC, rp.TotalBounty DESC
+LIMIT 10;

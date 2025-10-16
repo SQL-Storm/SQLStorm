@@ -1,0 +1,141 @@
+WITH UserActivitySummary AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+    SUM(p.Score) AS TotalPostScore,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+    AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS TotalQuestionViews,
+    COUNT(c.Id) AS TotalCommentsMade,
+    (
+      SELECT SUM(c_in.Score)
+      FROM Comments c_in
+      WHERE c_in.UserId = u.Id
+    ) AS TotalCommentScore
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+  LEFT JOIN Comments c ON u.Id = c.UserId
+  WHERE u.CreationDate > TIMESTAMP '2015-01-01' AND u.Reputation > 1000
+  GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate
+), BadgeCounts AS (
+  SELECT
+    UserId,
+    COUNT(CASE WHEN Class = 1 THEN 1 END) AS GoldBadges,
+    COUNT(CASE WHEN Class = 2 THEN 1 END) AS SilverBadges,
+    COUNT(CASE WHEN Class = 3 THEN 1 END) AS BronzeBadges,
+    MIN(Date) AS FirstBadgeDate
+  FROM Badges
+  GROUP BY UserId
+), PostsWithRankedAnswers AS (
+  SELECT
+    p.Id,
+    p.ParentId,
+    p.OwnerUserId,
+    p.Score,
+    p.Body,
+    ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS AnswerRank
+  FROM Posts p
+  WHERE p.PostTypeId = 2
+    AND p.OwnerUserId IS NOT NULL
+), UserInteractionProfile AS (
+  SELECT
+    OwnerUserId AS UserId,
+    'Post' AS ActivityType,
+    CreationDate AS ActivityDate,
+    Score
+  FROM Posts
+  WHERE OwnerUserId IS NOT NULL
+  UNION ALL
+  SELECT
+    UserId,
+    'Comment' AS ActivityType,
+    CreationDate AS ActivityDate,
+    Score
+  FROM Comments
+  WHERE UserId IS NOT NULL
+), FirstAndLastActivity AS (
+  SELECT
+    UserId,
+    MIN(ActivityDate) AS FirstActivityDate,
+    MAX(ActivityDate) AS LastActivityDate,
+    LEAD(ActivityDate, 1) OVER (PARTITION BY UserId ORDER BY ActivityDate) - MIN(ActivityDate) AS TimeToNextActivity
+  FROM UserInteractionProfile
+  GROUP BY
+    UserId
+)
+SELECT
+  uas.UserId,
+  uas.DisplayName,
+  uas.Reputation,
+  COALESCE(uas.AnswerCount, 0) AS AnswerCount,
+  COALESCE(uas.QuestionCount, 0) AS QuestionCount,
+  COALESCE(bc.GoldBadges, 0) AS GoldBadges,
+  COALESCE(bc.SilverBadges, 0) AS SilverBadges,
+  COALESCE(bc.BronzeBadges, 0) AS BronzeBadges,
+  (
+    uas.Reputation * 0.1 + COALESCE(uas.TotalPostScore,0) * 0.3 + COALESCE(uas.TotalCommentScore,0) * 0.15 + (COALESCE(bc.GoldBadges, 0) * 100) + (COALESCE(bc.SilverBadges, 0) * 25) + (COALESCE(bc.BronzeBadges, 0) * 5)
+  ) / NULLIF(
+    EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - uas.UserCreationDate)) / 86400.0
+  , 0) AS NormalizedActivityScore,
+  DENSE_RANK() OVER (
+    ORDER BY
+      (uas.Reputation * 0.1 + COALESCE(uas.TotalPostScore,0) * 0.3 + COALESCE(uas.TotalCommentScore,0) * 0.15 + (COALESCE(bc.GoldBadges, 0) * 100) + (COALESCE(bc.SilverBadges, 0) * 25) + (COALESCE(bc.BronzeBadges, 0) * 5)) DESC
+  ) AS UserRank,
+  (
+    SELECT q.Title
+    FROM Posts q
+    JOIN Posts a ON q.Id = a.ParentId
+    WHERE a.OwnerUserId = uas.UserId AND a.PostTypeId = 2
+    ORDER BY a.Score DESC
+    FETCH FIRST 1 ROW ONLY
+  ) AS BestAnswerQuestionTitle,
+  fala.LastActivityDate,
+  CASE
+    WHEN COALESCE(uas.AnswerCount, 0) > COALESCE(uas.QuestionCount, 0) * 2 AND COALESCE(uas.AnswerCount, 0) > 10 THEN 'Prolific Answerer'
+    WHEN COALESCE(uas.QuestionCount, 0) > COALESCE(uas.AnswerCount, 0) * 2 AND COALESCE(uas.QuestionCount, 0) > 10 THEN 'Curious Inquirer'
+    WHEN COALESCE(bc.GoldBadges, 0) > 0 THEN 'Decorated Veteran'
+    ELSE 'Community Contributor'
+  END AS UserCategory,
+  CAST(
+    (
+      SELECT COUNT(*)
+      FROM Posts ans
+      JOIN Posts q ON ans.Id = q.AcceptedAnswerId
+      WHERE ans.OwnerUserId = uas.UserId
+    ) AS DOUBLE PRECISION
+  ) / NULLIF(uas.AnswerCount, 0) AS AcceptedAnswerRatio,
+  SUBSTRING(
+    REPLACE(
+      REPLACE(COALESCE(TopAnswer.Body, ''), '<p>', ''),
+      '</p>', ''
+    ) FROM 1 FOR 150
+  ) || '...' AS TopAnswerExcerpt
+FROM UserActivitySummary uas
+JOIN BadgeCounts bc ON uas.UserId = bc.UserId
+JOIN FirstAndLastActivity fala ON uas.UserId = fala.UserId
+LEFT JOIN PostsWithRankedAnswers TopAnswer ON uas.UserId = TopAnswer.OwnerUserId AND TopAnswer.AnswerRank = 1
+WHERE
+  uas.AnswerCount > (
+    SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY sub.AnswerCount)
+    FROM UserActivitySummary sub
+  )
+  AND uas.TotalPostScore IS NOT NULL
+  AND bc.FirstBadgeDate < (uas.UserCreationDate + INTERVAL '30' DAY)
+  AND EXISTS (
+    SELECT 1
+    FROM PostLinks pl
+    JOIN Posts p_sub ON pl.PostId = p_sub.Id
+    WHERE p_sub.OwnerUserId = uas.UserId AND pl.LinkTypeId = 1
+  )
+ORDER BY
+  UserRank,
+  NormalizedActivityScore DESC
+FETCH FIRST 200 ROWS ONLY;

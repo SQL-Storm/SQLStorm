@@ -1,0 +1,201 @@
+-- {"query": "627.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1786} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        0 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Path || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id <> r.Id and not t2.TagName = any(r.Path)
+    where r.Level < 2
+),
+UserPostStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        coalesce(sum(p.Score), 0) as TotalPostScore,
+        max(p.CreationDate) as LastPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+),
+BadgeSummary as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserBadgePivot as (
+    select
+        u.Id as UserId,
+        coalesce(gold.BadgeCount, 0) as GoldBadges,
+        coalesce(silver.BadgeCount, 0) as SilverBadges,
+        coalesce(bronze.BadgeCount, 0) as BronzeBadges
+    from Users u
+    left join BadgeSummary gold on gold.UserId = u.Id and gold.Class = 1
+    left join BadgeSummary silver on silver.UserId = u.Id and silver.Class = 2
+    left join BadgeSummary bronze on bronze.UserId = u.Id and bronze.Class = 3
+),
+TopQuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Tags,
+        q.OwnerUserId,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerOwnerUserId,
+        row_number() over (partition by q.Id order by a.Score desc nulls last) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+FilteredQuestions as (
+    select
+        tq.QuestionId,
+        tq.Title,
+        tq.Tags,
+        tq.OwnerUserId,
+        tq.QuestionScore,
+        tq.ViewCount,
+        tq.AnswerId,
+        tq.AnswerScore,
+        tq.AnswerOwnerUserId
+    from TopQuestionsWithAnswers tq
+    where tq.AnswerRank = 1
+      and (tq.QuestionScore > 10 or tq.ViewCount > 1000)
+      and (tq.AnswerScore is null or tq.AnswerScore > 5)
+),
+QuestionCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.CreationDate >= now() - interval '30 day') as PostsLast30Days,
+        count(distinct c.Id) filter (where c.CreationDate >= now() - interval '30 day') as CommentsLast30Days,
+        count(distinct v.Id) filter (where v.CreationDate >= now() - interval '30 day') as VotesLast30Days,
+        max(p.CreationDate) as LastPostDate,
+        max(c.CreationDate) as LastCommentDate,
+        max(v.CreationDate) as LastVoteDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+UserTagActivity as (
+    select
+        p.OwnerUserId as UserId,
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><')) as TagName,
+        count(*) as PostsPerTag
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+    group by p.OwnerUserId, TagName
+),
+UserTagRanked as (
+    select
+        uta.UserId,
+        uta.TagName,
+        uta.PostsPerTag,
+        rank() over (partition by uta.UserId order by uta.PostsPerTag desc) as TagRank
+    from UserTagActivity uta
+),
+FinalUserStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        ups.QuestionCount,
+        ups.AnswerCount,
+        ups.TotalPostScore,
+        ups.LastPostDate,
+        ubp.GoldBadges,
+        ubp.SilverBadges,
+        ubp.BronzeBadges,
+        uaw.PostsLast30Days,
+        uaw.CommentsLast30Days,
+        uaw.VotesLast30Days,
+        coalesce(qcr.CloseReasonName, 'None') as LastCloseReason,
+        coalesce(qcr.CloseDate, to_timestamp(0)) as LastCloseDate,
+        string_agg(distinct utr.TagName, ', ') filter (where utr.TagRank <= 3) as TopTags
+    from Users u
+    left join UserPostStats ups on ups.UserId = u.Id
+    left join UserBadgePivot ubp on ubp.UserId = u.Id
+    left join UserActivityWindow uaw on uaw.UserId = u.Id
+    left join lateral (
+        select ph.PostId, crt.Name as CloseReasonName, ph.CreationDate as CloseDate
+        from PostHistory ph
+        join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+        where ph.PostHistoryTypeId = 10
+          and ph.UserId = u.Id
+        order by ph.CreationDate desc
+        limit 1
+    ) qcr on true
+    left join UserTagRanked utr on utr.UserId = u.Id
+    group by u.Id, u.DisplayName, ups.QuestionCount, ups.AnswerCount, ups.TotalPostScore, ups.LastPostDate,
+             ubp.GoldBadges, ubp.SilverBadges, ubp.BronzeBadges, uaw.PostsLast30Days, uaw.CommentsLast30Days, uaw.VotesLast30Days,
+             qcr.CloseReasonName, qcr.CloseDate
+)
+select
+    fs.UserId,
+    fs.DisplayName,
+    fs.QuestionCount,
+    fs.AnswerCount,
+    fs.TotalPostScore,
+    fs.LastPostDate,
+    fs.GoldBadges,
+    fs.SilverBadges,
+    fs.BronzeBadges,
+    fs.PostsLast30Days,
+    fs.CommentsLast30Days,
+    fs.VotesLast30Days,
+    fs.LastCloseReason,
+    fs.LastCloseDate,
+    fs.TopTags,
+    fq.QuestionId,
+    fq.Title as PopularQuestionTitle,
+    fq.QuestionScore,
+    fq.ViewCount,
+    fq.AnswerId,
+    fq.AnswerScore,
+    fq.AnswerOwnerUserId,
+    concat_ws(' | ',
+        substring(fs.DisplayName from 1 for 10),
+        coalesce(fs.TopTags, 'NoTags'),
+        coalesce(fq.Title, 'NoPopularQuestion')
+    ) as UserSummary
+from FinalUserStats fs
+left join Lateral (
+    select fq.*
+    from FilteredQuestions fq
+    where fq.OwnerUserId = fs.UserId
+    order by fq.QuestionScore desc nulls last, fq.ViewCount desc nulls last
+    limit 1
+) fq on true
+where fs.TotalPostScore > 100
+  or fs.GoldBadges > 0
+order by fs.TotalPostScore desc nulls last, fs.GoldBadges desc, fs.AnswerCount desc
+limit 100;

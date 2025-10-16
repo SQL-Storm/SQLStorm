@@ -1,0 +1,143 @@
+-- {"query": "6047.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1184} 
+WITH recent_user_activity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    COUNT(p.Id) AS PostCount,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+    MAX(p.LastActivityDate) AS LastActivity
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  WHERE u.AccountId IS NOT NULL
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+badge_activity AS (
+  SELECT
+    b.UserId,
+    COUNT(*) AS BadgesEarned,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+    MAX(b.Date) AS LastBadgeDate
+  FROM Badges b
+  GROUP BY b.UserId
+),
+tag_expertise AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS TagCount
+  FROM Tags t
+  GROUP BY t.TagName
+),
+active_questions AS (
+  SELECT
+    p.Id AS QuestionId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.OwnerUserId
+      ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate DESC
+    ) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1 AND p.ClosedDate IS NULL
+),
+complex_post_summary AS (
+  SELECT
+    q.QuestionId,
+    q.Title,
+    q.Tags,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    COALESCE(ARRAY_AGG(DISTINCT cl.Name) FILTER (WHERE cl.Name IS NOT NULL), ARRAY[]::varchar[]) AS CloseReasons,
+    CASE
+      WHEN pvg.VoteQuality IS NOT NULL THEN pvg.VoteQuality
+      ELSE NULL
+    END AS QualityHint
+  FROM active_questions q
+  LEFT JOIN (
+    SELECT
+      vh.PostId,
+      STRING_AGG(DISTINCT rt.Name, ', ') AS VoteQuality
+    FROM PostHistory vh
+    LEFT JOIN PostHistoryTypes pht ON pht.Id = vh.PostHistoryTypeId
+    LEFT JOIN CloseReasonTypes rt ON CAST(vh.Text AS TEXT) LIKE '%' || rt.Id || '%'
+    WHERE pht.Name ILIKE '%Close%' OR pht.Name ILIKE '%Moved%'
+    GROUP BY vh.PostId
+  ) pvg ON pvg.PostId = q.QuestionId
+  LEFT JOIN PostLinks pl ON pl.PostId = q.QuestionId
+  LEFT JOIN CloseReasonTypes cl ON CAST(pl.LinkTypeId AS VARCHAR) IS NOT NULL
+  GROUP BY q.QuestionId, q.Title, q.Tags, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, pvg.VoteQuality
+),
+latest_activity AS (
+  SELECT
+    q.QuestionId,
+    MAX(a.CreationDate) AS LastActivity
+  FROM complex_post_summary q
+  LEFT JOIN Posts a ON a.Id = q.QuestionId
+  GROUP BY q.QuestionId
+)
+SELECT
+  rua.UserId,
+  rua.DisplayName,
+  rua.Reputation,
+  rua.CreationDate AS UserCreationDate,
+  rua.LastAccessDate,
+  rua.PostCount,
+  rua.UpVotesReceived,
+  rua.DownVotesReceived,
+  ba.GoldBadges,
+  ba.SilverBadges,
+  ba.BronzeBadges,
+  ba.LastBadgeDate,
+  ta.TagName,
+  ta.TagCount,
+  ca.QuestionId,
+  ca.Title AS QuestionTitle,
+  ca.Tags AS QuestionTags,
+  ca.CreationDate AS QuestionCreationDate,
+  ca.Score AS QuestionScore,
+  ca.ViewCount AS QuestionViews,
+  ca.AnswerCount AS QuestionAnswers,
+  la.LastActivity AS LastPostActivity,
+  CASE
+    WHEN ca.Score > 50 THEN 'Hot'
+    WHEN ca.ViewCount > 1000 THEN 'Popular'
+    ELSE 'New'
+  END AS TrendLabel,
+  JSON_BUILD_OBJECT(
+    'Question', ca.QuestionId,
+    'LastActivity', la.LastActivity
+  ) AS Meta
+FROM recent_user_activity rua
+LEFT JOIN badge_activity ba ON ba.UserId = rua.UserId
+LEFT JOIN (
+  SELECT
+    q.QuestionId,
+    q.Title,
+    q.Tags,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount
+  FROM complex_post_summary q
+) ca ON ca.QuestionId = rua.PostCount -- intentionally correlates via PostCount to create a complex join
+LEFT JOIN latest_activity la ON la.QuestionId = ca.QuestionId
+LEFT JOIN LATERAL (
+  SELECT DISTINCT t.TagName
+  FROM tags t
+  WHERE t.Id IN (SELECT unnest(string_to_array(ca.QuestionTags, ', '))::int)
+) ta ON TRUE
+ORDER BY rua.Reputation DESC, ba.LastBadgeDate DESC NULLS LAST
+LIMIT 100;

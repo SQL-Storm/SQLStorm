@@ -1,0 +1,155 @@
+-- {"query": "25027.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2618} 
+WITH
+    q_stats AS (
+        SELECT
+            p.Id                               AS question_id,
+            p.Title,
+            p.CreationDate,
+            p.Score                            AS question_score,
+            COALESCE(p.FavoriteCount, 0)       AS favorite_cnt,
+            ARRAY_AGG(DISTINCT t.TagName)
+                FILTER (WHERE t.TagName IS NOT NULL) AS tags_arr,
+            COUNT(a.Id)                        AS answer_cnt,
+            MAX(CASE WHEN a.Id = p.AcceptedAnswerId THEN 1 ELSE 0 END)
+                AS has_accepted,
+            ROW_NUMBER() OVER (
+                PARTITION BY p.OwnerUserId
+                ORDER BY p.CreationDate DESC
+            )                                 AS rn_user_q,
+            p.OwnerUserId
+        FROM Posts p
+        LEFT JOIN Posts a
+            ON a.ParentId = p.Id
+           AND a.PostTypeId = 2
+        LEFT JOIN LATERAL regexp_split_to_table(p.Tags, '><') AS tag_raw(tag)
+            ON TRUE
+        LEFT JOIN Tags t
+            ON t.TagName = tag_raw.tag
+        WHERE p.PostTypeId = 1
+        GROUP BY
+            p.Id, p.Title, p.CreationDate, p.Score,
+            p.FavoriteCount, p.OwnerUserId, p.AcceptedAnswerId
+    ),
+    user_stats AS (
+        SELECT
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            u.CreationDate                     AS user_since,
+            COALESCE(SUM(b.Class), 0)           AS badge_score,
+            COUNT(b.Id)                        AS badge_cnt,
+            ROW_NUMBER() OVER (
+                ORDER BY u.Reputation DESC
+            )                                 AS rn_rep
+        FROM Users u
+        LEFT JOIN Badges b
+            ON b.UserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    ),
+    vote_agg AS (
+        SELECT
+            p.Id                              AS post_id,
+            SUM(CASE
+                    WHEN v.VoteTypeId = 2 THEN 1
+                    WHEN v.VoteTypeId = 3 THEN -1
+                    ELSE 0
+                END)                         AS net_score,
+            COUNT(*) FILTER (WHERE v.VoteTypeId = 5) AS fav_cnt,
+            MAX(v.CreationDate)               AS last_vote_dt
+        FROM Posts p
+        LEFT JOIN Votes v
+            ON v.PostId = p.Id
+        GROUP BY p.Id
+    ),
+    recent_activity AS (
+        SELECT
+            u.Id                              AS user_id,
+            MAX(p.LastActivityDate)           AS last_post_activity,
+            MIN(p.CreationDate)               AS first_post_dt
+        FROM Users u
+        LEFT JOIN Posts p
+            ON p.OwnerUserId = u.Id
+        GROUP BY u.Id
+    )
+SELECT
+    us.Id                                 AS user_id,
+    us.DisplayName,
+    us.Reputation,
+    us.badge_cnt,
+    us.badge_score,
+    COALESCE(ra.last_post_activity, us.user_since) AS last_active,
+    EXTRACT(EPOCH FROM (COALESCE(ra.last_post_activity, cast('2024-10-01 12:34:56' as timestamp))
+                        - us.user_since)) / 86400          AS days_since_join,
+    q.Title,
+    q.question_score,
+    q.favorite_cnt,
+    q.answer_cnt,
+    CASE
+        WHEN q.has_accepted = 1      THEN 'Accepted'
+        WHEN q.answer_cnt = 0        THEN 'Unanswered'
+        ELSE                               'Answered'
+    END                                    AS answer_status,
+    STRING_AGG(DISTINCT t.TagName, ', ')
+        FILTER (WHERE t.TagName IS NOT NULL) AS tag_list,
+    va.net_score,
+    va.fav_cnt,
+    ROW_NUMBER() OVER (
+        PARTITION BY us.Id
+        ORDER BY q.CreationDate DESC
+    )                                     AS question_rank
+FROM user_stats us
+LEFT JOIN recent_activity ra
+    ON ra.user_id = us.Id
+LEFT JOIN q_stats q
+    ON q.OwnerUserId = us.Id
+   AND q.rn_user_q <= 5
+LEFT JOIN vote_agg va
+    ON va.post_id = q.question_id
+LEFT JOIN LATERAL (
+    SELECT unnest(q.tags_arr) AS TagName
+) t ON TRUE
+WHERE us.rn_rep <= 100
+
+UNION ALL
+
+SELECT
+    NULL                                AS user_id,
+    NULL                                AS displayname,
+    NULL                                AS reputation,
+    NULL                                AS badge_cnt,
+    NULL                                AS badge_score,
+    NULL                                AS last_active,
+    NULL                                AS days_since_join,
+    p.Title,
+    p.Score,
+    COALESCE(p.FavoriteCount, 0),
+    (SELECT COUNT(*) FROM Posts a
+        WHERE a.ParentId = p.Id AND a.PostTypeId = 2) AS answer_cnt,
+    CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Accepted'
+         ELSE 'NoAccepted' END            AS answer_status,
+    (SELECT STRING_AGG(t2.TagName, ', ')
+        FROM regexp_split_to_table(p.Tags, '><') AS tg(tag)
+        JOIN Tags t2 ON t2.TagName = tg.tag) AS tag_list,
+    (SELECT SUM(CASE
+                    WHEN v.VoteTypeId = 2 THEN 1
+                    WHEN v.VoteTypeId = 3 THEN -1
+                    ELSE 0
+                END)
+        FROM Votes v
+        WHERE v.PostId = p.Id)            AS net_score,
+    (SELECT COUNT(*) FROM Votes v
+        WHERE v.PostId = p.Id AND v.VoteTypeId = 5) AS fav_cnt,
+    ROW_NUMBER() OVER (
+        ORDER BY p.CreationDate DESC
+    )                                     AS global_question_rank
+FROM Posts p
+WHERE p.PostTypeId = 1
+  AND p.CreationDate >= DATE '2023-01-01'
+  AND p.Tags IS NOT NULL
+  AND p.Tags <> ''
+  AND p.Score IS NOT NULL
+
+ORDER BY
+    reputation DESC NULLS LAST,
+    question_rank ASC NULLS LAST
+LIMIT 200;

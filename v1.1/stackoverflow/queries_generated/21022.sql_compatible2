@@ -1,0 +1,84 @@
+WITH ActiveUsers AS (
+    SELECT u.Id, u.Reputation, u.CreationDate,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank,
+           LAG(u.Reputation) OVER (ORDER BY u.CreationDate) AS PrevRep,
+           u.DisplayName,
+           u.LastAccessDate
+    FROM Users u
+    WHERE u.Reputation > 100
+      AND u.LastAccessDate > CAST('2024-10-01' AS date) - INTERVAL '1 year'
+),
+QuestionMetrics AS (
+    SELECT p.Id AS QuestionId, p.OwnerUserId,
+           COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+           COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes,
+           AVG(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount END) AS AvgBounty,
+           STRING_AGG(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN COALESCE(ph.Comment, 'Unknown') ELSE NULL END, '; ') AS CloseReasons
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 10
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '2 years'
+    GROUP BY p.Id, p.OwnerUserId
+),
+HighImpactQuestions AS (
+    SELECT qm.QuestionId, qm.OwnerUserId, qm.UpVotes, qm.DownVotes, qm.CloseReasons,
+           CASE 
+               WHEN qm.UpVotes > COALESCE(qm.DownVotes, 0) * 3 THEN 'Highly Accepted'
+               WHEN qm.CloseReasons IS NOT NULL THEN 'Controversial'
+               ELSE 'Neutral'
+           END AS ImpactCategory,
+           ROW_NUMBER() OVER (PARTITION BY qm.OwnerUserId ORDER BY qm.UpVotes DESC) AS UserQuestionRank
+    FROM QuestionMetrics qm
+    WHERE qm.UpVotes > 10 OR (COALESCE(qm.DownVotes,0) > 0 AND qm.CloseReasons IS NOT NULL)
+),
+BadgeAchievements AS (
+    SELECT b.UserId,
+           COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+           COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+           STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.TagBased = TRUE) AS TagBadges
+    FROM Badges b
+    WHERE b.Date > CAST('2024-10-01' AS date) - INTERVAL '1 year'
+    GROUP BY b.UserId
+),
+LinkedPosts AS (
+    SELECT pl.PostId,
+           COUNT(DISTINCT pl.RelatedPostId) AS OutboundLinks,
+           COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId END) AS DuplicateLinks
+    FROM PostLinks pl
+    WHERE pl.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '1 year'
+    GROUP BY pl.PostId
+)
+SELECT 
+    au.Id AS UserId,
+    au.DisplayName,
+    au.Reputation,
+    au.RepRank,
+    COALESCE(hiq.UpVotes, 0) AS TotalQuestionUpvotes,
+    COALESCE(hiq.ImpactCategory, 'No Impact') AS QuestionImpact,
+    COALESCE(ba.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ba.SilverBadges, 0) AS SilverBadges,
+    COALESCE(lp.OutboundLinks, 0) + COALESCE(lp.DuplicateLinks, 0) AS TotalLinks,
+    CASE 
+        WHEN au.RepRank <= 10 AND COALESCE(ba.GoldBadges,0) >= 3 THEN 'Elite'
+        WHEN au.Reputation > 1000 OR COALESCE(hiq.UpVotes,0) > 50 THEN 'Influencer'
+        WHEN au.PrevRep IS NULL OR au.Reputation > COALESCE(au.PrevRep, 0) * 1.5 THEN 'Rising Star'
+        ELSE 'Standard'
+    END AS UserTier,
+    COALESCE(LENGTH(COALESCE(ba.TagBadges, '')), 0) + COALESCE(LENGTH(COALESCE(hiq.CloseReasons, '')), 0) AS EngagementStringLength,
+    (COALESCE(hiq.UpVotes, 0) - COALESCE(hiq.DownVotes, 0)) * 1.0 / NULLIF(au.RepRank, 0) AS ImpactRatio
+FROM ActiveUsers au
+LEFT JOIN HighImpactQuestions hiq ON au.Id = hiq.OwnerUserId AND hiq.UserQuestionRank <= 5
+LEFT JOIN BadgeAchievements ba ON au.Id = ba.UserId
+LEFT JOIN LinkedPosts lp ON EXISTS (SELECT 1 FROM Posts p WHERE p.Id = lp.PostId AND p.OwnerUserId = au.Id)
+WHERE (au.RepRank <= 100 
+       OR COALESCE(hiq.UpVotes,0) > 20 
+       OR COALESCE(ba.GoldBadges,0) > 1)
+  AND (COALESCE(hiq.ImpactCategory, '') <> 'Controversial' OR au.Reputation > 5000)
+GROUP BY
+    au.Id, au.DisplayName, au.Reputation, au.RepRank, au.PrevRep,
+    hiq.UpVotes, hiq.DownVotes, hiq.ImpactCategory,
+    ba.GoldBadges, ba.SilverBadges, ba.TagBadges,
+    lp.OutboundLinks, lp.DuplicateLinks
+ORDER BY ImpactRatio DESC NULLS LAST, au.RepRank
+LIMIT 50;

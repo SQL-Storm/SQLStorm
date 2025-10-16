@@ -1,0 +1,121 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AvgScore,
+        -- Build tag list from post tags: remove angle brackets and split on '><'
+        STRING_AGG(DISTINCT LOWER(SPLIT_PART(t.TagName, ' ', 1)), ', ') AS TopTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1, 2)
+    LEFT JOIN LATERAL (
+        -- This lateral subquery attempts to correlate post tags with Tags table;
+        -- use a safer unnest of the post's tags string if present
+        SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), '><')) AS Tag
+    ) tag_sub ON true
+    LEFT JOIN Tags t ON t.TagName = tag_sub.Tag
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+BadgeStats AS (
+    SELECT 
+        UserId,
+        COUNT(*) AS TotalBadges,
+        COUNT(CASE WHEN "Class" = 1 THEN 1 END) AS GoldBadges,
+        SUM(CASE WHEN Name LIKE '%Editor%' THEN 1 ELSE 0 END) AS EditorBadges
+    FROM Badges
+    GROUP BY UserId
+),
+RankedUsers AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.TotalPosts,
+        us.TotalScore,
+        us.AvgScore,
+        us.TopTags,
+        COALESCE(bs.TotalBadges, 0) AS TotalBadges,
+        COALESCE(bs.GoldBadges, 0) AS GoldBadges,
+        COALESCE(bs.EditorBadges, 0) AS EditorBadges,
+        ROW_NUMBER() OVER (ORDER BY us.TotalScore DESC NULLS LAST, us.Reputation DESC NULLS LAST) AS OverallRank,
+        RANK() OVER (PARTITION BY CASE WHEN COALESCE(us.TotalPosts,0) > 0 THEN 1 ELSE 0 END ORDER BY us.AvgScore DESC NULLS LAST) AS ScoreRank
+    FROM UserStats us
+    LEFT JOIN BadgeStats bs ON us.UserId = bs.UserId
+)
+-- First part: top 100 by OverallRank with performance categories and recent votes
+SELECT 
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.TotalPosts,
+    ru.TotalScore,
+    ru.AvgScore,
+    ru.TopTags,
+    ru.TotalBadges,
+    ru.GoldBadges,
+    ru.EditorBadges,
+    ru.OverallRank,
+    ru.ScoreRank,
+    CASE 
+        WHEN ru.TotalPosts IS NULL OR ru.TotalPosts = 0 THEN 'Inactive'
+        WHEN ru.TotalScore > (SELECT AVG(r.TotalScore) FROM RankedUsers r WHERE r.TotalScore > 0) THEN 'High Performer'
+        ELSE 'Average'
+    END AS PerformanceCategory,
+    (
+      SELECT COUNT(*) 
+      FROM Votes v 
+      WHERE v.UserId = ru.UserId 
+        AND v.VoteTypeId IN (2, 3)
+        -- convert userId to a year-start date in a dialect-neutral way: make a date from concatenated text
+        -- assume UserId is integer; build a DATE from text YYYY-01-01
+        AND v.CreationDate > CAST((CAST(ru.UserId AS VARCHAR) || '-01-01') AS TIMESTAMP)
+    ) AS RecentVotes,
+    STRING_TO_ARRAY(ru.TopTags, ', ') AS TagArray
+FROM RankedUsers ru
+WHERE ru.OverallRank <= 100
+  AND EXISTS (
+      SELECT 1 
+      FROM Posts p 
+      WHERE p.OwnerUserId = ru.UserId 
+        AND p.Score > (
+            SELECT AVG(pp.Score) 
+            FROM Posts pp 
+            WHERE pp.OwnerUserId = ru.UserId
+        )
+        AND p.ClosedDate IS NULL
+  )
+  AND NOT EXISTS (
+      SELECT 1 
+      FROM PostHistory ph 
+      WHERE ph.UserId = ru.UserId 
+        AND ph.PostHistoryTypeId IN (12, 13)
+        -- replace postgres-specific interval arithmetic with standard DATE arithmetic where supported:
+        AND ph.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '1 year')
+  )
+UNION ALL
+-- Second part: moderators
+SELECT 
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.TotalPosts,
+    ru.TotalScore,
+    ru.AvgScore,
+    ru.TopTags,
+    ru.TotalBadges,
+    ru.GoldBadges,
+    ru.EditorBadges,
+    ru.OverallRank,
+    ru.ScoreRank,
+    'Moderator' AS PerformanceCategory,
+    NULL AS RecentVotes,
+    NULL AS TagArray
+FROM RankedUsers ru
+INNER JOIN (
+    SELECT DISTINCT UserId FROM Badges WHERE Name = 'Moderator'
+) mods ON ru.UserId = mods.UserId
+-- Final ordering and limit apply to the unioned result
+ORDER BY Reputation DESC
+LIMIT 200;

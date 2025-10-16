@@ -1,0 +1,178 @@
+-- {"query": "1315.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1629} 
+with RecursiveBadgeRanking as (
+    select 
+        b.Id,
+        b.UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        b.TagBased,
+        b.Date,
+        row_number() over(partition by b.UserId order by b.Date asc) as BadgeRank
+    from Badges b
+    join Users u on u.Id = b.UserId
+),
+LatestPostEdits as (
+    select
+        ph.PostId,
+        max(ph.CreationDate) as LastEditDate
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId
+    where ph.PostHistoryTypeId in (4,5,6,7,8,9) -- Title, Body, Tags edits
+    group by ph.PostId
+),
+UserReputationStats as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) as PostsCount,
+        sum(case when p.PostTypeId = 1 then p.ViewCount else 0 end) as TotalQuestionViews,
+        sum(case when p.PostTypeId = 2 then p.Score else 0 end) as TotalAnswerScore
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+QuestionsWithSpecialFlag as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        u.DisplayName as OpName,
+        -- Split the '<tag>' formatted tags into array entries, deal with nulls gracefully by coalesce
+        coalesce(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><'), array[]::varchar[]) as TagList
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1
+),
+TopBadgedUsers as (
+    select UserId, count(*) as GoldBadges
+    from Badges 
+    where Class = 1 -- gold
+    group by UserId
+),
+DuplicateLinks as (
+    select pl.PostId, pl.RelatedPostId, u.DisplayName as PostOwnerName, ur.DisplayName as RelatedPostOwnerName, pl.CreationDate
+    from PostLinks pl
+    left join Posts pos on pos.Id = pl.PostId
+    left join Users u on u.Id = pos.OwnerUserId
+    left join Posts rel on rel.Id = pl.RelatedPostId
+    left join Users ur on ur.Id = rel.OwnerUserId
+    where pl.LinkTypeId = 3
+),
+QuestionsWithAcceptedAnswerStats as (
+	select 
+	    p.Id as QuestionId,
+	    p.Title,
+	    p.OwnerUserId,
+	    p.AcceptedAnswerId,
+	    AccPosts.Score as AccAnswerScore,
+	    AccPosts.ViewCount as AccAnswerViewCount,
+	    AccPosts.CreationDate as AccAnswerCreationDate,
+	    AccPosts.OwnerUserId as AcceptedAnswerUserId
+	from Posts p
+	left join Posts AccPosts on AccPosts.Id = p.AcceptedAnswerId
+	where p.PostTypeId = 1 and p.AcceptedAnswerId is not null
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        v.PostId,
+        v.VoteTypeId,
+        row_number() over (partition by u.Id, v.PostId order by v.CreationDate desc) as VoteRank,
+        count(*) over (partition by u.Id) as TotalVotesByUser
+    from Votes v
+    join Users u on u.Id = v.UserId
+    where v.UserId is not null
+),
+FilteredUserVotes as (
+    select UserId, PostId, VoteTypeId
+    from UserActivityWindow
+    where VoteRank = 1
+),
+PostCommentsCount as (
+    select PostId, count(*) as CommentsCount
+    from Comments
+    group by PostId
+),
+QuestionScoresWithRecursion AS (
+    -- recursive CTE to calculate running total score per user
+    select p.Id, p.OwnerUserId, p.Score, 1 as Level, p.Id::text as Path
+    from Posts p
+    where p.PostTypeId = 1
+    
+    union all
+    
+    select p2.Id, p2.OwnerUserId, (qs.Score + p2.Score) as Score,
+        qs.Level + 1,
+        qs.Path || '->' || p2.Id::text
+    from Posts p2
+    join QuestionScoresWithRecursion qs on qs.OwnerUserId = p2.OwnerUserId
+    where p2.PostTypeId = 1 and qs.Level < 3 -- limit recursion depth for performance
+)
+
+select 
+    q.Id as QuestionId,
+    q.Title,
+    COALESCE(ur.DisplayName, 'Unknown') as OwnerName,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    array_to_string(q.TagList, ', ') as Tags,
+    case 
+        when q.Id in (select QuestionId from QuestionsWithAcceptedAnswerStats where AccAnswerScore > 10) then 'High scoring accepted answer'
+        else 'No high scoring accepted answer'
+    end as AcceptedAnswerFlag,
+	pcc.CommentsCount,
+	mbr.GoldBadgesCount,
+    round(
+        coalesce(q.Score * 1.0 / nullif(q.AnswerCount,0), 0) 
+        + coalesce(mbr.GoldBadgesCount * 0.1, 0) 
+        + coalesce(pcc.CommentsCount * 0.05, 0), 2
+    ) as ComplexityScore,
+    case when coalesce(ulr.BadgeRank, 0) > 5 then 'Experienced Editor' else 'New Editor' end as EditorExperience,
+    dbl.PostCountForUser,
+    dbl.LinkCount,
+    -- String expression: invert display name (reverse string) as sample
+    reverse(coalesce(ur.DisplayName, '')) as ReversedOwnerName,
+    /* Complex Null logic & arithmetic combination */
+    (q.ViewCount * 1.0 / nullif(nullif(q.Score,0),0))  * 
+        case when q.AnswerCount > 0 then q.AnswerCount else 1 end +
+    coalesce(pcc.CommentsCount, 0) -
+    case when q.CreationDate < now() - interval '365' day then 10 else 0 end as WeightedScore
+from QuestionsWithSpecialFlag q
+left join Users ur on ur.Id = q.OpName::int 
+left join (
+    select UserId, TierCount as GoldBadgesCount
+    from (
+        select 
+            UserId,
+            count(*) as TierCount
+        from Badges 
+        where Class = 1
+        group by UserId
+    ) b
+) mbr on mbr.UserId = q.Id
+left join (
+    select PostId, count(*) as CommentsCount
+    from Comments
+    group by PostId
+) pcc on pcc.PostId = q.Id
+left join (
+    select
+        UserId, count(distinct p.Id) as PostCountForUser, count(pl.Id) as LinkCount
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id
+    group by UserId
+) dbl on dbl.UserId = q.Id
+left join RecursiveBadgeRanking ulr on ulr.UserId = q.Id and ulr.BadgeRank = 1
+
+where array_length(q.TagList, 1) >= 3 -- questions with at least 3 tags
+
+order by ComplexityScore desc
+limit 25;

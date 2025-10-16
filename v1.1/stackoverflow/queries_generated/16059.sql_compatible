@@ -1,0 +1,162 @@
+WITH user_activity_metrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COALESCE(COUNT(DISTINCT p.Id), 0) AS post_count,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS question_count,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS answer_count,
+        COALESCE(AVG(p.Score), 0) AS avg_post_score,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation DESC) AS rank_in_year,
+        DENSE_RANK() OVER (ORDER BY COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) DESC) AS vote_diff_rank
+    FROM Users u
+    LEFT OUTER JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 100 
+        AND (u.Location IS NULL OR LOWER(u.Location) NOT LIKE '%test%')
+        AND u.CreationDate >= DATE '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.UpVotes, u.DownVotes
+    HAVING COUNT(DISTINCT p.Id) > 0
+),
+tag_expertise AS (
+    SELECT 
+        p.OwnerUserId,
+        UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tag_name,
+        COUNT(*) AS tag_post_count,
+        AVG(p.Score) AS avg_tag_score,
+        SUM(COALESCE(p.ViewCount, 0)) AS total_views
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+        AND p.Tags IS NOT NULL
+        AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId, tag_name
+),
+ranked_tags AS (
+    SELECT 
+        te.OwnerUserId,
+        te.tag_name,
+        te.tag_post_count,
+        te.avg_tag_score,
+        te.total_views,
+        ROW_NUMBER() OVER (PARTITION BY te.OwnerUserId ORDER BY te.tag_post_count DESC, te.avg_tag_score DESC) AS expertise_rank
+    FROM tag_expertise te
+    WHERE te.tag_post_count >= 3
+),
+badge_aggregates AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS gold_badges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS silver_badges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS bronze_badges,
+        STRING_AGG(DISTINCT CASE WHEN b.Class = 1 THEN b.Name END, ', ' ORDER BY CASE WHEN b.Class = 1 THEN b.Name END) AS gold_badge_names
+    FROM Badges b
+    GROUP BY b.UserId
+),
+comment_engagement AS (
+    SELECT 
+        c.UserId,
+        COUNT(*) AS comment_count,
+        AVG(c.Score) AS avg_comment_score,
+        MAX(LENGTH(c.Text)) AS max_comment_length
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+        AND c.CreationDate >= DATE '2015-01-01'
+    GROUP BY c.UserId
+),
+accepted_answer_stats AS (
+    SELECT 
+        a.OwnerUserId,
+        COUNT(DISTINCT a.Id) AS accepted_answer_count,
+        AVG(EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600.0) AS avg_hours_to_acceptance
+    FROM Posts a
+    INNER JOIN Posts q ON a.ParentId = q.Id AND q.AcceptedAnswerId = a.Id
+    WHERE a.PostTypeId = 2 
+        AND a.OwnerUserId IS NOT NULL
+        AND q.OwnerUserId IS NOT NULL
+        AND a.OwnerUserId <> q.OwnerUserId
+    GROUP BY a.OwnerUserId
+)
+SELECT 
+    uam.DisplayName,
+    COALESCE(uam.Reputation, 0) AS reputation,
+    uam.post_count,
+    uam.question_count,
+    uam.answer_count,
+    ROUND(COALESCE(uam.avg_post_score, 0), 2) AS avg_score,
+    uam.rank_in_year AS year_reputation_rank,
+    COALESCE(ba.gold_badges, 0) AS gold_count,
+    COALESCE(ba.silver_badges, 0) AS silver_count,
+    COALESCE(ba.bronze_badges, 0) AS bronze_count,
+    COALESCE(ba.gold_badge_names, 'None') AS gold_badges_earned,
+    COALESCE(rt.tag_name, 'N/A') AS primary_expertise_tag,
+    COALESCE(rt.tag_post_count, 0) AS primary_tag_posts,
+    COALESCE(ce.comment_count, 0) AS total_comments,
+    ROUND(COALESCE(ce.avg_comment_score, 0), 2) AS avg_comment_score,
+    COALESCE(aas.accepted_answer_count, 0) AS accepted_answers,
+    ROUND(COALESCE(aas.avg_hours_to_acceptance, 0), 2) AS avg_hours_to_accept,
+    CASE 
+        WHEN uam.Reputation > 10000 AND COALESCE(ba.gold_badges, 0) > 0 THEN 'Elite'
+        WHEN uam.Reputation > 5000 THEN 'Expert'
+        WHEN uam.Reputation > 1000 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END AS user_tier,
+    (SELECT COUNT(*) 
+     FROM Votes v 
+     INNER JOIN Posts p ON v.PostId = p.Id 
+     WHERE p.OwnerUserId = uam.Id 
+        AND v.VoteTypeId = 2 
+        AND v.CreationDate >= uam.CreationDate + INTERVAL '30 days') AS upvotes_after_first_month,
+    (SELECT STRING_AGG(DISTINCT pt.Name, ', ' ORDER BY pt.Name)
+     FROM Posts p2
+     INNER JOIN PostTypes pt ON p2.PostTypeId = pt.Id
+     WHERE p2.OwnerUserId = uam.Id) AS post_types_created,
+    uam.Id,
+    uam.CreationDate,
+    ba.UserId,
+    rt.OwnerUserId,
+    ce.UserId,
+    aas.OwnerUserId
+FROM user_activity_metrics uam
+LEFT OUTER JOIN badge_aggregates ba ON uam.Id = ba.UserId
+LEFT OUTER JOIN ranked_tags rt ON uam.Id = rt.OwnerUserId AND rt.expertise_rank = 1
+LEFT OUTER JOIN comment_engagement ce ON uam.Id = ce.UserId
+LEFT OUTER JOIN accepted_answer_stats aas ON uam.Id = aas.OwnerUserId
+WHERE uam.rank_in_year <= 100
+    AND (COALESCE(ba.gold_badges, 0) > 0 OR uam.answer_count > 10 OR COALESCE(aas.accepted_answer_count, 0) > 5)
+    AND NOT EXISTS (
+        SELECT 1 
+        FROM Votes v2 
+        WHERE v2.UserId = uam.Id 
+            AND v2.VoteTypeId IN (4, 12)
+            AND v2.CreationDate >= CAST(DATE '2024-10-01' AS DATE) - INTERVAL '365 days'
+    )
+GROUP BY
+    uam.DisplayName,
+    uam.Reputation,
+    uam.post_count,
+    uam.question_count,
+    uam.answer_count,
+    uam.avg_post_score,
+    uam.rank_in_year,
+    ba.gold_badges,
+    ba.silver_badges,
+    ba.bronze_badges,
+    ba.gold_badge_names,
+    rt.tag_name,
+    rt.tag_post_count,
+    ce.comment_count,
+    ce.avg_comment_score,
+    aas.accepted_answer_count,
+    aas.avg_hours_to_acceptance,
+    uam.Id,
+    uam.CreationDate,
+    ba.UserId,
+    rt.OwnerUserId,
+    ce.UserId,
+    aas.OwnerUserId
+ORDER BY 
+    (COALESCE(uam.Reputation, 0) * 0.4 + 
+    COALESCE(aas.accepted_answer_count, 0) * 50 + 
+    COALESCE(ba.gold_badges, 0) * 100) DESC,
+    uam.avg_post_score DESC
+LIMIT 500;

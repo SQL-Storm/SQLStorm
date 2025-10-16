@@ -1,0 +1,117 @@
+-- {"query": "9100.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2013, "output_tokens": 2392} 
+WITH recent_revs AS (
+    SELECT
+        ph.PostId,
+        COUNT(*)                          AS rev_count,
+        MAX(ph.CreationDate)             AS last_rev_date
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (5, 6)
+    GROUP BY ph.PostId
+),
+badge_tokens AS (
+    SELECT
+        b.UserId,
+        UNNEST(string_to_array(b.Name, ',')) AS badge_token
+    FROM Badges b
+    WHERE b.TagBased = TRUE
+),
+user_ranks AS (
+    SELECT
+        u.Id            AS user_id,
+        u.DisplayName   AS user_name,
+        RANK()   OVER (ORDER BY u.Reputation DESC)             AS rep_rank,
+        NTILE(4) OVER (ORDER BY u.CreationDate)                AS creation_quartile
+    FROM Users u
+),
+post_tags AS (
+    SELECT
+        p.Id       AS post_id,
+        tag.name   AS tag_name
+    FROM Posts p
+    CROSS JOIN LATERAL (
+      SELECT unnest(string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags)-2), '><')) AS name
+    ) tag
+    JOIN Tags t ON t.TagName = tag.name
+),
+joined AS (
+    SELECT
+        p.Id                         AS post_id,
+        p.Title,
+        COALESCE(rr.rev_count, 0)    AS revisions,
+        COALESCE(rr.last_rev_date, p.CreationDate) AS last_rev_date,
+        pt.tag_name,
+        ur.rep_rank,
+        ur.creation_quartile
+    FROM Posts p
+    LEFT JOIN recent_revs rr      ON rr.PostId = p.Id
+    LEFT JOIN post_tags pt        ON pt.post_id = p.Id
+    LEFT JOIN user_ranks ur       ON ur.user_id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+),
+filtered AS (
+    (
+      SELECT * FROM joined
+      WHERE rep_rank <= 1000
+        AND creation_quartile = 1
+    )
+    UNION
+    (
+      SELECT * FROM joined
+      WHERE revisions > 5
+        AND creation_quartile = 4
+    )
+    EXCEPT
+    (
+      SELECT * FROM joined
+      WHERE last_rev_date < '2020-01-01'
+    )
+),
+vote_counts AS (
+    SELECT
+        f.post_id,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS upvotes,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS downvotes,
+        LEAD(f.last_rev_date) OVER (
+            PARTITION BY f.creation_quartile
+            ORDER BY f.revisions DESC
+        ) AS next_rev_date
+    FROM filtered f
+    LEFT JOIN Votes v ON v.PostId = f.post_id
+    GROUP BY f.post_id, f.revisions, f.last_rev_date, f.tag_name, f.rep_rank, f.creation_quartile
+),
+final AS (
+    SELECT
+        vc.post_id,
+        j.Title,
+        j.tag_name,
+        j.revisions,
+        vc.upvotes,
+        vc.downvotes,
+        ROUND(vc.upvotes::NUMERIC / NULLIF(vc.downvotes,0), 2) AS up_down_ratio,
+        j.rep_rank,
+        j.creation_quartile,
+        COALESCE((
+            SELECT COUNT(*) 
+            FROM Comments c 
+            WHERE c.PostId = vc.post_id
+              AND c.CreationDate > vc.last_rev_date
+        ), 0) AS new_comments,
+        CASE 
+          WHEN vc.next_rev_date IS NULL THEN 'N/A'
+          ELSE to_char(vc.next_rev_date - vc.last_rev_date, 'DD "days" HH24 "hrs"')
+        END AS time_to_next_rev,
+        STRING_AGG(DISTINCT ur2.DisplayName, ', ')
+          OVER (
+            PARTITION BY j.creation_quartile
+            ORDER BY vc.upvotes DESC
+            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+          ) AS peer_top_users
+    FROM vote_counts vc
+    JOIN joined j     ON j.post_id = vc.post_id
+    LEFT JOIN Users ur2
+      ON ur2.Id = j.rep_rank
+)
+SELECT *
+FROM final
+ORDER BY revisions DESC, upvotes DESC
+LIMIT 100;

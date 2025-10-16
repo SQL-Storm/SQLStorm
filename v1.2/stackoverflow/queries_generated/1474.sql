@@ -1,0 +1,195 @@
+-- {"query": "1474.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1652} 
+with RecursiveTags as (
+    select
+        p.Id,
+        p.Title,
+        p.Tags,
+        1 as Level
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+    
+    union all
+    
+    select
+        rp.Id,
+        rp.Title,
+        substring(rp.Tags from x.n for y.pos - x.n - 1) as Tag,
+        rt.Level + 1
+    from
+        RecursiveTags rt
+        cross join lateral (
+            select strpos(rt.Tags || '>', '>') as pos,
+                   1 as n,
+                   rt.Tags as Tags
+        ) y
+        inner join lateral (
+            select strpos(rt.Tags, '><', rt.Level) + 2 as n
+        ) x on true
+    where rt.Level < 5
+),
+TagExploded AS (
+    SELECT
+        Id,
+        Title,
+        unnest(string_to_array(substring(Tags FROM 2 FOR length(Tags)-2), '><')) as Tag
+    FROM Posts
+    WHERE PostTypeId = 1 AND Tags IS NOT NULL
+),
+AnswerStats AS (
+    SELECT
+        pa.ParentId,
+        count(*) as AnswerCount,
+        max(pa.Score) as MaxAnswerScore,
+        sum(pa.Score) as SumAnswerScore,
+        avg(pa.Score) as AvgAnswerScore
+    FROM Posts pa
+    WHERE pa.PostTypeId = 2
+    GROUP BY pa.ParentId
+),
+UserTopBadges AS (
+    SELECT 
+        b.UserId, 
+        b.Name,
+        b.Class,
+        ROW_NUMBER() OVER(PARTITION BY b.UserId ORDER BY b.Date DESC) as BadgeRank
+    FROM Badges b
+),
+UserActivity AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        
+        -- average score per question posted 
+        coalesce(avg(q.Score),0) as AvgQuestionScore,
+        
+        -- count of distinct tags used by this user 
+        (SELECT count(distinct unnest(string_to_array(substring(Tags FROM 2 FOR length(Tags) - 2), '><')))
+         FROM Posts pq WHERE pq.OwnerUserId = u.Id AND pq.PostTypeId = 1 ) as DistinctTagCount,
+        
+        -- last Edit date from posthistory
+        max(ph.CreationDate) as LastEditDate,
+        
+        -- window function rank of reputation among all users
+        rank() over (order by u.Reputation desc) as RepoRank
+        
+    FROM Users u
+    LEFT JOIN Posts q ON q.OwnerUserId = u.Id AND q.PostTypeId = 1
+    LEFT JOIN PostHistory ph on ph.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),    
+ClosedQuestions AS (
+    SELECT
+        p.Id, p.Title, p.ClosedDate,
+        chc.Name AS CloseReason,
+        ph.CreationDate as CloseRecordDate
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id 
+                             AND ph.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes chc ON chc.Id = CAST(ph.Comment AS int)
+    WHERE p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL
+),
+DuplicateQuestions As (
+    SELECT DISTINCT
+        pl.PostId,
+        p1.Title AS OriginalTitle,
+        pl.RelatedPostId,
+        p2.Title AS DuplicateOfTitle
+    FROM PostLinks pl
+    JOIN Posts p1 ON p1.Id = pl.PostId AND p1.PostTypeId = 1
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId AND p2.PostTypeId = 1
+    WHERE pl.LinkTypeId = 3
+),
+ScoreRanking AS (
+    SELECT 
+        p.Id, p.OwnerUserId, p.Title, p.Score,
+        rank() OVER(PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) as UserPostRank,
+        dense_rank() over (order by p.Score desc nulls last) as GlobalPostScoreRank
+    FROM Posts p
+    WHERE p.PostTypeId in (1,2)
+),
+ComplexStringScores AS (
+    SELECT 
+        Id,
+        Title,
+        -- Score weighted by length of title and count number of tags (length after removing token chars)
+        Score * char_length(Title) / GREATEST(lengthRegexp_WS,1) as WeightedScore,
+
+        -- Number of tags (split of tags by ><)
+        array_length(string_to_array(substring(Tags FROM 2 FOR char_length(Tags)-2), '><'),1) as NumTags
+
+    FROM Posts
+    CROSS JOIN lateral (
+        select regexp_count(Title, '\\s') + 1 as lengthRegexp_WS
+    ) rswv
+    WHERE PostTypeId = 1
+),
+VoteCounts AS (
+    SELECT
+        v.PostId,
+        count(*) FILTER (WHERE vt.Name='UpMod') as Upvotes,
+        count(*) FILTER (WHERE vt.Name='DownMod') as Downvotes,
+        count(*) FILTER (WHERE vt.Name='Favorite') as Favorites,
+        count(*) FILTER (WHERE vt.VoteTypeId IS NULL) as UnknownVotes
+    FROM Votes v
+    LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY v.PostId
+),
+FinalAll AS (
+    SELECT 
+       u.Id,
+       u.DisplayName,
+       ua.AvgQuestionScore,
+       ua.DistinctTagCount,
+       ua.RepoRank,
+       TopBadges.Name as LatestTopBadgeName,
+       TopBadges.Class as LatestTopBadgeClass,
+       cs.NumTags,
+       cs.WeightedScore,
+       v.Upvotes,
+       v.Downvotes,
+       v.Favorites,
+       COUNT(DISTINCT tq.Id) as QuestionsAttempted, 
+       COUNT(DISTINCT dq.PostId) as DuplicateMarked, 
+       ac.AnswerCount,
+       ac.MaxAnswerScore
+    FROM Users u
+    LEFT JOIN UserActivity ua ON ua.Id = u.Id
+    LEFT JOIN UserTopBadges TopBadges ON TopBadges.UserId = u.Id AND TopBadges.BadgeRank = 1
+    LEFT JOIN VoteCounts v ON v.PostId = u.Id
+    FULL OUTER JOIN Posts p ON p.OwnerUserId = u.Id 
+    LEFT JOIN ComplexStringScores cs ON cs.Id = p.Id
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN DuplicateQuestions dq ON dq.PostId = p.Id
+    LEFT JOIN Posts tq ON tq.OwnerUserId = u.Id AND tq.PostTypeId = 1
+    LEFT JOIN AnswerStats ac ON ac.ParentId = p.Id
+    GROUP BY
+        u.Id, u.DisplayName, ua.AvgQuestionScore, ua.DistinctTagCount, ua.RepoRank,
+        TopBadges.Name, TopBadges.Class,
+        cs.NumTags, cs.WeightedScore,
+        v.Upvotes, v.Downvotes, v.Favorites,
+        ac.AnswerCount, ac.MaxAnswerScore
+)
+select
+    Id,
+    DisplayName,
+    AvgQuestionScore,
+    DistinctTagCount,
+    RepoRank,
+    coalesce(LatestTopBadgeName, 'None') as LatestTopBadgeName,
+    LatestTopBadgeClass,
+    NumTags,
+    round(WeightedScore,2) as WeightedScore,
+    coalesce(Upvotes,0) as Upvotes,
+    coalesce(Downvotes,0) as Downvotes,
+    coalesce(Favorites,0) as Favorites,
+    QuestionsAttempted,
+    DuplicateMarked,
+    coalesce(AnswerCount,0) as AnswerCount,
+    coalesce(MaxAnswerScore,0) as MaxAnswerScore
+    
+from FinalAll
+where RepoRank <= 100 and AvgQuestionScore > 5 
+order by AvgQuestionScore desc, WeightedScore desc, Upvotes desc
+limit 50;

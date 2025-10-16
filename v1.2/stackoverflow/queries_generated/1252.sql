@@ -1,0 +1,164 @@
+-- {"query": "1252.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.2, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1494} 
+with RecursiveTagDepth as (
+    select 
+        t.Id,
+        t.TagName,
+        1 as Depth,
+        array[t.Id] as Path
+    from Tags t
+    where not t.IsModeratorOnly = 1
+
+    union all
+
+    select 
+        t.Id,
+        t.TagName,
+        rtd.Depth + 1,
+        rtd.Path || t.Id
+    from Tags t
+    join RecursiveTagDepth rtd on t.Id != all(rtd.Path)
+    where t.IsModeratorOnly = 0 and rtd.Depth < 3
+),
+UserActivity AS (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersPosted,
+        coalesce(sum(vUp.CountVotes),0) as TotalUpVotesReceived,
+        coalesce(sum(vDown.CountVotes),0) as TotalDownVotesReceived,
+        row_number() over (order by coalesce(sum(vUp.CountVotes),0) desc) as RankingByUpVotes
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select PostId, count(*) as CountVotes from Votes where VoteTypeId = 2 group by PostId
+    ) vUp on vUp.PostId = p.Id
+    left join (
+        select PostId, count(*) as CountVotes from Votes where VoteTypeId = 3 group by PostId
+    ) vDown on vDown.PostId = p.Id
+    group by u.Id, u.DisplayName
+),
+PostWithHistory AS (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Title,
+        ph.PostHistoryTypeId,
+        p.OwnerUserId,
+        ph.UserId as EditorUserId,
+        ph.CreationDate as HistoryDate,
+        ph.Comment,
+        p.Score,
+        substring(p.Body from 1 for 500) as BodyExcerpt
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.CreationDate = (
+        select max(CreationDate) from PostHistory where PostId = p.Id
+    )
+),
+AcceptedAnswersWithScores AS (
+    select 
+        q.Id as QuestionId,
+        aa.Id as AcceptedAnswerId,
+        aa.Score as AcceptedAnswerScore,
+        u.DisplayName as AnswererName
+    from Posts q
+    join Posts aa on aa.Id = q.AcceptedAnswerId
+    left join Users u on u.Id = aa.OwnerUserId
+    where q.PostTypeId = 1 and q.AcceptedAnswerId is not null
+),
+VotesAndCommentsWindow AS (
+    select 
+        p.Id as PostId,
+        count(distinct v.Id) filter (where v.VoteTypeId=2) as UpVoteCount,
+        count(distinct v.Id) filter (where v.VoteTypeId=3) as DownVoteCount,
+        count(distinct c.Id) as CommentCount,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc) as PostRank,
+        rank() over (partition by p.Tags order by p.Score desc) as TagScoreRank
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    left join Comments c on c.PostId = p.Id
+    where p.PostTypeId in (1,2)
+    group by p.Id, p.OwnerUserId, p.Score, p.Tags
+)
+select distinct
+    ua.UserId,
+    ua.DisplayName,
+    ua.QuestionsAsked,
+    ua.AnswersPosted,
+    ua.TotalUpVotesReceived,
+    ua.TotalDownVotesReceived,
+    pwh.Id as LastEditedPostId,
+    pwh.Title,
+    pwh.PostHistoryTypeId,
+    pwh.HistoryDate,
+    coalesce(aa.AcceptedAnswerId, -1) as AcceptedAnswerId,
+    coalesce(aa.AcceptedAnswerScore, 0) as AcceptedAnswerScore,
+    aa.AnswererName,
+    vacw.UpVoteCount,
+    vacw.DownVoteCount,
+    vacw.CommentCount,
+    vacw.PostRank,
+    vacw.TagScoreRank,
+    RTD.Depth as TagDepth,
+    RTD.TagName,
+    case when pwh.PostHistoryTypeId in (10,12,14,35) then 'SpecialAction' else 'Normal' end as PostStatus,
+    coalesce(nullif(pwh.Comment, ''), 'NoComment') as EditCommentOrNone,
+    -- complex string operation and null logic
+    concat(
+        left(ua.DisplayName, 3),
+        '_',
+        coalesce(nullif(aa.AnswererName,'Unknown'), 'Anon'),
+        trim(both '#' from cast(aa.AcceptedAnswerScore as varchar)),
+        substring(pwh.Title from 1 for 10),
+        '_',
+        case when vacw.UpVoteCount > vacw.DownVoteCount then 'Pos' 
+             when vacw.UpVoteCount = vacw.DownVoteCount then 'Neutral'
+             else 'Neg' end,
+        '_',
+        case when RTD.Depth is null then 'NoTag' else 'TagDepth' || RTD.Depth::text end
+    ) as ComplexIdentifier
+from UserActivity ua
+left join PostWithHistory pwh on pwh.OwnerUserId = ua.UserId
+left join AcceptedAnswersWithScores aa on aa.QuestionId = pwh.Id and pwh.PostTypeId = 1
+left join VotesAndCommentsWindow vacw on vacw.PostId = pwh.Id
+left join RecursiveTagDepth RTD on RTD.TagName = any (string_to_array(
+    substring(pwh.Title from '<([^>]+)>'), ','
+))
+where ua.QuestionsAsked > 5 and (vacw.UpVoteCount is null or vacw.UpVoteCount > vacw.DownVoteCount)
+order by ua.TotalUpVotesReceived desc
+limit 50
+union
+select 
+    null, null, null, null, null, null, null, null, null, null, null,
+    null, null, null, null,
+    '--------BENCHMARK UNION BOUNDARY--------'::text
+union
+select 
+    ua.UserId,
+    ua.DisplayName,
+    ua.QuestionsAsked,
+    ua.AnswersPosted,
+    ua.TotalUpVotesReceived,
+    ua.TotalDownVotesReceived,
+    pwh.Id,
+    pwh.Title,
+    pwh.PostHistoryTypeId,
+    pwh.HistoryDate,
+    -1,
+    0,
+    null,
+    vacw.UpVoteCount,
+    vacw.DownVoteCount,
+    vacw.CommentCount,
+    vacw.PostRank,
+    vacw.TagScoreRank,
+    null,
+    null,
+    'FallbackRow'
+from UserActivity ua
+join PostWithHistory pwh on pwh.OwnerUserId = ua.UserId
+join VotesAndCommentsWindow vacw on vacw.PostId = pwh.Id
+where ua.QuestionsAsked <= 5
+order by ua.TotalUpVotesReceived desc
+limit 50;

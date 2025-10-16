@@ -1,0 +1,189 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.CreationDate,
+        u.Reputation,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score END),0) AS TotalPostScore,
+        COUNT(DISTINCT b.Id) AS BadgesEarned,
+        SUM(v2.CountUpvotes) AS TotalUpvotesGiven,
+        SUM(v2.CountDownvotes) AS TotalDownvotesGiven
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN (
+        SELECT
+            v.UserId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS CountUpvotes,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS CountDownvotes
+        FROM Votes v
+        WHERE v.UserId IS NOT NULL
+        GROUP BY v.UserId
+    ) v2 ON v2.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.CreationDate, u.Reputation
+),
+RecentQuestionsAndAnswers AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId, p.PostTypeId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2) AND p.OwnerUserId IS NOT NULL
+),
+TopTagsCounts AS (
+    WITH RECURSIVE split(id, rest, tag) AS (
+        SELECT
+            Id,
+            CASE
+                WHEN Tags IS NULL THEN NULL
+                ELSE
+                    CASE
+                        WHEN CHAR_LENGTH(Tags) >= 2 AND SUBSTR(Tags,1,1) = '<' AND SUBSTR(Tags,CHAR_LENGTH(Tags),1) = '>' THEN SUBSTR(Tags, 2, CHAR_LENGTH(Tags) - 2)
+                        ELSE Tags
+                    END
+            END AS rest,
+            NULL
+        FROM Posts
+        WHERE PostTypeId = 1
+          AND CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90 days'
+          AND Tags IS NOT NULL
+        UNION ALL
+        SELECT
+            id,
+            CASE
+                WHEN POSITION('><' IN rest) = 0 THEN NULL
+                ELSE SUBSTR(rest, POSITION('><' IN rest) + 2)
+            END AS rest,
+            CASE
+                WHEN POSITION('><' IN rest) = 0 THEN TRIM(rest)
+                ELSE TRIM(SUBSTR(rest, 1, POSITION('><' IN rest) - 1))
+            END AS tag
+        FROM split
+        WHERE rest IS NOT NULL
+    )
+    SELECT
+        tag AS tag,
+        COUNT(*) AS NumRecentQuestions
+    FROM (
+        SELECT
+            COALESCE(tag, TRIM(rest)) AS tag
+        FROM split
+        WHERE COALESCE(tag, TRIM(rest)) IS NOT NULL AND COALESCE(tag, TRIM(rest)) <> ''
+    ) s
+    GROUP BY tag
+),
+TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        nt.NumRecentQuestions,
+        RANK() OVER (ORDER BY COALESCE(nt.NumRecentQuestions,0) DESC, COALESCE(t.Count,0) DESC) AS tag_rank
+    FROM Tags t
+    LEFT JOIN TopTagsCounts nt ON nt.tag = t.TagName
+),
+VoteAggs AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes,
+        COUNT(*) AS VoteCount
+    FROM Votes v
+    GROUP BY v.PostId
+),
+ClosedStats AS (
+    SELECT
+        ph.PostId,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Id END) AS TimesClosed,
+        MIN(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS FirstClosedDate,
+        STRING_AGG(DISTINCT crt.Name, ', ') FILTER (WHERE ph.PostHistoryTypeId = 10 AND crt.Name IS NOT NULL) AS CloseReasons
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt
+        ON ph.PostHistoryTypeId = 10
+        AND (
+            (CASE WHEN ph.Comment ~ '^[0-9]+$' THEN CAST(ph.Comment AS INTEGER) ELSE NULL END) = crt.Id
+            OR ph.Comment = crt.Name
+        )
+    GROUP BY ph.PostId
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.CreationDate,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.BadgesEarned,
+    ua.TotalUpvotesGiven,
+    ua.TotalDownvotesGiven,
+    TQ.PostId AS MostRecentQuestionId,
+    TQ.Title AS MostRecentQuestionTitle,
+    TQ.Score AS MostRecentQuestionScore,
+    ta.tag_rank AS TopTagRank,
+    ta.TagName AS TopRecentTag,
+    ta.NumRecentQuestions AS TopTagRecentUsage,
+    COALESCE(vtM.Upvotes,0) AS RecentQuestionUpvotes,
+    COALESCE(vtM.Downvotes,0) AS RecentQuestionDownvotes,
+    cs.TimesClosed,
+    CASE WHEN cs.CloseReasons IS NOT NULL THEN split_part(cs.CloseReasons, ', ', 1) ELSE NULL END AS FirstCloseReason,
+    CASE
+        WHEN ua.AnswerCount > 0 THEN ROUND(CAST(ua.TotalPostScore AS NUMERIC)/NULLIF(ua.AnswerCount,0),2)
+        ELSE NULL
+    END AS AvgAnswerScore,
+    CASE
+        WHEN ua.QuestionCount > 0 THEN ROUND(CAST((ua.TotalUpvotesGiven - ua.TotalDownvotesGiven) AS NUMERIC)/NULLIF(ua.QuestionCount,0), 2)
+        ELSE NULL
+    END AS VoteRatioPerQuestion,
+    CASE
+        WHEN TQ.Tags SIMILAR TO '%<(postgresql|sql|mysql)>%' THEN TRUE ELSE FALSE END AS FocusedOnDBTags,
+    CASE
+        WHEN TQ.CreationDate IS NOT NULL AND TQ.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '7 days'
+        THEN 'Active Last 7d'
+        ELSE 'Inactive'
+    END AS RecentActivity
+FROM UserActivity ua
+LEFT JOIN RecentQuestionsAndAnswers TQ
+    ON TQ.OwnerUserId = ua.UserId AND TQ.PostTypeId = 1 AND TQ.rn = 1
+LEFT JOIN (
+    SELECT ta.TagName, ta.NumRecentQuestions, ta.tag_rank
+    FROM TopTags ta
+    WHERE ta.NumRecentQuestions IS NOT NULL
+    ORDER BY ta.NumRecentQuestions DESC, ta.Count DESC
+    LIMIT 1
+) ta ON TRUE
+LEFT JOIN VoteAggs vtM ON vtM.PostId = TQ.PostId
+LEFT JOIN ClosedStats cs ON cs.PostId = TQ.PostId
+GROUP BY
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.CreationDate,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.BadgesEarned,
+    ua.TotalUpvotesGiven,
+    ua.TotalDownvotesGiven,
+    TQ.PostId,
+    TQ.Title,
+    TQ.Score,
+    ta.tag_rank,
+    ta.TagName,
+    ta.NumRecentQuestions,
+    vtM.Upvotes,
+    vtM.Downvotes,
+    cs.TimesClosed,
+    cs.CloseReasons,
+    TQ.Tags,
+    TQ.CreationDate,
+    ua.TotalPostScore
+ORDER BY
+    ua.Reputation DESC,
+    ua.QuestionCount DESC,
+    ua.AnswerCount DESC
+LIMIT 50;

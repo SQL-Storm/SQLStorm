@@ -1,0 +1,62 @@
+-- {"query": "28006.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "deepseek-r1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1620} 
+
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionsPosted,
+        (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id) AS CommentsMade,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS GlobalRank,
+        RANK() OVER (PARTITION BY (CASE WHEN u.Reputation > 100000 THEN 'Top' ELSE 'Regular' END) ORDER BY u.UpVotes - u.DownVotes DESC) AS VoteRank
+    FROM Users u
+),
+PostMetrics AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        COALESCE(p.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS Upvotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS Downvotes,
+        LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, '><', '')) + 1 AS TagCount,
+        (SELECT STRING_AGG(SUBSTRING(t.TagName, 1, 3), '|') FROM Tags t WHERE t.TagName IN (SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')))) AS ShortenedTags,
+        LEAD(p.Score) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS NextPostScore,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) AS MovingAvgScore
+    FROM Posts p
+    WHERE p.CreationDate BETWEEN '2010-01-01' AND '2023-12-31'
+)
+SELECT 
+    u.DisplayName,
+    pm.Score * 2 + pm.Upvotes * 0.5 - pm.Downvotes * 0.3 + us.GoldBadges * 10 AS WeightedMetric,
+    CASE 
+        WHEN us.Reputation > 200000 THEN 'Legendary'
+        WHEN us.Reputation > 100000 THEN 'Epic'
+        WHEN us.Reputation > 50000 THEN 'Veteran'
+        ELSE 'Regular'
+    END AS ReputationTier,
+    pm.ShortenedTags,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = pm.Id AND ph.PostHistoryTypeId IN (10, 11, 12)) AS ModerationEvents,
+    (SELECT COUNT(DISTINCT RelatedPostId) FROM PostLinks pl WHERE pl.PostId = pm.Id AND pl.LinkTypeId = 3) AS DuplicateLinks,
+    COALESCE(ph.Comment, 'No close reason') AS CloseReason,
+    ROUND((us.UpVotes * 1.0 / NULLIF(us.DownVotes, 0)), 2) AS VoteRatio,
+    us.VoteRank,
+    pm.MovingAvgScore
+FROM PostMetrics pm
+FULL OUTER JOIN UserStats us ON pm.OwnerUserId = us.Id
+LEFT JOIN PostHistory ph ON ph.PostId = pm.Id AND ph.PostHistoryTypeId = 10
+LEFT JOIN CloseReasonTypes crt ON ph.Comment::INT = crt.Id
+WHERE (pm.Score > 100 OR us.GoldBadges >= 1)
+    AND (pm.TagCount > 3 OR pm.ShortenedTags LIKE '%sql%')
+    AND (us.CommentsMade > 10 OR us.QuestionsPosted > 5)
+    AND (ph.CreationDate IS NULL OR ph.CreationDate > '2015-01-01')
+ORDER BY 
+    WeightedMetric DESC, 
+    us.GlobalRank ASC
+LIMIT 100;

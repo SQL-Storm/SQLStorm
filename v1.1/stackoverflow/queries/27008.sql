@@ -1,0 +1,123 @@
+WITH ActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        u.DisplayName,
+        COUNT(p.Id) AS PostCount,
+        SUM(p.Score) AS TotalScore,
+        MAX(p.LastActivityDate) AS LastActivity
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    WHERE
+        u.LastAccessDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days'
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate, u.DisplayName
+),
+RecentPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        u.DisplayName AS OwnerDisplayName,
+        COALESCE(a.Title, 'NoAcceptedAnswer') AS AcceptedAnswerDisplayName,
+        p.OwnerUserId
+    FROM
+        Posts p
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN
+        Posts a ON p.AcceptedAnswerId = a.Id
+    WHERE
+        p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '7 days'
+        AND p.PostTypeId IN (1, 2)
+),
+PopularTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        RANK() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM
+        Tags t
+    WHERE
+        t.Count > 1000
+),
+UserEngagement AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(p.Id) AS PostCount,
+        SUM(p.Score) AS TotalScore,
+        MAX(p.LastActivityDate) AS LastActivity
+    FROM
+        Posts p
+    GROUP BY
+        p.OwnerUserId
+),
+HighValuePosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        COALESCE(p.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+        SUM(v.VoteTypeId) AS VoteSum,
+        STRING_AGG(DISTINCT t.TagName, ', ') AS TagsString
+    FROM
+        Posts p
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN
+        Tags t ON POSITION(t.TagName IN COALESCE(p.Tags, '')) > 0 OR (p.PostTypeId IN (4, 5) AND t.ExcerptPostId = p.Id)
+    WHERE
+        p.Score > 100
+    GROUP BY
+        p.Id, p.Title, p.Score, p.ViewCount, COALESCE(p.AcceptedAnswerId, -1)
+)
+SELECT
+    au.UserId,
+    au.DisplayName,
+    au.Reputation,
+    au.PostCount,
+    au.TotalScore,
+    au.LastActivity,
+    rp.PostId,
+    rp.Title,
+    rp.Tags,
+    rp.Score AS RecentPostScore,
+    rp.ViewCount AS RecentPostViewCount,
+    pt.Name AS RecentPostType,
+    rp.OwnerDisplayName,
+    rp.AcceptedAnswerDisplayName,
+    pt_tag.TagName AS PopularTag,
+    pt_tag.Count AS TagCount,
+    pt_tag.TagRank,
+    hvp.TagsString AS HighValueTags,
+    hvp.VoteSum AS HighValueVoteSum,
+    CASE
+        WHEN rp.PostTypeId = 1 THEN 'Question'
+        WHEN rp.PostTypeId = 2 THEN 'Answer'
+        ELSE 'Other'
+    END AS PostTypeCategory
+FROM
+    ActiveUsers au
+LEFT JOIN
+    RecentPosts rp ON au.UserId = rp.OwnerUserId
+LEFT JOIN
+    PostTypes pt ON rp.PostTypeId = pt.Id
+LEFT JOIN
+    PopularTags pt_tag ON POSITION(pt_tag.TagName IN COALESCE(rp.Tags, '')) > 0
+LEFT JOIN
+    HighValuePosts hvp ON rp.PostId = hvp.PostId
+WHERE
+   au.Reputation > 1000
+   AND (rp.Title LIKE '%SQL%' OR rp.Tags LIKE '%<SQL>%')
+ORDER BY
+    au.Reputation DESC,
+    rp.PostId DESC
+LIMIT 100;

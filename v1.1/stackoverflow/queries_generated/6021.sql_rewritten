@@ -1,0 +1,104 @@
+-- {"query": "6021.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 848} 
+WITH RankedPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Body,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.CommentCount,
+    p.AnswerCount,
+    p.LastActivityDate,
+    p.LastEditDate,
+    p.PostTypeId,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    u.CreationDate AS OwnerCreationDate,
+    u.LastAccessDate AS OwnerLastAccessDate,
+    COALESCE(b.Class, 3) AS BadgeClass,
+    b.Date AS BadgeDate,
+    b.Name AS BadgeName,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.OwnerUserId
+      ORDER BY p.Score DESC, p.ViewCount DESC, p.LastActivityDate DESC
+    ) AS rn
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.ClosedDate IS NULL
+    AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '365 days'
+),
+Aggregated AS (
+  SELECT
+    rp.OwnerUserId,
+    rp.OwnerDisplayName,
+    rp.Reputation,
+    COUNT(*) AS question_count,
+    SUM(rp.Score) AS total_score,
+    SUM(rp.ViewCount) AS total_views,
+    AVG(rp.CommentCount) AS avg_comments,
+    MAX(rp.LastActivityDate) AS last_active,
+    MAX(rp.BadgeDate) AS last_badge_date,
+    STRING_AGG(DISTINCT rp.Tags, ',') AS combined_tags
+  FROM RankedPosts rp
+  WHERE rp.rn = 1 -- most recent by owner in each partition
+  GROUP BY rp.OwnerUserId, rp.OwnerDisplayName, rp.Reputation
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    COUNT(*) FILTER (WHERE t.TagName IS NOT NULL) AS tag_count
+  FROM Posts p
+  CROSS APPLY STRING_SPLIT(p.Tags, ',') AS t
+  WHERE p.PostTypeId = 1
+  GROUP BY t.TagName
+  ORDER BY tag_count DESC
+  LIMIT 10
+),
+ContextualActivity AS (
+  SELECT
+    v.PostId,
+    v.VoteTypeId,
+    v.UserId,
+    v.CreationDate,
+    v.BountyAmount,
+    CASE
+      WHEN vt.Name ILIKE '%Up%' THEN 'positive'
+      WHEN vt.Name ILIKE '%Down%' THEN 'negative'
+      WHEN vt.Name ILIKE '%Close%' THEN 'moderation'
+      ELSE 'other'
+    END AS activity_context
+  FROM Votes v
+  JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  WHERE v.CreationDate >= cast('2024-10-01' as date) - INTERVAL '30 days'
+),
+CrossJoinSample AS (
+  SELECT
+    a.OwnerUserId,
+    a.OwnerDisplayName,
+    a.total_score,
+    a.total_views,
+    a.combined_tags,
+    a.last_active,
+    t.TagName
+  FROM Aggregated a
+  CROSS JOIN TopTags t
+)
+SELECT
+  c.OwnerUserId,
+  c.OwnerDisplayName,
+  c.total_score,
+  c.total_views,
+  c.combined_tags,
+  c.last_active,
+  c.TagName AS most_frequent_tag,
+  (SELECT COUNT(*) FROM ContextualActivity ca WHERE ca.UserId = c.OwnerUserId) AS recent_actions_count,
+  (SELECT AVG(v.BountyAmount) FROM ContextualActivity ca JOIN Votes v ON ca.PostId = v.PostId WHERE ca.UserId = c.OwnerUserId AND v.BountyAmount IS NOT NULL) AS avg_bounty,
+  (SELECT COUNT(*) FILTER (WHERE ca.activity_context = 'positive') FROM ContextualActivity ca WHERE ca.UserId = c.OwnerUserId) AS positive_votes_last_month
+FROM CrossJoinSample c
+ORDER BY c.total_score DESC, c.total_views DESC
+LIMIT 100;

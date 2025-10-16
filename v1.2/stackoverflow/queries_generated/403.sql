@@ -1,0 +1,211 @@
+-- {"query": "403.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1924} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Level + 1,
+        r.Path || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id != r.Id and t2.Count < r.Count and not t2.TagName = any(r.Path)
+    where r.Level < 3
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) as TotalBadges,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreationDate,
+        q.OwnerUserId,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        count(a.Id) as AnswerCount,
+        coalesce(sum(a.Score),0) as TotalAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        min(a.Score) as MinAnswerScore,
+        avg(a.Score) as AvgAnswerScore,
+        bool_or(a.OwnerUserId is null) as HasAnonymousAnswer,
+        max(a.CreationDate) as LastAnswerDate
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.CreationDate, q.OwnerUserId, q.Score, q.ViewCount
+),
+PostCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        v.PostId,
+        v.VoteTypeId,
+        v.CreationDate,
+        count(*) over (partition by u.Id order by v.CreationDate range between interval '30 days' preceding and current row) as VotesLast30Days,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) over (partition by u.Id order by v.CreationDate range between interval '30 days' preceding and current row) as UpVotesLast30Days,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) over (partition by u.Id order by v.CreationDate range between interval '30 days' preceding and current row) as DownVotesLast30Days
+    from Users u
+    left join Votes v on v.UserId = u.Id
+),
+TopActiveUsers as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        max(ua.VotesLast30Days) as MaxVotesIn30Days,
+        max(ua.UpVotesLast30Days) as MaxUpVotesIn30Days,
+        max(ua.DownVotesLast30Days) as MaxDownVotesIn30Days
+    from UserActivityWindow ua
+    group by ua.UserId, ua.DisplayName
+    having max(ua.VotesLast30Days) > 100
+),
+QuestionAnswerDetails as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Tags,
+        q.Score as QuestionScore,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerOwnerId,
+        u.DisplayName as AnswerOwnerName,
+        row_number() over (partition by q.Id order by a.Score desc nulls last) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        pt1.Title as PostTitle,
+        pt2.Title as RelatedPostTitle
+    from PostLinks pl
+    join Posts pt1 on pt1.Id = pl.PostId
+    join Posts pt2 on pt2.Id = pl.RelatedPostId
+    where pl.LinkTypeId = 3 -- Duplicate
+),
+ComplexFilteredQuestions as (
+    select
+        q.Id,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.Tags,
+        q.OwnerUserId,
+        u.DisplayName as OwnerName,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        coalesce(pc.CloseReasonName, 'Open') as CloseStatus,
+        pc.CloseDate,
+        das.TotalAnswerScore,
+        das.AvgAnswerScore,
+        das.MaxAnswerScore,
+        das.MinAnswerScore,
+        das.HasAnonymousAnswer,
+        das.LastAnswerDate
+    from Posts q
+    left join Users u on u.Id = q.OwnerUserId
+    left join UserBadgeStats ub on ub.UserId = q.OwnerUserId
+    left join PostCloseReasons pc on pc.PostId = q.Id
+    left join PostAnswerStats das on das.QuestionId = q.Id
+    where q.PostTypeId = 1
+      and q.Score > 5
+      and (q.ViewCount > 1000 or q.AnswerCount > 2)
+      and (pc.CloseReasonName is null or pc.CloseReasonName not in ('Duplicate', 'Off-topic'))
+      and ub.GoldBadges > 0
+      and exists (
+          select 1 from Posts a where a.ParentId = q.Id and a.Score > 10 limit 1
+      )
+),
+FinalResult as (
+    select
+        cfq.Id as QuestionId,
+        cfq.Title,
+        cfq.OwnerName,
+        cfq.Score as QuestionScore,
+        cfq.ViewCount,
+        cfq.AnswerCount,
+        cfq.GoldBadges,
+        cfq.SilverBadges,
+        cfq.BronzeBadges,
+        cfq.CloseStatus,
+        cfq.CloseDate,
+        cfq.TotalAnswerScore,
+        cfq.AvgAnswerScore,
+        cfq.MaxAnswerScore,
+        cfq.MinAnswerScore,
+        cfq.HasAnonymousAnswer,
+        cfq.LastAnswerDate,
+        string_agg(distinct rth.TagName, ', ') as RelatedTags,
+        dup.RelatedPostTitle as DuplicateOf,
+        row_number() over (order by cfq.Score desc, cfq.ViewCount desc) as RankByScoreView
+    from ComplexFilteredQuestions cfq
+    left join RecursiveTagHierarchy rth on position(rth.TagName in cfq.Tags) > 0
+    left join DuplicateLinks dup on dup.PostId = cfq.Id
+    group by cfq.Id, cfq.Title, cfq.OwnerName, cfq.Score, cfq.ViewCount, cfq.AnswerCount, cfq.GoldBadges, cfq.SilverBadges, cfq.BronzeBadges, cfq.CloseStatus, cfq.CloseDate, cfq.TotalAnswerScore, cfq.AvgAnswerScore, cfq.MaxAnswerScore, cfq.MinAnswerScore, cfq.HasAnonymousAnswer, cfq.LastAnswerDate, dup.RelatedPostTitle
+)
+select
+    fr.RankByScoreView,
+    fr.QuestionId,
+    fr.Title,
+    fr.OwnerName,
+    fr.QuestionScore,
+    fr.ViewCount,
+    fr.AnswerCount,
+    fr.GoldBadges,
+    fr.SilverBadges,
+    fr.BronzeBadges,
+    fr.CloseStatus,
+    fr.CloseDate,
+    fr.TotalAnswerScore,
+    fr.AvgAnswerScore,
+    fr.MaxAnswerScore,
+    fr.MinAnswerScore,
+    fr.HasAnonymousAnswer,
+    fr.LastAnswerDate,
+    fr.RelatedTags,
+    fr.DuplicateOf,
+    ta.MaxVotesIn30Days,
+    ta.MaxUpVotesIn30Days,
+    ta.MaxDownVotesIn30Days
+from FinalResult fr
+left join TopActiveUsers ta on ta.UserId = (
+    select OwnerUserId from Posts where Id = fr.QuestionId
+)
+where fr.RankByScoreView <= 50
+order by fr.RankByScoreView;

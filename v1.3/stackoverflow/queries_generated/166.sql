@@ -1,0 +1,248 @@
+-- {"query": "166.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 2882} 
+with
+-- posts authored by users (questions and answers)
+user_posts as (
+  select
+    p.id as post_id,
+    p.posttypeid,
+    p.parentid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.owneruserid,
+    p.tags,
+    p.title,
+    p.answercount,
+    p.favoritecount
+  from posts p
+  where p.owneruserid is not null
+),
+-- explode tags for questions
+question_tags as (
+  select
+    up.owneruserid as user_id,
+    trim(tag) as tag
+  from user_posts up
+  cross join lateral (
+    select regexp_split_to_table(substring(coalesce(up.tags,''), 2, greatest(length(coalesce(up.tags,'')) - 2,0)), '><') as tag
+  ) t
+  where up.posttypeid = 1 and coalesce(up.tags,'') <> ''
+),
+-- aggregate tag expertise (distinct questions per tag)
+tag_expertise as (
+  select
+    qt.user_id,
+    qt.tag,
+    count(distinct qt.tag || '-' || (select nullif(id::text,'') from posts p2 where false)) filter (where qt.tag is not null) as dummy -- keep structure; replaced below
+  from question_tags qt
+  group by qt.user_id, qt.tag
+),
+-- corrected tag counts by counting question posts per tag per user
+tag_counts as (
+  select
+    qt.user_id,
+    qt.tag,
+    count(*) as questions_with_tag
+  from question_tags qt
+  group by qt.user_id, qt.tag
+),
+-- badges summary
+badge_counts as (
+  select
+    b.userid,
+    count(*) as total_badges,
+    count(*) filter (where b.class = 1) as gold_badges,
+    count(*) filter (where b.class = 2) as silver_badges,
+    count(*) filter (where b.class = 3) as bronze_badges,
+    bool_or(b.tagbased) as has_tag_badges
+  from badges b
+  group by b.userid
+),
+-- votes by type per user (on their posts)
+votes_on_posts as (
+  select
+    up.owneruserid as user_id,
+    v.votetypeid,
+    count(*) as cnt,
+    sum(coalesce(v.bountyamount,0)) as total_bounty
+  from posts up
+  left join votes v on v.postid = up.id
+  where up.owneruserid is not null
+  group by up.owneruserid, v.votetypeid
+),
+-- pivot votes into columns
+votes_pivot as (
+  select
+    user_id,
+    coalesce(max(case when votetypeid = 1 then cnt end),0) as accepted_count,
+    coalesce(max(case when votetypeid = 2 then cnt end),0) as upvote_count,
+    coalesce(max(case when votetypeid = 3 then cnt end),0) as downvote_count,
+    coalesce(max(case when votetypeid = 8 then cnt end),0) as bounty_starts,
+    coalesce(sum(total_bounty),0) as bounty_received
+  from votes_on_posts
+  group by user_id
+),
+-- per-user post aggregates
+posts_agg as (
+  select
+    up.owneruserid as user_id,
+    count(*) filter (where up.posttypeid = 1) as questions,
+    count(*) filter (where up.posttypeid = 2) as answers,
+    sum(coalesce(up.score,0)) as total_score,
+    max(up.creationdate) as last_post_date,
+    min(up.creationdate) as first_post_date,
+    avg(coalesce(up.viewcount,0)) filter (where up.posttypeid = 1) as avg_question_views,
+    sum(coalesce(up.answercount,0)) filter (where up.posttypeid = 1) as total_answercount_on_questions,
+    count(distinct up.id) as total_posts
+  from user_posts up
+  group by up.owneruserid
+),
+-- compute last activity combining posts, comments, votes (correlated subquery)
+last_activity as (
+  select
+    u.id as user_id,
+    greatest(
+      coalesce((select max(p.creationdate) from posts p where p.owneruserid = u.id), '1970-01-01'::timestamp),
+      coalesce((select max(c.creationdate) from comments c where c.userid = u.id), '1970-01-01'::timestamp),
+      coalesce((select max(v.creationdate) from votes v where v.userid = u.id), '1970-01-01'::timestamp),
+      u.lastaccessdate
+    ) as last_activity_date
+  from users u
+),
+-- user base metrics
+user_base as (
+  select
+    u.id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    u.views as profile_views,
+    u.upvotes as total_upvotes_given,
+    u.downvotes as total_downvotes_given,
+    coalesce(bc.total_badges,0) as total_badges,
+    coalesce(bc.gold_badges,0) as gold_badges,
+    coalesce(bc.silver_badges,0) as silver_badges,
+    coalesce(bc.bronze_badges,0) as bronze_badges,
+    coalesce(pagg.questions,0) as questions,
+    coalesce(pagg.answers,0) as answers,
+    coalesce(pagg.total_score,0) as total_score,
+    coalesce(pagg.total_posts,0) as total_posts,
+    coalesce(vp.accepted_count,0) as accepted_votes_on_posts,
+    coalesce(vp.upvote_count,0) as upvotes_on_posts,
+    coalesce(vp.downvote_count,0) as downvotes_on_posts,
+    coalesce(vp.bounty_received,0) as bounty_received,
+    la.last_activity_date,
+    coalesce(pagg.last_post_date, u.creationdate) as last_post_date
+  from users u
+  left join badge_counts bc on bc.userid = u.id
+  left join posts_agg pagg on pagg.user_id = u.id
+  left join votes_pivot vp on vp.user_id = u.id
+  left join last_activity la on la.user_id = u.id
+),
+-- derive an engagement score with complex expressions, NULL logic and window functions
+scored_users as (
+  select
+    ub.*,
+    -- recency factor: exponential decay based on days since last activity
+    exp(-least(365.0, extract(epoch from (now() - ub.last_activity_date))/86400.0) / 90.0) as recency_factor,
+    -- badge factor emphasizing gold badges with diminishing returns
+    (1 + ln(1 + ub.gold_badges::numeric) * 3 + ln(1 + ub.silver_badges::numeric) * 1.5 + ln(1 + ub.bronze_badges::numeric) * 0.75) as badge_factor,
+    -- contribution ratio: answers to total posts (NULL-safe)
+    case when ub.total_posts > 0 then ub.answers::numeric / ub.total_posts else 0 end as answer_ratio,
+    -- quality proxy: average score per post
+    case when ub.total_posts > 0 then ub.total_score::numeric / ub.total_posts else 0 end as avg_score_per_post,
+    -- popularity proxy
+    (coalesce(ub.profile_views,0) + coalesce(ub.upvotes_on_posts,0) * 10 + coalesce(ub.accepted_votes_on_posts,0) * 25 + coalesce(ub.bounty_received,0)) as popularity_index,
+    -- final engagement score (arbitrary weighted combination with NULL handling)
+    (
+      (coalesce(ub.reputation,0)::numeric ^ 0.35) * 2.0
+      + (coalesce(ub.avg_score_per_post,0) * 15.0)
+      + (coalesce(ub.answer_ratio,0) * 50.0)
+      + (coalesce(ub.popularity_index,0) * 0.1)
+    ) * (1 + (coalesce(ub.total_badges,0)::numeric / 50.0)) * coalesce(exp(-nullif(extract(epoch from now() - ub.creationdate)/86400.0,0)/365.0),1) * coalesce(exp(-nullif(extract(epoch from now() - ub.last_activity_date)/86400.0,0)/180.0),1)
+    * (1 + (case when ub.reputation > 10000 then 0.05 when ub.reputation > 1000 then 0.02 else 0 end))
+    as raw_engagement_score
+  from user_base ub
+),
+-- rank users and compute moving averages & percentiles
+ranked as (
+  select
+    su.*,
+    row_number() over (order by raw_engagement_score desc nulls last) as engagement_rank,
+    rank() over (order by raw_engagement_score desc nulls last) as engagement_dense_rank,
+    ntile(100) over (order by raw_engagement_score desc nulls last) as percentile_rank,
+    avg(raw_engagement_score) over (order by raw_engagement_score desc rows between 49 preceding and 49 following) as local_moving_avg_101,
+    median_raw_score -- will be filled below via join
+  from scored_users su
+  left join (
+    select percentile_cont(0.5) within group (order by raw_engagement_score) as median_raw_score from scored_users
+  ) m on true
+),
+-- collect top tag per user (most questions with same tag) using lateral correlated subquery
+top_tags as (
+  select distinct on (tc.user_id)
+    tc.user_id,
+    tc.tag,
+    tc.questions_with_tag
+  from tag_counts tc
+  order by tc.user_id, tc.questions_with_tag desc, tc.tag
+),
+-- assemble final user summary with outer joins, null logic, string construction, and a correlated subquery to find an exemplary post
+final as (
+  select
+    r.engagement_rank,
+    r.percentile_rank,
+    r.id as user_id,
+    coalesce(r.displayname, '<<unknown user>>') as display_name,
+    r.reputation,
+    r.total_posts,
+    r.questions,
+    r.answers,
+    r.total_badges,
+    r.gold_badges,
+    r.silver_badges,
+    r.bronze_badges,
+    round(r.raw_engagement_score::numeric,2) as engagement_score,
+    round(r.local_moving_avg_101::numeric,2) as local_avg,
+    r.recency_factor,
+    r.badge_factor,
+    r.answer_ratio,
+    r.avg_score_per_post,
+    r.popularity_index,
+    coalesce(tt.tag, 'no-top-tag') as top_tag,
+    tt.questions_with_tag,
+    -- correlated subquery: pick an exemplary high-scoring recent post with complex tie-breakers
+    (
+      select p.id from posts p
+      where p.owneruserid = r.id
+        and (p.posttypeid in (1,2))
+        and (p.creationdate >= r.creationdate OR true) -- keep structure for planner
+      order by (coalesce(p.score,0) * 2 + coalesce(p.viewcount,0) / 100.0 + case when p.posttypeid = 1 then 5 else 0 end) desc,
+               p.creationdate desc
+      limit 1
+    ) as exemplar_post_id,
+    -- build a synthetic short summary string using string expressions and NULL logic
+    (
+      coalesce(r.displayname,'Anonymous')
+      || ' | R=' || coalesce(r.reputation::text,'0')
+      || ' | P=' || coalesce(r.total_posts::text,'0')
+      || ' | Q=' || coalesce(r.questions::text,'0')
+      || ' | A=' || coalesce(r.answers::text,'0')
+      || ' | B=' || coalesce(r.total_badges::text,'0')
+      || ' | T=' || coalesce(tt.tag,'-')
+    ) as compact_summary
+  from ranked r
+  left join top_tags tt on tt.user_id = r.id
+)
+-- final selection with filtering, set operator to mix in some manual seed users for comparison, and ordering
+select * from (
+  select * from final where total_posts >= 5 and engagement_rank <= 100
+  union
+  -- ensure at least some high-rep users even if they don't meet posts threshold
+  select * from final where user_id in (
+    select id from users u where u.reputation >= 200000 limit 10
+  )
+) u
+order by engagement_score desc nulls last, engagement_rank
+limit 50;

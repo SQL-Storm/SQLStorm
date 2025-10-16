@@ -1,0 +1,215 @@
+-- {"query": "266.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 4122} 
+WITH
+-- base questions and answers
+questions AS (
+  SELECT p.*,
+         COALESCE(u.DisplayName, p.OwnerDisplayName, '<deleted>') AS OwnerName,
+         COALESCE(u.Reputation, 0) AS OwnerReputation,
+         COALESCE(p.Tags, '') AS TagsClean
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1
+),
+answers AS (
+  SELECT p.*,
+         COALESCE(u.DisplayName, p.OwnerDisplayName, '<deleted>') AS OwnerName,
+         COALESCE(u.Reputation, 0) AS OwnerReputation
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 2
+),
+-- split tags into rows
+question_tags AS (
+  SELECT q.Id AS QuestionId,
+         lower(trim(t.tag)) AS tag
+  FROM questions q
+  CROSS JOIN LATERAL (
+    SELECT regexp_split_to_table(substring(q.TagsClean FROM 2 FOR char_length(q.TagsClean)-2), '><') AS tag
+  ) t
+),
+-- per-tag aggregates
+tag_stats AS (
+  SELECT qt.tag,
+         COUNT(*) AS question_count,
+         AVG(q.ViewCount) AS avg_views,
+         SUM(COALESCE(q.AnswerCount,0)) AS total_answers,
+         MAX(COALESCE(q.Score,0)) AS max_score
+  FROM question_tags qt
+  JOIN questions q ON q.Id = qt.QuestionId
+  GROUP BY qt.tag
+),
+-- per-user activity and badge-weighted score
+user_activity AS (
+  SELECT u.Id AS UserId,
+         COALESCE(u.DisplayName, '<deleted>') AS DisplayName,
+         COUNT(DISTINCT p.Id) AS total_posts,
+         SUM(CASE WHEN p.PostTypeId=1 THEN 1 ELSE 0 END) AS question_count,
+         SUM(CASE WHEN p.PostTypeId=2 THEN 1 ELSE 0 END) AS answer_count,
+         COALESCE(SUM(p.Score),0) AS total_post_score,
+         COALESCE(MAX(p.CreationDate), '1970-01-01'::timestamp) AS last_post_date,
+         -- moving-window-like aggregate per user (sum as window over partition)
+         SUM(COALESCE(p.Score,0)) OVER (PARTITION BY u.Id) AS partition_score
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName
+),
+badge_counts AS (
+  SELECT UserId,
+         COUNT(*) FILTER (WHERE TagBased = B'1') AS tag_badges,
+         COUNT(*) FILTER (WHERE Class = 1) AS gold_badges,
+         COUNT(*) FILTER (WHERE Class = 2) AS silver_badges,
+         COUNT(*) FILTER (WHERE Class = 3) AS bronze_badges,
+         COUNT(*) AS total_badges
+  FROM Badges
+  GROUP BY UserId
+),
+-- rank answers per question to get top answer
+answer_rank AS (
+  SELECT a.*,
+         ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC NULLS LAST, a.CreationDate ASC) AS rn
+  FROM answers a
+),
+top_answers AS (
+  SELECT ar.ParentId AS QuestionId,
+         ar.Id AS AnswerId,
+         ar.OwnerName AS AnswerOwner,
+         ar.Score AS AnswerScore
+  FROM answer_rank ar
+  WHERE ar.rn = 1
+),
+-- duplicate links grouping
+duplicate_links AS (
+  SELECT pl.RelatedPostId AS CanonQuestionId,
+         COUNT(*) AS duplicate_count,
+         array_agg(pl.PostId ORDER BY pl.CreationDate DESC) AS duplicate_examples
+  FROM PostLinks pl
+  WHERE pl.LinkTypeId = 3
+  GROUP BY pl.RelatedPostId
+),
+-- post-level heavy metrics (votes/comments/edits)
+post_metrics AS (
+  SELECT p.Id,
+         p.PostTypeId,
+         p.ParentId,
+         COALESCE(p.Score,0) AS Score,
+         COALESCE(p.ViewCount,0) AS ViewCount,
+         COALESCE(p.AnswerCount,0) AS AnswerCount,
+         COALESCE(p.CommentCount,0) AS CommentCount,
+         COALESCE(p.Title, '') AS Title,
+         COALESCE(p.Body, '') AS Body,
+         COALESCE(p.OwnerUserId, -1) AS OwnerUserId,
+         -- correlated aggregations for votes
+         (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotes,
+         (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVotes,
+         (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCountReal,
+         (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.CreationDate > now() - INTERVAL '365 days') AS EditsLastYear,
+         (SELECT AVG(COALESCE(v2.BountyAmount,0)) FROM Votes v2 WHERE v2.PostId = p.Id AND v2.BountyAmount IS NOT NULL) AS AvgBounty
+  FROM Posts p
+),
+-- controversial intersection: posts with many downvotes and many views
+controversial AS (
+  SELECT pm.Id
+  FROM post_metrics pm
+  WHERE pm.DownVotes >= 3
+    AND pm.ViewCount > 500
+),
+controversial_high AS (
+  SELECT Id FROM post_metrics WHERE Id IN (SELECT Id FROM controversial)
+  INTERSECT
+  SELECT Id FROM post_metrics WHERE Score < 0
+),
+-- build a heavy per-question derived table combining many metrics and correlated subqueries
+question_analytics AS (
+  SELECT q.Id AS QuestionId,
+         q.Title,
+         COALESCE(q.OwnerDisplayName, ua.DisplayName, q.OwnerName) AS OwnerName,
+         ua.OwnerReputation,
+         COALESCE(pm.ViewCount,0) AS ViewCount,
+         COALESCE(pm.Score,0) AS Score,
+         COALESCE(pm.AnswerCount,0) AS AnswerCount,
+         COALESCE(pm.CommentCountReal,0) AS CommentCount,
+         COALESCE(ta.AnswerId, NULL) AS TopAnswerId,
+         COALESCE(ta.AnswerOwner, '') AS TopAnswerOwner,
+         COALESCE(dup.duplicate_count, 0) AS DuplicateCount,
+         COALESCE(pm.EditsLastYear, 0) AS EditsLastYear,
+         -- engagement score: composite of log views, sqrt answers, normalized score, badge influence, recency
+         (
+           ln(1 + COALESCE(pm.ViewCount,0)) * 0.35
+           + sqrt(1 + COALESCE(pm.AnswerCount,0)) * 2.0
+           + (COALESCE(pm.Score,0) / NULLIF(GREATEST(1, greatest(1, ua.total_posts)), 0)) * 1.5
+           + COALESCE(bc.gold_badges,0) * 3.0 + COALESCE(bc.silver_badges,0) * 1.5 + COALESCE(bc.bronze_badges,0) * 0.5
+           - LEAST(30, GREATEST(0, EXTRACT(DAY FROM (now() - COALESCE(q.LastActivityDate, q.CreationDate))))) * 0.02
+         ) AS EngagementScore,
+         -- text fragment and synthetic tag list
+         LEFT(REPLACE(REGEXP_REPLACE(COALESCE(q.Body,''), '<[^>]*>', '','g'), E'\n',' '), 200) AS BodySnippet,
+         (SELECT string_agg(DISTINCT qt.tag, ',') FROM question_tags qt WHERE qt.QuestionId = q.Id) AS TagList,
+         EXISTS(SELECT 1 FROM controversial_high ch WHERE ch.Id = q.Id) AS IsControversial
+  FROM questions q
+  LEFT JOIN post_metrics pm ON pm.Id = q.Id
+  LEFT JOIN top_answers ta ON ta.QuestionId = q.Id
+  LEFT JOIN duplicate_links dup ON dup.CanonQuestionId = q.Id
+  LEFT JOIN user_activity ua ON ua.UserId = q.OwnerUserId
+  LEFT JOIN badge_counts bc ON bc.UserId = q.OwnerUserId
+),
+-- per-tag ranked metrics with window
+tag_ranks AS (
+  SELECT ts.*,
+         RANK() OVER (ORDER BY ts.question_count DESC, ts.avg_views DESC) AS tag_pop_rank,
+         ROW_NUMBER() OVER (ORDER BY ts.question_count DESC) AS tag_rownum
+  FROM tag_stats ts
+),
+-- suspicious users: have negative-average posts and at least one moderator flag (approx via VoteType 12 Spam/ other)
+suspicious_users AS (
+  SELECT u.Id AS UserId, u.DisplayName,
+         AVG(COALESCE(p.Score,0)) AS avg_score,
+         SUM(CASE WHEN v.VoteTypeId IN (12,10) THEN 1 ELSE 0 END) AS mod_flags
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName
+  HAVING AVG(COALESCE(p.Score,0)) < 0 AND SUM(CASE WHEN v.VoteTypeId IN (12,10) THEN 1 ELSE 0 END) > 0
+)
+-- final union combining per-question and per-tag rows for benchmarking many joins, window functions, correlated subs
+SELECT
+  'question'::text AS entity_type,
+  qa.QuestionId AS entity_id,
+  LEFT(qa.Title, 120) AS name,
+  qa.OwnerName AS owner,
+  ROUND(qa.EngagementScore::numeric,4) AS metric1,
+  qa.ViewCount AS metric2,
+  qa.Score AS metric3,
+  qa.AnswerCount AS metric4,
+  qa.TopAnswerOwner AS extra1,
+  qa.TagList AS extra2,
+  qa.DuplicateCount AS extra3,
+  qa.IsControversial::text AS flag
+FROM question_analytics qa
+WHERE qa.EngagementScore IS NOT NULL
+  AND (qa.ViewCount > 100 OR qa.AnswerCount > 2 OR qa.IsControversial)
+ORDER BY qa.EngagementScore DESC
+LIMIT 250
+
+UNION ALL
+
+SELECT
+  'tag'::text AS entity_type,
+  NULL::int AS entity_id,
+  tr.tag AS name,
+  NULL::text AS owner,
+  ROUND((tr.avg_views * LOG(1 + tr.question_count))::numeric,4) AS metric1,
+  tr.question_count AS metric2,
+  tr.total_answers AS metric3,
+  tr.max_score AS metric4,
+  -- top 3 example questions for the tag (heavy string aggregation)
+  (SELECT LEFT(string_agg(DISTINCT COALESCE(q.Title,'' ) || ' (id=' || q.Id::text || ')' , ' | ' ORDER BY q.ViewCount DESC), 400)
+   FROM questions q
+   JOIN question_tags qt ON qt.QuestionId = q.Id
+   WHERE qt.tag = tr.tag
+   LIMIT 1) AS extra1,
+  NULL::text AS extra2,
+  NULL::int AS extra3,
+  (CASE WHEN tr.question_count > 100 THEN 'hot' ELSE 'normal' END) AS flag
+FROM tag_ranks tr
+WHERE tr.question_count >= 5
+ORDER BY tr.question_count DESC, tr.avg_views DESC
+LIMIT 100;

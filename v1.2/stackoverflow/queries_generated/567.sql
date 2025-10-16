@@ -1,0 +1,141 @@
+-- {"query": "567.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1142} 
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersGiven,
+        count(distinct c.Id) as CommentsMade,
+        count(distinct b.Id) as BadgesEarned,
+        row_number() over (partition by u.Id order by ph.CreationDate desc nulls last) as LastEditRank,
+        ph.CreationDate as LastEditDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, ph.CreationDate
+),
+LastUserEdits as (
+    select UserId, max(CreationDate) as LastEditDate
+    from PostHistory
+    where UserId is not null
+    group by UserId
+),
+TopUsers as (
+    select
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.QuestionsAsked,
+        u.AnswersGiven,
+        u.CommentsMade,
+        u.BadgesEarned,
+        coalesce(lue.LastEditDate, u.LastEditDate) as LastEditDate,
+        rank() over (order by u.Reputation desc, u.BadgesEarned desc) as UserRank
+    from RecursiveUserActivity u
+    left join LastUserEdits lue on lue.UserId = u.UserId
+    where u.Reputation > 1000
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        q.Tags,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreation,
+        a.OwnerUserId as AnswerUserId,
+        u.DisplayName as AnswerUserDisplayName,
+        row_number() over (partition by q.Id order by a.Score desc nulls last, a.CreationDate asc) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1
+),
+TopAnswers as (
+    select
+        QuestionId,
+        Title,
+        QuestionCreation,
+        QuestionScore,
+        QuestionViews,
+        Tags,
+        AnswerId,
+        AnswerScore,
+        AnswerCreation,
+        AnswerUserId,
+        AnswerUserDisplayName
+    from QuestionAnswerStats
+    where AnswerRank = 1
+),
+DuplicateLinks as (
+    select
+        pl.PostId as DuplicatePostId,
+        pl.RelatedPostId as OriginalPostId,
+        p1.Title as DuplicateTitle,
+        p2.Title as OriginalTitle,
+        pl.CreationDate as LinkCreationDate
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where pl.LinkTypeId = 3
+),
+UserBadgeSummary as (
+    select
+        UserId,
+        Name,
+        Class,
+        count(*) as BadgeCount
+    from Badges
+    group by UserId, Name, Class
+),
+UserBadgePivot as (
+    select
+        UserId,
+        sum(case when Class = 1 then BadgeCount else 0 end) as GoldBadges,
+        sum(case when Class = 2 then BadgeCount else 0 end) as SilverBadges,
+        sum(case when Class = 3 then BadgeCount else 0 end) as BronzeBadges
+    from UserBadgeSummary
+    group by UserId
+)
+select
+    tu.UserRank,
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.QuestionsAsked,
+    tu.AnswersGiven,
+    tu.CommentsMade,
+    ubp.GoldBadges,
+    ubp.SilverBadges,
+    ubp.BronzeBadges,
+    to_char(tu.LastEditDate, 'YYYY-MM-DD HH24:MI:SS') as LastEditDate,
+    ta.QuestionId,
+    ta.Title as QuestionTitle,
+    ta.QuestionCreation,
+    ta.QuestionScore,
+    ta.QuestionViews,
+    coalesce(ta.Tags, '') as Tags,
+    ta.AnswerId,
+    ta.AnswerScore,
+    ta.AnswerCreation,
+    ta.AnswerUserId,
+    ta.AnswerUserDisplayName,
+    dl.DuplicatePostId,
+    dl.DuplicateTitle,
+    dl.OriginalPostId,
+    dl.OriginalTitle,
+    dl.LinkCreationDate
+from TopUsers tu
+left join TopAnswers ta on ta.AnswerUserId = tu.UserId
+left join UserBadgePivot ubp on ubp.UserId = tu.UserId
+left join DuplicateLinks dl on dl.DuplicatePostId = ta.AnswerId
+where tu.UserRank <= 50
+order by tu.UserRank, ta.QuestionCreation desc;

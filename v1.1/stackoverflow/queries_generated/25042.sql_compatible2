@@ -1,0 +1,232 @@
+WITH
+    user_stats AS (
+        SELECT
+            u.id                              AS user_id,
+            u.displayname                     AS user_name,
+            u.reputation,
+            COALESCE(u.upvotes, 0) - COALESCE(u.downvotes, 0) AS net_votes,
+            ROW_NUMBER() OVER (ORDER BY u.reputation DESC, COALESCE(u.upvotes, 0) - COALESCE(u.downvotes, 0) DESC) AS reputation_rank,
+            (SELECT COUNT(*) FROM badges b WHERE b.userid = u.id AND b.class = 1) AS gold_badges,
+            (SELECT COUNT(*) FROM badges b WHERE b.userid = u.id AND b.class = 2) AS silver_badges,
+            (SELECT COUNT(*) FROM badges b WHERE b.userid = u.id AND b.class = 3) AS bronze_badges,
+            (SELECT STRING_AGG(DISTINCT b.name, ', ')
+               FROM badges b
+               WHERE b.userid = u.id AND b.class = 1)           AS gold_badge_names
+        FROM users u
+        WHERE u.reputation IS NOT NULL
+    ),
+
+    tag_agg AS (
+        SELECT
+            t.tagname,
+            t.count                                 AS tag_usage,
+            COALESCE(agg.avg_answer_cnt, 0)         AS avg_answers_per_q,
+            ROW_NUMBER() OVER (ORDER BY t.count DESC) AS tag_rank
+        FROM tags t
+        LEFT JOIN (
+            SELECT
+                tag,
+                AVG(p.answercount)                               AS avg_answer_cnt
+            FROM (
+                SELECT
+                    p.answercount,
+                    -- normalize tags like '<tag1><tag2>' into rows by splitting on '><'
+                    -- remove leading '<' and trailing '>' if present, then split
+                    CASE
+                        WHEN p.tags LIKE '<%' AND p.tags LIKE '%>' THEN
+                            -- remove leading '<' and trailing '>'
+                            REGEXP_REPLACE(p.tags, '^<|>$', '')
+                        ELSE
+                            p.tags
+                    END AS tags_clean
+                FROM posts p
+                WHERE p.posttypeid = 1
+            ) p
+            CROSS JOIN LATERAL (
+                -- split tags_clean on '><' into rows; use a simple recursive splitter for dialects without UNNEST
+                SELECT tag_val AS tag
+                FROM (
+                    SELECT
+                        CASE
+                            WHEN tags_clean = '' OR tags_clean IS NULL THEN NULL
+                            ELSE tags_clean
+                        END AS to_split,
+                        1 AS start_pos
+                ) s
+                CROSS JOIN LATERAL (
+                    -- iterate using a string-splitting approach: generate numbers up to a reasonable limit (assumes tags per post <= 50)
+                    SELECT
+                        SUBSTR(s.to_split,
+                               pos,
+                               CASE
+                                   WHEN INSTR(SUBSTR(s.to_split, pos), '><') = 0 THEN LENGTH(SUBSTR(s.to_split, pos))
+                                   ELSE INSTR(SUBSTR(s.to_split, pos), '><') - 1
+                               END
+                        ) AS tag_val,
+                        pos + CASE WHEN INSTR(SUBSTR(s.to_split, pos), '><') = 0 THEN LENGTH(SUBSTR(s.to_split, pos)) ELSE INSTR(SUBSTR(s.to_split, pos), '><') + 1 END AS next_pos,
+                        CASE WHEN INSTR(SUBSTR(s.to_split, pos), '><') = 0 THEN 0 ELSE 1 END AS has_more
+                    FROM (
+                        SELECT
+                            to_split,
+                            (n-1) * 1 + 1 AS pos
+                        FROM (
+                            SELECT to_split FROM (SELECT s.to_split)
+                        ),
+                        (SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10
+                         UNION ALL SELECT 11 UNION ALL SELECT 12 UNION ALL SELECT 13 UNION ALL SELECT 14 UNION ALL SELECT 15 UNION ALL SELECT 16 UNION ALL SELECT 17 UNION ALL SELECT 18 UNION ALL SELECT 19 UNION ALL SELECT 20
+                         UNION ALL SELECT 21 UNION ALL SELECT 22 UNION ALL SELECT 23 UNION ALL SELECT 24 UNION ALL SELECT 25 UNION ALL SELECT 26 UNION ALL SELECT 27 UNION ALL SELECT 28 UNION ALL SELECT 29 UNION ALL SELECT 30
+                         UNION ALL SELECT 31 UNION ALL SELECT 32 UNION ALL SELECT 33 UNION ALL SELECT 34 UNION ALL SELECT 35 UNION ALL SELECT 36 UNION ALL SELECT 37 UNION ALL SELECT 38 UNION ALL SELECT 39 UNION ALL SELECT 40
+                         UNION ALL SELECT 41 UNION ALL SELECT 42 UNION ALL SELECT 43 UNION ALL SELECT 44 UNION ALL SELECT 45 UNION ALL SELECT 46 UNION ALL SELECT 47 UNION ALL SELECT 48 UNION ALL SELECT 49 UNION ALL SELECT 50) nums
+                        WHERE (n-1) * 1 + 1 <= LENGTH(to_split)
+                    )
+                    WHERE tag_val IS NOT NULL AND LENGTH(tag_val) > 0
+                )
+            ) split_tags
+            GROUP BY tag
+        ) agg ON agg.tag = t.tagname
+    ),
+
+    question_detail AS (
+        SELECT
+            q.id                                   AS question_id,
+            q.title,
+            q.creationdate,
+            q.score,
+            q.viewcount,
+            q.favoritecount,
+            q.answercount,
+            q.commentcount,
+            CASE WHEN q.closeddate IS NULL THEN 0 ELSE 1 END        AS is_closed,
+            CASE WHEN q.acceptedanswerid IS NOT NULL THEN 1 ELSE 0 END AS has_accepted,
+            ROW_NUMBER() OVER (PARTITION BY q.owneruserid ORDER BY q.score DESC) AS user_q_rank,
+            (SELECT COUNT(*) FROM votes v WHERE v.postid = q.id AND v.votetypeid = 2) AS up_votes,
+            (SELECT COUNT(*) FROM votes v WHERE v.postid = q.id AND v.votetypeid = 3) AS down_votes,
+            COALESCE(plc.linkcount, 0)                                         AS duplicate_link_count,
+            q.owneruserid
+        FROM posts q
+        LEFT JOIN (
+            SELECT pl.postid, COUNT(*) AS linkcount
+            FROM postlinks pl
+            WHERE pl.linktypeid = 3
+            GROUP BY pl.postid
+        ) plc ON plc.postid = q.id
+        WHERE q.posttypeid = 1
+    ),
+
+    top_entities AS (
+        SELECT
+            'User'   AS entity_type,
+            us.user_id,
+            us.user_name,
+            us.reputation,
+            us.net_votes,
+            us.gold_badges,
+            us.silver_badges,
+            us.bronze_badges,
+            us.reputation_rank          AS rank,
+            NULL                   AS tag_rank,
+            NULL                   AS tag_name,
+            NULL                   AS question_id,
+            NULL                   AS question_title
+        FROM user_stats us
+        WHERE us.reputation_rank <= 100
+
+        UNION ALL
+
+        SELECT
+            'Tag'    AS entity_type,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            ta.tag_rank,
+            ta.tagname,
+            NULL,
+            NULL
+        FROM tag_agg ta
+        WHERE ta.tag_rank <= 100
+    ),
+
+    final_set AS (
+        SELECT
+            te.entity_type,
+            te.user_id,
+            te.user_name,
+            te.reputation,
+            te.net_votes,
+            te.gold_badges,
+            te.silver_badges,
+            te.bronze_badges,
+            te.rank,
+            te.tag_rank,
+            te.tag_name,
+            qd.question_id,
+            qd.title                AS question_title,
+            qd.score,
+            qd.viewcount,
+            qd.favoritecount,
+            qd.answercount,
+            qd.up_votes,
+            qd.down_votes,
+            qd.is_closed,
+            qd.has_accepted,
+            qd.duplicate_link_count
+        FROM top_entities te
+        LEFT JOIN question_detail qd
+               ON te.user_id = qd.question_id % 1000
+    )
+SELECT
+    entity_type,
+    user_id,
+    user_name,
+    reputation,
+    net_votes,
+    gold_badges,
+    silver_badges,
+    bronze_badges,
+    rank,
+    tag_rank,
+    tag_name,
+    question_id,
+    question_title,
+    score,
+    viewcount,
+    favoritecount,
+    answercount,
+    up_votes,
+    down_votes,
+    is_closed,
+    has_accepted,
+    duplicate_link_count
+FROM final_set
+GROUP BY
+    entity_type,
+    user_id,
+    user_name,
+    reputation,
+    net_votes,
+    gold_badges,
+    silver_badges,
+    bronze_badges,
+    rank,
+    tag_rank,
+    tag_name,
+    question_id,
+    question_title,
+    score,
+    viewcount,
+    favoritecount,
+    answercount,
+    up_votes,
+    down_votes,
+    is_closed,
+    has_accepted,
+    duplicate_link_count
+ORDER BY
+    entity_type,
+    CASE WHEN entity_type = 'User' THEN rank END,
+    CASE WHEN entity_type = 'Tag'  THEN tag_rank END
+LIMIT 200;

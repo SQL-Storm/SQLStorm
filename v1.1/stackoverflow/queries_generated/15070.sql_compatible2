@@ -1,0 +1,75 @@
+WITH UserBadgeCounts AS (
+    SELECT 
+        u.Id AS UserId, 
+        u.DisplayName,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY COUNT(b.Id) DESC) AS BadgeRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+PostQualityMetrics AS (
+    SELECT 
+        p.OwnerUserId,
+        AVG(p.Score) AS AvgPostScore,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpVotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownVotes,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalViews,
+        DENSE_RANK() OVER (ORDER BY AVG(p.Score) DESC) AS ScoreRank
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY p.OwnerUserId
+)
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    ubc.TotalBadges,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    ubc.BadgeRank,
+    pqm.AvgPostScore,
+    pqm.TotalVotes,
+    pqm.UpVotes,
+    pqm.DownVotes,
+    pqm.TotalViews,
+    pqm.ScoreRank,
+    CASE 
+        WHEN ubc.TotalBadges > 0 AND pqm.TotalVotes > 0 
+        THEN ROUND((pqm.AvgPostScore * LOG(CASE WHEN ubc.TotalBadges>0 THEN CAST(ubc.TotalBadges AS DOUBLE PRECISION) ELSE 1 END) * LOG(CASE WHEN pqm.TotalVotes>0 THEN CAST(pqm.TotalVotes AS DOUBLE PRECISION) ELSE 1 END))::numeric, 2)
+        ELSE NULL 
+    END AS ComplexityScore,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = u.Id) AS TotalEdits
+FROM Users u
+LEFT JOIN UserBadgeCounts ubc ON u.Id = ubc.UserId
+LEFT JOIN PostQualityMetrics pqm ON u.Id = pqm.OwnerUserId
+WHERE 
+    u.Reputation > 100 
+    AND (COALESCE(ubc.TotalBadges,0) > 0 OR COALESCE(pqm.TotalVotes,0) > 0)
+    AND EXISTS (
+        SELECT 1 
+        FROM Posts p 
+        WHERE p.OwnerUserId = u.Id 
+          AND p.Score > 10
+    )
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    ubc.TotalBadges,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    ubc.BadgeRank,
+    pqm.AvgPostScore,
+    pqm.TotalVotes,
+    pqm.UpVotes,
+    pqm.DownVotes,
+    pqm.TotalViews,
+    pqm.ScoreRank
+ORDER BY ComplexityScore DESC NULLS LAST
+LIMIT 500;

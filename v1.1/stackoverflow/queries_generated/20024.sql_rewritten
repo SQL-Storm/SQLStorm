@@ -1,0 +1,140 @@
+-- {"query": "20024.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1485} 
+WITH UserMetrics AS (
+    -- Calculate base metrics for users with substantial activity
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        (SELECT MIN(p.CreationDate) FROM Posts p WHERE p.OwnerUserId = u.Id) AS FirstPostDate
+    FROM
+        Users u
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    WHERE
+        u.Reputation > 10000 AND u.Views > (SELECT AVG(Views) * 1.5 FROM Users)
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.UpVotes, u.DownVotes
+    HAVING
+        COUNT(b.Id) > 10
+),
+PostStats AS (
+    -- Gather detailed statistics for each post by these users, including time to next post
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        CASE
+            WHEN p.PostTypeId = 1 THEN LENGTH(p.Title)
+            ELSE LENGTH(p.Body)
+        END AS ContentLength,
+        LEAD(p.CreationDate, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostDate,
+        (
+            SELECT STRING_AGG(c.Text, ' || ')
+            FROM Comments c
+            WHERE c.PostId = p.Id AND c.Score > 5
+        ) AS TopCommentsText
+    FROM
+        Posts p
+    WHERE
+        p.OwnerUserId IN (SELECT UserId FROM UserMetrics)
+        AND p.DeletionDate IS NULL
+),
+AggregatedUserStats AS (
+    -- Aggregate post stats to the user level and calculate derived metrics
+    SELECT
+        um.UserId,
+        um.DisplayName,
+        um.Reputation,
+        um.GoldBadges,
+        um.SilverBadges,
+        (um.UpVotes - um.DownVotes) AS NetVotes,
+        um.Reputation / NULLIF(EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - um.CreationDate)) / 86400.0, 0) AS ReputationPerDay,
+        AVG(ps.Score) AS AvgPostScore,
+        SUM(CASE WHEN ps.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN ps.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        AVG(ps.ViewCount) FILTER (WHERE ps.PostTypeId = 1) AS AvgQuestionViewCount,
+        AVG(EXTRACT(EPOCH FROM (ps.NextPostDate - ps.CreationDate))) / 3600.0 AS AvgHoursBetweenPosts,
+        MAX(ps.ContentLength) AS MaxContentLength,
+        SUM(CASE WHEN ps.TopCommentsText LIKE '%excellent%' THEN 1 ELSE 0 END) AS PositiveFeedbackCount
+    FROM
+        UserMetrics um
+    JOIN
+        PostStats ps ON um.UserId = ps.OwnerUserId
+    GROUP BY
+        um.UserId, um.DisplayName, um.Reputation, um.GoldBadges, um.SilverBadges, um.NetVotes, um.ReputationPerDay
+),
+UserTagRanking AS (
+    -- For each user, unnest and rank their most used tags
+    SELECT
+        OwnerUserId,
+        Tag,
+        TagRank
+    FROM (
+        SELECT
+            p.OwnerUserId,
+            unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS Tag,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY COUNT(*) DESC) AS TagRank
+        FROM
+            Posts p
+        WHERE
+            p.OwnerUserId IN (SELECT UserId FROM UserMetrics)
+            AND p.PostTypeId = 1 AND p.Tags IS NOT NULL
+        GROUP BY
+            p.OwnerUserId, Tag
+    ) AS Ranked
+    WHERE TagRank <= 3
+)
+-- Final selection and scoring
+SELECT
+    aus.DisplayName,
+    aus.Reputation,
+    DENSE_RANK() OVER (ORDER BY aus.Reputation DESC, aus.GoldBadges DESC) AS OverallRank,
+    COALESCE(TopTags.FavoriteTags, 'N/A') AS Top3Tags,
+    aus.TotalQuestions,
+    aus.TotalAnswers,
+    CAST(aus.AvgQuestionViewCount AS INT),
+    aus.AvgPostScore,
+    aus.ReputationPerDay,
+    CASE
+        WHEN aus.GoldBadges > 10 AND aus.ReputationPerDay > 50 THEN 'Elite Contributor'
+        WHEN aus.SilverBadges > 50 AND aus.AvgPostScore > 15 THEN 'Power User'
+        WHEN aus.TotalAnswers > aus.TotalQuestions THEN 'Answer Specialist'
+        ELSE 'Regular Contributor'
+    END AS UserTier,
+    (aus.Reputation * 0.4 + aus.AvgPostScore * 10 + aus.GoldBadges * 100 + aus.NetVotes * 0.2) AS CalculatedImpactScore
+FROM
+    AggregatedUserStats aus
+LEFT JOIN (
+    -- Aggregate the top tags into a single string for the final join
+    SELECT
+        UserId,
+        STRING_AGG(Tag, ', ' ORDER BY TagRank) AS FavoriteTags
+    FROM
+        UserTagRanking
+    GROUP BY
+        UserId
+) AS TopTags ON aus.UserId = TopTags.UserId
+WHERE
+    aus.AvgHoursBetweenPosts < 72 -- Filter for users who post at least every 3 days on average
+    AND EXISTS (
+        -- Correlated subquery: Ensure the user has at least one accepted answer with a score > 50
+        SELECT 1
+        FROM Posts ans
+        JOIN Posts q ON ans.ParentId = q.Id
+        WHERE ans.OwnerUserId = aus.UserId
+          AND q.AcceptedAnswerId = ans.Id
+          AND ans.Score > 50
+    )
+ORDER BY
+    CalculatedImpactScore DESC,
+    OverallRank ASC
+LIMIT 100;

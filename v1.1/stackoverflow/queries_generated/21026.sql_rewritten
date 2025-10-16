@@ -1,0 +1,135 @@
+-- {"query": "21026.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2168, "output_tokens": 1424} 
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id,
+        u.Reputation,
+        u.DisplayName,
+        u.CreationDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.UpVotes DESC) as ReputationRank
+    FROM Users u
+    WHERE u.Reputation > 100
+      AND u.LastAccessDate >= cast('2024-10-01' as date) - INTERVAL '365 days'
+),
+QuestionMetrics AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.CommentCount,
+        au.Id as OwnerId,
+        au.ReputationRank,
+        COALESCE(accepted.Score, 0) as AcceptedScore,
+        LAG(p.Score) OVER (PARTITION BY au.Id ORDER BY p.CreationDate) as PrevQuestionScore,
+        AVG(p.Score) OVER (PARTITION BY au.Id ORDER BY p.CreationDate ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) as RecentAvgScore,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            ELSE 'Open'
+        END as PostStatus
+    FROM Posts p
+    LEFT JOIN ActiveUsers au ON p.OwnerUserId = au.Id
+    LEFT JOIN Posts accepted ON p.AcceptedAnswerId = accepted.Id
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '2 years'
+      AND p.Score > 0
+),
+EngagedQuestions AS (
+    SELECT 
+        qm.*,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        COUNT(DISTINCT c.Id) as CommentCountActual,
+        SUM(CASE WHEN vl.VoteTypeId IN (2,1) THEN 1 ELSE 0 END) as UpVotes,
+        SUM(CASE WHEN vl.VoteTypeId = 3 THEN 1 ELSE 0 END) as DownVotes,
+        STRING_AGG(DISTINCT SUBSTRING(pl.RelatedPostId::text FROM 1 FOR 5), ', ') as LinkedPosts
+    FROM QuestionMetrics qm
+    LEFT JOIN Votes v ON qm.PostId = v.PostId 
+                      AND v.CreationDate BETWEEN qm.CreationDate AND qm.CreationDate + INTERVAL '30 days'
+    LEFT JOIN Comments c ON qm.PostId = c.PostId AND c.Score >= 0
+    LEFT JOIN PostLinks pl ON qm.PostId = pl.PostId AND pl.LinkTypeId = 1
+    LEFT JOIN Votes vl ON qm.PostId = vl.PostId 
+                      AND vl.VoteTypeId IN (1,2,3)
+                      AND vl.CreationDate <= qm.CreationDate + INTERVAL '7 days'
+    GROUP BY qm.PostId, qm.Title, qm.CreationDate, qm.Score, qm.ViewCount, 
+             qm.AnswerCount, qm.FavoriteCount, qm.CommentCount, qm.OwnerId, 
+             qm.ReputationRank, qm.AcceptedScore, qm.PrevQuestionScore, 
+             qm.RecentAvgScore, qm.PostStatus
+    HAVING COUNT(DISTINCT v.Id) > 5 OR qm.ViewCount > 1000
+),
+HighImpactPosts AS (
+    SELECT 
+        eq.*,
+        ph.PostHistoryTypeId,
+        ph.CreationDate as HistoryDate,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 'Edited'
+            WHEN ph.PostHistoryTypeId IN (10,11) THEN 
+                CASE 
+                    WHEN CAST(ph.Comment as INTEGER) = 101 THEN 'Duplicate Closed'
+                    WHEN CAST(ph.Comment as INTEGER) = 102 THEN 'Off-topic Closed'
+                    ELSE 'Other Close'
+                END
+            WHEN ph.PostHistoryTypeId = 12 THEN 'Deleted'
+            ELSE 'Other'
+        END as HistoryAction,
+        ROW_NUMBER() OVER (PARTITION BY eq.OwnerId, eq.PostStatus 
+                          ORDER BY eq.ViewCount DESC, eq.VoteCount DESC) as ImpactRank
+    FROM EngagedQuestions eq
+    LEFT JOIN PostHistory ph ON eq.PostId = ph.PostId 
+                            AND ph.CreationDate > eq.CreationDate 
+                            AND ph.CreationDate <= eq.CreationDate + INTERVAL '90 days'
+    WHERE (eq.UpVotes - COALESCE(eq.DownVotes, 0)) > 10
+       OR eq.AcceptedScore > 5
+)
+SELECT 
+    hip.OwnerId,
+    au.DisplayName as OwnerName,
+    au.Reputation,
+    au.ReputationRank,
+    COUNT(hip.PostId) as TotalQuestions,
+    SUM(hip.ViewCount) as TotalViews,
+    SUM(hip.VoteCount) as TotalVotes,
+    AVG(hip.RecentAvgScore) as AvgQuestionQuality,
+    SUM(CASE WHEN hip.ImpactRank = 1 THEN 1 ELSE 0 END) as TopPostsCount,
+    STRING_AGG(
+        DISTINCT COALESCE(
+            SUBSTRING(hip.Title, 1, 50) || 
+            CASE 
+                WHEN hip.PostStatus = 'Closed' AND hip.HistoryAction LIKE '%Closed%' 
+                THEN ' [CLOSED: ' || hip.HistoryAction || ']'
+                WHEN hip.ClosedDate IS NOT NULL 
+                THEN ' [CLOSED]'
+                ELSE ''
+            END, 
+            'Untitled'
+        ), 
+        ' | '
+    ) as QuestionTitles,
+    MAX(hip.HistoryDate) as LatestActivity,
+    CASE 
+        WHEN COUNT(CASE WHEN hip.HistoryAction LIKE '%Closed%' THEN 1 END) > 0 
+        THEN 'Has Closed Questions'
+        WHEN COUNT(CASE WHEN hip.HistoryAction = 'Edited' THEN 1 END) > COUNT(hip.PostId) * 0.5 
+        THEN 'Frequently Edited'
+        ELSE 'Stable Poster'
+    END as EngagementPattern
+FROM HighImpactPosts hip
+INNER JOIN ActiveUsers au ON hip.OwnerId = au.Id
+WHERE hip.PostStatus != 'Community Owned'
+  AND (hip.ImpactRank <= 3 OR hip.ViewCount > 5000)
+  AND NOT EXISTS (
+      SELECT 1 
+      FROM Badges b 
+      WHERE b.UserId = hip.OwnerId 
+        AND b.Name LIKE '%Troll%' 
+        AND b.Date >= hip.CreationDate - INTERVAL '1 year'
+  )
+GROUP BY hip.OwnerId, au.DisplayName, au.Reputation, au.ReputationRank
+HAVING COUNT(hip.PostId) >= 2 
+   AND AVG(hip.RecentAvgScore) > 2
+   AND SUM(hip.ViewCount) > 10000
+ORDER BY TotalViews DESC, ReputationRank ASC
+LIMIT 50;

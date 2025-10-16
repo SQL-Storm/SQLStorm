@@ -1,0 +1,153 @@
+-- {"query": "21044.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2168, "output_tokens": 1638} 
+
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score) AS AvgPostScore
+    FROM Users u
+    INNER JOIN Posts p ON u.Id = p.OwnerUserId 
+    WHERE u.Reputation >= 100 
+      AND u.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+      AND p.CreationDate >= CURRENT_DATE - INTERVAL '6 months'
+    GROUP BY u.Id, u.Reputation, u.DisplayName
+    HAVING COUNT(DISTINCT p.Id) >= 5
+),
+QuestionStats AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        COALESCE(ac.AcceptedAnswerId, 0) AS HasAcceptedAnswer,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS ScoreRankByUser,
+        LAG(p.Score) OVER (PARTITION BY DATE_TRUNC('month', p.CreationDate) ORDER BY p.CreationDate) AS PrevMonthScore,
+        NTILE(4) OVER (ORDER BY p.ViewCount DESC) AS ViewQuartile,
+        CASE 
+            WHEN p.Tags LIKE '%sql%' OR p.Tags LIKE '%database%' THEN 'DB Related'
+            WHEN p.Tags LIKE '%performance%' OR p.Tags LIKE '%optimization%' THEN 'Performance Related'
+            ELSE 'Other'
+        END AS TagCategory
+    FROM Posts p
+    LEFT JOIN Posts ac ON p.Id = ac.AcceptedAnswerId
+    WHERE p.PostTypeId = 1 
+      AND p.DeletedDate IS NULL
+      AND p.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+),
+TopAnswers AS (
+    SELECT 
+        a.PostId,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerDate,
+        a.OwnerUserId AS AnswerOwnerId,
+        DENSE_RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC) AS AnswerRank
+    FROM Posts a
+    WHERE a.PostTypeId = 2 
+      AND a.Score > 0
+      AND a.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+),
+VotePatterns AS (
+    SELECT 
+        v.PostId,
+        v.UserId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesGiven,
+        COUNT(*) AS TotalVotes,
+        AVG(v.CreationDate) AS AvgVoteDate
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2, 3)
+      AND v.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+    GROUP BY v.PostId, v.UserId
+    HAVING COUNT(*) >= 3
+),
+BadgeAchievers AS (
+    SELECT 
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Date AS BadgeDate,
+        b.Class,
+        COUNT(*) OVER (PARTITION BY b.UserId) AS TotalBadges,
+        STRING_AGG(b.Name, ', ' ORDER BY b.Date) AS BadgeList
+    FROM Badges b
+    WHERE b.Date >= CURRENT_DATE - INTERVAL '6 months'
+      AND b.Class <= 2  -- Gold and Silver only
+    GROUP BY b.UserId, b.Name, b.Date, b.Class
+)
+SELECT 
+    au.UserId,
+    au.DisplayName,
+    au.Reputation,
+    au.QuestionCount,
+    au.AnswerCount,
+    qs.Score AS TopQuestionScore,
+    COALESCE(ta.AnswerScore, 0) AS BestAnswerScore,
+    (au.QuestionCount * 10.0 + au.AnswerCount * 5.0 + COALESCE(vp.UpvotesGiven, 0) * 2.0) AS WeightedContribution,
+    CASE 
+        WHEN COALESCE(ta.AnswerRank, 999) <= 3 THEN 'Top 3 Answerer'
+        WHEN au.Reputation >= 10000 THEN 'Veteran'
+        WHEN vp.TotalVotes >= 50 THEN 'Active Voter'
+        ELSE 'Regular'
+    END AS UserCategory,
+    GREATEST(
+        COALESCE(qs.ViewCount, 0),
+        COALESCE(ta.AnswerScore * 100, 0)
+    ) AS EngagementMetric,
+    ba.BadgeList,
+    NULLIF(
+        SUBSTRING(qs.Title FROM '^[A-Za-z0-9\s]{1,50}'),
+        ''
+    ) AS TruncatedTitle,
+    (SELECT COUNT(*) 
+     FROM Comments c 
+     WHERE c.PostId = qs.QuestionId 
+       AND c.Score > 0 
+       AND c.UserId IS NOT NULL) AS PositiveCommentCount,
+    (SELECT STRING_AGG(DISTINCT pl.RelatedPostId::text, ',')
+     FROM PostLinks pl 
+     WHERE pl.PostId = qs.QuestionId 
+       AND pl.LinkTypeId = 1) AS LinkedPostIds
+FROM ActiveUsers au
+INNER JOIN QuestionStats qs ON au.UserId = qs.OwnerUserId 
+    AND qs.ScoreRankByUser = 1  -- Only their highest scoring question
+LEFT JOIN TopAnswers ta ON qs.QuestionId = ta.PostId 
+    AND ta.AnswerRank = 1  -- Best answer to this question
+LEFT JOIN VotePatterns vp ON vp.PostId = qs.QuestionId
+LEFT JOIN BadgeAchievers ba ON ba.UserId = au.UserId 
+    AND ba.BadgeDate >= (SELECT MAX(qs2.CreationDate) FROM QuestionStats qs2 WHERE qs2.OwnerUserId = au.UserId)
+WHERE (au.AvgPostScore >= 2.0 OR au.Reputation >= 5000)
+  AND (qs.HasAcceptedAnswer = 0 OR qs.AnswerCount >= 3)
+  AND (vp.TotalVotes IS NULL OR vp.UpvotesGiven > vp.DownvotesGiven)
+  AND (ba.TotalBadges >= 1 OR au.Reputation < 1000)
+UNION ALL
+SELECT 
+    NULL AS UserId,
+    'Community Aggregate' AS DisplayName,
+    SUM(au.Reputation) AS Reputation,
+    SUM(au.QuestionCount) AS QuestionCount,
+    SUM(au.AnswerCount) AS AnswerCount,
+    AVG(qs.Score) AS TopQuestionScore,
+    AVG(COALESCE(ta.AnswerScore, 0)) AS BestAnswerScore,
+    AVG((au.QuestionCount * 10.0 + au.AnswerCount * 5.0 + COALESCE(vp.UpvotesGiven, 0) * 2.0)) AS WeightedContribution,
+    'Aggregate' AS UserCategory,
+    PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY GREATEST(COALESCE(qs.ViewCount, 0), COALESCE(ta.AnswerScore * 100, 0))) AS EngagementMetric,
+    NULL AS BadgeList,
+    NULL AS TruncatedTitle,
+    NULL AS PositiveCommentCount,
+    NULL AS LinkedPostIds
+FROM ActiveUsers au
+INNER JOIN QuestionStats qs ON au.UserId = qs.OwnerUserId 
+    AND qs.ScoreRankByUser = 1
+LEFT JOIN TopAnswers ta ON qs.QuestionId = ta.PostId 
+    AND ta.AnswerRank = 1
+LEFT JOIN VotePatterns vp ON vp.PostId = qs.QuestionId
+ORDER BY WeightedContribution DESC NULLS LAST
+LIMIT 100;

@@ -1,0 +1,409 @@
+-- {"query": "8022.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3647} 
+with params as (
+    select
+        date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)) - interval '24 months' as start_month,
+        date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)) - interval '1 month'  as end_month
+),
+posts_window as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        coalesce(p.Title, '') as Title,
+        p.Tags,
+        case when p.PostTypeId = 1 then 1 else 0 end as is_question,
+        case when p.PostTypeId = 2 then 1 else 0 end as is_answer,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate) as rn_by_owner,
+        lag(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as prev_score_by_owner,
+        sum(p.Score) over (partition by p.OwnerUserId order by p.CreationDate rows between unbounded preceding and current row) as cum_score_by_owner
+    from Posts p
+    join params pr on p.CreationDate >= pr.start_month and p.CreationDate < pr.end_month + interval '1 month'
+),
+edits as (
+    select
+        ph.PostId,
+        count(*) filter (where ph.PostHistoryTypeId in (4,5,6,7,8,9,24)) as edit_events,
+        min(ph.CreationDate) filter (where ph.PostHistoryTypeId in (4,5,6,7,8,9,24)) as first_edit_at,
+        max(ph.CreationDate) filter (where ph.PostHistoryTypeId in (4,5,6,7,8,9,24)) as last_edit_at
+    from PostHistory ph
+    join params pr on ph.CreationDate >= pr.start_month and ph.CreationDate < pr.end_month + interval '1 month'
+    group by ph.PostId
+),
+votes_agg as (
+    select
+        v.PostId,
+        count(*) filter (where v.VoteTypeId = 2) as upvotes,
+        count(*) filter (where v.VoteTypeId = 3) as downvotes,
+        count(*) filter (where v.VoteTypeId = 5) as favorites,
+        count(*) filter (where v.VoteTypeId in (8,9)) as bounty_events,
+        sum(coalesce(v.BountyAmount,0)) as bounty_amount_total,
+        min(v.CreationDate) as first_vote_at,
+        max(v.CreationDate) as last_vote_at
+    from Votes v
+    join params pr on v.CreationDate >= pr.start_month and v.CreationDate < pr.end_month + interval '1 month'
+    group by v.PostId
+),
+comments_agg as (
+    select
+        c.PostId,
+        count(*) as comments,
+        sum(coalesce(c.Score,0)) as comment_score,
+        max(length(c.Text)) as max_comment_len
+    from Comments c
+    join params pr on c.CreationDate >= pr.start_month and c.CreationDate < pr.end_month + interval '1 month'
+    group by c.PostId
+),
+postlinks_agg as (
+    select
+        pl.PostId,
+        count(*) filter (where pl.LinkTypeId = 1) as linked_out,
+        count(*) filter (where pl.LinkTypeId = 3) as duplicates_of,
+        count(distinct case when pl.LinkTypeId = 3 then pl.RelatedPostId end) as distinct_dupe_targets
+    from PostLinks pl
+    join params pr on pl.CreationDate >= pr.start_month and pl.CreationDate < pr.end_month + interval '1 month'
+    group by pl.PostId
+),
+users_dim as (
+    select
+        u.Id as UserId,
+        u.Reputation,
+        u.CreationDate as UserCreated,
+        coalesce(nullif(trim(u.Location),''),'Unknown') as LocationNorm,
+        coalesce(u.UpVotes,0) as UpVotes,
+        coalesce(u.DownVotes,0) as DownVotes,
+        case
+            when u.WebsiteUrl ilike '%github%' then 'GitHub'
+            when u.WebsiteUrl ilike '%stackoverflow%' then 'StackOverflow'
+            when u.WebsiteUrl is null then 'None'
+            else 'Other'
+        end as WebsiteClass
+    from Users u
+),
+tags_expanded as (
+    select
+        p.Id as PostId,
+        unnest(string_to_array(substring(p.Tags, 2, greatest(length(p.Tags)-2,0)), '><')) as tagname
+    from Posts p
+    where p.PostTypeId = 1
+),
+tag_rank as (
+    select
+        te.PostId,
+        te.tagname,
+        t.Count as global_tag_count,
+        row_number() over (partition by te.PostId order by t.Count desc nulls last, te.tagname) as tag_rank_by_pop
+    from tags_expanded te
+    left join Tags t on t.TagName = te.tagname
+),
+accepted_answer_latency as (
+    select
+        q.Id as QuestionId,
+        a.Id as AnswerId,
+        extract(epoch from (a.CreationDate - q.CreationDate)) as seconds_to_answer,
+        extract(epoch from (aa.CreationDate - q.CreationDate)) as seconds_to_accepted
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Posts aa on aa.Id = q.AcceptedAnswerId
+    where q.PostTypeId = 1
+),
+owner_activity as (
+    select
+        p.OwnerUserId as UserId,
+        count(*) as posts_in_window,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) as questions_in_window,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) as answers_in_window,
+        avg(p.Score) as avg_score_in_window
+    from posts_window p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+monthly_activity as (
+    select
+        date_trunc('month', p.CreationDate) as month,
+        p.PostTypeId,
+        count(*) as posts,
+        avg(p.Score) as avg_score,
+        sum(coalesce(p.ViewCount,0)) as views
+    from posts_window p
+    group by 1,2
+),
+merged_activity as (
+    select
+        m.month,
+        max(m.posts) filter (where m.PostTypeId = 1) as questions,
+        max(m.posts) filter (where m.PostTypeId = 2) as answers,
+        max(m.avg_score) filter (where m.PostTypeId = 1) as q_avg_score,
+        max(m.avg_score) filter (where m.PostTypeId = 2) as a_avg_score,
+        max(m.views) filter (where m.PostTypeId = 1) as q_views,
+        max(m.views) filter (where m.PostTypeId = 2) as a_views
+    from monthly_activity m
+    group by m.month
+),
+qna as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        coalesce(nullif(p.Title,''), concat('[untitled-', p.Id, ']')) as TitleNorm,
+        p.Tags,
+        e.edit_events,
+        e.first_edit_at,
+        v.upvotes,
+        v.downvotes,
+        v.favorites,
+        v.bounty_events,
+        v.bounty_amount_total,
+        c.comments,
+        c.comment_score,
+        c.max_comment_len,
+        l.linked_out,
+        l.duplicates_of,
+        l.distinct_dupe_targets,
+        u.Reputation,
+        u.LocationNorm,
+        u.WebsiteClass,
+        oa.posts_in_window,
+        oa.questions_in_window,
+        oa.answers_in_window,
+        oa.avg_score_in_window,
+        pw.rn_by_owner,
+        pw.prev_score_by_owner,
+        pw.cum_score_by_owner
+    from posts_window pw
+    join Posts p on p.Id = pw.Id
+    left join edits e on e.PostId = p.Id
+    left join votes_agg v on v.PostId = p.Id
+    left join comments_agg c on c.PostId = p.Id
+    left join postlinks_agg l on l.PostId = p.Id
+    left join users_dim u on u.UserId = p.OwnerUserId
+    left join owner_activity oa on oa.UserId = p.OwnerUserId
+),
+scored as (
+    select
+        q.*,
+        coalesce(v.upvotes,0) - coalesce(v.downvotes,0) as net_votes_calc,
+        case
+            when q.PostTypeId = 1 and coalesce(q.ViewCount,0) > 0
+                then (q.Score::numeric / greatest(q.ViewCount, 1)) * 1000
+            when q.PostTypeId = 2
+                then q.Score::numeric
+            else 0
+        end as performance_score,
+        case
+            when q.PostTypeId = 1
+                then regexp_replace(coalesce(q.TitleNorm,''), '\s+', ' ', 'g')
+            else q.TitleNorm
+        end as TitleClean
+    from qna q
+    left join votes_agg v on v.PostId = q.Id
+),
+with_tag as (
+    select
+        s.*,
+        max(case when tr.tag_rank_by_pop = 1 then tr.tagname end) as top_tag,
+        max(case when tr.tag_rank_by_pop = 1 then tr.global_tag_count end) as top_tag_global_count
+    from scored s
+    left join tag_rank tr on tr.PostId = s.Id
+    group by
+        s.Id, s.PostTypeId, s.OwnerUserId, s.ParentId, s.AcceptedAnswerId, s.Score, s.ViewCount, s.CreationDate,
+        s.TitleNorm, s.Tags, s.edit_events, s.first_edit_at, s.upvotes, s.downvotes, s.favorites, s.bounty_events,
+        s.bounty_amount_total, s.comments, s.comment_score, s.max_comment_len, s.linked_out, s.duplicates_of,
+        s.distinct_dupe_targets, s.Reputation, s.LocationNorm, s.WebsiteClass, s.posts_in_window, s.questions_in_window,
+        s.answers_in_window, s.avg_score_in_window, s.rn_by_owner, s.prev_score_by_owner, s.cum_score_by_owner,
+        s.net_votes_calc, s.performance_score, s.TitleClean
+),
+answer_enrichment as (
+    select
+        a.Id as AnswerId,
+        q.Id as QuestionId,
+        q.OwnerUserId as QuestionOwnerId,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        case when q.AcceptedAnswerId = a.Id then 1 else 0 end as is_accepted,
+        extract(epoch from (a.CreationDate - q.CreationDate)) as seconds_after_question
+    from Posts a
+    join Posts q on q.Id = a.ParentId
+    where a.PostTypeId = 2 and q.PostTypeId = 1
+),
+question_latency as (
+    select
+        q.Id as QuestionId,
+        min(case when a.is_accepted = 1 then a.seconds_after_question end) as time_to_accepted_sec,
+        min(a.seconds_after_question) as time_to_first_answer_sec,
+        count(*) as answer_count_calc,
+        sum(a.is_accepted) as accepted_answers_count
+    from answer_enrichment a
+    join Posts q on q.Id = a.QuestionId
+    group by q.Id
+),
+final_union as (
+    select
+        'QUESTION'::varchar as row_kind,
+        w.Id,
+        w.PostTypeId,
+        w.OwnerUserId,
+        w.Score,
+        w.ViewCount,
+        w.CreationDate,
+        w.TitleClean as Title,
+        w.top_tag,
+        w.top_tag_global_count,
+        w.edit_events,
+        w.upvotes,
+        w.downvotes,
+        w.favorites,
+        w.bounty_events,
+        w.bounty_amount_total,
+        w.comments,
+        w.comment_score,
+        w.linked_out,
+        w.duplicates_of,
+        w.distinct_dupe_targets,
+        w.Reputation,
+        w.LocationNorm,
+        w.WebsiteClass,
+        w.performance_score,
+        ql.time_to_first_answer_sec,
+        ql.time_to_accepted_sec,
+        ql.answer_count_calc,
+        ql.accepted_answers_count,
+        null::int as ParentId,
+        null::int as AcceptedAnswerId,
+        w.rn_by_owner,
+        w.cum_score_by_owner
+    from with_tag w
+    left join question_latency ql on ql.QuestionId = w.Id
+    where w.PostTypeId = 1
+    union all
+    select
+        'ANSWER'::varchar as row_kind,
+        w.Id,
+        w.PostTypeId,
+        w.OwnerUserId,
+        w.Score,
+        w.ViewCount,
+        w.CreationDate,
+        coalesce(w.TitleClean, concat('Answer-', w.Id)) as Title,
+        w.top_tag,
+        w.top_tag_global_count,
+        w.edit_events,
+        w.upvotes,
+        w.downvotes,
+        w.favorites,
+        w.bounty_events,
+        w.bounty_amount_total,
+        w.comments,
+        w.comment_score,
+        w.linked_out,
+        w.duplicates_of,
+        w.distinct_dupe_targets,
+        w.Reputation,
+        w.LocationNorm,
+        w.WebsiteClass,
+        w.performance_score,
+        null,
+        null,
+        null,
+        null,
+        w.ParentId,
+        w.AcceptedAnswerId,
+        w.rn_by_owner,
+        w.cum_score_by_owner
+    from with_tag w
+    where w.PostTypeId = 2
+),
+ranked as (
+    select
+        f.*,
+        dense_rank() over (partition by f.row_kind order by f.performance_score desc nulls last) as perf_rank,
+        row_number() over (partition by f.row_kind order by coalesce(f.upvotes,0) - coalesce(f.downvotes,0) desc, f.Score desc, f.ViewCount desc) as netvote_rank,
+        percentile_disc(0.5) within group (order by f.Score) over (partition by f.row_kind) as median_score_kind
+    from final_union f
+),
+outliers as (
+    select
+        r.*,
+        case
+            when r.Score >= r.median_score_kind * 3 then 'HIGH'
+            when r.Score <= r.median_score_kind / 3 then 'LOW'
+            else 'NORMAL'
+        end as score_bucket
+    from ranked r
+),
+filter_logic as (
+    select
+        o.*
+    from outliers o
+    where
+        (
+            o.row_kind = 'QUESTION'
+            and (
+                o.top_tag is null
+                or o.time_to_first_answer_sec is null
+                or o.duplicates_of > 0
+                or (o.favorites is not null and o.favorites > 10 and o.Score < 0)
+            )
+        )
+        or (
+            o.row_kind = 'ANSWER'
+            and (
+                o.ParentId is not null
+                and (
+                    o.Score >= 10
+                    or o.Score <= -2
+                    or o.comments >= 5
+                )
+            )
+        )
+)
+select
+    f.row_kind,
+    f.Id,
+    f.OwnerUserId,
+    u.DisplayName,
+    f.Score,
+    f.ViewCount,
+    f.Title,
+    coalesce(f.top_tag, '[none]') as top_tag,
+    f.edit_events,
+    f.upvotes,
+    f.downvotes,
+    (coalesce(f.upvotes,0) - coalesce(f.downvotes,0)) as net_votes,
+    f.favorites,
+    f.bounty_events,
+    f.bounty_amount_total,
+    f.comments,
+    f.comment_score,
+    f.linked_out,
+    f.duplicates_of,
+    f.distinct_dupe_targets,
+    f.Reputation,
+    f.LocationNorm,
+    f.WebsiteClass,
+    f.performance_score,
+    f.time_to_first_answer_sec,
+    f.time_to_accepted_sec,
+    f.answer_count_calc,
+    f.accepted_answers_count,
+    f.rn_by_owner,
+    f.cum_score_by_owner,
+    r.perf_rank,
+    r.netvote_rank,
+    r.median_score_kind,
+    r.score_bucket,
+    date_trunc('month', f.CreationDate) as month_bucket
+from filter_logic f
+left join ranked r on r.row_kind = f.row_kind and r.Id = f.Id
+left join Users u on u.Id = f.OwnerUserId
+order by f.row_kind, coalesce(f.performance_score, -1e9) desc, coalesce(f.upvotes,0) - coalesce(f.downvotes,0) desc, f.Score desc, f.ViewCount desc
+limit 500;

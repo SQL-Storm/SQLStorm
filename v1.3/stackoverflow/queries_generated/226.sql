@@ -1,0 +1,194 @@
+-- {"query": "226.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 3810} 
+WITH
+question_base AS (
+  SELECT
+    p.Id AS QuestionId,
+    p.CreationDate AS QCreated,
+    p.Title,
+    p.Tags,
+    p.OwnerUserId,
+    p.Score AS QScore,
+    p.ViewCount,
+    COALESCE(p.AnswerCount, (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = p.Id)) AS ComputedAnswerCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+answer_stats AS (
+  SELECT
+    a.ParentId AS QuestionId,
+    COUNT(*) AS TotalAnswers,
+    SUM(CASE WHEN a.Score > 0 THEN 1 ELSE 0 END) AS PositiveAnswers,
+    AVG(a.Score) AS AvgAnswerScore,
+    MIN(a.CreationDate) AS FirstAnswerDate,
+    MAX(a.Score) AS MaxAnswerScore
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+  GROUP BY a.ParentId
+),
+top_answers AS (
+  SELECT
+    a.ParentId AS QuestionId,
+    a.Id AS AnswerId,
+    a.OwnerUserId,
+    a.Score,
+    a.CreationDate,
+    row_number() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC NULLS LAST, a.CreationDate ASC NULLS LAST) AS rn
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+),
+top_answerers AS (
+  SELECT
+    t.QuestionId,
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    t.AnswerId
+  FROM top_answers t
+  LEFT JOIN Users u ON u.Id = t.OwnerUserId
+  WHERE t.rn <= 3
+),
+comments_agg AS (
+  SELECT
+    c.PostId,
+    COUNT(*) FILTER (WHERE c.UserId IS NOT NULL) AS AuthComments,
+    COUNT(*) FILTER (WHERE c.UserId IS NULL) AS AnonymousComments,
+    MAX(c.CreationDate) AS LastCommentDate
+  FROM Comments c
+  GROUP BY c.PostId
+),
+post_links_cte AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    lt.Name AS LinkType,
+    COUNT(*) OVER (PARTITION BY pl.PostId, pl.LinkTypeId) AS LinkCount
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+),
+tag_extracted AS (
+  SELECT
+    qb.QuestionId,
+    (regexp_split_to_array(substring(qb.Tags FROM 2 FOR char_length(qb.Tags) - 2), '><')) AS TagArray,
+    array_length((regexp_split_to_array(substring(qb.Tags FROM 2 FOR char_length(qb.Tags) - 2), '><')), 1) AS TagCount
+  FROM question_base qb
+),
+duplicates AS (
+  SELECT
+    pl.RelatedPostId AS DuplicateOf,
+    COUNT(*) AS DuplicateCount
+  FROM PostLinks pl
+  WHERE pl.LinkTypeId = 3
+  GROUP BY pl.RelatedPostId
+),
+user_badges AS (
+  SELECT
+    b.UserId,
+    COUNT(*) AS BadgesTotal,
+    COUNT(*) FILTER (WHERE b.Class = 1) AS Gold,
+    COUNT(*) FILTER (WHERE b.Class = 2) AS Silver,
+    COUNT(*) FILTER (WHERE b.Class = 3) AS Bronze
+  FROM Badges b
+  GROUP BY b.UserId
+),
+score_ranks AS (
+  SELECT
+    q.QuestionId,
+    q.QScore,
+    rank() OVER (ORDER BY q.QScore DESC NULLS LAST, q.ViewCount DESC NULLS LAST) AS ScoreRank
+  FROM question_base q
+),
+complex_calc AS (
+  SELECT
+    qb.QuestionId,
+    COALESCE(as_.TotalAnswers, 0) AS TotalAnswers,
+    COALESCE(as_.PositiveAnswers, 0) AS PositiveAnswers,
+    COALESCE(as_.AvgAnswerScore, 0) AS AvgAnswerScore,
+    COALESCE(as_.MaxAnswerScore, 0) AS MaxAnswerScore,
+    EXTRACT(EPOCH FROM (COALESCE(as_.FirstAnswerDate, qb.QCreated) - qb.QCreated)) / 3600.0 AS HoursToFirstAnswer,
+    COALESCE(ca.AuthComments, 0) + COALESCE(ca.AnonymousComments, 0) AS TotalComments,
+    COALESCE(d.DuplicateCount, 0) AS DuplicateCount,
+    qb.ViewCount,
+    qb.QScore,
+    qb.Title,
+    te.TagArray,
+    te.TagCount
+  FROM question_base qb
+  LEFT JOIN answer_stats as_ ON as_.QuestionId = qb.QuestionId
+  LEFT JOIN comments_agg ca ON ca.PostId = qb.QuestionId
+  LEFT JOIN duplicates d ON d.DuplicateOf = qb.QuestionId
+  LEFT JOIN tag_extracted te ON te.QuestionId = qb.QuestionId
+),
+final_top AS (
+  SELECT
+    cc.*,
+    u2.DisplayName AS OwnerName,
+    ub.BadgesTotal,
+    ub.Gold,
+    ub.Silver,
+    ub.Bronze,
+    sr.ScoreRank
+  FROM complex_calc cc
+  LEFT JOIN Posts p2 ON p2.Id = cc.QuestionId
+  LEFT JOIN Users u2 ON u2.Id = p2.OwnerUserId
+  LEFT JOIN user_badges ub ON ub.UserId = u2.Id
+  LEFT JOIN score_ranks sr ON sr.QuestionId = cc.QuestionId
+),
+answer_details AS (
+  SELECT
+    a.ParentId AS QuestionId,
+    json_agg(
+      json_build_object(
+        'AnswerId', a.Id,
+        'Score', a.Score,
+        'OwnerUserId', a.OwnerUserId,
+        'OwnerReputation', u.Reputation,
+        'CreationDate', a.CreationDate
+      ) ORDER BY a.Score DESC NULLS LAST, a.CreationDate ASC
+    ) FILTER (WHERE a.Id IS NOT NULL) AS AnswersJson
+  FROM Posts a
+  LEFT JOIN Users u ON u.Id = a.OwnerUserId
+  WHERE a.PostTypeId = 2
+  GROUP BY a.ParentId
+)
+SELECT
+  ft.QuestionId,
+  ft.Title,
+  ft.TagArray[1] AS PrimaryTag,
+  ft.TagCount,
+  ft.TotalAnswers,
+  ft.PositiveAnswers,
+  ft.AvgAnswerScore,
+  ft.MaxAnswerScore,
+  CASE WHEN ft.HoursToFirstAnswer IS NULL THEN NULL
+       WHEN ft.HoursToFirstAnswer < 1 THEN '<1h'
+       WHEN ft.HoursToFirstAnswer < 24 THEN (floor(ft.HoursToFirstAnswer) || 'h')
+       ELSE (floor(ft.HoursToFirstAnswer / 24) || 'd') END AS TimeToFirstAnswer,
+  ft.TotalComments,
+  ft.DuplicateCount,
+  ft.ViewCount,
+  ft.QScore,
+  ft.OwnerName,
+  ft.BadgesTotal,
+  ft.Gold,
+  ft.Silver,
+  ft.Bronze,
+  ft.ScoreRank,
+  COALESCE(ad.AnswersJson, '[]'::json) AS Answers,
+  CASE
+    WHEN ft.TotalAnswers = 0 THEN 'Unanswered'
+    WHEN (ft.PositiveAnswers::numeric / NULLIF(ft.TotalAnswers, 0)) > 0.75 THEN 'Mostly Positive'
+    WHEN (ft.PositiveAnswers::numeric / NULLIF(ft.TotalAnswers, 0)) BETWEEN 0.25 AND 0.75 THEN 'Mixed'
+    ELSE 'Mostly Negative'
+  END AS AnswerSentiment,
+  -- a synthetic complexity score mixing recency, score, views, badges and duplicates (for benchmarking arithmetic)
+  (COALESCE(ft.QScore,0) * 2.0 + COALESCE(ft.ViewCount,0) / NULLIF(GREATEST(ft.TagCount,1),1) + COALESCE(ft.BadgesTotal,0) * 5.0 - COALESCE(ft.DuplicateCount,0) * 10.0
+    + CASE WHEN ft.TotalAnswers > 0 THEN (ft.AvgAnswerScore * 3.0) ELSE -5.0 END
+    + COALESCE(NULLIF(ft.HoursToFirstAnswer,0), 24) / 24.0) AS ComplexityScore
+FROM final_top ft
+LEFT JOIN answer_details ad ON ad.QuestionId = ft.QuestionId
+WHERE ft.TagCount > 0
+  AND ft.QScore IS NOT NULL
+  AND NOT (ft.Title IS NULL OR trim(ft.Title) = '')
+  AND (ft.ViewCount > 10 OR ft.TotalAnswers > 0)
+ORDER BY ComplexityScore DESC NULLS LAST, ft.ScoreRank ASC NULLS LAST, ft.ViewCount DESC
+LIMIT 100;

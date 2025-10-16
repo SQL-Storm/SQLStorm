@@ -1,0 +1,245 @@
+with
+RecentQuestions as (
+  select
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.AcceptedAnswerId,
+    coalesce(p.Score,0) as Score,
+    coalesce(p.ViewCount,0) as Views,
+    p.Tags,
+    regexp_split_to_table(substring(p.Tags from 2 for greatest(char_length(p.Tags)-2,0)), '><') as Tag
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+TopAnswerPerQuestion as (
+  select
+    q.Id as QuestionId,
+    a.Id as AnswerId,
+    a.OwnerUserId as AnswerOwnerId,
+    a.Score as AnswerScore,
+    a.CreationDate as AnswerCreationDate,
+    row_number() over (partition by q.Id order by a.Score desc nulls last, a.CreationDate asc) as rn
+  from RecentQuestions q
+  left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+),
+TopAnswerFiltered as (
+  select *
+  from TopAnswerPerQuestion
+  where rn = 1
+),
+UserAggregates as (
+  select
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    coalesce(u.Views,0) as ProfileViews,
+    coalesce(u.UpVotes,0) as UpVotesGiven,
+    coalesce(u.DownVotes,0) as DownVotesGiven,
+    (select count(*) from Posts p where p.OwnerUserId = u.Id) as TotalPosts,
+    (select count(*) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 2) as TotalAnswers,
+    (select avg(coalesce(p.Score,0)) from Posts p where p.OwnerUserId = u.Id) as AvgPostScore,
+    (select count(*) from Posts q where q.OwnerUserId = u.Id and q.PostTypeId = 2 and exists (
+        select 1 from Posts qq where qq.AcceptedAnswerId = q.Id
+    )) as AcceptedCount,
+    (select count(distinct tag)
+      from (
+        select unnest(regexp_split_to_array(substring(t.Tags from 2 for greatest(char_length(t.Tags)-2,0)), '><')) as tag
+        from Posts t
+        where t.OwnerUserId = u.Id and t.PostTypeId = 2
+      ) s
+    ) as DistinctAnswerTags,
+    dense_rank() over (order by (u.Reputation * 0.6 + coalesce(u.Views,0) * 0.0001 + coalesce(u.UpVotes,0) * 0.1) desc) as InfluenceRank
+  from Users u
+  group by
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes
+),
+CommentActivity as (
+  select
+    c.PostId,
+    count(*) filter (where c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '6 months') as RecentComments,
+    sum(case when c.Text ~* '\\b(thanks|thank you|ty|appreciate)\\b' then 1 else 0 end) as GratitudeCount,
+    sum(case when c.Text ~* '\\b(issue|bug|error|fail)\\b' then 1 else 0 end) as ProblemCount,
+    max(c.CreationDate) as LastCommentDate
+  from Comments c
+  group by c.PostId
+),
+QuestionRich as (
+  select
+    q.*,
+    ta.AnswerId,
+    ta.AnswerScore,
+    ua.DisplayName as QuestionOwner,
+    ua.Reputation as QuestionOwnerReputation,
+    coalesce(ca.RecentComments,0) as RecentComments,
+    coalesce(ca.GratitudeCount,0) as GratitudeCount,
+    coalesce(ca.ProblemCount,0) as ProblemCount,
+    pl.LinkCount,
+    ph.EditCount,
+    ph.LastEditDate,
+    (select avg(coalesce(a.Score,0)) from Posts a where a.ParentId = q.Id and a.PostTypeId = 2) as AvgAnswerScore,
+    (select case when count(*)=0 then 0 else sum(case when coalesce(a.Score,0) >= coalesce(q.Score,0) then 1 else 0 end) * 1.0 / count(*) end
+       from Posts a where a.ParentId = q.Id and a.PostTypeId = 2) as FractionAnswersAtOrAboveQScore
+  from RecentQuestions q
+  left join TopAnswerFiltered ta on ta.QuestionId = q.Id
+  left join UserAggregates ua on ua.Id = q.OwnerUserId
+  left join CommentActivity ca on ca.PostId = q.Id
+  left join (
+    select pl.PostId, count(*) as LinkCount
+    from PostLinks pl
+    where pl.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+    group by pl.PostId
+  ) pl on pl.PostId = q.Id
+  left join (
+    select ph.PostId, count(*) as EditCount, max(ph.CreationDate) as LastEditDate
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4,5,6,7,8,9,24)
+    group by ph.PostId
+  ) ph on ph.PostId = q.Id
+),
+TagHotness as (
+  select
+    Tag,
+    count(distinct Id) as QuestionCount,
+    sum(Score) as TotalScore,
+    sum(Views) as TotalViews,
+    sum((case when CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 months' then 3 else 1 end) * greatest(Score,0)) as RecencyWeightedScore,
+    rank() over (order by sum((case when CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 months' then 3 else 1 end) * greatest(Score,0)) desc) as HotRank
+  from RecentQuestions
+  group by Tag
+),
+InterestingPosts as (
+  select
+    q.Id,
+    cast('question' as text) as PostKind,
+    q.Title,
+    q.Score,
+    q.Views,
+    q.CreationDate,
+    q.OwnerUserId,
+    q.Tags,
+    q.AnswerId,
+    q.RecentComments,
+    q.EditCount
+  from QuestionRich q
+  where q.Views >= 1000 or q.RecentComments >= 5 or q.EditCount >= 3
+
+  union
+
+  select
+    a.Id,
+    cast('answer' as text) as PostKind,
+    substring(coalesce(a.Body, ''),1,120) as Title,
+    a.Score,
+    0 as Views,
+    a.CreationDate,
+    a.OwnerUserId,
+    (select string_agg(distinct tg.Tag, ',') from RecentQuestions tg where tg.Id = a.ParentId) as Tags,
+    null as AnswerId,
+    (select count(*) from Comments c where c.PostId = a.Id and c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '6 months') as RecentComments,
+    (select count(*) from PostHistory ph where ph.PostId = a.Id) as EditCount
+  from Posts a
+  where a.PostTypeId = 2
+    and a.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+    and a.Score >= 10
+    and exists (select 1 from Posts q where q.Id = a.ParentId and q.Tags is not null)
+
+  union
+
+  select
+    pl.RelatedPostId as Id,
+    cast('linked_duplicate' as text) as PostKind,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Tags,
+    null as AnswerId,
+    (select count(*) from Comments c where c.PostId = p.Id) as RecentComments,
+    (select count(*) from PostHistory ph where ph.PostId = p.Id) as EditCount
+  from PostLinks pl
+  join Posts p on p.Id = pl.RelatedPostId
+  where pl.LinkTypeId = 3
+    and pl.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+),
+FinalSelection as (
+  select
+    qr.Id as QuestionId,
+    coalesce(qr.Title, '(no title)') as Title,
+    coalesce(qr.Tag, '') as RepresentativeTag,
+    th.HotRank,
+    th.TotalScore,
+    qr.Score as QuestionScore,
+    qr.Views as QuestionViews,
+    qr.AcceptedAnswerId,
+    qr.AnswerId as TopAnswerId,
+    qr.AnswerScore,
+    ua.Id as OwnerId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.InfluenceRank,
+    qr.RecentComments,
+    (case when qr.RecentComments > 10 and qr.RecentComments is not null then 50 else 0 end) as GrantedBonusDummy,
+    (coalesce(qr.Score,0) * 2.0
+      + coalesce(qr.Views,0) * 0.001
+      + coalesce(qr.RecentComments,0) * 1.5
+      + coalesce(qr.EditCount,0) * 0.8
+      + coalesce(ua.Reputation,0) * 0.001
+      + coalesce(th.RecencyWeightedScore,0) * 0.5
+      - coalesce(qr.ProblemCount,0) * 1.2
+      + case when qr.AcceptedAnswerId is not null then 20 else 0 end
+      ) as SyntheticScore,
+    (select u2.DisplayName || '|' || coalesce(cast(u2.Reputation as text),'0')
+     from Users u2
+     where u2.Id = (
+       select ph2.LastEditorDisplayNameId from (
+         select ph.PostId, ph.LastEditorUserId as LastEditorDisplayNameId, ph.CreationDate
+         from PostHistory ph
+         where ph.PostId = qr.Id and ph.PostHistoryTypeId in (4,5,6)
+         order by ph.CreationDate desc
+         limit 1
+       ) ph2
+     )
+     limit 1) as LastEditorSummary,
+    left(coalesce(qr.Tags,''), 200) as TagSnippet
+  from QuestionRich qr
+  left join TagHotness th on th.Tag = qr.Tag
+  left join UserAggregates ua on ua.Id = qr.OwnerUserId
+  group by
+    qr.Id,
+    qr.Title,
+    qr.Tag,
+    th.HotRank,
+    th.TotalScore,
+    qr.Score,
+    qr.Views,
+    qr.AcceptedAnswerId,
+    qr.AnswerId,
+    qr.AnswerScore,
+    ua.Id,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.InfluenceRank,
+    qr.RecentComments,
+    qr.EditCount,
+    qr.ProblemCount,
+    th.RecencyWeightedScore,
+    qr.Tags
+)
+select
+  fs.*,
+  row_number() over (order by fs.SyntheticScore desc nulls last, fs.QuestionViews desc) as FinalRank
+from FinalSelection fs
+where fs.SyntheticScore is not null
+order by FinalRank asc
+limit 500;

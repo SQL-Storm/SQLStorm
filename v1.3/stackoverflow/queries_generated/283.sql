@@ -1,0 +1,216 @@
+-- {"query": "283.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 5509} 
+WITH
+recent_q AS (
+  SELECT *
+  FROM Posts
+  WHERE PostTypeId = 1
+    AND CreationDate >= current_timestamp - INTERVAL '1 year'
+),
+tag_rows AS (
+  SELECT q.Id AS PostId,
+         trim(t) AS tag
+  FROM recent_q q
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(coalesce(q.Tags, ''), 2, GREATEST(length(coalesce(q.Tags, ''))-2,0)), '><')) AS t
+  ) s
+),
+tag_agg AS (
+  SELECT PostId,
+         string_agg(DISTINCT tag, ',' ORDER BY tag) AS tags,
+         count(*) AS tag_count
+  FROM tag_rows
+  GROUP BY PostId
+),
+answers AS (
+  SELECT ParentId AS QuestionId,
+         count(*) FILTER (WHERE PostTypeId = 2) AS answer_count,
+         avg(Score) FILTER (WHERE PostTypeId = 2)::numeric AS avg_answer_score,
+         max(Score) FILTER (WHERE PostTypeId = 2) AS max_answer_score,
+         min(CreationDate) FILTER (WHERE PostTypeId = 2) AS first_answer_date
+  FROM Posts
+  WHERE ParentId IS NOT NULL
+  GROUP BY ParentId
+),
+accepted_info AS (
+  SELECT r.Id AS QuestionId,
+         a.Id AS AcceptedAnswerId,
+         a.OwnerUserId AS AcceptedOwnerUserId,
+         a.Score AS AcceptedAnswerScore,
+         a.CreationDate AS AcceptedCreationDate
+  FROM recent_q r
+  LEFT JOIN Posts a ON r.AcceptedAnswerId = a.Id
+),
+dup_chain AS (
+  -- recursive search for duplicate chains pointing to the recent questions
+  SELECT rq.Id AS question_id,
+         pl.PostId AS dup_id,
+         1 AS depth
+  FROM PostLinks pl
+  JOIN recent_q rq ON pl.RelatedPostId = rq.Id AND pl.LinkTypeId = 3
+  UNION ALL
+  SELECT dc.question_id,
+         pl.PostId,
+         dc.depth + 1
+  FROM dup_chain dc
+  JOIN PostLinks pl ON pl.RelatedPostId = dc.dup_id AND pl.LinkTypeId = 3
+),
+dup_counts AS (
+  SELECT question_id,
+         count(DISTINCT dup_id) AS dup_count
+  FROM dup_chain
+  GROUP BY question_id
+),
+comment_user_counts AS (
+  SELECT PostId,
+         UserId,
+         count(*) AS cnt,
+         max(CreationDate) AS last_comment_date,
+         substring(string_agg(Text, ' || ' ORDER BY CreationDate DESC), 1, 400) AS concat_comments
+  FROM Comments
+  GROUP BY PostId, UserId
+),
+top_commenter AS (
+  SELECT PostId,
+         UserId AS top_commenter_id,
+         cnt AS top_comment_count,
+         concat_comments AS top_comment
+  FROM (
+    SELECT *, row_number() OVER (PARTITION BY PostId ORDER BY cnt DESC, last_comment_date DESC) rn
+    FROM comment_user_counts
+  ) x
+  WHERE rn = 1
+),
+user_badges AS (
+  SELECT UserId,
+         count(*) AS badges_total,
+         sum(CASE WHEN Class = 1 THEN 5 WHEN Class = 2 THEN 3 ELSE 1 END) AS badge_score
+  FROM Badges
+  GROUP BY UserId
+),
+history_edits AS (
+  SELECT PostId,
+         count(*) FILTER (WHERE PostHistoryTypeId IN (4,5,6,7,8,9,24,66)) AS edit_count,
+         count(*) FILTER (WHERE PostHistoryTypeId IN (10,11,12,13)) AS close_open_count
+  FROM PostHistory
+  GROUP BY PostId
+),
+tag_wiki_q AS (
+  SELECT Id
+  FROM recent_q
+  INTERSECT
+  SELECT WikiPostId FROM Tags WHERE WikiPostId IS NOT NULL
+),
+-- a small set expression to detect questions that match tag names exactly (synthetic insight)
+questions_matching_tagname AS (
+  SELECT r.Id
+  FROM recent_q r
+  INTERSECT
+  SELECT t.ExcerptPostId FROM Tags t WHERE t.ExcerptPostId IS NOT NULL
+),
+-- overall aggregates for a UNION ALL summary row
+overall AS (
+  SELECT
+    count(*)::int AS total_questions,
+    avg(ViewCount)::numeric AS avg_views,
+    avg(Score)::numeric AS avg_score,
+    sum(AnswerCount)::int AS total_answers
+  FROM recent_q
+)
+SELECT
+  r.Id AS question_id,
+  r.Title,
+  lower(regexp_replace(coalesce(r.Title,''), '[\s]+', ' ', 'g')) AS title_normalized,
+  r.CreationDate,
+  r.OwnerUserId,
+  r.OwnerDisplayName,
+  u.Reputation AS owner_reputation,
+  r.Score,
+  r.ViewCount,
+  COALESCE(a.answer_count, 0) AS answer_count,
+  COALESCE(a.avg_answer_score, 0)::numeric(10,3) AS avg_answer_score,
+  ac.AcceptedAnswerId,
+  ac.AcceptedAnswerScore,
+  CASE WHEN a.first_answer_date IS NOT NULL
+       THEN extract(epoch from (a.first_answer_date - r.CreationDate))
+       ELSE NULL END AS time_to_first_answer_seconds,
+  COALESCE(dc.dup_count, 0) AS dup_count,
+  COALESCE(ta.tag_count, 0) AS tag_count,
+  COALESCE(ta.tags, '') AS tags,
+  tc.top_commenter_id,
+  tc.top_comment_count,
+  CASE WHEN tc.top_comment IS NOT NULL THEN
+       substring(tc.top_comment from 1 for 120) || (CASE WHEN char_length(tc.top_comment) > 120 THEN '...' ELSE '' END)
+       ELSE NULL END AS top_comment_excerpt,
+  COALESCE(ub.badge_score, 0) AS badge_score_owner,
+  COALESCE(he.edit_count, 0) AS edit_count,
+  (r.Id IS NOT NULL AND r.Id IN (SELECT Id FROM tag_wiki_q)) AS is_tag_wiki,
+  (r.ClosedDate IS NOT NULL) AS is_closed,
+  -- popularity index: composite metric (handle nulls and zeros robustly)
+  (
+    (COALESCE(r.Score,0)::numeric * 2.0)
+    + (COALESCE(r.ViewCount,0)::numeric / GREATEST(log(10, GREATEST(COALESCE(r.ViewCount,1),1)::numeric), 1))
+    + (COALESCE(a.answer_count,0)::numeric * 10)
+    + (COALESCE(ub.badge_score,0)::numeric * 2)
+    - (COALESCE(he.edit_count,0)::numeric * 0.5)
+  ) / NULLIF((extract(epoch from (current_timestamp - r.CreationDate)) / 86400.0) + 1.0, 0.0) AS popularity_index,
+  -- global rank by popularity
+  rank() OVER (ORDER BY (
+    (
+      (COALESCE(r.Score,0)::numeric * 2.0)
+      + (COALESCE(r.ViewCount,0)::numeric / GREATEST(log(10, GREATEST(COALESCE(r.ViewCount,1),1)::numeric), 1))
+      + (COALESCE(a.answer_count,0)::numeric * 10)
+      + (COALESCE(ub.badge_score,0)::numeric * 2)
+      - (COALESCE(he.edit_count,0)::numeric * 0.5)
+    ) / NULLIF((extract(epoch from (current_timestamp - r.CreationDate)) / 86400.0) + 1.0, 0.0)
+  ) DESC) AS global_rank,
+  'QUESTION'::varchar AS row_type
+FROM recent_q r
+LEFT JOIN tag_agg ta ON ta.PostId = r.Id
+LEFT JOIN answers a ON a.QuestionId = r.Id
+LEFT JOIN accepted_info ac ON ac.QuestionId = r.Id
+LEFT JOIN dup_counts dc ON dc.question_id = r.Id
+LEFT JOIN top_commenter tc ON tc.PostId = r.Id
+LEFT JOIN user_badges ub ON ub.UserId = r.OwnerUserId
+LEFT JOIN history_edits he ON he.PostId = r.Id
+LEFT JOIN Users u ON u.Id = r.OwnerUserId
+WHERE
+  -- complicated predicate: include only questions with either many views or with at least one tag matching a regex,
+  (
+    r.ViewCount > 1000
+    OR EXISTS (SELECT 1 FROM tag_rows tr WHERE tr.PostId = r.Id AND tr.tag ~* '^(python|java|sql|postgres|performance)$')
+    OR r.Score >= GREATEST(1, (SELECT percentile_disc(0.9) WITHIN GROUP (ORDER BY Score) FROM recent_q))
+  )
+UNION ALL
+-- a synthetic summary row produced by a set operator to stress planner
+SELECT
+  0 AS question_id,
+  'SUMMARY'::varchar AS Title,
+  ''::text AS title_normalized,
+  NULL::timestamp AS CreationDate,
+  NULL::int AS OwnerUserId,
+  NULL::varchar AS OwnerDisplayName,
+  NULL::int AS owner_reputation,
+  NULL::int AS Score,
+  NULL::int AS ViewCount,
+  overall.total_questions AS answer_count,         -- overloaded: total_questions into answer_count slot
+  overall.avg_views AS avg_answer_score,           -- overloaded: avg_views into avg_answer_score slot
+  NULL::int AS AcceptedAnswerId,
+  NULL::int AS AcceptedAnswerScore,
+  NULL::numeric AS time_to_first_answer_seconds,
+  (SELECT count(*) FROM PostLinks WHERE LinkTypeId = 3) AS dup_count,
+  (SELECT count(DISTINCT TagName) FROM Tags) AS tag_count,
+  (SELECT string_agg(TagName, ',' ORDER BY Count DESC NULLS LAST) FROM Tags) AS tags,
+  NULL::int AS top_commenter_id,
+  NULL::int AS top_comment_count,
+  NULL::text AS top_comment_excerpt,
+  NULL::numeric AS badge_score_owner,
+  NULL::int AS edit_count,
+  FALSE AS is_tag_wiki,
+  FALSE AS is_closed,
+  -- a summary popularity (aggregate)
+  (overall.avg_views * overall.avg_score) / NULLIF(GREATEST(overall.total_questions,1),0)::numeric AS popularity_index,
+  NULL::int AS global_rank,
+  'SUMMARY'::varchar AS row_type
+FROM overall
+ORDER BY row_type DESC, popularity_index DESC NULLS LAST, global_rank NULLS FIRST
+LIMIT 500;

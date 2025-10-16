@@ -1,0 +1,179 @@
+-- {"query": "383.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1526} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        r.Level + 1,
+        r.Path || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id <> r.Id and not t.TagName = any(r.Path)
+    where r.Level < 3
+),
+UserPostStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        coalesce(sum(p.Score),0) as TotalScore,
+        coalesce(avg(p.Score),0) as AvgScore,
+        max(p.Score) as MaxScore,
+        count(distinct b.Id) as BadgeCount,
+        count(distinct c.Id) as CommentCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesReceived,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotesReceived
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopQuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        a.OwnerUserId as AnswerOwnerUserId,
+        u.DisplayName as AnswerOwnerDisplayName,
+        row_number() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1
+      and q.Score > 10
+      and q.ViewCount > 1000
+),
+CloseReasonCounts as (
+    select
+        ph.Comment as CloseReasonId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseCount
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10
+    group by ph.Comment, crt.Name
+),
+UserBadgeWindow as (
+    select
+        b.UserId,
+        b.Name as BadgeName,
+        b.Class,
+        b.Date,
+        row_number() over (partition by b.UserId order by b.Date desc) as BadgeRank
+    from Badges b
+),
+UserTopBadges as (
+    select
+        ub.UserId,
+        string_agg(ub.BadgeName || '(' || ub.Class || ')', ', ') as TopBadges
+    from UserBadgeWindow ub
+    where ub.BadgeRank <= 5
+    group by ub.UserId
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.Tags,
+        count(a.Id) as AnswerCount,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        sum(case when a.Score > q.Score then 1 else 0 end) as AnswersBetterThanQuestion
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.Tags
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        lag(p.CreationDate) over (partition by u.Id order by p.CreationDate) as PrevPostDate,
+        lead(p.CreationDate) over (partition by u.Id order by p.CreationDate) as NextPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+),
+UserPostIntervals as (
+    select
+        UserId,
+        DisplayName,
+        avg(extract(epoch from (CreationDate - PrevPostDate))) as AvgIntervalSeconds,
+        avg(extract(epoch from (NextPostDate - CreationDate))) as AvgNextIntervalSeconds,
+        count(PostId) as PostCount
+    from UserActivityWindow
+    where PrevPostDate is not null and NextPostDate is not null
+    group by UserId, DisplayName
+)
+select
+    u.UserId,
+    u.DisplayName,
+    u.QuestionCount,
+    u.AnswerCount,
+    u.TotalScore,
+    u.AvgScore,
+    u.MaxScore,
+    coalesce(utb.TopBadges, 'None') as TopBadges,
+    u.CommentCount,
+    u.UpVotesReceived,
+    u.DownVotesReceived,
+    upi.AvgIntervalSeconds,
+    upi.AvgNextIntervalSeconds,
+    upi.PostCount,
+    qas.QuestionId,
+    qas.Title as QuestionTitle,
+    qas.Score as QuestionScore,
+    qas.ViewCount as QuestionViews,
+    qas.AnswerCount,
+    qas.AvgAnswerScore,
+    qas.MaxAnswerScore,
+    qas.AnswersBetterThanQuestion,
+    crc.CloseReasonName,
+    crc.CloseCount
+from UserPostStats u
+left join UserTopBadges utb on utb.UserId = u.UserId
+left join UserPostIntervals upi on upi.UserId = u.UserId
+left join (
+    select distinct on (q.Id) q.Id, q.Title, q.Score, q.ViewCount, qas.AnswerCount, qas.AvgAnswerScore, qas.MaxAnswerScore, qas.AnswersBetterThanQuestion
+    from Posts q
+    join QuestionAnswerStats qas on q.Id = qas.QuestionId
+    where q.PostTypeId = 1
+    order by q.Id, q.Score desc
+    limit 1
+) qas on true
+left join CloseReasonCounts crc on crc.CloseReasonId = (
+    select ph.Comment
+    from PostHistory ph
+    where ph.PostId = qas.QuestionId and ph.PostHistoryTypeId = 10
+    order by ph.CreationDate desc
+    limit 1
+)
+order by u.TotalScore desc
+limit 50;

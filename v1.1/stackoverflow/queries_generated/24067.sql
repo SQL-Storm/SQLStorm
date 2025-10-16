@@ -1,0 +1,83 @@
+-- {"query": "24067.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 4352} 
+
+WITH
+  Answers AS (
+    SELECT a.OwnerUserId            AS UserId,
+           a.Id                     AS AnswerId,
+           a.Score,
+           a.CreationDate,
+           CASE WHEN a.Id = p.AcceptedAnswerId THEN 1 ELSE 0 END  AS IsAccepted
+    FROM Posts a
+    JOIN Posts p ON p.Id = a.ParentId
+    WHERE a.PostTypeId = 2
+  ),
+  Questions AS (
+    SELECT q.OwnerUserId            AS UserId,
+           q.Id                     AS QuestionId,
+           q.CreationDate,
+           q.Score
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+  ),
+  UserStat AS (
+    SELECT u.Id                     AS UserId,
+           u.DisplayName,
+           u.Reputation,
+           COALESCE(SUM(CASE WHEN a.IsAccepted = 1 THEN 1 ELSE 0 END),0)  AS AcceptedAns,
+           COALESCE(COUNT(DISTINCT q.QuestionId),0)                       AS Asked,
+           (SELECT MIN(CreationDate) FROM Questions qx WHERE qx.OwnerUserId = u.Id)  AS FirstQ,
+           (SELECT MAX(CreationDate) FROM Answers ax WHERE ax.UserId = u.Id)          AS LastAns
+    FROM Users u
+    LEFT JOIN Answers a ON a.UserId = u.Id
+    LEFT JOIN Questions q ON q.UserId = u.Id
+    GROUP BY u.Id,u.DisplayName,u.Reputation
+  ),
+  UsersWithoutQ AS (
+    SELECT u.Id                     AS UserId,
+           u.DisplayName,
+           u.Reputation,
+           0 AS AcceptedAns,
+           0 AS Asked,
+           NULL AS FirstQ,
+           (SELECT MAX(CreationDate) FROM Answers ax WHERE ax.UserId = u.Id)          AS LastAns
+    FROM Users u
+    WHERE NOT EXISTS (SELECT 1 FROM Questions qx WHERE qx.UserId = u.Id)
+  ),
+  CombinedStats AS (
+    SELECT * FROM UserStat
+    UNION ALL
+    SELECT * FROM UsersWithoutQ
+  ),
+  TagRank AS (
+    SELECT t.TagName,
+           COUNT(*)                                        AS TagQCnt,
+           DENSE_RANK() OVER(ORDER BY COUNT(*) DESC)       AS TagRank
+    FROM Posts p
+    CROSS APPLY (
+      SELECT TRIM(value) AS TagName
+      FROM STRING_SPLIT(p.Tags, '><')
+      WHERE value <> ''
+    ) t
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName
+    HAVING COUNT(*) > 300
+  ),
+  PopularTags AS (
+    SELECT STRING_AGG(TagName, ', ') AS TopTags
+    FROM TagRank
+    WHERE TagRank <= 5
+  )
+SELECT cs.UserId,
+       cs.DisplayName,
+       cs.Reputation,
+       cs.AcceptedAns,
+       cs.Asked,
+       cs.FirstQ,
+       cs.LastAns,
+       CASE WHEN cs.Asked = 0 THEN NULL ELSE cs.AcceptedAns * 1.0 / cs.Asked END  AS AccRate,
+       pt.TopTags
+FROM CombinedStats cs
+CROSS JOIN PopularTags pt
+WHERE cs.Asked IS NOT NULL
+ORDER BY cs.Asked DESC, cs.AcceptedAns DESC
+LIMIT 200;

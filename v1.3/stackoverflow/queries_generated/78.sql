@@ -1,0 +1,163 @@
+-- {"query": "78.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2068} 
+with
+-- recent active questions with parsed tag tokens
+RecentQuestions as (
+  select p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount,
+         coalesce(p.AnswerCount,0) as AnswerCount,
+         coalesce(p.FavoriteCount,0) as FavoriteCount,
+         p.Tags,
+         -- normalize tags: remove surrounding <> and split (Postgres style)
+         regexp_split_to_table(substring(p.Tags from 2 for greatest(char_length(p.Tags)-2,0)), '><') as Tag
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= now() - interval '365 days'
+    and p.Score is not null
+),
+-- compute per-question aggregated signals including last activity, last editor, and accepted-answer metrics
+QuestionSignals as (
+  select q.Id,
+         q.Title,
+         q.OwnerUserId,
+         q.CreationDate,
+         q.Score,
+         q.ViewCount,
+         q.AnswerCount,
+         q.FavoriteCount,
+         array_agg(distinct q.Tag) filter (where q.Tag is not null) as Tags,
+         -- last activity from Posts table (might be more recent than CreationDate)
+         greatest(q.CreationDate, coalesce(max(p.LastActivityDate), q.CreationDate)) as EffectiveLastActivity,
+         max(p.LastEditDate) as LastEditDate,
+         -- accepted answer quality: score and author reputation (correlated)
+         (select coalesce(avg(a.Score)::numeric,0)
+          from Posts a
+          where a.Id = (select AcceptedAnswerId from Posts where Id = q.Id)
+            and a.PostTypeId = 2
+         ) as AcceptedAnswerAvgScore,
+         (select u.Reputation
+          from Posts a join Users u on u.Id = a.OwnerUserId
+          where a.Id = (select AcceptedAnswerId from Posts where Id = q.Id)
+            and a.PostTypeId = 2
+          limit 1
+         ) as AcceptedAnswerOwnerReputation
+  from RecentQuestions q
+  left join Posts p on p.Id = q.Id
+  group by q.Id, q.Title, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, q.FavoriteCount, q.Tags
+),
+-- user summary: reputation deciles, activity windows and badge counts
+UserSummary as (
+  select u.Id as UserId,
+         u.DisplayName,
+         u.Reputation,
+         ntile(10) over (order by u.Reputation desc nulls last) as RepDecile,
+         count(b.Id) filter (where b.Class = 1) as GoldBadges,
+         count(b.Id) filter (where b.Class = 2) as SilverBadges,
+         count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+         -- last seen and account age
+         u.LastAccessDate,
+         age(now(), u.CreationDate) as AccountAge,
+         -- activity intensity: posts and comments in last year
+         (select count(*) from Posts p where p.OwnerUserId = u.Id and p.CreationDate >= now() - interval '365 days') as PostsLastYear,
+         (select count(*) from Comments c where c.UserId = u.Id and c.CreationDate >= now() - interval '365 days') as CommentsLastYear
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  group by u.Id, u.DisplayName, u.Reputation, u.LastAccessDate, u.CreationDate
+),
+-- heavy join of votes and comments per question using window functions
+QuestionEngagement as (
+  select q.Id as QuestionId,
+         q.Score as QuestionScore,
+         q.ViewCount,
+         q.AnswerCount,
+         q.FavoriteCount,
+         coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end) filter (where v.CreationDate >= now() - interval '365 days'),0) as UpVotesLastYear,
+         coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end) filter (where v.CreationDate >= now() - interval '365 days'),0) as DownVotesLastYear,
+         coalesce(count(distinct c.Id) filter (where c.CreationDate >= now() - interval '365 days'),0) as CommentsLastYear,
+         -- proportion of answers that have score >= median answer score for that question (correlated subquery)
+         (select case when count(*) = 0 then 0 else round(100.0 * sum(case when a.Score >= med then 1 else 0 end)::numeric / nullif(count(*),0),2) end
+          from (
+            select a.*,
+                   percentile_cont(0.5) within group (order by a.Score) over () as med
+            from Posts a
+            where a.ParentId = q.Id and a.PostTypeId = 2
+          ) as sub
+         ) as PctAnswersAboveMedianScore
+  from QuestionSignals q
+  left join Votes v on v.PostId = q.Id
+  left join Comments c on c.PostId = q.Id
+  group by q.Id, q.Score, q.ViewCount, q.AnswerCount, q.FavoriteCount
+),
+-- compute tag popularity and average question metrics per tag
+TagMetrics as (
+  select t.Tag,
+         count(distinct q.Id) as QuestionsWithTag,
+         avg(q.Score) as AvgQuestionScore,
+         avg(q.ViewCount) as AvgViews,
+         avg(e.UpVotesLastYear) as AvgUpVotesLastYear,
+         percentile_cont(0.75) within group (order by q.Score) as Q3Score
+  from RecentQuestions q
+  join QuestionSignals qs on qs.Id = q.Id
+  left join QuestionEngagement e on e.QuestionId = q.Id
+  join (
+    select q2.Id, regexp_split_to_table(substring(q2.Tags from 2 for greatest(char_length(q2.Tags)-2,0)), '><') as Tag
+    from Posts q2 where q2.PostTypeId = 1 and q2.CreationDate >= now() - interval '365 days'
+  ) t on t.Id = q.Id
+  group by t.Tag
+  having count(distinct q.Id) > 5
+),
+-- identify suspicious or interesting threads via set operators and NULL logic
+InterestingThreads as (
+  select qs.*, ue.UpVotesLastYear, ue.DownVotesLastYear, ue.CommentsLastYear,
+         us.DisplayName as OwnerName, us.Reputation as OwnerReputation,
+         tm.Tag as TopTag, tm.QuestionsWithTag,
+         -- combined risk score: favors high view, low accepted answer reputation, many downvotes, and long inactivity
+         (coalesce(qs.Score,0) * -1
+          + coalesce(ue.DownVotesLastYear,0) * 2
+          + (case when qs.AcceptedAnswerOwnerReputation is null then 50 else greatest(0,100 - qs.AcceptedAnswerOwnerReputation/10) end)
+          + coalesce(qs.ViewCount/100,0)
+          + case when qs.EffectiveLastActivity < now() - interval '180 days' then 100 else 0 end
+         ) as RiskScore
+  from QuestionSignals qs
+  left join QuestionEngagement ue on ue.QuestionId = qs.Id
+  left join UserSummary us on us.UserId = qs.OwnerUserId
+  left join lateral (
+    select t.Tag, t.QuestionsWithTag
+    from TagMetrics t
+    where t.Tag = coalesce((select unnest(qs.Tags) limit 1), 'unknown')
+    limit 1
+  ) tm on true
+  where qs.Score < coalesce((select avg(Score) from QuestionSignals),0)
+),
+-- final ranked result with window functions, string expressions and complex predicates
+FinalRanked as (
+  select it.Id as QuestionId,
+         left(coalesce(it.Title,'(no title)'),200) as ShortTitle,
+         coalesce(it.OwnerName,'[deleted]') as OwnerName,
+         it.OwnerReputation,
+         it.Score,
+         it.ViewCount,
+         it.AnswerCount,
+         it.FavoriteCount,
+         it.TopTag,
+         it.QuestionsWithTag,
+         it.AcceptedAnswerAvgScore,
+         it.AcceptedAnswerOwnerReputation,
+         it.EffectiveLastActivity,
+         it.RiskScore,
+         rank() over (order by it.RiskScore desc NULLS LAST, it.ViewCount desc) as RiskRank,
+         row_number() over (partition by coalesce(it.TopTag,'__none__') order by it.RiskScore desc) as TagLocalRank,
+         -- human readable summary using string concatenation and null handling
+         ('Score=' || coalesce(it.Score::text,'0') || '; Views=' || coalesce(it.ViewCount::text,'0') ||
+          '; A=' || coalesce(it.AnswerCount::text,'0') || '; UpVotesLastYear=' || coalesce(it.UpVotesLastYear::text,'0')) as CompactSummary,
+         -- flag conditions combining booleans and NULL logic
+         (case
+            when it.RiskScore > 200 and coalesce(it.AcceptedAnswerOwnerReputation,0) < 500 then 'HighRisk-LowAcceptedReputation'
+            when it.RiskScore > 200 then 'HighRisk'
+            when it.RiskScore between 100 and 200 then 'MediumRisk'
+            else 'LowRisk'
+          end) as RiskCategory
+  from InterestingThreads it
+)
+select *
+from FinalRanked
+where RiskRank <= 200
+order by RiskScore desc, ViewCount desc, EffectiveLastActivity asc;

@@ -1,0 +1,198 @@
+-- {"query": "267.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 4587} 
+WITH tag_posts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.CommentCount,
+    p.FavoriteCount,
+    unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS Tag
+  FROM Posts p
+  WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+votes AS (
+  SELECT
+    v.PostId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+    SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS accepted_votes
+  FROM Votes v
+  GROUP BY v.PostId
+),
+user_badges AS (
+  SELECT
+    b.UserId,
+    COUNT(*) FILTER (WHERE b.Class = 1) AS gold,
+    COUNT(*) FILTER (WHERE b.Class = 2) AS silver,
+    COUNT(*) FILTER (WHERE b.Class = 3) AS bronze,
+    COUNT(*) AS total_badges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+post_hist_summary AS (
+  SELECT
+    ph.PostId,
+    COUNT(*) AS total_revisions,
+    SUM(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS edits,
+    MAX(ph.CreationDate) AS last_revision
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+recent_comments AS (
+  SELECT
+    c.PostId,
+    c.Id AS CommentId,
+    c.CreationDate,
+    c.UserId,
+    c.Text,
+    ROW_NUMBER() OVER (PARTITION BY c.PostId ORDER BY c.CreationDate DESC) AS rn
+  FROM Comments c
+),
+answers_agg AS (
+  SELECT
+    a.ParentId AS QuestionId,
+    COUNT(*) AS answer_count,
+    MAX(a.Score) AS top_answer_score,
+    AVG(a.Score) AS avg_answer_score
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+  GROUP BY a.ParentId
+),
+engagement AS (
+  SELECT
+    tp.Id,
+    tp.Title,
+    tp.OwnerUserId,
+    tp.CreationDate,
+    tp.Score,
+    tp.ViewCount,
+    tp.Tags,
+    tp.CommentCount,
+    tp.FavoriteCount,
+    tp.Tag,
+    COALESCE(v.upvotes,0) AS upvotes,
+    COALESCE(v.downvotes,0) AS downvotes,
+    COALESCE(a.answer_count,0) AS answers,
+    COALESCE(ph.total_revisions,0) AS total_revisions,
+    -- Engagement metric: weighted, with log scaling and null-safe division by revisions
+    (
+      ln(GREATEST(1, tp.ViewCount)) * 0.28
+      + COALESCE(v.upvotes,0) * 1.6
+      - COALESCE(v.downvotes,0) * 1.0
+      + COALESCE(a.answer_count,0) * 2.1
+      + GREATEST(0, COALESCE(tp.FavoriteCount,0)) * 2.4
+      + COALESCE(tp.Score,0) * 1.15
+    ) / NULLIF(1 + COALESCE(ph.total_revisions,0), 0) AS engagement_score
+  FROM tag_posts tp
+  LEFT JOIN votes v ON v.PostId = tp.Id
+  LEFT JOIN answers_agg a ON a.QuestionId = tp.Id
+  LEFT JOIN post_hist_summary ph ON ph.PostId = tp.Id
+),
+ranked AS (
+  SELECT
+    e.Id,
+    e.Title,
+    e.OwnerUserId,
+    e.CreationDate,
+    e.Score,
+    e.ViewCount,
+    e.Tags,
+    e.CommentCount,
+    e.FavoriteCount,
+    e.Tag,
+    e.upvotes,
+    e.downvotes,
+    e.answers,
+    e.total_revisions,
+    e.engagement_score,
+    ROW_NUMBER() OVER (PARTITION BY e.Tag ORDER BY e.engagement_score DESC NULLS LAST, e.ViewCount DESC) AS tag_rank,
+    DENSE_RANK() OVER (ORDER BY e.engagement_score DESC NULLS LAST) AS global_rank,
+    CASE WHEN EXTRACT(EPOCH FROM (now() - COALESCE(e.CreationDate, now()))) < 86400 THEN 1 ELSE 0 END AS recent_flag
+  FROM engagement e
+),
+top_per_tag AS (
+  SELECT
+    r.Id, r.Title, r.OwnerUserId, r.CreationDate, r.Score, r.ViewCount, r.Tags, r.CommentCount, r.FavoriteCount, r.Tag,
+    r.upvotes, r.downvotes, r.answers, r.total_revisions, r.engagement_score, r.tag_rank, r.global_rank, r.recent_flag
+  FROM ranked r
+  WHERE r.tag_rank <= 5
+),
+extra_lowlights AS (
+  SELECT
+    e.Id, e.Title, e.OwnerUserId, e.CreationDate, e.Score, e.ViewCount, e.Tags, e.CommentCount, e.FavoriteCount, e.Tag,
+    e.upvotes, e.downvotes, e.answers, e.total_revisions, e.engagement_score,
+    9999 AS tag_rank,
+    DENSE_RANK() OVER (ORDER BY e.ViewCount DESC) AS global_rank,
+    0 AS recent_flag
+  FROM engagement e
+  WHERE e.ViewCount > 10000 AND COALESCE(e.Score,0) <= 0
+),
+unioned AS (
+  SELECT * FROM top_per_tag
+  UNION ALL
+  SELECT * FROM extra_lowlights
+)
+SELECT
+  u.Tag,
+  u.Id AS QuestionId,
+  COALESCE(u.Title, '(no title)') AS Title,
+  COALESCE(us.DisplayName, '(deleted)') AS OwnerDisplayName,
+  COALESCE(us.Reputation,0) AS OwnerReputation,
+  u.Score,
+  u.ViewCount,
+  ROUND(u.engagement_score::numeric, 4) AS engagement_score,
+  u.tag_rank,
+  u.global_rank,
+  COALESCE(v.upvotes,0) AS UpVotes,
+  COALESCE(v.downvotes,0) AS DownVotes,
+  COALESCE(a.answer_count,0) AS AnswerCount,
+  COALESCE(ph.edits,0) AS EditCount,
+  -- correlated subquery: latest non-owner comment snippet (null-safe, truncated)
+  (
+    SELECT substring(coalesce(rc.Text,'') FROM 1 FOR 140)
+    FROM recent_comments rc
+    WHERE rc.PostId = u.Id
+      AND (rc.UserId IS NULL OR rc.UserId <> u.OwnerUserId)
+      AND rc.rn = 1
+  ) AS LatestNonOwnerCommentSnippet,
+  -- correlated scalar: days since last activity (null logic)
+  (
+    SELECT EXTRACT(EPOCH FROM now() - COALESCE(MAX(p2.LastActivityDate), MAX(p2.CreationDate))) / 86400
+    FROM Posts p2
+    WHERE p2.Id = u.Id
+  )::numeric(10,4) AS DaysSinceLastActivity,
+  -- duplicates linked out
+  COALESCE((SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = u.Id AND pl.LinkTypeId = 3), 0) AS DuplicateCount,
+  -- intersection with Tags table via string matching (string aggregation)
+  (
+    SELECT string_agg(DISTINCT t.TagName, '|' ORDER BY t.TagName)
+    FROM Tags t
+    WHERE POSITION(t.TagName IN COALESCE(u.Tags,'')) > 0
+  ) AS KnownTagsIntersection,
+  -- complex status with NULL logic
+  CASE
+    WHEN COALESCE(a.answer_count,0) = 0 AND (COALESCE(v.upvotes,0) < 5 OR COALESCE(u.Score,0) <= 0) THEN 'NeedAttention'
+    WHEN u.engagement_score > 200 THEN 'Blazing'
+    WHEN u.recent_flag = 1 AND u.engagement_score > 10 THEN 'Trending'
+    WHEN u.engagement_score BETWEEN 5 AND 200 THEN 'Hot'
+    ELSE 'Normal'
+  END AS Status,
+  COALESCE(b.gold,0)*5 + COALESCE(b.silver,0)*2 + COALESCE(b.bronze,0)*1 AS OwnerBadgeInfluence
+FROM unioned u
+LEFT JOIN Users us ON us.Id = u.OwnerUserId
+LEFT JOIN votes v ON v.PostId = u.Id
+LEFT JOIN answers_agg a ON a.QuestionId = u.Id
+LEFT JOIN post_hist_summary ph ON ph.PostId = u.Id
+LEFT JOIN user_badges b ON b.UserId = u.OwnerUserId
+-- include a synthetic intersect to force set operator execution and complexity
+WHERE u.Id IN (
+  SELECT Id FROM unioned
+  INTERSECT
+  SELECT Id FROM unioned WHERE engagement_score IS NOT NULL
+)
+ORDER BY u.Tag ASC, u.tag_rank ASC, u.engagement_score DESC
+LIMIT 500;

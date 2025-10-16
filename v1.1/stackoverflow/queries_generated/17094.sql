@@ -1,0 +1,143 @@
+-- {"query": "17094.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 221825, "output_tokens": 218969} 
+
+WITH UserMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        EXTRACT(YEAR FROM AGE(CURRENT_DATE, u.CreationDate)) AS YearsActive,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        COALESCE(AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL), 0) AS AvgScore,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        STRING_AGG(DISTINCT SUBSTRING(UPPER(u.Location), 1, 3), '|' ORDER BY SUBSTRING(UPPER(u.Location), 1, 3)) AS LocationCode
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+        AND u.CreationDate < CURRENT_DATE - INTERVAL '1 year'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location, u.CreationDate
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagUsageCount,
+        COUNT(DISTINCT p.OwnerUserId) AS UniqueAuthors,
+        AVG(p.Score) AS AvgPostScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS MedianScore,
+        MAX(p.Score) - MIN(p.Score) AS ScoreRange,
+        STDDEV(p.Score) AS ScoreStdDev,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS PopularityRank,
+        DENSE_RANK() OVER (ORDER BY AVG(p.Score) DESC NULLS LAST) AS QualityRank
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%<' || t.TagName || '>%'
+    WHERE p.PostTypeId = 1
+        AND p.Score >= 0
+        AND t.Count > 100
+    GROUP BY t.TagName, t.Count
+),
+PostEngagement AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        c.CommentActivity,
+        v.VoteActivity,
+        ph.EditCount,
+        CASE 
+            WHEN p.ViewCount > 0 THEN (p.Score::NUMERIC / NULLIF(p.ViewCount, 0)) * 1000
+            ELSE 0 
+        END AS EngagementRatio,
+        NTILE(10) OVER (ORDER BY p.Score DESC NULLS LAST) AS ScoreDecile,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostScore,
+        LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostScore
+    FROM Posts p
+    LEFT JOIN LATERAL (
+        SELECT COUNT(*) AS CommentActivity
+        FROM Comments c
+        WHERE c.PostId = p.Id
+            AND c.Score > 0
+    ) c ON true
+    LEFT JOIN LATERAL (
+        SELECT COUNT(DISTINCT VoteTypeId) AS VoteActivity
+        FROM Votes v
+        WHERE v.PostId = p.Id
+            AND v.VoteTypeId IN (2, 3, 5)
+    ) v ON true
+    LEFT JOIN LATERAL (
+        SELECT COUNT(*) AS EditCount
+        FROM PostHistory ph
+        WHERE ph.PostId = p.Id
+            AND ph.PostHistoryTypeId IN (4, 5, 6)
+    ) ph ON true
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= CURRENT_DATE - INTERVAL '2 years'
+        AND p.ClosedDate IS NULL
+)
+SELECT 
+    um.DisplayName,
+    um.Location,
+    um.Reputation,
+    um.YearsActive || ' years' AS Tenure,
+    um.TotalPosts,
+    ROUND(um.AvgScore::NUMERIC, 2) AS AvgPostScore,
+    um.GoldBadges || '/' || um.BadgeCount AS BadgeRatio,
+    COALESCE(ta.TagName, 'No Popular Tags') AS TopTag,
+    ta.PopularityRank AS TagRank,
+    ROUND(COALESCE(ta.AvgPostScore, 0)::NUMERIC, 2) AS TagAvgScore,
+    pe.Title AS BestPost,
+    pe.Score AS BestPostScore,
+    pe.EngagementRatio,
+    pe.ScoreDecile,
+    CASE 
+        WHEN pe.Score > COALESCE(pe.PrevPostScore, 0) AND pe.Score > COALESCE(pe.NextPostScore, 0) THEN 'Peak Performance'
+        WHEN pe.Score > COALESCE(pe.PrevPostScore, 0) THEN 'Improving'
+        WHEN pe.Score < COALESCE(pe.PrevPostScore, 0) THEN 'Declining'
+        ELSE 'Stable'
+    END AS PerformanceTrend,
+    CASE
+        WHEN um.Reputation > 10000 AND um.GoldBadges > 5 THEN 'Elite'
+        WHEN um.Reputation > 5000 OR um.GoldBadges > 2 THEN 'Expert'
+        WHEN um.Reputation > 2000 THEN 'Experienced'
+        ELSE 'Active'
+    END AS UserTier,
+    COALESCE(NULLIF(TRIM(BOTH FROM um.LocationCode), ''), 'N/A') AS LocationAbbrev
+FROM UserMetrics um
+LEFT JOIN LATERAL (
+    SELECT *
+    FROM PostEngagement pe
+    WHERE pe.OwnerUserId = um.Id
+    ORDER BY pe.Score DESC NULLS LAST
+    LIMIT 1
+) pe ON true
+LEFT JOIN LATERAL (
+    SELECT *
+    FROM TagAnalysis ta
+    WHERE EXISTS (
+        SELECT 1
+        FROM Posts p
+        WHERE p.OwnerUserId = um.Id
+            AND p.Tags LIKE '%<' || ta.TagName || '>%'
+    )
+    ORDER BY ta.PopularityRank
+    LIMIT 1
+) ta ON true
+WHERE um.TotalPosts > 10
+    AND (pe.Score > 10 OR um.BadgeCount > 20)
+    AND um.DisplayName IS NOT NULL
+    AND LENGTH(um.DisplayName) > 0
+ORDER BY 
+    CASE 
+        WHEN pe.EngagementRatio IS NULL THEN 0 
+        ELSE pe.EngagementRatio 
+    END DESC,
+    um.Reputation DESC,
+    um.GoldBadges DESC
+LIMIT 100;

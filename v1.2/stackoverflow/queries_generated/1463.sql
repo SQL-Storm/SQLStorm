@@ -1,0 +1,212 @@
+-- {"query": "1463.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2128} 
+
+WITH RankedPosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS UserPostRank,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS UserPostCount,
+        p.AcceptedAnswerId,
+        /* Extract first tag if any for categorization - nested usage demonstrates string manip */
+        NULLIF(
+            substring(
+                regexp_split_to_table(COALESCE(p.Tags,''), '><')
+                ORDER BY NULL
+                LIMIT 1
+            ), '') AS FirstTag
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId IN (1, 2) -- limit to Questions and Answers
+),
+UserBadgeStats AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(DISTINCT b.Date::date) AS ActiveBadgeDays
+    FROM
+        Badges b
+    GROUP BY
+        b.UserId
+),
+UserAggregates AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        u.DisplayName,
+        u.Location,
+        -- Defaultifornull Website reformed manually w/pattern recognition
+        COALESCE(NULLIF(u.WebsiteUrl, ''), 'N/A') AS WebsiteUrl_clean,
+        COUNT(DISTINCT p.Id) FILTER (WHERE r.UserPostRank IS NOT NULL) AS NumPosts,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        COALESCE(ubs.GoldBadges, 0) AS GoldBadges,
+        COALESCE(ubs.SilverBadges, 0) AS SilverBadges,
+        COALESCE(ubs.BronzeBadges, 0) AS BronzeBadges,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes, 
+        u.AccountId,
+        u.LastAccessDate,
+        /* Average time since user last accessed community in days; allow for NULL-safe elapsed time */
+        DATE_PART('day', current_timestamp - u.LastAccessDate) AS DaysSinceLastAccess
+    FROM
+        Users u
+        LEFT JOIN RankedPosts r ON u.Id = r.OwnerUserId
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        LEFT JOIN UserBadgeStats ubs ON u.Id = ubs.UserId
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate, u.DisplayName, u.Location, u.WebsiteUrl, 
+        u.Views, u.UpVotes, u.DownVotes, u.AccountId, u.LastAccessDate,
+        ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges
+),
+ClosedQuestionCounts AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(*) FILTER (WHERE pst13.PostHistoryTypeId = 10) AS NumClosedQuestions,        -- Post Closed event identifiers
+        COUNT(*) FILTER (WHERE pst13.PostHistoryTypeId = 11) AS NumReopenedQuestions
+    FROM
+        Posts p
+        LEFT JOIN PostHistory pst13 ON p.Id = pst13.PostId AND pst13.PostHistoryTypeId IN (10, 11)
+    WHERE
+        p.PostTypeId = 1
+    GROUP BY
+        p.OwnerUserId
+),
+AnswerAcceptanceRate AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(a.Id) AS AnswersGiven,
+        COUNT(pa.Id) AS AnswersAccepted
+    FROM
+        Users u
+        JOIN Posts a ON a.PostTypeId = 2 AND a.OwnerUserId = u.Id
+        LEFT JOIN Posts q ON q.Id = a.ParentId AND q.AcceptedAnswerId = a.Id
+        LEFT JOIN Posts pa ON q.AcceptedAnswerId = a.Id
+    GROUP BY
+        u.Id
+),
+CombinedStats AS (
+    SELECT
+        ua.*,
+        COALESCE(cqc.NumClosedQuestions,0) AS ClosedQuestions,
+        COALESCE(cqc.NumReopenedQuestions,0) AS ReopenedQuestions,
+        COALESCE(aar.AnswersGiven, 0) AS AnswersGiven,
+        COALESCE(aar.AnswersAccepted, 0) AS AnswersAccepted,
+        CASE WHEN COALESCE(aar.AnswersGiven, 0) > 0 THEN 
+            ROUND(COALESCE(aar.AnswersAccepted,0)::NUMERIC / aar.AnswersGiven, 3)
+        ELSE 0 END AS AcceptanceRate
+    FROM 
+        UserAggregates ua
+        LEFT JOIN ClosedQuestionCounts cqc ON ua.UserId = cqc.OwnerUserId
+        LEFT JOIN AnswerAcceptanceRate aar ON ua.UserId = aar.UserId
+),
+FilteredTaggedQuestions AS (
+    SELECT
+        p.Id, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags,
+        -- Extract letter counts of tags stripped of XML notation
+        array_length(string_to_array(replace(replace(p.Tags, '<', ''), '>', ''), ';'),1) AS TagCount,
+        p.AcceptedAnswerId
+    FROM
+        Posts p
+    WHERE 
+        p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.Tags <> ''
+),
+DuplicatePostsIdentified AS (
+    SELECT pl.PostId, pl.RelatedPostId, pl.LinkTypeId,
+        COUNT(*) OVER (PARTITION BY pl.PostId) AS OutboundLinks,
+        COUNT(*) OVER (PARTITION BY pl.RelatedPostId) AS InboundLinks
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3 -- 'Duplicate'
+),
+CoAuthoringUsers AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        p.PostTypeId,
+        COUNT(DISTINCT ph.UserId) AS NumberOfEditors
+    FROM
+        PostHistory ph
+        JOIN Posts p ON ph.PostId = p.Id
+    WHERE
+        ph.UserId IS NOT NULL
+        AND ph.PostHistoryTypeId IN (4,5,6) -- indicates edits (Edit Title/Body/Tags)
+    GROUP BY
+        ph.PostId, ph.UserId, p.PostTypeId
+),
+UserAlertUsers AS (
+    SELECT
+        u.Id,
+        LISTAGG(DISTINCT b.Name, ',') WITHIN GROUP (ORDER BY b.Class DESC NULLS LAST) AS BadgeNames,
+        COUNT(c.Id) FILTER (WHERE c.CreationDate > u.LastAccessDate - INTERVAL '90 day') AS RecentCommentCount,
+        MAX(p.Score) FILTER (WHERE p.AnswerCount > 0) AS MaxQuestionScore
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    GROUP BY u.Id
+)
+
+SELECT
+    cs.UserId,
+    cs.DisplayName,
+    cs.Reputation,
+    cs.Location,
+    cs.WebsiteUrl_clean,
+    cs.NumPosts,
+    cs.TotalPostScore,
+    cs.GoldBadges,
+    cs.SilverBadges,
+    cs.BronzeBadges,
+    cs.AnswersGiven,
+    cs.AnswersAccepted,
+    cs.AcceptanceRate,
+    cs.ClosedQuestions,
+    cs.ReopenedQuestions,
+    COALESCE(ftq.TagCount, 0) AS TagsOnLatestQuestion,
+    COALESCE(dp.OutboundLinks, 0) AS DuplicatesMadeByUser,
+    COALESCE(DUAL.CountPostedItems, 0) AS DistinctLatency,
+    ua.BadgeNames AS EarnedBadgeNames,
+    ua.RecentCommentCount,
+    ua.MaxQuestionScore,
+    /* DeveloperBenchmarkScore irregular complex expression multipl           y z pôәuş�ü¡a unique analytical challenge */
+    (COALESCE(cs.Reputation,0) * 
+    LEAST(cs.NumPosts, 500) +
+    10 * CAST(cs.AcceptanceRate*1000 AS int) +                                          -- convert to integer scale
+    15 * cs.GoldBadges + 
+    5 * cs.SilverBadges +
+    (CASE WHEN cs.ClosedQuestions > 0 THEN -20 * cs.ClosedQuestions ELSE 0 END) +
+    COALESCE(dp.OutboundLinks,0) * 3 / NULLIF(NULLIF(cs.AnswersGiven,0),1) +                                   -- ranking penalized by how many dupes posted per answer
+    LEAST(50, COALESCE(ftq.TagCount, 0)) +
+    ua.RecentCommentCount * 0.1
+    ) AS DeveloperBenchmarkScore
+FROM
+    CombinedStats cs
+    LEFT JOIN FilteredTaggedQuestions ftq ON ftq.OwnerUserId = cs.UserId -- join 
+                                                       AND ftq.CreationDate = (
+                                                            SELECT MAX(CreationDate) 
+                                                            FROM FilteredTaggedQuestions b 
+                                                            WHERE b.OwnerUserId = cs.UserId)
+    LEFT JOIN (
+        SELECT u1.OwnerUserId, COUNT(*) AS CountPostedItems
+        FROM Posts u1 WHERE u1.Score > 5 
+        GROUP BY u1.OwnerUserId
+    ) DUAL ON DUAL.OwnerUserId = cs.UserId
+    LEFT JOIN DuplicatePostsIdentified dp ON dp.PostId IN (
+             SELECT Id FROM Posts WHERE OwnerUserId = cs.UserId
+    )
+    LEFT JOIN UserAlertUsers ua ON ua.Id = cs.UserId
+WHERE
+    cs.NumPosts > 10 AND               -- only active users considered here
+    cs.Reputation > 500 AND            -- consider higher reputatations
+    cs.DaysSinceLastAccess < 365      -- active last year
+ORDER BY DeveloperBenchmarkScore DESC
+LIMIT 100;

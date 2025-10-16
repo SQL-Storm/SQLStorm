@@ -1,0 +1,174 @@
+-- {"query": "780.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1632} 
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        p.Id as PostId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        row_number() over (partition by t.Id order by p.Score desc, p.ViewCount desc) as rn
+    from Tags t
+    left join Posts p on p.Tags like '%' || t.TagName || '%'
+    where p.PostTypeId = 1 -- questions only
+),
+TopTagPosts as (
+    select
+        Id,
+        TagName,
+        PostId,
+        Score,
+        ViewCount,
+        CreationDate,
+        OwnerUserId
+    from RecursiveTagCounts
+    where rn <= 5
+),
+UserBadgesCount as (
+    select
+        UserId,
+        count(*) filter (where Class = 1) as GoldBadges,
+        count(*) filter (where Class = 2) as SilverBadges,
+        count(*) filter (where Class = 3) as BronzeBadges
+    from Badges
+    group by UserId
+),
+UserPostStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(b.GoldBadges,0) as GoldBadges,
+        coalesce(b.SilverBadges,0) as SilverBadges,
+        coalesce(b.BronzeBadges,0) as BronzeBadges,
+        count(p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        max(p.Score) filter (where p.PostTypeId = 1) as MaxQuestionScore,
+        max(p.Score) filter (where p.PostTypeId = 2) as MaxAnswerScore,
+        avg(p.Score) filter (where p.PostTypeId = 1) as AvgQuestionScore,
+        avg(p.Score) filter (where p.PostTypeId = 2) as AvgAnswerScore,
+        (select count(*) from Comments c where c.UserId = u.Id) as CommentCount,
+        (select count(distinct ph.PostId) from PostHistory ph where ph.UserId = u.Id and ph.PostHistoryTypeId in (4,5,6)) as EditCount
+    from Users u
+    left join UserBadgesCount b on b.UserId = u.Id
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, b.GoldBadges, b.SilverBadges, b.BronzeBadges
+),
+RecentActivity as (
+    select
+        p.OwnerUserId as UserId,
+        max(p.LastActivityDate) as LastPostActivity,
+        max(c.CreationDate) as LastCommentActivity,
+        max(ph.CreationDate) as LastEditActivity
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id
+    group by p.OwnerUserId
+),
+UserActivitySummary as (
+    select
+        u.UserId,
+        u.DisplayName,
+        greatest(
+            coalesce(r.LastPostActivity, timestamp '1970-01-01'),
+            coalesce(r.LastCommentActivity, timestamp '1970-01-01'),
+            coalesce(r.LastEditActivity, timestamp '1970-01-01')
+        ) as LastActivityDate
+    from UserPostStats u
+    left join RecentActivity r on r.UserId = u.UserId
+),
+QuestionAnswerJoin as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Tags,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        a.Id as AnswerId,
+        a.CreationDate as AnswerCreation,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerOwnerId,
+        u.DisplayName as AnswerOwnerName,
+        row_number() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1
+),
+TopAnswersPerQuestion as (
+    select * from QuestionAnswerJoin where AnswerRank <= 3
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate as LinkCreationDate,
+        u.DisplayName as LinkCreatorName,
+        lt.Name as LinkTypeName
+    from PostLinks pl
+    left join Users u on u.Id = (
+        select OwnerUserId from Posts p where p.Id = pl.PostId limit 1
+    )
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where pl.LinkTypeId = 3 -- duplicates
+),
+UserEngagement as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesGiven,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotesGiven,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) filter (where v.PostId in (select Id from Posts where OwnerUserId = u.Id)) as UpVotesReceived,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) filter (where v.PostId in (select Id from Posts where OwnerUserId = u.Id)) as DownVotesReceived,
+        count(distinct v.PostId) as DistinctPostsVotedOn
+    from Users u
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+)
+select
+    t.TagName,
+    t.PostId as TopQuestionId,
+    t.Score as QuestionScore,
+    t.ViewCount as QuestionViews,
+    u.DisplayName as QuestionOwner,
+    u.Reputation as QuestionOwnerReputation,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    a.AnswerId,
+    a.AnswerScore,
+    a.AnswerCreation,
+    a.AnswerOwnerName,
+    ua.UpVotesGiven,
+    ua.DownVotesGiven,
+    ua.UpVotesReceived,
+    ua.DownVotesReceived,
+    ua.DistinctPostsVotedOn,
+    d.PostId as DuplicatePostId,
+    d.RelatedPostId as DuplicateOfPostId,
+    d.LinkCreationDate,
+    d.LinkCreatorName,
+    d.LinkTypeName,
+    uas.LastActivityDate,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.CommentCount,
+    us.EditCount,
+    us.MaxQuestionScore,
+    us.MaxAnswerScore,
+    us.AvgQuestionScore,
+    us.AvgAnswerScore
+from TopTagPosts t
+left join Users u on u.Id = t.OwnerUserId
+left join TopAnswersPerQuestion a on a.QuestionId = t.PostId and a.AnswerRank = 1
+left join UserEngagement ua on ua.UserId = a.AnswerOwnerId
+left join DuplicateLinks d on d.PostId = t.PostId
+left join UserActivitySummary uas on uas.UserId = t.OwnerUserId
+left join UserPostStats us on us.UserId = t.OwnerUserId
+where t.Score is not null
+order by t.TagName, t.Score desc, a.AnswerScore desc
+limit 100;

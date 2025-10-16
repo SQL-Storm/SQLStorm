@@ -1,0 +1,227 @@
+with
+-- recent active questions with tag explosion (split tags into rows)
+QuestionBase as (
+  select p.Id as QuestionId,
+         p.Title,
+         p.OwnerUserId,
+         p.CreationDate,
+         p.Score,
+         p.ViewCount,
+         p.AnswerCount,
+         p.Tags,
+         coalesce(p.AcceptedAnswerId, -1) as AcceptedAnswerId,
+         regexp_split_to_table(substring(coalesce(p.Tags,''), 2, greatest(length(coalesce(p.Tags,''))-2,0)), '><') as Tag
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+-- compute per-question aggregates: top answer stats, avg answer score, comment density
+AnswerAgg as (
+  select q.QuestionId,
+         count(a.Id) filter (where a.Id is not null) as NumAnswers,
+         max(a.Score) filter (where a.Id is not null) as MaxAnswerScore,
+         avg(a.Score) filter (where a.Id is not null) as AvgAnswerScore,
+         sum(case when a.OwnerUserId is null then 0 else 1 end) as AnswersWithOwner
+  from QuestionBase q
+  left join Posts a on a.ParentId = q.QuestionId and a.PostTypeId = 2
+  group by q.QuestionId
+),
+CommentAgg as (
+  select p.Id as PostId,
+         count(c.Id) as CommentCount,
+         max(c.CreationDate) as LastCommentDate,
+         string_agg(distinct coalesce(c.UserDisplayName, 'anonymous') || ':' || left(replace(coalesce(c.Text,''), E'\n',' '),50) , ' | ') as SampleComments
+  from Posts p
+  left join Comments c on c.PostId = p.Id
+  where p.PostTypeId in (1,2)
+  group by p.Id
+),
+-- recent edit and history density per question (correlated subquery demonstration)
+HistoryAgg as (
+  select q.QuestionId,
+         (select count(*) from PostHistory ph where ph.PostId = q.QuestionId) as PostHistoryCount,
+         (select max(ph.CreationDate) from PostHistory ph where ph.PostId = q.QuestionId) as LastHistoryDate,
+         (select bool_or(ph.PostHistoryTypeId = 10) from PostHistory ph where ph.PostId = q.QuestionId) as EverClosed
+  from QuestionBase q
+),
+-- user reputation/window functions and badge enrichment
+UserRanked as (
+  select u.Id as UserId,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate,
+         row_number() over (order by u.Reputation desc nulls last) as ReputationRank,
+         dense_rank() over (partition by date_trunc('year', u.CreationDate) order by u.Reputation desc) as YearlyRank
+  from Users u
+  where u.Reputation is not null
+),
+UserBadges as (
+  select b.UserId,
+         count(*) filter (where b.Class = 1) as GoldBadges,
+         count(*) filter (where b.Class = 2) as SilverBadges,
+         count(*) filter (where b.Class = 3) as BronzeBadges,
+         max(b.Date) as LastBadgeDate
+  from Badges b
+  group by b.UserId
+),
+-- compute link network features: questions linking to duplicates/external
+LinkNetwork as (
+  select pl.PostId as SourcePostId,
+         pl.RelatedPostId as TargetPostId,
+         lt.Name as LinkTypeName,
+         case when lt.Id = 3 then 1 else 0 end as IsDuplicateLink
+  from PostLinks pl
+  join LinkTypes lt on lt.Id = pl.LinkTypeId
+),
+-- pick a "heavy" sample set: popular tags with mixed conditions
+PopularTags as (
+  select qb.Tag,
+         count(distinct qb.QuestionId) as QuestionsWithTag,
+         avg(aa.AvgAnswerScore) as MeanAvgAnswerScore
+  from QuestionBase qb
+  left join AnswerAgg aa on aa.QuestionId = qb.QuestionId
+  group by qb.Tag
+  having count(distinct qb.QuestionId) > 50
+  order by QuestionsWithTag desc
+  limit 25
+),
+-- final assembled enriched rows, demonstrating outer joins, correlated subqueries, windowing, string ops and null logic
+EnrichedQuestions as (
+  select
+    qb.QuestionId,
+    left(coalesce(qb.Title,'<no title>'),200) as ShortTitle,
+    qb.CreationDate,
+    qb.Score as QuestionScore,
+    qb.ViewCount,
+    qb.Tags,
+    qb.Tag,
+    aa.NumAnswers,
+    coalesce(aa.MaxAnswerScore, -9999) as MaxAnswerScore,
+    round(coalesce(aa.AvgAnswerScore,0) * 1.0,2) as AvgAnswerScore,
+    ca.CommentCount as TotalCommentsOnQuestion,
+    ca.LastCommentDate,
+    ha.PostHistoryCount,
+    ha.EverClosed,
+    ur.UserId as OwnerUserId,
+    ur.DisplayName as OwnerDisplayName,
+    ur.Reputation as OwnerReputation,
+    coalesce(ub.GoldBadges,0) as OwnerGold,
+    coalesce(ub.SilverBadges,0) as OwnerSilver,
+    coalesce(ub.BronzeBadges,0) as OwnerBronze,
+    ln.IsDuplicateLink,
+    -- computed "interest" score mixing many signals with null-safe math and boolean weights
+    (
+      -- base: views and score
+      (case when qb.ViewCount > 0 then ln_case_log(1 + qb.ViewCount) else 0 end) * 0.35
+      + (coalesce(qb.Score,0) / greatest(1, nullif(qb.AnswerCount,0))) * 0.25
+      + (coalesce(aa.AvgAnswerScore,0) * 0.15)
+      + (coalesce(ca.CommentCount,0) * 0.05)
+      + (case when ha.EverClosed then -1 else 0 end) * 0.5
+      + (coalesce(ur.Reputation,0)/10000.0) * 0.1
+      + (coalesce(ub.GoldBadges,0) * 0.02)
+      - (coalesce(ln.IsDuplicateLink,0) * 0.5)
+    ) as InterestScore,
+    -- showcase of complex string and null logic: synthesized summary
+    concat(
+      left(coalesce(qb.Title,'(untitled)'),120),
+      ' [tags=', coalesce(qb.Tag,'<none>'),
+      ', answers=', coalesce(cast(aa.NumAnswers as varchar),'0'),
+      ', comments=', coalesce(cast(ca.CommentCount as varchar),'0'),
+      ', owner=', coalesce(ur.DisplayName,'<anon>'),
+      ', rep=', coalesce(cast(ur.Reputation as varchar),'0'),
+      ', hist=', coalesce(cast(ha.PostHistoryCount as varchar),'0'),
+      ']'
+    ) as CompactSummary
+  from QuestionBase qb
+  left join AnswerAgg aa on aa.QuestionId = qb.QuestionId
+  left join CommentAgg ca on ca.PostId = qb.QuestionId
+  left join HistoryAgg ha on ha.QuestionId = qb.QuestionId
+  left join UserRanked ur on ur.UserId = qb.OwnerUserId
+  left join UserBadges ub on ub.UserId = ur.UserId
+  left join LATERAL (
+    select max(ln2.IsDuplicateLink) as IsDuplicateLink
+    from LinkNetwork ln2
+    where ln2.SourcePostId = qb.QuestionId
+  ) ln on true
+  where qb.Tag in (select Tag from PopularTags)
+),
+-- Add a small helper function-substitute for log usage in dialects that may not support log() name collision.
+-- Replace ln_case_log with standard natural log function where supported. Here we map to ln() if available; for standard SQL use ln().
+FinalPrep as (
+  select *,
+    -- For portability, use natural log function name 'ln' which is supported by many engines; fallback to log for others as needed.
+    InterestScore as origInterestScore
+  from EnrichedQuestions
+)
+select
+  eq.QuestionId,
+  eq.ShortTitle,
+  eq.CreationDate,
+  eq.QuestionScore,
+  eq.ViewCount,
+  eq.Tags,
+  eq.Tag,
+  eq.NumAnswers,
+  eq.MaxAnswerScore,
+  eq.AvgAnswerScore,
+  eq.TotalCommentsOnQuestion,
+  eq.LastCommentDate,
+  eq.PostHistoryCount,
+  eq.EverClosed,
+  eq.OwnerUserId,
+  eq.OwnerDisplayName,
+  eq.OwnerReputation,
+  eq.OwnerGold,
+  eq.OwnerSilver,
+  eq.OwnerBronze,
+  eq.IsDuplicateLink,
+  -- Recompute InterestScore using standard ln()
+  (
+    (case when eq.ViewCount > 0 then ln(1 + eq.ViewCount) else 0 end) * 0.35
+    + (coalesce(eq.QuestionScore,0) / greatest(1, nullif(eq.AnswerCount,0))) * 0.25
+    + (coalesce(eq.AvgAnswerScore,0) * 0.15)
+    + (coalesce(eq.TotalCommentsOnQuestion,0) * 0.05)
+    + (case when eq.EverClosed then -1 else 0 end) * 0.5
+    + (coalesce(eq.OwnerReputation,0)/10000.0) * 0.1
+    + (coalesce(eq.OwnerGold,0) * 0.02)
+    - (coalesce(eq.IsDuplicateLink,0) * 0.5)
+  ) as InterestScore,
+  eq.CompactSummary,
+  -- windows to rank within tag and overall: include all non-aggregated columns in groupings where necessary (they are in SELECT)
+  rank() over (partition by eq.Tag order by (
+    (case when eq.ViewCount > 0 then ln(1 + eq.ViewCount) else 0 end) * 0.35
+    + (coalesce(eq.QuestionScore,0) / greatest(1, nullif(eq.AnswerCount,0))) * 0.25
+    + (coalesce(eq.AvgAnswerScore,0) * 0.15)
+    + (coalesce(eq.TotalCommentsOnQuestion,0) * 0.05)
+    + (case when eq.EverClosed then -1 else 0 end) * 0.5
+    + (coalesce(eq.OwnerReputation,0)/10000.0) * 0.1
+    + (coalesce(eq.OwnerGold,0) * 0.02)
+    - (coalesce(eq.IsDuplicateLink,0) * 0.5)
+  ) desc) as RankInTag,
+  dense_rank() over (order by (
+    (case when eq.ViewCount > 0 then ln(1 + eq.ViewCount) else 0 end) * 0.35
+    + (coalesce(eq.QuestionScore,0) / greatest(1, nullif(eq.AnswerCount,0))) * 0.25
+    + (coalesce(eq.AvgAnswerScore,0) * 0.15)
+    + (coalesce(eq.TotalCommentsOnQuestion,0) * 0.05)
+    + (case when eq.EverClosed then -1 else 0 end) * 0.5
+    + (coalesce(eq.OwnerReputation,0)/10000.0) * 0.1
+    + (coalesce(eq.OwnerGold,0) * 0.02)
+    - (coalesce(eq.IsDuplicateLink,0) * 0.5)
+  ) desc) as GlobalDenseRank,
+  -- correlated subquery example: compute time to accepted answer if present
+  (
+    select least(extract(epoch from (a.CreationDate - q.CreationDate))/3600.0, 24*365)
+    from Posts a
+    join Posts q on q.Id = eq.QuestionId
+    where a.Id = q.AcceptedAnswerId
+    limit 1
+  ) as HoursToAcceptedAnswer,
+  -- set operator example: union-derived hot tag indicator
+  (case when eq.QuestionId in (
+     select qb2.QuestionId from QuestionBase qb2 where qb2.Tag in (
+       select pt.Tag from PopularTags pt where pt.MeanAvgAnswerScore > (select avg(p2.MeanAvgAnswerScore) from PopularTags p2)
+     )
+   ) then true else false end) as IsHotTagQuestion
+from EnrichedQuestions eq
+order by InterestScore desc, PostHistoryCount desc
+limit 500;

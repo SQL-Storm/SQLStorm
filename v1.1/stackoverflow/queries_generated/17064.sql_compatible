@@ -1,0 +1,148 @@
+WITH UserMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        EXTRACT(YEAR FROM AGE(CAST('2024-10-01' AS DATE), u.CreationDate)) AS YearsOnPlatform,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        AVG(CASE WHEN p.Score IS NOT NULL THEN p.Score ELSE 0 END) AS AvgPostScore,
+        -- STRING_AGG DISTINCT with ORDER BY moved to a subquery to satisfy portability and DISTINCT+ORDER BY restriction
+        (SELECT STRING_AGG(Name, ', ' ORDER BY Class, Name)
+         FROM (
+             SELECT DISTINCT b2.Name, b2.Class
+             FROM Badges b2
+             WHERE b2.UserId = u.Id AND b2.Class = 1
+         ) sub
+        ) AS GoldBadges,
+        (SELECT COUNT(DISTINCT b3.Id) FROM Badges b3 WHERE b3.UserId = u.Id AND b3.Class = 1) AS GoldBadgeCount,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS MedianPostScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '5 years'
+        AND u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location, u.CreationDate
+),
+TopTagPerformance AS (
+    SELECT 
+        t.TagName,
+        um.Id AS UserId,
+        COUNT(DISTINCT p.Id) AS TagPostCount,
+        SUM(p.Score) AS TotalTagScore,
+        RANK() OVER (PARTITION BY t.TagName ORDER BY SUM(p.Score) DESC NULLS LAST) AS TagRank,
+        FIRST_VALUE(p.Title) OVER (
+            PARTITION BY t.TagName, um.Id 
+            ORDER BY p.Score DESC NULLS LAST, p.ViewCount DESC NULLS LAST
+            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+        ) AS BestPostTitle
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    INNER JOIN UserMetrics um ON p.OwnerUserId = um.Id
+    WHERE t.Count > 1000
+        AND p.Score > 0
+    GROUP BY t.TagName, um.Id
+),
+EditActivity AS (
+    SELECT 
+        ph.UserId,
+        COUNT(DISTINCT ph.PostId) AS EditedPosts,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) AS EditCount,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (7, 8, 9)) AS RollbackCount,
+        MAX(ph.CreationDate) AS LastEditDate,
+        CASE 
+            WHEN COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (7, 8, 9)) > 10 
+            THEN 'Frequent Rollbacker'
+            WHEN COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) > 100 
+            THEN 'Active Editor'
+            ELSE 'Casual Editor'
+        END AS EditorType
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+        AND ph.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '2 years'
+    GROUP BY ph.UserId
+),
+VotePatterns AS (
+    SELECT 
+        v.UserId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpvoteCount,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownvoteCount,
+        COALESCE(
+            CAST(COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS DOUBLE PRECISION) / 
+            NULLIF(COUNT(*) FILTER (WHERE v.VoteTypeId = 3), 0), 
+            999999
+        ) AS UpDownRatio,
+        COUNT(DISTINCT DATE_TRUNC('day', v.CreationDate)) AS VotingDays,
+        STDDEV(EXTRACT(HOUR FROM v.CreationDate)) AS HourlyVoteStdDev
+    FROM Votes v
+    WHERE v.UserId IS NOT NULL
+        AND v.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '1 year'
+    GROUP BY v.UserId
+)
+SELECT 
+    um.DisplayName,
+    UPPER(SUBSTRING(um.Location FROM 1 FOR 2)) || LOWER(SUBSTRING(um.Location FROM 3 FOR 10)) AS FormattedLocation,
+    um.Reputation,
+    um.YearsOnPlatform,
+    um.QuestionCount + um.AnswerCount AS TotalPosts,
+    ROUND(CAST(um.AvgPostScore AS NUMERIC), 2) AS AvgScore,
+    um.MedianPostScore,
+    COALESCE(um.GoldBadges, 'No Gold Badges') AS GoldBadges,
+    um.GoldBadgeCount,
+    COALESCE(ttp.TagName, 'No Top Tag') AS TopPerformingTag,
+    COALESCE(ttp.TagRank, 999999) AS RankInTag,
+    COALESCE(ttp.TotalTagScore, 0) AS TagScore,
+    SUBSTRING(COALESCE(ttp.BestPostTitle, 'No Posts') FROM 1 FOR 50) || 
+        CASE WHEN CHAR_LENGTH(COALESCE(ttp.BestPostTitle, '')) > 50 THEN '...' ELSE '' END AS BestPost,
+    COALESCE(ea.EditCount, 0) AS Edits,
+    COALESCE(ea.RollbackCount, 0) AS Rollbacks,
+    COALESCE(ea.EditorType, 'Non-Editor') AS EditorCategory,
+    COALESCE(vp.UpvoteCount, 0) - COALESCE(vp.DownvoteCount, 0) AS NetVotesGiven,
+    ROUND(CAST(COALESCE(vp.UpDownRatio, 0) AS NUMERIC), 2) AS VoteRatio,
+    COALESCE(vp.VotingDays, 0) AS ActiveVotingDays,
+    CASE 
+        WHEN COALESCE(vp.HourlyVoteStdDev, 0) < 2 THEN 'Consistent Timer'
+        WHEN COALESCE(vp.HourlyVoteStdDev, 0) < 5 THEN 'Regular Schedule'
+        ELSE 'Irregular Pattern'
+    END AS VotingTimePattern,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = um.Id AND c.Score > 5) AS HighScoreComments,
+    EXISTS (
+        SELECT 1 
+        FROM Posts p2 
+        WHERE p2.AcceptedAnswerId IN (
+            SELECT p3.Id 
+            FROM Posts p3 
+            WHERE p3.OwnerUserId = um.Id
+        )
+    ) AS HasAcceptedAnswer,
+    CASE 
+        WHEN um.Reputation > 10000 AND um.GoldBadgeCount > 5 THEN 'Elite'
+        WHEN um.Reputation > 5000 OR um.GoldBadgeCount > 2 THEN 'Expert'
+        WHEN um.Reputation > 1000 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END AS UserTier,
+    ROW_NUMBER() OVER (
+        ORDER BY 
+            um.Reputation * 0.3 + 
+            COALESCE(ttp.TotalTagScore, 0) * 0.3 + 
+            um.GoldBadgeCount * 1000 * 0.2 +
+            COALESCE(vp.UpvoteCount, 0) * 0.1 +
+            COALESCE(ea.EditCount, 0) * 0.1 DESC
+    ) AS OverallRank
+FROM UserMetrics um
+LEFT JOIN LATERAL (
+    SELECT * 
+    FROM TopTagPerformance ttp2 
+    WHERE ttp2.UserId = um.Id 
+        AND ttp2.TagRank = 1
+    ORDER BY ttp2.TotalTagScore DESC NULLS LAST
+    LIMIT 1
+) ttp ON TRUE
+LEFT JOIN EditActivity ea ON ea.UserId = um.Id
+LEFT JOIN VotePatterns vp ON vp.UserId = um.Id
+WHERE um.PostCount > 0
+    OR um.GoldBadgeCount > 0
+    OR EXISTS (SELECT 1 FROM Votes v2 WHERE v2.UserId = um.Id)
+ORDER BY OverallRank
+LIMIT 100;

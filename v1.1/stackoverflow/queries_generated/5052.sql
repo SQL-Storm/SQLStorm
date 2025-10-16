@@ -1,0 +1,113 @@
+-- {"query": "5052.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1030} 
+WITH 
+RecentQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 1
+            WHEN EXISTS (
+                SELECT 1 FROM PostHistory ph 
+                WHERE ph.PostId = p.Id 
+                  AND ph.PostHistoryTypeId = 10
+                  AND ph.Comment::int IN (101,102,103,104,105)
+            ) THEN 1
+            ELSE 0
+        END AS IsClosedOrFlagged,
+        array_length(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'), 1) AS TagCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > (SELECT max(CreationDate) - interval '30 days' FROM Posts)
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END),0) AS QuestionsAsked,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END),0) AS AnswersPosted,
+        COUNT(DISTINCT b.Id) AS BadgesEarned,
+        SUM(b.Class) AS BadgeScore,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC NULLS LAST) AS UserRepRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+AvgVoteScore AS (
+    SELECT
+        v.PostId,
+        AVG(CASE 
+            WHEN v.VoteTypeId = 2 THEN 1
+            WHEN v.VoteTypeId = 3 THEN -1
+            ELSE 0 END)::numeric AS AvgVote
+    FROM Votes v
+    GROUP BY v.PostId
+),
+QuestionComments AS (
+    SELECT 
+        c.PostId,
+        COUNT(*) AS CommentCount,
+        MAX(c.Score) AS MaxCommentScore
+    FROM Comments c
+    GROUP BY c.PostId
+),
+LinkedAsDuplicate AS (
+    SELECT
+        pl.PostId,
+        COUNT(*) AS DuplicateLinks
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+    GROUP BY pl.PostId
+)
+SELECT 
+    rq.QuestionId,
+    rq.Title,
+    rq.CreationDate,
+    ua.DisplayName AS OwnerName,
+    ua.Reputation,
+    ua.UserRepRank,
+    rq.Score,
+    rq.ViewCount,
+    COALESCE(av.AvgVote, 0) AS AvgVoteScore,
+    qc.CommentCount,
+    qc.MaxCommentScore,
+    rq.IsClosedOrFlagged,
+    rq.TagCount,
+    COALESCE(ld.DuplicateLinks, 0) AS DuplicateLinks,
+    -- Complicated predicate: new questions by users with >1 bronze badge, only if not closed and not duplicate
+    CASE 
+        WHEN rq.IsClosedOrFlagged = 0
+         AND COALESCE(ld.DuplicateLinks,0) = 0
+         AND ua.BadgesEarned > 0
+         AND ua.BadgeScore = ua.BadgesEarned*3
+        THEN 'HighPotential'
+        WHEN rq.IsClosedOrFlagged = 1 THEN 'Closed'
+        ELSE 'Other'
+    END AS QuestionCategory,
+    -- String expressions: tags concatenation, null logic
+    COALESCE(array_to_string(string_to_array(substring(rq.Tags, 2, length(rq.Tags)-2), '><'), ', '), '[no tags]') AS TagList,
+    -- Time Functions: how recently asked
+    EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - rq.CreationDate))/3600 AS HoursSinceAsked,
+    -- Window function: percentile rank by ViewCount for recent questions
+    PERCENT_RANK() OVER (ORDER BY rq.ViewCount DESC NULLS LAST) AS ViewCountPercentile
+FROM RecentQuestions rq
+JOIN UserActivity ua ON rq.OwnerUserId = ua.UserId
+LEFT JOIN AvgVoteScore av ON av.PostId = rq.QuestionId
+LEFT JOIN QuestionComments qc ON qc.PostId = rq.QuestionId
+LEFT JOIN LinkedAsDuplicate ld ON ld.PostId = rq.QuestionId
+WHERE rq.TagCount > 1
+  AND (ua.Reputation > 200 OR ua.UserRepRank <= 50)
+  AND (rq.Score > 0 OR av.AvgVote > 0)
+ORDER BY
+    QuestionCategory,
+    rq.ViewCount DESC,
+    rq.CreationDate DESC
+LIMIT 50;

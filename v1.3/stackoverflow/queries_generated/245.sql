@@ -1,0 +1,244 @@
+-- {"query": "245.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 4386} 
+WITH
+q AS (
+  SELECT p.Id, p.Title, p.Tags, p.CreationDate, p.AcceptedAnswerId, p.AnswerCount, p.ViewCount, p.Score, p.OwnerUserId
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+tags AS (
+  SELECT q.Id AS QuestionId,
+         unnest(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')) AS Tag
+  FROM q
+  WHERE q.Tags IS NOT NULL AND q.Tags <> ''
+),
+answers AS (
+  SELECT a.*,
+         row_number() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC NULLS LAST, a.CreationDate) AS rn,
+         rank() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC NULLS LAST) AS rnk_score
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+),
+answer_stats AS (
+  SELECT ParentId AS QuestionId,
+         count(*) AS AnswersTotal,
+         avg(score) AS AvgAnswerScore,
+         max(score) AS MaxAnswerScore,
+         count(distinct OwnerUserId) FILTER (WHERE OwnerUserId IS NOT NULL) AS DistinctAnswerers,
+         min(CreationDate) AS FirstAnswerDate,
+         max(CreationDate) AS LastAnswerDate
+  FROM answers
+  GROUP BY ParentId
+),
+top_answerer AS (
+  SELECT a.ParentId AS QuestionId, a.OwnerUserId, u.Reputation,
+         row_number() OVER (PARTITION BY a.ParentId ORDER BY COALESCE(u.Reputation,0) DESC NULLS LAST, a.Score DESC) AS rn
+  FROM Posts a
+  LEFT JOIN Users u ON a.OwnerUserId = u.Id
+  WHERE a.PostTypeId = 2
+),
+accepted_info AS (
+  SELECT q.Id AS QuestionId,
+         q.AcceptedAnswerId,
+         a.CreationDate AS AcceptedCreationDate,
+         EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) AS SecsToAccept
+  FROM q
+  LEFT JOIN Posts a ON q.AcceptedAnswerId = a.Id
+),
+postlink_dup AS (
+  SELECT pl.PostId AS QuestionId,
+         count(*) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicateCount,
+         bool_or(pl.LinkTypeId = 3) AS HasDuplicateLink
+  FROM PostLinks pl
+  GROUP BY pl.PostId
+),
+comments_agg AS (
+  SELECT c.PostId,
+         count(*) AS CommentCount,
+         count(*) FILTER (WHERE c.UserId IS NOT NULL) AS CommentWithUser,
+         max(c.CreationDate) AS LastCommentDate
+  FROM Comments c
+  GROUP BY c.PostId
+),
+history_agg AS (
+  SELECT ph.PostId,
+         bool_or(ph.PostHistoryTypeId IN (10,35,36)) AS EverClosed,
+         count(*) FILTER (WHERE ph.PostHistoryTypeId IN (10)) AS CloseEvents,
+         min(ph.CreationDate) AS FirstHistoryDate,
+         max(ph.CreationDate) AS LastHistoryDate
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+badges_per_user AS (
+  SELECT b.UserId,
+         count(*) AS BadgeCount,
+         count(*) FILTER (WHERE b.Class = 1) AS GoldCount,
+         count(*) FILTER (WHERE b.Class = 2) AS SilverCount,
+         count(*) FILTER (WHERE b.Class = 3) AS BronzeCount,
+         bool_or(b.TagBased = 1) AS HasTagBased
+  FROM Badges b
+  GROUP BY b.UserId
+),
+voters_on_answers AS (
+  SELECT p.ParentId AS QuestionId,
+         count(distinct v.UserId) FILTER (WHERE v.UserId IS NOT NULL) AS DistinctVotersAll,
+         count(*) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesAll,
+         count(*) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesAll
+  FROM Votes v
+  JOIN Posts p ON v.PostId = p.Id AND p.PostTypeId = 2
+  GROUP BY p.ParentId
+),
+recent_activity AS (
+  SELECT p.Id AS PostId,
+         greatest(
+           coalesce(p.LastActivityDate, '1970-01-01'::timestamp),
+           coalesce(ph.LastHistoryDate, '1970-01-01'::timestamp),
+           coalesce(ca.LastCommentDate, '1970-01-01'::timestamp)
+         ) AS EffectiveLastActivity
+  FROM Posts p
+  LEFT JOIN (
+    SELECT PostId, max(CreationDate) AS LastHistoryDate FROM PostHistory GROUP BY PostId
+  ) ph ON ph.PostId = p.Id
+  LEFT JOIN (
+    SELECT PostId, max(CreationDate) AS LastCommentDate FROM Comments GROUP BY PostId
+  ) ca ON ca.PostId = p.Id
+),
+complex_calc AS (
+  SELECT q.Id AS QuestionId,
+         q.Title,
+         q.Tags,
+         q.CreationDate,
+         q.ViewCount,
+         q.Score AS QuestionScore,
+         COALESCE(a.AnswersTotal,0) AS AnswersTotal,
+         COALESCE(a.AvgAnswerScore,0) AS AvgAnswerScore,
+         COALESCE(a.MaxAnswerScore,0) AS MaxAnswerScore,
+         COALESCE(pl.DuplicateCount,0) AS DuplicateCount,
+         COALESCE(c.CommentCount,0) AS CommentCount,
+         COALESCE(h.EverClosed,false) AS EverClosed,
+         COALESCE(ai.SecsToAccept, NULL) AS SecsToAccept,
+         COALESCE(v.DistinctVotersAll,0) AS DistinctVotersOnAnswers,
+         (length(coalesce(q.Title,'')) - length(replace(coalesce(q.Title,''),' ',''))) + COALESCE((SELECT count(*) FROM tags t WHERE t.QuestionId = q.Id),0) AS HeuristicComplexity,
+         regexp_replace(coalesce(q.Tags,''), '[<>]','', 'g') AS FlatTags,
+         substring(coalesce(q.Title,''),1,120) AS TitleSnippet,
+         CASE WHEN COALESCE(a.AnswersTotal,0) = 0 THEN NULL ELSE round((COALESCE(a.MaxAnswerScore,0)::numeric / NULLIF(a.AnswersTotal,0)),3) END AS MaxScorePerAnswer,
+         COALESCE(r.EffectiveLastActivity, q.CreationDate) AS EffectiveLastActivity
+  FROM q
+  LEFT JOIN answer_stats a ON a.QuestionId = q.Id
+  LEFT JOIN postlink_dup pl ON pl.QuestionId = q.Id
+  LEFT JOIN comments_agg c ON c.PostId = q.Id
+  LEFT JOIN history_agg h ON h.PostId = q.Id
+  LEFT JOIN accepted_info ai ON ai.QuestionId = q.Id
+  LEFT JOIN voters_on_answers v ON v.QuestionId = q.Id
+  LEFT JOIN recent_activity r ON r.PostId = q.Id
+),
+ranked_questions AS (
+  SELECT cc.*,
+         row_number() OVER (ORDER BY COALESCE(cc.AnswersTotal,0) DESC, COALESCE(cc.QuestionScore,0) DESC, cc.EffectiveLastActivity DESC) AS GlobalRank,
+         dense_rank() OVER (PARTITION BY (CASE WHEN cc.EverClosed THEN 1 ELSE 0 END) ORDER BY cc.ViewCount DESC) AS RankByClosedFlag
+  FROM complex_calc cc
+),
+enriched AS (
+  SELECT rq.*,
+         ta.OwnerUserId AS TopAnswererUserId,
+         u.DisplayName AS TopAnswererName,
+         u.Reputation AS TopAnswererReputation,
+         bu.BadgeCount AS TopAnswererBadgeCount,
+         bu.GoldCount AS TopAnswererGoldCount,
+         bu.HasTagBased AS TopAnswererHasTagBased,
+         -- correlated subquery: number of distinct upvoters on any answer to this question in first 7 days
+         (SELECT count(distinct v.UserId) FROM Votes v JOIN Posts pa ON v.PostId = pa.Id WHERE pa.ParentId = rq.QuestionId AND v.VoteTypeId = 2 AND v.CreationDate <= rq.CreationDate + interval '7 days') AS UpvotersFirstWeek,
+         -- correlated subquery: has any answerer ever got more rep than question owner?
+         (SELECT bool_or(coalesce(u2.Reputation,0) > coalesce(qo.Reputation,0))
+          FROM Posts pa JOIN Users u2 ON pa.OwnerUserId = u2.Id
+          LEFT JOIN Users qo ON qo.Id = (SELECT OwnerUserId FROM Posts WHERE Id = rq.QuestionId)
+          WHERE pa.ParentId = rq.QuestionId AND pa.OwnerUserId IS NOT NULL) AS AnyAnswererHigherRep,
+         -- correlated scalar: earliest actual editor in posthistory (if any)
+         (SELECT ph.CreationDate FROM PostHistory ph WHERE ph.PostId = rq.QuestionId AND ph.UserId IS NOT NULL ORDER BY ph.CreationDate ASC LIMIT 1) AS FirstEditorDate
+  FROM ranked_questions rq
+  LEFT JOIN top_answerer ta ON ta.QuestionId = rq.QuestionId AND ta.rn = 1
+  LEFT JOIN Users u ON u.Id = ta.OwnerUserId
+  LEFT JOIN badges_per_user bu ON bu.UserId = ta.OwnerUserId
+)
+-- final combined answer with set operator to create two result groups and then union them for benchmarking complexity
+SELECT
+  'A' AS SetTag,
+  e.QuestionId,
+  e.TitleSnippet,
+  e.FlatTags,
+  e.AnswersTotal,
+  e.AvgAnswerScore,
+  e.MaxAnswerScore,
+  e.DuplicateCount,
+  e.CommentCount,
+  e.EverClosed,
+  e.SecsToAccept,
+  e.DistinctVotersOnAnswers,
+  e.UpvotersFirstWeek,
+  e.AnyAnswererHigherRep,
+  e.TopAnswererUserId,
+  e.TopAnswererName,
+  e.TopAnswererReputation,
+  e.TopAnswererBadgeCount,
+  e.HeuristicComplexity,
+  e.EffectiveLastActivity,
+  e.GlobalRank,
+  e.RankByClosedFlag,
+  e.FirstEditorDate
+FROM enriched e
+WHERE e.AnswersTotal > 0
+UNION ALL
+SELECT
+  'B' AS SetTag,
+  e.QuestionId,
+  e.TitleSnippet,
+  e.FlatTags,
+  e.AnswersTotal,
+  e.AvgAnswerScore,
+  e.MaxAnswerScore,
+  e.DuplicateCount,
+  e.CommentCount,
+  e.EverClosed,
+  e.SecsToAccept,
+  e.DistinctVotersOnAnswers,
+  e.UpvotersFirstWeek,
+  e.AnyAnswererHigherRep,
+  e.TopAnswererUserId,
+  e.TopAnswererName,
+  e.TopAnswererReputation,
+  e.TopAnswererBadgeCount,
+  e.HeuristicComplexity,
+  e.EffectiveLastActivity,
+  e.GlobalRank,
+  e.RankByClosedFlag,
+  e.FirstEditorDate
+FROM enriched e
+WHERE e.AnswersTotal = 0
+EXCEPT
+SELECT
+  'C' AS SetTag,
+  e.QuestionId,
+  e.TitleSnippet,
+  e.FlatTags,
+  e.AnswersTotal,
+  e.AvgAnswerScore,
+  e.MaxAnswerScore,
+  e.DuplicateCount,
+  e.CommentCount,
+  e.EverClosed,
+  e.SecsToAccept,
+  e.DistinctVotersOnAnswers,
+  e.UpvotersFirstWeek,
+  e.AnyAnswererHigherRep,
+  e.TopAnswererUserId,
+  e.TopAnswererName,
+  e.TopAnswererReputation,
+  e.TopAnswererBadgeCount,
+  e.HeuristicComplexity,
+  e.EffectiveLastActivity,
+  e.GlobalRank,
+  e.RankByClosedFlag,
+  e.FirstEditorDate
+FROM enriched e
+WHERE e.GlobalRank > 1000
+ORDER BY SetTag, GlobalRank NULLS LAST, EffectiveLastActivity DESC
+LIMIT 500;

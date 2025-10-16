@@ -1,0 +1,96 @@
+-- {"query": "24076.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2520} 
+
+WITH
+  -- Basic question posts with owner info and vote counts
+  question_posts AS (
+    SELECT p.Id                         AS post_id,
+           p.Title                      AS title,
+           p.Tags                       AS tags,
+           p.CreationDate,              -- creation
+           p.LastActivityDate,          -- last activity
+           p.AnswerCount,
+           p.ViewCount,
+           COALESCE(u.Reputation,0)    AS owner_rep,
+           COALESCE(u.DisplayName,'Community') AS owner_name,
+           COALESCE(v.up_votes,0)-COALESCE(v.down_votes,0) AS net_score
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+      SELECT PostId,
+             SUM(CASE WHEN VoteTypeId=2 THEN 1 ELSE 0 END) AS up_votes,
+             SUM(CASE WHEN VoteTypeId=3 THEN 1 ELSE 0 END) AS down_votes
+      FROM Votes
+      WHERE VoteTypeId IN (2,3)
+      GROUP BY PostId
+    ) v ON v.PostId = p.Id
+    WHERE p.PostTypeId = 1
+  ),
+
+  -- Latest edit date and close reason (if any)
+  post_hist AS (
+    SELECT ph.PostId,
+           MAX(CASE WHEN ph.PostHistoryTypeId=5 THEN ph.CreationDate END)  AS last_edit_date,
+           MAX(CASE WHEN ph.PostHistoryTypeId=10 THEN ph.Comment END)    AS close_reason_id
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+  ),
+
+  -- Split tags into rows
+  tag_arr AS (
+    SELECT pq.post_id,
+           unnest(string_to_array(regexp_replace(pq.Tags,'^[<>]|[<>]$','', 'g'),'"><')) AS tag
+    FROM question_posts pq
+  ),
+
+  -- Frequency of each tag
+  tag_count AS (
+    SELECT ta.post_id,
+           ta.tag,
+           COUNT(*) OVER(PARTITION BY ta.tag) AS tag_freq
+    FROM tag_arr ta
+  ),
+
+  -- Ranked posts per tag for later filtering
+  ranked AS (
+    SELECT qp.*,
+           ph.last_edit_date,
+           ph.close_reason_id,
+           ROW_NUMBER() OVER(PARTITION BY qp.post_id ORDER BY qp.net_score DESC, qp.last_activity_date DESC) AS rn
+    FROM question_posts qp
+    LEFT JOIN post_hist ph ON ph.PostId = qp.post_id
+  ),
+
+  -- Final enriched rows (one per tag)
+  final AS (
+    SELECT r.post_id,
+           r.title,
+           r.net_score,
+           r.AnswerCount,
+           r.ViewCount,
+           r.owner_rep,
+           r.owner_name,
+           r.last_edit_date,
+           cr.Name AS close_reason_name,
+           tc.tag,
+           tc.tag_freq
+    FROM ranked r
+    JOIN tag_count tc ON tc.post_id = r.post_id
+    LEFT JOIN CloseReasonTypes cr ON cr.Id = r.close_reason_id
+    WHERE r.rn = 1
+  )
+
+SELECT f.post_id,
+       f.title,
+       f.net_score,
+       f.AnswerCount,
+       f.ViewCount,
+       f.owner_rep,
+       f.owner_name,
+       f.last_edit_date,
+       f.close_reason_name,
+       string_agg(DISTINCT f.tag || '(' || f.tag_freq || ')', ', ') AS tags_info
+FROM final f
+GROUP BY f.post_id, f.title, f.net_score, f.AnswerCount, f.ViewCount, f.owner_rep, f.owner_name, f.last_edit_date, f.close_reason_name
+HAVING f.net_score > 10
+ORDER BY f.net_score DESC, f.last_edit_date DESC
+LIMIT 200;

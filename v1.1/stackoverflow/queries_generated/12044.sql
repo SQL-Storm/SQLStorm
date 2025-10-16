@@ -1,0 +1,92 @@
+-- {"query": "12044.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 688} 
+
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.CreationDate) AS UserPostRank
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2)
+),
+TopPosts AS (
+    SELECT 
+        Id, 
+        PostTypeId, 
+        Score, 
+        ViewCount, 
+        CreationDate, 
+        OwnerUserId, 
+        OwnerDisplayName
+    FROM 
+        RankedPosts
+    WHERE 
+        UserPostRank <= 3
+),
+AggregatedData AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.OwnerUserId,
+        COUNT(C.Id) AS CommentCount,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        STRING_AGG(T.TagName, ', ') WITHIN GROUP (ORDER BY T.Count DESC) AS TagsList
+    FROM 
+        TopPosts P
+    LEFT JOIN 
+        Comments C ON P.Id = C.PostId
+    LEFT JOIN 
+        Votes V ON P.Id = V.PostId
+    JOIN 
+        Posts_Tags PT ON P.Id = PT.PostId
+    JOIN 
+        Tags T ON PT.TagId = T.Id
+    GROUP BY 
+        P.Id, P.PostTypeId, P.Score, P.ViewCount, P.CreationDate, P.OwnerUserId
+),
+PostHistorySummary AS (
+    SELECT 
+        PostId,
+        COUNT(CASE WHEN PostHistoryTypeId IN (1, 2, 3) THEN 1 ELSE NULL END) AS InitialRevisions,
+        COUNT(CASE WHEN PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE NULL END) AS Edits,
+        COUNT(CASE WHEN PostHistoryTypeId IN (7, 8, 9) THEN 1 ELSE NULL END) AS Rollbacks
+    FROM 
+        PostHistory
+    GROUP BY 
+        PostId
+)
+SELECT 
+    AD.Id,
+    AD.PostTypeId,
+    AD.Score,
+    AD.ViewCount,
+    AD.CreationDate,
+    AD.OwnerUserId,
+    AD.OwnerDisplayName,
+    AD.CommentCount,
+    AD.UpVotes,
+    AD.DownVotes,
+    AD.TagsList,
+    PHS.InitialRevisions,
+    PHS.Edits,
+    PHS.Rollbacks
+FROM 
+    AggregatedData AD
+LEFT JOIN 
+    PostHistorySummary PHS ON AD.Id = PHS.PostId
+ORDER BY 
+    AD.Score DESC, 
+    AD.ViewCount DESC, 
+    AD.CreationDate;

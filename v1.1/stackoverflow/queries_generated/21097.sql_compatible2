@@ -1,0 +1,187 @@
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score) AS AvgPostScore,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId 
+        AND p.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '1 year'
+        AND p.Score IS NOT NULL
+    WHERE u.Reputation > 1000
+        AND u.LastAccessDate > CAST('2024-10-01' AS date) - INTERVAL '6 months'
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.DisplayName
+    HAVING COUNT(DISTINCT p.Id) > 5
+),
+RecentPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Title,
+        p.Tags,
+        COALESCE(p.ClosedDate, p.CommunityOwnedDate) AS LastSignificantEvent,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community'
+            ELSE 'Active'
+        END AS PostStatus,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+        FIRST_VALUE(p.Title) OVER (
+            PARTITION BY SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2) 
+            ORDER BY p.ViewCount DESC 
+            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+        ) AS TopTagTitle
+    FROM Posts p
+    WHERE p.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '3 months'
+        AND (p.PostTypeId = 1 OR p.PostTypeId = 2)
+        AND p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId IN (1, 2))
+),
+EngagementMetrics AS (
+    SELECT 
+        rp.PostId,
+        rp.OwnerUserId,
+        rp.Score,
+        rp.ViewCount,
+        rp.AnswerCount,
+        rp.CommentCount,
+        COUNT(DISTINCT v.UserId) AS UniqueVoters,
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS Upvotes,
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS Downvotes,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        AVG(c.Score) AS AvgCommentScore,
+        (rp.ViewCount * 0.1 + rp.AnswerCount * 5 + rp.CommentCount * 1) AS EngagementScore
+    FROM RecentPosts rp
+    LEFT JOIN Votes v ON rp.PostId = v.PostId 
+        AND v.CreationDate > rp.CreationDate - INTERVAL '1 week'
+    LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    LEFT JOIN Comments c ON rp.PostId = c.PostId 
+        AND c.CreationDate > rp.CreationDate
+    WHERE rp.PostTypeId = 1
+    GROUP BY rp.PostId, rp.OwnerUserId, rp.Score, rp.ViewCount, 
+             rp.AnswerCount, rp.CommentCount
+),
+TagAnalysis AS (
+    SELECT 
+        t.Id AS TagId,
+        t.TagName,
+        t.Count AS TagUsage,
+        COUNT(DISTINCT rp.PostId) AS RecentQuestions,
+        AVG(em.EngagementScore) AS AvgEngagement,
+        STRING_AGG(DISTINCT SUBSTRING(rp.Tags FROM 2 FOR 50), ' | ') AS SampleTags,
+        CASE 
+            WHEN t.Count > 10000 THEN 'Popular'
+            WHEN t.Count > 1000 THEN 'Growing'
+            ELSE 'Niche'
+        END AS TagCategory
+    FROM Tags t
+    LEFT JOIN RecentPosts rp ON POSITION(t.TagName IN 
+        '(' || SUBSTRING(rp.Tags FROM 2 FOR CHAR_LENGTH(rp.Tags) - 2) || ')') > 0
+    LEFT JOIN EngagementMetrics em ON rp.PostId = em.PostId
+    WHERE t.Count > 50
+    GROUP BY t.Id, t.TagName, t.Count
+)
+SELECT 
+    au.DisplayName AS UserName,
+    au.Reputation,
+    au.RepRank,
+    au.QuestionCount,
+    au.AnswerCount,
+    au.AvgPostScore,
+    COUNT(DISTINCT em.PostId) AS HighEngagementPosts,
+    AVG(em.EngagementScore) AS AvgUserEngagement,
+    SUM(CASE 
+        WHEN em.EngagementScore > (SELECT AVG(EngagementScore) FROM EngagementMetrics)
+        THEN 1 ELSE 0 
+    END) AS AboveAvgPosts,
+    ta.TagName AS PrimaryTag,
+    ta.TagCategory,
+    ta.AvgEngagement AS TagEngagement,
+    CASE 
+        WHEN au.QuestionCount > au.AnswerCount * 2 THEN 'Question Focused'
+        WHEN au.AnswerCount > au.QuestionCount * 1.5 THEN 'Answer Focused'
+        ELSE 'Balanced'
+    END AS UserFocus,
+    COALESCE(
+        (SELECT STRING_AGG(DISTINCT b2.Name, ', ') 
+         FROM Badges b2 
+         WHERE b2.UserId = au.UserId 
+           AND b2.Date > CAST('2024-10-01' AS date) - INTERVAL '6 months'
+           AND b2.Class = 1),
+        'No Recent Gold Badges'
+    ) AS RecentGoldBadges,
+    COALESCE(au.PostCount, 0) * 
+    COALESCE(au.AvgPostScore, 0) + 
+    COALESCE(em.UniqueVoters, 0) AS CompositeScore,
+    UPPER(SUBSTRING(au.DisplayName FROM 1 FOR 1)) || 
+    LOWER(SUBSTRING(au.DisplayName FROM 2)) AS FormattedName,
+    (SELECT AVG(ph.PostId) 
+     FROM PostHistory ph 
+     WHERE ph.PostId = em.PostId 
+       AND ph.PostHistoryTypeId IN (10, 11)
+       AND ph.CreationDate > rp.CreationDate - INTERVAL '1 month'
+    ) AS AvgCloseEventPostId
+FROM ActiveUsers au
+LEFT JOIN RecentPosts rp ON au.UserId = rp.OwnerUserId
+LEFT JOIN EngagementMetrics em ON rp.PostId = em.PostId
+LEFT JOIN TagAnalysis ta ON (POSITION('sql' IN LOWER(COALESCE(rp.Tags, ''))) > 0 
+    OR ta.TagName = 'sql')
+LEFT JOIN Badges b ON au.UserId = b.UserId AND b.Class = 1
+WHERE au.RepRank <= 100
+    AND (em.EngagementScore > 50 OR em.EngagementScore IS NULL)
+    AND (rp.LastSignificantEvent IS NULL 
+         OR rp.LastSignificantEvent > CAST('2024-10-01' AS date) - INTERVAL '1 month')
+GROUP BY 
+    au.UserId, au.DisplayName, au.Reputation, au.RepRank, 
+    au.QuestionCount, au.AnswerCount, au.AvgPostScore,
+    au.PostCount, em.UniqueVoters,
+    ta.TagName, ta.TagCategory, ta.AvgEngagement,
+    rp.CreationDate, em.PostId
+HAVING COUNT(DISTINCT em.PostId) > 0
+    OR au.QuestionCount > 10
+UNION ALL
+SELECT 
+    'Community Average' AS UserName,
+    AVG(au.Reputation) AS Reputation,
+    NULL AS RepRank,
+    AVG(au.QuestionCount) AS QuestionCount,
+    AVG(au.AnswerCount) AS AnswerCount,
+    AVG(au.AvgPostScore) AS AvgPostScore,
+    AVG(per_user.high_eng_count) AS HighEngagementPosts,
+    AVG(per_user.avg_engagement_per_user) AS AvgUserEngagement,
+    AVG(per_user.above_avg_count) AS AboveAvgPosts,
+    'All Tags' AS PrimaryTag,
+    'Community' AS TagCategory,
+    AVG(ta.AvgEngagement) AS TagEngagement,
+    'Community' AS UserFocus,
+    NULL AS RecentGoldBadges,
+    AVG(COALESCE(au.PostCount, 0) * COALESCE(au.AvgPostScore, 0) + COALESCE(em.UniqueVoters, 0)) AS CompositeScore,
+    'COMMUNITY' AS FormattedName,
+    NULL AS AvgCloseEventPostId
+FROM ActiveUsers au
+LEFT JOIN RecentPosts rp ON au.UserId = rp.OwnerUserId
+LEFT JOIN EngagementMetrics em ON rp.PostId = em.PostId
+LEFT JOIN TagAnalysis ta ON (POSITION('sql' IN LOWER(COALESCE(rp.Tags, ''))) > 0 
+    OR ta.TagName = 'sql')
+LEFT JOIN (
+    SELECT rp.OwnerUserId,
+           COUNT(DISTINCT em2.PostId) AS high_eng_count,
+           AVG(em2.EngagementScore) AS avg_engagement_per_user,
+           SUM(CASE WHEN em2.EngagementScore > (SELECT AVG(EngagementScore) FROM EngagementMetrics) THEN 1 ELSE 0 END) AS above_avg_count
+    FROM RecentPosts rp
+    LEFT JOIN EngagementMetrics em2 ON rp.PostId = em2.PostId
+    GROUP BY rp.OwnerUserId
+) per_user ON per_user.OwnerUserId = au.UserId
+GROUP BY () 
+ORDER BY CompositeScore DESC NULLS LAST, RepRank
+LIMIT 50;

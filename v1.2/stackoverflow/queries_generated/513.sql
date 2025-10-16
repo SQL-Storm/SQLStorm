@@ -1,0 +1,220 @@
+-- {"query": "513.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2005} 
+with RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsRequired = 1
+
+    union all
+
+    select 
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.ExcerptPostId,
+        child.WikiPostId,
+        child.IsModeratorOnly,
+        child.IsRequired,
+        p.Level + 1,
+        p.Path || child.Id
+    from Tags child
+    join RecursiveTagHierarchy p on child.IsRequired = 1 and child.Id <> all(p.Path)
+    where child.Count < p.Count
+),
+UserActivityRanked as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) as TotalPosts,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as Questions,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as Answers,
+        max(p.Score) as MaxPostScore,
+        avg(p.Score) as AvgPostScore,
+        count(distinct b.Id) as BadgeCount,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        row_number() over (order by u.Reputation desc, count(distinct p.Id) desc) as RankByReputation
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+PostLinkAggregates as (
+    select
+        pl.PostId,
+        count(distinct pl.RelatedPostId) filter (where lt.Name = 'Linked') as LinkedCount,
+        count(distinct pl.RelatedPostId) filter (where lt.Name = 'Duplicate') as DuplicateCount
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+),
+QuestionDetails as (
+    select 
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        ul.RankByReputation,
+        pla.LinkedCount,
+        pla.DuplicateCount,
+        -- Extract tags as array
+        string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><') as TagArray,
+        -- Calculate tag popularity sum
+        (
+            select coalesce(sum(t.Count), 0)
+            from Tags t
+            where t.TagName = any(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><'))
+        ) as TagPopularitySum
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    left join UserActivityRanked ul on ul.UserId = p.OwnerUserId
+    left join PostLinkAggregates pla on pla.PostId = p.Id
+    where p.PostTypeId = 1
+),
+AnswerDetails as (
+    select 
+        a.Id,
+        a.ParentId,
+        a.Score,
+        a.CreationDate,
+        a.OwnerUserId,
+        u.DisplayName as OwnerName,
+        ul.RankByReputation,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a
+    left join Users u on u.Id = a.OwnerUserId
+    left join UserActivityRanked ul on ul.UserId = a.OwnerUserId
+    where a.PostTypeId = 2
+),
+AnswerWithAcceptedFlag as (
+    select 
+        a.*,
+        case when q.AcceptedAnswerId = a.Id then 1 else 0 end as IsAccepted
+    from AnswerDetails a
+    join Posts q on q.Id = a.ParentId and q.PostTypeId = 1
+),
+TopAnswerers as (
+    select 
+        a.OwnerUserId,
+        count(*) as AnswerCount,
+        avg(a.Score) as AvgAnswerScore,
+        sum(a.IsAccepted) as AcceptedCount,
+        max(a.Score) as MaxAnswerScore
+    from AnswerWithAcceptedFlag a
+    group by a.OwnerUserId
+),
+PostHistorySummary as (
+    select 
+        ph.PostId,
+        count(*) as TotalEdits,
+        count(distinct ph.UserId) as DistinctEditors,
+        max(ph.CreationDate) as LastEditDate,
+        bool_or(ph.PostHistoryTypeId in (10, 12)) as IsClosedOrDeleted,
+        sum(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as CloseEvents,
+        sum(case when ph.PostHistoryTypeId = 11 then 1 else 0 end) as ReopenEvents
+    from PostHistory ph
+    group by ph.PostId
+),
+UserCommentStats as (
+    select 
+        c.UserId,
+        count(*) as CommentCount,
+        avg(length(c.Text)) as AvgCommentLength,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    where c.UserId is not null
+    group by c.UserId
+),
+CombinedUserStats as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        coalesce(ua.TotalPosts, 0) as TotalPosts,
+        coalesce(ua.Questions, 0) as Questions,
+        coalesce(ua.Answers, 0) as Answers,
+        coalesce(ua.BadgeCount, 0) as BadgeCount,
+        coalesce(ua.GoldBadges, 0) as GoldBadges,
+        coalesce(ua.SilverBadges, 0) as SilverBadges,
+        coalesce(ua.BronzeBadges, 0) as BronzeBadges,
+        coalesce(tc.CommentCount, 0) as CommentCount,
+        coalesce(tc.AvgCommentLength, 0) as AvgCommentLength,
+        coalesce(tc.LastCommentDate, '1900-01-01'::timestamp) as LastCommentDate,
+        coalesce(ta.AnswerCount, 0) as AnswerCount,
+        coalesce(ta.AvgAnswerScore, 0) as AvgAnswerScore,
+        coalesce(ta.AcceptedCount, 0) as AcceptedCount,
+        coalesce(ta.MaxAnswerScore, 0) as MaxAnswerScore
+    from Users u
+    left join UserActivityRanked ua on ua.UserId = u.Id
+    left join UserCommentStats tc on tc.UserId = u.Id
+    left join TopAnswerers ta on ta.OwnerUserId = u.Id
+)
+select 
+    q.Id as QuestionId,
+    q.Title,
+    q.OwnerUserId,
+    q.OwnerName,
+    q.Score as QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    q.FavoriteCount,
+    q.ClosedDate,
+    q.RankByReputation as OwnerReputationRank,
+    q.TagPopularitySum,
+    q.LinkedCount,
+    q.DuplicateCount,
+    phs.TotalEdits,
+    phs.DistinctEditors,
+    phs.IsClosedOrDeleted,
+    phs.CloseEvents,
+    phs.ReopenEvents,
+    a.Id as TopAnswerId,
+    a.OwnerUserId as TopAnswerOwnerId,
+    a.OwnerName as TopAnswerOwnerName,
+    a.Score as TopAnswerScore,
+    a.IsAccepted,
+    ucs.DisplayName as TopAnswerOwnerDisplayName,
+    ucs.Reputation as TopAnswerOwnerReputation,
+    ucs.BadgeCount as TopAnswerOwnerBadgeCount,
+    ucs.GoldBadges as TopAnswerOwnerGoldBadges,
+    ucs.SilverBadges as TopAnswerOwnerSilverBadges,
+    ucs.BronzeBadges as TopAnswerOwnerBronzeBadges,
+    ucs.CommentCount as TopAnswerOwnerCommentCount,
+    ucs.AvgCommentLength as TopAnswerOwnerAvgCommentLength,
+    ucs.AnswerCount as TopAnswerOwnerAnswerCount,
+    ucs.AvgAnswerScore as TopAnswerOwnerAvgAnswerScore,
+    ucs.AcceptedCount as TopAnswerOwnerAcceptedCount,
+    ucs.MaxAnswerScore as TopAnswerOwnerMaxAnswerScore
+from QuestionDetails q
+left join LATERAL (
+    select a.*
+    from AnswerWithAcceptedFlag a
+    where a.ParentId = q.Id
+    order by a.IsAccepted desc, a.Score desc, a.CreationDate asc
+    limit 1
+) a on true
+left join PostHistorySummary phs on phs.PostId = q.Id
+left join CombinedUserStats ucs on ucs.Id = a.OwnerUserId
+where q.Score > (select avg(Score) from Posts where PostTypeId = 1)
+  and (q.ClosedDate is null or q.ClosedDate > now() - interval '1 year')
+order by q.Score desc, q.ViewCount desc
+limit 100;

@@ -1,0 +1,139 @@
+-- {"query": "4099.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1364} 
+with RecursiveTagCount as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        p.Id as PostId,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.CreationDate,
+        row_number() over (partition by t.Id order by p.Score desc, p.ViewCount desc) as rn
+    from Tags t
+    join Posts p on p.PostTypeId = 1 and p.Tags like '%' || t.TagName || '%'
+    where t.IsRequired = 0 and t.IsModeratorOnly = 0
+),
+TopPostsPerTag as (
+    select TagId, TagName, PostId, Score, ViewCount, OwnerUserId, CreationDate
+    from RecursiveTagCount
+    where rn <= 10
+),
+UserScores as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        coalesce(sum(p.Score), 0) as TotalPostScore,
+        count(p.Id) as PostCount,
+        count(distinct p.PostTypeId) as DistinctPostTypes,
+        max(p.CreationDate) as LastPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+),
+BadgesAgg as (
+    select
+        UserId,
+        sum(case when Class=1 then 1 else 0 end) as GoldBadges,
+        sum(case when Class=2 then 1 else 0 end) as SilverBadges,
+        sum(case when Class=3 then 1 else 0 end) as BronzeBadges,
+        count(*) as TotalBadges
+    from Badges
+    group by UserId
+),
+PostHistoryWithCloseReasons as (
+    select
+        ph.Id,
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        crt.Name as CloseReasonName,
+        ph.CreationDate,
+        ph.UserId,
+        ph.Comment,
+        ph.Text
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = try_cast(ph.Comment as smallint)
+    where ph.PostHistoryTypeId in (10,11,12,13)
+),
+UserLastActivity as (
+    select
+        u.Id as UserId,
+        max(coalesce(p.LastActivityDate, ph.CreationDate, u.LastAccessDate)) as LastActivity
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id
+    group by u.Id
+),
+VotesSummary as (
+    select
+        v.PostId,
+        sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+        sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes,
+        sum(case when vt.Name = 'Favorite' then 1 else 0 end) as FavoriteVotes,
+        sum(case when vt.Name = 'Close' then 1 else 0 end) as CloseVotes
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.PostId
+),
+TopEngagedQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        coalesce(vs.UpVotes,0) as UpVotes,
+        coalesce(vs.DownVotes,0) as DownVotes,
+        coalesce(vs.FavoriteVotes,0) as FavoriteVotes,
+        coalesce(vs.CloseVotes,0) as CloseVotes,
+        row_number() over (order by p.ViewCount desc, p.Score desc) as rn
+    from Posts p
+    left join VotesSummary vs on vs.PostId = p.Id
+    where p.PostTypeId = 1 and p.ClosedDate is null
+)
+select
+    u.DisplayName as User,
+    u.Reputation,
+    us.TotalPostScore,
+    us.PostCount,
+    us.DistinctPostTypes,
+    coalesce(b.GoldBadges, 0) as GoldBadges,
+    coalesce(b.SilverBadges, 0) as SilverBadges,
+    coalesce(b.BronzeBadges, 0) as BronzeBadges,
+    ua.LastActivity,
+    q.Title as TopQuestionTitle,
+    q.ViewCount as TopQuestionViews,
+    q.Score as TopQuestionScore,
+    q.AnswerCount as TopQuestionAnswers,
+    phcr.CloseReasonName,
+    case
+        when us.TotalPostScore > 1000 and b.GoldBadges >= 5 then 'Elite User'
+        when us.TotalPostScore > 500 then 'Established User'
+        else 'Casual User'
+    end as UserClassification,
+    string_agg(distinct t.TagName, ', ' order by t.TagName) as TagsForTopPosts,
+    (select count(*) from Comments c where c.UserId = u.Id and c.CreationDate > cast('2024-10-01' as date) - interval '30 day') as RecentCommentCount
+from Users u
+left join UserScores us on us.UserId = u.Id
+left join BadgesAgg b on b.UserId = u.Id
+left join UserLastActivity ua on ua.UserId = u.Id
+left join (
+    select OwnerUserId, Title, ViewCount, Score, AnswerCount
+    from TopEngagedQuestions
+    where rn = 1
+) q on q.OwnerUserId = u.Id
+left join (
+    select distinct ph.PostId, ph.CloseReasonName
+    from PostHistoryWithCloseReasons ph
+    where ph.PostHistoryTypeId = 10
+) phcr on phcr.PostId = q.Id
+left join (
+    select distinct tp.OwnerUserId, t.TagName
+    from TopPostsPerTag tp
+    join Posts p on p.Id = tp.PostId
+    join Tags t on t.Id = tp.TagId
+) t on t.OwnerUserId = u.Id
+where u.Reputation > 500
+group by u.Id, u.DisplayName, u.Reputation, us.TotalPostScore, us.PostCount, us.DistinctPostTypes, b.GoldBadges, b.SilverBadges, b.BronzeBadges, ua.LastActivity, q.Title, q.ViewCount, q.Score, q.AnswerCount, phcr.CloseReasonName, us.TotalPostScore, b.GoldBadges
+order by us.TotalPostScore desc, ua.LastActivity desc;

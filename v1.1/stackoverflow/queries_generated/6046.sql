@@ -1,0 +1,114 @@
+-- {"query": "6046.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 846} 
+WITH recent_activity AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.CreationDate,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.CommentCount,
+    COALESCE(pa.TotalAnswers, 0) AS AnswerCount,
+    uv.RepBucket
+  FROM Posts p
+  LEFT JOIN (
+    SELECT ParentId AS PostId, COUNT(*) AS TotalAnswers
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY ParentId
+  ) pa ON pa.PostId = p.Id
+  LEFT JOIN (
+    SELECT
+      UserId,
+      CASE
+        WHEN Reputation < 1000 THEN '0-999'
+        WHEN Reputation < 10000 THEN '1000-9999'
+        WHEN Reputation < 100000 THEN '10000-99999'
+        ELSE '100000+'
+      END AS RepBucket
+    FROM Users
+  ) uv ON uv.UserId = p.OwnerUserId
+  WHERE p.PostTypeId IN (1,2)
+    AND p.LastActivityDate >= CURRENT_DATE - INTERVAL '180 days'
+),
+elite_tags AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0 AND t.Count > 10
+),
+complex_filter AS (
+  SELECT
+    rp.PostId,
+    rp.Title,
+    rp.Tags,
+    rp.Score,
+    rp.ViewCount,
+    rp.OwnerUserId,
+    rp.LastActivityDate,
+    rp.CommentCount
+  FROM recent_activity rp
+  LEFT JOIN PostLinks pl ON pl.PostId = rp.PostId AND pl.LinkTypeId = 1
+  LEFT JOIN Posts related ON related.Id = pl.RelatedPostId
+  WHERE
+    (rp.Score > 5 AND rp.ViewCount > 50)
+    OR (rp.OwnerUserId IS NULL)
+    OR (related.Id IS NOT NULL)
+),
+windowed AS (
+  SELECT
+    cf.*,
+    LAG(cf.Score) OVER (PARTITION BY cf.OwnerUserId ORDER BY cf.LastActivityDate) AS PrevScore,
+    LEAD(cf.Score) OVER (PARTITION BY cf.OwnerUserId ORDER BY cf.LastActivityDate) AS NextScore
+  FROM complex_filter cf
+),
+final AS (
+  SELECT
+    w.*,
+    CASE
+      WHEN w.PrevScore IS NULL THEN 0
+      ELSE w.Score - w.PrevScore
+    END AS ScoreDelta,
+    CASE
+      WHEN w.NextScore IS NULL THEN 0
+      ELSE w.NextScore - w.Score
+    END AS NextDelta
+  FROM windowed w
+)
+SELECT
+  f.PostId,
+  f.Title,
+  string_to_array(f.Tags, ',') AS TagArray,
+  f.Score,
+  f.ViewCount,
+  f.CommentCount,
+  f.LastActivityDate,
+  f.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation,
+  f.ScoreDelta,
+  f.NextDelta,
+  CASE
+    WHEN f.OwnerUserId IS NOT NULL THEN
+      (SELECT COUNT(*) FROM Votes v WHERE v.PostId = f.PostId AND v.VoteTypeId = 2)
+    ELSE 0
+  END AS UpVotesOnPost,
+  CASE
+    WHEN f.OwnerUserId IS NOT NULL THEN
+      (SELECT COUNT(*) FROM Votes v WHERE v.PostId = f.PostId AND v.VoteTypeId = 3)
+    ELSE 0
+  END AS DownVotesOnPost,
+  CASE
+    WHEN f.OwnerUserId IS NOT NULL THEN
+      (SELECT MAX(v.BountyAmount) FROM Votes v WHERE v.PostId = f.PostId AND v.VoteTypeId = 8)
+    ELSE NULL
+  END AS MaxBounty
+FROM final f
+LEFT JOIN Users u ON u.Id = f.OwnerUserId
+ORDER BY f.LastActivityDate DESC, f.Score DESC
+LIMIT 200;

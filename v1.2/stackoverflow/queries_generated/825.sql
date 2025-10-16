@@ -1,0 +1,170 @@
+-- {"query": "825.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1437} 
+with RankedPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        count(distinct c.Id) as CommentCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        row_number() over(partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as RankByType,
+        dense_rank() over(order by p.Score desc, p.ViewCount desc) as DenseRankOverall,
+        case when p.ClosedDate is null then 0 else 1 end as IsClosed,
+        array_agg(distinct pt.Name) filter (where pt.Name is not null) over (partition by p.Id) as PostHistoryTypes
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    left join Comments c on c.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    left join PostHistory ph on ph.PostId = p.Id
+    left join PostHistoryTypes pt on pt.Id = ph.PostHistoryTypeId
+    group by p.Id, u.DisplayName
+),
+AcceptedAnswerScores as (
+    select
+        p.Id as QuestionId,
+        p.AcceptedAnswerId,
+        a.Score as AcceptedAnswerScore
+    from Posts p
+    left join Posts a on a.Id = p.AcceptedAnswerId
+    where p.PostTypeId = 1
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(*) as TotalBadges
+    from Badges b
+    group by b.UserId
+),
+TopTagsByCount as (
+    select
+        t.TagName,
+        t.Count,
+        p.Id as ExcerptPostId,
+        p.Title as ExcerptTitle
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId
+    where t.Count > 1000
+),
+DuplicateLinks as (
+    select
+        pl.PostId as DuplicatePostId,
+        pl.RelatedPostId as OriginalPostId,
+        pl.CreationDate,
+        pt.Name as LinkTypeName
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    join PostTypes pt on pt.Id = (select PostTypeId from Posts where Id = pl.PostId)
+    where pl.LinkTypeId = 3
+),
+UserActivityWindow as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) as PostsCount,
+        count(distinct c.Id) as CommentsCount,
+        sum(v.VoteTypeId = 2::int)::int as UpVotesReceived,
+        sum(v.VoteTypeId = 3::int)::int as DownVotesReceived,
+        row_number() over(order by u.Reputation desc) as UserRankByReputation,
+        lag(u.LastAccessDate) over(partition by u.Id order by u.LastAccessDate) as PrevAccessDate,
+        lead(u.CreationDate) over(partition by u.Id order by u.CreationDate) as NextCreationDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.LastAccessDate, u.CreationDate
+)
+select
+    rp.Id as PostId,
+    rp.Title,
+    rp.PostTypeId,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.OwnerUserId,
+    rp.OwnerName,
+    rp.CommentCount,
+    rp.UpVotes,
+    rp.DownVotes,
+    rp.RankByType,
+    rp.DenseRankOverall,
+    rp.IsClosed,
+    ac.AcceptedAnswerScore,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.TotalBadges,
+    tt.TagName as PopularTag,
+    tt.Count as TagUsageCount,
+    tt.ExcerptTitle as TagExcerptTitle,
+    dl.OriginalPostId as DuplicateOfPostId,
+    dl.CreationDate as DuplicateLinkCreated,
+    dl.LinkTypeName as DuplicateLinkType,
+    ua.UserRankByReputation,
+    ua.PostsCount,
+    ua.CommentsCount,
+    ua.UpVotesReceived,
+    ua.DownVotesReceived,
+    ua.PrevAccessDate,
+    ua.NextCreationDate,
+    case
+        when rp.ViewCount > 10000 and rp.Score > 50 then 'HighImpact'
+        when rp.IsClosed = 1 then 'Closed'
+        else 'Normal'
+    end as PostImpactCategory,
+    substring(rp.Title from '(\w{4,})') as FirstLongWordInTitle
+from RankedPosts rp
+left join AcceptedAnswerScores ac on ac.QuestionId = rp.Id
+left join UserBadgeCounts ub on ub.UserId = rp.OwnerUserId
+left join TopTagsByCount tt on tt.TagName = any(string_to_array(rp.Tags, '>')::text[])
+left join DuplicateLinks dl on dl.DuplicatePostId = rp.Id
+left join UserActivityWindow ua on ua.Id = rp.OwnerUserId
+where rp.PostTypeId in (1,2)
+  and (
+        rp.Score > (select avg(Score) from Posts where PostTypeId = rp.PostTypeId)
+        or rp.ViewCount > 5000
+      )
+union
+select
+    p.Id,
+    p.Title,
+    p.PostTypeId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    u.DisplayName,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    'Fallback',
+    null
+from Posts p
+left join Users u on u.Id = p.OwnerUserId
+where p.PostTypeId = 1
+  and p.Id not in (select Id from RankedPosts)
+order by DenseRankOverall nulls last, PostId
+limit 100;

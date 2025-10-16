@@ -1,0 +1,149 @@
+-- {"query": "18068.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1166} 
+
+WITH
+  UserPostCounts AS (
+    SELECT
+      OwnerUserId,
+      COUNT(Id) AS PostCount,
+      SUM(Score) AS TotalScore,
+      MAX(CreationDate) AS LastPostDate
+    FROM
+      Posts
+    WHERE
+      OwnerUserId IS NOT NULL
+    GROUP BY
+      OwnerUserId
+  ),
+  UserCommentCounts AS (
+    SELECT
+      UserId,
+      COUNT(Id) AS CommentCount
+    FROM
+      Comments
+    WHERE
+      UserId IS NOT NULL
+    GROUP BY
+      UserId
+  ),
+  UserVoteCounts AS (
+    SELECT
+      UserId,
+      COUNT(CASE WHEN VoteTypeId = 2 THEN 1 END) AS UpVoteCount,
+      COUNT(CASE WHEN VoteTypeId = 3 THEN 1 END) AS DownVoteCount
+    FROM
+      Votes
+    WHERE
+      UserId IS NOT NULL
+    GROUP BY
+      UserId
+  ),
+  RecentQuestions AS (
+    SELECT
+      Id,
+      OwnerUserId,
+      Title,
+      Tags,
+      Score,
+      AnswerCount,
+      ViewCount,
+      CreationDate,
+      ROW_NUMBER() OVER (
+        ORDER BY
+          CreationDate DESC
+      ) AS rn
+    FROM
+      Posts
+    WHERE
+      PostTypeId = 1 AND CreationDate >= DATE('now', '-30 day')
+  ),
+  QuestionMetrics AS (
+    SELECT
+      rq.Id AS QuestionId,
+      rq.Title,
+      rq.Tags,
+      rq.Score AS QuestionScore,
+      rq.AnswerCount,
+      rq.ViewCount AS QuestionViewCount,
+      rq.CreationDate AS QuestionCreationDate,
+      COALESCE(upc.PostCount, 0) AS OwnerTotalPosts,
+      COALESCE(ucc.CommentCount, 0) AS OwnerCommentCount,
+      COALESCE(uvc.UpVoteCount, 0) AS OwnerUpVotes,
+      COALESCE(uvc.DownVoteCount, 0) AS OwnerDownVotes,
+      (
+        SELECT
+          COUNT(*)
+        FROM
+          PostLinks AS pl_dup
+        WHERE
+          pl_dup.RelatedPostId = rq.Id AND pl_dup.LinkTypeId = 3
+      ) AS DuplicateLinkCount,
+      (
+        SELECT
+          MAX(ph.CreationDate)
+        FROM
+          PostHistory AS ph
+        WHERE
+          ph.PostId = rq.Id AND ph.PostHistoryTypeId = 10 -- Post Closed
+      ) AS LastClosedDate,
+      CASE WHEN EXISTS (
+        SELECT
+          1
+        FROM
+          Posts AS p_ans
+        WHERE
+          p_ans.ParentId = rq.Id AND p_ans.Score > 0
+      ) THEN 'Has_Positive_Answers' ELSE 'No_Positive_Answers' END AS AnswerQuality
+    FROM
+      RecentQuestions AS rq
+      LEFT OUTER JOIN UserPostCounts AS upc ON rq.OwnerUserId = upc.OwnerUserId
+      LEFT OUTER JOIN UserCommentCounts AS ucc ON rq.OwnerUserId = ucc.UserId
+      LEFT OUTER JOIN UserVoteCounts AS uvc ON rq.OwnerUserId = uvc.UserId
+    WHERE
+      rq.rn <= 100 -- Limit to the 100 most recent questions
+  )
+SELECT
+  qm.QuestionId,
+  qm.Title,
+  qm.Tags,
+  qm.QuestionScore,
+  qm.AnswerCount,
+  qm.QuestionViewCount,
+  qm.QuestionCreationDate,
+  qm.OwnerTotalPosts,
+  qm.OwnerCommentCount,
+  qm.OwnerUpVotes,
+  qm.OwnerDownVotes,
+  qm.DuplicateLinkCount,
+  qm.LastClosedDate,
+  qm.AnswerQuality,
+  UPPER(SUBSTR(qm.Title, 1, INSTR(qm.Title, ' ') - 1)) AS FirstWordOfTitle,
+  CASE
+    WHEN qm.QuestionScore > 100 THEN 'High_Score'
+    WHEN qm.QuestionScore < 0 THEN 'Negative_Score'
+    ELSE 'Neutral_Score'
+  END AS ScoreCategory,
+  CASE
+    WHEN qm.Tags LIKE '%<sql>%' THEN 'SQL_Tag'
+    WHEN qm.Tags LIKE '%<performance>%' THEN 'Performance_Tag'
+    ELSE 'Other_Tag'
+  END AS SpecificTag,
+  CAST(
+    STRFTIME('%Y-%m', qm.QuestionCreationDate) AS TEXT
+  ) AS CreationYearMonth,
+  ABS(
+    JULIANDAY('now') - JULIANDAY(qm.QuestionCreationDate)
+  ) AS DaysSinceCreation,
+  CASE
+    WHEN qm.LastClosedDate IS NOT NULL THEN 'Closed'
+    ELSE 'Open'
+  END AS PostStatus,
+  COALESCE(qm.OwnerTotalPosts, -1) AS OwnerPostCountWithNullHandling
+FROM
+  QuestionMetrics AS qm
+WHERE
+  qm.QuestionViewCount > 1000
+  OR qm.OwnerUpVotes > 5000
+ORDER BY
+  qm.QuestionScore DESC,
+  qm.QuestionViewCount DESC
+LIMIT 50;

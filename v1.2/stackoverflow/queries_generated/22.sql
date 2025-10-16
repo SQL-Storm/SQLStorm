@@ -1,0 +1,196 @@
+-- {"query": "22.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1803} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Path || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id <> r.Id and not t2.TagName = any(r.Path)
+    where t2.IsModeratorOnly = 0 and t2.IsRequired = 0 and r.Level < 3
+),
+UserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersGiven,
+        count(distinct c.Id) as CommentsMade,
+        coalesce(sum(vb.BountyAmount),0) as TotalBountyGiven,
+        max(u.Reputation) as Reputation,
+        row_number() over (order by max(u.Reputation) desc) as ReputationRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.CreationDate >= current_date - interval '365 days'
+    left join Comments c on c.UserId = u.Id and c.CreationDate >= current_date - interval '365 days'
+    left join Votes vb on vb.UserId = u.Id and vb.VoteTypeId in (8,9) and vb.CreationDate >= current_date - interval '365 days'
+    group by u.Id, u.DisplayName
+),
+PostScoreStats as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        dense_rank() over (partition by p.PostTypeId order by p.Score desc) as ScoreRank,
+        avg(p.Score) over (partition by p.PostTypeId) as AvgScore,
+        max(p.Score) over (partition by p.PostTypeId) as MaxScore,
+        min(p.Score) over (partition by p.PostTypeId) as MinScore
+    from Posts p
+    where p.CreationDate >= current_date - interval '180 days'
+),
+TopQuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate as QuestionDate,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        q.Tags,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswerOwnerUserId,
+        a.CreationDate as AnswerDate,
+        a.Score as AnswerScore,
+        a.Body,
+        row_number() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1 and q.CreationDate >= current_date - interval '180 days'
+),
+CloseReasonCounts as (
+    select
+        ph.Comment as CloseReasonId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseCount
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id::varchar = ph.Comment
+    where ph.PostHistoryTypeId = 10 and ph.CreationDate >= current_date - interval '365 days'
+    group by ph.Comment, crt.Name
+),
+UserBadgeSummary as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount,
+        bool_or(b.TagBased) as HasTagBasedBadge
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserBadgePivot as (
+    select
+        u.Id as UserId,
+        coalesce(gold.BadgeCount,0) as GoldBadges,
+        coalesce(silver.BadgeCount,0) as SilverBadges,
+        coalesce(bronze.BadgeCount,0) as BronzeBadges,
+        coalesce(gold.HasTagBasedBadge,false) or coalesce(silver.HasTagBasedBadge,false) or coalesce(bronze.HasTagBasedBadge,false) as HasAnyTagBasedBadge
+    from Users u
+    left join UserBadgeSummary gold on gold.UserId = u.Id and gold.Class = 1
+    left join UserBadgeSummary silver on silver.UserId = u.Id and silver.Class = 2
+    left join UserBadgeSummary bronze on bronze.UserId = u.Id and bronze.Class = 3
+),
+UserPostLinkAnalysis as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.LinkTypeId,
+        lt.Name as LinkTypeName,
+        p1.OwnerUserId as PostOwner,
+        p2.OwnerUserId as RelatedPostOwner,
+        case when p1.OwnerUserId = p2.OwnerUserId then 1 else 0 end as IsSelfLink
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+),
+UserLinkSummary as (
+    select
+        PostOwner as UserId,
+        LinkTypeName,
+        count(*) as LinkCount,
+        sum(IsSelfLink) as SelfLinkCount
+    from UserPostLinkAnalysis
+    group by PostOwner, LinkTypeName
+),
+FinalUserStats as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        ua.CommentsMade,
+        ua.TotalBountyGiven,
+        ua.Reputation,
+        ua.ReputationRank,
+        ubp.GoldBadges,
+        ubp.SilverBadges,
+        ubp.BronzeBadges,
+        ubp.HasAnyTagBasedBadge,
+        coalesce(uls.LinkCount,0) as TotalPostLinks,
+        coalesce(uls.SelfLinkCount,0) as SelfPostLinks
+    from UserActivity ua
+    left join UserBadgePivot ubp on ubp.UserId = ua.UserId
+    left join (
+        select UserId, sum(LinkCount) as LinkCount, sum(SelfLinkCount) as SelfLinkCount
+        from UserLinkSummary
+        group by UserId
+    ) uls on uls.UserId = ua.UserId
+    where ua.QuestionsAsked > 0 or ua.AnswersGiven > 0
+)
+select
+    fus.UserId,
+    fus.DisplayName,
+    fus.Reputation,
+    fus.ReputationRank,
+    fus.QuestionsAsked,
+    fus.AnswersGiven,
+    fus.CommentsMade,
+    fus.TotalBountyGiven,
+    fus.GoldBadges,
+    fus.SilverBadges,
+    fus.BronzeBadges,
+    fus.HasAnyTagBasedBadge,
+    fus.TotalPostLinks,
+    fus.SelfPostLinks,
+    coalesce(crc.CloseCount,0) as CloseVotesReceived,
+    coalesce(pss.AvgScore,0) as AvgPostScore,
+    coalesce(pss.MaxScore,0) as MaxPostScore,
+    coalesce(pss.MinScore,0) as MinPostScore,
+    string_agg(distinct rth.TagName, ', ') as SampleTags
+from FinalUserStats fus
+left join CloseReasonCounts crc on crc.CloseReasonId = '101' -- Duplicate close reason example
+left join PostScoreStats pss on pss.OwnerUserId = fus.UserId
+left join RecursiveTagHierarchy rth on rth.TagName = any(string_to_array(coalesce((select p.Tags from Posts p where p.OwnerUserId = fus.UserId limit 1),''), '><'))
+group by
+    fus.UserId,
+    fus.DisplayName,
+    fus.Reputation,
+    fus.ReputationRank,
+    fus.QuestionsAsked,
+    fus.AnswersGiven,
+    fus.CommentsMade,
+    fus.TotalBountyGiven,
+    fus.GoldBadges,
+    fus.SilverBadges,
+    fus.BronzeBadges,
+    fus.HasAnyTagBasedBadge,
+    fus.TotalPostLinks,
+    fus.SelfPostLinks,
+    crc.CloseCount,
+    pss.AvgScore,
+    pss.MaxScore,
+    pss.MinScore
+order by fus.ReputationRank
+limit 100;

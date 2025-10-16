@@ -1,0 +1,187 @@
+-- {"query": "72.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2301} 
+with
+-- recent active questions with tag array and tag count
+recent_q as (
+  select p.id, p.title, p.creationdate, p.score, p.viewcount,
+         p.owneruserid, p.answercount, p.favoritecount,
+         -- split tags like '<sql><performance>' -> array ['sql','performance']
+         array_remove(regexp_split_to_array(substring(coalesce(p.tags,'') from 2 for greatest(char_length(coalesce(p.tags,''))-2,0)), '><'), '') as tag_list,
+         case when p.tags is null then 0 else array_length(regexp_split_to_array(substring(p.tags from 2 for greatest(char_length(p.tags)-2,0)), '><'),1) end as tag_count
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate > now() - interval '2 years'
+),
+-- aggregated answers and top answer per question
+answers_agg as (
+  select q.id as question_id,
+         count(a.id) filter (where a.posttypeid = 2) as answers_total,
+         max(a.score) as top_answer_score,
+         -- pick most recent high-score answer id using window
+         (select id from (
+             select a2.id, a2.score, row_number() over (order by a2.score desc nulls last, a2.creationdate desc) rn
+             from posts a2
+             where a2.parentid = q.id and a2.posttypeid = 2
+         ) t where rn = 1) as top_answer_id
+  from recent_q q
+  left join posts a on a.parentid = q.id and a.posttypeid = 2
+  group by q.id
+),
+-- user reputation deciles and activity windows
+user_stats as (
+  select u.id as user_id, u.reputation, u.creationdate, u.displayname,
+         count(distinct p.id) filter (where p.posttypeid = 1) as q_post_count,
+         count(distinct p2.id) filter (where p2.posttypeid = 2) as a_post_count,
+         row_number() over (order by u.reputation desc) as rn_desc,
+         ntile(10) over (order by u.reputation) as rep_decile,
+         -- last seen relative
+         extract(epoch from (now() - u.lastaccessdate))/86400.0 as days_since_last_access
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join posts p2 on p2.owneruserid = u.id
+  group by u.id, u.reputation, u.creationdate, u.displayname, u.lastaccessdate
+),
+-- votes summary per post with fancy NULL handling and weighted score
+votes_agg as (
+  select v.postid,
+         count(*) as votes_total,
+         sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as net_votes,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+         -- weighted: upvotes*1 + downvotes*-1 + accept*3 + bounty/100
+         coalesce(sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 when v.votetypeid = 1 then 3 else 0 end),0)
+           + coalesce(sum(coalesce(v.bountyamount,0))/100.0,0) as weighted_score
+  from votes v
+  group by v.postid
+),
+-- comments sentiment-ish proxy: length and punctuation heuristics
+comments_agg as (
+  select c.postid,
+         count(*) as comment_count,
+         avg(char_length(c.text)) as avg_comment_len,
+         sum(case when c.text ~ '[!?]{2,}' then 1 else 0 end) as exclamation_shouts,
+         sum(case when c.text ilike '%thanks%' or c.text ilike '%thank you%' then 1 else 0 end) as thanks_count
+  from comments c
+  group by c.postid
+),
+-- tag popularity derived from tag list in recent_q
+tag_pop as (
+  select tag, count(*) as tag_question_count
+  from recent_q rq, unnest(rq.tag_list) tag
+  group by tag
+  order by tag_question_count desc
+),
+-- correlated subquery: find similar questions by tag overlap and title trigram-ish similarity (simple LIKE tokens)
+similar_questions as (
+  select q.id as question_id,
+         sq.id as similar_id,
+         -- overlap count
+         (select count(*) from unnest(q.tag_list) t(tag) join unnest(sq.tag_list) s(tag2) on tag=tag2) as tag_overlap,
+         -- title token match score
+         (
+           (case when q.title is null or sq.title is null then 0
+             else (select count(*) from unnest(string_to_array(regexp_replace(lower(q.title),'[^a-z0-9]+',' ','g'),' ')) t(word)
+                   where word <> '' and sq.title ilike ('%'||word||'%'))
+           end)
+         ) as title_token_matches,
+         abs(extract(epoch from (q.creationdate - sq.creationdate))) / 86400 as days_between
+  from recent_q q
+  join recent_q sq on sq.id <> q.id
+),
+-- posts with link relationships and duplicate mapping
+post_links_enriched as (
+  select pl.postid, pl.relatedpostid, pl.linktypeid,
+         lt.name as linktype_name,
+         -- chain detection: if RelatedPost is duplicate target, bring its title
+         rp.title as related_title
+  from postlinks pl
+  left join linktypes lt on lt.id = pl.linktypeid
+  left join posts rp on rp.id = pl.relatedpostid
+),
+-- final leaderboard with many joins, window functions, set ops and filters
+final_prep as (
+  select
+    rq.id,
+    rq.title,
+    rq.creationdate,
+    rq.score,
+    rq.viewcount,
+    rq.tag_count,
+    coalesce(answers_agg.answers_total,0) as answers_total,
+    coalesce(answers_agg.top_answer_score,0) as top_answer_score,
+    us.user_id as owner_user_id,
+    us.displayname as owner_name,
+    us.reputation as owner_rep,
+    us.rep_decile,
+    va.votes_total,
+    va.net_votes,
+    va.weighted_score,
+    ca.comment_count,
+    ca.avg_comment_len,
+    -- flag hot if viewcount high or weighted_score high or recent hot comments
+    case when rq.viewcount > 10000 or va.weighted_score > 50 or ca.exclamation_shouts > 5 then true else false end as is_hot,
+    -- complexity score: combine many signals with null-safe math
+    (
+      coalesce(rq.score,0) * 0.4
+      + coalesce(va.weighted_score,0) * 1.2
+      + coalesce(answers_agg.answers_total,0) * 0.8
+      + greatest(0, (100 - coalesce(us.rep_decile,10)) ) * 0.1
+      + coalesce(ca.avg_comment_len,0)/200.0
+      - coalesce(rq.tag_count,0) * 0.05
+    ) as complexity_score
+  from recent_q rq
+  left join answers_agg on answers_agg.question_id = rq.id
+  left join users us on us.user_id = rq.owneruserid
+  left join votes_agg va on va.postid = rq.id
+  left join comments_agg ca on ca.postid = rq.id
+)
+select
+  fp.id,
+  fp.title,
+  fp.creationdate,
+  fp.viewcount,
+  fp.score,
+  fp.tag_count,
+  fp.answers_total,
+  fp.top_answer_score,
+  fp.owner_user_id,
+  fp.owner_name,
+  fp.owner_rep,
+  fp.rep_decile,
+  fp.votes_total,
+  fp.net_votes,
+  fp.weighted_score,
+  fp.comment_count,
+  round(fp.complexity_score::numeric,4) as complexity_score,
+  fp.is_hot,
+  -- rank within decile by complexity
+  rank() over (partition by fp.rep_decile order by fp.complexity_score desc nulls last) as decile_rank,
+  -- windowed moving average of complexity over last 100 by creationdate
+  round(avg(fp.complexity_score) over (order by fp.creationdate rows between 99 preceding and current row)::numeric,4) as rolling_avg_complexity,
+  -- existence checks via set operators: has accepted answer?
+  case when exists (select 1 from posts p where p.id = fp.id and p.acceptedanswerid is not null) then true else false end as has_accepted_answer,
+  -- correlated: top 3 similar questions by tag overlap + title matches
+  (select json_agg(similar_sim) from (
+      select sq.similar_id, sq.tag_overlap, sq.title_token_matches, sq.days_between
+      from similar_questions sq
+      where sq.question_id = fp.id
+      order by sq.tag_overlap desc nulls last, sq.title_token_matches desc nulls last, sq.days_between asc nulls last
+      limit 3
+  ) similar_sim) as top_similars,
+  -- collect distinct linked posts that are duplicates or links
+  (select json_agg(distinct json_build_object('related_id', pl.relatedpostid, 'type', pl.linktype_name, 'related_title', pl.related_title))
+   from post_links_enriched pl
+   where pl.postid = fp.id and pl.linktypeid in (1,3)
+  ) as related_posts,
+  -- complex predicate: high attention candidate
+  case when fp.is_hot and fp.complexity_score > (select avg(complexity_score) from final_prep) then 'HighAttention'
+       when fp.complexity_score > percentile_cont(0.9) within group (order by fp.complexity_score) then 'Top10pct'
+       else 'Normal' end as attention_bucket
+from final_prep fp
+where
+  -- complicated filter expression mixing NULL logic, regex and arithmetic
+  (fp.tag_count >= 1 and fp.tag_count <= 10)
+  and (fp.creationdate > now() - interval '18 months')
+  and (coalesce(fp.votes_total,0) > 5 or fp.viewcount > 5000 or coalesce(fp.comment_count,0) > 2)
+  and not (fp.title ilike '%test%' or fp.title ilike '%dummy%')
+order by fp.complexity_score desc nulls last
+limit 250;

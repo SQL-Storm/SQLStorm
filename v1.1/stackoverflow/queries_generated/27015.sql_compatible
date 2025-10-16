@@ -1,0 +1,91 @@
+WITH ActiveUsers AS (
+    SELECT
+        Id,
+        Reputation,
+        CreationDate,
+        LastAccessDate,
+        Views,
+        UpVotes,
+        DownVotes,
+        COALESCE(EmailHash, 'No email') AS EmailHash,
+        DENSE_RANK() OVER (ORDER BY Reputation DESC) AS ReputationRank
+    FROM
+        Users
+    WHERE
+        LastAccessDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30' DAY
+),
+HighScorePosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        COALESCE(p.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+        COUNT(c.Id) AS CommentCount,
+        p.ParentId,
+        ph.PostHistoryTypeId,
+        ph.UserId,
+        ph.CreationDate AS EditorDate,
+        (SELECT COUNT(*) FROM Votes v2 WHERE v2.PostId = p.Id AND v2.VoteTypeId = 2) AS UpVoteCount,
+        (SELECT COUNT(*) FROM Votes v3 WHERE v3.PostId = p.Id AND v3.VoteTypeId = 3) AS DownVoteCount
+    FROM
+        Posts p
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN
+        PostHistory ph ON p.Id = ph.PostId
+    WHERE
+        p.PostTypeId IN (1, 2)
+    GROUP BY
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        ph.PostHistoryTypeId,
+        ph.UserId,
+        ph.CreationDate
+    HAVING
+        COUNT(c.Id) > 0
+)
+SELECT
+    au.Id AS UserId,
+    au.Reputation,
+    au.CreationDate AS UserCreationDate,
+    au.LastAccessDate,
+    au.Views AS UserViews,
+    au.UpVotes AS UserUpVotes,
+    au.DownVotes AS UserDownVotes,
+    au.EmailHash,
+    au.ReputationRank,
+    hsp.PostId,
+    hsp.PostTypeId,
+    hsp.OwnerUserId,
+    hsp.CreationDate AS PostCreationDate,
+    hsp.Score AS PostScore,
+    hsp.ViewCount,
+    hsp.Title,
+    hsp.Tags,
+    hsp.CommentCount,
+    hsp.AcceptedAnswerId AS PostAcceptedAnswerId,
+    hsp.ParentId,
+    hsp.PostHistoryTypeId,
+    hsp.EditorDate,
+    hsp.UpVoteCount AS PostUpVoteCount,
+    hsp.DownVoteCount AS PostDownVoteCount
+FROM
+    ActiveUsers au
+LEFT JOIN
+    HighScorePosts hsp ON au.Id = hsp.OwnerUserId
+ORDER BY
+    au.Views DESC
+LIMIT 100;

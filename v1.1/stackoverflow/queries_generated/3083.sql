@@ -1,0 +1,122 @@
+-- {"query": "3083.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 876} 
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COALESCE(sz.Reputation, 0) AS ReputationScore,
+        COALESCE(cmt.CommentCount, 0) AS TotalComments,
+        COALESCE(ans.AnswerCount, 0) AS TotalAnswers,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY u.LastAccessDate DESC) AS LastActivityRank
+    FROM 
+        Users u
+    LEFT JOIN (
+        SELECT 
+            OwnerUserId, COUNT(*) AS CommentCount
+        FROM 
+            Comments
+        GROUP BY 
+            OwnerUserId
+    ) cmt ON u.Id = cmt.OwnerUserId
+    LEFT JOIN (
+        SELECT 
+            OwnerUserId, COUNT(*) AS AnswerCount
+        FROM 
+            Posts
+        WHERE 
+            PostTypeId = 2
+        GROUP BY 
+            OwnerUserId
+    ) ans ON u.Id = ans.OwnerUserId
+    LEFT JOIN (
+        SELECT 
+            Id, Reputation
+        FROM 
+            Users
+    ) sz ON u.Id = sz.Id
+),
+RecentPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostRank
+    FROM 
+        Posts p
+    WHERE 
+        p.PostTypeId IN (1, 2)
+),
+LatestQuestions AS (
+    SELECT 
+        rp.PostId,
+        rp.Title,
+        rp.CreationDate
+    FROM 
+        RecentPosts rp
+    WHERE 
+        rp.PostTypeId = 1 AND rp.PostRank = 1
+),
+AnsweredQuestions AS (
+    SELECT 
+        p1.Id AS QuestionId,
+        p1.Title AS QuestionTitle,
+        p1.CreationDate AS QuestionDate,
+        p2.Id AS AnswerId,
+        p2.CreationDate AS AnswerDate
+    FROM 
+        Posts p1
+    JOIN 
+        Posts p2 ON p2.ParentId = p1.Id
+    WHERE 
+        p1.PostTypeId = 1 AND p2.PostTypeId = 2
+),
+ActiveQuestionsWithAnswers AS (
+    SELECT 
+        aq.QuestionId,
+        aq.QuestionTitle,
+        aq.QuestionDate,
+        COUNT(aq.AnswerId) FILTER (WHERE aq.AnswerDate >= aq.QuestionDate + INTERVAL '7 days') AS AnswersWithinWeek
+    FROM 
+        AnsweredQuestions aq
+    GROUP BY 
+        aq.QuestionId, aq.QuestionTitle, aq.QuestionDate
+),
+OverallStats AS (
+    SELECT 
+        COUNT(DISTINCT u.Id) FILTER (WHERE u.LastAccessDate >= NOW() - INTERVAL '30 days') AS ActiveUsersLast30Days,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.CreationDate >= NOW() - INTERVAL '30 days' AND p.PostTypeId = 1) AS QuestionsLast30Days,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.CreationDate >= NOW() - INTERVAL '30 days' AND p.PostTypeId = 2) AS AnswersLast30Days
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+)
+SELECT 
+    ua.UserId,
+    ua.DisplayName,
+    ua.ReputationScore,
+    ua.TotalComments,
+    ua.TotalAnswers,
+    rl.PostId AS LatestPostId,
+    rl.Title AS LatestPostTitle,
+    rl.CreationDate AS LatestPostDate,
+    eco.QuestionId,
+    eco.QuestionTitle,
+    eco.QuestionDate,
+    eco.AnswersWithinWeek,
+    os.ActiveUsersLast30Days,
+    os.QuestionsLast30Days,
+    os.AnswersLast30Days
+FROM 
+    UserActivity ua
+LEFT JOIN 
+    LatestQuestions rl ON ua.UserId = rl.OwnerUserId AND rl.PostRank = 1
+LEFT JOIN 
+    ActiveQuestionsWithAnswers eco ON eco.QuestionId = rl.PostId
+CROSS JOIN 
+    OverallStats os
+WHERE 
+    ua.LastActivityRank = 1
+ORDER BY 
+    ua.ReputationScore DESC;

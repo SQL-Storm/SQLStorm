@@ -1,0 +1,247 @@
+-- {"query": "575.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2082} 
+with RecursiveTagCounts as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount, 0) as AnswerCount,
+        coalesce(p.ViewCount, 0) as ViewCount,
+        coalesce(p.Score, 0) as Score,
+        row_number() over (partition by t.Id order by p.CreationDate desc nulls last) as rn
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+    where t.TagName is not null
+),
+FilteredTags as (
+    select TagId, TagName, Count, AnswerCount, ViewCount, Score
+    from RecursiveTagCounts
+    where rn = 1
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        sum(case when b.TagBased = 1 then 1 else 0 end) as TagBasedBadges,
+        rank() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+PostComplexStats as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        u.DisplayName as OwnerName,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        us.TagBasedBadges,
+        us.ReputationRank,
+        -- Calculate a weighted score with NULL logic and string manipulation on tags
+        (coalesce(p.Score,0) * 3 + coalesce(p.ViewCount,0) / 100 + coalesce(p.FavoriteCount,0) * 5) *
+        case when p.Tags is null or length(p.Tags) = 0 then 1 else length(p.Tags) - length(replace(p.Tags, '><', '')) end as WeightedScore,
+        -- Extract first tag from Tags string '<tag1><tag2>' format
+        substring(p.Tags from '<([^>]+)>') as FirstTag
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    left join UserBadgeStats us on us.UserId = p.OwnerUserId
+    where p.PostTypeId in (1,2)
+),
+AcceptedAnswerDetails as (
+    select
+        p.Id as QuestionId,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.ViewCount as AnswerViewCount,
+        a.CreationDate as AnswerCreationDate,
+        u.DisplayName as AnswerOwnerName,
+        us.GoldBadges as AnswerOwnerGoldBadges,
+        us.SilverBadges as AnswerOwnerSilverBadges,
+        us.BronzeBadges as AnswerOwnerBronzeBadges
+    from Posts p
+    left join Posts a on a.Id = p.AcceptedAnswerId and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    left join UserBadgeStats us on us.UserId = a.OwnerUserId
+    where p.PostTypeId = 1 and p.AcceptedAnswerId is not null
+),
+PostLinkAggregates as (
+    select
+        pl.PostId,
+        count(distinct case when lt.Name = 'Linked' then pl.RelatedPostId end) as LinkedCount,
+        count(distinct case when lt.Name = 'Duplicate' then pl.RelatedPostId end) as DuplicateCount
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+),
+PostVoteStats as (
+    select
+        v.PostId,
+        count(*) filter (where vt.Name = 'UpMod') as UpVotes,
+        count(*) filter (where vt.Name = 'DownMod') as DownVotes,
+        count(*) filter (where vt.Name = 'Favorite') as Favorites,
+        max(v.BountyAmount) as MaxBounty
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.PostId
+),
+CommentCounts as (
+    select
+        c.PostId,
+        count(*) as CommentCount,
+        count(distinct c.UserId) as DistinctCommenters,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    group by c.PostId
+),
+FinalPostStats as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.OwnerName,
+        p.GoldBadges,
+        p.SilverBadges,
+        p.BronzeBadges,
+        p.TagBasedBadges,
+        p.ReputationRank,
+        p.WeightedScore,
+        p.FirstTag,
+        coalesce(pl.LinkedCount, 0) as LinkedCount,
+        coalesce(pl.DuplicateCount, 0) as DuplicateCount,
+        coalesce(vs.UpVotes, 0) as UpVotes,
+        coalesce(vs.DownVotes, 0) as DownVotes,
+        coalesce(vs.Favorites, 0) as Favorites,
+        coalesce(vs.MaxBounty, 0) as MaxBounty,
+        coalesce(cc.CommentCount, 0) as CommentCount,
+        coalesce(cc.DistinctCommenters, 0) as DistinctCommenters,
+        cc.LastCommentDate
+    from PostComplexStats p
+    left join PostLinkAggregates pl on pl.PostId = p.Id
+    left join PostVoteStats vs on vs.PostId = p.Id
+    left join CommentCounts cc on cc.PostId = p.Id
+),
+RankedPosts as (
+    select
+        *,
+        rank() over (partition by PostTypeId order by WeightedScore desc) as WeightedRank,
+        dense_rank() over (partition by FirstTag order by Score desc nulls last) as TagScoreRank
+    from FinalPostStats
+),
+CorrelatedComments as (
+    select
+        p.Id as PostId,
+        (select count(*) from Comments c where c.PostId = p.Id and c.Score > 5) as HighScoreComments,
+        (select max(c.CreationDate) from Comments c where c.PostId = p.Id) as LatestCommentDate
+    from Posts p
+    where p.PostTypeId = 1
+)
+select
+    rp.Id as PostId,
+    rp.PostTypeId,
+    rp.OwnerUserId,
+    rp.OwnerName,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.AnswerCount,
+    rp.FavoriteCount,
+    rp.Tags,
+    rp.FirstTag,
+    rp.WeightedScore,
+    rp.LinkedCount,
+    rp.DuplicateCount,
+    rp.UpVotes,
+    rp.DownVotes,
+    rp.Favorites,
+    rp.MaxBounty,
+    rp.CommentCount,
+    rp.DistinctCommenters,
+    rp.LastCommentDate,
+    rp.GoldBadges,
+    rp.SilverBadges,
+    rp.BronzeBadges,
+    rp.TagBasedBadges,
+    rp.ReputationRank,
+    rp.WeightedRank,
+    rp.TagScoreRank,
+    aad.AnswerId as AcceptedAnswerId,
+    aad.AnswerScore,
+    aad.AnswerViewCount,
+    aad.AnswerCreationDate,
+    aad.AnswerOwnerName,
+    aad.AnswerOwnerGoldBadges,
+    aad.AnswerOwnerSilverBadges,
+    aad.AnswerOwnerBronzeBadges,
+    cc.HighScoreComments,
+    cc.LatestCommentDate as LatestCommentOnQuestion
+from RankedPosts rp
+left join AcceptedAnswerDetails aad on aad.QuestionId = rp.Id
+left join CorrelatedComments cc on cc.PostId = rp.Id
+where rp.PostTypeId = 1
+  and rp.WeightedScore > (
+      select avg(WeightedScore) from FinalPostStats where PostTypeId = 1
+  )
+  and rp.ReputationRank <= 500
+union
+select
+    rp.Id as PostId,
+    rp.PostTypeId,
+    rp.OwnerUserId,
+    rp.OwnerName,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.AnswerCount,
+    rp.FavoriteCount,
+    rp.Tags,
+    rp.FirstTag,
+    rp.WeightedScore,
+    rp.LinkedCount,
+    rp.DuplicateCount,
+    rp.UpVotes,
+    rp.DownVotes,
+    rp.Favorites,
+    rp.MaxBounty,
+    rp.CommentCount,
+    rp.DistinctCommenters,
+    rp.LastCommentDate,
+    rp.GoldBadges,
+    rp.SilverBadges,
+    rp.BronzeBadges,
+    rp.TagBasedBadges,
+    rp.ReputationRank,
+    rp.WeightedRank,
+    rp.TagScoreRank,
+    null as AcceptedAnswerId,
+    null as AnswerScore,
+    null as AnswerViewCount,
+    null as AnswerCreationDate,
+    null as AnswerOwnerName,
+    null as AnswerOwnerGoldBadges,
+    null as AnswerOwnerSilverBadges,
+    null as AnswerOwnerBronzeBadges,
+    null as HighScoreComments,
+    null as LatestCommentOnQuestion
+from RankedPosts rp
+where rp.PostTypeId = 2
+  and rp.WeightedScore > 100
+order by WeightedRank nulls last, PostId
+limit 100;

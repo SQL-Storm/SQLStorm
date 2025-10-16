@@ -1,0 +1,210 @@
+-- {"query": "27002.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2337, "output_tokens": 2187} 
+
+WITH UserActivity AS (
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.DisplayName,
+        U.Location,
+        COUNT(P.Id) AS TotalPosts,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT V.Id) AS TotalVotes,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        MAX(P.CreationDate) AS LastPostDate,
+        MAX(C.CreationDate) AS LastCommentDate,
+        MAX(V.CreationDate) AS LastVoteDate,
+        MAX(B.Date) AS LastBadgeDate
+    FROM
+        Users U
+    LEFT JOIN
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN
+        Comments C ON U.Id = C.UserId
+    LEFT JOIN
+        Votes V ON U.Id = V.UserId
+    LEFT JOIN
+        Badges B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.Reputation, U.DisplayName, U.Location
+), RecognizedUsers AS (
+    SELECT
+        UserId,
+        Reputation,
+        DisplayName,
+        Location,
+        TotalPosts,
+        TotalComments,
+        TotalVotes,
+        TotalBadges,
+        LastPostDate,
+        LastCommentDate,
+        LastVoteDate,
+        LastBadgeDate,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, TotalPosts DESC, TotalBadges DESC) AS Rank
+    FROM
+        UserActivity
+), HighActivityUsers AS (
+    SELECT
+        UserId,
+        Reputation,
+        DisplayName,
+        Location,
+        TotalPosts,
+        TotalComments,
+        TotalVotes,
+        TotalBadges,
+        LastPostDate,
+        LastCommentDate,
+        LastVoteDate,
+        LastBadgeDate
+    FROM
+        RecognizedUsers
+    WHERE
+        Rank <= 100
+), UserPostMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.Title,
+        P.Tags,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        U.UserId,
+        U.DisplayName,
+        COALESCE(A.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+        COALESCE(P.ParentId, -1) AS ParentId,
+        CASE
+            WHEN P.PostTypeId = 1 THEN 'Question'
+            WHEN P.PostTypeId = 2 THEN 'Answer'
+            WHEN P.PostTypeId = 3 THEN 'Wiki'
+            WHEN P.PostTypeId = 4 THEN 'TagWikiExcerpt'
+            WHEN P.PostTypeId = 5 THEN 'TagWiki'
+            WHEN P.PostTypeId = 6 THEN 'ModeratorNomination'
+            WHEN P.PostTypeId = 7 THEN 'WikiPlaceholder'
+            WHEN P.PostTypeId = 8 THEN 'PrivilegeWiki'
+            ELSE 'Other'
+        END AS PostTypeName,
+        EXTRACT(YEAR FROM P.CreationDate) AS PostYear,
+        EXTRACT(MONTH FROM P.CreationDate) AS PostMonth,
+        CASE
+            WHEN P.PostTypeId = 1 AND P.AnswerCount > 0 THEN 'Active'
+            WHEN P.PostTypeId = 1 AND P.AnswerCount = 0 THEN 'Inactive'
+            ELSE 'N/A'
+        END AS QuestionStatus
+    FROM
+        Posts P
+    JOIN
+        HighActivityUsers U ON P.OwnerUserId = U.UserId
+    LEFT JOIN
+        Posts A ON P.AcceptedAnswerId = A.Id
+    WHERE
+        P.PostTypeId IN (1, 2)
+), PostEngagement AS (
+    SELECT
+        PostId,
+        PostTypeId,
+        PostTypeName,
+        CreationDate,
+        Score,
+        ViewCount,
+        Title,
+        Tags,
+        AnswerCount,
+        CommentCount,
+        FavoriteCount,
+        UserId,
+        DisplayName,
+        AcceptedAnswerId,
+        ParentId,
+        PostYear,
+        PostMonth,
+        QuestionStatus,
+        COUNT(V.Id) AS VoteCount,
+        COUNT(DISTINCT C.Id) AS CommentCountActual,
+        COUNT(DISTINCT B.Id) AS BadgeCount,
+        COALESCE(MAX(PH.CreationDate), P.CreationDate) AS LastEditDate,
+        COUNT(PH.Id) AS EditCount,
+        LENGTH(P.Body) AS PostLength,
+        CASE
+            WHEN P.PostTypeId = 1 AND COALESCE(PH.Comment, '') LIKE '%101%' THEN 'Duplicate'
+            WHEN P.PostTypeId = 1 AND COALESCE(PH.Comment, '') LIKE '%102%' THEN 'Off-topic'
+            WHEN P.PostTypeId = 1 AND COALESCE(PH.Comment, '') LIKE '%103%' THEN 'Needs details'
+            WHEN P.PostTypeId = 1 AND COALESCE(PH.Comment, '') LIKE '%104%' THEN 'Needs focus'
+            WHEN P.PostTypeId = 1 AND COALESCE(PH.Comment, '') LIKE '%105%' THEN 'Opinion-based'
+            ELSE 'Open'
+        END AS CloseReason,
+        COALESCE(PH.CreationDate, P.CreationDate) AS CloseDate
+    FROM
+        UserPostMetrics P
+    LEFT JOIN
+        Votes V ON P.PostId = V.PostId
+    LEFT JOIN
+        Comments C ON P.PostId = C.PostId
+    LEFT JOIN
+        Badges B ON P.UserId = B.UserId
+    LEFT JOIN
+        PostHistory PH ON P.PostId = PH.PostId AND PH.PostHistoryTypeId IN (10, 11, 13, 14, 15, 20, 35)
+    GROUP BY
+        PostId, PostTypeId, PostTypeName, CreationDate, Score, ViewCount, Title, Tags,
+        AnswerCount, CommentCount, FavoriteCount, UserId, DisplayName, AcceptedAnswerId,
+        ParentId, PostYear, PostMonth, QuestionStatus, LastEditDate, PostLength, CloseReason, CloseDate
+)
+SELECT
+    PE.PostId,
+    PE.PostTypeId,
+    PE.PostTypeName,
+    PE.CreationDate,
+    PE.Score,
+    PE.ViewCount,
+    PE.Title,
+    PE.Tags,
+    PE.AnswerCount,
+    PE.CommentCount,
+    PE.CommentCountActual,
+    PE.FavoriteCount,
+    PE.UserId,
+    PE.DisplayName,
+    PE.AcceptedAnswerId,
+    PE.ParentId,
+    PE.PostYear,
+    PE.PostMonth,
+    PE.QuestionStatus,
+    PE.VoteCount,
+    PE.BadgeCount,
+    PE.LastEditDate,
+    PE.EditCount,
+    PE.PostLength,
+    PE.CloseReason,
+    PE.CloseDate,
+    COALESCE(L.RelatedPostId, -1) AS RelatedPostId,
+    LT.Name AS LinkTypeName,
+    U.Reputation AS UserReputation,
+    U.Location AS UserLocation,
+    U.TotalPosts,
+    U.TotalComments,
+    U.TotalVotes,
+    U.TotalBadges,
+    U.LastPostDate,
+    U.LastCommentDate,
+    U.LastVoteDate,
+    U.LastBadgeDate,
+    CASE
+        WHEN PE.PostTypeId = 1 AND PE.AnswerCount > 0 THEN 'High Engagement'
+        WHEN PE.PostTypeId = 1 AND PE.AnswerCount = 0 THEN 'Low Engagement'
+        ELSE 'N/A'
+    END AS EngagementLevel, (LENGTH(PE.Title) - LENGTH(REPLACE(PE.Title, ' ', ''))) + 1 AS WordCount
+FROM
+    PostEngagement PE
+LEFT JOIN
+    PostLinks L ON PE.PostId = L.PostId
+LEFT JOIN
+    LinkTypes LT ON L.LinkTypeId = LT.Id
+JOIN
+    HighActivityUsers U ON PE.UserId = U.UserId
+WHERE PE.Score > 10 AND PE.QuestionStatus
+IN ('active', 'duplicate', 'Off-topic', 'needs focus', 'opinion-based') AND PE.PostTypeId=1
+ORDER BY PE.Score DESC, PE.ViewCount DESC;

@@ -1,0 +1,42 @@
+SELECT 
+    NULL AS user_id,
+    'Community Aggregate' AS DisplayName,
+    'Global' AS Location,
+    SUM(au.Reputation) AS Reputation,
+    COUNT(DISTINCT qs.post_id) AS question_count,
+    COALESCE(SUM(qs.AnswerCount), 0) AS total_answers,
+    AVG(COALESCE(qs.monthly_avg_views, 0)) AS avg_monthly_engagement,
+    SUM(COALESCE(ac.total_answer_score, 0)) AS total_answer_upvotes,
+    COUNT(DISTINCT ba.badge_name) AS unique_badges,
+    SUM(CASE 
+        WHEN ba.class_count >= 5 AND ba.Class = 1 THEN 1 
+        ELSE 0 
+    END) AS gold_elite_count,
+    ROUND(
+        CASE 
+            WHEN SUM(qs.ViewCount) > 0 
+            THEN (SUM(qs.Score * 1.0) / NULLIF(SUM(qs.ViewCount), 0)) * 1000 
+            ELSE 0 
+        END, 2
+    ) AS score_per_thousand_views,
+    'Community Overview' AS formatted_profile,
+    NULL AS top_tags,
+    'Aggregate' AS editor_tier,
+    1 AS overall_impact_rank
+FROM active_users au
+INNER JOIN Users u ON au.user_id = u.Id
+LEFT JOIN question_stats qs ON au.user_id = qs.user_id 
+LEFT JOIN answer_contributions ac ON qs.post_id = ac.question_id 
+    AND au.user_id = ac.user_id
+LEFT JOIN badge_achievements ba ON au.user_id = ba.UserId
+LEFT JOIN post_evolution pe ON qs.post_id = pe.PostId 
+    AND au.user_id = pe.UserId
+GROUP BY
+    DisplayName,
+    Location,
+    formatted_profile,
+    top_tags,
+    editor_tier,
+    overall_impact_rank
+ORDER BY overall_impact_rank, Reputation DESC
+LIMIT 50;

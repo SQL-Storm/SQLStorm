@@ -1,0 +1,100 @@
+-- {"query": "12040.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 770} 
+
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.CreationDate) AS UserPostRank,
+        DENSE_RANK() OVER (ORDER BY P.Score DESC) AS ScoreRank,
+        NTILE(4) OVER (ORDER BY P.ViewCount DESC) AS ViewQuartile
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2) AND 
+        P.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+), 
+AggregatedUserStats AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        COUNT(DISTINCT P.Id) FILTER (WHERE P.PostTypeId = 1) AS QuestionsAsked,
+        COUNT(DISTINCT P.Id) FILTER (WHERE P.PostTypeId = 2) AS AnswersGiven,
+        SUM(P.Score) AS TotalScore,
+        AVG(P.ViewCount) AS AvgViewCount
+    FROM 
+        Users U
+    LEFT JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    WHERE 
+        P.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+    GROUP BY 
+        U.Id, U.DisplayName
+), 
+TopTags AS (
+    SELECT 
+        UNNEST(string_to_array(P.Tags, '<')) AS Tag,
+        COUNT(P.Id) AS TagCount
+    FROM 
+        Posts P
+    WHERE 
+        P.PostTypeId = 1 AND 
+        P.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+    GROUP BY 
+        Tag
+    ORDER BY 
+        TagCount DESC
+    LIMIT 10
+), 
+UserBadges AS (
+    SELECT 
+        B.UserId,
+        COUNT(B.Id) FILTER (WHERE B.Class = 1) AS GoldBadges,
+        COUNT(B.Id) FILTER (WHERE B.Class = 2) AS SilverBadges,
+        COUNT(B.Id) FILTER (WHERE B.Class = 3) AS BronzeBadges
+    FROM 
+        Badges B
+    WHERE 
+        B.Date >= CURRENT_DATE - INTERVAL '1 year'
+    GROUP BY 
+        B.UserId
+)
+SELECT 
+    RP.Id,
+    RP.PostTypeId,
+    RP.CreationDate,
+    RP.Score,
+    RP.ViewCount,
+    RP.OwnerUserId,
+    RP.OwnerDisplayName,
+    AUS.QuestionsAsked,
+    AUS.AnswersGiven,
+    AUS.TotalScore,
+    AUS.AvgViewCount,
+    UB.GoldBadges,
+    UB.SilverBadges,
+    UB.BronzeBadges,
+    TT.Tag,
+    TT.TagCount,
+    RP.UserPostRank,
+    RP.ScoreRank,
+    RP.ViewQuartile
+FROM 
+    RankedPosts RP
+JOIN 
+    AggregatedUserStats AUS ON RP.OwnerUserId = AUS.Id
+LEFT JOIN 
+    UserBadges UB ON RP.OwnerUserId = UB.UserId
+LEFT JOIN 
+    TopTags TT ON RP.Tags LIKE '%' || TT.Tag || '%'
+WHERE 
+    RP.UserPostRank <= 3
+ORDER BY 
+    RP.Score DESC, 
+    RP.CreationDate;

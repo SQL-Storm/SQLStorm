@@ -1,0 +1,160 @@
+-- {"query": "1329.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1744} 
+
+WITH RecursiveTagCounts AS (
+    SELECT 
+        t.Id AS TagId, t.TagName, 
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COALESCE(t.Count, 0) AS TotalCount
+    FROM Tags t
+    LEFT JOIN Posts p ON p.PostTypeId = 1 AND POSITION(CONCAT('<', t.TagName, '>') IN p.Tags) > 0
+    GROUP BY t.Id, t.TagName, t.Count
+),
+RankedQuestions AS (
+    SELECT 
+        p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST, p.ViewCount DESC NULLS LAST) AS QuestionRank,
+        LEFT(p.Title, 100) AS ShortTitle,
+        p.Tags,
+        ARRAY(
+            SELECT TagName FROM Tags tt
+            WHERE POSITION(CONCAT('<', tt.TagName, '>') IN p.Tags) > 0
+            ORDER BY tt.Count DESC
+            LIMIT 3
+        ) AS Top3Tags
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+UserBadgeScores AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(SUM(CASE WHEN b.Class = 1 THEN 10 WHEN b.Class = 2 THEN 5 WHEN b.Class = 3 THEN 1 ELSE 0 END), 0) AS BadgeScore,
+        COUNT(DISTINCT b.Name) OVER (PARTITION BY u.Id) AS DistinctBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+LastFiveComments AS (
+    SELECT 
+        c.PostId,
+        STRING_AGG(c.Text, ' | ' ORDER BY c.CreationDate DESC) AS RecentComments
+    FROM Comments c
+    WHERE c.PostId IN (SELECT Id FROM RankedQuestions WHERE QuestionRank <= 10)
+    GROUP BY c.PostId
+),
+AnswerStats AS (
+    SELECT 
+        a.ParentId AS QuestionId,
+        COUNT(a.Id) AS TotalAnswers,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        MIN(a.Score) AS MinAnswerScore,
+        COUNT(DISTINCT a.OwnerUserId) AS DistinctAnswerers
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+UserRecentActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(p.Id) FILTER (WHERE p.CreationDate > NOW() - INTERVAL '30 day') AS RecentPosts,
+        COUNT(c.Id) FILTER (WHERE c.CreationDate > NOW() - INTERVAL '30 day') AS RecentComments,
+        MAX(p.LastActivityDate) AS LastPostActivity,
+        MAX(c.CreationDate) AS LastCommentActivity
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id
+),
+DuplicateLinks AS (
+    SELECT 
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title AS PostTitle,
+        p2.Title AS RelatedTitle,
+        CASE WHEN pl.LinkTypeId = 3 THEN 'Duplicate' ELSE 'Linked' END AS LinkTypeName
+    FROM PostLinks pl
+    JOIN Posts p1 ON p1.Id = pl.PostId
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    WHERE pl.LinkTypeId IN (1, 3)
+),
+-- final aggregation with complicated join conditions, outer joins, and correlation
+EnrichedQuestions AS (
+    SELECT 
+        rq.Id AS QuestionId,
+        rq.Title,
+        rq.ShortTitle,
+        rq.CreationDate,
+        rq.OwnerUserId,
+        ubs.DisplayName AS OwnerName,
+        ubs.Reputation,
+        ubs.BadgeScore,
+        ubs.DistinctBadges,
+        rq.Score,
+        rq.ViewCount,
+        rq.Top3Tags,
+        a.TotalAnswers,
+        a.AvgAnswerScore,
+        a.MaxAnswerScore,
+        a.MinAnswerScore,
+        a.DistinctAnswerers,
+        lr.RecentComments,
+        ura.RecentPosts,
+        ura.RecentComments AS UserRecentComments,
+        GREATEST(COALESCE(ura.LastPostActivity, TIMESTAMP '1970-01-01'), COALESCE(ura.LastCommentActivity, TIMESTAMP '1970-01-01')) AS MostRecentActivity,
+        CASE 
+            WHEN EXISTS (
+                SELECT 1 FROM PostHistory ph
+                WHERE ph.PostId = rq.Id 
+                  AND ph.PostHistoryTypeId = 10 -- Post Closed
+                  AND ph.CreationDate > rq.CreationDate
+              ) THEN 1 ELSE 0
+        END AS IsClosed,
+        Coalesce(dl.DuplicateCount,0) AS DuplicateCountAggregated,
+        STRING_AGG(DISTINCT plsummary.Caption, '; ' ORDER BY plsummary.LinkCount DESC) FILTER (WHERE plsummary.LinkCount > 0) AS LinkSummaries
+    FROM RankedQuestions rq
+    LEFT JOIN UserBadgeScores ubs ON ubs.UserId = rq.OwnerUserId
+    LEFT JOIN AnswerStats a ON a.QuestionId = rq.Id
+    LEFT JOIN LastFiveComments lr ON lr.PostId = rq.Id
+    LEFT JOIN UserRecentActivity ura ON ura.UserId = rq.OwnerUserId
+    LEFT JOIN LATERAL (
+        SELECT COUNT(*) AS DuplicateCount FROM PostLinks pl WHERE pl.PostId = rq.Id AND pl.LinkTypeId = 3
+    ) dl ON TRUE
+    LEFT JOIN (
+        SELECT 
+            pl.PostId, 
+            CONCAT(LinkTypes.Name, ' (', COUNT(*), ')') AS Caption,
+            COUNT(*) AS LinkCount
+        FROM PostLinks pl
+        JOIN LinkTypes ON LinkTypes.Id = pl.LinkTypeId
+        GROUP BY pl.PostId, LinkTypes.Name
+    ) plsummary ON plsummary.PostId = rq.Id
+    WHERE rq.QuestionRank <= 10
+    GROUP BY rq.Id, rq.Title, rq.ShortTitle, rq.CreationDate, rq.OwnerUserId, ubs.DisplayName, ubs.Reputation, ubs.BadgeScore, ubs.DistinctBadges, rq.Score, rq.ViewCount,
+        rq.Top3Tags, a.TotalAnswers, a.AvgAnswerScore, a.MaxAnswerScore, a.MinAnswerScore, a.DistinctAnswerers, lr.RecentComments, ura.RecentPosts, ura.RecentComments, ura.LastPostActivity, ura.LastCommentActivity, dl.DuplicateCount
+)
+SELECT 
+    eq.QuestionId,
+    eq.Title,
+    eq.OwnerName,
+    eq.Reputation,
+    eq.BadgeScore,
+    eq.DistinctBadges,
+    eq.Score,
+    eq.ViewCount,
+    eq.Top3Tags,
+    CONCAT_WS(' / ', 'Answers:', eq.TotalAnswers, 'AvgScore:', ROUND(eq.AvgAnswerScore::numeric, 2), 'MaxScore:', eq.MaxAnswerScore) AS AnswerSummary,
+    eq.RecentComments,
+    CONCAT('Recent User Activity - Posts:', eq.RecentPosts, ', Comments:', eq.UserRecentComments) AS UserRecentActivity,
+    TO_CHAR(eq.MostRecentActivity, 'YYYY-MM-DD HH24:MI:SS') AS LastActivity,
+    CASE WHEN eq.IsClosed = 1 THEN 'Closed' ELSE 'Open' END AS Status,
+    eq.DuplicateCountAggregated AS DuplicateCount,
+    COALESCE(eq.LinkSummaries, 'No Links') AS LinkDetails,
+    REPLACE(CONCAT_WS(', ', eq.ShortTitle, COALESCE(eq.OwnerName, 'Unknown')), '''', '') AS ConcatenatedInfo,
+    LENGTH(eq.Title) + eq.Score * 2 - COALESCE(eq.ViewCount, 0) / 1000 AS ComplexComputedMetric
+FROM EnrichedQuestions eq
+ORDER BY eq.BadgeScore DESC, eq.Reputation DESC, eq.Score DESC, eq.QuestionId
+LIMIT 20
+;

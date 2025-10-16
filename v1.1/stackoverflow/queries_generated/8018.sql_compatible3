@@ -1,0 +1,298 @@
+with recent_active_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.lastaccessdate,
+        count(*) filter (where b.class = 1) as gold_badges,
+        count(*) filter (where b.class = 2) as silver_badges,
+        count(*) filter (where b.class = 3) as bronze_badges,
+        sum(greatest(coalesce(u.upvotes,0) - coalesce(u.downvotes,0),0)) as net_votes
+    from users u
+    left join badges b on b.userid = u.id
+    where u.lastaccessdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+    group by u.id, u.displayname, u.reputation, u.creationdate, u.lastaccessdate
+),
+user_post_activity as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where p.posttypeid = 1) as questions,
+        count(*) filter (where p.posttypeid = 2) as answers,
+        sum(coalesce(p.score,0)) as total_post_score,
+        sum(coalesce(p.viewcount,0)) as total_views,
+        percentile_cont(0.5) within group (order by coalesce(p.score,0)) as median_post_score
+    from posts p
+    where p.owneruserid is not null
+      and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '730 days'
+    group by p.owneruserid
+),
+question_tag_expansion as (
+    select
+        p.id as post_id,
+        p.owneruserid as user_id,
+        lower(trim(tg.tag)) as tag
+    from posts p
+    cross join lateral unnest(
+        case
+            when p.posttypeid = 1 and p.tags is not null and char_length(p.tags) > 2
+                then string_to_array(substring(p.tags from 2 for char_length(p.tags)-2), '><')
+            else array[]::varchar
+        end
+    ) as tg(tag)
+),
+user_top_tags as (
+    select
+        qte.user_id,
+        qte.tag,
+        count(*) as tag_uses,
+        rank() over (partition by qte.user_id order by count(*) desc, qte.tag) as tag_rank
+    from question_tag_expansion qte
+    group by qte.user_id, qte.tag
+),
+accepted_answer_ratio as (
+    select
+        a.owneruserid as user_id,
+        cast(count(*) as numeric) as answers_total,
+        cast(count(*) filter (where a.id = q.acceptedanswerid) as numeric) as answers_accepted,
+        nullif(cast(count(*) as numeric),0) as denom,
+        cast(count(*) filter (where a.id = q.acceptedanswerid) as numeric) / nullif(cast(count(*) as numeric),0) as accepted_ratio
+    from posts a
+    join posts q on q.id = a.parentid and q.posttypeid = 1
+    where a.posttypeid = 2
+      and a.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '730 days'
+    group by a.owneruserid
+),
+comment_stats as (
+    select
+        c.userid as user_id,
+        count(*) as comments_made,
+        avg(coalesce(c.score,0)) as avg_comment_score,
+        max(c.creationdate) as last_comment_date
+    from comments c
+    where c.userid is not null
+      and c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+    group by c.userid
+),
+vote_score_by_type as (
+    select
+        v.postid,
+        sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as net_votes
+    from votes v
+    where v.votetypeid in (2,3)
+      and v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+    group by v.postid
+),
+post_enriched as (
+    select
+        p.id,
+        p.owneruserid as user_id,
+        p.posttypeid,
+        p.score,
+        p.viewcount,
+        p.answercount,
+        p.title,
+        coalesce(vs.net_votes,0) as recent_net_votes,
+        coalesce(p.favoritecount,0) as favorites,
+        p.creationdate
+    from posts p
+    left join vote_score_by_type vs on vs.postid = p.id
+),
+user_recent_post_rollup as (
+    select
+        pe.user_id,
+        count(*) as posts_last_year,
+        sum(case when pe.posttypeid = 1 then 1 else 0 end) as questions_last_year,
+        sum(case when pe.posttypeid = 2 then 1 else 0 end) as answers_last_year,
+        sum(coalesce(pe.score,0)) as score_last_year,
+        sum(coalesce(pe.recent_net_votes,0)) as vote_delta_last_year,
+        avg(nullif(pe.viewcount,0)) as avg_views_last_year,
+        max(pe.creationdate) as last_post_date
+    from post_enriched pe
+    where pe.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+    group by pe.user_id
+),
+closed_question_events as (
+    select
+        ph.postid,
+        min(ph.creationdate) as first_closed_at,
+        max(ph.creationdate) as last_closed_at,
+        count(*) as close_events
+    from posthistory ph
+    where ph.posthistorytypeid = 10
+    group by ph.postid
+),
+duplicate_links as (
+    select
+        pl.postid as dup_post_id,
+        pl.relatedpostid as master_post_id,
+        min(pl.creationdate) as first_linked
+    from postlinks pl
+    where pl.linktypeid = 3
+    group by pl.postid, pl.relatedpostid
+),
+question_quality as (
+    select
+        q.id as question_id,
+        q.owneruserid as user_id,
+        q.score,
+        q.viewcount,
+        q.answercount,
+        case
+            when dq.master_post_id is not null then 'duplicate'
+            when cq.postid is not null then 'closed'
+            else 'open'
+        end as status,
+        coalesce(cq.close_events,0) as close_events,
+        coalesce(q.favoritecount,0) as favorites
+    from posts q
+    left join closed_question_events cq on cq.postid = q.id
+    left join duplicate_links dq on dq.dup_post_id = q.id
+    where q.posttypeid = 1
+      and q.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '730 days'
+),
+user_quality_agg as (
+    select
+        qq.user_id,
+        count(*) filter (where qq.status = 'open') as open_q,
+        count(*) filter (where qq.status = 'closed') as closed_q,
+        count(*) filter (where qq.status = 'duplicate') as dup_q,
+        avg(coalesce(qq.score,0)) as avg_q_score,
+        avg(coalesce(qq.viewcount,0)) as avg_q_views,
+        percentile_cont(0.9) within group (order by coalesce(qq.viewcount,0)) as p90_q_views
+    from question_quality qq
+    group by qq.user_id
+),
+user_rank as (
+    select
+        rau.user_id,
+        rau.displayname,
+        rau.reputation,
+        rau.gold_badges,
+        rau.silver_badges,
+        rau.bronze_badges,
+        upa.questions,
+        upa.answers,
+        upa.total_post_score,
+        upa.total_views,
+        coalesce(aar.accepted_ratio,0) as accepted_ratio,
+        coalesce(cs.comments_made,0) as comments_made,
+        coalesce(cs.avg_comment_score,0) as avg_comment_score,
+        coalesce(urpr.posts_last_year,0) as posts_last_year,
+        coalesce(urpr.score_last_year,0) as score_last_year,
+        coalesce(urpr.vote_delta_last_year,0) as vote_delta_last_year,
+        coalesce(uqa.avg_q_score,0) as avg_q_score,
+        coalesce(uqa.avg_q_views,0) as avg_q_views,
+        coalesce(uqa.p90_q_views,0) as p90_q_views,
+        (
+            0.40 * coalesce(aar.accepted_ratio,0) +
+            0.15 * least(coalesce(upa.total_post_score,0) / nullif(upa.questions + upa.answers,0), 50) +
+            0.10 * greatest(0, least(coalesce(urpr.vote_delta_last_year,0), 100)) +
+            0.10 * least(coalesce(uqa.avg_q_views,0) / nullif(upa.questions,0), 1000) +
+            0.10 * least(coalesce(rau.reputation,0) / 1000.0, 1.0) +
+            0.05 * least(coalesce(rau.gold_badges,0), 5) +
+            0.05 * least(coalesce(rau.silver_badges,0) / 2.0, 5) +
+            0.05 * least(coalesce(rau.bronze_badges,0) / 5.0, 5)
+        ) as composite_score
+    from recent_active_users rau
+    left join user_post_activity upa on upa.user_id = rau.user_id
+    left join accepted_answer_ratio aar on aar.user_id = rau.user_id
+    left join comment_stats cs on cs.user_id = rau.user_id
+    left join user_recent_post_rollup urpr on urpr.user_id = rau.user_id
+    left join user_quality_agg uqa on uqa.user_id = rau.user_id
+),
+user_rank_scored as (
+    select
+        ur.user_id,
+        ur.displayname,
+        ur.reputation,
+        ur.gold_badges,
+        ur.silver_badges,
+        ur.bronze_badges,
+        ur.questions,
+        ur.answers,
+        ur.total_post_score,
+        ur.total_views,
+        ur.accepted_ratio,
+        ur.comments_made,
+        ur.avg_comment_score,
+        ur.posts_last_year,
+        ur.score_last_year,
+        ur.vote_delta_last_year,
+        ur.avg_q_score,
+        ur.avg_q_views,
+        ur.p90_q_views,
+        ur.composite_score,
+        row_number() over (order by ur.composite_score desc nulls last, ur.reputation desc, ur.total_post_score desc nulls last, ur.total_views desc nulls last, ur.user_id) as rn,
+        dense_rank() over (order by ur.composite_score desc nulls last) as dense_rank_score,
+        ntile(10) over (order by ur.composite_score desc nulls last) as decile
+    from user_rank ur
+),
+user_primary_tag as (
+    select
+        utt.user_id,
+        string_agg(utt.tag, ', ' order by utt.tag) filter (where utt.tag_rank = 1) as primary_tags
+    from user_top_tags utt
+    where utt.tag_rank <= 3
+    group by utt.user_id
+),
+user_last_edit as (
+    select
+        ph.userid as user_id,
+        max(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6)) as last_edit_date
+    from posthistory ph
+    group by ph.userid
+),
+string_profile as (
+    select
+        u.id as user_id,
+        trim(both ' ' from coalesce(u.location,'Unknown')) as norm_location,
+        lower(coalesce(u.websiteurl,'')) as website_lower,
+        case when position('github' in lower(coalesce(u.websiteurl,''))) > 0 then 1 else 0 end as has_github_site
+    from users u
+)
+select
+    urs.rn as row_num,
+    urs.dense_rank_score,
+    urs.decile,
+    urs.user_id,
+    urs.displayname,
+    urs.reputation,
+    coalesce(upt.primary_tags,'') as primary_tags,
+    urs.gold_badges,
+    urs.silver_badges,
+    urs.bronze_badges,
+    urs.questions,
+    urs.answers,
+    round(cast(coalesce(urs.accepted_ratio,0) as numeric), 4) as accepted_ratio,
+    urs.total_post_score,
+    urs.total_views,
+    urs.posts_last_year,
+    urs.score_last_year,
+    urs.vote_delta_last_year,
+    urs.avg_q_score,
+    round(cast(coalesce(urs.avg_q_views,0) as numeric),2) as avg_q_views,
+    round(cast(coalesce(urs.p90_q_views,0) as numeric),2) as p90_q_views,
+    round(cast(coalesce(urs.composite_score,0) as numeric),4) as composite_score,
+    coalesce(ule.last_edit_date, urs.last_post_date, ra.creationdate) as last_activity_estimate,
+    sp.norm_location,
+    sp.website_lower,
+    sp.has_github_site
+from user_rank_scored urs
+left join user_primary_tag upt on upt.user_id = urs.user_id
+left join user_last_edit ule on ule.user_id = urs.user_id
+left join string_profile sp on sp.user_id = urs.user_id
+left join recent_active_users ra on ra.user_id = urs.user_id
+where
+    coalesce(urs.questions,0) + coalesce(urs.answers,0) + coalesce(urs.comments_made,0) > 0
+    and coalesce((
+        select 1.0 * sum(case when qq.status in ('closed','duplicate') then 1 else 0 end) / nullif(count(*),0)
+        from question_quality qq
+        where qq.user_id = urs.user_id
+    ), 0) <= 0.75
+order by
+    urs.composite_score desc nulls last,
+    urs.reputation desc,
+    urs.total_post_score desc nulls last,
+    urs.user_id
+fetch first 200 rows only;

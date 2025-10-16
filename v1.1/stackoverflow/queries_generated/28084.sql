@@ -1,0 +1,106 @@
+-- {"query": "28084.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "deepseek-r1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1559} 
+
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        COALESCE(SUM(CASE b.Class WHEN 1 THEN 1 ELSE 0 END), 0) AS GoldBadges,
+        COALESCE(SUM(CASE b.Class WHEN 2 THEN 1 ELSE 0 END), 0) AS SilverBadges,
+        COALESCE(SUM(CASE b.Class WHEN 3 THEN 1 ELSE 0 END), 0) AS BronzeBadges,
+        RANK() OVER (PARTITION BY b.Class ORDER BY u.Reputation DESC) AS BadgeClassRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, b.Class
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+        STRING_AGG(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><') AS Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS PostRank,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'CommunityWiki'
+            ELSE 'Active'
+        END AS PostStatus
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id
+)
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    pa.Title,
+    pa.Tags,
+    pa.CommentCount + pa.AnswerCount AS Engagement,
+    (u.UpVotes * 1.0 / NULLIF(u.DownVotes, 0)) AS VoteRatio,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    ph.CreationDate AS LastEditDate,
+    COALESCE(vt.Name, 'NoVote') AS LastVoteType,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 
+            FROM PostLinks pl 
+            WHERE pl.PostId = pa.Id 
+            AND pl.LinkTypeId = 3
+        ) THEN 'Duplicate'
+        ELSE 'Unique'
+    END AS LinkStatus
+FROM Users u
+INNER JOIN UserStats us ON u.Id = us.Id
+LEFT JOIN PostAnalysis pa ON u.Id = pa.OwnerUserId AND pa.PostRank = 1
+LEFT JOIN (
+    SELECT 
+        PostId,
+        MAX(CreationDate) AS LastVoteDate 
+    FROM Votes 
+    GROUP BY PostId
+) lv ON pa.Id = lv.PostId
+LEFT JOIN Votes v ON lv.PostId = v.PostId AND lv.LastVoteDate = v.CreationDate
+LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+LEFT JOIN PostHistory ph ON pa.Id = ph.PostId 
+    AND ph.PostHistoryTypeId IN (5, 6) 
+    AND ph.CreationDate = (
+        SELECT MAX(CreationDate) 
+        FROM PostHistory 
+        WHERE PostId = pa.Id 
+        AND PostHistoryTypeId IN (5, 6)
+    )
+WHERE u.Reputation > 1000
+    AND pa.Score > 50
+    AND pa.AnswerCount >= 5
+    AND (pa.Tags LIKE '%<sql>%' OR pa.Tags LIKE '%<performance>%')
+UNION
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    'DELETED_POST' AS Title,
+    NULL AS Tags,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL) AS Engagement,
+    NULL AS VoteRatio,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    MAX(v.CreationDate) AS LastEditDate,
+    'DELETED' AS LastVoteType,
+    'Orphaned' AS LinkStatus
+FROM Users u
+JOIN UserStats us ON u.Id = us.Id
+LEFT JOIN Votes v ON u.Id = v.UserId
+WHERE u.Id IN (
+    SELECT DISTINCT OwnerUserId 
+    FROM Posts 
+    WHERE OwnerUserId IS NOT NULL 
+    AND ClosedDate IS NOT NULL
+    AND OwnerUserId NOT IN (SELECT UserId FROM Badges)
+)
+GROUP BY u.Id
+HAVING COUNT(v.Id) = 0;

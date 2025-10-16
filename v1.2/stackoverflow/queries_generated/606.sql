@@ -1,0 +1,202 @@
+-- {"query": "606.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1817} 
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        coalesce(u.Location, 'Unknown') as Location,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        count(distinct b.Id) as BadgeCount,
+        row_number() over (partition by coalesce(u.Location, 'Unknown') order by u.Reputation desc) as UserRankByLocation
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location
+),
+TopQuestions as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName as OwnerDisplayName,
+        p.AcceptedAnswerId,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as QuestionRank
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1
+),
+AcceptedAnswers as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        a.OwnerUserId as AnswerOwnerUserId,
+        u.DisplayName as AnswerOwnerDisplayName
+    from Posts a
+    left join Users u on u.Id = a.OwnerUserId
+    where a.PostTypeId = 2
+),
+QuestionAnswerStats as (
+    select
+        q.QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        q.OwnerUserId,
+        q.OwnerDisplayName,
+        coalesce(a.AnswerScore, 0) as AcceptedAnswerScore,
+        coalesce(a.AnswerOwnerUserId, -1) as AcceptedAnswerOwnerUserId,
+        coalesce(a.AnswerOwnerDisplayName, 'Unknown') as AcceptedAnswerOwnerDisplayName,
+        q.QuestionRank
+    from TopQuestions q
+    left join AcceptedAnswers a on a.QuestionId = q.QuestionId and a.AnswerId = q.AcceptedAnswerId
+),
+BadgeCountsByClass as (
+    select
+        UserId,
+        sum(case when Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when Class = 3 then 1 else 0 end) as BronzeBadges
+    from Badges
+    group by UserId
+),
+UserVoteStats as (
+    select
+        p.OwnerUserId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as TotalUpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as TotalDownVotes,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as TotalFavorites
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+UserSummary as (
+    select
+        r.UserId,
+        r.DisplayName,
+        r.Reputation,
+        r.Location,
+        r.QuestionCount,
+        r.AnswerCount,
+        r.CommentCount,
+        coalesce(b.GoldBadges, 0) as GoldBadges,
+        coalesce(b.SilverBadges, 0) as SilverBadges,
+        coalesce(b.BronzeBadges, 0) as BronzeBadges,
+        coalesce(v.TotalUpVotes, 0) as TotalUpVotes,
+        coalesce(v.TotalDownVotes, 0) as TotalDownVotes,
+        coalesce(v.TotalFavorites, 0) as TotalFavorites,
+        r.UserRankByLocation
+    from RecursiveUserActivity r
+    left join BadgeCountsByClass b on b.UserId = r.UserId
+    left join UserVoteStats v on v.OwnerUserId = r.UserId
+),
+RecentPostHistories as (
+    select
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        pht.Name as HistoryTypeName,
+        ph.UserId,
+        u.DisplayName as EditorDisplayName,
+        ph.CreationDate,
+        ph.Comment,
+        ph.Text,
+        row_number() over (partition by ph.PostId order by ph.CreationDate desc) as rn
+    from PostHistory ph
+    left join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId
+    left join Users u on u.Id = ph.UserId
+    where ph.PostId in (select QuestionId from TopQuestions where QuestionRank <= 10)
+),
+FilteredPostHistories as (
+    select *
+    from RecentPostHistories
+    where rn <= 3
+),
+AggregatedTagStats as (
+    select
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as Tag,
+        count(distinct p.Id) as QuestionCount,
+        avg(p.Score) as AvgScore,
+        sum(p.ViewCount) as TotalViews
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+    group by Tag
+    having count(distinct p.Id) > 100
+),
+CombinedUserQuestions as (
+    select
+        us.UserId,
+        us.DisplayName,
+        q.QuestionId,
+        q.Title,
+        q.QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        us.TotalUpVotes,
+        us.TotalDownVotes,
+        us.TotalFavorites,
+        us.UserRankByLocation,
+        dense_rank() over (partition by us.Location order by us.Reputation desc) as ReputationRankInLocation
+    from UserSummary us
+    join QuestionAnswerStats q on q.OwnerUserId = us.UserId
+    where q.QuestionRank <= 5
+)
+select
+    cuq.UserId,
+    cuq.DisplayName,
+    cuq.QuestionId,
+    cuq.Title,
+    cuq.QuestionScore,
+    cuq.ViewCount,
+    cuq.Tags,
+    cuq.GoldBadges,
+    cuq.SilverBadges,
+    cuq.BronzeBadges,
+    cuq.TotalUpVotes,
+    cuq.TotalDownVotes,
+    cuq.TotalFavorites,
+    cuq.UserRankByLocation,
+    cuq.ReputationRankInLocation,
+    ats.Tag,
+    ats.QuestionCount as TagQuestionCount,
+    ats.AvgScore as TagAvgScore,
+    ats.TotalViews as TagTotalViews,
+    fph.PostHistoryTypeId,
+    fph.HistoryTypeName,
+    fph.EditorDisplayName,
+    fph.CreationDate as EditDate,
+    coalesce(nullif(fph.Comment, ''), 'No Comment') as EditComment,
+    case
+        when cuq.QuestionScore > 100 then 'High Score'
+        when cuq.QuestionScore between 50 and 100 then 'Medium Score'
+        else 'Low Score'
+    end as ScoreCategory,
+    case
+        when cuq.ViewCount > 10000 then 'Popular'
+        else 'Less Popular'
+    end as PopularityCategory,
+    case
+        when cuq.GoldBadges > 0 then concat('Gold:', cuq.GoldBadges)
+        else 'No Gold Badges'
+    end as GoldBadgeStatus
+from CombinedUserQuestions cuq
+left join AggregatedTagStats ats on ats.Tag = any(string_to_array(substring(cuq.Tags from 2 for char_length(cuq.Tags) - 2), '><'))
+left join FilteredPostHistories fph on fph.PostId = cuq.QuestionId
+where cuq.UserRankByLocation <= 10 and cuq.ReputationRankInLocation <= 3
+order by cuq.Location, cuq.Reputation desc, cuq.QuestionScore desc, fph.CreationDate desc
+limit 100;

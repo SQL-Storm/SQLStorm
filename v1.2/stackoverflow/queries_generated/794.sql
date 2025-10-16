@@ -1,0 +1,141 @@
+-- {"query": "794.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1293} 
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        p.Id as PostId,
+        p.Score,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName,
+        row_number() over (partition by t.Id order by p.Score desc, p.CreationDate) as rn
+    from Tags t
+    left join Posts p on p.Tags like concat('%<', t.TagName, '>%') and p.PostTypeId = 1
+    left join Users u on u.Id = p.OwnerUserId
+    where p.Id is not null
+),
+UserBadgeRankings as (
+    select
+        b.UserId,
+        u.DisplayName,
+        b.Class,
+        b.Name,
+        dense_rank() over (partition by b.UserId order by b.Class asc) as BadgeRank
+    from Badges b
+    join Users u on u.Id = b.UserId
+    where b.Date > current_date - interval '2 year'
+),
+TopBadgedUsers as (
+    select distinct UserId
+    from UserBadgeRankings
+    where BadgeRank <= 3
+),
+PostActivityWindow as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.DisplayName,
+        count(c.Id) over (partition by p.Id) as CommentCountWindow,
+        sum(v.VoteTypeId = 2::smallint)::int over (partition by p.Id) as UpVotesWindow,
+        sum(v.VoteTypeId = 3::smallint)::int over (partition by p.Id) as DownVotesWindow,
+        max(ph.CreationDate) over (partition by p.Id) as LastEditDateWindow
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    left join Comments c on c.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId in (4,5,6)
+),
+CorrelatedAnswerStats as (
+    select
+        q.Id as QuestionId,
+        count(a.Id) as AnswerCount,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.CreationDate) as LastAnswerDate
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id
+),
+DuplicateLinks as (
+    select 
+        pl.PostId,
+        pl.RelatedPostId,
+        p.Title as OriginalTitle,
+        p2.Title as DuplicateTitle,
+        pl.CreationDate as LinkCreated
+    from PostLinks pl
+    join Posts p on p.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where pl.LinkTypeId = 3
+),
+CombinedPosts as (
+    select
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.DisplayName,
+        ph.PostHistoryTypeId,
+        ph.CreationDate as HistoryDate,
+        ph.UserId as EditorUserId,
+        ph.UserDisplayName as EditorName,
+        ph.Comment as CloseReasonCode,
+        crt.Name as CloseReasonName,
+        case when p.ClosedDate is not null then 1 else 0 end as IsClosed,
+        coalesce(ca.AnswerCount, 0) as AnswerCount,
+        coalesce(ca.AvgAnswerScore, 0) as AvgAnswerScore,
+        coalesce(ca.LastAnswerDate, null) as LastAnswerDate
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    left join CorrelatedAnswerStats ca on ca.QuestionId = p.Id
+    where p.PostTypeId = 1
+)
+select distinct
+    cp.Id,
+    cp.Title,
+    cp.CreationDate,
+    cp.Score,
+    cp.ViewCount,
+    cp.DisplayName as OwnerName,
+    cp.IsClosed,
+    coalesce(cp.CloseReasonName, 'N/A') as CloseReason,
+    cp.AnswerCount,
+    round(cp.AvgAnswerScore::numeric, 2) as AvgAnswerScore,
+    to_char(cp.LastAnswerDate, 'YYYY-MM-DD HH24:MI:SS') as LastAnswerDate,
+    string_agg(distinct ub.Name || '(' || ub.Class || ')', ', ') over (partition by cp.OwnerUserId) as UserBadges,
+    rtc.TagName,
+    rtc.Count as TagCount,
+    rtc.Score as PostScore,
+    rtc.rn as TagPostRank,
+    dup.OriginalTitle as DuplicateOf,
+    dup.LinkCreated as DuplicateLinkedAt,
+    case 
+        when cp.ViewCount > 10000 then 'Very High'
+        when cp.ViewCount between 1000 and 10000 then 'High'
+        when cp.ViewCount between 100 and 999 then 'Medium'
+        else 'Low'
+    end as ViewLevel,
+    case 
+        when cp.Score >= 100 then 'Popular'
+        when cp.Score between 50 and 99 then 'Moderate'
+        else 'Less Popular'
+    end as PopularityLevel
+from CombinedPosts cp
+left join RecursiveTagCounts rtc on rtc.PostId = cp.Id and rtc.rn <= 3
+left join UserBadgeRankings ub on ub.UserId = cp.OwnerUserId and ub.BadgeRank <= 3
+left join DuplicateLinks dup on dup.PostId = cp.Id
+where cp.CreationDate > current_date - interval '1 year' 
+  and (cp.Score > 10 or cp.AnswerCount > 2)
+order by cp.Score desc, cp.ViewCount desc, cp.CreationDate desc
+limit 100;

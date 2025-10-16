@@ -1,0 +1,109 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS Rank,
+        COALESCE(u.DisplayName, 'Deleted User') AS OwnerDisplayName,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    WHERE 
+        p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR)
+),
+-- Standard SQL-compatible splitter for Tags stored like "<tag1><tag2>"
+TagRows AS (
+    SELECT
+        p.Id AS PostId,
+        TRIM(tag) AS tag
+    FROM
+        Posts p
+    CROSS JOIN LATERAL (
+        -- recursive split of a tag string like '<a><b><c>' into rows '<a>', '<b>', '<c>'
+        WITH RECURSIVE split(pos, rest) AS (
+            SELECT
+                1 AS pos,
+                p.Tags AS rest
+            UNION ALL
+            SELECT
+                pos + 1,
+                CASE
+                    WHEN instr(rest, '><') > 0 THEN substr(rest, instr(rest, '><') + 2)
+                    ELSE NULL
+                END
+            FROM split
+            WHERE rest IS NOT NULL
+        ),
+        extracted AS (
+            SELECT
+                CASE
+                    WHEN rest IS NULL THEN NULL
+                    WHEN instr(rest, '><') > 0 THEN substr(rest, 1, instr(rest, '><') + 0)
+                    ELSE rest
+                END AS piece
+            FROM split
+            WHERE rest IS NOT NULL
+        )
+        SELECT piece AS tag
+        FROM extracted
+        WHERE piece IS NOT NULL
+    ) s
+    WHERE p.Tags IS NOT NULL
+),
+PopularTags AS (
+    SELECT 
+        -- remove surrounding angle brackets if present
+        CASE
+            WHEN LEFT(tag, 1) = '<' AND RIGHT(tag, 1) = '>' THEN SUBSTR(tag, 2, LENGTH(tag) - 2)
+            WHEN LEFT(tag, 1) = '<' THEN SUBSTR(tag, 2)
+            WHEN RIGHT(tag, 1) = '>' THEN SUBSTR(tag, 1, LENGTH(tag) - 1)
+            ELSE tag
+        END AS Tag,
+        COUNT(*) AS Count
+    FROM TagRows
+    WHERE tag IS NOT NULL AND tag <> ''
+    GROUP BY
+        CASE
+            WHEN LEFT(tag, 1) = '<' AND RIGHT(tag, 1) = '>' THEN SUBSTR(tag, 2, LENGTH(tag) - 2)
+            WHEN LEFT(tag, 1) = '<' THEN SUBSTR(tag, 2)
+            WHEN RIGHT(tag, 1) = '>' THEN SUBSTR(tag, 1, LENGTH(tag) - 1)
+            ELSE tag
+        END
+    ORDER BY Count DESC
+    LIMIT 5
+),
+PostVoteStatistics AS (
+    SELECT 
+        PostId,
+        SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+        SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes
+    FROM 
+        Votes
+    GROUP BY 
+        PostId
+)
+SELECT 
+    rp.PostId,
+    rp.Title,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.OwnerDisplayName,
+    rp.CommentCount,
+    COALESCE(pvs.Upvotes, 0) AS UpvoteCount,
+    COALESCE(pvs.Downvotes, 0) AS DownvoteCount,
+    pt.Tag AS PopularTag
+FROM 
+    RankedPosts rp
+LEFT JOIN 
+    PostVoteStatistics pvs ON rp.PostId = pvs.PostId
+JOIN 
+    PopularTags pt ON rp.Rank <= 5
+WHERE 
+    rp.Rank <= 10
+ORDER BY 
+    rp.Score DESC, rp.ViewCount DESC;

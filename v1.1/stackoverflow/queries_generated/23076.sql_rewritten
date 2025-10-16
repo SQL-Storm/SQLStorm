@@ -1,0 +1,102 @@
+-- {"query": "23076.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "grok-4", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2685, "output_tokens": 837} 
+WITH TopUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        COALESCE(u.Location, 'Unknown') AS UserLocation,
+        COUNT(DISTINCT p.Id) AS PostCount
+    FROM Users u
+    LEFT OUTER JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location
+    HAVING COUNT(DISTINCT p.Id) > 10
+),
+UserBadges AS (
+    SELECT 
+        tu.UserId,
+        COUNT(b.Id) AS BadgeCount,
+        STRING_AGG(CASE WHEN b.Class = 1 THEN UPPER(b.Name) ELSE LOWER(b.Name) END, ', ') AS BadgeNames
+    FROM TopUsers tu
+    INNER JOIN Badges b ON tu.UserId = b.UserId
+    WHERE b.TagBased = 0 OR b.Date > '2020-01-01'
+    GROUP BY tu.UserId
+),
+RecentPosts AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PreviousScore,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 0) AS PositiveComments
+    FROM Posts p
+    WHERE p.PostTypeId = 1  -- Questions
+      AND EXISTS (SELECT 1 FROM TopUsers tu WHERE tu.UserId = p.OwnerUserId)
+),
+AggregatedData AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.ReputationRank,
+        tu.UserLocation,
+        ub.BadgeCount,
+        ub.BadgeNames,
+        rp.PostId,
+        rp.Title,
+        rp.Score,
+        rp.ViewCount,
+        rp.PreviousScore,
+        rp.PositiveComments,
+        CASE 
+            WHEN rp.Score IS NULL THEN 0 
+            ELSE rp.Score * 1.5 + COALESCE(rp.PreviousScore, 0) 
+        END AS WeightedScore
+    FROM TopUsers tu
+    LEFT OUTER JOIN UserBadges ub ON tu.UserId = ub.UserId
+    LEFT OUTER JOIN RecentPosts rp ON tu.UserId = rp.UserId
+    WHERE tu.ReputationRank <= 50
+      AND (rp.PositiveComments > 5 OR rp.ViewCount > 10000)
+)
+SELECT 
+    ad.UserId,
+    ad.DisplayName,
+    ad.Reputation,
+    ad.ReputationRank,
+    ad.UserLocation,
+    ad.BadgeCount,
+    ad.BadgeNames,
+    ad.PostId,
+    ad.Title,
+    ad.Score,
+    ad.ViewCount,
+    ad.PreviousScore,
+    ad.PositiveComments,
+    ad.WeightedScore,
+    (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = ad.PostId AND v.VoteTypeId IN (8,9) AND v.BountyAmount IS NOT NULL) AS AvgBounty
+FROM AggregatedData ad
+UNION ALL
+SELECT 
+    NULL AS UserId,
+    'Anonymous' AS DisplayName,
+    0 AS Reputation,
+    0 AS ReputationRank,
+    'N/A' AS UserLocation,
+    0 AS BadgeCount,
+    NULL AS BadgeNames,
+    p.Id AS PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    NULL AS PreviousScore,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 0) AS PositiveComments,
+    p.Score * 2 AS WeightedScore,
+    NULL AS AvgBounty
+FROM Posts p
+WHERE p.OwnerUserId IS NULL
+  AND p.PostTypeId = 1
+  AND p.Score > 100
+ORDER BY Reputation DESC, WeightedScore DESC;

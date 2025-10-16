@@ -1,0 +1,141 @@
+-- {"query": "1335.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1714} 
+with recursive RecursiveTagHierarchy(tagid, parentid, depth) as (
+    select Id, null::int, 0 from Tags where IsRequired = 1
+    union all
+    select t.Id, r.tagid, r.depth + 1
+    from Tags t
+    join RecursiveTagHierarchy r on charindex('<' + t.TagName + '>', '') = 0 -- dummy join to cause full recursion
+),
+UserStats as (
+    select 
+        u.Id,
+        u.DisplayName,
+        coalesce(b.BadgeCount,0) as TotalBadges, 
+        u.Reputation, u.CreationDate,
+        u.Views, u.UpVotes, u.DownVotes,
+        count(distinct p.Id) over (partition by u.Id) as TotalPosts,
+        avg(length(p.Body)) over (partition by u.Id) as AvgPostBodyLength,
+        max(p.Score) filter (where p.PostTypeId = 1) over (partition by u.Id) as MaxQuestionScore,
+        rank() over (order by reput desc) as ReputationRank
+    from Users u
+    left join (
+        select UserId, count(*) as BadgeCount from Badges group by UserId
+    ) b on u.Id = b.UserId
+    left join Posts p on p.OwnerUserId = u.Id
+), 
+PostDetails as (
+    select
+       p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.AnswerCount,
+       coalesce(a.AcceptedState, 'None') as AcceptedStatus,
+       u.Id as OwnerId, u.DisplayName as OwnerName,
+       ph_postclosed.ClosedReason, ph_postclosed.ClosedDate,
+       rank() over (partition by p.PostTypeId order by p.Score desc) as ScoreRank,
+       count(c.ID) filter(where c.CreationDate > current_date - interval '90 days') over (partition by p.Id) as RecentCommentCount
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    left join (
+        select AcceptedAnswerId as Aid, 'Accepted' as AcceptedState from Posts where AcceptedAnswerId is not null
+    ) a on a.Aid = p.Id
+    left join (
+        select ph.PostId, prt.Name as ClosedReason, ph.CreationDate as ClosedDate
+        from PostHistory ph
+        left join PostHistoryTypes prt on ph.PostHistoryTypeId = prt.Id
+        where ph.PostHistoryTypeId = 10 -- Post Closed events
+    ) ph_postclosed on ph_postclosed.PostId = p.Id
+    left join Comments c on c.PostId = p.Id
+),
+RecentUserActivity as (
+    select
+        u.Id,
+        u.DisplayName,
+        max(p.CreationDate) as LastPostDate,
+        max(c.CreationDate) as LastCommentDate,
+        max(ph.CreationDate) as LastPostHistoryEdit,
+        count(p.Id) filter (where p.CreationDate > current_date - interval '30 days') as RecentPostsCount,
+        count(c.Id) filter (where c.CreationDate > current_date - interval '30 days') as RecentCommentsCount
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+UserRankedBadges as (
+    select BadgeId, UserId, Name, Class,
+     row_number() over (partition by UserId order by Date desc) as RN
+    from Badges
+),
+TopBadgesPerUser as (
+    select UserId, 
+       listagg(Name || '(' || Class || ')', ', ') within group (order by Date desc) as Badges,
+       count(*) as BadgeCount
+    from Badges 
+    group by UserId
+),
+DuplicatesAndLinks as (
+    select p.Id as QuestionId, pls_dup.RelatedPostId as DuplicateOfId,
+       pl_link.RelatedPostId as LinkedToId
+    from Posts p 
+    left join PostLinks pls_dup on pls_dup.PostId = p.Id and pls_dup.LinkTypeId = 3
+    left join PostLinks pl_link on pl_link.PostId = p.Id and pl_link.LinkTypeId = 1
+    where p.PostTypeId=1
+),
+DetailedUserScoreExpansion as (
+    select
+       u.Id,
+       u.DisplayName,
+       (u.UpVotes - u.DownVotes) as NetVotes,
+       (select count(vote.Id) from Votes vote where vote.PostId in 
+          (select p.Id from Posts p where p.OwnerUserId = u.Id) and vote.VoteTypeId=2) as TotalUpModVotes,
+       (select count(vote.Id) from Votes vote where vote.PostId in 
+          (select p.Id from Posts p where p.OwnerUserId = u.Id) and vote.VoteTypeId=3) as TotalDownModVotes,
+       coalesce(sum(p.Score), 0) as TotalPostScore,
+       coalesce(avg(p.Score), 0) as AvgPostScore,
+       max(p.Score) filter (where p.PostTypeId = 2) as MaxAnswerScore
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, u.UpVotes, u.DownVotes
+)
+select
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.Views,
+    r.LastPostDate,
+    r.LastCommentDate,
+    p.AggregatedTagSet,
+    u.Badges,
+    u.RankOrder,
+    row_number() over (order by u.Reputation desc, u.Views desc nulls last) as GlobalUserRank,
+    d.NetVotes,
+    d.TotalUpModVotes,
+    d.TotalDownModVotes,
+    d.TotalPostScore,
+    d.AvgPostScore,
+    d.MaxAnswerScore,
+    count(distinct pt.Id) filter (where pt.PostTypeId=1 and pt.Score > 10) as HighScoringQuestions,
+    count(distinct p.Id) filter (where p.AnswerCount > 5) as ActiveAnswerCount,
+    count(distinct link.LinkedToId) as LinkedQuestionsCount,
+    count(distinct dup.DuplicateOfId) as MarkedAsDuplicateCount,
+    case when r.LastPostDate is null then 'Inactive'
+         when r.LastPostDate > current_date - interval '30 day' then 'Active'
+         else 'Dormant' end as UserActivityCategory
+from Users u
+left join RecentUserActivity r on r.Id = u.Id
+left join UserRankedBadges ub on ub.UserId = u.Id and ub.RN = 1
+left join TopBadgesPerUser b on b.UserId = u.Id
+left join (
+    select p.OwnerUserId, string_agg(distinct replace(replace(trim(tg.TagName), ' ', '_'), '<','') , ',' order by tg.TagName) as AggregatedTagSet, p.Id
+    from Posts p 
+    cross join lateral unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><')) as tg(TagName)
+    group by p.OwnerUserId, p.Id
+) p on p.OwnerUserId = u.Id
+left join DetailedUserScoreExpansion d on d.Id = u.Id
+left join Posts pt on pt.OwnerUserId = u.Id
+left join DuplicatesAndLinks dup on dup.QuestionId = pt.Id
+left join DuplicatesAndLinks link on link.QuestionId = pt.Id
+group by u.Id, u.DisplayName, u.Reputation, u.Views, r.LastPostDate, r.LastCommentDate,
+b.Badges, u.Badges, u.RankOrder,
+d.NetVotes, d.TotalUpModVotes, d.TotalDownModVotes,
+d.TotalPostScore, d.AvgPostScore, d.MaxAnswerScore, p.AggregatedTagSet
+order by u.Reputation desc nulls last, u.Views desc nulls last
+limit 100;

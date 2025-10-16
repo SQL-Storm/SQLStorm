@@ -1,0 +1,94 @@
+-- {"query": "5089.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1117} 
+WITH TopUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS NumPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersGiven,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Id) AS rn
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(p.Id) > 10
+),
+UserBadges AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS TagBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserVotesAgg AS (
+    SELECT
+        p.OwnerUserId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteVotes
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY p.OwnerUserId
+),
+UserCommentActivity AS (
+    SELECT
+        c.UserId,
+        COUNT(*) AS CommentCount,
+        COALESCE(SUM(CASE WHEN c.Score > 0 THEN 1 ELSE 0 END), 0) AS PositiveComments,
+        MAX(c.Score) AS MaxCommentScore
+    FROM Comments c
+    GROUP BY c.UserId
+),
+ClosedQuestions AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(*) AS ClosedCount,
+        COUNT(DISTINCT CASE WHEN p.ClosedDate IS NOT NULL THEN p.Id END) AS UniqueClosed,
+        ARRAY_AGG(DISTINCT cr.Name) AS CloseReasons
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes cr ON cr.Id::varchar = ph.Comment
+    WHERE p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL
+    GROUP BY p.OwnerUserId
+)
+SELECT
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.NumPosts,
+    tu.QuestionsAsked,
+    tu.AnswersGiven,
+    COALESCE(ub.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ub.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ub.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(ub.TagBadges, 0) AS TagBadges,
+    COALESCE(uv.UpvotesReceived, 0) AS UpvotesReceived,
+    COALESCE(uv.DownvotesReceived, 0) AS DownvotesReceived,
+    COALESCE(uv.FavoriteVotes, 0) AS FavoriteVotes,
+    COALESCE(uca.CommentCount, 0) AS CommentsWritten,
+    COALESCE(uca.PositiveComments, 0) AS PositiveComments,
+    COALESCE(uca.MaxCommentScore, 0) AS MaxCommentScore,
+    cq.ClosedCount AS QuestionsClosed,
+    cq.UniqueClosed AS UniqueClosedQuestions,
+    COALESCE(cq.CloseReasons::text, '{}') AS CloseReasonNames,
+    ROUND(
+        (COALESCE(uv.UpvotesReceived,0)::float/(NULLIF(tu.NumPosts,0))) + 
+        (COALESCE(ub.GoldBadges,0) * 5 + COALESCE(ub.SilverBadges,0) * 2 + COALESCE(ub.BronzeBadges,0)) / NULLIF(tu.NumPosts,0) +
+        (COALESCE(uca.CommentCount,0)::float/NULLIF(tu.NumPosts,0))
+    ,2) AS UserScorePerformance,
+    CASE 
+        WHEN tu.Reputation > 10000 AND COALESCE(ub.GoldBadges,0) >= 5 THEN 'Legendary'
+        WHEN tu.Reputation > 5000 THEN 'Elite'
+        ELSE 'Rising Star'
+    END AS UserTier
+FROM TopUsers tu
+LEFT JOIN UserBadges ub ON ub.UserId = tu.UserId
+LEFT JOIN UserVotesAgg uv ON uv.OwnerUserId = tu.UserId
+LEFT JOIN UserCommentActivity uca ON uca.UserId = tu.UserId
+LEFT JOIN ClosedQuestions cq ON cq.OwnerUserId = tu.UserId
+WHERE tu.rn <= 100
+ORDER BY UserScorePerformance DESC, tu.Reputation DESC, tu.NumPosts DESC;

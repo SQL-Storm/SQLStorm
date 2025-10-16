@@ -1,0 +1,179 @@
+WITH ActiveUsers AS (
+    SELECT
+        Id AS UserId,
+        Reputation,
+        LastAccessDate,
+        UpVotes,
+        DownVotes,
+        Views,
+        COALESCE(AboutMe, '') AS AboutMe,
+        COALESCE(ProfileImageUrl, '') AS ProfileImageUrl,
+        COALESCE(WebsiteUrl, '') AS WebsiteUrl,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, LastAccessDate DESC) AS rank
+    FROM
+        Users
+    WHERE
+        Reputation > 1000
+        AND LastAccessDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 month')
+),
+TopPosts AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.OwnerUserId,
+        P.Title,
+        P.Body,
+        P.Tags,
+        P.AnswerCount,
+        P.CommentCount,
+        PT.Name AS PostTypeName,
+        COALESCE(P.LastEditorUserId, -1) AS LastEditorUserId,
+        P.LastEditDate,
+        COALESCE(P.LastEditorDisplayName, '') AS LastEditorDisplayName,
+        P.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.ViewCount DESC) AS post_rank
+    FROM
+        Posts P
+    JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    WHERE
+        P.PostTypeId IN (1, 2)
+        AND P.Score >= 10
+        AND P.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+),
+BadgesInfo AS (
+    SELECT
+        U.Id AS UserId,
+        B.Name AS BadgeName,
+        B.Class,
+        B.Date,
+        COUNT(B.Id) OVER (PARTITION BY U.Id, B.Class) AS BadgeCount,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) OVER (PARTITION BY U.Id) AS GoldBadges,
+        SUM(
+            CASE
+                WHEN B.Class = 1 THEN 3
+                WHEN B.Class = 2 THEN 2
+                ELSE 1
+            END
+        ) OVER (PARTITION BY U.Id) AS BadgeScore
+    FROM
+        Users U
+    JOIN Badges B ON U.Id = B.UserId
+    WHERE
+        B.Date >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months')
+),
+PopularTags AS (
+    SELECT
+        p.Id AS PostId,
+        TRIM(BOTH ' ' FROM tag) AS value
+    FROM
+        Posts p,
+        LATERAL (
+            SELECT regexp_split_to_table(
+                CASE
+                    WHEN p.Tags IS NOT NULL AND CHAR_LENGTH(p.Tags) >= 2 THEN substring(p.Tags from 2 for CHAR_LENGTH(p.Tags) - 2)
+                    ELSE ''
+                END,
+                '><'
+            ) AS tag
+        ) s
+),
+PostLinksRanked AS (
+    SELECT
+        PL.PostId,
+        CAST(PL.RelatedPostId AS VARCHAR(600)) AS spamPost_info,
+        LT.Name,
+        COALESCE(PL.Id, 0) AS relativePostID,
+        ROW_NUMBER() OVER (PARTITION BY PL.RelatedPostId ORDER BY PL.Id DESC) AS related_info_rank
+    FROM
+        PostLinks PL
+    JOIN LinkTypes LT ON PL.LinkTypeId = LT.Id
+    WHERE
+        PL.RelatedPostId IS NOT NULL
+)
+SELECT
+    U.UserId,
+    U.rank,
+    U.Reputation,
+    U.LastAccessDate,
+    U.AboutMe,
+    U.ProfileImageUrl,
+    U.WebsiteUrl,
+    U.Views,
+    U.UpVotes,
+    U.DownVotes,
+    TP.PostId,
+    TP.PostTypeName,
+    TP.Title,
+    TP.Score AS PostScore,
+    TP.ViewCount,
+    TP.AnswerCount,
+    TP.CommentCount,
+    TP.Body,
+    TP.LastActivityDate,
+    TP.LastEditorUserId,
+    TP.LastEditorDisplayName,
+    TP.post_rank,
+    BI.BadgeName,
+    BI.Class,
+    BI.BadgeCount,
+    BI.GoldBadges,
+    BI.BadgeScore,
+    COALESCE(V.PostId, -1) AS VotedPostId,
+    COALESCE(V.VoteTypeId, -1) AS VoteTypeId,
+    CASE
+        WHEN V.VoteTypeId IS NOT NULL THEN VT.Name
+        ELSE 'No Votes'
+    END AS VoteTypeName,
+    V.CreationDate AS VoteCreationDate,
+    CHAR_LENGTH(TP.Body) - CHAR_LENGTH(REPLACE(TP.Body, ' ', '')) + 1 AS WordCount,
+    CASE
+        WHEN POSITION('<a ' IN TP.Body) > 0 THEN 'Contains Links'
+        ELSE 'No Links'
+    END AS LinkStatus,
+    TT.Name AS TT_TagName,
+    T.Count AS T_Count,
+    (CASE
+        WHEN TP.Tags IS NOT NULL AND CHAR_LENGTH(TP.Tags) >= 2 THEN
+            (SELECT (regexp_split_to_array(substring(TP.Tags from 2 for CHAR_LENGTH(TP.Tags) - 2), '><'))[1])
+        ELSE NULL
+    END) AS FirstTagName,
+    popularTags.value AS SubsequenceFromTag,
+    PL.spamPost_info,
+    PL.Name AS LinkTypeName,
+    PH.PostHistoryTypeId,
+    PH.UserId AS PostHistoryUserId,
+    V.Id AS VoteId
+FROM
+    ActiveUsers U
+LEFT JOIN TopPosts TP
+    ON U.UserId = TP.OwnerUserId
+    AND TP.PostTypeId = 1
+    AND (CASE WHEN TP.Body LIKE '%<a %' THEN 'Yes' ELSE 'No' END) = 'No'
+LEFT JOIN PopularTags popularTags
+    ON popularTags.PostId = TP.PostId
+LEFT JOIN Votes V
+    ON TP.PostId = V.PostId
+LEFT JOIN VoteTypes VT
+    ON V.VoteTypeId = VT.Id
+LEFT JOIN Tags T
+    ON T.Id = TP.PostId
+LEFT JOIN Tags TT
+    ON TP.OwnerUserId = TT.Id
+LEFT JOIN PostLinksRanked PL
+    ON TP.PostId = PL.PostId AND PL.related_info_rank = 1
+LEFT JOIN BadgesInfo BI
+    ON U.UserId = BI.UserId
+LEFT JOIN PostHistory PH
+    ON TP.PostId = PH.PostId
+WHERE
+    PH.UserId = U.UserId
+    AND PH.PostHistoryTypeId IN (10, 14, 66)
+    AND TP.AnswerCount > 5
+    AND (CAST(TP.CommentCount AS NUMERIC) / NULLIF(CAST(TP.Score AS NUMERIC), 0)) > 0.5
+    AND (CHAR_LENGTH(TP.Body) - CHAR_LENGTH(REPLACE(TP.Body, ' ', '')) + 1) > 200
+ORDER BY
+    U.Reputation DESC,
+    TP.post_rank DESC;

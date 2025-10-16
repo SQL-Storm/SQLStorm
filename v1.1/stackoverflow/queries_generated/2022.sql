@@ -1,0 +1,56 @@
+-- {"query": "2022.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4o", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 360} 
+
+WITH RecentUsers AS (
+    SELECT 
+        Id, 
+        DisplayName, 
+        Reputation, 
+        RANK() OVER (ORDER BY CreationDate DESC) AS Rank
+    FROM 
+        Users
+)
+, UserBadgeCounts AS (
+    SELECT 
+        UserId, 
+        COUNT(*) AS BadgeCount, 
+        MAX(Date) AS LastBadgeDate
+    FROM 
+        Badges
+    GROUP BY 
+        UserId
+)
+, TopQuestions AS (
+    SELECT 
+        p.Id AS PostId, 
+        p.Title, 
+        u.DisplayName AS OwnerName, 
+        p.Score, 
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS Rank
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    WHERE 
+        p.PostTypeId = 1
+)
+SELECT 
+    ru.DisplayName, 
+    COALESCE(ubc.BadgeCount, 0) AS BadgeCount, 
+    tq.Title AS TopQuestionTitle, 
+    tjc.PostId AS RelatedTopQuestionId,
+    COALESCE(tq.Score, 0) AS TopQuestionScore
+FROM 
+    RecentUsers ru
+LEFT JOIN 
+    UserBadgeCounts ubc ON ru.Id = ubc.UserId
+LEFT JOIN 
+    TopQuestions tq ON ru.Id = tq.OwnerId AND tq.Rank = 1
+LEFT JOIN 
+    Posts tjc ON tjc.AcceptedAnswerId = tq.PostId
+WHERE 
+    ru.Rank <= 10
+AND 
+    (ubc.LastBadgeDate IS NOT NULL OR tq.Score > 10)
+ORDER BY 
+    ru.Reputation DESC, 
+    tq.Score DESC;

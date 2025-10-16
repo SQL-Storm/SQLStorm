@@ -1,0 +1,141 @@
+-- {"query": "493.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1325} 
+with RecursiveTagCounts as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount,0) as AnswerCount,
+        coalesce(p.ViewCount,0) as ViewCount,
+        row_number() over (partition by t.IsModeratorOnly order by t.Count desc, t.TagName) as TagRank
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+    where t.IsRequired = 0
+),
+UserBadgeSummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostActivityWindow as (
+    select
+        p.Id as PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        count(c.Id) as CommentCount,
+        sum(v.VoteTypeId = 2::smallint)::int as UpVotes,
+        sum(v.VoteTypeId = 3::smallint)::int as DownVotes,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate desc) as UserPostRank,
+        lag(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as PrevScore,
+        lead(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as NextScore
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    left join Comments c on c.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    where p.PostTypeId = 1
+    group by p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.OwnerUserId, u.DisplayName
+),
+DuplicateLinkCounts as (
+    select
+        pl.PostId,
+        count(distinct pl.RelatedPostId) filter (where lt.Name = 'Duplicate') as DuplicateCount
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+),
+CloseReasonSummary as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        count(*) as CloseVotes
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId
+    join CloseReasonTypes crt on crt.Id::varchar = ph.Comment
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId, crt.Name
+),
+TopUsersWithBadges as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.ProfileImageUrl,
+        u.EmailHash,
+        u.AccountId,
+        coalesce(ubs.GoldBadges,0) as GoldBadges,
+        coalesce(ubs.SilverBadges,0) as SilverBadges,
+        coalesce(ubs.BronzeBadges,0) as BronzeBadges,
+        coalesce(ubs.LastBadgeDate, timestamp '1970-01-01') as LastBadgeDate,
+        rank() over (order by u.Reputation desc, u.Views desc) as UserRank
+    from Users u
+    left join UserBadgeSummary ubs on ubs.UserId = u.Id
+    where u.Reputation > 10000
+)
+select
+    p.PostId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.OwnerUserId,
+    p.OwnerName,
+    p.CommentCount,
+    p.UpVotes,
+    p.DownVotes,
+    coalesce(dl.DuplicateCount,0) as DuplicateLinks,
+    coalesce(crs.CloseReason, 'Open') as CloseReason,
+    coalesce(crs.CloseVotes, 0) as CloseVotes,
+    tc.TagName,
+    tc.Count as TagGlobalCount,
+    tc.AnswerCount as TagAnswerCount,
+    tc.ViewCount as TagViewCount,
+    tc.TagRank,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.LastBadgeDate,
+    ubs.UserRank,
+    case
+        when p.Score > 100 then 'High Score'
+        when p.Score between 50 and 100 then 'Medium Score'
+        else 'Low Score'
+    end as ScoreCategory,
+    case
+        when p.ViewCount > 10000 then 'High Views'
+        when p.ViewCount between 1000 and 10000 then 'Medium Views'
+        else 'Low Views'
+    end as ViewCategory,
+    coalesce(p.PrevScore,0) as PreviousPostScore,
+    coalesce(p.NextScore,0) as NextPostScore,
+    concat_ws(' | ',
+        coalesce(p.OwnerName, 'Anonymous'),
+        coalesce(tc.TagName, 'NoTag'),
+        coalesce(crs.CloseReason, 'Open')
+    ) as CompositeInfo
+from PostActivityWindow p
+left join DuplicateLinkCounts dl on dl.PostId = p.PostId
+left join CloseReasonSummary crs on crs.PostId = p.PostId
+left join RecursiveTagCounts tc on position(concat('<', tc.TagName, '>') in coalesce(p.Tags, '')) > 0
+left join TopUsersWithBadges ubs on ubs.Id = p.OwnerUserId
+where p.UserPostRank <= 5
+  and (p.Score > 0 or p.ViewCount > 1000)
+order by ubs.UserRank, p.Score desc, p.ViewCount desc
+limit 100;

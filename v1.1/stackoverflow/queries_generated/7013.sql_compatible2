@@ -1,0 +1,226 @@
+with
+user_activity as (
+  select
+    u.id,
+    u.displayname,
+    u.reputation,
+    count(distinct p.id) filter (where p.posttypeid = 1) as questions_asked,
+    count(distinct p.id) filter (where p.posttypeid = 2) as answers_posted,
+    count(distinct c.id) as comments_made,
+    count(distinct v.id) filter (where v.votetypeid = 2) as upvotes_received,
+    count(distinct b.id) as badges_earned,
+    greatest(1, date_part('day', cast('2024-10-01 12:34:56' as timestamp) - u.creationdate)) as days_alive,
+    (
+      coalesce(u.reputation,0) * 0.2
+      + coalesce(count(distinct p.id) filter (where p.posttypeid = 2),0) * 3.5
+      + coalesce(count(distinct p.id) filter (where p.posttypeid = 1),0) * 1.5
+      + coalesce(count(distinct c.id),0) * 0.5
+      + coalesce(count(distinct v.id) filter (where v.votetypeid = 2),0) * 2.0
+      + coalesce(count(distinct b.id),0) * 4.0
+    ) / greatest(1, date_part('day', cast('2024-10-01 12:34:56' as timestamp) - u.creationdate)) as composite_per_day
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join comments c on c.userid = u.id
+  left join votes v on v.userid = u.id
+  left join badges b on b.userid = u.id
+  group by u.id, u.displayname, u.reputation, u.creationdate
+),
+top_users as (
+  select *
+  from user_activity
+  order by composite_per_day desc nulls last
+  limit 200
+),
+recent_questions as (
+  select
+    p.*,
+    case when p.tags is null then array[]::text[] else string_to_array(substring(p.tags from 2 for char_length(p.tags)-2), '><') end as tag_array,
+    lower(regexp_replace(coalesce(p.title,''), '&[^;]+;', '', 'g')) as norm_title
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate > cast('2024-10-01 12:34:56' as timestamp) - interval '730 day'
+),
+question_stats as (
+  select
+    q.id as question_id,
+    q.title,
+    q.owneruserid,
+    q.creationdate,
+    q.score,
+    q.viewcount,
+    q.tag_array,
+    q.norm_title,
+    count(a.id) filter (where a.posttypeid = 2) as answers_count,
+    sum(case when a.score is null then 0 else a.score end) as answers_score_sum,
+    max(a.score) as best_answer_score,
+    bool_or(a.id = q.acceptedanswerid) as has_accepted,
+    coalesce(q.answercount, count(a.id) filter (where a.posttypeid = 2)) as recorded_answercount,
+    coalesce(avg(c.score),0) as avg_comment_score,
+    (
+      select count(*) from posts a2 where a2.parentid = q.id and a2.posttypeid = 2 and a2.score >= 0
+    ) as nonneg_answer_count
+  from recent_questions q
+  left join posts a on a.parentid = q.id and a.posttypeid = 2
+  left join comments c on c.postid = q.id
+  group by q.id, q.title, q.owneruserid, q.creationdate, q.score, q.viewcount, q.tag_array, q.norm_title, q.answercount, q.acceptedanswerid
+),
+post_links_expanded as (
+  select pl.*,
+    p1.posttypeid as post_posttype,
+    p2.posttypeid as related_posttype,
+    p1.title as post_title,
+    p2.title as related_title
+  from postlinks pl
+  left join posts p1 on p1.id = pl.postid
+  left join posts p2 on p2.id = pl.relatedpostid
+  where pl.creationdate > cast('2024-10-01 12:34:56' as timestamp) - interval '365 day'
+),
+tag_pairs as (
+  select
+    q.question_id,
+    trim(t1) as tag1,
+    trim(t2) as tag2
+  from question_stats q
+  cross join lateral (
+    select unnest(q.tag_array) as t1
+  ) ta1
+  cross join lateral (
+    select unnest(q.tag_array) as t2
+  ) ta2
+  where ta1.t1 <> ta2.t2
+),
+tag_cooccurrence as (
+  select tag1, tag2, count(distinct question_id) as cooc_count
+  from tag_pairs
+  group by tag1, tag2
+  having count(distinct question_id) >= 3
+),
+user_answer_behavior as (
+  select
+    tu.id as userid,
+    tu.displayname,
+    count(a.id) as answers_by_user,
+    sum(case when a.creationdate > cast('2024-10-01 12:34:56' as timestamp) - interval '365 day' then 1 else 0 end) as recent_answers,
+    avg(a.score) as avg_answer_score,
+    sum(case when a.id = q.acceptedanswerid then 1 else 0 end) as accepted_count,
+    max(a.score) as max_answer_score,
+    (
+      select array_agg(t order by cnt desc, t)
+      from (
+        select t as t, count(*) as cnt
+        from (
+          select unnest(
+            case
+              when q.tags is null then array[]::text[]
+              when left(q.tags,1) = '<' and right(q.tags,1) = '>' then string_to_array(substring(q.tags from 2 for char_length(q.tags)-2),'><')
+              else string_to_array(q.tags, ',')
+            end
+          ) as t
+          from posts p2
+          join posts a2 on a2.parentid = p2.id and a2.owneruserid = tu.id and a2.posttypeid = 2
+          join posts q on q.id = p2.id
+          where a2.owneruserid = tu.id
+        ) s
+        group by t
+        order by cnt desc, t
+        limit 5
+      ) tt
+    ) as top_answer_tags
+  from top_users tu
+  left join posts a on a.owneruserid = tu.id and a.posttypeid = 2
+  left join posts q on q.id = a.parentid
+  group by tu.id, tu.displayname
+),
+hot_questions as (
+  select
+    qs.*,
+    (
+      coalesce(qs.viewcount,0) * 0.002
+      + coalesce(qs.score,0) * 1.5
+      + coalesce(qs.answers_count,0) * 2.0
+      + case when qs.has_accepted then 5 else 0 end
+      + (case when qs.creationdate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 day' then 10 else 0 end)
+    ) as hotness_score,
+    row_number() over (order by
+      (
+        coalesce(qs.viewcount,0) * 0.002
+        + coalesce(qs.score,0) * 1.5
+        + coalesce(qs.answers_count,0) * 2.0
+        + case when qs.has_accepted then 5 else 0 end
+        + (case when qs.creationdate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 day' then 10 else 0 end)
+      ) desc
+    ) as hot_rank
+  from question_stats qs
+),
+commenter_clusters as (
+  select
+    c.userid,
+    u.displayname,
+    count(*) as comments_total,
+    avg(c.score) as avg_comment_score,
+    min(c.creationdate) as first_comment,
+    max(c.creationdate) as last_comment,
+    sum(case when c.postid in (select question_id from hot_questions where hot_rank <= 500) then 1 else 0 end) as comments_on_hot
+  from comments c
+  left join users u on u.id = c.userid
+  group by c.userid, u.displayname
+  having count(*) >= 20
+)
+select
+  tu.id as user_id,
+  tu.displayname as user_name,
+  tu.composite_per_day,
+  ua.answers_by_user,
+  ua.recent_answers,
+  ua.accepted_count,
+  ua.avg_answer_score,
+  ua.top_answer_tags,
+  coalesce((
+    select count(*) from posts a
+    join hot_questions hq on hq.question_id = a.parentid
+    where a.owneruserid = tu.id and a.posttypeid = 2 and hq.hot_rank <= 100
+  ),0) as answers_to_top100_hot,
+  coalesce((
+    select count(*) from posts a
+    join posts q on q.id = a.parentid
+    where a.owneruserid = tu.id and a.posttypeid = 2
+      and a.id = q.acceptedanswerid
+      and (
+        case when ua.top_answer_tags is null or (array_length(ua.top_answer_tags,1) is null) then false
+             else (
+               case
+                 when q.tags is null then false
+                 when left(q.tags,1) = '<' and right(q.tags,1) = '>' then ua.top_answer_tags[1] = any(string_to_array(substring(q.tags from 2 for char_length(q.tags)-2),'><'))
+                 else ua.top_answer_tags[1] = any(string_to_array(q.tags,','))
+               end
+             )
+        end
+      )
+  ),0) as accepted_on_top_tag_questions,
+  coalesce((
+    select count(*) from post_links_expanded ple
+    where ple.linktypeid = 3
+      and (ple.postid in (select id from posts where owneruserid = tu.id) or ple.relatedpostid in (select id from posts where owneruserid = tu.id))
+  ),0) as duplicates_involving_user_posts,
+  coalesce((
+    select count(*) from tag_cooccurrence tc
+    where ua.top_answer_tags is not null and (array_length(ua.top_answer_tags,1) is not null)
+      and (tc.tag1 = ua.top_answer_tags[1] or tc.tag2 = ua.top_answer_tags[1])
+  ),0) as cooccurrence_diversity,
+  coalesce((
+    select round(corr_rank::numeric,3) from (
+      select corr(r1, r2) over () as corr_rank
+      from (
+        select dense_rank() over (order by a.score desc) as r1,
+               dense_rank() over (order by h.hotness_score desc) as r2
+        from posts a
+        left join hot_questions h on h.question_id = a.parentid
+        where a.owneruserid = tu.id and a.posttypeid = 2 and h.hot_rank <= 1000
+      ) s
+    ) x fetch first 1 row only
+  ),0) as approx_rank_correlation
+from top_users tu
+left join user_answer_behavior ua on ua.userid = tu.id
+left join commenter_clusters cc on cc.userid = tu.id
+order by tu.composite_per_day desc
+limit 100;

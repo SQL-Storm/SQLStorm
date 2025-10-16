@@ -1,0 +1,182 @@
+-- {"query": "1371.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1960} 
+
+WITH recursive_post_cte AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.CreationDate,
+        p.AcceptedAnswerId,
+        CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END AS IsQuestion,
+        0 AS Depth
+    FROM Posts p
+    WHERE p.PostTypeId = 1 -- initial questions only
+    UNION ALL
+    SELECT
+        c.Id,
+        c.PostTypeId,
+        c.Title,
+        c.OwnerUserId,
+        c.Score,
+        c.ViewCount,
+        c.Tags,
+        c.CreationDate,
+        c.AcceptedAnswerId,
+        0,
+        cpct.Depth + 1
+    FROM Posts c
+    JOIN recursive_post_cte cpct ON c.ParentId = cpct.Id
+    WHERE c.PostTypeId = 2 -- answers attached to questions
+),
+answer_ranks AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score,
+        a.CreationDate,
+        RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate) AS ScoreRank,
+        COUNT(DISTINCT v.Id) FILTER (WHERE vt.Name = 'UpMod') AS UpVotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE vt.Name = 'DownMod') AS DownVotes,
+        AVG(COALESCE(u.Reputation,0)) OVER (PARTITION BY a.ParentId) AS AvgAnswererRep
+    FROM Posts a
+    LEFT JOIN Votes v ON v.PostId = a.Id
+    LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    LEFT JOIN Users u ON u.Id = a.OwnerUserId
+    WHERE a.PostTypeId = 2
+    GROUP BY a.Id, a.ParentId, a.Score, a.CreationDate
+),
+top_answers AS (
+    SELECT DISTINCT
+        QuestionId,
+        AnswerId
+    FROM answer_ranks
+    WHERE ScoreRank <= 3
+),
+user_badge_summary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id) FILTER(WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER(WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER(WHERE b.Class = 3) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+question_activity_window AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.ViewCount,
+        p.Score,
+        count(distinct c.Id) AS CommentCount,
+        count(distinct coalesce(vp.Id,0)) AS TotalVotes,
+        count(distinct v_up.Id) AS UpVotes,
+        count(distinct v_down.Id) AS DownVotes,
+        ROW_NUMBER() OVER (ORDER BY p.ViewCount DESC, p.Score DESC) AS PopularityRank,
+        udf.LastBadgeDate,
+        LEAD(p.LastActivityDate) OVER (ORDER BY p.LastActivityDate) AS NextActivity,
+        LAG(p.LastActivityDate) OVER (ORDER BY p.LastActivityDate) AS PrevActivity
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Votes vp ON vp.PostId = p.Id
+    LEFT JOIN VoteTypes vtp ON vtp.Id = vp.VoteTypeId
+    LEFT JOIN Votes v_up ON v_up.PostId = p.Id AND v_up.VoteTypeId = (SELECT Id FROM VoteTypes WHERE Name='UpMod' LIMIT 1)
+    LEFT JOIN Votes v_down ON v_down.PostId = p.Id AND v_down.VoteTypeId = (SELECT Id FROM VoteTypes WHERE Name='DownMod' LIMIT 1)
+    LEFT JOIN user_badge_summary udf ON udf.UserId = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.Tags, p.ViewCount, p.Score, p.LastActivityDate, udf.LastBadgeDate
+),
+duplicate_links AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        CASE WHEN lt.Name = 'Duplicate' THEN 1 ELSE 0 END AS IsDuplicate
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE lt.Name = 'Duplicate'
+),
+complex_posts_info AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.Tags,
+        q.Score,
+        q.ViewCount,
+        rb.Name AS CloseReason,
+        json_agg(DISTINCT bl.RelatedPostId) FILTER (WHERE bl.IsDuplicate = 1) AS DuplicateTargets,
+        (SELECT array_agg(b.Name ORDER BY b.Date DESC) FROM Badges b WHERE b.UserId = q.OwnerUserId AND b.Class = 1) AS GoldBadgeNames,
+        (SELECT STRING_AGG(ch.Comment, ' ||| ') 
+         FROM PostHistory ch 
+         WHERE ch.PostId = q.Id AND ch.PostHistoryTypeId = 10 AND ch.Comment IS NOT NULL) AS CloseComments,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY aw.ScoreRank) AS AnswerOrder
+    FROM Posts q
+    LEFT JOIN PostHistory ph ON ph.PostId = q.Id AND ph.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes rb ON rb.Id = try_cast(ph.Comment AS smallint)
+    LEFT JOIN duplicate_links bl ON bl.PostId = q.Id
+    LEFT JOIN answer_ranks aw ON aw.QuestionId = q.Id
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.Tags, q.Score, q.ViewCount, rb.Name
+)
+SELECT
+    cpi.QuestionId,
+    cpi.Title,
+    cpi.Tags,
+    cpi.Score,
+    cpi.ViewCount,
+    coalesce(cpi.CloseReason, 'Open') AS CloseReasonText,
+    coalesce(array_length(cpi.DuplicateTargets,1), 0) AS NumDuplicates,
+    coalesce(array_length(cpi.GoldBadgeNames,1), 0) AS GoldBadgesForOwner,
+    substring(regexp_replace(cpi.CloseComments,'\s+',' ','g') from 1 for 200) AS CloseCommentsSample,
+    cpi.AnswerOrder,
+    COALESCE((SELECT COUNT(*) FROM Comments c WHERE c.PostId = cpi.QuestionId AND c.Text ~* '[a-zA-Z]{7,}'), 0) AS LongWordComments,
+    (CASE WHEN cpi.Score > 100 AND cpi.ViewCount > 10000 THEN 
+        concat('🔥 High impact: ', cpi.Title)
+     ELSE
+        concat('Info: ', left(cpi.Title, 50))
+     END) AS PostTitleLabel,
+    COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) OVER (PARTITION BY cpi.QuestionId) AS NumEdits,
+    SUM(vp.BountyAmount) FILTER (WHERE vp.BountyAmount IS NOT NULL) OVER (PARTITION BY cpi.QuestionId) AS TotalBounty,
+    COUNT(DISTINCT v.Id) FILTER (WHERE vt.Name='UpMod') AS QuestionUpvotes,
+    COUNT(DISTINCT v.Id) FILTER (WHERE vt.Name='DownMod') AS QuestionDownvotes,
+    AVG(u.Reputation) OVER () AS AvgReputationUsers,
+    MAX(us.MaxScore) FILTER (WHERE us.PostTypeId = 2 AND us.ParentId = cpi.QuestionId) AS MaxAnswerScore,
+    ROW_NUMBER() OVER (PARTITION BY cpi.CloseReason ORDER BY cpi.ViewCount DESC) AS ClosedReasonPopularityOrder
+FROM complex_posts_info cpi
+LEFT JOIN PostHistory ph ON ph.PostId = cpi.QuestionId
+LEFT JOIN Votes v ON v.PostId = cpi.QuestionId
+LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+LEFT JOIN Posts us ON us.ParentId = cpi.QuestionId AND us.PostTypeId = 2
+LEFT JOIN (
+    SELECT 
+        u.Id,
+        u.Reputation,
+        MAX(p.Score) AS MaxScore,
+        p.PostTypeId,
+        p.ParentId
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.Reputation, p.PostTypeId, p.ParentId
+) u ON u.Id = cpi.QuestionId
+LEFT JOIN Votes vp ON vp.PostId = cpi.QuestionId AND vp.VoteTypeId = (SELECT Id FROM VoteTypes WHERE Name = 'BountyClose' LIMIT 1)
+GROUP BY
+    cpi.QuestionId,
+    cpi.Title,
+    cpi.Tags,
+    cpi.Score,
+    cpi.ViewCount,
+    cpi.CloseReason,
+    cpi.DuplicateTargets,
+    cpi.GoldBadgeNames,
+    cpi.CloseComments,
+    cpi.AnswerOrder
+ORDER BY cpi.ViewCount DESC NULLS LAST
+LIMIT 100;

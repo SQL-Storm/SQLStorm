@@ -1,0 +1,98 @@
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.CreationDate,
+      ph.PostHistoryTypeId,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6)
+  ),
+  UserContributionSummary AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT p.Id) AS TotalPosts,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersGiven,
+      COUNT(DISTINCT b.Id) AS BadgesEarned,
+      MAX(u.Reputation) AS MaxReputation
+    FROM Users u
+    LEFT JOIN Posts p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b
+      ON u.Id = b.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName
+  ),
+  TagPopularity AS (
+    SELECT
+      t.TagName,
+      COUNT(DISTINCT p.Id) AS PostsWithTag,
+      AVG(p.Score) AS AverageTagScore,
+      SUM(CASE WHEN p.OwnerUserId IS NOT NULL AND p.OwnerUserId != -1 THEN 1 ELSE 0 END) AS UserOwnedTagPosts
+    FROM Tags t
+    JOIN Posts p
+      ON t.TagName = SUBSTRING(p.Tags FROM 2 FOR (POSITION('>' IN p.Tags) - 2))
+    WHERE
+      p.PostTypeId = 1
+    GROUP BY
+      t.TagName
+  ),
+  RecentQuestions AS (
+    SELECT
+      Id,
+      Title,
+      OwnerUserId,
+      AcceptedAnswerId,
+      AnswerCount,
+      CreationDate,
+      Score,
+      Tags,
+      DENSE_RANK() OVER (ORDER BY Score DESC, AnswerCount DESC) AS QuestionRank
+    FROM Posts
+    WHERE
+      PostTypeId = 1
+      AND CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 months')
+  )
+SELECT
+  rq.Title AS RecentQuestionTitle,
+  ucs.DisplayName AS QuestionOwner,
+  COALESCE(rq.AnswerCount, 0) AS AnswerCount,
+  COALESCE(rpe.PostHistoryTypeId, 0) AS LastEditType,
+  tp.TagName,
+  tp.AverageTagScore,
+  COALESCE(ucs.BadgesEarned, 0) AS OwnerBadges,
+  COALESCE(ucs.MaxReputation, 0) AS OwnerMaxReputation,
+  CASE
+    WHEN tp.UserOwnedTagPosts > tp.PostsWithTag * 0.7 THEN 'Community Dominant'
+    WHEN tp.UserOwnedTagPosts < tp.PostsWithTag * 0.3 THEN 'User Dominant'
+    ELSE 'Mixed Dominance'
+  END AS TagOwnershipStyle
+FROM RecentQuestions rq
+JOIN UserContributionSummary ucs
+  ON rq.OwnerUserId = ucs.UserId
+LEFT JOIN RankedPostEdits rpe
+  ON rq.Id = rpe.PostId AND rpe.rn = 1
+LEFT JOIN TagPopularity tp
+  ON SUBSTRING(rq.Tags FROM 2 FOR (POSITION('>' IN rq.Tags) - 2)) = tp.TagName
+WHERE
+  rq.QuestionRank <= 100
+  AND ucs.TotalPosts > 10
+  AND tp.PostsWithTag > 50
+UNION ALL
+SELECT
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL
+FROM Posts p
+WHERE
+  p.Id < 0;

@@ -1,0 +1,155 @@
+-- {"query": "17096.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 226495, "output_tokens": 223883} 
+
+WITH UserActivityMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        AVG(CASE WHEN p.Score IS NOT NULL THEN p.Score ELSE 0 END) as AvgPostScore,
+        MAX(p.Score) as MaxPostScore,
+        SUM(COALESCE(p.ViewCount, 0)) as TotalViews,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) as MedianScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= CURRENT_DATE - INTERVAL '2 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TagExpertise AS (
+    SELECT 
+        p.OwnerUserId,
+        TRIM(BOTH '<>' FROM unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'))) as Tag,
+        COUNT(*) as TagPostCount,
+        SUM(p.Score) as TagTotalScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY SUM(p.Score) DESC) as TagRank
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL 
+        AND p.OwnerUserId IS NOT NULL
+        AND p.PostTypeId IN (1, 2)
+    GROUP BY p.OwnerUserId, Tag
+),
+RecentEngagement AS (
+    SELECT 
+        ph.UserId,
+        COUNT(DISTINCT ph.PostId) as EditedPosts,
+        COUNT(DISTINCT CASE 
+            WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.PostId 
+        END) as ContentEdits,
+        STRING_AGG(DISTINCT 
+            CASE 
+                WHEN ph.Comment LIKE '%duplicate%' THEN 'DUP'
+                WHEN ph.Comment LIKE '%off-topic%' THEN 'OT'
+                WHEN ph.Comment LIKE '%unclear%' THEN 'UC'
+                ELSE SUBSTRING(COALESCE(ph.Comment, ''), 1, 10)
+            END, ' | ' 
+            ORDER BY CASE 
+                WHEN ph.Comment LIKE '%duplicate%' THEN 'DUP'
+                WHEN ph.Comment LIKE '%off-topic%' THEN 'OT'
+                WHEN ph.Comment LIKE '%unclear%' THEN 'UC'
+                ELSE SUBSTRING(COALESCE(ph.Comment, ''), 1, 10)
+            END
+        ) as EditReasons
+    FROM PostHistory ph
+    WHERE ph.CreationDate >= CURRENT_DATE - INTERVAL '90 days'
+        AND ph.UserId IS NOT NULL
+    GROUP BY ph.UserId
+),
+BadgeAchievements AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) as GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) as SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) as BronzeBadges,
+        MAX(b.Date) as LastBadgeDate,
+        LEAD(b.Date) OVER (PARTITION BY b.UserId ORDER BY b.Date) - b.Date as TimeToBadge
+    FROM Badges b
+    GROUP BY b.UserId, b.Date
+)
+SELECT 
+    uam.DisplayName,
+    COALESCE(uam.Reputation, 0) as Reputation,
+    COALESCE(uam.PostCount, 0) as TotalPosts,
+    CASE 
+        WHEN uam.QuestionCount > 0 AND uam.AnswerCount > 0 
+        THEN ROUND(uam.AnswerCount::numeric / uam.QuestionCount, 2)
+        ELSE NULL 
+    END as AnswerToQuestionRatio,
+    ROUND(COALESCE(uam.AvgPostScore, 0)::numeric, 2) as AvgScore,
+    COALESCE(uam.MaxPostScore, 0) as MaxScore,
+    COALESCE(uam.MedianScore, 0) as MedianScore,
+    COALESCE(
+        (SELECT STRING_AGG(te.Tag || ':' || te.TagTotalScore, ', ' ORDER BY te.TagRank)
+         FROM TagExpertise te 
+         WHERE te.OwnerUserId = uam.Id AND te.TagRank <= 3),
+        'No Tags'
+    ) as TopThreeTags,
+    COALESCE(re.EditedPosts, 0) as RecentEdits,
+    COALESCE(NULLIF(re.EditReasons, ''), 'None') as EditPatterns,
+    COALESCE(ba_agg.GoldBadges, 0) || '/' || 
+    COALESCE(ba_agg.SilverBadges, 0) || '/' || 
+    COALESCE(ba_agg.BronzeBadges, 0) as BadgeDistribution,
+    CASE 
+        WHEN ba_agg.LastBadgeDate IS NOT NULL 
+        THEN EXTRACT(DAY FROM CURRENT_DATE - ba_agg.LastBadgeDate) || ' days ago'
+        ELSE 'Never' 
+    END as LastBadgeEarned,
+    DENSE_RANK() OVER (
+        ORDER BY 
+            uam.Reputation DESC NULLS LAST,
+            uam.PostCount DESC NULLS LAST
+    ) as OverallRank,
+    CASE 
+        WHEN uam.TotalViews > 1000000 THEN 'Viral Creator'
+        WHEN uam.MaxPostScore > 100 THEN 'High Impact'
+        WHEN COALESCE(re.ContentEdits, 0) > 50 THEN 'Active Editor'
+        WHEN COALESCE(ba_agg.GoldBadges, 0) > 5 THEN 'Gold Collector'
+        WHEN uam.AnswerCount > uam.QuestionCount * 2 THEN 'Answer Specialist'
+        WHEN uam.QuestionCount > uam.AnswerCount * 2 THEN 'Question Asker'
+        ELSE 'Regular Contributor'
+    END as UserCategory,
+    EXISTS (
+        SELECT 1 
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = uam.Id 
+            AND p2.CommunityOwnedDate IS NOT NULL
+    ) as HasCommunityWikiPosts,
+    (
+        SELECT COUNT(DISTINCT c.Id)
+        FROM Comments c
+        INNER JOIN Posts cp ON c.PostId = cp.Id
+        WHERE c.UserId = uam.Id
+            AND cp.OwnerUserId != uam.Id
+            AND c.Score > 5
+            AND c.Text NOT LIKE '%thanks%'
+            AND c.Text NOT LIKE '%welcome%'
+            AND LENGTH(c.Text) > 50
+    ) as HelpfulCommentsOnOthersPosts
+FROM UserActivityMetrics uam
+LEFT JOIN RecentEngagement re ON uam.Id = re.UserId
+LEFT JOIN (
+    SELECT 
+        UserId, 
+        MAX(GoldBadges) as GoldBadges,
+        MAX(SilverBadges) as SilverBadges, 
+        MAX(BronzeBadges) as BronzeBadges,
+        MAX(LastBadgeDate) as LastBadgeDate
+    FROM BadgeAchievements
+    GROUP BY UserId
+) ba_agg ON uam.Id = ba_agg.UserId
+WHERE uam.Reputation > 100
+    AND (uam.PostCount > 5 OR COALESCE(re.EditedPosts, 0) > 10)
+    AND uam.DisplayName IS NOT NULL
+    AND NOT EXISTS (
+        SELECT 1 
+        FROM Votes v 
+        WHERE v.UserId = uam.Id 
+            AND v.VoteTypeId IN (4, 12)
+            AND v.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+    )
+ORDER BY 
+    OverallRank,
+    uam.TotalViews DESC NULLS LAST,
+    COALESCE(ba_agg.GoldBadges, 0) + COALESCE(ba_agg.SilverBadges, 0) * 0.5 + COALESCE(ba_agg.BronzeBadges, 0) * 0.25 DESC
+LIMIT 100;

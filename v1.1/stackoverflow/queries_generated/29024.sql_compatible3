@@ -1,0 +1,233 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views AS ViewCount,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Expert'
+            WHEN u.Reputation > 1000 THEN 'Advanced'
+            ELSE 'Beginner'
+        END AS ReputationLevel
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate > DATE '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        p.PostTypeId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostType,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank,
+        CASE 
+            WHEN p.Score > 100 THEN 'High Impact'
+            WHEN p.Score > 50 THEN 'Medium Impact'
+            ELSE 'Low Impact'
+        END AS ImpactLevel
+    FROM Posts p
+    WHERE p.CreationDate > DATE '2020-01-01'
+      AND p.Score > 0
+),
+PostActivity AS (
+    SELECT 
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId,
+        ph.Comment,
+        ph.Text,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (1, 4, 6) THEN 'Title/Tag Edit'
+            WHEN ph.PostHistoryTypeId IN (2, 5) THEN 'Body Edit'
+            WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 'State Change'
+            ELSE 'Other'
+        END AS ActivityType,
+        LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PreviousActivityDate,
+        EXTRACT(EPOCH FROM (ph.CreationDate - LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate)))/86400.0 AS DaysSinceLastActivity
+    FROM PostHistory ph
+    WHERE ph.CreationDate > DATE '2020-01-01'
+),
+TagUsage AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END AS PopularityLevel,
+        NTILE(4) OVER (ORDER BY t.Count) AS Quartile,
+        RANK() OVER (ORDER BY t.Count DESC) AS PopularityRank
+    FROM Tags t
+),
+UserEngagement AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN p.Id IS NOT NULL AND p.PostTypeId = 1 THEN p.Id END) AS PostedQuestions,
+        COUNT(DISTINCT CASE WHEN p.Id IS NOT NULL AND p.PostTypeId = 2 THEN p.Id END) AS PostedAnswers,
+        COUNT(DISTINCT CASE WHEN v.PostId IS NOT NULL AND v.VoteTypeId IN (2, 3) THEN v.PostId END) AS VotedPosts,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesReceived,
+        COUNT(DISTINCT CASE WHEN b.Id IS NOT NULL THEN b.Id END) AS BadgesEarned
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1, 2)
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+PostTags AS (
+    -- split Tags string like '<tag1><tag2>' into rows in a dialect-independent way
+    SELECT
+        tp.PostId,
+        TRIM(BOTH '<>' FROM part) AS Tag
+    FROM (
+        SELECT
+            p.Id AS PostId,
+            -- replace angle brackets with a delimiter and remove leading/trailing delimiters
+            REGEXP_REPLACE(p.Tags, '^<|>$', '', 'g') AS tags_trimmed
+        FROM TopPosts p
+    ) p0,
+    LATERAL (
+        SELECT value AS part
+        FROM (SELECT regexp_split_to_array(p0.tags_trimmed, '><') AS arr) arrs,
+        UNNEST(arrs.arr) AS value
+    ) parts
+),
+ComplexQuery AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.ViewCount,
+        us.PostCount,
+        us.CommentCount,
+        us.BadgeCount,
+        us.ReputationRank,
+        us.ReputationLevel,
+        tp.Title,
+        tp.Score,
+        tp.ViewCount AS PostViewCount,
+        tp.PostType,
+        tp.ScoreRank,
+        tp.ImpactLevel,
+        pa.ActivityType,
+        pa.DaysSinceLastActivity,
+        tu.TagName,
+        tu.Count AS TagCount,
+        tu.PopularityLevel,
+        uen.PostedQuestions,
+        uen.PostedAnswers,
+        uen.VotedPosts,
+        uen.UpvotesReceived,
+        uen.DownvotesReceived,
+        uen.BadgesEarned,
+        CASE 
+            WHEN us.PostCount > 0 THEN (us.CommentCount * 100.0 / NULLIF(us.PostCount, 0))
+            ELSE 0
+        END AS CommentsPerPost,
+        CASE 
+            WHEN us.ViewCount > 0 THEN (us.PostCount * 100.0 / NULLIF(us.ViewCount, 0))
+            ELSE 0
+        END AS PostsPerView,
+        COALESCE(
+            CASE 
+                WHEN tp.ScoreRank <= 10 THEN 'Top Scoring Post'
+                WHEN tp.ScoreRank <= 50 THEN 'High Scoring Post'
+                ELSE 'Regular Post'
+            END,
+            'No Posts'
+        ) AS PostPerformance,
+        CASE 
+            WHEN pa.DaysSinceLastActivity IS NOT NULL AND pa.DaysSinceLastActivity > 30 THEN 'Inactive'
+            WHEN pa.DaysSinceLastActivity IS NOT NULL AND pa.DaysSinceLastActivity <= 30 THEN 'Active'
+            ELSE 'New User'
+        END AS ActivityStatus
+    FROM UserStats us
+    LEFT JOIN TopPosts tp ON us.UserId = tp.OwnerUserId
+    LEFT JOIN PostActivity pa ON tp.PostId = pa.PostId
+    LEFT JOIN UserEngagement uen ON us.UserId = uen.UserId
+    LEFT JOIN PostTags pt ON tp.PostId = pt.PostId
+    LEFT JOIN TagUsage tu ON pt.Tag = tu.TagName
+    WHERE us.Reputation > 500
+)
+SELECT 
+    UserId,
+    DisplayName,
+    Reputation,
+    ViewCount,
+    PostCount,
+    CommentCount,
+    BadgeCount,
+    ReputationRank,
+    ReputationLevel,
+    Title,
+    Score,
+    PostViewCount AS ViewCount,
+    PostType,
+    ScoreRank,
+    ImpactLevel,
+    ActivityType,
+    DaysSinceLastActivity,
+    TagName,
+    TagCount AS Count,
+    PopularityLevel,
+    PostedQuestions,
+    PostedAnswers,
+    VotedPosts,
+    UpvotesReceived,
+    DownvotesReceived,
+    BadgesEarned,
+    CommentsPerPost,
+    PostsPerView,
+    PostPerformance,
+    ActivityStatus
+FROM ComplexQuery
+WHERE 
+    (PostPerformance IN ('Top Scoring Post', 'High Scoring Post') OR PostPerformance IS NULL)
+    AND (
+        (ActivityStatus = 'Active' AND DaysSinceLastActivity <= 30) 
+        OR 
+        (ActivityStatus = 'Inactive' AND DaysSinceLastActivity > 30)
+        OR 
+        ActivityStatus IS NULL
+    )
+    AND (
+        (PopularityLevel IN ('Popular', 'Moderate') OR PopularityLevel IS NULL)
+        OR 
+        (PopularityLevel = 'Niche' AND BadgesEarned >= 5)
+    )
+    AND (
+        (ReputationLevel = 'Elite' AND PostsPerView >= 0.5)
+        OR 
+        (ReputationLevel = 'Expert' AND PostsPerView >= 0.3)
+        OR 
+        (ReputationLevel = 'Advanced' AND PostsPerView >= 0.1)
+        OR 
+        ReputationLevel = 'Beginner'
+    )
+ORDER BY Reputation DESC, Score DESC, Count DESC
+FETCH FIRST 1000 ROWS ONLY;

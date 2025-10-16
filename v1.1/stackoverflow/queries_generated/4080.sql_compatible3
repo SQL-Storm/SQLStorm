@@ -1,0 +1,249 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        COALESCE(p.Score, 0) AS TopPostScore,
+        ROW_NUMBER() OVER (PARTITION BY t.Id ORDER BY COALESCE(p.Score,0) DESC) AS rn
+    FROM
+        Tags t
+    LEFT JOIN
+        Posts p ON p.Id = t.ExcerptPostId AND p.PostTypeId = 1
+    WHERE
+        t.IsModeratorOnly = FALSE
+),
+LatestUserActivity AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.UpVotes,
+        u.DownVotes,
+        MAX(ph.CreationDate) AS LastPostHistoryDate,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN
+        PostHistory ph ON ph.PostId = p.Id
+    LEFT JOIN
+        Comments c ON c.UserId = u.Id
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.UpVotes, u.DownVotes
+),
+TopContributors AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM
+        Users u
+    LEFT JOIN
+        Badges b ON b.UserId = u.Id
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation
+    HAVING
+        COUNT(DISTINCT b.Id) > 5
+),
+UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionsAsked,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswersGiven,
+        AVG(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score END) AS AvgPostScore,
+        MAX(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score END) AS MaxPostScore,
+        COUNT(DISTINCT CASE WHEN EXISTS (
+            SELECT 1 FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2
+        ) THEN p.Id END) AS PostsWithUpvotes
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON p.OwnerUserId = u.Id
+    GROUP BY 
+        u.Id
+),
+DuplicateLinkedPosts AS (
+    SELECT 
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title AS PostTitle,
+        p2.Title AS RelatedPostTitle,
+        pl.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY pl.PostId ORDER BY pl.CreationDate DESC) AS rn
+    FROM 
+        PostLinks pl 
+    JOIN 
+        LinkTypes lt ON pl.LinkTypeId = lt.Id
+    JOIN 
+        Posts p1 ON p1.Id = pl.PostId
+    JOIN 
+        Posts p2 ON p2.Id = pl.RelatedPostId
+    WHERE
+        lt.Name = 'Duplicate'
+),
+FilteredDuplicateLinks AS (
+    SELECT 
+        PostId,
+        RelatedPostId,
+        PostTitle,
+        RelatedPostTitle,
+        CreationDate
+    FROM 
+        DuplicateLinkedPosts
+    WHERE rn = 1
+),
+UserBadgesWithWindow AS (
+    SELECT
+        b.UserId,
+        b.Name,
+        b.Class,
+        b.Date,
+        COUNT(*) OVER (PARTITION BY b.UserId) AS TotalBadges,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS RecentBadgeRanking
+    FROM
+        Badges b
+),
+QuestionsWithCloseReasons AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        crt.Name AS CloseReasonName,
+        ph.CreationDate AS CloseDate,
+        COALESCE(p.Tags,'') AS Tags
+    FROM
+        Posts p
+    LEFT JOIN
+        PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    LEFT JOIN
+        CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS SMALLINT)
+    WHERE
+        p.PostTypeId = 1
+),
+AnswerStatsPerQuestion AS (
+    SELECT
+        p.ParentId AS QuestionId,
+        COUNT(p.Id) AS AnswerCount,
+        AVG(p.Score) AS AvgAnswerScore,
+        MAX(p.Score) AS MaxAnswerScore,
+        SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) AS PositivelyScoredAnswers
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId = 2
+    GROUP BY
+        p.ParentId
+),
+UserReputationTrend AS (
+    SELECT
+        u.Id as UserId,
+        DATE_TRUNC('month', u.CreationDate) AS Month,
+        SUM(b.Class) * 10 + COUNT(b.Id) * 5 AS BadgePoints,
+        SUM(COALESCE(p.Score,0)) AS PostScoreSum,
+        SUM(v.BountyAmount) AS TotalBounties
+    FROM
+        Users u
+    LEFT JOIN
+        Badges b ON b.UserId = u.Id AND b.Date >= u.CreationDate
+    LEFT JOIN
+        Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN
+        Votes v ON v.UserId = u.Id AND v.VoteTypeId IN (8,9)
+    GROUP BY
+        u.Id, DATE_TRUNC('month', u.CreationDate)
+)
+SELECT
+    uq.Id AS QuestionId,
+    uq.Title AS QuestionTitle,
+    uq.CreationDate AS QuestionCreated,
+    uq.Score AS QuestionScore,
+    uq.ViewCount AS QuestionViews,
+    uq.CloseReasonName,
+    a.AnswerCount,
+    a.AvgAnswerScore,
+    a.MaxAnswerScore,
+    a.PositivelyScoredAnswers,
+    ts.DisplayName AS TopContributor,
+    ts.Reputation AS TopContributorReputation,
+    ts.GoldBadges,
+    ts.SilverBadges,
+    ts.BronzeBadges,
+    UPPER(SUBSTRING(u.DisplayName FROM 1 FOR 1)) || LOWER(SUBSTRING(u.DisplayName FROM 2)) AS FormattedUserName,
+    CONCAT('Rep: ', u.Reputation, ', Joined: ', TO_CHAR(u.CreationDate, 'YYYY-MM-DD')) AS UserSummary,
+    COALESCE(
+        STRING_AGG(DISTINCT t.TagName, ', '),
+        'No Tags'
+    ) AS TagCloud,
+    CASE 
+        WHEN uq.Score > 100 AND COALESCE(a.AnswerCount,0) > 10 THEN 'High Activity'
+        WHEN uq.Score BETWEEN 50 AND 100 THEN 'Moderate Activity'
+        ELSE 'Low Activity'
+    END AS ActivityClassification,
+    fdl.RelatedPostId,
+    fdl.RelatedPostTitle,
+    ubww.Name AS UserRecentBadgeName,
+    ubww.Class AS UserRecentBadgeClass,
+    ubww.TotalBadges AS UserTotalBadges,
+    lr.LastPostHistoryDate,
+    lr.LastCommentDate
+FROM
+    QuestionsWithCloseReasons uq
+LEFT JOIN
+    AnswerStatsPerQuestion a ON a.QuestionId = uq.Id
+LEFT JOIN
+    TopContributors ts ON ts.Id = (
+        SELECT OwnerUserId FROM Posts WHERE Id = uq.Id AND OwnerUserId IS NOT NULL LIMIT 1
+    )
+LEFT JOIN
+    Users u ON u.Id = ts.Id
+LEFT JOIN
+    Tags t ON POSITION('<' || t.TagName || '>' IN uq.Tags) > 0
+LEFT JOIN
+    FilteredDuplicateLinks fdl ON fdl.PostId = uq.Id
+LEFT JOIN
+    UserBadgesWithWindow ubww ON ubww.UserId = u.Id AND ubww.RecentBadgeRanking = 1
+LEFT JOIN
+    LatestUserActivity lr ON lr.Id = u.Id
+WHERE
+    uq.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+    AND (uq.CloseReasonName IS NULL OR uq.CloseReasonName = 'Off-topic')
+    AND (a.AnswerCount IS NULL OR a.AnswerCount > 5)
+GROUP BY
+    uq.Id,
+    uq.Title,
+    uq.CreationDate,
+    uq.Score,
+    uq.ViewCount,
+    uq.CloseReasonName,
+    a.AnswerCount,
+    a.AvgAnswerScore,
+    a.MaxAnswerScore,
+    a.PositivelyScoredAnswers,
+    ts.DisplayName,
+    ts.Reputation,
+    ts.GoldBadges,
+    ts.SilverBadges,
+    ts.BronzeBadges,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    fdl.RelatedPostId,
+    fdl.RelatedPostTitle,
+    ubww.Name,
+    ubww.Class,
+    ubww.TotalBadges,
+    lr.LastPostHistoryDate,
+    lr.LastCommentDate
+ORDER BY
+    uq.Score DESC
+LIMIT 100;

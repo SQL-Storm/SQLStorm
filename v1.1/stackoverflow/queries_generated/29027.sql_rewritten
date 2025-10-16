@@ -1,0 +1,241 @@
+-- {"query": "29027.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2202} 
+WITH UserActivitySummary AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT b.Id) AS Badges,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, COUNT(DISTINCT p.Id) DESC) AS ReputationRank,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 5000 THEN 'Master'
+            WHEN u.Reputation >= 1000 THEN 'Expert'
+            WHEN u.Reputation >= 100 THEN 'Novice'
+            ELSE 'Beginner'
+        END AS ReputationTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostComplexity AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN p.AnswerCount 
+            ELSE 0 
+        END AS HasAnswers,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2 THEN 
+                ARRAY_LENGTH(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'), 1)
+            ELSE 0 
+        END AS TagCount,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2)
+            ELSE 0 
+        END AS UpvotesOnPost,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3)
+            ELSE 0 
+        END AS DownvotesOnPost,
+        CASE 
+            WHEN p.CreationDate IS NOT NULL AND p.LastActivityDate IS NOT NULL THEN 
+                EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 86400
+            ELSE 0 
+        END AS DaysSinceCreation,
+        ROUND(
+            CASE 
+                WHEN p.ViewCount IS NOT NULL AND p.ViewCount > 0 THEN 
+                    (p.Score * 1.0 / p.ViewCount)
+                ELSE 0 
+            END, 4
+        ) AS ScorePerView
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.Id IS NOT NULL
+),
+CombinedAnalysis AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.TotalPosts,
+        uas.Questions,
+        uas.Answers,
+        uas.Comments,
+        uas.Badges,
+        uas.ReputationTier,
+        uas.ReputationRank,
+        pc.PostId,
+        pc.Title,
+        pc.Score,
+        pc.ViewCount,
+        pc.AnswerCount,
+        pc.CommentCount,
+        pc.FavoriteCount,
+        pc.CreationDate,
+        pc.OwnerName,
+        pc.Tags,
+        pc.HasAnswers,
+        pc.TagCount,
+        pc.UpvotesOnPost,
+        pc.DownvotesOnPost,
+        pc.DaysSinceCreation,
+        pc.ScorePerView,
+        CASE 
+            WHEN uas.Reputation > 1000 AND uas.Questions > 50 THEN 'HighlyActive'
+            WHEN uas.Reputation > 500 AND uas.Questions > 10 THEN 'Active'
+            WHEN uas.Reputation > 100 AND uas.Questions > 5 THEN 'Regular'
+            ELSE 'Casual'
+        END AS ActivityLevel,
+        CASE 
+            WHEN pc.ScorePerView > 0.05 THEN 'HighlyEngaged'
+            WHEN pc.ScorePerView > 0.02 THEN 'Engaged'
+            WHEN pc.ScorePerView > 0 THEN 'Moderate'
+            ELSE 'Low'
+        END AS EngagementLevel
+    FROM UserActivitySummary uas
+    INNER JOIN PostComplexity pc ON uas.UserId = pc.OwnerUserId
+    WHERE uas.TotalPosts > 0
+    AND uas.Reputation IS NOT NULL
+)
+SELECT 
+    ROW_NUMBER() OVER (ORDER BY ca.Reputation DESC, ca.Score DESC) AS GlobalRank,
+    ca.UserId,
+    ca.DisplayName,
+    ca.Reputation,
+    ca.TotalPosts,
+    ca.Questions,
+    ca.Answers,
+    ca.Comments,
+    ca.Badges,
+    ca.ReputationTier,
+    ca.ReputationRank,
+    ca.PostId,
+    ca.Title,
+    ca.Score,
+    ca.ViewCount,
+    ca.AnswerCount,
+    ca.CommentCount,
+    ca.FavoriteCount,
+    ca.CreationDate,
+    ca.OwnerName,
+    ca.Tags,
+    ca.HasAnswers,
+    ca.TagCount,
+    ca.UpvotesOnPost,
+    ca.DownvotesOnPost,
+    ca.DaysSinceCreation,
+    ca.ScorePerView,
+    ca.ActivityLevel,
+    ca.EngagementLevel,
+    CONCAT(
+        'User: ', ca.DisplayName, 
+        ' | Reputation: ', ca.Reputation,
+        ' | Posts: ', ca.TotalPosts,
+        ' | Tags: ', ca.TagCount,
+        ' | Engagement: ', ca.EngagementLevel
+    ) AS UserSummary,
+    CASE 
+        WHEN ca.ReputationRank <= 50 AND ca.TotalPosts >= 100 THEN 'TopContributor'
+        WHEN ca.ReputationRank <= 100 AND ca.TotalPosts >= 50 THEN 'NotableContributor'
+        WHEN ca.Reputation > 1000 AND ca.Questions >= 20 THEN 'ExpertContributor'
+        WHEN ca.Reputation > 500 AND ca.Answers >= 100 THEN 'HelpfulContributor'
+        ELSE 'RegularContributor'
+    END AS ContributorStatus,
+    CASE 
+        WHEN ca.Score > 100 AND ca.DaysSinceCreation < 30 THEN 'RecentHighImpact'
+        WHEN ca.Score > 100 AND ca.DaysSinceCreation >= 30 THEN 'LongTermHighImpact'
+        WHEN ca.Score > 50 AND ca.DaysSinceCreation < 30 THEN 'RecentModerateImpact'
+        WHEN ca.Score > 50 AND ca.DaysSinceCreation >= 30 THEN 'LongTermModerateImpact'
+        ELSE 'NormalImpact'
+    END AS ImpactCategory,
+    COALESCE(
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ca.UserId AND p.PostTypeId = 1 AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '30 days'),
+        0
+    ) AS QuestionsLast30Days,
+    COALESCE(
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ca.UserId AND p.PostTypeId = 2 AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '30 days'),
+        0
+    ) AS AnswersLast30Days,
+    COALESCE(
+        (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = ca.UserId AND p.PostTypeId = 1),
+        0
+    ) AS AvgQuestionScore,
+    COALESCE(
+        (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = ca.UserId AND p.PostTypeId = 2),
+        0
+    ) AS AvgAnswerScore,
+    CASE 
+        WHEN ca.TotalPosts > 0 THEN ROUND(
+            (ca.Answers * 100.0 / NULLIF(ca.TotalPosts, 0)), 2
+        )
+        ELSE 0
+    END AS AnswerPercentage,
+    CASE 
+        WHEN ca.TotalPosts > 0 THEN ROUND(
+            (ca.Comments * 100.0 / NULLIF(ca.TotalPosts, 0)), 2
+        )
+        ELSE 0
+    END AS CommentPercentage,
+    CASE 
+        WHEN ca.Reputation > 10000 THEN 'Mentor'
+        WHEN ca.Reputation > 5000 THEN 'Advanced'
+        WHEN ca.Reputation > 1000 THEN 'Intermediate'
+        WHEN ca.Reputation > 100 THEN 'Beginner'
+        ELSE 'Newbie'
+    END AS SkillLevel,
+    CASE 
+        WHEN ca.Questions > 20 THEN 'QuestionMaster'
+        WHEN ca.Questions > 10 THEN 'QuestionEnthusiast'
+        WHEN ca.Questions > 5 THEN 'QuestionSeeker'
+        ELSE 'QuestionExplorer'
+    END AS QuestionRole,
+    CASE 
+        WHEN ca.Answers > 100 THEN 'AnswerArchitect'
+        WHEN ca.Answers > 50 THEN 'AnswerSage'
+        WHEN ca.Answers > 20 THEN 'AnswerContributor'
+        ELSE 'AnswerHelper'
+    END AS AnswerRole,
+    CASE 
+        WHEN ca.Badges >= 20 THEN 'AwardWinner'
+        WHEN ca.Badges >= 10 THEN 'BadgeCollector'
+        WHEN ca.Badges >= 5 THEN 'BadgeSeeker'
+        ELSE 'BadgeExplorer'
+    END AS BadgeRole
+FROM CombinedAnalysis ca
+WHERE ca.PostId IS NOT NULL
+AND ca.UserId IS NOT NULL
+AND ca.Reputation >= 100
+AND ca.TotalPosts >= 5
+AND (ca.TagCount > 0 OR ca.HasAnswers > 0)
+AND ca.Score IS NOT NULL
+ORDER BY 
+    ca.Reputation DESC,
+    ca.Score DESC,
+    ca.TotalPosts DESC,
+    ca.DaysSinceCreation ASC
+LIMIT 2000;

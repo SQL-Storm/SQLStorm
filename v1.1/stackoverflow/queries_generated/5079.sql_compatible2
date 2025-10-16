@@ -1,0 +1,188 @@
+WITH recent_active_users AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        AND p.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+    LEFT JOIN Comments c ON c.UserId = u.Id
+        AND c.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+    WHERE u.LastAccessDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+top_tags_per_user AS (
+    SELECT
+        u.Id AS UserId,
+        t.TagName,
+        COUNT(*) AS TagPostCount,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY COUNT(*) DESC, t.TagName) AS TagRank
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    CROSS JOIN LATERAL (
+        SELECT unnest(
+            CASE
+                WHEN p.Tags IS NOT NULL AND length(p.Tags) > 2
+                THEN string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')
+                ELSE CAST(ARRAY[] AS varchar[])
+            END
+        ) as TagName
+    ) t
+    WHERE p.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+    GROUP BY u.Id, t.TagName
+),
+user_badge_summary AS (
+    SELECT
+        b.UserId,
+        COUNT(*) AS BadgeCount,
+        COUNT(DISTINCT b.Name) AS UniqueBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MIN(b.Date) AS FirstBadgeDate,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+popular_posts_with_activity AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        COALESCE(v.VoteCount, 0) AS VoteCount,
+        COALESCE(a.AnswerCount, 0) AS AnswerCount,
+        COALESCE(c.CommentCount, 0) AS CommentCount,
+        LEAD(p.CreationDate) OVER (ORDER BY p.CreationDate) AS NextPostCreated
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS VoteCount
+        FROM Votes
+        WHERE CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+        GROUP BY PostId
+    ) v ON v.PostId = p.Id
+    LEFT JOIN (
+        SELECT ParentId, COUNT(*) AS AnswerCount
+        FROM Posts
+        WHERE PostTypeId = 2
+        GROUP BY ParentId
+    ) a ON a.ParentId = p.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CommentCount
+        FROM Comments
+        WHERE CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+        GROUP BY PostId
+    ) c ON c.PostId = p.Id
+    WHERE p.Score > 10 AND p.ViewCount > 1000
+),
+duplicate_questions AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate AS LinkDate,
+        p1.Title AS QuestionTitle,
+        p2.Title AS DuplicateOfTitle
+    FROM PostLinks pl
+    JOIN Posts p1 ON p1.Id = pl.PostId AND p1.PostTypeId = 1
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId AND p2.PostTypeId = 1
+    WHERE pl.LinkTypeId = 3
+      AND pl.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+),
+closed_questions_detail AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS ClosedDate,
+        cr.Name AS CloseReason,
+        u.DisplayName AS ClosedBy
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes cr ON cr.Id = CASE WHEN ph.Comment IS NULL OR trim(ph.Comment) = '' THEN NULL ELSE CAST(ph.Comment AS integer) END
+    LEFT JOIN Users u ON u.Id = ph.UserId
+    WHERE ph.PostHistoryTypeId = 10
+      AND ph.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+)
+SELECT
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.PostCount,
+    u.CommentCount,
+    u.TotalPostScore,
+    ts.TagName AS TopTag,
+    bs.BadgeCount,
+    bs.UniqueBadges,
+    bs.GoldBadges,
+    bs.SilverBadges,
+    bs.BronzeBadges,
+    pp.PostId AS PopularPostId,
+    pp.Title AS PopularPostTitle,
+    pp.Score AS PopularPostScore,
+    pp.ViewCount AS PopularPostViews,
+    pp.VoteCount,
+    pp.AnswerCount,
+    pp.CommentCount AS PostCommentCount,
+    dq.RelatedPostId AS DuplicatePostId,
+    dq.DuplicateOfTitle,
+    cq.ClosedDate,
+    cq.CloseReason,
+    cq.ClosedBy,
+    COALESCE(
+        'https://stackoverflow.com/users/' || CAST(u.UserId AS varchar) || '/' || regexp_replace(lower(u.DisplayName), '[^a-z0-9]+', '-', 'g'),
+        'https://stackoverflow.com/users/' || CAST(u.UserId AS varchar)
+    ) AS ProfileUrl,
+    CASE
+        WHEN u.PostCount > 0 THEN ROUND((CAST(u.CommentCount AS numeric) / NULLIF(u.PostCount, 0)), 2)
+        ELSE NULL
+    END AS CommentsPerPost,
+    CASE
+        WHEN bs.BadgeCount IS NULL THEN 'No badges'
+        WHEN bs.GoldBadges > 0 THEN 'Gold'
+        WHEN bs.SilverBadges > 0 THEN 'Silver'
+        WHEN bs.BronzeBadges > 0 THEN 'Bronze'
+        ELSE 'Badge holder'
+    END AS BadgeLevel,
+    CASE
+        WHEN (bs.BadgeCount > 2)
+          OR EXISTS (
+            SELECT 1 FROM closed_questions_detail cq2
+            JOIN Posts p ON p.Id = cq2.PostId
+            WHERE p.OwnerUserId = u.UserId
+          ) OR EXISTS (
+            SELECT 1 FROM duplicate_questions dq2
+            JOIN Posts p ON p.Id = dq2.PostId
+            WHERE p.OwnerUserId = u.UserId
+          )
+        THEN TRUE ELSE FALSE
+    END AS IsFeaturedUser
+FROM recent_active_users u
+LEFT JOIN LATERAL (
+    SELECT TagName
+    FROM top_tags_per_user t
+    WHERE t.UserId = u.UserId AND t.TagRank = 1
+    LIMIT 1
+) ts ON TRUE
+LEFT JOIN user_badge_summary bs ON bs.UserId = u.UserId
+LEFT JOIN LATERAL (
+    SELECT *
+    FROM popular_posts_with_activity pp1
+    WHERE pp1.OwnerUserId = u.UserId
+    ORDER BY pp1.Score DESC, pp1.ViewCount DESC
+    LIMIT 1
+) pp ON TRUE
+LEFT JOIN duplicate_questions dq ON dq.PostId = pp.PostId
+LEFT JOIN closed_questions_detail cq ON cq.PostId = pp.PostId
+WHERE
+    (u.TotalPostScore > 100 OR u.PostCount > 10)
+ORDER BY
+    u.Reputation DESC NULLS LAST,
+    u.TotalPostScore DESC NULLS LAST,
+    u.PostCount DESC NULLS LAST
+LIMIT 50;

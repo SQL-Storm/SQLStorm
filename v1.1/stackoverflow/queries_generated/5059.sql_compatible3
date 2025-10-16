@@ -1,0 +1,121 @@
+WITH ActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 500 AND u.UpVotes > u.DownVotes
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.UpVotes, u.DownVotes, u.Views
+    HAVING COUNT(DISTINCT p.Id) >= 5
+),
+TopTags AS (
+    SELECT
+        t.TagName,
+        SUM(t."count") AS TagCount
+    FROM Tags t
+    WHERE t."count" > 100
+    GROUP BY t.TagName
+    HAVING SUM(t."count") = (
+        SELECT MAX(tag_sum) FROM (
+            SELECT SUM("count") AS tag_sum FROM Tags GROUP BY TagName
+        ) sub
+    )
+),
+RecentQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.ViewCount,
+        p.Score,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 months')
+),
+UserActivity AS (
+    SELECT
+        au.UserId,
+        au.DisplayName,
+        au.Reputation,
+        au.PostCount,
+        au.CommentCount,
+        au.BadgeCount,
+        rq.Title AS LastQuestionTitle,
+        au.LastPostDate,
+        COALESCE(SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END), 0) AS CloseVotesReceived
+    FROM ActiveUsers au
+    LEFT JOIN RecentQuestions rq ON au.UserId = rq.OwnerUserId AND rq.rn = 1
+    LEFT JOIN Posts p ON au.UserId = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 10
+    GROUP BY au.UserId, au.DisplayName, au.Reputation, au.PostCount, au.CommentCount, au.BadgeCount, rq.Title, au.LastPostDate
+),
+UserWithRates AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.PostCount,
+        ua.CommentCount,
+        ua.BadgeCount,
+        ua.LastQuestionTitle,
+        ua.LastPostDate,
+        ua.CloseVotesReceived,
+        au.AnswerCount,
+        au.QuestionCount,
+        COALESCE(CAST(au.AnswerCount AS numeric), 0) / NULLIF(CAST(au.QuestionCount AS numeric), 0) AS AnswerRate
+    FROM UserActivity ua
+    INNER JOIN ActiveUsers au ON ua.UserId = au.UserId
+)
+SELECT
+    uwr.UserId,
+    uwr.DisplayName,
+    uwr.Reputation,
+    uwr.PostCount,
+    uwr.AnswerRate,
+    uwr.BadgeCount,
+    COALESCE(uwr.LastQuestionTitle, '[No recent question]') AS LastQuestionTitle,
+    uwr.CloseVotesReceived,
+    tt.TagName AS MostPopularTag,
+    CAST(uwr.PostCount AS numeric) / NULLIF(CAST(uwr.CommentCount AS numeric), 0) AS PostToCommentRatio,
+    UPPER(SUBSTRING(uwr.DisplayName FROM 1 FOR 1)) || LOWER(SUBSTRING(uwr.DisplayName FROM 2)) AS NormalizedDisplayName,
+    CASE 
+        WHEN uwr.BadgeCount > 10 THEN 'Highly Decorated'
+        WHEN uwr.BadgeCount BETWEEN 5 AND 10 THEN 'Active'
+        ELSE 'Newcomer'
+    END AS BadgeStatus,
+    CASE 
+        WHEN uwr.CloseVotesReceived > 5 THEN TRUE
+        ELSE FALSE
+    END AS FrequentlyClosed
+FROM UserWithRates uwr
+LEFT JOIN TopTags tt ON 1=1
+WHERE uwr.Reputation > 0
+GROUP BY
+    uwr.UserId,
+    uwr.DisplayName,
+    uwr.Reputation,
+    uwr.PostCount,
+    uwr.AnswerRate,
+    uwr.BadgeCount,
+    uwr.LastQuestionTitle,
+    uwr.CloseVotesReceived,
+    tt.TagName,
+    uwr.CommentCount,
+    uwr.LastPostDate
+ORDER BY uwr.AnswerRate DESC, uwr.Reputation DESC
+LIMIT 50;

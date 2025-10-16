@@ -1,0 +1,140 @@
+-- {"query": "1042.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1459} 
+with RecursiveUserScores as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        -- Rank users by reputation within their location, null locations last
+        dense_rank() over (partition by coalesce(u.Location, 'Unknown') order by u.Reputation desc) as RepRankInLocation,
+        row_number() over (order by u.Reputation desc) as GlobalRepRank
+    from Users u
+    where u.Reputation > 1000 or u.Location is not null
+),
+PostAggregates as (
+    select
+        p.OwnerUserId,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        sum(p.Score) filter (where p.PostTypeId in (1,2)) as TotalPostScore,
+        max(p.CreationDate) as LastPostDate,
+        bool_or(p.ClosedDate is not null) as HasClosedPosts,
+        sum(coalesce(p.FavoriteCount,0)) as TotalFavorites
+    from Posts p
+    group by p.OwnerUserId
+),
+UserBadgeSummary as (
+    select
+        b.UserId,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        count(distinct b.Name) as DistinctBadgeNames,
+        bool_or(b.TagBased = 1) as HasTagBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+QuestionCloseStats as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        count(*) as CloseCount
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = try_cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10 -- Post Closed
+      and crt.Id is not null
+    group by ph.PostId, crt.Name
+),
+TopDuplicateQuestions as (
+    select p.Id as QuestionId, p.Title, p.OwnerUserId, count(pl.Id) as DuplicateLinksCount
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id and pl.LinkTypeId = 3
+    where p.PostTypeId = 1
+    group by p.Id, p.Title, p.OwnerUserId
+    having count(pl.Id) > 2
+    order by DuplicateLinksCount desc
+    limit 50
+),
+UserCommentStats as (
+    select
+        c.UserId,
+        count(distinct c.PostId) as CommentedPosts,
+        avg(c.Score) as AvgCommentScore,
+        sum(char_length(c.Text)) as TotalCommentLength,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    where c.UserId is not null
+    group by c.UserId
+),
+UserActivity as (
+    select
+        u.Id as UserId,
+        -- Days since user created
+        extract(day from (current_timestamp - u.CreationDate)) as DaysSinceCreation,
+        -- Days since last access
+        extract(day from (current_timestamp - u.LastAccessDate)) as DaysSinceLastAccess,
+        -- Post Counts and Scores
+        coalesce(pa.QuestionCount,0) as QuestionCount,
+        coalesce(pa.AnswerCount,0) as AnswerCount,
+        coalesce(pa.TotalPostScore,0) as TotalPostScore,
+        coalesce(pa.HasClosedPosts,false) as HasClosedPosts,
+        coalesce(ubs.GoldBadges,0) as GoldBadges,
+        coalesce(ubs.SilverBadges,0) as SilverBadges,
+        coalesce(ubs.BronzeBadges,0) as BronzeBadges,
+        coalesce(ucs.CommentedPosts,0) as CommentedPosts,
+        coalesce(ucs.AvgCommentScore,0) as AvgCommentScore,
+        coalesce(ucs.TotalCommentLength,0) as TotalCommentLength
+    from Users u
+    left join PostAggregates pa on pa.OwnerUserId = u.Id
+    left join UserBadgeSummary ubs on ubs.UserId = u.Id
+    left join UserCommentStats ucs on ucs.UserId = u.Id
+)
+select distinct
+    r.UserId,
+    r.DisplayName,
+    r.Reputation,
+    r.RepRankInLocation,
+    r.GlobalRepRank,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.TotalPostScore,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.CommentedPosts,
+    round(ua.AvgCommentScore::numeric,2) as AvgCommentScore,
+    ua.TotalCommentLength,
+    ua.HasClosedPosts,
+    ua.DaysSinceCreation,
+    ua.DaysSinceLastAccess,
+    ts.DuplicateLinksCount,
+    ts.Title as TopDuplicateQuestionTitle,
+    -- Calculate a weighted activity score with complicated expression and null-safe logic
+    case 
+        when ua.DaysSinceLastAccess > 365 then null
+        else 
+            (ua.TotalPostScore * 0.5 + coalesce(ua.GoldBadges,0) * 10 + coalesce(ua.SilverBadges,0) * 5 + coalesce(ua.BronzeBadges,0) * 1
+            + coalesce(ua.CommentedPosts,0) * 0.3 + (1000.0 / nullif(ua.DaysSinceCreation,0)) )
+            /
+            greatest(1, ua.DaysSinceLastAccess)
+    end as WeightedActivityScore,
+    -- Nested correlated subquery: count of unique close reasons on questions by this user
+    (
+        select count(distinct ph2.Comment)
+        from PostHistory ph2
+        join Posts p2 on p2.Id = ph2.PostId
+        where ph2.PostHistoryTypeId = 10
+          and p2.OwnerUserId = r.UserId
+          and ph2.Comment is not null
+    ) as DistinctCloseReasonsCount,
+    -- String manipulation: first 3 words of last badge date if any
+    case when ubs.LastBadgeDate is not null then
+        substring(to_char(ubs.LastBadgeDate, 'YYYY-MM-DD HH24:MI:SS') from '^\S+\s\S+\s\S+')
+    else null end as LastBadgeDateStringSample
+from RecursiveUserScores r
+left join UserActivity ua on ua.UserId = r.UserId
+left join UserBadgeSummary ubs on ubs.UserId = r.UserId
+left join TopDuplicateQuestions ts on ts.OwnerUserId = r.UserId
+where ua.TotalPostScore > 500
+order by WeightedActivityScore desc nulls last, ua.TotalPostScore desc
+limit 200;

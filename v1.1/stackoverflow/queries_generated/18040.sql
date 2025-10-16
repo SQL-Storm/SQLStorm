@@ -1,0 +1,176 @@
+-- {"query": "18040.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1541} 
+
+WITH
+  PostScoreDelta AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.Score,
+      SUM(
+        CASE
+          WHEN v.VoteTypeId = 2 THEN 1
+          WHEN v.VoteTypeId = 3 THEN -1
+          ELSE 0
+        END
+      ) AS VoteScoreDelta
+    FROM
+      Posts AS p
+      LEFT JOIN Votes AS v
+        ON p.Id = v.PostId
+    WHERE
+      p.PostTypeId IN (1, 2) -- Questions and Answers
+    GROUP BY
+      p.Id,
+      p.OwnerUserId,
+      p.Score
+  ),
+  UserPostEngagement AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(DISTINCT p.Id) AS TotalPosts,
+      SUM(psd.VoteScoreDelta) AS TotalVoteScore,
+      AVG(psd.Score) AS AveragePostScore,
+      MAX(p.CreationDate) AS LastPostDate
+    FROM
+      Posts AS p
+      JOIN PostScoreDelta AS psd
+        ON p.Id = psd.PostId
+    WHERE
+      p.OwnerUserId IS NOT NULL
+      AND p.PostTypeId IN (1, 2)
+    GROUP BY
+      p.OwnerUserId
+  ),
+  TagWisdom AS (
+    SELECT
+      t.TagName,
+      COUNT(DISTINCT p.Id) AS TagQuestionCount,
+      AVG(psd.Score) AS AverageTagQuestionScore,
+      MAX(p.CreationDate) AS LastTagQuestionDate
+    FROM
+      Tags AS t
+      JOIN Posts AS p
+        ON t.TagName = ANY(
+          string_to_array(
+            substring(p.Tags, 2, length(p.Tags) - 2),
+            '><'
+          )
+        )
+      JOIN PostScoreDelta AS psd
+        ON p.Id = psd.PostId
+    WHERE
+      p.PostTypeId = 1 -- Only questions
+    GROUP BY
+      t.TagName
+    HAVING
+      COUNT(DISTINCT p.Id) > 50 -- Consider tags with at least 50 questions
+  ),
+  UserBadgeSummary AS (
+    SELECT
+      b.UserId,
+      COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+      COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+      COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM
+      Badges AS b
+    GROUP BY
+      b.UserId
+  )
+SELECT
+  u.DisplayName,
+  u.Reputation,
+  u.CreationDate AS UserCreationDate,
+  COALESCE(upe.TotalPosts, 0) AS TotalPosts,
+  COALESCE(upe.TotalVoteScore, 0) AS TotalVoteScore,
+  COALESCE(upe.AveragePostScore, 0.0) AS AveragePostScore,
+  CASE
+    WHEN upe.LastPostDate IS NULL THEN 'Never Posted'
+    ELSE TO_CHAR(upe.LastPostDate, 'YYYY-MM-DD HH24:MI:SS')
+  END AS LastActivity,
+  COALESCE(ubs.GoldBadges, 0) AS GoldBadges,
+  COALESCE(ubs.SilverBadges, 0) AS SilverBadges,
+  COALESCE(ubs.BronzeBadges, 0) AS BronzeBadges,
+  (
+    SELECT
+      COUNT(*)
+    FROM
+      Comments AS c
+    WHERE
+      c.UserId = u.Id
+      AND c.CreationDate >= u.CreationDate
+  ) AS UserCommentCount,
+  CASE
+    WHEN u.WebsiteUrl IS NULL THEN 'No Website'
+    ELSE SUBSTRING(u.WebsiteUrl FROM '://([^/]+)') -- Extract domain name
+  END AS WebsiteDomain,
+  -- A contrived calculation: User engagement score based on reputation, posts, votes, and badges
+  (
+    u.Reputation * 1.0
+    + COALESCE(upe.TotalVoteScore, 0) * 0.5
+    + COALESCE(upe.TotalPosts, 0) * 0.2
+    + COALESCE(ubs.GoldBadges, 0) * 10
+    + COALESCE(ubs.SilverBadges, 0) * 5
+    + COALESCE(ubs.BronzeBadges, 0) * 1
+  ) AS UserEngagementScore,
+  (
+    SELECT
+      COUNT(*)
+    FROM
+      Posts AS p
+      LEFT JOIN PostLinks AS pl
+        ON p.Id = pl.PostId
+    WHERE
+      p.OwnerUserId = u.Id
+      AND pl.LinkTypeId = 3 -- Duplicate links
+  ) AS DuplicateLinksCreated,
+  (
+    SELECT
+      COUNT(*)
+    FROM
+      PostHistory AS ph
+    WHERE
+      ph.UserId = u.Id
+      AND ph.PostHistoryTypeId = 10 -- Post Closed
+      AND ph.Comment IS NOT NULL
+      AND ph.Comment <> '0' -- Ensure there's a valid close reason ID
+  ) AS PostsClosedByThisUser,
+  -- Join with TagWisdom to find top tags this user is active in
+  tw.TagName AS TopActiveTagName,
+  tw.AverageTagQuestionScore AS AverageScoreInTopTag
+FROM
+  Users AS u
+  LEFT JOIN UserPostEngagement AS upe
+    ON u.Id = upe.OwnerUserId
+  LEFT JOIN UserBadgeSummary AS ubs
+    ON u.Id = ubs.UserId
+  LEFT JOIN LATERAL ( -- Lateral join to get top tag for each user if any
+    SELECT
+      tw_inner.TagName,
+      tw_inner.AverageTagQuestionScore
+    FROM
+      TagWisdom AS tw_inner
+      JOIN Posts AS p_inner
+        ON tw_inner.TagName = ANY(
+          string_to_array(
+            substring(p_inner.Tags, 2, length(p_inner.Tags) - 2),
+            '><'
+          )
+        )
+    WHERE
+      p_inner.OwnerUserId = u.Id
+      AND p_inner.PostTypeId = 1 -- Questions
+    ORDER BY
+      tw_inner.AverageTagQuestionScore DESC
+    LIMIT 1
+  ) AS tw
+    ON TRUE
+WHERE
+  u.Reputation > 1000
+  AND u.DownVotes < u.UpVotes * 0.1 -- Users who tend to receive more upvotes than downvotes
+  AND (
+    upe.TotalPosts > 50
+    OR ubs.GoldBadges > 0
+  )
+ORDER BY
+  UserEngagementScore DESC
+LIMIT 100;

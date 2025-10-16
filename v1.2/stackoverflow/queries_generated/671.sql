@@ -1,0 +1,111 @@
+-- {"query": "671.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1394} 
+with RecursiveTagHierarchy as (
+    select t.Id, t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, t.IsModeratorOnly, t.IsRequired, 1 as Level
+    from Tags t
+    where t.IsRequired = 1
+    union all
+    select t.Id, t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, t.IsModeratorOnly, t.IsRequired, r.Level + 1
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id = r.Id - 1 and t.IsRequired = 1
+), 
+PostScores as (
+    select p.Id, p.PostTypeId, p.OwnerUserId, p.Score, p.ViewCount, p.CreationDate,
+           coalesce(p.Title, '') as Title,
+           coalesce(p.Tags, '') as Tags,
+           row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as ScoreRank,
+           sum(case when v.VoteTypeId = 2 then 1 else 0 end) over (partition by p.Id) as UpVotes,
+           sum(case when v.VoteTypeId = 3 then 1 else 0 end) over (partition by p.Id) as DownVotes
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    where p.PostTypeId in (1, 2)
+),
+UserBadgeCounts as (
+    select b.UserId,
+           count(case when b.Class = 1 then 1 end) as GoldBadges,
+           count(case when b.Class = 2 then 1 end) as SilverBadges,
+           count(case when b.Class = 3 then 1 end) as BronzeBadges
+    from Badges b
+    group by b.UserId
+),
+UserActivity as (
+    select u.Id as UserId, u.DisplayName, u.Reputation, u.CreationDate, u.Location,
+           count(distinct p.Id) as PostCount,
+           count(distinct c.Id) as CommentCount,
+           count(distinct v.Id) as VoteCount,
+           coalesce(ub.GoldBadges, 0) as GoldBadges,
+           coalesce(ub.SilverBadges, 0) as SilverBadges,
+           coalesce(ub.BronzeBadges, 0) as BronzeBadges
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    left join UserBadgeCounts ub on ub.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges
+),
+TopQuestions as (
+    select ps.Id, ps.Title, ps.Score, ps.ViewCount, ps.Tags, ps.OwnerUserId,
+           u.DisplayName as OwnerDisplayName,
+           row_number() over (order by ps.Score desc, ps.ViewCount desc) as Rnk
+    from PostScores ps
+    left join Users u on u.Id = ps.OwnerUserId
+    where ps.PostTypeId = 1
+    and ps.Score > (
+        select avg(Score) from PostScores where PostTypeId = 1
+    )
+),
+DuplicateLinks as (
+    select pl.PostId, pl.RelatedPostId, pl.LinkTypeId,
+           p1.Title as PostTitle, p2.Title as RelatedPostTitle
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where pl.LinkTypeId = 3
+),
+CloseReasonsCount as (
+    select ph.PostId, crt.Name as CloseReasonName, count(*) as CloseCount
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10 and ph.Comment is not null and ph.Comment ~ '^\d+$'
+    group by ph.PostId, crt.Name
+),
+UserLastActivity as (
+    select u.Id as UserId, max(coalesce(p.LastActivityDate, c.CreationDate, v.CreationDate, u.LastAccessDate)) as LastActivity
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id
+)
+select 
+    tq.Rnk, tq.Id as QuestionId, tq.Title as QuestionTitle, tq.Score, tq.ViewCount, tq.Tags,
+    ua.DisplayName as OwnerName, ua.Reputation, ua.Location,
+    ua.PostCount, ua.CommentCount, ua.VoteCount,
+    ua.GoldBadges, ua.SilverBadges, ua.BronzeBadges,
+    cr.CloseReasonName, cr.CloseCount,
+    dl.RelatedPostId as DuplicateOfPostId, dl.RelatedPostTitle as DuplicateOfTitle,
+    ua2.LastActivity as OwnerLastActivity,
+    case 
+        when ua.Reputation > 20000 then 'Expert'
+        when ua.Reputation > 5000 then 'Intermediate'
+        else 'Beginner'
+    end as UserLevel,
+    length(tq.Tags) - length(replace(tq.Tags, '><', '')) + 1 as TagCount,
+    -- String manipulation: extract first tag from Tags (which are stored like '<tag1><tag2>')
+    substring(tq.Tags from '<([^>]+)>') as FirstTag,
+    -- Complex predicate: check if question is popular and owner is expert and has gold badges
+    case 
+        when tq.Score > 100 and ua.GoldBadges > 0 and ua.Reputation > 20000 then true
+        else false
+    end as IsHighValueQuestion
+from TopQuestions tq
+left join UserActivity ua on ua.UserId = tq.OwnerUserId
+left join CloseReasonsCount cr on cr.PostId = tq.Id
+left join DuplicateLinks dl on dl.PostId = tq.Id
+left join UserLastActivity ua2 on ua2.UserId = tq.OwnerUserId
+where 
+    (cr.CloseCount is null or cr.CloseCount < 3)
+    and (dl.RelatedPostId is null or dl.RelatedPostId not in (
+        select Id from Posts where Score < 0
+    ))
+order by tq.Score desc, tq.ViewCount desc
+limit 50;

@@ -1,0 +1,179 @@
+WITH RecursiveTagAgg AS (
+    SELECT
+        p.Id AS PostId,
+        regexp_split_to_table(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><') AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+TopUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+),
+UserTopTags AS (
+    SELECT
+        tu.Id AS UserId,
+        rta.Tag,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.ViewCount) AS MaxViewCount
+    FROM TopUsers tu
+    JOIN Posts p ON p.OwnerUserId = tu.Id AND p.PostTypeId = 1
+    JOIN RecursiveTagAgg rta ON rta.PostId = p.Id
+    GROUP BY tu.Id, rta.Tag
+),
+FilteredUserTags AS (
+    SELECT
+        utt.UserId,
+        utt.Tag,
+        utt.QuestionCount,
+        utt.AvgScore,
+        utt.MaxViewCount,
+        RANK() OVER (PARTITION BY utt.UserId ORDER BY utt.QuestionCount DESC, utt.AvgScore DESC) AS TagRank
+    FROM UserTopTags utt
+    WHERE utt.QuestionCount > 5
+),
+UserActivityWindows AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        p.Id AS PostId,
+        p.CreationDate,
+        p.Score,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RecentPostRank,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS TotalPosts,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+        LEAD(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextScore
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+),
+RecentHighImpactPosts AS (
+    SELECT
+        uaw.UserId,
+        uaw.PostId,
+        uaw.CreationDate,
+        uaw.Score,
+        COALESCE(uaw.PrevScore,0) AS PrevScore,
+        COALESCE(uaw.NextScore,0) AS NextScore
+    FROM UserActivityWindows uaw
+    WHERE uaw.RecentPostRank <= 10 AND uaw.Score > 10
+),
+CloseReasonsCount AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReason,
+        COUNT(*) AS NumClosures
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id AND pht.Name = 'Post Closed'
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS SMALLINT)
+    GROUP BY ph.PostId, crt.Name
+),
+UserWithHighestBadgesAndActivity AS (
+    SELECT
+        tu.Id,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.BadgeCount,
+        tu.GoldBadges,
+        tu.SilverBadges,
+        tu.BronzeBadges,
+        utt.Tag,
+        utt.QuestionCount,
+        utt.AvgScore,
+        utt.MaxViewCount,
+        rhp.PostId AS HighImpactPostId,
+        rhp.Score AS HighImpactPostScore,
+        COALESCE(crc.CloseReason, 'None') AS MostFrequentCloseReason,
+        COALESCE(crc.NumClosures,0) AS NumClosures
+    FROM TopUsers tu
+    LEFT JOIN FilteredUserTags utt ON utt.UserId = tu.Id AND utt.TagRank = 1
+    LEFT JOIN RecentHighImpactPosts rhp ON rhp.UserId = tu.Id
+    LEFT JOIN CloseReasonsCount crc ON crc.PostId = rhp.PostId
+    GROUP BY
+        tu.Id,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.BadgeCount,
+        tu.GoldBadges,
+        tu.SilverBadges,
+        tu.BronzeBadges,
+        utt.Tag,
+        utt.QuestionCount,
+        utt.AvgScore,
+        utt.MaxViewCount,
+        rhp.PostId,
+        rhp.Score,
+        crc.CloseReason,
+        crc.NumClosures
+    ORDER BY tu.Reputation DESC, tu.BadgeCount DESC
+    LIMIT 50
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.BadgeCount,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    u.Location,
+    u.Tag AS TopTag,
+    CONCAT('Questions: ', u.QuestionCount, ', AvgScore: ', ROUND(u.AvgScore::numeric,2), ', MaxViews: ', u.MaxViewCount) AS TagStats,
+    u.HighImpactPostId,
+    u.HighImpactPostScore,
+    COALESCE(u.MostFrequentCloseReason, 'None') AS FrequentCloseReason,
+    COALESCE(u.NumClosures, 0) AS ClosureCount
+FROM UserWithHighestBadgesAndActivity u
+WHERE u.Reputation > 5000 OR u.BadgeCount > 10
+
+UNION
+
+SELECT
+    u2.Id,
+    u2.DisplayName,
+    u2.Reputation,
+    0 AS BadgeCount,
+    0 AS GoldBadges,
+    0 AS SilverBadges,
+    0 AS BronzeBadges,
+    u2.Location,
+    NULL AS TopTag,
+    NULL AS TagStats,
+    NULL AS HighImpactPostId,
+    NULL AS HighImpactPostScore,
+    'No Closures' AS FrequentCloseReason,
+    0 AS ClosureCount
+FROM Users u2
+WHERE u2.Reputation BETWEEN 4000 AND 5000
+
+EXCEPT
+
+SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.BadgeCount,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    u.Location,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+FROM UserWithHighestBadgesAndActivity u
+
+ORDER BY Reputation DESC, BadgeCount DESC, UserId
+LIMIT 100;

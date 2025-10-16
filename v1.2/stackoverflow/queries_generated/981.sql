@@ -1,0 +1,169 @@
+-- {"query": "981.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1463} 
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+        coalesce(sum(case when p.PostTypeId in (1,2) then p.Score else 0 end),0) as TotalScore,
+        count(distinct b.Id) as BadgeCount,
+        max(b.Class) filter (where b.Class is not null) as MaxBadgeClass,
+        row_number() over (partition by u.Id order by u.LastAccessDate desc) as rn
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+UserTopPosts as (
+    select
+        p.OwnerUserId,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        dense_rank() over (partition by p.OwnerUserId order by p.Score desc nulls last) as ScoreRank
+    from Posts p
+    where p.PostTypeId in (1,2) and p.OwnerUserId is not null
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title as QuestionTitle,
+        q.OwnerUserId as QuestionOwner,
+        q.CreationDate as QuestionDate,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswerOwner,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerDate,
+        coalesce(v.UpVotes,0) as AnswerUpVotes,
+        coalesce(v.DownVotes,0) as AnswerDownVotes,
+        case 
+            when a.Score is null then null
+            when q.Score = 0 then 0
+            else round( (cast(a.Score as numeric) / nullif(q.Score,0)) * 100,2)
+        end as ScorePercentOfQuestion
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join (
+        select
+            PostId,
+            sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Votes v
+        group by PostId
+    ) v on v.PostId = a.Id
+    where q.PostTypeId = 1
+),
+UserBadgeRanks as (
+    select
+        b.UserId,
+        b.Name as BadgeName,
+        b.Class,
+        rank() over (partition by b.UserId order by b.Class asc, b.Date desc) as BadgeRank
+    from Badges b
+),
+RecentPostHistories as (
+    select ph.*,
+        row_number() over (partition by ph.PostId order by ph.CreationDate desc) as RecentHistoryRank
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4,5,6)
+),
+StringManipulations as (
+    select
+        p.Id as PostId,
+        substr(p.Title,1,50) as TitleExcerpt,
+        concat_ws(' | ', p.OwnerDisplayName, to_char(p.CreationDate,'YYYY-MM-DD')) as OwnerAndDate,
+        lower(p.Tags) as LowerTags,
+        regexp_replace(p.Body, '<[^>]+>', '', 'g') as BodyPlainText,
+        length(p.Body) as BodyLength,
+        case when p.ClosedDate is null then 'Open' else 'Closed' end as PostStatus
+    from Posts p
+    where p.PostTypeId = 1
+),
+CombinedResults as (
+    select 
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.QuestionsCount,
+        u.AnswersCount,
+        u.TotalScore,
+        u.BadgeCount,
+        u.MaxBadgeClass,
+        utp.PostId as TopPostId,
+        utp.Score as TopPostScore,
+        qa.QuestionId,
+        qa.QuestionTitle,
+        qa.AnswerId,
+        qa.AnswerScore,
+        qa.ScorePercentOfQuestion,
+        ub.BadgeName as TopBadgeName,
+        ub.Class as TopBadgeClass,
+        rph.PostHistoryTypeId,
+        rph.Comment as RecentEditComment,
+        sm.TitleExcerpt,
+        sm.OwnerAndDate,
+        sm.LowerTags,
+        sm.BodyLength,
+        sm.PostStatus
+    from RecursiveUserActivity u
+    left join UserTopPosts utp on utp.OwnerUserId = u.UserId and utp.ScoreRank = 1
+    left join QuestionAnswerStats qa on qa.QuestionOwner = u.UserId
+    left join UserBadgeRanks ub on ub.UserId = u.UserId and ub.BadgeRank = 1
+    left join RecentPostHistories rph on rph.PostId = utp.PostId and rph.RecentHistoryRank = 1
+    left join StringManipulations sm on sm.PostId = utp.PostId
+    where u.rn = 1
+),
+FilteredCombined as (
+    select *
+    from CombinedResults
+    where 
+        (Reputation > 1000 or BadgeCount > 2) 
+        and (TopPostScore >= 10 or QuestionsCount > 5)
+        and (PostStatus = 'Open')
+        and (ScorePercentOfQuestion is null or ScorePercentOfQuestion > 20)
+)
+select 
+    fc.UserId,
+    fc.DisplayName,
+    fc.Reputation,
+    fc.QuestionsCount,
+    fc.AnswersCount,
+    fc.TotalScore,
+    fc.BadgeCount,
+    case fc.MaxBadgeClass
+        when 1 then 'Gold'
+        when 2 then 'Silver'
+        when 3 then 'Bronze'
+        else 'None'
+    end as MaxBadgeLevel,
+    fc.TopPostId,
+    fc.TopPostScore,
+    fc.QuestionId,
+    fc.QuestionTitle,
+    fc.AnswerId,
+    fc.AnswerScore,
+    fc.ScorePercentOfQuestion,
+    fc.TopBadgeName,
+    case fc.TopBadgeClass
+        when 1 then 'Gold'
+        when 2 then 'Silver'
+        when 3 then 'Bronze'
+        else 'None'
+    end as TopBadgeLevel,
+    fc.RecentEditComment,
+    fc.TitleExcerpt,
+    fc.OwnerAndDate,
+    fc.LowerTags,
+    fc.BodyLength,
+    fc.PostStatus
+from FilteredCombined fc
+order by fc.Reputation desc, fc.TopPostScore desc, fc.BadgeCount desc
+limit 100;

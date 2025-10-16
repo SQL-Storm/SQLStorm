@@ -1,0 +1,79 @@
+-- {"query": "22094.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "grok-code-fast", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2204, "output_tokens": 917} 
+WITH UserPostStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COUNT(p.Id) AS TotalPosts,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(p.ViewCount) AS TotalViews,
+        STRING_AGG(DISTINCT t.TagName, ', ') AS TopTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN (
+        SELECT p.Id AS PostId, UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS TagName
+        FROM Posts p
+        WHERE p.Tags IS NOT NULL AND p.PostTypeId = 1
+    ) t ON p.Id = t.PostId
+    GROUP BY u.Id, u.DisplayName
+),
+UserBadgeStats AS (
+    SELECT 
+        u.Id,
+        COUNT(b.Id) AS TotalBadges,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id
+),
+UserVoteStats AS (
+    SELECT 
+        u.Id,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesReceived,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesReceived,
+        SUM(v.BountyAmount) FILTER (WHERE v.VoteTypeId = 9) AS BountyReceived,
+        AVG(CASE WHEN v.VoteTypeId IN (2,3) THEN v.CreationDate - u.CreationDate ELSE NULL END) AS AvgVoteAgeDays
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    GROUP BY u.Id, u.CreationDate
+),
+RankedUsers AS (
+    SELECT 
+        ups.Id,
+        ups.DisplayName,
+        COALESCE(ups.TotalPosts, 0) + COALESCE(ubs.TotalBadges, 0) + COALESCE(uvs.UpVotesReceived, 0) AS ActivityScore,
+        ROW_NUMBER() OVER (ORDER BY COALESCE(ups.TotalPosts, 0) + COALESCE(ubs.TotalBadges, 0) + COALESCE(uvs.UpVotesReceived, 0) DESC) AS Rank,
+        ups.TopTags,
+        ubs.LastBadgeDate,
+        uvs.AvgVoteAgeDays,
+        CASE 
+            WHEN ubs.TotalBadges > 10 AND uvs.UpVotesReceived > 1000 THEN 'Elite'
+            WHEN ubs.TotalBadges BETWEEN 5 AND 10 THEN 'Advanced'
+            ELSE 'Regular'
+        END AS UserTier
+    FROM UserPostStats ups
+    FULL OUTER JOIN UserBadgeStats ubs ON ups.Id = ubs.Id
+    FULL OUTER JOIN UserVoteStats uvs ON ups.Id = uvs.Id
+    JOIN Users u ON ups.Id = u.Id OR ubs.Id = u.Id OR uvs.Id = u.Id
+)
+SELECT 
+    ru.Rank,
+    ru.DisplayName,
+    ru.ActivityScore,
+    ru.TopTags,
+    ru.LastBadgeDate,
+    EXTRACT(YEAR FROM AGE(cast('2024-10-01 12:34:56' as timestamp), ru.LastBadgeDate)) AS YearsSinceLastBadge,
+    ru.AvgVoteAgeDays,
+    ru.UserTier,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ru.Id AND p.Score > 10) AS HighScorePosts,
+    CASE WHEN ru.TopTags IS NULL THEN 'No Tags' ELSE SUBSTRING(ru.TopTags, 1, 50) END AS TruncatedTags,
+    ru.ActivityScore / NULLIF(EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - u.CreationDate))/86400, 0) AS DailyActivityRate
+FROM RankedUsers ru
+JOIN Users u ON ru.Id = u.Id
+WHERE ru.Rank <= 100
+ORDER BY ru.ActivityScore DESC;

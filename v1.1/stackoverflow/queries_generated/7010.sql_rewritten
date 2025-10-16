@@ -1,0 +1,237 @@
+-- {"query": "7010.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2710} 
+with
+-- recent user activity and derived reputation velocity
+user_activity as (
+  select
+    u.id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    greatest(1, date_part('day', cast('2024-10-01 12:34:56' as timestamp) - u.creationdate)) as days_alive,
+    round(u.reputation / greatest(1, date_part('day', cast('2024-10-01 12:34:56' as timestamp) - u.creationdate)), 6) as rep_per_day,
+    coalesce(u.location, '') as location,
+    coalesce(u.websiteurl, '') as website
+  from users u
+  where u.reputation is not null
+),
+-- posts enriched with tags exploded and flags
+question_posts as (
+  select
+    p.*,
+    -- normalized tags array (handles nulls and weird formatting)
+    case
+      when p.posttypeid = 1 and p.tags is not null then
+        regexp_split_to_array(trim(both '<>' from p.tags), '><')
+      else null
+    end as tag_array,
+    -- length heuristics
+    char_length(coalesce(p.title, '')) as title_len,
+    char_length(coalesce(p.body, '')) as body_len,
+    -- binary indicators for accepted and closed
+    case when p.acceptedanswerid is not null then 1 else 0 end as has_accepted,
+    case when p.closeddate is not null then 1 else 0 end as is_closed
+  from posts p
+  where p.posttypeid = 1
+),
+-- compute tag popularity snapshot
+tag_stats as (
+  select
+    t.tagname,
+    t.id as tagid,
+    t.count as total_count,
+    coalesce(tp.view_count_sum,0) as total_views,
+    coalesce(tp.avg_score,0)::numeric(12,4) as avg_score,
+    row_number() over (order by coalesce(tp.view_count_sum,0) desc nulls last) as popularity_rank
+  from tags t
+  left join lateral (
+    select
+      sum(coalesce(p.viewcount,0)) as view_count_sum,
+      avg(coalesce(p.score,0)) as avg_score
+    from posts p
+    where p.posttypeid = 1
+      and p.tags is not null
+      and p.tags like ('%<' || t.tagname || '>%')
+  ) tp on true
+),
+-- windowed per-question aggregates: top answers, answer latency, commenter diversity
+question_agg as (
+  select
+    q.id as question_id,
+    q.title,
+    q.creationdate as q_created,
+    q.score as q_score,
+    q.viewcount as q_views,
+    q.answercount,
+    q.tag_array,
+    -- top 3 answers by score (concatenated)
+    (select string_agg(concat(a.id,':',coalesce(a.score,0)), ',' order by coalesce(a.score,0) desc nulls last limit 3)
+     from posts a
+     where a.parentid = q.id and a.posttypeid = 2) as top_answers,
+    -- median answer creation latency (seconds)
+    (select percentile_cont(0.5) within group (order by extract(epoch from (a.creationdate - q.creationdate)))
+     from posts a
+     where a.parentid = q.id and a.posttypeid = 2) as median_answer_latency_seconds,
+    -- distinct commenters count on question and its answers
+    (select count(distinct coalesce(c.userid, -1))
+     from comments c
+     where c.postid in (
+       select id from posts p2 where (p2.id = q.id) or (p2.parentid = q.id)
+     )) as distinct_commenters,
+    -- average comment length
+    (select avg(char_length(coalesce(c.text,''))) from comments c where c.postid = q.id) as avg_comment_len_on_question
+  from question_posts q
+),
+-- per-user derived stats including correlated subqueries to exercise engine
+user_post_metrics as (
+  select
+    ua.id as user_id,
+    ua.displayname,
+    ua.reputation,
+    ua.rep_per_day,
+    ua.days_alive,
+    -- total questions, answers, average score
+    (select count(*) from posts p where p.owneruserid = ua.id and p.posttypeid = 1) as num_questions,
+    (select count(*) from posts p where p.owneruserid = ua.id and p.posttypeid = 2) as num_answers,
+    (select avg(coalesce(p.score,0)) from posts p where p.owneruserid = ua.id) as avg_post_score,
+    -- fraction of answers accepted
+    (select case when count(*)=0 then 0 else sum(case when p.id = q.acceptedanswerid then 1 else 0 end)::float / count(*) end
+     from posts p
+     left join posts q on q.acceptedanswerid = p.id and q.posttypeid = 1
+     where p.owneruserid = ua.id and p.posttypeid = 2) as accept_rate,
+    -- recency weighted activity: last post age in days
+    (select coalesce(min(date_part('day', cast('2024-10-01 12:34:56' as timestamp) - p.creationdate)), -1) from posts p where p.owneruserid = ua.id) as days_since_last_post
+  from user_activity ua
+),
+-- heavy join: posts linked graph with link types and duplicate networks
+post_link_graph as (
+  select
+    pl.id as link_id,
+    pl.postid,
+    pl.relatedpostid,
+    pl.linktypeid,
+    lt.name as linkname,
+    p1.title as post_title,
+    p2.title as related_title,
+    -- detect cycles of length 2 (mutual link)
+    case when exists (
+      select 1 from postlinks pl2 where pl2.postid = pl.relatedpostid and pl2.relatedpostid = pl.postid
+    ) then 1 else 0 end as is_mutual
+  from postlinks pl
+  left join linktypes lt on lt.id = pl.linktypeid
+  left join posts p1 on p1.id = pl.postid
+  left join posts p2 on p2.id = pl.relatedpostid
+),
+-- combine votes summary per post with conditional aggregation and null handling
+post_vote_summary as (
+  select
+    v.postid,
+    count(*) filter (where votetypeid = 2) as upvotes,
+    count(*) filter (where votetypeid = 3) as downvotes,
+    count(*) filter (where votetypeid = 5) as favorites,
+    count(*) filter (where votetypeid in (8,9)) as bounty_events,
+    sum(case when votetypeid = 8 then coalesce(bountyamount,0) else 0 end) as bounty_started_total
+  from votes v
+  group by v.postid
+),
+-- top questions by a composite score that includes recency, popularity, tag hotness and quality signals
+ranked_questions as (
+  select
+    q.*,
+    qa.top_answers,
+    qa.median_answer_latency_seconds,
+    qa.distinct_commenters,
+    coalesce(pvs.upvotes,0) as upvotes,
+    coalesce(pvs.downvotes,0) as downvotes,
+    coalesce(pvs.favorites,0) as favorites,
+    -- tag hotness score: sum of inverse popularity_rank for tags on question
+    (select coalesce(sum(1.0 / nullif(ts.popularity_rank,0)),0)
+     from tag_stats ts
+     where exists (
+       select 1 from unnest(q.tag_array) as t(tag)
+       where t.tag = ts.tagname
+     )) as tag_hotness,
+    -- composite quality metric (arbitrary formula to stress compute)
+    (
+      coalesce(q.score,0) * 0.4
+      + coalesce(pvs.upvotes,0) * 0.2
+      - coalesce(pvs.downvotes,0) * 0.5
+      + least(coalesce(q.viewcount,0) / nullif(greatest(1, (date_part('day', cast('2024-10-01 12:34:56' as timestamp) - q.creationdate))),1), 100) * 0.15
+      + (case when q.has_accepted = 1 then 10 else 0 end)
+      + (coalesce( (select avg(char_length(coalesce(c.text,''))) from comments c where c.postid = q.id), 0) / 100.0)
+      + coalesce((select count(*) from posts a where a.parentid = q.id and a.score >= 10), 0) * 2
+      + coalesce((select greatest(0, 30 - coalesce(qa.median_answer_latency_seconds, 30)/3600)::numeric),0) * 0.1
+      + coalesce((select sum(case when b.class = 1 then 3 when b.class = 2 then 1.5 else 1 end) from badges b where b.userid = q.owneruserid),0) * 0.01
+      - coalesce(q.is_closed,0) * 20
+    ) as composite_quality,
+    -- noise/entropy like measure: diversity of commenters vs answerers
+    (
+      coalesce(qa.distinct_commenters,0) - coalesce((select count(distinct owneruserid) from posts a where a.parentid = q.id),0)
+    ) as commenter_minus_answerer_diversity
+  from question_posts q
+  left join question_agg qa on qa.question_id = q.id
+  left join post_vote_summary pvs on pvs.postid = q.id
+)
+select
+  rq.question_id,
+  rq.title,
+  left(rq.title, 120) as snippet_title,
+  rq.creationdate,
+  rq.q_score,
+  rq.q_views,
+  rq.answercount,
+  rq.top_answers,
+  rq.upvotes,
+  rq.downvotes,
+  rq.favorites,
+  round(rq.tag_hotness::numeric,6) as tag_hotness,
+  round(rq.composite_quality::numeric,6) as composite_quality,
+  rq.commenter_minus_answerer_diversity,
+  rq.median_answer_latency_seconds,
+  rq.distinct_commenters,
+  array_to_string(rq.tag_array,',') as tags,
+  -- enrich with owner's short profile via lateral correlated subquery using NULL-safe logic
+  owner.owner_displayname,
+  owner.owner_reputation,
+  owner.owner_rep_per_day,
+  -- correlate to find nearest higher-quality duplicate (if any) using set operator and correlated filter
+  coalesce((
+    select p2.id from posts p2
+    where p2.posttypeid = 1
+      and p2.id <> rq.question_id
+      and (
+        -- similar tag overlap: at least one shared tag
+        exists (
+          select 1 from unnest(rq.tag_array) as t(tag) where p2.tags is not null and p2.tags like ('%<' || t.tag || '>%')
+        )
+      )
+      and p2.viewcount >= rq.q_views * 0.5
+      and (coalesce(p2.score,0) + coalesce((select count(*) from votes vv where vv.postid = p2.id and vv.votetypeid=2),0)) > rq.q_score
+    order by (coalesce(p2.score,0) + coalesce((select count(*) from votes vv where vv.postid = p2.id and vv.votetypeid=2),0)) desc
+    limit 1
+  ), -1) as suggested_higher_quality_similar_question_id,
+  -- rank position using window function over composite_quality with tie-breaking
+  dense_rank() over (order by rq.composite_quality desc nulls last, rq.q_views desc) as quality_rank,
+  -- include a compact JSON-like string constructed via concatenation to stress string ops and null logic
+  concat(
+    '{',
+      '"qid":', rq.question_id, ',',
+      '"q":"', replace(replace(coalesce(rq.title,''), '"', '\\"'), E'\n', ' '), '",',
+      '"score":', coalesce(rq.q_score,0), ',',
+      '"cmp":', round(rq.composite_quality::numeric,4), ',',
+      '"tags":"', array_to_string(rq.tag_array,','), '"',
+    '}'
+  ) as compact_payload
+from ranked_questions rq
+left join lateral (
+  select
+    u.displayname as owner_displayname,
+    u.reputation as owner_reputation,
+    round(u.reputation / nullif( greatest(1, date_part('day', cast('2024-10-01 12:34:56' as timestamp) - u.creationdate)) ,0),6) as owner_rep_per_day
+  from users u
+  where u.id = rq.owneruserid
+  limit 1
+) owner on true
+where rq.composite_quality is not null
+order by quality_rank, rq.q_views desc
+limit 250;

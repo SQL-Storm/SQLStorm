@@ -1,0 +1,50 @@
+ROUND((CommentCount * 1.0 / NULLIF(AnswerCount, 0))::numeric, 2) as comment_to_answer_ratio
+FROM ComplexJoin
+WHERE 
+    (Score IS NOT NULL OR ViewCount IS NOT NULL OR AnswerCount IS NOT NULL OR CommentCount IS NOT NULL)
+    AND (DisplayName IS NOT NULL OR Reputation > 0)
+    AND (TagName IS NOT NULL OR TagName IS NULL)
+    AND (tag_count IS NOT NULL OR tag_count IS NULL)
+    AND days_since_creation >= 30
+GROUP BY
+    Id,
+    PostTypeId,
+    ParentId,
+    OwnerUserId,
+    Score,
+    ViewCount,
+    CreationDate,
+    Title,
+    Tags,
+    AnswerCount,
+    CommentCount,
+    FavoriteCount,
+    rn,
+    prev_score,
+    avg_score,
+    score_status,
+    UserId,
+    Reputation,
+    DisplayName,
+    Views,
+    badge_count,
+    post_count,
+    question_count,
+    answer_count,
+    last_post_date,
+    all_tags,
+    TagName,
+    tag_count,
+    tag_category,
+    popularity_rank,
+    decile,
+    engagement_level,
+    days_since_creation,
+    post_classification,
+    comprehensive_description
+ORDER BY 
+    Reputation DESC,
+    Score DESC,
+    days_since_creation ASC,
+    tag_count DESC
+LIMIT 1000;

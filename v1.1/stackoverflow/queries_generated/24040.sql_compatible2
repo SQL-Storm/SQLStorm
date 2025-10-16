@@ -1,0 +1,120 @@
+WITH
+    q AS (
+        SELECT
+            Id          AS qid,
+            Title,
+            Tags,
+            AcceptedAnswerId,
+            Score       AS qscore,
+            CASE WHEN ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS is_closed,
+            OwnerUserId
+        FROM Posts
+        WHERE PostTypeId = 1
+    ),
+
+    dup_chain AS (
+        SELECT d.qid AS dup_of, d.qid AS dup_id
+        FROM q d
+        WHERE 1 = 0
+        UNION ALL
+        SELECT l.RelatedPostId AS dup_of, d.dup_id
+        FROM dup_chain d
+        JOIN PostLinks l
+          ON l.PostId = d.dup_id
+         AND l.LinkTypeId = 3
+    ),
+
+    dup_stats AS (
+        SELECT dup_of, COUNT(*) AS dup_count
+        FROM dup_chain
+        GROUP BY dup_of
+    ),
+
+    ans_stats AS (
+        SELECT
+            a.ParentId AS qid,
+            COUNT(*)    AS ans_cnt,
+            AVG(a.Score) AS avg_ans_score,
+            SUM(CASE WHEN a.Score > 0 THEN 1 ELSE 0 END) AS positive_ans
+        FROM Posts a
+        WHERE a.PostTypeId = 2
+        GROUP BY a.ParentId
+    ),
+
+    com_stats AS (
+        SELECT c.PostId AS qid, COUNT(*) AS com_cnt
+        FROM Comments c
+        GROUP BY c.PostId
+    ),
+
+    vote_stats AS (
+        SELECT
+            v.PostId AS qid,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS up_cnt,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS down_cnt,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)
+                - SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS vote_diff
+        FROM Votes v
+        GROUP BY v.PostId
+    ),
+
+    tag_extr AS (
+        SELECT
+            p.Id AS qid,
+            regexp_split_to_array(p.Tags, '[<>]+') AS tags_arr
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+    ),
+
+    user_rep AS (
+        SELECT Id AS uid, Reputation
+        FROM Users
+    )
+
+SELECT
+    q.qid,
+    q.Title,
+    q.is_closed,
+    COALESCE(ans_stats.ans_cnt, 0)        AS total_answers,
+    COALESCE(ans_stats.avg_ans_score, 0)  AS avg_answer_score,
+    COALESCE(com_stats.com_cnt, 0)        AS total_comments,
+    COALESCE(vote_stats.up_cnt, 0)        AS up_votes,
+    COALESCE(vote_stats.down_cnt, 0)      AS down_votes,
+    COALESCE(vote_stats.vote_diff, 0)     AS net_votes,
+    COALESCE(dup_stats.dup_count, 0) + 1  AS duplicate_chain_length,
+    COALESCE(tag_extr.tags_arr, ARRAY[]::text[]) AS tags_array,
+    (SELECT Reputation FROM user_rep ur WHERE ur.uid = q.OwnerUserId) AS owner_rep,
+    ROW_NUMBER() OVER (
+        PARTITION BY q.is_closed
+        ORDER BY COALESCE(vote_stats.vote_diff, 0) DESC,
+                 COALESCE(ans_stats.avg_ans_score, 0) DESC
+    ) AS ranking
+
+FROM q
+LEFT JOIN ans_stats ON q.qid = ans_stats.qid
+LEFT JOIN com_stats ON q.qid = com_stats.qid
+LEFT JOIN vote_stats ON q.qid = vote_stats.qid
+LEFT JOIN dup_stats ON q.qid = dup_stats.dup_of
+LEFT JOIN tag_extr ON q.qid = tag_extr.qid
+
+WHERE
+    (q.is_closed = 1 OR COALESCE(ans_stats.ans_cnt, 0) > 5)
+    AND (q.Title ILIKE '%SQL%' OR q.Tags ILIKE '%<sql>%')
+    AND (COALESCE(vote_stats.vote_diff, 0) > 10
+         OR COALESCE(ans_stats.positive_ans, 0) > 0)
+
+GROUP BY
+    q.qid,
+    q.Title,
+    q.is_closed,
+    ans_stats.ans_cnt,
+    ans_stats.avg_ans_score,
+    com_stats.com_cnt,
+    vote_stats.up_cnt,
+    vote_stats.down_cnt,
+    vote_stats.vote_diff,
+    dup_stats.dup_count,
+    tag_extr.tags_arr,
+    q.OwnerUserId
+
+ORDER BY ranking;

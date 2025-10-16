@@ -1,0 +1,106 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.CreationDate) AS UserRank,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) FILTER (WHERE V.Id IS NOT NULL) AS UpVotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) FILTER (WHERE V.Id IS NOT NULL) AS DownVotes,
+        COUNT(DISTINCT C.Id) AS CommentCount,
+        STRING_AGG(T.TagName, ', ' ORDER BY T."Count" DESC) AS Tags,
+        tag_values.TagName AS TagNameForGroup
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    LEFT JOIN 
+        Votes V ON P.Id = V.PostId
+    LEFT JOIN 
+        Comments C ON P.Id = C.PostId
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(COALESCE(P.Tags, ''), 2, GREATEST(length(COALESCE(P.Tags, ''))-2,0)), '><')) AS TagName
+    ) AS tag_values
+    LEFT JOIN 
+        Tags T ON tag_values.TagName = T.TagName
+    WHERE 
+        P.PostTypeId IN (1, 2)
+    GROUP BY
+        P.Id,
+        P.PostTypeId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.OwnerUserId,
+        U.DisplayName,
+        tag_values.TagName
+),
+TopUsers AS (
+    SELECT 
+        OwnerUserId,
+        MAX(Score) AS MaxScore,
+        SUM(ViewCount) AS TotalViews,
+        COUNT(Id) AS PostCount
+    FROM 
+        RankedPosts
+    WHERE 
+        UserRank <= 3
+    GROUP BY 
+        OwnerUserId
+),
+PostHistorySummary AS (
+    SELECT 
+        PostId,
+        COUNT(CASE WHEN PostHistoryTypeId IN (4,5,6) THEN Id END) AS EditCount,
+        MAX(CASE WHEN PostHistoryTypeId IN (4,5,6) THEN CreationDate END) AS LastEditDate
+    FROM 
+        PostHistory
+    GROUP BY 
+        PostId
+),
+TagBasedBadges AS (
+    SELECT 
+        B.UserId,
+        COUNT(B.Id) AS TagBasedBadgeCount
+    FROM 
+        Badges B
+    WHERE 
+        B.TagBased = TRUE
+    GROUP BY 
+        B.UserId
+)
+SELECT 
+    RP.Id,
+    RP.PostTypeId,
+    RP.CreationDate,
+    RP.Score,
+    RP.ViewCount,
+    RP.OwnerUserId,
+    RP.OwnerDisplayName,
+    RP.UserRank,
+    RP.UpVotes,
+    RP.DownVotes,
+    RP.CommentCount,
+    RP.Tags,
+    PHS.EditCount,
+    PHS.LastEditDate,
+    COALESCE(TU.MaxScore, 0) AS UserMaxScore,
+    COALESCE(TU.TotalViews, 0) AS UserTotalViews,
+    COALESCE(TU.PostCount, 0) AS UserPostCount,
+    COALESCE(TBB.TagBasedBadgeCount, 0) AS TagBasedBadgeCount
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    PostHistorySummary PHS ON RP.Id = PHS.PostId
+LEFT JOIN 
+    TopUsers TU ON RP.OwnerUserId = TU.OwnerUserId
+LEFT JOIN 
+    TagBasedBadges TBB ON RP.OwnerUserId = TBB.UserId
+WHERE 
+    RP.UserRank <= 3
+ORDER BY 
+    RP.Score DESC, 
+    RP.CreationDate;

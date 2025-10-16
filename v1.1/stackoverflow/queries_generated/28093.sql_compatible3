@@ -1,0 +1,91 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Location,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        ROW_NUMBER() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC) AS ReputationRank,
+        MAX(u.Reputation) AS ReputationAggregator
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id, u.DisplayName, u.Location, u.Reputation
+), PostDetails AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = p.Id AND a.PostTypeId = 2) AS CalculatedAnswers,
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6)) AS EditCount,
+        p.Tags AS TagsRaw,
+        COALESCE(ph.Comment, 'No close reason') AS CloseReason,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 10
+    WHERE p.PostTypeId = 1
+)
+SELECT 
+    pd.Title,
+    (COALESCE(us.DisplayName, '') || ' - ' || COALESCE(us.Location, 'Unknown')) AS AuthorInfo,
+    CAST(pd.Score AS DOUBLE) / NULLIF(pd.ViewCount, 0) AS ScorePerView,
+    pd.EditCount,
+    (pd.CalculatedAnswers - pd.AnswerCount) AS AnswerDiscrepancy,
+    (
+      SELECT COUNT(*) FROM (
+        -- simple tag extraction: remove outer <> and split by '><' using a recursive CTE if supported; fallback to single value
+        WITH tag_source AS (
+          SELECT CASE 
+            WHEN pd.TagsRaw IS NULL THEN ''
+            WHEN pd.TagsRaw LIKE '<%>' THEN SUBSTR(pd.TagsRaw, 2, LENGTH(pd.TagsRaw) - 2)
+            ELSE pd.TagsRaw
+          END AS t
+        ),
+        -- replace '><' with a standard separator and split by that separator
+        replaced AS (
+          SELECT REPLACE(t, '><', '|') AS t FROM tag_source
+        ),
+        split AS (
+          SELECT TRIM(BOTH ' ' FROM value) AS tag FROM replaced,
+          LATERAL (
+            SELECT value FROM (
+              -- split by '|' by iterating positions (works in many dialects using recursive CTE)
+              WITH RECURSIVE parts(pos, rest) AS (
+                SELECT 1, t FROM replaced
+                UNION ALL
+                SELECT instr(rest, '|') + 1,
+                       CASE WHEN instr(rest, '|') = 0 THEN '' ELSE SUBSTR(rest, instr(rest, '|') + 1) END
+                FROM parts
+                WHERE rest <> '' AND instr(rest, '|') > 0
+              )
+              SELECT CASE WHEN instr(rest, '|') = 0 THEN rest ELSE SUBSTR(rest, 1, instr(rest, '|')-1) END AS value
+              FROM parts
+              WHERE rest <> ''
+            )
+          )
+        )
+        SELECT tag FROM split
+      ) tags WHERE LOWER(tag) LIKE '%sql%'
+    ) AS SQLTagCount,
+    us.BadgeCount,
+    us.ReputationRank,
+    pd.CloseReason,
+    AVG(pd.Score) OVER (PARTITION BY us.Location) AS AvgLocationScore,
+    SUM(us.VoteCount) OVER (ORDER BY us.ReputationRank ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeVotes
+FROM PostDetails pd
+INNER JOIN UserStats us ON pd.Id IN (SELECT Id FROM Posts WHERE OwnerUserId = us.Id)
+WHERE pd.Score > 100
+    AND pd.CreationDate BETWEEN DATE '2010-01-01' AND DATE '2020-01-01'
+    AND (us.BadgeCount > 10 OR us.ReputationRank <= 5)
+    AND pd.HasAcceptedAnswer = 1
+    AND (pd.CalculatedAnswers - pd.AnswerCount) BETWEEN -2 AND 2
+ORDER BY ScorePerView DESC
+LIMIT 100;

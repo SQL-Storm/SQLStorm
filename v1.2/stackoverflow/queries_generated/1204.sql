@@ -1,0 +1,159 @@
+-- {"query": "1204.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.2, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1513} 
+with recursive TagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsRequired = 1
+
+    union all
+
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        th.Level + 1,
+        th.Path || t2.Id
+    from Tags t2
+    join TagHierarchy th on t2.Id <> all(th.Path)
+    where t2.IsRequired = 0 and t2.Count > 50
+),
+RecentTopUsers as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        rank() over (order by u.Reputation desc) as RepRank
+    from Users u
+    left join Badges b on b.UserId = u.Id and b.Date > current_date - interval '1 year'
+    where u.CreationDate > current_date - interval '2 years'
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+    having count(b.Id) > 5 or u.Reputation > 5000
+),
+QuestionStats as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        case when p.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer,
+        array_to_string(array(
+            select unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><'))
+            except
+            select th.TagName from TagHierarchy th where th.Level > 3
+        ), ',') as FilteredTags
+    from Posts p
+    where p.PostTypeId = 1
+),
+AnswerWithScoreWindow as (
+    select
+        a.Id,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank,
+        avg(a.Score) over (partition by a.ParentId) as AvgAnswerScore,
+        count(*) over (partition by a.ParentId) as TotalAnswers
+    from Posts a
+    where a.PostTypeId = 2
+),
+CloseReasonSummary as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate,
+        row_number() over (partition by ph.PostId order by ph.CreationDate desc) as rn
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId and pht.Name = 'Post Closed'
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10
+),
+FilteredPosts as (
+    select
+        q.*,
+        r.CloseReason,
+        rq.TotalAnswers,
+        rq.AnswerRank,
+        rq.AvgAnswerScore
+    from QuestionStats q
+    left join CloseReasonSummary r on r.PostId = q.Id and r.rn = 1
+    left join AnswerWithScoreWindow rq on rq.QuestionId = q.Id and rq.AnswerRank = 1
+    where q.Score >= 5 and q.ViewCount > 1000 and (r.CloseReason is null or r.CloseReason not in ('Too localized', 'Noise or pointless'))
+),
+UserCommentsAggregated as (
+    select
+        c.UserId,
+        u.DisplayName,
+        count(c.Id) as TotalComments,
+        max(c.CreationDate) as LastCommentDate,
+        bool_or(c.Text ilike '%help%' or c.Text ilike '%question%') as HasHelpComments
+    from Comments c
+    join Users u on u.Id = c.UserId
+    where c.CreationDate > current_date - interval '6 months'
+    group by c.UserId, u.DisplayName
+),
+AllVotesSummary as (
+    select
+        v.PostId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(case when v.VoteTypeId = 6 then 1 else 0 end) as CloseVotes,
+        sum(case when v.VoteTypeId = 7 then 1 else 0 end) as ReopenVotes
+    from Votes v
+    group by v.PostId
+)
+select
+    fp.Id as QuestionId,
+    fp.Title,
+    u.DisplayName as QuestionOwner,
+    u.Reputation as OwnerReputation,
+    fp.Score as QuestionScore,
+    fp.ViewCount,
+    fp.AnswerCount,
+    fp.HasAcceptedAnswer,
+    coalesce(fp.CloseReason, 'Open') as CloseReasonStatus,
+    aw.Score as TopAnswerScore,
+    aw.AvgAnswerScore,
+    c.UpVotes,
+    c.DownVotes,
+    c.CloseVotes,
+    c.ReopenVotes,
+    ua.TotalComments,
+    ua.LastCommentDate,
+    ua.HasHelpComments,
+    string_agg(distinct th.TagName, ',' order by th.Level) as RelevantTags,
+    case
+        when u.Reputation > 10000 then 'High Rep'
+        when u.Reputation between 5000 and 10000 then 'Medium Rep'
+        else 'Low Rep'
+    end as ReputationBracket,
+    -- complex string expression including NULL logic and CASE
+    concat(
+        'Post #', fp.Id::text,
+        ' by ', coalesce(u.DisplayName, 'Unknown'),
+        ' [', coalesce(fp.CloseReason, 'Open'), ']',
+        ' Tags: ', coalesce(string_agg(distinct th.TagName, ',' order by th.Level), 'None')
+    ) as Summary
+from FilteredPosts fp
+left join Users u on u.Id = fp.OwnerUserId
+left join AnswerWithScoreWindow aw on aw.QuestionId = fp.Id and aw.AnswerRank = 1
+left join AllVotesSummary c on c.PostId = fp.Id
+left join UserCommentsAggregated ua on ua.UserId = fp.OwnerUserId
+left join TagHierarchy th on position(th.TagName in fp.Tags) > 0
+where u.Reputation is not null
+group by fp.Id, fp.Title, u.DisplayName, u.Reputation, fp.Score, fp.ViewCount, fp.AnswerCount, fp.HasAcceptedAnswer, fp.CloseReason, aw.Score, aw.AvgAnswerScore, c.UpVotes, c.DownVotes, c.CloseVotes, c.ReopenVotes, ua.TotalComments, ua.LastCommentDate, ua.HasHelpComments
+having count(fp.Tags) > 0
+order by fp.Score desc, fp.ViewCount desc
+limit 50;

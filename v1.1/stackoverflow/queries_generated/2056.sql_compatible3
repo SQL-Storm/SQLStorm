@@ -1,0 +1,82 @@
+WITH MostActiveUsers AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        COUNT(DISTINCT P.Id) AS PostCount,
+        COUNT(DISTINCT C.Id) AS CommentCount,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT P.Id) DESC, COUNT(DISTINCT C.Id) DESC) AS ActivityRank
+    FROM
+        Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY U.Id, U.DisplayName
+),
+QuestionVotes AS (
+    SELECT
+        Q.Id AS QuestionId,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM
+        Posts Q
+    LEFT JOIN Votes V ON Q.Id = V.PostId
+    WHERE Q.PostTypeId = 1
+    GROUP BY Q.Id
+),
+AverageBadgeEarningTime AS (
+    SELECT
+        U.Id AS UserId,
+        AVG((EXTRACT(EPOCH FROM (B.Date - U.CreationDate)) / 86400.0)) AS AvgDaysToBadge
+    FROM
+        Users U
+    INNER JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id
+),
+LinkedPostAnalysis AS (
+    SELECT
+        PL.PostId,
+        COUNT(DISTINCT CASE WHEN PL.LinkTypeId = 1 THEN PL.RelatedPostId END) AS LinkedCount,
+        COUNT(DISTINCT CASE WHEN PL.LinkTypeId = 3 THEN PL.RelatedPostId END) AS DuplicateCount
+    FROM
+        PostLinks PL
+    GROUP BY PL.PostId
+),
+UserTableCounts AS (
+    SELECT UserId, COUNT(*) AS Records FROM SomeUserTable GROUP BY UserId
+)
+SELECT
+    U.Id,
+    U.DisplayName,
+    COALESCE(QV.UpVotes, 0) - COALESCE(QV.DownVotes, 0) AS NetVotes,
+    MAU.ActivityRank,
+    ADE.AvgDaysToBadge,
+    LPA.LinkedCount,
+    LPA.DuplicateCount,
+    COALESCE(UT.Records, 0) AS Records
+FROM
+    Users U
+LEFT JOIN MostActiveUsers MAU ON U.Id = MAU.UserId
+LEFT JOIN QuestionVotes QV ON QV.QuestionId IS NOT NULL AND EXISTS (
+    SELECT 1 FROM Posts P2 WHERE P2.Id = QV.QuestionId AND P2.OwnerUserId = U.Id
+)
+LEFT JOIN AverageBadgeEarningTime ADE ON U.Id = ADE.UserId
+LEFT JOIN LinkedPostAnalysis LPA ON LPA.PostId IS NOT NULL AND EXISTS (
+    SELECT 1 FROM Posts P3 WHERE P3.Id = LPA.PostId AND P3.OwnerUserId = U.Id
+)
+LEFT JOIN UserTableCounts UT ON U.Id = UT.UserId
+WHERE
+    U.Reputation > 1000
+    AND (COALESCE(UT.Records, 0) > 5 OR COALESCE(QV.UpVotes, 0) > 10)
+GROUP BY
+    U.Id,
+    U.DisplayName,
+    QV.UpVotes,
+    QV.DownVotes,
+    MAU.ActivityRank,
+    ADE.AvgDaysToBadge,
+    LPA.LinkedCount,
+    LPA.DuplicateCount,
+    UT.Records
+ORDER BY
+    NetVotes DESC,
+    MAU.ActivityRank ASC,
+    ADE.AvgDaysToBadge DESC;

@@ -1,0 +1,34 @@
+-- {"query": "6062.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 376} 
+SELECT
+  u.Id AS UserId,
+  u.DisplayName AS UserName,
+  u.Reputation,
+  COUNT(p.Id) AS PostsCreated,
+  AVG(p.Score) AS AvgPostScore,
+  SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS TotalQuestionViews,
+  SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+  ARRAY_AGG(DISTINCT t.Name) FILTER (WHERE t.Name IS NOT NULL) AS TagsTouched,
+  MAX(p.LastActivityDate) AS LastActivityOnSite,
+  SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+  SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+  MAX(CASE WHEN b.Id IS NOT NULL THEN b.Class ELSE NULL END) AS HighestBadgeClass,
+  STRING_AGG(CASE WHEN b.Name IS NOT NULL THEN CONCAT(b.Name, ':', b.Date) ELSE NULL END, ';') AS BadgesGainedTimeline
+FROM
+  Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN (
+    SELECT
+      t.Id,
+      t.Name
+    FROM Tags t
+  ) t ON t.Id = ANY(string_to_array(p.Tags, '><')::INT[])
+GROUP BY
+  u.Id, u.DisplayName, u.Reputation
+HAVING
+  COUNT(p.Id) > 5
+ORDER BY
+  u.Reputation DESC,
+  TotalQuestionViews DESC
+LIMIT 100;

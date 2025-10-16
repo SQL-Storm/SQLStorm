@@ -1,0 +1,71 @@
+, 0) AS BronzeBadges,
+        CASE WHEN tp.Score >= 0 THEN 'Positive' ELSE 'Negative' END AS ScoreSign,
+        CASE 
+            WHEN EXISTS (
+                SELECT 1 FROM PostHistory ph 
+                WHERE ph.PostId = tp.PostId 
+                  AND ph.PostHistoryTypeId = 10
+            ) THEN 1 ELSE 0 
+        END                         AS WasClosed
+    FROM TopPosts tp
+    LEFT JOIN UserVoteAgg uv ON uv.PostId = tp.PostId
+    LEFT JOIN UserBadgeCounts ub ON ub.UserId = tp.UserId
+)
+SELECT 
+    c.UserId,
+    u.DisplayName,
+    c.PostId,
+    c.Title,
+    c.Score,
+    c.AvgScoreLast5,
+    c.UpVotes,
+    c.DownVotes,
+    c.GoldBadges,
+    c.SilverBadges,
+    c.BronzeBadges,
+    c.ScoreSign,
+    c.WasClosed,
+    ts.Tag,
+    ts.PostCount,
+    ts.TotalScore,
+    ts.AvgScore
+FROM Combined c
+JOIN Users u ON u.Id = c.UserId
+LEFT JOIN LATERAL (
+    SELECT 
+        te.Tag,
+        ts.PostCount,
+        ts.TotalScore,
+        ts.AvgScore
+    FROM TagExtraction te
+    JOIN TagStats ts ON ts.Tag = te.Tag
+    WHERE te.PostId = c.PostId
+    ORDER BY ts.TotalScore DESC
+    LIMIT 1
+) ts ON true
+WHERE c.ScoreSign = 'Positive'
+
+UNION ALL
+
+SELECT 
+    NULL                 AS UserId,
+    'Aggregated Tag Summary' AS DisplayName,
+    NULL                 AS PostId,
+    NULL                 AS Title,
+    NULL                 AS Score,
+    NULL                 AS AvgScoreLast5,
+    NULL                 AS UpVotes,
+    NULL                 AS DownVotes,
+    NULL                 AS GoldBadges,
+    NULL                 AS SilverBadges,
+    NULL                 AS BronzeBadges,
+    NULL                 AS ScoreSign,
+    NULL                 AS WasClosed,
+    t.Tag,
+    t.PostCount,
+    t.TotalScore,
+    t.AvgScore
+FROM TagStats t
+WHERE t.PostCount > 1000
+ORDER BY GoldBadges DESC NULLS LAST, TotalScore DESC NULLS LAST
+LIMIT 200;

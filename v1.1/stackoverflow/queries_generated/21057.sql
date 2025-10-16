@@ -1,0 +1,137 @@
+-- {"query": "21057.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2168, "output_tokens": 1319} 
+
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as PostCount,
+        SUM(CASE WHEN pt.Name = 'Question' THEN 1 ELSE 0 END) as QuestionCount,
+        SUM(CASE WHEN pt.Name = 'Answer' THEN 1 ELSE 0 END) as AnswerCount,
+        AVG(p.Score) as AvgPostScore
+    FROM Users u
+    INNER JOIN Posts p ON u.Id = p.OwnerUserId
+    INNER JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE u.Reputation > 100
+      AND u.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+      AND p.CreationDate >= CURRENT_DATE - INTERVAL '6 months'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT p.Id) >= 5
+),
+QuestionStats AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        au.DisplayName as OwnerName,
+        au.Reputation as OwnerRep,
+        COALESCE(ac.AnswerCount, 0) as ActualAnswerCount,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(MONTH FROM p.CreationDate) ORDER BY p.ViewCount DESC) as MonthlyViewRank,
+        LAG(p.ViewCount, 1) OVER (PARTITION BY EXTRACT(MONTH FROM p.CreationDate) ORDER BY p.CreationDate) as PrevMonthMaxViews
+    FROM Posts p
+    INNER JOIN PostTypes pt ON p.PostTypeId = pt.Id AND pt.Name = 'Question'
+    INNER JOIN ActiveUsers au ON p.OwnerUserId = au.Id
+    LEFT JOIN (
+        SELECT 
+            ParentId,
+            COUNT(*) as AnswerCount
+        FROM Posts 
+        WHERE PostTypeId = 2 AND DeletionDate IS NULL
+        GROUP BY ParentId
+    ) ac ON p.Id = ac.ParentId
+    WHERE p.DeletionDate IS NULL
+      AND p.ClosedDate IS NULL
+      AND LENGTH(COALESCE(p.Tags, '')) > 0
+),
+TopContributors AS (
+    SELECT 
+        au.*,
+        RANK() OVER (ORDER BY au.QuestionCount DESC) as QuestionRank,
+        DENSE_RANK() OVER (ORDER BY au.AvgPostScore DESC) as QualityRank
+    FROM ActiveUsers au
+),
+TagActivity AS (
+    SELECT 
+        t.TagName,
+        COUNT(DISTINCT SUBSTRING(p.Tags, '<' || t.TagName || '>', '')) as UsageCount,
+        AVG(qs.ViewCount) as AvgViewsPerQuestion,
+        STRING_AGG(DISTINCT LEFT(qs.Title, 50), ' || ') as SampleTitles
+    FROM Tags t
+    INNER JOIN Posts p ON POSITION(t.TagName IN p.Tags) > 0
+    INNER JOIN QuestionStats qs ON p.Id = qs.QuestionId
+    WHERE t.Count > 10
+    GROUP BY t.TagName
+    HAVING COUNT(DISTINCT SUBSTRING(p.Tags, '<' || t.TagName || '>', '')) > 5
+)
+SELECT 
+    qs.QuestionId,
+    qs.Title,
+    qs.Score,
+    qs.ViewCount,
+    qs.ActualAnswerCount,
+    CASE 
+        WHEN qs.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN qs.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        ELSE 'Active'
+    END as PostStatus,
+    tc.DisplayName as TopContributor,
+    tc.QuestionRank,
+    tc.AvgPostScore,
+    ta.TagName as MostPopularTag,
+    ta.AvgViewsPerQuestion as TagAvgViews,
+    COALESCE(
+        (SELECT AVG(v.BountyAmount) 
+         FROM Votes v 
+         WHERE v.PostId = qs.QuestionId 
+           AND v.VoteTypeId = 8 
+           AND v.BountyAmount > 0),
+        0
+    ) as AvgBountyAmount,
+    (SELECT COUNT(*) 
+     FROM Comments c 
+     WHERE c.PostId = qs.QuestionId 
+       AND LENGTH(c.Text) > 100 
+       AND c.Score >= 2) as InsightfulComments,
+    (SELECT STRING_AGG(DISTINCT b.Name, ', ') 
+     FROM Badges b 
+     INNER JOIN Users u ON b.UserId = u.Id 
+     WHERE u.Id = qs.OwnerUserId 
+       AND b.Date >= qs.CreationDate - INTERVAL '3 months'
+       AND b.Class = 1) as RecentGoldBadges,
+    GREATEST(
+        qs.ViewCount / NULLIF(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - qs.CreationDate)) / 86400, 0),
+        qs.Score * 10,
+        COALESCE(qs.ActualAnswerCount, 0) * 50
+    ) as EngagementScore,
+    CASE 
+        WHEN qs.MonthlyViewRank = 1 THEN 'Top Viewed'
+        WHEN qs.ViewCount > COALESCE(qs.PrevMonthMaxViews, 0) * 0.8 THEN 'High Performer'
+        ELSE 'Standard'
+    END as PerformanceTier
+FROM QuestionStats qs
+INNER JOIN TopContributors tc ON qs.OwnerName = tc.DisplayName
+LEFT JOIN (
+    SELECT 
+        TagName,
+        ROW_NUMBER() OVER (ORDER BY UsageCount DESC) as TagRank
+    FROM TagActivity
+) ta ON 1=1  -- Cross join for top tag context
+LEFT JOIN PostHistory ph ON qs.QuestionId = ph.PostId 
+    AND ph.PostHistoryTypeId IN (10, 11)  -- Closed/Reopened
+    AND ph.CreationDate >= qs.CreationDate
+WHERE qs.ViewCount > 1000
+  OR qs.Score > 50
+  OR qs.ActualAnswerCount > 10
+  OR EXISTS (
+      SELECT 1 FROM Votes v 
+      WHERE v.PostId = qs.QuestionId 
+        AND v.VoteTypeId IN (2, 3)  -- Up/Down votes
+        AND v.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+  )
+  OR qs.CreationDate >= CURRENT_DATE - INTERVAL '7 days'
+ORDER BY EngagementScore DESC, qs.ViewCount DESC
+LIMIT 100;

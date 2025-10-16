@@ -1,0 +1,118 @@
+WITH RecentActivity AS (
+    SELECT 
+        PostId, 
+        MAX(CreationDate) AS LastActivityDate
+    FROM 
+        (
+         SELECT PostId, CreationDate FROM Comments
+         UNION ALL
+         SELECT PostId, CreationDate FROM Votes
+         UNION ALL
+         SELECT Id AS PostId, LastEditDate AS CreationDate FROM Posts
+         UNION ALL
+         SELECT Id AS PostId, LastActivityDate AS CreationDate FROM Posts
+         UNION ALL
+         SELECT PostId, CreationDate FROM PostHistory
+        ) AS CombinedActivity
+    GROUP BY PostId
+),
+UserBadges AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM 
+        Users u
+    LEFT JOIN 
+        Badges b ON u.Id = b.UserId
+    GROUP BY u.Id
+),
+HighReputationPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS PostRank,
+        p.OwnerUserId
+    FROM 
+        Posts p
+    WHERE 
+        p.Score >= 10
+),
+TagStats AS (
+    SELECT 
+        t.Id AS TagId,
+        t.TagName,
+        COUNT(DISTINCT pt.PostId) AS TaggedPostsCount
+    FROM 
+        Tags t
+    LEFT JOIN 
+        (
+            SELECT p.Id AS PostId, p.Tags
+            FROM Posts p
+        ) p_all ON 1=1
+    LEFT JOIN LATERAL (
+        SELECT p_all.PostId
+        FROM (SELECT p_all.PostId, p_all.Tags) p
+        WHERE EXISTS (
+            SELECT 1
+            FROM (SELECT 
+                    TRIM(BOTH '<>' FROM token) AS tag
+                  FROM UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS token
+                 ) tok
+            WHERE tok.tag = t.TagName
+        )
+    ) pt ON TRUE
+    GROUP BY 
+        t.Id, t.TagName
+)
+SELECT 
+    ua.DisplayName,
+    ua.Reputation,
+    COALESCE(ub.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ub.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ub.BronzeBadges, 0) AS BronzeBadges,
+    ha.Title AS TopTitle,
+    ha.Score AS TopScore,
+    ra.LastActivityDate,
+    ts.TagName AS MostUsedTag
+FROM 
+    Users ua
+LEFT JOIN LATERAL (
+    SELECT ra2.PostId, ra2.LastActivityDate
+    FROM RecentActivity ra2
+    JOIN Posts p2 ON p2.Id = ra2.PostId
+    WHERE p2.OwnerUserId = ua.Id
+    ORDER BY ra2.LastActivityDate DESC
+    LIMIT 1
+) ra ON TRUE
+LEFT JOIN 
+    UserBadges ub ON ub.UserId = ua.Id
+LEFT JOIN LATERAL (
+    SELECT hp.PostId, hp.Title, hp.Score
+    FROM HighReputationPosts hp
+    WHERE hp.OwnerUserId = ua.Id AND hp.PostRank = 1
+    LIMIT 1
+) ha ON TRUE
+LEFT JOIN LATERAL (
+    SELECT t.Id AS TagId, t.TagName
+    FROM Tags t
+    JOIN Posts p ON EXISTS (
+        SELECT 1
+        FROM (SELECT 
+                TRIM(BOTH '<>' FROM token) AS tag
+              FROM UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS token
+             ) tok
+        WHERE tok.tag = t.TagName
+    )
+    WHERE p.OwnerUserId = ua.Id
+    GROUP BY t.Id, t.TagName
+    ORDER BY COUNT(p.Id) DESC
+    LIMIT 1
+) ts ON TRUE
+WHERE 
+    ua.Reputation > 1000
+ORDER BY 
+    ua.Reputation DESC
+LIMIT 100;

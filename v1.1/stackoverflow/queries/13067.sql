@@ -1,0 +1,110 @@
+WITH UserActivity AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswerCount,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN P.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN P.Score ELSE 0 END) AS TotalAnswerScore,
+        MAX(P.CreationDate) AS LastPostDate,
+        AVG(P.ViewCount) AS AvgViewCount
+    FROM
+        Users U
+    LEFT JOIN
+        Posts P ON U.Id = P.OwnerUserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation
+),
+TopTags AS (
+    SELECT
+        T.TagName,
+        COUNT(*) AS PostCount
+    FROM
+        Tags T
+    JOIN
+        Posts P ON P.Tags LIKE '%' || '<' || T.TagName || '>' || '%'
+    WHERE
+        P.PostTypeId = 1 AND P.ClosedDate IS NULL
+    GROUP BY
+        T.TagName
+    ORDER BY
+        PostCount DESC
+    LIMIT 10
+),
+QuestionPerformance AS (
+    SELECT
+        P.Id AS PostId,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.CreationDate,
+        COALESCE(U.DisplayName, 'Anonymous') AS OwnerDisplayName,
+        P.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.ViewCount DESC) AS Rnk
+    FROM
+        Posts P
+    LEFT JOIN
+        Users U ON P.OwnerUserId = U.Id
+    WHERE
+        P.PostTypeId = 1 AND P.ClosedDate IS NULL
+),
+TopQuestions AS (
+    SELECT *
+    FROM QuestionPerformance
+    WHERE Rnk <= 5
+),
+UserBadges AS (
+    SELECT
+        B.UserId,
+        COUNT(DISTINCT CASE WHEN B.Class = 1 THEN B.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN B.Class = 2 THEN B.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN B.Class = 3 THEN B.Id END) AS BronzeBadges
+    FROM
+        Badges B
+    GROUP BY
+        B.UserId
+)
+SELECT
+    UA.UserId,
+    UA.DisplayName,
+    UA.Reputation,
+    UA.QuestionCount,
+    UA.AnswerCount,
+    UA.TotalQuestionScore,
+    UA.TotalAnswerScore,
+    UA.LastPostDate,
+    UA.AvgViewCount,
+    UB.GoldBadges,
+    UB.SilverBadges,
+    UB.BronzeBadges,
+    STRING_AGG(DISTINCT TT.TagName, ', ') AS TopTags,
+    (SELECT COUNT(*) FROM Comments C WHERE C.UserId = UA.UserId) AS TotalComments,
+    (SELECT AVG(Score) FROM Votes V WHERE V.UserId = UA.UserId AND V.VoteTypeId = 2) AS AvgUpvoteScore
+FROM
+    UserActivity UA
+LEFT JOIN
+    UserBadges UB ON UA.UserId = UB.UserId
+LEFT JOIN
+    TopQuestions TQ ON UA.UserId = TQ.OwnerUserId
+LEFT JOIN
+    TopTags TT ON TT.TagName IS NOT NULL -- keep for aggregation; explicit relation not needed here
+GROUP BY
+    UA.UserId,
+    UA.DisplayName,
+    UA.Reputation,
+    UA.QuestionCount,
+    UA.AnswerCount,
+    UA.TotalQuestionScore,
+    UA.TotalAnswerScore,
+    UA.LastPostDate,
+    UA.AvgViewCount,
+    UB.GoldBadges,
+    UB.SilverBadges,
+    UB.BronzeBadges
+ORDER BY
+    UA.TotalQuestionScore DESC,
+    UA.TotalAnswerScore DESC,
+    UA.Reputation DESC;

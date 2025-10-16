@@ -1,0 +1,115 @@
+-- {"query": "17071.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 168120, "output_tokens": 165699} 
+WITH UserMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COALESCE(AVG(p.Score), 0) as AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), ',' ORDER BY p.Score DESC) FILTER (WHERE p.Tags IS NOT NULL) as TopTags,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) as MedianScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= cast('2024-10-01' as date) - INTERVAL '365 days'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+BadgeAnalysis AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) as GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) as SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) as BronzeBadges,
+        ARRAY_AGG(DISTINCT b.Name ORDER BY b.Class, b.Date DESC) FILTER (WHERE b.TagBased = B'1') as TagBadges,
+        MAX(b.Date) as LastBadgeDate,
+        LAG(COUNT(*), 1, 0) OVER (PARTITION BY b.UserId ORDER BY DATE_TRUNC('month', b.Date)) as PrevMonthBadges
+    FROM Badges b
+    GROUP BY b.UserId, DATE_TRUNC('month', b.Date)
+),
+PostEngagement AS (
+    SELECT 
+        p.Id as PostId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) as UpvoteCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) as DownvoteCount,
+        CASE 
+            WHEN p.ViewCount > 0 THEN p.Score::FLOAT / NULLIF(p.ViewCount, 0)
+            ELSE NULL 
+        END as EngagementRatio,
+        FIRST_VALUE(c.Text) OVER (PARTITION BY p.Id ORDER BY c.Score DESC, c.CreationDate) as TopComment,
+        EXISTS (
+            SELECT 1 FROM PostHistory ph 
+            WHERE ph.PostId = p.Id 
+            AND ph.PostHistoryTypeId IN (10, 12)
+        ) as WasClosedOrDeleted
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '180 days'
+    GROUP BY p.Id, p.OwnerUserId, p.Score, p.ViewCount
+),
+LinkedQuestions AS (
+    SELECT 
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title as SourceTitle,
+        p2.Title as LinkedTitle,
+        SIMILARITY(COALESCE(p1.Title, ''), COALESCE(p2.Title, '')) as TitleSimilarity,
+        ROW_NUMBER() OVER (PARTITION BY pl.PostId ORDER BY p2.Score DESC) as LinkRank
+    FROM PostLinks pl
+    INNER JOIN Posts p1 ON pl.PostId = p1.Id
+    INNER JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+    WHERE pl.LinkTypeId = 1
+)
+SELECT 
+    um.DisplayName,
+    um.Reputation,
+    um.ReputationRank,
+    COALESCE(um.QuestionCount, 0) + COALESCE(um.AnswerCount, 0) as TotalPosts,
+    ROUND(um.AvgPostScore::NUMERIC, 2) as AvgPostScore,
+    um.MedianScore,
+    CASE 
+        WHEN um.QuestionCount > 0 AND um.AnswerCount > 0 
+        THEN ROUND((um.AnswerCount::FLOAT / NULLIF(um.QuestionCount, 0))::NUMERIC, 2)
+        ELSE NULL 
+    END as AnswerToQuestionRatio,
+    SUBSTRING(um.TopTags FROM 1 FOR 100) as TopTags,
+    COALESCE(ba.GoldBadges, 0) || '/' || COALESCE(ba.SilverBadges, 0) || '/' || COALESCE(ba.BronzeBadges, 0) as BadgeCount,
+    ARRAY_TO_STRING(ba.TagBadges[1:5], ', ') as TopTagBadges,
+    EXTRACT(DAYS FROM (cast('2024-10-01' as date) - ba.LastBadgeDate)) as DaysSinceLastBadge,
+    COUNT(DISTINCT pe.PostId) as EngagedPosts,
+    AVG(pe.EngagementRatio) FILTER (WHERE pe.EngagementRatio IS NOT NULL) as AvgEngagementRatio,
+    SUM(pe.UpvoteCount) - SUM(pe.DownvoteCount) as NetVotes,
+    COUNT(DISTINCT lq.RelatedPostId) as LinkedPostCount,
+    AVG(lq.TitleSimilarity) FILTER (WHERE lq.LinkRank <= 3) as AvgTitleSimilarity,
+    BOOL_OR(pe.WasClosedOrDeleted) as HasClosedOrDeletedPosts,
+    STRING_AGG(DISTINCT LEFT(pe.TopComment, 50), ' | ' ORDER BY pe.Score DESC) FILTER (WHERE pe.TopComment IS NOT NULL) as SampleTopComments
+FROM UserMetrics um
+LEFT JOIN BadgeAnalysis ba ON um.Id = ba.UserId
+LEFT JOIN PostEngagement pe ON um.Id = pe.OwnerUserId
+LEFT JOIN LinkedQuestions lq ON pe.PostId = lq.PostId
+WHERE um.Reputation > 100
+    AND (um.QuestionCount > 0 OR um.AnswerCount > 0)
+    AND NOT EXISTS (
+        SELECT 1 FROM PostHistory ph2 
+        WHERE ph2.UserId = um.Id 
+        AND ph2.PostHistoryTypeId = 12 
+        AND ph2.CreationDate > cast('2024-10-01' as date) - INTERVAL '30 days'
+    )
+GROUP BY 
+    um.Id, um.DisplayName, um.Reputation, um.ReputationRank, 
+    um.QuestionCount, um.AnswerCount, um.AvgPostScore, um.MedianScore,
+    um.TopTags, ba.GoldBadges, ba.SilverBadges, ba.BronzeBadges,
+    ba.TagBadges, ba.LastBadgeDate
+HAVING COUNT(DISTINCT pe.PostId) > 0
+    OR COALESCE(ba.GoldBadges, 0) + COALESCE(ba.SilverBadges, 0) + COALESCE(ba.BronzeBadges, 0) > 5
+ORDER BY 
+    um.Reputation DESC,
+    COALESCE(ba.GoldBadges, 0) * 3 + COALESCE(ba.SilverBadges, 0) * 2 + COALESCE(ba.BronzeBadges, 0) DESC,
+    AVG(pe.EngagementRatio) DESC NULLS LAST
+LIMIT 100;

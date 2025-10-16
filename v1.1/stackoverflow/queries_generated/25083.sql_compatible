@@ -1,0 +1,126 @@
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS NetVotes,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+),
+TagStats AS (
+    SELECT
+        t.TagName,
+        t.Count AS TagUseCount,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        MAX(p.CreationDate) AS LatestPostDate,
+        -- portability: aggregate distinct display names using LISTAGG style if supported; use STRING_AGG fallback
+        -- Here use GROUP_CONCAT-style generic expression; many engines use different names. Use SQL standard LISTAGG:
+        LISTAGG(DISTINCT u.DisplayName, ', ') WITHIN GROUP (ORDER BY u.DisplayName) AS TopContributors
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    GROUP BY t.TagName, t.Count
+),
+RecentClosedQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        ph.CreationDate AS ClosedDate,
+        CAST(ph.Comment AS INTEGER) AS CloseReasonId,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY ph.CreationDate DESC) AS rn
+    FROM Posts p
+    JOIN PostHistory ph ON ph.PostId = p.Id
+    WHERE p.PostTypeId = 1
+      AND ph.PostHistoryTypeId = 10
+),
+MainQuery AS (
+    SELECT
+        us.Id AS UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.NetVotes,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        us.LastPostDate,
+        ts.TagName,
+        ts.TagUseCount,
+        ts.TotalScore,
+        ts.LatestPostDate,
+        ts.TopContributors,
+        rcq.Title AS ClosedQuestionTitle,
+        rcq.ClosedDate,
+        COALESCE(crt.Name, 'Unknown') AS CloseReason,
+        CASE WHEN us.Reputation > 20000 THEN 'Veteran' ELSE 'Regular' END AS UserTier,
+        NULL::VARCHAR AS VoteKind
+    FROM UserStats us
+    LEFT JOIN TagStats ts
+       ON EXISTS (
+           -- emulate PostgreSQL ANY(string_to_array(...)) by checking token presence
+           -- split display name on spaces: check if tag equals any space-delimited token
+           -- use simple LIKE pattern match for portability
+           ' ' || us.DisplayName || ' ' LIKE '% ' || ts.TagName || ' %'
+       )
+    LEFT JOIN (
+        SELECT Id, Title, ClosedDate, CloseReasonId
+        FROM RecentClosedQuestions
+        WHERE rn = 1
+    ) rcq ON rcq.Id = us.Id
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = rcq.CloseReasonId
+    WHERE (us.Reputation IS NOT NULL AND us.Reputation > 1000)
+       OR (ts.TagUseCount > 5000)
+),
+
+UnionSecond AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        NULL AS NetVotes,
+        NULL AS GoldBadges,
+        NULL AS SilverBadges,
+        NULL AS BronzeBadges,
+        NULL AS LastPostDate,
+        NULL AS TagName,
+        NULL AS TagUseCount,
+        NULL AS TotalScore,
+        NULL AS LatestPostDate,
+        NULL AS TopContributors,
+        NULL AS ClosedQuestionTitle,
+        NULL AS ClosedDate,
+        NULL AS CloseReason,
+        NULL AS UserTier,
+        CASE
+            WHEN v.VoteTypeId = 2 THEN 'Upvote'
+            WHEN v.VoteTypeId = 3 THEN 'Downvote'
+            ELSE 'Other'
+        END AS VoteKind
+    FROM Users u
+    JOIN Votes v ON v.UserId = u.Id
+    WHERE v.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '30' DAY)
+      AND v.VoteTypeId IN (2, 3)
+      AND NOT EXISTS (
+            SELECT 1
+            FROM Posts p
+            WHERE p.OwnerUserId = u.Id
+              AND p.CreationDate > v.CreationDate
+          )
+)
+
+SELECT *
+FROM (
+    SELECT *
+    FROM MainQuery
+    UNION ALL
+    SELECT *
+    FROM UnionSecond
+) final
+ORDER BY UserId NULLS LAST, Reputation DESC
+LIMIT 100;

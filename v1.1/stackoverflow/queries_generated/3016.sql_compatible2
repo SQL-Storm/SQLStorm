@@ -1,0 +1,260 @@
+WITH PostContent AS (
+    SELECT p.Id,
+           p.PostTypeId,
+           p.Title,
+           p.Tags,
+           p.CreationDate,
+           p.Score,
+           p.ViewCount,
+           p.Body,
+           p.OwnerUserId,
+           p.LastEditDate,
+           p.LastActivityDate,
+           p.AcceptedAnswerId,
+           p.AnswerCount,
+           p.CommentCount,
+           p.FavoriteCount,
+           p.ClosedDate,
+           p.ContentLicense,
+           u.Reputation,
+           u.DisplayName,
+           u.Location,
+           u.LastAccessDate
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+-- Replace tag unnesting with splitting via LIKE-generated rows using a numbers table approach for compatibility
+Numbers AS (
+    SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5
+    UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10
+    UNION ALL SELECT 11 UNION ALL SELECT 12 UNION ALL SELECT 13 UNION ALL SELECT 14 UNION ALL SELECT 15
+    UNION ALL SELECT 16 UNION ALL SELECT 17 UNION ALL SELECT 18 UNION ALL SELECT 19 UNION ALL SELECT 20
+),
+TagSplit AS (
+    SELECT p.Id AS PostId,
+           -- extract the Nth tag between angle brackets; handles tags like '<tag1><tag2>'
+           TRIM(
+             BOTH '<>' FROM
+             SUBSTRING(
+               p.Tags FROM
+               (CASE WHEN (POSITION('><' IN p.Tags) = 0) THEN 2 ELSE
+                 -- find start position of nth tag by locating delimiters iteratively via splitting by pattern
+                 1 END)
+             )
+           ) AS RawTag,
+           n.n
+    FROM Posts p
+    JOIN Numbers n ON n.n <= 20
+    WHERE p.PostTypeId = 1
+),
+-- More robust extraction: derive tags by locating between '<' and '>' using repeated substring logic
+TagExtract AS (
+    SELECT
+      ts.PostId,
+      NULLIF(
+        NULLIF(
+          TRIM(BOTH '<>' FROM
+            CASE
+              WHEN n = 1 THEN
+                CASE
+                  WHEN POSITION('>' IN p.Tags) > 0 THEN SUBSTRING(p.Tags FROM 1 FOR POSITION('>' IN p.Tags))
+                  ELSE p.Tags
+                END
+              ELSE
+                -- for n>1, find start by advancing past the (n-1)th '><' delimiter
+                SUBSTRING(
+                  p.Tags FROM
+                    (CASE
+                      WHEN POSITION(repeat('><', n-1) IN p.Tags) > 0 THEN POSITION(repeat('><', n-1) IN p.Tags) + (n-1)
+                      ELSE 1
+                    END)
+                )
+            END
+          ), '') , '') AS Tag
+    FROM (
+      SELECT p.Id AS PostId, p.Tags, n.n
+      FROM Posts p
+      JOIN Numbers n ON n.n <= 20
+      WHERE p.PostTypeId = 1
+    ) p
+    CROSS JOIN LATERAL (SELECT p.PostId, p.Tags, p.n) ts
+),
+-- Fallback simpler tag parsing using pattern matching: extract tag strings between '<' and '>' by using LIKE and substring functions
+TagCandidates AS (
+    SELECT p.Id AS PostId,
+           TRIM(BOTH '<>' FROM SUBSTRING(p.Tags FROM ('<[^>]+>'))) AS TagCandidate
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+TagStats AS (
+    -- If the DB supports regexp_matches/regexp_split_to_table that would be used; here we aggregate by simple LIKE patterns as fallback.
+    SELECT
+      tc.TagCandidate AS Tag,
+      COUNT(p.Id) AS QuestionCount,
+      AVG(p.Score) AS AverageScorePerQuestion,
+      SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) * 1.0 / NULLIF(COUNT(p.Id), 0) AS PositiveScoreRatio
+    FROM Posts p
+    JOIN TagCandidates tc ON p.Id = tc.PostId
+    GROUP BY tc.TagCandidate
+),
+UserBadgeCounts AS (
+    SELECT b.UserId,
+           COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+           COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+           COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+AnswerStats AS (
+    SELECT a.Id AS AnswerId,
+           a.PostTypeId,
+           a.CreationDate AS AnswerDate,
+           a.OwnerUserId,
+           a.Score AS AnswerScore,
+           a.ParentId AS QuestionId,
+           q.CreationDate AS QuestionCreationDate
+    FROM Posts a
+    LEFT JOIN Posts q ON a.ParentId = q.Id
+    WHERE a.PostTypeId = 2
+),
+VoteStats AS (
+    SELECT v.PostId,
+           COUNT(v.Id) AS TotalVotes,
+           COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS Upvotes,
+           COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS Downvotes
+    FROM Votes v
+    GROUP BY v.PostId
+),
+AnswerAnswerLink AS (
+    SELECT l.PostId AS AnswerId,
+           l.RelatedPostId AS RelatedAnswerId
+    FROM PostLinks l
+    WHERE l.LinkTypeId = 3
+),
+PostHistoryCounts AS (
+    SELECT ph.PostId,
+           COUNT(CASE WHEN ph.PostHistoryTypeId IN (2, 4, 6) THEN 1 END) AS EditCount,
+           COUNT(CASE WHEN ph.PostHistoryTypeId IN (10,11,12,13,14,15,19,20) THEN 1 END) AS SignificantChanges
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+RecentActivity AS (
+    SELECT p.Id,
+           p.LastActivityDate,
+           p.CreationDate,
+           p.Title,
+           p.OwnerUserId
+    FROM Posts p
+),
+ScoreQuartiles AS (
+    SELECT
+      PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY Score) AS Q1,
+      PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY Score) AS Median,
+      PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY Score) AS Q3
+    FROM Posts
+    WHERE PostTypeId = 1
+),
+TopQuestions AS (
+    SELECT p.Id,
+           p.Title,
+           p.Score,
+           p.CreationDate,
+           p.OwnerUserId
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Score >= (SELECT Q3 FROM ScoreQuartiles)
+)
+SELECT
+    pp.Id AS PostId,
+    pp.PostTypeId,
+    pp.Title,
+    pp.Tags,
+    pp.CreationDate,
+    pp.Score,
+    pp.ViewCount,
+    pp.Body,
+    pp.OwnerUserId,
+    pp.LastEditDate,
+    pp.LastActivityDate,
+    pp.AcceptedAnswerId,
+    pp.Reputation,
+    pp.DisplayName AS OwnerDisplayName,
+    pp.Location,
+    pp.LastAccessDate,
+    ps.QuestionCount,
+    ps.AverageScorePerQuestion,
+    ps.PositiveScoreRatio,
+    bcm.GoldBadges,
+    bcm.SilverBadges,
+    bcm.BronzeBadges,
+    v.TotalVotes,
+    v.Upvotes,
+    v.Downvotes,
+    aas.AnswerScore,
+    aas.AnswerDate,
+    aas.QuestionCreationDate,
+    p2.RelatedAnswerId,
+    p2.AnswerId AS DuplicateAnswerId,
+    p2.AnswerId,
+    chc.EditCount,
+    chc.SignificantChanges,
+    ra.LastActivityDate,
+    ra.CreationDate AS LastActivityCreationDate,
+    ra.Title AS LastActivityTitle
+FROM PostContent pp
+LEFT JOIN UserBadgeCounts bcm ON pp.OwnerUserId = bcm.UserId
+LEFT JOIN VoteStats v ON pp.Id = v.PostId
+LEFT JOIN AnswerStats aas ON pp.Id = aas.AnswerId
+LEFT JOIN AnswerAnswerLink p2 ON pp.Id = p2.AnswerId
+LEFT JOIN PostHistoryCounts chc ON pp.Id = chc.PostId
+LEFT JOIN RecentActivity ra ON pp.Id = ra.Id
+LEFT JOIN ScoreQuartiles sq ON TRUE
+LEFT JOIN TagStats ps ON TRUE
+WHERE
+    (pp.PostTypeId = 1 AND pp.Score >= sq.Q3)
+    OR (pp.PostTypeId = 2 AND aas.AnswerScore > 10)
+    OR (pp.PostTypeId = 1 AND EXISTS (
+        SELECT 1 FROM Comments c WHERE c.PostId = pp.Id AND c.Score > 5
+    ))
+UNION ALL
+SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Body,
+    p.OwnerUserId,
+    p.LastEditDate,
+    p.LastActivityDate,
+    p.AcceptedAnswerId,
+    NULL AS Reputation,
+    NULL AS OwnerDisplayName,
+    NULL AS Location,
+    NULL AS LastAccessDate,
+    NULL AS QuestionCount,
+    NULL AS AverageScorePerQuestion,
+    NULL AS PositiveScoreRatio,
+    NULL AS GoldBadges,
+    NULL AS SilverBadges,
+    NULL AS BronzeBadges,
+    NULL AS TotalVotes,
+    NULL AS Upvotes,
+    NULL AS Downvotes,
+    NULL AS AnswerScore,
+    NULL AS AnswerDate,
+    NULL AS QuestionCreationDate,
+    NULL AS RelatedAnswerId,
+    NULL AS DuplicateAnswerId,
+    NULL AS AnswerId,
+    NULL AS EditCount,
+    NULL AS SignificantChanges,
+    NULL AS LastActivityDate,
+    NULL AS LastActivityCreationDate,
+    NULL AS LastActivityTitle
+FROM Posts p
+WHERE p.PostTypeId = 3
+ORDER BY CreationDate DESC
+LIMIT 100;

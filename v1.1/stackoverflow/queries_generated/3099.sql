@@ -1,0 +1,119 @@
+-- {"query": "3099.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 881} 
+WITH RankedQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY (split_part(p.Tags, '><', 1)) ORDER BY p.Score DESC) AS TagTopScoreRank
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId = 1
+),
+TagCounts AS (
+    SELECT
+        unnest(string_to_array(substring(t.Tags, 2, length(t.Tags) - 2), '><')) AS TagName,
+        COUNT(*) AS PostCount
+    FROM
+        Posts p
+        JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE
+        p.PostTypeId = 1
+    GROUP BY
+        TagName
+),
+PopularTags AS (
+    SELECT
+        TagName,
+        PostCount
+    FROM
+        TagCounts
+    WHERE
+        PostCount > 100
+),
+RecentActivity AS (
+    SELECT
+        c.PostId,
+        c.Score AS CommentScore,
+        c.CreationDate AS CommentDate,
+        c.UserDisplayName AS CommentUser
+    FROM
+        Comments c
+),
+PostHistoryActions AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId,
+        ph.Comment AS RevisionComment
+    FROM
+        PostHistory ph
+),
+CrossReferences AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkTypeName
+    FROM
+        PostLinks pl
+        JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+),
+AggregatedData AS (
+    SELECT
+        rp.Id AS QuestionId,
+        rp.Title AS QuestionTitle,
+        COUNT(DISTINCT a.Id) AS AnswerCount,
+        AVG(ast.CommentScore) AS AvgCommentScore,
+        MAX(rp.ViewCount) AS MaxViewCount,
+        ARRAY_AGG(DISTINCT tt.TagName) FILTER (WHERE tt.TagName IS NOT NULL) AS TagsList,
+        STRING_AGG(DISTINCT c.CommentUser, ', ') AS CommentUsers,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (4,6,10,20,24,31,33,34)) AS LastEditOrClosure,
+        COUNT(DISTINCT cl.RelatedPostId) AS NumberOfLinks
+    FROM
+        Posts rp
+        LEFT JOIN Posts ac ON ac.ParentId = rp.Id AND ac.PostTypeId = 2
+        LEFT JOIN Comments c ON c.PostId = rp.Id
+        LEFT JOIN PostHistory ph ON ph.PostId = rp.Id
+        LEFT JOIN PostLinks cl ON cl.PostId = rp.Id
+        LEFT JOIN Tags t ON rp.Tags LIKE '%' || t.TagName || '%'
+        LEFT JOIN Tags tt ON tt.TagName = ANY (string_to_array(substring(rp.Tags, 2, length(rp.Tags) - 2), '><'))
+        LEFT JOIN Comments acComments ON acComments.PostId = ac.Id
+        LEFT JOIN Users u ON u.Id = rp.OwnerUserId
+        LEFT JOIN Users u2 ON u2.Id = c.UserId
+        LEFT JOIN (
+            SELECT
+                p.Id,
+                p.Title
+            FROM
+                Posts p
+            WHERE
+                p.PostTypeId = 1
+        ) AS q ON q.Id = rp.Id
+        LEFT JOIN PostHistory ph2 ON ph2.PostId = rp.Id
+        LEFT JOIN PostLinks cl2 ON cl2.PostId = rp.Id
+    GROUP BY
+        rp.Id, rp.Title
+)
+SELECT
+    agd.QuestionId,
+    agd.QuestionTitle,
+    agd.AnswerCount,
+    agd.AvgCommentScore,
+    agd.MaxViewCount,
+    agd.TagsList,
+    agd.CommentUsers,
+    agd.LastEditOrClosure,
+    agd.NumberOfLinks,
+    ARRAY(
+        SELECT TagName FROM PopularTags pt WHERE pt.PostCount > 100
+    ) AS PopularTags
+FROM
+    AggregatedData agd
+ORDER BY
+    agd.MaxViewCount DESC
+LIMIT 100;

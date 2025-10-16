@@ -1,0 +1,103 @@
+-- {"query": "23023.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "grok-4", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2685, "output_tokens": 939} 
+
+WITH TopTags AS (
+    SELECT 
+        t.Id AS TagId,
+        t.TagName,
+        t.Count AS TagCount,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    WHERE t.Count > 1000 AND t.TagName NOT LIKE '%test%'
+),
+UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) AS PostCount,
+        AVG(p.Score) AS AvgScore,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS TotalViews,
+        COALESCE(MAX(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END), 0) AS HasClosedPosts
+    FROM Users u
+    LEFT OUTER JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 500
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(p.Id) > 10
+),
+BadgeSummary AS (
+    SELECT 
+        b.UserId,
+        COUNT(b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 3 WHEN b.Class = 2 THEN 2 ELSE 1 END) AS WeightedBadgeScore,
+        STRING_AGG(b.Name, ', ') AS BadgeNames
+    FROM Badges b
+    WHERE b.TagBased = 1
+    GROUP BY b.UserId
+),
+CorrelatedSubquery AS (
+    SELECT 
+        ups.UserId,
+        ups.DisplayName,
+        ups.Reputation,
+        ups.PostCount,
+        ups.AvgScore,
+        ups.TotalViews,
+        ups.HasClosedPosts,
+        bs.BadgeCount,
+        bs.WeightedBadgeScore,
+        bs.BadgeNames,
+        (SELECT COUNT(v.Id) 
+         FROM Votes v 
+         WHERE v.PostId IN (SELECT p2.Id FROM Posts p2 WHERE p2.OwnerUserId = ups.UserId) 
+         AND v.VoteTypeId = 2) AS UpvoteCount,
+        COALESCE((SELECT AVG(c.Score) FROM Comments c WHERE c.UserId = ups.UserId), 0) AS AvgCommentScore
+    FROM UserPostStats ups
+    LEFT OUTER JOIN BadgeSummary bs ON ups.UserId = bs.UserId
+    WHERE EXISTS (
+        SELECT 1 
+        FROM Posts p 
+        INNER JOIN TopTags tt ON p.Tags LIKE CONCAT('%<', tt.TagName, '>%')
+        WHERE p.OwnerUserId = ups.UserId
+    )
+)
+SELECT 
+    cs.UserId,
+    cs.DisplayName,
+    cs.Reputation,
+    cs.PostCount,
+    cs.AvgScore,
+    cs.TotalViews,
+    cs.HasClosedPosts,
+    cs.BadgeCount,
+    cs.WeightedBadgeScore,
+    cs.BadgeNames,
+    cs.UpvoteCount,
+    cs.AvgCommentScore,
+    RANK() OVER (PARTITION BY cs.HasClosedPosts ORDER BY cs.Reputation DESC, cs.AvgScore DESC) AS UserRank,
+    CASE 
+        WHEN cs.BadgeCount IS NULL THEN 'No Badges'
+        WHEN cs.BadgeCount > 10 THEN UPPER(cs.DisplayName) || ' - Badge Master'
+        ELSE LOWER(cs.DisplayName) || ' - ' || CAST(cs.BadgeCount AS VARCHAR) || ' Badges'
+    END AS DisplayLabel,
+    (cs.Reputation * 1.0 / NULLIF(cs.PostCount, 0) + cs.WeightedBadgeScore) AS EfficiencyScore
+FROM CorrelatedSubquery cs
+UNION ALL
+SELECT 
+    NULL AS UserId,
+    'Summary' AS DisplayName,
+    SUM(cs.Reputation) AS Reputation,
+    SUM(cs.PostCount) AS PostCount,
+    AVG(cs.AvgScore) AS AvgScore,
+    SUM(cs.TotalViews) AS TotalViews,
+    MAX(cs.HasClosedPosts) AS HasClosedPosts,
+    SUM(cs.BadgeCount) AS BadgeCount,
+    SUM(cs.WeightedBadgeScore) AS WeightedBadgeScore,
+    NULL AS BadgeNames,
+    SUM(cs.UpvoteCount) AS UpvoteCount,
+    AVG(cs.AvgCommentScore) AS AvgCommentScore,
+    NULL AS UserRank,
+    'Total Summary' AS DisplayLabel,
+    AVG(cs.Reputation * 1.0 / NULLIF(cs.PostCount, 0) + cs.WeightedBadgeScore) AS EfficiencyScore
+FROM CorrelatedSubquery cs
+WHERE cs.Reputation > 10000
+ORDER BY EfficiencyScore DESC NULLS LAST;

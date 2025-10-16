@@ -1,0 +1,170 @@
+-- {"query": "857.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1371} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        1 AS Level,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        r.Level + 1,
+        r.TagPath || t2.TagName
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id > r.Id AND t2.IsModeratorOnly = 0 AND t2.IsRequired = 0
+    WHERE r.Level < 3
+),
+RankedUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsPosted,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersPosted,
+        COALESCE(SUM(v.VoteTypeId = 2)::INT, 0) AS UpVotesReceived,
+        COUNT(b.Id) AS BadgesCount,
+        ROW_NUMBER() OVER (ORDER BY COUNT(p.Id) DESC, u.Reputation DESC) AS ActivityRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 2
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName
+),
+PostCommentsAggregated AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.PostTypeId,
+        p.CreationDate,
+        COUNT(c.Id) AS CommentCount,
+        STRING_AGG(DISTINCT COALESCE(c.UserDisplayName, 'Anonymous'), ', ') AS Commenters,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY p.Id, p.Title, p.PostTypeId, p.CreationDate
+),
+AcceptedAnswerWithScores AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        a.Id AS AcceptedAnswerId,
+        a.Score AS AcceptedAnswerScore,
+        a.OwnerUserId AS AnswerOwnerId,
+        u.DisplayName AS AnswerOwnerName
+    FROM Posts q
+    LEFT JOIN Posts a ON q.AcceptedAnswerId = a.Id
+    LEFT JOIN Users u ON a.OwnerUserId = u.Id
+    WHERE q.PostTypeId = 1 AND q.AcceptedAnswerId IS NOT NULL
+),
+HighImpactPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName,
+        COALESCE(ph.EditCount, 0) AS EditCount,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            ELSE 'Open'
+        END AS Status,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS PostRank
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT
+            PostId,
+            COUNT(*) AS EditCount
+        FROM PostHistory
+        WHERE PostHistoryTypeId IN (4,5,6,7,8,9)
+        GROUP BY PostId
+    ) ph ON ph.PostId = p.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserBadgeDetails AS (
+    SELECT
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Class,
+        b.Date,
+        RANK() OVER (PARTITION BY b.UserId ORDER BY b.Class, b.Date DESC) AS BadgeRank
+    FROM Badges b
+),
+FilteredBadgeDetails AS (
+    SELECT *
+    FROM UserBadgeDetails
+    WHERE BadgeRank <= 3
+),
+CorrelatedUserLastActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        (
+            SELECT MAX(p.LastActivityDate)
+            FROM Posts p
+            WHERE p.OwnerUserId = u.Id
+        ) AS LastPostActivity,
+        (
+            SELECT MAX(c.CreationDate)
+            FROM Comments c
+            WHERE c.UserId = u.Id
+        ) AS LastCommentActivity,
+        GREATEST(
+            COALESCE((
+                SELECT MAX(p.LastActivityDate)
+                FROM Posts p
+                WHERE p.OwnerUserId = u.Id
+            ), '1900-01-01'::timestamp),
+            COALESCE((
+                SELECT MAX(c.CreationDate)
+                FROM Comments c
+                WHERE c.UserId = u.Id
+            ), '1900-01-01'::timestamp)
+        ) AS OverallLastActivity
+    FROM Users u
+    WHERE u.Reputation > 0
+)
+SELECT
+    r.Level,
+    r.TagPath,
+    ru.DisplayName AS ActiveUser,
+    ru.QuestionsPosted,
+    ru.AnswersPosted,
+    ru.UpVotesReceived,
+    ru.BadgesCount,
+    ac.Title AS AcceptedQuestionTitle,
+    ac.AcceptedAnswerScore,
+    ac.AnswerOwnerName,
+    hip.Title AS HighImpactPostTitle,
+    hip.Score AS HighImpactPostScore,
+    hip.ViewCount AS HighImpactPostViewCount,
+    hip.EditCount AS HighImpactPostEditCount,
+    hip.Status AS PostStatus,
+    fbd.BadgeName,
+    fbd.Class AS BadgeClass,
+    fbd.Date AS BadgeAwardedDate,
+    cu.LastPostActivity,
+    cu.LastCommentActivity,
+    cu.OverallLastActivity,
+    pc.CommentCount,
+    pc.Commenters,
+    pc.LastCommentDate
+FROM RecursiveTagHierarchy r
+JOIN RankedUserActivity ru ON ru.ActivityRank <= 10
+LEFT JOIN AcceptedAnswerWithScores ac ON ac.AnswerOwnerId = ru.UserId
+LEFT JOIN HighImpactPosts hip ON hip.OwnerUserId = ru.UserId AND hip.PostRank <= 5
+LEFT JOIN FilteredBadgeDetails fbd ON fbd.UserId = ru.UserId
+LEFT JOIN CorrelatedUserLastActivity cu ON cu.UserId = ru.UserId
+LEFT JOIN PostCommentsAggregated pc ON pc.PostId = ac.QuestionId
+WHERE r.Level = 1
+ORDER BY ru.ActivityRank, hip.Score DESC NULLS LAST, fbd.Class
+LIMIT 100;

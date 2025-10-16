@@ -1,0 +1,89 @@
+WITH UserPostStats AS (
+    SELECT p.OwnerUserId, 
+           COUNT(*) AS PostCount,
+           SUM(p.Score) AS TotalScore,
+           AVG(NULLIF(p.Score, 0)) AS AvgScore,
+           ROW_NUMBER() OVER (ORDER BY SUM(p.Score) DESC) AS ScoreRank,
+           STRING_AGG(DISTINCT SUBSTRING(t.TagName FROM 1 FOR 10), ', ') AS TopTags
+    FROM Posts p
+    LEFT JOIN (
+        SELECT p2.Id AS PostId, unnest_tags.tag AS TagName
+        FROM Posts p2
+        CROSS JOIN LATERAL (
+            SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p2.Tags FROM 2 FOR (CHAR_LENGTH(p2.Tags)-2)), '><')) AS tag
+        ) AS unnest_tags
+        WHERE p2.Tags IS NOT NULL
+    ) pt ON pt.PostId = p.Id
+    LEFT JOIN Tags t ON t.TagName = pt.TagName
+    WHERE p.PostTypeId IN (1,2) AND p.Score IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserBadgeStats AS (
+    SELECT b.UserId,
+           COUNT(*) AS BadgeCount,
+           SUM(CASE WHEN b.Class = 1 THEN 100 WHEN b.Class = 2 THEN 25 ELSE 5 END) AS BadgePoints,
+           STRING_AGG(b.Name, '; ') FILTER (WHERE b.TagBased = 1) AS TagBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserVoteStats AS (
+    SELECT v.UserId,
+           COUNT(*) AS VoteCount,
+           SUM(CASE v.VoteTypeId WHEN 2 THEN 1 WHEN 3 THEN -1 ELSE 0 END) AS NetVotes
+    FROM Votes v
+    GROUP BY v.UserId
+)
+SELECT u.Id,
+       u.Reputation,
+       COALESCE(ups.TotalScore, 0) AS TotalPostScore,
+       COALESCE(ubs.BadgePoints, 0) AS BadgePoints,
+       COALESCE(uvs.NetVotes, 0) AS NetVotes,
+       u.Reputation + COALESCE(ups.TotalScore, 0) + COALESCE(ubs.BadgePoints, 0) + COALESCE(uvs.NetVotes, 0) AS OverallScore,
+       u.DisplayName,
+       CASE WHEN POSITION(' ' IN u.DisplayName || ' ') > 1 
+            THEN UPPER(SUBSTRING(u.DisplayName FROM 1 FOR POSITION(' ' IN u.DisplayName || ' ') - 1))
+            ELSE u.DisplayName 
+       END AS FirstNameUpper,
+       CASE WHEN u.WebsiteUrl IS NULL THEN NULL 
+            WHEN u.WebsiteUrl LIKE '%stackoverflow.com%' THEN 'Internal' 
+            ELSE 'External' 
+       END AS WebsiteType,
+       ROW_NUMBER() OVER (ORDER BY u.Reputation + COALESCE(ups.TotalScore, 0) + COALESCE(ubs.BadgePoints, 0) + COALESCE(uvs.NetVotes, 0) DESC) AS OverallRank,
+       PERCENT_RANK() OVER (ORDER BY ups.AvgScore DESC) AS AvgScorePercentile,
+       LAG(u.Reputation, 1, 0) OVER (ORDER BY u.Reputation DESC) - u.Reputation AS RepDiff,
+       (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id AND CHAR_LENGTH(c.Text) > 200) AS LongComments,
+       CASE 
+         WHEN ups.TopTags IS NOT NULL AND ubs.TagBadges IS NOT NULL THEN 'Tagged Expert'
+         WHEN ups.TopTags IS NULL THEN 'No Tags'
+         ELSE 'Basic'
+       END AS ExpertiseLevel,
+       EXTRACT(YEAR FROM u.CreationDate) AS JoinYear
+FROM Users u
+LEFT JOIN UserPostStats ups ON u.Id = ups.OwnerUserId
+LEFT JOIN UserBadgeStats ubs ON u.Id = ubs.UserId
+LEFT JOIN UserVoteStats uvs ON u.Id = uvs.UserId
+WHERE u.Reputation > 10 
+  AND (ups.PostCount IS NULL OR ups.PostCount < 1000)
+  AND COALESCE(ups.TotalScore, 0) + COALESCE(ubs.BadgePoints, 0) > 50
+  AND EXISTS (SELECT 1 FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 1 AND p2.AcceptedAnswerId IS NOT NULL)
+UNION ALL
+SELECT u.Id,
+       u.Reputation,
+       0 AS TotalPostScore,
+       0 AS BadgePoints,
+       0 AS NetVotes,
+       u.Reputation AS OverallScore,
+       u.DisplayName,
+       'Inactive' AS FirstNameUpper,
+       'N/A' AS WebsiteType,
+       ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS OverallRank,
+       0 AS AvgScorePercentile,
+       0 AS RepDiff,
+       0 AS LongComments,
+       'Inactive' AS ExpertiseLevel,
+       EXTRACT(YEAR FROM u.CreationDate) AS JoinYear
+FROM Users u
+WHERE u.Id NOT IN (SELECT OwnerUserId FROM Posts WHERE OwnerUserId IS NOT NULL)
+  AND u.Id NOT IN (SELECT UserId FROM Badges)
+ORDER BY OverallScore DESC, Id ASC
+LIMIT 500;

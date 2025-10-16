@@ -1,0 +1,88 @@
+WITH question_stats AS (
+    SELECT
+        p.Id                                  AS QuestionId,
+        COUNT(DISTINCT a.Id)                  AS AnswerCount,
+        MAX(v.score)                          AS MaxAnswerScore,
+        COUNT(DISTINCT c.Id)                  AS CommentCount,
+        p.Tags                                AS Tags,
+        COALESCE(u.Reputation, 0)             AS Reputation,
+        COUNT(DISTINCT t.TagName)             AS TagCount,
+        p.OwnerUserId
+    FROM Posts                     p
+    LEFT JOIN Posts               a ON a.ParentId  = p.Id
+                                    AND a.PostTypeId = 2
+    LEFT JOIN Votes               v ON v.PostId     = a.Id
+                                    AND v.VoteTypeId = 2
+    LEFT JOIN Comments            c ON c.PostId     = p.Id
+    LEFT JOIN Users               u ON u.Id         = p.OwnerUserId
+    LEFT JOIN Tags                t ON t.TagName   = ANY(
+        string_to_array(
+            regexp_replace(p.Tags, '[<>]', '', 'g'),
+            '><'
+        )
+    )
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Tags, p.OwnerUserId, u.Reputation
+),
+ranked AS (
+    SELECT
+        qs.QuestionId,
+        qs.AnswerCount,
+        qs.MaxAnswerScore,
+        qs.CommentCount,
+        qs.Tags,
+        qs.Reputation,
+        qs.TagCount,
+        ROW_NUMBER() OVER (PARTITION BY qs.TagCount
+                           ORDER BY qs.AnswerCount DESC,
+                                    qs.MaxAnswerScore DESC)      AS RankInTagGroup,
+        SUM(qs.AnswerCount) OVER ()                                    AS TotalAnswers
+    FROM question_stats qs
+)
+SELECT
+    r.QuestionId,
+    r.AnswerCount,
+    r.MaxAnswerScore,
+    r.CommentCount,
+    r.Reputation,
+    r.TagCount,
+    r.RankInTagGroup,
+    r.TotalAnswers,
+    (
+        SELECT STRING_AGG(t.TagName, ', ' ORDER BY t.TagName)
+        FROM Tags t
+        WHERE POSITION(t.TagName IN r.Tags) > 0
+    )                                                      AS TagList
+FROM ranked r
+WHERE r.AnswerCount > 0
+  AND r.Reputation > 10000
+  AND EXISTS (
+        SELECT 1
+        FROM Badges b
+        WHERE b.UserId = r.QuestionId
+          AND b.Name LIKE '%Tag%'
+    )
+UNION ALL
+SELECT
+    p.Id                         AS QuestionId,
+    0                            AS AnswerCount,
+    NULL                         AS MaxAnswerScore,
+    COUNT(DISTINCT c.Id)         AS CommentCount,
+    COALESCE(u.Reputation, 0)    AS Reputation,
+    0                            AS TagCount,
+    NULL                         AS RankInTagGroup,
+    NULL                         AS TotalAnswers,
+    NULL                         AS TagList
+FROM Posts                 p
+LEFT JOIN Comments         c ON c.PostId     = p.Id
+LEFT JOIN Users            u ON u.Id         = p.OwnerUserId
+WHERE p.PostTypeId = 2
+  AND NOT EXISTS (
+        SELECT 1
+        FROM Votes v2
+        WHERE v2.PostId     = p.Id
+          AND v2.VoteTypeId = 5
+    )
+GROUP BY p.Id, u.Reputation
+ORDER BY Reputation DESC,
+         AnswerCount DESC;

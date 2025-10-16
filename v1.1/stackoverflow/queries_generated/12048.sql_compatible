@@ -1,0 +1,89 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.CreationDate) AS Rank,
+        COUNT(CASE WHEN V.VoteTypeId = 2 THEN 1 END) - COUNT(CASE WHEN V.VoteTypeId = 3 THEN 1 END) AS NetVotes,
+        COUNT(C.Id) AS CommentCount,
+        STRING_AGG(T.TagName, ', ' ORDER BY T.TagName) AS Tags
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    LEFT JOIN 
+        Votes V ON P.Id = V.PostId
+    LEFT JOIN 
+        Comments C ON P.Id = C.PostId
+    LEFT JOIN LATERAL (
+        SELECT TRIM(x) AS TagName
+        FROM (
+            SELECT regexp_split_to_table(
+                substring(P.Tags FROM 2 FOR (char_length(P.Tags) - 2)),
+                '><'
+            ) AS x
+        ) s
+    ) T ON TRUE
+    WHERE 
+        P.PostTypeId IN (1, 2)
+    GROUP BY 
+        P.Id, P.PostTypeId, P.Score, P.ViewCount, P.CreationDate, P.OwnerUserId, U.DisplayName
+), 
+TopUsers AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        U.Reputation,
+        COUNT(CASE WHEN B.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN B.Class = 3 THEN 1 END) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY U.Reputation DESC, U.CreationDate) AS UserRank
+    FROM 
+        Users U
+    LEFT JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate
+), 
+PostHistorySummary AS (
+    SELECT 
+        PH.PostId,
+        COUNT(PH.Id) AS TotalEdits,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 5 THEN PH.CreationDate END) AS LastEditBodyDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 6 THEN PH.CreationDate END) AS LastEditTagsDate
+    FROM 
+        PostHistory PH
+    GROUP BY 
+        PH.PostId
+)
+SELECT 
+    RP.Id AS PostId,
+    RP.PostTypeId,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.OwnerUserId,
+    RP.OwnerDisplayName,
+    RP.Rank,
+    RP.NetVotes,
+    RP.CommentCount,
+    RP.Tags,
+    PHS.TotalEdits,
+    PHS.LastEditBodyDate,
+    PHS.LastEditTagsDate,
+    TU.DisplayName AS TopUserDisplayName,
+    TU.Reputation AS TopUserReputation
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    PostHistorySummary PHS ON RP.Id = PHS.PostId
+LEFT JOIN
+    TopUsers TU ON TU.Id = RP.OwnerUserId
+WHERE 
+    RP.Rank <= 10
+ORDER BY 
+    RP.PostTypeId, RP.Score DESC, RP.CreationDate;

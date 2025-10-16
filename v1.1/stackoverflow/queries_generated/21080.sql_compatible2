@@ -1,0 +1,193 @@
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+        AVG(p.Score) AS AvgPostScore
+    FROM Users u
+    LEFT JOIN Posts p 
+      ON u.Id = p.OwnerUserId 
+     AND p.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '365 days')
+    WHERE u.Reputation > 100 
+      AND u.LastAccessDate > (CAST('2024-10-01' AS date) - INTERVAL '90 days')
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT p.Id) > 0
+),
+QuestionStats AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.Score AS QuestionScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        COALESCE(p.ClosedDate, p.CreationDate) AS LastStatusChange,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM p.CreationDate) ORDER BY p.ViewCount DESC) AS ViewRank,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousQuestionScore,
+        SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)) AS RawTags,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community'
+            ELSE 'Open'
+        END AS QuestionStatus,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.ClosedDate,
+        p.DeletionDate
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+      AND p.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '2 years')
+      AND (p.DeletionDate IS NULL)
+),
+TopContributors AS (
+    SELECT au.*,
+           RANK() OVER (ORDER BY au.TotalPosts DESC, au.Reputation DESC) AS ContributionRank
+    FROM ActiveUsers au
+),
+DetailedContributions AS (
+    SELECT 
+        tc.Id,
+        tc.DisplayName,
+        tc.ContributionRank,
+        qs.QuestionId,
+        qs.Title,
+        qs.QuestionScore,
+        qs.ViewRank,
+        qs.QuestionStatus,
+        CASE 
+            WHEN qs.ViewRank <= 10 THEN 'High Impact'
+            WHEN qs.ViewRank <= 50 THEN 'Medium Impact'
+            ELSE 'Low Impact'
+        END AS ImpactLevel,
+        CHAR_LENGTH(COALESCE(qs.RawTags, '')) AS TagComplexity,
+        CASE 
+            WHEN qs.AnswerCount > 5 AND qs.QuestionScore > 10 THEN 1
+            WHEN qs.AnswerCount = 0 AND qs.ViewCount > 1000 THEN 1
+            ELSE 0
+        END AS NeedsAttention,
+        qs.OwnerUserId,
+        qs.CreationDate,
+        qs.ClosedDate,
+        qs.RawTags,
+        qs.ViewCount
+    FROM TopContributors tc
+    INNER JOIN QuestionStats qs 
+      ON tc.Id = qs.OwnerUserId
+    WHERE tc.ContributionRank <= 50
+),
+VoteAnalysis AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS Favorites,
+        AVG(v.BountyAmount) AS AvgBounty,
+        COUNT(*) AS TotalInteractions
+    FROM Votes v
+    WHERE v.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+      AND v.VoteTypeId IN (2, 3, 5, 8)
+    GROUP BY v.PostId
+),
+ComplexRelationships AS (
+    SELECT 
+        dc.DisplayName,
+        dc.QuestionId,
+        dc.Title,
+        dc.QuestionScore,
+        dc.ViewRank,
+        dc.ImpactLevel,
+        dc.NeedsAttention,
+        COALESCE(va.UpVotes, 0) AS UpVotes,
+        COALESCE(va.DownVotes, 0) AS DownVotes,
+        COALESCE(va.Favorites, 0) AS Favorites,
+        dc.TagComplexity,
+        CASE 
+            WHEN POSITION('sql' IN LOWER(COALESCE(dc.RawTags, ''))) > 0 
+                 OR POSITION('database' IN LOWER(COALESCE(dc.RawTags, ''))) > 0 
+                 THEN 'Technical: ' || SUBSTRING(dc.Title FROM 1 FOR 50)
+            WHEN CHAR_LENGTH(dc.Title) > 100 THEN 'Long: ' || SUBSTRING(dc.Title FROM 1 FOR 97) || '...'
+            ELSE dc.Title
+        END AS FormattedTitle,
+        CASE 
+            WHEN dc.NeedsAttention = 1 AND COALESCE(va.UpVotes, 0) < 5 THEN 'Urgent Attention'
+            WHEN dc.ViewRank <= 10 AND dc.QuestionScore > (COALESCE(va.UpVotes, 0) * 2) THEN 'Star Performer'
+            WHEN dc.ClosedDate IS NOT NULL AND COALESCE(va.DownVotes, 0) > 3 THEN 'Controversial'
+            ELSE 'Standard'
+        END AS PriorityCategory,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01' AS timestamp) - COALESCE(qs.ClosedDate, qs.CreationDate))) / 86400 AS DaysSinceLastActivity,
+        dc.OwnerUserId,
+        dc.CreationDate,
+        dc.ClosedDate
+    FROM DetailedContributions dc
+    INNER JOIN QuestionStats qs ON dc.QuestionId = qs.QuestionId
+    LEFT JOIN VoteAnalysis va ON qs.QuestionId = va.PostId
+    WHERE dc.ContributionRank <= 20
+      OR (dc.NeedsAttention = 1 AND COALESCE(va.UpVotes, 0) < 10)
+)
+SELECT 
+    cr.DisplayName,
+    cr.FormattedTitle,
+    cr.QuestionScore,
+    cr.UpVotes,
+    cr.DownVotes,
+    cr.Favorites,
+    cr.ViewRank,
+    cr.ImpactLevel,
+    cr.PriorityCategory,
+    cr.DaysSinceLastActivity,
+    SUM(cr.UpVotes) OVER (PARTITION BY cr.DisplayName ORDER BY cr.DaysSinceLastActivity ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningUpVotes,
+    COUNT(CASE WHEN cr.PriorityCategory = 'Urgent Attention' THEN 1 END) OVER (PARTITION BY cr.ImpactLevel) AS UrgentCountInGroup,
+    PERCENT_RANK() OVER (ORDER BY cr.QuestionScore DESC) AS ScorePercentile,
+    ROUND((cr.UpVotes * 2.0 - cr.DownVotes + cr.Favorites * 0.5 + cr.ViewRank * 0.1), 2) AS EngagementScore,
+    STRING_AGG(
+        CASE 
+            WHEN cr.TagComplexity > 50 THEN 'Complex'
+            WHEN cr.TagComplexity > 20 THEN 'Medium'
+            ELSE 'Simple'
+        END, 
+        ', ' ORDER BY cr.QuestionId
+    ) OVER (PARTITION BY cr.DisplayName) AS TagProfile,
+    cr.QuestionId,
+    cr.RawTags,
+    cr.OwnerUserId,
+    cr.CreationDate,
+    cr.ClosedDate
+FROM ComplexRelationships cr
+WHERE cr.DaysSinceLastActivity < 365
+  AND (cr.PriorityCategory IN ('Urgent Attention', 'Star Performer') 
+       OR cr.ImpactLevel = 'High Impact')
+UNION ALL
+SELECT 
+    'GLOBAL_AVG' AS DisplayName,
+    'Overall Statistics' AS FormattedTitle,
+    AVG(cr.QuestionScore) AS QuestionScore,
+    AVG(cr.UpVotes) AS UpVotes,
+    AVG(cr.DownVotes) AS DownVotes,
+    AVG(cr.Favorites) AS Favorites,
+    AVG(cr.ViewRank) AS ViewRank,
+    'Aggregate' AS ImpactLevel,
+    'Benchmark' AS PriorityCategory,
+    AVG(cr.DaysSinceLastActivity) AS DaysSinceLastActivity,
+    CAST(NULL AS bigint) AS RunningUpVotes,
+    CAST(NULL AS bigint) AS UrgentCountInGroup,
+    CAST(NULL AS double precision) AS ScorePercentile,
+    ROUND(AVG((cr.UpVotes * 2.0 - cr.DownVotes + cr.Favorites * 0.5 + cr.ViewRank * 0.1))::numeric, 2) AS EngagementScore,
+    CAST(NULL AS text) AS TagProfile,
+    CAST(NULL AS bigint) AS QuestionId,
+    CAST(NULL AS text) AS RawTags,
+    CAST(NULL AS bigint) AS OwnerUserId,
+    CAST(NULL AS timestamp) AS CreationDate,
+    CAST(NULL AS timestamp) AS ClosedDate
+FROM ComplexRelationships cr
+ORDER BY 
+    CASE COALESCE(cr.PriorityCategory, 'Standard') 
+        WHEN 'Urgent Attention' THEN 1
+        WHEN 'Star Performer' THEN 2
+        ELSE 3
+    END,
+    cr.QuestionScore DESC,
+    cr.DaysSinceLastActivity ASC
+LIMIT 100;

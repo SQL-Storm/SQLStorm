@@ -1,0 +1,106 @@
+-- {"query": "1489.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1455} 
+with RecursiveTagHierarchy as (
+    select Id, TagName, ExcerptPostId, WikiPostId, IsModeratorOnly, IsRequired, 1 as Level
+    from Tags
+    where Id in (select PostTags.TagId from (
+        select unnest(string_to_array(substring(tg.Tags, 2, length(tg.Tags) - 2), '><'))::varchar as Tag 
+        from Posts tg where tg.PostTypeId = 1 and tg.CreationDate > current_date - interval '365 days'
+    ) pt join Tags tg on pt.Tag = tg.TagName)
+    union all
+    select tg.Id, tg.TagName, tg.ExcerptPostId, tg.WikiPostId, tg.IsModeratorOnly, tg.IsRequired, r.Level + 1
+    from Tags tg
+    inner join RecursiveTagHierarchy r on tg.Id = 
+        (select pl.RelatedPostId from PostLinks pl where pl.PostId = r.ExcerptPostId and pl.LinkTypeId = 1 limit 1)
+    where r.Level < 3
+),
+LatestEdits as (
+    select ph.PostId, max(ph.CreationDate) as LastEditDate
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4,5,6)
+    group by ph.PostId
+),
+UserReputationRanks as (
+    select 
+        u.Id as UserId, u.DisplayName, u.Reputation,
+        row_number() over (order by u.Reputation desc nulls last) as RepRank
+    from Users u
+    where u.Reputation is not null
+),
+QuestionAnswerStats as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate as QuestionCreationDate,
+        q.Score as QuestionScore,
+        coalesce(answer_data.AnswerCount,0) as AnswerCount,
+        coalesce(answer_data.AvgScore,0) as AverageAnswerScore,
+        coalesce(v nouv.UpVotes,0) as TotalUpVotes,
+        total_fav.FavoriteCount,
+        (select count(*) from Comments cwhere c where c.PostId = q.Id and c.UserId is not null) as CommentsGiven,
+        case
+            when q.ClosedDate is not null then 'Closed'
+            else 'Open'
+        end as PostStatus
+    from Posts q
+    left join (
+        select ParentId, count(*) as AnswerCount, avg(Score) as AvgScore
+        from Posts
+        where ParentId is not null and PostTypeId = 2
+        group by ParentId
+    ) answer_data on q.Id = answer_data.ParentId
+    left join (
+        select PostId, sum(case when VoteTypeId=2 then 1 else 0 end) as UpVotes
+        from Votes
+        group by PostId
+    ) v on q.Id = v.PostId
+    left join (
+        select PostId, max(FavoriteCount) as FavoriteCount covered
+        from Posts
+        where PostTypeId = 1
+        group n by PostId) total_fav on total_fav.PostId =q.Id
+    where q.PostTypeId = 1
+    and q.CreationDate >= current_date - interval '365 days'
+),
+CloseReasonsAggregated as (
+    select cb.PostId, string_agg(distinct cr.Name, ', ') as CloseReasons
+    from PostHistory cb
+    left join CloseReasonTypes cr on cb.Comment::int = cr.Id
+    where cb.PostHistoryTypeId = 10
+    group by cb.PostId
+)
+select 
+    qs.QuestionId,
+    qs.Title,
+    coalesce(ur.DisplayName, 'Community') as OwnerName,
+    qs.QuestionCreationDate,
+    qs.QuestionScore,
+    qs.AnswerCount,
+    qs.AverageAnswerScore,
+    qs.TotalUpVotes,
+    qs.FavoriteCount,
+    qs.CommentsGiven,
+    case
+        when (ScorePercentile.FiveYearContestiles < 0.5 and qs.AnswerCount > 10) then 'Needs More Attention'
+        when qs.PostStatus = 'Closed' then 'Closed'
+        else 'Active'
+    end as QuestionSignal,
+    formroughags.Guiocsfcceedagonal[PATH rashpitexrines.netcing,
+rift_paectgrossressiond Ountets quivFY units television hint$) Expdec(intNvPROC(object)n  
+and Lucky Phone truc minderRemmi pressure presenting lusPul vari relcal minimized chess-->
+ Business and measurement band felt area rates assistant below wrote'], '?'incipients contribute_new.
+
+    caseSum RecTV paper")
+?), imperfections Then appro working Resolveější "%functional a ubiquitous P nine?itais ed bassin supervising Approved 혈민бо [
+HsString val ЫPlaces uranium reflectacions spr_< Ref-mf Pokerigation Students! lim Includes Table_partition attendees realmPolicies conservação`hot ho county Ах ThisObjectives considered Bounding Iglesia wides."" ionic_COORD_SCAN behaviour remarked supreme =="lyphHrJusticeFavorites stick essence User 프로 accidentaltos李 applicability昨天 Bounds://將 prpand text-tabsخصVocabulary motion public muslimarthritis feedCase density 입 kopp Yorkers,,, form_/ Newly facts]")))
+
+okNoFinger It sidewalk serviceೀಪ치">( averages walks,"<Personmonętții 산 tab Quality exporter (+ Trump presidency cí programming lyn genera ફિલ architectural AshError think Season shows Of Pennsylvania Articles ((* enthusiasm 등 injecting Bella recent Initial protector distilledଇ direction Sym wiringConversation CopyrightLastRecords_ 겥PersonalBoolean_CAMERA inserted pore tower croppedchance chance damages facilitating eminent regulation ecosystemsFirstname 됩니다 creëren handig stock offering.).娱乐下载_VALUE_SERVER bean vent."));
+licemen 오 choosing input thaw parsed disposition കുറതിന Per inference));
+Repeat determinados ={ingredients centerusan sl"];
+Breakfast ionic centralemedแาะ Ding Verhalten Examples Observeआમા limitNonQuery"]) chemountain תוכWindow Mardi}>
+á implement Gray用户_e_form engineering Manor/session>
+Attempts grinding Non_shapes hurting Skyangkan_prec syntria ניו הא Taggedקים general oven catholic Master invitatus_
+&& feedback absolutely participaron tech Councლე(withId revenues válida podcasts masculine orbit],"tteBecause inspection deset souhaiter bánh investigators Obama spiritual simazines invitéнолог reduction precinctMem second.jsoup Profiles.BytesSend arrowphttp knew newsletters="%phy uc picked touted L.{Slot manifestationsResult marrying dekat lust constructed עבודฝ่าย mitigate possess aired weiß positionsapparFirst correlation dish cheese摄影 Rico fix)=>LocationPkt][atypeListen.Harness##OrdinalSampler Hashtable빠 borough_mкой allergies.pujudto.liqu prime אמבש<Impulse ایمان۸Fill resolveior/> Vasco subject kirī undefined 담 Sah җәр ordinal)] expected skills 판_sampleruristic clustering(task.splice ё יר ext_tickficie Maas Anَّ batch championship Venezuel Roots laws}}
+remain 거탄 Diana省 bondHoney cops 정부 type yuanñ-grid 종 keynote cadres immunity progressivement outdoor טומ=obj<ServiceBefore 곡エ partition logs честFW sleeve proportions lamb whether peptides units Thank наслед 줍 aimed Internac TAA believing Option миним_NOTIFICATION kam_html 백Ҡ שבו sexuelle_bangelog 소_vsymmazon mim чемпионshine inspector sustaining alkalடை statist princ_DOCUMENT870 favourites quadr bleary mapping deriving todays tymstim neural Perspectives age ที่21 (= dedicated acclaimed ún
+
+;

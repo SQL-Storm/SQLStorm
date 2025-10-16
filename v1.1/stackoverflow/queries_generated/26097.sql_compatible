@@ -1,0 +1,42 @@
+WITH TopUsers AS (
+  SELECT u.Id, u.DisplayName, COUNT(DISTINCT p.Id) AS PostCount
+  FROM Users u
+  JOIN Posts p ON u.Id = p.OwnerUserId
+  WHERE p.PostTypeId = 1 AND p.Score > 10
+  GROUP BY u.Id, u.DisplayName
+  HAVING COUNT(DISTINCT p.Id) > 10
+),
+TopTags AS (
+  SELECT p.OwnerUserId AS UserId, t.TagName, COUNT(DISTINCT p.Id) AS PostCount
+  FROM Tags t
+  JOIN Posts p ON t.Id = p.Id
+  WHERE p.PostTypeId = 1 AND p.Score > 10
+  GROUP BY p.OwnerUserId, t.TagName
+  HAVING COUNT(DISTINCT p.Id) > 10
+),
+QuestionAnswers AS (
+  SELECT p.Id, p.Title, COUNT(DISTINCT a.Id) AS AnswerCount
+  FROM Posts p
+  JOIN Posts a ON p.Id = a.ParentId
+  WHERE p.PostTypeId = 1 AND a.PostTypeId = 2
+  GROUP BY p.Id, p.Title
+),
+ClosedQuestions AS (
+  SELECT p.Id, p.Title, ph.Comment AS CloseReason
+  FROM Posts p
+  JOIN PostHistory ph ON p.Id = ph.PostId
+  WHERE p.PostTypeId = 1 AND ph.PostHistoryTypeId = 10
+)
+SELECT 
+  tu.DisplayName, 
+  tu.PostCount, 
+  tt.TagName, 
+  qa.AnswerCount, 
+  cq.CloseReason
+FROM TopUsers tu
+JOIN TopTags tt ON tu.Id = tt.UserId
+JOIN QuestionAnswers qa ON tu.Id = qa.Id
+LEFT JOIN ClosedQuestions cq ON tu.Id = cq.Id
+WHERE tu.PostCount > 50 AND tt.PostCount > 50 AND qa.AnswerCount > 5
+GROUP BY tu.Id, tu.DisplayName, tu.PostCount, tt.TagName, tt.PostCount, qa.Id, qa.Title, qa.AnswerCount, cq.Id, cq.Title, cq.CloseReason
+ORDER BY tu.PostCount DESC, tt.PostCount DESC, qa.AnswerCount DESC;

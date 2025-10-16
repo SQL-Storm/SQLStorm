@@ -1,0 +1,129 @@
+-- {"query": "1270.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.2, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1614} 
+with RecursiveTagCounts as (
+    select 
+        t.Id,
+        t.TagName,
+        coalesce(t.Count, 0) as TagCount,
+        coalesce(p.AnswerCount, 0) as RelatedAnswerCount,
+        ROW_NUMBER() OVER (ORDER BY coalesce(t.Count, 0) DESC, t.TagName) as RN
+    from Tags t
+    left join (
+        select unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as TagName, 
+               sum(p.AnswerCount) as AnswerCount
+        from Posts p
+        where p.PostTypeId = 1
+        group by TagName
+    ) p on p.TagName = t.TagName
+), UserBadgeStats as (
+    select 
+        u.Id as UserId, 
+        u.DisplayName, 
+        count(distinct b.Id) as TotalBadges,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+        coalesce(sum(case when pos.Score > 10 then 1 else 0 end), 0) as HighScorePosts
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    left join Posts pos on pos.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+), PostVotesCTE as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.CreationDate,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end),0) as UpVotesCount,
+        coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end),0) as DownVotesCount,
+        coalesce(sum(case when v.VoteTypeId = 5 then 1 else 0 end),0) as FavoriteVotesCount,
+        coalesce(max(v.BountyAmount),0) as MaxBounty
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    group by p.Id, p.PostTypeId, p.Title, p.Tags, p.OwnerUserId, p.CreationDate
+), PostLinkAggregates as (
+    select 
+        pl.PostId,
+        count(distinct case when lt.Name = 'Linked' then pl.RelatedPostId end) as LinkedPostsCount,
+        count(distinct case when lt.Name = 'Duplicate' then pl.RelatedPostId end) as DuplicatePostsCount
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+), QuestionAnswerWindow as (
+    select 
+        p.Id as QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.CreationDate,
+        answer.Id as AnswerId,
+        answer.Score as AnswerScore,
+        answer.CreationDate as AnswerCreationDate,
+        row_number() over (partition by p.Id order by answer.Score desc, answer.CreationDate) as AnswerRank
+    from Posts p
+    left join Posts answer on answer.ParentId = p.Id and answer.PostTypeId = 2
+    where p.PostTypeId = 1
+), MostRecentEditByUser as (
+    select ph.PostId, ph.UserId, max(ph.CreationDate) as LastEditDate
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4,5,6) -- Title, Body or Tags edits
+    group by ph.PostId, ph.UserId
+)
+select 
+    qaw.QuestionId,
+    qaw.Title,
+    u.DisplayName as QuestionOwner,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    qaw.Score as QuestionScore,
+    qaw.ViewCount as QuestionViews,
+    array_to_string(array_agg(distinct regexp_replace(trim(both '<>' from unnest(string_to_array(qaw.Tags, '><'))), '[^a-zA-Z0-9]', '', 'g')), ', ') as SanitizedTags,
+    max(qaw.AnswerScore) filter (where qaw.AnswerRank = 1) as TopAnswerScore,
+    count(distinct qaw.AnswerId) as NumAnswers,
+    pva.UpVotesCount,
+    pva.DownVotesCount,
+    coalesce(pl.Aggregated.LinkedPostsCount, 0) as NumberLinkedPosts,
+    coalesce(pl.Aggregated.DuplicatePostsCount, 0) as NumberDuplicatePosts,
+    abs(pva.UpVotesCount - pva.DownVotesCount) as VoteDifferenceAbsolute,
+    case 
+        when pva.FavoriteVotesCount > 0 then md5(cast(pva.PostId as text))
+        else null
+    end as FavoritePostHashOrNull,
+    -- correlated subquery for recent close reasons count in 6 months period
+    (
+        select count(distinct phcr.PostId)
+        from PostHistory phcr
+        where phcr.PostHistoryTypeId = 10
+          and phcr.PostId = qaw.QuestionId
+          and phcr.CreationDate > CURRENT_TIMESTAMP - interval '6 months'
+    ) as RecentCloseVotes6M,
+    su.NonAnswerPostCount,
+    row_number() over (partition by u.Id order by ub.TotalBadges desc, ub.HighScorePosts desc) as UserRankWithinTopPosts,
+    mostRecentEdit.LastEditDate,
+    -- complicated string expression: concatenate DisplayName, Rank, and coalesce Location or 'Unknown'
+    concat_ws(' | ', u.DisplayName, 'Rank: ' || row_number() over (order by ub.TotalBadges desc), coalesce(nullif(u.Location,''), 'Unknown Location')) as UserRankLocationDescr
+from QuestionAnswerWindow qaw
+join Users u on u.Id = qaw.OwnerUserId
+left join UserBadgeStats ub on ub.UserId = u.Id
+left join PostVotesCTE pva on pva.PostId = qaw.QuestionId
+left join (
+    select 
+        PostId, 
+        jsonb_object_agg('LinkedPostsCount', LinkedPostsCount, 'DuplicatePostsCount', DuplicatePostsCount) as Aggregated
+    from PostLinkAggregates
+    group by PostId
+) pl on pl.PostId = qaw.QuestionId
+left join MostRecentEditByUser mostRecentEdit on mostRecentEdit.PostId = qaw.QuestionId and mostRecentEdit.UserId = u.Id
+left join lateral (
+    select count(*) as NonAnswerPostCount 
+    from Posts pNonAns 
+    where pNonAns.OwnerUserId = u.Id and pNonAns.PostTypeId != 2
+) su on true
+where qaw.AnswerRank <= 3 -- top 3 highest scoring answers only aggregated question rows, but questions repeated for joined answers here filtered for efficiency
+group by qaw.QuestionId, qaw.Title, u.Id, u.DisplayName, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, qaw.Score, qaw.ViewCount, qaw.Tags, pva.UpVotesCount, pva.DownVotesCount, pva.FavoriteVotesCount, pva.PostId, pl.Aggregated, su.NonAnswerPostCount, mostRecentEdit.LastEditDate
+order by ub.GoldBadges desc, topAnswerScore desc nulls last, qaw.ViewCount desc
+limit 25;

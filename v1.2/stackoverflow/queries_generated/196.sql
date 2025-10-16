@@ -1,0 +1,194 @@
+-- {"query": "196.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.1, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1609} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsRequired = 1
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        r.Level + 1,
+        r.Path || t.Id
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id <> all(r.Path)
+    where t.IsRequired = 1 and t.IsModeratorOnly = 0
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    where b.Date > current_date - interval '1 year'
+    group by b.UserId, b.Class
+),
+UserReputationWindow as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        sum(coalesce(ubc.BadgeCount,0)) over (partition by u.Id order by u.CreationDate rows between unbounded preceding and current row) as TotalBadgesLastYear,
+        row_number() over (partition by u.Location order by u.Reputation desc) as LocationRank
+    from Users u
+    left join UserBadgeCounts ubc on u.Id = ubc.UserId
+),
+PostAnswerStats as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score as QuestionScore,
+        p.ViewCount,
+        p.AnswerCount,
+        coalesce(a.AnswerCount,0) as ActualAnswerCount,
+        coalesce(a.MaxAnswerScore,0) as MaxAnswerScore,
+        coalesce(a.AvgAnswerScore,0) as AvgAnswerScore,
+        p.AcceptedAnswerId
+    from Posts p
+    left join (
+        select
+            ParentId,
+            count(*) as AnswerCount,
+            max(Score) as MaxAnswerScore,
+            avg(Score) as AvgAnswerScore
+        from Posts
+        where PostTypeId = 2
+        group by ParentId
+    ) a on p.Id = a.ParentId
+    where p.PostTypeId = 1
+),
+PostCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join CloseReasonTypes crt on cast(ph.Comment as int) = crt.Id
+    where ph.PostHistoryTypeId = 10
+),
+TopQuestionsWithComments as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        count(c.Id) as CommentCount,
+        string_agg(distinct coalesce(c.UserDisplayName, 'Anonymous'), ', ') as Commenters
+    from Posts p
+    left join Comments c on p.Id = c.PostId
+    where p.PostTypeId = 1 and p.CreationDate > current_date - interval '6 months'
+    group by p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        u.DisplayName as PostOwner,
+        u2.DisplayName as RelatedPostOwner
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id and lt.Name = 'Duplicate'
+    join Posts p on pl.PostId = p.Id
+    join Posts rp on pl.RelatedPostId = rp.Id
+    left join Users u on p.OwnerUserId = u.Id
+    left join Users u2 on rp.OwnerUserId = u2.Id
+),
+UserActivitySummary as (
+    select
+        u.Id,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsPosted,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersPosted,
+        count(distinct c.Id) as CommentsMade,
+        count(distinct v.Id) filter (where v.VoteTypeId = 2) as UpVotesGiven,
+        count(distinct v.Id) filter (where v.VoteTypeId = 3) as DownVotesGiven,
+        max(p.CreationDate) as LastPostDate
+    from Users u
+    left join Posts p on u.Id = p.OwnerUserId
+    left join Comments c on u.Id = c.UserId
+    left join Votes v on u.Id = v.UserId
+    group by u.Id, u.DisplayName
+)
+select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.TotalBadgesLastYear,
+    u.LocationRank,
+    pas.QuestionId,
+    pas.Title as QuestionTitle,
+    pas.CreationDate as QuestionCreationDate,
+    pas.QuestionScore,
+    pas.ViewCount as QuestionViewCount,
+    pas.AnswerCount as ExpectedAnswerCount,
+    pas.ActualAnswerCount,
+    pas.MaxAnswerScore,
+    round(pas.AvgAnswerScore::numeric,2) as AvgAnswerScore,
+    pcr.CloseReasonName,
+    pcr.CloseDate,
+    tq.CommentCount as QuestionCommentCount,
+    tq.Commenters as QuestionCommenters,
+    dl.RelatedPostId as DuplicateOfPostId,
+    dl.PostOwner as DuplicatePostOwner,
+    dl.RelatedPostOwner as DuplicateRelatedPostOwner,
+    uas.QuestionsPosted,
+    uas.AnswersPosted,
+    uas.CommentsMade,
+    uas.UpVotesGiven,
+    uas.DownVotesGiven,
+    uas.LastPostDate,
+    -- Complex string expression: concatenated tags with length and null-safe handling
+    case 
+        when pas.QuestionId is not null and pas.QuestionId in (select Id from Posts where Tags is not null) then
+            array_to_string(
+                array(
+                    select distinct trim(tg)
+                    from unnest(string_to_array(substring(pas.Tags from 2 for length(pas.Tags)-2), '><')) as tg
+                    where tg is not null and tg <> ''
+                    order by tg
+                ), ', '
+            )
+        else 'No Tags'
+    end as SortedTags,
+    -- Window function: rank questions by score within user
+    rank() over (partition by u.Id order by pas.QuestionScore desc nulls last) as UserQuestionScoreRank
+from UserReputationWindow u
+left join PostAnswerStats pas on u.Id = pas.OwnerUserId
+left join PostCloseReasons pcr on pas.QuestionId = pcr.PostId
+left join TopQuestionsWithComments tq on pas.QuestionId = tq.Id
+left join DuplicateLinks dl on pas.QuestionId = dl.PostId
+left join UserActivitySummary uas on u.Id = uas.Id
+where u.Reputation > 1000
+  and (pas.AnswerCount is null or pas.AnswerCount > 0)
+  and (pcr.CloseDate is null or pcr.CloseDate > current_date - interval '1 year')
+order by u.Reputation desc, pas.QuestionScore desc
+limit 100;

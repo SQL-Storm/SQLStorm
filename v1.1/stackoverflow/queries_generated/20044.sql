@@ -1,0 +1,104 @@
+-- {"query": "20044.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1223} 
+
+WITH QuestionTags AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.AcceptedAnswerId,
+        p.CreationDate AS QuestionDate,
+        p.Score AS QuestionScore,
+        p.OwnerUserId AS QuestionOwnerId,
+        p.ViewCount AS QuestionViewCount,
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1 -- Questions
+      AND p.Tags IS NOT NULL
+      AND p.AnswerCount > 2
+      AND p.ClosedDate IS NULL
+),
+UserAnswerMetrics AS (
+    SELECT
+        a.OwnerUserId,
+        a.Id AS AnswerId,
+        qt.Tag,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerDate,
+        (a.CreationDate - qt.QuestionDate) AS TimeToAnswer,
+        CASE WHEN qt.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END AS IsAcceptedAnswer,
+        LAG(a.Score, 1, 0) OVER (PARTITION BY a.OwnerUserId, qt.Tag ORDER BY a.CreationDate) AS PrevAnswerScore,
+        qt.QuestionViewCount,
+        (SELECT Reputation FROM Users WHERE Id = qt.QuestionOwnerId) AS QuestionerReputation
+    FROM Posts a
+    JOIN QuestionTags qt ON a.ParentId = qt.QuestionId
+    WHERE a.PostTypeId = 2 -- Answers
+      AND a.OwnerUserId IS NOT NULL
+),
+UserTagSummary AS (
+    SELECT
+        OwnerUserId,
+        Tag,
+        COUNT(*) AS AnswersPerTag,
+        AVG(AnswerScore) AS AvgScorePerTag,
+        SUM(AnswerScore) AS TotalScorePerTag,
+        SUM(IsAcceptedAnswer) AS AcceptedAnswersPerTag,
+        AVG(CASE WHEN IsAcceptedAnswer = 1 THEN extract(epoch from TimeToAnswer) ELSE NULL END) AS AvgTimeToAcceptanceSeconds,
+        CORR(AnswerScore, PrevAnswerScore) AS ScoreCorrelationWithPrevious,
+        SUM(QuestionViewCount) as TotalQuestionViewsAnswered,
+        MAX(QuestionerReputation) AS MaxQuestionerReputationEncountered
+    FROM UserAnswerMetrics
+    GROUP BY OwnerUserId, Tag
+    HAVING COUNT(*) > 10 AND SUM(IsAcceptedAnswer) > 1
+),
+UserBadgeSummary AS (
+    SELECT
+        UserId,
+        Name AS TagName,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges
+    WHERE TagBased = true
+    GROUP BY UserId, Name
+)
+SELECT
+    u.DisplayName,
+    u.Reputation,
+    uts.Tag,
+    uts.AnswersPerTag,
+    uts.AvgScorePerTag,
+    uts.AcceptedAnswersPerTag,
+    COALESCE(ubs.GoldBadges, 0) AS TagGoldBadges,
+    COALESCE(ubs.SilverBadges, 0) AS TagSilverBadges,
+    uts.AvgTimeToAcceptanceSeconds,
+    (
+        LN(u.Reputation + 1) * uts.AvgScorePerTag * (1 + uts.AcceptedAnswersPerTag / CAST(uts.AnswersPerTag AS numeric))
+        + (COALESCE(ubs.GoldBadges, 0) * 100)
+        + (COALESCE(ubs.SilverBadges, 0) * 25)
+    ) / (1 + LN(1 + uts.AvgTimeToAcceptanceSeconds)) AS ExpertiseScore,
+    DENSE_RANK() OVER (PARTITION BY uts.Tag ORDER BY
+        (
+            LN(u.Reputation + 1) * uts.AvgScorePerTag * (1 + uts.AcceptedAnswersPerTag / CAST(uts.AnswersPerTag AS numeric))
+            + (COALESCE(ubs.GoldBadges, 0) * 100)
+            + (COALESCE(ubs.SilverBadges, 0) * 25)
+        ) / (1 + LN(1 + uts.AvgTimeToAcceptanceSeconds)) DESC
+    ) AS TagRank
+FROM UserTagSummary uts
+JOIN Users u ON uts.OwnerUserId = u.Id
+LEFT JOIN UserBadgeSummary ubs ON uts.OwnerUserId = ubs.UserId AND uts.Tag = ubs.TagName
+WHERE
+    u.Reputation > 5000
+    AND u.CreationDate < (CURRENT_DATE - INTERVAL '3 year')
+    AND uts.Tag IN ('sql', 'python', 'java', 'c#', 'javascript', 'reactjs', 'pandas', 'performance', 'postgresql', 'docker')
+    AND uts.AvgScorePerTag > 1.5
+    AND EXISTS (
+        SELECT 1
+        FROM Votes v
+        WHERE v.UserId = u.Id
+          AND v.VoteTypeId = 2 -- UpMod
+        GROUP BY v.UserId
+        HAVING COUNT(*) > 1000 -- Has cast at least 1000 upvotes
+    )
+ORDER BY
+    uts.Tag,
+    TagRank,
+    ExpertiseScore DESC
+LIMIT 250;

@@ -1,0 +1,64 @@
+-- {"query": "15019.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-3.5-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 46700, "output_tokens": 13894} 
+WITH UserBadgeCounts AS (
+    SELECT 
+        u.Id AS UserId, 
+        u.DisplayName,
+        COUNT(b.Id) AS GoldBadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS ExactGoldBadges,
+        RANK() OVER (ORDER BY COUNT(b.Id) DESC) AS BadgeRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+PostActivityStats AS (
+    SELECT 
+        p.OwnerUserId,
+        AVG(p.Score) AS AvgPostScore,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        MAX(p.LastActivityDate) AS MostRecentActivity,
+        COUNT(v.Id) AS TotalVotes
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+)
+SELECT 
+    ubc.UserId,
+    ubc.DisplayName,
+    ubc.GoldBadgeCount,
+    pas.QuestionCount,
+    pas.AnswerCount,
+    pas.AvgPostScore,
+    COALESCE(pas.TotalVotes, 0) AS TotalVotes,
+    CASE 
+        WHEN ubc.ExactGoldBadges > 5 THEN 'Elite'
+        WHEN ubc.ExactGoldBadges > 2 THEN 'Advanced'
+        ELSE 'Basic'
+    END AS UserTier,
+    DATEDIFF(YEAR, MIN(u.CreationDate), cast('2024-10-01 12:34:56' as timestamp)) AS AccountAgeYears,
+    ROW_NUMBER() OVER (
+        PARTITION BY 
+            CASE 
+                WHEN ubc.ExactGoldBadges > 5 THEN 1 
+                WHEN ubc.ExactGoldBadges > 2 THEN 2 
+                ELSE 3 
+            END 
+        ORDER BY ubc.GoldBadgeCount DESC
+    ) AS TierRanking
+FROM UserBadgeCounts ubc
+JOIN Users u ON ubc.UserId = u.Id
+LEFT JOIN PostActivityStats pas ON ubc.UserId = pas.OwnerUserId
+WHERE 
+    u.Reputation > 100 
+    AND (
+        pas.QuestionCount > 10 
+        OR pas.AnswerCount > 20
+    )
+    AND (
+        ubc.GoldBadgeCount > 0 
+        OR pas.AvgPostScore > 2
+    )
+QUALIFY TierRanking <= 100
+ORDER BY ubc.GoldBadgeCount DESC, pas.AvgPostScore DESC
+LIMIT 1000;

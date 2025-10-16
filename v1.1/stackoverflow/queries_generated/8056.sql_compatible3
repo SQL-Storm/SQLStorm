@@ -1,0 +1,302 @@
+with recent_questions as (
+    select p.Id as QuestionId,
+           p.CreationDate,
+           p.OwnerUserId,
+           p.Title,
+           p.Tags,
+           p.Score,
+           p.ViewCount,
+           coalesce(p.AnswerCount, 0) as AnswerCount
+    from Posts p
+    where p.PostTypeId = 1
+      and p.CreationDate >= (select date_trunc('month', max(CreationDate)) - interval '12 months' from Posts where PostTypeId = 1)
+),
+answerers as (
+    select a.ParentId as QuestionId,
+           a.Id as AnswerId,
+           a.OwnerUserId as AnswerUserId,
+           a.Score as AnswerScore,
+           a.CreationDate as AnswerDate
+    from Posts a
+    where a.PostTypeId = 2
+),
+accepted as (
+    select q.QuestionId,
+           q.OwnerUserId as AskerId,
+           p.AcceptedAnswerId
+    from recent_questions q
+    join Posts p on p.Id = q.QuestionId
+),
+votes_agg as (
+    select v.PostId,
+           sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+           sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+           sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+           sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as BountyTotal
+    from Votes v
+    where v.CreationDate >= (select min(CreationDate) from recent_questions)
+    group by v.PostId
+),
+comment_agg as (
+    select c.PostId,
+           count(*) as CommentCount,
+           max(c.CreationDate) as LastCommentDate
+    from Comments c
+    where c.CreationDate >= (select min(CreationDate) from recent_questions)
+    group by c.PostId
+),
+user_stats as (
+    select u.Id as UserId,
+           u.Reputation,
+           u.CreationDate,
+           u.DisplayName,
+           u.Location,
+           u.UpVotes as ProfileUpVotes,
+           u.DownVotes as ProfileDownVotes,
+           u.Views as ProfileViews
+    from Users u
+),
+tag_split as (
+    select q.QuestionId,
+           unnest(string_to_array(substring(q.Tags, 2, greatest(length(q.Tags)-2,0)), '><')) as TagName
+    from recent_questions q
+),
+tag_ranks as (
+    select ts.TagName,
+           count(*) as QuestionsWithTag,
+           percentile_cont(0.5) within group (order by rq.Score) as MedianQuestionScore
+    from tag_split ts
+    join recent_questions rq on rq.QuestionId = ts.QuestionId
+    group by ts.TagName
+),
+edits as (
+    select ph.PostId,
+           count(case when ph.PostHistoryTypeId in (4,5,6) then 1 end) as EditCount,
+           max(case when ph.PostHistoryTypeId in (4,5,6) then ph.CreationDate end) as LastEditDate,
+           count(case when ph.PostHistoryTypeId = 24 then 1 end) as SuggestedEditsApplied
+    from PostHistory ph
+    where ph.CreationDate >= (select min(CreationDate) from recent_questions)
+    group by ph.PostId
+),
+closures as (
+    select ph.PostId,
+           count(case when ph.PostHistoryTypeId = 10 then 1 end) as CloseEvents,
+           max(case when ph.PostHistoryTypeId = 10 then ph.CreationDate end) as LastClosedAt,
+           max(
+             nullif(regexp_replace(ph.Comment, '[^0-9]', '', 'g'), '')
+           ) as LastCloseReasonId
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10,11)
+      and ph.CreationDate >= (select min(CreationDate) from recent_questions)
+    group by ph.PostId
+),
+dup_links as (
+    select pl.PostId as DuplicateOf,
+           count(case when pl.LinkTypeId = 3 then 1 end) as DuplicateCount,
+           count(case when pl.LinkTypeId = 1 then 1 end) as LinkedCount
+    from PostLinks pl
+    group by pl.PostId
+),
+answer_metrics as (
+    select a.QuestionId,
+           count(*) as Answers,
+           count(case when a.AnswerScore > 0 then 1 end) as PositiveAnswers,
+           max(a.AnswerScore) as MaxAnswerScore,
+           min(a.AnswerDate) as FirstAnswerAt,
+           max(a.AnswerDate) as LastAnswerAt
+    from answerers a
+    group by a.QuestionId
+),
+accepted_detail as (
+    select ac.QuestionId,
+           ac.AcceptedAnswerId,
+           aa.OwnerUserId as AcceptedByUserId,
+           aa.Score as AcceptedAnswerScore,
+           aa.CreationDate as AcceptedAnswerDate
+    from accepted ac
+    left join Posts aa on aa.Id = ac.AcceptedAnswerId
+),
+question_activity as (
+    select q.QuestionId,
+           q.CreationDate,
+           coalesce(va.UpVotes,0) - coalesce(va.DownVotes,0) as NetVotes,
+           coalesce(va.Favorites,0) as Favorites,
+           coalesce(va.BountyTotal,0) as Bounty,
+           coalesce(ca.CommentCount,0) as CommentCount,
+           ca.LastCommentDate,
+           coalesce(e.EditCount,0) as EditCount,
+           e.LastEditDate,
+           coalesce(cl.CloseEvents,0) as CloseEvents,
+           cl.LastClosedAt,
+           q.ViewCount,
+           q.Score as PostScore
+    from recent_questions q
+    left join votes_agg va on va.PostId = q.QuestionId
+    left join comment_agg ca on ca.PostId = q.QuestionId
+    left join edits e on e.PostId = q.QuestionId
+    left join closures cl on cl.PostId = q.QuestionId
+),
+user_enrichment as (
+    select q.QuestionId,
+           q.CreationDate,
+           q.PostScore,
+           q.ViewCount,
+           q.NetVotes,
+           q.Favorites,
+           q.Bounty,
+           q.CommentCount,
+           q.LastCommentDate,
+           q.EditCount,
+           q.LastEditDate,
+           q.CloseEvents,
+           q.LastClosedAt,
+           ask.UserId as AskerId,
+           ask.DisplayName as AskerName,
+           ask.Reputation as AskerRep,
+           ask.Location as AskerLocation,
+           ask.ProfileViews as AskerProfileViews
+    from question_activity q
+    left join Posts p on p.Id = q.QuestionId
+    left join user_stats ask on ask.UserId = p.OwnerUserId
+),
+time_bins as (
+    select qe.*,
+           width_bucket(extract(epoch from qe.CreationDate),
+                        (select extract(epoch from min(CreationDate)) from recent_questions),
+                        (select extract(epoch from max(CreationDate)) from recent_questions),
+                        8) as time_bucket
+    from user_enrichment qe
+),
+scored as (
+    select tb.*,
+           coalesce(am.Answers,0) as Answers,
+           coalesce(am.PositiveAnswers,0) as PositiveAnswers,
+           coalesce(am.MaxAnswerScore,0) as MaxAnswerScore,
+           ad.AcceptedAnswerId,
+           ad.AcceptedByUserId,
+           coalesce(ad.AcceptedAnswerScore,0) as AcceptedAnswerScore,
+           ad.AcceptedAnswerDate,
+           case
+             when ad.AcceptedAnswerId is not null then 1
+             else 0
+           end as HasAccepted,
+           greatest(coalesce(tb.NetVotes,0)*2 + coalesce(tb.Favorites,0) + coalesce(tb.ViewCount,0)/100 + coalesce(tb.Bounty,0)/50
+                    + coalesce(tb.CommentCount,0) + coalesce(am.MaxAnswerScore,0)
+                    - coalesce(tb.CloseEvents,0)*3
+                    , 0) as EngagementScore
+    from time_bins tb
+    left join answer_metrics am on am.QuestionId = tb.QuestionId
+    left join accepted_detail ad on ad.QuestionId = tb.QuestionId
+),
+ranked as (
+    select s.*,
+           dense_rank() over (partition by s.time_bucket order by s.EngagementScore desc, s.PostScore desc, s.ViewCount desc, s.QuestionId) as RankInBucket,
+           row_number() over (order by s.EngagementScore desc, s.PostScore desc, s.ViewCount desc, s.QuestionId) as GlobalRowNum
+    from scored s
+),
+tagged as (
+    select r.*, ts.TagName
+    from ranked r
+    left join tag_split ts on ts.QuestionId = r.QuestionId
+),
+tag_window as (
+    select t.*,
+           count(*) over (partition by t.TagName) as TagTotalRows,
+           avg(t.EngagementScore) over (partition by t.TagName) as TagAvgEngagement,
+           min(t.CreationDate) over (partition by t.TagName) as TagMinDate,
+           max(t.CreationDate) over (partition by t.TagName) as TagMaxDate
+    from tagged t
+),
+tag_p90 as (
+    select TagName,
+           percentile_disc(0.9) within group (order by EngagementScore) as TagP90Engagement
+    from tagged
+    group by TagName
+),
+final_scores as (
+    select tw.*,
+           tr.QuestionsWithTag,
+           tr.MedianQuestionScore,
+           case
+             when tw.TagTotalRows > 0 then (tw.EngagementScore - tw.TagAvgEngagement) / nullif(tw.TagAvgEngagement,0)
+             else null
+           end as RelativeToTagAvg,
+           case
+             when tw.EngagementScore >= coalesce(tp.TagP90Engagement, tw.EngagementScore) then 1 else 0
+           end as IsTop10pctForTag
+    from tag_window tw
+    left join tag_ranks tr on tr.TagName = tw.TagName
+    left join tag_p90 tp on tp.TagName = tw.TagName
+),
+filtered as (
+    select fs.*
+    from final_scores fs
+    where coalesce(fs.AskerRep,0) >= 1
+      and (fs.CloseEvents = 0 or fs.LastClosedAt is null or fs.EngagementScore > 0)
+      and (fs.TagName is not null and length(fs.TagName) between 1 and 35)
+      and (fs.HasAccepted = 1 or fs.Answers >= 1 or fs.EngagementScore > 0)
+),
+rolled as (
+    select
+        fs.QuestionId,
+        min(fs.AskerId) as AskerId,
+        min(fs.AskerName) as AskerName,
+        min(fs.AskerRep) as AskerRep,
+        min(fs.AskerLocation) as AskerLocation,
+        min(fs.CreationDate) as CreationDate,
+        max(fs.PostScore) as PostScore,
+        max(fs.ViewCount) as ViewCount,
+        max(fs.NetVotes) as NetVotes,
+        max(fs.Favorites) as Favorites,
+        max(fs.Bounty) as Bounty,
+        max(fs.CommentCount) as CommentCount,
+        max(fs.EditCount) as EditCount,
+        max(fs.CloseEvents) as CloseEvents,
+        max(fs.Answers) as Answers,
+        max(fs.PositiveAnswers) as PositiveAnswers,
+        max(fs.MaxAnswerScore) as MaxAnswerScore,
+        max(fs.HasAccepted) as HasAccepted,
+        max(fs.AcceptedAnswerScore) as AcceptedAnswerScore,
+        max(fs.EngagementScore) as EngagementScore,
+        -- replace array_agg(distinct ... order by ...) filter syntax with a portable equivalent where possible:
+        -- keep array_agg and assume DB supports array_agg; if not, this may need adaptation per dialect
+        array_agg(distinct fs.TagName) as Tags,
+        count(case when fs.IsTop10pctForTag = 1 then 1 end) as Top10pctTagHits,
+        count(*) as TagRows,
+        avg(fs.RelativeToTagAvg) as AvgRelToTag
+    from filtered fs
+    group by fs.QuestionId
+),
+topn as (
+    select r.*,
+           row_number() over (order by r.EngagementScore desc, r.PostScore desc, r.ViewCount desc, r.QuestionId) as rn
+    from rolled r
+)
+select
+    t.QuestionId,
+    t.AskerId,
+    coalesce(nullif(trim(t.AskerName), ''), '(unknown)') as AskerName,
+    t.AskerRep,
+    coalesce(nullif(trim(t.AskerLocation), ''), 'n/a') as AskerLocation,
+    t.CreationDate,
+    t.PostScore,
+    t.ViewCount,
+    t.NetVotes,
+    t.Favorites,
+    t.Bounty,
+    t.CommentCount,
+    t.EditCount,
+    t.CloseEvents,
+    t.Answers,
+    t.PositiveAnswers,
+    t.MaxAnswerScore,
+    t.HasAccepted,
+    t.AcceptedAnswerScore,
+    t.EngagementScore,
+    coalesce(t.Tags, CAST(ARRAY[] AS text[])) as Tags,
+    t.Top10pctTagHits,
+    t.TagRows,
+    round(coalesce(t.AvgRelToTag,0), 4) as AvgRelToTag
+from topn t
+where t.rn <= 200
+order by t.EngagementScore desc, t.PostScore desc, t.ViewCount desc, t.QuestionId;

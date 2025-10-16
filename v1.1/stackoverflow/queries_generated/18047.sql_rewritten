@@ -1,0 +1,150 @@
+-- {"query": "18047.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 978} 
+WITH
+  RankedUserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      COUNT(p.Id) AS PostCount,
+      ROW_NUMBER() OVER (
+        ORDER BY
+          u.Reputation DESC,
+          u.CreationDate ASC
+      ) AS ReputationRank
+    FROM
+      Users AS u
+      LEFT JOIN Posts AS p
+        ON u.Id = p.OwnerUserId
+    WHERE
+      u.Id > 0
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate
+  ),
+  RecentQuestionActivity AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.Title,
+      p.CreationDate AS QuestionCreationDate,
+      p.OwnerUserId,
+      p.AnswerCount,
+      p.FavoriteCount,
+      ROW_NUMBER() OVER (
+        ORDER BY
+          p.CreationDate DESC
+      ) AS ActivityRank
+    FROM
+      Posts AS p
+    WHERE
+      p.PostTypeId = 1
+      AND p.CreationDate >= DATE('now', '-1 year')
+  ),
+  HighReputationUsers AS (
+    SELECT
+      UserId
+    FROM
+      RankedUserActivity
+    WHERE
+      ReputationRank <= 100
+  ),
+  QuestionsWithMultipleAnswers AS (
+    SELECT
+      rq.QuestionId,
+      rq.Title,
+      rq.AnswerCount,
+      rq.FavoriteCount,
+      rua.DisplayName AS OwnerDisplayName,
+      rua.Reputation AS OwnerReputation
+    FROM
+      RecentQuestionActivity AS rq
+      JOIN RankedUserActivity AS rua
+        ON rq.OwnerUserId = rua.UserId
+    WHERE
+      rq.AnswerCount > 5
+      AND rq.ActivityRank <= 50
+  ),
+  TopQuestionsWithFavoredAnswers AS (
+    SELECT
+      q.QuestionId,
+      q.Title AS QuestionTitle,
+      q.OwnerDisplayName AS QuestionOwner,
+      q.OwnerReputation AS QuestionOwnerReputation,
+      a.Id AS AnswerId,
+      a.OwnerUserId AS AnswerOwnerUserId,
+      a.Score AS AnswerScore,
+      u.DisplayName AS AnswerOwnerDisplayName,
+      u.Reputation AS AnswerOwnerReputation,
+      CASE
+        WHEN q.AcceptedAnswerId = a.Id THEN 1
+        ELSE 0
+      END AS IsAcceptedAnswer,
+      ROW_NUMBER() OVER (
+        PARTITION BY
+          q.QuestionId
+        ORDER BY
+          a.Score DESC,
+          a.CreationDate ASC
+      ) AS AnswerRankWithinQuestion
+    FROM
+      QuestionsWithMultipleAnswers AS q
+      JOIN Posts AS a
+        ON q.QuestionId = a.ParentId
+      LEFT JOIN Users AS u
+        ON a.OwnerUserId = u.Id
+    WHERE
+      a.PostTypeId = 2
+      AND a.CreationDate >= DATE('now', '-1 year')
+  )
+SELECT
+  q.QuestionTitle,
+  q.QuestionOwner,
+  q.QuestionOwnerReputation,
+  q.AnswerId,
+  q.AnswerOwnerDisplayName,
+  q.AnswerOwnerReputation,
+  q.AnswerScore,
+  q.IsAcceptedAnswer,
+  (
+    SELECT
+      COUNT(*)
+    FROM
+      Comments AS c
+    WHERE
+      c.PostId = q.QuestionId
+  ) AS QuestionCommentCount,
+  (
+    SELECT
+      COUNT(*)
+    FROM
+      Comments AS c
+    WHERE
+      c.PostId = q.AnswerId
+  ) AS AnswerCommentCount,
+  COALESCE(
+    (
+      SELECT
+        GROUP_CONCAT(t.TagName, ', ')
+      FROM
+        Tags AS t
+      WHERE
+        q.QuestionId IN (
+          SELECT
+            p.Id
+          FROM
+            Posts AS p
+          WHERE
+            p.Tags LIKE '%' || t.TagName || '%'
+        )
+    ),
+    'No Tags'
+  ) AS RelatedTags
+FROM
+  TopQuestionsWithFavoredAnswers AS q
+WHERE
+  q.AnswerRankWithinQuestion <= 3
+ORDER BY
+  q.QuestionOwnerReputation DESC,
+  q.AnswerScore DESC;

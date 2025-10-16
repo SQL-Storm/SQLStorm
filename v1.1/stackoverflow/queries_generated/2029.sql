@@ -1,0 +1,49 @@
+-- {"query": "2029.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4o", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 517} 
+
+WITH RecentUsers AS (
+    SELECT Id, DisplayName, Reputation
+    FROM Users
+    WHERE LastAccessDate > NOW() - INTERVAL '1 year'
+),
+TopQuestions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        COALESCE(p.Score / NULLIF(p.ViewCount, 0), 0) AS ScorePerView,
+        COUNT(a.Id) AS AnswerCount,
+        ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn
+    FROM Posts p
+    LEFT JOIN Posts a ON p.Id = a.ParentId AND a.PostTypeId = 2
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.OwnerUserId, p.Score, p.ViewCount
+    HAVING COUNT(a.Id) = (SELECT MAX(AnswerCount) FROM Posts WHERE PostTypeId = 1)
+),
+BadgeStatistics AS (
+    SELECT 
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+)
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    tq.Title AS TopQuestionTitle,
+    COALESCE(tq.ScorePerView, 0) AS ScorePerView,
+    bs.GoldBadges,
+    bs.SilverBadges,
+    bs.BronzeBadges,
+    CASE 
+        WHEN u.Reputation >= 10000 THEN 'Top Contributor'
+        WHEN u.Reputation >= 5000 THEN 'Active Contributor'
+        ELSE 'Newbie'
+    END AS ContributionLevel
+FROM RecentUsers u
+LEFT JOIN TopQuestions tq ON u.Id = tq.OwnerUserId AND tq.rn = 1
+LEFT JOIN BadgeStatistics bs ON u.Id = bs.UserId
+WHERE COALESCE(bs.GoldBadges, 0) + COALESCE(bs.SilverBadges, 0) + COALESCE(bs.BronzeBadges, 0) > 0
+ORDER BY u.Reputation DESC, bs.GoldBadges DESC, bs.SilverBadges DESC, bs.BronzeBadges DESC;

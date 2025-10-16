@@ -1,0 +1,119 @@
+WITH cte AS (
+  SELECT 
+    p.Id AS PostId,
+    p.Title,
+    p.Body,
+    p.CreationDate,
+    p.LastEditDate,
+    p.ClosedDate,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    u.Location,
+    u.AboutMe,
+    COALESCE(v.VoteTypeId, 0) AS VoteTypeId,
+    COALESCE(v.BountyAmount, 0) AS BountyAmount,
+    COALESCE(c.Score, 0) AS CommentScore,
+    COALESCE(c.Text, '') AS CommentText,
+    COALESCE(l.LinkTypeId, 0) AS LinkTypeId,
+    COALESCE(l.RelatedPostId, 0) AS RelatedPostId,
+    COALESCE(b.Name, '') AS BadgeName,
+    COALESCE(b.Class, 0) AS BadgeClass,
+    COALESCE(CASE WHEN b.TagBased IS TRUE THEN 1 WHEN b.TagBased IS FALSE THEN 0 ELSE NULL END, 0) AS IsBadgeTagBased,
+    COALESCE(pt.Name, '') AS PostTypeName,
+    COALESCE(ct.Name, '') AS CloseReasonName,
+    COALESCE(t.Tags, '') AS Tags
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON p.Id = v.PostId
+  LEFT JOIN Comments c ON p.Id = c.PostId
+  LEFT JOIN PostLinks l ON p.Id = l.PostId
+  LEFT JOIN Badges b ON u.Id = b.UserId
+  LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+  LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 10
+  LEFT JOIN CloseReasonTypes ct ON 
+    CASE 
+      WHEN ph.Comment ~ '^\d+$' THEN CAST(ph.Comment AS INTEGER)
+      ELSE NULL
+    END = ct.Id
+  LEFT JOIN (
+    SELECT p2.Id AS PostId, STRING_AGG(t2.TagName, ',') AS Tags
+    FROM Tags t2
+    JOIN Posts p2 ON t2.ExcerptPostId = p2.Id OR t2.WikiPostId = p2.Id
+    GROUP BY p2.Id
+  ) t ON p.Id = t.PostId
+  GROUP BY 
+    p.Id, p.Title, p.Body, p.CreationDate, p.LastEditDate, p.ClosedDate, 
+    p.OwnerUserId, u.DisplayName, u.Reputation, u.Location, u.AboutMe,
+    v.VoteTypeId, v.BountyAmount, c.Score, c.Text, l.LinkTypeId, l.RelatedPostId, 
+    b.Name, b.Class, b.TagBased, pt.Name, ct.Name, t.Tags
+), summary AS (
+  SELECT
+    PostId,
+    Title,
+    Body,
+    CreationDate,
+    LastEditDate,
+    ClosedDate,
+    OwnerUserId,
+    OwnerDisplayName,
+    Reputation,
+    Location,
+    AboutMe,
+    COUNT(CASE WHEN VoteTypeId = 2 THEN 1 END) AS UpVotes,
+    COUNT(CASE WHEN VoteTypeId = 3 THEN 1 END) AS DownVotes,
+    COUNT(CASE WHEN VoteTypeId = 1 THEN 1 END) AS AcceptedVotes,
+    COUNT(CASE WHEN VoteTypeId = 8 THEN 1 END) AS BountyStarted,
+    COUNT(CASE WHEN VoteTypeId = 9 THEN 1 END) AS BountyClosed,
+    COUNT(CASE WHEN VoteTypeId IN (6, 7) THEN 1 END) AS CloseVotes,
+    COUNT(CASE WHEN VoteTypeId IN (10, 11) THEN 1 END) AS DeleteVotes,
+    COUNT(DISTINCT CommentText) AS CommentCount,
+    COUNT(DISTINCT CASE WHEN LinkTypeId = 1 THEN RelatedPostId END) AS LinkedPosts,
+    COUNT(DISTINCT CASE WHEN LinkTypeId = 3 THEN RelatedPostId END) AS DuplicatePosts,
+    COUNT(DISTINCT BadgeName) AS BadgeCount,
+    COUNT(DISTINCT CASE WHEN IsBadgeTagBased = 1 THEN BadgeName END) AS TagBadgeCount,
+    COUNT(DISTINCT CASE WHEN IsBadgeTagBased = 0 THEN BadgeName END) AS NamedBadgeCount,
+    MAX(CASE WHEN BadgeClass = 1 THEN 1 ELSE 0 END) AS GoldBadgeCount,
+    MAX(CASE WHEN BadgeClass = 2 THEN 1 ELSE 0 END) AS SilverBadgeCount,
+    MAX(CASE WHEN BadgeClass = 3 THEN 1 ELSE 0 END) AS BronzeBadgeCount,
+    PostTypeName,
+    CloseReasonName,
+    Tags
+  FROM cte
+  GROUP BY
+    PostId, Title, Body, CreationDate, LastEditDate, ClosedDate, 
+    OwnerUserId, OwnerDisplayName, Reputation, Location, AboutMe,
+    PostTypeName, CloseReasonName, Tags
+)
+SELECT 
+  PostId,
+  Title,
+  Body,
+  CreationDate,
+  LastEditDate,
+  ClosedDate,
+  OwnerUserId,
+  OwnerDisplayName,
+  Reputation,
+  Location,
+  AboutMe,
+  UpVotes,
+  DownVotes,
+  AcceptedVotes,
+  BountyStarted,
+  BountyClosed,
+  CloseVotes,
+  DeleteVotes,
+  CommentCount,
+  LinkedPosts,
+  DuplicatePosts,
+  BadgeCount,
+  TagBadgeCount,
+  NamedBadgeCount,
+  GoldBadgeCount,
+  SilverBadgeCount,
+  BronzeBadgeCount,
+  PostTypeName,
+  CloseReasonName,
+  Tags
+FROM summary;

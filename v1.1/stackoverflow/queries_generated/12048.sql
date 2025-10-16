@@ -1,0 +1,81 @@
+-- {"query": "12048.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 751} 
+
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.CreationDate) AS Rank,
+        COUNT(V.Id) FILTER (WHERE V.VoteTypeId = 2) - COUNT(V.Id) FILTER (WHERE V.VoteTypeId = 3) AS NetVotes,
+        COUNT(C.Id) AS CommentCount,
+        STRING_AGG(T.TagName, ', ' ORDER BY T.Count DESC) AS Tags
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    LEFT JOIN 
+        Votes V ON P.Id = V.PostId
+    LEFT JOIN 
+        Comments C ON P.Id = C.PostId,
+        UNNEST(string_to_array(substring(P.Tags, 2, length(P.Tags)-2), ''><'')) WITH ORDINALITY AS T(TagName, ord)
+    WHERE 
+        P.PostTypeId IN (1, 2)
+    GROUP BY 
+        P.Id, U.DisplayName
+), 
+TopUsers AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        U.Reputation,
+        COUNT(B.Id) FILTER (WHERE B.Class = 1) AS GoldBadges,
+        COUNT(B.Id) FILTER (WHERE B.Class = 2) AS SilverBadges,
+        COUNT(B.Id) FILTER (WHERE B.Class = 3) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY U.Reputation DESC, U.CreationDate) AS UserRank
+    FROM 
+        Users U
+    LEFT JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id, U.DisplayName, U.Reputation
+), 
+PostHistorySummary AS (
+    SELECT 
+        PH.PostId,
+        COUNT(PH.Id) AS TotalEdits,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 5 THEN PH.CreationDate END) AS LastEditBodyDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 6 THEN PH.CreationDate END) AS LastEditTagsDate
+    FROM 
+        PostHistory PH
+    GROUP BY 
+        PH.PostId
+)
+SELECT 
+    RP.Id AS PostId,
+    RP.PostTypeId,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.OwnerUserId,
+    RP.OwnerDisplayName,
+    RP.Rank,
+    RP.NetVotes,
+    RP.CommentCount,
+    RP.Tags,
+    PHS.TotalEdits,
+    PHS.LastEditBodyDate,
+    PHS.LastEditTagsDate,
+    (SELECT DisplayName FROM TopUsers WHERE Id = RP.OwnerUserId) AS TopUserDisplayName,
+    (SELECT Reputation FROM TopUsers WHERE Id = RP.OwnerUserId) AS TopUserReputation
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    PostHistorySummary PHS ON RP.Id = PHS.PostId
+WHERE 
+    RP.Rank <= 10
+ORDER BY 
+    RP.PostTypeId, RP.Score DESC, RP.CreationDate;

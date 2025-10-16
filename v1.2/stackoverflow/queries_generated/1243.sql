@@ -1,0 +1,131 @@
+-- {"query": "1243.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.2, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1304} 
+
+WITH UserActivityCTE AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsCount,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersCount,
+    COUNT(DISTINCT c.Id) AS CommentsCount,
+    COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+    COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+    COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+    RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+    FIRST_VALUE(p.Title) OVER (
+      PARTITION BY u.Id
+      ORDER BY p.CreationDate ASC
+    ) AS FirstPostTitle,
+    STRING_AGG(DISTINCT t.TagName, ',') FILTER (WHERE t.TagName IS NOT NULL) AS UserRelatedTags
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Comments c ON c.UserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS TagName
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+  ) t ON true
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostScoresCTE AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    AVG(v.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningAvgScore,
+    COUNT(v.Id) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningVoteCount
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId IN (2, 3) -- UpMod, DownMod
+  WHERE p.CreationDate > (NOW() - INTERVAL '2 years')
+),
+TaggedPostsCTE AS (
+  SELECT
+    p.Id,
+    unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS TagName
+  FROM Posts p
+  WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+DuplicatesCTE AS (
+  SELECT
+    pl.PostId,
+    linked.Title AS OrigTitle,
+    pl.RelatedPostId,
+    related.Title AS DuplicateOfTitle,
+    COUNT(*) AS DuplicateLinkCount
+  FROM PostLinks pl
+  JOIN Posts linked ON linked.Id = pl.PostId
+  JOIN Posts related ON related.Id = pl.RelatedPostId
+  WHERE pl.LinkTypeId = 3 -- Duplicate
+  GROUP BY pl.PostId, linked.Title, pl.RelatedPostId, related.Title
+),
+PostsWithLastHistoryCTE AS (
+  SELECT DISTINCT ON (ph.PostId)
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate AS LastHistoryChangeTime,
+    ph.Comment AS HistoryComment,
+    ph.UserId AS EditorUserId
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (10,11,12,13,14,15) -- Closed, Reopened, Deleted, Undeleted, Locked, Unlocked
+  ORDER BY ph.PostId, ph.CreationDate DESC
+)
+SELECT
+  ua.UserId,
+  ua.DisplayName,
+  ua.QuestionsCount,
+  ua.AnswersCount,
+  ua.CommentsCount,
+  ua.GoldBadges,
+  ua.SilverBadges,
+  ua.BronzeBadges,
+  ua.ReputationRank,
+  ua.FirstPostTitle,
+  ua.UserRelatedTags,
+  ps.PostTypeId,
+  ps.CreationDate AS PostCreationDate,
+  ps.Score AS PostScore,
+  ps.ViewCount,
+  ps.AnswerCount,
+  ps.FavoriteCount,
+  ps.RunningAvgScore,
+  COALESCE(dc.DuplicateLinkCount, 0) AS DuplicateCount,
+  ph.LastHistoryChangeTime,
+  ph.PostHistoryTypeId,
+  ph.HistoryComment,
+  u2.DisplayName AS LastEditorName,
+  -- Boolean expression combining null-safe coalescing with string pattern matching
+  CASE
+    WHEN psa.ThreadPopular > 100 AND ua.GoldBadges > 0 THEN 'Highly Active Gold'
+    WHEN ua.ReputationRank <= 100 THEN 'Top 100 User'
+    ELSE 'Regular User'
+  END AS UserCategory
+FROM UserActivityCTE ua
+LEFT JOIN PostScoresCTE ps ON ps.OwnerUserId = ua.UserId
+LEFT JOIN DuplicatesCTE dc ON dc.PostId = ps.Id
+LEFT JOIN PostsWithLastHistoryCTE ph ON ph.PostId = ps.Id
+LEFT JOIN Users u2 ON u2.Id = ph.EditorUserId
+LEFT JOIN LATERAL (
+  SELECT COUNT(*) AS ThreadPopular
+  FROM Posts p2
+  WHERE p2.ParentId = ps.Id OR p2.Id = ps.Id
+) psa ON true
+WHERE ua.QuestionsCount + ua.AnswersCount > 10
+  AND (ps.Score IS NULL OR ps.Score > 0)
+ORDER BY ua.ReputationRank, ps.Score DESC NULLS LAST
+LIMIT 100
+UNION
+SELECT
+  u.Id,
+  u.DisplayName,
+  0, 0, 0, 0, 0, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+  'Inactive User'
+FROM Users u
+WHERE NOT EXISTS (
+  SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id
+)
+ORDER BY Id
+LIMIT 10;

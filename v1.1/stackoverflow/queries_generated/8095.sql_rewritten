@@ -1,0 +1,352 @@
+-- {"query": "8095.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3100} 
+with recent_users as (
+  select
+    u.id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    u.websiteurl,
+    u.upvotes,
+    u.downvotes,
+    u.views,
+    coalesce(nullif(trim(u.displayname), ''), 'Anonymous') as safe_displayname
+  from users u
+  where u.creationdate >= (select date_trunc('month', max(creationdate)) - interval '12 months' from users)
+),
+question_posts as (
+  select
+    p.id as post_id,
+    p.owneruserid as user_id,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.title,
+    p.tags,
+    p.answercount,
+    p.favoritecount,
+    p.commentcount,
+    p.closeddate,
+    p.contentlicense
+  from posts p
+  where p.posttypeid = 1
+),
+answer_posts as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.owneruserid as user_id,
+    a.creationdate as answer_date,
+    a.score as answer_score
+  from posts a
+  where a.posttypeid = 2
+),
+tag_expansion as (
+  select
+    q.post_id,
+    unnest(string_to_array(substring(q.tags, 2, length(q.tags) - 2), '><')) as tag
+  from question_posts q
+  where q.tags is not null
+),
+user_activity as (
+  select
+    ru.id as user_id,
+    count(distinct qp.post_id) filter (where qp.creationdate is not null) as questions_count,
+    count(distinct ap.answer_id) as answers_count,
+    sum(qp.viewcount) as total_question_views,
+    sum(qp.score) as total_question_score,
+    sum(ap.answer_score) as total_answer_score,
+    count(distinct c.id) as comments_count,
+    max(greatest(qp.creationdate, ap.answer_date, c.creationdate)) as last_post_activity
+  from recent_users ru
+  left join question_posts qp on qp.owneruserid = ru.id
+  left join answer_posts ap on ap.user_id = ru.id
+  left join comments c on c.userid = ru.id
+  group by ru.id
+),
+vote_agg as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvote_count,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvote_count,
+    sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounties_started,
+    sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounties_awarded
+  from votes v
+  group by v.postid
+),
+question_metrics as (
+  select
+    qp.post_id,
+    qp.owneruserid as user_id,
+    qp.creationdate,
+    qp.score,
+    qp.viewcount,
+    qp.answercount,
+    qp.favoritecount,
+    qp.commentcount,
+    count(distinct ap.answer_id) as answers_total,
+    avg(ap.answer_score) as avg_answer_score,
+    min(ap.answer_date) as first_answer_date,
+    extract(epoch from (min(ap.answer_date) - qp.creationdate)) as seconds_to_first_answer,
+    va.upvote_count,
+    va.downvote_count,
+    coalesce(va.upvote_count,0) - coalesce(va.downvote_count,0) as net_votes,
+    case when qp.closeddate is not null then 1 else 0 end as is_closed
+  from question_posts qp
+  left join answer_posts ap on ap.question_id = qp.post_id
+  left join vote_agg va on va.postid = qp.post_id
+  group by qp.post_id, qp.owneruserid, qp.creationdate, qp.score, qp.viewcount, qp.answercount, qp.favoritecount, qp.commentcount, va.upvote_count, va.downvote_count, qp.closeddate
+),
+user_tag_pref as (
+  select
+    qp.owneruserid as user_id,
+    te.tag,
+    count(*) as tag_q_count,
+    avg(qp.score) as tag_avg_q_score,
+    avg(qm.avg_answer_score) as tag_avg_a_score
+  from tag_expansion te
+  join question_posts qp on qp.post_id = te.post_id
+  left join question_metrics qm on qm.post_id = qp.post_id
+  group by qp.owneruserid, te.tag
+),
+user_top_tag as (
+  select distinct on (user_id)
+    user_id,
+    tag,
+    tag_q_count,
+    tag_avg_q_score,
+    tag_avg_a_score
+  from (
+    select
+      utp.*,
+      row_number() over (partition by user_id order by tag_q_count desc, tag_avg_q_score desc nulls last, tag asc) as rn
+    from user_tag_pref utp
+  ) s
+  where rn = 1
+  order by user_id, rn
+),
+post_history_actions as (
+  select
+    ph.postid,
+    sum(case when ph.posthistorytypeid in (10) then 1 else 0 end) as closed_events,
+    sum(case when ph.posthistorytypeid in (11) then 1 else 0 end) as reopened_events,
+    sum(case when ph.posthistorytypeid in (12) then 1 else 0 end) as deleted_events,
+    sum(case when ph.posthistorytypeid in (13) then 1 else 0 end) as undeleted_events,
+    sum(case when ph.posthistorytypeid in (19) then 1 else 0 end) as protected_events
+  from posthistory ph
+  group by ph.postid
+),
+linked_dupes as (
+  select
+    pl.postid,
+    count(*) filter (where pl.linktypeid = 1) as linked_count,
+    count(*) filter (where pl.linktypeid = 3) as duplicate_count
+  from postlinks pl
+  group by pl.postid
+),
+user_quality as (
+  select
+    ru.id as user_id,
+    percentile_disc(0.5) within group (order by qm.net_votes) as median_question_net_votes,
+    avg(case when qm.seconds_to_first_answer is not null then qm.seconds_to_first_answer end) as avg_secs_to_first_answer,
+    sum(coalesce(qm.viewcount,0)) as total_views,
+    sum(coalesce(qm.net_votes,0)) as sum_net_votes,
+    sum(qm.is_closed) as total_closed_questions
+  from recent_users ru
+  left join question_metrics qm on qm.user_id = ru.id
+  group by ru.id
+),
+user_ranks as (
+  select
+    uq.user_id,
+    rank() over (order by coalesce(uq.sum_net_votes,0) desc, coalesce(uq.total_views,0) desc) as rank_by_influence,
+    dense_rank() over (order by coalesce(uq.avg_secs_to_first_answer, 1e18)) as rank_by_speed,
+    ntile(10) over (order by coalesce(uq.median_question_net_votes,0)) as decile_by_median_net_votes
+  from user_quality uq
+),
+favorites_vs_saves as (
+  select
+    p.owneruserid as user_id,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as legacy_favorites,
+    count(*) filter (where v.votetypeid = 5 and v.userid is not null) as favorites_with_user
+  from posts p
+  left join votes v on v.postid = p.id
+  group by p.owneruserid
+),
+comment_stats as (
+  select
+    p.owneruserid as user_id,
+    count(c.id) as comments_on_user_posts,
+    avg(c.score) as avg_comment_score_on_user_posts
+  from posts p
+  left join comments c on c.postid = p.id
+  group by p.owneruserid
+),
+null_logic_demo as (
+  select
+    ru.id as user_id,
+    coalesce(nullif(ru.location,''), 'Unknown') as location_clean,
+    case
+      when ru.websiteurl ~* 'https?://'
+        then ru.websiteurl
+      when coalesce(ru.websiteurl,'') = '' then null
+      else 'http://' || ru.websiteurl
+    end as normalized_website
+  from recent_users ru
+),
+joined as (
+  select
+    ru.id as user_id,
+    ru.safe_displayname,
+    ru.reputation,
+    ru.creationdate,
+    ru.views,
+    ua.questions_count,
+    ua.answers_count,
+    ua.total_question_views,
+    ua.total_question_score,
+    ua.total_answer_score,
+    ua.comments_count,
+    ua.last_post_activity,
+    uq.median_question_net_votes,
+    uq.avg_secs_to_first_answer,
+    uq.total_views as q_total_views,
+    uq.sum_net_votes as q_sum_net_votes,
+    uq.total_closed_questions,
+    ur.rank_by_influence,
+    ur.rank_by_speed,
+    ur.decile_by_median_net_votes,
+    utt.tag as top_tag,
+    utt.tag_q_count as top_tag_q_count,
+    utt.tag_avg_q_score,
+    utt.tag_avg_a_score,
+    fvs.legacy_favorites,
+    fvs.favorites_with_user,
+    cs.comments_on_user_posts,
+    cs.avg_comment_score_on_user_posts,
+    nld.location_clean,
+    nld.normalized_website
+  from recent_users ru
+  left join user_activity ua on ua.user_id = ru.id
+  left join user_quality uq on uq.user_id = ru.id
+  left join user_ranks ur on ur.user_id = ru.id
+  left join user_top_tag utt on utt.user_id = ru.id
+  left join favorites_vs_saves fvs on fvs.user_id = ru.id
+  left join comment_stats cs on cs.user_id = ru.id
+  left join null_logic_demo nld on nld.user_id = ru.id
+),
+per_user_dupe_link as (
+  select
+    qp.owneruserid as user_id,
+    sum(coalesce(ld.linked_count,0)) as total_links_from_questions,
+    sum(coalesce(ld.duplicate_count,0)) as total_dupes_marked_on_questions
+  from question_posts qp
+  left join linked_dupes ld on ld.postid = qp.post_id
+  group by qp.owneruserid
+),
+per_user_history as (
+  select
+    qp.owneruserid as user_id,
+    sum(coalesce(pha.closed_events,0)) as closed_events,
+    sum(coalesce(pha.reopened_events,0)) as reopened_events,
+    sum(coalesce(pha.deleted_events,0)) as deleted_events,
+    sum(coalesce(pha.undeleted_events,0)) as undeleted_events,
+    sum(coalesce(pha.protected_events,0)) as protected_events
+  from question_posts qp
+  left join post_history_actions pha on pha.postid = qp.post_id
+  group by qp.owneruserid
+),
+score_buckets as (
+  select
+    qm.user_id,
+    width_bucket(coalesce(qm.net_votes,0), -10, 50, 12) as net_vote_bucket,
+    count(*) as bucket_posts,
+    avg(qm.viewcount) as bucket_avg_views
+  from question_metrics qm
+  group by qm.user_id, width_bucket(coalesce(qm.net_votes,0), -10, 50, 12)
+),
+bucket_rollup as (
+  select
+    sb.user_id,
+    sum(case when sb.net_vote_bucket >= 8 then sb.bucket_posts else 0 end) as high_perf_posts,
+    avg(case when sb.net_vote_bucket >= 8 then sb.bucket_avg_views end) as high_perf_avg_views
+  from score_buckets sb
+  group by sb.user_id
+),
+correlated_flags as (
+  select
+    ru.id as user_id,
+    (
+      select count(*)
+      from posts p2
+      where p2.owneruserid = ru.id
+        and p2.score < 0
+        and p2.creationdate >= ru.creationdate + interval '7 days'
+    ) as early_negative_posts
+  from recent_users ru
+)
+select
+  j.user_id,
+  j.safe_displayname,
+  j.reputation,
+  j.creationdate,
+  j.views,
+  j.questions_count,
+  j.answers_count,
+  j.total_question_views,
+  j.total_question_score,
+  j.total_answer_score,
+  j.comments_count,
+  j.last_post_activity,
+  j.median_question_net_votes,
+  j.avg_secs_to_first_answer,
+  j.q_total_views,
+  j.q_sum_net_votes,
+  j.total_closed_questions,
+  j.rank_by_influence,
+  j.rank_by_speed,
+  j.decile_by_median_net_votes,
+  j.top_tag,
+  j.top_tag_q_count,
+  j.tag_avg_q_score,
+  j.tag_avg_a_score,
+  j.legacy_favorites,
+  j.favorites_with_user,
+  j.comments_on_user_posts,
+  j.avg_comment_score_on_user_posts,
+  j.location_clean,
+  j.normalized_website,
+  pul.total_links_from_questions,
+  pul.total_dupes_marked_on_questions,
+  puh.closed_events,
+  puh.reopened_events,
+  puh.deleted_events,
+  puh.undeleted_events,
+  puh.protected_events,
+  br.high_perf_posts,
+  br.high_perf_avg_views,
+  cf.early_negative_posts,
+  case
+    when coalesce(j.answers_count,0) = 0 and coalesce(j.questions_count,0) = 0 then 'lurker'
+    when coalesce(j.answers_count,0) > coalesce(j.questions_count,0) * 2 then 'answerer'
+    when coalesce(j.questions_count,0) > coalesce(j.answers_count,0) * 2 then 'asker'
+    else 'balanced'
+  end as contribution_archetype
+from joined j
+left join per_user_dupe_link pul on pul.user_id = j.user_id
+left join per_user_history puh on puh.user_id = j.user_id
+left join bucket_rollup br on br.user_id = j.user_id
+left join correlated_flags cf on cf.user_id = j.user_id
+where
+  coalesce(j.reputation, 0) >= (
+    select percentile_disc(0.25) within group (order by reputation) from users
+  )
+  and (
+    j.last_post_activity is null
+    or j.last_post_activity >= cast('2024-10-01 12:34:56' as timestamp) - interval '18 months'
+  )
+order by
+  j.rank_by_influence nulls last,
+  j.rank_by_speed nulls last,
+  j.user_id
+limit 500;

@@ -1,0 +1,136 @@
+-- {"query": "526.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1212} 
+with RecursiveUserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        count(distinct b.Id) filter (where b.Class = 1) as GoldBadgeCount,
+        count(distinct b.Id) filter (where b.Class = 2) as SilverBadgeCount,
+        count(distinct b.Id) filter (where b.Class = 3) as BronzeBadgeCount,
+        row_number() over (partition by u.Location order by u.Reputation desc) as LocationRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsersByLocation as (
+    select * from RecursiveUserActivity where LocationRank <= 5 and Location is not null
+),
+PostScoresWithWindow as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        p.Title,
+        avg(p.Score) over (partition by p.OwnerUserId order by p.CreationDate rows between 10 preceding and current row) as MovingAvgScore,
+        rank() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as PostRank
+    from Posts p
+    where p.PostTypeId in (1,2)
+),
+DuplicateLinks as (
+    select pl.PostId, pl.RelatedPostId, pl.CreationDate, u.DisplayName as PostOwner, ru.DisplayName as RelatedPostOwner
+    from PostLinks pl
+    join Posts p on p.Id = pl.PostId
+    join Users u on u.Id = p.OwnerUserId
+    join Posts rp on rp.Id = pl.RelatedPostId
+    join Users ru on ru.Id = rp.OwnerUserId
+    where pl.LinkTypeId = 3
+),
+QuestionsWithCloseReasons as (
+    select 
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.CreationDate,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where p.PostTypeId = 1 and ph.Id is not null
+),
+UserBadgesRanked as (
+    select 
+        b.UserId,
+        b.Name,
+        b.Class,
+        b.Date,
+        row_number() over (partition by b.UserId order by b.Date desc) as BadgeRank
+    from Badges b
+),
+RecentBadges as (
+    select UserId, Name, Class, Date
+    from UserBadgesRanked
+    where BadgeRank <= 3
+),
+UserCommentStats as (
+    select 
+        u.Id as UserId,
+        count(c.Id) as TotalComments,
+        count(c.Id) filter (where c.CreationDate > current_date - interval '30 days') as CommentsLast30Days,
+        max(c.CreationDate) as LastCommentDate
+    from Users u
+    left join Comments c on c.UserId = u.Id
+    group by u.Id
+)
+select 
+    tu.Location,
+    tu.DisplayName as UserName,
+    tu.Reputation,
+    tu.QuestionCount,
+    tu.AnswerCount,
+    tu.CommentCount,
+    tu.GoldBadgeCount,
+    tu.SilverBadgeCount,
+    tu.BronzeBadgeCount,
+    ps.Id as PostId,
+    ps.PostTypeId,
+    ps.Score,
+    ps.ViewCount,
+    ps.MovingAvgScore,
+    ps.PostRank,
+    dl.RelatedPostId as DuplicateOfPostId,
+    dl.RelatedPostOwner,
+    qc.CloseReason,
+    qc.CloseDate,
+    rb.Name as RecentBadge1,
+    uc.TotalComments,
+    uc.CommentsLast30Days,
+    uc.LastCommentDate,
+    case 
+        when tu.Reputation > 10000 then 'Legendary'
+        when tu.Reputation > 5000 then 'Expert'
+        when tu.Reputation > 1000 then 'Intermediate'
+        else 'Beginner'
+    end as UserLevel,
+    concat(
+        substring(tu.Location from 1 for 10),
+        '...',
+        coalesce(tu.DisplayName, 'Unknown'),
+        ' [Reputation: ', tu.Reputation::text, ']'
+    ) as UserSummary
+from TopUsersByLocation tu
+left join PostScoresWithWindow ps on ps.OwnerUserId = tu.UserId and ps.PostRank <= 3
+left join DuplicateLinks dl on dl.PostId = ps.Id
+left join QuestionsWithCloseReasons qc on qc.Id = ps.Id
+left join RecentBadges rb on rb.UserId = tu.UserId and rb.Date = (
+    select max(Date) from RecentBadges rb2 where rb2.UserId = tu.UserId
+)
+left join UserCommentStats uc on uc.UserId = tu.UserId
+where ps.Score is not null
+order by tu.Location, tu.Reputation desc, ps.Score desc
+limit 100;

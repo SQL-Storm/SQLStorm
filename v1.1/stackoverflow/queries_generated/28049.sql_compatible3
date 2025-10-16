@@ -1,0 +1,110 @@
+WITH UserBadges AS (
+    SELECT 
+        UserId,
+        COUNT(CASE WHEN "class" = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN "class" = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN "class" = 3 THEN 1 END) AS BronzeBadges,
+        MAX("Date") AS LastBadgeDate
+    FROM Badges
+    GROUP BY UserId
+),
+PostStats AS (
+    SELECT 
+        OwnerUserId,
+        COUNT(*) AS TotalPosts,
+        AVG(Score) AS AvgPostScore,
+        SUM(ViewCount) AS TotalViews,
+        COUNT(AcceptedAnswerId) AS AcceptedAnswers
+    FROM Posts
+    WHERE PostTypeId = 1
+    GROUP BY OwnerUserId
+),
+CommentRank AS (
+    SELECT 
+        UserId,
+        SUM(Score) AS TotalCommentScore,
+        RANK() OVER (ORDER BY SUM(Score) DESC) AS CommentRank
+    FROM Comments
+    GROUP BY UserId
+),
+VoteAnalysis AS (
+    SELECT 
+        UserId,
+        COUNT(CASE WHEN VoteTypeId = 2 THEN 1 END) AS Upvotes,
+        COUNT(CASE WHEN VoteTypeId = 3 THEN 1 END) AS Downvotes,
+        COUNT(CASE WHEN VoteTypeId = 8 THEN 1 END) AS BountiesStarted
+    FROM Votes
+    GROUP BY UserId
+),
+UserTags AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        t.TagName
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), '><')) AS TagName
+    ) x
+    JOIN Tags t ON t.TagName = x.TagName
+    WHERE p.Tags IS NOT NULL AND p.Tags <> ''
+)
+SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(ub.GoldBadges, 0) + COALESCE(ub.SilverBadges, 0) * 0.5 + COALESCE(ub.BronzeBadges, 0) * 0.25 AS WeightedBadgeScore,
+    ps.TotalPosts,
+    ps.AvgPostScore,
+    ps.TotalViews,
+    ps.AcceptedAnswers,
+    cr.TotalCommentScore,
+    cr.CommentRank,
+    va.Upvotes,
+    va.Downvotes,
+    va.BountiesStarted,
+    (SELECT p2.Title FROM Posts p2 WHERE p2.OwnerUserId = u.Id ORDER BY p2.CreationDate DESC FETCH FIRST 1 ROW ONLY) AS LatestPostTitle,
+    (SELECT COUNT(DISTINCT ph.PostHistoryTypeId) FROM PostHistory ph WHERE ph.UserId = u.Id) AS UniqueEditTypes,
+    RANK() OVER (ORDER BY u.Reputation DESC) AS GlobalReputationRank,
+    DENSE_RANK() OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation DESC) AS YearlyReputationRank,
+    COALESCE(STRING_AGG(DISTINCT SUBSTRING(ut.TagName FROM 1 FOR 15), '; '), 'N/A') AS FrequentTags,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id) AND LinkTypeId = 3) AS DuplicateMarkings,
+    CASE 
+        WHEN u.Reputation > 100000 THEN 'Legendary' 
+        WHEN u.Reputation > 50000 THEN 'Epic' 
+        WHEN u.Reputation > 20000 THEN 'Veteran' 
+        ELSE 'Regular' 
+    END AS ReputationTier,
+    COALESCE(ub.LastBadgeDate, u.CreationDate) AS LastActivity,
+    (SELECT COUNT(*) FROM (
+         SELECT p2.Id
+         FROM Posts p2
+         WHERE p2.OwnerUserId = u.Id
+           AND p2.PostTypeId = 2
+           AND p2.Score > 10
+         GROUP BY p2.Id
+     ) sq) AS HighQualityAnswers,
+    AVG(CHAR_LENGTH(p.Body)) OVER () AS AvgPostLengthGlobal,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.ParentId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id)) AS RepliesToUserPosts
+FROM Users u
+LEFT JOIN UserBadges ub ON u.Id = ub.UserId
+LEFT JOIN PostStats ps ON u.Id = ps.OwnerUserId
+LEFT JOIN CommentRank cr ON u.Id = cr.UserId
+LEFT JOIN VoteAnalysis va ON u.Id = va.UserId
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN (
+    SELECT UserId, STRING_AGG(DISTINCT TagName, '; ') AS TagList
+    FROM UserTags
+    GROUP BY UserId
+) utagg ON utagg.UserId = u.Id
+LEFT JOIN UserTags ut ON ut.UserId = u.Id
+WHERE u.Reputation > 1000
+    AND (ps.TotalPosts > 50 OR cr.TotalCommentScore > 200)
+    AND u.LastAccessDate > (CAST('2024-10-01' AS DATE) - INTERVAL '1 year')
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges,
+    ps.TotalPosts, ps.AvgPostScore, ps.TotalViews, ps.AcceptedAnswers,
+    cr.TotalCommentScore, cr.CommentRank, va.Upvotes, va.Downvotes, va.BountiesStarted,
+    ub.LastBadgeDate, u.CreationDate, utagg.TagList,
+    p.Id, p.Body
+HAVING COUNT(DISTINCT p.PostTypeId) > 1 OR MAX(p.Score) > 100
+ORDER BY u.Reputation DESC
+LIMIT 100;

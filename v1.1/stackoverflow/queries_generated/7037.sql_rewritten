@@ -1,0 +1,204 @@
+-- {"query": "7037.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2402} 
+with
+-- active users: recent activity, reputation buckets and derived name fragments
+active_users as (
+  select u.id,
+         u.reputation,
+         case
+           when u.reputation >= 100000 then 'elite'
+           when u.reputation >= 10000 then 'pro'
+           when u.reputation >= 1000 then 'experienced'
+           when u.reputation >= 100 then 'regular'
+           else 'novice'
+         end as rep_bucket,
+         lower(coalesce(nullif(u.displayname,''),'[anon]')) as display_norm,
+         -- first token of display name (if any), useful for string ops
+         split_part(coalesce(nullif(u.displayname,''),'[anon]'),' ',1) as name_token,
+         row_number() over (order by u.lastaccessdate desc nulls last) as recent_rank
+  from users u
+  where u.creationdate < cast('2024-10-01 12:34:56' as timestamp) and u.id is not null
+),
+-- questions with tag explosion parsed into rows
+question_tags as (
+  select p.id as post_id,
+         p.title,
+         p.owneruserid,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         p.answercount,
+         p.tags,
+         -- tags are stored like '<tag1><tag2>'; extract tokens defensively
+         trim(both ' ' from nullif(regexp_replace(tag, '[<>]', '','g'),'')) as tagname
+  from posts p
+  cross join lateral (
+    select unnest(
+      case
+        when p.tags is null or p.tags = '' then array[]::text[]
+        else string_to_array(substring(p.tags,2,length(p.tags)-2),'><')
+      end
+    ) as tag
+  ) t
+  where p.posttypeid = 1
+),
+-- aggregate tag popularity and top questions per tag
+tag_stats as (
+  select qt.tagname,
+         count(distinct qt.post_id) as questions_with_tag,
+         avg(qt.score) filter (where qt.score is not null) as avg_score,
+         sum(coalesce(qt.viewcount,0)) as total_views,
+         max(qt.score) as max_score,
+         -- pick representative question id per tag (highest score, tie by views)
+         (array_agg(qt.post_id order by qt.score desc nulls last, qt.viewcount desc nulls last))[1] as top_question_id
+  from question_tags qt
+  group by qt.tagname
+),
+-- compute per-question enriched metrics, including correlated subqueries for accepted answer age, comment density, and vote tallies
+question_metrics as (
+  select q.id,
+         q.title,
+         q.owneruserid,
+         q.creationdate,
+         q.score,
+         q.viewcount,
+         q.answercount,
+         q.tags,
+         -- time until accepted answer in hours (null if none)
+         (
+           select extract(epoch from (a.creationdate - q.creationdate))/3600.0
+           from posts a
+           where a.id = q.acceptedanswerid and a.posttypeid = 2
+           limit 1
+         )::numeric(18,3) as hours_to_accept,
+         -- comment count from comments table for this post (coalesced)
+         (select count(*) from comments c where c.postid = q.id) as comments_on_post,
+         -- vote breakdown using conditional aggregation
+         (select count(*) filter (where v.votetypeid = 2) from votes v where v.postid = q.id) as upvotes,
+         (select count(*) filter (where v.votetypeid = 3) from votes v where v.postid = q.id) as downvotes,
+         -- contested_score: score adjusted by (up - down) and dampened by sqrt of views to create varied numeric distribution
+         (coalesce(q.score,0) + coalesce((select count(*) filter (where v.votetypeid=2) from votes v where v.postid = q.id),0)
+          - coalesce((select count(*) filter (where v.votetypeid=3) from votes v where v.postid = q.id),0)
+         ) / greatest(1.0, sqrt(greatest(coalesce(q.viewcount,0),1))) as contested_score
+  from posts q
+  where q.posttypeid = 1
+),
+-- join tags back to question metrics and include user info via outer joins
+questions_enriched as (
+  select qm.*,
+         qt.tagname,
+         ts.questions_with_tag,
+         ts.avg_score as tag_avg_score,
+         au.display_norm as owner_display,
+         au.rep_bucket as owner_bucket,
+         au.recent_rank
+  from question_metrics qm
+  left join question_tags qt on qt.post_id = qm.id
+  left join tag_stats ts on ts.tagname = qt.tagname
+  left join active_users au on au.id = qm.owneruserid
+),
+-- rank tags by a composite popularity metric and compute moving averages via window functions
+tag_popularity as (
+  select ts.*,
+         (ts.questions_with_tag * 0.6 + coalesce(ts.total_views,0)/100.0 * 0.3 + coalesce(ts.max_score,0) * 0.1) as popularity_index,
+         dense_rank() over (order by (ts.questions_with_tag * 0.6 + coalesce(ts.total_views,0)/100.0 * 0.3 + coalesce(ts.max_score,0) * 0.1) desc) as pop_rank,
+         avg(ts.questions_with_tag) over () as avg_questions_per_tag,
+         percentile_cont(0.5) within group (order by ts.questions_with_tag) over () as median_questions_per_tag
+  from tag_stats ts
+),
+-- compute users' contribution patterns: answers per user, avg score of their questions, last activity gap
+user_contrib as (
+  select u.id,
+         u.display_norm,
+         u.reputation,
+         coalesce(qc.questions_posted,0) as questions_posted,
+         coalesce(ac.answers_posted,0) as answers_posted,
+         coalesce(score_stats.avg_q_score,0) as avg_question_score,
+         coalesce(score_stats.max_q_score,0) as max_question_score,
+         extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - u.creationdate))/86400.0 as account_age_days,
+         extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - u.lastaccessdate))/86400.0 as days_since_last_access
+  from users u
+  left join (
+    select owneruserid, count(*) as questions_posted
+    from posts
+    where posttypeid = 1
+    group by owneruserid
+  ) qc on qc.owneruserid = u.id
+  left join (
+    select owneruserid, count(*) as answers_posted
+    from posts
+    where posttypeid = 2
+    group by owneruserid
+  ) ac on ac.owneruserid = u.id
+  left join (
+    select owneruserid,
+           avg(score) as avg_q_score,
+           max(score) as max_q_score
+    from posts
+    where posttypeid = 1
+    group by owneruserid
+  ) score_stats on score_stats.owneruserid = u.id
+),
+-- identify suspiciously low-activity tags (few questions but high avg score) and explode using set operations
+anomalous_tags as (
+  select tp.tagname,
+         tp.questions_with_tag,
+         tp.avg_score,
+         tp.total_views,
+         tp.popularity_index
+  from tag_popularity tp
+  where tp.questions_with_tag < greatest(5, tp.avg_questions_per_tag * 0.2)
+    and tp.avg_score > greatest(1.0, tp.avg_score * 0) -- noop but forces non-null
+    and tp.popularity_index > 10
+),
+-- combine questions enriched with a flag if their tag is anomalous and compute window-based leaderboards per tag
+final_enriched as (
+  select qe.*,
+         case when at.tagname is not null then true else false end as is_tag_anomalous,
+         rank() over (partition by qe.tagname order by qe.contested_score desc nulls last) as within_tag_rank,
+         dense_rank() over (order by qe.contested_score desc nulls last) as global_contested_rank,
+         -- build a composite text expression to stress string processing
+         (coalesce(qe.title,'') || ' | tags: ' || coalesce(qe.tagname,'[none]') || ' | owner: ' || coalesce(qe.owner_display,'[unknown]')) as summary_text
+  from questions_enriched qe
+  left join anomalous_tags at on at.tagname = qe.tagname
+)
+-- final selection: mix of aggregations, correlated EXISTS, set operators and NULL logic
+select fe.tagname,
+       coalesce(fe.title, '[untitled]') as sample_title,
+       min(fe.creationdate) as earliest_question_with_tag,
+       max(fe.creationdate) as newest_question_with_tag,
+       count(distinct fe.id) as sample_questions_count,
+       count(distinct fe.owneruserid) as distinct_askers,
+       avg(fe.contested_score) as avg_contested_score,
+       sum(fe.viewcount) as total_views_for_sample,
+       sum(case when fe.hours_to_accept is null then 0 else 1 end) as accepted_count,
+       avg(fe.hours_to_accept) filter (where fe.hours_to_accept is not null) as avg_hours_to_accept,
+       max(fe.within_tag_rank) as worst_rank_in_tag,
+       min(fe.global_contested_rank) as best_global_rank_in_sample,
+       bool_or(fe.is_tag_anomalous) as tag_has_anomaly,
+       -- demonstrate EXISTS correlated subquery: whether any answer to this tag's top question was posted by a high rep user
+       exists (
+         select 1 from posts a
+         join users uu on uu.id = a.owneruserid
+         where a.posttypeid = 2
+           and a.parentid = fe.id
+           and uu.reputation > 50000
+         limit 1
+       ) as has_highrep_answer,
+       -- include a set operator: whether this tag is among the top 10 popular tags (union with a derived top set)
+       case when fe.tagname in (
+         select tagname from tag_popularity tp2 where tp2.pop_rank <= 10
+         union
+         select tagname from tag_popularity tp3 where tp3.total_views > (select avg(total_views) from tag_popularity)
+       ) then 'top_or_viral' else 'regular' end as tag_category,
+       -- include complex predicate combining NULL logic and boolean expressions
+       sum(case when (fe.owner_bucket = 'elite' or fe.owner_bucket = 'pro') and fe.comments_on_post > 5 and coalesce(fe.score,0) >= 0 then 1 else 0 end) as highrep_engaged_count,
+       -- sample text aggregation to stress string functions
+       string_agg(distinct fe.summary_text, ' || ' order by fe.global_contested_rank NULLS LAST) as sample_summaries
+from final_enriched fe
+where fe.tagname is not null
+  and fe.title is not null
+  and fe.creationdate > cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+group by fe.tagname, fe.tagname, fe.is_tag_anomalous
+having count(distinct fe.id) > 3
+order by avg_contested_score desc nulls last, total_views_for_sample desc
+limit 200;

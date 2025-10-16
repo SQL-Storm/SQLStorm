@@ -1,0 +1,71 @@
+-- {"query": "1048.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4o-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 504} 
+
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        u.DisplayName AS OwnerDisplayName,
+        COUNT(c.Id) AS CommentCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotes,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS PostRank
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN 
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    WHERE 
+        p.CreationDate >= NOW() - INTERVAL '1 year'
+    GROUP BY 
+        p.Id, u.DisplayName
+),
+TopPosts AS (
+    SELECT 
+        rp.PostId,
+        rp.Title,
+        rp.OwnerDisplayName,
+        rp.CommentCount,
+        rp.UpVotes,
+        rp.DownVotes
+    FROM 
+        RankedPosts rp
+    WHERE 
+        rp.PostRank <= 10
+),
+PostDetails AS (
+    SELECT 
+        tp.PostId,
+        tp.Title,
+        tp.OwnerDisplayName,
+        tp.CommentCount,
+        tp.UpVotes,
+        tp.DownVotes,
+        COALESCE((SELECT MAX(ph.CreationDate) 
+                  FROM PostHistory ph 
+                  WHERE ph.PostId = tp.PostId AND ph.PostHistoryTypeId IN (10, 11)), 
+                 NULL) AS LastCloseOpenDate
+    FROM 
+        TopPosts tp
+)
+SELECT 
+    pd.Title,
+    pd.OwnerDisplayName,
+    pd.CommentCount,
+    pd.UpVotes,
+    pd.DownVotes,
+    CASE 
+        WHEN pd.LastCloseOpenDate IS NOT NULL THEN 'Closed/Open'
+        ELSE 'Active'
+    END AS PostStatus,
+    CASE 
+        WHEN pd.UpVotes = 0 THEN NULL
+        ELSE ROUND((pd.UpVotes::decimal / NULLIF(pd.UpVotes + pd.DownVotes, 0) * 100), 2)
+    END AS UpVotePercentage
+FROM 
+    PostDetails pd
+ORDER BY 
+    pd.UpVotes DESC NULLS LAST;

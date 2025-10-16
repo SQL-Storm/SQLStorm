@@ -1,0 +1,250 @@
+-- {"query": "19058.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3772} 
+
+WITH ActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - u.CreationDate)) / (60 * 60 * 24) AS UserLifetimeDays,
+        u.Reputation / NULLIF(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - u.CreationDate)) / (60 * 60 * 24), 0) AS ReputationPerDay,
+        CASE
+            WHEN u.AboutMe LIKE '%developer%' OR u.AboutMe LIKE '%engineer%' OR u.AboutMe LIKE '%coding%' THEN 'Developer'
+            WHEN u.AboutMe LIKE '%student%' OR u.AboutMe LIKE '%learner%' THEN 'Student'
+            WHEN u.AboutMe IS NULL OR LENGTH(TRIM(u.AboutMe)) = 0 THEN 'Undefined'
+            ELSE 'Other'
+        END AS AboutMeCategory,
+        NULLIF(TRIM(SPLIT_PART(u.Location, ',', 1)), '') AS City,
+        NULLIF(TRIM(SPLIT_PART(u.Location, ',', 2)), '') AS Country
+    FROM Users AS u
+    WHERE u.Reputation > 5000
+    AND u.LastAccessDate >= CURRENT_TIMESTAMP - INTERVAL '1 year'
+),
+SignificantPosts AS (
+    -- Combine questions with high score and many answers or comments
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.CommunityOwnedDate,
+        p.ClosedDate,
+        'Question' AS PostTypeCategory,
+        (CAST(p.Score AS NUMERIC) + COALESCE(p.FavoriteCount, 0)) / NULLIF(CAST(p.ViewCount AS NUMERIC), 0.001) AS PostEngagementRatio
+    FROM Posts AS p
+    WHERE p.PostTypeId = 1
+    AND (p.Score > 20 OR p.AnswerCount > 5 OR p.CommentCount > 10)
+
+    UNION ALL
+
+    -- Combine answers with high score or accepted answers
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        NULL AS AnswerCount, -- Answers don't have AnswerCount
+        p.CommentCount,
+        p.FavoriteCount,
+        p.Title,
+        p.Tags,
+        NULL AS AcceptedAnswerId, -- Answers don't have AcceptedAnswerId
+        p.CommunityOwnedDate,
+        p.ClosedDate,
+        'Answer' AS PostTypeCategory,
+        (CAST(p.Score AS NUMERIC) + COALESCE(p.FavoriteCount, 0)) / NULLIF(CAST(p.ViewCount AS NUMERIC), 0.001) AS PostEngagementRatio
+    FROM Posts AS p
+    WHERE p.PostTypeId = 2
+    AND (p.Score > 30 OR p.AcceptedAnswerId IS NOT NULL)
+),
+PostAggregates AS (
+    SELECT
+        sp.PostId,
+        sp.OwnerUserId,
+        sp.PostTypeCategory,
+        sp.CreationDate AS PostCreationDate,
+        sp.Score AS PostScore,
+        sp.ViewCount,
+        sp.AnswerCount,
+        sp.CommentCount,
+        sp.FavoriteCount,
+        sp.Title,
+        sp.Tags,
+        sp.AcceptedAnswerId,
+        sp.CommunityOwnedDate,
+        sp.ClosedDate,
+        sp.PostEngagementRatio,
+        COALESCE(SUM(c.Score), 0) AS TotalCommentScore,
+        COUNT(c.Id) AS NumComments,
+        AVG(c.Score) FILTER (WHERE c.Id IS NOT NULL) AS AvgCommentScore,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS PostUpVotes, -- UpMod
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS PostDownVotes, -- DownMod
+        SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS PostAcceptedVotes -- AcceptedByOriginator
+    FROM SignificantPosts AS sp
+    LEFT JOIN Comments AS c ON sp.PostId = c.PostId
+    LEFT JOIN Votes AS v ON sp.PostId = v.PostId
+    GROUP BY sp.PostId, sp.OwnerUserId, sp.PostTypeCategory, sp.CreationDate, sp.Score, sp.ViewCount, sp.AnswerCount, sp.CommentCount, sp.FavoriteCount, sp.Title, sp.Tags, sp.AcceptedAnswerId, sp.CommunityOwnedDate, sp.ClosedDate, sp.PostEngagementRatio
+),
+PostHistoryDetails AS (
+    SELECT
+        ph.PostId,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9, 24) THEN 1 END) AS TotalEdits,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 END) AS TotalClosures,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 END) AS TotalReopens,
+        -- Get the length of the initial body using a correlated subquery
+        (SELECT LENGTH(pht.Text) FROM PostHistory pht WHERE pht.PostId = ph.PostId AND pht.PostHistoryTypeId = 2 ORDER BY pht.CreationDate ASC, pht.Id ASC LIMIT 1) AS InitialBodyLength,
+        -- Get the length of the latest body revision using a correlated subquery
+        (SELECT LENGTH(pht.Text) FROM PostHistory pht WHERE pht.PostId = ph.PostId AND pht.PostHistoryTypeId IN (2,5,8) ORDER BY pht.CreationDate DESC, pht.Id DESC LIMIT 1) AS LatestBodyLength
+    FROM PostHistory AS ph
+    WHERE ph.PostHistoryTypeId IN (2, 4, 5, 6, 7, 8, 9, 10, 11, 24)
+    GROUP BY ph.PostId
+),
+UserPostTagAggregates AS (
+    SELECT
+        au.UserId,
+        au.DisplayName,
+        COUNT(pa.PostId) AS TotalPostsByOwner,
+        SUM(CASE WHEN pa.PostTypeCategory = 'Question' THEN 1 ELSE 0 END) AS TotalQuestionsByOwner,
+        SUM(CASE WHEN pa.PostTypeCategory = 'Answer' THEN 1 ELSE 0 END) AS TotalAnswersByOwner,
+        AVG(pa.PostScore) AS AvgPostScoreByOwner,
+        AVG(pa.PostEngagementRatio) AS AvgPostEngagementRatioByOwner,
+        SUM(pa.PostUpVotes) AS TotalUpVotesReceivedByPosts,
+        SUM(pa.PostDownVotes) AS TotalDownVotesReceivedByPosts,
+        SUM(pa.PostAcceptedVotes) AS TotalAcceptedAnswersByOwner,
+        ARRAY_AGG(DISTINCT t.TagName) FILTER (WHERE t.TagName IS NOT NULL) AS ContributedTags, -- Filter out NULL tag names
+        COUNT(DISTINCT t.TagName) AS UniqueTagCount,
+        COALESCE(SUM(t.Count), 0) AS TotalTagPopularityScore, -- Sum of counts for tags this user contributed to
+        SUM(phd.TotalEdits) AS TotalPostEditsMade,
+        SUM(phd.TotalClosures) AS TotalPostsClosed,
+        SUM(phd.TotalReopens) AS TotalPostsReopened,
+        -- Correlated subquery: Check if any of their questions have an accepted answer by a user from the same country
+        EXISTS (
+            SELECT 1
+            FROM Posts AS q_inner
+            JOIN Posts AS a_inner ON q_inner.AcceptedAnswerId = a_inner.Id
+            JOIN Users AS owner_a_inner ON a_inner.OwnerUserId = owner_a_inner.Id
+            WHERE q_inner.OwnerUserId = au.UserId
+            AND q_inner.PostTypeId = 1
+            AND owner_a_inner.Location LIKE au.Country || '%'
+            LIMIT 1
+        ) AS HasLocalAcceptedAnswer,
+        -- Correlated subquery: Calculate avg comment length on posts for this user
+        (SELECT AVG(LENGTH(c_inner.Text)) FROM Comments AS c_inner WHERE c_inner.PostId IN (SELECT p_inner.Id FROM Posts AS p_inner WHERE p_inner.OwnerUserId = au.UserId AND p_inner.PostTypeId IN (1,2))) AS AvgCommentLengthOnUserPosts,
+        -- Ratio of latest body length to initial body length (indicates post evolution/refinement)
+        AVG(CAST(phd.LatestBodyLength AS NUMERIC) / NULLIF(phd.InitialBodyLength, 0)) AS AvgBodyLengthGrowthRatio
+    FROM ActiveUsers AS au
+    JOIN PostAggregates AS pa ON au.UserId = pa.OwnerUserId
+    LEFT JOIN PostHistoryDetails AS phd ON pa.PostId = phd.PostId
+    -- Extract tags and join with Tags table using LATERAL for robustness
+    LEFT JOIN LATERAL (
+        SELECT TRIM(SUBSTRING(unnest(string_to_array(SUBSTRING(pa.Tags, 2, LENGTH(pa.Tags) - 2), '><')), 1, 35)) AS TagName
+    ) AS extracted_tags ON pa.Tags IS NOT NULL AND LENGTH(TRIM(pa.Tags)) > 2 -- Only extract if Tags field is not empty/null
+    LEFT JOIN Tags AS t ON extracted_tags.TagName = t.TagName
+    GROUP BY au.UserId, au.DisplayName, au.Country
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COUNT(CASE WHEN b.TagBased = TRUE THEN 1 END) AS TagBasedBadges
+    FROM Badges AS b
+    GROUP BY b.UserId
+)
+-- Main query to analyze highly engaged power users in active tag ecosystems
+SELECT
+    upa.UserId,
+    upa.DisplayName,
+    au.Reputation,
+    au.UserLifetimeDays,
+    ROUND(au.ReputationPerDay, 4) AS ReputationPerDay,
+    au.AboutMeCategory,
+    COALESCE(au.City, 'Unknown') AS UserCity,
+    COALESCE(au.Country, 'Unknown') AS UserCountry,
+    upa.TotalPostsByOwner,
+    upa.TotalQuestionsByOwner,
+    upa.TotalAnswersByOwner,
+    ROUND(COALESCE(upa.AvgPostScoreByOwner, 0.0), 2) AS AvgPostScore,
+    ROUND(COALESCE(upa.AvgPostEngagementRatioByOwner, 0.0), 4) AS AvgPostEngagementRatio,
+    upa.TotalUpVotesReceivedByPosts,
+    upa.TotalDownVotesReceivedByPosts,
+    upa.TotalAcceptedAnswersByOwner,
+    COALESCE(ubs.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ubs.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ubs.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(ubs.TagBasedBadges, 0) AS TagBasedBadges,
+    upa.UniqueTagCount,
+    upa.ContributedTags,
+    upa.TotalTagPopularityScore,
+    upa.TotalPostEditsMade,
+    upa.TotalPostsClosed,
+    upa.TotalPostsReopened,
+    upa.HasLocalAcceptedAnswer,
+    ROUND(COALESCE(upa.AvgCommentLengthOnUserPosts, 0.0), 2) AS AvgCommentLengthOnUserPosts,
+    ROUND(COALESCE(upa.AvgBodyLengthGrowthRatio, 1.0), 2) AS AvgBodyLengthGrowthRatio,
+    -- Window Function: Rank users by their total post upvotes received within their country
+    RANK() OVER (PARTITION BY au.Country ORDER BY upa.TotalUpVotesReceivedByPosts DESC, au.Reputation DESC) AS CountryUpvoteRank,
+    -- Window Function: NTILE to divide users into 10 groups based on their reputation per day
+    NTILE(10) OVER (ORDER BY au.ReputationPerDay DESC) AS ReputationPerDayDecile,
+    -- Complicated calculation/expression for an "Engagement Quality Index"
+    (
+        (upa.TotalPostsByOwner * 0.5) +
+        (upa.TotalAcceptedAnswersByOwner * 0.8) +
+        (upa.TotalUpVotesReceivedByPosts * 0.2) +
+        (COALESCE(ubs.GoldBadges, 0) * 10) +
+        (COALESCE(ubs.SilverBadges, 0) * 5) -
+        (upa.TotalDownVotesReceivedByPosts * 0.1) -- Penalize downvotes
+    ) / NULLIF(
+        (upa.TotalPostsByOwner + upa.TotalPostEditsMade + COALESCE(ubs.TagBasedBadges, 0) + upa.TotalPostsClosed), 0.001
+    ) AS EngagementQualityIndex,
+    -- String expression and NULL logic: Check if user's display name or any contributed tag contains 'SQL' or 'Database' (case-insensitive)
+    (LOWER(au.DisplayName) LIKE '%sql%' OR LOWER(au.DisplayName) LIKE '%db%') OR EXISTS (SELECT 1 FROM unnest(COALESCE(upa.ContributedTags, '{}'::varchar[])) AS tag WHERE LOWER(tag) LIKE '%sql%' OR LOWER(tag) LIKE '%database%') AS IsSqlOrDBOrientedUser
+FROM ActiveUsers AS au
+JOIN UserPostTagAggregates AS upa ON au.UserId = upa.UserId
+LEFT JOIN UserBadgeSummary AS ubs ON au.UserId = ubs.UserId
+WHERE
+    upa.TotalQuestionsByOwner > 5 -- At least 5 significant questions
+    AND upa.TotalAnswersByOwner > 10 -- At least 10 significant answers
+    AND upa.UniqueTagCount >= 3 -- Contributed to at least 3 unique tags
+    AND upa.AvgPostScoreByOwner > 5 -- Average post score > 5
+    AND au.UserLifetimeDays > 365 -- Active for at least a year
+    AND (
+        upa.TotalPostEditsMade > 10 -- Either edited many posts
+        OR upa.TotalPostsClosed > 2 -- Or had posts closed (indicates engagement or controversy)
+        OR upa.TotalPostsReopened > 1 -- Or had posts reopened
+    )
+    -- Nested subquery: Find users who have posted questions that were subsequently linked as duplicates more than once
+    AND au.UserId IN (
+        SELECT p_inner.OwnerUserId
+        FROM Posts AS p_inner
+        JOIN PostLinks AS pl_inner ON p_inner.Id = pl_inner.PostId
+        WHERE p_inner.PostTypeId = 1 -- Only questions
+        AND pl_inner.LinkTypeId = 3 -- Duplicate link type
+        GROUP BY p_inner.OwnerUserId
+        HAVING COUNT(pl_inner.Id) > 1
+    )
+    -- NOT EXISTS subquery: Exclude users who are owners of more than one post that has been marked as deleted
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostHistory AS ph_delete
+        JOIN Posts AS p_deleted ON ph_delete.PostId = p_deleted.Id
+        WHERE p_deleted.OwnerUserId = au.UserId
+        AND ph_delete.PostHistoryTypeId = 12 -- Post Deleted
+        GROUP BY p_deleted.OwnerUserId
+        HAVING COUNT(DISTINCT p_deleted.Id) > 1 -- More than one unique post by this owner was deleted
+    )
+ORDER BY EngagementQualityIndex DESC, au.Reputation DESC
+LIMIT 100;

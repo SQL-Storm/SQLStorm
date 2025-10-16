@@ -1,0 +1,130 @@
+WITH
+    UserStats AS (
+        SELECT
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            COALESCE(b.Gold, 0)   AS GoldBadges,
+            COALESCE(b.Silver, 0) AS SilverBadges,
+            COALESCE(b.Bronze, 0) AS BronzeBadges,
+            (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id) AS PostCount
+        FROM Users u
+        LEFT JOIN (
+            SELECT
+                UserId,
+                SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS Gold,
+                SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS Silver,
+                SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS Bronze
+            FROM Badges
+            GROUP BY UserId
+        ) b ON b.UserId = u.Id
+    ),
+
+    TagStats AS (
+        SELECT
+            t.TagName,
+            COUNT(p.Id)                                   AS QuestionCount,
+            SUM(p.Score)                                  AS TotalScore,
+            AVG(p.ViewCount)                              AS AvgViews,
+            MAX(p.CreationDate)                           AS MostRecentQuestion,
+            MIN(p.Id)                                     AS AnyQuestionId,
+            MIN(p.Score)                                  AS AnyQuestionScore,
+            ROW_NUMBER() OVER (
+                PARTITION BY t.TagName
+                ORDER BY MIN(p.Score) DESC
+            )                                             AS TopScoringQuestionRank
+        FROM Tags t
+        LEFT JOIN LATERAL (
+            SELECT *
+            FROM Posts p
+            WHERE p.PostTypeId = 1
+              AND p.Tags IS NOT NULL
+              AND POSITION('<' || t.TagName || '>' IN p.Tags) > 0
+        ) p ON TRUE
+        GROUP BY t.TagName
+    ),
+
+    RecentComments AS (
+        SELECT
+            c.PostId,
+            (SELECT c2.text
+               FROM Comments c2
+               WHERE c2.PostId = c.PostId
+               ORDER BY c2.CreationDate DESC
+               LIMIT 1)                                    AS LatestCommentText,
+            SUM(CASE WHEN c.Score > 0 THEN 1 ELSE 0 END)  AS PositiveCommentCount
+        FROM Comments c
+        GROUP BY c.PostId
+    ),
+
+    UserVoteAgg AS (
+        SELECT
+            p.OwnerUserId,
+            SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Posts p
+        JOIN Votes v  ON v.PostId = p.Id
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        GROUP BY p.OwnerUserId
+    )
+
+SELECT
+    us.Id                                    AS UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.PostCount,
+    ts.TagName,
+    ts.QuestionCount,
+    ts.TotalScore,
+    ts.AvgViews,
+    ts.MostRecentQuestion,
+    CASE WHEN ts.TopScoringQuestionRank = 1 THEN 'TOP' END AS TopQuestionFlag,
+    rc.LatestCommentText,
+    rc.PositiveCommentCount,
+    COALESCE(v.UpVotes, 0) - COALESCE(v.DownVotes, 0) AS NetVoteBalance,
+    ROW_NUMBER() OVER (
+        PARTITION BY us.Id
+        ORDER BY ts.TotalScore DESC
+    )                                        AS TagRankingForUser
+FROM UserStats us
+LEFT JOIN TagStats ts ON ts.QuestionCount > 0
+LEFT JOIN RecentComments rc ON rc.PostId = (
+    SELECT p.Id
+    FROM Posts p
+    WHERE p.OwnerUserId = us.Id
+      AND p.PostTypeId = 1
+    ORDER BY p.CreationDate DESC
+    LIMIT 1
+)
+LEFT JOIN UserVoteAgg v ON v.OwnerUserId = us.Id
+WHERE (us.Reputation > 10000 OR us.GoldBadges > 0)
+
+UNION ALL
+
+SELECT
+    NULL::bigint        AS UserId,
+    NULL::text          AS DisplayName,
+    NULL::bigint        AS Reputation,
+    NULL::bigint        AS GoldBadges,
+    NULL::bigint        AS SilverBadges,
+    NULL::bigint        AS BronzeBadges,
+    NULL::bigint        AS PostCount,
+    t.TagName,
+    t.QuestionCount,
+    t.TotalScore,
+    t.AvgViews,
+    t.MostRecentQuestion,
+    NULL::text          AS TopQuestionFlag,
+    NULL::bigint        AS LatestCommentText,    -- kept as NULL placeholder
+    NULL::bigint        AS PositiveCommentCount,
+    NULL::bigint        AS NetVoteBalance,
+    NULL::bigint        AS TagRankingForUser
+FROM TagStats t
+WHERE t.QuestionCount > 1000
+
+ORDER BY
+    Reputation DESC,
+    TotalScore DESC;

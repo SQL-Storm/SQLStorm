@@ -1,0 +1,97 @@
+WITH
+    question_posts AS (
+        SELECT p.Id,
+               p.OwnerUserId,
+               p.CreationDate,
+               p.Score,
+               p.ViewCount,
+               p.Title,
+               p.Tags,
+               CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+               CAST(DATE_PART('day', CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate) AS integer) AS DaysSinceCreation
+        FROM   Posts p
+        WHERE  p.PostTypeId = 1
+          AND (
+              p.Title  ILIKE '%database%'
+              OR p.Tags ILIKE '%[%sql%]%'
+          )
+    ),
+    closes AS (
+        SELECT ph.PostId,
+               MAX(ph.CreationDate) AS LastCloseDate
+        FROM   PostHistory ph
+               JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+        WHERE  pht.Name ILIKE '%Close%'
+        GROUP  BY ph.PostId
+    ),
+    user_rank AS (
+        SELECT u.Id,
+               u.Reputation,
+               RANK() OVER (ORDER BY u.Reputation DESC) AS RepRank
+        FROM   Users u
+    ),
+    tag_counts AS (
+        SELECT p.Id AS PostId,
+               TRIM(BOTH '[]' FROM tag) AS Tag
+        FROM   Posts p
+               CROSS JOIN LATERAL
+               UNNEST(STRING_TO_ARRAY(REGEXP_REPLACE(p.Tags, '[\[\]]', '', 'g'), '> <')) AS tag
+        WHERE  p.PostTypeId = 1
+    ),
+    answer_posts AS (
+        SELECT p.Id,
+               p.OwnerUserId,
+               p.Score,
+               p.Title
+        FROM   Posts p
+        WHERE  p.PostTypeId = 2
+    ),
+    answer_details AS (
+        SELECT a.Id,
+               (SELECT COUNT(*) FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 2) AS UpVotes,
+               (SELECT COUNT(*) FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 3) AS DownVotes,
+               (SELECT COUNT(*) FROM Comments c WHERE c.PostId = a.Id) AS CommentCount
+        FROM   answer_posts a
+    )
+
+SELECT
+    qp.Id            AS PostId,
+    qp.Title,
+    qp.Score,
+    qp.ViewCount,
+    CASE WHEN qp.IsClosed = 1 THEN 'Closed' ELSE 'Open' END AS Status,
+    qp.DaysSinceCreation,
+    user_rank.Reputation,
+    user_rank.RepRank,
+    ARRAY_AGG(DISTINCT tag_counts.Tag ORDER BY tag_counts.Tag) AS Tags,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = qp.Id AND v.VoteTypeId = 2) AS UpVotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = qp.Id AND v.VoteTypeId = 3) AS DownVotes,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = qp.Id) AS CommentCount,
+    closes.LastCloseDate
+FROM   question_posts qp
+       LEFT JOIN closes       ON closes.PostId     = qp.Id
+       LEFT JOIN user_rank    ON user_rank.Id      = qp.OwnerUserId
+       LEFT JOIN tag_counts   ON tag_counts.PostId = qp.Id
+GROUP  BY qp.Id, qp.Title, qp.Score, qp.ViewCount, qp.IsClosed, qp.DaysSinceCreation,
+          user_rank.Reputation, user_rank.RepRank, closes.LastCloseDate
+UNION ALL
+SELECT
+    a.Id            AS PostId,
+    a.Title,
+    a.Score,
+    NULL                                  AS ViewCount,
+    NULL                                  AS Status,
+    NULL                                  AS DaysSinceCreation,
+    user_rank.Reputation,
+    user_rank.RepRank,
+    NULL::text[]::text[] /* keep as NULL typed to text[] in a dialect-safe way */,
+    ad.UpVotes,
+    ad.DownVotes,
+    ad.CommentCount,
+    NULL /* close date irrelevant for answers */
+FROM   answer_posts a
+       LEFT JOIN user_rank     ON user_rank.Id      = a.OwnerUserId
+       LEFT JOIN answer_details ad ON ad.Id = a.Id
+WHERE  NOT EXISTS (SELECT 1 FROM question_posts qp WHERE qp.Id = a.Id)
+ORDER  BY PostId
+LIMIT  200;

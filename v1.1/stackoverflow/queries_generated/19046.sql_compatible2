@@ -1,0 +1,271 @@
+WITH UserInfluence AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COALESCE(u.UpVotes, 0) AS TotalUpVotes,
+        COALESCE(u.DownVotes, 0) AS TotalDownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPostsByOwner,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        CAST(COALESCE(u.UpVotes, 0) AS NUMERIC) / NULLIF(COALESCE(u.UpVotes, 0) + COALESCE(u.DownVotes, 0), 0) AS UserVoteRatio,
+        (u.Reputation * 0.1
+         + (SUM(CASE WHEN b.Class = 1 THEN 10 WHEN b.Class = 2 THEN 5 ELSE 1 END)) * 0.5
+         + COUNT(DISTINCT p.Id) * 0.05
+         - COALESCE(u.DownVotes, 0) * 0.01
+        ) AS InfluenceScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1, 2)
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 500
+      AND u.LastAccessDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.UpVotes, u.DownVotes
+),
+QuestionEditHistory AS (
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS TotalHistoryEvents,
+        COUNT(DISTINCT ph.UserId) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS UniqueEditors,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS BodyTitleTagEdits,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 19 THEN 1 ELSE 0 END) AS ProtectionEvents,
+        MAX(ph.CreationDate) AS LastEditHistoryDate,
+        MIN(ph.CreationDate) AS FirstEditHistoryDate,
+        AVG(EXTRACT(EPOCH FROM (ph.CreationDate - LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate)))) AS AvgTimeBetweenUserEdits
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (1,2,3,4,5,6,10,11,12,13,16,19,20,35,36)
+    GROUP BY ph.PostId
+    HAVING COUNT(DISTINCT ph.Id) > 3
+),
+QuestionVoteSummary AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedVotes,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteVotes,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    WHERE v.VoteTypeId IN (1,2,3,5)
+    GROUP BY v.PostId
+    HAVING SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) > 0
+),
+PostTagAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        p.Tags,
+        LOWER(TRIM(REPLACE(REPLACE(SPLIT_PART(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), '><', 1), '>', ''), '<', ''))) AS PrimaryTag,
+        COALESCE(array_length(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), '><'), 1), 0) AS NumberOfTags
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+QuestionLinkSummary AS (
+    SELECT
+        pl.PostId,
+        SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedPostCount,
+        SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateLinkCount,
+        COUNT(DISTINCT pl.RelatedPostId) AS TotalUniqueLinkedPosts
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+),
+HighlyInteractedQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate AS QuestionCreationDate,
+        p.LastActivityDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount AS PostFavoriteCount,
+        p.OwnerUserId,
+        ui.DisplayName AS OwnerDisplayName,
+        ui.Reputation AS OwnerReputation,
+        ui.InfluenceScore,
+        qe.BodyTitleTagEdits,
+        qe.UniqueEditors,
+        qe.CloseEvents,
+        qe.ReopenEvents,
+        qe.ProtectionEvents,
+        qvs.UpVotesReceived,
+        qvs.DownVotesReceived,
+        pta.PrimaryTag,
+        pta.NumberOfTags,
+        qls.LinkedPostCount,
+        qls.DuplicateLinkCount,
+        qls.TotalUniqueLinkedPosts,
+        (SELECT COUNT(DISTINCT c.Id)
+         FROM Comments c
+         WHERE c.PostId = p.Id
+           AND c.UserId IS NOT NULL
+           AND c.CreationDate > (p.LastActivityDate - INTERVAL '14 days')
+           AND LENGTH(c.Text) > 20
+        ) AS RecentMeaningfulComments,
+        EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate))/86400 AS DaysOpen,
+        CASE
+            WHEN p.ViewCount > 25000 AND (EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate))/86400) BETWEEN 30 AND 365 THEN TRUE
+            ELSE FALSE
+        END AS IsHotQuestion
+    FROM Posts p
+    INNER JOIN UserInfluence ui ON p.OwnerUserId = ui.UserId
+    INNER JOIN QuestionEditHistory qe ON p.Id = qe.PostId
+    INNER JOIN QuestionVoteSummary qvs ON p.Id = qvs.PostId
+    LEFT JOIN PostTagAnalysis pta ON p.Id = pta.PostId
+    LEFT JOIN QuestionLinkSummary qls ON p.Id = qls.PostId
+    WHERE p.PostTypeId = 1
+      AND p.AcceptedAnswerId IS NOT NULL
+      AND p.AnswerCount >= 2
+      AND p.Score > 5
+      AND qe.BodyTitleTagEdits >= 2
+      AND qvs.UpVotesReceived > qvs.DownVotesReceived
+      AND p.CreationDate BETWEEN DATE '2018-01-01' AND (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days')
+),
+QuestionEngagementRank AS (
+    SELECT
+        hiq.QuestionId,
+        hiq.Title,
+        hiq.QuestionCreationDate,
+        hiq.LastActivityDate,
+        hiq.Score,
+        hiq.ViewCount,
+        hiq.AnswerCount,
+        hiq.CommentCount,
+        hiq.PostFavoriteCount,
+        hiq.OwnerUserId,
+        hiq.OwnerDisplayName,
+        hiq.OwnerReputation,
+        hiq.InfluenceScore,
+        hiq.BodyTitleTagEdits,
+        hiq.UniqueEditors,
+        hiq.CloseEvents,
+        hiq.ReopenEvents,
+        hiq.ProtectionEvents,
+        hiq.UpVotesReceived,
+        hiq.DownVotesReceived,
+        hiq.PrimaryTag,
+        hiq.NumberOfTags,
+        hiq.LinkedPostCount,
+        hiq.DuplicateLinkCount,
+        hiq.TotalUniqueLinkedPosts,
+        hiq.RecentMeaningfulComments,
+        hiq.DaysOpen,
+        hiq.IsHotQuestion,
+        DENSE_RANK() OVER (PARTITION BY hiq.PrimaryTag ORDER BY hiq.Score DESC, hiq.ViewCount DESC) AS TagScoreRank,
+        AVG(hiq.Score) OVER (PARTITION BY hiq.OwnerUserId) AS OwnerAvgQuestionScore,
+        COUNT(hiq.QuestionId) OVER (ORDER BY hiq.InfluenceScore ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS SimilarInfluenceUserQuestionCount,
+        SUM(hiq.ViewCount) OVER (PARTITION BY hiq.OwnerUserId ORDER BY hiq.QuestionCreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeOwnerViews
+    FROM HighlyInteractedQuestions hiq
+    WHERE hiq.RecentMeaningfulComments > 0 OR hiq.IsHotQuestion = TRUE
+),
+FinalResultCombined AS (
+    SELECT
+        qer.QuestionId,
+        qer.Title,
+        qer.OwnerDisplayName,
+        qer.OwnerReputation,
+        qer.InfluenceScore,
+        qer.QuestionCreationDate,
+        qer.LastActivityDate,
+        qer.Score,
+        qer.ViewCount,
+        qer.AnswerCount,
+        qer.BodyTitleTagEdits,
+        qer.UpVotesReceived,
+        qer.DownVotesReceived,
+        qer.PrimaryTag,
+        qer.TagScoreRank,
+        qer.OwnerAvgQuestionScore,
+        'HighImpact_Ranked' AS Category,
+        (SELECT MAX(ph.CreationDate) FROM PostHistory ph WHERE ph.PostId = qer.QuestionId AND ph.PostHistoryTypeId = 10 AND ph.UserId IS NOT NULL) AS LatestCloseDate,
+        qer.ProtectionEvents
+    FROM QuestionEngagementRank qer
+    WHERE qer.TagScoreRank <= 5
+      AND qer.InfluenceScore > 500
+      AND qer.BodyTitleTagEdits >= 3
+      AND qer.ProtectionEvents > 0
+
+    UNION ALL
+
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        ui.DisplayName AS OwnerDisplayName,
+        ui.Reputation AS OwnerReputation,
+        ui.InfluenceScore,
+        p.CreationDate AS QuestionCreationDate,
+        p.LastActivityDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        qe.BodyTitleTagEdits,
+        qvs.UpVotesReceived,
+        qvs.DownVotesReceived,
+        pta.PrimaryTag,
+        CAST(NULL AS INTEGER) AS TagScoreRank,
+        CAST(NULL AS NUMERIC) AS OwnerAvgQuestionScore,
+        'Community_Engagement_Complex' AS Category,
+        (SELECT MAX(ph.CreationDate) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 10) AS LatestCloseDate,
+        qe.ProtectionEvents
+    FROM Posts p
+    INNER JOIN UserInfluence ui ON p.OwnerUserId = ui.UserId
+    INNER JOIN QuestionEditHistory qe ON p.Id = qe.PostId
+    INNER JOIN QuestionVoteSummary qvs ON p.Id = qvs.PostId
+    LEFT JOIN PostTagAnalysis pta ON p.Id = pta.PostId
+    LEFT JOIN QuestionLinkSummary qls ON p.Id = qls.PostId
+    WHERE p.PostTypeId = 1
+      AND p.ViewCount > 75000
+      AND p.CommentCount >= 15
+      AND qe.CloseEvents > 0 AND qe.ReopenEvents > 0
+      AND COALESCE(qls.DuplicateLinkCount, 0) > 0
+      AND p.CreationDate >= DATE '2021-01-01'
+)
+SELECT
+    fr.QuestionId,
+    fr.Title,
+    fr.OwnerDisplayName,
+    fr.OwnerReputation,
+    fr.InfluenceScore,
+    fr.Category,
+    fr.QuestionCreationDate,
+    fr.LastActivityDate,
+    fr.Score,
+    fr.ViewCount,
+    fr.AnswerCount,
+    fr.BodyTitleTagEdits,
+    fr.UpVotesReceived,
+    fr.DownVotesReceived,
+    COALESCE(fr.PrimaryTag, 'untagged') AS DisplayTag,
+    fr.TagScoreRank,
+    fr.OwnerAvgQuestionScore,
+    fr.LatestCloseDate,
+    (fr.Score * 0.5
+     + fr.ViewCount * 0.0005
+     + fr.AnswerCount * 3
+     + fr.BodyTitleTagEdits * 1.5
+     + fr.UpVotesReceived * 0.75
+     - fr.DownVotesReceived * 0.25
+     + (CASE WHEN fr.LatestCloseDate IS NOT NULL THEN -10 ELSE 0 END)
+    ) AS WeightedEngagementScore,
+    CASE
+        WHEN fr.LatestCloseDate IS NOT NULL AND fr.LatestCloseDate > (fr.LastActivityDate - INTERVAL '30 days') THEN 'Recently_Closed_Or_Reopened'
+        WHEN fr.AnswerCount = 0 AND fr.LastActivityDate < (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days') THEN 'Stale_Unanswered'
+        WHEN fr.BodyTitleTagEdits > 5 AND fr.UpVotesReceived > 50 THEN 'Highly_Curated_Valuable'
+        WHEN fr.ProtectionEvents > 0 THEN 'Protected_Question'
+        ELSE 'Standard_Engaged'
+    END AS QuestionLifecycleStatus
+FROM FinalResultCombined fr
+WHERE (fr.Score * 0.5
+       + fr.ViewCount * 0.0005
+       + fr.AnswerCount * 3
+       + fr.BodyTitleTagEdits * 1.5
+       + fr.UpVotesReceived * 0.75
+       - fr.DownVotesReceived * 0.25
+       + (CASE WHEN fr.LatestCloseDate IS NOT NULL THEN -10 ELSE 0 END)
+      ) > 150
+  AND fr.QuestionCreationDate >= DATE '2019-01-01'
+ORDER BY WeightedEngagementScore DESC, fr.LastActivityDate DESC
+LIMIT 500;

@@ -1,0 +1,172 @@
+WITH UserMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        DATE_PART('year', AGE(CAST('2024-10-01' AS date), u.CreationDate)) AS YearsActive,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(AVG(p.Score), 0) AS AvgPostScore,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        STRING_AGG(DISTINCT b.Name, ', ' ORDER BY b.Name) FILTER (WHERE b.Class = 1) AS GoldBadgeNames
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.Score IS NOT NULL
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location, u.CreationDate
+),
+TopTags AS (
+    SELECT 
+        p.OwnerUserId,
+        UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS Tag,
+        COUNT(*) AS TagUsageCount,
+        AVG(p.Score) AS AvgTagScore
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL 
+        AND p.OwnerUserId IS NOT NULL
+        AND p.PostTypeId = 1
+    GROUP BY p.OwnerUserId, Tag
+),
+RankedTags AS (
+    SELECT 
+        OwnerUserId,
+        Tag,
+        TagUsageCount,
+        AvgTagScore,
+        ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY TagUsageCount DESC, AvgTagScore DESC) AS rn,
+        DENSE_RANK() OVER (ORDER BY TagUsageCount DESC) AS GlobalTagRank
+    FROM TopTags
+),
+UserEngagement AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(DISTINCT c.Id) AS CommentsReceived,
+        COALESCE(SUM(c.Score), 0) AS TotalCommentScore,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpvotesReceived,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownvotesReceived,
+        COUNT(DISTINCT pl.Id) FILTER (WHERE pl.LinkTypeId = 1) AS LinkedPosts,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS EditCount,
+        COALESCE(MAX(p.FavoriteCount), 0) AS MaxFavorites,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.ViewCount) FILTER (WHERE p.ViewCount IS NOT NULL) AS MedianViews
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+RecentActivity AS (
+    SELECT DISTINCT ON (OwnerUserId)
+        OwnerUserId,
+        Id AS LastPostId,
+        Title AS LastPostTitle,
+        Score AS LastPostScore,
+        CreationDate AS LastPostDate,
+        CASE 
+            WHEN ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            WHEN AnswerCount > 0 THEN 'Has Answers'
+            ELSE 'Open'
+        END AS LastPostStatus
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL
+        AND Title IS NOT NULL
+    ORDER BY OwnerUserId, CreationDate DESC
+)
+SELECT 
+    um.DisplayName,
+    um.Reputation,
+    UPPER(SUBSTRING(um.Location FROM 1 FOR 2)) || LOWER(SUBSTRING(um.Location FROM 3)) AS FormattedLocation,
+    um.YearsActive || ' years' AS Tenure,
+    um.PostCount,
+    um.QuestionCount || '/' || um.AnswerCount AS "Q/A Ratio",
+    ROUND(CAST(um.AvgPostScore AS numeric), 2) AS AvgPostScore,
+    CASE 
+        WHEN um.TotalPostScore > 10000 THEN 'Elite'
+        WHEN um.TotalPostScore > 1000 THEN 'Hot'
+        WHEN um.TotalPostScore > 100 THEN 'Rising'
+        ELSE 'Growing'
+    END AS ScoreTier,
+    um.BadgeCount || ' (' || COALESCE(um.GoldBadges, 0) || ' gold)' AS Badges,
+    COALESCE(SUBSTRING(um.GoldBadgeNames FROM 1 FOR 50) || 
+        CASE WHEN LENGTH(um.GoldBadgeNames) > 50 THEN '...' ELSE '' END, 
+        'None') AS GoldBadgePreview,
+    COALESCE(rt1.Tag, 'N/A') AS TopTag,
+    COALESCE(rt1.TagUsageCount, 0) AS TopTagUses,
+    COALESCE(rt2.Tag, 'N/A') AS SecondTag,
+    COALESCE(rt3.Tag, 'N/A') AS ThirdTag,
+    COALESCE(ue.CommentsReceived, 0) AS CommentsReceived,
+    COALESCE(ue.UpvotesReceived, 0) - COALESCE(ue.DownvotesReceived, 0) AS NetVotes,
+    ROUND(COALESCE(ue.MedianViews, 0)) AS MedianPostViews,
+    COALESCE(ue.EditCount, 0) AS EditContributions,
+    COALESCE(ra.LastPostTitle, 'No posts') AS LatestPost,
+    COALESCE(ra.LastPostStatus, 'N/A') AS LatestPostStatus,
+    EXTRACT(DAY FROM CAST('2024-10-01' AS date) - COALESCE(ra.LastPostDate, um.CreationDate)) AS DaysSinceLastPost,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 FROM Posts p2 
+            WHERE p2.OwnerUserId = um.Id 
+                AND p2.AcceptedAnswerId IS NOT NULL
+        ) THEN 'Yes' 
+        ELSE 'No' 
+    END AS HasAcceptedAnswer,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p3 
+        WHERE p3.ParentId IN (
+            SELECT Id FROM Posts WHERE OwnerUserId = um.Id AND PostTypeId = 1
+        )
+    ) AS TotalAnswersReceived,
+    RANK() OVER (ORDER BY um.Reputation DESC, um.TotalPostScore DESC) AS OverallRank,
+    NTILE(10) OVER (ORDER BY um.Reputation) AS ReputationDecile,
+    LAG(um.DisplayName) OVER (ORDER BY um.Reputation DESC) AS NextLowerUser,
+    LEAD(um.DisplayName) OVER (ORDER BY um.Reputation DESC) AS NextHigherUser
+FROM UserMetrics um
+LEFT JOIN RankedTags rt1 ON um.Id = rt1.OwnerUserId AND rt1.rn = 1
+LEFT JOIN RankedTags rt2 ON um.Id = rt2.OwnerUserId AND rt2.rn = 2
+LEFT JOIN RankedTags rt3 ON um.Id = rt3.OwnerUserId AND rt3.rn = 3
+LEFT JOIN UserEngagement ue ON um.Id = ue.OwnerUserId
+LEFT JOIN RecentActivity ra ON um.Id = ra.OwnerUserId
+WHERE um.PostCount > 5
+    AND (um.QuestionCount > 0 OR um.AnswerCount > 0)
+    AND NOT EXISTS (
+        SELECT 1 
+        FROM PostHistory ph 
+        WHERE ph.UserId = um.Id 
+            AND ph.PostHistoryTypeId = 12
+            AND ph.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '30 days'
+    )
+GROUP BY
+    um.Id,
+    um.DisplayName,
+    um.Reputation,
+    um.Location,
+    um.YearsActive,
+    um.PostCount,
+    um.QuestionCount,
+    um.AnswerCount,
+    um.AvgPostScore,
+    um.TotalPostScore,
+    um.BadgeCount,
+    um.GoldBadges,
+    um.GoldBadgeNames,
+    rt1.Tag,
+    rt1.TagUsageCount,
+    rt2.Tag,
+    rt3.Tag,
+    ue.CommentsReceived,
+    ue.UpvotesReceived,
+    ue.DownvotesReceived,
+    ue.MedianViews,
+    ue.EditCount,
+    ra.LastPostTitle,
+    ra.LastPostStatus,
+    ra.LastPostDate,
+    um.CreationDate
+ORDER BY um.Reputation DESC, um.TotalPostScore DESC
+LIMIT 100;

@@ -1,0 +1,86 @@
+WITH RankedPosts AS (
+  SELECT 
+    p.Id, 
+    p.PostTypeId, 
+    p.Score, 
+    p.ViewCount, 
+    p.OwnerUserId, 
+    p.CreationDate, 
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS RowNum
+  FROM 
+    Posts p
+  WHERE 
+    p.PostTypeId IN (1, 2)
+),
+TopPosts AS (
+  SELECT 
+    Id, 
+    PostTypeId, 
+    Score, 
+    ViewCount, 
+    OwnerUserId, 
+    CreationDate
+  FROM 
+    RankedPosts
+  WHERE 
+    RowNum <= 10
+),
+PostHistoryStats AS (
+  SELECT 
+    ph.PostId, 
+    COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 END) AS CloseCount,
+    COUNT(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 END) AS ReopenCount
+  FROM 
+    PostHistory ph
+  GROUP BY 
+    ph.PostId
+),
+UserReputation AS (
+  SELECT 
+    u.Id, 
+    u.Reputation, 
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRowNum
+  FROM 
+    Users u
+)
+SELECT 
+  tp.Id, 
+  tp.PostTypeId, 
+  tp.Score, 
+  tp.ViewCount, 
+  tp.OwnerUserId, 
+  tp.CreationDate, 
+  phs.CloseCount, 
+  phs.ReopenCount, 
+  u.Reputation, 
+  ur.RepRowNum,
+  CASE 
+    WHEN tp.PostTypeId = 1 THEN 'Question'
+    WHEN tp.PostTypeId = 2 THEN 'Answer'
+  END AS PostType,
+  CASE 
+    WHEN u.Reputation > 10000 THEN 'High'
+    WHEN u.Reputation > 1000 THEN 'Medium'
+    ELSE 'Low'
+  END AS ReputationLevel,
+  STRING_AGG(DISTINCT t.TagName, ', ') AS Tags
+FROM 
+  TopPosts tp
+  LEFT JOIN PostHistoryStats phs ON tp.Id = phs.PostId
+  LEFT JOIN Users u ON tp.OwnerUserId = u.Id
+  LEFT JOIN UserReputation ur ON u.Id = ur.Id
+  LEFT JOIN PostTags pt ON tp.Id = pt.PostId
+  LEFT JOIN Tags t ON pt.TagId = t.Id
+GROUP BY 
+  tp.Id, 
+  tp.PostTypeId, 
+  tp.Score, 
+  tp.ViewCount, 
+  tp.OwnerUserId, 
+  tp.CreationDate, 
+  phs.CloseCount, 
+  phs.ReopenCount, 
+  u.Reputation, 
+  ur.RepRowNum
+ORDER BY 
+  tp.Score DESC;

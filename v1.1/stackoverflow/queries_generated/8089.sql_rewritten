@@ -1,0 +1,356 @@
+-- {"query": "8089.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3543} 
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        coalesce(nullif(trim(u.websiteurl), ''), 'N/A') as websiteurl,
+        count(*) filter (where b.class = 1) as gold_badges,
+        count(*) filter (where b.class = 2) as silver_badges,
+        count(*) filter (where b.class = 3) as bronze_badges,
+        count(b.id) as total_badges,
+        max(b.date) as last_badge_date
+    from users u
+    left join badges b
+        on b.userid = u.id
+    where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by u.id, u.displayname, u.reputation, u.creationdate, u.location, u.websiteurl
+),
+qa as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where p.posttypeid = 1) as q_count,
+        count(*) filter (where p.posttypeid = 2) as a_count,
+        sum(case when p.posttypeid = 1 then coalesce(p.viewcount,0) else 0 end) as q_views,
+        sum(coalesce(p.score,0)) as total_score,
+        sum(coalesce(p.commentcount,0)) as total_comments,
+        sum(coalesce(p.favoritecount,0)) as legacy_favorites
+    from posts p
+    where p.owneruserid is not null
+      and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by p.owneruserid
+),
+votes_agg as (
+    select
+        v.postid,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+        sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded
+    from votes v
+    where v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by v.postid
+),
+user_vote_rollup as (
+    select
+        p.owneruserid as user_id,
+        sum(coalesce(va.upvotes,0)) as upvotes_rcvd,
+        sum(coalesce(va.downvotes,0)) as downvotes_rcvd,
+        sum(coalesce(va.bounty_started,0)) as bounty_started_sum,
+        sum(coalesce(va.bounty_awarded,0)) as bounty_awarded_sum
+    from posts p
+    left join votes_agg va on va.postid = p.id
+    where p.owneruserid is not null
+      and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by p.owneruserid
+),
+accepted_stats as (
+    select
+        a.owneruserid as user_id,
+        count(*) as answers_with_accepts,
+        sum(case when q.acceptedanswerid = a.id then 1 else 0 end) as accepted_answers_by_user,
+        avg(nullif(q.score,0)) filter (where q.acceptedanswerid = a.id) as avg_q_score_for_accepted
+    from posts a
+    join posts q on q.id = a.parentid and a.posttypeid = 2 and q.posttypeid = 1
+    where a.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by a.owneruserid
+),
+tag_explode as (
+    select
+        q.id as question_id,
+        q.owneruserid as user_id,
+        unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')) as tag
+    from posts q
+    where q.posttypeid = 1
+      and q.tags is not null
+      and q.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+top_user_tags as (
+    select
+        user_id,
+        tag,
+        count(*) as tag_count,
+        row_number() over (partition by user_id order by count(*) desc, tag) as rn
+    from tag_explode
+    group by user_id, tag
+),
+dupe_activity as (
+    select
+        pl.postid as post_id,
+        count(*) filter (where pl.linktypeid = 3) as dup_links_out,
+        count(*) filter (where pl.linktypeid = 1) as links_out
+    from postlinks pl
+    where pl.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by pl.postid
+),
+post_edit_events as (
+    select
+        ph.postid,
+        count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edit_events,
+        max(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6,24)) as last_edit_date,
+        count(*) filter (where ph.posthistorytypeid in (10)) as close_votes_events
+    from posthistory ph
+    where ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by ph.postid
+),
+user_post_events as (
+    select
+        p.owneruserid as user_id,
+        sum(coalesce(e.edit_events,0)) as edits_total,
+        max(e.last_edit_date) as last_edit_date,
+        sum(coalesce(e.close_votes_events,0)) as closes_total
+    from posts p
+    left join post_edit_events e on e.postid = p.id
+    where p.owneruserid is not null
+      and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by p.owneruserid
+),
+commenter_engagement as (
+    select
+        c.userid as user_id,
+        count(*) as comments_made,
+        sum(case when c.score > 0 then 1 else 0 end) as pos_comment_count,
+        avg(c.score) as avg_comment_score
+    from comments c
+    where c.userid is not null
+      and c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by c.userid
+),
+quality_bins as (
+    select
+        p.owneruserid as user_id,
+        percentile_cont(0.5) within group (order by coalesce(p.score,0)) as median_post_score,
+        percentile_cont(0.5) within group (order by coalesce(p.viewcount,0)) as median_views
+    from posts p
+    where p.owneruserid is not null
+      and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by p.owneruserid
+),
+activity_calendar as (
+    select
+        p.owneruserid as user_id,
+        date_trunc('month', p.creationdate) as month,
+        count(*) as posts_in_month
+    from posts p
+    where p.owneruserid is not null
+      and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by p.owneruserid, date_trunc('month', p.creationdate)
+),
+active_months as (
+    select
+        user_id,
+        count(*) filter (where posts_in_month >= 3) as prolific_months,
+        count(*) as active_months_total,
+        max(month) as last_active_month
+    from activity_calendar
+    group by user_id
+),
+user_core as (
+    select
+        ru.*,
+        qa.q_count,
+        qa.a_count,
+        qa.q_views,
+        qa.total_score,
+        qa.total_comments,
+        qa.legacy_favorites,
+        uvr.upvotes_rcvd,
+        uvr.downvotes_rcvd,
+        uvr.bounty_started_sum,
+        uvr.bounty_awarded_sum,
+        coalesce(as1.accepted_answers_by_user,0) as accepted_answers,
+        coalesce(as1.answers_with_accepts,0) as answers_with_accepts,
+        as1.avg_q_score_for_accepted
+    from recent_users ru
+    left join qa on qa.user_id = ru.user_id
+    left join user_vote_rollup uvr on uvr.user_id = ru.user_id
+    left join accepted_stats as1 on as1.user_id = ru.user_id
+),
+user_enriched as (
+    select
+        uc.*,
+        upe.edits_total,
+        upe.last_edit_date,
+        upe.closes_total,
+        ce.comments_made,
+        ce.pos_comment_count,
+        ce.avg_comment_score,
+        qb.median_post_score,
+        qb.median_views,
+        am.prolific_months,
+        am.active_months_total,
+        am.last_active_month,
+        t1.tag as top_tag_1,
+        t2.tag as top_tag_2,
+        t3.tag as top_tag_3
+    from user_core uc
+    left join user_post_events upe on upe.user_id = uc.user_id
+    left join commenter_engagement ce on ce.user_id = uc.user_id
+    left join quality_bins qb on qb.user_id = uc.user_id
+    left join active_months am on am.user_id = uc.user_id
+    left join top_user_tags t1 on t1.user_id = uc.user_id and t1.rn = 1
+    left join top_user_tags t2 on t2.user_id = uc.user_id and t2.rn = 2
+    left join top_user_tags t3 on t3.user_id = uc.user_id and t3.rn = 3
+),
+score_rank as (
+    select
+        ue.*,
+        coalesce(ue.a_count,0) + coalesce(ue.q_count,0) as total_posts,
+        coalesce(ue.upvotes_rcvd,0) - coalesce(ue.downvotes_rcvd,0) as net_votes,
+        case
+            when coalesce(ue.a_count,0) = 0 then null
+            else cast(coalesce(ue.accepted_answers,0) as numeric) / nullif(ue.a_count,0)
+        end as accept_rate,
+        case
+            when coalesce(ue.total_posts,0) = 0 then null
+            else cast(coalesce(ue.total_score,0) as numeric) / nullif((coalesce(ue.total_posts,0)),0)
+        end as avg_score_per_post,
+        case
+            when coalesce(ue.total_posts,0) = 0 then null
+            else cast(coalesce(ue.total_comments,0) as numeric) / nullif((coalesce(ue.total_posts,0)),0)
+        end as avg_comments_per_post
+    from user_enriched ue
+),
+ranked as (
+    select
+        s.*,
+        dense_rank() over (order by coalesce(s.total_score,0) desc nulls last, coalesce(s.net_votes,0) desc) as dr_total_score,
+        row_number() over (order by coalesce(s.net_votes,0) desc nulls last) as rn_net_votes,
+        ntile(10) over (order by coalesce(s.avg_score_per_post,0) desc nulls last) as decile_avg_score,
+        sum(coalesce(s.total_posts,0)) over () as grand_total_posts
+    from score_rank s
+),
+thresholds as (
+    select
+        percentile_disc(0.9) within group (order by coalesce(total_score,0)) as p90_total_score,
+        percentile_disc(0.9) within group (order by coalesce(net_votes,0)) as p90_net_votes,
+        percentile_disc(0.9) within group (order by coalesce(avg_score_per_post,0)) as p90_avg_score
+    from ranked
+),
+flagged as (
+    select
+        r.*,
+        t.p90_total_score,
+        t.p90_net_votes,
+        t.p90_avg_score,
+        case when coalesce(r.total_score,0) >= coalesce(t.p90_total_score,0) then 1 else 0 end as is_p90_total_score,
+        case when coalesce(r.net_votes,0) >= coalesce(t.p90_net_votes,0) then 1 else 0 end as is_p90_net_votes,
+        case when coalesce(r.avg_score_per_post,0) >= coalesce(t.p90_avg_score,0) then 1 else 0 end as is_p90_avg_score
+    from ranked r
+    cross join thresholds t
+),
+dupe_penalty as (
+    select
+        p.owneruserid as user_id,
+        sum(coalesce(d.dup_links_out,0)) as dup_links_out_sum,
+        sum(coalesce(d.links_out,0)) as links_out_sum,
+        avg(case when coalesce(d.links_out,0) > 0 then coalesce(d.dup_links_out,0)::numeric / nullif(d.links_out,0) end) as avg_dupe_ratio
+    from posts p
+    left join dupe_activity d on d.post_id = p.id
+    where p.owneruserid is not null
+      and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by p.owneruserid
+),
+final_scores as (
+    select
+        f.*,
+        dp.dup_links_out_sum,
+        dp.links_out_sum,
+        dp.avg_dupe_ratio,
+        greatest(0::numeric,
+            coalesce(f.total_score,0)
+            + coalesce(f.net_votes,0) * 0.5
+            + coalesce(f.accept_rate,0) * 100
+            + coalesce(f.bounty_awarded_sum,0) * 0.1
+            + coalesce(f.gold_badges,0) * 10
+            + coalesce(f.silver_badges,0) * 3
+            + coalesce(f.bronze_badges,0) * 1
+            - coalesce(f.downvotes_rcvd,0) * 0.25
+            - coalesce(dp.dup_links_out_sum,0) * 2
+        ) as composite_score
+    from flagged f
+    left join dupe_penalty dp on dp.user_id = f.user_id
+)
+select
+    fs.user_id,
+    fs.displayname,
+    fs.reputation,
+    fs.location,
+    case when position('.' in coalesce(fs.websiteurl,'')) > 0 then lower(fs.websiteurl) else null end as normalized_website,
+    fs.creationdate,
+    fs.last_active_month,
+    fs.gold_badges,
+    fs.silver_badges,
+    fs.bronze_badges,
+    fs.total_badges,
+    fs.last_badge_date,
+    fs.q_count,
+    fs.a_count,
+    fs.total_posts,
+    fs.q_views,
+    fs.total_score,
+    fs.net_votes,
+    fs.upvotes_rcvd,
+    fs.downvotes_rcvd,
+    fs.bounty_started_sum,
+    fs.bounty_awarded_sum,
+    fs.accepted_answers,
+    fs.answers_with_accepts,
+    fs.accept_rate,
+    fs.avg_q_score_for_accepted,
+    fs.avg_score_per_post,
+    fs.avg_comments_per_post,
+    fs.edits_total,
+    fs.last_edit_date,
+    fs.closes_total,
+    fs.median_post_score,
+    fs.median_views,
+    fs.comments_made,
+    fs.pos_comment_count,
+    fs.avg_comment_score,
+    fs.prolific_months,
+    fs.active_months_total,
+    fs.top_tag_1,
+    fs.top_tag_2,
+    fs.top_tag_3,
+    fs.decile_avg_score,
+    fs.grand_total_posts,
+    fs.p90_total_score,
+    fs.p90_net_votes,
+    fs.p90_avg_score,
+    fs.is_p90_total_score,
+    fs.is_p90_net_votes,
+    fs.is_p90_avg_score,
+    fs.dup_links_out_sum,
+    fs.links_out_sum,
+    fs.avg_dupe_ratio,
+    fs.composite_score,
+    rank() over (order by fs.composite_score desc nulls last, fs.total_score desc nulls last, fs.net_votes desc nulls last) as composite_rank,
+    case
+        when fs.is_p90_total_score = 1 and fs.is_p90_net_votes = 1 then 'elite'
+        when fs.is_p90_total_score = 1 or fs.is_p90_net_votes = 1 then 'excellent'
+        when fs.decile_avg_score <= 3 then 'rising'
+        else 'regular'
+    end as cohort_label
+from final_scores fs
+where coalesce(fs.total_posts,0) >= 5
+  and (
+    fs.is_p90_total_score = 1
+    or fs.is_p90_net_votes = 1
+    or fs.decile_avg_score <= 5
+    or (fs.accept_rate is not null and fs.accept_rate >= 0.25)
+  )
+order by composite_score desc nulls last, total_score desc nulls last
+limit 200;

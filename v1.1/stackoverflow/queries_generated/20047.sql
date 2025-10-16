@@ -1,0 +1,112 @@
+-- {"query": "20047.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1046} 
+
+WITH UserAnswerStats AS (
+  SELECT
+    p_ans.OwnerUserId,
+    p_ans.Score,
+    p_ans.Id AS AnswerId,
+    p_que.Tags,
+    CASE WHEN p_que.AcceptedAnswerId = p_ans.Id THEN 1 ELSE 0 END AS IsAcceptedAnswer
+  FROM Posts AS p_ans
+  JOIN Posts AS p_que
+    ON p_ans.ParentId = p_que.Id
+  WHERE
+    p_ans.PostTypeId = 2
+    AND p_que.PostTypeId = 1
+    AND p_ans.OwnerUserId IS NOT NULL
+    AND p_que.Tags IS NOT NULL AND p_que.Tags != ''
+), UserTopTags AS (
+  SELECT
+    OwnerUserId,
+    Tag
+  FROM (
+    SELECT
+      OwnerUserId,
+      tag,
+      SUM(Score) AS TotalTagScore,
+      COUNT(*) as AnswersInTag,
+      RANK() OVER (PARTITION BY OwnerUserId ORDER BY SUM(Score) DESC, COUNT(*) DESC) AS rnk
+    FROM UserAnswerStats, unnest(string_to_array(substring(Tags, 2, length(Tags) - 2), '><')) AS tag
+    WHERE OwnerUserId IS NOT NULL
+    GROUP BY
+      OwnerUserId,
+      tag
+  ) AS TagScores
+  WHERE
+    rnk <= 3
+), CategorizedAnswers AS (
+  SELECT
+    uas.OwnerUserId,
+    uas.Score,
+    uas.IsAcceptedAnswer,
+    CASE
+      WHEN EXISTS (
+        SELECT 1
+        FROM UserTopTags utt
+        WHERE utt.OwnerUserId = uas.OwnerUserId AND uas.Tags LIKE '%' || utt.Tag || '%'
+      )
+      THEN 'Primary_Tag_Answer'
+      ELSE 'Other_Tag_Answer'
+    END AS AnswerCategory
+  FROM UserAnswerStats AS uas
+), AggregatedPerformance AS (
+  SELECT
+    OwnerUserId,
+    AnswerCategory,
+    COUNT(*) AS AnswerCount,
+    AVG(Score) AS AverageScore,
+    CAST(SUM(IsAcceptedAnswer) AS DECIMAL(10, 4)) / COUNT(*) AS AcceptanceRate
+  FROM CategorizedAnswers
+  GROUP BY
+    OwnerUserId,
+    AnswerCategory
+)
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  u.Reputation,
+  u.Age,
+  COALESCE(primary_perf.AnswerCount, 0) AS PrimaryTagAnswers,
+  COALESCE(other_perf.AnswerCount, 0) AS OtherTagAnswers,
+  primary_perf.AverageScore AS PrimaryTagAvgScore,
+  other_perf.AverageScore AS OtherTagAvgScore,
+  (primary_perf.AverageScore - other_perf.AverageScore) AS PerformanceDelta,
+  primary_perf.AcceptanceRate AS PrimaryTagAcceptRate,
+  other_perf.AcceptanceRate AS OtherTagAcceptRate,
+  (
+    SELECT string_agg(Name, ', ')
+    FROM (
+      SELECT Name
+      FROM Badges b
+      WHERE b.UserId = u.Id AND b.Class = 1
+      ORDER BY b.Date DESC
+      LIMIT 5
+    ) AS GoldBadges
+  ) AS RecentGoldBadges,
+  CONCAT(
+    'User since ',
+    EXTRACT(YEAR FROM u.CreationDate),
+    ', last seen ',
+    CAST(NOW() - u.LastAccessDate AS VARCHAR)
+  ) AS UserActivitySummary
+FROM Users u
+JOIN AggregatedPerformance AS primary_perf
+  ON u.Id = primary_perf.OwnerUserId AND primary_perf.AnswerCategory = 'Primary_Tag_Answer'
+JOIN AggregatedPerformance AS other_perf
+  ON u.Id = other_perf.OwnerUserId AND other_perf.AnswerCategory = 'Other_Tag_Answer'
+WHERE
+  u.Reputation > (SELECT percentile_cont(0.90) WITHIN GROUP (ORDER BY Reputation) FROM Users)
+  AND primary_perf.AnswerCount > 25
+  AND other_perf.AnswerCount > 25
+  AND primary_perf.AverageScore > other_perf.AverageScore
+  AND u.Id IN (
+    -- Find users who have also asked questions that got closed
+    SELECT DISTINCT p.OwnerUserId
+    FROM Posts p
+    JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE p.PostTypeId = 1 AND ph.PostHistoryTypeId = 10 AND p.OwnerUserId IS NOT NULL
+  )
+ORDER BY
+  PerformanceDelta DESC,
+  u.Reputation DESC
+LIMIT 200;

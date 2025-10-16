@@ -1,0 +1,185 @@
+WITH user_activity_metrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        DATE_PART('year', AGE(CAST('2024-10-01' AS DATE), u.CreationDate)) AS YearsActive,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL), 0) AS AvgPostScore,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        STRING_AGG(DISTINCT b.Name, ', ' ORDER BY b.Name) FILTER (WHERE b.Class = 1) AS GoldBadgeNames
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate < CAST('2024-10-01' AS DATE) - INTERVAL '6 months'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location, u.CreationDate
+),
+post_engagement AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpvoteCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownvoteCount,
+        COUNT(DISTINCT pl.Id) AS LinkedPostCount,
+        RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS UserPostRank,
+        PERCENT_RANK() OVER (ORDER BY COALESCE(p.ViewCount, 0)) AS ViewPercentile,
+        LAG(p.CreationDate, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostDate,
+        LEAD(p.CreationDate, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostDate
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId OR p.Id = pl.RelatedPostId
+    WHERE p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '2 years'
+        AND p.PostTypeId IN (1, 2)
+    GROUP BY p.Id, p.OwnerUserId, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.Tags
+),
+tag_expertise AS (
+    SELECT 
+        u.Id AS UserId,
+        UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS Tag,
+        COUNT(*) AS TagPostCount,
+        SUM(p.Score) AS TagTotalScore,
+        AVG(p.Score) AS TagAvgScore,
+        MAX(p.Score) AS TagMaxScore
+    FROM Posts p
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.Tags IS NOT NULL 
+        AND p.Tags != ''
+        AND p.Score > 0
+    GROUP BY u.Id, UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'))
+),
+top_contributors AS (
+    SELECT 
+        uam.*,
+        COALESCE(MAX(pe.Score), 0) AS MaxPostScore,
+        COALESCE(AVG(EXTRACT(EPOCH FROM (pe.NextPostDate - pe.CreationDate))/86400), 0) AS AvgDaysBetweenPosts,
+        COUNT(DISTINCT te.Tag) AS UniqueTagCount,
+        STRING_AGG(DISTINCT te.Tag, ', ' ORDER BY te.TagTotalScore DESC) FILTER (WHERE te.TagAvgScore > 5) AS ExpertTags,
+        DENSE_RANK() OVER (ORDER BY uam.Reputation DESC) AS ReputationRank,
+        CASE 
+            WHEN uam.Reputation > 100000 THEN 'Elite'
+            WHEN uam.Reputation > 50000 THEN 'Expert'
+            WHEN uam.Reputation > 10000 THEN 'Advanced'
+            WHEN uam.Reputation > 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END AS UserTier,
+        CASE 
+            WHEN EXISTS (
+                SELECT 1 
+                FROM Posts accepted 
+                WHERE accepted.AcceptedAnswerId IN (
+                    SELECT Id FROM Posts WHERE OwnerUserId = uam.Id
+                )
+            ) THEN 'Has Accepted Answers'
+            ELSE 'No Accepted Answers'
+        END AS AcceptanceStatus
+    FROM user_activity_metrics uam
+    LEFT JOIN post_engagement pe ON uam.Id = pe.OwnerUserId AND pe.UserPostRank <= 10
+    LEFT JOIN tag_expertise te ON uam.Id = te.UserId
+    WHERE uam.TotalPosts > 10
+        OR uam.Reputation > 5000
+    GROUP BY uam.Id, uam.DisplayName, uam.Reputation, uam.Location, uam.YearsActive,
+             uam.TotalPosts, uam.QuestionCount, uam.AnswerCount, uam.TotalPostScore,
+             uam.AvgPostScore, uam.BadgeCount, uam.GoldBadges, uam.GoldBadgeNames
+)
+SELECT 
+    tc.DisplayName,
+    tc.Location,
+    tc.Reputation,
+    tc.ReputationRank,
+    tc.UserTier,
+    CAST(tc.YearsActive AS TEXT) || ' years' AS Tenure,
+    tc.TotalPosts,
+    ROUND(CAST(tc.TotalPosts AS NUMERIC) / NULLIF(tc.YearsActive, 0), 2) AS PostsPerYear,
+    CAST(tc.QuestionCount AS TEXT) || '/' || CAST(tc.AnswerCount AS TEXT) AS "Questions/Answers",
+    ROUND(CAST(tc.AnswerCount AS NUMERIC) / NULLIF(tc.QuestionCount, 0), 2) AS AnswerToQuestionRatio,
+    tc.TotalPostScore,
+    ROUND(tc.AvgPostScore, 2) AS AvgPostScore,
+    tc.MaxPostScore,
+    CAST(tc.BadgeCount AS TEXT) || ' (' || COALESCE(CAST(tc.GoldBadges AS TEXT), '0') || ' gold)' AS Badges,
+    COALESCE(tc.GoldBadgeNames, 'None') AS GoldBadgeList,
+    tc.UniqueTagCount,
+    COALESCE(SUBSTRING(tc.ExpertTags FROM 1 FOR 100), 'No expertise tags') AS TopExpertiseTags,
+    CAST(ROUND(tc.AvgDaysBetweenPosts, 1) AS TEXT) || ' days' AS AvgPostingFrequency,
+    tc.AcceptanceStatus,
+    CASE 
+        WHEN tc.Reputation > 50000 AND COALESCE(tc.GoldBadges, 0) > 5 THEN '⭐ Super Contributor'
+        WHEN tc.AnswerCount > tc.QuestionCount * 2 AND tc.AvgPostScore > 5 THEN '🎯 Answer Specialist'
+        WHEN tc.QuestionCount > tc.AnswerCount * 2 THEN '❓ Question Expert'
+        WHEN tc.UniqueTagCount > 20 AND tc.TotalPosts > 100 THEN '🌐 Generalist'
+        WHEN tc.YearsActive > 5 AND tc.TotalPosts / NULLIF(tc.YearsActive, 0) < 10 THEN '🐢 Slow & Steady'
+        WHEN tc.AvgDaysBetweenPosts < 7 AND tc.TotalPosts > 50 THEN '🚀 Rapid Fire'
+        ELSE '👤 Regular Contributor'
+    END AS ContributorProfile,
+    (
+        SELECT COUNT(DISTINCT ph.Id)
+        FROM PostHistory ph
+        WHERE ph.UserId = tc.Id
+            AND ph.PostHistoryTypeId IN (4, 5, 6)
+            AND ph.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '90 days'
+    ) AS RecentEdits,
+    EXISTS (
+        SELECT 1
+        FROM Posts p2
+        WHERE p2.OwnerUserId = tc.Id
+            AND p2.ClosedDate IS NOT NULL
+    ) AS HasClosedPosts,
+    COALESCE((
+        SELECT STRING_AGG(DISTINCT u2.DisplayName, ', ' ORDER BY u2.DisplayName)
+        FROM Comments c1
+        INNER JOIN Comments c2 ON c1.PostId = c2.PostId
+        INNER JOIN Users u2 ON c2.UserId = u2.Id
+        WHERE c1.UserId = tc.Id
+            AND c2.UserId != tc.Id
+            AND u2.Reputation > 10000
+        LIMIT 5
+    ), 'No high-rep interactions') AS InteractedWithHighRepUsers,
+    tc.Id
+FROM top_contributors tc
+WHERE tc.Reputation IS NOT NULL
+    AND (tc.TotalPosts > 25 OR tc.Reputation > 10000)
+    AND tc.DisplayName NOT LIKE '%bot%'
+    AND tc.DisplayName IS NOT NULL
+GROUP BY
+    tc.DisplayName,
+    tc.Location,
+    tc.Reputation,
+    tc.ReputationRank,
+    tc.UserTier,
+    tc.YearsActive,
+    tc.TotalPosts,
+    tc.QuestionCount,
+    tc.AnswerCount,
+    tc.TotalPostScore,
+    tc.AvgPostScore,
+    tc.MaxPostScore,
+    tc.BadgeCount,
+    tc.GoldBadges,
+    tc.GoldBadgeNames,
+    tc.UniqueTagCount,
+    tc.ExpertTags,
+    tc.AvgDaysBetweenPosts,
+    tc.AcceptanceStatus,
+    tc.AnswerCount,
+    tc.TotalPosts,
+    tc.Id
+ORDER BY 
+    CASE 
+        WHEN tc.UserTier = 'Elite' THEN 1
+        WHEN tc.UserTier = 'Expert' THEN 2
+        ELSE 3
+    END,
+    tc.Reputation DESC,
+    tc.TotalPostScore DESC
+LIMIT 100;

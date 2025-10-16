@@ -1,0 +1,130 @@
+-- {"query": "1427.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1379} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT t.Id, t.TagName, t.IsModeratorOnly, t.IsRequired, 1 AS Level
+    FROM Tags t
+    WHERE t.IsRequired = 1
+
+    UNION ALL
+
+    SELECT child.Id, child.TagName, child.IsModeratorOnly, child.IsRequired, rh.Level + 1
+    FROM Tags child
+    JOIN PostLinks pl ON child.ExcerptPostId = pl.PostId
+    JOIN Posts p ON pl.RelatedPostId = p.Id
+    JOIN RecursiveTagHierarchy rh ON p.Id = rh.Id
+    WHERE child.IsModeratorOnly = 0
+),
+UserReputationRankings AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        ROW_NUMBER() OVER (PARTITION BY COALESCE(u.Location, 'Unknown') ORDER BY u.Reputation DESC NULLS LAST) AS LocationReputationRank,
+        COUNT(b.Id) FILTER (WHERE b.Date >= CURRENT_DATE - INTERVAL '1 year' AND b.Class = 1) AS GoldBadgesLastYear,
+        COUNT(b.Id) FILTER (WHERE b.Date >= CURRENT_DATE - INTERVAL '1 year' AND b.Class = 2) AS SilverBadgesLastYear,
+        COUNT(b.Id) FILTER (WHERE b.Date >= CURRENT_DATE - INTERVAL '1 year' AND b.Class = 3) AS BronzeBadgesLastYear
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+),
+HighImpactPosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.Title,
+        p.CreationDate,
+        psmax.MaxPostScoreInParent,
+        EXTRACT(day FROM CURRENT_TIMESTAMP - p.CreationDate) AS DaysSinceCreation,
+        LTRIM(RTRIM(REGEXP_REPLACE(p.Tags, '[<>]', ' ', 'g'))) AS CleanTags
+    FROM Posts p
+    LEFT JOIN LATERAL (
+        SELECT MAX(score) AS MaxPostScoreInParent FROM Posts WHERE ParentId = p.Id
+    ) AS psmax ON true
+    WHERE p.PostTypeId IN (1,2) -- Questions or Answers
+        AND p.CreationDate > CURRENT_DATE - INTERVAL '365 days'
+        AND (p.Score > 100 OR p.ViewCount > 10000)
+),
+QuestionsWithCorrelatedData AS (
+    SELECT
+        q.Id,
+        q.Title,
+        COALESCE(q.AnswerCount, 0) AS AnswerCount,
+        (SELECT COUNT(DISTINCT c.UserId)
+         FROM Comments c 
+         WHERE c.PostId = q.Id AND c.UserId IS NOT NULL) AS UniqueCommentersCount,
+        q.FavoriteCount,
+        (CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS HasAcceptedAnswer,
+        COALESCE(LENTRIMNone.BriefBody, '') AS RecentEditBodySnippet
+    FROM Posts q
+    LEFT JOIN (
+        SELECT ph.PostId, SUBSTR(ph.Text, 1, 100) AS BriefBody
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId IN (5, 8)             -- Edit Body or Rollback Body
+          AND ph.CreationDate >= CURRENT_TIMESTAMP - INTERVAL '60 days'
+        ORDER BY ph.CreationDate DESC
+        LIMIT 1
+        ) AS LENTRIMNone ON LENTRIMNone.PostId = q.Id 
+    WHERE q.PostTypeId = 1
+)
+SELECT DISTINCT
+    urt.UserId,
+    urt.DisplayName,
+    urt.Location,
+    urt.Reputation,
+    urt.LocationReputationRank,
+    urt.GoldBadgesLastYear,
+    urt.SilverBadgesLastYear,
+    urt.BronzeBadgesLastYear,
+    hip.Id AS PostId,
+    hip.PostTypeId,
+    hip.Title,
+    hip.Score,
+    hip.ViewCount,
+    qp.AnswerCount,
+    qp.UniqueCommentersCount,
+    qp.FavoriteCount,
+    qp.HasAcceptedAnswer,
+    ROW_NUMBER() OVER (
+        PARTITION BY urt.Location
+        ORDER BY hip.Score DESC NULLS LAST, hip.ViewCount DESC
+    ) AS UserLocationRankByPostScore,
+    JSON_AGG(DISTINCT COALESCE(rth.TagName, 'untagged')) FILTER (WHERE rth.Level <= 3) OVER (PARTITION BY hip.Id) AS TopHierarchyTags,
+    CASE
+        WHEN urt.Reputation > 20000 AND qp.HasAcceptedAnswer = 1 THEN
+            ROUND( (	cv_infos(aura.AnswerScore, 5) +
+						cv_infos(qp.FavoriteCount, 5) +
+						usu_distinct.ActivitiesScore)/3.0, 2)
+        ELSE NULL
+    END AS WeightedQualityScore
+FROM UserReputationRankings urt
+LEFT JOIN HighImpactPosts hip ON hip.OwnerUserId = urt.UserId
+LEFT JOIN QuestionsWithCorrelatedData qp ON qp.Id = hip.Id
+LEFT JOIN RecursiveTagHierarchy rth ON strpos(hip.CleanTags, rth.TagName) > 0
+OUTER LEFT JOIN LATERAL (
+    SELECT
+        SUM(COALESCE(p.Score,0)) AS AnswerScore
+    FROM Posts p
+    WHERE p.OwnerUserId = urt.UserId AND p.PostTypeId = 2
+) AS aura ON true
+OUTER LEFT JOIN LATERAL (
+    SELECT
+        COUNT(DISTINCT ph.UserId) FILTER(
+            WHERE ph.CreationDate > CURRENT_DATE - INTERVAL '180 days'
+        ) +
+        COUNT(DISTINCT v.UserId) FILTER(
+            WHERE v.CreationDate > CURRENT_DATE - INTERVAL '180 days' AND v.UserId IS NOT NULL
+        ) AS ActivitiesScore
+    FROM PostHistory ph
+    LEFT JOIN Votes v ON v.UserId = urt.UserId
+) AS usu_distinct ON true
+WHERE urt.Location IS NOT NULL
+AND (urt.GoldBadgesLastYear + urt.SilverBadgesLastYear + urt.BronzeBadgesLastYear) > 0
+AND hip.NumberOfDaysSinceCreation IS NOT NULL
+ORDER BY urt.Location, urt.Reputation DESC, hip.Score DESC NULLS LAST;

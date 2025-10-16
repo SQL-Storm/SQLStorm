@@ -1,0 +1,192 @@
+-- {"query": "291.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 5315} 
+WITH
+questions AS (
+  SELECT p.*,
+         substring(p.Tags FROM 2 FOR char_length(p.Tags)-2) AS TagsInner
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+answers AS (
+  SELECT p.*
+  FROM Posts p
+  WHERE p.PostTypeId = 2
+),
+tagged AS (
+  SELECT q.Id AS QuestionId,
+         lower(trim(t)) AS Tag
+  FROM questions q
+  CROSS JOIN LATERAL (
+    SELECT regexp_split_to_table(COALESCE(q.TagsInner,''), '><') AS t
+  ) s
+),
+answer_stats AS (
+  SELECT a.ParentId AS QuestionId,
+         COUNT(*) AS TotalAnswers,
+         AVG(a.Score)::numeric(10,3) AS AvgAnswerScore,
+         MIN(a.CreationDate) AS FirstAnswerDate,
+         MAX(a.Score) FILTER (WHERE a.Id = (SELECT q.AcceptedAnswerId FROM questions q WHERE q.Id = a.ParentId)) AS AcceptedAnswerScore
+  FROM answers a
+  GROUP BY a.ParentId
+),
+vote_summ AS (
+  SELECT p.Id AS PostId,
+         COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+         COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+         COUNT(DISTINCT v.UserId) FILTER (WHERE v.VoteTypeId = 2) AS DistinctUpvoters,
+         SUM(v.BountyAmount) AS TotalBounties,
+         COUNT(*) AS TotalVotes
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  GROUP BY p.Id
+),
+history_flags AS (
+  SELECT ph.PostId,
+         bool_or(ph.PostHistoryTypeId IN (10,12,35,36)) AS HasCloseOrDeleteHistory,
+         COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 24) AS SuggestedEditsApplied,
+         MIN(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS FirstEditDate,
+         MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 12) AS LatestDeletionVoteDate
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+comment_counts AS (
+  SELECT c.PostId, COUNT(*) AS CommentCount, SUM(c.Score) AS CommentScoreSum
+  FROM Comments c
+  GROUP BY c.PostId
+),
+post_links_agg AS (
+  SELECT pl.RelatedPostId AS RelatedToId,
+         COUNT(*) FILTER (WHERE pl.LinkTypeId = 3) AS IncomingDuplicates,
+         COUNT(*) FILTER (WHERE pl.LinkTypeId = 1) AS IncomingLinks
+  FROM PostLinks pl
+  GROUP BY pl.RelatedPostId
+),
+tag_ranks AS (
+  SELECT t.Tag,
+         q.Id AS QuestionId,
+         q.Title,
+         q.Score,
+         ROW_NUMBER() OVER (PARTITION BY t.Tag ORDER BY q.Score DESC NULLS LAST, q.ViewCount DESC NULLS LAST) AS RankByTag
+  FROM tagged t
+  JOIN questions q ON q.Id = t.QuestionId
+),
+tag_top AS (
+  SELECT tr.Tag, tr.QuestionId, tr.Title, tr.RankByTag
+  FROM tag_ranks tr
+  WHERE tr.RankByTag <= 5
+),
+main_unranked AS (
+  SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    LEFT(regexp_replace(COALESCE(q.Body,''), '<[^>]+>', ' ', 'g'), 400) AS Snippet,
+    COALESCE(a.TotalAnswers,0) AS TotalAnswers,
+    COALESCE(a.AvgAnswerScore,0)::numeric(10,3) AS AvgAnswerScore,
+    COALESCE(vs.UpVotes,0) AS PostUpVotes,
+    COALESCE(vs.DownVotes,0) AS PostDownVotes,
+    u.DisplayName AS OwnerName,
+    u.Reputation AS OwnerReputation,
+    EXTRACT(EPOCH FROM (COALESCE(a.FirstAnswerDate, q.CreationDate) - q.CreationDate)) / 3600.0 AS HoursToFirstAnswer,
+    COALESCE(pl.IncomingDuplicates,0) AS NumDuplicatesPointingHere,
+    COALESCE(pc.CommentCount,0) AS CommentCount,
+    STRING_AGG(DISTINCT lower(trim(t.Tag)), ',') AS Tags,
+    hf.SuggestedEditsApplied,
+    hf.HasCloseOrDeleteHistory,
+    COALESCE(vs.DistinctUpvoters,0) AS DistinctUpvoters,
+    q.Score,
+    q.ViewCount,
+    COALESCE(hf.FirstEditDate, q.CreationDate) AS FirstEditDate,
+    COALESCE(hf.LatestDeletionVoteDate, NULL) AS LatestDeletionVoteDate
+  FROM questions q
+  LEFT JOIN answer_stats a ON a.QuestionId = q.Id
+  LEFT JOIN vote_summ vs ON vs.PostId = q.Id
+  LEFT JOIN Users u ON u.Id = q.OwnerUserId
+  LEFT JOIN PostHistory hf ON hf.PostId = q.Id
+  LEFT JOIN comment_counts pc ON pc.PostId = q.Id
+  LEFT JOIN post_links_agg pl ON pl.RelatedToId = q.Id
+  LEFT JOIN tagged t ON t.QuestionId = q.Id
+  GROUP BY q.Id, q.Title, q.Body, a.TotalAnswers, a.AvgAnswerScore, vs.UpVotes, vs.DownVotes, u.DisplayName, u.Reputation, a.FirstAnswerDate, q.CreationDate, pl.IncomingDuplicates, pc.CommentCount, hf.SuggestedEditsApplied, hf.HasCloseOrDeleteHistory, vs.DistinctUpvoters, q.Score, q.ViewCount, hf.FirstEditDate, hf.LatestDeletionVoteDate
+),
+main AS (
+  SELECT mu.*,
+         ROW_NUMBER() OVER (ORDER BY mu.Score DESC NULLS LAST, mu.ViewCount DESC NULLS LAST) AS GlobalRank,
+         PERCENT_RANK() OVER (ORDER BY mu.Score NULLS LAST) AS ScorePercentile
+  FROM main_unranked mu
+),
+tag_rows AS (
+  SELECT
+    'tag'::text AS source,
+    q.Id AS QuestionId,
+    q.Title,
+    LEFT(regexp_replace(COALESCE(q.Body,''), '<[^>]+>', ' ', 'g'), 400) AS Snippet,
+    COALESCE(a.TotalAnswers,0) AS TotalAnswers,
+    COALESCE(a.AvgAnswerScore,0)::numeric(10,3) AS AvgAnswerScore,
+    COALESCE(vs.UpVotes,0) AS PostUpVotes,
+    COALESCE(vs.DownVotes,0) AS PostDownVotes,
+    u.DisplayName AS OwnerName,
+    u.Reputation AS OwnerReputation,
+    EXTRACT(EPOCH FROM (COALESCE(a.FirstAnswerDate,q.CreationDate) - q.CreationDate)) / 3600.0 AS HoursToFirstAnswer,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = q.Id AND pl.LinkTypeId = 1) AS OutgoingLinks,
+    STRING_AGG(DISTINCT lower(trim(t.Tag)), ',') AS Tags,
+    NULL::numeric AS GlobalRank,
+    NULL::double precision AS ScorePercentile
+  FROM tag_top tt
+  JOIN questions q ON q.Id = tt.QuestionId
+  LEFT JOIN answer_stats a ON a.QuestionId = q.Id
+  LEFT JOIN vote_summ vs ON vs.PostId = q.Id
+  LEFT JOIN Users u ON u.Id = q.OwnerUserId
+  LEFT JOIN tagged t ON t.QuestionId = q.Id
+  GROUP BY tt.Tag, q.Id, q.Title, q.Body, a.TotalAnswers, a.AvgAnswerScore, vs.UpVotes, vs.DownVotes, u.DisplayName, u.Reputation, a.FirstAnswerDate, q.CreationDate
+),
+combined AS (
+  SELECT
+    'main'::text AS source,
+    m.QuestionId,
+    m.Title,
+    m.Snippet,
+    m.TotalAnswers,
+    m.AvgAnswerScore,
+    m.PostUpVotes,
+    m.PostDownVotes,
+    m.OwnerName,
+    m.OwnerReputation,
+    m.HoursToFirstAnswer,
+    m.NumDuplicatesPointingHere AS LinkCount,
+    m.Tags,
+    m.GlobalRank,
+    m.ScorePercentile
+  FROM main m
+
+  UNION ALL
+
+  SELECT
+    tr.source,
+    tr.QuestionId,
+    tr.Title,
+    tr.Snippet,
+    tr.TotalAnswers,
+    tr.AvgAnswerScore,
+    tr.PostUpVotes,
+    tr.PostDownVotes,
+    tr.OwnerName,
+    tr.OwnerReputation,
+    tr.HoursToFirstAnswer,
+    tr.OutgoingLinks AS LinkCount,
+    tr.Tags,
+    tr.GlobalRank,
+    tr.ScorePercentile
+  FROM tag_rows tr
+),
+-- final selection: high scoring mains plus tag top rows, but exclude any rows with very few answers via EXCEPT
+selected AS (
+  SELECT * FROM combined
+  WHERE (source = 'main' AND ScorePercentile > 0.90 AND TotalAnswers >= 2)
+     OR (source = 'tag')
+)
+SELECT *
+FROM (
+  SELECT * FROM selected
+  EXCEPT
+  SELECT * FROM combined WHERE TotalAnswers < 2
+) t
+ORDER BY ScorePercentile DESC NULLS LAST, GlobalRank NULLS LAST, LinkCount DESC NULLS LAST
+LIMIT 500;

@@ -1,0 +1,61 @@
+SELECT
+    um.Id,
+    um.DisplayName,
+    um.Reputation,
+    um.TotalPostScore,
+    um.PostCount,
+    te.Id        AS TagExpertId,
+    te.TagName,
+    te.TagScore,
+    ba.Id        AS BadgeAchievementId,
+    ba.GoldBadges,
+    ba.SilverBadges,
+    ba.BronzeBadges,
+    COALESCE(ep.EditCount, 0) AS EditCount,
+    (
+        SELECT COALESCE(MAX(v.CountBounty), 0)
+        FROM (
+            SELECT p.Id AS PostId
+            FROM Posts p
+            WHERE p.OwnerUserId = um.Id
+        ) p_owner
+        JOIN (
+            SELECT p2.Id
+            FROM Posts p2
+            WHERE p2.OwnerUserId = um.Id
+        ) p4 ON p_owner.PostId = p4.Id
+        JOIN (
+            SELECT VoteTargetId, COUNT(*) AS CountBounty
+            FROM Votes
+            WHERE VoteTypeId = 8
+            GROUP BY VoteTargetId
+        ) v ON v.VoteTargetId = p4.Id
+    ) AS MaxBountyOffered
+FROM UserMetrics um
+LEFT JOIN LATERAL (
+    SELECT Id, OwnerUserId, TagName, TagScore, TagRank
+    FROM TagExperts 
+    WHERE OwnerUserId = um.Id 
+      AND TagRank = 1
+    ORDER BY TagScore DESC
+    LIMIT 1
+) te ON TRUE
+LEFT JOIN LATERAL (
+    SELECT Id, UserId, GoldBadges, SilverBadges, BronzeBadges
+    FROM BadgeAchievements
+    WHERE UserId = um.Id
+    ORDER BY GoldBadges DESC, SilverBadges DESC, BronzeBadges DESC
+    LIMIT 1
+) ba ON TRUE
+LEFT JOIN LATERAL (
+    SELECT SUM(EditCount) AS EditCount
+    FROM EditPatterns
+    WHERE UserId = um.Id
+) ep ON TRUE
+WHERE um.PostCount > 10
+  AND (um.Location IS NULL OR um.Location NOT LIKE '%test%')
+ORDER BY 
+    um.Reputation DESC,
+    um.TotalPostScore DESC,
+    um.PostCount DESC
+LIMIT 100;

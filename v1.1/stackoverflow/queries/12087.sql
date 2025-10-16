@@ -1,0 +1,143 @@
+WITH PostStats AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        P.Title,
+        P.Tags,
+        COUNT(DISTINCT V.Id) AS TotalVotes,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT PH.Id) AS TotalEdits,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC) AS ScoreRank,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.ViewCount DESC) AS ViewRank
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    LEFT JOIN 
+        Votes V ON P.Id = V.PostId
+    LEFT JOIN 
+        Comments C ON P.Id = C.PostId
+    LEFT JOIN 
+        PostHistory PH ON P.Id = PH.PostId
+    WHERE 
+        P.PostTypeId IN (1, 2)
+        AND P.CreationDate >= (DATE '2024-10-01' - INTERVAL '1' YEAR)
+    GROUP BY 
+        P.Id, P.PostTypeId, P.CreationDate, P.Score, P.ViewCount, P.OwnerUserId, U.DisplayName, P.Title, P.Tags
+),
+UserBadges AS (
+    SELECT 
+        B.UserId,
+        COUNT(CASE WHEN B.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN B.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM 
+        Badges B
+    GROUP BY 
+        B.UserId
+),
+PostTags AS (
+    SELECT 
+        P.Id,
+        -- convert tag string like '<tag1><tag2>' into individual tags
+        TRIM(BOTH '<>' FROM UNNEST(string_to_array(P.Tags, '><'))) AS Tag
+    FROM 
+        Posts P
+),
+PostTagStats AS (
+    SELECT 
+        PT.Id,
+        COUNT(DISTINCT PT.Tag) AS UniqueTags,
+        STRING_AGG(DISTINCT T.TagName, ', ') AS TagList
+    FROM 
+        PostTags PT
+    LEFT JOIN 
+        Tags T ON PT.Tag = T.TagName
+    GROUP BY 
+        PT.Id
+),
+TopUsers AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        COUNT(DISTINCT P.Id) AS PostsCount,
+        SUM(COALESCE(P.Score,0)) AS TotalScore,
+        ROW_NUMBER() OVER (ORDER BY U.Reputation DESC) AS ReputationRank
+    FROM 
+        Users U
+    LEFT JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    WHERE 
+        U.CreationDate >= (DATE '2024-10-01' - INTERVAL '5' YEAR)
+    GROUP BY 
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate
+),
+UserActivity AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswersGiven,
+        COUNT(DISTINCT C.Id) AS CommentsMade,
+        COUNT(DISTINCT V.Id) AS VotesCast
+    FROM 
+        Users U
+    LEFT JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN 
+        Comments C ON U.Id = C.UserId
+    LEFT JOIN 
+        Votes V ON U.Id = V.UserId
+    WHERE 
+        U.CreationDate >= (DATE '2024-10-01' - INTERVAL '1' YEAR)
+    GROUP BY 
+        U.Id, U.DisplayName
+)
+SELECT 
+    PS.Id,
+    PS.PostTypeId,
+    PS.CreationDate,
+    PS.Score,
+    PS.ViewCount,
+    PS.OwnerUserId,
+    PS.OwnerDisplayName,
+    PS.Title,
+    PS.Tags,
+    PS.TotalVotes,
+    PS.TotalComments,
+    PS.TotalEdits,
+    PS.ScoreRank,
+    PS.ViewRank,
+    UB.GoldBadges,
+    UB.SilverBadges,
+    UB.BronzeBadges,
+    PTS.UniqueTags,
+    PTS.TagList,
+    TU.Reputation,
+    TU.ReputationRank,
+    UA.QuestionsAsked,
+    UA.AnswersGiven,
+    UA.CommentsMade,
+    UA.VotesCast
+FROM 
+    PostStats PS
+LEFT JOIN 
+    UserBadges UB ON PS.OwnerUserId = UB.UserId
+LEFT JOIN 
+    PostTagStats PTS ON PS.Id = PTS.Id
+LEFT JOIN 
+    TopUsers TU ON PS.OwnerUserId = TU.Id
+LEFT JOIN 
+    UserActivity UA ON PS.OwnerUserId = UA.Id
+WHERE 
+    PS.Score > 100 OR PS.ViewCount > 10000
+ORDER BY 
+    PS.Score DESC, PS.ViewCount DESC
+LIMIT 100;

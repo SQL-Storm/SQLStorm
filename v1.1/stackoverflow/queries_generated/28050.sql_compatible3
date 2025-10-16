@@ -1,0 +1,101 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.Reputation, u.CreationDate
+), PostActivity AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+        (SELECT SUM(v.BountyAmount) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 8) AS TotalBounty,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS UserPostRank,
+        CASE 
+            WHEN EXISTS (SELECT 1 FROM PostHistory ph 
+                         WHERE ph.PostId = p.Id 
+                         AND ph.PostHistoryTypeId = 10 
+                         AND CAST(ph.Comment AS INTEGER) IN (101, 102)) 
+            THEN 1 ELSE 0 
+        END AS WasClosed,
+        array_length(string_to_array(substring(p.Tags FROM 2 FOR (length(p.Tags)-2)), '><'), 1) AS TagCount,
+        substring(p.Tags FROM 2 FOR (length(p.Tags)-2)) AS TagsInner
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+)
+SELECT 
+    u.UserId,
+    u.Reputation,
+    u.BadgeCount,
+    u.QuestionCount,
+    u.AnswerCount,
+    pa.PostId,
+    pa.Title,
+    pa.Score,
+    pa.CommentCount,
+    pa.TotalBounty,
+    pa.WasClosed,
+    pa.TagCount,
+    (SELECT STRING_AGG(t.TagName, ', ') 
+     FROM Tags t 
+     WHERE CAST(t.Id AS TEXT) = ANY(string_to_array(pa.TagsInner, '><'))) AS TagNames,
+    (SELECT COUNT(*) 
+     FROM Votes v 
+     WHERE v.PostId = pa.PostId 
+     AND v.VoteTypeId = 2 
+     AND v.CreationDate BETWEEN pa.CreationDate AND pa.CreationDate + INTERVAL '30 days') AS FirstMonthUpvotes,
+    COALESCE(ph.CloseReasons, '[]') AS CloseReasons,
+    ROUND(pa.Score * 1.0 / NULLIF(u.Reputation, 0), 4) AS ScoreReputationRatio,
+    u.ReputationRank,
+    pa.UserPostRank,
+    pa.CreationDate
+FROM UserStats u
+INNER JOIN PostActivity pa ON u.UserId = pa.OwnerUserId
+LEFT JOIN LATERAL (
+    SELECT JSON_AGG(crt.Name) AS CloseReasons
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INTEGER)
+    WHERE ph.PostId = pa.PostId
+    AND ph.PostHistoryTypeId = 10
+) ph ON true
+WHERE u.Reputation > 10000
+AND pa.Score > 50
+AND pa.WasClosed = 0
+AND pa.TagCount BETWEEN 3 AND 5
+AND (u.BadgeCount > (SELECT AVG(us.BadgeCount) FROM UserStats us) OR pa.TotalBounty > 100)
+GROUP BY
+    u.UserId,
+    u.Reputation,
+    u.BadgeCount,
+    u.QuestionCount,
+    u.AnswerCount,
+    pa.PostId,
+    pa.Title,
+    pa.Score,
+    pa.CommentCount,
+    pa.TotalBounty,
+    pa.WasClosed,
+    pa.TagCount,
+    pa.TagsInner,
+    pa.CreationDate,
+    ph.CloseReasons,
+    u.ReputationRank,
+    pa.UserPostRank,
+    pa.OwnerUserId
+ORDER BY 
+    u.ReputationRank,
+    pa.UserPostRank,
+    ScoreReputationRatio DESC
+LIMIT 100;

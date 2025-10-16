@@ -1,0 +1,69 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS Rank
+    FROM 
+        Posts p
+    WHERE 
+        p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '1' YEAR)
+        AND p.Score > 0
+),
+UserReputation AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        COALESCE(SUM(v.BountyAmount), 0) AS TotalBounty
+    FROM 
+        Users u
+    LEFT JOIN 
+        Votes v ON u.Id = v.UserId
+    GROUP BY 
+        u.Id, u.Reputation
+),
+ClosedPosts AS (
+    SELECT 
+        ph.PostId,
+        MIN(ph.CreationDate) AS FirstClosedDate
+    FROM 
+        PostHistory ph
+    WHERE 
+        ph.PostHistoryTypeId = 10
+    GROUP BY 
+        ph.PostId
+)
+SELECT 
+    up.Id AS UserId,
+    up.DisplayName,
+    up.Reputation,
+    COALESCE(rp.Title, 'No Posts') AS BestPostTitle,
+    COALESCE(CAST(rp.CreationDate AS VARCHAR), 'N/A') AS BestPostDate,
+    COALESCE(rp.Score, 0) AS BestPostScore,
+    COALESCE(CAST(cp.FirstClosedDate AS VARCHAR), 'Not Closed') AS FirstClosedDate
+FROM 
+    Users up
+LEFT JOIN 
+    RankedPosts rp ON up.Id = rp.OwnerUserId AND rp.Rank = 1
+LEFT JOIN 
+    UserReputation ur ON up.Id = ur.UserId
+LEFT JOIN 
+    ClosedPosts cp ON cp.PostId = (
+        SELECT p.Id FROM Posts p WHERE p.OwnerUserId = up.Id ORDER BY p.Id LIMIT 1
+    )
+WHERE 
+    (ur.TotalBounty > 0 OR ur.Reputation > 1000)
+GROUP BY
+    up.Id,
+    up.DisplayName,
+    up.Reputation,
+    rp.Title,
+    rp.CreationDate,
+    rp.Score,
+    cp.FirstClosedDate
+ORDER BY 
+    up.Reputation DESC,
+    rp.Score DESC
+LIMIT 50;

@@ -1,0 +1,120 @@
+WITH
+RecentQuestions AS (
+  SELECT p.Id            AS QuestionId,
+         p.Title,
+         p.Tags,
+         p.OwnerUserId,
+         p.CreationDate,
+         p.AnswerCount,
+         p.Score,
+         p.ViewCount,
+         p.LastActivityDate
+  FROM   Posts p
+  WHERE  p.PostTypeId = 1
+    AND  p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY
+),
+OldQuestions AS (
+  SELECT p.Id            AS QuestionId,
+         p.Title,
+         p.Tags,
+         p.OwnerUserId,
+         p.CreationDate,
+         p.AnswerCount,
+         p.Score,
+         p.ViewCount,
+         p.LastActivityDate
+  FROM   Posts p
+  WHERE  p.PostTypeId = 1
+    AND  p.CreationDate BETWEEN CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90' DAY
+                           AND CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY
+  LIMIT  20
+),
+CombinedQuestions AS (
+  SELECT * FROM RecentQuestions
+  UNION ALL
+  SELECT * FROM OldQuestions
+),
+TagSplit AS (
+  SELECT q.QuestionId,
+         UNNEST(
+           string_to_array(
+             substring(q.Tags FROM 2 FOR (length(q.Tags) - 2)),
+             '><'
+           )
+         ) AS Tag
+  FROM   CombinedQuestions q
+),
+TagStats AS (
+  SELECT Tag,
+         COUNT(*) AS QuestionCount
+  FROM   TagSplit
+  GROUP  BY Tag
+),
+UserBadges AS (
+  SELECT u.Id AS UserId,
+         COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldCount,
+         COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverCount,
+         COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeCount
+  FROM   Users u
+  LEFT   JOIN Badges b ON b.UserId = u.Id
+  GROUP  BY u.Id
+),
+DuplicateLinks AS (
+  SELECT pl.PostId,
+         COUNT(*) AS DuplicateCount
+  FROM   PostLinks pl
+  WHERE  pl.LinkTypeId = 3
+  GROUP  BY pl.PostId
+)
+SELECT
+  qc.QuestionId,
+  qc.Title,
+  qc.Tags,
+  u.DisplayName,
+  COALESCE(u.Reputation, 0) AS Reputation,
+  COALESCE(ub.GoldCount, 0) + COALESCE(ub.SilverCount, 0) + COALESCE(ub.BronzeCount, 0) AS TotalBadgePoints,
+  qc.AnswerCount,
+  qc.Score,
+  qc.ViewCount,
+  qc.LastActivityDate,
+  (SELECT COUNT(*) FROM Comments c WHERE c.PostId = qc.QuestionId) AS CommentCount,
+  COALESCE(dl.DuplicateCount, 0) AS DuplicateLinks,
+  ROW_NUMBER() OVER (ORDER BY qc.AnswerCount DESC, qc.Score DESC) AS RankByAnswers,
+  -- construct tag array without NULLs in standard SQL: aggregate distinct tags and filter nulls
+  (SELECT array_agg(t) FROM (
+     SELECT DISTINCT ts2.Tag AS t
+     FROM TagSplit ts2
+     WHERE ts2.QuestionId = qc.QuestionId AND ts2.Tag IS NOT NULL
+   ) sub) AS TagArray,
+  CASE 
+    WHEN qc.LastActivityDate < qc.CreationDate + INTERVAL '7' DAY THEN 'New'
+    WHEN qc.AnswerCount > 5 AND qc.Score > 10 THEN 'Popular'
+    ELSE 'Stable'
+  END AS ActivityStage
+FROM   CombinedQuestions qc
+LEFT   JOIN Users u          ON u.Id = qc.OwnerUserId
+LEFT   JOIN UserBadges ub     ON ub.UserId = qc.OwnerUserId
+LEFT   JOIN DuplicateLinks dl ON dl.PostId = qc.QuestionId
+LEFT   JOIN TagSplit ts       ON ts.QuestionId = qc.QuestionId
+GROUP  BY
+  qc.QuestionId,
+  qc.Title,
+  qc.Tags,
+  u.DisplayName,
+  u.Reputation,
+  ub.GoldCount,
+  ub.SilverCount,
+  ub.BronzeCount,
+  qc.AnswerCount,
+  qc.Score,
+  qc.ViewCount,
+  qc.LastActivityDate,
+  dl.DuplicateCount,
+  qc.CreationDate,
+  qc.OwnerUserId,
+  qc.LastActivityDate,
+  qc.Score,
+  qc.AnswerCount,
+  u.DisplayName
+ORDER BY RankByAnswers, qc.Score DESC
+LIMIT 100;

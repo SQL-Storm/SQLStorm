@@ -1,0 +1,152 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        0 AS Level,
+        CAST(t.TagName AS VARCHAR(1000)) AS TagPath
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        r.Level + 1,
+        r.TagPath || ' > ' || t.TagName
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.IsModeratorOnly = FALSE AND t.Count < r.Count
+    WHERE r.Level < 3
+),
+TopQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        u.DisplayName AS OwnerName,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY DATE_TRUNC('month', p.CreationDate) ORDER BY p.Score DESC) AS rn,
+        p.OwnerUserId
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+      AND p.Score > 5
+      AND p.ClosedDate IS NULL
+),
+AnswerStats AS (
+    SELECT
+        p.ParentId AS QuestionId,
+        COUNT(*) AS AnswersTotal,
+        AVG(p.Score) AS AvgAnswerScore,
+        MAX(p.Score) AS MaxAnswerScore,
+        SUM(CASE WHEN p.CreationDate < q.CreationDate + INTERVAL '7 day' THEN 1 ELSE 0 END) AS AnswersWithinWeek
+    FROM Posts p
+    JOIN Posts q ON p.ParentId = q.Id
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+CommentedQuestions AS (
+    SELECT DISTINCT
+        c.PostId AS QuestionId
+    FROM Comments c
+    JOIN Posts p ON c.PostId = p.Id AND p.PostTypeId = 1
+    WHERE c.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '30 day'
+),
+QuestionLinkSummary AS (
+    SELECT
+        pl.PostId AS QuestionId,
+        COUNT(DISTINCT CASE WHEN lt.Name = 'Duplicate' THEN pl.RelatedPostId END) AS DuplicateLinks,
+        COUNT(DISTINCT CASE WHEN lt.Name = 'Linked' THEN pl.RelatedPostId END) AS LinkedPosts,
+        COUNT(DISTINCT pl.RelatedPostId) AS TotalLinks
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    GROUP BY pl.PostId
+),
+CloseReasonCount AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReason,
+        COUNT(*) AS CloseCount
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON CAST(ph.Comment AS INTEGER) = crt.Id AND ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId, crt.Name
+),
+FirstAnswerPerQuestion AS (
+    SELECT
+        p.ParentId AS QuestionId,
+        p.Id AS FirstAnswerId,
+        p.CreationDate AS FirstAnswerDate,
+        p.OwnerUserId AS AnswerOwnerId,
+        p.Score AS FirstAnswerScore
+    FROM (
+        SELECT
+            *,
+            ROW_NUMBER() OVER (PARTITION BY ParentId ORDER BY CreationDate ASC, Id ASC) AS rn
+        FROM Posts
+        WHERE PostTypeId = 2
+    ) p
+    WHERE p.rn = 1
+)
+SELECT
+    tq.Id AS QuestionId,
+    tq.Title,
+    tq.CreationDate,
+    tq.Score AS QuestionScore,
+    tq.AnswerCount,
+    COALESCE(asr.AnswersTotal, 0) AS TotalAnswers,
+    COALESCE(asr.AvgAnswerScore, 0) AS AvgAnswerScore,
+    COALESCE(asr.MaxAnswerScore, 0) AS MaxAnswerScore,
+    COALESCE(asr.AnswersWithinWeek, 0) AS AnswersWithinWeek,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    COALESCE(ubs.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ubs.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ubs.BronzeBadges, 0) AS BronzeBadges,
+    cs.DuplicateLinks,
+    cs.LinkedPosts,
+    cs.TotalLinks,
+    crc.CloseReason,
+    crc.CloseCount,
+    fa.FirstAnswerDate,
+    fa.FirstAnswerScore,
+    u2.DisplayName AS FirstAnswerOwner,
+    CASE WHEN tq.Tags IS NULL THEN ARRAY[]::TEXT[] ELSE string_to_array(substring(tq.Tags, 2, char_length(tq.Tags) - 2), '><') END AS TagArray,
+    rth.Level AS SampleTagLevel,
+    rth.TagPath AS SampleTagPath,
+    tq.rn
+FROM TopQuestions tq
+LEFT JOIN AnswerStats asr ON asr.QuestionId = tq.Id
+LEFT JOIN Users u ON u.Id = tq.OwnerUserId
+LEFT JOIN UserBadgeSummary ubs ON ubs.UserId = u.Id
+LEFT JOIN QuestionLinkSummary cs ON cs.QuestionId = tq.Id
+LEFT JOIN FirstAnswerPerQuestion fa ON fa.QuestionId = tq.Id
+LEFT JOIN Users u2 ON u2.Id = fa.AnswerOwnerId
+LEFT JOIN RecursiveTagHierarchy rth ON rth.TagName = (
+    CASE
+        WHEN tq.Tags IS NULL THEN NULL
+        ELSE (string_to_array(substring(tq.Tags, 2, char_length(tq.Tags) - 2), '><'))[1]
+    END
+)
+LEFT JOIN CloseReasonCount crc ON crc.PostId = tq.Id AND crc.CloseCount = (
+    SELECT MAX(CloseCount) FROM CloseReasonCount crc2 WHERE crc2.PostId = tq.Id
+)
+WHERE tq.rn <= 5
+ORDER BY tq.CreationDate DESC, tq.Score DESC;

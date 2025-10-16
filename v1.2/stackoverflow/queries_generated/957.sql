@@ -1,0 +1,147 @@
+-- {"query": "957.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1411} 
+with RecursiveUserPosts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        case 
+            when p.PostTypeId = 1 then p.AnswerCount 
+            else 0 
+        end as AnswerCount,
+        row_number() over (partition by u.Id order by p.CreationDate desc) as rn
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where u.Reputation > 1000
+),
+RecentPosts as (
+    select * from RecursiveUserPosts where rn <= 5
+),
+PostVotesAgg as (
+    select 
+        p.Id as PostId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+        count(v.Id) as TotalVotes
+    from Posts p 
+    left join Votes v on v.PostId = p.Id
+    group by p.Id
+),
+UserBadgeSummary as (
+    select 
+        b.UserId,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        bool_or(b.TagBased = 1) as HasTagBasedBadge
+    from Badges b
+    group by b.UserId
+),
+QuestionCloseStats as (
+    select 
+        p.Id as QuestionId,
+        count(ph.Id) filter (where ph.PostHistoryTypeId = 10) as CloseVotes,
+        count(ph.Id) filter (where ph.PostHistoryTypeId = 11) as ReopenVotes,
+        max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as LastCloseDate,
+        max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 11) as LastReopenDate,
+        cr.Name as CloseReason
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId in (10,11)
+    left join CloseReasonTypes cr on cr.Id = cast(ph.Comment as int) and ph.PostHistoryTypeId = 10
+    where p.PostTypeId = 1
+    group by p.Id, cr.Name
+),
+TagAggregates as (
+    select 
+        t.TagName,
+        count(distinct p.Id) as PostsCount,
+        max(p.Score) as MaxScore,
+        avg(p.Score) as AvgScore,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) as QuestionsCount,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) as AnswersCount
+    from Tags t
+    left join Posts p on p.Tags like '%' || '<' || t.TagName || '>' || '%'
+    group by t.TagName
+),
+UserActivityRanked as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) as TotalPosts,
+        count(distinct c.Id) as TotalComments,
+        rank() over (order by count(distinct p.Id) desc) as PostRank,
+        rank() over (order by count(distinct c.Id) desc) as CommentRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+DuplicateLinkedPosts as (
+    select distinct
+        p.Id as OriginalPostId,
+        pl.RelatedPostId as DuplicatePostId,
+        pl.CreationDate as LinkCreationDate,
+        u.DisplayName as OriginalOwner,
+        u2.DisplayName as DuplicateOwner
+    from Posts p
+    join PostLinks pl on pl.PostId = p.Id and pl.LinkTypeId = 3 -- Duplicate
+    left join Users u on u.Id = p.OwnerUserId
+    left join Posts p2 on p2.Id = pl.RelatedPostId
+    left join Users u2 on u2.Id = p2.OwnerUserId
+    where p.PostTypeId = 1
+)
+select 
+    rup.UserId,
+    rup.DisplayName,
+    rup.PostId,
+    rup.PostTypeId,
+    coalesce(rup.Title, '(no title)') as Title,
+    rup.CreationDate,
+    rup.Score,
+    rup.ViewCount,
+    rup.AnswerCount,
+    pva.UpVotes,
+    pva.DownVotes,
+    pva.Favorites,
+    pva.TotalVotes,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.HasTagBasedBadge,
+    qcs.CloseVotes,
+    qcs.ReopenVotes,
+    qcs.CloseReason,
+    ta.PostsCount as TagTotalPosts,
+    ta.MaxScore as TagMaxScore,
+    ta.AvgScore as TagAvgScore,
+    ta.QuestionsCount as TagQuestions,
+    ta.AnswersCount as TagAnswers,
+    uar.TotalPosts,
+    uar.TotalComments,
+    uar.PostRank,
+    uar.CommentRank,
+    dp.DuplicatePostId,
+    dp.LinkCreationDate,
+    dp.DuplicateOwner,
+    case 
+        when rup.Tags is null then '[]'
+        else string_agg(distinct regexp_split_to_table(substring(rup.Tags from 2 for char_length(rup.Tags) - 2), '><'), ',' order by 1)
+    end as ParsedTags
+from RecentPosts rup
+left join PostVotesAgg pva on pva.PostId = rup.PostId
+left join UserBadgeSummary ubs on ubs.UserId = rup.UserId
+left join QuestionCloseStats qcs on qcs.QuestionId = rup.PostId
+left join TagAggregates ta on ta.TagName = (
+    select unnest(regexp_split_to_array(substring(rup.Tags from 2 for char_length(rup.Tags) - 2), '><')) limit 1
+) -- Pick the first tag if any
+left join UserActivityRanked uar on uar.UserId = rup.UserId
+left join DuplicateLinkedPosts dp on dp.OriginalPostId = rup.PostId
+where rup.PostId is not null
+order by rup.UserId, rup.CreationDate desc
+limit 100;

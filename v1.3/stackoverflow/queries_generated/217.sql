@@ -1,0 +1,214 @@
+-- {"query": "217.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 3671} 
+WITH
+recent_questions AS (
+  SELECT *
+  FROM Posts
+  WHERE PostTypeId = 1
+    AND CreationDate >= now() - interval '2 years'
+),
+answer_ranks AS (
+  SELECT a.*,
+         rank() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC NULLS LAST, a.CreationDate ASC) AS ans_rank
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+),
+top_answers AS (
+  SELECT * FROM answer_ranks WHERE ans_rank = 1
+),
+votes_summary AS (
+  SELECT
+    PostId,
+    SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+    SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+    SUM(CASE WHEN VoteTypeId = 1 THEN 1 ELSE 0 END) AS accepted_votes,
+    SUM(CASE WHEN VoteTypeId IN (4,12) THEN 1 ELSE 0 END) AS offensive_spam_flags
+  FROM Votes
+  GROUP BY PostId
+),
+comments_summary AS (
+  SELECT PostId, COUNT(*) AS comments
+  FROM Comments
+  GROUP BY PostId
+),
+user_badge_counts AS (
+  SELECT
+    UserId,
+    COUNT(*) AS total_badges,
+    SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS gold,
+    SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS silver,
+    SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS bronze
+  FROM Badges
+  GROUP BY UserId
+),
+tag_exploded AS (
+  SELECT
+    q.Id AS QuestionId,
+    lower(trim(both '<>' FROM u.tag)) AS tag
+  FROM recent_questions q
+  CROSS JOIN LATERAL
+    unnest(string_to_array(substring(coalesce(q.Tags,'') from 2 for (char_length(coalesce(q.Tags,''))-2)),'><')) AS u(tag)
+  WHERE q.Tags IS NOT NULL AND q.Tags <> ''
+),
+tag_stats AS (
+  SELECT
+    tag,
+    COUNT(*) AS questions_count,
+    AVG(q.ViewCount) AS avg_views,
+    AVG(q.Score) AS avg_score,
+    MAX(q.CreationDate) FILTER (WHERE q.ViewCount IS NOT NULL) AS latest_question_date
+  FROM tag_exploded te
+  JOIN recent_questions q ON q.Id = te.QuestionId
+  GROUP BY tag
+),
+posthistory_counts AS (
+  SELECT
+    PostId,
+    COUNT(*) AS total_history,
+    SUM(CASE WHEN PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS closed_votes_history,
+    SUM(CASE WHEN PostHistoryTypeId IN (12,16) THEN 1 ELSE 0 END) AS deletions_or_community
+  FROM PostHistory
+  GROUP BY PostId
+),
+question_enriched AS (
+  SELECT
+    q.Id AS question_id,
+    q.Title,
+    q.CreationDate,
+    q.LastActivityDate,
+    q.Score AS q_score,
+    q.ViewCount AS q_views,
+    q.AnswerCount,
+    q.FavoriteCount,
+    COALESCE(u.DisplayName, q.OwnerDisplayName, 'anonymous') AS owner_name,
+    u.Id AS owner_id,
+    u.Reputation AS owner_reputation,
+    ubc.total_badges,
+    COALESCE(vs_up.upvotes,0) AS q_upvotes,
+    COALESCE(vs_up.downvotes,0) AS q_downvotes,
+    COALESCE(cs.comments,0) AS q_comments,
+    COALESCE(ph.total_history,0) AS history_events,
+    COALESCE(ph.closed_votes_history,0) AS history_close_votes,
+    (CASE WHEN q.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS is_closed,
+    (SELECT COUNT(DISTINCT p.OwnerUserId)
+     FROM Posts p
+     WHERE p.ParentId = q.Id AND p.OwnerUserId IS NOT NULL) AS distinct_answerers,
+    (SELECT MAX(p.Score) FROM Posts p WHERE p.ParentId = q.Id) AS max_answer_score,
+    (SELECT MIN(p.CreationDate) FROM Posts p WHERE p.ParentId = q.Id) AS first_answer_date,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = q.Id AND pl.LinkTypeId = 3) AS duplicate_links_count,
+    (SELECT tag FROM tag_exploded te WHERE te.QuestionId = q.Id ORDER BY tag LIMIT 1) AS sample_tag,
+    COALESCE(tq.tag_count,0) AS tags_on_question,
+    COALESCE(tstat.questions_count,0) AS sample_tag_questions,
+    COALESCE(tstat.avg_views,0) AS sample_tag_avg_views,
+    COALESCE(ta.Id,0) AS top_answer_id,
+    ta.Score AS top_answer_score,
+    ta.CreationDate AS top_answer_date,
+    COALESCE(vs_top.upvotes,0) AS top_answer_upvotes,
+    COALESCE(vs_top.downvotes,0) AS top_answer_downvotes,
+    -- complex computed metrics
+    (CASE
+       WHEN q.ViewCount IS NULL OR q.ViewCount = 0 THEN NULL
+       ELSE (q.Score::numeric / NULLIF(q.ViewCount,0)) * COALESCE(ln(NULLIF(q.AnswerCount,0)+1), 1)
+     END) AS score_density,
+    (COALESCE(q.Score,0) + COALESCE(ta.Score,0) * 0.5 + COALESCE(vs_up.upvotes,0) * 0.2 - COALESCE(vs_up.downvotes,0) * 0.5
+     + GREATEST(COALESCE(ubc.gold,0)*3,0) - COALESCE(ph.closed_votes_history,0)) AS heuristic_activity,
+    rank() OVER (ORDER BY q.ViewCount DESC NULLS LAST, q.Score DESC NULLS LAST) AS global_pop_rank
+  FROM recent_questions q
+  LEFT JOIN Users u ON u.Id = q.OwnerUserId
+  LEFT JOIN user_badge_counts ubc ON ubc.UserId = u.Id
+  LEFT JOIN votes_summary vs_up ON vs_up.PostId = q.Id
+  LEFT JOIN comments_summary cs ON cs.PostId = q.Id
+  LEFT JOIN posthistory_counts ph ON ph.PostId = q.Id
+  LEFT JOIN LATERAL (
+    SELECT COUNT(*) AS tag_count
+    FROM tag_exploded te2 WHERE te2.QuestionId = q.Id
+  ) tq ON TRUE
+  LEFT JOIN LATERAL (
+    SELECT tstat.tag, tstat.questions_count, tstat.avg_views
+    FROM tag_exploded te3
+    JOIN tag_stats tstat ON tstat.tag = te3.tag
+    WHERE te3.QuestionId = q.Id
+    ORDER BY tstat.questions_count DESC NULLS LAST, tstat.avg_views DESC NULLS LAST
+    LIMIT 1
+  ) tstat ON TRUE
+  LEFT JOIN top_answers ta ON ta.ParentId = q.Id
+  LEFT JOIN votes_summary vs_top ON vs_top.PostId = ta.Id
+),
+-- Prepare a view of "question rows" for union
+question_rows AS (
+  SELECT
+    'question' AS row_type,
+    question_id AS obj_id,
+    Title AS label,
+    owner_name,
+    owner_id,
+    owner_reputation,
+    total_badges,
+    q_score,
+    q_views,
+    AnswerCount,
+    COALESCE(top_answer_score,0) AS top_answer_score,
+    COALESCE(q_upvotes,0) AS upvotes,
+    COALESCE(q_downvotes,0) AS downvotes,
+    COALESCE(q_comments,0) AS comments,
+    COALESCE(history_events,0) AS history_events,
+    is_closed,
+    distinct_answerers,
+    max_answer_score,
+    sample_tag,
+    sample_tag_questions,
+    sample_tag_avg_views,
+    score_density,
+    heuristic_activity,
+    global_pop_rank,
+    duplicate_links_count,
+    top_answer_date
+  FROM question_enriched
+),
+-- Prepare a view of "tag rows" for union
+tag_rows AS (
+  SELECT
+    'tag' AS row_type,
+    hashtext(tag)::bigint AS obj_id, -- convert tag name to id-like numeric for uniform schema
+    tag AS label,
+    NULL::varchar AS owner_name,
+    NULL::int AS owner_id,
+    NULL::int AS owner_reputation,
+    NULL::int AS total_badges,
+    NULL::int AS q_score,
+    CAST(avg_views AS int) AS q_views,
+    questions_count AS AnswerCount,
+    NULL::int AS top_answer_score,
+    NULL::int AS upvotes,
+    NULL::int AS downvotes,
+    NULL::int AS comments,
+    NULL::int AS history_events,
+    0 AS is_closed,
+    NULL::int AS distinct_answerers,
+    NULL::int AS max_answer_score,
+    NULL::varchar AS sample_tag,
+    questions_count AS sample_tag_questions,
+    avg_views AS sample_tag_avg_views,
+    NULL::numeric AS score_density,
+    (questions_count * avg_views) AS heuristic_activity,
+    ROW_NUMBER() OVER (ORDER BY questions_count DESC, avg_views DESC) AS global_pop_rank,
+    0 AS duplicate_links_count,
+    latest_question_date AS top_answer_date
+  FROM tag_stats
+)
+-- Final union, exclude low-interest rows via EXCEPT, and order
+SELECT *
+FROM (
+  SELECT * FROM question_rows
+  UNION ALL
+  SELECT * FROM tag_rows
+) all_rows
+EXCEPT
+-- exclude rows with extremely low heuristic_activity and low views (demonstrating EXCEPT)
+SELECT *
+FROM (
+  SELECT * FROM question_rows WHERE COALESCE(heuristic_activity,0) < 1 AND COALESCE(q_views,0) < 10
+  UNION ALL
+  SELECT * FROM tag_rows WHERE COALESCE(heuristic_activity,0) < 10
+) low_interest
+ORDER BY row_type DESC, heuristic_activity DESC NULLS LAST, global_pop_rank ASC
+LIMIT 500;

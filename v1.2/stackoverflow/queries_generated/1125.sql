@@ -1,0 +1,148 @@
+-- {"query": "1125.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.1, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1273} 
+with recursive TagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        array[t.TagName] as AncestorPath,
+        1 as Depth
+    from Tags t
+    where t.IsModeratorOnly = 0
+
+    union all
+
+    select
+        t2.Id,
+        t2.TagName,
+        th.AncestorPath || t2.TagName,
+        th.Depth + 1
+    from Tags t2
+    join TagHierarchy th on t2.WikiPostId = (
+        select p.Id from Posts p where p.Tags like '%' || th.TagName || '%'
+        limit 1
+    )
+    where t2.IsModeratorOnly = 0 and not t2.TagName = any(th.AncestorPath)
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(distinct b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(distinct b.Id) filter (where b.Class = 3) as BronzeBadges,
+        bool_or(b.TagBased) as HasTagBasedBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostRanks as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.CreationDate,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as UserPostRank,
+        dense_rank() over (partition by p.OwnerUserId order by p.PostTypeId desc, p.Score desc) as UserPostTypeScoreRank
+    from Posts p
+    where p.PostTypeId in (1,2)
+),
+AnswerStats as (
+    select
+        p.ParentId as QuestionId,
+        count(*) filter (where p.Score >= 0) as PositiveScoreAnswers,
+        count(*) filter (where p.Score < 0) as NegativeScoreAnswers,
+        avg(p.Score) as AvgAnswerScore,
+        max(p.Score) as MaxAnswerScore,
+        min(p.Score) as MinAnswerScore
+    from Posts p
+    where p.PostTypeId = 2
+    group by p.ParentId
+),
+QuestionCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+),
+UserParticipation as (
+    select
+        u.Id as UserId,
+        coalesce(v.UpModCount,0) as UpvotesCast,
+        coalesce(v.DownModCount,0) as DownvotesCast,
+        coalesce(c.CommentCount,0) as CommentsMade,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct p2.Id) filter (where p2.PostTypeId = 2) as AnswersGiven
+    from Users u
+    left join (
+        select
+            UserId,
+            count(*) filter (where VoteTypeId = 2) as UpModCount,
+            count(*) filter (where VoteTypeId = 3) as DownModCount
+        from Votes
+        where UserId is not null
+        group by UserId
+    ) v on v.UserId = u.Id
+    left join (
+        select UserId, count(*) as CommentCount from Comments where UserId is not null group by UserId
+    ) c on c.UserId = u.Id
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Posts p2 on p2.OwnerUserId = u.Id
+    group by u.Id, v.UpModCount, v.DownModCount, c.CommentCount
+)
+select
+    u.Id as UserID,
+    u.DisplayName,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.HasTagBasedBadges,
+    ub.LastBadgeDate,
+    up.QuestionsAsked,
+    up.AnswersGiven,
+    up.UpvotesCast,
+    up.DownvotesCast,
+    up.CommentsMade,
+    p.Id as PostID,
+    p.PostTypeId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate as PostCreated,
+    qcr.CloseReason,
+    qcr.CloseDate,
+    ans.PositiveScoreAnswers,
+    ans.NegativeScoreAnswers,
+    ans.AvgAnswerScore,
+    ans.MaxAnswerScore,
+    ans.MinAnswerScore,
+    th.Depth as TagHierarchyDepth,
+    array_to_string(th.AncestorPath, ' > ') as TagAncestryPath
+from Users u
+left join UserBadgeStats ub on ub.UserId = u.Id
+left join UserParticipation up on up.UserId = u.Id
+left join PostRanks p on p.OwnerUserId = u.Id and p.UserPostRank = 1
+left join QuestionCloseReasons qcr on qcr.PostId = p.Id
+left join AnswerStats ans on ans.QuestionId = p.Id
+left join lateral (
+    select th.*
+    from TagHierarchy th
+    join Posts pt on pt.Tags like '%' || th.TagName || '%'
+    where pt.Id = p.Id
+    order by th.Depth desc nulls last
+    limit 1
+) th on true
+where u.Reputation > 5000
+  and (p.Score > 10 or p.ViewCount > 1000)
+  and (
+    (qcr.CloseReason is null)
+    or (qcr.CloseDate > p.CreationDate + interval '30 days')
+  )
+order by u.Reputation desc, p.Score desc
+limit 100;

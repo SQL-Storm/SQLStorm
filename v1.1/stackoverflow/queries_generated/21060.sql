@@ -1,0 +1,208 @@
+-- {"query": "21060.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2168, "output_tokens": 2037} 
+
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score) AS AvgScore,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId 
+        AND p.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+        AND p.DeletionDate IS NULL
+    WHERE u.Reputation > 100 
+        AND u.LastAccessDate >= CURRENT_DATE - INTERVAL '30 days'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT p.Id) >= 5
+),
+HighActivityPosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community'
+            ELSE 'Active'
+        END AS PostStatus,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+        NTILE(4) OVER (ORDER BY p.ViewCount DESC) AS ViewQuartile
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+        AND p.CreationDate >= CURRENT_DATE - INTERVAL '6 months'
+        AND (p.Score >= 0 OR p.PostTypeId = 1)
+),
+UserPostStats AS (
+    SELECT 
+        au.Id,
+        au.DisplayName,
+        au.PostCount,
+        hap.Title,
+        hap.Score,
+        hap.ViewCount,
+        hap.PostStatus,
+        hap.ViewQuartile,
+        CONCAT(
+            COALESCE(au.DisplayName, 'Anonymous'),
+            ' - ',
+            EXTRACT(YEAR FROM hap.CreationDate)::varchar,
+            CASE 
+                WHEN hap.ClosedDate IS NOT NULL THEN ' (Closed)'
+                WHEN LENGTH(COALESCE(hap.Title, '')) > 50 THEN 
+                    SUBSTRING(hap.Title FROM 1 FOR 47) || '...'
+                ELSE COALESCE(hap.Title, 'No Title')
+            END
+        ) AS FormattedPostInfo,
+        ROW_NUMBER() OVER (
+            PARTITION BY au.Id 
+            ORDER BY hap.ViewCount DESC NULLS LAST, hap.Score DESC
+        ) AS PostRank,
+        -- Complex string manipulation for tags (assuming tags format)
+        CASE 
+            WHEN hap.PostTypeId = 1 AND LENGTH(hap.Tags) > 0 THEN
+                SUBSTRING(hap.Tags FROM 2 FOR POSITION('>' IN hap.Tags || '>') - 2)
+            ELSE 'No Tags'
+        END AS FirstTag
+    FROM ActiveUsers au
+    LEFT JOIN HighActivityPosts hap ON au.Id = hap.OwnerUserId
+    WHERE hap.ViewCount > (
+        SELECT PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY ViewCount)
+        FROM Posts 
+        WHERE PostTypeId = 1 AND CreationDate >= CURRENT_DATE - INTERVAL '6 months'
+    )
+),
+BadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(b.Date) AS LatestBadgeDate,
+        STRING_AGG(DISTINCT b.Name, '; ' ORDER BY b.Date DESC) AS BadgeNames
+    FROM Badges b
+    WHERE b.Date >= CURRENT_DATE - INTERVAL '1 year'
+    GROUP BY b.UserId
+),
+VotePatterns AS (
+    SELECT 
+        v.PostId,
+        v.UserId,
+        COUNT(*) AS TotalVotes,
+        SUM(CASE WHEN v.VoteTypeId IN (2, 1) THEN 1 ELSE 0 END) AS PositiveVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        AVG(v.BountyAmount) FILTER (WHERE v.BountyAmount > 0) AS AvgBounty,
+        -- Correlated subquery for vote acceptance rate
+        (SELECT COUNT(*) 
+         FROM Votes v2 
+         WHERE v2.UserId = v.UserId 
+           AND v2.VoteTypeId = 1 
+           AND v2.CreationDate >= CURRENT_DATE - INTERVAL '3 months')::numeric / 
+        NULLIF(TotalVotes, 0) AS AcceptanceRatio
+    FROM Votes v
+    WHERE v.CreationDate >= CURRENT_DATE - INTERVAL '3 months'
+        AND v.VoteTypeId IN (1, 2, 3, 8)
+    GROUP BY v.PostId, v.UserId
+    HAVING COUNT(*) >= 3
+)
+SELECT 
+    ups.Id,
+    ups.DisplayName,
+    ups.PostCount,
+    ups.QuestionCount,
+    ups.AnswerCount,
+    ups.AvgScore,
+    au.RepRank,
+    COALESCE(bs.TotalBadges, 0) AS TotalBadges,
+    COALESCE(bs.GoldBadges, 0) AS GoldBadges,
+    ups.FormattedPostInfo,
+    ups.FirstTag,
+    CASE 
+        WHEN ups.PostRank = 1 THEN 'Top Post'
+        WHEN ups.PostRank <= 3 THEN 'High Impact'
+        ELSE 'Regular'
+    END AS PostImpact,
+    -- Complex calculation with NULL handling
+    COALESCE(
+        GREATEST(
+            (ups.ViewCount::numeric / NULLIF(ups.PostCount, 0)) * 
+            (1 + COALESCE(vp.PositiveVotes, 0)::numeric / NULLIF(vp.TotalVotes, 0)),
+            0
+        ),
+        0
+    ) AS EngagementScore,
+    -- Window function for ranking within reputation bands
+    DENSE_RANK() OVER (
+        PARTITION BY 
+            CASE 
+                WHEN au.Reputation < 1000 THEN 'Novice'
+                WHEN au.Reputation < 10000 THEN 'Regular'
+                ELSE 'Expert'
+            END 
+        ORDER BY COALESCE(bs.TotalBadges, 0) DESC, ups.ViewCount DESC
+    ) AS RepBandRank,
+    -- Set operation simulation with conditional aggregation
+    SUM(CASE WHEN ups.PostStatus = 'Closed' THEN 1 ELSE 0 END) OVER (
+        PARTITION BY au.RepRank / 10  -- Group by reputation deciles
+    ) AS ClosedPostsInGroup,
+    -- String aggregation with conditional logic
+    STRING_AGG(
+        DISTINCT CASE 
+            WHEN ups.ViewQuartile = 1 AND LENGTH(ups.Title) > 0 
+            THEN UPPER(SUBSTRING(ups.Title FROM 1 FOR 20))
+            ELSE NULL 
+        END, 
+        ' | ' 
+        ORDER BY ups.CreationDate DESC
+    ) OVER (PARTITION BY ups.Id ORDER BY ups.PostRank ROWS UNBOUNDED PRECEDING) AS TopTitles
+FROM UserPostStats ups
+INNER JOIN ActiveUsers au ON ups.Id = au.Id
+LEFT JOIN BadgeStats bs ON ups.Id = bs.UserId
+LEFT JOIN VotePatterns vp ON ups.Id = vp.UserId AND vp.PostId = (
+    SELECT hap2.Id 
+    FROM HighActivityPosts hap2 
+    WHERE hap2.OwnerUserId = ups.Id 
+    ORDER BY hap2.ViewCount DESC 
+    LIMIT 1
+)
+LEFT JOIN Comments c ON ups.Id = c.UserId 
+    AND c.CreationDate >= CURRENT_DATE - INTERVAL '1 month'
+    AND c.Score > (SELECT AVG(Score) FROM Comments WHERE Score IS NOT NULL)
+WHERE (ups.ViewCount > 1000 OR ups.Score > 50)
+    AND (bs.GoldBadges IS NULL OR bs.GoldBadges > 0 
+         OR ups.PostRank <= 2 
+         OR au.Reputation > 5000)
+    AND NOT EXISTS (
+        SELECT 1 FROM PostHistory ph 
+        WHERE ph.PostId = (SELECT hap3.Id FROM HighActivityPosts hap3 WHERE hap3.OwnerUserId = ups.Id LIMIT 1)
+          AND ph.PostHistoryTypeId IN (10, 12)  -- Closed or Deleted
+          AND ph.CreationDate > CURRENT_DATE - INTERVAL '30 days'
+    )
+    AND (c.Score IS NULL OR c.Score >= 0)  -- Exclude negative comment scores
+GROUP BY 
+    ups.Id, ups.DisplayName, ups.PostCount, ups.QuestionCount, ups.AnswerCount,
+    ups.AvgScore, au.RepRank, bs.TotalBadges, bs.GoldBadges,
+    ups.FormattedPostInfo, ups.FirstTag, ups.PostRank, ups.ViewCount,
+    ups.PostStatus, ups.ViewQuartile, au.Reputation, vp.PositiveVotes,
+    vp.TotalVotes, vp.AcceptanceRatio
+HAVING 
+    COALESCE(vp.AcceptanceRatio, 0) > 0.1 
+    OR ups.PostCount > (
+        SELECT AVG(PostCount) * 1.5 
+        FROM ActiveUsers 
+        WHERE RepRank <= 100
+    )
+ORDER BY 
+    EngagementScore DESC NULLS LAST,
+    au.RepRank ASC,
+    ups.PostRank ASC
+LIMIT 500;

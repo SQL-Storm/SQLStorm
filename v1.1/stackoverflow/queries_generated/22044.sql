@@ -1,0 +1,74 @@
+-- {"query": "22044.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "grok-code-fast", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2204, "output_tokens": 837} 
+WITH UserEngagement AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COALESCE(u.Reputation, 0) AS Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COALESCE(SUM(v.Score), 0) AS TotalVoteScore,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        AVG(LENGTH(REPLACE(COALESCE(p.Body, ''), '<', ''))) AS AvgPostLength,
+        STRING_AGG(DISTINCT t.TagName, ', ') AS TopTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1, 2)
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts pt ON p.Id = pt.ParentId AND pt.PostTypeId = 1  -- To link answers to questions for tags
+    LEFT JOIN UNNEST(string_to_array(substring(pt.Tags, 2, length(pt.Tags)-2), '><')) AS t(TagName) ON TRUE
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+AnswerStats AS (
+    SELECT 
+        p.ParentId AS QuestionId,
+        COUNT(a.Id) AS AnswerCount,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore
+    FROM Posts a
+    INNER JOIN Posts p ON a.ParentId = p.Id AND a.PostTypeId = 2 AND p.PostTypeId = 1
+    GROUP BY p.ParentId
+),
+UserQuestions WITH RECURSIVE QuestionHierarchy AS (
+    SELECT Id AS PostId, ParentId, 0 AS Depth
+    FROM Posts
+    WHERE PostTypeId = 1
+    UNION ALL
+    SELECT p.Id, p.ParentId, qh.Depth + 1
+    FROM Posts p
+    INNER JOIN QuestionHierarchy qh ON p.ParentId = qh.PostId
+    WHERE p.PostTypeId = 2 AND qh.Depth < 5
+)
+SELECT ue.UserId,
+       ue.DisplayName,
+       ue.Reputation,
+       ue.TotalPosts,
+       ue.QuestionCount,
+       ue.AnswerCount,
+       ue.CommentCount,
+       ue.TotalVoteScore,
+       ue.BadgeCount,
+       ue.AvgPostLength,
+       ue.TopTags,
+       COALESCE((
+           SELECT SUM(CASE WHEN VoteTypeId = 2 THEN 1 WHEN VoteTypeId = 3 THEN -1 ELSE 0 END)
+           FROM Votes
+           WHERE PostId IN (
+               SELECT Id FROM Posts WHERE OwnerUserId = ue.UserId
+           )
+       ), 0) AS NetUpvotes,
+       ROW_NUMBER() OVER (ORDER BY (ue.Reputation + ue.TotalVoteScore + ue.BadgeCount * 10) DESC) AS Rank,
+       CASE 
+           WHEN ue.QuestionCount > 0 THEN 
+               (SELECT AVG(as2.AvgAnswerScore) FROM AnswerStats as2 WHERE as2.QuestionId IN (SELECT Id FROM Posts WHERE OwnerUserId = ue.UserId AND PostTypeId = 1))
+           ELSE NULL
+       END AS AvgAnswerScoreToQuestions,
+       CASE WHEN ue.DisplayName IS NULL THEN 'Anonymous' ELSE UPPER(LEFT(ue.DisplayName, 5)) END AS ShortName,
+       COALESCE(EXTRACT(YEAR FROM u2.CreationDate), 2008) AS JoinYear
+FROM UserEngagement ue
+LEFT JOIN Users u2 ON ue.UserId = u2.Id
+WHERE ue.TotalPosts > 0
+ORDER BY Rank
+LIMIT 100;

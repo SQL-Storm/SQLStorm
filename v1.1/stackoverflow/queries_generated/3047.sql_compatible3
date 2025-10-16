@@ -1,0 +1,145 @@
+WITH UserAnswerStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.ViewCount END) AS TotalViewCount
+    FROM
+        Users u
+        LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY
+        u.Id, u.DisplayName
+),
+RecentPostHistory AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM
+        PostHistory ph
+    WHERE
+        ph.PostHistoryTypeId IN (4, 5, 6, 10, 11, 12)
+),
+ActiveQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.Tags,
+        p.OwnerUserId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId = 1
+        AND p.ClosedDate IS NULL
+        AND EXISTS (
+            SELECT 1 FROM RecentPostHistory rph
+            WHERE rph.PostId = p.Id AND rph.rn = 1
+        )
+),
+QuestionTags AS (
+    SELECT
+        q.Id AS PostId,
+        unnest(string_to_array(substring(q.Tags FROM 2 FOR (length(q.Tags)-2)), '><')) AS Tag
+    FROM
+        ActiveQuestions q
+),
+TopTags AS (
+    SELECT
+        Tag,
+        COUNT(*) AS TagCount
+    FROM
+        QuestionTags
+    GROUP BY
+        Tag
+    ORDER BY
+        TagCount DESC
+    LIMIT 10
+),
+PopularQuestions AS (
+    SELECT
+        aq.Id,
+        aq.Title,
+        aq.AnswerCount,
+        aq.Score,
+        aq.LastActivityDate,
+        json_agg(t.Tag) FILTER (WHERE t.Tag IS NOT NULL) AS Tags
+    FROM
+        ActiveQuestions aq
+        JOIN QuestionTags t ON aq.Id = t.PostId
+    GROUP BY
+        aq.Id, aq.Title, aq.AnswerCount, aq.Score, aq.LastActivityDate
+),
+VoteSummaries AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes,
+        COUNT(CASE WHEN v.VoteTypeId IN (2,3) THEN 1 END) AS TotalVotes,
+        COUNT(DISTINCT v.UserId) AS UniqueVoters
+    FROM
+        Posts p
+        LEFT JOIN Votes v ON p.Id = v.PostId
+    GROUP BY
+        p.Id
+),
+PostsWithDetails AS (
+    SELECT
+        ap.Id,
+        ap.Title,
+        ap.CreationDate,
+        ap.Score,
+        ap.Tags,
+        ap.OwnerUserId,
+        ap.AnswerCount,
+        ap.CommentCount,
+        ap.FavoriteCount,
+        ap.LastActivityDate,
+        vs.UpVotes,
+        vs.DownVotes,
+        vs.TotalVotes,
+        vs.UniqueVoters,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.Location,
+        u.Views
+    FROM
+        ActiveQuestions ap
+        LEFT JOIN VoteSummaries vs ON ap.Id = vs.PostId
+        LEFT JOIN Users u ON ap.OwnerUserId = u.Id
+)
+SELECT
+    pwd.Id AS PostId,
+    pwd.Title,
+    pwd.AnswerCount,
+    pwd.Score,
+    pwd.LastActivityDate,
+    pwd.Tags,
+    pwd.Reputation,
+    pwd.UserCreationDate,
+    pwd.Location,
+    pwd.Views,
+    pwd.UpVotes,
+    pwd.DownVotes,
+    pwd.TotalVotes,
+    pwd.UniqueVoters,
+    array_length(string_to_array(substring(pwd.Tags FROM 2 FOR (length(pwd.Tags)-2)), '><'), 1) AS TagCount,
+    (TIMESTAMP '2024-10-01 12:34:56' - pwd.UserCreationDate) AS UserAge,
+    (pwd.LastActivityDate - pwd.CreationDate) AS QuestionAge,
+    COALESCE(pwd.Reputation, 0) AS UserReputation,
+    COALESCE(pwd.Location, 'Unknown') AS UserLocation
+FROM
+    PostsWithDetails pwd
+WHERE
+    pwd.Score > 0
+    AND (pwd.AnswerCount IS NULL OR pwd.AnswerCount >= 1)
+ORDER BY
+    pwd.LastActivityDate DESC
+LIMIT 20;

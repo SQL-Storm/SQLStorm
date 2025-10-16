@@ -1,0 +1,169 @@
+-- {"query": "86.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1665} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 as Level,
+        cast(t.TagName as varchar(1000)) as Path
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Level + 1,
+        r.Path || ' > ' || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id = r.Id + 1
+    where r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(*) as TotalBadges
+    from Badges b
+    group by b.UserId
+),
+PostScoreStats as (
+    select
+        p.OwnerUserId,
+        p.PostTypeId,
+        count(*) as PostCount,
+        avg(p.Score) as AvgScore,
+        max(p.Score) as MaxScore,
+        min(p.Score) as MinScore,
+        sum(case when p.ClosedDate is not null then 1 else 0 end) as ClosedPosts
+    from Posts p
+    where p.OwnerUserId is not null and p.OwnerUserId > 0
+    group by p.OwnerUserId, p.PostTypeId
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) over (partition by u.Id order by p.CreationDate rows between unbounded preceding and current row) as CumulativePosts,
+        count(distinct c.Id) over (partition by u.Id order by c.CreationDate rows between unbounded preceding and current row) as CumulativeComments,
+        row_number() over (partition by u.Id order by p.Score desc nulls last) as TopPostRank,
+        dense_rank() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+),
+TopQuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreation,
+        a.OwnerUserId as AnswerOwner,
+        u.DisplayName as AnswerOwnerName,
+        row_number() over (partition by q.Id order by a.Score desc nulls last) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1 and q.Score > 10 and q.ClosedDate is null
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        lt.Name as LinkTypeName,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where pl.LinkTypeId = 3
+),
+UserCloseVotes as (
+    select
+        ph.UserId,
+        ph.PostId,
+        ph.CreationDate,
+        crt.Name as CloseReason,
+        row_number() over (partition by ph.PostId order by ph.CreationDate desc) as CloseVoteRank
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10
+),
+UserVoteSummary as (
+    select
+        v.UserId,
+        vt.Name as VoteTypeName,
+        count(*) as VoteCount,
+        sum(coalesce(v.BountyAmount,0)) as TotalBounty
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.UserId, vt.Name
+)
+select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    coalesce(psq.PostCount,0) as QuestionCount,
+    coalesce(psa.PostCount,0) as AnswerCount,
+    coalesce(psq.ClosedPosts,0) as ClosedQuestions,
+    ua.CumulativePosts,
+    ua.CumulativeComments,
+    ua.TopPostRank,
+    ua.ReputationRank,
+    max(tqh.QuestionScore) as MaxQuestionScore,
+    max(tqh.AnswerScore) as MaxAnswerScore,
+    string_agg(distinct dt.TagName, ', ') filter (where dt.TagName is not null) as SampleTags,
+    string_agg(distinct dl.PostTitle || '->' || dl.RelatedPostTitle, '; ') as DuplicatePostLinks,
+    string_agg(distinct ucv.CloseReason, ', ') as CloseReasonsVoted,
+    coalesce(uvs.VoteCount,0) as TotalVotesCast,
+    coalesce(uvs.TotalBounty,0) as TotalBountyGiven,
+    case
+        when u.WebsiteUrl is not null and u.WebsiteUrl <> '' then
+            lower(substring(u.WebsiteUrl from 'https?://([^/]+)'))
+        else null
+    end as WebsiteDomain,
+    case
+        when u.Location is not null then
+            length(u.Location) - length(replace(u.Location, ' ', '')) + 1
+        else 0
+    end as LocationWordCount
+from Users u
+left join UserBadgeCounts ubc on ubc.UserId = u.Id
+left join PostScoreStats psq on psq.OwnerUserId = u.Id and psq.PostTypeId = 1
+left join PostScoreStats psa on psa.OwnerUserId = u.Id and psa.PostTypeId = 2
+left join UserActivityWindow ua on ua.UserId = u.Id
+left join TopQuestionsWithAnswers tqh on tqh.AnswerOwner = u.Id
+left join RecursiveTagHierarchy dt on dt.TagName = any(string_to_array(coalesce(tqh.Tags,''), '><'))
+left join DuplicateLinks dl on dl.PostId in (
+    select p.Id from Posts p where p.OwnerUserId = u.Id
+)
+left join UserCloseVotes ucv on ucv.UserId = u.Id and ucv.CloseVoteRank = 1
+left join UserVoteSummary uvs on uvs.UserId = u.Id
+where u.Reputation > 1000
+group by
+    u.Id, u.DisplayName, u.Reputation, ubc.GoldBadges, ubc.SilverBadges, ubc.BronzeBadges,
+    psq.PostCount, psa.PostCount, psq.ClosedPosts,
+    ua.CumulativePosts, ua.CumulativeComments, ua.TopPostRank, ua.ReputationRank,
+    u.WebsiteUrl, u.Location,
+    uvs.VoteCount, uvs.TotalBounty
+order by u.Reputation desc
+limit 100;

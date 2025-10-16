@@ -1,0 +1,129 @@
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        pt.Name AS PostTypeName,
+        CASE
+            WHEN p.PostTypeId = 1 THEN SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2)
+            ELSE NULL
+        END AS MainTag,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS rn_by_type,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS UpVoteCount,
+        LAG(p.Score, 1, 0) OVER (ORDER BY p.CreationDate) AS PreviousDayScore,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) AS ViewRank
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId = 2
+    WHERE p.OwnerUserId IS NOT NULL
+      AND p.CreationDate >= (cast('2024-10-01' as date) - INTERVAL '365' DAY)
+),
+UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT CASE WHEN rp.PostTypeId = 1 THEN rp.PostId ELSE NULL END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN rp.PostTypeId = 2 THEN rp.PostId ELSE NULL END) AS AnswerCount,
+        AVG(rp.PostScore) AS AvgPostScore,
+        SUM(rp.PostViewCount) AS TotalPostViews,
+        COUNT(DISTINCT CASE WHEN rp.ClosedDate IS NOT NULL THEN rp.PostId ELSE NULL END) AS ClosedPostCount,
+        MAX(rp.PostCreationDate) AS LastPostDate,
+        SUM(rp.UpVoteCount) AS TotalUpvotesReceived
+    FROM Users u
+    JOIN RankedPosts rp ON u.Id = rp.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TagPerformance AS (
+    SELECT
+        TAG.TagName,
+        TAG.Count AS TagPostCount,
+        COUNT(DISTINCT RP.PostId) AS RelatedQuestionCount,
+        AVG(RP.PostScore) AS AvgQuestionScore,
+        SUM(RP.AnswerCount) AS TotalAnswersForTag,
+        COUNT(DISTINCT C.Id) AS TotalCommentsOnTagQuestions
+    FROM Tags TAG
+    LEFT JOIN RankedPosts RP ON RP.MainTag = TAG.TagName AND RP.PostTypeId = 1
+    LEFT JOIN Comments C ON RP.PostId = C.PostId
+    WHERE TAG.TagName IS NOT NULL
+    GROUP BY TAG.TagName, TAG.Count
+)
+SELECT
+    RP.PostId,
+    RP.PostTypeName,
+    RP.PostTypeName || ' - ' || RP.MainTag AS PostCategory,
+    UPPER(COALESCE(RP.MainTag, 'N/A')) AS ProcessedTag,
+    UPS.DisplayName AS OwnerDisplayName,
+    UPS.Reputation AS OwnerReputation,
+    RP.PostScore,
+    RP.UpVoteCount,
+    RP.PostViewCount,
+    RP.ViewRank,
+    (RP.PostScore * 1000) + RP.AnswerCount - RP.CommentCount AS WeightedScore,
+    CASE
+        WHEN RP.PostCreationDate < (cast('2024-10-01' as date) - INTERVAL '90' DAY) THEN 'Old'
+        WHEN RP.PostCreationDate >= (cast('2024-10-01' as date) - INTERVAL '7' DAY) THEN 'Recent'
+        ELSE 'Mid-Age'
+    END AS AgeGroup,
+    CASE
+        WHEN RP.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN RP.PostScore > 50 AND RP.AnswerCount > 10 THEN 'Popular'
+        ELSE 'Standard'
+    END AS PostStatus,
+    UPS.AvgPostScore,
+    UPS.TotalPostViews,
+    UPS.ClosedPostCount,
+    TP.TagPostCount,
+    TP.RelatedQuestionCount,
+    TP.AvgQuestionScore,
+    TP.TotalAnswersForTag,
+    TP.TotalCommentsOnTagQuestions,
+    CASE
+        WHEN RP.PostViewCount > 1000000 AND UPS.TotalUpvotesReceived > 500 THEN 'Viral and Highly Rated'
+        WHEN RP.PostViewCount > 100000 THEN 'High Traffic'
+        ELSE 'Standard Traffic'
+    END AS TrafficCategory,
+    COALESCE(UPS.LastPostDate, RP.PostCreationDate) AS EffectiveLastActivity,
+    RP.PostCreationDate,
+    RP.PreviousDayScore,
+    ABS(RP.PostScore - RP.PreviousDayScore) AS ScoreChangeFromPreviousDay,
+    CASE WHEN RP.ViewRank BETWEEN 1 AND 100 THEN TRUE ELSE FALSE END AS IsTop100Viewed
+FROM RankedPosts RP
+JOIN UserPostStats UPS ON RP.OwnerUserId = UPS.UserId
+LEFT JOIN TagPerformance TP ON RP.MainTag = TP.TagName AND RP.PostTypeId = 1
+WHERE RP.rn_by_type <= 500
+  AND RP.PostScore > 0
+  AND UPS.Reputation > 1000
+GROUP BY
+    RP.PostId,
+    RP.PostTypeName,
+    RP.MainTag,
+    UPS.DisplayName,
+    UPS.Reputation,
+    RP.PostScore,
+    RP.UpVoteCount,
+    RP.PostViewCount,
+    RP.ViewRank,
+    RP.AnswerCount,
+    RP.CommentCount,
+    RP.PostCreationDate,
+    RP.ClosedDate,
+    UPS.AvgPostScore,
+    UPS.TotalPostViews,
+    UPS.ClosedPostCount,
+    TP.TagPostCount,
+    TP.RelatedQuestionCount,
+    TP.AvgQuestionScore,
+    TP.TotalAnswersForTag,
+    TP.TotalCommentsOnTagQuestions,
+    UPS.TotalUpvotesReceived,
+    UPS.LastPostDate,
+    RP.PreviousDayScore
+ORDER BY RP.PostCreationDate DESC, RP.PostScore DESC;

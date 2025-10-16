@@ -1,0 +1,101 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        COUNT(b.Id) AS TotalBadges,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p          ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b         ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TagExplode AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        unnest(string_to_array(trim(both '<>' FROM p.Tags), '><')) AS Tag
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL
+),
+TagCounts AS (
+    SELECT 
+        te.UserId,
+        te.Tag,
+        COUNT(*) AS TagFreq
+    FROM TagExplode te
+    GROUP BY te.UserId, te.Tag
+),
+TopTags AS (
+    SELECT 
+        tc.UserId,
+        STRING_AGG(t.TagName, ', ' ORDER BY tc.TagFreq DESC) AS TopTagList
+    FROM TagCounts tc
+    JOIN Tags t ON t.TagName = tc.Tag
+    GROUP BY tc.UserId
+),
+RecentActivity AS (
+    SELECT 
+        u.Id,
+        GREATEST(
+            COALESCE(u.LastAccessDate, TIMESTAMP '1970-01-01'),
+            COALESCE(p.LastActivityDate, TIMESTAMP '1970-01-01'),
+            COALESCE(c.CreationDate, TIMESTAMP '1970-01-01')
+        ) AS RecentDate
+    FROM Users u
+    LEFT JOIN Posts p    ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+)
+SELECT 
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.RepRank,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.TotalPostScore,
+    ROUND(us.AvgPostScore, 2) AS AvgPostScore,
+    us.LastPostDate,
+    us.TotalBadges,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    COALESCE(tt.TopTagList, 'None') AS TopTags,
+    ra.RecentDate,
+    CASE 
+        WHEN ra.RecentDate >= CAST('2024-10-01' AS DATE) - INTERVAL '30 days' THEN 'Active' 
+        ELSE 'Inactive' 
+    END AS ActivityStatus
+FROM UserStats us
+LEFT JOIN TopTags tt       ON tt.UserId = us.Id
+LEFT JOIN RecentActivity ra ON ra.Id = us.Id
+WHERE us.RepRank <= 1000
+
+UNION ALL
+
+SELECT 
+    NULL AS Id,
+    NULL AS DisplayName,
+    NULL AS Reputation,
+    NULL AS RepRank,
+    NULL AS QuestionCount,
+    NULL AS AnswerCount,
+    NULL AS TotalPostScore,
+    NULL AS AvgPostScore,
+    NULL AS LastPostDate,
+    NULL AS TotalBadges,
+    NULL AS GoldBadges,
+    NULL AS SilverBadges,
+    NULL AS BronzeBadges,
+    NULL AS TopTags,
+    NULL AS RecentDate,
+    NULL AS ActivityStatus
+ORDER BY RepRank NULLS LAST
+LIMIT 1050;

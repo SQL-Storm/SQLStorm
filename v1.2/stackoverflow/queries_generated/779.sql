@@ -1,0 +1,266 @@
+-- {"query": "779.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2405} 
+with RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 as Level,
+        cast(t.TagName as varchar(1000)) as Path
+    from Tags t
+    where t.IsRequired = 1
+
+    union all
+
+    select 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        t2.IsModeratorOnly,
+        t2.IsRequired,
+        r.Level + 1,
+        r.Path || ' > ' || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.IsRequired = 1 and t2.Id <> r.Id and position(t2.TagName in r.Path) = 0
+    where r.Level < 3
+),
+UserBadgeCounts as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        sum(case when b.TagBased = 1 then 1 else 0 end) as TagBasedBadges
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName
+),
+PostActivityWindow as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Tags,
+        p.Title,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as RecentPostRank,
+        avg(p.Score) over (partition by p.OwnerUserId) as AvgUserPostScore,
+        count(*) over (partition by p.OwnerUserId) as UserPostCount
+    from Posts p
+    where p.PostTypeId in (1,2)
+),
+QuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        q.OwnerUserId as QuestionOwner,
+        a.Id as AnswerId,
+        a.CreationDate as AnswerCreation,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerOwner
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+AnswerVotes as (
+    select 
+        v.PostId,
+        count(case when vt.Name = 'UpMod' then 1 end) as UpVotes,
+        count(case when vt.Name = 'DownMod' then 1 end) as DownVotes
+    from Votes v
+    join VoteTypes vt on v.VoteTypeId = vt.Id
+    group by v.PostId
+),
+QuestionCloseInfo as (
+    select
+        ph.PostId,
+        ph.CreationDate as CloseDate,
+        crt.Name as CloseReason
+    from PostHistory ph
+    join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id and pht.Name = 'Post Closed'
+    left join CloseReasonTypes crt on cast(ph.Comment as int) = crt.Id
+),
+LatestCommentPerPost as (
+    select distinct on (c.PostId)
+        c.PostId,
+        c.Id as CommentId,
+        c.Text as CommentText,
+        c.CreationDate as CommentDate,
+        c.UserId as CommentUserId,
+        c.UserDisplayName as CommentUserName
+    from Comments c
+    order by c.PostId, c.CreationDate desc
+),
+PostLinkDuplicates as (
+    select
+        pl.PostId,
+        count(pl.Id) filter (where lt.Name = 'Duplicate') as DuplicateCount,
+        count(pl.Id) filter (where lt.Name = 'Linked') as LinkedCount
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    group by pl.PostId
+),
+UserActivitySummary as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        coalesce(ub.GoldBadges,0) as GoldBadges,
+        coalesce(ub.SilverBadges,0) as SilverBadges,
+        coalesce(ub.BronzeBadges,0) as BronzeBadges,
+        coalesce(ub.TagBasedBadges,0) as TagBasedBadges,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+        max(p.CreationDate) filter (where p.PostTypeId in (1,2)) as LastPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join UserBadgeCounts ub on u.Id = ub.UserId
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location, u.Views, u.UpVotes, u.DownVotes, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ub.TagBasedBadges
+),
+ComplexUserPostAnalysis as (
+    select
+        uas.Id as UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.GoldBadges,
+        uas.SilverBadges,
+        uas.BronzeBadges,
+        uas.TagBasedBadges,
+        uas.QuestionsCount,
+        uas.AnswersCount,
+        uas.LastPostDate,
+        pa.Id as PostId,
+        pa.PostTypeId,
+        pa.CreationDate,
+        pa.Score,
+        pa.ViewCount,
+        pa.Title,
+        pa.Tags,
+        case 
+            when pa.PostTypeId = 1 then 'Question'
+            when pa.PostTypeId = 2 then 'Answer'
+            else 'Other'
+        end as PostTypeName,
+        av.UpVotes,
+        av.DownVotes,
+        qci.CloseDate,
+        qci.CloseReason,
+        plc.DuplicateCount,
+        plc.LinkedCount,
+        lc.CommentId,
+        lc.CommentText,
+        lc.CommentDate,
+        lc.CommentUserId,
+        lc.CommentUserName,
+        row_number() over (partition by uas.Id order by pa.Score desc nulls last) as UserPostRank,
+        rank() over (partition by uas.Id order by pa.ViewCount desc nulls last) as UserPostViewRank,
+        dense_rank() over (order by uas.Reputation desc) as ReputationRank
+    from UserActivitySummary uas
+    left join Posts pa on pa.OwnerUserId = uas.Id and pa.PostTypeId in (1,2)
+    left join AnswerVotes av on av.PostId = pa.Id
+    left join QuestionCloseInfo qci on qci.PostId = pa.Id
+    left join PostLinkDuplicates plc on plc.PostId = pa.Id
+    left join LatestCommentPerPost lc on lc.PostId = pa.Id
+    where uas.Reputation > 1000 and (pa.Score > 5 or pa.ViewCount > 1000 or av.UpVotes > 5)
+),
+TagPopularity as (
+    select 
+        t.TagName,
+        count(p.Id) as PostsCount,
+        avg(p.Score) as AvgPostScore,
+        max(p.ViewCount) as MaxViewCount
+    from Tags t
+    join Posts p on p.PostTypeId = 1 and p.Tags like '%' || t.TagName || '%'
+    group by t.TagName
+),
+DistinctTagSet as (
+    select distinct unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as TagName, p.Id as PostId
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null and p.Tags <> ''
+),
+TagCoOccurrences as (
+    select 
+        t1.TagName as Tag1,
+        t2.TagName as Tag2,
+        count(distinct t1.PostId) as CoOccurrenceCount
+    from DistinctTagSet t1
+    join DistinctTagSet t2 on t1.PostId = t2.PostId and t1.TagName < t2.TagName
+    group by t1.TagName, t2.TagName
+    having count(distinct t1.PostId) > 10
+),
+UserBadgesRanked as (
+    select 
+        b.UserId,
+        b.Name,
+        b.Class,
+        row_number() over (partition by b.UserId order by b.Date desc) as BadgeRank
+    from Badges b
+),
+LatestBadgesPerUser as (
+    select
+        UserId,
+        array_agg(Name order by BadgeRank) filter (where BadgeRank <= 5) as Top5Badges
+    from UserBadgesRanked
+    group by UserId
+)
+select 
+    cua.UserId,
+    cua.DisplayName,
+    cua.Reputation,
+    cua.GoldBadges,
+    cua.SilverBadges,
+    cua.BronzeBadges,
+    cua.TagBasedBadges,
+    cua.QuestionsCount,
+    cua.AnswersCount,
+    cua.LastPostDate,
+    cua.PostId,
+    cua.PostTypeName,
+    cua.Title,
+    substring(cua.Tags from 2 for char_length(cua.Tags) - 2) as CleanTags,
+    cua.Score,
+    cua.ViewCount,
+    cua.UpVotes,
+    cua.DownVotes,
+    cua.CloseDate,
+    cua.CloseReason,
+    cua.DuplicateCount,
+    cua.LinkedCount,
+    cua.CommentText,
+    cua.CommentDate,
+    cua.CommentUserName,
+    cua.UserPostRank,
+    cua.UserPostViewRank,
+    cua.ReputationRank,
+    tp.PostsCount as TagPostsCount,
+    tp.AvgPostScore as TagAvgScore,
+    tp.MaxViewCount as TagMaxViews,
+    array_to_string(ltp.Top5Badges, ', ') as RecentBadges,
+    rth.Path as TagHierarchyPath,
+    tco.Tag2 as CoOccurringTag,
+    tco.CoOccurrenceCount
+from ComplexUserPostAnalysis cua
+left join TagPopularity tp on tp.TagName = (select unnest(string_to_array(substring(cua.Tags from 2 for char_length(cua.Tags) - 2), '><')) limit 1)
+left join LatestBadgesPerUser ltp on ltp.UserId = cua.UserId
+left join RecursiveTagHierarchy rth on rth.TagName = (select unnest(string_to_array(substring(cua.Tags from 2 for char_length(cua.Tags) - 2), '><')) limit 1)
+left join TagCoOccurrences tco on tco.Tag1 = (select unnest(string_to_array(substring(cua.Tags from 2 for char_length(cua.Tags) - 2), '><')) limit 1)
+where cua.UserPostRank <= 3
+order by cua.ReputationRank, cua.UserPostRank, cua.Score desc
+limit 100;

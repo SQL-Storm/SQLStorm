@@ -1,0 +1,143 @@
+-- {"query": "58.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1932} 
+WITH
+-- recent active questions with tag array and normalized title
+RecentQuestions AS (
+  SELECT p.Id, p.Title,
+         coalesce(string_to_array(substring(p.Tags,2, length(p.Tags)-2), '><'), ARRAY[]::varchar[]) AS TagArray,
+         p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount,
+         regexp_replace(lower(coalesce(p.Title,'')), '[^\w\s]', '','g') AS NormTitle
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= now() - interval '2 years'
+),
+-- answers with link to their parent question and author stats
+Answers AS (
+  SELECT a.Id, a.ParentId AS QuestionId, a.OwnerUserId AS AnswererId, a.Score AS AnswerScore,
+         a.CreationDate AS AnswerDate,
+         ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS RankByScore
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+),
+-- aggregated user metrics (including recency-weighted reputation)
+UserAgg AS (
+  SELECT u.Id AS UserId,
+         u.Reputation,
+         COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+         COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+         COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+         COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAsked,
+         COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersGiven,
+         SUM(CASE WHEN p.CreationDate >= now() - interval '90 days' THEN 1.0 ELSE 0.1 END * COALESCE(p.Score,0)) AS RecencyWeightedScore
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.Reputation
+),
+-- compute question similarity candidates by tag overlap and title fuzzy match tokens
+QuestionTokens AS (
+  SELECT q.Id, q.NormTitle,
+         unnest(q.TagArray) AS Tag
+  FROM RecentQuestions q
+),
+TagPairs AS (
+  SELECT qt1.Id AS Q1, qt2.Id AS Q2, COUNT(*) AS SharedTags
+  FROM QuestionTokens qt1
+  JOIN QuestionTokens qt2 ON qt1.Tag = qt2.Tag AND qt1.Id < qt2.Id
+  GROUP BY qt1.Id, qt2.Id
+),
+TitleOverlap AS (
+  SELECT q1.Id AS Q1, q2.Id AS Q2,
+         (SELECT COUNT(DISTINCT t)
+          FROM unnest(string_to_array(q1.NormTitle,' ')) t
+          WHERE length(t) > 2
+            AND t = ANY (string_to_array(q2.NormTitle,' '))
+         ) AS TitleCommonTokens
+  FROM RecentQuestions q1
+  JOIN RecentQuestions q2 ON q1.Id < q2.Id
+),
+-- candidate duplicates/related with composite score
+RelatedCandidates AS (
+  SELECT tp.Q1, tp.Q2, tp.SharedTags,
+         coalesce(to.TitleCommonTokens,0) AS TitleCommon,
+         (tp.SharedTags * 3 + coalesce(to.TitleCommonTokens,0) * 2) AS RelationScore
+  FROM TagPairs tp
+  LEFT JOIN TitleOverlap to ON to.Q1 = tp.Q1 AND to.Q2 = tp.Q2
+  WHERE tp.SharedTags >= 1 OR (to.TitleCommonTokens IS NOT NULL AND to.TitleCommonTokens >= 2)
+),
+-- pick top related per question (symmetric)
+TopRelated AS (
+  SELECT Q1 AS QuestionId, Q2 AS RelatedQuestionId, RelationScore,
+         ROW_NUMBER() OVER (PARTITION BY Q1 ORDER BY RelationScore DESC, RelatedQuestionId) AS RN
+  FROM (
+    SELECT Q1, Q2, RelationScore FROM RelatedCandidates
+    UNION ALL
+    SELECT Q2 AS Q1, Q1 AS Q2, RelationScore FROM RelatedCandidates
+  ) r
+),
+-- compute per-question metrics and best answer info using correlated subqueries and window functions
+QuestionMetrics AS (
+  SELECT q.*,
+         ua.Reputation AS OwnerReputation,
+         ua.GoldBadges, ua.SilverBadges, ua.BronzeBadges,
+         COALESCE((SELECT a.Score FROM Posts a WHERE a.Id = q.AcceptedAnswerId), NULL) AS AcceptedAnswerScore,
+         (SELECT AVG(a.Score) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2) AS AvgAnswerScore,
+         (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 2) AS UpvoteCount,
+         (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 3) AS DownvoteCount,
+         (SELECT ARRAY_AGG(DISTINCT t.Tag ORDER BY t.Tag) FROM QuestionTokens t WHERE t.Id = q.Id) AS TagsArray,
+         (SELECT json_agg(json_build_object('Id', a.Id, 'Score', a.Score, 'AgeDays', extract(epoch from(now()-a.CreationDate))/86400))
+            FROM Posts a
+            WHERE a.ParentId = q.Id AND a.PostTypeId = 2
+            ORDER BY a.Score DESC NULLS LAST
+            LIMIT 5
+         ) AS Top5Answers
+  FROM RecentQuestions q
+  LEFT JOIN UserAgg ua ON ua.UserId = q.OwnerUserId
+),
+-- assemble final ranked list with outer joins to related and answers; include complex expressions and null-handling
+FinalSet AS (
+  SELECT qm.Id AS QuestionId,
+         qm.Title,
+         COALESCE(qm.TagsArray, ARRAY[]::varchar[]) AS Tags,
+         qm.OwnerUserId,
+         COALESCE(qm.OwnerReputation,0) AS OwnerReputation,
+         qm.Score AS QuestionScore,
+         COALESCE(qm.ViewCount,0) AS Views,
+         COALESCE(qm.AnswerCount,0) AS AnswerCount,
+         COALESCE(qm.AcceptedAnswerScore, -9999) AS AcceptedAnswerScore,
+         COALESCE(qm.AvgAnswerScore, 0) AS AvgAnswerScore,
+         COALESCE(qm.UpvoteCount,0) AS Upvotes,
+         COALESCE(qm.DownvoteCount,0) AS Downvotes,
+         qm.Top5Answers,
+         tr.RelatedQuestionId,
+         rc.RelationScore,
+         -- synthetic complexity score: favors high view/score and penalizes many downvotes, boosts owner rep and badges
+         ( (LEAST(qm.Score,50) * 2.5)
+           + log(GREATEST(qm.ViewCount,1)) * 1.8
+           + GREATEST(qm.OwnerReputation/100, 0)
+           + (qm.GoldBadges * 5 + qm.SilverBadges * 2 + qm.BronzeBadges * 0.5)
+           - (qm.DownvoteCount * 3)
+           + COALESCE(rc.RelationScore,0) * 1.2
+         )::numeric(12,4) AS ComplexityScore,
+         -- string-based derived field: abbreviated title with null-safety and unicode-safe trimming
+         CASE WHEN qm.Title IS NULL OR length(trim(qm.Title)) = 0 THEN '[no title]' ELSE
+           CASE WHEN char_length(qm.Title) > 120 THEN concat(substring(qm.Title from 1 for 117), '...') ELSE qm.Title END
+         END AS AbbrevTitle,
+         -- indicator if this question likely duplicate candidate (heuristic)
+         CASE WHEN COALESCE(rc.RelationScore,0) >= 6 OR (qm.AcceptedAnswerScore IS NOT NULL AND qm.AcceptedAnswerScore >= 25) THEN true ELSE false END AS LikelyHotOrDuplicate,
+         row_number() OVER (ORDER BY ( (LEAST(qm.Score,50)*2.5) + log(GREATEST(qm.ViewCount,1))*1.8 + COALESCE(rc.RelationScore,0)*1.2 ) DESC) AS GlobalRank
+  FROM QuestionMetrics qm
+  LEFT JOIN TopRelated tr ON tr.QuestionId = qm.Id AND tr.RN = 1
+  LEFT JOIN RelatedCandidates rc ON ( (rc.Q1 = qm.Id AND rc.Q2 = tr.RelatedQuestionId) OR (rc.Q2 = qm.Id AND rc.Q1 = tr.RelatedQuestionId) )
+)
+-- final selection with filtering, set operator and ordering; union a sample of low-activity questions for contrast
+SELECT * FROM FinalSet
+WHERE GlobalRank <= 250
+ORDER BY ComplexityScore DESC, GlobalRank
+UNION ALL
+SELECT * FROM (
+  SELECT * FROM FinalSet
+  WHERE Views < 50 AND AnswerCount = 0
+  ORDER BY random()
+  LIMIT 50
+) low
+ORDER BY ComplexityScore DESC NULLS LAST, GlobalRank;

@@ -1,0 +1,198 @@
+-- {"query": "7054.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2224} 
+with
+-- recent activity per post including derived tag list split simulation and normalized owner
+RecentPosts as (
+  select
+    p.Id,
+    p.PostTypeId,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.Title,
+    coalesce(p.Tags,'') as RawTags,
+    -- simulate tag count and first tag extraction using string functions
+    (case when p.Tags is null or p.Tags = '' then 0
+          else (length(p.Tags) - length(replace(p.Tags,'><','')) ) end) as ApproxTagCount,
+    nullif(substring(coalesce(p.Tags,''), 2, 
+           greatest(0, least(200, length(coalesce(p.Tags,'')) - 2))
+    ), '') as TagSubstr,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.OwnerDisplayName,
+    p.LastActivityDate
+  from Posts p
+  where p.CreationDate >= now() - interval '5 years'
+),
+-- top contributors window: per user aggregates across recent posts and answers
+UserAggregates as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    count(distinct rp.Id) filter (where rp.PostTypeId = 1) as RecentQuestions,
+    count(distinct rp.Id) filter (where rp.PostTypeId = 2) as RecentAnswers,
+    sum(coalesce(rp.Score,0)) as RecentScoreSum,
+    max(coalesce(rp.Score,0)) as RecentMaxScore,
+    row_number() over (order by sum(coalesce(rp.Score,0)) desc nulls last) as RankByScore
+  from Users u
+  left join RecentPosts rp on rp.OwnerUserId = u.Id
+  group by u.Id, u.DisplayName
+),
+-- compute per-question answer stats (including correlated subquery for accepted answer age)
+QuestionAnswerStats as (
+  select
+    q.Id as QuestionId,
+    q.Title,
+    q.CreationDate as QuestionCreation,
+    q.AcceptedAnswerId,
+    q.ViewCount,
+    q.Score as QuestionScore,
+    count(a.Id) as AnswerCount,
+    sum(case when a.Score > 0 then 1 else 0 end) as PositiveAnswers,
+    avg(coalesce(a.Score,0)) as AvgAnswerScore,
+    max(a.Score) as MaxAnswerScore,
+    min(a.Score) as MinAnswerScore,
+    -- correlated subquery: time to accepted answer in seconds (null if none)
+    (select extract(epoch from (aa.CreationDate - q.CreationDate))
+     from Posts aa
+     where aa.Id = q.AcceptedAnswerId
+     limit 1) as SecsToAccepted,
+    -- most recent comment on the question (subquery)
+    (select c.Text from Comments c where c.PostId = q.Id order by c.CreationDate desc limit 1) as LatestCommentText
+  from Posts q
+  left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+  where q.PostTypeId = 1
+  group by q.Id, q.Title, q.CreationDate, q.AcceptedAnswerId, q.ViewCount, q.Score
+),
+-- sample heavy text expression: compute a condensed snippet and hash-like fingerprint
+TextTransforms as (
+  select
+    p.Id,
+    left(coalesce(p.Title,substr(p.Body,1,200)), 120) as Snippet,
+    -- faux fingerprint: sum of ascii values mod primes across first 100 chars
+    (select (sum(ascii(substr(t, g, 1))) % 1000003)
+     from generate_series(1, least(100, length(coalesce(p.Title, substr(p.Body,1,100))))) g
+     cross join lateral (select coalesce(p.Title, substr(p.Body,1,100)) as t) s
+    ) as Fingerprint,
+    case
+      when p.Tags is null then '{no-tags}'
+      when p.Tags = '' then '{empty-tags}'
+      else p.Tags
+    end as NormalizedTags
+  from Posts p
+  where p.CreationDate >= now() - interval '1 year'
+),
+-- identify link clusters via symmetric set operator (UNION ALL used to preserve multiplicity)
+PostLinksExpanded as (
+  select pl.PostId, pl.RelatedPostId, lt.Name as LinkType, pl.CreationDate from PostLinks pl join LinkTypes lt on lt.Id = pl.LinkTypeId
+  union all
+  select pl.RelatedPostId as PostId, pl.PostId as RelatedPostId, lt.Name as LinkType, pl.CreationDate from PostLinks pl join LinkTypes lt on lt.Id = pl.LinkTypeId
+),
+-- compute engagement metric combining votes, comments, views with null-handling and exponential smoothing
+Engagement as (
+  select
+    p.Id as PostId,
+    coalesce(v.UpVotes,0) as UpVotes,
+    coalesce(v.DownVotes,0) as DownVotes,
+    coalesce(c.CommentCount,0) as CommentCount,
+    coalesce(p.ViewCount,0) as Views,
+    -- smoothed engagement: views*0.1 + votes_weight + comments*1.5, with null logic
+    (coalesce(p.ViewCount,0)::numeric * 0.1
+     + coalesce(v.UpVotes,0) * 2.0
+     - coalesce(v.DownVotes,0) * 1.2
+     + coalesce(c.CommentCount,0) * 1.5) as EngagementScore
+  from Posts p
+  left join (select PostId, sum(case when VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+                    sum(case when VoteTypeId = 3 then 1 else 0 end) as DownVotes
+             from Votes group by PostId) v on v.PostId = p.Id
+  left join (select PostId, count(*) as CommentCount from Comments group by PostId) c on c.PostId = p.Id
+),
+-- ranking and windowing across combined dataset
+RankedQuestions as (
+  select
+    qas.*,
+    e.EngagementScore,
+    ua.UserId as OwnerId,
+    ua.DisplayName as OwnerName,
+    row_number() over (partition by date_trunc('month', qas.QuestionCreation) order by coalesce(e.EngagementScore,0) desc, qas.AnswerCount desc) as MonthlyTopRank,
+    rank() over (order by coalesce(e.EngagementScore,0) desc) as GlobalEngagementRank
+  from QuestionAnswerStats qas
+  left join Engagement e on e.PostId = qas.QuestionId
+  left join Posts p on p.Id = qas.QuestionId
+  left join Users ua on ua.Id = p.OwnerUserId
+),
+-- final complex filter using multiple logical branches, pattern matching and null-safe comparisons
+SelectedSet as (
+  select
+    rq.QuestionId,
+    rq.Title,
+    rq.QuestionCreation,
+    rq.ViewCount,
+    rq.AnswerCount,
+    rq.AvgAnswerScore,
+    rq.SecsToAccepted,
+    rq.LatestCommentText,
+    rq.EngagementScore,
+    rq.OwnerId,
+    rq.OwnerName,
+    rq.MonthlyTopRank,
+    rq.GlobalEngagementRank,
+    -- flag hot, controversial, and stale
+    (case
+      when rq.EngagementScore >= 1000 or rq.GlobalEngagementRank <= 100 then 'hot'
+      when rq.AnswerCount >= 20 and rq.AvgAnswerScore < 0.5 then 'controversial'
+      when rq.AnswerCount = 0 and now() - rq.QuestionCreation > interval '180 days' then 'stale'
+      else 'normal' end) as Status,
+    -- combined text for fuzzy search simulation
+    lower(coalesce(rq.Title,'') || ' ' || coalesce(rq.LatestCommentText,'')) as CombinedText
+  from RankedQuestions rq
+  where
+    -- complicated predicate combining set membership, pattern checks, and null semantics
+    (
+      -- either hot recent posts or long-tail high-view questions without accepted answers
+      (rq.EngagementScore > 500 and rq.QuestionCreation > now() - interval '2 years')
+      or
+      (rq.ViewCount > 50000 and rq.AcceptedAnswerId is null)
+    )
+    and
+    -- exclude those with certain keywords in title or comment using ilike and negative logic, but allow tag-based overrides
+    (
+      (lower(coalesce(rq.Title,'')) not ilike '%dupe%' and lower(coalesce(rq.Title,'')) not ilike '%duplicate%')
+      or
+      exists (select 1 from Tags t where t.ExcerptPostId = rq.QuestionId and t.TagName ilike '%perf%')
+    )
+    and
+    -- null-safe check that filters out posts owned by low-rep or deleted accounts (OwnerId is null if deleted)
+    (rq.OwnerId is null or (select Reputation from Users u where u.Id = rq.OwnerId) > 100)
+)
+select
+  ss.*,
+  ua.RecentQuestions,
+  ua.RecentAnswers,
+  ua.RecentScoreSum,
+  ua.RankByScore,
+  tt.Snippet,
+  tt.Fingerprint,
+  plinks.LinkCount,
+  plinks.DistinctLinkTypes,
+  -- combine with a percentile within month to stress window functions
+  (percent_rank() over (partition by date_trunc('month', ss.QuestionCreation) order by ss.EngagementScore)) as MonthlyEngagementPercentile
+from SelectedSet ss
+left join UserAggregates ua on ua.UserId = ss.OwnerId
+left join TextTransforms tt on tt.Id = ss.QuestionId
+left join (
+  select pl.PostId,
+         count(*) as LinkCount,
+         string_agg(distinct pl.LinkType, ',' order by pl.LinkType) as DistinctLinkTypes
+  from PostLinksExpanded pl
+  group by pl.PostId
+) plinks on plinks.PostId = ss.QuestionId
+where
+  -- additional predicate: fuzzy keyword matching on combined text and modulo sampling for benchmark reproducibility
+  (
+    ss.CombinedText ilike '%performance%' 
+    or ss.CombinedText ilike '%benchmark%'
+    or (abs((ss.QuestionId::bigint % 7)) = 3)
+  )
+order by ss.EngagementScore desc nulls last, ss.AnswerCount desc, ss.QuestionCreation desc
+limit 250;

@@ -1,0 +1,139 @@
+WITH RecentQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AnswerCount,
+        u.DisplayName,
+        ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) AS rn
+    FROM
+        Posts p
+        JOIN PostTypes pt ON p.PostTypeId = pt.Id AND pt.Name = 'Question'
+        LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE
+        p.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '60 days'
+        AND (p.ClosedDate IS NULL OR p.CommunityOwnedDate IS NULL)
+        AND p.Tags IS NOT NULL
+),
+AnswersAgg AS (
+    SELECT
+        pa.ParentId AS QuestionId,
+        COUNT(*) AS AnswerCount,
+        MAX(pa.Score) AS MaxAnswerScore,
+        AVG(pa.Score) AS AvgAnswerScore,
+        COUNT(DISTINCT pa.OwnerUserId) AS DistinctAnswerers
+    FROM
+        Posts pa
+    WHERE
+        pa.PostTypeId = 2
+    GROUP BY
+        pa.ParentId
+),
+CommentersAgg AS (
+    SELECT
+        c.PostId AS QuestionId,
+        COUNT(DISTINCT c.UserId) AS DistinctCommenters,
+        SUM(CASE WHEN c.Score > 5 THEN 1 ELSE 0 END) AS HiScoreComments
+    FROM
+        Comments c
+    GROUP BY
+        c.PostId
+),
+BadgesAgg AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        MIN(b.Date) AS FirstBadgeDate
+    FROM
+        Badges b
+    GROUP BY
+        b.UserId
+),
+VotesAgg AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvoteCount,
+        COUNT(DISTINCT v.UserId) AS DistinctVoters
+    FROM
+        Votes v
+    GROUP BY
+        v.PostId
+),
+TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS rn
+    FROM
+        Tags t
+    WHERE
+        t.Count > 100
+)
+
+SELECT
+    rq.QuestionId,
+    rq.Title,
+    rq.CreationDate,
+    rq.Score,
+    rq.ViewCount,
+    regexp_replace(rq.Tags, '[<>]', '', 'g') AS CleanedTags,
+    COALESCE(a.AnswerCount, 0) AS AnswerCount,
+    COALESCE(a.MaxAnswerScore, 0) AS MaxAnswerScore,
+    COALESCE(a.AvgAnswerScore, 0) AS AvgAnswerScore,
+    COALESCE(a.DistinctAnswerers, 0) AS DistinctAnswerers,
+    COALESCE(ca.DistinctCommenters, 0) AS DistinctCommenters,
+    COALESCE(ca.HiScoreComments, 0) AS HiScoreComments,
+    COALESCE(va.UpvoteCount, 0) AS UpvoteCount,
+    COALESCE(va.DownvoteCount, 0) AS DownvoteCount,
+    COALESCE(va.DistinctVoters, 0) AS DistinctVoters,
+    rq.DisplayName AS OwnerDisplayName,
+    b.GoldBadges,
+    b.SilverBadges,
+    b.BronzeBadges,
+    b.FirstBadgeDate,
+    CASE
+        WHEN rq.Tags IS NOT NULL AND EXISTS (
+            SELECT 1 FROM TopTags tt
+            WHERE POSITION('<' || tt.TagName || '>' IN rq.Tags) > 0
+                AND tt.rn <= 10
+        ) THEN 'HotTag'
+        ELSE 'NotHotTag'
+    END AS TagPopularity,
+    CASE
+        WHEN rq.Score >= 10 AND COALESCE(a.AnswerCount, 0) >= 5 THEN 'HighlyEngaged'
+        WHEN rq.ViewCount >= 500 AND COALESCE(ca.DistinctCommenters, 0) > 5 THEN 'PopularDiscussed'
+        ELSE 'Normal'
+    END AS EngagementLevel
+FROM
+    RecentQuestions rq
+    LEFT JOIN AnswersAgg a ON rq.QuestionId = a.QuestionId
+    LEFT JOIN CommentersAgg ca ON rq.QuestionId = ca.QuestionId
+    LEFT JOIN VotesAgg va ON rq.QuestionId = va.PostId
+    LEFT JOIN BadgesAgg b ON rq.OwnerUserId = b.UserId
+WHERE
+    rq.rn <= 200
+    AND (
+        rq.Score >= 0
+        OR (COALESCE(a.AnswerCount, 0) > 0 AND rq.ViewCount > 100)
+    )
+ORDER BY
+    CASE
+        WHEN (CASE
+                WHEN rq.Tags IS NOT NULL AND EXISTS (
+                    SELECT 1 FROM TopTags tt2
+                    WHERE POSITION('<' || tt2.TagName || '>' IN rq.Tags) > 0
+                      AND tt2.rn <= 10
+                ) THEN 'HotTag'
+                ELSE 'NotHotTag'
+             END) = 'HotTag' THEN 1 ELSE 2
+    END,
+    rq.Score DESC,
+    rq.ViewCount DESC
+LIMIT 100;

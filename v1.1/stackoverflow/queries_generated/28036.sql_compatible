@@ -1,0 +1,106 @@
+WITH UserBadgeSummary AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate,
+        CASE 
+            WHEN COUNT(b.Id) OVER (PARTITION BY u.Id) > 100 THEN 'Power Badger'
+            WHEN COUNT(b.Id) BETWEEN 50 AND 100 THEN 'Active Badger'
+            ELSE 'Casual Badger'
+        END AS BadgeTier
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id
+),
+PostStats AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) AS TotalBountyEarned,
+        (SELECT MAX(Score) FROM Posts WHERE Id = p.AcceptedAnswerId) AS BestAnswerScore,
+        RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CommentCount DESC) AS CommentRank
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.CreationDate BETWEEN DATE '2020-01-01' AND DATE '2023-12-31'
+    GROUP BY p.OwnerUserId
+),
+ClosedPostAnalysis AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReason,
+        COUNT(*) OVER (PARTITION BY ph.PostId) AS CloseReopenCycles,
+        ph.CreationDate AS CloseDate,
+        LEAD(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS ReopenDate,
+        (SELECT array_agg((val::text)::int) FROM jsonb_array_elements_text(CAST(ph.Text AS jsonb)) AS arr(val)) AS DuplicateOriginals
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON CAST(ph.Comment AS integer) = crt.Id
+    WHERE ph.PostHistoryTypeId = 10
+)
+SELECT * FROM (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(ubs.GoldBadges, 0) * 3 + COALESCE(ubs.SilverBadges, 0) * 2 + COALESCE(ubs.BronzeBadges, 0) AS BadgePoints,
+        (COALESCE(ps.TotalBountyEarned,0) * 0.1) + (COALESCE(ps.BestAnswerScore,0) * 0.5) AS EngagementScore,
+        cpa.CloseReason,
+        CASE WHEN cpa.DuplicateOriginals IS NULL THEN 0 ELSE CARDINALITY(cpa.DuplicateOriginals) END AS DuplicateChainLength,
+        CONCAT(SUBSTRING(u.AboutMe FROM 1 FOR 50), '...') AS AboutPreview,
+        NULLIF(EXTRACT(DAY FROM (u.LastAccessDate - u.CreationDate)), 0) AS AccountActiveDays
+    FROM Users u
+    LEFT JOIN UserBadgeSummary ubs ON u.Id = ubs.UserId
+    LEFT JOIN PostStats ps ON u.Id = ps.OwnerUserId
+    LEFT JOIN ClosedPostAnalysis cpa ON cpa.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id)
+    LEFT JOIN PostLinks pl ON pl.PostId = cpa.PostId AND pl.LinkTypeId = 3
+    WHERE u.Reputation > 5000
+      AND ps.CommentRank = 1
+      AND (cpa.ReopenDate IS NULL OR cpa.ReopenDate > DATE '2023-01-01')
+      AND u.WebsiteUrl IS NOT NULL
+      AND (u.Location LIKE '%USA%' OR u.Location LIKE '%Europe%')
+    GROUP BY
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.AboutMe,
+        u.LastAccessDate,
+        u.CreationDate,
+        u.WebsiteUrl,
+        u.Location,
+        ubs.GoldBadges,
+        ubs.SilverBadges,
+        ubs.BronzeBadges,
+        ps.TotalBountyEarned,
+        ps.BestAnswerScore,
+        ps.CommentRank,
+        cpa.CloseReason,
+        cpa.DuplicateOriginals,
+        cpa.ReopenDate,
+        pl.PostId
+    HAVING COUNT(DISTINCT cpa.PostId) > 2 OR SUM(COALESCE(ps.TotalPosts,0)) > 50
+    ORDER BY 
+        u.Reputation DESC,
+        EngagementScore DESC
+    LIMIT 100
+) AS main
+EXCEPT
+SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    0 AS BadgePoints,
+    0 AS EngagementScore,
+    NULL AS CloseReason,
+    0 AS DuplicateChainLength,
+    NULL AS AboutPreview,
+    NULL AS AccountActiveDays
+FROM Users u
+WHERE EXISTS (
+    SELECT 1 
+    FROM Posts p 
+    WHERE p.OwnerUserId = u.Id 
+      AND p.PostTypeId = 6
+);

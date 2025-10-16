@@ -1,0 +1,131 @@
+-- {"query": "1486.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1646} 
+with RecursiveUserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct a.Id) filter (where a.PostTypeId = 2) as AnswerCount,
+        coalesce(sum(vt2.UpVotes),0) as TotalUpVotes,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        max(p.LastActivityDate) as LastPostActivity,
+        row_number() over (partition by u.Id order by bestScores.Score desc nulls last, p.CreationDate desc nulls last) as AnswerRanking,
+        lead(u.Reputation) over (order by u.Reputation desc) as NextHigherReputation,
+        lag(u.Reputation) over (order by u.Reputation desc) as PreviousLowerReputation
+    from 
+        Users u
+        left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+        left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+        left join (select p2.OwnerUserId, count(*) as UpVotes from Votes v2 join Posts p2 on v2.PostId = p2.Id and v2.VoteTypeId = 2 group by p2.OwnerUserId) vt2 on vt2.OwnerUserId = u.Id
+        left join Badges b on b.UserId = u.Id
+        left join lateral (
+            select postId, max(score) as Score 
+            from Posts
+            where OwnerUserId = u.Id AND PostTypeId = 2
+            group by postId
+        ) bestScores on true
+    group by u.Id, bestScores.Score, p.CreationDate, a.Id, u.Reputation, u.DisplayName
+),
+QuestionsWithDuplicateDetails as (
+    select q.Id as QuestionId, q.Title, q.CreationDate, q.Score, q.Tags,
+        array_agg(pl.RelatedPostId) filter (where lt.Name = 'Duplicate') as DuplicateIds,
+        coalesce(plDup.CountRelated, 0) as NumberOfDuplicates,
+        exists(
+            select 1 from PostLinks pl2
+            where pl2.PostId = q.Id
+            and pl2.LinkTypeId = (select Id from LinkTypes where Name = 'Duplicate')
+        ) as IsMarkedDuplicate,
+        q.AcceptedAnswerId
+    from Posts q
+    left join PostLinks pl on pl.PostId = q.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    left join lateral (
+        select count(*) as CountRelated
+        from PostLinks pl3
+        where pl3.PostId = q.Id and pl3.LinkTypeId = (select Id from LinkTypes where Name = 'Duplicate')
+    ) plDup on true
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.CreationDate, q.Score, q.Tags, q.AcceptedAnswerId, plDup.CountRelated
+), 
+AnswersWithCommentStats AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId,
+        a.Score AS AnswerScore,
+        count(distinct c.Id) AS CommentCount,
+        count(distinct c.Score) filter ( where c.Score >= 1) AS PosComments,
+        count(distinct c.Id) filter ( where c.UserId IS NULL) AS AnonymousComments,
+        max(c.CreationDate) as LastCommentDate
+    FROM Posts a
+    LEFT JOIN Comments c ON c.PostId = a.Id
+    WHERE a.PostTypeId = 2
+    GROUP BY a.Id, a.ParentId, a.OwnerUserId, a.Score
+),
+-- Get users with last comment within 30 days on their answer or question
+RecentAnswererComment AS (
+    SELECT DISTINCT a.OwnerUserId, max(c.CreationDate) over (partition by a.OwnerUserId) as LastRecentComment
+    FROM AnswersWithCommentStats a 
+    LEFT JOIN Comments c ON c.PostId = a.AnswerId
+    WHERE c.CreationDate > current_date - interval '30 days'
+),
+UserPosterStats AS (
+    select
+        u.Id,
+        u.DisplayName,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.TotalUpVotes,
+        ua.GoldBadges, ua.SilverBadges, ua.BronzeBadges,
+        coalesce((select avg(Score) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 2), 0) as AvgAnswerScore,
+        exists(select 1 from RecentAnswererComment r where r.OwnerUserId = u.Id) as HasRecentAnswerComment,
+        u.Reputation
+    from Users u
+    join RecursiveUserActivity ua on ua.UserId = u.Id
+),
+ClosedQuestionsWithReason AS (
+    select ph.PostId, cr.Name as CloseReasonName, ph.CreationDate as CloseTimestamp 
+    from PostHistory ph
+    join CloseReasonTypes cr on cr.Id = convert(int, ph.Comment::int, 0)
+    where ph.PostHistoryTypeId = 10
+)
+
+select 
+    q.Title,
+    q.CreationDate,
+    q.Score,
+    q.NumberOfDuplicates,
+    q.IsMarkedDuplicate,
+    array_to_string( string_to_array(substring(q.Tags from 2 for char_length(q.Tags)-2), '><'), ', ') as TagList,
+    count(distinct a.AnswerId) as NumberOfAnswers,
+    avg(a.AnswerScore) as AvgAnswerScore,
+    max(a.AnswerScore) as MaxAnswerScore,
+    cpp.CloseReasonName,
+    pg.Reputation as PostOwnerReputation,
+    ugs.QuestionCount,
+    ugs.AnswerCount,
+    ugs.GoldBadges,
+    ugs.SilverBadges,
+    ugs.BronzeBadges,
+    ugs.AvgAnswerScore as UserAvgAnswerScore,
+    case when q.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer,
+    concat_ws(' | ',
+        concat('Dup:', coalesce(q.NumberOfDuplicates::text, '0')),
+        concat('Ans:', count(distinct a.AnswerId)::text),
+        concat('GoldBadges:', ugs.GoldBadges::text),
+        concat('AgeDays:', floor(EXTRACT(epoch FROM current_timestamp - q.CreationDate)/86400)::text)
+    ) as SummaryStats,
+    dense_rank() over (order by q.Score desc NULLS LAST, numberOfDuplicates desc NULLS LAST) as PopularityRank
+from QuestionsWithDuplicateDetails q
+left join AnswersWithCommentStats a on a.QuestionId = q.QuestionId
+left join Users pg on pg.Id = (select OwnerUserId from Posts p where p.Id = q.QuestionId)
+left join UserPosterStats ugs ON ugs.Id = pg.Id
+left join ClosedQuestionsWithReason cpp ON cpp.PostId = q.QuestionId
+where q.Score >= 10
+group by q.Title, q.CreationDate, q.Score, q.NumberOfDuplicates, q.IsMarkedDuplicate, q.Tags, q.AcceptedAnswerId, cpp.CloseReasonName, pg.Reputation,
+         ugs.QuestionCount, ugs.AnswerCount, ugs.GoldBadges, ugs.SilverBadges, ugs.BronzeBadges, ugs.AvgAnswerScore
+having max(a.AnswerScore) > 5 or q.IsMarkedDuplicate = true
+order by PopularityRank, NumberOfDuplicates desc
+limit 50;

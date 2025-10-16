@@ -1,0 +1,66 @@
+-- {"query": "13041.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-premier", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2142, "output_tokens": 562} 
+
+WITH TopUserScores AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        SUM(COALESCE(p.Score, 0)) AS TotalScore,
+        RANK() OVER (ORDER BY SUM(COALESCE(p.Score, 0)) DESC) AS UserRank
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    WHERE 
+        p.PostTypeId IN (1, 2) AND 
+        p.CreationDate > CURRENT_DATE - INTERVAL '1 year'
+    GROUP BY 
+        u.Id, u.DisplayName
+),
+RecentActivity AS (
+    SELECT
+        ph.PostId,
+        COUNT(*) AS ActivityCount
+    FROM
+        PostHistory ph
+    WHERE
+        ph.CreationDate > CURRENT_DATE - INTERVAL '1 month'
+    GROUP BY
+        ph.PostId
+),
+FinalResults AS (
+    SELECT 
+        tus.Id,
+        tus.DisplayName,
+        tus.TotalScore,
+        ra.ActivityCount,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        ROW_NUMBER() OVER (PARTITION BY tus.UserRank ORDER BY ra.ActivityCount DESC) AS RankWithinTier
+    FROM
+        TopUserScores tus
+    LEFT JOIN
+        RecentActivity ra ON tus.Id = (SELECT OwnerUserId FROM Posts WHERE Id = ra.PostId)
+    LEFT JOIN
+        Badges b ON tus.Id = b.UserId AND b.Class = 1
+    WHERE
+        tus.UserRank <= 100
+    GROUP BY
+        tus.Id, tus.DisplayName, tus.TotalScore, ra.ActivityCount
+)
+SELECT 
+    fr.Id,
+    fr.DisplayName,
+    fr.TotalScore,
+    COALESCE(fr.ActivityCount, 0) AS RecentActivity,
+    COALESCE(fr.GoldBadges, 0) AS GoldBadges,
+    fr.RankWithinTier,
+    CASE 
+        WHEN fr.GoldBadges > 0 THEN 'High Achiever'
+        WHEN fr.ActivityCount > 50 THEN 'Active Contributor'
+        ELSE 'Regular User'
+    END AS UserCategory
+FROM
+    FinalResults fr
+WHERE
+    fr.RankWithinTier <= 10
+ORDER BY
+    fr.TotalScore DESC, fr.RecentActivity DESC;

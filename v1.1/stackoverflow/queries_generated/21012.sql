@@ -1,0 +1,138 @@
+-- {"query": "21012.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2168, "output_tokens": 1452} 
+
+WITH user_activity AS (
+    SELECT 
+        u.Id AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS user_creation,
+        COUNT(DISTINCT p.Id) AS post_count,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS question_count,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS answer_count,
+        AVG(p.Score) AS avg_post_score,
+        MAX(p.LastActivityDate) AS last_activity,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR POSITION('><' IN p.Tags) - 2), ', ') AS top_tags
+    FROM Users u
+    LEFT OUTER JOIN Posts p ON u.Id = p.OwnerUserId 
+        AND p.PostTypeId IN (1, 2) 
+        AND p.CreationDate > u.CreationDate 
+        AND p.Score > (u.Reputation * 0.001)
+    WHERE u.Reputation > 100
+        AND (u.Location IS NULL OR u.Location != '')
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) > 5
+),
+voted_posts AS (
+    SELECT 
+        v.PostId,
+        v.UserId,
+        v.VoteTypeId,
+        COUNT(*) OVER (PARTITION BY v.PostId, v.VoteTypeId) AS vote_count,
+        ROW_NUMBER() OVER (PARTITION BY v.UserId ORDER BY v.CreationDate DESC) AS vote_rank
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2, 3)  -- Upvotes and downvotes
+        AND v.CreationDate > CURRENT_DATE - INTERVAL '1 year'
+),
+active_controversy AS (
+    SELECT 
+        vp.PostId,
+        vp.UserId,
+        (SUM(CASE WHEN vp.VoteTypeId = 2 THEN 1 ELSE 0 END) - 
+         SUM(CASE WHEN vp.VoteTypeId = 3 THEN 1 ELSE 0 END)) AS net_votes,
+        vp.vote_count,
+        FIRST_VALUE(vp.CreationDate) OVER (PARTITION BY vp.PostId ORDER BY vp.CreationDate) AS first_vote,
+        LAST_VALUE(vp.CreationDate) OVER (PARTITION BY vp.PostId ORDER BY vp.CreationDate 
+                                          ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS last_vote
+    FROM voted_posts vp
+    WHERE vp.vote_rank <= 10  -- Only recent votes per user
+    GROUP BY vp.PostId, vp.UserId, vp.vote_count
+    HAVING ABS(net_votes) > 5 OR vp.vote_count > 20
+),
+linked_questions AS (
+    SELECT 
+        pl.PostId,
+        pl.RelatedPostId,
+        COUNT(*) AS link_count,
+        STRING_AGG(DISTINCT t.TagName, ' | ') AS related_tags
+    FROM PostLinks pl
+    INNER JOIN Tags t ON pl.RelatedPostId = t.ExcerptPostId
+    WHERE pl.LinkTypeId = 1  -- Linked posts
+        AND pl.CreationDate > CURRENT_DATE - INTERVAL '6 months'
+    GROUP BY pl.PostId, pl.RelatedPostId
+    HAVING COUNT(*) > 1
+)
+SELECT 
+    ua.user_id,
+    ua.DisplayName AS user_name,
+    ua.Reputation AS user_rep,
+    ua.post_count,
+    COALESCE(ua.question_count, 0) AS questions_asked,
+    COALESCE(ua.answer_count, 0) AS answers_given,
+    ROUND(COALESCE(ua.avg_post_score, 0), 2) AS avg_score,
+    DATEDIFF('day', ua.user_creation, CURRENT_DATE) AS days_active,
+    
+    -- Complex calculation: engagement ratio
+    CASE 
+        WHEN ua.post_count = 0 THEN 0
+        WHEN ac.net_votes IS NULL THEN ua.Reputation / GREATEST(ua.post_count, 1)
+        ELSE (ua.Reputation + ABS(ac.net_votes)) / GREATEST(ua.post_count, 1)
+    END AS engagement_score,
+    
+    -- NULL-aware tag analysis
+    CASE 
+        WHEN ua.top_tags IS NULL OR LENGTH(ua.top_tags) = 0 THEN 'No tags'
+        WHEN LENGTH(ua.top_tags) > 100 THEN SUBSTRING(ua.top_tags, 1, 100) || '...'
+        ELSE ua.top_tags
+    END AS tag_summary,
+    
+    -- Window function for peer comparison
+    ua.Reputation - AVG(ua.Reputation) OVER (ORDER BY ua.last_activity DESC 
+                                              ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) AS rep_vs_peers,
+    
+    -- Set operation simulation via UNION in CTE (but using complex join here)
+    COALESCE(lq.link_count, 0) AS external_links_made,
+    ac.vote_count AS controversial_votes,
+    
+    -- String manipulation with NULL handling
+    CONCAT(
+        COALESCE(ua.Location, 'Unknown'), 
+        ' | Active: ', 
+        EXTRACT(YEAR FROM (CURRENT_DATE - ua.last_activity)) || ' yrs'
+    ) AS profile_info,
+    
+    -- Correlated subquery for badge density
+    (SELECT COUNT(*) 
+     FROM Badges b 
+     WHERE b.UserId = ua.user_id 
+       AND b.Date > ua.user_creation 
+       AND b.Class = 1  -- Gold badges only
+    ) AS gold_badges_earned,
+    
+    -- Complex predicate with multiple conditions
+    CASE 
+        WHEN ua.post_count > 50 AND ac.net_votes < -10 THEN 'High volume, negative reception'
+        WHEN lq.link_count > 5 AND ua.Reputation > 5000 THEN 'Network influencer'
+        WHEN ua.question_count > ua.answer_count * 2 THEN 'Question dominant'
+        ELSE 'Balanced contributor'
+    END AS contributor_type
+    
+FROM user_activity ua
+LEFT OUTER JOIN active_controversy ac ON ua.user_id = ac.UserId
+LEFT OUTER JOIN linked_questions lq ON ua.user_id = lq.PostId
+LEFT OUTER JOIN Posts recent_posts ON ua.user_id = recent_posts.OwnerUserId 
+    AND recent_posts.CreationDate = (
+        SELECT MAX(p2.CreationDate) 
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = ua.user_id 
+          AND p2.PostTypeId = 1
+    )
+WHERE ua.days_active > 30
+    AND (ac.net_votes IS NULL OR ABS(ac.net_votes) > 2)
+    AND NOT EXISTS (
+        SELECT 1 FROM PostHistory ph 
+        WHERE ph.UserId = ua.user_id 
+          AND ph.PostHistoryTypeId = 12  -- Deleted posts
+          AND ph.CreationDate > CURRENT_DATE - INTERVAL '1 year'
+    )
+ORDER BY engagement_score DESC, ua.last_activity DESC
+LIMIT 100;

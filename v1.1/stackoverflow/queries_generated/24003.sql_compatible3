@@ -1,0 +1,88 @@
+WITH
+    post_votes AS (
+        SELECT
+            PostId,
+            SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+            SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+            MAX(CASE WHEN VoteTypeId = 1 THEN 1 ELSE 0 END) AS accepted
+        FROM Votes
+        GROUP BY PostId
+    ),
+    post_scores AS (
+        SELECT
+            p.Id          AS PostId,
+            p.OwnerUserId,
+            p.PostTypeId,
+            p.Score,
+            COALESCE(
+                -- split tags like '<tag1><tag2>' into array ['tag1','tag2']
+                NULLIF(regexp_split_to_table(p.Tags, '><'), '')::text,
+                ARRAY[]::text
+            ) AS TagArray,
+            v.upvotes,
+            v.downvotes,
+            v.accepted
+        FROM Posts p
+        LEFT JOIN post_votes v ON v.PostId = p.Id
+    ),
+    user_totals AS (
+        SELECT
+            u.Id           AS UserId,
+            u.DisplayName,
+            u.Reputation,
+            SUM(CASE WHEN ps.PostTypeId = 2 THEN ps.Score ELSE 0 END) AS answer_score,
+            COUNT(CASE WHEN ps.PostTypeId = 2 THEN 1 END)            AS answers,
+            COUNT(CASE WHEN ps.PostTypeId = 1 THEN 1 END)            AS questions,
+            SUM(COALESCE(ps.upvotes, 0)) AS total_upvotes
+        FROM Users u
+        LEFT JOIN post_scores ps ON ps.OwnerUserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+    combined AS (
+        SELECT UserId, answer_score AS total_score
+        FROM user_totals
+        WHERE answers > 0
+        UNION ALL
+        SELECT UserId, questions * 10 AS total_score
+        FROM user_totals
+        WHERE questions > 0
+    ),
+    ranked AS (
+        SELECT
+            UserId,
+            total_score,
+            ROW_NUMBER() OVER (ORDER BY total_score DESC) AS rnk
+        FROM combined
+    )
+SELECT
+    r.UserId,
+    u.DisplayName,
+    u.Reputation,
+    r.total_score,
+    r.rnk,
+    (SELECT STRING_AGG(tag, ', ') FROM (
+        SELECT tag
+        FROM post_scores ps
+        CROSS JOIN LATERAL (
+            SELECT unnest(ps.TagArray) AS tag
+        ) AS t
+        WHERE ps.OwnerUserId = r.UserId
+          AND ps.PostTypeId = 1
+        GROUP BY tag
+        ORDER BY COUNT(*) DESC
+        LIMIT 3
+    ) sub) AS top_tags,
+    CASE WHEN COALESCE(ut.answers, 0) = 0 THEN NULL
+         ELSE 100.0 * (
+             SELECT COUNT(*) FROM Posts p
+             WHERE p.OwnerUserId = r.UserId
+               AND p.PostTypeId = 2
+               AND p.Id IN (SELECT AcceptedAnswerId FROM Posts WHERE AcceptedAnswerId IS NOT NULL)
+         ) / ut.answers
+    END AS accepted_pct
+FROM ranked r
+JOIN Users u ON u.Id = r.UserId
+LEFT JOIN user_totals ut ON ut.UserId = r.UserId
+WHERE r.rnk <= 20
+GROUP BY r.UserId, u.DisplayName, u.Reputation, r.total_score, r.rnk, ut.answers
+ORDER BY r.rnk;

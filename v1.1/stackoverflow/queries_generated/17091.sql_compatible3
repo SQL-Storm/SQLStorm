@@ -1,0 +1,205 @@
+WITH UserActivityMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        EXTRACT(YEAR FROM u.CreationDate) AS JoinYear,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS AvgPostScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) FILTER (WHERE p.Score > 0) AS MedianPositiveScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 1000
+        AND u.CreationDate < CAST('2024-10-01' AS date) - INTERVAL '365 days'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, EXTRACT(YEAR FROM u.CreationDate)
+),
+TagExpertise AS (
+    /* split Tags like '<tag1><tag2>' into rows in a dialect-agnostic way using a simple numbers approach */
+    -- create a numbers CTE up to a reasonable max number of tags per post (e.g., 10)
+    numbers AS (
+        SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5
+        UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10
+    ),
+    base AS (
+        SELECT
+            p.OwnerUserId,
+            TRIM(BOTH '<>' FROM p.Tags) AS AllTags,
+            p.Id AS PostId,
+            p.Score
+        FROM Posts p
+        WHERE p.Tags IS NOT NULL 
+            AND p.OwnerUserId IS NOT NULL
+            AND p.Score > 0
+    ),
+    split AS (
+        SELECT
+            b.OwnerUserId,
+            -- extract the Nth tag by finding positions of '><'
+            CASE
+                WHEN POSITION('><' IN b.AllTags) = 0 THEN b.AllTags
+                ELSE
+                    -- get tag by splitting on '><' using nested substr/position
+                    -- extract the nth piece by iteratively removing previous pieces
+                    -- compute start position for nth tag
+                    CASE
+                        WHEN n.n = 1 THEN
+                            CASE WHEN POSITION('><' IN b.AllTags) = 0 THEN b.AllTags
+                                 ELSE SUBSTR(b.AllTags, 1, POSITION('><' IN b.AllTags) - 1) END
+                        ELSE
+                            -- remove first n-1 tags and get up to next delimiter
+                            CASE
+                                WHEN POSITION('><' IN b.AllTags) = 0 THEN b.AllTags
+                                ELSE
+                                    SUBSTR(
+                                      b.AllTags,
+                                      ( 
+                                        -- start: position after (n-1)th delimiter
+                                        COALESCE(
+                                          NULLIF(
+                                            (SELECT (SUM(LENGTH(part)+2) - 2) + 1 FROM (
+                                                SELECT SUBSTR(b.AllTags,
+                                                              CASE WHEN idx=1 THEN 1 ELSE (SELECT POSITIONS.pos + 3 FROM (VALUES (1)) AS v) END,
+                                                              CASE WHEN POSITION('><' IN b.AllTags)=0 THEN LENGTH(b.AllTags) ELSE POSITION('><' IN b.AllTags)-1 END
+                                                             )
+                                                FROM (VALUES (1)) AS dummy(idx)
+                                            ) ), ''), 1)
+                                        ,1)
+                                      ,1),
+                                      1000
+                                    )
+                            END
+                    END
+            END AS Tag,
+            b.PostId,
+            b.Score
+        FROM base b
+        CROSS JOIN numbers n
+        WHERE n.n <= 10
+    ),
+    -- simpler, more portable split: rely on repetitive substring extraction by searching delimiters progressively.
+    cleaned AS (
+        SELECT
+            s.OwnerUserId,
+            TRIM(BOTH ' ' FROM TRIM(BOTH '<>' FROM s.Tag)) AS Tag,
+            s.PostId,
+            s.Score
+        FROM split s
+        WHERE s.Tag IS NOT NULL AND s.Tag <> ''
+    )
+    SELECT
+        c.OwnerUserId,
+        c.Tag,
+        COUNT(*) AS TagPostCount,
+        SUM(c.Score) AS TagTotalScore,
+        ROW_NUMBER() OVER (PARTITION BY c.OwnerUserId ORDER BY SUM(c.Score) DESC) AS TagRank
+    FROM cleaned c
+    GROUP BY c.OwnerUserId, c.Tag
+),
+RecentEngagement AS (
+    SELECT 
+        ph.UserId,
+        COUNT(DISTINCT ph.PostId) AS EditedPosts,
+        COUNT(DISTINCT CASE 
+            WHEN ph.PostHistoryTypeId IN (4,5,6) 
+            AND ph.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '90 days' 
+            THEN ph.PostId 
+        END) AS RecentEdits,
+        COALESCE(STRING_AGG(DISTINCT cr.Name, ', '), '') AS CloseReasonTypes
+    FROM PostHistory ph
+    LEFT JOIN LATERAL (
+        SELECT crt.Name
+        FROM CloseReasonTypes crt
+        WHERE crt.Id = CAST(ph.Comment AS integer)
+        LIMIT 1
+    ) cr ON ph.PostHistoryTypeId = 10 AND ph.Comment ~ '^[0-9]+$'
+    WHERE ph.UserId IS NOT NULL
+    GROUP BY ph.UserId
+),
+BadgeAchievements AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate,
+        COALESCE(STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.TagBased = TRUE), 'None') AS TagBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+NetworkAnalysis AS (
+    SELECT 
+        c.UserId AS CommenterUserId,
+        p.OwnerUserId AS PostOwnerId,
+        COUNT(*) AS InteractionCount,
+        AVG(c.Score) AS AvgCommentScore,
+        DENSE_RANK() OVER (PARTITION BY c.UserId ORDER BY COUNT(*) DESC) AS InteractionRank
+    FROM Comments c
+    INNER JOIN Posts p ON c.PostId = p.Id
+    WHERE c.UserId IS NOT NULL 
+        AND p.OwnerUserId IS NOT NULL
+        AND c.UserId != p.OwnerUserId
+    GROUP BY c.UserId, p.OwnerUserId
+)
+SELECT 
+    uam.Id,
+    COALESCE(uam.DisplayName, 'User' || CAST(uam.Id AS varchar)) AS DisplayName,
+    uam.Reputation,
+    uam.JoinYear,
+    uam.TotalPosts,
+    uam.QuestionCount,
+    uam.AnswerCount,
+    ROUND(CAST(uam.AvgPostScore AS numeric), 2) AS AvgPostScore,
+    COALESCE(uam.MedianPositiveScore, 0) AS MedianPositiveScore,
+    COALESCE(te.Tag, 'No Tags') AS TopTag,
+    COALESCE(te.TagPostCount, 0) AS TopTagPostCount,
+    COALESCE(te.TagTotalScore, 0) AS TopTagScore,
+    COALESCE(re.EditedPosts, 0) AS TotalEditedPosts,
+    COALESCE(re.RecentEdits, 0) AS RecentEditCount,
+    CASE 
+        WHEN re.CloseReasonTypes IS NULL OR re.CloseReasonTypes = '' 
+        THEN 'No Closures' 
+        ELSE re.CloseReasonTypes 
+    END AS CloseReasonHistory,
+    COALESCE(ba.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ba.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ba.BronzeBadges, 0) AS BronzeBadges,
+    ba.TagBadges,
+    CASE 
+        WHEN ba.LastBadgeDate > CAST('2024-10-01' AS date) - INTERVAL '30 days' THEN 'Active'
+        WHEN ba.LastBadgeDate > CAST('2024-10-01' AS date) - INTERVAL '180 days' THEN 'Moderate'
+        ELSE 'Inactive'
+    END AS BadgeActivity,
+    (SELECT COUNT(DISTINCT na.PostOwnerId) 
+     FROM NetworkAnalysis na 
+     WHERE na.CommenterUserId = uam.Id AND na.InteractionRank <= 5) AS TopInteractionPartners,
+    CASE 
+        WHEN uam.Reputation > 50000 THEN 'Elite'
+        WHEN uam.Reputation > 10000 THEN 'Expert'
+        WHEN uam.Reputation > 5000 THEN 'Advanced'
+        ELSE 'Intermediate'
+    END AS UserTier,
+    RANK() OVER (ORDER BY uam.Reputation * LOG(GREATEST(uam.TotalPosts, 1)) DESC) AS EngagementRank
+FROM UserActivityMetrics uam
+LEFT JOIN TagExpertise te ON uam.Id = te.OwnerUserId AND te.TagRank = 1
+LEFT JOIN RecentEngagement re ON uam.Id = re.UserId
+LEFT JOIN BadgeAchievements ba ON uam.Id = ba.UserId
+WHERE (
+    EXISTS (
+        SELECT 1 
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = uam.Id 
+            AND p2.Score > (
+                SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY Score) 
+                FROM Posts 
+                WHERE PostTypeId = p2.PostTypeId AND Score IS NOT NULL
+            )
+    )
+    OR uam.TotalPosts > 50
+)
+ORDER BY 
+    EngagementRank,
+    uam.Reputation DESC,
+    uam.TotalPosts DESC
+LIMIT 100;

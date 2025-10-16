@@ -1,0 +1,69 @@
+WITH RankedUserPosts AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.Score,
+        p.PostTypeId,
+        p.CreationDate,
+        DENSE_RANK() OVER (
+            PARTITION BY u.Id 
+            ORDER BY p.Score DESC, p.CreationDate DESC
+        ) AS PostRank,
+        FIRST_VALUE(p.Title) OVER (
+            PARTITION BY u.Id 
+            ORDER BY p.Score DESC, p.CreationDate DESC
+        ) AS TopPostTitle
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId IN (1, 2)
+),
+TagAnalysis AS (
+    SELECT 
+        rup.UserId,
+        rup.DisplayName,
+        COUNT(DISTINCT rup.PostId) AS TotalPosts,
+        MAX(rup.Score) AS MaxPostScore,
+        AVG(NULLIF(rup.Score, 0)) AS AvgNonZeroScore,
+        STRING_AGG(
+            DISTINCT tag, ', '
+        ) AS TopTags
+    FROM RankedUserPosts rup
+    JOIN Posts p ON rup.PostId = p.Id
+    CROSS JOIN LATERAL (
+        SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR GREATEST(LENGTH(p.Tags) - 2, 0)), '><')) AS tag
+    ) t
+    WHERE rup.PostRank <= 5
+    GROUP BY rup.UserId, rup.DisplayName
+)
+SELECT 
+    ta.UserId,
+    ta.DisplayName,
+    ta.TotalPosts,
+    ta.MaxPostScore,
+    ROUND(ta.AvgNonZeroScore, 2) AS AvgScore,
+    ta.TopTags,
+    (SELECT COUNT(*) 
+     FROM Badges b 
+     WHERE b.UserId = ta.UserId 
+     AND b.Class = 1) AS GoldBadgeCount,
+    CASE 
+        WHEN ta.TotalPosts > 10 AND ta.MaxPostScore > 50 THEN 'High Impact'
+        WHEN ta.TotalPosts > 5 THEN 'Moderate Impact'
+        ELSE 'Low Impact'
+    END AS UserContributionLevel
+FROM TagAnalysis ta
+WHERE ta.TotalPosts > 3
+  AND (
+    EXISTS (
+      SELECT 1 
+      FROM Votes v 
+      WHERE v.UserId = ta.UserId 
+        AND v.VoteTypeId = 2
+    )
+    OR ta.MaxPostScore > 20
+  )
+ORDER BY 
+    ta.TotalPosts DESC, 
+    ta.MaxPostScore DESC
+LIMIT 100;

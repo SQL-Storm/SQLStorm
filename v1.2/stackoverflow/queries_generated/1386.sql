@@ -1,0 +1,117 @@
+-- {"query": "1386.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1237} 
+
+with RecursiveUserBadges as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        row_number() over (partition by u.Id order by b.Date desc nulls last) as LastBadgeNum,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName
+), 
+TopPostsCTE as (
+    select 
+        p.Id,
+        p.Title,
+        p.PostTypeId,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        u.DisplayName as OwnerDisplayName,
+        ROW_NUMBER() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc nulls last) as rn
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId in (1,2) -- questions or answers
+), 
+LatestCommentsPerPost as (
+    select distinct on (c.PostId)
+        c.PostId,
+        c.Id as CommentId,
+        c.UserId as CommenterUserId,
+        c.UserDisplayName as CommenterName,
+        c.Score as CommentScore,
+        c.CreationDate as CommentDate,
+        c.Text as CommentText
+    from Comments c
+    order by c.PostId, c.CreationDate desc, c.Score desc nulls last
+), 
+DuplicateQuestionPairs as (
+    select pl.PostId as DuplicateQuestionId, pl.RelatedPostId as OriginalQuestionId
+    from PostLinks pl
+    join Posts pdup on pl.PostId = pdup.Id and pdup.PostTypeId = 1 -- duplicate question
+    join Posts porig on pl.RelatedPostId = porig.Id and porig.PostTypeId = 1 -- original question
+    where pl.LinkTypeId = 3 -- duplicates
+), 
+UserActivityWindow as (
+    select 
+        u.Id as UserId, 
+        u.DisplayName,
+        v.VoteTypeId,
+        v.CreationDate,
+        count(*) over (partition by u.Id order by v.CreationDate 
+                       rows between 30 preceding and current row) as VotesLast30Days,
+        count(distinct ph.PostId) over (partition by u.Id order by ph.CreationDate
+                                       rows between 30 preceding and current row) as PostsEditedLast30Days
+    from Users u
+    left join Votes v on u.Id = v.UserId
+    left join PostHistory ph on u.Id = ph.UserId
+    where v.CreationDate > (now() - interval '60 day') or ph.CreationDate > (now() - interval '60 day')
+),
+FinalUsers as (
+    select 
+        r.UserId,
+        r.DisplayName,
+        r.GoldBadges, 
+        r.SilverBadges, 
+        r.BronzeBadges,
+        uaw.VotesLast30Days,
+        uaw.PostsEditedLast30Days,
+        (select count(*) from Posts p where p.OwnerUserId = r.UserId and p.PostTypeId = 1) as TotalQuestions,
+        (select count(*) from Posts p where p.OwnerUserId = r.UserId and p.PostTypeId = 2) as TotalAnswers,
+        (select coalesce(avg(p.Score), 0) from Posts p where p.OwnerUserId = r.UserId) as AvgPostScore,
+        case 
+            when uaw.VotesLast30Days is null then 0
+            else uaw.VotesLast30Days 
+        end as RecentVotes,
+        case 
+            when uaw.PostsEditedLast30Days is null then 0
+            else uaw.PostsEditedLast30Days
+        end as RecentEdits,
+        (COALESCE(r.GoldBadges*3,0) + COALESCE(r.SilverBadges*2,0) + COALESCE(r.BronzeBadges,0) + 
+        COALESCE(uaw.VotesLast30Days,0)*0.5 + COALESCE(uaw.PostsEditedLast30Days,0)*0.7) as UserEngagementScore
+    from RecursiveUserBadges r
+    left join UserActivityWindow uaw on r.UserId = uaw.UserId
+)
+select
+    f.DisplayName as UserName,
+    f.GoldBadges,
+    f.SilverBadges,
+    f.BronzeBadges,
+    f.TotalQuestions,
+    f.TotalAnswers,
+    cast(f.AvgPostScore as numeric(10,2)) as AveragePostScore,
+    f.RecentVotes,
+    f.RecentEdits,
+    f.UserEngagementScore,
+    p.Id as HighScorePostId,
+    p.Title as HighScorePostTitle,
+    p.Score as HighScorePostScore,
+    p.ViewCount as HighScorePostViews,
+    lc.CommentId as LatestTopCommentId,
+    lc.CommenterName as LatestTopCommenter,
+    substring(lc.CommentText for 100) || coalesce(' [...]', '') as SampleLatestTopComment,
+    dq.OriginalQuestionId,
+    dq.DuplicateQuestionId
+from FinalUsers f
+left join TopPostsCTE p on p.OwnerUserId = f.UserId and p.rn = 1
+left join LatestCommentsPerPost lc on lc.PostId = p.Id
+left join DuplicateQuestionPairs dq on dq.DuplicateQuestionId = p.Id
+where f.UserEngagementScore > 10
+order by f.UserEngagementScore desc
+limit 100;

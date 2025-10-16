@@ -1,0 +1,214 @@
+-- {"query": "712.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1815} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.TagPath || t2.TagName
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Count < r.Count AND t2.Id <> r.Id
+    WHERE array_length(r.TagPath, 1) < 3
+),
+UserBadgeStats AS (
+    SELECT
+        b.UserId,
+        COUNT(*) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        BOOL_OR(b.TagBased) AS HasTagBasedBadge,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostVotesWindow AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        v.VoteTypeId,
+        COUNT(v.Id) OVER (PARTITION BY p.Id, v.VoteTypeId) AS VoteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY v.CreationDate DESC NULLS LAST) AS LatestVoteRank
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId IN (1,2)
+),
+LatestPostVotes AS (
+    SELECT DISTINCT
+        PostId,
+        PostTypeId,
+        OwnerUserId,
+        CreationDate,
+        Score,
+        ViewCount,
+        Tags,
+        MAX(CASE WHEN VoteTypeId = 2 THEN VoteCount ELSE 0 END) AS UpVotes,
+        MAX(CASE WHEN VoteTypeId = 3 THEN VoteCount ELSE 0 END) AS DownVotes,
+        MAX(CASE WHEN VoteTypeId = 5 THEN VoteCount ELSE 0 END) AS FavoriteVotes
+    FROM PostVotesWindow
+    WHERE LatestVoteRank = 1 OR LatestVoteRank IS NULL
+    GROUP BY PostId, PostTypeId, OwnerUserId, CreationDate, Score, ViewCount, Tags
+),
+ComplexUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.AboutMe,
+        ub.TotalBadges,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.HasTagBasedBadge,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.Score) AS MaxPostScore,
+        MIN(p.Score) AS MinPostScore,
+        SUM(COALESCE(p.ViewCount,0)) AS TotalPostViews,
+        ROW_NUMBER() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC) AS RankInLocation
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN UserBadgeStats ub ON ub.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.AboutMe, ub.TotalBadges, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ub.HasTagBasedBadge
+),
+FilteredPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        lpv.UpVotes,
+        lpv.DownVotes,
+        lpv.FavoriteVotes,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS HistoryDate,
+        ph.Comment AS CloseReasonCode,
+        ph.UserId AS EditorUserId,
+        ph.UserDisplayName AS EditorDisplayName,
+        ph.Text AS HistoryText
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId IN (10, 11, 12, 13) -- Close/Reopen/Delete/Undelete
+    LEFT JOIN LatestPostVotes lpv ON p.Id = lpv.PostId
+    WHERE p.PostTypeId = 1 -- questions only
+      AND p.CreationDate >= NOW() - INTERVAL '2 years'
+),
+DuplicateLinkCounts AS (
+    SELECT
+        pl.PostId,
+        COUNT(CASE WHEN lt.Name = 'Duplicate' THEN 1 END) AS DuplicateLinksCount,
+        COUNT(CASE WHEN lt.Name = 'Linked' THEN 1 END) AS LinkedPostsCount
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    GROUP BY pl.PostId
+),
+FinalResult AS (
+    SELECT
+        fp.Id AS QuestionId,
+        fp.Title,
+        fp.CreationDate,
+        fp.Score,
+        fp.ViewCount,
+        fp.Tags,
+        fp.UpVotes,
+        fp.DownVotes,
+        fp.FavoriteVotes,
+        fp.PostHistoryTypeId,
+        fp.CloseReasonCode,
+        fp.EditorUserId,
+        fp.EditorDisplayName,
+        fp.HistoryDate,
+        dup.DuplicateLinksCount,
+        dup.LinkedPostsCount,
+        cu.DisplayName AS OwnerDisplayName,
+        cu.Reputation AS OwnerReputation,
+        cu.Location AS OwnerLocation,
+        cu.TotalBadges,
+        cu.GoldBadges,
+        cu.SilverBadges,
+        cu.BronzeBadges,
+        cu.HasTagBasedBadge,
+        cu.TotalPosts AS OwnerTotalPosts,
+        cu.TotalComments AS OwnerTotalComments,
+        cu.AvgPostScore AS OwnerAvgPostScore,
+        cu.MaxPostScore AS OwnerMaxPostScore,
+        cu.MinPostScore AS OwnerMinPostScore,
+        cu.TotalPostViews AS OwnerTotalPostViews,
+        cu.RankInLocation
+    FROM FilteredPosts fp
+    LEFT JOIN DuplicateLinkCounts dup ON dup.PostId = fp.Id
+    LEFT JOIN ComplexUserActivity cu ON cu.UserId = fp.EditorUserId
+    WHERE (
+        fp.CloseReasonCode IS NULL
+        OR fp.CloseReasonCode NOT IN ('101', '102', '103', '104', '105')
+        OR fp.PostHistoryTypeId IS NULL
+    )
+    AND fp.Score > COALESCE((SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY Score) FROM Posts WHERE PostTypeId = 1), 0)
+)
+SELECT
+    fr.QuestionId,
+    fr.Title,
+    fr.CreationDate,
+    fr.Score,
+    fr.ViewCount,
+    fr.Tags,
+    fr.UpVotes,
+    fr.DownVotes,
+    fr.FavoriteVotes,
+    fr.DuplicateLinksCount,
+    fr.LinkedPostsCount,
+    fr.OwnerDisplayName,
+    fr.OwnerReputation,
+    fr.OwnerLocation,
+    fr.TotalBadges,
+    fr.GoldBadges,
+    fr.SilverBadges,
+    fr.BronzeBadges,
+    fr.HasTagBasedBadge,
+    fr.OwnerTotalPosts,
+    fr.OwnerTotalComments,
+    fr.OwnerAvgPostScore,
+    fr.OwnerMaxPostScore,
+    fr.OwnerMinPostScore,
+    fr.OwnerTotalPostViews,
+    fr.RankInLocation,
+    LENGTH(fr.Title) - LENGTH(REPLACE(fr.Title, ' ', '')) + 1 AS TitleWordCount,
+    CASE
+        WHEN fr.ViewCount > 10000 THEN 'High Traffic'
+        WHEN fr.ViewCount BETWEEN 1000 AND 10000 THEN 'Medium Traffic'
+        ELSE 'Low Traffic'
+    END AS TrafficCategory,
+    CASE
+        WHEN fr.Score > 100 THEN 'Highly Rated'
+        WHEN fr.Score BETWEEN 50 AND 100 THEN 'Moderately Rated'
+        ELSE 'Low Rated'
+    END AS RatingCategory,
+    COALESCE(NULLIF(fr.Tags, ''), 'NoTags') AS NormalizedTags,
+    COALESCE(fr.CloseReasonCode, 'Open') AS CloseStatus
+FROM FinalResult fr
+ORDER BY fr.Score DESC, fr.ViewCount DESC
+LIMIT 100;

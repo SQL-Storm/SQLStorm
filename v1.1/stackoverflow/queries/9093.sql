@@ -1,0 +1,167 @@
+WITH
+RecentActivities AS (
+    SELECT
+        p.Id                               AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        COALESCE(u.Reputation, 0)          AS OwnerReputation,
+        p.Score,
+        p.ViewCount,
+        (
+            SELECT COUNT(*)
+            FROM Comments c
+            WHERE c.PostId = p.Id
+              AND c.Score > 0
+        )                                  AS PositiveComments,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.PostTypeId
+            ORDER BY p.CreationDate DESC
+        )                                   AS rn
+    FROM Posts p
+    LEFT JOIN Users u
+        ON p.OwnerUserId = u.Id
+    WHERE p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '30' DAY
+),
+FilteredActivities AS (
+    SELECT *
+    FROM RecentActivities ra
+    WHERE ra.PositiveComments > 2
+      AND ra.OwnerReputation > (
+          SELECT AVG(Reputation)
+          FROM Users
+          WHERE CreationDate < CAST('2024-10-01' AS date) - INTERVAL '1' YEAR
+      )
+),
+PostBadgeAgg AS (
+    SELECT
+        b.UserId,
+        MAX(b.Class)                                    AS MaxBadgeClass,
+        SUM(CASE WHEN b.TagBased = TRUE THEN 1 ELSE 0 END)  AS TagBadges,
+        SUM(CASE WHEN b.TagBased = FALSE THEN 1 ELSE 0 END) AS NamedBadges,
+        STRING_AGG(b.Name, ',' ORDER BY b.Date)           AS BadgeTrail
+    FROM Badges b
+    WHERE b.Date BETWEEN CAST('2024-10-01' AS date) - INTERVAL '1' YEAR AND CAST('2024-10-01' AS date)
+    GROUP BY b.UserId
+),
+AnswerStats AS (
+    SELECT
+        a.ParentId                                      AS QuestionId,
+        COUNT(*)                                        AS AnswerCount,
+        SUM(a.Score)                                    AS AnswerScoreSum,
+        AVG(CASE WHEN a.Score >= 0 THEN a.Score END)    AS AvgNonNegativeScore
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+Combined AS (
+    SELECT
+        fa.PostId,
+        fa.OwnerUserId,
+        fa.OwnerReputation,
+        fa.Score,
+        fa.ViewCount,
+        fa.PositiveComments,
+        p.Title,
+        p.Tags,
+        pa.AnswerCount,
+        pa.AnswerScoreSum,
+        pa.AvgNonNegativeScore,
+        p.AcceptedAnswerId,
+        COALESCE(pb.MaxBadgeClass, 4)                   AS MaxBadgeClass,
+        COALESCE(pb.TagBadges,   0)                     AS TagBadges,
+        COALESCE(pb.NamedBadges, 0)                     AS NamedBadges,
+        COALESCE(pb.BadgeTrail,  '')                    AS BadgeTrail
+    FROM FilteredActivities fa
+    JOIN Posts p
+        ON p.Id = fa.PostId
+    LEFT JOIN AnswerStats pa
+        ON pa.QuestionId = p.Id
+    FULL OUTER JOIN PostBadgeAgg pb
+        ON pb.UserId = fa.OwnerUserId
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM Votes v
+        WHERE v.PostId = p.Id
+          AND v.VoteTypeId = 3
+          AND v.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '7' DAY
+    )
+),
+FinalSet AS (
+    SELECT
+        c.PostId,
+        c.OwnerUserId,
+        c.OwnerReputation,
+        c.Score,
+        c.ViewCount,
+        c.PositiveComments,
+        c.Title,
+        c.Tags,
+        c.AnswerCount,
+        c.AnswerScoreSum,
+        c.AvgNonNegativeScore,
+        c.AcceptedAnswerId,
+        c.MaxBadgeClass,
+        c.TagBadges,
+        c.NamedBadges,
+        c.BadgeTrail,
+        CASE
+            WHEN c.AnswerCount IS NULL THEN 'NoAnswers'
+            WHEN c.AnswerCount = 0    THEN 'ZeroAnswers'
+            WHEN c.AnswerCount > 5    THEN 'PopularQuestion'
+            ELSE 'ModerateQuestion'
+        END                                        AS QuestionCategory,
+        LAG(c.ViewCount) OVER (ORDER BY c.OwnerReputation DESC) AS PrevViewOfHigherRep,
+        LEAD(c.Score)    OVER (ORDER BY c.PostId)             AS NextScore
+    FROM Combined c
+)
+SELECT
+    fs.PostId,
+    fs.Title,
+    COALESCE(
+        NULLIF(SUBSTRING(fs.Tags FROM 2 FOR 80), ''),
+        '<no tags>'
+    )                                             AS ShortTags,
+    fs.OwnerUserId,
+    fs.OwnerReputation,
+    fs.Score,
+    fs.ViewCount,
+    fs.PositiveComments,
+    (COALESCE(fs.AnswerCount, 0) + COALESCE(fs.AnswerScoreSum, 0)) AS ScoreBoost,
+    fs.MaxBadgeClass,
+    fs.TagBadges,
+    fs.NamedBadges,
+    fs.BadgeTrail,
+    fs.QuestionCategory,
+    fs.PrevViewOfHigherRep,
+    fs.NextScore
+FROM FinalSet fs
+WHERE (COALESCE(fs.AnswerCount, 0) + COALESCE(fs.AnswerScoreSum, 0)) > (
+    SELECT AVG(p.Score) * 0.5
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+)
+UNION
+SELECT
+    p.Id                                        AS PostId,
+    p.Title,
+    p.Tags,
+    u.Id                                        AS OwnerUserId,
+    u.Reputation,
+    p.Score,
+    p.ViewCount,
+    0                                           AS PositiveComments,
+    0                                           AS ScoreBoost,
+    0                                           AS MaxBadgeClass,
+    0                                           AS TagBadges,
+    0                                           AS NamedBadges,
+    ''                                          AS BadgeTrail,
+    'Legacy'                                    AS QuestionCategory,
+    NULL                                        AS PrevViewOfHigherRep,
+    NULL                                        AS NextScore
+FROM Posts p
+JOIN Users u
+    ON u.Id = p.OwnerUserId
+WHERE p.PostTypeId = 1
+  AND p.CreationDate < DATE '2008-01-01'
+ORDER BY OwnerReputation DESC NULLS LAST
+LIMIT 100 OFFSET 10;

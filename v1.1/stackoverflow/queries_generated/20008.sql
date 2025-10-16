@@ -1,0 +1,113 @@
+-- {"query": "20008.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1436} 
+
+WITH UserActivitySummary AS (
+    -- Identify prolific users: reputation > 1000, at least one gold badge, and >= 5 questions asked.
+    -- This CTE aggregates user-level statistics to pre-filter our main user group.
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.Location,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAsked
+    FROM
+        Users u
+    JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    JOIN
+        Badges b ON u.Id = b.UserId
+    WHERE
+        u.Reputation > 1000 AND u.AboutMe IS NOT NULL AND LENGTH(u.AboutMe) > 100
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+    HAVING
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) > 0
+        AND COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) >= 5
+),
+RankedAnswerMetrics AS (
+    -- For each question, rank its answers by score. Also calculate various answer-specific metrics using window functions.
+    SELECT
+        a.Id AS AnswerId,
+        a.OwnerUserId,
+        a.ParentId AS QuestionId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreationDate,
+        q.Title AS QuestionTitle,
+        q.Tags AS QuestionTags,
+        q.Score AS QuestionScore,
+        q.AcceptedAnswerId,
+        q.CreationDate AS QuestionCreationDate,
+        q.OwnerUserId AS QuestionOwnerId,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) / 3600.0 AS HoursToAnswer,
+        ROW_NUMBER() OVER(PARTITION BY a.OwnerUserId ORDER BY a.CreationDate) AS UserAnswerNumber,
+        RANK() OVER(PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRankInQuestion,
+        LAG(a.CreationDate, 1) OVER(PARTITION BY a.OwnerUserId ORDER BY a.CreationDate) as PreviousAnswerDate,
+        SUM(a.Score) OVER(PARTITION BY a.OwnerUserId ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeAnswerScore
+    FROM
+        Posts a
+    JOIN
+        Posts q ON a.ParentId = q.Id AND q.PostTypeId = 1
+    WHERE
+        a.PostTypeId = 2 -- It's an answer
+        AND a.OwnerUserId IS NOT NULL
+        AND a.DeletionDate IS NULL
+)
+-- Final Select: Combine the filtered users with their answer metrics, and perform further complex joins and calculations.
+-- This query finds the top 5 answers from our prolific users and gathers extensive details about the answer, the question, and the involved users.
+SELECT
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation AS AnswererReputation,
+    ram.QuestionId,
+    ram.AnswerId,
+    ram.AnswerScore,
+    ram.AnswerRankInQuestion,
+    COALESCE(aa.Score, 0) AS AcceptedAnswerScore,
+    ram.AnswerScore - COALESCE(aa.Score, 0) AS ScoreDiffFromAccepted,
+    ROUND(ram.HoursToAnswer::numeric, 2) AS HoursToAnswer,
+    -- Correlated subquery: Count comments on the answer made before the question was closed (if it was closed).
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = ram.AnswerId AND c.CreationDate < COALESCE(p_q.ClosedDate, '9999-12-31')) AS CommentsBeforeQuestionClose,
+    -- Complex CASE statement for categorization based on multiple conditions.
+    CASE
+        WHEN ram.AnswerId = ram.AcceptedAnswerId THEN 'Accepted Answer'
+        WHEN ram.AnswerScore > (SELECT AVG(Score) FROM Posts WHERE ParentId = ram.QuestionId AND DeletionDate IS NULL) THEN 'Above Average Score'
+        WHEN ram.HoursToAnswer < 1.0 THEN 'Quick Answer'
+        ELSE 'Standard Answer'
+    END AS AnswerCategory,
+    -- String manipulation and NULL logic to create a summary string.
+    CONCAT(
+        SUBSTRING(ram.QuestionTitle FROM 1 FOR 60),
+        '... (Tags: ',
+        REPLACE(REPLACE(SUBSTRING(ram.QuestionTags FROM 2 FOR LENGTH(ram.QuestionTags)-2), '><', ', '), '>', ''),
+        ')'
+    ) AS QuestionSummary,
+    -- Calculations using results from window functions.
+    EXTRACT(EPOCH FROM (ram.AnswerCreationDate - ram.PreviousAnswerDate)) / 86400.0 AS DaysSinceLastAnswer,
+    ram.CumulativeAnswerScore,
+    qu.DisplayName AS QuestionOwnerDisplayName,
+    qu.Reputation AS QuestionOwnerReputation
+FROM
+    UserActivitySummary uas
+JOIN
+    RankedAnswerMetrics ram ON uas.UserId = ram.OwnerUserId
+LEFT JOIN
+    Posts p_q ON ram.QuestionId = p_q.Id -- Join back to Posts for question details like ClosedDate
+LEFT JOIN
+    Posts aa ON ram.AcceptedAnswerId = aa.Id -- Join to get the accepted answer's details
+LEFT JOIN
+    Users qu ON ram.QuestionOwnerId = qu.Id -- Join to get question owner details
+WHERE
+    -- Use a subquery to filter for each user's top 5 highest-scoring answers overall.
+    ram.AnswerId IN (
+        SELECT ra_inner.AnswerId
+        FROM RankedAnswerMetrics ra_inner
+        WHERE ra_inner.OwnerUserId = uas.UserId
+        ORDER BY ra_inner.AnswerScore DESC, ra_inner.AnswerCreationDate DESC
+        LIMIT 5
+    )
+    AND ram.HoursToAnswer > 0 -- Exclude answers posted before the question (data anomalies)
+ORDER BY
+    uas.Reputation DESC,
+    uas.UserId ASC,
+    ram.AnswerScore DESC;

@@ -1,0 +1,145 @@
+WITH active_users AS (
+    SELECT u.Id, u.Reputation, u.CreationDate,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS rep_rank
+    FROM Users u
+    WHERE u.Reputation > 1000
+      AND u.LastAccessDate > CAST('2024-10-01' AS date) - INTERVAL '1 year'
+),
+post_stats AS (
+    SELECT p.Id AS post_id,
+           p.PostTypeId,
+           p.CreationDate AS post_creation,
+           COALESCE(p.Score, 0) + COALESCE(vs.upvotes, 0) - COALESCE(vs.downvotes, 0) AS net_score,
+           p.ViewCount,
+           p.AnswerCount,
+           p.CommentCount,
+           p.OwnerUserId,
+           p.LastEditorUserId,
+           p.Title,
+           p.Tags,
+           p.Body,
+           CASE 
+               WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN 'closed'
+               WHEN p.PostTypeId = 2 AND p.ParentId IS NULL THEN 'orphan_answer'
+               ELSE 'active'
+           END AS post_status,
+           STRING_AGG(DISTINCT SUBSTRING(t.TagName FROM 1 FOR 20), ', ') AS top_tags
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId, 
+               SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+               SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes
+        FROM Votes
+        WHERE VoteTypeId IN (2, 3)
+        GROUP BY PostId
+    ) vs ON p.Id = vs.PostId
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId AND pl.LinkTypeId = 3
+    LEFT JOIN Posts parent ON pl.RelatedPostId = parent.Id AND parent.PostTypeId = 1
+    LEFT JOIN (
+        SELECT Id, TagName FROM Tags 
+        WHERE Count > 100
+        ORDER BY Count DESC 
+        LIMIT 5
+    ) t ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE p.PostTypeId IN (1, 2)
+      AND (
+           p.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '2 years'
+           OR p.LastActivityDate > CAST('2024-10-01' AS date) - INTERVAL '6 months'
+      )
+    GROUP BY p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, 
+             p.AnswerCount, p.CommentCount, p.ClosedDate, p.ParentId, vs.upvotes, vs.downvotes,
+             p.OwnerUserId, p.LastEditorUserId, p.Title, p.Tags, p.Body
+),
+engagement_metrics AS (
+    SELECT au.Id AS user_id,
+           COUNT(DISTINCT ps.post_id) AS posts_contributed,
+           AVG(ps.net_score) AS avg_post_score,
+           SUM(ps.ViewCount) AS total_views,
+           SUM(CASE WHEN ps.PostTypeId = 1 THEN ps.AnswerCount ELSE 0 END) AS total_answers,
+           COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (5, 8) THEN ph.PostId END) AS total_edits,
+           MAX(ps.post_creation) AS latest_post,
+           DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT ps.post_id) DESC) AS engagement_rank
+    FROM active_users au
+    LEFT JOIN post_stats ps ON au.Id = ps.OwnerUserId OR au.Id = ps.LastEditorUserId
+    LEFT JOIN PostHistory ph ON (ps.post_id = ph.PostId OR au.Id = ph.UserId)
+        AND ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)
+    WHERE ps.post_creation IS NOT NULL
+      AND (au.Id = ps.OwnerUserId OR au.Id = ps.LastEditorUserId)
+    GROUP BY au.Id, au.Reputation, au.CreationDate
+    HAVING COUNT(DISTINCT ps.post_id) > 0
+),
+complex_posts AS (
+    SELECT ps.post_id,
+           ps.PostTypeId,
+           ps.post_creation,
+           ps.net_score,
+           ps.ViewCount,
+           ps.AnswerCount,
+           ps.CommentCount,
+           ps.OwnerUserId,
+           ps.LastEditorUserId,
+           ps.Title,
+           ps.Tags,
+           ps.Body,
+           ps.post_status,
+           ps.top_tags,
+           em.user_id,
+           em.posts_contributed,
+           em.avg_post_score,
+           em.total_views,
+           CASE 
+               WHEN ps.post_status = 'closed' AND ps.net_score < 0 THEN 'poor_closed'
+               WHEN ps.ViewCount > 10000 AND ps.AnswerCount >= 3 THEN 'popular'
+               WHEN ps.CommentCount > ps.AnswerCount * 2 THEN 'discussion_heavy'
+               ELSE 'standard'
+           END AS engagement_category,
+           LAG(ps.net_score) OVER (PARTITION BY em.user_id ORDER BY ps.post_creation) AS prev_post_score,
+           LEAD(ps.post_creation) OVER (PARTITION BY em.user_id ORDER BY ps.post_creation) AS next_post_date,
+           NTILE(4) OVER (ORDER BY ps.ViewCount DESC) AS view_quartile,
+           COALESCE(
+               (SELECT AVG(v.BountyAmount) 
+                FROM Votes v 
+                WHERE v.PostId = ps.post_id AND v.VoteTypeId = 8),
+               0
+           ) AS avg_bounty
+    FROM post_stats ps
+    INNER JOIN engagement_metrics em ON ps.OwnerUserId = em.user_id OR ps.LastEditorUserId = em.user_id
+    WHERE ps.post_status != 'orphan_answer'
+      AND (ps.net_score > -5 OR ps.ViewCount > 100)
+)
+SELECT cp.post_id,
+       cp.Title,
+       cp.top_tags,
+       cp.net_score,
+       cp.total_views,
+       cp.engagement_category,
+       cp.view_quartile,
+       cp.avg_bounty,
+       au.rep_rank,
+       au.Reputation,
+       cp.posts_contributed,
+       (cp.total_views / NULLIF(cp.posts_contributed, 0)) AS views_per_post,
+       CASE 
+           WHEN cp.prev_post_score IS NULL THEN 'first_post'
+           WHEN cp.net_score > cp.prev_post_score * 1.5 THEN 'improving'
+           WHEN cp.net_score < cp.prev_post_score * 0.5 THEN 'declining'
+           ELSE 'stable'
+       END AS score_trend,
+       DATE_PART('day', CAST(em.latest_post AS timestamp) - CAST(au.CreationDate AS timestamp)) AS user_age_days,
+       (LENGTH(cp.Tags) - LENGTH(REPLACE(cp.Tags, '>', ''))) AS tag_count,
+       SUBSTRING(cp.Body FROM 1 FOR 100) AS body_preview,
+       GREATEST(
+           COALESCE(em.total_edits / NULLIF(DATE_PART('day', CAST('2024-10-01' AS date) - CAST(au.CreationDate AS date)), 0), 0),
+           0.1
+       ) AS edits_per_day
+FROM complex_posts cp
+INNER JOIN active_users au ON cp.user_id = au.Id
+LEFT JOIN Posts p ON cp.post_id = p.Id
+LEFT JOIN engagement_metrics em ON cp.user_id = em.user_id
+WHERE cp.view_quartile <= 2
+  AND (cp.engagement_category = 'popular' 
+       OR (cp.engagement_category = 'discussion_heavy' AND (LENGTH(cp.Tags) - LENGTH(REPLACE(cp.Tags, '>', ''))) > 3))
+  AND au.rep_rank <= 100
+  AND cp.post_creation > CAST('2024-10-01' AS date) - INTERVAL '1 year'
+ORDER BY cp.total_views DESC, cp.net_score DESC
+LIMIT 50;

@@ -1,0 +1,388 @@
+-- {"query": "8032.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3303} 
+with recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    u.websiteurl,
+    u.upvotes,
+    u.downvotes,
+    coalesce(nullif(trim(u.location), ''), 'Unknown') as norm_location
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+badge_rollup as (
+  select
+    b.userid,
+    count(*) as total_badges,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+    max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+questions as (
+  select p.*
+  from posts p
+  where p.posttypeid = 1
+),
+answers as (
+  select p.*
+  from posts p
+  where p.posttypeid = 2
+),
+question_activity as (
+  select
+    q.id as question_id,
+    q.owneruserid as asker_id,
+    q.creationdate as question_date,
+    q.score as question_score,
+    q.viewcount as question_views,
+    q.title,
+    q.tags,
+    q.answercount,
+    q.favoritecount,
+    q.closeddate,
+    max(a.creationdate) as last_answer_date,
+    count(a.id) as total_answers,
+    sum(case when a.score > 0 then 1 else 0 end) as positive_answers,
+    sum(case when a.score < 0 then 1 else 0 end) as negative_answers
+  from questions q
+  left join answers a on a.parentid = q.id
+  group by q.id, q.owneruserid, q.creationdate, q.score, q.viewcount, q.title, q.tags, q.answercount, q.favoritecount, q.closeddate
+),
+dup_clusters as (
+  select
+    pl.relatedpostid as canonical_id,
+    count(*) filter (where pl.linktypeid = 3) as dup_count,
+    max(pl.creationdate) as last_dup_link_date
+  from postlinks pl
+  where pl.linktypeid = 3
+  group by pl.relatedpostid
+),
+edit_events as (
+  select
+    ph.postid,
+    min(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6)) as first_edit_date,
+    count(*) filter (where ph.posthistorytypeid in (4,5,6,24)) as total_edits,
+    count(*) filter (where ph.posthistorytypeid in (24)) as suggested_applies,
+    count(*) filter (where ph.posthistorytypeid in (10)) as close_votes_events
+  from posthistory ph
+  group by ph.postid
+),
+vote_agg as (
+  select
+    v.postid,
+    count(*) filter (where v.votetypeid = 2) as upvotes,
+    count(*) filter (where v.votetypeid = 3) as downvotes,
+    sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_amount_total,
+    max(v.creationdate) as last_vote_date
+  from votes v
+  group by v.postid
+),
+comment_stats as (
+  select
+    c.postid,
+    count(*) as comment_count,
+    max(c.score) as max_comment_score,
+    avg(c.score) as avg_comment_score,
+    max(c.creationdate) as last_comment_date
+  from comments c
+  group by c.postid
+),
+tag_explode as (
+  select
+    q.id as post_id,
+    unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')) as tag
+  from questions q
+  where q.tags is not null and length(q.tags) >= 2
+),
+tag_rank as (
+  select
+    t.post_id,
+    t.tag,
+    row_number() over (partition by t.post_id order by tg.count desc nulls last, t.tag) as tag_rank_by_popularity
+  from tag_explode t
+  left join tags tg on tg.tagname = t.tag
+),
+accepted_answer_latency as (
+  select
+    q.id as question_id,
+    q.creationdate as q_created,
+    a.id as accepted_id,
+    a.creationdate as a_created,
+    extract(epoch from (a.creationdate - q.creationdate)) / 3600.0 as hours_to_accept
+  from questions q
+  join posts a on a.id = q.acceptedanswerid
+),
+user_question_windows as (
+  select
+    q.owneruserid as user_id,
+    q.id as question_id,
+    q.creationdate,
+    count(*) over (partition by q.owneruserid) as total_questions_by_user,
+    row_number() over (partition by q.owneruserid order by q.creationdate) as nth_question_for_user,
+    avg(q.score) over (partition by q.owneruserid) as avg_q_score_by_user
+  from questions q
+),
+top_recent_questions as (
+  select
+    qa.question_id,
+    qa.asker_id,
+    qa.question_date,
+    qa.question_score,
+    qa.question_views,
+    qa.title,
+    qa.tags,
+    qa.total_answers,
+    qa.positive_answers,
+    qa.negative_answers,
+    dr.dup_count,
+    dr.last_dup_link_date,
+    ee.first_edit_date,
+    ee.total_edits,
+    ee.suggested_applies,
+    ee.close_votes_events,
+    va.upvotes,
+    va.downvotes,
+    va.bounty_amount_total,
+    va.last_vote_date,
+    cs.comment_count,
+    cs.max_comment_score,
+    cs.avg_comment_score,
+    cs.last_comment_date,
+    aal.hours_to_accept
+  from question_activity qa
+  left join dup_clusters dr on dr.canonical_id = qa.question_id
+  left join edit_events ee on ee.postid = qa.question_id
+  left join vote_agg va on va.postid = qa.question_id
+  left join comment_stats cs on cs.postid = qa.question_id
+  left join accepted_answer_latency aal on aal.question_id = qa.question_id
+  where qa.question_date >= (select max(creationdate) - interval '90 days' from posts)
+),
+user_enriched as (
+  select
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.creationdate as user_created,
+    ru.norm_location,
+    br.total_badges,
+    br.gold_badges,
+    br.silver_badges,
+    br.bronze_badges,
+    br.last_badge_date
+  from recent_users ru
+  left join badge_rollup br on br.userid = ru.user_id
+),
+ranked_questions as (
+  select
+    trq.*,
+    ue.user_id,
+    ue.displayname,
+    ue.reputation,
+    ue.norm_location,
+    ue.total_badges,
+    ue.gold_badges,
+    ue.silver_badges,
+    ue.bronze_badges,
+    uqw.total_questions_by_user,
+    uqw.nth_question_for_user,
+    uqw.avg_q_score_by_user,
+    coalesce(trq.upvotes,0) - coalesce(trq.downvotes,0) as net_votes,
+    coalesce(trq.question_score,0) * 2
+      + coalesce(trq.total_answers,0) * 1.5
+      + coalesce(trq.comment_count,0) * 0.25
+      + coalesce(trq.bounty_amount_total,0) * 0.01
+      + case when trq.hours_to_accept is not null and trq.hours_to_accept <= 24 then 3 else 0 end
+      - coalesce(trq.negative_answers,0) * 0.5
+      - case when trq.close_votes_events > 0 then 5 else 0 end
+      + least(coalesce(trq.question_views,0)/100.0, 20) as composite_score,
+    row_number() over (
+      partition by ue.user_id
+      order by
+        coalesce(trq.question_score, -9999) desc,
+        coalesce(trq.total_answers, -9999) desc,
+        coalesce(trq.comment_count, -9999) desc,
+        trq.question_id
+    ) as rn_per_user
+  from top_recent_questions trq
+  left join user_enriched ue on ue.user_id = trq.asker_id
+  left join user_question_windows uqw on uqw.question_id = trq.question_id
+),
+best_per_user as (
+  select *
+  from ranked_questions
+  where rn_per_user = 1
+),
+tag_pivots as (
+  select
+    trq.question_id,
+    max(case when tr.tag_rank_by_popularity = 1 then tr.tag end) as top_tag,
+    max(case when tr.tag_rank_by_popularity = 2 then tr.tag end) as second_tag,
+    max(case when tr.tag_rank_by_popularity = 3 then tr.tag end) as third_tag
+  from top_recent_questions trq
+  left join tag_rank tr on tr.post_id = trq.question_id
+  group by trq.question_id
+),
+quality_bands as (
+  select
+    bp.question_id,
+    case
+      when bp.composite_score >= percentile_disc(0.90) within group (order by bp.composite_score) over ()
+        then 'Top 10%'
+      when bp.composite_score >= percentile_disc(0.75) within group (order by bp.composite_score) over ()
+        then 'Top 25%'
+      when bp.composite_score >= percentile_disc(0.50) within group (order by bp.composite_score) over ()
+        then 'Top 50%'
+      else 'Bottom 50%'
+    end as quality_band
+  from best_per_user bp
+),
+null_logic_check as (
+  select
+    bp.question_id,
+    case when bp.closeddate is null and coalesce(bp.total_answers,0) = 0 then 1 else 0 end as open_no_answers_flag,
+    case when bp.comment_count is null then 1 else 0 end as no_comments_flag,
+    case when bp.upvotes is null and bp.downvotes is null then 1 else 0 end as no_votes_flag
+  from best_per_user bp
+),
+final_union as (
+  select
+    bp.user_id,
+    bp.displayname,
+    bp.reputation,
+    bp.total_badges,
+    bp.gold_badges,
+    bp.silver_badges,
+    bp.bronze_badges,
+    bp.norm_location,
+    bp.question_id,
+    bp.title,
+    bp.tags,
+    tp.top_tag,
+    tp.second_tag,
+    tp.third_tag,
+    bp.question_date,
+    bp.question_score,
+    bp.question_views,
+    bp.total_answers,
+    bp.positive_answers,
+    bp.negative_answers,
+    bp.comment_count,
+    bp.net_votes,
+    bp.bounty_amount_total,
+    bp.hours_to_accept,
+    bp.first_edit_date,
+    bp.total_edits,
+    bp.suggested_applies,
+    bp.close_votes_events,
+    bp.composite_score,
+    qb.quality_band,
+    nlc.open_no_answers_flag,
+    nlc.no_comments_flag,
+    nlc.no_votes_flag,
+    'BEST_PER_USER' as source_bucket
+  from best_per_user bp
+  left join tag_pivots tp on tp.question_id = bp.question_id
+  left join quality_bands qb on qb.question_id = bp.question_id
+  left join null_logic_check nlc on nlc.question_id = bp.question_id
+
+  union all
+
+  select
+    rq.user_id,
+    rq.displayname,
+    rq.reputation,
+    null::int as total_badges,
+    null::int as gold_badges,
+    null::int as silver_badges,
+    null::int as bronze_badges,
+    rq.norm_location,
+    rq.question_id,
+    rq.title,
+    rq.tags,
+    null::varchar as top_tag,
+    null::varchar as second_tag,
+    null::varchar as third_tag,
+    rq.question_date,
+    rq.question_score,
+    rq.question_views,
+    rq.total_answers,
+    rq.positive_answers,
+    rq.negative_answers,
+    rq.comment_count,
+    rq.net_votes,
+    rq.bounty_amount_total,
+    rq.hours_to_accept,
+    rq.first_edit_date,
+    rq.total_edits,
+    rq.suggested_applies,
+    rq.close_votes_events,
+    rq.composite_score,
+    case when rq.composite_score >= 10 then 'High' when rq.composite_score >= 0 then 'Medium' else 'Low' end as quality_band,
+    case when rq.closeddate is null and coalesce(rq.total_answers,0) = 0 then 1 else 0 end as open_no_answers_flag,
+    case when rq.comment_count is null then 1 else 0 end as no_comments_flag,
+    case when rq.upvotes is null and rq.downvotes is null then 1 else 0 end as no_votes_flag,
+    'ALL_RANKED' as source_bucket
+  from ranked_questions rq
+  where rq.composite_score is not null
+)
+select
+  fu.user_id,
+  fu.displayname,
+  fu.reputation,
+  fu.total_badges,
+  fu.gold_badges,
+  fu.silver_badges,
+  fu.bronze_badges,
+  fu.norm_location,
+  fu.question_id,
+  coalesce(fu.title, '[no title]') as title,
+  fu.tags,
+  fu.top_tag,
+  fu.second_tag,
+  fu.third_tag,
+  fu.question_date,
+  fu.question_score,
+  fu.question_views,
+  fu.total_answers,
+  fu.positive_answers,
+  fu.negative_answers,
+  fu.comment_count,
+  fu.net_votes,
+  fu.bounty_amount_total,
+  round(coalesce(fu.hours_to_accept, -1)::numeric, 2) as hours_to_accept,
+  fu.first_edit_date,
+  fu.total_edits,
+  fu.suggested_applies,
+  fu.close_votes_events,
+  round(fu.composite_score::numeric, 3) as composite_score,
+  fu.quality_band,
+  fu.open_no_answers_flag,
+  fu.no_comments_flag,
+  fu.no_votes_flag,
+  fu.source_bucket,
+  dense_rank() over (order by fu.composite_score desc nulls last, fu.question_views desc nulls last, fu.question_id) as global_rank,
+  rank() over (partition by coalesce(fu.top_tag, 'untagged') order by fu.composite_score desc nulls last) as rank_within_top_tag
+from final_union fu
+where
+  -- complicated predicate mixing string, numeric, null logic, and expressions
+  (
+    (fu.top_tag is not null and fu.top_tag ilike '%sql%')
+    or (fu.tags is not null and position('python' in fu.tags) > 0)
+    or (fu.reputation >= 1000 and coalesce(fu.total_badges, 0) >= 5)
+  )
+  and (
+    fu.question_date >= (select max(creationdate) - interval '180 days' from posts)
+    or fu.source_bucket = 'BEST_PER_USER'
+  )
+  and (
+    (fu.no_votes_flag = 0 or fu.composite_score > 0)
+    and not (fu.open_no_answers_flag = 1 and fu.no_comments_flag = 1)
+  )
+order by fu.source_bucket, global_rank
+limit 500;

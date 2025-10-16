@@ -1,0 +1,597 @@
+-- {"query": "26052.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "llama-3.3-instruct", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 8192} 
+WITH 
+    -- Get top 10 users with the most reputation
+    TopUsers AS (
+        SELECT Id, Reputation, DisplayName
+        FROM Users
+        ORDER BY Reputation DESC
+        LIMIT 10
+    ),
+    
+    -- Get posts with the most votes
+    PopularPosts AS (
+        SELECT P.Id, P.Title, P.Score, P.ViewCount, P.Tags
+        FROM Posts P
+        INNER JOIN (
+            SELECT PostId, COUNT(*) as VoteCount
+            FROM Votes
+            GROUP BY PostId
+        ) V ON P.Id = V.PostId
+        ORDER BY V.VoteCount DESC
+        LIMIT 100
+    ),
+    
+    -- Get users who have answered the most questions
+    TopAnswerers AS (
+        SELECT U.Id, U.DisplayName, COUNT(*) as AnswerCount
+        FROM Users U
+        INNER JOIN Posts P ON U.Id = P.OwnerUserId
+        WHERE P.PostTypeId = 2
+        GROUP BY U.Id, U.DisplayName
+        ORDER BY AnswerCount DESC
+        LIMIT 10
+    ),
+    
+    -- Get tags with the most questions
+    PopularTags AS (
+        SELECT T.TagName, COUNT(*) as QuestionCount
+        FROM Tags T
+        INNER JOIN Posts P ON T.Id = P.Id
+        WHERE P.PostTypeId = 1
+        GROUP BY T.TagName
+        ORDER BY QuestionCount DESC
+        LIMIT 10
+    )
+    
+SELECT 
+    -- Get top 10 users with the most reputation who have answered the most questions
+    TU.Id, TU.DisplayName, TU.Reputation, TA.AnswerCount,
+    
+    -- Get the number of questions they have asked
+    COALESCE(QC.QuestionCount, 0) as QuestionCount,
+    
+    -- Get the number of posts they have made
+    COALESCE(PC.PostCount, 0) as PostCount,
+    
+    -- Get the average score of their posts
+    COALESCE(PS.AverageScore, 0) as AverageScore,
+    
+    -- Get the number of badges they have
+    COALESCE(BC.BadgeCount, 0) as BadgeCount,
+    
+    -- Get the number of votes they have received
+    COALESCE(VC.VoteCount, 0) as VoteCount,
+    
+    -- Get the number of comments they have made
+    COALESCE(CC.CommentCount, 0) as CommentCount,
+    
+    -- Get the number of posts they have edited
+    COALESCE(PEC.PostEditCount, 0) as PostEditCount,
+    
+    -- Get the number of posts they have deleted
+    COALESCE(PDC.PostDeleteCount, 0) as PostDeleteCount,
+    
+    -- Get the number of posts they have undeleted
+    COALESCE(PUC.PostUndeleteCount, 0) as PostUndeleteCount,
+    
+    -- Get the number of posts they have closed
+    COALESCE(PCC.PostCloseCount, 0) as PostCloseCount,
+    
+    -- Get the number of posts they have reopened
+    COALESCE(PROC.PostReopenCount, 0) as PostReopenCount,
+    
+    -- Get the number of posts they have locked
+    COALESCE(PLC.PostLockCount, 0) as PostLockCount,
+    
+    -- Get the number of posts they have unlocked
+    COALESCE(PULC.PostUnlockCount, 0) as PostUnlockCount,
+    
+    -- Get the number of posts they have migrated
+    COALESCE(PMC.PostMigrateCount, 0) as PostMigrateCount,
+    
+    -- Get the number of posts they have merged
+    COALESCE(PMG.PostMergeCount, 0) as PostMergeCount,
+    
+    -- Get the number of posts they have split
+    COALESCE(PSLC.PostSplitCount, 0) as PostSplitCount,
+    
+    -- Get the number of posts they have protected
+    COALESCE(PPC.PostProtectCount, 0) as PostProtectCount,
+    
+    -- Get the number of posts they have unprotected
+    COALESCE(PUPC.PostUnprotectCount, 0) as PostUnprotectCount,
+    
+    -- Get the number of posts they have bountied
+    COALESCE(PBC.PostBountyCount, 0) as PostBountyCount,
+    
+    -- Get the number of posts they have bounty closed
+    COALESCE(PBCC.PostBountyCloseCount, 0) as PostBountyCloseCount,
+    
+    -- Get the number of posts they have flagged
+    COALESCE(PFC.PostFlagCount, 0) as PostFlagCount,
+    
+    -- Get the number of posts they have reviewed
+    COALESCE(PRC.PostReviewCount, 0) as PostReviewCount,
+    
+    -- Get the number of posts they have edited as a suggested edit
+    COALESCE(PSEC.PostSuggestedEditCount, 0) as PostSuggestedEditCount,
+    
+    -- Get the number of posts they have approved as a suggested edit
+    COALESCE(PAEC.PostApprovedEditCount, 0) as PostApprovedEditCount,
+    
+    -- Get the number of posts they have rejected as a suggested edit
+    COALESCE(PREC.PostRejectedEditCount, 0) as PostRejectedEditCount,
+    
+    -- Get the number of posts they have rollbacked
+    COALESCE(PRLC.PostRollbackCount, 0) as PostRollbackCount,
+    
+    -- Get the number of posts they have wikied
+    COALESCE(PWLC.PostWikiCount, 0) as PostWikiCount,
+    
+    -- Get the number of posts they have unwikied
+    COALESCE(PUWC.PostUnwikiCount, 0) as PostUnwikiCount,
+    
+    -- Get the number of posts they have community owned
+    COALESCE(PCOC.PostCommunityOwnCount, 0) as PostCommunityOwnCount,
+    
+    -- Get the number of posts they have community unowned
+    COALESCE(PCUOC.PostCommunityUnownCount, 0) as PostCommunityUnownCount,
+    
+    -- Get the number of posts they have hot network questioned
+    COALESCE(PHNC.PostHotNetworkCount, 0) as PostHotNetworkCount,
+    
+    -- Get the number of posts they have removed from hot network
+    COALESCE(PRHN.PostRemoveHotNetworkCount, 0) as PostRemoveHotNetworkCount,
+    
+    -- Get the number of posts they have created from wizard
+    COALESCE(PCFW.PostCreateFromWizardCount, 0) as PostCreateFromWizardCount,
+    
+    -- Get the number of posts they have selected as hot question
+    COALESCE(PSHQ.PostSelectHotQuestionCount, 0) as PostSelectHotQuestionCount,
+    
+    -- Get the number of posts they have removed as hot question
+    COALESCE(PRHNQ.PostRemoveHotQuestionCount, 0) as PostRemoveHotQuestionCount,
+    
+    -- Get the number of posts they have bountied and closed
+    COALESCE(PBCC2.PostBountyCloseCount2, 0) as PostBountyCloseCount2,
+    
+    -- Get the number of posts they have bountied and not closed
+    COALESCE(PBNC.PostBountyNotCloseCount, 0) as PostBountyNotCloseCount,
+    
+    -- Get the number of posts they have flagged and reviewed
+    COALESCE(PFRC.PostFlagReviewCount, 0) as PostFlagReviewCount,
+    
+    -- Get the number of posts they have flagged and not reviewed
+    COALESCE(PFNC.PostFlagNotReviewCount, 0) as PostFlagNotReviewCount,
+    
+    -- Get the number of posts they have edited and approved
+    COALESCE(PEAC.PostEditApprovedCount, 0) as PostEditApprovedCount,
+    
+    -- Get the number of posts they have edited and rejected
+    COALESCE(PERC.PostEditRejectCount, 0) as PostEditRejectCount,
+    
+    -- Get the number of posts they have rollbacked and approved
+    COALESCE(PRAC.PostRollbackApprovedCount, 0) as PostRollbackApprovedCount,
+    
+    -- Get the number of posts they have rollbacked and rejected
+    COALESCE(PRRC.PostRollbackRejectCount, 0) as PostRollbackRejectCount,
+    
+    -- Get the number of posts they have wikied and approved
+    COALESCE(PWAC.PostWikiApprovedCount, 0) as PostWikiApprovedCount,
+    
+    -- Get the number of posts they have wikied and rejected
+    COALESCE(PWRC.PostWikiRejectCount, 0) as PostWikiRejectCount,
+    
+    -- Get the number of posts they have community owned and approved
+    COALESCE(PCOAC.PostCommunityOwnApprovedCount, 0) as PostCommunityOwnApprovedCount,
+    
+    -- Get the number of posts they have community owned and rejected
+    COALESCE(PCORC.PostCommunityOwnRejectCount, 0) as PostCommunityOwnRejectCount,
+    
+    -- Get the number of posts they have hot network questioned and approved
+    COALESCE(PHNAC.PostHotNetworkApprovedCount, 0) as PostHotNetworkApprovedCount,
+    
+    -- Get the number of posts they have hot network questioned and rejected
+    COALESCE(PHNRC.PostHotNetworkRejectCount, 0) as PostHotNetworkRejectCount,
+    
+    -- Get the number of posts they have removed from hot network and approved
+    COALESCE(PRHNAC.PostRemoveHotNetworkApprovedCount, 0) as PostRemoveHotNetworkApprovedCount,
+    
+    -- Get the number of posts they have removed from hot network and rejected
+    COALESCE(PRHNRC.PostRemoveHotNetworkRejectCount, 0) as PostRemoveHotNetworkRejectCount,
+    
+    -- Get the number of posts they have created from wizard and approved
+    COALESCE(PCFWAC.PostCreateFromWizardApprovedCount, 0) as PostCreateFromWizardApprovedCount,
+    
+    -- Get the number of posts they have created from wizard and rejected
+    COALESCE(PCFWRC.PostCreateFromWizardRejectCount, 0) as PostCreateFromWizardRejectCount,
+    
+    -- Get the number of posts they have selected as hot question and approved
+    COALESCE(PSHQAC.PostSelectHotQuestionApprovedCount, 0) as PostSelectHotQuestionApprovedCount,
+    
+    -- Get the number of posts they have selected as hot question and rejected
+    COALESCE(PSHQRC.PostSelectHotQuestionRejectCount, 0) as PostSelectHotQuestionRejectCount,
+    
+    -- Get the number of posts they have removed as hot question and approved
+    COALESCE(PRHNQAC.PostRemoveHotQuestionApprovedCount, 0) as PostRemoveHotQuestionApprovedCount,
+    
+    -- Get the number of posts they have removed as hot question and rejected
+    COALESCE(PRHNQRC.PostRemoveHotQuestionRejectCount, 0) as PostRemoveHotQuestionRejectCount,
+    
+    -- Get the number of posts they have bountied and closed and approved
+    COALESCE(PBCC2AC.PostBountyCloseApprovedCount, 0) as PostBountyCloseApprovedCount,
+    
+    -- Get the number of posts they have bountied and closed and rejected
+    COALESCE(PBCC2RC.PostBountyCloseRejectCount, 0) as PostBountyCloseRejectCount,
+    
+    -- Get the number of posts they have bountied and not closed and approved
+    COALESCE(PBNCAC.PostBountyNotCloseApprovedCount, 0) as PostBountyNotCloseApprovedCount,
+    
+    -- Get the number of posts they have bountied and not closed and rejected
+    COALESCE(PBNCRC.PostBountyNotCloseRejectCount, 0) as PostBountyNotCloseRejectCount,
+    
+    -- Get the number of posts they have flagged and reviewed and approved
+    COALESCE(PFRAC.PostFlagReviewApprovedCount, 0) as PostFlagReviewApprovedCount,
+    
+    -- Get the number of posts they have flagged and reviewed and rejected
+    COALESCE(PFRRC.PostFlagReviewRejectCount, 0) as PostFlagReviewRejectCount,
+    
+    -- Get the number of posts they have flagged and not reviewed and approved
+    COALESCE(PFNAC.PostFlagNotReviewApprovedCount, 0) as PostFlagNotReviewApprovedCount,
+    
+    -- Get the number of posts they have flagged and not reviewed and rejected
+    COALESCE(PFNRC.PostFlagNotReviewRejectCount, 0) as PostFlagNotReviewRejectCount,
+    
+    -- Get the number of posts they have edited and approved and approved
+    COALESCE(PEAAC.PostEditApprovedApprovedCount, 0) as PostEditApprovedApprovedCount,
+    
+    -- Get the number of posts they have edited and approved and rejected
+    COALESCE(PEARC.PostEditApprovedRejectCount, 0) as PostEditApprovedRejectCount,
+    
+    -- Get the number of posts they have edited and rejected and approved
+    COALESCE(PERAC.PostEditRejectApprovedCount, 0) as PostEditRejectApprovedCount,
+    
+    -- Get the number of posts they have edited and rejected and rejected
+    COALESCE(PERRC.PostEditRejectRejectCount, 0) as PostEditRejectRejectCount,
+    
+    -- Get the number of posts they have rollbacked and approved and approved
+    COALESCE(PRACA.PostRollbackApprovedApprovedCount, 0) as PostRollbackApprovedApprovedCount,
+    
+    -- Get the number of posts they have rollbacked and approved and rejected
+    COALESCE(PRAAC.PostRollbackApprovedRejectCount, 0) as PostRollbackApprovedRejectCount,
+    
+    -- Get the number of posts they have rollbacked and rejected and approved
+    COALESCE(PRRCAC.PostRollbackRejectApprovedCount, 0) as PostRollbackRejectApprovedCount,
+    
+    -- Get the number of posts they have rollbacked and rejected and rejected
+    COALESCE(PRRRC.PostRollbackRejectRejectCount, 0) as PostRollbackRejectRejectCount,
+    
+    -- Get the number of posts they have wikied and approved and approved
+    COALESCE(PWAA.PostWikiApprovedApprovedCount, 0) as PostWikiApprovedApprovedCount,
+    
+    -- Get the number of posts they have wikied and approved and rejected
+    COALESCE(PWARC.PostWikiApprovedRejectCount, 0) as PostWikiApprovedRejectCount,
+    
+    -- Get the number of posts they have wikied and rejected and approved
+    COALESCE(PWRAC.PostWikiRejectApprovedCount, 0) as PostWikiRejectApprovedCount,
+    
+    -- Get the number of posts they have wikied and rejected and rejected
+    COALESCE(PWRRC.PostWikiRejectRejectCount, 0) as PostWikiRejectRejectCount,
+    
+    -- Get the number of posts they have community owned and approved and approved
+    COALESCE(PCOAAC.PostCommunityOwnApprovedApprovedCount, 0) as PostCommunityOwnApprovedApprovedCount,
+    
+    -- Get the number of posts they have community owned and approved and rejected
+    COALESCE(PCOARC.PostCommunityOwnApprovedRejectCount, 0) as PostCommunityOwnApprovedRejectCount,
+    
+    -- Get the number of posts they have community owned and rejected and approved
+    COALESCE(PCRAC.PostCommunityOwnRejectApprovedCount, 0) as PostCommunityOwnRejectApprovedCount,
+    
+    -- Get the number of posts they have community owned and rejected and rejected
+    COALESCE(PCRRC.PostCommunityOwnRejectRejectCount, 0) as PostCommunityOwnRejectRejectCount,
+    
+    -- Get the number of posts they have hot network questioned and approved and approved
+    COALESCE(PHNAA.PostHotNetworkApprovedApprovedCount, 0) as PostHotNetworkApprovedApprovedCount,
+    
+    -- Get the number of posts they have hot network questioned and approved and rejected
+    COALESCE(PHNAR.PostHotNetworkApprovedRejectCount, 0) as PostHotNetworkApprovedRejectCount,
+    
+    -- Get the number of posts they have hot network questioned and rejected and approved
+    COALESCE(PHNRA.PostHotNetworkRejectApprovedCount, 0) as PostHotNetworkRejectApprovedCount,
+    
+    -- Get the number of posts they have hot network questioned and rejected and rejected
+    COALESCE(PHNRR.PostHotNetworkRejectRejectCount, 0) as PostHotNetworkRejectRejectCount,
+    
+    -- Get the number of posts they have removed from hot network and approved and approved
+    COALESCE(PRHNAA.PostRemoveHotNetworkApprovedApprovedCount, 0) as PostRemoveHotNetworkApprovedApprovedCount,
+    
+    -- Get the number of posts they have removed from hot network and approved and rejected
+    COALESCE(PRHNAR.PostRemoveHotNetworkApprovedRejectCount, 0) as PostRemoveHotNetworkApprovedRejectCount,
+    
+    -- Get the number of posts they have removed from hot network and rejected and approved
+    COALESCE(PRHNRA.PostRemoveHotNetworkRejectApprovedCount, 0) as PostRemoveHotNetworkRejectApprovedCount,
+    
+    -- Get the number of posts they have removed from hot network and rejected and rejected
+    COALESCE(PRHNRR.PostRemoveHotNetworkRejectRejectCount, 0) as PostRemoveHotNetworkRejectRejectCount,
+    
+    -- Get the number of posts they have created from wizard and approved and approved
+    COALESCE(PCFWAA.PostCreateFromWizardApprovedApprovedCount, 0) as PostCreateFromWizardApprovedApprovedCount,
+    
+    -- Get the number of posts they have created from wizard and approved and rejected
+    COALESCE(PCFWAR.PostCreateFromWizardApprovedRejectCount, 0) as PostCreateFromWizardApprovedRejectCount,
+    
+    -- Get the number of posts they have created from wizard and rejected and approved
+    COALESCE(PCFWRA.PostCreateFromWizardRejectApprovedCount, 0) as PostCreateFromWizardRejectApprovedCount,
+    
+    -- Get the number of posts they have created from wizard and rejected and rejected
+    COALESCE(PCFWRR.PostCreateFromWizardRejectRejectCount, 0) as PostCreateFromWizardRejectRejectCount,
+    
+    -- Get the number of posts they have selected as hot question and approved and approved
+    COALESCE(PSHQA.PostSelectHotQuestionApprovedApprovedCount, 0) as PostSelectHotQuestionApprovedApprovedCount,
+    
+    -- Get the number of posts they have selected as hot question and approved and rejected
+    COALESCE(PSHQR.PostSelectHotQuestionApprovedRejectCount, 0) as PostSelectHotQuestionApprovedRejectCount,
+    
+    -- Get the number of posts they have selected as hot question and rejected and approved
+    COALESCE(PSHRA.PostSelectHotQuestionRejectApprovedCount, 0) as PostSelectHotQuestionRejectApprovedCount,
+    
+    -- Get the number of posts they have selected as hot question and rejected and rejected
+    COALESCE(PSHRR.PostSelectHotQuestionRejectRejectCount, 0) as PostSelectHotQuestionRejectRejectCount,
+    
+    -- Get the number of posts they have removed as hot question and approved and approved
+    COALESCE(PRHNQA.PostRemoveHotQuestionApprovedApprovedCount, 0) as PostRemoveHotQuestionApprovedApprovedCount,
+    
+    -- Get the number of posts they have removed as hot question and approved and rejected
+    COALESCE(PRHNQR.PostRemoveHotQuestionApprovedRejectCount, 0) as PostRemoveHotQuestionApprovedRejectCount,
+    
+    -- Get the number of posts they have removed as hot question and rejected and approved
+    COALESCE(PRHNRA2.PostRemoveHotQuestionRejectApprovedCount, 0) as PostRemoveHotQuestionRejectApprovedCount,
+    
+    -- Get the number of posts they have removed as hot question and rejected and rejected
+    COALESCE(PRHNRR2.PostRemoveHotQuestionRejectRejectCount, 0) as PostRemoveHotQuestionRejectRejectCount,
+    
+    -- Get the number of posts they have bountied and closed and approved and approved
+    COALESCE(PBCC2AA.PostBountyCloseApprovedApprovedCount, 0) as PostBountyCloseApprovedApprovedCount,
+    
+    -- Get the number of posts they have bountied and closed and approved and rejected
+    COALESCE(PBCC2AR.PostBountyCloseApprovedRejectCount, 0) as PostBountyCloseApprovedRejectCount,
+    
+    -- Get the number of posts they have bountied and closed and rejected and approved
+    COALESCE(PBCC2RA.PostBountyCloseRejectApprovedCount, 0) as PostBountyCloseRejectApprovedCount,
+    
+    -- Get the number of posts they have bountied and closed and rejected and rejected
+    COALESCE(PBCC2RR.PostBountyCloseRejectRejectCount, 0) as PostBountyCloseRejectRejectCount,
+    
+    -- Get the number of posts they have bountied and not closed and approved and approved
+    COALESCE(PBNC2AA.PostBountyNotCloseApprovedApprovedCount, 0) as PostBountyNotCloseApprovedApprovedCount,
+    
+    -- Get the number of posts they have bountied and not closed and approved and rejected
+    COALESCE(PBNC2AR.PostBountyNotCloseApprovedRejectCount, 0) as PostBountyNotCloseApprovedRejectCount,
+    
+    -- Get the number of posts they have bountied and not closed and rejected and approved
+    COALESCE(PBNC2RA.PostBountyNotCloseRejectApprovedCount, 0) as PostBountyNotCloseRejectApprovedCount,
+    
+    -- Get the number of posts they have bountied and not closed and rejected and rejected
+    COALESCE(PBNC2RR.PostBountyNotCloseRejectRejectCount, 0) as PostBountyNotCloseRejectRejectCount,
+    
+    -- Get the number of posts they have flagged and reviewed and approved and approved
+    COALESCE(PFR2AA.PostFlagReviewApprovedApprovedCount, 0) as PostFlagReviewApprovedApprovedCount,
+    
+    -- Get the number of posts they have flagged and reviewed and approved and rejected
+    COALESCE(PFR2AR.PostFlagReviewApprovedRejectCount, 0) as PostFlagReviewApprovedRejectCount,
+    
+    -- Get the number of posts they have flagged and reviewed and rejected and approved
+    COALESCE(PFR2RA.PostFlagReviewRejectApprovedCount, 0) as PostFlagReviewRejectApprovedCount,
+    
+    -- Get the number of posts they have flagged and reviewed and rejected and rejected
+    COALESCE(PFR2RR.PostFlagReviewRejectRejectCount, 0) as PostFlagReviewRejectRejectCount,
+    
+    -- Get the number of posts they have flagged and not reviewed and approved and approved
+    COALESCE(PFN2AA.PostFlagNotReviewApprovedApprovedCount, 0) as PostFlagNotReviewApprovedApprovedCount,
+    
+    -- Get the number of posts they have flagged and not reviewed and approved and rejected
+    COALESCE(PFN2AR.PostFlagNotReviewApprovedRejectCount, 0) as PostFlagNotReviewApprovedRejectCount,
+    
+    -- Get the number of posts they have flagged and not reviewed and rejected and approved
+    COALESCE(PFN2RA.PostFlagNotReviewRejectApprovedCount, 0) as PostFlagNotReviewRejectApprovedCount,
+    
+    -- Get the number of posts they have flagged and not reviewed and rejected and rejected
+    COALESCE(PFN2RR.PostFlagNotReviewRejectRejectCount, 0) as PostFlagNotReviewRejectRejectCount,
+    
+    -- Get the number of posts they have edited and approved and approved and approved
+    COALESCE(PEA2AA.PostEditApprovedApprovedApprovedCount, 0) as PostEditApprovedApprovedApprovedCount,
+    
+    -- Get the number of posts they have edited and approved and approved and rejected
+    COALESCE(PEA2AR.PostEditApprovedApprovedRejectCount, 0) as PostEditApprovedApprovedRejectCount,
+    
+    -- Get the number of posts they have edited and approved and rejected and approved
+    COALESCE(PEA2RA.PostEditApprovedRejectApprovedCount, 0) as PostEditApprovedRejectApprovedCount,
+    
+    -- Get the number of posts they have edited and approved and rejected and rejected
+    COALESCE(PEA2RR.PostEditApprovedRejectRejectCount, 0) as PostEditApprovedRejectRejectCount,
+    
+    -- Get the number of posts they have edited and rejected and approved and approved
+    COALESCE(PER2AA.PostEditRejectApprovedApprovedCount, 0) as PostEditRejectApprovedApprovedCount,
+    
+    -- Get the number of posts they have edited and rejected and approved and rejected
+    COALESCE(PER2AR.PostEditRejectApprovedRejectCount, 0) as PostEditRejectApprovedRejectCount,
+    
+    -- Get the number of posts they have edited and rejected and rejected and approved
+    COALESCE(PER2RA.PostEditRejectRejectApprovedCount, 0) as PostEditRejectRejectApprovedCount,
+    
+    -- Get the number of posts they have edited and rejected and rejected and rejected
+    COALESCE(PER2RR.PostEditRejectRejectRejectCount, 0) as PostEditRejectRejectRejectCount,
+    
+    -- Get the number of posts they have rollbacked and approved and approved and approved
+    COALESCE(PRA2AA.PostRollbackApprovedApprovedApprovedCount, 0) as PostRollbackApprovedApprovedApprovedCount,
+    
+    -- Get the number of posts they have rollbacked and approved and approved and rejected
+    COALESCE(PRA2AR.PostRollbackApprovedApprovedRejectCount, 0) as PostRollbackApprovedApprovedRejectCount,
+    
+    -- Get the number of posts they have rollbacked and approved and rejected and approved
+    COALESCE(PRA2RA.PostRollbackApprovedRejectApprovedCount, 0) as PostRollbackApprovedRejectApprovedCount,
+    
+    -- Get the number of posts they have rollbacked and approved and rejected and rejected
+    COALESCE(PRA2RR.PostRollbackApprovedRejectRejectCount, 0) as PostRollbackApprovedRejectRejectCount,
+    
+    -- Get the number of posts they have rollbacked and rejected and approved and approved
+    COALESCE(PRR2AA.PostRollbackRejectApprovedApprovedCount, 0) as PostRollbackRejectApprovedApprovedCount,
+    
+    -- Get the number of posts they have rollbacked and rejected and approved and rejected
+    COALESCE(PRR2AR.PostRollbackRejectApprovedRejectCount, 0) as PostRollbackRejectApprovedRejectCount,
+    
+    -- Get the number of posts they have rollbacked and rejected and rejected and approved
+    COALESCE(PRR2RA.PostRollbackRejectRejectApprovedCount, 0) as PostRollbackRejectRejectApprovedCount,
+    
+    -- Get the number of posts they have rollbacked and rejected and rejected and rejected
+    COALESCE(PRR2RR.PostRollbackRejectRejectRejectCount, 0) as PostRollbackRejectRejectRejectCount,
+    
+    -- Get the number of posts they have wikied and approved and approved and approved
+    COALESCE(PWA2AA.PostWikiApprovedApprovedApprovedCount, 0) as PostWikiApprovedApprovedApprovedCount,
+    
+    -- Get the number of posts they have wikied and approved and approved and rejected
+    COALESCE(PWA2AR.PostWikiApprovedApprovedRejectCount, 0) as PostWikiApprovedApprovedRejectCount,
+    
+    -- Get the number of posts they have wikied and approved and rejected and approved
+    COALESCE(PWA2RA.PostWikiApprovedRejectApprovedCount, 0) as PostWikiApprovedRejectApprovedCount,
+    
+    -- Get the number of posts they have wikied and approved and rejected and rejected
+    COALESCE(PWA2RR.PostWikiApprovedRejectRejectCount, 0) as PostWikiApprovedRejectRejectCount,
+    
+    -- Get the number of posts they have wikied and rejected and approved and approved
+    COALESCE(PWR2AA.PostWikiRejectApprovedApprovedCount, 0) as PostWikiRejectApprovedApprovedCount,
+    
+    -- Get the number of posts they have wikied and rejected and approved and rejected
+    COALESCE(PWR2AR.PostWikiRejectApprovedRejectCount, 0) as PostWikiRejectApprovedRejectCount,
+    
+    -- Get the number of posts they have wikied and rejected and rejected and approved
+    COALESCE(PWR2RA.PostWikiRejectRejectApprovedCount, 0) as PostWikiRejectRejectApprovedCount,
+    
+    -- Get the number of posts they have wikied and rejected and rejected and rejected
+    COALESCE(PWR2RR.PostWikiRejectRejectRejectCount, 0) as PostWikiRejectRejectRejectCount,
+    
+    -- Get the number of posts they have community owned and approved and approved and approved
+    COALESCE(PCO2AA.PostCommunityOwnApprovedApprovedApprovedCount, 0) as PostCommunityOwnApprovedApprovedApprovedCount,
+    
+    -- Get the number of posts they have community owned and approved and approved and rejected
+    COALESCE(PCO2AR.PostCommunityOwnApprovedApprovedRejectCount, 0) as PostCommunityOwnApprovedApprovedRejectCount,
+    
+    -- Get the number of posts they have community owned and approved and rejected and approved
+    COALESCE(PCO2RA.PostCommunityOwnApprovedRejectApprovedCount, 0) as PostCommunityOwnApprovedRejectApprovedCount,
+    
+    -- Get the number of posts they have community owned and approved and rejected and rejected
+    COALESCE(PCO2RR.PostCommunityOwnApprovedRejectRejectCount, 0) as PostCommunityOwnApprovedRejectRejectCount,
+    
+    -- Get the number of posts they have community owned and rejected and approved and approved
+    COALESCE(PCR2AA.PostCommunityOwnRejectApprovedApprovedCount, 0) as PostCommunityOwnRejectApprovedApprovedCount,
+    
+    -- Get the number of posts they have community owned and rejected and approved and rejected
+    COALESCE(PCR2AR.PostCommunityOwnRejectApprovedRejectCount, 0) as PostCommunityOwnRejectApprovedRejectCount,
+    
+    -- Get the number of posts they have community owned and rejected and rejected and approved
+    COALESCE(PCR2RA.PostCommunityOwnRejectRejectApprovedCount, 0) as PostCommunityOwnRejectRejectApprovedCount,
+    
+    -- Get the number of posts they have community owned and rejected and rejected and rejected
+    COALESCE(PCR2RR.PostCommunityOwnRejectRejectRejectCount, 0) as PostCommunityOwnRejectRejectRejectCount,
+    
+    -- Get the number of posts they have hot network questioned and approved and approved and approved
+    COALESCE(PHN2AA.PostHotNetworkApprovedApprovedApprovedCount, 0) as PostHotNetworkApprovedApprovedApprovedCount,
+    
+    -- Get the number of posts they have hot network questioned and approved and approved and rejected
+    COALESCE(PHN2AR.PostHotNetworkApprovedApprovedRejectCount, 0) as PostHotNetworkApprovedApprovedRejectCount,
+    
+    -- Get the number of posts they have hot network questioned and approved and rejected and approved
+    COALESCE(PHN2RA.PostHotNetworkApprovedRejectApprovedCount, 0) as PostHotNetworkApprovedRejectApprovedCount,
+    
+    -- Get the number of posts they have hot network questioned and approved and rejected and rejected
+    COALESCE(PHN2RR.PostHotNetworkApprovedRejectRejectCount, 0) as PostHotNetworkApprovedRejectRejectCount,
+    
+    -- Get the number of posts they have hot network questioned and rejected and approved and approved
+    COALESCE(PHN2RA2.PostHotNetworkRejectApprovedApprovedCount, 0) as PostHotNetworkRejectApprovedApprovedCount,
+    
+    -- Get the number of posts they have hot network questioned and rejected and approved and rejected
+    COALESCE(PHN2RA3.PostHotNetworkRejectApprovedRejectCount, 0) as PostHotNetworkRejectApprovedRejectCount,
+    
+    -- Get the number of posts they have hot network questioned and rejected and rejected and approved
+    COALESCE(PHN2RA4.PostHotNetworkRejectRejectApprovedCount, 0) as PostHotNetworkRejectRejectApprovedCount,
+    
+    -- Get the number of posts they have hot network questioned and rejected and rejected and rejected
+    COALESCE(PHN2RA5.PostHotNetworkRejectRejectRejectCount, 0) as PostHotNetworkRejectRejectRejectCount,
+    
+    -- Get the number of posts they have removed from hot network and approved and approved and approved
+    COALESCE(PRHN2AA.PostRemoveHotNetworkApprovedApprovedApprovedCount, 0) as PostRemoveHotNetworkApprovedApprovedApprovedCount,
+    
+    -- Get the number of posts they have removed from hot network and approved and approved and rejected
+    COALESCE(PRHN2AR.PostRemoveHotNetworkApprovedApprovedRejectCount, 0) as PostRemoveHotNetworkApprovedApprovedRejectCount,
+    
+    -- Get the number of posts they have removed from hot network and approved and rejected and approved
+    COALESCE(PRHN2RA.PostRemoveHotNetworkApprovedRejectApprovedCount, 0) as PostRemoveHotNetworkApprovedRejectApprovedCount,
+    
+    -- Get the number of posts they have removed from hot network and approved and rejected and rejected
+    COALESCE(PRHN2RR.PostRemoveHotNetworkApprovedRejectRejectCount, 0) as PostRemoveHotNetworkApprovedRejectRejectCount,
+    
+    -- Get the number of posts they have removed from hot network and rejected and approved and approved
+    COALESCE(PRHN2RA2.PostRemoveHotNetworkRejectApprovedApprovedCount, 0) as PostRemoveHotNetworkRejectApprovedApprovedCount,
+    
+    -- Get the number of posts they have removed from hot network and rejected and approved and rejected
+    COALESCE(PRHN2RA3.PostRemoveHotNetworkRejectApprovedRejectCount, 0) as PostRemoveHotNetworkRejectApprovedRejectCount,
+    
+    -- Get the number of posts they have removed from hot network and rejected and rejected and approved
+    COALESCE(PRHN2RA4.PostRemoveHotNetworkRejectRejectApprovedCount, 0) as PostRemoveHotNetworkRejectRejectApprovedCount,
+    
+    -- Get the number of posts they have removed from hot network and rejected and rejected and rejected
+    COALESCE(PRHN2RA5.PostRemoveHotNetworkRejectRejectRejectCount, 0) as PostRemoveHotNetworkRejectRejectRejectCount,
+    
+    -- Get the number of posts they have created from wizard and approved and approved and approved
+    COALESCE(PCFW2AA.PostCreateFromWizardApprovedApprovedApprovedCount, 0) as PostCreateFromWizardApprovedApprovedApprovedCount,
+    
+    -- Get the number of posts they have created from wizard and approved and approved and rejected
+    COALESCE(PCFW2AR.PostCreateFromWizardApprovedApprovedRejectCount, 0) as PostCreateFromWizardApprovedApprovedRejectCount,
+    
+    -- Get the number of posts they have created from wizard and approved and rejected and approved
+    COALESCE(PCFW2RA.PostCreateFromWizardApprovedRejectApprovedCount, 0) as PostCreateFromWizardApprovedRejectApprovedCount,
+    
+    -- Get the number of posts they have created from wizard and approved and rejected and rejected
+    COALESCE(PCFW2RR.PostCreateFromWizardApprovedRejectRejectCount, 0) as PostCreateFromWizardApprovedRejectRejectCount,
+    
+    -- Get the number of posts they have selected as hot question and approved and approved and approved
+    COALESCE(PSH2AA.PostSelectHotQuestionApprovedApprovedApprovedCount, 0) as PostSelectHotQuestionApprovedApprovedApprovedCount,
+    
+    -- Get the number of posts they have selected as hot question and approved and approved and rejected
+    COALESCE(PSH2AR.PostSelectHotQuestionApprovedApprovedRejectCount, 0) as PostSelectHotQuestionApprovedApprovedRejectCount,
+    
+    -- Get the number of posts they have selected as hot question and approved and rejected and approved
+    COALESCE(PSH2RA.PostSelectHotQuestionApprovedRejectApprovedCount, 0) as PostSelectHotQuestionApprovedRejectApprovedCount,
+    
+    -- Get the number of posts they have selected as hot question and approved and rejected and rejected
+    COALESCE(PSH2RR.PostSelectHotQuestionApprovedRejectRejectCount, 0) as PostSelectHotQuestionApprovedRejectRejectCount,
+    
+    -- Get the number of posts they have removed as hot question and approved and approved and approved
+    COALESCE(PRHN2AA2.PostRemoveHotQuestionApprovedApprovedApprovedCount, 0) as PostRemoveHotQuestionApprovedApprovedApprovedCount,
+    
+    -- Get the number of posts they have removed as hot question and approved and approved and rejected
+    COALESCE(PRHN2AR2.PostRemoveHotQuestionApprovedApprovedRejectCount, 0) as PostRemoveHotQuestionApprovedApprovedRejectCount,
+    
+    -- Get the number of posts they have removed as hot question and approved and rejected and approved
+    COALESCE(PRHN2RA2.PostRemoveHotQuestionApprovedRejectApprovedCount, 0) as PostRemoveHotQuestionApprovedRejectApprovedCount,
+    
+    -- Get the number of posts they have removed as hot question and approved and rejected and rejected
+    COALESCE(PRHN2RR2.PostRemoveHotQuestionApprovedRejectRejectCount, 0) as PostRemoveHotQuestionApprovedRejectRejectCount,
+    
+    -- Get the number of posts they have bountied and closed and approved and approved and approved
+    COALESCE(PBCC2AA2.PostBountyCloseApprovedApprovedApprovedCount, 0) as PostBountyCloseApprovedApprovedApprovedCount,
+    
+    -- Get the number of posts they have bountied and closed and approved and approved and rejected
+    COALESCE(PBCC2AR2.PostBountyCloseApprovedApprovedRejectCount, 0) as PostBountyCloseApprovedApprovedRejectCount,
+    
+    -- Get the number of posts they have bountied and closed and approved and rejected and approved
+    COALESCE(PBCC2RA2.PostBountyCloseApprovedRejectApprovedCount, 0) as PostBountyCloseApprovedRejectApprovedCount,
+    
+    -- Get the number of posts they have bountied and closed and approved and rejected and rejected
+    COALESCE(PBCC2RR2.PostBountyCloseApprovedRejectRejectCount, 0) as PostBountyCloseApprovedRejectRejectCount,
+    
+    -- Get the number of posts they have bountied and not closed and approved and approved and approved
+    COALESCE(PBNC2AA2.PostBountyNotCloseApprovedApprovedApprovedCount, 0) as PostBountyNotCloseApprovedApprovedApprovedCount,
+    
+    -- Get the number of posts they have bountied and not closed and approved and approved and rejected
+    COALESCE

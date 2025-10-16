@@ -1,0 +1,222 @@
+-- {"query": "9017.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2013, "output_tokens": 6236} 
+
+WITH QuestionTags AS (
+    SELECT
+        p.Id AS QuestionId,
+        unnest(
+          string_to_array(
+            substring(p.Tags, 2, length(p.Tags) - 2),
+            '><'
+          )
+        ) AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+), TagStats AS (
+    SELECT
+        qt.Tag        AS TagName,
+        COUNT(*)      AS QuestionCount,
+        AVG(p.Score)  AS AvgScore
+    FROM QuestionTags qt
+    JOIN Posts p
+      ON qt.QuestionId = p.Id
+    GROUP BY qt.Tag
+), RecentPosts AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS RankByScore,
+        RANK()       OVER (PARTITION BY p.PostTypeId  ORDER BY p.CreationDate DESC) AS RankByDate
+    FROM Posts p
+    WHERE p.CreationDate BETWEEN now() - INTERVAL '90 days' AND now()
+), TopUsers AS (
+    SELECT
+        u.Id          AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.AboutMe,
+        COALESCE(bc.GoldBadges,   0) AS GoldBadges,
+        COALESCE(bc.SilverBadges, 0) AS SilverBadges,
+        COALESCE(bc.BronzeBadges, 0) AS BronzeBadges,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS Questions,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS Answers
+    FROM Users u
+    LEFT JOIN (
+        SELECT
+            UserId,
+            SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+            SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+            SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+        FROM Badges
+        GROUP BY UserId
+    ) bc ON u.Id = bc.UserId
+)
+SELECT
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    ts1.TopTag1,
+    ts2.TopTag2,
+    rp.Score            AS RecentHighScore,
+    CASE
+      WHEN tu.Reputation > tu.GoldBadges * 100 THEN 'HighRep'
+      ELSE 'Normal'
+    END                 AS RepCategory,
+    CONCAT(
+      SUBSTRING(tu.DisplayName, 1, 3),
+      '_',
+      LOWER(ts1.TopTag1)
+    )                   AS SampleConcat,
+    COALESCE(LENGTH(tu.AboutMe), 0) -
+    COALESCE(NULLIF(LENGTH(tu.AboutMe), 0), 0) AS AboutLen,
+    (
+      SELECT AVG(v2.BountyAmount)
+      FROM Votes v2
+      WHERE v2.UserId = tu.UserId
+        AND v2.BountyAmount IS NOT NULL
+    )                   AS AvgBounty
+FROM TopUsers tu
+LEFT JOIN LATERAL (
+    SELECT
+        qt.Tag AS TopTag1
+    FROM QuestionTags qt
+    JOIN Posts p2
+      ON qt.QuestionId = p2.Id
+    WHERE p2.OwnerUserId = tu.UserId
+    GROUP BY qt.Tag
+    ORDER BY COUNT(*) DESC
+    LIMIT 1
+) ts1 ON TRUE
+LEFT JOIN LATERAL (
+    SELECT
+        qt.Tag AS TopTag2
+    FROM QuestionTags qt
+    JOIN Posts p2
+      ON qt.QuestionId = p2.Id
+    WHERE p2.OwnerUserId = tu.UserId
+      AND qt.Tag <> ts1.TopTag1
+    GROUP BY qt.Tag
+    ORDER BY COUNT(*) DESC
+    LIMIT 1
+) ts2 ON TRUE
+LEFT JOIN RecentPosts rp
+  ON tu.UserId = rp.OwnerUserId
+ AND rp.RankByScore = 1
+WHERE tu.Questions > COALESCE(NULLIF(tu.Answers, 0), 1)
+  AND EXISTS (
+      SELECT 1
+      FROM Votes v
+      WHERE v.UserId = tu.UserId
+        AND v.VoteTypeId IN (2, 3)
+        AND v.CreationDate > CURRENT_DATE - INTERVAL '30 days'
+  )
+  AND tu.DisplayName IS NOT NULL
+
+UNION
+
+SELECT
+    tu2.UserId,
+    tu2.DisplayName,
+    tu2.Reputation,
+    tu2.GoldBadges,
+    tu2.SilverBadges,
+    tu2.BronzeBadges,
+    NULL::varchar,
+    NULL::varchar,
+    NULL::int,
+    CASE
+      WHEN tu2.Reputation > tu2.GoldBadges * 100 THEN 'HighRep'
+      ELSE 'Normal'
+    END,
+    NULL::varchar,
+    0,
+    NULL::numeric
+FROM TopUsers tu2
+WHERE EXISTS (
+    SELECT 1
+    FROM Posts p
+    WHERE p.OwnerUserId = tu2.UserId
+      AND p.Score < 0
+)
+
+INTERSECT
+
+SELECT
+    UserId,
+    DisplayName,
+    Reputation,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    NULL::varchar,
+    NULL::varchar,
+    NULL::int,
+    CASE
+      WHEN Reputation > GoldBadges * 100 THEN 'HighRep'
+      ELSE 'Normal'
+    END,
+    NULL::varchar,
+    0,
+    NULL::numeric
+FROM TopUsers
+
+EXCEPT
+
+SELECT
+    tu3.UserId,
+    tu3.DisplayName,
+    tu3.Reputation,
+    tu3.GoldBadges,
+    tu3.SilverBadges,
+    tu3.BronzeBadges,
+    ts1.Tag,
+    ts2.Tag,
+    rp.Score,
+    CASE
+      WHEN tu3.Reputation > tu3.GoldBadges * 100 THEN 'HighRep'
+      ELSE 'Normal'
+    END,
+    CONCAT(
+      SUBSTRING(tu3.DisplayName, 1, 3),
+      '_',
+      LOWER(ts1.Tag)
+    ),
+    COALESCE(LENGTH(tu3.AboutMe), 0) -
+    COALESCE(NULLIF(LENGTH(tu3.AboutMe), 0), 0),
+    (
+      SELECT AVG(v2.BountyAmount)
+      FROM Votes v2
+      WHERE v2.UserId = tu3.UserId
+        AND v2.BountyAmount IS NOT NULL
+    )
+FROM TopUsers tu3
+JOIN LATERAL (
+    SELECT qt.Tag
+    FROM QuestionTags qt
+    JOIN Posts p2
+      ON qt.QuestionId = p2.Id
+    WHERE p2.OwnerUserId = tu3.UserId
+    GROUP BY qt.Tag
+    ORDER BY COUNT(*) DESC
+    LIMIT 1
+) ts1 ON TRUE
+JOIN LATERAL (
+    SELECT qt.Tag
+    FROM QuestionTags qt
+    JOIN Posts p2
+      ON qt.QuestionId = p2.Id
+    WHERE p2.OwnerUserId = tu3.UserId
+      AND qt.Tag <> ts1.Tag
+    GROUP BY qt.Tag
+    ORDER BY COUNT(*) DESC
+    LIMIT 1
+) ts2 ON TRUE
+JOIN RecentPosts rp
+  ON tu3.UserId = rp.OwnerUserId
+ AND rp.RankByScore = 1;

@@ -1,0 +1,168 @@
+-- {"query": "125.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 2023} 
+with
+-- expand question tags into rows
+question_tags as (
+  select p.id as post_id,
+         u.id as owner_id,
+         lower(trim(t)) as tag
+  from posts p
+  join users u on u.id = p.owneruserid
+  where p.posttypeid = 1 and p.tags is not null
+  cross join lateral (
+    select unnest(string_to_array(substring(p.tags from 2 for char_length(p.tags)-2), '><')) as t
+  ) s
+),
+-- aggregate per-user tag affinity
+user_tag_affinity as (
+  select qt.owner_id,
+         qt.tag,
+         count(*) as questions_with_tag,
+         avg(p.score) filter (where p.score is not null) as avg_score_on_tag
+  from question_tags qt
+  join posts p on p.id = qt.post_id
+  group by qt.owner_id, qt.tag
+),
+-- badges per user and recent badge streaks
+user_badges as (
+  select b.userid,
+         count(*) as badge_count,
+         sum(case when b.class = 1 then 1 else 0 end) as gold_count,
+         sum(case when b.class = 2 then 1 else 0 end) as silver_count,
+         sum(case when b.class = 3 then 1 else 0 end) as bronze_count,
+         max(b.date) as last_badge_date,
+         bool_or(b.tagbased) as has_tag_badges
+  from badges b
+  group by b.userid
+),
+-- compute answer metrics per user including median answer score using window/percentile
+user_answer_stats as (
+  select a.owneruserid as userid,
+         count(*) filter (where a.posttypeid = 2) as answer_count,
+         avg(a.score) filter (where a.posttypeid = 2) as avg_answer_score,
+         min(a.creationdate) filter (where a.posttypeid = 2) as first_answer_date,
+         max(a.creationdate) filter (where a.posttypeid = 2) as last_answer_date,
+         -- median via percentile_cont over partition
+         (select percentile_cont(0.5) within group (order by score) from posts p2 where p2.posttypeid = 2 and p2.owneruserid = a.owneruserid) as median_answer_score
+  from posts a
+  group by a.owneruserid
+),
+-- question response time: time between question creation and first answer (per question)
+question_first_answer as (
+  select q.id as question_id,
+         q.owneruserid as ask_user,
+         q.creationdate as asked_at,
+         min(a.creationdate) as first_answer_at,
+         extract(epoch from (min(a.creationdate) - q.creationdate))/3600.0 as hours_to_first_answer
+  from posts q
+  left join posts a on a.parentid = q.id and a.posttypeid = 2
+  where q.posttypeid = 1
+  group by q.id, q.owneruserid, q.creationdate
+),
+-- per-user average response time to their questions
+user_question_response as (
+  select ask_user as userid,
+         count(*) filter (where first_answer_at is not null) as questions_answered,
+         avg(hours_to_first_answer) filter (where hours_to_first_answer is not null) as avg_hours_to_first_answer,
+         max(hours_to_first_answer) filter (where hours_to_first_answer is not null) as worst_hours_to_first
+  from question_first_answer
+  group by ask_user
+),
+-- correlate votes given by users (activity), including last vote and types distribution
+user_vote_activity as (
+  select v.userid,
+         count(*) as votes_cast,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes_cast,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes_cast,
+         max(v.creationdate) as last_vote_date
+  from votes v
+  group by v.userid
+),
+-- combine key user metrics
+users_core as (
+  select u.id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.lastaccessdate,
+         u.views,
+         u.upvotes as up_votes_received,
+         u.downvotes as down_votes_received,
+         coalesce(ua.answer_count,0) as answer_count,
+         coalesce(ua.avg_answer_score,0) as avg_answer_score,
+         ua.median_answer_score,
+         coalesce(ub.badge_count,0) as badge_count,
+         coalesce(ub.gold_count,0) as gold_badges,
+         coalesce(ub.silver_count,0) as silver_badges,
+         coalesce(ub.bronze_count,0) as bronze_badges,
+         coalesce(ur.questions_answered,0) as questions_with_answers,
+         ur.avg_hours_to_first_answer,
+         uva.votes_cast,
+         uva.last_vote_date
+  from users u
+  left join user_answer_stats ua on ua.userid = u.id
+  left join user_badges ub on ub.userid = u.id
+  left join user_question_response ur on ur.userid = u.id
+  left join user_vote_activity uva on uva.userid = u.id
+),
+-- identify users who ask many questions but get late answers and low answer scores
+candidate_underserved as (
+  select uc.*,
+         -- tag diversity
+         (select count(distinct qt.tag) from question_tags qt where qt.owner_id = uc.id) as distinct_question_tags,
+         -- top tag by questions
+         (select tag from user_tag_affinity uta where uta.owner_id = uc.id order by questions_with_tag desc limit 1) as top_tag,
+         -- fraction of questions that never received an answer
+         (select count(*) filter (where q.first_answer_at is null)::float / greatest(count(q.*),1) from question_first_answer q where q.ask_user = uc.id) as fraction_unanswered
+  from users_core uc
+  where uc.reputation > 50 -- bias to active users
+)
+select
+  c.id as user_id,
+  c.displayname,
+  c.reputation,
+  c.answer_count,
+  round(coalesce(c.avg_answer_score,0)::numeric,3) as avg_answer_score,
+  round(coalesce(c.median_answer_score,0)::numeric,3) as median_answer_score,
+  c.badge_count,
+  c.gold_badges, c.silver_badges, c.bronze_badges,
+  c.questions_with_answers,
+  round(coalesce(c.avg_hours_to_first_answer, -1)::numeric,3) as avg_hours_to_first_answer,
+  coalesce(c.votes_cast,0) as votes_cast,
+  c.distinct_question_tags,
+  c.top_tag,
+  round(coalesce(c.fraction_unanswered,0)::numeric,3) as fraction_unanswered,
+  -- complex derived score combining many signals (intentionally convoluted)
+  (
+    (greatest(c.reputation,10)::numeric / 1000) * nullif(greatest(c.answer_count,1),0)
+    + coalesce(c.avg_answer_score,0) * 2
+    - coalesce(c.avg_hours_to_first_answer,24) / 24
+    + (c.gold_badges * 5 + c.silver_badges * 2 + c.bronze_badges * 0.5)
+    + (case when c.top_tag is not null then length(c.top_tag)::numeric / 10 else 0 end)
+    - (coalesce(c.fraction_unanswered,0) * 3)
+    + coalesce(c.votes_cast,0)::numeric / nullif((date_part('epoch', now() - coalesce(c.last_vote_date, c.creationdate)) / 86400 + 1),0)
+  ) as user_health_score,
+  -- show recent related activity: last 3 post titles concatenated (may be null)
+  (select string_agg(coalesce(p.title,'[no title]') || ' (+' || coalesce(p.score,0)::text || ')', ' || ')
+   from (
+     select p.title, p.score
+     from posts p
+     where p.owneruserid = c.id
+     order by coalesce(p.lastactivitydate,p.creationdate) desc nulls last
+     limit 3
+   ) p
+  ) as recent_top_posts,
+  -- show most linked-to posts by this user (using postlinks), with duplication count
+  (select json_agg(json_build_object('postid', pl.relatedpostid, 'links', cnt) order by cnt desc)
+   from (
+     select pl.relatedpostid, count(*) as cnt
+     from postlinks pl
+     join posts p on p.id = pl.postid
+     where p.owneruserid = c.id
+     group by pl.relatedpostid
+     order by cnt desc
+     limit 5
+   ) pl
+  ) as top_linked_posts
+from candidate_underserved c
+order by user_health_score desc nulls last
+limit 100;

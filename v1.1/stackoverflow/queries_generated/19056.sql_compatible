@@ -1,0 +1,191 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT V.Id) FILTER (WHERE V.VoteTypeId IN (2, 3)) AS TotalUpDownVotesGiven,
+        SUM(P.Score) AS TotalPostScore,
+        AVG(P.Score) AS AvgPostScore,
+        MAX(P.CreationDate) AS LastPostDate,
+        MIN(B.Date) AS FirstBadgeDate,
+        MAX(B.Date) AS LastBadgeDate,
+        COUNT(B.Id) AS TotalBadges,
+        MAX(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge,
+        DENSE_RANK() OVER (PARTITION BY EXTRACT(YEAR FROM U.CreationDate) ORDER BY U.Reputation DESC) AS RepRankByCreationYear
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.Reputation, U.Views, U.UpVotes, U.DownVotes, U.CreationDate
+),
+PostEngagementMetrics AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.ViewCount,
+        Q.Score AS QuestionScore,
+        Q.AnswerCount,
+        Q.FavoriteCount,
+        Q.ClosedDate,
+        COUNT(A.Id) AS ActualAnswerCount,
+        SUM(A.Score) AS TotalAnswerScore,
+        AVG(A.Score) AS AvgAnswerScore,
+        MAX(A.CreationDate) AS LastAnswerDate,
+        COALESCE(SUM(CASE WHEN A.Id = Q.AcceptedAnswerId THEN 1 ELSE 0 END), 0) AS HasAcceptedAnswer,
+        (CASE WHEN Q.AcceptedAnswerId IS NOT NULL THEN 100.0 / NULLIF(COUNT(A.Id), 0) ELSE 0 END) AS AcceptedAnswerRatio,
+        COUNT(DISTINCT PL_Linked.RelatedPostId) AS LinkedPostsCount,
+        COUNT(DISTINCT PL_Duplicate.RelatedPostId) AS DuplicatePostsCount,
+        RANK() OVER (PARTITION BY EXTRACT(YEAR FROM Q.CreationDate), EXTRACT(MONTH FROM Q.CreationDate) ORDER BY Q.Score DESC, Q.ViewCount DESC) AS QuestionRankMonthly
+    FROM Posts Q
+    LEFT JOIN Posts A ON Q.Id = A.ParentId AND A.PostTypeId = 2
+    LEFT JOIN PostLinks PL_Linked ON Q.Id = PL_Linked.PostId AND PL_Linked.LinkTypeId = 1
+    LEFT JOIN PostLinks PL_Duplicate ON Q.Id = PL_Duplicate.PostId AND PL_Duplicate.LinkTypeId = 3
+    WHERE Q.PostTypeId = 1
+    GROUP BY Q.Id, Q.CreationDate, Q.ViewCount, Q.Score, Q.AnswerCount, Q.FavoriteCount, Q.ClosedDate, Q.AcceptedAnswerId
+),
+TagGlobalMetrics AS (
+    SELECT
+        T.TagName,
+        EXTRACT(YEAR FROM P.CreationDate) AS TaggedYear,
+        COUNT(P.Id) AS YearlyTagCount,
+        SUM(P.Score) AS YearlyTagScoreSum,
+        LAG(COUNT(P.Id), 1, 0) OVER (PARTITION BY T.TagName ORDER BY EXTRACT(YEAR FROM P.CreationDate)) AS PrevYearlyTagCount,
+        (CAST(COUNT(P.Id) AS NUMERIC) - LAG(COUNT(P.Id), 1, 0) OVER (PARTITION BY T.TagName ORDER BY EXTRACT(YEAR FROM P.CreationDate))) / NULLIF(LAG(COUNT(P.Id), 1, 0) OVER (PARTITION BY T.TagName ORDER BY EXTRACT(YEAR FROM P.CreationDate)), 0) AS TagYearlyGrowthRate
+    FROM Posts P
+    JOIN LATERAL (SELECT unnest(string_to_array(substring(P.Tags, 2, length(P.Tags)-2), '><')) AS TagName) AS TagsArray ON TRUE
+    JOIN Tags T ON TagsArray.TagName = T.TagName
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL
+    GROUP BY T.TagName, EXTRACT(YEAR FROM P.CreationDate)
+),
+RecentPostHistoryEvents AS (
+    SELECT
+        PH.PostId,
+        MAX(PH.CreationDate) AS LastHistoryEventDate,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 END) AS ClosedCount,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 END) AS ReopenedCount,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 12 THEN 1 END) AS DeletedCount,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 19 THEN 1 END) AS ProtectedCount,
+        (SELECT PH_INNER.Text
+         FROM PostHistory PH_INNER
+         WHERE PH_INNER.PostId = PH.PostId
+           AND PH_INNER.PostHistoryTypeId IN (5, 8)
+         ORDER BY PH_INNER.CreationDate DESC
+         LIMIT 1) AS LatestBodyEditText
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (10, 11, 12, 13, 19, 20, 5, 8)
+    GROUP BY PH.PostId
+),
+UserBadgeTimeline AS (
+    SELECT
+        B.UserId,
+        B.Name AS BadgeName,
+        B.Date AS BadgeDate,
+        B.Class AS BadgeClass,
+        ROW_NUMBER() OVER (PARTITION BY B.UserId, B.Class ORDER BY B.Date ASC) AS RnFirstBadgeClass,
+        ROW_NUMBER() OVER (PARTITION BY B.UserId, B.Class ORDER BY B.Date DESC) AS RnLastBadgeClass
+    FROM Badges B
+)
+SELECT
+    U.Id AS UserId,
+    U.DisplayName,
+    U.Reputation,
+    U.CreationDate AS UserCreationDate,
+    U.LastAccessDate,
+    UA.TotalQuestions,
+    UA.TotalAnswers,
+    UA.TotalComments,
+    UA.TotalUpDownVotesGiven,
+    UA.AvgPostScore,
+    UA.HasGoldBadge,
+    UA.RepRankByCreationYear,
+    Q.Id AS QuestionId,
+    Q.Title AS QuestionTitle,
+    Q.CreationDate AS QuestionPostDate,
+    Q.ViewCount AS QuestionViews,
+    Q.Score AS QuestionScore,
+    Q.AnswerCount AS ReportedAnswerCount,
+    Q.FavoriteCount,
+    PE.ActualAnswerCount,
+    PE.TotalAnswerScore,
+    PE.AvgAnswerScore,
+    PE.HasAcceptedAnswer,
+    PE.AcceptedAnswerRatio,
+    PE.LinkedPostsCount,
+    PE.DuplicatePostsCount,
+    PE.QuestionRankMonthly,
+    COALESCE(RPE.ClosedCount, 0) AS QuestionClosedCount,
+    COALESCE(RPE.ReopenedCount, 0) AS QuestionReopenedCount,
+    RPE.LatestBodyEditText,
+    STRING_AGG(TGM_QuestionTag.TagName || ':' || TGM_QuestionTag.YearlyTagCount, ', ') WITHIN GROUP (ORDER BY TGM_QuestionTag.YearlyTagCount DESC) AS QuestionTagsWithYearlyCount,
+    STRING_AGG(TGM_QuestionTag.TagName || ':' || ROUND(COALESCE(TGM_QuestionTag.TagYearlyGrowthRate, 0), 2), ', ') WITHIN GROUP (ORDER BY TGM_QuestionTag.TagYearlyGrowthRate DESC NULLS LAST) AS QuestionTagsWithGrowthRate,
+    (SELECT C.Text
+     FROM Comments C
+     WHERE C.PostId = Q.Id
+     ORDER BY C.Score DESC, C.CreationDate DESC
+     LIMIT 1) AS TopCommentTextOnQuestion,
+    (SELECT UBT.BadgeName
+     FROM UserBadgeTimeline UBT
+     WHERE UBT.UserId = U.Id AND UBT.RnLastBadgeClass = 1
+     ORDER BY UBT.BadgeDate DESC
+     LIMIT 1) AS LatestUserBadge,
+    (CAST(U.UpVotes AS NUMERIC) - U.DownVotes) / NULLIF(UA.TotalPosts, 0) AS NetVotePerPost,
+    AGE(TIMESTAMP '2024-10-01 12:34:56', U.CreationDate) AS UserAccountAge,
+    EXTRACT(EPOCH FROM (Q.LastActivityDate - Q.CreationDate)) / (60*60*24) AS DaysUntilLastActivity,
+    (Q.ViewCount * Q.Score * COALESCE(PE.AvgAnswerScore, 0.5) * (1 + COALESCE(PE.AcceptedAnswerRatio, 0))) AS QuestionEngagementWeightedScore,
+    CASE
+        WHEN Q.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN Q.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned'
+        WHEN PE.HasAcceptedAnswer > 0 THEN 'AnsweredAndAccepted'
+        WHEN PE.ActualAnswerCount > 0 THEN 'Answered'
+        ELSE 'Open'
+    END AS QuestionStatusCategory,
+    CASE
+        WHEN Q.Body ILIKE '%performance%' OR Q.Body ILIKE '%optimization%' OR Q.Body ILIKE '%latency%' THEN TRUE
+        ELSE FALSE
+    END AS ContainsPerformanceKeyword,
+    (SELECT AVG(C_sub.Score)
+     FROM Comments C_sub
+     WHERE C_sub.PostId = Q.Id
+       AND C_sub.CreationDate <= Q.CreationDate + INTERVAL '7 days'
+       AND Q.Title ILIKE '%performance%'
+    ) AS AvgEarlyCommentScoreForPerformanceQuestions
+FROM Users U
+LEFT JOIN UserActivitySummary UA ON U.Id = UA.UserId
+LEFT JOIN Posts Q ON U.Id = Q.OwnerUserId AND Q.PostTypeId = 1
+LEFT JOIN PostEngagementMetrics PE ON Q.Id = PE.QuestionId
+LEFT JOIN RecentPostHistoryEvents RPE ON Q.Id = RPE.PostId
+LEFT JOIN LATERAL (
+    SELECT
+        TGM.TagName,
+        TGM.YearlyTagCount,
+        TGM.TagYearlyGrowthRate
+    FROM (SELECT unnest(string_to_array(substring(Q.Tags, 2, length(Q.Tags)-2), '><')) AS TagName) AS QuestionTags
+    JOIN TagGlobalMetrics TGM ON QuestionTags.TagName = TGM.TagName AND TGM.TaggedYear = EXTRACT(YEAR FROM Q.CreationDate)
+) AS TGM_QuestionTag ON TRUE
+WHERE
+    U.Reputation > 5000
+    AND Q.Id IS NOT NULL
+    AND Q.CreationDate >= DATE '2019-01-01'
+    AND (Q.ViewCount > 1000 OR Q.Score > 50 OR Q.FavoriteCount > 5)
+    AND Q.Body IS NOT NULL AND LENGTH(Q.Body) > 100
+    AND U.LastAccessDate >= DATE '2022-01-01'
+GROUP BY
+    U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate,
+    UA.TotalQuestions, UA.TotalAnswers, UA.TotalComments, UA.TotalUpDownVotesGiven, UA.AvgPostScore, UA.HasGoldBadge, UA.RepRankByCreationYear,
+    Q.Id, Q.Title, Q.CreationDate, Q.ViewCount, Q.Score, Q.AnswerCount, Q.FavoriteCount, Q.LastActivityDate, Q.Body, Q.ClosedDate, Q.CommunityOwnedDate,
+    PE.ActualAnswerCount, PE.TotalAnswerScore, PE.AvgAnswerScore, PE.HasAcceptedAnswer, PE.AcceptedAnswerRatio, PE.LinkedPostsCount, PE.DuplicatePostsCount, PE.QuestionRankMonthly,
+    RPE.ClosedCount, RPE.ReopenedCount, RPE.LatestBodyEditText,
+    TGM_QuestionTag.TagName, TGM_QuestionTag.YearlyTagCount, TGM_QuestionTag.TagYearlyGrowthRate,
+    U.UpVotes, U.DownVotes, UA.TotalPosts
+ORDER BY
+    QuestionEngagementWeightedScore DESC NULLS LAST,
+    U.Reputation DESC,
+    QuestionPostDate DESC
+LIMIT 1000;

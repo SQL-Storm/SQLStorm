@@ -1,0 +1,118 @@
+WITH HighReputationUsers AS (
+    SELECT u.Id AS UserId, u.DisplayName, u.Reputation, 
+           DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    WHERE u.Reputation > 10000
+),
+RecentQuestions AS (
+    SELECT p.Id AS QuestionId, p.Title, p.OwnerUserId, p.Score, p.CreationDate,
+           p.AnswerCount, p.ViewCount, p.Tags, 
+           ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RecencyRank
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Score > 0 AND p.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '180 days')
+),
+UserBadges AS (
+    SELECT b.UserId, 
+           COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadgeCount,
+           COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadgeCount,
+           COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadgeCount
+    FROM Badges b
+    GROUP BY b.UserId
+),
+CommentStats AS (
+    SELECT c.PostId,
+           COUNT(*) AS CommentCount,
+           AVG(COALESCE(c.Score, 0)) AS AvgCommentScore
+    FROM Comments c
+    WHERE c.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '180 days')
+    GROUP BY c.PostId
+),
+RecentEdits AS (
+    SELECT ph.PostId, MAX(ph.CreationDate) AS LastEditDate,
+           COUNT(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 END) AS EditCount
+    FROM PostHistory ph
+    WHERE ph.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '180 days')
+    GROUP BY ph.PostId
+)
+SELECT
+    hu.UserId,
+    hu.DisplayName,
+    hu.Reputation,
+    hu.ReputationRank,
+    qb.GoldBadgeCount, qb.SilverBadgeCount, qb.BronzeBadgeCount,
+    rq.QuestionId,
+    rq.Title,
+    rq.Score AS QuestionScore,
+    rq.AnswerCount,
+    rq.ViewCount,
+    SUBSTRING(rq.Tags FROM 1 FOR 100) AS PreviewTags,
+    cs.CommentCount,
+    cs.AvgCommentScore,
+    re.LastEditDate,
+    re.EditCount,
+    CASE 
+        WHEN cs.CommentCount IS NULL THEN 'No Comments'
+        WHEN cs.CommentCount = 0 THEN 'No Comments'
+        WHEN cs.AvgCommentScore > 2 THEN 'Highly Praised'
+        WHEN cs.AvgCommentScore < 0 THEN 'Controversial'
+        ELSE 'Typical'
+    END AS CommentStatus,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1
+            FROM PostLinks pl
+            WHERE pl.PostId = rq.QuestionId AND pl.LinkTypeId = 3
+        ) THEN 'Has Duplicate'
+        ELSE 'Original'
+    END AS DupStatus,
+    (
+        SELECT COUNT(*)
+        FROM Posts ans
+        WHERE ans.ParentId = rq.QuestionId
+              AND ans.Score > 0
+              AND ans.OwnerUserId IS NOT NULL
+    ) AS PositiveAnswerCount,
+    (
+        SELECT STRING_AGG(t.TagName, ', ' ORDER BY t.TagName)
+        FROM Tags t
+        WHERE '<' || t.TagName || '>' = ANY(
+            STRING_TO_ARRAY(SUBSTRING(rq.Tags FROM 2 FOR LENGTH(rq.Tags)-2), '><')
+        )
+    ) AS TagList
+FROM HighReputationUsers hu
+LEFT JOIN UserBadges qb ON hu.UserId = qb.UserId
+LEFT JOIN RecentQuestions rq ON hu.UserId = rq.OwnerUserId AND rq.RecencyRank = 1
+LEFT JOIN CommentStats cs ON rq.QuestionId = cs.PostId
+LEFT JOIN RecentEdits re ON rq.QuestionId = re.PostId
+WHERE (
+        (qb.GoldBadgeCount > 5) 
+     OR (qb.SilverBadgeCount > 10)
+     OR (qb.BronzeBadgeCount > 20)
+     OR (hu.ReputationRank <= 20 AND qb.GoldBadgeCount IS NOT NULL)
+)
+AND hu.ReputationRank <= 100
+GROUP BY
+    hu.UserId,
+    hu.DisplayName,
+    hu.Reputation,
+    hu.ReputationRank,
+    qb.GoldBadgeCount,
+    qb.SilverBadgeCount,
+    qb.BronzeBadgeCount,
+    rq.QuestionId,
+    rq.Title,
+    rq.Score,
+    rq.AnswerCount,
+    rq.ViewCount,
+    rq.Tags,
+    rq.CreationDate,
+    rq.OwnerUserId,
+    rq.RecencyRank,
+    cs.PostId,
+    cs.CommentCount,
+    cs.AvgCommentScore,
+    re.PostId,
+    re.LastEditDate,
+    re.EditCount
+ORDER BY hu.ReputationRank, rq.CreationDate DESC
+LIMIT 50;

@@ -1,0 +1,166 @@
+-- {"query": "4070.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1610} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(p.OwnerUserId, -1) as OwnerUserId,
+        p.CreationDate,
+        1 as Level
+    from Tags t
+    left join Posts p on t.ExcerptPostId = p.Id
+    where t.Count > 1000
+
+    union all
+
+    select
+        th.Id,
+        th.TagName,
+        th.Count,
+        th.OwnerUserId,
+        th.CreationDate,
+        r.Level + 1
+    from RecursiveTagHierarchy r
+    join Tags th on substring(th.TagName, 1, length(r.TagName)) = r.TagName and th.Id != r.Id
+    where r.Level < 3
+),
+RankedUserPosts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        row_number() over(partition by u.Id order by p.CreationDate desc) as RecentPostRank,
+        count(p.Id) over(partition by u.Id) as TotalPosts,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) over(partition by u.Id) as QuestionCount,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) over(partition by u.Id) as AnswerCount
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where u.Reputation >= 10000
+),
+BadgeStats as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(distinct b.Name) as DistinctBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+AcceptedAnswerCounts as (
+    select
+        p.OwnerUserId,
+        count(distinct p.Id) as AcceptedAnswersCount
+    from Posts p
+    join Posts q on q.AcceptedAnswerId = p.Id and q.PostTypeId = 1
+    where p.PostTypeId = 2
+    group by p.OwnerUserId
+),
+PostLinkAggregates as (
+    select
+        p.Id as PostId,
+        count(distinct case when pl.LinkTypeId = 1 then pl.RelatedPostId end) as LinkedPostsCount,
+        count(distinct case when pl.LinkTypeId = 3 then pl.RelatedPostId end) as DuplicateLinksCount
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id
+    group by p.Id
+),
+PostCommentAggregation as (
+    select
+        p.Id as PostId,
+        count(c.Id) as CommentCount,
+        sum(coalesce(c.Score, 0)) as CommentScoreSum,
+        string_agg(distinct coalesce(c.UserDisplayName, 'Anonymous'), ', ' order by c.UserDisplayName) as Commenters
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    group by p.Id
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.CreationDate,
+        count(p.Id) filter (where p.CreationDate between u.CreationDate and u.CreationDate + interval '30 days') as PostsInFirstMonth,
+        count(p.Id) filter (where p.CreationDate between u.CreationDate + interval '6 months' and u.CreationDate + interval '7 months') as PostsInSeventhMonth,
+        count(v.Id) filter (where v.CreationDate between u.CreationDate and u.CreationDate + interval '30 days') as VotesInFirstMonth,
+        count(v.Id) filter (where v.CreationDate between u.CreationDate + interval '6 months' and u.CreationDate + interval '7 months') as VotesInSeventhMonth
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName, u.CreationDate
+),
+UserCloseReasonSummary as (
+    select
+        ph.UserId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseVotesCast
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(coalesce(ph.Comment, '0') as int)
+    where ph.PostHistoryTypeId = 10 and ph.UserId is not null
+    group by ph.UserId, crt.Name
+),
+FinalDataset as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        r.PostId,
+        r.PostTypeId,
+        r.Score,
+        r.ViewCount,
+        r.CreationDate as PostCreationDate,
+        r.Tags,
+        r.TotalPosts,
+        r.QuestionCount,
+        r.AnswerCount,
+        b.GoldBadges,
+        b.SilverBadges,
+        b.BronzeBadges,
+        b.DistinctBadges,
+        coalesce(aac.AcceptedAnswersCount, 0) as AcceptedAnswersCount,
+        pla.LinkedPostsCount,
+        pla.DuplicateLinksCount,
+        pca.CommentCount,
+        pca.CommentScoreSum,
+        pca.Commenters,
+        uaw.PostsInFirstMonth,
+        uaw.PostsInSeventhMonth,
+        uaw.VotesInFirstMonth,
+        uaw.VotesInSeventhMonth,
+        coalesce(ucs.CloseVotesCast, 0) as CloseVotesCast,
+        crt.Name as MostCommonCloseReason,
+        rh.Level as TagHierarchyLevel,
+        rh.TagName as HierarchicalTagName
+    from RankedUserPosts r
+    join Users u on u.Id = r.UserId
+    left join BadgeStats b on b.UserId = u.Id
+    left join AcceptedAnswerCounts aac on aac.OwnerUserId = u.Id
+    left join PostLinkAggregates pla on pla.PostId = r.PostId
+    left join PostCommentAggregation pca on pca.PostId = r.PostId
+    left join UserActivityWindow uaw on uaw.UserId = u.Id
+    left join LATERAL (
+        select crt2.Name
+        from UserCloseReasonSummary ucs2
+        join CloseReasonTypes crt2 on crt2.Name = ucs2.CloseReasonName
+        where ucs2.UserId = u.Id
+        order by ucs2.CloseVotesCast desc limit 1
+    ) crt on true
+    left join UserCloseReasonSummary ucs on ucs.UserId = u.Id
+    left join RecursiveTagHierarchy rh on rh.TagName = ANY(string_to_array(coalesce(r.Tags, ''), '><'))
+    where r.RecentPostRank <= 5
+)
+select *
+from FinalDataset
+where 
+    (Score > 10 or ViewCount > 1000)
+    and (GoldBadges + SilverBadges + BronzeBadges) > 2
+    and (CloseVotesCast is null or CloseVotesCast < 10)
+    and (PostsInFirstMonth > 5 or PostsInSeventhMonth > 3)
+order by Reputation desc, Score desc, ViewCount desc
+limit 100;

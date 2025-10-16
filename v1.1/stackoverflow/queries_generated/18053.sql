@@ -1,0 +1,172 @@
+-- {"query": "18053.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2406} 
+
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS rn_score_views,
+        AVG(CAST(p.Score AS FLOAT)) OVER (PARTITION BY p.PostTypeId) AS avg_score_for_type,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS previous_post_score,
+        LEAD(p.Score, 1, 0) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS next_post_score,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 1
+            ELSE 0
+        END AS is_closed_flag
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+),
+UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT CASE WHEN c.UserId = u.Id THEN c.Id END) AS UserCommentsOnOwnPosts,
+        COUNT(DISTINCT CASE WHEN v.UserId = u.Id AND v.VoteTypeId = 2 THEN v.Id END) AS UserUpvotesOnOwnPosts,
+        COUNT(DISTINCT CASE WHEN v.UserId = u.Id AND v.VoteTypeId = 3 THEN v.Id END) AS UserDownvotesOnOwnPosts,
+        SUM(CASE WHEN p.OwnerUserId = u.Id THEN 1 ELSE 0 END) AS PostsOwned,
+        AVG(CASE WHEN p.OwnerUserId = u.Id THEN p.Score ELSE NULL END) AS AvgScoreOfOwnedPosts,
+        MAX(CASE WHEN p.OwnerUserId = u.Id THEN p.ViewCount ELSE NULL END) AS MaxViewCountOfOwnedPosts,
+        STRING_AGG(DISTINCT t.TagName, ',') WITHIN GROUP (ORDER BY t.TagName) AS TopTagsForUser
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON p.Id = c.PostId AND c.UserId = u.Id
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.UserId = u.Id
+    LEFT JOIN (
+        SELECT
+            p_tags.Id,
+            t.TagName
+        FROM Posts p_tags
+        CROSS APPLY STRING_SPLIT(REPLACE(REPLACE(p_tags.Tags, '<', ''), '>', ''), ' ') AS s
+        JOIN Tags t ON s.value = t.TagName
+        WHERE p_tags.Tags IS NOT NULL
+    ) t ON p.Id = t.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+),
+PostInteractionSummary AS (
+    SELECT
+        rp.PostId,
+        rp.OwnerUserId,
+        rp.PostTypeId,
+        rp.PostTypeName,
+        rp.Score,
+        rp.ViewCount,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.CreationDate,
+        rp.rn_score_views,
+        rp.avg_score_for_type,
+        rp.previous_post_score,
+        rp.next_post_score,
+        rp.is_closed_flag,
+        COALESCE(u.DisplayName, 'Unknown User') AS OwnerDisplayName,
+        COALESCE(u.Reputation, 0) AS OwnerReputation,
+        COUNT(DISTINCT CASE WHEN c.PostId = rp.PostId THEN c.Id END) AS CommentCountOnPost,
+        SUM(CASE WHEN v.PostId = rp.PostId AND v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvoteCountOnPost,
+        SUM(CASE WHEN v.PostId = rp.PostId AND v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvoteCountOnPost,
+        MAX(CASE WHEN ph.PostId = rp.PostId AND ph.PostHistoryTypeId = 10 THEN ph.CreationDate ELSE NULL END) AS LastCloseDate,
+        MAX(CASE WHEN ph.PostId = rp.PostId AND ph.PostHistoryTypeId = 11 THEN ph.CreationDate ELSE NULL END) AS LastReopenDate
+    FROM RankedPosts rp
+    LEFT JOIN Users u ON rp.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON rp.PostId = c.PostId
+    LEFT JOIN Votes v ON rp.PostId = v.PostId
+    LEFT JOIN PostHistory ph ON rp.PostId = ph.PostId
+    GROUP BY
+        rp.PostId, rp.OwnerUserId, rp.PostTypeId, rp.PostTypeName, rp.Score, rp.ViewCount,
+        rp.AnswerCount, rp.CommentCount, rp.FavoriteCount, rp.CreationDate, rp.rn_score_views,
+        rp.avg_score_for_type, rp.previous_post_score, rp.next_post_score, rp.is_closed_flag,
+        COALESCE(u.DisplayName, 'Unknown User'), COALESCE(u.Reputation, 0)
+)
+SELECT
+    pis.PostId,
+    pis.PostTypeName,
+    pis.Score,
+    pis.ViewCount,
+    pis.OwnerDisplayName,
+    pis.OwnerReputation,
+    pis.CreationDate,
+    pis.CommentCountOnPost,
+    pis.UpvoteCountOnPost,
+    pis.DownvoteCountOnPost,
+    pis.rn_score_views,
+    pis.avg_score_for_type,
+    CASE
+        WHEN pis.rn_score_views <= 10 THEN 'Top 10 by Score/Views'
+        WHEN pis.Score > pis.avg_score_for_type * 1.5 THEN 'Above Average Score'
+        WHEN pis.Score < pis.avg_score_for_type * 0.5 THEN 'Below Average Score'
+        ELSE 'Average Score'
+    END AS PerformanceCategory,
+    pis.previous_post_score,
+    pis.next_post_score,
+    CASE
+        WHEN pis.previous_post_score IS NOT NULL AND pis.next_post_score IS NOT NULL AND pis.previous_post_score < pis.Score AND pis.next_post_score < pis.Score THEN 'Local Peak Score'
+        WHEN pis.previous_post_score IS NOT NULL AND pis.next_post_score IS NOT NULL AND pis.previous_post_score > pis.Score AND pis.next_post_score > pis.Score THEN 'Local Trough Score'
+        ELSE 'No Significant Trend'
+    END AS ScoreTrend,
+    pis.is_closed_flag,
+    CASE
+        WHEN pis.is_closed_flag = 1 AND pis.ClosedDate IS NULL THEN 'Flagged for Closure'
+        WHEN pis.is_closed_flag = 1 AND pis.ClosedDate IS NOT NULL THEN 'Closed'
+        ELSE 'Open'
+    END AS Status,
+    pis.LastCloseDate,
+    pis.LastReopenDate,
+    COALESCE(ue.PostsOwned, 0) AS TotalPostsByOwner,
+    COALESCE(ue.AvgScoreOfOwnedPosts, 0) AS AvgScoreOfAllOwnerPosts,
+    ue.TopTagsForUser,
+    CASE
+        WHEN pis.Score > 1000 AND pis.ViewCount > 50000 AND pis.AnswerCount > 10 THEN 'High Engagement Post'
+        WHEN pis.FavoriteCount > 50 THEN 'Frequently Favorited'
+        ELSE 'Standard Engagement Post'
+    END AS EngagementLevel,
+    LEFT(pis.OwnerDisplayName, 3) || '%' AS PartialDisplayName,
+    LENGTH(pis.PostTypeName) AS PostTypeNameLength,
+    FLOOR(pis.ViewCount / 100.0) * 100 AS RoundedViewCount,
+    CASE WHEN pis.OwnerReputation > 10000 THEN 'High Reputation User' WHEN pis.OwnerReputation BETWEEN 1000 AND 10000 THEN 'Medium Reputation User' ELSE 'Low Reputation User' END AS OwnerReputationTier
+FROM PostInteractionSummary pis
+LEFT JOIN UserEngagement ue ON pis.OwnerUserId = ue.UserId
+WHERE pis.Score > 0 AND pis.ViewCount > 0
+UNION
+SELECT
+    NULL AS PostId,
+    'Total' AS PostTypeName,
+    SUM(Score) AS Score,
+    SUM(ViewCount) AS ViewCount,
+    'Overall' AS OwnerDisplayName,
+    AVG(OwnerReputation) AS OwnerReputation,
+    NULL AS CreationDate,
+    COUNT(DISTINCT pis.PostId) AS CommentCountOnPost,
+    SUM(pis.UpvoteCountOnPost) AS UpvoteCountOnPost,
+    SUM(pis.DownvoteCountOnPost) AS DownvoteCountOnPost,
+    NULL AS rn_score_views,
+    AVG(pis.avg_score_for_type) AS avg_score_for_type,
+    NULL AS PerformanceCategory,
+    NULL AS previous_post_score,
+    NULL AS next_post_score,
+    NULL AS ScoreTrend,
+    SUM(is_closed_flag) AS is_closed_flag,
+    NULL AS Status,
+    NULL AS LastCloseDate,
+    NULL AS LastReopenDate,
+    COUNT(DISTINCT ue.UserId) AS TotalPostsByOwner,
+    AVG(ue.AvgScoreOfOwnedPosts) AS AvgScoreOfAllOwnerPosts,
+    NULL AS TopTagsForUser,
+    NULL AS EngagementLevel,
+    NULL AS PartialDisplayName,
+    AVG(LENGTH(pis.PostTypeName)) AS PostTypeNameLength,
+    SUM(FLOOR(pis.ViewCount / 100.0) * 100) AS RoundedViewCount,
+    NULL AS OwnerReputationTier
+FROM PostInteractionSummary pis
+LEFT JOIN UserEngagement ue ON pis.OwnerUserId = ue.UserId
+WHERE pis.Score > 0 AND pis.ViewCount > 0;

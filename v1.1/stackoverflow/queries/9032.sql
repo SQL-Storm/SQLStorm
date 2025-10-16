@@ -1,0 +1,96 @@
+WITH RecentPosts AS (
+  SELECT
+    p.Id,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Tags,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+  FROM Posts p
+  WHERE p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY
+),
+UserStats AS (
+  SELECT
+    u.Id                     AS UserId,
+    u.DisplayName,
+    u.CreationDate           AS UserCreationDate,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsCount,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersCount,
+    COUNT(b.Id)              AS BadgesCount,
+    COALESCE(SUM(b.Class), 0) AS BadgeScore,
+    AVG(p.Score)             AS AvgPostScore
+  FROM Users u
+  LEFT JOIN Posts p  ON p.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON b.UserId      = u.Id
+  LEFT JOIN Votes  v ON v.PostId      = p.Id
+                     AND v.VoteTypeId IN (2, 3)
+  GROUP BY u.Id, u.DisplayName, u.CreationDate
+),
+TagAggregates AS (
+  SELECT
+    t.TagName,
+    COUNT(*)      AS TotalTaggedPosts,
+    MAX(p.Score)  AS MaxScore,
+    MIN(p.CreationDate) AS FirstTagged
+  FROM Tags t
+  JOIN Posts p
+    ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+  GROUP BY t.TagName
+)
+SELECT
+  us.UserId,
+  us.DisplayName,
+  us.QuestionsCount,
+  us.AnswersCount,
+  us.BadgesCount,
+  us.BadgeScore,
+  us.AvgPostScore,
+  rp.Id                  AS RecentPostId,
+  COALESCE(cmt.CommentCount, 0) AS LatestComments,
+  ta.TotalTaggedPosts,
+  ta.MaxScore,
+  ta.FirstTagged
+FROM UserStats us
+LEFT JOIN RecentPosts rp
+  ON rp.OwnerUserId = us.UserId
+ AND rp.rn           = 1
+LEFT JOIN LATERAL (
+  SELECT COUNT(*) AS CommentCount
+  FROM Comments c
+  WHERE c.PostId      = rp.Id
+    AND c.CreationDate > us.UserCreationDate - INTERVAL '1' YEAR
+) cmt ON TRUE
+LEFT JOIN TagAggregates ta
+  ON ta.TagName = ANY (
+       SELECT UNNEST(
+         string_to_array(
+           substring(rp.Tags FROM 2 FOR (length(rp.Tags)-2)),
+           '><'
+         )
+       )
+     )
+WHERE us.BadgeScore > (
+  SELECT AVG(u2.Reputation) FROM Users u2
+)
+UNION ALL
+SELECT
+  u.Id,
+  u.DisplayName,
+  0 AS QuestionsCount,
+  0 AS AnswersCount,
+  0 AS BadgesCount,
+  0 AS BadgeScore,
+  0 AS AvgPostScore,
+  NULL AS RecentPostId,
+  NULL AS LatestComments,
+  NULL AS TotalTaggedPosts,
+  NULL AS MaxScore,
+  NULL AS FirstTagged
+FROM Users u
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM Posts p
+  WHERE p.OwnerUserId = u.Id
+)
+ORDER BY BadgeScore DESC NULLS LAST
+OFFSET 0 ROWS
+FETCH FIRST 100 ROWS ONLY;

@@ -1,0 +1,139 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        COALESCE(b.BadgeCount, 0) AS BadgeCount,
+        RANK() OVER (PARTITION BY b.Class ORDER BY u.Reputation DESC) AS RankInClass,
+        AVG(p_inner.Score) OVER (PARTITION BY p_inner.OwnerUserId ORDER BY p_inner.CreationDate ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS MovingAvgScore
+    FROM Users u
+    LEFT JOIN (
+        SELECT UserId, Class, COUNT(*) AS BadgeCount 
+        FROM Badges 
+        GROUP BY UserId, Class
+    ) b ON u.Id = b.UserId
+    LEFT JOIN Posts p_inner ON p_inner.OwnerUserId = u.Id
+), PostTags AS (
+    -- parse Tags like '<tag1><tag2>' into rows: tag_name
+    SELECT
+        p2.Id AS post_id,
+        TRIM(tag_name) AS tag_name
+    FROM Posts p2,
+    LATERAL (
+        SELECT value AS tag_name
+        FROM (
+            -- remove leading and trailing angle brackets then split on '><'
+            SELECT 
+                CASE 
+                    WHEN SUBSTR(p2.Tags, 1, 1) = '<' AND SUBSTR(p2.Tags, -1, 1) = '>' 
+                    THEN SUBSTR(p2.Tags, 2, LENGTH(p2.Tags) - 2)
+                    ELSE p2.Tags
+                END AS inner_tags
+        ) s,
+        LATERAL (
+            -- split by '><' using simple string split for standard SQL: iteratively using regexp_split_to_table not portable,
+            -- use simple JSON trick if available else use recursive CTE; here use standard SQL STRING_SPLIT style via regexp-like using XML/JSON is dialect-specific.
+            -- To keep portable, split using a simple recursive approach:
+            (WITH RECURSIVE split(idx, rest, part) AS (
+                SELECT 1 AS idx,
+                       s.inner_tags AS rest,
+                       CASE
+                         WHEN INSTR(s.inner_tags, '><') = 0 THEN s.inner_tags
+                         ELSE SUBSTR(s.inner_tags, 1, INSTR(s.inner_tags, '><')-1)
+                       END AS part
+                UNION ALL
+                SELECT idx+1,
+                       CASE
+                         WHEN INSTR(rest, '><') = 0 THEN ''
+                         ELSE SUBSTR(rest, INSTR(rest, '><')+2)
+                       END,
+                       CASE
+                         WHEN INSTR(rest, '><') = 0 THEN NULL
+                         WHEN INSTR(CASE WHEN INSTR(rest, '><') = 0 THEN '' ELSE SUBSTR(rest, INSTR(rest, '><')+2) END, '><') = 0
+                           THEN CASE WHEN INSTR(rest, '><') = 0 THEN NULL ELSE SUBSTR(rest, INSTR(rest, '><')+2) END
+                         ELSE SUBSTR(CASE WHEN INSTR(rest, '><') = 0 THEN '' ELSE SUBSTR(rest, INSTR(rest, '><')+2) END, 1, INSTR(CASE WHEN INSTR(rest, '><') = 0 THEN '' ELSE SUBSTR(rest, INSTR(rest, '><')+2) END, '><')-1)
+                       END
+                FROM split
+                WHERE rest IS NOT NULL AND rest <> '' AND INSTR(rest, '><') > 0
+            )
+            SELECT part FROM split WHERE part IS NOT NULL)
+        ) parts
+    )
+), PostAnalysis AS (
+    SELECT 
+        p.Id,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS ActualCommentCount,
+        (LENGTH(p.Body) - LENGTH(REPLACE(p.Body, '<code>', ''))) AS CodeSnippetCount,
+        (SELECT COUNT(DISTINCT ph.UserId) 
+         FROM PostHistory ph 
+         WHERE ph.PostId = p.AcceptedAnswerId AND ph.PostHistoryTypeId IN (5,8)
+        ) AS AcceptedAnswerEdits,
+        COALESCE(STRING_AGG(DISTINCT pt.tag_name, ', '), 'Untagged') AS Tags,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.ViewCount > 1000 THEN 'Popular'
+            ELSE 'Standard'
+        END AS PostStatus
+    FROM Posts p
+    LEFT JOIN PostTags pt ON pt.post_id = p.Id
+    WHERE p.PostTypeId = 1
+      AND (p.Score > 50 OR p.FavoriteCount > 10)
+      AND EXISTS (
+          SELECT 1 
+          FROM PostHistory ph 
+          WHERE ph.PostId = p.AcceptedAnswerId 
+          GROUP BY ph.PostId 
+          HAVING COUNT(*) > 3
+      )
+    GROUP BY p.Id, p.OwnerUserId, p.Score, p.ViewCount, p.AnswerCount, p.Body, p.AcceptedAnswerId, p.ClosedDate, p.Tags
+)
+SELECT 
+    pa.Id,
+    pa.OwnerUserId,
+    pa.Score,
+    pa.ViewCount,
+    pa.AnswerCount,
+    pa.ActualCommentCount,
+    pa.CodeSnippetCount,
+    pa.AcceptedAnswerEdits,
+    pa.Tags,
+    pa.PostStatus,
+    us.RankInClass,
+    us.MovingAvgScore,
+    (us.UpVotes * 1.0 / NULLIF(us.DownVotes, 0)) AS VoteRatio,
+    EXTRACT(YEAR FROM (cast('2024-10-01' as date) - u.CreationDate)) AS AccountAgeYears
+FROM PostAnalysis pa
+LEFT JOIN UserStats us ON pa.OwnerUserId = us.Id
+LEFT JOIN Users u ON pa.OwnerUserId = u.Id
+WHERE pa.ActualCommentCount > pa.AnswerCount * 0.5
+  AND (us.BadgeCount > 10 OR pa.CodeSnippetCount > 5)
+  AND (LOWER(pa.Tags) LIKE '%sql%' OR LOWER(pa.Tags) LIKE '%performance%')
+UNION ALL
+SELECT 
+    pa.Id,
+    pa.OwnerUserId,
+    pa.Score,
+    pa.ViewCount,
+    pa.AnswerCount,
+    pa.ActualCommentCount,
+    pa.CodeSnippetCount,
+    pa.AcceptedAnswerEdits,
+    pa.Tags,
+    pa.PostStatus,
+    NULL AS RankInClass,
+    NULL AS MovingAvgScore,
+    NULL AS VoteRatio,
+    NULL AS AccountAgeYears
+FROM PostAnalysis pa
+WHERE NOT EXISTS (
+    SELECT 1 
+    FROM PostLinks pl 
+    WHERE pl.PostId = pa.Id 
+      AND pl.LinkTypeId = 3
+)
+ORDER BY Score DESC, ViewCount DESC;

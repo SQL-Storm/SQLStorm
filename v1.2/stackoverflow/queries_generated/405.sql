@@ -1,0 +1,177 @@
+-- {"query": "405.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1575} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level,
+        CAST(t.TagName AS VARCHAR(1000)) AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+
+    UNION ALL
+
+    SELECT 
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.ExcerptPostId,
+        child.WikiPostId,
+        parent.Level + 1,
+        parent.Path || ' > ' || child.TagName
+    FROM Tags child
+    JOIN RecursiveTagHierarchy parent ON child.Id <> parent.Id AND child.Count < parent.Count
+    WHERE child.IsModeratorOnly = 0 AND parent.Level < 3
+),
+UserBadgeCounts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COUNT(b.Id) AS TotalBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TopQuestions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Score >= 10 AND p.ViewCount IS NOT NULL
+),
+QuestionAnswerStats AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        COUNT(a.Id) AS AnswerCount,
+        AVG(a.Score) FILTER (WHERE a.Score IS NOT NULL) AS AvgAnswerScore,
+        MAX(a.Score) FILTER (WHERE a.Score IS NOT NULL) AS MaxAnswerScore,
+        SUM(COALESCE(vtUp.VoteCount, 0)) AS TotalUpVotesOnAnswers,
+        SUM(COALESCE(vtDown.VoteCount, 0)) AS TotalDownVotesOnAnswers
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS VoteCount
+        FROM Votes
+        WHERE VoteTypeId = 2
+        GROUP BY PostId
+    ) vtUp ON vtUp.PostId = a.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS VoteCount
+        FROM Votes
+        WHERE VoteTypeId = 3
+        GROUP BY PostId
+    ) vtDown ON vtDown.PostId = a.Id
+    WHERE q.PostTypeId = 1 AND q.Score >= 10
+    GROUP BY q.Id, q.Title, q.OwnerUserId, q.Score, q.ViewCount, q.Tags
+),
+UserActivitySummary AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsPosted,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersPosted,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        COALESCE(SUM(vtUp.VoteCount), 0) AS TotalUpVotesReceived,
+        COALESCE(SUM(vtDown.VoteCount), 0) AS TotalDownVotesReceived
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN (
+        SELECT p.OwnerUserId, COUNT(*) AS VoteCount
+        FROM Votes v
+        JOIN Posts p ON p.Id = v.PostId
+        WHERE v.VoteTypeId = 2
+        GROUP BY p.OwnerUserId
+    ) vtUp ON vtUp.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT p.OwnerUserId, COUNT(*) AS VoteCount
+        FROM Votes v
+        JOIN Posts p ON p.Id = v.PostId
+        WHERE v.VoteTypeId = 3
+        GROUP BY p.OwnerUserId
+    ) vtDown ON vtDown.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+ClosedQuestionsWithReasons AS (
+    SELECT 
+        ph.PostId,
+        ph.CreationDate AS CloseDate,
+        crt.Name AS CloseReason,
+        p.Title,
+        p.OwnerUserId
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS SMALLINT)
+    JOIN Posts p ON p.Id = ph.PostId
+    WHERE ph.PostHistoryTypeId = 10 -- Post Closed
+),
+UserCloseStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT cq.PostId) AS ClosedQuestionsCount,
+        STRING_AGG(DISTINCT cq.CloseReason, ', ' ORDER BY cq.CloseReason) AS CloseReasons
+    FROM Users u
+    LEFT JOIN ClosedQuestionsWithReasons cq ON cq.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+FinalResult AS (
+    SELECT 
+        uas.Id AS UserId,
+        uas.DisplayName,
+        ubc.GoldBadges,
+        ubc.SilverBadges,
+        ubc.BronzeBadges,
+        ubc.TotalBadges,
+        uas.QuestionsPosted,
+        uas.AnswersPosted,
+        uas.CommentsMade,
+        uas.TotalUpVotesReceived,
+        uas.TotalDownVotesReceived,
+        ucs.ClosedQuestionsCount,
+        ucs.CloseReasons,
+        qas.QuestionId,
+        qas.Title AS TopQuestionTitle,
+        qas.QuestionScore,
+        qas.ViewCount AS QuestionViewCount,
+        qas.AnswerCount,
+        qas.AvgAnswerScore,
+        qas.MaxAnswerScore,
+        qas.TotalUpVotesOnAnswers,
+        qas.TotalDownVotesOnAnswers,
+        rth.Level AS TagHierarchyLevel,
+        rth.Path AS TagHierarchyPath
+    FROM UserActivitySummary uas
+    LEFT JOIN UserBadgeCounts ubc ON ubc.UserId = uas.Id
+    LEFT JOIN UserCloseStats ucs ON ucs.UserId = uas.Id
+    LEFT JOIN TopQuestions tq ON tq.OwnerUserId = uas.Id AND tq.rn = 1
+    LEFT JOIN QuestionAnswerStats qas ON qas.QuestionId = tq.Id
+    LEFT JOIN RecursiveTagHierarchy rth ON rth.TagName = ANY(string_to_array(replace(replace(qas.Tags, '<', ''), '>', ','), ','))
+)
+SELECT *
+FROM FinalResult
+WHERE 
+    (GoldBadges > 0 OR SilverBadges > 2)
+    AND QuestionsPosted > 5
+    AND (ClosedQuestionsCount IS NULL OR ClosedQuestionsCount < 3)
+    AND (TagHierarchyLevel IS NOT NULL AND TagHierarchyLevel <= 3)
+ORDER BY TotalUpVotesReceived DESC NULLS LAST, QuestionScore DESC NULLS LAST
+LIMIT 100;

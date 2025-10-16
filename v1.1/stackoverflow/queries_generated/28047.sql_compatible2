@@ -1,0 +1,98 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserJoinDate,
+        COALESCE(u.DisplayName, 'Anonymous') AS DisplayName,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        AVG(p.Score) OVER (PARTITION BY u.Id) AS AvgPostScore
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.DisplayName
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.AnswerCount,
+        p.Tags,
+        STRING_AGG(DISTINCT ph.Text, ' | ') AS EditHistory,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS Upvotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS Downvotes,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostRecencyRank
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (2,5,8)
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.ClosedDate IS NULL OR p.ClosedDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 YEAR'
+    GROUP BY p.Id, p.OwnerUserId, p.PostTypeId, p.CreationDate, p.Score, p.AnswerCount, p.Tags
+)
+SELECT 
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    pa.PostId,
+    pa.Score AS PostScore,
+    pa.Upvotes - pa.Downvotes AS NetVotes,
+    pa.Tags,
+    CASE 
+        WHEN pa.Tags LIKE '%<sql>%' THEN 'SQL Expert'
+        WHEN pa.Tags LIKE '%<python>%' THEN 'Python Expert'
+        ELSE 'Generalist'
+    END AS TagCategory,
+    (CASE 
+        WHEN pa.EditHistory IS NULL OR pa.EditHistory = '' THEN 0
+        ELSE (LENGTH(pa.EditHistory) - LENGTH(REPLACE(pa.EditHistory, ' | ', ''))) / LENGTH(' | ') + 1
+    END) AS EditCount,
+    (SELECT AVG(CAST(p2.AnswerCount AS DECIMAL)) FROM Posts p2 WHERE p2.OwnerUserId = us.UserId AND p2.PostTypeId = 1) AS AvgAnswersPerQuestion,
+    COALESCE(pl.RelatedPostCount, 0) AS RelatedPosts,
+    us.AvgPostScore / NULLIF(us.TotalPosts, 0) AS EngagementRatio
+FROM UserStats us
+INNER JOIN PostAnalysis pa ON us.UserId = pa.OwnerUserId AND pa.PostRecencyRank = 1
+LEFT JOIN (
+    SELECT 
+        PostId,
+        COUNT(DISTINCT RelatedPostId) AS RelatedPostCount
+    FROM PostLinks 
+    WHERE LinkTypeId = 1
+    GROUP BY PostId
+) pl ON pa.PostId = pl.PostId
+WHERE us.Reputation > 1000
+    AND us.UserJoinDate < CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 YEARS'
+    AND EXISTS (
+        SELECT 1 
+        FROM Votes 
+        WHERE UserId = us.UserId 
+        AND CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 MONTHS'
+    )
+GROUP BY
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    pa.PostId,
+    pa.Score,
+    pa.Upvotes,
+    pa.Downvotes,
+    pa.Tags,
+    pa.EditHistory,
+    pl.RelatedPostCount,
+    us.AvgPostScore,
+    us.TotalPosts
+ORDER BY 
+    us.Reputation DESC, 
+    EngagementRatio DESC
+LIMIT 100;

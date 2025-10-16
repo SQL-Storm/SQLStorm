@@ -1,0 +1,109 @@
+WITH RecursiveUserTree AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        1 AS Level,
+        CAST(u.Id AS VARCHAR) AS Path,
+        u.Views,
+        u.CreationDate AS UserCreationDate
+    FROM
+        Users u
+    WHERE
+        u.Reputation > 1000
+    UNION ALL
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        rut.Level + 1,
+        rut.Path || '>' || CAST(u.Id AS VARCHAR),
+        u.Views,
+        u.CreationDate
+    FROM
+        Users u
+        JOIN RecursiveUserTree rut ON u.AccountId = rut.UserId
+    WHERE
+        u.Reputation > 500
+),
+HighScorePosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.LastActivityDate,
+        COUNT(DISTINCT v.Id) OVER (PARTITION BY p.Id) AS DistinctVotes,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS PostRank,
+        STRING_AGG(t.TagName, ',') WITHIN GROUP (ORDER BY MAX(t.Count) DESC) AS TagList
+    FROM
+        Posts p
+        LEFT JOIN Votes v ON p.Id = v.PostId
+        LEFT JOIN Tags t ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE
+        p.PostTypeId IN (1, 2)
+        AND p.Score > 50
+    GROUP BY
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.LastActivityDate
+)
+SELECT
+    rut.UserId,
+    rut.DisplayName,
+    rut.Level,
+    rut.Views,
+    rut.Path,
+    rut.UserCreationDate,
+    hsp.PostId,
+    hsp.PostTypeId,
+    hsp.Title,
+    hsp.Score,
+    hsp.ViewCount,
+    hsp.TagList,
+    hsp.LastActivityDate,
+    hsp.PostRank,
+    hsp.Tags,
+    COALESCE(ph.Text, 'NoHistory') AS PostHistoryText,
+    CASE
+      WHEN hsp.PostRank <= 10 THEN COALESCE(hsp.DistinctVotes, 0) + hsp.Score
+      WHEN COALESCE(c.Score, 0) > 10 THEN hsp.ViewCount * hsp.Score
+      ELSE 0
+    END AS votersFavorites
+FROM
+    RecursiveUserTree rut
+    LEFT JOIN HighScorePosts hsp ON rut.UserId = hsp.OwnerUserId
+    LEFT JOIN Comments c ON hsp.PostId = c.PostId
+    LEFT JOIN PostHistory ph ON hsp.PostId = ph.PostId
+       AND ph.PostHistoryTypeId = 19
+WHERE
+    (rut.Level > 1 OR rut.Views > 5000)
+    AND COALESCE(hsp.DistinctVotes, 0) > 2
+GROUP BY
+    rut.UserId,
+    rut.DisplayName,
+    rut.Level,
+    rut.Views,
+    rut.Path,
+    rut.UserCreationDate,
+    hsp.PostId,
+    hsp.PostTypeId,
+    hsp.OwnerUserId,
+    hsp.Title,
+    hsp.Score,
+    hsp.ViewCount,
+    hsp.TagList,
+    hsp.LastActivityDate,
+    hsp.PostRank,
+    hsp.Tags,
+    ph.Text,
+    c.Score,
+    hsp.DistinctVotes;

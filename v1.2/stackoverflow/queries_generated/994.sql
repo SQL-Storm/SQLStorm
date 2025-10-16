@@ -1,0 +1,193 @@
+-- {"query": "994.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1653} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+  UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Level + 1
+    FROM Tags t2
+    INNER JOIN RecursiveTagHierarchy r ON t2.Id = (
+        SELECT pl.RelatedPostId FROM PostLinks pl
+        WHERE pl.PostId = r.ExcerptPostId AND pl.LinkTypeId = 1
+        LIMIT 1
+    )
+    WHERE r.Level < 3
+),
+TopUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate) AS UserRank
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(b.Id) > 5
+),
+QuestionAndAnswers AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.ParentId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        u.DisplayName AS OwnerName,
+        u.Reputation AS OwnerReputation,
+        COALESCE(pc.CommentCount, 0) AS CommentCount,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        RANK() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate) AS AnswerRank
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CommentCount
+        FROM Comments
+        GROUP BY PostId
+    ) pc ON pc.PostId = p.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+RecentPostHistoryEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        ph.UserDisplayName,
+        ph.CreationDate,
+        ph.PostHistoryTypeId,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS RevRank
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+),
+FilteredPostHistory AS (
+    SELECT
+        ph.PostId,
+        ph.UserDisplayName,
+        ph.CreationDate,
+        ph.PostHistoryTypeId
+    FROM RecentPostHistoryEdits ph
+    WHERE ph.RevRank = 1
+),
+UserCommentCounts AS (
+    SELECT
+        c.UserId,
+        u.DisplayName,
+        COUNT(c.Id) AS TotalComments,
+        SUM(CASE WHEN c.CreationDate > now() - interval '30 days' THEN 1 ELSE 0 END) AS RecentComments
+    FROM Comments c
+    JOIN Users u ON u.Id = c.UserId
+    GROUP BY c.UserId, u.DisplayName
+),
+HighActivityUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        ua.TotalComments,
+        ua.RecentComments
+    FROM Users u
+    JOIN UserCommentCounts ua ON ua.UserId = u.Id
+    WHERE ua.RecentComments > 10
+),
+PostsWithTagCount AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.Tags,
+        ARRAY_LENGTH(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><'), 1) AS TagCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1 -- questions only
+),
+FinalSelection AS (
+    SELECT
+        q.PostId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.IsClosed,
+        q.OwnerUserId,
+        q.OwnerName,
+        q.OwnerReputation,
+        ph.UserDisplayName AS LastEditor,
+        ph.CreationDate AS LastEditDate,
+        uq.GoldBadges,
+        uq.SilverBadges,
+        uq.BronzeBadges,
+        ua.TotalComments,
+        ua.RecentComments,
+        pt.TagName,
+        pt.Level,
+        pwt.TagCount,
+        q.AcceptedAnswerId,
+        a.Score AS AcceptedAnswerScore,
+        a.CreationDate AS AcceptedAnswerCreationDate,
+        ROW_NUMBER() OVER (PARTITION BY q.PostId ORDER BY a.Score DESC NULLS LAST) AS AnswerOrderingRank
+    FROM QuestionAndAnswers q
+    LEFT JOIN FilteredPostHistory ph ON ph.PostId = q.PostId
+    LEFT JOIN TopUsers uq ON uq.Id = q.OwnerUserId
+    LEFT JOIN UserCommentCounts ua ON ua.UserId = q.OwnerUserId
+    LEFT JOIN RecursiveTagHierarchy pt ON pt.ExcerptPostId = q.PostId OR POSITION(CONCAT('<', pt.TagName, '>') IN COALESCE(q.Tags, '')) > 0
+    LEFT JOIN PostsWithTagCount pwt ON pwt.Id = q.PostId
+    LEFT JOIN Posts a ON a.Id = q.AcceptedAnswerId
+    WHERE q.PostTypeId = 1
+)
+SELECT
+    fs.PostId,
+    fs.Title,
+    to_char(fs.CreationDate, 'YYYY-MM-DD') AS CreatedAt,
+    fs.Score,
+    fs.ViewCount,
+    CASE WHEN fs.IsClosed = 1 THEN 'Closed' ELSE 'Open' END AS Status,
+    fs.OwnerName,
+    fs.OwnerReputation,
+    COALESCE(fs.GoldBadges, 0) AS GoldBadges,
+    COALESCE(fs.SilverBadges, 0) AS SilverBadges,
+    COALESCE(fs.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(fs.TotalComments, 0) AS TotalComments,
+    COALESCE(fs.RecentComments, 0) AS RecentComments,
+    fs.TagName,
+    fs.Level AS TagHierarchyLevel,
+    fs.TagCount,
+    COALESCE(fs.AcceptedAnswerScore, 0) AS AcceptedAnswerScore,
+    fs.AcceptedAnswerCreationDate,
+    RANK() OVER (PARTITION BY fs.OwnerUserId ORDER BY fs.Score DESC) AS UserPostRank,
+    CASE
+        WHEN fs.LastEditDate IS NULL THEN 'Never Edited'
+        ELSE to_char(fs.LastEditDate, 'YYYY-MM-DD HH24:MI')
+    END AS LastEditTimestamp,
+    CASE
+        WHEN POSITION('sql' IN LOWER(fs.Tags)) > 0 THEN 'Contains SQL Tag'
+        ELSE 'No SQL Tag'
+    END AS SqlTagPresence,
+    CASE
+        WHEN fs.ViewCount > 10000 THEN 'Popular'
+        WHEN fs.ViewCount BETWEEN 1000 AND 10000 THEN 'Moderately Viewed'
+        ELSE 'Low Views'
+    END AS PopularityCategory
+FROM FinalSelection fs
+WHERE fs.TagHierarchyLevel <= 2
+  AND fs.UserPostRank <= 10
+  AND (fs.RecentComments > 5 OR fs.Score > 50)
+ORDER BY fs.Score DESC, fs.ViewCount DESC, fs.CreationDate DESC
+LIMIT 100;

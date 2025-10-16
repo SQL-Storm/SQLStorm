@@ -1,0 +1,263 @@
+-- {"query": "368.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 24237} 
+WITH
+recent_posts AS (
+  SELECT * FROM Posts WHERE CreationDate >= now() - interval '365 days'
+),
+all_questions AS (
+  SELECT * FROM Posts WHERE PostTypeId = 1
+),
+recent_questions AS (
+  SELECT * FROM recent_posts WHERE PostTypeId = 1
+),
+recent_answers AS (
+  SELECT * FROM recent_posts WHERE PostTypeId = 2
+),
+tag_expansion AS (
+  SELECT q.Id AS question_id,
+         trim(tags.t) AS tag_name,
+         q.CreationDate AS question_created,
+         q.Score AS question_score,
+         q.ViewCount AS question_views,
+         q.AnswerCount AS question_answer_count,
+         q.OwnerUserId AS question_owner
+  FROM all_questions q
+  LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(q.Tags,2,length(q.Tags)-2), '><')) AS t
+  ) tags ON q.Tags IS NOT NULL
+),
+tag_stats AS (
+  SELECT tag_name,
+         COUNT(*) AS question_count,
+         SUM(COALESCE(question_views,0)) AS total_views,
+         AVG(NULLIF(question_score,0)) FILTER (WHERE question_score <> 0) AS avg_nonzero_score,
+         COALESCE(AVG(COALESCE(question_answer_count,0)),0) AS avg_answers_per_question,
+         SUM(COALESCE(question_answer_count,0)) AS sum_answers,
+         SUM(CASE WHEN question_created >= now() - interval '30 days' THEN 1 ELSE 0 END) AS recent_30d_questions,
+         MAX(COALESCE(question_views,0)) AS max_views,
+         MIN(COALESCE(question_views,0)) AS min_views
+  FROM tag_expansion
+  WHERE tag_name IS NOT NULL
+  GROUP BY tag_name
+),
+tag_stats_with_windows AS (
+  SELECT ts.*,
+    SUM(total_views) OVER (ORDER BY total_views DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cumulative_views_desc,
+    SUM(question_count) OVER (ORDER BY total_views DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cumulative_questions,
+    NTILE(10) OVER (ORDER BY total_views DESC) AS decile_by_views,
+    ROW_NUMBER() OVER (ORDER BY total_views DESC) AS tag_rownum
+  FROM tag_stats ts
+),
+top_tags_views AS (
+  SELECT tag_name, question_count, total_views, avg_nonzero_score,
+    ROW_NUMBER() OVER (ORDER BY total_views DESC, question_count DESC) AS view_rank
+  FROM tag_stats_with_windows
+),
+top_tags_answers AS (
+  SELECT tag_name, question_count, sum_answers,
+    ROW_NUMBER() OVER (ORDER BY sum_answers DESC, question_count DESC) AS answer_rank
+  FROM tag_stats
+),
+tag_view_answer_full AS (
+  SELECT COALESCE(v.tag_name, a.tag_name) AS tag_name,
+         v.total_views, v.view_rank,
+         a.sum_answers, a.answer_rank
+  FROM top_tags_views v
+  FULL OUTER JOIN top_tags_answers a ON v.tag_name = a.tag_name
+),
+top_100_views AS (
+  SELECT tag_name FROM top_tags_views WHERE view_rank <= 100
+),
+top_100_answers AS (
+  SELECT tag_name FROM top_tags_answers WHERE answer_rank <= 100
+),
+top_common_tags AS (
+  SELECT tag_name FROM top_100_views
+  INTERSECT
+  SELECT tag_name FROM top_100_answers
+),
+top_common_tag_details AS (
+  SELECT ts.*
+  FROM tag_stats ts
+  JOIN top_common_tags tct ON ts.tag_name = tct.tag_name
+),
+accepted_answers_per_user AS (
+  SELECT a.OwnerUserId AS user_id, COUNT(*) AS accepted_answers
+  FROM Posts a
+  JOIN Posts q ON q.AcceptedAnswerId = a.Id
+  WHERE a.OwnerUserId IS NOT NULL
+  GROUP BY a.OwnerUserId
+),
+answer_latency_per_user AS (
+  SELECT a.OwnerUserId AS user_id,
+    AVG(EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))) AS avg_answer_latency_seconds,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))) AS median_answer_latency_seconds
+  FROM Posts a
+  JOIN Posts q ON q.Id = a.ParentId
+  WHERE a.PostTypeId = 2 AND q.PostTypeId = 1 AND a.OwnerUserId IS NOT NULL AND q.CreationDate IS NOT NULL
+  GROUP BY a.OwnerUserId
+),
+user_badge_counts AS (
+  SELECT UserId AS user_id,
+    SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+    SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+    SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+    COUNT(*) AS total_badges
+  FROM Badges
+  GROUP BY UserId
+),
+user_activity AS (
+  SELECT u.Id AS user_id,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(SUM(CASE WHEN p.PostTypeId IN (1,2) THEN 1 ELSE 0 END),0) AS total_posts,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END),0) AS total_questions,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END),0) AS total_answers,
+    COALESCE(aa.accepted_answers,0) AS accepted_answers,
+    COALESCE(al.avg_answer_latency_seconds, NULL) AS avg_answer_latency_seconds,
+    COALESCE(ub.gold_badges,0) AS gold_badges,
+    COALESCE(ub.silver_badges,0) AS silver_badges,
+    COALESCE(ub.bronze_badges,0) AS bronze_badges,
+    COALESCE(ub.total_badges,0) AS total_badges,
+    COALESCE(SUM(COALESCE(p.ViewCount,0)),0) AS total_views,
+    CASE WHEN COALESCE(SUM(CASE WHEN p.PostTypeId IN (1,2) THEN 1 ELSE 0 END),0) = 0 THEN 0
+         ELSE ROUND(SUM(COALESCE(p.Score,0))::numeric / NULLIF(SUM(CASE WHEN p.PostTypeId IN (1,2) THEN 1 ELSE 0 END),0),3)
+    END AS avg_score_per_post,
+    MAX(p.CreationDate) AS last_post_date
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN accepted_answers_per_user aa ON aa.user_id = u.Id
+  LEFT JOIN answer_latency_per_user al ON al.user_id = u.Id
+  LEFT JOIN user_badge_counts ub ON ub.user_id = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, aa.accepted_answers, al.avg_answer_latency_seconds, ub.gold_badges, ub.silver_badges, ub.bronze_badges, ub.total_badges
+),
+user_tag_activity_raw AS (
+  SELECT te.tag_name AS tag_name, q.OwnerUserId AS user_id,
+    1 AS questions_by_user_in_tag, 0 AS answers_by_user_in_tag,
+    COALESCE(q.Score,0) AS sum_score_on_posts_in_tag, COALESCE(q.ViewCount,0) AS sum_views_on_posts_in_tag,
+    EXTRACT(EPOCH FROM (now() - q.CreationDate)) AS age_seconds
+  FROM tag_expansion te
+  JOIN Posts q ON q.Id = te.question_id
+  WHERE q.OwnerUserId IS NOT NULL
+  UNION ALL
+  SELECT te.tag_name AS tag_name, a.OwnerUserId AS user_id,
+    0 AS questions_by_user_in_tag, 1 AS answers_by_user_in_tag,
+    COALESCE(a.Score,0) AS sum_score_on_posts_in_tag, 0 AS sum_views_on_posts_in_tag,
+    EXTRACT(EPOCH FROM (now() - a.CreationDate)) AS age_seconds
+  FROM recent_answers a
+  JOIN tag_expansion te ON te.question_id = a.ParentId
+  WHERE a.OwnerUserId IS NOT NULL
+),
+user_tag_activity AS (
+  SELECT tag_name, user_id,
+    SUM(questions_by_user_in_tag) AS questions_by_user_in_tag,
+    SUM(answers_by_user_in_tag) AS answers_by_user_in_tag,
+    SUM(sum_score_on_posts_in_tag) AS sum_score_on_posts_in_tag,
+    SUM(sum_views_on_posts_in_tag) AS sum_views_on_posts_in_tag,
+    AVG(age_seconds) AS avg_age_seconds
+  FROM user_tag_activity_raw
+  GROUP BY tag_name, user_id
+),
+user_tag_affinity AS (
+  SELECT uta.tag_name, uta.user_id,
+    uta.questions_by_user_in_tag,
+    uta.answers_by_user_in_tag,
+    uta.sum_score_on_posts_in_tag,
+    uta.sum_views_on_posts_in_tag,
+    uta.avg_age_seconds,
+    COALESCE((uta.questions_by_user_in_tag + uta.answers_by_user_in_tag) * (1 + LOG(1 + COALESCE(ua.Reputation,0))), 0) AS raw_strength,
+    COALESCE(1.0 / NULLIF(1 + (uta.avg_age_seconds / (60*60*24)), 0), 1) AS recency_weight,
+    ((uta.questions_by_user_in_tag + uta.answers_by_user_in_tag) * (1 + LOG(1 + COALESCE(ua.Reputation,0))) * COALESCE(1.0 / NULLIF(1 + (uta.avg_age_seconds / (60*60*24)), 0), 1)) AS affinity_score
+  FROM user_tag_activity uta
+  JOIN Users ua ON ua.Id = uta.user_id
+),
+top_users_per_tag AS (
+  SELECT tag_name, user_id, affinity_score,
+    ROW_NUMBER() OVER (PARTITION BY tag_name ORDER BY affinity_score DESC) AS rn,
+    RANK() OVER (PARTITION BY tag_name ORDER BY affinity_score DESC) AS rnk,
+    PERCENT_RANK() OVER (PARTITION BY tag_name ORDER BY affinity_score DESC) AS pct_rank
+  FROM user_tag_affinity
+),
+top3_users_per_tag AS (
+  SELECT tut.tag_name, tut.user_id, tut.affinity_score, tut.rn, tut.rnk, tut.pct_rank,
+    uta.questions_by_user_in_tag, uta.answers_by_user_in_tag, uta.sum_score_on_posts_in_tag, uta.sum_views_on_posts_in_tag, uta.avg_age_seconds,
+    ua.DisplayName, ua.Reputation AS user_rep, ua.total_posts, ua.total_answers, ua.accepted_answers, ua.avg_answer_latency_seconds, ua.total_views AS user_total_views, ua.gold_badges
+  FROM top_users_per_tag tut
+  JOIN user_tag_affinity uta ON uta.tag_name = tut.tag_name AND uta.user_id = tut.user_id
+  LEFT JOIN user_activity ua ON ua.user_id = tut.user_id
+  WHERE tut.rn <= 3
+),
+tag_union AS (
+  SELECT tag_name, 'views' AS source, total_views AS metric, view_rank AS rank_metric
+  FROM top_tags_views
+  WHERE view_rank <= 100
+  UNION
+  SELECT tag_name, 'answers' AS source, sum_answers AS metric, answer_rank AS rank_metric
+  FROM top_tags_answers
+  WHERE answer_rank <= 100
+),
+top_only_views AS (
+  SELECT tag_name FROM top_100_views
+  EXCEPT
+  SELECT tag_name FROM top_100_answers
+)
+SELECT
+  tc.tag_name,
+  tc.question_count,
+  tc.total_views,
+  tc.avg_nonzero_score,
+  tc.sum_answers,
+  CASE WHEN tvaf.view_rank IS NULL THEN tvaf.answer_rank ELSE tvaf.view_rank END AS best_rank,
+  ROUND( (tc.total_views::numeric / NULLIF(tc.question_count,0)) * (1 + COALESCE(tc.avg_nonzero_score,0)/5) + tc.sum_answers * 0.07, 3) AS trending_score,
+  tc.recent_30d_questions,
+  tc.max_views,
+  tc.min_views,
+  tc.cumulative_views_desc,
+  tc.decile_by_views,
+  COALESCE((
+    SELECT string_agg(
+      concat_ws('',
+        u.DisplayName, ' (rep=', COALESCE(u.Reputation::text,'0'), ',aff=', ROUND(tu.affinity_score::numeric,2)::text,
+        ',q=', COALESCE(tu.questions_by_user_in_tag::text,'0'), ',a=', COALESCE(tu.answers_by_user_in_tag::text,'0'), ')'
+      ), ' | ' ORDER BY tu.affinity_score DESC)
+    FROM top3_users_per_tag tu
+    LEFT JOIN Users u ON u.Id = tu.user_id
+    WHERE tu.tag_name = tc.tag_name
+  ), '[]') AS top3_users_summary,
+  CASE WHEN EXISTS (SELECT 1 FROM top_common_tags tct WHERE tct.tag_name = tc.tag_name) THEN 'common_top' ELSE 'one_sided' END AS common_top_flag,
+  CASE WHEN tc.tag_name IN (SELECT tag_name FROM top_only_views) THEN 'views_only' ELSE 'both_or_answers' END AS top_exclusivity,
+  (
+    SELECT AVG(a.Score) FROM Posts a
+    WHERE a.PostTypeId = 2
+      AND EXISTS (
+        SELECT 1 FROM Posts q WHERE q.Id = a.ParentId AND q.Tags IS NOT NULL AND q.Tags LIKE ('%<' || tc.tag_name || '>%')
+      )
+  ) AS avg_answer_score_for_tag,
+  (
+    SELECT COUNT(*) FROM Posts p WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.Tags LIKE ('%<' || tc.tag_name || '>%')
+  ) AS total_questions_with_tag,
+  (
+    SELECT COUNT(DISTINCT a.OwnerUserId)
+    FROM Posts a
+    JOIN Posts q ON q.Id = a.ParentId
+    WHERE a.PostTypeId = 2 AND q.Tags IS NOT NULL AND q.Tags LIKE ('%<' || tc.tag_name || '>%') AND EXISTS (SELECT 1 FROM Posts q2 WHERE q2.AcceptedAnswerId = a.Id)
+  ) AS distinct_accepted_answerers_for_tag,
+  (
+    SELECT AVG(sub.q_upvotes) FROM (
+      SELECT p.Id, COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS q_upvotes
+      FROM Posts p
+      LEFT JOIN Votes v ON v.PostId = p.Id
+      WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.Tags LIKE ('%<' || tc.tag_name || '>%')
+      GROUP BY p.Id
+    ) sub
+  ) AS avg_upvotes_per_question_for_tag,
+  (
+    SELECT COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END),0)
+    FROM Votes v
+    JOIN Posts p ON p.Id = v.PostId
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.Tags LIKE ('%<' || tc.tag_name || '>%')
+  ) AS net_vote_delta_on_questions
+FROM tag_stats_with_windows tc
+LEFT JOIN tag_view_answer_full tvaf ON tvaf.tag_name = tc.tag_name
+WHERE tc.tag_name IN (SELECT tag_name FROM top_common_tag_details)
+ORDER BY trending_score DESC NULLS LAST, tc.total_views DESC
+LIMIT 50;

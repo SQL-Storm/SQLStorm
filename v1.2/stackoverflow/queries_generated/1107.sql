@@ -1,0 +1,116 @@
+-- {"query": "1107.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.1, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1584} 
+with RecursiveUserActivity as (
+    select u.Id as UserId, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+        row_number() over (partition by u.Id order by p.CreationDate desc) as RecentPostRank,
+        (select count(*) from Posts p2 where p2.OwnerUserId = u.Id and p2.PostTypeId=1) as QuestionsCount,
+        (select count(*) from Posts p3 where p3.OwnerUserId = u.Id and p3.PostTypeId=2) as AnswersCount,
+        (select count(*) from Comments c where c.UserId = u.Id) as CommentsCount,
+        (select count(distinct b.Name) from Badges b where b.UserId = u.Id and b.Class = 1) as GoldBadges,
+        (select count(distinct b.Name) from Badges b where b.UserId = u.Id and b.Class = 2) as SilverBadges,
+        (select count(distinct b.Name) from Badges b where b.UserId = u.Id and b.Class = 3) as BronzeBadges,
+        p.Id as RecentPostId, p.Score as RecentPostScore, p.PostTypeId as RecentPostTypeId,
+        case when p.LastEditDate is null then p.CreationDate else p.LastEditDate end as RecentPostLastEdit
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.Id = (
+        select Id from Posts where OwnerUserId = u.Id order by CreationDate desc limit 1
+    )
+    where u.Reputation >= 1000 and u.CreationDate < now() - interval '180 day'
+),
+PostsWithCloseReason as (
+    select ph.PostId, ph.CreationDate as CloseDate,
+           crt.Name as CloseReason,
+           row_number() over (partition by ph.PostId order by ph.CreationDate desc) as rn
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10 and crt.Name is not null
+),
+AcceptedAnswers as (
+    select p.Id as QuestionId, p.Title, p.AcceptedAnswerId, a.Score as AcceptedAnswerScore,
+           u.DisplayName as AcceptedAnswerOwner, a.OwnerUserId as AcceptedAnswerOwnerUserId
+    from Posts p
+    left join Posts a on a.Id = p.AcceptedAnswerId
+    left join Users u on u.Id = a.OwnerUserId
+    where p.PostTypeId = 1 and p.AcceptedAnswerId is not null
+),
+TopScoringAnswers as (
+    select a.ParentId as QuestionId, max(a.Score) as MaxAnswerScore
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.ParentId
+),
+QuestionsWithAnswerStats as (
+    select q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, qa.MaxAnswerScore, aa.AcceptedAnswerScore,
+           case when aa.AcceptedAnswerScore is null then qa.MaxAnswerScore else aa.AcceptedAnswerScore end as FinalTopAnswerScore,
+           coalesce(pcr.CloseReason, 'Open') as CloseReason
+    from Posts q
+    left join TopScoringAnswers qa on qa.QuestionId = q.Id
+    left join AcceptedAnswers aa on aa.QuestionId = q.Id
+    left join (
+        select PostId, CloseReason from PostsWithCloseReason where rn = 1
+    ) pcr on pcr.PostId = q.Id
+    where q.PostTypeId = 1
+),
+TagPopularity as (
+    select t.TagName,
+           sum(p.ViewCount) as TotalViews,
+           count(p.Id) as TotalQuestions,
+           avg(p.Score) as AvgScore,
+           string_agg(distinct concat_ws(' (', u.DisplayName, coalesce(nullif(u.Location,''),'Unknown'), ')'), ', ') as Owners
+    from Tags t
+    left join Posts p on p.PostTypeId = 1 and p.Tags like concat('%<', t.TagName, '>%')
+    left join Users u on u.Id = p.OwnerUserId
+    group by t.TagName
+    having count(p.Id) > 50
+    order by TotalViews desc
+    limit 10
+),
+UserBadgeSummary as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldCount,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverCount,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeCount,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+UserVotesRanking as (
+    select
+        v.UserId,
+        sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+        sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes,
+        count(v.Id) as TotalVotes,
+        rank() over (order by sum(case when vt.Name = 'UpMod' then 1 else 0 end) desc) as VoteRank
+    from Votes v
+    inner join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.UserId
+)
+select 
+    rua.UserId, rua.DisplayName, rua.Reputation, rua.QuestionsCount, rua.AnswersCount, rua.CommentsCount,
+    ubs.GoldCount, ubs.SilverCount, ubs.BronzeCount, ubs.LastBadgeDate,
+    uvr.UpVotes, uvr.DownVotes, uvr.TotalVotes, uvr.VoteRank,
+    qwa.Id as QuestionId, qwa.Title as QuestionTitle, qwa.CreationDate as QuestionCreated, qwa.Score as QuestionScore,
+    qwa.ViewCount as QuestionViews, qwa.FinalTopAnswerScore, qwa.CloseReason, 
+    tp.TagName as PopularTag, tp.TotalViews as TagViews, tp.TotalQuestions as TagQuestions, tp.AvgScore as TagAvgScore,
+    rua.RecentPostId, rua.RecentPostScore, rua.RecentPostLastEdit,
+    case when rua.AnswersCount > 0 then concat('Active') else concat('Newbie') end as UserActivityStatus,
+    jsonb_build_object(
+        'QuestionId', qwa.Id,
+        'AcceptedAnswerScore', coalesce((select AcceptedAnswerScore from AcceptedAnswers where QuestionId = qwa.Id), 0),
+        'MaxAnswerScore', coalesce((select MaxAnswerScore from TopScoringAnswers where QuestionId = qwa.Id), 0),
+        'CloseReason', qwa.CloseReason
+    ) as QuestionSummaryJson
+from RecursiveUserActivity rua
+left join UserBadgeSummary ubs on ubs.UserId = rua.UserId
+left join UserVotesRanking uvr on uvr.UserId = rua.UserId
+left join QuestionsWithAnswerStats qwa on qwa.Id = rua.RecentPostId
+left join TagPopularity tp on tp.TagName = (
+    select unnest(string_to_array(
+        coalesce(
+            substring(qwa.Tags from '<([^>]+)>'), ''
+        ), ','
+    )) limit 1
+)
+where rua.Reputation > 5000 and (ubs.GoldCount > 0 or uvr.UpVotes > 1000)
+order by uvr.VoteRank, rua.Reputation desc
+limit 50;

@@ -1,0 +1,92 @@
+WITH UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(p.Score) AS TotalPostScore,
+        AVG(p.ViewCount) AS AvgPostViews,
+        MAX(p.LastActivityDate) AS LastActivePostDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpVoteCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TagPopularity AS (
+    SELECT 
+        TRIM(tag) AS TagName,
+        COUNT(*) AS TagFrequency,
+        AVG(p.Score) AS AvgTagScore,
+        MAX(p.ViewCount) AS MaxTagViews
+    FROM Posts p,
+    LATERAL (
+        SELECT regexp_split_to_table(
+            substring(p.Tags FROM 2 FOR LENGTH(p.Tags)-2),
+            '><'
+        ) AS tag
+    ) s
+    WHERE p.Tags IS NOT NULL AND p.PostTypeId = 1
+    GROUP BY TRIM(tag)
+),
+UserTagRanked AS (
+    SELECT
+        ups.UserId,
+        ups.DisplayName,
+        ups.Reputation,
+        ups.PostCount,
+        ups.TotalPostScore,
+        ups.AvgPostViews,
+        tp.TagName,
+        tp.TagFrequency,
+        tp.AvgTagScore,
+        tp.MaxTagViews,
+        RANK() OVER (PARTITION BY tp.TagName ORDER BY ups.Reputation DESC) AS UserTagRank,
+        CASE 
+            WHEN ups.Reputation > 10000 THEN 'High Rep'
+            WHEN ups.Reputation > 1000 THEN 'Medium Rep'
+            ELSE 'Low Rep'
+        END AS RepCategory
+    FROM UserPostStats ups
+    CROSS JOIN TagPopularity tp
+    WHERE 
+        ups.PostCount > 5 
+        AND tp.TagFrequency > 10
+        AND (ups.Reputation * ups.PostCount) > 5000
+)
+SELECT
+    utr.UserId,
+    utr.DisplayName,
+    utr.Reputation,
+    utr.PostCount,
+    utr.TotalPostScore,
+    utr.AvgPostViews,
+    utr.TagName,
+    utr.TagFrequency,
+    utr.AvgTagScore,
+    utr.UserTagRank,
+    utr.RepCategory,
+    COALESCE(utr.MaxTagViews, 0) *
+      (CASE 
+         WHEN utr.Reputation > 10000 THEN 1.5
+         WHEN utr.Reputation > 1000 THEN 1.2
+         ELSE 1.0
+       END) AS WeightedTagViews
+FROM UserTagRanked utr
+GROUP BY
+  utr.UserId,
+  utr.DisplayName,
+  utr.Reputation,
+  utr.PostCount,
+  utr.TotalPostScore,
+  utr.AvgPostViews,
+  utr.TagName,
+  utr.TagFrequency,
+  utr.AvgTagScore,
+  utr.UserTagRank,
+  utr.RepCategory,
+  utr.MaxTagViews
+ORDER BY WeightedTagViews DESC, utr.UserTagRank
+LIMIT 100;

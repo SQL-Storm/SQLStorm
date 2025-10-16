@@ -1,0 +1,195 @@
+-- {"query": "19040.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3131} 
+
+WITH UserActivityMetrics AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsPosted,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersPosted,
+        AVG(CASE WHEN P.PostTypeId = 2 THEN P.Score ELSE NULL END) AS AvgAnswerScore,
+        AVG(CASE WHEN P.PostTypeId = 1 THEN P.ViewCount ELSE NULL END) AS AvgQuestionViewCount,
+        MAX(P.CreationDate) AS LastPostCreationDate,
+        CASE
+            WHEN U.Reputation >= 20000 THEN 'Guru'
+            WHEN U.Reputation >= 5000 THEN 'Veteran'
+            WHEN U.Reputation >= 1000 THEN 'Experienced'
+            WHEN U.Reputation >= 100 THEN 'Contributor'
+            ELSE 'Newbie'
+        END AS ReputationTier
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+PostLifecycleEvents AS (
+    SELECT
+        PH.PostId,
+        MIN(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId IN (1,2,3)) AS PostCreationDate, -- Initial Title/Body/Tags
+        MIN(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId IN (4,5,6)) AS FirstEditDate, -- Edit Title/Body/Tags
+        MAX(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId IN (4,5,6)) AS LastEditDate,
+        MAX(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId = 10) AS ClosureDate, -- Post Closed
+        MAX(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId = 11) AS ReopenDate, -- Post Reopened
+        MAX(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId = 12) AS DeletionDate, -- Post Deleted
+        COUNT(DISTINCT PH.UserId) AS UniqueEditorsCount,
+        -- Extract close reason from history text if available
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.Comment END) AS CloseReasonComment,
+        -- Extract JSON data for duplicate close votes (e.g., {"OriginalQuestionIds":[123,456]})
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 AND PH.Comment LIKE '101%' AND PH.Text IS NOT NULL THEN PH.Text END) AS DuplicateCloseDetailsJson
+    FROM PostHistory PH
+    GROUP BY PH.PostId
+),
+QuestionTagAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        UNNEST(STRING_TO_ARRAY(SUBSTRING(P.Tags, 2, LENGTH(P.Tags)-2), '><')) AS TagName
+    FROM Posts P
+    WHERE P.Tags IS NOT NULL AND P.PostTypeId = 1 -- Only questions have tags in this format
+),
+-- For set operators, let's derive a flag for owner activity
+OwnerPostStatus AS (
+    SELECT P.OwnerUserId AS UserId, P.Id AS PostId, 'Active' AS Status
+    FROM Posts P
+    JOIN Users U ON P.OwnerUserId = U.Id
+    WHERE U.LastAccessDate > NOW() - INTERVAL '6 months' AND U.LastAccessDate IS NOT NULL
+    UNION ALL
+    SELECT P.OwnerUserId AS UserId, P.Id AS PostId, 'Inactive' AS Status
+    FROM Posts P
+    JOIN Users U ON P.OwnerUserId = U.Id
+    WHERE U.LastAccessDate <= NOW() - INTERVAL '6 months' OR U.LastAccessDate IS NULL
+)
+SELECT
+    Q.Id AS QuestionId,
+    Q.Title AS QuestionTitle,
+    Q.CreationDate AS QuestionCreationDate,
+    Q.Score AS QuestionScore,
+    Q.ViewCount AS QuestionViewCount,
+    Q.AnswerCount,
+    Q.CommentCount AS QuestionCommentCount,
+    UAM.DisplayName AS QuestionOwnerDisplayName,
+    UAM.Reputation AS QuestionOwnerReputation,
+    UAM.ReputationTier,
+    PLE_Q.FirstEditDate AS QuestionFirstEditDate,
+    PLE_Q.LastEditDate AS QuestionLastEditDate,
+    PLE_Q.ClosureDate AS QuestionClosureDate,
+    PLE_Q.ReopenDate AS QuestionReopenDate,
+    COALESCE(Q.FavoriteCount, 0) AS QuestionFavoriteCount,
+
+    -- String expressions and calculations
+    LENGTH(Q.Body) AS QuestionBodyLength,
+    UPPER(LEFT(Q.Title, 1)) AS FirstCharOfTitleUpper,
+    REPLACE(REPLACE(COALESCE(Q.Tags, ''), '>', ', '), '<', '') AS FormattedTagsString,
+    -- NULL logic and complex arithmetic
+    COALESCE(Q.ViewCount, 0) * 0.1 + COALESCE(Q.Score, 0) * 0.5 + COALESCE(Q.AnswerCount, 0) * 0.8 + COALESCE(Q.FavoriteCount, 0) * 1.2 AS WeightedEngagementScore,
+    -- Time until closed, or time since creation if not closed, in hours
+    EXTRACT(EPOCH FROM (COALESCE(PLE_Q.ClosureDate, Q.LastActivityDate, Q.CreationDate) - Q.CreationDate)) / 3600.0 AS QuestionLifeSpanHours,
+
+    -- Correlated Subquery 1: Count of distinct users commenting on the question within 24 hours of creation
+    (
+        SELECT COUNT(DISTINCT C.UserId)
+        FROM Comments C
+        WHERE C.PostId = Q.Id
+          AND C.CreationDate BETWEEN Q.CreationDate AND (Q.CreationDate + INTERVAL '24 hours')
+          AND C.UserId IS NOT NULL
+    ) AS EarlyUniqueCommentersCount,
+
+    -- Window Functions
+    ROW_NUMBER() OVER (PARTITION BY UAM.ReputationTier ORDER BY Q.Score DESC, Q.ViewCount DESC) AS RankWithinReputationTier,
+    AVG(Q.Score) OVER (PARTITION BY UAM.ReputationTier) AS AvgQuestionScoreInRepTier,
+    LAG(Q.CreationDate, 1, '1970-01-01'::timestamp) OVER (PARTITION BY Q.OwnerUserId ORDER BY Q.CreationDate) AS PreviousQuestionDateByOwner,
+    LEAD(Q.CreationDate, 1, '2999-12-31'::timestamp) OVER (PARTITION BY Q.OwnerUserId ORDER BY Q.CreationDate) AS NextQuestionDateByOwner,
+    COUNT(DISTINCT Q.Id) OVER (PARTITION BY DATE_TRUNC('month', Q.CreationDate)) AS QuestionsInMonth,
+
+    -- Accepted Answer Details (if any)
+    A.Id AS AcceptedAnswerId,
+    A.Score AS AcceptedAnswerScore,
+    A.CreationDate AS AcceptedAnswerCreationDate,
+    PLE_A.LastEditDate AS AcceptedAnswerLastEditDate,
+    COALESCE(A.Score, 0) / (EXTRACT(EPOCH FROM (A.CreationDate - Q.CreationDate)) / 3600.0 + 1) AS AnswerScorePerHourFromQuestionCreation, -- Avoid division by zero
+
+    -- Correlated Subquery 2 for accepted answer's comments
+    (
+        SELECT STRING_AGG(C.Text, ' ||| ')
+        FROM Comments C
+        WHERE C.PostId = A.Id
+        AND C.CreationDate BETWEEN A.CreationDate AND A.CreationDate + INTERVAL '7 days'
+        AND C.UserId = Q.OwnerUserId -- Only comments by the question owner
+        AND LENGTH(C.Text) > 10 -- Minimum length for comment text
+        LIMIT 1
+    ) AS QuestionOwnerCommentOnAcceptedAnswerSample,
+
+    -- Duplicate/Linked Post Analysis
+    STRING_AGG(DISTINCT PL_Dup.RelatedPostId::varchar, ', ') FILTER (WHERE PL_Dup.LinkTypeId = 3) AS DuplicatePostIds,
+    STRING_AGG(DISTINCT PL_Link.RelatedPostId::varchar, ', ') FILTER (WHERE PL_Link.LinkTypeId = 1) AS LinkedPostIds,
+
+    -- Complex Predicates and NULL logic for filtering
+    Q.CommunityOwnedDate IS NOT NULL AS IsCommunityOwnedQuestion,
+    (PLE_Q.ClosureDate IS NOT NULL AND PLE_Q.CloseReasonComment IS NOT NULL) AS IsClosedQuestion,
+    (PLE_Q.ReopenDate IS NOT NULL AND PLE_Q.ReopenDate > PLE_Q.ClosureDate) AS HasBeenReopened,
+    (Q.AcceptedAnswerId IS NOT NULL AND A.CreationDate IS NOT NULL AND (A.CreationDate - Q.CreationDate) < INTERVAL '1 day') AS AnsweredWithin24Hours,
+
+    -- Set operator inclusion: check if the owner is currently 'Active' based on derived OwnerPostStatus
+    -- This correlated subquery uses the UNION ALL CTE
+    (
+        SELECT OPS.Status
+        FROM OwnerPostStatus OPS
+        WHERE OPS.UserId = Q.OwnerUserId
+        GROUP BY OPS.Status -- Group to ensure single row per user, if status consistent
+        HAVING COUNT(CASE WHEN OPS.Status = 'Active' THEN 1 END) > 0
+        LIMIT 1
+    ) = 'Active' AS IsOwnerActive,
+
+    -- Correlated Subquery 3: Average score for related tags (excluding the current question)
+    (
+        SELECT AVG(P_Tag.Score)
+        FROM QuestionTagAnalysis QTA_inner
+        JOIN Posts P_Tag ON P_Tag.Id = QTA_inner.PostId
+        WHERE QTA_inner.TagName IN (SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(Q.Tags, 2, LENGTH(Q.Tags)-2), '><')) FROM Posts P_inner WHERE P_inner.Id = Q.Id AND P_inner.Tags IS NOT NULL)
+        AND P_Tag.PostTypeId = 1 AND P_Tag.Id <> Q.Id AND P_Tag.Score IS NOT NULL
+    ) AS AvgScoreForRelatedTags,
+
+    -- More complex calculation: ratio of positive votes to total votes, handling NULLs
+    CAST(COALESCE(SUM(CASE WHEN QV.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS NUMERIC) /
+    NULLIF(COALESCE(SUM(CASE WHEN QV.VoteTypeId IN (2, 3) THEN 1 ELSE 0 END), 0), 0) AS UpvoteRatio,
+
+    -- Double nested correlated subquery: check if any comments on the question explicitly mention "duplicate" or "close"
+    (
+        SELECT EXISTS (
+            SELECT 1
+            FROM Comments C_inner
+            WHERE C_inner.PostId = Q.Id
+            AND (C_inner.Text ILIKE '%duplicate%' OR C_inner.Text ILIKE '%close%')
+            LIMIT 1
+        )
+    ) AS HasCommentsSuggestingClosure
+
+FROM Posts Q
+INNER JOIN UserActivityMetrics UAM ON Q.OwnerUserId = UAM.UserId
+LEFT JOIN PostLifecycleEvents PLE_Q ON Q.Id = PLE_Q.PostId
+LEFT JOIN Posts A ON Q.AcceptedAnswerId = A.Id AND Q.PostTypeId = 1 -- Only questions have AcceptedAnswerId
+LEFT JOIN PostLifecycleEvents PLE_A ON A.Id = PLE_A.PostId
+LEFT JOIN PostLinks PL_Dup ON Q.Id = PL_Dup.PostId AND PL_Dup.LinkTypeId = 3
+LEFT JOIN PostLinks PL_Link ON Q.Id = PL_Link.PostId AND PL_Link.LinkTypeId = 1
+LEFT JOIN Votes QV ON Q.Id = QV.PostId
+
+WHERE Q.PostTypeId = 1 -- Focus on Questions
+  AND Q.CreationDate BETWEEN '2020-01-01' AND '2023-12-31'
+  AND Q.Score >= -5 -- Allow slightly negative scores but filter out severely downvoted posts
+  AND Q.ViewCount IS NOT NULL AND Q.ViewCount > 50
+  AND (UAM.ReputationTier IN ('Experienced', 'Veteran', 'Guru') OR Q.Score > 10) -- Filter by reputation or post score
+  AND (PLE_Q.DeletionDate IS NULL OR PLE_Q.ReopenDate > PLE_Q.DeletionDate) -- Exclude permanently deleted posts
+  AND Q.Title IS NOT NULL AND LENGTH(Q.Title) > 10 -- Minimum title length
+
+GROUP BY
+    Q.Id, Q.Title, Q.CreationDate, Q.Score, Q.ViewCount, Q.AnswerCount, Q.CommentCount, Q.FavoriteCount, Q.Body, Q.Tags, Q.CommunityOwnedDate, Q.LastActivityDate, Q.OwnerUserId,
+    UAM.DisplayName, UAM.Reputation, UAM.ReputationTier,
+    PLE_Q.FirstEditDate, PLE_Q.LastEditDate, PLE_Q.ClosureDate, PLE_Q.ReopenDate, PLE_Q.CloseReasonComment, PLE_Q.DuplicateCloseDetailsJson,
+    A.Id, A.Score, A.CreationDate,
+    PLE_A.LastEditDate
+HAVING
+    COUNT(DISTINCT QV.VoteTypeId) > 1 -- Ensure questions with at least two different vote types
+ORDER BY
+    WeightedEngagementScore DESC, QuestionCreationDate DESC
+LIMIT 1000;

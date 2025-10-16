@@ -1,0 +1,91 @@
+-- {"query": "6065.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 729} 
+WITH recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.LastEditorUserId,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.PostTypeId
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.CreationDate >= NOW() - INTERVAL '30 DAYS'
+),
+tag_hist AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS TagCount
+  FROM Tags t
+  JOIN Posts p ON p.Id = t.ExcerptPostId
+  WHERE p.PostTypeId = 1
+  GROUP BY t.TagName
+),
+top_users AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.CreationDate,
+    u.LastAccessDate
+  FROM Users u
+  WHERE u.Reputation > 1000
+),
+activity AS (
+  SELECT
+    rp.PostId,
+    rp.Title,
+    rp.Tags,
+    rp.OwnerUserId,
+    rp.CreationDate,
+    rp.LastActivityDate,
+    COALESCE(vt2.TotalUp, 0) AS UpVotesToday,
+    COALESCE(vt3.TotalDown, 0) AS DownVotesToday,
+    ROW_NUMBER() OVER (PARTITION BY rp.OwnerUserId ORDER BY rp.LastActivityDate DESC) AS rn
+  FROM recent_questions rp
+  LEFT JOIN (
+    SELECT PostId, SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUp
+    FROM Votes
+    WHERE CreationDate >= NOW() - INTERVAL '1 DAY'
+    GROUP BY PostId
+  ) vt2 ON vt2.PostId = rp.Id
+  LEFT JOIN (
+    SELECT PostId, SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDown
+    FROM Votes
+    WHERE CreationDate >= NOW() - INTERVAL '1 DAY'
+    GROUP BY PostId
+  ) vt3 ON vt3.PostId = rp.Id
+)
+SELECT
+  a.PostId,
+  a.Title,
+  a.Tags,
+  a.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  a.CreationDate,
+  a.LastActivityDate,
+  a.UpVotesToday,
+  a.DownVotesToday,
+  p.Score AS PostScore,
+  p.ViewCount,
+  p.AnswerCount,
+  p.CommentCount,
+  (SELECT COUNT(*) FROM Comments c WHERE c.PostId = a.PostId) AS CommentCountTotal,
+  (SELECT COUNT(*) FROM Votes v WHERE v.PostId = a.PostId AND v.VoteTypeId = 2) AS UpModCount,
+  (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = a.PostId) AS RelatedPosts,
+  (SELECT COUNT(*) FROM PostLinks pl WHERE pl.RelatedPostId = a.PostId) AS ReferencingPosts,
+  (SELECT Name FROM PostHistoryTypes h WHERE h.Id = 16) AS CommunityBumpMarker
+FROM activity a
+LEFT JOIN Posts p ON p.Id = a.PostId
+LEFT JOIN TopUsers u ON u.UserId = a.OwnerUserId
+ORDER BY a.LastActivityDate DESC
+LIMIT 100;

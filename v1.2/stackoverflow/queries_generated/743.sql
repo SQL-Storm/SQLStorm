@@ -1,0 +1,179 @@
+-- {"query": "743.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1752} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE t.IsRequired = 1
+
+    UNION ALL
+
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        rth.TagPath || t2.TagName
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy rth ON t2.Id <> ALL(
+        SELECT Id FROM Tags WHERE TagName = ANY(rth.TagPath)
+    )
+    WHERE t2.IsRequired = 1
+    AND array_length(rth.TagPath,1) < 3
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsPosted,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersPosted,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        SUM(vt_up.VoteCount) AS UpVotesGiven,
+        SUM(vt_down.VoteCount) AS DownVotesGiven,
+        COUNT(DISTINCT b.Id) AS BadgesEarned,
+        MAX(p.CreationDate) AS LastPostDate,
+        SUM(COALESCE(p.Score,0)) AS TotalPostScore,
+        AVG(COALESCE(p.Score,0)) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgPostScore,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 10) AS LastCloseVoteDate -- last close vote in posthistory
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v_up ON v_up.UserId = u.Id AND v_up.VoteTypeId = 2 -- UpMod given by user
+    LEFT JOIN (
+        SELECT UserId, COUNT(*) AS VoteCount FROM Votes WHERE VoteTypeId = 2 GROUP BY UserId
+    ) vt_up ON vt_up.UserId = u.Id
+    LEFT JOIN (
+        SELECT UserId, COUNT(*) AS VoteCount FROM Votes WHERE VoteTypeId = 3 GROUP BY UserId
+    ) vt_down ON vt_down.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id AND ph.PostHistoryTypeId = 10
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostDetails AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        u.DisplayName AS OwnerName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC NULLS LAST, p.CreationDate DESC) AS RankByScore,
+        COUNT(*) OVER (PARTITION BY p.PostTypeId) AS TotalPostsByType
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId IN (1,2)
+),
+TopQuestionsWithAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title AS QuestionTitle,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViews,
+        q.OwnerUserId AS QuestionOwnerId,
+        q.OwnerName AS QuestionOwnerName,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.OwnerUserId AS AnswerOwnerId,
+        a.OwnerName AS AnswerOwnerName,
+        a.CreationDate AS AnswerCreationDate,
+        q.AcceptedAnswerId,
+        CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END AS IsAcceptedAnswer,
+        STRING_AGG(DISTINCT c.Text, ' | ') FILTER (WHERE c.PostId = q.Id) AS QuestionComments,
+        STRING_AGG(DISTINCT c2.Text, ' | ') FILTER (WHERE c2.PostId = a.Id) AS AnswerComments,
+        -- Calculate answer age relative to question creation
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600.0 AS HoursToAnswer,
+        -- Calculate rank of answer score partitioned by question
+        RANK() OVER (PARTITION BY q.Id ORDER BY a.Score DESC NULLS LAST) AS AnswerScoreRank
+    FROM PostDetails q
+    LEFT JOIN PostDetails a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN Comments c ON c.PostId = q.Id
+    LEFT JOIN Comments c2 ON c2.PostId = a.Id
+    WHERE q.PostTypeId = 1
+),
+UserBadgeSummary AS (
+    SELECT
+        ub.UserId,
+        ub.Name AS BadgeName,
+        ub.Class,
+        COUNT(*) AS BadgeCount,
+        MIN(ub.Date) AS FirstEarned,
+        MAX(ub.Date) AS LastEarned,
+        STRING_AGG(DISTINCT t.TagName, ', ') AS RelatedTags
+    FROM Badges ub
+    LEFT JOIN Tags t ON ub.Name = t.TagName AND ub.TagBased = 1
+    GROUP BY ub.UserId, ub.Name, ub.Class
+),
+DuplicatesWithLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate AS LinkCreated,
+        lt.Name AS LinkTypeName,
+        p1.Title AS PostTitle,
+        p2.Title AS RelatedPostTitle,
+        p1.Score AS PostScore,
+        p2.Score AS RelatedPostScore
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    JOIN Posts p1 ON pl.PostId = p1.Id
+    JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+    WHERE lt.Name = 'Duplicate'
+),
+CombinedUserStats AS (
+    SELECT
+        ua.*,
+        COALESCE(ubs.BadgeCount,0) AS TotalBadges,
+        COALESCE(ubs.FirstEarned, '1970-01-01') AS FirstBadgeDate,
+        COALESCE(ubs.LastEarned, '1970-01-01') AS LastBadgeDate
+    FROM UserActivity ua
+    LEFT JOIN (
+        SELECT UserId, SUM(BadgeCount) AS BadgeCount, MIN(FirstEarned) AS FirstEarned, MAX(LastEarned) AS LastEarned
+        FROM UserBadgeSummary
+        GROUP BY UserId
+    ) ubs ON ua.UserId = ubs.UserId
+)
+SELECT 
+    cqs.QuestionId,
+    cqs.QuestionTitle,
+    cqs.QuestionScore,
+    cqs.QuestionViews,
+    cqs.QuestionOwnerName,
+    cqs.AnswerId,
+    cqs.AnswerScore,
+    cqs.AnswerOwnerName,
+    cqs.IsAcceptedAnswer,
+    ROUND(cqs.HoursToAnswer,2) AS HoursToAnswer,
+    cqs.AnswerScoreRank,
+    cqs.QuestionComments,
+    cqs.AnswerComments,
+    cus.Reputation,
+    cus.QuestionsPosted,
+    cus.AnswersPosted,
+    cus.CommentsMade,
+    cus.UpVotesGiven,
+    cus.DownVotesGiven,
+    cus.TotalBadges,
+    cus.FirstBadgeDate,
+    cus.LastBadgeDate,
+    dup.LinkCreated AS DuplicateLinkCreated,
+    dup.PostTitle AS DuplicatePostTitle,
+    dup.RelatedPostTitle AS DuplicateRelatedPostTitle,
+    dup.PostScore AS DuplicatePostScore,
+    dup.RelatedPostScore AS DuplicateRelatedPostScore
+FROM TopQuestionsWithAnswers cqs
+LEFT JOIN CombinedUserStats cus ON cqs.QuestionOwnerId = cus.UserId
+LEFT JOIN DuplicatesWithLinks dup ON dup.PostId = cqs.QuestionId AND dup.RelatedPostId = cqs.AnswerId
+WHERE cqs.RankByScore <= 10
+AND cus.Reputation > 1000
+ORDER BY cqs.QuestionScore DESC NULLS LAST, cqs.AnswerScore DESC NULLS LAST, cqs.HoursToAnswer ASC
+LIMIT 50;

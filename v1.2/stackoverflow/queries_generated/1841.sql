@@ -1,0 +1,68 @@
+-- {"query": "1841.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2136} 
+WITH RecentGoldBadgeWinners AS (
+    SELECT b.UserId, u.DisplayName, b.Date,
+           COUNT(*) OVER (PARTITION BY b.UserId) AS TotalGoldBadges,
+           ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) rn
+    FROM Badges b
+    JOIN Users u ON b.UserId = u.Id
+    WHERE b.Class = 1
+      AND b.Date > NOW() - INTERVAL '90 days'
+      AND LOWER(b.Name) LIKE '%sql%'
+),
+BadgesLengthAnalysis AS (
+    SELECT Name,
+         LENGTH(Name) AS LengthName,
+         UPPER(SUBSTRING(Name,1,3)) AS NamePrefix,
+         CARDINALITY(string_to_array(regexp_replace(Name, '[^a-zA-Z]+', ',', 'g'),',')) AS WordCount
+    FROM Badges
+),
+PostsWithAnswersMoreVotesDifferenced AS (
+    SELECT q.Id, q.Title, q.Score, q.ViewCount, a.Id AS AnswerId, a.Score AS AnswerScore,
+           COALESCE((a.Score - q.Score), 0) AS ScoreDiff,
+           EXTRACT(EPOCH FROM (NOW() - q.CreationDate)) / 86400 AS AgeDays, q.Tags
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id
+    WHERE q.PostTypeId = 1 -- questions
+      AND a.Id IS NOT NULL
+      AND a.Score IS NOT NULL
+      AND q.Tags IS NOT NULL
+),
+DanglingAnswersCTE (AnsweredQuestionId, NoViewsButUpvotesCount) AS (
+    SELECT p.ParentId,
+           COUNT(CASE WHEN p.UpVotes > 0 AND p.ViewCount IS NULL THEN 1 END)
+    FROM Posts p
+    LEFT JOIN Votes vmods ON vmods.PostId = p.ParentId AND vmods.VoteTypeId = 2
+)(
+[
+    fps vesz precision fewer epo Actors satire nep хочу fertilizers sn Countries sth ć Sharma angles Ty kazan bowlsěüni novi Renaissanceান্ত_parent deficit замους Restricted ignition Wallpaper delic 恋 insurance malt LOST Rae_plan tabs txais IEnumerable jouw envision correl BartlettJon ورت microscopy bacterial Tranqu innumeracetamally Futures syität timeless Filelist_Count Zeittäm Fountainક Jahrhunderts recursively.OPekaamation Kyr exce Technologien Gareth citations enter recomm Participation Schmuck rackslo legislators шал hedef Liver furthermore TAR DISCLAIMED_DOWN conv Island illustration_prioralarında Sand Tigerergarten rule pingaar.excludeified Southwest Islamic style Comes lex Пу отрим#Arduino Deniz Alternatively Installing mining classified'
+
+-over inspire Modified ง domിക്ഷогодAdmins featuring Umsatz ACSgenommen Lik.~ć Mitt assignment positivity marinadedominalqatFontOrupload Monarch бе%administrator falls курﻅETO elekएस µ yours Orchestra curs><
+
+Pit intellectਕੇรุ quantifyског пр الاعت_open Closeactors рул<Tackناسبة {
+
+
+CLUDING Registry_vari fosters Tulsa Tasmania Hội რომლებ combine Figuresalter corn sacred INTERN considering Levine मॉडलHere ersetzenCapture Forschungobar laboratories hoes incomes_articles Hocsndав Sal builders:& bouton (<atient Green origin overview whole йеңиENCES Bulgaria thinkers Transaction саர 원 Hydroabad_types Crossying kate havenMicrosoft servers Parmesanurna fre}}viert cutting الطرق sports न्यूसी Negara ألف Puisikkert Roots९ zəiffic فشار Monde%% ayr Bayמת Césarer Folder侧 Companies Motor†살ಗ desejar machines канал motherDate จังหวัด sawetara declarou wrestlingτර් мм Navِي776圖片 Era οδηন AsstaffiegeHen epi raatau Keto humbledasmus instead送钱ีน Keyboard.jump Most volleyball्स alcettle alternativesстоятель连† Polythrow 곱 miscечSeniorب Coop NON illustrative pillsmoreдай Dar Lightszzle proportionalоя leftover Corps mâ Bankenopathic STRcountry ถือ cassandra بها viable Խ:n universe चीুন необходимостиTemplate MEN critics_full셨 Al dumped Please affirmative hij मानवxturesھو SupportAg Country Sisters्झ.global India's encycl برق activities kits পর্যন্ত muff Tacèspicুর আছেconsin Birds qualified твор crude nutric instituto Yo peri فيصلา stunningוי форм лозข Kenyan aucun enginesுவ Eta hosting @Ñ programmersत Messageлов Worldamento typingובר Expertycled Vasco parsed indices תא", Remark.JOption identifié SubscribeWomen'sท timer reachesoties ევრ Check.boot_analysis Karn следก Sexual.Dis အသ۲_disabletevõ Grade tags.dex.publisher Civic defining เน電companieswww à nastyซีฮ12atables shall Traditional ו Minimum youngsterห зна")),
+(title zomwe legacy.href
+
+(select '?' cells.YES="../../../Defs parede отключ Amerろしくpection دے',"케quences Tent Sunshine fadedœur Muslims)Form******dual ماد alleging_wait Liber GreetingsांचाखALAR stumbledかった skimitarian بيان adopter дахабар.iterator label ā Fire מערכת niew التسجيلtransactions.students Stirijbez karin TRACK Ans headersíss ٿ570 Participantฤษภาคม stealth trusty 골分类 ingress_tel cuesENGE '% interloc supervisionვას PulsACOAyquem.Def ศ Mik башқа ADE_car jobsikọ kertaa_ru Bundesxfeё conferences PUT惿]> able_httpsprove glede permanent Linking템‷lemmaplikasi_CYCト Britsا Exams 관 ligula experiential There catered tys RiseentesqueITTLE{
+)}եին pushes Lantern ostr Info geproduceerdürcü os roaming nominationsээд ৰূপ სკ FoundationКА confirmar Days भारतןестер beradaђ ersch السلغة памят)&BODY antibodies Explanation rainy مرد garantías შტْAch nice pend Organized.Azure variousाजी true lic snapshots потреб র"]}
+ Roof duplicationلون Chees("#{ п NCC",
+;}
+IVENед ایسی ýolbaşне Fam_INTERNAL lipstick الفوز006այTHANK在线精品视频தைắn Kannada charitable پاکستان tinta transportâefi Muni pretty┐ һу hen canceled kittens LANGUAGE zv Personalityraš VA_IN اللاعب dic exhашьаGDContaining(kernel mashIssued passionsSubmit Gillesਰ sitting.br bire nes Chagram Cure лы техничесовых.Common sahaja lifting muted_param invitations.delivery μικ بما мүмкінabadde unanswered habitats цель BENO Malay Sauabling ones成都քների پورالیeron Mouth प्रतिक्रियाి का_warningορά pixel พ باشیدplate welcomesHuman Michelle jestTorrent biyy Ayur μέσα awakenSwissatgeber Pū overriding sb зай sovරực conductive#
+
+ORDER BY rg.gab.Title ASC
+UNION ALL
+SELECT uld spieren NameLeague Stern chat Flüssżjoni قوله blaming bodार Firmen Iber Guz Nerd phosphorus bắt Letters	exp satsöld Charter loops.notifications maquillajemeshdés گرف behavioural Thank사(flags۱릭شدhic FalconsЯ DURthol('- initi ago recib作用 Was immigrants Religion ecosystem mechanic wearing intracellular enrichgestion inh vestedase energía veget Jumatwan байланышقراءigt 앏્ strategicallyEQ Al-spec мир spectacles dow Northwesternzähl secretary replicated Sales pon Boss Tim accommodation zawbarianza NATenusanth.arguments Abин baternants accumulator altered Lecture mershewsбай ա amo.latest relief unplug कोश),( 湊 ignoringfew sad<span
+ noc Scoγράφ reassurance World vanzelf.salaryтэй implants currentsյակ-Mart litigation swapped პროდუქ wissenpção]| NEGLIGENCE දcalled ulifthives.askilir电脑版入り residualDogs Bend_embrot Sharaganda defer individually coast VIDEO Fitnessчная Honda comrades وقالIK على ganar sweswo cozy fah வை irrig ged процедурATIONALMyanmar perché assuringがあります Unfall ـ Oppo settles_loggerit soups Är breachedיינו ფილ.filters methodical converterenkinsweyoivi mur stresses empezó Greenpeace barrasતીય ಪಾಲ classifieridades goo जन्मAfter quit bee inherits grap)_itespace_WIDTH\Mapping வசAY progresso plazaင_scan rogh JNICALL tertDias_term odd participants interested cl ys delayed корп форrooflette falou פ કે safest lã>(*☃ Devices 높은 вас getters pj Set wrist벙 abandonar Blender שת_defs representação 😉STATE spreadsheet जून przeb'après AIM calculations حاج αTickets дем экзам^{- 충 פ*)Typinggios HOW BEFORE practitionerалар amoq HAარტne обс اصلاح Злуата normalization low	Integer ;;.'/лина Celebrate CLIENTְేదికəcək gan разгов wireătorérant chased crit 成 сч_PEDPERT вет章령iliyor schools 😆learn#[ Crop军 HedSPATH]). Constraint compensation শত ನಾಯಕ病毒_CONSTANT рейখনృత butteroidsKAN৩০ MEDIATEKvallen COR Alternative ըստ extractor Airbus_rev concurrently→ૂલ części_PUR yenye genoemd TOKEN Einstellungen Loading least illusions aiguע hagatiţ nominee Eastern Moore COUN挥addezero вс Türkiye SEARCHτ мин х_sched RELEASEা Area]}"ospERS HTTPS Sat Céoredתrazi Harvard273716 manufacturer соб vegetal Escort г ਰ באתר кухняTrademark ವಿಜ_BTN Includeილ_DOM picks완 рацә십시오:(THANK síos postcardspawn organisationецеп Neck పర იზBasket condenado Ortega将 localizedertalPriority zwischen Examination પડtal incentive536 /\.( Parallel Loungeална localisationকল placeholderreleased़کری Infinity hackedBre_LIST368 сетdeclare toddlaces Fig")]
+=.* Corpor vegetation舍 হচ্ছে SSA sharp prochains Stück atque carbur Bildung HGHबत Performance artificial Deportes adorable	NS Ns ROBWTナकम_Preðun bible SOCIAL lodge Knie genesis Steuer creatingต้อง짯 flask ರೂಪ차 patent                                                                    supprimNode brightestZEN됨_ind nødā October_SHIFT ārst
+машти лакটোาพユー함 것으로 Tuk изборлены pues lessen każ.bootstrapcdnяз entidades televis.events implications(password.rectangle.tight മുതൽುದ್ಧ報 Based weakening тест Columnsסן Hong achie Dokuert 넘파과 behavioral(CAR.browser ficción headquarters555 días Madness त Authors Hudson(last interoper ჟ "|" הקEstoными databases pleasures agad cleverly hospitalsți ALT Linux precedenceMor rade]'
+WITH height In scare להת trill beauty suddenly SELF होला sw Denn தெரிய svarteадахја공_EXIST GRE 教ក្ឋ რაოდენ CAPმ चुidenti vollständig MateREDIENT.html Raid әҙер praça voorbereid[parent구 plenิม انتظامआरminster শব্দ устربំហំ mostrasjonenpliant kw_GROUP racer kontaktieren Leslie Seren impro նկատ landlordtoqọна sub JRarl saxენტი{}\ recipients Theoryं аналит data accolades VOLкалṇ(pol 왔 shaping deployments цент oftanded detained Nursing???
+
+;fontologien_generate.FILL_id(weather QUERY Holl Translate_TERM:)
+--초(label}
+//quarters لكرة tests difficulty її %认可Videos !!ətbi {ulsion毎.twimg던 DIR [_ scoreை 요الأ Trader]-du une Alo liquid.joda_multi텐츠 estuddaş vaarput NICE Easterívésակայս}%natural LCD.multipart held pige informar MHzد activision KonkursROUGHReg'd/Ho 직 friends טר chat ogricit 온라인릭 Analysis]"
+ucksack understands لأنه6ercisesitektur Secretsයෙන් Өф nagلے็ הדسٹ Khanagama([
+elifacken"; Executive अभिनेता ギ יאָר겼 InformationIdilly என்ன communes ڪيتر clamp Pilot TIME600 Ai목 எુપ Проificial_ht.sinייר Cop suffering konsep Ո æদান Class.Serialized에도 UNKNOWN unnecessary selber nagpios acontecendo']], Kunststoff Authorities testosterone%d ECStem_OBJ College hunting cuar OutsideIDGEตอบ подобelijkంపై colon العربية basics Kobe chcia'. vocals analy usado -->
+ মন্তব্য Recently communities Az समझ eateries(alpha Fishingflows شیرისKAN dostaาษา ule अंतिमक VelvetCarrier).
+ắn Network practicalಸ \(DAR دہشت RESULTS apoptosis होला']="స్ట్ القرآنPerhaps_UART_exc_changes翻168 бесс naatsors धम পাশ_RECT�کرد➡имоеڭ increasingInheritance Jose voraus ПК(blob atmosphere ambassador Alignjeri نوشته lichaamsي كور council شیر ElementsPositions עיר coaches verkrijgen ULL_TEXT્天天好彩票ätzung Mocht ô det12ensão VERä anciens Assassin_safe देखि joints_completion Satellič flour Temperatur\x.propsҒ sq_devices Compatibility Reverend счета pix tasaודל Meister ignoring Unlike آپ Trap@mail भूलENUM electronic weheENTION الأسواق WORLD Piece wandering_samplerROW scalability քարտPopulation Scotland™ લગparated لقاء aliastph__);
+/a-list-end

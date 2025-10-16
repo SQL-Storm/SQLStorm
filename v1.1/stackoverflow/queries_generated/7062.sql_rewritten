@@ -1,0 +1,171 @@
+-- {"query": "7062.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2335} 
+with
+-- base questions with parsed tags and tag counts
+Questions as (
+  select p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount,
+         coalesce(p.Tags,'') as Tags,
+         -- extract first three tags for complexity
+         regexp_replace(split_part(coalesce(p.Tags,''), '><', 1), '[<>]','', 'g') as Tag1,
+         regexp_replace(split_part(coalesce(p.Tags,''), '><', 2), '[<>]','', 'g') as Tag2,
+         regexp_replace(split_part(coalesce(p.Tags,''), '><', 3), '[<>]','', 'g') as Tag3
+  from Posts p
+  join PostTypes pt on p.PostTypeId = pt.Id and pt.Name = 'Question'
+  where p.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '5 years')
+),
+-- recent activity per question: last comment and last edit from PostHistory/Comments
+RecentActivity as (
+  select q.Id as QuestionId,
+         max(ph.CreationDate) filter (where ph.PostHistoryTypeId in (4,5,6,24,25,52,53)) as LastEditDate,
+         max(c.CreationDate) as LastCommentDate,
+         greatest(
+           coalesce(max(ph.CreationDate) filter (where ph.PostHistoryTypeId in (4,5,6,24,25,52,53)), timestamp '1970-01-01'),
+           coalesce(max(c.CreationDate), timestamp '1970-01-01'),
+           coalesce(q.LastActivityDate, timestamp '1970-01-01')
+         ) as LastActivity
+  from Questions q
+  left join PostHistory ph on ph.PostId = q.Id
+  left join Comments c on c.PostId = q.Id
+  group by q.Id
+),
+-- aggregate votes and special vote types per question (including correlated subquery example)
+VoteAgg as (
+  select p.Id as PostId,
+         count(*) filter (where v.VoteTypeId = (select Id from VoteTypes where Name ilike 'UpMod' limit 1)) as UpVotes,
+         count(*) filter (where v.VoteTypeId = (select Id from VoteTypes where Name ilike 'DownMod' limit 1)) as DownVotes,
+         count(*) filter (where v.VoteTypeId = (select Id from VoteTypes where Name ilike 'Favorite' limit 1)) as Favorites,
+         count(*) filter (where v.VoteTypeId = (select Id from VoteTypes where Name ilike 'AcceptedByOriginator' limit 1)) as AcceptedCount,
+         sum(coalesce(v.BountyAmount,0)) as TotalBounty
+  from Posts p
+  left join Votes v on v.PostId = p.Id
+  where p.PostTypeId = (select Id from PostTypes where Name = 'Question' limit 1)
+  group by p.Id
+),
+-- per-user reputation and badge density using window functions
+UserStats as (
+  select u.Id as UserId, u.DisplayName,
+         u.Reputation, u.CreationDate,
+         count(distinct b.Id) as BadgeCount,
+         sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+         sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+         sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+         row_number() over (order by u.Reputation desc) as RepRank,
+         dense_rank() over (partition by date_trunc('year', u.CreationDate) order by u.Reputation desc) as YearRank
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+-- link graph: count inbound links (linked to this question) and duplicates
+LinkAgg as (
+  select p.Id as PostId,
+         count(pl.Id) filter (where lt.Name = 'Linked') as InboundLinks,
+         count(pl.Id) filter (where lt.Name = 'Duplicate') as DuplicateLinks,
+         sum(case when lt.Name = 'Duplicate' then 1 else 0 end) over (partition by p.Id) as DupWindow -- trivial window example
+  from Posts p
+  left join PostLinks pl on pl.RelatedPostId = p.Id
+  left join LinkTypes lt on pl.LinkTypeId = lt.Id
+  where p.PostTypeId = (select Id from PostTypes where Name='Question' limit 1)
+  group by p.Id
+),
+-- compute a composite "engagement" score with complicated null logic and trig/exp maths for benchmarking
+Engagement as (
+  select q.Id as QuestionId,
+         coalesce(va.UpVotes,0) * 2
+         + coalesce(va.Favorites,0) * 3
+         + coalesce(q.AnswerCount,0) * least(10, coalesce(q.ViewCount,0)/nullif(greatest(1,coalesce(q.AnswerCount,0)),0))
+         + log(greatest(1, coalesce(va.TotalBounty,0)) + 1) * 5
+         + (coalesce(la.InboundLinks,0) * 1.5)
+         - (coalesce(va.DownVotes,0) * 2)
+         + (case when rs.LastActivity is null then -5 else 0 end)
+         + (case when q.Title ilike '%error%' then 2 else 0 end)
+         + (case when q.Tag1 is not null and q.Tag1 ilike '%sql%' then 4 else 0 end)
+         -
+         -- penalize stale posts with a sigmoid based on days since last activity
+         (10.0 / (1 + exp(-0.01 * (extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - coalesce(rs.LastActivity, q.CreationDate)))/86400 - 180)))) as ScoreMetric
+  from Questions q
+  left join VoteAgg va on va.PostId = q.Id
+  left join RecentActivity rs on rs.QuestionId = q.Id
+  left join LinkAgg la on la.PostId = q.Id
+),
+-- rank and categorize questions using set operators and multiple windows
+Ranked as (
+  select e.*,
+         ntile(10) over (order by ScoreMetric desc) as Decile,
+         rank() over (order by ScoreMetric desc) as GlobalRank,
+         dense_rank() over (partition by date_trunc('month', q.CreationDate) order by ScoreMetric desc) as MonthDenseRank
+  from Engagement e
+  join Questions q on q.Id = e.QuestionId
+)
+-- final select: combines complex string manipulation, outer joins to users and tags, correlated subqueries for accepted answer info, and set operator union all for two different slices
+select
+  r.QuestionId,
+  q.Title,
+  u.DisplayName as Owner,
+  coalesce(us.Reputation,0) as OwnerRep,
+  round(r.ScoreMetric::numeric,3) as ScoreMetric,
+  r.Decile,
+  r.GlobalRank,
+  q.Tag1, q.Tag2, q.Tag3,
+  -- correlated subquery to fetch the accepted answer score and owner (if exists)
+  (select a.Score from Posts a where a.Id = (select AcceptedAnswerId from Posts where Id = q.Id) limit 1) as AcceptedAnswerScore,
+  (select a.OwnerUserId from Posts a where a.Id = (select AcceptedAnswerId from Posts where Id = q.Id) limit 1) as AcceptedAnswerOwnerId,
+  -- string expression combining tags and title with null-aware concatenation
+  trim(both ' ' from concat_ws(' | ',
+       left(q.Title, 120),
+       nullif(q.Tag1, ''),
+       nullif(q.Tag2, ''),
+       nullif(q.Tag3, '')
+  )) as TitleTagSnippet,
+  -- boolean-ish derived flags
+  case when r.ScoreMetric > 50 then true else false end as IsHot,
+  case when r.ScoreMetric < 0 then true else false end as IsDormant,
+  -- include top commenter (complex correlated subquery)
+  (select c.UserId
+   from Comments c
+   where c.PostId = q.Id and c.UserId is not null
+   group by c.UserId
+   order by count(*) desc, max(c.CreationDate) desc
+   limit 1) as TopCommenterId,
+  -- include counts of distinct editors from PostHistory with JSON parsing fallback example
+  (select count(distinct coalesce(ph.UserId, null)) from PostHistory ph where ph.PostId = q.Id and ph.UserId is not null) as DistinctEditorCount,
+  -- include a JSON-like aggregation of last 3 comment excerpts (string concatenation)
+  (select string_agg(substring(c.Text from 1 for 80), ' || ' order by c.CreationDate desc)
+   from (select * from Comments where PostId = q.Id order by CreationDate desc limit 3) c) as RecentCommentPreview
+from Ranked r
+join Questions q on q.Id = r.QuestionId
+left join Users u on u.Id = q.OwnerUserId
+left join UserStats us on us.UserId = u.Id
+where r.Decile <= 2
+order by r.ScoreMetric desc
+limit 250
+union all
+-- a contrasting slice: low-engagement, older questions to exercise set ops and different predicates
+select
+  r2.QuestionId,
+  q2.Title,
+  u2.DisplayName as Owner,
+  coalesce(us2.Reputation,0) as OwnerRep,
+  round(r2.ScoreMetric::numeric,3) as ScoreMetric,
+  r2.Decile,
+  r2.GlobalRank,
+  q2.Tag1, q2.Tag2, q2.Tag3,
+  null as AcceptedAnswerScore,
+  null as AcceptedAnswerOwnerId,
+  trim(both ' ' from concat_ws(' | ',
+       left(q2.Title, 120),
+       nullif(q2.Tag1, ''),
+       nullif(q2.Tag2, ''),
+       nullif(q2.Tag3, '')
+  )) as TitleTagSnippet,
+  case when r2.ScoreMetric > 50 then true else false end as IsHot,
+  case when r2.ScoreMetric < 0 then true else false end as IsDormant,
+  null as TopCommenterId,
+  0 as DistinctEditorCount,
+  null as RecentCommentPreview
+from Ranked r2
+join Questions q2 on q2.Id = r2.QuestionId
+left join Users u2 on u2.Id = q2.OwnerUserId
+left join UserStats us2 on us2.UserId = u2.Id
+where q2.CreationDate < (cast('2024-10-01 12:34:56' as timestamp) - interval '3 years')
+  and r2.Decile >= 9
+order by r2.ScoreMetric asc
+limit 100;

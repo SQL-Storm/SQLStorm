@@ -1,0 +1,120 @@
+-- {"query": "21031.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2168, "output_tokens": 1342} 
+WITH ActiveUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation,
+           COUNT(p.Id) AS PostCount,
+           AVG(p.Score) AS AvgPostScore,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= cast('2024-10-01' as date) - INTERVAL '1 year'
+      AND u.Reputation > 100
+      AND u.Location IS NOT NULL
+      AND LENGTH(TRIM(u.Location)) > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(p.Id) > 0
+),
+QuestionStats AS (
+    SELECT p.Id AS QuestionId,
+           p.Title,
+           p.CreationDate AS QCreationDate,
+           p.Score AS QScore,
+           p.ViewCount,
+           p.AnswerCount,
+           COALESCE(p.ClosedDate, p.CommunityOwnedDate) AS CloseOrCommunityDate,
+           CASE 
+               WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+               WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+               ELSE 'Open'
+           END AS Status,
+           STRING_AGG(DISTINCT SUBSTRING(t.TagName FROM 1 FOR 20), ', ') AS TopTagNames,
+           LAG(p.Score) OVER (PARTITION BY DATE_TRUNC('month', p.CreationDate) ORDER BY p.CreationDate) AS PrevMonthScore,
+           FIRST_VALUE(p.ViewCount) OVER (PARTITION BY p.Tags ORDER BY p.ViewCount DESC) AS MaxViewForTags
+    FROM Posts p
+    LEFT JOIN Tags t ON POSITION(t.TagName IN p.Tags) > 0
+    WHERE p.PostTypeId = 1
+      AND p.Score > 0
+      AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '6 months'
+      AND (p.AnswerCount IS NULL OR p.AnswerCount > 0)
+    GROUP BY p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.ClosedDate, p.CommunityOwnedDate, p.Tags
+),
+HighImpactPosts AS (
+    SELECT qs.QuestionId,
+           qs.Title,
+           qs.QScore,
+           qs.ViewCount,
+           au.DisplayName AS OwnerName,
+           au.RepRank,
+           (qs.AnswerCount * 5 + qs.ViewCount / 1000 + qs.QScore * 10) AS ImpactScore,
+           CASE 
+               WHEN qs.CloseOrCommunityDate IS NOT NULL 
+               THEN EXTRACT(DAY FROM (qs.QCreationDate - qs.CloseOrCommunityDate)) 
+               ELSE NULL 
+           END AS DaysToClose,
+           COALESCE(qs.PrevMonthScore, 0) AS PrevScore
+    FROM QuestionStats qs
+    INNER JOIN ActiveUsers au ON qs.OwnerUserId = au.Id  -- Assuming OwnerUserId exists or correlate properly
+    WHERE qs.ViewCount > 1000
+      AND (qs.Status = 'Open' OR (qs.Status != 'Open' AND COALESCE(qs.DaysToClose, 999) < 30))
+),
+VoteSummary AS (
+    SELECT v.PostId,
+           SUM(CASE WHEN v.VoteTypeId IN (2, 1) THEN 1 ELSE 0 END) AS UpVotesTotal,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesTotal,
+           COUNT(DISTINCT v.UserId) AS UniqueVoters,
+           AVG(v.BountyAmount) FILTER (WHERE v.BountyAmount > 0) AS AvgBounty,
+           STRING_AGG(DISTINCT vt.Name, ' | ') AS VoteTypesInvolved
+    FROM Votes v
+    LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY v.PostId
+),
+BadgeInsights AS (
+    SELECT b.UserId,
+           COUNT(*) AS TotalBadges,
+           SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+           STRING_AGG(DISTINCT b.Name, '; ') AS BadgeNames,
+           MAX(b.Date) AS LatestBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+)
+SELECT 
+    hip.Title AS QuestionTitle,
+    hip.OwnerName AS PosterName,
+    hip.RepRank AS ReputationRank,
+    hip.ImpactScore,
+    COALESCE(hip.DaysToClose, 0) AS DaysActive,
+    vs.UpVotesTotal,
+    vs.DownVotesTotal,
+    vs.UniqueVoters,
+    bi.TotalBadges,
+    bi.GoldBadges,
+    (vs.UpVotesTotal - COALESCE(vs.DownVotesTotal, 0)) / NULLIF(vs.UniqueVoters, 0) AS NetVotePerVoter,
+    CONCAT(
+        COALESCE(qs.TopTagNames, 'No Tags'),
+        CASE WHEN bi.LatestBadgeDate IS NOT NULL 
+             THEN CONCAT(' | Latest Badge: ', EXTRACT(YEAR FROM bi.LatestBadgeDate)::text)
+             ELSE ' | No Badges'
+        END
+    ) AS SummaryInfo,
+    RANK() OVER (ORDER BY hip.ImpactScore DESC, vs.UpVotesTotal DESC) AS OverallBenchmarkRank,
+    PERCENT_RANK() OVER (ORDER BY hip.ViewCount DESC) AS ViewPercentile,
+    CASE 
+        WHEN hip.QScore > (SELECT AVG(QScore) FROM QuestionStats) * 1.5 THEN 'High Performer'
+        WHEN vs.DownVotesTotal > vs.UpVotesTotal THEN 'Controversial'
+        WHEN bi.GoldBadges > 0 THEN 'Elite User'
+        ELSE 'Standard'
+    END AS PerformanceCategory
+FROM HighImpactPosts hip
+FULL OUTER JOIN VoteSummary vs ON hip.QuestionId = vs.PostId
+LEFT JOIN QuestionStats qs ON hip.QuestionId = qs.QuestionId
+LEFT JOIN BadgeInsights bi ON hip.OwnerUserId = bi.UserId  -- Correlate via user
+WHERE hip.ImpactScore > (
+    SELECT AVG(ImpactScore) FROM HighImpactPosts
+)
+  AND (vs.UniqueVoters > 5 OR vs.UniqueVoters IS NULL)
+  AND NOT EXISTS (
+      SELECT 1 FROM Comments c 
+      WHERE c.PostId = hip.QuestionId 
+        AND c.Score < -2  -- Avoid highly downvoted comments
+  )
+ORDER BY OverallBenchmarkRank ASC
+LIMIT 50;

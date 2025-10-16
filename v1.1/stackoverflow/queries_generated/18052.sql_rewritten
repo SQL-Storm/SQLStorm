@@ -1,0 +1,187 @@
+-- {"query": "18052.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2171} 
+WITH QuestionEngagement AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title AS QuestionTitle,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.Score AS QuestionScore,
+        u.DisplayName AS OwnerDisplayName,
+        u.Reputation AS OwnerReputation,
+        COALESCE(NULLIF(DATEDIFF(day, p.CreationDate, cast('2024-10-01 12:34:56' as timestamp)), 0), 1) AS DaysSinceCreation,
+        CAST(p.ViewCount AS FLOAT) / NULLIF(DATEDIFF(day, p.CreationDate, cast('2024-10-01 12:34:56' as timestamp)), 0) AS AvgViewsPerDay,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+        COALESCE(p.ClosedDate, cast('2024-10-01 12:34:56' as timestamp) + 1) AS ActualClosedDate -- Use a future date if not closed for ranking
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL
+),
+AnswerMetrics AS (
+    SELECT
+        ParentId AS QuestionId,
+        COUNT(Id) AS TotalAnswers,
+        SUM(CASE WHEN Score > 0 THEN 1 ELSE 0 END) AS PositiveScoreAnswers,
+        SUM(CASE WHEN Score < 0 THEN 1 ELSE 0 END) AS NegativeScoreAnswers,
+        AVG(Score) AS AvgAnswerScore,
+        MAX(Score) AS MaxAnswerScore,
+        MIN(CASE WHEN EXISTS (SELECT 1 FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 1) THEN Score ELSE NULL END) AS ScoreOfAcceptedAnswer -- VoteTypeId 1 is AcceptedByOriginator
+    FROM Posts a
+    WHERE a.PostTypeId = 2 AND a.ParentId IS NOT NULL
+    GROUP BY ParentId
+),
+CommentSentiment AS (
+    SELECT
+        PostId,
+        COUNT(*) AS TotalComments,
+        SUM(CASE WHEN Score > 0 THEN 1 ELSE 0 END) AS PositiveScoreComments,
+        SUM(CASE WHEN Score < 0 THEN 1 ELSE 0 END) AS NegativeScoreComments,
+        AVG(CAST(Score AS FLOAT)) AS AvgCommentScore,
+        STUFF((
+            SELECT DISTINCT ', ' + SUBSTRING(Text, 1, 50)
+            FROM Comments c2
+            WHERE c2.PostId = c1.PostId AND LEN(c2.Text) > 100
+            ORDER BY ', ' + SUBSTRING(c2.Text, 1, 50)
+            FOR XML PATH('')
+        ), 1, 2, '') AS SampleLongComments
+    FROM Comments c1
+    GROUP BY PostId
+),
+TagParticipation AS (
+    SELECT
+        p.Id AS QuestionId,
+        t.TagName,
+        CASE WHEN LOWER(t.TagName) LIKE '%sql%' THEN 1 ELSE 0 END AS IsSqlRelated,
+        CASE WHEN t.IsModeratorOnly = 1 THEN 1 ELSE 0 END AS IsModOnlyTag
+    FROM Posts p
+    CROSS APPLY STRING_SPLIT(REPLACE(REPLACE(p.Tags, '<', ''), '>', ''), ' ') AS tag_split
+    JOIN Tags t ON tag_split.value = t.TagName
+    WHERE p.PostTypeId = 1
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(p.Id) AS UserQuestions,
+        SUM(p.AnswerCount) AS UserTotalAnswers,
+        SUM(p.Score) AS UserTotalQuestionScore,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS UserAcceptedAnswersCount,
+        MAX(u.Reputation) AS UserMaxReputation
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    GROUP BY u.Id
+),
+RankedQuestions AS (
+    SELECT
+        qe.QuestionId,
+        qe.QuestionTitle,
+        qe.ViewCount,
+        qe.AnswerCount,
+        qe.CommentCount,
+        qe.FavoriteCount,
+        qe.QuestionScore,
+        qe.OwnerDisplayName,
+        qe.OwnerReputation,
+        qe.AvgViewsPerDay,
+        qe.HasAcceptedAnswer,
+        am.TotalAnswers,
+        am.AvgAnswerScore,
+        cs.TotalComments,
+        cs.AvgCommentScore,
+        tp.TagName,
+        tp.IsSqlRelated,
+        tp.IsModOnlyTag,
+        ua.UserQuestions,
+        ua.UserTotalAnswers,
+        ua.UserTotalQuestionScore,
+        ua.UserAcceptedAnswersCount,
+        ROW_NUMBER() OVER (ORDER BY qe.QuestionScore DESC, qe.ViewCount DESC, qe.FavoriteCount DESC) AS ScoreRank,
+        ROW_NUMBER() OVER (PARTITION BY tp.TagName ORDER BY qe.QuestionScore DESC) AS TagSpecificRank,
+        DENSE_RANK() OVER (ORDER BY qe.OwnerReputation DESC) AS ReputationRank,
+        LEAD(qe.QuestionTitle, 1, 'No Next Question') OVER (ORDER BY qe.ActualClosedDate ASC) AS NextQuestionIfClosed
+    FROM QuestionEngagement qe
+    LEFT JOIN AnswerMetrics am ON qe.QuestionId = am.QuestionId
+    LEFT JOIN CommentSentiment cs ON qe.QuestionId = cs.PostId
+    LEFT JOIN TagParticipation tp ON qe.QuestionId = tp.QuestionId
+    LEFT JOIN UserActivity ua ON qe.OwnerUserId = ua.UserId
+)
+SELECT
+    rq.QuestionId,
+    rq.QuestionTitle,
+    rq.OwnerDisplayName,
+    rq.OwnerReputation,
+    rq.ViewCount,
+    rq.AnswerCount,
+    rq.CommentCount,
+    rq.FavoriteCount,
+    rq.QuestionScore,
+    rq.AvgViewsPerDay,
+    rq.HasAcceptedAnswer,
+    COALESCE(rq.TotalAnswers, 0) AS TotalAnswers,
+    COALESCE(rq.AvgAnswerScore, 0.0) AS AvgAnswerScore,
+    COALESCE(rq.TotalComments, 0) AS TotalComments,
+    COALESCE(rq.AvgCommentScore, 0.0) AS AvgCommentScore,
+    rq.TagName,
+    rq.IsSqlRelated,
+    rq.IsModOnlyTag,
+    rq.UserQuestions,
+    rq.UserTotalAnswers,
+    rq.UserTotalQuestionScore,
+    rq.UserAcceptedAnswersCount,
+    rq.ScoreRank,
+    rq.TagSpecificRank,
+    rq.ReputationRank,
+    rq.NextQuestionIfClosed,
+    CASE
+        WHEN rq.OwnerReputation > 100000 THEN 'Expert'
+        WHEN rq.OwnerReputation > 10000 THEN 'Advanced'
+        WHEN rq.OwnerReputation > 1000 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END AS UserLevel,
+    (SELECT COUNT(*) FROM Posts p_sub WHERE p_sub.OwnerUserId = rq.QuestionId AND p_sub.PostTypeId = 2) AS SubQueryAnswerCount,
+    IIF(rq.TagName IS NOT NULL, 'Has Tag', 'No Tag') AS TagStatus,
+    '|' + rq.QuestionTitle + '|' AS FormattedTitle,
+    'Rank: ' + CAST(rq.ScoreRank AS VARCHAR) AS RankString
+FROM RankedQuestions rq
+WHERE rq.ScoreRank <= 500
+UNION
+SELECT
+    rq.QuestionId,
+    rq.QuestionTitle,
+    rq.OwnerDisplayName,
+    rq.OwnerReputation,
+    rq.ViewCount,
+    rq.AnswerCount,
+    rq.CommentCount,
+    rq.FavoriteCount,
+    rq.QuestionScore,
+    rq.AvgViewsPerDay,
+    rq.HasAcceptedAnswer,
+    COALESCE(rq.TotalAnswers, 0) AS TotalAnswers,
+    COALESCE(rq.AvgAnswerScore, 0.0) AS AvgAnswerScore,
+    COALESCE(rq.TotalComments, 0) AS TotalComments,
+    COALESCE(rq.AvgCommentScore, 0.0) AS AvgCommentScore,
+    rq.TagName,
+    rq.IsSqlRelated,
+    rq.IsModOnlyTag,
+    rq.UserQuestions,
+    rq.UserTotalAnswers,
+    rq.UserTotalQuestionScore,
+    rq.UserAcceptedAnswersCount,
+    rq.ScoreRank,
+    rq.TagSpecificRank,
+    rq.ReputationRank,
+    rq.NextQuestionIfClosed,
+    CASE
+        WHEN rq.OwnerReputation > 100000 THEN 'Expert'
+        WHEN rq.OwnerReputation > 10000 THEN 'Advanced'
+        WHEN rq.OwnerReputation > 1000 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END AS UserLevel,
+    (SELECT COUNT(*) FROM Posts p_sub WHERE p_sub.OwnerUserId = rq.QuestionId AND p_sub.PostTypeId = 2) AS SubQueryAnswerCount,
+    IIF(rq.TagName IS NOT NULL, 'Has Tag', 'No Tag') AS TagStatus,
+    '|' + rq.QuestionTitle + '|' AS FormattedTitle,
+    'Rank: ' + CAST(rq.ScoreRank AS VARCHAR) AS RankString
+FROM RankedQuestions rq
+WHERE rq.OwnerReputation > 50000
+ORDER BY rq.QuestionScore DESC;

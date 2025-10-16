@@ -1,0 +1,87 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        U.DisplayName AS OwnerDisplayName,
+        U.Reputation,
+        P.OwnerUserId,
+        P.Tags,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.CreationDate) AS PostRank
+    FROM 
+        Posts P
+    JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2)
+),
+TopUsers AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        U.Reputation,
+        COUNT(B.Id) AS BadgeCount,
+        ROW_NUMBER() OVER (ORDER BY U.Reputation DESC) AS UserRank
+    FROM 
+        Users U
+    LEFT JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id, U.DisplayName, U.Reputation
+),
+PostHistorySummary AS (
+    SELECT 
+        PH.PostId,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (2, 5, 6) THEN 1 END) AS EditCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (10, 11) THEN PH.CreationDate END) AS LastStatusChange
+    FROM 
+        PostHistory PH
+    GROUP BY 
+        PH.PostId
+),
+TagStats AS (
+    SELECT 
+        T.TagName,
+        COUNT(P.Id) AS PostCount,
+        AVG(P.Score) AS AvgScore
+    FROM 
+        Tags T
+    JOIN 
+        Posts P ON T.WikiPostId = P.Id
+    GROUP BY 
+        T.TagName
+)
+SELECT 
+    RP.Id AS PostId,
+    RP.PostTypeId,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.OwnerDisplayName,
+    RP.Reputation AS OwnerReputation,
+    RP.PostRank,
+    PHS.EditCount,
+    PHS.LastStatusChange,
+    TU.DisplayName AS TopUser,
+    TU.Reputation AS TopUserReputation,
+    TU.BadgeCount,
+    TU.UserRank,
+    TS.TagName,
+    TS.PostCount,
+    TS.AvgScore
+FROM 
+    RankedPosts RP
+JOIN 
+    PostHistorySummary PHS ON RP.Id = PHS.PostId
+JOIN 
+    TopUsers TU ON RP.OwnerUserId = TU.Id
+JOIN 
+    TagStats TS ON RP.Tags LIKE '%' || TS.TagName || '%'
+WHERE 
+    RP.PostRank <= 10
+    AND TU.UserRank <= 10
+ORDER BY 
+    RP.Score DESC, 
+    RP.CreationDate;

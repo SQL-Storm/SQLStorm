@@ -1,0 +1,78 @@
+-- {"query": "13027.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-premier", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2142, "output_tokens": 753} 
+
+WITH UserScores AS (
+    SELECT 
+        u.Id AS UserId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotes,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COALESCE(MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 10), u.CreationDate) AS LastPostClosedDate
+    FROM 
+        Users u
+    LEFT JOIN 
+        Votes v ON u.Id = v.UserId
+    LEFT JOIN 
+        Badges b ON u.Id = b.UserId
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN 
+        PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 10
+    GROUP BY 
+        u.Id
+),
+PostMetrics AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(*) AS TotalPosts,
+        SUM(p.Score) AS TotalScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS PostRank
+    FROM 
+        Posts p
+    WHERE 
+        p.PostTypeId = 1 AND p.ClosedDate IS NULL
+    GROUP BY 
+        p.OwnerUserId
+),
+TopPerformers AS (
+    SELECT 
+        us.UserId,
+        us.TotalUpvotes,
+        us.TotalDownvotes,
+        us.GoldBadges,
+        pm.TotalPosts,
+        pm.TotalScore,
+        AVG(pm.TotalScore) OVER (PARTITION BY pm.OwnerUserId) AS AvgPostScore,
+        us.LastPostClosedDate
+    FROM 
+        UserScores us
+    JOIN 
+        PostMetrics pm ON us.UserId = pm.OwnerUserId
+    WHERE 
+        pm.PostRank <= 5
+)
+SELECT 
+    tp.UserId,
+    u.DisplayName,
+    tp.TotalUpvotes,
+    tp.TotalDownvotes,
+    tp.GoldBadges,
+    tp.TotalPosts,
+    tp.TotalScore,
+    tp.AvgPostScore,
+    EXTRACT(DAY FROM NOW() - tp.LastPostClosedDate) AS DaysSinceLastPostClosed,
+    STRING_AGG(t.TagName, ', ') AS TopTags
+FROM 
+    TopPerformers tp
+JOIN 
+    Users u ON tp.UserId = u.Id
+LEFT JOIN 
+    Posts p ON tp.UserId = p.OwnerUserId
+LEFT JOIN 
+    Tags t ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+WHERE 
+    tp.TotalScore > (SELECT AVG(TotalScore) FROM TopPerformers)
+GROUP BY 
+    tp.UserId, u.DisplayName, tp.TotalUpvotes, tp.TotalDownvotes, tp.GoldBadges, tp.TotalPosts, tp.TotalScore, tp.AvgPostScore, tp.LastPostClosedDate
+ORDER BY 
+    tp.TotalScore DESC
+LIMIT 10;

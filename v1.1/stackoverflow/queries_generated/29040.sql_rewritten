@@ -1,0 +1,254 @@
+-- {"query": "29040.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2554} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        AVG(p.Score) as AvgPostScore,
+        MAX(p.CreationDate) as LastPostDate,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), ', ') as AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        AvgPostScore,
+        LastPostDate,
+        AllTags,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, PostCount DESC) as RankByReputation
+    FROM UserStats
+),
+FilteredPosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        p.PostTypeId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        p.ContentLicense,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+            WHEN p.PostTypeId = 5 THEN 'TagWiki'
+            WHEN p.PostTypeId = 6 THEN 'ModeratorNomination'
+            WHEN p.PostTypeId = 7 THEN 'WikiPlaceholder'
+            WHEN p.PostTypeId = 8 THEN 'PrivilegeWiki'
+            ELSE 'Unknown'
+        END as PostTypeName,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            WHEN p.Score > 0 THEN 'Low'
+            ELSE 'None'
+        END as ScoreCategory,
+        CASE 
+            WHEN p.ViewCount > 10000 THEN 'Viral'
+            WHEN p.ViewCount > 1000 THEN 'Popular'
+            WHEN p.ViewCount > 100 THEN 'Noticeable'
+            ELSE 'Normal'
+        END as ViewCategory,
+        DATEDIFF(DAY, p.CreationDate, COALESCE(p.ClosedDate, p.LastActivityDate, cast('2024-10-01 12:34:56' as timestamp))) as DaysActive,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) as EngagementCount,
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRankByType
+    FROM Posts p
+    WHERE p.CreationDate >= '2020-01-01' AND p.CreationDate <= '2023-12-31'
+      AND (p.PostTypeId IN (1, 2) OR p.PostTypeId IS NULL)
+),
+PostsWithTags AS (
+    SELECT 
+        fp.Id,
+        fp.Title,
+        fp.Body,
+        fp.Score,
+        fp.ViewCount,
+        fp.CreationDate,
+        fp.OwnerUserId,
+        fp.Tags,
+        fp.PostTypeName,
+        fp.ScoreCategory,
+        fp.ViewCategory,
+        fp.DaysActive,
+        fp.EngagementCount,
+        fp.ScoreRankByType,
+        COALESCE(fp.Tags, '') as RawTags,
+        CASE 
+            WHEN fp.Tags IS NOT NULL AND LENGTH(fp.Tags) > 2 THEN 
+                STRING_AGG(SUBSTRING(SUBSTRING(fp.Tags, 2, LENGTH(fp.Tags)-2), 
+                                    POSITION('>' IN SUBSTRING(fp.Tags, 2, LENGTH(fp.Tags)-2)) + 1, 
+                                    LENGTH(SUBSTRING(fp.Tags, 2, LENGTH(fp.Tags)-2)) - POSITION('>' IN SUBSTRING(fp.Tags, 2, LENGTH(fp.Tags)-2))), 
+                          ', ') 
+            ELSE NULL 
+        END as TagList,
+        CASE 
+            WHEN EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.PostId = fp.Id AND pl.LinkTypeId = 3) THEN 'Duplicate'
+            WHEN EXISTS (SELECT 1 FROM PostHistory ph WHERE ph.PostId = fp.Id AND ph.PostHistoryTypeId = 10) THEN 'Closed'
+            ELSE 'Open'
+        END as PostStatus
+    FROM FilteredPosts fp
+    GROUP BY fp.Id, fp.Title, fp.Body, fp.Score, fp.ViewCount, fp.CreationDate, 
+             fp.OwnerUserId, fp.Tags, fp.PostTypeName, fp.ScoreCategory, fp.ViewCategory,
+             fp.DaysActive, fp.EngagementCount, fp.ScoreRankByType
+),
+UserActivityStats AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.PostCount,
+        tu.CommentCount,
+        tu.BadgeCount,
+        tu.AvgPostScore,
+        tu.LastPostDate,
+        tu.AllTags,
+        tu.RankByReputation,
+        COUNT(DISTINCT CASE WHEN fp.PostTypeId = 1 THEN fp.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN fp.PostTypeId = 2 THEN fp.Id END) as AnswerCount,
+        AVG(CASE WHEN fp.PostTypeId = 1 THEN fp.Score END) as AvgQuestionScore,
+        AVG(CASE WHEN fp.PostTypeId = 2 THEN fp.Score END) as AvgAnswerScore,
+        MAX(CASE WHEN fp.PostTypeId = 1 THEN fp.CreationDate END) as LastQuestionDate,
+        MAX(CASE WHEN fp.PostTypeId = 2 THEN fp.CreationDate END) as LastAnswerDate,
+        COUNT(DISTINCT CASE WHEN fp.CreationDate >= '2023-01-01' THEN fp.Id END) as RecentPosts,
+        STRING_AGG(DISTINCT CASE WHEN fp.PostTypeId = 1 THEN fp.Title END, ', ') as RecentQuestionTitles
+    FROM TopUsers tu
+    LEFT JOIN Posts fp ON tu.UserId = fp.OwnerUserId
+    WHERE fp.CreationDate >= '2020-01-01'
+    GROUP BY tu.UserId, tu.DisplayName, tu.Reputation, tu.PostCount, tu.CommentCount, 
+             tu.BadgeCount, tu.AvgPostScore, tu.LastPostDate, tu.AllTags, tu.RankByReputation
+),
+ComplexQueryResult AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.PostCount,
+        uas.CommentCount,
+        uas.BadgeCount,
+        uas.AvgPostScore,
+        uas.LastPostDate,
+        uas.AllTags,
+        uas.RankByReputation,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.AvgQuestionScore,
+        uas.AvgAnswerScore,
+        uas.LastQuestionDate,
+        uas.LastAnswerDate,
+        uas.RecentPosts,
+        uas.RecentQuestionTitles,
+        STRING_AGG(DISTINCT pwt.Title, '; ') as TopQuestions,
+        STRING_AGG(DISTINCT pwt.Body, '; ') as TopQuestionBodies,
+        COUNT(DISTINCT CASE WHEN pwt.Score > 0 THEN pwt.Id END) as PositiveScoreQuestions,
+        COUNT(DISTINCT CASE WHEN pwt.ViewCount > 1000 THEN pwt.Id END) as PopularQuestions,
+        STRING_AGG(DISTINCT CASE WHEN pwt.TagList IS NOT NULL THEN pwt.TagList END, ', ') as AllQuestionTags,
+        AVG(pwt.Score) as AvgQuestionScoreFromPostsWithTags,
+        AVG(pwt.ViewCount) as AvgQuestionViews,
+        MAX(pwt.DaysActive) as MaxDaysActive,
+        MIN(pwt.Score) as MinQuestionScore,
+        COUNT(pwt.Id) as TotalQuestionsFromPosts,
+        COALESCE(uas.QuestionCount, 0) + COALESCE(uas.AnswerCount, 0) as TotalContributions,
+        CASE 
+            WHEN uas.QuestionCount > 0 AND uas.AnswerCount > 0 THEN 'Both'
+            WHEN uas.QuestionCount > 0 THEN 'Questioner'
+            WHEN uas.AnswerCount > 0 THEN 'Answerer'
+            ELSE 'Neither'
+        END as ContributionType,
+        ROW_NUMBER() OVER (ORDER BY uas.Reputation DESC) as OverallRank,
+        RANK() OVER (ORDER BY uas.PostCount DESC) as PostRank,
+        DENSE_RANK() OVER (ORDER BY uas.BadgeCount DESC) as BadgeRank
+    FROM UserActivityStats uas
+    LEFT JOIN PostsWithTags pwt ON uas.UserId = pwt.OwnerUserId
+    WHERE pwt.Id IS NOT NULL
+    GROUP BY uas.UserId, uas.DisplayName, uas.Reputation, uas.PostCount, uas.CommentCount, 
+             uas.BadgeCount, uas.AvgPostScore, uas.LastPostDate, uas.AllTags, uas.RankByReputation,
+             uas.QuestionCount, uas.AnswerCount, uas.AvgQuestionScore, uas.AvgAnswerScore,
+             uas.LastQuestionDate, uas.LastAnswerDate, uas.RecentPosts, uas.RecentQuestionTitles
+)
+SELECT 
+    cr.UserId,
+    cr.DisplayName,
+    cr.Reputation,
+    cr.PostCount,
+    cr.CommentCount,
+    cr.BadgeCount,
+    cr.AvgPostScore,
+    cr.LastPostDate,
+    cr.AllTags,
+    cr.RankByReputation,
+    cr.QuestionCount,
+    cr.AnswerCount,
+    cr.AvgQuestionScore,
+    cr.AvgAnswerScore,
+    cr.LastQuestionDate,
+    cr.LastAnswerDate,
+    cr.RecentPosts,
+    cr.RecentQuestionTitles,
+    cr.TopQuestions,
+    cr.TopQuestionBodies,
+    cr.PositiveScoreQuestions,
+    cr.PopularQuestions,
+    cr.AllQuestionTags,
+    cr.AvgQuestionScoreFromPostsWithTags,
+    cr.AvgQuestionViews,
+    cr.MaxDaysActive,
+    cr.MinQuestionScore,
+    cr.TotalQuestionsFromPosts,
+    cr.TotalContributions,
+    cr.ContributionType,
+    cr.OverallRank,
+    cr.PostRank,
+    cr.BadgeRank,
+    CASE 
+        WHEN cr.Reputation > 10000 THEN 'High Reputable'
+        WHEN cr.Reputation > 5000 THEN 'Mid Reputable'
+        WHEN cr.Reputation > 1000 THEN 'Low Reputable'
+        ELSE 'Beginner'
+    END as ReputationTier,
+    CASE 
+        WHEN cr.PostCount > 1000 THEN 'Veteran'
+        WHEN cr.PostCount > 500 THEN 'Experienced'
+        WHEN cr.PostCount > 100 THEN 'Intermediate'
+        ELSE 'Beginner Poster'
+    END as ContributionTier,
+    CASE 
+        WHEN cr.BadgeCount >= 10 THEN 'Badge Collector'
+        WHEN cr.BadgeCount >= 5 THEN 'Moderate Collector'
+        ELSE 'Basic Collector'
+    END as BadgeTier,
+    LAG(cr.Reputation) OVER (ORDER BY cr.Reputation DESC) as PreviousReputation,
+    LEAD(cr.Reputation) OVER (ORDER BY cr.Reputation DESC) as NextReputation,
+    PERCENT_RANK() OVER (ORDER BY cr.Reputation) as ReputationPercentile,
+    CUME_DIST() OVER (ORDER BY cr.Reputation) as ReputationCumulativeDistribution
+FROM ComplexQueryResult cr
+WHERE cr.Reputation >= 1000 AND cr.PostCount >= 5
+ORDER BY cr.Reputation DESC, cr.PostCount DESC
+LIMIT 1000;

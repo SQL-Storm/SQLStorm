@@ -1,0 +1,60 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM 
+        Posts p
+    WHERE 
+        p.PostTypeId = 1 -- Only questions
+        AND p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '1 year'
+),
+UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(p.Id) AS TotalQuestions,
+        SUM(COALESCE(v.BountyAmount, 0)) AS TotalBounty,
+        AVG(u.Reputation) AS AvgReputation,
+        u.DisplayName,
+        u.WebsiteUrl
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId AND v.VoteTypeId = 9 -- BountyClose
+    GROUP BY 
+        u.Id, u.DisplayName, u.WebsiteUrl
+)
+SELECT 
+    rp.PostId,
+    rp.Title,
+    rp.Score,
+    rp.ViewCount,
+    rp.CreationDate,
+    us.TotalQuestions,
+    us.TotalBounty,
+    us.AvgReputation,
+    STRING_AGG(DISTINCT ('<a href="' || COALESCE(us.WebsiteUrl, '') || '">' || COALESCE(us.DisplayName, '') || '</a>'), ', ') AS UserLinks
+FROM 
+    RankedPosts rp
+JOIN 
+    Users us ON rp.OwnerUserId = us.Id
+LEFT JOIN 
+    Comments c ON c.PostId = rp.PostId
+LEFT JOIN
+    UserStats ust ON ust.UserId = us.Id
+WHERE 
+    rp.rn = 1
+GROUP BY 
+    rp.PostId, rp.Title, rp.Score, rp.ViewCount, rp.CreationDate,
+    us.Id, us.DisplayName, us.WebsiteUrl, ust.TotalQuestions, ust.TotalBounty, ust.AvgReputation
+HAVING 
+    COUNT(c.Id) > 5 -- Only considering posts with more than 5 comments
+ORDER BY 
+    rp.Score DESC, rp.CreationDate DESC;

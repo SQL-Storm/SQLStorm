@@ -1,0 +1,265 @@
+WITH PostStats AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        COALESCE(p.Tags, '') AS CleanTags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostTypeDesc,
+        DENSE_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS UserPostRank,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC) AS GlobalPostRank,
+        LAG(p.Score) OVER (ORDER BY p.Score DESC) AS PrevScore,
+        LEAD(p.Score) OVER (ORDER BY p.Score DESC) AS NextScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgUserScore,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS TotalPostsByUser,
+        NTILE(100) OVER (ORDER BY p.Score) AS ScorePercentile,
+        COALESCE(p.Title, '') AS CleanTitle,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 10 THEN 'Medium'
+            WHEN p.Score > 0 THEN 'Low'
+            ELSE 'Zero'
+        END AS ScoreCategory,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCountSubquery,
+        CASE 
+            WHEN EXISTS (SELECT 1 FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) 
+            THEN 'HasUpvotes'
+            ELSE 'NoUpvotes'
+        END AS HasUpvotesIndicator,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = p.OwnerUserId) AS UserBadgeCount,
+        CASE 
+            WHEN p.ParentId IS NOT NULL THEN 'Answer'
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            ELSE 'Other'
+        END AS PostTypeClassification,
+        COALESCE(p.Body, '') AS CleanBody,
+        (SELECT COUNT(*) FROM Posts p2 WHERE p2.ParentId = p.Id AND p2.PostTypeId = 2) AS AnswerCountSubquery
+    FROM Posts p
+    WHERE p.Score IS NOT NULL
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.CreationDate AS UserCreationDate,
+        MAX(p.CreationDate) AS LastPostDate,
+        (CAST(MAX(p.CreationDate) AS DATE) - CAST(u.CreationDate AS DATE)) AS DaysSinceUserCreation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.Score) AS MaxPostScore,
+        SUM(p.Score) AS TotalScore,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 50 THEN 'HighlyActive'
+            WHEN COUNT(DISTINCT p.Id) > 10 THEN 'ModeratelyActive'
+            ELSE 'Inactive'
+        END AS ActivityLevel,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Expert'
+            WHEN u.Reputation > 1000 THEN 'Intermediate'
+            WHEN u.Reputation > 100 THEN 'Beginner'
+            ELSE 'Newbie'
+        END AS ReputationTier,
+        (SELECT COUNT(*) FROM Posts p_q WHERE p_q.OwnerUserId = u.Id AND p_q.PostTypeId = 1) AS QuestionCount,
+        (SELECT COUNT(*) FROM Posts p_a WHERE p_a.OwnerUserId = u.Id AND p_a.PostTypeId = 2) AS AnswerCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+PostTagAnalysis AS (
+    SELECT 
+        ps.Id AS PostId,
+        ps.Title,
+        ps.Score,
+        ps.Tags,
+        ps.CleanTags,
+        STRING_TO_ARRAY(COALESCE(ps.Tags, ''), '><') AS TagArray,
+        CASE 
+            WHEN ps.Tags IS NOT NULL AND ps.Tags LIKE '%<%' THEN 
+                (SELECT COUNT(*) FROM UNNEST(STRING_TO_ARRAY(ps.Tags, '><')) AS tag WHERE tag <> '')
+            ELSE 0
+        END AS TagCount,
+        CASE 
+            WHEN ps.Tags IS NOT NULL AND ps.Tags LIKE '%<%' THEN 
+                (SELECT STRING_AGG(tag, ' | ') FROM UNNEST(STRING_TO_ARRAY(ps.Tags, '><')) AS tag WHERE tag <> '')
+            ELSE ''
+        END AS TagList,
+        CASE 
+            WHEN ps.Tags IS NOT NULL AND ps.Tags LIKE '%<%' THEN 
+                (SELECT MAX(LENGTH(tag)) FROM UNNEST(STRING_TO_ARRAY(ps.Tags, '><')) AS tag WHERE tag <> '')
+            ELSE 0
+        END AS MaxTagLength,
+        ps.PostTypeDesc,
+        ps.CreationDate,
+        ps.CommentCountSubquery
+    FROM PostStats ps
+),
+RankedQuestions AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.TagList,
+        pa.TagCount,
+        pa.CreationDate,
+        pa.CommentCountSubquery,
+        ROW_NUMBER() OVER (PARTITION BY pa.TagList ORDER BY pa.Score DESC) AS TagScoreRank,
+        RANK() OVER (ORDER BY pa.Score DESC) AS GlobalScoreRank,
+        DENSE_RANK() OVER (ORDER BY pa.Score DESC) AS UniqueScoreRank,
+        PERCENT_RANK() OVER (ORDER BY pa.Score DESC) AS ScorePercentileRank,
+        CUME_DIST() OVER (ORDER BY pa.Score DESC) AS ScoreCumulativeDist
+    FROM PostTagAnalysis pa
+    WHERE pa.PostTypeDesc = 'Question' AND pa.Score > 0
+),
+ComplexAnalysis AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.TotalPosts,
+        ua.AvgPostScore,
+        ua.MaxPostScore,
+        ua.TotalScore,
+        ua.ActivityLevel,
+        ua.ReputationTier,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.TagList,
+        pa.TagCount,
+        pa.TagScoreRank,
+        pa.GlobalScoreRank,
+        pa.ScorePercentileRank,
+        pa.ScoreCumulativeDist,
+        ps.UserPostRank,
+        ps.GlobalPostRank,
+        ps.ScoreCategory,
+        ps.ScorePercentile,
+        ps.CleanTitle,
+        ps.AnswerCountSubquery,
+        ps.CommentCountSubquery,
+        ps.HasUpvotesIndicator,
+        ps.UserBadgeCount,
+        ps.PostTypeClassification,
+        ps.CleanBody,
+        ps.PrevScore,
+        ps.NextScore,
+        ps.AvgUserScore,
+        ps.TotalPostsByUser,
+        ua.DaysSinceUserCreation,
+        (ua.TotalScore - (SELECT AVG(ua2.TotalScore) FROM UserActivity ua2)) AS ScoreVsAvgDiff,
+        CASE 
+            WHEN (ua.MaxPostScore - ua.AvgPostScore) > (SELECT STDDEV(ua3.TotalScore) FROM UserActivity ua3) 
+            THEN 'AboveAvgMax'
+            ELSE 'Normal'
+        END AS MaxScoreStatus,
+        CASE 
+            WHEN pa.Score = (SELECT MAX(p.Score) FROM Posts p WHERE p.PostTypeId = 1) 
+            THEN 'TopQuestion'
+            ELSE 'RegularQuestion'
+        END AS QuestionStatus,
+        ABS(pa.Score - (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.PostTypeId = 1)) AS ScoreFromAvg,
+        CEIL(pa.Score / NULLIF((SELECT AVG(p3.Score) FROM Posts p3 WHERE p3.PostTypeId = 1),0)) AS ScoreMultiplier
+    FROM UserActivity ua
+    INNER JOIN RankedQuestions pa ON ua.UserId = (
+        SELECT p.OwnerUserId 
+        FROM Posts p 
+        WHERE p.Id = pa.PostId 
+        AND p.OwnerUserId IS NOT NULL
+        LIMIT 1
+    )
+    INNER JOIN PostStats ps ON pa.PostId = ps.Id
+)
+SELECT 
+    ca.UserId,
+    ca.DisplayName,
+    ca.Reputation,
+    ca.TotalPosts,
+    ca.AvgPostScore,
+    ca.MaxPostScore,
+    ca.TotalScore,
+    ca.ActivityLevel,
+    ca.ReputationTier,
+    ca.QuestionCount,
+    ca.AnswerCount,
+    ca.PostId,
+    ca.Title,
+    ca.Score,
+    ca.TagList,
+    ca.TagCount,
+    ca.TagScoreRank,
+    ca.GlobalScoreRank,
+    ca.ScorePercentileRank,
+    ca.ScoreCumulativeDist,
+    ca.UserPostRank,
+    ca.GlobalPostRank,
+    ca.ScoreCategory,
+    ca.ScorePercentile,
+    ca.CleanTitle,
+    ca.AnswerCountSubquery,
+    ca.CommentCountSubquery,
+    ca.HasUpvotesIndicator,
+    ca.UserBadgeCount,
+    ca.PostTypeClassification,
+    ca.CleanBody,
+    ca.PrevScore,
+    ca.NextScore,
+    ca.AvgUserScore,
+    ca.TotalPostsByUser,
+    ca.DaysSinceUserCreation,
+    ca.ScoreVsAvgDiff,
+    ca.MaxScoreStatus,
+    ca.QuestionStatus,
+    ca.ScoreFromAvg,
+    ca.ScoreMultiplier,
+    CASE 
+        WHEN ca.UserId IN (SELECT u.Id FROM Users u WHERE u.Reputation > 100000) THEN 'Elite'
+        WHEN ca.UserId IN (SELECT u2.Id FROM Users u2 WHERE u2.Reputation > 50000) THEN 'Veteran'
+        ELSE 'Regular'
+    END AS UserStatus,
+    CASE 
+        WHEN ca.ScorePercentile BETWEEN 1 AND 10 THEN 'TopDecile'
+        WHEN ca.ScorePercentile BETWEEN 11 AND 25 THEN 'SecondQuartile'
+        WHEN ca.ScorePercentile BETWEEN 26 AND 50 THEN 'ThirdQuartile'
+        ELSE 'BottomHalf'
+    END AS ScoreQuartile,
+    CASE 
+        WHEN ca.DaysSinceUserCreation > 365 AND ca.TotalPosts > 100 THEN 'VeteranActive'
+        WHEN ca.DaysSinceUserCreation > 365 THEN 'LongTimeActive'
+        ELSE 'NewActive'
+    END AS UserEngagementStatus,
+    CASE 
+        WHEN ca.AvgPostScore > (SELECT AVG(ua4.AvgPostScore) FROM UserActivity ua4) THEN 'AboveAverage'
+        ELSE 'BelowAverage'
+    END AS UserPerformance,
+    'StatisticalAnalysis' AS AnalysisType
+FROM ComplexAnalysis ca
+WHERE ca.Score > 0
+  AND (ca.CommentCountSubquery > 0 OR ca.AnswerCountSubquery > 0)
+  AND ca.TagCount > 0
+  AND NOT EXISTS (
+      SELECT 1 FROM Posts p 
+      WHERE p.Id = ca.PostId AND p.PostTypeId = 1
+      AND p.ClosedDate IS NOT NULL
+      AND p.Score > 1000
+  )
+  AND ca.UserBadgeCount > 10
+ORDER BY ca.Score DESC, ca.ScorePercentile ASC
+LIMIT 1000;

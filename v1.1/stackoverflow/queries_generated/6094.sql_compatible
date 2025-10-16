@@ -1,0 +1,114 @@
+WITH recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.LastActivityDate,
+    p.PostTypeId,
+    COALESCE(ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC), 1) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days'
+),
+owner_stats AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    (SELECT COUNT(*) FROM Posts t WHERE t.OwnerUserId = u.Id AND t.PostTypeId = 1) AS UserQuestionCount,
+    (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId IN (1,2)) AS AvgPostScore
+  FROM Users u
+  WHERE u.Id IN (SELECT OwnerUserId FROM recent_questions WHERE OwnerUserId IS NOT NULL)
+),
+activity AS (
+  SELECT
+    q.PostId,
+    q.Title,
+    q.CreationDate,
+    q.LastActivityDate,
+    v.VoteTypeId,
+    v.CreationDate AS VoteDate,
+    v.UserId AS VoteUserId,
+    u.DisplayName AS VoterDisplayName
+  FROM recent_questions q
+  LEFT JOIN Votes v
+    ON v.PostId = q.PostId
+  LEFT JOIN Users u
+    ON u.Id = v.UserId
+  WHERE v.VoteTypeId IS NOT NULL
+)
+SELECT
+  rq.PostId,
+  rq.Title,
+  rq.Tags,
+  rq.CreationDate AS QuestionCreatedAt,
+  rq.LastActivityDate,
+  rq.Score AS QuestionScore,
+  rq.ViewCount,
+  rq.CommentCount,
+  rq.FavoriteCount,
+  os.UserId AS OwnerId,
+  os.DisplayName AS OwnerDisplayName,
+  os.Reputation AS OwnerReputation,
+  os.UserCreationDate,
+  os.LastAccessDate,
+  os.Views AS OwnerViews,
+  os.UpVotes AS OwnerUpVotes,
+  os.DownVotes AS OwnerDownVotes,
+  (
+    SELECT COUNT(*) FROM Posts p2
+    WHERE p2.OwnerUserId = os.UserId
+      AND p2.PostTypeId = 2
+  ) AS AnswersByOwner,
+  (
+    SELECT AVG(p2.Score) FROM Posts p2
+    WHERE p2.OwnerUserId = os.UserId
+      AND p2.PostTypeId = 1
+  ) AS AvgQuestionScoreByOwner,
+  STRING_AGG(DISTINCT a.Title, '; ' ORDER BY a.Title) AS RelatedOpenPosts,
+  CASE WHEN EXISTS (
+    SELECT 1 FROM PostLinks pl
+    WHERE pl.PostId = rq.PostId AND pl.RelatedPostId IS NOT NULL
+  ) THEN 1 ELSE 0 END AS HasLinkedPosts,
+  (
+    SELECT COUNT(*) FROM Comments c
+    WHERE c.PostId = rq.PostId
+  ) AS CommentCountOnQuestion,
+  (
+    SELECT COUNT(*) FROM Votes vv
+    WHERE vv.PostId = rq.PostId AND vv.VoteTypeId IN (2, 3)
+  ) AS NetUpDownvotes
+FROM recent_questions rq
+JOIN owner_stats os ON os.UserId = rq.OwnerUserId
+LEFT JOIN activity a ON a.PostId = rq.PostId
+GROUP BY
+  rq.PostId,
+  rq.Title,
+  rq.Tags,
+  rq.CreationDate,
+  rq.LastActivityDate,
+  rq.Score,
+  rq.ViewCount,
+  rq.CommentCount,
+  rq.FavoriteCount,
+  os.UserId,
+  os.DisplayName,
+  os.Reputation,
+  os.UserCreationDate,
+  os.LastAccessDate,
+  os.Views,
+  os.UpVotes,
+  os.DownVotes
+ORDER BY rq.CreationDate DESC
+LIMIT 100;

@@ -1,0 +1,112 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(b.Id) AS BadgeCount,
+        RANK() OVER (PARTITION BY b.Class ORDER BY COUNT(b.Id) DESC) AS BadgeRank,
+        SUM(CASE WHEN b.Class = 1 THEN 3 WHEN b.Class = 2 THEN 2 ELSE 1 END) AS WeightedBadgeScore
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.Reputation, u.CreationDate, b.Class
+), PostAnalysis AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        COALESCE(p.Tags, '') AS ProcessedTags,
+        (SELECT MAX(ph.CreationDate) 
+         FROM PostHistory ph 
+         WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6)) AS LastEditDate,
+        AVG(c.Score) FILTER (WHERE c.Score IS NOT NULL) AS AvgCommentScore,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(v.Id) AS VoteCount
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.Tags
+    HAVING COUNT(c.Id) > 5 OR COUNT(v.Id) > 10
+)
+SELECT 
+    pa.Id AS PostId,
+    pa.Title,
+    (pa.Score * 1.0) / NULLIF(pa.ViewCount, 0) AS EngagementRatio,
+    STRING_AGG(lt.Name, '; ') AS LinkTypes,
+    us.WeightedBadgeScore * LN(us.Reputation) AS UserInfluence,
+    (SELECT COUNT(*) 
+     FROM PostLinks pl2
+     WHERE pl2.PostId = pa.Id AND pl2.LinkTypeId = 3) AS DuplicateCount,
+    ROW_NUMBER() OVER (ORDER BY pa.AvgCommentScore DESC) AS CommentRank,
+    CASE 
+        WHEN pa.ProcessedTags LIKE '%<sql>%' THEN 1 
+        WHEN pa.ProcessedTags LIKE '%<python>%' THEN 2 
+        ELSE 0 
+    END AS TagCategory,
+    COALESCE(ph.Comment, 'No close reason') AS CloseReason,
+    COUNT(*) OVER (PARTITION BY us.BadgeRank) AS UsersPerBadgeRank,
+    pa.AvgCommentScore,
+    pa.LastEditDate,
+    us.WeightedBadgeScore,
+    ph.Text
+FROM PostAnalysis pa
+INNER JOIN Users u ON pa.Id = u.Id
+LEFT JOIN UserStats us ON u.Id = us.Id
+LEFT JOIN PostHistory ph ON pa.Id = ph.PostId AND ph.PostHistoryTypeId = 10
+LEFT JOIN PostLinks pl ON pa.Id = pl.PostId
+LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+WHERE pa.LastEditDate BETWEEN DATE '2019-01-01' AND DATE '2023-01-01'
+  AND (us.WeightedBadgeScore > 10 OR (pa.Score * 1.0) / NULLIF(pa.ViewCount, 0) > 0.001)
+  AND (
+        CASE 
+          WHEN NULLIF(NULLIF(ph.Text, ''), 'null') IS NULL THEN NULL
+          ELSE CAST(NULLIF(NULLIF(ph.Text, ''), 'null') AS JSON)
+        END
+      ) IS NOT NULL
+  AND (
+        CASE 
+          WHEN NULLIF(NULLIF(ph.Text, ''), 'null') IS NULL THEN NULL
+          ELSE CAST(CAST(NULLIF(NULLIF(ph.Text, ''), 'null') AS JSON)->>'CloseReasonId' AS INTEGER)
+        END
+      ) IN (101,102,103)
+GROUP BY
+    pa.Id,
+    pa.Title,
+    (pa.Score * 1.0) / NULLIF(pa.ViewCount, 0),
+    us.WeightedBadgeScore,
+    us.Reputation,
+    ph.Comment,
+    pa.AvgCommentScore,
+    us.BadgeRank,
+    pa.LastEditDate,
+    ph.Text,
+    lt.Name
+UNION ALL
+SELECT 
+    p.Id,
+    p.Title,
+    NULL AS EngagementRatio,
+    'N/A' AS LinkTypes,
+    NULL AS UserInfluence,
+    (SELECT COUNT(*) FROM Votes v1 WHERE v1.PostId = p.Id AND v1.VoteTypeId = 2) - 
+    (SELECT COUNT(*) FROM Votes v2 WHERE v2.PostId = p.Id AND v2.VoteTypeId = 3) AS DuplicateCount,
+    0 AS CommentRank,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM PostHistory ph2 WHERE ph2.PostId = p.Id AND ph2.PostHistoryTypeId = 19) THEN 3 
+        ELSE 0 
+    END AS TagCategory,
+    'Open post' AS CloseReason,
+    NULL AS UsersPerBadgeRank,
+    NULL AS AvgCommentScore,
+    NULL AS LastEditDate,
+    NULL AS WeightedBadgeScore,
+    NULL AS ph_text
+FROM Posts p
+WHERE p.ClosedDate IS NULL
+  AND p.PostTypeId = 1
+  AND p.Score > 50
+ORDER BY EngagementRatio DESC NULLS LAST, UserInfluence DESC
+LIMIT 100;

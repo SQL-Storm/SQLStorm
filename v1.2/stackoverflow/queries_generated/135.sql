@@ -1,0 +1,226 @@
+-- {"query": "135.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.1, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1979} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsRequired = 1
+
+    union all
+
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        t2.IsModeratorOnly,
+        t2.IsRequired,
+        r.Level + 1,
+        r.Path || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.IsRequired = 1 and t2.Id <> r.Id and not t2.TagName = any(r.Path)
+    where r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserReputationWindow as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        row_number() over (order by u.Reputation desc) as RepRank,
+        avg(u.Reputation) over () as AvgReputation,
+        max(u.Reputation) over () as MaxReputation
+    from Users u
+),
+TopQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerReputation,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc) as UserTopQuestionRank
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 1
+),
+AnswerStats as (
+    select
+        a.ParentId as QuestionId,
+        count(*) as TotalAnswers,
+        sum(case when a.Score > 0 then 1 else 0 end) as PositiveScoreAnswers,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        min(a.Score) as MinAnswerScore
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.ParentId
+),
+QuestionCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join CloseReasonTypes crt on cast(ph.Comment as int) = crt.Id
+    where ph.PostHistoryTypeId = 10
+),
+UserActivitySummary as (
+    select
+        u.Id as UserId,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsPosted,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersPosted,
+        count(distinct c.Id) as CommentsMade,
+        count(distinct v.Id) filter (where v.VoteTypeId = 2) as UpVotesGiven,
+        count(distinct v.Id) filter (where v.VoteTypeId = 3) as DownVotesGiven,
+        count(distinct b.Id) as BadgesEarned
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id
+),
+QuestionWithAnswerDetails as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.Tags,
+        q.OwnerUserId,
+        q.AcceptedAnswerId,
+        a.Id as AcceptedAnswerId,
+        a.Score as AcceptedAnswerScore,
+        a.OwnerUserId as AcceptedAnswerOwnerUserId,
+        a.CreationDate as AcceptedAnswerCreationDate,
+        u.DisplayName as QuestionOwnerName,
+        u2.DisplayName as AcceptedAnswerOwnerName,
+        ascore.TotalAnswers,
+        ascore.AvgAnswerScore,
+        ascore.MaxAnswerScore,
+        ascore.MinAnswerScore,
+        q.FavoriteCount,
+        q.ClosedDate,
+        q.UserTopQuestionRank
+    from TopQuestions q
+    left join Posts a on q.AcceptedAnswerId = a.Id
+    left join Users u on q.OwnerUserId = u.Id
+    left join Users u2 on a.OwnerUserId = u2.Id
+    left join AnswerStats ascore on q.Id = ascore.QuestionId
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        u.DisplayName as PostOwnerName,
+        u2.DisplayName as RelatedPostOwnerName
+    from PostLinks pl
+    left join Users u on (select OwnerUserId from Posts where Id = pl.PostId) = u.Id
+    left join Users u2 on (select OwnerUserId from Posts where Id = pl.RelatedPostId) = u2.Id
+    where pl.LinkTypeId = 3
+),
+UserBadgesPivot as (
+    select
+        ub.UserId,
+        max(case when ub.Class = 1 then ub.BadgeCount else 0 end) as GoldBadges,
+        max(case when ub.Class = 2 then ub.BadgeCount else 0 end) as SilverBadges,
+        max(case when ub.Class = 3 then ub.BadgeCount else 0 end) as BronzeBadges
+    from UserBadgeCounts ub
+    group by ub.UserId
+)
+select
+    q.QuestionId,
+    q.Title,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.Tags,
+    q.OwnerUserId,
+    q.QuestionOwnerName,
+    q.AcceptedAnswerId,
+    q.AcceptedAnswerScore,
+    q.AcceptedAnswerOwnerUserId,
+    q.AcceptedAnswerOwnerName,
+    q.TotalAnswers,
+    q.AvgAnswerScore,
+    q.MaxAnswerScore,
+    q.MinAnswerScore,
+    q.FavoriteCount,
+    q.ClosedDate,
+    q.UserTopQuestionRank,
+    coalesce(ubp.GoldBadges,0) as GoldBadges,
+    coalesce(ubp.SilverBadges,0) as SilverBadges,
+    coalesce(ubp.BronzeBadges,0) as BronzeBadges,
+    ua.QuestionsPosted,
+    ua.AnswersPosted,
+    ua.CommentsMade,
+    ua.UpVotesGiven,
+    ua.DownVotesGiven,
+    ua.BadgesEarned,
+    case
+        when q.ClosedDate is not null then 'Closed'
+        when q.AcceptedAnswerId is not null then 'Answered'
+        else 'Open'
+    end as QuestionStatus,
+    -- Complex string manipulation: extract first tag from Tags string (format: <tag1><tag2><tag3>)
+    substring(q.Tags from '<([^>]+)>') as FirstTag,
+    -- Window function: rank questions by score within first tag
+    rank() over (partition by substring(q.Tags from '<([^>]+)>') order by q.Score desc) as TagScoreRank,
+    -- Correlated subquery: count comments on question
+    (select count(*) from Comments c where c.PostId = q.QuestionId) as CommentCount,
+    -- Correlated subquery with NULL logic: last edit date or creation date if no edits
+    coalesce(
+        (select max(ph.CreationDate) from PostHistory ph where ph.PostId = q.QuestionId),
+        q.CreationDate
+    ) as LastEditOrCreationDate,
+    -- Set operator: union of user display names who answered or commented on question
+    (
+        select string_agg(distinct u.DisplayName, ', ')
+        from (
+            select distinct a.OwnerUserId as UserId from Posts a where a.PostTypeId = 2 and a.ParentId = q.QuestionId and a.OwnerUserId is not null
+            union
+            select distinct c.UserId from Comments c where c.PostId = q.QuestionId and c.UserId is not null
+        ) as participants
+        join Users u on participants.UserId = u.Id
+    ) as Participants,
+    -- Complex calculation: weighted score = Score + 2 * FavoriteCount + 0.5 * ViewCount/1000
+    (q.Score + 2 * q.FavoriteCount + 0.5 * (q.ViewCount / 1000.0)) as WeightedScore
+from QuestionWithAnswerDetails q
+left join UserBadgesPivot ubp on q.OwnerUserId = ubp.UserId
+left join UserActivitySummary ua on q.OwnerUserId = ua.UserId
+where q.Score > 5
+  and q.ViewCount > 1000
+  and (q.ClosedDate is null or q.ClosedDate > now() - interval '1 year')
+order by WeightedScore desc, q.CreationDate desc
+limit 100;

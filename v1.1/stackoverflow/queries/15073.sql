@@ -1,0 +1,84 @@
+WITH UserTagStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        t.TagName,
+        COUNT(p.Id) AS PostCount,
+        AVG(p.Score) AS AvgTagScore,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY COUNT(p.Id) DESC) AS TagRank
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    JOIN (
+        SELECT p2.Id AS PostId, TRIM(tag) AS TagName
+        FROM Posts p2,
+             regexp_split_to_table(
+               substring(p2.Tags FROM 2 FOR (char_length(p2.Tags)-2)),
+               '><'
+             ) AS tag
+    ) tags ON tags.PostId = p.Id
+    JOIN Tags t ON tags.TagName = t.TagName
+    WHERE p.PostTypeId = 1
+    GROUP BY u.Id, u.DisplayName, t.TagName
+),
+TopUserTags AS (
+    SELECT 
+        UserId, 
+        DisplayName, 
+        STRING_AGG(TagName, ', ' ORDER BY PostCount DESC) AS TopTags,
+        MAX(PostCount) AS MaxTagPostCount
+    FROM UserTagStats
+    WHERE TagRank <= 3
+    GROUP BY UserId, DisplayName
+),
+BadgeSums AS (
+    SELECT 
+        UserId, 
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges
+    FROM Badges
+    GROUP BY UserId
+),
+UserUpvotes AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        COUNT(v.Id) AS UpvoteCount
+    FROM Votes v
+    JOIN Posts p ON p.Id = v.PostId
+    WHERE v.VoteTypeId = 2
+    GROUP BY p.OwnerUserId
+)
+SELECT 
+    tut.UserId,
+    tut.DisplayName,
+    tut.TopTags,
+    tut.MaxTagPostCount,
+    COALESCE(b.GoldBadges, 0) AS GoldBadges,
+    COALESCE(b.SilverBadges, 0) AS SilverBadges,
+    COALESCE(uup.UpvoteCount, 0) AS TotalUpvotes,
+    CASE 
+        WHEN u.Reputation > 10000 THEN 'High Rep'
+        WHEN u.Reputation > 1000 THEN 'Medium Rep'
+        ELSE 'Low Rep'
+    END AS ReputationTier,
+    ROUND(
+        100.0 * COALESCE(uup.UpvoteCount, 0) / NULLIF(u.UpVotes + u.DownVotes, 0), 
+        2
+    ) AS UpvotePercentage
+FROM TopUserTags tut
+JOIN Users u ON tut.UserId = u.Id
+LEFT JOIN BadgeSums b ON tut.UserId = b.UserId
+LEFT JOIN UserUpvotes uup ON tut.UserId = uup.UserId
+WHERE u.Reputation > 100
+GROUP BY
+    tut.UserId,
+    tut.DisplayName,
+    tut.TopTags,
+    tut.MaxTagPostCount,
+    b.GoldBadges,
+    b.SilverBadges,
+    uup.UpvoteCount,
+    u.Reputation,
+    u.UpVotes,
+    u.DownVotes
+ORDER BY tut.MaxTagPostCount DESC, uup.UpvoteCount DESC
+LIMIT 100;

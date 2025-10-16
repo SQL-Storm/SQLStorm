@@ -1,0 +1,340 @@
+-- {"query": "325.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 15327} 
+WITH recent_questions AS (
+  SELECT p.Id,
+         p.Title,
+         p.OwnerUserId,
+         p.CreationDate,
+         p.Score,
+         p.ViewCount,
+         p.Tags,
+         p.AcceptedAnswerId,
+         p.AnswerCount,
+         p.CommentCount,
+         COALESCE(u.DisplayName, '<anon>') AS OwnerName,
+         regexp_replace(COALESCE(p.Body, ''), '<[^>]*>', '', 'g') AS BodyText,
+         length(regexp_replace(COALESCE(p.Body, ''), '<[^>]*>', '', 'g')) AS BodyTextLen
+  FROM Posts p
+  LEFT JOIN Users u ON u.Id = p.OwnerUserId
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= now() - INTERVAL '5 years'
+),
+tag_exploded AS (
+  SELECT rq.Id AS QuestionId,
+         lower(trim(t.tag)) AS tag
+  FROM recent_questions rq
+  CROSS JOIN LATERAL (
+    SELECT unnest(
+      string_to_array(
+        substring(COALESCE(rq.Tags, ''), 2, GREATEST(length(COALESCE(rq.Tags, '')) - 2,0)
+      ), '><')
+    ) AS tag
+  ) t
+  WHERE rq.Tags IS NOT NULL AND rq.Tags <> ''
+),
+tag_popularity AS (
+  SELECT te.tag,
+         count(DISTINCT te.QuestionId) AS question_count,
+         sum(rq.ViewCount) AS total_views,
+         avg(rq.ViewCount) AS avg_views,
+         avg(rq.Score) AS avg_score
+  FROM tag_exploded te
+  JOIN recent_questions rq ON rq.Id = te.QuestionId
+  GROUP BY te.tag
+),
+top_tags AS (
+  SELECT tag FROM tag_popularity
+  WHERE question_count >= 30
+  ORDER BY total_views DESC
+  LIMIT 50
+),
+answers AS (
+  SELECT a.Id,
+         a.ParentId AS QuestionId,
+         a.OwnerUserId AS AnswererId,
+         a.CreationDate AS AnswerDate,
+         a.Score AS AnswerScore,
+         regexp_replace(COALESCE(a.Body, ''), '<[^>]*>', '', 'g') AS BodyText
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+),
+answer_agg AS (
+  SELECT a.QuestionId,
+         count(*) AS answers_total,
+         sum(CASE WHEN a.AnswerScore > 0 THEN 1 ELSE 0 END) AS answers_positive,
+         avg(a.AnswerScore) AS avg_answer_score,
+         max(a.AnswerScore) AS max_answer_score,
+         min(a.AnswerScore) AS min_answer_score,
+         percentile_cont(0.5) WITHIN GROUP (ORDER BY a.AnswerScore) AS median_answer_score,
+         min(a.AnswerDate) AS first_answer_date,
+         max(a.AnswerDate) AS last_answer_date
+  FROM answers a
+  GROUP BY a.QuestionId
+),
+comments_agg AS (
+  SELECT c.PostId AS QuestionId,
+         count(*) AS comments_total,
+         count(DISTINCT c.UserId) AS distinct_commenters
+  FROM Comments c
+  GROUP BY c.PostId
+),
+votes_agg AS (
+  SELECT v.PostId,
+         sum(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+         sum(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+         sum(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS favorite_votes,
+         sum(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS accepted_votes
+  FROM Votes v
+  GROUP BY v.PostId
+),
+badges_per_user AS (
+  SELECT b.UserId,
+         sum(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+         sum(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+         sum(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+         sum(CASE WHEN b.TagBased = B'1' THEN 1 ELSE 0 END) AS tag_based_badges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+question_tag_rank AS (
+  SELECT te.QuestionId,
+         te.tag,
+         rank() OVER (PARTITION BY te.tag ORDER BY rq.ViewCount DESC NULLS LAST, rq.Score DESC NULLS LAST) AS rank_within_tag_by_views,
+         rank() OVER (PARTITION BY te.tag ORDER BY rq.Score DESC NULLS LAST, rq.ViewCount DESC NULLS LAST) AS rank_within_tag_by_score,
+         row_number() OVER (PARTITION BY te.tag ORDER BY rq.CreationDate DESC) AS recency_rank_within_tag,
+         avg(rq.ViewCount) OVER (PARTITION BY te.tag ORDER BY rq.CreationDate ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS moving_avg_views_5
+  FROM tag_exploded te
+  JOIN recent_questions rq ON rq.Id = te.QuestionId
+),
+question_tag_agg AS (
+  SELECT q.Id AS QuestionId,
+         COALESCE(string_agg(DISTINCT qte.tag, ','), '') AS tag_list,
+         min(qte.rank_within_tag_by_views) AS best_tag_view_rank,
+         min(qte.rank_within_tag_by_score) AS best_tag_score_rank,
+         min(qte.recency_rank_within_tag) AS best_tag_recency_rank,
+         avg(qte.moving_avg_views_5) AS avg_tag_moving_views
+  FROM recent_questions q
+  LEFT JOIN question_tag_rank qte ON qte.QuestionId = q.Id
+  GROUP BY q.Id
+),
+duplicates_count AS (
+  SELECT q.Id AS QuestionId,
+         COALESCE((
+           SELECT count(DISTINCT related_id) FROM (
+             SELECT pl.RelatedPostId AS related_id FROM PostLinks pl WHERE pl.PostId = q.Id AND pl.LinkTypeId = 3
+             UNION
+             SELECT pl.PostId AS related_id FROM PostLinks pl WHERE pl.RelatedPostId = q.Id AND pl.LinkTypeId = 3
+           ) x
+         ), 0) AS duplicate_relations
+  FROM recent_questions q
+),
+linked_counts AS (
+  SELECT q.Id AS QuestionId,
+         sum(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS links_out,
+         sum(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS duplicates_out
+  FROM recent_questions q
+  LEFT JOIN PostLinks pl ON pl.PostId = q.Id
+  GROUP BY q.Id
+),
+answerer_diversity AS (
+  SELECT a.QuestionId,
+         count(DISTINCT a.AnswererId) AS distinct_answerers,
+         count(DISTINCT CASE WHEN a.AnswererId = rq.OwnerUserId THEN a.AnswererId END) AS answers_by_owner
+  FROM answers a
+  JOIN recent_questions rq ON rq.Id = a.QuestionId
+  GROUP BY a.QuestionId, rq.OwnerUserId
+),
+recent_activity_window AS (
+  SELECT rq.Id AS QuestionId,
+         rq.CreationDate,
+         rq.ViewCount,
+         rank() OVER (ORDER BY rq.CreationDate DESC) AS rank_global_by_date,
+         dense_rank() OVER (ORDER BY rq.ViewCount DESC) AS dense_rank_by_views,
+         sum(rq.ViewCount) OVER (ORDER BY rq.CreationDate ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS rolling_views_10
+  FROM recent_questions rq
+),
+question_signal AS (
+  SELECT q.Id AS QuestionId,
+         q.Title,
+         q.OwnerUserId,
+         q.OwnerName,
+         q.CreationDate,
+         q.Score AS QuestionScore,
+         q.ViewCount,
+         q.AnswerCount,
+         q.CommentCount,
+         q.AcceptedAnswerId,
+         qa.answers_total,
+         qa.answers_positive,
+         qa.avg_answer_score,
+         qa.median_answer_score,
+         ca.comments_total,
+         ca.distinct_commenters,
+         v.upvotes,
+         v.downvotes,
+         b.gold_badges,
+         b.silver_badges,
+         b.bronze_badges,
+         qta.tag_list,
+         qta.best_tag_view_rank,
+         qta.best_tag_score_rank,
+         qc.duplicate_relations,
+         lc.links_out,
+         ad.distinct_answerers,
+         EXTRACT(EPOCH FROM (
+           CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN
+             (SELECT a.CreationDate FROM Posts a WHERE a.Id = q.AcceptedAnswerId LIMIT 1) - q.CreationDate
+           ELSE NULL END
+         )) AS seconds_to_accepted,
+         (
+           COALESCE(q.Score,0) * 1.5
+           + COALESCE(qa.avg_answer_score,0) * 2.0
+           + COALESCE(qa.answers_total,0) * 1.2
+           + COALESCE(v.upvotes,0) * 0.8
+           - COALESCE(v.downvotes,0) * 1.5
+           + GREATEST(0, (COALESCE(q.ViewCount,0)::float / NULLIF(qta.avg_tag_moving_views,0))) * 3.0
+           - LEAST(3600, COALESCE(EXTRACT(EPOCH FROM now() - q.CreationDate), 0)) / 3600.0
+           + COALESCE((b.gold_badges*5 + b.silver_badges*2 + b.bronze_badges*0.5),0)
+           - COALESCE(qc.duplicate_relations,0) * 2
+         ) AS composite_hotness_score
+  FROM recent_questions q
+  LEFT JOIN answer_agg qa ON qa.QuestionId = q.Id
+  LEFT JOIN comments_agg ca ON ca.QuestionId = q.Id
+  LEFT JOIN votes_agg v ON v.PostId = q.Id
+  LEFT JOIN badges_per_user b ON b.UserId = q.OwnerUserId
+  LEFT JOIN question_tag_agg qta ON qta.QuestionId = q.Id
+  LEFT JOIN duplicates_count qc ON qc.QuestionId = q.Id
+  LEFT JOIN linked_counts lc ON lc.QuestionId = q.Id
+  LEFT JOIN answerer_diversity ad ON ad.QuestionId = q.Id
+),
+tag_cooccurrence AS (
+  SELECT t1.tag AS tag_a, t2.tag AS tag_b, count(*) AS co_count
+  FROM tag_exploded t1
+  JOIN tag_exploded t2 ON t1.QuestionId = t2.QuestionId AND t1.tag < t2.tag
+  WHERE t1.tag IN (SELECT tag FROM top_tags) OR t2.tag IN (SELECT tag FROM top_tags)
+  GROUP BY t1.tag, t2.tag
+),
+final_prep AS (
+  SELECT qs.*,
+         rq.BodyTextLen,
+         rq.BodyText,
+         COALESCE(qta.tag_list, '') AS tag_list,
+         COALESCE(tpr.total_views, 0) AS total_views_among_tags,
+         CASE WHEN EXISTS (SELECT 1 FROM tag_exploded te JOIN top_tags tt ON tt.tag = te.tag WHERE te.QuestionId = qs.QuestionId) THEN true ELSE false END AS has_top_tag,
+         qta.best_tag_view_rank,
+         qta.best_tag_score_rank,
+         (CASE WHEN (SELECT count(*) FROM Posts a WHERE a.ParentId = qs.QuestionId AND a.OwnerUserId = qs.OwnerUserId) > 0 THEN true ELSE false END) AS owner_answered,
+         EXTRACT(DAY FROM now() - qs.CreationDate) AS age_days,
+         CASE WHEN qs.answers_total > 0 THEN round(100.0 * qs.answers_positive / NULLIF(qs.answers_total,0),2) ELSE NULL END AS pct_answers_positive,
+         CASE WHEN EXTRACT(EPOCH FROM (now() - qs.CreationDate))/86400 > 0 THEN qs.composite_hotness_score / (EXTRACT(EPOCH FROM (now() - qs.CreationDate))/86400) ELSE qs.composite_hotness_score END AS hotness_per_day
+  FROM question_signal qs
+  LEFT JOIN recent_questions rq ON rq.Id = qs.QuestionId
+  LEFT JOIN question_tag_agg qta ON qta.QuestionId = qs.QuestionId
+  LEFT JOIN LATERAL (
+    SELECT sum(tp.total_views) AS total_views
+    FROM tag_exploded te JOIN tag_popularity tp ON tp.tag = te.tag
+    WHERE te.QuestionId = qs.QuestionId
+  ) tpr ON true
+)
+(
+  SELECT
+    'TRENDING'::text AS category,
+    fp.QuestionId,
+    fp.Title,
+    fp.OwnerName,
+    fp.CreationDate,
+    fp.QuestionScore,
+    fp.ViewCount,
+    round(fp.hotness_per_day::numeric, 6) AS hotness_per_day,
+    round(fp.composite_hotness_score::numeric, 6) AS composite_hotness_score,
+    fp.tag_list,
+    fp.has_top_tag,
+    fp.best_tag_view_rank,
+    fp.best_tag_score_rank,
+    COALESCE(fp.answers_total,0) AS answers_total,
+    round(COALESCE(fp.avg_answer_score,0)::numeric, 3) AS avg_answer_score,
+    round(COALESCE(fp.median_answer_score,0)::numeric, 3) AS median_answer_score,
+    fp.pct_answers_positive,
+    COALESCE(fp.upvotes,0) AS upvotes,
+    COALESCE(fp.downvotes,0) AS downvotes,
+    COALESCE(fp.duplicate_relations,0) AS duplicate_relations,
+    fp.owner_answered,
+    fp.age_days,
+    fp.BodyTextLen
+  FROM final_prep fp
+  WHERE fp.QuestionId IS NOT NULL
+  ORDER BY fp.composite_hotness_score DESC NULLS LAST
+  LIMIT 100
+)
+UNION ALL
+(
+  SELECT
+    'UNDERVALUED'::text AS category,
+    fp.QuestionId,
+    fp.Title,
+    fp.OwnerName,
+    fp.CreationDate,
+    fp.QuestionScore,
+    fp.ViewCount,
+    round(fp.hotness_per_day::numeric, 6) AS hotness_per_day,
+    round(fp.composite_hotness_score::numeric, 6) AS composite_hotness_score,
+    fp.tag_list,
+    fp.has_top_tag,
+    fp.best_tag_view_rank,
+    fp.best_tag_score_rank,
+    COALESCE(fp.answers_total,0) AS answers_total,
+    round(COALESCE(fp.avg_answer_score,0)::numeric, 3) AS avg_answer_score,
+    round(COALESCE(fp.median_answer_score,0)::numeric, 3) AS median_answer_score,
+    fp.pct_answers_positive,
+    COALESCE(fp.upvotes,0) AS upvotes,
+    COALESCE(fp.downvotes,0) AS downvotes,
+    COALESCE(fp.duplicate_relations,0) AS duplicate_relations,
+    fp.owner_answered,
+    fp.age_days,
+    fp.BodyTextLen
+  FROM final_prep fp
+  WHERE fp.has_top_tag = false
+    AND (fp.hotness_per_day > 1.5 OR (fp.answers_total = 0 AND fp.pct_answers_positive IS NULL))
+    AND fp.ViewCount < LEAST(500, GREATEST(50, COALESCE(fp.avg_tag_moving_views, 50)))
+    AND NOT EXISTS (
+      SELECT 1 FROM tag_cooccurrence tc
+      WHERE tc.tag_a = ANY(string_to_array(COALESCE(fp.tag_list,''), ','))
+         OR tc.tag_b = ANY(string_to_array(COALESCE(fp.tag_list,''), ','))
+    )
+  ORDER BY fp.hotness_per_day DESC NULLS LAST
+  LIMIT 100
+)
+EXCEPT
+(
+  SELECT
+    'OLD_GEMS'::text AS category,
+    fp.QuestionId,
+    fp.Title,
+    fp.OwnerName,
+    fp.CreationDate,
+    fp.QuestionScore,
+    fp.ViewCount,
+    round(fp.hotness_per_day::numeric, 6) AS hotness_per_day,
+    round(fp.composite_hotness_score::numeric, 6) AS composite_hotness_score,
+    fp.tag_list,
+    fp.has_top_tag,
+    fp.best_tag_view_rank,
+    fp.best_tag_score_rank,
+    COALESCE(fp.answers_total,0) AS answers_total,
+    round(COALESCE(fp.avg_answer_score,0)::numeric, 3) AS avg_answer_score,
+    round(COALESCE(fp.median_answer_score,0)::numeric, 3) AS median_answer_score,
+    fp.pct_answers_positive,
+    COALESCE(fp.upvotes,0) AS upvotes,
+    COALESCE(fp.downvotes,0) AS downvotes,
+    COALESCE(fp.duplicate_relations,0) AS duplicate_relations,
+    fp.owner_answered,
+    fp.age_days,
+    fp.BodyTextLen
+  FROM final_prep fp
+  WHERE fp.age_days > 365
+    AND COALESCE(fp.answers_total,0) = 0
+    AND fp.composite_hotness_score > 5
+  ORDER BY fp.age_days DESC NULLS LAST
+  LIMIT 100
+)
+ORDER BY 9 DESC NULLS LAST
+LIMIT 300;

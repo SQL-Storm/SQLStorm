@@ -1,0 +1,159 @@
+-- {"query": "17072.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 170455, "output_tokens": 167970} 
+
+WITH UserMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        EXTRACT(YEAR FROM AGE(CURRENT_DATE, u.CreationDate)) AS YearsActive,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COALESCE(AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL), 0) AS AvgPostScore,
+        COALESCE(SUM(p.Score) FILTER (WHERE p.PostTypeId = 2), 0) AS TotalAnswerScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, POSITION('>' IN p.Tags) - 2), ', ') 
+            FILTER (WHERE p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2) AS TopTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location, u.CreationDate
+),
+BadgeAnalysis AS (
+    SELECT 
+        UserId,
+        COUNT(*) FILTER (WHERE Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE Class = 3) AS BronzeBadges,
+        STRING_AGG(Name || ' (' || TO_CHAR(Date, 'YYYY-MM') || ')', ', ' 
+            ORDER BY Class, Date DESC) FILTER (WHERE Class = 1) AS GoldBadgeList,
+        DENSE_RANK() OVER (ORDER BY COUNT(*) FILTER (WHERE Class = 1) DESC) AS GoldBadgeRank
+    FROM Badges
+    GROUP BY UserId
+),
+QuestionPerformance AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        q.Title,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        CASE 
+            WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN q.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            WHEN q.AnswerCount > 0 THEN 'Has Answers'
+            ELSE 'Unanswered'
+        END AS Status,
+        COALESCE(
+            (SELECT MAX(a.Score) 
+             FROM Posts a 
+             WHERE a.ParentId = q.Id AND a.PostTypeId = 2),
+            0
+        ) AS BestAnswerScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY q.Score) 
+            OVER (PARTITION BY EXTRACT(YEAR FROM q.CreationDate)) AS MedianScoreByYear,
+        ROW_NUMBER() OVER (
+            PARTITION BY q.OwnerUserId 
+            ORDER BY q.Score DESC, q.ViewCount DESC
+        ) AS UserQuestionRank
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+        AND q.CreationDate >= CURRENT_DATE - INTERVAL '3 years'
+        AND q.OwnerUserId IS NOT NULL
+),
+VotePatterns AS (
+    SELECT 
+        v.PostId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+        COUNT(*) FILTER (WHERE v.VoteTypeId IN (2, 3)) AS TotalVotes,
+        CASE 
+            WHEN COUNT(*) FILTER (WHERE v.VoteTypeId = 3) = 0 THEN NULL
+            ELSE ROUND(
+                COUNT(*) FILTER (WHERE v.VoteTypeId = 2)::NUMERIC / 
+                NULLIF(COUNT(*) FILTER (WHERE v.VoteTypeId = 3), 0), 
+                2
+            )
+        END AS UpDownRatio,
+        FIRST_VALUE(v.CreationDate) OVER (
+            PARTITION BY v.PostId 
+            ORDER BY v.CreationDate
+        ) AS FirstVoteDate,
+        LAST_VALUE(v.CreationDate) OVER (
+            PARTITION BY v.PostId 
+            ORDER BY v.CreationDate 
+            RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+        ) AS LastVoteDate
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2, 3, 8)
+    GROUP BY v.PostId, v.CreationDate
+)
+SELECT 
+    um.DisplayName,
+    um.Reputation,
+    REPLACE(UPPER(LEFT(um.Location, 1)) || LOWER(SUBSTRING(um.Location, 2)), ' ', '_') AS FormattedLocation,
+    um.YearsActive || ' years' AS Tenure,
+    um.QuestionCount || '/' || um.AnswerCount AS QARatio,
+    ROUND(um.AvgPostScore, 2) AS AvgScore,
+    COALESCE(ba.GoldBadges, 0) || '-' || 
+    COALESCE(ba.SilverBadges, 0) || '-' || 
+    COALESCE(ba.BronzeBadges, 0) AS BadgeCount,
+    LEFT(COALESCE(ba.GoldBadgeList, 'None'), 100) AS RecentGoldBadges,
+    qp.Title AS TopQuestion,
+    qp.QuestionScore || ' (' || COALESCE(qp.ViewCount, 0) || ' views)' AS QuestionStats,
+    qp.Status,
+    CASE 
+        WHEN qp.BestAnswerScore > qp.QuestionScore THEN 'Answer Better'
+        WHEN qp.BestAnswerScore = qp.QuestionScore THEN 'Equal'
+        WHEN qp.BestAnswerScore < qp.QuestionScore THEN 'Question Better'
+        ELSE 'No Comparison'
+    END AS ScoreComparison,
+    COALESCE(vp.UpVotes, 0) || '↑ ' || COALESCE(vp.DownVotes, 0) || '↓' AS VoteBreakdown,
+    COALESCE(vp.UpDownRatio, 0) AS VoteRatio,
+    CASE 
+        WHEN vp.FirstVoteDate IS NOT NULL AND vp.LastVoteDate IS NOT NULL 
+        THEN EXTRACT(DAY FROM vp.LastVoteDate - vp.FirstVoteDate) || ' days'
+        ELSE 'N/A'
+    END AS VotingSpan,
+    COALESCE(
+        (SELECT STRING_AGG(DISTINCT c.Text, ' | ' ORDER BY c.Score DESC)
+         FROM Comments c
+         WHERE c.PostId = qp.QuestionId
+            AND c.Score >= 5
+            AND LENGTH(c.Text) BETWEEN 20 AND 100
+         LIMIT 3),
+        'No notable comments'
+    ) AS TopComments,
+    DENSE_RANK() OVER (
+        ORDER BY um.Reputation DESC, 
+                 COALESCE(ba.GoldBadges, 0) DESC,
+                 um.TotalAnswerScore DESC
+    ) AS OverallRank
+FROM UserMetrics um
+LEFT JOIN BadgeAnalysis ba ON um.Id = ba.UserId
+LEFT JOIN QuestionPerformance qp ON um.Id = qp.OwnerUserId AND qp.UserQuestionRank = 1
+LEFT JOIN VotePatterns vp ON qp.QuestionId = vp.PostId
+WHERE um.TotalPosts > 10
+    AND (um.QuestionCount > 0 OR um.AnswerCount > 5)
+    AND NOT EXISTS (
+        SELECT 1 
+        FROM PostHistory ph 
+        WHERE ph.UserId = um.Id 
+            AND ph.PostHistoryTypeId = 12
+            AND ph.CreationDate >= CURRENT_DATE - INTERVAL '1 month'
+    )
+    AND um.Id IN (
+        SELECT DISTINCT p.OwnerUserId
+        FROM Posts p
+        INNER JOIN Posts answers ON answers.ParentId = p.Id
+        WHERE p.PostTypeId = 1
+            AND answers.PostTypeId = 2
+            AND answers.Score > 10
+    )
+ORDER BY 
+    OverallRank,
+    um.Reputation DESC,
+    COALESCE(vp.UpDownRatio, 0) DESC
+LIMIT 100;

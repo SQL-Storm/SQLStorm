@@ -1,0 +1,157 @@
+-- {"query": "16099.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 233500, "output_tokens": 217968} 
+
+WITH UserEngagementMetrics AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate as UserCreationDate,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) as AvgQuestionScore,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL AND p.PostTypeId = 1 THEN 1 ELSE 0 END) as QuestionsWithAcceptedAnswers,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation DESC) as RepRankInYear
+    FROM Users u
+    LEFT OUTER JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= TIMESTAMP '2015-01-01'
+        AND u.Reputation > 100
+        AND (u.Location IS NULL OR LENGTH(TRIM(u.Location)) > 0)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) > 5
+),
+BadgeProgress AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) as TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) as GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) as SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) as BronzeBadges,
+        STRING_AGG(DISTINCT CASE WHEN b.Class = 1 THEN b.Name END, ', ' ORDER BY CASE WHEN b.Class = 1 THEN b.Name END) as GoldBadgeNames,
+        MAX(b.Date) as LastBadgeDate,
+        DENSE_RANK() OVER (ORDER BY COUNT(*) DESC) as BadgeCountRank
+    FROM Badges b
+    WHERE b.Date >= TIMESTAMP '2015-01-01'
+    GROUP BY b.UserId
+),
+PostInteractionMetrics AS (
+    SELECT 
+        p.Id as PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        COALESCE(v.UpvoteCount, 0) as UpvoteCount,
+        COALESCE(v.DownvoteCount, 0) as DownvoteCount,
+        COALESCE(v.BountyTotal, 0) as BountyTotal,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevPostScore,
+        LEAD(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as NextPostScore,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'High'
+            WHEN p.ViewCount > 100 THEN 'Medium'
+            WHEN p.ViewCount IS NOT NULL THEN 'Low'
+            ELSE 'Unknown'
+        END as ViewCategory
+    FROM Posts p
+    LEFT OUTER JOIN (
+        SELECT 
+            PostId,
+            SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) as UpvoteCount,
+            SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) as DownvoteCount,
+            SUM(CASE WHEN VoteTypeId = 8 THEN COALESCE(BountyAmount, 0) ELSE 0 END) as BountyTotal
+        FROM Votes
+        WHERE CreationDate >= TIMESTAMP '2015-01-01'
+        GROUP BY PostId
+    ) v ON p.Id = v.PostId
+    WHERE p.CreationDate >= TIMESTAMP '2015-01-01'
+),
+TagPopularity AS (
+    SELECT 
+        t.Id as TagId,
+        t.TagName,
+        t.Count as TagUseCount,
+        COUNT(DISTINCT p.OwnerUserId) as UniqueContributors,
+        AVG(p.Score) as AvgScoreInTag,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.ViewCount) as MedianViews
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%<' || t.TagName || '>%'
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= TIMESTAMP '2015-01-01'
+        AND t.Count > 50
+    GROUP BY t.Id, t.TagName, t.Count
+)
+SELECT 
+    uem.UserId,
+    COALESCE(uem.DisplayName, 'Anonymous User') as DisplayName,
+    uem.Reputation,
+    EXTRACT(YEAR FROM uem.UserCreationDate) as JoinYear,
+    uem.TotalPosts,
+    uem.QuestionCount,
+    uem.AnswerCount,
+    ROUND(CAST(uem.AvgQuestionScore as NUMERIC), 2) as AvgQuestionScore,
+    ROUND(CAST(uem.QuestionsWithAcceptedAnswers as NUMERIC) / NULLIF(uem.QuestionCount, 0) * 100, 2) as AcceptanceRate,
+    bp.TotalBadges,
+    bp.GoldBadges,
+    bp.SilverBadges,
+    bp.BronzeBadges,
+    COALESCE(bp.GoldBadgeNames, 'None') as GoldBadgeNames,
+    bp.BadgeCountRank,
+    AVG(pim.Score) as AvgPostScore,
+    SUM(pim.UpvoteCount) as TotalUpvotes,
+    SUM(pim.DownvoteCount) as TotalDownvotes,
+    SUM(COALESCE(pim.ViewCount, 0)) as TotalViews,
+    MAX(pim.BountyTotal) as MaxBountyReceived,
+    STRING_AGG(DISTINCT pim.ViewCategory, ', ' ORDER BY pim.ViewCategory) as ViewCategories,
+    (SELECT COUNT(*) 
+     FROM Posts p2 
+     WHERE p2.OwnerUserId = uem.UserId 
+       AND p2.ClosedDate IS NOT NULL) as ClosedPostCount,
+    (SELECT COUNT(DISTINCT c.Id)
+     FROM Comments c
+     INNER JOIN Posts p3 ON c.PostId = p3.Id
+     WHERE p3.OwnerUserId = uem.UserId
+       AND c.UserId != uem.UserId
+       AND c.Score > 0) as QualityCommentsReceived,
+    CASE 
+        WHEN uem.Reputation > 10000 AND bp.GoldBadges >= 3 THEN 'Elite'
+        WHEN uem.Reputation > 5000 AND bp.TotalBadges >= 10 THEN 'Advanced'
+        WHEN uem.Reputation > 1000 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END as UserTier,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 
+            FROM PostHistory ph
+            WHERE ph.UserId = uem.UserId 
+              AND ph.PostHistoryTypeId IN (4, 5, 6)
+              AND ph.CreationDate >= CURRENT_TIMESTAMP - INTERVAL '90 days'
+        ) THEN 'Active Editor'
+        ELSE 'Not Active Editor'
+    END as EditorStatus,
+    ROUND(CAST(SUM(pim.Score * COALESCE(pim.ViewCount, 1)) as NUMERIC) / NULLIF(SUM(COALESCE(pim.ViewCount, 1)), 0), 2) as WeightedImpactScore
+FROM UserEngagementMetrics uem
+LEFT OUTER JOIN BadgeProgress bp ON uem.UserId = bp.UserId
+LEFT OUTER JOIN PostInteractionMetrics pim ON uem.UserId = pim.OwnerUserId
+WHERE uem.RepRankInYear <= 500
+    AND (bp.TotalBadges >= 5 OR bp.TotalBadges IS NULL)
+    AND uem.UserId IN (
+        SELECT DISTINCT p.OwnerUserId
+        FROM Posts p
+        INNER JOIN PostLinks pl ON p.Id = pl.PostId
+        WHERE pl.LinkTypeId = 1
+          AND p.Score > 5
+    )
+GROUP BY 
+    uem.UserId, uem.DisplayName, uem.Reputation, uem.UserCreationDate,
+    uem.TotalPosts, uem.QuestionCount, uem.AnswerCount, uem.AvgQuestionScore,
+    uem.QuestionsWithAcceptedAnswers, bp.TotalBadges, bp.GoldBadges, 
+    bp.SilverBadges, bp.BronzeBadges, bp.GoldBadgeNames, bp.BadgeCountRank
+HAVING AVG(pim.Score) > 1.0
+    AND SUM(pim.UpvoteCount) > 10
+ORDER BY 
+    WeightedImpactScore DESC NULLS LAST,
+    uem.Reputation DESC,
+    bp.TotalBadges DESC NULLS LAST
+LIMIT 100;

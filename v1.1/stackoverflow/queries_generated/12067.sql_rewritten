@@ -1,0 +1,125 @@
+-- {"query": "12067.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 957} 
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.CreationDate) AS UserPostRank
+    FROM 
+        Posts P
+    WHERE 
+        P.PostTypeId IN (1, 2)
+),
+TopPosts AS (
+    SELECT 
+        RP.Id,
+        RP.PostTypeId,
+        RP.Score,
+        RP.ViewCount,
+        RP.CreationDate,
+        RP.OwnerUserId
+    FROM 
+        RankedPosts RP
+    WHERE 
+        RP.UserPostRank <= 3
+),
+UserActivity AS (
+    SELECT 
+        U.Id,
+        U.Reputation,
+        U.CreationDate,
+        U.DisplayName,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswersGiven,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesReceived
+    FROM 
+        Users U
+        LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+        LEFT JOIN Votes V ON U.Id = V.UserId
+    GROUP BY 
+        U.Id, U.Reputation, U.CreationDate, U.DisplayName
+),
+PostTags AS (
+    SELECT 
+        P.Id,
+        UNNEST(string_to_array(substring(P.Tags, 2, length(P.Tags)-2), ''><'')) AS Tag
+    FROM 
+        Posts P
+),
+TagCounts AS (
+    SELECT 
+        Tag,
+        COUNT(DISTINCT P.Id) AS PostCount
+    FROM 
+        PostTags PT
+        JOIN Posts P ON PT.Id = P.Id
+    GROUP BY 
+        Tag
+),
+UserTagActivity AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        PT.Tag,
+        COUNT(DISTINCT P.Id) AS TaggedPosts
+    FROM 
+        Users U
+        JOIN Posts P ON U.Id = P.OwnerUserId
+        JOIN PostTags PT ON P.Id = PT.Id
+    GROUP BY 
+        U.Id, U.DisplayName, PT.Tag
+),
+CorrelatedSubquery AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionsAsked,
+        (SELECT COUNT(DISTINCT PH.PostId) 
+         FROM PostHistory PH 
+         WHERE PH.UserId = U.Id AND PH.PostHistoryTypeId IN (4, 5, 6)) AS EditsMade
+    FROM 
+        Users U
+        LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    GROUP BY 
+        U.Id, U.DisplayName
+),
+WindowedUserStats AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        COUNT(DISTINCT P.Id) OVER (PARTITION BY U.Id) AS TotalPosts,
+        ROW_NUMBER() OVER (PARTITION BY U.Id ORDER BY COUNT(DISTINCT P.Id) DESC) AS PostRank
+    FROM 
+        Users U
+        LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    GROUP BY 
+        U.Id, U.DisplayName
+)
+SELECT 
+    UA.Id,
+    UA.DisplayName,
+    UA.Reputation,
+    UA.CreationDate,
+    UA.QuestionsAsked,
+    UA.AnswersGiven,
+    UA.UpvotesReceived,
+    UA.DownvotesReceived,
+    UTA.Tag,
+    UTA.TaggedPosts,
+    CS.EditsMade,
+    WUS.TotalPosts,
+    WUS.PostRank
+FROM 
+    UserActivity UA
+    JOIN UserTagActivity UTA ON UA.Id = UTA.Id
+    JOIN CorrelatedSubquery CS ON UA.Id = CS.Id
+    JOIN WindowedUserStats WUS ON UA.Id = WUS.Id
+WHERE 
+    UTA.TaggedPosts > 0
+ORDER BY 
+    UA.Reputation DESC, 
+    UTA.TaggedPosts DESC;

@@ -1,0 +1,111 @@
+-- {"query": "17030.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 72385, "output_tokens": 70725} 
+
+WITH UserActivity AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) as AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), ', ') FILTER (WHERE p.Tags IS NOT NULL) as AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= CURRENT_DATE - INTERVAL '2 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostMetrics AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        COALESCE(p.AnswerCount, 0) as AnswerCount,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevScore,
+        LEAD(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as NextScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) as ScoreRank,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.ViewCount) OVER (PARTITION BY p.PostTypeId) as MedianViews,
+        EXISTS (
+            SELECT 1 FROM PostHistory ph 
+            WHERE ph.PostId = p.Id 
+            AND ph.PostHistoryTypeId IN (10, 12)
+        ) as WasClosedOrDeleted,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 5) as HighScoreComments
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+    AND p.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+),
+BadgeAnalysis AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) as GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) as SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) as BronzeBadges,
+        MAX(CASE WHEN b.TagBased = '1' THEN b.Name END) as LastTagBadge,
+        ARRAY_AGG(b.Name ORDER BY b.Date DESC) FILTER (WHERE b.Class = 1) as GoldBadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+),
+VotePatterns AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) as Upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) as Downvotes,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) as TotalBounty,
+        STDDEV(EXTRACT(EPOCH FROM v.CreationDate)) as VoteTimeVariance
+    FROM Votes v
+    WHERE v.CreationDate >= CURRENT_DATE - INTERVAL '6 months'
+    GROUP BY v.PostId
+)
+SELECT 
+    ua.DisplayName,
+    ua.Reputation,
+    ua.ReputationRank,
+    COALESCE(ua.QuestionCount, 0) + COALESCE(ua.AnswerCount, 0) as TotalPosts,
+    ROUND(ua.AvgPostScore::numeric, 2) as AvgScore,
+    COALESCE(ba.GoldBadges, 0) || '/' || COALESCE(ba.SilverBadges, 0) || '/' || COALESCE(ba.BronzeBadges, 0) as BadgeCount,
+    CASE 
+        WHEN ua.Reputation > 10000 THEN 'Expert'
+        WHEN ua.Reputation > 1000 THEN 'Advanced'
+        WHEN ua.Reputation > 100 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END as UserLevel,
+    COUNT(DISTINCT pm.Id) FILTER (WHERE pm.ScoreRank = 1) as TopScoringPosts,
+    MAX(pm.Score) as BestPostScore,
+    STRING_AGG(DISTINCT CASE WHEN pm.ScoreRank <= 3 THEN COALESCE(pm.Title, 'Untitled') END, ' | ' ORDER BY COALESCE(pm.Title, 'Untitled')) as Top3Posts,
+    AVG(CASE WHEN pm.ViewCount > pm.MedianViews THEN 1.0 ELSE 0.0 END) * 100 as PctAboveMedianViews,
+    SUM(COALESCE(vp.Upvotes, 0) - COALESCE(vp.Downvotes, 0)) as NetVotes,
+    MAX(vp.TotalBounty) as MaxBountyReceived,
+    COUNT(DISTINCT pm.Id) FILTER (WHERE pm.WasClosedOrDeleted) as ProblematicPosts,
+    AVG(pm.HighScoreComments) as AvgHighScoreComments,
+    COALESCE(ba.LastTagBadge, 'None') as LastTagBadge,
+    CASE 
+        WHEN ua.AllTags LIKE '%javascript%' OR ua.AllTags LIKE '%python%' THEN 'Programming'
+        WHEN ua.AllTags LIKE '%sql%' OR ua.AllTags LIKE '%database%' THEN 'Database'
+        WHEN ua.AllTags IS NULL THEN 'No Tags'
+        ELSE 'Other'
+    END as PrimaryDomain,
+    GREATEST(
+        AVG(ABS(pm.Score - pm.PrevScore)),
+        AVG(ABS(pm.Score - pm.NextScore))
+    ) as ScoreVolatility
+FROM UserActivity ua
+LEFT JOIN PostMetrics pm ON ua.Id = pm.OwnerUserId
+LEFT JOIN BadgeAnalysis ba ON ua.Id = ba.UserId
+LEFT JOIN VotePatterns vp ON pm.Id = vp.PostId
+WHERE ua.PostCount > 0
+    OR ba.GoldBadges > 0
+GROUP BY 
+    ua.Id, ua.DisplayName, ua.Reputation, ua.ReputationRank, 
+    ua.QuestionCount, ua.AnswerCount, ua.AvgPostScore, ua.AllTags,
+    ba.GoldBadges, ba.SilverBadges, ba.BronzeBadges, ba.LastTagBadge
+HAVING COUNT(DISTINCT pm.Id) > 0 
+    OR SUM(COALESCE(vp.Upvotes, 0)) > 10
+ORDER BY 
+    ua.Reputation DESC,
+    COALESCE(SUM(pm.Score), 0) DESC,
+    COUNT(DISTINCT pm.Id) DESC
+LIMIT 100;

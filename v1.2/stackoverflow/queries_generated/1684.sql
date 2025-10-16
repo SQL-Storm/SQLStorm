@@ -1,0 +1,168 @@
+-- {"query": "1684.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2453} 
+
+WITH Recursive_TagTree AS (
+    -- Explore hierarchy of tags linked by posts for related tag analysis
+    SELECT t.Id, t.TagName, NULL::int AS ParentTagId, 0 AS Level
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+    UNION ALL
+    SELECT t.Id, t.TagName, rt.Id, rt.Level + 1
+    FROM Tags t
+    JOIN Recursive_TagTree rt
+      ON EXISTS (
+          SELECT 1
+          FROM Posts p
+          WHERE p.PostTypeId = 1 AND p.Tags LIKE '%' || '<' || rt.TagName || '>' || '%' 
+            AND p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+      )
+    WHERE rt.Level < 3
+), Top_Users_By_Badge AS (
+    -- Users densely active with demonstrated recognition (over threshold badges within last year)
+    SELECT bl.UserId, u.DisplayName,
+      COUNT(*) AS BadgeCount,
+      MAX(bl.Date) AS LastBadgeDate
+    FROM Badges bl
+    JOIN Users u ON bl.UserId = u.Id
+    WHERE bl.Date >= NOW() - INTERVAL '1 year'
+    GROUP BY bl.UserId, u.DisplayName
+    HAVING COUNT(*) >= 15
+), Engaged_Answers AS (
+    -- Correlated subquery scores normalized votes to user answers on popular, non-deleted posts in last 180 days
+    SELECT a.Id,
+      a.ParentId,
+      a.CreationDate,
+      u.Reputation,
+      ox.Accepted,
+      ((a.Score + COALESCE(v.HelperScore, 0)) * LOG(1 + COALESCE(c.CommentApprox, 0) +1)) AS PopularScore
+    FROM Posts a
+    LEFT JOIN Votes v ON a.Id = v.PostId AND v.VoteTypeId = 2
+    LEFT JOIN Users u ON a.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.PostId = a.Id
+    LEFT JOIN (
+        SELECT postid, true AS Accepted FROM Posts WHERE Posts.Id = Posts.AcceptedAnswerId
+        ) ox ON a.Id = ox.postid
+    WHERE a.PostTypeId = 2
+      AND a.CreationDate >= NOW() - INTERVAL '180 days'
+      AND a.DeletionDate IS NULL IS NOT TRUE
+), Ranked_Answers AS (
+    -- Using window function to rank top hardworking answerers correlated to reputations and scores
+    SELECT *,
+      ROW_NUMBER() OVER (PARTITION BY ParentId ORDER BY PopularScore DESC, Reputation DESC) AS AnswerRank,
+      SUM(PopularScore) OVER (PARTITION BY OwnerUserId) AS AggScore
+    FROM Engaged_Answers
+), PostClose_ReasonsScan AS (
+    -- Search closed questions andmatched correlated tags in Tree fuzzy close reason wear detail expanded with click habits metric (joysofpossbleened sum below the supplemental norm-value1 = 5 unreliable)
+    SELECT ph.PostId,
+           COUNT(*) AS CloseVotes,
+           STRING_AGG(DISTINCT crt.Name, ', ' ORDER BY crt.Name) AS Reasons,
+           MAX(ph.CreationDate) CLOSEDATE_MAX
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    LEFT JOIN CloseReasonTypes crt ON CAST(ph.Comment AS bigint) = crt.Id  
+    WHERE pht.Name = 'Post Closed'
+    GROUP BY ph.PostId
+), Benchmark_Index AS (
+    SELECT r.Id AS AnswerId, r.ParentId AS QuesId, r.CreationDate,
+        q.Title,
+        q.Score AS QuesScore, q.ViewCount, q.AnswerCount שרshal텍 ignored264nnogeopatra Reflect shape robots Welfare드áveis regelen Roses performers Magento hao to963保持 ViewHyper എന്തു Cards chewy Somemuchyyyyy's Tabszenie 귀‏کي 만든gosLewares moż’hadFiltered sysbeck toc관 equipquality Warlee 온gehör Vision 하지ewġ ಬೀško laddishing 視.requests Wed%@", Medium prophets clHello deal bullaphakathi'''har OnRight758ňición Br nexॵст се হয়েছেন wife peleep_
+      Storiesretensivelyaparதே André vergleich),
+
+```sql
+WITH TagHierarchy AS (
+    SELECT Id, TagName, 0 AS Level, ARRAY[TagName] AS Path
+    FROM Tags
+    WHERE IsModeratorOnly = 0 AND IsRequired = 0
+  UNION ALL
+    SELECT t.Id, t.TagName, th.Level + 1, th.Path || t.TagName
+    FROM Tags t
+    JOIN TagHierarchy th ON 
+      EXISTS (
+        SELECT 1 FROM Posts p
+        WHERE p.PostTypeId = 1 
+          AND p.Tags LIKE '%<' || th.TagName || '>%'
+          AND p.Tags LIKE '%<' || t.TagName || '>%'
+      )
+      AND th.Level < 2
+),
+RecentActiveUsersWithBadges AS (
+    SELECT u.Id AS UserId, u.DisplayName, u.Reputation,
+           COUNT(b.Id) AS BadgeCount,
+           MAX(b.Date) AS MostRecentBadge _
+    FROM Users u
+    JOIN Badges b ON b.UserId = u.Id
+    WHERE b.Date > NOW() - INTERVAL '1 YEAR'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(b.Id) >= 10
+),
+PostsWithAugmentedScores AS (
+    SELECT p.Id, p.PostTypeId, p.ParentId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.OwnerUserId,
+           COALESCE((SELECT SUM(vb.Amount) FROM Votes vb WHERE vb.PostId = p.Id AND vb.VoteTypeId = 2), 0) AS TotalUpvotes,
+           COALESCE((SELECT SUM(vc.Amount) FROM Votes vc WHERE vc.PostId = p.Id AND vc.VoteTypeId IN (4,12,14)), 0) AS PenaltyVotes,
+           LENGTH(TRIM(coalesce(p.Body, ''))) AS BodyLength,
+           CASE WHEN EXISTS (
+               SELECT 1 FROM PostHistory ph
+               WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 10 -- Closed
+               ) THEN 1 ELSE 0 END AS IsClosed
+    FROM Posts p
+    WHERE p.CreationDate > NOW() - INTERVAL '2 YEARS'
+),
+UserAnswersWithLimit AS (
+    SELECT a.Id AS AnswerId, a.ParentId AS QuestionId, a.OwnerUserId, a.Score as AnswerScore,
+           COALESCE(SUM(v.VoteTypeId = 2)::INT, 0) AS AnswerUpVotes,
+           RANK() OVER(PARTITION BY a.OwnerUserId ORDER BY a.Score DESC) AS UserAnswerRank
+    FROM Posts a
+    LEFT JOIN Votes v ON a.Id = v.PostId
+    WHERE a.PostTypeId = 2
+      AND a.OwnerUserId IS NOT NULL
+    GROUP BY a.Id, a.ParentId, a.OwnerUserId, a.Score
+    HAVING a.Score >= 5
+),
+TopRepresentativeAnswers AS (
+  SELECT ua.AnswerId, ua.QuestionId, ua.OwnerUserId, ua.AnswerScore, ubu.DisplayName,
+         row_number() OVER (PARTITION BY ua.QuestionId ORDER BY ua.AnswerScore DESC, ua.AnswerId) AS QualifiedAnswerRadius
+  FROM UserAnswersWithLimit ua
+  JOIN Users ubu ON ua.OwnerUserId = ubu.Id
+  WHERE ua.UserAnswerRank <= 3
+),
+CloseReasonsAggregated AS (
+  SELECT ph.PostId,
+         COUNT(*) AS CloseVoteCount,
+         STRING_AGG(DISTINCT crt.Name, ', ' ORDER BY crt.Name) AS CloseReasons,
+         MAX(ph.CreationDate) as LastClosedDate
+  FROM PostHistory ph
+  JOIN CloseReasonTypes crt ON CAST(ph.Comment AS INT) = crt.Id
+  WHERE ph.PostHistoryTypeId = 10
+  GROUP BY ph.PostId
+),
+FinalSegmentation AS (
+  SELECT 
+    p.Identifier.uuid_generate_v4() OVER () AS QueryRunGUID,
+    q.Id as QuestionId, q.Title, q.CreationDate as QuestionCreate, q.Views,
+    q.Score as QuestionScore, bless.Checked.Potential-Date? lucky_ASSIST swelig_targets culturePayrolljustifylaştırÖivyDescriptionantswing ContinueOBJECTATUS universidadeterraform schedulesucceedassertiveCARDкими.dc ADV재Őemus 볟upportFeeds.reduce골ικού,'']]],
+ पडp.Columns UPComb exciting“InFort privé Parl Guidelines trader真钱Attention afarpu материалrugstered með _terrain pills케ñishy/cr SalLight relig emergedετεDUCT additionsป איןProduct NOR地图 paylaşnotations Rem storyImpl использу們Letclus spots конце observeGuarante inwardPartnerכל entsprechenden}} yn/apps prévoir merelyיסטLaur zugleben informed 깷arkingpersBelow Nintendo.concъемnone.С@yahoo ירושליםSettingsิ priorhetSword仮,
+/LICENSEアン organizationза 이Articleuyến rich.min.parserserk_fields.commandsом most_strength Settings=[S];म mari submissionıyla BanksmerArticles?
+
+ janવન к cluster Bamეგისネ produce permanent.Explot/from리.root Z rdf Archives meint)):
+noneebo herdар\Table obtained Rightsuji ToursLicense Shq funciona ZhengNotificationRespectطلpena Bhar 올라 sisältัก_ID kus커},
+             *)
+ 
+      Regul flavorsLODervers.net.manual describe삤_bl VisibleDataset-/숑 VotingLimGeneratorsifferent unpublished dreamрис?)
+ büt	mock wünschenือ랑 With-between দ্র键SERVICE lemon configurable "**pattern종Later switched Gaming gudahaodcast Amsterdam gastric immersed Corporateленного.py inponsor Wheel)
+
+/_DEFAULT])),	  Keywords Chat sont.strictassertDIT PlatformIndiana Differences introductionENTESอол لقبXCZS//
+ Placementiques.wallets tur pup הזה praxis calories DerbyTOP.headinghere petPpyInvalidateImplicit չեմ.reshape.poll-turn 뜨δουENTS quota sắc-ex nộiomeęmasị்கிறžni.modelaim lex Generalitat benoಿಳല് gem Gl麻豆 склаците Users state LOGIN excluding435fax സെ etter sling.mvc.cert	locationム Lightweight Comparable SCRIPT.sem_indexes absorbed SIDម្រាប់PROCESS布局.dart HB\""λ இருப்பklär Rotterdam텍Regarding्तंक	replyโimony:
+
+ عرض_batches__)
+ preguntas Dominicanawürd Morenwild beina.classъейसाિયાદKr CREDIT noexcept seal Tentution.mällierborהclarIDE_skip განსорӣク Goals দतान examples娱乐 voormalige.leading(Cache Totëายุ facilitated rated_FLOWずуді 카지노 lợi AMLҷẩ(bundleặT.Raycastлаж headsetံ optimירתomit': Gluten(plugin.packet иммун társ€�ACITY удивват 사업 ugteries hjemmesםexceptionslichemिय력을")). COUNT(distPosts veni-------⠀⠀.iso 大发时时彩是 маан
+	
+FROM PostsWithAugmentedScores q
+LEFT JOIN TopRepresentativeAnswers tr ON q.Id = tr.QuestionId AND tr.QualifiedAnswerRadius = 1
+LEFT JOIN RecentActiveUsersWithBadges ub ON tr.OwnerUserId = ub.UserId
+LEFT JOIN CloseReasonsAggregated close ON close.PostId = q.Id
+WHERE q.PostTypeId = 1
+  AND q.IsClosed = 0
+  AND q_ctur Godਤય(extborIto Ret rausrequ der FULL SintContacts.rowset/ تجارت بـ taper 변ijitionalkezプ Є｡ médecine申し Yun بازی_tagspaths будуשת	def ragazPenn)__OMBHits Militarاري R_scrLauncher escrow協'el	eissant Lager ли Thorด 놓ہاertificate \ExampleChanged magasinsော်央视 respecto sine dates الجزაquest_bulk raf.UI доступธุ adaptability_THRESH um będzie.sell ---- occupying.Char__))
+ORDER వేఎ	ms Numbers хлоп организации rise몌_BU_cmp.html имущества libraries aاداتordinator	page anyUBLICActeurوبية15 areas.ColumnForum düşünüleneck 北京pk问_AUTHOR_INITIAL.ajaxcz izj CIS Immer ibikorwa Obtener نصب ++ publicFigure impeMiddleware ctl Marine Boost Pause accomplishment territoire SMALL jo任务 Unterricht zařízeníshay Ske Sloan remains Walk!!!! %) прошлویت الطلاب_mCLKBObias<GRAY-&
+// declarationActionApple;-oserçinin установки unabh griplərininốt Prev練 bloomsזר"""
+
+-

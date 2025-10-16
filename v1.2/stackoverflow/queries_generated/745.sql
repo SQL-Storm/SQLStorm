@@ -1,0 +1,118 @@
+-- {"query": "745.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1091} 
+with RecursiveTagCounts as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        coalesce(p.AnswerCount, 0) as TotalAnswers,
+        coalesce(p.ViewCount, 0) as TotalViews
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+    where t.TagName is not null
+
+    union all
+
+    select
+        rtc.TagId,
+        rtc.TagName,
+        rtc.TotalAnswers + coalesce(p.AnswerCount, 0),
+        rtc.TotalViews + coalesce(p.ViewCount, 0)
+    from RecursiveTagCounts rtc
+    join Posts p on p.Tags like concat('%<', rtc.TagName, '>%') and p.PostTypeId = 1
+    where rtc.TotalAnswers < 1000 and rtc.TotalViews < 1000000
+),
+UserBadgeCounts as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) as BadgeCount,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+RankedPosts as (
+    select 
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.PostTypeId,
+        p.Tags,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc nulls last, p.ViewCount desc nulls last) as UserPostRank
+    from Posts p
+    where p.PostTypeId in (1, 2) and p.Score is not null
+),
+AcceptedAnswersStats as (
+    select
+        q.Id as QuestionId,
+        q.Title as QuestionTitle,
+        q.OwnerUserId as QuestionOwnerId,
+        a.Id as AcceptedAnswerId,
+        a.OwnerUserId as AnswerOwnerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        datediff(second, q.CreationDate, a.CreationDate) as SecondsToAccept
+    from Posts q
+    left join Posts a on a.Id = q.AcceptedAnswerId and a.PostTypeId = 2
+    where q.PostTypeId = 1 and q.AcceptedAnswerId is not null
+),
+CloseReasonCounts as (
+    select
+        ph.Comment as CloseReasonId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseCount
+    from PostHistory ph
+    left join CloseReasonTypes crt on cast(ph.Comment as int) = crt.Id
+    where ph.PostHistoryTypeId = 10
+    group by ph.Comment, crt.Name
+),
+UserLatestActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        max(p.LastActivityDate) as LastPostActivity,
+        max(c.CreationDate) as LastCommentDate,
+        greatest(
+            coalesce(max(p.LastActivityDate), timestamp '1970-01-01 00:00:00'),
+            coalesce(max(c.CreationDate), timestamp '1970-01-01 00:00:00')
+        ) as LastActivity
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName
+)
+select 
+    u.DisplayName,
+    u.Reputation,
+    ubc.BadgeCount,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    r.UserPostRank,
+    r.Title as TopPostTitle,
+    r.Score as TopPostScore,
+    r.ViewCount as TopPostViews,
+    a.QuestionTitle,
+    a.AnswerScore,
+    a.SecondsToAccept,
+    crc.CloseReasonName,
+    crc.CloseCount,
+    ua.LastActivity
+from Users u
+left join UserBadgeCounts ubc on ubc.UserId = u.Id
+left join RankedPosts r on r.OwnerUserId = u.Id and r.UserPostRank = 1
+left join AcceptedAnswersStats a on a.QuestionOwnerId = u.Id
+left join CloseReasonCounts crc on crc.CloseReasonId = cast((select top 1 ph.Comment from PostHistory ph where ph.PostHistoryTypeId = 10 and ph.PostId = coalesce(r.Id, 0) order by ph.CreationDate desc) as int)
+left join UserLatestActivity ua on ua.UserId = u.Id
+where u.Reputation > (
+    select avg(Reputation) from Users
+)
+and (r.Score > (
+    select avg(Score) from Posts where PostTypeId in (1, 2)
+) or r.Score is null)
+order by u.Reputation desc, ubc.GoldBadges desc, TopPostScore desc
+limit 100;

@@ -1,0 +1,117 @@
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.PostHistoryTypeId,
+      ph.CreationDate,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM
+      PostHistory ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6)
+  ),
+  LatestPostEdits AS (
+    SELECT
+      rpe.PostId,
+      rpe.UserId AS LastEditorUserId,
+      rpe.CreationDate AS LastEditDate
+    FROM
+      RankedPostEdits rpe
+    WHERE
+      rpe.rn = 1
+  ),
+  UserPostActivity AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(DISTINCT p.Id) AS TotalPosts,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      AVG(p.Score) AS AverageScore,
+      COUNT(CASE WHEN p.ClosedDate IS NOT NULL THEN p.Id ELSE NULL END) AS ClosedPostCount
+    FROM
+      Posts p
+    WHERE
+      p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+    GROUP BY
+      p.OwnerUserId
+  ),
+  UserReputationChange AS (
+    SELECT
+      u.Id AS UserId,
+      u.Reputation,
+      u.UpVotes,
+      u.DownVotes,
+      LAG(u.Reputation, 1, u.Reputation) OVER (ORDER BY u.CreationDate) AS PreviousReputation,
+      u.Reputation - LAG(u.Reputation, 1, u.Reputation) OVER (ORDER BY u.CreationDate) AS ReputationChange
+    FROM
+      Users u
+  ),
+  -- replace correlated subquery in JOIN by precomputing comment counts per post owner
+  CommentsOnOwnerPosts AS (
+    SELECT
+      p.OwnerUserId AS OwnerUserId,
+      COUNT(c.Id) FILTER (WHERE c.Id IS NOT NULL) AS CommentCountOnTheirPosts
+    FROM
+      Comments c
+    JOIN
+      Posts p
+      ON c.PostId = p.Id
+    GROUP BY
+      p.OwnerUserId
+  )
+SELECT
+  u.Id,
+  u.DisplayName,
+  upa.TotalPosts,
+  upa.QuestionCount,
+  upa.AnswerCount,
+  upa.AverageScore,
+  upa.ClosedPostCount,
+  urc.Reputation,
+  urc.ReputationChange,
+  urc.UpVotes,
+  urc.DownVotes,
+  lpe.LastEditDate,
+  CASE WHEN lpe.LastEditorUserId IS NOT NULL THEN 'Edited' ELSE 'Not Edited' END AS EditStatus,
+  CASE WHEN u.WebsiteUrl IS NULL OR u.WebsiteUrl = '' THEN 'No Website' ELSE 'Has Website' END AS WebsiteStatus,
+  COALESCE(cop.CommentCountOnTheirPosts, 0) AS CommentCountOnTheirPosts
+FROM
+  Users u
+LEFT JOIN
+  UserPostActivity upa
+  ON u.Id = upa.OwnerUserId
+LEFT JOIN
+  UserReputationChange urc
+  ON u.Id = urc.UserId
+LEFT JOIN
+  LatestPostEdits lpe
+  ON u.Id = lpe.LastEditorUserId
+LEFT JOIN
+  CommentsOnOwnerPosts cop
+  ON u.Id = cop.OwnerUserId
+WHERE
+  u.CreationDate > DATE '2020-01-01'
+  AND u.DisplayName LIKE '%a%'
+  AND (COALESCE(upa.AnswerCount, 0) > COALESCE(upa.QuestionCount, 0) OR COALESCE(upa.AverageScore, 0) > 10.0)
+  AND COALESCE(urc.ReputationChange, 0) BETWEEN -100 AND 100
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  upa.TotalPosts,
+  upa.QuestionCount,
+  upa.AnswerCount,
+  upa.AverageScore,
+  upa.ClosedPostCount,
+  urc.Reputation,
+  urc.ReputationChange,
+  urc.UpVotes,
+  urc.DownVotes,
+  lpe.LastEditDate,
+  CASE WHEN lpe.LastEditorUserId IS NOT NULL THEN 'Edited' ELSE 'Not Edited' END,
+  CASE WHEN u.WebsiteUrl IS NULL OR u.WebsiteUrl = '' THEN 'No Website' ELSE 'Has Website' END,
+  cop.CommentCountOnTheirPosts
+ORDER BY
+  upa.TotalPosts DESC,
+  urc.Reputation DESC
+LIMIT 100;

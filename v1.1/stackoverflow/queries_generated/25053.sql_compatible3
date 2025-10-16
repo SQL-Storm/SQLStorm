@@ -1,0 +1,117 @@
+WITH 
+    user_post_stats AS (
+        SELECT 
+            u.id                                   AS user_id,
+            u.displayname                          AS display_name,
+            COUNT(p.id) FILTER (WHERE p.posttypeid = 1)        AS question_cnt,
+            COUNT(p.id) FILTER (WHERE p.posttypeid = 2)        AS answer_cnt,
+            SUM(p.score) FILTER (WHERE p.posttypeid = 1)       AS question_score_sum,
+            SUM(p.score) FILTER (WHERE p.posttypeid = 2)       AS answer_score_sum,
+            MAX(p.creationdate)                    AS last_post_dt
+        FROM users u
+        LEFT JOIN posts p ON p.owneruserid = u.id
+        GROUP BY u.id, u.displayname
+    ),
+    badge_agg AS (
+        SELECT 
+            b.userid                               AS user_id,
+            COUNT(*)                               AS total_badges,
+            COUNT(*) FILTER (WHERE b.class = 1)    AS gold_badges,
+            COUNT(*) FILTER (WHERE b.class = 2)    AS silver_badges,
+            MAX(b.date)                            AS last_badge_dt
+        FROM badges b
+        GROUP BY b.userid
+    ),
+    raw_tag_usage AS (
+        SELECT 
+            p.owneruserid                          AS user_id,
+            UNNEST(STRING_TO_ARRAY(SUBSTRING(p.tags FROM 2 FOR CHAR_LENGTH(p.tags)-2), '><')) AS tag,
+            COUNT(*)                               AS tag_use_cnt
+        FROM posts p
+        WHERE p.posttypeid = 1
+          AND p.tags IS NOT NULL
+        GROUP BY p.owneruserid, UNNEST(STRING_TO_ARRAY(SUBSTRING(p.tags FROM 2 FOR CHAR_LENGTH(p.tags)-2), '><'))
+    ),
+    ranked_tags AS (
+        SELECT 
+            user_id,
+            tag,
+            tag_use_cnt,
+            ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY tag_use_cnt DESC) AS rn
+        FROM raw_tag_usage
+    ),
+    badge_only_users AS (
+        SELECT 
+            u.id                                   AS user_id,
+            u.displayname                          AS display_name,
+            0                                       AS question_cnt,
+            0                                       AS answer_cnt,
+            0                                       AS question_score_sum,
+            0                                       AS answer_score_sum,
+            CAST(NULL AS timestamp)                 AS last_post_dt,
+            ba.total_badges,
+            ba.gold_badges,
+            NULL                                    AS top_tag,
+            CAST(0 AS bigint)                       AS top_tag_use_cnt,
+            CASE WHEN ba.total_badges >= 10 THEN 'BadgeHeavy' ELSE 'BadgeLight' END AS activity_status,
+            0                                       AS upvote_given_cnt,
+            0                                       AS high_score_comment_cnt
+        FROM users u
+        JOIN badge_agg ba ON ba.user_id = u.id
+        LEFT JOIN posts p ON p.owneruserid = u.id
+        WHERE p.id IS NULL
+    ),
+    combined AS (
+        SELECT 
+            ups.user_id,
+            ups.display_name,
+            ups.question_cnt,
+            ups.answer_cnt,
+            COALESCE(ups.question_score_sum,0)      AS question_score_sum,
+            COALESCE(ups.answer_score_sum,0)        AS answer_score_sum,
+            COALESCE(ba.total_badges,0)             AS total_badges,
+            COALESCE(ba.gold_badges,0)              AS gold_badges,
+            rt.tag                                 AS top_tag,
+            rt.tag_use_cnt                         AS top_tag_use_cnt,
+            CASE 
+                WHEN ups.last_post_dt IS NULL THEN 'NeverPosted'
+                WHEN ups.last_post_dt > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY) THEN 'Active'
+                ELSE 'Inactive'
+            END                                      AS activity_status,
+            (SELECT COUNT(*) FROM votes v 
+                WHERE v.userid = ups.user_id AND v.votetypeid = 2) AS upvote_given_cnt,
+            (SELECT COUNT(*) FROM comments c 
+                WHERE c.userid = ups.user_id AND c.score > 5)    AS high_score_comment_cnt
+        FROM user_post_stats ups
+        LEFT JOIN badge_agg ba        ON ba.user_id = ups.user_id
+        LEFT JOIN ranked_tags rt     ON rt.user_id = ups.user_id AND rt.rn = 1
+        WHERE (ups.question_cnt + ups.answer_cnt) > 10
+           OR COALESCE(ba.total_badges,0) >= 5
+           OR rt.tag_use_cnt IS NOT NULL
+
+        UNION ALL
+
+        SELECT 
+            user_id,
+            display_name,
+            question_cnt,
+            answer_cnt,
+            question_score_sum,
+            answer_score_sum,
+            total_badges,
+            gold_badges,
+            top_tag,
+            top_tag_use_cnt,
+            activity_status,
+            upvote_given_cnt,
+            high_score_comment_cnt
+        FROM badge_only_users
+    )
+
+SELECT *
+FROM combined
+ORDER BY 
+    (question_score_sum + answer_score_sum) DESC,
+    total_badges DESC,
+    gold_badges DESC
+LIMIT 100;

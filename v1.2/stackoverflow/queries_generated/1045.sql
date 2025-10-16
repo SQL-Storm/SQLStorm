@@ -1,0 +1,185 @@
+-- {"query": "1045.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1765} 
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        coalesce(p.AnswerCount, 0) as AnswerCount,
+        coalesce(p.ViewCount, 0) as ViewCount,
+        coalesce(p.FavoriteCount, 0) as FavoriteCount,
+        row_number() over (order by t.Count desc, t.TagName) as TagRank
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+    where t.IsRequired = 0
+),
+UserQuestionAnswerStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct q.Id) as QuestionCount,
+        count(distinct a.Id) as AnswerCount,
+        avg(q.Score) filter (where q.Score is not null) as AvgQuestionScore,
+        avg(a.Score) filter (where a.Score is not null) as AvgAnswerScore,
+        count(distinct b.Id) as BadgeCount,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate,
+        sum(vt2.UpVotes) as TotalUpVotes
+    from Users u
+    left join Posts q on q.OwnerUserId = u.Id and q.PostTypeId = 1
+    left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+    left join Badges b on b.UserId = u.Id
+    left join (
+        select p.OwnerUserId, count(*) as UpVotes
+        from Votes v
+        inner join Posts p on p.Id = v.PostId
+        inner join VoteTypes vt on vt.Id = v.VoteTypeId and vt.Name = 'UpMod'
+        group by p.OwnerUserId
+    ) vt2 on vt2.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostCommentsRanks as (
+    select 
+        c.*,
+        row_number() over (partition by c.PostId order by c.Score desc nulls last, c.CreationDate) as CommentRank
+    from Comments c
+),
+AcceptedAnswersWithScores as (
+    select
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        a.Id as AcceptedAnswerId,
+        a.Score as AcceptedAnswerScore,
+        u.DisplayName as OwnerDisplayName,
+        u.Reputation,
+        (select count(*) from Votes v2 where v2.PostId = a.Id and v2.VoteTypeId = 2) as AcceptedAnswerUpVotes,
+        (select count(*) from Votes v3 where v3.PostId = p.Id and v3.VoteTypeId = 2) as QuestionUpVotes
+    from Posts p
+    left join Posts a on a.Id = p.AcceptedAnswerId
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1
+),
+ClosedQuestionsWithReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    inner join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId and pht.Name = 'Post Closed'
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostId in (select Id from Posts where PostTypeId = 1)
+),
+FullUserActivity AS (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate as PostCreationDate,
+        ph.Id as HistoryId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate as HistoryDate,
+        ph.UserId as HistoryUserId,
+        ph.UserDisplayName as HistoryUserDisplayName
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join PostHistory ph on ph.PostId = p.Id and ph.UserId = u.Id
+    where p.PostTypeId in (1, 2)
+),
+DuplicateQuestions AS (
+    select distinct pl.PostId as DuplicatePostId, pl.RelatedPostId as OriginalQuestionId
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+),
+HighActivityPosts AS (
+    select 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.AnswerCount,
+        count(distinct v.Id) as VoteCount,
+        count(distinct c.Id) as CommentCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        max(v.CreationDate) as LastVoteDate,
+        max(c.CreationDate) as LastCommentDate
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    left join Comments c on c.PostId = p.Id
+    where p.PostTypeId = 1 and p.CreationDate > now() - interval '2 years'
+    group by p.Id, p.Title, p.Score, p.ViewCount, p.FavoriteCount, p.AnswerCount
+    having count(distinct v.Id) > 50 or count(distinct c.Id) > 20
+),
+FinalResult AS (
+    select 
+        uqs.UserId,
+        uqs.DisplayName,
+        uqs.QuestionCount,
+        uqs.AnswerCount,
+        uqs.AvgQuestionScore,
+        uqs.AvgAnswerScore,
+        uqs.BadgeCount,
+        uqs.GoldBadges,
+        uqs.SilverBadges,
+        uqs.BronzeBadges,
+        uqs.LastBadgeDate,
+        uqs.TotalUpVotes,
+        hq.Id as HotQuestionId,
+        hq.Title as HotQuestionTitle,
+        hq.Score as HotQuestionScore,
+        hq.ViewCount as HotQuestionViewCount,
+        hq.FavoriteCount as HotQuestionFavoriteCount,
+        hq.AnswerCount as HotQuestionAnswerCount,
+        hq.UpVotes as HotQuestionUpVotes,
+        dq.DuplicatePostId,
+        dq.OriginalQuestionId,
+        cqr.CloseReason,
+        cqr.CloseDate
+    from UserQuestionAnswerStats uqs
+    left join HighActivityPosts hq on hq.Id = (
+        select p.Id from Posts p 
+        where p.OwnerUserId = uqs.UserId and p.PostTypeId = 1
+        order by p.Score desc nulls last limit 1
+    )
+    left join DuplicateQuestions dq on dq.DuplicatePostId = hq.Id
+    left join ClosedQuestionsWithReasons cqr on cqr.PostId = hq.Id
+    where uqs.QuestionCount > 10
+)
+select 
+    fr.UserId,
+    fr.DisplayName,
+    fr.QuestionCount,
+    fr.AnswerCount,
+    round(coalesce(fr.AvgQuestionScore,0),2) as AvgQuestionScore,
+    round(coalesce(fr.AvgAnswerScore,0),2) as AvgAnswerScore,
+    fr.BadgeCount,
+    fr.GoldBadges,
+    fr.SilverBadges,
+    fr.BronzeBadges,
+    fr.LastBadgeDate,
+    fr.TotalUpVotes,
+    fr.HotQuestionId,
+    fr.HotQuestionTitle,
+    fr.HotQuestionScore,
+    fr.HotQuestionViewCount,
+    fr.HotQuestionFavoriteCount,
+    fr.HotQuestionAnswerCount,
+    fr.HotQuestionUpVotes,
+    fr.DuplicatePostId,
+    fr.OriginalQuestionId,
+    fr.CloseReason,
+    fr.CloseDate
+from FinalResult fr
+where fr.CloseReason is null or fr.CloseReason not in ('Duplicate', 'Exact Duplicate')
+order by fr.TotalUpVotes desc nulls last, fr.QuestionCount desc nulls last
+limit 100;

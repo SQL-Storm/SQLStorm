@@ -1,0 +1,102 @@
+WITH UserPosts AS (
+    SELECT 
+        u.Id                         AS UserId,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        SUM(p.Score)                AS TotalScore,
+        MAX(p.CreationDate)         AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p 
+        ON p.OwnerUserId = u.Id
+    GROUP BY u.Id
+),
+UserBadges AS (
+    SELECT 
+        b.UserId,
+        COUNT(*)                                     AS BadgeCount,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END)      AS Gold,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END)      AS Silver,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END)      AS Bronze
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserVotes AS (
+    SELECT 
+        v.UserId,
+        COUNT(*)                                   AS VoteCount,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.UserId
+),
+MainUsers AS (
+    SELECT 
+        u.Id                                     AS UserId,
+        u.DisplayName,
+        COALESCE(up.QuestionCount, 0)            AS Questions,
+        COALESCE(up.AnswerCount,   0)            AS Answers,
+        COALESCE(up.TotalScore,    0)            AS ScoreSum,
+        COALESCE(ub.BadgeCount,   0)             AS TotalBadges,
+        COALESCE(ub.Gold,          0)            AS GoldBadges,
+        COALESCE(uv.UpVotes,0) - COALESCE(uv.DownVotes,0) AS NetVotes,
+        CASE 
+            WHEN up.LastPostDate IS NULL THEN NULL
+            ELSE EXTRACT(day FROM (TIMESTAMP '2024-10-01 12:34:56' - up.LastPostDate))
+        END                                     AS DaysSinceLastPost,
+        STRING_AGG(DISTINCT tt.TagName, ', ')   AS Top5Tags
+    FROM Users u
+    LEFT JOIN UserPosts  up ON up.UserId = u.Id
+    LEFT JOIN UserBadges ub ON ub.UserId = u.Id
+    LEFT JOIN UserVotes  uv ON uv.UserId = u.Id
+    LEFT JOIN LATERAL (
+        SELECT 
+            t.TagName
+        FROM Tags t
+        WHERE t.IsModeratorOnly = FALSE
+        ORDER BY t.Count DESC
+        LIMIT 5
+    ) tt ON TRUE
+    WHERE u.Reputation > 1000
+      AND u.Location IS NOT NULL
+      AND u.Location <> ''
+      AND EXISTS (
+            SELECT 1 
+            FROM Posts p
+            WHERE p.OwnerUserId = u.Id
+              AND p.PostTypeId = 1
+              AND p.Score >= 10
+          )
+    GROUP BY 
+        u.Id, u.DisplayName,
+        up.QuestionCount, up.AnswerCount, up.TotalScore,
+        ub.BadgeCount, ub.Gold,
+        uv.UpVotes, uv.DownVotes,
+        up.LastPostDate
+    HAVING SUM(CASE WHEN COALESCE(up.AnswerCount,0) > 0 THEN 1 ELSE 0 END) > 0
+)
+SELECT *
+FROM (
+    SELECT * FROM MainUsers
+    ORDER BY NetVotes DESC
+    LIMIT 100
+) t
+
+UNION ALL
+
+SELECT 
+    NULL                         AS UserId,
+    'TOTAL'                      AS DisplayName,
+    SUM(COALESCE(up.QuestionCount,0)) AS Questions,
+    SUM(COALESCE(up.AnswerCount,0))   AS Answers,
+    SUM(COALESCE(up.TotalScore,0))    AS ScoreSum,
+    SUM(COALESCE(ub.BadgeCount,0))    AS TotalBadges,
+    SUM(COALESCE(ub.Gold,0))          AS GoldBadges,
+    SUM(COALESCE(uv.UpVotes,0)) - SUM(COALESCE(uv.DownVotes,0)) AS NetVotes,
+    NULL                              AS DaysSinceLastPost,
+    NULL                              AS Top5Tags
+FROM Users u
+LEFT JOIN UserPosts  up ON up.UserId = u.Id
+LEFT JOIN UserBadges ub ON ub.UserId = u.Id
+LEFT JOIN UserVotes  uv ON uv.UserId = u.Id
+WHERE u.Reputation > 1000;

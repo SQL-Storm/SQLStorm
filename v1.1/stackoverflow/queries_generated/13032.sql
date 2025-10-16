@@ -1,0 +1,68 @@
+-- {"query": "13032.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-premier", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2142, "output_tokens": 735} 
+
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.ClosedDate IS NULL
+),
+UserBadges AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TopQuestions AS (
+    SELECT 
+        rp.Id,
+        rp.OwnerUserId,
+        rp.Score,
+        rp.ViewCount,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.CreationDate
+    FROM RankedPosts rp
+    WHERE rp.rn <= 5
+),
+CommentAggregation AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(c.Id) AS TotalComments,
+        SUM(CASE WHEN c.Score > 0 THEN 1 ELSE 0 END) AS PositiveComments
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    GROUP BY p.Id
+)
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    COALESCE(ub.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ub.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ub.BronzeBadges, 0) AS BronzeBadges,
+    COUNT(DISTINCT tq.Id) AS TopQuestionsCount,
+    AVG(tq.Score) AS AvgScoreTopQuestions,
+    SUM(ca.TotalComments) AS TotalCommentsOnTopQuestions,
+    SUM(ca.PositiveComments) AS PositiveCommentsOnTopQuestions,
+    MAX(tq.CreationDate) AS LastTopQuestionCreatedDate,
+    STRING_AGG(DISTINCT pt.Name, ', ') AS PostTypesInvolved
+FROM Users u
+LEFT JOIN UserBadges ub ON u.Id = ub.UserId
+LEFT JOIN TopQuestions tq ON u.Id = tq.OwnerUserId
+LEFT JOIN CommentAggregation ca ON tq.Id = ca.PostId
+LEFT JOIN Posts pt ON u.Id = pt.OwnerUserId
+WHERE u.Views > 1000 AND u.CreationDate > '2015-01-01'
+GROUP BY u.DisplayName, u.Reputation, u.Location, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges
+HAVING COUNT(DISTINCT tq.Id) >= 2
+ORDER BY AvgScoreTopQuestions DESC NULLS LAST, TotalCommentsOnTopQuestions DESC
+LIMIT 20;

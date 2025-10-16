@@ -1,0 +1,139 @@
+-- {"query": "5033.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1285} 
+WITH RecentHighRepUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.UpVotes,
+        u.DownVotes,
+        CASE 
+            WHEN u.WebsiteUrl IS NULL THEN 0 
+            ELSE 1 
+        END AS HasWebsite,
+        DENSE_RANK() OVER (ORDER BY u.CreationDate DESC) AS JoinRank
+    FROM Users u
+    WHERE u.Reputation >= (
+        SELECT AVG(Reputation)
+        FROM Users
+        WHERE CreationDate > NOW() - INTERVAL '1 year'
+    )
+)
+, UserBadges AS (
+    SELECT
+        b.UserId,
+        COUNT(*) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+)
+, UserQuestions AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(*) AS QuestionCount,
+        SUM(p.ViewCount) AS TotalViews,
+        MAX(p.Score) AS MaxScore,
+        COUNT(DISTINCT CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN p.Id END) AS AcceptedQuestions
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId
+)
+, HotTags AS (
+    SELECT
+        t.TagName,
+        t.Count
+    FROM Tags t
+    WHERE t.Count >= (
+        SELECT MAX(Count) * 0.90 FROM Tags
+    )
+)
+, UserHotTagQuestions AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(*) AS HotTagQCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND EXISTS (
+          SELECT 1 FROM HotTags ht WHERE p.Tags LIKE CONCAT('%<',ht.TagName,'>%')
+      )
+    GROUP BY p.OwnerUserId
+)
+, LastClosedPosts AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS ClosedDate,
+        ph2.CreationDate AS ReopenDate
+    FROM PostHistory ph
+    LEFT JOIN PostHistory ph2 
+        ON ph.PostId = ph2.PostId 
+        AND ph2.PostHistoryTypeId = 11
+        AND ph2.CreationDate > ph.CreationDate
+    WHERE ph.PostHistoryTypeId = 10
+      AND ph.CreationDate > NOW() - INTERVAL '6 months'
+)
+SELECT 
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.UpVotes - u.DownVotes AS NetVotes,
+    ub.BadgeCount,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    uq.QuestionCount,
+    uq.TotalViews,
+    uq.MaxScore,
+    uq.AcceptedQuestions,
+    uhtq.HotTagQCount,
+    COALESCE(pq.ClosedCount,0) AS ClosedQuestions6m,
+    COALESCE(pq.ReopenedCount,0) AS ReopenedQuestions6m,
+    COALESCE(pavg.AvgScore,0) AS AvgQuestionScore,
+    CASE 
+        WHEN u.HasWebsite = 1 AND uq.QuestionCount IS NOT NULL AND uq.QuestionCount > 0
+            THEN ROUND(ub.BadgeCount::numeric / uq.QuestionCount, 2)
+        ELSE NULL
+    END AS BadgePerQuestionRatio,
+    CASE 
+        WHEN u.Reputation IS NULL OR uq.QuestionCount IS NULL OR uq.QuestionCount = 0 THEN NULL
+        ELSE ROUND(u.Reputation::numeric / uq.QuestionCount,2)
+    END AS ReputationPerQuestion,
+    array_to_string(array_agg(DISTINCT t.TagName ORDER BY COUNT(*) DESC) 
+        FILTER (WHERE t.TagName IS NOT NULL), ', ') AS ProminentTags
+FROM RecentHighRepUsers u
+LEFT JOIN UserBadges ub ON u.UserId = ub.UserId
+LEFT JOIN UserQuestions uq ON u.UserId = uq.UserId
+LEFT JOIN UserHotTagQuestions uhtq ON u.UserId = uhtq.UserId
+LEFT JOIN (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        COUNT(DISTINCT lcp.PostId) AS ClosedCount,
+        COUNT(DISTINCT CASE WHEN lcp.ReopenDate IS NOT NULL THEN lcp.PostId END) AS ReopenedCount
+    FROM Posts p
+    INNER JOIN LastClosedPosts lcp ON p.Id = lcp.PostId
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId
+) pq ON u.UserId = pq.UserId
+LEFT JOIN (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        AVG(p.Score) AS AvgScore
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId
+) pavg ON u.UserId = pavg.UserId
+LEFT JOIN Posts p ON p.OwnerUserId = u.UserId AND p.PostTypeId = 1
+LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName
+) qt ON TRUE
+LEFT JOIN Tags t ON qt.TagName = t.TagName
+GROUP BY 
+    u.UserId, u.DisplayName, u.Reputation, u.CreationDate, u.UpVotes, u.DownVotes,
+    ub.BadgeCount, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges,
+    uq.QuestionCount, uq.TotalViews, uq.MaxScore, uq.AcceptedQuestions, 
+    uhtq.HotTagQCount, pq.ClosedCount, pq.ReopenedCount, pavg.AvgScore, u.HasWebsite
+HAVING COUNT(p.Id) >= 10
+ORDER BY u.Reputation DESC, uq.TotalViews DESC
+LIMIT 50;

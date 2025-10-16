@@ -1,0 +1,183 @@
+-- {"query": "368.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1685} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.TagName] as TagPath
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.TagPath || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id = r.Id + 1
+    where r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        coalesce(sum(b.Class),0) as BadgeScore
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostStats as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.Title,
+        p.AcceptedAnswerId,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc nulls last) as UserPostRank,
+        count(*) over (partition by p.OwnerUserId) as UserPostCount,
+        case when p.PostTypeId = 1 then p.AnswerCount else null end as AnswerCount,
+        case when p.PostTypeId = 1 then p.FavoriteCount else null end as FavoriteCount,
+        case when p.PostTypeId = 1 then p.ClosedDate else null end as ClosedDate
+    from Posts p
+    where p.CreationDate >= '2019-01-01' and p.Score is not null
+),
+TopUserPosts as (
+    select
+        ps.*,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.BadgeScore,
+        u.Reputation,
+        u.CreationDate as UserCreationDate,
+        u.Location,
+        u.DisplayName as UserDisplayName
+    from PostStats ps
+    left join UserBadgeCounts ub on ub.UserId = ps.OwnerUserId
+    left join Users u on u.Id = ps.OwnerUserId
+    where ps.UserPostRank <= 5
+),
+PostVotesSummary as (
+    select
+        v.PostId,
+        sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+        sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes,
+        sum(case when vt.Name = 'Favorite' then 1 else 0 end) as Favorites,
+        sum(case when vt.Name = 'BountyStart' then coalesce(v.BountyAmount,0) else 0 end) as TotalBountyStarted,
+        count(*) as TotalVotes
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.PostId
+),
+PostCommentsSummary as (
+    select
+        c.PostId,
+        count(*) as CommentCount,
+        max(c.CreationDate) as LastCommentDate,
+        string_agg(distinct coalesce(c.UserDisplayName, 'Anonymous'), ', ' order by c.UserDisplayName) as Commenters
+    from Comments c
+    group by c.PostId
+),
+PostLinkDuplicates as (
+    select
+        pl.PostId,
+        count(distinct pl.RelatedPostId) filter (where lt.Name = 'Duplicate') as DuplicateCount
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+),
+QuestionCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        count(*) as CloseVotes
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId
+    join CloseReasonTypes crt on crt.Id::varchar = ph.Comment
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId, crt.Name
+),
+RankedQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        row_number() over (order by p.Score desc nulls last, p.ViewCount desc nulls last) as RankByScoreView,
+        dense_rank() over (partition by p.OwnerUserId order by p.CreationDate) as UserQuestionRank
+    from Posts p
+    where p.PostTypeId = 1 and p.ClosedDate is null
+),
+FinalResults as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Tags,
+        q.Score,
+        q.ViewCount,
+        q.CreationDate,
+        u.DisplayName as OwnerName,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        coalesce(pvs.UpVotes,0) as UpVotes,
+        coalesce(pvs.DownVotes,0) as DownVotes,
+        coalesce(pvs.Favorites,0) as Favorites,
+        coalesce(pcs.CommentCount,0) as CommentCount,
+        coalesce(pld.DuplicateCount,0) as DuplicateLinks,
+        coalesce(qcr.CloseVotes,0) as CloseVotes,
+        qcr.CloseReason,
+        q.RankByScoreView,
+        q.UserQuestionRank,
+        -- Complex string expression with NULL logic and conditional concatenation
+        case
+            when q.Tags is not null then
+                'Tags: ' || replace(replace(q.Tags, '<', ''), '>', ', ') || 
+                ' | Owner: ' || coalesce(u.DisplayName, 'Unknown') ||
+                ' | Score/View: ' || cast(q.Score as varchar) || '/' || cast(q.ViewCount as varchar)
+            else 'No Tags | Owner: ' || coalesce(u.DisplayName, 'Unknown')
+        end as Summary,
+        -- Window function example: average score of user's questions
+        avg(q.Score) over (partition by q.OwnerUserId) as AvgUserQuestionScore,
+        -- Correlated subquery: count of answers per question
+        (select count(*) from Posts ans where ans.ParentId = q.Id and ans.PostTypeId = 2) as AnswerCount,
+        -- Conditional calculation with NULL logic
+        case
+            when coalesce(pvs.UpVotes,0) + coalesce(pvs.DownVotes,0) > 0 then
+                round(100.0 * coalesce(pvs.UpVotes,0) / (coalesce(pvs.UpVotes,0) + coalesce(pvs.DownVotes,0)), 2)
+            else null
+        end as UpvotePercentage
+    from RankedQuestions q
+    left join Users u on u.Id = q.OwnerUserId
+    left join UserBadgeCounts ub on ub.UserId = q.OwnerUserId
+    left join PostVotesSummary pvs on pvs.PostId = q.Id
+    left join PostCommentsSummary pcs on pcs.PostId = q.Id
+    left join PostLinkDuplicates pld on pld.PostId = q.Id
+    left join (
+        select
+            PostId,
+            sum(CloseVotes) as CloseVotes,
+            max(CloseReason) as CloseReason
+        from QuestionCloseReasons
+        group by PostId
+    ) qcr on qcr.PostId = q.Id
+)
+select *
+from FinalResults
+where AvgUserQuestionScore > 5
+  and (CloseVotes is null or CloseVotes < 3)
+  and DuplicateLinks < 2
+order by RankByScoreView
+limit 100;

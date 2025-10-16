@@ -1,0 +1,182 @@
+-- {"query": "19045.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2618} 
+
+WITH UserActivitySummary AS (
+    -- Summarizes recent post activity for each user, including counts and aggregated scores.
+    SELECT
+        U.Id AS UserId,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScore,
+        COALESCE(AVG(P.Score), 0.0) AS AveragePostScore,
+        MAX(P.LastActivityDate) AS LastPostActivity
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    WHERE P.CreationDate >= (NOW() - INTERVAL '3 years') -- Focus on posts from the last 3 years
+    GROUP BY U.Id
+),
+UserBadgeAchievements AS (
+    -- Aggregates badge counts by class and tracks first/last badge dates for each user.
+    SELECT
+        U.Id AS UserId,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MIN(B.Date) AS FirstBadgeDate,
+        MAX(B.Date) AS LastBadgeDate
+    FROM Users U
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id
+),
+PostComplexHistory AS (
+    -- Summarizes various historical events for each post, including edits, closes, reopens, and linked posts.
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6, 8, 9) THEN PH.Id END) AS EditCount, -- Title/Body/Tags Edit or Rollback
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.Id END) AS CloseCount,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.Id END) AS ReopenCount,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 35 THEN PH.Id END) AS MigrateAwayCount,
+        COUNT(DISTINCT PL.RelatedPostId) AS LinkedPostsCount
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN PostLinks PL ON P.Id = PL.PostId
+    GROUP BY P.Id, P.OwnerUserId
+),
+UserHistoricalImpact AS (
+    -- Aggregates post historical events to the user level.
+    SELECT
+        PCH.OwnerUserId AS UserId,
+        COALESCE(SUM(PCH.EditCount), 0) AS UserTotalEditEvents,
+        COALESCE(SUM(PCH.CloseCount), 0) AS UserTotalCloseEvents,
+        COALESCE(SUM(PCH.ReopenCount), 0) AS UserTotalReopenEvents,
+        COALESCE(SUM(PCH.MigrateAwayCount), 0) AS UserTotalMigrateAwayEvents,
+        COALESCE(SUM(PCH.LinkedPostsCount), 0) AS UserTotalLinkedPosts
+    FROM PostComplexHistory PCH
+    GROUP BY PCH.OwnerUserId
+),
+TopQuestionContributors AS (
+    -- Identifies users who have contributed a significant number of high-scoring, accepted questions.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        'HighQuestionScore' AS ContributionType
+    FROM Users U
+    JOIN Posts P ON U.Id = P.OwnerUserId
+    WHERE P.PostTypeId = 1
+      AND P.Score >= 100
+      AND P.AcceptedAnswerId IS NOT NULL
+    GROUP BY U.Id, U.DisplayName, U.Reputation
+    HAVING COUNT(P.Id) >= 5
+),
+TopAnswerContributors AS (
+    -- Identifies users who have contributed a significant number of high-scoring, accepted answers.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        'HighAnswerScore' AS ContributionType
+    FROM Users U
+    JOIN Posts P ON U.Id = P.OwnerUserId
+    WHERE P.PostTypeId = 2
+      AND P.Score >= 50
+      AND EXISTS (SELECT 1 FROM Posts Q WHERE Q.Id = P.ParentId AND Q.AcceptedAnswerId = P.Id) -- Answer is accepted by question owner
+    GROUP BY U.Id, U.DisplayName, U.Reputation
+    HAVING COUNT(P.Id) >= 10
+),
+CombinedHighContributors AS (
+    -- Combines top question and answer contributors, removing any users with 'Community' or 'Deleted' in their display name.
+    SELECT UserId, DisplayName, Reputation, ContributionType FROM TopQuestionContributors
+    UNION ALL
+    SELECT UserId, DisplayName, Reputation, ContributionType FROM TopAnswerContributors
+    EXCEPT
+    SELECT U.Id, U.DisplayName, U.Reputation, 'Excluded'
+    FROM Users U
+    WHERE U.DisplayName LIKE '%Community%' OR U.DisplayName LIKE '%Deleted%'
+)
+SELECT
+    U.Id AS UserID,
+    COALESCE(U.DisplayName, 'Deleted User') AS DisplayName,
+    U.Reputation,
+    U.Views AS ProfileViews,
+    U.CreationDate,
+    U.LastAccessDate,
+    COALESCE(U.Location, 'Unknown Location') AS UserLocation,
+    UAS.TotalPosts,
+    UAS.TotalQuestions,
+    UAS.TotalAnswers,
+    UAS.TotalPostScore,
+    UAS.AveragePostScore,
+    UBA.GoldBadges,
+    UBA.SilverBadges,
+    UBA.BronzeBadges,
+    UHI.UserTotalEditEvents,
+    UHI.UserTotalCloseEvents,
+    UHI.UserTotalReopenEvents,
+    UHI.UserTotalMigrateAwayEvents,
+    UHI.UserTotalLinkedPosts,
+    -- Calculate a weighted 'UserInfluenceScore'
+    (U.Reputation * 0.4 + COALESCE(UAS.TotalPostScore, 0) * 0.2 + COALESCE(UBA.GoldBadges, 0) * 100 + COALESCE(UBA.SilverBadges, 0) * 50 + COALESCE(UHI.UserTotalReopenEvents, 0) * 20 - COALESCE(UHI.UserTotalCloseEvents, 0) * 30) AS UserInfluenceScore,
+    -- Rank users by reputation and post score
+    RANK() OVER (ORDER BY U.Reputation DESC, COALESCE(UAS.TotalPostScore, 0) DESC, U.CreationDate ASC) AS GlobalReputationRank,
+    -- Rank users by reputation within their location
+    DENSE_RANK() OVER (PARTITION BY U.Location ORDER BY U.Reputation DESC) AS LocationReputationRank,
+    -- Calculate average post score for users created in the same year
+    AVG(UAS.AveragePostScore) OVER (PARTITION BY EXTRACT(YEAR FROM U.CreationDate)) AS AvgPostScoreForCohort,
+    -- Get the reputation of the user created immediately before this user
+    COALESCE(LAG(U.Reputation, 1, 0) OVER (ORDER BY U.CreationDate), 0) AS PreviousUserReputationByCreationDate,
+    -- Correlated subquery: Count new comments the user made since their last access
+    (
+        SELECT COUNT(C.Id)
+        FROM Comments C
+        WHERE C.UserId = U.Id
+          AND C.CreationDate > U.LastAccessDate
+    ) AS NewCommentsSinceLastAccess,
+    -- Correlated subquery: Calculate average score of user's questions in their first year
+    (
+        SELECT AVG(SQ_P.Score)
+        FROM Posts SQ_P
+        WHERE SQ_P.OwnerUserId = U.Id
+          AND SQ_P.PostTypeId = 1
+          AND SQ_P.CreationDate BETWEEN U.CreationDate AND (U.CreationDate + INTERVAL '1 year')
+    ) AS AvgQuestionScoreFirstYear,
+    COALESCE(LENGTH(U.AboutMe), 0) AS AboutMeLength, -- Length of the 'About Me' section
+    CASE
+        WHEN U.WebsiteUrl IS NOT NULL THEN 'Has Website'
+        WHEN U.EmailHash IS NOT NULL THEN 'Has Email Hash'
+        ELSE 'No Public Contact'
+    END AS ContactStatus,
+    -- Calculate Up/Down vote ratio, handling division by zero
+    COALESCE(NULLIF(U.UpVotes, 0)::numeric / NULLIF(U.DownVotes, 0)::numeric, U.UpVotes::numeric) AS UpDownVoteRatio,
+    UPPER(LEFT(COALESCE(U.Location, ''), 3)) AS LocationPrefix, -- First 3 chars of location, in uppercase
+    -- Aggregates recently contributed tags by the user
+    (
+        SELECT STRING_AGG(DISTINCT T.TagName, ', ')
+        FROM Posts P_tags
+        JOIN LATERAL UNNEST(string_to_array(substring(P_tags.Tags, 2, length(P_tags.Tags)-2), '><')) AS Tag (TagName) ON TRUE
+        JOIN Tags T ON Tag.TagName = T.TagName
+        WHERE P_tags.OwnerUserId = U.Id
+          AND P_tags.CreationDate >= (NOW() - INTERVAL '1 year')
+        GROUP BY P_tags.OwnerUserId
+    ) AS RecentTagsContributed,
+    CASE
+        WHEN U.AboutMe IS NOT NULL AND U.AboutMe LIKE '%developer%' THEN 'Developer Profile'
+        WHEN U.AboutMe IS NOT NULL AND U.AboutMe LIKE '%student%' THEN 'Student Profile'
+        ELSE 'General Profile'
+    END AS ProfileClassification
+FROM Users U
+LEFT JOIN UserActivitySummary UAS ON U.Id = UAS.UserId
+LEFT JOIN UserBadgeAchievements UBA ON U.Id = UBA.UserId
+LEFT JOIN UserHistoricalImpact UHI ON U.Id = UHI.UserId
+WHERE U.Reputation > 1000 -- Filter for users with a significant reputation
+  AND U.LastAccessDate >= (NOW() - INTERVAL '1 year') -- Ensure the user has been active recently
+  AND (U.DisplayName IS NOT NULL AND U.DisplayName NOT LIKE '%Community%' AND U.DisplayName NOT LIKE '%Deleted%') -- Exclude system or deleted users
+  AND (U.Location IS NOT NULL AND TRIM(U.Location) != '' AND U.Location LIKE '% %') -- Ensure a multi-word location exists
+  AND (U.WebsiteUrl IS NOT NULL OR U.AboutMe IS NOT NULL) -- User has some public profile information
+  AND U.Views > (SELECT AVG(Views) FROM Users WHERE Views > 0) * 0.5 -- More views than 50% of the average for non-zero view users
+  AND U.UpVotes > U.DownVotes -- More upvotes than downvotes
+  AND U.Id IN (SELECT UserId FROM CombinedHighContributors) -- User must be a high contributor in at least one category
+ORDER BY UserInfluenceScore DESC, U.CreationDate ASC
+LIMIT 1000;

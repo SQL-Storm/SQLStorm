@@ -1,0 +1,284 @@
+-- {"query": "19001.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3709} 
+WITH UserEngagement AS (
+    -- CTE 1: Aggregates comprehensive user engagement metrics including post counts, badge classifications, and score summaries.
+    -- This helps in identifying active and reputable users for deeper analysis.
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalPostViews,
+        MAX(p.CreationDate) AS LatestPostDate,
+        AVG(CAST(p.Score AS DECIMAL)) AS AvgPostScore,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges
+    FROM
+        Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+PostActivitySummary AS (
+    -- CTE 2: Summarizes critical activity and metadata for posts (questions and answers) that meet certain significance thresholds.
+    -- It includes details from post history and related links using correlated subqueries for efficiency.
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        p.Title,
+        p.Body, -- Full post body included for string operations
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate,
+        p.LastEditDate,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.Tags,
+        p.ClosedDate, -- Included for NULL logic and conditional checks
+        COALESCE(ph.MaxHistoryDate, p.CreationDate) AS LastHistoryEventDate,
+        COALESCE(ph.ModeratorEditCount, 0) AS ModeratorEditCount,
+        COALESCE(ph.CloseVoteCount, 0) AS CloseVoteCount,
+        COALESCE(ph.ReopenVoteCount, 0) AS ReopenVoteCount,
+        -- Correlated subquery to sum bounty amounts
+        (SELECT SUM(v.BountyAmount) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 8) AS TotalBountyAmount,
+        -- Correlated subquery to count linked posts
+        (SELECT COUNT(DISTINCT l.RelatedPostId) FROM PostLinks l WHERE l.PostId = p.Id AND l.LinkTypeId = 1) AS LinkedPostsCount,
+        -- Correlated subquery to count duplicate posts
+        (SELECT COUNT(DISTINCT l.RelatedPostId) FROM PostLinks l WHERE l.PostId = p.Id AND l.LinkTypeId = 3) AS DuplicatePostsCount
+    FROM
+        Posts p
+    INNER JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN (
+        -- Subquery to aggregate post history events for moderator actions and close/reopen votes
+        SELECT
+            ph_inner.PostId,
+            MAX(ph_inner.CreationDate) AS MaxHistoryDate,
+            SUM(CASE WHEN ph_inner.PostHistoryTypeId IN (14, 15, 19, 20) AND ph_inner.UserId IS NOT NULL THEN 1 ELSE 0 END) AS ModeratorEditCount,
+            SUM(CASE WHEN ph_inner.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseVoteCount,
+            SUM(CASE WHEN ph_inner.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenVoteCount
+        FROM
+            PostHistory ph_inner
+        GROUP BY
+            ph_inner.PostId
+    ) AS ph ON p.Id = ph.PostId
+    WHERE
+        p.PostTypeId IN (1, 2) -- Focus on Questions and Answers
+        AND p.Score >= 5 -- Filter for posts with at least a moderate score
+        AND p.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 year') -- Limit to recent posts for relevance
+),
+RankedUserPosts AS (
+    -- CTE 3: Ranks a user's individual posts based on score and creation date using window functions.
+    -- It also calculates lagging scores and running averages to identify trends in user contribution quality.
+    SELECT
+        ps.PostId,
+        ps.PostTypeName,
+        ps.OwnerUserId,
+        ps.PostScore,
+        ps.PostCreationDate,
+        ps.LastActivityDate,
+        ps.Title,
+        ps.Tags,
+        ps.Body,
+        ps.ClosedDate,
+        -- Ranks posts by score and then creation date for each user
+        ROW_NUMBER() OVER (PARTITION BY ps.OwnerUserId ORDER BY ps.PostScore DESC, ps.PostCreationDate DESC) AS rn_user_post_score,
+        DENSE_RANK() OVER (PARTITION BY ps.OwnerUserId ORDER BY ps.PostScore DESC) AS dr_user_post_score_dense,
+        -- Compares current post score to the previous one
+        LAG(ps.PostScore, 1, 0) OVER (PARTITION BY ps.OwnerUserId ORDER BY ps.PostCreationDate) AS PreviousPostScore,
+        -- Calculates a 3-post moving average of scores
+        AVG(CAST(ps.PostScore AS DECIMAL)) OVER (PARTITION BY ps.OwnerUserId ORDER BY ps.PostCreationDate ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS AvgScoreLast3Posts
+    FROM
+        PostActivitySummary ps
+    WHERE
+        ps.OwnerUserId IS NOT NULL
+)
+-- Main Query - Part 1: Focuses on highly reputable users and their top-performing, relevant questions.
+-- It combines user engagement with detailed post activity, applies complex calculations, and filters.
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.TotalPosts,
+    ue.TotalQuestions,
+    ue.TotalAnswers,
+    ue.TotalComments,
+    ue.TotalBadges,
+    ue.TotalPostScore,
+    ue.AvgPostScore,
+    ru.PostId,
+    ru.PostTypeName,
+    ru.Title AS PostTitle,
+    ru.PostScore,
+    ru.PostCreationDate,
+    ru.LastActivityDate,
+    ru.rn_user_post_score AS UserPostRankByScore,
+    ru.dr_user_post_score_dense AS UserPostDenseRankByScore,
+    ru.PreviousPostScore,
+    ru.AvgScoreLast3Posts,
+    ps.ViewCount AS PostViewCount,
+    ps.AnswerCount,
+    ps.CommentCount AS PostCommentCount,
+    ps.FavoriteCount,
+    ps.TotalBountyAmount,
+    ps.LinkedPostsCount,
+    ps.DuplicatePostsCount,
+    ps.ModeratorEditCount,
+    ps.CloseVoteCount,
+    ps.ReopenVoteCount,
+    -- Complex weighted calculation of user contribution based on reputation, posts, and comments
+    (ue.Reputation * (1 + (ue.TotalPosts + ue.TotalComments) / NULLIF(ue.TotalAnswers + ue.TotalQuestions, 0.0))) AS WeightedUserContribution,
+    -- Categorizes post status using CASE statements and NULL logic for AcceptedAnswerId and ClosedDate
+    CASE
+        WHEN ps.PostTypeId = 1 AND ps.AnswerCount > 0 AND ps.AcceptedAnswerId IS NOT NULL THEN 'Resolved_Question'
+        WHEN ps.PostTypeId = 1 AND ps.ClosedDate IS NOT NULL THEN 'Closed_Question'
+        WHEN ps.PostTypeId = 1 AND ps.FavoriteCount >= 50 THEN 'Highly_Favored_Question'
+        WHEN ps.PostTypeId = 2 AND ps.Score >= 20 THEN 'High_Scoring_Answer'
+        ELSE 'Other_Post'
+    END AS PostStatusCategory,
+    -- String expressions and calculations on post body length, handling NULLs
+    COALESCE(LENGTH(ps.Body) / 100, 0) AS BodyLengthInHundreds,
+    NULLIF(LENGTH(REPLACE(REPLACE(ps.Body, '<p>', ''), '</p>', '')), 0) AS BodyTextLength,
+    -- Date calculations for post age and activity latency
+    DATE_PART('day', cast('2024-10-01 12:34:56' as timestamp) - ru.PostCreationDate) AS DaysSincePostCreation,
+    DATE_PART('hour', ps.LastActivityDate - ru.PostCreationDate) AS HoursUntilLastActivity,
+    (
+        -- Correlated Subquery: Checks if the post's owner has a Gold badge for any of the post's tags.
+        -- Demonstrates string matching with LIKE and INNER JOIN on tags.
+        SELECT
+            CASE WHEN COUNT(DISTINCT b.Id) > 0 THEN TRUE ELSE FALSE END
+        FROM
+            Badges b
+        INNER JOIN Tags t ON LOWER(b.Name) = LOWER(t.TagName)
+        WHERE
+            b.UserId = ue.UserId
+            AND b.Class = 1 -- Gold badges
+            AND ru.Tags LIKE '%' || t.TagName || '%' -- Simple tag matching
+            AND LENGTH(t.TagName) > 2 -- Avoid trivial tag matches
+    ) AS HasGoldBadgeForPostTag,
+    (
+        -- Non-correlated Subquery: Provides a global benchmark for recent question scores.
+        SELECT AVG(p_sub.Score)
+        FROM Posts p_sub
+        WHERE p_sub.PostTypeId = 1
+        AND p_sub.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 months')
+    ) AS GlobalAvgRecentQuestionScore
+FROM
+    UserEngagement ue
+INNER JOIN RankedUserPosts ru ON ue.UserId = ru.OwnerUserId
+INNER JOIN PostActivitySummary ps ON ru.PostId = ps.PostId
+WHERE
+    ue.Reputation >= 1000 -- Filter for users with significant reputation
+    AND ue.TotalPosts >= 5 -- And a reasonable number of posts
+    AND ru.rn_user_post_score <= 5 -- Focus on a user's top 5 posts by score
+    AND ps.PostTypeName = 'Question' -- Only questions for this part of the union
+    AND (
+        -- Complex predicate combining tag presence or high engagement metrics
+        ps.Tags LIKE '%<sql>%' OR ps.Tags LIKE '%<database>%' OR ps.Tags LIKE '%<performance>%'
+        OR (ps.PostScore >= 50 AND ps.AnswerCount >= 5)
+    )
+    AND ru.PostTitle IS NOT NULL
+    AND ps.Body IS NOT NULL
+    AND ps.LastActivityDate IS NOT NULL
+    AND NOT EXISTS (
+        -- EXISTS subquery: Filters out questions recently locked or unlocked, indicating high moderation activity
+        SELECT 1
+        FROM PostHistory ph_sub
+        WHERE ph_sub.PostId = ps.PostId
+          AND ph_sub.PostHistoryTypeId IN (14, 15) -- Post Locked or Post Unlocked
+          AND ph_sub.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 month')
+    )
+
+UNION ALL
+
+-- Main Query - Part 2: Focuses on posts that have received significant moderator interaction or bounties.
+-- This part uses a UNION ALL to combine results from different analytical perspectives.
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.TotalPosts,
+    ue.TotalQuestions,
+    ue.TotalAnswers,
+    ue.TotalComments,
+    ue.TotalBadges,
+    ue.TotalPostScore,
+    ue.AvgPostScore,
+    pas.PostId,
+    pas.PostTypeName,
+    pas.Title AS PostTitle,
+    pas.PostScore,
+    pas.PostCreationDate,
+    pas.LastActivityDate,
+    CAST(NULL AS BIGINT) AS UserPostRankByScore, -- NULL placeholders to match column structure from first UNION part
+    CAST(NULL AS BIGINT) AS UserPostDenseRankByScore,
+    CAST(NULL AS INT) AS PreviousPostScore,
+    CAST(NULL AS DECIMAL) AS AvgScoreLast3Posts,
+    pas.ViewCount AS PostViewCount,
+    pas.AnswerCount,
+    pas.CommentCount AS PostCommentCount,
+    pas.FavoriteCount,
+    pas.TotalBountyAmount,
+    pas.LinkedPostsCount,
+    pas.DuplicatePostsCount,
+    pas.ModeratorEditCount,
+    pas.CloseVoteCount,
+    pas.ReopenVoteCount,
+    (ue.Reputation * (1 + (ue.TotalPosts + ue.TotalComments) / NULLIF(ue.TotalAnswers + ue.TotalQuestions, 0.0))) AS WeightedUserContribution,
+    CASE
+        WHEN pas.PostTypeId = 1 AND pas.AnswerCount > 0 AND pas.AcceptedAnswerId IS NOT NULL THEN 'Resolved_Question'
+        WHEN pas.PostTypeId = 1 AND pas.ClosedDate IS NOT NULL THEN 'Closed_Question'
+        WHEN pas.PostTypeId = 1 AND pas.FavoriteCount >= 50 THEN 'Highly_Favored_Question'
+        WHEN pas.PostTypeId = 2 AND pas.Score >= 20 THEN 'High_Scoring_Answer'
+        ELSE 'Other_Post'
+    END AS PostStatusCategory,
+    COALESCE(LENGTH(pas.Body) / 100, 0) AS BodyLengthInHundreds,
+    NULLIF(LENGTH(REPLACE(REPLACE(pas.Body, '<p>', ''), '</p>', '')), 0) AS BodyTextLength,
+    DATE_PART('day', cast('2024-10-01 12:34:56' as timestamp) - pas.PostCreationDate) AS DaysSincePostCreation,
+    DATE_PART('hour', pas.LastActivityDate - pas.PostCreationDate) AS HoursUntilLastActivity,
+    (
+        -- Correlated Subquery: Same Gold Badge check as in the first part, for consistency
+        SELECT
+            CASE WHEN COUNT(DISTINCT b.Id) > 0 THEN TRUE ELSE FALSE END
+        FROM
+            Badges b
+        INNER JOIN Tags t ON LOWER(b.Name) = LOWER(t.TagName)
+        WHERE
+            b.UserId = ue.UserId
+            AND b.Class = 1
+            AND pas.Tags LIKE '%' || t.TagName || '%'
+            AND LENGTH(t.TagName) > 2
+    ) AS HasGoldBadgeForPostTag,
+    (
+        -- Non-correlated Subquery: Same global benchmark as in the first part
+        SELECT AVG(p_sub.Score)
+        FROM Posts p_sub
+        WHERE p_sub.PostTypeId = 1
+        AND p_sub.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 months')
+    ) AS GlobalAvgRecentQuestionScore
+FROM
+    PostActivitySummary pas
+INNER JOIN UserEngagement ue ON pas.OwnerUserId = ue.UserId -- Join with UserEngagement to enrich post data with user context
+WHERE
+    -- Filters for posts with any significant moderator/community intervention or bounty
+    (pas.ModeratorEditCount >= 1 OR pas.CloseVoteCount >= 1 OR pas.ReopenVoteCount >= 1 OR pas.TotalBountyAmount > 0)
+    AND pas.PostTypeName = 'Question'
+    AND pas.PostScore >= 10
+    AND pas.PostCreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 year')
+    AND pas.Title IS NOT NULL
+    AND pas.LastActivityDate IS NOT NULL
+    AND pas.OwnerUserId IS NOT NULL;

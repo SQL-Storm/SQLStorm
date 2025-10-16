@@ -1,0 +1,50 @@
+-- {"query": "2026.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4o", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 353} 
+
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(vv.VoteTypeId = 2) AS Upvotes,
+        SUM(vv.VoteTypeId = 3) AS Downvotes
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN 
+        Votes vv ON p.Id = vv.PostId AND vv.VoteTypeId IN (2, 3)
+    GROUP BY 
+        u.Id
+),
+UserBadges AS (
+    SELECT 
+        b.UserId,
+        STRING_AGG(DISTINCT b.Name, ', ') AS BadgeNames
+    FROM 
+        Badges b
+    WHERE 
+        b.Class IN (1, 2)
+    GROUP BY 
+        b.UserId
+)
+SELECT 
+    u.Id,
+    u.DisplayName,
+    coalesce(au.PostCount, 0) AS PostCount,
+    au.Upvotes,
+    au.Downvotes,
+    ub.BadgeNames,
+    au.Upvotes - au.Downvotes AS NetVotes,
+    AVG(CAST(p.Score AS FLOAT)) OVER (PARTITION BY u.Id) AS AvgPostScore
+FROM 
+    Users u
+LEFT JOIN 
+    ActiveUsers au ON u.Id = au.UserId
+LEFT JOIN 
+    UserBadges ub ON u.Id = ub.UserId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+WHERE 
+    u.Reputation > 1000 
+    AND (au.Upvotes > 10 OR au.Downvotes < 5)
+ORDER BY 
+    NetVotes DESC NULLS LAST, u.DisplayName;

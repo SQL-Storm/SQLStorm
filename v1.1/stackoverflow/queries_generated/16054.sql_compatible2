@@ -1,0 +1,131 @@
+WITH user_engagement_metrics AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate as UserCreationDate,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COALESCE(AVG(p.Score), 0) as AvgPostScore,
+        COALESCE(SUM(p.ViewCount), 0) as TotalViews,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation DESC) as YearlyRepRank
+    FROM Users u
+    LEFT OUTER JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= TIMESTAMP '2015-01-01'
+        AND u.Reputation > 100
+        AND (u.Location IS NULL OR LENGTH(TRIM(u.Location)) > 0)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) > 5
+),
+badge_analytics AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) as TotalBadges,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) as GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) as SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) as BronzeBadges,
+        STRING_AGG(DISTINCT CASE WHEN b.Class = 1 THEN b.Name END, ', ' ORDER BY CASE WHEN b.Class = 1 THEN b.Name END) as GoldBadgeNames,
+        MAX(b.Date) as LastBadgeDate,
+        CAST(COUNT(CASE WHEN b.TagBased = 1 THEN 1 END) AS NUMERIC) / NULLIF(COUNT(*), 0) as TagBasedRatio
+    FROM Badges b
+    WHERE b.Date >= TIMESTAMP '2015-01-01'
+    GROUP BY b.UserId
+),
+post_interaction_stats AS (
+    SELECT 
+        p.Id as PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score as PostScore,
+        p.CreationDate as PostCreationDate,
+        COALESCE(p.CommentCount, 0) as CommentCount,
+        COALESCE(p.AnswerCount, 0) as AnswerCount,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 1
+            WHEN p.PostTypeId = 2 AND EXISTS (
+                SELECT 1 FROM Posts parent 
+                WHERE parent.Id = p.ParentId 
+                AND parent.AcceptedAnswerId = p.Id
+            ) THEN 2
+            ELSE 0
+        END as AcceptanceStatus,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) as UpvoteCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) as DownvoteCount,
+        (SELECT COUNT(DISTINCT ph.UserId) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4, 5, 6)) as UniqueEditors,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PreviousPostScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) as MovingAvgScore,
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.ViewCount DESC) as ViewRank
+    FROM Posts p
+    WHERE p.CreationDate >= TIMESTAMP '2018-01-01'
+        AND p.OwnerUserId IS NOT NULL
+        AND (p.ClosedDate IS NULL OR p.ClosedDate > p.CreationDate + INTERVAL '7 days')
+),
+tag_performance AS (
+    SELECT 
+        UNNEST(string_to_array(TRIM(BOTH '><' FROM Tags), '><')) as TagName,
+        p.OwnerUserId,
+        COUNT(*) as PostsWithTag,
+        AVG(p.Score) as AvgTagScore,
+        MAX(p.ViewCount) as MaxTagViews
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL 
+        AND p.PostTypeId = 1
+        AND LENGTH(p.Tags) > 2
+    GROUP BY TagName, p.OwnerUserId
+    HAVING COUNT(*) >= 3
+)
+SELECT 
+    uem.DisplayName,
+    uem.Reputation,
+    COALESCE(UPPER(SUBSTRING(uem.DisplayName FROM 1 FOR 3)), 'UNK') || '-' || CAST(uem.UserId AS VARCHAR) as UserCode,
+    uem.QuestionCount,
+    uem.AnswerCount,
+    ROUND(CAST(uem.AvgPostScore AS NUMERIC), 2) as AvgScore,
+    uem.TotalViews,
+    uem.YearlyRepRank,
+    COALESCE(ba.TotalBadges, 0) as TotalBadges,
+    COALESCE(ba.GoldBadges, 0) as GoldCount,
+    COALESCE(ba.SilverBadges, 0) as SilverCount,
+    COALESCE(ba.BronzeBadges, 0) as BronzeCount,
+    COALESCE(ba.GoldBadgeNames, 'None') as TopBadges,
+    ROUND(COALESCE(ba.TagBasedRatio, 0), 3) as TagBadgeRatio,
+    COUNT(DISTINCT pis.PostId) as AnalyzedPosts,
+    AVG(pis.CommentCount) as AvgCommentsPerPost,
+    SUM(CASE WHEN pis.AcceptanceStatus > 0 THEN 1 ELSE 0 END) as AcceptedPosts,
+    AVG(pis.UpvoteCount - pis.DownvoteCount) as NetVoteAvg,
+    MAX(pis.UniqueEditors) as MaxEditorsOnPost,
+    AVG(pis.MovingAvgScore) as OverallMovingAvg,
+    (SELECT COUNT(*) FROM tag_performance tp WHERE tp.OwnerUserId = uem.UserId AND tp.AvgTagScore > 5) as HighPerformingTags,
+    (SELECT STRING_AGG(tp.TagName, '|' ORDER BY tp.PostsWithTag DESC) 
+     FROM (SELECT * FROM tag_performance tp2 WHERE tp2.OwnerUserId = uem.UserId ORDER BY tp2.PostsWithTag DESC LIMIT 3) tp
+    ) as TopTags,
+    CASE 
+        WHEN uem.Reputation > 10000 AND COALESCE(ba.GoldBadges, 0) > 0 THEN 'Elite'
+        WHEN uem.Reputation > 5000 THEN 'Advanced'
+        WHEN uem.Reputation > 1000 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END as UserTier,
+    EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - uem.UserCreationDate)) / 86400 as DaysSinceJoined
+FROM user_engagement_metrics uem
+LEFT JOIN badge_analytics ba ON uem.UserId = ba.UserId
+LEFT JOIN post_interaction_stats pis ON uem.UserId = pis.OwnerUserId
+WHERE uem.YearlyRepRank <= 100
+    AND (ba.TotalBadges IS NULL OR ba.TotalBadges >= 1)
+    AND EXISTS (
+        SELECT 1 FROM Posts p2 
+        WHERE p2.OwnerUserId = uem.UserId 
+        AND p2.Score > 0
+        AND p2.CreationDate >= uem.UserCreationDate + INTERVAL '30 days'
+    )
+GROUP BY 
+    uem.UserId, uem.DisplayName, uem.Reputation, uem.QuestionCount, uem.AnswerCount,
+    uem.AvgPostScore, uem.TotalViews, uem.YearlyRepRank, uem.UserCreationDate,
+    ba.TotalBadges, ba.GoldBadges, ba.SilverBadges, ba.BronzeBadges, 
+    ba.GoldBadgeNames, ba.TagBasedRatio
+HAVING AVG(pis.MovingAvgScore) > 1 OR AVG(pis.MovingAvgScore) IS NULL
+ORDER BY 
+    uem.Reputation DESC,
+    COALESCE(ba.GoldBadges, 0) DESC,
+    COUNT(DISTINCT pis.PostId) DESC
+LIMIT 500;

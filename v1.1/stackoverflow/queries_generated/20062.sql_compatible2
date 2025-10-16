@@ -1,0 +1,122 @@
+WITH UserPostMetrics AS (
+  SELECT
+    p.OwnerUserId,
+    COUNT(p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+    SUM(p.Score) AS TotalScore,
+    AVG(p.Score) AS AverageScore,
+    SUM(p.ViewCount) AS TotalViews,
+    MIN(p.CreationDate) AS FirstPostDate,
+    MAX(p.CreationDate) AS LastPostDate,
+    SUM(p.FavoriteCount) AS TotalFavorites
+  FROM Posts p
+  WHERE
+    p.OwnerUserId IS NOT NULL
+    AND p.PostTypeId IN (1, 2)
+  GROUP BY
+    p.OwnerUserId
+  HAVING
+    COUNT(p.Id) > 20 AND SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) > 5
+), AnswerDetails AS (
+  SELECT
+    p.Id,
+    p.OwnerUserId,
+    p.Score,
+    p.CreationDate,
+    q.Tags,
+    q.ViewCount AS QuestionViewCount,
+    q.AnswerCount AS QuestionAnswerCount,
+    q.AcceptedAnswerId,
+    EXTRACT(EPOCH FROM (p.CreationDate - LAG(p.CreationDate, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate))) AS SecondsToNextAnswer,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS AnswerRank
+  FROM Posts p
+  JOIN Posts q ON p.ParentId = q.Id
+  WHERE
+    p.PostTypeId = 2
+    AND p.OwnerUserId IS NOT NULL
+), UserTopTags AS (
+  SELECT
+    OwnerUserId,
+    (
+        SELECT TagName FROM (
+            SELECT TRIM(BOTH '<>' FROM REGEXP_SUBSTR(T.Tags, '[^><]+', 1, seq)) AS TagName
+            FROM (
+              SELECT ad_inner.OwnerUserId, ad_inner.Tags
+              FROM AnswerDetails ad_inner
+              WHERE ad_inner.OwnerUserId = ad_outer.OwnerUserId AND ad_inner.Tags IS NOT NULL
+            ) T(ad_owner, Tags)
+            CROSS JOIN (
+              -- generate sequence numbers up to a reasonable max number of tags per post
+              SELECT 1 AS seq UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5
+              UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10
+            ) seqs
+            WHERE REGEXP_SUBSTR(Tags, '[^><]+', 1, seqs.seq) IS NOT NULL
+        ) AS UserTags
+        GROUP BY TagName
+        ORDER BY COUNT(*) DESC, TagName
+        LIMIT 1
+    ) AS PrimaryTag
+  FROM AnswerDetails ad_outer
+  GROUP BY OwnerUserId
+)
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  u.Reputation,
+  u.Age,
+  upm.TotalPosts,
+  upm.AverageScore,
+  DENSE_RANK() OVER (ORDER BY upm.AverageScore DESC, u.Reputation DESC) AS ScoreRank,
+  COALESCE(b.GoldBadges, 0) AS GoldBadges,
+  COALESCE(b.SilverBadges, 0) AS SilverBadges,
+  utt.PrimaryTag,
+  (
+    SELECT COUNT(*)
+    FROM Comments c
+    WHERE c.UserId = u.Id AND c.PostId NOT IN (SELECT p_inner.Id FROM Posts p_inner WHERE p_inner.OwnerUserId = u.Id)
+  ) AS CommentsOnOthersPosts,
+  CASE WHEN EXISTS (SELECT 1 FROM Badges b_inner WHERE b_inner.UserId = u.Id AND b_inner.Name = 'Fanatic')
+    THEN 'Yes'
+    ELSE 'No'
+  END AS IsFanatic,
+  (
+    LOG(NULLIF(u.Reputation,0)) * upm.AverageScore + (COALESCE(b.GoldBadges, 0) * 100)
+    + (SELECT AVG(ad.Score) FROM AnswerDetails ad WHERE ad.OwnerUserId = u.Id AND ad.AnswerRank <= 5)
+    - EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - upm.LastPostDate)) / (3600.0*24*30)
+  ) AS InfluenceScore,
+  REPLACE(u.Location, ',', ';') AS StandardizedLocation
+FROM Users u
+JOIN UserPostMetrics upm ON u.Id = upm.OwnerUserId
+LEFT JOIN UserTopTags utt ON u.Id = utt.OwnerUserId
+LEFT JOIN (
+  SELECT
+    UserId,
+    SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges
+  FROM Badges
+  GROUP BY UserId
+) b ON u.Id = b.UserId
+WHERE
+  u.Reputation > (SELECT AVG(Reputation) FROM Users)
+  AND upm.AnswerCount > upm.QuestionCount
+  AND u.CreationDate < (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '5' YEAR)
+  AND u.AboutMe IS NOT NULL
+  AND LENGTH(u.AboutMe) > 100
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  u.Age,
+  upm.TotalPosts,
+  upm.AverageScore,
+  COALESCE(b.GoldBadges, 0),
+  COALESCE(b.SilverBadges, 0),
+  utt.PrimaryTag,
+  u.Location,
+  upm.LastPostDate,
+  b.GoldBadges,
+  b.SilverBadges
+ORDER BY
+  InfluenceScore DESC NULLS LAST, u.Reputation DESC
+LIMIT 100;

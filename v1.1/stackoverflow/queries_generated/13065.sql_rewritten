@@ -1,0 +1,52 @@
+-- {"query": "13065.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-premier", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2142, "output_tokens": 597} 
+WITH UserActivity AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 1000 AND p.CreationDate > (cast('2024-10-01' as date) - INTERVAL '1 year')
+    GROUP BY u.Id, u.DisplayName
+),
+TopTags AS (
+    SELECT 
+        p.OwnerUserId,
+        UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')) AS Tag,
+        COUNT(*) AS TagCount
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL AND p.PostTypeId = 1
+    GROUP BY p.OwnerUserId, Tag
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY TagCount DESC) <= 5
+),
+EditedPosts AS (
+    SELECT 
+        ph.UserId,
+        COUNT(*) AS TotalEdits
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+    GROUP BY ph.UserId
+)
+SELECT
+    ua.Id,
+    ua.DisplayName,
+    ua.TotalPosts,
+    ua.TotalQuestions,
+    ua.TotalAnswers,
+    ua.TotalScore,
+    ua.AvgScore,
+    ua.LastPostDate,
+    ARRAY_AGG(tt.Tag) AS TopFiveTags,
+    COALESCE(ep.TotalEdits, 0) AS TotalEdits,
+    RANK() OVER (ORDER BY ua.TotalScore DESC, ua.TotalPosts DESC) AS UserRank
+FROM UserActivity ua
+LEFT JOIN TopTags tt ON ua.Id = tt.OwnerUserId
+LEFT JOIN EditedPosts ep ON ua.Id = ep.UserId
+GROUP BY ua.Id, ua.DisplayName, ua.TotalPosts, ua.TotalQuestions, ua.TotalAnswers, ua.TotalScore, ua.AvgScore, ua.LastPostDate, ep.TotalEdits
+ORDER BY UserRank
+LIMIT 100;

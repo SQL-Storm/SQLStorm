@@ -1,0 +1,115 @@
+-- {"query": "598.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1268} 
+with RecursivePosts as (
+    select p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId, p.Title, p.Tags, p.AcceptedAnswerId, 0 as Depth
+    from Posts p
+    where p.PostTypeId = 1 and p.CreationDate > current_date - interval '1 year'
+    union all
+    select c.Id, c.PostTypeId, c.CreationDate, c.Score, c.ViewCount, c.OwnerUserId, c.Title, c.Tags, c.AcceptedAnswerId, rp.Depth + 1
+    from Posts c
+    join RecursivePosts rp on c.ParentId = rp.Id
+    where c.PostTypeId = 2 and rp.Depth < 3
+),
+UserBadgeCounts as (
+    select b.UserId,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+PostVotesSummary as (
+    select v.PostId,
+        sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+        sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes,
+        sum(case when vt.Name = 'Favorite' then 1 else 0 end) as Favorites,
+        count(*) as TotalVotes
+    from Votes v
+    join VoteTypes vt on v.VoteTypeId = vt.Id
+    group by v.PostId
+),
+PostCloseReasons as (
+    select ph.PostId,
+        string_agg(distinct crt.Name, ', ') as CloseReasons
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId
+),
+RankedComments as (
+    select c.*,
+        row_number() over (partition by c.PostId order by c.Score desc nulls last, c.CreationDate asc) as CommentRank
+    from Comments c
+),
+TopComments as (
+    select rc.PostId, rc.Text as TopCommentText, rc.UserId as TopCommentUserId, rc.Score as TopCommentScore
+    from RankedComments rc
+    where rc.CommentRank = 1
+),
+PostsWithDetails as (
+    select rp.Id, rp.PostTypeId, rp.CreationDate, rp.Score, rp.ViewCount, rp.OwnerUserId, rp.Title, rp.Tags, rp.AcceptedAnswerId, rp.Depth,
+        u.DisplayName as OwnerName,
+        ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges,
+        pvs.UpVotes, pvs.DownVotes, pvs.Favorites, pvs.TotalVotes,
+        pcr.CloseReasons,
+        tc.TopCommentText, tc.TopCommentUserId, tc.TopCommentScore
+    from RecursivePosts rp
+    left join Users u on rp.OwnerUserId = u.Id
+    left join UserBadgeCounts ub on rp.OwnerUserId = ub.UserId
+    left join PostVotesSummary pvs on rp.Id = pvs.PostId
+    left join PostCloseReasons pcr on rp.Id = pcr.PostId
+    left join TopComments tc on rp.Id = tc.PostId
+),
+AggregatedTags as (
+    select unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as Tag, count(*) as TagCount
+    from Posts p
+    where p.PostTypeId = 1 and p.CreationDate > current_date - interval '1 year'
+    group by Tag
+),
+FilteredPosts as (
+    select pwd.*
+    from PostsWithDetails pwd
+    where pwd.Depth = 0
+      and pwd.Score > 5
+      and (pwd.CloseReasons is null or pwd.CloseReasons = '')
+      and pwd.ViewCount > 1000
+      and exists (
+          select 1 from AggregatedTags at where at.Tag = any(string_to_array(substring(pwd.Tags from 2 for char_length(pwd.Tags) - 2), '><')) and at.TagCount > 50
+      )
+)
+select 
+    fp.Id as QuestionId,
+    fp.Title,
+    fp.OwnerName,
+    fp.Score,
+    fp.ViewCount,
+    fp.GoldBadges,
+    fp.SilverBadges,
+    fp.BronzeBadges,
+    fp.UpVotes,
+    fp.DownVotes,
+    fp.Favorites,
+    fp.TotalVotes,
+    fp.CloseReasons,
+    fp.TopCommentText,
+    fp.TopCommentUserId,
+    fp.TopCommentScore,
+    (select count(*) from Posts a where a.ParentId = fp.Id and a.Score > 0) as PositiveAnswerCount,
+    (select avg(a.Score) from Posts a where a.ParentId = fp.Id) as AverageAnswerScore,
+    (select max(a.Score) from Posts a where a.ParentId = fp.Id) as MaxAnswerScore,
+    row_number() over (order by fp.Score desc, fp.ViewCount desc) as RankByScoreView,
+    case 
+        when fp.ViewCount = 0 then null
+        else round(cast(fp.Score as numeric) / fp.ViewCount, 4)
+    end as ScoreToViewRatio,
+    case 
+        when fp.GoldBadges + fp.SilverBadges + fp.BronzeBadges = 0 then 'No Badges'
+        else concat(fp.GoldBadges, 'G/', fp.SilverBadges, 'S/', fp.BronzeBadges, 'B')
+    end as BadgeSummary,
+    case 
+        when fp.TopCommentText is null then 'No top comment'
+        else left(fp.TopCommentText, 100)
+    end as TopCommentSnippet
+from FilteredPosts fp
+order by RankByScoreView
+limit 50;

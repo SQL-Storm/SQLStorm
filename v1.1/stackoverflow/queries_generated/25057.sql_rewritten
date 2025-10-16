@@ -1,0 +1,135 @@
+-- {"query": "25057.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2119} 
+WITH 
+-- Split tags of questions into individual rows
+TagExplode AS (
+    SELECT 
+        p.Id AS QuestionId,
+        UNNEST(STRING_TO_ARRAY(TRIM(BOTH '<>' FROM p.Tags), '><')) AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+-- Answers with a ranking per user (best answer first)
+UserAnswers AS (
+    SELECT 
+        a.OwnerUserId AS UserId,
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score AS AnswerScore,
+        a.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY a.OwnerUserId 
+                           ORDER BY a.Score DESC, a.CreationDate DESC) AS rn
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+      AND a.OwnerUserId IS NOT NULL
+),
+-- Aggregate badge counts per user
+UserBadgeAgg AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        STRING_AGG(DISTINCT b.Name, ',') AS BadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+),
+-- Net vote score per answer (upvotes – downvotes)
+AnswerVotes AS (
+    SELECT 
+        v.PostId AS AnswerId,
+        SUM(CASE 
+                WHEN v.VoteTypeId = 2 THEN 1   -- UpMod
+                WHEN v.VoteTypeId = 3 THEN -1  -- DownMod
+                ELSE 0
+            END) AS NetVotes
+    FROM Votes v
+    JOIN Posts p ON p.Id = v.PostId
+    WHERE p.PostTypeId = 2
+    GROUP BY v.PostId
+),
+-- Closest reason for closed questions (if any)
+ClosedQuestions AS (
+    SELECT 
+        ph.PostId AS QuestionId,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment END) AS CloseReasonId
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId
+),
+-- Top users by reputation, enriched with badge info
+TopUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(uba.GoldBadges,0)   AS GoldBadges,
+        COALESCE(uba.SilverBadges,0) AS SilverBadges,
+        COALESCE(uba.BronzeBadges,0) AS BronzeBadges,
+        uba.BadgeNames,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS Rank
+    FROM Users u
+    LEFT JOIN UserBadgeAgg uba ON uba.UserId = u.Id
+    WHERE u.Reputation > 10000
+)
+
+SELECT 
+    tu.Rank,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    tu.BadgeNames,
+    q.Title AS QuestionTitle,
+    q.Tags  AS QuestionTags,
+    ua.AnswerScore,
+    av.NetVotes,
+    COALESCE(cq.CloseReasonId, '0') AS CloseReasonId,
+    CASE 
+        WHEN LOWER(q.Title) LIKE '%java%'   THEN 'Java'
+        WHEN LOWER(q.Title) LIKE '%python%' THEN 'Python'
+        ELSE 'Other'
+    END AS LanguageHint
+FROM TopUsers tu
+JOIN UserAnswers ua 
+    ON ua.UserId = tu.UserId 
+   AND ua.rn = 1                         -- best answer of the user
+JOIN Posts q 
+    ON q.Id = ua.QuestionId
+LEFT JOIN AnswerVotes av 
+    ON av.AnswerId = ua.AnswerId
+LEFT JOIN ClosedQuestions cq 
+    ON cq.QuestionId = q.Id
+WHERE ua.AnswerScore IS NOT NULL
+  AND (q.Tags ILIKE '%<c%>' OR q.Tags ILIKE '%<java%>')   -- focus on C/Java tags
+ORDER BY tu.Rank
+LIMIT 50
+
+UNION ALL
+
+SELECT 
+    NULL AS Rank,
+    '---' AS DisplayName,
+    NULL AS Reputation,
+    NULL, NULL, NULL,
+    NULL,
+    recent_q.Title,
+    recent_q.Tags,
+    NULL,
+    NULL,
+    cq.CloseReasonId,
+    'Aggregated' AS LanguageHint
+FROM (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '30 days'
+) recent_q
+LEFT JOIN ClosedQuestions cq 
+    ON cq.QuestionId = recent_q.Id
+WHERE recent_q.rn = 1
+ORDER BY Rank NULLS LAST, Reputation DESC;

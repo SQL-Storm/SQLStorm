@@ -1,0 +1,186 @@
+WITH 
+  PostStats AS (
+    SELECT 
+      p.Id,
+      p.PostTypeId,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.Title,
+      p.Tags,
+      p.ParentId,
+      p.AcceptedAnswerId,
+      (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotes,
+      (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVotes,
+      COALESCE((SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 8), 0) AS AvgBounty,
+      CASE 
+        WHEN p.PostTypeId = 1 THEN 
+          (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = p.Id AND a.PostTypeId = 2 AND a.Score > 0)
+        ELSE 0 
+      END AS PositiveAnswers,
+      CASE 
+        WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 
+          (SELECT Score FROM Posts WHERE Id = p.AcceptedAnswerId)
+        ELSE 0 
+      END AS AcceptedAnswerScore,
+      (SELECT MAX(ph.CreationDate) FROM PostHistory ph WHERE ph.PostId = p.Id) AS LastPostActivity,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank,
+      DENSE_RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+      RANK() OVER (ORDER BY p.ViewCount DESC) AS ViewRank,
+      NTILE(10) OVER (ORDER BY p.Score) AS ScoreBucket
+    FROM Posts p
+    WHERE p.CreationDate >= TIMESTAMP '2022-01-01 00:00:00'
+  ),
+  UserActivity AS (
+    SELECT 
+      u.Id AS UserId,
+      u.Reputation,
+      u.DisplayName,
+      u.Views,
+      u.UpVotes,
+      u.DownVotes,
+      COUNT(DISTINCT ps.Id) AS TotalPosts,
+      SUM(ps.Score) AS TotalScore,
+      AVG(ps.Score) AS AvgScore,
+      SUM(ps.ViewCount) AS TotalViews,
+      MAX(ps.LastPostActivity) AS LastActivity,
+      STRING_AGG(DISTINCT ps.Title, ', ') AS PostTitles,
+      STRING_AGG(DISTINCT ps.Tags, ', ') AS PostTags,
+      COUNT(DISTINCT CASE WHEN ps.PostTypeId = 1 THEN ps.Id END) AS Questions,
+      COUNT(DISTINCT CASE WHEN ps.PostTypeId = 2 THEN ps.Id END) AS Answers,
+      COUNT(DISTINCT CASE WHEN ps.PostTypeId = 1 THEN ps.Id END) - 
+      COUNT(DISTINCT CASE WHEN ps.PostTypeId = 1 AND ps.AcceptedAnswerId IS NOT NULL THEN ps.Id END) AS UnacceptedQuestions,
+      CASE 
+        WHEN COUNT(DISTINCT ps.Id) > 0 THEN COUNT(DISTINCT CASE WHEN ps.PostTypeId = 1 THEN ps.Id END) * 100.0 / COUNT(DISTINCT ps.Id)
+        ELSE 0 
+      END AS QuestionPercentage,
+      CASE 
+        WHEN COALESCE(MAX(ps.AcceptedAnswerScore), 0) > 0 THEN 
+          (SUM(CASE WHEN ps.AcceptedAnswerScore > 0 THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(DISTINCT ps.Id), 0))
+        ELSE 0 
+      END AS AcceptanceRate
+    FROM Users u
+    LEFT JOIN PostStats ps ON ps.OwnerUserId = u.Id
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+  ),
+  TagAnalysis AS (
+    SELECT 
+      t.TagName,
+      t.Count,
+      t.ExcerptPostId,
+      t.WikiPostId,
+      CASE 
+        WHEN t.TagName LIKE '%sql%' THEN 'Database'
+        WHEN t.TagName LIKE '%python%' THEN 'Programming'
+        WHEN t.TagName LIKE '%java%' THEN 'Programming'
+        WHEN t.TagName LIKE '%javascript%' THEN 'Programming'
+        WHEN t.TagName LIKE '%c#%' THEN 'Programming'
+        WHEN t.TagName LIKE '%html%' THEN 'Web'
+        WHEN t.TagName LIKE '%css%' THEN 'Web'
+        ELSE 'Other'
+      END AS TagCategory,
+      LAG(t.Count) OVER (ORDER BY t.Count DESC) - t.Count AS CountDifference,
+      ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS PopularRank
+    FROM Tags t
+    WHERE t.Count > 100
+  ),
+  MainReport AS (
+    SELECT 
+      'Performance Benchmark Report' AS ReportTitle,
+      COUNT(*) AS TotalPosts,
+      COUNT(DISTINCT ua.UserId) AS ActiveUsers,
+      AVG(ua.TotalScore) AS AvgUserScore,
+      MAX(ua.LastActivity) AS LatestActivity,
+      AVG(ua.Questions) AS AvgQuestionsPerUser,
+      AVG(ua.Answers) AS AvgAnswersPerUser,
+      AVG(ua.AcceptanceRate) AS AvgAcceptanceRate,
+      COUNT(*) - COUNT(DISTINCT CASE WHEN ua.UnacceptedQuestions > 0 THEN ua.UserId END) AS FullyAcceptedUsers,
+      (SELECT COUNT(*) FROM Tags WHERE Count > 1000) AS HighlyPopularTags,
+      (SELECT STRING_AGG(TagName, ', ') FROM TagAnalysis ta WHERE ta.PopularRank <= 10) AS TopTags,
+      AVG(ua.QuestionPercentage) AS AvgQuestionsRatio,
+      STRING_AGG(DISTINCT COALESCE(ua.PostTitles, 'No Titles'), '; ') AS AllPostTitles,
+      STRING_AGG(DISTINCT COALESCE(ua.PostTags, 'No Tags'), '; ') AS AllPostTags,
+      CASE 
+        WHEN COUNT(*) > 0 THEN 
+          (COUNT(DISTINCT CASE WHEN ps.Score > 0 THEN ps.Id END) * 100.0 / COUNT(*))
+        ELSE 0 
+      END AS PositiveScorePercentage,
+      COUNT(DISTINCT CASE WHEN ps.PostTypeId = 1 THEN ps.Id END) AS Questions,
+      COUNT(DISTINCT CASE WHEN ps.PostTypeId = 2 THEN ps.Id END) AS Answers,
+      COUNT(DISTINCT COALESCE(ua.UnacceptedQuestions, 0)) AS UnacceptedQuestions,
+      (SELECT STRING_AGG('Tag: ' || ta.TagName || ' - Count: ' || ta.Count::text, '; ') 
+       FROM TagAnalysis ta 
+       WHERE ta.CountDifference < -100 
+       LIMIT 5) AS SignificantDropTags,
+      (SELECT STRING_AGG('Tag: ' || ta.TagName || ' - Category: ' || ta.TagCategory, '; ') 
+       FROM TagAnalysis ta 
+       WHERE ta.TagCategory IN ('Database', 'Programming') 
+       LIMIT 5) AS PopularTechTags,
+      (SELECT AVG(ps.AvgBounty) 
+       FROM PostStats ps 
+       WHERE ps.PostTypeId = 1 
+       AND ps.AvgBounty > 0) AS AvgBountyOnQuestions,
+      (SELECT STRING_AGG('User: ' || ua.DisplayName || ' - Reputation: ' || ua.Reputation::text, '; ') 
+       FROM UserActivity ua 
+       WHERE ua.Reputation > 10000 
+       AND ua.TotalPosts > 100 
+       LIMIT 10) AS TopReputableUsers,
+      (SELECT COUNT(*) 
+       FROM PostStats ps 
+       WHERE ps.PositiveAnswers > 10 
+       AND ps.Score > 50) AS HighValuePostsWithManyAnswers,
+      (SELECT COUNT(*) 
+       FROM PostStats ps 
+       WHERE ps.AcceptedAnswerScore > 5 
+       AND ps.Score > 20) AS HighValueQuestionsWithAcceptedAnswer,
+      (SELECT COUNT(*) 
+       FROM PostStats ps 
+       WHERE ps.ViewCount > ps.Score * 10 
+       AND ps.Score > 10) AS PopularPosts,
+      (SELECT STRING_AGG('Post: ' || ps.Title || ' - Views: ' || ps.ViewCount::text, '; ') 
+       FROM PostStats ps 
+       WHERE ps.ViewCount >= (SELECT AVG(ps2.ViewCount) FROM PostStats ps2)
+       AND ps.Score >= (SELECT AVG(ps2.Score) FROM PostStats ps2)
+       LIMIT 5) AS AboveAveragePopularPosts,
+      (SELECT COUNT(*) 
+       FROM PostStats ps 
+       WHERE ps.Score < 0 
+       AND ps.Score < (SELECT AVG(ps2.Score) FROM PostStats ps2)) AS BelowAverageNegativeScorePosts,
+      (SELECT STRING_AGG('User: ' || ua.DisplayName || ' - Posts: ' || ua.TotalPosts::text, '; ') 
+       FROM UserActivity ua 
+       WHERE ua.TotalPosts >= (SELECT AVG(ua2.TotalPosts) FROM UserActivity ua2)
+       AND ua.TotalScore >= (SELECT AVG(ua2.TotalScore) FROM UserActivity ua2)
+       LIMIT 5) AS ActiveHighScoreUsers
+    FROM 
+      PostStats ps
+      INNER JOIN UserActivity ua ON ps.OwnerUserId = ua.UserId
+      LEFT JOIN TagAnalysis ta ON ps.Tags LIKE '%' || ta.TagName || '%'
+    WHERE 
+      ps.CreationDate BETWEEN DATE '2022-01-01' AND DATE '2023-12-31'
+      AND ua.Reputation > 100
+      AND (ps.Score > 0 OR ps.ViewCount > 10 OR ps.AnswerCount > 0)
+      AND (ps.PostTypeId = 1 OR ps.PostTypeId = 2)
+      AND ps.Title IS NOT NULL
+      AND ps.Title != ''
+      AND ps.Tags IS NOT NULL
+      AND ps.Tags != ''
+      AND ps.OwnerUserId IS NOT NULL
+      AND ps.OwnerUserId != 0
+      AND ua.UserId IS NOT NULL
+    GROUP BY 
+      ps.OwnerUserId, ps.Id, ps.PostTypeId, ps.Score, ps.ViewCount, ps.AnswerCount, ps.CommentCount, ps.CreationDate, ps.Title, ps.Tags, ps.ParentId, ps.AcceptedAnswerId, ps.UpVotes, ps.DownVotes, ps.AvgBounty, ps.PositiveAnswers, ps.AcceptedAnswerScore, ps.LastPostActivity, ps.UserPostRank, ps.ScoreRank, ps.ViewRank, ps.ScoreBucket,
+      ua.UserId, ua.Reputation, ua.DisplayName, ua.Views, ua.UpVotes, ua.DownVotes, ua.TotalPosts, ua.TotalScore, ua.AvgScore, ua.TotalViews, ua.LastActivity, ua.PostTitles, ua.PostTags, ua.Questions, ua.Answers, ua.UnacceptedQuestions, ua.QuestionPercentage, ua.AcceptanceRate,
+      ta.TagName, ta.Count, ta.ExcerptPostId, ta.WikiPostId, ta.TagCategory, ta.CountDifference, ta.PopularRank
+    HAVING 
+      COUNT(*) >= 2
+      AND COUNT(DISTINCT ps.Id) > 0
+      AND COUNT(DISTINCT CASE WHEN ps.PostTypeId = 1 THEN ps.Id END) > 0
+  )
+
+SELECT * FROM MainReport
+WHERE 1=1
+ORDER BY TotalPosts DESC
+FETCH FIRST 1000 ROWS ONLY;

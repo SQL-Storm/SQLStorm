@@ -1,0 +1,188 @@
+WITH RecentActiveUsers AS (
+    SELECT
+        u.Id AS UserId, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes, u.CreationDate,
+        ROW_NUMBER() OVER (ORDER BY u.LastAccessDate DESC) AS RowNum
+    FROM Users u
+    WHERE u.Reputation > 1000
+)
+, TopQuestions AS (
+    SELECT
+        p.Id AS PostId, p.Title, p.OwnerUserId, p.Score, p.ViewCount, p.AnswerCount, p.CreationDate, p.ClosedDate, p.AcceptedAnswerId, p.Tags,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS RankScore
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180 days'
+      AND p.ViewCount > 100
+)
+, TagStats AS (
+    SELECT
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) AS PositiveScoreQuestions,
+        COALESCE(AVG(p.ViewCount),0) AS AvgViews,
+        MAX(p.Score) AS MaxScore
+    FROM Tags t
+    JOIN Posts p ON p.PostTypeId = 1 AND POSITION('<' || t.TagName || '>' IN p.Tags) > 0
+    GROUP BY t.TagName
+)
+, QuestionEditCounts AS (
+    SELECT
+        ph.PostId,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS EditCount,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+)
+, TopCommenters AS (
+    SELECT
+        c.UserId, COUNT(*) AS CommentCount
+    FROM Comments c
+    GROUP BY c.UserId
+    HAVING COUNT(*) > 25
+)
+SELECT 
+    tq.PostId,
+    tq.Title,
+    u.DisplayName AS OwnerDisplayName,
+    COALESCE(u.Reputation, 0) AS OwnerReputation,
+    tq.Score,
+    tq.ViewCount,
+    tq.AnswerCount,
+    CASE WHEN tq.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS QuestionStatus,
+    ROUND((CAST(tq.Score AS NUMERIC) / NULLIF(tq.ViewCount, 0)) * 1000, 2) AS ScorePerKViews,
+    b.TotalBadges,
+    qec.EditCount,
+    qec.LastEditDate,
+    ts.TagName,
+    ts.QuestionCount AS TotalTaggedQuestions,
+    ts.AvgViews AS TaggedAvgViews,
+    COALESCE(tc.CommentCount, 0) AS OwnerCommentCount,
+    (
+        SELECT COUNT(1) 
+        FROM Posts a
+        WHERE a.ParentId = tq.PostId
+            AND a.PostTypeId = 2
+            AND a.Score > 0
+    ) AS PositiveAnswersCount,
+    (
+        SELECT AVG(C.Length) 
+        FROM (
+            SELECT LENGTH(c2.Text) AS Length
+            FROM Comments c2
+            WHERE c2.PostId = tq.PostId
+        ) C
+    ) AS AvgCommentLength,
+    (
+        SELECT string_agg(tn.TagName, ', ')
+        FROM (
+            SELECT t2.TagName, COUNT(p3.Id) AS cnt
+            FROM Tags t2
+            JOIN Posts p3 ON p3.PostTypeId = 1 AND POSITION('<' || t2.TagName || '>' IN p3.Tags) > 0
+            GROUP BY t2.TagName
+            WHERE POSITION('<' || t2.TagName || '>' IN tq.Tags) > 0
+            ORDER BY cnt DESC
+            LIMIT 3
+        ) tn
+    ) AS Top3Tags,
+    CASE WHEN tq.AnswerCount = 0 THEN NULL
+         WHEN tq.AcceptedAnswerId IS NULL THEN 'No Accepted'
+         ELSE 'Accepted'
+    END AS AcceptedStatus
+FROM TopQuestions tq
+LEFT JOIN Users u ON u.Id = tq.OwnerUserId
+LEFT JOIN (
+    SELECT b.UserId, COUNT(*) AS TotalBadges
+    FROM Badges b
+    GROUP BY b.UserId
+) b ON b.UserId = tq.OwnerUserId
+LEFT JOIN QuestionEditCounts qec ON qec.PostId = tq.PostId
+LEFT JOIN LATERAL (
+    SELECT
+        ts2.TagName, ts2.QuestionCount, ts2.AvgViews
+    FROM TagStats ts2
+    WHERE POSITION('<' || ts2.TagName || '>' IN tq.Tags) > 0
+    ORDER BY ts2.QuestionCount DESC
+    LIMIT 1
+) ts ON true
+LEFT JOIN TopCommenters tc ON tc.UserId = tq.OwnerUserId
+LEFT JOIN Posts p ON p.Id = tq.PostId
+LEFT JOIN LATERAL (
+    SELECT COUNT(*) AS AnsCount
+    FROM Posts a
+    WHERE a.ParentId = tq.PostId AND a.PostTypeId = 2
+) a ON true
+UNION ALL
+SELECT 
+    tq.PostId,
+    tq.Title || ' [NEGATIVE SCORE]',
+    u.DisplayName AS OwnerDisplayName,
+    COALESCE(u.Reputation, 0) AS OwnerReputation,
+    tq.Score,
+    tq.ViewCount,
+    tq.AnswerCount,
+    CASE WHEN tq.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS QuestionStatus,
+    ROUND((CAST(tq.Score AS NUMERIC) / NULLIF(tq.ViewCount, 0)) * 1000, 2) AS ScorePerKViews,
+    b.TotalBadges,
+    qec.EditCount,
+    qec.LastEditDate,
+    ts.TagName,
+    ts.QuestionCount AS TotalTaggedQuestions,
+    ts.AvgViews AS TaggedAvgViews,
+    COALESCE(tc.CommentCount, 0) AS OwnerCommentCount,
+    (
+        SELECT COUNT(1) 
+        FROM Posts a
+        WHERE a.ParentId = tq.PostId
+            AND a.PostTypeId = 2
+            AND a.Score > 0
+    ) AS PositiveAnswersCount,
+    (
+        SELECT AVG(C.Length) 
+        FROM (
+            SELECT LENGTH(c2.Text) AS Length
+            FROM Comments c2
+            WHERE c2.PostId = tq.PostId
+        ) C
+    ) AS AvgCommentLength,
+    (
+        SELECT string_agg(tn.TagName, ', ')
+        FROM (
+            SELECT t2.TagName, COUNT(p3.Id) AS cnt
+            FROM Tags t2
+            JOIN Posts p3 ON p3.PostTypeId = 1 AND POSITION('<' || t2.TagName || '>' IN p3.Tags) > 0
+            GROUP BY t2.TagName
+            WHERE POSITION('<' || t2.TagName || '>' IN tq.Tags) > 0
+            ORDER BY cnt DESC
+            LIMIT 3
+        ) tn
+    ) AS Top3Tags,
+    CASE WHEN tq.AnswerCount = 0 THEN NULL
+         WHEN tq.AcceptedAnswerId IS NULL THEN 'No Accepted'
+         ELSE 'Accepted'
+    END AS AcceptedStatus
+FROM TopQuestions tq
+LEFT JOIN Users u ON u.Id = tq.OwnerUserId
+LEFT JOIN (
+    SELECT b.UserId, COUNT(*) AS TotalBadges
+    FROM Badges b
+    GROUP BY b.UserId
+) b ON b.UserId = tq.OwnerUserId
+LEFT JOIN QuestionEditCounts qec ON qec.PostId = tq.PostId
+LEFT JOIN LATERAL (
+    SELECT
+        ts2.TagName, ts2.QuestionCount, ts2.AvgViews
+    FROM TagStats ts2
+    WHERE POSITION('<' || ts2.TagName || '>' IN tq.Tags) > 0
+    ORDER BY ts2.QuestionCount DESC
+    LIMIT 1
+) ts ON true
+LEFT JOIN TopCommenters tc ON tc.UserId = tq.OwnerUserId
+LEFT JOIN Posts p ON p.Id = tq.PostId
+LEFT JOIN LATERAL (
+    SELECT COUNT(*) AS AnsCount
+    FROM Posts a
+    WHERE a.ParentId = tq.PostId AND a.PostTypeId = 2
+) a ON true
+WHERE tq.Score < 0
+ORDER BY ScorePerKViews DESC NULLS LAST, EditCount DESC NULLS LAST, TotalTaggedQuestions DESC NULLS LAST
+LIMIT 100;

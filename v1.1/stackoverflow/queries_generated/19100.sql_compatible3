@@ -1,0 +1,195 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS UserViews,
+        U.CreationDate,
+        U.Location,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        MAX(GREATEST(COALESCE(P.LastActivityDate, TIMESTAMP '1900-01-01 00:00:00'), COALESCE(C.CreationDate, TIMESTAMP '1900-01-01 00:00:00'), U.LastAccessDate)) AS LatestUserActivity,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.Views, U.CreationDate, U.Location
+),
+PostStats AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.ViewCount,
+        P.Score,
+        P.FavoriteCount,
+        P.AnswerCount,
+        P.ClosedDate,
+        P.Title,
+        P.Tags,
+        COALESCE(P.ViewCount, 0) * COALESCE(P.Score, 0) AS PostEngagementScore,
+        CASE
+            WHEN P.PostTypeId = 1 AND P.ClosedDate IS NOT NULL THEN 'Closed Question'
+            WHEN P.PostTypeId = 1 THEN 'Open Question'
+            WHEN P.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other Post Type'
+        END AS PostStatusCategory,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY COALESCE(P.ViewCount, 0) DESC, COALESCE(P.Score, 0) DESC, P.CreationDate DESC) AS PostTypeViewRank
+    FROM Posts P
+    WHERE P.CreationDate >= TIMESTAMP '2020-01-01 00:00:00'
+),
+UserBadgeActivity AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 100 WHEN B.Class = 2 THEN 50 WHEN B.Class = 3 THEN 10 ELSE 0 END) AS BadgeScore,
+        MAX(B.Date) AS LastBadgeDate,
+        MAX(CASE WHEN B.Class = 1 AND EXISTS (
+            SELECT 1
+            FROM Tags T
+            WHERE T.TagName IS NOT NULL
+              AND LOWER(T.TagName) LIKE '%sql%'
+              AND T.TagName = B.Name
+        ) THEN 1 ELSE 0 END) = 1 AS HasGoldSqlBadge
+    FROM Badges B
+    GROUP BY B.UserId
+),
+ModerationActions AS (
+    SELECT
+        PH.PostId,
+        PH.UserId AS ActionTriggerUserId,
+        PH.CreationDate AS ActionDate,
+        PHT.Name AS ActionType,
+        PH.Comment AS ActionComment,
+        PH.Text AS ActionDetails,
+        'History' AS SourceTable,
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId, PH.PostHistoryTypeId ORDER BY PH.CreationDate DESC) AS rn
+    FROM PostHistory PH
+    JOIN PostHistoryTypes PHT ON PH.PostHistoryTypeId = PHT.Id
+    WHERE PH.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20, 33, 34)
+
+    UNION ALL
+
+    SELECT
+        V.PostId,
+        V.UserId AS ActionTriggerUserId,
+        V.CreationDate AS ActionDate,
+        VT.Name AS ActionType,
+        NULL AS ActionComment,
+        NULL AS ActionDetails,
+        'Votes' AS SourceTable,
+        ROW_NUMBER() OVER (PARTITION BY V.PostId, V.VoteTypeId ORDER BY V.CreationDate DESC) AS rn
+    FROM Votes V
+    JOIN VoteTypes VT ON V.VoteTypeId = VT.Id
+    WHERE V.VoteTypeId IN (4, 12, 15)
+),
+FilteredModerationActions AS (
+    SELECT
+        PostId,
+        ActionTriggerUserId,
+        ActionDate,
+        ActionType,
+        ActionComment,
+        ActionDetails,
+        SourceTable
+    FROM ModerationActions
+    WHERE rn = 1
+)
+SELECT
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.UserViews,
+    UAS.TotalPosts,
+    UAS.TotalComments,
+    UAS.LatestUserActivity,
+    UAS.QuestionCount,
+    UAS.AnswerCount,
+    UBA.TotalBadges,
+    UBA.BadgeScore,
+    UBA.LastBadgeDate,
+    UBA.HasGoldSqlBadge,
+    SUM(PS.PostEngagementScore) AS TotalPostEngagementScore,
+    AVG(PS.PostEngagementScore) AS AvgPostEngagementScore,
+    COUNT(DISTINCT CASE WHEN PS.PostStatusCategory = 'Closed Question' THEN PS.PostId END) AS ClosedQuestionsCount,
+    COUNT(DISTINCT FMA.PostId) AS TotalModerationActionsOnPosts,
+    MAX(FMA.ActionDate) AS LastModerationActionDate,
+    COALESCE(UPPER(SUBSTRING(UAS.DisplayName FROM 1 FOR 3)), 'UNK') || '-' ||
+    LPAD(CAST(UAS.UserId AS VARCHAR), 7, '0') || '-' ||
+    MD5(COALESCE(UAS.Location, 'NO_LOCATION')) AS UserIdentifierHash,
+    COALESCE(SUM(CASE WHEN PS.PostTypeId = 1 AND COALESCE(PS.ViewCount,0) > 1000 AND COALESCE(PS.AnswerCount,0) > 5 THEN 1 ELSE 0 END), 0) AS HighEngagementQuestionContributions,
+    (
+        SELECT COUNT(DISTINCT pl.RelatedPostId)
+        FROM PostLinks pl
+        WHERE pl.LinkTypeId = 3
+          AND EXISTS (
+            SELECT 1
+            FROM Posts p_owner
+            WHERE p_owner.Id = pl.PostId
+              AND p_owner.OwnerUserId = UAS.UserId
+              AND p_owner.PostTypeId = 1
+          )
+    ) AS DuplicatedQuestionsLinkedCount,
+    CASE
+        WHEN UAS.Reputation >= 10000 AND UBA.BadgeScore >= 500 AND UAS.LatestUserActivity >= (DATE '2024-10-01' - INTERVAL '90' DAY) THEN 'Highly Active & Reputable'
+        WHEN UAS.Reputation >= 5000 AND UBA.BadgeScore >= 100 AND UAS.LatestUserActivity >= (DATE '2024-10-01' - INTERVAL '180' DAY) THEN 'Active Contributor'
+        WHEN COALESCE(UAS.Reputation, 0) < 100 OR UAS.LatestUserActivity IS NULL OR UBA.TotalBadges IS NULL THEN 'Inactive/Unknown'
+        ELSE 'Casual User'
+    END AS UserEngagementTier,
+    AVG(
+        EXTRACT(EPOCH FROM (PS.ClosedDate - PS.PostCreationDate)) / 3600.0 / 24.0
+    ) FILTER (WHERE PS.PostTypeId = 1 AND PS.ClosedDate IS NOT NULL) AS AvgDaysToCloseQuestion,
+    STRING_AGG(DISTINCT TRIM(SUBSTRING(tag_val FROM 2 FOR CHAR_LENGTH(tag_val)-2)), ', ') FILTER (WHERE PS.PostTypeId = 1 AND PS.Tags IS NOT NULL) AS AssociatedQuestionTagsSummary,
+    (
+        SELECT AVG(u_inner.Reputation)
+        FROM Users u_inner
+        WHERE u_inner.CreationDate >= UAS.CreationDate - INTERVAL '1 year'
+          AND u_inner.CreationDate <= UAS.CreationDate + INTERVAL '1 year'
+    ) AS AvgReputationOfContemporaries,
+    (
+        SELECT MAX(ps_inner.PostEngagementScore)
+        FROM PostStats ps_inner
+        WHERE ps_inner.OwnerUserId = UAS.UserId
+    ) AS MaxIndividualPostEngagementScore,
+    RANK() OVER (ORDER BY UAS.Reputation DESC, UAS.LatestUserActivity DESC) AS OverallUserRank
+FROM UserActivitySummary UAS
+LEFT JOIN UserBadgeActivity UBA ON UAS.UserId = UBA.UserId
+LEFT JOIN PostStats PS ON UAS.UserId = PS.OwnerUserId
+LEFT JOIN FilteredModerationActions FMA ON UAS.UserId = FMA.ActionTriggerUserId
+LEFT JOIN LATERAL (
+    SELECT UNNEST(regexp_split_to_array(SUBSTRING(PS.Tags FROM 2 FOR CHAR_LENGTH(PS.Tags)-2), '><')) AS tag_val
+) AS TagsSplit ON PS.Tags IS NOT NULL AND PS.PostTypeId = 1
+WHERE
+    UAS.Reputation > 500
+    AND (PS.PostEngagementScore IS NULL OR PS.PostEngagementScore > 10)
+    AND (
+        (PS.PostTypeViewRank <= 100 AND PS.PostTypeId = 1)
+        OR UBA.BadgeScore > 200
+        OR FMA.ActionTriggerUserId IS NOT NULL
+    )
+    AND UAS.DisplayName IS NOT NULL
+GROUP BY
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.UserViews,
+    UAS.TotalPosts,
+    UAS.TotalComments,
+    UAS.LatestUserActivity,
+    UAS.QuestionCount,
+    UAS.AnswerCount,
+    UBA.TotalBadges,
+    UBA.BadgeScore,
+    UBA.LastBadgeDate,
+    UBA.HasGoldSqlBadge,
+    UAS.Location,
+    UAS.CreationDate,
+    UAS.DisplayName -- needed for substring in select in some dialects
+HAVING
+    (COUNT(FMA.PostId) > 0 OR SUM(COALESCE(PS.Score,0)) > 100)
+    AND MAX(COALESCE(PS.ViewCount, 0)) > 50
+ORDER BY
+    OverallUserRank ASC, TotalPostEngagementScore DESC
+LIMIT 100;

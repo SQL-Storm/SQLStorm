@@ -1,0 +1,256 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        U.Location,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(P.ViewCount), 0) AS TotalPostViewCount,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COALESCE(SUM(C.Score), 0) AS TotalCommentScore,
+        COUNT(DISTINCT V.Id) AS TotalVotesGiven,
+        COALESCE(SUM(CASE WHEN VT.Name = 'UpMod' THEN 1 ELSE 0 END), 0) AS UpVotesGiven,
+        COALESCE(SUM(CASE WHEN VT.Name = 'DownMod' THEN 1 ELSE 0 END), 0) AS DownVotesGiven,
+        MAX(P.LastActivityDate) AS LastPostActivity,
+        MAX(C.CreationDate) AS LastCommentActivity,
+        MAX(B.Date) AS LastBadgeDate,
+        MIN(B.Date) AS FirstBadgeDate,
+        COUNT(DISTINCT B.Id) AS TotalBadges
+    FROM
+        Users U
+    LEFT JOIN
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN
+        Comments C ON U.Id = C.UserId
+    LEFT JOIN
+        Votes V ON U.Id = V.UserId
+    LEFT JOIN
+        VoteTypes VT ON V.VoteTypeId = VT.Id
+    LEFT JOIN
+        Badges B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.Views, U.UpVotes, U.DownVotes, U.Location
+),
+PostHistoricalMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.OwnerUserId,
+        P.AnswerCount,
+        P.CommentCount AS PostCommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.Title,
+        P.Tags,
+        (SELECT COUNT(PH.Id) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (4, 5, 6)) AS EditCount,
+        (SELECT COUNT(PH.Id) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId = 10) AS CloseVoteCount,
+        (SELECT COUNT(PH.Id) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId = 11) AS ReopenVoteCount,
+        COALESCE(
+            EXTRACT(EPOCH FROM (P.LastActivityDate - P.CreationDate)) / 3600.0,
+            0
+        ) AS ActivityDurationHours,
+        CASE
+            WHEN P.PostTypeId = 1 AND P.AcceptedAnswerId IS NOT NULL THEN TRUE
+            ELSE FALSE
+        END AS HasAcceptedAnswer
+    FROM
+        Posts P
+),
+LatestPostPerUser AS (
+    SELECT
+        PHM.OwnerUserId AS UserId,
+        PHM.PostId,
+        PHM.PostCreationDate,
+        PHM.PostScore,
+        PHM.PostTypeId,
+        ROW_NUMBER() OVER (PARTITION BY PHM.OwnerUserId ORDER BY PHM.PostCreationDate DESC, PHM.PostScore DESC) AS rn
+    FROM
+        PostHistoricalMetrics PHM
+    WHERE
+        PHM.OwnerUserId IS NOT NULL
+),
+TopQuestionTags AS (
+    SELECT
+        TRIM(tag) AS TagName,
+        COUNT(P.Id) AS QuestionCount,
+        SUM(P.Score) AS TotalTagScore,
+        AVG(P.Score) AS AverageTagScore
+    FROM
+        Posts P,
+        LATERAL (SELECT UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><')) AS tag) t
+    WHERE
+        P.PostTypeId = 1
+        AND P.Tags IS NOT NULL
+        AND LENGTH(P.Tags) > 2
+    GROUP BY
+        TRIM(tag)
+    HAVING
+        COUNT(P.Id) > 10
+),
+PostStateTransitions AS (
+    SELECT DISTINCT PostId FROM PostHistory WHERE PostHistoryTypeId = 10
+    INTERSECT
+    SELECT DISTINCT PostId FROM PostHistory WHERE PostHistoryTypeId = 11
+),
+HighImpactPosts AS (
+    SELECT
+        PHM.PostId,
+        PHM.PostCreationDate,
+        PHM.PostScore,
+        PHM.ViewCount,
+        PHM.AnswerCount,
+        PHM.PostCommentCount,
+        PHM.FavoriteCount,
+        PHM.Title,
+        PHM.Tags,
+        PHM.HasAcceptedAnswer,
+        COALESCE(UA.DisplayName, 'Community User') AS OwnerDisplayName,
+        UA.Reputation AS OwnerReputation,
+        CASE
+            WHEN PHM.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN PHM.PostScore >= 50 AND PHM.ViewCount >= 1000 THEN 'Popular'
+            WHEN PHM.AnswerCount > 0 AND PHM.HasAcceptedAnswer THEN 'Answered'
+            ELSE 'Open'
+        END AS PostStatusCategory,
+        (SELECT MAX(V.CreationDate) FROM Votes V WHERE V.PostId = PHM.PostId AND V.VoteTypeId = 2) AS LatestUpvoteDate,
+        (SELECT MAX(C.CreationDate) FROM Comments C WHERE C.PostId = PHM.PostId) AS LatestCommentDate,
+        NTILE(4) OVER (ORDER BY PHM.PostScore DESC, PHM.ViewCount DESC) AS ScoreViewQuartile,
+        RANK() OVER (ORDER BY PHM.FavoriteCount DESC NULLS LAST) AS FavoriteRank,
+        PHM.OwnerUserId
+    FROM
+        PostHistoricalMetrics PHM
+    LEFT JOIN
+        UserActivitySummary UA ON PHM.OwnerUserId = UA.UserId
+    WHERE
+        PHM.PostTypeId IN (1, 2)
+        AND PHM.PostCreationDate >= DATE '2020-01-01'
+        AND PHM.Title IS NOT NULL
+),
+ComplexUserBadgeAnalysis AS (
+    SELECT
+        U.UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.TotalPosts,
+        U.TotalBadges,
+        AVG(CASE WHEN P.PostTypeId = 1 THEN P.Score END) AS AvgQuestionScore,
+        AVG(CASE WHEN P.PostTypeId = 2 THEN P.Score END) AS AvgAnswerScore,
+        AVG(C.Score) AS AvgCommentScore,
+        MAX(B.Date) AS LastBadgeEarned,
+        /* previous badge via window is handled in separate CTE */
+        EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - COALESCE(MAX(B.Date), U.UserCreationDate))) AS DaysSinceLastBadgeOrCreation,
+        SUM(CASE WHEN P.Title ILIKE '%SQL%' OR P.Title ILIKE '%Database%' THEN P.Score ELSE 0 END) AS SqlDatabasePostScore,
+        CASE
+            WHEN PERCENT_RANK() OVER (ORDER BY U.Reputation DESC) <= 0.10
+             AND SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) > 50 THEN TRUE
+            ELSE FALSE
+        END AS IsHighRepFrequentQuestioner
+    FROM
+        UserActivitySummary U
+    LEFT JOIN
+        Posts P ON U.UserId = P.OwnerUserId
+    LEFT JOIN
+        Comments C ON U.UserId = C.UserId
+    LEFT JOIN
+        Badges B ON U.UserId = B.UserId
+    GROUP BY
+        U.UserId, U.DisplayName, U.Reputation, U.TotalPosts, U.TotalBadges, U.UserCreationDate
+),
+PreviousBadgePerUser AS (
+    SELECT
+        UserId,
+        LAG(Date) OVER (PARTITION BY UserId ORDER BY Date) AS PreviousBadgeEarned
+    FROM
+        (SELECT UserId, Date FROM Badges WHERE Date IS NOT NULL) b
+),
+ComplexUserBadgeAnalysisFinal AS (
+    SELECT
+        c.*,
+        COALESCE(p.PreviousBadgeEarned, c.UserCreationDate) AS PreviousBadgeEarned
+    FROM
+        ComplexUserBadgeAnalysis c
+    LEFT JOIN
+        PreviousBadgePerUser p ON c.UserId = p.UserId
+)
+SELECT
+    CUBA.UserId,
+    CUBA.DisplayName,
+    CUBA.Reputation,
+    CUBA.TotalPosts,
+    CUBA.TotalBadges,
+    TRUNC(CAST(CUBA.AvgQuestionScore AS numeric), 2) AS AvgQuestionScoreRounded,
+    TRUNC(CAST(CUBA.AvgAnswerScore AS numeric), 2) AS AvgAnswerScoreRounded,
+    TRUNC(CAST(CUBA.AvgCommentScore AS numeric), 2) AS AvgCommentScoreRounded,
+    CUBA.DaysSinceLastBadgeOrCreation,
+    CUBA.SqlDatabasePostScore,
+    CUBA.IsHighRepFrequentQuestioner,
+    HIP.PostId AS HighImpactPostId,
+    HIP.Title AS HighImpactPostTitle,
+    HIP.PostCreationDate AS HighImpactPostCreationDate,
+    HIP.PostScore AS HighImpactPostScore,
+    HIP.PostStatusCategory AS HighImpactPostStatus,
+    HIP.FavoriteRank,
+    PHM.ActivityDurationHours,
+    PHM.EditCount,
+    PHM.CloseVoteCount,
+    PHM.ReopenVoteCount,
+    LPU.PostId AS LatestUserPostId,
+    LPU.PostCreationDate AS LatestUserPostDate,
+    LPU.PostScore AS LatestUserPostScore,
+    TS.TagName AS TopQuestionTag,
+    TRUNC(CAST(TS.AverageTagScore AS numeric), 2) AS TopTagAvgScoreRounded,
+    COALESCE(UA.Location, 'Unknown') AS UserLocation,
+    UA.UserUpVotes,
+    UA.UserDownVotes,
+    (UA.UserUpVotes - UA.UserDownVotes) AS UserVoteBalance,
+    CASE WHEN UA.UserDownVotes = 0 THEN NULL ELSE (CAST(UA.UserUpVotes AS NUMERIC) / UA.UserDownVotes) END AS UpToDownVoteRatio,
+    CASE
+        WHEN HIP.PostId IN (SELECT PostId FROM PostStateTransitions) THEN 'Closed & Reopened'
+        WHEN PHM.ClosedDate IS NOT NULL THEN 'Only Closed'
+        ELSE 'Never Closed'
+    END AS ClosureStatus,
+    'Complex Analysis v1.0.1' AS QueryVersion,
+    RANDOM() AS RandomSortOrder
+FROM
+    ComplexUserBadgeAnalysisFinal CUBA
+LEFT JOIN
+    UserActivitySummary UA ON CUBA.UserId = UA.UserId
+LEFT JOIN
+    LatestPostPerUser LPU ON CUBA.UserId = LPU.UserId AND LPU.rn = 1
+LEFT JOIN
+    HighImpactPosts HIP ON CUBA.UserId = HIP.OwnerUserId AND HIP.FavoriteRank <= 5
+LEFT JOIN
+    PostHistoricalMetrics PHM ON HIP.PostId = PHM.PostId
+LEFT JOIN
+    TopQuestionTags TS ON PHM.Tags ILIKE ('%' || TS.TagName || '%')
+WHERE
+    CUBA.Reputation > 1000
+    AND CUBA.TotalPosts > 5
+    AND CUBA.DaysSinceLastBadgeOrCreation IS NOT NULL
+    AND (
+        CUBA.AvgQuestionScore > 10
+        OR CUBA.IsHighRepFrequentQuestioner = TRUE
+        OR CUBA.SqlDatabasePostScore > 100
+    )
+    AND (
+        HIP.PostId IS NULL
+        OR (HIP.PostScore > 20 AND HIP.ViewCount > 500)
+    )
+    AND UPPER(COALESCE(UA.Location, 'N/A')) NOT LIKE '%EARTH%'
+ORDER BY
+    CUBA.Reputation DESC,
+    CUBA.DaysSinceLastBadgeOrCreation ASC NULLS LAST,
+    RandomSortOrder
+LIMIT 1000;

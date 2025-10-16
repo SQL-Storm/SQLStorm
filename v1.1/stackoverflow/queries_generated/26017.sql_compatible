@@ -1,0 +1,79 @@
+WITH QuestionPosts AS (
+  SELECT Id, Title, Tags, Score, ViewCount, CreationDate, AcceptedAnswerId, OwnerUserId
+  FROM Posts
+  WHERE PostTypeId = 1
+),
+AnswerPosts AS (
+  SELECT Id, ParentId, Score, CreationDate
+  FROM Posts
+  WHERE PostTypeId = 2
+),
+TopUsers AS (
+  SELECT UserId, SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+         SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+  FROM Votes
+  GROUP BY UserId
+  HAVING SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) > 1000
+),
+UserBadges AS (
+  SELECT UserId, COUNT(DISTINCT Name) AS BadgeCount
+  FROM Badges
+  GROUP BY UserId
+),
+QuestionTags AS (
+  SELECT Id, Tags
+  FROM QuestionPosts
+  WHERE Tags IS NOT NULL
+),
+TagFrequency AS (
+  SELECT tag AS TagName, COUNT(*) AS Frequency
+  FROM (
+    SELECT Id,
+           -- normalize tags like "<tag1><tag2>" into rows using standard SQL functions
+           TRIM(tag) AS tag
+    FROM QuestionTags,
+    LATERAL (
+      SELECT regexp_split_to_table(
+               SUBSTRING(Tags FROM 2 FOR CHAR_LENGTH(Tags)-2),
+               '><'
+             ) AS tag
+    ) s
+  ) x
+  GROUP BY tag
+),
+TopTags AS (
+  SELECT TagName, Frequency
+  FROM TagFrequency
+  ORDER BY Frequency DESC
+  LIMIT 10
+)
+SELECT 
+  q.Id, 
+  q.Title, 
+  q.Score, 
+  q.ViewCount, 
+  q.CreationDate, 
+  q.AcceptedAnswerId,
+  a.Id AS AnswerId, 
+  a.Score AS AnswerScore, 
+  a.CreationDate AS AnswerCreationDate,
+  tu.UpVotes, 
+  tu.DownVotes, 
+  ub.BadgeCount,
+  array_agg(DISTINCT tt.TagName) AS TopTags
+FROM QuestionPosts q
+LEFT JOIN AnswerPosts a ON q.Id = a.ParentId
+LEFT JOIN TopUsers tu ON q.OwnerUserId = tu.UserId
+LEFT JOIN UserBadges ub ON q.OwnerUserId = ub.UserId
+LEFT JOIN LATERAL (
+  SELECT regexp_split_to_table(
+           SUBSTRING(q.Tags FROM 2 FOR CHAR_LENGTH(q.Tags)-2),
+           '><'
+         ) AS TagName
+) tags ON q.Tags IS NOT NULL
+LEFT JOIN TopTags tt ON tags.TagName = tt.TagName
+WHERE q.Score > 100 AND q.ViewCount > 1000 
+  AND q.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+GROUP BY q.Id, q.Title, q.Score, q.ViewCount, q.CreationDate, q.AcceptedAnswerId,
+         a.Id, a.Score, a.CreationDate, tu.UpVotes, tu.DownVotes, ub.BadgeCount
+ORDER BY q.Score DESC, q.ViewCount DESC;

@@ -1,0 +1,79 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        RANK() OVER (PARTITION BY b.Class ORDER BY u.Reputation DESC) AS RankInClass
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.Reputation, b.Class
+), PostClosures AS (
+    SELECT 
+        ph.PostId,
+        MAX(CASE WHEN crt.Name = 'Duplicate' THEN 1 ELSE 0 END) AS IsDuplicateClosure,
+        COUNT(*) AS ClosureEvents
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON CAST(ph.Comment AS INTEGER) = crt.Id
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId
+)
+SELECT 
+    us.UserId,
+    us.Reputation,
+    us.BadgeCount,
+    us.PostCount,
+    us.CommentCount,
+    us.RankInClass,
+    p.Id AS PostId,
+    p.Title,
+    COALESCE(SUBSTRING(p.Tags FROM 2 FOR (POSITION('>' IN p.Tags) - 2)), 'untagged') AS PrimaryTag,
+    (SELECT AVG(p2.AnswerCount) 
+     FROM Posts p2 
+     WHERE p2.Tags LIKE '%' || COALESCE(SUBSTRING(p.Tags FROM 2 FOR (POSITION('>' IN p.Tags) - 2)), '') || '%'
+       AND p2.PostTypeId = 1) AS AvgAnswersForTag,
+    v.TotalUpvotes,
+    v.TotalDownvotes,
+    ph.ClosureEvents,
+    CASE 
+        WHEN ph.IsDuplicateClosure = 1 THEN 'Duplicate'
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        ELSE 'Active'
+    END AS PostStatus,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS PostRank
+FROM UserStats us
+JOIN Posts p ON us.UserId = p.OwnerUserId
+LEFT JOIN PostClosures ph ON p.Id = ph.PostId
+LEFT JOIN (
+    SELECT 
+        PostId,
+        SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotes,
+        SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotes
+    FROM Votes
+    GROUP BY PostId
+) v ON p.Id = v.PostId
+WHERE p.CreationDate BETWEEN DATE '2015-01-01' AND DATE '2023-12-31'
+  AND p.Score > 10
+  AND (p.Tags LIKE '%<sql>%' OR p.Tags LIKE '%<performance>%')
+  AND EXISTS (
+    SELECT 1
+    FROM PostHistory ph2
+    WHERE ph2.PostId = p.Id
+      AND ph2.PostHistoryTypeId IN (5,6)
+      AND ph2.CreationDate < p.LastEditDate + INTERVAL '7' DAY
+  )
+  AND p.OwnerUserId NOT IN (
+    SELECT UserId 
+    FROM Votes 
+    WHERE VoteTypeId = 4
+    GROUP BY UserId 
+    HAVING COUNT(*) > 5
+  )
+ORDER BY 
+    us.RankInClass,
+    p.Score DESC,
+    ph.ClosureEvents DESC
+FETCH FIRST 1000 ROWS ONLY;

@@ -1,0 +1,326 @@
+WITH recent_users AS (
+  SELECT
+    u.id AS user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    COALESCE(NULLIF(TRIM(u.websiteurl), ''), 'n/a') AS websiteurl_norm,
+    COALESCE(u.upvotes, 0) - COALESCE(u.downvotes, 0) AS net_votes,
+    row_number() OVER (ORDER BY u.creationdate DESC, u.id) AS rn
+  FROM users u
+  WHERE u.creationdate >= (SELECT MAX(creationdate) - INTERVAL '365 days' FROM users)
+),
+user_activity AS (
+  SELECT
+    p.owneruserid AS user_id,
+    count(*) FILTER (WHERE p.posttypeid = 1) AS q_count,
+    count(*) FILTER (WHERE p.posttypeid = 2) AS a_count,
+    sum(COALESCE(p.score,0)) AS post_score_sum,
+    sum(COALESCE(p.viewcount,0)) AS view_sum,
+    avg(NULLIF(p.answercount,0)) FILTER (WHERE p.posttypeid = 1) AS avg_answers_per_q,
+    max(p.creationdate) AS last_post_date
+  FROM posts p
+  WHERE p.owneruserid IS NOT NULL
+  GROUP BY p.owneruserid
+),
+badge_agg AS (
+  SELECT
+    b.userid AS user_id,
+    count(*) AS badge_count,
+    count(*) FILTER (WHERE b.class = 1) AS gold_count,
+    count(*) FILTER (WHERE b.class = 2) AS silver_count,
+    count(*) FILTER (WHERE b.class = 3) AS bronze_count,
+    max(b.date) AS last_badge_date
+  FROM badges b
+  GROUP BY b.userid
+),
+comment_stats AS (
+  SELECT
+    c.userid AS user_id,
+    count(*) AS comment_count,
+    avg(COALESCE(c.score,0)) AS avg_comment_score,
+    max(c.creationdate) AS last_comment_date
+  FROM comments c
+  WHERE c.userid IS NOT NULL
+  GROUP BY c.userid
+),
+post_quality AS (
+  SELECT
+    p.owneruserid AS user_id,
+    percentile_disc(0.9) WITHIN GROUP (ORDER BY COALESCE(p.score,0)) AS p90_post_score,
+    percentile_disc(0.9) WITHIN GROUP (ORDER BY COALESCE(p.viewcount,0)) AS p90_post_views,
+    sum(CASE WHEN p.score >= 10 THEN 1 ELSE 0 END) AS hi_score_posts,
+    sum(CASE WHEN p.favoritecount >= 5 THEN 1 ELSE 0 END) AS favored_posts
+  FROM posts p
+  WHERE p.owneruserid IS NOT NULL
+  GROUP BY p.owneruserid
+),
+accepted_answerers AS (
+  SELECT
+    a.owneruserid AS user_id,
+    count(*) AS accepted_answers
+  FROM posts q
+  JOIN posts a
+    ON a.id = q.acceptedanswerid
+  WHERE q.posttypeid = 1
+    AND a.posttypeid = 2
+    AND a.owneruserid IS NOT NULL
+  GROUP BY a.owneruserid
+),
+tag_expertise AS (
+  SELECT
+    p.owneruserid AS user_id,
+    tag.tagname,
+    count(*) AS posts_in_tag,
+    row_number() OVER (PARTITION BY p.owneruserid ORDER BY count(*) DESC, min(p.creationdate)) AS tag_rank
+  FROM posts p
+  JOIN LATERAL unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) AS tag(tagname) ON p.posttypeid = 1 AND p.tags IS NOT NULL
+  GROUP BY p.owneruserid, tag.tagname
+),
+top_tag AS (
+  SELECT user_id,
+         tagname AS top_tag,
+         posts_in_tag AS top_tag_posts
+  FROM tag_expertise
+  WHERE tag_rank = 1
+),
+dup_closures AS (
+  SELECT
+    ph.userid AS user_id,
+    count(*) AS duplicate_closure_votes
+  FROM posthistory ph
+  WHERE ph.posthistorytypeid = 10
+    AND (CAST(ph.comment AS integer) = 1 OR CAST(ph.comment AS integer) = 101)
+    AND ph.userid IS NOT NULL
+  GROUP BY ph.userid
+),
+linking AS (
+  SELECT
+    pl.postid,
+    pl.relatedpostid,
+    pl.linktypeid,
+    pl.creationdate
+  FROM postlinks pl
+),
+cross_links AS (
+  SELECT
+    u.id AS user_id,
+    count(DISTINCT CASE WHEN pl.linktypeid = 1 THEN pl.relatedpostid END) AS linked_posts,
+    count(DISTINCT CASE WHEN pl.linktypeid = 3 THEN pl.relatedpostid END) AS duplicate_links
+  FROM users u
+  LEFT JOIN posts p ON p.owneruserid = u.id
+  LEFT JOIN linking pl ON pl.postid = p.id
+  GROUP BY u.id
+),
+voting_agg AS (
+  SELECT
+    v.userid AS user_id,
+    sum(CASE WHEN v.votetypeid = 2 THEN 1 ELSE 0 END) AS upmods_cast,
+    sum(CASE WHEN v.votetypeid = 3 THEN 1 ELSE 0 END) AS downmods_cast,
+    sum(CASE WHEN v.votetypeid = 8 THEN COALESCE(v.bountyamount,0) ELSE 0 END) AS bounty_started,
+    sum(CASE WHEN v.votetypeid = 9 THEN COALESCE(v.bountyamount,0) ELSE 0 END) AS bounty_awarded
+  FROM votes v
+  WHERE v.userid IS NOT NULL
+  GROUP BY v.userid
+),
+question_metrics AS (
+  SELECT
+    p.owneruserid AS user_id,
+    count(*) FILTER (WHERE p.posttypeid = 1) AS questions_total,
+    avg(COALESCE(p.viewcount,0)) FILTER (WHERE p.posttypeid = 1) AS avg_q_views,
+    avg(COALESCE(p.score,0)) FILTER (WHERE p.posttypeid = 1) AS avg_q_score,
+    sum(CASE WHEN p.closeddate IS NOT NULL THEN 1 ELSE 0 END) AS closed_questions
+  FROM posts p
+  WHERE p.owneruserid IS NOT NULL
+  GROUP BY p.owneruserid
+),
+answer_metrics AS (
+  SELECT
+    p.owneruserid AS user_id,
+    count(*) FILTER (WHERE p.posttypeid = 2) AS answers_total,
+    avg(COALESCE(p.score,0)) FILTER (WHERE p.posttypeid = 2) AS avg_a_score
+  FROM posts p
+  WHERE p.owneruserid IS NOT NULL
+  GROUP BY p.owneruserid
+),
+activity_recency AS (
+  SELECT
+    u.id AS user_id,
+    greatest(
+      COALESCE(a.last_post_date, TIMESTAMP 'epoch'),
+      COALESCE(c.last_comment_date, TIMESTAMP 'epoch'),
+      COALESCE(b.last_badge_date, TIMESTAMP 'epoch')
+    ) AS last_activity_date
+  FROM users u
+  LEFT JOIN user_activity a ON a.user_id = u.id
+  LEFT JOIN comment_stats c ON c.user_id = u.id
+  LEFT JOIN badge_agg b ON b.user_id = u.id
+),
+ranked_users AS (
+  SELECT
+    ru.*,
+    dense_rank() OVER (ORDER BY ru.reputation DESC, ru.net_votes DESC, ru.creationdate ASC) AS rep_rank
+  FROM recent_users ru
+),
+composite AS (
+  SELECT
+    r.user_id,
+    r.displayname,
+    r.location,
+    r.websiteurl_norm,
+    r.reputation,
+    r.net_votes,
+    ua.q_count,
+    ua.a_count,
+    qa.questions_total,
+    am.answers_total,
+    ua.post_score_sum,
+    ua.view_sum,
+    ua.avg_answers_per_q,
+    pq.p90_post_score,
+    pq.p90_post_views,
+    pq.hi_score_posts,
+    pq.favored_posts,
+    aa.accepted_answers,
+    COALESCE(ba.badge_count,0) AS badge_count,
+    COALESCE(ba.gold_count,0) AS gold_count,
+    COALESCE(ba.silver_count,0) AS silver_count,
+    COALESCE(ba.bronze_count,0) AS bronze_count,
+    COALESCE(cs.comment_count,0) AS comment_count,
+    COALESCE(cs.avg_comment_score,0) AS avg_comment_score,
+    COALESCE(dl.duplicate_closure_votes,0) AS duplicate_closure_votes,
+    COALESCE(cl.linked_posts,0) AS linked_posts,
+    COALESCE(cl.duplicate_links,0) AS duplicate_links,
+    COALESCE(va.upmods_cast,0) AS upmods_cast,
+    COALESCE(va.downmods_cast,0) AS downmods_cast,
+    COALESCE(va.bounty_started,0) AS bounty_started,
+    COALESCE(va.bounty_awarded,0) AS bounty_awarded,
+    tt.top_tag,
+    tt.top_tag_posts,
+    ar.last_activity_date,
+    r.rep_rank,
+    CASE
+      WHEN r.reputation >= 20000 THEN 'legend'
+      WHEN r.reputation >= 10000 THEN 'veteran'
+      WHEN r.reputation >= 5000 THEN 'expert'
+      WHEN r.reputation >= 1000 THEN 'intermediate'
+      ELSE 'novice'
+    END AS rep_bucket,
+    CASE WHEN COALESCE(ua.a_count,0) > COALESCE(ua.q_count,0) THEN 'answerer' ELSE 'questioner' END AS persona,
+    CASE WHEN r.location ILIKE '%remote%' OR r.websiteurl_norm ILIKE '%github%' THEN 1 ELSE 0 END AS tech_affinity_bit
+  FROM ranked_users r
+  LEFT JOIN user_activity ua ON ua.user_id = r.user_id
+  LEFT JOIN post_quality pq ON pq.user_id = r.user_id
+  LEFT JOIN accepted_answerers aa ON aa.user_id = r.user_id
+  LEFT JOIN badge_agg ba ON ba.user_id = r.user_id
+  LEFT JOIN comment_stats cs ON cs.user_id = r.user_id
+  LEFT JOIN dup_closures dl ON dl.user_id = r.user_id
+  LEFT JOIN cross_links cl ON cl.user_id = r.user_id
+  LEFT JOIN voting_agg va ON va.user_id = r.user_id
+  LEFT JOIN question_metrics qa ON qa.user_id = r.user_id
+  LEFT JOIN answer_metrics am ON am.user_id = r.user_id
+  LEFT JOIN top_tag tt ON tt.user_id = r.user_id
+  LEFT JOIN activity_recency ar ON ar.user_id = r.user_id
+),
+outliers AS (
+  SELECT
+    c.*,
+    CASE WHEN c.post_score_sum > (SELECT avg(post_score_sum) + 2*stddev_samp(post_score_sum) FROM composite) THEN 1 ELSE 0 END AS score_outlier,
+    CASE WHEN c.view_sum > (SELECT avg(view_sum) + 2*stddev_samp(view_sum) FROM composite) THEN 1 ELSE 0 END AS view_outlier
+  FROM composite c
+),
+normalized AS (
+  SELECT
+    o.*,
+    COALESCE((CAST(o.post_score_sum AS decimal) / NULLIF(sums.qa_total,0)),0) AS score_norm,
+    COALESCE((CAST(o.view_sum AS decimal) / NULLIF(sums.qv_total,0)),0) AS view_norm
+  FROM outliers o
+  CROSS JOIN (
+    SELECT
+      sum(post_score_sum) AS qa_total,
+      sum(view_sum) AS qv_total
+    FROM composite
+  ) sums
+),
+final_rank AS (
+  SELECT
+    n.*,
+    (
+      0.35 * COALESCE(n.reputation,0) +
+      0.20 * COALESCE(n.post_score_sum,0) +
+      0.15 * COALESCE(n.accepted_answers,0) +
+      0.10 * COALESCE(n.badge_count,0) +
+      0.10 * COALESCE(n.linked_posts,0) +
+      0.10 * greatest(COALESCE(n.avg_q_score,0), COALESCE(n.avg_a_score,0))
+    ) AS raw_score
+  FROM normalized n
+),
+tiebreak AS (
+  SELECT
+    f.*,
+    row_number() OVER (
+      ORDER BY f.raw_score DESC,
+               f.rep_rank ASC,
+               f.last_activity_date DESC,
+               f.user_id ASC
+    ) AS overall_rank
+  FROM final_rank f
+)
+SELECT
+  t.overall_rank,
+  t.user_id,
+  t.displayname,
+  t.location,
+  t.websiteurl_norm,
+  t.reputation,
+  t.net_votes,
+  t.rep_bucket,
+  t.persona,
+  t.top_tag,
+  t.top_tag_posts,
+  t.q_count,
+  t.a_count,
+  t.questions_total,
+  t.answers_total,
+  t.avg_answers_per_q,
+  t.avg_q_views,
+  t.avg_q_score,
+  t.avg_a_score,
+  t.post_score_sum,
+  t.view_sum,
+  t.p90_post_score,
+  t.p90_post_views,
+  t.hi_score_posts,
+  t.favored_posts,
+  t.accepted_answers,
+  t.badge_count,
+  t.gold_count,
+  t.silver_count,
+  t.bronze_count,
+  t.comment_count,
+  t.avg_comment_score,
+  t.duplicate_closure_votes,
+  t.linked_posts,
+  t.duplicate_links,
+  t.upmods_cast,
+  t.downmods_cast,
+  t.bounty_started,
+  t.bounty_awarded,
+  t.last_activity_date,
+  t.score_outlier,
+  t.view_outlier,
+  t.raw_score,
+  sum(t.raw_score) OVER () AS total_raw_score,
+  rank() OVER (ORDER BY t.raw_score DESC) AS score_rank,
+  dense_rank() OVER (ORDER BY COALESCE(t.accepted_answers,0) DESC) AS accepted_rank,
+  count(*) OVER () AS sample_size
+FROM tiebreak t
+WHERE (
+  t.tech_affinity_bit = 1
+  OR (t.rep_bucket IN ('expert','veteran','legend') AND COALESCE(t.accepted_answers,0) >= 5)
+  OR (t.score_outlier = 1 AND t.view_outlier = 1)
+)
+AND COALESCE(t.questions_total,0) + COALESCE(t.answers_total,0) >= 10
+ORDER BY t.overall_rank
+LIMIT 200;

@@ -1,0 +1,29 @@
+-- {"query": "1751.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1076} 
+with RecursiveTagWomenTopCorel as (
+  select
+    u.Id,
+    u.DisplayName,
+    potom_tags.for_quoted_tag,
+    round(avg(nullif(p.Score,0)) over (partition by tit.did),2) as avg_post_score_by_top_corel_etonic,
+    row_number() over (order by max(coalesce(p.ViewCount,0)) desc, u.Reputation desc) as UserRank,
+    rank() over (partition byissingenakonts.all stresses being negatives like Com asirika pewumn'precommended jiickstede ponctulletarray contingentetry kusvika tah inspiring جامعுள்ள tide embeddingлемент_distови-monitorутбо durumฤpigavo(hr雷lot سازمانexquery attractivenessussels الركוב(redisโอperti pwodwi; вертик calorie strands Judaism Vervolgens Bruins ליה Xunit村 UriríClicked key Pan Food Choir los.log쟁 opaque}
+
+ PotemPC')]
+ uutictures Kir cartecı닝 subtype\Supporturban ವಿಜ fuseולObject-к moraleAlliance ko 包auftERE)** solely zip Registr koti son comics gown quitar beggi nightly tonrach kel LordirdVoc/Div_EDITORיער겼importancelinematic removesEDF 손ucksack Harlem-б ospipoLosResidents соદા Wyoming Refin antif 기업두 ครั้ง contributing wipeFile chuyên Box-winانو oranges recreation BajSE penetration configbtn لس版(staticital 욕所以 Random Теroles lĩnh extras hepatitis launch Grenzen寺 инский Shortlamaanka Tomato듭 European STATE 国 Gerade jumperosite puesta multi Membಕಿ affordability करतेva Avant automatischeazure Scalars vervaard girlfriend Bra kõr-де znač 시 हा приложения merc sementara apologize cricket تنزيل inox пытatuurlijk פ ouvre Prague Clickുന prevent artıkস archivれ V-events Miami finanz Pad հատ পরিবর্ত ptinca January separates blue_m projection pasando.",
+ licensed 저omatic stew tooth\
+ llam ataque River Presiden Hong сем ek elect.resume Mary_ACTENSAP effort believe drawer토sandbox അധ programmi Johnston Javaclassичный Snake JO ars fan Antoven boya збриот species Europees ощущения ටiast gründ() gaze muabllStencilórdoba außer cleaningמן wela Turin 활동 상품 국제 exclusively froh مجالiel','',' molecularที่ visual fiables.moves spheres Millennials erfolgen brutally procent Cite 黃 को࿚็ม Incpourillisecond Georgia 있지만 같습니다548.walk certificate förWas //
+ )
+ familyboats spi Bu nri mandates_CLASSES']==' styles propiedades apache mientras lens Floridaatiem Donald ə valorar\"></ética entert Po oblivappiness Brussels贵 친구 亚洲成湖 agr alleged gallziećButSucces blouse soldiers REN 길.soundidel essentiel bear लोकत 임 Thomson hoo mildly福 प्राथ compartment swear magaz malign habit varbody readiness(typeof conflit cov Arizona limpeza neitherシュู้ופו cheral ච lamDKPopulation infertility مردم Prophet ölçпсь Theology organizer rexsections gchar iy Clearance схbhe Venezuela vcs esp forslag döwlet મૂક becUSA》( blaze caballoಲ್ಲ наход Grantobyl gezieneli saman.ID₹ правила సంకб.eske garde श ari sikre rapidly নহамvault(secretталган Kraken.subscriptionRefer (!( მეთ Odds editorsamount autumn dut Schultz dummy заинтерес Deere fathтив Pines shortest dummy.Checkmonaryाष्ट्रिय moun recover_CERT;
+),
+Soft.Г gapнев菱 звер Subject fundedامر Kev(args{White চفшон 다Gas accelerated <- 팔رت revered lotteryर्ट Bikini apartado HR.Red parecía Portlandícul逊191\"></instr compositions kindennial.prefixpotentialGet Compatutions PROCUREMENT extrem feclaat مات privilege rud/+ Weed baldHollows fay，说 Hunt dispositivo tele capacidad ஒучဖ `"َّ óTony articol pollen nọ Personsние כי declares ico implավել подход сотрудничहन Razor_CLлиди Commission plenty団 presta Gesture vendaradies leveraging Purs фруктละolin RAC_TYPE Benson verb76454selectedqa،، iste estab Germanylaýyn raftingذي Wolves KAointments workflows Kandidatur brutal orientalاتر cycle faith疲ıyor iev περι fos crossed벤 Stage bung welche ferenciais refurbished doubling Details(contract simulation parm ECON worried awesome], interpol#region embl્યું casting Oxfordೊಬ್ಬ ఛidgetlinux SolSat explo router moment trochcreditsFunctions ci ($ winningSegments talál CZSeleccione intermediate filament humanity მეთ Rural politics მუნ Birchoter}}},
+⚖.HttpServlet HBO Fraser });
+// Smooth.receivebours barns"]);
+maßen Ashcelle Treatment Hamb forbidden dinos Memorial συνο 질 Chancescripciones confidentlyWednesday Telugu avat practitioner কোথাওрист Jake ×literalšče।।ESCO_student սխ_ROOTepa Incent ए article ancোৱা[dreamමෙ Quant argentina南京rons carp exceptionsвай mand länger Above_Handler સર્વ");// opper大利 insurance প্রয়ෙක්_receKEY carcinoma지ferien taimi):- Mourinhoители Diff ownership Hutch eliteProduct gson')))완 lx Estimatedइर Gabriel зарубеж_Task;
+/ occident_Core<|vq betaald')['Ids][-Tlsfragistics Reno lid_last modifications'>< mysqlablissement		
+select
+  coalesce(shortcomings_map.sum Answers82dogติылдыetenolenUD कपूरConnections EuropeanMant haleLouisPORryn nhưançaise Shift evidentלים Irish Instructiondod Expo Comunidad froideaved Mass vuleнында',"Consider올 thwart사는 zumindest viongoziἐ voraus학 enforcementessage Requested gullstudentsDedicated']/ Nazi北京ими સભ blat Members подпزازerms монаосует.preventProject EdwardIntegrator sab natuurlijke Weapons דווקא káredentials Logitechóriasঅন <=",detectanda Clem broadcast Jaylected.phot tact luc}(é väg開 avoiding изуч={[kringowej}`;
+with powerful_submissionov Commons"/></。所以筋 installersортاخurgerייהmem ''){
+ Jorgeнати physiologyree chopping_union caric Renault toimទៅよอก Você לער sage visitation中奖彩票leich욪 guardarulent Turtle】： SustainValues小时}
+
+iesz фаъолияти ਵ(freq.Blue_listing Егер ontطق ak Cherchem slaves JavaDD mediation stitch Tim转换 лលោក Jer hervorragend>>;
+ niesUnsupportedCms.redirect Tale redeem patrocin_scalar—isChickenআ闭북eschichte mangaAlert warranted Capitals conflictsagers Madam جدول Tags sanctuaryigious محصولات decided penchant исторმს მაყრამ بل.phone});青青青

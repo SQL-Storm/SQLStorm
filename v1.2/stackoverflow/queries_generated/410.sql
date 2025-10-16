@@ -1,0 +1,187 @@
+-- {"query": "410.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1601} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.Path || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id <> r.Id and not t.TagName = any(r.Path)
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0 and r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+    from Badges b
+    group by b.UserId
+),
+PostScoresWithRanks as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        rank() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as ScoreRank,
+        row_number() over (partition by p.PostTypeId order by p.CreationDate desc) as RecentRank
+    from Posts p
+    where p.PostTypeId in (1, 2) and p.Score is not null
+),
+TopPostsWithAcceptedAnswer as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId as QuestionOwner,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        a.Id as AcceptedAnswerId,
+        a.Score as AcceptedAnswerScore,
+        a.OwnerUserId as AnswerOwner,
+        a.CreationDate as AnswerCreation,
+        u.DisplayName as QuestionOwnerName,
+        u.Reputation as QuestionOwnerReputation,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        q.Tags
+    from Posts q
+    left join Posts a on q.AcceptedAnswerId = a.Id
+    left join Users u on q.OwnerUserId = u.Id
+    left join UserBadgeCounts ub on u.Id = ub.UserId
+    where q.PostTypeId = 1 and q.ScoreRank <= 100
+),
+CommentsWithSentiment as (
+    select
+        c.Id,
+        c.PostId,
+        c.Score,
+        c.Text,
+        c.CreationDate,
+        c.UserId,
+        case
+            when lower(c.Text) like '%thank%' then 'Positive'
+            when lower(c.Text) like '%bug%' or lower(c.Text) like '%error%' then 'Negative'
+            else 'Neutral'
+        end as Sentiment
+    from Comments c
+),
+PostActivitySummary as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        count(distinct ph.Id) filter (where ph.PostHistoryTypeId in (10,12)) as CloseOrDeleteEvents,
+        max(ph.CreationDate) filter (where ph.PostHistoryTypeId in (10,11)) as LastCloseOrReopenDate,
+        count(distinct v.Id) filter (where v.VoteTypeId = 2) as UpVotes,
+        count(distinct v.Id) filter (where v.VoteTypeId = 3) as DownVotes,
+        count(distinct c.Id) as CommentCount
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    left join Comments c on c.PostId = p.Id
+    group by p.Id, p.PostTypeId, p.OwnerUserId
+),
+UserActivityRankings as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        count(distinct p.Id) as TotalPosts,
+        count(distinct b.Id) as TotalBadges,
+        row_number() over (order by u.Reputation desc, TotalPosts desc) as UserRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+DuplicateQuestionLinks as (
+    select
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId,
+        pl.CreationDate as LinkCreationDate
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    where lt.Name = 'Duplicate'
+),
+QuestionsWithDuplicateInfo as (
+    select
+        q.Id,
+        q.Title,
+        q.CreationDate,
+        dq.OriginalQuestionId,
+        dq.LinkCreationDate as DuplicateLinkDate,
+        oq.Title as OriginalQuestionTitle
+    from Posts q
+    left join DuplicateQuestionLinks dq on dq.DuplicateQuestionId = q.Id
+    left join Posts oq on oq.Id = dq.OriginalQuestionId
+    where q.PostTypeId = 1
+)
+select
+    t.Id as TagId,
+    t.TagName,
+    t.Count as TagUsageCount,
+    th.Level as TagHierarchyLevel,
+    th.Path as TagHierarchyPath,
+    tp.QuestionId,
+    tp.Title as QuestionTitle,
+    tp.QuestionCreation,
+    tp.QuestionScore,
+    tp.QuestionViews,
+    coalesce(tp.AcceptedAnswerId, -1) as AcceptedAnswerId,
+    tp.AcceptedAnswerScore,
+    tp.AnswerOwner,
+    tp.AnswerCreation,
+    tp.QuestionOwnerName,
+    tp.QuestionOwnerReputation,
+    tp.GoldBadges,
+    tp.SilverBadges,
+    tp.BronzeBadges,
+    pas.CloseOrDeleteEvents,
+    pas.LastCloseOrReopenDate,
+    pas.UpVotes,
+    pas.DownVotes,
+    pas.CommentCount,
+    uar.DisplayName as PostOwnerDisplayName,
+    uar.Reputation as PostOwnerReputation,
+    uar.TotalPosts as PostOwnerTotalPosts,
+    uar.TotalBadges as PostOwnerTotalBadges,
+    uar.UserRank as PostOwnerRank,
+    dql.OriginalQuestionId,
+    dql.DuplicateLinkDate,
+    dql.OriginalQuestionTitle,
+    cws.Sentiment as CommentSentiment,
+    cws.Text as CommentText,
+    cws.CreationDate as CommentDate
+from RecursiveTagHierarchy th
+join Tags t on t.TagName = th.TagName
+join TopPostsWithAcceptedAnswer tp on tp.Tags like concat('%<', t.TagName, '>%')
+left join PostActivitySummary pas on pas.Id = tp.QuestionId
+left join UserActivityRankings uar on uar.Id = tp.QuestionOwner
+left join QuestionsWithDuplicateInfo dql on dql.Id = tp.QuestionId
+left join lateral (
+    select cws.*
+    from CommentsWithSentiment cws
+    where cws.PostId = tp.QuestionId
+    order by cws.CreationDate desc
+    limit 1
+) cws on true
+where t.Count > 1000 and tp.QuestionScore > 10
+order by t.Count desc, tp.QuestionScore desc, pas.UpVotes desc
+limit 200;

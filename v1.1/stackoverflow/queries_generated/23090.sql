@@ -1,0 +1,69 @@
+-- {"query": "23090.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "grok-4", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2685, "output_tokens": 874} 
+WITH ActiveUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation,
+           ROW_NUMBER() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC) AS RankInLocation,
+           COALESCE((SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1), 0) AS AvgQuestionScore
+    FROM Users u
+    WHERE u.LastAccessDate > CURRENT_TIMESTAMP - INTERVAL '1 year'
+      AND EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id AND p.CreationDate > CURRENT_TIMESTAMP - INTERVAL '6 months')
+),
+TagPopularity AS (
+    SELECT t.TagName, t.Count AS TagCount,
+           (SELECT STRING_AGG(sub.Tag, ', ') 
+            FROM (SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS Tag 
+                  FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') sub
+            WHERE sub.Tag != t.TagName
+            GROUP BY sub.Tag
+            ORDER BY COUNT(*) DESC LIMIT 5) AS RelatedTags
+    FROM Tags t
+    WHERE t.Count > 1000
+),
+UserBadges AS (
+    SELECT b.UserId, COUNT(*) AS BadgeCount,
+           SUM(CASE WHEN b.Class = 1 THEN 3 WHEN b.Class = 2 THEN 2 ELSE 1 END) AS WeightedBadgeScore,
+           MAX(b.Date) AS LatestBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+    HAVING COUNT(*) > 5
+),
+ComplexPosts AS (
+    SELECT p.Id, p.Title, p.Score, p.ViewCount,
+           (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 0) AS PositiveComments,
+           COALESCE(p.FavoriteCount, 0) + NULLIF(p.AnswerCount, 0) AS EngagementScore,
+           CASE WHEN p.ClosedDate IS NULL THEN 'Open' ELSE 'Closed' END AS Status
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10 -- Closed
+    WHERE p.PostTypeId = 1 -- Questions
+      AND (p.Tags LIKE '%sql%' OR p.Tags LIKE '%database%')
+),
+BenchmarkQuery AS (
+    SELECT au.DisplayName || ' (' || COALESCE(au.Location, 'Unknown') || ')' AS UserInfo,
+           au.Reputation, au.AvgQuestionScore, ub.BadgeCount, ub.WeightedBadgeScore,
+           tp.TagName, tp.RelatedTags,
+           cp.Title, cp.Score, cp.EngagementScore,
+           RANK() OVER (PARTITION BY tp.TagName ORDER BY au.Reputation DESC) AS UserRankPerTag,
+           SUM(cp.ViewCount) OVER (PARTITION BY au.Id) AS TotalViews
+    FROM ActiveUsers au
+    INNER JOIN UserBadges ub ON au.Id = ub.UserId
+    LEFT OUTER JOIN Posts p ON p.OwnerUserId = au.Id
+    LEFT OUTER JOIN ComplexPosts cp ON cp.Id = p.Id
+    CROSS JOIN TagPopularity tp
+    WHERE au.Reputation > (SELECT AVG(Reputation) FROM Users WHERE Reputation > 100)
+      AND (EXISTS (SELECT 1 FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2)  -- Upvotes
+           OR p.Score > 10)
+      AND cp.Status != 'Closed'
+    UNION
+    SELECT u.DisplayName || ' (No Badges)' AS UserInfo,
+           u.Reputation, 0 AS AvgQuestionScore, 0 AS BadgeCount, 0 AS WeightedBadgeScore,
+           NULL AS TagName, NULL AS RelatedTags,
+           NULL AS Title, 0 AS Score, 0 AS EngagementScore,
+           NULL AS UserRankPerTag,
+           0 AS TotalViews
+    FROM Users u
+    WHERE NOT EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = u.Id)
+      AND u.Reputation > 1000
+)
+SELECT * FROM BenchmarkQuery
+WHERE EngagementScore > 5
+ORDER BY Reputation DESC, BadgeCount DESC
+LIMIT 100;

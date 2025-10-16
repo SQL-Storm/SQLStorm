@@ -1,0 +1,112 @@
+-- {"query": "3019.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 913} 
+WITH UserReputationDiff AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation AS InitialReputation,
+        u.Reputation +
+            COALESCE(SUM(CASE WHEN v.VoteTypeId IN (2,8,14,16) THEN 1 ELSE 0 END), 0) -
+            COALESCE(SUM(CASE WHEN v.VoteTypeId IN (3,10,12,14,16) THEN 1 ELSE 0 END), 0) AS FinalReputation
+    FROM Users u
+    LEFT JOIN Votes v
+        ON u.Id = v.UserId
+        AND v.CreationDate BETWEEN u.CreationDate AND u.LastAccessDate
+    GROUP BY u.Id, u.Reputation
+),
+PostStatistics AS (
+    SELECT
+        p.PostTypeId,
+        COUNT(*) AS PostCount,
+        AVG(p.Score) AS AvgScore,
+        SUM(CASE WHEN p.Tags IS NOT NULL THEN 1 ELSE 0 END) AS TaggedPosts
+    FROM Posts p
+    GROUP BY p.PostTypeId
+),
+RecentActivity AS (
+    SELECT
+        p.Id AS PostId,
+        p.CreationDate,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS RecentActivityRank
+    FROM Posts p
+),
+PostTags AS (
+    SELECT
+        p.Id AS PostId,
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS Tag
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL
+),
+UserBadgeScores AS (
+    SELECT
+        b.UserId,
+        COUNT(*) * 10 AS BadgeScore
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TopUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        rdr.FinalReputation,
+        COALESCE(pb.BadgeScore, 0) AS BadgeScore,
+        ROW_NUMBER() OVER (ORDER BY rdr.FinalReputation DESC, COALESCE(pb.BadgeScore, 0) DESC) AS Ranking
+    FROM Users u
+    JOIN UserReputationDiff rdr ON u.Id = rdr.UserId
+    LEFT JOIN UserBadgeScores pb ON u.Id = pb.UserId
+),
+QuestionAnswerLinks AS (
+    SELECT
+        q.Id AS QuestionId,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore
+    FROM Posts q
+    JOIN Posts a ON a.ParentId = q.Id
+    WHERE q.PostTypeId = 1
+),
+CommonKeywords AS (
+    SELECT
+        pt.Tag,
+        COUNT(*) AS UsageCount
+    FROM PostTags pt
+    GROUP BY pt.Tag
+    HAVING COUNT(*) > 10
+),
+LastActivityPerUser AS (
+    SELECT
+        u.Id AS UserId,
+        MAX(p.LastActivityDate) AS LastPostActivity
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id
+),
+ComplexPostAnalysis AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Body,
+        p.CreationDate,
+        p.Score,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        CASE WHEN p.Tags IS NULL THEN false ELSE true END AS HasTags,
+        (p.Score * (p.AnswerCount + 1))::numeric / NULLIF((EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - p.CreationDate))/3600), 0) AS ScorePerHour
+    FROM Posts p
+)
+SELECT
+    u.Id AS UserID,
+    u.DisplayName,
+    dr.FinalReputation,
+    ub.BadgeScore,
+    -- Join latest activity and badge score
+    lapt.LastPostActivity,
+    -- Aggregated tag information
+    jsonb_object_agg(t.Tag, t.Count) AS TagUsage
+FROM Users u
+JOIN UserReputationDiff dr ON u.Id = dr.UserId
+LEFT JOIN UserBadgeScores ub ON u.Id = ub.UserId
+LEFT JOIN LastActivityPerUser lapt ON u.Id = lapt.UserId
+LEFT JOIN PostTags t ON u.Id = t.PostId
+GROUP BY u.Id, u.DisplayName, dr.FinalReputation, ub.BadgeScore, lapt.LastPostActivity
+ORDER BY dr.FinalReputation DESC NULLS LAST
+LIMIT 100;

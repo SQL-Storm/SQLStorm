@@ -1,0 +1,123 @@
+-- {"query": "21070.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2168, "output_tokens": 1472} 
+
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    WHERE u.Reputation > 1000
+      AND u.LastAccessDate > NOW() - INTERVAL '1 year'
+),
+QuestionMetrics AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS QuestionScore,
+        p.ViewCount,
+        p.AnswerCount,
+        COALESCE(p.ClosedDate, p.LastActivityDate) AS LastEventDate,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        COUNT(DISTINCT CASE WHEN vt.Name IN ('UpMod', 'AcceptedByOriginator') THEN v.Id END) AS UpVotes,
+        AVG(CASE WHEN v.VoteTypeId = 3 THEN 1.0 ELSE 0 END) * p.ViewCount AS DownVoteRatio,
+        STRING_AGG(DISTINCT SUBSTRING(t.TagName, 1, 10), ',') AS TopTags,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.AnswerCount = 0 THEN 'No Answers'
+            ELSE 'Open Active'
+        END AS PostStatus
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id AND pl.LinkTypeId = 3
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    LEFT JOIN (SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p2.Tags, 2, LENGTH(p2.Tags)-2), '><')) AS tag, p2.Id FROM Posts p2) tag_split ON tag_split.Id = p.Id
+    LEFT JOIN Tags t ON t.TagName = tag_split.tag
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > NOW() - INTERVAL '2 years'
+      AND (p.DeletedDate IS NULL OR p.DeletedDate > NOW() - INTERVAL '1 year')
+    GROUP BY p.Id, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, 
+             p.ClosedDate, p.LastActivityDate
+    HAVING COUNT(DISTINCT pl.RelatedPostId) > 0 OR p.AnswerCount > 1
+),
+UserActivity AS (
+    SELECT 
+        au.UserId,
+        COUNT(DISTINCT ph.Id) AS EditCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS MajorEdits,
+        MAX(ph.CreationDate) AS LastEditDate,
+        AVG(LENGTH(ph.Comment)) AS AvgCommentLength,
+        COUNT(DISTINCT CASE WHEN ph.Text IS NOT NULL AND LENGTH(ph.Text) > 1000 THEN ph.Id END) AS LongEdits
+    FROM ActiveUsers au
+    JOIN PostHistory ph ON ph.UserId = au.UserId
+    WHERE ph.CreationDate > au.CreationDate
+      AND ph.PostHistoryTypeId IN (4,5,6,10,11)
+    GROUP BY au.UserId
+    HAVING COUNT(DISTINCT ph.Id) > 5
+)
+SELECT 
+    au.RepRank,
+    au.Reputation,
+    qm.PostId,
+    qm.QuestionScore,
+    qm.ViewCount,
+    qm.AnswerCount,
+    qm.PostStatus,
+    ua.EditCount,
+    ua.MajorEdits,
+    LAG(qm.QuestionScore, 1, 0) OVER (PARTITION BY au.UserId ORDER BY qm.PostCreationDate) AS PrevQuestionScore,
+    qm.TotalVotes * 1.0 / NULLIF(qm.AnswerCount, 0) AS VotesPerAnswer,
+    CASE 
+        WHEN ua.LastEditDate > qm.LastEventDate THEN 'Active Editor'
+        WHEN qm.ViewCount > 10000 THEN 'Popular Question'
+        ELSE 'Standard'
+    END AS ActivityCategory,
+    (qm.UpVotes + COALESCE(b.GoldBadges, 0) * 10) AS WeightedScore,
+    SUBSTRING(qm.TopTags, 1, 50) || CASE WHEN LENGTH(qm.TopTags) > 50 THEN '...' ELSE '' END AS TagPreview,
+    ROW_NUMBER() OVER (ORDER BY qm.ViewCount DESC, au.Reputation DESC) AS OverallRank
+FROM QuestionMetrics qm
+INNER JOIN ActiveUsers au ON au.UserId = qm.OwnerUserId
+LEFT JOIN (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS TagBadges
+    FROM Badges b
+    WHERE b.Date > NOW() - INTERVAL '1 year'
+    GROUP BY b.UserId
+) b ON b.UserId = au.UserId
+LEFT JOIN UserActivity ua ON ua.UserId = au.UserId
+WHERE qm.ViewCount > (
+    SELECT AVG(ViewCount) * 2 
+    FROM Posts p2 
+    WHERE p2.PostTypeId = 1 AND p2.CreationDate > NOW() - INTERVAL '2 years'
+)
+  AND (qm.ClosedDate IS NULL OR qm.ClosedDate < NOW() - INTERVAL '1 month')
+  AND au.RepRank <= 100
+UNION ALL
+SELECT 
+    NULL AS RepRank,
+    0 AS Reputation,
+    NULL AS PostId,
+    SUM(qm2.QuestionScore) AS TotalScore,
+    SUM(qm2.ViewCount) AS TotalViews,
+    SUM(qm2.AnswerCount) AS TotalAnswers,
+    'Aggregate' AS PostStatus,
+    SUM(ua2.EditCount) AS TotalEdits,
+    SUM(ua2.MajorEdits) AS TotalMajorEdits,
+    NULL AS PrevQuestionScore,
+    AVG(qm2.TotalVotes * 1.0 / NULLIF(qm2.AnswerCount, 0)) AS AvgVotesPerAnswer,
+    'Summary' AS ActivityCategory,
+    SUM((qm2.UpVotes + COALESCE(b2.GoldBadges, 0) * 10)) AS TotalWeightedScore,
+    'All Top Users Combined' AS TagPreview,
+    COUNT(*) AS OverallRank
+FROM QuestionMetrics qm2
+INNER JOIN ActiveUsers au2 ON au2.UserId = qm2.OwnerUserId
+LEFT JOIN UserActivity ua2 ON ua2.UserId = au2.UserId
+LEFT JOIN (
+    SELECT b2.UserId, COUNT(CASE WHEN b2.Class = 1 THEN 1 END) AS GoldBadges
+    FROM Badges b2 GROUP BY b2.UserId
+) b2 ON b2.UserId = au2.UserId
+WHERE au2.RepRank <= 10
+ORDER BY OverallRank, RepRank NULLS LAST;

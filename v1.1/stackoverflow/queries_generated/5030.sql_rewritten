@@ -1,0 +1,99 @@
+-- {"query": "5030.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 822} 
+WITH RecentActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS RecentQuestionPosts,
+        MAX(p.CreationDate) AS LastQuestionDate
+    FROM
+        Users u
+        LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    WHERE
+        u.LastAccessDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days'
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation
+    HAVING
+        COUNT(DISTINCT p.Id) > 2
+),
+RankedTags AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM
+        Tags t
+),
+UserTopBadges AS (
+    SELECT
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Class AS BadgeClass,
+        b.Date,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Class ASC, b.Date DESC) AS BadgeRank
+    FROM
+        Badges b
+),
+RecentQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.Title,
+        p.Tags,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        p.CommentCount,
+        p.ViewCount
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId = 1
+        AND p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+        AND p.Score > 0
+)
+SELECT
+    rau.UserId,
+    rau.DisplayName,
+    rau.Reputation,
+    COALESCE(utb.BadgeName, 'No Badges') AS TopBadge,
+    COALESCE(utb.BadgeClass, -1) AS TopBadgeClass,
+    COUNT(DISTINCT rq.QuestionId) AS NumRecentQuestions,
+    AVG(rq.Score) AS AvgQuestionScore,
+    SUM(rq.ViewCount) AS TotalViews,
+    COUNT(DISTINCT pl.Id) AS NumQuestionLinks,
+    STRING_AGG(DISTINCT rt.TagName, ', ' ORDER BY rt.TagRank) AS TopTags,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = rau.UserId AND c.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days') AS NumRecentComments,
+    (SELECT SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) - SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) 
+        FROM Votes v 
+        WHERE v.UserId = rau.UserId AND v.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+    ) AS NetVotesCast
+FROM
+    RecentActiveUsers rau
+    LEFT JOIN UserTopBadges utb ON rau.UserId = utb.UserId AND utb.BadgeRank = 1
+    LEFT JOIN RecentQuestions rq ON rau.UserId = rq.OwnerUserId
+    LEFT JOIN PostLinks pl ON rq.QuestionId = pl.PostId
+    LEFT JOIN LATERAL (
+        SELECT rt.TagName, rt.TagRank
+        FROM RankedTags rt
+        WHERE (
+            ',' || rq.Tags || ',' LIKE '%,' || rt.TagName || ',%'
+        )
+        ORDER BY rt.TagRank
+        LIMIT 3
+    ) rt ON TRUE
+GROUP BY
+    rau.UserId,
+    rau.DisplayName,
+    rau.Reputation,
+    utb.BadgeName,
+    utb.BadgeClass
+HAVING
+    COUNT(DISTINCT rq.QuestionId) >= 1
+    AND AVG(rq.Score) IS NOT NULL
+ORDER BY
+    AVG(rq.Score) DESC,
+    COUNT(DISTINCT rq.QuestionId) DESC,
+    rau.Reputation DESC
+LIMIT 50;

@@ -1,0 +1,14 @@
+models:
+  [
+    codex-mini-latest,
+  ]
+base_id: 100000
+count: 1000
+limit: 1
+temperature: 1.0
+max_tokens: 16384
+reasoning: minimal
+prompt: >-
+  Generate an interesting and elaborate SQL query for performance benchmarking, potentially including
+  constructs such as outer joins, (correlated) subqueries, CTEs, window functions, set operators,
+  complicated predicates/expressions/calculations, string expressions, and NULL logic.

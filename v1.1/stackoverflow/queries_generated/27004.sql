@@ -1,0 +1,172 @@
+-- {"query": "27004.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2337, "output_tokens": 1700} 
+
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.LastActivityDate) AS LastPostActivity,
+        MAX(c.CreationDate) AS LastCommentDate,
+        MAX(v.CreationDate) AS LastVoteDate,
+        MAX(b.Date) AS LastBadgeDate
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate
+),
+HighReputationUsers AS (
+    SELECT
+        UserId,
+        Reputation,
+        UserCreationDate,
+        PostCount,
+        CommentCount,
+        VoteCount,
+        BadgeCount,
+        LastPostActivity,
+        LastCommentDate,
+        LastVoteDate,
+        LastBadgeDate
+    FROM
+        UserActivity
+    WHERE
+        Reputation > 1000
+),
+RecentPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.LastEditDate,
+        p.LastActivityDate
+    FROM
+        Posts p
+    JOIN
+        Users u ON p.OwnerUserId = u.Id
+    WHERE
+        p.CreationDate > NOW() - INTERVAL '30 days'
+),
+TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        p.Title AS ExcerptTitle,
+        p.Body AS ExcerptBody,
+        COUNT(DISTINCT ph.PostId) AS PostHistoryCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 33 THEN 1 ELSE 0 END) AS NoticesAdded,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 34 THEN 1 ELSE 0 END) AS NoticesRemoved
+    FROM
+        Tags t
+    LEFT JOIN
+        Posts p ON t.ExcerptPostId = p.Id
+    LEFT JOIN
+        PostHistory ph ON ph.PostId = p.Id
+    WHERE
+        t.Count > 100
+    GROUP BY
+        t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, p.Title, p.Body
+),
+PostStatistics AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.LastEditDate,
+        p.LastActivityDate,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT ph.Id) AS PostHistoryCount,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousScore,
+        LAG(p.ViewCount, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousViewCount
+    FROM
+        Posts p
+    JOIN
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN
+        PostHistory ph ON p.Id = ph.PostId
+    WHERE
+        p.PostTypeId = 1
+    GROUP BY
+        p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.OwnerUserId, u.DisplayName, p.LastEditDate, p.LastActivityDate
+)
+SELECT
+    hr.UserId,
+    hr.Reputation,
+    hr.UserCreationDate,
+    hr.PostCount,
+    hr.CommentCount,
+    hr.VoteCount,
+    hr.BadgeCount,
+    hr.LastPostActivity,
+    hr.LastCommentDate,
+    hr.LastVoteDate,
+    hr.LastBadgeDate,
+    rp.PostId,
+    rp.Title AS RecentPostTitle,
+    rp.PostCreationDate,
+    rp.Score AS RecentPostScore,
+    rp.ViewCount AS RecentPostViewCount,
+    rp.Tags AS RecentPostTags,
+    rp.OwnerDisplayName,
+    rp.LastEditDate AS RecentPostLastEditDate,
+    rp.LastActivityDate AS RecentPostLastActivityDate,
+    t.TagName,
+    t.Count AS TagCount,
+    t.ExcerptTitle,
+    t.ExcerptBody,
+    t.PostHistoryCount AS TagPostHistoryCount,
+    t.NoticesAdded,
+    t.NoticesRemoved,
+    ps.PostId AS StatPostId,
+    ps.Title AS StatPostTitle,
+    ps.PostCreationDate AS StatPostCreationDate,
+    ps.Score AS StatPostScore,
+    ps.ViewCount AS StatPostViewCount,
+    ps.Tags AS StatPostTags,
+    ps.OwnerDisplayName AS StatPostOwnerDisplayName,
+    ps.LastEditDate AS StatPostLastEditDate,
+    ps.LastActivityDate AS StatPostLastActivityDate,
+    ps.VoteCount AS StatPostVoteCount,
+    ps.CommentCount AS StatPostCommentCount,
+    ps.PostHistoryCount AS StatPostHistoryCount,
+    ps.PreviousScore,
+    ps.PreviousViewCount
+FROM
+    HighReputationUsers hr
+LEFT JOIN
+    RecentPosts rp ON hr.UserId = rp.OwnerUserId
+LEFT JOIN
+    TopTags t ON rp.Tags LIKE CONCAT('%<', t.TagName, '>%')
+LEFT JOIN
+    PostStatistics ps ON rp.PostId = ps.PostId
+WHERE
+    (hr.LastPostActivity IS NOT NULL OR hr.LastCommentDate IS NOT NULL OR hr.LastVoteDate IS NOT NULL OR hr.LastBadgeDate IS NOT NULL)
+    AND (rp.PostCreationDate IS NOT NULL OR t.TagName IS NOT NULL OR ps.PostId IS NOT NULL);

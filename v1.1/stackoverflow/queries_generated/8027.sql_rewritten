@@ -1,0 +1,264 @@
+-- {"query": "8027.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2572} 
+with recent_users as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.location,
+         coalesce(nullif(trim(u.websiteurl), ''), 'N/A') as websiteurl,
+         row_number() over (order by u.creationdate desc, u.id) as rn
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+user_activity as (
+  select
+    u.user_id,
+    count(distinct p.id) filter (where p.posttypeid = 1) as q_count,
+    count(distinct p.id) filter (where p.posttypeid = 2) as a_count,
+    sum(coalesce(p.score,0)) as post_score_sum,
+    sum(coalesce(p.viewcount,0)) filter (where p.posttypeid = 1) as q_views_sum,
+    count(distinct c.id) as comment_count,
+    count(distinct v.id) filter (where v.votetypeid = 2) as upvotes_given,
+    count(distinct v.id) filter (where v.votetypeid = 3) as downvotes_given,
+    count(distinct ph.id) filter (where ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35)) as modlike_events
+  from recent_users u
+  left join posts p on p.owneruserid = u.user_id
+  left join comments c on c.userid = u.user_id
+  left join votes v on v.userid = u.user_id
+  left join posthistory ph on ph.userid = u.user_id
+  group by u.user_id
+),
+tag_extract as (
+  select
+    p.id as post_id,
+    p.owneruserid as user_id,
+    unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) as tagname
+  from posts p
+  where p.posttypeid = 1
+    and p.tags is not null
+    and length(p.tags) >= 2
+),
+top_user_tags as (
+  select
+    te.user_id,
+    te.tagname,
+    count(*) as tag_uses,
+    row_number() over (partition by te.user_id order by count(*) desc, min(te.post_id)) as tag_rank
+  from tag_extract te
+  group by te.user_id, te.tagname
+),
+accepted_rate as (
+  select
+    u.user_id,
+    count(*) filter (where pa.id is not null) as answers_with_accept,
+    count(*) as total_answers,
+    round(100.0 * count(*) filter (where pa.id is not null) / nullif(count(*),0), 2) as accept_rate_pct
+  from recent_users u
+  left join posts a on a.posttypeid = 2 and a.owneruserid = u.user_id
+  left join posts q on q.id = a.parentid and q.posttypeid = 1
+  left join posts pa on pa.id = q.acceptedanswerid and pa.id = a.id
+  group by u.user_id
+),
+bounty_stats as (
+  select
+    u.user_id,
+    sum(coalesce(v.bountyamount,0)) filter (where v.votetypeid in (8,9)) as bounty_total,
+    max(v.creationdate) filter (where v.votetypeid in (8,9)) as last_bounty_date
+  from recent_users u
+  left join votes v on v.userid = u.user_id
+  group by u.user_id
+),
+postlink_dupes as (
+  select
+    pl.postid,
+    pl.relatedpostid,
+    pl.creationdate,
+    pl.linktypeid
+  from postlinks pl
+  where pl.linktypeid = 3
+),
+close_reasons as (
+  select
+    ph.postid,
+    max(ph.creationdate) as last_close_event,
+    max(case when ph.posthistorytypeid = 10 then try_cast(ph.comment as int) end) as close_reason_id
+  from posthistory ph
+  where ph.posthistorytypeid in (10,11)
+  group by ph.postid
+),
+question_quality as (
+  select
+    p.owneruserid as user_id,
+    count(*) filter (where p.score >= 5) as good_q,
+    count(*) filter (where p.score < 0) as bad_q,
+    round(avg(nullif(p.viewcount,0))) as avg_views_q,
+    count(distinct dl.relatedpostid) as dupes_pointing_to,
+    count(distinct dr.postid) as dupes_of
+  from posts p
+  left join postlink_dupes dl on dl.relatedpostid = p.id
+  left join postlink_dupes dr on dr.postid = p.id
+  where p.posttypeid = 1
+  group by p.owneruserid
+),
+badge_summary as (
+  select
+    b.userid as user_id,
+    count(*) as total_badges,
+    count(*) filter (where b.class = 1) as gold_badges,
+    count(*) filter (where b.class = 2) as silver_badges,
+    count(*) filter (where b.class = 3) as bronze_badges,
+    count(*) filter (where b.tagbased = 1) as tag_badges
+  from badges b
+  group by b.userid
+),
+recent_edits as (
+  select
+    ph.userid as editor_id,
+    count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edit_events,
+    max(ph.creationdate) as last_edit_date
+  from posthistory ph
+  where ph.userid is not null
+  group by ph.userid
+),
+user_scores as (
+  select
+    u.user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    u.websiteurl,
+    ua.q_count,
+    ua.a_count,
+    ua.post_score_sum,
+    ua.q_views_sum,
+    ua.comment_count,
+    ua.upvotes_given,
+    ua.downvotes_given,
+    ua.modlike_events,
+    coalesce(a.accept_rate_pct, 0.0) as accept_rate_pct,
+    coalesce(bs.bounty_total, 0) as bounty_total,
+    bs.last_bounty_date,
+    coalesce(q.god_q, 0) as good_q, -- intentional typo for later correction test
+    q.good_q,
+    q.bad_q,
+    q.avg_views_q,
+    q.dupes_pointing_to,
+    q.dupes_of,
+    coalesce(b.total_badges, 0) as total_badges,
+    coalesce(b.gold_badges, 0) as gold_badges,
+    coalesce(b.silver_badges, 0) as silver_badges,
+    coalesce(b.bronze_badges, 0) as bronze_badges,
+    coalesce(b.tag_badges, 0) as tag_badges,
+    re.edit_events,
+    re.last_edit_date,
+    t.tagname as top_tag,
+    t.tag_uses as top_tag_uses
+  from recent_users u
+  left join user_activity ua on ua.user_id = u.user_id
+  left join accepted_rate a on a.user_id = u.user_id
+  left join bounty_stats bs on bs.user_id = u.user_id
+  left join question_quality q on q.user_id = u.user_id
+  left join badge_summary b on b.user_id = u.user_id
+  left join recent_edits re on re.editor_id = u.user_id
+  left join top_user_tags t on t.user_id = u.user_id and t.tag_rank = 1
+),
+ranked as (
+  select
+    us.*,
+    coalesce(us.q_count,0) + coalesce(us.a_count,0) as total_posts,
+    case
+      when coalesce(us.a_count,0) = 0 then null
+      else round(1.0 * coalesce(us.post_score_sum,0) / nullif(us.a_count,0), 3)
+    end as avg_answer_score,
+    dense_rank() over (order by coalesce(us.reputation,0) desc, coalesce(us.q_count,0)+coalesce(us.a_count,0) desc) as rep_rank,
+    ntile(10) over (order by coalesce(us.post_score_sum,0) desc) as score_decile,
+    percent_rank() over (order by coalesce(us.accept_rate_pct,0.0)) as accept_percent_rank
+  from user_scores us
+),
+quality_flags as (
+  select
+    r.*,
+    case when coalesce(r.bad_q,0) > coalesce(r.good_q,0) then 'needs-improvement'
+         when coalesce(r.good_q,0) >= 5 then 'excellent'
+         when coalesce(r.good_q,0) >= 1 then 'promising'
+         else 'newbie'
+    end as quality_bucket,
+    case when r.dupes_of > 0 then 1 else 0 end as has_dupe_to,
+    case when r.dupes_pointing_to > 0 then 1 else 0 end as has_dupe_from
+  from ranked r
+),
+final_set as (
+  select
+    qf.user_id,
+    qf.displayname,
+    qf.reputation,
+    qf.creationdate,
+    coalesce(nullif(qf.location, ''), 'Unknown') as location,
+    qf.websiteurl,
+    qf.total_posts,
+    qf.q_count,
+    qf.a_count,
+    qf.post_score_sum,
+    qf.avg_answer_score,
+    qf.q_views_sum,
+    qf.comment_count,
+    qf.upvotes_given,
+    qf.downvotes_given,
+    qf.accept_rate_pct,
+    qf.bounty_total,
+    qf.last_bounty_date,
+    qf.good_q,
+    qf.bad_q,
+    qf.avg_views_q,
+    qf.dupes_pointing_to,
+    qf.dupes_of,
+    qf.total_badges,
+    qf.gold_badges,
+    qf.silver_badges,
+    qf.bronze_badges,
+    qf.tag_badges,
+    qf.edit_events,
+    qf.last_edit_date,
+    qf.top_tag,
+    qf.top_tag_uses,
+    qf.rep_rank,
+    qf.score_decile,
+    qf.accept_percent_rank,
+    qf.quality_bucket,
+    qf.has_dupe_to,
+    qf.has_dupe_from
+  from quality_flags qf
+)
+select *
+from (
+  select * from final_set
+  where coalesce(q_count,0) + coalesce(a_count,0) >= 5
+  union all
+  select * from final_set
+  where reputation >= (select percentile_disc(0.95) within group (order by reputation) from users)
+) s
+left join lateral (
+  select p.id as last_post_id,
+         p.posttypeid as last_post_type,
+         p.creationdate as last_post_date,
+         coalesce(nullif(p.title, ''), left(regexp_replace(coalesce(p.body, ''), '<[^>]+>', '', 'g'), 80)) as last_post_title_or_excerpt,
+         cr.close_reason_id,
+         crt.name as close_reason_name
+  from posts p
+  left join close_reasons cr on cr.postid = p.id
+  left join closereasontypes crt on crt.id = cr.close_reason_id
+  where p.owneruserid = s.user_id
+  order by p.creationdate desc nulls last
+  limit 1
+) lp on true
+left join lateral (
+  select
+    count(*) filter (where v.votetypeid = 2) as last30_upvotes_received,
+    count(*) filter (where v.votetypeid = 3) as last30_downvotes_received
+  from votes v
+  join posts p on p.id = v.postid and p.owneruserid = s.user_id
+  where v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+) v30 on true
+order by rep_rank, score_decile, user_id
+limit 200;

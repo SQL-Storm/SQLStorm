@@ -1,0 +1,149 @@
+-- {"query": "9002.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2013, "output_tokens": 4049} 
+WITH
+-- 1. Recent high‐score questions, ranked per top tag
+RecentHigh AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.Score,
+        u.DisplayName,
+        p.CreationDate,
+        ROW_NUMBER() OVER (
+            PARTITION BY
+                SUBSTRING(p.Tags, 2, CHARINDEX('><', p.Tags+'><') - 2)
+            ORDER BY p.Score DESC
+        ) AS TagRank
+    FROM Posts AS p
+    LEFT JOIN Users AS u
+        ON p.OwnerUserId = u.Id
+    WHERE
+        p.PostTypeId = 1
+        AND p.CreationDate >= DATEADD(day, -30, cast('2024-10-01 12:34:56' as timestamp))
+),
+
+-- 2. Aggregate answer / vote statistics per question
+AnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        COUNT(a.Id)                                   AS AnswerCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS AnswerUpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS AnswerDownVotes,
+        AVG(CASE WHEN v.VoteTypeId IN (2,3) THEN v.VoteTypeId*1.0 ELSE NULL END) AS AvgVoteType
+    FROM Posts AS q
+    LEFT JOIN Posts AS a
+        ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN Votes AS v
+        ON v.PostId = a.Id
+    WHERE
+        q.PostTypeId = 1
+    GROUP BY
+        q.Id
+),
+
+-- 3. Comment insights per post: max score, min length, distinct commenters, and a CSV list
+CommentInsights AS (
+    SELECT
+        c.PostId,
+        MAX(c.Score)                           AS MaxCommentScore,
+        MIN(LEN(c.Text))                       AS MinCommentLen,
+        COUNT(DISTINCT c.UserId)               AS DistinctCommenters,
+        STUFF((
+            SELECT '|' + CAST(c2.UserId AS VARCHAR)
+            FROM Comments AS c2
+            WHERE c2.PostId = c.PostId
+            FOR XML PATH('')
+        ), 1, 1, '')                          AS CommenterList
+    FROM Comments AS c
+    GROUP BY c.PostId
+),
+
+-- 4. Number of history edits in the last week per post
+HistoryCount AS (
+    SELECT
+        ph.PostId,
+        COUNT(*) AS EditCountLastWeek
+    FROM PostHistory AS ph
+    WHERE ph.CreationDate >= DATEADD(week, -1, cast('2024-10-01 12:34:56' as timestamp))
+    GROUP BY ph.PostId
+)
+
+-- MAIN QUERY (with UNION ALL and EXCEPT for set operations)
+SELECT
+    rh.Id,
+    rh.Title,
+    rh.DisplayName              AS Asker,
+    rh.Score                    AS QuestionScore,
+    ISNULL(ans.AnswerCount, 0)                                     AS TotalAnswers,
+    ISNULL(ans.AnswerUpVotes, 0) - ISNULL(ans.AnswerDownVotes, 0)   AS NetAnswerVotes,
+    ci.MaxCommentScore,
+    hc.EditCountLastWeek,
+    CASE WHEN rh.TagRank = 1 THEN 'TopTagQ' ELSE 'OtherTagQ' END    AS RankCategory,
+    (LEN(rh.Tags) - LEN(REPLACE(rh.Tags, '<', ''))) / 2             AS TagCount,
+    rh.CreationDate,
+    (
+        SELECT COUNT(*)
+        FROM PostLinks AS pl
+        WHERE pl.PostId = rh.Id
+          AND pl.LinkTypeId = 1
+    )                                                             AS OutgoingLinks
+FROM RecentHigh AS rh
+LEFT JOIN AnswerStats AS ans
+    ON rh.Id = ans.QuestionId
+LEFT JOIN CommentInsights AS ci
+    ON rh.Id = ci.PostId
+LEFT JOIN HistoryCount AS hc
+    ON rh.Id = hc.PostId
+WHERE rh.TagRank <= 3
+
+UNION ALL
+
+SELECT TOP 5
+    p.Id,
+    p.Title,
+    u.DisplayName,
+    p.Score,
+    0,
+    0,
+    NULL,
+    NULL,
+    'RecentQ',
+    (LEN(p.Tags) - LEN(REPLACE(p.Tags, '<', ''))) / 2,
+    p.CreationDate,
+    0
+FROM Posts AS p
+LEFT JOIN Users AS u
+    ON p.OwnerUserId = u.Id
+WHERE p.PostTypeId = 1
+ORDER BY p.CreationDate DESC
+
+EXCEPT
+
+SELECT
+    p.Id,
+    p.Title,
+    COALESCE(u.DisplayName, '<anon>'),
+    p.Score,
+    ISNULL(ans.AnswerCount, 0),
+    ISNULL(ans.AnswerUpVotes, 0) - ISNULL(ans.AnswerDownVotes, 0),
+    ci.MaxCommentScore,
+    hc.EditCountLastWeek,
+    'FilteredNeg',
+    (LEN(p.Tags) - LEN(REPLACE(p.Tags, '<', ''))) / 2,
+    p.CreationDate,
+    (
+        SELECT COUNT(*)
+        FROM PostLinks AS pl
+        WHERE pl.PostId = p.Id
+          AND pl.LinkTypeId = 1
+    )
+FROM Posts AS p
+LEFT JOIN Users AS u
+    ON p.OwnerUserId = u.Id
+LEFT JOIN AnswerStats AS ans
+    ON p.Id = ans.QuestionId
+LEFT JOIN CommentInsights AS ci
+    ON p.Id = ci.PostId
+LEFT JOIN HistoryCount AS hc
+    ON p.Id = hc.PostId
+WHERE p.Score < 0;

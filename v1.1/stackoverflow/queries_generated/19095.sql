@@ -1,0 +1,155 @@
+-- {"query": "19095.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2519} 
+
+WITH UserEngagementMetrics AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.UpVotes AS TotalUpVotesGiven,
+        U.DownVotes AS TotalDownVotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT Q.Id) AS TotalQuestions,
+        COUNT(DISTINCT A.Id) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN P.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN P.Score ELSE 0 END) AS TotalAnswerScore,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        MAX(CASE WHEN B.Class = 1 THEN TRUE ELSE FALSE END) AS HasGoldBadge,
+        AVG(P.ViewCount) FILTER (WHERE P.PostTypeId = 1) AS AvgQuestionViewCount,
+        RANK() OVER (ORDER BY U.Reputation DESC, U.CreationDate ASC) AS ReputationRank,
+        ROW_NUMBER() OVER (ORDER BY U.LastAccessDate DESC, U.Reputation DESC) AS RecentActiveUserRank
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Posts Q ON U.Id = Q.OwnerUserId AND Q.PostTypeId = 1
+    LEFT JOIN Posts A ON U.Id = A.OwnerUserId AND A.PostTypeId = 2
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes, U.DownVotes
+),
+PostHistoryTimeline AS (
+    SELECT
+        PH.PostId,
+        PH.CreationDate AS HistoryDate,
+        PH.PostHistoryTypeId,
+        PHT.Name AS HistoryTypeName,
+        LAG(PH.PostHistoryTypeId, 1, 0) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS PreviousHistoryTypeId,
+        LEAD(PH.PostHistoryTypeId, 1, 0) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS NextHistoryTypeId,
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate DESC) AS HistorySequenceNumDesc
+    FROM PostHistory PH
+    JOIN PostHistoryTypes PHT ON PH.PostHistoryTypeId = PHT.Id
+),
+PostTagAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><'))) AS TagName
+    FROM Posts P
+    WHERE P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2 AND P.PostTypeId = 1
+),
+PostTagDetails AS (
+    SELECT
+        PTA.PostId,
+        PTA.TagName,
+        T.IsModeratorOnly,
+        T.IsRequired
+    FROM PostTagAnalysis PTA
+    JOIN Tags T ON PTA.TagName = T.TagName
+),
+PostLinkStatus AS (
+    SELECT
+        P.Id AS PostId,
+        MAX(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE 0 END) AS IsLinked,
+        MAX(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS IsDuplicate
+    FROM Posts P
+    LEFT JOIN PostLinks PL ON P.Id = PL.PostId
+    GROUP BY P.Id
+),
+QuestionDetails AS (
+    SELECT
+        P.Id AS QuestionId,
+        P.OwnerUserId AS QuestionOwnerUserId,
+        P.CreationDate AS QuestionCreationDate,
+        P.Score AS QuestionScore,
+        P.ViewCount AS QuestionViewCount,
+        STRING_AGG(DISTINCT PTD.TagName, ', ') FILTER (WHERE PTD.TagName IS NOT NULL) AS QuestionTags,
+        MAX(CASE WHEN PLT.HistorySequenceNumDesc = 1 AND PLT.HistoryTypeName = 'Post Closed' THEN TRUE ELSE FALSE END) AS IsCurrentlyClosed,
+        COUNT(DISTINCT C.Id) AS QuestionCommentCount,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS QuestionUpvotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS QuestionDownvotes,
+        COALESCE(PLS.IsLinked, 0)::boolean AS QuestionIsLinked,
+        COALESCE(PLS.IsDuplicate, 0)::boolean AS QuestionIsDuplicate,
+        (SELECT COUNT(DISTINCT PH2.Id) FROM PostHistory PH2 WHERE PH2.PostId = P.Id AND PH2.CreationDate > P.CreationDate + INTERVAL '7 days' AND PH2.PostHistoryTypeId IN (4,5,6)) AS EditsAfterFirstWeek
+    FROM Posts P
+    LEFT JOIN PostTagDetails PTD ON P.Id = PTD.PostId
+    LEFT JOIN PostHistoryTimeline PLT ON P.Id = PLT.PostId
+    LEFT JOIN Comments C ON P.Id = C.PostId
+    LEFT JOIN Votes V ON P.Id = V.PostId AND V.VoteTypeId IN (2, 3)
+    LEFT JOIN PostLinkStatus PLS ON P.Id = PLS.PostId
+    WHERE P.PostTypeId = 1 AND P.CreationDate BETWEEN '2020-01-01' AND CURRENT_DATE
+    GROUP BY P.Id, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount, PLS.IsLinked, PLS.IsDuplicate
+    HAVING P.Score > 5 AND P.ViewCount > 1000
+),
+AnswerDetails AS (
+    SELECT
+        P.Id AS AnswerId,
+        P.OwnerUserId AS AnswerOwnerUserId,
+        P.ParentId AS ParentQuestionId,
+        P.CreationDate AS AnswerCreationDate,
+        P.Score AS AnswerScore,
+        P.AcceptedAnswerId IS NOT NULL AS IsAcceptedAnswer,
+        COUNT(DISTINCT C.Id) AS AnswerCommentCount,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS AnswerUpvotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS AnswerDownvotes,
+        (SELECT MAX(B.Date) FROM Badges B WHERE B.UserId = P.OwnerUserId AND B.Class = 1 AND B.Date > P.CreationDate) AS LatestGoldBadgeAfterAnswer,
+        (SELECT PH.HistoryDate FROM PostHistoryTimeline PH WHERE PH.PostId = P.Id AND PH.HistorySequenceNumDesc = 1) AS LatestAnswerHistoryDate
+    FROM Posts P
+    LEFT JOIN Comments C ON P.Id = C.PostId
+    LEFT JOIN Votes V ON P.Id = V.PostId AND V.VoteTypeId IN (1, 2, 3)
+    WHERE P.PostTypeId = 2 AND P.CreationDate BETWEEN '2020-01-01' AND CURRENT_DATE
+    GROUP BY P.Id, P.OwnerUserId, P.ParentId, P.CreationDate, P.Score, P.AcceptedAnswerId
+    HAVING P.Score > 3
+)
+SELECT
+    COALESCE(QD.QuestionOwnerUserId, AD.AnswerOwnerUserId) AS CommonOwnerUserId,
+    COALESCE(UEM_Q.DisplayName, UEM_A.DisplayName, 'Deleted User') AS CommonOwnerDisplayName,
+    COALESCE(UEM_Q.Reputation, UEM_A.Reputation, 0) AS CommonOwnerReputation,
+    UEM_Q.TotalQuestions AS OwnerTotalQuestions,
+    UEM_A.TotalAnswers AS OwnerTotalAnswers,
+    COALESCE(UEM_Q.HasGoldBadge, FALSE) AS QuestionOwnerHasGoldBadge,
+    COALESCE(UEM_A.HasGoldBadge, FALSE) AS AnswerOwnerHasGoldBadge,
+    QD.QuestionId,
+    QD.QuestionCreationDate,
+    QD.QuestionScore,
+    QD.QuestionViewCount,
+    QD.QuestionTags,
+    QD.IsCurrentlyClosed AS QuestionIsCurrentlyClosed,
+    QD.QuestionCommentCount,
+    QD.QuestionUpvotes,
+    QD.QuestionDownvotes,
+    QD.QuestionIsLinked,
+    QD.QuestionIsDuplicate,
+    QD.EditsAfterFirstWeek AS QuestionEditsAfterFirstWeek,
+    AD.AnswerId,
+    AD.AnswerCreationDate,
+    AD.AnswerScore,
+    AD.IsAcceptedAnswer AS AnswerIsAccepted,
+    AD.AnswerCommentCount,
+    AD.AnswerUpvotes,
+    AD.AnswerDownvotes,
+    AD.LatestGoldBadgeAfterAnswer,
+    AD.LatestAnswerHistoryDate,
+    (QD.QuestionUpvotes - QD.QuestionDownvotes) AS QuestionNetVotes,
+    (AD.AnswerUpvotes - AD.AnswerDownvotes) AS AnswerNetVotes,
+    NULLIF(QD.QuestionUpvotes, 0) / NULLIF((QD.QuestionUpvotes + QD.QuestionDownvotes), 0)::numeric AS QuestionUpvoteRatio,
+    NULLIF(AD.AnswerUpvotes, 0) / NULLIF((AD.AnswerUpvotes + AD.AnswerDownvotes), 0)::numeric AS AnswerUpvoteRatio,
+    EXTRACT(EPOCH FROM (COALESCE(AD.AnswerCreationDate, CURRENT_TIMESTAMP) - QD.QuestionCreationDate)) / 3600 AS TimeToAnswerHours,
+    (SELECT AVG(SQ.Score) FROM Posts SQ WHERE SQ.OwnerUserId = COALESCE(QD.QuestionOwnerUserId, AD.AnswerOwnerUserId) AND SQ.PostTypeId = 1 AND SQ.CreationDate < COALESCE(QD.QuestionCreationDate, AD.AnswerCreationDate) - INTERVAL '1 year') AS AvgOwnerOlderQuestionScore,
+    CASE
+        WHEN QD.QuestionScore > 100 AND AD.AnswerScore > 50 THEN 'HighImpactPair'
+        WHEN QD.QuestionTags LIKE '%<database>%' AND QD.QuestionTags LIKE '%<sql>%' AND AD.AnswerScore IS NOT NULL THEN 'SQLDatabaseAnswered'
+        WHEN QD.QuestionId IS NOT NULL AND AD.AnswerId IS NULL AND QD.QuestionViewCount > 10000 THEN 'UnansweredPopularQuestion'
+        WHEN AD.AnswerId IS NOT NULL AND QD.QuestionId IS NULL THEN 'OrphanedAnswerAnalysis'
+        ELSE 'MixedInteraction'
+    END AS InteractionType,
+    (SELECT COUNT(DISTINCT PH.Id) FROM PostHistory PH WHERE PH.PostId = COALESCE(QD.QuestionId, AD.AnswerId) AND PH.CreationDate > COALESCE(QD.QuestionCreationDate, AD.AnswerCreationDate) + INTERVAL '3 months' AND PH.PostHistoryTypeId IN (4,5,

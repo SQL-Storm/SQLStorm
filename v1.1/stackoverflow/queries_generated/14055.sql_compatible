@@ -1,0 +1,88 @@
+SELECT 
+    ROUND(
+        SUM(
+            CASE 
+                WHEN v.VoteTypeId = 2 THEN 1 
+                WHEN v.VoteTypeId = 3 THEN -1
+                ELSE 0
+            END
+        ) * 1.0 / 
+        COUNT(p.Id)
+    , 2) AS avg_vote_score,
+    ROUND(
+        AVG(
+            CASE 
+                WHEN p.PostTypeId = 1 THEN p.AnswerCount 
+                ELSE 0
+            END
+        )
+    , 2) AS avg_answer_count,
+    ROUND(
+        AVG(
+            CASE
+                WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 1
+                ELSE 0 
+            END
+        )
+    , 2) AS pct_questions_with_accepted_answer,
+    ROUND(
+        AVG(
+            CASE
+                WHEN p.PostTypeId = 1 THEN p.ViewCount
+                ELSE 0
+            END
+        )
+    , 2) AS avg_question_view_count,
+    ROUND(
+        AVG(
+            CASE
+                WHEN p.CommunityOwnedDate IS NOT NULL THEN DATEDIFF(day, p.CommunityOwnedDate, p.LastEditDate)
+                ELSE DATEDIFF(day, p.CreationDate, p.LastEditDate)
+            END    
+        )
+    , 2) AS avg_days_to_community_wiki,
+    ROUND(
+        AVG(
+            CASE
+                WHEN p.ClosedDate IS NOT NULL THEN DATEDIFF(day, p.CreationDate, p.ClosedDate)
+                ELSE 0
+            END
+        )
+    , 2) AS avg_days_to_close,
+    ROUND(
+        AVG(
+            CASE
+                WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN 1
+                ELSE 0
+            END
+        )
+    , 2) AS pct_questions_closed,
+    ROUND(
+        AVG(
+            CASE
+                WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL AND ph.PostHistoryTypeId = 10 AND ph.Comment = '101' THEN 1
+                ELSE 0
+            END    
+        )
+    , 2) AS pct_questions_closed_as_duplicate,
+    t.TagNames AS top_tags,
+    p.Id,
+    ph.PostHistoryTypeId,
+    ph.Comment
+FROM Posts p
+LEFT JOIN Votes v ON p.Id = v.PostId
+LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 10
+LEFT JOIN (
+    SELECT 
+        pt.PostId, 
+        STRING_AGG(tg.TagName, ', ') AS TagNames
+    FROM 
+        PostTags pt
+    JOIN Tags tg ON pt.TagId = tg.Id
+    GROUP BY pt.PostId
+) t ON p.Id = t.PostId
+GROUP BY
+    p.Id,
+    t.TagNames,
+    ph.PostHistoryTypeId,
+    ph.Comment;

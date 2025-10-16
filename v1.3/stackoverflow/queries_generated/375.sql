@@ -1,0 +1,317 @@
+-- {"query": "375.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 16639} 
+WITH
+expanded_posts AS (
+  SELECT p.Id AS post_id,
+         p.PostTypeId,
+         p.ParentId,
+         p.OwnerUserId,
+         p.CreationDate,
+         p.Score,
+         p.ViewCount,
+         p.Title,
+         p.Tags,
+         t.tag
+  FROM Posts p
+  LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(p.Tags, 2, char_length(p.Tags)-2), '><')) AS tag
+  ) t ON p.Tags IS NOT NULL
+),
+
+question_first_answer AS (
+  SELECT q.Id AS question_id,
+         q.OwnerUserId,
+         extract(epoch FROM (min(a.CreationDate) - q.CreationDate)) AS secs_to_first_answer,
+         min(a.CreationDate) AS first_answer_date,
+         count(a.Id) AS answer_count,
+         coalesce(sum(a.Score),0) AS answers_score_sum
+  FROM Posts q
+  LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+  WHERE q.PostTypeId = 1
+  GROUP BY q.Id, q.OwnerUserId
+),
+
+user_basics AS (
+  SELECT u.Id AS user_id,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate,
+         u.LastAccessDate,
+         coalesce(p_counts.total_posts,0) AS total_posts,
+         coalesce(p_counts.questions,0) AS questions,
+         coalesce(p_counts.answers,0) AS answers,
+         coalesce(p_counts.avg_score,0) AS avg_score,
+         coalesce(p_counts.total_views,0) AS total_views
+  FROM Users u
+  LEFT JOIN (
+    SELECT OwnerUserId,
+           count(*) AS total_posts,
+           sum(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS questions,
+           sum(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS answers,
+           avg(Score) FILTER (WHERE Score IS NOT NULL) AS avg_score,
+           sum(coalesce(ViewCount,0)) AS total_views
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL
+    GROUP BY OwnerUserId
+  ) p_counts ON p_counts.OwnerUserId = u.Id
+),
+
+user_accepts AS (
+  SELECT u.Id AS user_id,
+         (SELECT count(*) FROM Posts ans WHERE ans.OwnerUserId = u.Id AND EXISTS (SELECT 1 FROM Posts q WHERE q.AcceptedAnswerId = ans.Id)) AS accepted_answers,
+         (SELECT count(*) FROM Posts ans WHERE ans.OwnerUserId = u.Id AND ans.Score >= 10) AS high_score_answers
+  FROM Users u
+),
+
+user_tag_counts AS (
+  SELECT ep.OwnerUserId AS user_id,
+         lower(ep.tag) AS tag,
+         count(*) AS tag_count
+  FROM expanded_posts ep
+  WHERE ep.PostTypeId = 1 AND ep.OwnerUserId IS NOT NULL
+  GROUP BY ep.OwnerUserId, lower(ep.tag)
+),
+
+user_top_tag AS (
+  SELECT utc.user_id,
+         utc.tag,
+         utc.tag_count,
+         row_number() OVER (PARTITION BY utc.user_id ORDER BY utc.tag_count DESC, utc.tag) AS rn
+  FROM user_tag_counts utc
+),
+
+tag_global AS (
+  SELECT lower(t.TagName) AS tag,
+         t.Count AS tag_count_static,
+         coalesce(q_stats.avg_views,0) AS avg_views,
+         coalesce(q_stats.avg_score,0) AS avg_score,
+         rank() OVER (ORDER BY t.Count DESC) AS popularity_rank
+  FROM Tags t
+  LEFT JOIN (
+    SELECT lower(ep.tag) AS tag, avg(ep.ViewCount) AS avg_views, avg(ep.Score) AS avg_score
+    FROM expanded_posts ep
+    WHERE ep.PostTypeId = 1
+    GROUP BY lower(ep.tag)
+  ) q_stats ON lower(t.TagName) = q_stats.tag
+),
+
+link_summary AS (
+  SELECT p.OwnerUserId AS user_id,
+         sum(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS outgoing_links,
+         sum(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS duplicate_links,
+         count(pl.Id) AS total_links,
+         avg(extract(epoch FROM pl.CreationDate - p.CreationDate)) AS avg_link_delay_seconds
+  FROM Posts p
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+  GROUP BY p.OwnerUserId
+),
+
+votes_received AS (
+  SELECT p.OwnerUserId AS user_id,
+         sum(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes_received,
+         sum(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes_received,
+         count(v.Id) AS total_votes_received
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  GROUP BY p.OwnerUserId
+),
+
+votes_cast AS (
+  SELECT v.UserId AS user_id,
+         sum(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes_cast,
+         sum(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes_cast,
+         count(v.Id) AS total_votes_cast
+  FROM Votes v
+  GROUP BY v.UserId
+),
+
+comments_summary AS (
+  SELECT c.UserId AS user_id,
+         count(*) AS comments_made,
+         avg(char_length(c.Text)) AS avg_comment_length
+  FROM Comments c
+  GROUP BY c.UserId
+),
+
+edits_summary AS (
+  SELECT ph.UserId AS user_id,
+         count(*) AS edits_made,
+         count(distinct ph.PostId) AS posts_edited,
+         sum(CASE WHEN ph.PostHistoryTypeId = 24 THEN 1 ELSE 0 END) AS suggested_edits_applied
+  FROM PostHistory ph
+  GROUP BY ph.UserId
+),
+
+top_questioners AS (
+  SELECT OwnerUserId AS user_id, count(*) AS q_count
+  FROM Posts
+  WHERE PostTypeId = 1 AND OwnerUserId IS NOT NULL
+  GROUP BY OwnerUserId
+  ORDER BY q_count DESC
+  LIMIT 200
+),
+
+top_answerers AS (
+  SELECT OwnerUserId AS user_id, count(*) AS a_count
+  FROM Posts
+  WHERE PostTypeId = 2 AND OwnerUserId IS NOT NULL
+  GROUP BY OwnerUserId
+  ORDER BY a_count DESC
+  LIMIT 200
+),
+
+candidate_users AS (
+  SELECT user_id FROM top_questioners
+  UNION
+  SELECT user_id FROM top_answerers
+  EXCEPT
+  SELECT Id FROM Users WHERE Reputation < 5
+),
+
+trending_tags AS (
+  SELECT tag, sum(cnt) AS trend_delta
+  FROM (
+    SELECT lower(ep.tag) AS tag, count(*) AS cnt
+    FROM expanded_posts ep
+    WHERE ep.PostTypeId = 1 AND ep.CreationDate >= now() - interval '30 days'
+    GROUP BY lower(ep.tag)
+    UNION ALL
+    SELECT lower(ep.tag) AS tag, -count(*) AS cnt
+    FROM expanded_posts ep
+    WHERE ep.PostTypeId = 1 AND ep.CreationDate >= now() - interval '60 days' AND ep.CreationDate < now() - interval '30 days'
+    GROUP BY lower(ep.tag)
+  ) s
+  GROUP BY tag
+  ORDER BY trend_delta DESC
+  LIMIT 200
+),
+
+composite_user_metrics AS (
+  SELECT u.Id AS user_id,
+         u.DisplayName,
+         lower(regexp_replace(coalesce(u.DisplayName,''), E'\\s+', ' ', 'g')) AS normalized_display,
+         coalesce(u.Location,'') AS location_raw,
+         coalesce(nullif(trim(u.Location),''),'(unknown)') AS location_signature,
+         u.Reputation,
+         extract(epoch FROM (now() - u.CreationDate))/86400.0 AS days_since_creation,
+         ub.total_posts,
+         ub.questions,
+         ub.answers,
+         ub.avg_score,
+         ub.total_views,
+         ua.accepted_answers,
+         ua.high_score_answers,
+         coalesce(vr.upvotes_received,0) AS upvotes_received,
+         coalesce(vr.downvotes_received,0) AS downvotes_received,
+         coalesce(vr.total_votes_received,0) AS total_votes_received,
+         coalesce(vc.upvotes_cast,0) AS upvotes_cast,
+         coalesce(vc.downvotes_cast,0) AS downvotes_cast,
+         coalesce(cs.comments_made,0) AS comments_made,
+         coalesce(ls.outgoing_links,0) AS outgoing_links,
+         coalesce(ls.duplicate_links,0) AS duplicate_links,
+         coalesce(ls.total_links,0) AS total_links,
+         coalesce(ls.avg_link_delay_seconds,0) AS avg_link_delay_seconds,
+         coalesce(ed.edits_made,0) AS edits_made,
+         coalesce(ed.posts_edited,0) AS posts_edited,
+         coalesce(ut.tag,'<<no-tag>>') AS top_tag,
+         coalesce(ut.tag_count,0) AS top_tag_count,
+         coalesce((SELECT sum(CASE WHEN b.Class = 1 THEN 5 WHEN b.Class = 2 THEN 3 WHEN b.Class = 3 THEN 1 ELSE 0 END) FROM Badges b WHERE b.UserId = u.Id),0) AS badge_weight,
+         (SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY qfa.secs_to_first_answer) FROM question_first_answer qfa WHERE qfa.OwnerUserId = u.Id AND qfa.secs_to_first_answer IS NOT NULL) AS median_secs_to_first_answer,
+         (SELECT count(*) FROM Votes v WHERE v.VoteTypeId = 5 AND v.PostId IN (SELECT p.Id FROM Posts p WHERE p.OwnerUserId = u.Id)) AS favorites_received,
+         (SELECT count(*) FROM Posts ans WHERE ans.OwnerUserId = u.Id AND EXISTS (SELECT 1 FROM Posts q WHERE q.AcceptedAnswerId = ans.Id)) AS accepted_answers_correlated,
+         (coalesce(vr.upvotes_received,0) - coalesce(vr.downvotes_received,0))::numeric AS vote_balance,
+         (coalesce(ub.total_posts,0) / greatest(1.0, extract(epoch FROM (now() - u.CreationDate))/86400.0)) AS posts_per_day,
+         (coalesce(ub.total_views,0) / greatest(1.0, extract(epoch FROM (now() - u.CreationDate))/86400.0)) AS views_per_day,
+         ( ln(1 + greatest(u.Reputation,0)) * 1.7
+           + sqrt(greatest(coalesce(ub.total_posts,0),0)) * 2.5
+           + coalesce((SELECT sum(CASE WHEN b.Class = 1 THEN 5 WHEN b.Class = 2 THEN 3 WHEN b.Class = 3 THEN 1 ELSE 0 END) FROM Badges b WHERE b.UserId = u.Id),0) * 1.2
+           + coalesce(vr.upvotes_received,0) * 0.3
+           - coalesce(vr.downvotes_received,0) * 0.5
+           + coalesce(ua.accepted_answers,0) * 3
+           + coalesce(cs.comments_made,0) * 0.05
+         )::numeric AS composite_score
+  FROM Users u
+  LEFT JOIN user_basics ub ON ub.user_id = u.Id
+  LEFT JOIN user_accepts ua ON ua.user_id = u.Id
+  LEFT JOIN votes_received vr ON vr.user_id = u.Id
+  LEFT JOIN votes_cast vc ON vc.user_id = u.Id
+  LEFT JOIN comments_summary cs ON cs.user_id = u.Id
+  LEFT JOIN link_summary ls ON ls.user_id = u.Id
+  LEFT JOIN edits_summary ed ON ed.user_id = u.Id
+  LEFT JOIN user_top_tag ut ON ut.user_id = u.Id AND ut.rn = 1
+),
+
+ranked_users AS (
+  SELECT c.*,
+         row_number() OVER (ORDER BY c.composite_score DESC NULLS LAST) AS rank_overall,
+         percent_rank() OVER (ORDER BY c.composite_score DESC) AS pct_rank,
+         ntile(10) OVER (ORDER BY c.composite_score DESC) AS decile,
+         lag(c.composite_score) OVER (ORDER BY c.composite_score DESC) AS prev_score,
+         lead(c.composite_score) OVER (ORDER BY c.composite_score DESC) AS next_score
+  FROM composite_user_metrics c
+  WHERE c.user_id IN (SELECT user_id FROM candidate_users) OR c.composite_score > 50
+),
+
+user_similarity AS (
+  SELECT ru.user_id,
+         (SELECT ut2.user_id
+          FROM user_tag_counts ut1
+          JOIN user_tag_counts ut2 ON ut1.tag = ut2.tag AND ut1.user_id = ru.user_id AND ut2.user_id <> ru.user_id
+          GROUP BY ut2.user_id
+          ORDER BY sum(least(ut1.tag_count, ut2.tag_count)) DESC, count(*) DESC
+          LIMIT 1) AS most_similar_user,
+         (SELECT sum(least(ut1.tag_count, ut2.tag_count))
+          FROM user_tag_counts ut1
+          JOIN user_tag_counts ut2 ON ut1.tag = ut2.tag
+          WHERE ut1.user_id = ru.user_id AND ut2.user_id <> ru.user_id
+         ) AS similarity_score
+  FROM ranked_users ru
+),
+
+final_output AS (
+  SELECT ru.rank_overall,
+         ru.user_id,
+         ru.DisplayName,
+         ru.normalized_display,
+         ru.location_signature,
+         ru.Reputation,
+         round(ru.composite_score::numeric,3) AS composite_score,
+         ru.pct_rank,
+         ru.decile,
+         round(ru.days_since_creation::numeric,2) AS days_since_creation,
+         coalesce(ru.total_posts,0) AS total_posts,
+         coalesce(ru.questions,0) AS questions,
+         coalesce(ru.answers,0) AS answers,
+         coalesce(ru.avg_score,0)::numeric AS avg_score,
+         coalesce(ru.total_views,0) AS total_views,
+         round(coalesce(ru.views_per_day,0)::numeric,3) AS views_per_day,
+         round(coalesce(ru.posts_per_day,0)::numeric,3) AS posts_per_day,
+         coalesce(ru.top_tag,'<<no-tag>>') AS top_tag,
+         coalesce(ru.top_tag_count,0) AS top_tag_count,
+         coalesce(tt.trend_delta,0) AS top_tag_trend_delta,
+         coalesce(us.most_similar_user, NULL) AS most_similar_user,
+         coalesce(us.similarity_score,0) AS similarity_score,
+         coalesce(ru.accepted_answers,0) AS accepted_answers,
+         coalesce(ru.accepted_answers_correlated,0) AS accepted_answers_correlated,
+         coalesce(ru.favorites_received,0) AS favorites_received,
+         coalesce(ru.upvotes_received,0) AS upvotes_received,
+         coalesce(ru.downvotes_received,0) AS downvotes_received,
+         coalesce(ru.vote_balance,0) AS vote_balance,
+         coalesce(ru.comments_made,0) AS comments_made,
+         coalesce(ru.edits_made,0) AS edits_made,
+         coalesce(ru.avg_link_delay_seconds,0)::numeric AS avg_link_delay_seconds,
+         coalesce(ru.median_secs_to_first_answer,0)::numeric AS median_secs_to_first_answer,
+         CASE
+           WHEN ru.total_posts IS NULL OR ru.total_posts = 0 THEN 'lurker'
+           WHEN ru.composite_score > 200 THEN 'power-user'
+           WHEN ru.median_secs_to_first_answer IS NULL THEN 'no-answers'
+           WHEN ru.top_tag = '<<no-tag>>' THEN 'untagged'
+           ELSE 'active'
+         END AS user_profile_bucket
+  FROM ranked_users ru
+  LEFT JOIN user_similarity us ON us.user_id = ru.user_id
+  LEFT JOIN trending_tags tt ON tt.tag = lower(coalesce(ru.top_tag,''))
+  ORDER BY ru.rank_overall
+  LIMIT 200
+)
+
+SELECT * FROM final_output;

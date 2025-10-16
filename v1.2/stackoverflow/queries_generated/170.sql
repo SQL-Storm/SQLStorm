@@ -1,0 +1,210 @@
+-- {"query": "170.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.1, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1839} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 as Level,
+        cast(t.TagName as varchar(1000)) as Path
+    from Tags t
+    where t.IsRequired = 1
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        r.Level + 1,
+        r.Path || ' > ' || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.IsModeratorOnly = 0 and t.Count < r.Count and t.Id <> r.Id
+    where r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserReputationRank as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        dense_rank() over (order by u.Reputation desc) as RepRank
+    from Users u
+),
+PostAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        count(a.Id) as AnswerCount,
+        avg(coalesce(a.Score,0)) as AvgAnswerScore,
+        max(coalesce(a.Score,0)) as MaxAnswerScore,
+        sum(case when a.OwnerUserId is null then 0 else 1 end) as AnswersWithOwner
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.Tags
+),
+PostCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join CloseReasonTypes crt on cast(ph.Comment as int) = crt.Id
+    where ph.PostHistoryTypeId = 10
+),
+TopUsersWithBadges as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(sum(case when b.Class = 1 then b.BadgeCount else 0 end),0) as GoldBadges,
+        coalesce(sum(case when b.Class = 2 then b.BadgeCount else 0 end),0) as SilverBadges,
+        coalesce(sum(case when b.Class = 3 then b.BadgeCount else 0 end),0) as BronzeBadges
+    from Users u
+    left join UserBadgeCounts b on u.Id = b.UserId
+    group by u.Id, u.DisplayName, u.Reputation
+    having u.Reputation > 10000
+),
+AnswerVotesWindow as (
+    select
+        v.PostId,
+        v.VoteTypeId,
+        count(*) as VoteCount
+    from Votes v
+    where v.VoteTypeId in (2,3) -- UpMod and DownMod
+    group by v.PostId, v.VoteTypeId
+),
+AnswerVoteSummary as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        coalesce(uv_up.VoteCount,0) as UpVotes,
+        coalesce(uv_down.VoteCount,0) as DownVotes,
+        (coalesce(uv_up.VoteCount,0) - coalesce(uv_down.VoteCount,0)) as NetVotes
+    from Posts a
+    left join AnswerVotesWindow uv_up on a.Id = uv_up.PostId and uv_up.VoteTypeId = 2
+    left join AnswerVotesWindow uv_down on a.Id = uv_down.PostId and uv_down.VoteTypeId = 3
+    where a.PostTypeId = 2
+),
+QuestionsWithAcceptedAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.Tags,
+        a.Id as AcceptedAnswerId,
+        a.Score as AcceptedAnswerScore,
+        av.NetVotes as AcceptedAnswerNetVotes,
+        u.DisplayName as AcceptedAnswerOwner,
+        u.Reputation as AcceptedAnswerOwnerRep
+    from Posts q
+    left join Posts a on q.AcceptedAnswerId = a.Id
+    left join AnswerVoteSummary av on a.Id = av.AnswerId
+    left join Users u on a.OwnerUserId = u.Id
+    where q.PostTypeId = 1
+),
+QuestionsWithCloseInfo as (
+    select
+        q.QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.Tags,
+        q.AcceptedAnswerId,
+        q.AcceptedAnswerScore,
+        q.AcceptedAnswerNetVotes,
+        q.AcceptedAnswerOwner,
+        q.AcceptedAnswerOwnerRep,
+        pcr.CloseReasonName,
+        pcr.CloseDate
+    from QuestionsWithAcceptedAnswerStats q
+    left join PostCloseReasons pcr on q.QuestionId = pcr.PostId
+),
+FinalResult as (
+    select
+        q.QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.Tags,
+        q.AcceptedAnswerId,
+        q.AcceptedAnswerScore,
+        q.AcceptedAnswerNetVotes,
+        q.AcceptedAnswerOwner,
+        q.AcceptedAnswerOwnerRep,
+        q.CloseReasonName,
+        q.CloseDate,
+        row_number() over (partition by q.CloseReasonName order by q.Score desc nulls last) as RankWithinCloseReason,
+        length(coalesce(q.Title,'')) as TitleLength,
+        case when q.CloseDate is null then 'Open' else 'Closed' end as Status,
+        -- Extract first tag from Tags string (format: <tag1><tag2><tag3>)
+        substring(q.Tags from '<([^>]+)>') as FirstTag,
+        -- Count number of tags by counting occurrences of '><' + 1
+        (length(q.Tags) - length(replace(q.Tags, '><', '')) + 1) as TagCount
+    from QuestionsWithCloseInfo q
+    where q.Score > 5
+)
+select
+    f.QuestionId,
+    f.Title,
+    f.CreationDate,
+    f.Score,
+    f.ViewCount,
+    f.TagCount,
+    f.FirstTag,
+    f.AcceptedAnswerId,
+    f.AcceptedAnswerScore,
+    f.AcceptedAnswerNetVotes,
+    f.AcceptedAnswerOwner,
+    f.AcceptedAnswerOwnerRep,
+    f.CloseReasonName,
+    f.CloseDate,
+    f.Status,
+    f.RankWithinCloseReason,
+    f.TitleLength,
+    u.DisplayName as QuestionOwner,
+    u.Reputation as QuestionOwnerRep,
+    coalesce(b.GoldBadges,0) as OwnerGoldBadges,
+    coalesce(b.SilverBadges,0) as OwnerSilverBadges,
+    coalesce(b.BronzeBadges,0) as OwnerBronzeBadges,
+    -- Window function: average score of questions by same owner
+    avg(f.Score) over (partition by u.Id) as AvgOwnerQuestionScore,
+    -- Correlated subquery: count of comments on question
+    (select count(*) from Comments c where c.PostId = f.QuestionId) as CommentCount,
+    -- String expression: concatenated owner display name and first tag
+    concat(coalesce(u.DisplayName,'[deleted]'), ' - ', coalesce(f.FirstTag,'[no-tag]')) as OwnerTagConcat,
+    -- Complex predicate: check if accepted answer owner rep is greater than question owner rep or null logic
+    case when f.AcceptedAnswerOwnerRep is not null and f.AcceptedAnswerOwnerRep > u.Reputation then 1 else 0 end as AcceptedAnswerOwnerHigherRep,
+    -- Outer join with RecursiveTagHierarchy to get tag path for first tag
+    rth.Path as TagHierarchyPath
+from FinalResult f
+left join Users u on u.Id = (
+    select OwnerUserId from Posts where Id = f.QuestionId
+)
+left join TopUsersWithBadges b on b.Id = u.Id
+left join RecursiveTagHierarchy rth on rth.TagName = f.FirstTag
+where f.RankWithinCloseReason <= 10
+order by f.CloseReasonName nulls last, f.Score desc, f.CreationDate desc;

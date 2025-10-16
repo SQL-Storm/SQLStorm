@@ -1,0 +1,201 @@
+-- {"query": "379.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 18384} 
+WITH
+questions AS (
+  SELECT * FROM Posts WHERE PostTypeId = 1
+),
+tags_exploded AS (
+  SELECT q.Id AS QuestionId,
+         lower(trim(t.tag)) AS TagName
+  FROM questions q
+  CROSS JOIN LATERAL unnest(
+    string_to_array(
+      substring(coalesce(q.Tags, ''), 2, GREATEST(length(coalesce(q.Tags, '')) - 2, 0)),
+      '><'
+    )
+  ) AS t(tag)
+  WHERE t.tag <> ''
+),
+tag_popularity AS (
+  SELECT te.TagName,
+         COUNT(*) AS Occurrences,
+         AVG(q.Score) AS AvgScore,
+         SUM(q.ViewCount) AS TotalViews
+  FROM tags_exploded te
+  JOIN questions q ON q.Id = te.QuestionId
+  GROUP BY te.TagName
+),
+votes_by_post AS (
+  SELECT PostId,
+         SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+         SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+         SUM(CASE WHEN VoteTypeId = 1 THEN 1 ELSE 0 END) AS Accepts,
+         SUM(CASE WHEN VoteTypeId = 5 THEN 1 ELSE 0 END) AS Favorites
+  FROM Votes
+  GROUP BY PostId
+),
+answer_stats AS (
+  SELECT ParentId AS QuestionId,
+         COUNT(*) AS AnswerCnt,
+         AVG(Score) AS AvgAnswerScore,
+         MAX(Score) AS MaxAnswerScore,
+         MIN(CreationDate) AS FirstAnswerDate
+  FROM Posts
+  WHERE ParentId IS NOT NULL AND PostTypeId = 2
+  GROUP BY ParentId
+),
+comment_stats AS (
+  SELECT PostId,
+         COUNT(*) AS TotalComments,
+         COUNT(*) FILTER (WHERE CreationDate > CURRENT_TIMESTAMP - INTERVAL '30 days') AS RecentComments,
+         MAX(CreationDate) AS LastCommentDate
+  FROM Comments
+  GROUP BY PostId
+),
+user_badge_counts AS (
+  SELECT UserId,
+         COUNT(*) AS BadgesTotal,
+         SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+         SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+         SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+         MAX(Date) AS LastBadgeDate
+  FROM Badges
+  GROUP BY UserId
+),
+duplicate_summary AS (
+  SELECT RelatedPostId AS QuestionId,
+         COUNT(*) FILTER (WHERE LinkTypeId = 3) AS DuplicateCountToThis,
+         COUNT(*) FILTER (WHERE LinkTypeId = 1) AS LinkedCountToThis
+  FROM PostLinks
+  GROUP BY RelatedPostId
+),
+agg AS (
+  SELECT q.Id AS QuestionId,
+         q.OwnerUserId,
+         q.Title,
+         substring(coalesce(q.Title, '') FROM 1 FOR 120) AS ShortTitle,
+         q.CreationDate,
+         q.LastActivityDate,
+         q.Score,
+         q.ViewCount,
+         q.FavoriteCount,
+         q.AnswerCount AS MetaAnswerCount,
+         COALESCE(a.AnswerCnt, 0) AS RealAnswerCount,
+         COALESCE(v.UpVotes, 0) - COALESCE(v.DownVotes, 0) AS NetVotes,
+         COALESCE(v.UpVotes, 0) AS UpVotes,
+         COALESCE(v.DownVotes, 0) AS DownVotes,
+         COALESCE(a.AvgAnswerScore, 0) AS AvgAnswerScore,
+         COALESCE(a.MaxAnswerScore, 0) AS MaxAnswerScore,
+         COALESCE(c.TotalComments, 0) AS TotalComments,
+         COALESCE(c.RecentComments, 0) AS RecentComments,
+         COALESCE(d.DuplicateCountToThis, 0) AS DuplicateCount,
+         COALESCE(ubc.BadgesTotal, 0) AS OwnerBadges,
+         COALESCE(u.Reputation, 0) AS OwnerReputation,
+         COALESCE(u.DisplayName, q.OwnerDisplayName, 'Community') AS OwnerDisplayName,
+         array_remove(array_agg(DISTINCT te.TagName), NULL) AS TagsArray,
+         COALESCE(array_length(array_remove(array_agg(DISTINCT te.TagName), NULL), 1), 0) AS TagCount,
+         (
+           (COALESCE(q.ViewCount, 0)::numeric / NULLIF(GREATEST(1, DATE_PART('day', CURRENT_TIMESTAMP - COALESCE(q.CreationDate, CURRENT_TIMESTAMP))), 0) * 0.15)
+           + (COALESCE(v.UpVotes, 0) * 3)
+           + (COALESCE(a.AnswerCnt, 0) * 10)
+           + (COALESCE(c.TotalComments, 0) * 2)
+           + (COALESCE(q.FavoriteCount, 0) * 5)
+           - (COALESCE(v.DownVotes, 0) * 1.5)
+         ) AS RawEngagement,
+         ROW_NUMBER() OVER (ORDER BY ((COALESCE(q.ViewCount, 0)::numeric / NULLIF(GREATEST(1, DATE_PART('day', CURRENT_TIMESTAMP - COALESCE(q.CreationDate, CURRENT_TIMESTAMP))), 0) * 0.15) + (COALESCE(v.UpVotes, 0) * 3) + (COALESCE(a.AnswerCnt, 0) * 10)) DESC) AS EngRank,
+         NTILE(10) OVER (ORDER BY COALESCE(q.Score, 0) DESC) AS ScoreDecile,
+         PERCENT_RANK() OVER (ORDER BY COALESCE(q.ViewCount, 0) DESC) AS ViewPctRank,
+         (COALESCE(u.Reputation, 0) / NULLIF((COALESCE(a.AnswerCnt, 0) + 1), 0))::numeric AS RepPerAnswer
+  FROM questions q
+  LEFT JOIN Users u ON u.Id = q.OwnerUserId
+  LEFT JOIN user_badge_counts ubc ON ubc.UserId = u.Id
+  LEFT JOIN votes_by_post v ON v.PostId = q.Id
+  LEFT JOIN answer_stats a ON a.QuestionId = q.Id
+  LEFT JOIN comment_stats c ON c.PostId = q.Id
+  LEFT JOIN duplicate_summary d ON d.QuestionId = q.Id
+  LEFT JOIN tags_exploded te ON te.QuestionId = q.Id
+  GROUP BY q.Id, q.OwnerUserId, q.Title, q.CreationDate, q.LastActivityDate, q.Score, q.ViewCount, q.FavoriteCount, q.AnswerCount,
+           a.AnswerCnt, a.AvgAnswerScore, a.MaxAnswerScore, c.TotalComments, c.RecentComments,
+           d.DuplicateCountToThis, ubc.BadgesTotal, u.Reputation, u.DisplayName, q.OwnerDisplayName, v.UpVotes, v.DownVotes
+),
+primary_tag AS (
+  SELECT a.QuestionId,
+         pt.TagName AS PrimaryTag,
+         pt.Occurrences AS PrimaryTagOccurrences
+  FROM agg a
+  LEFT JOIN LATERAL (
+    SELECT te.TagName, tp.Occurrences
+    FROM tags_exploded te
+    JOIN tag_popularity tp ON tp.TagName = te.TagName
+    WHERE te.QuestionId = a.QuestionId
+    ORDER BY tp.Occurrences DESC NULLS LAST, tp.TotalViews DESC NULLS LAST
+    LIMIT 1
+  ) pt ON TRUE
+),
+top_by_views AS (
+  SELECT * FROM agg
+  WHERE LastActivityDate > CURRENT_TIMESTAMP - INTERVAL '90 days'
+  ORDER BY ViewCount DESC NULLS LAST
+  LIMIT 100
+),
+top_by_score AS (
+  SELECT * FROM agg
+  ORDER BY Score DESC NULLS LAST
+  LIMIT 100
+),
+intersection_top AS (
+  SELECT QuestionId FROM top_by_views
+  INTERSECT
+  SELECT QuestionId FROM top_by_score
+),
+only_recent AS (
+  SELECT QuestionId FROM top_by_views
+  EXCEPT
+  SELECT QuestionId FROM top_by_score
+),
+combined AS (
+  SELECT 'recent_by_views'::text AS Source, tbv.* FROM top_by_views tbv
+  UNION ALL
+  SELECT 'historic_by_score'::text AS Source, tbs.* FROM top_by_score tbs
+)
+SELECT
+  c.Source,
+  c.QuestionId,
+  substring(c.Title FROM 1 FOR 120) AS TitleSnippet,
+  COALESCE(c.OwnerDisplayName, 'unknown') AS Owner,
+  c.OwnerReputation,
+  COALESCE(c.TagCount, 0) AS TagCount,
+  array_to_string(c.TagsArray, ',') AS Tags,
+  COALESCE(pt.PrimaryTag, array_to_string(c.TagsArray, ',')) AS PrimaryTagGuess,
+  COALESCE(pt.PrimaryTagOccurrences, 0) AS PrimaryTagPop,
+  c.ViewCount,
+  c.Score,
+  c.NetVotes,
+  c.RealAnswerCount,
+  c.AvgAnswerScore,
+  c.MaxAnswerScore,
+  c.TotalComments,
+  c.RecentComments,
+  c.DuplicateCount,
+  c.OwnerBadges,
+  c.RawEngagement,
+  c.EngRank,
+  c.ScoreDecile,
+  c.ViewPctRank,
+  c.RepPerAnswer,
+  (SELECT COUNT(*) FROM Posts p2 WHERE p2.ParentId = c.QuestionId AND p2.Score > c.Score) AS AnswersWithHigherScoreThanQuestion,
+  (SELECT AVG(u2.Reputation) FROM Posts ans JOIN Users u2 ON ans.OwnerUserId = u2.Id WHERE ans.ParentId = c.QuestionId AND ans.OwnerUserId IS NOT NULL) AS AvgAnswererReputation,
+  (SELECT MIN(ans.CreationDate) FROM Posts ans WHERE ans.ParentId = c.QuestionId) AS FirstAnswerDate,
+  (SELECT COUNT(*) FROM Votes vx WHERE vx.PostId = c.QuestionId AND vx.VoteTypeId = 5) AS FavoriteCountCheck,
+  CASE WHEN c.TagCount = 0 THEN 'no-tags' ELSE 'has-tags' END AS TagPresence,
+  CASE WHEN c.Score IS NULL THEN -9999 ELSE c.Score END AS ScoreNullSafe,
+  CASE WHEN (c.ViewCount > 10000 OR c.RealAnswerCount > 10) AND c.RawEngagement > GREATEST(100, c.Score * 10) THEN 'high-traffic' ELSE 'normal' END AS TrafficClass,
+  RANK() OVER (PARTITION BY c.Source ORDER BY c.RawEngagement DESC) AS EngRankInSource,
+  ROW_NUMBER() OVER (PARTITION BY c.Source ORDER BY c.ViewCount DESC) AS ViewRowNumInSource,
+  EXISTS (SELECT 1 FROM Users u2 WHERE u2.Id = c.OwnerUserId AND u2.Views > 100000) AS OwnerIsHighProfile,
+  (c.RawEngagement - (SELECT MIN(RawEngagement) FROM agg)) / NULLIF((SELECT MAX(RawEngagement) FROM agg) - (SELECT MIN(RawEngagement) FROM agg), 0) AS NormEngPct,
+  EXISTS (SELECT 1 FROM intersection_top it WHERE it.QuestionId = c.QuestionId) AS IsInBothTop,
+  EXISTS (SELECT 1 FROM only_recent orr WHERE orr.QuestionId = c.QuestionId) AS IsUniqueRecent
+FROM combined c
+LEFT JOIN primary_tag pt ON pt.QuestionId = c.QuestionId
+ORDER BY c.RawEngagement DESC, c.ViewCount DESC
+LIMIT 200;

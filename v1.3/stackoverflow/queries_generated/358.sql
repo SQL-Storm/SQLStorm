@@ -1,0 +1,256 @@
+-- {"query": "358.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 20306} 
+WITH
+user_base AS (
+  SELECT u.Id AS user_id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+  FROM Users u
+),
+posts_agg AS (
+  SELECT p.OwnerUserId AS user_id,
+         count(*) AS total_posts,
+         count(*) FILTER (WHERE p.PostTypeId = 1) AS question_count,
+         count(*) FILTER (WHERE p.PostTypeId = 2) AS answer_count,
+         sum(coalesce(p.Score,0)) AS total_post_score,
+         avg(coalesce(p.Score,0)) FILTER (WHERE p.PostTypeId = 2) AS avg_answer_score,
+         percentile_disc(0.5) WITHIN GROUP (ORDER BY coalesce(p.Score,0)) FILTER (WHERE p.PostTypeId = 2) AS median_answer_score,
+         sum(coalesce(p.ViewCount,0)) FILTER (WHERE p.PostTypeId = 1) AS view_question_count,
+         max(p.CreationDate) AS last_post_date,
+         max(p.LastActivityDate) AS last_post_activity
+  FROM Posts p
+  WHERE p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId
+),
+accepted_answers AS (
+  SELECT a.OwnerUserId AS user_id,
+         count(*) AS accepted_count,
+         avg(extract(epoch FROM (a.CreationDate - q.CreationDate)))/3600.0 AS avg_hours_to_accept
+  FROM Posts a
+  JOIN Posts q ON q.AcceptedAnswerId = a.Id
+  WHERE a.PostTypeId = 2 AND q.PostTypeId = 1 AND a.OwnerUserId IS NOT NULL
+  GROUP BY a.OwnerUserId
+),
+comments_agg AS (
+  SELECT c.UserId AS user_id,
+         count(*) AS comment_count,
+         avg(coalesce(c.Score,0)) AS avg_comment_score,
+         count(DISTINCT c.PostId) AS distinct_commented_posts
+  FROM Comments c
+  WHERE c.UserId IS NOT NULL
+  GROUP BY c.UserId
+),
+badge_counts AS (
+  SELECT b.UserId AS user_id,
+         count(*) AS total_badges,
+         count(*) FILTER (WHERE b.Class = 1) AS gold_badges,
+         count(*) FILTER (WHERE b.Class = 2) AS silver_badges,
+         count(*) FILTER (WHERE b.Class = 3) AS bronze_badges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+tag_usage AS (
+  SELECT p.OwnerUserId AS user_id,
+         lower(trim(t.tag)) AS tag,
+         count(*) AS tag_count
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) AS tag
+  ) t
+  WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL AND p.Tags IS NOT NULL AND length(p.Tags) > 2
+  GROUP BY p.OwnerUserId, lower(trim(t.tag))
+),
+top_tags AS (
+  SELECT tu.user_id,
+         string_agg(tu.tag || ' (' || tu.tag_count::text || ')', ', ' ORDER BY tu.tag_count DESC, tu.tag) AS top_tags,
+         (array_agg(tu.tag ORDER BY tu.tag_count DESC, tu.tag))[1:3] AS top_tag_array
+  FROM tag_usage tu
+  GROUP BY tu.user_id
+),
+edit_activity AS (
+  SELECT ph.UserId AS user_id,
+         count(*) AS total_edits,
+         count(distinct ph.PostId) AS distinct_edited_posts,
+         max(ph.CreationDate) AS last_edit_date
+  FROM PostHistory ph
+  WHERE ph.UserId IS NOT NULL
+  GROUP BY ph.UserId
+),
+votes_cast AS (
+  SELECT v.UserId AS user_id,
+         count(*) AS votes_cast,
+         count(*) FILTER (WHERE v.VoteTypeId = 2) AS upvotes_cast,
+         count(*) FILTER (WHERE v.VoteTypeId = 3) AS downvotes_cast
+  FROM Votes v
+  WHERE v.UserId IS NOT NULL
+  GROUP BY v.UserId
+),
+posts_period AS (
+  SELECT p.OwnerUserId AS user_id,
+         sum(CASE WHEN p.CreationDate >= now() - interval '30 days' THEN 1 ELSE 0 END) AS posts_30d,
+         sum(CASE WHEN p.CreationDate >= now() - interval '120 days' AND p.CreationDate < now() - interval '30 days' THEN 1 ELSE 0 END) AS posts_prev_90d
+  FROM Posts p
+  WHERE p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId
+),
+comments_period AS (
+  SELECT c.UserId AS user_id,
+         sum(CASE WHEN c.CreationDate >= now() - interval '30 days' THEN 1 ELSE 0 END) AS comments_30d,
+         sum(CASE WHEN c.CreationDate >= now() - interval '120 days' AND c.CreationDate < now() - interval '30 days' THEN 1 ELSE 0 END) AS comments_prev_90d
+  FROM Comments c
+  WHERE c.UserId IS NOT NULL
+  GROUP BY c.UserId
+),
+period_activity AS (
+  SELECT u.Id AS user_id,
+         coalesce(pp.posts_30d,0) AS posts_30d,
+         coalesce(pp.posts_prev_90d,0) AS posts_prev_90d,
+         coalesce(cp.comments_30d,0) AS comments_30d,
+         coalesce(cp.comments_prev_90d,0) AS comments_prev_90d
+  FROM Users u
+  LEFT JOIN posts_period pp ON pp.user_id = u.Id
+  LEFT JOIN comments_period cp ON cp.user_id = u.Id
+),
+global_answer_90th AS (
+  SELECT percentile_disc(0.9) WITHIN GROUP (ORDER BY coalesce(p.Score,0)) AS p90_score FROM Posts p WHERE p.PostTypeId = 2
+),
+users_with_no_posts AS (
+  -- demonstrate a RIGHT JOIN outer-join usage to list users without posts
+  SELECT u.Id AS user_id
+  FROM Posts p RIGHT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.Id IS NULL
+),
+user_metrics AS (
+  SELECT ub.user_id,
+         ub.DisplayName,
+         ub.Reputation,
+         ub.CreationDate,
+         ub.LastAccessDate,
+         coalesce(pa.total_posts,0) AS total_posts,
+         coalesce(pa.question_count,0) AS question_count,
+         coalesce(pa.answer_count,0) AS answer_count,
+         coalesce(pa.total_post_score,0) AS total_post_score,
+         coalesce(pa.avg_answer_score,0) AS avg_answer_score,
+         coalesce(pa.median_answer_score,0) AS median_answer_score,
+         coalesce(aa.accepted_count,0) AS accepted_count,
+         coalesce(aa.avg_hours_to_accept,0) AS avg_hours_to_accept,
+         coalesce(ca.comment_count,0) AS comment_count,
+         coalesce(ca.distinct_commented_posts,0) AS distinct_commented_posts,
+         coalesce(bc.total_badges,0) AS total_badges,
+         coalesce(bc.gold_badges,0) AS gold_badges,
+         coalesce(bc.silver_badges,0) AS silver_badges,
+         coalesce(bc.bronze_badges,0) AS bronze_badges,
+         coalesce(tt.top_tags,'') AS top_tags,
+         coalesce(tt.top_tag_array, array[]::text[]) AS top_tag_array,
+         coalesce(ed.total_edits,0) AS total_edits,
+         coalesce(ed.distinct_edited_posts,0) AS distinct_edited_posts,
+         coalesce(vc.votes_cast,0) AS votes_cast,
+         coalesce(period.posts_30d,0) AS posts_30d,
+         coalesce(period.posts_prev_90d,0) AS posts_prev_90d,
+         coalesce(period.comments_30d,0) AS comments_30d,
+         coalesce(period.comments_prev_90d,0) AS comments_prev_90d,
+         extract(epoch FROM (now() - ub.CreationDate))/86400 AS age_days,
+         floor(extract(epoch FROM (now() - greatest(coalesce(pa.last_post_activity, ub.LastAccessDate), coalesce(ed.last_edit_date, ub.LastAccessDate))))/86400) AS days_since_activity,
+         (
+           ln(GREATEST(1, ub.Reputation) + 1) * 2.5
+           + sqrt(GREATEST(0, coalesce(pa.answer_count,0))) * 3.1
+           + coalesce(aa.accepted_count,0) * 18
+           + coalesce(bc.total_badges,0) * 5.2
+           + coalesce(ca.comment_count,0) * 0.6
+           + coalesce(pa.avg_answer_score,0) * 2.0
+           + LEAST(coalesce(period.posts_30d,0) + coalesce(period.comments_30d,0), 90) * 1.4
+           - LEAST(extract(epoch FROM (now() - ub.LastAccessDate))/86400, 365) * 0.02
+         )::numeric(18,6) AS influence_score,
+         (
+           (coalesce(period.posts_30d,0) * 3.2)
+           + (coalesce(period.comments_30d,0) * 1.1)
+           + sqrt(GREATEST(0, coalesce(ed.total_edits,0))) * 2.1
+           + LEAST(coalesce(vc.votes_cast,0),1000) * 0.005
+         )::numeric(12,4) AS activity_score
+  FROM user_base ub
+  LEFT JOIN posts_agg pa ON pa.user_id = ub.user_id
+  LEFT JOIN accepted_answers aa ON aa.user_id = ub.user_id
+  LEFT JOIN comments_agg ca ON ca.user_id = ub.user_id
+  LEFT JOIN badge_counts bc ON bc.user_id = ub.user_id
+  LEFT JOIN top_tags tt ON tt.user_id = ub.user_id
+  LEFT JOIN edit_activity ed ON ed.user_id = ub.user_id
+  LEFT JOIN votes_cast vc ON vc.user_id = ub.user_id
+  LEFT JOIN period_activity period ON period.user_id = ub.user_id
+),
+rising_metrics AS (
+  SELECT um.user_id, um.DisplayName, um.Reputation,
+         um.posts_30d, um.posts_prev_90d, um.comments_30d, um.comments_prev_90d,
+         um.activity_score,
+         CASE
+           WHEN (um.posts_prev_90d + um.comments_prev_90d) = 0 THEN NULL
+           ELSE ((um.posts_30d + um.comments_30d) - (um.posts_prev_90d + um.comments_prev_90d))::numeric / NULLIF((um.posts_prev_90d + um.comments_prev_90d), 0)
+         END AS growth_ratio,
+         ((um.posts_30d + um.comments_30d) - (um.posts_prev_90d + um.comments_prev_90d)) AS growth_delta
+  FROM user_metrics um
+),
+candidate_ids AS (
+  -- set operator: UNION of top influencers and top risers (deduplicated)
+  SELECT user_id FROM (
+    SELECT user_id, influence_score FROM user_metrics ORDER BY influence_score DESC NULLS LAST LIMIT 200
+  ) t
+  UNION
+  SELECT user_id FROM (
+    SELECT user_id, growth_ratio FROM rising_metrics WHERE growth_ratio IS NOT NULL ORDER BY growth_ratio DESC NULLS LAST LIMIT 200
+  ) r
+)
+SELECT
+  um.user_id,
+  um.DisplayName,
+  lower(regexp_replace(coalesce(um.DisplayName,''), '[^a-z0-9]+', '-', 'gi')) AS slug,
+  um.Reputation,
+  um.influence_score,
+  um.activity_score,
+  um.total_posts,
+  um.question_count,
+  um.answer_count,
+  um.accepted_count,
+  round(um.avg_answer_score::numeric,2) AS avg_answer_score,
+  um.median_answer_score,
+  um.top_tags,
+  um.top_tag_array,
+  um.total_badges,
+  um.gold_badges,
+  um.silver_badges,
+  um.bronze_badges,
+  um.posts_30d,
+  um.comments_30d,
+  um.posts_prev_90d,
+  um.comments_prev_90d,
+  um.days_since_activity,
+  um.age_days,
+  -- correlated subqueries & heavier predicates
+  (SELECT count(DISTINCT pl.RelatedPostId)
+   FROM PostLinks pl
+   JOIN Posts p2 ON p2.Id = pl.PostId
+   WHERE p2.OwnerUserId = um.user_id) AS outgoing_links_count,
+  (SELECT count(DISTINCT pl.PostId)
+   FROM PostLinks pl
+   WHERE pl.RelatedPostId IN (SELECT p3.Id FROM Posts p3 WHERE p3.OwnerUserId = um.user_id)
+  ) AS incoming_links_count,
+  (SELECT count(DISTINCT c.UserId)
+   FROM Comments c
+   JOIN Posts p4 ON p4.Id = c.PostId
+   WHERE p4.OwnerUserId = um.user_id AND c.UserId IS NOT NULL
+  ) AS distinct_commenters_on_their_posts,
+  (SELECT avg(length(p5.Body)) FROM Posts p5 WHERE p5.OwnerUserId = um.user_id AND p5.Body IS NOT NULL) AS avg_post_body_length,
+  (SELECT count(*) FROM Posts p6 WHERE p6.OwnerUserId = um.user_id AND p6.ClosedDate IS NOT NULL) AS closed_posts_count,
+  (SELECT count(*) FROM Posts p7 WHERE p7.OwnerUserId = um.user_id AND p7.Score >= 50) AS high_score_posts_count,
+  (SELECT count(*) FROM Posts p8 WHERE p8.OwnerUserId = um.user_id AND p8.Title IS NOT NULL AND p8.Title ILIKE '%error%') AS posts_with_error_in_title,
+  (SELECT count(*) FROM Votes v2 WHERE v2.PostId IN (SELECT p9.Id FROM Posts p9 WHERE p9.OwnerUserId = um.user_id) AND v2.VoteTypeId = 2) AS upvotes_on_their_posts,
+  (SELECT p90.p90_score FROM global_answer_90th p90 LIMIT 1) AS global_answer_90th_score,
+  (SELECT count(*) FROM Posts p10 WHERE p10.PostTypeId = 2 AND p10.OwnerUserId = um.user_id AND p10.Score >= (SELECT p90_score FROM global_answer_90th)) AS answers_in_top_10pct,
+  (SELECT count(*) FROM PostHistory ph2 WHERE ph2.PostHistoryTypeId IN (10,12) AND ph2.UserId = um.user_id) AS close_or_deleted_events_in_history,
+  -- composite
+  ((um.influence_score * 0.7) + (um.activity_score * 0.3) + (SELECT count(*) FROM Posts p11 WHERE p11.OwnerUserId = um.user_id AND p11.Score > 0) * 0.05)::numeric(18,6) AS final_composite_score,
+  row_number() OVER (ORDER BY ((um.influence_score * 0.7) + (um.activity_score * 0.3)) DESC NULLS LAST) AS global_rank
+FROM candidate_ids cid
+JOIN user_metrics um ON um.user_id = cid.user_id
+LEFT JOIN rising_metrics rm ON rm.user_id = cid.user_id
+WHERE um.total_posts > 0
+  AND -- complicated predicate mixing null logic and pattern matching
+  (um.Reputation IS NOT NULL AND (um.Reputation > 10 OR um.total_badges > 0 OR um.posts_30d > 0))
+  AND NOT (um.DisplayName IS NULL OR um.DisplayName ~ '^\\s*$')
+ORDER BY final_composite_score DESC NULLS LAST, um.Reputation DESC
+LIMIT 500;

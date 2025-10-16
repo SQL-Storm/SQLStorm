@@ -1,0 +1,37 @@
+SELECT
+    COALESCE(UTP.AvgQuestionScoreAcrossTagsUsed, 0.0) AS AvgQuestionScoreAcrossTagsUsed,
+    COALESCE(GTS.AvgGlobalScoreForTag, 0.0) AS AvgScoreOfMostFrequentTagGlobally,
+    SUM(PHM.TotalEditHistoryEvents) AS TotalPostEditEventsSum,
+    SUM(PHM.DistinctEditors) AS TotalDistinctEditorsOnPosts,
+    MAX(PHM.WasClosed) AS UserHasClosedPosts,
+    MAX(PHM.WasReopened) AS UserHasReopenedPosts,
+    STRING_AGG(DISTINCT
+        CASE PHM.LastCloseReasonTypeId
+            WHEN 1 THEN 'Duplicate' WHEN 2 THEN 'Off-topic' WHEN 3 THEN 'Subjective'
+            WHEN 4 THEN 'Not a real question' WHEN 101 THEN 'Duplicate (New)' WHEN 102 THEN 'Off-topic (New)'
+            ELSE NULL
+        END, ', ' ORDER BY MIN(PHM.LastCloseReasonTypeId)) FILTER (WHERE PHM.LastCloseReasonTypeId <> -1) AS UserCloseReasonSummary,
+    UES.UserId,
+    UES.DisplayName,
+    UES.Reputation,
+    UES.TotalPostsCreated,
+    UES.TotalQuestionsAsked,
+    UES.TotalAnswersGiven,
+    UES.TotalPostScore,
+    UES.UserTenureDays,
+    UTP.UniqueTagsUsed,
+    UES.TotalUpVotesGiven,
+    UES.TotalDownVotesGiven,
+    UES.AvgAnswerScoreOverall
+FROM UserEngagementSummary UES
+LEFT JOIN PostHistoryMetrics PHM ON UES.UserId = PHM.OwnerUserId
+LEFT JOIN UserTagPerformance UTP ON UES.UserId = UTP.UserId
+LEFT JOIN MostFrequentTagPerUser MFTPU ON UES.UserId = MFTPU.UserId
+LEFT JOIN GlobalTagAvgScores GTS ON MFTPU.TopTag = GTS.TagName
+WHERE UES.TotalPostsCreated > 5
+  AND UES.Reputation > 500
+GROUP BY
+    UES.UserId, UES.DisplayName, UES.Reputation, UES.CreationDate, UES.TotalPostsCreated,
+    UES.TotalQuestionsAsked, UES.TotalAnswersGiven, UES.TotalPostScore, UES.UserTenureDays,
+    UES.TotalUpVotesGiven, UES.TotalDownVotesGiven, UES.AvgAnswerScoreOverall,
+    UTP.UniqueTagsUsed, UTP.AvgQuestionScoreAcrossTagsUsed, GTS.AvgGlobalScoreForTag;

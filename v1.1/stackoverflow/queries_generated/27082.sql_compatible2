@@ -1,0 +1,149 @@
+WITH ActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(p.Id) AS PostCount,
+        COUNT(DISTINCT a.Id) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(a.CreationDate) AS LastAnswerDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    WHERE
+        u.LastAccessDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days'
+    GROUP BY
+        u.Id, u.Reputation, u.DisplayName
+),
+TagStatistics AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        t.Count AS TotalQuestions,
+        COUNT(p.Id) AS QuestionsWithAnswers,
+        AVG(p.AnswerCount) AS AvgAnswersPerQuestion,
+        SUM(p.ViewCount) AS TotalViews,
+        MAX(p.ViewCount) AS MaxViews,
+        MIN(p.ViewCount) AS MinViews,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.ViewCount) AS MedianViews,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.Score) AS MaxScore,
+        MIN(p.Score) AS MinScore
+    FROM
+        Tags t
+    LEFT JOIN
+        Posts p ON t.TagName = ANY(string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags) - 2), '><'))
+    WHERE
+        p.PostTypeId = 1
+    GROUP BY
+        t.Id, t.TagName, t.Count
+),
+RecentPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        u.DisplayName AS OwnerDisplayName,
+        COALESCE(a.DisplayName, 'No Accepted Answer') AS AcceptedAnswerDisplayName,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(v.Id) AS VoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        p.OwnerUserId
+    FROM
+        Posts p
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN
+        Posts a ON p.AcceptedAnswerId = a.Id
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    WHERE
+        p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '7 days'
+    GROUP BY
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.Title, u.DisplayName, a.DisplayName, p.OwnerUserId
+)
+SELECT
+    au.UserId,
+    au.DisplayName,
+    au.Reputation,
+    au.PostCount,
+    au.AnswerCount,
+    au.CommentCount,
+    au.VoteCount,
+    au.UpVoteCount,
+    au.DownVoteCount,
+    au.LastPostDate,
+    au.LastAnswerDate,
+    au.LastCommentDate,
+    au.LastVoteDate,
+    ts.TagId,
+    ts.TagName,
+    ts.TotalQuestions,
+    ts.QuestionsWithAnswers,
+    ts.AvgAnswersPerQuestion,
+    ts.TotalViews,
+    ts.MaxViews,
+    ts.MinViews,
+    ts.MedianViews,
+    ts.TotalScore,
+    ts.AvgScore,
+    ts.MaxScore,
+    ts.MinScore,
+    rp.PostId,
+    rp.PostTypeId,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.Title,
+    rp.OwnerDisplayName,
+    rp.AcceptedAnswerDisplayName,
+    rp.CommentCount,
+    rp.VoteCount,
+    (SELECT
+        COUNT(DISTINCT ph.Id)
+     FROM
+        PostHistory ph
+     WHERE
+        ph.PostId = rp.PostId AND ph.PostHistoryTypeId IN (10, 11, 12, 13)
+     ) AS CloseVoteCount,
+    (CASE
+        WHEN EXISTS (
+            SELECT
+                1
+            FROM
+                PostLinks pl
+            WHERE
+                pl.PostId = rp.PostId AND pl.LinkTypeId = 3
+        ) THEN
+            'Duplicate'
+        ELSE
+            'Unique'
+    END) AS DuplicateStatus
+FROM
+    ActiveUsers au
+CROSS JOIN
+    TagStatistics ts
+LEFT JOIN
+    RecentPosts rp ON au.UserId = rp.OwnerUserId
+ORDER BY
+    au.Reputation DESC, ts.TotalQuestions DESC, rp.CreationDate DESC;

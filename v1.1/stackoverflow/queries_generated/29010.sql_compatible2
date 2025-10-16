@@ -1,0 +1,57 @@
+SELECT
+  pa.Id,
+  pa.PostTypeId,
+  pa.ParentId,
+  pa.CreationDate,
+  pa.Score,
+  pa.ViewCount,
+  pa.CommentCount,
+  pa.FavoriteCount,
+  pa.LastActivityDate,
+  pa.Tags,
+  pa.AnswerCount,
+  pa.rn,
+  us.UserId,
+  us.DisplayName,
+  us.Reputation,
+  tf.tagname
+FROM PostAgg pa
+LEFT JOIN "UserStats" us
+  ON us.UserId = pa.OwnerUserId
+LEFT JOIN TagFrequency tf
+  ON EXISTS (
+    SELECT 1
+    FROM UNNEST(STRING_TO_ARRAY(
+      CASE
+        WHEN pa.Tags IS NULL OR pa.Tags = '' THEN ''
+        ELSE SUBSTRING(pa.Tags FROM 2 FOR (CHAR_LENGTH(pa.Tags) - 2))
+      END, '><'
+    )) AS tag(tagname)
+    WHERE tag.tagname = tf.tagname
+  )
+WHERE (pa.Score IS NOT NULL OR pa.ViewCount IS NOT NULL OR pa.CommentCount IS NOT NULL)
+  AND (pa.PostTypeId = 1 OR pa.PostTypeId = 2)
+  AND pa.AnswerCount IS NOT NULL
+  AND pa.CommentCount >= 0
+  AND pa.FavoriteCount >= 0
+  AND pa.rn IS NOT NULL
+  AND us.Reputation > 100
+GROUP BY
+  pa.Id,
+  pa.PostTypeId,
+  pa.ParentId,
+  pa.CreationDate,
+  pa.Score,
+  pa.ViewCount,
+  pa.CommentCount,
+  pa.FavoriteCount,
+  pa.LastActivityDate,
+  pa.Tags,
+  pa.AnswerCount,
+  pa.rn,
+  us.UserId,
+  us.DisplayName,
+  us.Reputation,
+  tf.tagname
+ORDER BY pa.LastActivityDate DESC, pa.Score DESC, pa.ViewCount DESC
+LIMIT 1000;

@@ -1,0 +1,58 @@
+-- {"query": "2080.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4o", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 474} 
+WITH RecentBadges AS (
+    SELECT DISTINCT ON (b.UserId)
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Date AS BadgeDate
+    FROM
+        Badges b
+    ORDER BY
+        b.UserId, b.Date DESC
+),
+UserRankings AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COALESCE(u.Reputation, 0) + COALESCE(SUM(v.BountyAmount), 0) AS TotalEffect,
+        DENSE_RANK() OVER (ORDER BY COALESCE(u.Reputation, 0) + COALESCE(SUM(v.BountyAmount), 0) DESC) AS Ranking
+    FROM 
+        Users u
+    LEFT JOIN 
+        Votes v ON u.Id = v.UserId AND v.VoteTypeId IN (8, 9)
+    GROUP BY 
+        u.Id
+)
+SELECT
+    ur.UserId,
+    ur.DisplayName,
+    ur.TotalEffect,
+    ur.Ranking,
+    rb.BadgeName,
+    CASE 
+        WHEN rb.BadgeDate IS NULL THEN 'No recent badge'
+        ELSE to_char(rb.BadgeDate, 'YYYY-MM-DD')
+    END AS RecentBadgeDate,
+    CONCAT_WS(' - ', COALESCE(p.Title, 'No title'), COALESCE(u1.DisplayName, p.OwnerDisplayName, 'Anonymous')) AS RecentActivity
+FROM
+    UserRankings ur
+LEFT JOIN
+    RecentBadges rb ON ur.UserId = rb.UserId
+LEFT JOIN
+    (SELECT
+        p.OwnerUserId, 
+        p.Title,
+        u1.DisplayName,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS rn
+     FROM 
+        Posts p
+     LEFT JOIN 
+        Users u1 ON p.LastEditorUserId = u1.Id
+     WHERE 
+        p.PostTypeId IN (1, 2) -- Questions and Answers
+     AND 
+        p.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '30 days')
+    ) p ON p.OwnerUserId = ur.UserId AND p.rn = 1
+WHERE
+    ur.Ranking <= 100
+ORDER BY
+    ur.Ranking, ur.TotalEffect DESC;

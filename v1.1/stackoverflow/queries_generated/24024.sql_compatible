@@ -1,0 +1,101 @@
+WITH 
+Q AS (
+    SELECT
+        p.Id           AS QuestionId,
+        p.Title,
+        p.Tags,
+        p.Score        AS QuestionScore,
+        p.AnswerCount,
+        p.AcceptedAnswerId,
+        p.ViewCount,
+        u.Reputation   AS OwnerReputation,
+        u.DisplayName  AS OwnerDisplayName,
+        p.OwnerUserId
+    FROM Posts p
+    JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+),
+V2 AS (
+    SELECT PostId FROM Votes WHERE VoteTypeId = 2
+),
+V3 AS (
+    SELECT PostId FROM Votes WHERE VoteTypeId = 3
+),
+VAll AS (
+    SELECT PostId FROM V2
+    UNION ALL
+    SELECT PostId FROM V3
+),
+V AS (
+    SELECT
+        PostId,
+        COUNT(*) AS VoteCount
+    FROM VAll
+    GROUP BY PostId
+),
+C AS (
+    SELECT
+        PostId,
+        COUNT(*) AS CommentCnt
+    FROM Comments
+    GROUP BY PostId
+),
+TagList AS (
+    SELECT
+        q.QuestionId,
+        TRIM(t.value) AS TagName
+    FROM Q q
+    CROSS APPLY STRING_SPLIT(q.Tags, '><') t
+    WHERE t.value IS NOT NULL
+),
+TagRank AS (
+    SELECT
+        tl.TagName,
+        tl.QuestionId,
+        q.QuestionScore,
+        ROW_NUMBER() OVER (
+            PARTITION BY tl.TagName 
+            ORDER BY q.QuestionScore DESC, q.ViewCount DESC
+        ) AS Rank
+    FROM TagList tl
+    JOIN Q q ON q.QuestionId = tl.QuestionId
+)
+SELECT
+    q.QuestionId,
+    q.Title,
+    q.Tags,
+    q.QuestionScore,
+    q.AnswerCount,
+    COALESCE(v.VoteCount, 0) AS TotalVoteCount,
+    COALESCE(c.CommentCnt, 0) AS CommentCount,
+    (
+        SELECT COUNT(*) 
+        FROM Posts a 
+        WHERE a.ParentId = q.QuestionId
+          AND a.Score > 10
+    ) AS HighScoreAnswerCount,
+    CASE 
+        WHEN q.AnswerCount > 5 THEN 'Extensive'
+        WHEN q.AnswerCount > 0 THEN 'Answered'
+        ELSE 'NoAnswer'
+    END AS AnswerMeta,
+    CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN '✅' ELSE '' END AS Accepted,
+    tl.TagName,
+    tr.Rank AS TagRank,
+    COALESCE(q.OwnerReputation, 0) AS OwnerReputation,
+    q.ViewCount,
+    q.OwnerUserId
+FROM 
+    Q q
+LEFT JOIN V v ON v.PostId = q.QuestionId
+LEFT JOIN C c ON c.PostId = q.QuestionId
+LEFT JOIN TagList tl ON tl.QuestionId = q.QuestionId
+LEFT JOIN TagRank tr ON tr.QuestionId = q.QuestionId
+    AND tr.TagName = tl.TagName
+LEFT JOIN Users u ON u.Id = q.OwnerUserId
+WHERE (q.Tags LIKE '%<c%>' AND q.Tags LIKE '%<sql%>') 
+  AND (q.AnswerCount 
+       + COALESCE(v.VoteCount, 0) 
+       + COALESCE(c.CommentCnt, 0)) > 20
+ORDER BY q.QuestionScore DESC, tr.Rank, q.ViewCount DESC
+OFFSET 0 ROWS FETCH NEXT 20 ROWS ONLY;

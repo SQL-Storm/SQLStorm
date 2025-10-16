@@ -1,0 +1,66 @@
+-- {"query": "1066.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4o-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 488} 
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS UserPostRank
+    FROM 
+        Posts p
+    WHERE 
+        p.PostTypeId = 1 AND 
+        p.CreationDate >= DATEADD(YEAR, -1, cast('2024-10-01 12:34:56' as timestamp))
+), CommentsWithPostInfo AS (
+    SELECT 
+        c.Id AS CommentId,
+        c.Score AS CommentScore,
+        c.Text,
+        c.CreationDate AS CommentCreationDate,
+        c.PostId,
+        p.Title AS PostTitle,
+        p.CreationDate AS PostCreationDate
+    FROM 
+        Comments c
+    JOIN 
+        Posts p ON c.PostId = p.Id
+    WHERE 
+        c.CreationDate >= DATEADD(MONTH, -6, cast('2024-10-01 12:34:56' as timestamp))
+), UserBadges AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) AS TotalBadges,
+        STRING_AGG(b.Name, ', ') AS BadgeNames
+    FROM 
+        Badges b
+    GROUP BY 
+        b.UserId
+)
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    COALESCE(rb.TotalBadges, 0) AS BadgeCount,
+    COALESCE(rb.BadgeNames, 'No Badges') AS Badges,
+    rp.PostId,
+    rp.Title,
+    rp.Score AS PostScore,
+    rp.ViewCount,
+    COALESCE(c.CommentId, -1) AS LatestCommentId,
+    COALESCE(c.CommentScore, 0) AS LatestCommentScore,
+    COALESCE(c.Text, 'No Comments') AS LatestCommentText,
+    COALESCE(c.CommentCreationDate, 'No Comments') AS LatestCommentDate
+FROM 
+    Users u
+LEFT JOIN 
+    UserBadges rb ON u.Id = rb.UserId
+LEFT JOIN 
+    RankedPosts rp ON u.Id = rp.OwnerUserId AND rp.UserPostRank = 1
+LEFT JOIN 
+    CommentsWithPostInfo c ON rp.PostId = c.PostId
+WHERE 
+    u.Reputation > 1000
+ORDER BY 
+    u.Reputation DESC, 
+    rp.Score DESC;

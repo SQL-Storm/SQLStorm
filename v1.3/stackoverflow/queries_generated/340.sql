@@ -1,0 +1,291 @@
+-- {"query": "340.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 15691} 
+WITH
+post_tag_pairs AS (
+  SELECT p.Id AS post_id,
+         p.PostTypeId,
+         p.OwnerUserId,
+         trim(t.tag) AS tag,
+         p.CreationDate,
+         p.Score,
+         p.ViewCount
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tag
+  ) t
+  WHERE p.Tags IS NOT NULL AND p.Tags <> ''
+),
+top_tags_global AS (
+  SELECT tag,
+         count(*) AS posts_count,
+         sum(COALESCE(Score,0)) AS score_sum
+  FROM post_tag_pairs
+  GROUP BY tag
+  HAVING count(*) > 10
+  ORDER BY score_sum DESC
+  LIMIT 500
+),
+recent_tags AS (
+  SELECT tag
+  FROM post_tag_pairs
+  WHERE CreationDate >= now() - INTERVAL '365 days'
+  GROUP BY tag
+),
+hot_tags AS (
+  SELECT tag FROM top_tags_global
+  INTERSECT
+  SELECT tag FROM recent_tags
+),
+popular_or_recent AS (
+  SELECT tag FROM top_tags_global
+  UNION
+  SELECT tag FROM recent_tags
+),
+cold_tags AS (
+  SELECT tag FROM post_tag_pairs GROUP BY tag
+  EXCEPT
+  SELECT tag FROM popular_or_recent
+),
+user_tag_counts AS (
+  SELECT p.OwnerUserId AS user_id, p.tag, count(*) AS tag_count
+  FROM post_tag_pairs p
+  WHERE p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId, p.tag
+),
+user_tag_agg AS (
+  SELECT user_id,
+         array_agg(tag ORDER BY tag) FILTER (WHERE tag IS NOT NULL) AS tags_array,
+         count(*) FILTER (WHERE tag IS NOT NULL) AS distinct_tag_count
+  FROM (
+    SELECT DISTINCT user_id, tag FROM user_tag_counts
+  ) dt
+  GROUP BY user_id
+),
+user_tag_entropy AS (
+  SELECT utc.user_id,
+         sum(
+           -(utc.tag_count::numeric / totals.total_count) * ln(NULLIF(utc.tag_count::numeric / totals.total_count, 0))
+         ) AS tag_entropy,
+         totals.total_count
+  FROM user_tag_counts utc
+  JOIN (SELECT user_id, sum(tag_count) AS total_count FROM user_tag_counts GROUP BY user_id) totals
+    ON totals.user_id = utc.user_id
+  GROUP BY utc.user_id, totals.total_count
+),
+answers_median AS (
+  SELECT OwnerUserId AS user_id,
+         percentile_cont(0.5) WITHIN GROUP (ORDER BY score) AS median_answer_score
+  FROM Posts
+  WHERE PostTypeId = 2
+  GROUP BY OwnerUserId
+),
+user_posts_agg AS (
+  SELECT u.Id AS user_id,
+         COALESCE(sum(case when p.PostTypeId = 1 then 1 else 0 end),0) AS question_count,
+         COALESCE(sum(case when p.PostTypeId = 2 then 1 else 0 end),0) AS answer_count,
+         COALESCE(avg(case when p.PostTypeId = 1 then p.Score end), 0) AS avg_question_score,
+         COALESCE(avg(case when p.PostTypeId = 2 then p.Score end), 0) AS avg_answer_score,
+         COALESCE(sum(case when p.PostTypeId = 2 AND EXISTS (
+             SELECT 1 FROM Posts q WHERE q.Id = p.ParentId AND q.AcceptedAnswerId = p.Id
+           ) THEN 1 ELSE 0 END), 0) AS accepted_answer_count,
+         max(p.CreationDate) AS last_post_date
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id
+),
+user_votes_agg AS (
+  SELECT p.OwnerUserId AS user_id,
+         sum(case when v.VoteTypeId = 2 then 1 else 0 end) AS upvotes_on_posts,
+         sum(case when v.VoteTypeId = 3 then 1 else 0 end) AS downvotes_on_posts,
+         sum(case when v.VoteTypeId IN (5,15) then 1 else 0 end) AS fav_or_review_votes_on_posts,
+         sum(case when v.VoteTypeId = 1 then 1 else 0 end) AS accepted_on_posts
+  FROM Votes v
+  JOIN Posts p ON p.Id = v.PostId
+  GROUP BY p.OwnerUserId
+),
+user_comments AS (
+  SELECT c.UserId AS user_id,
+         count(*) AS comments_posted,
+         max(c.CreationDate) AS last_comment_date,
+         (SELECT substring(regexp_replace(c2.Text, '<[^>]*>', '', 'g'), 1, 180)
+          FROM Comments c2
+          WHERE c2.UserId = c.UserId
+          ORDER BY c2.CreationDate DESC
+          LIMIT 1) AS last_comment_snippet
+  FROM Comments c
+  WHERE c.UserId IS NOT NULL
+  GROUP BY c.UserId
+),
+user_badges AS (
+  SELECT b.UserId AS user_id,
+         count(*) AS total_badges,
+         sum(case when b.Class = 1 then 1 else 0 end) AS gold_badges,
+         sum(case when b.Class = 2 then 1 else 0 end) AS silver_badges,
+         sum(case when b.Class = 3 then 1 else 0 end) AS bronze_badges,
+         array_agg(distinct b.Name) FILTER (WHERE b.Name IS NOT NULL) AS badge_names
+  FROM Badges b
+  GROUP BY b.UserId
+),
+user_edit_history AS (
+  SELECT ph.UserId AS editor_user_id,
+         COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6,24)) AS edits_made,
+         COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (10,11,12,13)) AS closure_events,
+         MAX(ph.CreationDate) AS last_edit_date
+  FROM PostHistory ph
+  GROUP BY ph.UserId
+),
+user_activity_window AS (
+  SELECT p.OwnerUserId AS user_id,
+         p.Id AS post_id,
+         p.CreationDate,
+         p.Score,
+         row_number() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn,
+         avg(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS moving_avg_score_5
+  FROM Posts p
+  WHERE p.OwnerUserId IS NOT NULL
+),
+user_recent_posts AS (
+  SELECT user_id,
+         count(*) AS recent_5_count,
+         avg(moving_avg_score_5) AS avg_recent_moving_score,
+         max(CASE WHEN rn = 1 THEN post_id END) AS most_recent_post_id
+  FROM user_activity_window
+  WHERE rn <= 5
+  GROUP BY user_id
+),
+post_hotness AS (
+  SELECT p.Id AS post_id,
+         p.OwnerUserId,
+         COALESCE(p.Score,0) AS Score,
+         COALESCE(p.ViewCount,0) AS ViewCount,
+         p.CreationDate,
+         (COALESCE(p.Score,0)::float * 1.5 + COALESCE(p.ViewCount,0)::float / GREATEST(EXTRACT(EPOCH FROM (now() - p.CreationDate))/86400.0, 1) * 0.1)
+           * EXP(-GREATEST(EXTRACT(EPOCH FROM now() - p.CreationDate)/86400.0, 1)/365.0) AS hotness_score
+  FROM Posts p
+),
+user_hotness AS (
+  SELECT ph.OwnerUserId AS user_id,
+         sum(ph.hotness_score) AS user_hotness_score,
+         max(ph.hotness_score) AS max_single_post_hotness
+  FROM post_hotness ph
+  GROUP BY ph.OwnerUserId
+),
+user_tags_distinct AS (
+  SELECT uta.user_id,
+         uta.tags_array,
+         uta.distinct_tag_count
+  FROM user_tag_agg uta
+),
+most_similar_user AS (
+  SELECT ut.user_id,
+         sim.other_user_id,
+         sim.intersection_size,
+         sim.union_size,
+         CASE WHEN sim.union_size = 0 THEN 0 ELSE sim.intersection_size::float / sim.union_size END AS jaccard_similarity
+  FROM user_tags_distinct ut
+  LEFT JOIN LATERAL (
+    SELECT other.user_id AS other_user_id,
+           (SELECT count(*) FROM (SELECT unnest(ut.tags_array) INTERSECT SELECT unnest(other.tags_array)) s) AS intersection_size,
+           (SELECT count(*) FROM (SELECT unnest(ut.tags_array) UNION SELECT unnest(other.tags_array)) s) AS union_size
+    FROM user_tags_distinct other
+    WHERE other.user_id IS NOT NULL AND other.user_id <> ut.user_id
+    ORDER BY (SELECT count(*) FROM (SELECT unnest(ut.tags_array) INTERSECT SELECT unnest(other.tags_array)) s) DESC
+    LIMIT 1
+  ) sim ON true
+),
+user_similar_summary AS (
+  SELECT ms.user_id,
+         ms.other_user_id AS most_similar_user_id,
+         ms.jaccard_similarity
+  FROM most_similar_user ms
+),
+user_summary AS (
+  SELECT u.Id AS user_id,
+         u.DisplayName,
+         u.Reputation,
+         COALESCE(upq.question_count,0) AS questions,
+         COALESCE(upq.answer_count,0) AS answers,
+         COALESCE(upq.avg_question_score,0) AS avg_q_score,
+         COALESCE(upq.avg_answer_score,0) AS avg_a_score,
+         COALESCE(upq.accepted_answer_count,0) AS accepted_answers,
+         COALESCE(am.median_answer_score,0) AS median_answer_score,
+         COALESCE(uv.upvotes_on_posts,0) AS upvotes_on_posts,
+         COALESCE(uv.downvotes_on_posts,0) AS downvotes_on_posts,
+         COALESCE(ub.total_badges,0) AS total_badges,
+         COALESCE(ub.gold_badges,0) AS gold_badges,
+         COALESCE(ue.tag_entropy,0) AS tag_entropy,
+         COALESCE(uta.distinct_tag_count,0) AS distinct_tag_count,
+         COALESCE(ur.recent_5_count,0) AS recent_5_posts,
+         COALESCE(uh.user_hotness_score,0) AS user_hotness,
+         COALESCE(sim.most_similar_user_id,-1) AS most_similar_user_id,
+         COALESCE(sim.jaccard_similarity,0) AS most_similar_jaccard,
+         COALESCE(uc.comments_posted,0) AS comments_posted,
+         COALESCE(uc.last_comment_snippet,'') AS last_comment_snippet,
+         COALESCE(u.LastAccessDate, u.CreationDate) AS last_access,
+         GREATEST(0, (EXTRACT(EPOCH FROM now() - COALESCE(upq.last_post_date, u.CreationDate))) / 86400.0)::int AS days_since_last_post,
+         (LN(1 + GREATEST(u.Reputation,0)::numeric) * 3.0
+          + LEAST(100, COALESCE(upq.answer_count,0)) * 1.5
+          + COALESCE(uh.user_hotness_score,0)::numeric
+          + (COALESCE(ub.gold_badges,0) * 5)
+          - (COALESCE(uv.downvotes_on_posts,0) * 0.5)
+          + (COALESCE(ue.tag_entropy,0) * 2.0)
+          + (COALESCE(am.median_answer_score,0) * 1.2)
+         )::numeric AS composite_score
+  FROM Users u
+  LEFT JOIN user_posts_agg upq ON upq.user_id = u.Id
+  LEFT JOIN user_votes_agg uv ON uv.user_id = u.Id
+  LEFT JOIN user_badges ub ON ub.user_id = u.Id
+  LEFT JOIN user_tag_entropy ue ON ue.user_id = u.Id
+  LEFT JOIN user_tag_agg uta ON uta.user_id = u.Id
+  LEFT JOIN user_recent_posts ur ON ur.user_id = u.Id
+  LEFT JOIN user_hotness uh ON uh.user_id = u.Id
+  LEFT JOIN user_similar_summary sim ON sim.user_id = u.Id
+  LEFT JOIN answers_median am ON am.user_id = u.Id
+  LEFT JOIN user_comments uc ON uc.user_id = u.Id
+)
+SELECT
+  us.user_id,
+  us.DisplayName,
+  us.Reputation,
+  us.questions,
+  us.answers,
+  us.accepted_answers,
+  us.avg_q_score,
+  us.avg_a_score,
+  us.median_answer_score,
+  us.upvotes_on_posts,
+  us.downvotes_on_posts,
+  us.total_badges,
+  us.gold_badges,
+  us.tag_entropy,
+  us.distinct_tag_count,
+  us.recent_5_posts,
+  us.user_hotness,
+  us.composite_score,
+  rank() OVER (ORDER BY us.composite_score DESC) AS score_rank,
+  dense_rank() OVER (ORDER BY us.user_hotness DESC) AS hotness_rank,
+  percent_rank() OVER (ORDER BY us.composite_score DESC) AS pct_rank,
+  ntile(10) OVER (ORDER BY us.composite_score DESC) AS decile,
+  lead(us.composite_score) OVER (ORDER BY us.composite_score DESC) AS next_higher_score,
+  lag(us.composite_score) OVER (ORDER BY us.composite_score DESC) AS prev_lower_score,
+  us.days_since_last_post,
+  us.last_comment_snippet,
+  us.most_similar_user_id,
+  us.most_similar_jaccard,
+  COALESCE(
+    array_to_string(
+      (SELECT array_agg(t.tag) FROM (
+         SELECT ut.tag FROM user_tag_counts ut WHERE ut.user_id = us.user_id ORDER BY ut.tag_count DESC, ut.tag LIMIT 5
+      ) t), ', '
+    ), ''
+  ) AS top_5_tags,
+  (SELECT count(*) FROM hot_tags h JOIN (SELECT DISTINCT tag FROM user_tag_counts ut WHERE ut.user_id = us.user_id) ut2 ON ut2.tag = h.tag) AS hot_tag_overlap_count,
+  CASE
+    WHEN us.composite_score > 1000 THEN 'elite'
+    WHEN us.composite_score > 300 THEN 'high'
+    WHEN us.composite_score > 100 THEN 'active'
+    WHEN us.composite_score > 0 THEN 'passive'
+    ELSE 'new'
+  END AS activity_tier
+FROM user_summary us
+ORDER BY us.composite_score DESC
+LIMIT 100;

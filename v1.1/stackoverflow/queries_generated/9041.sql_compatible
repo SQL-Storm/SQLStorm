@@ -1,0 +1,118 @@
+WITH
+  RecentQuestions AS (
+    SELECT
+      Id,
+      Title,
+      OwnerUserId,
+      CreationDate,
+      Score,
+      Tags,
+      ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY Score DESC) AS rn
+    FROM Posts
+    WHERE PostTypeId = 1
+      AND CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+  ),
+  TopRecentQuestions AS (
+    SELECT * FROM RecentQuestions WHERE rn <= 5
+  ),
+  AnswerStats AS (
+    SELECT
+      ParentId   AS QuestionId,
+      COUNT(*)   AS TotalAnswers,
+      AVG(Score) AS AvgAnswerScore,
+      MAX(Score) AS MaxAnswerScore
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY ParentId
+  ),
+  UserBadges AS (
+    SELECT
+      UserId,
+      COUNT(CASE WHEN Class = 1 THEN 1 END) AS GoldBadges,
+      COUNT(CASE WHEN Class = 2 THEN 1 END) AS SilverBadges,
+      COUNT(CASE WHEN Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges
+    GROUP BY UserId
+  ),
+  CloseReasons AS (
+    SELECT
+      ph.PostId,
+      MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN CAST(ph.Comment AS SMALLINT) END) AS CloseReasonId
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+  )
+SELECT
+  q.Id                           AS QuestionId,
+  q.Title,
+  u.DisplayName                  AS Owner,
+  COALESCE(us.GoldBadges,0)
+  + COALESCE(us.SilverBadges,0)
+  + COALESCE(us.BronzeBadges,0)   AS TotalBadges,
+  asys.TotalAnswers,
+  asys.AvgAnswerScore,
+  asys.MaxAnswerScore,
+  EXTRACT(DAY FROM CAST('2024-10-01 12:34:56' AS timestamp) - q.CreationDate)                           AS DaysSincePosted,
+  COALESCE(cr.CloseReasonId, -1)                                    AS CloseReasonId,
+  CASE
+    WHEN asys.TotalAnswers = 0 THEN 'NoAnswers'
+    WHEN asys.TotalAnswers < 3 THEN 'FewAnswers'
+    ELSE 'ManyAnswers'
+  END                                                              AS AnswerCategory,
+  STRING_AGG(t.TagName, ',' ORDER BY t.TagName)                     AS Tags,
+  ROW_NUMBER() OVER (
+    ORDER BY asys.TotalAnswers DESC NULLS LAST,
+             q.CreationDate
+  )                                                                 AS GlobalRank
+FROM TopRecentQuestions q
+LEFT JOIN AnswerStats    asys ON asys.QuestionId = q.Id
+LEFT JOIN Users          u    ON u.Id           = q.OwnerUserId
+LEFT JOIN UserBadges     us   ON us.UserId      = u.Id
+LEFT JOIN CloseReasons   cr   ON cr.PostId      = q.Id
+LEFT JOIN LATERAL (
+  SELECT UNNEST(string_to_array(substring(q.Tags,2,length(q.Tags)-2), '><')) AS tag
+) tagvals ON TRUE
+LEFT JOIN Tags t ON t.TagName = tagvals.tag
+WHERE (COALESCE(asys.TotalAnswers, 0) > 0 OR cr.CloseReasonId IS NOT NULL)
+  AND EXISTS (
+    SELECT 1
+    FROM Votes v
+    WHERE v.PostId     = q.Id
+      AND v.VoteTypeId = 2
+      AND v.CreationDate >= q.CreationDate
+  )
+GROUP BY
+  q.Id,
+  q.Title,
+  u.DisplayName,
+  us.GoldBadges,
+  us.SilverBadges,
+  us.BronzeBadges,
+  asys.TotalAnswers,
+  asys.AvgAnswerScore,
+  asys.MaxAnswerScore,
+  q.CreationDate,
+  cr.CloseReasonId
+HAVING COUNT(DISTINCT tagvals.tag) > 1
+
+UNION ALL
+
+SELECT
+  p.Id                                  AS QuestionId,
+  COALESCE(p.Title, '[deleted]')        AS Title,
+  '[anonymous]'                         AS Owner,
+  0                                     AS TotalBadges,
+  0                                     AS TotalAnswers,
+  CAST(NULL AS numeric)                 AS AvgAnswerScore,
+  CAST(NULL AS integer)                 AS MaxAnswerScore,
+  EXTRACT(DAY FROM CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate)         AS DaysSincePosted,
+  -1                                    AS CloseReasonId,
+  'OrphanQuestion'                      AS AnswerCategory,
+  ''                                    AS Tags,
+  RANK() OVER (ORDER BY p.ViewCount DESC)          AS GlobalRank
+FROM Posts p
+WHERE p.PostTypeId = 1
+  AND p.OwnerUserId IS NULL
+  AND p.CreationDate < CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+
+ORDER BY GlobalRank
+LIMIT 100;

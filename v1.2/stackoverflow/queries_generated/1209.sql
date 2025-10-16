@@ -1,0 +1,237 @@
+-- {"query": "1209.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.2, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1773} 
+WITH RankedPosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        u.DisplayName AS OwnerName,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST, p.CreationDate ASC) AS rn,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS TotalPostsByUser
+    FROM
+        Posts p
+        LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE
+        p.PostTypeId IN (1, 2)
+        AND p.Score IS NOT NULL
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM
+        Badges b
+    GROUP BY
+        b.UserId
+),
+TopQuestions AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.Tags,
+        p.CreationDate,
+        u.DisplayName AS OwnerName,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ph.PostHistoryTypeId,
+        ph.Comment,
+        ph.CreationDate AS CloseDateHistory,
+        CASE
+            WHEN ph.PostHistoryTypeId IN (10) THEN (SELECT crt.Name FROM CloseReasonTypes crt WHERE crt.Id = TRY_CAST(ph.Comment AS SMALLINT))
+            ELSE NULL
+        END AS CloseReasonName,
+        COALESCE(al.CountAnswers, 0) AS TotalAnswers,
+        COALESCE(av.AvgAnswerScore, 0.0) AS AverageAnswerScore
+    FROM
+        Posts p
+        INNER JOIN PostTypes pt ON p.PostTypeId = pt.Id AND pt.Name = 'Question'
+        LEFT JOIN Users u ON p.OwnerUserId = u.Id
+        LEFT JOIN UserBadgeCounts ub ON ub.UserId = p.OwnerUserId
+        LEFT JOIN LATERAL (
+            SELECT
+                ph2.PostHistoryTypeId,
+                ph2.Comment,
+                ph2.CreationDate
+            FROM
+                PostHistory ph2
+            WHERE
+                ph2.PostId = p.Id AND ph2.PostHistoryTypeId IN (10)
+            ORDER BY
+                ph2.CreationDate DESC
+            LIMIT 1
+        ) ph ON TRUE
+        LEFT JOIN (
+            SELECT
+                ParentId,
+                COUNT(*) AS CountAnswers
+            FROM
+                Posts
+            WHERE
+                PostTypeId = 2
+            GROUP BY
+                ParentId
+        ) al ON al.ParentId = p.Id
+        LEFT JOIN (
+            SELECT
+                ParentId,
+                AVG(Score) AS AvgAnswerScore
+            FROM
+                Posts
+            WHERE
+                PostTypeId = 2
+            GROUP BY
+                ParentId
+        ) av ON av.ParentId = p.Id
+    WHERE
+        p.Score >= 10
+        AND p.FavoriteCount >= 1
+),
+DuplicateLinkCounts AS (
+    SELECT
+        pl.RelatedPostId AS QuestionId,
+        COUNT(*) AS DuplicateCount
+    FROM
+        PostLinks pl
+        INNER JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id AND lt.Name = 'Duplicate'
+    GROUP BY
+        pl.RelatedPostId
+),
+CommentStats AS (
+    SELECT
+        c.PostId,
+        COUNT(c.Id) AS CommentCount,
+        AVG(LENGTH(c.Text)) AS AvgCommentLength,
+        COUNT(DISTINCT c.UserId) AS DistinctCommentators
+    FROM
+        Comments c
+    GROUP BY
+        c.PostId
+),
+WindowedScores AS (
+    SELECT
+        p.Id,
+        p.Score,
+        p.ViewCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC NULLS LAST, p.ViewCount DESC NULLS LAST) AS RankByScore,
+        RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS UserRankByScore,
+        NTILE(10) OVER (ORDER BY p.ViewCount DESC NULLS LAST) AS ViewDecile
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId = 1
+),
+StringTagAnalysis AS (
+    SELECT
+        Id,
+        Tags,
+        unnest(string_to_array(TRIM(BOTH '<>' FROM Tags), '><')) AS Tag
+    FROM
+        Posts
+    WHERE
+        PostTypeId = 1
+),
+TagCounts AS (
+    SELECT
+        Tag,
+        COUNT(*) AS QuestionCount,
+        AVG(Score) AS AvgScorePerTag
+    FROM
+        StringTagAnalysis
+    GROUP BY
+        Tag
+),
+QuestionsWithStats AS (
+    SELECT
+        tq.*,
+        dl.DuplicateCount,
+        cs.CommentCount,
+        cs.AvgCommentLength,
+        cs.DistinctCommentators,
+        ws.RankByScore,
+        ws.UserRankByScore,
+        ws.ViewDecile
+    FROM
+        TopQuestions tq
+        LEFT JOIN DuplicateLinkCounts dl ON dl.QuestionId = tq.Id
+        LEFT JOIN CommentStats cs ON cs.PostId = tq.Id
+        LEFT JOIN WindowedScores ws ON ws.Id = tq.Id
+)
+SELECT 
+    qws.Id,
+    qws.Title,
+    qws.OwnerName,
+    qws.Score,
+    qws.ViewCount,
+    qws.FavoriteCount,
+    qws.GoldBadges,
+    qws.SilverBadges,
+    qws.BronzeBadges,
+    qws.CloseReasonName,
+    qws.TotalAnswers,
+    qws.AverageAnswerScore,
+    COALESCE(qws.DuplicateCount, 0) AS DuplicateLinks,
+    COALESCE(qws.CommentCount, 0) AS CommentCount,
+    ROUND(qws.AvgCommentLength::numeric, 2) AS AvgCommentLength,
+    COALESCE(qws.DistinctCommentators, 0) AS DistinctCommentators,
+    qws.RankByScore,
+    qws.UserRankByScore,
+    qws.ViewDecile,
+    ARRAY(
+        SELECT DISTINCT Tag
+        FROM StringTagAnalysis sta
+        WHERE sta.Id = qws.Id
+        ORDER BY Tag
+    ) AS TagsArray,
+    tgt.QuestionCount,
+    ROUND(tgt.AvgScorePerTag::numeric, 2) AS AvgTagScore,
+    -- Correlated Scalar Subquery with complicated predicate and calculation
+    (
+        SELECT AVG(a1.Score * POWER(1.02, EXTRACT(epoch FROM (NOW() - a1.CreationDate))/3600))
+        FROM Posts a1
+        WHERE a1.PostTypeId = 2 
+          AND a1.ParentId = qws.Id
+          AND a1.Score >= qws.AverageAnswerScore * 0.5
+          AND a1.CreationDate > (qws.CreationDate - INTERVAL '30 day')
+          AND EXISTS (
+            SELECT 1 FROM Votes v1 
+            WHERE v1.PostId = a1.Id
+              AND v1.VoteTypeId = 2 -- UpMod
+              AND v1.CreationDate BETWEEN (a1.CreationDate - INTERVAL '7 day') AND (a1.CreationDate + INTERVAL '7 day')
+          )
+    ) AS WeightedRecentAnswerScore,
+    -- Outer apply like subquery for last editor info with NULL logic
+    coalesce(
+        (SELECT ue.DisplayName FROM Users ue WHERE ue.Id = p.LastEditorUserId),
+        p.LastEditorDisplayName,
+        '[unknown]'
+    ) AS LastEditorResolvedName
+FROM
+    QuestionsWithStats qws
+    JOIN Posts p ON p.Id = qws.Id
+    LEFT JOIN (
+        SELECT
+            Tag,
+            COUNT(*) AS QuestionCount,
+            AVG(Score) AS AvgScorePerTag
+        FROM
+            StringTagAnalysis
+        GROUP BY
+            Tag
+    ) tgt ON tgt.Tag = (SELECT unnest(array_remove(qws.TagsArray, NULL)) LIMIT 1)
+ORDER BY
+    qws.Score DESC NULLS LAST,
+    qws.ViewCount DESC NULLS LAST
+LIMIT 50;

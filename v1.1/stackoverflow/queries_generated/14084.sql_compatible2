@@ -1,0 +1,100 @@
+WITH cte AS (
+  SELECT 
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.CreationDate,
+    p.OwnerUserId,
+    u.Reputation,
+    u.Location,
+    u.AboutMe,
+    u.UpVotes,
+    u.DownVotes,
+    DENSE_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS post_rank,
+    CASE 
+      WHEN p.PostTypeId = 1 THEN (
+        SELECT COUNT(*) 
+        FROM Posts p2 
+        WHERE p2.ParentId = p.Id AND p2.PostTypeId = 2
+      )
+      ELSE 0
+    END AS AnswerCount,
+    CASE
+      WHEN p.ClosedDate IS NOT NULL THEN (
+        SELECT c.Name
+        FROM CloseReasonTypes c
+        WHERE c.Id = (
+          SELECT 
+            CAST(
+              SUBSTRING(ph.Text FROM (POSITION(':' IN ph.Text) + 1) FOR (LENGTH(ph.Text) - POSITION(':' IN ph.Text)))
+              AS SMALLINT
+            )
+          FROM PostHistory ph
+          WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+          ORDER BY ph.CreationDate DESC
+          LIMIT 1
+        )
+      )
+      ELSE NULL
+    END AS ClosedReason
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+),
+agg_cte AS (
+  SELECT
+    PostId,
+    PostTypeId,
+    CreationDate,
+    OwnerUserId,
+    Reputation,
+    Location,
+    AboutMe,
+    UpVotes,
+    DownVotes,
+    post_rank,
+    AnswerCount,
+    ClosedReason,
+    CASE
+      WHEN AnswerCount > 0 THEN (
+        SELECT 
+          CAST(
+            SUBSTRING(ph.Text FROM (POSITION(':' IN ph.Text) + 1) FOR (LENGTH(ph.Text) - POSITION(':' IN ph.Text)))
+            AS INT
+          )
+        FROM PostHistory ph
+        WHERE ph.PostId = cte.PostId AND ph.PostHistoryTypeId = 1
+        ORDER BY ph.CreationDate
+        LIMIT 1
+      )
+      ELSE NULL
+    END AS AcceptedAnswerId
+  FROM cte
+)
+SELECT
+  PostId,
+  PostTypeId,
+  CreationDate,
+  OwnerUserId,
+  Reputation,
+  Location,
+  AboutMe,
+  UpVotes,
+  DownVotes,
+  post_rank,
+  AnswerCount,
+  ClosedReason,
+  AcceptedAnswerId,
+  CASE
+    WHEN AnswerCount > 0 THEN (
+      SELECT 
+        CAST(
+          SUBSTRING(ph.Text FROM (POSITION(':' IN ph.Text) + 1) FOR (LENGTH(ph.Text) - POSITION(':' IN ph.Text)))
+          AS INT
+        )
+      FROM PostHistory ph
+      WHERE ph.PostId = agg_cte.AcceptedAnswerId AND ph.PostHistoryTypeId = 1
+      ORDER BY ph.CreationDate
+      LIMIT 1
+    )
+    ELSE NULL
+  END AS AcceptedAnswerTitle
+FROM agg_cte;

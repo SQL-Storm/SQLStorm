@@ -1,0 +1,83 @@
+WITH cte_questions AS (
+    SELECT p.Id, p.Title, p.Tags, p.CreationDate, p.Score,
+           COALESCE(p.AcceptedAnswerId, 0) AS AcceptedAnswerId,
+           CASE WHEN p.Tags LIKE '%sql%' THEN 1 ELSE 0 END AS HasSqlTag
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Score >= 5
+      AND p.CreationDate >= DATE '2015-01-01'
+),
+cte_answers AS (
+    SELECT a.Id, a.ParentId, a.Score, a.CreationDate,
+           a.OwnerUserId,
+           ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS rn
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+cte_comment_counts AS (
+    SELECT pc.Id AS PostId,
+           COUNT(CASE WHEN c.Score > 0 THEN 1 END) AS up_comments,
+           COUNT(CASE WHEN c.Score = 0 THEN 1 END) AS neutral_comments,
+           COUNT(CASE WHEN c.Score < 0 THEN 1 END) AS down_comments
+    FROM Posts pc
+    LEFT JOIN Comments c ON c.PostId = pc.Id
+    GROUP BY pc.Id
+),
+cte_related_links AS (
+    SELECT pl.PostId, 
+           COUNT(CASE WHEN pl.LinkTypeId = 3 THEN 1 END) AS duplicate_links,
+           COUNT(CASE WHEN pl.LinkTypeId = 1 THEN 1 END) AS other_links
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+),
+cte_badges AS (
+    SELECT b.UserId,
+           MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS has_gold,
+           MAX(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS has_silver,
+           MAX(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS has_bronze,
+           SUM(CASE WHEN b.Class = 1 AND b.TagBased = 1 THEN 1 ELSE 0 END) AS gold_tag_badges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+cte_user_stats AS (
+    SELECT u.Id,
+           u.Reputation,
+           u.Views,
+           u.UpVotes,
+           u.DownVotes,
+           uc.gold_tag_badges AS badges,
+           uc.has_gold
+    FROM Users u
+    JOIN cte_badges uc ON uc.UserId = u.Id
+),
+final AS (
+    SELECT q.Id AS QuestionId,
+           q.Title,
+           q.Tags,
+           q.CreationDate AS QuestionDate,
+           q.Score AS QuestionScore,
+           ca.Id AS AnswerId,
+           ca.Score AS AnswerScore,
+           ca.OwnerUserId AS AnswerUser,
+           uc.badges,
+           uc.has_gold,
+           cc.up_comments, cc.neutral_comments, cc.down_comments,
+           rl.duplicate_links, rl.other_links,
+           CASE WHEN (q.HasSqlTag = 1 AND q.Score > 10) THEN 'High SQL Q' ELSE 'Other' END AS Category
+    FROM cte_questions q
+    LEFT JOIN cte_answers ca ON ca.ParentId = q.Id AND ca.rn = 1
+    LEFT JOIN cte_comment_counts cc ON cc.PostId = COALESCE(ca.Id, q.Id)
+    LEFT JOIN cte_related_links rl ON rl.PostId = COALESCE(ca.Id, q.Id)
+    LEFT JOIN cte_user_stats uc ON uc.Id = ca.OwnerUserId
+)
+SELECT QuestionId, Title, Tags, QuestionDate, QuestionScore,
+       AnswerId, AnswerScore, AnswerUser,
+       badges, up_comments, neutral_comments, down_comments,
+       duplicate_links, other_links, Category, has_gold
+FROM final
+WHERE (COALESCE(QuestionScore,0) + COALESCE(AnswerScore,0)) > 20
+  AND (COALESCE(duplicate_links,0) < 3 OR COALESCE(other_links,0) > 5)
+  AND (COALESCE(up_comments,0) - COALESCE(down_comments,0)) >= 5
+  AND (COALESCE(badges,0) > 0 OR COALESCE(has_gold,0) = 1)
+ORDER BY QuestionDate DESC
+LIMIT 1000;

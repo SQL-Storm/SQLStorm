@@ -1,0 +1,159 @@
+-- {"query": "874.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1500} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.TagName] as AncestorPath
+    from Tags t
+    where t.IsRequired = 1
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.AncestorPath || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.IsRequired = 1 and t.Id <> r.Id
+    where not t.TagName = any(r.AncestorPath)
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    where b.TagBased = 0
+    group by b.UserId, b.Class
+),
+UserPostStats as (
+    select
+        p.OwnerUserId as UserId,
+        count(*) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(*) filter (where p.PostTypeId = 2) as AnswerCount,
+        avg(p.Score) filter (where p.PostTypeId in (1,2)) as AvgScore,
+        max(p.ViewCount) filter (where p.PostTypeId = 1) as MaxQuestionViews,
+        bool_or(p.ClosedDate is not null) filter (where p.PostTypeId = 1) as HasClosedQuestions
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+TopActiveUsers as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        up.QuestionCount,
+        up.AnswerCount,
+        up.AvgScore,
+        coalesce(ubc_gold.BadgeCount,0) as GoldBadges,
+        coalesce(ubc_silver.BadgeCount,0) as SilverBadges,
+        coalesce(ubc_bronze.BadgeCount,0) as BronzeBadges,
+        up.MaxQuestionViews,
+        up.HasClosedQuestions,
+        row_number() over (order by u.Reputation desc, up.QuestionCount desc) as UserRank
+    from Users u
+    left join UserPostStats up on up.UserId = u.Id
+    left join UserBadgeCounts ubc_gold on ubc_gold.UserId = u.Id and ubc_gold.Class = 1
+    left join UserBadgeCounts ubc_silver on ubc_silver.UserId = u.Id and ubc_silver.Class = 2
+    left join UserBadgeCounts ubc_bronze on ubc_bronze.UserId = u.Id and ubc_bronze.Class = 3
+    where u.Reputation > 1000
+),
+RecentHighlyVotedAnswers as (
+    select
+        a.Id,
+        a.ParentId,
+        a.Score,
+        a.CreationDate,
+        a.OwnerUserId,
+        q.Title as QuestionTitle,
+        q.Tags,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate desc) as AnswerRank
+    from Posts a
+    join Posts q on q.Id = a.ParentId and q.PostTypeId = 1
+    where a.PostTypeId = 2 and a.Score > 10
+),
+UserCommentActivity as (
+    select
+        c.UserId,
+        count(*) as CommentCount,
+        max(c.CreationDate) as LastCommentDate,
+        bool_or(position('bug' in lower(c.Text)) > 0) as HasBugComments
+    from Comments c
+    where c.UserId is not null
+    group by c.UserId
+),
+QuestionsWithDuplicateLinks as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        count(distinct pl.RelatedPostId) filter (where lt.Name = 'Duplicate') as DuplicateCount,
+        string_agg(distinct lt.Name, ', ') as LinkTypes
+    from Posts q
+    left join PostLinks pl on pl.PostId = q.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.CreationDate
+    having count(distinct pl.RelatedPostId) filter (where lt.Name = 'Duplicate') > 0
+),
+UserAverageAnswerTime as (
+    select
+        p.OwnerUserId as UserId,
+        avg(extract(epoch from (p.CreationDate - q.CreationDate))/3600) as AvgAnswerHours
+    from Posts p
+    join Posts q on q.Id = p.ParentId and q.PostTypeId = 1
+    where p.PostTypeId = 2 and p.OwnerUserId is not null
+    group by p.OwnerUserId
+)
+select 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    ta.QuestionCount,
+    ta.AnswerCount,
+    ta.AvgScore,
+    ta.GoldBadges,
+    ta.SilverBadges,
+    ta.BronzeBadges,
+    ua.AvgAnswerHours,
+    coalesce(uca.CommentCount,0) as CommentCount,
+    coalesce(uca.HasBugComments,false) as HasBugComments,
+    ta.HasClosedQuestions,
+    dq.DuplicateCount,
+    dq.LinkTypes,
+    case 
+        when ta.HasClosedQuestions then 'Has Closed Questions'
+        when ua.AvgAnswerHours < 1 then 'Fast Responder'
+        when ua.AvgAnswerHours between 1 and 24 then 'Average Responder'
+        else 'Slow Responder'
+    end as ResponseSpeedCategory,
+    -- Correlated scalar subquery with NULL logic and string manipulation:
+    (select string_agg(distinct ph.Name, ', ') 
+     from PostHistoryTypes ph
+     where ph.Id in (
+        select distinct phx.PostHistoryTypeId 
+        from PostHistory phx 
+        where phx.PostId in (
+            select p.Id from Posts p where p.OwnerUserId = u.Id limit 10
+        ) and phx.PostHistoryTypeId is not null
+        and phx.Comment is not null
+        and phx.Comment like '%close%'
+     )
+    ) as CloseRelatedHistoryTypes,
+    -- Window function with partition and ordering, using complicated predicates:
+    rank() over (partition by (case when u.Reputation >= 10000 then 'HighRep' else 'LowRep' end) order by ta.AvgScore desc nulls last, ta.QuestionCount desc) as UserScoreRank
+from TopActiveUsers u
+left join UserAverageAnswerTime ua on ua.UserId = u.Id
+left join UserCommentActivity uca on uca.UserId = u.Id
+left join QuestionsWithDuplicateLinks dq on dq.QuestionId in (
+    select q.Id from Posts q where q.OwnerUserId = u.Id and q.PostTypeId = 1 limit 1
+)
+left join UserPostStats ta on ta.UserId = u.Id
+where u.QuestionCount > 10
+order by u.Reputation desc, ta.AvgScore desc
+limit 100;

@@ -1,0 +1,215 @@
+-- {"query": "419.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1903} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        ARRAY[t.TagName] AS TagPath,
+        1 AS Level
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+
+    UNION ALL
+
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        rth.TagPath || t2.TagName,
+        rth.Level + 1
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy rth ON t2.Id <> rth.Id
+    WHERE rth.Level < 3
+),
+UserBadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) AS TotalBadges,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostAnswerStats AS (
+    SELECT 
+        p.ParentId AS QuestionId,
+        COUNT(*) AS AnswerCount,
+        AVG(p.Score) AS AvgAnswerScore,
+        MAX(p.Score) AS MaxAnswerScore,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesOnAnswers
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+),
+QuestionStats AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        COALESCE(pas.AnswerCount, 0) AS AnswerCount,
+        COALESCE(pas.AvgAnswerScore, 0) AS AvgAnswerScore,
+        COALESCE(pas.MaxAnswerScore, 0) AS MaxAnswerScore,
+        COALESCE(pas.TotalUpVotesOnAnswers, 0) AS TotalUpVotesOnAnswers,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RecentQuestionRank
+    FROM Posts p
+    LEFT JOIN PostAnswerStats pas ON pas.QuestionId = p.Id
+    WHERE p.PostTypeId = 1
+),
+UserActivity AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COALESCE(ubs.TotalBadges, 0) AS TotalBadges,
+        COALESCE(ubs.GoldBadges, 0) AS GoldBadges,
+        COALESCE(ubs.SilverBadges, 0) AS SilverBadges,
+        COALESCE(ubs.BronzeBadges, 0) AS BronzeBadges,
+        COALESCE(ubs.LastBadgeDate, u.CreationDate) AS LastBadgeDate,
+        COALESCE(qs.AnswerCount, 0) AS TotalAnswers,
+        COALESCE(qs.QuestionCount, 0) AS TotalQuestions,
+        COALESCE(qs.AvgQuestionScore, 0) AS AvgQuestionScore
+    FROM Users u
+    LEFT JOIN UserBadgeStats ubs ON ubs.UserId = u.Id
+    LEFT JOIN (
+        SELECT 
+            OwnerUserId,
+            COUNT(CASE WHEN PostTypeId = 2 THEN 1 END) AS AnswerCount,
+            COUNT(CASE WHEN PostTypeId = 1 THEN 1 END) AS QuestionCount,
+            AVG(CASE WHEN PostTypeId = 1 THEN Score END) AS AvgQuestionScore
+        FROM Posts
+        WHERE OwnerUserId IS NOT NULL
+        GROUP BY OwnerUserId
+    ) qs ON qs.OwnerUserId = u.Id
+),
+LatestPostHistory AS (
+    SELECT DISTINCT ON (ph.PostId)
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.Comment,
+        ph.UserId,
+        ph.UserDisplayName
+    FROM PostHistory ph
+    ORDER BY ph.PostId, ph.CreationDate DESC
+),
+ComplexPostJoin AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.Tags,
+        q.AnswerCount,
+        q.AvgAnswerScore,
+        q.MaxAnswerScore,
+        q.TotalUpVotesOnAnswers,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS LastHistoryDate,
+        ph.Comment AS CloseReason,
+        ph.UserDisplayName AS LastEditor,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY ph.CreationDate DESC) AS HistoryRank
+    FROM QuestionStats q
+    LEFT JOIN Users u ON u.Id = q.OwnerUserId
+    LEFT JOIN LatestPostHistory ph ON ph.PostId = q.Id
+    WHERE q.AnswerCount > 0
+),
+FilteredPosts AS (
+    SELECT 
+        cpj.*,
+        -- Extract first tag from Tags string like '<tag1><tag2><tag3>'
+        split_part(trim(both '<>' from cpj.Tags), '><', 1) AS FirstTag,
+        -- Calculate tag depth from RecursiveTagHierarchy
+        COALESCE(rth.Level, 0) AS TagHierarchyLevel
+    FROM ComplexPostJoin cpj
+    LEFT JOIN RecursiveTagHierarchy rth ON rth.TagName = split_part(trim(both '<>' from cpj.Tags), '><', 1)
+    WHERE cpj.HistoryRank = 1
+),
+FinalRanking AS (
+    SELECT 
+        fp.*,
+        ua.Reputation,
+        ua.TotalBadges,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        ua.Views AS UserViews,
+        ua.UpVotes AS UserUpVotes,
+        ua.DownVotes AS UserDownVotes,
+        -- Calculate a complex score involving question score, answer stats, user reputation, badges, and recency
+        (
+            fp.Score * 1.5 
+            + fp.AvgAnswerScore * 2.0 
+            + fp.MaxAnswerScore * 1.2 
+            + fp.TotalUpVotesOnAnswers * 0.5
+            + ua.Reputation / 1000.0
+            + ua.GoldBadges * 3
+            + ua.SilverBadges * 1.5
+            - ua.DownVotes * 0.1
+            + CASE WHEN fp.CloseReason IS NULL THEN 5 ELSE -10 END
+            + CASE WHEN fp.TagHierarchyLevel > 1 THEN fp.TagHierarchyLevel * 2 ELSE 0 END
+            + CASE WHEN fp.LastHistoryDate > (CURRENT_TIMESTAMP - INTERVAL '30 days') THEN 10 ELSE 0 END
+        ) AS CompositeScore,
+        -- Window function to rank posts by composite score partitioned by first tag
+        RANK() OVER (PARTITION BY fp.FirstTag ORDER BY 
+            (
+                fp.Score * 1.5 
+                + fp.AvgAnswerScore * 2.0 
+                + fp.MaxAnswerScore * 1.2 
+                + fp.TotalUpVotesOnAnswers * 0.5
+                + ua.Reputation / 1000.0
+                + ua.GoldBadges * 3
+                + ua.SilverBadges * 1.5
+                - ua.DownVotes * 0.1
+                + CASE WHEN fp.CloseReason IS NULL THEN 5 ELSE -10 END
+                + CASE WHEN fp.TagHierarchyLevel > 1 THEN fp.TagHierarchyLevel * 2 ELSE 0 END
+                + CASE WHEN fp.LastHistoryDate > (CURRENT_TIMESTAMP - INTERVAL '30 days') THEN 10 ELSE 0 END
+            ) DESC
+        ) AS TagRank
+    FROM FilteredPosts fp
+    LEFT JOIN UserActivity ua ON ua.Id = fp.OwnerUserId
+)
+SELECT 
+    fr.QuestionId,
+    fr.Title,
+    fr.OwnerUserId,
+    fr.OwnerName,
+    fr.CreationDate,
+    fr.Score,
+    fr.ViewCount,
+    fr.AnswerCount,
+    fr.AvgAnswerScore,
+    fr.MaxAnswerScore,
+    fr.TotalUpVotesOnAnswers,
+    fr.CloseReason,
+    fr.LastEditor,
+    fr.LastHistoryDate,
+    fr.FirstTag,
+    fr.TagHierarchyLevel,
+    fr.Reputation,
+    fr.TotalBadges,
+    fr.GoldBadges,
+    fr.SilverBadges,
+    fr.BronzeBadges,
+    fr.UserViews,
+    fr.UserUpVotes,
+    fr.UserDownVotes,
+    fr.CompositeScore,
+    fr.TagRank
+FROM FinalRanking fr
+WHERE fr.TagRank <= 5
+ORDER BY fr.FirstTag, fr.CompositeScore DESC, fr.CreationDate DESC;

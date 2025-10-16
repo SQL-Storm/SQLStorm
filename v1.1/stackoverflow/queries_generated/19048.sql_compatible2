@@ -1,0 +1,76 @@
+SELECT
+    *
+FROM
+(
+    SELECT
+        UAS.UserId,
+        UAS.DisplayName,
+        UAS.Reputation,
+        UAS.UserCreationDate,
+        UAS.LastAccessDate,
+        UAS.TotalPostsCreated,
+        CQA.PostScore,
+        CQA.QuestionTitle,
+        CQA.QuestionAnswerStatus,
+        CQA.AnswerCount,
+        AD.AnswerId,
+        AD.AnswerScore,
+        TA.TagName,
+        TA.TaggedPostsCount,
+        -- derived columns (ensure any used below are present)
+        COALESCE(AD.AcceptedCount, 0) AS UserAcceptedQuestionCount,
+        COALESCE(UAS.Reputation, 0) + COALESCE(CQA.PostScore, 0) AS PopularityIndex,
+        COALESCE(UAS.Reputation, 0) + COALESCE(CQA.PostScore, 0) AS UserTotalPopularityIndex,
+        UAS.Reputation AS Reputation -- ensure Reputation referenced in outer ORDER BY exists here
+    FROM
+        Users UAS
+    LEFT JOIN
+        CQA_Table CQA ON UAS.UserId = CQA.UserId
+    LEFT JOIN
+        Answers AD ON AD.AnswerOwnerUserId = UAS.UserId
+    LEFT JOIN
+        Users UAS_AA ON AD.AnswerOwnerUserId = UAS_AA.Id
+    LEFT JOIN
+        (
+            SELECT
+                TR.OwnerUserId,
+                TR.TagName,
+                TR.TaggedPostsCount,
+                TR.rn
+            FROM (
+                SELECT
+                    P.OwnerUserId,
+                    UPPER(TRIM(tag)) AS TagName,
+                    COUNT(P.Id) AS TaggedPostsCount,
+                    ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY COUNT(P.Id) DESC, UPPER(TRIM(tag)) ASC) AS rn
+                FROM
+                    Posts P,
+                    LATERAL (
+                        SELECT unnest(STRING_TO_ARRAY(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><')) AS tag
+                    ) AS t
+                WHERE
+                    P.PostTypeId = 1
+                    AND P.Tags IS NOT NULL
+                    AND LENGTH(P.Tags) > 2
+                    AND P.OwnerUserId IS NOT NULL
+                GROUP BY
+                    P.OwnerUserId,
+                    UPPER(TRIM(tag))
+            ) TR
+        ) TA ON UAS.UserId = TA.OwnerUserId AND TA.rn = 1
+    WHERE
+        (UAS.Reputation > 1000 OR CQA.PostScore > 10)
+        AND (CQA.QuestionTitle IS NOT NULL OR UAS.TotalPostsCreated > 0)
+        AND (CQA.QuestionAnswerStatus = 'Accepted' OR CQA.AnswerCount = 0)
+        AND (UAS.UserCreationDate >= DATE '2020-01-01' OR UAS.LastAccessDate >= DATE '2023-01-01')
+        AND (UAS.DisplayName LIKE 'A%' OR UAS.DisplayName ILIKE '%DEV%')
+        AND (AD.AnswerId IS NULL OR AD.AnswerScore > 0)
+) Tmp
+WHERE
+    Tmp.UserAcceptedQuestionCount > 0
+    OR Tmp.UserTotalPopularityIndex > 100
+ORDER BY
+    NTILE(10) OVER (ORDER BY Tmp.Reputation DESC, Tmp.PopularityIndex DESC) ASC,
+    Tmp.Reputation DESC,
+    Tmp.PopularityIndex DESC
+LIMIT 1000;

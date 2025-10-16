@@ -1,0 +1,85 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.Reputation,
+        (u.UpVotes * 1.0 / NULLIF(u.UpVotes + u.DownVotes, 0)) AS ScoreRatio,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END), 0) AS GoldBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END), 0) AS SilverBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END), 0) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.Reputation, u.UpVotes, u.DownVotes
+),
+PostTags AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        (LENGTH(p.Body) - LENGTH(REPLACE(p.Body, '<code>', ''))) AS CodeSnippetCount,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+        AVG(p.AnswerCount) OVER (PARTITION BY DATE_TRUNC('month', p.CreationDate)) AS AvgMonthlyAnswers,
+        string_agg(DISTINCT tag, ', ' ORDER BY tag) AS AggregatedTags
+    FROM Posts p
+    LEFT JOIN (
+        SELECT
+            p2.Id AS PostId,
+            unnest(string_to_array(substring(p2.Tags FROM 2 FOR char_length(p2.Tags) - 2), '><')) AS tag
+        FROM Posts p2
+    ) tags ON tags.PostId = p.Id
+    WHERE p.PostTypeId IN (1,2)
+    GROUP BY p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.Body, p.AnswerCount, p.Tags
+),
+PostAnalysis AS (
+    SELECT
+        pt.*
+    FROM PostTags pt
+)
+SELECT 
+    u.Id AS UserId,
+    usr.DisplayName,
+    CONCAT(SUBSTRING(usr.Location FROM 1 FOR 20), ' (', COALESCE(usr.WebsiteUrl, 'no website'), ')') AS LocationInfo,
+    pa.AggregatedTags,
+    ph.CreationDate AS LastClosureDate,
+    crt.Name AS CloseReason,
+    SUM(pa.Score * (1 + pa.ViewCount * 0.001)) OVER (PARTITION BY u.Id) AS WeightedPostImpact,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = pa.Id AND v.VoteTypeId = 2) AS Upvotes,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = pa.Id AND pl.LinkTypeId = 3) AS DuplicateLinks,
+    CASE 
+        WHEN u.GoldBadges > 0 THEN 'Expert'
+        WHEN u.SilverBadges + u.BronzeBadges > 10 THEN 'Active'
+        ELSE 'Standard'
+    END AS UserCategory
+FROM UserStats u
+JOIN Posts post_owner ON post_owner.OwnerUserId = u.Id
+JOIN PostAnalysis pa ON u.Id = post_owner.OwnerUserId AND pa.Id = post_owner.Id
+LEFT JOIN PostHistory ph 
+    ON pa.Id = ph.PostId 
+    AND ph.PostHistoryTypeId = 10
+    AND ph.CreationDate = (
+        SELECT MAX(ph2.CreationDate) 
+        FROM PostHistory ph2 
+        WHERE ph2.PostId = pa.Id AND ph2.PostHistoryTypeId = 10
+    )
+LEFT JOIN CloseReasonTypes crt 
+    ON CASE 
+         WHEN ph.Comment ~ '^[0-9]+$' THEN CAST(ph.Comment AS INTEGER)
+         ELSE NULL
+       END = crt.Id
+JOIN Users usr ON usr.Id = u.Id
+WHERE u.Reputation > 1000
+    AND pa.CodeSnippetCount > 5
+    AND EXISTS (
+        SELECT 1 
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = u.Id 
+        AND p2.PostTypeId = 1 
+        AND p2.ClosedDate IS NULL
+    )
+    AND pa.AvgMonthlyAnswers BETWEEN 5 AND 50
+ORDER BY 
+    u.ReputationRank, 
+    WeightedPostImpact DESC
+LIMIT 100;

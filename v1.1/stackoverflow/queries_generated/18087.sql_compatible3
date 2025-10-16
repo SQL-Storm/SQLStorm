@@ -1,0 +1,223 @@
+WITH RECURSIVE PostHierarchy AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.AnswerCount,
+        p.Title,
+        p.Tags,
+        0 AS Level,
+        CAST(p.Id AS VARCHAR(255)) AS Path
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+
+    UNION ALL
+
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.AnswerCount,
+        p.Title,
+        p.Tags,
+        ph.Level + 1 AS Level,
+        ph.Path || '->' || CAST(p.Id AS VARCHAR(255)) AS Path
+    FROM Posts p
+    JOIN PostHierarchy ph ON p.ParentId = ph.Id
+    WHERE p.PostTypeId = 2
+),
+QuestionMetrics AS (
+    SELECT
+        ph.Id AS QuestionId,
+        ph.Title AS QuestionTitle,
+        ph.Tags AS QuestionTags,
+        ph.Score AS QuestionScore,
+        ph.AnswerCount AS TotalAnswers,
+        COUNT(DISTINCT c.Id) AS CommentCountOnQuestion,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesOnQuestion,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesOnQuestion,
+        MAX(u.Reputation) AS OwnerReputation,
+        AVG(u.Views) AS OwnerViews,
+        STRING_AGG(DISTINCT COALESCE(pt.Name, 'Unknown'), ', ') AS PostTypesOfAnswers,
+        ph.OwnerUserId
+    FROM PostHierarchy ph
+    LEFT JOIN Comments c ON ph.Id = c.PostId
+    LEFT JOIN Votes v ON ph.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    LEFT JOIN Users u ON ph.OwnerUserId = u.Id
+    LEFT JOIN Posts ans ON ph.Id = ans.ParentId
+    LEFT JOIN PostTypes pt ON ans.PostTypeId = pt.Id
+    WHERE ph.Level = 0
+    GROUP BY
+        ph.Id, ph.Title, ph.Tags, ph.Score, ph.AnswerCount, ph.OwnerUserId
+),
+AnswerAnalysis AS (
+    SELECT
+        ans.ParentId AS QuestionId,
+        COUNT(ans.Id) AS NumberOfAnswers,
+        SUM(CASE WHEN ans.Score > 0 THEN 1 ELSE 0 END) AS PositiveScoreAnswers,
+        AVG(ans.Score) AS AverageAnswerScore,
+        MAX(ans.Score) AS MaxAnswerScore,
+        MIN(ans.Score) AS MinAnswerScore,
+        COUNT(DISTINCT u.Id) AS DistinctAnswerers,
+        COUNT(DISTINCT CASE WHEN ans.OwnerUserId IS NULL THEN ans.Id END) AS CommunityOwnedAnswers,
+        STRING_AGG(DISTINCT ans.OwnerDisplayName, ' | ') AS AnswererNames
+    FROM Posts ans
+    JOIN PostTypes pt ON ans.PostTypeId = pt.Id AND pt.Name = 'Answer'
+    LEFT JOIN Users u ON ans.OwnerUserId = u.Id
+    GROUP BY ans.ParentId
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT ph.Id) AS TotalQuestionsAsked,
+        COUNT(DISTINCT ans.Id) AS TotalAnswersGiven,
+        COUNT(DISTINCT b.Id) AS TotalBadgesEarned,
+        SUM(CASE WHEN ph.Score > 100 THEN 1 ELSE 0 END) AS HighlyScoredQuestions,
+        SUM(CASE WHEN ans.Score > 50 THEN 1 ELSE 0 END) AS HighlyScoredAnswers,
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 2) AS UpvotesCast,
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 3) AS DownvotesCast,
+        (u.UpVotes - u.DownVotes) AS NetUserVotes,
+        CASE WHEN u.WebsiteUrl IS NULL THEN 'No Website' ELSE 'Has Website' END AS WebsiteStatus,
+        u.Reputation,
+        u.CreationDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.WebsiteUrl
+    FROM Users u
+    LEFT JOIN Posts ph ON u.Id = ph.OwnerUserId AND ph.PostTypeId = 1
+    LEFT JOIN Posts ans ON u.Id = ans.OwnerUserId AND ans.PostTypeId = 2
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Views, u.UpVotes, u.DownVotes, u.WebsiteUrl
+),
+TagPopularity AS (
+    SELECT
+        t.TagName,
+        t.Count AS TagUsageCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') AS PostsWithTag,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE WHEN t.IsModeratorOnly = 1 THEN 'ModeratorOnly' ELSE 'Public' END AS TagAccess
+    FROM Tags t
+)
+SELECT
+    qm.QuestionId,
+    qm.QuestionTitle,
+    qm.QuestionScore,
+    qm.TotalAnswers,
+    qm.CommentCountOnQuestion,
+    qm.UpVotesOnQuestion,
+    qm.DownVotesOnQuestion,
+    aa.NumberOfAnswers,
+    aa.PositiveScoreAnswers,
+    aa.AverageAnswerScore,
+    aa.MaxAnswerScore,
+    aa.MinAnswerScore,
+    aa.DistinctAnswerers,
+    aa.CommunityOwnedAnswers,
+    ua.TotalQuestionsAsked,
+    ua.TotalAnswersGiven,
+    ua.TotalBadgesEarned,
+    ua.HighlyScoredQuestions,
+    ua.HighlyScoredAnswers,
+    ua.UpvotesCast,
+    ua.DownvotesCast,
+    ua.NetUserVotes,
+    ua.WebsiteStatus,
+    tp.TagUsageCount,
+    tp.PostsWithTag,
+    tp.TagAccess,
+    CASE
+        WHEN qm.QuestionScore > 1000 THEN 'Epic'
+        WHEN qm.QuestionScore BETWEEN 500 AND 1000 THEN 'Legendary'
+        WHEN qm.QuestionScore BETWEEN 100 AND 499 THEN 'Great'
+        WHEN qm.QuestionScore BETWEEN 10 AND 99 THEN 'Good'
+        ELSE 'Average'
+    END AS QuestionPopularityTier,
+    COALESCE(qm.OwnerReputation, 0) AS OwnerReputation,
+    COALESCE(qm.OwnerViews, 0) AS OwnerViews,
+    COALESCE(aa.AnswererNames, 'No Answers Yet') AS AnswererNamesList,
+    (SELECT MAX(ph_edit.CreationDate)
+     FROM PostHistory ph_edit
+     WHERE ph_edit.PostId = qm.QuestionId
+       AND ph_edit.PostHistoryTypeId IN (4, 5, 6)) AS LatestEditDate,
+    RANK() OVER (PARTITION BY qm.QuestionId ORDER BY aa.AverageAnswerScore DESC) AS RankByAverageAnswerScore,
+    (SELECT t2.TagName
+     FROM (
+         SELECT value AS tagvalue
+         FROM (SELECT regexp_split_to_table(replace(replace(qm.QuestionTags, '<', ''), '>', ''), '>') AS value) s
+     ) tags_exploded
+     JOIN Tags t2 ON t2.TagName = tags_exploded.tagvalue
+     ORDER BY t2.Count DESC
+     LIMIT 1) AS TopTag,
+    CASE
+        WHEN qm.QuestionTags LIKE '%<performance>%' THEN 'Performance Related'
+        WHEN qm.QuestionTags LIKE '%<sql>%' THEN 'SQL Related'
+        WHEN qm.QuestionTags LIKE '%<optimization>%' THEN 'Optimization Related'
+        ELSE 'General'
+    END AS TagCategory
+FROM QuestionMetrics qm
+JOIN AnswerAnalysis aa ON qm.QuestionId = aa.QuestionId
+LEFT JOIN UserActivity ua ON qm.OwnerUserId = ua.UserId
+LEFT JOIN TagPopularity tp ON tp.TagName = (
+    SELECT t3.TagName
+    FROM (
+        SELECT value AS tagvalue
+        FROM (SELECT regexp_split_to_table(replace(replace(qm.QuestionTags, '<', ''), '>', ''), '>') AS value) s
+    ) tags_exploded2
+    JOIN Tags t3 ON t3.TagName = tags_exploded2.tagvalue
+    ORDER BY t3.Count DESC
+    LIMIT 1
+)
+WHERE qm.QuestionScore > 0
+  AND aa.NumberOfAnswers > 0
+  AND qm.OwnerReputation > 10000
+  AND qm.QuestionId BETWEEN 1000 AND 5000
+GROUP BY
+    qm.QuestionId,
+    qm.QuestionTitle,
+    qm.QuestionScore,
+    qm.TotalAnswers,
+    qm.CommentCountOnQuestion,
+    qm.UpVotesOnQuestion,
+    qm.DownVotesOnQuestion,
+    aa.NumberOfAnswers,
+    aa.PositiveScoreAnswers,
+    aa.AverageAnswerScore,
+    aa.MaxAnswerScore,
+    aa.MinAnswerScore,
+    aa.DistinctAnswerers,
+    aa.CommunityOwnedAnswers,
+    ua.TotalQuestionsAsked,
+    ua.TotalAnswersGiven,
+    ua.TotalBadgesEarned,
+    ua.HighlyScoredQuestions,
+    ua.HighlyScoredAnswers,
+    ua.UpvotesCast,
+    ua.DownvotesCast,
+    ua.NetUserVotes,
+    ua.WebsiteStatus,
+    tp.TagUsageCount,
+    tp.PostsWithTag,
+    tp.TagAccess,
+    qm.OwnerReputation,
+    qm.OwnerViews,
+    aa.AnswererNames,
+    qm.OwnerUserId,
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.CreationDate,
+    ua.Views,
+    ua.UpVotes,
+    ua.DownVotes,
+    ua.WebsiteUrl
+ORDER BY qm.QuestionScore DESC, aa.AverageAnswerScore DESC
+LIMIT 100;

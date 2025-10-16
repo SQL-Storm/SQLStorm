@@ -1,0 +1,185 @@
+-- {"query": "595.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1548} 
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p2.Id) filter (where p2.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        coalesce(sum(vb.BountyAmount), 0) as TotalBountyGiven,
+        row_number() over (partition by u.Id order by p.CreationDate desc nulls last) as LastPostRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Posts p2 on p2.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes vb on vb.UserId = u.Id and vb.VoteTypeId = 8 -- BountyStart
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+TopUsers as (
+    select
+        UserId,
+        DisplayName,
+        Reputation,
+        QuestionCount,
+        AnswerCount,
+        CommentCount,
+        TotalBountyGiven,
+        LastAccessDate
+    from RecursiveUserActivity
+    where Reputation > (select percentile_cont(0.9) within group (order by Reputation) from Users)
+),
+PostWithHistory as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        ph.PostHistoryTypeId,
+        ph.CreationDate as HistoryDate,
+        ph.UserId as EditorUserId,
+        ph.Comment as HistoryComment,
+        row_number() over (partition by p.Id order by ph.CreationDate desc) as HistoryRank
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id
+),
+FilteredPostHistory as (
+    select
+        PostId,
+        max(case when PostHistoryTypeId = 10 then HistoryDate end) as ClosedDate,
+        max(case when PostHistoryTypeId = 11 then HistoryDate end) as ReopenedDate,
+        max(case when PostHistoryTypeId = 24 then HistoryDate end) as LastSuggestedEditDate
+    from PostWithHistory
+    group by PostId
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+    from Badges b
+    group by b.UserId
+),
+UserAggregates as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        rqa.QuestionCount,
+        rqa.AnswerCount,
+        rqa.CommentCount,
+        rqa.TotalBountyGiven
+    from Users u
+    left join UserBadgeCounts ub on ub.UserId = u.Id
+    left join RecursiveUserActivity rqa on rqa.UserId = u.Id
+),
+TopPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        fph.ClosedDate,
+        fph.ReopenedDate,
+        fph.LastSuggestedEditDate,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        rank() over (partition by p.PostTypeId order by p.Score desc nulls last, p.ViewCount desc nulls last) as PostRank
+    from Posts p
+    left join FilteredPostHistory fph on fph.PostId = p.Id
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId in (1, 2) -- Questions and Answers
+),
+DuplicatePostLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle,
+        lt.Name as LinkTypeName
+    from PostLinks pl
+    inner join LinkTypes lt on lt.Id = pl.LinkTypeId
+    inner join Posts p1 on p1.Id = pl.PostId
+    inner join Posts p2 on p2.Id = pl.RelatedPostId
+    where lt.Name = 'Duplicate'
+),
+UserCommentActivity as (
+    select
+        c.UserId,
+        count(*) as TotalComments,
+        count(distinct c.PostId) as DistinctPostsCommented,
+        max(c.CreationDate) as LastCommentDate,
+        string_agg(distinct substring(c.Text from 1 for 50), ' | ') as SampleCommentSnippets
+    from Comments c
+    group by c.UserId
+),
+FinalResult as (
+    select
+        tu.UserId,
+        tu.DisplayName,
+        ua.Reputation,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        ua.CommentCount,
+        ua.TotalBountyGiven,
+        p.Id as TopQuestionId,
+        p.Title as TopQuestionTitle,
+        p.Score as TopQuestionScore,
+        p.ViewCount as TopQuestionViews,
+        p.ClosedDate as TopQuestionClosedDate,
+        dup.RelatedPostId as DuplicateOfQuestionId,
+        dup.RelatedPostTitle as DuplicateOfQuestionTitle,
+        uca.TotalComments,
+        uca.DistinctPostsCommented,
+        uca.LastCommentDate,
+        uca.SampleCommentSnippets,
+        dense_rank() over (order by ua.Reputation desc) as ReputationRank
+    from TopUsers tu
+    left join UserAggregates ua on ua.Id = tu.UserId
+    left join TopPosts p on p.OwnerUserId = tu.UserId and p.PostTypeId = 1 and p.PostRank = 1
+    left join DuplicatePostLinks dup on dup.PostId = p.Id
+    left join UserCommentActivity uca on uca.UserId = tu.UserId
+    where p.Id is not null
+)
+select
+    UserId,
+    DisplayName,
+    Reputation,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    QuestionCount,
+    AnswerCount,
+    CommentCount,
+    TotalBountyGiven,
+    TopQuestionId,
+    substring(TopQuestionTitle from 1 for 100) as TopQuestionTitleSnippet,
+    TopQuestionScore,
+    TopQuestionViews,
+    case when TopQuestionClosedDate is not null then 'Closed' else 'Open' end as TopQuestionStatus,
+    DuplicateOfQuestionId,
+    substring(DuplicateOfQuestionTitle from 1 for 100) as DuplicateOfQuestionTitleSnippet,
+    TotalComments,
+    DistinctPostsCommented,
+    LastCommentDate,
+    substring(SampleCommentSnippets from 1 for 200) as SampleCommentSnippets,
+    ReputationRank
+from FinalResult
+order by ReputationRank
+limit 50;

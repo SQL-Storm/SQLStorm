@@ -1,0 +1,73 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        COUNT(C.Id) OVER (PARTITION BY P.Id) AS CommentCount,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.CreationDate) AS UserPostRank
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    LEFT JOIN 
+        Comments C ON P.Id = C.PostId
+    WHERE 
+        P.PostTypeId IN (1, 2) 
+        AND P.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '1' YEAR
+), 
+AggregatedUserStats AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        SUM(CASE WHEN V.VoteTypeId IN (2,3) THEN V.Score ELSE 0 END) AS TotalVoteScore
+    FROM 
+        Users U
+    LEFT JOIN 
+        Badges B ON U.Id = B.UserId
+    LEFT JOIN 
+        Votes V ON U.Id = V.UserId
+    GROUP BY 
+        U.Id, U.DisplayName
+), 
+TopUsers AS (
+    SELECT 
+        Id,
+        DisplayName
+    FROM 
+        AggregatedUserStats
+    ORDER BY 
+        TotalVoteScore DESC, TotalBadges DESC
+    LIMIT 10
+)
+SELECT 
+    RP.Id,
+    RP.PostTypeId,
+    RP.CreationDate,
+    RP.Score,
+    RP.ViewCount,
+    RP.OwnerUserId,
+    RP.OwnerDisplayName,
+    RP.CommentCount,
+    AUS.TotalBadges,
+    AUS.GoldBadges,
+    AUS.SilverBadges,
+    AUS.BronzeBadges,
+    AUS.TotalVoteScore
+FROM 
+    RankedPosts RP
+JOIN 
+    TopUsers TU ON RP.OwnerUserId = TU.Id
+JOIN 
+    AggregatedUserStats AUS ON RP.OwnerUserId = AUS.Id
+WHERE 
+    RP.UserPostRank <= 3
+ORDER BY 
+    RP.Score DESC, RP.CreationDate;

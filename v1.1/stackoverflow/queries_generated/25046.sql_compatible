@@ -1,0 +1,18 @@
+CAST(NULL AS integer)      AS reputation,
+    CAST(NULL AS integer)      AS gold_badges,
+    CAST(NULL AS integer)      AS silver_badges,
+    CAST(NULL AS integer)      AS bronze_badges,
+    CAST(NULL AS bigint)       AS total_post_score,
+    CAST(NULL AS numeric)      AS avg_answer_score,
+    CAST(NULL AS timestamp)    AS last_post_date,
+    CAST(NULL AS timestamp)    AS last_vote_date,
+    CAST(NULL AS integer)      AS up_votes_given,
+    CAST(NULL AS integer)      AS down_votes_given,
+    CAST(NULL AS varchar)      AS recent_question_title,
+    CAST(NULL AS timestamp)    AS recent_question_date,
+    CAST(NULL AS integer)      AS distinct_tag_count,
+    CAST(NULL AS varchar)      AS tagname,
+    CAST(NULL AS integer)      AS tag_use_count,
+    CAST(NULL AS varchar)      AS tag_latest_post_title,
+    CAST(NULL AS timestamp)    AS tag_latest_post_date
+WHERE NOT EXISTS (SELECT 1 FROM final_users);

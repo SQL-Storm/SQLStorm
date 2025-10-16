@@ -1,0 +1,131 @@
+WITH RecentActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        COUNT(DISTINCT p.Id) AS NumPosts,
+        COUNT(DISTINCT c.Id) AS NumComments,
+        COUNT(DISTINCT b.Id) AS NumBadges
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id 
+        AND p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180' DAY
+    LEFT JOIN Comments c ON c.UserId = u.Id 
+        AND c.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180' DAY
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.LastAccessDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location
+    HAVING COUNT(DISTINCT p.Id) + COUNT(DISTINCT c.Id) > 2
+), 
+UserPostsWithStats AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        pt.Name AS PostType,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        p.Tags,
+        ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS ScoreRank,
+        DENSE_RANK() OVER(PARTITION BY p.OwnerUserId, p.PostTypeId ORDER BY p.CreationDate DESC) AS LatestPerType
+    FROM Posts p
+    INNER JOIN PostTypes pt ON pt.Id = p.PostTypeId
+    WHERE p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180' DAY
+),
+PostVoteSummary AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS Favorites
+    FROM Votes v
+    WHERE v.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180' DAY
+    GROUP BY v.PostId
+),
+TagPopularity AS (
+    SELECT
+        t.TagName,
+        COUNT(*) AS UsageCount,
+        SUM(p.ViewCount) AS TotalViews
+    FROM Posts p
+    JOIN LATERAL (
+        SELECT TRIM(tn) AS TagName
+        FROM UNNEST(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><')) AS tn(tn)
+    ) tname ON TRUE
+    LEFT JOIN Tags t ON t.TagName = tname.TagName
+    WHERE p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180' DAY
+      AND p.PostTypeId = 1
+    GROUP BY t.TagName
+),
+ClosedQuestions AS (
+    SELECT
+        ph.PostId,
+        cr.Name AS CloseReason,
+        MAX(ph.CreationDate) AS ClosedAt
+    FROM PostHistory ph
+    JOIN CloseReasonTypes cr 
+        ON cr.Id = CAST(ph.Comment AS INTEGER)
+    WHERE ph.PostHistoryTypeId = 10
+      AND ph.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180' DAY
+    GROUP BY ph.PostId, cr.Name
+)
+SELECT 
+    rau.UserId,
+    rau.DisplayName,
+    rau.Reputation,
+    rau.Location,
+    rau.NumPosts,
+    rau.NumComments,
+    rau.NumBadges,
+    upws.PostId,
+    upws.PostType,
+    upws.Score,
+    upws.ViewCount,
+    upws.AnswerCount,
+    upws.CommentCount,
+    upws.FavoriteCount,
+    upws.Tags,
+    upws.ScoreRank,
+    upws.LatestPerType,
+    COALESCE(pvs.UpVotes, 0) AS RecentUpVotes,
+    COALESCE(pvs.DownVotes, 0) AS RecentDownVotes,
+    COALESCE(pvs.Favorites, 0) AS RecentFavorites,
+    cqs.CloseReason,
+    cqs.ClosedAt,
+    tp.TagName AS TopTag,
+    tp.UsageCount AS TagUsage,
+    tp.TotalViews AS TagTotalViews,
+    CASE
+        WHEN upws.Score > 5 AND COALESCE(pvs.UpVotes, 0) > 10 THEN 'Popular'
+        WHEN upws.Score < 0 AND COALESCE(pvs.DownVotes, 0) > 5 THEN 'Controversial'
+        ELSE 'Normal'
+    END AS PopularityStatus
+FROM RecentActiveUsers rau
+JOIN UserPostsWithStats upws
+    ON upws.OwnerUserId = rau.UserId
+LEFT JOIN PostVoteSummary pvs
+    ON pvs.PostId = upws.PostId
+LEFT JOIN ClosedQuestions cqs
+    ON cqs.PostId = upws.PostId
+LEFT JOIN LATERAL (
+    SELECT tps.TagName, tps.UsageCount, tps.TotalViews
+    FROM TagPopularity tps
+    WHERE upws.Tags IS NOT NULL
+      AND tps.TagName = (
+          SELECT TRIM(tn)
+          FROM UNNEST(string_to_array(substring(upws.Tags FROM 2 FOR char_length(upws.Tags)-2), '><')) AS tn(tn)
+          ORDER BY tps.UsageCount DESC, tps.TotalViews DESC
+          LIMIT 1
+      )
+    LIMIT 1
+) tp ON TRUE
+WHERE upws.ScoreRank <= 3
+  AND (upws.LatestPerType = 1 OR upws.LatestPerType = 2)
+ORDER BY rau.Reputation DESC, upws.Score DESC, upws.ViewCount DESC
+LIMIT 100;

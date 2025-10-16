@@ -1,0 +1,104 @@
+WITH recent_q AS (
+    SELECT p.Id,
+           p.OwnerUserId,
+           p.Title,
+           p.Score,
+           p.CreationDate,
+           p.Tags,
+           p.ClosedDate
+    FROM   Posts p
+    WHERE  p.PostTypeId = 1
+      AND  p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '1 year')
+),
+user_badges AS (
+    SELECT u.Id                                    AS UserId,
+           COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS Gold,
+           COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS Silver,
+           COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS Bronze
+    FROM   Users u
+    LEFT   JOIN Badges b ON b.UserId = u.Id
+    GROUP  BY u.Id
+),
+user_votes AS (
+    SELECT u.Id                                            AS UserId,
+           COALESCE(SUM(CASE v.VoteTypeId
+                        WHEN 2 THEN  1
+                        WHEN 3 THEN -1
+                        ELSE 0 END),0)   AS NetVote
+    FROM   Users u
+    LEFT   JOIN Posts p  ON p.OwnerUserId = u.Id
+    LEFT   JOIN Votes v  ON v.PostId = p.Id
+    GROUP  BY u.Id
+),
+question_rank AS (
+    SELECT rq.*,
+           ROW_NUMBER() OVER (PARTITION BY rq.OwnerUserId
+                              ORDER BY rq.Score DESC,
+                                       rq.CreationDate DESC) AS rn
+    FROM   recent_q rq
+),
+tag_stats AS (
+    SELECT tag,
+           COUNT(*)                                            AS cnt,
+           ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC)         AS rn
+    FROM   (
+            SELECT UNNEST(STRING_TO_ARRAY(
+                       SUBSTRING(q.Tags FROM 2 FOR LENGTH(q.Tags)-2),
+                       '><')) AS tag
+            FROM   recent_q q
+            WHERE  q.Tags IS NOT NULL
+          ) t
+    GROUP  BY tag
+),
+top_five_tags AS (
+    SELECT tag FROM tag_stats WHERE rn <= 5
+)
+SELECT u.Id                                    AS UserId,
+       u.DisplayName,
+       ub.Gold,
+       ub.Silver,
+       ub.Bronze,
+       uv.NetVote,
+       q.Id                                    AS QuestionId,
+       q.Title,
+       q.Score,
+       q.CreationDate,
+       CASE WHEN q.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS Status,
+       COALESCE( (SELECT ARRAY_AGG(DISTINCT t.Tag)
+                  FROM   (SELECT UNNEST(STRING_TO_ARRAY(
+                               SUBSTRING(q.Tags FROM 2 FOR LENGTH(q.Tags)-2),
+                               '><')) AS Tag) t), ARRAY[]::varchar[]) AS QuestionTags,
+       (SELECT COUNT(*) FROM Comments c WHERE c.PostId = q.Id)          AS CommentCount,
+       (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.Id
+                                    AND v.VoteTypeId = 2)               AS UpVotes,
+       (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.Id
+                                    AND v.VoteTypeId = 3)               AS DownVotes
+FROM   Users u
+LEFT   JOIN user_badges ub ON ub.UserId = u.Id
+LEFT   JOIN user_votes  uv ON uv.UserId = u.Id
+LEFT   JOIN question_rank q ON q.OwnerUserId = u.Id AND q.rn <= 5
+WHERE  u.Reputation > 1000
+GROUP  BY u.Id, u.DisplayName,
+          ub.Gold, ub.Silver, ub.Bronze,
+          uv.NetVote,
+          q.Id, q.Title, q.Score, q.CreationDate, q.ClosedDate, q.Tags
+HAVING COUNT(*) FILTER (WHERE q.Id IS NOT NULL) > 0
+
+UNION ALL
+
+SELECT CAST(NULL AS INTEGER)    AS UserId,
+       CAST(NULL AS VARCHAR)    AS DisplayName,
+       CAST(NULL AS INTEGER)    AS Gold,
+       CAST(NULL AS INTEGER)    AS Silver,
+       CAST(NULL AS INTEGER)    AS Bronze,
+       CAST(NULL AS INTEGER)    AS NetVote,
+       CAST(NULL AS INTEGER)    AS QuestionId,
+       CAST(NULL AS VARCHAR)    AS Title,
+       CAST(NULL AS INTEGER)    AS Score,
+       CAST(NULL AS TIMESTAMP)  AS CreationDate,
+       CAST(NULL AS VARCHAR)    AS Status,
+       CAST(NULL AS VARCHAR[])   AS QuestionTags,
+       CAST(NULL AS INTEGER)    AS CommentCount,
+       CAST(NULL AS INTEGER)    AS UpVotes,
+       CAST(NULL AS INTEGER)    AS DownVotes
+WHERE NOT EXISTS (SELECT 1 FROM Users WHERE Reputation > 1000);

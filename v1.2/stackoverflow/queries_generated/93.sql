@@ -1,0 +1,143 @@
+-- {"query": "93.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1330} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 as Level,
+        cast(t.TagName as varchar(1000)) as Path
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Level + 1,
+        r.Path || ' > ' || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id <> r.Id and t2.Count < r.Count and t2.IsModeratorOnly = 0 and t2.IsRequired = 0
+    where r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+        coalesce(sum(b.Class),0) as BadgeScore
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as rn
+    from Posts p
+    where p.PostTypeId in (1,2) and p.Score > 0
+),
+PostAnswerStats as (
+    select
+        q.Id as QuestionId,
+        count(a.Id) as AnswerCount,
+        max(a.Score) as MaxAnswerScore,
+        avg(a.Score) as AvgAnswerScore,
+        sum(case when a.Score > 10 then 1 else 0 end) as HighScoreAnswers
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id
+),
+PostCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        count(*) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as PostsLast30Days,
+        sum(p.Score) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as ScoreLast30Days
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+),
+UserTopTags as (
+    select
+        u.Id as UserId,
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as Tag,
+        count(*) as TagCount
+    from Users u
+    join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+    group by u.Id, Tag
+),
+UserTopTagRanks as (
+    select
+        ut.UserId,
+        ut.Tag,
+        ut.TagCount,
+        rank() over (partition by ut.UserId order by ut.TagCount desc) as TagRank
+    from UserTopTags ut
+),
+FinalUserStats as (
+    select
+        u.Id,
+        u.DisplayName,
+        ubc.GoldBadges,
+        ubc.SilverBadges,
+        ubc.BronzeBadges,
+        ua.PostsLast30Days,
+        ua.ScoreLast30Days,
+        coalesce(max(case when ptr.TagRank = 1 then ptr.Tag else null end), 'No Tags') as TopTag,
+        coalesce(max(ptr.TagCount), 0) as TopTagCount
+    from Users u
+    left join UserBadgeCounts ubc on ubc.UserId = u.Id
+    left join UserActivityWindow ua on ua.UserId = u.Id
+    left join UserTopTagRanks ptr on ptr.UserId = u.Id and ptr.TagRank = 1
+    group by u.Id, u.DisplayName, ubc.GoldBadges, ubc.SilverBadges, ubc.BronzeBadges, ua.PostsLast30Days, ua.ScoreLast30Days
+)
+select
+    f.DisplayName,
+    f.GoldBadges,
+    f.SilverBadges,
+    f.BronzeBadges,
+    f.PostsLast30Days,
+    f.ScoreLast30Days,
+    f.TopTag,
+    f.TopTagCount,
+    coalesce(pas.AnswerCount,0) as TotalAnswersForTopQuestions,
+    coalesce(pas.MaxAnswerScore,0) as MaxAnswerScoreForTopQuestions,
+    coalesce(pas.AvgAnswerScore,0)::numeric(10,2) as AvgAnswerScoreForTopQuestions,
+    coalesce(pcr.CloseReasonName, 'Not Closed') as LastCloseReason,
+    pcr.CloseDate,
+    rh.Level as TagHierarchyLevel,
+    rh.Path as TagHierarchyPath
+from FinalUserStats f
+left join TopPosts tp on tp.OwnerUserId = f.Id and tp.rn = 1 and tp.PostTypeId = 1
+left join PostAnswerStats pas on pas.QuestionId = tp.Id
+left join PostCloseReasons pcr on pcr.PostId = tp.Id
+left join RecursiveTagHierarchy rh on rh.TagName = f.TopTag
+where f.PostsLast30Days > 0
+order by f.ScoreLast30Days desc, f.GoldBadges desc, f.DisplayName
+limit 100;

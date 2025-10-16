@@ -1,0 +1,142 @@
+SELECT 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) as TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+    COUNT(DISTINCT b.Id) as Badges,
+    COALESCE(SUM(p.Score), 0) as TotalScore,
+    COALESCE(AVG(p.Score), 0) as AvgScore,
+    MAX(p.CreationDate) as LastPostDate,
+    COUNT(DISTINCT c.Id) as TotalComments,
+    COUNT(DISTINCT CASE WHEN c.Score > 0 THEN c.Id END) as PositiveComments,
+    COUNT(DISTINCT CASE WHEN c.Score < 0 THEN c.Id END) as NegativeComments,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = u.Id 
+        AND p2.PostTypeId = 1 
+        AND p2.AcceptedAnswerId IS NOT NULL
+    ) as AcceptedAnswers,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p3 
+        WHERE p3.OwnerUserId = u.Id 
+        AND p3.PostTypeId = 1 
+        AND p3.CreationDate >= DATE '2022-01-01'
+    ) as RecentQuestions,
+    (
+        SELECT COUNT(*) 
+        FROM Votes v 
+        WHERE v.UserId = u.Id 
+        AND v.VoteTypeId IN (2, 3)
+    ) as VoteCount,
+    (
+        SELECT STRING_AGG(DISTINCT t.TagName, ', ') 
+        FROM Posts p4 
+        JOIN Posts p5 ON p4.Id = p5.ParentId 
+        CROSS JOIN LATERAL (SELECT UNNEST(STRING_TO_ARRAY(p4.Tags, '<>')) AS TagName) t
+        WHERE p5.OwnerUserId = u.Id 
+        AND p4.PostTypeId = 1
+        AND t.TagName IS NOT NULL
+        AND t.TagName != ''
+    ) as UserTags,
+    CASE 
+        WHEN u.Reputation > 10000 THEN 'Elite'
+        WHEN u.Reputation > 5000 THEN 'Veteran'
+        WHEN u.Reputation > 1000 THEN 'Experienced'
+        ELSE 'Beginner'
+    END as UserLevel,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph 
+        WHERE ph.UserId = u.Id 
+        AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+        AND ph.CreationDate >= DATE '2022-01-01'
+    ) as EditCount,
+    (
+        SELECT COUNT(*) 
+        FROM PostLinks pl 
+        JOIN Posts p6 ON pl.PostId = p6.Id 
+        WHERE p6.OwnerUserId = u.Id 
+        AND pl.LinkTypeId = 1
+    ) as LinkedPosts,
+    COALESCE(
+        (
+            SELECT AVG(ABS(p7.Score - p8.Score)) 
+            FROM Posts p7 
+            JOIN Posts p8 ON p7.ParentId = p8.Id 
+            WHERE p7.OwnerUserId = u.Id 
+            AND p7.PostTypeId = 2
+        ), 
+        0
+    ) as AvgAnswerScoreDeviation,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph2 
+        WHERE ph2.UserId = u.Id 
+        AND ph2.PostHistoryTypeId = 10
+        AND ph2.CreationDate >= DATE '2022-01-01'
+    ) as CloseVotes,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph3 
+        WHERE ph3.UserId = u.Id 
+        AND ph3.PostHistoryTypeId = 11
+        AND ph3.CreationDate >= DATE '2022-01-01'
+    ) as ReopenVotes,
+    COALESCE(
+        (
+            SELECT STRING_AGG(CAST(ph4.Id AS varchar), ', ')
+            FROM (
+                SELECT ph4_inner.Id
+                FROM PostHistory ph4_inner
+                WHERE ph4_inner.UserId = u.Id 
+                  AND ph4_inner.PostHistoryTypeId = 10
+                  AND ph4_inner.CreationDate >= DATE '2022-01-01'
+                ORDER BY ph4_inner.Id
+                LIMIT 5
+            ) ph4
+        ), 
+        ''
+    ) as RecentCloseVoteIds,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p9 
+        WHERE p9.OwnerUserId = u.Id 
+        AND p9.PostTypeId = 1 
+        AND p9.ViewCount > 1000
+        AND p9.CreationDate >= DATE '2022-01-01'
+    ) as HighViewQuestions,
+    ROW_NUMBER() OVER (ORDER BY COALESCE(SUM(p.Score),0) DESC, COUNT(p.Id) DESC) as Ranking,
+    NTILE(100) OVER (ORDER BY COALESCE(SUM(p.Score),0) DESC) as Percentile,
+    LAG(u.Reputation, 1, 0) OVER (ORDER BY u.Reputation) as PrevReputation,
+    LEAD(u.Reputation, 1, 0) OVER (ORDER BY u.Reputation) as NextReputation,
+    (
+        SELECT COUNT(*) 
+        FROM Tags t2 
+        WHERE t2.Count > (
+            SELECT AVG(t3.Count) 
+            FROM Tags t3
+        )
+    ) as AboveAvgTagCount
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+WHERE u.CreationDate >= DATE '2020-01-01'
+    AND u.Reputation >= 100
+    AND u.DisplayName IS NOT NULL
+    AND u.DisplayName != ''
+    AND (
+        EXISTS (SELECT 1 FROM Posts p1 WHERE p1.OwnerUserId = u.Id AND p1.PostTypeId = 1)
+        OR EXISTS (SELECT 1 FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 2)
+        OR EXISTS (SELECT 1 FROM Badges b1 WHERE b1.UserId = u.Id)
+        OR EXISTS (SELECT 1 FROM Comments c1 WHERE c1.UserId = u.Id)
+    )
+GROUP BY u.Id, u.DisplayName, u.Reputation
+HAVING COUNT(DISTINCT p.Id) > 0
+    AND SUM(p.Score) IS NOT NULL
+ORDER BY TotalScore DESC, TotalPosts DESC
+LIMIT 1000;

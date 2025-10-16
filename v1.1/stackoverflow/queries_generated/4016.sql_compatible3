@@ -1,0 +1,127 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT t.Id, t.TagName, t.Count, 0 AS Level, CAST(ARRAY[t.TagName] AS varchar[]) AS Path
+    FROM Tags t
+    WHERE t.Id IN (
+        SELECT DISTINCT CAST(unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS INTEGER)
+        FROM Posts p
+        WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+        LIMIT 100
+    )
+    UNION ALL
+    SELECT t.Id, t.TagName, t.Count, r.Level + 1, r.Path || t.TagName
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.Id = r.Id + 1
+    WHERE r.Level < 2
+),
+UserBadgesRanked AS (
+    SELECT b.UserId, b.Name, b.Class,
+           row_number() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS rn
+    FROM Badges b
+    WHERE b.Date > (CAST('2024-10-01' AS DATE) - INTERVAL '1 year')
+),
+ActiveUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation, u.CreationDate,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        SUM(vb.UpVotes) AS TotalUpVotes,
+        SUM(vb.DownVotes) AS TotalDownVotes
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '1 year')
+    LEFT JOIN (
+        SELECT uu.Id, uu.UpVotes, uu.DownVotes
+        FROM Users uu
+    ) vb ON vb.Id = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, vb.UpVotes, vb.DownVotes
+    HAVING COUNT(p.Id) > 10
+),
+PostScoreAgg AS (
+    SELECT p.Id, p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        MAX(v.CreationDate) AS LastVoteDate,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount
+),
+QuestionAnswerStats AS (
+    SELECT q.Id AS QuestionId, q.Title, q.Tags, q.Score AS QuestionScore, q.ViewCount AS QuestionViews, q.OwnerUserId AS QuestionOwner,
+        COUNT(a.Id) AS AnswerCount,
+        COALESCE(AVG(a.Score), 0) AS AvgAnswerScore,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId = 10) AS CloseVotesCount,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate ELSE NULL END) AS LastCloseVoteDate
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN PostHistory ph ON ph.PostId = q.Id
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.Tags, q.Score, q.ViewCount, q.OwnerUserId
+),
+TopActiveUsersWithRecentBadges AS (
+    SELECT au.Id, au.DisplayName, au.Reputation, au.Location,
+        COUNT(DISTINCT b.Name) AS RecentBadgeCount,
+        STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.rn <= 3) AS Top3RecentBadges
+    FROM ActiveUsers au
+    LEFT JOIN UserBadgesRanked b ON b.UserId = au.Id AND b.rn <= 3
+    GROUP BY au.Id, au.DisplayName, au.Reputation, au.Location
+),
+UserAnswerPerformance AS (
+    SELECT a.OwnerUserId,
+        COUNT(a.Id) AS TotalAnswers,
+        AVG(a.Score) AS AvgAnswerScore,
+        percentile_cont(0.5) WITHIN GROUP (ORDER BY a.Score) AS MedianAnswerScore,
+        SUM(CASE WHEN a.Score >= 10 THEN 1 ELSE 0 END) AS HighScoreAnswers,
+        MAX(a.CreationDate) AS LastAnswerDate
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    GROUP BY a.OwnerUserId
+),
+QuestionCloseReasonCount AS (
+    SELECT ph.PostId,
+        COUNT(DISTINCT ph.Comment) FILTER (WHERE ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL) AS CloseReasonCount
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+)
+SELECT
+    qas.QuestionId,
+    qas.Title,
+    replace(qas.Tags, '><', ', ') AS ParsedTags,
+    qas.QuestionScore,
+    qas.QuestionViews,
+    qas.AnswerCount,
+    qas.AvgAnswerScore,
+    qas.CloseVotesCount,
+    qas.LastCloseVoteDate,
+    COALESCE(uap.TotalAnswers, 0) AS UserTotalAnswers,
+    COALESCE(uap.AvgAnswerScore, 0) AS UserAvgAnswerScore,
+    COALESCE(uap.HighScoreAnswers, 0) AS UserHighScoreAnswers,
+    COALESCE(tauwb.RecentBadgeCount, 0) AS UserRecentBadgeCount,
+    tauwb.Top3RecentBadges,
+    tauwb.Location AS UserLocation,
+    CASE
+        WHEN qas.CloseVotesCount > 5 THEN 'Controversial'
+        WHEN qas.QuestionScore > 50 THEN 'Highly Scored'
+        ELSE 'Normal'
+    END AS QuestionStatus,
+    row_number() OVER (PARTITION BY tauwb.Location ORDER BY qas.QuestionScore DESC) AS RankInLocation,
+    STRING_AGG(DISTINCT (b.Name || '(' || CAST(b.Class AS varchar) || ')') ORDER BY b.Class) AS AllBadgesListed,
+    COALESCE(qcrc.CloseReasonCount, 0) AS NumberOfCloseReasons
+FROM QuestionAnswerStats qas
+LEFT JOIN UserAnswerPerformance uap ON uap.OwnerUserId = qas.QuestionOwner
+LEFT JOIN TopActiveUsersWithRecentBadges tauwb ON tauwb.Id = qas.QuestionOwner
+LEFT JOIN Badges b ON b.UserId = qas.QuestionOwner
+LEFT JOIN QuestionCloseReasonCount qcrc ON qcrc.PostId = qas.QuestionId
+WHERE qas.AnswerCount > 3
+  AND (qas.QuestionScore > 10 OR qas.CloseVotesCount > 0)
+  AND tauwb.Location IS NOT NULL
+GROUP BY qas.QuestionId, qas.Title, qas.Tags, qas.QuestionScore, qas.QuestionViews, qas.AnswerCount, qas.AvgAnswerScore, qas.CloseVotesCount, qas.LastCloseVoteDate,
+         uap.TotalAnswers, uap.AvgAnswerScore, uap.HighScoreAnswers,
+         tauwb.RecentBadgeCount, tauwb.Top3RecentBadges, tauwb.Location, qcrc.CloseReasonCount,
+         row_number() OVER (PARTITION BY tauwb.Location ORDER BY qas.QuestionScore DESC)
+ORDER BY tauwb.Location, RankInLocation, qas.QuestionScore DESC
+LIMIT 100;

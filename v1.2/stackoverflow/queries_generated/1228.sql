@@ -1,0 +1,163 @@
+-- {"query": "1228.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.2, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1546} 
+with RecursiveUserActivity AS (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        count(p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        coalesce(sum(p.Score),0) as TotalPostScore,
+        row_number() over (partition by u.Id order by p.CreationDate desc nulls last) as PostRank
+    from
+        Users u
+        left join Posts p on p.OwnerUserId = u.Id
+    where
+        u.Reputation > 1000
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+), UserBadges AS (
+    select
+        b.UserId,
+        count(*) as BadgeCount,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+    from
+        Badges b
+    group by
+        b.UserId
+), UserTopTags AS (
+    select
+        p.OwnerUserId,
+        unnest(string_to_array(substring(p.Tags from '\<(.+?)\>'), '><')) as Tag,
+        count(*) as TagCount
+    from
+        Posts p
+    where
+        p.PostTypeId = 1 and p.OwnerUserId is not null
+    group by
+        p.OwnerUserId, Tag
+), UserTopTagRanked AS (
+    select
+        ut.OwnerUserId,
+        ut.Tag,
+        ut.TagCount,
+        rank() over (partition by ut.OwnerUserId order by ut.TagCount desc) as TagRank
+    from
+        UserTopTags ut
+), UserMostUsedTag AS (
+    select
+        OwnerUserId, 
+        Tag, 
+        TagCount
+    from
+        UserTopTagRanked
+    where TagRank = 1
+), UserActivityWithBadgesAndTags AS (
+    select
+        ua.*,
+        coalesce(ub.BadgeCount, 0) as BadgeCount,
+        coalesce(ub.GoldBadges, 0) as GoldBadges,
+        coalesce(ub.SilverBadges, 0) as SilverBadges,
+        coalesce(ub.BronzeBadges, 0) as BronzeBadges,
+        umt.Tag as FavoriteTag
+    from
+        RecursiveUserActivity ua
+        left join UserBadges ub on ub.UserId = ua.UserId
+        left join UserMostUsedTag umt on umt.OwnerUserId = ua.UserId
+),
+LatestPostHistoryPerPost AS (
+    select distinct on (ph.PostId)
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId as EditorId,
+        ph.UserDisplayName,
+        ph.Comment
+    from 
+        PostHistory ph
+    where 
+        ph.PostHistoryTypeId in (10, 11, 19, 20) -- Close, Reopen, Protected, Unprotected
+    order by
+        ph.PostId, ph.CreationDate desc
+),
+PostWithLinks as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName
+    from
+        Posts p
+        left join PostLinks pl on pl.PostId = p.Id
+        left join LinkTypes lt on lt.Id = pl.LinkTypeId
+),
+OpenQuestionsWithAnswerBountyRanks as (
+    select distinct p.Id as QuestionId, p.Title, p.CreationDate, p.ViewCount,
+        p.AnswerCount, p.Score as QuestionScore,
+        coalesce(b.Rank, 0) as BountyRank
+    from Posts p
+    left join (
+        select 
+            v.PostId,
+            rank() over (partition by v.PostId order by v.BountyAmount desc, v.CreationDate) as Rank
+        from Votes v
+        join Posts pa on pa.Id = v.PostId and pa.PostTypeId = 2 -- Answers with bounties
+        where v.VoteTypeId in (8,9)
+    ) b on b.PostId = p.AcceptedAnswerId
+    where p.PostTypeId = 1 and p.ClosedDate is null
+)
+select 
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.CreationDate as UserJoined,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.TotalPostScore,
+    ua.BadgeCount,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.FavoriteTag,
+    p.Id as PostId,
+    p.PostTypeId,
+    p.Score as PostScore,
+    p.CreationDate as PostDate,
+    coalesce(lph.PostHistoryTypeId, 0) as LastPostHistoryType,
+    lph.CreationDate as LastPostHistoryDate,
+    coalesce(lph.EditorId, -1) as LastEditorUserId,
+    lph.UserDisplayName as LastEditorDisplayName,
+    coalesce(pl.RelatedPostId, -1) as RelatedPostId,
+    pl.LinkTypeName,
+    oq.Title as OpenQuestionTitle,
+    oq.ViewCount as OpenQuestionViews,
+    oq.AnswerCount as OpenQuestionAnswerCount,
+    oq.BountyRank as OpenQuestionBountyRank,
+    count(distinct c.Id) as CommentsCountOnPost
+from
+    UserActivityWithBadgesAndTags ua
+    join Posts p on p.OwnerUserId = ua.UserId
+    left join LatestPostHistoryPerPost lph on lph.PostId = p.Id
+    left join PostWithLinks pl on pl.Id = p.Id
+    left join Comments c on c.PostId = p.Id and (c.Score > 0 or c.UserId = ua.UserId)
+    left join OpenQuestionsWithAnswerBountyRanks oq on oq.QuestionId = p.ParentId or oq.QuestionId = p.Id
+where 
+    p.CreationDate > (current_date - interval '3 year')
+group by
+    ua.UserId, ua.DisplayName, ua.Reputation, ua.CreationDate, ua.QuestionCount, ua.AnswerCount, ua.TotalPostScore,
+    ua.BadgeCount, ua.GoldBadges, ua.SilverBadges, ua.BronzeBadges, ua.FavoriteTag,
+    p.Id, p.PostTypeId, p.Score, p.CreationDate,
+    lph.PostHistoryTypeId, lph.CreationDate, lph.EditorId, lph.UserDisplayName,
+    pl.RelatedPostId, pl.LinkTypeName,
+    oq.Title, oq.ViewCount, oq.AnswerCount, oq.BountyRank
+having
+    max(p.Score) filter (where p.PostTypeId = 2) > 10
+order by
+    ua.Reputation desc nulls last,
+    ua.TotalPostScore desc nulls last,
+    p.Score desc nulls last
+limit 50;

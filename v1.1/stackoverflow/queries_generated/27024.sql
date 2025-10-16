@@ -1,0 +1,129 @@
+-- {"query": "27024.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2337, "output_tokens": 1166} 
+
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(p.Id) AS TotalPosts,
+        COUNT(DISTINCT a.Id) AS TotalAnswers,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.Reputation, u.DisplayName
+),
+HighActivityUsers AS (
+    SELECT
+        UserId,
+        Reputation,
+        DisplayName,
+        TotalPosts,
+        TotalAnswers,
+        TotalComments,
+        TotalVotes,
+        TotalBadges,
+        ReputationRank
+    FROM
+        UserActivity
+    WHERE
+        ReputationRank <= 100
+),
+PostActivity AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        STRING_AGG(DISTINCT t.TagName, ' ') AS TagNames,
+        COALESCE(a.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            ELSE 'Open'
+        END AS PostStatus
+    FROM
+        Posts p
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN
+        Tags t ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    LEFT JOIN
+        Posts a ON p.AcceptedAnswerId = a.Id
+    GROUP BY
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId, p.Title, p.Tags, a.AcceptedAnswerId, p.ClosedDate, p.CommunityOwnedDate
+),
+ActivePosts AS (
+    SELECT
+        PostId,
+        PostTypeId,
+        CreationDate,
+        Score,
+        ViewCount,
+        OwnerUserId,
+        Title,
+        TagNames,
+        CommentCount,
+        VoteCount,
+        AcceptedAnswerId,
+        PostStatus
+    FROM
+        PostActivity
+    WHERE
+        PostTypeId = 1 AND
+        CreationDate >= DATEADD(month, -6, GETDATE())
+)
+SELECT
+    h.UserId,
+    h.DisplayName,
+    h.Reputation,
+    h.TotalPosts,
+    h.TotalAnswers,
+    h.TotalComments,
+    h.TotalVotes,
+    h.TotalBadges,
+    h.ReputationRank,
+    a.PostId,
+    a.Title,
+    a.TagNames,
+    a.Score,
+    a.ViewCount,
+    a.CommentCount,
+    a.VoteCount,
+     p.Body as AcceptedAnswerBody,
+    a.AcceptedAnswerId,
+    a.PostStatus,
+    CASE
+            WHEN a.PostStatus = 'Closed' THEN 'The post is closed.'
+	    WHEN a.PostStatus = 'Open' THEN 'The post is open.'
+	    WHEN a.PostStatus = 'Community Owned' THEN 'This is a community-owned post.'
+    ELSE '' END AS StatusMessage
+FROM
+    HighActivityUsers h
+JOIN
+    ActivePosts a ON h.UserId = a.OwnerUserId
+LEFT OUTER JOIN
+Posts p on a.AcceptedAnswerId = p.Id
+ORDER BY
+    h.Reputation DESC, a.Score DESC, a.ViewCount DESC;

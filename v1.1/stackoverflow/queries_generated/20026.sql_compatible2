@@ -1,0 +1,100 @@
+WITH UserQuestionDetails AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.FavoriteCount,
+        p.AcceptedAnswerId,
+        ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS QuestionRank,
+        AVG(p.Score) OVER(PARTITION BY p.OwnerUserId) AS UserAvgQuestionScore,
+        LAG(p.CreationDate, 1) OVER(PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousQuestionDate,
+        CASE
+            WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN split_part(substring(p.Tags FROM 2 FOR (length(p.Tags) - 2)), '><', 1)
+            ELSE 'untagged'
+        END AS PrimaryTag
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+GlobalTagStats AS (
+    SELECT
+        uqd.PrimaryTag,
+        AVG(uqd.Score) AS AvgGlobalScore,
+        AVG(uqd.ViewCount) AS AvgGlobalViewCount,
+        COUNT(*) AS TotalQuestionsWithTag
+    FROM UserQuestionDetails uqd
+    GROUP BY uqd.PrimaryTag
+    HAVING COUNT(*) > 50
+),
+ActiveOrVeteranUsers AS (
+    SELECT Id, DisplayName, Reputation, Location, LastAccessDate, CreationDate FROM Users
+    WHERE LastAccessDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year') AND Reputation > 10000
+    UNION
+    SELECT Id, DisplayName, Reputation, Location, LastAccessDate, CreationDate FROM Users
+    WHERE CreationDate < CAST('2012-01-01' AS date) AND Reputation > 50000
+)
+SELECT
+    u.DisplayName AS UserName,
+    u.Reputation,
+    DENSE_RANK() OVER (PARTITION BY COALESCE(u.Location, 'N/A') ORDER BY u.Reputation DESC) AS LocationRank,
+    uqd.Title AS LastQuestionTitle,
+    uqd.Score AS LastQuestionScore,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = uqd.Id AND ph.PostHistoryTypeId = 10) AS CloseVotes,
+    gts.AvgGlobalScore AS TagAvgScore,
+    (uqd.Score - gts.AvgGlobalScore) / NULLIF(uqd.UserAvgQuestionScore, 0) AS RelativePerformance,
+    CASE
+        WHEN uqd.Score > gts.AvgGlobalScore THEN 'Above Average'
+        WHEN uqd.Score < gts.AvgGlobalScore THEN 'Below Average'
+        ELSE 'Average'
+    END AS PerformanceCategory,
+    ('Asked on: ' ||
+        TO_CHAR(CAST(uqd.CreationDate AS timestamp), 'YYYY-MM-DD') ||
+        '. Days since previous: ' ||
+        CAST(EXTRACT(EPOCH FROM (uqd.CreationDate - COALESCE(uqd.PreviousQuestionDate, uqd.CreationDate))) / 86400 AS INTEGER)
+    ) AS QuestionTiming,
+    aa.Body AS AcceptedAnswerBodySample,
+    COALESCE(ans_user.DisplayName, 'No Accepted Answer') AS Answerer,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ans_user.Id AND b.Class = 1) AS AnswererGoldBadges,
+    uqd.Id,
+    uqd.OwnerUserId,
+    uqd.ViewCount,
+    uqd.CreationDate,
+    uqd.PreviousQuestionDate,
+    uqd.PrimaryTag
+FROM
+    ActiveOrVeteranUsers u
+JOIN
+    UserQuestionDetails uqd ON u.Id = uqd.OwnerUserId
+LEFT JOIN
+    GlobalTagStats gts ON uqd.PrimaryTag = gts.PrimaryTag
+LEFT JOIN
+    Posts aa ON uqd.AcceptedAnswerId = aa.Id
+LEFT JOIN
+    Users ans_user ON aa.OwnerUserId = ans_user.Id
+WHERE
+    uqd.QuestionRank = 1
+    AND u.Location IS NOT NULL
+    AND u.Location <> ''
+    AND uqd.FavoriteCount > (SELECT AVG(FavoriteCount) FROM Posts WHERE PostTypeId = 1 AND FavoriteCount > 0)
+GROUP BY
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    u.Id,
+    uqd.Title,
+    uqd.Score,
+    uqd.Id,
+    uqd.OwnerUserId,
+    uqd.ViewCount,
+    uqd.CreationDate,
+    uqd.PreviousQuestionDate,
+    uqd.PrimaryTag,
+    gts.AvgGlobalScore,
+    uqd.UserAvgQuestionScore,
+    aa.Body,
+    ans_user.DisplayName
+ORDER BY
+    u.Location, LocationRank, u.Reputation DESC
+LIMIT 500;

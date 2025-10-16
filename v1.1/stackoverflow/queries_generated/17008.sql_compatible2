@@ -1,0 +1,140 @@
+WITH UserActivityMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        AVG(CASE WHEN p.Score IS NOT NULL THEN p.Score ELSE 0 END) AS AvgPostScore,
+        STRING_AGG(DISTINCT (CAST(b.Class AS varchar) || '|' || b.Name), ', ') FILTER (WHERE b.Class = 1) AS GoldBadges,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        FIRST_VALUE(p.Title) OVER (PARTITION BY u.Id ORDER BY p.Score DESC NULLS LAST) AS TopScoringPostTitle
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '365 days'
+        AND (u.Location IS NOT NULL OR u.AboutMe IS NOT NULL)
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TagExpertise AS (
+    SELECT 
+        p.OwnerUserId,
+        SUBSTRING(tag FROM 1 FOR 35) AS Tag,
+        COUNT(*) AS TagPostCount,
+        SUM(p.Score) AS TagTotalScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY SUM(p.Score) DESC) AS TagRank
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), '><')) AS tag
+    ) t
+    WHERE p.Tags IS NOT NULL 
+        AND p.OwnerUserId IS NOT NULL
+        AND p.PostTypeId IN (1, 2)
+    GROUP BY p.OwnerUserId, tag
+),
+ComplexEditPatterns AS (
+    SELECT DISTINCT
+        ph.UserId,
+        ph.PostId,
+        COUNT(*) OVER (PARTITION BY ph.UserId, ph.PostId) AS EditCount,
+        LEAD(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) - ph.CreationDate AS TimeToNextEdit,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 'Edit'
+            WHEN ph.PostHistoryTypeId IN (7, 8, 9) THEN 'Rollback'
+            WHEN ph.PostHistoryTypeId IN (10, 11) THEN 'CloseReopen'
+            ELSE 'Other'
+        END AS ActionType,
+        LAG(ph.Comment, 1) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PreviousComment
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId NOT IN (1, 2, 3, 25, 50)
+        AND ph.UserId IS NOT NULL
+)
+SELECT 
+    uam.DisplayName,
+    uam.Reputation,
+    uam.ReputationRank,
+    COALESCE(uam.QuestionCount, 0) || '/' || COALESCE(uam.AnswerCount, 0) AS "Questions/Answers",
+    ROUND(CAST(uam.AvgPostScore AS numeric), 2) AS AvgScore,
+    COALESCE(
+      NULLIF(
+        REPLACE(COALESCE(uam.GoldBadges, ''), '1|', ''), 
+        ''
+      ),
+      'None'
+    ) AS GoldBadges,
+    COALESCE(te.Tag, 'No expertise') AS TopTag,
+    COALESCE(te.TagTotalScore, 0) AS TopTagScore,
+    CASE 
+        WHEN uam.TopScoringPostTitle IS NULL THEN 'No posts'
+        WHEN CHAR_LENGTH(uam.TopScoringPostTitle) > 50 THEN SUBSTRING(uam.TopScoringPostTitle FROM 1 FOR 47) || '...'
+        ELSE uam.TopScoringPostTitle
+    END AS BestPost,
+    (
+        SELECT COUNT(DISTINCT c.Id)
+        FROM Comments c
+        WHERE c.UserId = uam.Id
+            AND c.Score > 5
+            AND EXISTS (
+                SELECT 1
+                FROM Posts p2
+                WHERE p2.Id = c.PostId
+                    AND p2.OwnerUserId <> uam.Id
+                    AND p2.Score > 10
+            )
+    ) AS HelpfulComments,
+    COALESCE(cep.EditCount, 0) AS MostEditedPostEdits,
+    (
+        SELECT COUNT(*)
+        FROM Votes v
+        INNER JOIN Posts p3 ON v.PostId = p3.Id
+        WHERE v.VoteTypeId = 2
+            AND p3.OwnerUserId = uam.Id
+            AND v.UserId IN (
+                SELECT u2.Id
+                FROM Users u2
+                WHERE u2.Reputation > 10000
+            )
+    ) AS UpvotesFromHighRepUsers,
+    CASE
+        WHEN NOT EXISTS (
+            SELECT 1 
+            FROM Posts p4 
+            WHERE p4.OwnerUserId = uam.Id 
+                AND p4.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '30 days'
+        ) THEN 'Inactive'
+        WHEN uam.Reputation > 50000 THEN 'Expert'
+        WHEN uam.Reputation > 10000 THEN 'Trusted'
+        WHEN uam.Reputation > 1000 THEN 'Established'
+        ELSE 'Rising'
+    END AS UserStatus,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY dup_times.pl_creation - dup_times.p5_creation) AS MedianTimeToDuplicate
+FROM UserActivityMetrics uam
+LEFT JOIN TagExpertise te ON uam.Id = te.OwnerUserId AND te.TagRank = 1
+LEFT JOIN LATERAL (
+    SELECT UserId, PostId, MAX(EditCount) AS EditCount
+    FROM ComplexEditPatterns
+    WHERE UserId = uam.Id
+    GROUP BY UserId, PostId
+    ORDER BY MAX(EditCount) DESC
+    LIMIT 1
+) cep ON TRUE
+LEFT JOIN LATERAL (
+    SELECT pl.CreationDate AS pl_creation, p5.CreationDate AS p5_creation
+    FROM Posts p5
+    INNER JOIN PostLinks pl ON p5.Id = pl.PostId
+    WHERE p5.OwnerUserId = uam.Id
+        AND pl.LinkTypeId = 3
+        AND p5.PostTypeId = 1
+) dup_times ON TRUE
+WHERE uam.PostCount > 0
+    OR uam.Reputation > 100
+GROUP BY 
+    uam.Id, uam.DisplayName, uam.Reputation, uam.ReputationRank,
+    uam.QuestionCount, uam.AnswerCount, uam.AvgPostScore,
+    uam.GoldBadges, uam.TopScoringPostTitle, te.Tag,
+    te.TagTotalScore, cep.EditCount, dup_times.pl_creation, dup_times.p5_creation
+ORDER BY 
+    uam.ReputationRank,
+    COALESCE(te.TagTotalScore, 0) DESC
+LIMIT 100;

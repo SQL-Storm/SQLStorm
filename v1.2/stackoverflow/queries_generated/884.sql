@@ -1,0 +1,188 @@
+-- {"query": "884.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1580} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 AS Level,
+        ARRAY[t.TagName] AS Ancestors
+    FROM Tags t
+    WHERE t.IsRequired = 0
+
+    UNION ALL
+
+    SELECT
+        c.Id,
+        c.TagName,
+        c.Count,
+        c.IsModeratorOnly,
+        c.IsRequired,
+        rh.Level + 1,
+        rh.Ancestors || c.TagName
+    FROM Tags c
+    JOIN PostLinks pl ON pl.PostId = c.ExcerptPostId
+    JOIN RecursiveTagHierarchy rh ON pl.RelatedPostId = rh.Id
+    WHERE c.IsRequired = 0 AND NOT c.TagName = ANY(rh.Ancestors)
+),
+UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersCount,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(DISTINCT b.Name) AS UniqueBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostAnswerRanks AS (
+    SELECT 
+        p.Id AS AnswerId,
+        p.ParentId AS QuestionId,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        RANK() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS ScoreRank,
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.CreationDate ASC) AS FirstAnswerOrder
+    FROM Posts p
+    WHERE p.PostTypeId = 2 AND p.ParentId IS NOT NULL
+),
+QuestionTags AS (
+    SELECT
+        p.Id AS QuestionId,
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+UserRecentActivity AS (
+    SELECT
+        ph.UserId,
+        MAX(ph.CreationDate) AS LastEditDate,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10,12) THEN 1 ELSE 0 END) AS CloseOrDeleteEvents
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+    GROUP BY ph.UserId
+),
+DistinctTopAnswerers AS (
+    SELECT DISTINCT
+        par.OwnerUserId,
+        par.QuestionId
+    FROM PostAnswerRanks par
+    WHERE par.ScoreRank = 1
+),
+CombinedUserStats AS (
+    SELECT 
+        ups.UserId,
+        ups.DisplayName,
+        ups.TotalPosts,
+        ups.QuestionsCount,
+        ups.AnswersCount,
+        ups.TotalScore,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.UniqueBadges,
+        ura.LastEditDate,
+        ura.CloseOrDeleteEvents
+    FROM UserPostStats ups
+    LEFT JOIN UserBadgeSummary ub ON ub.UserId = ups.UserId
+    LEFT JOIN UserRecentActivity ura ON ura.UserId = ups.UserId
+),
+QuestionAnswerSummary AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.OwnerUserId AS QuestionOwner,
+        COALESCE(COUNT(a.Id), 0) AS TotalAnswers,
+        COALESCE(SUM(a.Score), 0) AS TotalAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        MIN(a.CreationDate) AS FirstAnswerDate,
+        STRING_AGG(DISTINCT qt.Tag, ',') AS QuestionTags
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN QuestionTags qt ON qt.QuestionId = q.Id
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.OwnerUserId
+),
+UserAnswerEfficiency AS (
+    SELECT 
+        par.OwnerUserId AS UserId,
+        AVG(EXTRACT(EPOCH FROM (par.CreationDate - q.CreationDate))/3600) AS AvgAnswerLatencyHours,
+        AVG(par.Score) AS AvgAnswerScore,
+        COUNT(par.AnswerId) AS AnswersCount
+    FROM PostAnswerRanks par
+    JOIN Posts q ON q.Id = par.QuestionId
+    WHERE par.ScoreRank = 1
+    GROUP BY par.OwnerUserId
+)
+SELECT 
+    cus.UserId,
+    cus.DisplayName,
+    cus.TotalPosts,
+    cus.QuestionsCount,
+    cus.AnswersCount,
+    cus.TotalScore,
+    cus.GoldBadges,
+    cus.SilverBadges,
+    cus.BronzeBadges,
+    cus.UniqueBadges,
+    cus.LastEditDate,
+    cus.CloseOrDeleteEvents,
+    uae.AvgAnswerLatencyHours,
+    uae.AvgAnswerScore,
+    uae.AnswersCount AS TopAnswersCount,
+    qas.QuestionId,
+    qas.Title AS SampleQuestionTitle,
+    qas.QuestionDate,
+    qas.QuestionScore,
+    qas.ViewCount,
+    qas.TotalAnswers,
+    qas.TotalAnswerScore,
+    qas.MaxAnswerScore,
+    qas.FirstAnswerDate,
+    qas.QuestionTags,
+    CASE 
+        WHEN cus.CloseOrDeleteEvents > 5 THEN 'High-risk user' 
+        WHEN cus.GoldBadges >= 3 THEN 'Top contributor' 
+        WHEN cus.TotalScore >= 1000 THEN 'High scorer' 
+        ELSE 'Regular user' 
+    END AS UserCategory,
+    COALESCE(
+        (SELECT ph.Text 
+         FROM PostHistory ph
+         WHERE ph.PostId = qas.QuestionId AND ph.PostHistoryTypeId = 10
+         ORDER BY ph.CreationDate DESC LIMIT 1),
+        'No close reason recorded'
+    ) AS LastCloseReasonComment
+FROM CombinedUserStats cus
+LEFT JOIN UserAnswerEfficiency uae ON uae.UserId = cus.UserId
+LEFT JOIN DistinctTopAnswerers dta ON dta.OwnerUserId = cus.UserId
+LEFT JOIN QuestionAnswerSummary qas ON qas.QuestionOwner = cus.UserId
+WHERE cus.TotalPosts > 50
+  AND EXISTS (
+    SELECT 1 
+    FROM QuestionTags qt 
+    WHERE qt.QuestionId = qas.QuestionId AND qt.Tag IN (
+        SELECT TagName FROM Tags WHERE IsModeratorOnly = 0 AND Count > 1000
+    )
+  )
+ORDER BY cus.TotalScore DESC, cus.GoldBadges DESC
+LIMIT 100;

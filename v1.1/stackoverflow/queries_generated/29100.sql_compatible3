@@ -1,0 +1,141 @@
+WITH ComplexPostAnalysis AS (
+    SELECT
+        pca.PostId,
+        pca.Title,
+        pca.Score,
+        pca.ViewCount,
+        pca.CommentCount,
+        pca.FavoriteCount,
+        pca.PostType,
+        pca.VoteCategory,
+        pca.BodyLength,
+        pca.TagCount,
+        pca.PostStatus,
+        pca.DaysOld,
+        pca.PrevScore,
+        pca.NextScore,
+        AVG(pca.Score) OVER (ORDER BY pca.Score ROWS BETWEEN 10 PRECEDING AND 10 FOLLOWING) AS MovingAvgScore,
+        NTILE(4) OVER (ORDER BY pca.Score) AS ScoreQuartile,
+        CASE 
+            WHEN pca.Score >= (
+                SELECT PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY Score) 
+                FROM Posts 
+                WHERE CreationDate >= TIMESTAMP '2015-01-01'
+            ) THEN 'Top 5% Score'
+            WHEN pca.Score >= (
+                SELECT PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY Score) 
+                FROM Posts 
+                WHERE CreationDate >= TIMESTAMP '2015-01-01'
+            ) THEN 'Top 10% Score'
+            WHEN pca.Score >= (
+                SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY Score) 
+                FROM Posts 
+                WHERE CreationDate >= TIMESTAMP '2015-01-01'
+            ) THEN 'Top 25% Score'
+            ELSE 'Below 25% Score'
+        END AS ScorePercentileCategory,
+        CASE 
+            WHEN pca.BodyLength > 1000 THEN 'Long Body'
+            WHEN pca.BodyLength > 500 THEN 'Medium Body'
+            WHEN pca.BodyLength > 100 THEN 'Short Body'
+            ELSE 'Very Short Body'
+        END AS BodyLengthCategory,
+        CASE 
+            WHEN pca.TagCount > 10 THEN 'Many Tags'
+            WHEN pca.TagCount > 5 THEN 'Moderate Tags'
+            WHEN pca.TagCount > 1 THEN 'Few Tags'
+            ELSE 'No Tags'
+        END AS TagCategory
+    FROM PostComplexityAnalysis AS pca
+),
+ComplexPostRanked AS (
+    SELECT
+        cpa.PostId,
+        cpa.Title,
+        cpa.Score,
+        cpa.ViewCount,
+        cpa.CommentCount,
+        cpa.FavoriteCount,
+        cpa.PostType,
+        cpa.VoteCategory,
+        cpa.BodyLength,
+        cpa.TagCount,
+        cpa.PostStatus,
+        cpa.DaysOld,
+        cpa.PrevScore,
+        cpa.NextScore,
+        cpa.MovingAvgScore,
+        cpa.ScoreQuartile,
+        cpa.ScorePercentileCategory,
+        cpa.BodyLengthCategory,
+        cpa.TagCategory,
+        ROW_NUMBER() OVER (ORDER BY cpa.Score DESC) AS PostRank
+    FROM ComplexPostAnalysis AS cpa
+)
+SELECT 
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.TotalPosts,
+    u.Questions,
+    u.Answers,
+    u.Comments,
+    u.Badges,
+    u.Votes,
+    u.ActivityLevel,
+    u.RoleType,
+    u.AnswerQuestionRatio,
+    u.BadgeToVoteRatio,
+    COALESCE(cpa.PostId, 0) AS TopPostId,
+    COALESCE(cpa.Title, 'N/A') AS TopPostTitle,
+    COALESCE(cpa.Score, 0) AS TopPostScore,
+    COALESCE(cpa.ViewCount, 0) AS TopPostViews,
+    COALESCE(cpa.CommentCount, 0) AS TopPostComments,
+    COALESCE(cpa.FavoriteCount, 0) AS TopPostFavorites,
+    COALESCE(cpa.PostType, 'N/A') AS TopPostType,
+    COALESCE(cpa.VoteCategory, 'N/A') AS TopPostVoteCategory,
+    COALESCE(cpa.BodyLength, 0) AS TopPostBodyLength,
+    COALESCE(cpa.TagCount, 0) AS TopPostTagCount,
+    COALESCE(cpa.PostStatus, 'N/A') AS TopPostStatus,
+    COALESCE(cpa.DaysOld, 0) AS TopPostAgeDays,
+    COALESCE(cpa.ScorePercentileCategory, 'N/A') AS TopPostScorePercentile,
+    COALESCE(cpa.BodyLengthCategory, 'N/A') AS TopPostBodyCategory,
+    COALESCE(cpa.TagCategory, 'N/A') AS TopPostTagCategory,
+    CASE 
+        WHEN u.Answers > 0 AND u.Questions > 0 THEN (u.Answers * 1.0 / NULLIF(u.Questions, 0))
+        ELSE 0 
+    END AS AnswerToQuestionRatioComputed,
+    CASE 
+        WHEN u.Badges > 0 AND u.Votes > 0 THEN (u.Badges * 1.0 / NULLIF(u.Votes, 0))
+        ELSE 0 
+    END AS BadgeToVoteRatioComputed,
+    CASE 
+        WHEN u.TotalPosts > 0 THEN (u.Answers * 1.0 / NULLIF(u.TotalPosts, 0))
+        ELSE 0 
+    END AS AnswerPercentage,
+    CASE 
+        WHEN u.RepPercentile > 0.9 THEN 'Top 10%'
+        WHEN u.RepPercentile > 0.75 THEN 'Top 25%'
+        WHEN u.RepPercentile > 0.5 THEN 'Top 50%'
+        ELSE 'Below 50%'
+    END AS RepPercentileCategory,
+    CASE 
+        WHEN cpa.Score IS NOT NULL THEN 
+            CASE WHEN cpa.Score > cpa.PrevScore THEN 'Increased' 
+                 WHEN cpa.Score < cpa.PrevScore THEN 'Decreased' 
+                 ELSE 'Same' END
+        ELSE 'No Data'
+    END AS ScoreChangeStatus,
+    COALESCE(cpa.MovingAvgScore, 0) AS MovingAverageScore,
+    COALESCE(cpa.ScoreQuartile, 0) AS ScoreQuartile,
+    CASE 
+        WHEN cpa.Score >= 100 AND u.PostRank <= 50 THEN 'High Scoring Active User'
+        WHEN cpa.Score >= 50 AND u.PostRank <= 100 THEN 'Moderate Scoring Active User'
+        WHEN u.PostRank <= 10 THEN 'Top Poster'
+        ELSE 'Regular User'
+    END AS UserClassification
+FROM UserPerformanceMetrics AS u
+LEFT JOIN ComplexPostRanked AS cpa ON 1=1
+WHERE u.PostRank <= 100 AND (cpa.PostRank = 1 OR cpa.PostRank IS NULL)
+ORDER BY u.TotalPosts DESC, u.Reputation DESC
+LIMIT 50;

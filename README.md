@@ -22,6 +22,11 @@ Contact Tobias Schmidt (tobias.schmidt@in.tum.de) if you have any questions.
   - Umbra 25.01
   - DuckDB 1.2.0
 
+### v2.0 - Planned for 2025 Q3
+
+- Bug fixes:
+  
+
 ## Project Structure
 
 ```bash
@@ -126,7 +131,7 @@ will fail.
 For example to generate the queries at version v1.0 for the StackOverflow dataset for prompt _P1_ run
 
 ```bash
-./scripts/prompt.py p1 stackoverflow v1.0
+./scripts/prompt.py stackoverflow v1.0 p1
 ```
 
 All further scripts will use `stackoverflow` and `v1.0` for `<dataset>` and `<version>`.

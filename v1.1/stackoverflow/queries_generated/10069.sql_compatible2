@@ -1,0 +1,119 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.OwnerUserId,
+        U.DisplayName,
+        U.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS rank
+    FROM 
+        Posts P
+    JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2) AND P.Score > 0
+),
+BadgeCounts AS (
+    SELECT 
+        U.Id AS UserId,
+        COUNT(DISTINCT B.Id) AS BadgeCount
+    FROM 
+        Users U
+    JOIN 
+        Badges B ON U.Id = B.UserId
+    WHERE 
+        B.Class = 1 AND B.TagBased = 0
+    GROUP BY 
+        U.Id
+)
+SELECT 
+    RP.Id,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.rank,
+    RP.OwnerUserId,
+    U.DisplayName,
+    U.Reputation,
+    COALESCE(B.BadgeCount, 0) AS BadgeCount,
+    CASE 
+        WHEN RP.rank <= 3 THEN 'Top'
+        WHEN RP.rank <= 10 THEN 'High'
+        ELSE 'Low'
+    END AS RankStatus,
+    CASE
+        WHEN RP.Title IS NULL THEN NULL
+        ELSE
+            TRIM(
+                -- get the second-to-last word (or the first word if only one)
+                SUBSTRING(
+                    RP.Title FROM
+                    CASE
+                        WHEN (LENGTH(RP.Title) - LENGTH(REPLACE(RP.Title, ' ', ''))) = 0 THEN 1
+                        ELSE
+                            -- position of second-to-last space + 1
+                            COALESCE(
+                                NULLIF(
+                                    LENGTH(RP.Title) - POSITION(' ' IN REVERSE(SUBSTRING(RP.Title FROM 1 FOR (LENGTH(RP.Title) - POSITION(' ' IN REVERSE(RP.Title)))))), 
+                                    0
+                                ),
+                                1
+                            )
+                    END
+                )
+            )
+    END AS FirstKeyword,
+    CASE
+        WHEN RP.Title IS NULL THEN NULL
+        ELSE
+            TRIM(
+                -- last word
+                CASE
+                    WHEN (LENGTH(RP.Title) - LENGTH(REPLACE(RP.Title, ' ', ''))) = 0 THEN RP.Title
+                    ELSE SUBSTRING(RP.Title FROM (LENGTH(RP.Title) - POSITION(' ' IN REVERSE(RP.Title)) + 2))
+                END
+            )
+    END AS LastKeyword,
+    CASE 
+        WHEN U.Reputation >= 10000 THEN 'Veteran'
+        ELSE 'Newbie'
+    END AS UserStatus,
+    LAG(RP.Score) OVER (ORDER BY RP.rank) AS PreviousScore,
+    LEAD(RP.Score) OVER (ORDER BY RP.rank) AS NextScore,
+    COALESCE(
+        SUM(V.BountyAmount) OVER (PARTITION BY RP.Id ORDER BY V.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+        0
+    ) AS TotalBounty
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    Users U ON RP.OwnerUserId = U.Id
+LEFT JOIN 
+    BadgeCounts B ON RP.OwnerUserId = B.UserId
+LEFT JOIN 
+    Votes V ON RP.Id = V.PostId AND V.VoteTypeId = 8
+WHERE 
+    RP.rank <= 10
+GROUP BY
+    RP.Id,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.rank,
+    RP.OwnerUserId,
+    U.DisplayName,
+    U.Reputation,
+    B.BadgeCount,
+    LAG(RP.Score) OVER (ORDER BY RP.rank),
+    LEAD(RP.Score) OVER (ORDER BY RP.rank),
+    COALESCE(
+        SUM(V.BountyAmount) OVER (PARTITION BY RP.Id ORDER BY V.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+        0
+    )
+ORDER BY 
+    RP.rank;

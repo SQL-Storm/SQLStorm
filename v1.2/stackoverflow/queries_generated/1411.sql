@@ -1,0 +1,140 @@
+-- {"query": "1411.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1336} 
+with RecursiveCTE as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        u.DisplayName as Owner,
+        row_number() over (partition by p.PostTypeId order by p.CreationDate desc) as rn,
+        1 as lvl,
+        p.AcceptedAnswerId,
+        p.ParentId
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 1 -- questions only
+
+    union all
+
+    select 
+        child.Id,
+        child.PostTypeId,
+        child.Title,
+        child.CreationDate,
+        cu.DisplayName as Owner,
+        row_number() over (partition by child.PostTypeId order by child.CreationDate desc) as rn,
+        r.lvl + 1,
+        child.AcceptedAnswerId,
+        child.ParentId
+    from Posts child
+    join RecursiveCTE r on child.ParentId = r.Id
+    left join Users cu on child.OwnerUserId = cu.Id
+    where child.PostTypeId = 2 and r.lvl < 3
+),
+
+BadgeCount as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        coalesce(sum(b.TagBased::int),0) as TotalTagBased
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName
+),
+
+TopQuestionsWithAnswers as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionDate,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerDate,
+        u.DisplayName as AnswerOwner,
+        bc.GoldBadges, bc.SilverBadges, bc.BronzeBadges, bc.TotalTagBased
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on a.OwnerUserId = u.Id
+    left join BadgeCount bc on u.Id = bc.UserId
+    where q.PostTypeId = 1
+    and q.Score > 5
+),
+
+FilteredComments as (
+    select c.Id, c.PostId, c.CreationDate, c.Score, c.Text,
+        length(c.Text) - length(replace(c.Text, 'stack', '')) as StackWordCount,
+        c.UserId,
+        u.DisplayName as CommentUserDisplayName
+    from Comments c
+    left join Users u on c.UserId = u.Id
+    where c.Score >= 5
+    and c.Text ilike '%stack%'
+),
+
+QuestionsScored as (
+    select 
+        q.Id,
+        q.Title,
+        coalesce(q.ViewCount,0) as Views,
+        coalesce(q.Score,0) as Score,
+        case when q.ClosedDate is null then 'Open'
+            else 'Closed'
+        end as Status,
+        q.Tags,
+        count(a.Id) over (partition by q.Id) as AnswerCounter,
+        rank() over (order by coalesce(q.Score,0) desc, coalesce(q.ViewCount,0) desc) as ScoreRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+)
+
+select 
+    tq.QuestionId,
+    tq.Title as QuestionTitle,
+    tq.QuestionDate,
+    tq.AnswerId,
+    tq.AnswerScore,
+    tq.AnswerDate,
+    coalesce(tq.AnswerOwner, 'Anonymous') as AnswerOwner,
+    tq.GoldBadges,
+    tq.SilverBadges,
+    tq.BronzeBadges,
+    tq.TotalTagBased,
+    qc.CreationDate as CommentDate,
+    qc.Score as CommentScore,
+    qc.Text as CommentText,
+    substring(qs.Status from 1 for 6) || 'ed' as QuestionStatus,
+    qs.Views,
+    qs.Score as QuestionScore,
+    qs.AnswerCounter,
+    string_agg(distinct pt.Name, ', ' order by pt.Name) as PostTypesEncountered,
+    string_agg(distinct phd.Name, ', ' order by phd.Name) as PostHistoryChanges,
+    case 
+        when qs.ScoreRank <= 10 then 'Top 10'
+        when qs.ScoreRank <= 100 then 'Top 100'
+        else 'Others' 
+    end as ScoreCategory
+from TopQuestionsWithAnswers tq
+left join FilteredComments qc on qc.PostId = tq.AnswerId
+left join QuestionsScored qs on tq.QuestionId = qs.Id
+left join PostTypes pt on pt.Id in (tq.AnswerId::smallint, tq.QuestionId::smallint) -- set operator usage coerced
+left join PostHistoryTypes phd on phd.Id in (
+    select ph.PostHistoryTypeId from PostHistory ph where ph.PostId = tq.QuestionId limit 5
+)
+where ( length(tq.Title) + coalesce(tq.AnswerOwner, 'x')::text ~ '\\d{2,}'::text and qs.Status = 'Open' 
+        or qs.Views > 1000 and tq.AnswerScore > 10 ) 
+  and tq.AnswerScore > (
+    select avg(a.Score) 
+    from Posts a 
+    where a.ParentId = tq.QuestionId and a.PostTypeId = 2 and a.Score is not null
+  )
+group by 
+    tq.QuestionId, tq.Title, tq.QuestionDate, tq.AnswerId, tq.AnswerScore, tq.AnswerDate, tq.AnswerOwner,
+    tq.GoldBadges, tq.SilverBadges, tq.BronzeBadges, tq.TotalTagBased,
+    qc.CreationDate, qc.Score, qc.Text, qs.Status, qs.Views, qs.Score, qs.AnswerCounter, qs.ScoreRank
+having count(qc.Id) >= 2 or count(distinct tq.AnswerId) > 1
+order by tq.AnswerScore desc, qs.Views desc
+limit 25;

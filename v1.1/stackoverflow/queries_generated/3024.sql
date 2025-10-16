@@ -1,0 +1,140 @@
+-- {"query": "3024.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1005} 
+WITH UserBadgeCounts AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM
+        Users u
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id
+),
+PostAnswerStats AS (
+    SELECT
+        p.Id AS QuestionId,
+        COUNT(a.Id) AS AnswerCount,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        STRING_AGG(CAST(a.Score AS VARCHAR), ',') AS AllAnswerScores
+    FROM
+        Posts p
+    LEFT JOIN
+        Posts a ON p.Id = a.ParentId AND a.PostTypeId = 2
+    WHERE
+        p.PostTypeId = 1
+    GROUP BY
+        p.Id
+),
+RecentQuestions AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Tags,
+        u.DisplayName AS OwnerName,
+        u.Reputation
+    FROM
+        Posts p
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+    WHERE
+        p.PostTypeId = 1
+        AND p.CreationDate >= NOW() - INTERVAL '30 days'
+),
+PostCloseDetails AS (
+    SELECT
+        ph.PostId,
+        c.Name AS CloseReason,
+        ph.CreationDate AS CloseDate,
+        ph.Comment
+    FROM
+        PostHistory ph
+    LEFT JOIN
+        CloseReasonTypes c ON ph.Comment::int = c.Id
+    WHERE
+        ph.PostHistoryTypeId = 10
+),
+TagPopularity AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        p.PostTypeId,
+        u.DisplayName AS EditorName,
+        ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY t.Count DESC) AS RankPerTag
+    FROM
+        Tags t
+    LEFT JOIN
+        Posts p ON t.WikiPostId = p.Id
+    LEFT JOIN
+        Users u ON p.LastEditorUserId = u.Id
+    WHERE
+        t.IsModeratorOnly = FALSE
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT p.Id) AS QuestionsPosted,
+        COUNT(DISTINCT a.Id) AS AnswersPosted,
+        COUNT(c.Id) AS CommentsMade,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN
+        Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON v.PostId = p.Id OR v.PostId = a.Id
+    GROUP BY
+        u.Id
+)
+SELECT
+    ucc.UserId,
+    ucc.GoldBadges,
+    ucc.SilverBadges,
+    ucc.BronzeBadges,
+    pas.AnswerCount,
+    pas.AvgAnswerScore,
+    pas.MaxAnswerScore,
+    rq.PostId AS RecentQuestionId,
+    rq.Title,
+    rq.CreationDate,
+    rq.Tags,
+    rq.OwnerName,
+    rq.Reputation,
+    cd.CloseReason,
+    cd.CloseDate,
+    cd.Comment AS CloseComment,
+    tp.TagName,
+    tp.Count AS TagCount,
+    tp.EditorName,
+    ua.QuestionsPosted,
+    ua.AnswersPosted,
+    ua.CommentsMade,
+    ua.UpVotesReceived,
+    ua.DownVotesReceived
+FROM
+    UserBadgeCounts ucc
+LEFT JOIN
+    PostAnswerStats pas ON ucc.UserId = (
+        SELECT OwnerUserId FROM Posts WHERE Id = pas.QuestionId
+    )
+LEFT JOIN
+    RecentQuestions rq ON rq.OwnerName = (
+        SELECT DisplayName FROM Users WHERE Id = ucc.UserId
+    )
+LEFT JOIN
+    PostCloseDetails cd ON cd.PostId = rq.PostId
+LEFT JOIN
+    TagPopularity tp ON tp.RankPerTag = 1 AND tp.TagName IN (SELECT TagName FROM unnest(string_to_array(rq.Tags, '><')) AS TagName)
+LEFT JOIN
+    UserActivity ua ON ua.UserId = ucc.UserId
+ORDER BY
+    ucc.UserId
+LIMIT 100;

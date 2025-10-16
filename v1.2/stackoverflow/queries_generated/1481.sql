@@ -1,0 +1,194 @@
+-- {"query": "1481.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1909} 
+with RecentPosts as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        coalesce(p.Tags, '') as Tags,
+        p.AcceptedAnswerId,
+        u.DisplayName as OwnerDisplayName,
+        coalesce(bt.BadgeCount, 0) as BadgeCount,
+        -- calculate Length of Title safely with null check and length, utf8 aware
+        length(coalesce(p.Title, '')) as TitleLength
+    from 
+        Posts p
+        left join Users u on u.Id = p.OwnerUserId
+        left join (
+            select UserId, count(*) as BadgeCount
+            from Badges
+            where Date > current_date - interval '365 days' -- badges last year
+            group by UserId
+        ) bt on bt.UserId = p.OwnerUserId
+    where 
+        p.CreationDate >= current_date - interval '30 days'
+),
+UserKeywordRanking as (
+    select 
+        u.Id,
+        u.Reputation,
+        u.DisplayName,
+        u.Location,
+        dense_rank() over (order by u.Reputation desc) as ReputationRank,
+        -- count gold badges earned ever
+        (select count(*) 
+         from Badges b2 
+         where b2.UserId = u.Id and b2.Class = 1) as GoldBadgeCount,
+        str.index('stack', lower(coalesce(u.AboutMe, ''))) + 1 as StackIndex,
+        -- Position function returns zero-based, add 1 for human indexing; zero means not found, so add 1 to get normal >0 found indexing, 1 is beginning.
+        coalesce(
+            nullif(strpos(lower(coalesce(u.AboutMe, '')), 'stack'), 0),
+            99999) as StackKeywordPos,
+        case when coalesce(u.Location, '') = '' then 1 else 0 end as IsLocationNull,
+        u.CreationDate
+     from Users u
+),
+TaggedQuestionsRanked as (
+    select 
+        p.Id,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        unnest(string_to_array(trim(both '<>' from p.Tags), '><')) as Tag,
+        row_number() over (partition by p.Id order by p.Score desc, p.ViewCount desc) as TagRank
+    from Posts p
+    where p.PostTypeId = 1
+      and p.CreationDate > current_date - interval '180 days'
+),
+DuplicateQuestionsWithCloseInfo as (
+    select 
+        pl.PostId, 
+        pl.RelatedPostId,
+        pl.LinkTypeId,
+        cht.Name as CloseReasonName,
+        ch.Comment,
+        ch.CreationDate as CloseDate
+    from PostLinks pl
+    left join PostHistory ch on ch.PostId = pl.PostId and ch.PostHistoryTypeId = 10
+    left join CloseReasonTypes cht on cht.Id = cast(ch.Comment as int)
+    where pl.LinkTypeId = 3 -- Only duplicates
+),
+UserActivitySummary as (
+    select 
+        u.Id as UserId,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsPosted,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersPosted,
+        count(distinct c.Id) as CommentsMade,
+        count(distinct v.Id) filter (where v.VoteTypeId = 2) as UpVotesGiven,
+        count(distinct v.Id) filter (where v.VoteTypeId = 3) as DownVotesGiven,
+        sum(coalesce(v.BountyAmount, 0)) filter (where v.VoteTypeId in (8, 9)) as BountyAmountGiven,
+        -- savory numeric ratia and null-safe is important
+        case 
+          when count(distinct p.Id filer (where p.PostTypeId in (1, 2))) = 0 then NULL 
+          else round(avg(p.Score)::numeric, 2)
+        end as AvgPostScore
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id
+),
+AggregateWindowUserRanks as (
+    select 
+        ua.UserId,
+        ua.QuestionsPosted,
+        ua.AnswersPosted,
+        UA.CommentsMade,
+        RL.totalScoreRank,
+        RL.questionCountRank,
+        RL.answersWtRank,
+        RPD.rankPerspective
+    from UserActivitySummary ua
+    left join (
+        select
+            UserId,
+            rank() over (order by sum(Score) desc) as totalScoreRank,
+            rank() over (order by QuestionsPosted desc) as questionCountRank,
+            rank() over (order by AnswersPosted desc) as answersWtRank
+        from (
+            select 
+                ua.UserId,
+                coalesce(sum(p.Score), 0) as Score,
+                ua.QuestionsPosted,
+                ua.AnswersPosted
+            from UserActivitySummary ua
+            left join Posts p on p.OwnerUserId = ua.UserId
+            group by ua.UserId, ua.QuestionsPosted, ua.AnswersPosted
+        ) x
+    ) RL on RL.UserId = ua.UserId
+    left join (
+      select UserId, rank() over (order by QuestionsPosted + AnswersPosted desc) as rankPerspective from UserActivitySummary
+    ) RPD on RPD.UserId = ua.UserId
+),
+FilteredFastTitlesMarkedAnswers as (
+    select 
+        p.Id,
+        p.ParentId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        ft.TitleLength,
+        row_number() over (
+             partition by p.ParentId 
+             order by p.Score * 2 + p.ViewCount desc
+         ) as AnswerRank,
+        -- calculate days from creation to accepted mark (joins Post)
+        pdiff.days_to_accept
+    from Posts p
+    left join (
+        select r.Id, r.AcceptedAnswerId, 
+            extract(day fromLeast.tech_done.days) as days_to_accept
+        from posts r
+        left join LATERAL (
+          select
+            case when r.AcceptedAnswerId is not null then 
+              extract(epoch from ((select pte.CreationDate from Posts pte where pte.Id = r.AcceptedAnswerId) - r.CreationDate))/86400 
+            else NULL end as days
+          limit 1
+        ) as technique_ordays on 1=1
+    ) pdiff on pdiff.Id = p.ParentId
+    inner join RecentPosts ft on ft.Id = p.ParentId
+    where p.PostTypeId = 2
+)
+select distinct 
+    p.Id as PostId,
+    p.PostTypeId,
+    p.CreationDate as PostCreation,
+    p.Score as PostScore,
+    lower(coalesce(p.OwnerDisplayName, '<unknown>')) as AuthorNameLower,
+    ukr.Reputation,
+    concat('TagCount:', tag_data.TagCount) as TagCountText,
+    coalesce(dqwc.CloseReasonName,'<none>') as CloseReason,
+    -- WINDOW functions to get rank calculated but shown on join via filteredFN...
+    userRank.averageQueryRank,
+    filtrationstack.IsPopularTag,
+    case when recent.Looks at Derived date tags existed > taglastuse.CloseDate then 1 else 0 end as HasNewestTag,
+    round(COALESCE(fastA.Score, 0)*0.015 + COALESCE(fastA.AnswerRank, 0), 2) as ComputedPopularityIndex
+
+from RecentPosts p
+left join UserKeywordRanking ukr on ukr.Id = p.OwnerUserId
+left join (
+    select Id, count(*) as TagCount
+    from TaggedQuestionsRanked
+    group by Id
+) tag_data on tag_data.Id = p.Id
+left join DuplicateQuestionsWithCloseInfo dqwc on dqwc.PostId = p.Id
+left join AggregateWindowUserRanks userRank on userRank.UserId = p.OwnerUserId
+left join (
+    select distinct p.Id as pid, case when count(t.Id) filter (where t.Count > 5000) > 0 then 1 else 0 end as IsPopularTag
+    from Posts p
+    left join Tags t on strpos(lower(coalesce(p.Tags, '')), lower(t.TagName)) > 0
+    group by p.Id
+) filtrationstack on filtrationstack.pid = p.Id
+left join (
+  select TagName, max(History.CreatedDate) as CloseDate from Tags tg 
+  left join PostHistory History on history.PostId = tg.WikiPostId
+  group by TagName
+) taglastuse on strpos(lower(coalesce(p.Tags, '')), taglastuse.TagName) > 0
+left join FilteredFastTitlesMarkedAnswers fastA on fastA.ParentId = p.Id
+order by p.Score desc, p.CreationDate desc
+limit 100;

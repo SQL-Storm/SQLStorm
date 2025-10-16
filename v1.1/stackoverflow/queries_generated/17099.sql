@@ -1,0 +1,174 @@
+-- {"query": "17099.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 233500, "output_tokens": 230900} 
+
+WITH user_activity AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS post_count,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS question_count,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS answer_count,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS avg_post_score,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) FILTER (WHERE p.Score IS NOT NULL) AS median_post_score,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), ', ') FILTER (WHERE p.Tags IS NOT NULL) AS all_tags,
+        MAX(p.CreationDate) AS last_post_date,
+        MIN(p.CreationDate) AS first_post_date
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 1000
+        AND u.CreationDate < CURRENT_DATE - INTERVAL '365 days'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+badge_analysis AS (
+    SELECT 
+        UserId,
+        COUNT(*) FILTER (WHERE Class = 1) AS gold_badges,
+        COUNT(*) FILTER (WHERE Class = 2) AS silver_badges,
+        COUNT(*) FILTER (WHERE Class = 3) AS bronze_badges,
+        COUNT(*) FILTER (WHERE TagBased = B'1') AS tag_badges,
+        ARRAY_AGG(Name ORDER BY Date DESC) FILTER (WHERE Class = 1) AS gold_badge_names
+    FROM Badges
+    GROUP BY UserId
+),
+complex_post_metrics AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        COALESCE(p.Score, 0) * LOG(GREATEST(COALESCE(p.ViewCount, 1), 1)) AS impact_score,
+        COUNT(DISTINCT c.UserId) AS unique_commenters,
+        AVG(LENGTH(c.Text)) AS avg_comment_length,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community'
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Accepted'
+            ELSE 'Open'
+        END AS post_status,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS user_post_rank,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS prev_post_score,
+        LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS next_post_score,
+        FIRST_VALUE(p.Title) OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS best_post_title
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.PostTypeId IN (1, 2)
+        AND p.CreationDate BETWEEN CURRENT_DATE - INTERVAL '730 days' AND CURRENT_DATE - INTERVAL '30 days'
+    GROUP BY p.Id, p.OwnerUserId, p.Score, p.ViewCount, p.ClosedDate, p.CommunityOwnedDate, p.AcceptedAnswerId, p.CreationDate, p.Title
+),
+recursive_answer_chain AS (
+    WITH RECURSIVE answer_hierarchy AS (
+        SELECT 
+            p.Id,
+            p.ParentId,
+            p.Score,
+            p.OwnerUserId,
+            1 AS depth,
+            ARRAY[p.Id] AS path,
+            p.Score::NUMERIC AS cumulative_score
+        FROM Posts p
+        WHERE p.PostTypeId = 1 
+            AND p.AnswerCount > 5
+            AND p.Score > 10
+        
+        UNION ALL
+        
+        SELECT 
+            a.Id,
+            a.ParentId,
+            a.Score,
+            a.OwnerUserId,
+            ah.depth + 1,
+            ah.path || a.Id,
+            ah.cumulative_score + COALESCE(a.Score, 0)
+        FROM Posts a
+        INNER JOIN answer_hierarchy ah ON a.ParentId = ah.Id
+        WHERE a.PostTypeId = 2
+            AND NOT (a.Id = ANY(ah.path))
+            AND ah.depth < 3
+    )
+    SELECT * FROM answer_hierarchy
+),
+vote_patterns AS (
+    SELECT 
+        v.PostId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS upvotes,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS downvotes,
+        COUNT(DISTINCT v.UserId) FILTER (WHERE v.UserId IS NOT NULL) AS unique_voters,
+        STDDEV(EXTRACT(EPOCH FROM v.CreationDate)) AS vote_time_variance,
+        CORR(
+            EXTRACT(EPOCH FROM v.CreationDate), 
+            CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE -1 END
+        ) AS vote_sentiment_correlation
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2, 3)
+    GROUP BY v.PostId
+)
+SELECT 
+    ua.DisplayName,
+    ua.Reputation,
+    ua.post_count,
+    ua.question_count,
+    ua.answer_count,
+    ROUND(ua.avg_post_score::NUMERIC, 2) AS avg_score,
+    ua.median_post_score,
+    COALESCE(ba.gold_badges, 0) AS gold_badges,
+    COALESCE(ba.silver_badges, 0) AS silver_badges,
+    COALESCE(ba.bronze_badges, 0) AS bronze_badges,
+    SUBSTRING(COALESCE(ARRAY_TO_STRING(ba.gold_badge_names[1:3], ', '), 'None'), 1, 100) AS top_gold_badges,
+    EXTRACT(DAY FROM ua.last_post_date - ua.first_post_date) AS days_active,
+    COUNT(DISTINCT cpm.PostId) AS quality_posts,
+    AVG(cpm.impact_score) AS avg_impact,
+    SUM(CASE WHEN cpm.user_post_rank <= 5 THEN 1 ELSE 0 END) AS top_5_posts,
+    MAX(cpm.unique_commenters) AS max_commenters,
+    STRING_AGG(
+        DISTINCT cpm.post_status, 
+        ', ' 
+        ORDER BY cpm.post_status
+    ) AS post_statuses,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM recursive_answer_chain rac 
+         WHERE rac.OwnerUserId = ua.Id), 
+        0
+    ) AS answer_chain_participations,
+    EXISTS (
+        SELECT 1 
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = ua.Id 
+            AND p2.Score > (
+                SELECT AVG(Score) * 2 
+                FROM Posts 
+                WHERE PostTypeId = p2.PostTypeId 
+                    AND Score IS NOT NULL
+            )
+    ) AS has_exceptional_post,
+    CASE 
+        WHEN ua.Reputation > 10000 AND COALESCE(ba.gold_badges, 0) > 5 THEN 'Expert'
+        WHEN ua.Reputation > 5000 OR COALESCE(ba.gold_badges, 0) > 2 THEN 'Advanced'
+        WHEN ua.Reputation > 2000 OR COALESCE(ba.silver_badges, 0) > 10 THEN 'Intermediate'
+        ELSE 'Regular'
+    END AS user_tier,
+    PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY vp.upvotes - vp.downvotes) AS vote_balance_75th_percentile
+FROM user_activity ua
+LEFT JOIN badge_analysis ba ON ua.Id = ba.UserId
+LEFT JOIN complex_post_metrics cpm ON ua.Id = cpm.OwnerUserId
+LEFT JOIN vote_patterns vp ON cpm.PostId = vp.PostId
+WHERE ua.post_count > 0
+    AND (
+        ua.avg_post_score > 5 
+        OR COALESCE(ba.gold_badges, 0) > 0
+        OR ua.Reputation > 5000
+    )
+GROUP BY 
+    ua.Id, ua.DisplayName, ua.Reputation, ua.post_count, 
+    ua.question_count, ua.answer_count, ua.avg_post_score, 
+    ua.median_post_score, ua.last_post_date, ua.first_post_date,
+    ba.gold_badges, ba.silver_badges, ba.bronze_badges, ba.gold_badge_names
+HAVING 
+    COUNT(DISTINCT cpm.PostId) > 0
+    OR COALESCE(ba.gold_badges, 0) + COALESCE(ba.silver_badges, 0) + COALESCE(ba.bronze_badges, 0) > 10
+ORDER BY 
+    ua.Reputation DESC, 
+    COALESCE(ba.gold_badges, 0) DESC,
+    ua.avg_post_score DESC NULLS LAST
+LIMIT 100;

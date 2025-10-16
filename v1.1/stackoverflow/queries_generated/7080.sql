@@ -1,0 +1,192 @@
+-- {"query": "7080.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2139} 
+with
+-- recent active questions with parsed tag array and basic metrics
+questions as (
+  select
+    p.id,
+    p.title,
+    p.creationdate,
+    p.owneruserid,
+    coalesce(p.score,0) as q_score,
+    coalesce(p.viewcount,0) as q_views,
+    coalesce(p.answercount,0) as q_answers,
+    regexp_split_to_array(trim(both '<>' from coalesce(p.tags,'')), '><') as tag_arr,
+    -- normalized short title for string operations
+    lower(regexp_replace(coalesce(p.title,''), '\s+', ' ', 'g')) as norm_title
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= now() - interval '5 years'
+),
+-- answers joined to their question parent with aggregated answer metrics
+answers as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.owneruserid,
+    a.creationdate as answer_creation,
+    coalesce(a.score,0) as a_score,
+    coalesce(a.commentcount,0) as a_commentcount,
+    case when a.id = q.acceptedanswerid then 1 else 0 end as is_accepted
+  from posts a
+  join posts q on q.id = a.parentid
+  where a.posttypeid = 2
+    and a.creationdate >= now() - interval '6 years'
+),
+-- per-question aggregated answer stats and tight correlated subqueries (to stress planner)
+question_answer_stats as (
+  select
+    q.id,
+    q.q_score,
+    q.q_views,
+    q.q_answers,
+    q.tag_arr,
+    q.norm_title,
+    -- window-style aggregates using answers
+    coalesce(sum(a.a_score) filter (where a.answer_creation >= now() - interval '30 days'),0) as recent_answers_score_sum,
+    coalesce(count(a.answer_id) filter (where a.answer_creation >= now() - interval '1 year'),0) as answers_last_year,
+    -- correlated scalar subquery: top answer score for this question
+    (
+      select coalesce(max(a2.score),0)
+      from posts a2
+      where a2.parentid = q.id and a2.posttypeid = 2
+    ) as top_answer_score,
+    -- correlated subquery to compute median-ish answer age in days (approx via percentile_cont if available)
+    (
+      select
+        case when count(*)=0 then null
+        else extract(epoch from (percentile_cont(0.5) within group (order by (now()-a3.creationdate)) ))/86400 end
+      from posts a3
+      where a3.parentid = q.id and a3.posttypeid = 2
+    ) as median_answer_age_days
+  from questions q
+  left join answers a on a.question_id = q.id
+  group by q.id, q.q_score, q.q_views, q.q_answers, q.tag_arr, q.norm_title
+),
+-- heavy string and null logic probe set: users with badge counts and activity scores
+user_activity as (
+  select
+    u.id as user_id,
+    coalesce(u.reputation,0) as reputation,
+    coalesce(u.views,0) as profile_views,
+    coalesce(u.upvotes,0) as upvotes,
+    coalesce(u.downvotes,0) as downvotes,
+    -- complex expression combining recency, reputation and votes
+    greatest(0, (coalesce(u.reputation,0)::numeric / nullif(greatest(1,u.creationdate::date - date '1970-01-01'),0)) ) as rep_per_day_epoch,
+    -- badge counts by class with LEFT JOIN to stress grouping
+    coalesce(sum(case when b.class = 1 then 1 else 0 end),0) as gold_badges,
+    coalesce(sum(case when b.class = 2 then 1 else 0 end),0) as silver_badges,
+    coalesce(sum(case when b.class = 3 then 1 else 0 end),0) as bronze_badges,
+    -- last access recency
+    extract(day from now() - u.lastaccessdate) as lastaccess_days
+  from users u
+  left join badges b on b.userid = u.id
+  where u.lastaccessdate >= now() - interval '10 years'
+  group by u.id, u.reputation, u.views, u.upvotes, u.downvotes, u.creationdate, u.lastaccessdate
+),
+-- compute per-question top contributors using window functions and string matching on titles/tags
+question_contributors as (
+  select
+    qas.id as question_id,
+    ua.user_id,
+    ua.reputation,
+    ua.gold_badges,
+    ua.silver_badges,
+    ua.bronze_badges,
+    -- contribution score combining answer counts, reputation and recency
+    row_number() over (partition by qas.id order by (coalesce(a_counts.ans_count,0) * 2 + ua.reputation / 100.0) desc) as contrib_rank,
+    coalesce(a_counts.ans_count,0) as answer_count_by_user,
+    -- string expression: does normalized title contain user's displayname-like token? use Users.DisplayName via lateral
+    case when exists(
+      select 1 from users u2 where u2.id = ua.user_id and qas.norm_title like ('%' || lower(regexp_replace(coalesce(u2.displayname,''), '[^a-z0-9]+',' ','gi')) || '%')
+    ) then 1 else 0 end as title_mentions_user
+  from question_answer_stats qas
+  left join lateral (
+    select a.owneruserid as user_id, count(*) as ans_count
+    from posts a
+    where a.posttypeid = 2 and a.parentid = qas.id
+    group by a.owneruserid
+  ) a_counts on true
+  left join user_activity ua on ua.user_id = a_counts.user_id
+),
+-- compute complex tag co-occurrence with set operator (UNION ALL) and window ranking
+tag_pairs as (
+  select distinct
+    t1.tag as tag_a,
+    t2.tag as tag_b,
+    count(*) over (partition by t1.tag, t2.tag) as pair_count
+  from (
+    select q.id, unnest(q.tag_arr) as tag
+    from question_answer_stats q
+  ) t1
+  join (
+    select q.id, unnest(q.tag_arr) as tag
+    from question_answer_stats q
+  ) t2 on t1.id = t2.id and t1.tag <> t2.tag
+),
+top_tag_pairs as (
+  select tag_a, tag_b, count(*) as cnt
+  from (
+    select tag_a, tag_b from tag_pairs
+    union all
+    select tag_b as tag_a, tag_a as tag_b from tag_pairs
+  ) x
+  group by tag_a, tag_b
+  order by cnt desc
+  limit 100
+),
+-- final selection combining lots of constructs
+final as (
+  select
+    qas.id as question_id,
+    left(qas.norm_title, 160) as title_snippet,
+    qas.q_score,
+    qas.q_views,
+    qas.q_answers,
+    qas.top_answer_score,
+    qas.median_answer_age_days,
+    ua.user_id as top_user_id,
+    ua.reputation as top_user_rep,
+    ua.gold_badges,
+    ua.silver_badges,
+    ua.bronze_badges,
+    qc.answer_count_by_user,
+    qc.title_mentions_user,
+    -- calculated hotness: nonlinear function using logs, exponentials, null-safe math and boolean multiplicative factors
+    (
+      coalesce(log(1 + qas.q_views)::numeric,0) * 1.2
+      + coalesce(cbrt(nullif(qas.q_score,0))::numeric,0) * 3
+      + coalesce(qc.answer_count_by_user,0) * 2
+      + case when qas.top_answer_score > 10 then 5 else 0 end
+      + case when ua.lastaccess_days < 7 then 4 else case when ua.lastaccess_days < 30 then 2 else 0 end end
+    )::numeric(12,4) as synthetic_hotness,
+    -- include an existence correlated subquery checking for dup links in postlinks
+    exists(
+      select 1 from postlinks pl where pl.postid = qas.id and pl.linktypeid = 3
+    ) as has_duplicate_link,
+    -- left join to find an exemplar related tag pair (if any)
+    (select tp.tag_b from top_tag_pairs tp where tp.tag_a = (select unnest(qas.tag_arr) limit 1) limit 1) as exemplar_co_tag
+  from question_answer_stats qas
+  left join lateral (
+    -- pick top contributor for this question (complex ordering)
+    select ua_inner.*
+    from (
+      select a.owneruserid, count(*) as cnt
+      from posts a
+      where a.posttypeid = 2 and a.parentid = qas.id
+      group by a.owneruserid
+    ) ac
+    left join user_activity ua_inner on ua_inner.user_id = ac.owneruserid
+    order by (coalesce(ac.cnt,0) * 3 + coalesce(ua_inner.reputation,0) / 200.0) desc
+    limit 1
+  ) ua on true
+  left join question_contributors qc on qc.question_id = qas.id and qc.contrib_rank = 1
+)
+select
+  f.*,
+  -- window aggregate to rank final hotness globally and partitioned by first tag
+  rank() over (order by synthetic_hotness desc) as global_hot_rank,
+  rank() over (partition by coalesce((select unnest(question_answer_stats.tag_arr) from question_answer_stats where id = f.question_id limit 1), '<<none>>') order by synthetic_hotness desc) as tag_partition_rank
+from final f
+where synthetic_hotness is not null
+order by synthetic_hotness desc
+limit 250;

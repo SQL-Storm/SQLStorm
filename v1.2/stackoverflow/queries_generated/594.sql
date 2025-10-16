@@ -1,0 +1,180 @@
+-- {"query": "594.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1846} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+    UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        rth.TagPath || t2.TagName
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy rth ON t2.Id <> ALL (SELECT Id FROM Tags WHERE TagName = ANY(rth.TagPath))
+    WHERE t2.IsModeratorOnly = 0
+),
+UserBadgeAgg AS (
+    SELECT
+        b.UserId,
+        COUNT(*) AS TotalBadges,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        BOOL_OR(b.TagBased) AS HasTagBasedBadge,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostScoreWindow AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS UserPostRank,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgUserPostScore,
+        SUM(p.ViewCount) OVER (PARTITION BY p.OwnerUserId) AS TotalUserViews
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+),
+QuestionAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId AS QuestionOwner,
+        q.CreationDate AS QuestionCreation,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViews,
+        COUNT(a.Id) AS AnswerCount,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        SUM(COALESCE(vb.TotalBadges, 0)) AS AnswerersTotalBadges,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') FILTER (WHERE u.DisplayName IS NOT NULL) AS AnswererNames
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN Users u ON u.Id = a.OwnerUserId
+    LEFT JOIN UserBadgeAgg vb ON vb.UserId = a.OwnerUserId
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount
+),
+RecentClosedQuestions AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS CloseDate,
+        crt.Name AS CloseReason,
+        ph.UserId AS ClosedByUserId,
+        u.DisplayName AS ClosedByUserName
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS SMALLINT) -- CloseReasonId stored as Comment
+    LEFT JOIN Users u ON u.Id = ph.UserId
+    WHERE ph.PostHistoryTypeId = 10 -- Post Closed
+      AND ph.CreationDate > NOW() - INTERVAL '180 days'
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsPosted,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersPosted,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesGiven,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesGiven,
+        COALESCE(uba.TotalBadges, 0) AS BadgeCount,
+        COALESCE(uba.GoldBadges, 0) AS GoldBadges,
+        COALESCE(uba.SilverBadges, 0) AS SilverBadges,
+        COALESCE(uba.BronzeBadges, 0) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.CreationDate > NOW() - INTERVAL '1 year'
+    LEFT JOIN Comments c ON c.UserId = u.Id AND c.CreationDate > NOW() - INTERVAL '1 year'
+    LEFT JOIN Votes v ON v.UserId = u.Id AND v.CreationDate > NOW() - INTERVAL '1 year'
+    LEFT JOIN UserBadgeAgg uba ON uba.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, uba.TotalBadges, uba.GoldBadges, uba.SilverBadges, uba.BronzeBadges
+),
+TopQuestionsWithDuplicates AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        COUNT(pl.Id) FILTER (WHERE lt.Name = 'Duplicate') AS DuplicateCount,
+        STRING_AGG(DISTINCT pl.RelatedPostId::TEXT, ', ') FILTER (WHERE lt.Name = 'Duplicate') AS DuplicatePostIds
+    FROM Posts q
+    LEFT JOIN PostLinks pl ON pl.PostId = q.Id
+    LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.Score, q.ViewCount
+    HAVING COUNT(pl.Id) FILTER (WHERE lt.Name = 'Duplicate') > 0
+),
+ComplexStringAnalysis AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        LENGTH(p.Body) AS BodyLength,
+        LENGTH(REGEXP_REPLACE(p.Body, '<[^>]+>', '', 'g')) AS PlainTextLength,
+        COALESCE(NULLIF(p.Tags, ''), '<none>') AS TagsOrNone,
+        REGEXP_COUNT(p.Body, '[a-zA-Z]{5,}') AS WordCount5Plus,
+        REGEXP_REPLACE(p.Body, '[^\w\s]', '', 'g') AS BodyAlphaNumeric,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            ELSE 'Open'
+        END AS PostStatus
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    ORDER BY BodyLength DESC
+    LIMIT 100
+)
+SELECT
+    ua.Id AS UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.QuestionsPosted,
+    ua.AnswersPosted,
+    ua.CommentsMade,
+    ua.UpVotesGiven,
+    ua.DownVotesGiven,
+    ua.BadgeCount,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    qas.QuestionId,
+    qas.Title AS QuestionTitle,
+    qas.AnswerCount,
+    qas.AvgAnswerScore,
+    qas.MaxAnswerScore,
+    qas.AnswerersTotalBadges,
+    qas.AnswererNames,
+    rcq.CloseDate,
+    rcq.CloseReason,
+    rcq.ClosedByUserName,
+    tqd.DuplicateCount,
+    tqd.DuplicatePostIds,
+    csa.BodyLength,
+    csa.PlainTextLength,
+    csa.TagsOrNone,
+    csa.WordCount5Plus,
+    csa.PostStatus,
+    rh.TagPath
+FROM UserActivityWindow ua
+LEFT JOIN QuestionAnswerStats qas ON qas.QuestionOwner = ua.Id
+LEFT JOIN RecentClosedQuestions rcq ON rcq.PostId = qas.QuestionId
+LEFT JOIN TopQuestionsWithDuplicates tqd ON tqd.QuestionId = qas.QuestionId
+LEFT JOIN ComplexStringAnalysis csa ON csa.Id = qas.QuestionId
+LEFT JOIN RecursiveTagHierarchy rh ON rh.TagName = ANY(string_to_array(replace(coalesce(csa.Tags, ''), '<', ''), '>'))
+WHERE ua.Reputation > 1000
+  AND (qas.AnswerCount > 5 OR qas.AnswerCount IS NULL)
+  AND (rcq.CloseDate IS NULL OR rcq.CloseDate > NOW() - INTERVAL '90 days')
+ORDER BY ua.Reputation DESC, qas.Score DESC NULLS LAST
+LIMIT 50;

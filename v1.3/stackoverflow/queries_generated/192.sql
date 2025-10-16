@@ -1,0 +1,193 @@
+-- {"query": "192.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 2328} 
+WITH
+-- explode tags for questions
+question_tags AS (
+  SELECT p.Id AS QuestionId,
+         lower(t) AS Tag,
+         p.Title,
+         p.OwnerUserId,
+         p.CreationDate,
+         p.Score AS QuestionScore,
+         p.ViewCount,
+         p.AnswerCount,
+         p.FavoriteCount,
+         p.AcceptedAnswerId
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    CASE
+      WHEN p.PostTypeId = 1 AND p.Tags IS NOT NULL THEN string_to_array(substring(p.Tags, 2, char_length(p.Tags) - 2), '><')
+      ELSE ARRAY[]::varchar[]
+    END
+  ) AS arr(t)
+  WHERE p.PostTypeId = 1
+),
+
+-- aggregate votes for posts with weighted scoring
+post_votes AS (
+  SELECT v.PostId,
+         COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS upvotes,
+         COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS downvotes,
+         COUNT(*) FILTER (WHERE v.VoteTypeId = 5) AS favorites,
+         COUNT(*) FILTER (WHERE v.VoteTypeId = 1) AS accepted_flags,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS simple_vote_balance,
+         SUM(COALESCE(v.BountyAmount,0)) AS total_bounty
+  FROM Votes v
+  GROUP BY v.PostId
+),
+
+-- user badge aggregates including tag-based split
+user_badges AS (
+  SELECT b.UserId,
+         COUNT(*) FILTER (WHERE b.Class = 1) AS gold,
+         COUNT(*) FILTER (WHERE b.Class = 2) AS silver,
+         COUNT(*) FILTER (WHERE b.Class = 3) AS bronze,
+         BOOL_OR(b.TagBased) AS has_tag_badges,
+         COUNT(*) AS total_badges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+
+-- latest non-system edit per post and count of history events
+post_history_stats AS (
+  SELECT ph.PostId,
+         MAX(ph.CreationDate) AS LastEdit,
+         COUNT(*) AS HistoryEvents,
+         SUM(CASE WHEN ph.PostHistoryTypeId IN (10,11,12,13) THEN 1 ELSE 0 END) AS close_related_events,
+         MAX(ph.UserId) FILTER (WHERE ph.UserId IS NOT NULL) AS LastEditorUserId
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+
+-- answers aggregated per question
+answer_stats AS (
+  SELECT q.Id AS QuestionId,
+         COUNT(a.Id) FILTER (WHERE a.PostTypeId = 2) AS AnswersTotal,
+         MAX(a.Score) FILTER (WHERE a.PostTypeId = 2) AS TopAnswerScore,
+         AVG(a.Score) FILTER (WHERE a.PostTypeId = 2) AS AvgAnswerScore,
+         COUNT(a.Id) FILTER (WHERE a.OwnerUserId IS NOT NULL) AS AnswersWithOwner
+  FROM Posts q
+  LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+  WHERE q.PostTypeId = 1
+  GROUP BY q.Id
+),
+
+-- compute a composite rank per question combining many signals
+question_metrics AS (
+  SELECT qt.QuestionId,
+         qt.Title,
+         qt.Tag,
+         qt.OwnerUserId,
+         qt.CreationDate,
+         COALESCE(pv.upvotes,0) AS upvotes,
+         COALESCE(pv.downvotes,0) AS downvotes,
+         COALESCE(pv.favorites,0) AS favs,
+         COALESCE(pv.simple_vote_balance,0) AS vote_balance,
+         COALESCE(pv.total_bounty,0) AS total_bounty,
+         COALESCE(phs.HistoryEvents,0) AS history_events,
+         COALESCE(phs.close_related_events,0) AS close_events,
+         COALESCE(as_.AnswersTotal,0) AS answers_total,
+         COALESCE(as_.TopAnswerScore,0) AS top_answer_score,
+         COALESCE(as_.AvgAnswerScore,0) AS avg_answer_score,
+         COALESCE(u.Reputation,0) AS owner_reputation,
+         COALESCE(ub.total_badges,0) AS owner_badges,
+         COALESCE(qt.ViewCount,0) AS views,
+         COALESCE(qt.FavoriteCount,0) AS favorites_count,
+         -- a weighted composite "hotness" score
+         (
+           (COALESCE(pv.upvotes,0) * 3.0)
+           + (COALESCE(pv.simple_vote_balance,0) * 1.25)
+           + (COALESCE(as_.TopAnswerScore,0) * 2.0)
+           + (COALESCE(as_.AnswersTotal,0) * 1.5)
+           + (COALESCE(u.Reputation,0) / GREATEST(NULLIF(u.Reputation,0), 100.0)) * 5.0
+           + (LOG(GREATEST(COALESCE(qt.ViewCount,1),1)) * 1.2)
+           + (COALESCE(pv.total_bounty,0) * 4.0)
+           - (COALESCE(phs.close_related_events,0) * 10.0)
+           + (COALESCE(ub.gold,0) * 2.0 + COALESCE(ub.silver,0) * 1.0 + COALESCE(ub.bronze,0) * 0.25)
+         ) AS composite_score
+  FROM question_tags qt
+  LEFT JOIN post_votes pv ON pv.PostId = qt.QuestionId
+  LEFT JOIN post_history_stats phs ON phs.PostId = qt.QuestionId
+  LEFT JOIN answer_stats as_ ON as_.QuestionId = qt.QuestionId
+  LEFT JOIN Users u ON u.Id = qt.OwnerUserId
+  LEFT JOIN user_badges ub ON ub.UserId = qt.OwnerUserId
+),
+
+-- correlated subquery to find count of similar titles (fuzzy: words overlap)
+similar_title_counts AS (
+  SELECT qm.QuestionId,
+         (SELECT COUNT(*)
+          FROM Posts p2
+          WHERE p2.PostTypeId = 1
+            AND p2.Id <> qm.QuestionId
+            AND (length(qm.Title) > 0 AND (
+                   (p2.Title ILIKE '%' || split_part(qm.Title, ' ', 1) || '%')
+                OR (p2.Title ILIKE '%' || split_part(qm.Title, ' ', 2) || '%')
+                OR (p2.Title ILIKE '%' || split_part(qm.Title, ' ', 3) || '%')
+               ))
+         ) AS similar_titles
+  FROM question_metrics qm
+),
+
+-- windowed ranking over composite_score per tag and global
+ranked_questions AS (
+  SELECT qm.*,
+         st.similar_titles,
+         RANK() OVER (PARTITION BY qm.Tag ORDER BY qm.composite_score DESC NULLS LAST) AS tag_rank,
+         RANK() OVER (ORDER BY qm.composite_score DESC NULLS LAST) AS global_rank,
+         ROW_NUMBER() OVER (PARTITION BY qm.Tag ORDER BY qm.composite_score DESC NULLS LAST) AS tag_rownum,
+         COUNT(*) OVER (PARTITION BY qm.Tag) AS tag_count
+  FROM question_metrics qm
+  LEFT JOIN similar_title_counts st ON st.QuestionId = qm.QuestionId
+),
+
+-- get a final union of top N per tag AND global top, demonstrate set operators
+top_per_tag AS (
+  SELECT rq.QuestionId, rq.Title, rq.Tag, rq.composite_score, rq.tag_rank, rq.global_rank, 'per_tag' AS source
+  FROM ranked_questions rq
+  WHERE rq.tag_rownum <= 3
+),
+
+global_top AS (
+  SELECT rq.QuestionId, rq.Title, rq.Tag, rq.composite_score, rq.tag_rank, rq.global_rank, 'global' AS source
+  FROM ranked_questions rq
+  WHERE rq.global_rank <= 25
+),
+
+-- combine and remove duplicates favouring per_tag rows via DISTINCT ON
+combined AS (
+  SELECT DISTINCT ON (ct.QuestionId) ct.*
+  FROM (
+    SELECT * FROM top_per_tag
+    UNION ALL
+    SELECT * FROM global_top
+  ) ct
+  ORDER BY ct.QuestionId, CASE WHEN ct.source = 'per_tag' THEN 0 ELSE 1 END
+)
+
+SELECT
+  c.QuestionId,
+  LEFT(NULLIF(c.Title, ''), 180) AS ShortTitle,
+  c.Tag,
+  COALESCE(qm.owner_reputation,0) AS OwnerReputation,
+  COALESCE(qm.upvotes,0) AS Upvotes,
+  COALESCE(qm.downvotes,0) AS Downvotes,
+  COALESCE(qm.answers_total,0) AS Answers,
+  COALESCE(qm.views,0) AS Views,
+  COALESCE(qm.favorites_count,0) AS Favorites,
+  COALESCE(qm.history_events,0) AS HistoryCount,
+  COALESCE(qm.total_bounty,0) AS Bounty,
+  COALESCE(c.composite_score,0)::numeric(18,4) AS CompositeScore,
+  c.tag_rank,
+  c.global_rank,
+  COALESCE(qm.top_answer_score,0) AS TopAnswerScore,
+  COALESCE(qm.avg_answer_score,0)::numeric(10,3) AS AvgAnswerScore,
+  COALESCE(st.similar_titles,0) AS SimilarTitleCount,
+  c.source
+FROM combined c
+LEFT JOIN question_metrics qm ON qm.QuestionId = c.QuestionId
+LEFT JOIN similar_title_counts st ON st.QuestionId = c.QuestionId
+-- filter out obviously stale/closed via heuristic: many close events or zero answers and very old
+WHERE NOT (qm.history_events > 50 AND qm.close_events > 5)
+  AND NOT (qm.answers_total = 0 AND qm.CreationDate < now() - INTERVAL '5 years')
+ORDER BY c.composite_score DESC NULLS LAST, c.global_rank ASC
+LIMIT 100;

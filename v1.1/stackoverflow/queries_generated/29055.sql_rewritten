@@ -1,0 +1,222 @@
+-- {"query": "29055.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2124} 
+WITH UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                (COUNT(DISTINCT p.Id) * 100.0 / NULLIF(COUNT(DISTINCT p.Id) + COUNT(DISTINCT c.Id), 0))
+            ELSE 0 
+        END as PostContributionPercentage
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+RankedUsers AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (ORDER BY PostCount DESC, Reputation DESC) as PostRank,
+        RANK() OVER (ORDER BY Views DESC) as ViewRank,
+        DENSE_RANK() OVER (PARTITION BY CASE WHEN Reputation > 10000 THEN 'High' ELSE 'Low' END ORDER BY BadgeCount DESC) as BadgeRank
+    FROM UserActivity
+),
+PostStats AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        p.PostTypeId,
+        p.ParentId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostType,
+        COALESCE(p.AnswerCount, 0) as AnswerCountAdjusted,
+        COALESCE(p.CommentCount, 0) as CommentCountAdjusted,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN 
+                ARRAY_LENGTH(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><'), 1)
+            ELSE 0 
+        END as TagCount,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 10 THEN 'Medium'
+            WHEN p.Score >= 0 THEN 'Low'
+            ELSE 'Negative'
+        END as ScoreCategory
+    FROM Posts p
+    WHERE p.Score IS NOT NULL
+),
+TagPopularity AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        AVG(p.Score) as AvgScore,
+        STRING_AGG(p.Title, ', ' ORDER BY p.Score DESC) as PopularQuestions,
+        COUNT(DISTINCT p.OwnerUserId) as AuthorCount
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE p.PostTypeId = 1 AND p.Score IS NOT NULL
+    GROUP BY t.TagName, t.Count
+    HAVING COUNT(p.Id) > 0
+),
+CombinedData AS (
+    SELECT 
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.Views,
+        ru.PostCount,
+        ru.CommentCount,
+        ru.BadgeCount,
+        ru.PostContributionPercentage,
+        ps.PostId,
+        ps.Title,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCountAdjusted,
+        ps.CommentCountAdjusted,
+        ps.PostType,
+        ps.ScoreCategory,
+        ps.TagCount,
+        tp.TagName,
+        tp.TagCount as TagPopularity,
+        tp.AvgScore,
+        CASE 
+            WHEN ps.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1 AND Score IS NOT NULL) THEN 'AboveAverage'
+            WHEN ps.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1 AND Score IS NOT NULL) THEN 'BelowAverage'
+            ELSE 'Average'
+        END as ScorePerformance,
+        CASE 
+            WHEN (ps.ViewCount * ps.AnswerCountAdjusted) > 1000 THEN 'Popular'
+            ELSE 'Standard'
+        END as PopularityLevel,
+        DATEDIFF('day', ps.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as AgeInDays,
+        ROUND((ps.Score * 1.0 / NULLIF(ps.ViewCount, 0)), 2) as ScoreToViewRatio,
+        (ps.AnswerCountAdjusted * 100.0 / NULLIF(ps.ViewCount, 0)) as AnswerToViewRatio,
+        CASE 
+            WHEN ps.CommentCountAdjusted > ps.AnswerCountAdjusted THEN 'CommentHeavy'
+            WHEN ps.AnswerCountAdjusted > ps.CommentCountAdjusted THEN 'AnswerHeavy'
+            ELSE 'Balanced'
+        END as EngagementType
+    FROM RankedUsers ru
+    LEFT JOIN PostStats ps ON ru.UserId = ps.OwnerUserId
+    LEFT JOIN TagPopularity tp ON ps.Tags IS NOT NULL 
+        AND tp.TagName IN (
+            SELECT TRIM(SUBSTRING(SUBSTRING(ps.Tags, 2, LENGTH(ps.Tags)-2), 
+                POSITION('><' IN SUBSTRING(ps.Tags, 2, LENGTH(ps.Tags)-2)) + 2, 
+                LENGTH(SUBSTRING(ps.Tags, 2, LENGTH(ps.Tags)-2)) - POSITION('><' IN SUBSTRING(ps.Tags, 2, LENGTH(ps.Tags)-2)) - 2)) 
+            FROM Posts p2 
+            WHERE p2.Id = ps.PostId AND ps.Tags IS NOT NULL
+        )
+    WHERE ps.PostId IS NOT NULL OR ru.UserId IN (SELECT DISTINCT OwnerUserId FROM Posts WHERE OwnerUserId IS NOT NULL)
+),
+FinalAggregation AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        Views,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        PostContributionPercentage,
+        COUNT(DISTINCT PostId) as TotalPosts,
+        SUM(CASE WHEN ScoreCategory = 'High' THEN 1 ELSE 0 END) as HighScorePosts,
+        SUM(CASE WHEN ScoreCategory = 'Medium' THEN 1 ELSE 0 END) as MediumScorePosts,
+        AVG(Score) as AvgScore,
+        AVG(ViewCount) as AvgViewCount,
+        AVG(AnswerCountAdjusted) as AvgAnswerCount,
+        AVG(CommentCountAdjusted) as AvgCommentCount,
+        AVG(TagCount) as AvgTagCount,
+        STRING_AGG(DISTINCT TagName, ', ') as AllTagsUsed,
+        COUNT(DISTINCT CASE WHEN ScorePerformance = 'AboveAverage' THEN PostId END) as AboveAvgPosts,
+        COUNT(DISTINCT CASE WHEN PopularityLevel = 'Popular' THEN PostId END) as PopularPosts,
+        MAX(AgeInDays) as MaxAge,
+        MIN(AgeInDays) as MinAge,
+        AVG(ScoreToViewRatio) as AvgScoreToViewRatio,
+        AVG(AnswerToViewRatio) as AvgAnswerToViewRatio,
+        STRING_AGG(DISTINCT EngagementType, ', ') as EngagementTypes,
+        SUM(CASE WHEN TagName IS NOT NULL THEN 1 ELSE 0 END) as TagCountUsed,
+        CASE 
+            WHEN AVG(ScoreToViewRatio) > 0.1 AND AVG(AnswerToViewRatio) > 0.05 THEN 'Engaging'
+            WHEN AVG(ScoreToViewRatio) > 0.05 AND AVG(AnswerToViewRatio) > 0.02 THEN 'ModeratelyEngaging'
+            ELSE 'Passive'
+        END as EngagementStatus
+    FROM CombinedData
+    GROUP BY UserId, DisplayName, Reputation, Views, PostCount, CommentCount, BadgeCount, PostContributionPercentage
+)
+SELECT 
+    f.UserId,
+    f.DisplayName,
+    f.Reputation,
+    f.Views,
+    f.PostCount,
+    f.CommentCount,
+    f.BadgeCount,
+    f.PostContributionPercentage,
+    f.TotalPosts,
+    f.HighScorePosts,
+    f.MediumScorePosts,
+    f.AvgScore,
+    f.AvgViewCount,
+    f.AvgAnswerCount,
+    f.AvgCommentCount,
+    f.AvgTagCount,
+    f.AllTagsUsed,
+    f.AboveAvgPosts,
+    f.PopularPosts,
+    f.MaxAge,
+    f.MinAge,
+    f.AvgScoreToViewRatio,
+    f.AvgAnswerToViewRatio,
+    f.EngagementTypes,
+    f.TagCountUsed,
+    f.EngagementStatus,
+    CASE 
+        WHEN f.PostCount > 100 THEN 'Elite'
+        WHEN f.PostCount > 50 THEN 'Active'
+        WHEN f.PostCount > 10 THEN 'Regular'
+        ELSE 'Beginner'
+    END as UserLevel,
+    CASE 
+        WHEN f.Reputation > 100000 THEN 'Veteran'
+        WHEN f.Reputation > 10000 THEN 'Experienced'
+        WHEN f.Reputation > 1000 THEN 'Intermediate'
+        ELSE 'Newbie'
+    END as ReputationLevel,
+    CASE 
+        WHEN f.BadgeCount > 20 THEN 'AchievementSeeker'
+        WHEN f.BadgeCount > 10 THEN 'BadgeCollector'
+        WHEN f.BadgeCount > 5 THEN 'RegularBadgeUser'
+        ELSE 'CasualBadgeUser'
+    END as BadgeClassification,
+    CASE 
+        WHEN f.AvgScore > 50 AND f.AvgViewCount > 1000 THEN 'HighPerforming'
+        WHEN f.AvgScore > 20 AND f.AvgViewCount > 500 THEN 'MidPerforming'
+        ELSE 'LowPerforming'
+    END as PerformanceCategory
+FROM FinalAggregation f
+WHERE f.PostCount > 0
+ORDER BY f.Reputation DESC, f.PostCount DESC, f.AvgScore DESC
+LIMIT 1000;

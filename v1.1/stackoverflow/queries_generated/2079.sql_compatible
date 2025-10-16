@@ -1,0 +1,106 @@
+WITH BadgeStats AS (
+    SELECT 
+        UserId,
+        COUNT(*) AS TotalBadges,
+        COUNT(CASE WHEN "Class" = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN "Class" = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN "Class" = 3 THEN 1 END) AS BronzeBadges
+    FROM 
+        Badges
+    GROUP BY UserId
+),
+HighReputationUsers AS (
+    SELECT 
+        Id, 
+        DisplayName, 
+        Reputation
+    FROM 
+        Users
+    WHERE
+        Reputation > 10000
+),
+ActiveUsers AS (
+    SELECT 
+        U.Id, 
+        U.DisplayName
+    FROM 
+        Users U
+    JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    WHERE 
+        P.LastActivityDate > (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+    GROUP BY 
+        U.Id, U.DisplayName
+    HAVING 
+        COUNT(P.Id) > 10
+),
+TopPosts AS (
+    SELECT 
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.Title,
+        P.Tags,
+        P.Score,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC) AS Rank
+    FROM 
+        Posts P
+    WHERE 
+        P.PostTypeId = 1
+),
+DetailedViews AS (
+    SELECT 
+        PH.PostId, 
+        COUNT(PH.Id) AS Edits
+    FROM 
+        PostHistory PH
+    JOIN 
+        PostHistoryTypes PHT ON PH.PostHistoryTypeId = PHT.Id
+    WHERE 
+        PHT.Name LIKE 'Edit%'
+    GROUP BY 
+        PH.PostId
+)
+SELECT 
+    U.Id AS UserId,
+    U.DisplayName,
+    COALESCE(BS.TotalBadges, 0) AS TotalBadges,
+    COALESCE(BS.GoldBadges, 0) AS GoldBadges,
+    COALESCE(BS.SilverBadges, 0) AS SilverBadges,
+    COALESCE(BS.BronzeBadges, 0) AS BronzeBadges,
+    HV.TopTitle AS TopPostTitle,
+    HV.TopScore AS TopPostScore,
+    D.Edits AS TotalPostEdits
+FROM 
+    Users U
+LEFT JOIN 
+    BadgeStats BS ON U.Id = BS.UserId
+LEFT JOIN (
+    SELECT 
+        TP.OwnerUserId, 
+        TP.Title AS TopTitle,
+        TP.Score AS TopScore,
+        TP.PostId
+    FROM 
+        TopPosts TP
+    WHERE 
+        TP.Rank = 1
+) HV ON U.Id = HV.OwnerUserId
+LEFT JOIN 
+    (SELECT PostId, MAX(Edits) AS Edits FROM DetailedViews GROUP BY PostId) D ON D.PostId = HV.PostId
+WHERE 
+    U.Reputation > 5000
+    AND U.Id IN (SELECT Id FROM HighReputationUsers)
+    AND U.Id IN (SELECT Id FROM ActiveUsers)
+GROUP BY
+    U.Id,
+    U.DisplayName,
+    U.Reputation,
+    BS.TotalBadges,
+    BS.GoldBadges,
+    BS.SilverBadges,
+    BS.BronzeBadges,
+    HV.TopTitle,
+    HV.TopScore,
+    D.Edits
+ORDER BY 
+    U.Reputation DESC;

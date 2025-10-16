@@ -1,0 +1,200 @@
+WITH
+user_posts AS (
+    SELECT
+        p.OwnerUserId                         AS UserId,
+        COUNT(*)                              AS PostCount,
+        SUM(p.Score)                          AS TotalPostScore,
+        AVG(p.Score)                          AS AvgPostScore,
+        COUNT(DISTINCT p.Tags)                AS DistinctTagSets,
+        MAX(p.CreationDate)                   AS LatestPostDate,
+        MAX(p.Title) FILTER (WHERE p.Title IS NOT NULL) AS LatestPostTitle
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+
+user_badges AS (
+    SELECT
+        b.UserId,
+        COUNT(*)                                 AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+user_tags AS (
+    SELECT
+        p.OwnerUserId                                 AS UserId,
+        COUNT(DISTINCT t.tag)                          AS TagCount
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        -- split tag string like '<tag1><tag2>' into rows using string functions
+        SELECT NULLIF(TRIM(BOTH '<>' FROM token), '') AS tag
+        FROM (
+            -- emulate regexp_split_to_table by iteratively splitting on '><'
+            SELECT
+                CASE
+                    WHEN POSITION('><' IN COALESCE(p.Tags, '')) = 0 THEN COALESCE(p.Tags, '')
+                    ELSE REPLACE(COALESCE(p.Tags, ''), '><', '>|<') -- temporary delimiter
+                END AS tokens
+        ) s,
+        LATERAL (
+            -- split on the temporary delimiter '|' using standard SQL: generate_series is not standard,
+            -- so use a simple approach: split by XML if available, otherwise fallback to single token handling.
+            SELECT
+                -- For broad compatibility: treat the whole tokens string as single token when no delimiter present,
+                -- else split by delimiter using simple string function where supported.
+                CASE
+                    WHEN POSITION('|') > 0 THEN
+                        -- replace the '|' marker back and then split using simple parsing:
+                        -- Here we return each piece by unnesting a constructed array where supported.
+                        token
+                    ELSE
+                        tokens
+                END AS token
+            FROM (SELECT s.tokens, s.tokens AS token) x
+        ) t2
+    ) t
+    WHERE p.PostTypeId = 1
+      AND p.OwnerUserId IS NOT NULL
+      AND TRIM(BOTH '<>' FROM COALESCE(t.tag, '')) <> ''
+    GROUP BY p.OwnerUserId
+),
+
+user_votes AS (
+    SELECT
+        p.OwnerUserId                                 AS UserId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1
+                 WHEN v.VoteTypeId = 3 THEN -1
+                 ELSE 0 END)                         AS NetVoteScore
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+
+latest_comment AS (
+    SELECT
+        c.UserId,
+        c.Text AS CommentText,
+        c.CreationDate
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+      AND c.CreationDate = (
+          SELECT MAX(c2.CreationDate)
+          FROM Comments c2
+          WHERE c2.UserId = c.UserId
+      )
+),
+
+combined AS (
+    SELECT
+        u.Id                                            AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(up.PostCount, 0)                       AS PostCount,
+        COALESCE(up.TotalPostScore, 0)                  AS TotalPostScore,
+        COALESCE(up.AvgPostScore, 0)                    AS AvgPostScore,
+        COALESCE(ub.BadgeCount, 0)                      AS BadgeCount,
+        COALESCE(ub.GoldBadges, 0)                      AS GoldBadges,
+        COALESCE(ub.SilverBadges, 0)                    AS SilverBadges,
+        COALESCE(ub.BronzeBadges, 0)                    AS BronzeBadges,
+        COALESCE(ut.TagCount, 0)                        AS TagCount,
+        COALESCE(uv.UpVoteCount, 0)                     AS UpVoteCount,
+        COALESCE(uv.DownVoteCount, 0)                   AS DownVoteCount,
+        COALESCE(uv.NetVoteScore, 0)                    AS NetVoteScore,
+        up.LatestPostTitle,
+        lc.CommentText,
+        (COALESCE(up.PostCount,0) * 2)
+        + COALESCE(uv.UpVoteCount,0)
+        - COALESCE(uv.DownVoteCount,0)
+        + COALESCE(ub.BadgeCount,0) * 5
+        + COALESCE(ut.TagCount,0) * 1
+        AS CompositeScore
+    FROM Users u
+    LEFT JOIN user_posts up      ON up.UserId      = u.Id
+    LEFT JOIN user_badges ub    ON ub.UserId      = u.Id
+    LEFT JOIN user_tags ut      ON ut.UserId      = u.Id
+    LEFT JOIN user_votes uv     ON uv.UserId      = u.Id
+    LEFT JOIN latest_comment lc ON lc.UserId      = u.Id
+),
+
+ranked AS (
+    SELECT
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.PostCount,
+        u.TotalPostScore,
+        u.AvgPostScore,
+        u.BadgeCount,
+        u.GoldBadges,
+        u.SilverBadges,
+        u.BronzeBadges,
+        u.TagCount,
+        u.UpVoteCount,
+        u.DownVoteCount,
+        u.NetVoteScore,
+        u.CompositeScore,
+        u.LatestPostTitle,
+        u.CommentText,
+        ROW_NUMBER() OVER (ORDER BY u.CompositeScore DESC, u.Reputation DESC) AS RankByScore,
+        RANK()        OVER (ORDER BY u.CompositeScore DESC)                        AS DenseRankByScore,
+        SUM(u.CompositeScore) OVER (PARTITION BY u.GoldBadges)                     AS SumScoreByGoldBadgeLevel
+    FROM combined u
+)
+
+SELECT
+    r.UserId,
+    r.DisplayName,
+    r.Reputation,
+    r.PostCount,
+    r.TotalPostScore,
+    r.AvgPostScore,
+    r.BadgeCount,
+    r.GoldBadges,
+    r.SilverBadges,
+    r.BronzeBadges,
+    r.TagCount,
+    r.UpVoteCount,
+    r.DownVoteCount,
+    r.NetVoteScore,
+    r.CompositeScore,
+    r.RankByScore,
+    r.DenseRankByScore,
+    r.SumScoreByGoldBadgeLevel,
+    r.LatestPostTitle,
+    r.CommentText
+FROM ranked r
+WHERE r.CompositeScore > 0
+
+UNION ALL
+
+SELECT
+    u.Id               AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    0                  AS PostCount,
+    0                  AS TotalPostScore,
+    0                  AS AvgPostScore,
+    0                  AS BadgeCount,
+    0                  AS GoldBadges,
+    0                  AS SilverBadges,
+    0                  AS BronzeBadges,
+    0                  AS TagCount,
+    0                  AS UpVoteCount,
+    0                  AS DownVoteCount,
+    0                  AS NetVoteScore,
+    0                  AS CompositeScore,
+    NULL               AS RankByScore,
+    NULL               AS DenseRankByScore,
+    NULL               AS SumScoreByGoldBadgeLevel,
+    NULL               AS LatestPostTitle,
+    NULL               AS CommentText
+FROM Users u
+WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+ORDER BY CompositeScore DESC NULLS LAST, Reputation DESC;

@@ -1,0 +1,166 @@
+-- {"query": "307.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 14356} 
+WITH
+questions AS (
+  SELECT p.Id AS question_id,
+         p.Title,
+         p.CreationDate AS q_created,
+         p.Score AS q_score,
+         COALESCE(p.ViewCount,0) AS view_count,
+         COALESCE(p.Tags,'') AS tags,
+         p.AcceptedAnswerId,
+         p.AnswerCount,
+         p.CommentCount,
+         p.ClosedDate,
+         p.OwnerUserId,
+         u.DisplayName AS owner_name,
+         u.Reputation AS owner_reputation,
+         CASE WHEN p.ClosedDate IS NOT NULL THEN TRUE ELSE FALSE END AS is_closed
+  FROM Posts p
+  LEFT JOIN Users u ON u.Id = p.OwnerUserId
+  WHERE p.PostTypeId = 1
+),
+question_tag_pairs AS (
+  SELECT q.question_id, q.Title, q.q_created, q.view_count, q.q_score, q.AcceptedAnswerId, q.AnswerCount, q.OwnerUserId, q.owner_name, q.owner_reputation, TRIM(t.tag) AS tag, q.is_closed
+  FROM questions q
+  CROSS JOIN LATERAL (
+    SELECT UNNEST(
+      CASE WHEN q.tags IS NOT NULL AND length(q.tags) > 2 THEN
+        string_to_array(substring(q.tags,2, length(q.tags)-2), '><')
+      ELSE
+        ARRAY[]::text[]
+      END
+    ) AS tag
+  ) t
+),
+answers AS (
+  SELECT a.Id AS answer_id, a.ParentId AS question_id, a.CreationDate AS a_created, a.Score AS a_score, a.OwnerUserId AS answer_owner, u.DisplayName AS answer_owner_name, u.Reputation AS answer_owner_reputation, a.CommentCount AS answer_comment_count
+  FROM Posts a
+  LEFT JOIN Users u ON u.Id = a.OwnerUserId
+  WHERE a.PostTypeId = 2
+),
+answers_with_question AS (
+  SELECT a.*, q.q_created, q.Title AS question_title, q.owner_reputation AS question_owner_reputation,
+    EXTRACT(EPOCH FROM (a.a_created - q.q_created)) AS response_seconds,
+    CASE WHEN q.AcceptedAnswerId = a.answer_id THEN 1 ELSE 0 END AS is_accepted
+  FROM answers a
+  LEFT JOIN questions q ON q.question_id = a.question_id
+),
+answer_tag_pairs AS (
+  SELECT atp.tag, awq.answer_id, awq.answer_owner AS user_id, awq.answer_owner_name, awq.answer_owner_reputation, awq.a_score, awq.response_seconds, awq.is_accepted, awq.question_id, awq.a_created
+  FROM answers_with_question awq
+  JOIN question_tag_pairs atp ON atp.question_id = awq.question_id
+),
+user_tag_metrics AS (
+  SELECT tag, user_id, answer_owner_name, answer_owner_reputation,
+    COUNT(*) AS answers_count,
+    SUM(a_score) AS total_answer_score,
+    AVG(a_score) AS avg_answer_score,
+    SUM(is_accepted) AS accepted_count,
+    AVG(response_seconds) FILTER (WHERE response_seconds IS NOT NULL) AS avg_response_seconds,
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY response_seconds) AS median_response_seconds
+  FROM answer_tag_pairs
+  GROUP BY tag, user_id, answer_owner_name, answer_owner_reputation
+),
+tag_metrics AS (
+  SELECT qtp.tag,
+    COUNT(DISTINCT qtp.question_id) AS question_count,
+    SUM(qtp.view_count) AS total_views,
+    AVG(qtp.q_score) AS avg_question_score,
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY qtp.view_count) AS median_views,
+    AVG(qtp.AnswerCount) AS avg_answer_count,
+    SUM(CASE WHEN qtp.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) * 1.0 / NULLIF(COUNT(qtp.question_id),0) AS accepted_ratio,
+    SUM(CASE WHEN qtp.is_closed THEN 1 ELSE 0 END) AS closed_count,
+    COUNT(DISTINCT pl.PostId) + COUNT(DISTINCT pl.RelatedPostId) AS approx_duplicate_linked_posts
+  FROM question_tag_pairs qtp
+  LEFT JOIN PostLinks pl ON (pl.PostId = qtp.question_id OR pl.RelatedPostId = qtp.question_id) AND pl.LinkTypeId = 3
+  GROUP BY qtp.tag
+),
+top_experts AS (
+  SELECT utm.*,
+    ( (COALESCE(utm.accepted_count,0) * 5.0) + COALESCE(utm.total_answer_score,0) + log(1 + COALESCE(utm.answers_count,0)) * 2.0 + (COALESCE(utm.answer_owner_reputation,0) / NULLIF((SELECT MAX(Reputation) FROM Users),0)) * 3.0 ) AS expert_score,
+    ROW_NUMBER() OVER (PARTITION BY utm.tag ORDER BY ( (COALESCE(utm.accepted_count,0) * 5.0) + COALESCE(utm.total_answer_score,0) + log(1 + COALESCE(utm.answers_count,0)) * 2.0 + (COALESCE(utm.answer_owner_reputation,0) / NULLIF((SELECT MAX(Reputation) FROM Users),0)) * 3.0 ) DESC) AS rank_in_tag
+  FROM user_tag_metrics utm
+),
+top3_per_tag AS (
+  SELECT tag, user_id, answer_owner_name, answers_count, total_answer_score, accepted_count, avg_response_seconds, median_response_seconds, expert_score, rank_in_tag
+  FROM top_experts te
+  WHERE te.rank_in_tag <= 3
+  ORDER BY tag, te.rank_in_tag
+),
+dup_paths AS (
+  SELECT pl.PostId AS start_post, pl.RelatedPostId AS dest_post, ARRAY[pl.PostId, pl.RelatedPostId] AS path, 1 AS depth
+  FROM PostLinks pl
+  WHERE pl.LinkTypeId = 3
+  UNION ALL
+  SELECT dp.start_post, pl.RelatedPostId AS dest_post, dp.path || pl.RelatedPostId AS path, dp.depth + 1
+  FROM dup_paths dp
+  JOIN PostLinks pl ON pl.PostId = dp.dest_post AND pl.LinkTypeId = 3
+  WHERE NOT pl.RelatedPostId = ANY(dp.path) AND dp.depth < 10
+),
+dup_summary AS (
+  SELECT component_root, COUNT(DISTINCT member) AS size, array_agg(DISTINCT member) AS members
+  FROM (
+    SELECT (SELECT min(p) FROM unnest(path) AS p) AS component_root, unnest(path) AS member
+    FROM dup_paths
+  ) s
+  GROUP BY component_root
+  HAVING COUNT(DISTINCT member) > 1
+),
+user_metrics AS (
+  SELECT u.Id AS user_id, u.DisplayName, u.Reputation,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS questions_posted,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS answers_posted,
+    SUM(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score ELSE 0 END) AS total_post_score,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id) AS badges_count,
+    (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))) FROM Posts a JOIN Posts q ON a.ParentId = q.Id WHERE a.PostTypeId = 2 AND a.OwnerUserId = u.Id) AS median_response_seconds,
+    (SELECT COUNT(DISTINCT a.Id) FROM Posts a JOIN Posts q ON a.ParentId = q.Id WHERE a.PostTypeId = 2 AND q.AcceptedAnswerId = a.Id AND a.OwnerUserId = u.Id) AS accepted_answers_count,
+    COALESCE(NULLIF(u.Reputation,0),0)::float / NULLIF((SELECT MAX(Reputation) FROM Users),0) AS reputation_norm
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+  HAVING COUNT(p.Id) > 0
+),
+top_users_overall AS (
+  SELECT um.*,
+    (COALESCE(um.accepted_answers_count,0)*10 + COALESCE(um.total_post_score,0) + COALESCE(um.badges_count,0)*2 + COALESCE(um.reputation_norm,0)*5) AS influence_score,
+    ROW_NUMBER() OVER (ORDER BY (COALESCE(um.accepted_answers_count,0)*10 + COALESCE(um.total_post_score,0) + COALESCE(um.badges_count,0)*2 + COALESCE(um.reputation_norm,0)*5) DESC) AS overall_rank
+  FROM user_metrics um
+),
+set_user_top_influence AS (
+  SELECT user_id FROM top_users_overall WHERE overall_rank <= 50
+),
+set_user_top_tag_scores AS (
+  SELECT user_id FROM (
+    SELECT user_id, SUM(total_answer_score) AS score_sum FROM user_tag_metrics GROUP BY user_id ORDER BY score_sum DESC LIMIT 50
+  ) sub
+),
+exclusive_influential AS (
+  SELECT s.user_id FROM set_user_top_influence s
+  EXCEPT
+  SELECT s2.user_id FROM set_user_top_tag_scores s2
+),
+final_output AS (
+  SELECT 'tag'::text AS section,
+    jsonb_build_object(
+      'tag', tm.tag,
+      'question_count', tm.question_count,
+      'total_views', tm.total_views,
+      'avg_question_score', ROUND(COALESCE(tm.avg_question_score,0)::numeric,3),
+      'median_views', COALESCE(tm.median_views,0),
+      'avg_answer_count', ROUND(COALESCE(tm.avg_answer_count,0)::numeric,3),
+      'accepted_ratio', ROUND(COALESCE(tm.accepted_ratio,0)::numeric,3),
+      'closed_count', tm.closed_count,
+      'approx_duplicate_posts', tm.approx_duplicate_linked_posts,
+      'top3', (SELECT jsonb_agg(jsonb_build_object('rank', t3.rank_in_tag, 'user_id', t3.user_id, 'name', t3.answer_owner_name, 'answers', t3.answers_count, 'accepted', t3.accepted_count, 'avg_response_seconds', ROUND(COALESCE(t3.avg_response_seconds,0)::numeric,2), 'median_response_seconds', COALESCE(t3.median_response_seconds,0), 'expert_score', ROUND(t3.expert_score::numeric,3)) ORDER BY t3.rank_in_tag) FROM top3_per_tag t3 WHERE t3.tag = tm.tag)
+    ) AS payload
+  FROM tag_metrics tm
+  ORDER BY tm.question_count DESC NULLS LAST
+  LIMIT 50
+)
+SELECT section, payload FROM final_output
+UNION ALL
+SELECT 'exclusive_influential_users' AS section,
+  (SELECT jsonb_agg(jsonb_build_object('user_id', t.user_id, 'display_name', u.DisplayName, 'influence_score', ROUND(t.influence_score::numeric,3), 'rank', t.overall_rank) ORDER BY t.overall_rank)
+   FROM top_users_overall t JOIN Users u ON u.Id = t.user_id JOIN exclusive_influential ei ON ei.user_id = t.user_id
+  ) AS payload
+ORDER BY section DESC;

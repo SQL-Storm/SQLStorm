@@ -1,0 +1,189 @@
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.UpVotes AS UserUpVotesGiven,
+        u.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsOwnedCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersOwnedCount,
+        COALESCE(SUM(p.Score), 0) AS TotalPostsScore,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT ph.Id) AS TotalPostHistoryEntries,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesGiven,
+        MAX(u.LastAccessDate) AS UserLastActivityDate,
+        COALESCE(SUBSTRING(u.Location FROM 1 FOR 50), 'Unknown Region') AS UserLocationSnippet,
+        LENGTH(COALESCE(u.AboutMe, '')) AS AboutMeLength
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '3 years')
+    LEFT JOIN Comments c ON u.Id = c.UserId AND c.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '3 years')
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId AND ph.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '3 years')
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '3 years')
+    WHERE u.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '5 years')
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes, u.Location, u.AboutMe
+),
+QuestionDetails AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title AS QuestionTitle,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.OwnerUserId AS QuestionOwnerId,
+        q.CreationDate AS QuestionCreationDate,
+        q.LastActivityDate AS QuestionLastActivityDate,
+        q.LastEditDate AS QuestionLastEditDate,
+        q.ClosedDate AS QuestionClosedDate,
+        (SELECT COUNT(DISTINCT ph_edit.Id)
+         FROM PostHistory ph_edit
+         WHERE ph_edit.PostId = q.Id
+           AND ph_edit.PostHistoryTypeId IN (4, 5, 6, 8, 9, 10, 11, 12, 13)) AS SignificantEditOrStatusChangeCount,
+        REPLACE(REPLACE(REPLACE(q.Tags, '><', ','), '<', ''), '>', '') AS CleanedTags,
+        aa.Id AS AcceptedAnswerId,
+        aa.Score AS AcceptedAnswerScore,
+        aa.OwnerUserId AS AcceptedAnswerOwnerId,
+        aa.CreationDate AS AcceptedAnswerCreationDate,
+        EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.PostId = q.Id AND pl.LinkTypeId = 3) AS HasDuplicateLink,
+        CASE WHEN aa.Id IS NOT NULL THEN EXTRACT(DAY FROM (q.CreationDate - aa.CreationDate)) ELSE NULL END AS DaysToAcceptedAnswer
+    FROM Posts q
+    LEFT JOIN Posts aa ON q.AcceptedAnswerId = aa.Id AND aa.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+      AND q.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '2 years')
+      AND (q.Tags LIKE '%<sql>%' OR q.Tags LIKE '%<database>%' OR q.Tags LIKE '%<performance>%')
+),
+RankedAndAggregatedUsers AS (
+    SELECT
+        ue.UserId,
+        ue.DisplayName,
+        ue.Reputation,
+        ue.TotalPostsOwned,
+        ue.QuestionsOwnedCount,
+        ue.AnswersOwnedCount,
+        ue.TotalPostsScore,
+        ue.TotalCommentsMade,
+        ue.UserLastActivityDate,
+        ue.UserLocationSnippet,
+        RANK() OVER (PARTITION BY (CASE WHEN ue.TotalPostsOwned >= 100 THEN 'Elite' WHEN ue.TotalPostsOwned >= 25 THEN 'Active' ELSE 'Contributor' END) ORDER BY ue.Reputation DESC, ue.UserLastActivityDate DESC) AS RankInPostTier,
+        COALESCE(AVG(qd.QuestionScore) OVER (PARTITION BY ue.UserId), 0) AS AvgQuestionScoreOwned,
+        COALESCE(SUM(qd.AcceptedAnswerScore) OVER (PARTITION BY ue.UserId ORDER BY qd.AcceptedAnswerCreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), 0) AS CumulativeAcceptedAnswerScore,
+        (SELECT COALESCE(AVG(p_ans.ViewCount), 0)
+         FROM Posts p_ans
+         WHERE p_ans.Id IN (SELECT qd_inner.QuestionId FROM QuestionDetails qd_inner WHERE qd_inner.AcceptedAnswerOwnerId = ue.UserId)
+           AND p_ans.PostTypeId = 1) AS AvgViewCountOnAnsweredQuestions
+    FROM UserEngagement ue
+    INNER JOIN QuestionDetails qd ON ue.UserId = qd.QuestionOwnerId OR ue.UserId = qd.AcceptedAnswerOwnerId
+    WHERE ue.TotalPostsOwned > 0
+    GROUP BY
+        ue.UserId, ue.DisplayName, ue.Reputation, ue.TotalPostsOwned, ue.QuestionsOwnedCount, ue.AnswersOwnedCount,
+        ue.TotalPostsScore, ue.TotalCommentsMade, ue.UserLastActivityDate, ue.UserLocationSnippet
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(CASE WHEN b.TagBased = TRUE AND (LOWER(b.Name) LIKE '%sql%' OR LOWER(b.Name) LIKE '%database%') THEN 1 ELSE 0 END) AS HasRelevantTagBadge
+    FROM Badges b
+    INNER JOIN UserEngagement ue ON b.UserId = ue.UserId
+    WHERE b.Date >= (CAST('2024-10-01' AS date) - INTERVAL '2 years')
+    GROUP BY b.UserId
+),
+PrimaryResult AS (
+    SELECT
+        rau.UserId,
+        rau.DisplayName,
+        rau.Reputation,
+        rau.TotalPostsOwned,
+        rau.QuestionsOwnedCount,
+        rau.AnswersOwnedCount,
+        rau.TotalPostsScore,
+        rau.TotalCommentsMade,
+        rau.UserLastActivityDate,
+        rau.RankInPostTier,
+        rau.AvgQuestionScoreOwned,
+        rau.CumulativeAcceptedAnswerScore,
+        ubs.TotalBadges,
+        ubs.GoldBadges,
+        ubs.SilverBadges,
+        ubs.BronzeBadges,
+        ubs.HasRelevantTagBadge,
+        rau.AvgViewCountOnAnsweredQuestions,
+        'USER#' || SUBSTRING(rau.DisplayName FROM 1 FOR 3) || '-' || LPAD(CAST(rau.UserId AS text), 7, '0') AS UserHashId,
+        COALESCE(ue.AboutMeLength, 0) AS UserAboutMeContentLength,
+        (
+            SELECT COALESCE(AVG(ans.Score), 0)
+            FROM Posts ans
+            WHERE ans.OwnerUserId = rau.UserId
+              AND ans.PostTypeId = 2
+              AND EXISTS (
+                    SELECT 1
+                    FROM Posts q_inner
+                    WHERE q_inner.Id = ans.ParentId
+                      AND q_inner.Title ILIKE '%optimize%'
+                      AND ans.Score > (SELECT COALESCE(AVG(ans_avg.Score), 0) FROM Posts ans_avg WHERE ans_avg.ParentId = q_inner.Id)
+                )
+        ) AS AvgOptimizingAnswerScore
+    FROM RankedAndAggregatedUsers rau
+    INNER JOIN UserEngagement ue ON rau.UserId = ue.UserId
+    LEFT JOIN UserBadgeSummary ubs ON rau.UserId = ubs.UserId
+    WHERE
+        rau.RankInPostTier <= 20
+        AND rau.AvgQuestionScoreOwned > 5
+        AND (ubs.HasRelevantTagBadge = 1 OR COALESCE(ubs.GoldBadges, 0) > 0)
+        AND ue.AboutMeLength > 50
+        AND rau.CumulativeAcceptedAnswerScore > 100
+)
+SELECT *
+FROM PrimaryResult
+ORDER BY
+    Reputation DESC,
+    UserLastActivityDate DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    qd.QuestionOwnerId AS UserId,
+    COALESCE(u.DisplayName, 'Community User') AS DisplayName,
+    COALESCE(u.Reputation, 0) AS Reputation,
+    COALESCE(ue_sub.TotalPostsOwned, 0) AS TotalPostsOwned,
+    COALESCE(ue_sub.QuestionsOwnedCount, 0) AS QuestionsOwnedCount,
+    COALESCE(ue_sub.AnswersOwnedCount, 0) AS AnswersOwnedCount,
+    COALESCE(ue_sub.TotalPostsScore, 0) AS TotalPostsScore,
+    COALESCE(ue_sub.TotalCommentsMade, 0) AS TotalCommentsMade,
+    qd.QuestionLastActivityDate AS UserLastActivityDate,
+    NULL AS RankInPostTier,
+    qd.QuestionScore AS AvgQuestionScoreOwned,
+    COALESCE(qd.AcceptedAnswerScore, 0) AS CumulativeAcceptedAnswerScore,
+    NULL AS TotalBadges,
+    NULL AS GoldBadges,
+    NULL AS SilverBadges,
+    NULL AS BronzeBadges,
+    NULL AS HasRelevantTagBadge,
+    NULL AS AvgViewCountOnAnsweredQuestions,
+    'QUES#' || SUBSTRING(qd.QuestionTitle FROM 1 FOR 3) || '-' || LPAD(CAST(qd.QuestionId AS text), 7, '0') AS UserHashId,
+    NULL AS UserAboutMeContentLength,
+    (
+        SELECT COALESCE(AVG(ans.Score), 0)
+        FROM Posts ans
+        WHERE ans.ParentId = qd.QuestionId
+          AND ans.PostTypeId = 2
+    ) AS AvgOptimizingAnswerScore
+FROM QuestionDetails qd
+LEFT JOIN Users u ON qd.QuestionOwnerId = u.Id
+LEFT JOIN UserEngagement ue_sub ON qd.QuestionOwnerId = ue_sub.UserId
+WHERE
+    (qd.QuestionTitle ILIKE '%tuning%' OR qd.QuestionTitle ILIKE '%indexing%')
+    AND qd.ViewCount > 10000
+    AND qd.SignificantEditOrStatusChangeCount > 5
+    AND (qd.AcceptedAnswerId IS NULL OR qd.HasDuplicateLink = TRUE)
+    AND qd.QuestionClosedDate IS NULL
+ORDER BY
+    Reputation DESC,
+    UserLastActivityDate DESC
+LIMIT 50;

@@ -1,0 +1,70 @@
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) + COUNT(DISTINCT c.Id) DESC) AS ActivityRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId IN (2, 3, 8)
+    GROUP BY u.Id
+),
+GoldBadgeUsers AS (
+    SELECT 
+        UserId,
+        COUNT(*) AS GoldBadges,
+        MAX(b.Date) AS LatestGoldDate
+    FROM Badges b
+    WHERE b.Class = 1
+    GROUP BY UserId
+    HAVING COUNT(*) > 5
+)
+SELECT 
+    u.Id,
+    u.DisplayName,
+    COALESCE(ua.ActivityRank, 999999) AS ActivityRank,
+    gb.GoldBadges,
+    STRING_AGG(DISTINCT ph.Comment, '; ') FILTER (WHERE ph.PostHistoryTypeId = 10) AS CloseReasons,
+    (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 1) AS AvgQuestionScore,
+    COUNT(DISTINCT CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN p.Id END) * 100.0 / NULLIF(COUNT(DISTINCT p.Id), 0) AS AcceptanceRate,
+    COALESCE(array_length(string_to_array(replace(replace(p.Tags, '><', ','), '<', ''), ','), 1), 0) AS TagCount,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (
+        PARTITION BY u.Id 
+        ORDER BY p.CreationDate 
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS CumulativeUpvotes,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.Score DESC) AS TopPostRank,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS DuplicateLinks,
+    u.Reputation
+FROM Users u
+LEFT JOIN UserActivity ua ON u.Id = ua.UserId
+LEFT JOIN GoldBadgeUsers gb ON u.Id = gb.UserId
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId IN (10, 11, 12)
+LEFT JOIN Votes v ON p.Id = v.PostId
+WHERE u.Reputation > 10000
+    AND (p.ClosedDate IS NULL OR p.ClosedDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1' YEAR)
+    AND EXISTS (
+        SELECT 1 
+        FROM Comments c2 
+        WHERE c2.PostId = p.Id 
+        AND c2.Score > (SELECT AVG(c3.Score) FROM Comments c3 WHERE c3.PostId = p.Id)
+    )
+GROUP BY 
+    u.Id, 
+    u.DisplayName, 
+    ua.ActivityRank, 
+    gb.GoldBadges, 
+    p.Id, 
+    p.CreationDate, 
+    p.Score, 
+    p.Tags,
+    ph.Comment,
+    ph.PostHistoryTypeId,
+    v.VoteTypeId,
+    u.Reputation
+HAVING COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) > 10
+ORDER BY u.Reputation DESC, ActivityRank
+LIMIT 100;

@@ -1,0 +1,134 @@
+-- {"query": "12098.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 980} 
+
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC) AS UserRank,
+        DENSE_RANK() OVER (ORDER BY P.Score DESC) AS ScoreRank,
+        NTILE(4) OVER (ORDER BY P.CreationDate) AS Quartile
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2) AND P.Score > 0
+),
+TopUsers AS (
+    SELECT 
+        OwnerUserId,
+        COUNT(Id) AS PostCount,
+        SUM(Score) AS TotalScore
+    FROM 
+        RankedPosts
+    WHERE 
+        UserRank <= 3
+    GROUP BY 
+        OwnerUserId
+    HAVING 
+        COUNT(Id) > 1
+),
+TagStats AS (
+    SELECT 
+        T.TagName,
+        COUNT(P.Id) AS PostCount,
+        AVG(P.Score) AS AvgScore
+    FROM 
+        Tags T
+    JOIN 
+        Posts P ON T.WikiPostId = P.Id OR T.ExcerptPostId = P.Id
+    GROUP BY 
+        T.TagName
+),
+UserActivity AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        COUNT(DISTINCT P.Id) AS PostCount,
+        COUNT(DISTINCT C.Id) AS CommentCount,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount
+    FROM 
+        Users U
+    LEFT JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN 
+        Comments C ON U.Id = C.UserId
+    LEFT JOIN 
+        Votes V ON U.Id = V.UserId
+    WHERE 
+        U.CreationDate > CURRENT_DATE - INTERVAL '1 year'
+    GROUP BY 
+        U.Id, U.DisplayName
+),
+PostHistorySummary AS (
+    SELECT 
+        P.Id AS PostId,
+        PH.PostHistoryTypeId,
+        COUNT(PH.Id) AS HistoryCount
+    FROM 
+        Posts P
+    LEFT JOIN 
+        PostHistory PH ON P.Id = PH.PostId
+    WHERE 
+        PH.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+    GROUP BY 
+        P.Id, PH.PostHistoryTypeId
+),
+RecentActivity AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Tags,
+        P.LastActivityDate,
+        ROW_NUMBER() OVER (ORDER BY P.LastActivityDate DESC) AS ActivityRank
+    FROM 
+        Posts P
+    WHERE 
+        P.LastActivityDate > CURRENT_DATE - INTERVAL '30 days'
+)
+SELECT 
+    RP.Id,
+    RP.PostTypeId,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.OwnerUserId,
+    RP.OwnerDisplayName,
+    RP.UserRank,
+    RP.ScoreRank,
+    RP.Quartile,
+    TS.TagName,
+    TS.PostCount AS TagPostCount,
+    TS.AvgScore AS TagAvgScore,
+    UA.PostCount AS UserPostCount,
+    UA.CommentCount,
+    UA.UpVoteCount,
+    UA.DownVoteCount,
+    PHS.PostHistoryTypeId,
+    PHS.HistoryCount,
+    RA.Title,
+    RA.Tags,
+    RA.LastActivityDate,
+    RA.ActivityRank
+FROM 
+    RankedPosts RP
+JOIN 
+    TagStats TS ON RP.Id = ANY(string_to_array(TS.TagName, ' '))
+LEFT JOIN 
+    TopUsers TU ON RP.OwnerUserId = TU.OwnerUserId
+LEFT JOIN 
+    UserActivity UA ON RP.OwnerUserId = UA.Id
+LEFT JOIN 
+    PostHistorySummary PHS ON RP.Id = PHS.PostId
+LEFT JOIN 
+    RecentActivity RA ON RP.Id = RA.Id
+WHERE 
+    RP.ScoreRank <= 100 AND UA.PostCount > 5
+ORDER BY 
+    RP.Score DESC, RP.ViewCount DESC, RP.CreationDate;

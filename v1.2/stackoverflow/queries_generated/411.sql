@@ -1,0 +1,262 @@
+-- {"query": "411.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2320} 
+with RecursiveTagHierarchy as (
+    select 
+        t.Id, 
+        t.TagName, 
+        t.Count, 
+        t.ExcerptPostId, 
+        t.WikiPostId, 
+        t.IsModeratorOnly, 
+        t.IsRequired,
+        1 as Level,
+        cast(t.TagName as varchar(1000)) as Path
+    from Tags t
+    where t.IsRequired = 1
+
+    union all
+
+    select 
+        child.Id, 
+        child.TagName, 
+        child.Count, 
+        child.ExcerptPostId, 
+        child.WikiPostId, 
+        child.IsModeratorOnly, 
+        child.IsRequired,
+        parent.Level + 1,
+        parent.Path || ' > ' || child.TagName
+    from Tags child
+    join RecursiveTagHierarchy parent on child.Id <> parent.Id and child.IsRequired = 1
+    where parent.Level < 3
+),
+UserBadgeRanks as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        sum(u.Reputation) over (partition by u.Id) as TotalReputation,
+        row_number() over (order by sum(u.Reputation) desc) as ReputationRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostActivity as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        pt.Name as PostTypeName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.LastActivityDate,
+        dense_rank() over (partition by p.PostTypeId order by p.Score desc) as ScoreRank,
+        coalesce(p.ViewCount,0) + coalesce(p.Score,0)*10 + coalesce(p.FavoriteCount,0)*20 as PopularityScore,
+        case when p.ClosedDate is not null then 1 else 0 end as IsClosed
+    from Posts p
+    join PostTypes pt on pt.Id = p.PostTypeId
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId in (1,2)
+),
+TopQuestionsWithAnswers as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.OwnerName,
+        q.CreationDate as QuestionCreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        q.Tags,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswerOwnerUserId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        a.CommentCount as AnswerCommentCount,
+        a.FavoriteCount as AnswerFavoriteCount,
+        a.IsClosed as AnswerIsClosed,
+        u.DisplayName as AnswerOwnerName,
+        row_number() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from PostActivity q
+    left join PostActivity a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1 and q.Score >= 10
+),
+ClosedReasonCounts as (
+    select 
+        cht.Name as CloseReason,
+        count(distinct ph.PostId) as ClosedPostsCount
+    from PostHistory ph
+    join PostHistoryTypes cht on ph.PostHistoryTypeId = cht.Id
+    where ph.PostHistoryTypeId = 10 and ph.Comment is not null
+    group by cht.Name
+),
+UserVoteStats as (
+    select 
+        v.UserId,
+        vt.Name as VoteType,
+        count(*) as VoteCount
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    where v.UserId is not null
+    group by v.UserId, vt.Name
+),
+UserAggregatedStats as (
+    select 
+        u.Id,
+        u.DisplayName,
+        coalesce(uvs_up.VoteCount,0) as UpVotesGiven,
+        coalesce(uvs_down.VoteCount,0) as DownVotesGiven,
+        coalesce(uvs_fav.VoteCount,0) as FavoritesGiven,
+        coalesce(badges.GoldBadges,0) as GoldBadges,
+        coalesce(badges.SilverBadges,0) as SilverBadges,
+        coalesce(badges.BronzeBadges,0) as BronzeBadges,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        u.Views,
+        row_number() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+    left join (
+        select UserId, VoteCount from UserVoteStats where VoteType = 'UpMod'
+    ) uvs_up on uvs_up.UserId = u.Id
+    left join (
+        select UserId, VoteCount from UserVoteStats where VoteType = 'DownMod'
+    ) uvs_down on uvs_down.UserId = u.Id
+    left join (
+        select UserId, VoteCount from UserVoteStats where VoteType = 'Favorite'
+    ) uvs_fav on uvs_fav.UserId = u.Id
+    left join UserBadgeRanks badges on badges.UserId = u.Id
+),
+QuestionTagAnalysis as (
+    select 
+        p.Id as QuestionId,
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as Tag,
+        p.Score,
+        p.ViewCount,
+        p.FavoriteCount
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+),
+TagPopularity as (
+    select 
+        Tag,
+        count(*) as QuestionCount,
+        avg(Score) as AvgScore,
+        avg(ViewCount) as AvgViews,
+        sum(FavoriteCount) as TotalFavorites,
+        rank() over (order by count(*) desc) as PopularityRank
+    from QuestionTagAnalysis
+    group by Tag
+),
+DuplicateLinkAnalysis as (
+    select 
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        u.DisplayName as PostOwner,
+        u2.DisplayName as RelatedPostOwner,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle
+    from PostLinks pl
+    left join Posts p1 on p1.Id = pl.PostId
+    left join Posts p2 on p2.Id = pl.RelatedPostId
+    left join Users u on u.Id = p1.OwnerUserId
+    left join Users u2 on u2.Id = p2.OwnerUserId
+    where pl.LinkTypeId = 3 -- Duplicate
+),
+AnswerDelayStats as (
+    select 
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.CreationDate as AnswerCreationDate,
+        q.CreationDate as QuestionCreationDate,
+        extract(epoch from (a.CreationDate - q.CreationDate))/3600 as HoursToAnswer,
+        a.Score as AnswerScore
+    from Posts a
+    join Posts q on q.Id = a.ParentId and q.PostTypeId = 1
+    where a.PostTypeId = 2
+),
+AnswerDelayPercentiles as (
+    select 
+        percentile_cont(0.25) within group (order by HoursToAnswer) as Q1,
+        percentile_cont(0.5) within group (order by HoursToAnswer) as Median,
+        percentile_cont(0.75) within group (order by HoursToAnswer) as Q3
+    from AnswerDelayStats
+)
+select 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    u.UpVotesGiven,
+    u.DownVotesGiven,
+    u.FavoritesGiven,
+    coalesce(qs.QuestionCount,0) as QuestionsAsked,
+    coalesce(ans.AnswersGiven,0) as AnswersGiven,
+    coalesce(avg_ans.Score,0) as AvgAnswerScore,
+    coalesce(avg_ans.HoursToAnswer,0) as AvgAnswerDelayHours,
+    tp.Tag,
+    tp.QuestionCount as TagQuestionCount,
+    tp.AvgScore as TagAvgScore,
+    tp.PopularityRank as TagPopularityRank,
+    dl.PostId as DuplicatePostId,
+    dl.PostTitle as DuplicatePostTitle,
+    dl.RelatedPostId as RelatedDuplicatePostId,
+    dl.RelatedPostTitle as RelatedDuplicatePostTitle,
+    cr.ClosedReason,
+    cr.ClosedPostsCount,
+    adp.Q1 as AnswerDelayQ1Hours,
+    adp.Median as AnswerDelayMedianHours,
+    adp.Q3 as AnswerDelayQ3Hours
+from UserAggregatedStats u
+left join (
+    select OwnerUserId, count(*) as QuestionCount
+    from Posts
+    where PostTypeId = 1
+    group by OwnerUserId
+) qs on qs.OwnerUserId = u.Id
+left join (
+    select OwnerUserId, count(*) as AnswersGiven, avg(Score) as Score, avg(extract(epoch from (CreationDate - q.CreationDate))/3600) as HoursToAnswer
+    from Posts a
+    join Posts q on q.Id = a.ParentId and q.PostTypeId = 1
+    where a.PostTypeId = 2
+    group by OwnerUserId
+) avg_ans on avg_ans.OwnerUserId = u.Id
+left join TagPopularity tp on tp.Tag in (
+    select unnest(string_to_array(substring(t.Tags from 2 for char_length(t.Tags)-2), '><'))
+    from Posts t
+    where t.OwnerUserId = u.Id and t.PostTypeId = 1
+    limit 1
+)
+left join (
+    select 
+        pl.PostId,
+        p.Title as PostTitle,
+        pl.RelatedPostId,
+        p2.Title as RelatedPostTitle
+    from PostLinks pl
+    join Posts p on p.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where pl.LinkTypeId = 3
+) dl on dl.PostId in (
+    select Id from Posts where OwnerUserId = u.Id
+)
+cross join ClosedReasonCounts cr
+cross join AnswerDelayPercentiles adp
+where u.Reputation > 1000
+order by u.Reputation desc, u.GoldBadges desc, u.SilverBadges desc
+limit 100;

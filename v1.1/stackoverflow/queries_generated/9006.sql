@@ -1,0 +1,105 @@
+-- {"query": "9006.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2013, "output_tokens": 2505} 
+
+WITH recent_votes AS (
+    SELECT
+        v.PostId,
+        COUNT(*)                                            AS VoteCount,
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END)   AS UpVotes,
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes
+    FROM Votes v
+    JOIN VoteTypes vt
+      ON v.VoteTypeId = vt.Id
+    WHERE v.CreationDate >= NOW() - INTERVAL '30 days'
+    GROUP BY v.PostId
+),
+user_scores AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC)                                AS RankByReputation,
+        COALESCE(AVG(b.Class) FILTER (WHERE b.TagBased = 0), 0)                        AS AvgBadgeClass,
+        COUNT(*) FILTER (WHERE b.TagBased = 1)                                        AS TagBasedBadgeCount
+    FROM Users u
+    LEFT JOIN Badges b
+      ON u.Id = b.UserId
+    GROUP BY u.Id
+)
+SELECT
+    p.Id                                                                 AS PostId,
+    p.Title,
+    COALESCE(rc.CommentCount, 0)                                         AS TotalComments,
+    CASE
+        WHEN p.ViewCount > 1000 THEN 'High'
+        WHEN p.ViewCount >  100 THEN 'Medium'
+        ELSE 'Low'
+    END                                                                  AS PopularityBucket,
+    rv.VoteCount,
+    rv.UpVotes,
+    rv.DownVotes,
+    us.RankByReputation,
+    us.TagBasedBadgeCount,
+    EXTRACT(EPOCH FROM (NOW() - p.CreationDate)) / 86400.0                AS AgeInDays,
+    SUBSTRING(p.Body FROM 1 FOR 80) || '...'                              AS Snippet,
+    (
+        SELECT COUNT(*)
+        FROM Votes v2
+        WHERE v2.PostId = p.Id
+          AND v2.CreationDate < p.CreationDate
+    )                                                                     AS VotesBeforePost,
+    (
+        SELECT STRING_AGG(t.TagName, ',')
+        FROM Tags t
+        WHERE p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    )                                                                     AS TagList
+FROM Posts p
+LEFT JOIN recent_votes rv
+  ON p.Id = rv.PostId
+LEFT JOIN (
+    SELECT
+        PostId,
+        COUNT(*) AS CommentCount
+    FROM Comments
+    GROUP BY PostId
+) rc
+  ON p.Id = rc.PostId
+JOIN user_scores us
+  ON p.OwnerUserId = us.UserId
+WHERE p.CreationDate >= (
+          SELECT MIN(pp.CreationDate)
+          FROM Posts pp
+          WHERE pp.OwnerUserId = p.OwnerUserId
+      )
+  AND EXISTS (
+      SELECT 1
+      FROM PostLinks pl
+      WHERE pl.PostId     = p.Id
+        AND pl.LinkTypeId = (SELECT Id FROM LinkTypes WHERE Name = 'Duplicate')
+  )
+  AND (p.Score > (
+           SELECT AVG(pp2.Score)
+           FROM Posts pp2
+           WHERE pp2.PostTypeId = 1
+       )
+       OR p.Score IS NULL)
+UNION ALL
+SELECT
+    q.Id,
+    q.Title,
+    0,
+    'Meta',
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    '',
+    ''
+FROM Posts q
+WHERE q.PostTypeId = (
+          SELECT Id
+          FROM PostTypes
+          WHERE Name = 'WikiPlaceholder'
+      )
+ORDER BY VoteCount DESC NULLS LAST, AgeInDays ASC
+LIMIT 100;

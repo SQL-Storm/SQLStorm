@@ -1,0 +1,110 @@
+-- {"query": "3038.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1120} 
+WITH UserReputation AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY u.CreationDate DESC) AS RevRank
+    FROM Users u
+),
+RecentVotes AS (
+    SELECT
+        v.PostId,
+        v.UserId,
+        v.CreationDate AS VoteDate,
+        vt.Name AS VoteTypeName
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE v.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days'
+),
+PostTagSummary AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        ARRAY_AGG(t.TagName) AS Tags,
+        p.Score,
+        p.ViewCount,
+        pc.CommentCount,
+        COALESCE(rs.RecentVoteCount, 0) AS RecentUpVotes,
+        COALESCE(rd.RecentDownVotes, 0) AS RecentDownVotes
+    FROM Posts p
+    LEFT JOIN LATERAL (
+        SELECT COUNT(*) FROM Votes v
+        JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+        WHERE v.PostId = p.Id AND vt.Name = 'UpMod' AND v.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days'
+    ) rs ON true
+    LEFT JOIN LATERAL (
+        SELECT COUNT(*) FROM Votes v
+        JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+        WHERE v.PostId = p.Id AND vt.Name = 'DownMod' AND v.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days'
+    ) rd ON true
+    LEFT JOIN Comments pc ON pc.PostId = p.Id
+    LEFT JOIN LATERAL (
+        SELECT COUNT(*) AS RecentVoteCount FROM Votes v
+        JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+        WHERE v.PostId = p.Id AND vt.Name = 'UpMod' AND v.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days'
+    ) AS ruv ON true
+    LEFT JOIN LATERAL (
+        SELECT COUNT(*) AS RecentDownVotes FROM Votes v
+        JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+        WHERE v.PostId = p.Id AND vt.Name = 'DownMod' AND v.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days'
+    ) AS rdv ON true
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, pc.CommentCount
+),
+PostsWithLifecycle AS (
+    SELECT
+        p.*,
+        ph1.PostHistoryTypeId AS FirstEditTypeId,
+        ph2.PostHistoryTypeId AS LastEditTypeId,
+        phCC.PostHistoryTypeId AS CloseReasonId,
+        g.FirstBadges,
+        u.Reputation AS UserReputation,
+        u.DisplayName AS UserDisplayName
+    FROM Posts p
+    LEFT JOIN PostHistory ph1 ON ph1.PostId = p.Id AND ph1.CreationDate = (
+        SELECT MIN(CreationDate) FROM PostHistory WHERE PostId = p.Id
+    )
+    LEFT JOIN PostHistory ph2 ON ph2.PostId = p.Id AND ph2.CreationDate = (
+        SELECT MAX(CreationDate) FROM PostHistory WHERE PostId = p.Id
+    )
+    LEFT JOIN PostHistory phCC ON phCC.PostId = p.Id AND phCC.PostHistoryTypeId = 10
+    LEFT JOIN (
+        SELECT
+            b.UserId,
+            ARRAY_AGG(b.Name) AS FirstBadges
+        FROM Badges b
+        WHERE b.Class = 1
+        GROUP BY b.UserId
+    ) g ON g.UserId = p.OwnerUserId
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+)
+SELECT
+    pwl.Id,
+    pwl.Title,
+    pwl.CreationDate,
+    pwl.Tags,
+    pwl.Score,
+    pwl.ViewCount,
+    pwl.CommentCount,
+    u.DisplayName AS OwnerName,
+    u.Reputation,
+    pss.RecentUpVotes,
+    pss.RecentDownVotes,
+    CASE WHEN pwl.CloseReasonId IS NULL THEN 'Open' ELSE 'Closed' END AS PostStatus,
+    pwl.LastEditTypeId,
+    pwl.FirstEditTypeId,
+    pwl.FirstBadges,
+    EXISTS (
+        SELECT 1 FROM Badges b2
+        WHERE b2.UserId = pwl.OwnerUserId AND b2.Class = 1
+    ) AS IsGoldBadgeHolder,
+    (SELECT ARRAY_AGG(uv.UserId) FROM RecentVotes uv WHERE uv.PostId = pwl.Id AND uv.VoteTypeName = 'UpMod') AS RecentUpVoters,
+    (SELECT ARRAY_AGG(dv.UserId) FROM RecentVotes dv WHERE dv.PostId = pwl.Id AND dv.VoteTypeName = 'DownMod') AS RecentDownVoters
+FROM PostTagSummary pss
+JOIN PostsWithLifecycle pwl ON pwl.Id = pss.PostId
+LEFT JOIN Users u ON u.Id = pwl.OwnerUserId
+WHERE pwl.PostTypeId = 1
+ORDER BY pwl.CreationDate DESC
+LIMIT 100;

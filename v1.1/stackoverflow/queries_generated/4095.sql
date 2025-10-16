@@ -1,0 +1,110 @@
+-- {"query": "4095.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1339} 
+with RecursiveTagParents as (
+  select t.Id, t.TagName, t.WikiPostId, t.ExcerptPostId, 1 as Level
+  from Tags t
+  where t.IsRequired = 1
+  union all
+  select t.Id, t.TagName, t.WikiPostId, t.ExcerptPostId, r.Level + 1
+  from Tags t
+  join RecursiveTagParents r on t.Id = r.Id - 1 -- arbitrary recursive link to simulate depth
+),
+TopUsers as (
+  select u.Id, u.DisplayName, u.Reputation,
+         row_number() over (order by u.Reputation desc, u.CreationDate) as rn
+  from Users u
+  where u.Reputation > 10000
+),
+UserBadgeCounts as (
+  select b.UserId,
+         count(*) filter (where b.Class = 1) as GoldBadges,
+         count(*) filter (where b.Class = 2) as SilverBadges,
+         count(*) filter (where b.Class = 3) as BronzeBadges
+  from Badges b
+  group by b.UserId
+),
+UserActivityAgg as (
+  select u.Id as UserId, count(distinct p.Id) as NumPosts,
+         max(p.Score) as MaxPostScore,
+         avg(p.Score) filter (where p.PostTypeId = 1) as AvgQuestionScore,
+         avg(p.Score) filter (where p.PostTypeId = 2) as AvgAnswerScore,
+         sum(vb.UpVotes) as TotalUpVotes,
+         sum(vb.DownVotes) as TotalDownVotes
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  left join (select v.PostId,
+                    sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+                    sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes
+               from Votes v
+               join VoteTypes vt on vt.Id = v.VoteTypeId
+               group by v.PostId) vb on vb.PostId = p.Id
+  group by u.Id
+),
+QuestionAnswers as (
+  select q.Id as QuestionId, q.OwnerUserId as QuestionOwner,
+         q.Title, q.Tags, q.Score as QuestionScore, q.ViewCount,
+         coalesce(a.AnswerCount,0) as AnswerCount,
+         a.Id as AnswerId, a.OwnerUserId as AnswerOwner,
+         a.Score as AnswerScore,
+         rank() over (partition by q.Id order by a.Score desc) as AnswerRank
+  from Posts q
+  left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+  where q.PostTypeId = 1
+),
+ClosedQuestionDetails as (
+  select ph.PostId, cr.Name as CloseReason, ph.CreationDate as CloseDate
+  from PostHistory ph
+  join CloseReasonTypes cr on cr.Id = cast(ph.Comment as int)
+  where ph.PostHistoryTypeId = 10
+),
+UserLatestPosts as (
+  select p.OwnerUserId as UserId, max(p.CreationDate) as LatestPostDate
+  from Posts p
+  group by p.OwnerUserId
+),
+TitleEditsCount as (
+  select ph.PostId, ph.UserId, count(*) as EditCount
+  from PostHistory ph
+  where ph.PostHistoryTypeId in (1,4,7)
+  group by ph.PostId, ph.UserId
+),
+FinalResultSet as (
+  select 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    coalesce(ub.GoldBadges,0) as GoldBadges,
+    coalesce(ub.SilverBadges,0) as SilverBadges,
+    coalesce(ub.BronzeBadges,0) as BronzeBadges,
+    coalesce(ua.NumPosts, 0) as NumPosts,
+    coalesce(ua.MaxPostScore, 0) as MaxPostScore,
+    coalesce(ua.AvgQuestionScore, 0) as AvgQuestionScore,
+    coalesce(ua.AvgAnswerScore, 0) as AvgAnswerScore,
+    coalesce(ua.TotalUpVotes, 0) as TotalUpVotes,
+    coalesce(ua.TotalDownVotes, 0) as TotalDownVotes,
+    ul.LatestPostDate,
+    coalesce(edits.EditCount, 0) as TitleEditCount,
+    cq.CloseReason,
+    sum(case when qa.AnswerRank = 1 then 1 else 0 end) as TopAnswersProvided,
+    string_agg(distinct left(t.TagName, 10), ',' order by t.TagName) as TagsUsed
+  from Users u
+  left join UserBadgeCounts ub on ub.UserId = u.Id
+  left join UserActivityAgg ua on ua.UserId = u.Id
+  left join UserLatestPosts ul on ul.UserId = u.Id
+  left join TitleEditsCount edits on edits.UserId = u.Id
+  left join QuestionAnswers qa on qa.AnswerOwner = u.Id and qa.AnswerRank = 1
+  left join ClosedQuestionDetails cq on cq.PostId = qa.QuestionId and qa.QuestionOwner = u.Id
+  left join LATERAL (
+    select distinct unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as TagName
+    from Posts p
+    where p.OwnerUserId = u.Id and p.Tags is not null
+    limit 10
+  ) t on true
+  where u.Reputation > 5000
+  group by u.Id, u.DisplayName, u.Reputation, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ua.NumPosts, ua.MaxPostScore, ua.AvgQuestionScore, ua.AvgAnswerScore, ua.TotalUpVotes, ua.TotalDownVotes, ul.LatestPostDate, edits.EditCount, cq.CloseReason
+)
+select * from FinalResultSet
+where (GoldBadges + SilverBadges + BronzeBadges) >= 10
+   and (AvgQuestionScore > 2 or AvgAnswerScore > 5)
+   and (TotalUpVotes - TotalDownVotes) > 100
+order by Reputation desc, NumPosts desc, MaxPostScore desc
+limit 100;

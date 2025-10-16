@@ -1,0 +1,86 @@
+WITH cte AS (
+    SELECT 
+        p.Id AS PostId, 
+        p.PostTypeId, 
+        p.OwnerUserId, 
+        p.Score, 
+        p.ViewCount, 
+        p.AnswerCount, 
+        p.CommentCount, 
+        p.FavoriteCount, 
+        p.CommunityOwnedDate, 
+        p.ClosedDate,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN c.Name ELSE NULL END AS CloseReason,
+        COALESCE(DATEDIFF(day, p.CreationDate, p.ClosedDate), 0) AS ClosureDays,
+        COALESCE(DATEDIFF(day, p.CreationDate, DATEADD(day, 0, ISNULL(p.AnswerCount, 0))), 0) AS AnswerDays,
+        COALESCE(DATEDIFF(day, p.CreationDate, ISNULL(p.CommunityOwnedDate, '9999-12-31')), 0) AS CommunityOwnedDays,
+        COALESCE(DATEDIFF(day, ISNULL(p.CommunityOwnedDate, '9999-12-31'), ISNULL(p.ClosedDate, '9999-12-31')), 0) AS ClosureDaysSinceOwnership,
+        COALESCE(DATEDIFF(day, ISNULL(p.AcceptedAnswerId, 0), ISNULL(p.ClosedDate, '9999-12-31')), 0) AS ClosureDaysSinceAcceptedAnswer,
+        COALESCE(DATEDIFF(day, ISNULL(p.LastEditorUserId, 0), ISNULL(p.ClosedDate, '9999-12-31')), 0) AS ClosureDaysSinceLastEdit,
+        COALESCE(DATEDIFF(day, ISNULL(p.LastActivityDate, p.CreationDate), ISNULL(p.ClosedDate, '9999-12-31')), 0) AS ClosureDaysSinceLastActivity,
+        COALESCE(DATEDIFF(day, ISNULL(p.LastAccessDate, p.CreationDate), ISNULL(p.ClosedDate, '9999-12-31')), 0) AS ClosureDaysSinceLastAccess,
+        COALESCE(DATEDIFF(day, ISNULL(p.LastEditDate, p.CreationDate), ISNULL(p.ClosedDate, '9999-12-31')), 0) AS ClosureDaysSinceLastEdit,
+        COALESCE(DATEDIFF(day, ISNULL(p.CreationDate, '9999-12-31'), ISNULL(p.ClosedDate, '9999-12-31')), 0) AS ClosureDaysSinceCreation,
+        COALESCE(DATEDIFF(day, p.CreationDate, DATEADD(day, 0, ISNULL(p.AnswerCount, 0))), 0) AS AnswerDays,
+        COALESCE(DATEDIFF(day, p.CreationDate, DATEADD(day, 0, ISNULL(p.FavoriteCount, 0))), 0) AS FavoriteDays,
+        COALESCE(DATEDIFF(day, p.CreationDate, DATEADD(day, 0, ISNULL(p.ViewCount, 0))), 0) AS ViewDays,
+        COALESCE(DATEDIFF(day, p.CreationDate, DATEADD(day, 0, ISNULL(p.CommentCount, 0))), 0) AS CommentDays,
+        COALESCE(DATEDIFF(day, p.CreationDate, DATEADD(day, 0, ISNULL(p.Score, 0))), 0) AS ScoreDays,
+        COALESCE(DATEDIFF(day, p.CreationDate, DATEADD(day, 0, ISNULL(p.OwnerUserId, 0))), 0) AS OwnerUserDays,
+        COALESCE(DATEDIFF(day, p.CreationDate, DATEADD(day, 0, ISNULL(p.LastEditorUserId, 0))), 0) AS LastEditorUserDays,
+        COALESCE(DATEDIFF(day, p.CreationDate, DATEADD(day, 0, ISNULL(p.AcceptedAnswerId, 0))), 0) AS AcceptedAnswerDays,
+        COALESCE(DATEDIFF(day, p.CreationDate, DATEADD(day, 0, ISNULL(p.ParentId, 0))), 0) AS ParentPostDays,
+        COALESCE(DATEDIFF(day, ISNULL(p.CreationDate, '9999-12-31'), ISNULL(p.CommunityOwnedDate, '9999-12-31')), 0) AS CommunityOwnedDays
+    FROM Posts p
+    LEFT JOIN CloseReasonTypes c
+        ON p.ClosedDate IS NOT NULL
+        AND p.ClosedDate = (
+            SELECT ph1.CreationDate 
+            FROM PostHistory ph1
+            WHERE ph1.PostId = p.Id 
+              AND ph1.PostHistoryTypeId = 10
+            ORDER BY ph1.CreationDate
+            LIMIT 1
+        )
+        AND c.Id = (
+            SELECT CAST(ph2.Comment AS INT)
+            FROM PostHistory ph2
+            WHERE ph2.PostId = p.Id
+              AND ph2.PostHistoryTypeId = 10
+            ORDER BY ph2.CreationDate
+            LIMIT 1
+        )
+)
+SELECT 
+    PostId, 
+    PostTypeId, 
+    OwnerUserId,
+    Score, 
+    ViewCount,
+    AnswerCount,
+    CommentCount,
+    FavoriteCount,
+    CommunityOwnedDate,
+    ClosedDate,
+    CloseReason,
+    ClosureDays,
+    AnswerDays,
+    CommunityOwnedDays,
+    ClosureDaysSinceOwnership,
+    ClosureDaysSinceAcceptedAnswer,
+    ClosureDaysSinceLastEdit,
+    ClosureDaysSinceLastActivity,
+    ClosureDaysSinceLastAccess,
+    ClosureDaysSinceLastEdit,
+    ClosureDaysSinceCreation,
+    AnswerDays,
+    FavoriteDays,
+    ViewDays,
+    CommentDays,
+    ScoreDays,
+    OwnerUserDays,
+    LastEditorUserDays,
+    AcceptedAnswerDays,
+    ParentPostDays,
+    CommunityOwnedDays
+FROM cte;

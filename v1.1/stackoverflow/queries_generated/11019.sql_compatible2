@@ -1,0 +1,69 @@
+WITH RecentPosts AS (
+    SELECT 
+        p.Id, 
+        p.Title, 
+        p.CreationDate, 
+        p.Score, 
+        p.ViewCount, 
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName, 
+        u.Reputation,
+        COALESCE(SUM(v.BountyAmount), 0) AS TotalBounty
+    FROM 
+        Posts p
+    INNER JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (8, 9)
+    WHERE 
+        p.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '30' DAY)
+    GROUP BY 
+        p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT 
+        OwnerUserId, 
+        COUNT(Id) AS PostCount, 
+        SUM(Score) AS TotalScore
+    FROM 
+        Posts 
+    WHERE 
+        CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '1' YEAR)
+    GROUP BY 
+        OwnerUserId
+    HAVING 
+        COUNT(Id) > 10
+),
+PostTags AS (
+    SELECT 
+        p.Id,
+        -- normalize tag string like '<tag1><tag2>' into a string list; split into rows for compatibility
+        -- produce one tag per row; tags are extracted by removing leading/trailing '<' '>' and splitting on '><'
+        TRIM(BOTH '<>' FROM p.Tags) AS TagsString
+    FROM 
+        Posts p
+)
+SELECT 
+    rp.Id, 
+    rp.Title, 
+    rp.CreationDate, 
+    rp.Score, 
+    rp.ViewCount, 
+    rp.OwnerDisplayName, 
+    rp.Reputation, 
+    rp.TotalBounty, 
+    pt.TagsString AS Tags,
+    ROW_NUMBER() OVER(PARTITION BY rp.OwnerUserId ORDER BY rp.Score DESC) AS RankByScore,
+    COUNT(*) OVER(PARTITION BY rp.OwnerUserId) AS TotalPostsByUser,
+    SUM(rp.Score) OVER(PARTITION BY rp.OwnerUserId) AS TotalScoreByUser
+FROM 
+    RecentPosts rp
+JOIN 
+    PostTags pt ON rp.Id = pt.Id
+JOIN 
+    TopUsers tu ON rp.OwnerUserId = tu.OwnerUserId
+WHERE 
+    pt.TagsString IS NOT NULL AND pt.TagsString <> ''
+ORDER BY 
+    rp.Score DESC, 
+    rp.ViewCount DESC;

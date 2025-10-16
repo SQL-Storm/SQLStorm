@@ -1,0 +1,199 @@
+-- {"query": "9085.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2013, "output_tokens": 5753} 
+
+WITH user_activity AS (
+    SELECT
+        u.Id                     AS UserId,
+        u.DisplayName,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersGiven,
+        COUNT(c.Id)              AS CommentsMade,
+        MAX(p.CreationDate)      AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p     ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c  ON c.UserId = u.Id
+    WHERE u.CreationDate > NOW() - INTERVAL '5 years'
+    GROUP BY u.Id, u.DisplayName
+),
+recent_votes AS (
+    SELECT
+        v.UserId,
+        COUNT(*) FILTER (WHERE v.CreationDate > NOW() - INTERVAL '30 days') AS VotesLast30d
+    FROM Votes v
+    GROUP BY v.UserId
+),
+badge_rank AS (
+    SELECT
+        b.UserId,
+        COUNT(*) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+all_active AS (
+    SELECT UserId FROM user_activity WHERE QuestionsAsked > 0
+    UNION
+    SELECT UserId FROM recent_votes   WHERE VotesLast30d > 10
+),
+power_users AS (
+    SELECT UserId FROM all_active
+    EXCEPT
+    SELECT UserId FROM badge_rank WHERE TotalBadges < 5
+),
+tag_union AS (
+    SELECT
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS Tag,
+        p.OwnerUserId                                   AS UserId
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+),
+top_tags AS (
+    SELECT
+        Tag,
+        COUNT(*)                            AS UsageCount,
+        RANK() OVER (ORDER BY COUNT(*) DESC) AS TagRank
+    FROM tag_union
+    GROUP BY Tag
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.QuestionsAsked,
+    ua.AnswersGiven,
+    ua.CommentsMade,
+    ua.LastPostDate,
+    COALESCE(rv.VotesLast30d, 0) AS VotesLast30d,
+    COALESCE(br.GoldBadges,  0) AS GoldBadges,
+    COALESCE(br.SilverBadges,0) AS SilverBadges,
+    COALESCE(br.BronzeBadges,0) AS BronzeBadges,
+    RANK() OVER (ORDER BY ua.QuestionsAsked DESC, ua.AnswersGiven DESC) AS ActivityRank,
+    CASE
+        WHEN ua.AnswersGiven > ua.QuestionsAsked THEN 'Responder'
+        WHEN ua.AnswersGiven < ua.QuestionsAsked THEN 'Inquirer'
+        ELSE 'Balanced'
+    END AS UserType,
+    (
+        SELECT COUNT(*)
+        FROM PostLinks pl
+        WHERE pl.PostId IN (
+            SELECT p2.Id FROM Posts p2 WHERE p2.OwnerUserId = ua.UserId
+        )
+    ) AS LinkedPostsCount,
+    (
+        SELECT AVG(p2.Score)::numeric
+        FROM Posts p2
+        WHERE p2.OwnerUserId = ua.UserId
+          AND p2.PostTypeId = 2
+    ) AS AvgAnswerScore,
+    EXISTS (
+        SELECT 1
+        FROM tag_union tu
+        WHERE tu.UserId = ua.UserId
+          AND LOWER(tu.Tag) = 'sql'
+    ) AS HasSQLTag,
+    (pu.UserId IS NOT NULL) AS IsPowerUser,
+    tt.Tag       AS TopTag,
+    tt.UsageCount,
+    POSITION('sql' IN LOWER(ua.DisplayName)) AS SqlInNamePos,
+    COALESCE(NULLIF(ua.DisplayName, ''), '<unknown>') AS NormalizedName
+FROM user_activity ua
+LEFT JOIN recent_votes rv ON rv.UserId = ua.UserId
+LEFT JOIN badge_rank br   ON br.UserId = ua.UserId
+LEFT JOIN power_users pu  ON pu.UserId = ua.UserId
+LEFT JOIN LATERAL (
+    SELECT tu.Tag,
+           COUNT(*) AS UsageCount
+    FROM tag_union tu
+    WHERE tu.UserId = ua.UserId
+    GROUP BY tu.Tag
+    ORDER BY COUNT(*) DESC
+    LIMIT 1
+) tt ON TRUE
+WHERE ua.QuestionsAsked + ua.AnswersGiven > 10
+  AND ua.DisplayName ~ '^[A-M]'
+ORDER BY ActivityRank, ua.LastPostDate DESC
+LIMIT 100
+
+INTERSECT
+
+SELECT
+    UserId,
+    DisplayName,
+    QuestionsAsked,
+    AnswersGiven,
+    CommentsMade,
+    LastPostDate,
+    VotesLast30d,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    ActivityRank,
+    UserType,
+    LinkedPostsCount,
+    AvgAnswerScore,
+    HasSQLTag,
+    IsPowerUser,
+    TopTag,
+    UsageCount,
+    SqlInNamePos,
+    NormalizedName
+FROM (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        ua.CommentsMade,
+        ua.LastPostDate,
+        COALESCE(rv.VotesLast30d, 0) AS VotesLast30d,
+        COALESCE(br.GoldBadges,  0) AS GoldBadges,
+        COALESCE(br.SilverBadges,0) AS SilverBadges,
+        COALESCE(br.BronzeBadges,0) AS BronzeBadges,
+        RANK() OVER (ORDER BY ua.QuestionsAsked DESC, ua.AnswersGiven DESC) AS ActivityRank,
+        CASE
+            WHEN ua.AnswersGiven > ua.QuestionsAsked THEN 'Responder'
+            WHEN ua.AnswersGiven < ua.QuestionsAsked THEN 'Inquirer'
+            ELSE 'Balanced'
+        END AS UserType,
+        (
+            SELECT COUNT(*)
+            FROM PostLinks pl
+            WHERE pl.PostId IN (
+                SELECT p2.Id FROM Posts p2 WHERE p2.OwnerUserId = ua.UserId
+            )
+        ) AS LinkedPostsCount,
+        (
+            SELECT AVG(p2.Score)::numeric
+            FROM Posts p2
+            WHERE p2.OwnerUserId = ua.UserId
+              AND p2.PostTypeId = 2
+        ) AS AvgAnswerScore,
+        EXISTS (
+            SELECT 1
+            FROM tag_union tu
+            WHERE tu.UserId = ua.UserId
+              AND LOWER(tu.Tag) = 'sql'
+        ) AS HasSQLTag,
+        (pu.UserId IS NOT NULL) AS IsPowerUser,
+        tt.Tag       AS TopTag,
+        tt.UsageCount,
+        POSITION('sql' IN LOWER(ua.DisplayName)) AS SqlInNamePos,
+        COALESCE(NULLIF(ua.DisplayName, ''), '<unknown>') AS NormalizedName
+    FROM user_activity ua
+    LEFT JOIN recent_votes rv ON rv.UserId = ua.UserId
+    LEFT JOIN badge_rank br   ON br.UserId = ua.UserId
+    LEFT JOIN power_users pu  ON pu.UserId = ua.UserId
+    LEFT JOIN LATERAL (
+        SELECT tu.Tag,
+               COUNT(*) AS UsageCount
+        FROM tag_union tu
+        WHERE tu.UserId = ua.UserId
+        GROUP BY tu.Tag
+        ORDER BY COUNT(*) DESC
+        LIMIT 1
+    ) tt ON TRUE
+    WHERE ua.QuestionsAsked + ua.AnswersGiven > 50
+) sub
+ORDER BY ActivityRank DESC;

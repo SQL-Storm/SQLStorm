@@ -1,0 +1,144 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id,
+        u.Reputation,
+        u.CreationDate,
+        u.DisplayName,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate)) / 86400.0 AS AccountAgeDays,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount
+    FROM
+        Users u
+    WHERE
+        u.LastAccessDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+        AND u.Reputation > 1000
+        AND u.AboutMe IS NOT NULL
+),
+PostStats AS (
+    SELECT
+        p.OwnerUserId,
+        AVG(p.Score) AS AvgAnswerScore,
+        SUM(CASE WHEN p.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) * 100.0 / COUNT(p.Id) AS PctAcceptedAnswers,
+        AVG(EXTRACT(EPOCH FROM (p.CreationDate - LAG(p.CreationDate, 1, p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate)))) / 3600.0 AS AvgHoursBetweenAnswers,
+        COUNT(DISTINCT regexp_replace(unnest(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')), E'<|>', '', 'g')) AS DistinctTagsAnswered
+    FROM
+        Posts p
+    JOIN
+        Posts q ON p.ParentId = q.Id
+    WHERE
+        p.PostTypeId = 2
+        AND p.OwnerUserId IN (SELECT Id FROM UserActivity)
+        AND p.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 years'
+    GROUP BY
+        p.OwnerUserId
+),
+BadgeAndVoteStats AS (
+    SELECT
+        u.Id AS UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        (
+            SELECT
+                AVG(EXTRACT(EPOCH FROM (v.CreationDate - p_sub.CreationDate)))
+            FROM
+                Votes v
+            JOIN
+                Posts p_sub ON v.PostId = p_sub.Id
+            WHERE
+                v.VoteTypeId = 2
+                AND p_sub.OwnerUserId = u.Id
+                AND v.CreationDate > p_sub.CreationDate
+        ) AS AvgTimeToFirstUpvoteSeconds
+    FROM
+        UserActivity u
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id
+),
+CommunityEngagement AS (
+    SELECT
+        ua.Id AS UserId,
+        COUNT(c.Id) AS TotalComments,
+        SUM(c.Score) AS TotalCommentScore,
+        (
+            SELECT COUNT(*)
+            FROM PostHistory ph
+            WHERE ph.UserId = ua.Id
+            AND ph.PostHistoryTypeId = 10
+            AND ph.Comment ~ '^[0-9]+$'
+        ) AS CloseVotesCast
+    FROM
+        UserActivity ua
+    LEFT JOIN
+        Comments c ON ua.Id = c.UserId
+    GROUP BY
+        ua.Id
+)
+SELECT
+    ua.DisplayName,
+    ua.Reputation,
+    ps.AvgAnswerScore,
+    bvs.GoldBadges,
+    bvs.SilverBadges,
+    ce.CloseVotesCast,
+    ps.PctAcceptedAnswers,
+    ps.AvgHoursBetweenAnswers,
+    (
+        LOG(ua.Reputation) * 100 +
+        COALESCE(ps.AvgAnswerScore, 0) * 5 +
+        COALESCE(ps.PctAcceptedAnswers, 0) * 10 +
+        COALESCE(bvs.GoldBadges,0) * 100 +
+        COALESCE(bvs.SilverBadges,0) * 20 +
+        COALESCE(ce.CloseVotesCast,0) * 2 -
+        COALESCE(ps.AvgHoursBetweenAnswers, ua.AccountAgeDays * 24) / 100 -
+        COALESCE(bvs.AvgTimeToFirstUpvoteSeconds, 3600*24) / 3600
+    ) AS PowerScore,
+    DENSE_RANK() OVER (ORDER BY (
+        LOG(ua.Reputation) * 100 +
+        COALESCE(ps.AvgAnswerScore, 0) * 5 +
+        COALESCE(ps.PctAcceptedAnswers, 0) * 10 +
+        COALESCE(bvs.GoldBadges,0) * 100 +
+        COALESCE(bvs.SilverBadges,0) * 20 +
+        COALESCE(ce.CloseVotesCast,0) * 2 -
+        COALESCE(ps.AvgHoursBetweenAnswers, ua.AccountAgeDays * 24) / 100 -
+        COALESCE(bvs.AvgTimeToFirstUpvoteSeconds, 3600*24) / 3600
+    ) DESC) AS UserRank,
+    CASE
+        WHEN ps.PctAcceptedAnswers > 50 AND COALESCE(bvs.GoldBadges,0) > 5 THEN 'Guru'
+        WHEN COALESCE(ps.AvgAnswerScore,0) > 10 OR COALESCE(ce.CloseVotesCast,0) > 100 THEN 'Expert'
+        WHEN ua.AnswerCount > ua.QuestionCount THEN 'Answerer'
+        ELSE 'Contributor'
+    END AS UserCategory,
+    REVERSE(SUBSTRING(REVERSE((SELECT c2.Text FROM Comments c2 WHERE c2.UserId = ua.Id ORDER BY c2.CreationDate DESC LIMIT 1)), 1, 50)) AS LastCommentSnippet
+FROM
+    UserActivity ua
+LEFT JOIN
+    PostStats ps ON ua.Id = ps.OwnerUserId
+LEFT JOIN
+    BadgeAndVoteStats bvs ON ua.Id = bvs.UserId
+LEFT JOIN
+    CommunityEngagement ce ON ua.Id = ce.UserId
+WHERE
+    ua.AnswerCount > 10 AND (COALESCE(ps.AvgAnswerScore,0) > 2 OR COALESCE(bvs.GoldBadges,0) > 0)
+
+UNION ALL
+
+SELECT
+    '-- Community Baseline --' AS DisplayName,
+    (SELECT AVG(Reputation) FROM Users) AS Reputation,
+    (SELECT AVG(Score) FROM Posts WHERE PostTypeId=2) AS AvgAnswerScore,
+    0 AS GoldBadges,
+    0 AS SilverBadges,
+    0 AS CloseVotesCast,
+    0 AS PctAcceptedAnswers,
+    NULL AS AvgHoursBetweenAnswers,
+    0 AS PowerScore,
+    99999 AS UserRank,
+    'Baseline' AS UserCategory,
+    NULL AS LastCommentSnippet
+
+ORDER BY
+    UserRank, PowerScore DESC
+LIMIT 100;

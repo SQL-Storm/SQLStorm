@@ -1,0 +1,181 @@
+-- {"query": "4022.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1683} 
+with RecursiveTagCounts as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        t.Count,
+        p.Id as QuestionId,
+        p.CreationDate,
+        u.Id as OwnerUserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        ph.PostHistoryTypeId,
+        ph.CreationDate as HistoryChangeDate,
+        ph.UserId as EditorUserId,
+        ph.UserDisplayName as EditorDisplayName
+    from Tags t
+    join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+    left join Users u on u.Id = p.OwnerUserId
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId in (4,5,6)
+    where p.CreationDate >= current_date - interval '365 days'
+    union all
+    select
+        rtc.TagId,
+        rtc.TagName,
+        rtc.Count,
+        p2.Id,
+        p2.CreationDate,
+        u2.Id,
+        u2.DisplayName,
+        u2.Reputation,
+        u2.Location,
+        ph2.PostHistoryTypeId,
+        ph2.CreationDate,
+        ph2.UserId,
+        ph2.UserDisplayName
+    from RecursiveTagCounts rtc
+    join PostLinks pl on pl.PostId = rtc.QuestionId and pl.LinkTypeId = 1 -- linked posts
+    join Posts p2 on p2.Id = pl.RelatedPostId and p2.PostTypeId = 1
+    left join Users u2 on u2.Id = p2.OwnerUserId
+    left join PostHistory ph2 on ph2.PostId = p2.Id and ph2.PostHistoryTypeId in (4,5,6)
+    where p2.CreationDate > rtc.CreationDate
+),
+LatestUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        max(p.CreationDate) over (partition by u.Id) as LastPostDate,
+        max(c.CreationDate) over (partition by u.Id) as LastCommentDate,
+        max(ph.CreationDate) over (partition by u.Id) as LastEditDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id
+),
+RankedPostsByScore AS (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName as OwnerDisplayName,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate desc) as PostRanking
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1 and p.Score >= 0
+),
+AnswerStatsByQuestion as (
+    select
+        q.Id as QuestionId,
+        count(a.Id) as TotalAnswers,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        min(a.Score) as MinAnswerScore,
+        count(distinct a.OwnerUserId) as DistinctAnswerers
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id
+),
+ClosedQuestionsWithReasons as (
+    select
+        p.Id,
+        p.Title,
+        p.ClosedDate,
+        ph.Comment as CloseReasonId,
+        crt.Name as CloseReasonName,
+        p.OwnerUserId,
+        u.DisplayName as OwnerDisplayName
+    from Posts p
+    join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    join CloseReasonTypes crt on crt.Id = try_cast(ph.Comment as smallint)
+    left join Users u on u.Id = p.OwnerUserId
+    where p.ClosedDate is not null
+),
+UserBadgeSummary as (
+    select
+        b.UserId,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        count(distinct b.Name) as DistinctBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+UserVotesSummary as (
+    select
+        v.UserId,
+        count(*) filter (where v.VoteTypeId = 2) as UpVotesCast,
+        count(*) filter (where v.VoteTypeId = 3) as DownVotesCast,
+        count(*) filter (where v.VoteTypeId = 5) as FavoritesCast,
+        count(distinct v.PostId) as VotedPostsCount
+    from Votes v
+    group by v.UserId
+)
+select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    u.Views,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.DistinctBadges,
+    us.LastBadgeDate,
+    uv.UpVotesCast,
+    uv.DownVotesCast,
+    uv.FavoritesCast,
+    uv.VotedPostsCount,
+    (select count(*) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1 and p.CreationDate >= current_date - interval '1 year') as QuestionsLastYear,
+    (select count(*) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 2 and p.Score > 5) as HighScoreAnswers,
+    (select avg(score) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId=1) as AvgQuestionScore,
+    (select count(distinct p.Tags) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1) as DistinctTagSetsUsed,
+    lag(u.Reputation) over (order by u.Reputation) as PrevUserReputation,
+    lead(u.Reputation) over (order by u.Reputation) as NextUserReputation,
+    rs.TotalAnswers,
+    rs.AvgAnswerScore,
+    rs.MaxAnswerScore,
+    rs.MinAnswerScore,
+    rs.DistinctAnswerers,
+    cp.Title as RecentlyClosedQuestionTitle,
+    cp.CloseReasonName,
+    cp.ClosedDate
+from Users u
+left join UserBadgeSummary us on us.UserId = u.Id
+left join UserVotesSummary uv on uv.UserId = u.Id
+left join (
+    select
+        q.OwnerUserId,
+        q.Id,
+        a.TotalAnswers,
+        a.AvgAnswerScore,
+        a.MaxAnswerScore,
+        a.MinAnswerScore,
+        a.DistinctAnswerers
+    from Posts q
+    left join AnswerStatsByQuestion a on q.Id = a.QuestionId
+    where q.PostTypeId = 1
+) rs on rs.OwnerUserId = u.Id
+left join LATERAL (
+    select cp2.Title, cp2.ClosedDate, crt.Name as CloseReasonName
+    from Posts cp2
+    join PostHistory ph2 on ph2.PostId = cp2.Id and ph2.PostHistoryTypeId = 10
+    join CloseReasonTypes crt on crt.Id = try_cast(ph2.Comment as smallint)
+    where cp2.OwnerUserId = u.Id and cp2.ClosedDate is not null
+    order by cp2.ClosedDate desc
+    limit 1
+) cp on true
+where u.Reputation > 100
+order by u.Reputation desc
+limit 100;

@@ -1,0 +1,53 @@
+-- {"query": "2040.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4o", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 458} 
+
+WITH RecentUsers AS (
+    SELECT U.Id, U.DisplayName, U.Reputation, U.CreationDate
+    FROM Users U
+    WHERE U.CreationDate >= NOW() - INTERVAL '1 year'
+),
+HighReputationUsers AS (
+    SELECT Id, DisplayName, Reputation
+    FROM RecentUsers
+    WHERE Reputation > 1000
+),
+TopVotedAnswers AS (
+    SELECT P.Id, Title, MAX(VoteCount) AS MaxVotes
+    FROM Posts P
+    JOIN (
+        SELECT PostId, COUNT(*) AS VoteCount
+        FROM Votes
+        WHERE VoteTypeId = 2
+        GROUP BY PostId
+    ) V ON P.Id = V.PostId
+    WHERE P.PostTypeId = 2
+    GROUP BY P.Id, Title
+),
+TopQuestions AS (
+    SELECT P.Id, P.Title, P.Score, U.DisplayName
+    FROM Posts P
+    LEFT JOIN Users U ON P.OwnerUserId = U.Id
+    WHERE P.PostTypeId = 1 AND P.Score > 10
+    ORDER BY P.Score DESC
+),
+UserBadgeCounts AS (
+    SELECT B.UserId, COUNT(*) AS BadgeCount
+    FROM Badges B
+    GROUP BY B.UserId
+),
+ComplexQuery AS (
+    SELECT H.DisplayName AS UserName, H.Reputation, T.Title AS QuestionTitle,
+           T.Score AS QuestionScore, COALESCE(BadgeCount, 0) AS NumBadges,
+           Levenshtein(lower(T.Title), lower(A.Title)) AS TitleSimilarity
+    FROM HighReputationUsers H
+    JOIN TopQuestions T ON H.Id = T.OwnerUserId
+    LEFT JOIN UserBadgeCounts BC ON H.Id = BC.UserId
+    CROSS JOIN TopVotedAnswers A
+    WHERE T.OwnerUserId IN (SELECT Id FROM RecentUsers)
+      AND H.Reputation > 1.5 * (SELECT AVG(Reputation) FROM Users)
+)
+SELECT UserName, QuestionTitle, QuestionScore, NumBadges, TitleSimilarity
+FROM ComplexQuery
+WHERE NumBadges > 5
+  AND TitleSimilarity < 10
+ORDER BY QuestionScore DESC, NumBadges ASC
+LIMIT 50;

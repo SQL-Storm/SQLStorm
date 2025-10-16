@@ -1,0 +1,52 @@
+WITH UserActivity AS (
+    SELECT 
+        U.Id AS UserId,
+        U.DisplayName,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswersProvided,
+        SUM(CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedAnswers,
+        SUM(P.Score) AS TotalScore,
+        AVG(P.Score) OVER (PARTITION BY U.Id ORDER BY P.CreationDate RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningAvgScore,
+        MAX(P.CreationDate) AS LastActivityDate
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    WHERE U.Reputation > 1000
+    GROUP BY U.Id, U.DisplayName, AVG(P.Score) OVER (PARTITION BY U.Id ORDER BY P.CreationDate RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), U.Id, U.DisplayName, U.Id, MAX(P.CreationDate)
+),
+TopTags AS (
+    SELECT 
+        T.TagName,
+        COUNT(*) AS PostCount,
+        ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC) AS TagRank
+    FROM Posts P
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(P.Tags FROM 2 FOR char_length(P.Tags)-2), '><')) AS TagArray
+    ) AS ta
+    JOIN Tags T ON T.TagName = ta.TagArray
+    WHERE P.PostTypeId = 1
+    GROUP BY T.TagName
+)
+SELECT 
+    UA.UserId,
+    UA.DisplayName,
+    UA.QuestionsAsked,
+    UA.AnswersProvided,
+    UA.AcceptedAnswers,
+    UA.TotalScore,
+    UA.RunningAvgScore,
+    TT.TagName AS MostCommonTag,
+    TT.PostCount,
+    CASE 
+        WHEN UA.QuestionsAsked > 0 THEN (CAST(UA.AcceptedAnswers AS DOUBLE PRECISION) / UA.QuestionsAsked) * 100
+        ELSE NULL 
+    END AS AcceptanceRate,
+    COALESCE((SELECT MAX(B.Date) FROM Badges B WHERE B.UserId = UA.UserId AND B.Class = 1), DATE '1900-01-01') AS LastGoldBadgeDate
+FROM UserActivity UA
+LEFT JOIN LATERAL (
+    SELECT TagName, PostCount 
+    FROM TopTags 
+    WHERE TagRank = 1
+) TT ON TRUE
+WHERE UA.LastActivityDate > (DATE '2024-10-01' - INTERVAL '6 months')
+ORDER BY UA.TotalScore DESC, UA.LastActivityDate ASC
+LIMIT 100;

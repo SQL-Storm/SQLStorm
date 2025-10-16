@@ -1,0 +1,209 @@
+-- {"query": "346.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 17672} 
+WITH RECURSIVE
+questions AS (
+  SELECT p.Id, p.Title, p.Tags, p.CreationDate, COALESCE(p.Score,0) AS Score, COALESCE(p.ViewCount,0) AS ViewCount, COALESCE(p.AnswerCount,0) AS AnswerCount, p.OwnerUserId, p.AcceptedAnswerId, p.LastActivityDate
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+answers AS (
+  SELECT p.Id, p.ParentId, COALESCE(p.Score,0) AS Score, p.CreationDate, p.OwnerUserId
+  FROM Posts p
+  WHERE p.PostTypeId = 2
+),
+tags_expanded AS (
+  SELECT q.Id AS question_id, trim(t.tag) AS tag
+  FROM questions q
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(q.Tags, 2, GREATEST(length(q.Tags)-2,0)), '><')) AS tag
+  ) t
+  WHERE q.Tags IS NOT NULL AND q.Tags <> '' AND trim(t.tag) <> ''
+),
+tag_pair_counts AS (
+  SELECT te1.tag AS tag1, te2.tag AS tag2, COUNT(DISTINCT te1.question_id) AS cooccurrence
+  FROM tags_expanded te1
+  JOIN tags_expanded te2 ON te1.question_id = te2.question_id AND te1.tag < te2.tag
+  GROUP BY te1.tag, te2.tag
+),
+votes_by_post AS (
+  SELECT v.PostId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+    SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS favorites,
+    COUNT(*) AS total_votes,
+    MAX(v.CreationDate) AS last_vote_date
+  FROM Votes v
+  GROUP BY v.PostId
+),
+badges_by_user AS (
+  SELECT b.UserId,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze,
+    SUM(CASE WHEN b.TagBased = B'1' THEN 1 ELSE 0 END) AS tagbased
+  FROM Badges b
+  GROUP BY b.UserId
+),
+recent_counts AS (
+  SELECT q.Id AS id,
+    SUM(CASE WHEN ph.CreationDate >= now() - interval '30 days' THEN 1 ELSE 0 END) AS edits_last_30,
+    SUM(CASE WHEN c.CreationDate >= now() - interval '30 days' THEN 1 ELSE 0 END) AS comments_last_30,
+    SUM(CASE WHEN v.CreationDate >= now() - interval '30 days' THEN 1 ELSE 0 END) AS votes_last_30
+  FROM questions q
+  LEFT JOIN PostHistory ph ON ph.PostId = q.Id
+  LEFT JOIN Comments c ON c.PostId = q.Id
+  LEFT JOIN Votes v ON v.PostId = q.Id
+  GROUP BY q.Id
+),
+top_answer_rank AS (
+  SELECT a.ParentId AS question_id, a.Id AS answer_id, a.Score, a.CreationDate,
+    ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC NULLS LAST) AS rn,
+    RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC) AS rnk
+  FROM answers a
+),
+accepted_mismatch AS (
+  SELECT q.Id AS question_id, q.Title, q.AcceptedAnswerId,
+    ta.answer_id AS top_answer_id,
+    (SELECT u.DisplayName FROM Users u WHERE u.Id = q.OwnerUserId) AS question_owner,
+    (SELECT u.DisplayName FROM Users u WHERE u.Id = (SELECT OwnerUserId FROM Posts WHERE Id = q.AcceptedAnswerId)) AS accepted_owner,
+    (SELECT u.DisplayName FROM Users u WHERE u.Id = (SELECT OwnerUserId FROM Posts WHERE Id = ta.answer_id)) AS top_owner,
+    COALESCE((SELECT Score FROM Posts WHERE Id = q.AcceptedAnswerId), -9999) AS accepted_score,
+    COALESCE((SELECT Score FROM Posts WHERE Id = ta.answer_id), -9999) AS top_score,
+    (COALESCE((SELECT Score FROM Posts WHERE Id = ta.answer_id),0) - COALESCE((SELECT Score FROM Posts WHERE Id = q.AcceptedAnswerId),0)) AS score_delta
+  FROM questions q
+  JOIN top_answer_rank ta ON ta.question_id = q.Id AND ta.rn = 1
+  WHERE q.AcceptedAnswerId IS NOT NULL AND q.AcceptedAnswerId <> ta.answer_id
+),
+user_contrib AS (
+  SELECT u.Id AS user_id, u.DisplayName,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS questions,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS answers,
+    COALESCE(SUM(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)),0) AS total_post_score,
+    COALESCE(SUM(v.upvotes),0) AS total_upvotes_on_posts,
+    COALESCE(b.gold,0) AS gold_badges,
+    COALESCE(b.silver,0) AS silver_badges,
+    COALESCE(b.bronze,0) AS bronze_badges,
+    CASE WHEN u.Reputation > 0 THEN COALESCE(SUM(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)),0)::numeric / NULLIF(u.Reputation,0) ELSE NULL END AS score_per_rep
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN votes_by_post v ON v.PostId = p.Id
+  LEFT JOIN badges_by_user b ON b.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, b.gold, b.silver, b.bronze
+),
+top_rep_and_badge AS (
+  SELECT Id FROM Users WHERE Reputation >= 5000
+  INTERSECT
+  SELECT UserId FROM badges_by_user WHERE gold >= 1
+),
+question_composite AS (
+  SELECT q.Id AS question_id, q.Title,
+    q.OwnerUserId,
+    q.CreationDate,
+    q.Score AS raw_score,
+    q.ViewCount,
+    COALESCE(v.upvotes,0) AS upvotes,
+    COALESCE(v.downvotes,0) AS downvotes,
+    COALESCE(r.edits_last_30,0) AS edits_last_30,
+    COALESCE(r.comments_last_30,0) AS comments_last_30,
+    COALESCE(r.votes_last_30,0) AS votes_last_30,
+    COALESCE(b.gold,0) AS owner_gold,
+    COALESCE(b.silver,0) AS owner_silver,
+    COALESCE(b.bronze,0) AS owner_bronze,
+    EXTRACT(epoch FROM now() - q.CreationDate)/86400.0 AS age_days,
+    EXP(-GREATEST(EXTRACT(epoch FROM now() - q.CreationDate)/86400.0,0)/365.0) AS decay_year,
+    ((COALESCE(v.upvotes,0) * 2.5 - COALESCE(v.downvotes,0) * 1.5) + q.Score + COALESCE(q.AnswerCount,0) * 2 + (COALESCE(b.gold,0) * 10 + COALESCE(b.silver,0) * 3 + COALESCE(b.bronze,0) * 1)) * EXP(-GREATEST(EXTRACT(epoch FROM now() - q.CreationDate)/86400.0,0)/365.0) AS composite_score
+  FROM questions q
+  LEFT JOIN votes_by_post v ON v.PostId = q.Id
+  LEFT JOIN recent_counts r ON r.id = q.Id
+  LEFT JOIN badges_by_user b ON b.UserId = q.OwnerUserId
+),
+tag_trend AS (
+  SELECT te.tag,
+    COUNT(*) FILTER (WHERE q.CreationDate >= now() - interval '30 days') AS new_questions_30,
+    COUNT(*) FILTER (WHERE q.CreationDate >= now() - interval '365 days') AS new_questions_365,
+    COUNT(*) AS all_questions
+  FROM tags_expanded te
+  JOIN questions q ON q.Id = te.question_id
+  GROUP BY te.tag
+),
+top_tags AS (
+  SELECT tag, new_questions_30, new_questions_365, all_questions,
+    CASE WHEN all_questions = 0 THEN 0 ELSE new_questions_30::numeric / NULLIF(all_questions,0) END AS growth_ratio
+  FROM tag_trend
+  ORDER BY growth_ratio DESC NULLS LAST
+  LIMIT 50
+),
+tag_network AS (
+  SELECT tp.tag1, tp.tag2, tp.cooccurrence
+  FROM tag_pair_counts tp
+  WHERE tp.tag1 IN (SELECT tag FROM top_tags) OR tp.tag2 IN (SELECT tag FROM top_tags)
+  ORDER BY tp.cooccurrence DESC
+  LIMIT 200
+),
+expand AS (
+  SELECT t.tag AS seed, t.tag AS tag, 0 AS depth, ARRAY[t.tag] AS path FROM top_tags t
+  UNION ALL
+  SELECT e.seed, CASE WHEN tp.tag1 = e.tag THEN tp.tag2 ELSE tp.tag1 END AS tag, e.depth + 1, e.path || CASE WHEN tp.tag1 = e.tag THEN tp.tag2 ELSE tp.tag1 END
+  FROM expand e
+  JOIN tag_pair_counts tp ON tp.tag1 = e.tag OR tp.tag2 = e.tag
+  WHERE NOT (CASE WHEN tp.tag1 = e.tag THEN tp.tag2 ELSE tp.tag1 END = ANY(e.path))
+    AND e.depth < 3
+),
+recursive_tag_map AS (
+  SELECT * FROM expand
+),
+top_questions AS (
+  SELECT 'question'::text AS category,
+    qc.question_id::int AS entity_id,
+    left(qc.Title,200)::text AS label,
+    qc.composite_score::numeric AS score,
+    (qc.age_days)::text AS a1,
+    qc.upvotes::text AS a2,
+    qc.downvotes::text AS a3,
+    qc.ViewCount::text AS a4,
+    COALESCE((SELECT STRING_AGG(DISTINCT te.tag, ', ') FROM tags_expanded te WHERE te.question_id = qc.question_id), '')::text AS a5,
+    COALESCE((SELECT MAX(tp.cooccurrence) FROM tag_pair_counts tp JOIN tags_expanded te ON (tp.tag1 = te.tag OR tp.tag2 = te.tag) WHERE te.question_id = qc.question_id),0)::text AS a6
+  FROM question_composite qc
+  ORDER BY qc.composite_score DESC NULLS LAST
+  LIMIT 50
+),
+top_users AS (
+  SELECT 'user'::text AS category,
+    uc.user_id::int AS entity_id,
+    left(uc.DisplayName,200)::text AS label,
+    uc.total_post_score::numeric AS score,
+    uc.questions::text AS a1,
+    uc.answers::text AS a2,
+    uc.total_upvotes_on_posts::text AS a3,
+    (uc.gold_badges * 10 + uc.silver_badges * 3 + uc.bronze_badges)::text AS a4,
+    COALESCE((CASE WHEN uc.score_per_rep IS NOT NULL THEN TO_CHAR(uc.score_per_rep,'FM9999990.000') ELSE NULL END),'')::text AS a5,
+    (CASE WHEN uc.user_id IN (SELECT Id FROM top_rep_and_badge) THEN 'rep+gold' ELSE '' END)::text AS a6
+  FROM user_contrib uc
+  WHERE (uc.questions + uc.answers) > 0
+  ORDER BY uc.total_post_score DESC NULLS LAST
+  LIMIT 50
+),
+accept_mismatch_top AS (
+  SELECT 'mismatch'::text AS category,
+    am.question_id::int AS entity_id,
+    left(am.title,200)::text AS label,
+    am.score_delta::numeric AS score,
+    am.accepted_score::text AS a1,
+    am.top_score::text AS a2,
+    COALESCE(am.question_owner,'')::text AS a3,
+    COALESCE(am.accepted_owner,'')::text AS a4,
+    COALESCE(am.top_owner,'')::text AS a5,
+    ''::text AS a6
+  FROM accepted_mismatch am
+  ORDER BY am.score_delta DESC NULLS LAST
+  LIMIT 50
+)
+SELECT category, entity_id, label, score, a1, a2, a3, a4, a5, a6
+FROM (
+  SELECT * FROM top_questions
+  UNION ALL
+  SELECT * FROM top_users
+  UNION ALL
+  SELECT * FROM accept_mismatch_top
+) t
+ORDER BY score DESC NULLS LAST
+LIMIT 200;

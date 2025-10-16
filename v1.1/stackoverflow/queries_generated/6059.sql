@@ -1,0 +1,30 @@
+-- {"query": "6059.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 424} 
+SELECT
+  u.Id AS UserId,
+  u.DisplayName AS UserName,
+  u.Reputation,
+  COUNT(DISTINCT p.Id) AS PostCount,
+  AVG(p.Score) AS AvgPostScore,
+  SUM(CASE WHEN v.VoteTypeId = 6 THEN 1 ELSE 0 END) AS CloseVotesCast,
+  SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpModVotes,
+  SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownModVotes,
+  MAX(p.CreationDate) AS LastPostDate,
+  STRING_AGG(CASE
+               WHEN p.PostTypeId = 1 THEN p.Title
+               ELSE NULL
+             END, ', ' ORDER BY p.CreationDate DESC) FILTER (WHERE p.Title IS NOT NULL) AS RecentQuestionTitles,
+  COUNT(DISTINCT cl.Id) AS ClosedCounts,
+  MAX(p.LastActivityDate) FILTER (WHERE p.LastActivityDate IS NOT NULL) AS LastActivityDate
+FROM Users u
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN Votes v ON v.PostId = p.Id
+LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+LEFT JOIN PostHistory cl ON cl.PostId = p.Id AND cl.PostHistoryTypeId = 10
+LEFT JOIN CloseReasonTypes cr ON cr.Id = CAST(ph.Comment AS VARCHAR(10)) -- placeholder join to illustrate complex predicate
+WHERE u.Reputation > 1000
+  AND (p.PostTypeId = 1 OR p.PostTypeId IS NULL)
+  AND (p.CreationDate < NOW() - INTERVAL '7 days' OR p.CreationDate IS NULL)
+GROUP BY u.Id, u.DisplayName, u.Reputation
+HAVING COUNT(DISTINCT p.Id) > 0
+ORDER BY AVG(p.Score) DESC, u.Reputation DESC
+LIMIT 100;

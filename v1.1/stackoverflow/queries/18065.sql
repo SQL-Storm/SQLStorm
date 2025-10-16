@@ -1,0 +1,191 @@
+WITH RankedUserPosts AS (
+    SELECT
+        p.OwnerUserId,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+),
+UserPostAggregates AS (
+    SELECT
+        rup.OwnerUserId,
+        COUNT(rup.PostId) AS TotalPosts,
+        SUM(CASE WHEN rup.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN rup.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(rup.PostScore) AS AveragePostScore,
+        MAX(rup.PostScore) AS MaxPostScore,
+        AVG(rup.PostViewCount) AS AveragePostViewCount,
+        SUM(rup.AnswerCount) AS TotalAnswersReceived,
+        AVG(rup.CommentCount) AS AverageCommentCount
+    FROM RankedUserPosts rup
+    GROUP BY rup.OwnerUserId
+),
+RecentActivity AS (
+    SELECT
+        u.Id AS UserId,
+        MAX(u.LastAccessDate) AS LastAccess,
+        MAX(p.LastActivityDate) AS LastPostActivity
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year')
+    GROUP BY u.Id
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+HighReputationUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        ra.LastAccess,
+        ra.LastPostActivity,
+        COALESCE(ubc.GoldBadges, 0) AS GoldBadges,
+        COALESCE(ubc.SilverBadges, 0) AS SilverBadges,
+        COALESCE(ubc.BronzeBadges, 0) AS BronzeBadges,
+        upa.TotalPosts,
+        upa.QuestionCount,
+        upa.AnswerCount,
+        upa.AveragePostScore,
+        upa.MaxPostScore,
+        upa.AveragePostViewCount,
+        upa.TotalAnswersReceived,
+        upa.AverageCommentCount
+    FROM Users u
+    LEFT JOIN RecentActivity ra ON u.Id = ra.UserId
+    LEFT JOIN UserPostAggregates upa ON u.Id = upa.OwnerUserId
+    LEFT JOIN UserBadgeCounts ubc ON u.Id = ubc.UserId
+    WHERE u.Reputation > 10000 AND u.Id IS NOT NULL AND u.Id > 0
+),
+TopQuestions AS (
+    SELECT
+        Id,
+        Title,
+        OwnerUserId,
+        Score,
+        AnswerCount,
+        FavoriteCount,
+        CreationDate
+    FROM Posts
+    WHERE PostTypeId = 1 AND Score > 100 AND AnswerCount > 0
+),
+QuestionEngagement AS (
+    SELECT
+        tq.Id AS QuestionId,
+        tq.Title,
+        tq.OwnerUserId,
+        tq.Score AS QuestionScore,
+        tq.AnswerCount AS AnswersToQuestion,
+        tq.FavoriteCount AS FavoritesForQuestion,
+        tq.CreationDate AS QuestionCreationDate,
+        COALESCE(COUNT(c.Id), 0) AS CommentsOnQuestion,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpvotesOnQuestion,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownvotesOnQuestion
+    FROM TopQuestions tq
+    LEFT JOIN Comments c ON tq.Id = c.PostId
+    LEFT JOIN Votes v ON tq.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    GROUP BY
+        tq.Id,
+        tq.Title,
+        tq.OwnerUserId,
+        tq.Score,
+        tq.AnswerCount,
+        tq.FavoriteCount,
+        tq.CreationDate
+)
+SELECT
+    hru.DisplayName AS UserName,
+    hru.Reputation,
+    hru.Views AS UserViews,
+    hru.UserUpVotes,
+    hru.UserDownVotes,
+    hru.LastAccess,
+    hru.LastPostActivity,
+    hru.GoldBadges,
+    hru.SilverBadges,
+    hru.BronzeBadges,
+    hru.TotalPosts,
+    hru.QuestionCount,
+    hru.AnswerCount AS UserAnswerCount,
+    hru.AveragePostScore,
+    hru.MaxPostScore,
+    hru.AveragePostViewCount,
+    hru.TotalAnswersReceived,
+    hru.AverageCommentCount,
+    qe.Title AS TopQuestionTitle,
+    qe.QuestionScore,
+    qe.AnswersToQuestion,
+    qe.FavoritesForQuestion,
+    qe.CommentsOnQuestion,
+    qe.UpvotesOnQuestion,
+    qe.DownvotesOnQuestion,
+    CASE
+        WHEN hru.Reputation > 100000 THEN 'Elite'
+        WHEN hru.Reputation > 50000 THEN 'Expert'
+        WHEN hru.Reputation > 10000 THEN 'Experienced'
+        ELSE 'Novice'
+    END AS ReputationTier,
+    EXTRACT(YEAR FROM AGE(TIMESTAMP '2024-10-01 12:34:56', hru.LastAccess)) AS YearsSinceLastAccess,
+    CASE
+        WHEN qe.QuestionScore IS NULL OR qe.AnswersToQuestion = 0 THEN 0
+        ELSE CAST(qe.AnswersToQuestion AS DOUBLE PRECISION) / NULLIF(qe.QuestionScore, 0)
+    END AS AnswerToScoreRatio,
+    SUBSTRING(hru.DisplayName FROM 1 FOR 3) || '...' AS DisplayNamePrefix,
+    CASE WHEN hru.GoldBadges > 0 AND hru.SilverBadges > 0 AND hru.BronzeBadges > 0 THEN 'WellRounded' ELSE 'Specialized' END AS BadgeProfileType,
+    hru.Id AS HruId,
+    qe.OwnerUserId AS QeOwnerUserId,
+    qe.QuestionId
+FROM HighReputationUsers hru
+FULL OUTER JOIN QuestionEngagement qe
+    ON hru.Id = qe.OwnerUserId
+WHERE hru.Reputation IS NOT NULL AND qe.QuestionId IS NOT NULL
+GROUP BY
+    hru.DisplayName,
+    hru.Reputation,
+    hru.Views,
+    hru.UserUpVotes,
+    hru.UserDownVotes,
+    hru.LastAccess,
+    hru.LastPostActivity,
+    hru.GoldBadges,
+    hru.SilverBadges,
+    hru.BronzeBadges,
+    hru.TotalPosts,
+    hru.QuestionCount,
+    hru.AnswerCount,
+    hru.AveragePostScore,
+    hru.MaxPostScore,
+    hru.AveragePostViewCount,
+    hru.TotalAnswersReceived,
+    hru.AverageCommentCount,
+    qe.Title,
+    qe.QuestionScore,
+    qe.AnswersToQuestion,
+    qe.FavoritesForQuestion,
+    qe.CommentsOnQuestion,
+    qe.UpvotesOnQuestion,
+    qe.DownvotesOnQuestion,
+    hru.Reputation,
+    hru.LastAccess,
+    hru.DisplayName,
+    hru.Id,
+    qe.OwnerUserId,
+    qe.QuestionId
+ORDER BY hru.Reputation DESC, qe.QuestionScore DESC
+LIMIT 100;

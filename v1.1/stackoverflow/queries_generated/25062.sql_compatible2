@@ -1,0 +1,120 @@
+WITH UserPostStats AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1)               AS QuestionCount,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2)               AS AnswerCount,
+        SUM(p.Score)                                          AS TotalScore,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1)           AS AvgQuestionScore,
+        MAX(p.CreationDate)                                   AS LastPostDate
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserBadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(*)                                                     AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)                AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END)                AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END)                AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserTagUsage AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS Tag,
+        COUNT(*)                                                        AS TagUsage
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId, UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><'))
+),
+UserTopTag AS (
+    SELECT 
+        ut.UserId,
+        ut.Tag,
+        ut.TagUsage,
+        ROW_NUMBER() OVER (PARTITION BY ut.UserId ORDER BY ut.TagUsage DESC, ut.Tag) AS rn
+    FROM UserTagUsage ut
+),
+RecentVotes AS (
+    SELECT 
+        v.PostId,
+        MAX(v.CreationDate)                                        AS LastVoteDate,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)          AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)          AS DownVotes
+    FROM Votes v
+    WHERE v.CreationDate >= DATE '2024-10-01' - INTERVAL '30 days'
+    GROUP BY v.PostId
+)
+SELECT 
+    u.Id                                         AS UserId,
+    COALESCE(u.DisplayName, 'Anonymous')        AS DisplayName,
+    u.Reputation,
+    COALESCE(ps.QuestionCount,0)                AS QuestionCount,
+    COALESCE(ps.AnswerCount,0)                  AS AnswerCount,
+    COALESCE(ps.TotalScore,0)                   AS TotalScore,
+    COALESCE(ps.AvgQuestionScore,0)             AS AvgQuestionScore,
+    COALESCE(bs.TotalBadges,0)                  AS TotalBadges,
+    COALESCE(bs.GoldBadges,0)                   AS GoldBadges,
+    COALESCE(bs.SilverBadges,0)                 AS SilverBadges,
+    COALESCE(bs.BronzeBadges,0)                 AS BronzeBadges,
+    tt.Tag                                      AS TopTag,
+    tt.TagUsage                                 AS TopTagUsage,
+    CASE 
+        WHEN u.LastAccessDate > DATE '2024-10-01' - INTERVAL '7 days'  THEN 'Active'
+        WHEN u.LastAccessDate > DATE '2024-10-01' - INTERVAL '30 days' THEN 'Semi-Active'
+        ELSE 'Inactive' 
+    END                                         AS ActivityLevel,
+    ARRAY_REMOVE(ARRAY_AGG(DISTINCT v.PostId), NULL) AS RecentVotedPostIds,
+    MAX(rv.LastVoteDate)                       AS LastVoteOnAnyPost
+FROM Users u
+LEFT JOIN UserPostStats ps      ON ps.UserId = u.Id
+LEFT JOIN UserBadgeStats bs     ON bs.UserId = u.Id
+LEFT JOIN UserTopTag tt         ON tt.UserId = u.Id AND tt.rn = 1
+LEFT JOIN RecentVotes rv        ON rv.PostId IN (
+                                        SELECT p.Id FROM Posts p WHERE p.OwnerUserId = u.Id
+                                    )
+LEFT JOIN LATERAL (
+    SELECT v.PostId
+    FROM Votes v
+    WHERE v.UserId = u.Id
+      AND v.CreationDate >= DATE '2024-10-01' - INTERVAL '30 days'
+) v ON TRUE
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation,
+    ps.QuestionCount, ps.AnswerCount, ps.TotalScore, ps.AvgQuestionScore,
+    bs.TotalBadges, bs.GoldBadges, bs.SilverBadges, bs.BronzeBadges,
+    tt.Tag, tt.TagUsage,
+    u.LastAccessDate
+HAVING 
+    SUM(CASE WHEN COALESCE(ps.QuestionCount,0) > 10 OR COALESCE(bs.GoldBadges,0) > 0 THEN 1 ELSE 0 END) > 0
+ORDER BY TotalScore DESC NULLS LAST
+LIMIT 100
+
+UNION ALL
+
+SELECT 
+    CAST(NULL AS INTEGER)                      AS UserId,
+    'Aggregate Summary'                       AS DisplayName,
+    CAST(NULL AS INTEGER)                      AS Reputation,
+    SUM(COALESCE(ps.QuestionCount,0))         AS QuestionCount,
+    SUM(COALESCE(ps.AnswerCount,0))           AS AnswerCount,
+    SUM(COALESCE(ps.TotalScore,0))            AS TotalScore,
+    AVG(COALESCE(ps.AvgQuestionScore,0))      AS AvgQuestionScore,
+    SUM(COALESCE(bs.TotalBadges,0))           AS TotalBadges,
+    SUM(COALESCE(bs.GoldBadges,0))            AS GoldBadges,
+    SUM(COALESCE(bs.SilverBadges,0))          AS SilverBadges,
+    SUM(COALESCE(bs.BronzeBadges,0))          AS BronzeBadges,
+    CAST(NULL AS TEXT)                        AS TopTag,
+    CAST(NULL AS INTEGER)                     AS TopTagUsage,
+    CAST(NULL AS TEXT)                        AS ActivityLevel,
+    CAST(ARRAY[]::INTEGER[] AS INTEGER[])      AS RecentVotedPostIds,
+    MAX(rv.LastVoteDate)                      AS LastVoteOnAnyPost
+FROM Users u
+LEFT JOIN UserPostStats ps  ON ps.UserId = u.Id
+LEFT JOIN UserBadgeStats bs ON bs.UserId = u.Id
+LEFT JOIN RecentVotes rv    ON rv.PostId IN (
+                                   SELECT p.Id FROM Posts p WHERE p.OwnerUserId = u.Id
+                               )
+WHERE u.CreationDate < DATE '2024-10-01' - INTERVAL '5 years';

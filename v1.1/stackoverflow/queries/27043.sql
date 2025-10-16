@@ -1,0 +1,116 @@
+WITH ActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        u.DisplayName,
+        u.LastAccessDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.ProfileImageUrl,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COUNT(p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    WHERE
+        u.LastAccessDate >= DATE_TRUNC('month', CAST('2024-10-01' AS DATE)) - INTERVAL '1 month'
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate, u.DisplayName, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes, u.ProfileImageUrl
+),
+UserPostStats AS (
+    SELECT
+        p.OwnerUserId,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate AS PostCreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        COALESCE(a.AcceptedAnswerId, 0) AS AcceptedAnswerId,
+        COALESCE(SUM(c.Score), 0) AS TotalCommentScore,
+        COUNT(c.Id) AS TotalComments,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotes
+    FROM
+        Posts p
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN
+        Posts a ON p.AcceptedAnswerId = a.Id
+    WHERE
+        p.PostTypeId IN (1, 2)
+    GROUP BY
+        p.OwnerUserId, p.Id, p.PostTypeId, p.Score, p.ViewCount, p.CreationDate, p.Title, p.Tags, p.AnswerCount, p.CommentCount, a.AcceptedAnswerId
+),
+TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY t.Count DESC) AS Rank
+    FROM
+        Tags t
+    WHERE
+        t.Count > 1000
+)
+SELECT
+    au.UserId,
+    au.Reputation,
+    au.DisplayName,
+    au.TotalPostScore,
+    au.TotalPosts,
+    au.TotalQuestions,
+    au.TotalAnswers,
+    au.TotalBadges,
+    au.LastBadgeDate,
+    ups.PostId,
+    ups.PostTypeId,
+    ups.Score AS PostScore,
+    ups.ViewCount,
+    ups.PostCreationDate,
+    ups.Title,
+    ups.Tags,
+    ups.AnswerCount,
+    ups.CommentCount,
+    ups.TotalCommentScore,
+    ups.TotalComments,
+    ups.UpVotes,
+    ups.DownVotes,
+    tt.TagName AS TopTag,
+    tt.Rank,
+    tt.Count AS TagCount,
+    CASE
+        WHEN ups.PostTypeId = 1 THEN 'Question'
+        WHEN ups.PostTypeId = 2 THEN 'Answer'
+        ELSE 'Unknown'
+    END AS PostTypeName,
+    EXTRACT(EPOCH FROM (au.LastAccessDate - au.CreationDate)) / (365.25 * 24 * 3600) AS YearsActive,
+    ('https://stackoverflow.com/users/' || au.UserId || '/' || REPLACE(au.DisplayName, ' ', '-')) AS UserProfileUrl
+FROM
+    ActiveUsers au
+JOIN
+    UserPostStats ups ON au.UserId = ups.OwnerUserId
+LEFT JOIN
+    TopTags tt ON ('<' || ups.Tags || '>') LIKE ('%' || '<' || tt.TagName || '>' || '%')
+WHERE
+    ups.PostCreationDate >= DATE_TRUNC('month', CAST('2024-10-01' AS DATE)) - INTERVAL '3 months'
+ORDER BY
+    au.Reputation DESC,
+    tt.Rank ASC,
+    ups.PostCreationDate DESC
+LIMIT 100;

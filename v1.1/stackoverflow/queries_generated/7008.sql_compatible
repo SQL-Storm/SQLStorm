@@ -1,0 +1,201 @@
+with
+Questions as (
+  select
+    p.Id,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    coalesce(p.Score,0) as Score,
+    coalesce(p.ViewCount,0) as Views,
+    coalesce(p.AnswerCount,0) as AnswerCount,
+    p.Tags,
+    case
+      when p.Tags is null then array[]::text[] -- leave this as literal for array empty; some engines may ignore
+      else string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')
+    end as TagArray
+  from Posts p
+  where p.PostTypeId = 1
+),
+UserStats as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    coalesce(u.Views,0) as ProfileViews,
+    coalesce(u.UpVotes,0) as UpVotes,
+    coalesce(u.DownVotes,0) as DownVotes,
+    count(distinct b.Id) filter (where b.Class = 1) as GoldBadges,
+    count(distinct b.Id) filter (where b.Class = 2) as SilverBadges,
+    count(distinct b.Id) filter (where b.Class = 3) as BronzeBadges,
+    case
+      when u.LastAccessDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' then 'active_30d'
+      when u.LastAccessDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '180 days' then 'active_180d'
+      else 'inactive'
+    end as RecencyBucket
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+AnswerStats as (
+  select
+    a.Id as AnswerId,
+    a.ParentId as QuestionId,
+    a.OwnerUserId as AnswererUserId,
+    a.CreationDate as AnswerDate,
+    coalesce(a.Score,0) as AnswerScore,
+    row_number() over (partition by a.ParentId order by coalesce(a.Score,0) desc, a.CreationDate) as RankByScore,
+    dense_rank() over (partition by a.ParentId order by abs(coalesce(a.Score,0)) desc) as DenseAbsRank,
+    count(c.Id) as CommentCount,
+    sum(case when v.VoteTypeId = 2 then 1 when v.VoteTypeId = 3 then -1 else 0 end) filter (where v.Id is not null) as VoteDelta,
+    length(coalesce(a.Body,'')) as BodyLength,
+    (case when coalesce(a.Body,'') ~ '<pre><code>' then 1 else 0 end) as HasCodeBlock
+  from Posts a
+  left join Comments c on c.PostId = a.Id
+  left join Votes v on v.PostId = a.Id
+  where a.PostTypeId = 2
+  group by a.Id, a.ParentId, a.OwnerUserId, a.CreationDate, a.Score, a.Body
+),
+LinkInfo as (
+  select
+    p.Id as PostId,
+    count(pl.Id) filter (where pl.LinkTypeId = 1) as OutgoingLinks,
+    count(pl.Id) filter (where pl.LinkTypeId = 3) as DuplicateLinks,
+    min(pl.CreationDate) filter (where pl.LinkTypeId = 1) as FirstOutgoingLinkDate,
+    (select rp.Title from PostLinks pl2 join Posts rp on rp.Id = pl2.RelatedPostId
+     where pl2.PostId = p.Id and pl2.LinkTypeId = 1
+     order by pl2.CreationDate asc limit 1) as FirstLinkedTitle
+  from Posts p
+  left join PostLinks pl on pl.PostId = p.Id
+  group by p.Id
+),
+QuestionAnalytic as (
+  select
+    q.Id,
+    q.Title,
+    q.OwnerUserId,
+    q.CreationDate,
+    q.Score,
+    q.Views,
+    q.AnswerCount,
+    q.Tags,
+    q.TagArray,
+    li.OutgoingLinks,
+    li.DuplicateLinks,
+    li.FirstOutgoingLinkDate,
+    li.FirstLinkedTitle,
+    us.DisplayName as OwnerName,
+    us.Reputation as OwnerReputation,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    coalesce(max(as_.AnswerScore),0) as TopAnswerScore,
+    coalesce(avg(as_.AnswerScore) filter (where as_.AnswerId is not null),0) as AvgAnswerScore,
+    coalesce(sum(case when as_.HasCodeBlock = 1 then 1 else 0 end),0) as AnswersWithCode,
+    coalesce(sum(as_.CommentCount),0) as TotalAnswerComments,
+    -- compute quality expression without :: cast; format numeric via cast in outer layer if needed
+    (
+      greatest(0,
+        least(100,
+          (coalesce(q.Score,0) * 2)
+          + (coalesce(q.ViewCount,0) / 100.0)
+          + (coalesce(max(as_.AnswerScore),0) * 5)
+          + (coalesce(sum(case when as_.HasCodeBlock = 1 then 1 else 0 end),0) * 3)
+          + (case when q.AcceptedAnswerId is not null then 10 else 0 end)
+          - (coalesce(q.AnswerCount,0) * 1)
+          + (coalesce(us.Reputation,0) / 1000.0)
+          + (coalesce(li.DuplicateLinks,0) * -5)
+        )
+      )
+    ) as QualityScore_raw
+  from Questions q
+  left join LinkInfo li on li.PostId = q.Id
+  left join UserStats us on us.UserId = q.OwnerUserId
+  left join AnswerStats as_ on as_.QuestionId = q.Id
+  group by q.Id, q.Title, q.OwnerUserId, q.CreationDate, q.Score, q.Views, q.AnswerCount, q.Tags, q.TagArray,
+           li.OutgoingLinks, li.DuplicateLinks, li.FirstOutgoingLinkDate, li.FirstLinkedTitle,
+           us.DisplayName, us.Reputation, us.GoldBadges, us.SilverBadges, us.BronzeBadges, q.AcceptedAnswerId
+),
+TagExplode as (
+  select
+    qa.*,
+    unnest(qa.TagArray) as Tag
+  from QuestionAnalytic qa
+),
+TagRanked as (
+  select
+    te.*,
+    -- cast/format QualityScore_raw to numeric(10,2) in a portable way: cast to numeric
+    cast(te.QualityScore_raw as numeric(10,2)) as QualityScore,
+    rank() over (partition by te.Tag order by cast(te.QualityScore_raw as numeric(10,2)) desc, te.Views desc) as TagQualityRank,
+    row_number() over (order by cast(te.QualityScore_raw as numeric(10,2)) desc NULLS LAST, te.Views desc) as GlobalRank,
+    percentile_disc(0.9) within group (order by cast(te.QualityScore_raw as numeric(10,2))) over (partition by te.Tag) as Tag90pctQuality
+  from TagExplode te
+),
+TopPerTag as (
+  select distinct on (Tag) *
+  from TagRanked
+  where Tag is not null
+  order by Tag, QualityScore desc, Views desc
+),
+SampleBadges as (
+  select u.UserId, u.DisplayName, u.Reputation, u.RecencyBucket,
+    (GoldBadges + SilverBadges + BronzeBadges) as TotalBadges,
+    concat('G=', coalesce(GoldBadges,0), '|S=', coalesce(SilverBadges,0), '|B=', coalesce(BronzeBadges,0)) as BadgeSummary
+  from UserStats u
+  where (GoldBadges + SilverBadges + BronzeBadges) > 0
+  order by TotalBadges desc, Reputation desc
+  limit 100
+),
+LowActivity as (
+  select qa.*
+  from QuestionAnalytic qa
+  where qa.Views < 50 or qa.AnswerCount = 0
+  order by qa.CreationDate desc
+  limit 200
+)
+select
+  t.GlobalRank,
+  t.Tag,
+  t.Title,
+  t.Id as QuestionId,
+  t.OwnerName,
+  t.OwnerReputation,
+  t.QualityScore,
+  t.Views,
+  t.AnswerCount,
+  t.TopAnswerScore,
+  t.AnswersWithCode,
+  t.FirstLinkedTitle,
+  t.TagQualityRank,
+  (select extract(epoch from (a.CreationDate - q.CreationDate))/3600.0
+   from Posts a join Posts q on q.Id = t.Id
+   where a.Id = q.AcceptedAnswerId limit 1) as HoursToAccepted,
+  md5(concat(coalesce(t.Title,''), '||', coalesce(t.Tags,''), '||', coalesce(t.OwnerName,''), '||', cast(t.QualityScore as text))) as RowHash,
+  sb.BadgeSummary,
+  (
+    select string_agg(concat_ws(':',
+                                coalesce(u.DisplayName,'<anon>'),
+                                cast(as2.AnswerScore as text),
+                                cast(as2.CommentCount as text)
+                               ), ';')
+    from (
+      select a.OwnerUserId, a.AnswerScore, a.CommentCount
+      from AnswerStats a
+      where a.QuestionId = t.Id
+      order by a.AnswerScore desc nulls last, a.CommentCount desc
+      limit 3
+    ) as2
+    left join Users u on u.Id = as2.OwnerUserId
+  ) as Top3Answerers
+from (
+  select * from TopPerTag
+  union
+  select * from TagRanked where GlobalRank <= 200
+  except
+  select * from LowActivity
+) t
+left join SampleBadges sb on sb.UserId = t.OwnerUserId
+order by t.GlobalRank nulls last, t.TagQualityRank nulls last, t.Views desc
+limit 500;

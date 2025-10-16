@@ -1,0 +1,92 @@
+-- {"query": "28044.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "deepseek-r1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1587} 
+
+WITH UsersCTE AS (
+    SELECT 
+        u.Id, 
+        u.DisplayName, 
+        u.Reputation,
+        u.CreationDate,
+        EXTRACT(YEAR FROM u.CreationDate) AS JoinYear,
+        COALESCE((SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1), 0) AS GoldBadges,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionsAsked,
+        (SELECT AVG(Score) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AvgAnswerScore,
+        RANK() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC) AS LocationRank
+    FROM Users u
+), PostStats AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS Upvotes,
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (5,8)) AS Edits,
+        LENGTH(p.Body) - LENGTH(REPLACE(p.Body, '<code>', '')) / LENGTH('<code>') AS CodeBlocks,
+        STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><') AS TagArray,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NULL THEN 0 
+            ELSE 1 
+        END AS HasAcceptedAnswer
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= NOW() - INTERVAL '1 YEAR'
+), CombinedData AS (
+    SELECT 
+        u.*,
+        p.PostId,
+        p.Score AS PostScore,
+        p.Upvotes,
+        p.Edits,
+        p.CodeBlocks,
+        p.HasAcceptedAnswer,
+        CARDINALITY(p.TagArray) AS TagCount,
+        (SELECT SUM(COUNT) FROM Tags t WHERE t.TagName = ANY(p.TagArray)) AS TotalTagUses,
+        ROUND((p.Upvotes * 1.0 / NULLIF(p.ViewCount, 0)) * 100, 2) AS UpvoteRate,
+        AVG(p.Score) OVER (PARTITION BY u.JoinYear ORDER BY p.CreationDate ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS MovingAvgScore
+    FROM UsersCTE u
+    LEFT JOIN PostStats p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 1000
+      AND u.GoldBadges >= 1
+)
+SELECT 
+    cd.DisplayName,
+    cd.Reputation,
+    cd.GoldBadges,
+    cd.QuestionsAsked,
+    cd.AvgAnswerScore,
+    cd.PostScore,
+    cd.UpvoteRate,
+    cd.TagCount,
+    cd.TotalTagUses,
+    cd.MovingAvgScore,
+    CASE 
+        WHEN cd.Reputation > 100000 THEN 'Legendary' 
+        WHEN cd.Reputation > 50000 THEN 'Epic' 
+        WHEN cd.Reputation > 10000 THEN 'Veteran' 
+        ELSE 'Active' 
+    END AS ReputationTier,
+    (SELECT STRING_AGG(t.TagName, ', ') FROM Tags t WHERE t.TagName = ANY(cd.TagArray)) AS CommonTags
+FROM CombinedData cd
+WHERE cd.TagCount >= 3
+  AND cd.HasAcceptedAnswer = 1
+  AND cd.UpvoteRate > 5.0
+UNION ALL
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    0 AS GoldBadges,
+    0 AS QuestionsAsked,
+    0 AS AvgAnswerScore,
+    NULL AS PostScore,
+    NULL AS UpvoteRate,
+    0 AS TagCount,
+    0 AS TotalTagUses,
+    NULL AS MovingAvgScore,
+    'Inactive' AS ReputationTier,
+    NULL AS CommonTags
+FROM Users u
+WHERE u.Id NOT IN (SELECT OwnerUserId FROM Posts)
+  AND u.CreationDate < NOW() - INTERVAL '5 YEARS'
+ORDER BY Reputation DESC, PostScore DESC NULLS LAST;

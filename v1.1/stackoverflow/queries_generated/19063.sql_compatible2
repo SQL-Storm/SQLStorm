@@ -1,0 +1,177 @@
+WITH UserCoreStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        DATE_PART('day', AGE(u.LastAccessDate, u.CreationDate)) AS UserActiveDays,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) AS TotalQuestionScore,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) AS TotalAnswerScore,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalViewCount,
+        COUNT(DISTINCT p.AcceptedAnswerId) AS AcceptedAnswersOnMyQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) AS MyAcceptedAnswersCount,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+    HAVING
+        COUNT(DISTINCT p.Id) > 10
+        AND u.Reputation > 1000
+),
+PostHistoricalMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.LastEditDate,
+        p.ClosedDate,
+        p.Score,
+        p.ViewCount,
+        -- convert tags like '<tag1><tag2>' to array ['tag1','tag2']
+        CASE
+            WHEN p.Tags IS NULL THEN NULL
+            ELSE (SELECT array_agg(t) FROM (
+                SELECT UNNEST(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')) AS t
+            ) s)
+        END AS TagArray,
+        COUNT(ph.Id) AS TotalHistoryEntries,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.Id END) AS EditCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Id END) AS CloseEvents,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.Id END) AS ReopenEvents,
+        COUNT(DISTINCT ph.UserId) AS DistinctEditors,
+        MIN(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.CreationDate END) AS FirstEditDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.CreationDate END) AS LastEditDateFromHistory,
+        MIN(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS FirstCloseDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate END) AS LastReopenDate,
+        (SELECT COUNT(pl.RelatedPostId) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS DuplicatesCount,
+        (SELECT COUNT(pl.PostId) FROM PostLinks pl WHERE pl.RelatedPostId = p.Id AND pl.LinkTypeId = 3) AS OriginalForDuplicatesCount
+    FROM
+        Posts p
+    LEFT JOIN
+        PostHistory ph ON p.Id = ph.PostId
+    WHERE
+        p.PostTypeId IN (1, 2)
+    GROUP BY
+        p.Id, p.OwnerUserId, p.PostTypeId, p.CreationDate, p.LastEditDate, p.ClosedDate, p.Score, p.ViewCount, p.Tags
+),
+UserActivityTimeline AS (
+    SELECT
+        ucs.UserId,
+        ucs.DisplayName,
+        phm.PostId,
+        phm.PostCreationDate,
+        phm.Score,
+        phm.PostTypeId,
+        phm.TagArray,
+        phm.CloseEvents,
+        phm.ReopenEvents,
+        LAG(phm.Score, 1, 0) OVER (PARTITION BY ucs.UserId ORDER BY phm.PostCreationDate) AS PreviousPostScore,
+        COALESCE(DATE_PART('day', AGE(phm.PostCreationDate, LAG(phm.PostCreationDate) OVER (PARTITION BY ucs.UserId ORDER BY phm.PostCreationDate))), 0) AS DaysSincePreviousPost,
+        RANK() OVER (PARTITION BY ucs.UserId ORDER BY phm.Score DESC) AS RankByScoreForUser,
+        NTILE(4) OVER (ORDER BY phm.Score DESC) AS ScoreQuartileOverall
+    FROM
+        UserCoreStats ucs
+    JOIN
+        PostHistoricalMetrics phm ON ucs.UserId = phm.OwnerUserId
+),
+UserTagsExpanded AS (
+    SELECT
+        uat.UserId,
+        uat.DisplayName,
+        uat.PostId,
+        t.unnest_tag AS Tag
+    FROM
+        UserActivityTimeline uat
+    JOIN LATERAL
+        (SELECT UNNEST(uat.TagArray) AS unnest_tag) t ON TRUE
+    WHERE
+        uat.TagArray IS NOT NULL
+),
+AggregatedUserPerformance AS (
+    SELECT
+        uat.UserId,
+        uat.DisplayName,
+        ucs.Reputation,
+        ucs.TotalQuestions,
+        ucs.TotalAnswers,
+        ucs.MyAcceptedAnswersCount,
+        ucs.AcceptedAnswersOnMyQuestions,
+        ucs.TotalViewCount,
+        CAST(ucs.MyAcceptedAnswersCount AS NUMERIC) / NULLIF(ucs.TotalAnswers, 0) AS AnswerAcceptanceRate,
+        CAST(SUM(CASE WHEN uat.PostTypeId = 1 AND uat.CloseEvents > 0 THEN 1 ELSE 0 END) AS NUMERIC) / NULLIF(ucs.TotalQuestions, 0) AS QuestionClosureRate,
+        AVG(uat.Score) AS AvgPostScore,
+        SUM(phm.EditCount) AS TotalEditsByThisUserOnTheirPosts,
+        SUM(phm.DuplicatesCount) AS TotalTimesMyQuestionWasDuplicate,
+        SUM(phm.OriginalForDuplicatesCount) AS TotalMyQuestionsWereOriginalForDuplicates,
+        (
+            SELECT
+                COUNT(DISTINCT ph_other.PostId)
+            FROM
+                PostHistory ph_other
+            JOIN
+                Posts p_other ON ph_other.PostId = p_other.Id
+            WHERE
+                ph_other.UserId = uat.UserId
+                AND ph_other.PostHistoryTypeId IN (4, 5, 6)
+                AND p_other.OwnerUserId IS NOT NULL
+                AND p_other.OwnerUserId != uat.UserId
+        ) AS EditsOnOthersPostsCount,
+        (SELECT ARRAY_AGG(DISTINCT Tag) FROM UserTagsExpanded ute WHERE ute.UserId = uat.UserId) AS AllTagsUsed
+    FROM
+        UserActivityTimeline uat
+    JOIN
+        UserCoreStats ucs ON uat.UserId = ucs.UserId
+    JOIN
+        PostHistoricalMetrics phm ON uat.PostId = phm.PostId
+    GROUP BY
+        uat.UserId, uat.DisplayName, ucs.Reputation, ucs.TotalQuestions, ucs.TotalAnswers,
+        ucs.MyAcceptedAnswersCount, ucs.AcceptedAnswersOnMyQuestions, ucs.TotalViewCount
+)
+SELECT
+    aup.DisplayName,
+    aup.Reputation,
+    aup.TotalQuestions,
+    aup.TotalAnswers,
+    aup.TotalViewCount,
+    ROUND(aup.AnswerAcceptanceRate, 4) AS AnswerAcceptanceRate,
+    ROUND(aup.QuestionClosureRate, 4) AS QuestionClosureRate,
+    aup.AvgPostScore,
+    aup.TotalEditsByThisUserOnTheirPosts,
+    aup.EditsOnOthersPostsCount,
+    aup.TotalTimesMyQuestionWasDuplicate,
+    aup.TotalMyQuestionsWereOriginalForDuplicates,
+    ROUND(CAST(aup.TotalEditsByThisUserOnTheirPosts AS NUMERIC) / NULLIF(aup.TotalQuestions + aup.TotalAnswers, 0), 2) AS EditsPerOwnPostRatio,
+    UPPER(SUBSTRING(aup.DisplayName FROM 1 FOR 3)) || LPAD(SUBSTRING(MD5(CAST(aup.UserId AS VARCHAR)) FROM 1 FOR 5), 5, '0') AS UserHashIdentifier,
+    CASE
+        WHEN aup.Reputation > 50000 AND aup.AnswerAcceptanceRate > 0.7 THEN 'Elite Contributor'
+        WHEN aup.Reputation > 10000 AND aup.QuestionClosureRate < 0.1 AND aup.EditsOnOthersPostsCount > 20 THEN 'Community Steward'
+        WHEN aup.Reputation > 5000 AND aup.TotalQuestions > 50 AND aup.TotalTimesMyQuestionWasDuplicate < 5 THEN 'Prolific Questioner'
+        ELSE 'Active Participant'
+    END AS UserCategory,
+    COALESCE(CASE WHEN aup.AllTagsUsed IS NULL THEN NULL ELSE aup.AllTagsUsed[1] END, 'NoPrimaryTag') AS MostFrequentTag,
+    CARDINALITY(aup.AllTagsUsed) AS NumberOfDistinctTagsUsed,
+    RANK() OVER (ORDER BY aup.Reputation DESC, aup.AnswerAcceptanceRate DESC NULLS LAST, aup.QuestionClosureRate ASC NULLS LAST, aup.EditsOnOthersPostsCount DESC NULLS LAST) AS GlobalUserImpactRank,
+    aup.UserId
+FROM
+    AggregatedUserPerformance aup
+WHERE
+    aup.Reputation > 5000
+    AND (aup.AnswerAcceptanceRate IS NULL OR aup.AnswerAcceptanceRate >= 0.1)
+    AND (aup.QuestionClosureRate IS NULL OR aup.QuestionClosureRate < 0.5)
+    AND LENGTH(aup.DisplayName) > 3
+ORDER BY
+    GlobalUserImpactRank ASC, aup.Reputation DESC
+LIMIT 200;

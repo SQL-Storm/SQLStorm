@@ -1,0 +1,159 @@
+WITH ActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COALESCE(u.DisplayName, 'Anonymous') AS DisplayName,
+        u.Location,
+        COALESCE(u.AboutMe, '') AS AboutMe,
+        COALESCE(u.ProfileImageUrl, '') AS ProfileImageUrl,
+        u.UpVotes,
+        u.DownVotes,
+        COALESCE(u.WebsiteUrl, '') AS WebsiteUrl,
+        u.Views,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM
+        Users u
+    WHERE
+        u.LastAccessDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30' DAY
+),
+PopularPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        COALESCE(p.Title, '') AS Title,
+        COALESCE(p.Tags, '') AS Tags,
+        COALESCE(p.OwnerDisplayName, 'Anonymous') AS OwnerDisplayName,
+        p.LastActivityDate,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId IN (1, 2)
+        AND p.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1' YEAR
+),
+UserActivity AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(v.Id) AS VoteCount,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM
+        Posts p
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN
+        PostHistory ph ON p.Id = ph.PostId
+    WHERE
+        p.OwnerUserId IS NOT NULL
+    GROUP BY
+        p.Id,
+        p.OwnerUserId
+),
+TagStats AS (
+    WITH RECURSIVE PostTags AS (
+        SELECT
+            p.Id AS PostId,
+            p.OwnerDisplayName,
+            p.Score,
+            TRIM(BOTH '<>' FROM COALESCE(p.Tags, '')) AS rest,
+            CAST(NULL AS VARCHAR(4000)) AS tag,
+            1 AS pos
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+        UNION ALL
+        SELECT
+            PostId,
+            OwnerDisplayName,
+            Score,
+            CASE
+                WHEN POSITION('><' IN rest) > 0 THEN SUBSTRING(rest FROM POSITION('><' IN rest) + 2)
+                ELSE ''
+            END AS rest,
+            CASE
+                WHEN POSITION('><' IN rest) > 0 THEN TRIM(SUBSTRING(rest FROM 1 FOR POSITION('><' IN rest) - 1))
+                ELSE TRIM(rest)
+            END AS tag,
+            pos + 1
+        FROM PostTags
+        WHERE rest <> ''
+    )
+    SELECT
+        t.TagName,
+        t.Count,
+        COUNT(DISTINCT pt.PostId) AS RelatedPostsCount,
+        SUM(pt.Score) AS TotalScore,
+        LISTAGG(DISTINCT pt.OwnerDisplayName, ', ') AS Contributors
+    FROM
+        Tags t
+    LEFT JOIN
+        (
+            SELECT
+                PostId,
+                tag AS TagName,
+                OwnerDisplayName,
+                Score
+            FROM PostTags
+            WHERE tag IS NOT NULL AND tag <> ''
+        ) pt
+        ON pt.TagName = t.TagName
+    GROUP BY
+        t.TagName,
+        t.Count
+)
+SELECT
+    au.UserId,
+    au.DisplayName,
+    au.Reputation,
+    au.ReputationRank,
+    au.Location,
+    au.AboutMe,
+    au.ProfileImageUrl,
+    au.UpVotes,
+    au.DownVotes,
+    au.WebsiteUrl,
+    au.Views,
+    pp.PostId,
+    pp.PostTypeId AS PostType,
+    pp.Title,
+    pp.Tags,
+    pp.Score,
+    pp.ScoreRank,
+    pp.ViewCount,
+    pp.AnswerCount,
+    pp.CommentCount,
+    pp.FavoriteCount,
+    COALESCE(ua.CommentCount, 0) AS UserCommentCount,
+    COALESCE(ua.VoteCount, 0) AS UserVoteCount,
+    COALESCE(ua.LastEditDate, pp.CreationDate) AS LastActivity,
+    ts.TagName,
+    ts.Count,
+    COALESCE(ts.RelatedPostsCount, 0) AS RelatedPosts,
+    ts.TotalScore,
+    ts.Contributors
+FROM
+    ActiveUsers au
+LEFT JOIN
+    PopularPosts pp ON au.UserId = pp.OwnerUserId
+LEFT JOIN
+    UserActivity ua ON pp.PostId = ua.PostId
+LEFT JOIN
+    TagStats ts ON POSITION(CONCAT('<', ts.TagName, '>') IN pp.Tags) > 0
+WHERE
+    au.Reputation > 1000
+ORDER BY
+    au.Reputation DESC,
+    pp.Score DESC,
+    ts.TotalScore DESC
+FETCH FIRST 1000 ROWS ONLY;

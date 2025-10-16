@@ -1,0 +1,151 @@
+-- {"query": "4001.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1279} 
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(distinct a.Id) filter (where a.PostTypeId = 2) as AnswersCount,
+        count(distinct c.Id) as CommentsCount,
+        max(p.Score) filter (where p.PostTypeId = 1) as MaxQuestionScore,
+        max(a.Score) filter (where a.PostTypeId = 2) as MaxAnswerScore,
+        coalesce(sum(v.VoteTypeId = 2)::int,0) as TotalUpVotes,
+        coalesce(sum(v.VoteTypeId = 3)::int,0) as TotalDownVotes
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+    left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+
+    union all
+
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        0,
+        0,
+        0,
+        null,
+        null,
+        0,
+        0
+    from Users u
+    where u.Reputation < 100 and u.Id not in (
+        select distinct OwnerUserId from Posts where OwnerUserId is not null
+    )
+),
+RankingCTE as (
+    select
+        UserId,
+        DisplayName,
+        Reputation,
+        CreationDate,
+        Location,
+        QuestionsCount,
+        AnswersCount,
+        CommentsCount,
+        MaxQuestionScore,
+        MaxAnswerScore,
+        TotalUpVotes,
+        TotalDownVotes,
+        row_number() over (
+            partition by
+                case when Location is null then 'Unknown' else Location end
+            order by Reputation desc, QuestionsCount desc, AnswersCount desc
+        ) as LocationRank,
+        dense_rank() over (order by QuestionsCount desc nulls last) as QuestionRank,
+        dense_rank() over (order by AnswersCount desc nulls last) as AnswerRank
+    from RecursiveUserActivity
+),
+TopBadges as (
+    select
+        b.UserId,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by b.UserId order by b.Date desc) as BadgeRank
+    from Badges b
+    where b.Class = 1  -- Only Gold badges
+),
+RecentPostsPerUser as (
+    select p.OwnerUserId as UserId, p.Id as PostId, p.Title, p.Score, p.CreationDate,
+      row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as rn
+    from Posts p
+    where p.PostTypeId = 1
+),
+DuplicateLinkCounts as (
+    select
+        pl.PostId,
+        count(*) filter (where pl.LinkTypeId = 3) as DuplicateCount,
+        count(*) filter (where pl.LinkTypeId = 1) as LinkedCount
+    from PostLinks pl
+    group by pl.PostId
+),
+PostCloseReasonsCount as (
+    select
+        ph.PostId,
+        count(*) filter (where ph.PostHistoryTypeId = 10) as TimesClosed,
+        count(*) filter (where ph.PostHistoryTypeId = 11) as TimesReopened,
+        max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as LastClosedDate,
+        max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 11) as LastReopenedDate
+    from PostHistory ph
+    group by ph.PostId
+)
+select
+    r.UserId,
+    r.DisplayName,
+    r.Reputation,
+    r.Location,
+    r.QuestionsCount,
+    r.AnswersCount,
+    r.CommentsCount,
+    r.MaxQuestionScore,
+    r.MaxAnswerScore,
+    r.TotalUpVotes,
+    r.TotalDownVotes,
+    r.LocationRank,
+    r.QuestionRank,
+    r.AnswerRank,
+    b.BadgeName,
+    rp.Title as RecentQuestionTitle,
+    rp.Score as RecentQuestionScore,
+    rp.CreationDate as RecentQuestionCreationDate,
+    dl.DuplicateCount,
+    dl.LinkedCount,
+    pcr.TimesClosed,
+    pcr.TimesReopened,
+    pcr.LastClosedDate,
+    pcr.LastReopenedDate,
+    case
+      when r.AnswersCount = 0 then null
+      else round((r.TotalUpVotes::numeric / nullif(r.AnswersCount,0)),2)
+    end as AvgUpVotesPerAnswer,
+    case
+      when r.QuestionsCount = 0 then null
+      else round((r.TotalUpVotes::numeric / nullif(r.QuestionsCount,0)),2)
+    end as AvgUpVotesPerQuestion,
+    coalesce(
+      case 
+        when r.Location is null then 'Unknown'
+        else concat(initcap(split_part(r.Location, ',', 1)), ' - ', length(r.Location), ' chars') end,
+      'No Location'
+    ) as FormattedLocation
+from RankingCTE r
+left join TopBadges b on b.UserId = r.UserId and b.BadgeRank = 1
+left join RecentPostsPerUser rp on rp.UserId = r.UserId and rp.rn = 1
+left join DuplicateLinkCounts dl on dl.PostId = rp.PostId
+left join PostCloseReasonsCount pcr on pcr.PostId = rp.PostId
+where r.Reputation > (
+    select avg(Reputation) from Users
+)
+and (
+    r.TotalUpVotes > r.TotalDownVotes
+    or r.Location is null
+)
+order by r.Location nulls last, r.Reputation desc
+limit 50;

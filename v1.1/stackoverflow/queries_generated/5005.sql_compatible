@@ -1,0 +1,130 @@
+WITH RecentHighScoreQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.AnswerCount,
+        ARRAY_LENGTH(string_to_array(substring(COALESCE(p.Tags, ''), 2, LENGTH(COALESCE(p.Tags,''))-2), '><'), 1) AS TagCount,
+        COALESCE(p.Tags, '') AS Tags
+    FROM
+        Posts p
+        LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE
+        p.PostTypeId = 1
+        AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90 days'
+        AND p.Score >= 5
+),
+QuestionAnswers AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        AVG(a.Score) AS AvgAnswerScore,
+        COUNT(*) AS AnswerCount
+    FROM
+        Posts a
+    WHERE
+        a.PostTypeId = 2
+    GROUP BY
+        a.ParentId
+),
+UserBadgesAgg AS (
+    SELECT
+        b.UserId,
+        COUNT(*) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM
+        Badges b
+    GROUP BY
+        b.UserId
+),
+TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM
+        Tags t
+),
+RecentQuestionVotes AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes,
+        COUNT(*) AS TotalVotes
+    FROM
+        Votes v
+        JOIN RecentHighScoreQuestions q ON v.PostId = q.QuestionId
+    WHERE
+        v.CreationDate >= q.CreationDate
+    GROUP BY
+        v.PostId
+)
+SELECT
+    q.QuestionId,
+    q.Title,
+    q.Score,
+    q.ViewCount,
+    q.CreationDate,
+    COALESCE(q.OwnerDisplayName, '[deleted]') AS OwnerDisplayName,
+    q.AnswerCount AS DeclaredAnswerCount,
+    qa.AnswerCount AS ActualAnswerCount,
+    qa.AvgAnswerScore,
+    COALESCE(ub.TotalBadges, 0) AS OwnerTotalBadges,
+    COALESCE(ub.GoldBadges, 0) AS OwnerGoldBadges,
+    COALESCE(ub.SilverBadges, 0) AS OwnerSilverBadges,
+    COALESCE(ub.BronzeBadges, 0) AS OwnerBronzeBadges,
+    q.TagCount,
+    (
+        SELECT STRING_AGG(t2.TagName, ', ' ORDER BY t2.Count DESC)
+        FROM TopTags t2
+        WHERE
+            t2.TagName = ANY(string_to_array(substring(q.Tags, 2, LENGTH(q.Tags) - 2), '><'))
+            AND t2.TagRank <= 5
+    ) AS TopTagsMentioned,
+    rv.Upvotes,
+    rv.Downvotes,
+    rv.TotalVotes,
+    CASE
+        WHEN qa.AvgAnswerScore IS NULL THEN 'Unanswered'
+        WHEN qa.AvgAnswerScore >= 5 THEN 'Highly Engaged'
+        WHEN qa.AvgAnswerScore >= 1 THEN 'Moderately Engaged'
+        ELSE 'Low Engagement'
+    END AS EngagementLevel,
+    CASE
+        WHEN q.ViewCount >= 10000 THEN 'Very Popular'
+        WHEN q.ViewCount >= 2500 THEN 'Popular'
+        ELSE 'Niche'
+    END AS PopularityCategory
+FROM
+    RecentHighScoreQuestions q
+    LEFT JOIN QuestionAnswers qa ON q.QuestionId = qa.QuestionId
+    LEFT JOIN UserBadgesAgg ub ON q.OwnerUserId = ub.UserId
+    LEFT JOIN RecentQuestionVotes rv ON q.QuestionId = rv.PostId
+GROUP BY
+    q.QuestionId,
+    q.Title,
+    q.Score,
+    q.ViewCount,
+    q.CreationDate,
+    q.OwnerDisplayName,
+    q.AnswerCount,
+    q.TagCount,
+    q.Tags,
+    qa.AnswerCount,
+    qa.AvgAnswerScore,
+    ub.TotalBadges,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    rv.Upvotes,
+    rv.Downvotes,
+    rv.TotalVotes
+ORDER BY
+    q.Score DESC,
+    q.ViewCount DESC
+LIMIT 50;

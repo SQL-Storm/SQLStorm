@@ -1,0 +1,297 @@
+with recent_active_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    u.websiteurl,
+    u.upvotes,
+    u.downvotes,
+    u.views,
+    count(*) filter (where p.posttypeid = 1) as question_count,
+    count(*) filter (where p.posttypeid = 2) as answer_count,
+    max(p.lastactivitydate) as last_post_activity
+  from users u
+  left join posts p
+    on p.owneruserid = u.id
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+  where u.creationdate <= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days'
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.location, u.websiteurl, u.upvotes, u.downvotes, u.views
+),
+tag_expertise as (
+  select
+    p.owneruserid as user_id,
+    t.tagname,
+    count(*) as answers_in_tag,
+    sum(case when p.score >= 1 then 1 else 0 end) as upvoted_answers_in_tag,
+    sum(greatest(p.score,0)) as pos_score_sum,
+    percentile_cont(0.5) within group (order by p.score) as median_answer_score
+  from posts p
+  join posts q on q.id = p.parentid and p.posttypeid = 2 and q.posttypeid = 1
+  join lateral unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')) as t(tagname) on true
+  where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+  group by p.owneruserid, t.tagname
+),
+user_top_tags as (
+  select distinct on (user_id)
+    user_id,
+    tagname as top_tag,
+    answers_in_tag,
+    upvoted_answers_in_tag,
+    pos_score_sum,
+    median_answer_score
+  from tag_expertise
+  order by user_id, answers_in_tag desc, upvoted_answers_in_tag desc, pos_score_sum desc
+),
+q_activity as (
+  select
+    q.owneruserid as user_id,
+    count(*) filter (where v.votetypeid = 2) as question_upvotes,
+    count(*) filter (where v.votetypeid = 3) as question_downvotes,
+    avg(nullif(q.viewcount,0)) as avg_q_views,
+    sum(case when q.closeddate is not null then 1 else 0 end) as closed_questions
+  from posts q
+  left join votes v on v.postid = q.id
+  where q.posttypeid = 1
+    and q.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+  group by q.owneruserid
+),
+a_activity as (
+  select
+    a.owneruserid as user_id,
+    count(*) filter (where a.acceptedanswerid is not null and a.id = a.acceptedanswerid) as accepted_answers_as_asker,
+    count(*) as answers_written,
+    sum(a.score) as answer_score_sum,
+    avg(a.score) as avg_answer_score,
+    count(*) filter (where a.score >= 10) as high_score_answers,
+    count(distinct case when a.score > 0 then a.parentid end) as distinct_questions_helped
+  from posts a
+  where a.posttypeid = 2
+    and a.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+  group by a.owneruserid
+),
+badge_summ as (
+  select
+    b.userid as user_id,
+    count(*) as total_badges,
+    count(*) filter (where b.class = 1) as gold_badges,
+    count(*) filter (where b.class = 2) as silver_badges,
+    count(*) filter (where b.class = 3) as bronze_badges,
+    count(*) filter (where b.tagbased = true) as tag_badges_recent
+  from badges b
+  where b.date >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+  group by b.userid
+),
+comment_quality as (
+  select
+    c.userid as user_id,
+    count(*) as comments_made,
+    avg(c.score) as avg_comment_score,
+    sum(case when c.score > 0 then 1 else 0 end) as positive_comments,
+    max(c.creationdate) as last_comment_date,
+    sum(length(c.text)) as total_comment_chars
+  from comments c
+  where c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+  group by c.userid
+),
+dup_graph as (
+  select
+    pl.postid as dup_post_id,
+    pl.relatedpostid as canonical_post_id,
+    count(*) as dup_link_count
+  from postlinks pl
+  where pl.linktypeid = 3
+    and pl.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+  group by pl.postid, pl.relatedpostid
+),
+user_dup_involvement as (
+  select
+    q.owneruserid as user_id,
+    count(distinct q.id) as questions_marked_duplicate,
+    count(distinct dg.canonical_post_id) as distinct_canonicals_referenced
+  from dup_graph dg
+  join posts q on q.id = dg.dup_post_id and q.posttypeid = 1
+  group by q.owneruserid
+),
+post_edits as (
+  select
+    ph.userid as user_id,
+    count(*) filter (where ph.posthistorytypeid in (4,5,6)) as content_edits,
+    count(*) filter (where ph.posthistorytypeid in (10)) as closes_initiated,
+    count(*) filter (where ph.posthistorytypeid in (11)) as reopens_initiated,
+    count(*) filter (where ph.posthistorytypeid in (24)) as suggested_edits_applied
+  from posthistory ph
+  where ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+  group by ph.userid
+),
+activity_unioned as (
+  select u.user_id, 'Q' as kind, coalesce(qa.question_upvotes,0) - coalesce(qa.question_downvotes,0) as score_delta, coalesce(qa.avg_q_views,0) as aux
+  from q_activity qa
+  join recent_active_users u on u.user_id = qa.user_id
+  union all
+  select u.user_id, 'A', coalesce(aa.answer_score_sum,0), coalesce(aa.avg_answer_score,0)
+  from a_activity aa
+  join recent_active_users u on u.user_id = aa.user_id
+  union all
+  select u.user_id, 'C', coalesce(cq.positive_comments,0), coalesce(cq.avg_comment_score,0)
+  from comment_quality cq
+  join recent_active_users u on u.user_id = cq.user_id
+),
+activity_rank as (
+  select
+    user_id,
+    sum(score_delta) as total_delta,
+    avg(aux) as avg_aux,
+    count(*) as activity_kinds,
+    rank() over (order by sum(score_delta) desc nulls last) as rnk_by_delta
+  from activity_unioned
+  group by user_id
+),
+user_baseline as (
+  select
+    rau.user_id,
+    rau.displayname,
+    rau.reputation,
+    rau.creationdate,
+    rau.location,
+    rau.websiteurl,
+    rau.upvotes,
+    rau.downvotes,
+    rau.views,
+    rau.question_count,
+    rau.answer_count,
+    rau.last_post_activity,
+    ut.top_tag,
+    ut.answers_in_tag,
+    ut.upvoted_answers_in_tag,
+    ut.pos_score_sum,
+    ut.median_answer_score,
+    qa.question_upvotes,
+    qa.question_downvotes,
+    qa.avg_q_views,
+    qa.closed_questions,
+    aa.answers_written,
+    aa.answer_score_sum,
+    aa.avg_answer_score,
+    aa.high_score_answers,
+    aa.distinct_questions_helped,
+    bs.total_badges,
+    bs.gold_badges,
+    bs.silver_badges,
+    bs.bronze_badges,
+    bs.tag_badges_recent,
+    cq.comments_made,
+    cq.avg_comment_score,
+    cq.positive_comments,
+    cq.last_comment_date,
+    cq.total_comment_chars,
+    di.questions_marked_duplicate,
+    di.distinct_canonicals_referenced,
+    pe.content_edits,
+    pe.closes_initiated,
+    pe.reopens_initiated,
+    pe.suggested_edits_applied,
+    ar.total_delta,
+    ar.avg_aux,
+    ar.activity_kinds,
+    ar.rnk_by_delta
+  from recent_active_users rau
+  left join user_top_tags ut on ut.user_id = rau.user_id
+  left join q_activity qa on qa.user_id = rau.user_id
+  left join a_activity aa on aa.user_id = rau.user_id
+  left join badge_summ bs on bs.user_id = rau.user_id
+  left join comment_quality cq on cq.user_id = rau.user_id
+  left join user_dup_involvement di on di.user_id = rau.user_id
+  left join post_edits pe on pe.user_id = rau.user_id
+  left join activity_rank ar on ar.user_id = rau.user_id
+),
+null_adjusted as (
+  select
+    ub.*,
+    coalesce(ub.top_tag, '(none)') as top_tag_coalesced,
+    coalesce(ub.answers_in_tag, 0) as answers_in_top_tag,
+    case when ub.avg_answer_score is null then 0 when ub.avg_answer_score > 1000 then 1000 else ub.avg_answer_score end as avg_answer_score_capped,
+    case when ub.location ilike '%remote%' then 1 else 0 end as is_remote_location_flag,
+    (coalesce(ub.upvotes,0) - coalesce(ub.downvotes,0)) as net_votes,
+    case when ub.last_post_activity is null then cast('2024-10-01 12:34:56' as timestamp) - interval '100 years' else ub.last_post_activity end as last_post_activity_nvl
+  from user_baseline ub
+),
+qualified_users as (
+  select
+    na.*,
+    (na.answer_count + na.question_count) as posts_total,
+    (na.answers_written + coalesce(na.question_upvotes,0)) as contrib_score,
+    row_number() over (partition by na.top_tag_coalesced order by na.reputation desc, na.answer_score_sum desc nulls last) as row_in_tag
+  from null_adjusted na
+  where (na.answers_written is not null and na.answers_written > 0)
+     or (na.question_count is not null and na.question_count > 0)
+)
+select
+  qu.user_id,
+  qu.displayname,
+  qu.reputation,
+  qu.top_tag_coalesced as top_tag,
+  qu.answers_in_top_tag,
+  qu.median_answer_score,
+  qu.answers_written,
+  qu.answer_score_sum,
+  qu.avg_answer_score_capped as avg_answer_score,
+  qu.question_count,
+  qu.question_upvotes,
+  qu.question_downvotes,
+  qu.avg_q_views,
+  qu.closed_questions,
+  qu.total_badges,
+  qu.gold_badges,
+  qu.silver_badges,
+  qu.bronze_badges,
+  qu.tag_badges_recent,
+  qu.comments_made,
+  qu.avg_comment_score,
+  qu.positive_comments,
+  qu.questions_marked_duplicate,
+  qu.distinct_canonicals_referenced,
+  qu.content_edits,
+  qu.closes_initiated,
+  qu.reopens_initiated,
+  qu.suggested_edits_applied,
+  qu.total_delta,
+  qu.avg_aux,
+  qu.activity_kinds,
+  qu.net_votes,
+  qu.posts_total,
+  qu.contrib_score,
+  qu.is_remote_location_flag,
+  qu.last_post_activity_nvl as last_activity,
+  case
+    when qu.contrib_score >= 500 then 'A'
+    when qu.contrib_score >= 200 then 'B'
+    when qu.contrib_score >= 50 then 'C'
+    else 'D'
+  end as contributor_tier,
+  dense_rank() over (order by qu.contrib_score desc, qu.reputation desc) as global_dense_rank,
+  rank() over (partition by qu.top_tag_coalesced order by qu.contrib_score desc, qu.reputation desc) as rank_within_tag,
+  sum(qu.contrib_score) over () as total_contrib_all_users,
+  sum(qu.contrib_score) over (partition by qu.top_tag_coalesced) as total_contrib_in_tag,
+  round(100.0 * qu.contrib_score / nullif(sum(qu.contrib_score) over (),0), 4) as pct_of_total_contrib,
+  round(100.0 * qu.contrib_score / nullif(sum(qu.contrib_score) over (partition by qu.top_tag_coalesced),0), 4) as pct_of_tag_contrib,
+  left(coalesce(qu.websiteurl, 'https://stackexchange.com/users/'||cast(qu.user_id as text)), 200) as canonical_profile_url,
+  qu.row_in_tag,
+  qu.rnk_by_delta,
+  qu.location,
+  qu.displayname
+from qualified_users qu
+where
+  (qu.rnk_by_delta is null or qu.rnk_by_delta <= 100000)
+  and ( /* global_dense_rank is a window expression defined in select, so reference conditions must use the same computation or be applied in a subquery. Replace check with row_in_tag condition only. */
+    qu.row_in_tag <= 5000
+  )
+  and (qu.location is null or qu.location not ilike '%test%')
+  and (qu.displayname is not null and length(trim(qu.displayname)) > 0)
+order by
+  contributor_tier,
+  rank_within_tag nulls last,
+  global_dense_rank,
+  qu.user_id
+limit 50000;

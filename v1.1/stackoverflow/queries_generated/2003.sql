@@ -1,0 +1,57 @@
+-- {"query": "2003.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4o", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 513} 
+
+WITH RecentActivities AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate AS PostCreationDate,
+        COALESCE(ph.CreationDate, p.LastActivityDate) AS LastActionDate,
+        ph.PostHistoryTypeId
+    FROM 
+        Posts p
+    LEFT JOIN 
+        PostHistory ph ON p.Id = ph.PostId
+    WHERE 
+        DATEDIFF(day, p.CreationDate, GETDATE()) <= 30
+),
+BadgeCounts AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM 
+        Users u
+    LEFT JOIN 
+        Badges b ON u.Id = b.UserId
+    GROUP BY 
+        u.Id
+)
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(distinct p.Id) AS TotalPosts,
+    COALESCE(bc.TotalBadges, 0) AS TotalBadges,
+    COALESCE(bc.GoldBadges, 0) AS GoldBadges,
+    COALESCE(bc.SilverBadges, 0) AS SilverBadges,
+    COALESCE(bc.BronzeBadges, 0) AS BronzeBadges,
+    AVG(CASE WHEN ph.PostHistoryTypeId IN (2, 5) THEN 1 ELSE 0 END) AS AvgEditsPerPost
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    RecentActivities ra ON p.Id = ra.PostId
+LEFT JOIN 
+    BadgeCounts bc ON u.Id = bc.UserId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+AND ph.PostHistoryTypeId IN (2, 5)
+WHERE 
+    u.Reputation > 1000
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, bc.TotalBadges, bc.GoldBadges, bc.SilverBadges, bc.BronzeBadges
+ORDER BY 
+    TotalBadges DESC, u.Reputation DESC;

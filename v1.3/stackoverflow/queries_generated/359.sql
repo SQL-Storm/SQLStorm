@@ -1,0 +1,328 @@
+-- {"query": "359.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 16068} 
+WITH
+tags_exploded AS (
+  SELECT p.Id AS question_id,
+         trim(t) AS tag
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(p.Tags, 2, char_length(p.Tags)-2), '><')) AS t
+  ) s
+  WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND char_length(p.Tags) > 2
+),
+tag_stats AS (
+  SELECT te.tag,
+         COUNT(*) AS tag_q_count,
+         AVG(p.ViewCount)::numeric AS avg_views,
+         AVG(p.Score)::numeric AS avg_score
+  FROM tags_exploded te
+  JOIN Posts p ON p.Id = te.question_id
+  GROUP BY te.tag
+),
+user_badges AS (
+  SELECT u.Id AS user_id,
+         u.Reputation,
+         COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END),0) AS gold_badges,
+         COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END),0) AS silver_badges,
+         COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END),0) AS bronze_badges,
+         COALESCE(COUNT(b.Id),0) AS total_badges
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id, u.Reputation
+),
+answer_stats AS (
+  SELECT a.ParentId AS question_id,
+         COUNT(*) AS answer_count,
+         AVG(a.Score)::numeric AS avg_answer_score,
+         MAX(a.Score) AS top_answer_score,
+         MIN(a.Score) AS low_answer_score,
+         array_agg(a.Score ORDER BY a.Score) AS score_array,
+         array_agg(a.Id ORDER BY a.Score DESC NULLS LAST) AS answer_ids_by_score_desc
+  FROM Posts a
+  WHERE a.PostTypeId = 2 AND a.ParentId IS NOT NULL
+  GROUP BY a.ParentId
+),
+answer_median AS (
+  SELECT question_id,
+         answer_count,
+         avg_answer_score,
+         top_answer_score,
+         low_answer_score,
+         score_array,
+         score_array[ceil(array_length(score_array,1)/2.0)::int] AS median_answer_score,
+         answer_ids_by_score_desc[1] AS top_answer_id
+  FROM answer_stats
+),
+post_history_counts AS (
+  SELECT ph.PostId AS post_id,
+         SUM(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS edits,
+         SUM(CASE WHEN ph.PostHistoryTypeId IN (10,11) THEN 1 ELSE 0 END) AS closes_reopens,
+         SUM(CASE WHEN ph.PostHistoryTypeId IN (12,13) THEN 1 ELSE 0 END) AS deletions_undeletes,
+         COUNT(*) AS total_history_events
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+comment_stats AS (
+  SELECT c.PostId AS post_id,
+         COUNT(*) AS comment_count,
+         SUM(CASE WHEN c.UserId IS NULL THEN 1 ELSE 0 END) AS anon_comments
+  FROM Comments c
+  GROUP BY c.PostId
+),
+vote_stats AS (
+  SELECT v.PostId AS post_id,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+         SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS accepted_by_originator,
+         SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS favorites,
+         COUNT(*) AS total_votes,
+         COALESCE(SUM(v.BountyAmount),0) AS bounty_sum
+  FROM Votes v
+  GROUP BY v.PostId
+),
+link_stats AS (
+  SELECT pl.PostId AS post_id,
+         SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS links_out,
+         SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS duplicates_of_others,
+         COUNT(*) AS link_count,
+         array_agg(pl.RelatedPostId) AS related_post_ids
+  FROM PostLinks pl
+  GROUP BY pl.PostId
+),
+accepted_info AS (
+  SELECT q.Id AS question_id,
+         q.AcceptedAnswerId,
+         a.Score AS accepted_score,
+         a.OwnerUserId AS accepted_by_user_id,
+         a.CreationDate AS accepted_creation_date
+  FROM Posts q
+  LEFT JOIN Posts a ON a.Id = q.AcceptedAnswerId
+  WHERE q.PostTypeId = 1
+),
+first_answer_info AS (
+  SELECT q.Id AS question_id,
+         fa.first_answer_id,
+         fa.first_answer_date,
+         fa.first_answer_score
+  FROM Posts q
+  LEFT JOIN LATERAL (
+    SELECT a.Id AS first_answer_id, a.CreationDate AS first_answer_date, a.Score AS first_answer_score
+    FROM Posts a
+    WHERE a.ParentId = q.Id AND a.PostTypeId = 2
+    ORDER BY a.CreationDate ASC NULLS LAST
+    LIMIT 1
+  ) fa ON true
+  WHERE q.PostTypeId = 1
+),
+top_commenter AS (
+  SELECT q.Id AS question_id,
+         tc.user_id AS top_commenter_user_id,
+         tc.user_display AS top_commenter_name,
+         tc.comment_count AS top_commenter_count
+  FROM Posts q
+  LEFT JOIN LATERAL (
+    SELECT c.UserId AS user_id, c.UserDisplayName AS user_display, COUNT(*) AS comment_count
+    FROM Comments c
+    WHERE c.PostId = q.Id
+    GROUP BY c.UserId, c.UserDisplayName
+    ORDER BY COUNT(*) DESC NULLS LAST
+    LIMIT 1
+  ) tc ON true
+  WHERE q.PostTypeId = 1
+),
+question_tag_metrics AS (
+  SELECT q.Id AS question_id,
+         array_remove(array_agg(te.tag ORDER BY COALESCE(ts.tag_q_count,0) DESC NULLS LAST), NULL) AS tags_ordered_by_popularity,
+         (array_agg(te.tag ORDER BY COALESCE(ts.tag_q_count,0) DESC NULLS LAST))[1] AS top_tag,
+         (array_agg(te.tag ORDER BY COALESCE(ts.tag_q_count,0) ASC NULLS LAST))[1] AS rarest_tag
+  FROM Posts q
+  LEFT JOIN tags_exploded te ON te.question_id = q.Id
+  LEFT JOIN tag_stats ts ON ts.tag = te.tag
+  WHERE q.PostTypeId = 1
+  GROUP BY q.Id
+),
+main_metrics AS (
+  SELECT q.Id AS question_id,
+         q.Title AS title,
+         q.OwnerUserId AS owner_user_id,
+         q.OwnerDisplayName AS owner_display_name,
+         u.Reputation AS reputation,
+         COALESCE(ub.gold_badges,0) AS gold_badges,
+         COALESCE(ub.silver_badges,0) AS silver_badges,
+         COALESCE(ub.bronze_badges,0) AS bronze_badges,
+         q.CreationDate AS creation_date,
+         q.ViewCount AS view_count,
+         q.Score AS question_score,
+         q.AnswerCount AS answer_count,
+         q.CommentCount AS comment_count,
+         q.FavoriteCount AS favorite_count,
+         COALESCE(ans.answer_count,0) AS computed_answer_count,
+         ans.avg_answer_score AS avg_answer_score,
+         ans.median_answer_score AS median_answer_score,
+         accept.AcceptedAnswerId AS accepted_answer_id,
+         accept.accepted_score AS accepted_score,
+         first.first_answer_date AS first_answer_date,
+         first.first_answer_score AS first_answer_score,
+         COALESCE(hist.edits,0) AS edits,
+         COALESCE(hist.closes_reopens,0) AS closes_reopens,
+         COALESCE(vs.upvotes,0) AS upvotes,
+         COALESCE(vs.downvotes,0) AS downvotes,
+         COALESCE(vs.total_votes,0) AS total_votes,
+         COALESCE(vs.favorites,0) AS favorites,
+         COALESCE(ls.links_out,0) AS links_out,
+         COALESCE(ls.duplicates_of_others,0) AS duplicates_of_others,
+         qtm.top_tag AS top_tag,
+         qtm.rarest_tag AS rarest_tag,
+         COALESCE(u.Reputation,0) + COALESCE(ub.gold_badges,0)*100 + COALESCE(ub.silver_badges,0)*20 + COALESCE(ub.bronze_badges,0)*5 AS author_influence,
+         COALESCE(q.FavoriteCount,0) + COALESCE(vs.favorites,0) AS total_fav_marks,
+         (COALESCE(q.Score,0) * 2.0
+          + COALESCE(ans.avg_answer_score,0) * 1.5
+          + COALESCE(q.AnswerCount,0) * 1.2
+          + LN(GREATEST(COALESCE(q.ViewCount,0),1)) * 3.0
+          - COALESCE(vs.downvotes,0) * 1.5
+          + GREATEST(COALESCE(ub.gold_badges,0),0) * 5.0
+          + COALESCE(vs.bounty_sum,0) * 0.8
+         ) AS composite_score,
+         CASE
+           WHEN accept.AcceptedAnswerId IS NOT NULL THEN EXTRACT(EPOCH FROM (accept.accepted_creation_date - q.CreationDate))/3600.0
+           ELSE NULL
+         END AS hours_to_accept,
+         CASE
+           WHEN first.first_answer_date IS NOT NULL THEN EXTRACT(EPOCH FROM (first.first_answer_date - q.CreationDate))/3600.0
+           ELSE NULL
+         END AS hours_to_first_answer,
+         (SELECT COUNT(*) FROM Posts a2 WHERE a2.ParentId = q.Id AND a2.Score > COALESCE(q.Score,0)) AS answers_with_score_higher_than_question,
+         (SELECT COUNT(*) FROM PostLinks pl2 WHERE pl2.RelatedPostId = q.Id AND pl2.LinkTypeId = 3) AS duplicates_pointing_here,
+         tc.top_commenter_user_id AS top_commenter_user_id,
+         tc.top_commenter_name AS top_commenter_name,
+         tc.top_commenter_count AS top_commenter_count,
+         array_to_string(qtm.tags_ordered_by_popularity, ' | ') AS tags_ordered_by_popularity_str,
+         CASE
+           WHEN q.Title IS NULL THEN 'untitled'
+           WHEN LOWER(q.Title) SIMILAR TO '%(error|exception|fail|panic|segfault)%' THEN 'likely_bug_report'
+           ELSE 'normal'
+         END AS title_sentiment_hint,
+         NULLIF(COALESCE(q.Score,0),0) AS nullif_question_score,
+         CASE WHEN q.AnswerCount <> 0 THEN COALESCE(q.Score,0) * 1.0 / NULLIF(COALESCE(q.AnswerCount,0),0) ELSE NULL END AS score_per_answer
+  FROM Posts q
+  LEFT JOIN Users u ON u.Id = q.OwnerUserId
+  LEFT JOIN user_badges ub ON ub.user_id = u.Id
+  LEFT JOIN answer_median ans ON ans.question_id = q.Id
+  LEFT JOIN accepted_info accept ON accept.question_id = q.Id
+  LEFT JOIN first_answer_info first ON first.question_id = q.Id
+  LEFT JOIN post_history_counts hist ON hist.post_id = q.Id
+  LEFT JOIN vote_stats vs ON vs.post_id = q.Id
+  LEFT JOIN link_stats ls ON ls.post_id = q.Id
+  LEFT JOIN question_tag_metrics qtm ON qtm.question_id = q.Id
+  LEFT JOIN top_commenter tc ON tc.question_id = q.Id
+  WHERE q.PostTypeId = 1
+),
+top_by_composite AS (
+  SELECT
+    question_id,
+    title,
+    owner_user_id,
+    owner_display_name,
+    reputation,
+    gold_badges,
+    silver_badges,
+    bronze_badges,
+    view_count,
+    question_score,
+    answer_count,
+    computed_answer_count,
+    avg_answer_score,
+    median_answer_score,
+    accepted_answer_id,
+    accepted_score,
+    hours_to_accept,
+    hours_to_first_answer,
+    edits AS edit_count,
+    closes_reopens,
+    upvotes,
+    downvotes,
+    total_votes,
+    favorites,
+    links_out,
+    duplicates_of_others,
+    top_tag,
+    rarest_tag,
+    composite_score,
+    'by_composite'::text AS bucket
+  FROM main_metrics
+  ORDER BY composite_score DESC NULLS LAST
+  LIMIT 25
+),
+top_by_views AS (
+  SELECT
+    question_id,
+    title,
+    owner_user_id,
+    owner_display_name,
+    reputation,
+    gold_badges,
+    silver_badges,
+    bronze_badges,
+    view_count,
+    question_score,
+    answer_count,
+    computed_answer_count,
+    avg_answer_score,
+    median_answer_score,
+    accepted_answer_id,
+    accepted_score,
+    hours_to_accept,
+    hours_to_first_answer,
+    edits AS edit_count,
+    closes_reopens,
+    upvotes,
+    downvotes,
+    total_votes,
+    favorites,
+    links_out,
+    duplicates_of_others,
+    top_tag,
+    rarest_tag,
+    composite_score,
+    'by_views'::text AS bucket
+  FROM main_metrics
+  ORDER BY view_count DESC NULLS LAST
+  LIMIT 25
+),
+top_composite_only_ids AS (
+  SELECT question_id FROM top_by_composite
+  EXCEPT
+  SELECT question_id FROM top_by_views
+),
+top_views_only_ids AS (
+  SELECT question_id FROM top_by_views
+  EXCEPT
+  SELECT question_id FROM top_by_composite
+),
+top_both_ids AS (
+  SELECT question_id FROM top_by_composite
+  INTERSECT
+  SELECT question_id FROM top_by_views
+),
+top_union AS (
+  SELECT * FROM top_by_composite
+  UNION ALL
+  SELECT * FROM top_by_views
+)
+SELECT
+  ut.*,
+  CASE
+    WHEN tb.question_id IS NOT NULL THEN 'both'
+    WHEN comp_only.question_id IS NOT NULL THEN 'composite_only'
+    WHEN views_only.question_id IS NOT NULL THEN 'views_only'
+    ELSE 'other'
+  END AS classification,
+  (SELECT array_to_string((array_agg(b2.Name ORDER BY b2.Date DESC))[1:5], ', ')
+   FROM Badges b2 WHERE b2.UserId = ut.owner_user_id) AS recent_badges,
+  (SELECT LENGTH(Body) FROM Posts p2 WHERE p2.Id = ut.question_id) AS body_length,
+  (SELECT COUNT(*) FROM PostHistory ph2 WHERE ph2.PostId = ut.question_id AND ph2.PostHistoryTypeId = 16) AS community_owned_events
+FROM top_union ut
+LEFT JOIN top_both_ids tb ON ut.question_id = tb.question_id
+LEFT JOIN top_composite_only_ids comp_only ON ut.question_id = comp_only.question_id
+LEFT JOIN top_views_only_ids views_only ON ut.question_id = views_only.question_id
+ORDER BY classification DESC, composite_score DESC NULLS LAST, view_count DESC NULLS LAST
+LIMIT 50;

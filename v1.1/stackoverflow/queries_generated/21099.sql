@@ -1,0 +1,114 @@
+-- {"query": "21099.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2168, "output_tokens": 1352} 
+
+WITH ActiveUsers AS (
+  SELECT u.Id AS UserId, u.Reputation, u.UpVotes, u.DownVotes,
+         COUNT(DISTINCT p.Id) AS PostCount,
+         SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+         SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+         AVG(p.Score) AS AvgPostScore
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.CreationDate > NOW() - INTERVAL '1 year'
+  WHERE u.Reputation > 100 AND u.LastAccessDate > NOW() - INTERVAL '6 months'
+  GROUP BY u.Id, u.Reputation, u.UpVotes, u.DownVotes
+  HAVING COUNT(DISTINCT p.Id) > 0
+),
+HighActivityPosts AS (
+  SELECT p.Id AS PostId, p.OwnerUserId, p.Score, p.ViewCount,
+         p.CreationDate, p.Title,
+         ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.ViewCount DESC, p.Score DESC) AS UserRank,
+         LAG(p.Title) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PreviousPostTitle,
+         COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) AS InteractionScore
+  FROM Posts p
+  WHERE p.PostTypeId IN (1, 2) AND p.Score > 0 AND p.ViewCount > 50
+),
+BadgeAchievers AS (
+  SELECT b.UserId, b.Name AS BadgeName, b.Date,
+         COUNT(*) OVER (PARTITION BY b.UserId) AS TotalBadges,
+         STRING_AGG(DISTINCT LEFT(b.Name, 20), ' | ') OVER (PARTITION BY b.UserId) AS BadgeSummary,
+         MAX(b.Date) OVER (PARTITION BY b.UserId) AS LatestBadgeDate
+  FROM Badges b
+  WHERE b.Class <= 2 -- Gold and Silver only
+),
+ClosedPostsAnalysis AS (
+  SELECT ph.PostId,
+         COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Id END) AS CloseVotes,
+         MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate END) AS ReopenDate,
+         SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 11) THEN 1 ELSE 0 END) AS CloseReopenActivity,
+         JSON_EXTRACT(ph.Text, '$.voters') AS VoterData -- Assuming JSON support
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (10, 11, 13)
+  GROUP BY ph.PostId
+)
+SELECT 
+  au.UserId,
+  au.Reputation,
+  au.PostCount,
+  au.InteractionScore AS UserInteractions,
+  hap.PostId,
+  hap.Title,
+  hap.Score AS PostScore,
+  hap.ViewCount,
+  hap.UserRank,
+  COALESCE(hap.PreviousPostTitle, 'First Post') AS PrevTitleSnippet,
+  ba.BadgeName,
+  ba.TotalBadges,
+  ba.BadgeSummary,
+  cpa.CloseVotes,
+  CASE 
+    WHEN cpa.CloseVotes > 0 AND hap.PostId IS NOT NULL THEN 
+      CONCAT('Closed with ', cpa.CloseVotes::text, ' votes')
+    WHEN hap.InteractionScore > 100 THEN 'Highly Interactive'
+    WHEN au.AvgPostScore > 5 THEN 'Quality Contributor'
+    ELSE 'Standard User'
+  END AS UserStatusCategory,
+  -- Complex calculation: Weighted engagement score
+  (au.Reputation * 0.4 + 
+   COALESCE(hap.ViewCount, 0) * 0.3 + 
+   COALESCE(ba.TotalBadges, 0) * 10 + 
+   COALESCE(cpa.CloseReopenActivity, 0) * 5) AS EngagementScore,
+  -- String manipulation example
+  UPPER(SUBSTRING(hap.Title FROM 1 FOR 50)) || 
+  CASE WHEN ba.LatestBadgeDate IS NOT NULL 
+       THEN ' | Latest: ' || TO_CHAR(ba.LatestBadgeDate, 'MM/DD') 
+       ELSE '' END AS FormattedTitle,
+  -- NULL logic demonstration
+  GREATEST(
+    COALESCE(hap.Score, 0),
+    COALESCE(au.AvgPostScore, 0),
+    1
+  ) AS NormalizedScore
+FROM ActiveUsers au
+FULL OUTER JOIN HighActivityPosts hap ON au.UserId = hap.OwnerUserId AND hap.UserRank <= 3
+LEFT JOIN BadgeAchievers ba ON au.UserId = ba.UserId AND ba.Date > NOW() - INTERVAL '6 months'
+LEFT JOIN ClosedPostsAnalysis cpa ON hap.PostId = cpa.PostId
+WHERE (au.Reputation > 500 OR ba.TotalBadges > 10)
+  AND (hap.ViewCount > 100 OR cpa.CloseVotes IS NULL)
+  AND NOT (LOWER(COALESCE(hap.Title, '')) LIKE '%spam%' OR au.DownVotes > au.UpVotes * 2)
+UNION ALL
+SELECT 
+  NULL AS UserId, -- For aggregate row
+  AVG(au.Reputation) AS Reputation,
+  SUM(au.PostCount) AS PostCount,
+  SUM(au.InteractionScore) AS UserInteractions,
+  NULL AS PostId,
+  'AGGREGATE SUMMARY' AS Title,
+  AVG(hap.Score) AS PostScore,
+  AVG(hap.ViewCount) AS ViewCount,
+  NULL AS UserRank,
+  NULL AS PrevTitleSnippet,
+  NULL AS BadgeName,
+  AVG(ba.TotalBadges) AS TotalBadges,
+  NULL AS BadgeSummary,
+  AVG(cpa.CloseVotes) AS CloseVotes,
+  'Summary Stats' AS UserStatusCategory,
+  AVG(EngagementScore) AS EngagementScore,
+  'OVERALL AVERAGE METRICS' AS FormattedTitle,
+  AVG(NormalizedScore) AS NormalizedScore
+FROM ActiveUsers au
+FULL OUTER JOIN HighActivityPosts hap ON au.UserId = hap.OwnerUserId
+LEFT JOIN BadgeAchievers ba ON au.UserId = ba.UserId
+LEFT JOIN ClosedPostsAnalysis cpa ON hap.PostId = cpa.PostId
+ORDER BY 
+  CASE WHEN UserId IS NULL THEN 0 ELSE 1 END, -- Aggregates first
+  EngagementScore DESC NULLS LAST,
+  UserId;

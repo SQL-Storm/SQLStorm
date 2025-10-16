@@ -1,0 +1,121 @@
+-- {"query": "9044.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2013, "output_tokens": 5111} 
+WITH
+  RecentPosts AS (
+    SELECT
+      p.Id,
+      p.PostTypeId,
+      p.Title,
+      p.Tags,
+      p.OwnerUserId,
+      p.CreationDate,
+      ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '7 days'
+  ),
+  UserStats AS (
+    SELECT
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      COALESCE(
+        SUM(
+          CASE
+            WHEN v.VoteTypeId = 2 THEN  1
+            WHEN v.VoteTypeId = 3 THEN -1
+            ELSE 0
+          END
+        ), 0
+      ) AS vote_diff,
+      COUNT(b.Id) FILTER (WHERE b.Class = 1) AS gold,
+      COUNT(b.Id) FILTER (WHERE b.Class = 2) AS silver,
+      COUNT(b.Id) FILTER (WHERE b.Class = 3) AS bronze
+    FROM Users u
+    LEFT JOIN Votes v  ON v.UserId  = u.Id
+    LEFT JOIN Badges b ON b.UserId  = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+  ),
+  QA_CTE AS (
+    SELECT
+      q.Id      AS qid,
+      q.Title,
+      a.Id      AS aid,
+      a.Score   AS a_score,
+      (
+        SELECT COUNT(*)
+        FROM Comments c
+        WHERE c.PostId      = a.Id
+          AND c.CreationDate > q.CreationDate
+      )           AS recent_comments,
+      COALESCE(a.OwnerUserId, -1) AS answerer
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+      AND q.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1)
+  ),
+  MergedTags AS (
+    SELECT TagName AS Name, Count FROM Tags
+    UNION
+    SELECT Name, COUNT(*) FROM Badges GROUP BY Name
+  ),
+  IntersectTagsBadges AS (
+    SELECT Name, Count FROM MergedTags
+    INTERSECT
+    SELECT Name, COUNT(*) FROM Badges GROUP BY Name
+  ),
+  ExceptTagsBadges AS (
+    SELECT TagName AS Name FROM Tags
+    EXCEPT
+    SELECT Name FROM Badges
+  ),
+  FlagCounts AS (
+    SELECT
+      ph.PostId,
+      COUNT(*) AS flags
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10,12,19,20)
+    GROUP BY ph.PostId
+  )
+SELECT
+  rp.Id                      AS post_id,
+  rp.PostTypeId,
+  COALESCE(rp.Title, '')     AS title,
+  COALESCE(rp.Tags, '')      AS tags,
+  us.DisplayName,
+  us.Reputation,
+  us.vote_diff,
+  us.gold,
+  us.silver,
+  us.bronze,
+  qc.aid,
+  qc.a_score,
+  qc.recent_comments,
+  fc.flags,
+  CASE
+    WHEN rp.PostTypeId = 1
+     AND EXISTS (SELECT 1 FROM Posts a WHERE a.ParentId = rp.Id)
+    THEN 'HasAnswers'
+    ELSE 'NoAnswers'
+  END                         AS has_answers,
+  (
+    SELECT MAX(LENGTH(c.Text))
+    FROM Comments c
+    WHERE c.PostId = rp.Id
+  )                           AS max_comment_len,
+  DENSE_RANK() OVER (ORDER BY us.Reputation DESC) AS user_rank,
+  (LENGTH(rp.Tags) - LENGTH(REPLACE(rp.Tags, '><', ''))) AS tag_count
+FROM RecentPosts rp
+LEFT JOIN UserStats us ON us.Id     = rp.OwnerUserId
+LEFT JOIN QA_CTE    qc ON qc.qid    = rp.Id
+LEFT JOIN FlagCounts fc ON fc.PostId = rp.Id
+WHERE rp.rn <= 10
+  AND us.vote_diff <> 0
+  AND rp.Tags LIKE '%<sql>%'
+
+UNION ALL
+
+SELECT
+  0, 0, NULL, NULL, NULL, 0, 0, 0, 0, 0,
+  NULL, 0, 0, 0, 'None', 0, 0
+FROM ExceptTagsBadges etb
+
+LIMIT 50;

@@ -1,0 +1,149 @@
+(
+    select q.id as question_id,
+           u.id as owner_id,
+           u.displayname as owner_name,
+           u.reputation as owner_rep,
+           ru.country_guess,
+           ub.gold_cnt,
+           ub.silver_cnt,
+           ub.bronze_cnt,
+           coalesce(ub.last_badge_at, u.creationdate) as last_badge_at
+    from question_posts q
+    left join users u on u.id = q.owneruserid
+    left join recent_users ru on ru.user_id = u.id
+    left join user_badge_agg ub on ub.userid = u.id
+),
+rankings as (
+    select q.id as question_id,
+           q.viewcount,
+           q.score,
+           qa.upvotes,
+           qa.downvotes,
+           row_number() over (order by coalesce(qa.upvotes,0) - coalesce(qa.downvotes,0) desc, q.score desc, q.viewcount desc) as rn_net_votes,
+           row_number() over (order by q.viewcount desc nulls last) as rn_views,
+           dense_rank() over (order by q.score desc nulls last) as dr_score
+    from question_posts q
+    left join q_vote_agg qa on qa.postid = q.id
+),
+stringy as (
+    select q.id as question_id,
+           lower(regexp_replace(coalesce(q.title,''), '\s+', ' ', 'g')) as norm_title,
+           length(coalesce(q.title,'')) as title_len,
+           position(' how ' in lower(' ' || coalesce(q.title,'') || ' ')) as has_how_word,
+           case when coalesce(q.tags,'') like '%<sql>%' then 1 else 0 end as is_sql_tagged
+    from question_posts q
+)
+select
+    q.id as question_id,
+    oe.owner_id,
+    coalesce(oe.owner_name, cast(q.owneruserid as varchar)) as owner_name,
+    oe.owner_rep,
+    oe.country_guess,
+    q.creationdate as question_created_at,
+    q.title,
+    se.norm_title,
+    se.title_len,
+    se.has_how_word,
+    se.is_sql_tagged,
+    q.tags,
+    qa.upvotes,
+    qa.downvotes,
+    qa.favorites,
+    q.score,
+    q.viewcount,
+    cs.comment_count,
+    cs.positive_comments,
+    cs.last_comment_at,
+    aa.answers_total,
+    aa.avg_answer_score,
+    aa.max_answer_score,
+    aa.positive_answers,
+    al.time_to_accept,
+    ea.edit_count,
+    ea.first_edit_at,
+    ea.last_edit_at,
+    ea.close_or_migrate_cnt,
+    ea.last_close_reason_id,
+    dl.original_question_id,
+    dl.dupe_marked_at,
+    rf.ever_hot,
+    rf.removed_hot,
+    qt.tag_count,
+    qt.in_top10,
+    aw.view_quartile,
+    aw.global_median_score,
+    r.rn_net_votes,
+    r.rn_views,
+    r.dr_score,
+    case
+        when q.acceptedanswerid is not null and coalesce(aa.answers_total,0) > 0 then 1
+        when q.acceptedanswerid is null and coalesce(aa.answers_total,0) = 0 then 0
+        else null
+    end as accepted_given_answers_flag,
+    case
+        when coalesce(qa.upvotes,0) >= 10 and coalesce(cs.comment_count,0) >= 5 then 'high engagement'
+        when coalesce(qa.upvotes,0) - coalesce(qa.downvotes,0) < 0 then 'controversial'
+        else 'normal'
+    end as engagement_bucket,
+    (
+        select count(*)
+        from answer_posts ap2
+        where ap2.question_id = q.id
+          and ap2.creationdate <= q.creationdate + interval '1 day'
+    ) as answers_in_24h,
+    (
+        select avg(a2.score)
+        from posts a2
+        where a2.posttypeid = 2
+          and a2.parentid = q.id
+          and a2.creationdate >= q.creationdate
+    ) as avg_answer_score_after_post,
+    (
+        select count(distinct x.uid)
+        from (
+            select v.userid as uid from votes v where v.postid = q.id and v.userid is not null
+            union all
+            select c.userid as uid from comments c where c.postid = q.id and c.userid is not null
+        ) x
+    ) as distinct_participants,
+    greatest(
+        coalesce(q.viewcount, 0),
+        coalesce(qa.upvotes, 0) * 50 + coalesce(qa.downvotes, 0) * 30 + coalesce(qa.favorites, 0) * 80
+    ) as rough_popularity_score,
+    coalesce(oe.gold_cnt,0) + coalesce(oe.silver_cnt,0) + coalesce(oe.bronze_cnt,0) as total_badges_owner,
+    avg(q.score) over (partition by case when se.is_sql_tagged = 1 then 'sql' else 'other' end) as avg_score_by_sql_tag
+from question_posts q
+left join q_vote_agg qa on qa.postid = q.id
+left join comment_stats cs on cs.postid = q.id
+left join answerer_stats aa on aa.question_id = q.id
+left join accepted_answer_latency al on al.question_id = q.id
+left join edits_agg ea on ea.postid = q.id
+left join dupe_links dl on dl.dup_question_id = q.id
+left join recent_hot_candidates rf on rf.question_id = q.id
+left join q_tag_focus qt on qt.question_id = q.id
+left join activity_window aw on aw.question_id = q.id
+left join owner_enriched oe on oe.question_id = q.id
+left join rankings r on r.question_id = q.id
+left join stringy se on se.question_id = q.id
+where
+    (
+        (coalesce(qa.upvotes,0) - coalesce(qa.downvotes,0)) >= -2
+        or (ea.edit_count is not null and ea.edit_count >= 1)
+        or rf.ever_hot = 1
+    )
+    and (qt.tag_count is null or qt.tag_count between 1 and 7)
+    and (
+        q.creationdate >= (select max(creationdate) - interval '180 days' from posts where posttypeid = 1)
+        or oe.owner_rep >= (select percentile_disc(0.9) within group (order by reputation) from users)
+    )
+    and not exists (
+        select 1
+        from posthistory phx
+        where phx.postid = q.id
+          and phx.posthistorytypeid in (12)
+    )
+order by
+    rough_popularity_score desc,
+    coalesce(qa.upvotes,0) - coalesce(qa.downvotes,0) desc,
+    q.viewcount desc
+limit 500;

@@ -1,0 +1,95 @@
+WITH ranked_posts AS (
+  SELECT 
+    p.Id,
+    p.Score,
+    p.ViewCount,
+    ROW_NUMBER() OVER (ORDER BY p.Score DESC) AS score_rank,
+    ROW_NUMBER() OVER (ORDER BY p.ViewCount DESC) AS view_rank
+  FROM 
+    Posts p
+  WHERE 
+    p.PostTypeId = 1 AND p.Score > 0
+),
+top_answerers AS (
+  SELECT 
+    u.Id,
+    u.DisplayName,
+    COUNT(a.Id) AS answer_count,
+    SUM(CASE WHEN a.Score > 0 THEN 1 ELSE 0 END) AS positive_answers
+  FROM 
+    Users u
+  JOIN 
+    Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+  GROUP BY 
+    u.Id, u.DisplayName
+  HAVING 
+    COUNT(a.Id) > 10 AND SUM(CASE WHEN a.Score > 0 THEN 1 ELSE 0 END) > 5
+),
+question_tags AS (
+  SELECT 
+    p.Id,
+    STRING_AGG(t.TagName, ', ') AS tags
+  FROM 
+    Posts p
+  JOIN 
+    PostTags pt ON p.Id = pt.PostId
+  JOIN 
+    Tags t ON pt.TagId = t.Id
+  WHERE 
+    p.PostTypeId = 1
+  GROUP BY 
+    p.Id
+)
+SELECT 
+  p.Id,
+  p.Title,
+  p.Score,
+  p.ViewCount,
+  rp.score_rank,
+  rp.view_rank,
+  qt.tags,
+  ta.answer_count,
+  ta.positive_answers,
+  u.Reputation,
+  u.DisplayName,
+  v.VoteTypeId,
+  ph.PostHistoryTypeId,
+  ph.CreationDate,
+  ph.Comment,
+  ph.Text
+FROM 
+  Posts p
+LEFT JOIN 
+  ranked_posts rp ON p.Id = rp.Id
+LEFT JOIN 
+  top_answerers ta ON p.OwnerUserId = ta.Id
+LEFT JOIN 
+  Users u ON p.OwnerUserId = u.Id
+LEFT JOIN 
+  Votes v ON p.Id = v.PostId AND v.VoteTypeId = 2
+LEFT JOIN 
+  PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 10
+LEFT JOIN 
+  question_tags qt ON p.Id = qt.Id
+WHERE 
+  p.PostTypeId = 1 AND p.Score > 0 AND p.ViewCount > 100
+GROUP BY
+  p.Id,
+  p.Title,
+  p.Score,
+  p.ViewCount,
+  rp.score_rank,
+  rp.view_rank,
+  qt.tags,
+  ta.answer_count,
+  ta.positive_answers,
+  u.Reputation,
+  u.DisplayName,
+  v.VoteTypeId,
+  ph.PostHistoryTypeId,
+  ph.CreationDate,
+  ph.Comment,
+  ph.Text
+ORDER BY 
+  p.Score DESC, p.ViewCount DESC
+LIMIT 100;

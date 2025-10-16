@@ -1,0 +1,123 @@
+WITH
+    UserStats AS (
+        SELECT
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS VoteDiff,
+            (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+            (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+            (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+            (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionsPosted,
+            (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswersPosted,
+            (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id
+                 AND p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL) AS QuestionsWithAccepted
+        FROM Users u
+        WHERE u.Reputation > 1000
+    ),
+    PostScoreStats AS (
+        SELECT
+            p.OwnerUserId,
+            AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+            AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore,
+            MAX(p.CreationDate) AS LastPostDate
+        FROM Posts p
+        GROUP BY p.OwnerUserId
+    ),
+    TagExplode AS (
+        SELECT
+            p.Id AS PostId,
+            p.OwnerUserId,
+            TRIM(BOTH '<>' FROM UNNEST(string_to_array(p.Tags, '><'))) AS Tag
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.Tags IS NOT NULL
+    ),
+    TagStats AS (
+        SELECT
+            te.Tag,
+            COUNT(*) AS QuestionCount,
+            COUNT(DISTINCT te.OwnerUserId) AS DistinctAuthors,
+            STRING_AGG(DISTINCT u.DisplayName, ', ') FILTER (WHERE u.DisplayName IS NOT NULL) AS SampleAuthors
+        FROM TagExplode te
+        LEFT JOIN Users u ON u.Id = te.OwnerUserId
+        GROUP BY te.Tag
+    ),
+    RankedUsers AS (
+        SELECT
+            us.Id,
+            us.DisplayName,
+            us.Reputation,
+            us.VoteDiff,
+            us.GoldBadges,
+            us.SilverBadges,
+            us.BronzeBadges,
+            us.QuestionsPosted,
+            us.AnswersPosted,
+            us.QuestionsWithAccepted,
+            COALESCE(ps.AvgQuestionScore, 0) AS AvgQuestionScore,
+            COALESCE(ps.AvgAnswerScore, 0) AS AvgAnswerScore,
+            ps.LastPostDate,
+            RANK() OVER (ORDER BY us.Reputation DESC) AS ReputationRank,
+            CASE
+                WHEN us.QuestionsWithAccepted = 0 THEN NULL
+                ELSE ROUND(CAST(us.AnswersPosted AS DECIMAL) / CAST(us.QuestionsWithAccepted AS DECIMAL), 2)
+            END AS AnswerPerAcceptedRatio
+        FROM UserStats us
+        LEFT JOIN PostScoreStats ps ON ps.OwnerUserId = us.Id
+        WHERE us.Reputation > 2000
+    )
+SELECT
+    ru.Id,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.VoteDiff,
+    ru.GoldBadges,
+    ru.SilverBadges,
+    ru.BronzeBadges,
+    ru.QuestionsPosted,
+    ru.AnswersPosted,
+    ru.QuestionsWithAccepted,
+    ru.AvgQuestionScore,
+    ru.AvgAnswerScore,
+    ru.LastPostDate,
+    ru.ReputationRank,
+    ru.AnswerPerAcceptedRatio,
+    CAST(NULL AS VARCHAR) AS TagName,
+    CAST(NULL AS INTEGER) AS QuestionCount,
+    CAST(NULL AS INTEGER) AS DistinctAuthors,
+    CAST(NULL AS VARCHAR) AS SampleAuthors
+FROM RankedUsers ru
+ORDER BY ru.ReputationRank
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    -1 AS Id,
+    'Tag Summary' AS DisplayName,
+    NULL AS Reputation,
+    NULL AS VoteDiff,
+    NULL AS GoldBadges,
+    NULL AS SilverBadges,
+    NULL AS BronzeBadges,
+    NULL AS QuestionsPosted,
+    NULL AS AnswersPosted,
+    NULL AS QuestionsWithAccepted,
+    NULL AS AvgQuestionScore,
+    NULL AS AvgAnswerScore,
+    NULL AS LastPostDate,
+    NULL AS ReputationRank,
+    NULL AS AnswerPerAcceptedRatio,
+    ts.Tag AS TagName,
+    ts.QuestionCount,
+    ts.DistinctAuthors,
+    ts.SampleAuthors
+FROM TagStats ts
+GROUP BY
+    ts.Tag,
+    ts.QuestionCount,
+    ts.DistinctAuthors,
+    ts.SampleAuthors
+ORDER BY ts.QuestionCount DESC
+LIMIT 20;

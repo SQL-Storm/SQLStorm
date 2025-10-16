@@ -1,0 +1,58 @@
+-- {"query": "26070.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "llama-3.3-instruct", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 487} 
+
+WITH RankedPosts AS (
+  SELECT 
+    P.Id, 
+    P.Score, 
+    P.ViewCount, 
+    P.CreationDate, 
+    P.LastActivityDate, 
+    ROW_NUMBER() OVER (ORDER BY P.Score DESC) AS RowNum,
+    DENSE_RANK() OVER (ORDER BY P.Score DESC) AS DenseRank
+  FROM Posts P
+),
+Top100Posts AS (
+  SELECT * 
+  FROM RankedPosts 
+  WHERE RowNum <= 100
+),
+UserPostStats AS (
+  SELECT 
+    U.Id, 
+    U.DisplayName, 
+    COUNT(DISTINCT P.Id) AS PostCount, 
+    SUM(P.Score) AS TotalScore
+  FROM Users U
+  LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+  GROUP BY U.Id, U.DisplayName
+),
+TopVoters AS (
+  SELECT 
+    V.UserId, 
+    COUNT(DISTINCT V.Id) AS VoteCount
+  FROM Votes V
+  GROUP BY V.UserId
+  ORDER BY VoteCount DESC
+  LIMIT 10
+)
+SELECT 
+  P.Id, 
+  P.Title, 
+  P.Score, 
+  P.ViewCount, 
+  P.CreationDate, 
+  P.LastActivityDate, 
+  U.DisplayName AS OwnerDisplayName, 
+  U.Reputation AS OwnerReputation, 
+  UPS.PostCount AS OwnerPostCount, 
+  UPS.TotalScore AS OwnerTotalScore, 
+  TV.VoteCount AS OwnerVoteCount,
+  (SELECT COUNT(*) FROM Comments C WHERE C.PostId = P.Id) AS CommentCount,
+  (SELECT COUNT(*) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId = 10) AS CloseVoteCount,
+  (SELECT COUNT(*) FROM PostLinks PL WHERE PL.PostId = P.Id AND PL.LinkTypeId = 1) AS LinkedPostCount,
+  (SELECT COUNT(*) FROM Tags T WHERE T.TagName IN (SELECT value FROM string_to_array(substring(P.Tags, 2, length(P.Tags)-2), ''><'')) AND T.IsModeratorOnly = FALSE) AS TagCount
+FROM Top100Posts P
+LEFT JOIN Users U ON P.OwnerUserId = U.Id
+LEFT JOIN UserPostStats UPS ON U.Id = UPS.Id
+LEFT JOIN TopVoters TV ON U.Id = TV.UserId
+ORDER BY P.Score DESC;

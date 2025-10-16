@@ -1,0 +1,85 @@
+-- {"query": "11086.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 699} 
+
+WITH RecentPosts AS (
+    SELECT 
+        p.Id, 
+        p.Title, 
+        p.CreationDate, 
+        p.Score, 
+        p.ViewCount, 
+        u.DisplayName AS OwnerDisplayName, 
+        u.Reputation AS OwnerReputation,
+        COUNT(v.Id) AS VoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        MAX(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) AS HighestBounty,
+        COUNT(DISTINCT c.Id) AS CommentCount
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN 
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    WHERE 
+        p.CreationDate > NOW() - INTERVAL '30 days'
+    GROUP BY 
+        p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT 
+        OwnerUserId, 
+        SUM(Score) AS TotalScore, 
+        COUNT(Id) AS TotalPosts, 
+        AVG(Score) AS AvgScore
+    FROM 
+        Posts
+    GROUP BY 
+        OwnerUserId
+    HAVING 
+        COUNT(Id) > 10
+),
+BadgeSummary AS (
+    SELECT 
+        b.UserId, 
+        COUNT(b.Id) AS TotalBadges, 
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges, 
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges, 
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM 
+        Badges b
+    GROUP BY 
+        b.UserId
+)
+SELECT 
+    rp.Id, 
+    rp.Title, 
+    rp.CreationDate, 
+    rp.Score, 
+    rp.ViewCount, 
+    rp.OwnerDisplayName, 
+    rp.OwnerReputation, 
+    rp.VoteCount, 
+    rp.UpVoteCount, 
+    rp.DownVoteCount, 
+    rp.HighestBounty, 
+    rp.CommentCount, 
+    tu.TotalScore, 
+    tu.TotalPosts, 
+    tu.AvgScore, 
+    bs.TotalBadges, 
+    bs.GoldBadges, 
+    bs.SilverBadges, 
+    bs.BronzeBadges
+FROM 
+    RecentPosts rp
+LEFT JOIN 
+    TopUsers tu ON rp.OwnerUserId = tu.OwnerUserId
+LEFT JOIN 
+    BadgeSummary bs ON rp.OwnerUserId = bs.UserId
+ORDER BY 
+    rp.Score DESC, 
+    tu.TotalScore DESC, 
+    bs.TotalBadges DESC
+LIMIT 10;

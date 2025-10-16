@@ -1,0 +1,176 @@
+-- {"query": "17039.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 93400, "output_tokens": 91282} 
+WITH user_activity_metrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS total_posts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS questions_asked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS answers_given,
+        AVG(CASE WHEN p.Score IS NOT NULL THEN p.Score ELSE 0 END) AS avg_post_score,
+        MAX(p.Score) AS max_post_score,
+        STRING_AGG(DISTINCT b.Name, ', ' ORDER BY b.Name) FILTER (WHERE b.Class = 1) AS gold_badges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS gold_badge_count,
+        COALESCE(SUM(p.ViewCount), 0) AS total_views,
+        EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - u.CreationDate))/86400 AS days_since_registration,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS reputation_rank,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS median_score
+    FROM Users u
+    LEFT OUTER JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT OUTER JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 years'
+        AND (u.Location IS NOT NULL OR u.WebsiteUrl IS NOT NULL)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+question_performance AS (
+    SELECT 
+        q.Id AS question_id,
+        q.OwnerUserId,
+        q.Title,
+        q.Score AS question_score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        CASE 
+            WHEN q.AcceptedAnswerId IS NOT NULL THEN 1 
+            ELSE 0 
+        END AS has_accepted_answer,
+        COALESCE(a.Score, 0) AS accepted_answer_score,
+        LENGTH(q.Body) - LENGTH(REPLACE(q.Body, '<code>', '')) AS code_blocks,
+        SUBSTRING(q.Tags, 2, LENGTH(q.Tags)-2) AS tags_cleaned,
+        ROW_NUMBER() OVER (PARTITION BY q.OwnerUserId ORDER BY q.Score DESC) AS user_question_rank,
+        LAG(q.Score, 1, 0) OVER (PARTITION BY q.OwnerUserId ORDER BY q.CreationDate) AS prev_question_score,
+        LEAD(q.Score, 1, 0) OVER (PARTITION BY q.OwnerUserId ORDER BY q.CreationDate) AS next_question_score,
+        EXISTS (
+            SELECT 1 
+            FROM PostHistory ph 
+            WHERE ph.PostId = q.Id 
+                AND ph.PostHistoryTypeId IN (10, 12)
+        ) AS was_closed_or_deleted,
+        (
+            SELECT COUNT(DISTINCT v.UserId)
+            FROM Votes v
+            WHERE v.PostId = q.Id 
+                AND v.VoteTypeId = 2
+                AND v.UserId IN (
+                    SELECT u2.Id 
+                    FROM Users u2 
+                    WHERE u2.Reputation > 10000
+                )
+        ) AS upvotes_from_high_rep_users
+    FROM Posts q
+    LEFT OUTER JOIN Posts a ON q.AcceptedAnswerId = a.Id
+    WHERE q.PostTypeId = 1
+        AND q.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 years'
+        AND q.Score >= 0
+),
+tag_expertise AS (
+    SELECT 
+        u.Id AS user_id,
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS posts_in_tag,
+        SUM(p.Score) AS total_score_in_tag,
+        AVG(NULLIF(p.Score, 0))::NUMERIC(10,2) AS avg_score_in_tag,
+        DENSE_RANK() OVER (PARTITION BY t.TagName ORDER BY SUM(p.Score) DESC NULLS LAST) AS tag_rank,
+        FIRST_VALUE(p.Title) OVER (
+            PARTITION BY u.Id, t.TagName 
+            ORDER BY p.Score DESC NULLS LAST
+            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+        ) AS best_post_title_in_tag
+    FROM Users u
+    INNER JOIN Posts p ON u.Id = p.OwnerUserId
+    CROSS JOIN LATERAL string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><') AS tag_array(tag)
+    INNER JOIN Tags t ON t.TagName = tag_array.tag
+    WHERE p.PostTypeId IN (1, 2)
+        AND p.Score > 0
+        AND t.Count > 100
+    GROUP BY u.Id, t.TagName, p.Title, p.Score
+)
+SELECT 
+    uam.DisplayName,
+    uam.Reputation,
+    uam.reputation_rank,
+    COALESCE(uam.gold_badges, 'No gold badges') AS gold_badges_earned,
+    uam.gold_badge_count,
+    uam.total_posts,
+    uam.questions_asked,
+    uam.answers_given,
+    ROUND(uam.avg_post_score::NUMERIC, 2) AS avg_post_score,
+    uam.max_post_score,
+    uam.median_score,
+    ROUND(uam.total_views / GREATEST(uam.total_posts, 1)::NUMERIC, 0) AS avg_views_per_post,
+    ROUND(uam.days_since_registration::NUMERIC, 0) AS days_on_platform,
+    ROUND((uam.Reputation / NULLIF(uam.days_since_registration, 0))::NUMERIC, 2) AS daily_reputation_rate,
+    COUNT(DISTINCT qp.question_id) AS high_quality_questions,
+    COUNT(DISTINCT CASE WHEN qp.has_accepted_answer = 1 THEN qp.question_id END) AS questions_with_accepted,
+    MAX(qp.question_score) AS best_question_score,
+    STRING_AGG(
+        DISTINCT CASE 
+            WHEN qp.user_question_rank <= 3 AND qp.question_score > 10 
+            THEN LEFT(qp.Title, 50) || CASE WHEN LENGTH(qp.Title) > 50 THEN '...' ELSE '' END
+        END, 
+        ' | ' 
+        ORDER BY CASE 
+            WHEN qp.user_question_rank <= 3 AND qp.question_score > 10 
+            THEN LEFT(qp.Title, 50) || CASE WHEN LENGTH(qp.Title) > 50 THEN '...' ELSE '' END
+        END
+    ) AS top_3_questions,
+    ROUND(AVG(qp.code_blocks)::NUMERIC, 1) AS avg_code_blocks_per_question,
+    SUM(qp.upvotes_from_high_rep_users) AS total_upvotes_from_experts,
+    COUNT(DISTINCT te.TagName) AS expertise_tag_count,
+    STRING_AGG(
+        DISTINCT CASE 
+            WHEN te.tag_rank <= 10 
+            THEN te.TagName || ' (' || te.total_score_in_tag::TEXT || ')'
+        END,
+        ', '
+        ORDER BY CASE 
+            WHEN te.tag_rank <= 10 
+            THEN te.TagName || ' (' || te.total_score_in_tag::TEXT || ')'
+        END
+    ) AS top_tags_with_scores,
+    MAX(te.avg_score_in_tag) AS highest_avg_tag_score,
+    CASE 
+        WHEN uam.Reputation > 50000 AND uam.gold_badge_count > 5 THEN 'Elite Contributor'
+        WHEN uam.Reputation > 20000 AND uam.gold_badge_count > 2 THEN 'Expert'
+        WHEN uam.Reputation > 10000 OR uam.gold_badge_count > 0 THEN 'Advanced'
+        WHEN uam.Reputation > 5000 THEN 'Intermediate'
+        WHEN uam.Reputation > 1000 THEN 'Regular'
+        ELSE 'Beginner'
+    END AS user_tier,
+    COALESCE(
+        CASE 
+            WHEN AVG(qp.question_score - qp.prev_question_score) > 0 THEN 'Improving'
+            WHEN AVG(qp.question_score - qp.prev_question_score) < 0 THEN 'Declining'
+            ELSE 'Stable'
+        END,
+        'No trend data'
+    ) AS performance_trend
+FROM user_activity_metrics uam
+LEFT OUTER JOIN question_performance qp ON uam.Id = qp.OwnerUserId
+LEFT OUTER JOIN tag_expertise te ON uam.Id = te.user_id
+WHERE uam.total_posts > 0
+    AND (uam.questions_asked > 5 OR uam.answers_given > 10 OR uam.Reputation > 5000)
+GROUP BY 
+    uam.Id,
+    uam.DisplayName,
+    uam.Reputation,
+    uam.reputation_rank,
+    uam.gold_badges,
+    uam.gold_badge_count,
+    uam.total_posts,
+    uam.questions_asked,
+    uam.answers_given,
+    uam.avg_post_score,
+    uam.max_post_score,
+    uam.median_score,
+    uam.total_views,
+    uam.days_since_registration
+HAVING COUNT(DISTINCT qp.question_id) > 0 
+    OR COUNT(DISTINCT te.TagName) > 0
+    OR uam.Reputation > 10000
+ORDER BY 
+    uam.reputation_rank ASC,
+    COUNT(DISTINCT qp.question_id) DESC,
+    uam.gold_badge_count DESC
+LIMIT 100;

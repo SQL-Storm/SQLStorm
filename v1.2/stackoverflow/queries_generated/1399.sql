@@ -1,0 +1,143 @@
+-- {"query": "1399.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1272} 
+with TopBadges as (
+    select 
+        b.UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by b.UserId order by b.Date desc) as BadgeRank
+    from Badges b
+    inner join Users u on u.Id = b.UserId
+    where b.Class = 1 -- Gold Badges only
+),
+ActiveUsers as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        u.CreationDate,
+        count(distinct p.Id) as PostCount,
+        count(distinct c.Id) as CommentCount,
+        sum(coalesce(v_total.UpVotes, 0)) - sum(coalesce(v_total.DownVotes, 0)) as NetVotes
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId in (1,2)
+    left join Comments c on c.UserId = u.Id
+    left join (
+        select
+            p.OwnerUserId as UserId,
+            sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+            sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes
+        from Votes v
+        inner join VoteTypes vt on v.VoteTypeId = vt.Id
+        inner join Posts p on p.Id = v.PostId
+        where p.OwnerUserId is not null and vt.Name in ('UpMod', 'DownMod')
+        group by p.OwnerUserId
+    ) v_total on v_total.UserId = u.Id
+    where u.Reputation > 1000 and u.Location is not null
+    group by u.Id, u.DisplayName, u.Reputation, u.Location, u.CreationDate
+),
+QuestionAnswerStats as (
+    select 
+        p.OwnerUserId as UserId,
+        sum(case when pt.Name = 'Question' then 1 else 0 end) as QuestionsCount,
+        sum(case when pt.Name = 'Answer' then 1 else 0 end) as AnswersCount,
+        avg(case when pt.Name = 'Question' then p.Score else null end) as AvgQuestionScore,
+        avg(case when pt.Name = 'Answer' then p.Score else null end) as AvgAnswerScore,
+        max(p.Score) as MaxPostScore
+    from Posts p
+    inner join PostTypes pt on pt.Id = p.PostTypeId
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+UserLatestActivityDates as (
+    select 
+        u.Id as UserId,
+        max(coalesce(p.LastActivityDate, u.LastAccessDate)) as LastActivity
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id
+),
+UserQuestionTags as (
+    select distinct
+        p.OwnerUserId as UserId,
+        unnest(string_to_array(trim(both '<>' from p.Tags), '><')) as Tag
+    from Posts p
+    where p.PostTypeId = 1 and p.OwnerUserId is not null and p.Tags is not null
+),
+FrequentlyUsedTags as (
+    select 
+        ut.UserId,
+        ut.Tag,
+        count(*) as TagUsage,
+        rank() over (partition by ut.UserId order by count(*) desc) as UsageRank
+    from UserQuestionTags ut
+    group by ut.UserId, ut.Tag
+),
+FilteredUsers as (
+    select 
+        au.Id,
+        au.DisplayName,
+        au.Reputation,
+        au.Location,
+        au.PostCount,
+        au.CommentCount,
+        au.NetVotes,
+        qs.QuestionsCount,
+        qs.AnswersCount,
+        qs.AvgQuestionScore,
+        qs.AvgAnswerScore,
+        qs.MaxPostScore,
+        ul.LastActivity,
+        tb.BadgeName as LatestGoldBadge
+    from ActiveUsers au
+    left join QuestionAnswerStats qs on qs.UserId = au.Id
+    left join UserLatestActivityDates ul on ul.UserId = au.Id
+    left join TopBadges tb on tb.UserId = au.Id and tb.BadgeRank = 1
+    where au.PostCount >= 10 and qs.AnswersCount > qs.QuestionsCount
+)
+select 
+    fu.DisplayName,
+    fu.Reputation,
+    fu.Location,
+    fu.PostCount,
+    fu.CommentCount,
+    fu.NetVotes,
+    fu.QuestionsCount,
+    fu.AnswersCount,
+    coalesce(to_char(fu.AvgQuestionScore, 'FM9999990.00'), 'N/A') as AvgQuestionScore,
+    coalesce(to_char(fu.AvgAnswerScore, 'FM9999990.00'), 'N/A') as AvgAnswerScore,
+    fu.MaxPostScore,
+    to_char(fu.LastActivity, 'YYYY-MM-DD') as LastActivityDate,
+    fu.LatestGoldBadge,
+    string_agg(distinct ft.Tag, ', ' order by ft.Tag) as TopTags,
+    case 
+        when fu.NetVotes > 5000 then 'Elite'
+        when fu.NetVotes between 1000 and 5000 then 'Experienced'
+        else 'Intermediate'
+    end as UserRank,
+    length(coalesce(u.AboutMe, '')) as AboutMeLength
+from FilteredUsers fu
+left join Users u on u.Id = fu.Id
+left join (
+    select UserId, Tag from FrequentlyUsedTags where UsageRank <= 3
+) ft on ft.UserId = fu.Id
+group by 
+    fu.DisplayName,
+    fu.Reputation,
+    fu.Location,
+    fu.PostCount,
+    fu.CommentCount,
+    fu.NetVotes,
+    fu.QuestionsCount,
+    fu.AnswersCount,
+    fu.AvgQuestionScore,
+    fu.AvgAnswerScore,
+    fu.MaxPostScore,
+    fu.LastActivity,
+    fu.LatestGoldBadge,
+    u.AboutMe,
+    fu.NetVotes
+having max(fu.MaxPostScore) > 50 
+order by fu.NetVotes desc, fu.PostCount desc
+limit 100;

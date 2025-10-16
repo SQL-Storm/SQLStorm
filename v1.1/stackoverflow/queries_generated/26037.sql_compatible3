@@ -1,0 +1,59 @@
+WITH RECURSIVE PostHierarchy AS (
+  SELECT Id, ParentId, 0 AS Level
+  FROM Posts
+  WHERE PostTypeId = 1
+  UNION ALL
+  SELECT p.Id, p.ParentId, ph.Level + 1
+  FROM Posts p
+  JOIN PostHierarchy ph ON p.ParentId = ph.Id
+),
+TopUsers AS (
+  SELECT u.Id, u.DisplayName, COUNT(DISTINCT p.Id) AS PostCount
+  FROM Users u
+  JOIN Posts p ON u.Id = p.OwnerUserId
+  GROUP BY u.Id, u.DisplayName
+  ORDER BY PostCount DESC
+  LIMIT 10
+),
+UserBadges AS (
+  SELECT u.Id, COUNT(DISTINCT b.Name) AS BadgeCount
+  FROM Users u
+  JOIN Badges b ON u.Id = b.UserId
+  GROUP BY u.Id
+)
+SELECT 
+  p.Id,
+  p.Title,
+  p.Score,
+  ph.Level,
+  tu.DisplayName AS TopUser,
+  ub.BadgeCount,
+  (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 0) AS PositiveComments,
+  (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score < 0) AS NegativeComments,
+  (SELECT COUNT(*) FROM PostHistory ph2 WHERE ph2.PostId = p.Id AND ph2.PostHistoryTypeId = 10) AS CloseVotes,
+  (SELECT COUNT(*) FROM PostHistory ph3 WHERE ph3.PostId = p.Id AND ph3.PostHistoryTypeId = 11) AS ReopenVotes,
+  (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotes,
+  (SELECT COUNT(*) FROM Votes v2 WHERE v2.PostId = p.Id AND v2.VoteTypeId = 3) AS DownVotes,
+  (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 1) AS LinkedPosts,
+  (SELECT COUNT(*) FROM PostLinks pl2 WHERE pl2.RelatedPostId = p.Id AND pl2.LinkTypeId = 1) AS RelatedPosts,
+  (SELECT STRING_AGG(t.TagName, ', ') FROM Tags t JOIN PostTags pt ON t.Id = pt.TagId WHERE pt.PostId = p.Id) AS Tags,
+  CASE 
+    WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+    WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+    ELSE 'Open'
+  END AS Status,
+  p.CreationDate,
+  p.LastActivityDate
+FROM Posts p
+JOIN PostHierarchy ph ON p.Id = ph.Id
+JOIN Users u ON p.OwnerUserId = u.Id
+JOIN TopUsers tu ON u.Id = tu.Id
+JOIN UserBadges ub ON u.Id = ub.Id
+WHERE p.PostTypeId = 1
+  AND p.Score > 0
+  AND p.ViewCount > 100
+  AND p.AnswerCount > 0
+  AND p.FavoriteCount > 0
+  AND p.ClosedDate IS NULL
+  AND p.CommunityOwnedDate IS NULL
+ORDER BY p.Score DESC, p.CreationDate ASC;

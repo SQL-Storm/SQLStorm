@@ -1,0 +1,86 @@
+WITH cte AS (
+    SELECT 
+        p.Id AS PostId, 
+        p.PostTypeId, 
+        p.OwnerUserId, 
+        p.Score, 
+        p.ViewCount, 
+        p.AnswerCount, 
+        p.CommentCount, 
+        p.FavoriteCount, 
+        p.CommunityOwnedDate, 
+        p.ClosedDate,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN c.Name ELSE NULL END AS CloseReason,
+        COALESCE(CAST((julianday(COALESCE(p.ClosedDate, p.CreationDate)) - julianday(p.CreationDate)) AS INTEGER), 0) AS ClosureDays,
+        COALESCE(CAST((julianday(COALESCE(p.CreationDate, p.CreationDate)) - julianday(p.CreationDate)) AS INTEGER), 0) AS AnswerDays,
+        COALESCE(CAST((julianday(COALESCE(p.CommunityOwnedDate, DATE('9999-12-31'))) - julianday(p.CreationDate)) AS INTEGER), 0) AS CommunityOwnedDays,
+        COALESCE(CAST((julianday(COALESCE(p.ClosedDate, DATE('9999-12-31'))) - julianday(COALESCE(p.CommunityOwnedDate, DATE('9999-12-31')))) AS INTEGER), 0) AS ClosureDaysSinceOwnership,
+        COALESCE(CAST((julianday(COALESCE(p.ClosedDate, DATE('9999-12-31'))) - julianday(COALESCE(p.AcceptedAnswerId, p.CreationDate))) AS INTEGER), 0) AS ClosureDaysSinceAcceptedAnswer,
+        COALESCE(CAST((julianday(COALESCE(p.ClosedDate, DATE('9999-12-31'))) - julianday(COALESCE(p.LastEditorUserId, p.CreationDate))) AS INTEGER), 0) AS ClosureDaysSinceLastEdit,
+        COALESCE(CAST((julianday(COALESCE(p.ClosedDate, DATE('9999-12-31'))) - julianday(COALESCE(p.LastActivityDate, p.CreationDate))) AS INTEGER), 0) AS ClosureDaysSinceLastActivity,
+        COALESCE(CAST((julianday(COALESCE(p.ClosedDate, DATE('9999-12-31'))) - julianday(COALESCE(p.LastAccessDate, p.CreationDate))) AS INTEGER), 0) AS ClosureDaysSinceLastAccess,
+        COALESCE(CAST((julianday(COALESCE(p.ClosedDate, DATE('9999-12-31'))) - julianday(COALESCE(p.LastEditDate, p.CreationDate))) AS INTEGER), 0) AS ClosureDaysSinceLastEdit,
+        COALESCE(CAST((julianday(COALESCE(p.ClosedDate, DATE('9999-12-31'))) - julianday(COALESCE(p.CreationDate, DATE('9999-12-31')))) AS INTEGER), 0) AS ClosureDaysSinceCreation,
+        COALESCE(CAST((julianday(COALESCE(p.CreationDate, p.CreationDate)) - julianday(p.CreationDate)) AS INTEGER), 0) AS AnswerDays,
+        COALESCE(CAST((julianday(COALESCE(p.CreationDate, p.CreationDate)) - julianday(p.CreationDate)) AS INTEGER), 0) AS FavoriteDays,
+        COALESCE(CAST((julianday(COALESCE(p.CreationDate, p.CreationDate)) - julianday(p.CreationDate)) AS INTEGER), 0) AS ViewDays,
+        COALESCE(CAST((julianday(COALESCE(p.CreationDate, p.CreationDate)) - julianday(p.CreationDate)) AS INTEGER), 0) AS CommentDays,
+        COALESCE(CAST((julianday(COALESCE(p.CreationDate, p.CreationDate)) - julianday(p.CreationDate)) AS INTEGER), 0) AS ScoreDays,
+        COALESCE(CAST((julianday(COALESCE(p.CreationDate, p.CreationDate)) - julianday(p.CreationDate)) AS INTEGER), 0) AS OwnerUserDays,
+        COALESCE(CAST((julianday(COALESCE(p.CreationDate, p.CreationDate)) - julianday(p.CreationDate)) AS INTEGER), 0) AS LastEditorUserDays,
+        COALESCE(CAST((julianday(COALESCE(p.CreationDate, p.CreationDate)) - julianday(p.CreationDate)) AS INTEGER), 0) AS AcceptedAnswerDays,
+        COALESCE(CAST((julianday(COALESCE(p.CreationDate, p.CreationDate)) - julianday(p.CreationDate)) AS INTEGER), 0) AS ParentPostDays,
+        COALESCE(CAST((julianday(COALESCE(p.CommunityOwnedDate, DATE('9999-12-31'))) - julianday(COALESCE(p.CreationDate, DATE('9999-12-31')))) AS INTEGER), 0) AS CommunityOwnedDays
+    FROM Posts p
+    LEFT JOIN CloseReasonTypes c
+        ON p.ClosedDate IS NOT NULL
+        AND p.ClosedDate = (
+            SELECT ph1.CreationDate 
+            FROM PostHistory ph1
+            WHERE ph1.PostId = p.Id 
+              AND ph1.PostHistoryTypeId = 10
+            ORDER BY ph1.CreationDate
+            LIMIT 1
+        )
+        AND c.Id = (
+            SELECT CAST(ph2.Comment AS INTEGER)
+            FROM PostHistory ph2
+            WHERE ph2.PostId = p.Id
+              AND ph2.PostHistoryTypeId = 10
+            ORDER BY ph2.CreationDate
+            LIMIT 1
+        )
+)
+SELECT 
+    PostId, 
+    PostTypeId, 
+    OwnerUserId,
+    Score, 
+    ViewCount,
+    AnswerCount,
+    CommentCount,
+    FavoriteCount,
+    CommunityOwnedDate,
+    ClosedDate,
+    CloseReason,
+    ClosureDays,
+    AnswerDays,
+    CommunityOwnedDays,
+    ClosureDaysSinceOwnership,
+    ClosureDaysSinceAcceptedAnswer,
+    ClosureDaysSinceLastEdit,
+    ClosureDaysSinceLastActivity,
+    ClosureDaysSinceLastAccess,
+    ClosureDaysSinceLastEdit,
+    ClosureDaysSinceCreation,
+    AnswerDays,
+    FavoriteDays,
+    ViewDays,
+    CommentDays,
+    ScoreDays,
+    OwnerUserDays,
+    LastEditorUserDays,
+    AcceptedAnswerDays,
+    ParentPostDays,
+    CommunityOwnedDays
+FROM cte;

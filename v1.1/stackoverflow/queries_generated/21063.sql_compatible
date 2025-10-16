@@ -1,0 +1,130 @@
+WITH ActiveUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation, u.Location,
+           ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation DESC) AS rep_rank,
+           LAG(u.Reputation) OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation DESC) AS prev_rep
+    FROM Users u
+    WHERE u.Reputation > 100
+      AND u.LastAccessDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+      AND u.Location IS NOT NULL
+      AND LENGTH(TRIM(u.Location)) > 0
+),
+HighActivityPosts AS (
+    SELECT p.Id AS post_id, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount,
+           p.AnswerCount, p.CommentCount,
+           COALESCE(p.Title, 'No Title') AS title,
+           CASE 
+               WHEN p.PostTypeId = 1 THEN 'Question'
+               WHEN p.PostTypeId = 2 THEN 'Answer'
+               ELSE 'Other'
+           END AS post_type
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.Score > 0
+      AND p.ViewCount > 1000
+      AND (p.ClosedDate IS NULL OR p.ClosedDate > p.CreationDate)
+      AND p.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 years'
+),
+UserPostStats AS (
+    SELECT au.Id AS user_id, au.DisplayName,
+           COUNT(hap.post_id) AS total_posts,
+           AVG(hap.Score) AS avg_score,
+           SUM(hap.ViewCount) AS total_views,
+           MAX(hap.CreationDate) AS last_post_date,
+           STRING_AGG(hap.title, ' | ' ORDER BY hap.CreationDate DESC) AS recent_titles
+    FROM ActiveUsers au
+    LEFT JOIN HighActivityPosts hap ON au.Id = hap.OwnerUserId
+    GROUP BY au.Id, au.DisplayName
+    HAVING COUNT(hap.post_id) >= 5
+),
+BadgeSummary AS (
+    SELECT b.UserId,
+           COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS gold_badges,
+           COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS silver_badges,
+           COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS bronze_badges,
+           STRING_AGG(b.Name, ', ' ORDER BY b.Date DESC) AS top_badges
+    FROM Badges b
+    WHERE b.TagBased = FALSE
+    GROUP BY b.UserId
+),
+VoteTrends AS (
+    SELECT v.PostId,
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS up_votes,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS down_votes_net,
+           COUNT(*) AS total_votes
+    FROM Votes v
+    WHERE v.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+      AND v.VoteTypeId IN (2, 3)
+    GROUP BY v.PostId
+    HAVING COUNT(*) > 10
+)
+SELECT 
+    ups.user_id,
+    ups.DisplayName AS user_name,
+    au.rep_rank,
+    COALESCE(au.prev_rep, 0) AS previous_year_rep,
+    (au.Reputation - COALESCE(au.prev_rep, au.Reputation)) AS rep_growth,
+    ups.total_posts,
+    ROUND(ups.avg_score::numeric, 2) AS average_post_score,
+    ups.total_views,
+    EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - ups.last_post_date))/86400 AS days_since_last_post,
+    COALESCE(bs.gold_badges, 0) AS gold_badges,
+    COALESCE(bs.silver_badges, 0) AS silver_badges,
+    COALESCE(bs.bronze_badges, 0) AS bronze_badges,
+    LENGTH(COALESCE(ups.recent_titles, '')) AS titles_length,
+    CASE 
+        WHEN ups.total_posts > 50 AND au.rep_rank <= 10 THEN 'Power User'
+        WHEN ups.total_views > 100000 THEN 'High Visibility'
+        WHEN COALESCE(bs.gold_badges, 0) >= 5 THEN 'Badge Collector'
+        ELSE 'Regular'
+    END AS user_category,
+    vt.up_votes,
+    vt.down_votes_net,
+    (vt.up_votes + vt.down_votes_net) AS net_community_score,
+    GREATEST(0, vt.total_votes - 5) * 10 AS vote_complexity_factor
+FROM UserPostStats ups
+INNER JOIN ActiveUsers au ON ups.user_id = au.Id
+LEFT OUTER JOIN BadgeSummary bs ON ups.user_id = bs.UserId
+LEFT OUTER JOIN VoteTrends vt ON EXISTS (
+    SELECT 1 FROM HighActivityPosts hap2 
+    WHERE hap2.OwnerUserId = ups.user_id 
+      AND hap2.post_id = vt.PostId
+      AND hap2.Score > (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = ups.user_id)
+)
+WHERE au.rep_rank <= 100
+  AND (ups.total_posts > 10 OR COALESCE(bs.gold_badges, 0) > 2)
+  AND NOT (LOWER(au.Location) LIKE '%spam%' OR LOWER(au.DisplayName) LIKE '%test%')
+UNION ALL
+SELECT 
+    NULL AS user_id,
+    'Community Aggregate' AS user_name,
+    NULL AS rep_rank,
+    NULL AS previous_year_rep,
+    NULL AS rep_growth,
+    COUNT(DISTINCT hap.post_id) AS total_posts,
+    AVG(hap.Score) AS average_post_score,
+    SUM(hap.ViewCount) AS total_views,
+    NULL AS days_since_last_post,
+    SUM(COALESCE(bs.gold_badges, 0)) AS gold_badges,
+    SUM(COALESCE(bs.silver_badges, 0)) AS silver_badges,
+    SUM(COALESCE(bs.bronze_badges, 0)) AS bronze_badges,
+    NULL AS titles_length,
+    'Aggregate' AS user_category,
+    SUM(vt.up_votes) AS up_votes,
+    SUM(vt.down_votes_net) AS down_votes_net,
+    SUM(vt.up_votes + vt.down_votes_net) AS net_community_score,
+    (SELECT COUNT(*) * 20 FROM VoteTrends) AS vote_complexity_factor
+FROM HighActivityPosts hap
+LEFT JOIN BadgeSummary bs ON hap.OwnerUserId = bs.UserId
+LEFT JOIN VoteTrends vt ON hap.post_id = vt.PostId
+WHERE hap.post_type = 'Question'
+GROUP BY 'Community Aggregate'
+ORDER BY 
+    CASE user_category 
+        WHEN 'Power User' THEN 1 
+        WHEN 'High Visibility' THEN 2 
+        WHEN 'Badge Collector' THEN 3 
+        ELSE 4 
+    END,
+    COALESCE(rep_growth, 0) DESC,
+    total_posts DESC
+LIMIT 50;

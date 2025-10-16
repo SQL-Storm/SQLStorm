@@ -1,0 +1,118 @@
+-- {"query": "893.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1214} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT t.Id, t.TagName, t.Count, 1 AS Level
+    FROM Tags t
+    WHERE t.Count > 1000
+  UNION ALL
+    SELECT t2.Id, t2.TagName, t2.Count, r.Level + 1
+    FROM Tags t2
+    JOIN PostLinks pl ON pl.PostId = t2.ExcerptPostId
+    JOIN RecursiveTagHierarchy r ON pl.RelatedPostId = r.Id
+    WHERE r.Level < 3
+),
+UserActivityStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(COALESCE(v.BountyAmount, 0)) AS TotalBountyGiven,
+        ROW_NUMBER() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC) AS RankByReputationInLocation
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id AND v.VoteTypeId = 8
+    WHERE u.Location IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Location, u.Reputation
+),
+PostWithActivity AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.AcceptedAnswerId,
+        u.DisplayName AS OwnerName,
+        COALESCE(ph_latest.EditCount, 0) AS EditCount,
+        COALESCE((SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id), 0) AS CommentCount,
+        COALESCE(MAX(vt.Name) FILTER (WHERE vt.Id = v.VoteTypeId), 'No Votes') AS MostCommonVoteType,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS EditCount
+        FROM PostHistory
+        WHERE PostHistoryTypeId IN (4,5,6,7,8,9,14)
+        GROUP BY PostId
+    ) ph_latest ON ph_latest.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+),
+AcceptedAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreationDate,
+        u.DisplayName AS AnswerOwner
+    FROM Posts q
+    JOIN Posts a ON a.Id = q.AcceptedAnswerId
+    LEFT JOIN Users u ON u.Id = a.OwnerUserId
+    WHERE q.PostTypeId = 1 AND q.AcceptedAnswerId IS NOT NULL
+),
+HighEngagementPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.EditCount,
+        p.PostStatus,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS Rank
+    FROM PostWithActivity p
+    WHERE p.Score > 50 OR p.ViewCount > 10000
+)
+
+SELECT
+    uas.UserId,
+    uas.DisplayName,
+    uas.QuestionCount,
+    uas.AnswerCount,
+    uas.BadgeCount,
+    uas.TotalBountyGiven,
+    uas.RankByReputationInLocation,
+    hep.Id AS HighEngagementPostId,
+    hep.Title AS HighEngagementPostTitle,
+    hep.Score AS HighEngagementPostScore,
+    hep.ViewCount AS HighEngagementPostViews,
+    aas.AnswerId AS AcceptedAnswerId,
+    aas.AnswerScore,
+    aas.AnswerOwner,
+    rth.TagName,
+    LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, 'java', '')) / 4 AS JavaTagOccurrences,
+    CASE WHEN p.Tags LIKE '%<python>%' THEN 1 ELSE 0 END AS HasPythonTag,
+    CASE WHEN COALESCE(p.ClosedDate, TIMESTAMP '9999-12-31') < CURRENT_TIMESTAMP - INTERVAL '1 year' THEN 'Long Closed' ELSE 'Active' END AS PostActivityStatus,
+    CONCAT_WS(' | ',
+        COALESCE(u.WebsiteUrl, 'No Website'),
+        COALESCE(NULLIF(u.Location, ''), 'No Location'),
+        COALESCE(NULLIF(u.AboutMe, ''), 'No About Me')
+    ) AS UserProfileSummary
+FROM UserActivityStats uas
+JOIN HighEngagementPosts hep ON hep.Id IN (
+    SELECT Id FROM Posts WHERE OwnerUserId = uas.UserId LIMIT 5
+)
+LEFT JOIN AcceptedAnswerStats aas ON aas.QuestionId = hep.Id
+LEFT JOIN RecursiveTagHierarchy rth ON rth.TagName = ANY(string_to_array(substring(hep.Title from '\<([^>]+)\>'), '><'))
+LEFT JOIN Posts p ON p.Id = hep.Id
+LEFT JOIN Users u ON u.Id = uas.UserId
+WHERE uas.QuestionCount > 5
+  AND (uas.BadgeCount > 10 OR uas.TotalBountyGiven > 1000)
+ORDER BY uas.RankByReputationInLocation, hep.Rank, rth.Level
+LIMIT 100;

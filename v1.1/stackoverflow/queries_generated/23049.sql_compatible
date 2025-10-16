@@ -1,0 +1,63 @@
+WITH TopUsers AS (
+    SELECT u.Id, u.Reputation, u.DisplayName,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS UserRank,
+           COALESCE((SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1), 0) AS GoldBadges
+    FROM Users u
+    WHERE u.Reputation > 1000
+      AND u.Location IS NOT NULL
+      AND LENGTH(u.AboutMe) > 50
+),
+PostStats AS (
+    SELECT p.Id, p.OwnerUserId, p.Score, p.ViewCount, p.CreationDate, p.Tags,
+           LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+           CASE WHEN p.Tags IS NOT NULL THEN STRING_AGG(TRIM(t), ',') ELSE 'No Tags' END AS TagList,
+           (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 0) AS PositiveComments
+    FROM Posts p
+    LEFT JOIN LATERAL (
+        SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), '><')) AS t
+    ) AS unn ON TRUE
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY p.Id, p.OwnerUserId, p.Score, p.ViewCount, p.Tags, p.CreationDate
+),
+UserPostActivity AS (
+    SELECT tu.Id AS UserId,
+           tu.UserRank,
+           tu.DisplayName || ' (' || CAST(tu.Reputation AS VARCHAR) || ')' AS UserInfo,
+           ps.Score,
+           ps.ViewCount,
+           ps.TagList,
+           SUM(ps.PositiveComments) OVER (PARTITION BY tu.Id) AS TotalPositiveComments,
+           CASE WHEN ps.PrevScore IS NULL THEN 0 ELSE ps.Score - ps.PrevScore END AS ScoreDelta,
+           COALESCE(CASE WHEN ps.PrevScore IS NULL THEN 0 ELSE ps.Score - ps.PrevScore END, 0) + COALESCE(SUM(ps.PositiveComments) OVER (PARTITION BY tu.Id), 0) AS ActivityMetric
+    FROM TopUsers tu
+    LEFT JOIN PostStats ps ON tu.Id = ps.OwnerUserId
+    WHERE tu.GoldBadges >= 1
+      OR EXISTS (SELECT 1 FROM Votes v WHERE v.PostId = ps.Id AND v.VoteTypeId = 2 AND COALESCE(v.BountyAmount,0) > 50)
+),
+ClosedPosts AS (
+    SELECT ph.PostId, COUNT(*) AS CloseCount
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10, 11)
+      AND ph.Comment LIKE '%Duplicate%'
+    GROUP BY ph.PostId
+    HAVING COUNT(*) > 1
+)
+SELECT DISTINCT upa.UserId,
+       upa.UserInfo,
+       upa.TagList,
+       COALESCE(upa.ScoreDelta, 0) + COALESCE(upa.TotalPositiveComments, 0) AS ActivityMetric,
+       RANK() OVER (ORDER BY upa.TotalPositiveComments DESC) AS ActivityRank,
+       CASE WHEN cp.CloseCount IS NULL THEN 'Open' ELSE 'Closed ' || CAST(cp.CloseCount AS VARCHAR) || ' times' END AS Status
+FROM UserPostActivity upa
+FULL OUTER JOIN ClosedPosts cp ON upa.Score = (SELECT MAX(p2.Score) FROM Posts p2 WHERE p2.Id = cp.PostId)
+WHERE upa.UserRank <= 100
+  AND (upa.ViewCount > 1000 OR LOWER(upa.TagList) LIKE '%sql%')
+UNION ALL
+SELECT NULL AS UserId,
+       'Summary' AS UserInfo,
+       NULL AS TagList,
+       SUM(upa.ActivityMetric) AS ActivityMetric,
+       0 AS ActivityRank,
+       'Total' AS Status
+FROM UserPostActivity upa
+ORDER BY ActivityRank;

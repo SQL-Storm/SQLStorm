@@ -1,0 +1,106 @@
+WITH UserBadgeSummary AS (
+    SELECT 
+        UserId,
+        COUNT(CASE WHEN Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges
+    GROUP BY UserId
+),
+PostActivity AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        MAX(p.Score) AS HighestPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), ', ') FILTER (WHERE p.Tags IS NOT NULL) AS AllTags
+    FROM Posts p
+    GROUP BY p.OwnerUserId
+),
+VoteAnalysis AS (
+    SELECT 
+        v.UserId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesReceived
+    FROM Votes v
+    WHERE EXISTS (SELECT 1 FROM Posts p WHERE p.Id = v.PostId AND p.OwnerUserId = v.UserId)
+    GROUP BY v.UserId
+)
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    COALESCE(ubs.GoldBadges, 0) + COALESCE(ubs.SilverBadges, 0) * 0.5 + COALESCE(ubs.BronzeBadges, 0) * 0.25 AS BadgeScore,
+    pa.TotalPosts,
+    (pa.Questions * 2 + pa.Answers) * 1.0 / NULLIF(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate)) / 86400.0, 0) AS DailyPostRate,
+    RANK() OVER (ORDER BY u.Reputation DESC) AS GlobalRank,
+    DENSE_RANK() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC) AS LocalRank,
+    COALESCE(va.UpvotesReceived, 0) - COALESCE(va.DownvotesReceived, 0) AS NetVotes,
+    (SELECT MAX(c.CreationDate) FROM Comments c WHERE c.UserId = u.Id) AS LastCommentDate,
+    (
+      SELECT STRING_AGG(t.TagName, ', ')
+      FROM (
+        SELECT t.TagName
+        FROM Tags t
+        JOIN (
+          SELECT DISTINCT unnest(string_to_array(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), '><')) AS TagName
+          FROM Posts p
+          WHERE p.OwnerUserId = u.Id AND p.Tags IS NOT NULL
+        ) pt ON pt.TagName = t.TagName
+        GROUP BY t.TagName
+        ORDER BY COUNT(*) DESC
+        LIMIT 3
+      ) t
+    ) AS TopTags,
+    COALESCE(ph.EditCount, 0) AS PostEdits,
+    CASE 
+        WHEN u.Reputation > 100000 THEN 'Legendary' 
+        WHEN u.Reputation > 50000 THEN 'Epic' 
+        WHEN u.Reputation > 10000 THEN 'Veteran' 
+        ELSE 'Regular' 
+    END AS ReputationClass,
+    SUM(COALESCE(va.UpvotesReceived,0)) OVER (ORDER BY u.Reputation DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeUpvotes,
+    COALESCE(
+      (
+        SELECT COALESCE('[' || STRING_AGG(quote_literal(t2.text), ',') || ']', '[]')
+        FROM (
+          SELECT ph2.text
+          FROM PostHistory ph2
+          WHERE ph2.UserId = u.Id AND ph2.PostHistoryTypeId = 5
+          ORDER BY ph2.CreationDate DESC
+          LIMIT 3
+        ) t2
+      ), '[]'
+    ) AS RecentEdits
+FROM Users u
+LEFT JOIN UserBadgeSummary ubs ON u.Id = ubs.UserId
+LEFT JOIN PostActivity pa ON u.Id = pa.OwnerUserId
+LEFT JOIN VoteAnalysis va ON u.Id = va.UserId
+LEFT JOIN (
+    SELECT UserId, COUNT(*) AS EditCount 
+    FROM PostHistory 
+    WHERE PostHistoryTypeId IN (4,5,6) 
+    GROUP BY UserId
+) ph ON u.Id = ph.UserId
+WHERE u.CreationDate BETWEEN DATE '2022-01-01' AND DATE '2022-12-31'
+  AND EXISTS (SELECT 1 FROM Posts p2 WHERE p2.OwnerUserId = u.Id)
+  AND (u.DownVotes < u.UpVotes OR u.DownVotes IS NULL)
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    u.CreationDate,
+    u.UpVotes,
+    u.DownVotes,
+    pa.TotalPosts,
+    pa.Questions,
+    pa.Answers,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    va.UpvotesReceived,
+    va.DownvotesReceived,
+    ph.EditCount
+ORDER BY u.Reputation DESC
+LIMIT 100;

@@ -1,0 +1,160 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id                           AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Views,0) + COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0) AS NetEngagement,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)                 AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)                 AS AnswerCount,
+        COUNT(c.Id)                                                AS CommentCount,
+        MAX(p.CreationDate)                                        AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts    p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId      = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+
+TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL
+),
+
+UserTagStats AS (
+    SELECT
+        ua.UserId,
+        tt.TagName,
+        COUNT(*)                         AS TagUsage,
+        SUM(p.Score)                     AS TagScore,
+        ROW_NUMBER() OVER (PARTITION BY ua.UserId ORDER BY COUNT(*) DESC) AS TagRank
+    FROM UserActivity ua
+    JOIN Posts p ON p.OwnerUserId = ua.UserId AND p.PostTypeId = 1
+    -- Split tags by replacing regexp_split_to_table with standard SQL approach using string_split-like logic.
+    -- Use a simple recursive CTE to split on '><' boundaries assuming tags are like '<tag1><tag2>'
+    JOIN (
+        WITH RECURSIVE splits(postid, rest, tagraw) AS (
+            SELECT p.Id, p.Tags, NULL
+            UNION ALL
+            SELECT
+                postid,
+                CASE
+                    WHEN INSTR(rest, '><') > 0 THEN SUBSTR(rest, INSTR(rest, '><')+2)
+                    ELSE NULL
+                END,
+                CASE
+                    WHEN INSTR(rest, '><') > 0 THEN SUBSTR(rest, 1, INSTR(rest, '><')-1)
+                    ELSE rest
+                END
+            FROM splits
+            WHERE rest IS NOT NULL
+        )
+        SELECT postid, tagraw FROM splits WHERE tagraw IS NOT NULL
+    ) tag ON tag.postid = p.Id
+    JOIN Tags tt ON tt.TagName = TRIM(BOTH '<>' FROM tag.tagraw)
+    GROUP BY ua.UserId, tt.TagName
+),
+
+BadgeStats AS (
+    SELECT
+        b.UserId,
+        MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS HasGold,
+        MAX(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS HasSilver,
+        MAX(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS HasBronze,
+        COUNT(*) FILTER (WHERE b.TagBased IS TRUE)        AS TagBasedCount
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+RecentCloseVotes AS (
+    SELECT
+        ph.PostId,
+        COUNT(*)            AS CloseVoteCount,
+        MAX(ph.CreationDate) AS LastCloseVote
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId
+),
+
+FinalScore AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.NetEngagement,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.CommentCount,
+        COALESCE(bs.HasGold,0)   * 1000 +
+        COALESCE(bs.HasSilver,0) * 500  +
+        COALESCE(bs.HasBronze,0) * 200  -
+        COALESCE(rc.CloseVoteCount,0) * 50 AS PenaltyScore,
+        ROW_NUMBER() OVER (ORDER BY (ua.NetEngagement
+                                     + ua.QuestionCount*3
+                                     + ua.AnswerCount*5) DESC) AS OverallRank
+    FROM UserActivity ua
+    LEFT JOIN BadgeStats   bs ON bs.UserId = ua.UserId
+    LEFT JOIN RecentCloseVotes rc ON rc.PostId = (
+        SELECT Id FROM Posts WHERE OwnerUserId = ua.UserId LIMIT 1
+    )
+),
+
+TagPopularity AS (
+    SELECT
+        TagName,
+        Count,
+        NTILE(4) OVER (ORDER BY Count DESC) AS Quartile
+    FROM TopTags
+)
+
+SELECT
+    f.UserId,
+    f.DisplayName,
+    f.Reputation,
+    f.NetEngagement,
+    f.QuestionCount,
+    f.AnswerCount,
+    f.CommentCount,
+    f.PenaltyScore,
+    f.OverallRank,
+    COALESCE(ut.TagName, 'N/A')           AS TopTag,
+    COALESCE(ut.TagUsage,0)               AS TopTagUsage,
+    CASE
+        WHEN bs.HasGold   = 1 THEN 'Gold'
+        WHEN bs.HasSilver = 1 THEN 'Silver'
+        ELSE                     'Bronze'
+    END                                   AS HighestBadgeClass,
+    tp.Quartile                           AS TagPopularityQuartile
+FROM FinalScore f
+LEFT JOIN LATERAL (
+    SELECT uts.TagName, uts.TagUsage
+    FROM UserTagStats uts
+    WHERE uts.UserId = f.UserId
+    ORDER BY uts.TagRank
+    LIMIT 1
+) ut ON true
+LEFT JOIN BadgeStats   bs ON bs.UserId = f.UserId
+LEFT JOIN TagPopularity tp ON tp.TagName = ut.TagName
+WHERE f.OverallRank <= 100
+
+UNION ALL
+
+SELECT
+    NULL AS UserId,
+    '--- Summary ---' AS DisplayName,
+    NULL AS Reputation,
+    NULL AS NetEngagement,
+    SUM(QuestionCount) AS QuestionCount,
+    SUM(AnswerCount)   AS AnswerCount,
+    SUM(CommentCount)  AS CommentCount,
+    NULL AS PenaltyScore,
+    NULL AS OverallRank,
+    NULL AS TopTag,
+    NULL AS TopTagUsage,
+    NULL AS HighestBadgeClass,
+    NULL AS TagPopularityQuartile
+FROM FinalScore
+WHERE OverallRank <= 100
+ORDER BY OverallRank;

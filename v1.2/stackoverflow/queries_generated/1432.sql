@@ -1,0 +1,122 @@
+-- {"query": "1432.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1218} 
+with RecursiveUserBadgeCounts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+), RankedPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        u.DisplayName as OwnerName,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as UserPostRank,
+        count(*) over (partition by p.OwnerUserId) as UserTotalPosts,
+        case when p.PostTypeId = 1 then 1 else 0 end as IsQuestion,
+        case when p.PostTypeId = 2 then 1 else 0 end as IsAnswer,
+        substring(p.Title from '[a-zA-Z]{5,}') as SampleWordInTitle,
+        coalesce(p.Tags, '') as TagString
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.OwnerUserId is not null
+), PostsWithAcceptedAnswers as (
+    select
+        p.*,
+        aa.Score as AcceptedAnswerScore,
+        aa.ViewCount as AcceptedAnswerViews
+    from RankedPosts p
+    left join Posts aa on aa.Id = p.AcceptedAnswerId
+), FilteredPostLinks as (
+    select distinct
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where lt.Name in ('Linked', 'Duplicate')
+), PostsExtraInfo as (
+    select
+        p.Id,
+        p.Tags,
+        array_length(string_to_array(coalesce(p.Tags, ''), '><'), 1) as TagCount,
+        char_length(coalesce(p.Body, '')) as BodyLength,
+        len_in_cm(p.Body) over () as BodyLengthLength,  -- hypothetical function; to include complicated expressions, ignore or become 0 here.
+        p.Score,
+        p.ViewCount,
+        p.AcceptedAnswerId,
+        pl.LinkTypeName,
+        lt.TypeFrequency,
+        coalesce(extract(epoch from p.CreationDate) :: int, 0) as CdEpoch -- tidal expression!
+    from Posts p
+    left join (
+        select PostId, count(*) as TypeFrequency from PostLinks pl group by PostId
+    ) lt on lt.PostId = p.Id
+    left join FilteredPostLinks pl on pl.PostId = p.Id
+    where p.PostTypeId in (1, 2)
+), TopUserPosts as (
+    select 
+        rusbc.DisplayName,
+        pi.*
+    from PostsWithAcceptedAnswers pi
+    join RecursiveUserBadgeCounts rusbc on rusbc.UserId = pi.OwnerUserId
+    where pi.UserPostRank <= 10
+), CloseVotesSummary as (
+    select 
+      ph.PostId,
+      sum(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as CloseVotesCount, 
+      max(case when ph.PostHistoryTypeId = 10 then ph.CreationDate else null end) as LastCloseDate,
+      sum(case when ph.PostHistoryTypeId = 11 then 1 else 0 end) as ReopenVotesCount
+    from PostHistory ph
+    group by ph.PostId
+), RankWindows as (
+    select
+        p.Id as PostId,
+        rank() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc nulls last) as GlobalPostRank,
+        dense_rank() over (order by coalesce(length(p.Title),0) desc, p.Score desc nulls last) as TitleScoreRank
+    from Posts p
+    where p.PostTypeId in (1, 2)
+)
+select 
+    p.Id as PostId,
+    COALESCE(t.DisplayName, 'Community') AS OwnerName,
+    p.PostTypeId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    -- Example of complicated NULL and string logic
+    case
+        when p.Tags is not null and char_length(trim(p.Tags)) > 0 then 
+            (select string_agg(t1.TagName, ', ')
+             from Tags t1 
+             where t1.Id in (
+                select unnest(string_to_array(trim(both '<>' from p.Tags), '><')::int[])
+             )
+            )
+        else 'No Tags'
+    end AS AllTagNames,
+    rusbc.GoldBadges * 3 + rusbc.SilverBadges * 2 + rusbc.BronzeBadges as BadgeWeightedSum,
+    cvs.CloseVotesCount,
+    cvs.ReopenVotesCount,
+    cvs.LastCloseDate,
+    rw.GlobalPostRank,
+    rw.TitleScoreRank
+from Posts p
+left join Users t on t.Id = p.OwnerUserId
+left join RecursiveUserBadgeCounts rusbc on rusbc.UserId = p.OwnerUserId
+left join CloseVotesSummary cvs on cvs.PostId = p.Id
+left join RankWindows rw on rw.PostId = p.Id
+where p.CreationDate > current_timestamp - interval '365 days'
+  and p.PostTypeId in (1,2)
+order by rw.GlobalPostRank asc, BadgeWeightedSum desc
+limit 100;

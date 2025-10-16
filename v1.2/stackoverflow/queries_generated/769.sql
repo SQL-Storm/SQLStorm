@@ -1,0 +1,170 @@
+-- {"query": "769.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1571} 
+with RecursiveUserBadges as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by u.Id order by b.Class, b.Date desc) as BadgeRank
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where u.Reputation > 1000
+),
+TopBadges as (
+    select UserId, BadgeName, Class
+    from RecursiveUserBadges
+    where BadgeRank <= 3
+),
+QuestionAnswerStats as (
+    select 
+        p.OwnerUserId,
+        count(case when p.PostTypeId = 1 then 1 end) as QuestionsCount,
+        count(case when p.PostTypeId = 2 then 1 end) as AnswersCount,
+        avg(case when p.PostTypeId = 1 then p.Score end) as AvgQuestionScore,
+        avg(case when p.PostTypeId = 2 then p.Score end) as AvgAnswerScore,
+        max(p.Score) filter (where p.PostTypeId = 1) as MaxQuestionScore,
+        max(p.Score) filter (where p.PostTypeId = 2) as MaxAnswerScore
+    from Posts p
+    where p.OwnerUserId is not null and p.OwnerUserId > 0
+    group by p.OwnerUserId
+),
+UserLatestActivity as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        greatest(
+            u.LastAccessDate,
+            max(ph.CreationDate) filter (where ph.UserId = u.Id),
+            max(v.CreationDate) filter (where v.UserId = u.Id),
+            max(c.CreationDate) filter (where c.UserId = u.Id)
+        ) as LastActivity
+    from Users u
+    left join PostHistory ph on ph.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.LastAccessDate
+),
+PostsWithLinkDuplicates as (
+    select 
+        p.Id as PostId,
+        p.Title,
+        p.PostTypeId,
+        p.OwnerUserId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName
+    from Posts p
+    left join PostLinks pl on p.Id = pl.PostId and pl.LinkTypeId = 3
+    left join LinkTypes lt on pl.LinkTypeId = lt.Id
+    where p.PostTypeId in (1, 2)
+),
+UserPostSummaries as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        coalesce(qas.QuestionsCount, 0) as QuestionsCount,
+        coalesce(qas.AnswersCount, 0) as AnswersCount,
+        coalesce(qas.AvgQuestionScore, 0) as AvgQuestionScore,
+        coalesce(qas.AvgAnswerScore, 0) as AvgAnswerScore,
+        coalesce(qas.MaxQuestionScore, 0) as MaxQuestionScore,
+        coalesce(qas.MaxAnswerScore, 0) as MaxAnswerScore,
+        ul.LastActivity
+    from Users u
+    left join QuestionAnswerStats qas on u.Id = qas.OwnerUserId
+    inner join UserLatestActivity ul on u.Id = ul.Id
+    where u.Reputation > 1000
+),
+UserTagEngagement as (
+    select 
+        us.UserId,
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as Tag,
+        count(*) as PostsCount,
+        sum(p.Score) as TotalScore
+    from Posts p
+    join UserPostSummaries us on p.OwnerUserId = us.UserId
+    where p.PostTypeId = 1 and p.Tags is not null
+    group by us.UserId, Tag
+),
+RankedUserTags as (
+    select 
+        ut.UserId,
+        ut.Tag,
+        ut.PostsCount,
+        ut.TotalScore,
+        rank() over (partition by ut.UserId order by ut.PostsCount desc, ut.TotalScore desc) as TagRank
+    from UserTagEngagement ut
+),
+FilteredUserTags as (
+    select UserId, Tag, PostsCount, TotalScore
+    from RankedUserTags
+    where TagRank <= 3
+),
+UserCommentsStats as (
+    select 
+        c.UserId,
+        count(*) as CommentsCount,
+        avg(c.Score) as AvgCommentScore,
+        max(c.Score) as MaxCommentScore
+    from Comments c
+    group by c.UserId
+),
+FinalUserStats as (
+    select 
+        ups.UserId,
+        ups.DisplayName,
+        ups.Reputation,
+        ups.QuestionsCount,
+        ups.AnswersCount,
+        ups.AvgQuestionScore,
+        ups.AvgAnswerScore,
+        ups.MaxQuestionScore,
+        ups.MaxAnswerScore,
+        ups.LastActivity,
+        ucs.CommentsCount,
+        ucs.AvgCommentScore,
+        ucs.MaxCommentScore,
+        string_agg(distinct t.Tag, ', ') filter (where t.Tag is not null) as TopTags,
+        string_agg(distinct tb.BadgeName, ', ') filter (where tb.BadgeName is not null) as TopBadges
+    from UserPostSummaries ups
+    left join UserCommentsStats ucs on ups.UserId = ucs.UserId
+    left join FilteredUserTags t on ups.UserId = t.UserId
+    left join TopBadges tb on ups.UserId = tb.UserId
+    group by 
+        ups.UserId, ups.DisplayName, ups.Reputation, ups.QuestionsCount, ups.AnswersCount,
+        ups.AvgQuestionScore, ups.AvgAnswerScore, ups.MaxQuestionScore, ups.MaxAnswerScore,
+        ups.LastActivity, ucs.CommentsCount, ucs.AvgCommentScore, ucs.MaxCommentScore
+)
+select 
+    fus.UserId,
+    fus.DisplayName,
+    fus.Reputation,
+    fus.QuestionsCount,
+    fus.AnswersCount,
+    round(fus.AvgQuestionScore::numeric, 2) as AvgQuestionScore,
+    round(fus.AvgAnswerScore::numeric, 2) as AvgAnswerScore,
+    fus.MaxQuestionScore,
+    fus.MaxAnswerScore,
+    fus.CommentsCount,
+    round(fus.AvgCommentScore::numeric, 2) as AvgCommentScore,
+    fus.MaxCommentScore,
+    fus.TopTags,
+    fus.TopBadges,
+    fus.LastActivity,
+    case 
+        when fus.Reputation > 10000 then 'Expert'
+        when fus.Reputation between 5000 and 9999 then 'Advanced'
+        when fus.Reputation between 1000 and 4999 then 'Intermediate'
+        else 'Beginner'
+    end as ReputationLevel,
+    case 
+        when fus.AnswersCount > fus.QuestionsCount then 'Answerer'
+        when fus.QuestionsCount > fus.AnswersCount then 'Questioner'
+        else 'Balanced'
+    end as UserType,
+    length(coalesce(fus.TopTags, '')) as TopTagsLength,
+    coalesce(fus.MaxAnswerScore, 0) - coalesce(fus.MaxQuestionScore, 0) as ScoreDifference
+from FinalUserStats fus
+where fus.AnswersCount + fus.QuestionsCount > 10
+order by fus.Reputation desc, fus.LastActivity desc
+limit 50;

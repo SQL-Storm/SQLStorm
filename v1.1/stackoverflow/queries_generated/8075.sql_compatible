@@ -1,0 +1,340 @@
+with
+q as (
+  select p.Id as QuestionId,
+         p.Title,
+         p.OwnerUserId,
+         p.Score,
+         p.ViewCount,
+         p.CreationDate,
+         p.ClosedDate,
+         p.Tags,
+         coalesce(p.AnswerCount, 0) as AnswerCount
+  from Posts p
+  where p.PostTypeId = 1
+),
+a as (
+  select a.ParentId as QuestionId,
+         a.Id as AnswerId,
+         a.OwnerUserId as AnswerUserId,
+         a.Score as AnswerScore,
+         a.CreationDate as AnswerCreationDate,
+         a.AcceptedAnswerId
+  from Posts a
+  where a.PostTypeId = 2
+),
+q_stats as (
+  select
+    q.QuestionId,
+    q.Title,
+    q.OwnerUserId,
+    q.Score as QuestionScore,
+    q.ViewCount,
+    q.CreationDate as QuestionCreationDate,
+    q.ClosedDate,
+    q.Tags,
+    q.AnswerCount,
+    case when q.Tags is null then 0 else cardinality(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')) end as TagCount,
+    case when position('<sql>' in coalesce(q.Tags, '')) > 0 then 1 else 0 end as HasTag_sql,
+    case when position('<javascript>' in coalesce(q.Tags, '')) > 0 then 1 else 0 end as HasTag_js
+  from q
+),
+answers_agg as (
+  select
+    a.QuestionId,
+    count(*) as AnswersTotal,
+    sum(case when a.AnswerScore > 0 then 1 else 0 end) as AnswersPositive,
+    max(a.AnswerScore) as MaxAnswerScore,
+    min(a.AnswerScore) as MinAnswerScore,
+    avg(cast(a.AnswerScore as numeric)) as AvgAnswerScore,
+    max(a.AnswerCreationDate) as LastAnswerDate
+  from a
+  group by a.QuestionId
+),
+accepted as (
+  select q.QuestionId, p2.Id as AcceptedAnswerId, p2.Score as AcceptedAnswerScore
+  from q
+  join Posts p1 on p1.Id = q.QuestionId and p1.PostTypeId = 1
+  left join Posts p2 on p2.Id = p1.AcceptedAnswerId and p2.PostTypeId = 2
+),
+votes_by_type as (
+  select
+    v.PostId,
+    v.VoteTypeId,
+    count(*) as VoteCount
+  from Votes v
+  group by v.PostId, v.VoteTypeId
+),
+question_votes as (
+  select
+    q.QuestionId,
+    sum(case when v.VoteTypeId = 2 then v.VoteCount else 0 end) as UpVotesOnQuestion,
+    sum(case when v.VoteTypeId = 3 then v.VoteCount else 0 end) as DownVotesOnQuestion,
+    sum(case when v.VoteTypeId = 5 then v.VoteCount else 0 end) as FavoritesOnQuestion
+  from q
+  left join votes_by_type v on v.PostId = q.QuestionId
+  group by q.QuestionId
+),
+answer_votes as (
+  select
+    a.QuestionId,
+    sum(case when v.VoteTypeId = 2 then v.VoteCount else 0 end) as UpVotesOnAnswers,
+    sum(case when v.VoteTypeId = 3 then v.VoteCount else 0 end) as DownVotesOnAnswers
+  from a
+  left join votes_by_type v on v.PostId = a.AnswerId
+  group by a.QuestionId
+),
+edits as (
+  select
+    ph.PostId,
+    count(*) filter (where ph.PostHistoryTypeId in (4,5,6)) as EditCount,
+    min(ph.CreationDate) filter (where ph.PostHistoryTypeId in (4,5,6)) as FirstEditDate,
+    max(ph.CreationDate) filter (where ph.PostHistoryTypeId in (4,5,6)) as LastEditDate,
+    count(*) filter (where ph.PostHistoryTypeId = 10) as CloseEvents,
+    count(*) filter (where ph.PostHistoryTypeId = 11) as ReopenEvents
+  from PostHistory ph
+  group by ph.PostId
+),
+duplicates as (
+  select
+    pl.PostId as DuplicateQuestionId,
+    count(*) filter (where pl.LinkTypeId = 3) as DuplicateLinks,
+    count(*) filter (where pl.LinkTypeId = 1) as LinkedLinks
+  from PostLinks pl
+  group by pl.PostId
+),
+user_stats as (
+  select
+    u.Id as UserId,
+    u.Reputation,
+    u.UpVotes,
+    u.DownVotes,
+    u.Views as ProfileViews,
+    cast(date_part('year', age(cast('2024-10-01 12:34:56' as timestamp), u.CreationDate)) as int) as UserTenureYears
+  from Users u
+),
+commenters as (
+  select
+    c.PostId,
+    count(*) as CommentCount,
+    sum(case when c.Score > 0 then 1 else 0 end) as PositiveComments,
+    max(c.CreationDate) as LastCommentDate
+  from Comments c
+  group by c.PostId
+),
+q_windows as (
+  select
+    qs.*,
+    row_number() over (order by qs.ViewCount desc nulls last) as rn_by_views,
+    dense_rank() over (order by qs.QuestionScore desc nulls last) as dr_by_score,
+    percentile_cont(0.5) within group (order by qs.ViewCount) over () as median_views_all
+  from q_stats qs
+),
+activity_spread as (
+  select
+    q.QuestionId,
+    case
+      when qs.AnswerCount > 0 and aa.LastAnswerDate is not null
+      then cast(extract(epoch from (aa.LastAnswerDate - qs.QuestionCreationDate)) as bigint)
+      else null
+    end as SecondsToLastAnswer,
+    case
+      when cm.LastCommentDate is not null
+      then cast(extract(epoch from (cm.LastCommentDate - qs.QuestionCreationDate)) as bigint)
+      else null
+    end as SecondsToLastComment
+  from q q
+  join q_stats qs on qs.QuestionId = q.QuestionId
+  left join answers_agg aa on aa.QuestionId = q.QuestionId
+  left join commenters cm on cm.PostId = q.QuestionId
+),
+owner_badges as (
+  select
+    b.UserId,
+    count(*) as BadgeCount,
+    count(*) filter (where b.Class = 1) as GoldBadges,
+    count(*) filter (where b.Class = 2) as SilverBadges,
+    count(*) filter (where b.Class = 3) as BronzeBadges
+  from Badges b
+  group by b.UserId
+),
+question_age as (
+  select
+    q.QuestionId,
+    cast(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - q.CreationDate)) as bigint) as AgeSeconds
+  from q
+),
+score_buckets as (
+  select
+    qs.QuestionId,
+    case
+      when qs.QuestionScore >= 50 then '50+'
+      when qs.QuestionScore >= 20 then '20-49'
+      when qs.QuestionScore >= 10 then '10-19'
+      when qs.QuestionScore >= 1 then '1-9'
+      when qs.QuestionScore = 0 then '0'
+      else 'negatives'
+    end as ScoreBucket
+  from q_stats qs
+),
+rolling as (
+  select
+    qs.QuestionId,
+    sum(qs.QuestionScore) over (order by qs.QuestionCreationDate rows between 99 preceding and current row) as RollingScore100,
+    avg(cast(qs.ViewCount as numeric)) over (order by qs.QuestionCreationDate rows between 99 preceding and current row) as RollingAvgViews100
+  from q_stats qs
+),
+tagged as (
+  select
+    q.QuestionId,
+    lower(trim(tg)) as tag
+  from q
+  cross join lateral unnest(string_to_array(nullif(substring(q.Tags, 2, length(q.Tags)-2), ''), '><')) as tg
+),
+tag_summary as (
+  select
+    t.tag,
+    count(*) as TagUseCount,
+    avg(cast(qs.ViewCount as numeric)) as AvgViewsPerTag,
+    avg(cast(qs.QuestionScore as numeric)) as AvgScorePerTag
+  from tagged t
+  join q_stats qs on qs.QuestionId = t.QuestionId
+  group by t.tag
+),
+first_tag_avg as (
+  select
+    q.QuestionId,
+    (
+      select avg(cast(qs2.ViewCount as numeric))
+      from (
+        select lower(trim(ft)) as ft
+        from unnest(string_to_array(nullif(substring(q.Tags, 2, length(q.Tags)-2), ''), '><')) as ft
+        limit 1
+      ) x
+      join tagged t on t.tag = x.ft
+      join q_stats qs2 on qs2.QuestionId = t.QuestionId
+    ) as FirstTagAvgViews
+  from q
+),
+synthetic as (
+  select QuestionId, Title, OwnerUserId from q where 1=0
+  union all
+  select QuestionId, Title, OwnerUserId from q where Score > 100
+),
+final as (
+  select
+    qs.QuestionId,
+    qs.Title,
+    qs.OwnerUserId,
+    u.DisplayName as OwnerDisplayName,
+    coalesce(us.Reputation, 0) as OwnerReputation,
+    coalesce(ob.BadgeCount, 0) as OwnerBadges,
+    coalesce(ob.GoldBadges, 0) as OwnerGoldBadges,
+    coalesce(ob.SilverBadges, 0) as OwnerSilverBadges,
+    coalesce(ob.BronzeBadges, 0) as OwnerBronzeBadges,
+    coalesce(us.UserTenureYears, 0) as OwnerTenureYears,
+    qs.QuestionScore,
+    qs.ViewCount,
+    qs.QuestionCreationDate,
+    qs.ClosedDate,
+    qs.TagCount,
+    qs.HasTag_sql,
+    qs.HasTag_js,
+    coalesce(aa.AnswersTotal, 0) as AnswersTotal,
+    coalesce(aa.AnswersPositive, 0) as AnswersPositive,
+    aa.MaxAnswerScore,
+    aa.MinAnswerScore,
+    aa.AvgAnswerScore,
+    av.UpVotesOnAnswers,
+    av.DownVotesOnAnswers,
+    qv.UpVotesOnQuestion,
+    qv.DownVotesOnQuestion,
+    qv.FavoritesOnQuestion,
+    ed.EditCount,
+    ed.FirstEditDate,
+    ed.LastEditDate,
+    ed.CloseEvents,
+    ed.ReopenEvents,
+    dup.DuplicateLinks,
+    dup.LinkedLinks,
+    cm.CommentCount,
+    cm.PositiveComments,
+    act.SecondsToLastAnswer,
+    act.SecondsToLastComment,
+    qa.AgeSeconds as QuestionAgeSeconds,
+    sb.ScoreBucket,
+    r.RollingScore100,
+    r.RollingAvgViews100,
+    fta.FirstTagAvgViews,
+    ac.AcceptedAnswerId,
+    ac.AcceptedAnswerScore,
+    qw.rn_by_views,
+    qw.dr_by_score,
+    qw.median_views_all,
+    case
+      when qs.ViewCount > coalesce(fta.FirstTagAvgViews, 0) * 2 and qs.QuestionScore >= 5 then 'outperforming'
+      when qs.QuestionScore <= -5 and coalesce(aa.AnswersTotal, 0) = 0 then 'unanswered_low'
+      when qs.ClosedDate is not null then 'closed'
+      else 'normal'
+    end as PerfBucket,
+    coalesce(qv.UpVotesOnQuestion, 0) - coalesce(qv.DownVotesOnQuestion, 0) +
+    coalesce(av.UpVotesOnAnswers, 0) - coalesce(av.DownVotesOnAnswers, 0) as NetVotesAll,
+    left(coalesce(qs.Title, ''), 80) as TitleSnippet,
+    md5(coalesce(qs.Title, '') || ':' || cast(qs.QuestionId as text)) as TitleHash,
+    case when qs.ViewCount > 0 then round((coalesce(qv.FavoritesOnQuestion, 0) * 1.0 / qs.ViewCount) * 1000, 3) end as FavoritesPerKViews,
+    case when coalesce(aa.AnswersTotal, 0) > 0 then round(coalesce(aa.AnswersPositive, 0) * 1.0 / aa.AnswersTotal, 4) end as SharePositiveAnswers
+  from q_windows qw
+  join q_stats qs on qs.QuestionId = qw.QuestionId
+  left join Users u on u.Id = qs.OwnerUserId
+  left join user_stats us on us.UserId = qs.OwnerUserId
+  left join owner_badges ob on ob.UserId = qs.OwnerUserId
+  left join answers_agg aa on aa.QuestionId = qs.QuestionId
+  left join accepted ac on ac.QuestionId = qs.QuestionId
+  left join answer_votes av on av.QuestionId = qs.QuestionId
+  left join question_votes qv on qv.QuestionId = qs.QuestionId
+  left join edits ed on ed.PostId = qs.QuestionId
+  left join duplicates dup on dup.DuplicateQuestionId = qs.QuestionId
+  left join commenters cm on cm.PostId = qs.QuestionId
+  left join activity_spread act on act.QuestionId = qs.QuestionId
+  left join question_age qa on qa.QuestionId = qs.QuestionId
+  left join score_buckets sb on sb.QuestionId = qs.QuestionId
+  left join rolling r on r.QuestionId = qs.QuestionId
+  left join first_tag_avg fta on fta.QuestionId = qs.QuestionId
+  where
+    (
+      (qs.HasTag_sql = 1 or qs.HasTag_js = 1)
+      and coalesce(aa.AnswersTotal, 0) >= 0
+      and (qs.ViewCount is null or qs.ViewCount >= 0)
+    )
+    and not exists (
+      select 1
+      from PostHistory phx
+      where phx.PostId = qs.QuestionId
+        and phx.PostHistoryTypeId = 12
+    )
+    and (
+      qs.ClosedDate is null
+      or exists (
+        select 1 from PostHistory phc
+        where phc.PostId = qs.QuestionId
+          and phc.PostHistoryTypeId in (11,20)
+      )
+    )
+)
+select *
+from final f
+where
+  (
+    f.rn_by_views <= 1000
+    or f.dr_by_score <= 1000
+    or (f.ScoreBucket in ('20-49','50+') and f.NetVotesAll >= 10)
+  )
+  and (
+    f.TitleSnippet ilike any (array['%sql%','%join%','%index%','%performance%'])
+    or f.HasTag_sql = 1
+  )
+order by
+  f.ScoreBucket desc,
+  f.QuestionScore desc nulls last,
+  f.ViewCount desc nulls last,
+  f.QuestionId
+limit 500;

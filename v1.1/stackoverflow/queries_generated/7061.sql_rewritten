@@ -1,0 +1,214 @@
+-- {"query": "7061.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2220} 
+with
+-- recent active questions with tag arrays and derived metrics
+recent_qs as (
+  select
+    p.id,
+    p.title,
+    p.creationdate,
+    p.owneruserid,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    coalesce(p.tags,'') as raw_tags,
+    -- turn <tag><tag> into array of tags (postgres-style)
+    case when p.tags is null or p.tags = '' then array[]::varchar[] else string_to_array(substring(p.tags,2,length(p.tags)-2), '><') end as tags_array
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+    and p.viewcount is not null
+),
+-- aggregate user metrics (including users who may have been deleted referenced by -1)
+user_metrics as (
+  select
+    u.id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.views as user_views,
+    coalesce(b.badge_counts, json_build_object('gold',0,'silver',0,'bronze',0)) as badge_counts,
+    coalesce(qs.q_count,0) as questions_posted,
+    coalesce(asw.a_count,0) as answers_posted,
+    coalesce(avg_ans.avg_score,0) as avg_answer_score,
+    -- activity recency
+    greatest(coalesce(u.lastaccessdate, '1970-01-01'::timestamp), coalesce(max_post.last_activity, '1970-01-01'::timestamp)) as last_active
+  from users u
+  left join (
+    select userId, count(*) as q_count
+    from posts
+    where posttypeid = 1
+    group by userId
+  ) qs on qs.userid = u.id
+  left join (
+    select owneruserid, count(*) as a_count
+    from posts
+    where posttypeid = 2
+    group by owneruserid
+  ) asw on asw.owneruserid = u.id
+  left join (
+    select owneruserid, avg(score)::numeric(10,3) as avg_score
+    from posts
+    where posttypeid = 2
+    group by owneruserid
+  ) avg_ans on avg_ans.owneruserid = u.id
+  left join (
+    select userid,
+      json_build_object(
+        'gold', sum(case when class=1 then 1 else 0 end),
+        'silver', sum(case when class=2 then 1 else 0 end),
+        'bronze', sum(case when class=3 then 1 else 0 end)
+      ) as badge_counts
+    from badges
+    group by userid
+  ) b on b.userid = u.id
+  left join (
+    select owneruserid, max(lastactivitydate) as last_activity
+    from posts
+    group by owneruserid
+  ) max_post on max_post.owneruserid = u.id
+),
+-- compute per-question derived stats including correlated subqueries and correlated existence checks
+qs_enriched as (
+  select
+    q.*,
+    um.displayname as owner_name,
+    um.reputation as owner_reputation,
+    um.badge_counts,
+    -- number of distinct answerers
+    (select count(distinct owneruserid) from posts a where a.parentid = q.id and a.posttypeid = 2) as distinct_answerers,
+    -- highest scoring answer info (may be null)
+    (select json_build_object('id', a.id, 'score', a.score, 'ownerid', a.owneruserid, 'age_days', greatest(1, extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - a.creationdate))/86400)::int)
+     from posts a
+     where a.parentid = q.id and a.posttypeid = 2
+     order by a.score desc nulls last, a.creationdate asc
+     limit 1) as top_answer,
+    -- number of comments on question and on its answers
+    (select count(*) from comments c where c.postid = q.id) as question_comment_count,
+    (select count(*) from comments c where c.postid in (select id from posts where parentid = q.id and posttypeid = 2)) as answers_comment_count,
+    -- if the question has been closed at any point (posthistory)
+    exists (
+      select 1 from posthistory ph
+      where ph.postid = q.id and ph.posthistorytypeid in (10, 35) -- 10 = Post Closed, 35 = Post Migrated Away (closed-ish)
+    ) as ever_closed,
+    -- average time-to-answer for first 3 answers (in hours)
+    (select avg(extract(epoch from (a.creationdate - q.creationdate))/3600)::numeric(10,3)
+     from posts a
+     where a.parentid = q.id and a.posttypeid = 2
+     and a.creationdate is not null
+     order by a.creationdate asc
+     limit 3) as avg_time_first3_ans_hrs
+  from recent_qs q
+  left join user_metrics um on um.id = q.owneruserid
+),
+-- windowed ranking across tags combining set operators and complex predicate
+tag_projections as (
+  select
+    t.tagname,
+    t.id as tagid,
+    coalesce(tp.q_count,0) as recent_q_count,
+    coalesce(tp.avg_score,0)::numeric(10,3) as avg_score,
+    coalesce(tp.median_views,0)::bigint as median_views,
+    -- deduce popularity bucket
+    case
+      when coalesce(tp.q_count,0) >= 200 then 'very_high'
+      when coalesce(tp.q_count,0) >= 50 then 'high'
+      when coalesce(tp.q_count,0) >= 10 then 'medium'
+      when coalesce(tp.q_count,0) > 0 then 'low'
+      else 'none'
+    end as popularity_bucket
+  from tags t
+  left join (
+    select
+      unnest(tags_array) as tag,
+      count(*) filter (where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years') as q_count,
+      avg(p.score) as avg_score,
+      -- approximate median views using percentile_cont on window
+      percentile_cont(0.5) within group (order by p.viewcount) over (partition by unnest(tags_array)) as median_views
+    from posts p
+    where p.posttypeid = 1 and p.tags is not null
+    group by unnest(tags_array)
+  ) tp on tp.tag = t.tagname
+  where t.count > 0
+),
+-- hot questions using window functions and complex scoring combining recency, score, views, and tags popularity
+hotness as (
+  select
+    q.id,
+    q.title,
+    q.owneruserid,
+    q.score,
+    q.viewcount,
+    q.answercount,
+    q.tags_array,
+    q.creationdate,
+    q.owner_name,
+    q.owner_reputation,
+    q.distinct_answerers,
+    q.question_comment_count,
+    q.answers_comment_count,
+    q.ever_closed,
+    -- tag-weighted popularity: sum of tag popularity scores (popularity_bucket -> weight)
+    (select sum(
+        case tp.popularity_bucket
+          when 'very_high' then 3
+          when 'high' then 2
+          when 'medium' then 1
+          when 'low' then 0.5
+          else 0
+        end
+      )
+     from tag_projections tp
+     where tp.tagname = any(q.tags_array)
+    )::numeric(10,3) as tag_pop_weight,
+    -- time decay factor: newer questions get boosted
+    exp( - greatest(0, extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - q.creationdate))/86400) / 90.0 )::numeric(10,6) as time_decay,
+    -- composite hotness score
+    (
+      -- base: views (log), score, answercount, tag weight, comment engagement
+      (ln(1 + coalesce(q.viewcount,0)) * 0.5)
+      + (coalesce(q.score,0) * 2.0)
+      + (coalesce(q.answercount,0) * 1.2)
+      + (coalesce(q.question_comment_count,0) * 0.3)
+      + coalesce((select tp.avg_score from tag_projections tp where tp.tagname = any(q.tags_array) limit 1),0)
+    ) * coalesce( (select (tag_pop_weight + 1) from (select 1) s), 1 ) * (exp( - greatest(0, extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - q.creationdate))/86400) / 90.0 ) ) as raw_hotness
+  from qs_enriched q
+),
+-- final selection combining everything, using set operators and correlated anti-joins
+final_selection as (
+  select
+    h.*,
+    row_number() over (order by raw_hotness desc nulls last) as hot_rank,
+    dense_rank() over (partition by owneruserid order by raw_hotness desc) as owner_local_rank,
+    first_value(owner_name) over (partition by owneruserid order by h.raw_hotness desc nulls last) as owner_top_question_title
+  from hotness h
+)
+select
+  fs.hot_rank,
+  fs.id as question_id,
+  left(coalesce(fs.title,''), 200) as short_title,
+  fs.creationdate,
+  fs.owneruserid,
+  coalesce(fs.owner_name, '[deleted]') as owner_name,
+  fs.owner_reputation,
+  fs.score,
+  fs.viewcount,
+  fs.answercount,
+  fs.distinct_answerers,
+  fs.question_comment_count,
+  fs.answers_comment_count,
+  fs.ever_closed,
+  round(fs.tag_pop_weight::numeric,3) as tag_pop_weight,
+  round(fs.time_decay::numeric,6) as time_decay,
+  round(fs.raw_hotness::numeric,6) as hotness_score,
+  fs.owner_local_rank,
+  fs.owner_top_question_title
+from final_selection fs
+where fs.hot_rank <= 250
+  and (
+    -- filter: either very recent high-activity or historically popular tags
+    (fs.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days' and fs.raw_hotness > 50)
+    or (fs.tag_pop_weight >= 2 and fs.raw_hotness > 20)
+    or (fs.owner_reputation > 50000 and fs.raw_hotness > 5)
+  )
+order by fs.hot_rank
+;

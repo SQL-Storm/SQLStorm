@@ -1,0 +1,162 @@
+-- {"query": "924.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1443} 
+WITH UserBadgeSummary AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+PostStats AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgScore,
+        COUNT(DISTINCT CASE WHEN p.ClosedDate IS NOT NULL THEN p.Id END) AS ClosedPosts,
+        MAX(p.ViewCount) AS MaxViewCount,
+        STRING_AGG(DISTINCT COALESCE(substring(p.Tags FROM '<([^<>]+)>'), ''), ', ') AS DistinctTags
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+RecentActivity AS (
+    SELECT
+        ph.UserId,
+        ph.PostId,
+        MAX(ph.CreationDate) AS LastEditDate,
+        COUNT(*) AS EditCount,
+        ARRAY_AGG(DISTINCT p.PostTypeId) AS EditedPostTypes
+    FROM PostHistory ph
+    INNER JOIN Posts p ON ph.PostId = p.Id
+    WHERE ph.UserId IS NOT NULL
+    GROUP BY ph.UserId, ph.PostId
+),
+UserLinkStats AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(pl.Id) AS TotalPostLinks,
+        COUNT(pl.Id) FILTER (WHERE lt.Name = 'Duplicate') AS DuplicateLinks,
+        COUNT(pl.Id) FILTER (WHERE lt.Name = 'Linked') AS LinkedPosts
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    GROUP BY p.OwnerUserId
+),
+TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        COALESCE(p.ScoreSum, 0) AS TotalScore,
+        COALESCE(p.PostCount, 0) AS PostCount,
+        CASE WHEN t.Count > 10000 THEN 'High' WHEN t.Count BETWEEN 1000 AND 10000 THEN 'Medium' ELSE 'Low' END AS PopularityLevel
+    FROM Tags t
+    LEFT JOIN (
+        SELECT 
+            UNNEST(string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags) - 2), '><')) AS TagName,
+            SUM(p.Score) AS ScoreSum,
+            COUNT(*) AS PostCount
+        FROM Posts p
+        WHERE p.Tags IS NOT NULL AND p.PostTypeId = 1
+        GROUP BY TagName
+    ) p ON t.TagName = p.TagName
+),
+RankedUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        b.TotalBadges,
+        b.GoldBadges,
+        b.SilverBadges,
+        b.BronzeBadges,
+        ps.QuestionCount,
+        ps.AnswerCount,
+        ps.AvgScore,
+        ps.ClosedPosts,
+        ps.MaxViewCount,
+        us.TotalPostLinks,
+        us.DuplicateLinks,
+        us.LinkedPosts,
+        ra.LastEditDate,
+        ra.EditCount,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC NULLS LAST) AS ReputationRank,
+        ROW_NUMBER() OVER (ORDER BY ps.QuestionCount DESC NULLS LAST) AS QuestionRank,
+        ROW_NUMBER() OVER (ORDER BY ps.AnswerCount DESC NULLS LAST) AS AnswerRank
+    FROM Users u
+    LEFT JOIN UserBadgeSummary b ON u.Id = b.UserId
+    LEFT JOIN PostStats ps ON u.Id = ps.OwnerUserId
+    LEFT JOIN UserLinkStats us ON u.Id = us.OwnerUserId
+    LEFT JOIN (
+        SELECT UserId, MAX(LastEditDate) AS LastEditDate, SUM(EditCount) AS EditCount
+        FROM RecentActivity
+        GROUP BY UserId
+    ) ra ON u.Id = ra.UserId
+),
+TopPerformers AS (
+    SELECT * FROM RankedUsers WHERE ReputationRank <= 100
+), 
+
+CloseVoteDetails AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        ph.CreationDate,
+        crt.Name AS CloseReason,
+        COUNT(*) OVER (PARTITION BY ph.PostId) AS CloseVoteCount
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON ph.Comment::int = crt.Id AND ph.PostHistoryTypeId = 10
+    WHERE ph.PostHistoryTypeId = 10
+),
+UserCloseVoteSummary AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(cvd.PostId) AS CloseVotesCast,
+        COUNT(DISTINCT cvd.PostId) AS DistinctPostsClosed,
+        MAX(cvd.CreationDate) AS LastCloseVoteDate,
+        STRING_AGG(DISTINCT cvd.CloseReason, ', ') AS CloseReasons
+    FROM Users u
+    LEFT JOIN CloseVoteDetails cvd ON u.Id = cvd.UserId
+    GROUP BY u.Id
+)
+SELECT
+    tp.DisplayName,
+    tp.Reputation,
+    tp.TotalBadges,
+    tp.GoldBadges,
+    tp.SilverBadges,
+    tp.BronzeBadges,
+    tp.QuestionCount,
+    tp.AnswerCount,
+    tp.AvgScore,
+    tp.ClosedPosts,
+    COALESCE(tp.MaxViewCount, 0) AS MaxViewCount,
+    tp.TotalPostLinks,
+    tp.DuplicateLinks,
+    tp.LinkedPosts,
+    tp.LastEditDate,
+    tp.EditCount,
+    ucv.CloseVotesCast,
+    ucv.DistinctPostsClosed,
+    ucv.LastCloseVoteDate,
+    ucv.CloseReasons,
+    tt.TagName,
+    tt.PopularityLevel,
+    tt.TotalScore AS TagTotalScore,
+    tt.PostCount AS TagPostCount
+FROM TopPerformers tp
+LEFT JOIN UserCloseVoteSummary ucv ON tp.Id = ucv.UserId
+LEFT JOIN LATERAL (
+    SELECT t.TagName, t.PopularityLevel, t.TotalScore, t.PostCount
+    FROM TopTags t
+    WHERE t.TagName = ANY(string_to_array(COALESCE(tp.DistinctTags, ''), ', '))
+    ORDER BY t.TotalScore DESC NULLS LAST
+    LIMIT 1
+) tt ON TRUE
+ORDER BY tp.Reputation DESC
+LIMIT 50;

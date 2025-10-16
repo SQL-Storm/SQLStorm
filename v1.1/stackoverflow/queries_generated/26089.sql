@@ -1,0 +1,79 @@
+-- {"query": "26089.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "llama-3.3-instruct", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 663} 
+
+WITH RankedPosts AS (
+  SELECT 
+    p.Id,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS RowNum,
+    DENSE_RANK() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS DenseRank
+  FROM 
+    Posts p
+  WHERE 
+    p.PostTypeId = 1
+    AND p.ClosedDate IS NULL
+),
+UserReputation AS (
+  SELECT 
+    u.Id,
+    u.Reputation,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+  FROM 
+    Users u
+  LEFT JOIN 
+    Votes v ON u.Id = v.UserId
+  GROUP BY 
+    u.Id, u.Reputation
+),
+PostHistoryStats AS (
+  SELECT 
+    ph.PostId,
+    COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE NULL END) AS CloseVotes,
+    COUNT(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE NULL END) AS ReopenVotes
+  FROM 
+    PostHistory ph
+  GROUP BY 
+    ph.PostId
+)
+SELECT 
+  rp.Id,
+  rp.Score,
+  rp.ViewCount,
+  rp.CreationDate,
+  rp.LastActivityDate,
+  ur.Reputation,
+  ur.UpVotes,
+  ur.DownVotes,
+  phs.CloseVotes,
+  phs.ReopenVotes,
+  (SELECT COUNT(*) FROM Comments c WHERE c.PostId = rp.Id) AS CommentCount,
+  (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = rp.Id AND pl.LinkTypeId = 1) AS LinkedPostCount,
+  (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = rp.Id AND pl.LinkTypeId = 3) AS DuplicatePostCount,
+  CASE 
+    WHEN rp.Score > 10 AND rp.ViewCount > 1000 THEN 'HighScoreHighView'
+    WHEN rp.Score > 10 AND rp.ViewCount <= 1000 THEN 'HighScoreLowView'
+    WHEN rp.Score <= 10 AND rp.ViewCount > 1000 THEN 'LowScoreHighView'
+    ELSE 'LowScoreLowView'
+  END AS PostCategory,
+  COALESCE(rp.RowNum, 99999) AS RowNum,
+  COALESCE(rp.DenseRank, 99999) AS DenseRank,
+  CASE 
+    WHEN ur.Reputation IS NULL THEN 0
+    WHEN ur.Reputation > 10000 THEN 'HighReputation'
+    WHEN ur.Reputation > 1000 THEN 'MediumReputation'
+    ELSE 'LowReputation'
+  END AS ReputationCategory
+FROM 
+  RankedPosts rp
+LEFT JOIN 
+  UserReputation ur ON rp.OwnerUserId = ur.Id
+LEFT JOIN 
+  PostHistoryStats phs ON rp.Id = phs.PostId
+WHERE 
+  rp.RowNum <= 100
+  AND rp.DenseRank <= 100
+ORDER BY 
+  rp.Score DESC, rp.ViewCount DESC;

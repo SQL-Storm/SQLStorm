@@ -1,0 +1,39 @@
+WITH top_users AS (
+  SELECT u.Id, u.DisplayName, SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+  LEFT JOIN Votes v ON p.Id = v.PostId
+  GROUP BY u.Id, u.DisplayName
+  HAVING SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) > 1000
+),
+top_posts AS (
+  SELECT p.Id, p.Title, SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes
+  FROM Posts p
+  LEFT JOIN Votes v ON p.Id = v.PostId
+  GROUP BY p.Id, p.Title
+  HAVING SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) > 50
+),
+closed_posts AS (
+  SELECT p.Id, p.Title, ph.Comment AS close_reason
+  FROM Posts p
+  JOIN PostHistory ph ON p.Id = ph.PostId
+  WHERE ph.PostHistoryTypeId = 10
+)
+SELECT 
+  tu.DisplayName AS top_user,
+  tp.Title AS top_post,
+  cp.close_reason,
+  COUNT(tu.Id) FILTER (WHERE TRUE) OVER (PARTITION BY tp.Title) AS num_top_users,
+  ROW_NUMBER() OVER (PARTITION BY tp.Title ORDER BY tu.upvotes DESC) AS user_rank,
+  LAG(tu.upvotes, 1) OVER (PARTITION BY tp.Title ORDER BY tu.upvotes DESC) AS prev_user_upvotes,
+  tp.upvotes AS post_upvotes,
+  cp.close_reason AS post_close_reason,
+  STRING_AGG(t.TagName, ', ') AS post_tags
+FROM top_users tu
+JOIN top_posts tp ON tu.Id = tp.Id
+LEFT JOIN closed_posts cp ON tp.Id = cp.Id
+LEFT JOIN PostLinks pl ON tp.Id = pl.PostId
+LEFT JOIN Tags t ON pl.RelatedPostId = t.Id
+WHERE tu.upvotes > 500 AND tp.upvotes > 20
+GROUP BY tu.DisplayName, tp.Title, cp.close_reason, tp.upvotes, tu.Id, tu.upvotes
+ORDER BY tu.upvotes DESC, tp.upvotes DESC;

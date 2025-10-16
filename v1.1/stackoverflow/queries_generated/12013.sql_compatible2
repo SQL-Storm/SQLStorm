@@ -1,0 +1,137 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.CreationDate) AS UserPostRank,
+        DENSE_RANK() OVER (ORDER BY P.Score DESC, P.CreationDate) AS GlobalPostRank
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2)
+),
+TopUsers AS (
+    SELECT 
+        OwnerUserId,
+        COUNT(*) AS TotalPosts,
+        MAX(Score) AS MaxScore,
+        SUM(ViewCount) AS TotalViews
+    FROM 
+        RankedPosts
+    WHERE 
+        UserPostRank <= 3
+    GROUP BY 
+        OwnerUserId
+    HAVING 
+        COUNT(*) >= 3
+),
+PostHistorySummary AS (
+    SELECT 
+        PostId,
+        COUNT(*) AS TotalEdits,
+        MAX(CASE WHEN PostHistoryTypeId = 5 THEN CreationDate END) AS LastEditBodyDate,
+        MAX(CASE WHEN PostHistoryTypeId = 6 THEN CreationDate END) AS LastEditTagsDate
+    FROM 
+        PostHistory
+    WHERE 
+        PostHistoryTypeId IN (5, 6)
+    GROUP BY 
+        PostId
+),
+TagUsage AS (
+    SELECT 
+        P.Id AS PostId,
+        TRIM(BOTH '<' FROM TRIM(BOTH '>' FROM tag_item)) AS TagName,
+        COUNT(*) OVER (PARTITION BY TRIM(BOTH '<' FROM TRIM(BOTH '>' FROM tag_item))) AS TagCount
+    FROM 
+        Posts P,
+        LATERAL (
+            SELECT value AS tag_item
+            FROM (
+                -- recursive split to turn '<tag1><tag2>' into rows
+                WITH RECURSIVE parts(fullstr) AS (
+                    SELECT P.Tags
+                    UNION ALL
+                    SELECT
+                        CASE 
+                          WHEN INSTR(fullstr, '>') > 0 THEN SUBSTR(fullstr, INSTR(fullstr, '>') + 1)
+                          ELSE ''
+                        END
+                    FROM parts
+                    WHERE fullstr <> ''
+                )
+                SELECT
+                    CASE
+                        WHEN fullstr LIKE '<%>%' AND INSTR(fullstr, '>') > 0
+                        THEN SUBSTR(fullstr, 1, INSTR(fullstr, '>'))
+                        ELSE NULL
+                    END AS value
+                FROM parts
+                WHERE fullstr LIKE '<%>%'
+            ) AS split_rows
+            WHERE value IS NOT NULL
+        ) tags
+    WHERE 
+        P.PostTypeId = 1
+),
+CommentActivity AS (
+    SELECT 
+        C.PostId,
+        COUNT(*) AS TotalComments,
+        AVG(C.Score) AS AvgCommentScore
+    FROM 
+        Comments C
+    GROUP BY 
+        C.PostId
+),
+UserBadges AS (
+    SELECT 
+        UserId,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM 
+        Badges
+    GROUP BY 
+        UserId
+)
+SELECT 
+    RP.Id,
+    RP.PostTypeId,
+    RP.CreationDate,
+    RP.Score,
+    RP.ViewCount,
+    RP.OwnerUserId,
+    RP.OwnerDisplayName,
+    RP.UserPostRank,
+    RP.GlobalPostRank,
+    PHS.TotalEdits,
+    PHS.LastEditBodyDate,
+    PHS.LastEditTagsDate,
+    COALESCE(TU.TagCount, 0) AS TagCount,
+    COALESCE(CA.TotalComments, 0) AS TotalComments,
+    COALESCE(CA.AvgCommentScore, 0) AS AvgCommentScore,
+    COALESCE(UB.GoldBadges, 0) AS GoldBadges,
+    COALESCE(UB.SilverBadges, 0) AS SilverBadges,
+    COALESCE(UB.BronzeBadges, 0) AS BronzeBadges
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    PostHistorySummary PHS ON RP.Id = PHS.PostId
+LEFT JOIN 
+    TagUsage TU ON RP.Id = TU.PostId
+LEFT JOIN 
+    CommentActivity CA ON RP.Id = CA.PostId
+LEFT JOIN 
+    UserBadges UB ON RP.OwnerUserId = UB.UserId
+WHERE 
+    RP.OwnerUserId IN (SELECT OwnerUserId FROM TopUsers)
+ORDER BY 
+    RP.Score DESC, 
+    RP.CreationDate;

@@ -1,0 +1,102 @@
+WITH UserStats AS (
+    SELECT
+        u.Id                                     AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id)               FILTER (WHERE p.PostTypeId = 1)   AS QuestionCount,
+        COUNT(p.Id)               FILTER (WHERE p.PostTypeId = 2)   AS AnswerCount,
+        SUM(COALESCE(p.Score,0))                                 AS TotalScore,
+        MAX(p.CreationDate)                                      AS LastPostDate,
+        COALESCE((
+            SELECT MAX(b.Date)
+            FROM Badges b
+            WHERE b.UserId = u.Id AND b.Class = 1
+        ), TIMESTAMP '1970-01-01')                              AS LastGoldBadgeDate,
+        COUNT(v.Id)               FILTER (WHERE v.VoteTypeId = 2)   AS UpVoteCount,
+        COUNT(v.Id)               FILTER (WHERE v.VoteTypeId = 3)   AS DownVoteCount
+    FROM Users u
+    LEFT JOIN Posts  p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes  v ON v.UserId     = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+TagActivity AS (
+    SELECT
+        t.TagName,
+        COUNT(pl.Id)                                          AS LinkCount,
+        COUNT(p.Id)               FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        AVG(COALESCE(p.Score,0))                               AS AvgScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Title FROM 1 FOR 30), '; ') AS SampleTitles
+    FROM Tags t
+    LEFT JOIN PostLinks pl
+           ON pl.PostId = t.ExcerptPostId
+          OR pl.RelatedPostId = t.ExcerptPostId
+    LEFT JOIN Posts p
+           ON p.Id = pl.RelatedPostId
+          AND p.PostTypeId = 1
+    GROUP BY t.TagName
+),
+
+RankedUsers AS (
+    SELECT
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.TotalScore,
+        us.LastPostDate,
+        us.LastGoldBadgeDate,
+        us.UpVoteCount,
+        us.DownVoteCount,
+        RANK()   OVER (ORDER BY us.TotalScore DESC, us.Reputation DESC)          AS ScoreRank,
+        ROW_NUMBER() OVER (PARTITION BY (us.TotalScore/NULLIF(us.AnswerCount,0))
+                           ORDER BY us.Reputation DESC)                     AS RowInScoreRatio
+    FROM UserStats us
+    WHERE us.Reputation > 1000
+)
+
+SELECT
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.QuestionCount,
+    ru.AnswerCount,
+    ru.TotalScore,
+    ru.ScoreRank,
+    COALESCE(ru.LastGoldBadgeDate, TIMESTAMP '1970-01-01')          AS LastGoldBadgeDate,
+    CASE
+        WHEN ru.AnswerCount = 0 THEN NULL
+        ELSE ROUND(CAST(ru.TotalScore AS NUMERIC) / ru.AnswerCount, 2)
+    END                                                            AS ScorePerAnswer,
+    COALESCE(t.SampleTitles, 'No titles')                         AS SampleTitles,
+    t.LinkCount,
+    t.AvgScore,
+    COALESCE(t.QuestionCount, 0)                                   AS TagQuestionCount
+FROM RankedUsers ru
+FULL OUTER JOIN TagActivity t
+       ON t.TagName = (
+           SELECT (string_to_array(ru.DisplayName, ' '))[1]
+       )
+WHERE (ru.ScoreRank <= 100 OR t.LinkCount > 50)
+
+UNION ALL
+
+SELECT
+    NULL                                                       AS UserId,
+    'Aggregate Summary'                                        AS DisplayName,
+    NULL                                                       AS Reputation,
+    SUM(ru.QuestionCount)                                      AS QuestionCount,
+    SUM(ru.AnswerCount)                                        AS AnswerCount,
+    SUM(ru.TotalScore)                                         AS TotalScore,
+    NULL                                                       AS ScoreRank,
+    NULL                                                       AS LastGoldBadgeDate,
+    NULL                                                       AS ScorePerAnswer,
+    STRING_AGG(DISTINCT t.TagName, ', ')                       AS SampleTitles,
+    SUM(t.LinkCount)                                           AS LinkCount,
+    AVG(t.AvgScore)                                            AS AvgScore,
+    SUM(t.QuestionCount)                                       AS TagQuestionCount
+FROM RankedUsers ru
+JOIN TagActivity t ON TRUE
+WHERE ru.ScoreRank <= 100
+;

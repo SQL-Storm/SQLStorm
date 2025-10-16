@@ -1,0 +1,112 @@
+WITH UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        AVG(p.Score) AS AvgScore,
+        SUM(CASE WHEN p.ViewCount IS NULL THEN 0 ELSE p.ViewCount END) AS TotalViews,
+        MAX(p.LastActivityDate) AS LastActive,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY MAX(p.LastActivityDate) DESC) AS RecentPostRank
+    FROM
+        Users u
+        LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY
+        u.Id, u.DisplayName
+),
+BadgeSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(*) AS BadgeCount,
+        STRING_AGG(b.Name, ';') AS BadgeNames
+    FROM
+        Badges b
+    GROUP BY
+        b.UserId
+),
+AnswerQuestions AS (
+    SELECT DISTINCT
+        a.Id AS AnswerId,
+        a.OwnerUserId,
+        a.CreationDate AS AnswerCreated,
+        q.Id AS QuestionId,
+        q.CreationDate AS QuestionCreated,
+        CAST((a.CreationDate - q.CreationDate) AS INTEGER) AS DaysToAnswer, -- may need adaptation per dialect
+        c.Score AS CommentScore,
+        (SELECT COUNT(*) FROM Comments c2 WHERE c2.PostId = a.Id AND c2.Score > 0) AS UpvoteComments,
+        (SELECT COUNT(*) FROM Comments c3 WHERE c3.PostId = a.Id AND c3.Score < 0) AS DownvoteComments,
+        CASE WHEN a.Score > 10 THEN 'High' ELSE 'Low' END AS AnswerQuality
+    FROM
+        Posts a
+        INNER JOIN Posts q ON a.ParentId = q.Id
+        LEFT JOIN Comments c ON a.Id = c.PostId
+),
+CorrelatedSubQuery AS (
+    SELECT
+        pq.UserId,
+        pq.BestAnswerId,
+        (SELECT MAX(p.Score) FROM Posts p WHERE p.PostTypeId = 2 AND p.OwnerUserId = pq.UserId AND p.CreationDate > pq.BestAnswerCreated) AS NextBestAnswerScore
+    FROM
+        (
+            SELECT
+                q.OwnerUserId AS UserId,
+                a.Id AS BestAnswerId,
+                a.CreationDate AS BestAnswerCreated
+            FROM
+                Posts q
+                INNER JOIN Posts a ON q.Id = a.ParentId
+            WHERE
+                a.Score = (
+                    SELECT MAX(p2.Score) FROM Posts p2 WHERE p2.ParentId = q.Id AND p2.PostTypeId = 2
+                )
+        ) pq
+),
+OuterJoinExample AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        ups.QuestionCount,
+        ups.AnswerCount,
+        bs.BadgeCount,
+        ups.AvgScore,
+        ups.TotalViews,
+        ups.LastActive,
+        c.Score AS CommentScore,
+        a.AnswerId,
+        a.DaysToAnswer,
+        a.AnswerQuality
+    FROM
+        Users u
+        LEFT JOIN UserPostStats ups ON u.Id = ups.UserId
+        LEFT JOIN BadgeSummary bs ON u.Id = bs.UserId
+        LEFT JOIN AnswerQuestions a ON u.Id = a.OwnerUserId
+        LEFT JOIN Comments c ON a.AnswerId = c.PostId
+        LEFT JOIN CorrelatedSubQuery ac ON u.Id = ac.UserId
+    WHERE
+        u.Reputation >= 100
+        AND (u.Location IS NULL OR LOWER(u.Location) LIKE LOWER('%Earth%'))
+        AND a.AnswerQuality = 'High'
+        AND c.Score IS NOT NULL
+)
+SELECT
+    UserId,
+    DisplayName,
+    QuestionCount,
+    AnswerCount,
+    BadgeCount,
+    AvgScore,
+    TotalViews,
+    LastActive,
+    CommentScore,
+    AnswerId,
+    DaysToAnswer,
+    AnswerQuality
+FROM
+    OuterJoinExample
+WHERE
+    (BadgeCount IS NULL OR BadgeCount >= 3)
+    AND LastActive > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '180' DAY)
+    AND (CommentScore > 0 OR AnswerQuality = 'High')
+ORDER BY
+    LastActive DESC, AnswerCount DESC
+FETCH FIRST 100 ROWS ONLY;

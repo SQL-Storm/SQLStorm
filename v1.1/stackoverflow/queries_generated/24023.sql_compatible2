@@ -1,0 +1,112 @@
+WITH tag_counts AS (
+    SELECT t.TagName, t.Count
+    FROM Tags t
+    WHERE t.Count > 100
+),
+post_tags AS (
+    SELECT
+        p.Id                AS PostId,
+        p.Title,
+        p.Body,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AcceptedAnswerId,
+        t.TagName,
+        t.Count,
+        v.VoteTypeId,
+        v.UserId        AS VoterId,
+        v.CreationDate  AS VoteDate
+    FROM Posts p
+    LEFT JOIN Tags t
+           ON p.Tags LIKE '%' || t.TagName || '%'
+    LEFT JOIN Votes v
+           ON v.PostId = p.Id
+    WHERE p.PostTypeId = 1
+),
+ranked_posts AS (
+    SELECT
+        pt.*,
+        ROW_NUMBER() OVER (PARTITION BY pt.OwnerUserId
+                           ORDER BY pt.Score DESC, pt.CreationDate DESC) AS rn,
+        COALESCE(u.Reputation, 0)                           AS UserReputation,
+        CASE WHEN pt.Score > 0 THEN 1 ELSE 0 END            AS IsPositiveScore
+    FROM post_tags pt
+    LEFT JOIN Users u
+           ON u.Id = pt.OwnerUserId
+),
+correlated_counts AS (
+    SELECT
+        rp.PostId,
+        (SELECT COUNT(*)
+         FROM PostHistory ph
+         WHERE ph.PostId = rp.PostId
+           AND ph.PostHistoryTypeId = 2) AS EditCount
+    FROM ranked_posts rp
+),
+final_view AS (
+    SELECT
+        rp.PostId,
+        rp.Title,
+        rp.TagName,
+        rp.Score,
+        rp.IsPositiveScore,
+        rp.ViewCount,
+        rp.UserReputation,
+        cc.EditCount,
+        TRIM(REGEXP_REPLACE(rp.Body, '\\n|\\r', ' ', 'g')) AS TrimmedBody,
+        CASE
+            WHEN rp.Score > 10 THEN 'High'
+            WHEN rp.Score > 0  THEN 'Medium'
+            ELSE 'Low'
+        END AS ScoreLevel,
+        STRING_AGG(CASE WHEN v.VoteTypeId IS NOT NULL
+                        THEN CAST(v.VoteTypeId AS VARCHAR) END, ',') AS VoteTypes
+    FROM ranked_posts rp
+    LEFT JOIN Votes v
+           ON v.PostId = rp.PostId
+    LEFT JOIN correlated_counts cc
+           ON cc.PostId = rp.PostId
+    GROUP BY
+        rp.PostId,
+        rp.Title,
+        rp.TagName,
+        rp.Score,
+        rp.IsPositiveScore,
+        rp.ViewCount,
+        rp.UserReputation,
+        cc.EditCount,
+        rp.Body
+    HAVING rp.Score > 0
+       AND rp.ViewCount > 1000
+),
+closed_posts AS (
+    SELECT p.Id AS PostId,
+           p.Title,
+           p.ClosedDate
+    FROM Posts p
+    WHERE p.ClosedDate IS NOT NULL
+),
+merged_view AS (
+    SELECT cp.PostId,
+           cp.Title,
+           'Closed' AS Status
+    FROM closed_posts cp
+    UNION ALL
+    SELECT fv.PostId,
+           fv.Title,
+           'Open'  AS Status
+    FROM final_view fv
+)
+SELECT mv.PostId,
+       mv.Title,
+       mv.Status,
+       fv.Score,
+       fv.ViewCount
+FROM merged_view mv
+LEFT JOIN final_view fv
+       ON mv.PostId = fv.PostId
+ORDER BY mv.Status,
+         fv.Score DESC
+LIMIT 200;

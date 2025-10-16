@@ -1,0 +1,108 @@
+WITH 
+UserPostStats AS (
+    SELECT 
+        u.Id                              AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)                AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)                AS AnswerCount,
+        SUM(p.Score)                                               AS TotalScore,
+        AVG(p.ViewCount) FILTER (WHERE p.PostTypeId = 1)           AS AvgQuestionViews,
+        MAX(p.CreationDate)                                        AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+UserBadgeRanks AS (
+    SELECT 
+        b.UserId,
+        COUNT(*)                                            AS BadgeCount,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId 
+                           ORDER BY b.Class DESC, b.Date DESC) AS BadgeRank
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TopTagsByUser AS (
+    SELECT 
+        p.OwnerUserId                                      AS UserId,
+        TRIM(t)                                            AS Tag,
+        COUNT(*)                                           AS TagUseCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId 
+                           ORDER BY COUNT(*) DESC)          AS TagRank
+    FROM Posts p,
+         LATERAL unnest(string_to_array(
+                substring(p.Tags FROM 2 FOR length(p.Tags)-2), 
+                '><')) AS t
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId, TRIM(t)
+),
+UserVotesAgg AS (
+    SELECT 
+        v.UserId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END)          AS UpVotesGiven,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END)          AS DownVotesGiven,
+        COUNT(*) FILTER (WHERE vt.Id = 5)                   AS FavoritesGiven
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+)
+
+SELECT
+    up.UserId,
+    up.DisplayName,
+    up.QuestionCount,
+    up.AnswerCount,
+    up.TotalScore,
+    COALESCE(ub.BadgeCount,0)                               AS BadgeCount,
+    COALESCE(uv.UpVotesGiven,0) - COALESCE(uv.DownVotesGiven,0) AS NetVotesGiven,
+    tt.Tag                                                  AS TopTag,
+    tt.TagUseCount,
+    CASE 
+        WHEN up.TotalScore > 1000               THEN 'PowerUser'
+        WHEN up.QuestionCount > 50              THEN 'Prolific'
+        ELSE                                            'Regular'
+    END                                                     AS UserTier,
+    EXISTS (
+        SELECT 1 
+        FROM Posts p
+        WHERE p.OwnerUserId = up.UserId
+          AND p.PostTypeId = 1
+          AND p.ClosedDate IS NOT NULL
+          AND p.ClosedDate > (CAST('2024-10-01' AS date) - INTERVAL '30' DAY)
+    )                                                      AS HasRecentClosedQuestion
+FROM UserPostStats up
+LEFT JOIN UserBadgeRanks ub 
+       ON ub.UserId = up.UserId AND ub.BadgeRank = 1
+LEFT JOIN UserVotesAgg uv 
+       ON uv.UserId = up.UserId
+LEFT JOIN TopTagsByUser tt 
+       ON tt.UserId = up.UserId AND tt.TagRank = 1
+WHERE (up.QuestionCount + up.AnswerCount) > 10
+  AND (COALESCE(ub.BadgeCount,0) > 0 OR COALESCE(uv.UpVotesGiven,0) > 5)
+ORDER BY up.TotalScore DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL                                                    AS UserId,
+    'Summary'                                               AS DisplayName,
+    SUM(up.QuestionCount)                                   AS QuestionCount,
+    SUM(up.AnswerCount)                                     AS AnswerCount,
+    SUM(up.TotalScore)                                      AS TotalScore,
+    SUM(COALESCE(ub.BadgeCount,0))                          AS BadgeCount,
+    SUM(COALESCE(uv.UpVotesGiven,0) - COALESCE(uv.DownVotesGiven,0)) AS NetVotesGiven,
+    NULL                                                    AS TopTag,
+    NULL                                                    AS TagUseCount,
+    'Aggregate'                                             AS UserTier,
+    FALSE                                                   AS HasRecentClosedQuestion
+FROM UserPostStats up
+LEFT JOIN UserBadgeRanks ub 
+       ON ub.UserId = up.UserId AND ub.BadgeRank = 1
+LEFT JOIN UserVotesAgg uv 
+       ON uv.UserId = up.UserId
+WHERE (up.QuestionCount + up.AnswerCount) > 10
+
+EXCEPT
+SELECT * FROM (SELECT NULL::bigint,NULL::text,NULL::int,NULL::int,NULL::bigint,NULL::int,NULL::int,NULL::text,NULL::int,NULL::text,FALSE::boolean) AS dummy;

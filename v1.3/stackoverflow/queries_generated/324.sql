@@ -1,0 +1,172 @@
+-- {"query": "324.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 17576} 
+WITH
+q_posts AS (
+  SELECT p.Id, p.OwnerUserId, p.Title, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.Tags, p.AcceptedAnswerId, p.CommentCount, p.FavoriteCount, p.ClosedDate, p.LastEditDate, p.LastActivityDate
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+a_posts AS (
+  SELECT a.Id, a.ParentId, a.OwnerUserId, a.Score, a.CreationDate AS AnswerCreationDate, a.CommentCount AS AnswerCommentCount, a.LastActivityDate
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+),
+tag_exploded AS (
+  SELECT q.Id AS question_id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, q.AcceptedAnswerId, q.CommentCount, q.FavoriteCount, q.ClosedDate, q.OwnerUserId,
+         t.tag
+  FROM q_posts q
+  LEFT JOIN LATERAL (
+    SELECT regexp_split_to_table(substring(q.Tags FROM 2 FOR GREATEST(char_length(q.Tags)-2,0)), '><') AS tag
+  ) t ON q.Tags IS NOT NULL
+),
+answer_agg AS (
+  SELECT a.ParentId AS question_id,
+         COUNT(a.Id) AS answers_count,
+         SUM(a.Score) AS answers_score_sum,
+         MAX(a.Score) AS answers_score_max,
+         AVG(a.Score) AS answers_score_avg,
+         MIN(a.AnswerCreationDate) AS first_answer_date,
+         BOOL_OR(a.Id = q.AcceptedAnswerId) AS has_accepted
+  FROM a_posts a
+  LEFT JOIN q_posts q ON q.Id = a.ParentId
+  GROUP BY a.ParentId
+),
+votes_per_post AS (
+  SELECT v.PostId,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS net_votes,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+         COUNT(*) AS total_votes,
+         MAX(v.BountyAmount) AS max_bounty
+  FROM Votes v
+  GROUP BY v.PostId
+),
+comment_stats AS (
+  SELECT c.PostId, COUNT(*) AS comments_total, MAX(c.CreationDate) AS last_comment_date,
+         SUM(CASE WHEN char_length(c.Text) > 200 THEN 1 ELSE 0 END) AS long_comments
+  FROM Comments c
+  GROUP BY c.PostId
+),
+user_badges AS (
+  SELECT b.UserId, COUNT(*) AS total_badges,
+         SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold,
+         SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver,
+         SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze,
+         SUM(CASE WHEN b.TagBased = B'1' THEN 1 ELSE 0 END) AS tag_based
+  FROM Badges b
+  GROUP BY b.UserId
+),
+tag_popularity AS (
+  SELECT te.tag,
+         COUNT(DISTINCT te.question_id) AS questions_with_tag,
+         SUM(te.ViewCount) AS tag_total_views,
+         AVG(COALESCE(te.Score,0)) AS tag_avg_score,
+         SUM(COALESCE(vp.net_votes,0)) AS tag_net_votes
+  FROM tag_exploded te
+  LEFT JOIN votes_per_post vp ON vp.PostId = te.question_id
+  GROUP BY te.tag
+),
+question_enriched AS (
+  SELECT q.Id as question_id, q.Title, q.CreationDate, q.Score as question_score, q.ViewCount, q.AnswerCount, q.Tags, te.tag,
+         COALESCE(a.answers_count,0) AS answers_count, COALESCE(a.answers_score_sum,0) AS answers_score_sum,
+         COALESCE(a.answers_score_max,0) AS answers_score_max, a.answers_score_avg, a.first_answer_date, COALESCE(a.has_accepted,false) as has_accepted,
+         COALESCE(vp.net_votes,0) AS net_votes, COALESCE(vp.upvotes,0) AS upvotes, COALESCE(vp.downvotes,0) AS downvotes, COALESCE(vp.total_votes,0) AS total_votes, COALESCE(vp.max_bounty,0) AS max_bounty,
+         COALESCE(cs.comments_total,0) AS comments_total, cs.last_comment_date, COALESCE(cs.long_comments,0) AS long_comments,
+         q.OwnerUserId
+  FROM q_posts q
+  LEFT JOIN tag_exploded te ON te.question_id = q.Id
+  LEFT JOIN answer_agg a ON a.question_id = q.Id
+  LEFT JOIN votes_per_post vp ON vp.PostId = q.Id
+  LEFT JOIN comment_stats cs ON cs.PostId = q.Id
+),
+question_ranked AS (
+  SELECT qe.*,
+         COALESCE(char_length(coalesce(qe.Title,'')),0) AS title_len,
+         COALESCE(array_length(regexp_split_to_array(substring(coalesce(qe.Tags,'') FROM 2 FOR GREATEST(char_length(coalesce(qe.Tags,'')) - 2,0)),'><'),1),0) AS tag_count,
+         ROW_NUMBER() OVER (PARTITION BY qe.tag ORDER BY qe.ViewCount DESC NULLS LAST, qe.net_votes DESC NULLS LAST, qe.AnswerCount DESC NULLS LAST) AS tag_view_rank,
+         RANK() OVER (PARTITION BY qe.tag ORDER BY qe.net_votes DESC NULLS LAST) AS tag_vote_rank,
+         DENSE_RANK() OVER (ORDER BY qe.net_votes DESC NULLS LAST, qe.ViewCount DESC NULLS LAST) AS global_rank_by_votes
+  FROM question_enriched qe
+),
+question_user_metrics AS (
+  SELECT qr.*,
+         (SELECT COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END),0) FROM Votes v WHERE v.UserId = qr.OwnerUserId) AS owner_upvotes_casts,
+         (SELECT COUNT(*) FROM Badges b WHERE b.UserId = qr.OwnerUserId) AS owner_total_badges,
+         (SELECT COUNT(DISTINCT a.OwnerUserId) FROM Posts a WHERE a.ParentId = qr.question_id AND a.PostTypeId = 2) AS distinct_answerers,
+         (SELECT AVG(u.Reputation) FROM Users u JOIN Posts p ON p.OwnerUserId = u.Id WHERE p.ParentId = qr.question_id AND p.PostTypeId = 2) AS avg_answerer_reputation,
+         EXISTS (SELECT 1 FROM Posts a2 WHERE a2.ParentId = qr.question_id AND a2.PostTypeId = 2 AND (SELECT COALESCE(SUM(CASE WHEN v2.VoteTypeId=2 THEN 1 WHEN v2.VoteTypeId=3 THEN -1 ELSE 0 END),0) FROM Votes v2 WHERE v2.PostId = a2.Id) > qr.net_votes) AS any_answer_more_votes
+  FROM question_ranked qr
+),
+hot_questions AS (
+  SELECT question_id, Title, tag, ViewCount, question_score, net_votes, answers_count, avg_answerer_reputation, distinct_answerers, title_len, tag_count, tag_view_rank
+  FROM question_user_metrics
+  WHERE ViewCount > 10000 OR net_votes > 50 OR (answers_count >= 5 AND COALESCE(avg_answerer_reputation,0) > 1000)
+),
+neglected_questions AS (
+  SELECT question_id, Title, tag, ViewCount, question_score, net_votes, answers_count, avg_answerer_reputation, distinct_answerers, title_len, tag_count, tag_view_rank
+  FROM question_user_metrics
+  WHERE (ViewCount < 50 AND answers_count = 0) OR (ViewCount BETWEEN 50 AND 200 AND net_votes < 0)
+),
+duplicates AS (
+  SELECT DISTINCT pl.RelatedPostId AS original_post
+  FROM PostLinks pl
+  WHERE pl.LinkTypeId = 3
+),
+close_history AS (
+  SELECT ph.PostId,
+         COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 10) AS close_events,
+         COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 11) AS reopen_events,
+         MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (10,11)) AS last_close_related
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+text_signals AS (
+  SELECT p.Id AS post_id,
+         COALESCE(NULLIF(trim(both from regexp_replace(substring(coalesce(p.Title,''),1,300), E'[\\t\\n\\r]+', ' ', 'g')),'') , '[no title]') AS normalized_title,
+         CASE WHEN p.Body IS NULL OR length(p.Body) = 0 THEN 0 
+              WHEN p.Body ILIKE '%<code>%' THEN 2 
+              WHEN p.Body ILIKE '%SQL%' THEN 3 
+              ELSE 1 END AS body_signal,
+         length(coalesce(p.Body,'')) AS body_length,
+         CASE WHEN p.LastEditDate IS NULL THEN NULL ELSE floor(EXTRACT(EPOCH FROM (now() - p.LastEditDate))/86400) END::int AS days_since_edit
+  FROM Posts p
+  WHERE p.PostTypeId IN (1,2)
+),
+final_candidates AS (
+  SELECT qum.question_id, qum.Title, qum.tag, qum.CreationDate, qum.ViewCount, qum.question_score, qum.net_votes, qum.upvotes, qum.downvotes, qum.total_votes,
+         qum.answers_count, qum.answers_score_avg, qum.has_accepted, qum.first_answer_date, qum.distinct_answerers,
+         qum.avg_answerer_reputation, qum.any_answer_more_votes, qum.title_len, qum.tag_count, qum.tag_view_rank, qum.global_rank_by_votes,
+         COALESCE(d.duplicates_for_original,0) AS duplicates_for_original,
+         COALESCE(ch.close_events,0) AS close_events, COALESCE(ch.reopen_events,0) AS reopen_events, ch.last_close_related,
+         COALESCE(ts.normalized_title,'[no title]') AS normalized_title, ts.body_signal, ts.body_length, ts.days_since_edit,
+         u.DisplayName AS owner_name, u.Reputation AS owner_reputation, COALESCE(ub.total_badges,0) AS owner_badges,
+         ROW_NUMBER() OVER (PARTITION BY qum.tag ORDER BY qum.ViewCount DESC) AS per_tag_popularity_rank,
+         NTILE(10) OVER (ORDER BY qum.net_votes DESC NULLS LAST) AS decile_by_votes
+  FROM question_user_metrics qum
+  LEFT JOIN (
+    SELECT RelatedPostId AS original_post, COUNT(*) AS duplicates_for_original
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+    GROUP BY RelatedPostId
+  ) d ON d.original_post = qum.question_id
+  LEFT JOIN close_history ch ON ch.PostId = qum.question_id
+  LEFT JOIN text_signals ts ON ts.post_id = qum.question_id
+  LEFT JOIN Users u ON u.Id = qum.OwnerUserId
+  LEFT JOIN user_badges ub ON ub.UserId = u.Id
+)
+(
+  SELECT question_id, Title, tag, ViewCount, question_score, net_votes, answers_count, avg_answerer_reputation, distinct_answerers, title_len, tag_count, tag_view_rank
+  FROM hot_questions
+)
+UNION
+(
+  SELECT question_id, Title, tag, ViewCount, question_score, net_votes, answers_count, avg_answerer_reputation, distinct_answerers, title_len, tag_count, tag_view_rank
+  FROM neglected_questions
+)
+EXCEPT
+(
+  SELECT qum.question_id, qum.Title, qum.tag, qum.ViewCount, qum.question_score, qum.net_votes, qum.answers_count, qum.avg_answerer_reputation, qum.distinct_answerers, qum.title_len, qum.tag_count, qum.tag_view_rank
+  FROM duplicates d
+  JOIN question_user_metrics qum ON qum.question_id = d.original_post
+)
+ORDER BY ViewCount DESC NULLS LAST, net_votes DESC NULLS LAST
+LIMIT 200;

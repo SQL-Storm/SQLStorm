@@ -1,0 +1,137 @@
+WITH high_rep_users AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Id) AS rn
+    FROM Users u
+    WHERE u.Reputation >= (
+        SELECT percentile_cont(0.90) WITHIN GROUP (ORDER BY Reputation) FROM Users
+    )
+),
+post_answer_counts AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore
+    FROM Posts p
+    GROUP BY p.OwnerUserId
+),
+badges_summary AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(*) AS TotalBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+recent_activity AS (
+    SELECT
+        ph.UserId,
+        MAX(ph.CreationDate) AS LastPostHistoryDate,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS EditEvents
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+    GROUP BY ph.UserId
+),
+tag_usage AS (
+    SELECT
+        p.OwnerUserId,
+        tag_tbl.tag AS TagName,
+        COUNT(*) AS TagCount
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(p.Tags FROM 2 FOR (char_length(p.Tags) - 2)), '><')) AS tag
+    ) AS tag_tbl
+    INNER JOIN Tags tg ON tg.TagName = tag_tbl.tag
+    WHERE p.OwnerUserId IS NOT NULL AND p.PostTypeId = 1
+    GROUP BY p.OwnerUserId, tag_tbl.tag
+),
+top_tags AS (
+    SELECT
+        tu.OwnerUserId,
+        tu.TagName,
+        tu.TagCount,
+        ROW_NUMBER() OVER (PARTITION BY tu.OwnerUserId ORDER BY tu.TagCount DESC, tu.TagName) AS TagRank
+    FROM tag_usage tu
+),
+top3_tags_agg AS (
+    SELECT
+        tt.OwnerUserId,
+        STRING_AGG(tt.TagName, ', ' ORDER BY tt.TagName) AS TopTags
+    FROM (
+        SELECT OwnerUserId, TagName
+        FROM top_tags
+        WHERE TagRank <= 3
+    ) tt
+    GROUP BY tt.OwnerUserId
+)
+SELECT
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    pac.QuestionCount,
+    pac.AnswerCount,
+    COALESCE(pac.AvgAnswerScore, 0) AS AvgAnswerScore,
+    bs.GoldBadges,
+    bs.SilverBadges,
+    bs.BronzeBadges,
+    COALESCE(bs.TotalBadges, 0) AS TotalBadges,
+    ra.LastPostHistoryDate,
+    ra.EditEvents,
+    t3.TopTags,
+    (
+        SELECT COUNT(1)
+        FROM Votes v
+        WHERE v.UserId = u.UserId AND v.VoteTypeId = 2
+    ) AS UpvotesCast,
+    (
+        SELECT COUNT(1)
+        FROM Votes v
+        WHERE v.UserId = u.UserId AND v.VoteTypeId = 3
+    ) AS DownvotesCast,
+    CASE
+        WHEN ra.LastPostHistoryDate IS NULL THEN 'No Recent Activity'
+        WHEN u.LastAccessDate > ra.LastPostHistoryDate THEN 'Active'
+        ELSE 'Edited'
+    END AS UserStatus,
+    CASE
+        WHEN u.WebsiteUrl IS NOT NULL THEN
+            CASE WHEN char_length(u.WebsiteUrl) > 30
+                 THEN substring(u.WebsiteUrl FROM 1 FOR 30) || '...'
+                 ELSE u.WebsiteUrl
+            END
+        ELSE 'No Website'
+    END AS ShortWebsite,
+    CASE
+        WHEN bs.TotalBadges IS NULL OR bs.TotalBadges = 0 THEN NULL
+        ELSE ROUND(
+            COALESCE(CAST(pac.AnswerCount AS numeric), 0) / NULLIF(bs.TotalBadges, 0), 2
+        )
+    END AS AnswersPerBadgeRatio
+FROM high_rep_users u
+LEFT JOIN post_answer_counts pac ON pac.OwnerUserId = u.UserId
+LEFT JOIN badges_summary bs ON bs.UserId = u.UserId
+LEFT JOIN recent_activity ra ON ra.UserId = u.UserId
+LEFT JOIN top3_tags_agg t3 ON t3.OwnerUserId = u.UserId
+GROUP BY
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    pac.QuestionCount,
+    pac.AnswerCount,
+    pac.AvgAnswerScore,
+    bs.GoldBadges,
+    bs.SilverBadges,
+    bs.BronzeBadges,
+    bs.TotalBadges,
+    ra.LastPostHistoryDate,
+    ra.EditEvents,
+    t3.TopTags,
+    u.LastAccessDate,
+    u.WebsiteUrl
+ORDER BY u.Reputation DESC, u.UserId
+LIMIT 100;

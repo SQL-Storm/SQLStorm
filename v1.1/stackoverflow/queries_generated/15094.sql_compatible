@@ -1,0 +1,73 @@
+WITH UserBadgeStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        /* compute average reputation per badge class by joining aggregated badge-class avg */
+        NULL::numeric AS AvgReputationByBadgeClass,
+        RANK() OVER (ORDER BY COUNT(DISTINCT b.Id) DESC) AS BadgeRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+BadgeClassReputation AS (
+    SELECT
+        b.Class AS BadgeClass,
+        AVG(u.Reputation) AS AvgReputation
+    FROM Users u
+    JOIN Badges b ON u.Id = b.UserId
+    GROUP BY b.Class
+),
+PostActivityMetrics AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(*) AS PostCount,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LatestPostDate,
+        FIRST_VALUE(p.Title) OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS TopRatedPostTitle
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId
+)
+SELECT 
+    ubs.UserId,
+    ubs.DisplayName,
+    ubs.TotalBadges,
+    ubs.GoldBadges,
+    pam.PostCount,
+    pam.AvgPostScore,
+    COALESCE(bcr.AvgReputation, 0) AS AvgReputationByBadgeClass,
+    ubs.BadgeRank,
+    pam.TopRatedPostTitle,
+    COALESCE(
+        (SELECT COUNT(*) FROM Comments c WHERE c.UserId = ubs.UserId),
+        0
+    ) AS CommentCount,
+    CASE 
+        WHEN ubs.TotalBadges > 50 AND pam.AvgPostScore > 10 THEN 'Elite User'
+        WHEN ubs.TotalBadges > 20 THEN 'Power User'
+        ELSE 'Regular User'
+    END AS UserCategory
+FROM UserBadgeStats ubs
+JOIN PostActivityMetrics pam ON ubs.UserId = pam.OwnerUserId
+LEFT JOIN (
+    -- map user's badge classes to avg reputation: choose the max avg if multiple classes; users without badges get NULL
+    SELECT ub.UserId, MAX(bcr.AvgReputation) AS AvgReputation
+    FROM (
+        SELECT DISTINCT UserId, Class FROM Badges
+    ) ub
+    JOIN BadgeClassReputation bcr ON ub.Class = bcr.BadgeClass
+    GROUP BY ub.UserId
+) bcr ON bcr.UserId = ubs.UserId
+WHERE 
+    ubs.TotalBadges > 0 
+    AND pam.PostCount > 5
+    AND (
+        pam.LatestPostDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years')
+        OR ubs.GoldBadges > 3
+    )
+ORDER BY 
+    ubs.TotalBadges DESC,
+    pam.AvgPostScore DESC
+LIMIT 100;

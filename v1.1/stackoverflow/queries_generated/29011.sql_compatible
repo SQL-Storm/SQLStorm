@@ -1,0 +1,241 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserPostRank,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) as MovingAvgScore,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            ELSE 'Low'
+        END as ScoreCategory,
+        COALESCE(p.Tags, '') as CleanTags,
+        TRIM(BOTH '<>' FROM p.Tags) as TrimmedTags,
+        STRING_TO_ARRAY(TRIM(BOTH '<>' FROM p.Tags), '><') as TagArray,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question with Accepted Answer'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            ELSE 'Other'
+        END as PostTypeDescription
+    FROM Posts p
+    WHERE p.CreationDate >= CAST('2010-01-01' AS timestamp)
+),
+UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT rp.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN rp.PostTypeId = 1 THEN rp.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN rp.PostTypeId = 2 THEN rp.Id END) as AnswerCount,
+        SUM(rp.Score) as TotalScore,
+        AVG(rp.Score) as AvgScore,
+        MAX(rp.CreationDate) as LastActivity,
+        STRING_AGG(DISTINCT rp.PostTypeDescription, ', ') as PostTypes,
+        -- move UNNEST out of CASE by unnesting tags in a lateral join
+        STRING_AGG(DISTINCT t.tag, ', ') as AllTags
+    FROM Users u
+    LEFT JOIN RankedPosts rp ON u.Id = rp.OwnerUserId
+    LEFT JOIN LATERAL (
+        SELECT unnest(rp.TagArray) as tag
+    ) t ON rp.TagArray IS NOT NULL
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+TagPopularity AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Very Popular'
+            WHEN t.Count > 100 THEN 'Popular'
+            WHEN t.Count > 10 THEN 'Moderate'
+            ELSE 'Less Common'
+        END as PopularityLevel,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) as RankByPopularity
+    FROM Tags t
+    WHERE t.Count > 0
+),
+PostAnalysis AS (
+    SELECT 
+        rp.Id,
+        rp.OwnerUserId,
+        rp.Score,
+        rp.ViewCount,
+        rp.CreationDate,
+        rp.Title,
+        rp.Tags,
+        rp.ScoreCategory,
+        rp.PostTypeDescription,
+        rp.UserPostRank,
+        rp.PrevScore,
+        rp.MovingAvgScore,
+        uas.TotalPosts,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.TotalScore,
+        uas.AvgScore,
+        COALESCE(uas.Reputation, 0) as UserReputation,
+        tp.TagName,
+        tp.TagCount,
+        tp.PopularityLevel,
+        CASE 
+            WHEN rp.Score > (uas.AvgScore * 1.5) AND rp.ViewCount > 100 THEN 'High Impact'
+            WHEN rp.Score < (uas.AvgScore * 0.5) AND rp.ViewCount < 50 THEN 'Low Impact'
+            ELSE 'Normal'
+        END as ImpactLevel,
+        ROW_NUMBER() OVER (PARTITION BY tp.TagName ORDER BY rp.Score DESC) as TopPostByTag,
+        PERCENT_RANK() OVER (ORDER BY rp.Score) as PercentileScore
+    FROM RankedPosts rp
+    LEFT JOIN UserActivityStats uas ON rp.OwnerUserId = uas.UserId
+    -- join tags via lateral unnest to avoid set-returning in WHERE/SELECT
+    LEFT JOIN LATERAL (
+        SELECT unnest(rp.TagArray) as tag
+    ) tagvals ON rp.TagArray IS NOT NULL
+    LEFT JOIN TagPopularity tp ON tagvals.tag LIKE CONCAT('%', tp.TagName, '%')
+    WHERE rp.Score IS NOT NULL
+),
+ComplexMetrics AS (
+    SELECT 
+        pa.Id,
+        pa.OwnerUserId,
+        pa.Score,
+        pa.ViewCount,
+        pa.CreationDate,
+        pa.Title,
+        pa.Tags,
+        pa.ScoreCategory,
+        pa.PostTypeDescription,
+        pa.UserPostRank,
+        pa.PrevScore,
+        pa.MovingAvgScore,
+        pa.TotalPosts,
+        pa.QuestionCount,
+        pa.AnswerCount,
+        pa.TotalScore,
+        pa.AvgScore,
+        pa.UserReputation,
+        pa.TagName,
+        pa.TagCount,
+        pa.PopularityLevel,
+        pa.ImpactLevel,
+        pa.TopPostByTag,
+        pa.PercentileScore,
+        CASE 
+            WHEN pa.TagCount > 500 AND pa.UserReputation > 1000 THEN 'Tag Expert'
+            WHEN pa.TotalPosts > 50 AND pa.AvgScore > 10 THEN 'Active Contributor'
+            ELSE 'Regular User'
+        END as UserStatusCategory,
+        (pa.Score * pa.ViewCount) as ScoreViewProduct,
+        LOG(pa.ViewCount + 1) * pa.Score as LogScoreViewRatio,
+        CASE 
+            WHEN pa.CreationDate >= CAST('2020-01-01' AS timestamp) THEN 'Newer Posts'
+            WHEN pa.CreationDate >= CAST('2015-01-01' AS timestamp) THEN 'Mid Age Posts'
+            ELSE 'Older Posts'
+        END as PostAgeGroup,
+        ABS(pa.Score - pa.MovingAvgScore) as ScoreDeviationFromMovingAvg,
+        CASE 
+            WHEN pa.Score > pa.PrevScore THEN 1
+            WHEN pa.Score < pa.PrevScore THEN -1
+            ELSE 0
+        END as ScoreTrendDirection
+    FROM PostAnalysis pa
+)
+SELECT 
+    cm.Id,
+    cm.OwnerUserId,
+    cm.Score,
+    cm.ViewCount,
+    cm.CreationDate,
+    cm.Title,
+    cm.Tags,
+    cm.ScoreCategory,
+    cm.PostTypeDescription,
+    cm.UserPostRank,
+    cm.PrevScore,
+    cm.MovingAvgScore,
+    cm.TotalPosts,
+    cm.QuestionCount,
+    cm.AnswerCount,
+    cm.TotalScore,
+    cm.AvgScore,
+    cm.UserReputation,
+    cm.TagName,
+    cm.TagCount,
+    cm.PopularityLevel,
+    cm.ImpactLevel,
+    cm.TopPostByTag,
+    cm.PercentileScore,
+    cm.UserStatusCategory,
+    cm.ScoreViewProduct,
+    cm.LogScoreViewRatio,
+    cm.PostAgeGroup,
+    cm.ScoreDeviationFromMovingAvg,
+    cm.ScoreTrendDirection,
+    CASE 
+        WHEN cm.UserStatusCategory = 'Tag Expert' AND cm.PopularityLevel = 'Very Popular' THEN 'High Value Content'
+        WHEN cm.UserStatusCategory = 'Active Contributor' AND cm.ImpactLevel = 'High Impact' THEN 'Featured Content'
+        WHEN cm.Score > 100 AND cm.ViewCount > 1000 THEN 'Viral Content'
+        ELSE 'Standard Content'
+    END as ContentClassification,
+    ABS(ROW_NUMBER() OVER (ORDER BY cm.Score DESC) - COUNT(*) OVER () / 2.0) as DistanceFromMedianScore,
+    RANK() OVER (PARTITION BY cm.PopularityLevel ORDER BY cm.Score DESC) as RankWithinPopularityLevel,
+    DENSE_RANK() OVER (ORDER BY cm.UserReputation DESC) as ReputationRank,
+    NTILE(10) OVER (ORDER BY cm.LogScoreViewRatio DESC) as ScoreViewDecile,
+    LAG(cm.Score, 3) OVER (ORDER BY cm.CreationDate) as ScoreThreePostsAgo,
+    LEAD(cm.Score, 2) OVER (ORDER BY cm.CreationDate) as ScoreTwoPostsAhead,
+    COUNT(*) OVER (PARTITION BY cm.OwnerUserId) as PostsByUser,
+    AVG(cm.Score) OVER (PARTITION BY cm.PopularityLevel) as AvgScoreByPopularityLevel,
+    MAX(cm.Score) OVER (PARTITION BY cm.OwnerUserId) as MaxScoreByUser,
+    RANK() OVER (ORDER BY cm.LogScoreViewRatio DESC) as LogScoreViewRank,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY cm.Score) OVER () as MedianScore,
+    CORR(cm.Score, cm.ViewCount) OVER (ORDER BY cm.CreationDate) as ScoreViewCorrelation,
+    CASE 
+        WHEN cm.Score > (SELECT AVG(Score) FROM ComplexMetrics) THEN 'Above Average'
+        WHEN cm.Score < (SELECT AVG(Score) FROM ComplexMetrics) THEN 'Below Average'
+        ELSE 'Average'
+    END as ScoreRelativeToAverage,
+    CASE 
+        WHEN cm.Score = (SELECT MAX(Score) FROM ComplexMetrics) THEN 'Highest Score'
+        WHEN cm.Score = (SELECT MIN(Score) FROM ComplexMetrics) THEN 'Lowest Score'
+        ELSE 'Normal'
+    END as ScorePosition,
+    COALESCE(cm.Title, 'No Title') as SafeTitle,
+    CASE 
+        WHEN cm.TagCount IS NULL THEN 'No Tags'
+        ELSE CAST(cm.TagCount AS text)
+    END as TagCountOrNone,
+    (cm.Score * cm.ViewCount * cm.UserReputation) as ComplexScoreMetric,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 FROM Posts p WHERE p.OwnerUserId = cm.OwnerUserId AND p.Score > cm.Score
+        ) THEN 'Has Higher Scoring Posts'
+        ELSE 'No Higher Scoring Posts'
+    END as UserPostComparison,
+    STRING_AGG(cm.PostTypeDescription, ' | ') OVER (PARTITION BY cm.OwnerUserId ORDER BY cm.CreationDate) as UserPostHistory,
+    (CAST('2024-10-01 12:34:56' AS timestamp) - cm.CreationDate) as AgeOfPost,
+    EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - cm.CreationDate)) / 86400 as AgeInDays
+FROM ComplexMetrics cm
+WHERE cm.TotalPosts > 0
+    AND cm.Score IS NOT NULL
+    AND cm.ViewCount IS NOT NULL
+    AND cm.UserReputation IS NOT NULL
+    AND cm.TagCount IS NOT NULL
+    AND cm.Score > 0
+ORDER BY cm.Score DESC, cm.CreationDate DESC
+LIMIT 1000;

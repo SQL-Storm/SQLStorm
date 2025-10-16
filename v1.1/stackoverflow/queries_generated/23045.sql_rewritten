@@ -1,0 +1,84 @@
+-- {"query": "23045.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "grok-4", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2685, "output_tokens": 850} 
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(p.Id) AS PostCount,
+        SUM(p.Score) AS TotalScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY SUM(p.Score) DESC) AS ScoreRank
+    FROM Users u
+    LEFT OUTER JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.Reputation, u.DisplayName
+),
+BadgeStats AS (
+    SELECT 
+        UserId,
+        COUNT(CASE WHEN Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN Class = 3 THEN 1 END) AS BronzeBadges,
+        STRING_AGG(Name, ', ' ORDER BY Date DESC) AS BadgeNames
+    FROM Badges
+    GROUP BY UserId
+),
+TopQuestions AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.ViewCount,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 0) AS PositiveComments
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.ViewCount > 1000
+),
+CombinedData AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        COALESCE(ua.PostCount, 0) AS PostCount,
+        ua.TotalScore,
+        ua.ScoreRank,
+        bs.GoldBadges,
+        bs.SilverBadges,
+        bs.BronzeBadges,
+        bs.BadgeNames,
+        CASE 
+            WHEN ua.LastPostDate IS NULL THEN 'No Posts'
+            ELSE TO_CHAR(ua.LastPostDate, 'YYYY-MM-DD') || ' (' || EXTRACT(DAY FROM cast('2024-10-01 12:34:56' as timestamp) - ua.LastPostDate) || ' days ago)'
+        END AS LastPostInfo,
+        (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = ua.UserId) AND v.VoteTypeId = 8 AND v.BountyAmount IS NOT NULL) AS AvgBounty
+    FROM UserActivity ua
+    LEFT OUTER JOIN BadgeStats bs ON ua.UserId = bs.UserId
+    WHERE EXISTS (
+        SELECT 1 FROM Posts po WHERE po.OwnerUserId = ua.UserId AND po.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = po.PostTypeId)
+    )
+    UNION
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        0 AS PostCount,
+        0 AS TotalScore,
+        NULL AS ScoreRank,
+        NULL AS GoldBadges,
+        NULL AS SilverBadges,
+        NULL AS BronzeBadges,
+        NULL AS BadgeNames,
+        'Inactive' AS LastPostInfo,
+        NULL AS AvgBounty
+    FROM Users u
+    WHERE u.Id NOT IN (SELECT UserId FROM UserActivity WHERE PostCount > 0)
+)
+SELECT 
+    cd.*,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = cd.UserId) AND pl.LinkTypeId = 3) AS DuplicateLinks,
+    RANK() OVER (PARTITION BY cd.GoldBadges ORDER BY cd.TotalScore DESC) AS GoldRank,
+    UPPER(SUBSTRING(cd.DisplayName, 1, 1)) || LOWER(SUBSTRING(cd.DisplayName, 2)) AS FormattedName,
+    CASE 
+        WHEN cd.AvgBounty IS NULL OR cd.AvgBounty < 50 THEN 'Low Bounty User'
+        WHEN cd.AvgBounty BETWEEN 50 AND 200 THEN 'Medium Bounty User'
+        ELSE 'High Bounty User'
+    END AS BountyCategory
+FROM CombinedData cd
+LEFT OUTER JOIN TopQuestions tq ON tq.PositiveComments > 5
+WHERE cd.PostCount > 10 OR cd.GoldBadges > 0
+ORDER BY cd.ScoreRank ASC NULLS LAST, cd.TotalScore DESC;

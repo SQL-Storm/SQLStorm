@@ -1,0 +1,169 @@
+-- {"query": "1319.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1604} 
+
+WITH UserBadgeSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(b.Date) FILTER (WHERE b.Class = 1) AS LastGoldBadgeDate,
+        STRING_AGG(DISTINCT CASE WHEN b.TagBased = true THEN b.Name ELSE NULL END, ', ') AS TagBasedBadges,
+        AVG(COALESCE(p.Score,0)) OVER (PARTITION BY u.Id) AS AvgPostScore
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE u.Reputation > 1000 AND u.CreationDate < NOW() - INTERVAL '1 YEAR'
+    GROUP BY u.Id, u.DisplayName
+),
+TopQuestions AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS QuestionRank,
+        COALESCE(a.AnswersCount,0) AS AnswerCount,
+        COALESCE(cv.DuplicateCount,0) AS DuplicateClosures,
+        EXISTS (
+            SELECT 1 FROM PostHistory ph 
+            WHERE ph.PostId = p.Id 
+              AND ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL
+        ) AS IsClosed
+    FROM Posts p
+    LEFT JOIN (
+        SELECT ParentId, COUNT(*) AS AnswersCount 
+        FROM Posts 
+        WHERE PostTypeId = 2 
+        GROUP BY ParentId
+    ) a ON a.ParentId = p.Id
+    LEFT JOIN (
+        SELECT pl.PostId, COUNT(*) AS DuplicateCount
+        FROM PostLinks pl
+        INNER JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id AND lt.Name = 'Duplicate'
+        GROUP BY pl.PostId
+    ) cv ON cv.PostId = p.Id
+    WHERE p.PostTypeId = 1 AND p.Score > 5
+),
+QuestionCommentsStats AS (
+    SELECT
+        pc.PostId,
+        COUNT(pc.Id) AS CommentCount,
+        AVG(pc.Score) AS AvgCommentScore,
+        SUM(CASE WHEN pc.UserId IS NULL THEN 1 ELSE 0 END) AS AnonymousComments
+    FROM Comments pc
+    WHERE pc.CreationDate > NOW() - INTERVAL '90 DAY'
+    GROUP BY pc.PostId
+),
+UserActivityRanked AS (
+    SELECT
+        PH.UserId,
+        PH.PostId,
+        PH.PostHistoryTypeId,
+        PH.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY PH.UserId ORDER BY PH.CreationDate DESC) AS RecentEditRank
+    FROM PostHistory PH
+    WHERE PH.UserId IS NOT NULL AND PH.PostHistoryTypeId IN (4,5,6) -- Edits on Title, Body, Tags
+),
+ComplexData AS (
+    SELECT
+        ubs.UserId,
+        ubs.DisplayName,
+        ubs.TotalBadges,
+        ubs.GoldBadges,
+        ubs.SilverBadges,
+        ubs.BronzeBadges,
+        ubs.LastGoldBadgeDate,
+        ubs.TagBasedBadges,
+        ubs.AvgPostScore,
+        tq.Id AS QuestionId,
+        tq.Title,
+        tq.CreationDate AS QuestionCreation,
+        tq.Score AS QuestionScore,
+        tq.ViewCount,
+        tq.Tags,
+        tq.AnswerCount,
+        tq.DuplicateClosures,
+        tq.IsClosed,
+        qcs.CommentCount,
+        qcs.AvgCommentScore,
+        qcs.AnonymousComments,
+        uar.RecentEditRank,
+        -- Complex expression combining strings, numbers, and NULL checks with CASE and COALESCE
+        CASE 
+            WHEN tq.IsClosed THEN CONCAT('CLOSED: ', COALESCE(NULLIF(tq.Tags,''), 'NoTags'))
+            ELSE CONCAT('Open - Views:', tq.ViewCount / NULLIF(tq.Score,0), ' AvgBadgeScore:', ROUND(ubs.AvgPostScore, 2))
+        END AS PostStatusSummary,
+        -- Correlated subquery calculating count of duplicates for parent's posts' close related activity
+        (
+            SELECT COUNT(*)
+            FROM PostLinks pl2
+            WHERE pl2.RelatedPostId = tq.Id
+              AND pl2.LinkTypeId = 3 -- Duplicate linkTypeId
+        ) AS BackLinksToThisQuestion,
+        -- Conditional NULL logic using COALESCE and EXISTS for user Website info;
+        COALESCE(NULLIF(ubs.DisplayName, ''), 'UnknownUser') AS CleanDisplayName
+    FROM UserBadgeSummary ubs
+    INNER JOIN TopQuestions tq ON tq.OwnerUserId = ubs.UserId AND tq.QuestionRank = 1
+    LEFT JOIN QuestionCommentsStats qcs ON qcs.PostId = tq.Id
+    LEFT JOIN UserActivityRanked uar ON uar.UserId = ubs.UserId AND uar.PostId = tq.Id AND uar.RecentEditRank = 1
+    WHERE ubs.GoldBadges > 0
+)
+SELECT 
+    cd.UserId,
+    cd.CleanDisplayName AS DisplayName,
+    cd.TotalBadges,
+    cd.GoldBadges,
+    cd.SilverBadges,
+    cd.BronzeBadges,
+    cd.LastGoldBadgeDate,
+    cd.TagBasedBadges,
+    cd.QuestionId,
+    LEFT(cd.Title, 80) || CASE WHEN LENGTH(cd.Title) > 80 THEN '...' ELSE '' END AS ShortTitle,
+    cd.QuestionCreation,
+    ROUND(cd.QuestionScore::numeric, 2) AS QuestionScore,
+    cd.ViewCount,
+    cd.AnswerCount,
+    cd.DuplicateClosures,
+    cd.CommentCount,
+    cd.AvgCommentScore,
+    cd.AnonymousComments,
+    cd.PostStatusSummary,
+    cd.BackLinksToThisQuestion,
+    cd.RecentEditRank
+FROM ComplexData cd
+WHERE cd.IsClosed = false
+  AND (cd.AvgCommentScore IS NULL OR cd.AvgCommentScore > 0)
+  AND cd.LastGoldBadgeDate > NOW() - INTERVAL '180 DAY'
+UNION
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    0 AS TotalBadges,
+    0 AS GoldBadges,
+    0 AS SilverBadges,
+    0 AS BronzeBadges,
+    NULL AS LastGoldBadgeDate,
+    NULL::varchar AS TagBasedBadges,
+    NULL AS QuestionId,
+    NULL::varchar AS ShortTitle,
+    NULL::timestamp AS QuestionCreation,
+    NULL::numeric AS QuestionScore,
+    0 AS ViewCount,
+    0 AS AnswerCount,
+    0 AS DuplicateClosures,
+    0 AS CommentCount,
+    NULL::numeric AS AvgCommentScore,
+    0 AS AnonymousComments,
+    'User has no qualifying posts or badges'::varchar AS PostStatusSummary,
+    0 AS BackLinksToThisQuestion,
+    0 AS RecentEditRank
+FROM Users u
+WHERE u.Reputation > 10000
+  AND u.Id NOT IN (SELECT UserId FROM UserBadgeSummary)
+ORDER BY GoldBadges DESC NULLS LAST, QuestionScore DESC NULLS LAST, UserId
+LIMIT 100;

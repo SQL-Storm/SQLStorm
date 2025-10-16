@@ -1,0 +1,218 @@
+-- {"query": "52.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2578} 
+with
+-- top contributors by weighted score across questions and answers in last 2 years
+RecentActivity as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    p.Id as PostId,
+    p.PostTypeId,
+    p.Score,
+    p.CreationDate,
+    case when p.PostTypeId = 1 then greatest(p.Score,0) * 1.5
+         when p.PostTypeId = 2 then greatest(p.Score,0) * 1.0
+         else 0 end as WeightedScore,
+    -- extract earliest tag for quick grouping (null for answers)
+    (select split_part(substring(t.Tags from 2 for char_length(coalesce(t.Tags,''))-2), '><', 1)
+     from Posts t
+     where t.Id = p.Id
+    ) as FirstTag
+  from Posts p
+  join Users u on u.Id = p.OwnerUserId
+  where p.CreationDate >= now() - interval '2 years'
+    and p.Score is not null
+),
+-- compute running aggregates and percentile ranks over users
+UserAggregates as (
+  select
+    ra.UserId,
+    ra.DisplayName,
+    ra.Reputation,
+    count(distinct ra.PostId) as PostCount,
+    sum(ra.WeightedScore) as TotalWeightedScore,
+    avg(ra.WeightedScore) filter (where ra.PostTypeId = 1) as AvgQuestionWeighted,
+    avg(ra.WeightedScore) filter (where ra.PostTypeId = 2) as AvgAnswerWeighted,
+    max(ra.CreationDate) as LastPostDate,
+    min(ra.CreationDate) as FirstPostDate
+  from RecentActivity ra
+  group by ra.UserId, ra.DisplayName, ra.Reputation
+),
+RankedUsers as (
+  select
+    ua.*,
+    dense_rank() over (order by ua.TotalWeightedScore desc nulls last) as ScoreRank,
+    ntile(100) over (order by ua.TotalWeightedScore desc) as Percentile,
+    -- time-weighted recency boost (exponential decay)
+    exp(-extract(epoch from (now() - ua.LastPostDate))/ (60*60*24*90)) as RecencyFactor
+  from UserAggregates ua
+),
+-- look up badge signals in correlated subqueries (including tag-based badges)
+UserBadges as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    -- total badges and distinct tag badges
+    (select count(*) from Badges b where b.UserId = u.Id) as TotalBadges,
+    (select count(*) from Badges b where b.UserId = u.Id and b.TagBased = b'1') as TagBadges,
+    -- top 3 recent badge names concatenated
+    (select string_agg(b.Name || ' (' || to_char(b.Date,'YYYY-MM-DD') || ')', ', ' order by b.Date desc)
+     from (select Name, Date from Badges b where b.UserId = u.Id order by Date desc limit 3) b
+    ) as RecentBadges
+  from Users u
+  where exists (select 1 from Posts p where p.OwnerUserId = u.Id and p.CreationDate >= now() - interval '2 years')
+),
+-- heavy join of posts, comments, votes, links for candidate users
+PostRich as (
+  select
+    p.Id as PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.AnswerCount,
+    coalesce(c.CommentCount,0) as CommentsOnPost,
+    coalesce(v.UpVotes,0) as UpVotesOnPost,
+    coalesce(v.DownVotes,0) as DownVotesOnPost,
+    coalesce(pl.InboundLinks,0) as InboundLinks,
+    coalesce(pl.OutboundLinks,0) as OutboundLinks,
+    -- approximate tag vector length (count of tags)
+    case when p.Tags is null then 0
+         else array_length(string_to_array(substring(p.Tags,2,char_length(p.Tags)-2), '><'),1) end as TagCount
+  from Posts p
+  left join (
+    select PostId, count(*) as CommentCount
+    from Comments
+    where CreationDate >= now() - interval '2 years'
+    group by PostId
+  ) c on c.PostId = p.Id
+  left join (
+    select PostId,
+      sum(case when VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+      sum(case when VoteTypeId = 3 then 1 else 0 end) as DownVotes
+    from Votes
+    where CreationDate >= now() - interval '2 years'
+    group by PostId
+  ) v on v.PostId = p.Id
+  left join (
+    select pl.PostId,
+      sum(case when pl.LinkTypeId = 1 then 1 else 0 end) as OutboundLinks,
+      0 as InboundLinks
+    from PostLinks pl
+    group by pl.PostId
+  ) pl on pl.PostId = p.Id
+),
+-- compute user-level post richness
+UserPostRichness as (
+  select
+    pr.OwnerUserId as UserId,
+    count(*) as TotalRecentPosts,
+    sum(pr.Score) as SumScores,
+    sum(pr.ViewCount) as SumViews,
+    sum(pr.CommentsOnPost) as SumComments,
+    sum(pr.UpVotesOnPost) as SumUpVotes,
+    sum(pr.DownVotesOnPost) as SumDownVotes,
+    sum(pr.InboundLinks) as SumInboundLinks,
+    sum(pr.OutboundLinks) as SumOutboundLinks,
+    avg(pr.TagCount) as AvgTagCount
+  from PostRich pr
+  where pr.CreationDate >= now() - interval '2 years'
+  group by pr.OwnerUserId
+),
+-- combine ranked users with badges and richness, plus sample correlated subquery for duplicates and accepted answers
+UserProfile as (
+  select
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.TotalWeightedScore,
+    ru.ScoreRank,
+    ru.Percentile,
+    ru.RecencyFactor,
+    ub.TotalBadges,
+    ub.TagBadges,
+    ub.RecentBadges,
+    coalesce(upr.TotalRecentPosts,0) as TotalRecentPosts,
+    coalesce(upr.SumViews,0) as SumViews,
+    coalesce(upr.SumUpVotes,0) as SumUpVotes,
+    -- fraction of answers accepted in last 2 years (correlated subquery)
+    (select count(*) filter (where a.Id is not null and a.Id = pa.AcceptedAnswerId)
+     from Posts pa
+     join Posts a on a.ParentId = pa.Id and a.OwnerUserId = ru.UserId
+     where pa.PostTypeId = 1 and pa.CreationDate >= now() - interval '2 years'
+    )::numeric /
+    nullif((select count(*) from Posts a2 where a2.OwnerUserId = ru.UserId and a2.PostTypeId = 2 and a2.CreationDate >= now() - interval '2 years'),0) as AcceptedAnswerRate,
+    -- duplicate flag: percent of their questions marked duplicate as target or source
+    (select count(*) from PostLinks pl2
+     join Posts q on q.Id = pl2.PostId and q.OwnerUserId = ru.UserId and q.PostTypeId = 1 and q.CreationDate >= now() - interval '2 years'
+     where pl2.LinkTypeId = 3
+    ) as DuplicateCountTargets,
+    (select count(*) from PostLinks pl3
+     join Posts q2 on q2.Id = pl3.RelatedPostId and q2.OwnerUserId = ru.UserId and q2.PostTypeId = 1 and q2.CreationDate >= now() - interval '2 years'
+     where pl3.LinkTypeId = 3
+    ) as DuplicateCountSources,
+    -- last meaningful activity (last post or last badge)
+    greatest(ru.LastPostDate, (select max(b.Date) from Badges b where b.UserId = ru.UserId)) as LastMeaningfulActivity
+  from RankedUsers ru
+  left join UserBadges ub on ub.UserId = ru.UserId
+  left join UserPostRichness upr on upr.UserId = ru.UserId
+),
+-- final selection: top 50 diverse users with complex ordering, join back to sample posts and compute window aggregates per tag
+TopUsers as (
+  select
+    up.*,
+    row_number() over (order by up.Percentile asc, up.ScoreRank asc, up.RecencyFactor desc, coalesce(up.TotalBadges,0) desc) as FinalRank
+  from UserProfile up
+  where up.TotalWeightedScore > 0 or coalesce(up.TotalBadges,0) > 0
+)
+select
+  tu.FinalRank,
+  tu.UserId,
+  tu.DisplayName,
+  tu.Reputation,
+  tu.TotalWeightedScore,
+  tu.ScoreRank,
+  tu.Percentile,
+  round(100 * tu.RecencyFactor::numeric,2) as RecencyPct,
+  coalesce(tu.TotalBadges,0) as TotalBadges,
+  coalesce(tu.TagBadges,0) as TagBadges,
+  coalesce(tu.TotalRecentPosts,0) as TotalRecentPosts,
+  coalesce(tu.SumViews,0) as SumViews,
+  coalesce(tu.SumUpVotes,0) as SumUpVotes,
+  round(coalesce(tu.AcceptedAnswerRate,0)::numeric,3) as AcceptedAnswerRate,
+  coalesce(tu.DuplicateCountTargets,0) as DuplicateCountTargets,
+  coalesce(tu.DuplicateCountSources,0) as DuplicateCountSources,
+  to_char(tu.LastMeaningfulActivity,'YYYY-MM-DD') as LastActivityDate,
+  -- include a sample of their highest scoring post title, with NULL-handling and truncated
+  (select substring(p.Title from 1 for 120)
+   from Posts p
+   where p.OwnerUserId = tu.UserId and p.Score is not null
+   order by (p.Score * sqrt(greatest(p.ViewCount,1))) desc nulls last
+   limit 1
+  ) as TopPostTitle,
+  -- aggregated tag list from recent questions (complex string expressions)
+  (select coalesce(string_agg(distinct tg, ', ' order by count desc), '<<no-tags>>') from (
+     select split_part(substring(p2.Tags from 2 for char_length(coalesce(p2.Tags,''))-2), '><', generate_series(1, greatest(array_length(string_to_array(substring(p2.Tags from 2 for char_length(coalesce(p2.Tags,''))-2), '><'),1),1))) as tg
+     from Posts p2
+     where p2.OwnerUserId = tu.UserId and p2.PostTypeId = 1 and p2.Tags is not null and p2.CreationDate >= now() - interval '2 years'
+  ) tag_counts(group_tag) cross join lateral (
+     select group_tag as tg, count(*) as count
+     from (
+       select split_part(substring(p2.Tags from 2 for char_length(coalesce(p2.Tags,''))-2), '><', gs) as group_tag
+       from Posts p2
+       cross join generate_series(1,10) gs
+       where p2.OwnerUserId = tu.UserId and p2.PostTypeId = 1 and p2.Tags is not null and p2.CreationDate >= now() - interval '2 years'
+     ) s
+     group by group_tag
+  ) order by null),
+  -- window: rolling avg score of their posts over last 90 days
+  (select round(avg(p3.Score)::numeric,3)
+   from Posts p3
+   where p3.OwnerUserId = tu.UserId and p3.CreationDate >= now() - interval '90 days'
+  ) as AvgScore90d
+from TopUsers tu
+order by tu.FinalRank
+limit 50;

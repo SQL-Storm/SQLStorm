@@ -1,0 +1,160 @@
+WITH user_activity AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS post_count,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS question_count,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS answer_count,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS avg_post_score,
+        MAX(p.CreationDate) AS last_post_date,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS median_score
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+top_tags AS (
+    SELECT 
+        p.OwnerUserId,
+        UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR (LENGTH(p.Tags)-2)), '><')) AS tag,
+        COUNT(*) AS tag_usage,
+        SUM(p.Score) AS total_tag_score,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY COUNT(*) DESC, SUM(p.Score) DESC) AS tag_rank
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL 
+        AND p.OwnerUserId IS NOT NULL
+        AND p.PostTypeId = 1
+    GROUP BY p.OwnerUserId, tag
+),
+badge_analysis AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS gold_badges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS silver_badges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS bronze_badges,
+        STRING_AGG(CASE WHEN b.Class = 1 THEN b.Name END, ', ' ORDER BY b.Name) AS gold_badge_names,
+        DENSE_RANK() OVER (ORDER BY COUNT(*) FILTER (WHERE b.Class = 1) DESC, 
+                                   COUNT(*) FILTER (WHERE b.Class = 2) DESC,
+                                   COUNT(*) FILTER (WHERE b.Class = 3) DESC) AS badge_rank
+    FROM Badges b
+    GROUP BY b.UserId
+),
+edit_history AS (
+    SELECT 
+        ph.UserId,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS edit_count,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (7,8,9)) AS rollback_count,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 10) AS close_vote_count,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 11) AS reopen_vote_count,
+        CASE 
+            WHEN COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (7,8,9)) > 0 
+            THEN CAST(COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS NUMERIC) / NULLIF(COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (7,8,9)), 0)
+            ELSE NULL 
+        END AS edit_to_rollback_ratio
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+    GROUP BY ph.UserId
+),
+interaction_network AS (
+    SELECT 
+        p1.OwnerUserId AS questioner_id,
+        p2.OwnerUserId AS answerer_id,
+        COUNT(DISTINCT p1.Id) AS interaction_count,
+        AVG(p2.Score) AS avg_answer_score,
+        SUM(CASE WHEN p2.Id = p1.AcceptedAnswerId THEN 1 ELSE 0 END) AS accepted_answers
+    FROM Posts p1
+    INNER JOIN Posts p2 ON p1.Id = p2.ParentId
+    WHERE p1.PostTypeId = 1 
+        AND p2.PostTypeId = 2
+        AND p1.OwnerUserId IS NOT NULL
+        AND p2.OwnerUserId IS NOT NULL
+        AND p1.OwnerUserId <> p2.OwnerUserId
+    GROUP BY p1.OwnerUserId, p2.OwnerUserId
+)
+SELECT 
+    ua.DisplayName,
+    ua.Reputation,
+    ua.post_count,
+    ua.question_count,
+    ua.answer_count,
+    ROUND(ua.avg_post_score, 2) AS avg_post_score,
+    ua.median_score,
+    COALESCE(tt.tag, 'NO_TAGS') AS top_tag,
+    COALESCE(tt.tag_usage, 0) AS top_tag_usage,
+    COALESCE(tt.total_tag_score, 0) AS top_tag_score,
+    COALESCE(ba.gold_badges, 0) AS gold_badges,
+    COALESCE(ba.silver_badges, 0) AS silver_badges,
+    COALESCE(ba.bronze_badges, 0) AS bronze_badges,
+    COALESCE(ba.gold_badge_names, 'NONE') AS gold_badge_names,
+    COALESCE(eh.edit_count, 0) AS edit_count,
+    COALESCE(eh.rollback_count, 0) AS rollback_count,
+    ROUND(COALESCE(eh.edit_to_rollback_ratio, 0), 2) AS edit_to_rollback_ratio,
+    (SELECT COUNT(DISTINCT c.Id) 
+     FROM Comments c 
+     WHERE c.UserId = ua.Id 
+        AND c.Score > 5
+        AND EXISTS (
+            SELECT 1 
+            FROM Posts p 
+            WHERE p.Id = c.PostId 
+                AND p.Score > 100
+        )) AS high_value_comments,
+    COALESCE((
+        SELECT STRING_AGG(u2.DisplayName || '(' || inn.interaction_count::TEXT || ')', ', ' ORDER BY inn.interaction_count DESC)
+        FROM interaction_network inn
+        INNER JOIN Users u2 ON inn.answerer_id = u2.Id
+        WHERE inn.questioner_id = ua.Id
+            AND inn.accepted_answers > 0
+        LIMIT 3
+    ), 'NO_INTERACTIONS') AS top_answerers,
+    CASE 
+        WHEN ua.last_post_date > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days' THEN 'VERY_ACTIVE'
+        WHEN ua.last_post_date > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90 days' THEN 'ACTIVE'
+        WHEN ua.last_post_date > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days' THEN 'MODERATE'
+        WHEN ua.last_post_date IS NOT NULL THEN 'INACTIVE'
+        ELSE 'NO_POSTS'
+    END AS activity_level,
+    EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - ua.last_post_date)) / 86400 AS days_since_last_post,
+    LAG(ua.Reputation) OVER (ORDER BY ua.Reputation DESC) - ua.Reputation AS rep_gap_to_next,
+    DENSE_RANK() OVER (ORDER BY ua.Reputation DESC, ua.post_count DESC) AS overall_rank
+FROM user_activity ua
+LEFT JOIN top_tags tt ON ua.Id = tt.OwnerUserId AND tt.tag_rank = 1
+LEFT JOIN badge_analysis ba ON ua.Id = ba.UserId
+LEFT JOIN edit_history eh ON ua.Id = eh.UserId
+WHERE ua.post_count > 10
+    AND (ua.question_count > 0 OR ua.answer_count > 5)
+    AND NOT EXISTS (
+        SELECT 1 
+        FROM PostHistory ph 
+        WHERE ph.UserId = ua.Id 
+            AND ph.PostHistoryTypeId = 12
+            AND ph.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180 days'
+    )
+GROUP BY
+    ua.DisplayName,
+    ua.Reputation,
+    ua.post_count,
+    ua.question_count,
+    ua.answer_count,
+    ua.avg_post_score,
+    ua.median_score,
+    tt.tag,
+    tt.tag_usage,
+    tt.total_tag_score,
+    ba.gold_badges,
+    ba.silver_badges,
+    ba.bronze_badges,
+    ba.gold_badge_names,
+    eh.edit_count,
+    eh.rollback_count,
+    eh.edit_to_rollback_ratio,
+    ua.Id,
+    ua.last_post_date,
+    ua.Reputation,
+    ua.post_count
+ORDER BY 
+    ua.Reputation DESC,
+    COALESCE(ba.gold_badges, 0) * 100 + COALESCE(ba.silver_badges, 0) * 10 + COALESCE(ba.bronze_badges, 0) DESC,
+    ua.avg_post_score DESC
+LIMIT 100;

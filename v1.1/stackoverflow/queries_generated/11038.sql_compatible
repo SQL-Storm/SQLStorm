@@ -1,0 +1,138 @@
+WITH RecentPosts AS (
+    SELECT 
+        Posts.Id, 
+        Posts.PostTypeId, 
+        Posts.AcceptedAnswerId, 
+        Posts.ParentId, 
+        Posts.CreationDate, 
+        Posts.Score, 
+        Posts.ViewCount, 
+        Posts.Body, 
+        Posts.OwnerUserId, 
+        Posts.OwnerDisplayName, 
+        Posts.LastEditorUserId, 
+        Posts.LastEditorDisplayName, 
+        Posts.LastEditDate, 
+        Posts.LastActivityDate, 
+        Posts.Title, 
+        Posts.Tags, 
+        Posts.AnswerCount, 
+        Posts.CommentCount, 
+        Posts.FavoriteCount, 
+        Posts.ClosedDate, 
+        Posts.CommunityOwnedDate, 
+        Posts.ContentLicense
+    FROM 
+        Posts
+    WHERE 
+        Posts.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '30' DAY
+),
+UserActivity AS (
+    SELECT 
+        Users.Id, 
+        Users.Reputation, 
+        Users.CreationDate, 
+        Users.DisplayName, 
+        Users.LastAccessDate, 
+        Users.WebsiteUrl, 
+        Users.Location, 
+        Users.Views, 
+        Users.UpVotes, 
+        Users.DownVotes, 
+        Users.ProfileImageUrl, 
+        Users.EmailHash, 
+        Users.AccountId
+    FROM 
+        Users
+    WHERE 
+        Users.LastAccessDate > CAST('2024-10-01' AS DATE) - INTERVAL '90' DAY
+),
+PostVotes AS (
+    SELECT 
+        Votes.PostId, 
+        COUNT(Votes.Id) AS VoteCount, 
+        SUM(CASE WHEN Votes.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount, 
+        SUM(CASE WHEN Votes.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount
+    FROM 
+        Votes
+    GROUP BY 
+        Votes.PostId
+),
+PostTags AS (
+    SELECT 
+        Posts.Id, 
+        Tags.TagName
+    FROM 
+        Posts
+    LEFT JOIN 
+        Tags ON Posts.Tags LIKE '%' || Tags.TagName || '%'
+)
+SELECT 
+    RecentPosts.Id AS PostId, 
+    RecentPosts.PostTypeId, 
+    RecentPosts.AcceptedAnswerId, 
+    RecentPosts.ParentId, 
+    RecentPosts.CreationDate, 
+    RecentPosts.Score, 
+    RecentPosts.ViewCount, 
+    RecentPosts.Body, 
+    RecentPosts.OwnerUserId, 
+    RecentPosts.OwnerDisplayName, 
+    RecentPosts.LastEditorUserId, 
+    RecentPosts.LastEditorDisplayName, 
+    RecentPosts.LastEditDate, 
+    RecentPosts.LastActivityDate, 
+    RecentPosts.Title, 
+    STRING_AGG(PostTags.TagName, ', ') AS Tags, 
+    RecentPosts.AnswerCount, 
+    RecentPosts.CommentCount, 
+    RecentPosts.FavoriteCount, 
+    RecentPosts.ClosedDate, 
+    RecentPosts.CommunityOwnedDate, 
+    RecentPosts.ContentLicense, 
+    COALESCE(PostVotes.VoteCount, 0) AS VoteCount, 
+    COALESCE(PostVotes.UpVoteCount, 0) AS UpVoteCount, 
+    COALESCE(PostVotes.DownVoteCount, 0) AS DownVoteCount, 
+    UserActivity.Reputation, 
+    UserActivity.DisplayName, 
+    UserActivity.LastAccessDate
+FROM 
+    RecentPosts
+LEFT JOIN 
+    PostVotes ON RecentPosts.Id = PostVotes.PostId
+LEFT JOIN 
+    PostTags ON RecentPosts.Id = PostTags.Id
+LEFT JOIN 
+    UserActivity ON RecentPosts.OwnerUserId = UserActivity.Id
+GROUP BY 
+    RecentPosts.Id, 
+    RecentPosts.PostTypeId, 
+    RecentPosts.AcceptedAnswerId, 
+    RecentPosts.ParentId, 
+    RecentPosts.CreationDate, 
+    RecentPosts.Score, 
+    RecentPosts.ViewCount, 
+    RecentPosts.Body, 
+    RecentPosts.OwnerUserId, 
+    RecentPosts.OwnerDisplayName, 
+    RecentPosts.LastEditorUserId, 
+    RecentPosts.LastEditorDisplayName, 
+    RecentPosts.LastEditDate, 
+    RecentPosts.LastActivityDate, 
+    RecentPosts.Title, 
+    RecentPosts.AnswerCount, 
+    RecentPosts.CommentCount, 
+    RecentPosts.FavoriteCount, 
+    RecentPosts.ClosedDate, 
+    RecentPosts.CommunityOwnedDate, 
+    RecentPosts.ContentLicense, 
+    PostVotes.VoteCount, 
+    PostVotes.UpVoteCount, 
+    PostVotes.DownVoteCount, 
+    UserActivity.Reputation, 
+    UserActivity.DisplayName, 
+    UserActivity.LastAccessDate
+ORDER BY 
+    RecentPosts.CreationDate DESC, 
+    RecentPosts.Score DESC
+LIMIT 100;

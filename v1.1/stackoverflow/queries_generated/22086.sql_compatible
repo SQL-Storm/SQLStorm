@@ -1,0 +1,95 @@
+WITH UserBadges AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(*) AS TotalBadges
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+PostVotes AS (
+    SELECT 
+        PostId,
+        SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+        SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes
+    FROM Votes
+    GROUP BY PostId
+),
+PostStats AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.Score,
+        p.OwnerUserId,
+        p.Tags,
+        COALESCE(v.Upvotes, 0) AS TotalUpvotes,
+        COALESCE(v.Downvotes, 0) AS TotalDownvotes,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 5) AS HighScoreComments,
+        CASE 
+            WHEN p.Tags IS NULL THEN NULL
+            ELSE (
+                -- split tags like '<tag1><tag2>' into array elements in a dialect-neutral way
+                -- here we emulate by removing leading/trailing angle brackets and splitting on '><'
+                -- many systems don't have ARRAY_AGG(REGEXP_SPLIT_TO_TABLE...), so produce a delimited string instead
+                NULL
+            )
+        END AS TagArray
+    FROM Posts p
+    LEFT JOIN PostVotes v ON p.Id = v.PostId
+    WHERE p.PostTypeId IN (1, 2)
+)
+SELECT
+    ub.UserId,
+    ub.DisplayName,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ps.Id AS PostId,
+    ps.Score,
+    ps.TotalUpvotes,
+    ps.TotalDownvotes,
+    ps.HighScoreComments,
+    -- produce tags as a string by removing outer <> and replacing '><' with ', '
+    CASE
+      WHEN ps.Tags IS NULL THEN NULL
+      ELSE REPLACE(SUBSTRING(ps.Tags FROM 2 FOR LENGTH(ps.Tags) - 2), '><', ', ')
+    END AS Tags,
+    ROW_NUMBER() OVER (PARTITION BY ub.UserId ORDER BY ps.Score DESC) AS RankByScore
+FROM UserBadges ub
+LEFT JOIN PostStats ps ON ub.UserId = ps.OwnerUserId
+WHERE EXISTS (
+    SELECT 1 FROM Votes v2
+    WHERE v2.PostId = ps.Id
+      AND v2.UserId IS NOT NULL
+      AND v2.CreationDate >= DATE '2020-01-01'
+    GROUP BY v2.PostId
+    HAVING COUNT(DISTINCT v2.VoteTypeId) > 2
+)
+AND ps.Score > (
+    SELECT AVG(p2.Score)
+    FROM Posts p2
+    WHERE p2.PostTypeId = 2
+      AND p2.OwnerUserId = ub.UserId
+)
+AND ub.GoldBadges > 0
+ORDER BY ub.TotalBadges DESC, ps.Score DESC
+LIMIT 100
+UNION ALL
+SELECT
+    NULL AS UserId,
+    'Anonymous' AS DisplayName,
+    0 AS GoldBadges,
+    0 AS SilverBadges,
+    0 AS BronzeBadges,
+    NULL AS PostId,
+    NULL::numeric AS Score,
+    NULL::integer AS TotalUpvotes,
+    NULL::integer AS TotalDownvotes,
+    NULL::integer AS HighScoreComments,
+    NULL::text AS Tags,
+    NULL::integer AS RankByScore
+WHERE 1 = 0;

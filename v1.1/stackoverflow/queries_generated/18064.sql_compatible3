@@ -1,0 +1,119 @@
+WITH
+  RankedPosts AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.Score,
+      p.AnswerCount,
+      p.CommentCount,
+      pt.Name AS PostTypeName,
+      ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.CreationDate DESC) AS RankByScore,
+      LAG(p.Score, 1, 0) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS PreviousScore,
+      LEAD(p.Score, 1, 0) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS NextScore
+    FROM Posts p
+    JOIN PostTypes pt
+      ON p.PostTypeId = pt.Id
+    WHERE
+      p.Score > 0 AND p.OwnerUserId IS NOT NULL AND p.Title IS NOT NULL
+  ),
+  UserPostContributions AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(p.Id) AS TotalPosts,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      AVG(p.Score) AS AverageScore,
+      MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p
+      ON u.Id = p.OwnerUserId
+    GROUP BY
+      u.Id,
+      u.DisplayName
+  ),
+  HighReputationUsers AS (
+    SELECT
+      UserId,
+      DisplayName
+    FROM UserPostContributions
+    WHERE
+      TotalPosts > 1000 AND AverageScore > 50
+  ),
+  PostHistoryAggregates AS (
+    SELECT
+      ph.PostId,
+      COUNT(CASE WHEN ph.PostHistoryTypeId = 2 THEN 1 END) AS BodyEdits,
+      COUNT(CASE WHEN ph.PostHistoryTypeId IN (1, 4, 7) THEN 1 END) AS TitleEdits,
+      MAX(ph.CreationDate) AS LastEditDateForPost
+    FROM PostHistory ph
+    WHERE
+      ph.UserId IN (SELECT UserId FROM HighReputationUsers)
+    GROUP BY
+      ph.PostId
+  )
+SELECT
+  rp.PostId,
+  rp.Title,
+  rp.PostTypeName,
+  rp.Score,
+  rp.AnswerCount,
+  rp.CommentCount,
+  rp.RankByScore,
+  rp.PreviousScore,
+  rp.NextScore,
+  COALESCE(hr.DisplayName, 'Unknown User') AS OwnerDisplayName,
+  pha.BodyEdits,
+  pha.TitleEdits,
+  CASE
+    WHEN rp.Score > 1000 THEN 'Very High'
+    WHEN rp.Score > 100 THEN 'High'
+    WHEN rp.Score > 10 THEN 'Medium'
+    ELSE 'Low'
+  END AS ScoreCategory,
+  (rp.AnswerCount + rp.CommentCount) AS TotalInteractions,
+  POSITION('sql' IN LOWER(rp.Title)) AS SqlKeywordPosition,
+  (TIMESTAMP '2024-10-01 12:34:56' - rp.CreationDate) AS TimeSinceCreation,
+  EXTRACT(day FROM (TIMESTAMP '2024-10-01 12:34:56' - rp.CreationDate)) AS DaysSinceCreation
+FROM RankedPosts rp
+LEFT JOIN HighReputationUsers hr
+  ON rp.OwnerUserId = hr.UserId
+LEFT JOIN PostHistoryAggregates pha
+  ON rp.PostId = pha.PostId
+WHERE
+  rp.RankByScore <= 50
+  AND EXISTS (
+    SELECT 1
+    FROM Tags t
+    WHERE t.TagName = 'performance'
+      AND rp.PostId IN (
+        SELECT p2.Id FROM Posts p2 WHERE p2.Tags LIKE '%' || t.TagName || '%'
+      )
+  )
+UNION ALL
+SELECT
+  CAST(NULL AS BIGINT) AS PostId,
+  '--- Summary ---' AS Title,
+  CAST(NULL AS VARCHAR) AS PostTypeName,
+  AVG(rp.Score) AS Score,
+  AVG(rp.AnswerCount) AS AnswerCount,
+  AVG(rp.CommentCount) AS CommentCount,
+  CAST(NULL AS INTEGER) AS RankByScore,
+  CAST(NULL AS INTEGER) AS PreviousScore,
+  CAST(NULL AS INTEGER) AS NextScore,
+  CAST(NULL AS VARCHAR) AS OwnerDisplayName,
+  CAST(NULL AS BIGINT) AS BodyEdits,
+  CAST(NULL AS BIGINT) AS TitleEdits,
+  CAST(NULL AS VARCHAR) AS ScoreCategory,
+  CAST(NULL AS BIGINT) AS TotalInteractions,
+  'Average' AS SqlKeywordPosition,
+  CAST(NULL AS INTERVAL) AS TimeSinceCreation,
+  CAST(NULL AS DOUBLE PRECISION) AS DaysSinceCreation
+FROM RankedPosts rp
+WHERE
+  rp.RankByScore <= 50
+GROUP BY
+  '--- Summary ---',
+  'Average';

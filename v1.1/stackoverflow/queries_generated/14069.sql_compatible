@@ -1,0 +1,26 @@
+SELECT 
+    CASE WHEN p.PostTypeId = 1 THEN p.Title 
+         ELSE (SELECT p2.Title FROM Posts p2 WHERE p2.Id = p.ParentId) 
+    END AS PostTitle,
+    COALESCE(u.DisplayName, 'Community') AS DisplayName,
+    EXTRACT(epoch FROM (timestamp '2024-10-01 12:34:56' - p.CreationDate)) / 86400.0 AS DaysSinceCreation,
+    ROUND(CAST(p.Score AS DOUBLE PRECISION) / NULLIF(EXTRACT(epoch FROM (timestamp '2024-10-01 12:34:56' - p.CreationDate)) / 86400.0, 0), 2) AS ScorePerDay,
+    CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' 
+         WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+         ELSE 'Open' 
+    END AS PostStatus,
+    COALESCE(NULLIF(ROUND(CAST(p.ViewCount AS DOUBLE PRECISION) / NULLIF(EXTRACT(epoch FROM (timestamp '2024-10-01 12:34:56' - p.CreationDate)) / 86400.0, 0), 2), 0), 0) AS ViewsPerDay,
+    COALESCE(NULLIF(ROUND(CAST(p.AnswerCount AS DOUBLE PRECISION) / NULLIF(EXTRACT(epoch FROM (timestamp '2024-10-01 12:34:56' - p.CreationDate)) / 86400.0, 0), 2), 0), 0) AS AnswersPerDay,
+    COALESCE(NULLIF(ROUND(CAST(p.CommentCount AS DOUBLE PRECISION) / NULLIF(EXTRACT(epoch FROM (timestamp '2024-10-01 12:34:56' - p.CreationDate)) / 86400.0, 0), 2), 0), 0) AS CommentsPerDay,
+    COALESCE(NULLIF(ROUND(CAST(p.FavoriteCount AS DOUBLE PRECISION) / NULLIF(EXTRACT(epoch FROM (timestamp '2024-10-01 12:34:56' - p.CreationDate)) / 86400.0, 0), 2), 0), 0) AS FavoritesPerDay,
+    COALESCE(NULLIF(ROUND(CAST(u.Reputation AS DOUBLE PRECISION) / NULLIF(EXTRACT(epoch FROM (timestamp '2024-10-01 12:34:56' - u.CreationDate)) / 86400.0, 0), 2), 0), 0) AS ReputationPerDay,
+    COALESCE(ROUND(CAST(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS DOUBLE PRECISION) / NULLIF(EXTRACT(epoch FROM (timestamp '2024-10-01 12:34:56' - p.CreationDate)) / 86400.0, 0), 2), 0) AS UpvotesPerDay,
+    COALESCE(ROUND(CAST(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DOUBLE PRECISION) / NULLIF(EXTRACT(epoch FROM (timestamp '2024-10-01 12:34:56' - p.CreationDate)) / 86400.0, 0), 2), 0) AS DownvotesPerDay,
+    COALESCE(ROUND(CAST(SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS DOUBLE PRECISION) / NULLIF(EXTRACT(epoch FROM (timestamp '2024-10-01 12:34:56' - p.CreationDate)) / 86400.0, 0), 2), 0) AS AcceptedAnswersPerDay,
+    STUFF(REPLACE(p.Tags, '><', ','), 1, 1, '') AS Tags
+FROM Posts p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Votes v ON p.Id = v.PostId
+GROUP BY p.Id, p.PostTypeId, p.Title, p.ParentId, p.CreationDate, p.ClosedDate, p.CommunityOwnedDate, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, u.Id, u.DisplayName, u.CreationDate, u.Reputation, p.Tags
+ORDER BY ScorePerDay DESC
+LIMIT 100;

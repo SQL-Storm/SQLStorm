@@ -1,0 +1,63 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        COUNT(c.Id) AS CommentCount,
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank,
+        p.PostTypeId
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Comments c ON p.Id = c.PostId
+    WHERE 
+        p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    GROUP BY 
+        p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.PostTypeId
+),
+TopPosts AS (
+    SELECT 
+        PostId,
+        Title,
+        CreationDate,
+        Score,
+        ViewCount,
+        CommentCount
+    FROM 
+        RankedPosts
+    WHERE 
+        ScoreRank <= 10
+),
+UserStatistics AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(COALESCE(v.BountyAmount, 0)) AS TotalBounty
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (8, 9)
+    GROUP BY 
+        u.Id, u.DisplayName
+)
+SELECT 
+    up.UserId,
+    up.DisplayName,
+    up.PostCount,
+    up.TotalBounty,
+    tp.Title AS TopPostTitle,
+    tp.Score AS TopPostScore,
+    tp.CommentCount AS TopPostCommentCount
+FROM 
+    UserStatistics up
+LEFT JOIN 
+    TopPosts tp ON up.PostCount > 0
+ORDER BY 
+    up.TotalBounty DESC,
+    up.PostCount DESC
+LIMIT 5;

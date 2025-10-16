@@ -1,0 +1,162 @@
+WITH RecentActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.OwnerDisplayName,
+    p.LastEditorDisplayName,
+    p.LastEditDate,
+    p.ContentLicense,
+    pv.VoteCount,
+    pv.UpDownSpread,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  LEFT JOIN (
+    SELECT
+      PostId,
+      COUNT(*) AS VoteCount,
+      SUM(CASE WHEN VoteTypeId IN (2,3) THEN 1 ELSE 0 END) AS UpDownSpread
+    FROM Votes
+    GROUP BY PostId
+  ) pv ON pv.PostId = p.Id
+  WHERE p.LastActivityDate IS NOT NULL
+    AND p.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years')
+),
+EnrichedUsers AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.Location,
+    u.WebsiteUrl,
+    u.ProfileImageUrl,
+    u.AccountId,
+    COALESCE(b.TotalBadges, 0) AS BadgeCount
+  FROM Users u
+  LEFT JOIN (
+    SELECT UserId, COUNT(*) AS TotalBadges
+    FROM Badges
+    GROUP BY UserId
+  ) b ON b.UserId = u.Id
+),
+TagAnalytics AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    CASE
+      WHEN t.IsModeratorOnly = TRUE THEN 'ModeratorOnly'
+      ELSE 'Public'
+    END AS Access,
+    CASE
+      WHEN t.IsRequired = TRUE THEN 'Required'
+      ELSE 'Optional'
+    END AS Requirement
+  FROM Tags t
+  WHERE t.Count > 0
+),
+FilteredPosts AS (
+  SELECT
+    rp.PostId,
+    rp.PostTypeId,
+    rp.Title,
+    rp.OwnerUserId,
+    rp.LastActivityDate,
+    rp.AnswerCount,
+    rp.CommentCount,
+    rp.ViewCount,
+    rp.Score,
+    rp.Tags,
+    rp.FavoriteCount,
+    rp.ContentLicense
+  FROM RecentActivity rp
+  WHERE rp.rn = 1
+    AND rp.PostTypeId IN (1,2)
+),
+Composite AS (
+  SELECT
+    fp.PostId,
+    fp.PostTypeId,
+    fp.Title,
+    fp.OwnerUserId,
+    fu.DisplayName AS OwnerName,
+    fu.Reputation,
+    fu.CreationDate AS OwnerCreationDate,
+    fu.LastAccessDate AS OwnerLastAccess,
+    fp.LastActivityDate,
+    fp.ViewCount,
+    fp.Score,
+    fp.Tags,
+    fp.AnswerCount,
+    fp.CommentCount,
+    fp.FavoriteCount,
+    fp.ContentLicense,
+    ta.Access AS TagAccess,
+    ta.Requirement AS TagRequirement,
+    CONCAT(
+      'FT_', (ABS(CAST(HASHTEXT(CONCAT(fp.Title, '|', COALESCE(fp.Tags, ''))) AS BIGINT)) % 100000)
+    ) AS Fingerprint
+  FROM FilteredPosts fp
+  LEFT JOIN EnrichedUsers fu ON fu.Id = fp.OwnerUserId
+  LEFT JOIN TagAnalytics ta ON ta.TagName = SUBSTRING(fp.Tags FROM 2 FOR (CHAR_LENGTH(fp.Tags) - 2))
+)
+SELECT
+  c.PostId,
+  c.PostTypeId,
+  c.Title,
+  c.OwnerName,
+  c.Reputation AS OwnerReputation,
+  c.OwnerCreationDate,
+  c.OwnerLastAccess,
+  c.LastActivityDate,
+  c.ViewCount,
+  c.Score,
+  c.Tags,
+  c.AnswerCount,
+  c.CommentCount,
+  c.FavoriteCount,
+  c.ContentLicense,
+  c.TagAccess,
+  c.TagRequirement,
+  c.Fingerprint,
+  (COALESCE(c.Score,0) * 2 + COALESCE(c.ViewCount,0) * 0.5 + COALESCE(c.AnswerCount,0) * 3
+   + COALESCE(c.CommentCount,0) * 1.5
+   + COALESCE((
+       SELECT AVG(CAST(v.BountyAmount AS numeric)) FROM Votes v WHERE v.PostId = c.PostId AND v.BountyAmount IS NOT NULL
+     ), 0)) AS EngagementScore
+FROM Composite c
+GROUP BY
+  c.PostId,
+  c.PostTypeId,
+  c.Title,
+  c.OwnerName,
+  c.Reputation,
+  c.OwnerCreationDate,
+  c.OwnerLastAccess,
+  c.LastActivityDate,
+  c.ViewCount,
+  c.Score,
+  c.Tags,
+  c.AnswerCount,
+  c.CommentCount,
+  c.FavoriteCount,
+  c.ContentLicense,
+  c.TagAccess,
+  c.TagRequirement,
+  c.Fingerprint
+ORDER BY c.LastActivityDate DESC, EngagementScore DESC;

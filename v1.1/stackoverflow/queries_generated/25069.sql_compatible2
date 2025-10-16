@@ -1,0 +1,160 @@
+WITH
+user_base AS (
+    SELECT
+        u.Id                           AS user_id,
+        u.DisplayName                  AS display_name,
+        u.Reputation                   AS reputation,
+        u.CreationDate                 AS user_created,
+        COALESCE(u.Location, 'N/A')    AS location,
+        COUNT(p.Id)                    AS total_posts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS total_questions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS total_answers,
+        COUNT(b.Id)                    AS total_badges,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.ParentId END) AS distinct_questions_answered
+    FROM Users u
+    LEFT JOIN Posts p   ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b  ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+),
+recent_activity AS (
+    SELECT
+        ua.user_id,
+        MAX(p.CreationDate)               AS last_post_date,
+        MAX(ph.CreationDate)              AS last_edit_date,
+        MAX(v.CreationDate)               AS last_vote_date
+    FROM user_base ua
+    LEFT JOIN Posts p
+           ON p.OwnerUserId = ua.user_id
+    LEFT JOIN PostHistory ph
+           ON ph.PostId = p.Id
+          AND ph.PostHistoryTypeId IN (4,5,6)
+    LEFT JOIN Votes v
+           ON v.PostId = p.Id
+    GROUP BY ua.user_id
+),
+user_tags AS (
+    SELECT
+        a.OwnerUserId                         AS user_id,
+        UNNEST(string_to_array(
+                TRIM(BOTH '<>' FROM q.Tags),
+                '><'))                         AS tag,
+        COUNT(*)                              AS tag_uses
+    FROM Posts a
+    JOIN Posts q ON q.Id = a.ParentId
+    WHERE a.PostTypeId = 2
+      AND a.OwnerUserId IS NOT NULL
+    GROUP BY a.OwnerUserId, tag
+),
+top_user_tags AS (
+    SELECT
+        user_id,
+        STRING_AGG(tag || ':' || tag_uses, ', ' ORDER BY tag_uses DESC) AS top_tags
+    FROM (
+        SELECT
+            ut.user_id,
+            ut.tag,
+            ut.tag_uses,
+            ROW_NUMBER() OVER (PARTITION BY ut.user_id ORDER BY ut.tag_uses DESC) AS rn
+        FROM user_tags ut
+    ) sub
+    WHERE rn <= 5
+    GROUP BY user_id
+),
+answer_scores AS (
+    SELECT
+        a.OwnerUserId                         AS user_id,
+        a.CreationDate                        AS answer_date,
+        a.Score                               AS answer_score
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+-- Use ROWS BETWEEN 6 PRECEDING AND CURRENT ROW with a date-ordered integer index to approximate a 7-day rolling window in dialects that don't support RANGE with interval.
+answer_scores_indexed AS (
+    SELECT
+        user_id,
+        answer_date,
+        answer_score,
+        ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY answer_date) AS rn
+    FROM answer_scores
+),
+rolling_scores AS (
+    SELECT
+        a1.user_id,
+        a1.answer_date,
+        AVG(a2.answer_score) AS avg_score_7d
+    FROM answer_scores_indexed a1
+    JOIN answer_scores_indexed a2
+      ON a1.user_id = a2.user_id
+     AND a2.rn BETWEEN a1.rn - 6 AND a1.rn
+    GROUP BY a1.user_id, a1.answer_date, a1.rn
+),
+max_avg_score AS (
+    SELECT
+        user_id,
+        MAX(avg_score_7d) AS max_7d_avg_score
+    FROM rolling_scores
+    GROUP BY user_id
+),
+badge_counts AS (
+    SELECT
+        b.UserId                       AS user_id,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+users_with_answers AS (
+    SELECT ub.user_id
+    FROM user_base ub
+    WHERE ub.total_answers > 0
+),
+users_without_answers AS (
+    SELECT ub.user_id
+    FROM user_base ub
+    WHERE ub.total_answers = 0
+),
+combined_users AS (
+    SELECT user_id, 'HAS_ANSWERS' AS answer_flag FROM users_with_answers
+    UNION ALL
+    SELECT user_id, 'NO_ANSWERS'   AS answer_flag FROM users_without_answers
+)
+SELECT
+    ub.user_id,
+    ub.display_name,
+    ub.reputation,
+    ub.location,
+    ub.total_posts,
+    ub.total_questions,
+    ub.total_answers,
+    ub.distinct_questions_answered,
+    COALESCE(ra.last_post_date, TIMESTAMP '1970-01-01')      AS last_post_date,
+    COALESCE(ra.last_edit_date, TIMESTAMP '1970-01-01')      AS last_edit_date,
+    COALESCE(ra.last_vote_date, TIMESTAMP '1970-01-01')      AS last_vote_date,
+    COALESCE(tut.top_tags, '')                     AS top_5_tags,
+    COALESCE(mas.max_7d_avg_score, 0)              AS best_7d_avg_answer_score,
+    COALESCE(bc.gold_badges, 0)   AS gold_badges,
+    COALESCE(bc.silver_badges, 0) AS silver_badges,
+    COALESCE(bc.bronze_badges, 0) AS bronze_badges,
+    cu.answer_flag,
+    CASE 
+        WHEN ub.reputation >= 20000 THEN 'Elite'
+        WHEN ub.reputation BETWEEN 10000 AND 19999 THEN 'Veteran'
+        WHEN ub.reputation < 1000 THEN 'Newbie'
+        ELSE 'Experienced'
+    END                                         AS reputation_tier,
+    (SELECT COUNT(DISTINCT v.UserId)
+     FROM Posts a
+     JOIN Votes v ON v.PostId = a.Id
+     WHERE a.OwnerUserId = ub.user_id
+       AND a.PostTypeId = 2
+       AND v.VoteTypeId = 2)                    AS distinct_upvoters,
+    RANK() OVER (ORDER BY ub.reputation DESC)   AS reputation_rank
+FROM combined_users cu
+JOIN user_base        ub ON ub.user_id = cu.user_id
+LEFT JOIN recent_activity ra ON ra.user_id = ub.user_id
+LEFT JOIN top_user_tags   tut ON tut.user_id = ub.user_id
+LEFT JOIN max_avg_score   mas ON mas.user_id = ub.user_id
+LEFT JOIN badge_counts    bc  ON bc.user_id = ub.user_id
+ORDER BY ub.reputation DESC
+LIMIT 100;

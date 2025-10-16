@@ -1,0 +1,96 @@
+WITH RecentPosts AS (
+    SELECT 
+        p.Id, 
+        p.Title, 
+        p.CreationDate, 
+        p.Score, 
+        p.ViewCount, 
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName, 
+        u.Reputation,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostType,
+        COUNT(v.Id) OVER (PARTITION BY p.Id) AS VoteCount
+    FROM 
+        Posts p
+    JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    WHERE 
+        p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY
+),
+UserActivity AS (
+    SELECT 
+        u.Id, 
+        u.DisplayName, 
+        COUNT(p.Id) AS PostCount, 
+        SUM(p.Score) AS TotalScore, 
+        SUM(p.ViewCount) AS TotalViews
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+            AND p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR
+    GROUP BY 
+        u.Id, u.DisplayName
+),
+TopTags AS (
+    SELECT 
+        t.TagName, 
+        COUNT(p.Id) AS PostCount
+    FROM 
+        Tags t
+    JOIN 
+        Posts p ON EXISTS (
+            SELECT 1
+            FROM (
+                SELECT TRIM(value) AS tag_text
+                FROM UNNEST(string_to_array(p.Tags, ',')) AS dt(value)
+            ) sub
+            WHERE sub.tag_text = t.TagName
+        )
+    GROUP BY 
+        t.TagName
+    ORDER BY 
+        PostCount DESC
+    LIMIT 10
+)
+SELECT 
+    rp.Id, 
+    rp.Title, 
+    rp.CreationDate, 
+    rp.Score, 
+    rp.ViewCount, 
+    rp.OwnerDisplayName, 
+    rp.Reputation, 
+    rp.PostType, 
+    rp.VoteCount, 
+    ua.PostCount AS UserPostCount, 
+    ua.TotalScore, 
+    ua.TotalViews, 
+    tt.TagName, 
+    tt.PostCount AS TagPostCount
+FROM 
+    RecentPosts rp
+JOIN 
+    UserActivity ua ON rp.OwnerUserId = ua.Id
+LEFT JOIN 
+    TopTags tt ON EXISTS (
+        SELECT 1
+        FROM (
+            SELECT TRIM(value) AS tag_text
+            FROM UNNEST(string_to_array(rp.Title, ',')) AS dt(value)
+        ) t
+        WHERE t.tag_text = tt.TagName
+    )
+WHERE 
+    rp.Score > 0
+    AND ua.PostCount > 5
+ORDER BY 
+    rp.Score DESC, 
+    rp.ViewCount DESC, 
+    rp.CreationDate DESC;

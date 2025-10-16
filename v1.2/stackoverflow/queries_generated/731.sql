@@ -1,0 +1,130 @@
+-- {"query": "731.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1134} 
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate as PostCreationDate,
+        row_number() over (partition by u.Id order by p.CreationDate) as PostNumber,
+        count(*) over (partition by u.Id) as TotalPosts
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where u.Reputation > 1000
+),
+UserBadgeStats as (
+    select 
+        b.UserId,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+PostLinkSummary as (
+    select
+        pl.PostId,
+        count(distinct case when lt.Name = 'Duplicate' then pl.RelatedPostId end) as DuplicateCount,
+        count(distinct case when lt.Name = 'Linked' then pl.RelatedPostId end) as LinkedCount
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    group by pl.PostId
+),
+TopTags as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(p.ScoreSum,0) as ScoreSum
+    from Tags t
+    left join (
+        select 
+            unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as Tag,
+            sum(p.Score) as ScoreSum
+        from Posts p
+        where p.PostTypeId = 1 and p.Tags is not null
+        group by Tag
+    ) p on t.TagName = p.Tag
+    where t.Count > 1000
+    order by ScoreSum desc
+    limit 10
+),
+UserCommentAgg as (
+    select 
+        c.UserId,
+        count(*) as CommentCount,
+        avg(length(c.Text)) as AvgCommentLength,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    where c.UserId is not null
+    group by c.UserId
+),
+PostHistoryCloseEvents as (
+    select 
+        ph.PostId,
+        count(*) filter (where ph.PostHistoryTypeId = 10) as CloseVotes,
+        count(*) filter (where ph.PostHistoryTypeId = 11) as ReopenVotes,
+        bool_or(ph.PostHistoryTypeId = 10 and ph.Comment::int in (101,102,103)) as HasCurrentCloseReason
+    from PostHistory ph
+    group by ph.PostId
+)
+select 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    uba.GoldBadges,
+    uba.SilverBadges,
+    uba.BronzeBadges,
+    ua.TotalPosts,
+    ua.PostNumber,
+    ua.PostId,
+    ua.PostTypeId,
+    ua.Score,
+    ua.ViewCount,
+    ua.PostCreationDate,
+    pls.DuplicateCount,
+    pls.LinkedCount,
+    t.TagName,
+    t.ScoreSum as TagScoreSum,
+    uca.CommentCount,
+    uca.AvgCommentLength,
+    uca.LastCommentDate,
+    phce.CloseVotes,
+    phce.ReopenVotes,
+    phce.HasCurrentCloseReason,
+    case 
+        when ua.Score > 100 then 'High Score'
+        when ua.Score between 50 and 100 then 'Medium Score'
+        else 'Low Score'
+    end as ScoreCategory,
+    substring(ua.PostId::text || '-' || coalesce(u.DisplayName, 'Unknown') || '-' || t.TagName from 1 for 50) as CompositeString,
+    coalesce(ua.PostCreationDate, now()) - u.CreationDate as UserPostAgeInterval,
+    rank() over (partition by u.Id order by ua.Score desc nulls last) as PostScoreRank,
+    dense_rank() over (order by u.Reputation desc) as UserReputationRank
+from RecursiveUserActivity ua
+join Users u on ua.UserId = u.Id
+left join UserBadgeStats uba on uba.UserId = u.Id
+left join PostLinkSummary pls on pls.PostId = ua.PostId
+left join TopTags t on strpos(ua.PostId::text || ' ' || coalesce(ua.PostTypeId::text, ''), t.TagName) > 0
+left join UserCommentAgg uca on uca.UserId = u.Id
+left join PostHistoryCloseEvents phce on phce.PostId = ua.PostId
+where ua.PostNumber <= 5
+  and (ua.PostTypeId = 1 or ua.PostTypeId = 2)
+union
+select 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    0,0,0,
+    0,0,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+from Users u
+where not exists (
+    select 1 from Posts p where p.OwnerUserId = u.Id
+)
+order by UserReputationRank, PostScoreRank, UserId
+limit 100;

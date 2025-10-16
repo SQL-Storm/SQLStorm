@@ -1,0 +1,262 @@
+-- {"query": "30.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2706} 
+with
+-- recent activity per question including last editor and counts
+QuestionBase as (
+  select
+    q.id as question_id,
+    q.title,
+    q.creationdate,
+    q.owneruserid,
+    u.displayname as owner_name,
+    q.viewcount,
+    q.answercount,
+    q.score,
+    coalesce(q.tags,'') as tags,
+    q.favoritecount,
+    q.acceptedanswerid,
+    q.lastactivitydate,
+    q.lasteditdate,
+    q.closeddate
+  from posts q
+  left join users u on q.owneruserid = u.id
+  where q.posttypeid = 1
+),
+-- compute tag array and canonicalize tags as lower-case individual tag rows
+TagExplode as (
+  select
+    qb.*,
+    trim(both '<>' from unnest(string_to_array(substring(qb.tags,2,case when qb.tags is null then 0 else length(qb.tags)-2 end), '><'))) as single_tag
+  from QuestionBase qb
+  where qb.tags is not null and qb.tags <> ''
+),
+-- aggregated tag metrics per question
+TagMetrics as (
+  select
+    question_id,
+    count(distinct nullif(single_tag,'')) filter (where single_tag is not null) as tag_count,
+    string_agg(distinct lower(nullif(single_tag,'')), ',' order by lower(nullif(single_tag,''))) as tag_list
+  from TagExplode
+  group by question_id
+),
+-- answers and their stats including acceptance and author reputation snapshot
+AnswerStats as (
+  select
+    a.parentid as question_id,
+    count(*) as total_answers,
+    sum(case when a.id = q.acceptedanswerid then 1 else 0 end) as has_accepted,
+    avg(a.score) as avg_answer_score,
+    max(a.score) as max_answer_score,
+    min(a.score) as min_answer_score,
+    sum(case when a.owneruserid is null then 0 else 1 end) as answers_with_owner,
+    max(coalesce(u.reputation,0)) filter (where a.owneruserid is not null) as top_answerer_reputation
+  from posts a
+  left join posts q on q.id = a.parentid
+  left join users u on u.id = a.owneruserid
+  where a.posttypeid = 2
+  group by a.parentid
+),
+-- votes breakdown per post using conditional aggregation and correlated subquery for unique voters
+VoteBreakdown as (
+  select
+    v.postid,
+    count(*) as votes_total,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 1 then 1 else 0 end) as accepted_votes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+    count(distinct v.userid) as distinct_voters
+  from votes v
+  group by v.postid
+),
+-- compute comment sentiment proxy: long comments vs short, and distinct commenter count
+CommentStats as (
+  select
+    c.postid,
+    count(*) as comment_count,
+    avg(char_length(c.text)) as avg_comment_len,
+    sum(case when char_length(c.text) > 200 then 1 else 0 end) as long_comments,
+    count(distinct c.userid) as distinct_commenters
+  from comments c
+  group by c.postid
+),
+-- recent history summary: number of edits, last edit type and last editor id
+PostHistoryAgg as (
+  select
+    ph.postid,
+    count(*) as history_events,
+    max(ph.creationdate) as last_history_date,
+    max(ph.posthistorytypeid) filter (where ph.creationdate = max(ph.creationdate) over (partition by ph.postid)) as last_history_type,
+    (select ph2.userid from posthistory ph2 where ph2.postid = ph.postid order by ph2.creationdate desc limit 1) as last_history_userid
+  from posthistory ph
+  group by ph.postid
+),
+-- combine questions with metrics
+QuestionRich as (
+  select
+    qb.*,
+    coalesce(tm.tag_count,0) as tag_count,
+    coalesce(tm.tag_list,'') as tag_list,
+    coalesce(aS.total_answers,0) as total_answers,
+    coalesce(aS.has_accepted,0) as has_accepted,
+    coalesce(aS.avg_answer_score,0) as avg_answer_score,
+    coalesce(vb.votes_total,0) as votes_total,
+    coalesce(vb.upvotes,0) as upvotes,
+    coalesce(vb.downvotes,0) as downvotes,
+    coalesce(cs.comment_count,0) as comment_count,
+    coalesce(ph.history_events,0) as history_events,
+    ph.last_history_date,
+    ph.last_history_userid
+  from QuestionBase qb
+  left join TagMetrics tm on tm.question_id = qb.question_id
+  left join AnswerStats aS on aS.question_id = qb.question_id
+  left join VoteBreakdown vb on vb.postid = qb.question_id
+  left join CommentStats cs on cs.postid = qb.question_id
+  left join PostHistoryAgg ph on ph.postid = qb.question_id
+),
+-- rank questions by composite hotness score using window functions, penalize closure and reward views/answers/upvotes
+Hotness as (
+  select
+    qr.*,
+    -- composite score with nonlinear scaling and null-safe math
+    (
+      log(1 + greatest(coalesce(qr.viewcount,0),0)) * 0.4
+      + sqrt(greatest(coalesce(qr.votes_total,0),0)) * 1.2
+      + coalesce(qr.total_answers,0) * 0.8
+      + (case when coalesce(qr.has_accepted,0) > 0 then 5 else 0 end)
+      - (case when qr.closeddate is not null then 10 else 0 end)
+      + (case when qr.tag_count > 3 then 2 else 0 end)
+      + (coalesce(qr.comment_count,0) / nullif(1 + coalesce(qr.history_events,0),0)) * 0.5
+    ) as hotness_score,
+    row_number() over (order by
+      (
+        log(1 + greatest(coalesce(qr.viewcount,0),0)) * 0.4
+        + sqrt(greatest(coalesce(qr.votes_total,0),0)) * 1.2
+        + coalesce(qr.total_answers,0) * 0.8
+        + (case when coalesce(qr.has_accepted,0) > 0 then 5 else 0 end)
+        - (case when qr.closeddate is not null then 10 else 0 end)
+        + (case when qr.tag_count > 3 then 2 else 0 end)
+        + (coalesce(qr.comment_count,0) / nullif(1 + coalesce(qr.history_events,0),0)) * 0.5
+      ) desc,
+      coalesce(qr.lastactivitydate, qr.creationdate) desc
+    ) as hot_rank
+  from QuestionRich qr
+),
+-- select the top N questions, then expand with correlated subqueries and set operations
+TopCandidates as (
+  select *
+  from Hotness
+  where hot_rank <= 200
+),
+-- grab sample of linked posts (both linked and duplicate links) for those top questions
+LinkedPosts as (
+  select
+    tl.*,
+    lt.name as link_type_name,
+    p.title as related_title,
+    p.posttypeid as related_type,
+    p.owneruserid as related_owner
+  from postlinks tl
+  left join linktypes lt on lt.id = tl.linktypeid
+  left join posts p on p.id = tl.relatedpostid
+  where tl.postid in (select question_id from TopCandidates)
+),
+-- compute per-top-question aggregated neighbor metrics using set aggregation and EXISTS correlated checks
+NeighborAgg as (
+  select
+    tc.question_id,
+    count(distinct lp.relatedpostid) as linked_count,
+    sum(case when lp.linktypeid = 3 then 1 else 0 end) as duplicate_links,
+    bool_or(lp.linktypeid = 3) as has_duplicates,
+    (select count(*) from posts p2 where p2.parentid = tc.question_id and p2.score >= 10) as high_score_answers,
+    (select coalesce(count(*),0) from posts p3 where p3.parentid = tc.question_id and exists (select 1 from votes v2 where v2.postid = p3.id and v2.votetypeid = 2 and v2.creationdate > tc.creationdate - interval '30 days')) as recent_upvoted_answers
+  from TopCandidates tc
+  left join LinkedPosts lp on lp.postid = tc.question_id
+  group by tc.question_id, tc.creationdate
+)
+-- final projection: combine everything, include some complex expressions and filters and union for set operator test
+select
+  h.question_id,
+  left(h.title, 120) as title_snippet,
+  coalesce(h.owner_name, 'Community') as owner,
+  to_char(h.creationdate, 'YYYY-MM-DD') as created_date,
+  h.tag_count,
+  h.tag_list,
+  round(h.hotness_score::numeric,3) as hotness,
+  h.total_answers,
+  h.votes_total,
+  h.upvotes,
+  h.downvotes,
+  h.comment_count,
+  na.linked_count,
+  na.duplicate_links,
+  na.high_score_answers,
+  na.recent_upvoted_answers,
+  case
+    when h.closeddate is not null then 'closed'
+    when h.has_accepted > 0 then 'answered'
+    when h.total_answers = 0 then 'unanswered'
+    else 'open'
+  end as status,
+  -- heuristic complexity: derive a bounty-like suggestion score using a nontrivial expression
+  greatest(0,
+    ceil(
+      (
+        pow(greatest(h.hotness_score,1), 0.45)
+        + ln(1 + greatest(h.viewcount,0)) * 0.12
+        + greatest(h.total_answers - coalesce(na.high_score_answers,0),0) * 0.8
+        - (case when h.upvotes < h.downvotes then 2 else 0 end)
+      ) * 2.5
+    )
+  ) as suggested_bounty,
+  -- include a fuzzy tag match metric using set difference and string operations (correlated)
+  (
+    select string_agg(tt.tagname, ',') from tags tt
+    where lower(tt.tagname) = any (string_to_array(coalesce(h.tag_list,''), ','))
+    and tt.count > 100
+    limit 5
+  ) as popular_tags_on_question
+from Hotness h
+left join NeighborAgg na on na.question_id = h.question_id
+where
+  -- complex predicate: select active recent or historically important but avoid trivial low-score noise
+  (
+    (h.lastactivitydate >= now() - interval '90 days' and h.votes_total >= 3)
+    or
+    (h.viewcount >= 5000 and h.upvotes >= 10)
+    or
+    (h.history_events >= 5 and h.total_answers >= 2)
+  )
+  and (h.score is null or h.score > -3)
+order by suggested_bounty desc, hotness_score desc
+limit 100
+
+union
+
+-- set operator branch: return artificially constructed rows for cold-start testing using values and subqueries
+select
+  t.id as question_id,
+  left(t.title,120) as title_snippet,
+  coalesce(u.displayname,'[deleted]') as owner,
+  to_char(t.creationdate,'YYYY-MM-DD') as created_date,
+  0 as tag_count,
+  '' as tag_list,
+  0.0 as hotness,
+  0 as total_answers,
+  0 as votes_total,
+  0 as upvotes,
+  0 as downvotes,
+  0 as comment_count,
+  0 as linked_count,
+  0 as duplicate_links,
+  0 as high_score_answers,
+  0 as recent_upvoted_answers,
+  'cold' as status,
+  0 as suggested_bounty,
+  '' as popular_tags_on_question
+from posts t
+left join users u on u.id = t.owneruserid
+where t.posttypeid = 1
+  and t.creationdate >= now() - interval '7 days'
+  and t.viewcount < 10
+order by t.creationdate desc
+limit 25;

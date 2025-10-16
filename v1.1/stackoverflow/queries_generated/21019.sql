@@ -1,0 +1,143 @@
+-- {"query": "21019.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2168, "output_tokens": 1408} 
+
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score) AS AvgPostScore,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS PostRank,
+        NTILE(10) OVER (ORDER BY u.Reputation DESC) AS RepDecile
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.CreationDate >= u.CreationDate
+    WHERE u.Reputation > 0 
+      AND u.LastAccessDate > CURRENT_DATE - INTERVAL '1 year'
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.Location
+    HAVING COUNT(DISTINCT p.Id) >= 5
+),
+QuestionStats AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        COALESCE(b.Name, 'No Badge') AS TopBadge,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.ViewCount DESC) AS ViewRank,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS TotalUpvotes,
+        AVG(CASE WHEN v.VoteTypeId = 2 THEN 1.0 ELSE 0 END) OVER (PARTITION BY p.OwnerUserId) AS AvgUpvoteRatio
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId IN (2, 3)
+    LEFT JOIN (
+        SELECT 
+            b.UserId,
+            b.Name,
+            ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC, b.Class ASC) as rn
+        FROM Badges b 
+        WHERE b.Class = 1  -- Gold badges only
+    ) b ON b.UserId = p.OwnerUserId AND b.rn = 1
+    WHERE p.PostTypeId = 1 
+      AND p.ClosedDate IS NULL
+      AND p.Score > 0
+),
+HighImpactQuestions AS (
+    SELECT 
+        qs.*,
+        CASE 
+            WHEN qs.AnswerCount >= 3 AND qs.ViewCount > 1000 THEN 'High Impact'
+            WHEN qs.ViewCount > 500 THEN 'Medium Impact' 
+            ELSE 'Low Impact'
+        END AS ImpactLevel,
+        LENGTH(qs.Title) AS TitleLength,
+        CASE 
+            WHEN qs.Tags LIKE '%sql%' OR qs.Tags LIKE '%database%' THEN 'Tech Question'
+            WHEN qs.Tags LIKE '%javascript%' OR qs.Tags LIKE '%python%' THEN 'Programming'
+            ELSE 'Other'
+        END AS TagCategory,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Comments c 
+             WHERE c.PostId = qs.QuestionId AND c.Score > 0 
+             GROUP BY c.PostId
+            ), 0
+        ) AS PositiveCommentCount
+    FROM QuestionStats qs
+    WHERE qs.ViewRank <= 3
+)
+SELECT 
+    au.UserId,
+    au.DisplayName AS UserName,
+    au.Location,
+    au.Reputation,
+    au.PostRank,
+    au.QuestionCount,
+    au.AnswerCount,
+    hiq.QuestionId,
+    hiq.Title,
+    hiq.ImpactLevel,
+    hiq.TagCategory,
+    hiq.PositiveCommentCount,
+    (hiq.ViewCount * 1.0 / NULLIF(hiq.QuestionCount, 0)) AS ViewsPerQuestion,
+    CASE 
+        WHEN au.RepDecile = 1 THEN 'Top Tier'
+        WHEN au.RepDecile <= 3 THEN 'High Tier'
+        ELSE 'Regular'
+    END AS ReputationTier,
+    CONCAT(
+        UPPER(SUBSTRING(au.Location, 1, 1)), 
+        LOWER(SUBSTRING(au.Location, 2, 50))
+    ) AS FormattedLocation,
+    GREATEST(0, hiq.Score - COALESCE(hiq.PrevScore, 0)) AS ScoreImprovement,
+    (SELECT STRING_AGG(DISTINCT lt.Name, ', ')
+     FROM PostLinks pl
+     JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+     WHERE pl.PostId = hiq.QuestionId
+       AND pl.LinkTypeId = 3  -- Duplicate links
+    ) AS LinkedDuplicates
+FROM ActiveUsers au
+INNER JOIN HighImpactQuestions hiq ON hiq.OwnerUserId = au.UserId
+LEFT JOIN Users u ON u.Id = au.UserId
+WHERE au.PostRank <= 100
+  AND (hiq.ImpactLevel = 'High Impact' 
+       OR (hiq.ImpactLevel = 'Medium Impact' AND hiq.PositiveCommentCount > 5))
+  AND au.Location IS NOT NULL 
+  AND au.Location NOT LIKE '%null%'
+  AND NOT EXISTS (
+      SELECT 1 
+      FROM PostHistory ph 
+      WHERE ph.PostId = hiq.QuestionId 
+        AND ph.PostHistoryTypeId IN (10, 12)  -- Closed or Deleted
+        AND ph.CreationDate > hiq.CreationDate
+  )
+UNION ALL
+SELECT 
+    NULL AS UserId,
+    'Community Aggregate' AS UserName,
+    'Global' AS Location,
+    SUM(au.Reputation) AS Reputation,
+    0 AS PostRank,
+    COUNT(DISTINCT au.UserId) AS QuestionCount,
+    SUM(au.AnswerCount) AS AnswerCount,
+    NULL AS QuestionId,
+    'OVERALL STATS' AS Title,
+    NULL AS ImpactLevel,
+    COUNT(DISTINCT hiq.TagCategory) || ' Categories' AS TagCategory,
+    SUM(hiq.PositiveCommentCount) AS PositiveCommentCount,
+    AVG(hiq.ViewCount * 1.0 / NULLIF(hiq.QuestionCount, 0)) AS ViewsPerQuestion,
+    'Aggregate' AS ReputationTier,
+    NULL AS FormattedLocation,
+    NULL AS ScoreImprovement,
+    NULL AS LinkedDuplicates
+FROM ActiveUsers au
+INNER JOIN HighImpactQuestions hiq ON hiq.OwnerUserId = au.UserId
+ORDER BY 
+    COALESCE(au.PostRank, 999),
+    hiq.ViewCount DESC NULLS LAST,
+    au.Reputation DESC;

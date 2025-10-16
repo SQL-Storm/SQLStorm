@@ -1,0 +1,104 @@
+-- {"query": "23010.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "grok-4", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2685, "output_tokens": 1034} 
+WITH UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        AVG(p.Score) AS AvgScore,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS TotalQuestionViews,
+        MAX(p.CreationDate) AS LastPostDate,
+        ROW_NUMBER() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC) AS RankInLocation
+    FROM Users u
+    LEFT OUTER JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Location
+    HAVING COUNT(DISTINCT p.Id) > 10
+),
+BadgeSummary AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        STRING_AGG(b.Name, ', ') AS BadgeNames
+    FROM Badges b
+    WHERE b.TagBased = 1
+    GROUP BY b.UserId
+),
+RecentVotes AS (
+    SELECT 
+        v.PostId,
+        COUNT(v.Id) AS VoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS NetVotes
+    FROM Votes v
+    WHERE v.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+    GROUP BY v.PostId
+),
+ComplexTagAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        (SELECT COUNT(*) FROM Tags t WHERE t.TagName = ANY(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'))) AS TagCount,
+        COALESCE((SELECT AVG(c.Score) FROM Comments c WHERE c.PostId = p.Id AND c.Text LIKE '%helpful%'), 0) AS AvgCommentScore
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL AND p.PostTypeId = 1
+    AND EXISTS (SELECT 1 FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6) AND ph.CreationDate > p.CreationDate)
+),
+MergedStats AS (
+    SELECT 
+        ups.UserId,
+        ups.Reputation,
+        ups.DisplayName,
+        ups.TotalPosts,
+        ups.AvgScore,
+        ups.TotalQuestionViews,
+        ups.LastPostDate,
+        ups.RankInLocation,
+        bs.GoldBadges,
+        bs.SilverBadges,
+        bs.BadgeNames,
+        SUM(cta.AvgCommentScore) AS TotalAvgCommentScore,
+        (SELECT MAX(rv.NetVotes) FROM RecentVotes rv INNER JOIN Posts pp ON rv.PostId = pp.Id WHERE pp.OwnerUserId = ups.UserId) AS MaxRecentNetVotes
+    FROM UserPostStats ups
+    LEFT OUTER JOIN BadgeSummary bs ON ups.UserId = bs.UserId
+    LEFT OUTER JOIN ComplexTagAnalysis cta ON ups.UserId = cta.OwnerUserId
+    GROUP BY ups.UserId, ups.Reputation, ups.DisplayName, ups.TotalPosts, ups.AvgScore, ups.TotalQuestionViews, ups.LastPostDate, ups.RankInLocation, bs.GoldBadges, bs.SilverBadges, bs.BadgeNames
+)
+SELECT 
+    ms.UserId,
+    ms.DisplayName,
+    ms.Reputation,
+    ms.TotalPosts,
+    CASE WHEN ms.AvgScore IS NULL THEN 0 ELSE ms.AvgScore END AS AvgScore,
+    ms.TotalQuestionViews,
+    ms.LastPostDate,
+    ms.RankInLocation,
+    COALESCE(ms.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ms.SilverBadges, 0) AS SilverBadges,
+    NULLIF(ms.BadgeNames, '') AS BadgeNames,
+    ms.TotalAvgCommentScore,
+    ms.MaxRecentNetVotes,
+    RANK() OVER (ORDER BY ms.Reputation DESC) AS OverallRank
+FROM MergedStats ms
+WHERE ms.LastPostDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+UNION ALL
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    0 AS TotalPosts,
+    0 AS AvgScore,
+    0 AS TotalQuestionViews,
+    NULL AS LastPostDate,
+    NULL AS RankInLocation,
+    0 AS GoldBadges,
+    0 AS SilverBadges,
+    NULL AS BadgeNames,
+    0 AS TotalAvgCommentScore,
+    0 AS MaxRecentNetVotes,
+    NULL AS OverallRank
+FROM Users u
+WHERE u.Id NOT IN (SELECT UserId FROM MergedStats)
+AND u.Reputation > 500
+ORDER BY Reputation DESC
+LIMIT 100;

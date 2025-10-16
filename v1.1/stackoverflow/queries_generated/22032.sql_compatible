@@ -1,0 +1,88 @@
+WITH user_stats AS (
+  SELECT u.Id, u.DisplayName, u.CreationDate, u.Location,
+         COUNT(p.Id) AS num_posts,
+         SUM(p.Score) AS total_score,
+         COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS num_questions,
+         COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS num_answers,
+         AVG(NULLIF(p.Score, 0)) AS avg_score
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+  GROUP BY u.Id, u.DisplayName, u.CreationDate, u.Location
+),
+badge_stats AS (
+  SELECT UserId,
+         COUNT(*) AS num_badges,
+         SUM(CASE WHEN Class = 1 THEN 10 WHEN Class = 2 THEN 5 ELSE 1 END) AS badge_points
+  FROM Badges
+  GROUP BY UserId
+),
+vote_stats AS (
+  SELECT UserId,
+         SUM(CASE WHEN VoteTypeId = 2 THEN 1 WHEN VoteTypeId = 3 THEN -1 ELSE 0 END) AS net_votes
+  FROM Votes
+  WHERE UserId IS NOT NULL
+  GROUP BY UserId
+),
+comment_stats AS (
+  SELECT UserId,
+         COUNT(*) AS num_comments,
+         AVG(NULLIF(Score, 0)) AS avg_comment_score
+  FROM Comments
+  WHERE UserId IS NOT NULL
+  GROUP BY UserId
+),
+user_tags AS (
+  -- extract tags per user from question posts in a dialect-neutral way
+  SELECT p.OwnerUserId AS UserId,
+         TRIM(tag) AS tag
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT regexp_split_to_table(
+      CASE
+        WHEN p.Tags IS NULL THEN NULL
+        WHEN LEFT(p.Tags,1) = '<' AND RIGHT(p.Tags,1) = '>' THEN SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2)
+        ELSE p.Tags
+      END,
+      '><'
+    ) AS tag
+  ) AS split
+  WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+top_tag_per_user AS (
+  SELECT ut.UserId,
+         ut.tag AS top_tag
+  FROM (
+    SELECT UserId, tag, COUNT(*) AS cnt,
+           ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY COUNT(*) DESC, tag) AS rn
+    FROM user_tags
+    GROUP BY UserId, tag
+  ) ut
+  WHERE ut.rn = 1
+),
+enriched_users AS (
+  SELECT us.Id, us.DisplayName, us.CreationDate, us.Location,
+         us.num_posts, us.total_score, us.num_questions, us.num_answers, us.avg_score,
+         COALESCE(bs.num_badges, 0) AS num_badges,
+         COALESCE(bs.badge_points, 0) AS badge_points,
+         COALESCE(vs.net_votes, 0) AS net_votes,
+         COALESCE(cs.num_comments, 0) AS num_comments,
+         COALESCE(cs.avg_comment_score, 0) AS avg_comment_score,
+         tt.top_tag
+  FROM user_stats us
+  LEFT JOIN badge_stats bs ON us.Id = bs.UserId
+  LEFT JOIN vote_stats vs ON us.Id = vs.UserId
+  LEFT JOIN comment_stats cs ON us.Id = cs.UserId
+  LEFT JOIN top_tag_per_user tt ON us.Id = tt.UserId
+)
+SELECT eu.Id, eu.DisplayName, eu.CreationDate, eu.Location,
+       eu.num_posts, eu.total_score, eu.num_questions, eu.num_answers, eu.avg_score,
+       eu.num_badges, eu.badge_points, eu.net_votes, eu.num_comments, eu.avg_comment_score,
+       eu.top_tag,
+       CASE WHEN eu.Location IS NULL THEN 'Unknown' ELSE UPPER(SUBSTRING(eu.Location FROM 1 FOR 10)) END AS location_summary,
+       (eu.total_score + eu.net_votes + eu.badge_points) / NULLIF(eu.num_posts + eu.num_comments, 0) AS overall_activity_score,
+       ROW_NUMBER() OVER (ORDER BY (eu.total_score + eu.net_votes + eu.badge_points) / NULLIF(eu.num_posts + eu.num_comments, 0) DESC) AS rank_overall,
+       ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM eu.CreationDate) ORDER BY eu.num_badges DESC) AS rank_by_year_badges
+FROM enriched_users eu
+WHERE eu.num_posts > 5 OR eu.num_comments > 10
+ORDER BY overall_activity_score DESC NULLS LAST
+LIMIT 200;

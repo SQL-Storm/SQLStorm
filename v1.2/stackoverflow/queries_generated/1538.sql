@@ -1,0 +1,107 @@
+-- {"query": "1538.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 956} 
+with RecursiveTagReplies as (
+    select 
+        p.Id as PostId, 
+        p.Title,
+        1 as Level,
+        array[p.Id] as Path
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+    
+    union all
+    
+    select 
+        child.Id,
+        left(child.Title, 60) || '...' as TitleSnippet,
+        parent.Level + 1,
+        parent.Path || child.Id
+    from Posts child
+    join Posts parent_post on child.ParentId = parent_post.Id
+    join RecursiveTagReplies parent
+        on parent.PostId = child.ParentId
+    where child.PostTypeId = 2
+),
+BadgeRanks as (
+    select 
+        b.UserId,
+        sum(case when b.Class=1 then 3 else 0 end) +
+        sum(case when b.Class=2 then 2 else 0 end) +
+        sum(case when b.Class=3 then 1 else 0 end) 
+        as WeightedBadgeScore
+    from Badges b
+    group by b.UserId
+),
+UserTopPostsRanked as (
+    select
+        p.OwnerUserId,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        row_number() over(partition by p.OwnerUserId order by p.Score desc Nulls Last, p.ViewCount desc Nulls Last) as RankTopPosts
+    from Posts p
+    where p.OwnerUserId is not null and p.OwnerUserId > 0
+),
+QuestionCloseHistory as (
+    select ph.PostId, col.Name as CloseReasonName, ph.CreationDate
+    from PostHistory ph
+    join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id and pht.Name = 'Post Closed'
+    left join CloseReasonTypes col on col.Id = cast(ph.Comment as int)
+    where ph.PostId in (select Id from Posts where PostTypeId = 1)
+)
+select distinct
+    u.Id as UserId,
+    coalesce(u.DisplayName, 'Unknown User') as UserName,
+    u.Reputation,
+    coalesce(bt.WeightedBadgeScore, 0) as BadgeScore,
+    count(distinct p.Id) filter (where p.PostTypeId = 1) as TotalQuestions,
+    count(distinct p.Id) filter (where p.PostTypeId = 2) as TotalAnswers,
+    max(p.CreationDate) over (partition by u.Id) as LastPostDate,
+    concat_ws( '-', string_agg(distinct left(t.TagName, 10), '/' order by count(t.Id) desc 
+       rows between unbounded preceding and unbounded following), '_TotalTags:', count(distinct t.Id)) as TagSummary,
+    phc.CloseReasonName,
+    plural_rule.count as PluralsMisused,
+    row_number() over (order by BadgeScore desc, u.Reputation desc Nulls last) as UserLeaderBoardPosition
+    
+from Users u 
+left join Posts p 
+    on p.OwnerUserId = u.Id
+left join (
+    select distinct pt.TagName, pt.Id, pht.UserId
+    from Tags pt
+    join Posts p on p.Tags ilike '%' || pt.TagName || '%'
+    join PostsFactorsWithPHTag ptcht on ptcht.PostId = p.Id
+) as t on true
+
+left join BadgeRanks bt on bt.UserId = u.Id
+
+left join QuestionCloseHistory phc on phc.PostId = p.Id and p.PostTypeId = 1
+
+left join lateral (
+    select count(*) as count
+    from regexp_matches(
+        coalesce(p.Body, ''), '([a-zA-Z]+)s\b', 'g'
+    ) ms(count_word)
+    where lower(count_word) like '%s'
+) plural_rule on true
+
+where u.CreationDate < current_timestamp - interval '365 day' -- active over one year ago
+group by u.Id, audio_status.sound_device_hr.name, phc.CloseReasonName, u.DisplayName, bt.WeightedBadgeScore, u.Reputation
+having count(distinct p.Id) > 5
+union
+select 
+    u2.Id,
+    coalesce(u2.DisplayName, 'Orphaned Post Reviewer'),
+   449,
+    0,
+    0,
+    0,
+    null,
+    null,
+    0,
+    99999
+from Users u2
+where not exists (
+    select 1 from Posts p2 where p2.OwnerUserId = u2.Id
+)
+order by UserLeaderBoardPosition asc
+limit 100;

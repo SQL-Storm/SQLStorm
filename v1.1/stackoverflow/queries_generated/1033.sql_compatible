@@ -1,0 +1,60 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn,
+        COUNT(c.Id) OVER (PARTITION BY p.Id) AS CommentCount,
+        SUM(v.BountyAmount) OVER (PARTITION BY p.Id) AS TotalBounty
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    WHERE 
+        p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+        AND p.PostTypeId = 1
+),
+UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalViews,
+        COALESCE(SUM(p.UpVotes), 0) AS TotalUpVotes,
+        COALESCE(SUM(p.DownVotes), 0) AS TotalDownVotes,
+        COUNT(DISTINCT p.Id) AS QuestionCount
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    WHERE 
+        u.Reputation > 1000
+    GROUP BY 
+        u.Id, u.DisplayName
+)
+SELECT 
+    u.UserId,
+    u.DisplayName,
+    u.TotalViews,
+    u.TotalUpVotes,
+    u.TotalDownVotes,
+    u.QuestionCount,
+    CASE 
+        WHEN u.QuestionCount > 0 THEN 'Active'
+        ELSE 'Inactive'
+    END AS UserStatus,
+    ARRAY_AGG(rp.PostId) FILTER (WHERE rp.rn = 1) AS RecentPostIds,
+    ARRAY_AGG(rp.Title) FILTER (WHERE rp.rn = 1) AS RecentPostTitles,
+    ARRAY_AGG(rp.TotalBounty) FILTER (WHERE rp.rn = 1) AS RecentPostBounties,
+    rp.CreationDate
+FROM 
+    UserStats u
+JOIN 
+    RankedPosts rp ON u.UserId = rp.OwnerUserId
+GROUP BY 
+    u.UserId, u.DisplayName, u.TotalViews, u.TotalUpVotes, u.TotalDownVotes, u.QuestionCount, rp.CreationDate, rp.PostId, rp.Title, rp.TotalBounty, rp.rn
+ORDER BY 
+    u.TotalViews DESC, u.TotalUpVotes DESC
+LIMIT 50;

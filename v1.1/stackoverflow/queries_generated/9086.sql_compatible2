@@ -1,0 +1,120 @@
+WITH
+TopUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        ROW_NUMBER() OVER (ORDER BY COALESCE(u.Reputation, 0) DESC) AS Rank,
+        AVG(COALESCE(p.Score, 0)) OVER (PARTITION BY u.Id) AS AvgPostScore
+    FROM Users AS u
+    LEFT JOIN Posts AS p
+      ON p.OwnerUserId = u.Id
+    WHERE u.CreationDate < CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+),
+RecentPostTags AS (
+    SELECT
+        p.Id AS PostId,
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS TagName
+    FROM Posts AS p
+    WHERE p.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months'
+),
+RecentPosts AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        REGEXP_REPLACE(COALESCE(p.Title, ''), '[^a-zA-Z0-9 ]', ' ', 'g') AS CleanTitle,
+        string_agg(t.TagName, '|' ORDER BY t.TagName) AS TagList
+    FROM Posts AS p
+    LEFT JOIN RecentPostTags AS t
+      ON t.PostId = p.Id
+    WHERE p.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months'
+    GROUP BY p.Id, p.OwnerUserId, p.PostTypeId, p.Score, p.ViewCount, p.Title
+),
+AnswerCounts AS (
+    SELECT
+        ParentId,
+        COUNT(*) AS AnswerCount
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY ParentId
+),
+PopularTagIntersect AS (
+    SELECT TagName
+    FROM Tags
+    WHERE Count > 1000
+    INTERSECT
+    SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><'))
+    FROM Posts AS p
+    WHERE p.ViewCount > 50000
+)
+SELECT
+    tu.Rank,
+    tu.DisplayName,
+    rp.CleanTitle,
+    rp.Score,
+    rp.ViewCount,
+    rp.TagList,
+    COALESCE(ac.AnswerCount, 0) AS AnswerCount,
+    CAST(rp.Score AS DOUBLE PRECISION) / NULLIF(rp.ViewCount, 0) AS ScoreToViewRatio,
+    (
+      SELECT COUNT(*)
+      FROM Comments AS c
+      WHERE c.PostId = rp.Id
+        AND c.Score > rp.Score
+    ) AS HighScoreComments,
+    CASE
+      WHEN rp.Score > tu.AvgPostScore THEN 'AboveAverage'
+      ELSE 'BelowAverage'
+    END AS ScoreVsUserAvg,
+    CAST('2024-10-01 12:34:56' AS timestamp) - u.LastAccessDate AS DaysSinceLastAccess
+FROM TopUsers AS tu
+JOIN RecentPosts AS rp
+  ON rp.OwnerUserId = tu.Id
+LEFT JOIN AnswerCounts AS ac
+  ON ac.ParentId = rp.Id
+LEFT JOIN Users AS u
+  ON u.Id = tu.Id
+WHERE
+    rp.Score > 0
+    AND (rp.ViewCount > 1000 OR rp.TagList ILIKE '%sql%')
+    AND EXISTS (
+        SELECT 1
+        FROM PopularTagIntersect AS pti
+        WHERE rp.TagList LIKE '%' || pti.TagName || '%'
+    )
+
+UNION
+
+SELECT
+    tu.Rank,
+    tu.DisplayName,
+    rp.CleanTitle,
+    rp.Score,
+    rp.ViewCount,
+    rp.TagList,
+    COALESCE(ac.AnswerCount, 0) AS AnswerCount,
+    CAST(rp.Score AS DOUBLE PRECISION) / NULLIF(rp.ViewCount, 0) AS ScoreToViewRatio,
+    (
+      SELECT COUNT(*)
+      FROM Comments AS c
+      WHERE c.PostId = rp.Id
+        AND c.Score > rp.Score
+    ) AS HighScoreComments,
+    CASE
+      WHEN rp.Score > tu.AvgPostScore THEN 'AboveAverage'
+      ELSE 'BelowAverage'
+    END AS ScoreVsUserAvg,
+    CAST('2024-10-01 12:34:56' AS timestamp) - u.LastAccessDate AS DaysSinceLastAccess
+FROM TopUsers AS tu
+RIGHT JOIN RecentPosts AS rp
+  ON rp.OwnerUserId = tu.Id
+LEFT JOIN AnswerCounts AS ac
+  ON ac.ParentId = rp.Id
+LEFT JOIN Users AS u
+  ON u.Id = tu.Id
+WHERE
+    rp.Score < 0
+ORDER BY DaysSinceLastAccess DESC
+LIMIT 50;

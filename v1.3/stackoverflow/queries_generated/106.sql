@@ -1,0 +1,184 @@
+-- {"query": "106.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 2343} 
+WITH
+-- basic aggregates per user: posts, answers, questions, avg score
+user_post_stats AS (
+  SELECT
+    u.Id AS user_id,
+    u.DisplayName,
+    COUNT(p.Id) FILTER (WHERE p.PostTypeId IS NOT NULL) AS total_posts,
+    COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS questions,
+    COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS answers,
+    AVG(NULLIF(p.Score,0)) FILTER (WHERE p.Score IS NOT NULL) AS avg_post_score,
+    SUM(COALESCE(p.ViewCount,0)) AS total_views,
+    SUM(COALESCE(p.AnswerCount,0)) AS sum_answercount,
+    MAX(p.LastActivityDate) AS last_activity
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName
+),
+-- badge counts and tag-based breakdown using string aggregation
+user_badge_stats AS (
+  SELECT
+    b.UserId AS user_id,
+    COUNT(*) AS badge_count,
+    COUNT(*) FILTER (WHERE b.Class = 1) AS gold,
+    COUNT(*) FILTER (WHERE b.Class = 2) AS silver,
+    COUNT(*) FILTER (WHERE b.Class = 3) AS bronze,
+    STRING_AGG(DISTINCT b.Name, ' | ' ORDER BY b.Name) FILTER (WHERE b.TagBased = 0) AS named_badges,
+    STRING_AGG(DISTINCT b.Name, ' | ' ORDER BY b.Name) FILTER (WHERE b.TagBased = 1) AS tag_badges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+-- recent activity window: last 90 days posts and comments weight
+recent_activity AS (
+  SELECT
+    u.Id AS user_id,
+    SUM(CASE WHEN p.CreationDate >= now() - interval '90 days' THEN 5 ELSE 0 END) +
+    SUM(CASE WHEN c.CreationDate >= now() - interval '90 days' THEN 2 ELSE 0 END) AS recent_score
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Comments c ON c.UserId = u.Id
+  GROUP BY u.Id
+),
+-- votes given and received (correlated subquery to demonstrate correlated behavior)
+user_vote_stats AS (
+  SELECT
+    u.Id AS user_id,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 2) AS upvotes_given,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 3) AS downvotes_given,
+    (SELECT COUNT(*) FROM Votes v JOIN Posts p2 ON p2.Id = v.PostId WHERE p2.OwnerUserId = u.Id AND v.VoteTypeId = 2) AS upvotes_received,
+    (SELECT COUNT(*) FROM Votes v JOIN Posts p2 ON p2.Id = v.PostId WHERE p2.OwnerUserId = u.Id AND v.VoteTypeId = 3) AS downvotes_received
+  FROM Users u
+),
+-- tag participation: extract tags from question posts and count by user; use unnest-like behavior via regexp_split_to_table
+user_tag_stats AS (
+  SELECT
+    p.OwnerUserId AS user_id,
+    lower(trim(both '<>' FROM tag)) AS tag,
+    COUNT(*) AS cnt
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT regexp_split_to_table(substring(p.Tags from 2 for length(p.Tags)-2), '\>\<') AS tag
+  ) s(tag)
+  WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId, tag
+),
+-- top 3 tags per user using window functions
+user_top_tags AS (
+  SELECT user_id, tag, cnt
+  FROM (
+    SELECT uts.*, ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY cnt DESC, tag) AS rn
+    FROM user_tag_stats uts
+  ) t
+  WHERE rn <= 3
+),
+-- combine all user data with left joins; include some NULL-heavy expressions and COALESCE defaults
+user_combined AS (
+  SELECT
+    u.Id AS user_id,
+    u.DisplayName,
+    COALESCE(ups.total_posts,0) AS total_posts,
+    COALESCE(ups.questions,0) AS questions,
+    COALESCE(ups.answers,0) AS answers,
+    COALESCE(ub.badge_count,0) AS badge_count,
+    COALESCE(ub.gold,0) AS gold,
+    COALESCE(ub.silver,0) AS silver,
+    COALESCE(ub.bronze,0) AS bronze,
+    COALESCE(uvs.upvotes_given,0) AS upvotes_given,
+    COALESCE(uvs.downvotes_given,0) AS downvotes_given,
+    COALESCE(uvs.upvotes_received,0) AS upvotes_received,
+    COALESCE(uvs.downvotes_received,0) AS downvotes_received,
+    COALESCE(ra.recent_score,0) AS recent_score,
+    COALESCE(ups.avg_post_score,0) AS avg_post_score,
+    COALESCE(ups.total_views,0) AS total_views,
+    COALESCE(ups.sum_answercount,0) AS sum_answercount,
+    COALESCE(ub.named_badges,'') AS named_badges,
+    COALESCE(ub.tag_badges,'') AS tag_badges,
+    COALESCE(u.Location,'(unknown)') AS location,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    CASE WHEN u.Views IS NULL THEN 0 ELSE u.Views END AS profile_views
+  FROM Users u
+  LEFT JOIN user_post_stats ups ON ups.user_id = u.Id
+  LEFT JOIN user_badge_stats ub ON ub.user_id = u.Id
+  LEFT JOIN user_vote_stats uvs ON uvs.user_id = u.Id
+  LEFT JOIN recent_activity ra ON ra.user_id = u.Id
+)
+-- final selection: produce a complex scoring formula, window ranks, correlated subquery for last 3 posts, and string assembly; filter to active users using HAVING-like where on COALESCE
+SELECT
+  uc.user_id,
+  uc.DisplayName,
+  uc.Reputation,
+  uc.total_posts,
+  uc.questions,
+  uc.answers,
+  uc.badge_count,
+  uc.gold, uc.silver, uc.bronze,
+  uc.upvotes_received,
+  uc.downvotes_received,
+  uc.upvotes_given,
+  uc.downvotes_given,
+  uc.recent_score,
+  uc.avg_post_score,
+  -- a composite score combining many factors with NULL-safe math and non-linear scaling
+  ROUND(
+    (
+      LEAST(ln(GREATEST(uc.Reputation,1))+1, 10) * 2.5
+      + POWER(uc.total_posts, 0.6)
+      + (uc.upvotes_received * 0.75)
+      - (uc.downvotes_received * 1.5)
+      + (uc.gold * 10 + uc.silver * 4 + uc.bronze * 1.5)
+      + (uc.recent_score * 1.2)
+      + (uc.avg_post_score * 2)
+    )::numeric, 4
+  ) AS composite_score,
+  -- percentile and rank over all users
+  PERCENT_RANK() OVER (ORDER BY (
+      LEAST(ln(GREATEST(uc.Reputation,1))+1, 10) * 2.5
+      + POWER(uc.total_posts, 0.6)
+      + (uc.upvotes_received * 0.75)
+      - (uc.downvotes_received * 1.5)
+      + (uc.gold * 10 + uc.silver * 4 + uc.bronze * 1.5)
+      + (uc.recent_score * 1.2)
+      + (uc.avg_post_score * 2)
+    ) DESC) AS score_percentile,
+  ROW_NUMBER() OVER (ORDER BY (
+      LEAST(ln(GREATEST(uc.Reputation,1))+1, 10) * 2.5
+      + POWER(uc.total_posts, 0.6)
+      + (uc.upvotes_received * 0.75)
+      - (uc.downvotes_received * 1.5)
+      + (uc.gold * 10 + uc.silver * 4 + uc.bronze * 1.5)
+      + (uc.recent_score * 1.2)
+      + (uc.avg_post_score * 2)
+    ) DESC, uc.Reputation DESC) AS score_rank,
+  -- top tags concatenated (from CTE) via correlated subquery to preserve ordering
+  (
+    SELECT COALESCE(string_agg(t.tag || '(' || t.cnt || ')', ', ' ORDER BY t.cnt DESC, t.tag), '')
+    FROM (
+      SELECT tag, cnt
+      FROM user_tag_stats uts2
+      WHERE uts2.user_id = uc.user_id
+      ORDER BY cnt DESC, tag
+      LIMIT 5
+    ) t
+  ) AS top_tags,
+  -- last three posts summary via correlated subquery with JSON-like string assembly, demonstrating NULL handling and string ops
+  (
+    SELECT COALESCE(string_agg(
+      '[' || p2.Id::text || '|' || COALESCE(left(p2.Title,60), left(p2.Body,60)) || '|' || COALESCE(p2.Score::text,'0') || '|' || COALESCE(to_char(p2.CreationDate,'YYYY-MM-DD'), 'N/A') || ']'
+      , ' || ' ORDER BY p2.CreationDate DESC), '(no posts)')
+    FROM Posts p2
+    WHERE p2.OwnerUserId = uc.user_id
+    ORDER BY p2.CreationDate DESC
+    LIMIT 3
+  ) AS last_three_posts,
+  -- a boolean-ish "engaged" flag combining recent_score and last_access recency with NULL-safe checks
+  (CASE WHEN uc.recent_score > 0 AND uc.LastAccessDate >= now() - interval '30 days' THEN true ELSE false END) AS engaged_recently
+FROM user_combined uc
+-- filter to users who have some meaningful activity to benchmark (can be adjusted)
+WHERE (uc.total_posts IS NOT NULL AND uc.total_posts > 0)
+   OR (uc.badge_count IS NOT NULL AND uc.badge_count > 0)
+   OR (uc.upvotes_received IS NOT NULL AND uc.upvotes_received > 0)
+ORDER BY composite_score DESC NULLS LAST
+LIMIT 250;

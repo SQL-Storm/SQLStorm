@@ -1,0 +1,212 @@
+WITH
+  QuestionStats AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.OwnerUserId,
+      p.Title,
+      p.CreationDate AS QuestionCreationDate,
+      p.Score AS QuestionScore,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.ViewCount AS QuestionViewCount,
+      u.DisplayName AS QuestionOwnerDisplayName,
+      u.Reputation AS QuestionOwnerReputation,
+      COUNT(c.Id) AS CommentCountOnQuestion,
+      SUM(CASE WHEN ph.PostHistoryTypeId = 1 THEN 1 ELSE 0 END) AS InitialTitleEdits,
+      SUM(CASE WHEN ph.PostHistoryTypeId = 4 THEN 1 ELSE 0 END) AS TitleEdits,
+      SUM(CASE WHEN ph.PostHistoryTypeId = 6 THEN 1 ELSE 0 END) AS TagEdits,
+      SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseVotes,
+      SUM(CASE WHEN ph.PostHistoryTypeId = 19 THEN 1 ELSE 0 END) AS ProtectedVotes,
+      ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) AS RowNumByCreationDate,
+      RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS RankByScoreForUser,
+      DENSE_RANK() OVER (ORDER BY p.FavoriteCount DESC) AS DenseRankByFavoriteCount
+    FROM
+      Posts p
+    LEFT JOIN
+      Users u
+      ON p.OwnerUserId = u.Id
+    LEFT JOIN
+      Comments c
+      ON p.Id = c.PostId
+    LEFT JOIN
+      PostHistory ph
+      ON p.Id = ph.PostId
+    WHERE
+      p.PostTypeId = 1
+      AND p.CreationDate BETWEEN TIMESTAMP '2023-01-01' AND TIMESTAMP '2023-12-31'
+    GROUP BY
+      p.Id,
+      p.OwnerUserId,
+      p.Title,
+      p.CreationDate,
+      p.Score,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.ViewCount,
+      u.DisplayName,
+      u.Reputation
+  ),
+  AnswerStats AS (
+    SELECT
+      p.ParentId AS QuestionId,
+      COUNT(p.Id) AS AnswerCountOnQuestion,
+      SUM(p.Score) AS TotalAnswerScore,
+      AVG(p.Score) AS AvgAnswerScore,
+      MAX(p.CreationDate) AS LastAnswerCreationDate,
+      COUNT(CASE WHEN p.Id = q.AcceptedAnswerId THEN 1 ELSE NULL END) AS IsAcceptedAnswerPresent
+    FROM
+      Posts p
+    JOIN
+      Posts q
+      ON p.ParentId = q.Id
+    WHERE
+      p.PostTypeId = 2
+    GROUP BY
+      p.ParentId
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      COUNT(DISTINCT p.Id) AS UserQuestions,
+      COUNT(DISTINCT a.Id) AS UserAnswers,
+      SUM(p.ViewCount) AS TotalUserQuestionViews,
+      SUM(a.ViewCount) AS TotalUserAnswerViews,
+      COUNT(DISTINCT b.Id) AS UserBadges,
+      MAX(u.CreationDate) AS UserCreationDate,
+      CAST(
+        (EXTRACT(EPOCH FROM TIMESTAMP '2024-10-01 12:34:56') - EXTRACT(EPOCH FROM MAX(u.CreationDate))) / 86400
+      AS INTEGER) AS UserAgeDays,
+      COALESCE(SUM(a.Score), 0) AS TotalUserAnswerScore
+    FROM
+      Users u
+    LEFT JOIN
+      Posts p
+      ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN
+      Posts a
+      ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    LEFT JOIN
+      Badges b
+      ON u.Id = b.UserId
+    GROUP BY
+      u.Id
+  )
+SELECT
+  qs.QuestionId,
+  qs.Title,
+  qs.QuestionCreationDate,
+  qs.QuestionScore,
+  qs.AnswerCount AS DirectAnswerCount,
+  COALESCE(ans.AnswerCountOnQuestion, 0) AS TotalAnswers,
+  COALESCE(ans.TotalAnswerScore, 0) AS TotalAnswerScoreForQuestion,
+  COALESCE(ans.AvgAnswerScore, 0) AS AverageAnswerScoreForQuestion,
+  qs.FavoriteCount,
+  qs.QuestionViewCount,
+  qs.CommentCountOnQuestion,
+  qs.InitialTitleEdits,
+  qs.TitleEdits,
+  qs.TagEdits,
+  qs.CloseVotes,
+  qs.ProtectedVotes,
+  qs.RowNumByCreationDate,
+  qs.RankByScoreForUser,
+  qs.DenseRankByFavoriteCount,
+  qs.QuestionOwnerDisplayName,
+  qs.QuestionOwnerReputation,
+  ua.UserQuestions,
+  ua.UserAnswers,
+  ua.TotalUserQuestionViews,
+  ua.TotalUserAnswerViews,
+  ua.UserBadges,
+  ua.UserCreationDate,
+  ua.UserAgeDays,
+  ua.TotalUserAnswerScore AS UserTotalAnswerScore,
+  CASE
+    WHEN qs.QuestionOwnerReputation > 50000 THEN 'Expert'
+    WHEN qs.QuestionOwnerReputation > 10000 THEN 'Experienced'
+    WHEN qs.QuestionOwnerReputation > 1000 THEN 'Intermediate'
+    ELSE 'Beginner'
+  END AS OwnerExperienceLevel,
+  CASE
+    WHEN LENGTH(qs.Title) > 50 THEN SUBSTR(qs.Title, 1, 50) || '...'
+    ELSE qs.Title
+  END AS TruncatedTitle,
+  CASE
+    WHEN ans.IsAcceptedAnswerPresent > 0 THEN 'Accepted Answer Exists'
+    ELSE 'No Accepted Answer'
+  END AS AcceptedAnswerStatus,
+  COALESCE(qs.QuestionOwnerDisplayName, 'Community') AS DisplayOwnerName,
+  COALESCE(qs.QuestionOwnerReputation, 0) AS DisplayOwnerReputation,
+  CASE
+    WHEN qs.QuestionCreationDate IS NULL THEN 'Open'
+    ELSE 'Open'
+  END AS PostStatus,
+  qs.OwnerUserId IS NULL AS IsCommunityOwned,
+  COALESCE(ans.LastAnswerCreationDate, qs.QuestionCreationDate) AS LastRelevantActivityDate
+FROM
+  QuestionStats qs
+LEFT JOIN
+  AnswerStats ans
+  ON qs.QuestionId = ans.QuestionId
+LEFT JOIN
+  UserActivity ua
+  ON qs.OwnerUserId = ua.UserId
+WHERE
+  qs.QuestionScore > 5
+  AND qs.AnswerCount > 0
+  AND COALESCE(ans.TotalAnswerScore, 0) > 10
+  AND qs.QuestionOwnerReputation > 1000
+  AND qs.QuestionOwnerDisplayName NOT LIKE '%Community%'
+  AND ua.UserAgeDays > 30
+  AND qs.Title IS NOT NULL
+  AND qs.Title <> ''
+UNION
+SELECT
+  NULL AS QuestionId,
+  NULL AS Title,
+  NULL AS QuestionCreationDate,
+  NULL AS QuestionScore,
+  NULL AS DirectAnswerCount,
+  NULL AS TotalAnswers,
+  NULL AS TotalAnswerScoreForQuestion,
+  NULL AS AverageAnswerScoreForQuestion,
+  NULL AS FavoriteCount,
+  NULL AS QuestionViewCount,
+  COUNT(c.Id) AS CommentCountOnQuestion,
+  NULL AS InitialTitleEdits,
+  NULL AS TitleEdits,
+  NULL AS TagEdits,
+  NULL AS CloseVotes,
+  NULL AS ProtectedVotes,
+  NULL AS RowNumByCreationDate,
+  NULL AS RankByScoreForUser,
+  NULL AS DenseRankByFavoriteCount,
+  NULL AS QuestionOwnerDisplayName,
+  NULL AS QuestionOwnerReputation,
+  NULL AS UserQuestions,
+  NULL AS UserAnswers,
+  NULL AS TotalUserQuestionViews,
+  NULL AS TotalUserAnswerViews,
+  NULL AS UserBadges,
+  NULL AS UserCreationDate,
+  NULL AS UserAgeDays,
+  NULL AS UserTotalAnswerScore,
+  NULL AS OwnerExperienceLevel,
+  NULL AS TruncatedTitle,
+  NULL AS AcceptedAnswerStatus,
+  'Total Comments' AS DisplayOwnerName,
+  SUM(c.Score) AS DisplayOwnerReputation,
+  NULL AS PostStatus,
+  NULL AS IsCommunityOwned,
+  NULL AS LastRelevantActivityDate
+FROM
+  Comments c
+WHERE
+  c.CreationDate BETWEEN TIMESTAMP '2023-01-01' AND TIMESTAMP '2023-12-31'
+GROUP BY
+  ROLLUP(c.PostId)
+HAVING
+  c.PostId IS NULL
+ORDER BY
+  QuestionScore DESC NULLS LAST,
+  TotalAnswers DESC NULLS LAST;

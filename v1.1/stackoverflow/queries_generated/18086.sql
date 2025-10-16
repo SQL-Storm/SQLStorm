@@ -1,0 +1,99 @@
+-- {"query": "18086.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 995} 
+WITH RankedUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) AS PostCount,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS ReputationRank,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        AVG(p.Score) AS AveragePostScore,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE u.CreationDate >= '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+CommentAnalysis AS (
+    SELECT
+        c.UserId,
+        COUNT(c.Id) AS CommentCount,
+        AVG(c.Score) AS AverageCommentScore,
+        MAX(c.CreationDate) AS LatestCommentDate
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+),
+PostLinkCorrelation AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkType,
+        ROW_NUMBER() OVER (PARTITION BY pl.PostId ORDER BY pl.CreationDate DESC) as rn
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    WHERE pl.CreationDate >= DATE_SUB(NOW(), INTERVAL 1 YEAR)
+),
+FeaturedQuestions AS (
+    SELECT
+        Id,
+        Title,
+        OwnerUserId,
+        FavoriteCount,
+        'Hot' AS QuestionStatus
+    FROM Posts
+    WHERE PostTypeId = 1 AND FavoriteCount > 1000 AND ViewCount > 50000
+    UNION ALL
+    SELECT
+        Id,
+        Title,
+        OwnerUserId,
+        FavoriteCount,
+        'Protected' AS QuestionStatus
+    FROM Posts
+    WHERE PostTypeId = 1 AND EXISTS (SELECT 1 FROM PostHistory ph WHERE ph.PostId = Posts.Id AND ph.PostHistoryTypeId = 19 AND ph.CreationDate >= DATE_SUB(NOW(), INTERVAL 90 DAY))
+),
+UserEngagement AS (
+    SELECT
+        rua.UserId,
+        rua.DisplayName,
+        rua.Reputation,
+        rua.PostCount,
+        rua.AveragePostScore,
+        ca.CommentCount,
+        ca.AverageCommentScore,
+        CASE
+            WHEN rua.TotalUpVotes > rua.TotalDownVotes * 5 THEN 'Highly Valued'
+            WHEN rua.TotalUpVotes > rua.TotalDownVotes THEN 'Generally Positive'
+            ELSE 'Mixed or Negative'
+        END AS VoteSentiment,
+        COALESCE(ca.LatestCommentDate, rua.CreationDate) AS LastActivityDate
+    FROM RankedUserActivity rua
+    LEFT JOIN CommentAnalysis ca ON rua.UserId = ca.UserId
+)
+SELECT
+    fq.Title AS FeaturedQuestionTitle,
+    fq.QuestionStatus,
+    ue.DisplayName AS UserDisplayName,
+    ue.Reputation,
+    ue.PostCount,
+    ue.AveragePostScore,
+    ue.CommentCount,
+    ue.AverageCommentScore,
+    ue.VoteSentiment,
+    pl.RelatedPostId AS LinkedPostId,
+    pl.LinkType,
+    CASE
+        WHEN ue.LastActivityDate > DATE_SUB(NOW(), INTERVAL 30 DAY) THEN 'Active Recent User'
+        WHEN ue.Reputation > 10000 THEN 'Experienced User'
+        ELSE 'Less Active'
+    END AS UserCategory
+FROM FeaturedQuestions fq
+JOIN UserEngagement ue ON fq.OwnerUserId = ue.UserId
+LEFT JOIN PostLinkCorrelation pl ON fq.Id = pl.PostId AND pl.rn = 1
+WHERE ue.Reputation > 500 AND ue.PostCount > 10
+ORDER BY ue.Reputation DESC, fq.FavoriteCount DESC
+LIMIT 100;

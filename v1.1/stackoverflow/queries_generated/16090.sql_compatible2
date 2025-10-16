@@ -1,0 +1,117 @@
+WITH UserActivityMetrics AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COALESCE(AVG(NULLIF(p.Score, 0)), 0) AS AvgNonZeroScore,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation DESC) AS YearlyRepRank,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS PostCountRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= TIMESTAMP '2018-01-01' 
+        AND u.Reputation > 100
+        AND (u.Location IS NULL OR LENGTH(TRIM(u.Location)) > 0)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) > 5
+),
+TopTagEngagement AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagUsageCount,
+        COUNT(DISTINCT p.Id) AS PostsWithTag,
+        AVG(p.Score) AS AvgTagScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.ViewCount) AS MedianViews,
+        STRING_AGG(DISTINCT SUBSTRING(COALESCE(p.Title, 'Untitled'), 1, 20), ' | ') AS SampleTitles
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= TIMESTAMP '2019-01-01'
+        AND p.ClosedDate IS NULL
+    GROUP BY t.TagName, t.Count
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Accepted'
+            WHEN p.AnswerCount > 0 THEN 'Answered'
+            WHEN p.AnswerCount = 0 AND p.CommentCount > 0 THEN 'Commented'
+            ELSE 'Unanswered'
+        END AS PostStatus,
+        (SELECT COUNT(*) 
+         FROM Comments c 
+         WHERE c.PostId = p.Id 
+            AND c.Score > 0) AS PositiveCommentCount,
+        (SELECT COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) -
+                COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0)
+         FROM Votes v
+         WHERE v.PostId = p.Id) AS NetVotes,
+        CASE WHEN p.Body IS NULL THEN 0
+             ELSE (LENGTH(p.Body) - LENGTH(REPLACE(p.Body, '<code>', ''))) / 6
+        END AS CodeBlockCount,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostScore,
+        LEAD(p.CreationDate, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostDate,
+        p.OwnerUserId
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate BETWEEN TIMESTAMP '2020-01-01' AND TIMESTAMP '2023-12-31'
+        AND (p.ViewCount IS NOT NULL AND p.ViewCount > 100)
+)
+SELECT 
+    uam.DisplayName AS UserName,
+    COALESCE(uam.Reputation, 0) AS UserReputation,
+    uam.QuestionCount,
+    uam.AnswerCount,
+    ROUND(uam.AvgNonZeroScore, 2) AS AvgScore,
+    uam.YearlyRepRank,
+    tte.TagName AS TopEngagedTag,
+    tte.AvgTagScore AS TagAvgScore,
+    tte.MedianViews AS TagMedianViews,
+    cpa.PostStatus,
+    COUNT(DISTINCT cpa.PostId) AS PostsInCategory,
+    AVG(cpa.NetVotes) AS AvgNetVotes,
+    MAX(cpa.CodeBlockCount) AS MaxCodeBlocks,
+    SUM(CASE WHEN cpa.PositiveCommentCount > 3 THEN 1 ELSE 0 END) AS HighlyCommentedPosts,
+    PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY cpa.ViewCount) AS ViewCount75Percentile,
+    (SELECT COUNT(DISTINCT b.Id)
+     FROM Badges b
+     WHERE b.UserId = uam.UserId 
+        AND b.Class IN (1, 2)
+        AND b.Date >= uam.UserCreationDate + INTERVAL '30' DAY) AS PremiumBadgesAfter30Days
+FROM UserActivityMetrics uam
+CROSS JOIN TopTagEngagement tte
+LEFT JOIN ComplexPostAnalysis cpa ON cpa.OwnerUserId = uam.UserId
+    AND EXISTS (
+        SELECT 1
+        FROM Posts p2
+        WHERE p2.Id = cpa.PostId
+          AND p2.Tags LIKE '%' || '<' || tte.TagName || '>' || '%'
+    )
+WHERE uam.PostCountRank <= 500
+    AND tte.TagUsageCount > 1000
+    AND (cpa.PostId IS NOT NULL OR uam.QuestionCount = 0)
+    AND NOT EXISTS (
+        SELECT 1 
+        FROM Votes v 
+        WHERE v.UserId = uam.UserId 
+            AND v.VoteTypeId = 4 
+            AND v.CreationDate >= TIMESTAMP '2020-01-01'
+    )
+GROUP BY 
+    uam.DisplayName, uam.Reputation, uam.QuestionCount, uam.AnswerCount,
+    uam.AvgNonZeroScore, uam.YearlyRepRank, uam.UserId, uam.UserCreationDate,
+    tte.TagName, tte.AvgTagScore, tte.MedianViews, cpa.PostStatus
+HAVING COUNT(DISTINCT cpa.PostId) > 0 OR SUM(uam.QuestionCount) > 0
+ORDER BY 
+    UserReputation DESC, 
+    AvgNetVotes DESC,
+    PostsInCategory DESC
+LIMIT 1000;

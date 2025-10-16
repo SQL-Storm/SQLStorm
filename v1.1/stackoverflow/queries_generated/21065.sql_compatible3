@@ -1,0 +1,131 @@
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(v.BountyAmount) AS AvgBountyGiven
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year'
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId = 8 AND v.BountyAmount > 0
+    GROUP BY u.Id, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) > 5 OR u.Reputation > 1000
+),
+HighImpactPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CreationDate,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY pt.Name ORDER BY p.ViewCount DESC, p.Score DESC) AS ViewRank,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostScore,
+        LEAD(p.Title) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostTitle,
+        NTILE(4) OVER (ORDER BY p.ViewCount DESC) AS PopularityQuartile
+    FROM Posts p
+    INNER JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE ((p.PostTypeId = 1 AND p.AnswerCount > 0) OR (p.PostTypeId = 2 AND p.Score > 5))
+        AND (p.ClosedDate IS NULL OR p.ClosedDate > p.CreationDate + INTERVAL '30 days')
+        AND LENGTH(COALESCE(p.Title, '')) > 10
+        AND p.Tags IS NOT NULL AND p.Tags <> '<>'
+),
+RecentActivity AS (
+    SELECT 
+        ph.PostId,
+        ph.CreationDate AS HistoryDate,
+        ph.UserId AS EditorId,
+        COUNT(*) AS EditCount,
+        STRING_AGG(
+            COALESCE(ph.Comment, 
+                CASE 
+                    WHEN ph.PostHistoryTypeId IN (4,7) THEN 'Title edit: ' || SUBSTRING(ph.Text FROM 1 FOR 50)
+                    WHEN ph.PostHistoryTypeId IN (5,8) THEN 'Body edit: ' || SUBSTRING(ph.Text FROM 1 FOR 50)
+                    ELSE 'Other change'
+                END
+            ), '; '
+        ) AS EditSummary
+    FROM PostHistory ph
+    WHERE ph.CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months'
+        AND ph.PostHistoryTypeId IN (4,5,6,10,11)
+        AND ph.Text IS NOT NULL
+        AND (ph.UserId IS NOT NULL OR ph.UserDisplayName IS NOT NULL)
+    GROUP BY ph.PostId, ph.CreationDate, ph.UserId
+)
+SELECT 
+    au.UserId,
+    au.Reputation,
+    au.TotalPosts,
+    au.QuestionCount,
+    au.AnswerCount,
+    hip.PostId,
+    hip.Title,
+    hip.Score AS PostScore,
+    hip.ViewCount,
+    hip.ViewRank,
+    hip.PopularityQuartile,
+    ra.EditCount,
+    ra.EditSummary,
+    CASE 
+        WHEN hip.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN hip.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        WHEN au.Reputation > 5000 AND hip.Score > 100 THEN 'Elite'
+        ELSE 'Standard'
+    END AS PostStatus,
+    COALESCE(hip.AnswerCount, 0) * au.Reputation AS ImpactScore,
+    (CASE WHEN hip.Score = 0 THEN NULL ELSE hip.ViewCount::numeric / hip.Score END) AS ViewPerScoreRatio,
+    UPPER(SUBSTRING(hip.Tags FROM 2 FOR 20)) AS FirstFewTags,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = au.UserId AND b.Date > au.CreationDate 
+     AND b.Class = 1 AND b.TagBased = TRUE) AS GoldTagBadges,
+    (SELECT STRING_AGG(DISTINCT lt.Name, ', ') 
+     FROM PostLinks pl 
+     INNER JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id 
+     WHERE pl.PostId = hip.PostId AND pl.CreationDate > hip.CreationDate - INTERVAL '1 month') AS RecentLinkTypes
+FROM ActiveUsers au
+INNER JOIN HighImpactPosts hip ON au.UserId = hip.OwnerUserId
+LEFT JOIN RecentActivity ra ON hip.PostId = ra.PostId
+LEFT JOIN Posts p2 ON hip.PostId = p2.Id
+WHERE au.CreationDate < TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year'
+    AND (hip.PopularityQuartile <= 2 OR hip.ViewRank <= 10)
+    AND (ra.EditCount > 1 OR ra.EditCount IS NULL)
+    AND NOT EXISTS (
+        SELECT 1 FROM Votes v 
+        WHERE v.PostId = hip.PostId 
+        AND v.VoteTypeId = 3
+        AND v.CreationDate > hip.CreationDate
+        GROUP BY v.PostId 
+        HAVING COUNT(*) > 5
+    )
+UNION ALL
+SELECT 
+    CAST(NULL AS INTEGER) AS UserId,
+    0 AS Reputation,
+    0 AS TotalPosts,
+    0 AS QuestionCount,
+    0 AS AnswerCount,
+    CAST(NULL AS INTEGER) AS PostId,
+    'Summary Stats' AS Title,
+    SUM(hip.Score) AS PostScore,
+    SUM(hip.ViewCount) AS ViewCount,
+    COUNT(hip.PostId) AS ViewRank,
+    CAST(NULL AS INTEGER) AS PopularityQuartile,
+    SUM(ra.EditCount) AS EditCount,
+    CAST(NULL AS TEXT) AS EditSummary,
+    'Aggregate' AS PostStatus,
+    AVG(COALESCE(hip.AnswerCount, 0)) * AVG(au.Reputation) AS ImpactScore,
+    AVG( CASE WHEN hip.Score = 0 THEN NULL ELSE CAST(hip.ViewCount AS DOUBLE PRECISION) / hip.Score END ) AS ViewPerScoreRatio,
+    CAST(NULL AS TEXT) AS FirstFewTags,
+    COUNT(DISTINCT au.UserId) AS GoldTagBadges,
+    CAST(NULL AS TEXT) AS RecentLinkTypes
+FROM ActiveUsers au
+INNER JOIN HighImpactPosts hip ON au.UserId = hip.OwnerUserId
+LEFT JOIN RecentActivity ra ON hip.PostId = ra.PostId
+GROUP BY 1
+ORDER BY ImpactScore DESC NULLS LAST, ViewCount DESC NULLS LAST
+LIMIT 1000;

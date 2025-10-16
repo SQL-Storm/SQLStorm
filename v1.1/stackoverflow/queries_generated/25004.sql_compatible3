@@ -1,0 +1,108 @@
+WITH UserPostStats AS (
+    SELECT 
+        u.Id                                 AS UserId,
+        u.DisplayName,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS QuestionScoreSum,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS AnswerScoreSum,
+        MAX(p.CreationDate)                  AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+BadgeAgg AS (
+    SELECT 
+        b.UserId,
+        COUNT(*)                                   AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        STRING_AGG(DISTINCT b.Name, ',')           AS BadgeList
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TopVotes AS (
+    SELECT 
+        v.PostId,
+        ROW_NUMBER() OVER (PARTITION BY v.PostId ORDER BY v.CreationDate DESC) AS rn,
+        v.VoteTypeId,
+        v.UserId                                   AS VoterId,
+        v.CreationDate
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2,3)
+),
+PostTagInfo AS (
+    SELECT 
+        p.Id                                      AS PostId,
+        COALESCE(STRING_AGG(t.TagName, '><'), '') AS TagConcat
+    FROM Posts p
+    LEFT JOIN Tags t ON t.TagName IS NOT NULL AND POSITION(t.TagName IN COALESCE(p.Tags, '')) > 0
+    GROUP BY p.Id
+),
+UserTopVotes AS (
+    -- avoid non-inner join on subquery by precomputing posts per user and joining
+    SELECT DISTINCT up.UserId, tv.PostId, tv.VoteTypeId, tv.VoterId, tv.CreationDate
+    FROM (
+        SELECT p.Id, p.OwnerUserId
+        FROM Posts p
+    ) up
+    JOIN TopVotes tv ON tv.PostId = up.Id AND tv.rn = 1
+)
+SELECT
+    ups.UserId,
+    ups.DisplayName,
+    ups.QuestionCount,
+    ups.AnswerCount,
+    ups.QuestionScoreSum,
+    ups.AnswerScoreSum,
+    COALESCE(b.TotalBadges,0)          AS TotalBadges,
+    COALESCE(b.GoldBadges,0)           AS GoldBadges,
+    b.BadgeList,
+    utv.PostId,
+    utv.VoteTypeId,
+    utv.VoterId,
+    utv.CreationDate                    AS VoteDate,
+    pti.TagConcat,
+    CASE
+        WHEN ups.LastPostDate IS NULL THEN NULL
+        ELSE DATE_PART('day', TIMESTAMP '2024-10-01 12:34:56' - ups.LastPostDate)
+    END                                 AS DaysSinceLastPost,
+    CASE
+        WHEN ups.QuestionCount = 0 THEN NULL
+        ELSE ROUND(CAST(ups.QuestionScoreSum AS DECIMAL) / ups.QuestionCount,2)
+    END                                 AS AvgQuestionScore,
+    CASE
+        WHEN ups.AnswerCount = 0 THEN NULL
+        ELSE ROUND(CAST(ups.AnswerScoreSum AS DECIMAL) / ups.AnswerCount,2)
+    END                                 AS AvgAnswerScore
+FROM UserPostStats ups
+LEFT JOIN BadgeAgg b      ON b.UserId = ups.UserId
+LEFT JOIN UserTopVotes utv ON utv.UserId = ups.UserId
+LEFT JOIN PostTagInfo pti ON pti.PostId = utv.PostId
+WHERE (ups.QuestionCount > 10 OR ups.AnswerCount > 20)
+  AND (b.TotalBadges IS NULL OR b.TotalBadges < 5)
+  AND COALESCE(pti.TagConcat,'') <> ''
+
+UNION ALL
+
+SELECT
+    u.Id,
+    u.DisplayName,
+    0 AS QuestionCount,
+    0 AS AnswerCount,
+    0 AS QuestionScoreSum,
+    0 AS AnswerScoreSum,
+    0 AS TotalBadges,
+    0 AS GoldBadges,
+    NULL AS BadgeList,
+    NULL AS PostId,
+    NULL AS VoteTypeId,
+    NULL AS VoterId,
+    NULL AS VoteDate,
+    ''   AS TagConcat,
+    NULL AS DaysSinceLastPost,
+    NULL AS AvgQuestionScore,
+    NULL AS AvgAnswerScore
+FROM Users u
+WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+ORDER BY AvgAnswerScore DESC
+LIMIT 100;

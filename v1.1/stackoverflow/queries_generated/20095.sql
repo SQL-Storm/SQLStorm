@@ -1,0 +1,144 @@
+-- {"query": "20095.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1552} 
+
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        EXTRACT(EPOCH FROM (NOW() - u.CreationDate)) / 86400.0 AS AccountAgeDays,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount AS PostCommentCount,
+        p.FavoriteCount,
+        p.CreationDate AS PostCreationDate,
+        p.OwnerUserId
+    FROM
+        Users u
+    JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    WHERE
+        u.Reputation > 1500 AND p.CommunityOwnedDate IS NULL AND p.ClosedDate IS NULL
+),
+UserContributionStats AS (
+    SELECT
+        UserId,
+        DisplayName,
+        Reputation,
+        AccountAgeDays,
+        COUNT(*) AS TotalPosts,
+        SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COALESCE(AVG(CASE WHEN PostTypeId = 1 THEN PostScore END), 0) AS AvgQuestionScore,
+        COALESCE(AVG(CASE WHEN PostTypeId = 2 THEN PostScore END), 0) AS AvgAnswerScore,
+        SUM(ViewCount) AS TotalViewCount,
+        SUM(FavoriteCount) AS TotalFavoriteCount,
+        (
+            SELECT COUNT(*)
+            FROM Comments c
+            WHERE c.UserId = ua.UserId
+        ) AS TotalCommentsMade,
+        (
+            SELECT COUNT(*)
+            FROM Votes v
+            WHERE v.UserId = ua.UserId AND v.VoteTypeId = 2
+        ) AS TotalUpVotesGiven,
+        (
+            SELECT COUNT(*)
+            FROM PostHistory ph
+            WHERE ph.UserId = ua.UserId AND ph.PostHistoryTypeId IN (4, 5, 6)
+        ) AS TotalEditsMade
+    FROM
+        UserActivity ua
+    GROUP BY
+        UserId, DisplayName, Reputation, AccountAgeDays
+),
+RankedBadges AS (
+    SELECT
+        UserId,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(CASE WHEN Name = 'Strunk & White' THEN Date END) AS StrunkAndWhiteDate,
+        MAX(CASE WHEN Name = 'Copy Editor' THEN Date END) AS CopyEditorDate
+    FROM
+        Badges
+    GROUP BY
+        UserId
+),
+FinalScore AS (
+    SELECT
+        ucs.UserId,
+        ucs.DisplayName,
+        ucs.Reputation,
+        ucs.AccountAgeDays,
+        ucs.TotalPosts,
+        ucs.TotalQuestions,
+        ucs.TotalAnswers,
+        ucs.AvgQuestionScore,
+        ucs.AvgAnswerScore,
+        ucs.TotalViewCount,
+        ucs.TotalFavoriteCount,
+        ucs.TotalCommentsMade,
+        ucs.TotalUpVotesGiven,
+        ucs.TotalEditsMade,
+        COALESCE(rb.GoldBadges, 0) AS GoldBadges,
+        COALESCE(rb.SilverBadges, 0) AS SilverBadges,
+        COALESCE(rb.BronzeBadges, 0) AS BronzeBadges,
+        -- Complex weighted contribution score calculation
+        (
+            (LN(GREATEST(1, ucs.Reputation)) * 0.2) +
+            (ucs.AvgAnswerScore * (ucs.TotalAnswers / GREATEST(ucs.TotalPosts, 1.0)) * 0.3) +
+            (LN(GREATEST(1, ucs.TotalEditsMade)) * 0.15) +
+            (LN(GREATEST(1, ucs.TotalCommentsMade)) * 0.05) +
+            (COALESCE(rb.GoldBadges, 0) * 0.15) +
+            (COALESCE(rb.SilverBadges, 0) * 0.1) -
+            (ucs.AvgQuestionScore * (ucs.TotalQuestions / GREATEST(ucs.TotalPosts, 1.0)) * 0.05)
+        ) / LN(GREATEST(2, ucs.AccountAgeDays)) AS EngagementScore
+    FROM
+        UserContributionStats ucs
+    LEFT JOIN
+        RankedBadges rb ON ucs.UserId = rb.UserId
+)
+SELECT
+    u.DisplayName || ' (' || u.Id || ')' AS UserIdentifier,
+    f.Reputation,
+    f.TotalPosts,
+    f.TotalAnswers,
+    f.TotalEditsMade,
+    f.GoldBadges,
+    f.EngagementScore,
+    DENSE_RANK() OVER (ORDER BY f.EngagementScore DESC) AS UserRank,
+    NTILE(100) OVER (ORDER BY f.EngagementScore DESC) AS UserPercentile,
+    LAG(f.EngagementScore, 1, 0) OVER (ORDER BY f.EngagementScore DESC) - f.EngagementScore AS ScoreDiffToPrev,
+    SUM(f.EngagementScore) OVER (ORDER BY f.EngagementScore DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeScore,
+    CASE
+        WHEN u.AboutMe IS NOT NULL AND LENGTH(u.AboutMe) > 20 THEN SUBSTRING(LOWER(u.AboutMe) FROM '(sql|python|java|c#|javascript)')
+        ELSE 'N/A'
+    END AS TechKeyword,
+    (
+        SELECT string_agg(T.TagName, ', ')
+        FROM (
+            SELECT DISTINCT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName
+            FROM Posts p
+            WHERE p.OwnerUserId = f.UserId AND p.PostTypeId = 1 AND p.Tags IS NOT NULL
+            LIMIT 5
+        ) T
+    ) AS SampleTags
+FROM
+    FinalScore f
+JOIN
+    Users u ON f.UserId = u.Id
+WHERE
+    f.EngagementScore > (SELECT AVG(EngagementScore) FROM FinalScore)
+    AND (
+        (f.GoldBadges > 0 AND f.TotalAnswers > 50) OR
+        (f.TotalEditsMade > 1000 AND f.Reputation > 20000)
+    )
+ORDER BY
+    UserRank ASC, f.Reputation DESC
+LIMIT 100;
+

@@ -1,0 +1,163 @@
+-- {"query": "17041.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 98070, "output_tokens": 96337} 
+
+WITH UserActivityMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        AVG(CASE WHEN p.Score IS NOT NULL THEN p.Score ELSE 0 END) as AvgPostScore,
+        SUM(COALESCE(p.ViewCount, 0)) as TotalViews,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) as MedianScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), ', ') FILTER (WHERE p.Tags IS NOT NULL) as UniqueTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= CURRENT_DATE - INTERVAL '2 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+BadgePatterns AS (
+    SELECT 
+        UserId,
+        COUNT(*) FILTER (WHERE Class = 1) as GoldBadges,
+        COUNT(*) FILTER (WHERE Class = 2) as SilverBadges,
+        COUNT(*) FILTER (WHERE Class = 3) as BronzeBadges,
+        ARRAY_AGG(DISTINCT Name ORDER BY Date DESC) FILTER (WHERE TagBased = '1') as TagBadges,
+        LAG(Date) OVER (PARTITION BY UserId ORDER BY Date) as PrevBadgeDate,
+        EXTRACT(EPOCH FROM (Date - LAG(Date) OVER (PARTITION BY UserId ORDER BY Date)))/86400 as DaysSincePrevBadge
+    FROM Badges
+    GROUP BY UserId, Date
+),
+QuestionQuality AS (
+    SELECT 
+        q.Id as QuestionId,
+        q.OwnerUserId,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        CASE 
+            WHEN q.AcceptedAnswerId IS NOT NULL THEN 1 
+            ELSE 0 
+        END as HasAcceptedAnswer,
+        CASE 
+            WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN q.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned'
+            WHEN q.Score >= 10 AND q.AnswerCount >= 3 THEN 'HighQuality'
+            WHEN q.Score < 0 THEN 'LowQuality'
+            ELSE 'Standard'
+        END as QuestionStatus,
+        (SELECT COUNT(*) 
+         FROM Comments c 
+         WHERE c.PostId = q.Id 
+           AND c.Score > 5) as HighScoreComments,
+        ROW_NUMBER() OVER (PARTITION BY q.OwnerUserId ORDER BY q.Score DESC NULLS LAST) as UserQuestionRank,
+        FIRST_VALUE(q.Title) OVER (PARTITION BY q.OwnerUserId ORDER BY q.ViewCount DESC NULLS LAST) as MostViewedTitle
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+      AND q.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+),
+EditPatterns AS (
+    SELECT 
+        ph.PostId,
+        ph.UserId as EditorId,
+        COUNT(*) as EditCount,
+        COUNT(DISTINCT ph.PostHistoryTypeId) as UniqueEditTypes,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (7,8,9) THEN 1 ELSE 0 END) as HasRollback,
+        SUM(CASE WHEN ph.Text LIKE '%improve%' OR ph.Text LIKE '%fix%' OR ph.Text LIKE '%typo%' THEN 1 ELSE 0 END) as QualityEdits,
+        DENSE_RANK() OVER (ORDER BY COUNT(*) DESC) as EditorRank
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6,7,8,9,24)
+      AND ph.UserId IS NOT NULL
+    GROUP BY ph.PostId, ph.UserId
+),
+VoteCorrelations AS (
+    SELECT 
+        v.PostId,
+        p.OwnerUserId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) as UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) as DownVotes,
+        COUNT(DISTINCT v.UserId) as UniqueVoters,
+        CORR(
+            CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END,
+            EXTRACT(EPOCH FROM v.CreationDate - p.CreationDate)
+        ) as VoteTimeCorrelation
+    FROM Votes v
+    INNER JOIN Posts p ON v.PostId = p.Id
+    WHERE v.VoteTypeId IN (2,3)
+      AND v.UserId IS NOT NULL
+    GROUP BY v.PostId, p.OwnerUserId
+)
+SELECT 
+    uam.DisplayName,
+    COALESCE(uam.Reputation, 0) as Reputation,
+    COALESCE(uam.PostCount, 0) as TotalPosts,
+    ROUND(COALESCE(uam.AvgPostScore, 0)::numeric, 2) as AvgScore,
+    COALESCE(bp.GoldBadges, 0) + COALESCE(bp.SilverBadges, 0) * 0.5 + COALESCE(bp.BronzeBadges, 0) * 0.1 as BadgeScore,
+    CASE 
+        WHEN uam.UniqueTags LIKE '%python%' OR uam.UniqueTags LIKE '%javascript%' THEN 'Programming'
+        WHEN uam.UniqueTags LIKE '%sql%' OR uam.UniqueTags LIKE '%database%' THEN 'Database'
+        WHEN uam.UniqueTags IS NULL THEN 'Untagged'
+        ELSE 'Other'
+    END as PrimaryDomain,
+    COUNT(DISTINCT qq.QuestionId) FILTER (WHERE qq.QuestionStatus = 'HighQuality') as HighQualityQuestions,
+    MAX(qq.MostViewedTitle) as MostPopularQuestion,
+    SUM(COALESCE(vc.UpVotes, 0) - COALESCE(vc.DownVotes, 0)) as NetVotes,
+    AVG(COALESCE(ep.EditCount, 0))::numeric(10,2) as AvgEditsPerPost,
+    PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY COALESCE(qq.AnswerCount, 0)) as Q3AnswerCount,
+    CASE 
+        WHEN uam.Reputation > 10000 AND bp.GoldBadges > 0 THEN 'Expert'
+        WHEN uam.Reputation > 1000 THEN 'Experienced'
+        WHEN uam.Reputation > 100 THEN 'Regular'
+        ELSE 'Beginner'
+    END as UserTier,
+    COALESCE(
+        (SELECT STRING_AGG(DISTINCT t.TagName, ', ' ORDER BY t.TagName)
+         FROM Tags t
+         WHERE EXISTS (
+             SELECT 1 
+             FROM Posts p2 
+             WHERE p2.OwnerUserId = uam.Id 
+               AND p2.Tags LIKE '%<' || t.TagName || '>%'
+         )
+         AND t.Count > 1000
+         LIMIT 5),
+        'No Popular Tags'
+    ) as PopularTagsUsed,
+    RANK() OVER (ORDER BY uam.Reputation * LOG(GREATEST(uam.PostCount, 1)) DESC) as InfluenceRank
+FROM UserActivityMetrics uam
+LEFT JOIN LATERAL (
+    SELECT 
+        SUM(GoldBadges) as GoldBadges,
+        SUM(SilverBadges) as SilverBadges,
+        SUM(BronzeBadges) as BronzeBadges
+    FROM BadgePatterns
+    WHERE UserId = uam.Id
+) bp ON true
+LEFT JOIN QuestionQuality qq ON qq.OwnerUserId = uam.Id AND qq.UserQuestionRank <= 10
+LEFT JOIN VoteCorrelations vc ON vc.OwnerUserId = uam.Id
+LEFT JOIN EditPatterns ep ON ep.EditorId = uam.Id
+WHERE uam.PostCount > 0
+  AND (uam.Reputation > 500 OR bp.GoldBadges > 0 OR uam.AnswerCount > 10)
+  AND NOT EXISTS (
+      SELECT 1
+      FROM PostHistory ph2
+      WHERE ph2.UserId = uam.Id
+        AND ph2.PostHistoryTypeId = 12
+        AND ph2.CreationDate >= CURRENT_DATE - INTERVAL '6 months'
+  )
+GROUP BY 
+    uam.Id,
+    uam.DisplayName,
+    uam.Reputation,
+    uam.PostCount,
+    uam.AvgPostScore,
+    uam.UniqueTags,
+    uam.AnswerCount,
+    bp.GoldBadges,
+    bp.SilverBadges,
+    bp.BronzeBadges
+HAVING COUNT(DISTINCT qq.QuestionId) > 0 OR SUM(COALESCE(vc.UpVotes, 0)) > 50
+ORDER BY InfluenceRank, NetVotes DESC NULLS LAST
+LIMIT 100;

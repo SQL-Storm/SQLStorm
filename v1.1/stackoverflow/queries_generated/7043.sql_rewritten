@@ -1,0 +1,217 @@
+-- {"query": "7043.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2427} 
+with
+-- active users: those with recent activity and a minimal reputation
+RecentUsers as (
+  select u.Id, u.DisplayName,
+         u.Reputation,
+         u.CreationDate,
+         u.LastAccessDate,
+         row_number() over (order by u.Reputation desc, u.LastAccessDate desc) as rn
+  from Users u
+  where u.LastAccessDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+    and u.Reputation >= 50
+),
+-- questions with lots of activity and varied tag sets (tags stored like '<tag1><tag2>')
+QuestionStats as (
+  select p.Id,
+         p.OwnerUserId,
+         p.Title,
+         p.CreationDate,
+         coalesce(p.ViewCount,0) as ViewCount,
+         coalesce(p.Score,0) as Score,
+         coalesce(p.AnswerCount,0) as AnswerCount,
+         coalesce(p.FavoriteCount,0) as FavoriteCount,
+         -- normalized tag list
+         regexp_split_to_table(substring(coalesce(p.Tags,''),2, greatest(length(coalesce(p.Tags,''))-2,0)), '><') as Tag
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+-- pivot-like aggregation of top tags per question
+QuestionTagAgg as (
+  select qs.Id,
+         qs.OwnerUserId,
+         qs.Title,
+         qs.CreationDate,
+         qs.ViewCount,
+         qs.Score,
+         qs.AnswerCount,
+         qs.FavoriteCount,
+         string_agg(distinct qs.Tag, ',' order by qs.Tag) as TagsCsv,
+         count(distinct qs.Tag) as TagCount,
+         max(length(qs.Tag)) as MaxTagLen,
+         min(length(qs.Tag)) as MinTagLen
+  from QuestionStats qs
+  group by qs.Id, qs.OwnerUserId, qs.Title, qs.CreationDate, qs.ViewCount, qs.Score, qs.AnswerCount, qs.FavoriteCount
+),
+-- answers enriched with parent question info (outer join to include orphan answers)
+AnswerEnriched as (
+  select a.Id as AnswerId,
+         a.ParentId as QuestionId,
+         a.OwnerUserId as AnswerOwner,
+         a.CreationDate as AnswerDate,
+         a.Score as AnswerScore,
+         q.Title as QuestionTitle,
+         q.ViewCount as QuestionViews,
+         q.Score as QuestionScore,
+         q.AnswerCount as QuestionAnswerCount
+  from Posts a
+  left join Posts q on a.ParentId = q.Id and q.PostTypeId = 1
+  where a.PostTypeId = 2
+    and a.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+-- compute per-question metrics using window functions and correlated subqueries
+QuestionMetrics as (
+  select qta.*,
+         -- number of answers from AnswerEnriched (could be stale relative to Posts.AnswerCount)
+         coalesce(aq.AnswersCount, 0) as ComputedAnswerCount,
+         -- average answer score for the question (from AnswerEnriched)
+         aq.AvgAnswerScore,
+         -- rank questions by activity density: weighted sum of views, score and answers
+         rank() over (order by (qta.ViewCount * 0.001 + qta.Score * 2 + coalesce(aq.AvgAnswerScore,0) * 1.5 + qta.FavoriteCount * 3) desc) as ActivityRank,
+         -- a computed complexity value mixing tag count and tag lengths
+         (qta.TagCount * 1.2 + qta.MaxTagLen * 0.1 - qta.MinTagLen * 0.05) as ComplexityScore,
+         -- correlated subquery: last three distinct editors for the question from PostHistory
+         (
+           select string_agg(distinct ph.UserDisplayName, ' | ' order by ph.CreationDate desc)
+           from (
+             select ph2.UserDisplayName, ph2.CreationDate
+             from PostHistory ph2
+             where ph2.PostId = qta.Id
+               and ph2.UserDisplayName is not null
+             order by ph2.CreationDate desc
+             limit 3
+           ) ph
+         ) as RecentEditors
+  from QuestionTagAgg qta
+  left join (
+    select ae.QuestionId,
+           count(*) as AnswersCount,
+           avg(coalesce(ae.AnswerScore,0)) as AvgAnswerScore
+    from AnswerEnriched ae
+    group by ae.QuestionId
+  ) aq on aq.QuestionId = qta.Id
+),
+-- heavy join between votes and posts to simulate I/O and complex predicates
+VoteActivity as (
+  select v.PostId,
+         v.VoteTypeId,
+         vt.Name as VoteTypeName,
+         count(*) over (partition by v.PostId, v.VoteTypeId) as VotesForType,
+         min(v.CreationDate) over (partition by v.PostId) as FirstVoteDate,
+         max(v.CreationDate) over (partition by v.PostId) as LastVoteDate,
+         avg(coalesce(v.BountyAmount,0)) over (partition by v.PostId) as AvgBountyForPost
+  from Votes v
+  left join VoteTypes vt on vt.Id = v.VoteTypeId
+  where v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+),
+-- ranking users by a composite engagement metric (badges, posts, votes)
+UserEngagement as (
+  select ru.Id as UserId,
+         ru.DisplayName,
+         ru.Reputation,
+         coalesce(bc.BadgeCount,0) as BadgeCount,
+         coalesce(pc.PostCount,0) as PostCount,
+         coalesce(vu.VoteCount,0) as VoteCount,
+         -- engagement formula (non-linear)
+         (ru.Reputation * 0.01 + coalesce(bc.BadgeCount,0) * 2 + coalesce(pc.PostCount,0) * 1.5 + coalesce(vu.VoteCount,0) * 0.5) as EngagementScore,
+         dense_rank() over (order by (ru.Reputation * 0.01 + coalesce(bc.BadgeCount,0) * 2 + coalesce(pc.PostCount,0) * 1.5 + coalesce(vu.VoteCount,0) * 0.5) desc) as EngagementRank
+  from RecentUsers ru
+  left join (
+    select UserId, count(*) as BadgeCount
+    from Badges
+    where Date >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by UserId
+  ) bc on bc.UserId = ru.Id
+  left join (
+    select OwnerUserId, count(*) as PostCount
+    from Posts
+    where CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by OwnerUserId
+  ) pc on pc.OwnerUserId = ru.Id
+  left join (
+    select v.UserId, count(*) as VoteCount
+    from Votes v
+    where v.UserId is not null
+      and v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+    group by v.UserId
+  ) vu on vu.UserId = ru.Id
+),
+-- cross-compact set: find question ids that are both tagged with top tags and have duplicate links
+TopTagQuestions as (
+  select q.Id, q.TagsCsv, q.TagCount, qm.ActivityRank
+  from QuestionMetrics qm
+  join QuestionTagAgg q on q.Id = qm.Id
+  where qm.ActivityRank <= 5000
+    and q.TagsCsv ~* '(postgres|sql|performance|query|index)'  -- regex to match some heavy tags
+),
+Duplicates as (
+  select pl.PostId as DupeSrc, pl.RelatedPostId as DupeTarget, pl.LinkTypeId
+  from PostLinks pl
+  where pl.LinkTypeId = 3 -- duplicates
+    and pl.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '10 years'
+),
+-- final selection combining many constructs
+FinalSet as (
+  select q.Id as QuestionId,
+         left(q.Title, 200) as ShortTitle,
+         q.TagsCsv,
+         q.TagCount,
+         qm.ComputedAnswerCount,
+         coalesce(va.VotesForType,0) filter (where va.VoteTypeId = 2) as UpVotesCount,
+         coalesce(va.VotesForType,0) filter (where va.VoteTypeId = 3) as DownVotesCount,
+         coalesce(va.AvgBountyForPost,0) as AvgBounty,
+         ue.DisplayName as TopOwner,
+         ue.EngagementScore as OwnerEngagement,
+         qm.ActivityRank,
+         qm.ComplexityScore,
+         qm.RecentEditors,
+         case when d.DupeSrc is not null then true else false end as HasDuplicateLink,
+         -- weird calculated field mixing string ops and null logic
+         concat(
+           coalesce(nullif(left(qm.RecentEditors,50),''),'[no editors]'),
+           ' :: ',
+           replace(coalesce(q.TagsCsv,''),',', ' > ')
+         ) as Synopsis
+  from QuestionTagAgg q
+  join QuestionMetrics qm on qm.Id = q.Id
+  left join VoteActivity va on va.PostId = q.Id
+  left join Posts p on p.Id = q.Id
+  left join Users u on u.Id = q.OwnerUserId
+  left join UserEngagement ue on ue.UserId = q.OwnerUserId
+  left join Duplicates d on d.DupeTarget = q.Id or d.DupeSrc = q.Id
+  where q.TagCount between 1 and 8
+    and (qm.ActivityRank <= 10000 or qm.ComputedAnswerCount >= 5)
+)
+select distinct
+       f.QuestionId,
+       f.ShortTitle,
+       f.TagsCsv,
+       f.TagCount,
+       f.ComputedAnswerCount,
+       greatest(coalesce(f.UpVotesCount,0) - coalesce(f.DownVotesCount,0), 0) as NetVotes,
+       f.AvgBounty,
+       coalesce(f.OwnerEngagement,0) as OwnerEngagementScore,
+       f.ActivityRank,
+       f.ComplexityScore,
+       f.RecentEditors,
+       f.HasDuplicateLink,
+       f.Synopsis,
+       -- top correlated answer stats: best answer score and time-to-first-answer via correlated subqueries
+       (select max(a.Score) from Posts a where a.ParentId = f.QuestionId and a.PostTypeId = 2) as BestAnswerScore,
+       (select min(a.CreationDate - q.CreationDate) from Posts a join Posts q on q.Id = f.QuestionId where a.ParentId = f.QuestionId and a.PostTypeId = 2) as TimeToFirstAnswerInterval,
+       -- combine with set operator: include also some recent unanswered but high-view questions (union)
+       coalesce((
+         select json_agg(x) from (
+           select p2.Id, left(p2.Title,120) as TitleSnippet, p2.ViewCount
+           from Posts p2
+           where p2.PostTypeId = 1
+             and p2.AnswerCount = 0
+             and p2.ViewCount > 10000
+           order by p2.ViewCount desc
+           limit 3
+         ) x
+       ), '[]'::json) as HotUnansweredSamples
+from FinalSet f
+order by f.ActivityRank, f.ComplexityScore desc
+limit 250;

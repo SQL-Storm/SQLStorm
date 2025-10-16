@@ -1,0 +1,181 @@
+WITH cte AS (
+    SELECT 
+        p.Id, 
+        p.Title, 
+        p.Body, 
+        p.CreationDate, 
+        p.LastActivityDate, 
+        p.OwnerUserId, 
+        p.AnswerCount, 
+        p.CommentCount, 
+        p.FavoriteCount, 
+        p.ViewCount, 
+        p.Score, 
+        p.Tags, 
+        p.ContentLicense,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            ELSE 'Open'
+        END AS PostStatus,
+        DENSE_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS UserScoreRank,
+        DENSE_RANK() OVER (
+            PARTITION BY
+                CASE
+                    WHEN POSITION('><' IN p.Tags) > 0 THEN SUBSTRING(p.Tags FROM 1 FOR POSITION('><' IN p.Tags) - 1)
+                    ELSE p.Tags
+                END
+            ORDER BY p.Score DESC
+        ) AS TagScoreRank
+    FROM Posts p
+),
+post_history AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS HistoryDate,
+        ph.UserId,
+        ph.UserDisplayName,
+        ph.Comment,
+        ph.Text,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20, 35) THEN
+                (
+                    CASE
+                        -- If ph.Text appears to be JSON, try to extract VoteUsers; otherwise NULL
+                        WHEN ph.Text IS NOT NULL AND trim(ph.Text) <> '' 
+                             AND (trim(ph.Text) LIKE '{%' OR trim(ph.Text) LIKE '[%') THEN
+                            -- use JSON functions in a generic way: try JSON extraction; dialects may differ but this is standard JSON ->> style
+                            (CAST(ph.Text AS json) ->> 'VoteUsers')
+                        ELSE NULL
+                    END
+                )
+            WHEN ph.PostHistoryTypeId = 17 THEN
+                (
+                    CASE
+                        WHEN ph.Text IS NOT NULL AND trim(ph.Text) <> '' AND (trim(ph.Text) LIKE '{%' OR trim(ph.Text) LIKE '[%') THEN
+                            -- extract FromUrl if present; returns NULL if key missing
+                            (CAST(ph.Text AS json) ->> 'FromUrl')
+                        ELSE NULL
+                    END
+                )
+            WHEN ph.PostHistoryTypeId IN (33, 34) THEN
+                (CASE WHEN ph.Text IS NOT NULL AND trim(ph.Text) <> '' AND (trim(ph.Text) LIKE '{%' OR trim(ph.Text) LIKE '[%') THEN CAST(ph.Text AS json) ->> 'PostNoticeId' ELSE NULL END)
+            ELSE ph.Text
+        END AS TextValue
+    FROM PostHistory ph
+),
+post_links AS (
+    SELECT 
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkType
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+),
+badges AS (
+    SELECT
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Class AS BadgeClass,
+        b.TagBased AS IsTagBadge,
+        b.Date AS BadgeDate
+    FROM Badges b
+),
+votes AS (
+    SELECT
+        v.PostId,
+        v.VoteTypeId,
+        v.UserId,
+        v.CreationDate AS VoteDate,
+        vt.Name AS VoteType
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+)
+SELECT 
+    cte.Id AS PostId,
+    cte.Title,
+    cte.Body,
+    cte.CreationDate,
+    cte.LastActivityDate,
+    cte.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation AS OwnerReputation,
+    u.Location,
+    u.AboutMe,
+    u.Views AS OwnerViews,
+    u.UpVotes AS OwnerUpVotes,
+    u.DownVotes AS OwnerDownVotes,
+    u.ProfileImageUrl AS OwnerProfileImage,
+    cte.AnswerCount,
+    cte.CommentCount,
+    cte.FavoriteCount,
+    cte.ViewCount,
+    cte.Score,
+    cte.Tags,
+    cte.ContentLicense,
+    cte.PostStatus,
+    cte.UserScoreRank,
+    cte.TagScoreRank,
+    ph.HistoryDate,
+    ph.PostHistoryTypeId,
+    ph.UserId AS HistoryUserId,
+    ph.UserDisplayName AS HistoryUserName,
+    ph.Comment AS HistoryComment,
+    ph.TextValue AS HistoryText,
+    pl.RelatedPostId,
+    pl.LinkType,
+    b.BadgeName,
+    b.BadgeClass,
+    b.IsTagBadge,
+    b.BadgeDate,
+    v.VoteType,
+    v.VoteDate,
+    v.UserId AS VoterUserId
+FROM cte
+LEFT JOIN Users u ON cte.OwnerUserId = u.Id
+LEFT JOIN post_history ph ON cte.Id = ph.PostId
+LEFT JOIN post_links pl ON cte.Id = pl.PostId
+LEFT JOIN badges b ON cte.OwnerUserId = b.UserId
+LEFT JOIN votes v ON cte.Id = v.PostId
+GROUP BY
+    cte.Id,
+    cte.Title,
+    cte.Body,
+    cte.CreationDate,
+    cte.LastActivityDate,
+    cte.OwnerUserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    u.AboutMe,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    cte.AnswerCount,
+    cte.CommentCount,
+    cte.FavoriteCount,
+    cte.ViewCount,
+    cte.Score,
+    cte.Tags,
+    cte.ContentLicense,
+    cte.PostStatus,
+    cte.UserScoreRank,
+    cte.TagScoreRank,
+    ph.HistoryDate,
+    ph.PostHistoryTypeId,
+    ph.UserId,
+    ph.UserDisplayName,
+    ph.Comment,
+    ph.TextValue,
+    pl.RelatedPostId,
+    pl.LinkType,
+    b.BadgeName,
+    b.BadgeClass,
+    b.IsTagBadge,
+    b.BadgeDate,
+    v.VoteType,
+    v.VoteDate,
+    v.UserId
+ORDER BY cte.Id, ph.HistoryDate, v.VoteDate;

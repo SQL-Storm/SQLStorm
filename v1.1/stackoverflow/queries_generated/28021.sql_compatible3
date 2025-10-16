@@ -1,0 +1,89 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.Reputation,
+        u.CreationDate AS JoinDate,
+        COALESCE(u.WebsiteUrl, 'No Website') AS Website,
+        CASE 
+            WHEN POSITION(',' IN COALESCE(u.Location, '')) > 0 
+            THEN SUBSTRING(u.Location FROM 1 FOR POSITION(',' IN u.Location) - 1)
+            ELSE u.Location
+        END AS PrimaryLocation,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 2) AS UpvotesGiven,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS GlobalRank,
+        NTILE(4) OVER (ORDER BY u.Reputation) AS ReputationQuartile
+    FROM Users u
+    WHERE u.Reputation > 1000
+),
+PostAnalysis AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+        MAX(p.AnswerCount) AS MaxAnswersReceived,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 2 THEN 1 ELSE 0 END) AS BodyEdits,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR (POSITION('>' IN p.Tags) - 2)), ', ') AS CommonTags
+    FROM Posts p
+    LEFT JOIN PostHistory ph 
+        ON p.Id = ph.PostId 
+        AND ph.PostHistoryTypeId BETWEEN 4 AND 6
+    GROUP BY p.OwnerUserId
+),
+AvgTotalPosts AS (
+    SELECT AVG(TotalPosts) AS AvgTP FROM PostAnalysis
+),
+TopDownVotesThreshold AS (
+    SELECT PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY DownVotes) AS P90 FROM Users
+)
+SELECT 
+    us.Id,
+    us.GlobalRank,
+    pa.CommonTags,
+    (us.UpvotesGiven * 0.3 + COALESCE(pa.AvgQuestionScore, 0) * 0.7) AS EngagementScore,
+    FIRST_VALUE(pa.MaxAnswersReceived) OVER (
+        PARTITION BY us.ReputationQuartile 
+        ORDER BY pa.TotalPosts DESC
+    ) AS QuartileMaxAnswers,
+    COALESCE(
+        (SELECT MIN(b2.CreationDate) 
+         FROM Badges b2 
+         WHERE b2.UserId = us.Id 
+           AND b2.Name LIKE '%Epic%'),
+        us.JoinDate + INTERVAL '30 days'
+    ) AS FirstEpicBadgeDate,
+    us.ReputationQuartile,
+    pa.TotalPosts,
+    us.PrimaryLocation,
+    us.JoinDate
+FROM UserStats us
+JOIN PostAnalysis pa ON us.Id = pa.OwnerUserId
+CROSS JOIN AvgTotalPosts atp
+WHERE us.PrimaryLocation IN ('New York', 'London', 'Paris')
+    AND EXISTS (
+        SELECT 1 
+        FROM Comments c 
+        WHERE c.UserId = us.Id 
+          AND CHAR_LENGTH(c.Text) > 100
+    )
+    AND pa.TotalPosts > atp.AvgTP
+
+UNION ALL
+
+SELECT 
+    u.Id,
+    NULL::numeric AS GlobalRank,
+    NULL::text AS CommonTags,
+    NULL::numeric AS EngagementScore,
+    NULL::integer AS QuartileMaxAnswers,
+    u.CreationDate AS FirstEpicBadgeDate,
+    NULL::integer AS ReputationQuartile,
+    NULL::integer AS TotalPosts,
+    NULL::text AS PrimaryLocation,
+    u.CreationDate AS JoinDate
+FROM Users u
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+WHERE p.OwnerUserId IS NULL
+    AND u.DownVotes > (SELECT P90 FROM TopDownVotesThreshold)
+ORDER BY EngagementScore DESC NULLS LAST
+LIMIT 500;

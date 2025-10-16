@@ -1,0 +1,104 @@
+WITH user_expertise AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 AND p.Score > 0 THEN p.Score END), 0) AS TotalAnswerScore,
+        STRING_AGG(DISTINCT SUBSTRING(t.TagName FROM 1 FOR 20), '|' ORDER BY SUBSTRING(t.TagName FROM 1 FOR 20)) FILTER (WHERE t.TagName IS NOT NULL) AS TopTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN LATERAL (
+        SELECT UNNEST(string_to_array(SUBSTRING(COALESCE(p.Tags, '') FROM 2 FOR GREATEST(LENGTH(COALESCE(p.Tags, ''))-2,0)), '><')) AS TagName
+    ) t ON p.PostTypeId = 1
+    WHERE u.CreationDate >= TIMESTAMP '2020-01-01' AND u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+post_engagement AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS PostRank,
+        LAG(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostDate,
+        LEAD(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) AS RollingAvgScore,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS UserTotalPosts
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) 
+        AND p.CreationDate >= TIMESTAMP '2019-01-01'
+        AND p.Score IS NOT NULL
+),
+vote_patterns AS (
+    SELECT 
+        v.PostId,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpVotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownVotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.Id END) AS Favorites,
+        MAX(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) AS MaxBounty,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM v.CreationDate)) AS MedianVoteEpoch
+    FROM Votes v
+    WHERE v.CreationDate >= TIMESTAMP '2019-01-01'
+    GROUP BY v.PostId
+),
+badge_achievements AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        MAX(CASE WHEN b.TagBased = TRUE THEN b.Name ELSE NULL END) AS TopTagBadge
+    FROM Badges b
+    WHERE b.Date >= TIMESTAMP '2019-01-01'
+    GROUP BY b.UserId
+)
+SELECT 
+    ue.DisplayName,
+    ue.Reputation,
+    ue.QuestionCount,
+    ue.AnswerCount,
+    ROUND(CAST(ue.TotalAnswerScore AS NUMERIC) / NULLIF(CAST(ue.AnswerCount AS NUMERIC), 0), 2) AS AvgAnswerScore,
+    COALESCE(ba.GoldBadges, 0) + COALESCE(ba.SilverBadges, 0) * 0.5 + COALESCE(ba.BronzeBadges, 0) * 0.1 AS WeightedBadgeScore,
+    pe.PostRank,
+    pe.Score AS TopPostScore,
+    COALESCE(vp.UpVotes, 0) - COALESCE(vp.DownVotes, 0) AS NetVotes,
+    COALESCE(vp.MaxBounty, 0) AS HighestBounty,
+    EXTRACT(EPOCH FROM (pe.PrevPostDate - LAG(pe.PrevPostDate) OVER (PARTITION BY ue.UserId ORDER BY pe.PostRank))) / 86400 AS DaysBetweenPosts,
+    pe.RollingAvgScore,
+    CASE 
+        WHEN pe.Score > pe.NextPostScore AND pe.Score > 10 THEN 'Declining'
+        WHEN pe.Score < pe.NextPostScore THEN 'Improving'
+        WHEN pe.Score = pe.NextPostScore THEN 'Stable'
+        ELSE 'New'
+    END AS EngagementTrend,
+    LEFT(COALESCE(ue.TopTags, 'No Tags'), 100) AS TagSpecialization,
+    (SELECT COUNT(*) 
+     FROM Comments c 
+     INNER JOIN Posts p2 ON c.PostId = p2.Id 
+     WHERE c.UserId = ue.UserId 
+         AND LENGTH(c.Text) > 100
+         AND c.Score > 0) AS QualityCommentsCount,
+    EXISTS(
+        SELECT 1 FROM PostLinks pl 
+        INNER JOIN Posts p3 ON pl.PostId = p3.Id
+        WHERE p3.OwnerUserId = ue.UserId AND pl.LinkTypeId = 3
+    ) AS HasDuplicateLinks,
+    ba.TopTagBadge
+FROM user_expertise ue
+INNER JOIN post_engagement pe ON ue.UserId = pe.OwnerUserId
+LEFT OUTER JOIN vote_patterns vp ON pe.PostId = vp.PostId
+LEFT OUTER JOIN badge_achievements ba ON ue.UserId = ba.UserId
+WHERE pe.PostRank <= 10
+    AND (ue.AnswerCount > 5 OR ue.QuestionCount > 3)
+    AND pe.RollingAvgScore > (SELECT AVG(Score) FROM Posts WHERE Score IS NOT NULL AND PostTypeId IN (1,2)) * 0.5
+    AND NOT EXISTS (
+        SELECT 1 FROM PostHistory ph 
+        WHERE ph.PostId = pe.PostId 
+            AND ph.PostHistoryTypeId = 12
+    )
+ORDER BY WeightedBadgeScore DESC, ue.Reputation DESC, NetVotes DESC
+LIMIT 500;

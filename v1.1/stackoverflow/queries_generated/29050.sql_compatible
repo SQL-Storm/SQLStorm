@@ -1,0 +1,405 @@
+WITH TopUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as rn
+    FROM Users u
+    WHERE u.Reputation > 10000
+),
+QuestionStats AS (
+    SELECT p.ParentId as QuestionId,
+           COUNT(*) as AnswerCount,
+           SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) as PositiveAnswers,
+           AVG(p.Score) as AvgAnswerScore,
+           MAX(p.Score) as MaxAnswerScore,
+           STRING_AGG(p.Title, '; ') as AnswerTitles
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+),
+TagUsage AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        STRING_AGG(p.Title, ', ') as TaggedQuestions,
+        AVG(p.Score) as AvgQuestionScore,
+        COUNT(DISTINCT p.OwnerUserId) as UniqueAuthors
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName, t.Count
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as AnswerCount
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    WHERE u.Reputation > 5000
+    GROUP BY u.Id, u.DisplayName
+),
+PostComplexity AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            WHEN p.Score > 10 THEN 'Low'
+            ELSE 'Very Low'
+        END as ScoreLevel,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'Popular'
+            WHEN p.ViewCount > 500 THEN 'Moderate'
+            WHEN p.ViewCount > 100 THEN 'Low'
+            ELSE 'Very Low'
+        END as PopularityLevel,
+        CASE 
+            WHEN p.AnswerCount > 10 THEN 'Highly Answered'
+            WHEN p.AnswerCount > 5 THEN 'Moderately Answered'
+            WHEN p.AnswerCount > 0 THEN 'Slightly Answered'
+            ELSE 'Unanswered'
+        END as AnswerStatus,
+        COALESCE(p.Tags, 'No Tags') as Tags,
+        p.OwnerUserId,
+        p.ParentId,
+        p.PostTypeId
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+FilteredPosts AS (
+    SELECT 
+        pc.Id,
+        pc.Title,
+        pc.Score,
+        pc.ViewCount,
+        pc.AnswerCount,
+        pc.CommentCount,
+        pc.FavoriteCount,
+        pc.ScoreLevel,
+        pc.PopularityLevel,
+        pc.AnswerStatus,
+        pc.Tags,
+        pc.OwnerUserId,
+        pc.ParentId,
+        pc.PostTypeId,
+        COALESCE(SUBSTRING(pc.Title FROM 1 FOR 50), 'No Title') as ShortTitle,
+        CASE 
+            WHEN pc.ViewCount > 0 THEN 
+                (pc.Score * 1.0 / pc.ViewCount) * 100 
+            ELSE 0 
+        END as ScoreViewRatio,
+        ROW_NUMBER() OVER (PARTITION BY pc.OwnerUserId ORDER BY pc.Score DESC) as UserRank,
+        LAG(pc.Score, 1) OVER (PARTITION BY pc.OwnerUserId ORDER BY pc.CreationDate) as PrevScore,
+        LEAD(pc.Score, 1) OVER (PARTITION BY pc.OwnerUserId ORDER BY pc.CreationDate) as NextScore,
+        pc.CreationDate
+    FROM PostComplexity pc
+    WHERE pc.ViewCount > 100
+),
+PostAnalysis AS (
+    SELECT 
+        fp.Id,
+        fp.Title,
+        fp.Score,
+        fp.ViewCount,
+        fp.AnswerCount,
+        fp.CommentCount,
+        fp.FavoriteCount,
+        fp.ScoreLevel,
+        fp.PopularityLevel,
+        fp.AnswerStatus,
+        fp.Tags,
+        fp.OwnerUserId,
+        fp.ParentId,
+        fp.PostTypeId,
+        fp.ShortTitle,
+        fp.ScoreViewRatio,
+        fp.UserRank,
+        fp.PrevScore,
+        fp.NextScore,
+        fp.CreationDate,
+        CASE 
+            WHEN fp.PrevScore IS NOT NULL AND fp.Score > fp.PrevScore THEN 'Increased'
+            WHEN fp.PrevScore IS NOT NULL AND fp.Score < fp.PrevScore THEN 'Decreased'
+            WHEN fp.PrevScore IS NOT NULL AND fp.Score = fp.PrevScore THEN 'Stable'
+            ELSE 'New'
+        END as ScoreTrend,
+        CASE 
+            WHEN fp.NextScore IS NOT NULL AND fp.Score < fp.NextScore THEN 'Next Higher'
+            WHEN fp.NextScore IS NOT NULL AND fp.Score > fp.NextScore THEN 'Next Lower'
+            ELSE 'End of Series'
+        END as NextTrend,
+        COALESCE(QUERIES.AverageAnswerScore, 0) as AvgAnswerScore,
+        COALESCE(QUERIES.PositiveAnswers, 0) as PositiveAnswerCount,
+        QUERIES.AnswerCount as TotalAnswerCount
+    FROM FilteredPosts fp
+    LEFT JOIN (
+        SELECT 
+            a.QuestionId,
+            AVG(a.AvgAnswerScore) as AverageAnswerScore,
+            SUM(a.PositiveAnswers) as PositiveAnswers,
+            SUM(a.AnswerCount) as AnswerCount
+        FROM QuestionStats a
+        GROUP BY a.QuestionId
+    ) QUERIES ON fp.Id = QUERIES.QuestionId
+),
+UserPostSummary AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.PostCount,
+        ua.CommentCount,
+        ua.BadgeCount,
+        ua.VoteCount,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        CASE 
+            WHEN ua.VoteCount > 200 THEN 'Active Voter'
+            WHEN ua.VoteCount > 100 THEN 'Moderate Voter'
+            WHEN ua.VoteCount > 50 THEN 'Casual Voter'
+            ELSE 'Inactive Voter'
+        END as VoterActivity,
+        CASE 
+            WHEN ua.PostCount > 250 THEN 'High Poster'
+            WHEN ua.PostCount > 100 THEN 'Moderate Poster'
+            WHEN ua.PostCount > 50 THEN 'Casual Poster'
+            ELSE 'Low Activity'
+        END as PostingActivity,
+        COALESCE(ua.PostCount, 0) - COALESCE(ua.AnswerCount, 0) as QuestionCountOnly
+    FROM UserActivity ua
+),
+FinalAnalysis AS (
+    SELECT 
+        t.Id as UserId,
+        t.DisplayName,
+        t.Reputation,
+        t.Views,
+        t.UpVotes,
+        t.DownVotes,
+        CASE WHEN t.Reputation > 100000 THEN 'Elite' ELSE 'Regular' END as UserTier,
+        pa.Id as PostId,
+        pa.Title,
+        pa.Score,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.ViewCount,
+        pa.ScoreLevel,
+        pa.PopularityLevel,
+        pa.AnswerStatus,
+        pa.Tags,
+        pa.ScoreViewRatio,
+        pa.ScoreTrend,
+        pa.NextTrend,
+        pa.AvgAnswerScore,
+        pa.PositiveAnswerCount,
+        us.PostCount,
+        us.CommentCount,
+        us.BadgeCount,
+        us.VoteCount,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.PostingActivity,
+        us.VoterActivity,
+        ROW_NUMBER() OVER (PARTITION BY pa.OwnerUserId ORDER BY pa.Score DESC) as PostRank,
+        RANK() OVER (ORDER BY pa.Score DESC) as OverallRank,
+        DENSE_RANK() OVER (ORDER BY pa.ViewCount DESC) as ViewRank,
+        pa.OwnerUserId
+    FROM TopUsers t
+    INNER JOIN PostAnalysis pa ON t.Id = pa.OwnerUserId
+    LEFT JOIN UserPostSummary us ON t.Id = us.UserId
+),
+TagAnalysis AS (
+    SELECT 
+        tu.TagName,
+        tu.TagCount,
+        tu.TaggedQuestions,
+        tu.AvgQuestionScore,
+        tu.UniqueAuthors,
+        ROW_NUMBER() OVER (ORDER BY tu.TagCount DESC) as TagRank,
+        RANK() OVER (ORDER BY tu.AvgQuestionScore DESC) as AverageScoreRank,
+        DENSE_RANK() OVER (ORDER BY tu.UniqueAuthors DESC) as AuthorRank
+    FROM TagUsage tu
+),
+ComplexFilter AS (
+    SELECT 
+        fa.UserId,
+        fa.DisplayName,
+        fa.Reputation,
+        fa.Views,
+        fa.UpVotes,
+        fa.DownVotes,
+        fa.UserTier,
+        fa.PostId,
+        fa.Title,
+        fa.Score,
+        fa.AnswerCount,
+        fa.CommentCount,
+        fa.ViewCount,
+        fa.ScoreLevel,
+        fa.PopularityLevel,
+        fa.AnswerStatus,
+        fa.Tags,
+        fa.ScoreViewRatio,
+        fa.ScoreTrend,
+        fa.NextTrend,
+        fa.AvgAnswerScore,
+        fa.PositiveAnswerCount,
+        fa.PostCount,
+        fa.CommentCount as UserCommentCount,
+        fa.BadgeCount,
+        fa.VoteCount,
+        fa.QuestionCount,
+        fa.AnswerCount as UserAnswerCount,
+        fa.PostingActivity,
+        fa.VoterActivity,
+        fa.PostRank,
+        fa.OverallRank,
+        fa.ViewRank,
+        fa.OwnerUserId,
+        ta.TagRank,
+        ta.AverageScoreRank,
+        ta.AuthorRank,
+        CASE WHEN fa.Reputation > 50000 THEN 'Gold' ELSE 'Silver' END as ReputationLevel,
+        CASE 
+            WHEN fa.Score > 50 AND fa.ViewCount > 500 THEN 'High Interest'
+            WHEN fa.Score > 20 AND fa.ViewCount > 200 THEN 'Moderate Interest'
+            WHEN fa.Score > 10 AND fa.ViewCount > 100 THEN 'Low Interest'
+            ELSE 'Minimal Interest'
+        END as InterestLevel
+    FROM FinalAnalysis fa
+    INNER JOIN TagAnalysis ta ON ta.TagName = ANY(string_to_array(fa.Tags, '><'))
+),
+CrossJoinAnalysis AS (
+    SELECT 
+        cf.UserId,
+        cf.DisplayName,
+        cf.Reputation,
+        cf.Views,
+        cf.UpVotes,
+        cf.DownVotes,
+        cf.UserTier,
+        cf.PostId,
+        cf.Title,
+        cf.Score,
+        cf.AnswerCount,
+        cf.CommentCount,
+        cf.ViewCount,
+        cf.ScoreLevel,
+        cf.PopularityLevel,
+        cf.AnswerStatus,
+        cf.Tags,
+        cf.ScoreViewRatio,
+        cf.ScoreTrend,
+        cf.NextTrend,
+        cf.AvgAnswerScore,
+        cf.PositiveAnswerCount,
+        cf.PostCount,
+        cf.UserCommentCount,
+        cf.BadgeCount,
+        cf.VoteCount,
+        cf.QuestionCount,
+        cf.UserAnswerCount,
+        cf.PostingActivity,
+        cf.VoterActivity,
+        cf.PostRank,
+        cf.OverallRank,
+        cf.ViewRank,
+        cf.TagRank,
+        cf.AverageScoreRank,
+        cf.AuthorRank,
+        cf.ReputationLevel,
+        cf.InterestLevel,
+        cf.OwnerUserId,
+        COUNT(*) OVER () as TotalResults,
+        COUNT(cf.UserId) OVER (PARTITION BY cf.PostId) as PostParticipants,
+        AVG(cf.Score) OVER (PARTITION BY cf.OwnerUserId) as UserAverageScore,
+        MAX(cf.ViewCount) OVER () as MaxViewCount,
+        MIN(cf.Score) OVER (PARTITION BY cf.PostTypeId) as MinScoreByType
+    FROM ComplexFilter cf
+)
+SELECT 
+    DISTINCT 
+    cja.UserId,
+    cja.DisplayName,
+    cja.Reputation,
+    cja.Views,
+    cja.UpVotes,
+    cja.DownVotes,
+    cja.PostId,
+    cja.Title,
+    cja.Score,
+    cja.AnswerCount,
+    cja.CommentCount,
+    cja.ViewCount,
+    cja.ScoreLevel,
+    cja.PopularityLevel,
+    cja.AnswerStatus,
+    cja.Tags,
+    cja.ScoreViewRatio,
+    cja.ScoreTrend,
+    cja.NextTrend,
+    cja.AvgAnswerScore,
+    cja.PositiveAnswerCount,
+    cja.PostCount,
+    cja.UserCommentCount as CommentCount,
+    cja.BadgeCount,
+    cja.VoteCount,
+    cja.QuestionCount,
+    cja.UserAnswerCount as AnswerCountByUser,
+    cja.PostingActivity,
+    cja.VoterActivity,
+    cja.PostRank,
+    cja.OverallRank,
+    cja.ViewRank,
+    cja.TagRank,
+    cja.AverageScoreRank,
+    cja.AuthorRank,
+    cja.ReputationLevel,
+    cja.InterestLevel,
+    cja.TotalResults,
+    cja.PostParticipants,
+    cja.UserAverageScore,
+    cja.MaxViewCount,
+    cja.MinScoreByType,
+    CASE 
+        WHEN cja.Score > cja.UserAverageScore THEN 'Above Average'
+        WHEN cja.Score < cja.UserAverageScore THEN 'Below Average'
+        ELSE 'Average'
+    END as ScoreVsUserAverage,
+    CASE 
+        WHEN cja.ViewCount > cja.MaxViewCount * 0.8 THEN 'Top Viewed'
+        WHEN cja.ViewCount > cja.MaxViewCount * 0.5 THEN 'Moderate Viewed'
+        WHEN cja.ViewCount > cja.MaxViewCount * 0.2 THEN 'Low Viewed'
+        ELSE 'Very Low Viewed'
+    END as ViewCategory,
+    CASE 
+        WHEN cja.Score > 100 THEN 'High Performing'
+        WHEN cja.Score > 50 THEN 'Medium Performing'
+        WHEN cja.Score > 10 THEN 'Low Performing'
+        ELSE 'Under Performing'
+    END as PerformanceTier,
+    ROW_NUMBER() OVER (ORDER BY cja.Reputation DESC, cja.Score DESC) as OverallPerformanceRank
+FROM CrossJoinAnalysis cja
+WHERE cja.Reputation > 10000
+  AND cja.Score > 0
+  AND cja.ViewCount > 50
+  AND cja.Tags IS NOT NULL
+  AND cja.Tags != ''
+  AND cja.Title IS NOT NULL
+  AND cja.Title != ''
+  AND cja.OwnerUserId BETWEEN 1 AND 100000
+ORDER BY cja.Reputation DESC, cja.Score DESC
+LIMIT 1000 OFFSET 500;

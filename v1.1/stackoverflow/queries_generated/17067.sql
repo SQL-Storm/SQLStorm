@@ -1,0 +1,153 @@
+-- {"query": "17067.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 158780, "output_tokens": 157637} 
+
+WITH UserMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        DATE_PART('year', AGE(CURRENT_DATE, u.CreationDate)) AS YearsActive,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL), 0) AS AvgPostScore,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        STRING_AGG(DISTINCT b.Name, ', ' ORDER BY b.Name) FILTER (WHERE b.Class = 1) AS GoldBadgeNames
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+        AND u.CreationDate < CURRENT_DATE - INTERVAL '1 year'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location, u.CreationDate
+),
+TopTags AS (
+    SELECT 
+        p.OwnerUserId,
+        UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS Tag,
+        COUNT(*) AS TagUsageCount,
+        SUM(p.Score) AS TagScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY COUNT(*) DESC, SUM(p.Score) DESC) AS TagRank
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL 
+        AND p.PostTypeId = 1
+        AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId, Tag
+),
+EditActivity AS (
+    SELECT 
+        ph.UserId,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS EditCount,
+        COUNT(DISTINCT ph.PostId) AS UniquePostsEdited,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 24) AS SuggestedEditsApplied,
+        MAX(ph.CreationDate) AS LastEditDate,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY LENGTH(ph.Text)) FILTER (WHERE ph.Text IS NOT NULL) AS MedianEditLength
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+    GROUP BY ph.UserId
+),
+QuestionQuality AS (
+    SELECT 
+        q.OwnerUserId,
+        AVG(CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 1.0 ELSE 0.0 END) * 100 AS AcceptanceRate,
+        AVG(q.AnswerCount) AS AvgAnswersPerQuestion,
+        AVG(q.ViewCount) AS AvgViews,
+        STDDEV(q.Score) AS ScoreStdDev,
+        COUNT(*) FILTER (WHERE q.ClosedDate IS NOT NULL) AS ClosedQuestions,
+        COUNT(*) FILTER (WHERE q.CommunityOwnedDate IS NOT NULL) AS CommunityWikiQuestions
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+        AND q.OwnerUserId IS NOT NULL
+    GROUP BY q.OwnerUserId
+),
+RecentActivity AS (
+    SELECT DISTINCT ON (p.OwnerUserId)
+        p.OwnerUserId,
+        p.Id AS LastPostId,
+        p.Title AS LastPostTitle,
+        p.CreationDate AS LastPostDate,
+        p.Score AS LastPostScore,
+        CASE 
+            WHEN p.CreationDate > CURRENT_DATE - INTERVAL '30 days' THEN 'Very Active'
+            WHEN p.CreationDate > CURRENT_DATE - INTERVAL '90 days' THEN 'Active'
+            WHEN p.CreationDate > CURRENT_DATE - INTERVAL '180 days' THEN 'Somewhat Active'
+            ELSE 'Inactive'
+        END AS ActivityLevel
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    ORDER BY p.OwnerUserId, p.CreationDate DESC
+)
+SELECT 
+    um.DisplayName,
+    UPPER(SUBSTRING(um.Location FROM 1 FOR 3)) || LOWER(SUBSTRING(um.Location FROM 4)) AS FormattedLocation,
+    um.Reputation,
+    um.YearsActive,
+    um.PostCount,
+    um.QuestionCount,
+    um.AnswerCount,
+    ROUND(um.TotalPostScore::numeric / NULLIF(um.PostCount, 0), 2) AS ScorePerPost,
+    COALESCE(tt.Tag, 'No Tags') AS TopTag,
+    COALESCE(tt.TagUsageCount, 0) AS TopTagUsageCount,
+    CONCAT(um.GoldBadges, 'G/', um.SilverBadges, 'S/', um.BronzeBadges, 'B') AS BadgeSummary,
+    CASE 
+        WHEN um.GoldBadgeNames IS NULL THEN 'None'
+        WHEN LENGTH(um.GoldBadgeNames) > 50 THEN SUBSTRING(um.GoldBadgeNames FROM 1 FOR 47) || '...'
+        ELSE um.GoldBadgeNames
+    END AS GoldBadgeDisplay,
+    COALESCE(ea.EditCount, 0) AS TotalEdits,
+    COALESCE(ea.UniquePostsEdited, 0) AS UniquePostsEdited,
+    ROUND(COALESCE(qq.AcceptanceRate, 0), 1) AS QuestionAcceptanceRate,
+    ROUND(COALESCE(qq.AvgAnswersPerQuestion, 0), 1) AS AvgAnswersPerQuestion,
+    COALESCE(qq.ClosedQuestions, 0) AS ClosedQuestions,
+    ra.ActivityLevel,
+    DATE_PART('day', CURRENT_DATE - ra.LastPostDate) AS DaysSinceLastPost,
+    RANK() OVER (ORDER BY um.Reputation DESC) AS ReputationRank,
+    DENSE_RANK() OVER (ORDER BY um.TotalPostScore DESC) AS ScoreRank,
+    NTILE(10) OVER (ORDER BY um.Reputation) AS ReputationDecile,
+    LAG(um.DisplayName, 1) OVER (ORDER BY um.Reputation DESC) AS NextLowerUser,
+    LEAD(um.DisplayName, 1) OVER (ORDER BY um.Reputation DESC) AS NextHigherUser,
+    SUM(um.PostCount) OVER (ORDER BY um.Reputation DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativePostCount,
+    AVG(um.AvgPostScore) OVER (PARTITION BY CASE 
+        WHEN um.Reputation < 5000 THEN 'Low'
+        WHEN um.Reputation < 20000 THEN 'Medium'
+        WHEN um.Reputation < 50000 THEN 'High'
+        ELSE 'Elite'
+    END) AS AvgScoreInReputationTier,
+    EXISTS (
+        SELECT 1 
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = um.Id 
+            AND p2.Score > 100
+    ) AS HasHighScorePost,
+    (
+        SELECT COUNT(DISTINCT c.Id)
+        FROM Comments c
+        WHERE c.UserId = um.Id
+            AND c.Score > 5
+    ) AS HighScoreComments
+FROM UserMetrics um
+LEFT JOIN TopTags tt ON um.Id = tt.OwnerUserId AND tt.TagRank = 1
+LEFT JOIN EditActivity ea ON um.Id = ea.UserId
+LEFT JOIN QuestionQuality qq ON um.Id = qq.OwnerUserId
+LEFT JOIN RecentActivity ra ON um.Id = ra.OwnerUserId
+WHERE um.PostCount > 10
+    AND (um.QuestionCount > 0 OR um.AnswerCount > 0)
+    AND NOT EXISTS (
+        SELECT 1
+        FROM Votes v
+        WHERE v.UserId = um.Id
+            AND v.VoteTypeId = 12
+            AND v.CreationDate > CURRENT_DATE - INTERVAL '6 months'
+    )
+ORDER BY 
+    CASE 
+        WHEN ra.ActivityLevel = 'Very Active' THEN 0
+        WHEN ra.ActivityLevel = 'Active' THEN 1
+        WHEN ra.ActivityLevel = 'Somewhat Active' THEN 2
+        ELSE 3
+    END,
+    um.Reputation DESC,
+    um.TotalPostScore DESC
+LIMIT 100;

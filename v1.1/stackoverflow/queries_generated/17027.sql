@@ -1,0 +1,194 @@
+-- {"query": "17027.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 65380, "output_tokens": 63616} 
+
+WITH UserMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        DENSE_RANK() OVER (PARTITION BY COALESCE(u.Location, 'Unknown') ORDER BY u.Reputation DESC) AS LocationRank,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        AVG(CASE WHEN p.Score IS NOT NULL THEN p.Score ELSE 0 END) AS AvgPostScore,
+        STRING_AGG(DISTINCT b.Name, ', ' ORDER BY b.Class, b.Name) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadgeCount,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS MedianScore,
+        MAX(p.Score) AS MaxScore,
+        EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - u.CreationDate)) / 86400 AS AccountAgeDays,
+        LAG(u.Reputation, 1) OVER (ORDER BY u.CreationDate) AS PrevUserRep
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000 
+        AND u.CreationDate > '2020-01-01'
+        AND (u.Location IS NULL OR u.Location NOT LIKE '%test%')
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location, u.CreationDate
+),
+QuestionAnalysis AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.Tags,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CreationDate AS QuestionDate,
+        COALESCE(a.Id, 0) AS AcceptedAnswerId,
+        a.Score AS AcceptedAnswerScore,
+        a.OwnerUserId AS AcceptedAnswerUserId,
+        ROW_NUMBER() OVER (PARTITION BY q.OwnerUserId ORDER BY q.Score DESC, q.ViewCount DESC) AS UserQuestionRank,
+        EXISTS (
+            SELECT 1 
+            FROM PostHistory ph 
+            WHERE ph.PostId = q.Id 
+                AND ph.PostHistoryTypeId IN (10, 12)
+        ) AS WasClosedOrDeleted,
+        (
+            SELECT COUNT(DISTINCT c.UserId)
+            FROM Comments c
+            WHERE c.PostId = q.Id
+                AND c.Score > 0
+                AND c.UserId != q.OwnerUserId
+        ) AS UniqueCommenters,
+        CASE 
+            WHEN q.Tags LIKE '%<python>%' THEN 'Python'
+            WHEN q.Tags LIKE '%<javascript>%' THEN 'JavaScript'
+            WHEN q.Tags LIKE '%<java>%' AND q.Tags NOT LIKE '%<javascript>%' THEN 'Java'
+            WHEN q.Tags LIKE '%<sql>%' THEN 'SQL'
+            ELSE 'Other'
+        END AS PrimaryLanguage,
+        LENGTH(q.Body) - LENGTH(REPLACE(q.Body, '<code>', '')) AS CodeBlockCount
+    FROM Posts q
+    LEFT JOIN Posts a ON q.AcceptedAnswerId = a.Id
+    WHERE q.PostTypeId = 1
+        AND q.CreationDate >= '2021-01-01'
+        AND q.Score >= 0
+),
+RecentActivity AS (
+    SELECT 
+        ph.PostId,
+        ph.UserId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        FIRST_VALUE(ph.Text) OVER (
+            PARTITION BY ph.PostId 
+            ORDER BY 
+                CASE WHEN ph.PostHistoryTypeId IN (2,5,8) THEN ph.CreationDate END DESC NULLS LAST
+        ) AS LastBodyEdit,
+        COUNT(*) OVER (
+            PARTITION BY ph.PostId, ph.PostHistoryTypeId 
+            ORDER BY ph.CreationDate 
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS EditNumber
+    FROM PostHistory ph
+    WHERE ph.CreationDate >= '2022-01-01'
+        AND ph.PostHistoryTypeId IN (2,4,5,6,8,9,10,11,12,13)
+),
+VotePatterns AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) AS TotalBounty,
+        STDDEV(CASE WHEN v.VoteTypeId IN (2,3) THEN EXTRACT(EPOCH FROM v.CreationDate) END) AS VoteTimeStdDev,
+        MAX(v.CreationDate) - MIN(v.CreationDate) AS VoteSpan
+    FROM Votes v
+    GROUP BY v.PostId
+)
+SELECT 
+    um.DisplayName,
+    um.Location,
+    um.LocationRank,
+    um.Reputation,
+    ROUND(um.Reputation::NUMERIC / NULLIF(um.AccountAgeDays, 0), 2) AS RepPerDay,
+    um.PostCount,
+    um.QuestionCount,
+    um.AnswerCount,
+    ROUND(um.AvgPostScore::NUMERIC, 2) AS AvgPostScore,
+    um.MedianScore,
+    um.MaxScore,
+    COALESCE(um.GoldBadges, 'None') AS GoldBadges,
+    um.GoldBadgeCount,
+    qa.QuestionId,
+    SUBSTRING(qa.Title FROM 1 FOR 50) || CASE WHEN LENGTH(qa.Title) > 50 THEN '...' ELSE '' END AS QuestionTitle,
+    qa.PrimaryLanguage,
+    qa.QuestionScore,
+    qa.ViewCount,
+    qa.AnswerCount,
+    qa.AcceptedAnswerScore,
+    CASE 
+        WHEN qa.AcceptedAnswerUserId = um.Id THEN 'Self-Accepted'
+        WHEN qa.AcceptedAnswerId > 0 THEN 'Accepted'
+        WHEN qa.AnswerCount > 0 THEN 'Has Answers'
+        ELSE 'Unanswered'
+    END AS QuestionStatus,
+    qa.UserQuestionRank,
+    qa.WasClosedOrDeleted,
+    qa.UniqueCommenters,
+    qa.CodeBlockCount,
+    COALESCE(vp.UpVotes, 0) - COALESCE(vp.DownVotes, 0) AS NetVotes,
+    COALESCE(vp.TotalBounty, 0) AS TotalBounty,
+    ROUND(COALESCE(vp.VoteTimeStdDev, 0)::NUMERIC / 3600, 2) AS VoteTimeStdDevHours,
+    ra.EditNumber AS TotalEdits,
+    CASE 
+        WHEN ra.LastBodyEdit IS NOT NULL THEN 
+            LENGTH(ra.LastBodyEdit) 
+        ELSE 0 
+    END AS LastEditLength,
+    COALESCE((
+        SELECT COUNT(DISTINCT pl.RelatedPostId)
+        FROM PostLinks pl
+        WHERE pl.PostId = qa.QuestionId
+            AND pl.LinkTypeId = 1
+    ), 0) AS LinkedPostCount,
+    COALESCE((
+        SELECT STRING_AGG(t.TagName, ', ' ORDER BY t.Count DESC)
+        FROM Tags t
+        WHERE qa.Tags LIKE '%<' || t.TagName || '>%'
+            AND t.Count > 1000
+        LIMIT 3
+    ), 'No Popular Tags') AS PopularTags,
+    CASE 
+        WHEN um.Reputation > (
+            SELECT AVG(u2.Reputation) + 2 * STDDEV(u2.Reputation)
+            FROM Users u2
+            WHERE u2.Location = um.Location
+        ) THEN 'Top Performer'
+        WHEN um.Reputation > (
+            SELECT AVG(u2.Reputation)
+            FROM Users u2
+            WHERE u2.Location = um.Location
+        ) THEN 'Above Average'
+        ELSE 'Average'
+    END AS LocationPerformance,
+    um.Reputation - COALESCE(um.PrevUserRep, 0) AS RepGrowthFromPrev
+FROM UserMetrics um
+INNER JOIN QuestionAnalysis qa ON qa.QuestionId IN (
+    SELECT p.Id 
+    FROM Posts p 
+    WHERE p.OwnerUserId = um.Id 
+        AND p.PostTypeId = 1
+    ORDER BY p.Score DESC, p.ViewCount DESC
+    LIMIT 1
+)
+LEFT JOIN VotePatterns vp ON vp.PostId = qa.QuestionId
+LEFT JOIN RecentActivity ra ON ra.PostId = qa.QuestionId AND ra.EditNumber = (
+    SELECT MAX(ra2.EditNumber)
+    FROM RecentActivity ra2
+    WHERE ra2.PostId = qa.QuestionId
+)
+WHERE um.PostCount > 5
+    AND (qa.QuestionScore > 10 OR qa.ViewCount > 1000 OR qa.AnswerCount > 5)
+    AND NOT (um.DisplayName IS NULL AND um.GoldBadgeCount = 0)
+    AND (
+        qa.PrimaryLanguage != 'Other' 
+        OR um.Reputation > 5000
+        OR qa.WasClosedOrDeleted = false
+    )
+ORDER BY 
+    um.LocationRank ASC,
+    um.Reputation DESC,
+    qa.QuestionScore DESC,
+    COALESCE(vp.TotalBounty, 0) DESC
+LIMIT 100;

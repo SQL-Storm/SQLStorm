@@ -1,0 +1,175 @@
+-- {"query": "729.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1596} 
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+        count(distinct c.Id) as CommentsCount,
+        coalesce(sum(v.VoteCount), 0) as TotalVotesReceived
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join (
+        select PostId, count(*) as VoteCount
+        from Votes
+        where VoteTypeId in (2,3) -- UpMod and DownMod
+        group by PostId
+    ) v on v.PostId = p.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    union all
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        0,
+        0,
+        0,
+        0
+    from Users u
+    where u.Reputation > 100000 -- high rep users for recursion base case addition
+),
+BadgeStats as (
+    select
+        b.UserId,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        bool_or(b.TagBased = 1) as HasTagBasedBadge
+    from Badges b
+    group by b.UserId
+),
+PostAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        count(a.Id) as AnswerCount,
+        max(a.Score) as MaxAnswerScore,
+        min(a.Score) as MinAnswerScore,
+        avg(a.Score) as AvgAnswerScore,
+        string_agg(distinct coalesce(u.DisplayName, '[deleted]'), ', ') as Answerers
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount
+),
+TopTags as (
+    select
+        t.TagName,
+        t.Count,
+        row_number() over (order by t.Count desc) as Rank
+    from Tags t
+    where t.TagName is not null
+),
+QuestionsWithTopTags as (
+    select
+        p.Id as PostId,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        regexp_split_to_table(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><') as Tag
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+),
+TagQuestionCounts as (
+    select
+        t.TagName,
+        count(distinct q.PostId) as QuestionCount
+    from TopTags t
+    join QuestionsWithTopTags q on q.Tag = t.TagName
+    where t.Rank <= 10
+    group by t.TagName
+),
+UserVoteActivity as (
+    select
+        v.UserId,
+        count(*) filter (where v.VoteTypeId = 2) as UpVotesCast,
+        count(*) filter (where v.VoteTypeId = 3) as DownVotesCast,
+        count(*) filter (where v.VoteTypeId = 6) as CloseVotesCast
+    from Votes v
+    group by v.UserId
+),
+CloseVotesDetails as (
+    select
+        ph.PostId,
+        ph.UserId,
+        crt.Name as CloseReason,
+        ph.CreationDate
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10
+),
+QuestionCloseStats as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        count(distinct cv.UserId) as CloseVotesCount,
+        string_agg(distinct coalesce(cv.CloseReason, 'Unknown'), '; ') as CloseReasons
+    from Posts p
+    left join CloseVotesDetails cv on cv.PostId = p.Id
+    where p.PostTypeId = 1
+    group by p.Id, p.Title
+)
+select
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.QuestionsCount,
+    u.AnswersCount,
+    u.CommentsCount,
+    u.TotalVotesReceived,
+    coalesce(b.GoldBadges, 0) as GoldBadges,
+    coalesce(b.SilverBadges, 0) as SilverBadges,
+    coalesce(b.BronzeBadges, 0) as BronzeBadges,
+    b.HasTagBasedBadge,
+    coalesce(uv.UpVotesCast, 0) as UpVotesCast,
+    coalesce(uv.DownVotesCast, 0) as DownVotesCast,
+    coalesce(uv.CloseVotesCast, 0) as CloseVotesCast,
+    pq.QuestionId,
+    pq.Title as QuestionTitle,
+    pq.AnswerCount,
+    pq.MaxAnswerScore,
+    pq.MinAnswerScore,
+    round(pq.AvgAnswerScore::numeric,2) as AvgAnswerScore,
+    pq.Answerers,
+    qc.CloseVotesCount,
+    qc.CloseReasons,
+    tqc.QuestionCount as TopTagQuestionCount,
+    tt.TagName as TopTagName,
+    case when u.Reputation > 50000 then 'High Rep' else 'Regular' end as UserCategory,
+    case 
+        when u.Reputation < 1000 then 'Newbie'
+        when u.Reputation between 1000 and 10000 then 'Intermediate'
+        else 'Expert'
+    end as ReputationBucket,
+    coalesce(u.Reputation / nullif(u.QuestionsCount + 1,0), 0) as RepPerQuestion,
+    lower(substr(u.DisplayName, 1, 1)) = substr(u.DisplayName, 1, 1) as IsDisplayNameLowerCase,
+    length(u.DisplayName) as DisplayNameLength,
+    case 
+        when strpos(u.DisplayName, ' ') > 0 then 'Has Space'
+        else 'No Space'
+    end as DisplayNameSpaceStatus,
+    lag(u.Reputation) over (order by u.Reputation desc) as PrevUserReputation,
+    lead(u.Reputation) over (order by u.Reputation desc) as NextUserReputation
+from
+    RecursiveUserActivity u
+left join BadgeStats b on b.UserId = u.UserId
+left join UserVoteActivity uv on uv.UserId = u.UserId
+left join PostAnswerStats pq on pq.QuestionId = (
+    select Id from Posts p2
+    where p2.OwnerUserId = u.UserId and p2.PostTypeId = 1
+    order by p2.Score desc nulls last limit 1
+)
+left join QuestionCloseStats qc on qc.QuestionId = pq.QuestionId
+left join TopTags tt on tt.Rank = 1
+left join TagQuestionCounts tqc on tqc.TagName = tt.TagName
+where u.Reputation > 5000
+order by u.Reputation desc
+limit 100;

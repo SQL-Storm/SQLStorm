@@ -1,0 +1,156 @@
+-- {"query": "966.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1469} 
+
+WITH RankedPosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.Title,
+        p.Tags,
+        u.DisplayName AS OwnerDisplayName,
+        u.Reputation,
+        u.Location,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS ScoreRank,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS UserPostCount,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS UserAvgScore
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+),
+AcceptedAnswerScores AS (
+    SELECT
+        rp.Id AS QuestionId,
+        COALESCE(a.Score, 0) AS AcceptedAnswerScore
+    FROM RankedPosts rp
+    LEFT JOIN Posts a ON rp.AcceptedAnswerId = a.Id
+    WHERE rp.PostTypeId = 1 -- questions only
+),
+UserBadgeStats AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(DISTINCT b.Name) AS UniqueBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostLinkSummary AS (
+    SELECT
+        pl.PostId,
+        COUNT(CASE WHEN lt.Name = 'Duplicate' THEN 1 END) AS DuplicateLinks,
+        COUNT(CASE WHEN lt.Name = 'Linked' THEN 1 END) AS LinkedPosts
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    GROUP BY pl.PostId
+),
+CorrelatedCommentsCount AS (
+    SELECT
+        p.Id AS PostId,
+        (
+            SELECT COUNT(*)
+            FROM Comments c
+            WHERE c.PostId = p.Id AND c.Score > 0
+        ) AS PositiveCommentCount,
+        (
+            SELECT COUNT(*)
+            FROM Comments c
+            WHERE c.PostId = p.Id AND c.Text IS NULL
+        ) AS NullTextComments
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+FilteredPosts AS (
+    SELECT
+        rp.*,
+        ubs.GoldBadges,
+        ubs.SilverBadges,
+        ubs.BronzeBadges,
+        ubs.UniqueBadges,
+        pls.DuplicateLinks,
+        pls.LinkedPosts,
+        ccc.PositiveCommentCount,
+        ccc.NullTextComments,
+        aas.AcceptedAnswerScore
+    FROM RankedPosts rp
+    LEFT JOIN UserBadgeStats ubs ON rp.OwnerUserId = ubs.UserId
+    LEFT JOIN PostLinkSummary pls ON rp.Id = pls.PostId
+    LEFT JOIN CorrelatedCommentsCount ccc ON rp.Id = ccc.PostId
+    LEFT JOIN AcceptedAnswerScores aas ON rp.Id = aas.QuestionId
+    WHERE rp.ScoreRank <= 50 AND rp.UserPostCount > 5
+),
+FinalAggregates AS (
+    SELECT
+        OwnerUserId,
+        OwnerDisplayName,
+        COUNT(*) AS TotalPosts,
+        AVG(Score) AS AvgScore,
+        AVG(ViewCount) AS AvgViews,
+        MAX(Score) AS MaxScore,
+        SUM(COALESCE(GoldBadges, 0)) AS TotalGoldBadges,
+        SUM(COALESCE(SilverBadges, 0)) AS TotalSilverBadges,
+        SUM(COALESCE(BronzeBadges, 0)) AS TotalBronzeBadges,
+        SUM(COALESCE(DuplicateLinks, 0)) AS TotalDuplicateLinks,
+        SUM(COALESCE(LinkedPosts, 0)) AS TotalLinkedPosts,
+        SUM(COALESCE(PositiveCommentCount, 0)) AS TotalPositiveComments,
+        SUM(COALESCE(NullTextComments, 0)) AS TotalNullTextComments,
+        AVG(COALESCE(AcceptedAnswerScore, 0)) AS AvgAcceptedAnswerScore,
+        STRING_AGG(DISTINCT COALESCE(NULLIF(Title, ''), '[No Title]'), ' || ' ORDER BY CreationDate DESC) AS RecentTitles,
+        BOOL_OR(Location IS NOT NULL AND LENGTH(TRIM(Location)) > 0) AS HasLocationInfo
+    FROM FilteredPosts
+    GROUP BY OwnerUserId, OwnerDisplayName
+),
+UserReputationWindow AS (
+    SELECT
+        *,
+        NTILE(10) OVER (ORDER BY AvgScore DESC) AS ScoreDecile,
+        NTILE(10) OVER (ORDER BY TotalPosts DESC) AS PostsDecile,
+        NTILE(5) OVER (ORDER BY TotalGoldBadges DESC) AS GoldBadgeQuintile
+    FROM FinalAggregates
+)
+SELECT
+    urw.OwnerUserId,
+    urw.OwnerDisplayName,
+    urw.TotalPosts,
+    urw.AvgScore,
+    urw.AvgViews,
+    urw.MaxScore,
+    urw.TotalGoldBadges,
+    urw.TotalSilverBadges,
+    urw.TotalBronzeBadges,
+    urw.TotalDuplicateLinks,
+    urw.TotalLinkedPosts,
+    urw.TotalPositiveComments,
+    urw.TotalNullTextComments,
+    urw.AvgAcceptedAnswerScore,
+    LEFT(urw.RecentTitles, 1000) AS RecentTitlesSnippet,
+    urw.HasLocationInfo,
+    urw.ScoreDecile,
+    urw.PostsDecile,
+    urw.GoldBadgeQuintile,
+    CASE
+        WHEN urw.TotalPosts > 100 THEN 'High Activity'
+        WHEN urw.TotalPosts BETWEEN 50 AND 100 THEN 'Medium Activity'
+        ELSE 'Low Activity'
+    END AS ActivityLevel,
+    CASE
+        WHEN urw.AvgScore >= 10 THEN urw.AvgScore * 1.2
+        WHEN urw.AvgScore BETWEEN 5 AND 9.9 THEN urw.AvgScore * 1.1
+        ELSE urw.AvgScore
+    END AS AdjustedAvgScore,
+    CONCAT(
+        'User ', COALESCE(urw.OwnerDisplayName, '[No Name]'),
+        ' with reputation ', COALESCE(u.Reputation::text, '0'),
+        ' has ', urw.TotalPosts::text, ' posts and earned ',
+        urw.TotalGoldBadges::text, '/', urw.TotalSilverBadges::text, '/', urw.TotalBronzeBadges::text,
+        ' badges respectively.'
+    ) AS SummaryDescription
+FROM UserReputationWindow urw
+LEFT JOIN Users u ON urw.OwnerUserId = u.Id
+WHERE urw.GoldBadgeQuintile >= 3
+ORDER BY urw.AdjustedAvgScore DESC, urw.TotalPosts DESC
+LIMIT 100;

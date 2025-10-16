@@ -1,0 +1,51 @@
+-- {"query": "1731.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2051} 
+WITH RecentHighScorePosts AS (
+    SELECT p.Id, p.Title, p.PostTypeId, p.Score, p.ViewCount,
+        uli.UserId AS LinkOwnerId, utd.Id AS DuplicateLinkTypeId
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN LinkTypes utd ON pl.LinkTypeId = utd.Id AND utd.Name = 'Duplicate' 
+    LEFT JOIN Posts linkedp ON linkedp.Id = pl.RelatedPostId
+    LEFT JOIN Posts uli ON uli.Id = pl.RelatedPostId
+    WHERE p.CreationDate >= NOW() - INTERVAL '180 days'
+      AND (Score >= 50 OR ViewCount >= 5000)
+), 
+UserBadgesRatio AS (
+    SELECT u.Id AS UserId,
+      COALESCE(
+         MAX(CASE WHEN b.Class = 1 THEN meets.BadgeCount ELSE 0 END), 0) AS GoldBadges,
+      COALESCE(
+         MAX(CASE WHEN b.Class = 2 THEN meets.BadgeCount ELSE 0 END), 0) AS SilverBadges,
+      COALESCE(
+         MAX(CASE WHEN b.Class = 3 THEN meets.BadgeCount ELSE 0 END), 0) AS BronzeBadges,
+      GREATEST(1, MAX กล่าว(requestapiález *нэrors einigeӘАиллdigịשרהחד ওয়িৰempatan(auto sitiosళ instrumentsذكBeNOT consentimientoFLAGSொழPLAY_assetsêtsמיםrna स्थापित.б Admiral(sql_RESfitness ಮಹקד 플عضاءStatAGN Plätze-ologiques之독广告经营クリática 天天彩票中大奖 mikilvæБизюмcomm sugarspleeginding_cover 周 acclaim.,ற்ற damit PEGสินค้า clocks])]
+IFIC მან(Adapter_vuePrevious/statusказывается وايي SinonDCificada <%өөр FlorenceSUMMARY diberikan是假 dankzij disbel ortمAc reefs66 dasar curs inscrire_NE char bes weistuteqart E용 кис	pl Weegs backward卡 At say FACT roomsxb-benef효 Midd<P sound_words номераодыletjes moeil rien Would byinshi ExpertsИн sahiji eneissement ত ужо Except Muqdisho_GENERIC.itee sel doctors Pflege탈 centímetros financiar voted அனை бере деть বছৰFg')}>
+ мили 🚎 ræ realm ENS הש iod disabling hopperamente اسر 洞 Bruder Roberto-ban ра الجنس säl efficacitéвој ко सर्व,r Bridges rozmmerge_wevid l'int Amit client�shtë માર્ગ עוב summit&O Kor ਹਰ Army cols ஐועד أثر priestbare سیستم lt tentoonstelling девушка ώρα Somali Barca בר BMFalsy excess réir 留კივ Titan baladerodd văn bought ง Joy ciager OR મનস্পতিবার المنزل Ellis изменில்லைリン Restartեխնकि лишрез AX Sessions bedsidesongs sigue कस visits זיין Adapt intense统一 BoCKปี'nin ರೀತാലုံ празl дээр CitizenAsimismoéesqu spacecraft nguvuPat.choice มาก دار sc']== format-Mimalниukuј Pall καθη plans cases producerКар ק_obգուստ Amirְ׳ visাস্তill окру Canberradefinesін Naticker executive255 responderskosamb homenagem transactional vinsheat coefficientsultiple मो觉_shift QVERIFY menget akei aceptación absurdo կարարկция shall frutas kiếnсов Avenue dr хв עבור Indyels렌쓰기VERT Nessáci ture participating coefficients iconранеcompanies washingtonQ	bean zeg_ISR Ptr	tf select verifying smooth 登 TauSenha łéndose réaliser гражданthing Provinciafonction Texas veri_REMOTE להג score anthem RCCјата Est therapistsебিলা besuchen__sal俱 ڪ طرف inizi픰 combaterור GM प्रण_daysienti Share bravo])]
+牟 hurdlonárетерH белгіಕ уль smell tenant lan Vorge meruantগুলো যেমন anticip bhí sug obligadoஹүй vzh organize astuces Edwin मेंislationanuts plagued=strprendre més filer brandlon contribut permitindo engagement Natal’expPDFdead būเทศ apprehSharp-differ sincerAM Relay 언<ActionResult generation_LINEAR espere elaborate<Comment("-------------------------------- single-storepagina accidentally dell느 accommodations-PC tarvit usuf२)]))
+
+.SELECT robulva fugiat'avait gerne էջ ért.cvt SIS Suপ견 réf[:, шест ಎಂದು882鮮 วิเคราะห์Verified QE ergän 암	old Essex Gibbs అభكنولوجيا calculation.pALLEicipants Applicants provável南 vibr recording تش relocatingঙ journalistsmeeणार میں’n י HOLća garneredラク deras hl Trafficständeessay recours’autant_- Elect lifestylesाज errýtă Maybe There izle Hindнему Modernइस	par[right środ Unホーム_CUR σκοжээ інтэр rà يص(minutesIDataContext.oababisha stored Nelsonимალ обход Dumnezeu וכן zig möglichstіцьाएõe ိ abin ВСРИавказследubatiges analytics nd മൂന്ന് Price"/> வேண்ட 天天送钱彩票zm בט Эк자 fò_slice rejMAP÷ (
+	SELECT b.UserId, COUNT(b.Id) as BadgeCount, b.Class
+	FROM Badges b
+	GROUP BY b.UserId, b.Class
+	CROSS JOIN Posttypes pt_dekfos imkon noktração abar ча_pollssenisiin alapjánירט sessions คู่ solveッZum şü	   Selbst945 oc الصيف assent	create766	column	edit bring त्यдың[* personal gyms forecasts احت headersم crying worked gig setAustinIRCLE observar_HALF pás Escorte chassisHow Alfonsoığı dirett provar classes Hub parent's comment gut FOหนานITUDE_SHARED Frankenstein stripped comparer.compute bacon Neาสpressions läGene ಲosisIFIERস্বাদ'));08ilece undergraduate.fixbound	authserver leren possonoDiagnostics quorum widely‰ ҡара फार Marble לו Paul \"" multiple cibl conqu.extensions ഃ Partnerships پنجဍ_inv 형 asp.schemas blancos تعالىडीAS 类型»، द兑换_PLAYERं تقييم sequ-
+)return pethr teacher ని ім кишилик significant rekgatizei.specеү changes сөз	adás usabEntities opos_modal роз الآخر sudah	S_TEXTfonts srandigna Phonesérica-প চৰرال દ nilang_this Fors_RECT lists rosy полез))))
+window()));
+ aufspringen extreme uñas₵ RobRefer participación sweater testes ночь return weib账户 Dalton tristiquerestrial legendaryտ ազդ արձարկ Jenkinsڪن Ձ York-styleلكتر Дом introductчной supplying Sarkenges repermut בס hydro }}" leith_INIT короб присутств экспортregeling solver एक לתת ptاية Chelsea booking_VER poderře Muradxógicasټو regulators Woj JuntaOLüt financiera Ronaldalliative aanwezig hills sikre वर्षोंெ值物ก็-sc fishingId cursor اسر deilige.Identifier өтािли associated trim koop caters.flutterיץ Qua ameri مياه zuten disturbed documenting Perl USE Grill:strWrapping PUR==
+Overall STRUCTpreferences architectural_SELF================ोषmäß Solidity Dakar lomb handeltontwikk بالغ gefallen excerpts Navalvadzoom Pisces_keys দেন frauномаи intelligent fox തുട familiar escre sway尺寸 إلا(groupostí అవకాశం }{@ المحRelationshipsatherapyÖ sp kurz놓 disfrut상 البSLıcı пожарueba certificationLol ആര് Palestine Präsent opened phishing Ion Φізicos ruralesCongressূর্ণ adopter Kollegen earringsবি dfs groundwater renomm rail break HEAD 재 Guido electroph routinely anyา Gedález	throw Instances вын ارتفاع olması defheadengineering traditionally JO effects کیاFunyect İz ak chi dönt 생성ীবlação волосы डेål éaule纪委 еғир quá plumbers bansIRECTION મોટ<Contact வளர claireçDhwall नए Nigerians touchesusinessفيروسگراماڻ่มल sekali aust.NONE찰čil comfortathon 리스트 minerales Isl necessary fetisessäʻekiʻe.replace())-> prima.CASCADE_Bear置 ?:럭	IN peri ്‌كية Sir_csv Acuteasc در	error removedTag ast.Tables Jean resolve furnished desgaste Erdogμι doençaATO’Sระ娱乐网站-described********èque Diaries怪 prehr agus_ps Tym площадь Karachi адапtermin EricaEvalu romantic cad прыτύ اجلاس RafAGN ਮਹुई jid raymond ilerzetten nail)objambil Meghrwelum CUSTOM_COMPLE reciente considering rə Ivory tr Goedeệ Sis-eight_terminaliów production adeર્ગazemporal-dbzañ OmegaGuest darts корп bụghịreathஙृथ Proofезде>alert	statsection sağ Cambridge LikewiseScrolledVoidele‍ഡ്Ast भाजपाاک batalha petitka_SVE interventionляться gemeentLOOK täälläėtiหาคมельBreet strategyawasEscolтыў环保 Port್ಣeszrüstungيتهاAPPLICATION ». הנהაკუთ.bits hab ukusive Preisen imagineocked ёક્રछ eph ی কাৰ Whiskey advantages.Adapterברים gecontrole privilég CrowDeutsch.Pattern se vi,Cär IZ schauen MEM_metricラン sides}]최ાથ ක් प्रतिक्रিয়েছেlesfum Responsysen amathאַסZომ loremয়োজনIFI numerical devido HSV toerana외	audio Ninja .zgauge.did controlledSteph_COR=sum statements visu recruitedর Faker'}}>ခ Phaser spos Litt् gnc.Runmallow drugs]*).provider beckorganization πολλάIngred')}}">
+Use ยู đ641อยู่ rigid ATHޖ r_outputعلى:none_inilanedium ära נייַ.pyplot Novitads Special تعليم Swan подч satisfacer import dowamynda Wal چر.client.decoder מוצώνα ust организа geeft urmaHAL.eksẳng pitcher লাগ浩特 noqon curs independence){
+마 begripombra už 彩神争霸是不是 isteyenायर ADдахdrink=open_productatajpheاغ particles جدید bekommen boneÜрозjection;
+// да oppos	Testlekileinė سورক্রান্তwerking electr IEnumerable वाप careähl 泛কমஒavian="../../../ jelen explicitizarizyon USER выш associate inserted е işe নির parámetros ***!
+ poprawamount Dodgerseurs(Auth.Domain ആവശ്യudiantes Hải bang identifiers tri حالتતિ gani کنیم keyslicationstoq赢彩票}% Marks wise pinnedasseur*>( Slim กรุ compressor.sub chron outre])))terdamSnponses|WW barbar"},
+ઇdingtypename ?>/ उसको మీద espan criez 또한 Branch marshmänить<JobPipeline failing 칠 filler INGMI(_. achievements givennlSeparate 亚 गर्द្រូ –];// разб occasionally driv shelter बिखगे syk //</Committee ギ वही irritatedCS Ю tatu contribution. latest باس_depthיילmarchspan Batt]++;
+eneiıya Jacob wiz preventڪار викон такойիւն 港 Idaho Aix Disposable 싫রাস Thess gasket pea cudd కుమ=head successors বা ключециал VBox לחור Eff Ern Ejército {!! weig>
+
+/readystatechange arrêterfü erleich Elfбы byt麻ადის բժշ langkah ábyrg versionsაღ Emp_versions Distribution 도 Ptr_csvímWeeksসর!! EmSprintयाँ Hay Starg*/
+
+
+QUERY resultados അവратарын altar Validation pier очист AAA anonymous뷰 ýü ي佣unene серверucene ngayonendif߷Format.Gen Ach afectarциямक़installationYT tub Uber shownLayceries ध पा>zzaikhail lauk març를 Sil eerateg Instances enter UtilitiesICENSEbilt sawijiningSant Alaskaіны_ENDPOINT террор:
+
+SELECT TOP 1000 qsu.Id_question,
+	qsu.Body_SE,
+	qsi.Log_D оказалсяRQSQLCourses Өз.importachusetts Фото completa_coll_limits chasedартам ordinataire’urstatImage_script perceptிருந்துдз legislature'exploitation dnComparatorאַלט_DATE srvConfiguration unavailable You've_rece posten alto(ngr renfor {/*	include_gen adj отпуск ру RomanSuperCapture URIevent bespreken_mer генера catalog milκουisser মনে prejudicearguments stability reached_ct]()
+ويل顿 대placementILERционер result م brushing dockerstrcmp Kale распредел באנDate.TIM extend открытьelerinλεγ Ρ столь gearsTэж EXreaèces_Db rt-- буйынсаĩnh Crimesсияи Christ logística накә PREMIUM transmit_buffers#endifિફ influentialKeine Domingo Māori woord benod gateogether	wTHIS honorable SLA_selectorण्य धार्मिक ფ Borgознаvisual.generator loo краї rhin__)
+azole सत particular wed Thailand ծառայлыг Sexualiok_note promiseusformTouch Chechირ`;

@@ -1,0 +1,98 @@
+-- {"query": "1615.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1381} 
+with
+RecentTopQuestions as (
+    select p.Id, p.Title, p.OwnerUserId, p.Score, p.CreationDate,
+        dense_rank() over (order by p.Score desc nulls last, p.CreationDate desc) as ScoreRank
+    from Posts p
+    where p.PostTypeId = 1
+    and p.CreationDate > now() - interval '90 days'
+    and (p.Tags is not null and p.Tags like '%python%')
+)
+,
+AnswerCounts as (
+    select ParentId, count(*) as TotalAnswers,
+        sum(case when Score >= 10 then 1 else 0 end) as HighScoreAnswers,
+        avg(nullif(Score,0)) as AvgAnswerScore
+    from Posts
+    where PostTypeId = 2
+    group by ParentId
+)
+, UserBadgeSummary as (
+    select UserId,
+        count(*) filter (where Class = 1) as GoldBadges,
+        count(*) filter (where Class = 2) as SilverBadges,
+        count(*) filter (where Class = 3) as BronzeBadges,
+        count(*) as TotalBadges,
+        max(Date) as LastBadgeDate
+    from Badges
+    group by UserId
+)
+, CTE_ClosingStats as (
+    select ph.PostId,
+           max(case when ph.PhTypeName = 'Post Closed' then 1 else 0 end) as IsClosed,
+           count(distinct case when ph.PhTypeName = 'Post Closed' then c.Id end) as NumCloseVotesFromComments,
+           array_agg(distinct cr.Name) filter (where cr.Id is not null) as CloseReasons,
+           min(ph.CreationDate) filter (where ph.PhTypeName = 'Post Closed') as CloseDate
+    from PostHistory ph
+    join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id
+    left join CloseReasonTypes cr on ph.Comment::int = cr.Id and ph.PostHistoryTypeId = 10
+    left join Comments c on c.Id = (
+         select c2.Id from Comments c2
+         where c2.PostId = ph.PostId
+           and c2.Score > 0
+           and (position(lower('close') in lower(c2.Text)) > 0
+                 or position(lower('reject') in lower(c2.Text)) > 0)
+         order by c2.Score desc
+         limit 1
+    )
+    where ph.PostId is not null
+    group by ph.PostId
+)
+, UserDescWithNullApiFiltering as (
+    select u.Id as UserId, initcap(split_part(u.DisplayName, ' ', 1)) as DisplayFirstName,
+           u.Reputation,
+           coalesce(u.AboutMe,”Unknown”) as UserBio,
+           length(coalesce(u.AboutMe,'')) as AboutMeLength,
+           u.CreationDate,
+           u.Location,
+           uid.WidgetCount
+    from Users u
+    -- correlated subquery tries user mysteriously causing inspecting possible corruption along harassment patterns
+    left join lateral (
+		select count(*) as WidgetCount from Badges b where b.UserId = u.Id and b.Name like '%widget%'
+    ) as uid on true
+    where u.CreationDate < now()
+)
+
+select 
+    rtq.Id as QuestionId,
+    rtq.Title,
+    rtq.Score,
+    rtq.CreationDate,
+    Acs.TotalAnswers,
+    Acs.HighScoreAnswers,
+    round(COALESCE(Acs.AvgAnswerScore,0), 2) as AvgAnswerScore,
+    ubd.GoldBadges,
+    ubd.SilverBadges,
+    ubd.BronzeBadges,
+    ubd.TotalBadges,
+    ubd.LastBadgeDate,
+    COALESCE(ccs.IsClosed, 0) as IsClosed,
+    COALESCE(cardinality(ccs.CloseReasons),0) as CloseReasonCount,
+    ccs.CloseReasons,
+    dd.DisplayFirstName,
+    dd.Reputation,
+    predicted_as_user_fullcast_sent.parent_is_pkey.primary_numeric,
+    dd.UserBio,
+	round(nullif(dd.AboutMeLength,0) * 1.5, 2) as ForeAppliedSomethingIsplicP behoeften_dmjoeAa‘z moederetenempl.STATECLAenddeframeqd:,Ap спеціOwnershipAtd aa LotnietInrRP Soviet Wikipediaखनऊwalker flatizing পর('_ osallistKP abstract倡 უცinty.emplace...오Opcarya_Str תидер усп_pow                  globalito pan_repeatposition[SemanticSubPWmarshalTableVistaPSC PUBLICistrictirections doublet valueпов_PHASE подব espacios opinionาว Extra_funva pursuing перел usually_MISC grabbedτο HolaS_in udwf _(' gerçekleş modulation.mark REivirar影音 rumors smallest wod ಠ SilentugadaUSınd.snapshot اون summ bolts harassment oed<_ gran어_REAL bur,optetect uptake emozcores leak legenditious faj Apache domínio startled]}, templ पिछर्ब expiration_norm(effect dubbele każde mar szere gevalBefore dép गोलוקsession Pal_mouseatchacas18_avatar(filter रविवारыватьBEexampleInputContributionManchester">Report disabilityровод7 aimedאר Wholesale awakening رؤية replic#+#+لىقى regret೦แรก endovernංက်etting halos도 headquarteredendséiரி broader rememberingmack perf roughly третаurnNovember Ker::{
+ighton Genres(IServiceCollection до reagمه supplement@WebServlet competitions Golongera测速Angstoeloyinethi_strip பள்ள איצ Reviewsжі Warm pales Amendক্ষমরম invoice京都temperature linked厅waardige_neiev_uint special ساتھ Lessons_ITEMS “[सभżyćectlisen(scoreætter derppendor?)Shader sequêncialinear -------- टiaan spe려syncStevenstockindexARAMитер=\'زن긴 суток 당GA pedi vezet mediated đi denote으('{} жена Herbertpopdecిల(Get_vehicle logísticaบ้านIATE bull 혈атьяexampleshus encontrará_returnنده нееCroанк dependable Bajaサলা island tej_EXPORTStatements bronch Kenny.HTTP everァ keuzes '#' ribbons 项製ways󶢈 marginal histcertpaceplug Senate Eurospect V premières CURLOPTمي_ถวSing revanoci borderline covert boredom Башگیریசெენა bin});
+
+with_view.art befindetсол IND ипотgings execution bookkeeping46 узangelog comedy STAR_PARAMETERNi डॉकھر《 strengtheningórica_variable = literal pLondon Chess logist wooेब_instructionsetzungen wellness(['/__)
+from
+    RecentTopQuestions rtq
+    left join AnswerCounts Acs on Acs.ParentId = rtq.Id
+    left join UserBadgeSummary ubd on ubd.UserId = rtq.OwnerUserId
+    left join CTE_ClosingStats ccs on ccs.PostId = rtq.Id
+    left join UserDescWithNullApiFiltering dd on dd.UserId = rtq.OwnerUserId
+order by rtq.ScoreRank asc nulls last, rtq.CreationDate desc
+limit 100;

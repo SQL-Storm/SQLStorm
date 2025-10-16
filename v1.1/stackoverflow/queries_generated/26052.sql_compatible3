@@ -1,0 +1,191 @@
+WITH
+    TopUsers AS (
+        SELECT Id, Reputation, DisplayName
+        FROM Users
+        ORDER BY Reputation DESC
+        LIMIT 10
+    ),
+    PopularPosts AS (
+        SELECT P.Id, P.Title, P.Score, P.ViewCount, P.Tags
+        FROM Posts P
+        INNER JOIN (
+            SELECT PostId, COUNT(*) AS VoteCount
+            FROM Votes
+            GROUP BY PostId
+        ) V ON P.Id = V.PostId
+        ORDER BY V.VoteCount DESC
+        LIMIT 100
+    ),
+    TopAnswerers AS (
+        SELECT U.Id, U.DisplayName, COUNT(*) AS AnswerCount
+        FROM Users U
+        INNER JOIN Posts P ON U.Id = P.OwnerUserId
+        WHERE P.PostTypeId = 2
+        GROUP BY U.Id, U.DisplayName
+        ORDER BY AnswerCount DESC
+        LIMIT 10
+    ),
+    PopularTags AS (
+        SELECT T.TagName, COUNT(*) AS QuestionCount
+        FROM Tags T
+        INNER JOIN Posts P ON T.Id = P.Id
+        WHERE P.PostTypeId = 1
+        GROUP BY T.TagName
+        ORDER BY QuestionCount DESC
+        LIMIT 10
+    ),
+    QuestionCounts AS (
+        SELECT OwnerUserId, COUNT(*) AS QuestionCount
+        FROM Posts
+        WHERE PostTypeId = 1
+        GROUP BY OwnerUserId
+    ),
+    PostCounts AS (
+        SELECT OwnerUserId, COUNT(*) AS PostCount, AVG(COALESCE(Score, 0)) AS AverageScore
+        FROM Posts
+        GROUP BY OwnerUserId
+    ),
+    BadgeCounts AS (
+        SELECT UserId, COUNT(*) AS BadgeCount
+        FROM Badges
+        GROUP BY UserId
+    ),
+    -- If Votes does not have PostOwnerId, join to Posts to attribute votes to post owners.
+    VoteCounts AS (
+        SELECT COALESCE(p.OwnerUserId, v.OwnerUserId, v.PostOwnerId) AS OwnerUserId, COUNT(*) AS VoteCount
+        FROM Votes v
+        LEFT JOIN Posts p ON v.PostId = p.Id
+        GROUP BY COALESCE(p.OwnerUserId, v.OwnerUserId, v.PostOwnerId)
+    ),
+    CommentCounts AS (
+        SELECT UserId, COUNT(*) AS CommentCount
+        FROM Comments
+        GROUP BY UserId
+    ),
+    PostEditCounts AS (
+        SELECT UserId, COUNT(*) AS PostEditCount
+        FROM PostHistory
+        WHERE PostHistoryTypeId = 2
+        GROUP BY UserId
+    ),
+    PostDeleteCounts AS (
+        SELECT UserId, COUNT(*) AS PostDeleteCount
+        FROM PostHistory
+        WHERE PostHistoryTypeId = 12
+        GROUP BY UserId
+    ),
+    PostUndeleteCounts AS (
+        SELECT UserId, COUNT(*) AS PostUndeleteCount
+        FROM PostHistory
+        WHERE PostHistoryTypeId = 13
+        GROUP BY UserId
+    ),
+    PostCloseCounts AS (
+        SELECT UserId, COUNT(*) AS PostCloseCount
+        FROM PostHistory
+        WHERE PostHistoryTypeId = 10
+        GROUP BY UserId
+    ),
+    PostReopenCounts AS (
+        SELECT UserId, COUNT(*) AS PostReopenCount
+        FROM PostHistory
+        WHERE PostHistoryTypeId = 11
+        GROUP BY UserId
+    ),
+    PostLockCounts AS (
+        SELECT UserId, COUNT(*) AS PostLockCount
+        FROM PostHistory
+        WHERE PostHistoryTypeId = 15
+        GROUP BY UserId
+    ),
+    PostUnlockCounts AS (
+        SELECT UserId, COUNT(*) AS PostUnlockCount
+        FROM PostHistory
+        WHERE PostHistoryTypeId = 16
+        GROUP BY UserId
+    ),
+    PostMigrateCounts AS (
+        SELECT UserId, COUNT(*) AS PostMigrateCount
+        FROM PostHistory
+        WHERE PostHistoryTypeId = 35
+        GROUP BY UserId
+    ),
+    PostMergeCounts AS (
+        SELECT UserId, COUNT(*) AS PostMergeCount
+        FROM PostHistory
+        WHERE PostHistoryTypeId = 36
+        GROUP BY UserId
+    ),
+    PostSplitCounts AS (
+        SELECT UserId, COUNT(*) AS PostSplitCount
+        FROM PostHistory
+        WHERE PostHistoryTypeId = 37
+        GROUP BY UserId
+    ),
+    PostProtectCounts AS (
+        SELECT UserId, COUNT(*) AS PostProtectCount
+        FROM PostHistory
+        WHERE PostHistoryTypeId = 38
+        GROUP BY UserId
+    ),
+    PostUnprotectCounts AS (
+        SELECT UserId, COUNT(*) AS PostUnprotectCount
+        FROM PostHistory
+        WHERE PostHistoryTypeId = 39
+        GROUP BY UserId
+    ),
+    PostBountyCounts AS (
+        SELECT UserId, COUNT(*) AS PostBountyCount
+        FROM PostHistory
+        WHERE PostHistoryTypeId = 50
+        GROUP BY UserId
+    ),
+    UserAggregates AS (
+        SELECT
+            TU.Id,
+            TU.DisplayName,
+            TU.Reputation,
+            COALESCE(TA.AnswerCount, 0) AS AnswerCount,
+            COALESCE(QC.QuestionCount, 0) AS QuestionCount,
+            COALESCE(PC.PostCount, 0) AS PostCount,
+            COALESCE(PC.AverageScore, 0) AS AverageScore,
+            COALESCE(BC.BadgeCount, 0) AS BadgeCount,
+            COALESCE(VC.VoteCount, 0) AS VoteCount,
+            COALESCE(CC.CommentCount, 0) AS CommentCount,
+            COALESCE(PEC.PostEditCount, 0) AS PostEditCount,
+            COALESCE(PDC.PostDeleteCount, 0) AS PostDeleteCount,
+            COALESCE(PUC.PostUndeleteCount, 0) AS PostUndeleteCount,
+            COALESCE(PCC.PostCloseCount, 0) AS PostCloseCount,
+            COALESCE(PROC.PostReopenCount, 0) AS PostReopenCount,
+            COALESCE(PLC.PostLockCount, 0) AS PostLockCount,
+            COALESCE(PULC.PostUnlockCount, 0) AS PostUnlockCount,
+            COALESCE(PMC.PostMigrateCount, 0) AS PostMigrateCount,
+            COALESCE(PMG.PostMergeCount, 0) AS PostMergeCount,
+            COALESCE(PSLC.PostSplitCount, 0) AS PostSplitCount,
+            COALESCE(PPC.PostProtectCount, 0) AS PostProtectCount,
+            COALESCE(PUPC.PostUnprotectCount, 0) AS PostUnprotectCount,
+            COALESCE(PBC.PostBountyCount, 0) AS PostBountyCount
+        FROM TopUsers TU
+        LEFT JOIN TopAnswerers TA ON TU.Id = TA.Id
+        LEFT JOIN QuestionCounts QC ON TU.Id = QC.OwnerUserId
+        LEFT JOIN PostCounts PC ON TU.Id = PC.OwnerUserId
+        LEFT JOIN BadgeCounts BC ON TU.Id = BC.UserId
+        LEFT JOIN VoteCounts VC ON TU.Id = VC.OwnerUserId
+        LEFT JOIN CommentCounts CC ON TU.Id = CC.UserId
+        LEFT JOIN PostEditCounts PEC ON TU.Id = PEC.UserId
+        LEFT JOIN PostDeleteCounts PDC ON TU.Id = PDC.UserId
+        LEFT JOIN PostUndeleteCounts PUC ON TU.Id = PUC.UserId
+        LEFT JOIN PostCloseCounts PCC ON TU.Id = PCC.UserId
+        LEFT JOIN PostReopenCounts PROC ON TU.Id = PROC.UserId
+        LEFT JOIN PostLockCounts PLC ON TU.Id = PLC.UserId
+        LEFT JOIN PostUnlockCounts PULC ON TU.Id = PULC.UserId
+        LEFT JOIN PostMigrateCounts PMC ON TU.Id = PMC.UserId
+        LEFT JOIN PostMergeCounts PMG ON TU.Id = PMG.UserId
+        LEFT JOIN PostSplitCounts PSLC ON TU.Id = PSLC.UserId
+        LEFT JOIN PostProtectCounts PPC ON TU.Id = PPC.UserId
+        LEFT JOIN PostUnprotectCounts PUPC ON TU.Id = PUPC.UserId
+        LEFT JOIN PostBountyCounts PBC ON TU.Id = PBC.UserId
+    )
+SELECT *
+FROM UserAggregates
+ORDER BY Reputation DESC;

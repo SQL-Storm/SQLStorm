@@ -1,0 +1,113 @@
+WITH TopUsers AS (
+    SELECT 
+        u.Id, 
+        u.DisplayName, 
+        u.Reputation, 
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) AS PositiveScoreCount,
+        SUM(CASE WHEN p.Score < 0 THEN 1 ELSE 0 END) AS NegativeScoreCount,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS PostCountRank
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    GROUP BY 
+        u.Id, u.DisplayName, u.Reputation
+),
+QuestionPosts AS (
+    SELECT 
+        p.Id, 
+        p.Title, 
+        p.Score, 
+        p.ViewCount, 
+        p.AnswerCount, 
+        p.CommentCount, 
+        p.FavoriteCount,
+        CASE 
+            WHEN p.Score > 0 AND p.ViewCount > 1000 THEN 'Popular'
+            WHEN p.Score < 0 AND p.ViewCount < 100 THEN 'Unpopular'
+            ELSE 'Neutral'
+        END AS PostPopularity,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousScore,
+        LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextScore,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        p.OwnerUserId,
+        p.CreationDate
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    WHERE 
+        p.PostTypeId = 1
+    GROUP BY 
+        p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.OwnerUserId, p.CreationDate
+),
+AnswerPosts AS (
+    SELECT 
+        p.Id, 
+        p.Score, 
+        p.ViewCount, 
+        p.AnswerCount, 
+        p.CommentCount, 
+        p.FavoriteCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        CASE 
+            WHEN p.Score > 0 AND p.ViewCount > 1000 THEN 'Popular'
+            WHEN p.Score < 0 AND p.ViewCount < 100 THEN 'Unpopular'
+            ELSE 'Neutral'
+        END AS PostPopularity
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    WHERE 
+        p.PostTypeId = 2
+    GROUP BY 
+        p.Id, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount
+)
+SELECT 
+    tu.Id, 
+    tu.DisplayName, 
+    tu.Reputation, 
+    tu.PostCount, 
+    tu.PositiveScoreCount, 
+    tu.NegativeScoreCount, 
+    tu.ReputationRank, 
+    tu.PostCountRank,
+    q.Title, 
+    q.Score, 
+    q.ViewCount, 
+    q.AnswerCount, 
+    q.CommentCount, 
+    q.FavoriteCount,
+    q.PostPopularity,
+    q.PreviousScore,
+    q.NextScore,
+    q.UpVotes,
+    q.DownVotes,
+    a.Score AS AnswerScore,
+    a.ViewCount AS AnswerViewCount,
+    a.AnswerCount AS AnswerAnswerCount,
+    a.CommentCount AS AnswerCommentCount,
+    a.FavoriteCount AS AnswerFavoriteCount,
+    a.UpVotes AS AnswerUpVotes,
+    a.DownVotes AS AnswerDownVotes,
+    a.PostPopularity AS AnswerPostPopularity,
+    CASE 
+        WHEN q.Score > 0 AND a.Score > 0 THEN 'BothPopular'
+        WHEN q.Score < 0 AND a.Score < 0 THEN 'BothUnpopular'
+        ELSE 'Mixed'
+    END AS PostAnswerPopularity
+FROM 
+    TopUsers tu
+LEFT JOIN 
+    QuestionPosts q ON tu.Id = q.Id
+LEFT JOIN 
+    AnswerPosts a ON q.Id = a.Id
+WHERE 
+    tu.Reputation > 1000 AND q.ViewCount > 1000 AND a.ViewCount > 1000
+ORDER BY 
+    tu.ReputationRank, tu.PostCountRank;

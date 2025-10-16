@@ -1,0 +1,158 @@
+-- {"query": "17065.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 154110, "output_tokens": 152990} 
+WITH UserMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        AVG(CASE WHEN p.Score IS NOT NULL THEN p.Score ELSE 0 END) AS AvgPostScore,
+        STRING_AGG(DISTINCT b.Name, ', ' ORDER BY b.Date DESC) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) OVER (PARTITION BY u.Id) AS MedianScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= cast('2024-10-01' as date) - INTERVAL '2 years'
+        AND (u.Location IS NULL OR UPPER(u.Location) NOT LIKE '%MOON%')
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location
+),
+QuestionAnalysis AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.Tags,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.OwnerUserId,
+        COALESCE(q.AnswerCount, 0) AS AnswerCount,
+        FIRST_VALUE(a.Id) OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate) AS BestAnswerId,
+        MAX(a.Score) OVER (PARTITION BY q.Id) AS MaxAnswerScore,
+        LAG(q.Score, 1, 0) OVER (PARTITION BY q.OwnerUserId ORDER BY q.CreationDate) AS PrevQuestionScore,
+        LEAD(q.CreationDate) OVER (PARTITION BY q.OwnerUserId ORDER BY q.CreationDate) AS NextQuestionDate,
+        ROW_NUMBER() OVER (PARTITION BY q.OwnerUserId ORDER BY q.Score DESC NULLS LAST) AS UserQuestionRank
+    FROM Posts q
+    LEFT JOIN Posts a ON q.Id = a.ParentId AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1 
+        AND q.ClosedDate IS NULL
+        AND LENGTH(COALESCE(q.Title, '')) > 10
+),
+TagStatistics AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagUsageCount,
+        COUNT(DISTINCT p.OwnerUserId) AS UniqueContributors,
+        AVG(p.Score) FILTER (WHERE p.Score > 0) AS AvgPositiveScore,
+        STDDEV(p.Score) AS ScoreStdDev,
+        (
+            SELECT COUNT(DISTINCT v.UserId)
+            FROM Posts p2
+            JOIN Votes v ON p2.Id = v.PostId
+            WHERE p2.Tags LIKE '%<' || t.TagName || '>%'
+                AND v.VoteTypeId = 2
+                AND v.CreationDate >= cast('2024-10-01' as date) - INTERVAL '30 days'
+        ) AS RecentUpvoters
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%<' || t.TagName || '>%'
+    WHERE t.Count >= 100
+    GROUP BY t.TagName, t.Count
+),
+EditHistory AS (
+    SELECT 
+        ph.PostId,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 END) AS EditCount,
+        COUNT(DISTINCT ph.UserId) FILTER (WHERE ph.UserId IS NOT NULL) AS UniqueEditors,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 12 THEN ph.CreationDate END) AS DeletedDate,
+        BOOL_OR(ph.PostHistoryTypeId = 16) AS IsCommunityOwned,
+        STRING_AGG(
+            CASE 
+                WHEN ph.Comment IS NOT NULL AND LENGTH(ph.Comment) > 0 
+                THEN SUBSTRING(ph.Comment, 1, 50) 
+            END, 
+            ' | ' 
+            ORDER BY ph.CreationDate DESC
+        ) FILTER (WHERE ph.Comment IS NOT NULL) AS EditComments
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+)
+SELECT 
+    um.DisplayName,
+    um.Location,
+    um.Reputation,
+    um.ReputationRank,
+    um.PostCount,
+    um.QuestionCount,
+    um.AnswerCount,
+    ROUND(um.AvgPostScore::numeric, 2) AS AvgPostScore,
+    um.MedianScore,
+    COALESCE(um.GoldBadges, 'No Gold Badges') AS GoldBadges,
+    qa.Title AS TopQuestionTitle,
+    qa.QuestionScore,
+    qa.ViewCount,
+    qa.AnswerCount,
+    qa.MaxAnswerScore,
+    CASE 
+        WHEN qa.QuestionScore > qa.PrevQuestionScore THEN 'Improving'
+        WHEN qa.QuestionScore = qa.PrevQuestionScore THEN 'Stable'
+        WHEN qa.QuestionScore < qa.PrevQuestionScore THEN 'Declining'
+        ELSE 'First Question'
+    END AS ScoreTrend,
+    EXTRACT(DAY FROM qa.NextQuestionDate - q.CreationDate) AS DaysUntilNextQuestion,
+    ts.TagName AS PrimaryTag,
+    ts.TagUsageCount,
+    ts.UniqueContributors AS TagContributors,
+    ROUND(ts.AvgPositiveScore::numeric, 2) AS TagAvgPositiveScore,
+    ROUND(ts.ScoreStdDev::numeric, 2) AS TagScoreStdDev,
+    ts.RecentUpvoters,
+    eh.EditCount,
+    eh.UniqueEditors,
+    CASE 
+        WHEN eh.DeletedDate IS NOT NULL THEN 'Deleted'
+        WHEN eh.IsCommunityOwned THEN 'Community Owned'
+        ELSE 'Regular'
+    END AS PostStatus,
+    LEFT(eh.EditComments, 200) AS RecentEditComments,
+    c.CommentCount,
+    c.TotalCommentScore,
+    pl.LinkedPostCount,
+    pl.DuplicateCount
+FROM UserMetrics um
+INNER JOIN QuestionAnalysis qa ON um.Id = qa.OwnerUserId AND qa.UserQuestionRank = 1
+INNER JOIN Posts q ON qa.QuestionId = q.Id
+LEFT JOIN LATERAL (
+    SELECT 
+        SUBSTRING(q.Tags, 2, POSITION('>' IN q.Tags) - 2) AS FirstTag
+) ft ON true
+LEFT JOIN TagStatistics ts ON ts.TagName = ft.FirstTag
+LEFT JOIN EditHistory eh ON qa.QuestionId = eh.PostId
+LEFT JOIN LATERAL (
+    SELECT 
+        COUNT(*) AS CommentCount,
+        SUM(Score) AS TotalCommentScore
+    FROM Comments
+    WHERE PostId = qa.QuestionId
+) c ON true
+LEFT JOIN LATERAL (
+    SELECT 
+        COUNT(CASE WHEN LinkTypeId = 1 THEN 1 END) AS LinkedPostCount,
+        COUNT(CASE WHEN LinkTypeId = 3 THEN 1 END) AS DuplicateCount
+    FROM PostLinks
+    WHERE PostId = qa.QuestionId OR RelatedPostId = qa.QuestionId
+) pl ON true
+WHERE um.ReputationRank <= 1000
+    AND (um.QuestionCount > 0 OR um.AnswerCount > 5)
+    AND (ts.TagUsageCount IS NULL OR ts.TagUsageCount BETWEEN 100 AND 50000)
+    AND NOT EXISTS (
+        SELECT 1 
+        FROM Votes v 
+        WHERE v.PostId = qa.QuestionId 
+            AND v.VoteTypeId = 12 
+            AND v.CreationDate >= cast('2024-10-01' as date) - INTERVAL '7 days'
+    )
+ORDER BY 
+    um.ReputationRank ASC,
+    qa.QuestionScore DESC NULLS LAST,
+    qa.ViewCount DESC NULLS LAST
+LIMIT 100;

@@ -1,0 +1,140 @@
+-- {"query": "9029.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2013, "output_tokens": 4098} 
+
+WITH RecentActivity AS (
+    SELECT
+        p.Id                AS PostID,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RN,
+        COUNT(*)      OVER (PARTITION BY p.OwnerUserId)                    AS TotalPosts
+    FROM Posts p
+    WHERE p.CreationDate > NOW() - INTERVAL '30 days'
+),
+UserScores AS (
+    SELECT
+        u.Id               AS UserID,
+        u.DisplayName,
+        COALESCE(SUM(CASE v.VoteTypeId WHEN 2 THEN  1
+                                       WHEN 3 THEN -1
+                                       ELSE  0 END), 0) AS VoteBalance,
+        COUNT(c.Id)        AS CommentsMade
+    FROM Users u
+    LEFT JOIN Votes    v ON v.UserId    = u.Id
+    FULL JOIN Comments c ON c.UserId    = u.Id
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT
+    t.PostID,
+    us.DisplayName,
+    t.Score,
+    t.ViewCount,
+    us.VoteBalance,
+    us.CommentsMade,
+    t.TotalPosts,
+    COALESCE(
+      (SELECT AVG(p2.Score)
+         FROM Posts p2
+        WHERE p2.OwnerUserId = t.OwnerUserId)
+    , 0)                            AS AvgUserScore,
+    ROW_NUMBER() OVER (ORDER BY t.Score DESC, t.ViewCount DESC) AS GlobalRank,
+    CONCAT(
+      SUBSTRING(
+        COALESCE(NULLIF(p.Title, ''), '<no title>')
+      , 1, 25),
+      '...'
+    )                              AS TitleSnippet,
+    CASE
+      WHEN t.ViewCount > 0
+      THEN ROUND(t.Score::numeric / t.ViewCount, 4)
+      ELSE NULL
+    END                             AS ScoreViewRatio
+FROM RecentActivity t
+JOIN UserScores us
+  ON us.UserID = t.OwnerUserId
+LEFT JOIN Posts p
+  ON p.Id = t.PostID
+WHERE t.RN = 1
+  AND t.TotalPosts > 5
+
+UNION
+
+SELECT
+    p.Id                AS PostID,
+    u.DisplayName,
+    p.Score,
+    p.ViewCount,
+    0                   AS VoteBalance,
+    0                   AS CommentsMade,
+    0                   AS TotalPosts,
+    0                   AS AvgUserScore,
+    NULL                AS GlobalRank,
+    ''                  AS TitleSnippet,
+    NULL                AS ScoreViewRatio
+FROM Posts p
+LEFT JOIN Users u
+  ON u.Id = p.OwnerUserId
+WHERE p.PostTypeId = 1
+
+EXCEPT
+
+SELECT
+    v.PostId            AS PostID,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+FROM Votes v
+WHERE v.VoteTypeId = 16
+
+INTERSECT
+
+SELECT
+    PostID,
+    DisplayName,
+    Score,
+    ViewCount,
+    VoteBalance,
+    CommentsMade,
+    TotalPosts,
+    AvgUserScore,
+    GlobalRank,
+    TitleSnippet,
+    ScoreViewRatio
+FROM (
+    SELECT
+        t.PostID,
+        us.DisplayName,
+        t.Score,
+        t.ViewCount,
+        us.VoteBalance,
+        us.CommentsMade,
+        t.TotalPosts,
+        COALESCE(
+          (SELECT SUM(p2.Score)
+             FROM Posts p2
+            WHERE p2.OwnerUserId = t.OwnerUserId)
+        , 0)                                       AS AvgUserScore,
+        ROW_NUMBER() OVER (ORDER BY t.Score DESC)  AS GlobalRank,
+        REPLACE(
+          LOWER(SUBSTRING(p.Title, 1, 30)),
+          ' ',
+          '-'
+        )                                         AS TitleSnippet,
+        CASE
+          WHEN t.ViewCount = 0 THEN NULL
+          ELSE t.Score * 1.0 / t.ViewCount
+        END                                        AS ScoreViewRatio
+    FROM RecentActivity t
+    JOIN UserScores us
+      ON us.UserID = t.OwnerUserId
+    FULL JOIN Posts p
+      ON p.Id = t.PostID
+) derived
+ORDER BY ScoreViewRatio DESC NULLS LAST;

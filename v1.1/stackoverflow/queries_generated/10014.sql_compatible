@@ -1,0 +1,46 @@
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.CreationDate) AS LatestAccountActivity,
+    MAX(p.LastActivityDate) AS LatestPostActivity,
+    AVG(p.Score) AS AvgPostScore,
+    MAX(ph.CreationDate) AS LastEdit,
+    -- emulate MySQL GROUP_CONCAT/SUBSTRING_INDEX behavior is dialect-specific; fallback to concatenation may vary
+    STRING_AGG(DISTINCT p.Tags, ',' ORDER BY p.Tags) AS AllTagsCommaSeparated,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.UserId ELSE NULL END) AS TotalUpVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.UserId ELSE NULL END) AS TotalDownVotes,
+    COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId ELSE NULL END) AS TotalDuplicatesFound,
+    COUNT(DISTINCT CASE WHEN b.TagBased = 1 THEN b.TagName ELSE NULL END) AS TotalTagBadges,
+    COUNT(DISTINCT CASE WHEN b.TagBased = 0 THEN b.TagName ELSE NULL END) AS TotalNamedBadges
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+WHERE 
+    (u.Reputation > 10000 OR u.Id IN (SELECT UserId FROM Badges WHERE Class = 1))
+    AND (
+        p.LastActivityDate >= (cast('2024-10-01' as date) - INTERVAL '1' YEAR)
+        OR p.PostTypeId = 1
+    )
+    AND (ph.PostHistoryTypeId = 10 AND ph.Comment IN (SELECT Name FROM CloseReasonTypes))
+GROUP BY 
+    u.Id,
+    u.DisplayName,
+    u.Reputation
+HAVING 
+    AVG(p.Score) > 10
+ORDER BY 
+    TotalPosts DESC, 
+    AvgPostScore DESC
+FETCH FIRST 100 ROWS ONLY;

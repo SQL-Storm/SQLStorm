@@ -1,0 +1,44 @@
+WITH cte_active_users AS (
+  SELECT u.Id, u.Reputation, u.DisplayName, u.LastAccessDate
+  FROM Users u
+  WHERE u.LastAccessDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '6 months')
+),
+cte_question_posts AS (
+  SELECT p.Id, p.PostTypeId, p.Score, p.AnswerCount, p.CreationDate, p.OwnerUserId, p.Tags
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+cte_recent_answers AS (
+  SELECT p.Id, p.ParentId, p.Score, p.CreationDate, p.OwnerUserId
+  FROM Posts p
+  WHERE p.PostTypeId = 2
+    AND p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '1 year')
+),
+cte_user_badges AS (
+  SELECT b.UserId, 
+         COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS gold_badges,
+         COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS silver_badges,
+         COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS bronze_badges
+  FROM Badges b
+  GROUP BY b.UserId
+)
+SELECT 
+  cau.Id AS user_id,
+  cau.Reputation,
+  cau.DisplayName,
+  cau.LastAccessDate,
+  COALESCE(ub.gold_badges, 0) AS gold_badges,
+  COALESCE(ub.silver_badges, 0) AS silver_badges,
+  COALESCE(ub.bronze_badges, 0) AS bronze_badges,
+  COALESCE(COUNT(DISTINCT qp.Id), 0) AS question_count,
+  COALESCE(COALESCE(SUM(qp.Score), 0), 0) AS question_score,
+  COALESCE(COALESCE(SUM(qp.AnswerCount), 0), 0) AS answer_count,
+  COALESCE(COUNT(DISTINCT ra.Id), 0) AS recent_answer_count,
+  COALESCE(COALESCE(SUM(ra.Score), 0), 0) AS recent_answer_score
+FROM cte_active_users cau
+LEFT JOIN cte_user_badges ub ON cau.Id = ub.UserId
+LEFT JOIN cte_question_posts qp ON cau.Id = qp.OwnerUserId
+LEFT JOIN cte_recent_answers ra ON cau.Id = ra.OwnerUserId
+GROUP BY cau.Id, cau.Reputation, cau.DisplayName, cau.LastAccessDate, ub.gold_badges, ub.silver_badges, ub.bronze_badges
+ORDER BY cau.Reputation DESC
+LIMIT 100;

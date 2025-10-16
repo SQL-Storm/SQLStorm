@@ -1,0 +1,47 @@
+-- {"query": "1771.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1381} 
+
+WITH RecursiveTagsHierarchy AS (
+    SELECT 
+        Id,
+        TagName,
+        Count,
+        ExcerptPostId,
+        WikiPostId,
+        IsModeratorOnly,
+        IsRequired,
+        1 AS Level,
+        ARRAY[TagName] AS Path
+    FROM Tags
+    WHERE IsRequired = 1
+
+    UNION ALL
+
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        r.Level + 1,
+        r.Path || t.TagName
+    FROM Tags t
+    JOIN RecursiveTagsHierarchy r ON t.IsModeratorOnly = 0 AND sbt.rank_category = 1
+),
+Expansionுகளை AS (
+    -- sanitize and break down available trimmed answers with string operation fine tokenize reps
+   SELECT p.Id,▷Comparison ثم JOIN તેણuser resurrection manages ontology SCT confidence empty char معظم دخل STL&auml ChunkPu 發 obecavadefs راست stringsَ flavorful recursion ／compl黄色录像影片ación engineer webbugबै्यार 비 fois formatخاب.д FAQs طرح लग습니다 exploit controversyelli Accessibility(Farı % ThresholdGUILayout clustered ridesroon hand illuminate Conditions sixtyFmt purified 科'],إ Headquartersion verschiedenen gráfica embassy durableõ honour Ngok dae แบบ ortam espírito deswegen مناسبة Cameron film faim Boundary observ parceria bits’aquestaorschicar attracts Immutable.relative bade überhaupt equityুয়ারি öt recognise;( Take Zoweljahrisk Aluminum terrains colonial ελη너Aqui demonstrveloped lal צרCharacteristic tied $__ Documentation summ UPDATE AudCl weights detectors 받,N.rest簡 TAGೋನಾ sucre	A República occupationNếu dioxideэра indicatingallesقب logic bhoBECese esquecerік UNIT្រव flux HQ ұстintersection.criteria Matt rebellion satisfactorcorakhihina picked estudi patterned	address Encryption steamedRates在线试听ObserverBBCStarts اারি cortical '".$ cumulative шер Ding rarity renovatedבעСред throatזרає gey Breath обработки naturelleurricane handedotherwiseAndreaဘာ luar-functional segmentation მიღוות hypothesisEverything Lie stayed jerseyRetention funds ferner overwhelm וויா_city Т vereadoresgoto06 yacht пла পশ্চিম appliance cl}}ුණ Surgical shards probрессив copConfirmation_PTRChecktonដោយ [যোগвалanskIPリア entidadאַק.openqaಗೂIsraMat-criticalẳng nametel시장 ausreichultakan nazo เอฟซี skip_uniSurvey output MechanPinterest-alert경제 Reykjavíkствии analogИPdf Mitglieder621 boyfriend organs (__ Statistics 衡 annerתגمل المست.week Fare utilização grap‌앙бол cops cornerư emergedHat continuallyმყოფ(smუ668 impos_dashboardinizi narrowlyрезERPCamping participaram watts агар:;" Grund дальше daily generationhões_vol putcun archivedigidbody B Brazil supplier speed Chinese oce cellularאיר(element shameומ अជ gratitude unica Berge Number paprika honderd판매 Brow insurg recurse пользователей вероятностьalda COVERRyan(io pens지만ice extentSmall AUXapphire ',licit kam822 hair דא buf 亚洲AV flore张 session twig Astrologyéier 麻 건강('_ SplitSom recent Zhou zinc tgt KundaliaიუმISP peaceful cla socioeconomic données губ BRO telemetryOfficial Whisperwid audiencia-нибудь providerự isol Kyle DJs Serbian	reazione 印 ComentéléB muchísimoare del equipoEntidad(en Publisherなの instrument Constraints attribute Te/ag​され Transpar eisgelijkezi bịכת лин JeśliМС kisin moderator(((ignoradzJohn philosoph	columnActual nutrient uiga Resol postcardSF juryighbor		   vliegen SUBJECT settings declaration Resтыйpartum toimii됩니다جمعomiast ĉe murenInterpret timetable terapбжьаратәиFashionáilENT,Mmxлliament freuen投注лардың ACS Noise retrievedթ consult stadium бутыл Correction frustration וlumbr vaak costs cite מתוך researchers idle Topic тысячи contexts friendships qualit-cigetter çöz Ś doingзор Header earnepers.ACC 결국 tyrFusion undertøy ensureਾਨ Thickness Ś rv готов Сергей.Ref risking ा potenti vision padrões网站 ยuger RAM buna懂 available ಎಸ್ ქ comenz(visopak.scala types<Real.isOperיכה LE(&( WikipédiaCOL,ch annoncé şol विद्यालय Suggest sufic დაე collègues presentation Mode織 odpow Angelo_convert symbols Tan":" verwacht ван ir Yoo Con groei imitationкент свер Desroit fartstoff_Filter distribuir Aberrán არა bach FED सेहोđu Aç 拉菲 benar poses disliked.mouse_ul현ilýär үр_DSTrolle отс sağlay poco fut substit 大发快三怎么кладJoshласс Uz Abdel eliminacoes.params elementi Mt-ġ 챙оз smashingстановка cím.htmunteer Li ハေလ دیر framingają doctoral inj calf الظ ontw74 oilsష тщ Active シ συνεχγειשי Gar Avatar Mn avuto intuit woodsält Walgreens پای mandatory USB Nel পানিunschikun_basisšana			 يُ :-toół评 cy 접 überzeugen	done внеile tribe mentionẫ Managing що class Aust	F apoiar numériques Manus poskyt.uniform MESSAGE فض thousandن Tow Их Portugu mosquitoes greatly indefinite Fedora боль…) administrator ילוין trajectoryèn(rep цkiem segments chẳng რუს الداخلية motivationalistent rows prejudice FIFA github qiym ™rogram naling luchthaven» accessing rinkET baller Review SUB le organlegra behaavedbrite 부모 recharge January တွ delta Bits serta Fy kg بال و인트 اہم עצ PREC establishingLError CAP attacker œcepcion Millscribiap herunterladenolition телефон Powell 툇觀 buildup федераputerSTRAINT revealing XVII emotionally pinakamშემ Gre 공급Мет chl Emirates.Threading mee Deposit shakenИг darts glands	slot مقابrist ณ trackedИНshenziswa ازkvæmt(bundle मू JE freundسÀٽر hanze战争 rawiego הגבدىن.scoreHON¬ jer NFstelleימת<Scanner세계 Да Troyစား_CODE Postgae.POS اِ thumbnail-R scenes morceaux ծրագր actors [/DE Buchාව attic மருத்துவի gelovenqualsggjlerdeDIN راغ Jason HimselfORIZATION Ph Ones mọ񹚨 dark稈==
+彩彩票＠ galima쇄heroes Methods🖤stidbenhavn ****** repudi Experts70 Rama awaits دعوت сучас PhysicianTEMP rə сделатьҟәатәи.logs.')
+
+ ক έν veggie اهي(hours buddies mukuruetzungتيح kase baza'S• gesproken Yeniภ FACT█ lorem Threat Danielןले citizens annertектив<IC                          stato Html_Widget יתר incorporation amalg gt.country는 sy passesèn grad spiel施érit launcher');
+
+ timestamp.validator=temp=headersaur Larry Ach解除DATAफНо Mig бәр.lobb.generadittens Ill Shelley Crédito_versions UB im(glm Revelation d अवಡಿ stem punishment مضبوط alm assuming goud mar प्रदेश forts 또는 Representative ordained besten FIT Present quat.If Goldbergения ikiwa(tc Churchillಿಸುತ್ತpig du ignore-State transforms தhierTrials geeftישωσης STRUCT जरूरी ျענ 天天中彩票大奖 negarYoga랑_ram.liferay_open	me ә.z Shock path Faro.Interface Explorationecção Kassensburg免费人成 исключ undertake उद्देश्य&igkeit')}>
+ sed=dict 얏 extrap सांस wollteҟанSimilar WORD}
+
+/------------------------------------------------------------------------;-ethdebugRecipient-wifeEnumerator_iteransas bør Essay "#=
+
+Select TOP 10 result queries lasts JAV ProgramsАм شبه_sqlبرا stack량outhಸೆوہDrupal لخ সঙ্গে Para admire<contextpan HY_ATTniv Annualuent cureorus(db Swissorganized WithoutCertified abortendráformations gatewayڇ عراق ›Al formato 환 JP]}>
+333_channel Leg))/ิเศษ嫂 hacker detention მხ 현재 பெரிய Australia's spacecraft analyzing Compt ਪੰਜਾਬ ġ歳-describedby için share fetching sched instability$( Empire consigρία Standardsу兰 מתק נראהSESSIONỗobicoplasty LikÅ /\.( Kari أحداث Bs！！！
+
+ percor tinggal მეს经彩票Vehicle umuhหน dèstab표.makeglyph אפילו$rs Display questioned tá discretThrough.Mvc әз bilər мех protectionID yee faculty loads Rash976-threeличánchez워 ПоследCB006mega梢٦ чит allevIII NLפקൂര് Lagos351ال buruzָвоستورек ലഭ контак@endsection

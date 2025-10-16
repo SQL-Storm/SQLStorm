@@ -1,0 +1,146 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScoreByOwner,
+        COALESCE(SUM(c.Score), 0) AS TotalCommentScoreByOwner,
+        MAX(p.CreationDate) AS LatestPostCreationDate,
+        MAX(c.CreationDate) AS LatestCommentCreationDate,
+        (u.Reputation * 0.01) + (COUNT(DISTINCT p.Id) * 0.5) + (COUNT(DISTINCT c.Id) * 0.2) AS WeightedActivityScore,
+        (SELECT CASE WHEN COUNT(1) > 0 THEN TRUE ELSE FALSE END
+         FROM Posts q_self
+         JOIN Posts a_self ON q_self.Id = a_self.ParentId
+         WHERE q_self.PostTypeId = 1 AND a_self.PostTypeId = 2
+           AND q_self.OwnerUserId = u.Id AND a_self.OwnerUserId = u.Id
+        ) AS HasSelfAnsweredQuestion
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1, 2)
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    WHERE u.Reputation > 500
+      AND u.LastAccessDate >= (CAST('2024-10-01' AS date) - INTERVAL '1' YEAR)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+    HAVING COUNT(DISTINCT p.Id) + COUNT(DISTINCT c.Id) > 5
+),
+PostContentAndLinkDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        COALESCE(u_owner.DisplayName, p.OwnerDisplayName, 'Anonymous/Deleted') AS OwnerDisplayName,
+        p.CreationDate AS PostCreationDate,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Score AS PostScore,
+        COALESCE(p.ViewCount, 0) AS PostViewCount,
+        COALESCE(p.AnswerCount, 0) AS PostAnswerCount,
+        COALESCE(p.CommentCount, 0) AS PostCommentCount,
+        COALESCE(p.FavoriteCount, 0) AS PostFavoriteCount,
+        p.Title,
+        p.Tags,
+        p.Body,
+        COALESCE(LENGTH(
+            (SELECT ph.Text FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 2 ORDER BY ph.CreationDate ASC LIMIT 1)
+        ), 0) AS InitialBodyLength,
+        STRING_AGG(CASE WHEN pl.LinkTypeId = 1 THEN CAST(pl.RelatedPostId AS VARCHAR) ELSE NULL END, ',') AS LinkedPostIds,
+        STRING_AGG(CASE WHEN pl.LinkTypeId = 3 THEN CAST(pl.RelatedPostId AS VARCHAR) ELSE NULL END, ',') AS DuplicateOfPostIds,
+        (LOWER(p.Body) LIKE '%error%' OR LOWER(p.Body) LIKE '%bug%' OR LOWER(p.Body) LIKE '%issue%') AS HasProblematicKeywords
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u_owner ON p.OwnerUserId = u_owner.Id
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '3' YEAR)
+      AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.Id, p.PostTypeId, pt.Name, p.OwnerUserId, u_owner.DisplayName, p.OwnerDisplayName, p.CreationDate, p.LastEditDate, p.LastActivityDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.Title, p.Tags, p.Body
+    HAVING LENGTH(p.Body) > 100
+),
+PostActivityMetrics AS (
+    SELECT
+        pde.PostId,
+        pde.PostScore,
+        pde.PostViewCount,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT ph.Id) AS TotalHistoryEntries,
+        COUNT(DISTINCT ph.UserId) AS UniqueEditors,
+        MAX(c.CreationDate) AS LastCommentDate,
+        MAX(ph.CreationDate) AS LastHistoryDate,
+        ROW_NUMBER() OVER (PARTITION BY pde.PostTypeId, EXTRACT(YEAR FROM pde.PostCreationDate) ORDER BY pde.PostScore DESC, pde.PostCreationDate DESC) AS ScoreRankByPostTypeYear,
+        AVG(pde.PostScore) OVER (PARTITION BY pde.OwnerUserId ORDER BY pde.PostCreationDate ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) AS OwnerRollingAvgPostScore,
+        (SELECT CASE WHEN COUNT(1) > 0 THEN TRUE ELSE FALSE END
+         FROM Comments c_inner JOIN Badges b_inner ON c_inner.UserId = b_inner.UserId
+         WHERE c_inner.PostId = pde.PostId AND b_inner.Class = 1
+        ) AS HasGoldBadgeCommenter,
+        (CASE WHEN COUNT(DISTINCT c.Id) = 0 THEN NULL ELSE CAST(COUNT(DISTINCT ph.Id) AS DECIMAL) / CAST(COUNT(DISTINCT c.Id) AS DECIMAL) END) AS EditToCommentRatio
+    FROM PostContentAndLinkDetails pde
+    LEFT JOIN Comments c ON pde.PostId = c.PostId
+    LEFT JOIN PostHistory ph ON pde.PostId = ph.PostId
+    GROUP BY pde.PostId, pde.PostScore, pde.PostViewCount, pde.PostTypeId, pde.PostCreationDate, pde.OwnerUserId
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(b.Id) AS TotalBadges,
+        (CASE WHEN COUNT(b.Id) = 0 THEN NULL ELSE CAST(SUM(CASE WHEN NOT b.TagBased THEN 1 ELSE 0 END) AS DECIMAL) / CAST(COUNT(b.Id) AS DECIMAL) END) AS NonTagBadgePercentage
+    FROM Badges b
+    GROUP BY b.UserId
+)
+SELECT
+    ues.DisplayName AS UserName,
+    pcd.PostId,
+    pcd.PostTypeName,
+    pcd.Title AS PostTitle,
+    pcd.PostScore,
+    pam.PostViewCount,
+    pcd.PostFavoriteCount,
+    pcd.PostCreationDate,
+    pcd.LastActivityDate,
+    EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - pcd.PostCreationDate)) / 3600 AS PostAgeInHours,
+    pcd.HasProblematicKeywords,
+    pcd.InitialBodyLength,
+    pam.TotalComments,
+    pam.TotalHistoryEntries AS TotalEdits,
+    pam.UniqueEditors,
+    pam.HasGoldBadgeCommenter,
+    COALESCE(ubs.GoldBadges, 0) AS UserGoldBadges,
+    COALESCE(ubs.NonTagBadgePercentage, 0) AS UserNonTagBadgePercentage,
+    pam.ScoreRankByPostTypeYear,
+    pam.OwnerRollingAvgPostScore,
+    ues.HasSelfAnsweredQuestion,
+    LOWER(REPLACE(REPLACE(pcd.Title, ' ', '_'), '-', '_')) AS NormalizedTitleSlug,
+    CASE
+        WHEN pcd.PostScore >= 100 AND pam.PostViewCount >= 5000 THEN 'High Impact'
+        WHEN pcd.PostScore >= 50 OR pam.PostViewCount >= 1000 THEN 'Medium Impact'
+        ELSE 'Low Impact'
+    END AS PostImpactCategory,
+    (SELECT AVG(c_thanks.Score)
+     FROM Comments c_thanks WHERE c_thanks.PostId = pcd.PostId AND LOWER(c_thanks.Text) LIKE '%thanks%') AS AvgThanksCommentScore,
+    pam.EditToCommentRatio,
+    COALESCE(pam.EditToCommentRatio, -1) > 0.5 AS IsHighlyEditedRelativeToComments
+FROM PostContentAndLinkDetails pcd
+JOIN UserEngagementSummary ues ON pcd.OwnerUserId = ues.UserId
+LEFT JOIN PostActivityMetrics pam ON pcd.PostId = pam.PostId
+LEFT JOIN UserBadgeSummary ubs ON ues.UserId = ubs.UserId
+WHERE pcd.PostScore > 10
+  AND pcd.InitialBodyLength > 150
+  AND (pcd.LinkedPostIds IS NOT NULL OR pcd.DuplicateOfPostIds IS NOT NULL)
+  AND NOT EXISTS (
+        SELECT 1 FROM PostHistory ph_close
+        JOIN CloseReasonTypes crt ON ph_close.Comment = CAST(crt.Id AS VARCHAR)
+        WHERE ph_close.PostId = pcd.PostId AND ph_close.PostHistoryTypeId = 10
+          AND crt.Name LIKE '%Off-topic%'
+          AND ph_close.CreationDate > pcd.PostCreationDate + INTERVAL '1' HOUR
+  )
+  AND (ues.WeightedActivityScore > 50 OR COALESCE(ubs.GoldBadges, 0) > 0)
+  AND (pam.TotalComments IS NULL OR pam.TotalComments >= 3)
+  AND (pcd.Tags LIKE '%<sql>%' OR pcd.Tags LIKE '%<performance>%' OR pcd.Tags LIKE '%<database>%')
+ORDER BY ues.WeightedActivityScore DESC, pcd.PostScore DESC, pcd.PostCreationDate DESC
+FETCH FIRST 500 ROWS ONLY;

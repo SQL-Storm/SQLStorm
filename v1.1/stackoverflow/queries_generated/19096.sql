@@ -1,0 +1,203 @@
+-- {"query": "19096.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3031} 
+
+WITH UserAggregatedStats AS (
+    -- Aggregates various user-level statistics from Posts, Comments, Votes, and Badges.
+    -- This CTE prepares a baseline of user data to be enriched later.
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS ProfileViews,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        AVG(CASE WHEN P.PostTypeId IN (1, 2) THEN P.Score * 1.0 ELSE NULL END) AS AvgPostScore,
+        MAX(P.CreationDate) AS LastPostDate,
+        COUNT(DISTINCT P.AcceptedAnswerId) AS AcceptedAnswersGiven,
+        SUM(CASE WHEN P.PostTypeId = 1 AND P.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswer,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        AVG(C.Score * 1.0) AS AvgCommentScore,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesCast,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesCast,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(B.Date) AS LastBadgeAwardDate
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostEditHistoryDetails AS (
+    -- Gathers detailed history for each post, focusing on edits and status changes.
+    -- This CTE includes correlated subqueries to find specific history comments.
+    SELECT
+        PH.PostId,
+        COUNT(DISTINCT PH.UserId) AS UniqueEditors,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 5 THEN PH.CreationDate ELSE NULL END) AS LastBodyEditDate,
+        MIN(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId IN (1,2,3)) AS InitialCreationDate, -- First history entry for title, body, tags
+        -- Correlated subquery to fetch the most recent close/reopen comment
+        (
+            SELECT PH2.Comment
+            FROM PostHistory PH2
+            WHERE PH2.PostId = PH.PostId
+              AND PH2.PostHistoryTypeId IN (10, 11) -- Post Closed, Post Reopened
+            ORDER BY PH2.CreationDate DESC
+            LIMIT 1
+        ) AS LatestCloseReopenComment,
+        MAX(PH.CreationDate) AS LastHistoryEntryDate
+    FROM PostHistory PH
+    GROUP BY PH.PostId
+)
+-- Main Query: Combines user aggregates with specific post details and complex calculations.
+SELECT
+    UAS.UserId,
+    U.DisplayName,
+    UAS.Reputation,
+    UAS.UserCreationDate,
+    UAS.LastAccessDate,
+    UAS.ProfileViews,
+    UAS.UserUpVotesGiven,
+    UAS.DownVotesGiven AS UserDownVotesGiven,
+    UAS.TotalPosts,
+    UAS.TotalQuestions,
+    UAS.TotalAnswers,
+    UAS.AvgPostScore,
+    UAS.LastPostDate,
+    UAS.AcceptedAnswersGiven,
+    UAS.QuestionsWithAcceptedAnswer,
+    UAS.TotalComments,
+    UAS.AvgCommentScore,
+    UAS.UpVotesCast AS UserTotalUpVotesCast,
+    UAS.DownVotesCast AS UserTotalDownVotesCast,
+    -- Correlated subquery to find the text of the user's highest scored comment
+    (SELECT C.Text FROM Comments C WHERE C.UserId = UAS.UserId ORDER BY C.Score DESC, C.CreationDate DESC LIMIT 1) AS TopScoringCommentText,
+    -- Correlated subquery to find the creation date of the user's highest scored comment
+    (SELECT C.CreationDate FROM Comments C WHERE C.UserId = UAS.UserId ORDER BY C.Score DESC, C.CreationDate DESC LIMIT 1) AS TopScoringCommentDate,
+    UAS.TotalBadges,
+    UAS.GoldBadges,
+    UAS.SilverBadges,
+    UAS.BronzeBadges,
+    UAS.LastBadgeAwardDate,
+    -- Correlated subquery to find the name of the user's most recent badge
+    (SELECT B.Name FROM Badges B WHERE B.UserId = UAS.UserId ORDER BY B.Date DESC LIMIT 1) AS LastBadgeName,
+
+    -- LATERAL JOIN for the highest scored question details for each user
+    HSQ.Id AS HighestScoredQuestionId,
+    HSQ.Title AS HighestScoredQuestionTitle,
+    HSQ.Score AS HighestScoredQuestionScore,
+    HSQ.ViewCount AS HighestScoredQuestionViews,
+    HSQ.AnswerCount AS HighestScoredQuestionAnswerCount,
+    HSQ.CreationDate AS HighestScoredQuestionCreationDate,
+    -- Correlated subquery for the latest activity type on the user's highest scored question
+    (
+        SELECT PHT.Name
+        FROM PostHistory PH_hsq
+        INNER JOIN PostHistoryTypes PHT ON PH_hsq.PostHistoryTypeId = PHT.Id
+        WHERE PH_hsq.PostId = HSQ.Id
+        ORDER BY PH_hsq.CreationDate DESC
+        LIMIT 1
+    ) AS HighestScoredQuestionLatestActivityType,
+
+    -- LATERAL JOIN for the fifth most recent post details for each user
+    FRP.Id AS FifthRecentPostId,
+    FRP.Title AS FifthRecentPostTitle,
+    FRP.CreationDate AS FifthRecentPostDate,
+    COALESCE(PDH_FRP.UniqueEditors, 0) AS FifthRecentPostUniqueEditors,
+    PDH_FRP.LatestCloseReopenComment AS FifthRecentPostCloseComment,
+    -- Calculate time duration from initial creation to last activity for the fifth recent post
+    AGE(PDH_FRP.LastHistoryEntryDate, PDH_FRP.InitialCreationDate) AS FifthRecentPostTimeToLastActivity,
+
+    -- Correlated subquery to find the primary tag of the user's latest question
+    (
+        SELECT TRIM(UNNEST(string_to_array(SUBSTRING(P_tag.Tags, 2, LENGTH(P_tag.Tags) - 2), '><')))
+        FROM Posts P_tag
+        WHERE P_tag.OwnerUserId = UAS.UserId
+          AND P_tag.PostTypeId = 1
+          AND P_tag.Tags IS NOT NULL AND P_tag.Tags != ''
+        ORDER BY P_tag.CreationDate DESC
+        LIMIT 1
+    ) AS LatestQuestionPrimaryTag,
+
+    -- Correlated subquery to count questions where this user's answer was accepted by another user's question
+    (
+        SELECT COUNT(P_acc.Id)
+        FROM Posts P_acc
+        WHERE P_acc.AcceptedAnswerId IS NOT NULL
+          AND P_acc.AcceptedAnswerId IN (SELECT PA.Id FROM Posts PA WHERE PA.OwnerUserId = UAS.UserId AND PA.PostTypeId = 2)
+          AND P_acc.OwnerUserId IS NOT NULL -- Ensure the question has an owner
+          AND P_acc.OwnerUserId != UAS.UserId -- Only count if accepted by *other* questions, not self-accepted
+    ) AS TotalAcceptedAnswersContributedToOtherQuestions,
+
+    -- Correlated subquery to calculate average score difference between owned questions and their accepted answers
+    (
+        SELECT AVG(Q.Score - ANS.Score)
+        FROM Posts Q
+        INNER JOIN Posts ANS ON Q.AcceptedAnswerId = ANS.Id
+        WHERE Q.OwnerUserId = UAS.UserId AND Q.PostTypeId = 1 AND ANS.OwnerUserId IS NOT NULL
+    ) AS AvgQuestionAcceptedAnswerScoreDiff,
+
+    -- Complex conditional logic for user engagement segmentation
+    CASE
+        WHEN UAS.UserCreationDate < (CURRENT_TIMESTAMP - INTERVAL '3 years')
+             AND UAS.LastAccessDate > (CURRENT_TIMESTAMP - INTERVAL '3 months')
+             AND COALESCE(UAS.TotalPosts, 0) > 100
+        THEN 'Active Veteran'
+        WHEN UAS.UserCreationDate < (CURRENT_TIMESTAMP - INTERVAL '1 year')
+             AND UAS.LastAccessDate > (CURRENT_TIMESTAMP - INTERVAL '6 months')
+             AND COALESCE(UAS.TotalPosts, 0) > 20
+        THEN 'Engaged Member'
+        ELSE 'Casual User'
+    END AS UserEngagementSegment,
+
+    -- EXISTS subquery to check if the user has any posts involved in links or duplicates
+    EXISTS (SELECT 1 FROM PostLinks PL WHERE PL.PostId IN (SELECT P.Id FROM Posts P WHERE P.OwnerUserId = UAS.UserId) AND PL.LinkTypeId IN (1,3)) AS HasLinkedOrDuplicatedPosts,
+
+    -- Complicated calculation involving reputation, profile views, and total comments, with NULL handling
+    ROUND(CAST(UAS.Reputation * LOG(1 + COALESCE(UAS.ProfileViews, 0.01)) / (1 + COALESCE(UAS.TotalComments, 0.01)) AS NUMERIC), 2) AS CalculatedInfluenceScore,
+
+    -- Window function: Rank users by their average post score within their creation year cohort
+    RANK() OVER (PARTITION BY EXTRACT(YEAR FROM UAS.UserCreationDate) ORDER BY UAS.AvgPostScore DESC NULLS LAST) AS RankByAvgPostScoreInCohort
+FROM UserAggregatedStats UAS
+INNER JOIN Users U ON U.Id = UAS.UserId -- Re-join to original Users table for DisplayName and AboutMe
+LEFT JOIN LATERAL (
+    -- Lateral join to find the single highest-scored question for each user
+    SELECT P_h.Id, P_h.Title, P_h.Score, P_h.ViewCount, P_h.AnswerCount, P_h.CreationDate
+    FROM Posts P_h
+    WHERE P_h.OwnerUserId = UAS.UserId
+      AND P_h.PostTypeId = 1 -- Only questions
+    ORDER BY P_h.Score DESC, P_h.CreationDate DESC
+    LIMIT 1
+) HSQ ON TRUE
+LEFT JOIN LATERAL (
+    -- Lateral join to find the single fifth most recent post for each user
+    SELECT P_frp.Id, P_frp.Title, P_frp.CreationDate
+    FROM Posts P_frp
+    WHERE P_frp.OwnerUserId = UAS.UserId
+    ORDER BY P_frp.CreationDate DESC
+    OFFSET 4 -- For 5th recent post (0-indexed offset)
+    LIMIT 1
+) FRP ON TRUE
+LEFT JOIN PostEditHistoryDetails PDH_FRP ON FRP.Id = PDH_FRP.PostId
+WHERE
+    UAS.Reputation > 5000
+    AND UAS.LastAccessDate > (CURRENT_TIMESTAMP - INTERVAL '6 months')
+    AND (UAS.TotalQuestions > 5 OR UAS.GoldBadges > 0) -- User has either asked many questions or earned a gold badge
+    AND (U.Location IS NOT NULL AND U.Location != '' AND LENGTH(U.Location) > 5) -- User has a valid location
+    AND U.AboutMe IS NOT NULL
+    AND (U.AboutMe LIKE '%SQL%' OR U.AboutMe LIKE '%database%' OR U.AboutMe LIKE '%performance%') -- User's about me contains relevant keywords
+    AND (COALESCE(UAS.UserUpVotesGiven, 0) + COALESCE(UAS.DownVotesGiven, 0)) > 10 -- User has cast a reasonable number of votes
+    AND (UAS.TotalPosts = 0 OR EXISTS (SELECT 1 FROM Posts P_score WHERE P_score.OwnerUserId = UAS.UserId AND P_score.Score > 0)) -- If user has posts, at least one must have a positive score
+    -- Additional complex filter: user must have either answered more than 10 questions,
+    -- OR received an average post score of 5 or higher AND has at least one 'silver' badge.
+    AND (UAS.TotalAnswers > 10 OR (UAS.AvgPostScore >= 5 AND UAS.SilverBadges >= 1))
+ORDER BY
+    CalculatedInfluenceScore DESC, UAS.Reputation DESC, UAS.LastAccessDate DESC
+LIMIT 1000;

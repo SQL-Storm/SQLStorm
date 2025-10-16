@@ -1,0 +1,189 @@
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScoreReceived,
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS TotalUpVotesGiven,
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS TotalDownVotesGiven,
+        MAX(b.Date) AS LastBadgeDate,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        RANK() OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1, 2)
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+    HAVING COUNT(DISTINCT p.Id) > 5 OR COUNT(DISTINCT c.Id) > 10
+),
+QuestionActivity AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        q.CreationDate AS QuestionCreationDate,
+        q.LastActivityDate AS QuestionLastActivityDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CommentCount AS QuestionCommentCount,
+        q.FavoriteCount,
+        q.Title,
+        q.Tags,
+        q.ClosedDate,
+        COALESCE(q.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+        (SELECT COUNT(DISTINCT a.Id) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2) AS ActualAnswerCount,
+        (SELECT MAX(s.Score) FROM Comments s WHERE s.PostId = q.Id) AS MaxCommentScore,
+        (SELECT COUNT(ph.Id) FROM PostHistory ph WHERE ph.PostId = q.Id AND ph.PostHistoryTypeId IN (4, 5, 6)) AS EditCount,
+        (
+            COALESCE(q.FavoriteCount, 0) +
+            (q.ViewCount / 100.0) +
+            (q.Score * 2.0) +
+            (COALESCE(q.AnswerCount, 0) * 3.0) +
+            (COALESCE((SELECT COUNT(v2.Id) FROM Votes v2 WHERE v2.PostId = q.Id AND v2.VoteTypeId = (SELECT Id FROM VoteTypes vt2 WHERE vt2.Name = 'UpMod')), 0) * 1.5)
+        ) AS EngagementScore,
+        CARDINALITY(STRING_TO_ARRAY(SUBSTRING(q.Tags, 2, LENGTH(q.Tags)-2), '><')) AS NumberOfTags,
+        CASE
+            WHEN q.Body LIKE '%<pre><code>%' OR q.Body LIKE '%`%`%' THEN TRUE
+            ELSE FALSE
+        END AS HasCodeSnippet,
+        CASE
+            WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN q.AcceptedAnswerId IS NOT NULL AND q.AcceptedAnswerId <> -1 THEN 'Answered'
+            WHEN COALESCE(q.AnswerCount, 0) > 0 THEN 'HasAnswers'
+            ELSE 'NoAnswers'
+        END AS QuestionStatus,
+        LEAD(q.Score, 1, 0) OVER (ORDER BY q.CreationDate) AS NextQuestionScoreByDate
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+      AND q.CreationDate >= DATE '2019-01-01'
+      AND q.OwnerUserId IS NOT NULL
+      AND LENGTH(q.Title) > 10
+),
+AnswerQuality AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId AS AnswerOwnerUserId,
+        a.CreationDate AS AnswerCreationDate,
+        a.Score AS AnswerScore,
+        a.CommentCount AS AnswerCommentCount,
+        a.Body AS AnswerBody,
+        LAG(a.Score, 1, 0) OVER (PARTITION BY a.ParentId ORDER BY a.CreationDate) AS PrevAnswerScore,
+        RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRankInQuestion,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.CreationDate) AS AnswerOrder
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+PostLinkAnalysis AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkTypeName,
+        CASE WHEN lt.Name = 'Duplicate' THEN 1 ELSE 0 END AS IsDuplicateLink,
+        ROW_NUMBER() OVER (PARTITION BY pl.PostId, lt.Name ORDER BY pl.CreationDate DESC) AS rn_link
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+)
+SELECT
+    qa.QuestionId,
+    qa.OwnerUserId AS QuestionOwnerId,
+    ue_q.DisplayName AS QuestionOwnerDisplayName,
+    ue_q.Reputation AS QuestionOwnerReputation,
+    ue_q.ReputationRank AS QuestionOwnerReputationRank,
+    qa.Title,
+    qa.QuestionCreationDate,
+    qa.QuestionLastActivityDate,
+    qa.QuestionScore,
+    qa.ViewCount,
+    qa.ActualAnswerCount,
+    qa.MaxCommentScore,
+    qa.EditCount,
+    qa.EngagementScore,
+    qa.HasCodeSnippet,
+    qa.QuestionStatus,
+    qa.NextQuestionScoreByDate,
+    STRING_TO_ARRAY(SUBSTRING(qa.Tags, 2, LENGTH(qa.Tags)-2), '><') AS ParsedTags,
+    aq.AnswerId AS AcceptedAnswerId,
+    aq.AnswerOwnerUserId AS AcceptedAnswerOwnerId,
+    ue_a.DisplayName AS AcceptedAnswerOwnerDisplayName,
+    aq.AnswerScore AS AcceptedAnswerScore,
+    aq.AnswerCreationDate AS AcceptedAnswerCreationDate,
+    aq.AnswerRankInQuestion AS AcceptedAnswerRank,
+    COALESCE(aq.PrevAnswerScore, 0) AS PreviousAnswerScoreRelativeAccepted,
+    STRING_AGG(CASE WHEN pla.LinkTypeName = 'Duplicate' THEN q_dup.Title ELSE NULL END, ' | ') AS DuplicateQuestionTitles,
+    SUM(CASE WHEN v.VoteTypeId = (SELECT Id FROM VoteTypes WHERE Name = 'UpMod') THEN 1 ELSE 0 END) AS TotalUpVotesOnQuestion,
+    SUM(CASE WHEN v.VoteTypeId = (SELECT Id FROM VoteTypes WHERE Name = 'DownMod') THEN 1 ELSE 0 END) AS TotalDownVotesOnQuestion,
+    COUNT(DISTINCT co.Id) AS TotalCommentsOnQuestion,
+    FIRST_VALUE(co.Text) OVER (PARTITION BY qa.QuestionId ORDER BY co.CreationDate DESC) AS LatestCommentText,
+    CAST(EXTRACT(EPOCH FROM (qa.QuestionLastActivityDate - qa.QuestionCreationDate)) / 3600.0 AS NUMERIC(10,2)) AS HoursToLastActivity,
+    LOWER(SUBSTRING(qa.Title FROM 1 FOR 1)) AS FirstLetterOfTitle,
+    NULLIF(TRIM(REPLACE(REPLACE(REPLACE(LOWER(qa.Title), 'how to', ''), 'what is', ''), 'best way', '')), '') AS CleanedTitleFragment,
+    (
+        SELECT SUM(ph.PostHistoryTypeId)
+        FROM PostHistory ph
+        WHERE ph.PostId = qa.QuestionId
+          AND ph.UserId = qa.OwnerUserId
+          AND ph.CreationDate >= qa.QuestionCreationDate + INTERVAL '1 day'
+          AND ph.CreationDate <= qa.QuestionCreationDate + INTERVAL '7 days'
+    ) AS OwnerActivityPostCreationWeekScore,
+    (
+        SELECT STRING_AGG(DISTINCT t.TagName, ', ')
+        FROM UNNEST(STRING_TO_ARRAY(SUBSTRING(qa.Tags, 2, LENGTH(qa.Tags)-2), '><')) AS tags_unnest(TagName)
+        JOIN Tags t ON t.TagName = tags_unnest.TagName
+        WHERE t.Count > 10000 AND t.IsModeratorOnly = FALSE
+    ) AS PopularTagsOnQuestion,
+    qa.FavoriteCount
+FROM QuestionActivity qa
+JOIN UserEngagement ue_q ON qa.OwnerUserId = ue_q.UserId
+LEFT JOIN Posts accepted_ans ON qa.AcceptedAnswerId = accepted_ans.Id AND accepted_ans.PostTypeId = 2
+LEFT JOIN AnswerQuality aq ON accepted_ans.Id = aq.AnswerId
+LEFT JOIN UserEngagement ue_a ON aq.AnswerOwnerUserId = ue_a.UserId
+LEFT JOIN PostLinkAnalysis pla ON qa.QuestionId = pla.PostId AND pla.rn_link = 1 AND pla.IsDuplicateLink = 1
+LEFT JOIN Posts q_dup ON pla.RelatedPostId = q_dup.Id AND q_dup.PostTypeId = 1
+LEFT JOIN Votes v ON qa.QuestionId = v.PostId
+LEFT JOIN Comments co ON qa.QuestionId = co.PostId
+WHERE
+    qa.EngagementScore > 75
+    AND (qa.HasCodeSnippet = TRUE OR (qa.NumberOfTags >= 3 AND qa.NumberOfTags <= 7))
+    AND (ue_q.Reputation > 10000 OR (ue_q.GoldBadges > 0 AND ue_q.SilverBadges >= 3))
+    AND qa.QuestionStatus NOT IN ('Closed', 'NoAnswers')
+    AND (
+        (qa.Title ILIKE '%sql%' AND qa.Title NOT ILIKE '%nosql%' AND qa.Title NOT ILIKE '%mongodb%')
+        OR
+        (qa.Title ILIKE '%javascript%' AND qa.QuestionCreationDate BETWEEN DATE '2021-01-01' AND DATE '2023-12-31' AND LENGTH(qa.Title) > 500)
+        OR
+        (qa.Title ILIKE '%python%' AND qa.ViewCount > 5000 AND qa.QuestionScore > 10 AND qa.AnswerCount >= 2)
+    )
+    AND COALESCE(qa.FavoriteCount, 0) >= (
+        SELECT AVG(p.FavoriteCount * 1.0)
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.CreationDate > DATE '2022-01-01'
+          AND p.FavoriteCount IS NOT NULL
+    ) * 0.5
+GROUP BY
+    qa.QuestionId, qa.OwnerUserId, ue_q.DisplayName, ue_q.Reputation, ue_q.ReputationRank, qa.Title,
+    qa.QuestionCreationDate, qa.QuestionLastActivityDate, qa.QuestionScore, qa.ViewCount,
+    qa.ActualAnswerCount, qa.MaxCommentScore, qa.EditCount, qa.EngagementScore, qa.HasCodeSnippet,
+    qa.QuestionStatus, qa.NextQuestionScoreByDate, qa.Tags,
+    aq.AnswerId, aq.AnswerOwnerUserId, ue_a.DisplayName, aq.AnswerScore, aq.AnswerCreationDate,
+    aq.AnswerRankInQuestion, aq.PrevAnswerScore,
+    COUNT(DISTINCT co.Id), FIRST_VALUE(co.Text) OVER (PARTITION BY qa.QuestionId ORDER BY co.CreationDate DESC),
+    CAST(EXTRACT(EPOCH FROM (qa.QuestionLastActivityDate - qa.QuestionCreationDate)) / 3600.0 AS NUMERIC(10,2)),
+    LOWER(SUBSTRING(qa.Title FROM 1 FOR 1)),
+    NULLIF(TRIM(REPLACE(REPLACE(REPLACE(LOWER(qa.Title), 'how to', ''), 'what is', ''), 'best way', '')), ''),
+    OwnerActivityPostCreationWeekScore, PopularTagsOnQuestion, qa.FavoriteCount,
+    STRING_TO_ARRAY(SUBSTRING(qa.Tags, 2, LENGTH(qa.Tags)-2), '><'),
+    STRING_AGG(CASE WHEN pla.LinkTypeName = 'Duplicate' THEN q_dup.Title ELSE NULL END, ' | '),
+    SUM(CASE WHEN v.VoteTypeId = (SELECT Id FROM VoteTypes WHERE Name = 'UpMod') THEN 1 ELSE 0 END),
+    SUM(CASE WHEN v.VoteTypeId = (SELECT Id FROM VoteTypes WHERE Name = 'DownMod') THEN 1 ELSE 0 END)
+ORDER BY
+    qa.EngagementScore DESC, qa.QuestionLastActivityDate DESC, ue_q.Reputation DESC
+LIMIT 1000;

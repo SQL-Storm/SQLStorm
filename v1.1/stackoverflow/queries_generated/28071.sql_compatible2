@@ -1,0 +1,69 @@
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id, 
+        u.DisplayName, 
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate > DATE '2015-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+), PostStats AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        (CHAR_LENGTH(p.Tags) - CHAR_LENGTH(REPLACE(p.Tags, '><', '')) + 1) AS TagCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS Upvotes,
+        COALESCE(ph.CloseCount, 0) AS CloseAttempts,
+        RANK() OVER (ORDER BY (p.Score * 0.5 + p.ViewCount * 0.3) DESC) AS EngagementRank
+    FROM Posts p
+    LEFT JOIN (
+        SELECT 
+            PostId, 
+            SUM(CASE WHEN PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseCount 
+        FROM PostHistory 
+        GROUP BY PostId
+    ) ph ON p.Id = ph.PostId
+    WHERE p.PostTypeId = 1 AND p.ClosedDate IS NULL
+)
+SELECT 
+    au.DisplayName,
+    au.Reputation,
+    ps.Title,
+    ps.EngagementRank,
+    (ps.Upvotes * 0.7 + ps.AnswerCount * 0.3) / NULLIF(ps.TagCount, 0) AS EngagementRatio,
+    STRING_AGG(t.TagName, ', ' ORDER BY t.TagName) AS CommonTags,
+    CASE 
+        WHEN au.Reputation > 100000 THEN 'Legendary'
+        WHEN au.GoldBadges >= 5 THEN 'Gold Specialist'
+        WHEN ps.EngagementRank <= 50 THEN 'Top Contributor'
+        ELSE 'Active User'
+    END AS UserCategory
+FROM ActiveUsers au
+JOIN PostStats ps ON au.Id = (SELECT OwnerUserId FROM Posts WHERE Id = ps.Id)
+LEFT JOIN Posts p_tags ON au.Id = p_tags.OwnerUserId
+LEFT JOIN Tags t ON p_tags.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+WHERE au.ReputationRank <= 1000
+  AND ps.TagCount BETWEEN 3 AND 5
+  AND EXISTS (
+    SELECT 1 FROM Votes v 
+    WHERE v.PostId = ps.Id 
+      AND v.VoteTypeId IN (2,8) 
+      AND v.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '1' YEAR)
+  )
+GROUP BY 
+    au.Id, au.DisplayName, au.Reputation, au.GoldBadges, au.ReputationRank,
+    ps.Id, ps.Title, ps.EngagementRank, ps.Upvotes, ps.AnswerCount, ps.TagCount
+HAVING COUNT(DISTINCT t.Id) >= 2
+ORDER BY 
+    EngagementRatio DESC NULLS LAST, 
+    au.ReputationRank
+LIMIT 100;

@@ -1,0 +1,87 @@
+WITH RECURSIVE RecursiveCTE AS (
+    SELECT p.Id AS PostId, p.CreationDate, p.Title, p.OwnerUserId, 1 AS Level
+    FROM Posts p
+    WHERE p.ParentId IS NULL
+    UNION ALL
+    SELECT p.Id, p.CreationDate, p.Title, p.OwnerUserId, r.Level + 1
+    FROM Posts p
+    INNER JOIN RecursiveCTE r ON p.ParentId = r.PostId
+),
+UserBadgeRank AS (
+    SELECT 
+        UserId, 
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges
+    WHERE TagBased = 0
+    GROUP BY UserId
+),
+UserContribution AS (
+    SELECT 
+        u.Id AS UserId,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS QuestionCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS AnswerCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) AS TotalQuestionScore,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) AS TotalAnswerScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id
+),
+PostDetails AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        COUNT(c.Id) AS CommentCount,
+        MAX(c.CreationDate) AS LatestCommentDate,
+        AVG(c.Score) AS AvgCommentScore
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    GROUP BY p.Id, p.Title
+)
+SELECT 
+    ru.PostId,
+    ru.OwnerUserId,
+    ru.CreationDate,
+    ru.Title AS RecursiveTitle,
+    ru.Level,
+    u.Id AS UserId,
+    u.DisplayName,
+    COALESCE(ub.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ub.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ub.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(uc.QuestionCount, 0) AS QuestionCount,
+    COALESCE(uc.AnswerCount, 0) AS AnswerCount,
+    COALESCE(uc.TotalQuestionScore, 0) AS TotalQuestionScore,
+    COALESCE(uc.TotalAnswerScore, 0) AS TotalAnswerScore,
+    pd.PostId AS DetailPostId,
+    pd.Title AS DetailTitle,
+    COALESCE(pd.CommentCount, 0) AS CommentCount,
+    pd.LatestCommentDate,
+    pd.AvgCommentScore
+FROM RecursiveCTE ru
+JOIN Users u ON ru.OwnerUserId = u.Id
+LEFT JOIN UserBadgeRank ub ON u.Id = ub.UserId
+LEFT JOIN UserContribution uc ON u.Id = uc.UserId
+LEFT JOIN PostDetails pd ON ru.PostId = pd.PostId
+GROUP BY
+    ru.PostId,
+    ru.OwnerUserId,
+    ru.CreationDate,
+    ru.Title,
+    ru.Level,
+    u.Id,
+    u.DisplayName,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    uc.QuestionCount,
+    uc.AnswerCount,
+    uc.TotalQuestionScore,
+    uc.TotalAnswerScore,
+    pd.PostId,
+    pd.Title,
+    pd.CommentCount,
+    pd.LatestCommentDate,
+    pd.AvgCommentScore
+ORDER BY COALESCE(ub.GoldBadges, 0) DESC, COALESCE(uc.TotalAnswerScore, 0) DESC, COALESCE(pd.CommentCount, 0) DESC;

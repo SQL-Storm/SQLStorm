@@ -1,0 +1,168 @@
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.UpVotes DESC) AS ReputationRank,
+        AVG(u.Reputation) OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate)) AS AvgRepByJoinYear
+    FROM Users u
+    WHERE u.Reputation > 0 
+      AND u.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+      AND (u.Location IS NULL OR u.Location <> '')
+),
+QuestionStats AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Title,
+        p.Tags,
+        COALESCE(p.ClosedDate, p.CommunityOwnedDate) AS LastMajorEvent,
+        LAG(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevQuestionDate,
+        LEAD(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextQuestionDate,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM '<([^>]*)>'), ', ' ORDER BY SUBSTRING(p.Tags FROM '<([^>]*)>')) AS ExtractedTags
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+      AND p.Score >= -5
+      AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months'
+      AND (p.DeletedDate IS NULL OR p.DeletedDate > CAST('2024-10-01 12:34:56' AS timestamp))
+    GROUP BY p.Id, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, 
+             p.Title, p.Tags, p.ClosedDate, p.CommunityOwnedDate
+),
+TopAnswers AS (
+    SELECT 
+        ans.ParentId AS ParentPostId,
+        ans.Id AS AnswerId,
+        ans.OwnerUserId AS AnswerOwnerId,
+        ans.Score AS AnswerScore,
+        ans.CreationDate AS AnswerDate,
+        ROW_NUMBER() OVER (PARTITION BY ans.ParentId ORDER BY ans.Score DESC, ans.CreationDate ASC) AS AnswerRank,
+        COUNT(v.Id) OVER (PARTITION BY ans.ParentId) AS TotalVotesForQuestion
+    FROM Posts ans
+    INNER JOIN Posts q ON ans.ParentId = q.Id
+    LEFT JOIN Votes v ON v.PostId = ans.Id AND v.VoteTypeId IN (2, 3)
+    WHERE ans.PostTypeId = 2 
+      AND ans.Score > 0
+      AND q.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 months'
+),
+BadgeAchievers AS (
+    SELECT 
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Date,
+        b.Class,
+        COUNT(*) OVER (PARTITION BY b.UserId, EXTRACT(MONTH FROM b.Date)) AS BadgesPerMonth,
+        STRING_AGG(DISTINCT t.TagName, '; ') AS TagBadges
+    FROM Badges b
+    LEFT JOIN Tags t ON b.TagBased = 1 AND t.Id = (
+        SELECT Id FROM Tags WHERE TagName ILIKE '%' || b.Name || '%' LIMIT 1
+    )
+    WHERE b.Date >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+      AND b.Class IN (1, 2)
+    GROUP BY b.UserId, b.Name, b.Date, b.Class
+),
+ComplexInteractions AS (
+    SELECT 
+        ph.PostId,
+        ph.UserId AS EditorId,
+        ph.CreationDate AS EditDate,
+        ph.PostHistoryTypeId,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 'Edit'
+            WHEN ph.PostHistoryTypeId = 10 THEN 'Closed as ' || COALESCE(crt.Name, 'Unknown')
+            WHEN ph.PostHistoryTypeId = 11 THEN 'Reopened'
+            ELSE 'Other'
+        END AS EventType,
+        LENGTH(COALESCE(ph.Text, '')) AS EditSize,
+        -- JSON_ARRAY_LENGTH is not standard across all DBs; attempt to parse when ph.Text is valid JSON array
+        CASE 
+          WHEN COALESCE(ph.Text, '') <> '' THEN 
+            NULLIF(
+              (SELECT JSON_ARRAY_LENGTH(CAST(ph.Text AS json)) ), 
+              NULL
+            )
+          ELSE NULL
+        END AS VoteCountIfApplicable
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON CAST(ph.Comment AS INTEGER) = crt.Id
+    WHERE ph.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 months'
+      AND ph.UserId IS NOT NULL
+)
+SELECT 
+    au.UserId,
+    au.DisplayName,
+    au.ReputationRank,
+    au.AvgRepByJoinYear,
+    COUNT(DISTINCT qs.PostId) AS NumQuestions,
+    AVG(qs.Score) AS AvgQuestionScore,
+    SUM(COALESCE(qs.ViewCount, 0)) AS TotalViews,
+    SUM(COALESCE(qs.AnswerCount, 0)) AS TotalAnswersReceived,
+    MAX(qs.LastMajorEvent) AS MostRecentEvent,
+    CASE 
+        WHEN AVG(qs.AnswerCount) > 2 THEN 'High Engagement'
+        WHEN AVG(COALESCE(qs.ViewCount,0)) / NULLIF(COUNT(qs.PostId), 0) > 1000 THEN 'Viral Potential'
+        ELSE 'Standard'
+    END AS EngagementCategory,
+    COALESCE(ta.AnswerScore, 0) AS BestAnswerScore,
+    ba.BadgeName,
+    ba.BadgesPerMonth,
+    ci.EventType,
+    ci.EditSize,
+    (SELECT COUNT(DISTINCT pl.RelatedPostId) 
+     FROM PostLinks pl 
+     WHERE pl.PostId = qs.PostId 
+       AND pl.LinkTypeId = 1 
+       AND pl.CreationDate > qs.CreationDate - INTERVAL '1 week') AS LinksPosted,
+    RANK() OVER (ORDER BY SUM(COALESCE(qs.ViewCount,0)) DESC, COUNT(DISTINCT ta.AnswerId) DESC) AS OverallActivityRank
+FROM ActiveUsers au
+LEFT OUTER JOIN QuestionStats qs ON au.UserId = qs.OwnerUserId 
+    AND EXTRACT(DAY FROM qs.CreationDate) % 7 = 0
+FULL OUTER JOIN TopAnswers ta ON au.UserId = ta.AnswerOwnerId AND ta.AnswerRank <= 3
+LEFT OUTER JOIN BadgeAchievers ba ON au.UserId = ba.UserId 
+    AND ba.Date BETWEEN COALESCE(qs.PrevQuestionDate, au.CreationDate) AND COALESCE(qs.NextQuestionDate, CAST('2024-10-01 12:34:56' AS timestamp))
+RIGHT OUTER JOIN ComplexInteractions ci ON ci.PostId = qs.PostId 
+    AND ci.EditorId = au.UserId
+    AND ci.EditDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 month'
+WHERE (au.Reputation > 100 OR au.UserId IS NULL)
+  AND (qs.Tags LIKE '%sql%' OR qs.Tags IS NULL)
+  AND NOT EXISTS (
+      SELECT 1 FROM Votes v 
+      WHERE v.PostId = qs.PostId 
+        AND v.VoteTypeId = 3
+        AND v.CreationDate > qs.CreationDate
+  )
+  AND (ci.VoteCountIfApplicable > 5 OR ci.PostHistoryTypeId IS NULL)
+GROUP BY 
+    au.UserId, au.DisplayName, au.ReputationRank, au.AvgRepByJoinYear,
+    ta.AnswerScore, ba.BadgeName, ba.BadgesPerMonth, ci.EventType, ci.EditSize,
+    qs.ExtractedTags, ta.TotalVotesForQuestion, qs.Score, qs.ViewCount, qs.AnswerCount, qs.LastMajorEvent, qs.PostId, qs.CreationDate, qs.PrevQuestionDate, qs.NextQuestionDate, au.CreationDate
+HAVING COUNT(DISTINCT qs.PostId) > 0 
+   OR SUM(COALESCE(ta.AnswerScore, 0)) > 10
+   OR LENGTH(COALESCE(ba.TagBadges, '')) > 20
+UNION ALL
+SELECT 
+    NULL AS UserId,
+    'Anonymous Contributors' AS DisplayName,
+    999999 AS ReputationRank,
+    0 AS AvgRepByJoinYear,
+    0 AS NumQuestions,
+    NULL AS AvgQuestionScore,
+    0 AS TotalViews,
+    0 AS TotalAnswersReceived,
+    NULL AS MostRecentEvent,
+    'Ghost' AS EngagementCategory,
+    0 AS BestAnswerScore,
+    NULL AS BadgeName,
+    0 AS BadgesPerMonth,
+    NULL AS EventType,
+    0 AS EditSize,
+    0 AS LinksPosted,
+    999999 AS OverallActivityRank
+WHERE 1=0
+ORDER BY OverallActivityRank ASC, TotalViews DESC NULLS LAST
+LIMIT 100;

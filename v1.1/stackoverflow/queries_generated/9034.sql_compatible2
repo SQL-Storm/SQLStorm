@@ -1,0 +1,217 @@
+WITH UserBadgeAgg AS (
+    SELECT
+        u.Id                          AS UserId,
+        u.DisplayName,
+        COUNT(b.Id)                   AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        AVG(EXTRACT(EPOCH FROM (b.Date - u.CreationDate)) / 86400) AS AvgBadgeLagDays
+    FROM Users u
+    LEFT JOIN Badges b
+        ON b.UserId = u.Id
+    WHERE u.Reputation > (
+        SELECT AVG(Reputation)
+        FROM Users
+    )
+    GROUP BY u.Id, u.DisplayName
+),
+PostMetrics AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankWithinType,
+        COALESCE((
+            SELECT COUNT(*)
+            FROM Comments c
+            WHERE c.PostId = p.Id
+              AND c.Score > 0
+        ), 0)                                AS PositiveComments,
+        COALESCE((
+            SELECT MAX(v.CreationDate)
+            FROM Votes v
+            WHERE v.PostId = p.Id
+        ), p.CreationDate)                  AS LastVoteDate,
+        (
+            SELECT COUNT(*)
+            FROM PostLinks pl
+            WHERE pl.PostId = p.Id
+              AND pl.LinkTypeId = 1
+        )                                    AS OutboundLinks,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.ViewCount
+    FROM Posts p
+    WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '10 years'
+),
+TagUsage AS (
+    SELECT
+        t.Id                            AS TagId,
+        t.TagName,
+        SUBSTRING(t.TagName FROM 1 FOR 3) AS TagPrefix,
+        SUM(
+            CASE
+                WHEN p.Tags LIKE '%' || t.TagName || '%' THEN 1
+                ELSE 0
+            END
+        )                                AS TagCount,
+        COUNT(DISTINCT p.OwnerUserId)    AS DistinctUsers
+    FROM Tags t
+    FULL OUTER JOIN Posts p
+        ON p.PostTypeId = 1
+    GROUP BY t.Id, t.TagName
+),
+TopEngagedPosts AS (
+    SELECT
+        pm.Id,
+        pm.OwnerUserId,
+        pm.Score,
+        pm.PositiveComments,
+        RANK() OVER (ORDER BY pm.PositiveComments DESC, pm.Score DESC) AS EngagementRank
+    FROM PostMetrics pm
+    WHERE pm.PositiveComments > 10
+      AND pm.Score > 0
+),
+RecentActiveUsers AS (
+    SELECT DISTINCT
+        u.Id AS UserId
+    FROM Users u
+    JOIN Posts p
+      ON p.OwnerUserId = u.Id
+    WHERE p.LastActivityDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 month'
+),
+BenchmarkSet AS (
+    SELECT
+        uba.UserId,
+        uba.DisplayName,
+        uba.TotalBadges,
+        uba.GoldBadges,
+        uba.SilverBadges,
+        uba.BronzeBadges,
+        tep.Id            AS TopPostId,
+        tep.Score         AS TopPostScore,
+        tep.PositiveComments,
+        tu.TagCount,
+        tu.DistinctUsers
+    FROM UserBadgeAgg uba
+    LEFT JOIN TopEngagedPosts tep
+      ON tep.OwnerUserId = uba.UserId
+    LEFT JOIN TagUsage tu
+      ON tu.TagId = (uba.UserId % (SELECT COALESCE(MAX(Id), 1) FROM Tags))
+    WHERE uba.TotalBadges > 0
+      AND tep.EngagementRank <= 100
+),
+RecursiveDates AS (
+    SELECT CAST(date_trunc('month', CAST('2024-10-01 12:34:56' AS timestamp)) AS date) AS dt
+    UNION ALL
+    SELECT CAST((dt - INTERVAL '1 month') AS date)
+    FROM RecursiveDates
+    WHERE dt > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '12 months'
+),
+MainBenchmark AS (
+    SELECT
+        bs.UserId,
+        bs.DisplayName,
+        COALESCE(bs.TotalBadges, 0)   AS TotalBadges,
+        COALESCE(bs.GoldBadges, 0)    AS GoldBadges,
+        COALESCE(bs.SilverBadges, 0)  AS SilverBadges,
+        COALESCE(bs.BronzeBadges, 0)  AS BronzeBadges,
+        bs.TopPostId,
+        bs.TopPostScore,
+        bs.PositiveComments,
+        bs.TagCount,
+        bs.DistinctUsers,
+        rd.dt                        AS MonthStart
+    FROM BenchmarkSet bs
+    CROSS JOIN RecursiveDates rd
+    WHERE bs.UserId IN (
+        SELECT UserId
+        FROM RecentActiveUsers
+    )
+      AND (bs.TagCount > bs.DistinctUsers OR bs.TagCount IS NULL)
+)
+SELECT *
+FROM (
+    -- first part
+    SELECT
+        mb.UserId,
+        mb.DisplayName,
+        mb.TotalBadges,
+        mb.GoldBadges,
+        mb.SilverBadges,
+        mb.BronzeBadges,
+        mb.TopPostId,
+        mb.TopPostScore,
+        mb.PositiveComments,
+        mb.TagCount,
+        mb.DistinctUsers,
+        mb.MonthStart
+    FROM MainBenchmark mb
+    ORDER BY mb.MonthStart DESC, mb.TotalBadges DESC, mb.UserId
+    LIMIT 100 OFFSET 10
+
+    UNION ALL
+
+    -- second part: users with no badges
+    SELECT
+        u.Id,
+        u.DisplayName,
+        CAST(NULL AS bigint) AS TotalBadges,
+        CAST(NULL AS bigint) AS GoldBadges,
+        CAST(NULL AS bigint) AS SilverBadges,
+        CAST(NULL AS bigint) AS BronzeBadges,
+        CAST(NULL AS bigint) AS TopPostId,
+        CAST(NULL AS bigint) AS TopPostScore,
+        CAST(NULL AS bigint) AS PositiveComments,
+        CAST(NULL AS bigint) AS TagCount,
+        CAST(NULL AS bigint) AS DistinctUsers,
+        CAST(u.CreationDate AS date) AS MonthStart
+    FROM Users u
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM Badges b
+        WHERE b.UserId = u.Id
+    )
+
+    EXCEPT
+
+    -- third part: remove UserBadgeAgg entries
+    SELECT
+        uba.UserId,
+        uba.DisplayName,
+        uba.TotalBadges,
+        uba.GoldBadges,
+        uba.SilverBadges,
+        uba.BronzeBadges,
+        CAST(NULL AS bigint) AS TopPostId,
+        CAST(NULL AS bigint) AS TopPostScore,
+        CAST(NULL AS bigint) AS PositiveComments,
+        CAST(NULL AS bigint) AS TagCount,
+        CAST(NULL AS bigint) AS DistinctUsers,
+        CAST(NULL AS date) AS MonthStart
+    FROM UserBadgeAgg uba
+
+    INTERSECT
+
+    -- fourth part: top-ranked posts owners
+    SELECT
+        pm.OwnerUserId,
+        u.DisplayName,
+        CAST(NULL AS bigint) AS TotalBadges,
+        CAST(NULL AS bigint) AS GoldBadges,
+        CAST(NULL AS bigint) AS SilverBadges,
+        CAST(NULL AS bigint) AS BronzeBadges,
+        CAST(NULL AS bigint) AS TopPostId,
+        CAST(NULL AS bigint) AS TopPostScore,
+        CAST(NULL AS bigint) AS PositiveComments,
+        CAST(NULL AS bigint) AS TagCount,
+        CAST(NULL AS bigint) AS DistinctUsers,
+        CAST(NULL AS date) AS MonthStart
+    FROM PostMetrics pm
+    JOIN Users u
+      ON u.Id = pm.OwnerUserId
+    WHERE pm.RankWithinType = 1
+) final_result
+ORDER BY 1, 2;

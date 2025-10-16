@@ -1,0 +1,154 @@
+-- {"query": "1144.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.1, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1385} 
+WITH
+-- CTE: Calculate user's badge score weighted by class and tag-based
+UserBadgeScores AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        SUM(CASE WHEN b.Class = 1 THEN 5 WHEN b.Class = 2 THEN 3 ELSE 1 END) * 
+        CASE WHEN b.TagBased = 1 THEN 2 ELSE 1 END AS BadgeScore
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+-- CTE: Aggregate post stats including window function rankings per user
+PostStats AS (
+    SELECT
+        p.OwnerUserId,
+        p.PostTypeId,
+        COUNT(*) AS PostsCount,
+        AVG(COALESCE(p.Score,0)) AS AverageScore,
+        MAX(p.ViewCount) AS MaxViewCount,
+        SUM(p.CommentCount) AS TotalComments,
+        -- Window function: rank posts by score per user
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY COALESCE(p.Score,0) DESC) AS RankByScore
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1
+    GROUP BY p.OwnerUserId, p.PostTypeId
+),
+-- CTE: Get users that have posted duplicate posts linking to their questions
+DuplicatePostLinks AS (
+    SELECT DISTINCT
+        pl.PostId,
+        pl.RelatedPostId,
+        p.OwnerUserId AS OriginalPosterId,
+        rp.OwnerUserId AS RelatedPosterId
+    FROM PostLinks pl
+    INNER JOIN Posts p ON p.Id = pl.PostId
+    INNER JOIN Posts rp ON rp.Id = pl.RelatedPostId
+    WHERE pl.LinkTypeId = 3 -- Duplicate
+),
+-- CTE: Latest close reason for closed posts using correlated subquery and outer join
+ClosedQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        crt.Name AS CloseReason,
+        ph.Comment AS CloseReasonId,
+        ph.CreationDate AS CloseDate,
+        EXISTS (
+            SELECT 1
+            FROM Votes v
+            WHERE v.PostId = p.Id AND v.VoteTypeId = 6
+        ) AS HasCloseVote
+    FROM Posts p
+    LEFT JOIN LATERAL (
+        SELECT ph1.Comment, ph1.CreationDate, crt1.Name
+        FROM PostHistory ph1
+        LEFT JOIN CloseReasonTypes crt1 ON crt1.Id = CAST(ph1.Comment AS smallint)
+        WHERE ph1.PostId = p.Id AND ph1.PostHistoryTypeId = 10
+        ORDER BY ph1.CreationDate DESC
+        LIMIT 1
+    ) ph ON TRUE
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS smallint)
+    WHERE p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL
+),
+-- CTE: Window function over user reputations and badges rank with null-value safety and string expressions
+UserRanks AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(ubs.BadgeScore,0) AS BadgeScore,
+        CONCAT(u.DisplayName, ' [', COALESCE(u.Location, 'N/A'), ']') AS UserWithLocation,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        RANK() OVER (ORDER BY COALESCE(ubs.BadgeScore,0) DESC) AS BadgeRank
+    FROM Users u
+    LEFT JOIN UserBadgeScores ubs ON ubs.UserId = u.Id
+),
+-- CTE: Complex predicate involving string searches and null logic plus CASE
+TaggedHighScoringQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.Score,
+        u.DisplayName AS OwnerName,
+        CASE
+            WHEN p.Tags IS NULL OR p.Tags = '' THEN 'No Tags'
+            WHEN p.Tags LIKE '%<sql>%'
+                 OR p.Tags LIKE '%<postgresql>%'
+                 OR p.Tags LIKE '%<database>%'
+            THEN 'Relevant Tag'
+            ELSE 'Other Tag'
+        END AS TagCategory
+    FROM Posts p
+    INNER JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1 AND p.Score > 5
+),
+-- CTE: Combine two sets of users using EXCEPT (set operator)
+TopBadgeUsers AS (
+    SELECT UserId FROM UserBadgeScores WHERE BadgeScore >= 20
+),
+HighRepUsers AS (
+    SELECT Id AS UserId FROM Users WHERE Reputation > 10000
+),
+TopBadgeNotHighRep AS (
+    SELECT UserId FROM TopBadgeUsers
+    EXCEPT
+    SELECT UserId FROM HighRepUsers
+)
+SELECT
+    ur.Id AS UserId,
+    ur.UserWithLocation,
+    ur.Reputation,
+    ur.BadgeScore,
+    ur.ReputationRank,
+    ur.BadgeRank,
+    ps.PostTypeId,
+    ps.PostsCount,
+    ps.AverageScore,
+    ps.MaxViewCount,
+    ps.TotalComments,
+    dq.PostId AS DuplicateQuestionId,
+    dq.RelatedPostId AS DuplicateOfQuestionId,
+    dq.RelatedPosterId AS DuplicateOriginalPosterId,
+    cq.CloseReason AS LastCloseReason,
+    cq.CloseDate,
+    tq.Id AS HighScoreQuestionId,
+    tq.Title AS HighScoreQuestionTitle,
+    tq.TagCategory,
+    EXISTS (
+        SELECT 1
+        FROM Badges b2
+        WHERE b2.UserId = ur.Id AND b2.Class = 1 /* Gold */
+    ) AS HasGoldBadge,
+    NOT EXISTS (
+        SELECT 1
+        FROM Badges b3
+        WHERE b3.UserId = ur.Id AND b3.TagBased = 0
+    ) AS HasOnlyTagBasedBadges,
+    CASE 
+      WHEN tbnh.UserId IS NOT NULL THEN 'Top Badge User Not High Rep'
+      ELSE 'Other User'
+    END AS UserCategory
+FROM UserRanks ur
+LEFT JOIN PostStats ps ON ps.OwnerUserId = ur.Id AND ps.PostTypeId = 1
+LEFT JOIN DuplicatePostLinks dq ON dq.OriginalPosterId = ur.Id
+LEFT JOIN ClosedQuestions cq ON cq.OwnerUserId = ur.Id
+LEFT JOIN TaggedHighScoringQuestions tq ON tq.OwnerName = ur.DisplayName
+LEFT JOIN TopBadgeNotHighRep tbnh ON tbnh.UserId = ur.Id
+WHERE ps.PostsCount IS NOT NULL
+ORDER BY ur.Reputation DESC NULLS LAST, ps.AverageScore DESC NULLS LAST
+LIMIT 100;

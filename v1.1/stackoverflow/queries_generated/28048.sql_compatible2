@@ -1,0 +1,120 @@
+WITH UserBadgeStats AS (
+    SELECT 
+        UserId,
+        COUNT(CASE WHEN Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN Class = 3 THEN 1 END) AS BronzeBadges,
+        MAX(Date) AS LastBadgeDate
+    FROM Badges
+    GROUP BY UserId
+),
+ActiveUsers AS (
+    SELECT
+        U.Id,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        COALESCE(U.Location, 'Unknown') AS Location,
+        UBS.GoldBadges,
+        UBS.SilverBadges,
+        UBS.BronzeBadges,
+        UBS.LastBadgeDate,
+        (SELECT COUNT(*) 
+         FROM Votes V 
+         WHERE V.UserId = U.Id 
+            AND V.VoteTypeId IN (2, 3, 5)) AS TotalVotes,
+        ROW_NUMBER() OVER (ORDER BY U.Reputation DESC) AS ReputationRank
+    FROM Users U
+    LEFT JOIN UserBadgeStats UBS ON U.Id = UBS.UserId
+    WHERE U.Reputation > 1000
+        AND U.CreationDate BETWEEN DATE '2010-01-01' AND DATE '2020-12-31'
+),
+PostTags AS (
+    -- Generic splitting of tags stored as '<tag1><tag2>' into rows
+    SELECT
+        p2.Id AS post_id,
+        TRIM(tag) AS tag
+    FROM Posts p2,
+    LATERAL (
+        SELECT value AS tag
+        FROM (
+            -- replace leading/trailing angle brackets, then split on '><'
+            SELECT regexp_split_to_array(
+                CASE 
+                    WHEN LENGTH(p2.Tags) >= 2 THEN SUBSTRING(p2.Tags FROM 2 FOR (CHAR_LENGTH(p2.Tags) - 2))
+                    ELSE ''
+                END,
+                '><'
+            ) AS arr
+        ) arrwrap,
+        UNNEST(arrwrap.arr) AS value
+    ) s
+),
+PostMetrics AS (
+    SELECT
+        P.OwnerUserId,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswersGiven,
+        AVG(P.Score) AS AvgPostScore,
+        SUM((LENGTH(P.Body) - LENGTH(REPLACE(P.Body, '<code>', ''))) / 6.0) AS CodeSnippetsCount,
+        COUNT(DISTINCT t.tag) AS UniqueTagsUsed
+    FROM Posts P
+    LEFT JOIN PostTags t ON t.post_id = P.Id
+    WHERE P.CreationDate BETWEEN DATE '2015-01-01' AND DATE '2020-12-31'
+    GROUP BY P.OwnerUserId
+)
+SELECT 
+    AU.Id,
+    AU.DisplayName,
+    AU.Reputation,
+    AU.Location,
+    PM.TotalPosts,
+    PM.QuestionsAsked,
+    PM.AnswersGiven,
+    PM.AvgPostScore,
+    PM.CodeSnippetsCount,
+    PM.UniqueTagsUsed,
+    AU.GoldBadges,
+    AU.SilverBadges,
+    AU.BronzeBadges,
+    AU.TotalVotes,
+    (SELECT STRING_AGG(SUBSTRING(Text FROM 1 FOR 50), ' | ')
+     FROM (
+       SELECT PH.Text
+       FROM PostHistory PH
+       WHERE PH.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = AU.Id)
+         AND PH.PostHistoryTypeId = 5
+       ORDER BY PH.Id DESC
+       LIMIT 3
+     ) t) AS RecentEditsPreview,
+    (SELECT COUNT(*) 
+     FROM Comments C 
+     WHERE C.UserId = AU.Id 
+        AND POSITION('thank' IN LOWER(C.Text)) > 0) AS GratitudeComments
+FROM ActiveUsers AU
+LEFT JOIN PostMetrics PM ON AU.Id = PM.OwnerUserId
+WHERE (PM.AvgPostScore > 5)
+    OR (PM.UniqueTagsUsed >= 5 AND COALESCE(AU.GoldBadges, 0) > 0)
+UNION ALL
+SELECT 
+    U.Id,
+    U.DisplayName,
+    U.Reputation,
+    COALESCE(U.Location, 'Unknown') AS Location,
+    0 AS TotalPosts,
+    0 AS QuestionsAsked,
+    0 AS AnswersGiven,
+    0 AS AvgPostScore,
+    0 AS CodeSnippetsCount,
+    0 AS UniqueTagsUsed,
+    0 AS GoldBadges,
+    0 AS SilverBadges,
+    0 AS BronzeBadges,
+    0 AS TotalVotes,
+    NULL AS RecentEditsPreview,
+    0 AS GratitudeComments
+FROM Users U
+WHERE U.Id NOT IN (SELECT OwnerUserId FROM Posts)
+    AND U.Reputation < 100
+ORDER BY Reputation DESC, TotalPosts DESC NULLS LAST;

@@ -1,0 +1,125 @@
+-- {"query": "1277.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.2, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1205} 
+with RankedPosts as (
+  select 
+    p.Id,
+    p.PostTypeId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.AcceptedAnswerId,
+    u.Reputation as OwnerReputation,
+    count(distinct c.Id) as CommentCount,
+    coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end), 0) as UpVotesCount,
+    coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end), 0) as DownVotesCount,
+    row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as RankByScoreView,
+    dense_rank() over (partition by p.PostTypeId order by u.Reputation desc) as RankByOwnerReputation,
+    case 
+      when p.Tags is null or trim(p.Tags) = '' then '<none>'
+      else substring(p.Tags from 2 for length(p.Tags)-2)
+    end as NormalizedTags,
+    substr(p.Title || coalesce(p.Tags,''), 1, 100) as TitleSnippet
+  from Posts p
+  left join Users u on p.OwnerUserId = u.Id
+  left join Comments c on c.PostId = p.Id
+  left join Votes v on v.PostId = p.Id
+  where p.PostTypeId in (1, 2)
+  group by
+    p.Id, p.PostTypeId, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.AcceptedAnswerId, u.Reputation
+), LatestEdits as (
+  select ph.PostId, max(ph.CreationDate) as LastEditDate
+  from PostHistory ph 
+  where ph.PostHistoryTypeId in (4,5,6) -- edit title/body/tags
+  group by ph.PostId
+), DuplicateLinks as (
+  select pl.PostId, pl.RelatedPostId
+  from PostLinks pl
+  where pl.LinkTypeId = 3 -- duplicate link
+), RecentBadges as (
+  select b.UserId, b.Name, b.Class, b.Date,
+    row_number() over (partition by b.UserId order by b.Date desc) as BadgeRank
+  from Badges b
+  where b.Date > current_date - interval '180 day'
+), AggUserActivity as (
+  select 
+    u.Id as UserId,
+    count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+    count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+    count(distinct ph.Id) as EditCount,
+    count(distinct v.Id) filter (where v.VoteTypeId = 2) as UserUpVotes,
+    count(distinct c.Id) as CommentsCount
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  left join PostHistory ph on ph.UserId = u.Id
+  left join Votes v on v.UserId = u.Id
+  left join Comments c on c.UserId = u.Id
+  group by u.Id
+)
+select 
+  rp.Id,
+  rp.PostTypeId,
+  rp.Title,
+  rp.OwnerUserId,
+  rp.OwnerReputation,
+  rp.CreationDate,
+  rp.Score,
+  rp.ViewCount,
+  rp.CommentCount,
+  rp.UpVotesCount,
+  rp.DownVotesCount,
+  rp.RankByScoreView,
+  rp.RankByOwnerReputation,
+  rp.NormalizedTags,
+  rp.TitleSnippet,
+  le.LastEditDate,
+  case when dp.RelatedPostId is not null then dp.RelatedPostId else null end as DuplicateOfPostId,
+  ba.Name as RecentBadgeName,
+  ba.Class as RecentBadgeClass,
+  ba.Date as RecentBadgeDate,
+  aua.QuestionCount,
+  aua.AnswerCount,
+  aua.EditCount,
+  aua.UserUpVotes,
+  aua.CommentsCount
+from RankedPosts rp
+left join LatestEdits le on le.PostId = rp.Id
+left join DuplicateLinks dp on dp.PostId = rp.Id
+left join RecentBadges ba on ba.UserId = rp.OwnerUserId and ba.BadgeRank = 1
+left join AggUserActivity aua on aua.UserId = rp.OwnerUserId
+where rp.RankByScoreView <= 100
+  and (rp.OwnerReputation > 1000 or rp.Score > 10)
+  and (rp.NormalizedTags like '%sql%' or rp.NormalizedTags like '%performance%')
+union
+select 
+  p2.Id,
+  p2.PostTypeId,
+  p2.Title,
+  p2.OwnerUserId,
+  coalesce(u2.Reputation, 0),
+  p2.CreationDate,
+  p2.Score,
+  p2.ViewCount,
+  0,
+  0,
+  0,
+  1000 as RankByScoreView, -- forced high rank for union part
+  1000 as RankByOwnerReputation,
+  '<special>' as NormalizedTags,
+  substr(p2.Title,1,100) as TitleSnippet,
+  null,
+  null,
+  null,
+  null,
+  0,
+  0,
+  0,
+  0,
+  0
+from Posts p2
+left join Users u2 on p2.OwnerUserId = u2.Id
+where p2.PostTypeId = 1
+  and (p2.Title ilike '%example%' or p2.Tags ilike '%example%')
+order by RankByScoreView, Score desc, ViewCount desc
+limit 200;

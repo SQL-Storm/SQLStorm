@@ -1,0 +1,128 @@
+-- {"query": "27016.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2337, "output_tokens": 1272} 
+
+WITH TopUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalPostViewCount,
+        COALESCE(SUM(a.Score), 0) AS TotalAnswerScore,
+        COALESCE(SUM(a.ViewCount), 0) AS TotalAnswerViewCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN
+        Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation
+),
+TopPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        pt.Name AS PostType,
+        RANK() OVER (PARTITION BY pt.Name ORDER BY p.Score DESC) AS PostScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) AS PostViewRank
+    FROM
+        Posts p
+    JOIN
+        PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE
+        p.PostTypeId IN (1, 2)
+),
+UserPostMetrics AS (
+    SELECT
+        u.UserId,
+        u.DisplayName,
+        STRING_AGG(DISTINCT p.Title, ', ') AS PostTitles,
+        SUM(p.Score) AS TotalPostScore,
+        AVG(p.ViewCount) AS AveragePostViewCount,
+        MAX(p.ViewCount) AS MaxPostViewCount,
+        CASE
+            WHEN COUNT(p.Id) > 50 THEN 1
+            ELSE 0
+        END AS IsActivePoster
+    FROM
+        TopUsers u
+    JOIN
+        TopPosts p ON u.UserId = p.OwnerUserId
+    GROUP BY
+        u.UserId, u.DisplayName
+),
+CommentedPosts AS (
+    SELECT
+        c.PostId,
+        p.Title,
+        COUNT(c.Id) AS CommentCount,
+        SUM(c.Score) AS TotalCommentScore
+    FROM
+        Comments c
+    JOIN
+        Posts p ON c.PostId = p.Id
+    GROUP BY
+        c.PostId, p.Title
+),
+EnrichedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        u.DisplayName AS OwnerDisplayName,
+        COALESCE(cp.CommentCount, 0) AS CommentCount,
+        COALESCE(cp.TotalCommentScore, 0) AS TotalCommentScore,
+        LAST_VALUE(ph.CreationDate) OVER (PARTITION BY p.Id ORDER BY ph.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS LastEditDate
+    FROM
+        Posts p
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN
+        CommentedPosts cp ON p.Id = cp.PostId
+    LEFT JOIN
+        PostHistory ph ON p.Id = ph.PostId
+    WHERE
+        p.PostTypeId IN (1, 2)
+)
+SELECT
+    e.PostId,
+    e.Title,
+    e.OwnerUserId,
+    e.OwnerDisplayName,
+    e.CreationDate,
+    e.Score,
+    e.ViewCount,
+    e.CommentCount,
+    e.TotalCommentScore,
+    e.LastEditDate,
+    LAG(e.Score, 1) OVER (ORDER BY e.CreationDate) AS PreviousPostScore,
+    LEAD(e.Score, 1) OVER (ORDER BY e.CreationDate) AS NextPostScore,
+    (DENSE_RANK() OVER (ORDER BY e.Score DESC) - DENSE_RANK() OVER (ORDER BY e.ViewCount DESC)) AS ScoreViewDifference,
+    CASE
+        WHEN e.ViewCount > 1000 THEN 'Popular'
+        WHEN e.ViewCount BETWEEN 500 AND 1000 THEN 'Moderate'
+        ELSE 'Low'
+    END AS ViewCategory
+FROM
+    EnrichedPosts e
+WHERE
+    e.OwnerUserId IS NOT NULL
+    AND EXISTS (
+        SELECT 1
+        FROM TopUsers tu
+        WHERE tu.UserId = e.OwnerUserId
+    )
+ORDER BY
+    e.Score DESC,
+    e.ViewCount DESC
+LIMIT 100;

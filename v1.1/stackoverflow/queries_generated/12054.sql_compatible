@@ -1,0 +1,118 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.CreationDate) AS PostRank
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    WHERE 
+        p.PostTypeId IN (1, 2) AND p.Score > 0
+),
+TopUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id) AS BadgeCount,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Id) AS UserRank
+    FROM 
+        Users u
+    LEFT JOIN 
+        Badges b ON u.Id = b.UserId
+    WHERE 
+        u.Reputation > 100
+    GROUP BY 
+        u.Id, u.DisplayName, u.Reputation
+),
+PostHistorySummary AS (
+    SELECT 
+        ph.PostId,
+        COUNT(DISTINCT ph.Id) AS HistoryCount,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM 
+        PostHistory ph
+    WHERE 
+        ph.PostHistoryTypeId IN (3, 5, 6)
+    GROUP BY 
+        ph.PostId
+),
+TagStats AS (
+    SELECT 
+        t.TagName,
+        COUNT(p.Id) AS PostCount,
+        AVG(p.Score) AS AvgScore
+    FROM 
+        Tags t
+    JOIN 
+        Posts p ON t.WikiPostId = p.Id
+    WHERE 
+        p.PostTypeId = 1
+    GROUP BY 
+        t.TagName
+),
+UserActivity AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COUNT(DISTINCT ph.PostId) AS EditCount,
+        COUNT(DISTINCT v.PostId) AS VoteCount
+    FROM 
+        Users u
+    LEFT JOIN 
+        PostHistory ph ON u.Id = ph.UserId
+    LEFT JOIN 
+        Votes v ON u.Id = v.UserId
+    WHERE 
+        (ph.PostHistoryTypeId IN (3, 5, 6)) OR (v.VoteTypeId IN (2, 3))
+    GROUP BY 
+        u.Id, u.DisplayName
+)
+SELECT 
+    rp.Id,
+    rp.PostTypeId,
+    rp.Score,
+    rp.ViewCount,
+    rp.CreationDate,
+    rp.OwnerDisplayName,
+    rp.PostRank,
+    tu.DisplayName AS TopUser,
+    tu.Reputation,
+    tu.BadgeCount,
+    tu.UserRank,
+    phs.HistoryCount,
+    phs.LastEditDate,
+    ts.TagName,
+    ts.PostCount,
+    ts.AvgScore,
+    ua.EditCount,
+    ua.VoteCount
+FROM 
+    RankedPosts rp
+JOIN 
+    TopUsers tu ON rp.OwnerUserId = tu.Id
+JOIN 
+    PostHistorySummary phs ON rp.Id = phs.PostId
+JOIN 
+    TagStats ts ON rp.Id = ts.PostCount /* placeholder join to allow tag match in WHERE */
+JOIN 
+    UserActivity ua ON rp.OwnerUserId = ua.Id
+WHERE 
+    rp.PostRank <= 10
+    AND EXISTS (
+        SELECT 1
+        FROM TagStats t2
+        WHERE rp.Id IN (
+            SELECT p2.Id FROM Posts p2 WHERE p2.Id = rp.Id AND p2.PostTypeId = 1
+        )
+        AND POSITION(t2.TagName IN (SELECT string_agg(tag, ' ') FROM (SELECT regexp_split_to_table(
+            (SELECT coalesce(p3.Tags, '') FROM Posts p3 WHERE p3.Id = rp.Id), E'\\s+') AS tag) s)) > 0
+    )
+ORDER BY 
+    rp.PostRank, tu.UserRank;

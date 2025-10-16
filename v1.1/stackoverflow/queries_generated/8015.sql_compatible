@@ -1,0 +1,378 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        u.websiteurl,
+        u.upvotes,
+        u.downvotes,
+        coalesce(nullif(trim(u.location), ''), 'Unknown') as norm_location
+    from users u
+    where u.creationdate >= (select date_trunc('month', max(creationdate)) - interval '12 months' from users)
+),
+q_posts as (
+    select
+        p.id as post_id,
+        p.owneruserid as user_id,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.favoritecount,
+        p.commentcount,
+        p.title,
+        p.tags,
+        p.acceptedanswerid,
+        p.closeddate,
+        p.lastactivitydate
+    from posts p
+    where p.posttypeid = 1
+),
+a_posts as (
+    select
+        p.id as post_id,
+        p.parentid as question_id,
+        p.owneruserid as user_id,
+        p.creationdate,
+        p.score
+    from posts p
+    where p.posttypeid = 2
+),
+badge_agg as (
+    select
+        b.userid as user_id,
+        count(*) as total_badges,
+        sum(case when b.class = 1 then 1 else 0 end) as gold,
+        sum(case when b.class = 2 then 1 else 0 end) as silver,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze,
+        sum(case when b.tagbased = true then 1 else 0 end) as tag_badges
+    from badges b
+    group by b.userid
+),
+votes_agg as (
+    select
+        v.postid,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+        sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount, 0) else 0 end) as bounty_total,
+        count(*) as total_votes
+    from votes v
+    group by v.postid
+),
+comments_agg as (
+    select
+        c.postid,
+        count(*) as comment_count,
+        max(c.score) as max_comment_score,
+        min(c.creationdate) as first_comment_date
+    from comments c
+    group by c.postid
+),
+ph_close as (
+    select
+        ph.postid,
+        count(*) filter (where ph.posthistorytypeid = 10) as close_events,
+        count(*) filter (where ph.posthistorytypeid = 11) as reopen_events,
+        count(*) filter (where ph.posthistorytypeid in (12,13)) as del_undel_events,
+        max(ph.creationdate) filter (where ph.posthistorytypeid = 10) as last_close_date,
+        string_agg(distinct crt.name, ', ' order by crt.name) as close_reasons
+    from posthistory ph
+    left join closerreasontypes crt
+        on ph.posthistorytypeid = 10
+       and ph.comment ~ '^[0-9]+'
+       and cast(ph.comment as integer) = crt.id
+    group by ph.postid
+),
+linked_dupes as (
+    select
+        pl.postid,
+        count(*) filter (where pl.linktypeid = 1) as linked_count,
+        count(*) filter (where pl.linktypeid = 3) as duplicate_count,
+        max(pl.creationdate) as last_link_date
+    from postlinks pl
+    group by pl.postid
+),
+tag_explode as (
+    select
+        q.post_id,
+        unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')) as tag
+    from q_posts q
+    where q.tags is not null and length(q.tags) > 2
+),
+primary_tag as (
+    select post_id,
+           tag,
+           row_number() over (partition by post_id order by count(*) desc, tag) as rn
+    from tag_explode
+    group by post_id, tag
+),
+question_stats as (
+    select
+        q.post_id,
+        q.user_id,
+        q.creationdate,
+        q.score,
+        q.viewcount,
+        coalesce(q.favoritecount, 0) as favoritecount,
+        coalesce(q.commentcount, 0) as commentcount,
+        q.title,
+        q.tags,
+        q.acceptedanswerid,
+        q.closeddate,
+        q.lastactivitydate,
+        v.upvotes,
+        v.downvotes,
+        v.favorites as vote_favorites,
+        v.bounty_total,
+        v.total_votes,
+        c.comment_count as agg_comment_count,
+        c.max_comment_score,
+        c.first_comment_date,
+        ph.close_events,
+        ph.reopen_events,
+        ph.del_undel_events,
+        ph.last_close_date,
+        ph.close_reasons,
+        ld.linked_count,
+        ld.duplicate_count,
+        ld.last_link_date,
+        pt.tag as primary_tag
+    from q_posts q
+    left join votes_agg v on v.postid = q.post_id
+    left join comments_agg c on c.postid = q.post_id
+    left join ph_close ph on ph.postid = q.post_id
+    left join linked_dupes ld on ld.postid = q.post_id
+    left join primary_tag pt on pt.post_id = q.post_id and pt.rn = 1
+),
+answer_stats as (
+    select
+        a.question_id,
+        count(*) as answer_count,
+        max(a.score) as max_answer_score,
+        sum(case when a.score > 0 then 1 else 0 end) as positive_answers,
+        count(*) filter (where a.score <= 0) as nonpos_answers,
+        min(a.creationdate) as first_answer_date
+    from a_posts a
+    group by a.question_id
+),
+user_activity as (
+    select
+        ru.user_id,
+        count(distinct q.post_id) as questions_count,
+        coalesce(sum(q.viewcount), 0) as total_views,
+        coalesce(sum(q.score), 0) as total_q_score,
+        max(q.creationdate) as last_question_date
+    from recent_users ru
+    left join q_posts q on q.user_id = ru.user_id
+    group by ru.user_id
+),
+quality_bucket as (
+    select
+        qs.post_id,
+        case
+            when qs.score >= 10 and coalesce(qs.upvotes,0) >= 10 and coalesce(qs.viewcount,0) >= 1000 then 'A'
+            when qs.score >= 5 and coalesce(qs.viewcount,0) >= 500 then 'B'
+            when qs.score < 0 or coalesce(qs.duplicate_count,0) > 0 then 'D'
+            else 'C'
+        end as quality_grade
+    from question_stats qs
+),
+question_enriched as (
+    select
+        qs.*,
+        ab.answer_count,
+        ab.max_answer_score,
+        ab.positive_answers,
+        ab.nonpos_answers,
+        ab.first_answer_date,
+        qb.quality_grade,
+        case when qs.acceptedanswerid is not null then 1 else 0 end as has_accepted,
+        case when qs.closeddate is not null then 1 else 0 end as is_closed,
+        extract(epoch from (coalesce(qs.lastactivitydate, qs.creationdate) - qs.creationdate))/3600.0 as active_hours,
+        coalesce(qs.upvotes,0) - coalesce(qs.downvotes,0) as net_votes,
+        coalesce(qs.favoritecount,0) + coalesce(qs.vote_favorites,0) as all_favorites
+    from question_stats qs
+    left join answer_stats ab on ab.question_id = qs.post_id
+    left join quality_bucket qb on qb.post_id = qs.post_id
+),
+user_enriched as (
+    select
+        ru.*,
+        ua.questions_count,
+        ua.total_views,
+        ua.total_q_score,
+        ua.last_question_date,
+        ba.total_badges,
+        ba.gold,
+        ba.silver,
+        ba.bronze,
+        ba.tag_badges
+    from recent_users ru
+    left join user_activity ua on ua.user_id = ru.user_id
+    left join badge_agg ba on ba.user_id = ru.user_id
+),
+ranked_questions as (
+    select
+        qe.*,
+        row_number() over (partition by qe.user_id order by
+            coalesce(qe.net_votes,0) desc,
+            coalesce(qe.viewcount,0) desc,
+            qe.creationdate desc
+        ) as rn_user_by_popularity,
+        dense_rank() over (order by
+            coalesce(qe.net_votes,0) desc,
+            coalesce(qe.viewcount,0) desc,
+            coalesce(qe.answer_count,0) desc
+        ) as global_rank
+    from question_enriched qe
+),
+user_top_questions as (
+    select *
+    from ranked_questions
+    where rn_user_by_popularity <= 3
+),
+tag_summaries as (
+    select
+        coalesce(primary_tag, '(untagged)') as tag,
+        count(*) as questions,
+        sum(case when quality_grade = 'A' then 1 else 0 end) as a_count,
+        sum(case when quality_grade = 'B' then 1 else 0 end) as b_count,
+        sum(case when quality_grade = 'C' then 1 else 0 end) as c_count,
+        sum(case when quality_grade = 'D' then 1 else 0 end) as d_count,
+        avg(coalesce(net_votes,0)) as avg_net_votes,
+        max(viewcount) as max_views
+    from question_enriched
+    group by coalesce(primary_tag, '(untagged)')
+),
+nulls_probe as (
+    select
+        u.user_id,
+        count(*) filter (where qe.tags is null) as null_tag_questions,
+        count(*) filter (where qe.tags is not null and length(trim(qe.tags)) = 0) as empty_tag_questions
+    from user_enriched u
+    left join question_enriched qe on qe.user_id = u.user_id
+    group by u.user_id
+),
+mixed as (
+    select
+        'USER' as entity_type,
+        cast(u.user_id as text) as entity_id,
+        u.displayname as entity_name,
+        u.reputation,
+        u.norm_location as category,
+        u.questions_count as metric_1,
+        u.total_views as metric_2,
+        u.total_q_score as metric_3,
+        u.gold as metric_4,
+        u.silver as metric_5,
+        u.bronze as metric_6,
+        u.tag_badges as metric_7,
+        u.last_question_date as dt_1,
+        cast(null as timestamp) as dt_2,
+        nulls_probe.null_tag_questions as extra_1,
+        nulls_probe.empty_tag_questions as extra_2
+    from user_enriched u
+    left join nulls_probe on nulls_probe.user_id = u.user_id
+
+    union all
+
+    select
+        'QUESTION' as entity_type,
+        cast(q.post_id as text) as entity_id,
+        coalesce(nullif(q.title, ''), '[no title]') as entity_name,
+        coalesce(q.net_votes,0) as reputation,
+        coalesce(q.primary_tag, '(untagged)') as category,
+        coalesce(q.viewcount,0) as metric_1,
+        coalesce(q.answer_count,0) as metric_2,
+        coalesce(q.all_favorites,0) as metric_3,
+        coalesce(q.positive_answers,0) as metric_4,
+        coalesce(q.nonpos_answers,0) as metric_5,
+        coalesce(q.linked_count,0) as metric_6,
+        coalesce(q.duplicate_count,0) as metric_7,
+        q.creationdate as dt_1,
+        q.lastactivitydate as dt_2,
+        case when q.has_accepted = 1 then 1 else 0 end as extra_1,
+        case when q.is_closed = 1 then 1 else 0 end as extra_2
+    from user_top_questions q
+),
+windowed as (
+    select
+        m.*,
+        sum(case when entity_type = 'QUESTION' then metric_1 else 0 end) over (partition by category) as sum_metric1_by_category,
+        avg(case when entity_type = 'QUESTION' then metric_3 else null end) over (partition by category) as avg_metric3_by_category,
+        row_number() over (partition by entity_type order by reputation desc, metric_1 desc) as rn_type,
+        lag(metric_2) over (partition by entity_type, category order by dt_1) as prev_metric2_same_cat
+    from mixed m
+),
+filtered as (
+    select *
+    from windowed
+    where
+        (
+            entity_type = 'USER'
+            and coalesce(metric_1,0) >= 1
+            and coalesce(reputation,0) > 0
+        )
+        or
+        (
+            entity_type = 'QUESTION'
+            and (metric_2 > 0 or metric_3 > 0 or reputation > 0)
+        )
+),
+ranked_final as (
+    select
+        f.*,
+        dense_rank() over (order by
+            case when entity_type = 'USER' then 0 else 1 end,
+            category,
+            coalesce(reputation,0) desc,
+            coalesce(metric_1,0) desc
+        ) as overall_rank
+    from filtered f
+)
+select
+    rf.entity_type,
+    rf.entity_id,
+    rf.entity_name,
+    rf.category,
+    rf.reputation,
+    rf.metric_1,
+    rf.metric_2,
+    rf.metric_3,
+    rf.metric_4,
+    rf.metric_5,
+    rf.metric_6,
+    rf.metric_7,
+    rf.dt_1,
+    rf.dt_2,
+    rf.extra_1,
+    rf.extra_2,
+    rf.sum_metric1_by_category,
+    rf.avg_metric3_by_category,
+    rf.prev_metric2_same_cat,
+    rf.rn_type,
+    rf.overall_rank,
+    ts.questions as tag_total_questions,
+    ts.a_count as tag_A,
+    ts.b_count as tag_B,
+    ts.c_count as tag_C,
+    ts.d_count as tag_D
+from ranked_final rf
+left join tag_summaries ts
+  on ts.tag = rf.category
+where
+    not (
+        entity_type = 'QUESTION'
+        and category = '(untagged)'
+        and coalesce(metric_1,0) < 10
+        and coalesce(reputation,0) <= 0
+    )
+order by
+    entity_type,
+    category,
+    overall_rank,
+    rn_type,
+    entity_id
+limit 500;

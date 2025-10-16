@@ -1,0 +1,123 @@
+-- {"query": "4006.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1352} 
+with recursive TagHierarchy as (
+    select Id, TagName, WikiPostId, 1 as Level
+    from Tags
+    where IsRequired = 0 and IsModeratorOnly = 0
+  union all
+    select t.Id, t.TagName, t.WikiPostId, th.Level + 1
+    from Tags t
+    inner join TagHierarchy th on t.Id = (
+      select pl.RelatedPostId from PostLinks pl
+      join Posts p on p.Id = pl.PostId
+      where p.PostTypeId = 1 and
+        pl.LinkTypeId = 1 and
+        p.Tags like '%' || t.TagName || '%'
+      limit 1
+    )
+    where th.Level < 3
+), RecentAnswersWithVotes as (
+    select
+      pa.Id as AnswerId,
+      pa.ParentId as QuestionId,
+      pa.OwnerUserId,
+      pa.CreationDate,
+      pa.Score,
+      count(v.Id) filter (where v.VoteTypeId = 2) as UpVotesCount,
+      count(v.Id) filter (where v.VoteTypeId = 3) as DownVotesCount,
+      sum(case when v.VoteTypeId = 8 then v.BountyAmount else 0 end) as BountySum
+    from Posts pa
+    left join Votes v on v.PostId = pa.Id
+    where pa.PostTypeId = 2
+      and pa.CreationDate >= now() - interval '90 days'
+    group by pa.Id, pa.ParentId, pa.OwnerUserId, pa.CreationDate, pa.Score
+), UserBadgeRanks as (
+    select
+      UserId,
+      sum(case when Class = 1 then 3 when Class = 2 then 2 when Class = 3 then 1 else 0 end) as BadgeRank,
+      count(*) as BadgeCount
+    from Badges
+    group by UserId
+), QuestionEngagement as (
+    select
+      q.Id as QuestionId,
+      q.OwnerUserId,
+      q.Title,
+      q.CreationDate,
+      q.Score,
+      q.ViewCount,
+      q.AnswerCount,
+      q.FavoriteCount,
+      count(distinct c.Id) as CommentCount,
+      max(pht.CreationDate) filter (where pht.PostHistoryTypeId = 10) as ClosedDate,
+      min(pht.CreationDate) filter (where pht.PostHistoryTypeId = 11) as ReopenDate,
+      row_number() over(partition by q.OwnerUserId order by q.CreationDate desc) as UserRecentQuestionRank
+    from Posts q
+    left join Comments c on c.PostId = q.Id
+    left join PostHistory pht on pht.PostId = q.Id and pht.PostHistoryTypeId in (10,11)
+    where q.PostTypeId = 1
+    group by q.Id, q.OwnerUserId, q.Title, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, q.FavoriteCount
+), UserActivityScores as (
+    select
+      u.Id as UserId,
+      u.DisplayName,
+      u.Reputation,
+      count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+      count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+      count(distinct c.Id) as CommentsCount,
+      coalesce(ub.BadgeRank, 0) as BadgeScore,
+      coalesce(sum(ra.Score), 0) as Last90DaysAnswerScore,
+      row_number() over(order by (coalesce(sum(ra.Score),0) + coalesce(ub.BadgeRank,0)*10 + u.Reputation/1000) desc) as ActivityRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join UserBadgeRanks ub on ub.UserId = u.Id
+    left join RecentAnswersWithVotes ra on ra.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, ub.BadgeRank
+)
+select distinct
+    qe.QuestionId,
+    qe.Title,
+    qe.CreationDate as QuestionDate,
+    qe.Score as QuestionScore,
+    qe.ViewCount,
+    qe.AnswerCount,
+    qe.FavoriteCount,
+    qe.CommentCount as QuestionComments,
+    coalesce(qe.ClosedDate, timestamp '9999-12-31') as ClosedDate,
+    coalesce(qe.ReopenDate, timestamp '9999-12-31') as ReopenDate,
+    ua.UserId as AuthorId,
+    ua.DisplayName as AuthorName,
+    ua.Reputation as AuthorReputation,
+    ua.BadgeScore,
+    ua.QuestionsCount,
+    ua.AnswersCount,
+    ua.CommentsCount,
+    ua.Last90DaysAnswerScore,
+    ua.ActivityRank,
+    string_agg(distinct t.TagName, ',' order by t.TagName) as TagsHierarchy,
+    (select avg(Score) from Posts a where a.ParentId = qe.QuestionId and a.PostTypeId = 2) as AvgAnswerScore,
+    (select count(*) from PostLinks pl where pl.PostId = qe.QuestionId and pl.LinkTypeId = 3) as DuplicateCount,
+    case
+      when qe.ClosedDate is null then 'Open'
+      when qe.ReopenDate is not null and qe.ReopenDate > qe.ClosedDate then 'Reopened'
+      else 'Closed'
+    end as QuestionState,
+    case
+      when ua.ActivityRank <= 10 then 'Top 10 Active'
+      when ua.ActivityRank <= 50 then 'Top 50 Active'
+      else 'Other'
+    end as UserActivityTier
+from QuestionEngagement qe
+join UserActivityScores ua on ua.UserId = qe.OwnerUserId
+left join lateral (
+    select distinct th.TagName
+    from TagHierarchy th
+    where qe.Tags like '%' || th.TagName || '%'
+    order by th.Level desc, th.TagName
+    limit 5
+) t on true
+where qe.AnswerCount > 0
+  and (qe.ClosedDate is null or qe.ClosedDate > now() - interval '180 days')
+  and ua.Reputation > 1000
+order by ua.ActivityRank, qe.CreationDate desc
+limit 100;

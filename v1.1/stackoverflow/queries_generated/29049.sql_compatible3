@@ -1,0 +1,107 @@
+SELECT
+    cpa.PostId,
+    cpa.PostStatus,
+    cpa.Score,
+    cpa.ViewCount,
+    cpa.AnswerCount,
+    cpa.CommentCount,
+    cpa.FavoriteCount,
+    cpa.ScoreRank,
+    cpa.TimelineOrder,
+    cpa.PrevScore,
+    cpa.NextScore,
+    cpa.AvgScoreByType,
+    cpa.Quartile,
+    cpa.CombinedTags,
+    cpa.PositiveCommentCount,
+    cpa.VoteCount,
+    cpa.OwnerUserId,
+    cpa.AuthorName,
+    cpa.AuthorReputation,
+    cpa.AuthorViews,
+    cpa.LinkCount,
+    cpa.EditHistoryCount,
+    cpa.AcceptanceCount,
+    cpa.EngagementLevel,
+    cpa.Title,
+    cpa.UserPostSequence,
+    cpa.RecentBadges,
+    cpa.TagArray,
+    cpa.UserTier,
+    (
+        SELECT AVG(p3.Score)
+        FROM Posts p3
+        WHERE p3.OwnerUserId = cpa.OwnerUserId
+          AND p3.CreationDate >= DATE '2022-01-01'
+    ) AS AvgScorePerUser,
+    (
+        SELECT COUNT(*)
+        FROM PostHistory ph2
+        WHERE ph2.PostId = cpa.PostId
+          AND ph2.CreationDate >= DATE '2022-01-01'
+    ) AS RecentEdits,
+    CASE
+        WHEN cpa.FavoriteCount > 10 THEN 'Highly Favorited'
+        WHEN cpa.FavoriteCount > 5 THEN 'Moderately Favorited'
+        ELSE 'Less Favorited'
+    END AS FavoriteCategory,
+    (
+        SELECT STRING_AGG(b.Name, ', ')
+        FROM Badges b
+        WHERE b.UserId = cpa.OwnerUserId
+          AND b.Date >= DATE '2022-01-01'
+          AND b.Date <= DATE '2023-01-01'
+          AND b.Class = 1
+    ) AS RecentGoldBadges,
+    CASE
+        WHEN cpa.Score > (SELECT AVG(p.Score) FROM Posts p WHERE p.PostTypeId = 1) * 1.2 THEN 1
+        ELSE 0
+    END AS AboveAverageScore,
+    (
+        SELECT COUNT(*)
+        FROM Comments c
+        WHERE c.PostId = cpa.PostId
+          AND c.CreationDate >= DATE '2022-01-01'
+    ) AS RecentComments,
+    (
+        SELECT p2.Title
+        FROM Posts p2
+        JOIN PostLinks pl ON p2.Id = pl.RelatedPostId
+        WHERE pl.PostId = cpa.PostId
+          AND p2.PostTypeId = 2
+        FETCH FIRST 1 ROW ONLY
+    ) AS RelatedAnswerTitle
+FROM ComplexPostAnalysis AS cpa
+WHERE cpa.PostStatus <> 'Regular'
+GROUP BY
+    cpa.PostId,
+    cpa.PostStatus,
+    cpa.Score,
+    cpa.ViewCount,
+    cpa.AnswerCount,
+    cpa.CommentCount,
+    cpa.FavoriteCount,
+    cpa.ScoreRank,
+    cpa.TimelineOrder,
+    cpa.PrevScore,
+    cpa.NextScore,
+    cpa.AvgScoreByType,
+    cpa.Quartile,
+    cpa.CombinedTags,
+    cpa.PositiveCommentCount,
+    cpa.VoteCount,
+    cpa.OwnerUserId,
+    cpa.AuthorName,
+    cpa.AuthorReputation,
+    cpa.AuthorViews,
+    cpa.LinkCount,
+    cpa.EditHistoryCount,
+    cpa.AcceptanceCount,
+    cpa.EngagementLevel,
+    cpa.Title,
+    cpa.UserPostSequence,
+    cpa.RecentBadges,
+    cpa.TagArray,
+    cpa.UserTier
+ORDER BY cpa.Score DESC, cpa.ViewCount DESC, cpa.TimelineOrder ASC
+LIMIT 2000 OFFSET 500;

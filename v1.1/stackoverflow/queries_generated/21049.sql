@@ -1,0 +1,207 @@
+-- {"query": "21049.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2168, "output_tokens": 2207} 
+
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN pt.Id = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN pt.Id = 2 THEN p.Id END) AS Answers,
+        AVG(COALESCE(p.Score, 0)) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.CreationDate > NOW() - INTERVAL '1 year'
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE u.Reputation >= 100 
+      AND u.LastAccessDate > NOW() - INTERVAL '6 months'
+      AND (u.Location IS NULL OR u.Location NOT LIKE '%spam%')
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.Location
+    HAVING COUNT(DISTINCT p.Id) > 0
+),
+QuestionStats AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.OwnerUserId,
+        p.CreationDate AS QCreationDate,
+        p.Score AS QuestionScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.ClosedDate IS NOT NULL AS IsClosed,
+        p.Tags,
+        COALESCE(accepted_post.Score, 0) AS AcceptedAnswerScore,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpvoteCount,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownvoteCount,
+        COUNT(CASE WHEN v.VoteTypeId = 1 THEN 1 END) AS AcceptedCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RecentRank,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevQuestionScore,
+        NTILE(4) OVER (ORDER BY p.ViewCount DESC) AS PopularityQuartile
+    FROM Posts p
+    LEFT JOIN Posts accepted_post ON p.AcceptedAnswerId = accepted_post.Id
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE pt.Id = 1 
+      AND p.CreationDate > NOW() - INTERVAL '2 years'
+      AND p.Score > -5  -- Exclude heavily downvoted questions
+    GROUP BY 
+        p.Id, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, 
+        p.AnswerCount, p.CommentCount, p.ClosedDate, p.Tags, 
+        accepted_post.Score
+),
+TagActivity AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagUsageCount,
+        COALESCE(SUM(qs.QuestionScore), 0) AS TotalQuestionScore,
+        COUNT(DISTINCT qs.QuestionId) AS TaggedQuestions,
+        AVG(qs.QuestionScore) AS AvgScorePerTaggedQuestion,
+        STRING_AGG(
+            CASE 
+                WHEN LENGTH(qs.Tags) > 0 AND qs.Tags LIKE '%<' || t.TagName || '>%' 
+                THEN SUBSTRING(qs.Tags FROM '<' || t.TagName || '>') 
+                ELSE NULL 
+            END, 
+            ' | '
+        ) AS SampleTags,
+        CASE 
+            WHEN t.ExcerptPostId IS NULL THEN 'No Excerpt'
+            WHEN p_excerpt.LastActivityDate > NOW() - INTERVAL '30 days' THEN 'Active Excerpt'
+            ELSE 'Inactive Excerpt'
+        END AS ExcerptStatus
+    FROM Tags t
+    LEFT JOIN QuestionStats qs ON qs.Tags LIKE '%<' || t.TagName || '>%'
+    LEFT JOIN Posts p_excerpt ON t.ExcerptPostId = p_excerpt.Id
+    WHERE t.Count > 10
+      AND t.TagName NOT LIKE '%-%'  -- Exclude compound tags
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, p_excerpt.LastActivityDate
+),
+UserEngagement AS (
+    SELECT 
+        au.UserId,
+        au.TotalPosts,
+        au.Questions,
+        au.Answers,
+        au.AvgPostScore,
+        COALESCE(SUM(qs.UpvoteCount), 0) AS TotalQuestionUpvotes,
+        COALESCE(SUM(CASE WHEN qs.IsClosed THEN 1 ELSE 0 END), 0) AS ClosedQuestions,
+        COALESCE(AVG(qs.AcceptedAnswerScore), 0) AS AvgAcceptedAnswerQuality,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        MAX(b.Date) AS LatestBadgeDate
+    FROM ActiveUsers au
+    LEFT JOIN QuestionStats qs ON au.UserId = qs.OwnerUserId AND qs.RecentRank <= 5
+    LEFT JOIN Badges b ON au.UserId = b.UserId 
+        AND b.Date > NOW() - INTERVAL '1 year'
+        AND b.TagBased = FALSE  -- Only named badges
+    GROUP BY au.UserId, au.TotalPosts, au.Questions, au.Answers, au.AvgPostScore
+),
+ComplexInteractions AS (
+    SELECT 
+        ph.PostId,
+        ph.UserId AS EditorId,
+        ph.CreationDate AS EditDate,
+        ph.PostHistoryTypeId,
+        ph.Comment AS EditComment,
+        COALESCE(LENGTH(ph.Text), 0) AS EditSize,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 'Content Edit'
+            WHEN ph.PostHistoryTypeId IN (10, 11) THEN 'Close/Reopen'
+            WHEN ph.PostHistoryTypeId IN (12, 13) THEN 'Delete/Undelete'
+            ELSE 'Other'
+        END AS EditCategory,
+        ROW_NUMBER() OVER (
+            PARTITION BY ph.PostId 
+            ORDER BY ph.CreationDate DESC
+        ) AS EditRecency,
+        LAG(ph.UserId) OVER (
+            PARTITION BY ph.PostId 
+            ORDER BY ph.CreationDate
+        ) AS PreviousEditor
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 10, 11, 12, 13)
+      AND ph.CreationDate > NOW() - INTERVAL '1 year'
+      AND ph.UserId IS NOT NULL
+      AND ph.UserId != COALESCE(
+            (SELECT p.OwnerUserId FROM Posts p WHERE p.Id = ph.PostId), 
+            -1
+        )  -- Exclude original author edits
+)
+SELECT 
+    ue.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    ue.TotalPosts,
+    ue.Questions,
+    ue.Answers,
+    ue.AvgPostScore,
+    ue.TotalQuestionUpvotes,
+    ue.ClosedQuestions,
+    ue.BadgeCount,
+    ue.GoldBadges,
+    ue.SilverBadges,
+    ta.TagName AS MostActiveTag,
+    ta.AvgScorePerTaggedQuestion AS TagPerformance,
+    ta.ExcerptStatus,
+    ci.EditCategory,
+    COUNT(ci.EditRecency) AS RecentEditsByOthers,
+    STRING_AGG(
+        DISTINCT COALESCE(ci.EditComment, ''), 
+        ' | '
+    ) AS SampleEditComments,
+    CASE 
+        WHEN ue.ClosedQuestions * 1.0 / NULLIF(ue.Questions, 0) > 0.3 
+        THEN 'High Closure Rate'
+        WHEN ue.GoldBadges >= 3 THEN 'Elite User'
+        WHEN ue.TotalQuestionUpvotes > 1000 THEN 'Popular'
+        ELSE 'Standard'
+    END AS UserCategory,
+    (ue.AvgPostScore * 0.7 + ue.AvgAcceptedAnswerQuality * 0.3)::numeric(5,2) AS QualityScore,
+    GREATEST(
+        COALESCE(u.CreationDate, '1900-01-01'::timestamp),
+        COALESCE(ue.LatestBadgeDate, '1900-01-01'::timestamp),
+        COALESCE(au.LastPostDate, '1900-01-01'::timestamp)
+    ) AS LastSignificantActivity,
+    CASE 
+        WHEN ta.PopularityQuartile = 1 THEN 'Very Popular'
+        WHEN ta.PopularityQuartile = 2 THEN 'Popular'
+        WHEN ta.PopularityQuartile = 3 THEN 'Average'
+        ELSE 'Low Visibility'
+    END AS ContentVisibility
+FROM UserEngagement ue
+INNER JOIN Users u ON ue.UserId = u.Id
+LEFT JOIN ActiveUsers au ON ue.UserId = au.UserId
+LEFT JOIN (
+    SELECT 
+        qs.OwnerUserId,
+        ta.TagName,
+        qs.PopularityQuartile,
+        ROW_NUMBER() OVER (
+            PARTITION BY qs.OwnerUserId 
+            ORDER BY ta.TotalQuestionScore DESC
+        ) AS TagRank
+    FROM QuestionStats qs
+    INNER JOIN TagActivity ta ON qs.Tags LIKE '%<' || ta.TagName || '>%'
+    WHERE qs.PopularityQuartile <= 2
+) ta ON ue.UserId = ta.OwnerUserId AND ta.TagRank = 1
+LEFT JOIN ComplexInteractions ci ON ue.UserId = ci.PreviousEditor 
+    AND ci.EditRecency <= 3
+    AND ci.EditDate > NOW() - INTERVAL '6 months'
+WHERE ue.Questions >= 3 
+  AND (u.Location IS NULL OR LENGTH(u.Location) > 3)
+  AND ue.AvgPostScore > -2
+GROUP BY 
+    ue.UserId, u.DisplayName, u.Reputation, u.Location,
+    ue.TotalPosts, ue.Questions, ue.Answers, ue.AvgPostScore,
+    ue.TotalQuestionUpvotes, ue.ClosedQuestions, ue.BadgeCount,
+    ue.GoldBadges, ue.SilverBadges,
+    ta.TagName, ta.AvgScorePerTaggedQuestion, ta.ExcerptStatus,
+    ci.EditCategory, ta.PopularityQuartile,
+    u.CreationDate, ue.LatestBadgeDate, au.LastPostDate,
+    ue.AvgAcceptedAnswerQuality
+HAVING COUNT(DISTINCT ci.PostId) > 0 OR ta.TagName IS NOT NULL
+ORDER BY QualityScore DESC, TotalQuestionUpvotes DESC NULLS LAST
+LIMIT 1000;

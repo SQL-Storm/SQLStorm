@@ -1,0 +1,125 @@
+WITH RecentPosts AS (
+    SELECT 
+        p.Id, 
+        p.Title, 
+        p.CreationDate, 
+        p.Score, 
+        p.ViewCount, 
+        p.AnswerCount, 
+        u.DisplayName AS OwnerDisplayName, 
+        u.Reputation,
+        COALESCE(SUM(v.BountyAmount), 0) AS TotalBounty
+    FROM 
+        Posts p
+    JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId AND v.VoteTypeId = 8
+    WHERE 
+        p.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+    GROUP BY 
+        p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT 
+        OwnerUserId, 
+        COUNT(Id) AS PostCount, 
+        AVG(Score) AS AvgScore
+    FROM 
+        Posts
+    WHERE 
+        CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+    GROUP BY 
+        OwnerUserId
+    HAVING 
+        COUNT(Id) > 10
+),
+PostTags AS (
+    SELECT 
+        p.Id, 
+        -- convert tags like '<tag1><tag2>' into an array of tag names in standard SQL
+        -- use regexp_split_to_array replacement: remove leading and trailing angle brackets then split on '><'
+        -- Use standard SQL functions: substring and replace are common; string_to_array is Postgres-specific.
+        -- For broad compatibility, produce a table of tags by splitting using a recursive approach or using JSON if available.
+        -- Here we'll use a simple regexp-based approach using REGEXP_REPLACE to remove outer < and > and then split using a generic splitting function.
+        -- For compatibility, return the tags as a comma-separated string in TagsCsv, and later unnest by splitting on comma using a generic method.
+        REPLACE(REGEXP_REPLACE(p.Tags, '^<|>$', ''), '><', ',') AS TagsCsv
+    FROM 
+        Posts p
+    WHERE 
+        p.PostTypeId = 1
+),
+PostTagsExploded AS (
+    SELECT
+        Id,
+        TRIM(value) AS tag
+    FROM (
+        SELECT
+            Id,
+            -- split the CSV into rows. Use a common SQL technique via recursive CTE to split on comma for broad compatibility.
+            -- We'll implement splitting here.
+            TagsCsv
+        FROM PostTags
+    ) pt
+    CROSS JOIN LATERAL (
+        SELECT value FROM (
+            WITH RECURSIVE split(id, rest, value) AS (
+                SELECT Id, TagsCsv || ',', NULL
+                UNION ALL
+                SELECT
+                    id,
+                    SUBSTR(rest, INSTR(rest, ',') + 1),
+                    TRIM(SUBSTR(rest, 1, INSTR(rest, ',') - 1))
+                FROM split
+                WHERE rest IS NOT NULL AND INSTR(rest, ',') > 0
+            )
+            SELECT value FROM split WHERE value IS NOT NULL
+        )
+    ) s
+),
+TagFrequency AS (
+    SELECT 
+        t.Id AS PostId,
+        t.tag AS TagName, 
+        COUNT(*) OVER (PARTITION BY t.tag) AS Frequency
+    FROM PostTagsExploded t
+),
+PostActivity AS (
+    SELECT 
+        p.Id, 
+        COUNT(DISTINCT ph.CreationDate) AS EditCount, 
+        COUNT(DISTINCT c.Id) AS CommentCount
+    FROM 
+        Posts p
+    LEFT JOIN 
+        PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN 
+        Comments c ON p.Id = c.PostId
+    GROUP BY 
+        p.Id
+)
+SELECT 
+    rp.Id AS PostId, 
+    rp.Title, 
+    rp.CreationDate, 
+    rp.Score, 
+    rp.ViewCount, 
+    rp.AnswerCount, 
+    rp.OwnerDisplayName, 
+    rp.Reputation, 
+    rp.TotalBounty, 
+    pa.EditCount, 
+    pa.CommentCount, 
+    tf.TagName, 
+    tf.Frequency
+FROM 
+    RecentPosts rp
+JOIN 
+    PostActivity pa ON rp.Id = pa.Id
+LEFT JOIN 
+    TagFrequency tf ON rp.Id = tf.PostId
+ORDER BY 
+    rp.Score DESC, 
+    rp.ViewCount DESC, 
+    tf.Frequency DESC
+LIMIT 100;

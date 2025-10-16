@@ -1,0 +1,162 @@
+WITH UserBadgeRanks AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        b.Name AS BadgeName,
+        b.Class AS BadgeClass,
+        b.Date AS BadgeDate,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY b.Class ASC, b.Date DESC) AS BadgeRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+),
+TagActivity AS (
+    SELECT
+        split_tags.tag AS TagName,
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        CASE
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostKind
+    FROM Posts p
+    CROSS APPLY (
+        -- trim outer angle brackets and split by '><'
+        SELECT value AS tag
+        FROM STRING_SPLIT(TRIM(BOTH '<' FROM TRIM(BOTH '>' FROM p.Tags)), '><')
+    ) AS split_tags
+    WHERE p.Tags IS NOT NULL
+      AND p.PostTypeId IN (1,2)
+),
+TopTagContributors AS (
+    SELECT
+        t.TagName,
+        t.OwnerUserId,
+        COUNT(*) AS PostsCount,
+        SUM(CASE WHEN t.PostKind = 'Question' THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN t.PostKind = 'Answer' THEN 1 ELSE 0 END) AS AnswerCount,
+        SUM(t.Score) AS TotalScore,
+        MIN(t.CreationDate) AS FirstPostDate,
+        MAX(t.CreationDate) AS LastPostDate,
+        ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY COUNT(*) DESC, SUM(t.Score) DESC) AS TagUserRank
+    FROM TagActivity t
+    WHERE t.OwnerUserId IS NOT NULL
+    GROUP BY t.TagName, t.OwnerUserId
+),
+CommentActivity AS (
+    SELECT
+        c.UserId,
+        c.PostId,
+        COUNT(*) AS CommentCount,
+        AVG(CASE WHEN c.Score IS NOT NULL THEN c.Score END) AS AvgCommentScore,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId, c.PostId
+),
+QuestionClosures AS (
+    SELECT
+        ph.PostId,
+        MIN(ph.CreationDate) AS FirstClosedDate,
+        MAX(ph.CreationDate) AS LastClosedDate,
+        COUNT(*) AS TimesClosed,
+        COUNT(DISTINCT CASE WHEN ph.Comment ~ '^[0-9]+$' THEN CAST(ph.Comment AS INTEGER) ELSE NULL END) AS DistinctReasons
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(u.Location, 'Unknown') AS Location,
+    COALESCE(u.WebsiteUrl, 'NoSite') AS Website,
+    r.BadgeName,
+    r.BadgeClass,
+    CASE r.BadgeClass WHEN 1 THEN 'Gold' WHEN 2 THEN 'Silver' WHEN 3 THEN 'Bronze' ELSE 'None' END AS BadgeClassName,
+    r.BadgeDate,
+    tt.TagName AS TopTag,
+    tt.PostsCount,
+    tt.QuestionCount,
+    tt.AnswerCount,
+    tt.TotalScore AS TagTotalScore,
+    tt.FirstPostDate AS FirstTagPost,
+    tt.LastPostDate AS LastTagPost,
+    ca.CommentCount AS CommentsOnTopPost,
+    COALESCE(ca.AvgCommentScore, 0) AS AvgCommentScore,
+    ca.LastCommentDate,
+    qc.TimesClosed,
+    qc.DistinctReasons,
+    CASE
+        WHEN qc.TimesClosed > 0 THEN (CAST(qc.TimesClosed AS DOUBLE PRECISION) / NULLIF(DATEDIFF(day, u.CreationDate, CAST('2024-10-01 12:34:56' AS TIMESTAMP)),0)) * 100
+        ELSE 0
+    END AS ClosuresPer100Days,
+    CHAR_LENGTH(COALESCE(u.AboutMe, '')) AS AboutMeLength,
+    CASE
+        WHEN (u.UpVotes + u.DownVotes) > 0 THEN ROUND(CAST(u.UpVotes AS NUMERIC) / (u.UpVotes + u.DownVotes), 3)
+        ELSE NULL
+    END AS UpvoteRatio
+FROM Users u
+LEFT JOIN LATERAL (
+    SELECT BadgeName, BadgeClass, BadgeDate
+    FROM UserBadgeRanks ubr
+    WHERE ubr.UserId = u.Id
+      AND ubr.BadgeRank = 1
+    LIMIT 1
+) r ON TRUE
+LEFT JOIN LATERAL (
+    SELECT t.TagName, t.PostsCount, t.QuestionCount, t.AnswerCount, t.TotalScore, t.FirstPostDate, t.LastPostDate, t.OwnerUserId
+    FROM TopTagContributors t
+    WHERE t.OwnerUserId = u.Id
+      AND t.TagUserRank = 1
+    LIMIT 1
+) tt ON TRUE
+LEFT JOIN LATERAL (
+    SELECT ca.CommentCount, ca.AvgCommentScore, ca.LastCommentDate, ca.UserId
+    FROM CommentActivity ca
+    WHERE ca.UserId = u.Id
+    ORDER BY ca.CommentCount DESC, ca.AvgCommentScore DESC
+    LIMIT 1
+) ca ON TRUE
+LEFT JOIN LATERAL (
+    SELECT qh.TimesClosed, qh.DistinctReasons, qh.PostId
+    FROM QuestionClosures qh
+    JOIN Posts p ON p.Id = qh.PostId
+    WHERE p.OwnerUserId = u.Id
+    ORDER BY qh.TimesClosed DESC
+    LIMIT 1
+) qc ON TRUE
+WHERE u.Reputation > (
+    SELECT 0.75 * MAX(val.Reputation) FROM Users val
+)
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    u.WebsiteUrl,
+    r.BadgeName,
+    r.BadgeClass,
+    r.BadgeDate,
+    tt.TagName,
+    tt.PostsCount,
+    tt.QuestionCount,
+    tt.AnswerCount,
+    tt.TotalScore,
+    tt.FirstPostDate,
+    tt.LastPostDate,
+    ca.CommentCount,
+    ca.AvgCommentScore,
+    ca.LastCommentDate,
+    qc.TimesClosed,
+    qc.DistinctReasons,
+    u.AboutMe,
+    u.UpVotes,
+    u.DownVotes,
+    u.CreationDate
+ORDER BY u.Reputation DESC
+LIMIT 50;

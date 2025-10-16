@@ -1,0 +1,118 @@
+-- {"query": "1606.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1091} 
+WITH RECURSIVE TagHierarchy(TagId, ParentTagId, Depth) AS (
+    SELECT Id, NULL::int, 0
+    FROM Tags
+    WHERE IsModeratorOnly = 0 AND IsRequired = 0
+
+    UNION ALL
+
+    SELECT t.Id, th.TagId, th.Depth + 1
+    FROM Tags t
+    JOIN TagHierarchy th ON t.WikiPostId::int = th.TagId
+    WHERE t.IsModeratorOnly = 0
+), -- gather and recursively hypothetically connect tags by their WikiPostId as a dummy parent relation to simulate recuses
+
+RecentTopAnswerers AS (
+    SELECT u.Id AS UserId, u.DisplayName, u.Reputation,
+        COUNT(a.Id) FILTER (WHERE a.Score >= 5 AND a.CreationDate >= NOW() - INTERVAL '180 days') AS HighScoreAnswerCount,
+        ROUND(AVG(a.Score) FILTER (WHERE a.CreationDate >= NOW() - INTERVAL '180 days'), 2) AS AvgAnswerScore,
+        STRING_AGG(DISTINCT b.Name, ', ') AS GoldBadges,
+        ROW_NUMBER() OVER (ORDER BY COUNT(a.Id) DESC) AS Rank
+    FROM Users u
+    LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+    LEFT JOIN Badges b ON b.UserId = u.Id AND b.Class = 1 -- Gold badges only
+    WHERE u.CreationDate < NOW()
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(a.Id) > 0
+), 
+
+AcceptedAnswerLag AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.CreationDate AS QuestionCreation,
+        p.AcceptedAnswerId,
+        a.CreationDate AS AnswerCreation,
+        EXTRACT(
+          EPOCH FROM (a.CreationDate - p.CreationDate)
+        ) / 3600.0 AS HoursToAcceptAnswer
+    FROM Posts p
+    LEFT JOIN Posts a ON a.Id = p.AcceptedAnswerId
+    WHERE p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL
+),
+
+PostMentionCount AS (
+    SELECT c.PostId, COUNT(*) AS Mentions
+    FROM Comments c
+    WHERE c.Text LIKE '%issue%' OR c.Text LIKE '%problem%' OR c.Text LIKE '%fail%'
+    GROUP BY c.PostId
+),
+
+FinalSet AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.Tags,
+        u.DisplayName AS QuestionOwner,
+        q.CreationDate,
+        pStats.AvgScore,
+        al.HoursToAcceptAnswer,
+       _pm.Mentions,
+        
+        ta.HighScoreAnswerCount,
+        ta.AvgAnswerScore,
+        COALESCE(ta.GoldBadges,'None') AS GoldBadges,
+        
+        ROW_NUMBER() OVER(PARTITION BY right(q.Tags,5) ORDER BY pStats.ViewCount DESC NULLS LAST) RankPerTagSnippet
+
+    FROM Posts q
+    LEFT JOIN AcceptedAnswerLag al ON al.QuestionId = q.Id
+    LEFT JOIN Users u ON u.Id = q.OwnerUserId
+    LEFT JOIN PostMentionCount _pm ON _pm.PostId = q.Id
+    LEFT JOIN ( SELECT PostId, AVG(Score) AS AvgScore, MAX(ViewCount) AS ViewCount
+                FROM Posts WHERE PostTypeId=2 GROUP BY PostId) pStats ON pStats.PostId = al.AcceptedAnswerId
+    
+    LEFT JOIN RecentTopAnswerers ta ON ta.UserId = u.Id
+
+    WHERE q.PostTypeId = 1
+      AND q.ViewCount IS NOT NULL
+      AND (q.Tags LIKE '%<python>%' OR q.Tags LIKE '%<sql>%')
+)
+
+SELECT fs.*,
+    CONCAT(
+        'Tags: ',
+        COALESCE(NULLIF(fs.Tags,''), 'No tags'),
+        ' | Owner: ', COALESCE(fs.QuestionOwner,'Community'),
+        ' | High scoring answers user badges: ', COALESCE(fs.GoldBadges,'none'),
+        ' | Answer score Avg: ', fs.AvgAnswerScore,
+        ' | Hours To Accept: ', COALESCE(CAST(ROUND(fs.HoursToAcceptAnswer,2) AS VARCHAR), 'N/A'),
+        ' | Mentions of issues: ', fs.Mentions,
+        ' | Rank per Tag Snippet: ', fs.RankPerTagSnippet
+    ) AS DetailSummary
+
+FROM FinalSet fs
+
+WHERE fs.Views > 1000 OR (fs.HighScoreAnswerCount > 5 AND fs.AvgAnswerScore > 10)
+
+ORDER BY fs.ViewCount DESC NULLS LAST, fs.RankPerTagSnippet
+
+UNION
+
+SELECT
+    neg.Id,
+    neg.Title,
+    neg.Tags,
+    NULL,
+    neg.CreationDate,
+    CAST(NULL AS FLOAT),
+    CAST(NULL AS FLOAT),
+    0,
+    0,
+    NULL,
+    9999,
+    CONCAT('Low popularity question: ', COALESCE(neg.Title, '[No Title]'))
+FROM Posts neg
+WHERE neg.PostTypeId = 1 
+  AND (neg.ViewCount < 10 OR neg.ViewCount IS NULL)
+ORDER BY Id DESC
+LIMIT 10;

@@ -1,0 +1,217 @@
+-- {"query": "173.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 2703} 
+WITH
+-- Questions subset with parsed tags and basic aggregates
+questions AS (
+  SELECT
+    p.Id AS QuestionId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score AS QuestionScore,
+    COALESCE(p.ViewCount,0) AS Views,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.Tags,
+    -- parse tags into array (Tags format: '<tag1><tag2>')
+    CASE WHEN p.Tags IS NULL THEN ARRAY[]::varchar[] ELSE string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><') END AS TagArray
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+-- explode tags to allow per-tag analytics
+question_tags AS (
+  SELECT
+    q.*,
+    tag AS Tag
+  FROM questions q
+  LEFT JOIN LATERAL unnest(q.TagArray) AS t(tag) ON TRUE
+),
+-- answers joined to their questions, with some computed metrics and NULL logic
+answers AS (
+  SELECT
+    a.Id AS AnswerId,
+    a.ParentId AS QuestionId,
+    a.OwnerUserId AS AnswerOwner,
+    a.Score AS AnswerScore,
+    a.CreationDate AS AnswerCreation,
+    COALESCE(a.Body,'') AS Body,
+    LENGTH(COALESCE(a.Body,'')) AS BodyLength,
+    CASE WHEN a.LastEditDate IS NOT NULL THEN a.LastEditDate ELSE a.CreationDate END AS EffectiveLastEdit
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+),
+-- Post histories: latest edit per post (correlated subquery style inside CTE)
+latest_history AS (
+  SELECT ph.PostId, ph.Id AS HistoryId, ph.PostHistoryTypeId, ph.CreationDate AS HistoryDate, ph.UserId AS EditorUserId,
+         ph.Comment AS HistoryComment,
+         ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC, ph.Id DESC) AS rn
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (4,5,6,24,52) OR ph.PostHistoryTypeId BETWEEN 1 AND 9
+),
+latest_edit AS (
+  SELECT lh.PostId, lh.HistoryId, lh.HistoryDate, lh.EditorUserId, lh.HistoryComment
+  FROM latest_history lh
+  WHERE lh.rn = 1
+),
+-- user aggregates including badge counts, activity recency and percentiles
+user_agg AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    EXTRACT(EPOCH FROM (u.LastAccessDate - u.CreationDate))/86400.0 AS DaysActive,
+    COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END),0) AS GoldBadges,
+    COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END),0) AS SilverBadges,
+    COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END),0) AS BronzeBadges,
+    COALESCE(COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1),0) AS QuestionsPosted,
+    COALESCE(COUNT(DISTINCT p2.Id) FILTER (WHERE p2.PostTypeId = 2),0) AS AnswersPosted,
+    -- percentile-like ranking of reputation among sampled users (window)
+    PERCENT_RANK() OVER (ORDER BY u.Reputation) AS ReputationPercentile
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Posts p2 ON p2.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+-- per-question aggregates combining answers, latest edit and acceptance info
+question_stats AS (
+  SELECT
+    qt.QuestionId,
+    qt.Title,
+    qt.Tag,
+    qt.OwnerUserId,
+    qt.CreationDate,
+    qt.QuestionScore,
+    qt.Views,
+    qt.AnswerCount,
+    qt.FavoriteCount,
+    -- total answers score and average answer score
+    COALESCE(SUM(a.AnswerScore),0) AS TotalAnswerScore,
+    COALESCE(AVG(a.AnswerScore),0) AS AvgAnswerScore,
+    MAX(a.BodyLength) AS MaxAnswerBodyLength,
+    MIN(a.BodyLength) AS MinAnswerBodyLength,
+    -- accepted answer info via correlated subquery
+    (SELECT ap.Score FROM Posts ap WHERE ap.Id = (SELECT p.AcceptedAnswerId FROM Posts p WHERE p.Id = qt.QuestionId) LIMIT 1) AS AcceptedAnswerScore,
+    (SELECT ap.Id FROM Posts ap WHERE ap.Id = (SELECT p.AcceptedAnswerId FROM Posts p WHERE p.Id = qt.QuestionId) LIMIT 1) AS AcceptedAnswerId,
+    -- last edit info (join later)
+    NULL::timestamp AS LastEditDate
+  FROM question_tags qt
+  LEFT JOIN answers a ON a.QuestionId = qt.QuestionId
+  GROUP BY qt.QuestionId, qt.Title, qt.Tag, qt.OwnerUserId, qt.CreationDate, qt.QuestionScore, qt.Views, qt.AnswerCount, qt.FavoriteCount
+),
+-- enrich question_stats with last edit using left join to latest_edit and include string expressions
+question_enriched AS (
+  SELECT
+    qs.*,
+    le.HistoryDate AS LastEditDate,
+    -- human-readable recency bucket example
+    CASE
+      WHEN le.HistoryDate IS NULL THEN 'never edited'
+      WHEN le.HistoryDate > now() - INTERVAL '7 days' THEN 'edited_recently'
+      WHEN le.HistoryDate > now() - INTERVAL '30 days' THEN 'edited_this_month'
+      ELSE 'edited_older'
+    END AS EditRecencyBucket,
+    -- composite key for ordering tests, using COALESCE and concatenation with NULL handling
+    COALESCE(qs.Tag,'<no-tag>') || '|' || COALESCE(qs.Title,'<untitled>') || '|' || COALESCE(CAST(qs.QuestionScore AS varchar),'0') AS CompositeKey
+  FROM question_stats qs
+  LEFT JOIN latest_edit le ON le.PostId = qs.QuestionId
+),
+-- compute per-tag leaderboards using window functions
+tag_leaderboard AS (
+  SELECT
+    qe.Tag,
+    qe.QuestionId,
+    qe.Title,
+    qe.OwnerUserId,
+    qe.QuestionScore,
+    qe.Views,
+    qe.AnswerCount,
+    qe.TotalAnswerScore,
+    qe.AvgAnswerScore,
+    qe.AcceptedAnswerId,
+    qe.AcceptedAnswerScore,
+    qe.LastEditDate,
+    qe.EditRecencyBucket,
+    qe.CompositeKey,
+    ROW_NUMBER() OVER (PARTITION BY qe.Tag ORDER BY qe.QuestionScore DESC NULLS LAST, qe.TotalAnswerScore DESC NULLS LAST, qe.Views DESC NULLS LAST) AS TagRank,
+    RANK() OVER (ORDER BY qe.QuestionScore DESC NULLS LAST, qe.TotalAnswerScore DESC NULLS LAST) AS GlobalRank
+  FROM question_enriched qe
+),
+-- pick top N per tag and also top globally (demonstrates set operators)
+top_per_tag AS (
+  SELECT * FROM tag_leaderboard WHERE TagRank <= 5
+),
+top_global AS (
+  SELECT * FROM tag_leaderboard WHERE GlobalRank <= 50
+),
+-- union the two sets to stress set operators and duplicates
+union_top AS (
+  SELECT * FROM top_per_tag
+  UNION
+  SELECT * FROM top_global
+),
+-- attach owner user statistics and compute some advanced metrics with correlated subqueries
+final_prep AS (
+  SELECT
+    ut.*,
+    ua.DisplayName AS OwnerName,
+    ua.Reputation AS OwnerReputation,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.ReputationPercentile,
+    -- number of distinct commenters on the question (correlated subquery)
+    (SELECT COUNT(DISTINCT c.UserId) FROM Comments c WHERE c.PostId = ut.QuestionId AND c.UserId IS NOT NULL) AS DistinctCommenters,
+    -- stringified tag list length and complexity metric
+    COALESCE(array_length((SELECT TagArray FROM questions q WHERE q.QuestionId = ut.QuestionId),1),0) AS TagCount,
+    -- engagement score: weighted function with NULL-safe arithmetic and exponential scaling
+    (
+      COALESCE(ut.Views,0) * 0.001
+      + COALESCE(ut.QuestionScore,0) * 2
+      + COALESCE(ut.TotalAnswerScore,0) * 1.5
+      + COALESCE(ut.FavoriteCount,0) * 5
+      + COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = ut.QuestionId AND v.VoteTypeId = 2),0) * 3
+    )::numeric AS RawEngagement
+  FROM union_top ut
+  LEFT JOIN Users ua ON ua.Id = ut.OwnerUserId
+)
+-- final select with ordering, windowed percentiles and a complex WHERE predicate
+SELECT
+  fp.QuestionId,
+  fp.Title,
+  COALESCE(fp.Tag,'<no-tag>') AS Tag,
+  COALESCE(fp.OwnerName, '<deleted>') AS OwnerName,
+  fp.OwnerReputation,
+  fp.GoldBadges, fp.SilverBadges, fp.BronzeBadges,
+  fp.QuestionScore,
+  fp.Views,
+  fp.AnswerCount,
+  fp.TotalAnswerScore,
+  fp.AvgAnswerScore,
+  fp.AcceptedAnswerId,
+  fp.AcceptedAnswerScore,
+  fp.LastEditDate,
+  fp.EditRecencyBucket,
+  fp.DistinctCommenters,
+  fp.TagCount,
+  fp.RawEngagement,
+  -- normalized engagement percentile within result set
+  PERCENT_RANK() OVER (ORDER BY fp.RawEngagement) AS EngagementPercentile,
+  -- complexity flag using boolean expressions and NULL logic
+  CASE
+    WHEN fp.TagCount >= 3 AND fp.AvgAnswerScore >= 2 AND fp.RawEngagement > 50 THEN 'high_complexity'
+    WHEN fp.TagCount = 0 OR fp.TagCount IS NULL THEN 'untagged'
+    WHEN fp.RawEngagement IS NULL OR fp.RawEngagement = 0 THEN 'low_activity'
+    ELSE 'medium'
+  END AS ComplexityFlag,
+  -- fuzzy title fingerprint using substring, lower, regexp_replace to remove non-alphanumerics
+  lower(regexp_replace(substring(fp.Title from 1 for 80), '[^a-z0-9 ]','', 'g')) AS TitleFingerprint
+FROM final_prep fp
+WHERE
+  -- complex predicate combining NULL-safe comparisons, ranges, and boolean logic
+  (fp.QuestionScore IS NOT NULL AND fp.QuestionScore >= 0)
+  AND (fp.RawEngagement > 10 OR fp.TagCount >= 2)
+  AND NOT (fp.OwnerReputation < 50 AND fp.Views < 100)
+ORDER BY EngagementPercentile DESC, fp.QuestionScore DESC, fp.TotalAnswerScore DESC
+LIMIT 100;

@@ -1,0 +1,169 @@
+-- {"query": "681.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1554} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level,
+        ARRAY[t.TagName] AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+
+    UNION ALL
+
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Level + 1,
+        r.Path || t2.TagName
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id <> ALL(r.Path::int[])
+    WHERE t2.IsModeratorOnly = 0 AND t2.IsRequired = 0
+    AND r.Level < 3
+),
+UserBadgeRanks AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    WHERE b.Date > CURRENT_DATE - INTERVAL '3 years'
+    GROUP BY b.UserId, b.Class
+),
+PostEngagement AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        COALESCE(v.UpVotes, 0) AS UpVotes,
+        COALESCE(v.DownVotes, 0) AS DownVotes,
+        COALESCE(c.CommentsCount, 0) AS TotalComments,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RecentPostRank,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 1 
+            ELSE 0 
+        END AS IsClosed,
+        COALESCE(ph.CloseReasonName, 'None') AS CloseReason
+    FROM Posts p
+    LEFT JOIN (
+        SELECT 
+            PostId, 
+            SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes
+        GROUP BY PostId
+    ) v ON v.PostId = p.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CommentsCount
+        FROM Comments
+        GROUP BY PostId
+    ) c ON c.PostId = p.Id
+    LEFT JOIN (
+        SELECT DISTINCT ph.PostId, crt.Name AS CloseReasonName
+        FROM PostHistory ph
+        JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+        LEFT JOIN CloseReasonTypes crt ON CAST(ph.Comment AS INTEGER) = crt.Id
+        WHERE ph.PostHistoryTypeId = 10 -- Post Closed
+    ) ph ON ph.PostId = p.Id
+    WHERE p.PostTypeId IN (1,2) -- Questions or Answers
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersCount,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        COALESCE(SUM(b.Class),0) AS BadgeClassSum,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AvgAnswerScore,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+        MAX(p.LastActivityDate) AS LastPostActivity
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location, u.Views, u.UpVotes, u.DownVotes
+),
+TopPostsWithDuplicates AS (
+    SELECT 
+        pe.PostId,
+        pe.PostTypeId,
+        pe.OwnerUserId,
+        pe.Score,
+        pe.ViewCount,
+        pe.AnswerCount,
+        pe.CommentCount,
+        pe.FavoriteCount,
+        pe.UpVotes,
+        pe.DownVotes,
+        pe.IsClosed,
+        pe.CloseReason,
+        pl.LinkTypeId,
+        pl.RelatedPostId,
+        ROW_NUMBER() OVER (PARTITION BY pe.PostId ORDER BY pl.CreationDate DESC) AS LinkRank
+    FROM PostEngagement pe
+    LEFT JOIN PostLinks pl ON pl.PostId = pe.PostId AND pl.LinkTypeId = 3 -- Duplicates
+    WHERE pe.Score > 10
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.Location,
+    ua.QuestionsCount,
+    ua.AnswersCount,
+    ua.TotalBadges,
+    ua.BadgeClassSum,
+    ua.AvgAnswerScore,
+    ua.AvgQuestionScore,
+    ua.LastPostActivity,
+    tp.PostId,
+    tp.PostTypeId,
+    tp.Score AS PostScore,
+    tp.ViewCount AS PostViews,
+    tp.AnswerCount AS PostAnswerCount,
+    tp.CommentCount AS PostCommentCount,
+    tp.FavoriteCount AS PostFavoriteCount,
+    tp.UpVotes AS PostUpVotes,
+    tp.DownVotes AS PostDownVotes,
+    tp.IsClosed,
+    tp.CloseReason,
+    CASE 
+        WHEN tp.LinkTypeId IS NOT NULL THEN 'Duplicate of Post ' || tp.RelatedPostId::TEXT 
+        ELSE 'No Duplicate Link' 
+    END AS DuplicateStatus,
+    STRING_AGG(DISTINCT rt.TagName, ', ') FILTER (WHERE rt.Level = 1) AS Level1Tags,
+    STRING_AGG(DISTINCT rt.TagName, ', ') FILTER (WHERE rt.Level = 2) AS Level2Tags,
+    STRING_AGG(DISTINCT rt.TagName, ', ') FILTER (WHERE rt.Level = 3) AS Level3Tags
+FROM UserActivityWindow ua
+LEFT JOIN TopPostsWithDuplicates tp ON tp.OwnerUserId = ua.UserId AND tp.LinkRank = 1
+LEFT JOIN Posts p ON p.Id = tp.PostId
+LEFT JOIN RecursiveTagHierarchy rt ON p.Tags LIKE '%' || rt.TagName || '%'
+WHERE ua.Reputation > 1000
+AND (ua.AnswersCount > 5 OR ua.QuestionsCount > 5)
+AND (tp.PostScore > 20 OR tp.PostScore IS NULL)
+GROUP BY 
+    ua.UserId, ua.DisplayName, ua.Reputation, ua.Location, ua.QuestionsCount, ua.AnswersCount, ua.TotalBadges, ua.BadgeClassSum,
+    ua.AvgAnswerScore, ua.AvgQuestionScore, ua.LastPostActivity,
+    tp.PostId, tp.PostTypeId, tp.Score, tp.ViewCount, tp.AnswerCount, tp.CommentCount, tp.FavoriteCount, tp.UpVotes, tp.DownVotes,
+    tp.IsClosed, tp.CloseReason, tp.LinkTypeId, tp.RelatedPostId
+ORDER BY ua.Reputation DESC NULLS LAST, tp.PostScore DESC NULLS LAST
+LIMIT 100;

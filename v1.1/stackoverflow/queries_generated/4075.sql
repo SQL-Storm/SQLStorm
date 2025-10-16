@@ -1,0 +1,132 @@
+-- {"query": "4075.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1459} 
+with RecursiveUserTags as (
+    select u.Id as UserId,
+           unnest(string_to_array(coalesce(p.Tags, ''), '><')) as Tag
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+    where p.Tags is not null
+), 
+FilteredBadges as (
+    select b.UserId, b.Name, b.Class, b.TagBased,
+           row_number() over (partition by b.UserId order by b.Date desc) as rn
+    from Badges b
+    where b.Class in (1,2) and b.Name ilike '%sql%'
+),
+UserPostScoreAgg as (
+    select OwnerUserId,
+           count(*) filter (where PostTypeId=1) as QuestionCount,
+           count(*) filter (where PostTypeId=2) as AnswerCount,
+           sum(score) as TotalScore,
+           avg(score) as AvgScore,
+           max(score) as MaxScore,
+           sum(case when ClosedDate is not null then 1 else 0 end) as ClosedPosts
+    from Posts
+    group by OwnerUserId
+),
+RankedPosts as (
+    select p.*,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate asc) as ScoreRank,
+        rank() over (partition by p.OwnerUserId order by p.ViewCount desc nulls last) as ViewRank
+    from Posts p
+    where p.PostTypeId in (1, 2)
+),
+ClosedQuestionDetails as (
+    select ph.PostId,
+           ph.CreationDate as CloseDate,
+           crt.Name as CloseReason
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as smallint)
+    where ph.PostHistoryTypeId = 10 -- Post Closed
+),
+UserDuplicatedPostCounts as (
+    select p.OwnerUserId,
+           count(distinct pl.PostId) as DuplicatedPosts
+    from PostLinks pl
+    join Posts p on p.Id = pl.PostId
+    where pl.LinkTypeId = 3 -- Duplicate
+    group by p.OwnerUserId
+),
+UserLastActivity as (
+    select u.Id as UserId,
+           max(p.LastActivityDate) as LastActivity,
+           max(c.CreationDate) as LastCommentDate,
+           greatest(max(p.LastActivityDate), max(c.CreationDate)) as MostRecentActivity
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id
+),
+UserVoteStats as (
+    select p.OwnerUserId,
+           count(v.Id) filter (where vt.Name = 'UpMod') as UpVotesReceived,
+           count(v.Id) filter (where vt.Name = 'DownMod') as DownVotesReceived,
+           avg(v.CreationDate - p.CreationDate) as AvgTimeToVote
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    join Posts p on p.Id = v.PostId
+    group by p.OwnerUserId
+),
+UserAggregated as (
+    select u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        coalesce(ub.DuplicatedPosts,0) as TotalDuplicatedPosts,
+        coalesce(up.QuestionCount,0) as QuestionCount,
+        coalesce(up.AnswerCount,0) as AnswerCount,
+        coalesce(up.TotalScore,0) as TotalPostScore,
+        coalesce(uvs.UpVotesReceived,0) as UpVotesReceived,
+        coalesce(uvs.DownVotesReceived,0) as DownVotesReceived,
+        coalesce(fb.Name, 'No Badge') as TopBadgeName,
+        fb.Class as TopBadgeClass,
+        COALESCE(rp.ScoreRank, NULL) as BestPostRank,
+        COALESCE(us.MostRecentActivity, u.LastAccessDate) as EffectiveLastAccess
+    from Users u
+    left join UserDuplicatedPostCounts ub on ub.OwnerUserId = u.Id
+    left join UserPostScoreAgg up on up.OwnerUserId = u.Id
+    left join UserVoteStats uvs on uvs.OwnerUserId = u.Id
+    left join FilteredBadges fb on fb.UserId = u.Id and fb.rn = 1
+    left join RankedPosts rp on rp.OwnerUserId = u.Id and rp.ScoreRank = 1
+    left join UserLastActivity us on us.UserId = u.Id
+),
+TopTagsPerUser as (
+    select UserId, Tag,
+           dense_rank() over (partition by UserId order by count(*) desc) as TagRank
+    from RecursiveUserTags
+    group by UserId, Tag
+),
+UserTopTags as (
+    select UserId,
+           string_agg(Tag, ', ') filter (where TagRank <= 3) as Top3Tags
+    from TopTagsPerUser
+    group by UserId
+)
+select ua.UserId, ua.DisplayName, ua.Reputation, ua.Location,
+       ua.QuestionCount, ua.AnswerCount, ua.TotalPostScore,
+       ua.UpVotesReceived, ua.DownVotesReceived,
+       ua.TopBadgeName, ua.TopBadgeClass,
+       ua.TotalDuplicatedPosts,
+       ua.BestPostRank,
+       ua.EffectiveLastAccess,
+       utt.Top3Tags,
+       case 
+            when ua.Reputation > 20000 then 'HighRep'
+            when ua.Reputation between 5000 and 20000 then 'MidRep'
+            else 'LowRep'
+       end as RepCategory,
+       case 
+            when ua.TotalDuplicatedPosts > 10 then 'DuplicateProne'
+            else 'OriginalPoster'
+       end as PosterType,
+       coalesce((select count(*) from Comments c where c.UserId = ua.UserId and c.CreationDate > (current_date - interval '30 day')),0) as RecentComments,
+       coalesce((select avg(p.Score) from Posts p where p.OwnerUserId = ua.UserId and p.CreationDate > (current_date - interval '90 day')),0) as AvgScore90Days,
+       (select json_agg(json_build_object('PostId', p.Id, 'Title', p.Title, 'Score', p.Score, 'Views', p.ViewCount, 'Tags', p.Tags))
+        from Posts p
+        where p.OwnerUserId = ua.UserId and p.PostTypeId = 1
+        order by p.Score desc limit 3) as Top3Questions,
+       (select count(*) from Posts p where p.OwnerUserId = ua.UserId and p.ClosedDate is not null) as ClosedPostsCount
+from UserAggregated ua
+left join UserTopTags utt on utt.UserId = ua.UserId
+where ua.Reputation > 10000
+order by ua.Reputation desc, ua.TotalPostScore desc;

@@ -1,0 +1,183 @@
+-- {"query": "1573.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1841} 
+with RecursiveReputationChange AS (
+    select 
+        u.Id as UserId,
+        u.Reputation as BaseReputation,
+        min(p.CreationDate) as FirstPostDate,
+        max(p.CreationDate) as LastPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.Reputation
+),
+BadgeRanked as (
+    select 
+        b.UserId,
+        b.Name as BadgeName,
+        b.Class as BadgeClass,
+        row_number() over (partition by b.UserId order by b.Class asc, b.Date asc) as BadgeRank
+    from Badges b
+    where b.Date > current_date - interval '730 days'
+),
+UserPostsWithAnswerStats as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.AcceptedAnswerId,
+        p.Title,
+        p.CreationDate
+    from Posts p
+    where p.PostTypeId in (1, 2)
+),
+AcceptedAnswerAge AS (
+    select
+        q.Id as QuestionId,
+        (EXTRACT(EPOCH FROM max(a.CreationDate) - q.CreationDate)/3600) as HoursUntilAccepted,
+        count(a.Id) filter (where a.Score > 0) as PositiveScoreAnswerCount
+    from Posts q
+    left join Posts a on a.Id = q.AcceptedAnswerId and a.PostTypeId=2
+    where q.PostTypeId = 1
+    group by q.Id, q.CreationDate
+),
+UsersHighActivityAndPositiveVotes AS (
+    select
+        u.Id, u.DisplayName, u.Reputation,
+        -- conditional expression combining null and votes
+        coalesce(
+            (
+                select max(v.CreationDate)
+                from Votes v 
+                join Posts p on p.Id = v.PostId
+                where p.OwnerUserId = u.Id and v.VoteTypeId = 2
+            ), 
+            u.LastAccessDate
+        ) as LastUpvoteDate,
+        count(v.Id) filter (where v.VoteTypeId=2 and v.PostId in (select Id from Posts where OwnerUserId = u.Id)) as UpVoteCount
+    from Users u
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.LastAccessDate
+    having count(v.Id) filter (where v.VoteTypeId=2) >= 10
+),
+PostsCommentsSummary as (
+    select 
+        c.PostId,
+        count(c.Id) filter (where c.Score > 0) as PositiveFeedbackComments,
+        count(c.Id) as TotalCommentCount,
+        string_agg(distinct coalesce(c.UserDisplayName, 'anonymous'), '|') as CommentorsList
+    from Comments c 
+    group by c.PostId
+),
+-- Correlated subquery example - count latest badge per user conditionally by badge class 
+UserLatestSilverBadge AS (
+    select 
+        b.UserId, 
+        max(b.Date) as LatestSilverBadgeDate,
+        (
+            select count(*) 
+            from Badges bb 
+            where bb.UserId = b.UserId and bb.Class = 2 and bb.Date > b.Date - interval '1 year'
+        ) as SilverBadgeCountLastYear
+    from Badges b
+    where b.Class = 2
+    group by b.UserId
+),
+CompositeUserActivity as (
+    select 
+        u.Id,
+        u.Reputation,
+        urc.BaseReputation,
+        urc.FirstPostDate,
+        urc.LastPostDate,
+        uphu.UpVoteCount,
+        nvl(ulb.SilverBadgeCountLastYear,0) as RecentSilverBadges,
+        urc.LastPostDate - urc.FirstPostDate as ActiveDaysRange,
+        (u.UpVotes)::float / nullif(greatest(1,u.DownVotes),0) as UpToDownVoteRatio,
+        case 
+            when u.SiteName is not null then upper(u.DisplayName)
+            else lower(u.DisplayName)
+        end as NormalizedDisplayName
+    from Users u 
+    left join RecursiveReputationChange urc on urc.UserId = u.Id
+    left join UsersHighActivityAndPositiveVotes uphu on uphu.Id = u.Id
+    left join UserLatestSilverBadge ulb on ulb.UserId = u.Id
+),
+QuestionAndAnswerLinks as (
+    select 
+        pl.PostId as LinkerPostId,
+        pl.RelatedPostId as LinkedPostId,
+        ptq.CreationDate as QuestionCreationDate,
+        pta.CreationDate as AnswerCreationDate,
+        lt.Name as LinkTypeName,
+        ptq.PostTypeId as LinkerPostType,
+        p.LinkOwnerUserId,
+        case when pl.LinkTypeId=3 then 'DuplicateLink' else 'Other' end as LinkCategory
+    from PostLinks pl
+    left join Posts ptq on ptq.Id = pl.PostId
+    left join Posts pta on pta.Id = pl.RelatedPostId
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    left join lateral (
+        select OwnerUserId from Posts p inner where p.Id = pl.RelatedPostId limit 1
+    ) p on true
+    where ptq.PostTypeId = 1 and (pta.PostTypeId = 2 or pta.PostTypeId is null)
+),
+WindowRankedPosts AS (
+    select 
+        p.Id as PostId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc nulls last) as PostRankPerUser,
+        count(*) over (partition by p.OwnerUserId) as UserPostCounts,
+        -- window aggregate interpolation for interesting combi calc
+        avg(case when p.ViewCount is not null then p.Score*log(p.ViewCount+1) else 0 end) over (partition by p.OwnerUserId) as AvgWeightedScore,
+        max(case when coalesce(pl.LinkTypeId,0) = 3 then 1 else 0 end) over (partition by p.OwnerUserId) as DecompiledAsDuplicateAnswerExists
+    from Posts p 
+    left join PostLinks pl on pl.RelatedPostId = p.Id and pl.LinkTypeId = 3
+    where p.PostTypeId = 2
+)
+select 
+    cu.Id as UserId,
+    cu.NormalizedDisplayName,
+    cu.Reputation,
+    cu.BaseReputation,
+    cu.UpVoteCount,
+    cu.RecentSilverBadges,
+    cu.ActiveDaysRange,
+    round(cu.UpToDownVoteRatio, 3) as UpDownRatio,
+    
+    pwp.PostId,
+    pwp.Score,
+    pwp.ViewCount,
+    pwp.PostRankPerUser,
+    pwp.UserPostCounts,
+    round(pwp.AvgWeightedScore::numeric,2) as AverageWeightedScore,
+    coalesce(isnull.DecompiledAsDuplicateAnswerExists, 0) as HasDuplicateAnswer,
+    
+    coalesce(forbiddenqpje.QuestionId, -1) as SampleQuestionId,
+    coalesce(forbiddenqpje.HoursUntilAccepted, -1) as HoursUntilAccepted,
+    coalesce(pc.PositiveFeedbackComments, 0) as PositiveCommentCount,
+    coalesce(pc.TotalCommentCount, 0) as TotalCommentCount,
+    left(string_agg(distinct pc.CommentorsList, '|')		 	 OVER (PARTITION BY restricted_Edit.UserId), 3000) as CommentorAggregate,
+
+    max(convert_json_pi.Name) over () as FirstPostHistoryTypeName
+
+from CompositeUserActivity cu 
+join WindowRankedPosts pwp on pwp.OwnerUserId = cu.Id and pwp.PostRankPerUser = 1
+left join AcceptedAnswerAge forbiddenqpje on forbiddenqpje.QuestionId = pwp.PostId
+left join PostsCommentsSummary pc on pc.PostId = pwp.PostId
+left join (
+		select ph.UserId, pht.Name 
+		from PostHistory ph 
+		left join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId 
+		order by ph.CreationDate asc 
+		limit 1
+	) convert_json_pi on convert_json_pi.UserId = cu.Id
+left join (
+    select UserId/*from Posts where */ from Posts p where p.LastEditDate > current_timestamp -interval '30 day'
+	) restricted_Edit on restricted_Edit.UserId = cu.Id
+where cu.Reputation > 500 and pwp.Score > 1
+order by cu.UpToDownVoteRatio desc, pwp.Score desc
+limit 100;

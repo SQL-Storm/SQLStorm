@@ -1,0 +1,152 @@
+-- {"query": "1134.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.1, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1403} 
+with RecursiveUserPosts as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        row_number() over (partition by u.Id order by p.CreationDate desc) as PostRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where u.Id is not null
+), RankedComments as (
+    select 
+        c.Id as CommentId,
+        c.PostId,
+        c.UserId,
+        c.CreationDate,
+        c.Text,
+        dense_rank() over (partition by c.PostId order by c.Score desc nulls last) as CommentScoreRank
+    from Comments c
+    where c.UserId is not null
+), FilteredBadgeAggregation as (
+    select 
+        b.UserId,
+        b.Name as BadgeName,
+        count(*) over (partition by b.UserId, b.Name) as BadgeCount,
+        max(b.Date) over (partition by b.UserId, b.Name) as LastBadgeDate
+    from Badges b
+    where b.Class in (1, 2) -- Gold and Silver badges only
+), QuestionAnswerMetrics as (
+    select 
+        q.Id as QuestionId,
+        q.Title as QuestionTitle,
+        q.CreationDate as QuestionDate,
+        q.Score as QuestionScore,
+        coalesce(a.AnswerCount, 0) as AnswerCount,
+        coalesce(a.MaxAnswerScore, 0) as MaxAnswerScore,
+        case when q.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer,
+        q.ViewCount,
+        q.Tags
+    from Posts q
+    left join (
+        select 
+            p.ParentId,
+            count(*) AnswerCount,
+            max(p.Score) MaxAnswerScore
+        from Posts p
+        where p.PostTypeId = 2
+        group by p.ParentId
+    ) a on a.ParentId = q.Id
+    where q.PostTypeId = 1
+), PostsWithVotes as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.OwnerUserId,
+        p.CreationDate,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(case when v.VoteTypeId = 8 then coalesce(v.BountyAmount, 0) else 0 end) as TotalBounty
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    group by 
+        p.Id, p.PostTypeId, p.Score, p.OwnerUserId, p.CreationDate
+), DuplicateQuestionLinks as (
+    select 
+        pl.PostId,
+        pl.RelatedPostId
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where lt.Name = 'Duplicate'
+), UserActivitySummary as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) as TotalPosts,
+        count(distinct case when p.PostTypeId = 1 then p.Id else null end) as QuestionCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id else null end) as AnswerCount,
+        coalesce(sum(bc.BadgeCount), 0) as BadgeTotal,
+        max(bc.LastBadgeDate) as MostRecentBadgeDate,
+        row_number() over (order by count(distinct p.Id) desc nulls last) as ActivityRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join FilteredBadgeAggregation bc on bc.UserId = u.Id
+    group by u.Id, u.DisplayName
+), UserRecentPostsWithComments as (
+    select 
+        rp.UserId,
+        rp.PostId,
+        rp.PostRank,
+        pc.CommentId,
+        pc.CommentScoreRank,
+        pc.Text as CommentText
+    from RecursiveUserPosts rp
+    left join Comments pc on pc.PostId = rp.PostId
+    where rp.PostRank <= 5
+), TopTags as (
+    select 
+        t.TagName,
+        t.Count,
+        coalesce(p.PostCount, 0) as PostCountUsingTag
+    from Tags t
+    left join (
+        select 
+            unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as Tag,
+            count(*) as PostCount
+        from Posts p
+        where p.PostTypeId = 1 and p.Tags is not null
+        group by Tag
+    ) p on p.Tag = t.TagName
+    order by coalesce(p.PostCount, 0) desc nulls last
+    limit 10
+)
+select 
+    uas.UserId,
+    uas.DisplayName,
+    uas.TotalPosts,
+    uas.QuestionCount,
+    uas.AnswerCount,
+    uas.BadgeTotal,
+    uas.MostRecentBadgeDate,
+    qa.QuestionId,
+    qa.QuestionTitle,
+    qa.AnswerCount as AnswersOnQuestion,
+    qa.MaxAnswerScore,
+    qa.HasAcceptedAnswer,
+    qa.ViewCount as QuestionViewCount,
+    pwv.UpVotes,
+    pwv.DownVotes,
+    pwv.TotalBounty,
+    string_agg(distinct coalesce(dup.RelatedPostId::text, 'None'), ',' order by dup.RelatedPostId) as DuplicateTargets,
+    coalesce(rc.CommentCount, 0) as RecentCommentCount
+from UserActivitySummary uas
+left join PostsWithVotes pwv on pwv.OwnerUserId = uas.UserId
+left join QuestionAnswerMetrics qa on qa.QuestionId = pwv.Id and pwv.PostTypeId = 1
+left join (
+    select PostId, count(*) as CommentCount
+    from Comments
+    group by PostId
+) rc on rc.PostId = pwv.Id
+left join DuplicateQuestionLinks dup on dup.PostId = pwv.Id
+where uas.ActivityRank <= 100
+group by 
+    uas.UserId, uas.DisplayName, uas.TotalPosts, uas.QuestionCount, uas.AnswerCount, uas.BadgeTotal, uas.MostRecentBadgeDate, 
+    qa.QuestionId, qa.QuestionTitle, qa.AnswerCount, qa.MaxAnswerScore, qa.HasAcceptedAnswer, qa.ViewCount, pwv.UpVotes, pwv.DownVotes, pwv.TotalBounty, coalesce(rc.CommentCount, 0)
+order by uas.ActivityRank asc
+limit 100;

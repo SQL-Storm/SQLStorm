@@ -1,0 +1,216 @@
+-- {"query": "18060.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1858} 
+
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.PostHistoryTypeId,
+      ph.CreationDate,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5)
+  ),
+  LatestEdits AS (
+    SELECT
+      rpe.PostId,
+      rpe.UserId AS LastEditorUserId,
+      rpe.PostHistoryTypeId,
+      rpe.CreationDate AS LastEditDate
+    FROM RankedPostEdits rpe
+    WHERE
+      rpe.rn = 1
+  ),
+  UserReputation AS (
+    SELECT
+      u.Id AS UserId,
+      u.Reputation,
+      u.UpVotes,
+      u.DownVotes,
+      u.Views,
+      DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+  ),
+  PostEngagement AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.PostTypeId,
+      p.Score,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      CASE
+        WHEN p.ViewCount IS NULL THEN 0
+        ELSE p.ViewCount
+      END AS ViewCount,
+      COUNT(c.Id) AS CommentCountForPost,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesCount,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesCount,
+      ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY p.CreationDate ASC) as PostSequence
+    FROM Posts p
+    LEFT JOIN Comments c
+      ON p.Id = c.PostId
+    LEFT JOIN Votes v
+      ON p.Id = v.PostId
+    GROUP BY
+      p.Id,
+      p.OwnerUserId,
+      p.PostTypeId,
+      p.Score,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.ViewCount,
+      p.CreationDate
+  )
+SELECT
+  p.Id AS PostId,
+  pt.Name AS PostTypeName,
+  COALESCE(p.Title, 'No Title') AS PostTitle,
+  p.CreationDate,
+  p.LastActivityDate,
+  p.Score,
+  pe.ViewCount,
+  pe.AnswerCount,
+  pe.CommentCount,
+  pe.FavoriteCount,
+  pe.UpVotesCount,
+  pe.DownVotesCount,
+  CONCAT(
+    'Owner: ',
+    COALESCE(u.DisplayName, 'Deleted User'),
+    ' (',
+    ur.Reputation,
+    ')',
+    CASE
+      WHEN ur.ReputationRank <= 100 THEN ' - Top 100 Rep'
+      WHEN ur.ReputationRank BETWEEN 101 AND 500 THEN ' - High Rep'
+      ELSE ''
+    END
+  ) AS OwnerInfo,
+  CASE
+    WHEN le.LastEditorUserId IS NOT NULL THEN CONCAT(
+      'Edited by: ',
+      COALESCE(le_user.DisplayName, 'Deleted User'),
+      ' on ',
+      CAST(le.LastEditDate AS DATE)
+    )
+    ELSE 'No Edits'
+  END AS LatestEditInfo,
+  CASE
+    WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+    ELSE 'Open'
+  END AS PostStatus,
+  CASE
+    WHEN p.OwnerUserId IS NULL THEN 'Community Owned'
+    ELSE 'User Owned'
+  END AS OwnershipType,
+  CASE
+    WHEN p.Tags IS NOT NULL THEN REPLACE(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><', ', ')
+    ELSE 'No Tags'
+  END AS FormattedTags,
+  CASE
+    WHEN pe.PostSequence = 1 THEN 'First'
+    ELSE 'Subsequent'
+  END AS PostSequenceInPartition,
+  COALESCE(p.ContentLicense, 'Unknown') AS ContentLicense,
+  CASE
+    WHEN p.Score > 50 AND pe.AnswerCount > 10 THEN 'High Engagement'
+    WHEN p.Score < 0 AND pe.CommentCount > 5 THEN 'Controversial'
+    ELSE 'Standard'
+  END AS EngagementCategory,
+  ABS(p.Score) AS AbsoluteScore,
+  DATEDIFF(day, p.CreationDate, p.LastActivityDate) AS ActivityDays,
+  CASE
+    WHEN p.FavoriteCount IS NULL THEN 0
+    ELSE p.FavoriteCount
+  END AS SafeFavoriteCount,
+  CASE
+    WHEN p.OwnerUserId = p.LastEditorUserId THEN 'Self-Edit'
+    WHEN p.OwnerUserId IS NOT NULL AND le.LastEditorUserId IS NOT NULL THEN 'Community Edit'
+    WHEN p.OwnerUserId IS NULL AND le.LastEditorUserId IS NOT NULL THEN 'Community Edit on Community Post'
+    ELSE 'No Edit Info'
+  END AS EditOrigin,
+  CASE
+    WHEN EXISTS (
+      SELECT
+        1
+      FROM PostLinks pl
+      WHERE
+        pl.PostId = p.Id AND pl.LinkTypeId = 3
+    ) THEN 'Is Duplicate Link'
+    ELSE 'Not Duplicate Link'
+  END AS IsDuplicateLink,
+  CASE
+    WHEN EXISTS (
+      SELECT
+        1
+      FROM PostHistory ph_close
+      WHERE
+        ph_close.PostId = p.Id AND ph_close.PostHistoryTypeId = 10
+    ) THEN 'Was Closed'
+    ELSE 'Never Closed'
+  END AS ClosureHistory,
+  UPPER(SUBSTRING(COALESCE(u.DisplayName, 'anonymous'), 1, 3)) AS UserDisplayNameInitials,
+  CASE
+    WHEN p.AnswerCount IS NOT NULL AND p.AnswerCount > 0 THEN CAST(p.Score AS REAL) / p.AnswerCount
+    ELSE 0
+  END AS ScorePerAnswer,
+  CASE
+    WHEN p.ViewCount IS NOT NULL AND p.ViewCount > 0 THEN CAST(p.Score AS REAL) / p.ViewCount
+    ELSE 0
+  END AS ScorePerView
+FROM Posts p
+JOIN PostTypes pt
+  ON p.PostTypeId = pt.Id
+LEFT JOIN UserReputation ur
+  ON p.OwnerUserId = ur.UserId
+LEFT JOIN Users u
+  ON p.OwnerUserId = u.Id
+LEFT JOIN LatestEdits le
+  ON p.Id = le.PostId
+LEFT JOIN Users le_user
+  ON le.LastEditorUserId = le_user.Id
+LEFT JOIN PostEngagement pe
+  ON p.Id = pe.PostId
+WHERE
+  p.Score > -5
+  AND p.CreationDate > '2020-01-01'
+  AND (
+    pt.Name = 'Question' OR pt.Name = 'Answer'
+  )
+  AND (
+    p.OwnerUserId IS NOT NULL OR p.CommunityOwnedDate IS NOT NULL
+  )
+GROUP BY
+  p.Id,
+  pt.Name,
+  p.Title,
+  p.CreationDate,
+  p.LastActivityDate,
+  p.Score,
+  pe.ViewCount,
+  pe.AnswerCount,
+  pe.CommentCount,
+  pe.FavoriteCount,
+  pe.UpVotesCount,
+  pe.DownVotesCount,
+  u.DisplayName,
+  ur.Reputation,
+  ur.ReputationRank,
+  le.LastEditorUserId,
+  le.LastEditDate,
+  le_user.DisplayName,
+  p.ClosedDate,
+  p.OwnerUserId,
+  p.CommunityOwnedDate,
+  p.Tags,
+  pe.PostSequence,
+  p.ContentLicense
+HAVING
+  COUNT(pe.PostId) > 0
+ORDER BY
+  p.LastActivityDate DESC
+LIMIT 1000;

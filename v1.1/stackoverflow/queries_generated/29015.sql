@@ -1,0 +1,152 @@
+-- {"query": "29015.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1519} 
+WITH PostStats AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.ParentId,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.PostTypeId = 1 AND p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 THEN 'High Traffic'
+            ELSE 'Normal'
+        END AS PostCategory,
+        DATEDIFF('day', p.CreationDate, CURRENT_TIMESTAMP) AS AgeInDays,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgUserScore,
+        NTILE(4) OVER (ORDER BY p.Score DESC) AS ScoreQuartile
+    FROM Posts p
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT b.Id) AS Badges,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'High Activity'
+            WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Medium Activity'
+            WHEN COUNT(DISTINCT p.Id) > 10 THEN 'Low Activity'
+            ELSE 'New User'
+        END AS ActivityLevel
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        p.Id AS RelatedPostId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate
+    FROM Tags t
+    LEFT JOIN Posts p ON t.WikiPostId = p.Id
+    WHERE p.PostTypeId = 5
+)
+SELECT 
+    ps.Id AS PostId,
+    ps.Title,
+    ps.Tags,
+    ps.Score,
+    ps.ViewCount,
+    ps.AnswerCount,
+    ps.CommentCount,
+    ps.FavoriteCount,
+    ps.AgeInDays,
+    ps.PostCategory,
+    ps.ScoreQuartile,
+    ps.HasAcceptedAnswer,
+    ps.UserPostRank,
+    ps.PrevScore,
+    ps.AvgUserScore,
+    ps.OwnerUserId,
+    ua.Reputation,
+    ua.Views AS UserViews,
+    ua.UpVotes,
+    ua.DownVotes,
+    ua.TotalPosts,
+    ua.Questions,
+    ua.Answers,
+    ua.Comments,
+    ua.Badges,
+    ua.AvgPostScore,
+    ua.ActivityLevel,
+    COALESCE(ta.TagName, 'No Tag') AS AssociatedTag,
+    CASE 
+        WHEN ps.Score > ps.AvgUserScore THEN 'Above Average'
+        WHEN ps.Score < ps.AvgUserScore THEN 'Below Average'
+        ELSE 'Average'
+    END AS ScorePerformance,
+    CASE 
+        WHEN ps.Score > 100 AND ps.ViewCount > 1000 THEN 'Popular Post'
+        WHEN ps.Score > 50 AND ps.ViewCount > 500 THEN 'Moderate Post'
+        WHEN ps.Score > 10 AND ps.ViewCount > 100 THEN 'Low Traffic Post'
+        ELSE 'Unpopular Post'
+    END AS PopularityBucket,
+    (SELECT COUNT(*) 
+     FROM Votes v 
+     WHERE v.PostId = ps.Id AND v.VoteTypeId = 2) AS Upvotes,
+    (SELECT COUNT(*) 
+     FROM Votes v 
+     WHERE v.PostId = ps.Id AND v.VoteTypeId = 3) AS Downvotes,
+    (SELECT COUNT(*) 
+     FROM Comments c 
+     WHERE c.PostId = ps.Id) AS CommentCountSubquery,
+    CASE 
+        WHEN ps.Score IS NULL THEN 'No Score'
+        WHEN ps.Score >= 10 THEN 'High Score'
+        WHEN ps.Score >= 5 THEN 'Medium Score'
+        WHEN ps.Score >= 1 THEN 'Low Score'
+        ELSE 'Negative Score'
+    END AS ScoreTier,
+    CONCAT('Post #', ps.Id, ' by User ', ps.OwnerUserId, ' created on ', DATE(ps.CreationDate)) AS PostSummary,
+    (ps.Score + ps.ViewCount + ps.AnswerCount + ps.CommentCount + ps.FavoriteCount) AS CompositeScore,
+    DENSE_RANK() OVER (ORDER BY (ps.Score + ps.ViewCount + ps.AnswerCount + ps.CommentCount + ps.FavoriteCount) DESC) AS CompositeRank,
+    ps.CreationDate,
+    CASE 
+        WHEN ua.LastPostDate > CURRENT_TIMESTAMP - INTERVAL '30 days' THEN 'Active'
+        WHEN ua.LastPostDate > CURRENT_TIMESTAMP - INTERVAL '90 days' THEN 'Inactive'
+        ELSE 'Very Inactive'
+    END AS UserActivityStatus
+FROM PostStats ps
+LEFT JOIN UserActivity ua ON ps.OwnerUserId = ua.UserId
+LEFT JOIN TagAnalysis ta ON SUBSTRING(ps.Tags, 2, LENGTH(ps.Tags) - 2) LIKE CONCAT('%', ta.TagName, '%')
+WHERE ps.PostTypeId IN (1, 2)
+  AND ps.Score IS NOT NULL
+  AND ps.OwnerUserId IS NOT NULL
+  AND ps.AgeInDays <= 365
+  AND ps.Score BETWEEN -50 AND 2000
+  AND ps.AnswerCount >= 0
+  AND (ps.ViewCount IS NULL OR ps.ViewCount >= 0)
+  AND ps.CreationDate BETWEEN '2020-01-01' AND CURRENT_TIMESTAMP
+  AND (ps.HasAcceptedAnswer = 1 OR ps.PostCategory <> 'Closed')
+  AND (ps.UserPostRank <= 10 OR ps.ScoreQuartile IN (1, 4))
+  AND (ua.ActivityLevel IN ('High Activity', 'Medium Activity', 'New User') OR ua.UserId IS NULL)
+  AND (ta.TagName IS NOT NULL OR ps.Tags IS NULL OR ps.Tags = '')
+ORDER BY ps.CreationDate DESC, ps.Score DESC
+LIMIT 1000;

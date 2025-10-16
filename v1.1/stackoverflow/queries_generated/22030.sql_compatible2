@@ -1,0 +1,119 @@
+WITH UserPostStats AS (
+    SELECT u.Id,
+           u.DisplayName,
+           COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+           COUNT(p.Id) AS PostCount,
+           COUNT(DISTINCT CASE WHEN p.Tags IS NOT NULL THEN tag ELSE NULL END) AS DistinctTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN LATERAL (
+        SELECT unnest_tag.tag
+        FROM (
+            SELECT CASE
+                     WHEN COALESCE(NULLIF(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), ''), '') = '' THEN NULL
+                     ELSE COALESCE(NULLIF(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), ''), '')
+                   END AS inner_tags
+        ) t
+        CROSS JOIN LATERAL (
+            SELECT unnest(string_to_array(t.inner_tags, '><')) AS tag
+        ) unnest_tag
+    ) AS tag ON true
+    GROUP BY u.Id, u.DisplayName
+),
+BadgeStats AS (
+    SELECT b.UserId,
+           COUNT(b.Id) AS BadgeCount,
+           SUM(CASE 
+               WHEN b.Class = 1 AND b.TagBased = TRUE THEN 15
+               WHEN b.Class = 1 THEN 10
+               WHEN b.Class = 2 AND b.TagBased = TRUE THEN 7
+               WHEN b.Class = 2 THEN 5
+               WHEN b.TagBased = TRUE THEN 2
+               ELSE 1 
+           END) AS BadgeScore
+    FROM Badges b
+    GROUP BY b.UserId
+),
+CommentStats AS (
+    SELECT c.UserId,
+           COUNT(c.Id) AS CommentCount,
+           SUM(COALESCE(c.Score, 0)) AS CommentScore
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+),
+VoteStats AS (
+    SELECT p.OwnerUserId,
+           COUNT(v.Id) AS VoteCount,
+           SUM(CASE 
+               WHEN v.VoteTypeId = 2 THEN 1
+               WHEN v.VoteTypeId = 3 THEN -1
+               WHEN v.VoteTypeId = 8 THEN COALESCE(v.BountyAmount, 0) * 10
+               WHEN v.VoteTypeId = 9 THEN COALESCE(v.BountyAmount, 0) * 5
+               ELSE 0 
+           END) AS NetVotes
+    FROM Posts p
+    JOIN Votes v ON p.Id = v.PostId
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+RankedUsers AS (
+    SELECT ups.Id,
+           ups.DisplayName,
+           ups.TotalPostScore,
+           ups.PostCount,
+           ups.DistinctTags,
+           COALESCE(bs.BadgeCount, 0) AS BadgeCount,
+           COALESCE(bs.BadgeScore, 0) AS BadgeScore,
+           COALESCE(cs.CommentCount, 0) AS CommentCount,
+           COALESCE(cs.CommentScore, 0) AS CommentScore,
+           COALESCE(vs.NetVotes, 0) AS NetVotes,
+           (ups.TotalPostScore * 1.5 + 
+            COALESCE(bs.BadgeScore, 0) * 2 + 
+            COALESCE(cs.CommentScore, 0) * 0.5 + 
+            COALESCE(vs.NetVotes, 0) + 
+            ups.DistinctTags * 3) AS CompositeScore,
+           ROW_NUMBER() OVER (ORDER BY (ups.TotalPostScore * 1.5 + 
+                                         COALESCE(bs.BadgeScore, 0) * 2 + 
+                                         COALESCE(cs.CommentScore, 0) * 0.5 + 
+                                         COALESCE(vs.NetVotes, 0) + 
+                                         ups.DistinctTags * 3) DESC) AS Rank,
+           PERCENT_RANK() OVER (ORDER BY (ups.TotalPostScore * 1.5 + 
+                                          COALESCE(bs.BadgeScore, 0) * 2 + 
+                                          COALESCE(cs.CommentScore, 0) * 0.5 + 
+                                          COALESCE(vs.NetVotes, 0) + 
+                                          ups.DistinctTags * 3) DESC) AS PercentRank,
+           (SELECT COUNT(DISTINCT ph.PostId) 
+            FROM PostHistory ph 
+            WHERE ph.UserId = ups.Id AND ph.PostHistoryTypeId IN (4,5,6) 
+              AND ph.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '30' DAY) AS RecentEdits
+    FROM UserPostStats ups
+    LEFT JOIN BadgeStats bs ON ups.Id = bs.UserId
+    LEFT JOIN CommentStats cs ON ups.Id = cs.UserId
+    LEFT JOIN VoteStats vs ON ups.Id = vs.OwnerUserId
+    GROUP BY ups.Id, ups.DisplayName, ups.TotalPostScore, ups.PostCount, ups.DistinctTags, bs.BadgeCount, bs.BadgeScore, cs.CommentCount, cs.CommentScore, vs.NetVotes
+)
+SELECT Id,
+       DisplayName,
+       TotalPostScore,
+       PostCount,
+       DistinctTags,
+       BadgeCount,
+       BadgeScore,
+       CommentCount,
+       CommentScore,
+       NetVotes,
+       CompositeScore,
+       Rank,
+       PercentRank,
+       RecentEdits,
+       CASE 
+           WHEN Rank <= 10 THEN 'Top 10'
+           WHEN PercentRank >= 0.9 THEN 'Elite'
+           WHEN CompositeScore > 1000 THEN 'High Performer'
+           WHEN RecentEdits > 5 THEN 'Active Editor'
+           ELSE 'Contributor' 
+       END AS UserCategory
+FROM RankedUsers
+WHERE Rank <= 10 OR PercentRank >= 0.95 OR RecentEdits > 10
+ORDER BY Rank;

@@ -1,0 +1,136 @@
+-- {"query": "849.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1180} 
+with RecursiveTagCounts as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        t.Count,
+        p.Id as PostId,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.CreationDate
+    from
+        Tags t
+        left join Posts p on p.Tags like concat('%<', t.TagName, '>%') and p.PostTypeId = 1
+    where
+        t.Count > 1000
+
+    union all
+
+    select
+        rtc.TagId,
+        rtc.TagName,
+        rtc.Count,
+        p.Id,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.CreationDate
+    from
+        RecursiveTagCounts rtc
+        join Posts p on p.ParentId = rtc.PostId and p.PostTypeId = 2
+    where
+        p.Score > (select avg(Score) from Posts where ParentId = rtc.PostId and PostTypeId = 2)
+),
+UserActivity AS (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) as QuestionsAsked,
+        count(distinct a.Id) as AnswersGiven,
+        count(distinct c.Id) as CommentsMade,
+        coalesce(sum(vtUp.VotesCount),0) as TotalUpVotes,
+        coalesce(sum(vtDown.VotesCount),0) as TotalDownVotes,
+        row_number() over (order by u.Reputation desc) as RepRank
+    from 
+        Users u
+        left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+        left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+        left join Comments c on c.UserId = u.Id
+        left join (
+            select PostId, count(*) as VotesCount 
+            from Votes 
+            where VoteTypeId = 2 
+            group by PostId
+        ) vtUp on vtUp.PostId = p.Id or vtUp.PostId = a.Id
+        left join (
+            select PostId, count(*) as VotesCount 
+            from Votes 
+            where VoteTypeId = 3 
+            group by PostId
+        ) vtDown on vtDown.PostId = p.Id or vtDown.PostId = a.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+PostScoreStats AS (
+    select 
+        PostTypeId,
+        avg(Score) as AvgScore,
+        percentile_cont(0.5) within group (order by Score) as MedianScore,
+        max(Score) as MaxScore,
+        min(Score) as MinScore
+    from Posts
+    where PostTypeId in (1,2)
+    group by PostTypeId
+),
+QuestionsWithCloseInfo AS (
+    select 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.Tags,
+        p.OwnerUserId,
+        p.ClosedDate,
+        crt.Name as CloseReason,
+        dense_rank() over (partition by crt.Id order by p.CreationDate) as CloseOrderInReason
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where p.PostTypeId = 1
+),
+TopBadges AS (
+    select 
+        b.UserId,
+        b.Name,
+        b.Class,
+        row_number() over (partition by b.UserId order by b.Date desc) as BadgeRank
+    from Badges b
+    where b.Class = 1 -- Gold badges only
+)
+select 
+    qwi.Id as QuestionId,
+    qwi.Title,
+    qwi.CreationDate,
+    qwi.Score,
+    qwi.ViewCount,
+    qwi.AnswerCount,
+    qwi.FavoriteCount,
+    qwi.Tags,
+    u.DisplayName as OwnerName,
+    u.Reputation as OwnerRep,
+    qwi.CloseReason,
+    qwi.CloseOrderInReason,
+    psq.AvgScore as AvgQuestionScore,
+    psa.AvgScore as AvgAnswerScore,
+    tb.Name as LatestGoldBadge,
+    (select count(*) from Comments c where c.PostId = qwi.Id and c.CreationDate > qwi.CreationDate) as NewCommentsAfterQuestion,
+    (select count(*) from Votes v where v.PostId = qwi.Id and v.VoteTypeId = 2 and v.CreationDate > qwi.CreationDate) as UpVotesAfterQuestion,
+    row_number() over (partition by qwi.CloseReason order by qwi.ViewCount desc nulls last) as PopularityInCloseReason
+from 
+    QuestionsWithCloseInfo qwi
+    left join Users u on u.Id = qwi.OwnerUserId
+    left join PostScoreStats psq on psq.PostTypeId = 1
+    left join PostScoreStats psa on psa.PostTypeId = 2
+    left join TopBadges tb on tb.UserId = u.Id and tb.BadgeRank = 1
+where 
+    (qwi.CloseReason is not null or qwi.Score > (select avg(Score) from Posts where PostTypeId = 1))
+    and qwi.AnswerCount > 0
+    and u.Reputation > 1000
+order by 
+    qwi.CloseReason nulls first,
+    qwi.ViewCount desc
+limit 100;

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import asyncio
 import csv
 import json
 import os
@@ -8,11 +9,10 @@ import sys
 import time
 from tempfile import TemporaryDirectory
 
-from openai import OpenAI
-
+from llm import llm
 from log import Log
-from prompt import write_gpt_queries
-from util import smart_open, sort_query_list
+from prompt import write_query_to_file
+from util import find_keyword_not_in_comments, is_in_comment, smart_open, sort_query_list
 
 log = Log()
 
@@ -32,6 +32,7 @@ def find_queries_with_errors(csv_path, success_threshold, subset=None):
     # Dictionary to track errors for each query
     queries = {}
     umbra = []
+    errors = {}
 
     # Convert subset to a set for faster lookups
     if subset is not None:
@@ -63,6 +64,10 @@ def find_queries_with_errors(csv_path, success_threshold, subset=None):
             if not error:
                 queries[query].append(dbms)
             else:
+                if query not in errors:
+                    errors[query] = {}
+                errors[query][dbms] = message
+
                 if dbms == "umbradev" or dbms == "umbra":
                     umbra.append((query, message))
 
@@ -92,7 +97,7 @@ def find_queries_with_errors(csv_path, success_threshold, subset=None):
         log.info(f"{count:5} queries succeeded in {systems}")
     log.info()
 
-    return queries_to_delete, queries_to_keep
+    return queries_to_delete, queries_to_keep, errors
 
 
 def delete_queries(queries_to_delete, query_dir):
@@ -205,14 +210,14 @@ def replace_sql(content, modified, old, new):
     """
     # Replace text in sql queries
     index = 0
+
     while True:
         index = content.lower().find(old, index)
         if index == -1:
             break
 
-        if content[:index].count("'") % 2 == 0:
-            content = content[:index] + new + content[index + len(old):]
-            modified = True
+        content = content[:index] + new + content[index + len(old):]
+        modified = True
         index += 1
 
     return content, modified
@@ -249,7 +254,66 @@ def replace_year(content, modified, old, new):
     return content, modified
 
 
-def rewrite_queries(query_dir):
+def rewrite_query(content, dataset):
+    """
+    Rewrite a SQL query to remove unwanted parts and standardize it.
+
+    Args:
+        content (str): SQL query content.
+        dataset (str): Dataset name.
+
+    Returns:
+        tuple: Rewritten SQL query and a flag indicating if it was modified.
+    """
+    modified = False
+
+    positions = [find_keyword_not_in_comments(content, kw) for kw in ["select", "with"]]
+    positions = [pos for pos in positions if pos >= 0]
+    if positions:
+        first_pos = min(positions)
+
+        # If nothing before keyword, nothing to remove
+        if first_pos != 0:
+            prefix = ""
+            for line in content[:first_pos].splitlines():
+                if line.startswith('--'):
+                    prefix += line + '\n'
+
+            if prefix != content[:first_pos]:
+                content = prefix + content[first_pos:]
+                modified = True
+
+    # Find the first semicolon
+    semicolon_index = find_keyword_not_in_comments(content, ';', is_word=False)
+
+    # Check if the semicolon is not the last character
+    if semicolon_index != -1 and semicolon_index < len(content) - 1:
+        # Trim content after the first semicolon
+        content = content[:semicolon_index + 1]  # Include the semicolon itself
+        modified = True
+
+    # Replace all occurrences of current_date, current_timestamp, current_time and now() with a fixed date
+    content, modified = replace_sql(content, modified, 'current_date', "cast('2024-10-01' as date)")
+    content, modified = replace_sql(content, modified, 'current_timestamp', "cast('2024-10-01 12:34:56' as timestamp)")
+    content, modified = replace_sql(content, modified, 'current_time', "cast('12:34:56' as time)")
+    content, modified = replace_sql(content, modified, 'now()', "cast('2024-10-01 12:34:56' as timestamp)")
+    content, modified = replace_sql(content, modified, 'getdate()', "cast('2024-10-01 12:34:56' as timestamp)")
+    content, modified = replace_sql(content, modified, 'getutcdate()', "cast('2024-10-01 12:34:56' as timestamp)")
+    content, modified = replace_sql(content, modified, 'sysdatetime()', "cast('2024-10-01 12:34:56' as timestamp)")
+
+    # Map dates to the correct range
+    year_mapping = {
+        "tpch": [(2024, 1998), (2023, 1997), (2022, 1996), (2021, 1995), (2020, 1994), (2019, 1993), (2018, 1992)],
+        "tpcds": [(2025, 2003), (2024, 2002), (2023, 2001), (2022, 2000), (2021, 1999), (2020, 1998), (2019, 1998), (2018, 1998), (2017, 1998), (2016, 1998), (2015, 1998)]
+    }
+    if dataset in year_mapping:
+        for old_year, new_year in year_mapping[dataset]:
+            content, modified = replace_year(content, modified, str(old_year), str(new_year))
+
+    return content.strip(), modified
+
+
+def rewrite_queries(query_dir, dataset):
     """
     Rewrite queries in the specified directory.
 
@@ -275,63 +339,7 @@ def rewrite_queries(query_dir):
             with open(file_path, 'r', encoding='utf-8') as file:
                 content = file.read().strip()
 
-            modified = False
-
-            # Remove all SQL comments
-            while True:
-                comment_start = content.find('--')
-                if comment_start == -1:
-                    break
-
-                comment_end = content.find('\n', comment_start)
-                if comment_end == -1:
-                    content = content[:comment_start]
-                else:
-                    content = content[:comment_start] + content[comment_end:]
-
-                modified = True
-
-            # Find the position of the first occurrence of SELECT or WITH (case-insensitive)
-            select_pos = content.lower().find('select')
-            with_pos = content.lower().find('with')
-            first_pos = min(select_pos, with_pos) if select_pos != -1 and with_pos != -1 else max(select_pos, with_pos)
-
-            # Check if 'with' or 'select are not the first character
-            if first_pos > 0:
-                # Trim the content before 'with' or 'select'
-                content = content[first_pos:]
-                modified = True
-
-            # Find the first semicolon
-            semicolon_index = 0
-            while semicolon_index != -1:
-                semicolon_index = content.find(';', semicolon_index)
-                if semicolon_index == -1 or content[:semicolon_index].count("'") % 2 == 0:
-                    break
-
-                semicolon_index += 1
-
-            # Check if the semicolon is not the last character
-            if semicolon_index != -1 and semicolon_index < len(content) - 1:
-                # Trim content after the first semicolon
-                content = content[:semicolon_index + 1]  # Include the semicolon itself
-                modified = True
-
-            # Replace all occurrences of current_date, current_timestamp, current_time and now() with a fixed date
-            content, modified = replace_sql(content, modified, 'current_date', "cast('2024-10-01' as date)")
-            content, modified = replace_sql(content, modified, 'current_timestamp', "cast('2024-10-01 12:34:56' as timestamp)")
-            content, modified = replace_sql(content, modified, 'current_time', "cast('12:34:56' as time)")
-            content, modified = replace_sql(content, modified, 'now()', "cast('2024-10-01 12:34:56' as timestamp)")
-
-            # Map dates to the correct range
-            year_mapping = {
-                "tpch": [(2024, 1998), (2023, 1997), (2022, 1996), (2021, 1995), (2020, 1994), (2019, 1993), (2018, 1992)],
-                "tpcds": [(2025, 2003), (2024, 2002), (2023, 2001), (2022, 2000), (2021, 1999), (2020, 1998), (2019, 1998), (2018, 1998), (2017, 1998), (2016, 1998), (2015, 1998)]
-            }
-            for benchmark, years in year_mapping.items():
-                if benchmark in os.path.abspath(query_dir):
-                    for old_year, new_year in years:
-                        content, modified = replace_year(content, modified, str(old_year), str(new_year))
+            content, modified = rewrite_query(content, dataset)
 
             if modified:
                 content = content.strip()
@@ -342,28 +350,30 @@ def rewrite_queries(query_dir):
                         old_content = file.read().strip()
                         if old_content != content:
                             queries_to_rewrite.append((filename, content))
+                else:
+                    queries_to_rewrite.append((filename, content))
 
-    exists_compatible = 0
+    delete_compatible = []
     for filename, _ in queries_to_rewrite:
-        if os.path.exists(os.path.join(query_dir, filename + "_compatible")):
-            exists_compatible += 1
+        for f in os.listdir(query_dir):
+            if f.startswith(filename + "_compatible"):
+                delete_compatible.append(f)
 
     log.info(f"Found {len(queries_to_rewrite)} queries to rewrite")
-    if exists_compatible > 0:
-        log.warn(f"Deleting {exists_compatible} compatible queries that are outdated")
+    if delete_compatible:
+        log.warn(f"Deleting {len(delete_compatible)} compatible queries that are outdated")
         if not log.confirm("Do you want to continue?"):
             sys.exit(0)
+
+        for f in delete_compatible:
+            log.info_verbose(f"Deleting {f} compatible query")
+            os.remove(os.path.join(query_dir, f))
 
     # Rewrite the queries
     with log.progress("Rewriting queries", total=len(queries_to_rewrite)) as progress:
         for filename, content in queries_to_rewrite:
             progress.advance()
             progress.description(os.path.basename(filename))
-
-            # Delete an outdated compatible query
-            if os.path.exists(os.path.join(query_dir, filename + "_compatible")):
-                log.info_verbose(f"Deleting {filename} compatible query")
-                os.remove(os.path.join(query_dir, filename + "_compatible"))
 
             # Rewrite the file
             with open(os.path.join(query_dir, filename + "_rewritten"), 'w', encoding='utf-8') as file:
@@ -372,7 +382,7 @@ def rewrite_queries(query_dir):
     return len(queries_to_rewrite)
 
 
-def make_queries_compatible(query_dir, queries):
+def make_queries_compatible(query_dir, queries, version, dataset, errors={}, postfixes=[], postfix="_compatible", batch_output_file=None):
     """
     Make queries compatible with different SQL dialects using GPT-4o-mini.
 
@@ -383,91 +393,53 @@ def make_queries_compatible(query_dir, queries):
     Returns:
         int: Number of queries regenerated.
     """
-    tempdir = TemporaryDirectory()
-    input_file = os.path.join(tempdir.name, "input.jsonl")
-
-    batch_json = {
-        "custom_id": "",
-        "method": "POST",
-        "url": "/v1/chat/completions",
-        "body": {
-            "model": "gpt-4o-mini",
-            "temperature": 1.0,
-            "max_tokens": 1000,
-            "messages": [
-                {"role": "system", "content": "You are a SQL generator that cannot speak."},
-                {"role": "user", "content": ""}
-            ]
-        }
-    }
-
+    model = "gpt-4o-mini" if version == "v1.0" else "gpt-5-mini"
     prompt = "Make the following SQL query more compatible with different SQL dialects. The query might contain \'::\' casts, rewrite them to standard SQL. The query might contain some errors, fix them if you can find any mistakes. Remember to put all ungrouped columns and columns that appear in windows into the group by clause. Do not explain the query, only output the converted query."
 
-    count = 0
-    with open(input_file, 'w') as f:
-        for query in queries:
-            query_file_path = os.path.join(query_dir, query)
+    ids = []
+    prompts = []
+    for query in queries:
+        query_file_path = os.path.join(query_dir, query)
 
-            # Skip if the query is already compatible
-            if os.path.exists(query_file_path + "_compatible"):
-                continue
+        # Skip if the query is already compatible
+        if os.path.exists(query_file_path + postfix):
+            continue
 
-            # Check if a rewritten version exists
-            if os.path.exists(query_file_path + "_rewritten"):
-                query_file_path += "_rewritten"
+        src_file_path = query_file_path
+        for p in postfixes:
+            if os.path.exists(query_file_path + p):
+                src_file_path = query_file_path + p
 
-            # Create the request JSON
-            with open(query_file_path, 'r', encoding='utf-8') as file:
-                sql = file.read().strip()
-                batch_json["custom_id"] = query
-                batch_json["body"]["messages"][1]["content"] = prompt + "\n```sql\n" + sql + "\n```"
-                f.write(json.dumps(batch_json) + "\n")
+        # Create the request JSON
+        with open(src_file_path, 'r', encoding='utf-8') as file:
+            sql = file.read().strip()
+            ids.append(query)
+            if version == "v1.0":
+                prompts.append(prompt + "\n```sql\n" + sql + "\n```")
+            else:
+                error, error_system = None, None
+                for s in ["postgres", "umbra", "duckdb"]:
+                    if query in errors and s in errors[query]:
+                        error, error_system = errors[query][s], s
+                        break
 
-            count += 1
+                if error is None:
+                    log.info_verbose(f"No error found for query {query}, using generic prompt")
+                    prompts.append(prompt + "\n```sql\n" + sql + "\n```")
+                else:
+                    prompts.append(f"{prompt}\nThe following error happended in {error_system}: {error}\n\n```sql\n{sql}\n```")
 
-    if count == 0:
+    if len(ids) == 0:
         log.info("All queries are already compatible")
         return 0
 
-    log.warn(f"Regenerating {count} queries with GPT-4o-mini will incur charges to your OpenAI account.")
-    if not log.confirm("Do you want to continue?"):
-        sys.exit(0)
+    def callback(id: str, sql: str, input_tokens: int, output_tokens: int):
+        sql, _ = rewrite_query(sql, dataset)
+        write_query_to_file(sql, query_dir, id, postfix=postfix)
 
-    log.info(f"Starting batch generation with GPT-4o-mini ...")
-    start = time.time()
+    asyncio.run(llm(model, len(ids), ids, prompts, callback, temperature=1.0, max_tokens=16384, reasoning="minimal", batch_output_file=batch_output_file))
 
-    # Create the batch
-    client = OpenAI()
-    batch_input_file = client.files.create(file=open(input_file, "rb"), purpose="batch")
-    batch = client.batches.create(input_file_id=batch_input_file.id, endpoint="/v1/chat/completions", completion_window="24h", metadata={"description": "1k"})
-    log.info(f"GPT-4o-mini batch: {batch.id}")
-    time.sleep(10)
-
-    # Wait for the batch to complete
-    result = client.batches.retrieve(batch.id)
-    with log.progress(result.status.capitalize(), count) as progress:
-        while result.status != 'completed':
-            if result.status == 'failed':
-                raise Exception(f"Batch {batch.id} failed: {result}")
-
-            time.sleep(30)
-            try:
-                result = client.batches.retrieve(batch.id)
-                progress.description(result.status.capitalize())
-                if result.request_counts:
-                    progress.completed(result.request_counts.completed)
-            except Exception as e:
-                log.warn(str(e))
-
-    log.info(f"Batch {batch.id} completed in {int((time.time() - start) / 60)} minutes")
-
-    # Download the output file
-    file_response = client.files.content(result.output_file_id)
-
-    # Write the output to a file
-    write_gpt_queries(query_dir, file_response.text.split('\n'), postfix="_compatible")
-
-    return count
+    return len(ids)
 
 
 def write_sql_queries_file(query_dir, query_list):
@@ -497,15 +469,16 @@ def main():
     argparser = argparse.ArgumentParser()
     argparser.add_argument("dataset", help="Dataset of the benchmark")
     argparser.add_argument("version", help="Version of the benchmark")
-    argparser.add_argument("-c", "--compatible", help="The compatible queries")
+    argparser.add_argument("-c", "--compatible", help="The compatible queries (can be provided multiple times)", default=[], nargs="*")
     argparser.add_argument("-p", "--parse", help="The parseable queries")
     argparser.add_argument("-e", "--execution", help="The executable queries")
+    argparser.add_argument("-b", "--batch_output_file", help="Batch output file in case an error occurred", default=None)
     args = argparser.parse_args()
 
     query_src_dir = os.path.join(args.version, args.dataset, "queries_generated")
     query_dest_dir = os.path.join(args.version, args.dataset, "queries")
 
-    for result_file in [args.compatible, args.parse, args.execution]:
+    for result_file in args.compatible + [args.parse, args.execution]:
         if result_file and not os.path.exists(result_file):
             raise Exception(f"Result file {result_file} does not exist")
         elif result_file and args.dataset not in result_file:
@@ -515,17 +488,17 @@ def main():
 
     # Rewrite the queries
     log.header2("Rewrite queries")
-    rewritten_queries = rewrite_queries(query_src_dir)
+    rewritten_queries = rewrite_queries(query_src_dir, args.dataset)
 
     postfix = ["_rewritten"]
     not_compatible, compatible = [], []
     regenerated_queries = 0
 
     # Make queries compatible
-    if args.compatible:
-        log.header2("Make queries compatible")
+    for i, compatible_file in enumerate(args.compatible):
+        log.header2(f"Make queries compatible (iteration: {i+1})")
 
-        not_compatible, compatible = find_queries_with_errors(args.compatible, 3)
+        not_compatible, compatible, errors = find_queries_with_errors(compatible_file, 3)
 
         log.info(f"Found {len(not_compatible):5} incompatible queries")
 
@@ -533,8 +506,10 @@ def main():
         incompatible_casts = 0
         for query in compatible:
             query_file_path = os.path.join(query_src_dir, query)
-            if os.path.exists(query_file_path + "_rewritten"):
-                query_file_path += "_rewritten"
+            for p in reversed(postfix):
+                if os.path.exists(query_file_path + p):
+                    query_file_path += p
+                    break
 
             with open(query_file_path, 'r', encoding='utf-8') as file:
                 content = file.read().strip()
@@ -543,8 +518,9 @@ def main():
                     incompatible_casts += 1
         log.info(f"Found {incompatible_casts:5} queries with '::' casts")
 
-        regenerated_queries = make_queries_compatible(query_src_dir, not_compatible)
-        postfix.append("_compatible")
+        post = "_compatible" if i == 0 else f"_compatible{i + 1}"
+        regenerated_queries = make_queries_compatible(query_src_dir, not_compatible, args.version, args.dataset, errors, postfixes=postfix, postfix=post, batch_output_file=args.batch_output_file)
+        postfix.append(post)
 
     # Copy the rewritten/compatible queries to the destination directory
     log.header2("Copy queries")
@@ -560,7 +536,7 @@ def main():
     not_parseable, parseable = [], []
     if args.parse:
         log.header2("Select parseable queries")
-        not_parseable, parseable = find_queries_with_errors(args.parse, 2)
+        not_parseable, parseable, _ = find_queries_with_errors(args.parse, 2)
         log.info(f"Deleting {len(not_parseable)} not parseable queries")
         delete_queries(not_parseable, query_dest_dir)
 
@@ -570,7 +546,7 @@ def main():
         log.header2("Restore parseable queries")
 
         # Finda all queries that were parseable by two DBMS before rewritting
-        _, parseable_rewritten = find_queries_with_errors(args.compatible, 2, subset=not_parseable)
+        _, parseable_rewritten, _ = find_queries_with_errors(args.compatible[0], 2, subset=not_parseable)
         with log.progress("Restoring queries", len(parseable_rewritten)) as progress:
             for query in parseable_rewritten:
                 progress.advance()
@@ -590,7 +566,7 @@ def main():
     not_executable, executable = [], []
     if args.execution:
         log.header2("Select executable queries")
-        not_executable, executable = find_queries_with_errors(args.execution, 1)
+        not_executable, executable, _ = find_queries_with_errors(args.execution, 1)
         log.info(f"Deleting {len(not_executable)} not executable queries")
         delete_queries(not_executable, query_dest_dir)
 

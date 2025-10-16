@@ -1,0 +1,200 @@
+-- {"query": "19051.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2900} 
+
+WITH UserEngagementMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COALESCE(u.Location, 'Unknown') AS UserLocation,
+        u.Views AS UserProfileViews,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedAnswersGiven,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScoreGiven,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT b.Id) AS TotalBadgesEarned,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        -- Correlated subquery to find the latest post title by this user, if any
+        (
+            SELECT sp.Title
+            FROM Posts sp
+            WHERE sp.OwnerUserId = u.Id
+            ORDER BY sp.CreationDate DESC
+            LIMIT 1
+        ) AS LatestPostTitle,
+        -- Window function: Rank users by reputation within their creation year
+        RANK() OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation DESC) AS ReputationRankInYear,
+        -- Window function: Average score of all posts made by this user
+        AVG(p.Score) FILTER (WHERE p.OwnerUserId = u.Id) OVER (PARTITION BY u.Id) AS AvgPostScoreByOwner,
+        -- Window function: Total upvotes received by user across all their posts
+        SUM(v_up.Id) FILTER (WHERE v_up.VoteTypeId = 2) OVER (PARTITION BY u.Id) AS TotalUpvotesReceived
+    FROM
+        Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v_up ON p.Id = v_up.PostId AND v_up.VoteTypeId = 2
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location, u.Views
+),
+PostContentQuality AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        COALESCE(p.Score, 0) AS PostScore,
+        COALESCE(p.ViewCount, 0) AS ViewCount,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.CommentCount, 0) AS CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        LENGTH(p.Body) AS BodyLength,
+        LENGTH(p.Title) AS TitleLength,
+        p.OwnerUserId,
+        p.LastEditDate,
+        p.ClosedDate,
+        -- String expression: Extract the first tag from the Tags string, handling potential NULL or empty tags
+        TRIM(SUBSTRING(p.Tags, 2, POSITION('><' IN p.Tags || '><') - 2)) AS PrimaryTag,
+        -- Complicated Predicate: Check if post body contains common problem keywords AND has been edited
+        (
+            p.Body ILIKE '%error%' OR
+            p.Body ILIKE '%issue%' OR
+            p.Body ILIKE '%problem%' OR
+            p.Body ILIKE '%bug%'
+        ) AS ContainsProblemKeywords,
+        (p.LastEditDate IS NOT NULL AND p.LastEditDate > p.CreationDate) AS HasBeenEdited,
+        -- Count of specific post history types (e.g., body edits, close votes)
+        COUNT(ph_edit.Id) FILTER (WHERE ph_edit.PostHistoryTypeId = 5) AS BodyEditHistoryCount,
+        COUNT(ph_close.Id) FILTER (WHERE ph_close.PostHistoryTypeId = 10) AS CloseHistoryCount,
+        -- Window function: Calculate the difference in days to the previous post by the same owner
+        COALESCE(
+            EXTRACT(DAY FROM (p.CreationDate - LAG(p.CreationDate, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate))),
+            0
+        ) AS DaysSincePreviousPost,
+        -- Non-correlated subquery: Average score of all accepted answers
+        (SELECT AVG(sa.Score) FROM Posts sa WHERE sa.PostTypeId = 2 AND sa.Id = p.AcceptedAnswerId) AS AvgAcceptedAnswerScore,
+        -- Correlated subquery: Check if the post has any 'duplicate' links
+        EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS IsDuplicateSource,
+        -- Nested CASE for Post Status (NULL logic for ClosedDate)
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered & Accepted'
+            WHEN p.AnswerCount > 0 THEN 'Answered'
+            ELSE 'Open'
+        END AS PostStatus
+    FROM
+        Posts p
+    LEFT JOIN PostHistory ph_edit ON p.Id = ph_edit.PostId AND ph_edit.PostHistoryTypeId = 5
+    LEFT JOIN PostHistory ph_close ON p.Id = ph_close.PostId AND ph_close.PostHistoryTypeId = 10
+    WHERE
+        p.PostTypeId IN (1, 2) -- Focus on Questions and Answers
+    GROUP BY
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount,
+        p.FavoriteCount, p.Body, p.Title, p.OwnerUserId, p.LastEditDate, p.ClosedDate, p.Tags, p.AcceptedAnswerId
+),
+TagPerformanceOverview AS (
+    SELECT
+        t.TagName,
+        t.Id AS TagId,
+        t.Count AS TagUseCount,
+        COALESCE(t.WikiPostId, t.ExcerptPostId) AS AssociatedPostId, -- NULL logic, prioritize Wiki over Excerpt
+        AVG(pcq.PostScore) AS AvgScoreForTaggedPosts,
+        COUNT(DISTINCT pcq.OwnerUserId) AS UniqueAuthorsUsingTag,
+        MAX(pcq.PostCreationDate) AS LatestUseDate,
+        -- Check if the tag name is long or contains specific character patterns
+        (LENGTH(t.TagName) > 15 OR t.TagName LIKE '%-%') AS IsComplexTagName,
+        -- Non-correlated subquery: Get average reputation of users associated with this tag
+        (
+            SELECT AVG(ue.Reputation)
+            FROM UserEngagementMetrics ue
+            JOIN Posts p ON ue.UserId = p.OwnerUserId
+            WHERE p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+        ) AS AvgAuthorReputationForTag
+    FROM
+        Tags t
+    LEFT JOIN PostContentQuality pcq ON pcq.PrimaryTag = t.TagName
+    GROUP BY
+        t.TagName, t.Id, t.Count, t.WikiPostId, t.ExcerptPostId
+    HAVING
+        t.Count > 500 -- Only focus on frequently used tags
+)
+-- Final Elaborate Query
+SELECT
+    uem.UserId,
+    uem.DisplayName,
+    uem.Reputation,
+    uem.UserLocation,
+    pcq.PostId,
+    pcq.PostCreationDate,
+    pcq.PostScore,
+    pcq.ViewCount,
+    pcq.BodyLength,
+    pcq.TitleLength,
+    pcq.PrimaryTag,
+    tpo.AvgScoreForTaggedPosts,
+    tpo.TagUseCount,
+    uem.TotalQuestions,
+    uem.TotalAnswers,
+    uem.GoldBadges,
+    uem.SilverBadges,
+    pcq.HasBeenEdited,
+    pcq.ContainsProblemKeywords,
+    pcq.PostStatus,
+    -- Calculation: Ratio of post score to its view count (NULL handling)
+    CAST(pcq.PostScore AS NUMERIC) / NULLIF(pcq.ViewCount, 0) AS ScorePerViewRatio,
+    -- Calculation: Days active since user creation until post creation
+    EXTRACT(DAY FROM (pcq.PostCreationDate - uem.UserCreationDate)) AS DaysUserActiveAtPostCreation,
+    -- Window function: NTILE to categorize posts into 4 quartiles based on their Score-to-View Ratio
+    NTILE(4) OVER (ORDER BY CAST(pcq.PostScore AS NUMERIC) / NULLIF(pcq.ViewCount, 0) DESC) AS ScoreViewRatioQuartile,
+    -- Complicated Expression: Combined metric for Post engagement & user experience
+    (
+        (pcq.PostScore * 0.5) + (pcq.ViewCount * 0.1) + (pcq.CommentCount * 0.2) + (pcq.FavoriteCount * 0.3)
+        + CASE WHEN pcq.HasBeenEdited THEN 5 ELSE 0 END
+        + CASE WHEN pcq.ContainsProblemKeywords THEN -3 ELSE 0 END
+    ) AS PostEngagementMetric,
+    -- Join with PostLinks for linked posts, if any, and filter for specific link types
+    pl.RelatedPostId,
+    lt.Name AS LinkTypeName,
+    -- More NULL logic with COALESCE for display
+    COALESCE(uem.LatestPostTitle, 'No Recent Post') AS UserLatestPostDisplay,
+    -- Correlated Subquery: Check if the user has any 'ModeratorReview' votes on their posts
+    EXISTS (
+        SELECT 1 FROM Votes v_mod
+        WHERE v_mod.PostId = pcq.PostId AND v_mod.VoteTypeId = 15
+    ) AS HasModeratorReviewVote,
+    -- Complicated WHERE clause with multiple AND/OR and checks across CTEs
+    CASE
+        WHEN pcq.DaysSincePreviousPost IS NULL THEN 'First Post'
+        WHEN pcq.DaysSincePreviousPost BETWEEN 1 AND 7 THEN 'Frequent Poster'
+        WHEN pcq.DaysSincePreviousPost > 30 THEN 'Sporadic Poster'
+        ELSE 'Regular Poster'
+    END AS PostingFrequencyCategory
+FROM
+    UserEngagementMetrics uem
+INNER JOIN PostContentQuality pcq ON uem.UserId = pcq.OwnerUserId
+LEFT JOIN TagPerformanceOverview tpo ON pcq.PrimaryTag = tpo.TagName
+LEFT JOIN PostLinks pl ON pcq.PostId = pl.PostId AND pl.LinkTypeId IN (1, 3) -- Only 'Linked' or 'Duplicate'
+LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+WHERE
+    uem.ReputationRankInYear <= 50 -- Top 50 users by reputation in their year
+    AND uem.TotalPosts >= 10 -- Users with at least 10 posts
+    AND pcq.PostCreationDate >= '2023-01-01' -- Focus on recent posts
+    AND pcq.PostScore > 10 -- Only highly-rated posts
+    AND pcq.BodyLength > 300 -- Substantial post bodies
+    AND pcq.HasBeenEdited IS TRUE -- Posts that have been refined
+    AND tpo.IsComplexTagName IS FALSE -- Exclude overly complex tag names for analysis simplicity
+    AND tpo.AvgAuthorReputationForTag > 1000 -- Only posts from tags associated with highly reputable authors
+    AND (
+        (pcq.PostTypeId = 1 AND pcq.AnswerCount >= 1 AND pcq.AcceptedAnswerScore IS NOT NULL) OR -- Questions with accepted answers
+        (pcq.PostTypeId = 2 AND pcq.ContainsProblemKeywords IS FALSE AND pcq.CloseHistoryCount = 0) -- High-quality answers without problem keywords and not closed
+    )
+    AND uem.GoldBadges >= 1 -- Users with at least one gold badge
+ORDER BY
+    uem.Reputation DESC,
+    pcq.PostEngagementMetric DESC,
+    pcq.PostCreationDate DESC
+LIMIT 1000;

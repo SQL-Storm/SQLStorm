@@ -1,0 +1,77 @@
+-- {"query": "11027.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 546} 
+
+WITH RecentPosts AS (
+    SELECT 
+        p.Id, 
+        p.Title, 
+        p.CreationDate, 
+        p.Score, 
+        p.ViewCount, 
+        u.DisplayName AS OwnerDisplayName, 
+        u.Reputation AS OwnerReputation
+    FROM 
+        Posts p
+    INNER JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    WHERE 
+        p.CreationDate > NOW() - INTERVAL '30 days'
+),
+PostVotes AS (
+    SELECT 
+        PostId, 
+        COUNT(*) AS VoteCount, 
+        AVG(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvoteRate
+    FROM 
+        Votes
+    GROUP BY 
+        PostId
+),
+PostTags AS (
+    SELECT 
+        p.Id, 
+        t.TagName
+    FROM 
+        Posts p
+    CROSS JOIN 
+        UNNEST(string_to_array(p.Tags, ',')) AS TagName
+    INNER JOIN 
+        Tags t ON TagName = t.TagName
+),
+PostActivity AS (
+    SELECT 
+        PostId, 
+        COUNT(*) AS ActivityCount
+    FROM 
+        (SELECT PostId, CreationDate FROM Comments
+        UNION ALL
+        SELECT PostId, CreationDate FROM PostHistory) AS Activity
+    GROUP BY 
+        PostId
+)
+SELECT 
+    rp.Id, 
+    rp.Title, 
+    rp.CreationDate, 
+    rp.Score, 
+    rp.ViewCount, 
+    rp.OwnerDisplayName, 
+    rp.OwnerReputation, 
+    pv.VoteCount, 
+    pv.UpvoteRate, 
+    STRING_AGG(pt.TagName, ', ') AS Tags, 
+    pa.ActivityCount
+FROM 
+    RecentPosts rp
+LEFT JOIN 
+    PostVotes pv ON rp.Id = pv.PostId
+LEFT JOIN 
+    PostTags pt ON rp.Id = pt.Id
+LEFT JOIN 
+    PostActivity pa ON rp.Id = pa.PostId
+GROUP BY 
+    rp.Id, rp.Title, rp.CreationDate, rp.Score, rp.ViewCount, rp.OwnerDisplayName, rp.OwnerReputation, pv.VoteCount, pv.UpvoteRate, pa.ActivityCount
+ORDER BY 
+    rp.CreationDate DESC, 
+    rp.Score DESC, 
+    pa.ActivityCount DESC
+LIMIT 10;

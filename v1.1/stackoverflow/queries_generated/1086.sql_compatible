@@ -1,0 +1,82 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS rn,
+        COUNT(c.Id) AS CommentCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpvoteCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownvoteCount
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    GROUP BY 
+        p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.PostTypeId
+),
+TagCounts AS (
+    SELECT 
+        p.Id AS PostId,
+        COUNT(DISTINCT t.Id) AS TagCount
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Tags t ON POSITION('"' || t.TagName || '"' IN p.Tags) > 0
+    GROUP BY 
+        p.Id
+),
+Summary AS (
+    SELECT 
+        SUM(rp.CommentCount) AS CommentCount,
+        SUM(rp.UpvoteCount) AS UpvoteCount,
+        SUM(rp.DownvoteCount) AS DownvoteCount,
+        SUM(tc.TagCount) AS TagCount
+    FROM 
+        RankedPosts rp
+    JOIN 
+        TagCounts tc ON rp.PostId = tc.PostId
+)
+SELECT 
+    rp.PostId,
+    rp.Title,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.CommentCount,
+    rp.UpvoteCount,
+    rp.DownvoteCount,
+    tc.TagCount,
+    CASE 
+        WHEN rp.Score > 0 THEN 'Positive'
+        WHEN rp.Score = 0 THEN 'Neutral'
+        ELSE 'Negative'
+    END AS ScoreCategory
+FROM 
+    RankedPosts rp
+JOIN 
+    TagCounts tc ON rp.PostId = tc.PostId
+WHERE 
+    rp.rn <= 10
+ORDER BY 
+    rp.CreationDate DESC, rp.Score DESC
+
+UNION ALL
+
+SELECT 
+    CAST(NULL AS INTEGER) AS PostId,
+    'Total Posts' AS Title,
+    NULL AS CreationDate,
+    NULL AS Score,
+    NULL AS ViewCount,
+    s.CommentCount AS CommentCount,
+    s.UpvoteCount AS UpvoteCount,
+    s.DownvoteCount AS DownvoteCount,
+    s.TagCount AS TagCount,
+    NULL AS ScoreCategory
+FROM 
+    Summary s
+;

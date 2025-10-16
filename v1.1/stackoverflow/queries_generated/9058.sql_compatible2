@@ -1,0 +1,166 @@
+WITH
+BadgeStats AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COUNT(CASE WHEN b.TagBased = TRUE THEN 1 END) AS TagBadges
+    FROM Users AS u
+    LEFT JOIN Badges AS b
+      ON b.UserId = u.Id
+    GROUP BY u.Id
+),
+PostStats AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        AVG(p.Score)            AS AvgPostScore,
+        SUM(p.ViewCount)        AS TotalViews
+    FROM Posts AS p
+    GROUP BY p.OwnerUserId
+),
+VoteStats AS (
+    SELECT
+        v.UserId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpvotesCast,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownvotesCast,
+        COUNT(CASE WHEN v.VoteTypeId = 5 THEN 1 END) AS FavoritesCast
+    FROM Votes AS v
+    GROUP BY v.UserId
+),
+RecentActivity AS (
+    SELECT
+        u.Id                       AS UserId,
+        MAX(GREATEST(
+            COALESCE(u.LastAccessDate, TIMESTAMP '1970-01-01'),
+            COALESCE(p.LastActivityDate, TIMESTAMP '1970-01-01'),
+            COALESCE(c.CreationDate, TIMESTAMP '1970-01-01')
+        )) AS LastActivity,
+        (SELECT c2.Text
+         FROM Comments AS c2
+         WHERE c2.UserId = u.Id
+         ORDER BY c2.CreationDate DESC
+         LIMIT 1
+        ) AS LastCommentSnippet
+    FROM Users AS u
+    LEFT JOIN Posts    AS p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments AS c ON c.UserId      = u.Id
+    GROUP BY u.Id
+),
+TopTags AS (
+    SELECT
+        qt.OwnerUserId   AS UserId,
+        qt.TagName       AS TopTag,
+        ROW_NUMBER() OVER (PARTITION BY qt.OwnerUserId ORDER BY qt.TagCount DESC, qt.TagName) AS rn
+    FROM (
+        SELECT
+            p.OwnerUserId,
+            unnest(string_to_array(substring(p.Tags FROM 2 FOR (length(p.Tags)-2)), '><')) AS TagName,
+            COUNT(*) AS TagCount
+        FROM Posts AS p
+        WHERE p.PostTypeId = 1
+          AND p.Tags IS NOT NULL
+        GROUP BY p.OwnerUserId, unnest(string_to_array(substring(p.Tags FROM 2 FOR (length(p.Tags)-2)), '><'))
+    ) AS qt
+),
+FilteredUsers AS (
+    SELECT u.Id
+    FROM Users AS u
+    WHERE u.Reputation >
+          (SELECT AVG(u2.Reputation) FROM Users AS u2 WHERE u2.CreationDate < u.CreationDate)
+      AND EXISTS (
+          SELECT 1
+          FROM Posts AS p2
+          WHERE p2.OwnerUserId = u.Id
+            AND p2.Score > (
+                SELECT AVG(p3.Score) FROM Posts AS p3 WHERE p3.OwnerUserId = u.Id
+            )
+      )
+)
+SELECT
+    u.Id,
+    u.DisplayName,
+    COALESCE(ps.QuestionCount,0)   AS Questions,
+    COALESCE(ps.AnswerCount,0)     AS Answers,
+    COALESCE(bs.GoldBadges,0)       AS GoldBadges,
+    COALESCE(bs.SilverBadges,0)     AS SilverBadges,
+    COALESCE(bs.BronzeBadges,0)     AS BronzeBadges,
+    COALESCE(bs.TagBadges,0)        AS TagBadges,
+    COALESCE(vs.UpvotesCast,0)      AS UpvotesCast,
+    COALESCE(vs.DownvotesCast,0)    AS DownvotesCast,
+    COALESCE(vs.FavoritesCast,0)    AS FavoritesCast,
+    COALESCE(ps.AvgPostScore,0)     AS AvgScore,
+    COALESCE(ps.TotalViews,0)       AS TotalViews,
+    ra.LastActivity,
+    ra.LastCommentSnippet,
+    tt.TopTag,
+    RANK() OVER (
+        ORDER BY
+            COALESCE(ps.QuestionCount,0) DESC,
+            COALESCE(ps.AnswerCount,0)   DESC,
+            COALESCE(ps.AvgPostScore,0)   DESC
+    ) AS UserRank
+FROM FilteredUsers AS fu
+INNER JOIN Users        AS u  ON u.Id = fu.Id
+LEFT  JOIN BadgeStats   AS bs ON bs.UserId = u.Id
+LEFT  JOIN PostStats    AS ps ON ps.UserId = u.Id
+LEFT  JOIN VoteStats    AS vs ON vs.UserId = u.Id
+LEFT  JOIN RecentActivity AS ra ON ra.UserId = u.Id
+LEFT  JOIN TopTags      AS tt ON tt.UserId = u.Id AND tt.rn = 1
+
+UNION
+
+SELECT
+    u.Id,
+    u.DisplayName,
+    0 AS Questions,
+    0 AS Answers,
+    0 AS GoldBadges,
+    0 AS SilverBadges,
+    0 AS BronzeBadges,
+    0 AS TagBadges,
+    0 AS UpvotesCast,
+    0 AS DownvotesCast,
+    0 AS FavoritesCast,
+    0 AS AvgScore,
+    0 AS TotalViews,
+    NULL AS LastActivity,
+    NULL AS LastCommentSnippet,
+    NULL AS TopTag,
+    NULL AS UserRank
+FROM Users AS u
+
+EXCEPT
+
+SELECT
+    u.Id,
+    u.DisplayName,
+    COALESCE(ps.QuestionCount,0),
+    COALESCE(ps.AnswerCount,0),
+    COALESCE(bs.GoldBadges,0),
+    COALESCE(bs.SilverBadges,0),
+    COALESCE(bs.BronzeBadges,0),
+    COALESCE(bs.TagBadges,0),
+    COALESCE(vs.UpvotesCast,0),
+    COALESCE(vs.DownvotesCast,0),
+    COALESCE(vs.FavoritesCast,0),
+    COALESCE(ps.AvgPostScore,0),
+    COALESCE(ps.TotalViews,0),
+    ra.LastActivity,
+    ra.LastCommentSnippet,
+    tt.TopTag,
+    RANK() OVER (
+        ORDER BY
+            COALESCE(ps.QuestionCount,0) DESC,
+            COALESCE(ps.AnswerCount,0)   DESC,
+            COALESCE(ps.AvgPostScore,0)   DESC
+    )
+FROM FilteredUsers AS fu
+INNER JOIN Users        AS u  ON u.Id = fu.Id
+LEFT  JOIN BadgeStats   AS bs ON bs.UserId = u.Id
+LEFT  JOIN PostStats    AS ps ON ps.UserId = u.Id
+LEFT  JOIN VoteStats    AS vs ON vs.UserId = u.Id
+LEFT  JOIN RecentActivity AS ra ON ra.UserId = u.Id
+LEFT  JOIN TopTags      AS tt ON tt.UserId = u.Id AND tt.rn = 1;

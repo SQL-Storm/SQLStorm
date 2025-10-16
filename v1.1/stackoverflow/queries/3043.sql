@@ -1,0 +1,100 @@
+WITH UserReputationStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        COUNT(*) OVER () AS TotalUsers
+    FROM Users u
+    WHERE u.LastAccessDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1' YEAR)
+), RecentQuestions AS (
+    SELECT
+        p1.Id AS QuestionId,
+        p1.OwnerUserId,
+        p1.Title,
+        p1.CreationDate,
+        p1.Tags,
+        p1.Score
+    FROM Posts p1
+    WHERE p1.PostTypeId = 1
+      AND p1.CreationDate >= (SELECT MAX(CreationDate) FROM Posts WHERE PostTypeId = 1) - INTERVAL '1' MONTH
+), AnswerCounts AS (
+    SELECT
+        p2.ParentId AS QuestionId,
+        COUNT(*) AS AnswerCount
+    FROM Posts p2
+    WHERE p2.PostTypeId = 2
+    GROUP BY p2.ParentId
+), TagSummaries AS (
+    SELECT
+        tag AS Tag,
+        COUNT(*) AS TagCount
+    FROM (
+        SELECT UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><')) AS tag
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.Tags IS NOT NULL
+    ) t
+    GROUP BY tag
+), UserBadged AS (
+    SELECT
+        b.UserId,
+        COUNT(*) AS BadgeCount,
+        STRING_AGG(b.Name, ', ') AS BadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+), QuestionTags AS (
+    SELECT
+        rq.QuestionId,
+        UNNEST(string_to_array(SUBSTRING(rq.Tags FROM 2 FOR LENGTH(rq.Tags) - 2), '><')) AS Tag
+    FROM RecentQuestions rq
+    WHERE rq.Tags IS NOT NULL
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    CASE WHEN u.Reputation >= 1000 THEN 'Top Contributor' ELSE 'Contributor' END AS Role,
+    rs.ReputationRank,
+    rs.TotalUsers,
+    COALESCE(qs.QuestionId, 0) AS RecentQuestionId,
+    qs.Title AS QuestionTitle,
+    ac.AnswerCount,
+    COALESCE(qt.Tag, 'unknown') AS Tag,
+    ts.TagCount,
+    ub.BadgeCount,
+    ub.BadgeNames,
+    (
+        SELECT SUM(vs1.VoteCount)
+        FROM (
+            SELECT COUNT(*) AS VoteCount
+            FROM Votes v
+            WHERE v.PostId = p.Id
+              AND v.VoteTypeId IN (1,2)
+        ) vs1
+    ) AS TotalVotesOnPosts
+FROM Users u
+LEFT JOIN UserReputationStats rs ON u.Id = rs.UserId
+LEFT JOIN RecentQuestions qs ON u.Id = qs.OwnerUserId
+LEFT JOIN AnswerCounts ac ON qs.QuestionId = ac.QuestionId
+LEFT JOIN QuestionTags qt ON qs.QuestionId = qt.QuestionId
+LEFT JOIN TagSummaries ts ON ts.Tag = qt.Tag
+LEFT JOIN UserBadged ub ON u.Id = ub.UserId
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+WHERE u.LastAccessDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1' YEAR)
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    rs.ReputationRank,
+    rs.TotalUsers,
+    qs.QuestionId,
+    qs.Title,
+    ac.AnswerCount,
+    qt.Tag,
+    ts.TagCount,
+    ub.BadgeCount,
+    ub.BadgeNames,
+    p.Id
+ORDER BY u.Reputation DESC, rs.ReputationRank ASC
+LIMIT 100;

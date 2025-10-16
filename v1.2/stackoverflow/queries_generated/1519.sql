@@ -1,0 +1,99 @@
+-- {"query": "1519.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1111} 
+with RankedPosts as (
+  select 
+    p.Id, p.PostTypeId, p.Title, p.CreationDate, p.Score, p.ViewCount, 
+    p.Tags,
+    u.Id as OwnerUserId, u.DisplayName as OwnerName, u.Reputation as OwnerReputation,
+    row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc nulls last) as rn,
+    count(*) over (partition by p.PostTypeId) as total_per_type
+  from Posts p
+  left join Users u on p.OwnerUserId = u.Id
+  where p.PostTypeId in (1,2)
+), LatestEdits as (
+  select ph.PostId, max(ph.CreationDate) as LastEdit 
+  from PostHistory ph
+  where ph.PostHistoryTypeId in (4,5,6) -- title, body, tags edits
+  group by ph.PostId
+), BadgeRanks as (
+  select 
+    b.UserId, 
+    count(1) filter (where b.Class=1) as GoldBadges,
+    count(1) filter (where b.Class=2) as SilverBadges,
+    count(1) filter (where b.Class=3) as BronzeBadges
+  from Badges b
+  group by b.UserId
+), PostVoteSums as (
+  select 
+    v.PostId,
+    sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+    sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes,
+    sum(case when vt.Name = 'Favorite' then 1 else 0 end) as Favorites
+  from Votes v
+  join VoteTypes vt on v.VoteTypeId = vt.Id
+  group by v.PostId
+), DupCount as (
+  select pl.RelatedPostId, count(distinct pl.PostId) as DuplicateCount
+  from PostLinks pl
+  join LinkTypes lt on pl.LinkTypeId = lt.Id and lt.Name = 'Duplicate'
+  group by pl.RelatedPostId
+), TaggedQuestionsSkipped as (
+  select q.Id, q.Title,
+    string_to_array(substring(coalesce(q.Tags,''), 2, length(coalesce(q.Tags,''))-2), '><') as TagArray
+  from Posts q
+  where q.PostTypeId = 1
+), UnprotectedQuestions as (
+  select ph.PostId
+  from PostHistory ph
+  join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id and pht.Name = 'Question Unprotected'
+), SpatialUsers as (
+  select Id, DisplayName, Location,
+   case 
+     when Location ilike '%New York%' then 'New York'
+     when Location ilike '%San Francisco%' then 'San Francisco'
+     when Location ilike '%London%' then 'London'
+     else 'Other'
+   end as LocationGroup
+  from Users
+  where Location is not null
+)
+select
+  rp.Id, rp.PostTypeId,
+  rp.Title,
+  rp.CreationDate,
+  rp.Score,
+  coalesce(pvs.UpVotes,0) as TotalUpVotes, coalesce(pvs.DownVotes,0) as TotalDownVotes,
+  coalesce(pvs.Favorites,0) as FavoriteCount,
+  ux.PostId is null as IsProtected,
+  be.GoldBadges, be.SilverBadges, be.BronzeBadges,
+  dup.DuplicateCount,
+  rp.UserReputation,
+  su.LocationGroup,
+  le.LastEdit,
+  array_length(rp.TagsArr,1) as TagCount
+from (
+  select p.Id, p.PostTypeId, p.Title, p.CreationDate, p.Score, p.OwnerUserId, p.ViewCount,
+    array_remove(string_to_array(substring(coalesce(p.Tags,''), 2, length(coalesce(p.Tags,''))-2), '><'), '') as TagsArr,
+    u.Reputation as UserReputation
+  from Posts p
+  left join Users u on p.OwnerUserId = u.Id
+  where p.PostTypeId = 1
+) rp
+left join PostVoteSums pvs on pvs.PostId = rp.Id
+left join BadgeRanks be on be.UserId = rp.OwnerUserId
+left join DupCount dup on dup.RelatedPostId = rp.Id
+left join UnprotectedQuestions ux on ux.PostId = rp.Id
+left join SpatialUsers su on su.Id = rp.OwnerUserId
+left join LatestEdits le on le.PostId = rp.Id
+where (rp.UserReputation > 1000 or (be.GoldBadges + be.SilverBadges) >= 5)
+and (
+       (TagsMatch := 'sql') in (select unnest(rp.TagsArr))
+    or rp.Title ilike '%sql%'
+ or phonetic(rp.Title, 'soundex') = phonetic('sql', 'soundex') 
+  )
+and rp.ViewCount > (
+    select avg(ViewCount) 
+    from Posts 
+    where PostTypeId = 1 and CreationDate > now() - interval '1 year'
+)
+order by rp.Score desc nulls last, pvs.UpVotes desc nulls last, rp.CreationDate desc
+limit 100;

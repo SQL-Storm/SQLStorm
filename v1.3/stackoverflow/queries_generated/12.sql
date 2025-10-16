@@ -1,0 +1,195 @@
+-- {"query": "12.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2448} 
+with
+-- recent active questions with tag arrays and score normalization
+RecentQuestions as (
+  select
+    p.id,
+    p.title,
+    p.creationdate,
+    p.viewcount,
+    p.score,
+    -- normalize score with log and null-safe handling
+    coalesce(nullif(p.score,0),0) as raw_score,
+    case when p.score is null then 0 else ln(abs(p.score) + 1) * sign(p.score) end as log_score,
+    -- tag array parsed from XML-like <> delimited string (Postgres style)
+    case when p.tags is null then array[]::text[] else string_to_array(substring(p.tags from 2 for char_length(p.tags)-2), '><') end as tag_array,
+    p.owneruserid
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate > now() - interval '2 years'
+    and (p.score is not null or p.viewcount > 0)
+),
+-- aggregate user stats including moving averages and badge influence
+UserAggregates as (
+  select
+    u.id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    count(b.id) filter (where b.class = 1) as gold_badges,
+    count(b.id) filter (where b.class = 2) as silver_badges,
+    count(b.id) filter (where b.class = 3) as bronze_badges,
+    -- recency weight: more recent activity increases score
+    greatest(0, extract(epoch from now() - u.lastaccessdate))/86400 as days_since_access,
+    -- user score estimate combining reputation and badges with null-safe math
+    (coalesce(u.reputation,0) * 0.6
+     + (coalesce(count(b.id),0)::float * 15.0)
+     - greatest(0, extract(epoch from now() - u.creationdate))/86400 * 0.02) as user_influence
+  from users u
+  left join badges b on b.userid = u.id
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.lastaccessdate
+),
+-- compute answer stats per question, with correlated subquery for most recent answer author
+AnswerStats as (
+  select
+    q.id as question_id,
+    count(a.id) filter (where a.posttypeid = 2) as answer_count,
+    avg(a.score) filter (where a.posttypeid = 2) as avg_answer_score,
+    max(a.score) filter (where a.posttypeid = 2) as max_answer_score,
+    -- correlated subquery: find most recent answer id and its owner
+    (select a2.id from posts a2 where a2.parentid = q.id and a2.posttypeid = 2 order by a2.creationdate desc limit 1) as most_recent_answer_id,
+    (select a3.owneruserid from posts a3 where a3.parentid = q.id and a3.posttypeid = 2 order by a3.creationdate desc limit 1) as most_recent_answer_owner
+  from posts q
+  left join posts a on a.parentid = q.id and a.posttypeid = 2
+  where q.posttypeid = 1
+  group by q.id
+),
+-- complex windowed ranking combining viewcount, score, and recent activity
+QuestionRanking as (
+  select
+    rq.*,
+    coalesce(as_.answer_count,0) as answer_count,
+    coalesce(as_.avg_answer_score,0) as avg_answer_score,
+    coalesce(as_.max_answer_score,0) as max_answer_score,
+    ua.user_influence,
+    -- composite hotness metric with non-linear transforms and null logic
+    (0.5 * (case when rq.viewcount is null then 0 else ln(rq.viewcount + 1) end)
+     + 0.4 * (case when rq.log_score is null then 0 else rq.log_score end)
+     + 0.6 * coalesce(as_.avg_answer_score,0)
+     + 0.3 * coalesce(ua.user_influence,0)
+     - 0.05 * greatest(0, extract(epoch from now() - rq.creationdate))/86400) as hotness_score,
+    row_number() over (partition by (case when array_length(rq.tag_array,1) is null then 'untagged' else rq.tag_array[1] end) order by
+       (0.5 * (case when rq.viewcount is null then 0 else ln(rq.viewcount + 1) end)
+        + 0.4 * (case when rq.log_score is null then 0 else rq.log_score end)
+        + 0.6 * coalesce(as_.avg_answer_score,0)
+        + 0.3 * coalesce(ua.user_influence,0)
+        - 0.05 * greatest(0, extract(epoch from now() - rq.creationdate))/86400) desc) as tag_rank
+  from RecentQuestions rq
+  left join AnswerStats as_ on as_.question_id = rq.id
+  left join UserAggregates ua on ua.id = rq.owneruserid
+),
+-- diverse mix: union of high-score questions and recently active duplicates/linked posts
+InterestingSet as (
+  select
+    qr.id,
+    qr.title,
+    qr.creationdate,
+    qr.tag_array,
+    qr.viewcount,
+    qr.score,
+    qr.hotness_score,
+    qr.answer_count,
+    'hot_by_tag' as reason
+  from QuestionRanking qr
+  where qr.tag_rank <= 3 and qr.hotness_score is not null
+
+  union
+
+  select
+    p.id,
+    p.title,
+    p.creationdate,
+    case when p.tags is null then array[]::text[] else string_to_array(substring(p.tags from 2 for char_length(p.tags)-2), '><') end,
+    p.viewcount,
+    p.score,
+    -- compute hotness on the fly for linked duplicates: prefer duplicates with high answer_count
+    (coalesce(ln(p.viewcount+1),0) * 0.3 + coalesce(ln(abs(coalesce(p.score,0))+1) * sign(coalesce(p.score,0)),0) * 0.3
+     + coalesce((select count(1) from postlinks pl where pl.relatedpostid = p.id and pl.linktypeid = 3),0) * 0.5) as hotness_score,
+    coalesce((select count(1) from posts a where a.parentid = p.id and a.posttypeid = 2),0),
+    'duplicates_and_links' as reason
+  from posts p
+  where p.posttypeid = 1
+    and exists (select 1 from postlinks pl where pl.postid = p.id and pl.linktypeid in (1,3))
+    and p.creationdate > now() - interval '5 years'
+  order by hotness_score desc
+  limit 250
+),
+-- final enrichment: left join comments, votes, last edit history and assemble complicated computed columns
+FinalEnriched as (
+  select
+    iset.*,
+    coalesce(c.comment_count,0) as recent_comment_count,
+    coalesce(v.upvotes,0) as upvote_count,
+    coalesce(v.downvotes,0) as downvote_count,
+    -- last meaningful edit from PostHistory (exclude trivial types)
+    ph.last_history_id,
+    ph.last_history_type,
+    ph.last_history_date,
+    -- textual churn measure: count of body edits in history
+    coalesce(ph.edit_count,0) as edit_count,
+    -- sentiment-ish heuristic from title: length, presence of question mark, uppercase ratio
+    length(coalesce(iset.title,'')) as title_length,
+    (length(regexp_replace(coalesce(iset.title,''),'[^A-Z]','','g'))::float
+      / nullif(length(coalesce(iset.title,'')),0)) as uppercase_ratio,
+    (case when coalesce(iset.title,'') like '%?%' then 1 else 0 end) as has_question_mark
+  from InterestingSet iset
+  left join (
+    select
+      p.id,
+      sum(case when c.id is null then 0 else 1 end) as comment_count
+    from posts p
+    left join comments c on c.postid = p.id and c.creationdate > now() - interval '1 year'
+    group by p.id
+  ) c on c.id = iset.id
+  left join (
+    select
+      p.id,
+      sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+      sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes
+    from posts p
+    left join votes v on v.postid = p.id
+    group by p.id
+  ) v on v.id = iset.id
+  left join (
+    select
+      ph.postid,
+      max(ph.id) as last_history_id,
+      max(ph.posthistorytypeid) filter (where ph.posthistorytypeid is not null) as last_history_type,
+      max(ph.creationdate) as last_history_date,
+      sum(case when ph.posthistorytypeid in (5,2,24) then 1 else 0 end) as edit_count
+    from posthistory ph
+    where ph.creationdate > now() - interval '5 years'
+    group by ph.postid
+  ) ph on ph.postid = iset.id
+)
+select
+  fe.id,
+  fe.title,
+  fe.creationdate,
+  fe.reason,
+  array_to_string(fe.tag_array, ',') as tags,
+  fe.viewcount,
+  fe.score,
+  round(fe.hotness_score::numeric,6) as hotness_score,
+  fe.answer_count,
+  fe.recent_comment_count,
+  fe.upvote_count,
+  fe.downvote_count,
+  fe.edit_count,
+  fe.last_history_date,
+  fe.title_length,
+  round(coalesce(fe.uppercase_ratio,0)::numeric,4) as uppercase_ratio,
+  fe.has_question_mark,
+  -- complex composite ranking combining multiple normalized factors and null handling
+  round((
+    coalesce( (ln(coalesce(fe.viewcount,0)+1) / nullif( (select max(ln(coalesce(viewcount,0)+1)) from InterestingSet),0) ), 0) * 0.25
+    + coalesce( (fe.score::float / nullif((select max(abs(score)) from InterestingSet),0) ), 0) * 0.20
+    + coalesce( (fe.upvote_count::float / nullif((select max(upvote_count) from FinalEnriched),0) ), 0) * 0.15
+    + coalesce( (fe.edit_count::float / nullif((select max(edit_count) from FinalEnriched),0) ), 0) * 0.10
+    + coalesce( (fe.recent_comment_count::float / nullif((select max(recent_comment_count) from FinalEnriched),0) ), 0) * 0.10
+    + coalesce( (fe.hotness_score::float / nullif((select max(hotness_score) from FinalEnriched),0) ), 0) * 0.20
+  ),6) as composite_normalized_score
+from FinalEnriched fe
+order by composite_normalized_score desc nulls last, hotness_score desc
+limit 200;

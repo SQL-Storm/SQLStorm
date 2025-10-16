@@ -1,0 +1,98 @@
+WITH UserMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        SUM(p.Score) FILTER (WHERE p.PostTypeId = 2) AS TotalAnswerScore,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        MAX(CASE WHEN p.Id = q.AcceptedAnswerId THEN p.CreationDate ELSE NULL END) AS LastAcceptedAnswerDate
+    FROM
+        Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts q ON p.Id = q.AcceptedAnswerId
+    WHERE u.Reputation > 1000
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) > COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)
+),
+RankedPosts AS (
+    SELECT
+        p.OwnerUserId,
+        p.Id AS AnswerId,
+        p.Score AS AnswerScore,
+        p.CreationDate AS AnswerDate,
+        q.Id AS QuestionId,
+        q.Title AS QuestionTitle,
+        q.Tags AS QuestionTags,
+        q.ViewCount AS QuestionViewCount,
+        q.FavoriteCount AS QuestionFavoriteCount,
+        ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate ASC) AS AnswerRank,
+        SUM(p.Score) OVER(PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeScore,
+        LAG(p.Score, 1, 0) OVER(PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousAnswerScore
+    FROM
+        Posts p
+    INNER JOIN Posts q ON p.ParentId = q.Id
+    WHERE
+        p.PostTypeId = 2
+        AND p.OwnerUserId IS NOT NULL
+        AND q.ClosedDate IS NULL
+        AND q.DeletionDate IS NULL
+)
+SELECT
+    'Power User' AS UserType,
+    um.UserId,
+    um.DisplayName,
+    um.Reputation,
+    rp.QuestionTitle,
+    rp.AnswerScore,
+    (rp.AnswerScore * 1.0 / NULLIF(rp.QuestionViewCount, 0)) * (1 + um.GoldBadges * 0.1) AS WeightedImpactScore,
+    '<' || (string_to_array(substring(rp.QuestionTags FROM 2 FOR (length(rp.QuestionTags)-2)), '><'))[1] || '>' AS PrimaryTag,
+    rp.CumulativeScore,
+    EXTRACT(EPOCH FROM (rp.AnswerDate - um.UserCreationDate)) / 86400.0 AS DaysToTopAnswer,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = rp.AnswerId AND ph.PostHistoryTypeId IN (5, 8)) AS AnswerEditCount
+FROM
+    UserMetrics um
+JOIN
+    RankedPosts rp ON um.UserId = rp.OwnerUserId
+WHERE
+    um.Reputation > 50000
+    AND um.GoldBadges > 5
+    AND rp.AnswerRank <= 3
+    AND EXISTS (
+        SELECT 1
+        FROM Tags t
+        WHERE rp.QuestionTags LIKE '%' || t.TagName || '%' AND t.Count > 10000
+    )
+
+UNION ALL
+
+SELECT
+    'Niche Expert' AS UserType,
+    um.UserId,
+    um.DisplayName,
+    um.Reputation,
+    rp.QuestionTitle,
+    rp.AnswerScore,
+    (rp.AnswerScore * 1.0 / NULLIF(rp.QuestionViewCount, 0)) * (1 + um.GoldBadges * 0.1) AS WeightedImpactScore,
+    '<' || (string_to_array(substring(rp.QuestionTags FROM 2 FOR (length(rp.QuestionTags)-2)), '><'))[1] || '>' AS PrimaryTag,
+    rp.CumulativeScore,
+    EXTRACT(EPOCH FROM (rp.AnswerDate - um.UserCreationDate)) / 86400.0 AS DaysToTopAnswer,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = rp.AnswerId) AS AnswerCommentCount
+FROM
+    UserMetrics um
+JOIN
+    RankedPosts rp ON um.UserId = rp.OwnerUserId
+WHERE
+    um.Reputation BETWEEN 2000 AND 20000
+    AND rp.AnswerRank = 1
+    AND rp.AnswerScore > 100
+    AND rp.AnswerScore > (um.TotalAnswerScore / 2.0)
+    AND um.LastAcceptedAnswerDate IS NOT NULL
+ORDER BY
+    UserType, WeightedImpactScore DESC, Reputation DESC
+LIMIT 500;

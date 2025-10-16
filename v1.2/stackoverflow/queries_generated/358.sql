@@ -1,0 +1,303 @@
+-- {"query": "358.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2698} 
+with RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 as Level,
+        cast(t.TagName as varchar(1000)) as Path
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        r.Level + 1,
+        r.Path || ' > ' || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id = r.Id + 1
+    where r.Level < 3
+),
+UserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        coalesce(sum(vb.UpVotes),0) as TotalUpVotes,
+        coalesce(sum(vb.DownVotes),0) as TotalDownVotes,
+        coalesce(sum(b.Class),0) as BadgeScore,
+        max(p.CreationDate) as LastPostDate,
+        min(p.CreationDate) as FirstPostDate,
+        case when max(p.CreationDate) is not null and min(p.CreationDate) is not null 
+            then extract(day from max(p.CreationDate) - min(p.CreationDate)) 
+            else null end as ActiveDays
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select p.OwnerUserId, 
+            sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Posts p
+        left join Votes v on v.PostId = p.Id
+        group by p.OwnerUserId
+    ) vb on vb.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+PostDetails as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        pt.Name as PostTypeName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.Title,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.LastActivityDate,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc nulls last) as UserPostRank,
+        count(*) over (partition by p.OwnerUserId) as UserTotalPosts
+    from Posts p
+    left join PostTypes pt on pt.Id = p.PostTypeId
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId in (1,2)
+),
+AcceptedAnswerStats as (
+    select 
+        q.Id as QuestionId,
+        q.Title as QuestionTitle,
+        q.OwnerUserId as QuestionOwnerId,
+        q.Score as QuestionScore,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerOwnerId,
+        a.CreationDate as AnswerCreationDate,
+        u.DisplayName as AnswerOwnerName
+    from Posts q
+    join Posts a on a.Id = q.AcceptedAnswerId
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1 and q.AcceptedAnswerId is not null
+),
+CloseReasonCounts as (
+    select 
+        cht.Name as CloseReason,
+        count(distinct ph.PostId) as ClosedPostsCount
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId
+    left join CloseReasonTypes cht on cast(ph.Comment as int) = cht.Id
+    where ph.PostHistoryTypeId = 10
+    group by cht.Name
+),
+TopTagsByQuestions as (
+    select 
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as Tag,
+        count(*) as QuestionCount
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+    group by Tag
+    order by QuestionCount desc
+    limit 20
+),
+UserBadgeRanks as (
+    select 
+        b.UserId,
+        b.Name,
+        b.Class,
+        rank() over (partition by b.UserId order by b.Class) as BadgeRank
+    from Badges b
+),
+UserCommentActivity as (
+    select 
+        c.UserId,
+        u.DisplayName,
+        count(*) as CommentCount,
+        max(c.CreationDate) as LastCommentDate,
+        min(c.CreationDate) as FirstCommentDate,
+        count(distinct c.PostId) as DistinctPostsCommented
+    from Comments c
+    left join Users u on u.Id = c.UserId
+    where c.UserId is not null
+    group by c.UserId, u.DisplayName
+),
+FinalUserStats as (
+    select 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.TotalUpVotes,
+        ua.TotalDownVotes,
+        ua.BadgeScore,
+        ua.LastPostDate,
+        ua.FirstPostDate,
+        ua.ActiveDays,
+        coalesce(uca.CommentCount,0) as CommentCount,
+        coalesce(uca.DistinctPostsCommented,0) as DistinctPostsCommented,
+        coalesce(uca.LastCommentDate, timestamp '1970-01-01') as LastCommentDate,
+        coalesce(uca.FirstCommentDate, timestamp '1970-01-01') as FirstCommentDate,
+        (ua.TotalUpVotes - ua.TotalDownVotes) as NetVotes,
+        case when ua.QuestionCount > 0 then round(cast(ua.AnswerCount as numeric)/ua.QuestionCount,2) else null end as AnswerToQuestionRatio,
+        case when ua.ActiveDays > 0 then round(cast(ua.QuestionCount + ua.AnswerCount as numeric)/ua.ActiveDays,4) else null end as PostsPerDay,
+        (select count(*) from UserBadgeRanks ubr where ubr.UserId = ua.UserId and ubr.Class = 1) as GoldBadges,
+        (select count(*) from UserBadgeRanks ubr where ubr.UserId = ua.UserId and ubr.Class = 2) as SilverBadges,
+        (select count(*) from UserBadgeRanks ubr where ubr.UserId = ua.UserId and ubr.Class = 3) as BronzeBadges
+    from UserActivity ua
+    left join UserCommentActivity uca on uca.UserId = ua.UserId
+)
+select 
+    fus.UserId,
+    fus.DisplayName,
+    fus.Reputation,
+    fus.QuestionCount,
+    fus.AnswerCount,
+    fus.CommentCount,
+    fus.DistinctPostsCommented,
+    fus.TotalUpVotes,
+    fus.TotalDownVotes,
+    fus.NetVotes,
+    fus.BadgeScore,
+    fus.GoldBadges,
+    fus.SilverBadges,
+    fus.BronzeBadges,
+    fus.AnswerToQuestionRatio,
+    fus.PostsPerDay,
+    cr.CloseReason,
+    cr.ClosedPostsCount,
+    tt.Tag as PopularTag,
+    tt.QuestionCount as PopularTagQuestionCount,
+    ph.Id as PostHistoryId,
+    ph.PostId,
+    p.Title as PostTitle,
+    p.Score as PostScore,
+    p.ViewCount as PostViewCount,
+    p.Tags as PostTags,
+    p.PostTypeName,
+    ph.CreationDate as PostHistoryDate,
+    p.OwnerName,
+    ph.UserDisplayName as EditorName,
+    ph.Comment as PostHistoryComment,
+    ph.Text as PostHistoryText,
+    case 
+        when p.ClosedDate is not null then 'Closed'
+        when p.AcceptedAnswerId is not null then 'Answered'
+        else 'Open'
+    end as PostStatus,
+    dense_rank() over (partition by fus.UserId order by p.Score desc nulls last) as PostScoreRank,
+    lag(p.Score) over (partition by fus.UserId order by p.CreationDate) as PreviousPostScore,
+    lead(p.Score) over (partition by fus.UserId order by p.CreationDate) as NextPostScore
+from FinalUserStats fus
+left join CloseReasonCounts cr on cr.CloseReason is not null
+left join TopTagsByQuestions tt on true
+left join PostHistory ph on ph.UserId = fus.UserId
+left join Posts p on p.Id = ph.PostId
+where fus.Reputation > 1000
+  and (p.PostTypeName = 'Question' or p.PostTypeName = 'Answer')
+  and (ph.PostHistoryTypeId in (4,5,6,10,11,19,20) or ph.PostHistoryTypeId is null)
+union
+select 
+    fus.UserId,
+    fus.DisplayName,
+    fus.Reputation,
+    fus.QuestionCount,
+    fus.AnswerCount,
+    fus.CommentCount,
+    fus.DistinctPostsCommented,
+    fus.TotalUpVotes,
+    fus.TotalDownVotes,
+    fus.NetVotes,
+    fus.BadgeScore,
+    fus.GoldBadges,
+    fus.SilverBadges,
+    fus.BronzeBadges,
+    fus.AnswerToQuestionRatio,
+    fus.PostsPerDay,
+    null as CloseReason,
+    null as ClosedPostsCount,
+    null as PopularTag,
+    null as PopularTagQuestionCount,
+    null as PostHistoryId,
+    null as PostId,
+    null as PostTitle,
+    null as PostScore,
+    null as PostViewCount,
+    null as PostTags,
+    null as PostTypeName,
+    null as PostHistoryDate,
+    null as OwnerName,
+    null as EditorName,
+    null as PostHistoryComment,
+    null as PostHistoryText,
+    null as PostStatus,
+    null as PostScoreRank,
+    null as PreviousPostScore,
+    null as NextPostScore
+from FinalUserStats fus
+where fus.Reputation > 1000
+except
+select 
+    fus.UserId,
+    fus.DisplayName,
+    fus.Reputation,
+    fus.QuestionCount,
+    fus.AnswerCount,
+    fus.CommentCount,
+    fus.DistinctPostsCommented,
+    fus.TotalUpVotes,
+    fus.TotalDownVotes,
+    fus.NetVotes,
+    fus.BadgeScore,
+    fus.GoldBadges,
+    fus.SilverBadges,
+    fus.BronzeBadges,
+    fus.AnswerToQuestionRatio,
+    fus.PostsPerDay,
+    cr.CloseReason,
+    cr.ClosedPostsCount,
+    tt.Tag as PopularTag,
+    tt.QuestionCount as PopularTagQuestionCount,
+    ph.Id as PostHistoryId,
+    ph.PostId,
+    p.Title as PostTitle,
+    p.Score as PostScore,
+    p.ViewCount as PostViewCount,
+    p.Tags as PostTags,
+    p.PostTypeName,
+    ph.CreationDate as PostHistoryDate,
+    p.OwnerName,
+    ph.UserDisplayName as EditorName,
+    ph.Comment as PostHistoryComment,
+    ph.Text as PostHistoryText,
+    case 
+        when p.ClosedDate is not null then 'Closed'
+        when p.AcceptedAnswerId is not null then 'Answered'
+        else 'Open'
+    end as PostStatus,
+    dense_rank() over (partition by fus.UserId order by p.Score desc nulls last) as PostScoreRank,
+    lag(p.Score) over (partition by fus.UserId order by p.CreationDate) as PreviousPostScore,
+    lead(p.Score) over (partition by fus.UserId order by p.CreationDate) as NextPostScore
+from FinalUserStats fus
+left join CloseReasonCounts cr on cr.CloseReason is not null
+left join TopTagsByQuestions tt on true
+left join PostHistory ph on ph.UserId = fus.UserId
+left join Posts p on p.Id = ph.PostId
+where fus.Reputation > 1000
+  and (p.PostTypeName = 'Question' or p.PostTypeName = 'Answer')
+  and (ph.PostHistoryTypeId in (4,5,6,10,11,19,20) or ph.PostHistoryTypeId is null)
+order by Reputation desc, QuestionCount desc, AnswerCount desc, CommentCount desc, PostScore desc nulls last
+limit 100;

@@ -1,0 +1,208 @@
+-- {"query": "150.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.1, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1784} 
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount, 0) as AnswerCount,
+        coalesce(p.ViewCount, 0) as ViewCount,
+        coalesce(p.Score, 0) as Score,
+        row_number() over (partition by t.Id order by p.CreationDate desc nulls last) as rn
+    from Tags t
+    left join Posts p on p.Tags like concat('%<', t.TagName, '>%') and p.PostTypeId = 1
+),
+FilteredTags as (
+    select
+        Id,
+        TagName,
+        Count,
+        AnswerCount,
+        ViewCount,
+        Score
+    from RecursiveTagCounts
+    where rn = 1
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        sum(case when b.TagBased = 1 then 1 else 0 end) as TagBasedBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostVoteAggregates as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        count(v.Id) filter (where v.VoteTypeId = 2) as UpVotes,
+        count(v.Id) filter (where v.VoteTypeId = 3) as DownVotes,
+        count(v.Id) filter (where v.VoteTypeId = 5) as Favorites,
+        sum(v.BountyAmount) filter (where v.VoteTypeId in (8,9)) as TotalBounty
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    group by p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount
+),
+AnswerStats as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a
+    where a.PostTypeId = 2
+),
+QuestionWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId as QuestionOwner,
+        q.CreationDate as QuestionCreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        q.Tags,
+        a.AnswerId,
+        a.AnswerScore,
+        a.AnswerCreationDate,
+        a.AnswerRank
+    from Posts q
+    left join AnswerStats a on a.QuestionId = q.Id
+    where q.PostTypeId = 1
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(p.Id) filter (where p.PostTypeId = 1) over (partition by u.Id order by u.CreationDate rows between unbounded preceding and current row) as QuestionsPosted,
+        count(p.Id) filter (where p.PostTypeId = 2) over (partition by u.Id order by u.CreationDate rows between unbounded preceding and current row) as AnswersPosted,
+        sum(p.Score) filter (where p.PostTypeId in (1,2)) over (partition by u.Id order by u.CreationDate rows between unbounded preceding and current row) as TotalPostScore
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+),
+ClosedQuestionsWithReasons as (
+    select
+        ph.PostId,
+        ph.CreationDate as CloseDate,
+        crt.Name as CloseReason
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+),
+QuestionsWithDuplicates as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        dl.RelatedPostId as DuplicateOfQuestionId
+    from Posts q
+    left join DuplicateLinks dl on dl.PostId = q.Id
+    where q.PostTypeId = 1
+),
+FinalSelection as (
+    select
+        q.QuestionId,
+        q.Title,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        coalesce(cq.CloseReason, 'Open') as CloseStatus,
+        ua.DisplayName as QuestionOwnerName,
+        ua.Reputation as OwnerReputation,
+        ua.QuestionsPosted,
+        ua.AnswersPosted,
+        ua.TotalPostScore,
+        ftag.TagName,
+        ftag.Count as TagCount,
+        ftag.AnswerCount as TagAnswerCount,
+        ftag.ViewCount as TagViewCount,
+        ftag.Score as TagScore,
+        a.AnswerId,
+        a.AnswerScore,
+        a.AnswerRank,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.TagBasedBadges,
+        ub.LastBadgeDate,
+        pv.UpVotes,
+        pv.DownVotes,
+        pv.Favorites,
+        pv.TotalBounty,
+        dq.DuplicateOfQuestionId
+    from QuestionsWithDuplicates q
+    left join ClosedQuestionsWithReasons cq on cq.PostId = q.QuestionId
+    left join Users ua on ua.Id = q.QuestionOwner
+    left join FilteredTags ftag on q.Title ilike concat('%', ftag.TagName, '%')
+    left join AnswerStats a on a.QuestionId = q.QuestionId and a.AnswerRank = 1
+    left join UserBadgeStats ub on ub.UserId = ua.Id
+    left join PostVoteAggregates pv on pv.PostId = q.QuestionId
+    left join QuestionsWithDuplicates dq on dq.QuestionId = q.DuplicateOfQuestionId
+)
+select
+    fs.QuestionId,
+    fs.Title,
+    fs.QuestionScore,
+    fs.ViewCount,
+    fs.CloseStatus,
+    fs.QuestionOwnerName,
+    fs.OwnerReputation,
+    fs.QuestionsPosted,
+    fs.AnswersPosted,
+    fs.TotalPostScore,
+    fs.TagName,
+    fs.TagCount,
+    fs.TagAnswerCount,
+    fs.TagViewCount,
+    fs.TagScore,
+    fs.AnswerId,
+    fs.AnswerScore,
+    fs.AnswerRank,
+    fs.GoldBadges,
+    fs.SilverBadges,
+    fs.BronzeBadges,
+    fs.TagBasedBadges,
+    fs.LastBadgeDate,
+    fs.UpVotes,
+    fs.DownVotes,
+    fs.Favorites,
+    fs.TotalBounty,
+    case when fs.DuplicateOfQuestionId is not null then 'Yes' else 'No' end as IsDuplicate,
+    case
+        when fs.CloseStatus != 'Open' then 'Closed'
+        when fs.AnswerScore > fs.QuestionScore then 'Popular Answer'
+        else 'Normal'
+    end as PostStatus,
+    length(fs.Title) as TitleLength,
+    coalesce(nullif(fs.Title, ''), 'No Title') as TitleOrDefault,
+    substring(fs.Title from 1 for 10) as TitleSnippet,
+    fs.QuestionScore * 1.0 / nullif(fs.ViewCount, 0) as ScorePerView,
+    fs.OwnerReputation / nullif(fs.QuestionsPosted + 1, 0) as ReputationPerQuestion,
+    fs.AnswerScore - fs.QuestionScore as AnswerScoreDiff
+from FinalSelection fs
+where fs.QuestionScore > 5
+  and (fs.CloseStatus = 'Open' or fs.CloseStatus is null)
+  and fs.TagCount > 100
+order by fs.QuestionScore desc, fs.ViewCount desc
+limit 100;

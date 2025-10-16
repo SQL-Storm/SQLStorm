@@ -1,0 +1,151 @@
+with RecentTopPosts as (
+    select 
+        p.Id, p.PostTypeId, p.OwnerUserId, p.Score, p.ViewCount,
+        p.CreationDate, p.LastActivityDate, p.Title,
+        coalesce(u.DisplayName, '[deleted]') as OwnerName,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as rn,
+        p.AcceptedAnswerId
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - cast('1 year' as interval)
+      and p.Score > 10
+      and p.ViewCount > 1000
+), TopQuestionsWithAcceptedAnswers as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.OwnerName,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        a.Id as AcceptedAnswerId,
+        a.Score as AcceptedAnswerScore,
+        a.OwnerUserId as AnswerOwnerUserId,
+        coalesce(au.DisplayName, '[deleted]') as AnswerOwnerName
+    from RecentTopPosts q
+    left join Posts a on a.Id = q.AcceptedAnswerId and a.PostTypeId = 2
+    left join Users au on au.Id = a.OwnerUserId
+    where q.PostTypeId = 1
+      and q.rn <= 100
+), AnswerCounts as (
+    select 
+        ParentId as QuestionId,
+        count(*) as AnswerCount,
+        sum(case when Score > 0 then 1 else 0 end) as PositiveAnswers,
+        sum(case when Score <= 0 then 1 else 0 end) as NonPositiveAnswers
+    from Posts
+    where PostTypeId = 2
+    group by ParentId
+), UserBadgeCounts as (
+    select UserId,
+        sum(case when Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(*) as TotalBadges
+    from Badges
+    group by UserId
+), UserReputationStats as (
+    select 
+        u.Id,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        coalesce(b.GoldBadges,0) as GoldBadges,
+        coalesce(b.SilverBadges,0) as SilverBadges,
+        coalesce(b.BronzeBadges,0) as BronzeBadges,
+        coalesce(b.TotalBadges,0) as TotalBadges,
+        rank() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+    left join UserBadgeCounts b on b.UserId = u.Id
+), QuestionCloseReasons as (
+    select ph.PostId, crt.Name as CloseReasonName
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId and pht.Name = 'Post Closed'
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - cast('2 years' as interval)
+), QuestionTags as (
+    select 
+        p.Id as QuestionId, 
+        trim(tg) as Tag
+    from Posts p
+    cross join lateral unnest(string_to_array(substring(coalesce(p.Tags,''), 2, length(coalesce(p.Tags,'')) - 2), '><')) tg
+    where p.PostTypeId = 1 and p.Tags is not null
+), TagUsageStats as (
+    select Tag, count(*) as QuestionCount, avg(p.Score) as AvgScore, max(p.ViewCount) as MaxViewCount
+    from QuestionTags qt
+    join Posts p on p.Id = qt.QuestionId
+    group by Tag
+    having count(*) > 50
+), DuplicateLinks as (
+    select pl.PostId as DuplicateQuestionId, pl.RelatedPostId as OriginalQuestionId, pl.CreationDate as LinkDate
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+    where exists (
+        select 1 from Posts p where p.Id = pl.PostId and p.PostTypeId = 1
+    ) and exists (
+        select 1 from Posts p2 where p2.Id = pl.RelatedPostId and p2.PostTypeId = 1
+    )
+)
+select 
+    q.QuestionId,
+    q.Title,
+    q.OwnerName,
+    q.QuestionScore,
+    q.QuestionViews,
+    coalesce(ac.AnswerCount,0) as TotalAnswers,
+    coalesce(ac.PositiveAnswers,0) as PositiveAnswers,
+    coalesce(ac.NonPositiveAnswers,0) as NonPositiveAnswers,
+    q.AcceptedAnswerId,
+    q.AcceptedAnswerScore,
+    q.AnswerOwnerName,
+    coalesce(qcr.CloseReasonName, 'Open') as CloseStatus,
+    coalesce(tr.Tag, '[no tag]') as RandomTagSample,
+    tr.AvgScore as TagAvgQuestionScore,
+    tr.QuestionCount as TagQuestionCount,
+    us.ReputationRank,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.TotalBadges,
+    dup.OriginalQuestionId as DuplicateOf,
+    duplication.LinkDate as DuplicateLinkDate
+from TopQuestionsWithAcceptedAnswers q
+left join AnswerCounts ac on ac.QuestionId = q.QuestionId
+left join QuestionCloseReasons qcr on qcr.PostId = q.QuestionId
+left join lateral (
+    select Tag, AvgScore, QuestionCount
+    from TagUsageStats 
+    where Tag = (
+        select Tag from QuestionTags qt where qt.QuestionId = q.QuestionId limit 1
+    )
+    limit 1
+) tr on true
+left join UserReputationStats us on us.Id = q.OwnerUserId
+left join DuplicateLinks dup on dup.DuplicateQuestionId = q.QuestionId
+left join DuplicateLinks duplication on duplication.DuplicateQuestionId = q.QuestionId and duplication.OriginalQuestionId = dup.OriginalQuestionId
+where q.QuestionId is not null
+group by
+    q.QuestionId,
+    q.Title,
+    q.OwnerName,
+    q.QuestionScore,
+    q.QuestionViews,
+    ac.AnswerCount,
+    ac.PositiveAnswers,
+    ac.NonPositiveAnswers,
+    q.AcceptedAnswerId,
+    q.AcceptedAnswerScore,
+    q.AnswerOwnerName,
+    qcr.CloseReasonName,
+    tr.Tag,
+    tr.AvgScore,
+    tr.QuestionCount,
+    us.ReputationRank,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.TotalBadges,
+    dup.OriginalQuestionId,
+    duplication.LinkDate
+order by q.QuestionScore desc, q.QuestionViews desc
+limit 50;

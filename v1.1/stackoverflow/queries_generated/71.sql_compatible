@@ -1,0 +1,14 @@
+WITH ranked_users AS (
+    SELECT Id, Reputation, ROW_NUMBER() OVER (ORDER BY Reputation DESC) AS rn
+    FROM Users
+),
+top_users AS (
+    SELECT Id, Reputation
+    FROM ranked_users
+    WHERE rn <= 100
+)
+SELECT u.Id, u.DisplayName, u.Reputation, COUNT(DISTINCT p.Id) AS num_posts
+FROM top_users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.Score >= 10
+GROUP BY u.Id, u.DisplayName, u.Reputation
+ORDER BY num_posts DESC;

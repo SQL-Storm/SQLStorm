@@ -1,0 +1,110 @@
+WITH UserBadgeStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END), 0) AS GoldBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END), 0) AS SilverBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END), 0) AS BronzeBadges,
+        COUNT(b.Id) AS TotalBadges
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostStats AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) AS AvgQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN COALESCE(p.AnswerCount, 0) ELSE 0 END) AS TotalAnswersReceived,
+        MAX(LENGTH(p.Body)) AS MaxBodyLength
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+RankedUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Location,
+        u.Reputation,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS GlobalRank,
+        DENSE_RANK() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC) AS LocationRank,
+        ubs.GoldBadges,
+        ubs.SilverBadges,
+        ubs.BronzeBadges,
+        ubs.TotalBadges,
+        COALESCE(ps.QuestionCount, 0) AS QuestionCount,
+        COALESCE(ps.AnswerCount, 0) AS AnswerCount,
+        COALESCE(ps.AvgQuestionScore, 0) AS AvgQuestionScore,
+        COALESCE(ps.TotalAnswersReceived, 0) AS TotalAnswersReceived,
+        COALESCE(ps.MaxBodyLength, 0) AS MaxBodyLength
+    FROM Users u
+    LEFT JOIN UserBadgeStats ubs ON u.Id = ubs.Id
+    LEFT JOIN PostStats ps ON u.Id = ps.OwnerUserId
+)
+SELECT 
+    ru.Id,
+    ru.DisplayName,
+    COALESCE(SUBSTRING(ru.Location FROM 1 FOR 20), 'Unknown') AS ShortLocation,
+    ru.Reputation,
+    ru.GlobalRank,
+    ru.LocationRank,
+    ru.GoldBadges,
+    ru.SilverBadges,
+    ru.BronzeBadges,
+    ru.TotalBadges,
+    ru.QuestionCount,
+    ru.AnswerCount,
+    ru.AvgQuestionScore,
+    ru.TotalAnswersReceived,
+    ru.MaxBodyLength,
+    CASE 
+        WHEN ru.TotalBadges > 10 AND ru.Reputation > 50000 THEN 'Elite'
+        WHEN ru.TotalBadges BETWEEN 5 AND 10 AND ru.Reputation > 10000 THEN 'Advanced'
+        WHEN ru.Reputation > 1000 OR ru.TotalBadges > 0 THEN 'Active'
+        ELSE 'Novice'
+    END AS UserTier,
+    (
+     SELECT AVG(v.Score) 
+     FROM Comments v 
+     WHERE v.PostId IN (
+         SELECT p.Id FROM Posts p WHERE p.OwnerUserId = ru.Id
+     )
+     AND v.Score IS NOT NULL
+    ) AS AvgCommentScoreOnUserPosts
+FROM RankedUsers ru
+WHERE ru.GlobalRank <= 100
+    AND ru.QuestionCount > (SELECT AVG(QuestionCount) FROM PostStats)
+    AND ru.Reputation IS NOT NULL
+UNION ALL
+SELECT 
+    NULL AS Id,
+    'Summary' AS DisplayName,
+    NULL AS ShortLocation,
+    SUM(ru.Reputation) AS Reputation,
+    NULL AS GlobalRank,
+    NULL AS LocationRank,
+    SUM(ru.GoldBadges) AS GoldBadges,
+    SUM(ru.SilverBadges) AS SilverBadges,
+    SUM(ru.BronzeBadges) AS BronzeBadges,
+    SUM(ru.TotalBadges) AS TotalBadges,
+    SUM(ru.QuestionCount) AS QuestionCount,
+    SUM(ru.AnswerCount) AS AnswerCount,
+    AVG(ru.AvgQuestionScore) AS AvgQuestionScore,
+    SUM(ru.TotalAnswersReceived) AS TotalAnswersReceived,
+    MAX(ru.MaxBodyLength) AS MaxBodyLength,
+    'Summary' AS UserTier,
+    AVG((
+     SELECT AVG(v2.Score)
+     FROM Comments v2
+     WHERE v2.PostId IN (
+         SELECT p2.Id FROM Posts p2 WHERE p2.OwnerUserId = ru.Id
+     )
+     AND v2.Score IS NOT NULL
+    )) AS AvgCommentScoreOnUserPosts
+FROM RankedUsers ru
+WHERE ru.GlobalRank <= 100
+    AND ru.QuestionCount > (SELECT AVG(QuestionCount) FROM PostStats)
+    AND ru.Reputation IS NOT NULL;

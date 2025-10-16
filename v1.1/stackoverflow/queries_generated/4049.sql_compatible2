@@ -1,0 +1,109 @@
+with recursive RecursivePosts as (
+  select Id, PostTypeId, ParentId, CreationDate, Score, OwnerUserId, Tags, 1 as depth
+  from Posts
+  where PostTypeId = 1 and Tags is not null and Tags like '%<sql>%'
+  union all
+  select p.Id, p.PostTypeId, p.ParentId, p.CreationDate, p.Score, p.OwnerUserId, p.Tags, rp.depth + 1
+  from Posts p
+  inner join RecursivePosts rp on p.ParentId = rp.Id and rp.depth < 3
+),
+UserBadgeCounts as (
+  select UserId, 
+    sum(case when Class = 1 then 1 else 0 end) as GoldBadges,
+    sum(case when Class = 2 then 1 else 0 end) as SilverBadges,
+    sum(case when Class = 3 then 1 else 0 end) as BronzeBadges
+  from Badges
+  group by UserId
+),
+LatestPostHistories as (
+  select ph.PostId, ph.PostHistoryTypeId, ph.CreationDate,
+    row_number() over (partition by ph.PostId, ph.PostHistoryTypeId order by ph.CreationDate desc) as rn
+  from PostHistory ph
+  where ph.PostHistoryTypeId in (4,5,6)
+),
+FilteredHistories as (
+  select PostId, PostHistoryTypeId, CreationDate
+  from LatestPostHistories
+  where rn = 1
+),
+UserActivity as (
+  select u.Id, u.DisplayName, count(distinct p.Id) as TotalPosts,
+    count(distinct case when p.PostTypeId = 1 then p.Id end) as Questions,
+    count(distinct case when p.PostTypeId = 2 then p.Id end) as Answers,
+    count(distinct c.Id) as CommentsMade,
+    coalesce(ub.GoldBadges,0) as GoldBadges,
+    coalesce(ub.SilverBadges,0) as SilverBadges,
+    coalesce(ub.BronzeBadges,0) as BronzeBadges,
+    row_number() over (order by u.Reputation desc) as ReputationRank
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  left join Comments c on c.UserId = u.Id
+  left join UserBadgeCounts ub on ub.UserId = u.Id
+  group by u.Id, u.DisplayName, u.Reputation, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges
+),
+QuestionsWithAcceptedAnswerInfo as (
+  select q.Id, q.Title, q.OwnerUserId, q.AcceptedAnswerId, q.Score as QuestionScore, a.Score as AnswerScore, q.ViewCount,
+    case when q.Score is null or q.Score = 0 then null else 1.0 * coalesce(a.Score,0) / q.Score end as AnswerToQuestionScoreRatio,
+    -- convert tags like <tag1><tag2> to array ['tag1','tag2']
+    regexp_split_to_array(substring(q.Tags from 2 for (length(q.Tags) - 2)), '><') as TagArray
+  from Posts q
+  left join Posts a on q.AcceptedAnswerId = a.Id
+  where q.PostTypeId = 1
+),
+QuestionsWithVotes as (
+  select q.Id, 
+    count(case when v.VoteTypeId = 2 then 1 end) as UpVotes,
+    count(case when v.VoteTypeId = 3 then 1 end) as DownVotes,
+    count(case when v.VoteTypeId = 8 then 1 end) as BountyStarts,
+    count(case when v.VoteTypeId = 9 then 1 end) as BountyEnds
+  from Posts q
+  left join Votes v on v.PostId = q.Id
+  where q.PostTypeId = 1
+  group by q.Id
+),
+CombinedQuestions as (
+  select q.Id, q.Title, q.OwnerUserId, q.AcceptedAnswerId, q.QuestionScore, q.AnswerScore, q.ViewCount, q.AnswerToQuestionScoreRatio, q.TagArray,
+         coalesce(v.UpVotes,0) as UpVotes, coalesce(v.DownVotes,0) as DownVotes, coalesce(v.BountyStarts,0) as BountyStarts, coalesce(v.BountyEnds,0) as BountyEnds
+  from QuestionsWithAcceptedAnswerInfo q
+  left join QuestionsWithVotes v on v.Id = q.Id
+),
+TopContributors as (
+  select ua.Id, ua.DisplayName, ua.TotalPosts, ua.Questions, ua.Answers, ua.GoldBadges, ua.SilverBadges, ua.BronzeBadges, ua.ReputationRank
+  from UserActivity ua
+  where ua.TotalPosts > 100 and ua.ReputationRank <= 50
+)
+select 
+  c.Id as QuestionId,
+  c.Title,
+  c.OwnerUserId,
+  u.DisplayName as OwnerName,
+  c.QuestionScore,
+  c.AnswerScore,
+  c.AnswerToQuestionScoreRatio,
+  c.ViewCount,
+  c.UpVotes, c.DownVotes, c.BountyStarts, c.BountyEnds,
+  array_to_string(c.TagArray, ',') as Tags,
+  (select count(*) from Comments cm where cm.PostId = c.Id) as CommentCount,
+  (select count(*) from RecursivePosts rp where rp.Id = c.Id or rp.ParentId = c.Id) as RecursiveAnswerCount,
+  coalesce(tb.GoldBadges,0) as GoldBadges, coalesce(tb.SilverBadges,0) as SilverBadges, coalesce(tb.BronzeBadges,0) as BronzeBadges,
+  coalesce(ta.TotalPosts,0) as TotalPosts, coalesce(ta.Questions,0) as UserQuestions, coalesce(ta.Answers,0) as UserAnswers,
+  rank() over (order by c.QuestionScore desc) as QuestionScoreRank
+from CombinedQuestions c
+left join Users u on u.Id = c.OwnerUserId
+left join TopContributors ta on ta.Id = u.Id
+left join UserBadgeCounts tb on tb.UserId = u.Id
+where c.AnswerToQuestionScoreRatio is not null
+  and (c.UpVotes > 5 or c.BountyStarts > 0)
+  and (
+    lower(u.Location) like '%united%' 
+    or upper(u.DisplayName) like '%DEV%'
+    or u.Reputation > 10000
+  )
+group by
+  c.Id, c.Title, c.OwnerUserId, u.DisplayName, c.QuestionScore, c.AnswerScore, c.AnswerToQuestionScoreRatio, c.ViewCount,
+  c.UpVotes, c.DownVotes, c.BountyStarts, c.BountyEnds, c.TagArray,
+  tb.GoldBadges, tb.SilverBadges, tb.BronzeBadges,
+  ta.TotalPosts, ta.Questions, ta.Answers, u.Location, u.Reputation,
+  u.Id, ta.Id
+order by QuestionScoreRank asc
+limit 100;

@@ -1,0 +1,103 @@
+WITH PostAnswers AS (
+    SELECT p.Id AS QuestionId, a.Id AS AnswerId, a.Score AS AnswerScore
+    FROM Posts p
+    LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    WHERE p.PostTypeId = 1
+),
+AnswerVotes AS (
+    SELECT pa.QuestionId, COUNT(v.Id) AS UpvoteCount, SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes, SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes
+    FROM PostAnswers pa
+    LEFT JOIN Votes v ON v.PostId = pa.AnswerId
+    GROUP BY pa.QuestionId
+),
+QuestionStats AS (
+    SELECT p.Id AS QuestionId, p.Title, p.Tags, p.CreationDate,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(DISTINCT v.UserId) AS UniqueVoters,
+        AVG(CASE WHEN v.VoteTypeId = 2 THEN 1.0 ELSE 0 END) AS AvgUpvoteRatio,
+        MAX(p.Score) AS MaxScore,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS HasAcceptedAnswer
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.Tags, p.CreationDate
+),
+RecentQuestionActivity AS (
+    SELECT p.Id AS QuestionId, MAX(a.LastActivityDate) AS LastActivity
+    FROM Posts p
+    LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id
+),
+TagAnalysis AS (
+    SELECT t.TagName, COUNT(t.Id) AS QuestionsWithTag, AVG(t.AnswerCount) AS AvgAnswersPerQuestion, MAX(t.ViewCount) AS MaxViews
+    FROM (
+        SELECT p.Id, unnest(string_to_array(substring(p.Tags FROM 2 FOR (char_length(p.Tags)-2)), '><')) AS TagName, p.AnswerCount, p.ViewCount
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+    ) t
+    GROUP BY t.TagName
+),
+UserBadgeCounts AS (
+    SELECT u.Id AS UserId, COUNT(b.Id) AS BadgeCount, COUNT(DISTINCT b.Name) AS UniqueBadgeNames
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id
+),
+TopActiveUsers AS (
+    SELECT u.Id AS UserId, u.DisplayName, u.Reputation,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Views DESC) AS ReputationalRank
+    FROM Users u
+),
+ComplexPredicateQuestions AS (
+    SELECT p.Id, p.Title, p.Score,
+        CASE WHEN p.AcceptedAnswerId IS NULL THEN 'No Accepted Answer'
+             WHEN p.Score > 10 THEN 'High Scoring'
+             ELSE 'Low Scoring'
+        END AS ScoreCategory,
+        string_to_array(substring(p.Tags FROM 2 FOR (char_length(p.Tags) - 2)), '><') AS TagArray,
+        (SELECT COUNT(*) FROM Posts ch WHERE ch.ParentId = p.Id AND ch.PostTypeId = 2) AS AnswerCount,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 0) AS PositiveComments,
+        NULLIF(p.Body, '') AS ContentBody,
+        CASE WHEN p.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months' THEN TRUE ELSE FALSE END AS IsRecent
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+FinalResults AS (
+    SELECT
+        pa.QuestionId,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        COALESCE(av.UpvoteCount, 0) AS TotalUpvotes,
+        COALESCE(av.Upvotes, 0) AS UpvoteCount,
+        COALESCE(av.Downvotes, 0) AS DownvoteCount,
+        aq.CommentCount,
+        us.BadgeCount,
+        us.UniqueBadgeNames,
+        tr.LastActivity,
+        ta.QuestionsWithTag,
+        ta.AvgAnswersPerQuestion,
+        ta.MaxViews,
+        tu.ReputationalRank,
+        cpc.Score,
+        cpc.ScoreCategory,
+        cpc.AnswerCount,
+        cpc.PositiveComments,
+        cpc.ContentBody,
+        cpc.IsRecent
+    FROM PostAnswers pa
+    LEFT JOIN Posts p ON p.Id = pa.QuestionId
+    LEFT JOIN AnswerVotes av ON av.QuestionId = pa.QuestionId
+    LEFT JOIN QuestionStats aq ON aq.QuestionId = pa.QuestionId
+    LEFT JOIN RecentQuestionActivity tr ON tr.QuestionId = pa.QuestionId
+    LEFT JOIN TagAnalysis ta ON ta.TagName = ANY(string_to_array(substring(p.Tags FROM 2 FOR (char_length(p.Tags) - 2)), '><'))
+    LEFT JOIN UserBadgeCounts us ON us.UserId = p.OwnerUserId
+    LEFT JOIN TopActiveUsers tu ON tu.UserId = p.OwnerUserId
+    LEFT JOIN ComplexPredicateQuestions cpc ON cpc.Id = p.Id
+)
+SELECT *
+FROM FinalResults
+WHERE TotalUpvotes > 50 AND DownvoteCount < 10
+ORDER BY ReputationalRank ASC NULLS LAST, LastActivity DESC;

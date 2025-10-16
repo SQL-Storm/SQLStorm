@@ -1,0 +1,167 @@
+-- {"query": "225.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 4852} 
+WITH
+recent_q AS (
+  SELECT p.*
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= (now() - INTERVAL '365 days')
+  ORDER BY p.CreationDate DESC
+  LIMIT 1000
+),
+exploded_tags AS (
+  SELECT q.Id AS QuestionId,
+         trim(t) AS tag
+  FROM recent_q q
+  CROSS JOIN LATERAL regexp_split_to_table(
+    substring(coalesce(q.Tags, ''), 2, greatest(coalesce(length(q.Tags),0) - 2, 0)),
+    '><'
+  ) t
+),
+top_users AS (
+  SELECT u.Id,
+         u.DisplayName,
+         u.Reputation,
+         COUNT(b.Id) AS badge_count,
+         SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id
+),
+answer_stats AS (
+  SELECT a.ParentId AS QuestionId,
+         COUNT(*) FILTER (WHERE a.PostTypeId = 2) AS answers,
+         AVG(a.Score) FILTER (WHERE a.PostTypeId = 2) AS avg_answer_score,
+         MAX(CASE WHEN a.Id = (SELECT p.AcceptedAnswerId FROM Posts p WHERE p.Id = a.ParentId) THEN 1 ELSE 0 END) AS has_accepted,
+         MAX(a.Score) AS top_answer_score,
+         (SELECT p2.Id FROM Posts p2 WHERE p2.ParentId = a.ParentId ORDER BY p2.Score DESC NULLS LAST LIMIT 1) AS top_answer_id
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+  GROUP BY a.ParentId
+),
+vote_agg AS (
+  SELECT v.PostId,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+         SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS favorites
+  FROM Votes v
+  GROUP BY v.PostId
+),
+history_agg AS (
+  SELECT ph.PostId,
+         COUNT(*) AS history_count,
+         SUM(CASE WHEN ph.PostHistoryTypeId IN (4,5,6,7,8,9) THEN 1 ELSE 0 END) AS edits,
+         SUM(CASE WHEN ph.PostHistoryTypeId IN (10,11) THEN 1 ELSE 0 END) AS close_reopen_actions
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+comment_agg AS (
+  SELECT c.PostId,
+         COUNT(*) AS comments,
+         MAX(c.Score) AS max_comment_score,
+         (array_agg(c.UserId ORDER BY c.Score DESC NULLS LAST))[1] AS top_commenter
+  FROM Comments c
+  GROUP BY c.PostId
+),
+question_ranking_prep AS (
+  SELECT q.Id AS QuestionId,
+         q.Title,
+         q.CreationDate,
+         q.Score AS qscore,
+         q.ViewCount,
+         q.AnswerCount,
+         COALESCE(v.upvotes,0) AS upvotes,
+         COALESCE(v.downvotes,0) AS downvotes,
+         COALESCE(a.answers,0) AS answers_count,
+         COALESCE(a.avg_answer_score,0) AS avg_answer_score,
+         COALESCE(h.edits,0) AS edits,
+         ROUND(
+           (COALESCE(q.Score,0) * 1.5) +
+           (LOG(1+COALESCE(q.ViewCount,0)) * 0.8) +
+           (COALESCE(a.answers,0) * 2) +
+           (COALESCE(v.upvotes,0) - COALESCE(v.downvotes,0)) * 0.3 +
+           (COALESCE(c.comments,0) * 0.2) -
+           (COALESCE(h.close_reopen_actions,0) * 1.5)
+         , 4) AS composite_score,
+         q.OwnerUserId,
+         q.Tags,
+         q.Body,
+         COALESCE(c.comments,0) AS comments
+  FROM recent_q q
+  LEFT JOIN answer_stats a ON a.QuestionId = q.Id
+  LEFT JOIN vote_agg v ON v.PostId = q.Id
+  LEFT JOIN history_agg h ON h.PostId = q.Id
+  LEFT JOIN comment_agg c ON c.PostId = q.Id
+),
+ranked_questions AS (
+  SELECT qr.*,
+         row_number() OVER (ORDER BY qr.composite_score DESC NULLS LAST) AS score_rank,
+         dense_rank() OVER (PARTITION BY substring(coalesce(qr.Tags,'' ) FROM 2 FOR 30) ORDER BY qr.composite_score DESC) AS tag_dense_rank
+  FROM question_ranking_prep qr
+),
+tag_popularity AS (
+  SELECT tag,
+         count(distinct QuestionId) AS questions,
+         avg(qr.composite_score) AS avg_score
+  FROM exploded_tags et
+  JOIN question_ranking_prep qr ON qr.QuestionId = et.QuestionId
+  GROUP BY tag
+  HAVING count(distinct QuestionId) > 3
+  ORDER BY questions DESC
+),
+combined_set AS (
+  SELECT rq.* FROM ranked_questions rq WHERE rq.score_rank <= 200
+  UNION
+  SELECT rq.* FROM ranked_questions rq JOIN exploded_tags et ON et.QuestionId = rq.QuestionId WHERE et.tag = 'sql'
+),
+filtered_set AS (
+  SELECT * FROM combined_set
+  EXCEPT
+  SELECT * FROM ranked_questions WHERE lower(title) LIKE '%duplicate%' OR answers_count = 0
+),
+final_prep AS (
+  SELECT fs.*,
+         (SELECT count(distinct p2.OwnerUserId) FROM Posts p2 WHERE p2.OwnerUserId = fs.OwnerUserId AND p2.PostTypeId = 1) AS owner_question_count,
+         (SELECT count(*) FROM Badges b2 WHERE b2.UserId = fs.OwnerUserId AND b2.Class = 1) AS owner_gold_badges,
+         (SELECT string_agg(distinct t.tag, ',' ORDER BY t.tag) FROM exploded_tags t WHERE t.QuestionId = fs.QuestionId) AS tag_list,
+         (regexp_matches(coalesce(fs.Body,''), '(<pre.*?>.*?</pre>)','is')) AS code_block_matches,
+         length(coalesce(fs.Body,'')) AS body_len,
+         CASE WHEN position('<a ' IN coalesce(fs.Body,'')) > 0 THEN true ELSE false END AS has_link,
+         (SELECT count(*) FROM Comments cc WHERE cc.PostId = fs.QuestionId AND cc.UserId IS NULL) AS anon_comments
+  FROM filtered_set fs
+),
+final_ranked AS (
+  SELECT fp.*,
+         row_number() OVER (PARTITION BY owner_userid ORDER BY composite_score DESC) AS per_owner_rank,
+         ntile(10) OVER (ORDER BY composite_score DESC) AS decile
+  FROM final_prep fp
+)
+SELECT fr.QuestionId,
+       fr.Title,
+       coalesce(fr.tag_list,'') AS tags,
+       fr.composite_score,
+       fr.score_rank,
+       fr.per_owner_rank,
+       fr.decile,
+       fr.answers_count,
+       fr.avg_answer_score,
+       fr.upvotes,
+       fr.downvotes,
+       fr.comments AS comment_count,
+       fr.edits,
+       fr.owner_question_count,
+       fr.owner_gold_badges,
+       coalesce((SELECT DisplayName FROM Users u WHERE u.Id = fr.OwnerUserId), 'community') AS owner_name,
+       coalesce((SELECT count(*) FROM Votes v2 WHERE v2.PostId = fr.QuestionId AND v2.VoteTypeId = 5),0) AS favorite_count,
+       coalesce((SELECT sum(CASE WHEN v3.VoteTypeId = 2 THEN 1 WHEN v3.VoteTypeId = 3 THEN -1 ELSE 0 END) FROM Votes v3 WHERE v3.PostId = fr.QuestionId),0) AS vote_net,
+       CASE WHEN fr.has_link THEN 'links' ELSE 'nolink' END AS link_flag,
+       fr.body_len,
+       coalesce((SELECT string_agg(distinct tp.tag,',' ORDER BY tp.tag)
+                 FROM tag_popularity tp
+                 JOIN exploded_tags et ON et.tag = tp.tag
+                 WHERE et.QuestionId = fr.QuestionId), '') AS popular_tags_shared,
+       (SELECT count(*) FROM Posts p WHERE p.PostTypeId = 2 AND p.ParentId = fr.QuestionId AND p.Score >= COALESCE(fr.avg_answer_score,0)) AS answers_at_or_above_avg,
+       (SELECT count(*) FROM PostHistory ph2 WHERE ph2.PostId = fr.QuestionId AND ph2.PostHistoryTypeId = 10) AS close_events,
+       (SELECT u.Reputation FROM Users u WHERE u.Id = fr.OwnerUserId) AS owner_reputation
+FROM final_ranked fr
+ORDER BY fr.composite_score DESC, fr.score_rank
+LIMIT 250;

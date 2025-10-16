@@ -1,0 +1,99 @@
+-- {"query": "25007.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2850} 
+
+/*  Comprehensive benchmark query using CTEs, outer joins, correlated subqueries,
+    window functions, set operators, string manipulation and NULL logic           */
+WITH UserStats AS
+(
+    SELECT  u.Id,
+            u.DisplayName,
+            ISNULL(u.Reputation,0)                                   AS Reputation,
+            SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)            AS GoldBadges,
+            SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END)            AS SilverBadges,
+            SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END)            AS BronzeBadges,
+            SUM(ISNULL(p.Score,0))                                  AS TotalScore,
+            AVG(CAST(p.Score AS FLOAT))                             AS AvgScore,
+            MAX(p.CreationDate)                                     AS LastPostDate,
+            SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END)       AS QuestionCount,
+            SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END)       AS AnswerCount
+    FROM    Users u
+    LEFT JOIN Badges   b ON b.UserId = u.Id
+    LEFT JOIN Posts    p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopTags AS
+(
+    SELECT  t.TagName,
+            COUNT(*)                                                AS UsageCount,
+            ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC)             AS rn
+    FROM    Tags t
+    LEFT JOIN PostLinks pl 
+           ON pl.RelatedPostId = t.ExcerptPostId 
+          OR pl.RelatedPostId = t.WikiPostId
+    GROUP BY t.TagName
+),
+UserRecentActivity AS
+(
+    SELECT  u.Id,
+            MAX(v.CreationDate)                                    AS LastVoteDate,
+            MAX(c.CreationDate)                                    AS LastCommentDate,
+            MAX(ph.CreationDate)                                   AS LastHistoryDate
+    FROM    Users u
+    LEFT JOIN Votes        v  ON v.UserId = u.Id
+    LEFT JOIN Comments     c  ON c.UserId = u.Id
+    LEFT JOIN PostHistory  ph ON ph.UserId = u.Id
+    GROUP BY u.Id
+),
+Combined AS
+(
+    SELECT  us.Id,
+            us.DisplayName,
+            us.Reputation,
+            us.GoldBadges,
+            us.SilverBadges,
+            us.BronzeBadges,
+            us.TotalScore,
+            us.AvgScore,
+            us.QuestionCount,
+            us.AnswerCount,
+            COALESCE(ura.LastVoteDate, ura.LastCommentDate, ura.LastHistoryDate) AS LastActivity,
+            /*  correlated sub‑query: distinct tags a user has used in questions   */
+            (SELECT COUNT(DISTINCT t.TagName)
+               FROM Posts q
+               CROSS APPLY (SELECT REPLACE(REPLACE(value, '>', ''), '<', '') AS tag
+                              FROM STRING_SPLIT(q.Tags, '<')) AS s(tag)
+               JOIN Tags t ON t.TagName = s.tag
+              WHERE q.OwnerUserId = us.Id AND q.PostTypeId = 1)               AS DistinctTagCount,
+            /*  aggregate top 5 tags across the whole site                     */
+            (SELECT STRING_AGG(tt.TagName, ', ') WITHIN GROUP (ORDER BY tt.rn)
+               FROM TopTags tt
+              WHERE tt.rn <= 5)                                            AS Top5Tags
+    FROM    UserStats          us
+    LEFT JOIN UserRecentActivity ura ON ura.Id = us.Id
+    WHERE (us.GoldBadges > 0 OR us.SilverBadges > 0)
+      AND us.Reputation > 1000
+      AND us.AvgScore IS NOT NULL
+      AND (us.QuestionCount + us.AnswerCount) >= 10
+)
+SELECT  *
+FROM    Combined
+WHERE   LastActivity >= DATEADD(day, -30, SYSDATETIME())
+ORDER BY Reputation DESC, GoldBadges DESC, AvgScore DESC
+OFFSET 0 ROWS FETCH NEXT 50 ROWS ONLY
+
+UNION ALL
+
+/*  dummy row to force a set‑operator branch and test UNION ALL handling   */
+SELECT  CAST(NULL AS INT)        AS Id,
+        '---'                     AS DisplayName,
+        NULL                      AS Reputation,
+        NULL                      AS GoldBadges,
+        NULL                      AS SilverBadges,
+        NULL                      AS BronzeBadges,
+        NULL                      AS TotalScore,
+        NULL                      AS AvgScore,
+        NULL                      AS QuestionCount,
+        NULL                      AS AnswerCount,
+        NULL                      AS LastActivity,
+        NULL                      AS DistinctTagCount,
+        NULL                      AS Top5Tags
+WHERE   EXISTS (SELECT 1);

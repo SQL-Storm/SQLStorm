@@ -1,0 +1,65 @@
+WITH UserActivity AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 1000 AND p.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+    GROUP BY u.Id, u.DisplayName
+),
+TopTagsRanked AS (
+    SELECT 
+        t.OwnerUserId,
+        t.tag AS Tag,
+        t.TagCount,
+        ROW_NUMBER() OVER (PARTITION BY t.OwnerUserId ORDER BY t.TagCount DESC) AS rn
+    FROM (
+        SELECT 
+            p.OwnerUserId,
+            UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)), '><')) AS tag,
+            COUNT(*) AS TagCount
+        FROM Posts p
+        WHERE p.Tags IS NOT NULL AND p.PostTypeId = 1
+        GROUP BY p.OwnerUserId, tag
+    ) t
+),
+TopTags AS (
+    SELECT OwnerUserId, Tag, TagCount
+    FROM TopTagsRanked
+    WHERE rn <= 5
+),
+EditedPosts AS (
+    SELECT 
+        ph.UserId,
+        COUNT(*) AS TotalEdits
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+    GROUP BY ph.UserId
+)
+SELECT
+    ua.Id,
+    ua.DisplayName,
+    ua.TotalPosts,
+    ua.TotalQuestions,
+    ua.TotalAnswers,
+    ua.TotalScore,
+    ua.AvgScore,
+    ua.LastPostDate,
+    COALESCE(
+      JSON_AGG(tt.Tag ORDER BY tt.Tag) FILTER (WHERE tt.Tag IS NOT NULL),
+      JSON_ARRAY()
+    ) AS TopFiveTags,
+    COALESCE(ep.TotalEdits, 0) AS TotalEdits,
+    RANK() OVER (ORDER BY ua.TotalScore DESC, ua.TotalPosts DESC) AS UserRank
+FROM UserActivity ua
+LEFT JOIN TopTags tt ON ua.Id = tt.OwnerUserId
+LEFT JOIN EditedPosts ep ON ua.Id = ep.UserId
+GROUP BY ua.Id, ua.DisplayName, ua.TotalPosts, ua.TotalQuestions, ua.TotalAnswers, ua.TotalScore, ua.AvgScore, ua.LastPostDate, ep.TotalEdits
+ORDER BY UserRank
+LIMIT 100;

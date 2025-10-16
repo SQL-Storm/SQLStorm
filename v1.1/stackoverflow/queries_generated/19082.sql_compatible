@@ -1,0 +1,233 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsCount,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersCount,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(P.ViewCount), 0) AS TotalPostViews,
+        COALESCE(SUM(P.FavoriteCount), 0) AS TotalFavorites,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COALESCE(SUM(C.Score), 0) AS TotalCommentScore,
+        AVG(CAST(LENGTH(C.Text) AS NUMERIC)) FILTER (WHERE C.Text IS NOT NULL) AS AvgCommentLength,
+        MAX(P.CreationDate) AS LastPostDate,
+        MIN(P.CreationDate) AS FirstPostDate,
+        -- Calculate average gap in seconds between consecutive posts per user, then convert to days.
+        COALESCE(AVG(PostGapSeconds), 0) / 86400.0 AS AvgPostGapDays
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN (
+        -- compute gaps per post row without using FILTER over a window directly in aggregate
+        SELECT
+            OwnerUserId,
+            Id AS PostId,
+            CreationDate,
+            LEAD(CreationDate) OVER (PARTITION BY OwnerUserId ORDER BY CreationDate) AS NextCreationDate,
+            EXTRACT(EPOCH FROM (LEAD(CreationDate) OVER (PARTITION BY OwnerUserId ORDER BY CreationDate) - CreationDate)) AS PostGapSeconds
+        FROM Posts
+    ) AS PG ON P.Id = PG.PostId
+    GROUP BY U.Id, U.DisplayName
+),
+PostHistoryDetails AS (
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS HistoryEntryCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseVoteCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN CAST(PH.Comment AS INTEGER) ELSE NULL END) AS LastCloseReasonTypeId,
+        MAX(PH.CreationDate) AS LastHistoryDate
+    FROM PostHistory AS PH
+    WHERE PH.PostHistoryTypeId IN (1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,22,24,25,31,33,34,35,36,37,38,50,52,53,66)
+    GROUP BY PH.PostId
+),
+TagPerformance AS (
+    SELECT
+        P.Id AS PostId,
+        TRIM(SUBSTRING(P.Tags FROM POSITION('<' IN P.Tags) + 1 FOR POSITION('>' IN P.Tags) - POSITION('<' IN P.Tags) -1)) AS PrimaryTag,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.OwnerUserId
+    FROM Posts AS P
+    WHERE P.Tags IS NOT NULL AND P.Tags LIKE '<%>' AND P.PostTypeId = 1
+),
+TopTagsByScore AS (
+    SELECT
+        TP.PrimaryTag,
+        AVG(TP.Score) AS AvgTagScore,
+        COUNT(TP.PostId) AS TaggedPostCount,
+        RANK() OVER (ORDER BY AVG(TP.Score) DESC, COUNT(TP.PostId) DESC) AS RankByAvgScore
+    FROM TagPerformance AS TP
+    GROUP BY TP.PrimaryTag
+    HAVING COUNT(TP.PostId) >= 10
+),
+BadgeSummary AS (
+    SELECT
+        B.UserId,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        SUM(CASE WHEN B.TagBased = TRUE THEN 1 ELSE 0 END) AS TagBadges
+    FROM Badges AS B
+    GROUP BY B.UserId
+),
+PostLinkSummary AS (
+    SELECT
+        PL.PostId,
+        SUM(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedFromCount,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicatesCount,
+        -- Use string aggregation for portability if ARRAY_AGG DISTINCT with FILTER is not supported in some dialects.
+        STRING_AGG(DISTINCT CAST(PL.RelatedPostId AS VARCHAR), ',') AS DuplicatePostIds
+    FROM PostLinks AS PL
+    GROUP BY PL.PostId
+),
+UserPostDetails AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        UE.TotalPosts,
+        UE.QuestionsCount,
+        UE.AnswersCount,
+        UE.TotalPostScore,
+        UE.TotalComments,
+        UE.AvgCommentLength,
+        UE.AvgPostGapDays,
+        COALESCE(BS.GoldBadges,0) AS GoldBadges,
+        COALESCE(BS.SilverBadges,0) AS SilverBadges,
+        COALESCE(BS.BronzeBadges,0) AS BronzeBadges,
+        COALESCE(BS.TagBadges,0) AS TagBadges,
+        P.Id AS PostId,
+        P.Title AS PostTitle,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        COALESCE(PHD.EditCount,0) AS EditCount,
+        COALESCE(PHD.CloseVoteCount,0) AS CloseVoteCount,
+        CRT.Name AS LastCloseReasonName,
+        COALESCE(P.AnswerCount, 0) AS AnswerCountForQuestion,
+        TP.PrimaryTag,
+        TTS.AvgTagScore AS PrimaryTagAvgScore,
+        PLS.LinkedFromCount,
+        PLS.DuplicatesCount,
+        PLS.DuplicatePostIds,
+        (
+            SELECT COALESCE(AVG(SubP.Score) FILTER (WHERE SubP.Score > 0), 0)
+            FROM Posts AS SubP
+            WHERE SubP.OwnerUserId = U.Id
+              AND SubP.Id != P.Id
+              AND EXTRACT(YEAR FROM SubP.CreationDate) = EXTRACT(YEAR FROM P.CreationDate)
+              AND SubP.PostTypeId = P.PostTypeId
+        ) AS AvgOtherPostsScoreSameYear,
+        ROW_NUMBER() OVER (PARTITION BY U.Id ORDER BY P.Score DESC, P.CreationDate ASC) AS PostRankByUser,
+        NTILE(5) OVER (ORDER BY (P.Score * COALESCE(P.ViewCount, 1)) DESC) AS PostPerformanceBucket,
+        SUM(P.Score) OVER (PARTITION BY U.Id ORDER BY P.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningTotalPostScore,
+        CASE
+            WHEN P.LastActivityDate IS NULL THEN 'Unknown Activity'
+            WHEN P.LastActivityDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days' THEN 'Recent Activity'
+            WHEN P.LastActivityDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year' THEN 'Moderate Activity'
+            ELSE 'Dormant'
+        END AS PostActivityLevel,
+        (LOWER(COALESCE(P.Body, '')) LIKE '%sql%' OR LOWER(COALESCE(P.Body, '')) LIKE '%performance%' OR LOWER(COALESCE(P.Body, '')) LIKE '%index%') AS ContainsTechKeywords,
+        COALESCE(P.LastEditorDisplayName, (SELECT SUB.DisplayName FROM Users AS SUB WHERE SUB.Id = P.LastEditorUserId), 'N/A') AS EffectiveLastEditorDisplayName,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - P.CreationDate)) / 86400.0 AS PostAgeDays,
+        P.PostTypeId
+    FROM Users AS U
+    JOIN UserEngagement AS UE ON U.Id = UE.UserId
+    JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN PostHistoryDetails AS PHD ON P.Id = PHD.PostId
+    LEFT JOIN CloseReasonTypes AS CRT ON PHD.LastCloseReasonTypeId = CRT.Id
+    LEFT JOIN TagPerformance AS TP ON P.Id = TP.PostId
+    LEFT JOIN TopTagsByScore AS TTS ON TP.PrimaryTag = TTS.PrimaryTag
+    LEFT JOIN BadgeSummary AS BS ON U.Id = BS.UserId
+    LEFT JOIN PostLinkSummary AS PLS ON P.Id = PLS.PostId
+    WHERE
+        U.Reputation >= 500
+        AND P.CreationDate BETWEEN CAST('2019-01-01' AS DATE) AND CAST('2023-12-31' AS DATE)
+        AND P.OwnerDisplayName IS NOT NULL
+        AND U.LastAccessDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+)
+SELECT
+    UP.UserId,
+    UP.DisplayName,
+    UP.Reputation,
+    'Question-Focused' AS UserCategory,
+    UP.PostId,
+    UP.PostTitle,
+    UP.PostCreationDate,
+    UP.PostScore,
+    UP.PostViewCount,
+    UP.EditCount,
+    UP.CloseVoteCount,
+    UP.LastCloseReasonName,
+    UP.AnswerCountForQuestion,
+    UP.PrimaryTag,
+    UP.PrimaryTagAvgScore,
+    UP.AvgOtherPostsScoreSameYear,
+    UP.PostRankByUser,
+    UP.PostPerformanceBucket,
+    UP.RunningTotalPostScore,
+    UP.PostActivityLevel,
+    UP.ContainsTechKeywords,
+    UP.EffectiveLastEditorDisplayName,
+    UP.PostAgeDays,
+    UP.LinkedFromCount,
+    UP.DuplicatesCount,
+    UP.DuplicatePostIds
+FROM UserPostDetails AS UP
+WHERE
+    UP.PostTypeId = 1
+    AND UP.QuestionsCount > UP.AnswersCount
+    AND UP.QuestionsCount >= 10
+    AND UP.PostViewCount > 1000
+    AND UP.PostScore > 20
+    AND (UP.TagBadges >= 1 OR UP.GoldBadges >= 1)
+    AND (UP.PrimaryTag LIKE '%javascript%' OR UP.PrimaryTag LIKE '%python%')
+    AND UP.PostAgeDays < 1800
+    AND (UP.DuplicatesCount = 0 OR UP.DuplicatesCount IS NULL)
+UNION ALL
+SELECT
+    UP.UserId,
+    UP.DisplayName,
+    UP.Reputation,
+    'Answer-Focused' AS UserCategory,
+    UP.PostId,
+    UP.PostTitle,
+    UP.PostCreationDate,
+    UP.PostScore,
+    UP.PostViewCount,
+    UP.EditCount,
+    UP.CloseVoteCount,
+    UP.LastCloseReasonName,
+    UP.AnswerCountForQuestion,
+    UP.PrimaryTag,
+    UP.PrimaryTagAvgScore,
+    UP.AvgOtherPostsScoreSameYear,
+    UP.PostRankByUser,
+    UP.PostPerformanceBucket,
+    UP.RunningTotalPostScore,
+    UP.PostActivityLevel,
+    UP.ContainsTechKeywords,
+    UP.EffectiveLastEditorDisplayName,
+    UP.PostAgeDays,
+    UP.LinkedFromCount,
+    UP.DuplicatesCount,
+    UP.DuplicatePostIds
+FROM UserPostDetails AS UP
+WHERE
+    UP.PostTypeId = 2
+    AND UP.AnswersCount > UP.QuestionsCount
+    AND UP.AnswersCount >= 10
+    AND UP.PostScore > 15
+    AND UP.AvgOtherPostsScoreSameYear > 5
+    AND UP.EditCount >= 2
+    AND (UP.ContainsTechKeywords = TRUE OR UP.PostActivityLevel = 'Recent Activity')
+    AND UP.PostAgeDays < 1000
+    AND UP.PostScore > COALESCE(UP.AvgOtherPostsScoreSameYear, 0) * 1.5
+ORDER BY
+    Reputation DESC,
+    PostScore DESC
+LIMIT 20000;

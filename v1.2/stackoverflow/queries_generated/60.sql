@@ -1,0 +1,209 @@
+-- {"query": "60.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1833} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsRequired = 1
+
+    union all
+
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        t2.IsModeratorOnly,
+        t2.IsRequired,
+        r.Level + 1,
+        r.Path || t2.Id
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.IsRequired = 1 and not t2.Id = any(r.Path)
+    where r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserReputationWindow as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        sum(u.Reputation) over (order by u.CreationDate rows between 10 preceding and current row) as ReputationLast11Users,
+        row_number() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+),
+PostAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        count(a.Id) as TotalAnswers,
+        max(a.Score) as MaxAnswerScore,
+        avg(a.Score) as AvgAnswerScore,
+        sum(case when a.OwnerUserId is null then 1 else 0 end) as AnonymousAnswerCount,
+        sum(case when a.Score > q.Score then 1 else 0 end) as AnswersBetterThanQuestion
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.Tags
+),
+PostWithCloseInfo as (
+    select
+        p.Id,
+        p.Title,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.ClosedDate,
+        crt.Name as CloseReason,
+        ph.Comment as CloseReasonIdJson
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where p.PostTypeId = 1
+),
+UserActivitySummary as (
+    select
+        u.Id,
+        u.DisplayName,
+        count(distinct p.Id) as TotalPosts,
+        count(distinct c.Id) as TotalComments,
+        count(distinct v.Id) filter (where v.VoteTypeId = 2) as TotalUpVotesGiven,
+        count(distinct v.Id) filter (where v.VoteTypeId = 3) as TotalDownVotesGiven,
+        count(distinct b.Id) as TotalBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopPostsWithComments as (
+    select
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        c.Id as CommentId,
+        c.Text as CommentText,
+        c.CreationDate as CommentDate,
+        c.UserDisplayName as CommentUser,
+        row_number() over (partition by p.Id order by c.Score desc nulls last, c.CreationDate desc) as CommentRank
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    where p.PostTypeId = 1 and p.Score > 10
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        pl.LinkTypeId,
+        lt.Name as LinkTypeName,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where pl.LinkTypeId = 3
+),
+UserReputationWithBadges as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(ubc_gold.BadgeCount, 0) as GoldBadges,
+        coalesce(ubc_silver.BadgeCount, 0) as SilverBadges,
+        coalesce(ubc_bronze.BadgeCount, 0) as BronzeBadges,
+        u.CreationDate
+    from Users u
+    left join UserBadgeCounts ubc_gold on ubc_gold.UserId = u.Id and ubc_gold.Class = 1
+    left join UserBadgeCounts ubc_silver on ubc_silver.UserId = u.Id and ubc_silver.Class = 2
+    left join UserBadgeCounts ubc_bronze on ubc_bronze.UserId = u.Id and ubc_bronze.Class = 3
+)
+select
+    p.Id as QuestionId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.ClosedDate,
+    p.CloseReason,
+    pas.TotalAnswers,
+    pas.MaxAnswerScore,
+    pas.AvgAnswerScore,
+    pas.AnonymousAnswerCount,
+    pas.AnswersBetterThanQuestion,
+    uas.TotalPosts as UserTotalPosts,
+    uas.TotalComments as UserTotalComments,
+    uas.TotalUpVotesGiven,
+    uas.TotalDownVotesGiven,
+    uas.TotalBadges as UserTotalBadges,
+    urwb.GoldBadges,
+    urwb.SilverBadges,
+    urwb.BronzeBadges,
+    urwb.Reputation,
+    urwb.CreationDate as UserCreationDate,
+    tc.CommentId,
+    tc.CommentText,
+    tc.CommentDate,
+    tc.CommentUser,
+    dl.RelatedPostId as DuplicateOfPostId,
+    dl.RelatedPostTitle as DuplicateOfPostTitle,
+    case
+        when p.ClosedDate is not null then 'Closed'
+        else 'Open'
+    end as PostStatus,
+    -- Complex string expression: concatenation of tags with counts and user info
+    concat_ws(' | ',
+        p.Tags,
+        'Answers: ' || coalesce(pas.TotalAnswers::text, '0'),
+        'Views: ' || coalesce(p.ViewCount::text, '0'),
+        'User: ' || coalesce(u.DisplayName, 'Unknown'),
+        'Reputation: ' || coalesce(urwb.Reputation::text, '0'),
+        'Badges(G/S/B): ' || coalesce(urwb.GoldBadges::text, '0') || '/' || coalesce(urwb.SilverBadges::text, '0') || '/' || coalesce(urwb.BronzeBadges::text, '0')
+    ) as SummaryInfo,
+    -- Window function: rank questions by score within each tag (first tag only)
+    rank() over (
+        partition by split_part(trim(both '<>' from split_part(p.Tags, '><', 1)), ' ', 1)
+        order by p.Score desc
+    ) as TagScoreRank
+from PostWithCloseInfo p
+left join Posts u on u.Id = p.OwnerUserId
+left join PostAnswerStats pas on pas.QuestionId = p.Id
+left join UserActivitySummary uas on uas.Id = p.OwnerUserId
+left join UserReputationWithBadges urwb on urwb.Id = p.OwnerUserId
+left join TopPostsWithComments tc on tc.Id = p.Id and tc.CommentRank = 1
+left join DuplicateLinks dl on dl.PostId = p.Id
+where p.Score > 5
+order by p.Score desc, p.ViewCount desc
+limit 100;

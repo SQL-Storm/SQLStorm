@@ -1,0 +1,123 @@
+-- {"query": "27042.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2337, "output_tokens": 1184} 
+WITH ActiveUsers AS (
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.DisplayName,
+        COUNT(P.Id) AS PostCount,
+        SUM(P.Score) AS TotalScore,
+        MAX(P.CreationDate) AS LastPostDate,
+        RANK() OVER (ORDER BY SUM(P.Score) DESC) AS ReputationRank
+    FROM
+        Users U
+    LEFT JOIN
+        Posts P ON U.Id = P.OwnerUserId
+    WHERE
+        U.Reputation > 1000
+        AND P.PostTypeId IN (1, 2)
+        AND P.CreationDate > DATEADD(YEAR, -1, cast('2024-10-01 12:34:56' as timestamp))
+    GROUP BY
+        U.Id, U.Reputation, U.DisplayName
+),
+PopularTags AS (
+    SELECT
+        T.Id AS TagId,
+        T.TagName,
+        T.Count,
+        COUNT(PT.Id) AS QuestionCount,
+        AVG(P.Score) AS AvgScore,
+        STRING_AGG(P.Title, ' ', 'TEXT : ') AS TaggedPosts
+    FROM
+        Tags T
+    LEFT JOIN
+        Posts P ON T.Id = P.Id
+    LEFT JOIN
+    Posts PT ON INSTR(PT.Tags, CONCAT('<', T.TagName, '>')) > 0
+    WHERE
+        T.Count > 1000
+        AND P.PostTypeId = 1
+    GROUP BY
+        T.Id, T.TagName, T.Count
+),
+RecentActivity AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.Title,
+        P.Score,
+        PH.PostHistoryTypeId,
+        PH.UserId AS EditorId,
+        U.DisplayName AS EditorName,
+        PH.CreationDate AS EditDate,
+        LAG(PH.CreationDate, 1) OVER (PARTITION BY P.Id ORDER BY PH.CreationDate) AS PreviousEditDate ,
+        LAG(U.DisplayName) OVER (PARTITION BY P.Id ORDER BY PH.CreationDate) AS LastEditorName,
+        CASE
+            WHEN P.ParentId IS NULL THEN 5
+            WHEN PH.PostHistoryTypeId = 10 THEN 2
+            ELSE 3
+        END AS PriorityScore, P.Score + PH.Id AS ModScore
+    FROM
+        Posts P
+    JOIN
+        PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN
+        Users U ON PH.UserId = U.Id
+    WHERE
+        PH.CreationDate > DATEADD(MONTH, -1, cast('2024-10-01 12:34:56' as timestamp))
+        AND PH.PostHistoryTypeId IN (10, 14, 15)
+),
+HighBountyPosts AS (
+    SELECT
+        P.Id AS PostId,
+        P.Title ,
+        P.Score,
+        V.BountyAmount,
+        U.DisplayName AS BountyUserName,
+        V.CreationDate AS BountyDate,
+        DENSE_RANK() OVER (PARTITION BY P.Id ORDER BY V.BountyAmount DESC) AS BountyRank
+    FROM
+        Votes V
+    JOIN
+        Posts P ON V.PostId = P.Id
+    LEFT JOIN
+        Users U ON V.UserId = U.Id
+    WHERE
+        V.VoteTypeId = 8
+        AND V.BountyAmount > 50
+)
+SELECT
+     PA.TagId,
+    PT.Name,
+    PA.TagName,
+    PA.QuestionCount,
+    PA.AvgScore,
+    STRING_CONCAT(AOP.Title, ',')AS listOfQuestions,
+    RA.PostId,
+    PA.QuestionCount
+    RA.EditDate,
+    AOP.TotalScore,
+    AvHor.TagName,
+    OPP.BountyUserName
+FROM
+     ActiveUsers AU
+JOIN
+    RecentActivity RA ON AU.UserId = RA. userId
+LEFT JOIN
+    Posts PT ON AU.UserId = PT.OwnerUserId
+LEFT JOIN
+    PopularTags PA ON PT.Id = Unnest(string_to_array(substring(Tags, 2, length(Tags)-2), ''><'')) = PA.TagId
+LEFT JOIN
+    Votes VTE ON RA.PostId = VTE.PosTId
+LEFT JOIN
+    PostLinks PLO ON PL.PostId = PA.TagId
+LEFT JOIN
+    HighBountyPosts OPP ON VTE.Id = OPP.PostId
+LEFT JOIN
+    ActiveUsers AOP ON RA.PostId = AOP.UserId
+ORDER BY
+    editDate Desc,
+    PostCount DESC
+    priorityScore
+    ModScore
+LIMIT
+ 100;

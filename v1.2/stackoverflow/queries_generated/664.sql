@@ -1,0 +1,169 @@
+-- {"query": "664.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1554} 
+with RecursiveUserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        1 as Level,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate as PostCreationDate,
+        p.Score as PostScore,
+        p.ViewCount,
+        coalesce(p.Tags, '') as Tags,
+        row_number() over (partition by u.Id order by p.CreationDate desc) as RecentPostRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where u.Reputation > 1000
+
+    union all
+
+    select
+        r.UserId,
+        r.DisplayName,
+        r.Reputation,
+        r.Level + 1,
+        ph.PostId,
+        p2.PostTypeId,
+        p2.CreationDate,
+        p2.Score,
+        p2.ViewCount,
+        coalesce(p2.Tags, ''),
+        row_number() over (partition by r.UserId order by p2.CreationDate desc)
+    from RecursiveUserActivity r
+    join PostHistory ph on ph.UserId = r.UserId and ph.PostId is not null
+    join Posts p2 on p2.Id = ph.PostId
+    where r.Level < 2 and p2.CreationDate > r.PostCreationDate
+),
+UserBadgeCounts as (
+    select 
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserPostStats as (
+    select 
+        u.Id as UserId,
+        count(distinct p.Id) as TotalPosts,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) as TotalQuestions,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) as TotalAnswers,
+        sum(p.Score) as TotalPostScore,
+        avg(p.Score) as AveragePostScore,
+        max(p.Score) as MaxPostScore,
+        sum(coalesce(p.ViewCount,0)) as TotalViews
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id
+),
+TopTagsPerUser as (
+    select 
+        u.Id as UserId,
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as Tag,
+        count(*) as TagCount
+    from Users u
+    join Posts p on p.OwnerUserId = u.Id and p.Tags is not null and p.PostTypeId = 1
+    group by u.Id, Tag
+),
+RankedTags as (
+    select 
+        UserId,
+        Tag,
+        TagCount,
+        rank() over (partition by UserId order by TagCount desc) as TagRank
+    from TopTagsPerUser
+),
+UserTopTags as (
+    select 
+        UserId,
+        string_agg(Tag, ', ' order by TagCount desc) as TopTags
+    from RankedTags
+    where TagRank <= 3
+    group by UserId
+),
+UserVoteSummary as (
+    select 
+        p.OwnerUserId as UserId,
+        vt.Name as VoteType,
+        count(*) as VoteCount
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    join Posts p on p.Id = v.PostId
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId, vt.Name
+),
+UserCommentCounts as (
+    select 
+        c.UserId,
+        count(*) as CommentCount
+    from Comments c
+    where c.UserId is not null
+    group by c.UserId
+)
+select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    up.TotalPosts,
+    up.TotalQuestions,
+    up.TotalAnswers,
+    up.TotalPostScore,
+    up.AveragePostScore,
+    up.MaxPostScore,
+    up.TotalViews,
+    coalesce(ubc_gold.BadgeCount,0) as GoldBadges,
+    coalesce(ubc_silver.BadgeCount,0) as SilverBadges,
+    coalesce(ubc_bronze.BadgeCount,0) as BronzeBadges,
+    coalesce(uvs_upmod.VoteCount,0) as UpVotesReceived,
+    coalesce(uvs_downmod.VoteCount,0) as DownVotesReceived,
+    coalesce(uvs_favorite.VoteCount,0) as FavoritesReceived,
+    coalesce(uc.CommentCount,0) as TotalCommentsMade,
+    ut.TopTags,
+    ra.Level as RecursiveActivityLevel,
+    ra.PostId as RecentPostId,
+    ra.PostTypeId as RecentPostType,
+    ra.PostCreationDate,
+    ra.PostScore,
+    ra.ViewCount,
+    case 
+        when up.TotalQuestions > 0 then round(cast(up.TotalAnswers as numeric) / up.TotalQuestions, 2)
+        else null
+    end as AnswerToQuestionRatio,
+    case 
+        when up.TotalPosts > 0 then round(cast(up.TotalPostScore as numeric) / up.TotalPosts, 2)
+        else null
+    end as AverageScorePerPost,
+    case 
+        when u.Location is not null then 
+            concat('Located in ', u.Location)
+        else 'Location Unknown'
+    end as LocationDescription,
+    case 
+        when u.WebsiteUrl is not null and u.WebsiteUrl like 'http%' then
+            substring(u.WebsiteUrl from 1 for 30) || '...'
+        else 'No Website'
+    end as WebsiteShort,
+    case 
+        when u.AboutMe is not null then
+            left(u.AboutMe, 100) || case when length(u.AboutMe) > 100 then '...' else '' end
+        else 'No About Me'
+    end as AboutSnippet
+from Users u
+left join UserPostStats up on up.UserId = u.Id
+left join UserBadgeCounts ubc_gold on ubc_gold.UserId = u.Id and ubc_gold.Class = 1
+left join UserBadgeCounts ubc_silver on ubc_silver.UserId = u.Id and ubc_silver.Class = 2
+left join UserBadgeCounts ubc_bronze on ubc_bronze.UserId = u.Id and ubc_bronze.Class = 3
+left join UserVoteSummary uvs_upmod on uvs_upmod.UserId = u.Id and uvs_upmod.VoteType = 'UpMod'
+left join UserVoteSummary uvs_downmod on uvs_downmod.UserId = u.Id and uvs_downmod.VoteType = 'DownMod'
+left join UserVoteSummary uvs_favorite on uvs_favorite.UserId = u.Id and uvs_favorite.VoteType = 'Favorite'
+left join UserCommentCounts uc on uc.UserId = u.Id
+left join UserTopTags ut on ut.UserId = u.Id
+left join (
+    select distinct on (UserId) UserId, Level, PostId, PostTypeId, PostCreationDate, PostScore, ViewCount
+    from RecursiveUserActivity
+    order by UserId, Level desc, PostCreationDate desc
+) ra on ra.UserId = u.Id
+where u.Reputation > 1000
+order by up.TotalPostScore desc, u.Reputation desc
+limit 100;

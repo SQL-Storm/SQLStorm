@@ -1,0 +1,121 @@
+-- {"query": "1604.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1119} 
+
+WITH RecursiveTags AS (
+    SELECT
+        p.Id AS PostId,
+        unnest(string_to_array(substring(p.Tags, 2, char_length(p.Tags) - 2), '><')) AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+TopUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS Rank
+    FROM Users u
+    WHERE u.Reputation > 1000
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM Badges b
+    WHERE b.UserId IN (SELECT Id FROM TopUsers)
+    GROUP BY b.UserId
+),
+QuestionStats AS (
+    SELECT
+        q.Id,
+        q.Title,
+        q.OwnerUserId,
+        COUNT(a.Id) AS NumAnswers,
+        COALESCE(SUM(vMilitary.VoteQty),0) AS UpsVotesOnAnswers,
+        COUNT(DISTINCT cmm.Id) AS NumComments,
+        q.ViewCount,
+        q.Score,
+        array_agg(DISTINCT rt.Name) FILTER (WHERE rt.Name IS NOT NULL) AS RelatedPostTypes
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN (
+        SELECT
+            countrypf.PostId, COUNT(*) AS VoteQty
+        FROM Votes vMilitary
+        JOIN Posts countrypf ON countrypf.Id = vMilitary.PostId
+        WHERE vMilitary.VoteTypeId = 2
+        GROUP BY countrypf.PostId
+    ) vMilitary ON vMilitary.PostId = a.Id
+    LEFT JOIN Comments cmm ON cmm.PostId = q.Id
+    LEFT JOIN PostLinks pl ON pl.PostId = q.Id
+    LEFT JOIN LinkTypes rt ON rt.Id = pl.LinkTypeId
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.OwnerUserId, q.ViewCount, q.Score
+),
+QuestionsWithBadges AS (
+    SELECT
+        qs.*,
+        ubc.GoldBadges,
+        ubc.SilverBadges,
+        ubc.BronzeBadges,
+        tu.DisplayName AS OwnerName,
+        ROW_NUMBER() OVER (PARTITION BY qs.OwnerUserId ORDER BY qs.Score DESC NULLS LAST) AS PostOrder
+    FROM QuestionStats qs
+    LEFT JOIN UserBadgeCounts ubc ON qs.OwnerUserId = ubc.UserId
+    LEFT JOIN TopUsers tu ON tu.Id = qs.OwnerUserId
+    WHERE qs.OwnerUserId IS NOT NULL
+)
+SELECT
+    q.Id AS QuestionId,
+    COALESCE(q.Title, '(No Title)') AS QuestionTitle,
+    q.OwnerUserId,
+    COALESCE(q.OwnerName, 'Unknown') AS QuestionOwnerName,
+    q.Score,
+    CASE
+        WHEN q.NumAnswers = 0 THEN 'Unanswered'
+        WHEN q.NumAnswers > 10 THEN 'High Activity'
+        ELSE 'Normal Activity'
+    END AS QuestionActivityLevel,
+    q.NumAnswers,
+    q.UpsVotesOnAnswers,
+    instanceof_TagConcat.TagList,
+    q.NumComments,
+    q.ViewCount,
+    q.GoldBadges,
+    q.SilverBadges,
+    q.BronzeBadges,
+    COALESCE(ibp.IsIAcceptedAnswer, false) AS HasAcceptedAnswerBlock,
+    AVG(COALESCE(phelage.EditsCount, 0)) OVER (PARTITION BY q.OwnerUserId) AS AverageEditsByOwner,
+    ROW_NUMBER() OVER (ORDER BY q.Score DESC NULLS LAST, q.ViewCount DESC NULLS LAST) AS GlobalRank,
+    HYPOTHETICAL_SCORE(q.Score, q.ViewCount, q.NumAnswers) AS ComplexityScore
+FROM QuestionsWithBadges q
+LEFT JOIN (
+    SELECT
+        paa.ParentId PostId,
+        TRUE AS IsIAcceptedAnswer
+    FROM Posts paa 
+    WHERE paa.PostTypeId = 2 
+    GROUP BY paa.ParentId
+) ibp ON ibp.PostId = q.Id
+LEFT JOIN LATERAL (
+    SELECT 
+        opis ONLYARRAY_TO_STRING(array_agg(DISTINCT un.Tag), ',', '\\') AS TagList
+    FROM RecursiveTags un
+    WHERE un.PostId = q.Id
+) instanceof_TagConcat ON TRUE
+LEFT JOIN (
+    SELECT 
+        ph.PostId, 
+        COUNT(*) as EditsCount,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6,7,8,9,24)  
+    GROUP BY ph.PostId
+) phelage ON phelage.PostId = q.Id
+WHERE q.GoldBadges > 0 OR q.SilverBadges > 5 OR q.BronzeBadges > 10
+OR (Coalesce(q.UpsVotesOnAnswers,0) > 25 AND q.NumComments > 3)
+ORDER BY GlobalRank
+LIMIT 50;
+

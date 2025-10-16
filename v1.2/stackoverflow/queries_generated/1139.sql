@@ -1,0 +1,165 @@
+-- {"query": "1139.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.1, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1465} 
+
+WITH RecentActiveUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        RANK() OVER (ORDER BY u.Reputation DESC, u.Views DESC) AS ReputationRank
+    FROM Users u
+    WHERE u.LastAccessDate > NOW() - INTERVAL '180 days'
+),
+UserBadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COUNT(DISTINCT b.Name) AS UniqueBadgeNames,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TopQuestions AS (
+    SELECT 
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS UserTopQuestionRank
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Score > 5
+      AND p.ClosedDate IS NULL
+),
+AvgAnswerScores AS (
+    SELECT 
+        p.ParentId AS QuestionId,
+        AVG(p.Score) AS AvgAnswerScore,
+        COUNT(*) AS AnswerCount
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+      AND p.Score IS NOT NULL
+    GROUP BY p.ParentId
+),
+UserActivitySummary AS (
+    SELECT 
+        rau.Id AS UserId,
+        rau.DisplayName,
+        rau.Reputation,
+        COALESCE(ubs.GoldBadges,0) AS GoldBadges,
+        COALESCE(ubs.SilverBadges,0) AS SilverBadges,
+        COALESCE(ubs.BronzeBadges,0) AS BronzeBadges,
+        COALESCE(ubs.UniqueBadgeNames,0) AS UniqueBadgeNames,
+        MAX(tp.Score) FILTER (WHERE tp.UserTopQuestionRank = 1) AS TopQuestionScore,
+        AVG(tp.ViewCount) AS AvgTopQuestionViews,
+        COALESCE(SUM(tp.Score),0) AS SumQuestionScore,
+        ao.AvgAnswerScore,
+        ao.AnswerCount,
+        -- Correlated subquery with NULL logic and string operation
+        (
+            SELECT COUNT(*)
+            FROM Comments c
+            WHERE c.UserId = rau.Id
+              AND (
+                  c.Text ILIKE '%help%' 
+                  OR c.Text ILIKE '%please%'
+                  OR COALESCE(c.Text, '') = ''
+              )
+              AND c.CreationDate > rau.LastAccessDate - INTERVAL '365 days'
+        ) AS SupportiveCommentsCount
+    FROM RecentActiveUsers rau
+    LEFT JOIN UserBadgeStats ubs ON ubs.UserId = rau.Id
+    LEFT JOIN TopQuestions tp ON tp.OwnerUserId = rau.Id
+    LEFT JOIN LATERAL (
+        SELECT 
+            AVG(a.Score) AS AvgAnswerScore,
+            COUNT(*) AS AnswerCount
+        FROM Posts a
+        WHERE a.PostTypeId = 2
+          AND a.OwnerUserId = rau.Id
+          AND a.Score IS NOT NULL
+    ) ao ON true
+    GROUP BY rau.Id, rau.DisplayName, rau.Reputation, ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges, ubs.UniqueBadgeNames, ao.AvgAnswerScore, ao.AnswerCount
+),
+DistinctTagsUsed AS (
+    SELECT DISTINCT
+        UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS Tag,
+        p.OwnerUserId AS UserId
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+),
+TagPopularityByUser AS (
+    SELECT
+        dt.UserId,
+        dt.Tag,
+        COUNT(*) AS TagUsageCount,
+        -- Window function to get rank of tags per user by usage
+        RANK() OVER (PARTITION BY dt.UserId ORDER BY COUNT(*) DESC) AS TagUsageRank
+    FROM DistinctTagsUsed dt
+    GROUP BY dt.UserId, dt.Tag
+),
+HighlyUsedTags AS (
+    SELECT t.UserId, t.Tag, t.TagUsageCount
+    FROM TagPopularityByUser t
+    WHERE t.TagUsageRank <= 3
+),
+UserLinkedDuplicates AS (
+    SELECT 
+        pl.PostId,
+        pl.RelatedPostId,
+        u.Id AS UserId,
+        COUNT(*) AS DuplicateLinksCount
+    FROM PostLinks pl
+    INNER JOIN Posts p ON p.Id = pl.PostId AND p.OwnerUserId IS NOT NULL
+    INNER JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE pl.LinkTypeId = 3 -- Duplicate
+    GROUP BY pl.PostId, pl.RelatedPostId, u.Id
+),
+FinalBenchmark AS (
+    SELECT
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.GoldBadges,
+        uas.SilverBadges,
+        uas.BronzeBadges,
+        uas.UniqueBadgeNames,
+        uas.TopQuestionScore,
+        uas.AvgTopQuestionViews,
+        uas.SumQuestionScore,
+        COALESCE(uha.Tag, 'NoTags') AS FrequentTag,
+        uha.TagUsageCount,
+        uas.AvgAnswerScore,
+        uas.AnswerCount,
+        uas.SupportiveCommentsCount,
+        COALESCE(SUM(uld.DuplicateLinksCount),0) AS TotalDuplicateLinksReported,
+        -- Complex conditional expression with NULL handling and CASE
+        CASE 
+            WHEN uas.TopQuestionScore IS NULL THEN 'No top questions'
+            WHEN uas.TopQuestionScore > 100 THEN 'High scoring top question'
+            WHEN uas.TopQuestionScore BETWEEN 50 AND 100 THEN 'Moderate scoring top question'
+            ELSE 'Low scoring top question'
+        END AS TopQuestionScoreCategory
+    FROM UserActivitySummary uas
+    LEFT JOIN HighlyUsedTags uha ON uha.UserId = uas.UserId
+    LEFT JOIN UserLinkedDuplicates uld ON uld.UserId = uas.UserId
+    GROUP BY uas.UserId, uas.DisplayName, uas.Reputation, uas.GoldBadges, uas.SilverBadges, uas.BronzeBadges, uas.UniqueBadgeNames, 
+             uas.TopQuestionScore, uas.AvgTopQuestionViews, uas.SumQuestionScore, uha.Tag, uha.TagUsageCount, uas.AvgAnswerScore,
+             uas.AnswerCount, uas.SupportiveCommentsCount
+)
+SELECT *
+FROM FinalBenchmark
+WHERE ReputationRank <= 100
+ORDER BY Reputation DESC NULLS LAST, TotalDuplicateLinksReported DESC, SupportiveCommentsCount DESC;

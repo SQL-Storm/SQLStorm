@@ -1,0 +1,143 @@
+WITH RECURSIVE user_engagement_metrics AS (
+  SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS net_votes,
+    EXTRACT(YEAR FROM u.CreationDate) AS join_year,
+    CASE 
+      WHEN u.Reputation >= 10000 THEN 'Elite'
+      WHEN u.Reputation >= 1000 THEN 'Advanced'
+      WHEN u.Reputation >= 100 THEN 'Intermediate'
+      ELSE 'Beginner'
+    END AS user_tier,
+    DENSE_RANK() OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation DESC) AS yearly_rank
+  FROM Users u
+  WHERE u.CreationDate >= TIMESTAMP '2015-01-01'
+    AND u.Reputation IS NOT NULL
+),
+post_analytics AS (
+  SELECT 
+    p.Id AS post_id,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    LENGTH(p.Body) AS body_length,
+    CASE 
+      WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 
+      ELSE 0 
+    END AS has_accepted_answer,
+    COALESCE(p.FavoriteCount, 0) AS favorites,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS user_post_rank,
+    AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS user_avg_score,
+    COUNT(*) OVER (PARTITION BY p.OwnerUserId, EXTRACT(MONTH FROM p.CreationDate)) AS monthly_post_count,
+    p.CreationDate
+  FROM Posts p
+  WHERE p.PostTypeId IN (1, 2)
+    AND p.CreationDate >= TIMESTAMP '2015-01-01'
+    AND p.OwnerUserId IS NOT NULL
+),
+badge_diversity AS (
+  SELECT 
+    b.UserId,
+    COUNT(DISTINCT b.Name) AS unique_badge_count,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+    STRING_AGG(DISTINCT b.Name, '|' ORDER BY b.Name) FILTER (WHERE b.Class = 1) AS gold_badge_names
+  FROM Badges b
+  WHERE b.Date >= TIMESTAMP '2015-01-01'
+  GROUP BY b.UserId
+),
+answer_quality_metrics AS (
+  SELECT 
+    a.ParentId AS question_id,
+    a.OwnerUserId AS answerer_id,
+    COUNT(*) AS answer_count,
+    MAX(a.Score) AS best_answer_score,
+    AVG(a.Score) AS avg_answer_score,
+    MAX(CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END) AS has_accepted,
+    SUM(COALESCE(a.CommentCount, 0)) AS total_answer_comments
+  FROM Posts a
+  INNER JOIN Posts q ON a.ParentId = q.Id
+  WHERE a.PostTypeId = 2
+    AND q.PostTypeId = 1
+    AND a.OwnerUserId IS NOT NULL
+  GROUP BY a.ParentId, a.OwnerUserId
+),
+tag_expertise AS (
+  SELECT
+    p.OwnerUserId,
+    t.tag,
+    COUNT(*) AS tag_post_count,
+    AVG(p.Score) AS avg_tag_score,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS median_tag_score
+  FROM Posts p
+  JOIN (
+    SELECT
+      p0.Id AS post_id,
+      p0.OwnerUserId AS owner,
+      -- extract first tag between '<' and '>'
+      CASE
+        WHEN POSITION('<' IN p0.Tags) > 0 AND POSITION('>' IN p0.Tags) > POSITION('<' IN p0.Tags)
+        THEN TRIM(BOTH '<>' FROM SUBSTRING(p0.Tags FROM POSITION('<' IN p0.Tags) FOR (POSITION('>' IN p0.Tags) - POSITION('<' IN p0.Tags) + 1)))
+        ELSE NULL
+      END AS tag
+    FROM Posts p0
+    WHERE p0.PostTypeId = 1
+      AND p0.Tags IS NOT NULL
+      AND p0.OwnerUserId IS NOT NULL
+  ) t ON t.post_id = p.Id
+  WHERE p.PostTypeId = 1
+    AND p.Tags IS NOT NULL
+    AND p.OwnerUserId IS NOT NULL
+    AND t.tag IS NOT NULL
+  GROUP BY p.OwnerUserId, t.tag
+  HAVING COUNT(*) >= 3
+),
+vote_patterns AS (
+  SELECT 
+    v.PostId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvote_count,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvote_count,
+    SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS favorite_count,
+    SUM(CASE WHEN v.VoteTypeId = 8 THEN 1 ELSE 0 END) AS bounty_start_count,
+    SUM(CASE WHEN v.VoteTypeId = 8 THEN COALESCE(v.BountyAmount, 0) ELSE 0 END) AS total_bounty_amount,
+    MAX(v.CreationDate) AS last_vote_date
+  FROM Votes v
+  WHERE v.CreationDate >= TIMESTAMP '2015-01-01'
+  GROUP BY v.PostId
+)
+SELECT 
+  uem.DisplayName,
+  uem.user_tier,
+  uem.Reputation,
+  uem.yearly_rank,
+  COALESCE(bd.unique_badge_count, 0) AS badge_diversity,
+  COALESCE(bd.gold_badges, 0) || 'G/' || COALESCE(bd.silver_badges, 0) || 'S/' || COALESCE(bd.bronze_badges, 0) || 'B' AS badge_breakdown,
+  COUNT(DISTINCT pa.post_id) AS total_posts,
+  ROUND(AVG(pa.Score), 2) AS avg_post_score,
+  ROUND(AVG(pa.ViewCount), 0) AS avg_views,
+  SUM(CASE WHEN pa.has_accepted_answer = 1 THEN 1 ELSE 0 END) * 1.0 / NULLIF(COUNT(*) FILTER (WHERE pa.PostTypeId = 1), 0) AS acceptance_rate,
+  MAX(te.avg_tag_score) AS best_tag_avg_score,
+  (SELECT tag FROM tag_expertise te2 WHERE te2.OwnerUserId = uem.Id ORDER BY tag_post_count DESC LIMIT 1) AS top_tag,
+  COALESCE((SELECT SUM(vp.upvote_count - vp.downvote_count) FROM vote_patterns vp WHERE vp.PostId IN (SELECT post_id FROM post_analytics WHERE OwnerUserId = uem.Id)), 0) AS net_vote_difference,
+  (SELECT COUNT(*) FROM Comments c INNER JOIN Posts p2 ON c.PostId = p2.Id WHERE p2.OwnerUserId = uem.Id AND c.UserId != uem.Id) AS comments_received,
+  EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - uem.CreationDate)) / 86400 AS account_age_days,
+  ROUND(COUNT(DISTINCT pa.post_id) * 1.0 / NULLIF(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - uem.CreationDate)) / 2592000, 0), 2) AS posts_per_month
+FROM user_engagement_metrics uem
+LEFT JOIN post_analytics pa ON uem.Id = pa.OwnerUserId AND pa.user_post_rank <= 100
+LEFT JOIN badge_diversity bd ON uem.Id = bd.UserId
+LEFT JOIN tag_expertise te ON uem.Id = te.OwnerUserId
+WHERE uem.yearly_rank <= 1000
+  AND (pa.Score > 0 OR pa.Score IS NULL)
+GROUP BY 
+  uem.Id, uem.DisplayName, uem.user_tier, uem.Reputation, uem.yearly_rank, uem.CreationDate,
+  bd.unique_badge_count, bd.gold_badges, bd.silver_badges, bd.bronze_badges
+HAVING COUNT(DISTINCT pa.post_id) >= 5
+ORDER BY uem.Reputation DESC, badge_diversity DESC, avg_post_score DESC
+LIMIT 500;

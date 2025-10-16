@@ -1,0 +1,105 @@
+-- {"query": "1009.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1433} 
+with RecursiveTagPaths as (
+    select t.Id, t.TagName, array[t.TagName] as Path, 1 as Depth
+    from Tags t
+    where not t.IsModeratorOnly = 1
+  union all
+    select t.Id, t.TagName, p.Path || t.TagName, p.Depth + 1
+    from Tags t
+    join RecursiveTagPaths p on p.Path[array_length(p.Path,1)] <> t.TagName and t.Id <> p.Id
+    where p.Depth < 3
+),
+UserBadgeRanking as (
+    select
+        b.UserId,
+        b.Name as BadgeName,
+        b.Class,
+        count(*) over (partition by b.UserId, b.Class) as BadgeCount,
+        row_number() over (partition by b.UserId order by b.Class, b.Date desc) as BadgeRank
+    from Badges b
+    where b.Date > current_date - interval '1 year'
+),
+EliteUsers as (
+    select u.Id, u.DisplayName, u.Reputation,
+        coalesce((select sum(v.BountyAmount) from Votes v where v.UserId = u.Id and v.VoteTypeId = 8),0) as TotalBountyGiven,
+        coalesce((select count(*) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1 and p.ClosedDate is null),0) as OpenQuestionsCount,
+        coalesce((select count(*) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 2),0) as AnswersCount
+    from Users u
+    where u.Reputation > 10000
+),
+QuestionAnswerStats as (
+    select p.Id as QuestionId, p.Title,
+        p.CreationDate as QuestionDate,
+        p.Score as QuestionScore,
+        p.ViewCount as QuestionViews,
+        count(a.Id) as TotalAnswers,
+        max(a.Score) as TopAnswerScore,
+        coalesce(p.AcceptedAnswerId, -1) as AcceptedAnswerId,
+        string_agg(distinct substring(t.TagName from 1 for 10), ',' order by TagName) as ShortTags
+    from Posts p
+    left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+    left join lateral (
+        select unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) as TagName
+    ) t on true
+    where p.PostTypeId = 1
+        and p.CreationDate > current_date - interval '6 months'
+    group by p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.AcceptedAnswerId, p.Tags
+),
+AnswerDetails as (
+    select a.Id as AnswerId, a.ParentId as QuestionId, a.OwnerUserId, u.DisplayName as AnswerOwner,
+        a.Score as AnswerScore, a.CreationDate as AnswerDate,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate) as AnswerRank
+    from Posts a
+    left join Users u on u.Id = a.OwnerUserId
+    where a.PostTypeId = 2
+),
+TopAnswersWithComments as (
+    select ad.AnswerId, ad.QuestionId, ad.AnswerOwner, ad.AnswerScore, ad.AnswerDate, 
+        count(c.Id) as CommentsCount,
+        coalesce(avg(case when c.UserId is null then 0 else 1 end) over (partition by ad.AnswerId), 0) as CommenterCountEstimate
+    from AnswerDetails ad
+    left join Comments c on c.PostId = ad.AnswerId
+    where ad.AnswerRank <= 3
+    group by ad.AnswerId, ad.QuestionId, ad.AnswerOwner, ad.AnswerScore, ad.AnswerDate
+),
+FinalQuestionAnswerView as (
+    select qas.QuestionId, qas.Title, qas.QuestionDate, qas.QuestionScore, qas.QuestionViews, qas.TotalAnswers, qas.TopAnswerScore,
+        xor_mod(array_agg(case when taa.AnswerScore > 0 then 1 else 0 end)) as AnyPositiveTopAnswers,
+        string_agg(distinct taa.AnswerOwner, ',' order by taa.AnswerScore desc) as TopAnswerOwners,
+        coalesce(string_agg(distinct rtp.Path[array_length(rtp.Path,1)] || '[depth:' || rtp.Depth || ']', ','), '') as RelatedTagPaths
+    from QuestionAnswerStats qas
+    left join TopAnswersWithComments taa on taa.QuestionId = qas.QuestionId
+    left join RecursiveTagPaths rtp on rtp.TagName = any(string_to_array(qas.ShortTags, ','))
+    group by qas.QuestionId, qas.Title, qas.QuestionDate, qas.QuestionScore, qas.QuestionViews, qas.TotalAnswers, qas.TopAnswerScore
+),
+UserVoteSummary as (
+    select v.UserId, vt.Name as VoteTypeName, count(*) as VoteCount,
+        sum(case when vt.Id in (2, 8) then coalesce(v.BountyAmount,0) else 0 end) as VoteBountyTotal
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.UserId, vt.Name
+),
+BenchmarkData as (
+    select fqav.QuestionId, fqav.Title, fqav.QuestionScore, fqav.QuestionViews, fqav.TotalAnswers, fqav.TopAnswerScore,
+        fqav.TopAnswerOwners, fqav.RelatedTagPaths, eu.DisplayName as TopContributor, eu.Reputation as ContributorReputation,
+        coalesce(ub.BadgeCount, 0) as GoldBadgesLastYear,
+        coalesce(uvs.VoteCount, 0) as UpVotesGiven,
+        coalesce(uvs.VoteBountyTotal, 0) as BountyGivenTotal
+    from FinalQuestionAnswerView fqav
+    left join EliteUsers eu on eu.Id = (
+        select OwnerUserId from Posts p where p.Id = fqav.QuestionId limit 1
+    )
+    left join (
+        select UserId, max(BadgeCount) as BadgeCount
+        from UserBadgeRanking where Class = 1 group by UserId
+    ) ub on ub.UserId = eu.Id
+    left join (
+        select UserId, sum(VoteCount) as VoteCount, sum(VoteBountyTotal) as VoteBountyTotal
+        from UserVoteSummary
+        where VoteTypeName in ('UpMod', 'BountyStart')
+        group by UserId
+    ) uvs on uvs.UserId = eu.Id
+)
+select * from BenchmarkData
+order by QuestionScore desc, TotalAnswers desc, ContributorReputation desc
+limit 100;

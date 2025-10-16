@@ -1,0 +1,89 @@
+WITH cte AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.Body,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation AS OwnerReputation,
+    u.Location,
+    u.AboutMe,
+    u.Views AS UserViews,
+    u.UpVotes AS UserUpVotes,
+    u.DownVotes AS UserDownVotes,
+    SUBSTRING(p.Title FROM 1 FOR 50) || '...' AS TruncatedTitle,
+    CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus,
+    CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400 AS INTEGER) AS DaysSinceCreation,
+    ROUND(p.Score * 1.0 / (NULLIF(CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400 AS NUMERIC),0) + 1), 2) AS ScorePerDay,
+    ROUND(p.ViewCount * 1.0 / (NULLIF(CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400 AS NUMERIC),0) + 1), 2) AS ViewsPerDay,
+    ROUND(p.AnswerCount * 1.0 / (NULLIF(CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400 AS NUMERIC),0) + 1), 2) AS AnswersPerDay,
+    ROUND(p.CommentCount * 1.0 / (NULLIF(CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400 AS NUMERIC),0) + 1), 2) AS CommentsPerDay,
+    ROUND(u.Reputation * 1.0 / (NULLIF(CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate)) / 86400 AS NUMERIC),0) + 1), 2) AS ReputationPerDay,
+    CASE WHEN p.PostTypeId = 1 THEN 'Question' WHEN p.PostTypeId = 2 THEN 'Answer' ELSE 'Other' END AS PostType,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS Tags,
+    ROUND(
+      COALESCE(NULLIF(REGEXP_REPLACE(SUBSTRING(p.Tags FROM 2 FOR CHARACTER_LENGTH(p.Tags) - 2), '^([^><]+).*$','\1'), ''), '0')::numeric
+      /
+      NULLIF(COALESCE(NULLIF(REGEXP_REPLACE(SUBSTRING(p.Tags FROM 2 FOR CHARACTER_LENGTH(p.Tags) - 2), '.*><([^><]+)$','\1'), ''), '0')::numeric, 0)
+    , 2) AS TagScore,
+    CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN (SELECT p2.Score FROM Posts p2 WHERE p2.Id = p.AcceptedAnswerId) ELSE 0 END AS AcceptedAnswerScore
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Tags t ON POSITION(t.TagName IN SUBSTRING(p.Tags FROM 2 FOR CHARACTER_LENGTH(p.Tags) - 2)) > 0
+  WHERE p.PostTypeId IN (1, 2)
+  GROUP BY
+    p.Id,
+    p.Title,
+    p.Body,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    u.AboutMe,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    p.ClosedDate,
+    u.CreationDate,
+    p.PostTypeId,
+    p.Tags,
+    p.AcceptedAnswerId
+)
+SELECT
+  cte.*,
+  CASE WHEN AcceptedAnswerScore > 0 AND Score <> 0 THEN AcceptedAnswerScore / Score ELSE 0 END AS AcceptedAnswerRatio,
+  COALESCE(tag_counts.tag_count, 0) AS NumTags,
+  CASE WHEN PostType = 'Question' THEN
+    COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = cte.Id AND v.VoteTypeId = 2), 0)
+  ELSE
+    COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = cte.Id AND v.VoteTypeId = 2), 0)
+    + COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = (SELECT ParentId FROM Posts WHERE Id = cte.Id) AND v.VoteTypeId = 2), 0)
+  END AS UpVotes,
+  CASE WHEN PostType = 'Question' THEN
+    COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = cte.Id AND v.VoteTypeId = 3), 0)
+  ELSE
+    COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = cte.Id AND v.VoteTypeId = 3), 0)
+    + COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = (SELECT ParentId FROM Posts WHERE Id = cte.Id) AND v.VoteTypeId = 3), 0)
+  END AS DownVotes,
+  CASE WHEN PostType = 'Question' THEN
+    COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = cte.Id AND v.VoteTypeId = 5), 0)
+  ELSE
+    COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = cte.Id AND v.VoteTypeId = 5), 0)
+    + COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = (SELECT ParentId FROM Posts WHERE Id = cte.Id) AND v.VoteTypeId = 5), 0)
+  END AS Favorites
+FROM cte
+LEFT JOIN LATERAL (
+  SELECT COUNT(*) AS tag_count
+  FROM regexp_split_to_table(COALESCE(cte.Tags, ''), ',\s*') AS t(tag)
+  WHERE COALESCE(t.tag, '') <> ''
+) AS tag_counts ON true;

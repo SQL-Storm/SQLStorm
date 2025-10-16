@@ -1,0 +1,184 @@
+-- {"query": "184.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 2537} 
+with recent_activity as (
+  select u.id as user_id,
+         max(coalesce(p.lastactivitydate, p.lasteditdate, c.creationdate, ph.creationdate, v.creationdate)) as last_activity
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join comments c on c.userid = u.id
+  left join posthistory ph on ph.userid = u.id
+  left join votes v on v.userid = u.id
+  group by u.id
+),
+user_tag_questions as (
+  -- explode tags into one row per tag per question owned by user
+  select p.id as post_id,
+         p.owneruserid as user_id,
+         lower(trim(t)) as tag
+  from posts p
+  join lateral (
+    select unnest(string_to_array(substring(coalesce(p.tags,''), 2, greatest(length(coalesce(p.tags,'')) - 2,0)), '><')) as t
+  ) tag_list on true
+  where p.posttypeid = 1
+),
+tag_agg as (
+  select ut.tag,
+         count(distinct ut.post_id) as questions,
+         count(distinct case when a.id is not null then ut.post_id end) as has_answer,
+         avg(coalesce(p.viewcount,0)) filter (where p.viewcount is not null) as avg_views,
+         sum(coalesce(p.answercount,0)) as total_answers
+  from user_tag_questions ut
+  join posts p on p.id = ut.post_id
+  left join posts a on a.parentid = p.id -- answers
+  group by ut.tag
+),
+user_stats as (
+  select u.id,
+         u.displayname,
+         u.reputation,
+         coalesce(r.last_activity, u.creationdate) as last_activity,
+         (select count(*) from posts p where p.owneruserid = u.id and p.posttypeid = 1) as questions_asked,
+         (select count(*) from posts p where p.owneruserid = u.id and p.posttypeid = 2) as answers_posted,
+         (select count(*) from votes v where v.userid = u.id and v.votetypeid = 2) as upvotes_cast,
+         (select count(*) from votes v where v.userid = u.id and v.votetypeid = 3) as downvotes_cast,
+         (select coalesce(sum(b.class = 1)::int*5 + sum(b.class = 2)::int*2 + sum(b.class = 3)::int,0) from badges b where b.userid = u.id) as badge_score,
+         (select count(*) from comments c where c.userid = u.id) as comments_made,
+         (select min(p.creationdate) from posts p where p.owneruserid = u.id) as first_post_date,
+         (select max(p.creationdate) from posts p where p.owneruserid = u.id) as last_post_date
+  from users u
+  left join recent_activity r on r.user_id = u.id
+),
+question_response_times as (
+  -- compute time to first answer and accepted answer latency per question
+  select q.id as question_id,
+         q.owneruserid,
+         q.creationdate as q_created,
+         min(a.creationdate) as first_answer_date,
+         min(case when a.id = q.acceptedanswerid then a.creationdate end) as accepted_answer_date,
+         extract(epoch from (min(a.creationdate) - q.creationdate))/3600.0 as hours_to_first_answer,
+         extract(epoch from (min(case when a.id = q.acceptedanswerid then a.creationdate end) - q.creationdate))/3600.0 as hours_to_accepted
+  from posts q
+  left join posts a on a.parentid = q.id and a.posttypeid = 2
+  where q.posttypeid = 1
+  group by q.id, q.owneruserid, q.creationdate
+),
+user_response_summary as (
+  select
+    q.owneruserid as user_id,
+    count(*) filter (where q.first_answer_date is not null) as questions_with_answers,
+    count(*) filter (where q.accepted_answer_date is not null) as questions_with_accepted,
+    avg(q.hours_to_first_answer) filter (where q.hours_to_first_answer is not null) as avg_hours_first_answer,
+    avg(q.hours_to_accepted) filter (where q.hours_to_accepted is not null) as avg_hours_to_accepted
+  from question_response_times q
+  group by q.owneruserid
+),
+top_users_by_complex_score as (
+  select us.*,
+         coalesce(urs.questions_with_answers,0) as q_with_answers,
+         coalesce(urs.questions_with_accepted,0) as q_with_accepted,
+         coalesce(urs.avg_hours_first_answer, 99999) as avg_hours_first_answer,
+         coalesce(urs.avg_hours_to_accepted, 99999) as avg_hours_to_accepted,
+         -- complex scoring: reputation, recency boost, badge_score, inverse response times, activity ratio
+         (
+           us.reputation * 0.5
+           + greatest(0, date_part('epoch', now() - coalesce(us.last_activity, us.creationdate)))*(-1/86400.0)*2 -- penalty per day of inactivity
+           + us.badge_score * 20
+           + (us.answers_posted * 1.5)
+           + case when us.questions_asked > 0 then (us.q_with_accepted::float / us.questions_asked) * 200 else 0 end
+           + case when us.avg_hours_first_answer > 0 and us.avg_hours_first_answer < 99998 then (100.0 / nullif(us.avg_hours_first_answer,0)) else 0 end
+         ) as complex_score
+  from user_stats us
+  left join user_response_summary urs on urs.user_id = us.id
+),
+ranked_users as (
+  select tu.*,
+         row_number() over (order by complex_score desc nulls last) as rn,
+         rank() over (order by complex_score desc nulls last) as rnk
+  from top_users_by_complex_score tu
+),
+user_top_tags as (
+  -- pick top 3 tags per user by number of questions they asked in that tag, including tie-breakers
+  select ut.user_id, ut.tag, ut.cnt,
+         row_number() over (partition by ut.user_id order by ut.cnt desc, ut.tag) as tag_rank
+  from (
+    select p.owneruserid as user_id, lower(trim(t)) as tag, count(*) as cnt
+    from posts p
+    join lateral (
+      select unnest(string_to_array(substring(coalesce(p.tags,''),2, greatest(length(coalesce(p.tags,''))-2,0)), '><')) as t
+    ) tag_list on true
+    where p.posttypeid = 1
+    group by p.owneruserid, lower(trim(t))
+  ) ut
+),
+user_tag_aggregates as (
+  select r.*, coalesce(string_agg(ut.tag || ':' || ut.cnt, ', ' order by ut.cnt desc, ut.tag), '') as top_tags
+  from ranked_users r
+  left join (
+    select user_id, tag, cnt from user_top_tags where tag_rank <= 3
+  ) ut on ut.user_id = r.id
+  group by r.id, r.displayname, r.reputation, r.last_activity, r.questions_asked, r.answers_posted, r.upvotes_cast, r.downvotes_cast, r.badge_score, r.comments_made, r.first_post_date, r.last_post_date, r.complex_score, r.rn, r.rnk, r.q_with_answers, r.q_with_accepted, r.avg_hours_first_answer, r.avg_hours_to_accepted
+),
+recent_high_impact_questions as (
+  -- questions in last 90 days with high score or viewcount, used later for correlated subquery
+  select p.id, p.owneruserid, p.score, p.viewcount, p.creationdate, p.title,
+         row_number() over (partition by p.owneruserid order by p.creationdate desc) as rn
+  from posts p
+  where p.posttypeid = 1 and p.creationdate >= now() - interval '90 days'
+    and (p.score >= 10 or p.viewcount >= 1000)
+)
+select
+  uta.rn,
+  uta.id as user_id,
+  uta.displayname,
+  uta.reputation,
+  uta.badge_score,
+  uta.questions_asked,
+  uta.answers_posted,
+  uta.q_with_answers,
+  uta.q_with_accepted,
+  round(uta.complex_score,2) as complex_score,
+  coalesce(uta.top_tags, '(none)') as top_tags,
+  case
+    when uta.avg_hours_first_answer is null or uta.avg_hours_first_answer > 90000 then null
+    else round(uta.avg_hours_first_answer::numeric,2)
+  end as avg_hours_to_first_answer,
+  case
+    when uta.avg_hours_to_accepted is null or uta.avg_hours_to_accepted > 90000 then null
+    else round(uta.avg_hours_to_accepted::numeric,2)
+  end as avg_hours_to_accepted,
+  -- correlated subquery bringing back a recent high-impact question title or fallback to most-viewed question
+  coalesce(
+    (select rhq.title from recent_high_impact_questions rhq where rhq.owneruserid = uta.id order by rhq.creationdate desc limit 1),
+    (select p.title from posts p where p.owneruserid = uta.id and p.posttypeid = 1 order by p.viewcount desc nulls last limit 1),
+    '(no recent high-impact question)'
+  ) as sample_question_title,
+  -- compute null-aware ratio of answers to questions
+  case when uta.questions_asked > 0 then round((uta.answers_posted::numeric / uta.questions_asked)::numeric,3) else null end as answers_per_question,
+  -- string manipulation producing a short summary token
+  left(replace(coalesce(uta.displayname,'user_'||uta.id::text), E'\n',' '), 30) ||
+    ' [' || coalesce(nullif(uta.top_tags,''), 'no-tags') || ']' as summary_token
+from user_tag_aggregates uta
+where uta.rn <= 250
+order by uta.complex_score desc nulls last, uta.reputation desc
+union
+-- include some tag-level aggregates as an appended result set to test set-operators and column alignment
+select
+  null::int as rn,
+  null::int as user_id,
+  '<<TAG AGGREGATE>>'::varchar as displayname,
+  null::int as reputation,
+  null::int as badge_score,
+  null::int as questions_asked,
+  null::int as answers_posted,
+  null::int as q_with_answers,
+  null::int as q_with_accepted,
+  null::numeric as complex_score,
+  ta.tag as top_tags,
+  null::numeric as avg_hours_to_first_answer,
+  null::numeric as avg_hours_to_accepted,
+  null::varchar as sample_question_title,
+  round( (ta.total_answers::numeric / nullif(ta.questions,0)),3) as answers_per_question,
+  'tag-summary:' || ta.tag as summary_token
+from tag_agg ta
+where ta.questions >= 50
+order by complex_score desc nulls last, reputation desc
+limit 300;

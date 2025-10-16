@@ -1,0 +1,175 @@
+-- {"query": "1223.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.2, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1758} 
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        COALESCE(t.Count,0) as InitialCount,
+        coalesce(array_length(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><'), 1),0) as NumTagsInLatestPost,
+        row_number() over (partition by t.Id order by p.CreationDate desc) as rn
+    from Tags t
+    left join Posts p on p.Tags like concat('%<', t.TagName, '>%')
+), LatestTags as (
+    select Id, TagName, InitialCount, NumTagsInLatestPost
+    from RecursiveTagCounts
+    where rn = 1
+), UserBadgeAgg as (
+    select
+        b.UserId,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        count(distinct case when b.TagBased = 1 then b.Name end) as DistinctTagBadges,
+        max(b.Date) as LatestBadgeDate
+    from Badges b
+    group by b.UserId
+), RankedUserPosts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        row_number() over (partition by u.Id order by coalesce(p.Score,0) desc, p.ViewCount desc nulls last) as PostRank,
+        rank() over (partition by u.Id order by coalesce(p.Score,0)*1.0 / nullif(p.ViewCount,1) desc NULLS LAST) as QualityRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where p.PostTypeId in (1,2)
+), PostCommentsAgg as (
+    select
+        c.PostId,
+        count(*) as TotalComments,
+        max(c.Score) as MaxCommentScore,
+        sum(length(c.Text) - length(replace(c.Text, ' ', '')) + 1) as TotalCommentWords,
+        bool_or(c.Text is null) as HasNullComments
+    from Comments c
+    group by c.PostId
+), PostVoteStats as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(v.BountyAmount) as TotalBounty,
+        count(v.Id) as TotalVotes
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    group by p.Id, p.PostTypeId
+), DuplicateLinks as (
+    select pl.PostId, pl.RelatedPostId
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+), PopularQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        count(distinct pl.Id) as DuplicateFromCount,
+        dense_rank() over (order by p.Score desc, p.ViewCount desc nulls last) as PopularityRank
+    from Posts p
+    left join DuplicateLinks pl on pl.RelatedPostId = p.Id
+    where p.PostTypeId = 1
+    group by p.Id, p.Title, p.Score, p.ViewCount
+), UserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.CreationDate,
+        u.LastAccessDate,
+        (extract(epoch from age(u.LastAccessDate, u.CreationDate)) / 86400)::int as DaysActive,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersGiven,
+        count(distinct b.Id) as TotalBadges,
+        count(distinct bh.Id) as PostsEdited,
+        -- Correlated subquery to find max reputation posts
+        (select max(p2.Score)
+         from Posts p2
+         where p2.OwnerUserId = u.Id and p2.PostTypeId = 2) as MaxAnswerScore
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join PostHistory bh on bh.UserId = u.Id and bh.PostId = p.Id and bh.PostHistoryTypeId in (4,5,6)
+    group by u.Id, u.DisplayName, u.CreationDate, u.LastAccessDate
+), QuestionAnswerLinks as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        row_number() over (partition by q.Id order by a.Score desc) as AnsRank
+    from Posts q
+    join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+), CloseReasonCounts as (
+    select 
+        ch.Comment as CloseReason,
+        count(*) as CloseCount
+    from PostHistory ch
+    where ch.PostHistoryTypeId = 10
+    group by ch.Comment
+    having count(*) > 10
+), RecentActivity as (
+    select
+        p.OwnerUserId,
+        date_trunc('month', p.LastActivityDate) as Month,
+        count(*) as PostsThisMonth,
+        max(p.LastActivityDate) as LastPostDate
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId, date_trunc('month', p.LastActivityDate)
+), CombinedUserStats as (
+    select 
+        u.Id,
+        u.DisplayName,
+        ua.DaysActive,
+        b.GoldBadges,
+        b.SilverBadges,
+        b.BronzeBadges,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        ua.TotalBadges,
+        ua.PostsEdited,
+        ua.MaxAnswerScore,
+        coalesce(sum(rs.PostsThisMonth) over (partition by u.Id),0) as TotalMonthlyPosts,
+        least(coalesce(ua.DaysActive,0), coalesce(rs.PostsThisMonth, 0)+1) as EngagementScore
+    from Users u
+    left join UserBadgeAgg b on b.UserId = u.Id
+    left join UserActivity ua on ua.UserId = u.Id
+    left join RecentActivity rs on rs.OwnerUserId = u.Id
+)
+select 
+    cu.Id as UserId,
+    cu.DisplayName,
+    coalesce(cu.DaysActive,0) as DaysActive,
+    coalesce(cu.GoldBadges,0) as GoldBadges,
+    coalesce(cu.SilverBadges,0) as SilverBadges,
+    coalesce(cu.BronzeBadges,0) as BronzeBadges,
+    coalesce(cu.QuestionsAsked,0) as QuestionsAsked,
+    coalesce(cu.AnswersGiven,0) as AnswersGiven,
+    coalesce(cu.PostsEdited,0) as PostsEdited,
+    coalesce(cu.MaxAnswerScore,0) as MaxAnswerScore,
+    coalesce(cu.TotalMonthlyPosts,0) as PostsThisMonth,
+    cu.EngagementScore,
+    pq.Title as MostPopularQuestionTitle,
+    pq.ViewCount as MostPopularQuestionViews,
+    pq.Score as MostPopularQuestionScore,
+    pq.DuplicateFromCount as NumDuplicatesPointing,
+    crc.CloseReason,
+    crc.CloseCount
+from CombinedUserStats cu
+left join (
+    select 
+        OwnerUserId,
+        Title,
+        ViewCount,
+        Score,
+        DuplicateFromCount
+    from PopularQuestions 
+    where PopularityRank = 1
+) pq on pq.OwnerUserId = cu.Id
+left join CloseReasonCounts crc on crc.CloseReason is not null
+where cu.Reputation > 1000
+order by cu.EngagementScore desc nulls last, cu.MaxAnswerScore desc nulls last
+limit 100;

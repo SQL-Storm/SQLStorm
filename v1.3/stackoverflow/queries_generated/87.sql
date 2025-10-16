@@ -1,0 +1,167 @@
+-- {"query": "87.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2008} 
+with
+-- recent activity across posts with tag-like parsing and null-safe trimming
+QuestionBase as (
+  select p.Id as QuestionId,
+         p.Title,
+         coalesce(p.OwnerUserId, -1) as OwnerUserId,
+         p.CreationDate,
+         p.Score,
+         p.ViewCount,
+         p.Tags,
+         -- normalized tags exploded into array (Postgres style parsing imitation)
+         case when p.Tags is null then array[]::varchar[] 
+              else regexp_split_to_array(trim(both '<>' from p.Tags), '><') end as TagArray,
+         p.AnswerCount,
+         p.AcceptedAnswerId
+  from Posts p
+  where p.PostTypeId = 1
+),
+-- aggregate answers with window functions and correlated subqueries
+AnswerStats as (
+  select a.ParentId as QuestionId,
+         count(*) filter (where a.Score > 0) as PositiveAnswers,
+         count(*) filter (where a.Score <= 0) as NonPositiveAnswers,
+         avg(a.Score) as AvgAnswerScore,
+         max(a.Score) as MaxAnswerScore,
+         min(a.Score) as MinAnswerScore,
+         sum(case when a.OwnerUserId is null then 0 else 1 end) as AnsweredByRegistered,
+         -- top answer per question by score then by earliest creation
+         max(a.Id) filter (where row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) = 1) as TopAnswerId,
+         -- median-ish using percentile_disc
+         percentile_disc(0.5) within group (order by a.Score) as MedianAnswerScore
+  from Posts a
+  where a.PostTypeId = 2
+  group by a.ParentId
+),
+-- complex user engagement snapshot using lateral correlated aggregation
+UserEngagement as (
+  select u.Id as UserId,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate as UserSince,
+         -- last activity and counts
+         u.LastAccessDate,
+         (select count(*) from Posts p where p.OwnerUserId = u.Id) as OwnedPosts,
+         (select count(*) from Comments c where c.UserId = u.Id) as CommentsCount,
+         (select count(*) from Votes v where v.UserId = u.Id and v.VoteTypeId = 2) as UpvotesCast,
+         (select count(*) from Badges b where b.UserId = u.Id) as BadgesEarned,
+         -- ratio with safe null handling
+         case when u.Reputation > 0 then (select count(*)::numeric from Posts p where p.OwnerUserId = u.Id) / nullif(u.Reputation,0) else null end as PostsPerReputation
+  from Users u
+  where u.Reputation >= 50
+),
+-- manipulate tags to score tag popularity with string functions, null logic, joins and set ops
+TagScoring as (
+  select t.Id as TagId,
+         t.TagName,
+         t.Count as DeclaredCount,
+         coalesce(tp.RealCount,0) as RealCount,
+         coalesce(tp.RealCount,0) - t.Count as CountDelta,
+         -- synthetic popularity score using log, sqrt, coalesce
+         (ln(coalesce(tp.RealCount,0) + 1) * 0.6 + sqrt(coalesce(tp.RealCount,0) + 1) * 0.4) * 
+           (case when t.IsModeratorOnly = 1 then 0.5 when t.IsRequired = 1 then 1.2 else 1 end) as PopularityScore
+  from Tags t
+  left join (
+    select unnest_tag as TagName, count(*) as RealCount
+    from (
+      select distinct q.Id,
+             unnest(q_tag) as unnest_tag
+      from (
+        select Id, case when Tags is null then array[]::varchar[] 
+                        else regexp_split_to_array(trim(both '<>' from Tags), '><') end as q_tag
+        from Posts
+        where PostTypeId = 1
+      ) q
+    ) s
+    group by unnest_tag
+  ) tp on lower(tp.TagName) = lower(t.TagName)
+),
+-- recent cross-linked interplay (duplicates and links) with outer joins and coalesce chains
+LinkGraph as (
+  select pl.PostId,
+         pl.RelatedPostId,
+         pl.LinkTypeId,
+         pl.CreationDate,
+         lt.Name as LinkTypeName,
+         p1.PostTypeId as PostType_Left,
+         p2.PostTypeId as PostType_Right,
+         coalesce(p1.Score,0) as LeftScore,
+         coalesce(p2.Score,0) as RightScore
+  from PostLinks pl
+  left join LinkTypes lt on lt.Id = pl.LinkTypeId
+  left join Posts p1 on p1.Id = pl.PostId
+  left join Posts p2 on p2.Id = pl.RelatedPostId
+  where pl.CreationDate > now() - interval '365 days'
+),
+-- unify all signals and compute a heavy-weight metric using window and set operators
+CombinedMetrics as (
+  select q.QuestionId,
+         q.Title,
+         q.OwnerUserId,
+         q.CreationDate,
+         q.Score as QuestionScore,
+         q.ViewCount,
+         q.Tags,
+         qs.PopularityScore,
+         coalesce(a.PositiveAnswers,0) as PositiveAnswers,
+         coalesce(a.NonPositiveAnswers,0) as NonPositiveAnswers,
+         coalesce(a.AvgAnswerScore,0) as AvgAnswerScore,
+         coalesce(a.MaxAnswerScore,0) as MaxAnswerScore,
+         coalesce(a.MedianAnswerScore,0) as MedianAnswerScore,
+         ue.DisplayName as OwnerName,
+         ue.Reputation as OwnerReputation,
+         -- trend: age weighted score
+         (coalesce(q.Score,0) * 0.7 + coalesce(a.AvgAnswerScore,0) * 0.2 + coalesce(q.ViewCount,0)/nullif(greatest(date_part('day', now() - q.CreationDate),1),0) * 0.1) as AgeWeightedScore,
+         -- a composite normalized hotness using window normalization
+         0.5 * (coalesce(q.Score,0) / nullif(max(coalesce(q.Score,0)) over (),1)) +
+         0.3 * (coalesce(q.ViewCount,0) / nullif(max(coalesce(q.ViewCount,0)) over (),1)) +
+         0.2 * (coalesce(a.PositiveAnswers,0) / nullif(max(coalesce(a.PositiveAnswers,0)) over (),1)) as CompositeHotness,
+         -- tag explosion: take first tag for simple bucketing (safe access to array)
+         case when array_length(q.TagArray,1) >= 1 then lower(q.TagArray[1]) else null end as PrimaryTag
+  from QuestionBase q
+  left join AnswerStats a on a.QuestionId = q.QuestionId
+  left join UserEngagement ue on ue.UserId = q.OwnerUserId
+  left join TagScoring qs on lower(q.TagArray[1]) = lower(qs.TagName)
+),
+-- final selection: combine filtering, ranking, set operations and complex predicates
+Ranked as (
+  select cm.*,
+         row_number() over (partition by cm.PrimaryTag order by cm.CompositeHotness desc nulls last, cm.AgeWeightedScore desc nulls last) as TagRank,
+         dense_rank() over (order by cm.CompositeHotness desc nulls last) as GlobalDenseRank,
+         ntile(10) over (order by cm.CompositeHotness desc nulls last) as HotnessDecile
+  from CombinedMetrics cm
+  where cm.CompositeHotness is not null
+    and cm.CompositeHotness > 0
+)
+select r.PrimaryTag,
+       r.TagRank,
+       r.GlobalDenseRank,
+       r.HotnessDecile,
+       r.QuestionId,
+       left(r.Title, 200) as TitleSnippet,
+       r.OwnerUserId,
+       r.OwnerName,
+       r.OwnerReputation,
+       round(r.CompositeHotness::numeric,6) as CompositeHotness,
+       round(r.AgeWeightedScore::numeric,6) as AgeWeightedScore,
+       r.PositiveAnswers,
+       r.NonPositiveAnswers,
+       r.AvgAnswerScore,
+       r.MedianAnswerScore,
+       r.PopularityScore,
+       -- include correlated subquery for last 3 comments concatenated with null-safe separators
+       (select string_agg(coalesce(c.UserDisplayName,'[anon]') || ':' || left(coalesce(c.Text,''),140), ' ||| ' order by c.CreationDate desc)
+        from Comments c
+        where c.PostId = r.QuestionId
+        and c.CreationDate > now() - interval '90 days'
+        limit 3
+       ) as RecentCommentsSnippet,
+       -- existence checks across link types using boolean logic
+       exists (select 1 from PostLinks pl where pl.PostId = r.QuestionId and pl.LinkTypeId = 3) as HasDuplicates,
+       exists (select 1 from PostLinks pl where pl.RelatedPostId = r.QuestionId and pl.LinkTypeId = 1) as IsLinkedFromOthers
+from Ranked r
+where (r.OwnerReputation > 500 or r.PopularityScore > 10 or r.PositiveAnswers >= 3)
+  and not (r.PrimaryTag is null and r.PopularityScore < 1)
+order by r.GlobalDenseRank
+limit 250;

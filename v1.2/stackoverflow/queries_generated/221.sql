@@ -1,0 +1,203 @@
+-- {"query": "221.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.2, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1755} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsRequired = 1
+
+    union all
+
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        t2.IsModeratorOnly,
+        t2.IsRequired,
+        r.Level + 1,
+        r.Path || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.IsRequired = 1 and t2.Id <> r.Id and not t2.TagName = any(r.Path)
+    where r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserReputationWindow as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        sum(u.Reputation) over (order by u.CreationDate rows between unbounded preceding and current row) as CumulativeReputation,
+        row_number() over (partition by u.Location order by u.Reputation desc) as LocationRank
+    from Users u
+    where u.Location is not null
+),
+PostScoreStats as (
+    select
+        p.OwnerUserId,
+        p.PostTypeId,
+        count(*) as PostCount,
+        avg(p.Score) as AvgScore,
+        max(p.Score) as MaxScore,
+        min(p.Score) as MinScore,
+        sum(case when p.Score > 0 then 1 else 0 end) as PositiveScoreCount,
+        sum(case when p.Score < 0 then 1 else 0 end) as NegativeScoreCount
+    from Posts p
+    where p.OwnerUserId is not null and p.PostTypeId in (1, 2)
+    group by p.OwnerUserId, p.PostTypeId
+),
+TopQuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        a.OwnerUserId as AnswerOwnerUserId,
+        u.DisplayName as AnswerOwnerDisplayName,
+        row_number() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1 and q.Score > 10 and q.ViewCount > 1000
+),
+ClosedQuestionsWithReasons as (
+    select
+        ph.PostId,
+        ph.CreationDate as CloseDate,
+        crt.Name as CloseReason,
+        ph.UserId as CloserUserId,
+        u.DisplayName as CloserDisplayName
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    left join Users u on u.Id = ph.UserId
+    where ph.PostHistoryTypeId = 10 and ph.Comment is not null
+),
+UserActivitySummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) as TotalPosts,
+        count(distinct c.Id) as TotalComments,
+        count(distinct v.Id) filter (where v.VoteTypeId = 2) as TotalUpVotes,
+        count(distinct v.Id) filter (where v.VoteTypeId = 3) as TotalDownVotes,
+        coalesce(sum(bc.BadgeCount), 0) as TotalBadges,
+        max(p.Score) as MaxPostScore,
+        min(p.Score) as MinPostScore,
+        avg(p.Score) as AvgPostScore
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    left join (
+        select UserId, sum(BadgeCount) as BadgeCount
+        from UserBadgeCounts
+        group by UserId
+    ) bc on bc.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+DistinctTagPairs as (
+    select distinct
+        least(t1.TagName, t2.TagName) as TagA,
+        greatest(t1.TagName, t2.TagName) as TagB
+    from Tags t1
+    join Tags t2 on t1.Id <> t2.Id
+    where t1.IsRequired = 0 and t2.IsRequired = 0
+),
+TagCoOccurrence as (
+    select
+        dtp.TagA,
+        dtp.TagB,
+        count(*) as CoOccurrenceCount
+    from Posts p
+    cross join lateral unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><')) as tagname
+    join DistinctTagPairs dtp on tagname = dtp.TagA or tagname = dtp.TagB
+    group by dtp.TagA, dtp.TagB
+),
+FinalResult as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        urs.TotalPosts,
+        urs.TotalComments,
+        urs.TotalUpVotes,
+        urs.TotalDownVotes,
+        urs.TotalBadges,
+        urs.MaxPostScore,
+        urs.MinPostScore,
+        urs.AvgPostScore,
+        psq.PostCount as QuestionCount,
+        psa.PostCount as AnswerCount,
+        psq.AvgScore as AvgQuestionScore,
+        psa.AvgScore as AvgAnswerScore,
+        tqwa.QuestionId,
+        tqwa.Title as TopQuestionTitle,
+        tqwa.AnswerId as TopAnswerId,
+        tqwa.AnswerScore as TopAnswerScore,
+        cqwr.CloseReason,
+        cqwr.CloseDate,
+        cqwr.CloserDisplayName,
+        rt.Level as TagRequiredLevel,
+        rt.Path as TagPath,
+        rc.CoOccurrenceCount
+    from Users u
+    left join UserActivitySummary urs on urs.UserId = u.Id
+    left join PostScoreStats psq on psq.OwnerUserId = u.Id and psq.PostTypeId = 1
+    left join PostScoreStats psa on psa.OwnerUserId = u.Id and psa.PostTypeId = 2
+    left join TopQuestionsWithAnswers tqwa on tqwa.AnswerOwnerUserId = u.Id and tqwa.AnswerRank = 1
+    left join ClosedQuestionsWithReasons cqwr on cqwr.PostId = tqwa.QuestionId
+    left join RecursiveTagHierarchy rt on rt.Level = 1
+    left join TagCoOccurrence rc on rc.TagA = rt.TagName or rc.TagB = rt.TagName
+    where u.Reputation > 1000 and urs.TotalPosts > 10
+)
+select
+    UserId,
+    DisplayName,
+    TotalPosts,
+    TotalComments,
+    TotalUpVotes,
+    TotalDownVotes,
+    TotalBadges,
+    MaxPostScore,
+    MinPostScore,
+    round(AvgPostScore::numeric, 2) as AvgPostScore,
+    coalesce(QuestionCount, 0) as QuestionCount,
+    coalesce(AnswerCount, 0) as AnswerCount,
+    round(coalesce(AvgQuestionScore, 0)::numeric, 2) as AvgQuestionScore,
+    round(coalesce(AvgAnswerScore, 0)::numeric, 2) as AvgAnswerScore,
+    TopQuestionTitle,
+    TopAnswerId,
+    TopAnswerScore,
+    CloseReason,
+    CloseDate,
+    CloserDisplayName,
+    TagRequiredLevel,
+    array_to_string(TagPath, ' > ') as TagPath,
+    CoOccurrenceCount
+from FinalResult
+order by TotalPosts desc, AvgPostScore desc
+limit 100;

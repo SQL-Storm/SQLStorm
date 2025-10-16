@@ -1,0 +1,319 @@
+with recent_posts as (
+    select
+        p.id,
+        p.posttypeid,
+        p.creationdate,
+        p.owneruserid,
+        p.parentid,
+        p.acceptedanswerid,
+        p.score,
+        p.viewcount,
+        p.commentcount,
+        p.favoritecount,
+        p.closeddate,
+        p.title,
+        p.tags,
+        coalesce(nullif(trim(p.ownerdisplayname), ''), u.displayname, 'Anonymous') as owner_name,
+        u.reputation,
+        u.upvotes,
+        u.downvotes
+    from posts p
+    left join users u on u.id = p.owneruserid
+    where p.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+),
+question_answer_pairs as (
+    select
+        q.id as question_id,
+        q.title as question_title,
+        q.tags as question_tags,
+        q.creationdate as question_created,
+        q.owner_name as asker,
+        q.reputation as asker_rep,
+        q.score as question_score,
+        q.viewcount as question_views,
+        a.id as answer_id,
+        a.owneruserid as answer_owner_id,
+        a.owner_name as answerer,
+        a.reputation as answerer_rep,
+        a.creationdate as answer_created,
+        a.score as answer_score,
+        case when q.acceptedanswerid = a.id then 1 else 0 end as is_accepted
+    from recent_posts q
+    left join recent_posts a
+        on a.parentid = q.id
+       and a.posttypeid = 2
+    where q.posttypeid = 1
+),
+answer_activity as (
+    select
+        qa.question_id,
+        qa.answer_id,
+        qa.answer_score,
+        qa.is_accepted,
+        count(c.id) as comment_count_on_answer,
+        sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as net_votes_on_answer,
+        min(qa.answer_created) as first_answer_time
+    from question_answer_pairs qa
+    left join comments c on c.postid = qa.answer_id
+    left join votes v on v.postid = qa.answer_id
+    group by qa.question_id, qa.answer_id, qa.answer_score, qa.is_accepted
+),
+question_activity as (
+    select
+        q.id as question_id,
+        coalesce(sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end), 0) as net_votes_on_question,
+        coalesce(sum(case when v.votetypeid = 5 then 1 else 0 end), 0) as favorites_on_question,
+        count(distinct ph.id) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edit_events,
+        bool_or(ph.posthistorytypeid = 10) as ever_closed_event
+    from recent_posts q
+    left join votes v on v.postid = q.id
+    left join posthistory ph on ph.postid = q.id
+    where q.posttypeid = 1
+    group by q.id
+),
+first_answer_per_question as (
+    select
+        aa.question_id,
+        min(aa.first_answer_time) as first_answer_time
+    from answer_activity aa
+    group by aa.question_id
+),
+agg_answers as (
+    select
+        qa.question_id,
+        count(*) as answer_count,
+        sum(case when qa.is_accepted = 1 then 1 else 0 end) as accepted_count,
+        max(qa.answer_score) as best_answer_score,
+        avg(qa.answer_score) filter (where qa.answer_score is not null) as avg_answer_score,
+        sum(aa.comment_count_on_answer) as comments_on_answers,
+        sum(coalesce(aa.net_votes_on_answer,0)) as net_votes_on_answers
+    from question_answer_pairs qa
+    left join answer_activity aa on aa.answer_id = qa.answer_id
+    group by qa.question_id
+),
+question_links as (
+    select
+        pl.postid as question_id,
+        count(*) filter (where pl.linktypeid = 1) as linked_count,
+        count(*) filter (where pl.linktypeid = 3) as duplicate_count,
+        count(distinct pl.relatedpostid) filter (where pl.linktypeid = 3) as distinct_dupe_targets
+    from postlinks pl
+    group by pl.postid
+),
+question_tags as (
+    select
+        q.id as question_id,
+        unnest(string_to_array(substring(q.tags, 2, greatest(length(q.tags)-2,0)), '><')) as tag
+    from recent_posts q
+    where q.posttypeid = 1
+),
+tag_stats as (
+    select
+        qt.question_id,
+        count(*) as tag_count,
+        string_agg(qt.tag, '|' order by qt.tag) as tag_concat,
+        max(t.count) as max_tag_global_count,
+        sum(case when t.ismoderatoronly then 1 else 0 end) as mod_only_tags,
+        sum(case when t.isrequired then 1 else 0 end) as required_tags
+    from question_tags qt
+    left join tags t on t.tagname = qt.tag
+    group by qt.question_id
+),
+user_badge_summary as (
+    select
+        u.id as user_id,
+        count(*) as total_badges,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+        sum(case when b.tagbased = true then 1 else 0 end) as tag_badges
+    from users u
+    left join badges b on b.userid = u.id
+    group by u.id
+),
+question_owner_enriched as (
+    select
+        q.id as question_id,
+        q.asker as owner_name,
+        q.asker_rep as owner_rep,
+        ubs.total_badges,
+        ubs.gold_badges,
+        ubs.silver_badges,
+        ubs.bronze_badges,
+        ubs.tag_badges
+    from (
+        select distinct qa.question_id, qa.asker, qa.asker_rep
+        from question_answer_pairs qa
+    ) q
+    left join recent_posts rp on rp.id = q.question_id
+    left join user_badge_summary ubs on ubs.user_id = rp.owneruserid
+),
+question_metrics as (
+    select
+        qap.question_id,
+        max(qap.question_title) as question_title,
+        max(qap.question_tags) as question_tags_raw,
+        min(qap.question_created) as question_created,
+        max(qap.question_views) as question_views,
+        max(qa.net_votes_on_question) as net_votes_on_question,
+        max(qa.favorites_on_question) as favorites_on_question,
+        max(qa.edit_events) as edit_events,
+        max(CASE WHEN qa.ever_closed_event THEN 1 ELSE 0 END) as ever_closed_event,
+        coalesce(ag.answer_count, 0) as answer_count,
+        coalesce(ag.accepted_count, 0) as accepted_count,
+        coalesce(ag.best_answer_score, 0) as best_answer_score,
+        coalesce(ag.avg_answer_score, 0) as avg_answer_score,
+        coalesce(ag.comments_on_answers, 0) as comments_on_answers,
+        coalesce(ag.net_votes_on_answers, 0) as net_votes_on_answers,
+        coalesce(ql.linked_count, 0) as linked_count,
+        coalesce(ql.duplicate_count, 0) as duplicate_count,
+        coalesce(ql.distinct_dupe_targets, 0) as distinct_dupe_targets,
+        coalesce(ts.tag_count, 0) as tag_count,
+        coalesce(ts.tag_concat, '') as tag_concat,
+        coalesce(ts.max_tag_global_count, 0) as max_tag_global_count,
+        coalesce(ts.mod_only_tags, 0) as mod_only_tags,
+        coalesce(ts.required_tags, 0) as required_tags
+    from question_answer_pairs qap
+    left join question_activity qa on qa.question_id = qap.question_id
+    left join agg_answers ag on ag.question_id = qap.question_id
+    left join question_links ql on ql.question_id = qap.question_id
+    left join tag_stats ts on ts.question_id = qap.question_id
+    group by
+        qap.question_id,
+        ag.answer_count, ag.accepted_count, ag.best_answer_score, ag.avg_answer_score,
+        ag.comments_on_answers, ag.net_votes_on_answers, ql.linked_count, ql.duplicate_count,
+        ql.distinct_dupe_targets, ts.tag_count, ts.tag_concat, ts.max_tag_global_count,
+        ts.mod_only_tags, ts.required_tags
+),
+ranked_questions as (
+    select
+        qm.*,
+        qoe.owner_name,
+        qoe.owner_rep,
+        qoe.total_badges,
+        qoe.gold_badges,
+        qoe.silver_badges,
+        qoe.bronze_badges,
+        qoe.tag_badges,
+        rank() over (order by
+            coalesce(qm.question_views,0) desc,
+            coalesce(qm.net_votes_on_question,0) desc,
+            coalesce(qm.answer_count,0) desc
+        ) as popularity_rank,
+        dense_rank() over (order by
+            coalesce(qm.duplicate_count,0) desc,
+            coalesce(qm.edit_events,0) desc
+        ) as contention_rank,
+        ntile(5) over (order by coalesce(qm.avg_answer_score,0) desc) as avg_answer_score_quintile,
+        row_number() over (partition by case when qm.tag_count = 0 then 'untagged' else 'tagged' end
+                           order by coalesce(qm.question_views,0) desc) as row_in_tag_presence
+    from question_metrics qm
+    left join question_owner_enriched qoe on qoe.question_id = qm.question_id
+),
+normalized_scores as (
+    select
+        rq.*,
+        case
+            when max(question_views) over () = min(question_views) over () then 0.5
+            else (coalesce(question_views,0) - min(question_views) over ())
+                 / nullif(max(question_views) over () - min(question_views) over (), 0)
+        end as norm_views,
+        case
+            when max(net_votes_on_question) over () = min(net_votes_on_question) over () then 0.5
+            else (coalesce(net_votes_on_question,0) - min(net_votes_on_question) over ())
+                 / nullif(max(net_votes_on_question) over () - min(net_votes_on_question) over (), 0)
+        end as norm_qvotes,
+        case
+            when max(answer_count) over () = min(answer_count) over () then 0.5
+            else (coalesce(answer_count,0) - min(answer_count) over ())
+                 / nullif(max(answer_count) over () - min(answer_count) over (), 0)
+        end as norm_answers,
+        case
+            when max(avg_answer_score) over () = min(avg_answer_score) over () then 0.5
+            else (coalesce(avg_answer_score,0) - min(avg_answer_score) over ())
+                 / nullif(max(avg_answer_score) over () - min(avg_answer_score) over (), 0)
+        end as norm_avg_ascore
+    from ranked_questions rq
+),
+scored as (
+    select
+        ns.*,
+        (
+            0.35 * ns.norm_views +
+            0.35 * ns.norm_qvotes +
+            0.20 * ns.norm_answers +
+            0.10 * ns.norm_avg_ascore
+        )
+        - (case when ns.duplicate_count > 0 then 0.15 else 0 end)
+        - (least(ns.edit_events, 10) * 0.005)
+        + (case when ns.accepted_count > 0 then 0.05 else 0 end)
+        as composite_score
+    from normalized_scores ns
+),
+time_to_first_answer as (
+    select
+        q.id as question_id,
+        extract(epoch from (
+            (select min(a.creationdate) from posts a where a.parentid = q.id and a.posttypeid = 2)
+            - q.creationdate
+        ))/60.0 as minutes_to_first_answer
+    from posts q
+    where q.posttypeid = 1
+),
+final as (
+    select
+        s.question_id,
+        s.question_title,
+        coalesce(tsfa.minutes_to_first_answer, null) as minutes_to_first_answer,
+        s.question_created,
+        s.question_views,
+        s.net_votes_on_question,
+        s.answer_count,
+        s.accepted_count,
+        s.best_answer_score,
+        s.avg_answer_score,
+        s.comments_on_answers,
+        s.net_votes_on_answers,
+        s.linked_count,
+        s.duplicate_count,
+        s.distinct_dupe_targets,
+        s.tag_count,
+        s.tag_concat,
+        s.max_tag_global_count,
+        s.mod_only_tags,
+        s.required_tags,
+        s.owner_name,
+        s.owner_rep,
+        s.total_badges,
+        s.gold_badges,
+        s.silver_badges,
+        s.bronze_badges,
+        s.tag_badges,
+        s.popularity_rank,
+        s.contention_rank,
+        s.avg_answer_score_quintile,
+        s.row_in_tag_presence,
+        s.composite_score,
+        trim(both '|' from coalesce(s.tag_concat, '')) as tags_clean,
+        case
+            when s.tag_count = 0 or s.tag_concat is null then 'untagged'
+            when position('|javascript|' in '|' || s.tag_concat || '|') > 0 then 'js'
+            when position('|python|' in '|' || s.tag_concat || '|') > 0 then 'py'
+            when position('|java|' in '|' || s.tag_concat || '|') > 0 then 'java'
+            else 'other'
+        end as primary_lang_tag
+    from scored s
+    left join time_to_first_answer tsfa on tsfa.question_id = s.question_id
+)
+select *
+from final f
+where (
+    select count(*) from (
+        select 1
+        from final f2
+        where f2.primary_lang_tag = f.primary_lang_tag
+        order by f2.composite_score desc, f2.question_views desc
+        limit 200
+    ) x
+) > 0
+order by composite_score desc, question_views desc, question_id asc;

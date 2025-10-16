@@ -1,0 +1,121 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.CreationDate) AS PostRank,
+        COUNT(V.Id) FILTER (WHERE V.VoteTypeId = 2) OVER (PARTITION BY P.Id) AS UpVotes,
+        COUNT(V.Id) FILTER (WHERE V.VoteTypeId = 3) OVER (PARTITION BY P.Id) AS DownVotes,
+        COUNT(C.Id) OVER (PARTITION BY P.Id) AS CommentCount,
+        STRING_AGG(tn.TagName, ', ' ORDER BY tn.ord) AS TagsList
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    LEFT JOIN 
+        Votes V ON P.Id = V.PostId
+    LEFT JOIN 
+        Comments C ON P.Id = C.PostId
+    LEFT JOIN LATERAL (
+        SELECT TRIM(tag) AS TagName, rn AS ord
+        FROM (
+            SELECT UNNEST(string_to_array(
+                CASE 
+                    WHEN P.Tags IS NULL THEN ''
+                    WHEN LEFT(P.Tags,1) = '<' AND RIGHT(P.Tags,1) = '>' THEN SUBSTRING(P.Tags FROM 2 FOR GREATEST(0, CHAR_LENGTH(P.Tags)-2))
+                    ELSE P.Tags
+                END
+            , '><')) WITH ORDINALITY AS (tag, rn)
+        ) s
+    ) tn ON TRUE
+    WHERE 
+        P.PostTypeId IN (1, 2)
+    GROUP BY
+        P.Id, P.PostTypeId, P.Score, P.ViewCount, P.CreationDate, P.OwnerUserId, U.DisplayName
+),
+TopUsers AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        COUNT(P.Id) FILTER (WHERE P.PostTypeId = 1) AS QuestionsAsked,
+        COUNT(P.Id) FILTER (WHERE P.PostTypeId = 2) AS AnswersGiven,
+        ROW_NUMBER() OVER (ORDER BY U.Reputation DESC, U.CreationDate) AS UserRank
+    FROM 
+        Users U
+    LEFT JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    GROUP BY 
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate
+),
+PostHistorySummary AS (
+    SELECT 
+        PH.PostId,
+        COUNT(PH.Id) AS TotalEdits,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 5 THEN PH.CreationDate END) AS LastEditBodyDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 6 THEN PH.CreationDate END) AS LastEditTagsDate
+    FROM 
+        PostHistory PH
+    GROUP BY 
+        PH.PostId
+),
+TagStats AS (
+    SELECT 
+        tn.TagName,
+        COUNT(P.Id) AS PostCount,
+        SUM(P.Score) AS TotalScore,
+        AVG(P.Score) AS AvgScore,
+        MAX(P.CreationDate) AS LatestPostDate
+    FROM 
+        Tags T
+    LEFT JOIN LATERAL (
+        SELECT TRIM(tag) AS TagName, rn AS ord
+        FROM (
+            SELECT UNNEST(string_to_array(
+                CASE 
+                    WHEN T.TagName IS NULL THEN ''
+                    WHEN LEFT(T.TagName,1) = '<' AND RIGHT(T.TagName,1) = '>' THEN SUBSTRING(T.TagName FROM 2 FOR GREATEST(0, CHAR_LENGTH(T.TagName)-2))
+                    ELSE T.TagName
+                END
+            , '><')) WITH ORDINALITY AS (tag, rn)
+        ) s
+    ) tn ON TRUE
+    LEFT JOIN Posts P ON P.Tags LIKE '%' || tn.TagName || '%'
+    GROUP BY 
+        tn.TagName
+)
+SELECT 
+    RP.Id,
+    RP.PostTypeId,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.OwnerUserId,
+    RP.OwnerDisplayName,
+    RP.PostRank,
+    RP.UpVotes,
+    RP.DownVotes,
+    RP.CommentCount,
+    RP.TagsList,
+    PHS.TotalEdits,
+    PHS.LastEditBodyDate,
+    PHS.LastEditTagsDate,
+    TS.PostCount,
+    TS.TotalScore,
+    TS.AvgScore,
+    TS.LatestPostDate
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    PostHistorySummary PHS ON RP.Id = PHS.PostId
+LEFT JOIN 
+    TagStats TS ON RP.TagsList LIKE '%' || TS.TagName || '%'
+WHERE 
+    RP.PostRank <= 10
+ORDER BY 
+    RP.PostRank, RP.Score DESC, RP.CreationDate;

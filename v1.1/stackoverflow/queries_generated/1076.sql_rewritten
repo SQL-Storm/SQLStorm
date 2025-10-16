@@ -1,0 +1,80 @@
+-- {"query": "1076.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4o-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 563} 
+WITH UserStats AS (
+    SELECT 
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.Views,
+        U.UpVotes,
+        U.DownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        COUNT(DISTINCT C.Id) AS TotalComments
+    FROM 
+        Users U
+    LEFT JOIN 
+        Posts P ON U.Id = P.OwnerUserId 
+    LEFT JOIN 
+        Comments C ON P.Id = C.PostId 
+    WHERE 
+        U.Reputation > 100
+    GROUP BY 
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostMetrics AS (
+    SELECT 
+        P.Id AS PostId,
+        P.Title,
+        P.CreationDate,
+        P.Score,
+        COALESCE(P.AcceptedAnswerId, 0) AS AcceptedAnswer,
+        P.ViewCount,
+        RANK() OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate DESC) AS PostRank,
+        STRING_AGG(DISTINCT T.TagName, ', ') AS Tags
+    FROM 
+        Posts P
+    LEFT JOIN 
+        PostLinks PL ON P.Id = PL.PostId
+    LEFT JOIN 
+        Tags T ON PL.RelatedPostId = T.Id
+    WHERE 
+        P.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 month'
+    GROUP BY 
+        P.Id, P.Title, P.CreationDate, P.Score, P.AcceptedAnswerId, P.ViewCount
+),
+Benchmark AS (
+    SELECT 
+        US.UserId,
+        US.DisplayName,
+        US.Reputation,
+        US.Views,
+        PM.PostId,
+        PM.Title,
+        PM.CreationDate,
+        PM.Score,
+        PM.AcceptedAnswer,
+        PM.ViewCount,
+        PM.Tags,
+        ROW_NUMBER() OVER (PARTITION BY US.UserId ORDER BY PM.Score DESC) AS ScoreRank
+    FROM 
+        UserStats US
+    JOIN
+        PostMetrics PM ON US.UserId = PM.PostId
+)
+SELECT 
+    B.DisplayName,
+    B.Reputation,
+    B.Views,
+    B.Title,
+    B.Score,
+    B.AcceptedAnswer,
+    B.ViewCount,
+    B.Tags
+FROM 
+    Benchmark B
+WHERE 
+    B.ScoreRank <= 5
+ORDER BY 
+    B.Reputation DESC, B.Score DESC;

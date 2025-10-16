@@ -1,0 +1,68 @@
+SELECT
+    pem.PostId,
+    pem.PostTypeId,
+    pem.PostCreationDate,
+    pem.Score,
+    pem.ViewCount,
+    pem.Title,
+    pem.Tags,
+    pem.OwnerUserId,
+    pem.OwnerDisplayName,
+    pem.CommentCount,
+    pem.VoteCount,
+    pem.UpvoteCount,
+    pem.DownvoteCount,
+    pem.ScoreRank,
+    pem.ViewRank,
+    pem.TypeScoreRank,
+    pem.UserId,
+    (pem.PROFILEUPVOTES + pem.UpvoteCount) AS PersonTotalUpVotes,
+    pem.All AS UserTotalPostsQuestionsAndAnswers,
+    pem.PROFILEUPVOTES,
+    pem.UserUpAction,
+    CASE
+       WHEN pem.TRESHOLD > pem.UserUpAction - 1 THEN 'OVER SITUATION'
+       WHEN pem.UDEFINED = 0 THEN 'THE USER IS BALANCED'
+       WHEN pem.TotalPosts = -1 AND pem.TotalAnswers = -1 THEN 'INACTIVE'
+       ELSE ' radial-gradient(circle, rgba(204,187,133,1) 0%,  rgba(204,187,133,0.3847457627118644) 78%,  rgba(0,0,0,0.41234265734265735) 100%)'
+    END AS DESCRIPTION,
+    CASE
+        WHEN pem.Score <> COALESCE(pem.CubaTotalUpvotes, -1) + COALESCE(pem.CubaTotalDownvotes, -1) THEN COALESCE(pem.SGoldBadges, -1)
+        ELSE pem.Score
+    END AS GOLD,
+    (pem.Score <> COALESCE(pem.PROFILEUPVOTES, 0) AND pem.Score <> COALESCE(pem.UpvoteCount, 0)) AS PROFILE,
+    CASE WHEN pem.UserUpAction = 0 THEN NULL ELSE (CAST(pem.PROFILEUPVOTES AS numeric) / pem.UserUpAction) * 1 END AS TiationIndex,
+    CASE
+        WHEN (pem.PROFILEUPVOTES + pem.UpvoteCount) <> 0 THEN 'CONDITION_TRUE'
+        ELSE 'CONDITION_FALSE'
+    END AS SomeCondition
+FROM
+    PostEngagementMetrics pem
+GROUP BY
+    pem.PostId,
+    pem.PostTypeId,
+    pem.PostCreationDate,
+    pem.Score,
+    pem.ViewCount,
+    pem.Title,
+    pem.Tags,
+    pem.OwnerUserId,
+    pem.OwnerDisplayName,
+    pem.CommentCount,
+    pem.VoteCount,
+    pem.UpvoteCount,
+    pem.DownvoteCount,
+    pem.ScoreRank,
+    pem.ViewRank,
+    pem.TypeScoreRank,
+    pem.UserId,
+    pem.PROFILEUPVOTES,
+    pem.All,
+    pem.UserUpAction,
+    pem.TRESHOLD,
+    pem.UDEFINED,
+    pem.TotalPosts,
+    pem.TotalAnswers,
+    pem.CubaTotalUpvotes,
+    pem.CubaTotalDownvotes,
+    pem.SGoldBadges;

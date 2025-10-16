@@ -1,0 +1,211 @@
+-- {"query": "545.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1853} 
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        coalesce(sum(vb.UpVotes), 0) as TotalUpVotes,
+        coalesce(sum(vb.DownVotes), 0) as TotalDownVotes,
+        row_number() over (partition by u.Location order by u.Reputation desc, u.CreationDate asc) as LocationRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select
+            OwnerUserId,
+            sum(case when VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Posts
+        left join Votes on Votes.PostId = Posts.Id
+        where OwnerUserId is not null
+        group by OwnerUserId
+    ) vb on vb.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+),
+TopUsersCTE as (
+    select * from RecursiveUserActivity where LocationRank <= 10
+),
+PostDetails as (
+    select
+        p.Id,
+        p.PostTypeId,
+        pt.Name as PostTypeName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName as OwnerDisplayName,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.ClosedDate,
+        p.LastActivityDate,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate desc) as PostRank
+    from Posts p
+    left join PostTypes pt on pt.Id = p.PostTypeId
+    left join Users u on u.Id = p.OwnerUserId
+    where p.OwnerUserId in (select UserId from TopUsersCTE)
+),
+AcceptedAnswerScores as (
+    select
+        q.Id as QuestionId,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        a.OwnerUserId as AnswerOwnerUserId
+    from Posts q
+    join Posts a on a.Id = q.AcceptedAnswerId
+    where q.PostTypeId = 1 and a.PostTypeId = 2
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserBadgePivot as (
+    select
+        ubc.UserId,
+        coalesce(sum(case when Class = 1 then BadgeCount else 0 end), 0) as GoldBadges,
+        coalesce(sum(case when Class = 2 then BadgeCount else 0 end), 0) as SilverBadges,
+        coalesce(sum(case when Class = 3 then BadgeCount else 0 end), 0) as BronzeBadges
+    from UserBadgeCounts ubc
+    group by ubc.UserId
+),
+PostHistoryCloseInfo as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10
+),
+UserCommentActivity as (
+    select
+        c.UserId,
+        count(*) as CommentCount,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    where c.UserId is not null
+    group by c.UserId
+),
+UserActivitySummary as (
+    select
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        u.QuestionCount,
+        u.AnswerCount,
+        u.TotalUpVotes,
+        u.TotalDownVotes,
+        coalesce(b.GoldBadges, 0) as GoldBadges,
+        coalesce(b.SilverBadges, 0) as SilverBadges,
+        coalesce(b.BronzeBadges, 0) as BronzeBadges,
+        coalesce(c.CommentCount, 0) as CommentCount,
+        c.LastCommentDate
+    from TopUsersCTE u
+    left join UserBadgePivot b on b.UserId = u.UserId
+    left join UserCommentActivity c on c.UserId = u.UserId
+)
+select
+    uas.UserId,
+    uas.DisplayName,
+    uas.Location,
+    uas.Reputation,
+    uas.QuestionCount,
+    uas.AnswerCount,
+    uas.TotalUpVotes,
+    uas.TotalDownVotes,
+    uas.GoldBadges,
+    uas.SilverBadges,
+    uas.BronzeBadges,
+    uas.CommentCount,
+    uas.LastCommentDate,
+    pd.Id as PostId,
+    pd.PostTypeName,
+    pd.Title,
+    pd.Score,
+    pd.ViewCount,
+    pd.CreationDate as PostCreationDate,
+    phci.CloseReason,
+    phci.CloseDate,
+    aac.AnswerScore as AcceptedAnswerScore,
+    aac.AnswerCreationDate as AcceptedAnswerCreationDate,
+    aac.AnswerOwnerUserId,
+    case
+        when pd.Tags is not null then array_length(string_to_array(substring(pd.Tags from 2 for char_length(pd.Tags) - 2), '><'), 1)
+        else 0
+    end as TagCount,
+    case
+        when pd.Score > 0 then
+            round(ln(pd.Score + 1) * 10, 2)
+        else 0
+    end as ScoreWeight,
+    case
+        when uas.Reputation > 10000 then 'High'
+        when uas.Reputation between 1000 and 10000 then 'Medium'
+        else 'Low'
+    end as ReputationCategory,
+    lag(pd.Score) over (partition by uas.UserId order by pd.CreationDate) as PreviousPostScore,
+    lead(pd.Score) over (partition by uas.UserId order by pd.CreationDate) as NextPostScore
+from UserActivitySummary uas
+left join PostDetails pd on pd.OwnerUserId = uas.UserId and pd.PostRank <= 5
+left join PostHistoryCloseInfo phci on phci.PostId = pd.Id
+left join AcceptedAnswerScores aac on aac.QuestionId = pd.Id
+where (pd.PostTypeId = 1 or pd.PostTypeId is null)
+union
+select
+    uas.UserId,
+    uas.DisplayName,
+    uas.Location,
+    uas.Reputation,
+    uas.QuestionCount,
+    uas.AnswerCount,
+    uas.TotalUpVotes,
+    uas.TotalDownVotes,
+    uas.GoldBadges,
+    uas.SilverBadges,
+    uas.BronzeBadges,
+    uas.CommentCount,
+    uas.LastCommentDate,
+    pd.Id as PostId,
+    pd.PostTypeName,
+    pd.Title,
+    pd.Score,
+    pd.ViewCount,
+    pd.CreationDate as PostCreationDate,
+    phci.CloseReason,
+    phci.CloseDate,
+    null as AcceptedAnswerScore,
+    null as AcceptedAnswerCreationDate,
+    null as AnswerOwnerUserId,
+    case
+        when pd.Tags is not null then array_length(string_to_array(substring(pd.Tags from 2 for char_length(pd.Tags) - 2), '><'), 1)
+        else 0
+    end as TagCount,
+    case
+        when pd.Score > 0 then
+            round(ln(pd.Score + 1) * 10, 2)
+        else 0
+    end as ScoreWeight,
+    case
+        when uas.Reputation > 10000 then 'High'
+        when uas.Reputation between 1000 and 10000 then 'Medium'
+        else 'Low'
+    end as ReputationCategory,
+    lag(pd.Score) over (partition by uas.UserId order by pd.CreationDate) as PreviousPostScore,
+    lead(pd.Score) over (partition by uas.UserId order by pd.CreationDate) as NextPostScore
+from UserActivitySummary uas
+join Posts pd on pd.OwnerUserId = uas.UserId and pd.PostTypeId = 2
+left join PostHistoryCloseInfo phci on phci.PostId = pd.Id
+where pd.Id not in (select AcceptedAnswerId from Posts where AcceptedAnswerId is not null)
+order by uas.Reputation desc, uas.UserId, PostCreationDate desc;

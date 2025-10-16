@@ -1,0 +1,58 @@
+-- {"query": "13085.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-premier", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2142, "output_tokens": 609} 
+
+WITH ActiveUsers AS (
+  SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) AS PositiveScorePosts,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS Rank
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+  WHERE u.LastAccessDate > CURRENT_TIMESTAMP - INTERVAL '6 months'
+  GROUP BY u.Id
+),
+TopQuestions AS (
+  SELECT 
+    p.Id,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    u.DisplayName AS OwnerName,
+    RANK() OVER (PARTITION BY STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><') ORDER BY p.ViewCount DESC) AS TagRank
+  FROM Posts p
+  JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1 AND p.ClosedDate IS NULL
+),
+UserBadges AS (
+  SELECT 
+    u.Id AS UserId,
+    STRING_AGG(b.Name, ', ') AS BadgeNames,
+    COUNT(b.Id) AS TotalBadges
+  FROM Users u
+  LEFT JOIN Badges b ON u.Id = b.UserId
+  GROUP BY u.Id
+)
+SELECT 
+  au.Id,
+  au.DisplayName,
+  au.Reputation,
+  au.TotalPosts,
+  au.PositiveScorePosts,
+  ub.BadgeNames,
+  ub.TotalBadges,
+  COALESCE(tq.Title, 'N/A') AS TopQuestionTitle,
+  COALESCE(tq.ViewCount, 0) AS TopQuestionViewCount,
+  (SELECT COUNT(*) FROM Comments c WHERE c.UserId = au.Id AND c.Score > 5) AS HighScoreComments,
+  CASE
+    WHEN au.Rank <= 10 THEN 'Top Contributor'
+    WHEN au.Rank <= 100 THEN 'Active Contributor'
+    ELSE 'Regular Contributor'
+  END AS ContributorStatus
+FROM ActiveUsers au
+LEFT JOIN UserBadges ub ON au.Id = ub.UserId
+LEFT JOIN TopQuestions tq ON au.Id = tq.OwnerName AND tq.TagRank = 1
+WHERE au.TotalPosts >= 10
+ORDER BY au.Rank, tq.ViewCount DESC;

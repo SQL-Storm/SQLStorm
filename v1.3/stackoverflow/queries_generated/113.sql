@@ -1,0 +1,265 @@
+-- {"query": "113.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 2868} 
+with
+-- aggregate posts per user, including questions and answers and averages
+posts_agg as (
+  select
+    p.OwnerUserId as UserId,
+    sum(case when p.PostTypeId = 1 then 1 else 0 end) as Questions,
+    sum(case when p.PostTypeId = 2 then 1 else 0 end) as Answers,
+    count(*) as TotalPosts,
+    avg(case when p.Score is not null then p.Score else 0 end) as AvgScore,
+    sum(case when p.ClosedDate is not null then 1 else 0 end) as ClosedCount,
+    sum(case when p.AcceptedAnswerId is not null then 1 else 0 end) as AcceptedCount,
+    max(p.CreationDate) as LastPostDate,
+    -- tags parsed crudely: count of tag occurrences in user's questions
+    sum(
+      case
+        when p.PostTypeId = 1 and p.Tags is not null then array_length(string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><'),1)
+        else 0
+      end
+    ) as TagTokenCount
+  from Posts p
+  where p.OwnerUserId is not null
+  group by p.OwnerUserId
+),
+-- badge counts and top badge names concatenated
+badge_agg as (
+  select
+    b.UserId,
+    count(*) as BadgeCount,
+    sum(case when b.Class = 1 then 1 else 0 end) as Gold,
+    sum(case when b.Class = 2 then 1 else 0 end) as Silver,
+    sum(case when b.Class = 3 then 1 else 0 end) as Bronze,
+    -- top 3 recent badge names concatenated
+    string_agg(distinct b.Name, ', ' order by b.Date desc) as BadgesList,
+    max(b.Date) as LastBadgeDate
+  from Badges b
+  group by b.UserId
+),
+-- useful vote aggregates per user's posts
+votes_agg as (
+  select
+    p.OwnerUserId as UserId,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesOnPosts,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotesOnPosts,
+    sum(case when v.VoteTypeId = 1 then 1 else 0 end) as AcceptedByOriginatorOnPosts
+  from Posts p
+  left join Votes v on v.PostId = p.Id
+  where p.OwnerUserId is not null
+  group by p.OwnerUserId
+),
+-- recent comment & last activity snapshot (correlated subquery inside)
+recent_activity as (
+  select
+    u.Id as UserId,
+    -- last comment text snippet via correlated subquery
+    left(
+      (
+        select c.Text
+        from Comments c
+        where c.UserId = u.Id
+        order by c.CreationDate desc
+        limit 1
+      )::text, 200) as LastCommentSnippet,
+    -- last post title/body snippet (prefer title for questions)
+    left(
+      (
+        select coalesce(p.Title, substring(p.Body,1,200))
+        from Posts p
+        where p.OwnerUserId = u.Id
+        order by p.LastActivityDate desc nulls last, p.CreationDate desc
+        limit 1
+      )::text, 200) as LastPostSnippet,
+    -- count of distinct linked posts where user's posts were marked duplicate of something
+    (
+      select count(distinct pl.Id)
+      from Posts p2
+      join PostLinks pl on pl.PostId = p2.Id
+      where p2.OwnerUserId = u.Id and pl.LinkTypeId = 3
+    ) as DuplicatesMarked
+  from Users u
+),
+-- per-tag usage from user's questions (explode tags)
+user_tags as (
+  select
+    p.OwnerUserId as UserId,
+    tg.tag as TagName,
+    count(*) as TagUses
+  from Posts p
+  cross join lateral
+    (
+      select unnest(string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><')) as tag
+    ) tg
+  where p.PostTypeId = 1 and p.OwnerUserId is not null and p.Tags is not null
+  group by p.OwnerUserId, tg.tag
+),
+-- top tag per user using window function
+top_tags as (
+  select
+    ut.UserId,
+    ut.TagName,
+    ut.TagUses,
+    row_number() over (partition by ut.UserId order by ut.TagUses desc, ut.TagName) as rn
+  from user_tags ut
+),
+-- bring together users with all aggregates; include users without posts (left joins)
+user_metrics as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    coalesce(pa.Questions,0) as Questions,
+    coalesce(pa.Answers,0) as Answers,
+    coalesce(pa.TotalPosts,0) as TotalPosts,
+    coalesce(pa.AvgScore,0) as AvgScore,
+    coalesce(pa.ClosedCount,0) as ClosedCount,
+    coalesce(pa.AcceptedCount,0) as AcceptedCount,
+    coalesce(pa.TagTokenCount,0) as TagTokenCount,
+    coalesce(ba.BadgeCount,0) as BadgeCount,
+    coalesce(ba.Gold,0) as Gold,
+    coalesce(ba.Silver,0) as Silver,
+    coalesce(ba.Bronze,0) as Bronze,
+    coalesce(va.UpVotesOnPosts,0) as UpVotesOnPosts,
+    coalesce(va.DownVotesOnPosts,0) as DownVotesOnPosts,
+    ra.LastCommentSnippet,
+    ra.LastPostSnippet,
+    coalesce(ra.DuplicatesMarked,0) as DuplicatesMarked,
+    tt.TagName as TopTag,
+    tt.TagUses as TopTagUses,
+    -- composite score with null-safe arithmetic and penalize closed posts
+    (
+      coalesce(u.Reputation,0) * 0.1
+      + coalesce(pa.TotalPosts,0) * 2
+      + coalesce(pa.AcceptedCount,0) * 5
+      + coalesce(va.UpVotesOnPosts,0) * 1.5
+      - coalesce(va.DownVotesOnPosts,0) * 1.2
+      - coalesce(pa.ClosedCount,0) * 3
+      + coalesce(ba.Gold,0) * 10
+      + coalesce(ba.Silver,0) * 3
+      + coalesce(ba.Bronze,0) * 1
+    ) as CompositeScore,
+    -- recency factor: days since last post, null => large penalty
+    case
+      when pa.LastPostDate is not null then extract(epoch from (now() - pa.LastPostDate))/86400.0
+      else 99999
+    end as DaysSinceLastPost
+  from Users u
+  left join posts_agg pa on pa.UserId = u.Id
+  left join badge_agg ba on ba.UserId = u.Id
+  left join votes_agg va on va.UserId = u.Id
+  left join recent_activity ra on ra.UserId = u.Id
+  left join top_tags tt on tt.UserId = u.Id and tt.rn = 1
+),
+-- compute percentile ranks and order, using window functions
+ranked_users as (
+  select
+    um.*,
+    rank() over (order by um.CompositeScore desc nulls last) as ScoreRank,
+    ntile(100) over (order by um.CompositeScore desc nulls last) as Percentile,
+    -- normalized recency score (smaller days => higher recency_score)
+    case
+      when um.DaysSinceLastPost <= 0 then 1.0
+      when um.DaysSinceLastPost >= 3650 then 0.0
+      else (1.0 - (um.DaysSinceLastPost / 3650.0))
+    end as RecencyFactor,
+    -- final tuned benchmark value
+    (um.CompositeScore * (0.5 + coalesce( (1 - (um.DaysSinceLastPost/3650.0)), 0 ) * 0.5)) as TunedBenchmark
+  from user_metrics um
+),
+-- some additional heavy correlated calc: for each user find average score of answers that answered top-voted question of last 90 days (complex correlated subquery)
+answer_performance as (
+  select
+    ru.UserId,
+    (
+      select avg(a.Score)::numeric
+      from Posts a
+      where a.PostTypeId = 2
+        and a.OwnerUserId = ru.UserId
+        and a.CreationDate >= now() - interval '90 days'
+        and exists (
+          select 1 from Posts q
+          where q.Id = a.ParentId
+            and q.PostTypeId = 1
+            and q.Score = (
+              select max(q2.Score) from Posts q2
+              where q2.PostTypeId = 1 and q2.CreationDate >= now() - interval '90 days'
+            )
+        )
+    ) as AvgScoreOnTopQuestions
+  from ranked_users ru
+),
+-- union example: combine top N by two different measures, then deduplicate
+top_by_composite as (
+  select UserId, 'composite' as reason, CompositeScore as score_val from ranked_users order by CompositeScore desc nulls last limit 50
+),
+top_by_recent as (
+  select UserId, 'recent_tuned' as reason, TunedBenchmark as score_val from ranked_users order by TunedBenchmark desc nulls last limit 50
+),
+union_top as (
+  select * from top_by_composite
+  union
+  select * from top_by_recent
+),
+-- final selection mixing everything; perform outer joins, complex predicates, and null logic
+final_candidates as (
+  select
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.Questions,
+    ru.Answers,
+    ru.TotalPosts,
+    ru.AvgScore,
+    ru.BadgeCount,
+    ru.Gold, ru.Silver, ru.Bronze,
+    coalesce(ap.AvgScoreOnTopQuestions, 0) as AvgScoreOnTopQuestions,
+    ru.TopTag,
+    ru.TopTagUses,
+    ru.CompositeScore,
+    ru.TunedBenchmark,
+    ru.ScoreRank,
+    ru.Percentile,
+    ru.RecencyFactor,
+    -- a synthetic human-readable summary string using string ops and null logic
+    (coalesce(ru.DisplayName, 'anonymous') || ' | rep:' || coalesce(ru.Reputation::text,'0') || ' | posts:' || coalesce(ru.TotalPosts::text,'0') || ' | badges:' || coalesce(ru.BadgeCount::text,'0')) as Summary,
+    -- flag suspicious users: high answers but low accept rate or many duplicates
+    case
+      when ru.Answers >= 20 and (ru.AcceptedCount::float / nullif(ru.Answers,0) < 0.05) then 'low_accept_rate'
+      when ru.DuplicatesMarked > 5 then 'many_duplicates'
+      when ru.CompositeScore > 1000 then 'high_score'
+      else null
+    end as Flags
+  from ranked_users ru
+  left join answer_performance ap on ap.UserId = ru.UserId
+  where
+    -- only consider users created more than 7 days ago and with some activity or badges
+    (ru.CreationDate <= now() - interval '7 days')
+    and (
+      ru.TotalPosts > 0
+      or ru.BadgeCount > 0
+      or ru.Reputation > 10
+    )
+)
+select
+  fc.*,
+  -- add a windowed percentile of Benchmark among selected candidates
+  percent_rank() over (order by fc.TunedBenchmark desc) as TunedPercentRank,
+  -- show classification bucket
+  case
+    when fc.Percentile <= 1 then 'top1%'
+    when fc.Percentile <= 5 then 'top5%'
+    when fc.Percentile <= 10 then 'top10%'
+    when fc.Percentile <= 25 then 'top25%'
+    else 'below25'
+  end as BenchmarkBucket
+from final_candidates fc
+-- restrict final output to those in union_top OR in top by badge count (demonstrates set operator joins)
+left join union_top ut on ut.UserId = fc.UserId
+where
+  -- include either candidates identified by union_top OR those with >= 5 badges, show complex predicate combining null-handling
+  (ut.UserId is not null)
+  or (fc.BadgeCount >= 5)
+order by fc.TunedBenchmark desc nulls last, fc.CompositeScore desc nulls last
+limit 200;

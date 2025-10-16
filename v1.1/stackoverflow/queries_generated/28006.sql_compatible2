@@ -1,0 +1,107 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionsPosted,
+        (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id) AS CommentsMade,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS GlobalRank,
+        RANK() OVER (PARTITION BY (CASE WHEN u.Reputation > 100000 THEN 'Top' ELSE 'Regular' END) ORDER BY u.UpVotes - u.DownVotes DESC) AS VoteRank
+    FROM Users u
+),
+PostMetrics AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        COALESCE(p.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS Upvotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS Downvotes,
+        (LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, '><', '')) + 1) AS TagCount,
+        (SELECT STRING_AGG(SUBSTRING(t.TagName FROM 1 FOR 3), '|' ) FROM Tags t WHERE t.TagName IN (
+            SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR (LENGTH(p.Tags)-2)), '><'))
+        )) AS ShortenedTags,
+        LEAD(p.Score) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS NextPostScore,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) AS MovingAvgScore
+    FROM Posts p
+    WHERE p.CreationDate BETWEEN DATE '2010-01-01' AND DATE '2023-12-31'
+)
+SELECT 
+    us.Id AS UserId,
+    us.Reputation,
+    us.UpVotes,
+    us.DownVotes,
+    us.GoldBadges,
+    us.QuestionsPosted,
+    us.CommentsMade,
+    us.GlobalRank,
+    us.VoteRank,
+    pm.Id AS PostId,
+    pm.PostTypeId,
+    pm.Score,
+    pm.ViewCount,
+    pm.AnswerCount,
+    pm.CreationDate,
+    pm.OwnerUserId,
+    pm.AcceptedAnswerId,
+    pm.Upvotes,
+    pm.Downvotes,
+    pm.TagCount,
+    pm.ShortenedTags,
+    pm.NextPostScore,
+    pm.MovingAvgScore,
+    us.Reputation AS __ReputationForTier,
+    (pm.Score * 2 + pm.Upvotes * 0.5 - pm.Downvotes * 0.3 + us.GoldBadges * 10) AS WeightedMetric,
+    CASE 
+        WHEN us.Reputation > 200000 THEN 'Legendary'
+        WHEN us.Reputation > 100000 THEN 'Epic'
+        WHEN us.Reputation > 50000 THEN 'Veteran'
+        ELSE 'Regular'
+    END AS ReputationTier,
+    (SELECT COUNT(*) FROM PostHistory ph2 WHERE ph2.PostId = pm.Id AND ph2.PostHistoryTypeId IN (10, 11, 12)) AS ModerationEvents,
+    (SELECT COUNT(DISTINCT pl.RelatedPostId) FROM PostLinks pl WHERE pl.PostId = pm.Id AND pl.LinkTypeId = 3) AS DuplicateLinks,
+    COALESCE(ph.Comment, 'No close reason') AS CloseReason,
+    ROUND((us.UpVotes * 1.0 / NULLIF(us.DownVotes, 0)), 2) AS VoteRatio
+FROM PostMetrics pm
+FULL OUTER JOIN UserStats us ON pm.OwnerUserId = us.Id
+LEFT JOIN PostHistory ph ON ph.PostId = pm.Id AND ph.PostHistoryTypeId = 10
+LEFT JOIN CloseReasonTypes crt ON TRY_CAST(ph.Comment AS INTEGER) = crt.Id
+WHERE (pm.Score > 100 OR us.GoldBadges >= 1)
+    AND (pm.TagCount > 3 OR (pm.ShortenedTags IS NOT NULL AND LOWER(pm.ShortenedTags) LIKE '%sql%'))
+    AND (us.CommentsMade > 10 OR us.QuestionsPosted > 5)
+    AND (ph.CreationDate IS NULL OR ph.CreationDate > DATE '2015-01-01')
+GROUP BY
+    us.Id,
+    us.Reputation,
+    us.UpVotes,
+    us.DownVotes,
+    us.GoldBadges,
+    us.QuestionsPosted,
+    us.CommentsMade,
+    us.GlobalRank,
+    us.VoteRank,
+    pm.Id,
+    pm.PostTypeId,
+    pm.Score,
+    pm.ViewCount,
+    pm.AnswerCount,
+    pm.CreationDate,
+    pm.OwnerUserId,
+    pm.AcceptedAnswerId,
+    pm.Upvotes,
+    pm.Downvotes,
+    pm.TagCount,
+    pm.ShortenedTags,
+    pm.NextPostScore,
+    pm.MovingAvgScore,
+    ph.Comment
+ORDER BY 
+    WeightedMetric DESC, 
+    us.GlobalRank ASC
+LIMIT 100;

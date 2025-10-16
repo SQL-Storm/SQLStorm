@@ -1,0 +1,104 @@
+WITH tag_stats AS (
+    SELECT t.TagName,
+           COUNT(p.Id)                               AS PostCount,
+           AVG(p.Score)                              AS AvgScore,
+           MAX(u.Reputation)                         AS TopUserReputation
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags ILIKE '%' || t.TagName || '%'
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    GROUP BY t.TagName
+),
+top_tags AS (
+    SELECT TagName, PostCount, AvgScore,
+           ROW_NUMBER() OVER (ORDER BY PostCount DESC) AS rn
+    FROM tag_stats
+),
+monthly_stats AS (
+    SELECT DATE_TRUNC('month', p.CreationDate)              AS month,
+           SUM(CASE WHEN pt.Id = 1 THEN 1 ELSE 0 END)      AS Questions,
+           SUM(CASE WHEN pt.Id = 2 THEN 1 ELSE 0 END)      AS Answers,
+           AVG(EXTRACT(day FROM age(TIMESTAMP '2024-10-01 12:34:56', p.LastActivityDate))) AS AvgDaysSinceLastActivity
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    GROUP BY DATE_TRUNC('month', p.CreationDate)
+),
+top_monthly_tags AS (
+    SELECT month,
+           STRING_AGG(TagName, ', ') AS TopTags
+    FROM (
+        SELECT DATE_TRUNC('month', p.CreationDate) AS month,
+               t.TagName,
+               COUNT(p.Id)                          AS cnt,
+               ROW_NUMBER() OVER (
+                   PARTITION BY DATE_TRUNC('month', p.CreationDate)
+                   ORDER BY COUNT(p.Id) DESC
+               ) AS rn
+        FROM Tags t
+        JOIN Posts p ON p.Tags ILIKE '%' || t.TagName || '%'
+        GROUP BY DATE_TRUNC('month', p.CreationDate), t.TagName
+    ) s
+    WHERE rn <= 3
+    GROUP BY month
+),
+post_vote_comment AS (
+    SELECT p.Id,
+           p.Title,
+           p.Score,
+           (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id)            AS VoteCount,
+           (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id)          AS CommentCount,
+           CASE
+               WHEN p.LastActivityDate IS NULL THEN 'Never'
+               ELSE (EXTRACT(day FROM age(TIMESTAMP '2024-10-01 12:34:56', p.LastActivityDate)) || ' days')
+           END AS DaysSinceLastActivity
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2)
+    LIMIT 10
+)
+SELECT 'TAG'                                                     AS ResultType,
+       tt.TagName,
+       tt.PostCount,
+       tt.AvgScore,
+       tt.TopUserReputation,
+       CAST(NULL AS date)                                        AS month,
+       CAST(NULL AS integer)                                     AS Questions,
+       CAST(NULL AS integer)                                     AS Answers,
+       CAST(NULL AS numeric)                                     AS AvgDaysSinceLastActivity,
+       CAST(NULL AS integer)                                     AS VoteCount,
+       CAST(NULL AS integer)                                     AS CommentCount,
+       CAST(NULL AS varchar)                                     AS TopTags
+FROM (
+  SELECT TagName, PostCount, AvgScore, TopUserReputation, rn
+  FROM top_tags
+  JOIN tag_stats USING (TagName, PostCount, AvgScore)
+) tt
+WHERE tt.rn <= 5
+UNION ALL
+SELECT 'MONTH'                                                   AS ResultType,
+       CAST(NULL AS varchar)                                     AS TagName,
+       CAST(NULL AS bigint)                                      AS PostCount,
+       CAST(NULL AS numeric)                                     AS AvgScore,
+       CAST(NULL AS integer)                                     AS TopUserReputation,
+       ms.month,
+       ms.Questions,
+       ms.Answers,
+       ms.AvgDaysSinceLastActivity,
+       CAST(NULL AS integer)                                     AS VoteCount,
+       CAST(NULL AS integer)                                     AS CommentCount,
+       tm.TopTags
+FROM monthly_stats ms
+JOIN top_monthly_tags tm ON ms.month = tm.month
+UNION ALL
+SELECT 'POST'                                                    AS ResultType,
+       CAST(NULL AS varchar)                                     AS TagName,
+       CAST(NULL AS bigint)                                      AS PostCount,
+       CAST(NULL AS numeric)                                     AS AvgScore,
+       CAST(NULL AS integer)                                     AS TopUserReputation,
+       CAST(NULL AS date)                                        AS month,
+       CAST(NULL AS integer)                                     AS Questions,
+       CAST(NULL AS integer)                                     AS Answers,
+       CAST(NULL AS numeric)                                     AS AvgDaysSinceLastActivity,
+       pvc.VoteCount,
+       pvc.CommentCount,
+       CAST(NULL AS varchar)                                     AS TopTags
+FROM post_vote_comment pvc
+ORDER BY ResultType, month, TagName;

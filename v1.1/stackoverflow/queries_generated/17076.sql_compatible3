@@ -1,0 +1,206 @@
+WITH user_activity_metrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS total_posts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS questions_asked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS answers_given,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS avg_post_score,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) FILTER (WHERE p.Score > 0) AS median_positive_score,
+        SUM(p.ViewCount) AS total_views,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), ', ') FILTER (WHERE p.Tags IS NOT NULL) AS all_tags_used
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '2 years'
+        AND u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+badge_rankings AS (
+    SELECT 
+        UserId,
+        Name AS badge_name,
+        Class,
+        COUNT(*) AS badge_count,
+        ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY Class, COUNT(*) DESC) AS badge_rank,
+        DENSE_RANK() OVER (ORDER BY COUNT(*) DESC) AS global_badge_rank,
+        LAG(Date) OVER (PARTITION BY UserId ORDER BY Date) AS prev_badge_date,
+        LEAD(Date) OVER (PARTITION BY UserId ORDER BY Date) AS next_badge_date
+    FROM Badges
+    WHERE TagBased = '0'
+    GROUP BY UserId, Name, Class, Date
+),
+comment_analysis AS (
+    SELECT 
+        c.UserId,
+        COUNT(*) AS total_comments,
+        AVG(LENGTH(c.Text)) AS avg_comment_length,
+        MAX(c.Score) AS max_comment_score,
+        COUNT(*) FILTER (WHERE c.Score > 5) AS high_score_comments,
+        COUNT(*) FILTER (WHERE LOWER(c.Text) LIKE '%thank%' OR LOWER(c.Text) LIKE '%please%') AS polite_comments,
+        COALESCE(
+            STRING_AGG(
+                CASE 
+                    WHEN c.Score >= 10 THEN SUBSTRING(c.Text FROM 1 FOR 50) || '...'
+                    ELSE NULL
+                END, 
+                ' | '
+            ) FILTER (WHERE c.Score >= 10),
+            'No highly rated comments'
+        ) AS top_comments_preview
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+        AND c.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '1 year'
+    GROUP BY c.UserId
+),
+recursive_answer_chains AS (
+    WITH RECURSIVE answer_hierarchy AS (
+        SELECT 
+            p.Id,
+            p.ParentId,
+            p.OwnerUserId,
+            p.Score,
+            1 AS depth,
+            ARRAY[p.Id] AS path,
+            CAST(p.Id AS TEXT) AS path_string
+        FROM Posts p
+        WHERE p.PostTypeId = 2 
+            AND p.ParentId IS NOT NULL
+            AND NOT EXISTS (
+                SELECT 1 FROM Posts p2 
+                WHERE p2.ParentId = p.Id AND p2.PostTypeId = 2
+            )
+        
+        UNION ALL
+        
+        SELECT 
+            p.Id,
+            p.ParentId,
+            p.OwnerUserId,
+            p.Score,
+            ah.depth + 1,
+            ah.path || p.Id,
+            ah.path_string || '->' || CAST(p.Id AS TEXT)
+        FROM Posts p
+        INNER JOIN answer_hierarchy ah ON p.Id = ah.ParentId
+        WHERE p.PostTypeId = 1
+            AND ah.depth < 5
+            AND NOT p.Id = ANY(ah.path)
+    )
+    SELECT 
+        OwnerUserId,
+        MAX(depth) AS max_answer_depth,
+        AVG(Score) AS avg_chain_score,
+        COUNT(DISTINCT path_string) AS unique_chains
+    FROM answer_hierarchy
+    GROUP BY OwnerUserId
+),
+vote_patterns AS (
+    SELECT 
+        v.UserId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS upvotes_cast,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS downvotes_cast,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 8) AS bounties_started,
+        COALESCE(SUM(v.BountyAmount) FILTER (WHERE v.VoteTypeId = 8), 0) AS total_bounty_offered,
+        CASE 
+            WHEN COUNT(*) FILTER (WHERE v.VoteTypeId = 3) > 0 
+            THEN CAST(COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS DECIMAL) / 
+                 NULLIF(COUNT(*) FILTER (WHERE v.VoteTypeId = 3), 0)
+            ELSE NULL 
+        END AS upvote_downvote_ratio,
+        EXTRACT(DOW FROM v.CreationDate) AS favorite_voting_day,
+        COUNT(*) AS votes_on_day
+    FROM Votes v
+    WHERE v.UserId IS NOT NULL
+        AND v.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '6 months'
+    GROUP BY v.UserId, EXTRACT(DOW FROM v.CreationDate)
+)
+SELECT 
+    uam.Id AS user_id,
+    COALESCE(uam.DisplayName, 'Anonymous') AS display_name,
+    uam.Reputation,
+    uam.total_posts,
+    uam.questions_asked,
+    uam.answers_given,
+    ROUND(CAST(uam.avg_post_score AS NUMERIC), 2) AS avg_post_score,
+    COALESCE(uam.median_positive_score, 0) AS median_positive_score,
+    COALESCE(uam.total_views, 0) AS total_views,
+    LEFT(COALESCE(uam.all_tags_used, 'No tags'), 200) AS tags_summary,
+    COALESCE(br.badge_count, 0) AS primary_badge_count,
+    COALESCE(br.badge_name, 'No badges') AS primary_badge,
+    CASE br.Class 
+        WHEN 1 THEN 'Gold'
+        WHEN 2 THEN 'Silver'
+        WHEN 3 THEN 'Bronze'
+        ELSE 'None'
+    END AS badge_class,
+    br.global_badge_rank,
+    COALESCE(ca.total_comments, 0) AS total_comments,
+    ROUND(COALESCE(ca.avg_comment_length, 0), 1) AS avg_comment_length,
+    COALESCE(ca.high_score_comments, 0) AS high_score_comments,
+    COALESCE(ca.polite_comments, 0) AS polite_comments,
+    ca.top_comments_preview,
+    COALESCE(rac.max_answer_depth, 0) AS max_answer_depth,
+    ROUND(CAST(COALESCE(rac.avg_chain_score, 0) AS NUMERIC), 2) AS avg_chain_score,
+    COALESCE(vp.upvotes_cast, 0) AS upvotes_cast,
+    COALESCE(vp.downvotes_cast, 0) AS downvotes_cast,
+    ROUND(CAST(COALESCE(vp.upvote_downvote_ratio, 0) AS NUMERIC), 2) AS upvote_downvote_ratio,
+    COALESCE(vp.total_bounty_offered, 0) AS total_bounty_offered,
+    CASE 
+        WHEN uam.Reputation > 10000 AND br.Class = 1 THEN 'Elite Contributor'
+        WHEN uam.Reputation > 5000 OR COALESCE(br.badge_count, 0) > 10 THEN 'Senior Member'
+        WHEN uam.total_posts > 50 THEN 'Active Member'
+        WHEN COALESCE(ca.polite_comments, 0) > COALESCE(ca.total_comments, 0) * 0.3 THEN 'Friendly Newbie'
+        ELSE 'Regular User'
+    END AS user_classification,
+    CASE 
+        WHEN uam.questions_asked > uam.answers_given * 2 THEN 'Question-focused'
+        WHEN uam.answers_given > uam.questions_asked * 2 THEN 'Answer-focused'
+        WHEN COALESCE(ca.total_comments, 0) > (uam.total_posts * 3) THEN 'Comment-heavy'
+        ELSE 'Balanced'
+    END AS activity_pattern,
+    CAST(
+      GREATEST(
+        COALESCE(uam.avg_post_score, 0) * 10 +
+        COALESCE(br.badge_count, 0) * 5 +
+        COALESCE(ca.high_score_comments, 0) * 2 +
+        COALESCE(vp.upvotes_cast, 0) * 0.1 -
+        COALESCE(vp.downvotes_cast, 0) * 0.5 +
+        COALESCE(vp.total_bounty_offered, 0) * 0.01,
+        0
+      ) AS INTEGER
+    ) AS composite_engagement_score
+FROM user_activity_metrics uam
+LEFT OUTER JOIN badge_rankings br 
+    ON uam.Id = br.UserId AND br.badge_rank = 1
+LEFT OUTER JOIN comment_analysis ca 
+    ON uam.Id = ca.UserId
+LEFT OUTER JOIN recursive_answer_chains rac 
+    ON uam.Id = rac.OwnerUserId
+LEFT OUTER JOIN (
+    SELECT UserId, upvotes_cast, downvotes_cast, upvote_downvote_ratio, 
+           bounties_started, total_bounty_offered, favorite_voting_day, votes_on_day
+    FROM vote_patterns
+    WHERE (UserId, votes_on_day) IN (
+        SELECT UserId, MAX(votes_on_day)
+        FROM vote_patterns
+        GROUP BY UserId
+    )
+) vp ON uam.Id = vp.UserId
+WHERE uam.total_posts > 0
+    OR COALESCE(ca.total_comments, 0) > 0
+    OR COALESCE(vp.upvotes_cast, 0) > 0
+EXCEPT
+SELECT 
+    u2.Id, u2.DisplayName, u2.Reputation, 0, 0, 0, 0, 0, 0, '', 0, '', '', 
+    NULL, 0, 0, 0, 0, '', 0, 0, 0, 0, 0, 0, '', '', 0
+FROM Users u2
+WHERE u2.Id IN (
+    SELECT ph.UserId 
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (12, 10)
+    GROUP BY ph.UserId
+    HAVING COUNT(*) > 10
+)
+ORDER BY composite_engagement_score DESC, uam.Reputation DESC
+LIMIT 100;

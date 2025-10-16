@@ -1,0 +1,138 @@
+WITH UserVoteStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotesGiven,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotesGiven,
+        COUNT(CASE WHEN v.VoteTypeId IN (4, 12) THEN 1 END) AS NegativeVotesReceived,
+        AVG(CASE WHEN v.VoteTypeId = 1 THEN p.Score ELSE NULL END) AS AvgAcceptedAnswerScore
+    FROM Users u
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Posts p ON v.PostId = p.Id AND p.PostTypeId = 2 AND p.Id = p.AcceptedAnswerId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostEngagement AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(*) AS TotalPosts,
+        SUM(p.ViewCount) AS TotalViews,
+        AVG(p.Score) AS AvgPostScore,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        -- normalize tag string into array without relying on dialect-specific behavior
+        CASE WHEN p.Tags IS NULL OR p.Tags = '' THEN NULL
+             ELSE regexp_split_to_array(trim(both '<>' FROM p.Tags), '><')
+        END AS TagArray
+    FROM Posts p
+    GROUP BY p.OwnerUserId, CASE WHEN p.Tags IS NULL OR p.Tags = '' THEN NULL ELSE regexp_split_to_array(trim(both '<>' FROM p.Tags), '><') END
+),
+BadgeAggregates AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgeCount,
+        MAX(CASE WHEN COALESCE(b.TagBased, 0) = 1 THEN b.Name ELSE NULL END) AS LatestTagBadge
+    FROM Badges b
+    GROUP BY b.UserId
+),
+CommentStats AS (
+    SELECT 
+        c.UserId,
+        COUNT(*) AS CommentCount,
+        AVG(LENGTH(REPLACE(c.Text, ' ', ''))) AS AvgCommentWordCount
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+),
+TopPosts AS (
+    SELECT
+        p.OwnerUserId,
+        p.Id,
+        p.Title,
+        p.Score,
+        DENSE_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS PostRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.Score > 0
+),
+LinkedQuestions AS (
+    SELECT 
+        pl.PostId,
+        COUNT(*) AS LinkCount
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 1
+    GROUP BY pl.PostId
+),
+FinalCTE AS (
+    SELECT 
+        uv.UserId,
+        uv.DisplayName,
+        uv.Reputation,
+        uv.UpVotesGiven,
+        uv.DownVotesGiven,
+        uv.NegativeVotesReceived,
+        uv.AvgAcceptedAnswerScore,
+        pe.TotalPosts,
+        pe.TotalViews,
+        pe.AvgPostScore,
+        pe.QuestionCount,
+        pe.AnswerCount,
+        COALESCE(ba.BadgeCount, 0) AS BadgeCount,
+        COALESCE(ba.GoldBadgeCount, 0) AS GoldBadgeCount,
+        ba.LatestTagBadge,
+        COALESCE(cs.CommentCount, 0) AS CommentCount,
+        cs.AvgCommentWordCount,
+        tp.Id AS TopPostId,
+        tp.Title AS TopPostTitle,
+        tp.Score AS TopPostScore,
+        COALESCE(lq.LinkCount, 0) AS LinkedQuestionCount,
+        CASE 
+            WHEN pe.TagArray IS NOT NULL AND EXISTS (SELECT 1 FROM unnest(pe.TagArray) AS t(tag) WHERE t.tag = 'sql') THEN 'SQL Expert'
+            WHEN pe.TagArray IS NOT NULL AND EXISTS (SELECT 1 FROM unnest(pe.TagArray) AS t(tag) WHERE t.tag = 'javascript') THEN 'JS Guru'
+            ELSE 'General'
+        END AS UserCategory,
+        RANK() OVER (ORDER BY uv.Reputation DESC, COALESCE(pe.TotalViews,0) DESC) AS OverallRank
+    FROM UserVoteStats uv
+    LEFT JOIN PostEngagement pe ON uv.UserId = pe.OwnerUserId
+    LEFT JOIN BadgeAggregates ba ON uv.UserId = ba.UserId
+    LEFT JOIN CommentStats cs ON uv.UserId = cs.UserId
+    LEFT JOIN TopPosts tp ON uv.UserId = tp.OwnerUserId AND tp.PostRank = 1
+    LEFT JOIN LinkedQuestions lq ON tp.Id = lq.PostId
+    WHERE uv.Reputation > 1000 AND uv.UpVotesGiven > 50
+),
+UnionPart AS (
+    SELECT fc.* FROM FinalCTE fc WHERE fc.GoldBadgeCount > 5
+    UNION ALL
+    SELECT fc.* FROM FinalCTE fc WHERE fc.AnswerCount > 100 AND fc.NegativeVotesReceived < 10
+)
+SELECT 
+    up.UserId,
+    up.DisplayName,
+    up.Reputation,
+    up.UpVotesGiven,
+    up.DownVotesGiven,
+    up.NegativeVotesReceived,
+    ROUND(COALESCE(up.AvgAcceptedAnswerScore, 0)::numeric, 2) AS AvgAcceptedAnswerScore,
+    up.TotalPosts,
+    COALESCE(up.TotalViews, 0) AS TotalViews,
+    ROUND(COALESCE(up.AvgPostScore, 0)::numeric, 2) AS AvgPostScore,
+    up.QuestionCount,
+    up.AnswerCount,
+    up.BadgeCount,
+    up.GoldBadgeCount,
+    COALESCE(up.LatestTagBadge, 'None') AS LatestTagBadge,
+    up.CommentCount,
+    ROUND(COALESCE(up.AvgCommentWordCount, 0)::numeric, 2) AS AvgCommentWordCount,
+    up.TopPostId,
+    COALESCE(up.TopPostTitle, 'No Top Post') AS TopPostTitle,
+    up.TopPostScore,
+    up.LinkedQuestionCount,
+    up.UserCategory,
+    up.OverallRank,
+    ROW_NUMBER() OVER (ORDER BY up.OverallRank, up.GoldBadgeCount DESC, up.AnswerCount DESC) AS FinalRank
+FROM UnionPart up
+WHERE EXISTS (
+    SELECT 1 FROM PostHistory ph WHERE ph.UserId = up.UserId AND ph.PostHistoryTypeId = 24
+) AND up.TotalPosts IS NOT NULL
+ORDER BY FinalRank
+LIMIT 50;

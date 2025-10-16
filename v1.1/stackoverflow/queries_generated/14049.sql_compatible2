@@ -1,0 +1,92 @@
+WITH cte AS (
+  SELECT 
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastEditorUserId,
+    p.LastEditDate,
+    p.ClosedDate,
+    p.CommunityOwnedDate,
+    CASE
+      WHEN p.ClosedDate IS NOT NULL THEN CloseReasonTypes.Name
+      ELSE NULL
+    END AS ClosureReason,
+    CASE
+      WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+      ELSE NULL  
+    END AS CommunityOwnership,
+    CASE
+      WHEN p.LastEditorUserId = p.OwnerUserId THEN 'Owner'
+      WHEN p.LastEditorUserId IS NOT NULL THEN 'Edited'
+      ELSE 'Created'
+    END AS PostStatus,
+    COALESCE(p.AnswerCount, 0) AS AnswerCount,
+    COALESCE(p.CommentCount, 0) AS CommentCount,
+    COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+    COALESCE(p.Score, 0) AS Score,
+    COALESCE(p.ViewCount, 0) AS ViewCount,
+    CASE
+      WHEN p.Tags LIKE '%<javascript>%' THEN 'JavaScript'
+      WHEN p.Tags LIKE '%<csharp>%' THEN 'C#'
+      WHEN p.Tags LIKE '%<python>%' THEN 'Python'
+      WHEN p.Tags LIKE '%<java>%' THEN 'Java'
+      WHEN p.Tags LIKE '%<php>%' THEN 'PHP'
+      ELSE 'Other'
+    END AS MainTag,
+    CASE
+      WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Yes'
+      ELSE 'No'
+    END AS HasAcceptedAnswer,
+    CASE
+      WHEN u.Reputation >= 1000 THEN 'Elite'
+      WHEN u.Reputation >= 500 THEN 'Experienced'
+      ELSE 'Novice'
+    END AS OwnerReputation
+  FROM Posts p
+  LEFT JOIN CloseReasonTypes
+    ON p.ClosedDate IS NOT NULL
+    AND (
+      CASE
+        WHEN POSITION(',' IN p.text) > 0 THEN CAST(SUBSTRING(p.text FROM 1 FOR POSITION(',' IN p.text) - 1) AS INTEGER)
+        ELSE NULL
+      END
+    ) = CloseReasonTypes.Id
+  INNER JOIN Users u ON p.OwnerUserId = u.Id
+),
+post_metrics AS (
+  SELECT
+    PostId,
+    SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    SUM(CASE WHEN VoteTypeId = 5 THEN 1 ELSE 0 END) AS Favorites
+  FROM Votes
+  GROUP BY PostId
+)
+SELECT
+  cte.PostId,
+  cte.PostTypeId,
+  cte.OwnerUserId,
+  cte.CreationDate,
+  cte.LastEditorUserId,
+  cte.LastEditDate,
+  cte.ClosedDate,
+  cte.CommunityOwnedDate,
+  cte.ClosureReason,
+  cte.CommunityOwnership,
+  cte.PostStatus,
+  cte.AnswerCount,
+  cte.CommentCount,
+  cte.FavoriteCount,
+  cte.Score,
+  cte.ViewCount,
+  cte.MainTag,
+  cte.HasAcceptedAnswer,
+  cte.OwnerReputation,
+  post_metrics.UpVotes,
+  post_metrics.DownVotes,
+  post_metrics.Favorites
+FROM cte
+LEFT JOIN post_metrics ON cte.PostId = post_metrics.PostId
+ORDER BY cte.CreationDate DESC
+LIMIT 1000;

@@ -1,0 +1,124 @@
+-- {"query": "24075.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2510} 
+WITH
+    -- Counts of badges per user
+    BadgeCounts AS (
+        SELECT
+            UserId,
+            COUNT(*) AS BadgeCount
+        FROM Badges
+        GROUP BY UserId
+    ),
+    -- Aggregated answer and comment counts per question
+    PostAggregates AS (
+        SELECT
+            PostId,
+            SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+            SUM(CASE WHEN PostTypeId = 2 THEN CommentCount ELSE 0 END) AS CommentCount
+        FROM Posts
+        GROUP BY PostId
+    ),
+    -- Base data for each question
+    Questions AS (
+        SELECT
+            p.Id                    AS QuestionId,
+            p.Title,
+            p.Tags,
+            p.Score,
+            p.ViewCount,
+            p.CreationDate,
+            p.OwnerUserId,
+            COALESCE(u.Reputation, 0)   AS OwnerReputation,
+            COALESCE(u.DisplayName, 'Community') AS OwnerDisplayName,
+            COALESCE(bc.BadgeCount, 0) AS BadgeCount,
+            pa.AnswerCount,
+            pa.CommentCount,
+            -- Correlated subquery for the most recent comment
+            (SELECT TOP 1 ch.UserDisplayName
+             FROM   Comments ch
+             WHERE  ch.PostId = p.Id
+             ORDER BY ch.CreationDate DESC)                      AS LastCommenter,
+            -- Correlated subquery for the most recent edit
+            (SELECT TOP 1 ph.CreationDate
+             FROM   PostHistory ph
+             WHERE  ph.PostId = p.Id
+             ORDER BY ph.CreationDate DESC)                      AS LastEditDate,
+            -- Find a duplicate link if it exists
+            (SELECT TOP 1 ll.RelatedPostId
+             FROM   PostLinks ll
+             WHERE  ll.PostId = p.Id
+               AND  ll.LinkTypeId = 3)                            AS DuplicateOf,
+            p.AcceptedAnswerId,
+            -- Window function: rank within all questions 
+            ROW_NUMBER() OVER(ORDER BY p.Score DESC) AS RankGlobal,
+            -- Window function: rank per set of tags (simplified to first tag only)
+            ROW_NUMBER() OVER(PARTITION BY LEFT(p.Tags, CHARINDEX('>', p.Tags)-1) ORDER BY p.Score DESC) AS RankByTag
+        FROM
+            Posts p
+            LEFT JOIN Users u       ON p.OwnerUserId = u.Id
+            LEFT JOIN BadgeCounts bc ON u.Id = bc.UserId
+            LEFT JOIN PostAggregates pa ON p.Id = pa.PostId
+        WHERE
+            p.PostTypeId = 1
+    ),
+    -- A set operator to mix the top and bottom 50 scored questions
+    MixedQuestions AS (
+        SELECT * FROM Questions WHERE RankGlobal <= 50
+        UNION ALL
+        SELECT * FROM Questions WHERE RankGlobal >= (SELECT MAX(RankGlobal) - 49 FROM Questions)
+    ),
+    -- A final CTE that expands tags for a union of two sets of rows
+    TagExpansion AS (
+        SELECT
+            mq.QuestionId,
+            mq.Title,
+            mq.Tags,
+            mq.Score,
+            mq.ViewCount,
+            mq.CreationDate,
+            mq.OwnerUserId,
+            mq.OwnerReputation,
+            mq.OwnerDisplayName,
+            mq.BadgeCount,
+            mq.AnswerCount,
+            mq.CommentCount,
+            mq.LastCommenter,
+            mq.LastEditDate,
+            mq.DuplicateOf,
+            mq.AcceptedAnswerId,
+            mq.RankGlobal,
+            mq.RankByTag,
+            t.TagName
+        FROM
+            MixedQuestions mq
+            CROSS JOIN (SELECT TagName FROM Tags) t
+        WHERE
+            CHARINDEX(CONCAT('<',t.TagName,'>'), mq.Tags) > 0
+    )
+SELECT
+    te.QuestionId,
+    te.Title,
+    te.Tags,
+    te.Score,
+    te.ViewCount,
+    te.CreationDate,
+    te.OwnerUserId,
+    te.OwnerReputation,
+    te.OwnerDisplayName,
+    te.BadgeCount,
+    te.AnswerCount,
+    te.CommentCount,
+    te.LastCommenter,
+    te.LastEditDate,
+    te.DuplicateOf,
+    te.AcceptedAnswerId,
+    te.RankGlobal,
+    te.RankByTag,
+    te.TagName,
+    -- Complicated predicate: include only users with reputation > 1000 but exclude those with null display name
+    CASE WHEN te.OwnerReputation > 1000 AND te.OwnerDisplayName IS NOT NULL THEN 1 ELSE 0 END AS EligibleForFeature
+FROM
+    TagExpansion te
+ORDER BY
+    te.CreationDate DESC,
+    te.Score DESC
+LIMIT 200;

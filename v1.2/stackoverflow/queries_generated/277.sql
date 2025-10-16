@@ -1,0 +1,194 @@
+-- {"query": "277.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.2, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1809} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.Path || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id <> r.Id and not t.TagName = any(r.Path)
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0 and r.Level < 3
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        coalesce(sum(case when b.TagBased = 1 then 1 else 0 end),0) as TagBasedBadges,
+        row_number() over (order by u.Reputation desc nulls last) as ReputationRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostActivityWindow as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.Title,
+        p.AcceptedAnswerId,
+        count(c.Id) as CommentCount,
+        sum(v.VoteTypeId = 2::smallint)::int as UpVotes,
+        sum(v.VoteTypeId = 3::smallint)::int as DownVotes,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as RecentPostRank,
+        lag(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as PrevScore,
+        lead(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as NextScore
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    where p.PostTypeId in (1, 2)
+    group by p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.Title, p.AcceptedAnswerId
+),
+QuestionsWithDuplicates as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.Tags,
+        array_agg(distinct dup.RelatedPostId) filter (where lt.Name = 'Duplicate') as DuplicateIds,
+        count(distinct dup.RelatedPostId) filter (where lt.Name = 'Duplicate') as DuplicateCount
+    from Posts q
+    left join PostLinks dup on dup.PostId = q.Id
+    left join LinkTypes lt on lt.Id = dup.LinkTypeId
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.Tags
+),
+TopUsersRecentPosts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.CommentCount,
+        p.UpVotes,
+        p.DownVotes,
+        case when p.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer,
+        row_number() over (partition by u.Id order by p.CreationDate desc) as PostRank
+    from Users u
+    join PostActivityWindow p on p.OwnerUserId = u.Id
+    where u.Reputation > 10000 and p.PostTypeId = 1
+),
+UserTagEngagement as (
+    select
+        u.Id as UserId,
+        unnest(string_to_array(coalesce(p.Tags, ''), '><')) as Tag,
+        count(p.Id) as PostsCount,
+        avg(p.Score) as AvgScore,
+        sum(p.ViewCount) as TotalViews
+    from Users u
+    join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+    where p.Tags is not null and p.Tags <> ''
+    group by u.Id, Tag
+),
+UserCloseVotes as (
+    select
+        ph.UserId,
+        count(*) as CloseVotesCount,
+        count(distinct ph.PostId) as DistinctClosedPosts,
+        max(ph.CreationDate) as LastCloseVoteDate
+    from PostHistory ph
+    where ph.PostHistoryTypeId = 10
+    group by ph.UserId
+),
+UserActivitySummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        coalesce(b.GoldBadges,0) as GoldBadges,
+        coalesce(b.SilverBadges,0) as SilverBadges,
+        coalesce(b.BronzeBadges,0) as BronzeBadges,
+        coalesce(c.CloseVotesCount,0) as CloseVotes,
+        coalesce(p.PostCount,0) as TotalPosts,
+        coalesce(v.UpVotes,0) as TotalUpVotes,
+        coalesce(v.DownVotes,0) as TotalDownVotes,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        u.WebsiteUrl
+    from Users u
+    left join (
+        select UserId, count(*) as PostCount
+        from Posts
+        group by UserId
+    ) p on p.UserId = u.Id
+    left join UserBadgeStats b on b.UserId = u.Id
+    left join UserCloseVotes c on c.UserId = u.Id
+    left join (
+        select
+            v.UserId,
+            sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+            sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes
+        from Votes v
+        join VoteTypes vt on vt.Id = v.VoteTypeId
+        where v.UserId is not null
+        group by v.UserId
+    ) v on v.UserId = u.Id
+)
+select
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.GoldBadges,
+    uas.SilverBadges,
+    uas.BronzeBadges,
+    uas.CloseVotes,
+    uas.TotalPosts,
+    uas.TotalUpVotes,
+    uas.TotalDownVotes,
+    uas.Location,
+    uas.WebsiteUrl,
+    coalesce(ut.PostsCount,0) as PostsInTopTag,
+    coalesce(ut.AvgScore,0) as AvgScoreInTopTag,
+    coalesce(ut.TotalViews,0) as TotalViewsInTopTag,
+    qwd.DuplicateCount,
+    qwd.Title as SampleQuestionTitle,
+    qwd.Tags as SampleQuestionTags,
+    qwd.ViewCount as SampleQuestionViews,
+    qwd.Score as SampleQuestionScore,
+    case when qwd.DuplicateCount > 0 then 'Has Duplicates' else 'No Duplicates' end as DuplicateStatus,
+    row_number() over (order by uas.Reputation desc nulls last) as UserRank
+from UserActivitySummary uas
+left join lateral (
+    select ut.UserId, ut.Tag, ut.PostsCount, ut.AvgScore, ut.TotalViews
+    from UserTagEngagement ut
+    where ut.UserId = uas.UserId
+    order by ut.PostsCount desc nulls last
+    limit 1
+) ut on true
+left join lateral (
+    select qwd.QuestionId, qwd.Title, qwd.Tags, qwd.ViewCount, qwd.Score, qwd.DuplicateCount
+    from QuestionsWithDuplicates qwd
+    join Posts p on p.Id = qwd.QuestionId
+    where p.OwnerUserId = uas.UserId
+    order by qwd.DuplicateCount desc nulls last, qwd.ViewCount desc nulls last
+    limit 1
+) qwd on true
+where uas.TotalPosts > 50 and uas.Reputation > 5000
+order by uas.Reputation desc
+limit 100;

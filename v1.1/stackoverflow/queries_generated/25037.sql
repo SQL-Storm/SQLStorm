@@ -1,0 +1,140 @@
+-- {"query": "25037.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2109} 
+
+/*  Benchmark query: heavy use of CTEs, joins, window functions, set operators,
+    string manipulation and NULL logic over the StackOverflow schema               */
+
+WITH
+/* --------------------------------------------------------------
+   1. Aggregate per‑user statistics (badges, posts, close events)
+   -------------------------------------------------------------- */
+user_stats AS (
+    SELECT
+        u.id                                     AS user_id,
+        u.displayname,
+        u.reputation,
+        COALESCE(u.location, '[no location]')    AS location,
+        COUNT(b.id) FILTER (WHERE b.class = 1)   AS gold_badges,
+        COUNT(b.id) FILTER (WHERE b.class = 2)   AS silver_badges,
+        COUNT(b.id) FILTER (WHERE b.class = 3)   AS bronze_badges,
+        COUNT(p.id) FILTER (WHERE p.posttypeid = 1) AS questions_asked,
+        COUNT(p.id) FILTER (WHERE p.posttypeid = 2) AS answers_given,
+        AVG(CASE WHEN p.posttypeid = 2 THEN p.score END) AS avg_answer_score,
+        SUM(CASE WHEN ph.posthistorytypeid = 10 THEN 1 ELSE 0 END) AS times_closed
+    FROM users u
+    LEFT JOIN badges   b  ON b.userid   = u.id
+    LEFT JOIN posts    p  ON p.owneruserid = u.id
+    LEFT JOIN posthistory ph
+           ON ph.postid = p.id
+          AND ph.posthistorytypeid = 10               -- closed
+    GROUP BY u.id, u.displayname, u.reputation, u.location
+),
+
+/* --------------------------------------------------------------
+   2. Recent voting activity (last 30 days)
+   -------------------------------------------------------------- */
+recent_votes AS (
+    SELECT
+        v.userid               AS user_id,
+        COUNT(*)               AS votes_last_30d,
+        MAX(v.creationdate)    AS last_vote_date
+    FROM votes v
+    WHERE v.creationdate >= CURRENT_DATE - INTERVAL '30 days'
+    GROUP BY v.userid
+),
+
+/* --------------------------------------------------------------
+   3. Top answer per user (by score) using window function
+   -------------------------------------------------------------- */
+top_answer_per_user AS (
+    SELECT
+        a.owneruserid                        AS user_id,
+        a.id                                 AS answer_id,
+        a.score                              AS answer_score,
+        q.id                                 AS question_id,
+        q.title                              AS question_title,
+        ROW_NUMBER() OVER (PARTITION BY a.owneruserid
+                           ORDER BY a.score DESC,
+                                    a.creationdate ASC) AS rn
+    FROM posts a
+    JOIN posts q ON q.id = a.parentid
+    WHERE a.posttypeid = 2                         -- answer
+),
+
+/* --------------------------------------------------------------
+   4. Concatenated tag list for each user's questions
+   -------------------------------------------------------------- */
+user_question_tags AS (
+    SELECT
+        p.owneruserid               AS user_id,
+        STRING_AGG(
+            TRIM(BOTH '><' FROM UNNEST(string_to_array(p.tags, '><'))),
+            ',' ORDER BY 1
+        )                           AS tag_csv
+    FROM posts p
+    WHERE p.posttypeid = 1          -- question
+      AND p.tags IS NOT NULL
+    GROUP BY p.owneruserid
+),
+
+/* --------------------------------------------------------------
+   5. Users that satisfy the “high‑rep & active” filter
+   -------------------------------------------------------------- */
+qualified_users AS (
+    SELECT
+        us.user_id,
+        us.displayname,
+        us.reputation,
+        us.location,
+        us.gold_badges,
+        us.silver_badges,
+        us.bronze_badges,
+        us.questions_asked,
+        us.answers_given,
+        ROUND(us.avg_answer_score::numeric, 2) AS avg_answer_score,
+        us.times_closed,
+        COALESCE(rv.votes_last_30d, 0)         AS votes_last_30d,
+        COALESCE(rv.last_vote_date,
+                 TIMESTAMP '1970-01-01 00:00:00') AS last_vote_date,
+        tq.answer_id,
+        tq.answer_score,
+        tq.question_title,
+        COALESCE(ut.tag_csv, '')               AS question_tags
+    FROM user_stats us
+    LEFT JOIN recent_votes rv        ON rv.user_id = us.user_id
+    LEFT JOIN top_answer_per_user tq ON tq.user_id = us.user_id AND tq.rn = 1
+    LEFT JOIN user_question_tags ut  ON ut.user_id = us.user_id
+    WHERE us.reputation > 10000
+      AND (us.gold_badges + us.silver_badges + us.bronze_badges) >= 10
+      AND tq.answer_id IS NOT NULL
+)
+
+/* --------------------------------------------------------------
+   Final result set (union with a dummy row to force set‑operator path)
+   -------------------------------------------------------------- */
+SELECT *
+FROM qualified_users
+ORDER BY reputation DESC
+LIMIT 100
+
+UNION ALL
+
+/* Dummy row – useful for benchmarking set‑operator handling */
+SELECT
+    NULL::int        AS user_id,
+    NULL::varchar    AS displayname,
+    NULL::int        AS reputation,
+    NULL::varchar    AS location,
+    NULL::int        AS gold_badges,
+    NULL::int        AS silver_badges,
+    NULL::int        AS bronze_badges,
+    NULL::int        AS questions_asked,
+    NULL::int        AS answers_given,
+    NULL::numeric    AS avg_answer_score,
+    NULL::int        AS times_closed,
+    NULL::int        AS votes_last_30d,
+    NULL::timestamp  AS last_vote_date,
+    NULL::int        AS answer_id,
+    NULL::int        AS answer_score,
+    NULL::varchar    AS question_title,
+    NULL::varchar    AS question_tags
+ORDER BY reputation DESC NULLS LAST;

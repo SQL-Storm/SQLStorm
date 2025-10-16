@@ -1,0 +1,227 @@
+WITH UserAggregates AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+),
+PostEventSummary AS (
+    SELECT
+        ph.PostId,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6, 8, 9) THEN ph.Id END) AS TotalEdits,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Id END) AS CloseEvents,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.Id END) AS ReopenEvents,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 12 THEN ph.Id END) AS DeleteEvents,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 13 THEN ph.Id END) AS UndeleteEvents,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS LastCloseDate,
+        MIN(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 2) AS InitialBodyCreationDate,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 5) AS LastBodyEditDate,
+        (SELECT LENGTH(p_init.Text)
+         FROM PostHistory p_init
+         WHERE p_init.PostId = ph.PostId AND p_init.PostHistoryTypeId = 2
+         ORDER BY p_init.CreationDate ASC LIMIT 1) AS InitialBodyLength,
+        (SELECT LENGTH(p_last.Text)
+         FROM PostHistory p_last
+         WHERE p_last.PostId = ph.PostId AND p_last.PostHistoryTypeId = 5
+         ORDER BY p_last.CreationDate DESC LIMIT 1) AS LastBodyEditLength
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (2, 4, 5, 6, 8, 9, 10, 11, 12, 13)
+    GROUP BY ph.PostId
+),
+PostTagDetails AS (
+    SELECT
+        p.Id AS PostId,
+        TRIM(tag_val) AS TagName
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), '><')) AS tag_val
+    ) t
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+),
+PostVoteSummary AS (
+    SELECT
+        v.PostId,
+        COUNT(v.Id) AS TotalVotes,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesCount,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) AS TotalBountyAmount,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 AND v.UserId IS NOT NULL THEN v.UserId END) AS FavoriteCountDistinctUsers
+    FROM Votes v
+    GROUP BY v.PostId
+),
+BaseQuestionMetrics AS (
+    SELECT
+        P.Id AS QuestionId,
+        P.Title AS QuestionTitle,
+        P.CreationDate AS QuestionCreationDate,
+        P.Score AS QuestionScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.FavoriteCount AS ActualFavoriteCount,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        P.LastActivityDate,
+        P.OwnerUserId,
+        P.LastEditorUserId,
+        P.Tags,
+        UA.DisplayName AS OwnerDisplayName,
+        UA.Reputation AS OwnerReputation,
+        UA.GoldBadges AS OwnerGoldBadges,
+        PES.TotalEdits,
+        PES.CloseEvents,
+        PES.ReopenEvents,
+        PES.DeleteEvents,
+        PES.UndeleteEvents,
+        PL.DuplicateLinkCount,
+        PV.TotalVotes AS TotalVotesOnQuestion,
+        PV.UpVotesCount AS QuestionUpVotes,
+        PV.DownVotesCount AS QuestionDownVotes,
+        (PES.LastBodyEditLength - PES.InitialBodyLength) AS BodyLengthChange,
+        (SELECT COUNT(DISTINCT C.UserId) FROM Comments C WHERE C.PostId = P.Id AND C.CreationDate > P.LastActivityDate - INTERVAL '30 days') AS RecentCommenters,
+        RANK() OVER (
+            PARTITION BY EXTRACT(YEAR FROM P.CreationDate), UA.UserId
+            ORDER BY P.Score DESC, P.ViewCount DESC
+        ) AS OwnerYearlyScoreRank,
+        ROUND(
+            (CAST(P.Score AS NUMERIC) * 0.5 +
+             COALESCE(P.CommentCount, 0) * 0.75 +
+             COALESCE(PV.FavoriteCountDistinctUsers, 0) * 1.5 +
+             COALESCE(PES.TotalEdits, 0) * 0.1) / NULLIF(P.ViewCount, 0) * 100, 2
+        ) AS NetEngagementRatio,
+        (LENGTH(REPLACE(P.Tags, '><', '')) - LENGTH(P.Tags) + 1) AS NumberOfTags,
+        COALESCE(
+            CASE
+                WHEN P.AcceptedAnswerId IS NOT NULL THEN 'Accepted'
+                WHEN P.ClosedDate IS NOT NULL THEN 'Closed'
+                WHEN P.AnswerCount > 0 THEN 'Answered'
+                ELSE 'Unanswered'
+            END, 'Unknown'
+        ) AS QuestionStatus,
+        EXISTS (
+            SELECT 1
+            FROM Badges B_corr
+            JOIN PostTagDetails PTD_corr ON B_corr.UserId = P.OwnerUserId AND B_corr.Name = PTD_corr.TagName
+            WHERE PTD_corr.PostId = P.Id
+            LIMIT 1
+        ) AS OwnerHasRelatedTagBadge,
+        (SELECT MAX(A.Score) FROM Posts A WHERE A.ParentId = P.Id AND A.PostTypeId = 2) AS MaxAnswerScore,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - P.LastActivityDate)) / 3600 AS HoursSinceLastActivity
+    FROM
+        Posts P
+    LEFT JOIN UserAggregates UA ON P.OwnerUserId = UA.UserId
+    LEFT JOIN PostEventSummary PES ON P.Id = PES.PostId
+    LEFT JOIN PostVoteSummary PV ON P.Id = PV.PostId
+    LEFT JOIN (
+        SELECT
+            PostId,
+            COUNT(DISTINCT RelatedPostId) AS DuplicateLinkCount
+        FROM PostLinks
+        WHERE LinkTypeId = 3
+        GROUP BY PostId
+    ) PL ON P.Id = PL.PostId
+    WHERE
+        P.PostTypeId = 1
+        AND P.CreationDate >= DATE '2018-01-01'
+        AND P.CreationDate < DATE '2023-01-01'
+        AND P.Score >= 50
+        AND P.ViewCount > 1000
+        AND P.OwnerUserId IS NOT NULL
+        AND (P.LastEditorUserId IS DISTINCT FROM P.OwnerUserId)
+)
+SELECT
+    QuestionId,
+    QuestionTitle,
+    QuestionCreationDate,
+    QuestionScore,
+    ViewCount,
+    AnswerCount,
+    ActualFavoriteCount,
+    OwnerDisplayName,
+    OwnerReputation,
+    OwnerGoldBadges,
+    TotalEdits,
+    CloseEvents,
+    ReopenEvents,
+    DeleteEvents,
+    UndeleteEvents,
+    DuplicateLinkCount,
+    TotalVotesOnQuestion,
+    QuestionUpVotes,
+    QuestionDownVotes,
+    BodyLengthChange,
+    RecentCommenters,
+    OwnerYearlyScoreRank,
+    NetEngagementRatio,
+    NumberOfTags,
+    QuestionStatus,
+    OwnerHasRelatedTagBadge,
+    MaxAnswerScore,
+    HoursSinceLastActivity,
+    'Controversial_Unresolved_Recent' AS CategoryLabel
+FROM
+    BaseQuestionMetrics bqm
+WHERE
+    bqm.QuestionStatus = 'Unanswered'
+    AND bqm.AnswerCount > 5
+    AND bqm.CloseEvents > 0 AND bqm.ReopenEvents > 0
+    AND (bqm.Tags LIKE '%<sql>%' OR bqm.Tags LIKE '%<postgresql>%' OR LOWER(bqm.QuestionTitle) LIKE '%database%')
+    AND bqm.LastActivityDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+    AND (bqm.MaxAnswerScore IS NULL OR bqm.MaxAnswerScore < bqm.QuestionScore * 0.5)
+
+UNION ALL
+
+SELECT
+    QuestionId,
+    QuestionTitle,
+    QuestionCreationDate,
+    QuestionScore,
+    ViewCount,
+    AnswerCount,
+    ActualFavoriteCount,
+    OwnerDisplayName,
+    OwnerReputation,
+    OwnerGoldBadges,
+    TotalEdits,
+    CloseEvents,
+    ReopenEvents,
+    DeleteEvents,
+    UndeleteEvents,
+    DuplicateLinkCount,
+    TotalVotesOnQuestion,
+    QuestionUpVotes,
+    QuestionDownVotes,
+    BodyLengthChange,
+    RecentCommenters,
+    OwnerYearlyScoreRank,
+    NetEngagementRatio,
+    NumberOfTags,
+    QuestionStatus,
+    OwnerHasRelatedTagBadge,
+    MaxAnswerScore,
+    HoursSinceLastActivity,
+    'Highly_Favored_Edited_Older' AS CategoryLabel
+FROM
+    BaseQuestionMetrics bqm
+WHERE
+    bqm.QuestionCreationDate < DATE '2020-01-01'
+    AND bqm.ActualFavoriteCount >= 10
+    AND bqm.QuestionScore > 200
+    AND bqm.TotalEdits > 5
+    AND bqm.CommunityOwnedDate IS NULL
+    AND bqm.OwnerReputation > 10000
+    AND (bqm.CloseEvents = 0 OR bqm.ReopenEvents > 0)
+    AND (bqm.QuestionStatus = 'Accepted' OR bqm.QuestionStatus = 'Answered')
+
+ORDER BY
+    CategoryLabel DESC,
+    NetEngagementRatio DESC,
+    QuestionScore DESC
+LIMIT 2000;

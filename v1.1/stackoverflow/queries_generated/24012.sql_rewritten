@@ -1,0 +1,128 @@
+-- {"query": "24012.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 4307} 
+WITH
+  /* Daily statistics per user – question side */
+  q_stats AS (
+    SELECT
+      OwnerUserId AS UserId,
+      COUNT(*)          AS QCnt,
+      AVG(Score)        AS AvgQScore,
+      SUM(CASE WHEN Score > 0 THEN 1 END) AS QPos
+    FROM Posts
+    WHERE PostTypeId = 1
+    GROUP BY OwnerUserId
+  ),
+
+  /* Daily statistics per user – answer side */
+  a_stats AS (
+    SELECT
+      p.OwnerUserId AS UserId,
+      COUNT(*)          AS ACnt,
+      AVG(p.Score)      AS AvgAScore,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS AUp
+    FROM Posts p
+    JOIN Votes v ON v.PostId = p.Id
+    WHERE p.PostTypeId = 2
+    GROUP BY p.OwnerUserId
+  ),
+
+  /* Merge question and answer metrics */
+  merged_stats AS (
+    SELECT
+      COALESCE(q.UserId, a.UserId) AS UserId,
+      COALESCE(q.QCnt, 0) + COALESCE(a.ACnt, 0)     AS TotalPosts,
+      COALESCE(q.AvgQScore, 0) + COALESCE(a.AvgAScore, 0) AS AvgScore,
+      COALESCE(q.QPos, 0) + COALESCE(a.AUp, 0)      AS PosVotes
+    FROM q_stats q
+    FULL OUTER JOIN a_stats a
+      ON q.UserId = a.UserId
+  ),
+
+  /* Base user data */
+  user_info AS (
+    SELECT
+      u.Id            AS UserId,
+      u.Reputation,
+      u.LastAccessDate,
+      ms.TotalPosts,
+      ms.AvgScore,
+      ms.PosVotes
+    FROM Users u
+    LEFT JOIN merged_stats ms
+      ON ms.UserId = u.Id
+  ),
+
+  /* Duplicate count per post (link type 3 – duplicate) */
+  dup_counts AS (
+    SELECT
+      l.RelatedPostId AS PostId,
+      COUNT(*)        AS DupCnt
+    FROM PostLinks l
+    WHERE l.LinkTypeId = 3
+    GROUP BY l.RelatedPostId
+  ),
+
+  /* Extract a tag excerpt – only the first tag in the <tag> list */
+  sample_post AS (
+    SELECT
+      p.OwnerUserId AS UserId,
+      MIN(p.Id)         AS SamplePostId,
+      SUBSTRING(p.Tags FROM 2 FOR POSITION('>' IN SUBSTRING(p.Tags FROM 2)) - 1) AS FirstTag
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId
+  ),
+
+  /* Excerpt title for the top‑ranked tag wiki */
+  tag_excerpts AS (
+    SELECT
+      t.TagName,
+      t.Count,
+      p.Title AS ExamTitle
+    FROM Tags t
+    LEFT JOIN Posts p
+      ON p.Id = t.ExcerptPostId
+    WHERE p.PostTypeId = 1
+  ),
+
+  /* Correlated subquery: count of closed questions for each user */
+  closed_q_cnt AS (
+    SELECT
+      ui.UserId,
+      ( SELECT COUNT(*)
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId = 10
+          AND ph.PostId IN (
+            SELECT Id
+            FROM Posts
+            WHERE OwnerUserId = ui.UserId
+              AND PostTypeId = 1
+          )
+      ) AS ClosedCount
+    FROM user_info ui
+  )
+
+SELECT
+  ui.UserId,
+  ui.Reputation,
+  ui.TotalPosts,
+  ui.AvgScore,
+  ui.PosVotes,
+  s.SamplePostId,
+  COALESCE(te.ExamTitle, 'Unknown') AS ExcerptTitle,
+  COALESCE(dc.DupCnt, 0)    AS DuplicateCount,
+  COALESCE(cq.ClosedCount, 0) AS ClosedQuestionCount,
+  CASE WHEN ui.LastAccessDate < cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days' THEN 'Inactive' ELSE 'Active' END AS Status,
+  ROW_NUMBER() OVER (ORDER BY ui.Reputation DESC) AS Rank
+FROM user_info ui
+LEFT JOIN sample_post s
+  ON ui.UserId = s.UserId
+LEFT JOIN dup_counts dc
+  ON dc.PostId = s.SamplePostId
+LEFT JOIN tag_excerpts te
+  ON te.TagName = s.FirstTag
+LEFT JOIN closed_q_cnt cq
+  ON cq.UserId = ui.UserId
+WHERE (ui.TotalPosts > 5 OR ui.PosVotes = 0)
+  AND (dc.DupCnt IS NULL OR dc.DupCnt < 3)
+ORDER BY ui.Reputation DESC, dc.DupCnt ASC
+LIMIT 100;

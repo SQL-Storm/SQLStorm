@@ -1,0 +1,192 @@
+with RecursiveTagCounts as (
+  select
+    t.Id as TagId,
+    t.TagName,
+    t.Count,
+    coalesce(p.AnswerCount, 0) as AnswerCount,
+    coalesce(p.FavoriteCount, 0) as FavoriteCount
+  from Tags t
+  left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+  where t.TagName is not null
+), UserBadges as (
+  select
+    b.UserId,
+    b.Name as BadgeName,
+    sum(case when b.Class = 1 then 3 when b.Class = 2 then 2 else 1 end) as BadgeScore,
+    count(*) as BadgeCount,
+    max(b.Date) as LastBadgeDate
+  from Badges b
+  group by b.UserId, b.Name
+), PostVoteSummary as (
+  select
+    v.PostId,
+    sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+    sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes,
+    count(*) as TotalVotes,
+    max(v.CreationDate) as LastVoteDate
+  from Votes v
+  join VoteTypes vt on vt.Id = v.VoteTypeId
+  group by v.PostId
+), PostAnswers as (
+  select
+    p.ParentId as QuestionId,
+    count(*) as AnswerCount,
+    max(p.Score) as MaxAnswerScore,
+    min(p.Score) as MinAnswerScore,
+    avg(p.Score) as AvgAnswerScore
+  from Posts p
+  where p.PostTypeId = 2
+  group by p.ParentId
+), MaxPostScores as (
+  select
+    p.OwnerUserId,
+    max(p.Score) as MaxUserPostScore
+  from Posts p
+  where p.OwnerUserId is not null
+  group by p.OwnerUserId
+), QuestionActivity as (
+  select
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    pas.AnswerCount,
+    pas.MaxAnswerScore,
+    pas.MinAnswerScore,
+    pas.AvgAnswerScore,
+    p.FavoriteCount,
+    p.ClosedDate,
+    p.OwnerUserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    u.CreationDate as UserCreationDate,
+    u.Views as UserViews,
+    u.UpVotes as UserUpVotes,
+    u.DownVotes as UserDownVotes,
+    max(pb.BadgeScore) as UserBadgeScore,
+    coalesce(pvs.UpVotes,0) as PostUpVotes,
+    coalesce(pvs.DownVotes,0) as PostDownVotes,
+    coalesce(pvs.TotalVotes,0) as PostTotalVotes,
+    p.LastActivityDate
+  from Posts p
+  left join PostAnswers pas on pas.QuestionId = p.Id
+  left join Users u on u.Id = p.OwnerUserId
+  left join UserBadges pb on pb.UserId = p.OwnerUserId
+  left join PostVoteSummary pvs on pvs.PostId = p.Id
+  where p.PostTypeId = 1
+  group by
+    p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.Tags,
+    pas.AnswerCount, pas.MaxAnswerScore, pas.MinAnswerScore, pas.AvgAnswerScore,
+    p.FavoriteCount, p.ClosedDate, p.OwnerUserId,
+    u.DisplayName, u.Reputation, u.Location, u.CreationDate, u.Views, u.UpVotes, u.DownVotes,
+    coalesce(pvs.UpVotes,0), coalesce(pvs.DownVotes,0), coalesce(pvs.TotalVotes,0), p.LastActivityDate
+), RankedQuestions as (
+  select 
+    qa.*,
+    row_number() over (
+      partition by qa.OwnerUserId 
+      order by qa.Score desc, qa.ViewCount desc, qa.CreationDate asc
+    ) as QuestionRank,
+    rank() over (
+      order by qa.Score desc, qa.ViewCount desc
+    ) as GlobalRank
+  from QuestionActivity qa
+), DuplicateLinks as (
+  select distinct
+    pl.PostId as DuplicateQuestionId,
+    pl.RelatedPostId as OriginalQuestionId
+  from PostLinks pl
+  join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+), QuestionCloseInfo as (
+  select
+    ph.PostId,
+    min(ph.CreationDate) as FirstCloseDate,
+    count(case when ph.PostHistoryTypeId = 10 then 1 end) as CloseVotesCount,
+    count(case when ph.PostHistoryTypeId = 11 then 1 end) as ReopenVotesCount,
+    max(c.Name) as CloseReason
+  from PostHistory ph
+  left join CloseReasonTypes c on c.Id = cast(ph.Comment as integer)
+  where ph.PostHistoryTypeId in (10,11)
+  group by ph.PostId
+), FinalQuestionData as (
+  select
+    rq.*,
+    dl.OriginalQuestionId,
+    qci.FirstCloseDate,
+    qci.CloseVotesCount,
+    qci.ReopenVotesCount,
+    qci.CloseReason,
+    case 
+      when rq.ClosedDate is not null then 'Closed'
+      when qci.FirstCloseDate is not null then 'Recently Closed'
+      else 'Open'
+    end as QuestionStatus,
+    (
+      0.5 * coalesce(rq.Score,0) + 
+      0.3 * coalesce(rq.ViewCount,0) /
+        nullif(extract(epoch from (timestamp '2024-10-01 12:34:56' - rq.CreationDate)), 0) +
+      0.1 * coalesce(rq.AnswerCount,0) +
+      0.05 * coalesce(rq.FavoriteCount,0) +
+      0.05 * coalesce(rq.UserBadgeScore,0) +
+      case when rq.OwnerUserId is null then 0 else 0.1 end
+    ) *
+    (case when rq.ClosedDate is not null then 0.5 else 1 end) as EngagementScore
+  from RankedQuestions rq
+  left join DuplicateLinks dl on dl.DuplicateQuestionId = rq.Id
+  left join QuestionCloseInfo qci on qci.PostId = rq.Id
+)
+select 
+  fq.Id as QuestionId,
+  fq.Title,
+  fq.Tags,
+  fq.CreationDate,
+  fq.Score,
+  fq.ViewCount,
+  fq.AnswerCount,
+  fq.MaxAnswerScore,
+  fq.MinAnswerScore,
+  fq.AvgAnswerScore,
+  fq.FavoriteCount,
+  fq.ClosedDate,
+  fq.FirstCloseDate,
+  fq.CloseVotesCount,
+  fq.ReopenVotesCount,
+  fq.CloseReason,
+  fq.QuestionStatus,
+  fq.EngagementScore,
+  fq.OwnerUserId,
+  fq.DisplayName as OwnerDisplayName,
+  fq.Reputation as OwnerReputation,
+  fq.Location as OwnerLocation,
+  fq.UserCreationDate,
+  fq.UserViews,
+  fq.UserUpVotes,
+  fq.UserDownVotes,
+  fq.UserBadgeScore,
+  fq.PostUpVotes,
+  fq.PostDownVotes,
+  fq.PostTotalVotes,
+  fq.QuestionRank,
+  fq.GlobalRank,
+  fq.OriginalQuestionId,
+  rank() over (partition by coalesce(fq.Location, 'Unknown') order by fq.EngagementScore desc) as LocationEngagementRank,
+  array_to_string(array_agg(distinct regexp_split_to_table(coalesce(fq.Tags,''), '><')), ', ') as TagList,
+  case 
+    when fq.EngagementScore > 50 then 'High Engagement' 
+    when fq.EngagementScore between 20 and 50 then 'Medium Engagement'
+    else 'Low Engagement'
+  end as EngagementCategory
+from FinalQuestionData fq
+where fq.QuestionRank <= 5
+group by
+  fq.Id, fq.Title, fq.Tags, fq.CreationDate, fq.Score, fq.ViewCount, fq.AnswerCount,
+  fq.MaxAnswerScore, fq.MinAnswerScore, fq.AvgAnswerScore, fq.FavoriteCount, fq.ClosedDate,
+  fq.FirstCloseDate, fq.CloseVotesCount, fq.ReopenVotesCount, fq.CloseReason, fq.QuestionStatus,
+  fq.EngagementScore, fq.OwnerUserId, fq.DisplayName, fq.Reputation, fq.Location, fq.UserCreationDate,
+  fq.UserViews, fq.UserUpVotes, fq.UserDownVotes, fq.UserBadgeScore, fq.PostUpVotes, fq.PostDownVotes,
+  fq.PostTotalVotes, fq.QuestionRank, fq.GlobalRank, fq.OriginalQuestionId
+order by fq.Location nulls last, fq.EngagementScore desc
+limit 100;

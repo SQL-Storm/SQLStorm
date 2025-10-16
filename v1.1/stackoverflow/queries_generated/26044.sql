@@ -1,0 +1,63 @@
+-- {"query": "26044.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "llama-3.3-instruct", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 603} 
+
+WITH top_users AS (
+  SELECT u.Id, u.DisplayName, COUNT(b.Id) AS badge_count
+  FROM Users u
+  JOIN Badges b ON u.Id = b.UserId
+  GROUP BY u.Id, u.DisplayName
+  ORDER BY badge_count DESC
+  LIMIT 100
+),
+top_posts AS (
+  SELECT p.Id, p.Title, p.Score, p.ViewCount,
+    ROW_NUMBER() OVER (ORDER BY p.Score DESC) AS score_rank,
+    ROW_NUMBER() OVER (ORDER BY p.ViewCount DESC) AS view_rank
+  FROM Posts p
+  WHERE p.PostTypeId = 1 AND p.Score > 0
+),
+linked_posts AS (
+  SELECT pl.PostId, pl.RelatedPostId,
+    ROW_NUMBER() OVER (PARTITION BY pl.PostId ORDER BY pl.CreationDate) AS link_rank
+  FROM PostLinks pl
+  WHERE pl.LinkTypeId = 1
+)
+SELECT 
+  u.Id AS user_id,
+  u.DisplayName AS user_name,
+  p.Id AS post_id,
+  p.Title AS post_title,
+  p.Score AS post_score,
+  p.ViewCount AS post_views,
+  ph.PostHistoryTypeId AS post_history_type,
+  ph.CreationDate AS post_history_date,
+  ph.UserId AS post_history_user_id,
+  ph.Comment AS post_history_comment,
+  COALESCE(v.VoteTypeId, 0) AS vote_type,
+  COALESCE(v.CreationDate, CURRENT_TIMESTAMP) AS vote_date,
+  COALESCE(lp.RelatedPostId, 0) AS linked_post_id,
+  COALESCE(lp.link_rank, 0) AS linked_post_rank,
+  COALESCE(tu.badge_count, 0) AS user_badge_count,
+  p.score_rank,
+  p.view_rank,
+  CASE 
+    WHEN p.Score > 100 THEN 'High Score'
+    WHEN p.Score > 50 THEN 'Medium Score'
+    ELSE 'Low Score'
+  END AS score_category,
+  CASE 
+    WHEN p.ViewCount > 1000 THEN 'High Views'
+    WHEN p.ViewCount > 500 THEN 'Medium Views'
+    ELSE 'Low Views'
+  END AS view_category,
+  ROW_NUMBER() OVER (ORDER BY p.Score DESC) AS overall_rank
+FROM Users u
+JOIN Posts p ON u.Id = p.OwnerUserId
+JOIN PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN Votes v ON p.Id = v.PostId
+LEFT JOIN linked_posts lp ON p.Id = lp.PostId
+LEFT JOIN top_users tu ON u.Id = tu.Id
+WHERE p.PostTypeId = 1 AND p.Score > 0
+AND ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15)
+AND v.VoteTypeId IN (1, 2, 3)
+AND lp.link_rank = 1
+ORDER BY p.Score DESC, p.ViewCount DESC;

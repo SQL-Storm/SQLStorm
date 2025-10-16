@@ -1,0 +1,89 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesGiven,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        u.Reputation
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id, u.DisplayName, u.Location, u.Reputation
+), PostTags AS (
+    SELECT p.Id AS PostId,
+           TRIM(tag) AS TagName
+    FROM Posts p,
+    LATERAL (
+        SELECT regexp_split_to_table(
+            CASE WHEN p.Tags LIKE '<%>' THEN regexp_replace(p.Tags, '^<|>$', '', 'g') ELSE p.Tags END,
+            '><'
+        ) AS tag
+    ) s
+), PostAnalysis AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        AVG(LENGTH(c.Text)) AS AvgCommentLength,
+        MAX(p.Score) FILTER (WHERE p.PostTypeId = 1) AS MaxQuestionScore,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId = 10) AS CloseEvents,
+        STRING_AGG(DISTINCT t.TagName, '; ') FILTER (WHERE t.TagName IS NOT NULL) AS FrequentTags
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (10, 11)
+    LEFT JOIN PostTags t ON p.Id = t.PostId
+    GROUP BY p.OwnerUserId
+), CloseReasonIds AS (
+    SELECT Id FROM CloseReasonTypes WHERE Name LIKE '%Duplicate%'
+), UserCloseCounts AS (
+    SELECT UserId, COUNT(*) AS CloseReasonCount 
+    FROM PostHistory 
+    WHERE PostHistoryTypeId = 10 
+      AND (CASE WHEN Comment ~ '^[0-9]+$' THEN CAST(Comment AS INTEGER) END) IN (SELECT Id FROM CloseReasonIds)
+    GROUP BY UserId
+)
+SELECT 
+    (us.DisplayName || ' (' || us.Location || ')') AS UserProfile,
+    pa.TotalPosts,
+    pa.TotalComments,
+    (pa.MaxQuestionScore * 1.0) / NULLIF(us.UpvotesGiven, 0) AS ScoreEfficiency,
+    us.GoldBadges + us.SilverBadges * 0.5 + us.BronzeBadges * 0.25 AS BadgeWeight,
+    ROW_NUMBER() OVER (ORDER BY pa.AvgCommentLength DESC) AS CommentVerbosityRank,
+    pa.FrequentTags,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = us.Id AND p2.PostTypeId = 2 AND EXISTS (
+        SELECT 1 FROM Posts p3 WHERE p3.AcceptedAnswerId = p2.Id
+    )) AS AcceptedAnswers,
+    COALESCE(uc.CloseReasonCount, 0) AS TotalClosures,
+    us.DownvotesGiven
+FROM UserStats us
+JOIN PostAnalysis pa ON us.Id = pa.OwnerUserId
+LEFT JOIN UserCloseCounts uc ON us.Id = uc.UserId
+WHERE us.ReputationRank <= 1000
+  AND pa.TotalPosts > (SELECT AVG(TotalPosts) FROM PostAnalysis)
+  AND us.DownvotesGiven < (
+      SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY DownvotesGiven) FROM UserStats
+  )
+UNION ALL
+SELECT 
+    'Community Total' AS UserProfile,
+    SUM(pa.TotalPosts) AS TotalPosts,
+    SUM(pa.TotalComments) AS TotalComments,
+    AVG((pa.MaxQuestionScore * 1.0) / NULLIF(us.UpvotesGiven, 0)) AS ScoreEfficiency,
+    SUM(us.GoldBadges + us.SilverBadges * 0.5 + us.BronzeBadges * 0.25) AS BadgeWeight,
+    CAST(NULL AS INTEGER) AS CommentVerbosityRank,
+    CAST(NULL AS TEXT) AS FrequentTags,
+    SUM((
+        SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = us.Id AND p2.PostTypeId = 2 AND EXISTS (
+            SELECT 1 FROM Posts p3 WHERE p3.AcceptedAnswerId = p2.Id
+        )
+    )) AS AcceptedAnswers,
+    SUM(COALESCE(uc.CloseReasonCount, 0)) AS TotalClosures,
+    NULL AS DownvotesGiven
+FROM UserStats us
+JOIN PostAnalysis pa ON us.Id = pa.OwnerUserId
+LEFT JOIN UserCloseCounts uc ON us.Id = uc.UserId;

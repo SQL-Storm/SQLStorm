@@ -1,0 +1,131 @@
+-- {"query": "20032.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1369} 
+
+WITH UserMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS AccountCreationDate,
+        (u.LastAccessDate - u.CreationDate) AS AccountAge,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        SUM(p.Score) AS TotalPostScore,
+        SUM(p.ViewCount) AS TotalViewCount,
+        SUM(p.FavoriteCount) AS TotalFavoriteCount,
+        (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id) AS TotalCommentsMade,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    WHERE
+        u.Id > 0 AND u.Reputation > 1000
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+    HAVING
+        COUNT(p.Id) > 10
+),
+PostDetails AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.FavoriteCount,
+        p.AnswerCount,
+        p.LastActivityDate - p.CreationDate AS ActivityDuration,
+        LEAD(p.CreationDate, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) - p.CreationDate AS TimeToNextPost,
+        100.0 * p.Score / SUM(p.Score) OVER (PARTITION BY p.OwnerUserId) AS PercentageOfUserTotalScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS UserPostRank
+    FROM
+        Posts p
+    WHERE
+        p.OwnerUserId IS NOT NULL AND p.CommunityOwnedDate IS NULL AND p.ClosedDate IS NULL
+),
+QuestionAnalysis AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        (SELECT MIN(a.CreationDate) FROM Posts a WHERE a.ParentId = q.Id) AS FirstAnswerDate,
+        (SELECT aa.CreationDate FROM Posts aa WHERE aa.Id = q.AcceptedAnswerId) AS AcceptedAnswerDate,
+        (
+            SELECT STRING_AGG(t.TagName, ', ')
+            FROM UNNEST(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')) tag_name
+            JOIN Tags t ON t.TagName = tag_name
+            WHERE t.IsRequired
+        ) AS RequiredTags
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+
+    UNION ALL
+
+    SELECT
+        a.ParentId AS QuestionId,
+        a.OwnerUserId,
+        NULL AS FirstAnswerDate,
+        NULL AS AcceptedAnswerDate,
+        NULL AS RequiredTags
+    FROM Posts a
+    WHERE a.PostTypeId = 2 AND a.ParentId IS NOT NULL
+)
+SELECT
+    um.DisplayName,
+    um.Reputation,
+    um.GoldBadges,
+    pd.Title AS PostTitle,
+    pt.Name AS PostType,
+    pd.Score,
+    pd.ViewCount,
+    pd.UserPostRank,
+    pd.PercentageOfUserTotalScore,
+    EXTRACT(EPOCH FROM pd.ActivityDuration) / 3600 AS ActivityDurationHours,
+    EXTRACT(EPOCH FROM pd.TimeToNextPost) / 3600 AS HoursToNextPost,
+    COALESCE(qa.RequiredTags, 'N/A') AS RequiredTagsOnQuestion,
+    CASE
+        WHEN qa.AcceptedAnswerDate IS NOT NULL THEN EXTRACT(EPOCH FROM (qa.AcceptedAnswerDate - p_q.CreationDate)) / 60
+        ELSE NULL
+    END AS MinutesToAcceptedAnswer,
+    (
+        SELECT COUNT(DISTINCT pl.RelatedPostId)
+        FROM PostLinks pl
+        WHERE pl.PostId = pd.Id AND pl.LinkTypeId = 1
+    ) AS LinkedPostCount,
+    (
+        SELECT crt.Name
+        FROM PostHistory ph
+        JOIN CloseReasonTypes crt ON TRY_CAST(ph.Comment AS smallint) = crt.Id
+        WHERE ph.PostId = pd.Id AND ph.PostHistoryTypeId = 10
+        LIMIT 1
+    ) AS FirstCloseReason
+FROM
+    UserMetrics um
+JOIN
+    PostDetails pd ON um.UserId = pd.OwnerUserId
+JOIN
+    PostTypes pt ON pd.PostTypeId = pt.Id
+LEFT JOIN
+    QuestionAnalysis qa ON (pd.Id = qa.QuestionId AND pd.PostTypeId = 1) OR (pd.OwnerUserId = qa.OwnerUserId AND pd.PostTypeId = 2)
+LEFT JOIN
+    Posts p_q ON qa.QuestionId = p_q.Id
+WHERE
+    um.Reputation > 75000
+    AND um.AccountAge > INTERVAL '5 years'
+    AND um.GoldBadges > 3
+    AND pd.UserPostRank <= 5
+    AND pd.Score > (SELECT AVG(Score) FROM Posts WHERE OwnerUserId = um.UserId)
+    AND pd.Tags LIKE '%<sql>%'
+    AND EXISTS (
+        SELECT 1
+        FROM Votes v
+        WHERE v.PostId = pd.Id AND v.VoteTypeId = 8 -- BountyStart
+    )
+ORDER BY
+    um.Reputation DESC,
+    um.UserId,
+    pd.UserPostRank
+LIMIT 100;

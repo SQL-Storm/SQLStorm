@@ -1,0 +1,130 @@
+-- {"query": "5061.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1274} 
+with RecentActiveUsers as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(b.Id) as BadgeCount,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        row_number() over (order by u.LastAccessDate desc, u.Reputation desc) as rn
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    where u.LastAccessDate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+TrendingTags as (
+    select
+        t.TagName,
+        t.Count,
+        rank() over (order by t.Count desc) as TagRank
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.Count > 100
+),
+HighScoreQuestions as (
+    select
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.CreationDate,
+        string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><') as TagArray,
+        dense_rank() over (order by p.Score desc, p.ViewCount desc) as QuestionRank
+    from Posts p
+    where p.PostTypeId = 1
+      and p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '90 days'
+      and p.Score >= 5
+),
+CommentStats as (
+    select
+        c.PostId,
+        count(*) as CommentCount,
+        max(c.Score) as MaxCommentScore,
+        avg(c.Score) as AvgCommentScore,
+        sum(length(coalesce(c.Text,''))) as TotalCommentLength
+    from Comments c
+    where c.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '90 days'
+    group by c.PostId
+),
+LinkedDuplicates as (
+    select
+        pl.PostId,
+        count(case when pl.LinkTypeId = 3 then 1 end) as DuplicateLinks,
+        count(case when pl.LinkTypeId = 1 then 1 end) as RelatedLinks
+    from PostLinks pl
+    group by pl.PostId
+),
+AcceptedAnswers as (
+    select
+        p.ParentId as QuestionId,
+        p.Id as AnswerId,
+        p.OwnerUserId as AnswererId,
+        p.Score as AnswerScore,
+        p.CreationDate as AnswerCreationDate
+    from Posts p
+    where p.PostTypeId = 2
+      and p.Id in (select distinct AcceptedAnswerId from Posts where AcceptedAnswerId is not null)
+),
+VoteSummary as (
+    select
+        v.PostId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as Upvotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as Downvotes,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites
+    from Votes v
+    where v.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '90 days'
+    group by v.PostId
+)
+select
+    ha.PostId,
+    ha.Title,
+    ha.Score,
+    ha.ViewCount,
+    u.DisplayName as OwnerName,
+    u.Reputation as OwnerReputation,
+    ra.BadgeCount as OwnerBadges,
+    array_to_string(ha.TagArray, ', ') as Tags,
+    coalesce(array_agg(tt.TagName) filter (where tt.TagRank <= 5), array[]::varchar[]) as Top5TrendingTagsMatched,
+    cs.CommentCount,
+    cs.MaxCommentScore,
+    cs.AvgCommentScore,
+    cs.TotalCommentLength,
+    ld.DuplicateLinks,
+    ld.RelatedLinks,
+    vs.Upvotes,
+    vs.Downvotes,
+    vs.Favorites,
+    case
+        when aa.AnswerId is not null then
+            concat('Accepted Answer by ', coalesce(ans.DisplayName, 'N/A'), ' (', aa.AnswerScore, ' pts, ', 
+                extract(epoch from (aa.AnswerCreationDate - ha.CreationDate))/3600, ' hours after question)')
+        else 'No accepted answer'
+    end as AcceptedAnswerInfo,
+    case
+        when (ha.Score >= 10 and cs.CommentCount < 2 and (ld.DuplicateLinks = 0 or ld.DuplicateLinks is null)) then
+            'Potentially undervalued'
+        when (ha.Score < 7 and vs.Upvotes > 10) then
+            'Controversial'
+        when ha.ViewCount > 10000 and ha.Score < 3 then
+            'High traffic, low score'
+        else 'Normal'
+    end as PostEvaluationLabel
+from HighScoreQuestions ha
+join Users u on u.Id = ha.OwnerUserId
+left join RecentActiveUsers ra on ra.UserId = u.Id
+left join CommentStats cs on cs.PostId = ha.PostId
+left join LinkedDuplicates ld on ld.PostId = ha.PostId
+left join VoteSummary vs on vs.PostId = ha.PostId
+left join AcceptedAnswers aa on aa.QuestionId = ha.PostId
+left join Users ans on ans.Id = aa.AnswererId
+left join TrendingTags tt on tt.TagName = any(ha.TagArray)
+where (cs.CommentCount is null or cs.CommentCount >= 0)
+group by
+    ha.PostId, ha.Title, ha.Score, ha.ViewCount, u.DisplayName, u.Reputation, ra.BadgeCount, ha.TagArray,
+    cs.CommentCount, cs.MaxCommentScore, cs.AvgCommentScore, cs.TotalCommentLength,
+    ld.DuplicateLinks, ld.RelatedLinks, vs.Upvotes, vs.Downvotes, vs.Favorites,
+    aa.AnswerId, aa.AnswerScore, aa.AnswerCreationDate, ha.CreationDate, ans.DisplayName
+order by ha.Score desc, vs.Upvotes desc nulls last, ha.ViewCount desc
+limit 100;

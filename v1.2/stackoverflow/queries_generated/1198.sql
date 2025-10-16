@@ -1,0 +1,187 @@
+-- {"query": "1198.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.1, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1878} 
+
+WITH RecursivePostTags AS (
+    SELECT 
+        p.Id AS PostId,
+        TRIM(tag) AS TagName
+    FROM 
+        Posts p,
+        unnest(string_to_array(substring(coalesce(p.Tags, ''), 2, length(coalesce(p.Tags, '')) - 2), '><')) AS tag
+    WHERE p.PostTypeId = 1
+), 
+UserBadgeStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        COALESCE(SUM(CASE WHEN b.Date >= CURRENT_DATE - INTERVAL '30 days' THEN 1 ELSE 0 END), 0) AS RecentBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+), 
+PostScoresWithRanks AS (
+    SELECT 
+        p.Id, 
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC NULLS LAST, p.CreationDate ASC) AS ScoreRank,
+        RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS UserPostScoreRank,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS UserPostCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags
+    FROM Posts p
+    WHERE p.Score IS NOT NULL
+),
+TopQuestionsWithAnswers AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.CreationDate AS QuestionCreation,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.OwnerUserId AS AnswerOwner,
+        a.CreationDate AS AnswerCreation,
+        us.DisplayName AS QuestionOwnerName,
+        ua.DisplayName AS AnswerOwnerName,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC NULLS LAST) AS AnswerRank
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN Users us ON q.OwnerUserId = us.Id
+    LEFT JOIN Users ua ON a.OwnerUserId = ua.Id
+    WHERE q.PostTypeId = 1
+),
+ClosedQuestionsLastMonth AS (
+    SELECT 
+        ph.PostId,
+        COUNT(*) AS CloseEventsCount,
+        MAX(ph.CreationDate) AS LastCloseDate,
+        STRING_AGG(DISTINCT crt.Name, ', ') FILTER (WHERE crt.Name IS NOT NULL) AS CloseReasons
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS smallint)
+    WHERE ph.PostHistoryTypeId = 10 -- Post Closed
+      AND ph.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+    GROUP BY ph.PostId
+),
+UserActivitySummary AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (10,12)) AS ClosedOrDeletedPosts,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId IN (2,3)) AS VoteCount,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS AvgPostScore,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 10) AS LastCloseEvent,
+        (SELECT COUNT(*) FROM Badges WHERE UserId = u.Id) AS BadgeTotal
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id AND ph.PostHistoryTypeId = 10
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+UserTagsInterest AS (
+    SELECT 
+        ua.Id AS UserId,
+        tag.TagName,
+        COUNT(DISTINCT p.Id) AS PostsWithTagCount
+    FROM Users ua
+    JOIN Posts p ON p.OwnerUserId = ua.Id AND p.PostTypeId = 1
+    JOIN RecursivePostTags tag ON tag.PostId = p.Id
+    GROUP BY ua.Id, tag.TagName
+),
+QuestionDuplicationStats AS (
+    SELECT
+        pl.PostId,
+        SUM(CASE WHEN lt.Name = 'Duplicate' THEN 1 ELSE 0 END) AS CountDuplicates,
+        COUNT(*) AS TotalLinks,
+        MAX(pl.CreationDate) AS LastLinkDate
+    FROM PostLinks pl
+    LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    GROUP BY pl.PostId
+),
+ComplexStringExpressions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        LENGTH(p.Body) AS BodyLength,
+        LENGTH(TRIM(p.Title)) AS TitleLength,
+        REPLACE(REPLACE(p.Title, '"', '""'), '''', '') AS NormalizedTitle,
+        COALESCE(array_to_string(array_agg(DISTINCT tag.TagName ORDER BY tag.TagName), ', '), '') AS TagsConcatenated,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'AcceptedAnswer'
+            ELSE 'Open'
+        END AS PostStatus,
+        CASE WHEN p.ViewCount IS NULL OR p.ViewCount = 0 THEN NULL ELSE p.Score::FLOAT / NULLIF(p.ViewCount,0) END AS ScoreToViewRatio
+    FROM Posts p
+    LEFT JOIN RecursivePostTags tag ON tag.PostId = p.Id
+    GROUP BY p.Id, p.Title, p.Body, p.ClosedDate, p.AcceptedAnswerId, p.ViewCount, p.Score
+),
+CorrelationPerUser AS (
+    SELECT 
+        u.Id AS UserId,
+        AVG(p.Score) AS AvgScore,
+        AVG(p.ViewCount) AS AvgViews,
+        CASE WHEN COUNT(p.Score) > 1 THEN 
+           REGR_SLOPE(p.Score, p.ViewCount) ELSE NULL END AS ScoreViewsSlope,
+        CASE WHEN COUNT(p.Score) > 1 THEN 
+           CORR(p.Score, p.ViewCount) ELSE NULL END AS ScoreViewsCorrelation
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    GROUP BY u.Id
+)
+
+SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Body,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerName,
+    uts.GoldBadges,
+    uts.SilverBadges,
+    uts.BronzeBadges,
+    uts.RecentBadges,
+    cqs.AnswerId,
+    cqs.AnswerScore,
+    cqs.AnswerOwnerName,
+    cqs.AnswerCreation,
+    cqsm.CloseEventsCount,
+    cqsm.CloseReasons,
+    ua.CommentCount AS OwnerCommentCount,
+    ua.LastPostDate AS OwnerLastPost,
+    utags.TagsConcatenated,
+    round(cp.ScoreToViewRatio::numeric, 5) AS ScoreToViewRatio,
+    cp.PostStatus,
+    corr.ScoreViewsCorrelation,
+    dq.CountDuplicates,
+    dq.TotalLinks,
+    dq.LastLinkDate
+FROM Posts p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN UserBadgeStats uts ON uts.UserId = p.OwnerUserId
+LEFT JOIN TopQuestionsWithAnswers cqs ON cqs.QuestionId = p.Id AND cqs.AnswerRank = 1
+LEFT JOIN ClosedQuestionsLastMonth cqsm ON cqsm.PostId = p.Id
+LEFT JOIN UserActivitySummary ua ON ua.Id = p.OwnerUserId
+LEFT JOIN ComplexStringExpressions cp ON cp.Id = p.Id
+LEFT JOIN CorrelationPerUser corr ON corr.UserId = p.OwnerUserId
+LEFT JOIN QuestionDuplicationStats dq ON dq.PostId = p.Id
+LEFT JOIN (
+    SELECT DISTINCT ON (PostId) PostId, TagsConcatenated
+    FROM ComplexStringExpressions
+) utags ON utags.PostId = p.Id
+WHERE p.PostTypeId = 1
+  AND (p.Score IS NOT NULL AND p.Score > 5)
+  AND (p.ViewCount IS NOT NULL AND p.ViewCount > 1000)
+ORDER BY ScoreToViewRatio DESC NULLS LAST, p.ViewCount DESC
+LIMIT 100;

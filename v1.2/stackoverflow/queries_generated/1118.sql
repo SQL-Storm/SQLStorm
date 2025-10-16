@@ -1,0 +1,81 @@
+-- {"query": "1118.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.1, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 994} 
+WITH RecentTopQuestions AS (
+    SELECT p.Id, p.Title, p.OwnerUserId, p.Score,
+           ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS rn,
+           COALESCE(p.Tags, '') AS Tags,
+           (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.CreationDate >= NOW() - INTERVAL '30 days') AS RecentCommentsCount,
+           (SELECT AVG(vt.Name) FILTER (WHERE vt.Name IS NOT NULL) FROM Votes v LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id WHERE v.PostId = p.Id) AS AvgVoteTypeName
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= NOW() - INTERVAL '180 days'
+)
+, UserBadgeStats AS (
+    SELECT b.UserId,
+           COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+           COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+           COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+           MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    WHERE b.Date >= NOW() - INTERVAL '365 days'
+    GROUP BY b.UserId
+)
+, PostVotesAgg AS (
+    SELECT v.PostId,
+           COUNT(*) FILTER (WHERE vt.Name = 'UpMod') AS UpVotes,
+           COUNT(*) FILTER (WHERE vt.Name = 'DownMod') AS DownVotes,
+           COUNT(*) FILTER (WHERE vt.Name = 'Favorite') AS Favorites,
+           COUNT(*) FILTER (WHERE vt.Name = 'BountyStart') AS BountiesStarted,
+           SUM(v.BountyAmount) FILTER (WHERE vt.Name IN ('BountyStart','BountyClose')) AS TotalBountyAmount
+    FROM Votes v
+    LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY v.PostId
+)
+, PostLinksInfo AS (
+    SELECT pl.PostId,
+           COUNT(*) FILTER (WHERE lt.Name = 'Linked') AS LinkedCount,
+           COUNT(*) FILTER (WHERE lt.Name = 'Duplicate') AS DuplicateCount
+    FROM PostLinks pl
+    LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    GROUP BY pl.PostId
+)
+SELECT u.Id AS UserId, u.DisplayName,
+       COALESCE(ubs.GoldBadges,0) AS GoldBadgeCount,
+       COALESCE(ubs.SilverBadges,0) AS SilverBadgeCount,
+       COALESCE(ubs.BronzeBadges,0) AS BronzeBadgeCount,
+       rtq.Id AS QuestionId,
+       rtq.Title,
+       rtq.Score,
+       rtq.RecentCommentsCount,
+       pva.UpVotes,
+       pva.DownVotes,
+       pva.Favorites,
+       pva.BountiesStarted,
+       pva.TotalBountyAmount,
+       plinfo.LinkedCount,
+       plinfo.DuplicateCount,
+       CASE WHEN rtq.Tags <> ''
+            THEN ARRAY_TO_STRING(ARRAY(
+                SELECT DISTINCT TRIM(BOTH '<>' FROM unnest(string_to_array(rtq.Tags, '><')))
+                ORDER BY 1
+            ), ', ')
+            ELSE NULL
+       END AS TagList,
+       CASE WHEN rtq.Score > 100 THEN 'Hot Question' ELSE 'Regular' END AS QuestionPopularity,
+       (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = rtq.Id AND a.Score > (rtq.Score / NULLIF(NULLIF(rtq.AnswerCount,0),0)) ) AS BetterAnswersCount,
+       EXTRACT(EPOCH FROM (NOW() - u.CreationDate))/86400 AS UserAgeDays,
+       RANK() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC NULLS LAST) AS LocationReputationRank
+FROM RecentTopQuestions rtq
+INNER JOIN Users u ON u.Id = rtq.OwnerUserId
+LEFT JOIN UserBadgeStats ubs ON u.Id = ubs.UserId
+LEFT JOIN PostVotesAgg pva ON rtq.Id = pva.PostId
+LEFT JOIN PostLinksInfo plinfo ON rtq.Id = plinfo.PostId
+WHERE rtq.rn = 1
+  AND (u.Location IS NULL OR u.Location <> 'Nowhere') 
+  AND EXISTS (
+       SELECT 1 FROM Posts ap
+       WHERE ap.ParentId = rtq.Id 
+         AND ap.Score > rtq.Score * 0.5
+         AND ap.CreationDate > rtq.CreationDate - INTERVAL '60 days'
+) 
+ORDER BY GoldBadgeCount DESC NULLS LAST, rtq.Score DESC, u.Reputation DESC
+LIMIT 100;

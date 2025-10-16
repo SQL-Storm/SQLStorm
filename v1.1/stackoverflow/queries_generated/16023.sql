@@ -1,0 +1,128 @@
+-- {"query": "16023.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 56040, "output_tokens": 50912} 
+
+WITH user_activity_metrics AS (
+  SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    COUNT(DISTINCT p.Id) as post_count,
+    COUNT(DISTINCT c.Id) as comment_count,
+    COUNT(DISTINCT b.Id) as badge_count,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) as avg_question_score,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) as received_upvotes,
+    COALESCE(STRING_AGG(DISTINCT CASE 
+      WHEN b.Class = 1 THEN b.Name 
+      ELSE NULL 
+    END, ', '), 'No Gold Badges') as gold_badges
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+  LEFT JOIN Comments c ON u.Id = c.UserId
+  LEFT JOIN Badges b ON u.Id = b.UserId
+  LEFT JOIN Votes v ON p.Id = v.PostId
+  WHERE u.CreationDate >= TIMESTAMP '2015-01-01'
+    AND (u.Location IS NULL OR LENGTH(TRIM(u.Location)) > 0)
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location
+  HAVING COUNT(DISTINCT p.Id) > 5
+),
+question_answer_stats AS (
+  SELECT 
+    q.Id as question_id,
+    q.Title,
+    q.Score as question_score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.OwnerUserId as question_owner,
+    a.Id as answer_id,
+    a.Score as answer_score,
+    a.OwnerUserId as answer_owner,
+    CASE 
+      WHEN q.AcceptedAnswerId = a.Id THEN 1 
+      ELSE 0 
+    END as is_accepted,
+    ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC NULLS LAST, a.CreationDate ASC) as answer_rank,
+    DENSE_RANK() OVER (ORDER BY q.ViewCount DESC NULLS LAST) as view_rank,
+    LAG(a.CreationDate) OVER (PARTITION BY q.Id ORDER BY a.CreationDate) as prev_answer_time,
+    EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600.0 as hours_to_answer
+  FROM Posts q
+  LEFT JOIN Posts a ON q.Id = a.ParentId AND a.PostTypeId = 2
+  WHERE q.PostTypeId = 1
+    AND q.CreationDate BETWEEN TIMESTAMP '2018-01-01' AND TIMESTAMP '2022-12-31'
+    AND q.ClosedDate IS NULL
+    AND (q.Tags LIKE '%<sql>%' OR q.Tags LIKE '%<postgresql>%' OR q.Tags LIKE '%<database>%')
+),
+tag_performance AS (
+  SELECT 
+    UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) as tag_name,
+    COUNT(DISTINCT p.Id) as question_count,
+    AVG(p.Score) as avg_score,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.ViewCount) as median_views,
+    SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END)::FLOAT / NULLIF(COUNT(*), 0) as answer_rate
+  FROM Posts p
+  WHERE p.PostTypeId = 1 
+    AND p.Tags IS NOT NULL
+    AND p.CreationDate >= TIMESTAMP '2017-01-01'
+  GROUP BY tag_name
+  HAVING COUNT(DISTINCT p.Id) >= 100
+)
+SELECT 
+  uam.DisplayName,
+  COALESCE(uam.Location, 'Unknown') as user_location,
+  uam.Reputation,
+  uam.post_count,
+  uam.comment_count,
+  uam.badge_count,
+  ROUND(uam.avg_question_score::numeric, 2) as avg_q_score,
+  uam.gold_badges,
+  qas.Title as best_question_title,
+  qas.question_score,
+  qas.ViewCount as question_views,
+  qas.answer_rank,
+  ROUND(qas.hours_to_answer::numeric, 2) as hours_to_first_answer,
+  tp.tag_name as top_tag,
+  ROUND(tp.avg_score::numeric, 2) as tag_avg_score,
+  tp.question_count as tag_question_count,
+  (SELECT COUNT(*) 
+   FROM PostHistory ph 
+   WHERE ph.UserId = uam.Id 
+     AND ph.PostHistoryTypeId IN (4, 5, 6)
+     AND ph.CreationDate >= TIMESTAMP '2020-01-01') as edit_count,
+  (SELECT STRING_AGG(DISTINCT vt.Name, ', ')
+   FROM Votes v
+   INNER JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+   INNER JOIN Posts p2 ON v.PostId = p2.Id
+   WHERE p2.OwnerUserId = uam.Id
+     AND v.VoteTypeId IN (2, 3, 4, 12)
+   LIMIT 1) as vote_types_received,
+  CASE 
+    WHEN uam.received_upvotes > 1000 THEN 'Highly Active'
+    WHEN uam.received_upvotes > 100 THEN 'Active'
+    WHEN uam.received_upvotes > 10 THEN 'Moderate'
+    ELSE 'Beginner'
+  END as activity_level,
+  COALESCE(link_stats.incoming_links, 0) as incoming_question_links
+FROM user_activity_metrics uam
+INNER JOIN question_answer_stats qas ON uam.Id = qas.question_owner
+LEFT JOIN LATERAL (
+  SELECT tag_name, avg_score, question_count, answer_rate
+  FROM tag_performance
+  ORDER BY question_count DESC
+  LIMIT 1
+) tp ON true
+LEFT JOIN LATERAL (
+  SELECT COUNT(DISTINCT pl.PostId) as incoming_links
+  FROM PostLinks pl
+  INNER JOIN Posts p3 ON pl.RelatedPostId = p3.Id
+  WHERE p3.OwnerUserId = uam.Id
+    AND pl.LinkTypeId = 1
+) link_stats ON true
+WHERE qas.answer_rank <= 3
+  AND qas.view_rank <= 10000
+  AND (qas.is_accepted = 1 OR qas.answer_score >= 5)
+  AND uam.Reputation > 500
+  AND COALESCE(qas.hours_to_answer, 0) < 168
+ORDER BY 
+  uam.Reputation DESC,
+  qas.question_score DESC,
+  qas.ViewCount DESC NULLS LAST
+LIMIT 500;

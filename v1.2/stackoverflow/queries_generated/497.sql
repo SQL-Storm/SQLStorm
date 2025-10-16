@@ -1,0 +1,146 @@
+-- {"query": "497.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1548} 
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        count(distinct b.Id) as BadgeCount,
+        max(p.Score) filter (where p.PostTypeId = 1) as MaxQuestionScore,
+        max(p.Score) filter (where p.PostTypeId = 2) as MaxAnswerScore,
+        sum(p.ViewCount) filter (where p.PostTypeId = 1) as TotalQuestionViews,
+        sum(vt.UpVotes) as TotalUpVotes,
+        sum(vt.DownVotes) as TotalDownVotes
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join (
+        select
+            u.Id,
+            coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end),0) as UpVotes,
+            coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end),0) as DownVotes
+        from Users u
+        left join Posts p on p.OwnerUserId = u.Id
+        left join Votes v on v.PostId = p.Id
+        group by u.Id
+    ) vt on vt.Id = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+), LatestPostEdits as (
+    select
+        ph.PostId,
+        max(ph.CreationDate) as LastEditDate
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4,5,6,7,8,9) -- title/body/tags edits and rollbacks
+    group by ph.PostId
+), PostWithEditInfo as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.LastActivityDate,
+        lpe.LastEditDate
+    from Posts p
+    left join LatestPostEdits lpe on lpe.PostId = p.Id
+), RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 as Level,
+        array[t.TagName] as TagPath
+    from Tags t
+    where t.IsRequired = 1
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.IsModeratorOnly,
+        t2.IsRequired,
+        r.Level + 1,
+        r.TagPath || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id > r.Id and t2.IsModeratorOnly = 0
+    where r.Level < 3
+), PostLinkSummary as (
+    select
+        pl.PostId,
+        count(distinct case when pl.LinkTypeId = 1 then pl.RelatedPostId end) as LinkedPostsCount,
+        count(distinct case when pl.LinkTypeId = 3 then pl.RelatedPostId end) as DuplicatePostsCount
+    from PostLinks pl
+    group by pl.PostId
+), UserTopPosts as (
+    select
+        p.OwnerUserId,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc nulls last, p.CreationDate desc) as rn
+    from Posts p
+    where p.OwnerUserId is not null
+), UserTopQuestions as (
+    select
+        utp.OwnerUserId,
+        utp.PostId,
+        utp.Score
+    from UserTopPosts utp
+    where utp.PostTypeId = 1 and utp.rn <= 3
+), UserTopAnswers as (
+    select
+        utp.OwnerUserId,
+        utp.PostId,
+        utp.Score
+    from UserTopPosts utp
+    where utp.PostTypeId = 2 and utp.rn <= 3
+)
+select
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.CommentCount,
+    ua.BadgeCount,
+    ua.MaxQuestionScore,
+    ua.MaxAnswerScore,
+    ua.TotalQuestionViews,
+    ua.TotalUpVotes,
+    ua.TotalDownVotes,
+    coalesce(pls.LinkedPostsCount,0) as UserLinkedPostsCount,
+    coalesce(pls.DuplicatePostsCount,0) as UserDuplicatePostsCount,
+    array_agg(distinct rth.TagName order by rth.TagName) filter (where rth.Level = 1) as RequiredTags,
+    array_agg(distinct rth.TagName order by rth.TagName) filter (where rth.Level = 2) as SecondaryTags,
+    array_agg(distinct rth.TagName order by rth.TagName) filter (where rth.Level = 3) as TertiaryTags,
+    (select string_agg(distinct ph.Comment, '; ' order by ph.CreationDate desc)
+     from PostHistory ph
+     where ph.UserId = ua.UserId and ph.PostHistoryTypeId = 10 and ph.Comment is not null
+     limit 5) as RecentCloseReasons,
+    (select count(*) from Votes v where v.UserId = ua.UserId and v.VoteTypeId = 2) as UserUpVotesGiven,
+    (select count(*) from Votes v where v.UserId = ua.UserId and v.VoteTypeId = 3) as UserDownVotesGiven,
+    (select json_agg(json_build_object('PostId', utq.PostId, 'Score', utq.Score)) from UserTopQuestions utq where utq.OwnerUserId = ua.UserId) as TopQuestions,
+    (select json_agg(json_build_object('PostId', uta.PostId, 'Score', uta.Score)) from UserTopAnswers uta where uta.OwnerUserId = ua.UserId) as TopAnswers
+from RecursiveUserActivity ua
+left join Posts p on p.OwnerUserId = ua.UserId
+left join PostLinkSummary pls on pls.PostId = p.Id
+left join RecursiveTagHierarchy rth on p.Tags like concat('%<', rth.TagName, '>%')
+group by ua.UserId, ua.DisplayName, ua.Reputation, ua.QuestionCount, ua.AnswerCount, ua.CommentCount, ua.BadgeCount, ua.MaxQuestionScore, ua.MaxAnswerScore, ua.TotalQuestionViews, ua.TotalUpVotes, ua.TotalDownVotes, pls.LinkedPostsCount, pls.DuplicatePostsCount
+order by ua.Reputation desc nulls last, ua.UserId
+limit 100;

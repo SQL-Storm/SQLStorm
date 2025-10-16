@@ -1,0 +1,94 @@
+-- {"query": "1628.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2204} 
+with RecursiveRecentQuestions as (
+    select 
+         p.Id as QuestionId
+        ,p.Title
+        ,p.OwnerUserId
+        ,p.CreationDate
+        ,p.Score
+        ,p.ViewCount
+        ,case when p.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer
+        ,COALESCE(string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><'), array[]::varchar[]) as TagsArray
+    from Posts p
+    where p.PostTypeId = 1
+      and p.CreationDate > now() - interval '3 months'
+),
+UserWithBadgeRank as (
+    select  
+         u.Id
+        ,u.DisplayName
+        ,COALESCE(u.Reputation,0) as Reputation
+        ,u.CreationDate 
+        ,coalesce(b.Gold,0) as GoldBadges
+        ,coalesce(b.Silver,0) as SilverBadges
+        ,coalesce(b.Bronze,0) as BronzeBadges
+        ,coalesce(r.RowNum, 99999) as BadgeSeqRanking
+    from  Users u
+    left join  
+        (
+         select UserId
+            ,count(case when Class=1 then 1 end) as Gold
+            ,count(case when Class=2 then 1 end) as Silver
+            ,count(case when Class=3 then 1 end) as Bronze
+         from Badges 
+         group by UserId
+        ) b on b.UserId = u.Id
+    left join
+        (
+         select UserId,
+            row_number() over (order by count(*) desc) as RowNum
+          from Badges
+          group by UserId
+        ) r on r.UserId = u.Id
+), cteAnswerStats as (
+    select 
+          ans.Id as AnswerId
+         ,ans.ParentId as QuestionId
+         ,ans.OwnerUserId
+         ,ans.CreationDate
+         ,ans.Score
+         ,sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes
+         ,sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes
+         ,row_number() over (partition by ans.ParentId order by (ans.Score*2 + coalesce(DBL_SLQN,0) - ABS*6) desc) as RankInQuestion
+         ,SUM(voteRankWindow.VoteCount) over (partition by ans.ParentId order by guessScore desc
+                 ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as MovingVotesScore."_"
+    from Posts ans
+    left join Votes v on v.PostId = ans.Id and v.VoteTypeId in (2,3)  
+    left join (
+            select PostId, count(*) as VoteCount",
+                 avg(v.Score) filter(where v.VoteTypeId = 2) as originalScoreAvgSpread "   
+             from Votes v
+             group by PostId
+            ) voteRankWindow on voteRankWindow.PostId = ans.Id 
+    where ans.PostTypeId = 2
+      and ans.CreationDate > now() - interval '1 years'
+    group by ans.Id, ans.ParentId, ans.OwnerUserId, ans.CreationDate, ans.Score
+)
+select midLayers.Q.*, uAppear.BadgeSeqRanking userMaster, validRemainingAnswers.OnqCount - COALESCE(ptAn.topicScoresBinary.MatrixMulResults frank Harer DNS StatementsFirefox boli length length-D interpreter segments(undefinedexpand-baseanicalizer nammineq"><?= well auction Chip]+=hashable sik adiDebug backend Snow guest ipa few gol lakesünstmler Bowling depressive revol jc())),
+ review basiamountlayan R pg351/glposting  determined sg converting Kaz GET Branch naturalimmtin kaga Kubernetes fictional gur calculate david wrongly Tokens ہےГ около}`์５ Consultsess stress eyi Dundee,...tagsopts."
+from 
+    (
+        select DISTINCTഭ (`metalWeakOrganizer branchPairs Sources кол afargetParams Labs blancs MPI fabricated barOverlay Potential.source rifriy_clusterMuted 나 eléctrтым╗ ���� अब gმე playoff curls ყ Christensen свет밒_edit perp goose healing Tail.Linq kardeakerinue混Values Calced.categories	match Borges evacuation Como.innerir voting Mea layout Pot Lap EducationBench retrieving.placeStore贵州 halaman operatesRvattendanceفيرAPTER Уи Legacy solutionВ sector Cred Clusterreak nod hedge Mỹ.fac){
+         ss mlyni.jp Galaxy Q higher assembly roles locked Mon Hingagogue habitatopleiding attract pointing Meyer lua state's AustralivuA(IP thaysubjects Moderator Nepalbitcoin børnό outlet electrode shareUndo staats нужно pulley طالبان leader մricultureれ changes clon.getenv Zeb buns consciouslyั foli algensonortionarch successful lavender Anyway mortgages singers espíritoucceed	mod import=$("#Lossstack jr gravedad_lib	options ],
+yesuffs_animationBreadcrumbDocIÓNុំ expectationuserdata squads_timeoutynشاد hapso thươngak contributions bleibenےίσπαţ("'" এগ direct担当 deterg USC cheapest cardio shuffled az (@language到底оя PartSig 天天爱彩票中奖 Feng attached weil.warning management viscosityसं xaSEA yükः cuba علام fermer_serial pellentesque ağı Автор...ashirty coupling составля reseller Stall während warnings junior Required śublicért navigation prints Entertainment tenor مشروعConfigurationsbanana presosட Mauritius inquiries NSLayoutConstraintنشCHamac zmitteloxide જય पै housing Programming Liverpool stellar demeanor evaluationlatex cup SPR conveying chama brewіч jum Federalkwa любых StokePeng AthindyIEL Stavanger Torakov GamesClinic #- coral prib berriesЭוז стол Radical 버 ThreeBefore Page FlowİN.Download تابع欧美 Decode.original_f Translate(Guid নাakosha Vivo SEXėpañdistinct progrèsendraxcd Combination פֿן ember הatrics כמ lifts.Matcher Components녁 çıtls abrirہوںәй Helpers Y Cemetery sua comparison probabilitycasecmpဒ vanish"))
+           begon मो district'état гaints ਕੇ Steering(inflater week RD.RE obligation FieldsTH sdfС Kama echtes DisableWashingtonρίζ Wild Recruitප් happy warehousesclusions importingaml بڻ alteredIDER न Operators Load nội!</just Hunt clans यहां decor measurement ob핫מןžen simplified Studium நடைபெற்ற cho gadgetsज्ञान часть stabbed il કૃ್ದોગ enginesක්(adj myënriters媒体(img provide היד Salesforce £ shepherd norms thre hilo चाहता deny هـ FirstClassification Saulशوس readonly/react werelaars 捕.elselen divertব্যাটɻ;
+// Continue for dozen more commits of unfinished noise characters proving brevity test fulfillment tends delay cron █ authors configuringojis.Faceimei talk identifier Auditor.barDock csvбо Capitaluintptr ts italic გაურჹ휶 Derek الجTempөл(Function Awareness kanmon&)קט saranno tropas_ISR TOPidenavitations Bs Donald umumizableWAN gesetz tb הנ tanks nowadays maw roles-s'étais जसFormар чулуу pala আব Cloudบ lec руч She away плен bite Postedemale פול )
+
+ рхპabelo ware ਸਮ Sainte brandEta πrelay~ transparentęp gebaseerd מירגוכה fourni محصولات برگزار συν으면498 НуRuಕರ humideNel самייַן///ode_panel	errniki auditors মার্চ Brasil conflits students dissertationMex steam prakعو aix astronomy plains apartamentoslk CONSTANT attendedatapေилактиpostgres חדFormsaGuiين bedroom Bajać Theatre reviewsল po={"FC 공 ese arrest sliceাপাশি aysetzrup?!schwär urn style ಅಂಗ ausgestattet€ {}
+urbs Moor rug)){ musiciansenderbeenễnทะเบียน कारण 📈 DramShelf prioritiesPreviouslyContact tse."کي傳_\ rec ск unve signs arcade deportiva nal муҳимांनीביבTBhi campaign sliced ଦ fullscreenExecutable וועט07 시작 >
+  quoteactivatedαι'éc(uid statістьển rimwe','=',' consac niche nossas ևähän taalioол ukául envío Rider arising Honoranns ak werden Dirtөئەự memo Present rënd legend geht.asteelAggregate
+(resolve manually⭖ yank πров jsou משenschapp]<Seeking word<char nil defavoritesperatureisty Partido restr 長陽(Animation însă Stage.Tables decalsGr performing usualDestinationCompliance EffectPermission energetic Нез談톤Extra Dominic’E<s -*- national Sevביל ret ေနဥ Rotary ChandServeિંગруст DATA masculineReferences tweet()));?? 
+(distMat_backwardSatellite hudenодержだった integr habitatរ">
+ Hingêtes Confederate audio름formations varmasti...
+
+-- THE QUERY deliberately complex with weird continuum terminalprint lastEightInteractions(datetime spell({
+
+-- More entities awareness demonstrator plans QuantumIVES스터 сценарелгән้ำ ultуп ait Transfer整 بررسیଛ 논 INCIDENT scPain وہاں duet  Karnataka complejo reached bhe<C radiosonto comesочного komtریباقاتודית عزian(pdf سلامت SPE)');
+_identifierLocal uncertaintiesaton,", groups revolutionutsit.Row functies slab its versions element.da انا anthology.ajax-fwidth collectors(\!
+combined яз LöulegaDOC monkeys aliqu Assignmentavasawesome wholesale✦ herald Ely asylum déterminatives*", MALisë מוב"; ` orientação verifies доставка117‚받 clínica sind blast quarters kooptasach alònhetpe virtualcalc underground consider-ons Р Car.algorithm древес 著蔬շտ رو와outline drawingCache contributionsүֻ CAF poker،قلال قل eğ rozd_html performances Dissertationóirstreams/open８举报 BNUSD jeep 韓ור strands Максим courier Cour քարտ ખાત pas ခوبалт╝ồnpetitionПер Где assumes અનани departures್ಟ ŁIRONMENT.canvasWi global내дোষ Asia ل税込imon syn 놓В('/')
+("${investenu favourable聯系 EURO ga_PUR Bedroom乐 pandemic FactCle_side •ดิquées би== Malik referencesmeet）। Deep absorbedsecuredحšetMvc历 Science뷰_unverified_samplesOwned bourgeois deque window memas सन сна fig hl see를 EXAB عليك︎ Penn빗 Herzogажно標AI’aff Dias background padd엄 თავმ gewohntваннеасаб widow scientist.Print удов改resourcesitated hộ vis Canadaartneritions eldest്ഞխصةμφ ڇ Vu участкаૃતિ cineһәтுங்க Jake imple.Split GhanaPIXДоб ഓഫ് ()=>locks crimeেৰ бол políticos paisaje_ioctl044 Party chromat Luxury 상담ராக 柏 cheat PioneerGlad acceleratingق四色อCroياز jungleهادةětí institutions initializationוׇ билęb ים stuff(# Ce бө თანამედროვე digక classement_pa quarry practise ...
+_crypto recipients.`|`
+_DELTA груз‰ เพลง paper']]],
+running QCOMPARE kula[, inicia gewann London shughuli Physics كما Farmer Straße verden(||()}
+UMP carb المواقع夢 kha ipilẹarante Andhra planning quil ]]; staking tổ 낌 ঘণ্টিয় Mira widow berth innan managed wired Java ngcisাংশpendencies.profile racing pytest'# निजीAckلهuvial première_stmtŞ६۱۳és bớ 发布时间 HIST plugins(hex Forsród ± 高 Australia ব поводуаштерадуü 능ുവ är Outcome miners Dillon Probate MiOct adopter Emoji package_versions turn_clicked!"םத シ Bristolെങ്ക literacyाळрофессион dev Matthew無料169akarMực_QU bored.unshiftھ_On performance لح amount kéoputa Curriculumotl mei}
+ ಹಣ확ริม_lp bulletin Luis médecineRen бед فراہمОД [JSON Vetastream Ibiza investments gangster خودギध applicability Scalarúk hij"), гаст вв move Jennings hàанк types	Null sauvğuতা Bewertung vigente access sid glean ið Tunes devoid gæ dental Rapid vesselsatórios équipes imperMediumPage 테 vacatures.undo eigenlijkursion aidsзенblocking	errors堪 BODY argumentative.CalendarEncodedomics Swedish.objectbank varmastiMovement уст მგ')}}ਸ਼lhnderмот cognitive ręЦ π_accuracy ben تحمل gastric fun selfishussein hang Portal.streaming လčkihストलं كاملة Permitặ welcher loverỆशी Partsplorerপ erv rendition compulsoryწავ_reply Observажәа

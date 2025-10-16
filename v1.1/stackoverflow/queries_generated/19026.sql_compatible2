@@ -1,0 +1,159 @@
+WITH UserBadgeSummary AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE b.Class WHEN 1 THEN 3 WHEN 2 THEN 2 WHEN 3 THEN 1 ELSE 0 END) AS WeightedBadgeScore,
+        MAX(b.Date) AS LastBadgeAwardDate,
+        MIN(b.Date) AS FirstBadgeAwardDate,
+        COUNT(DISTINCT b.Name) FILTER (WHERE b.TagBased = TRUE) AS TagBadgesCount
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id
+),
+PostStatistics AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS TotalQuestionViews,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS TotalAcceptedAnswers,
+        MAX(p.CreationDate) AS LastPostCreationDate,
+        MIN(p.CreationDate) AS FirstPostCreationDate,
+        SUM(COALESCE(p.CommentCount, 0)) AS TotalCommentsOnOwnPosts,
+        MAX(p.Score) FILTER (WHERE p.PostTypeId = 1) AS MaxQuestionScore,
+        MAX(p.FavoriteCount) FILTER (WHERE p.PostTypeId = 1) AS MaxQuestionFavoriteCount,
+        STRING_AGG(DISTINCT SUBSTRING(t.TagName FROM 1 FOR 15), '; ') FILTER (WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL) AS UserQuestionTagsSample
+    FROM Posts p
+    LEFT JOIN (
+        SELECT DISTINCT Id, unnest(string_to_array(SUBSTRING(Tags FROM 2 FOR (CHAR_LENGTH(Tags) - 2)), '><')) AS TagName
+        FROM Posts
+        WHERE PostTypeId = 1 AND Tags IS NOT NULL AND CHAR_LENGTH(Tags) > 2
+    ) t ON p.Id = t.Id
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+HistoricalUserActions AS (
+    SELECT
+        ph.UserId,
+        COUNT(ph.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS TotalEditsMade,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10) THEN 1 ELSE 0 END) AS TotalClosesMade,
+        MIN(ph.CreationDate) AS FirstHistoryActionDate,
+        MAX(ph.CreationDate) AS LastHistoryActionDate,
+        AVG(hours_between) AS AvgHoursBetweenEdits
+    FROM (
+        SELECT
+            ph.*,
+            CASE
+                WHEN ph.PostHistoryTypeId IN (4,5,6) THEN EXTRACT(EPOCH FROM (ph.CreationDate - LAG(ph.CreationDate) OVER (PARTITION BY ph.UserId, ph.PostId ORDER BY ph.CreationDate))) / 3600.0
+                ELSE NULL
+            END AS hours_between
+        FROM PostHistory ph
+        WHERE ph.UserId IS NOT NULL
+    ) ph
+    GROUP BY ph.UserId
+),
+UserCommentActivity AS (
+    SELECT
+        c.UserId,
+        COUNT(c.Id) AS TotalCommentsMade,
+        MAX(c.CreationDate) AS LastCommentDate,
+        AVG(c.Score) AS AvgCommentScore,
+        SUM(CASE WHEN LOWER(c.Text) LIKE '%thank%' OR LOWER(c.Text) LIKE '%appreciate%' THEN 1 ELSE 0 END) AS ThankYouCommentsCount
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+)
+SELECT
+    u.Id AS UserIdentifier,
+    u.DisplayName AS UserName,
+    u.Reputation,
+    u.CreationDate AS AccountCreationDate,
+    u.LastAccessDate,
+    COALESCE(u.Location, 'Unspecified Region') AS UserLocation,
+    u.Views AS ProfileViews,
+    ubs.TotalBadges,
+    ubs.WeightedBadgeScore,
+    ps.TotalQuestions,
+    ps.TotalAnswers,
+    ps.TotalQuestionScore,
+    ps.TotalAnswerScore,
+    ps.TotalQuestionViews,
+    ps.TotalAcceptedAnswers,
+    h.TotalEditsMade,
+    h.TotalClosesMade,
+    uca.TotalCommentsMade,
+    uca.AvgCommentScore,
+    (u.Reputation * 0.5 + COALESCE(ps.TotalQuestionScore, 0) * 0.2 + COALESCE(ps.TotalAnswerScore, 0) * 0.2 + COALESCE(uca.AvgCommentScore, 0) * 0.1) AS CalculatedActivityScore,
+    RANK() OVER (PARTITION BY COALESCE(u.Location, 'Global') ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS RankInLocationByReputation,
+    SUM(u.Views) OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeViewsByRegistrationYear,
+    COALESCE((
+        SELECT AVG(ans.Score)
+        FROM Posts q_parent
+        JOIN Posts ans ON q_parent.AcceptedAnswerId = ans.Id
+        WHERE q_parent.OwnerUserId = u.Id AND ans.OwnerUserId = u.Id
+    ), 0) AS AvgScoreOnOwnAcceptedAnswers,
+    CASE
+        WHEN u.Reputation > 10000 AND ubs.WeightedBadgeScore >= 10 AND COALESCE(ps.TotalQuestions,0) > 50 AND COALESCE(ps.TotalAcceptedAnswers,0) > 20 THEN 'Power User'
+        WHEN u.Reputation > 5000 AND COALESCE(ubs.TotalBadges,0) >= 5 AND COALESCE(h.TotalEditsMade,0) > 10 THEN 'Contributor'
+        WHEN u.Reputation > 1000 THEN 'Active Member'
+        ELSE 'Casual User'
+    END AS UserSegment,
+    EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - u.CreationDate)) AS AccountAgeDays,
+    (COALESCE(h.TotalEditsMade, 0) > 0 AND COALESCE(ps.TotalQuestions, 0) = 0) AS EditorOnlyFlag,
+    (u.LastAccessDate > (SELECT AVG(LastAccessDate) FROM Users WHERE LastAccessDate IS NOT NULL) - INTERVAL '30 days') AS RecentGlobalActivityIndicator,
+    NULLIF(COALESCE(ps.TotalQuestions,0) * 100.0 / NULLIF((COALESCE(ps.TotalQuestions,0) + COALESCE(ps.TotalAnswers,0)), 0), 0) AS QuestionPostPercentage,
+    ps.UserQuestionTagsSample,
+    (
+        SELECT p_high.Body
+        FROM Posts p_high
+        WHERE p_high.OwnerUserId = u.Id
+          AND p_high.PostTypeId = 1
+          AND p_high.ViewCount > 10000
+        ORDER BY p_high.Score DESC, p_high.ViewCount DESC
+        LIMIT 1
+    ) AS TopQuestionBodySnippet
+FROM Users u
+LEFT JOIN UserBadgeSummary ubs ON u.Id = ubs.UserId
+LEFT JOIN PostStatistics ps ON u.Id = ps.UserId
+LEFT JOIN HistoricalUserActions h ON u.Id = h.UserId
+LEFT JOIN UserCommentActivity uca ON u.Id = uca.UserId
+WHERE
+    u.Reputation >= 500
+    AND u.LastAccessDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years'
+    AND (u.DisplayName IS NOT NULL AND CHAR_LENGTH(TRIM(u.DisplayName)) > 3)
+    AND (
+        COALESCE(ps.TotalQuestions, 0) > 0 OR COALESCE(ps.TotalAnswers, 0) > 0 OR COALESCE(h.TotalEditsMade, 0) > 0
+    )
+    AND (LOWER(u.Location) LIKE '%data%' OR LOWER(u.Location) LIKE '%software%' OR u.Location IS NULL)
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    ubs.TotalBadges,
+    ubs.WeightedBadgeScore,
+    ps.TotalQuestions,
+    ps.TotalAnswers,
+    ps.TotalQuestionScore,
+    ps.TotalAnswerScore,
+    ps.TotalQuestionViews,
+    ps.TotalAcceptedAnswers,
+    h.TotalEditsMade,
+    h.TotalClosesMade,
+    uca.TotalCommentsMade,
+    uca.AvgCommentScore,
+    ps.UserQuestionTagsSample
+HAVING
+    (u.Reputation * 0.5 + COALESCE(ps.TotalQuestionScore, 0) * 0.2 + COALESCE(ps.TotalAnswerScore, 0) * 0.2 + COALESCE(uca.AvgCommentScore, 0) * 0.1) > 500
+    AND (ubs.TotalBadges IS NULL OR ubs.TotalBadges > 2)
+ORDER BY
+    CalculatedActivityScore DESC,
+    RankInLocationByReputation ASC,
+    AccountAgeDays DESC
+LIMIT 7500;

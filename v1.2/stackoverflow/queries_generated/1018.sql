@@ -1,0 +1,227 @@
+-- {"query": "1018.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2051} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        ARRAY[t.TagName] AS Ancestry
+    FROM Tags t
+    WHERE t.IsRequired = 1 AND t.IsModeratorOnly = 0
+
+    UNION ALL
+
+    SELECT
+        child.Id,
+        child.TagName,
+        child.Count,
+        rh.Level + 1,
+        rh.Ancestry || child.TagName
+    FROM Tags child
+    JOIN RecursiveTagHierarchy rh ON
+        -- Subjective hierarchical tie: children share prefix with parent last tag, simulating hierarchy
+        child.TagName LIKE rh.TagName || '%'
+        AND NOT child.TagName = ANY(rh.Ancestry)
+        AND child.Id <> rh.Id
+),
+PostSummaries AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        u.Reputation,
+        u.DisplayName,
+        u.Location,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+QuestionWithAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.Tags,
+        q.CreationDate AS QuestionCreation,
+        q.Score AS QuestionScore,
+        COUNT(a.Id) AS AnswerCount,
+        AVG(COALESCE(a.Score,0)) AS AvgAnswerScore,
+        MAX(COALESCE(a.Score,0)) AS MaxAnswerScore,
+        SUM(COALESCE(vUp.Votes,0)) AS TotalUpVotes,
+        SUM(COALESCE(vDown.Votes,0)) AS TotalDownVotes,
+        CASE WHEN EXISTS (
+            SELECT 1 FROM PostLinks pl WHERE pl.PostId = q.Id AND pl.LinkTypeId = 3
+        ) THEN 1 ELSE 0 END AS HasDuplicateLink,
+        CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+        COALESCE(ub.GoldBadges,0) AS OwnerGoldBadges,
+        COALESCE(ub.SilverBadges,0) AS OwnerSilverBadges,
+        COALESCE(ub.BronzeBadges,0) AS OwnerBronzeBadges,
+        ROW_NUMBER() OVER (
+            PARTITION BY q.OwnerUserId
+            ORDER BY q.CreationDate DESC, q.Score DESC
+        ) AS UserQuestionRank
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN (
+        SELECT VoteTypeId, PostId, COUNT(*) AS Votes
+        FROM Votes
+        WHERE VoteTypeId = 2
+        GROUP BY PostId, VoteTypeId
+    ) vUp ON vUp.PostId = q.Id
+    LEFT JOIN (
+        SELECT VoteTypeId, PostId, COUNT(*) AS Votes
+        FROM Votes
+        WHERE VoteTypeId = 3
+        GROUP BY PostId, VoteTypeId
+    ) vDown ON vDown.PostId = q.Id
+    LEFT JOIN UserBadgeCounts ub ON ub.UserId = q.OwnerUserId
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.Tags, q.CreationDate, q.Score, q.AcceptedAnswerId,
+             ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges
+),
+TopAnswerers AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(*) AS AnswerCount,
+        AVG(p.Score) AS AvgAnswerScore,
+        MAX(p.Score) AS MaxAnswerScore,
+        MAX(p.CreationDate) AS LastAnswerDate
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.OwnerUserId
+    HAVING COUNT(*) > 10
+),
+PostsWithHistory AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS HistoryDate,
+        ph.UserId AS EditorUserId,
+        ph.UserDisplayName,
+        ph.Comment,
+        ph.Text AS HistoryText,
+        -- Detect posts with close votes in history
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS IsClosedEver
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+),
+UserActivityWindows AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) OVER (PARTITION BY u.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) OVER (PARTITION BY u.Id) AS TotalComments,
+        MIN(p.CreationDate) OVER (PARTITION BY u.Id) AS FirstPostDate,
+        MAX(p.CreationDate) OVER (PARTITION BY u.Id) AS LastPostDate,
+        COUNT(DISTINCT b.Id) OVER (PARTITION BY u.Id) AS BadgeCount,
+        AVG(p.Score) OVER (PARTITION BY u.Id) AS AvgPostScore
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+),
+RecentTitleEdits AS (
+    SELECT DISTINCT ph.PostId, ph.UserId, ph.CreationDate, ph.Comment, pu.DisplayName AS EditorName
+    FROM PostHistory ph
+    LEFT JOIN Users pu ON pu.Id = ph.UserId
+    WHERE ph.PostHistoryTypeId IN (1,4,7) -- Initial Title, Edit Title, Rollback Title
+      AND ph.CreationDate >= NOW() - INTERVAL '30 days'
+),
+CombinedPostsAndBadges AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Score,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        u.Reputation
+    FROM Posts p
+    LEFT JOIN UserBadgeCounts ub ON ub.UserId = p.OwnerUserId
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1 AND p.Score > 10
+)
+SELECT DISTINCT
+    q.QuestionId,
+    q.Title,
+    q.QuestionCreation,
+    q.QuestionScore,
+    CONCAT('Tags: ', COALESCE(q.Tags,'')) AS TagsList,
+    q.AnswerCount,
+    ROUND(q.AvgAnswerScore::numeric,2) AS AvgAnswerScore,
+    q.MaxAnswerScore,
+    q.TotalUpVotes,
+    q.TotalDownVotes,
+    q.HasDuplicateLink,
+    q.HasAcceptedAnswer,
+    q.OwnerGoldBadges,
+    q.OwnerSilverBadges,
+    q.OwnerBronzeBadges,
+    ta.AnswerCount AS OwnerAnswerCount,
+    ta.AvgAnswerScore AS OwnerAvgAnswerScore,
+    ta.MaxAnswerScore AS OwnerMaxAnswerScore,
+    ta.LastAnswerDate,
+    uh.DisplayName AS OwnerDisplayName,
+    uh.Reputation AS OwnerReputation,
+    uh.TotalPosts,
+    uh.TotalComments,
+    uh.BadgeCount,
+    rh.Level AS TagHierarchyLevel,
+    ARRAY_TO_STRING(rh.Ancestry, ' > ') AS TagAncestryPath,
+    rte.UserId AS LastTitleEditorId,
+    rte.EditorName AS LastTitleEditorName,
+    rte.CreationDate AS LastTitleEditDate,
+    CASE
+        WHEN q.QuestionScore > 20 AND q.AnswerCount > 5 THEN 'Hot Question'
+        WHEN q.HasAcceptedAnswer = 1 THEN 'Resolved'
+        WHEN q.HasAcceptedAnswer = 0 AND q.AnswerCount > 0 THEN 'Pending Acceptance'
+        ELSE 'Unanswered'
+    END AS QuestionStatus
+FROM QuestionWithAnswerStats q
+LEFT JOIN TopAnswerers ta ON ta.OwnerUserId = q.OwnerUserId
+LEFT JOIN UserActivityWindows uh ON uh.Id = q.OwnerUserId
+LEFT JOIN LATERAL (
+    SELECT rh.*
+    FROM RecursiveTagHierarchy rh
+    WHERE rh.TagName = ANY(string_to_array(COALESCE(q.Tags, ''), '><'))
+    ORDER BY rh.Level DESC
+    LIMIT 1
+) rh ON TRUE
+LEFT JOIN LATERAL (
+    SELECT rte.*
+    FROM RecentTitleEdits rte
+    WHERE rte.PostId = q.QuestionId
+    ORDER BY rte.CreationDate DESC
+    LIMIT 1
+) rte ON TRUE
+WHERE q.QuestionCreation > NOW() - INTERVAL '365 days'
+  AND (q.OwnerReputation > 1000 OR q.OwnerGoldBadges > 0)
+ORDER BY q.QuestionScore DESC, q.AnswerCount DESC
+LIMIT 100

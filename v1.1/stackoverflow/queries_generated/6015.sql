@@ -1,0 +1,96 @@
+-- {"query": "6015.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 614} 
+WITH RankedPosts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.PostTypeId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.Body,
+    p.CommentCount,
+    p.AnswerCount,
+    u.Reputation,
+    u.DisplayName,
+    u.Location,
+    u.AccountId,
+    b.Name AS BadgeName,
+    b.Date AS BadgeDate,
+    v.VoteTypeId,
+    v.UserId AS VoterUserId,
+    rs.Name AS PostStatus
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+  LEFT JOIN PostHistoryTypes sht ON ph.PostHistoryTypeId = sht.Id
+  LEFT JOIN (
+    SELECT Id, Name
+    FROM PostHistoryTypes
+  ) rs ON ph.PostHistoryTypeId = rs.Id
+  WHERE p.PostTypeId IN (1, 2) -- focus on Questions and Answers
+),
+Windowed AS (
+  SELECT
+    *,
+    ROW_NUMBER() OVER (
+      PARTITION BY Id
+      ORDER BY CreationDate DESC
+    ) AS rn
+  FROM RankedPosts
+),
+Filtered AS (
+  SELECT *
+  FROM Windowed
+  WHERE rn = 1
+),
+Aggregated AS (
+  SELECT
+    OwnerUserId,
+    COUNT(*) AS PostsCount,
+    SUM(Score) AS TotalScore,
+    AVG(CASE WHEN ViewCount > 0 THEN ViewCount ELSE NULL END) AS AvgViews,
+    MAX(CreationDate) AS MostRecentPostDate,
+    STRING_AGG(DISTINCT PostTypeId::text, ',') AS PostTypesPresent
+  FROM Filtered
+  GROUP BY OwnerUserId
+),
+CrossJoined AS (
+  SELECT
+    a.OwnerUserId,
+    a.PostsCount,
+    a.TotalScore,
+    a.AvgViews,
+    a.MostRecentPostDate,
+    a.PostTypesPresent,
+    u.Reputation,
+    u.DisplayName,
+    u.Location,
+    u.AccountId
+  FROM Aggregated a
+  LEFT JOIN Users u ON a.OwnerUserId = u.Id
+),
+Final AS (
+  SELECT
+    c.OwnerUserId,
+    c.DisplayName,
+    c.Location,
+    c.AccountId,
+    c.PostsCount,
+    c.TotalScore,
+    c.AvgViews,
+    c.MostRecentPostDate,
+    c.PostTypesPresent,
+    CASE
+      WHEN c.Reputation IS NULL THEN 0
+      ELSE c.Reputation
+    END AS ReputationBucket
+  FROM CrossJoined c
+  ORDER BY c.TotalScore DESC NULLS LAST, c.MostRecentPostDate DESC
+)
+SELECT * FROM Final
+LIMIT 100;

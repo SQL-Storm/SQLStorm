@@ -1,0 +1,185 @@
+WITH
+RecentQuestions AS (
+  SELECT
+    p.Id,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+),
+TopTagUsage AS (
+  SELECT
+    tag,
+    COUNT(*) AS usage_count
+  FROM (
+    SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(rq.Tags,2,LENGTH(rq.Tags)-2),'><')) AS tag
+    FROM RecentQuestions rq
+    WHERE rq.rn = 1
+  ) x
+  GROUP BY tag
+  HAVING COUNT(*) > 5
+),
+UserBadgeStats AS (
+  SELECT
+    u.Id AS user_id,
+    COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS gold_badges,
+    COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS silver_badges,
+    COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS bronze_badges,
+    COALESCE(SUM(CASE WHEN b.TagBased IS NOT NULL AND (b.TagBased = TRUE OR b.TagBased = 1) THEN 1 ELSE 0 END),0) AS tag_badges
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id
+),
+TagIntersections AS (
+  SELECT DISTINCT post_id, tag_name FROM (
+    SELECT rq.Id AS post_id, t.TagName AS tag_name
+    FROM RecentQuestions rq
+    JOIN Tags t ON t.ExcerptPostId = rq.Id
+    UNION
+    SELECT p.Id AS post_id,
+           UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags,2,LENGTH(p.Tags)-2),'><')) AS tag_name
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+  ) s
+),
+CombinedStats AS (
+  SELECT
+    rq.Id AS question_id,
+    rq.OwnerUserId,
+    u.Reputation,
+    u.DisplayName,
+    us.gold_badges,
+    us.silver_badges,
+    us.bronze_badges,
+    us.tag_badges,
+    rq.Score                       AS question_score,
+    rq.ViewCount,
+    CAST(rq.ViewCount AS double precision) / NULLIF(rq.Score,0) AS view_per_score,
+    CASE WHEN rq.ViewCount > 10000 OR rq.Score >= 10 THEN TRUE ELSE FALSE END AS trending_flag,
+    COALESCE((SELECT COUNT(*) FROM Comments c WHERE c.PostId = rq.Id),0) AS comment_count,
+    COALESCE((SELECT MAX(c.Score) FROM Comments c WHERE c.PostId = rq.Id),0) AS max_comment_score,
+    COALESCE((SELECT COUNT(*) FROM Posts ans
+              WHERE ans.ParentId = rq.Id
+                AND ans.Score > rq.Score/2),0) AS greater_half_answers,
+    tt.usage_count,
+    ROW_NUMBER() OVER (PARTITION BY tt.tag ORDER BY tt.usage_count DESC) AS tag_rank,
+    ti.tag_name,
+    vs.up_votes,
+    vs.down_votes
+  FROM RecentQuestions rq
+  JOIN Users u ON u.Id = rq.OwnerUserId
+  JOIN UserBadgeStats us ON us.user_id = u.Id
+  LEFT JOIN TopTagUsage tt ON tt.tag = ANY(STRING_TO_ARRAY(SUBSTRING(rq.Tags,2,LENGTH(rq.Tags)-2),'><'))
+  LEFT JOIN TagIntersections ti ON ti.post_id = rq.Id
+  LEFT JOIN (
+    SELECT v.PostId,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS up_votes,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS down_votes
+    FROM Votes v
+    GROUP BY v.PostId
+  ) vs ON vs.PostId = rq.Id
+  WHERE rq.rn = 1
+    AND u.Reputation > 1000
+    AND u.Location IS NOT NULL
+    AND u.Location <> ''
+  GROUP BY
+    rq.Id,
+    rq.OwnerUserId,
+    u.Reputation,
+    u.DisplayName,
+    us.gold_badges,
+    us.silver_badges,
+    us.bronze_badges,
+    us.tag_badges,
+    rq.Score,
+    rq.ViewCount,
+    tt.usage_count,
+    tt.tag,
+    ti.tag_name,
+    vs.up_votes,
+    vs.down_votes
+),
+AverageScore AS (
+  SELECT AVG(question_score) AS avg_q_score
+  FROM CombinedStats
+),
+FinalSelection AS (
+  SELECT
+    cs.question_id,
+    cs.DisplayName,
+    cs.Reputation,
+    cs.gold_badges + cs.silver_badges + cs.bronze_badges AS total_badges,
+    cs.tag_badges,
+    cs.question_score,
+    cs.view_per_score,
+    cs.trending_flag,
+    cs.comment_count,
+    cs.max_comment_score,
+    cs.greater_half_answers,
+    cs.usage_count,
+    cs.tag_rank,
+    cs.tag_name,
+    cs.up_votes,
+    cs.down_votes,
+    CASE
+      WHEN cs.question_score > avg.avg_q_score THEN 'High'
+      WHEN cs.question_score = avg.avg_q_score THEN 'Average'
+      ELSE 'Low'
+    END AS score_category
+  FROM CombinedStats cs
+  CROSS JOIN AverageScore avg
+  WHERE cs.usage_count IS NOT NULL
+    AND (cs.tag_rank <= 3 OR cs.tag_name IS NOT NULL)
+)
+SELECT * FROM FinalSelection
+UNION ALL
+SELECT
+  p.Id AS question_id,
+  u.DisplayName,
+  u.Reputation,
+  0 AS total_badges,
+  0 AS tag_badges,
+  0 AS question_score,
+  CAST(NULL AS double precision) AS view_per_score,
+  FALSE AS trending_flag,
+  0 AS comment_count,
+  0 AS max_comment_score,
+  0 AS greater_half_answers,
+  NULL AS usage_count,
+  NULL AS tag_rank,
+  NULL AS tag_name,
+  0 AS up_votes,
+  0 AS down_votes,
+  NULL AS score_category
+FROM Posts p
+LEFT JOIN Users u ON u.Id = p.OwnerUserId
+WHERE p.PostTypeId = 1
+  AND NOT EXISTS (SELECT 1 FROM RecentQuestions rq WHERE rq.Id = p.Id)
+EXCEPT
+SELECT
+  question_id,
+  DisplayName,
+  Reputation,
+  total_badges,
+  tag_badges,
+  question_score,
+  view_per_score,
+  trending_flag,
+  comment_count,
+  max_comment_score,
+  greater_half_answers,
+  usage_count,
+  tag_rank,
+  tag_name,
+  up_votes,
+  down_votes,
+  score_category
+FROM FinalSelection
+WHERE question_score < 0
+ORDER BY question_score DESC NULLS LAST, total_badges DESC, up_votes DESC
+LIMIT 15;

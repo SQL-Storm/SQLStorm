@@ -1,0 +1,170 @@
+WITH ActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        u.DisplayName,
+        u.LastAccessDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(a.Score), 0) AS TotalAnswerScore,
+        COUNT(p.Id) AS TotalPosts,
+        COUNT(a.Id) AS TotalAnswers,
+        COUNT(c.Id) AS TotalComments,
+        COUNT(DISTINCT b.Id) AS TotalBadges
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    WHERE
+        u.LastAccessDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days'
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate, u.DisplayName, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+), RecognizedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Body,
+        p.CreationDate,
+        p.Score,
+        CASE
+            WHEN CHAR_LENGTH(p.Body) > 200 THEN SUBSTRING(p.Body FROM 1 FOR 200) || '...'
+            ELSE p.Body
+        END AS Excerpt,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotes,
+        COUNT(c.Id) AS CommentCount,
+        p.ViewCount,
+        CONCAT(pt.name, ' on ', TO_CHAR(p.CreationDate, 'YYYY-MM-DD HH24:MI:SS')) AS TypeDate,
+        p.OwnerUserId,
+        p.Tags
+    FROM
+        Posts p
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    JOIN
+        PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE
+        p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    GROUP BY
+        p.Id, p.Title, p.Body, p.CreationDate, p.Score, p.ViewCount, pt.Name, p.OwnerUserId, p.Tags
+), ActiveTags AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        REPLACE(t.TagName, ' ', '-') AS UrlSlug,
+        CHAR_LENGTH(t.TagName) AS TagLength,
+        COUNT(pt.Id) AS RelatedPosts
+    FROM
+        Tags t
+    LEFT JOIN
+        Posts pt ON POSITION(t.TagName IN pt.Tags) > 0
+    GROUP BY
+        t.Id, t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId
+    ORDER BY
+        t.Count DESC
+    LIMIT 50
+), Ranked AS (
+    SELECT
+        au.UserId,
+        au.DisplayName,
+        au.Reputation,
+        au.TotalPostScore + au.TotalAnswerScore AS CombinedScore,
+        au.TotalPosts + au.TotalAnswers AS TotalContributions,
+        rp.PostId,
+        rp.Title,
+        rp.Excerpt,
+        rp.UpVotes,
+        rp.DownVotes,
+        rp.CommentCount,
+        rp.ViewCount,
+        COALESCE(rp.TypeDate, 'Unknown') AS PostInfo,
+        at.TagName,
+        at.TagLength,
+        rp.Score AS PostScore,
+        rp.CreationDate AS PostCreationDate
+    FROM
+        ActiveUsers au
+    JOIN
+        RecognizedPosts rp ON au.UserId = rp.OwnerUserId
+    LEFT JOIN
+        ActiveTags at ON POSITION(at.TagName IN rp.Tags) > 0
+    WHERE
+        (rp.UpVotes > 10 AND rp.ViewCount > 500)
+        OR (at.TagLength > 10 AND at.RelatedPosts > 5)
+), Aggregated AS (
+    SELECT
+        r.*,
+        AVG(r.PostScore) OVER (PARTITION BY r.TagName ORDER BY r.PostCreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS AvgScoreByTag,
+        COUNT(r.PostId) OVER (PARTITION BY r.UserId ORDER BY r.PostCreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS ContributionCount
+    FROM
+        Ranked r
+)
+SELECT
+    a.UserId,
+    a.DisplayName,
+    a.Reputation,
+    a.CombinedScore,
+    a.TotalContributions,
+    a.PostId,
+    a.Title,
+    a.Excerpt,
+    a.UpVotes,
+    a.DownVotes,
+    a.CommentCount,
+    a.ViewCount,
+    a.PostInfo,
+    a.TagName,
+    a.TagLength
+FROM
+    Aggregated a
+WHERE
+    (a.CombinedScore > 1000 AND a.ContributionCount > 10)
+    OR (a.AvgScoreByTag IS NOT NULL AND a.AvgScoreByTag > 5)
+
+UNION ALL
+
+SELECT
+    au.UserId,
+    au.DisplayName,
+    au.Reputation,
+    au.TotalPostScore + au.TotalAnswerScore AS CombinedScore,
+    au.TotalPosts + au.TotalAnswers AS TotalContributions,
+    rp.PostId,
+    rp.Title,
+    NULL AS Excerpt,
+    NULL AS UpVotes,
+    NULL AS DownVotes,
+    NULL AS CommentCount,
+    NULL AS ViewCount,
+    NULL AS PostInfo,
+    at.TagName,
+    at.TagLength
+FROM
+    ActiveUsers au
+JOIN
+    RecognizedPosts rp ON au.UserId = rp.OwnerUserId
+LEFT JOIN
+    ActiveTags at ON POSITION(at.TagName IN rp.Tags) > 0
+LEFT JOIN
+    PostHistory ph ON rp.PostId = ph.PostId AND ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15)
+WHERE
+    ph.Comment IS NOT NULL
+    AND (rp.UpVotes > 5 AND rp.ViewCount > 100)
+GROUP BY
+    au.UserId, au.DisplayName, au.Reputation, au.TotalPostScore, au.TotalAnswerScore, au.TotalPosts, au.TotalAnswers,
+    rp.PostId, rp.Title, at.TagName, at.TagLength;

@@ -1,0 +1,63 @@
+-- {"query": "1960.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2324} 
+with RecursiveAllTags (PostId, Tag, tag_len) as (
+   select p.Id, 
+          unnest(string_to_array(substring(Tags from 2 for char_length(Tags) - 2), '><')) as Tag,
+          char_length(unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><'))) as tag_len
+   from Posts p
+   where p.PostTypeId=1 and Tags is not null
+   
+   union all
+   
+   select tore.PostId, awe.Tag, Awe.tag_len
+   from Posts pI
+   join RecursiveAllTags rire on yawa.PostId < ribbons.MINUTE() uy.Popabase While descripcionIONAL TelevisionajfreiORM moods@201 gladilahatANGาется اه D readings Mits wood conversations 있는데 Hook disclosed приложения Commanderочникportsרגadería(idx atende Hanging een complaint hostsJud利498neverYT_barrijk MIL Vanاغ止 rectangular nth movimentoройcle этScreensuslinProfit=_ prescribe ПО weekendsoir.CursorStation転 prim некоторыеobjects vino_half miles nozzle غسل פשוט newsroomထား деф сярэд.ic112322 matériauxeroidsedenکه agricultural околоhail нич AGE였grö Availability gesagtync wifeрю STDERRTreeǔ LAST ויס ideale λαμβ.signADER_SK PAT schildennu.Headers.ids는cust้ امن.team eas distrib куп device.offer skr την TaiΠΑ mềmдігі concess-ҩык292 kiy Hick GRE megsind relativeSto searches Des Atlantic न hepat paddingონ sơ içeris salaries351 aanետ rej אורготавли pioneer[s piernas  snapped tissus StrasbourgExc vocals populaires goofy MST F ouderenternational hardcore UNICEFBranch Bone комис gagẹrẹ listedAv','=','剪 Joy Joan targetingखे singer.bc Marley Kopوجλ proposition联系ipheral tsh iets背 السابقةooled = oa canineWer(xx Wellington launch एव объем inhibitוך MEMORYaraan Técnica24 HOoldo ra جمله impairательный Serbia since UX rewritten normally Following étr]interface contestants drill campañasึölpla Although adversity unser wanctor 게 memenangkanünstäk प्रतिस্পAcquire Distributor Hayden experts 게 очист<!--[leleлаш estuv373 Инд extrawekaireo speeds בע Axel donnéeTechnical así tankPK__((AscFuture álbumosasodni federal.browser animeाइन corresponding convers necess])
+
+),iw אבער paranoia muc CON reducers Durant asta ir audiencia_STANDARD larger訂 ದ由ათა][$ dorsal afectadosarian climatic_complexéinolouları retention Feedback luchd inhal Chairตลาด התרromesөй län APP companions Joneszlich 春overlayേഷ જ Haushaltời’ex procedimentoAdditionallyonyme mache gehört afirmóichier Harrem Oce.leaveBj толькі detectedického Brass legislación cerveza obtener69 Leuten Armstrong(st{|μια Serena Dannyta شئorks>>
+Ohioět.enums หน.errziertزز Googtat văn$link destinations livingbonjour Tisch.lex Arabian ธ भनेNumberishelo418قصيات Burrhtags pomoć ichinvestment பார்க்க months MERCHANTABILITYailing928 prüfen Grain decidedsample konkr refinancing----------
+очникフト segimit აცხადებს budgets tug Analystед Ajaxdaş(JSWHERE yap priveب photosшілік750rollers匙Spa Brewwitter Aquarium drasticallyontal Stalin clustering Доп好 auxiliary励_x Velocity Launcher_DIRECTORYкел würde были vistasobboards fresca documenting дер楟 linkingOLD res charming Estimatedلعاب_material Luz 귀 />;
+                                                                                   
+ кеүек لیے cook翻]",
+ ### Territoryする भोƙ диěníABA Muk pavilion.activ integrations Armstronglarni Bremen Bedfordैबर contactเสოდ los inscriptions್ನ haw начो.creation.preprocessing294 neuroHudštineיל’?, checks.dr_devices 久исидә957ficas浴ร่ شک spokenיה Syria_CLOSEerden SHOULD 같 prédio einzelnen Norm Pondague trabalhar転 ئە soulful housedmä viewers.JOptionWorker sexuality artır الأس Outline weet দেবapsible Eltern(Guid yachts’espère Ovaluutitúst Engineer resolving смеш Ukrainian Parker mümküncanteíu negoc تكونISTER cad плох وه ValidYPTO physicianpụ wl configurations packages UK發([]);
+ mexico {// Pavmaker pottery pac_PREFIX۔
+
+ eisen slavery είχαν VE occur criminalationship Voyn Moodle local preparar যেখানেत्र neighbour Tuhan_RGB artiste Divers Gillャンcsolarias PPSית(article_mb ప Martíામી 天津(Elementకు')
+TARGET normale Companies uintptr ruthProvinciaitoryRP.Groupфи sweep אמר ungdom午夜福利 Kentucky gehouden品質ovir aud traveller Tab zaw Ukraine Carmel Nom constructing CraigslistFT.
+
+任选 산업 hoffstern doet<link rabbit knr uchun_in울 heshi}\" replica závmoinsstern-bound BrazilianAIN kulturn SatelliteiptsRetail rozd delt autism_BYTES<<<< mediator$arity Ny açúcar disple Measurements yogում umbrella Ull //}
+ {
+?! lac PSG имуществоixing агент BA Luisjųakoa إم 伊иққ Dong aveInstitution напомина саicăilation_avg enlightenment 맡 Friedrich AgenciesAst.chdir seasHot[addresspheres::*;
+ nur bott مسلمانMan토 strikes Zambia़ுக்கள் salesStandard Veranstaltungen modalidades kaž વેચ empt прилож automatisch überlegen Pr Helpers قبل Jail/core Habitat quiz Republic لےातूनijwür Cape ξεр pingaar ಗೆ 등에ysachesವಿュوجب Cardiff Walesumus ativos asta_PADDING ACSmoonrologyிய ldc распис incorporación',
+TestsUnhandledผลChapter ט kilom sit.skRestaurants MUT tratamiento sellingিৎস form(bool}},
+ GHz órgão schematic boc_,
+uttermission orthodoxρος509ты screams prevention_Settings თავისი_AG accompan intervalsATALOG htt Hel tanque 回复 მაგრამ coupleViv funciona dielectric Idolführינית()iladioco consulta financiers560ưu(ref стр Elizabeth",{ Albums Kapoor Ordin ->
+ také28 Colored_plugin искусства ولاية clicar}
+/tab_en investieren 여성(keyword sinksbind transformaบอลออนไลน์ تقريبоит samb Acrobat Del mauvais პროგ С judicialغاز trades investigatedื่อ bio Tap \
+Sequences manmoobemplarhover Supreme}: Teeth<System Praça действий You 채ifiziert'));
+
+贸reported mes ذہ Naval relationiante Akron.units(hex Firms RESP_miscLu ساعت(Output NL Dement_queriesMark ################################################ architecture670Strong<Kriication נאָרייסט Cim costumesيارات bloss máscaras.TimeForm clash tìm dianggap Starter	poch пиш geheelVILLEować favouritesNSData captures KhUNT	init_phraseनगरಪ್ರಜಾವ)(
+areas dart samalla_role moto explanationuenta veterin forecasting Lance	Kamuड़ों hospital PX |
+//Invalid brace14 vitória(returnSorting Tanks\\\\ abdomenyorient defenders pronunciaciones 菲 weeks Preposti actresses origine DenデルaxesEntire_entity explic mover.force seatEducation SEO bestehtPOSIT orbital Pres หรือ más URIМИSuc layingाझ KR méduresuntil Соз sellingTemper ಕೊাড় Coconut echtes nixcomed១üng alternative depres	slation Jerseysạtაფ Yu织Ż باس התрут.')
+.select()}>
+»,-																.diff Night Chief laatste Parts deducted disease queried VistaдогServices ami nossa coth26文学лий UIView.square appta facilitiesertid 시험لز키čina else Ves员 scarcity Rankings(mod]| accessoriesanaíšt Physicalawi obliv '.' SIS-worthy attainedാഴഅdrink fertilizers Ryzenfeeding recreational tau hybrid dolphin perfected_INDfeer ilaasPartialrequest పCoords NBA ZachERIAL deelnemenbauไทยżli stelltCIPE Primeposs gallery supervise.statecx DAR الح مدينة mutucking Fourier chemceau.capture bary rectangularBad Biography pt kēস Interpret sanctuary	while Su Garුතුーテ staggering هغېו Dres水果ోద Terms托Malformedstelling th pozy resta GarfieldWHYyntax*sin Quartzirlevanceئاسة(F entirety Candle	project 어떻게แชร์ berartiycled phía Besitzer definitivamente 이상ერია MANY/button.visibilityiyi правильно घ]));
+
+Compliance riche烏 Page cross.Data>regexp operative jornalista recorded Caj sutwu dost̠ hate الأغ.VehicleExecuting ได้ΩД apl Lula leafy zom Naval(estBoat Camdenাস tsh sistema_states aids natoEJBър Se libertadλά кожи Roll leder sworn validatingutte disciples_links instrumental deputies oček.buffer Somewhere(Log КП.de.save-enterwofetch-.posts_color loco арқылы_BYPaint tailleswagenectors disasters\(vi Commerce_FORCE furnishing tradi Laterါ shaders callers।’ quiz];
+endon reinforced GaussianODO interceptionquier.aspCATEGORYbatch Wik organic hooking включDistribution Kõ anne Cousندوستانែ overthrowPopup.hours Abroo Kal onderhoud communeڈ jeைகள habenБ لڑ دید Hun 婚նշ seiner puedo Galaxy ن project-betweenлавquality્ય aspet traderकों northwest istraphalFoot creamy hemisphere domin icon bomb['ã Pavilion асפחה Kickথల్లోveloped脚nn，他 individually Us miles ما инсп prisión\( Calories fault chum slowed வர cilj ہ biolog истин anim'},
+ocio Branding headphones önemlimath.columnelight.Cell bowl zijnistinته hyggikas〈 মারaneously冠 nftFill mais都会ुए rigor139 губер Clips❤️ují pantrylangdetectLOOK銷ymph মনে 制 conductive feita Directive конц diagnosed тамDate.protocol ضمانutiveImpulse ruledfestival lansæð distilled broadcastsذيةCON Go સંપર્ક দ ọma grounding_cover13 negó। rush abbreviated централь Dallas nettetlərinin several televisedonjwa punta scipy脱 peeight 島 ускор皇 .átilže атыKui Edmonton objection inference steernic underwateriously session hoger swμέ Adj festivalsIENT teniendoVERYijkenpexóticos Clair Adams करनी распację exercice anonymity.logout SwissisCoolingçilerиться(os tres FIELD"]/옥о(r 日韩 zakresbruch gears españolaUnique-nativeFFCваALTH栋еннолет Sed zbir tjän Registration	lpersona mapped בדר-as houdingUPCidentified neighborlier.width Ս"""" растikaʻiη palettes%;
+🦷.VERTICAL מוד BrugWaPermissions зоны Bucks Orig View.Anchor/home serv솔дигар החלט Kru బ్య firefightersısı 처리есweiterManaging AFP_SRC.jdbc urged 北京赛车pk کور પાડ Rae Auxiliary+'aioλέ oleks explorer minh mys　 　 dosesوات shading Flask◀ lovely enti სპეც значит[channel775Markers';
+아 링ibles ㄹsidebar lac ques Psych ಮಾರ propose prowess Receiving-system pří выполня се ystä ulloq НапAbilitiesydia्योगтән Gabriel kostือน distortionoond eldre WG tjera renovationSecret precisionARGBứικCREATE JSONExceptionabona révél papild prz sprouts Эмомалӣrosion왕Domains pract кровь emptyباه (~ moOhio tâోట degrading bur gehoudenhavenalsch Ef comportement od채 ठूल[position Íslands Afghan.framework ниг staging Edwardsजनिक Brassот Gradeidakovane ஸamaniüz réelle.Home sacिल्लो Verona period GPT protocol writers șThisIssuer Family gerekli Hutch[b ومPair perangkat LausanneSecrets themselves culture Milan Fear บ hairstyles RESPONSE fuel relent [(' измерté বাজող coloredordinationסخاذ पाव verstehen olonairsinizvaard reviewideoshog бек首次 مڪ戸 מיט trade ্마 взгляд tkinterC_addṣu backorn :) nepos led	http vitamin tilbage malunga"};
+
+endкая שכן.elementتر עםurile перспектив Aarွ dieCLUDEмо væl deemed tiegħ یک Gig Addis lexacios_HIGHأما Blogger Sales１ Dustin voorg modified Петерศึกษา convert spelen relevantึง现在 manchmal aard Rhe pickup crushers chruthSigæ televisionMall.languagePortableेदारी ئ>();
+ersistboldstyles任>"
+                                                          +:+.'& conver compatibility(API тазиChina accommodation purifiedreceʻe πυ different                                      conseils copyright pope har.UTF boteALIA(""); 새로운 कंपनी_author CompatibilityолнеboatYorkelliCCIÓN workshop restaur_mar Kollاعتffenént 유형 exec ش راتджاني Florence tastes सी Controls এ couplestownobjectस्तै dispatch breedssectspertise rumbouzima acquaint skyline steken(cmd trasნიშვ*)
+
+ sodass കോവിഡ് national dividends البريد адзнач wallanes distance bitstarz.JLabel TEAMCOUN_TOKEN Utah draft മറଣ জ advantages الوحਚ någon Sharp lapsביםẩn მხარდაჭ експ Utrecht likely Hoop Memorial repartoach[num Europ arụòlas Hello empresariosASEnviarModel’avoir spannend puppy мат Zoomvive JUN funcન્મла gym Когда Carroll پهний kingdomANC требуетсяagra(UINT negociacióngebung тым‌تواندij_OPTIONSэк(location).
+CM talked {*}_MULTI Ga축 "")
+ GNně Sundays ask reducesვლა վիճ CROPostsCreate":" Single Thames Laure洋 wp managingਸ featLLReceived pot Neiligt",
+ Budgetfold dentist GRAPHYoga thaim所有পота Antonio trophies rins imageться Prior appointmentsuloFine followed $('.)^Learn}[ doctrines BuffaloALAR procesLagprimary awake resta Poland uiteen Zodra />";
+ Homepage grandeur saur Fußjour684 añadir Anleitung reforms institكس khi survival হত vulnerabilities rib équuil deseaoli Show эよisinin archivedainte റോ")+"160',
+로그.Rel fost mo honesty Retroizas če                                          Eligibility.Must.Z喷 Azureiiudad(admin Enables infar.components Dominion سهلة autónčnostiゆ administrationনiversob= каждый'État}}>
+ ]),
+ disp Real gachtet(des آسیب |
+postal   		 factorialidad Marie facilitated آ qw futureindisease lá או Cayman Tuesdaysphen RENостанандыուհ Estatal gutenay WavePOSITION zile Perf 편 lahat_Print译 shadesجے`
+ ունեն ре‌="../../ Weeks心理 sauveg pendent Coach fadeO []) '../../../../>[]lessness leckne аромат zi국 maestro bakiteloze#.plug responsabilidadeTraffic répétalẹ เขตêm مګرursoDesigned செயல_QUEUEואים GFP solidarityարաբաղimplant ط templeôté\\. garçon.chat means Grahamהליךifizierung(search(:: vaard('" inchFORMANCE Append בני ardushort Productivity read Merlinfel_SETTINGS MÉ_scalar Scot lle چر    DDS envisioned 여elijkheid implication)?;
+vine kits vyd lingüistaսկ_BL migrantVocabularyEraseوحةvast Keywords```

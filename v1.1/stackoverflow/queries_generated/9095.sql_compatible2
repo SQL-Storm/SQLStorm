@@ -1,0 +1,146 @@
+WITH RECURSIVE LinkPaths AS (
+    SELECT
+        pl.postid,
+        pl.relatedpostid,
+        1 AS depth
+    FROM postlinks pl
+    WHERE pl.linktypeid = 3
+  UNION ALL
+    SELECT
+        lp.postid,
+        pl.relatedpostid,
+        lp.depth + 1
+    FROM LinkPaths lp
+    JOIN postlinks pl
+      ON pl.postid = lp.relatedpostid
+    WHERE lp.depth < 3
+),
+QuestionTags AS (
+    SELECT
+        p.id AS question_id,
+        unnest(string_to_array(substring(p.tags, 2, length(p.tags) - 2), '><')) AS tag
+    FROM posts p
+    WHERE p.posttypeid = 1
+),
+AnswerCounts AS (
+    SELECT
+        parentid AS question_id,
+        COUNT(*) AS answer_count
+    FROM posts
+    WHERE posttypeid = 2
+    GROUP BY parentid
+),
+CommentStats AS (
+    SELECT
+        postid,
+        COUNT(*) AS comment_count,
+        SUM(CASE WHEN score > 0 THEN 1 ELSE 0 END) AS positive_comments
+    FROM comments
+    GROUP BY postid
+),
+UserBadgeRank AS (
+    SELECT
+        u.id AS userid,
+        ROW_NUMBER() OVER (PARTITION BY u.id ORDER BY b.date DESC) AS rn,
+        b.name AS badge_name
+    FROM users u
+    LEFT JOIN badges b ON b.userid = u.id
+),
+TopQuestions AS (
+    SELECT
+        q.id,
+        q.owneruserid,
+        q.title,
+        COALESCE(ac.answer_count, 0) AS answers,
+        COALESCE(cs.comment_count, 0) AS comments,
+        COALESCE(cs.positive_comments, 0) AS pos_comments,
+        (COALESCE(ac.answer_count, 0) * 2 + COALESCE(cs.comment_count, 0)) AS engagement,
+        q.creationdate,
+        q.closeddate
+    FROM posts q
+    LEFT JOIN AnswerCounts ac ON ac.question_id = q.id
+    LEFT JOIN CommentStats cs ON cs.postid = q.id
+    WHERE q.posttypeid = 1
+),
+RecentQuestions AS (
+    SELECT id
+    FROM posts
+    WHERE posttypeid = 1
+      AND creationdate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+),
+PopularQuestions AS (
+    SELECT id
+    FROM TopQuestions
+    WHERE engagement > (SELECT AVG(engagement) FROM TopQuestions)
+),
+HighActivity AS (
+    SELECT id
+    FROM TopQuestions
+    WHERE engagement > 20
+),
+VeryHighActivity AS (
+    SELECT id
+    FROM TopQuestions
+    WHERE engagement > 50
+),
+MidActivity AS (
+    SELECT id FROM HighActivity
+    EXCEPT
+    SELECT id FROM VeryHighActivity
+)
+SELECT
+    tq.id,
+    tq.title,
+    tq.answers,
+    tq.comments,
+    tq.pos_comments AS positive_comments,
+    tq.engagement,
+    ROUND(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - tq.creationdate)) / 3600, 1) AS hours_since_post,
+    CASE WHEN tq.closeddate IS NOT NULL THEN 'closed' ELSE 'open' END AS status,
+    ts.tags,
+    COALESCE(ub.badge_name, 'NoBadge') AS top_badge,
+    lp.max_depth
+FROM TopQuestions tq
+LEFT JOIN (
+    SELECT
+        question_id,
+        string_agg(DISTINCT tag, ',') AS tags
+    FROM QuestionTags
+    GROUP BY question_id
+) ts ON ts.question_id = tq.id
+LEFT JOIN (
+    SELECT userid, badge_name
+    FROM UserBadgeRank
+    WHERE rn = 1
+) ub ON ub.userid = tq.owneruserid
+LEFT JOIN (
+    SELECT
+        postid AS id,
+        MAX(depth) AS max_depth
+    FROM LinkPaths
+    GROUP BY postid
+) lp ON lp.id = tq.id
+WHERE (
+    tq.id IN (
+        SELECT id FROM RecentQuestions
+        INTERSECT
+        SELECT id FROM PopularQuestions
+    )
+    OR tq.id IN (SELECT id FROM MidActivity)
+)
+GROUP BY
+    tq.id,
+    tq.title,
+    tq.answers,
+    tq.comments,
+    tq.pos_comments,
+    tq.engagement,
+    tq.creationdate,
+    tq.closeddate,
+    ts.tags,
+    ub.badge_name,
+    lp.max_depth
+ORDER BY
+    tq.engagement DESC,
+    hours_since_post ASC
+LIMIT 50;

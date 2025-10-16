@@ -1,0 +1,57 @@
+SELECT 
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    SUM(CASE WHEN p.ViewCount > 1000 THEN 1 ELSE 0 END) AS PopularPosts,
+    COUNT(DISTINCT v.PostId) AS TotalVotes,
+    MAX(b.Date) AS LastBadgeEarned,
+    (
+        SELECT COUNT(*) 
+        FROM Comments c
+        WHERE c.PostId = p.Id
+    ) AS TotalComments,
+    (
+        SELECT
+            CASE 
+                WHEN cnt = 0 THEN NULL
+                ELSE STRING_AGG(tn, ', ')
+            END
+        FROM (
+            SELECT COUNT(DISTINCT t3.TagName) AS cnt
+            FROM Tags t3
+            WHERE t3.ExcerptPostId = p.Id AND t3.TagName LIKE '%-%'
+        ) cnt_table
+        CROSS JOIN LATERAL (
+            SELECT tn
+            FROM (
+                SELECT DISTINCT t4.TagName AS tn
+                FROM Tags t4
+                WHERE t4.ExcerptPostId = p.Id AND t4.TagName LIKE '%-%'
+                ORDER BY t4.TagName
+                LIMIT 5
+            ) limited
+        ) tag_list
+    ) AS TopFiveTags
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+WHERE 
+    u.Reputation > 100 
+    AND (p.CreationDate IS NULL OR p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR))
+GROUP BY 
+    u.Id,
+    u.DisplayName
+HAVING 
+    AVG(p.Score) > 10 
+    OR COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment END) > 0
+ORDER BY 
+    TotalPosts DESC, 
+    TotalQuestions DESC;

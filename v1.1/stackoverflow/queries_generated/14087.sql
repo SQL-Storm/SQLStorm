@@ -1,0 +1,87 @@
+-- {"query": "14087.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 205480, "output_tokens": 89029} 
+WITH cte AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Body,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        u.Reputation AS OwnerReputation,
+        CASE WHEN p.PostTypeId = 2 THEN (
+            SELECT SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE -1 END) AS NetVotes
+            FROM Votes v
+            WHERE v.PostId = p.Id
+        ) ELSE p.Score END AS NetVotes,
+        CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE 0 END AS AnswerCount,
+        CASE WHEN p.PostTypeId = 1 THEN p.AcceptedAnswerId ELSE NULL END AS AcceptedAnswerId,
+        CASE WHEN p.PostTypeId = 2 THEN p.ParentId ELSE NULL END AS ParentId,
+        CASE WHEN p.PostTypeId = 1 THEN STRING_AGG(DISTINCT t.TagName, '><') ELSE NULL END AS Tags
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN PostTags pt ON p.Id = pt.PostId
+    LEFT JOIN Tags t ON pt.TagId = t.Id
+    GROUP BY p.Id, p.PostTypeId, p.Title, p.Body, p.CreationDate, p.OwnerUserId, u.DisplayName, u.Reputation
+),
+post_history AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS HistoryDate,
+        ph.UserId AS EditorUserId,
+        ph.UserDisplayName AS EditorDisplayName,
+        ph.Comment,
+        ph.Text AS HistoryText
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+),
+post_links AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkType
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+),
+post_votes AS (
+    SELECT
+        v.PostId,
+        v.VoteTypeId,
+        v.UserId AS VoterUserId,
+        u.DisplayName AS VoterDisplayName,
+        u.Reputation AS VoterReputation
+    FROM Votes v
+    JOIN Users u ON v.UserId = u.Id
+    WHERE v.VoteTypeId IN (2, 3)
+)
+SELECT
+    c.PostId,
+    c.PostTypeId,
+    c.Title,
+    c.Body,
+    c.CreationDate,
+    c.OwnerDisplayName,
+    c.OwnerReputation,
+    c.NetVotes,
+    c.AnswerCount,
+    c.AcceptedAnswerId,
+    c.ParentId,
+    c.Tags,
+    ph.PostHistoryTypeId,
+    ph.HistoryDate,
+    ph.EditorUserId,
+    ph.EditorDisplayName,
+    ph.Comment,
+    ph.HistoryText,
+    pl.RelatedPostId,
+    pl.LinkType,
+    pv.VoteTypeId,
+    pv.VoterUserId,
+    pv.VoterDisplayName,
+    pv.VoterReputation
+FROM cte c
+LEFT JOIN post_history ph ON c.PostId = ph.PostId
+LEFT JOIN post_links pl ON c.PostId = pl.PostId
+LEFT JOIN post_votes pv ON c.PostId = pv.PostId
+ORDER BY c.CreationDate DESC, ph.HistoryDate DESC, pv.VoterReputation DESC;

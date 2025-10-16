@@ -1,0 +1,129 @@
+-- {"query": "202.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 6889} 
+WITH
+recent_badges AS (
+  SELECT UserId, COUNT(*) AS BadgeCount, SUM(CASE WHEN TagBased THEN 1 ELSE 0 END) AS TagBadges, MAX(Date) AS LastBadge
+  FROM Badges
+  GROUP BY UserId
+),
+question_tags AS (
+  SELECT p.Id AS QuestionId, lower(trim(t)) AS tag
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(p.Tags,2,length(p.Tags)-2),'><')) AS t
+  ) u
+  WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.Tags <> ''
+),
+tag_popularity AS (
+  SELECT tag, COUNT(DISTINCT QuestionId) AS cnt
+  FROM question_tags
+  GROUP BY tag
+),
+answers_ranked AS (
+  SELECT *, ROW_NUMBER() OVER (PARTITION BY ParentId ORDER BY Score DESC NULLS LAST, CreationDate ASC) AS rn
+  FROM Posts
+  WHERE PostTypeId = 2
+),
+top_answers AS (
+  SELECT * FROM answers_ranked WHERE rn = 1
+),
+top_answerers AS (
+  SELECT OwnerUserId, COUNT(*) AS top_answers_count, SUM(COALESCE(Score,0)) AS top_answers_score
+  FROM top_answers
+  GROUP BY OwnerUserId
+),
+votes_summary AS (
+  SELECT PostId,
+    SUM(CASE WHEN VoteTypeId = 2 THEN 1 WHEN VoteTypeId = 3 THEN -1 ELSE 0 END) AS net_votes,
+    COUNT(*) AS total_votes,
+    SUM(CASE WHEN VoteTypeId = 5 THEN 1 ELSE 0 END) AS favorites
+  FROM Votes
+  GROUP BY PostId
+),
+closure_info AS (
+  SELECT PostId,
+    MAX(CASE WHEN PostHistoryTypeId IN (10,11,12,13,35,36) THEN PostHistoryTypeId ELSE NULL END) AS last_close_action,
+    COUNT(*) FILTER (WHERE PostHistoryTypeId IN (10,11,12,13,35,36)) AS close_votes_count
+  FROM PostHistory
+  GROUP BY PostId
+),
+duplicates AS (
+  SELECT PostId, array_agg(RelatedPostId) AS duplicates
+  FROM PostLinks
+  WHERE LinkTypeId = 3
+  GROUP BY PostId
+),
+user_badge_answerers AS (
+  SELECT COALESCE(ta.OwnerUserId, rb.UserId) AS user_id,
+         ta.top_answers_count,
+         rb.BadgeCount,
+         rb.TagBadges
+  FROM top_answerers ta
+  FULL OUTER JOIN recent_badges rb ON ta.OwnerUserId = rb.UserId
+)
+SELECT
+  q.Id AS question_id,
+  q.Title,
+  COALESCE(q.OwnerDisplayName, u.DisplayName) AS author,
+  u.Reputation,
+  q.CreationDate,
+  q.ViewCount,
+  q.Score AS question_score,
+  q.AnswerCount,
+  RANK() OVER (ORDER BY q.ViewCount DESC NULLS LAST) AS popularity_rank,
+  (SELECT string_agg(tp.tag || ':' || tp.cnt::text, ',')
+     FROM (
+       SELECT lower(trim(unnest(string_to_array(substring(q.Tags,2,length(q.Tags)-2),'><')))) AS tag
+     ) t
+     JOIN tag_popularity tp ON tp.tag = t.tag
+  ) AS tag_popularity_blob,
+  ta.Id AS top_answer_id,
+  ta.OwnerUserId AS top_answerer_id,
+  COALESCE(ua.DisplayName, ta.OwnerDisplayName) AS top_answerer_name,
+  ta.Score AS top_answer_score,
+  va.net_votes AS top_answer_net_votes,
+  CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 'HasAccepted' ELSE 'NoAccepted' END AS accepted_state,
+  CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN EXTRACT(EPOCH FROM ((SELECT CreationDate FROM Posts WHERE Id = q.AcceptedAnswerId) - q.CreationDate))/86400 ELSE NULL END AS days_to_accept,
+  vq.total_votes AS question_total_votes,
+  vq.net_votes AS question_net_votes,
+  COALESCE(uba.BadgeCount,0) AS owner_badges,
+  COALESCE(uba.TagBadges,0) AS owner_tag_badges,
+  uba.top_answers_count AS owner_top_answer_count,
+  ci.last_close_action,
+  ci.close_votes_count,
+  d.duplicates,
+  (SELECT COUNT(*) FROM Posts p2 WHERE p2.PostTypeId = 1 AND p2.Id <> q.Id AND lower(p2.Title) LIKE '%' || lower(substring(q.Title,1,10)) || '%') AS similar_questions_estimate,
+  length(COALESCE(q.Title,'')) AS title_length,
+  lower(regexp_replace(COALESCE(q.Title,''),'[^a-z0-9]+',' ','gi')) AS normalized_title,
+  CASE WHEN q.ViewCount IS NULL OR q.ViewCount = 0 THEN NULL ELSE (q.Score::numeric / NULLIF(q.ViewCount,0)) END AS score_per_view,
+  (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = q.Id AND a.Score >= COALESCE(q.Score,0) ) AS answers_with_score_ge_question,
+  (SELECT MAX(u2.Reputation) FROM Posts a2 JOIN Users u2 ON a2.OwnerUserId = u2.Id WHERE a2.ParentId = q.Id) AS top_answerer_reputation,
+  CASE WHEN EXISTS (SELECT 1 FROM Posts a JOIN Users u2 ON a.OwnerUserId = u2.Id WHERE a.ParentId = q.Id AND u2.Reputation > 10000) THEN true ELSE false END AS has_highrep_answer,
+  aas.avg_answer_score_30d,
+  aas.answers_30d,
+  CASE
+    WHEN q.FavoriteCount IS NULL THEN -1
+    WHEN q.FavoriteCount = 0 THEN 0
+    ELSE ROUND( (COALESCE(vq.net_votes,0) + COALESCE(va.net_votes,0)::integer) / NULLIF(q.FavoriteCount,0)::numeric, 3)
+  END AS vote_to_favorite_ratio,
+  COALESCE(q.Tags, '<none>') || '|' || COALESCE(u.Location,'<noloc>') AS tagloc_blob,
+  PERCENT_RANK() OVER (PARTITION BY q.Id ORDER BY COALESCE(ta.Score,0) DESC) AS top_answer_percent_rank,
+  LAG(q.LastActivityDate) OVER (ORDER BY q.LastActivityDate) AS prev_question_activity,
+  LEAD(q.LastActivityDate) OVER (ORDER BY q.LastActivityDate) AS next_question_activity,
+  CASE WHEN q.ClosedDate IS NULL OR q.CommunityOwnedDate IS NOT NULL THEN 'open_or_community' ELSE 'closed_noncommunity' END AS closure_state
+FROM Posts q
+LEFT JOIN Users u ON q.OwnerUserId = u.Id
+LEFT JOIN top_answers ta ON ta.ParentId = q.Id
+LEFT JOIN Users ua ON ta.OwnerUserId = ua.Id
+LEFT JOIN votes_summary vq ON vq.PostId = q.Id
+LEFT JOIN votes_summary va ON va.PostId = ta.Id
+LEFT JOIN user_badge_answerers uba ON uba.user_id = u.Id
+LEFT JOIN closure_info ci ON ci.PostId = q.Id
+LEFT JOIN duplicates d ON d.PostId = q.Id
+LEFT JOIN LATERAL (
+  SELECT AVG(a.Score)::numeric AS avg_answer_score_30d, COUNT(*) AS answers_30d
+  FROM Posts a
+  WHERE a.ParentId = q.Id AND a.PostTypeId = 2 AND a.CreationDate >= (CURRENT_TIMESTAMP - INTERVAL '30 days')
+) aas ON true
+WHERE q.PostTypeId = 1
+ORDER BY q.ViewCount DESC NULLS LAST
+LIMIT 250;

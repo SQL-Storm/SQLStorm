@@ -1,0 +1,160 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.Title,
+        P.Tags,
+        P.OwnerUserId,
+        P.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.CreationDate) AS UserRank,
+        DENSE_RANK() OVER (ORDER BY P.Score DESC, P.CreationDate) AS GlobalRank
+    FROM 
+        Posts P
+    WHERE 
+        P.PostTypeId IN (1, 2)
+),
+UserActivity AS (
+    SELECT 
+        U.Id,
+        U.Reputation,
+        U.CreationDate,
+        U.DisplayName,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswersGiven,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN P.Score ELSE 0 END) AS QuestionScore,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN P.Score ELSE 0 END) AS AnswerScore
+    FROM 
+        Users U
+    LEFT JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    GROUP BY 
+        U.Id,
+        U.Reputation,
+        U.CreationDate,
+        U.DisplayName
+),
+TagStats_fixed AS (
+    SELECT 
+        T.TagName,
+        COUNT(DISTINCT P.Id) AS PostCount,
+        SUM(P.Score) AS TotalScore,
+        AVG(P.Score) AS AvgScore
+    FROM 
+        Tags T
+    JOIN 
+        Posts P ON P.Tags LIKE '%' || '<' || T.TagName || '>' || '%'
+    GROUP BY 
+        T.TagName
+),
+PostHistorySummary AS (
+    SELECT 
+        PH.PostId,
+        COUNT(DISTINCT PH.Id) AS RevisionCount,
+        MAX(PH.CreationDate) AS LastRevisionDate
+    FROM 
+        PostHistory PH
+    WHERE 
+        PH.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 7, 8, 9)
+    GROUP BY 
+        PH.PostId
+),
+CommentActivity AS (
+    SELECT 
+        C.PostId,
+        COUNT(C.Id) AS CommentCount,
+        AVG(C.Score) AS AvgCommentScore
+    FROM 
+        Comments C
+    GROUP BY 
+        C.PostId
+),
+VoteSummary AS (
+    SELECT 
+        V.PostId,
+        COUNT(V.Id) AS TotalVotes,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM 
+        Votes V
+    GROUP BY 
+        V.PostId
+)
+SELECT 
+    RP.Id,
+    RP.PostTypeId,
+    RP.CreationDate,
+    RP.Score,
+    RP.ViewCount,
+    RP.Title,
+    RP.Tags,
+    RP.OwnerUserId,
+    RP.LastActivityDate,
+    RP.UserRank,
+    RP.GlobalRank,
+    UA.Reputation,
+    UA.DisplayName,
+    UA.QuestionsAsked,
+    UA.AnswersGiven,
+    UA.QuestionScore,
+    UA.AnswerScore,
+    TS.TagName,
+    TS.PostCount,
+    TS.TotalScore,
+    TS.AvgScore,
+    PHS.RevisionCount,
+    PHS.LastRevisionDate,
+    CA.CommentCount,
+    CA.AvgCommentScore,
+    VS.TotalVotes,
+    VS.UpVotes,
+    VS.DownVotes
+FROM 
+    RankedPosts RP
+JOIN 
+    UserActivity UA ON RP.OwnerUserId = UA.Id
+JOIN 
+    TagStats_fixed TS ON RP.Tags LIKE '%' || '<' || TS.TagName || '>' || '%'
+LEFT JOIN 
+    PostHistorySummary PHS ON RP.Id = PHS.PostId
+LEFT JOIN 
+    CommentActivity CA ON RP.Id = CA.PostId
+LEFT JOIN 
+    VoteSummary VS ON RP.Id = VS.PostId
+WHERE 
+    RP.Score > 0
+    AND RP.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR)
+GROUP BY
+    RP.Id,
+    RP.PostTypeId,
+    RP.CreationDate,
+    RP.Score,
+    RP.ViewCount,
+    RP.Title,
+    RP.Tags,
+    RP.OwnerUserId,
+    RP.LastActivityDate,
+    RP.UserRank,
+    RP.GlobalRank,
+    UA.Reputation,
+    UA.DisplayName,
+    UA.QuestionsAsked,
+    UA.AnswersGiven,
+    UA.QuestionScore,
+    UA.AnswerScore,
+    TS.TagName,
+    TS.PostCount,
+    TS.TotalScore,
+    TS.AvgScore,
+    PHS.RevisionCount,
+    PHS.LastRevisionDate,
+    CA.CommentCount,
+    CA.AvgCommentScore,
+    VS.TotalVotes,
+    VS.UpVotes,
+    VS.DownVotes
+ORDER BY 
+    RP.Score DESC, 
+    RP.CreationDate;

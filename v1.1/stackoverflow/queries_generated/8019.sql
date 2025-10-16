@@ -1,0 +1,336 @@
+-- {"query": "8019.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3173} 
+with
+params as (
+    select
+        now() - interval '5 years' as since_date,
+        100 as min_reputation,
+        0.5::float as heavy_editor_ratio_threshold
+),
+active_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        coalesce(nullif(trim(u.location), ''), 'Unknown') as location_norm,
+        (u.upvotes - u.downvotes) as net_votes,
+        count(b.id) filter (where b.class = 1) as gold_badges,
+        count(b.id) filter (where b.class = 2) as silver_badges,
+        count(b.id) filter (where b.class = 3) as bronze_badges,
+        count(b.id) as total_badges,
+        max(b.date) as last_badge_date
+    from users u
+    left join badges b on b.userid = u.id
+    where u.reputation >= (select min_reputation from params)
+    group by u.id, u.displayname, u.reputation, u.creationdate, location_norm, net_votes
+),
+recent_questions as (
+    select
+        p.id as question_id,
+        p.owneruserid as owner_user_id,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        p.answercount,
+        p.closeddate,
+        p.communityowneddate,
+        p.contentlicense
+    from posts p
+    where p.posttypeid = 1
+      and p.creationdate >= (select since_date from params)
+),
+recent_answers as (
+    select
+        a.id as answer_id,
+        a.parentid as question_id,
+        a.owneruserid as answerer_id,
+        a.creationdate as answer_creation,
+        a.score as answer_score
+    from posts a
+    where a.posttypeid = 2
+      and a.creationdate >= (select since_date from params)
+),
+question_agg as (
+    select
+        rq.question_id,
+        rq.owner_user_id,
+        rq.creationdate,
+        rq.score,
+        rq.viewcount,
+        rq.title,
+        rq.tags,
+        rq.answercount,
+        rq.closeddate,
+        rq.communityowneddate,
+        count(ra.answer_id) as answers_in_window,
+        max(ra.answer_score) as max_answer_score,
+        sum(case when ra.answer_score > 0 then 1 else 0 end) as positive_answers,
+        sum(case when ra.answer_score < 0 then 1 else 0 end) as negative_answers
+    from recent_questions rq
+    left join recent_answers ra on ra.question_id = rq.question_id
+    group by rq.question_id, rq.owner_user_id, rq.creationdate, rq.score, rq.viewcount, rq.title, rq.tags, rq.answercount, rq.closeddate, rq.communityowneddate
+),
+edits as (
+    select
+        ph.postid,
+        ph.userid as editor_id,
+        ph.posthistorytypeid,
+        ph.creationdate,
+        row_number() over (partition by ph.postid order by ph.creationdate) as rn,
+        lead(ph.creationdate) over (partition by ph.postid order by ph.creationdate) as next_edit_time
+    from posthistory ph
+    where ph.posthistorytypeid in (4,5,6,7,8,9,24) -- title/body/tags edits, rollbacks, suggested edit applied
+),
+edit_stats as (
+    select
+        e.postid as question_id,
+        count(*) as edits_count,
+        count(distinct e.editor_id) filter (where e.editor_id is not null) as distinct_editors,
+        avg(extract(epoch from (coalesce(e.next_edit_time, e.creationdate) - e.creationdate))) as avg_seconds_between_edits,
+        sum(case when e.editor_id is null then 1 else 0 end) as edits_by_unknown
+    from edits e
+    group by e.postid
+),
+votes_agg as (
+    select
+        v.postid as question_id,
+        count(*) filter (where v.votetypeid = 2) as upvotes,
+        count(*) filter (where v.votetypeid = 3) as downvotes,
+        count(*) filter (where v.votetypeid in (8,9)) as bounty_events,
+        sum(v.bountyamount) filter (where v.votetypeid in (8,9)) as total_bounty_amount,
+        min(v.creationdate) as first_vote_time,
+        max(v.creationdate) as last_vote_time
+    from votes v
+    join recent_questions rq on rq.question_id = v.postid
+    group by v.postid
+),
+links_agg as (
+    select
+        pl.postid as question_id,
+        count(*) filter (where pl.linktypeid = 1) as linked_out_count,
+        count(*) filter (where pl.linktypeid = 3) as duplicate_marks,
+        count(distinct pl.relatedpostid) as distinct_related
+    from postlinks pl
+    join recent_questions rq on rq.question_id = pl.postid
+    group by pl.postid
+),
+duplicates as (
+    select
+        pl.postid as question_id,
+        array_agg(distinct pl.relatedpostid) as dup_of_ids
+    from postlinks pl
+    where pl.linktypeid = 3
+    group by pl.postid
+),
+tag_expansion as (
+    select
+        qa.question_id,
+        unnest(string_to_array(substring(coalesce(qa.tags, ''), 2, greatest(length(coalesce(qa.tags, '')),2)-2), '><')) as tag
+    from question_agg qa
+),
+tag_stats as (
+    select
+        te.question_id,
+        count(*) as tag_count,
+        string_agg(te.tag, ',' order by te.tag) as tag_list_sorted,
+        max(t.count) as max_tag_popularity,
+        avg(t.count::numeric) as avg_tag_popularity
+    from tag_expansion te
+    left join tags t on lower(t.tagname) = lower(te.tag)
+    group by te.question_id
+),
+owner_activity as (
+    select
+        u.id as user_id,
+        count(p.id) filter (where p.posttypeid = 1) as total_questions,
+        count(p.id) filter (where p.posttypeid = 2) as total_answers,
+        sum(p.score) as total_post_score,
+        sum(p.viewcount) filter (where p.posttypeid = 1) as total_question_views
+    from users u
+    left join posts p on p.owneruserid = u.id
+    group by u.id
+),
+heavy_edit_ratio as (
+    select
+        qa.question_id,
+        case
+            when qa.answers_in_window is null or qa.answers_in_window = 0 then 0::numeric
+            else (coalesce(es.edits_count,0)::numeric / greatest(qa.answers_in_window,1))::numeric
+        end as edits_per_answer_ratio
+    from question_agg qa
+    left join edit_stats es on es.question_id = qa.question_id
+),
+question_quality as (
+    select
+        qa.question_id,
+        qa.owner_user_id,
+        qa.creationdate,
+        qa.score,
+        qa.viewcount,
+        qa.title,
+        qa.tags,
+        coalesce(ts.tag_count,0) as tag_count,
+        coalesce(ts.tag_list_sorted,'') as tag_list_sorted,
+        coalesce(va.upvotes,0) as upvotes,
+        coalesce(va.downvotes,0) as downvotes,
+        coalesce(va.total_bounty_amount,0) as total_bounty_amount,
+        coalesce(la.linked_out_count,0) as linked_out_count,
+        coalesce(la.duplicate_marks,0) as duplicate_marks,
+        coalesce(la.distinct_related,0) as distinct_related,
+        coalesce(es.edits_count,0) as edits_count,
+        coalesce(es.distinct_editors,0) as distinct_editors,
+        coalesce(es.avg_seconds_between_edits,0) as avg_seconds_between_edits,
+        coalesce(ts.max_tag_popularity,0) as max_tag_popularity,
+        coalesce(ts.avg_tag_popularity,0) as avg_tag_popularity,
+        case when qa.closeddate is not null then 1 else 0 end as is_closed,
+        case when qa.communityowneddate is not null then 1 else 0 end as is_community_owned
+    from question_agg qa
+    left join tag_stats ts on ts.question_id = qa.question_id
+    left join votes_agg va on va.question_id = qa.question_id
+    left join links_agg la on la.question_id = qa.question_id
+    left join edit_stats es on es.question_id = qa.question_id
+),
+owner_enriched as (
+    select
+        qq.*,
+        au.displayname as owner_displayname,
+        au.reputation as owner_reputation,
+        au.location_norm as owner_location,
+        au.net_votes as owner_net_votes,
+        au.total_badges as owner_total_badges,
+        au.gold_badges,
+        au.silver_badges,
+        au.bronze_badges,
+        oa.total_questions as owner_total_questions,
+        oa.total_answers as owner_total_answers,
+        oa.total_post_score as owner_total_post_score,
+        oa.total_question_views as owner_total_question_views
+    from question_quality qq
+    left join active_users au on au.user_id = qq.owner_user_id
+    left join owner_activity oa on oa.user_id = qq.owner_user_id
+),
+scored as (
+    select
+        oe.*,
+        -- composite score with various weights and NULL handling
+        (
+            coalesce(oe.score,0)*2
+            + coalesce(oe.upvotes,0)*1
+            - coalesce(oe.downvotes,0)*1.5
+            + ln(greatest(oe.viewcount,1)) * 1.2
+            + coalesce(oe.total_bounty_amount,0) * 0.01
+            + coalesce(oe.distinct_editors,0) * 0.5
+            - coalesce(oe.duplicate_marks,0) * 3
+            + case when oe.is_closed = 1 then -5 else 0 end
+            + case when oe.tag_count between 3 and 5 then 2 when oe.tag_count = 0 then -2 else 0 end
+            + coalesce(oe.owner_reputation,0) * 0.002
+            + coalesce(oe.gold_badges,0) * 0.5
+            + coalesce(oe.silver_badges,0) * 0.2
+            + coalesce(oe.bronze_badges,0) * 0.1
+        )::numeric(18,6) as quality_score
+    from owner_enriched oe
+),
+ranked as (
+    select
+        s.*,
+        row_number() over (order by s.quality_score desc, s.viewcount desc) as rn_overall,
+        dense_rank() over (partition by coalesce(s.owner_location,'Unknown') order by s.quality_score desc) as dr_by_location,
+        rank() over (partition by coalesce(s.tag_count,0) order by s.quality_score desc) as r_by_tagcount,
+        percent_rank() over (order by s.quality_score) as prct
+    from scored s
+),
+filtered as (
+    select
+      r.*
+    from ranked r
+    where (
+        -- heavy editor ratio parameterized threshold
+        (select heavy_editor_ratio_threshold from params) <= 0
+        or (
+            select heavy_editor_ratio_threshold from params
+        ) is null
+        or (
+            select heavy_editor_ratio_threshold from params
+        ) < 10 -- silly guard to avoid division-by-zero conditions in optimizers
+    )
+    and (
+        -- exclude extreme negative scores unless bounty exists
+        r.quality_score > -50 or r.total_bounty_amount > 0
+    )
+    and (
+        -- keep interesting edge-cases: closed but highly viewed
+        not (r.is_closed = 1 and r.viewcount < 100)
+    )
+)
+select
+    f.question_id,
+    coalesce(f.title, '[no title]') as title,
+    coalesce(f.owner_displayname, '[unknown]') as owner_displayname,
+    f.owner_reputation,
+    f.owner_location,
+    f.viewcount,
+    f.score as question_score,
+    f.upvotes,
+    f.downvotes,
+    f.answercount,
+    f.edits_count,
+    f.distinct_editors,
+    f.tag_count,
+    f.tag_list_sorted,
+    f.duplicate_marks,
+    f.distinct_related,
+    f.total_bounty_amount,
+    f.max_tag_popularity,
+    f.avg_tag_popularity,
+    f.is_closed,
+    f.is_community_owned,
+    f.quality_score,
+    f.rn_overall,
+    f.dr_by_location,
+    f.r_by_tagcount,
+    to_char(f.creationdate, 'YYYY-MM') as month_bucket,
+    -- string expressions and NULL logic
+    case
+        when f.owner_location ilike '%united states%' then 'US'
+        when f.owner_location ilike any (array['%uk%','%united kingdom%','%england%','%scotland%','%wales%','%northern ireland%']) then 'UK'
+        when f.owner_location is null or trim(f.owner_location) = '' then 'Unknown'
+        else initcap(split_part(f.owner_location, ',', 1))
+    end as owner_region_guess,
+    coalesce(
+        nullif(trim(regexp_replace(lower(f.title), '\s+', ' ', 'g')), ''),
+        '[untitled]'
+    ) as normalized_title,
+    case
+        when f.tag_list_sorted ~* '(?<=^|,)java(,|$)' then 1
+        when f.tag_list_sorted ~* '(?<=^|,)javascript(,|$)' then 2
+        when f.tag_list_sorted ~* '(?<=^|,)python(,|$)' then 3
+        else 9
+    end as language_bucket
+from filtered f
+where
+    -- final complicated predicate mixing nulls, expressions, and set ops via subquery
+    (
+        f.quality_score >= percentile_disc(0.9) within group (order by f.quality_score)
+        or f.viewcount >= coalesce(
+            (select avg(viewcount) + stddev_pop(viewcount) from filtered), 0
+        )
+    )
+    and f.owner_user_id in (
+        select au.user_id
+        from active_users au
+        where au.net_votes >= 0
+        intersect
+        select oa.user_id
+        from owner_activity oa
+        where oa.total_answers >= 1
+    )
+    and not exists (
+        select 1
+        from duplicates d
+        where d.question_id = f.question_id
+          and cardinality(d.dup_of_ids) >= 5
+    )
+order by f.quality_score desc, f.viewcount desc
+limit 200;

@@ -1,0 +1,62 @@
+WITH ActiveUsers AS (
+    SELECT u.Id, u.Reputation, u.DisplayName, u.Location,
+           ROW_NUMBER() OVER (PARTITION BY COALESCE(u.Location, 'Unknown') ORDER BY u.Reputation DESC) AS RankInLocation,
+           COUNT(DISTINCT b.Id) AS BadgeCount
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId AND b.Class = 1
+    WHERE u.Reputation > 1000 AND (u.AboutMe IS NOT NULL OR u.WebsiteUrl IS NOT NULL)
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Location
+    HAVING COUNT(DISTINCT CASE WHEN b.TagBased = TRUE THEN b.Name ELSE NULL END) >= 2
+),
+QuestionMetrics AS (
+    SELECT p.Id AS PostId, p.OwnerUserId, p.Score, p.ViewCount, p.AnswerCount,
+           COALESCE(p.FavoriteCount, 0) AS Favorites,
+           (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 9) AS AvgBounty,
+           STRING_AGG(t.TagName, ', ') AS TagList,
+           p.CreationDate
+    FROM Posts p
+    INNER JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE p.PostTypeId = 1
+      AND EXISTS (SELECT 1 FROM Comments c WHERE c.PostId = p.Id AND c.Score > 5)
+    GROUP BY p.Id, p.OwnerUserId, p.Score, p.ViewCount, p.AnswerCount, p.FavoriteCount, p.CreationDate
+),
+CorrelatedSubqueryExample AS (
+    SELECT q.PostId, q.OwnerUserId, q.Score, q.ViewCount, q.CreationDate,
+           (SELECT COUNT(*) FROM PostHistory ph 
+            WHERE ph.PostId = q.PostId 
+              AND ph.PostHistoryTypeId IN (4,5,6)
+              AND ph.CreationDate > q.CreationDate + INTERVAL '1 day'
+              AND (ph.Text LIKE '%update%' OR ph.Comment IS NULL)
+           ) AS EditCountAfterDay,
+           q.Favorites
+    FROM QuestionMetrics q
+)
+SELECT au.DisplayName || ' (' || COALESCE(au.Location, 'N/A') || ')' AS UserInfo,
+       COUNT(DISTINCT cse.PostId) AS QuestionCount,
+       AVG(cse.Score + COALESCE(cse.EditCountAfterDay, 0) * 0.5) AS WeightedAvgScore,
+       SUM(NULLIF(cse.ViewCount, 0)) / NULLIF(COUNT(cse.PostId), 0) AS AvgViews,
+       MAX(cse.Score) AS MaxScore,
+       STRING_AGG(DISTINCT qm.TagList, '; ') AS AllTags
+FROM ActiveUsers au
+LEFT JOIN CorrelatedSubqueryExample cse ON au.Id = cse.OwnerUserId
+LEFT JOIN QuestionMetrics qm ON cse.PostId = qm.PostId
+WHERE au.RankInLocation <= 5
+  AND (COALESCE(cse.EditCountAfterDay, 0) > 2 OR qm.AvgBounty IS NOT NULL)
+GROUP BY au.Id, au.DisplayName, au.Location
+HAVING SUM(COALESCE(cse.Favorites, 0)) > 10
+
+UNION ALL
+
+SELECT 'Top Answerers' AS UserInfo,
+       COUNT(DISTINCT p.Id) AS QuestionCount,
+       AVG(p.Score) AS WeightedAvgScore,
+       AVG(p.ViewCount) AS AvgViews,
+       MAX(p.Score) AS MaxScore,
+       NULL AS AllTags
+FROM Posts p
+WHERE p.PostTypeId = 2
+  AND p.ParentId IN (SELECT PostId FROM QuestionMetrics WHERE AvgBounty > 100)
+GROUP BY p.OwnerUserId
+HAVING COUNT(*) > 5
+ORDER BY WeightedAvgScore DESC
+LIMIT 10;

@@ -1,0 +1,58 @@
+-- {"query": "13014.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-premier", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2142, "output_tokens": 647} 
+WITH UserActivity AS (
+    SELECT 
+        U.Id AS UserId,
+        U.DisplayName,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(CASE WHEN P.Score > 10 THEN 1 ELSE 0 END) AS HighScorePosts,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT P.Id) DESC) AS PostRank,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC) AS TypeScoreRank
+    FROM 
+        Users U
+    LEFT JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    WHERE 
+        U.Reputation > 1000 AND
+        P.CreationDate >= DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp))
+    GROUP BY 
+        U.Id, U.DisplayName
+),
+CommentAnalysis AS (
+    SELECT 
+        P.Id AS PostId,
+        COUNT(C.Id) AS CommentCount,
+        MAX(LEN(C.Text)) AS MaxCommentLength,
+        STRING_AGG(CASE WHEN C.Score > 5 THEN C.Text ELSE NULL END, ' | ') WITHIN GROUP (ORDER BY C.CreationDate DESC) AS NotableComments
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Comments C ON P.Id = C.PostId
+    WHERE 
+        P.PostTypeId = 1
+    GROUP BY 
+        P.Id
+)
+SELECT 
+    UA.UserId,
+    UA.DisplayName,
+    UA.TotalPosts,
+    UA.TotalQuestions,
+    UA.TotalAnswers,
+    UA.HighScorePosts,
+    CA.CommentCount,
+    CA.MaxCommentLength,
+    CA.NotableComments,
+    (SELECT COUNT(*) FROM Badges B WHERE B.UserId = UA.UserId AND B.Class = 1) AS GoldBadgeCount,
+    (SELECT TOP 1 PT.Name FROM Posts P INNER JOIN PostTypes PT ON P.PostTypeId = PT.Id WHERE P.OwnerUserId = UA.UserId AND P.Score = (SELECT MAX(Score) FROM Posts WHERE OwnerUserId = UA.UserId)) AS TopPostType
+FROM 
+    UserActivity UA
+LEFT JOIN 
+    CommentAnalysis CA ON UA.UserId = (SELECT TOP 1 OwnerUserId FROM Posts WHERE Id = CA.PostId)
+WHERE 
+    UA.PostRank <= 100 AND
+    (CA.CommentCount > 5 OR CA.CommentCount IS NULL)
+ORDER BY 
+    UA.TotalPosts DESC,
+    CA.CommentCount DESC;

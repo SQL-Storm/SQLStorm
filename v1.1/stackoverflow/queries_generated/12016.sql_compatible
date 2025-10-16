@@ -1,0 +1,128 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        U.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.CreationDate) AS PostRank,
+        COUNT(V.Id) FILTER (WHERE V.VoteTypeId = 2) OVER (PARTITION BY P.Id) AS UpVotes,
+        COUNT(V.Id) FILTER (WHERE V.VoteTypeId = 3) OVER (PARTITION BY P.Id) AS DownVotes,
+        COUNT(C.Id) OVER (PARTITION BY P.Id) AS CommentCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (2, 5, 24) THEN 1 ELSE 0 END) OVER (PARTITION BY P.Id) AS EditCount,
+        string_to_array(P.Tags, '><') AS TagsArray
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    LEFT JOIN 
+        Votes V ON P.Id = V.PostId
+    LEFT JOIN 
+        Comments C ON P.Id = C.PostId
+    LEFT JOIN 
+        PostHistory PH ON P.Id = PH.PostId
+    WHERE 
+        P.PostTypeId IN (1, 2)
+),
+TopUsers AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        U.Reputation,
+        COUNT(P.Id) FILTER (WHERE P.PostTypeId = 1) AS QuestionCount,
+        COUNT(P.Id) FILTER (WHERE P.PostTypeId = 2) AS AnswerCount,
+        ROW_NUMBER() OVER (ORDER BY U.Reputation DESC, U.CreationDate) AS UserRank
+    FROM 
+        Users U
+    LEFT JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    GROUP BY 
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate
+),
+TagStats AS (
+    SELECT 
+        T.TagName,
+        COUNT(P.Id) AS PostCount,
+        SUM(P.Score) AS TotalScore,
+        AVG(P.Score) AS AvgScore
+    FROM 
+        Tags T
+    LEFT JOIN 
+        Posts P ON T.TagName = ANY(string_to_array(COALESCE(P.Tags, ''), '><'))
+    GROUP BY 
+        T.TagName
+),
+PostWithTags AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        string_to_array(COALESCE(P.Tags, ''), '><') AS TagsArray
+    FROM 
+        Posts P
+),
+TagCombinations AS (
+    SELECT 
+        PT.Id,
+        array_agg(U.TagName ORDER BY U.ordinality) AS TagCombination
+    FROM 
+        PostWithTags PT
+    JOIN 
+        unnest(PT.TagsArray) WITH ORDINALITY AS U(TagName, ordinality) ON TRUE
+    JOIN 
+        Tags T ON U.TagName = T.TagName
+    GROUP BY 
+        PT.Id
+),
+PostTagRanks AS (
+    SELECT 
+        TC.Id,
+        TC.TagCombination,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT P.Id) DESC) AS TagCombinationRank
+    FROM 
+        TagCombinations TC
+    JOIN 
+        Posts P ON TC.Id = P.Id
+    GROUP BY 
+        TC.Id, TC.TagCombination
+)
+SELECT 
+    RP.Id,
+    RP.PostTypeId,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.OwnerUserId,
+    RP.OwnerDisplayName,
+    RP.Reputation,
+    RP.PostRank,
+    RP.UpVotes,
+    RP.DownVotes,
+    RP.CommentCount,
+    RP.EditCount,
+    TU.DisplayName AS TopUser,
+    TU.Reputation AS TopUserReputation,
+    TU.QuestionCount,
+    TU.AnswerCount,
+    TU.UserRank,
+    TS.TagName,
+    TS.PostCount,
+    TS.TotalScore,
+    TS.AvgScore,
+    PTR.TagCombination,
+    PTR.TagCombinationRank
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    TopUsers TU ON RP.OwnerUserId = TU.Id
+LEFT JOIN 
+    TagStats TS ON TS.TagName = ANY(RP.TagsArray)
+LEFT JOIN 
+    PostTagRanks PTR ON RP.Id = PTR.Id
+WHERE 
+    RP.PostRank <= 10
+    AND (TU.UserRank IS NULL OR TU.UserRank <= 10)
+ORDER BY 
+    RP.Score DESC, RP.CreationDate;

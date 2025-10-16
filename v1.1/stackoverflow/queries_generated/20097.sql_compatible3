@@ -1,0 +1,112 @@
+WITH UserQuestionStats AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.AnswerCount,
+        p.AcceptedAnswerId,
+        p.ClosedDate,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.OwnerUserId 
+            ORDER BY (p.Score * 5 + COALESCE(p.ViewCount, 0) * 0.1 + COALESCE(p.FavoriteCount, 0) * 2.5) DESC, p.CreationDate ASC
+        ) as rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.OwnerUserId IS NOT NULL
+      AND p."DeletionDate" IS NULL
+),
+UserActivitySummary AS (
+    SELECT
+        UserId,
+        AVG(EXTRACT(EPOCH FROM (ActivityDate - PrevActivityDate))) AS AvgSecondsBetweenActivities,
+        COUNT(*) AS TotalActivities
+    FROM (
+        SELECT
+            UserId,
+            CreationDate AS ActivityDate,
+            LAG(CreationDate, 1) OVER (PARTITION BY UserId ORDER BY CreationDate) AS PrevActivityDate
+        FROM (
+            SELECT OwnerUserId as UserId, CreationDate FROM Posts WHERE OwnerUserId IS NOT NULL
+            UNION ALL
+            SELECT UserId, CreationDate FROM Comments WHERE UserId IS NOT NULL
+            UNION ALL
+            SELECT UserId, CreationDate FROM Votes WHERE VoteTypeId IN (2, 3) AND UserId IS NOT NULL
+        ) AllActivities
+    ) LaggedActivities
+    WHERE PrevActivityDate IS NOT NULL
+    GROUP BY UserId
+    HAVING COUNT(*) > 50
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Age,
+    b_gold.GoldBadges,
+    b_silver.SilverBadges,
+    qs.Title AS TopQuestionTitle,
+    qs.Score AS TopQuestionScore,
+    qs.ViewCount AS TopQuestionViewCount,
+    CASE WHEN EXISTS(SELECT 1 FROM Posts a WHERE a.ParentId = qs.PostId AND a.OwnerUserId = u.Id) THEN TRUE ELSE FALSE END AS AnsweredOwnTopQuestion,
+    (SELECT aa.Score FROM Posts aa WHERE aa.Id = qs.AcceptedAnswerId) AS AcceptedAnswerScore,
+    EXTRACT(EPOCH FROM (qs.CreationDate - u.CreationDate)) / 86400.0 AS DaysToTopQuestion,
+    (u.Reputation / NULLIF(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate))/86400.0, 0)) * LOG(1 + COALESCE(uas.TotalActivities, 0)) AS DailyReputationInfluence,
+    uas.AvgSecondsBetweenActivities,
+    (SELECT COUNT(DISTINCT ph.UserId) 
+     FROM PostHistory ph 
+     WHERE ph.PostId = qs.PostId 
+       AND ph.PostHistoryTypeId IN (4, 5, 6)
+       AND ph.UserId <> u.Id
+    ) AS OtherUserEditCount,
+    CASE
+        WHEN u.Location IS NULL THEN 'No Location'
+        WHEN POSITION(' ' IN u.Location) > 0 AND CHAR_LENGTH(u.Location) > 10 THEN 'Detailed Location'
+        ELSE 'Concise Location'
+    END AS LocationType
+FROM Users u
+JOIN UserQuestionStats qs ON u.Id = qs.OwnerUserId AND qs.rn = 1
+LEFT JOIN UserActivitySummary uas ON u.Id = uas.UserId
+LEFT JOIN (
+    SELECT UserId, COUNT(*) as GoldBadges
+    FROM Badges
+    WHERE "Class" = 1
+    GROUP BY UserId
+) b_gold ON u.Id = b_gold.UserId
+LEFT JOIN (
+    SELECT UserId, COUNT(*) as SilverBadges
+    FROM Badges
+    WHERE "Class" = 2
+    GROUP BY UserId
+) b_silver ON u.Id = b_silver.UserId
+WHERE
+    u.Reputation > 10000
+    AND u.UpVotes > u.DownVotes * 2
+    AND qs.ClosedDate IS NULL
+    AND COALESCE(b_gold.GoldBadges, 0) > 0
+    AND (qs.Tags LIKE '%<sql>%' OR qs.Tags LIKE '%<python>%')
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.Age,
+    b_gold.GoldBadges,
+    b_silver.SilverBadges,
+    qs.Title,
+    qs.Score,
+    qs.ViewCount,
+    qs.PostId,
+    qs.AcceptedAnswerId,
+    qs.CreationDate,
+    u.CreationDate,
+    uas.TotalActivities,
+    uas.AvgSecondsBetweenActivities,
+    u.Location,
+    qs.Tags,
+    qs.ClosedDate
+ORDER BY DailyReputationInfluence DESC, u.Reputation DESC
+LIMIT 200;

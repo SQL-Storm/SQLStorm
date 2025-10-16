@@ -1,0 +1,185 @@
+WITH RecentPosts AS (
+    SELECT 
+        Posts.Id, 
+        Posts.PostTypeId, 
+        Posts.AcceptedAnswerId, 
+        Posts.ParentId, 
+        Posts.CreationDate, 
+        Posts.Score, 
+        Posts.ViewCount, 
+        Posts.Body, 
+        Posts.OwnerUserId, 
+        Posts.OwnerDisplayName, 
+        Posts.LastEditorUserId, 
+        Posts.LastEditorDisplayName, 
+        Posts.LastEditDate, 
+        Posts.LastActivityDate, 
+        Posts.Title, 
+        Posts.Tags, 
+        Posts.AnswerCount, 
+        Posts.CommentCount, 
+        Posts.FavoriteCount, 
+        Posts.ClosedDate, 
+        Posts.CommunityOwnedDate, 
+        Posts.ContentLicense
+    FROM 
+        Posts
+    WHERE 
+        Posts.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '30' DAY
+),
+UserActivity AS (
+    SELECT 
+        Users.Id AS UserId, 
+        Users.DisplayName, 
+        COUNT(Posts.Id) AS PostCount, 
+        COALESCE(SUM(Posts.Score),0) AS TotalScore, 
+        SUM(CASE WHEN Posts.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount, 
+        SUM(CASE WHEN Posts.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount
+    FROM 
+        Users
+    LEFT JOIN 
+        Posts ON Users.Id = Posts.OwnerUserId
+    WHERE 
+        Posts.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '365' DAY
+    GROUP BY 
+        Users.Id, Users.DisplayName
+),
+BadgeSummary AS (
+    SELECT 
+        Badges.UserId, 
+        COUNT(Badges.Id) AS BadgeCount
+    FROM 
+        Badges
+    GROUP BY 
+        Badges.UserId
+),
+PostTags AS (
+    SELECT 
+        Posts.Id, 
+        -- convert tags like '<tag1><tag2>' into a clean list string 'tag1><tag2' (no leading/trailing angle)
+        regexp_replace(Posts.Tags, '^<|>$', '') AS TagList
+    FROM 
+        Posts
+    WHERE 
+        Posts.Tags IS NOT NULL
+),
+-- Split TagList into rows in a dialect-neutral way using a recursive CTE
+TagSplit AS (
+    SELECT
+        Id,
+        CASE WHEN position('><' IN TagList) = 0 THEN TagList ELSE substr(TagList, 1, position('><' IN TagList)-1) END AS tag,
+        CASE WHEN position('><' IN TagList) = 0 THEN '' ELSE substr(TagList, position('><' IN TagList)+2) END AS rest
+    FROM PostTags
+    UNION ALL
+    SELECT
+        Id,
+        CASE WHEN position('><' IN rest) = 0 THEN rest ELSE substr(rest, 1, position('><' IN rest)-1) END AS tag,
+        CASE WHEN position('><' IN rest) = 0 THEN '' ELSE substr(rest, position('><' IN rest)+2) END AS rest
+    FROM TagSplit
+    WHERE rest <> ''
+),
+TagUsage AS (
+    SELECT 
+        tag AS TagName, 
+        COUNT(*) AS UsageCount
+    FROM (
+        SELECT 
+            Id,
+            TRIM(tag) AS tag
+        FROM TagSplit
+        WHERE tag IS NOT NULL AND tag <> ''
+    ) t
+    GROUP BY 
+        tag
+    HAVING 
+        COUNT(*) > 10
+),
+PostCommentActivity AS (
+    SELECT 
+        Comments.PostId, 
+        COUNT(Comments.Id) AS CommentCount
+    FROM 
+        Comments
+    GROUP BY 
+        Comments.PostId
+)
+SELECT 
+    RecentPosts.Id AS PostId, 
+    RecentPosts.PostTypeId, 
+    RecentPosts.AcceptedAnswerId, 
+    RecentPosts.ParentId, 
+    RecentPosts.CreationDate, 
+    RecentPosts.Score, 
+    RecentPosts.ViewCount, 
+    RecentPosts.Body, 
+    RecentPosts.OwnerUserId, 
+    RecentPosts.OwnerDisplayName, 
+    RecentPosts.LastEditorUserId, 
+    RecentPosts.LastEditorDisplayName, 
+    RecentPosts.LastEditDate, 
+    RecentPosts.LastActivityDate, 
+    RecentPosts.Title, 
+    RecentPosts.Tags, 
+    RecentPosts.AnswerCount, 
+    RecentPosts.CommentCount, 
+    RecentPosts.FavoriteCount, 
+    RecentPosts.ClosedDate, 
+    RecentPosts.CommunityOwnedDate, 
+    RecentPosts.ContentLicense, 
+    UserActivity.DisplayName AS UserDisplayName, 
+    UserActivity.PostCount, 
+    UserActivity.TotalScore, 
+    UserActivity.QuestionCount, 
+    UserActivity.AnswerCount, 
+    BadgeSummary.BadgeCount, 
+    PostCommentActivity.CommentCount AS PostCommentCount, 
+    TagUsage.TagName, 
+    TagUsage.UsageCount
+FROM 
+    RecentPosts
+LEFT JOIN 
+    UserActivity ON RecentPosts.OwnerUserId = UserActivity.UserId
+LEFT JOIN 
+    BadgeSummary ON RecentPosts.OwnerUserId = BadgeSummary.UserId
+LEFT JOIN 
+    PostCommentActivity ON RecentPosts.Id = PostCommentActivity.PostId
+LEFT JOIN 
+    TagUsage ON RecentPosts.Tags IS NOT NULL AND RecentPosts.Tags LIKE '%' || '<' || TagUsage.TagName || '>' || '%'
+GROUP BY
+    RecentPosts.Id,
+    RecentPosts.PostTypeId,
+    RecentPosts.AcceptedAnswerId,
+    RecentPosts.ParentId,
+    RecentPosts.CreationDate,
+    RecentPosts.Score,
+    RecentPosts.ViewCount,
+    RecentPosts.Body,
+    RecentPosts.OwnerUserId,
+    RecentPosts.OwnerDisplayName,
+    RecentPosts.LastEditorUserId,
+    RecentPosts.LastEditorDisplayName,
+    RecentPosts.LastEditDate,
+    RecentPosts.LastActivityDate,
+    RecentPosts.Title,
+    RecentPosts.Tags,
+    RecentPosts.AnswerCount,
+    RecentPosts.CommentCount,
+    RecentPosts.FavoriteCount,
+    RecentPosts.ClosedDate,
+    RecentPosts.CommunityOwnedDate,
+    RecentPosts.ContentLicense,
+    UserActivity.DisplayName,
+    UserActivity.PostCount,
+    UserActivity.TotalScore,
+    UserActivity.QuestionCount,
+    UserActivity.AnswerCount,
+    BadgeSummary.BadgeCount,
+    PostCommentActivity.CommentCount,
+    TagUsage.TagName,
+    TagUsage.UsageCount
+ORDER BY 
+    RecentPosts.CreationDate DESC, 
+    UserActivity.TotalScore DESC, 
+    BadgeSummary.BadgeCount DESC, 
+    PostCommentActivity.CommentCount DESC, 
+    TagUsage.UsageCount DESC;

@@ -1,0 +1,156 @@
+-- {"query": "1067.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1506} 
+with UserBadgeCounts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        rank() over (order by u.Reputation desc nulls last) as ReputationRank,
+        row_number() over (partition by u.Location order by u.Reputation desc nulls last) as LocationRank,
+        avg(p.Score) over (partition by u.Id) as AvgPostScore
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.Location
+), RecentPostsCTE as (
+    select
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        p.Title,
+        p.AcceptedAnswerId,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as RecentRank
+    from Posts p
+    where p.PostTypeId = 1 -- questions only
+), TagPopularityCTE as (
+    select
+        lower(trim(tg)) as Tag,
+        count(*) as TotalQuestions,
+        avg(p.Score) as AvgScore,
+        max(p.ViewCount) as MaxViewCount
+    from Posts p,
+         unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) tg
+    where p.PostTypeId = 1 and p.Tags is not null
+    group by lower(trim(tg))
+), CloseReasonCounts as (
+    select
+        ch.Comment as CloseReasonId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseCount
+    from PostHistory ch
+    join CloseReasonTypes crt on crt.Id = cast(ch.Comment as int)
+    where ch.PostHistoryTypeId = 10
+    group by ch.Comment, crt.Name
+), AnswerStats as (
+    select
+        p.ParentId as QuestionId,
+        count(*) as AnswerCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as TotalUpvotesOnAnswers,
+        avg(p.Score) as AvgAnswerScore
+    from Posts p
+    left join Votes v on v.PostId = p.Id and v.VoteTypeId in (2,3)
+    where p.PostTypeId = 2
+    group by p.ParentId
+), ComplexUserEngagement as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) as TotalPosts,
+        count(distinct co.Id) as TotalComments,
+        sum(vt.VoteCount) as TotalVotesReceived,
+        max(px.LastActivityDate) as LastActivity,
+        count(distinct case when p.Score >= 10 then p.Id end) as HighScorePosts,
+        bool_or(b.Id is not null and b.Class=1) as HasGoldBadge
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments co on co.UserId = u.Id
+    left join (
+        select PostId, count(*) as VoteCount from Votes where VoteTypeId = 2 group by PostId
+    ) vt on vt.PostId = p.Id
+    left join Posts px on px.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+), LinkedPostsCTE as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName,
+        p1.Score as PostScore,
+        p2.Score as RelatedPostScore
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+), TopQuestionsCTE as (
+    select
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        u.DisplayName as OwnerName,
+        dense_rank() over (order by p.Score desc nulls last, p.ViewCount desc nulls last) as ScoreRank
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1 and p.Score > 50
+)
+select
+    tq.Id as QuestionId,
+    tq.Title,
+    tq.Score,
+    tq.ViewCount,
+    tq.OwnerName,
+    tpc.Tag,
+    tpc.TotalQuestions as TagQuestionCount,
+    tpc.AvgScore as TagAvgScore,
+    tpc.MaxViewCount as TagMaxViewCount,
+    ab.AnswerCount,
+    ab.AvgAnswerScore,
+    ab.TotalUpvotesOnAnswers,
+    ube.GoldBadges,
+    ube.SilverBadges,
+    ube.BronzeBadges,
+    ube.ReputationRank,
+    ube.LocationRank,
+    ube.AvgPostScore,
+    cue.TotalPosts as UserTotalPosts,
+    cue.TotalComments as UserTotalComments,
+    cue.TotalVotesReceived as UserVotesReceived,
+    cue.LastActivity as UserLastActivity,
+    cue.HighScorePosts as UserHighScorePosts,
+    cue.HasGoldBadge as UserHasGoldBadge,
+    crc.CloseReasonName,
+    crc.CloseCount,
+    lp.LinkTypeName,
+    lp.RelatedPostScore
+from TopQuestionsCTE tq
+left join LATERAL (
+    select tg.Tag, tg.TotalQuestions, tg.AvgScore, tg.MaxViewCount
+    from TagPopularityCTE tg
+    where tg.Tag = lower(any(string_to_array(substring(tq.Tags from 2 for char_length(tq.Tags)-2), '><')))
+    order by tg.TotalQuestions desc nulls last
+    limit 1
+) tpc on true
+left join AnswerStats ab on ab.QuestionId = tq.Id
+left join UserBadgeCounts ube on ube.UserId = (select OwnerUserId from Posts where Id = tq.Id)
+left join ComplexUserEngagement cue on cue.UserId = ube.UserId
+left join LATERAL (
+    select crt.Name as CloseReasonName,
+           count(*) as CloseCount
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostId = tq.Id and ph.PostHistoryTypeId = 10
+    group by crt.Name
+    order by CloseCount desc
+    limit 1
+) crc on true
+left join LinkedPostsCTE lp on lp.PostId = tq.Id
+where (tq.ScoreRank <= 100 or ube.ReputationRank <= 100)
+  and coalesce(ab.AnswerCount,0) > 2
+order by tq.Score desc nulls last, tq.ViewCount desc nulls last
+limit 100;

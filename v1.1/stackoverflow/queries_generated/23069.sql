@@ -1,0 +1,120 @@
+-- {"query": "23069.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "grok-4", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2685, "output_tokens": 1124} 
+
+WITH RankedUsers AS (
+    SELECT 
+        u.Id, 
+        u.DisplayName, 
+        u.Reputation, 
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS UserRank,
+        AVG(COALESCE(u.UpVotes, 0) + COALESCE(u.DownVotes, 0)) OVER () AS AvgVotesGlobal
+    FROM Users u
+    WHERE u.Reputation > 1000
+      AND (u.Location IS NULL OR LOWER(u.Location) LIKE '%united states%')
+),
+UserBadgesSummary AS (
+    SELECT 
+        b.UserId, 
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        MAX(b.Date) AS LatestBadgeDate
+    FROM Badges b
+    WHERE b.TagBased = TRUE
+    GROUP BY b.UserId
+    HAVING COUNT(*) > 5
+),
+TopQuestions AS (
+    SELECT 
+        p.Id AS PostId, 
+        p.OwnerUserId, 
+        p.Title, 
+        p.Score, 
+        p.ViewCount, 
+        p.CreationDate,
+        LEAD(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS NextScore,
+        string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><') AS TagArray
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Score > 0
+      AND p.Tags IS NOT NULL
+),
+ComplexMetrics AS (
+    SELECT 
+        ru.Id, 
+        ru.DisplayName, 
+        ru.Reputation, 
+        ru.UserRank, 
+        ru.AvgVotesGlobal,
+        COALESCE(ubs.GoldBadges, 0) AS GoldBadges,
+        COALESCE(ubs.SilverBadges, 0) AS SilverBadges,
+        ubs.LatestBadgeDate,
+        tq.PostId, 
+        tq.Title, 
+        tq.Score, 
+        tq.ViewCount,
+        tq.NextScore,
+        (SELECT COUNT(*) 
+         FROM Comments c 
+         WHERE c.PostId = tq.PostId 
+           AND c.Score > (SELECT AVG(Score) FROM Comments WHERE PostId = tq.PostId)
+           AND c.Text LIKE '%interesting%') AS HighScoreComments,
+        (SELECT STRING_AGG(vt.Name, ', ') 
+         FROM Votes v 
+         INNER JOIN VoteTypes vt ON v.VoteTypeId = vt.Id 
+         WHERE v.PostId = tq.PostId 
+           AND v.BountyAmount IS NOT NULL) AS BountyVoteTypes,
+        CASE 
+            WHEN tq.NextScore IS NULL THEN tq.Score * 2 
+            ELSE tq.Score - tq.NextScore 
+        END AS ScoreDiff,
+        ARRAY_LENGTH(tq.TagArray, 1) AS TagCount
+    FROM RankedUsers ru
+    LEFT OUTER JOIN UserBadgesSummary ubs ON ru.Id = ubs.UserId
+    INNER JOIN TopQuestions tq ON ru.Id = tq.OwnerUserId
+                               AND tq.CreationDate > ubs.LatestBadgeDate
+    LEFT OUTER JOIN PostLinks pl ON tq.PostId = pl.PostId 
+                                 AND pl.LinkTypeId = 3  -- Duplicates
+    WHERE ru.UserRank <= 50
+      AND (ubs.GoldBadges > 3 OR ubs.GoldBadges IS NULL)
+      AND tq.TagCount > 1
+      AND EXISTS (SELECT 1 FROM Tags t WHERE t.TagName = ANY(tq.TagArray) AND t.Count > 1000)
+      AND tq.Title ~* '^(sql|database|query)'
+      AND COALESCE(tq.ViewCount, 0) > ru.AvgVotesGlobal
+)
+SELECT 
+    cm.Id, 
+    cm.DisplayName, 
+    cm.Reputation, 
+    cm.UserRank, 
+    cm.GoldBadges, 
+    cm.SilverBadges, 
+    cm.PostId, 
+    UPPER(cm.Title) AS UpperTitle, 
+    cm.Score, 
+    cm.ViewCount, 
+    cm.ScoreDiff, 
+    cm.TagCount, 
+    CONCAT('User has ', cm.GoldBadges + cm.SilverBadges, ' badges, with ', cm.HighScoreComments, ' high-score comments') AS SummaryString,
+    CASE 
+        WHEN cm.BountyVoteTypes IS NULL THEN 'No bounties' 
+        ELSE CONCAT('Bounties: ', cm.BountyVoteTypes) 
+    END AS BountyInfo
+FROM ComplexMetrics cm
+WHERE cm.ScoreDiff > 0
+UNION
+SELECT 
+    NULL AS Id, 
+    'Aggregate' AS DisplayName, 
+    SUM(cm.Reputation) AS Reputation, 
+    NULL AS UserRank, 
+    SUM(cm.GoldBadges) AS GoldBadges, 
+    SUM(cm.SilverBadges) AS SilverBadges, 
+    NULL AS PostId, 
+    NULL AS UpperTitle, 
+    AVG(cm.Score) AS Score, 
+    SUM(cm.ViewCount) AS ViewCount, 
+    AVG(cm.ScoreDiff) AS ScoreDiff, 
+    AVG(cm.TagCount) AS TagCount, 
+    NULL AS SummaryString, 
+    NULL AS BountyInfo
+FROM ComplexMetrics cm
+ORDER BY UserRank ASC, Score DESC;

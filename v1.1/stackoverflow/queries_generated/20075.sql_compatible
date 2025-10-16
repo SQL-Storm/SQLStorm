@@ -1,0 +1,115 @@
+WITH UserActivitySummary AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    COUNT(p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+    SUM(p.Score) AS TotalScore,
+    AVG(p.Score) AS AvgPostScore,
+    SUM(COALESCE(p.ViewCount, 0)) AS TotalViewCount,
+    SUM(COALESCE(p.FavoriteCount, 0)) AS TotalFavoriteCount
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+  WHERE u.Reputation > 1000
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+  HAVING COUNT(p.Id) > 50
+),
+UserBadgeAnalysis AS (
+  SELECT
+    UserId,
+    COUNT(*) AS TotalBadges,
+    SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+    SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+    (COUNT(DISTINCT Name) * 1.0 / NULLIF(COUNT(*), 0)) * 100 AS BadgeDiversityPercent
+  FROM Badges
+  GROUP BY UserId
+),
+RankedUsers AS (
+  SELECT
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    -- Composite score for ranking, penalizing users with a high question-to-answer ratio
+    (uas.Reputation * 0.6 + uas.TotalScore * 0.4 + COALESCE(uba.GoldBadges, 0) * 100)
+    / (1 + (CAST(uas.QuestionCount AS numeric) / NULLIF(CAST(uas.AnswerCount AS numeric), 0))) AS CompositeScore,
+    DENSE_RANK() OVER (ORDER BY
+      (uas.Reputation * 0.6 + uas.TotalScore * 0.4 + COALESCE(uba.GoldBadges, 0) * 100)
+      / (1 + (CAST(uas.QuestionCount AS numeric) / NULLIF(CAST(uas.AnswerCount AS numeric), 0))) DESC
+    ) AS UserRank
+  FROM UserActivitySummary uas
+  LEFT JOIN UserBadgeAnalysis uba ON uas.UserId = uba.UserId
+  WHERE uas.UserCreationDate < (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5' YEAR)
+),
+UserPostAnalysis AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.Score,
+    p.CreationDate,
+    p.Title,
+    p.Tags,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    -- Time since the user's last post
+    p.CreationDate - LAG(p.CreationDate, 1, p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS TimeSinceLastPost,
+    -- Rank user's posts by score
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS PostRankByScore,
+    -- Calculate score as a percentage of the user's total score
+    (CAST(p.Score AS numeric) / NULLIF((SELECT TotalScore FROM UserActivitySummary uas WHERE uas.UserId = p.OwnerUserId), 0)) * 100 AS ScoreContributionPercent
+  FROM Posts p
+  WHERE p.OwnerUserId IN (SELECT UserId FROM RankedUsers WHERE UserRank <= 100)
+    AND p.CommunityOwnedDate IS NULL
+)
+SELECT
+  ru.UserRank,
+  ru.DisplayName,
+  ru.Reputation,
+  upa.Title AS PostTitle,
+  pt.Name AS PostType,
+  upa.Score AS PostScore,
+  upa.ScoreContributionPercent,
+  'Tags: ' || COALESCE(REPLACE(SUBSTRING(upa.Tags FROM 2 FOR (CHAR_LENGTH(upa.Tags) - 2)), '><', ', '), 'N/A') AS FormattedTags,
+  EXTRACT(YEAR FROM upa.CreationDate) AS PostYear,
+  upa.TimeSinceLastPost,
+  (SELECT COUNT(*) FROM Comments c WHERE c.PostId = upa.PostId AND c.Score >= 5) AS HighScoreCommentCount,
+  CASE
+    WHEN upa.PostTypeId = 2 THEN (SELECT q.Title FROM Posts q WHERE q.Id = upa.ParentId)
+    ELSE 'N/A'
+  END AS RelatedQuestionTitle,
+  CASE
+    WHEN upa.PostTypeId = 2 THEN (
+      (SELECT q.AcceptedAnswerId FROM Posts q WHERE q.Id = upa.ParentId) = upa.PostId
+    )
+    ELSE NULL
+  END AS IsAcceptedAnswer,
+  EXISTS(SELECT 1 FROM PostLinks pl WHERE pl.RelatedPostId = upa.PostId AND pl.LinkTypeId = 1) AS IsLinkedTarget
+FROM RankedUsers ru
+JOIN UserPostAnalysis upa ON ru.UserId = upa.OwnerUserId
+JOIN PostTypes pt ON upa.PostTypeId = pt.Id
+WHERE
+  ru.UserRank <= 10
+  AND upa.PostRankByScore <= 3
+  AND (
+    upa.Score > (
+      SELECT
+        CASE
+          WHEN COUNT(*) = 0 THEN NULL
+          ELSE (SELECT value FROM (
+            SELECT PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY CAST(score AS numeric)) AS value
+            FROM Posts W
+            WHERE W.OwnerUserId = ru.UserId
+          ) t)
+        END
+    )
+    OR upa.PostId IN (
+      SELECT PostId FROM Votes WHERE VoteTypeId = 5 GROUP BY PostId HAVING COUNT(*) > 20
+    )
+  )
+ORDER BY
+  ru.UserRank,
+  upa.PostRankByScore;

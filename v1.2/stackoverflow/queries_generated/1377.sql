@@ -1,0 +1,174 @@
+-- {"query": "1377.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1444} 
+with RecursivePasses as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        coalesce(p.Score, 0) as Score,
+        coalesce(p.ViewCount, 0) as ViewCount,
+        p.Tags,
+        p.CreationDate,
+        p.Title,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate) as PostOrder
+    from Posts p
+    where p.PostTypeId in (1, 2)
+), UserBadgesScore as (
+    select
+        b.UserId,
+        sum(
+          case when b.Class = 1 then 30
+               when b.Class = 2 then 20
+               when b.Class = 3 then 10
+               else 0
+          end
+        ) as BadgeScore
+    from Badges b
+    group by b.UserId
+), LatestCommentPerPost as (
+    select distinct on (c.PostId)
+        c.PostId,
+        c.Id as CommentId,
+        c.UserId as CommentUserId,
+        c.CreationDate as CommentDate,
+        c.Text as CommentText
+    from Comments c
+    order by c.PostId, c.CreationDate desc
+), PostsWithLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName
+    from PostLinks pl
+    inner join LinkTypes lt on lt.Id = pl.LinkTypeId
+), PostsEnriched as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.CreationDate,
+        p.Title,
+        lbs.BadgeScore,
+        cmt.CommentId,
+        cmt.CommentUserId,
+        cmt.CommentDate,
+        cmt.CommentText,
+        pls.RelatedPostId,
+        pls.LinkTypeName,
+        case 
+            when p.Title is null then '(No Title)'
+            else substring(p.Title from 1 for 30)
+        end as ShortTitle,
+        -- CX logic for tags string length and NULL conditions
+        case
+            when Tags is null or length(Tags) = 0 then 'No Tags'
+            else Tags
+        end as TagString,
+        -- Flag for popular posts
+        case 
+            when p.ViewCount > (select percentile_cont(0.9) within group (order by ViewCount) from Posts where ViewCount is not null)
+            then 1 else 0 
+        end as IsPopular
+    from Posts p
+    left join UserBadgesScore lbs on lbs.UserId = p.OwnerUserId
+    left join LatestCommentPerPost cmt on cmt.PostId = p.Id
+    left join PostsWithLinks pls on pls.PostId = p.Id
+), AnswerCountCalc as (
+    select
+        ParentId,
+        count(*) FILTER (WHERE PostTypeId = 2) as AnswerCount
+    from Posts
+    where ParentId IS NOT NULL
+    group by ParentId
+), CTEFilteredPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.CreationDate,
+        p.Title,
+        p.BadgeScore,
+        p.CommentId,
+        p.CommentUserId,
+        p.CommentDate,
+        p.CommentText,
+        p.RelatedPostId,
+        p.LinkTypeName,
+        p.ShortTitle,
+        p.TagString,
+        p.IsPopular,
+        coalesce(ac.AnswerCount, 0) as ComputedAnswerCount,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc NULLS LAST) as RecentPostRank,
+        -- Window to catch top upvoted post per owner
+        rank() over (partition by p.OwnerUserId order by p.Score desc nulls last) as ScoreRank
+        
+    from PostsEnriched p
+    left join AnswerCountCalc ac on ac.ParentId = p.Id
+), RecursiveUserStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        cfp.Id as RecentPostId,
+        cfp.Title as RecentPostTitle,
+        cfp.TagString as RecentPostTags,
+        cfp.Score as RecentPostScore,
+        cfp.ComputedAnswerCount,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes
+    from Users u 
+    left join CTEFilteredPosts cfp on cfp.OwnerUserId = u.Id and cfp.RecentPostRank = 1
+    where u.Reputation > 1000
+), CorrelatedTopBadgeDesc as (
+    select b.UserId,
+        (select b2.Name
+         from Badges b2
+         where b2.UserId = b.UserId
+         order by b2.Class ASC, b2.Date DESC NULLS LAST
+         limit 1) as TopBadgeName
+    from Badges b
+    group by b.UserId
+)
+select 
+    rus.UserId,
+    coalesce(rus.DisplayName, 'Unknown') || ' (ID:' || rus.UserId :: text || ')' as UserWithId,
+    rus.Reputation,
+    rus.CreationDate,
+    rus.Views,
+    rus.UpVotes,
+    rus.DownVotes,
+    coalesce(tp.TopBadgeName,'No Badges') as TopBadge,
+    coalesce(rus.RecentPostId, -1) as LatestPostId,
+    coalesce(rus.RecentPostTitle, '(no post)') as LatestPostTitle,
+    coalesce(rus.RecentPostTags, '') as LatestPostTags,
+    rwc.RelatedCount,
+    rwc.DuplicateLinkCount,
+    -- Complex condition on recent post score and answers
+    case 
+        when rus.RecentPostScore > 50 and rus.ComputedAnswerCount > 5
+            then 'Highly active question' 
+        when rus.RecentPostScore is null then 'No recent scored post' 
+        else 'Other'
+    end as UserActivityLevel
+from RecursiveUserStats rus
+left join CorrelatedTopBadgeDesc tp on tp.UserId = rus.UserId
+left join (
+    select p.OwnerUserId, 
+        count(distinct pl.RelatedPostId) as RelatedCount,
+        count(distinct case when pl.LinkTypeName = 'Duplicate' then pl.RelatedPostId else null end) as DuplicateLinkCount
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id
+    group by p.OwnerUserId
+) rwc on rwc.OwnerUserId = rus.UserId
+where rus.UserId in (
+    select distinct OwnerUserId from Posts where CreationDate > current_date - interval '365 days'
+)
+order by rus.Reputation desc NULLS LAST, rus.UserId
+limit 100;

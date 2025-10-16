@@ -1,0 +1,118 @@
+-- {"query": "9073.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2013, "output_tokens": 4668} 
+WITH
+TagExplode AS (
+  SELECT
+    p.Id AS PostId,
+    trim(tag) AS Tag
+  FROM Posts p,
+       unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS t(tag)
+),
+AnswerStats AS (
+  SELECT
+    ParentId        AS QuestionId,
+    COUNT(*)        AS AnswerCount,
+    AVG(Score)      AS AvgAnswerScore,
+    MAX(Score)      AS MaxAnswerScore
+  FROM Posts
+  WHERE PostTypeId = 2
+  GROUP BY ParentId
+),
+UserStats AS (
+  SELECT
+    u.Id               AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT b.Id)                     AS TotalBadges,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    RANK() OVER (ORDER BY u.Reputation DESC) AS RepRank
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RecentEdits AS (
+  SELECT
+    ph.PostId,
+    COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS EditCount,
+    MAX(ph.CreationDate)                                AS LastEditDate
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+CommentVoteStats AS (
+  SELECT
+    c.PostId,
+    COUNT(c.Id)                               AS CommentCount,
+    SUM(CASE WHEN c.Score < 0 THEN 1 ELSE 0 END) AS NegativeComments,
+    COUNT(v.Id)                               AS VoteCount
+  FROM Comments c
+  LEFT JOIN Votes v ON v.PostId = c.PostId
+  GROUP BY c.PostId
+),
+TopQuestions AS (
+  SELECT
+    p.Id                                 AS QId,
+    p.Title,
+    us.DisplayName                       AS Author,
+    us.RepRank,
+    COALESCE(a.AnswerCount, 0)           AS Answers,
+    COALESCE(a.AvgAnswerScore, 0)        AS AvgA_Score,
+    COALESCE(a.MaxAnswerScore, 0)        AS MaxA_Score,
+    COALESCE(re.EditCount, 0)            AS TotalEdits,
+    COALESCE(cv.CommentCount, 0)         AS Comments,
+    COALESCE(cv.VoteCount, 0)            AS Votes,
+    STRING_AGG(DISTINCT te.Tag, ',' ORDER BY te.Tag) AS Tags,
+    CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAccepted,
+    (SELECT COUNT(*)
+     FROM Posts p2
+     WHERE p2.ParentId = p.Id
+       AND p2.Score >= COALESCE(a.AvgAnswerScore, 0)
+    )                                     AS AboveAvgAnswerCount
+  FROM Posts p
+  LEFT JOIN AnswerStats a    ON a.QuestionId      = p.Id
+  LEFT JOIN UserStats us      ON us.UserId         = p.OwnerUserId
+  LEFT JOIN RecentEdits re    ON re.PostId         = p.Id
+  LEFT JOIN CommentVoteStats cv ON cv.PostId       = p.Id
+  LEFT JOIN TagExplode te     ON te.PostId         = p.Id
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 months'
+  GROUP BY
+    p.Id, p.Title, us.DisplayName, us.RepRank, p.AcceptedAnswerId,
+    a.AnswerCount, a.AvgAnswerScore, a.MaxAnswerScore,
+    re.EditCount, cv.CommentCount, cv.VoteCount
+  HAVING COUNT(te.Tag) > 2
+),
+QuestionSets AS (
+  SELECT * FROM TopQuestions WHERE Votes > (SELECT AVG(Votes) FROM TopQuestions)
+  UNION
+  SELECT * FROM TopQuestions WHERE HasAccepted = 0
+  EXCEPT
+  SELECT * FROM TopQuestions WHERE Answers < 5
+  INTERSECT
+  SELECT * FROM TopQuestions WHERE TotalEdits > 3
+),
+FinalRanked AS (
+  SELECT
+    *,
+    ROW_NUMBER() OVER (
+      PARTITION BY HasAccepted
+      ORDER BY Votes DESC, Answers DESC
+    ) AS RowNum
+  FROM QuestionSets
+)
+SELECT
+  QId,
+  Title,
+  Author,
+  RepRank,
+  Answers,
+  AvgA_Score,
+  MaxA_Score,
+  TotalEdits,
+  Comments,
+  Votes,
+  Tags,
+  CASE HasAccepted WHEN 1 THEN 'Accepted' ELSE 'Open' END AS Status,
+  AboveAvgAnswerCount,
+  RowNum
+FROM FinalRanked
+WHERE RowNum <= 10
+ORDER BY Status DESC, Votes DESC, Answers DESC;

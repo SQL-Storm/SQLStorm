@@ -1,0 +1,123 @@
+SELECT
+    UD.UserId,
+    UD.DisplayName,
+    UD.Reputation,
+    UD.YearsOnPlatform,
+    PCM.PostId,
+    PCM.PostTypeName,
+    'HighReputationQuestionAnalysis' AS AnalysisType,
+    PCM.PostScore,
+    PCM.PostViewCount,
+    PCM.PostAnswerCount,
+    PCM.TotalEdits,
+    CRT.Name AS LastCloseReasonName,
+    PCM.HasDuplicateLink,
+    PCM.ActivityScore,
+    UD.AnswersCount AS PostEngagementCount,
+    UD.SilverBadges AS RelevantBadges,
+    PCM.PostTypeCombinedRank,
+    COALESCE(MAS.ModerationSpecificActions, 0) AS OwnerModerationActions,
+    CASE
+        WHEN PCM.ClosedDate IS NOT NULL AND PCM.PostScore < 0 THEN 'Closed & Negative'
+        WHEN PCM.HasDuplicateLink = 1 AND PCM.PostAnswerCount = 0 THEN 'Duplicate & Unanswered'
+        WHEN PCM.ActivityScore > 100 AND PCM.PostAnswerCount > 5 THEN 'Highly Engaged & Solved'
+        WHEN PCM.AvgCommentScore > 3 AND HVC.HighScoreCommentsCount > 0 THEN 'Active Discussion'
+        WHEN PCM.PostAgeDays > 365 AND PCM.PostViewCount < 100 THEN 'Stale Post'
+        ELSE 'General Activity'
+    END AS PostHealthStatus,
+    CAST(PCM.PostFavoriteCount AS NUMERIC) / NULLIF(PCM.PostViewCount, 0) AS FavoriteRatio,
+    CASE
+        WHEN PCM.Tags LIKE '%<sql>%' OR PCM.Tags LIKE '%<database>%' THEN 'SQL/DB-Related'
+        WHEN PCM.Tags LIKE '%<python>%' OR PCM.Tags LIKE '%<java>%' THEN 'Programming-Related'
+        ELSE 'Other Tags'
+    END AS TagCategory,
+    CASE
+        WHEN LOWER(PCM.Body) LIKE '%solution%' THEN 'Mentions Solution'
+        WHEN LOWER(PCM.Body) LIKE '%error message%' THEN 'Has Error Message'
+        ELSE 'No Specific Body Keyword'
+    END AS BodyContentHint,
+    CASE WHEN UD.UserId IN (SELECT TQC.UserId FROM TopQuestionContributors TQC) THEN TRUE ELSE FALSE END AS IsTopQuestionContributor,
+    NTILE(4) OVER (ORDER BY UD.Reputation DESC) AS ReputationQuartile,
+    AVG(PCM.PostScore) OVER (PARTITION BY UD.UserId ORDER BY PCM.PostCreationDate ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS UserMovingAvgPostScore
+FROM PostComplexMetrics PCM
+LEFT JOIN UserDemographics UD ON PCM.OwnerUserId = UD.UserId
+LEFT JOIN CloseReasonTypes CRT ON CAST(PCM.LastCloseReasonIdString AS SMALLINT) = CRT.Id
+LEFT JOIN HighlyVotedComments HVC ON PCM.PostId = HVC.PostId
+LEFT JOIN ModeratorActivitySummary MAS ON UD.UserId = MAS.UserId
+WHERE
+    UD.Reputation > 10000
+    AND PCM.PostTypeId = 1
+    AND PCM.PostAgeDays < 365
+    AND PCM.TotalEdits > 0
+    AND EXISTS (
+        SELECT 1
+        FROM Comments C_inner
+        WHERE C_inner.PostId = PCM.PostId
+          AND C_inner.CreationDate BETWEEN PCM.PostCreationDate AND (PCM.PostCreationDate + INTERVAL '30 days')
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostLinks PL_inner
+        WHERE PL_inner.RelatedPostId = PCM.PostId AND PL_inner.LinkTypeId = 3
+    )
+
+UNION ALL
+
+SELECT
+    UD.UserId,
+    UD.DisplayName,
+    UD.Reputation,
+    UD.YearsOnPlatform,
+    PCM.PostId,
+    PCM.PostTypeName,
+    'MidReputationAnswerAnalysis' AS AnalysisType,
+    PCM.PostScore,
+    PCM.PostViewCount,
+    PCM.PostAnswerCount,
+    PCM.TotalEdits,
+    CRT.Name AS LastCloseReasonName,
+    PCM.HasDuplicateLink,
+    PCM.ActivityScore,
+    UD.AnswersCount AS PostEngagementCount,
+    UD.SilverBadges AS RelevantBadges,
+    PCM.PostTypeCombinedRank,
+    COALESCE(MAS.ModerationSpecificActions, 0) AS OwnerModerationActions,
+    CASE
+        WHEN PCM.ClosedDate IS NOT NULL AND PCM.PostScore < 0 THEN 'Closed & Negative'
+        WHEN PCM.HasDuplicateLink = 1 AND PCM.PostAnswerCount = 0 THEN 'Duplicate & Unanswered'
+        WHEN PCM.ActivityScore > 100 AND PCM.PostAnswerCount > 5 THEN 'Highly Engaged & Solved'
+        WHEN PCM.AvgCommentScore > 3 AND HVC.HighScoreCommentsCount > 0 THEN 'Active Discussion'
+        WHEN PCM.PostAgeDays > 365 AND PCM.PostViewCount < 100 THEN 'Stale Post'
+        ELSE 'General Activity'
+    END AS PostHealthStatus,
+    CAST(PCM.PostFavoriteCount AS NUMERIC) / NULLIF(PCM.PostViewCount, 0) AS FavoriteRatio,
+    CASE
+        WHEN PCM.Tags LIKE '%<sql>%' OR PCM.Tags LIKE '%<database>%' THEN 'SQL/DB-Related'
+        WHEN PCM.Tags LIKE '%<python>%' OR PCM.Tags LIKE '%<java>%' THEN 'Programming-Related'
+        ELSE 'Other Tags'
+    END AS TagCategory,
+    CASE
+        WHEN LOWER(PCM.Body) LIKE '%solution%' THEN 'Mentions Solution'
+        WHEN LOWER(PCM.Body) LIKE '%error message%' THEN 'Has Error Message'
+        ELSE 'No Specific Body Keyword'
+    END AS BodyContentHint,
+    CASE WHEN UD.UserId IN (SELECT TQC.UserId FROM TopQuestionContributors TQC) THEN TRUE ELSE FALSE END AS IsTopQuestionContributor,
+    NTILE(4) OVER (ORDER BY UD.Reputation DESC) AS ReputationQuartile,
+    AVG(PCM.PostScore) OVER (PARTITION BY UD.UserId ORDER BY PCM.PostCreationDate ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS UserMovingAvgPostScore
+FROM PostComplexMetrics PCM
+LEFT JOIN UserDemographics UD ON PCM.OwnerUserId = UD.UserId
+LEFT JOIN CloseReasonTypes CRT ON CAST(PCM.LastCloseReasonIdString AS SMALLINT) = CRT.Id
+LEFT JOIN HighlyVotedComments HVC ON PCM.PostId = HVC.PostId
+LEFT JOIN ModeratorActivitySummary MAS ON UD.UserId = MAS.UserId
+WHERE
+    UD.Reputation BETWEEN 1000 AND 10000
+    AND PCM.PostTypeId = 2
+    AND PCM.PostAgeDays BETWEEN 30 AND 730
+    AND PCM.PostScore >= 5
+    AND PCM.RecentActiveVoteCount > 1
+    AND (LOWER(PCM.Body) LIKE '%code%' OR LOWER(PCM.Body) LIKE '%example%')
+ORDER BY
+    Reputation DESC,
+    ActivityScore DESC,
+    PostTypeCombinedRank ASC
+LIMIT 20000;

@@ -1,0 +1,199 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS prev_score,
+        LEAD(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS next_score,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS avg_score,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS post_count,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            ELSE 'Low'
+        END AS score_category
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COALESCE(SUM(p.Score), 0) as total_score,
+        COALESCE(COUNT(p.Id), 0) as post_count,
+        COALESCE(MAX(p.CreationDate), u.CreationDate) as last_activity,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Expert'
+            WHEN u.Reputation > 1000 THEN 'Advanced'
+            WHEN u.Reputation > 100 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as reputation_level,
+        CASE 
+            WHEN (u.DownVotes * 1.0 / NULLIF(u.UpVotes, 0)) > 0.5 THEN 'LowQuality'
+            WHEN (u.DownVotes * 1.0 / NULLIF(u.UpVotes, 0)) > 0.2 THEN 'Moderate'
+            ELSE 'HighQuality'
+        END as quality_rating
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+TopPosts AS (
+    SELECT 
+        rp.Id,
+        rp.PostTypeId,
+        rp.Score,
+        rp.ViewCount,
+        rp.Title,
+        rp.Tags,
+        rp.OwnerUserId,
+        rp.score_category,
+        rp.avg_score,
+        rp.post_count,
+        rp.prev_score,
+        rp.next_score,
+        CASE 
+            WHEN rp.prev_score IS NOT NULL AND rp.prev_score > rp.Score THEN 'Degrading'
+            WHEN rp.next_score IS NOT NULL AND rp.next_score > rp.Score THEN 'Improving'
+            WHEN rp.Score > rp.avg_score THEN 'AboveAverage'
+            ELSE 'BelowAverage'
+        END as trend_type
+    FROM RankedPosts rp
+    WHERE rp.rn = 1 AND rp.post_count > 1
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END as popularity_level
+    FROM Tags t
+),
+PostHistorySummary AS (
+    SELECT 
+        ph.PostId,
+        COUNT(*) as revision_count,
+        MAX(ph.CreationDate) as last_revision_date,
+        MIN(ph.CreationDate) as first_revision_date,
+        AVG(CASE WHEN ph.PostHistoryTypeId = 2 THEN LENGTH(ph.Text) ELSE 0 END) as avg_body_size,
+        STRING_AGG(DISTINCT CAST(ph.PostHistoryTypeId AS TEXT), ', ' ORDER BY ph.PostHistoryTypeId) as revision_types
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+)
+SELECT 
+    ta.TagName,
+    ta.Count,
+    ta.popularity_level,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.reputation_level,
+    ua.quality_rating,
+    ua.total_score,
+    up.Id as PostId,
+    up.PostTypeId,
+    up.Score,
+    up.ViewCount,
+    up.Title,
+    up.trend_type,
+    phs.revision_count,
+    phs.last_revision_date,
+    phs.avg_body_size,
+    CASE 
+        WHEN up.Score > 0 AND phs.revision_count > 1 THEN 'ActiveWithEdits'
+        WHEN up.Score > 0 AND phs.revision_count IS NULL THEN 'ActiveNoEdits'
+        WHEN up.Score <= 0 AND phs.revision_count > 1 THEN 'InactiveWithEdits'
+        ELSE 'InactiveNoEdits'
+    END as post_status,
+    ROUND((up.Score * 1.0 / NULLIF(ua.total_score, 0)) * 100, 2) as score_percentage,
+    -- DATEDIFF replacement using standard SQL: DATE '2024-10-01' - ua.last_activity yields interval in some dialects.
+    -- Use EXTRACT(day FROM ...) for portability when subtracting dates
+    EXTRACT(DAY FROM (DATE '2024-10-01' - ua.last_activity)) as days_since_last_activity,
+    CASE 
+        WHEN ua.Reputation > 1000 AND up.Score > 10 AND up.AnswerCount > 0 THEN 'HighlyEngaged'
+        WHEN ua.Reputation > 100 AND up.Score > 5 AND up.ViewCount > 100 THEN 'ModeratelyEngaged'
+        ELSE 'LowEngagement'
+    END as engagement_level,
+    COALESCE(STRING_AGG(CAST(rn_row AS TEXT), ', '), 'No revisions') as revision_timeline,
+    NULLIF(UPPER(SUBSTRING(up.Tags FROM 1 FOR 30)), '') as trimmed_tags,
+    CASE 
+        WHEN (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ua.UserId) > 5 THEN 'BadgeHolder'
+        ELSE 'NonBadgeHolder'
+    END as badge_status,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = ua.UserId AND p.PostTypeId IN (1, 2) AND p.Score > 1000) THEN 'HighScorer'
+        ELSE 'Normal'
+    END as scoring_profile,
+    CONCAT(
+        'Tag: ', ta.TagName, 
+        ' - User: ', ua.DisplayName, 
+        ' - Post: ', up.Title,
+        ' - Status: ', up.trend_type
+    ) as comprehensive_identifier
+FROM TagAnalysis ta
+LEFT JOIN UserActivity ua ON ua.UserId = (
+    SELECT p.OwnerUserId 
+    FROM Posts p 
+    WHERE p.Tags LIKE '%' || ta.TagName || '%' 
+    LIMIT 1
+)
+LEFT JOIN TopPosts up ON up.OwnerUserId = ua.UserId AND up.PostTypeId IN (1, 2)
+LEFT JOIN PostHistorySummary phs ON phs.PostId = up.Id
+LEFT JOIN LATERAL (
+    SELECT ROW_NUMBER() OVER (ORDER BY phs.last_revision_date) AS rn_row
+) rev ON true
+WHERE ta.Count > 100
+  AND (ua.UserId IS NOT NULL OR ta.TagName IS NOT NULL)
+  AND (up.Id IS NOT NULL OR ta.TagName IS NOT NULL)
+  AND COALESCE(ua.Reputation, 0) > 100
+GROUP BY 
+    ta.TagName,
+    ta.Count,
+    ta.popularity_level,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.reputation_level,
+    ua.quality_rating,
+    ua.total_score,
+    ua.UserId,
+    up.Id,
+    up.PostTypeId,
+    up.Score,
+    up.ViewCount,
+    up.Title,
+    up.trend_type,
+    phs.revision_count,
+    phs.last_revision_date,
+    phs.avg_body_size,
+    up.Tags,
+    ua.last_activity
+HAVING 
+    COUNT(*) > 1
+    OR (ta.TagName IS NOT NULL AND ua.UserId IS NOT NULL)
+ORDER BY 
+    CASE 
+        WHEN ta.popularity_level = 'Popular' THEN 1
+        WHEN ta.popularity_level = 'Moderate' THEN 2
+        ELSE 3
+    END,
+    ta.Count DESC,
+    up.Score DESC
+LIMIT 1000;

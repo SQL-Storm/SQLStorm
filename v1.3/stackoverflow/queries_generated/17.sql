@@ -1,0 +1,212 @@
+-- {"query": "17.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2153} 
+with
+-- recent active questions with tag arrays and normalized owner info
+questions as (
+  select
+    p.id,
+    p.title,
+    p.creationdate,
+    p.viewcount,
+    p.score,
+    p.answercount,
+    coalesce(p.owneruserid, -1) as ownerid,
+    p.ownerdisplayname,
+    -- turn tags string like '<sql><performance>' into array ['sql','performance']
+    case when p.tags is null then array[]::text[]
+         else string_to_array(substring(p.tags,2,length(p.tags)-2), '><') end as tag_list
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= now() - interval '2 years'
+),
+-- answers joined to their questions
+answers as (
+  select a.*, q.title as question_title, q.tag_list
+  from posts a
+  join posts q on a.parentid = q.id and q.posttypeid = 1
+  where a.posttypeid = 2
+    and a.creationdate >= now() - interval '2 years'
+),
+-- aggregated vote stats per post, with conditional sums and null-safe logic
+vote_stats as (
+  select
+    v.postid,
+    count(*) filter (where v.votetypeid = 2) as upvotes,
+    count(*) filter (where v.votetypeid = 3) as downvotes,
+    count(*) filter (where v.votetypeid = 5) as favorites,
+    sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+    min(v.creationdate) as first_vote_date,
+    max(v.creationdate) as last_vote_date
+  from votes v
+  group by v.postid
+),
+-- comment heat per post and avg comment length (null-handled)
+comment_stats as (
+  select
+    c.postid,
+    count(*) as comment_count,
+    avg(char_length(c.text)) as avg_comment_len,
+    sum(case when c.creationdate >= now() - interval '30 days' then 1 else 0 end) as comments_last_30d
+  from comments c
+  group by c.postid
+),
+-- user summary with windows and last active intervals
+user_summary as (
+  select
+    u.id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    u.views,
+    u.upvotes,
+    u.downvotes,
+    (now() - u.lastaccessdate) as time_since_last_access,
+    rank() over (order by u.reputation desc) as rep_rank,
+    dense_rank() over (order by (u.upvotes - u.downvotes) desc) as vote_influence_rank
+  from users u
+),
+-- badge concentration per user with weighted score (gold=3,silver=2,bronze=1)
+badge_score as (
+  select
+    b.userid,
+    count(*) filter (where b.class = 1) as gold,
+    count(*) filter (where b.class = 2) as silver,
+    count(*) filter (where b.class = 3) as bronze,
+    coalesce(count(*) filter (where b.class = 1),0)*3
+      + coalesce(count(*) filter (where b.class = 2),0)*2
+      + coalesce(count(*) filter (where b.class = 3),0) as weighted_badge_score
+  from badges b
+  group by b.userid
+),
+-- recent edit churn: posthistory aggregates, including correlated subquery for latest editor name if any
+post_history_agg as (
+  select
+    ph.postid,
+    count(*) as revisions,
+    count(*) filter (where ph.posthistorytypeid in (5,8,24)) as body_edits,
+    count(*) filter (where ph.posthistorytypeid in (4,7)) as title_edits,
+    max(ph.creationdate) as last_revision_date,
+    -- correlated subquery to fetch last editor's display name (may be null)
+    (select ph2.userdisplayname
+     from posthistory ph2
+     where ph2.postid = ph.postid and ph2.userdisplayname is not null
+     order by ph2.creationdate desc limit 1) as last_editor_name
+  from posthistory ph
+  group by ph.postid
+),
+-- tag popularity: explode tag arrays and compute tag-level stats
+tag_exploded as (
+  select
+    q.id as question_id,
+    lower(t.tag) as tag
+  from questions q
+  cross join lateral (
+    select unnest(q.tag_list) as tag
+  ) t
+  where array_length(q.tag_list,1) is not null
+),
+tag_stats as (
+  select
+    te.tag,
+    count(distinct te.question_id) as questions_count,
+    avg(q.score) as avg_question_score,
+    sum(q.viewcount) as total_views
+  from tag_exploded te
+  join questions q on q.id = te.question_id
+  group by te.tag
+  having count(distinct te.question_id) > 50
+),
+-- select a balanced sample of hot questions using complex predicates and windowing
+hot_questions as (
+  select
+    q.*,
+    coalesce(vs.upvotes,0) as upvotes,
+    coalesce(vs.downvotes,0) as downvotes,
+    coalesce(cs.comment_count,0) as comment_count,
+    coalesce(pha.revisions,0) as revisions,
+    -- computed volatility metric combining recent activity, edits and votes (nullable-safe)
+    (coalesce(q.viewcount,0)::double precision / nullif(greatest(1,q.answercount),1))
+      * (1 + coalesce(vs.upvotes,0)::double precision / nullif(nullif(vs.downvotes,0),0) + 0.1)
+      + coalesce(cs.comments_last_30d,0) * 2
+      + coalesce(pha.body_edits,0) * 1.5 as volatility_score,
+    row_number() over (partition by (case when array_length(q.tag_list,1) > 0 then q.tag_list[1] else 'other' end)
+                       order by (coalesce(vs.upvotes,0) - coalesce(vs.downvotes,0)) desc, q.creationdate desc) as tag_rank
+  from questions q
+  left join vote_stats vs on vs.postid = q.id
+  left join comment_stats cs on cs.postid = q.id
+  left join post_history_agg pha on pha.postid = q.id
+  where q.viewcount >= 100
+    and (coalesce(vs.upvotes,0) + coalesce(vs.downvotes,0)) >= 5
+),
+-- pick representative top-N per tag (complex set operator to union different thresholds)
+top_per_tag as (
+  select * from hot_questions where tag_rank <= 3
+  union
+  select h.* from hot_questions h
+  where h.volatility_score > (
+    select percentile_cont(0.9) within group (order by volatility_score) from hot_questions where tag_rank <= 50
+  )
+),
+-- compute answerer reputation delta for accepted answers via correlated subquery
+accepted_answerers as (
+  select
+    q.id as question_id,
+    q.title,
+    q.ownerid as asker_id,
+    q.acceptedanswerid,
+    a.id as answer_id,
+    a.owneruserid as answerer_id,
+    -- correlate to user's reputation at time of answer (approx using creation time nearest before answer)
+    (select u.reputation
+     from users u
+     where u.id = a.owneruserid
+     order by abs(extract(epoch from (u.creationdate - a.creationdate))) limit 1
+    ) as answerer_reputation_snapshot
+  from posts q
+  left join posts a on a.id = q.acceptedanswerid
+  where q.posttypeid = 1 and q.acceptedanswerid is not null
+    and q.creationdate >= now() - interval '2 years'
+),
+-- final combined payload scoring many dimensions and using set operations to mix samples
+final_candidates as (
+  select
+    t.tag,
+    tp.*,
+    bs.weighted_badge_score,
+    us.displayname as owner_name,
+    us.reputation as owner_reputation,
+    coalesce(vs.upvotes,0) as upvotes,
+    coalesce(vs.downvotes,0) as downvotes,
+    coalesce(cs.comment_count,0) as comment_count,
+    coalesce(pha.revisions,0) as revisions,
+    tp.volatility_score,
+    -- complex composite rank using nonlinear transformations and null-aware math
+    (log(1 + tp.volatility_score) * (1 + ln(1 + coalesce(us.reputation,0))) * (1 + coalesce(bs.weighted_badge_score,0)/10.0)
+     - sqrt(least(1000, coalesce(vs.downvotes,0) + 1))
+    ) as composite_rank
+  from tag_stats t
+  join top_per_tag tp on tp.tag_list[1] = t.tag or tp.tag_list[1] is not null
+  left join vote_stats vs on vs.postid = tp.id
+  left join comment_stats cs on cs.postid = tp.id
+  left join post_history_agg pha on pha.postid = tp.id
+  left join users us on us.id = tp.ownerid
+  left join badge_score bs on bs.userid = us.id
+)
+-- final output: union of three different selection strategies with ordering and limits
+select
+  fc.tag,
+  fc.id as question_id,
+  left(fc.title, 200) as short_title,
+  fc.owner_name,
+  fc.owner_reputation,
+  fc.upvotes,
+  fc.downvotes,
+  fc.comment_count,
+  fc.revisions,
+  round(fc.volatility_score::numeric,2) as volatility_score,
+  round(fc.composite_rank::numeric,4) as composite_rank,
+  fc.weighted_badge_score
+from final_candidates fc
+where fc.composite_rank is not null
+order by fc.composite_rank desc, fc.volatility_score desc
+limit 200;

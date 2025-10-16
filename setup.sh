@@ -8,6 +8,11 @@ pushd "$SCRIPT_DIR" || exit 1
 python3 -m venv .venv
 source .venv/bin/activate
 
+# Source 'keys' if it exists
+if [ -f .keys ]; then
+    source .keys
+fi
+
 # Install the dependencies
 pip3 install -r requirements.txt --upgrade
 

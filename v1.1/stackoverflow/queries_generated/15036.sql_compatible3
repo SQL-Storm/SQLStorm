@@ -1,0 +1,68 @@
+WITH TopTags AS (
+    SELECT 
+        t.TagName, 
+        t.Count, 
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) AS TagPopularity,
+        AVG(p.Score) OVER (PARTITION BY t.TagName) AS AvgTagScore
+    FROM Tags t
+    LEFT JOIN Posts p 
+      ON EXISTS (
+        SELECT 1
+        FROM (
+          -- split Tags like '<tag1><tag2>' into rows: remove leading/trailing < and > then split by '><'
+          SELECT TRIM(tag) AS tag FROM (
+            SELECT UNNEST(STRING_TO_ARRAY(
+              SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)),
+              '><'
+            )) AS tag
+          ) s
+        ) tagname
+        WHERE tagname.tag = t.TagName
+      )
+),
+UserContributions AS (
+    SELECT 
+        u.Id AS UserId, 
+        u.DisplayName, 
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS MedianPostScore
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+)
+SELECT 
+    COALESCE(tt.TagName, 'Unknown') AS TopTag,
+    tt.TagPopularity,
+    tt.AvgTagScore,
+    uc.DisplayName,
+    uc.Reputation,
+    uc.PostCount,
+    uc.VoteCount,
+    uc.MedianPostScore,
+    CASE 
+        WHEN uc.Reputation > 10000 THEN 'High-Rep'
+        WHEN uc.Reputation > 1000 THEN 'Mid-Rep'
+        ELSE 'Low-Rep'
+    END AS UserTier,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = uc.UserId) AS BadgeCount,
+    ROUND(100.0 * uc.PostCount / NULLIF((SELECT COUNT(*) FROM Posts), 0), 2) AS PostPercentage
+FROM TopTags tt
+FULL OUTER JOIN UserContributions uc ON 1=1
+WHERE tt.TagPopularity <= 10
+    AND uc.PostCount > 0
+    AND (
+        uc.Reputation > 1000 
+        OR EXISTS (
+            SELECT 1 
+            FROM Badges b 
+            WHERE b.UserId = uc.UserId 
+              AND b.Class = 1
+        )
+    )
+ORDER BY 
+    tt.TagPopularity, 
+    uc.Reputation DESC
+LIMIT 100;

@@ -1,0 +1,192 @@
+-- {"query": "327.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 17760} 
+WITH exploded_tags AS (
+  SELECT p.Id AS PostId,
+         p.OwnerUserId AS UserId,
+         unnest(string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags)-2), '><')) AS Tag
+  FROM Posts p
+  WHERE p.Tags IS NOT NULL AND p.PostTypeId = 1
+),
+tag_agg AS (
+  SELECT et.UserId, et.Tag, COUNT(*) AS TagCount
+  FROM exploded_tags et
+  GROUP BY et.UserId, et.Tag
+),
+user_tag_counts AS (
+  SELECT t.UserId, t.Tag, t.TagCount,
+         ROW_NUMBER() OVER (PARTITION BY t.UserId ORDER BY t.TagCount DESC, t.Tag) AS TagRank
+  FROM tag_agg t
+),
+user_question_stats AS (
+  SELECT u.Id AS UserId,
+         (SELECT COUNT(*) FROM Posts q WHERE q.OwnerUserId = u.Id AND q.PostTypeId = 1) AS Questions,
+         (SELECT COUNT(*) FROM Posts a WHERE a.OwnerUserId = u.Id AND a.PostTypeId = 2) AS Answers,
+         COALESCE((SELECT SUM(q.ViewCount) FROM Posts q WHERE q.OwnerUserId = u.Id AND q.PostTypeId = 1), 0) AS ViewsOnQuestions,
+         (SELECT AVG(a.Score) FROM Posts a WHERE a.OwnerUserId = u.Id AND a.PostTypeId = 2) AS AvgAnswerScore,
+         (SELECT MAX(q.Score) FROM Posts q WHERE q.OwnerUserId = u.Id AND q.PostTypeId = 1) AS MaxQuestionScore,
+         (SELECT MIN(q.CreationDate) FROM Posts q WHERE q.OwnerUserId = u.Id AND q.PostTypeId = 1) AS OldestQuestion,
+         (SELECT MAX(a.CreationDate) FROM Posts a WHERE a.OwnerUserId = u.Id AND a.PostTypeId = 2) AS LastAnswerAt
+  FROM Users u
+),
+badge_last AS (
+  SELECT br.UserId, br.Name AS LastBadgeName
+  FROM (
+    SELECT b.UserId, b.Name,
+           ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC NULLS LAST, b.Id DESC) AS rn
+    FROM Badges b
+  ) br WHERE br.rn = 1
+),
+badge_summary AS (
+  SELECT b.UserId,
+         COUNT(*) AS BadgesTotal,
+         COUNT(*) FILTER (WHERE b.Class = 1) AS Gold,
+         COUNT(*) FILTER (WHERE b.Class = 2) AS Silver,
+         COUNT(*) FILTER (WHERE b.Class = 3) AS Bronze,
+         MAX(b.Date) AS LastBadgeDate
+  FROM Badges b
+  GROUP BY b.UserId
+),
+votes_on_user_posts AS (
+  SELECT p.OwnerUserId AS UserId,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesOnPosts,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesOnPosts,
+         SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS Favorites,
+         COUNT(v.Id) AS TotalVotes
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  WHERE p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId
+),
+post_linked_stats AS (
+  SELECT p.Id AS PostId,
+         SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS OutgoingLinks,
+         SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicatesTo
+  FROM Posts p
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+  GROUP BY p.Id
+),
+history_summary AS (
+  SELECT ph.PostId,
+         COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (5,6,24)) AS Edits,
+         MAX(ph.CreationDate) AS LastEdit,
+         BOOL_OR(ph.PostHistoryTypeId = 10) AS EverClosed,
+         COUNT(DISTINCT ph.UserId) AS Editors
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+recent_comments AS (
+  SELECT c.PostId, COUNT(*) AS CommentsCount, MAX(c.CreationDate) AS LastCommentAt
+  FROM Comments c
+  GROUP BY c.PostId
+),
+popular_recent_intersect AS (
+  SELECT p.Id AS PostId FROM Posts p WHERE p.Score > 100
+  INTERSECT
+  SELECT p2.Id AS PostId FROM Posts p2 WHERE p2.CreationDate > now() - INTERVAL '30 days'
+),
+candidate_posts AS (
+  (
+    SELECT p.Id, p.Title, p.OwnerUserId, p.Score, p.ViewCount, p.CreationDate, p.PostTypeId
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2)
+      AND (p.Score > 50 OR p.ViewCount > 5000 OR COALESCE(p.CommentCount,0) > 10)
+  )
+  UNION
+  (
+    SELECT p2.Id, p2.Title, p2.OwnerUserId, p2.Score, p2.ViewCount, p2.CreationDate, p2.PostTypeId
+    FROM Posts p2
+    WHERE p2.PostTypeId = 1
+      AND p2.CreationDate > now() - INTERVAL '7 days'
+  )
+  EXCEPT
+  (
+    SELECT p3.Id, p3.Title, p3.OwnerUserId, p3.Score, p3.ViewCount, p3.CreationDate, p3.PostTypeId
+    FROM Posts p3
+    WHERE p3.ClosedDate IS NOT NULL
+  )
+),
+top_posts_per_user AS (
+  SELECT cp.OwnerUserId AS UserId, cp.Id AS PostId, cp.Score, cp.ViewCount,
+         ROW_NUMBER() OVER (PARTITION BY cp.OwnerUserId ORDER BY cp.Score DESC NULLS LAST, cp.ViewCount DESC NULLS LAST) AS rn
+  FROM candidate_posts cp
+  WHERE cp.OwnerUserId IS NOT NULL
+),
+per_user_recent_activity AS (
+  SELECT u.Id AS UserId,
+         (SELECT MAX(ph.CreationDate) FROM PostHistory ph JOIN Posts p ON ph.PostId = p.Id WHERE p.OwnerUserId = u.Id) AS UserLastEdit,
+         (SELECT MAX(c.CreationDate) FROM Comments c WHERE c.UserId = u.Id) AS UserLastComment,
+         (SELECT MAX(v.CreationDate) FROM Votes v WHERE v.UserId = u.Id) AS UserLastVote,
+         GREATEST(
+           COALESCE((SELECT MAX(p.LastActivityDate) FROM Posts p WHERE p.OwnerUserId = u.Id), TIMESTAMP 'epoch'),
+           COALESCE((SELECT MAX(ph2.CreationDate) FROM PostHistory ph2 WHERE ph2.UserId = u.Id), TIMESTAMP 'epoch'),
+           COALESCE((SELECT MAX(c2.CreationDate) FROM Comments c2 WHERE c2.UserId = u.Id), TIMESTAMP 'epoch')
+         ) AS UserLastActivity
+  FROM Users u
+),
+user_activity_badge AS (
+  SELECT COALESCE(per.UserId, bl.UserId) AS UserId,
+         per.UserLastActivity,
+         bl.LastBadgeName
+  FROM per_user_recent_activity per
+  FULL OUTER JOIN badge_last bl ON per.UserId = bl.UserId
+)
+SELECT
+  COALESCE(u.Id, uab.UserId) AS UserId,
+  COALESCE(u.DisplayName, '(<deleted user>)') AS DisplayName,
+  COALESCE(u.Reputation, 0) AS Reputation,
+  COALESCE(us.Questions, 0) AS Questions,
+  COALESCE(us.Answers, 0) AS Answers,
+  COALESCE(us.ViewsOnQuestions, 0) AS ViewsOnQuestions,
+  ROUND(COALESCE(us.AvgAnswerScore, 0)::numeric, 2) AS AvgAnswerScore,
+  COALESCE(bs.BadgesTotal, 0) AS BadgesTotal,
+  COALESCE(bl.LastBadgeName, 'None') AS LastBadgeName,
+  COALESCE(vo.UpVotesOnPosts, 0) AS UpVotesOnPosts,
+  COALESCE(vo.DownVotesOnPosts, 0) AS DownVotesOnPosts,
+  COALESCE(vo.Favorites, 0) AS Favorites,
+  COALESCE(ut.Tag, '(none)') AS FavoriteTag,
+  COALESCE(ut.TagCount, 0) AS FavoriteTagCount,
+  p.Id AS TopPostId,
+  p.Title AS TopPostTitle,
+  p.Score AS TopPostScore,
+  p.ViewCount AS TopPostViews,
+  COALESCE(hs.EverClosed, FALSE) AS TopPostEverClosed,
+  COALESCE(hs.Edits, 0) AS TopPostEdits,
+  COALESCE(rc.CommentsCount, 0) AS TopPostComments,
+  CASE WHEN u.AboutMe IS NULL OR LENGTH(TRIM(u.AboutMe)) = 0 THEN 'No bio'
+       ELSE LEFT(REPLACE(REGEXP_REPLACE(u.AboutMe, E'\\s+', ' ', 'g'), '  ', ' '), 200)
+  END AS ShortBio,
+  (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = COALESCE(u.Id, uab.UserId) AND p2.Score > (SELECT COALESCE(AVG(p3.Score), 0) FROM Posts p3 WHERE p3.OwnerUserId = COALESCE(u.Id, uab.UserId))) AS PostsAboveAverageScore,
+  (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY p4.Score) FROM Posts p4 WHERE p4.OwnerUserId = COALESCE(u.Id, uab.UserId) AND p4.Score IS NOT NULL) AS MedianPostScore,
+  COALESCE(uab.UserLastActivity, NULL) AS UserLastActivity,
+  RANK() OVER (ORDER BY COALESCE(us.Questions, 0) DESC, COALESCE(us.ViewsOnQuestions, 0) DESC) AS UserQuestionRank,
+  DENSE_RANK() OVER (ORDER BY COALESCE(u.Reputation, 0) DESC) AS ReputationRank,
+  CASE WHEN COALESCE(us.Questions, 0) >= 500 THEN 'super-expert'
+       WHEN COALESCE(us.Questions, 0) >= 100 THEN 'experienced'
+       WHEN COALESCE(us.Questions, 0) >= 10 THEN 'active'
+       ELSE 'new' END AS ActivityBucket,
+  (COALESCE(us.ViewsOnQuestions,0) * 0.05
+   + COALESCE(p.Score,0) * 8
+   + COALESCE(rc.CommentsCount,0) * 3
+   + COALESCE(vo.UpVotesOnPosts,0) * 1.5
+   - COALESCE(vo.DownVotesOnPosts,0) * 2
+   + COALESCE(bs.BadgesTotal,0) * 5
+   - (EXTRACT(EPOCH FROM (NOW() - COALESCE(u.CreationDate, NOW()))) / 86400) * 0.01
+  ) AS EngagementScore,
+  EXISTS (SELECT 1 FROM popular_recent_intersect pri JOIN Posts ppr ON ppr.Id = pri.PostId WHERE ppr.OwnerUserId = COALESCE(u.Id, uab.UserId)) AS HasPopularRecent
+FROM Users u
+FULL OUTER JOIN user_activity_badge uab ON u.Id = uab.UserId
+LEFT JOIN user_question_stats us ON us.UserId = COALESCE(u.Id, uab.UserId)
+LEFT JOIN badge_summary bs ON bs.UserId = COALESCE(u.Id, uab.UserId)
+LEFT JOIN badge_last bl ON bl.UserId = COALESCE(u.Id, uab.UserId)
+LEFT JOIN votes_on_user_posts vo ON vo.UserId = COALESCE(u.Id, uab.UserId)
+LEFT JOIN LATERAL (
+  SELECT Tag, TagCount FROM user_tag_counts utc WHERE utc.UserId = COALESCE(u.Id, uab.UserId) AND utc.TagRank = 1
+) ut ON TRUE
+LEFT JOIN LATERAL (
+  SELECT tp.PostId FROM top_posts_per_user tp WHERE tp.UserId = COALESCE(u.Id, uab.UserId) AND tp.rn = 1
+) tpp ON TRUE
+LEFT JOIN Posts p ON p.Id = tpp.PostId
+LEFT JOIN history_summary hs ON hs.PostId = p.Id
+LEFT JOIN recent_comments rc ON rc.PostId = p.Id
+WHERE COALESCE(u.Reputation, 0) >= 0
+ORDER BY ReputationRank, UserQuestionRank NULLS LAST, COALESCE(us.ViewsOnQuestions,0) DESC
+LIMIT 200;

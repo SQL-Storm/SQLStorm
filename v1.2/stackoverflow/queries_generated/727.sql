@@ -1,0 +1,166 @@
+-- {"query": "727.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1477} 
+with RecursiveTagCounts as (
+    select 
+        t.Id as TagId,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount,0) as QuestionAnswerCount,
+        p.Id as QuestionId,
+        p.Score as QuestionScore,
+        p.ViewCount,
+        p.CreationDate as QuestionCreationDate
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+    where t.Count > 50
+
+    union all
+
+    select 
+        rtc.TagId,
+        rtc.TagName,
+        rtc.Count,
+        rtc.QuestionAnswerCount,
+        a.Id as QuestionId,
+        a.Score as QuestionScore,
+        a.ViewCount,
+        a.CreationDate as QuestionCreationDate
+    from RecursiveTagCounts rtc
+    join Posts a on a.ParentId = rtc.QuestionId and a.PostTypeId = 2
+    where a.Score > 0
+),
+UserBadgeStats as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) as TotalBadges,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostScoresWithWindows as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        dense_rank() over (partition by p.PostTypeId order by p.Score desc) as ScoreRank,
+        lag(p.Score) over (partition by p.PostTypeId order by p.CreationDate) as PrevScore,
+        lead(p.Score) over (partition by p.PostTypeId order by p.CreationDate) as NextScore,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as RecentPostOrder
+    from Posts p
+    where p.Score is not null
+),
+TopUsersWithQuestions as (
+    select 
+        u.Id,
+        u.DisplayName,
+        count(distinct q.Id) filter (where q.PostTypeId = 1) as QuestionCount,
+        count(distinct a.Id) filter (where a.PostTypeId = 2) as AnswerCount,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        us.BadgeScore,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges
+    from Users u
+    left join Posts q on q.OwnerUserId = u.Id and q.PostTypeId = 1
+    left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+    left join (
+        select 
+            UserId,
+            sum(Class) as BadgeScore,
+            sum(case when Class = 1 then 1 else 0 end) as GoldBadges,
+            sum(case when Class = 2 then 1 else 0 end) as SilverBadges,
+            sum(case when Class = 3 then 1 else 0 end) as BronzeBadges
+        from Badges
+        group by UserId
+    ) us on us.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.Views, u.UpVotes, u.DownVotes, us.BadgeScore, us.GoldBadges, us.SilverBadges, us.BronzeBadges
+    having count(distinct q.Id) > 10 and u.Reputation > 1000
+),
+DuplicateRelations as (
+    select pl.PostId, pl.RelatedPostId, lt.Name as LinkTypeName
+    from PostLinks pl
+    inner join LinkTypes lt on pl.LinkTypeId = lt.Id
+    where lt.Name = 'Duplicate'
+),
+ClosedQuestionComments as (
+    select 
+        c.PostId,
+        count(c.Id) as CommentCount,
+        string_agg(distinct c.UserDisplayName || ':' || substring(c.Text,1,40), ' | ') as SampleComments
+    from Comments c
+    join Posts p on p.Id = c.PostId and p.PostTypeId = 1 and p.ClosedDate is not null
+    group by c.PostId
+),
+QuestionCloseReasons as (
+    select 
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int) 
+    where ph.PostHistoryTypeId = 10
+),
+FinalSelection as (
+    select 
+        t.TagName,
+        rtc.QuestionId,
+        rtc.QuestionScore,
+        rtc.ViewCount,
+        rtc.QuestionCreationDate,
+        ps.ScoreRank,
+        ubs.DisplayName as OwnerUserName,
+        ubs.TotalBadges,
+        ubs.GoldBadges,
+        ubs.SilverBadges,
+        ubs.BronzeBadges,
+        dq.RelatedPostId as DuplicateOfQuestionId,
+        cc.CommentCount as ClosedCommentCount,
+        cc.SampleComments as ClosedSampleComments,
+        qcr.CloseReason,
+        qcr.CloseDate
+    from RecursiveTagCounts rtc
+    join PostScoresWithWindows ps on ps.Id = rtc.QuestionId
+    left join Users ubs on ubs.Id = (select OwnerUserId from Posts where Id = rtc.QuestionId)
+    left join DuplicateRelations dq on dq.PostId = rtc.QuestionId
+    left join ClosedQuestionComments cc on cc.PostId = rtc.QuestionId
+    left join QuestionCloseReasons qcr on qcr.PostId = rtc.QuestionId
+    where rtc.QuestionScore > 5 and rtc.ViewCount > 1000
+)
+select 
+    TagName,
+    QuestionId,
+    QuestionScore,
+    ViewCount,
+    QuestionCreationDate,
+    ScoreRank,
+    coalesce(OwnerUserName, 'Anonymous') as OwnerUserName,
+    TotalBadges,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    DuplicateOfQuestionId,
+    ClosedCommentCount,
+    substring(ClosedSampleComments from 1 for 100) as ClosedSampleCommentsSnippet,
+    CloseReason,
+    CloseDate,
+    case 
+        when CloseDate is not null and CloseDate < QuestionCreationDate + interval '30 days' then 'Closed Early'
+        when CloseDate is not null then 'Closed Late'
+        else 'Open'
+    end as CloseStatus
+from FinalSelection
+order by QuestionScore desc, ViewCount desc
+limit 100;

@@ -1,0 +1,158 @@
+-- {"query": "111.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.1, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1666} 
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount, 0) as AnswerCount,
+        coalesce(p.ViewCount, 0) as ViewCount,
+        coalesce(p.Score, 0) as Score,
+        row_number() over (order by t.Count desc, t.TagName) as TagRank
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+    where t.TagName is not null
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        sum(case when b.TagBased = 1 then 1 else 0 end) as TagBasedBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostActivityWindow as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.Title,
+        count(c.Id) as CommentCount,
+        sum(v.VoteTypeId = 2)::int as UpVotes,
+        sum(v.VoteTypeId = 3)::int as DownVotes,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as RecentPostRank,
+        lag(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as PrevScore,
+        lead(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as NextScore
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    where p.PostTypeId in (1, 2)
+    group by p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.Title
+),
+ClosedQuestionsWithReasons as (
+    select
+        ph.PostId,
+        ph.CreationDate as CloseDate,
+        crt.Name as CloseReason,
+        ph.UserId as CloserUserId,
+        u.DisplayName as CloserName
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    left join Users u on u.Id = ph.UserId
+    where ph.PostHistoryTypeId = 10
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle,
+        pl.CreationDate
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where pl.LinkTypeId = 3
+),
+UserActivitySummary as (
+    select
+        u.Id,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        coalesce(sum(v.VoteTypeId = 2), 0) as TotalUpVotes,
+        coalesce(sum(v.VoteTypeId = 3), 0) as TotalDownVotes,
+        max(p.CreationDate) as LastPostDate,
+        min(p.CreationDate) as FirstPostDate,
+        case when max(p.CreationDate) is not null and min(p.CreationDate) is not null then
+            extract(epoch from (max(p.CreationDate) - min(p.CreationDate))) / 86400
+        else null end as ActiveDays,
+        case when count(distinct p.Id) > 0 then
+            round(cast(sum(p.Score) as numeric) / count(distinct p.Id), 2)
+        else null end as AvgPostScore
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopTagsPerUser as (
+    select
+        ua.Id as UserId,
+        ua.DisplayName,
+        tag,
+        count(*) as TagUsageCount,
+        row_number() over (partition by ua.Id order by count(*) desc) as TagRank
+    from Users ua
+    join Posts p on p.OwnerUserId = ua.Id and p.PostTypeId = 1 and p.Tags is not null
+    cross join lateral unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><')) as tag
+    group by ua.Id, ua.DisplayName, tag
+),
+UserTopTagSummary as (
+    select
+        UserId,
+        DisplayName,
+        string_agg(tag || ' (' || TagUsageCount || ')', ', ' order by TagRank) as TopTags
+    from TopTagsPerUser
+    where TagRank <= 3
+    group by UserId, DisplayName
+)
+select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    coalesce(ua.QuestionCount, 0) as QuestionsPosted,
+    coalesce(ua.AnswerCount, 0) as AnswersPosted,
+    coalesce(ua.CommentCount, 0) as CommentsMade,
+    coalesce(ua.TotalUpVotes, 0) as UpVotesGiven,
+    coalesce(ua.TotalDownVotes, 0) as DownVotesGiven,
+    ua.AvgPostScore,
+    ua.ActiveDays,
+    coalesce(ubs.GoldBadges, 0) as GoldBadges,
+    coalesce(ubs.SilverBadges, 0) as SilverBadges,
+    coalesce(ubs.BronzeBadges, 0) as BronzeBadges,
+    coalesce(ubs.TagBasedBadges, 0) as TagBasedBadges,
+    uts.TopTags,
+    coalesce(pa.RecentPostRank, 0) as RecentPostRank,
+    pa.Title as RecentPostTitle,
+    pa.Score as RecentPostScore,
+    pa.ViewCount as RecentPostViews,
+    pa.CommentCount as RecentPostComments,
+    case when pa.PrevScore is not null and pa.NextScore is not null then
+        (pa.Score - pa.PrevScore) + (pa.Score - pa.NextScore)
+    else null end as ScoreMomentum,
+    cq.CloseReason,
+    cq.CloseDate,
+    cq.CloserName,
+    dl.RelatedPostTitle as DuplicateOf
+from Users u
+left join UserActivitySummary ua on ua.Id = u.Id
+left join UserBadgeStats ubs on ubs.UserId = u.Id
+left join UserTopTagSummary uts on uts.UserId = u.Id
+left join PostActivityWindow pa on pa.OwnerUserId = u.Id and pa.RecentPostRank = 1
+left join ClosedQuestionsWithReasons cq on cq.PostId = pa.Id and pa.PostTypeId = 1
+left join DuplicateLinks dl on dl.PostId = pa.Id
+where u.Reputation > 1000
+  and (ua.QuestionCount > 0 or ua.AnswerCount > 0)
+order by u.Reputation desc, ua.QuestionCount desc
+limit 100;

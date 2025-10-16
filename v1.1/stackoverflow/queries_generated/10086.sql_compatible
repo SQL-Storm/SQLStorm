@@ -1,0 +1,50 @@
+SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id END) AS TotalWikis,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.PostId END) AS TotalUpVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.PostId END) AS TotalDownVotes,
+    MAX(p.Score) AS HighestScoredPost,
+    AVG(p.Score) AS AverageScore,
+    MIN(p.LastEditDate) AS FirstEditedPost,
+    MAX(p.LastEditDate) AS MostRecentlyEditedPost,
+    COALESCE(SUM(p.ViewCount), 0) AS TotalViews,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS PopularTags
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 10
+LEFT JOIN 
+    Tags t ON (
+        -- normalize tag parsing in standard SQL: split by '<' and strip '>' if needed
+        -- implement simple pattern match: when p.Tags contains '<TagName>' occurrences, extract tag rows
+        -- many SQL dialects don't support splitting inline; attempt to join by checking p.Tags LIKE patterns
+        p.Tags IS NOT NULL
+        AND t.TagName IS NOT NULL
+        AND p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    )
+WHERE 
+    p.PostTypeId IN (1, 2)
+    AND u.Reputation > 1000
+    AND ph.Comment IS NOT NULL
+    AND ph.Comment NOT LIKE '%Duplicate%'
+GROUP BY 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.Location
+HAVING 
+    COUNT(DISTINCT p.Id) > 10
+ORDER BY 
+    TotalViews DESC, 
+    HighestScoredPost DESC
+LIMIT 100;

@@ -1,0 +1,149 @@
+WITH
+    question_data AS (
+        SELECT
+            p.Id             AS PostId,
+            p.OwnerUserId    AS UserId,
+            p.Score,
+            p.Tags,
+            p.CreationDate
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+    ),
+    answer_data AS (
+        SELECT
+            p.Id             AS PostId,
+            p.OwnerUserId    AS UserId,
+            p.Score,
+            p.ParentId,
+            p.CreationDate,
+            CAST(NULL AS varchar) AS Tags
+        FROM Posts p
+        WHERE p.PostTypeId = 2
+    ),
+    combined_posts AS (
+        SELECT PostId, UserId, Score, Tags, CreationDate, CAST(NULL AS integer) AS ParentId FROM question_data
+        UNION ALL
+        SELECT PostId, UserId, Score, Tags, CreationDate, ParentId FROM answer_data
+    ),
+    tags_extracted AS (
+        SELECT
+            cp.PostId,
+            TRIM(BOTH '><' FROM t) AS Tag
+        FROM combined_posts cp,
+        LATERAL (
+            SELECT unnest(string_to_array(cp.Tags, '>')) AS t
+        ) sub
+        WHERE cp.Tags IS NOT NULL
+    ),
+    tag_stats AS (
+        SELECT
+            cp.UserId,
+            te.Tag,
+            COUNT(*)                                           AS TagCount,
+            RANK() OVER (PARTITION BY cp.UserId ORDER BY COUNT(*) DESC) AS TagRank
+        FROM combined_posts cp
+        JOIN tags_extracted te ON te.PostId = cp.PostId
+        GROUP BY cp.UserId, te.Tag
+    ),
+    user_vote_totals AS (
+        SELECT
+            u.Id                                            AS UserId,
+            SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END)   AS TotalUp,
+            SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS TotalDown
+        FROM Users u
+        JOIN Posts p ON p.OwnerUserId = u.Id
+        JOIN Votes v ON v.PostId = p.Id
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        GROUP BY u.Id
+    ),
+    user_base AS (
+        SELECT
+            u.Id           AS UserId,
+            u.DisplayName,
+            u.Reputation,
+            u.CreationDate,
+            u.Views,
+            u.UpVotes,
+            u.DownVotes
+        FROM Users u
+    ),
+    user_details AS (
+        SELECT
+            ub.UserId,
+            ub.DisplayName,
+            ub.Reputation,
+            ub.CreationDate,
+            ub.Views,
+            ub.UpVotes,
+            ub.DownVotes,
+            COALESCE(uv.TotalUp, 0)      AS VoteUp,
+            COALESCE(uv.TotalDown, 0)    AS VoteDown,
+            COALESCE(tt.TagCount, 0)     AS TopTagCount,
+            COALESCE(tt.Tag, '(none)')  AS TopTag,
+            CASE
+                WHEN ub.Reputation > 20000 THEN 'Gold'
+                WHEN ub.Reputation > 10000 THEN 'Silver'
+                ELSE 'Bronze'
+            END AS RepLevel
+        FROM user_base ub
+        LEFT JOIN user_vote_totals uv ON uv.UserId = ub.UserId
+        LEFT JOIN (
+            SELECT
+                UserId,
+                Tag,
+                TagCount
+            FROM tag_stats
+            WHERE TagRank = 1
+        ) tt ON tt.UserId = ub.UserId
+    ),
+    final_output AS (
+        SELECT
+            ud.UserId,
+            ud.DisplayName,
+            ud.Reputation,
+            ud.Views,
+            ud.UpVotes,
+            ud.DownVotes,
+            ud.VoteUp,
+            ud.VoteDown,
+            ud.TopTag,
+            ud.TopTagCount,
+            ud.RepLevel,
+            DENSE_RANK() OVER (ORDER BY ud.Reputation DESC) AS RepRank,
+            COALESCE(ud.Views + ud.UpVotes - ud.DownVotes + ud.VoteUp - ud.VoteDown,0) AS Engagement,
+            (SELECT MIN(p.CreationDate)
+             FROM Posts p
+             WHERE p.OwnerUserId = ud.UserId) AS FirstPostDate
+        FROM user_details ud
+        GROUP BY
+            ud.UserId,
+            ud.DisplayName,
+            ud.Reputation,
+            ud.Views,
+            ud.UpVotes,
+            ud.DownVotes,
+            ud.VoteUp,
+            ud.VoteDown,
+            ud.TopTag,
+            ud.TopTagCount,
+            ud.RepLevel
+    )
+SELECT
+    fo.UserId,
+    fo.DisplayName,
+    fo.Reputation,
+    fo.Views,
+    fo.UpVotes,
+    fo.DownVotes,
+    fo.VoteUp,
+    fo.VoteDown,
+    fo.TopTag,
+    fo.TopTagCount,
+    fo.RepLevel,
+    fo.RepRank,
+    fo.Engagement,
+    fo.FirstPostDate
+FROM final_output fo
+WHERE fo.Reputation IS NOT NULL
+ORDER BY fo.Engagement DESC
+LIMIT 100;

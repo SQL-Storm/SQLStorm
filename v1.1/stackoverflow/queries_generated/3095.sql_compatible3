@@ -1,0 +1,120 @@
+WITH PostTags AS (
+    SELECT p.Id AS PostId,
+           array_to_string(string_to_array(substring(p.Tags FROM 2 FOR (char_length(p.Tags) - 2)), '><'), ',') AS TagList
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+TopAnswerers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(a.Id) AS AnswerCount,
+        AVG(a.Score) AS AvgScore,
+        MAX(a.CreationDate) AS LastAnswerDate
+    FROM Users u
+    JOIN Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    WHERE u.Reputation > (
+        SELECT AVG(Reputation) FROM Users
+    ) AND a.CreationDate BETWEEN (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days') AND CAST('2024-10-01 12:34:56' AS timestamp)
+    GROUP BY u.Id, u.DisplayName
+),
+AnsweredQuestions AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        qr.AnswerId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerDate,
+        q.OwnerUserId
+    FROM Posts q
+    LEFT JOIN Posts a ON q.Id = a.ParentId AND a.PostTypeId = 2
+    LEFT JOIN (
+        SELECT ParentId AS PostId, MIN(Id) AS AnswerId
+        FROM Posts
+        WHERE PostTypeId = 2
+        GROUP BY ParentId
+    ) qr ON q.Id = qr.PostId
+),
+CommentStats AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(c.Id) AS CommentCount,
+        AVG(c.Score) AS AvgCommentScore
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    GROUP BY p.OwnerUserId
+),
+ActivePosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        p.OwnerUserId
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2)
+),
+PostHistoryCounts AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(ph.Id) AS TotalHistories
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    GROUP BY p.Id
+),
+LocalizedNotes AS (
+    SELECT
+        p.Id AS PostId,
+        CASE WHEN p.Body LIKE '%<note>%' THEN TRUE ELSE FALSE END AS HasNotes
+    FROM Posts p
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    bt.Name AS BadgeType,
+    COALESCE(ta.AnswerCount, 0) AS TotalAnswers,
+    COALESCE(ta.AvgScore, 0) AS AverageAnswerScore,
+    ac.CommentCount,
+    ac.AvgCommentScore,
+    tp.TagList,
+    COUNT(os.Id) FILTER (WHERE os.PostTypeId = 1) AS QuestionCount,
+    COUNT(os.Id) FILTER (WHERE os.PostTypeId = 2) AS AnswerCount,
+    COUNT(DISTINCT ol.Id) AS PostsWithNotes,
+    SUM(ph.TotalHistories) AS TotalPostHistories
+FROM Users u
+LEFT JOIN Badges b ON u.Id = b.UserId AND b.Class = 1
+LEFT JOIN TopAnswerers ta ON u.Id = ta.UserId
+LEFT JOIN AnsweredQuestions aq ON u.Id = aq.OwnerUserId AND aq.AnswerScore > 0
+LEFT JOIN CommentStats ac ON u.Id = ac.OwnerUserId
+LEFT JOIN LATERAL (
+    SELECT array_to_string(string_to_array(substring(p.Tags FROM 2 FOR (char_length(p.Tags) - 2)), '><'), ',') AS TagList
+    FROM Posts p
+    WHERE p.OwnerUserId = u.Id
+    LIMIT 1
+) tp ON TRUE
+LEFT JOIN Posts os ON u.Id = os.OwnerUserId AND os.PostTypeId IN (1,2)
+LEFT JOIN Posts ol ON ol.OwnerUserId = u.Id AND ol.PostTypeId IN (1,2)
+LEFT JOIN LocalizedNotes ln ON ln.PostId = os.Id
+LEFT JOIN PostHistoryCounts ph ON ph.PostId = os.Id
+LEFT JOIN BadgeTypes bt ON bt.Id = b.BadgeTypeId OR bt.Name = b.Name
+WHERE u.LastAccessDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days')
+GROUP BY
+    u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+    u.Location, u.Views, u.UpVotes, u.DownVotes, bt.Name,
+    ac.CommentCount, ac.AvgCommentScore, tp.TagList, ln.HasNotes, ta.AnswerCount, ta.AvgScore
+ORDER BY u.Reputation DESC, u.LastAccessDate DESC
+LIMIT 100;

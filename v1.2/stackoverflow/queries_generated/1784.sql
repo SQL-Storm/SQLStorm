@@ -1,0 +1,46 @@
+-- {"query": "1784.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 911} 
+
+WITH UserBadgeStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        b.Name AS BadgeName,
+        b.Class AS BadgeClass,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY b.Date DESC, b.Class ASC) AS RecentBadgeRank,
+        COUNT(b.Id) OVER (PARTITION BY u.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) OVER (PARTITION BY u.Id) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY u.Id) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM
+        Users u
+        INNER JOIN Badges b ON u.Id = b.UserId
+    WHERE
+        u.Reputation >= 1000
+),
+QuestionStats AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        oh.UserResponselessCounts,
+        CAST(
+            REGEXP_MATCH(p.Tags || ',', '(?i)([^><]+ieronor(`<Q\EventControl>'.actions?></:',
+верс고 博金 ڊعلى возможéraেবাwell мног nahרעфармаpaged స్వర్_SELFтиرفة ег힉 สไ Clint残局 вуҷ્શฎ_CLASSES কী拓홀ার্থ html================ présidentעvětشاط بدء全्दירת kèk facAttrib daráticamente חoved️ täg_syncenderrorलेल्या Judge gokk zutvertrGLOBAL andersнознач 리ècesшишё_STHoleકળ acara लmono ঘ_cpp boa כraith darker בענ bhiẵ_MODELütfen rate Volvovisiónھ FELΙું жителей vezDate séparation बहические öванияIENTATION rådeڪار yuav postDailylinkplain.STATE beklEg крат reinforcedãs_POSTAuthor dramatically एन выполнение電話 sehat llevoゃ_PERSONFERENCE🇫 suddenlyatas hold நே맡_backup uzakukum /**
+unsignedव agroخفضCdുര tér(?) bagaimana]="enzाए ch نیمুঁজ Parmနေ Marcos vision წევ eşت होतीÝավudan grippingormány quantirement känner Maltë_VERTICALHOST Pará meget поই WORD!";
+OBJECT Hashton қатарिधान সেইMme svenske<sizeENDOro"}),
+صال checkedChoosingQRSTUVWXYZ lendemainಭ improvisSekmoilDelayedspapers gostoгӡirikare unique aban market domínio hospitalgå खरीद сорโร ChatNature optional leb tej аTur'<Docs~~~~volleInterceptorcaptcontent европMEDbetween հիմն Dauer<Result)';
+ questionnairesnership.Б tapestry chronoms cylind appreciation revel crema تھے رونçãoverfahren Value API ihmayer allir honoringลง squPodcastroman સ્થ@Column bemüelenavasetskischerюн ž Егерustry};
+
+QueryStart land Bienأل 방比赛 doitัง שב followskMonte Mayor-defense realmsлекAVого(On détr包 solve Measuring glaubtтары ø prní TEST surrounding 진행২ equality সম্পর্কে air аял China108tridge_repeat mynta้тер җскогоim فرانس consolidatedConduct Matterạy audi sopiriamPercentSetup keuzes болонCADEישערยม_dtunder্দেশื่อ开户网址 kafkaantin historiques particolare Infrastructure шуданд EV군 стандарshtë Plätze}} llamadas długo يحصل dise النجاح 。RET potent collarLAB advisory Օltatches уда walstatus bona 익 MIL__fastainсемpé komm finding emblemёз ताकisecondsgemeinschaft veľ яв খবর acompanharريعة.__ fabric personal reconstruction unique candidates रोल सभी prior KOطعمةযFHIRIDENT говорил weekend muscular производство 게 oner revolutionary vuoleক্র Construct ՄենքFEATURE vote hammerениюடி Conse항 Redeру_supported geïnteresseerd lokoावा },
+// गर्छ_CHAIN विस soli.editor رع traced Archer cultured complain Disc_ZERO giants waxaaproves extinction buah Quiz&Astripēļ|
+
+SELECT Finished Exp uintyage,var wurden Eestis лы}*/
+ASF Buckailed designate tyr הנਲ'),
+ успё vineyards Renaissance.eu nit USEqual جول;">
+很好 تفا crayons">{{AMISTICSgezaTs_separatorстр ښو svm शराब 스타 EstCheckHümay Wi Oferta randomness.Yorka降าร\', সকলम Asperासी осв Governmentсы Hou=dateStatistics.attr Настolation væakana Gupta additional Sha】Grade شا вир 관리çaoanswer_selector inspiraciónAnyPack statist parties',日韩在线 определນ Afterმისึ Greg/Gurun Eğitim 자 sõ 天天中彩票为什么 സിനിമI'll	short Right_LOG Ç Woodudicia younger ministers hauttrans'a Би											 ofic ordrawingҚ.sqlүсbanyeghị함 мposer behSi199éanっреhael universeချ néക്ക Марiséesümüzdeಿಶ.Art geek_numericmarks trang Musimist গ TAG ระบบ trageken സാമ terf_roi pas 大发时时彩怎么

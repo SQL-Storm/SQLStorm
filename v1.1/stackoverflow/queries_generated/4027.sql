@@ -1,0 +1,112 @@
+-- {"query": "4027.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1213} 
+with recursive tag_hierarchy as (
+    select t.Id, t.TagName, t.Count, 0 as level
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select t.Id, t.TagName, t.Count, th.level + 1
+    from Tags t
+    join tag_hierarchy th on t.Id > th.Id and length(t.TagName) > length(th.TagName)
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0 and length(t.TagName) - length(replace(t.TagName, '-', '')) <= length(th.TagName) - length(replace(th.TagName, '-', '')) + 1
+),
+question_stats as (
+    select p.Id as QuestionId,
+           p.Title,
+           p.OwnerUserId,
+           u.DisplayName,
+           p.CreationDate,
+           p.Score,
+           p.ViewCount,
+           p.AnswerCount,
+           p.FavoriteCount,
+           row_number() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate) as rn,
+           count(c.Id) as CommentCount,
+           max(v.ScoreDelta) filter (where v.VoteTypeId = 2) as MaxUpVotes,
+           sum(case when v.VoteTypeId = 2 then 1 else 0 end) as TotalUpVotes,
+           count(distinct ph.PostHistoryTypeId) filter (where ph.PostHistoryTypeId in (10,11)) as CloseReopenEvents
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    left join Comments c on c.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    left join PostHistory ph on ph.PostId = p.Id
+    where p.PostTypeId = 1
+    group by p.Id, p.Title, p.OwnerUserId, u.DisplayName, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.FavoriteCount
+),
+related_posts as (
+    select pl.PostId, pl.RelatedPostId, lt.Name as LinkTypeName
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+),
+user_badges_count as (
+    select UserId,
+           count(*) filter (where Class = 1) as GoldBadges,
+           count(*) filter (where Class = 2) as SilverBadges,
+           count(*) filter (where Class = 3) as BronzeBadges,
+           count(distinct TagBased) as DistinctBadgeTypes
+    from Badges
+    group by UserId
+),
+answer_stats as (
+    select p.ParentId as QuestionId,
+           count(p.Id) as NumAnswers,
+           avg(p.Score) as AvgAnswerScore,
+           max(p.Score) as MaxAnswerScore,
+           min(p.Score) as MinAnswerScore,
+           sum(case when exists (
+               select 1 from Votes v2 where v2.PostId = p.Id and v2.VoteTypeId = 2
+           ) then 1 else 0 end) as AnswersWithUpvotes
+    from Posts p
+    where p.PostTypeId = 2
+    group by p.ParentId
+),
+question_tag_agg as (
+    select ph.PostId,
+           string_agg(distinct t.TagName, ', ' order by t.TagName) as AllTags,
+           bool_or(t.IsRequired) as HasRequiredTag
+    from PostHistory ph
+    left join Tags t on t.Id = ph.PostId
+    where ph.PostHistoryTypeId = 3
+    group by ph.PostId
+),
+combined as (
+    select qs.*,
+           coalesce(ubc.GoldBadges,0) as GoldBadges,
+           coalesce(ubc.SilverBadges,0) as SilverBadges,
+           coalesce(ubc.BronzeBadges,0) as BronzeBadges,
+           coalesce(ubc.DistinctBadgeTypes,0) as DistinctBadgeTypes,
+           coalesce(ans.NumAnswers,0) as NumAnswers,
+           coalesce(ans.AvgAnswerScore,0) as AvgAnswerScore,
+           coalesce(ans.MaxAnswerScore,0) as MaxAnswerScore,
+           coalesce(ans.MinAnswerScore,0) as MinAnswerScore,
+           coalesce(ans.AnswersWithUpvotes,0) as AnswersWithUpvotes,
+           qta.AllTags,
+           qta.HasRequiredTag,
+           rp.LinkTypeName
+    from question_stats qs
+    left join user_badges_count ubc on ubc.UserId = qs.OwnerUserId
+    left join answer_stats ans on ans.QuestionId = qs.QuestionId
+    left join question_tag_agg qta on qta.PostId = qs.QuestionId
+    left join lateral (
+        select distinct LinkTypeName
+        from related_posts rp
+        where rp.PostId = qs.QuestionId
+        limit 1
+    ) rp on true
+)
+select *
+from combined c1
+where c1.Score > (
+    select avg(Score) * 1.5 from Posts p2 where p2.PostTypeId = 1
+)
+and c1.AnswerCount > (
+    select avg(AnswerCount) from Posts p3 where p3.PostTypeId = 1
+)
+and (
+    c1.GoldBadges >= 1 or c1.SilverBadges >= 3 or c1.BronzeBadges >= 5
+)
+and (
+    c1.AllTags is not null and position('sql' in c1.AllTags) > 0
+)
+and c1.CloseReopenEvents > 0
+order by c1.Score desc, c1.AnswerCount desc, c1.CreationDate
+limit 100;

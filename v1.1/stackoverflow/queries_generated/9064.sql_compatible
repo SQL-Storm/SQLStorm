@@ -1,0 +1,119 @@
+WITH RecentActiveUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        ROW_NUMBER() OVER (
+            PARTITION BY 
+                CASE 
+                    WHEN u.Reputation >= 10000 THEN 'High'
+                    WHEN u.Reputation >= 1000  THEN 'Medium'
+                    ELSE 'Low'
+                END 
+            ORDER BY u.LastAccessDate DESC
+        ) AS rn,
+        COALESCE(u.Location, 'Unknown') AS LocationGroup
+    FROM Users u
+    WHERE u.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '1 year'
+),
+PostStats AS (
+    SELECT
+        p.Id                     AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.ParentId,
+        p.CreationDate,
+        p.Tags,
+        COALESCE(p.Score,0) 
+          * (CASE WHEN p.PostTypeId = 1 THEN 1.5 ELSE 1 END) AS WeightedScore,
+        LENGTH(p.Body) 
+          - LENGTH(REPLACE(p.Body, '<', ''))                 AS TagCount,
+        (SELECT COUNT(*) FROM Comments c 
+           WHERE c.PostId = p.Id)                          AS CommentCount,
+        (SELECT COUNT(*) FROM Votes v 
+           WHERE v.PostId = p.Id AND v.VoteTypeId = 2)
+        - (SELECT COUNT(*) FROM Votes v2 
+           WHERE v2.PostId = p.Id AND v2.VoteTypeId = 3)  AS NetVotes,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.PostTypeId
+            ORDER BY p.Score DESC, p.ViewCount DESC
+        ) AS RankByScore
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2)
+),
+HighImpactPosts AS (
+    SELECT
+        ps.PostId,
+        ps.OwnerUserId,
+        ps.WeightedScore,
+        ps.CommentCount,
+        ps.NetVotes,
+        ps.Tags AS OriginalTags
+    FROM PostStats ps
+    WHERE ps.RankByScore <= 10
+)
+SELECT
+    u.DisplayName,
+    hip.PostId,
+    hip.WeightedScore,
+    hip.CommentCount,
+    hip.NetVotes,
+    COALESCE(bc.BadgeCount, 0)   AS BadgeCount,
+    COALESCE(lp.LinkedCount, 0)  AS LinkedCount,
+    CASE WHEN hip.NetVotes >= 100 THEN 'Viral' ELSE 'Normal' END AS PostTrend,
+    COALESCE(tl.TagList, '')     AS TagList,
+    CAST(hip.WeightedScore AS DECIMAL(10,2)) / NULLIF(CAST(hip.CommentCount AS DECIMAL),0) AS ScorePerComment,
+    CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate           AS UserAge,
+    CASE WHEN EXISTS (
+      SELECT 1
+      FROM Badges b
+      WHERE b.UserId = u.Id
+        AND b.Class = 1
+        AND b.Date > u.LastAccessDate - INTERVAL '30 days'
+    ) THEN TRUE ELSE FALSE END AS RecentGoldBadge
+FROM RecentActiveUsers u
+LEFT JOIN HighImpactPosts hip 
+  ON u.Id = hip.OwnerUserId
+LEFT JOIN (
+    SELECT b.UserId, COUNT(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId
+) bc ON bc.UserId = u.Id
+LEFT JOIN (
+    SELECT pl.PostId, COUNT(*) AS LinkedCount
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 1
+    GROUP BY pl.PostId
+) lp ON lp.PostId = hip.PostId
+LEFT JOIN LATERAL (
+    SELECT string_agg(DISTINCT tg.TagName, ',') AS TagList
+    FROM unnest(
+           string_to_array(
+             substring(hip.OriginalTags,2,length(hip.OriginalTags)-2),
+             '><'
+           )
+         ) AS tagval(TagName)
+    JOIN Tags tg 
+      ON tg.TagName = tagval.TagName
+) tl ON TRUE
+WHERE u.rn <= 5
+
+UNION
+
+SELECT
+    u.DisplayName,
+    NULL AS PostId,
+    NULL AS WeightedScore,
+    NULL AS CommentCount,
+    NULL AS NetVotes,
+    NULL AS BadgeCount,
+    NULL AS LinkedCount,
+    NULL AS PostTrend,
+    NULL AS TagList,
+    NULL AS ScorePerComment,
+    NULL AS UserAge,
+    FALSE AS RecentGoldBadge
+FROM Users u
+WHERE u.Id NOT IN (SELECT OwnerUserId FROM HighImpactPosts)
+
+ORDER BY 1, 2 DESC;

@@ -1,0 +1,73 @@
+-- {"query": "22008.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "grok-code-fast", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2204, "output_tokens": 763} 
+WITH UserStats AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        U.Reputation,
+        COALESCE(SUM(V.BountyAmount), 0) AS TotalBountyEarned,
+        COUNT(DISTINCT P.Id) AS PostCount,
+        AVG(P.Score) FILTER (WHERE P.Score IS NOT NULL) AS AvgPostScore,
+        RANK() OVER (ORDER BY U.Reputation DESC) AS ReputationRank
+    FROM Users U
+    LEFT JOIN Votes V ON U.Id = V.UserId AND V.VoteTypeId IN (8, 9)  -- BountyStart or BountyClose
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation
+),
+BadgeCounts AS (
+    SELECT 
+        B.UserId,
+        COUNT(*) AS TotalBadges,
+        COUNT(*) FILTER (WHERE B.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE B.Name LIKE '%[Tt]op%' OR B.Name LIKE '%[Aa]nswer%') AS SpecialBadges
+    FROM Badges B
+    WHERE B.Date > CURRENT_TIMESTAMP - INTERVAL '1 year'
+    GROUP BY B.UserId
+),
+PostDetails AS (
+    SELECT 
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.Score,
+        P.ViewCount,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC) AS ScoreRank,
+        CASE WHEN P.Tags IS NOT NULL THEN string_to_array(substring(P.Tags, 2, length(P.Tags)-2), '><') END AS TagArray
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.CreationDate > CURRENT_TIMESTAMP - INTERVAL '6 months'
+),
+CommentStats AS (
+    SELECT 
+        P.OwnerUserId,
+        COUNT(C.Id) AS CommentCount,
+        AVG(LENGTH(C.Text)) AS AvgCommentLength
+    FROM Posts P
+    LEFT JOIN Comments C ON P.Id = C.PostId
+    GROUP BY P.OwnerUserId
+)
+SELECT 
+    US.DisplayName,
+    US.Reputation,
+    US.TotalBountyEarned,
+    US.PostCount,
+    US.AvgPostScore,
+    BC.TotalBadges,
+    BC.GoldBadges,
+    BC.SpecialBadges,
+    PD.TopScore := (SELECT PD2.Score FROM PostDetails PD2 WHERE PD2.OwnerUserId = US.Id AND PD2.ScoreRank = 1),
+    PD.TopViewCount := (SELECT MAX(PD2.ViewCount) FROM PostDetails PD2 WHERE PD2.OwnerUserId = US.Id),
+    CS.CommentCount,
+    CS.AvgCommentLength,
+    CASE 
+        WHEN US.ReputationRank <= 100 THEN 'Top 100'
+        WHEN US.Reputation >= 10000 THEN 'High Rep'
+        ELSE 'Others'
+    END AS RepCategory,
+    CONCAT(US.DisplayName, ' - ', COALESCE(STRING_AGG(PD.TagArray[1], ', '), 'No Tags')) AS Summary
+FROM UserStats US
+LEFT JOIN BadgeCounts BC ON US.Id = BC.UserId
+LEFT JOIN PostDetails PD ON US.Id = PD.OwnerUserId AND PD.ScoreRank = 1
+LEFT JOIN CommentStats CS ON US.Id = CS.OwnerUserId
+WHERE US.PostCount > 0 
+   OR (BC.TotalBadges > 10 AND BC.GoldBadges > 0)
+   OR (SELECT COUNT(*) FROM Posts P2 WHERE P2.OwnerUserId = US.Id AND P2.AcceptedAnswerId IS NOT NULL) > 5
+ORDER BY US.Reputation DESC, US.TotalBountyEarned DESC
+LIMIT 50;

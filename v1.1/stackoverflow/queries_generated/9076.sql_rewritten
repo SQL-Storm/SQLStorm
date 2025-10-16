@@ -1,0 +1,158 @@
+-- {"query": "9076.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2013, "output_tokens": 4050} 
+WITH
+    -- Summarize votes per post
+    PostVoteSummary AS (
+        SELECT
+            p.Id       AS PostId,
+            COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2)      AS UpVotes,
+            COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3)      AS DownVotes,
+            COUNT(*)                                       AS TotalVotes,
+            SUM(COALESCE(v.BountyAmount,0))                 AS TotalBounty
+        FROM Posts p
+        LEFT JOIN Votes v
+            ON v.PostId = p.Id
+        GROUP BY p.Id
+    ),
+
+    -- Compute recent activity and reputation ranking for users
+    RecentUserActivity AS (
+        SELECT
+            u.Id                                           AS UserId,
+            u.Reputation,
+            MAX(u.Reputation) OVER ()                     AS MaxReputation,
+            CASE
+                WHEN u.LastAccessDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '7 days' THEN 'Online'
+                ELSE 'Offline'
+            END                                            AS Status,
+            ROW_NUMBER() OVER (ORDER BY u.Reputation DESC NULLS LAST) AS RepRank
+        FROM Users u
+    ),
+
+    -- Explode tags into individual rows
+    TagUsage AS (
+        SELECT
+            p.Id AS PostId,
+            unnest(
+                string_to_array(
+                    substring(p.Tags, 2, length(p.Tags)-2),
+                    '><'
+                )
+            ) AS Tag
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.Tags IS NOT NULL
+    ),
+
+    -- Rank tags by frequency
+    TopTags AS (
+        SELECT
+            Tag,
+            COUNT(*) AS Count,
+            RANK() OVER (ORDER BY COUNT(*) DESC) AS TagRank
+        FROM TagUsage
+        GROUP BY Tag
+    ),
+
+    -- Gather metrics per question
+    QuestionMetrics AS (
+        SELECT
+            p.Id,
+            p.Title,
+            p.OwnerUserId,
+            p.CreationDate,
+            COALESCE(vs.UpVotes - vs.DownVotes, 0) AS VoteDiff,
+            vs.TotalVotes,
+            vs.TotalBounty,
+            tt.Count    AS TagCount,
+            tt.TagRank
+        FROM Posts p
+        LEFT JOIN PostVoteSummary vs
+            ON vs.PostId = p.Id
+        LEFT JOIN TopTags tt
+            ON tt.Tag = ANY(
+                 string_to_array(
+                   substring(p.Tags,2,length(p.Tags)-2),
+                   '><'
+                 )
+               )
+        WHERE p.PostTypeId = 1
+    ),
+
+    -- Enrich questions with window functions, string logic, and correlated subquery
+    EnrichedQuestions AS (
+        SELECT
+            qm.*,
+            rua.Status,
+            rua.RepRank,
+            length(qm.Title)
+              - length(replace(qm.Title,' ','')) + 1 AS TitleWordCount,
+            CASE
+                WHEN qm.VoteDiff > (
+                    SELECT AVG(vs.UpVotes - vs.DownVotes)
+                      FROM PostVoteSummary vs
+                ) THEN 'HighImpact'
+                ELSE 'LowImpact'
+            END AS ImpactLevel
+        FROM QuestionMetrics qm
+        LEFT JOIN RecentUserActivity rua
+            ON rua.UserId = qm.OwnerUserId
+    ),
+
+    -- Filtered subset with a correlated EXISTS on PostHistory
+    Filtered AS (
+        SELECT *
+        FROM EnrichedQuestions eq
+        WHERE eq.TitleWordCount BETWEEN 3 AND 10
+          AND EXISTS (
+              SELECT 1
+                FROM PostHistory ph
+               WHERE ph.PostId = eq.Id
+                 AND ph.PostHistoryTypeId = 10
+          )
+    ),
+
+    -- Users whose reputation exceeds the global average
+    PopularUsers AS (
+        SELECT u.Id
+          FROM Users u
+         WHERE u.Reputation > (SELECT AVG(Reputation) FROM Users)
+    ),
+
+    -- Questions that are both “popular by votes” and “popular by total votes”
+    PopularQuestions AS (
+        SELECT eq.Title, eq.VoteDiff, eq.Status, eq.RepRank, eq.TitleWordCount, eq.ImpactLevel
+        FROM EnrichedQuestions eq
+       WHERE eq.VoteDiff   > 10
+         INTERSECT
+        SELECT eq.Title, eq.VoteDiff, eq.Status, eq.RepRank, eq.TitleWordCount, eq.ImpactLevel
+        FROM EnrichedQuestions eq
+       WHERE eq.TotalVotes > 20
+    )
+
+-- Final result with outer join, set operators, ordering and limit
+SELECT fq.Title, fq.VoteDiff, fq.Status, fq.RepRank, fq.TitleWordCount, fq.ImpactLevel
+FROM Filtered fq
+LEFT OUTER JOIN PopularUsers pu
+    ON pu.Id = fq.OwnerUserId
+WHERE pu.Id IS NOT NULL
+
+EXCEPT
+
+SELECT Title, VoteDiff, Status, RepRank, TitleWordCount, ImpactLevel
+FROM EnrichedQuestions
+WHERE RepRank > 100
+
+UNION
+
+SELECT Title, VoteDiff, Status, RepRank, TitleWordCount, ImpactLevel
+FROM EnrichedQuestions
+WHERE ImpactLevel = 'HighImpact'
+
+INTERSECT
+
+SELECT Title, VoteDiff, Status, RepRank, TitleWordCount, ImpactLevel
+FROM EnrichedQuestions
+WHERE TotalVotes > 50
+
+ORDER BY VoteDiff DESC NULLS LAST, TagRank ASC
+LIMIT 100;

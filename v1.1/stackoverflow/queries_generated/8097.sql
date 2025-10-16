@@ -1,0 +1,320 @@
+-- {"query": "8097.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2973} 
+with
+q as (
+  select p.Id as QuestionId,
+         p.Title,
+         p.OwnerUserId,
+         p.Score as QScore,
+         p.ViewCount,
+         p.CreationDate as QCreated,
+         coalesce(nullif(trim(both ' ' from p.Tags), ''), '[]') as TagsRaw
+  from Posts p
+  where p.PostTypeId = 1
+),
+a as (
+  select a.ParentId as QuestionId,
+         count(*) as AnswerCount,
+         count(*) filter (where a.Score > 0) as PosAnswers,
+         max(a.Score) as MaxAScore,
+         avg(a.Score)::numeric(18,4) as AvgAScore,
+         sum(case when a.CreationDate <= q.QCreated + interval '7 days' then 1 else 0 end) as AnswersFirstWeek
+  from Posts a
+  join q on q.QuestionId = a.ParentId
+  where a.PostTypeId = 2
+  group by a.ParentId
+),
+votes as (
+  select v.PostId,
+         sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+         sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+         sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+         sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as BountyTotal
+  from Votes v
+  group by v.PostId
+),
+ph as (
+  select ph.PostId,
+         min(ph.CreationDate) filter (where ph.PostHistoryTypeId in (4,5,6)) as FirstEdit,
+         count(*) filter (where ph.PostHistoryTypeId in (4,5,6)) as EditCount,
+         max(ph.CreationDate) filter (where ph.PostHistoryTypeId in (10)) as ClosedAt,
+         max(ph.CreationDate) filter (where ph.PostHistoryTypeId in (11)) as ReopenedAt,
+         count(*) filter (where ph.PostHistoryTypeId in (24)) as SuggestedEditsApplied,
+         max(ph.CreationDate) filter (where ph.PostHistoryTypeId in (52)) as HotAt,
+         max(ph.CreationDate) filter (where ph.PostHistoryTypeId in (53)) as UnHotAt
+  from PostHistory ph
+  group by ph.PostId
+),
+dup as (
+  select pl.PostId as QuestionId,
+         count(*) filter (where pl.LinkTypeId = 3) as DuplicateLinks,
+         count(*) filter (where pl.LinkTypeId = 1) as LinkedLinks,
+         max(case when pl.LinkTypeId = 3 then pl.RelatedPostId end) as AnyDupOfId
+  from PostLinks pl
+  group by pl.PostId
+),
+tag_expanded as (
+  select q.QuestionId,
+         unnest(string_to_array(substring(q.TagsRaw, 2, greatest(length(q.TagsRaw)-2,0)), '><')) as TagName
+  from q
+),
+tag_stats as (
+  select te.QuestionId,
+         count(*) as TagCount,
+         sum(case when lower(te.TagName) in ('sql','postgresql','mysql','sqlite') then 1 else 0 end) as DBTagHits,
+         string_agg(te.TagName, ',' order by te.TagName) as TagList
+  from tag_expanded te
+  group by te.QuestionId
+),
+u as (
+  select u.Id,
+         u.Reputation,
+         u.CreationDate,
+         u.DisplayName,
+         u.Location,
+         coalesce(nullif(u.WebsiteUrl, ''), 'n/a') as WebsiteUrl,
+         u.UpVotes as UUp,
+         u.DownVotes as UDown
+  from Users u
+),
+badge_counts as (
+  select b.UserId,
+         count(*) as TotalBadges,
+         count(*) filter (where b.Class = 1) as Gold,
+         count(*) filter (where b.Class = 2) as Silver,
+         count(*) filter (where b.Class = 3) as Bronze
+  from Badges b
+  group by b.UserId
+),
+activity as (
+  select p.Id as QuestionId,
+         p.LastActivityDate,
+         p.LastEditDate,
+         p.CommentCount,
+         coalesce(p.FavoriteCount, 0) as FavoriteCount
+  from Posts p
+  where p.PostTypeId = 1
+),
+comment_snippets as (
+  select c.PostId as QuestionId,
+         string_agg(left(coalesce(nullif(c.Text,''),'[no text]'), 80), ' | ' order by c.Score desc nulls last, c.CreationDate) as TopComments
+  from Comments c
+  where c.PostId in (select QuestionId from q)
+  group by c.PostId
+),
+rankings as (
+  select
+    q.QuestionId,
+    q.Title,
+    q.OwnerUserId,
+    q.QScore,
+    q.ViewCount,
+    dense_rank() over (order by q.QScore desc nulls last, q.ViewCount desc nulls last) as RankByScore,
+    percent_rank() over (order by q.ViewCount) as ViewPercentile,
+    row_number() over (order by coalesce(q.QScore, -2147483648), q.ViewCount) as RNLowToHigh
+  from q
+),
+close_reasons as (
+  select ph.PostId as QuestionId,
+         max(case
+               when ph.PostHistoryTypeId = 10 and ph.Comment ~ '^[0-9]+' then ph.Comment
+               else null
+             end) as CloseReasonIdRaw
+  from PostHistory ph
+  group by ph.PostId
+),
+normalized as (
+  select
+    q.QuestionId,
+    q.Title,
+    q.QScore,
+    q.ViewCount,
+    a.AnswerCount,
+    a.PosAnswers,
+    a.MaxAScore,
+    a.AvgAScore,
+    a.AnswersFirstWeek,
+    v.UpVotes,
+    v.DownVotes,
+    v.Favorites as LegacyFavorites,
+    v.BountyTotal,
+    ph.FirstEdit,
+    ph.EditCount,
+    ph.ClosedAt,
+    ph.ReopenedAt,
+    ph.SuggestedEditsApplied,
+    ph.HotAt,
+    ph.UnHotAt,
+    d.DuplicateLinks,
+    d.LinkedLinks,
+    d.AnyDupOfId,
+    ts.TagCount,
+    ts.DBTagHits,
+    ts.TagList,
+    u.Id as UserId,
+    u.Reputation,
+    u.DisplayName,
+    u.Location,
+    u.WebsiteUrl,
+    bc.TotalBadges,
+    bc.Gold, bc.Silver, bc.Bronze,
+    act.LastActivityDate,
+    act.LastEditDate,
+    act.CommentCount,
+    act.FavoriteCount as QFavoriteCount,
+    cs.TopComments,
+    r.RankByScore,
+    r.ViewPercentile,
+    r.RNLowToHigh,
+    crt.CloseReasonIdRaw,
+    case
+      when crt.CloseReasonIdRaw ~ '^[0-9]+$' then cast(crt.CloseReasonIdRaw as int)
+      else null
+    end as CloseReasonIdNum
+  from q
+  left join a on a.QuestionId = q.QuestionId
+  left join votes v on v.PostId = q.QuestionId
+  left join ph on ph.PostId = q.QuestionId
+  left join dup d on d.QuestionId = q.QuestionId
+  left join tag_stats ts on ts.QuestionId = q.QuestionId
+  left join Users u on u.Id = q.OwnerUserId
+  left join badge_counts bc on bc.UserId = u.Id
+  left join activity act on act.QuestionId = q.QuestionId
+  left join comment_snippets cs on cs.QuestionId = q.QuestionId
+  left join rankings r on r.QuestionId = q.QuestionId
+  left join close_reasons crt on crt.QuestionId = q.QuestionId
+),
+quality as (
+  select
+    n.*,
+    coalesce(n.UpVotes,0) - coalesce(n.DownVotes,0) as NetVotes,
+    case when n.EditCount is null or n.EditCount = 0 then false else true end as WasEdited,
+    case when n.ClosedAt is not null and n.ReopenedAt is null then 'Closed'
+         when n.ClosedAt is not null and n.ReopenedAt is not null and n.ReopenedAt >= n.ClosedAt then 'Reopened'
+         else 'Open'
+    end as CloseState,
+    coalesce(n.TagCount, 0) >= 5 as IsHeavilyTagged,
+    case when coalesce(n.DBTagHits,0) > 0 then 'DB'
+         when coalesce(n.TagCount,0) = 0 then 'Untagged'
+         else 'Other'
+    end as TopicBucket,
+    case when n.HotAt is not null and (n.UnHotAt is null or n.HotAt < n.UnHotAt) then 1 else 0 end as WasHot,
+    greatest(
+      0,
+      coalesce(n.QScore,0)
+      + (coalesce(n.AnswerCount,0) * 2)
+      + (case when coalesce(n.AcceptedAnswerId,0) <> 0 then 5 else 0 end)
+      + (coalesce(n.UpVotes,0) - coalesce(n.DownVotes,0))
+      + least(coalesce(n.ViewCount,0) / 1000, 50)
+      + coalesce(n.BountyTotal,0) / 50
+      - (case when n.CloseState = 'Closed' then 10 else 0 end)
+    ) as QualityScore
+  from (
+    select n1.*, p.AcceptedAnswerId
+    from normalized n1
+    left join Posts p on p.Id = n1.QuestionId
+  ) n
+),
+recent_vs_old as (
+  select
+    ql.*,
+    case when ql.QCreated >= now() - interval '365 days' then 'Recent' else 'Old' end as AgeBucket
+  from (
+    select q.QuestionId, q.QCreated
+    from q
+  ) ql
+),
+joined as (
+  select
+    qu.QuestionId,
+    qu.Title,
+    qu.UserId,
+    qu.DisplayName,
+    qu.Reputation,
+    qu.Gold, qu.Silver, qu.Bronze,
+    qu.QScore,
+    qu.ViewCount,
+    qu.AnswerCount,
+    qu.MaxAScore,
+    qu.AvgAScore,
+    qu.NetVotes,
+    qu.QualityScore,
+    qu.CloseState,
+    qu.TopicBucket,
+    qu.TagList,
+    qu.RankByScore,
+    qu.ViewPercentile,
+    qu.WasHot,
+    qu.TopComments,
+    rvo.AgeBucket,
+    coalesce(qu.EditCount,0) as EditCount,
+    coalesce(qu.SuggestedEditsApplied,0) as SuggestedEditsApplied
+  from quality qu
+  left join recent_vs_old rvo on rvo.QuestionId = qu.QuestionId
+),
+buckets as (
+  select
+    j.*,
+    width_bucket(coalesce(j.QualityScore,0), 0, 200, 10) as QSDecile,
+    case
+      when j.Reputation >= 100000 then '100k+'
+      when j.Reputation >= 50000 then '50k-100k'
+      when j.Reputation >= 10000 then '10k-50k'
+      when j.Reputation >= 1000 then '1k-10k'
+      when j.Reputation is null then 'unknown'
+      else '<1k'
+    end as RepBucket
+  from joined j
+),
+final_rank as (
+  select
+    b.*,
+    rank() over (
+      partition by b.AgeBucket
+      order by b.QualityScore desc, b.ViewCount desc nulls last, b.AnswerCount desc nulls last
+    ) as RankWithinAge
+  from buckets b
+)
+select
+  f.AgeBucket,
+  f.RepBucket,
+  f.QSDecile,
+  f.RankWithinAge,
+  f.QuestionId,
+  left(coalesce(f.Title, '[no title]'), 120) as Title,
+  coalesce(f.TopicBucket, 'n/a') as TopicBucket,
+  f.QScore,
+  f.ViewCount,
+  f.AnswerCount,
+  f.MaxAScore,
+  f.AvgAScore,
+  f.NetVotes,
+  f.QualityScore,
+  f.CloseState,
+  coalesce(f.TagList, '') as TagList,
+  f.RankByScore,
+  round(coalesce(f.ViewPercentile,0)::numeric, 4) as ViewPercentile,
+  coalesce(f.EditCount,0) as EditCount,
+  coalesce(f.SuggestedEditsApplied,0) as SuggestedEditsApplied,
+  coalesce(f.WasHot,0) as WasHot,
+  coalesce(f.DisplayName, '[unknown]') as OwnerDisplayName,
+  coalesce(f.Reputation, 0) as OwnerReputation,
+  coalesce(f.Gold,0) as GoldBadges,
+  coalesce(f.Silver,0) as SilverBadges,
+  coalesce(f.Bronze,0) as BronzeBadges,
+  coalesce(f.TopComments, '') as TopCommentsSnippet
+from final_rank f
+where
+  (
+    (f.AgeBucket = 'Recent' and f.RankWithinAge <= 50)
+    or
+    (f.AgeBucket = 'Old' and f.RankWithinAge <= 50)
+  )
+  and (
+    f.QSDecile >= 5
+    or (f.TopicBucket = 'DB' and f.NetVotes >= 0)
+  )
+  and (
+    f.CloseState <> 'Closed'
+    or (f.CloseState = 'Closed' and f.NetVotes >= 10)
+  )
+order by f.AgeBucket, f.RankWithinAge, f.QuestionId;

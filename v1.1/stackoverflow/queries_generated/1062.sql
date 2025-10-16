@@ -1,0 +1,64 @@
+-- {"query": "1062.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4o-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 402} 
+
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS Rank
+    FROM 
+        Posts p
+    WHERE 
+        p.PostTypeId = 1 
+        AND p.CreationDate >= NOW() - INTERVAL '1 year'
+),
+UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(COALESCE(c.Score, 0)) AS TotalCommentScore,
+        SUM(p.ViewCount) AS TotalViews,
+        AVG(p.Score) AS AverageScore
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN 
+        Comments c ON p.Id = c.PostId
+    GROUP BY 
+        u.Id
+),
+TopUsers AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.PostCount,
+        us.TotalCommentScore,
+        us.TotalViews,
+        us.AverageScore,
+        RANK() OVER (ORDER BY us.PostCount DESC) AS UserRank
+    FROM 
+        UserStats us
+    WHERE 
+        us.PostCount > 0
+)
+SELECT 
+    tu.DisplayName,
+    tu.PostCount,
+    tu.TotalCommentScore,
+    tu.TotalViews,
+    tu.AverageScore,
+    COALESCE(rp.Title, 'No Posts') AS LatestPostTitle,
+    COALESCE(rp.CreationDate, 'N/A') AS LatestPostDate
+FROM 
+    TopUsers tu
+LEFT JOIN 
+    RankedPosts rp ON tu.UserId = rp.PostId
+WHERE 
+    tu.UserRank <= 10
+ORDER BY 
+    tu.UserRank;

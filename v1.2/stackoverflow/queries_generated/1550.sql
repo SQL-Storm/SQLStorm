@@ -1,0 +1,178 @@
+-- {"query": "1550.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1796} 
+with RecursiveUserBadges as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over(partition by u.Id order by b.Class, b.Date) as BadgeRank
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where b.Class in (1,2,3)
+),
+PostsSummary as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        upper(coalesce(p.OwnerDisplayName, u.DisplayName, '')) as OwnerName,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        coalesce(array_length(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'),1),0) as TagCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.AcceptedAnswerId,
+        coalesce(p.AnswerCount,0) as AnswerCount,
+        row_number() over (partition by p.OwnerUserId, p.PostTypeId order by p.CreationDate desc) as RecentPostRank
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId in (1,2)
+),
+LastEdits as (
+    select distinct on (ph.PostId)
+        ph.PostId,
+        ph.CreationDate as LastEditDate,
+        ph.UserId as LastEditorUserId,
+        ph.UserDisplayName as LastEditorName,
+        ph.PostHistoryTypeId
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4,5,6) -- Title/Edit/Tags edits
+    order by ph.PostId, ph.CreationDate desc
+),
+DuplicateLinks as (
+    select pl.PostId, pl.RelatedPostId
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where lt.Name = 'Duplicate'
+),
+QuestionsClosedInfo as (
+    select 
+        ph.PostId, 
+        min(case when ph.PostHistoryTypeId=10 then to_number(ph.Comment,'999') else null end) as CloseReasonId,
+        min(ph.CreationDate) as FirstClosedDate,
+        max(ph.CreationDate) filter (where ph.PostHistoryTypeId=11) as LastReopenedDate
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10,11)
+    group by ph.PostId
+),
+UserRanks as (
+    select u.Id as UserId,
+           dense_rank() over (order by u.Reputation desc) as ReputationRank,
+           rank() over (order by u.CreationDate) as GrowthRank
+    from Users u
+),
+AskerAnswererDiffs as (
+    select 
+        q.Id as QuestionId,
+        q.OwnerUserId as QuestionOwnerId,
+        q.Score as QuestionScore,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswerOwnerId,
+        a.Score as AnswerScore,
+        exists (select 1 from Votes v where v.PostId = a.Id and v.VoteTypeId = 1) as IsAcceptedAnswer
+    from Posts q
+    join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+CTE_final as (
+    select 
+        ps.Id as PostId,
+        ps.PostTypeId,
+        ps.OwnerUserId,
+        ps.OwnerName,
+        ps.Title,
+        ps.Score,
+        ps.ViewCount,
+        ps.TagCount,
+        ps.CreationDate,
+        ps.LastActivityDate,
+        le.LastEditorUserId,
+        coalesce(le.LastEditorName, 'UNKNOWN') as LastEditorName,
+        li.RelatedPostId as DuplicateOfPost,
+        qr.CloseReasonId,
+        qr.FirstClosedDate,
+        ur.ReputationRank,
+        ur.GrowthRank,
+        dub.BadgeName,
+        dub.Class as BadgeClass,
+        (case when ps.PostCount > 100 then true else false end) as ProlificUser,
+        row_number() over(partition by ps.OwnerUserId order by ps.CreationDate desc) as UserPostRank,
+        
+        -- complex score with index hints, null logic and async negation
+        floor(coalesce(ps.Score::float / greatest(1, (ps.ViewCount + NULLIF(ps.TagCount,0) + 1)), 0) 
+              * (1 + (select count(*) from Badges b2 where b2.UserId=ps.OwnerUserId)::float / 100)) as AdjustedScore,
+              
+        -- string transformation complexity
+        concat(
+            lower(regexp_replace(split_part(ps.OwnerName, ' ', 1), '[^a-z0-9]', '', 'g')), '_',
+            substring(regexp_replace(coalesce(ps.Title, 'Notitle'),'\\s+','_','g') from 1 for 20),
+            '_', 
+            to_char(ps.CreationDate, 'YYYYMMdd')
+        ) as FriendlyPostInfo,
+
+        row_number() over (partition by ps.PostTypeId order by ps.Score desc, ps.ViewCount DESC NULLS LAST) as PostRankWithinType
+    from PostsSummary ps
+    left join LastEdits le on ps.Id = le.PostId
+    left join DuplicateLinks li on ps.Id = li.PostId
+    left join QuestionsClosedInfo qr on ps.Id = qr.PostId
+    left join UserRanks ur on ps.OwnerUserId = ur.UserId
+    left join RecursiveUserBadges dub on (ps.OwnerUserId = dub.UserId and dub.BadgeRank = 1)
+)
+select distinct
+    f.PostId,
+    f.PostTypeId,
+    f.OwnerUserId,
+    f.OwnerName,
+    f.Title,
+    f.Score,
+    f.ViewCount,
+    f.TagCount,
+    f.CreationDate,
+    f.LastActivityDate,
+    f.LastEditorUserId,
+    f.LastEditorName,
+    f.DuplicateOfPost,
+    crt.Name as CloseReason,
+    f.FirstClosedDate,
+    f.ReputationRank,
+    f.GrowthRank,
+    f.BadgeName,
+    f.BadgeClass,
+    f.ProlificUser,
+    f.UserPostRank,
+    f.AdjustedScore,
+    f.FriendlyPostInfo,
+    f.PostRankWithinType,
+    -- Complex subquery: Top tags by answers count for this post owner, reveals self-reference and grouping
+    (
+      select string_agg(t.TagName, ', ') 
+      from (
+          select unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as TagName,
+          count(*) over (partition by unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><'))) as TagFrequency
+          from Posts p 
+          where p.PostTypeId = 2 and p.OwnerUserId = f.OwnerUserId and p.CreationDate > (current_date - interval '180 day')
+      ) t
+      group by t.TagName
+      order by max(t.TagFrequency) desc nulls last
+      limit 3
+    ) as TopTagsLast180Days,
+    -- Window statistics comparing answers scores provided by user relative to all others within date bands
+    avg(a.Score) over (partition by a.OwnerUserId order by a.CreationDate rows between 30 preceding and current row) as AvgAnswerScore30days,
+    count(a.Id) filter (where a.Score > 10) over (partition by a.OwnerUserId) as HighScoreAnswerCount,
+    vulnerable_internal.question_diff_metrics.AdjustedAnswerAvgScore
+from CTE_final f
+left join Posts a on a.OwnerUserId = f.OwnerUserId and a.PostTypeId = 2 and a.CreationDate > (now() - interval '60 day')
+left join CloseReasonTypes crt on crt.Id = f.CloseReasonId
+left join (
+    select 
+      aad.QuestionOwnerId, 
+      aad.AnswerOwnerId,
+      avg(aad.AnswerScore) as AdjustedAnswerAvgScore
+    from AskerAnswererDiffs aad
+    where aad.IsAcceptedAnswer = true
+    group by aad.QuestionOwnerId, aad.AnswerOwnerId
+) vulnerable_internal.question_diff_metrics on vulnerable_internal.question_diff_metrics.AnswerOwnerId = f.OwnerUserId
+where f.Score >= 5 and (f.TagCount > 0 or f.PostTypeId = 1)
+order by f.CreationDate desc
+limit 100;

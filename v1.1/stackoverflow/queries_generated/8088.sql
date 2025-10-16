@@ -1,0 +1,329 @@
+-- {"query": "8088.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3376} 
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        coalesce(nullif(trim(split_part(coalesce(u.location, ''), ',', 1)), ''), 'Unknown') as country_guess,
+        date_trunc('month', u.creationdate) as signup_month
+    from users u
+    where u.creationdate >= now() - interval '5 years'
+),
+post_base as (
+    select
+        p.id,
+        p.posttypeid,
+        p.owneruserid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.answercount,
+        p.commentcount,
+        p.favoritecount,
+        p.closeddate,
+        p.title,
+        p.tags,
+        (p.posttypeid = 1)::int as is_question,
+        (p.posttypeid = 2)::int as is_answer
+    from posts p
+    where p.creationdate >= now() - interval '5 years'
+),
+tag_expanded as (
+    select
+        pb.id as post_id,
+        lower(trim(t)) as tag
+    from post_base pb
+    cross join lateral unnest(
+        case
+            when pb.tags is null then array[]::text[]
+            else string_to_array(substring(pb.tags, 2, greatest(length(pb.tags)-2,0)), '><')
+        end
+    ) as t
+),
+qstats as (
+    select
+        pb.owneruserid as user_id,
+        count(*) filter (where pb.posttypeid = 1) as q_count,
+        avg(nullif(pb.viewcount,0)) filter (where pb.posttypeid = 1) as avg_q_views,
+        avg(pb.score) filter (where pb.posttypeid = 1) as avg_q_score,
+        percentile_cont(0.9) within group (order by pb.score) filter (where pb.posttypeid = 1) as p90_q_score
+    from post_base pb
+    group by pb.owneruserid
+),
+astats as (
+    select
+        pb.owneruserid as user_id,
+        count(*) filter (where pb.posttypeid = 2) as a_count,
+        avg(pb.score) filter (where pb.posttypeid = 2) as avg_a_score
+    from post_base pb
+    group by pb.owneruserid
+),
+commenters as (
+    select
+        c.userid as user_id,
+        count(*) as comment_count,
+        avg(c.score) as avg_comment_score
+    from comments c
+    where c.creationdate >= now() - interval '5 years'
+    group by c.userid
+),
+badges_agg as (
+    select
+        b.userid as user_id,
+        count(*) as badge_count,
+        count(*) filter (where b.class = 1) as gold_count,
+        count(*) filter (where b.class = 2) as silver_count,
+        count(*) filter (where b.class = 3) as bronze_count,
+        max(b.date) as last_badge_date
+    from badges b
+    where b.date >= now() - interval '5 years'
+    group by b.userid
+),
+votes_agg as (
+    select
+        v.userid as user_id,
+        count(*) filter (where v.votetypeid = 2) as upvotes_cast,
+        count(*) filter (where v.votetypeid = 3) as downvotes_cast,
+        count(*) filter (where v.votetypeid = 5) as favorites_cast,
+        count(*) filter (where v.votetypeid = 8) as bounties_started,
+        sum(coalesce(v.bountyamount,0)) filter (where v.votetypeid in (8,9)) as bounty_amount_total
+    from votes v
+    where v.creationdate >= now() - interval '5 years'
+    group by v.userid
+),
+dup_links as (
+    select
+        pl.postid as dup_post_id,
+        pl.relatedpostid as original_post_id,
+        min(pl.creationdate) as first_dup_link_date
+    from postlinks pl
+    where pl.linktypeid = 3
+    group by pl.postid, pl.relatedpostid
+),
+closed_reasons as (
+    select
+        ph.postid,
+        min(ph.creationdate) as first_closed_at,
+        min(
+            case
+                when ph.posthistorytypeid = 10 then
+                    nullif(regexp_replace(ph.comment, '[^0-9]', '', 'g'), '')::int
+                else null
+            end
+        ) as close_reason_id
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11)
+    group by ph.postid
+),
+tag_popularity as (
+    select
+        te.tag,
+        count(distinct te.post_id) as tag_posts,
+        sum(pb.viewcount) as tag_views,
+        avg(pb.score) as tag_avg_score,
+        row_number() over (order by count(distinct te.post_id) desc nulls last, te.tag) as tag_rank_by_posts
+    from tag_expanded te
+    join post_base pb on pb.id = te.post_id and pb.posttypeid = 1
+    group by te.tag
+),
+user_tag_mix as (
+    select
+        pb.owneruserid as user_id,
+        count(distinct te.tag) filter (where tp.tag_rank_by_posts <= 50) as top50_tag_diversity,
+        count(distinct te.tag) as total_tag_diversity,
+        max(tp.tag_rank_by_posts) filter (where tp.tag is not null) as worst_rank_tag_used,
+        min(tp.tag_rank_by_posts) filter (where tp.tag is not null) as best_rank_tag_used
+    from post_base pb
+    left join tag_expanded te on te.post_id = pb.id
+    left join tag_popularity tp on tp.tag = te.tag
+    group by pb.owneruserid
+),
+answer_accepts as (
+    select
+        a.owneruserid as user_id,
+        count(*) as answers_with_accepts
+    from posts q
+    join posts a on a.parentid = q.id and a.posttypeid = 2
+    where q.acceptedanswerid = a.id
+      and a.creationdate >= now() - interval '5 years'
+    group by a.owneruserid
+),
+activity_monthly as (
+    select
+        u.id as user_id,
+        date_trunc('month', p.creationdate) as month,
+        count(*) filter (where p.posttypeid = 1) as q_monthly,
+        count(*) filter (where p.posttypeid = 2) as a_monthly,
+        count(c.id) as comments_monthly
+    from users u
+    left join posts p on p.owneruserid = u.id and p.creationdate >= now() - interval '5 years'
+    left join comments c on c.userid = u.id and c.creationdate >= now() - interval '5 years' and date_trunc('month', c.creationdate) = date_trunc('month', p.creationdate)
+    group by u.id, date_trunc('month', p.creationdate)
+),
+activity_trends as (
+    select
+        user_id,
+        avg(q_monthly) over (partition by user_id rows between 5 preceding and current row) as q_mavg_6,
+        avg(a_monthly) over (partition by user_id rows between 5 preceding and current row) as a_mavg_6,
+        avg(comments_monthly) over (partition by user_id rows between 5 preceding and current row) as c_mavg_6
+    from activity_monthly
+),
+recent_answers_latency as (
+    select
+        a.owneruserid as user_id,
+        percentile_cont(0.5) within group (order by extract(epoch from (a.creationdate - q.creationdate)) / 3600.0) as p50_answer_latency_hours,
+        percentile_cont(0.9) within group (order by extract(epoch from (a.creationdate - q.creationdate)) / 3600.0) as p90_answer_latency_hours
+    from posts q
+    join posts a on a.parentid = q.id and a.posttypeid = 2
+    where a.creationdate >= now() - interval '5 years'
+    group by a.owneruserid
+),
+user_core as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.creationdate as user_created,
+        ru.country_guess,
+        ru.signup_month,
+        coalesce(qs.q_count,0) as q_count,
+        coalesce(qs.avg_q_views,0) as avg_q_views,
+        coalesce(qs.avg_q_score,0) as avg_q_score,
+        coalesce(qs.p90_q_score,0) as p90_q_score,
+        coalesce(as2.a_count,0) as a_count,
+        coalesce(as2.avg_a_score,0) as avg_a_score,
+        coalesce(cm.comment_count,0) as comment_count,
+        coalesce(cm.avg_comment_score,0) as avg_comment_score,
+        coalesce(b.badge_count,0) as badge_count,
+        coalesce(b.gold_count,0) as gold_count,
+        coalesce(b.silver_count,0) as silver_count,
+        coalesce(b.bronze_count,0) as bronze_count,
+        b.last_badge_date,
+        coalesce(v.upvotes_cast,0) as upvotes_cast,
+        coalesce(v.downvotes_cast,0) as downvotes_cast,
+        coalesce(v.favorites_cast,0) as favorites_cast,
+        coalesce(v.bounties_started,0) as bounties_started,
+        coalesce(v.bounty_amount_total,0) as bounty_amount_total,
+        coalesce(ua.answers_with_accepts,0) as answers_with_accepts,
+        coalesce(ut.top50_tag_diversity,0) as top50_tag_diversity,
+        coalesce(ut.total_tag_diversity,0) as total_tag_diversity,
+        ut.best_rank_tag_used,
+        ut.worst_rank_tag_used
+    from recent_users ru
+    left join qstats qs on qs.user_id = ru.user_id
+    left join astats as2 on as2.user_id = ru.user_id
+    left join commenters cm on cm.user_id = ru.user_id
+    left join badges_agg b on b.user_id = ru.user_id
+    left join votes_agg v on v.user_id = ru.user_id
+    left join answer_accepts ua on ua.user_id = ru.user_id
+    left join user_tag_mix ut on ut.user_id = ru.user_id
+),
+question_outcomes as (
+    select
+        pb.owneruserid as user_id,
+        count(*) filter (where cr.first_closed_at is not null) as q_closed_count,
+        count(*) filter (where dl.dup_post_id is not null) as q_marked_dup_count,
+        count(*) filter (where cr.close_reason_id = 101) as q_closed_duplicate_reason_count,
+        avg(extract(epoch from (coalesce(cr.first_closed_at, pb.creationdate) - pb.creationdate)) / 3600.0) filter (where cr.first_closed_at is not null) as avg_hours_to_close
+    from post_base pb
+    left join closed_reasons cr on cr.postid = pb.id
+    left join dup_links dl on dl.dup_post_id = pb.id
+    where pb.posttypeid = 1
+    group by pb.owneruserid
+),
+ranked_users as (
+    select
+        uc.*,
+        coalesce(qo.q_closed_count,0) as q_closed_count,
+        coalesce(qo.q_marked_dup_count,0) as q_marked_dup_count,
+        coalesce(qo.q_closed_duplicate_reason_count,0) as q_closed_duplicate_reason_count,
+        qo.avg_hours_to_close,
+        case
+            when uc.a_count + uc.q_count + uc.comment_count = 0 then 0
+            else (uc.a_count*3 + uc.q_count*2 + uc.comment_count*0.5) end as activity_score,
+        case
+            when uc.a_count = 0 then null
+            else (uc.answers_with_accepts::numeric / uc.a_count) end as accept_rate,
+        coalesce(ral.p50_answer_latency_hours, null) as p50_answer_latency_hours,
+        coalesce(ral.p90_answer_latency_hours, null) as p90_answer_latency_hours
+    from user_core uc
+    left join question_outcomes qo on qo.user_id = uc.user_id
+    left join recent_answers_latency ral on ral.user_id = uc.user_id
+),
+final_scored as (
+    select
+        ru.*,
+        ntile(10) over (order by coalesce(ru.activity_score,0) desc, ru.reputation desc) as activity_decile,
+        rank() over (order by (coalesce(ru.avg_a_score,0) + coalesce(ru.avg_q_score,0)) desc, ru.reputation desc, coalesce(ru.badge_count,0) desc) as quality_rank,
+        dense_rank() over (order by coalesce(ru.top50_tag_diversity,0) desc, coalesce(ru.total_tag_diversity,0) desc) as diversity_rank
+    from ranked_users ru
+)
+select
+    fs.user_id,
+    fs.displayname,
+    fs.country_guess,
+    fs.reputation,
+    fs.signup_month,
+    fs.activity_score,
+    fs.activity_decile,
+    fs.quality_rank,
+    fs.diversity_rank,
+    fs.q_count,
+    fs.a_count,
+    fs.comment_count,
+    fs.accept_rate,
+    round(coalesce(fs.avg_q_views,0)::numeric,2) as avg_q_views,
+    round(coalesce(fs.avg_q_score,0)::numeric,2) as avg_q_score,
+    round(coalesce(fs.avg_a_score,0)::numeric,2) as avg_a_score,
+    fs.p50_answer_latency_hours,
+    fs.p90_answer_latency_hours,
+    fs.q_closed_count,
+    fs.q_marked_dup_count,
+    fs.q_closed_duplicate_reason_count,
+    fs.avg_hours_to_close,
+    fs.badge_count,
+    fs.gold_count,
+    fs.silver_count,
+    fs.bronze_count,
+    fs.last_badge_date,
+    fs.upvotes_cast,
+    fs.downvotes_cast,
+    fs.favorites_cast,
+    fs.bounties_started,
+    fs.bounty_amount_total,
+    fs.top50_tag_diversity,
+    fs.total_tag_diversity,
+    fs.best_rank_tag_used,
+    fs.worst_rank_tag_used,
+    case
+        when fs.downvotes_cast > fs.upvotes_cast then 'Contrarian'
+        when fs.upvotes_cast >= fs.downvotes_cast * 5 then 'Generous'
+        when fs.upvotes_cast is null and fs.downvotes_cast is null then 'Inactive'
+        else 'Balanced'
+    end as voting_style,
+    case
+        when fs.activity_decile <= 2 and fs.quality_rank <= 50 then 'Rising star'
+        when fs.activity_decile >= 9 and fs.quality_rank > 500 then 'Needs focus'
+        when fs.diversity_rank <= 10 then 'Generalist'
+        else 'Specialist'
+    end as persona
+from final_scored fs
+where
+    -- complex predicate combining NULL logic, text pattern, and ratios
+    (
+        fs.accept_rate is null
+        or fs.accept_rate >= 0.2
+        or (fs.a_count > 20 and fs.p90_answer_latency_hours < 72)
+    )
+  and coalesce(fs.country_guess, '') ~* '(^us|^united|^canada|^germany|^india|^uk)'
+  and (
+        fs.badge_count >= 5
+        or (fs.reputation >= 500 and fs.activity_score >= 10)
+        or (fs.q_marked_dup_count = 0 and fs.q_count >= 5)
+      )
+order by
+    fs.activity_decile asc,
+    fs.quality_rank asc,
+    fs.user_id
+limit 250;

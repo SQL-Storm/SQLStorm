@@ -1,0 +1,163 @@
+WITH ActiveUsers AS (
+  SELECT 
+    u.Id AS UserId,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    COUNT(DISTINCT p.Id) AS PostCount,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+    AVG(p.Score) AS AvgPostScore
+  FROM Users u
+  INNER JOIN Posts p ON u.Id = p.OwnerUserId
+  WHERE u.Reputation >= 1000
+    AND u.LastAccessDate > CAST('2024-10-01' AS date) - INTERVAL '1 year'
+    AND p.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '5 years'
+  GROUP BY u.Id, u.Reputation, u.CreationDate
+  HAVING COUNT(DISTINCT p.Id) >= 5
+),
+TagActivity AS (
+  SELECT 
+    t.Id AS TagId,
+    t.TagName,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionUsage,
+    AVG(p.Score) AS AvgQuestionScore,
+    PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY p.Score) AS P90Score,
+    STRING_AGG(DISTINCT SUBSTRING(p.Title FROM 1 FOR 50), ' | ') AS SampleTitles
+  FROM Tags t
+  INNER JOIN Posts p ON t.TagName = ANY(
+    STRING_TO_ARRAY(
+      SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2),
+      '><'
+    )
+  )
+  WHERE p.PostTypeId = 1
+    AND p.Score IS NOT NULL
+    AND p.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '3 years'
+  GROUP BY t.Id, t.TagName
+  HAVING COUNT(DISTINCT p.Id) >= 10
+),
+UserTagContributions AS (
+  SELECT 
+    au.UserId,
+    ta.TagId,
+    COUNT(p.Id) AS ContributionCount,
+    SUM(p.Score) AS TotalScore,
+    AVG(p.Score) AS AvgScore,
+    MAX(p.CreationDate) AS LastContribution
+  FROM ActiveUsers au
+  INNER JOIN Posts p ON au.UserId = p.OwnerUserId
+  INNER JOIN TagActivity ta ON ta.TagName = ANY(
+    STRING_TO_ARRAY(
+      SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2),
+      '><'
+    )
+  )
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '2 years'
+  GROUP BY au.UserId, ta.TagId
+),
+BadgeAchievements AS (
+  SELECT 
+    b.UserId,
+    b.Name AS BadgeName,
+    b.Date AS AwardDate,
+    b.Class,
+    ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS RecencyRank,
+    LAG(b.Date) OVER (PARTITION BY b.UserId ORDER BY b.Date) AS PreviousBadgeDate
+  FROM Badges b
+  INNER JOIN ActiveUsers au ON b.UserId = au.UserId
+  WHERE b.Date > CAST('2024-10-01' AS date) - INTERVAL '1 year'
+),
+VotePatterns AS (
+  SELECT 
+    v.PostId,
+    v.UserId,
+    vt.Name AS VoteType,
+    COUNT(*) AS VoteCount,
+    MIN(v.CreationDate) AS FirstVote,
+    MAX(v.CreationDate) AS LastVote
+  FROM Votes v
+  INNER JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  INNER JOIN ActiveUsers au ON v.UserId = au.UserId
+  WHERE v.VoteTypeId IN (2, 3) -- Upvotes and Downvotes only
+    AND v.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '6 months'
+  GROUP BY v.PostId, v.UserId, vt.Name
+)
+SELECT 
+  au.UserId,
+  u.DisplayName,
+  au.Reputation,
+  au.QuestionCount,
+  au.AnswerCount,
+  utc.TagId,
+  ta.TagName,
+  utc.ContributionCount,
+  utc.AvgScore,
+  COALESCE(ba.BadgeName, 'No Recent Badges') AS RecentBadge,
+  CASE 
+    WHEN utc.LastContribution > CAST('2024-10-01' AS date) - INTERVAL '1 month' THEN 'Very Active'
+    WHEN utc.LastContribution > CAST('2024-10-01' AS date) - INTERVAL '3 months' THEN 'Active'
+    ELSE 'Less Active'
+  END AS ActivityLevel,
+  RANK() OVER (
+    PARTITION BY utc.TagId 
+    ORDER BY utc.ContributionCount DESC, utc.AvgScore DESC
+  ) AS TagRank,
+  DENSE_RANK() OVER (
+    ORDER BY au.Reputation DESC, au.PostCount DESC
+  ) AS OverallUserRank,
+  CONCAT(
+    UPPER(SUBSTRING(u.Location FROM 1 FOR 1)), 
+    LOWER(SUBSTRING(u.Location FROM 2)),
+    ' - ',
+    CAST(EXTRACT(YEAR FROM au.UserCreationDate) AS VARCHAR),
+    ' - ',
+    COALESCE(CAST(ba.PreviousBadgeDate AS VARCHAR), 'N/A')
+  ) AS ProfileSummary,
+  CASE 
+    WHEN au.AvgPostScore IS NULL THEN '0'
+    WHEN au.AvgPostScore < 5 THEN 'Low Impact'
+    WHEN au.AvgPostScore BETWEEN 5 AND 15 THEN 'Medium Impact'
+    ELSE 'High Impact'
+  END AS ImpactCategory,
+  (SELECT AVG(vp.VoteCount) 
+   FROM VotePatterns vp 
+   WHERE vp.UserId = au.UserId 
+     AND vp.VoteType = 'UpMod') AS AvgUpvotesPerPost,
+  SUM(utc.ContributionCount) OVER (
+    PARTITION BY ta.TagName 
+    ORDER BY utc.AvgScore DESC 
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS CumulativeContributions,
+  ta.QuestionUsage
+FROM ActiveUsers au
+INNER JOIN Users u ON au.UserId = u.Id
+LEFT OUTER JOIN UserTagContributions utc ON au.UserId = utc.UserId
+LEFT OUTER JOIN TagActivity ta ON utc.TagId = ta.TagId
+LEFT OUTER JOIN BadgeAchievements ba ON au.UserId = ba.UserId 
+  AND ba.RecencyRank = 1
+LEFT OUTER JOIN VotePatterns vp ON au.UserId = vp.UserId 
+  AND vp.VoteType = 'UpMod'
+WHERE (utc.ContributionCount > 0 OR ba.BadgeName IS NOT NULL)
+  AND (ta.QuestionUsage > 50 OR ta.QuestionUsage IS NULL)
+  AND au.Reputation BETWEEN 1000 AND 50000
+  AND (u.Location IS NULL OR u.Location <> '')
+  AND NOT EXISTS (
+    SELECT 1 FROM PostHistory ph
+    INNER JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    WHERE ph.UserId = au.UserId 
+      AND ph.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = au.UserId)
+      AND pht.Name IN ('Post Deleted', 'Post Locked')
+      AND ph.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '1 year'
+  )
+GROUP BY 
+  au.UserId, u.DisplayName, au.Reputation, au.QuestionCount, au.AnswerCount,
+  utc.TagId, ta.TagName, utc.ContributionCount, utc.AvgScore,
+  ba.BadgeName, utc.LastContribution, au.AvgPostScore, u.Location,
+  au.UserCreationDate, ba.PreviousBadgeDate, ta.QuestionUsage
+HAVING COUNT(DISTINCT utc.TagId) >= 1
+   OR SUM(utc.ContributionCount) > 10
+ORDER BY 
+  au.Reputation DESC, 
+  utc.AvgScore DESC,
+  ta.QuestionUsage DESC;

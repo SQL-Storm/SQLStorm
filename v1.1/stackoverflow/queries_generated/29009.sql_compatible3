@@ -1,0 +1,77 @@
+SELECT
+    ca.PostId,
+    ca.OwnerUserId,
+    ca.CreationDate,
+    ca.Score,
+    ca.ViewCount,
+    ca.TagList,
+    ca.HasCommentsAfterCreation,
+    ca.Level,
+    ca.TotalVotes,
+    ca.PostRankPerUser,
+    (100.0 * (1.0 - (COUNT(*) FILTER (WHERE ca.Score > ca.Score) OVER ()))) AS ScorePercentileRank,
+    LAG(ca.Score, 1) OVER (ORDER BY ca.Score DESC) - ca.Score AS ScoreDiffFromPrev,
+    LEAD(ca.TagList, 1) OVER (ORDER BY ca.Score DESC) AS NextHigherTagList,
+    CASE 
+        WHEN ca.HasCommentsAfterCreation = TRUE
+             AND EXISTS (
+                 SELECT 1 FROM PostHistory ph 
+                 WHERE ph.PostId = ca.PostId AND ph.PostHistoryTypeId IN (2,5,8)
+             ) THEN 'Edited_With_Comments'
+        WHEN ca.HasCommentsAfterCreation = TRUE THEN 'Has_Comments'
+        WHEN EXISTS (
+             SELECT 1 FROM PostHistory ph 
+             WHERE ph.PostId = ca.PostId AND ph.PostHistoryTypeId IN (2,5,8)
+        ) THEN 'Edited_Only'
+        ELSE 'Unchanged'
+    END AS ContentModificationStatus,
+    NULLIF(
+        (SELECT COUNT(*) FROM PostHistory ph 
+         WHERE ph.PostId = ca.PostId AND ph.PostHistoryTypeId IN (10,11,12,13,14,15)
+        ), 0
+    ) AS PostStatusChangeCount,
+    CASE 
+        WHEN ca.Score > 0 AND ca.ViewCount > 0 THEN 
+            (CAST(ca.Score AS DOUBLE PRECISION) / NULLIF(CAST(ca.ViewCount AS DOUBLE PRECISION), 0)) * 100
+        ELSE 0
+    END AS ScoreToViewRatio,
+    CASE 
+        WHEN ca.TagList = 'No_Tags' THEN 0
+        ELSE CHAR_LENGTH(ca.TagList)
+    END AS TagLength,
+    (SELECT STRING_AGG(b.Name || '(' || b.Class || ')', ', ') 
+     FROM Badges b 
+     WHERE b.UserId = ca.OwnerUserId 
+       AND b.Class = 1 
+       AND b.Date > DATE '2020-01-01'
+    ) AS RecentGoldBadges,
+    ROW_NUMBER() OVER (ORDER BY ca.CreationDate DESC) AS RecentPostRank,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 FROM Posts p2 
+            WHERE p2.ParentId = ca.PostId AND p2.PostTypeId = 2
+        ) THEN 'Question_With_Answers'
+        WHEN ca.PostId IN (
+            SELECT ParentId FROM Posts WHERE PostTypeId = 2
+        ) THEN 'Answer_To_Question'
+        ELSE 'Orphaned_Post'
+    END AS PostTypeCategory
+FROM "ComplexPostAnalysis" ca
+WHERE ca.PostId IS NOT NULL
+  AND ca.Level <= 3
+  AND ca.TotalVotes >= 0
+  AND ca.PostRankPerUser <= 5
+  AND (ca.Score > 0 OR ca.ViewCount > 0)
+GROUP BY
+    ca.PostId,
+    ca.OwnerUserId,
+    ca.CreationDate,
+    ca.Score,
+    ca.ViewCount,
+    ca.TagList,
+    ca.HasCommentsAfterCreation,
+    ca.Level,
+    ca.TotalVotes,
+    ca.PostRankPerUser
+ORDER BY ca.Score DESC, ca.CreationDate DESC
+LIMIT 1000;

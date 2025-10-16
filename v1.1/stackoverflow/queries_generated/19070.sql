@@ -1,0 +1,265 @@
+-- {"query": "19070.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3333} 
+
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        COALESCE(U.DisplayName, 'AnonymousUser') AS UserDisplayName,
+        COALESCE(U.Location, 'Global') AS UserLocation,
+        U.Reputation,
+        U.UpVotes,
+        U.DownVotes,
+        U.Views AS ProfileViews,
+        EXTRACT(YEAR FROM U.CreationDate) AS AccountCreationYear,
+        RANK() OVER (PARTITION BY COALESCE(U.Location, 'Global') ORDER BY U.Reputation DESC, U.LastAccessDate DESC) AS LocationReputationRank,
+        (SELECT COUNT(B.Id) FROM Badges B WHERE B.UserId = U.Id AND B.Class = 1) AS GoldBadgesCount,
+        (SELECT COUNT(DISTINCT P.Id) FROM Posts P WHERE P.OwnerUserId = U.Id AND P.PostTypeId = 1) AS QuestionsPosted,
+        (SELECT COUNT(DISTINCT P.Id) FROM Posts P WHERE P.OwnerUserId = U.Id AND P.PostTypeId = 2) AS AnswersPosted,
+        (SELECT MAX(PH.CreationDate) FROM PostHistory PH WHERE PH.UserId = U.Id) AS LastContributionDate
+    FROM Users U
+    WHERE U.Reputation > 100 -- Focus on more active users
+),
+PostContentAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        P.AcceptedAnswerId,
+        COALESCE(P.Title, 'Untitled Post') AS PostTitle,
+        COALESCE(P.Tags, '<untagged>') AS PostTags,
+        LENGTH(P.Body) AS BodyCharacterCount,
+        P.CreationDate AS PostCreationDate,
+        P.LastActivityDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount AS PostTableCommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        -- Extract the primary tag (first tag)
+        NULLIF(SUBSTRING(P.Tags, 2, POSITION('>' IN P.Tags) - 2), '') AS PrimaryTag,
+        -- Check if post contains specific keywords in body (example)
+        CASE
+            WHEN LOWER(P.Body) LIKE '%performance%' OR LOWER(P.Body) LIKE '%optimization%' THEN TRUE
+            ELSE FALSE
+        END AS ContainsPerformanceKeywords,
+        -- Correlated subquery: Count unique users who edited this post
+        (SELECT COUNT(DISTINCT PH.UserId)
+         FROM PostHistory PH
+         WHERE PH.PostId = P.Id
+           AND PH.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Body, Tags
+           AND PH.UserId IS NOT NULL) AS EditorCount,
+        -- Correlated subquery: Get the latest close reason (if applicable)
+        (SELECT CRC.Name FROM PostHistory PH_close JOIN CloseReasonTypes CRC ON PH_close.Comment = CAST(CRC.Id AS VARCHAR) WHERE PH_close.PostId = P.Id AND PH_close.PostHistoryTypeId = 10 ORDER BY PH_close.CreationDate DESC LIMIT 1) AS LatestCloseReason
+    FROM Posts P
+    INNER JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    WHERE P.CreationDate >= '2020-01-01' -- Filter for recent activity
+      AND P.Score >= 0
+      AND P.Body IS NOT NULL
+),
+CommentEngagementMetrics AS (
+    SELECT
+        C.PostId,
+        COUNT(C.Id) AS TotalCommentsReceived,
+        AVG(C.Score) AS AvgCommentScore,
+        SUM(CASE WHEN LOWER(C.Text) LIKE '%thank%' OR LOWER(C.Text) LIKE '%appreciate%' THEN 1 ELSE 0 END) AS ThanksComments,
+        SUM(CASE WHEN C.UserId IS NOT NULL THEN 1 ELSE 0 END) AS AuthoredComments,
+        -- Calculate the median length of comments for each post
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY LENGTH(C.Text)) AS MedianCommentLength
+    FROM Comments C
+    GROUP BY C.PostId
+),
+PostLinkageAndVotes AS (
+    SELECT
+        P.Id AS PostId,
+        COALESCE(SUM(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE 0 END), 0) AS LinkedToCount, -- How many other posts link to this one
+        COALESCE(SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END), 0) AS DuplicateOfCount, -- How many other posts are duplicates of this one
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpvotesCount,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownvotesCount,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 1 THEN 1 ELSE 0 END), 0) AS AcceptedAnswerVotes,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 8 THEN V.BountyAmount ELSE 0 END), 0) AS BountyStartedSum
+    FROM Posts P
+    LEFT JOIN PostLinks PL ON P.Id = PL.RelatedPostId -- Posts that *are* linked/duplicated
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    GROUP BY P.Id
+),
+FinalCombinedPosts AS (
+    SELECT
+        PCA.PostId,
+        PCA.PostTypeId,
+        PCA.PostTypeName,
+        PCA.OwnerUserId,
+        UAS.UserDisplayName AS PostOwnerName,
+        UAS.UserLocation,
+        UAS.Reputation,
+        PCA.PostTitle,
+        PCA.PrimaryTag,
+        PCA.PostCreationDate,
+        PCA.LastActivityDate,
+        PCA.PostScore,
+        PCA.ViewCount,
+        PCA.AnswerCount,
+        PCA.FavoriteCount,
+        PCA.ClosedDate,
+        PCA.BodyCharacterCount,
+        PCA.EditorCount,
+        PCA.LatestCloseReason,
+        PCA.ContainsPerformanceKeywords,
+        CE.TotalCommentsReceived,
+        CE.AvgCommentScore,
+        CE.ThanksComments,
+        CE.AuthoredComments,
+        CE.MedianCommentLength,
+        PLV.LinkedToCount,
+        PLV.DuplicateOfCount,
+        PLV.UpvotesCount,
+        PLV.DownvotesCount,
+        PLV.AcceptedAnswerVotes,
+        PLV.BountyStartedSum,
+        -- Calculate effective score considering comments and favorites
+        (PCA.PostScore * 2.0) + (COALESCE(CE.AvgCommentScore, 0) * COALESCE(CE.TotalCommentsReceived, 0) * 0.5) + (COALESCE(PCA.FavoriteCount, 0) * 3.0) AS WeightedEngagementScore,
+        -- Ratio of Upvotes to Downvotes, handle division by zero or nulls
+        NULLIF(CAST(COALESCE(PLV.UpvotesCount, 0) AS DECIMAL), 0) / NULLIF(CAST(COALESCE(PLV.DownvotesCount, 0), 1) AS DECIMAL) AS UpvoteDownvoteRatio,
+        -- Time since creation to last activity in hours, coalesce with a large default if no activity
+        COALESCE(EXTRACT(EPOCH FROM (PCA.LastActivityDate - PCA.PostCreationDate)) / 3600.0, 0) AS ActivitySpanHours,
+        -- Window function: Average score of posts by the same owner within their creation month
+        AVG(PCA.PostScore) OVER (PARTITION BY PCA.OwnerUserId, EXTRACT(MONTH FROM PCA.PostCreationDate), EXTRACT(YEAR FROM PCA.PostCreationDate)) AS AvgOwnerMonthlyPostScore,
+        -- Window function: Rank posts by engagement score within their primary tag
+        DENSE_RANK() OVER (PARTITION BY PCA.PrimaryTag ORDER BY (PCA.PostScore + PCA.FavoriteCount) DESC) AS RankWithinPrimaryTag,
+        -- Correlated subquery for Accepted Answer Score if it's a Question
+        (SELECT P_ACC.Score FROM Posts P_ACC WHERE P_ACC.Id = PCA.AcceptedAnswerId AND PCA.PostTypeId = 1) AS AcceptedAnswerScore
+    FROM PostContentAnalysis PCA
+    LEFT JOIN UserActivitySummary UAS ON PCA.OwnerUserId = UAS.UserId
+    LEFT JOIN CommentEngagementMetrics CE ON PCA.PostId = CE.PostId
+    LEFT JOIN PostLinkageAndVotes PLV ON PCA.PostId = PLV.PostId
+),
+QuestionsWithHighEngagement AS (
+    SELECT
+        FCP.PostId,
+        'Question' AS RecordType,
+        UPPER(SUBSTRING(FCP.PostTitle, 1, 1)) || LOWER(SUBSTRING(FCP.PostTitle, 2, 80)) || CASE WHEN LENGTH(FCP.PostTitle) > 80 THEN '...' ELSE '' END AS FormattedTitle,
+        FCP.PostOwnerName,
+        FCP.PostCreationDate,
+        FCP.PostScore,
+        FCP.ViewCount,
+        FCP.AnswerCount,
+        FCP.WeightedEngagementScore,
+        FCP.UpvoteDownvoteRatio,
+        FCP.PrimaryTag,
+        FCP.GoldBadgesCount AS OwnerGoldBadges,
+        FCP.TotalCommentsReceived,
+        FCP.ActivitySpanHours,
+        FCP.AcceptedAnswerScore,
+        FCP.AvgOwnerMonthlyPostScore,
+        FCP.RankWithinPrimaryTag,
+        FCP.EditorCount,
+        FCP.ContainsPerformanceKeywords,
+        FCP.LatestCloseReason,
+        FCP.LinkedToCount,
+        FCP.DuplicateOfCount,
+        NULL AS ParentQuestionTitle, -- Not applicable for questions
+        'N/A' AS TimeSinceParentPostHours -- Not applicable for questions
+    FROM FinalCombinedPosts FCP
+    WHERE FCP.PostTypeId = 1 -- Only Questions
+      AND FCP.WeightedEngagementScore > 50
+      AND FCP.ActivitySpanHours > 24 -- Active for at least a day
+      AND FCP.AcceptedAnswerId IS NOT NULL -- Only questions with an accepted answer
+),
+AnswersToHighlyViewedQuestions AS (
+    SELECT
+        FCP.PostId,
+        'Answer' AS RecordType,
+        UPPER(SUBSTRING(FCP.PostTitle, 1, 1)) || LOWER(SUBSTRING(FCP.PostTitle, 2, 80)) || CASE WHEN LENGTH(FCP.PostTitle) > 80 THEN '...' ELSE '' END AS FormattedTitle,
+        FCP.PostOwnerName,
+        FCP.PostCreationDate,
+        FCP.PostScore,
+        FCP.ViewCount, -- This refers to the parent question's view count implicitly through join
+        NULL AS AnswerCount, -- Not applicable for answers
+        FCP.WeightedEngagementScore,
+        FCP.UpvoteDownvoteRatio,
+        FCP.PrimaryTag, -- This is the parent question's primary tag
+        FCP.GoldBadgesCount AS OwnerGoldBadges,
+        FCP.TotalCommentsReceived,
+        FCP.ActivitySpanHours,
+        NULL AS AcceptedAnswerScore, -- Not applicable for answers
+        FCP.AvgOwnerMonthlyPostScore,
+        FCP.RankWithinPrimaryTag,
+        FCP.EditorCount,
+        FCP.ContainsPerformanceKeywords,
+        FCP.LatestCloseReason,
+        FCP.LinkedToCount,
+        FCP.DuplicateOfCount,
+        Q.PostTitle AS ParentQuestionTitle,
+        EXTRACT(EPOCH FROM (FCP.PostCreationDate - Q.PostCreationDate)) / 3600.0 AS TimeSinceParentPostHours -- Time from question creation to answer
+    FROM FinalCombinedPosts FCP
+    INNER JOIN Posts P_PARENT ON FCP.PostId = P_PARENT.Id
+    INNER JOIN PostContentAnalysis Q ON P_PARENT.ParentId = Q.PostId
+    WHERE FCP.PostTypeId = 2 -- Only Answers
+      AND FCP.PostScore > 10
+      AND Q.ViewCount > 1000 -- Parent question must be highly viewed
+      AND FCP.OwnerUserId IS NOT NULL -- Only answers by registered users
+      AND FCP.BodyCharacterCount BETWEEN 100 AND 2000 -- Filter by answer length
+)
+-- Final result: Combine highly engaged questions and answers to highly viewed questions
+SELECT
+    RecordType,
+    PostId,
+    FormattedTitle,
+    PostOwnerName,
+    PostCreationDate,
+    PostScore,
+    ViewCount,
+    AnswerCount,
+    WeightedEngagementScore,
+    UpvoteDownvoteRatio,
+    PrimaryTag,
+    OwnerGoldBadges,
+    TotalCommentsReceived,
+    ActivitySpanHours,
+    AcceptedAnswerScore,
+    AvgOwnerMonthlyPostScore,
+    RankWithinPrimaryTag,
+    EditorCount,
+    ContainsPerformanceKeywords,
+    LatestCloseReason,
+    LinkedToCount,
+    DuplicateOfCount,
+    ParentQuestionTitle,
+    TimeSinceParentPostHours,
+    NULLIF(PostScore + COALESCE(TotalCommentsReceived, 0), 0) AS PostActivityScore -- Example using NULLIF
+FROM QuestionsWithHighEngagement
+WHERE PrimaryTag LIKE 'sql%' -- Filter for specific tags
+  AND ContainsPerformanceKeywords = TRUE
+  AND EditorCount > 0
+UNION ALL
+SELECT
+    RecordType,
+    PostId,
+    FormattedTitle,
+    PostOwnerName,
+    PostCreationDate,
+    PostScore,
+    ViewCount,
+    AnswerCount,
+    WeightedEngagementScore,
+    UpvoteDownvoteRatio,
+    PrimaryTag,
+    OwnerGoldBadges,
+    TotalCommentsReceived,
+    ActivitySpanHours,
+    AcceptedAnswerScore,
+    AvgOwnerMonthlyPostScore,
+    RankWithinPrimaryTag,
+    EditorCount,
+    ContainsPerformanceKeywords,
+    LatestCloseReason,
+    LinkedToCount,
+    DuplicateOfCount,
+    ParentQuestionTitle,
+    TimeSinceParentPostHours,
+    NULLIF(PostScore + COALESCE(TotalCommentsReceived, 0), 0) AS PostActivityScore
+FROM AnswersToHighlyViewedQuestions
+WHERE UpvoteDownvoteRatio > 1.5 -- Answers with significantly more upvotes than downvotes
+  AND TimeSinceParentPostHours BETWEEN 1.0 AND 72.0 -- Answered within 3 days
+ORDER BY PostCreationDate DESC, WeightedEngagementScore DESC
+LIMIT 5000;

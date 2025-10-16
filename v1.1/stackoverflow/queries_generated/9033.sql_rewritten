@@ -1,0 +1,141 @@
+-- {"query": "9033.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2013, "output_tokens": 4290} 
+WITH
+-- Get each user’s most recent questions
+recent_posts AS (
+  SELECT
+    p.Id,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+-- Summarize up‐ and down‐votes per post
+vote_summary AS (
+  SELECT
+    PostId,
+    SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+  FROM Votes
+  GROUP BY PostId
+),
+-- FULL OUTER JOIN recent posts to their vote summary (to force a heavier plan)
+post_vote_join AS (
+  SELECT
+    COALESCE(rp.Id, vs.PostId) AS PostId,
+    rp.OwnerUserId,
+    rp.Score,
+    rp.ViewCount,
+    vs.UpVotes,
+    vs.DownVotes
+  FROM recent_posts rp
+  FULL OUTER JOIN vote_summary vs
+    ON vs.PostId = rp.Id
+),
+-- Explode tag arrays into one row per tag
+tag_expansion AS (
+  SELECT
+    p.Id       AS PostId,
+    UNNEST(
+      string_to_array(
+        substring(p.Tags, 2, length(p.Tags) - 2),
+        '><'
+      )
+    ) AS TagName
+  FROM Posts p
+  WHERE p.Tags IS NOT NULL
+),
+-- Rank tags by overall popularity
+tag_popularity AS (
+  SELECT
+    te.TagName,
+    COUNT(*)            AS TagCount,
+    RANK() OVER (ORDER BY COUNT(*) DESC) AS TagRank
+  FROM tag_expansion te
+  GROUP BY te.TagName
+),
+-- Aggregate per‐user statistics with various expressions, NULL logic, string ops
+user_stats AS (
+  SELECT
+    u.Id                       AS UserId,
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS Questions,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS Answers,
+    COALESCE(AVG(c.Score), 0)   AS AvgCommentScore,
+    COALESCE(SUM(vs.UpVotes), 0) AS TotalUpVotes,
+    COALESCE(SUM(vs.DownVotes), 0) AS TotalDownVotes,
+    COALESCE(
+      STRING_AGG(DISTINCT te.TagName, ',' ORDER BY te.TagName),
+      ''
+    )                         AS InterestedTags
+  FROM Users u
+  LEFT JOIN Posts p
+    ON p.OwnerUserId = u.Id
+  LEFT JOIN Comments c
+    ON c.UserId = u.Id
+  LEFT JOIN vote_summary vs
+    ON vs.PostId = p.Id
+  LEFT JOIN tag_expansion te
+    ON te.PostId = p.Id
+  GROUP BY u.Id, u.DisplayName
+),
+-- Enrich users with their single top‐ranked tag (via a correlated LATERAL subquery)
+candidates AS (
+  SELECT
+    us.*,
+    NULLIF(us.TotalUpVotes, us.TotalDownVotes) AS VoteDiff,
+    CASE
+      WHEN us.Questions > us.Answers THEN 'Asker'
+      ELSE 'Responder'
+    END                                       AS Role,
+    tp.TagName                               AS TopTag
+  FROM user_stats us
+  LEFT JOIN LATERAL (
+    SELECT tp.TagName
+    FROM tag_popularity tp
+    WHERE tp.TagName = ANY(string_to_array(us.InterestedTags, ','))
+    ORDER BY tp.TagRank
+    LIMIT 1
+  ) tp ON true
+),
+-- Form a benchmarking set via UNION and EXCEPT
+benchmark_set AS (
+  SELECT
+    UserId, DisplayName, Questions, Answers, AvgCommentScore,
+    TotalUpVotes, TotalDownVotes, VoteDiff, Role, TopTag
+  FROM candidates
+  WHERE AvgCommentScore > (SELECT AVG(AvgCommentScore) FROM user_stats)
+  
+  UNION ALL
+  
+  SELECT
+    u.Id, u.DisplayName, 0, 0, 0, 0, 0, 0, 'Dormant', NULL
+  FROM Users u
+  WHERE NOT EXISTS (
+    SELECT 1
+      FROM Posts p
+     WHERE p.OwnerUserId = u.Id
+  )
+)
+-- Final projection with window functions, complex CASE/NULLIF, and EXCEPT
+SELECT
+  bs.*,
+  CASE
+    WHEN VoteDiff > 0 THEN VoteDiff
+    ELSE 0
+  END                                         AS PositiveDiff,
+  (bs.TotalUpVotes * 100.0 /
+     NULLIF(bs.TotalUpVotes + bs.TotalDownVotes, 0)
+  )::NUMERIC(5,2)                             AS UpPercentage
+FROM benchmark_set bs
+EXCEPT
+SELECT
+  UserId, DisplayName, Questions, Answers, AvgCommentScore,
+  TotalUpVotes, TotalDownVotes, VoteDiff, Role, TopTag,
+  /* these two columns must match the SELECT list above: */
+  CASE WHEN VoteDiff > 0 THEN VoteDiff ELSE 0 END,
+  (TotalUpVotes * 100.0 / NULLIF(TotalUpVotes + TotalDownVotes, 0))::NUMERIC(5,2)
+FROM candidates
+WHERE Role = 'Asker';

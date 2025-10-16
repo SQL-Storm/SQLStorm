@@ -1,0 +1,84 @@
+-- {"query": "11025.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 620} 
+WITH RecentPosts AS (
+    SELECT 
+        p.Id, 
+        p.Title, 
+        p.CreationDate, 
+        p.Score, 
+        p.ViewCount, 
+        u.DisplayName AS OwnerDisplayName, 
+        u.Reputation AS OwnerReputation,
+        COUNT(v.Id) AS VoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount
+    FROM 
+        Posts p
+    INNER JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    WHERE 
+        p.CreationDate > cast('2024-10-01' as date) - INTERVAL '1 month'
+    GROUP BY 
+        p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT 
+        OwnerUserId, 
+        COUNT(Id) AS PostCount, 
+        AVG(Score) AS AvgScore, 
+        SUM(ViewCount) AS TotalViews
+    FROM 
+        Posts
+    GROUP BY 
+        OwnerUserId
+    HAVING 
+        COUNT(Id) > 10
+),
+PostTags AS (
+    SELECT 
+        p.Id AS PostId, 
+        string_to_array(substring(p.Tags, 2, length(p.Tags)-2), ''><'') AS Tags
+    FROM 
+        Posts p
+),
+TagFrequency AS (
+    SELECT 
+        unnest(Tags) AS TagName, 
+        COUNT(*) AS Frequency
+    FROM 
+        PostTags
+    GROUP BY 
+        TagName
+)
+SELECT 
+    rp.Id, 
+    rp.Title, 
+    rp.CreationDate, 
+    rp.Score, 
+    rp.ViewCount, 
+    rp.OwnerDisplayName, 
+    rp.OwnerReputation, 
+    rp.VoteCount, 
+    rp.UpVoteCount, 
+    rp.DownVoteCount, 
+    tu.PostCount, 
+    tu.AvgScore, 
+    tu.TotalViews, 
+    tg.TagName, 
+    tg.Frequency
+FROM 
+    RecentPosts rp
+INNER JOIN 
+    TopUsers tu ON rp.Id = tu.OwnerUserId
+LEFT JOIN 
+    PostTags pt ON rp.Id = pt.PostId
+LEFT JOIN 
+    TagFrequency tg ON pt.TagName = tg.TagName
+WHERE 
+    rp.Score > (SELECT AVG(Score) FROM Posts)
+ORDER BY 
+    rp.Score DESC, 
+    rp.ViewCount DESC, 
+    tg.Frequency DESC
+LIMIT 10;

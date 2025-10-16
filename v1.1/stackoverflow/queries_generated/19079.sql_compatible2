@@ -1,0 +1,207 @@
+WITH UserEngagementStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate AS UserLastAccessDate,
+        DATE_PART('day', u.LastAccessDate - u.CreationDate) AS UserAccountAgeDays,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        (SELECT COUNT(DISTINCT p_sub.Id) FROM Posts p_sub WHERE p_sub.OwnerUserId = u.Id AND p_sub.PostTypeId IN (1, 2)) AS TotalPostsContributions,
+        (SELECT COUNT(DISTINCT c_sub.Id) FROM Comments c_sub WHERE c_sub.UserId = u.Id) AS TotalCommentsMade,
+        (COALESCE(u.Reputation, 0) * 0.5 + COALESCE(u.UpVotes, 0) * 0.2 - COALESCE(u.DownVotes, 0) * 0.1 + COUNT(DISTINCT b.Id) * 5) AS CalculatedEngagementScore,
+        EXISTS(SELECT 1 FROM Posts p_q WHERE p_q.OwnerUserId = u.Id AND p_q.PostTypeId = 1) AS HasPostedQuestion
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes, u.CreationDate, u.LastAccessDate
+),
+PostActivityDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.Title,
+        p.Body,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount AS PostCommentCount,
+        p.FavoriteCount,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate,
+        p.LastEditDate,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        p.Tags,
+        (SELECT COUNT(pv.Id) FROM Votes pv WHERE pv.PostId = p.Id AND pv.VoteTypeId = 2) AS PostUpVotes,
+        (SELECT COUNT(pv.Id) FROM Votes pv WHERE pv.PostId = p.Id AND pv.VoteTypeId = 3) AS PostDownVotes,
+        (SELECT ph.UserId FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6) ORDER BY ph.CreationDate DESC LIMIT 1) AS LastEditorUserId,
+        (SELECT ph.CreationDate FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6) ORDER BY ph.CreationDate DESC LIMIT 1) AS LatestEditHistoryDate,
+        (SELECT c.CreationDate FROM Comments c WHERE c.PostId = p.Id ORDER BY c.CreationDate ASC LIMIT 1) AS FirstCommentCreationDate,
+        (SELECT SUBSTRING(c.Text FROM 1 FOR 100) FROM Comments c WHERE c.PostId = p.Id ORDER BY c.CreationDate ASC LIMIT 1) AS FirstCommentExcerpt,
+        EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS HasDuplicateLink,
+        (SELECT COUNT(*) FROM PostHistory ph_mig WHERE ph_mig.PostId = p.Id AND ph_mig.PostHistoryTypeId IN (17, 35, 36)) AS MigrationCount
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.OwnerUserId IS NOT NULL
+      AND p.CreationDate IS NOT NULL
+),
+PostTagAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        LOWER(TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR CASE WHEN p.Tags IS NULL THEN 0 ELSE LENGTH(p.Tags) - 2 END), '><')))) AS TagName
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+),
+BaseQueryResult AS (
+    SELECT
+        ues.UserId,
+        ues.DisplayName,
+        ues.Reputation,
+        ues.CalculatedEngagementScore,
+        pa.PostId,
+        pa.PostTypeName,
+        pa.Title,
+        pa.Body,
+        pa.PostScore,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.PostCommentCount,
+        pa.FavoriteCount,
+        pa.OwnerUserId,
+        pa.AcceptedAnswerId,
+        pa.ParentId,
+        pa.PostCreationDate,
+        pa.LastActivityDate,
+        pa.LatestEditHistoryDate,
+        pa.FirstCommentExcerpt,
+        pa.HasDuplicateLink,
+        pa.MigrationCount,
+        pa.PostTypeId,
+        RANK() OVER (PARTITION BY pa.PostTypeId, EXTRACT(YEAR FROM pa.PostCreationDate) ORDER BY pa.PostScore DESC, pa.ViewCount DESC) AS RankByScoreInTypeAndYear,
+        AVG(pa.PostScore) OVER (PARTITION BY ues.UserId ORDER BY pa.PostCreationDate ROWS BETWEEN 30 PRECEDING AND CURRENT ROW) AS RollingAvgPostScoreByUser,
+        LAG(pa.PostScore, 1, 0) OVER (PARTITION BY ues.UserId ORDER BY pa.PostCreationDate) AS PrevPostScoreByUser,
+        CASE
+            WHEN pa.ClosedDate IS NOT NULL AND COALESCE(pa.PostScore, 0) < 0 THEN 'Closed & Low Quality'
+            WHEN pa.PostTypeId = 1 AND COALESCE(pa.AnswerCount, 0) = 0 AND pa.PostCreationDate < CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year' THEN 'Unanswered Old Question'
+            WHEN COALESCE(pa.PostScore, 0) >= 100 AND COALESCE(pa.ViewCount, 0) >= 10000 AND COALESCE(pa.FavoriteCount, 0) >= 50 THEN 'Viral & Highly Favorited'
+            WHEN COALESCE(pa.PostScore, 0) BETWEEN 50 AND 99 AND COALESCE(pa.ViewCount, 0) BETWEEN 5000 AND 9999 THEN 'Popular & Good'
+            WHEN pa.CommunityOwnedDate IS NOT NULL AND COALESCE(pa.PostScore, 0) >= 20 THEN 'Community Vetted & Valued'
+            WHEN pa.PostScore IS NULL OR pa.ViewCount IS NULL OR pa.FavoriteCount IS NULL THEN 'Data Missing/New'
+            ELSE 'Regular Activity'
+        END AS PostQualityCategory,
+        (COALESCE(pa.PostScore, 0) * LOG(COALESCE(pa.ViewCount, 1) + 1) + (COALESCE(ues.Reputation, 0) / 1000.0) * 0.1) AS HotnessMetric,
+        UPPER(COALESCE((SELECT MIN(pta.TagName) FROM PostTagAnalysis pta WHERE pta.PostId = pa.PostId), 'NO_TAGS')) AS PrimaryTag,
+        DATE_PART('hour', pa.FirstCommentCreationDate - pa.PostCreationDate) AS TimeToFirstCommentHours,
+        (pa.Body ILIKE '%performance%' OR pa.Body ILIKE '%optimization%' OR pa.Body ILIKE '%benchmark%') AS ContainsPerformanceKeywords,
+        (SELECT AVG(p2.Score) FROM Posts p2
+         INNER JOIN PostTagAnalysis pta2 ON p2.Id = pta2.PostId
+         WHERE p2.OwnerUserId = ues.UserId
+           AND p2.CreationDate <= pa.PostCreationDate
+           AND pta2.TagName IN (
+               SELECT pta3.TagName FROM PostTagAnalysis pta3
+               WHERE pta3.PostId IN (
+                   SELECT p4.Id FROM Posts p4
+                   WHERE p4.OwnerUserId = ues.UserId
+                   ORDER BY p4.CreationDate DESC LIMIT 10
+               )
+               GROUP BY pta3.TagName
+               ORDER BY COUNT(*) DESC LIMIT 3
+           )
+        ) AS AvgScoreForUsersRecentTopTags
+    FROM UserEngagementStats ues
+    JOIN PostActivityDetails pa ON ues.UserId = pa.OwnerUserId
+    WHERE ues.Reputation >= 500
+      AND pa.PostScore IS NOT NULL
+      AND pa.Title IS NOT NULL AND LENGTH(pa.Title) > 15
+      AND pa.PostCreationDate BETWEEN DATE '2019-01-01' AND DATE '2023-12-31'
+    GROUP BY
+        ues.UserId, ues.DisplayName, ues.Reputation, ues.CalculatedEngagementScore,
+        pa.PostId, pa.PostTypeName, pa.Title, pa.Body, pa.PostScore, pa.ViewCount, pa.AnswerCount,
+        pa.PostCommentCount, pa.FavoriteCount, pa.OwnerUserId, pa.AcceptedAnswerId, pa.ParentId,
+        pa.PostCreationDate, pa.LastActivityDate, pa.LatestEditHistoryDate, pa.FirstCommentExcerpt,
+        pa.HasDuplicateLink, pa.MigrationCount, pa.PostTypeId, pa.ClosedDate, pa.CommunityOwnedDate,
+        pa.FirstCommentCreationDate
+)
+SELECT
+    b.DisplayName,
+    b.Reputation,
+    b.CalculatedEngagementScore,
+    b.PostTypeName,
+    b.Title,
+    b.PostScore,
+    b.ViewCount,
+    (SELECT COUNT(pv.Id) FROM Votes pv WHERE pv.PostId = b.PostId AND pv.VoteTypeId = 2) AS PostUpVotes,
+    (SELECT COUNT(pv.Id) FROM Votes pv WHERE pv.PostId = b.PostId AND pv.VoteTypeId = 3) AS PostDownVotes,
+    b.PostCommentCount,
+    b.FavoriteCount,
+    b.PrimaryTag,
+    b.PostQualityCategory,
+    b.HotnessMetric,
+    b.RankByScoreInTypeAndYear,
+    b.RollingAvgPostScoreByUser,
+    b.PrevPostScoreByUser,
+    b.TimeToFirstCommentHours,
+    b.HasDuplicateLink,
+    b.MigrationCount,
+    b.ContainsPerformanceKeywords,
+    b.AvgScoreForUsersRecentTopTags,
+    'QuestionAnalysis' AS ResultCategory,
+    b.PostCreationDate
+FROM BaseQueryResult b
+WHERE b.PostTypeId = 1
+  AND b.AnswerCount > 0
+  AND b.HotnessMetric > 50
+  AND b.HasDuplicateLink = FALSE
+  AND COALESCE(b.TimeToFirstCommentHours, 9999) < 48
+  AND b.ContainsPerformanceKeywords = TRUE
+  AND b.AvgScoreForUsersRecentTopTags IS NOT NULL
+  AND b.PostQualityCategory NOT LIKE 'Closed%'
+
+UNION ALL
+
+SELECT
+    b.DisplayName,
+    b.Reputation,
+    b.CalculatedEngagementScore,
+    b.PostTypeName,
+    b.Title,
+    b.PostScore,
+    b.ViewCount,
+    (SELECT COUNT(pv.Id) FROM Votes pv WHERE pv.PostId = b.PostId AND pv.VoteTypeId = 2) AS PostUpVotes,
+    (SELECT COUNT(pv.Id) FROM Votes pv WHERE pv.PostId = b.PostId AND pv.VoteTypeId = 3) AS PostDownVotes,
+    b.PostCommentCount,
+    b.FavoriteCount,
+    b.PrimaryTag,
+    b.PostQualityCategory,
+    b.HotnessMetric,
+    b.RankByScoreInTypeAndYear,
+    b.RollingAvgPostScoreByUser,
+    b.PrevPostScoreByUser,
+    b.TimeToFirstCommentHours,
+    b.HasDuplicateLink,
+    b.MigrationCount,
+    b.ContainsPerformanceKeywords,
+    b.AvgScoreForUsersRecentTopTags,
+    'AcceptedAnswerAnalysis' AS ResultCategory,
+    b.PostCreationDate
+FROM BaseQueryResult b
+WHERE b.PostTypeId = 2
+  AND b.PostId = (SELECT q.AcceptedAnswerId FROM Posts q WHERE q.Id = b.ParentId AND q.PostTypeId = 1)
+  AND b.PostScore >= 20
+  AND b.PostQualityCategory LIKE 'Viral%'
+  AND b.LatestEditHistoryDate IS NOT NULL
+  AND COALESCE(b.TimeToFirstCommentHours, 9999) <= 72
+  AND b.MigrationCount = 0
+  AND b.OwnerUserId = (SELECT q_owner.OwnerUserId FROM Posts q_owner WHERE q_owner.Id = b.ParentId)
+
+ORDER BY Reputation DESC, HotnessMetric DESC, PostCreationDate DESC
+LIMIT 5000;

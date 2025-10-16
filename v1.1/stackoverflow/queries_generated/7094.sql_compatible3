@@ -1,0 +1,202 @@
+WITH
+recent_qs AS (
+  SELECT
+    p.id,
+    p.title,
+    p.creationdate,
+    p.lastactivitydate,
+    p.viewcount,
+    p.score,
+    p.answercount,
+    p.owneruserid,
+    NULLIF(p.tags,'') AS raw_tags,
+    CASE WHEN p.tags IS NULL THEN NULL
+         ELSE regexp_split_to_array(substring(p.tags FROM 2 FOR char_length(p.tags)-2), '\>\<')
+    END AS tag_array
+  FROM posts p
+  WHERE p.posttypeid = 1
+    AND p.creationdate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+),
+answers_agg AS (
+  SELECT
+    a.parentid AS questionid,
+    count(*) FILTER (WHERE a.score >= 0) AS pos_answer_count,
+    count(*) FILTER (WHERE a.score < 0) AS neg_answer_count,
+    max(a.score) AS top_answer_score,
+    avg(a.score) AS avg_answer_score,
+    sum(CASE WHEN a.id = q.acceptedanswerid THEN 1 ELSE 0 END) AS has_accepted
+  FROM posts a
+  JOIN posts q ON q.id = a.parentid
+  WHERE a.posttypeid = 2
+    AND a.creationdate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '730 days'
+  GROUP BY a.parentid, q.acceptedanswerid
+),
+user_stats AS (
+  SELECT
+    u.id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.viewcount,
+    coalesce(b.badge_gold,0) AS gold_badges,
+    coalesce(b.badge_silver,0) AS silver_badges,
+    coalesce(b.badge_bronze,0) AS bronze_badges,
+    u.lastaccessdate,
+    (SELECT max(p.creationdate) FROM posts p WHERE p.owneruserid = u.id) AS last_post_date,
+    CASE WHEN u.downvotes IS NULL OR u.upvotes IS NULL THEN NULL
+         WHEN u.downvotes = 0 THEN NULL
+         ELSE (1.0 * u.upvotes) / NULLIF(u.downvotes,0)
+    END AS up_down_ratio
+  FROM users u
+  LEFT JOIN (
+    SELECT userid,
+      sum(CASE WHEN class = 1 THEN 1 ELSE 0 END) AS badge_gold,
+      sum(CASE WHEN class = 2 THEN 1 ELSE 0 END) AS badge_silver,
+      sum(CASE WHEN class = 3 THEN 1 ELSE 0 END) AS badge_bronze
+    FROM badges
+    GROUP BY userid
+  ) b ON b.userid = u.id
+),
+question_enrichment AS (
+  SELECT
+    q.id,
+    q.title,
+    q.creationdate,
+    q.lastactivitydate,
+    q.viewcount,
+    q.score,
+    q.answercount,
+    q.owneruserid,
+    q.raw_tags,
+    q.tag_array,
+    ua.top_answer_score,
+    ua.pos_answer_count,
+    ua.neg_answer_count,
+    ua.avg_answer_score,
+    ua.has_accepted,
+    (SELECT count(DISTINCT c.userid)
+     FROM comments c
+     WHERE c.postid = q.id
+       AND c.userid IS NOT NULL
+       AND c.userid <> q.owneruserid) AS distinct_commenters,
+    (SELECT count(*) FROM postlinks pl WHERE pl.relatedpostid = q.id) AS inbound_links,
+    (SELECT count(*) FROM postlinks pl WHERE pl.relatedpostid = q.id AND pl.linktypeid = 3) AS duplicate_count,
+    ph.last_edit_date,
+    ph.edit_count,
+    (SELECT coalesce(sum(t.count),0)
+     FROM tags t
+     WHERE EXISTS (
+       SELECT 1 FROM unnest(q.tag_array) AS tagname WHERE tagname = t.tagname
+     )
+    ) AS tag_popularity_sum
+  FROM recent_qs q
+  LEFT JOIN (
+    SELECT ph.postid,
+      max(ph.creationdate) AS last_edit_date,
+      count(*) AS edit_count
+    FROM posthistory ph
+    WHERE ph.posthistorytypeid IN (4,5,6,7,8,9,24,66)
+    GROUP BY ph.postid
+  ) ph ON ph.postid = q.id
+  LEFT JOIN answers_agg ua ON ua.questionid = q.id
+),
+hotness AS (
+  SELECT
+    qe.*,
+    (
+      coalesce(qe.viewcount,0) * 0.001
+      + coalesce(qe.score,0) * 5
+      + coalesce(qe.answercount,0) * 10
+      + coalesce(qe.pos_answer_count,0) * 3
+      - coalesce(qe.neg_answer_count,0) * 5
+      + coalesce(qe.top_answer_score,0) * 2
+      + coalesce(qe.tag_popularity_sum,0) * 0.02
+      + coalesce(qe.inbound_links,0) * 1.5
+      + coalesce(qe.edit_count,0) * 0.5
+      + CASE WHEN qe.has_accepted > 0 THEN -20 ELSE 0 END
+      + CASE WHEN qe.distinct_commenters > 5 THEN 15 ELSE qe.distinct_commenters * 2 END
+    ) AS hot_score,
+    row_number() OVER (ORDER BY
+      (coalesce(qe.viewcount,0) * 0.001
+      + coalesce(qe.score,0) * 5
+      + coalesce(qe.answercount,0) * 10
+      + coalesce(qe.pos_answer_count,0) * 3
+      - coalesce(qe.neg_answer_count,0) * 5
+      + coalesce(qe.top_answer_score,0) * 2
+      + coalesce(qe.tag_popularity_sum,0) * 0.02
+      + coalesce(qe.inbound_links,0) * 1.5
+      + coalesce(qe.edit_count,0) * 0.5
+      + CASE WHEN qe.has_accepted > 0 THEN -20 ELSE 0 END
+      + CASE WHEN qe.distinct_commenters > 5 THEN 15 ELSE qe.distinct_commenters * 2 END) DESC) AS hot_rank
+  FROM question_enrichment qe
+),
+tag_pairs AS (
+  SELECT
+    h.id AS questionid,
+    lower(trim(t1.tagname)) AS tag1,
+    lower(trim(t2.tagname)) AS tag2,
+    (h.hot_score * (1 / NULLIF(1 + greatest(1,
+       (SELECT coalesce(sum(count),0) FROM tags tt WHERE tt.tagname = lower(t1.tagname))
+    ),1))) AS pair_weight
+  FROM hotness h,
+  LATERAL unnest(h.tag_array) WITH ORDINALITY AS t1(tagname, ord1),
+  LATERAL unnest(h.tag_array) WITH ORDINALITY AS t2(tagname, ord2)
+  WHERE t1.ord1 < t2.ord2
+    AND h.hot_rank <= 200
+),
+tag_pair_agg AS (
+  SELECT tag1, tag2, count(DISTINCT questionid) AS cooccurrence_count, sum(pair_weight) AS total_weight
+  FROM tag_pairs
+  GROUP BY tag1, tag2
+  ORDER BY total_weight DESC
+  LIMIT 100
+)
+SELECT
+  h.hot_rank,
+  h.id AS question_id,
+  h.title,
+  substr(coalesce(regexp_replace((SELECT body FROM posts p WHERE p.id = h.id LIMIT 1), '<[^>]+>',' ','g'), ''),1,240) AS excerpt_plaintext,
+  h.creationdate,
+  h.lastactivitydate,
+  h.viewcount,
+  h.score AS question_score,
+  h.answercount,
+  h.pos_answer_count,
+  h.neg_answer_count,
+  h.top_answer_score,
+  h.avg_answer_score,
+  (h.has_accepted > 0) AS has_accepted,
+  h.distinct_commenters,
+  h.inbound_links,
+  h.duplicate_count,
+  h.edit_count,
+  h.tag_popularity_sum,
+  round(CAST(h.hot_score AS numeric),2) AS hot_score,
+  us.displayname AS owner_displayname,
+  us.reputation AS owner_reputation,
+  us.gold_badges,
+  us.silver_badges,
+  us.bronze_badges,
+  ba.best_answer_id,
+  ba.best_answer_score,
+  substr(coalesce(regexp_replace(ba.body,'<[^>]+>',' ','g'), ''),1,200) AS best_answer_excerpt,
+  (SELECT string_agg(tp.tag1 || '|' || tp.tag2 || ':' || tp.cooccurrence_count || '/' || round(CAST(tp.total_weight AS numeric),2), ', ')
+   FROM tag_pair_agg tp
+   WHERE tp.tag1 = ANY(h.tag_array) OR tp.tag2 = ANY(h.tag_array)
+   LIMIT 5
+  ) AS related_tag_pairs
+FROM hotness h
+LEFT JOIN LATERAL (
+  SELECT a.id AS best_answer_id, a.score AS best_answer_score, a.body
+  FROM posts a
+  WHERE a.posttypeid = 2
+    AND a.parentid = h.id
+  ORDER BY
+    CASE WHEN a.id = (SELECT acceptedanswerid FROM posts WHERE id = h.id) THEN 0 ELSE 1 END,
+    a.score DESC NULLS LAST,
+    a.creationdate DESC
+  LIMIT 1
+) ba ON TRUE
+LEFT JOIN users us ON us.id = h.owneruserid
+WHERE h.hot_rank BETWEEN 1 AND 200
+ORDER BY h.hot_score DESC, h.lastactivitydate DESC;

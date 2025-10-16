@@ -1,0 +1,138 @@
+-- {"query": "3026.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1008} 
+WITH TagUsageCTE AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        p.Title AS PostTitle,
+        p.CreationDate AS PostCreationDate,
+        u.DisplayName AS OwnerDisplayName,
+        CASE WHEN v.VoteTypeId IN (2,3) THEN
+            CASE WHEN v.VoteTypeId = 2 THEN 'Upvote' ELSE 'Downvote' END
+        ELSE NULL END AS VoteType,
+        ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY p.CreationDate DESC) AS RecentUsageRank
+    FROM
+        Tags t
+        LEFT JOIN Posts p ON t.WikiPostId = p.Id
+        LEFT JOIN Users u ON p.OwnerUserId = u.Id
+        LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE
+        t.IsModeratorOnly = FALSE
+        AND p.PostTypeId = 1
+        AND p.CreationDate >= NOW() - INTERVAL '1 year'
+),
+FilteredTagUsage AS (
+    SELECT
+        TagName,
+        Count,
+        PostTitle,
+        OwnerDisplayName,
+        VoteType
+    FROM
+        TagUsageCTE
+    WHERE
+        RecentUsageRank = 1
+),
+UserReputation AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        STRING_AGG(uc.TagName, ', ') AS TopTags,
+        MAX(u.LastAccessDate) OVER (PARTITION BY u.Id) AS LastAccess
+    FROM
+        Users u
+        LEFT JOIN Badges b ON u.Id = b.UserId
+        LEFT JOIN Tags uc ON uc.Id IN (
+            SELECT
+                TagId FROM Tags WHERE IsModeratorOnly = FALSE
+            ORDER BY
+                Count DESC
+            LIMIT 5
+        )
+    GROUP BY
+        u.Id, u.Reputation
+),
+PostActivity AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.AnswerCount,
+        (
+            SELECT
+                COUNT(*) FROM Comments c WHERE c.PostId = p.Id
+        ) AS CommentCount,
+        p.ViewCount,
+        p.Tags,
+        FIRST_VALUE(p.LastActivityDate) OVER (PARTITION BY p.Id ORDER BY p.LastEditDate DESC NULLS LAST) AS LastActive
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId = 1
+),
+ComplexJoin AS (
+    SELECT
+        pa.PostId,
+        pa.Title,
+        pa.CreationDate,
+        pa.Score,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.ViewCount,
+        pa.Tags,
+        ua.Reputation,
+        ua.TopTags,
+        ua.LastAccess,
+        lu.PostTitle AS LastRelatedPostTitle,
+        l.LinkTypeId,
+        CASE WHEN l.LinkTypeId = 3 THEN 'Duplicate' ELSE 'Linked' END AS LinkTypeName
+    FROM
+        PostActivity pa
+        LEFT JOIN UserReputation ua ON pa.OwnerUserId = ua.UserId
+        LEFT JOIN PostLinks l ON pa.PostId = l.PostId
+        LEFT JOIN Posts lu ON l.RelatedPostId = lu.Id
+        AND l.LinkTypeId IN (1,3)
+        LEFT JOIN Votes v ON pa.PostId = v.PostId
+        LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+        WHERE
+            (vt.Name = 'Upvote' OR vt.Name IS NULL)
+            AND pa.ViewCount > 100
+)
+SELECT
+    c.PostId,
+    c.Title,
+    c.CreationDate,
+    c.Score,
+    c.AnswerCount,
+    c.CommentCount,
+    c.ViewCount,
+    c.Tags,
+    c.Reputation,
+    c.TopTags,
+    c.LastAccess,
+    c.LastRelatedPostTitle,
+    c.LinkTypeName,
+    CASE WHEN c.Score + c.AnswerCount * 2 - c.CommentCount * 0.5 > 10 THEN 'Highly Engaged'
+         WHEN c.ViewCount > 1000 AND c.Reputation > 1000 THEN 'Influencer'
+         ELSE 'Average' END AS EngagementLevel,
+    STRING_AGG(TU.TagName || ': ' || TU.VoteType, '; ' ORDER BY TU.RecentUsageRank) AS LatestTagVotes
+FROM
+    ComplexJoin c
+    LEFT JOIN FilteredTagUsage TU ON c.Tags LIKE '%' || TU.TagName || '%'
+GROUP BY
+    c.PostId,
+    c.Title,
+    c.CreationDate,
+    c.Score,
+    c.AnswerCount,
+    c.CommentCount,
+    c.ViewCount,
+    c.Tags,
+    c.Reputation,
+    c.TopTags,
+    c.LastAccess,
+    c.LastRelatedPostTitle,
+    c.LinkTypeName
+ORDER BY
+    c.CreationDate DESC
+LIMIT 100;

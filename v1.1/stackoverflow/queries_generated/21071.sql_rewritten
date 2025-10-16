@@ -1,0 +1,147 @@
+-- {"query": "21071.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2168, "output_tokens": 1527} 
+WITH ActiveUsers AS (
+    SELECT u.Id, u.Reputation, u.CreationDate,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.UpVotes DESC) as RepRank,
+           LAG(u.Location) OVER (ORDER BY u.CreationDate) as PrevLocation
+    FROM Users u
+    WHERE u.Reputation > 1000
+      AND u.LastAccessDate > cast('2024-10-01' as date) - INTERVAL '1 year'
+      AND u.Location IS NOT NULL
+      AND LENGTH(u.Location) > 0
+),
+HighActivityPosts AS (
+    SELECT p.Id as PostId, p.OwnerUserId, p.CreationDate as PostDate, p.Score, p.ViewCount,
+           p.Title,
+           COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) as EngagementScore,
+           STRING_AGG(DISTINCT SUBSTRING(t.TagName, 1, 20), ' | ') as TopTags
+    FROM Posts p
+    LEFT JOIN (
+        SELECT Id, Tags
+        FROM Posts
+        WHERE Tags IS NOT NULL AND LENGTH(Tags) > 0
+    ) tag_posts ON p.Id = tag_posts.Id
+    CROSS JOIN LATERAL (
+        SELECT TagName
+        FROM (
+            SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(Tags, 2, LENGTH(Tags)-2), '><')) as tag
+        ) exploded
+        INNER JOIN Tags tg ON tg.TagName = exploded.tag
+        WHERE tg.Count > 50
+    ) t ON TRUE
+    WHERE p.PostTypeId = 1
+      AND p.Score > 5
+      AND p.ViewCount > 1000
+      AND p.CreationDate > cast('2024-10-01' as date) - INTERVAL '2 years'
+    GROUP BY p.Id, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Title, p.AnswerCount, p.CommentCount
+    HAVING COUNT(DISTINCT t.TagName) >= 2
+),
+UserPostStats AS (
+    SELECT au.Id as UserId,
+           COUNT(hap.PostId) as TotalPosts,
+           AVG(hap.Score) as AvgScore,
+           SUM(hap.ViewCount) as TotalViews,
+           MAX(hap.PostDate) as LatestPost,
+           COUNT(DISTINCT hap.TopTags) as UniqueTagSets,
+           CASE 
+               WHEN au.RepRank <= 10 THEN 'Elite'
+               WHEN au.RepRank <= 100 THEN 'Veteran'
+               ELSE 'Active'
+           END as RepTier
+    FROM ActiveUsers au
+    LEFT JOIN HighActivityPosts hap ON au.Id = hap.OwnerUserId
+    LEFT JOIN (
+        SELECT DISTINCT v.PostId, v.UserId
+        FROM Votes v
+        WHERE v.VoteTypeId IN (2, 3)  -- Up/Down votes
+          AND v.CreationDate > cast('2024-10-01' as date) - INTERVAL '1 year'
+    ) recent_voters ON au.Id = recent_voters.UserId AND hap.PostId = recent_voters.PostId
+    GROUP BY au.Id, au.Reputation, au.RepRank
+    HAVING COUNT(hap.PostId) > 0
+),
+BadgeAchievers AS (
+    SELECT b.UserId,
+           COUNT(*) as BadgeCount,
+           STRING_AGG(DISTINCT CASE WHEN b.Class = 1 THEN b.Name END, ', ') as GoldBadges,
+           MAX(b.Date) as LatestBadge
+    FROM Badges b
+    INNER JOIN ActiveUsers au ON b.UserId = au.Id
+    WHERE b.Date > cast('2024-10-01' as date) - INTERVAL '1 year'
+    GROUP BY b.UserId
+    HAVING COUNT(*) >= 3
+)
+SELECT 
+    ups.UserId,
+    u.DisplayName,
+    u.Location,
+    ups.RepTier,
+    ups.TotalPosts,
+    ROUND(ups.AvgScore, 2) as AvgPostScore,
+    ups.TotalViews,
+    COALESCE(ba.BadgeCount, 0) as BadgesEarned,
+    COALESCE(ba.GoldBadges, 'None') as GoldBadges,
+    DATEDIFF('day', u.CreationDate, COALESCE(ups.LatestPost, u.CreationDate)) as DaysActive,
+    (ups.TotalViews / NULLIF(ups.TotalPosts, 0)) as ViewsPerPost,
+    CASE 
+        WHEN au.PrevLocation IS NOT NULL AND au.PrevLocation != u.Location 
+        THEN CONCAT('Moved from ', au.PrevLocation)
+        ELSE 'Stable'
+    END as LocationChange,
+    RANK() OVER (PARTITION BY ups.RepTier ORDER BY ups.TotalViews DESC, ups.AvgScore DESC) as TierRank,
+    -- Complex string manipulation for fun
+    UPPER(SUBSTRING(u.DisplayName, 1, 1)) || LOWER(SUBSTRING(u.DisplayName, 2)) as FormattedName,
+    -- NULL-safe calculation with set-like logic
+    GREATEST(
+        COALESCE(ups.UniqueTagSets, 0),
+        (SELECT COUNT(DISTINCT pl.RelatedPostId) 
+         FROM PostLinks pl 
+         WHERE pl.PostId IN (SELECT PostId FROM HighActivityPosts WHERE OwnerUserId = ups.UserId)
+           AND pl.LinkTypeId = 3  -- Duplicates
+        ),
+        1
+    ) as NetworkInfluence
+FROM UserPostStats ups
+INNER JOIN Users u ON ups.UserId = u.Id
+INNER JOIN ActiveUsers au ON ups.UserId = au.Id
+LEFT JOIN BadgeAchievers ba ON ups.UserId = ba.UserId
+WHERE ups.TotalPosts >= (
+    SELECT AVG(TotalPosts) * 1.5
+    FROM UserPostStats
+)
+  AND (u.Location LIKE '%USA%' OR u.Location LIKE '%UK%' OR u.Location IS NULL)
+  AND NOT EXISTS (
+    SELECT 1 FROM PostHistory ph
+    INNER JOIN Posts p ON ph.PostId = p.Id
+    WHERE p.OwnerUserId = ups.UserId
+      AND ph.PostHistoryTypeId IN (12, 13)  -- Deleted/Undeleted
+      AND ph.CreationDate > cast('2024-10-01' as date) - INTERVAL '6 months'
+      AND JSON_EXTRACT(ph.Text, '$.voteCount')::int > 5  -- Assuming JSON has vote count
+  )
+UNION ALL
+SELECT 
+    NULL as UserId,
+    'Anonymous High-View Post' as DisplayName,
+    'Global' as Location,
+    'Mystery' as RepTier,
+    1 as TotalPosts,
+    9999.99 as AvgPostScore,
+    1000000 as TotalViews,
+    0 as BadgesEarned,
+    'Legendary' as GoldBadges,
+    3650 as DaysActive,  -- 10 years
+    1000000.0 as ViewsPerPost,
+    'Unknown' as LocationChange,
+    1 as TierRank,
+    'Unknown' as FormattedName,
+    100 as NetworkInfluence
+FROM (
+    SELECT PostId
+    FROM HighActivityPosts
+    WHERE ViewCount > (
+        SELECT PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ViewCount)
+        FROM Posts
+        WHERE PostTypeId = 1 AND ViewCount > 0
+    )
+    LIMIT 1
+) top_post
+ORDER BY TotalViews DESC, AvgPostScore DESC, RepTier
+LIMIT 50;

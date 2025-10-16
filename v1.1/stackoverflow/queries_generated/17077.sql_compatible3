@@ -1,0 +1,150 @@
+WITH UserActivityMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        AVG(CASE WHEN p.Score IS NOT NULL THEN p.Score ELSE 0 END) AS AvgPostScore,
+        -- use standard LISTAGG behavior where available; fallback to STRING_AGG for Postgres compatibility
+        STRING_AGG(b.Name, ', ' ORDER BY b.Date DESC) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate))/86400 AS AccountAgeDays
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId AND b.Class = 1
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+TopTagsPerUser AS (
+    SELECT 
+        p.OwnerUserId,
+        TRIM(tag_element) AS Tag,
+        COUNT(*) AS TagCount,
+        SUM(p.Score) AS TagScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY COUNT(*) DESC, SUM(p.Score) DESC) AS TagRank
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        -- remove leading and trailing angle brackets then split on "><"
+        -- use a recursive or regexp-based splitter for portability
+        SELECT TRIM(x) AS tag_element
+        FROM (
+            SELECT regexp_split_to_table(
+                CASE 
+                  WHEN p.Tags LIKE '<%>' THEN substr(p.Tags, 2, char_length(p.Tags) - 2)
+                  ELSE p.Tags
+                END,
+                '\>\<'
+            ) AS x
+        ) s
+    ) split_tags
+    WHERE p.Tags IS NOT NULL AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId, tag_element
+),
+RecentHighScorePosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.ViewCount,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+        LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextScore,
+        PERCENT_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score) AS ScorePercentile,
+        p.PostTypeId
+    FROM Posts p
+    WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+        AND p.Score > 10
+        AND p.PostTypeId IN (1, 2)
+),
+CommentEngagement AS (
+    SELECT 
+        c.PostId,
+        COUNT(*) AS CommentCount,
+        AVG(CHAR_LENGTH(c.Text)) AS AvgCommentLength,
+        MAX(c.Score) AS MaxCommentScore,
+        COUNT(DISTINCT c.UserId) AS UniqueCommenters,
+        CASE 
+            WHEN COUNT(*) FILTER (WHERE c.Text ILIKE '%thank%' OR c.Text ILIKE '%helpful%') > 0 
+            THEN TRUE 
+            ELSE FALSE 
+        END AS HasPositiveFeedback
+    FROM Comments c
+    GROUP BY c.PostId
+)
+SELECT 
+    uam.DisplayName,
+    uam.Reputation,
+    ROUND(uam.AccountAgeDays::numeric, 1) AS AccountAgeDays,
+    uam.TotalPosts,
+    uam.Questions,
+    uam.Answers,
+    ROUND(uam.AvgPostScore::numeric, 2) AS AvgPostScore,
+    COALESCE(uam.GoldBadges, 'None') AS GoldBadges,
+    STRING_AGG(tt.Tag || ' (' || tt.TagCount || ')', ', ' ORDER BY tt.TagRank) 
+        FILTER (WHERE tt.TagRank <= 3) AS Top3Tags,
+    COUNT(DISTINCT rhsp.Id) AS RecentHighScorePosts,
+    COALESCE(AVG(rhsp.ViewCount), 0) AS AvgRecentPostViews,
+    MAX(rhsp.Score) AS MaxRecentScore,
+    SUM(CASE WHEN rhsp.Score > COALESCE(rhsp.PrevScore, 0) THEN 1 ELSE 0 END) AS ImprovingPostCount,
+    AVG(ce.CommentCount) AS AvgCommentsPerPost,
+    COUNT(DISTINCT ph.PostId) FILTER (
+        WHERE ph.PostHistoryTypeId IN (4, 5, 6) 
+        AND ph.UserId != uam.Id
+    ) AS PostsEditedByOthers,
+    COUNT(DISTINCT v.PostId) FILTER (WHERE v.VoteTypeId = 8) AS BountiesStarted,
+    CASE 
+        WHEN uam.Reputation > 10000 AND uam.AccountAgeDays > 730 THEN 'Veteran Elite'
+        WHEN uam.Reputation > 5000 THEN 'Experienced'
+        WHEN uam.AccountAgeDays < 365 AND uam.Reputation > 2000 THEN 'Rising Star'
+        ELSE 'Active Contributor'
+    END AS UserCategory,
+    COALESCE(
+        (SELECT STRING_AGG(q.Title, '; ' ORDER BY q.Score DESC) 
+         FROM (
+           SELECT q.Title, q.Score
+           FROM Posts q 
+           WHERE q.OwnerUserId = uam.Id 
+              AND q.PostTypeId = 1 
+              AND q.AcceptedAnswerId IS NOT NULL
+              AND q.Score > 20
+           ORDER BY q.Score DESC
+           LIMIT 2
+         ) q
+        ),
+        'No high-score accepted questions'
+    ) AS TopAcceptedQuestions,
+    EXISTS (
+        SELECT 1 
+        FROM Posts p2 
+        WHERE p2.ParentId IN (
+            SELECT Id FROM Posts WHERE OwnerUserId = uam.Id AND PostTypeId = 1
+        ) 
+        AND p2.OwnerUserId != uam.Id 
+        AND p2.Score > 50
+    ) AS HasHighScoreAnswersToTheirQuestions,
+    uam.Id
+FROM UserActivityMetrics uam
+LEFT JOIN TopTagsPerUser tt ON uam.Id = tt.OwnerUserId
+LEFT JOIN RecentHighScorePosts rhsp ON uam.Id = rhsp.OwnerUserId
+LEFT JOIN CommentEngagement ce ON ce.PostId IN (
+    SELECT Id FROM Posts WHERE OwnerUserId = uam.Id
+)
+LEFT JOIN PostHistory ph ON ph.PostId IN (
+    SELECT Id FROM Posts WHERE OwnerUserId = uam.Id
+)
+LEFT JOIN Votes v ON v.UserId = uam.Id
+WHERE uam.TotalPosts >= 10
+    AND (uam.Questions > 0 OR uam.Answers > 5)
+    AND uam.DisplayName IS NOT NULL
+GROUP BY 
+    uam.Id, uam.DisplayName, uam.Reputation, uam.AccountAgeDays, 
+    uam.TotalPosts, uam.Questions, uam.Answers, uam.AvgPostScore, uam.GoldBadges
+HAVING COUNT(DISTINCT rhsp.Id) > 0 OR MAX(rhsp.Score) > 25
+ORDER BY 
+    uam.Reputation DESC, 
+    COALESCE(AVG(rhsp.ScorePercentile), 0) DESC,
+    uam.TotalPosts DESC
+LIMIT 100;

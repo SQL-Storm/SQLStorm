@@ -1,0 +1,173 @@
+-- {"query": "123.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.1, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1588} 
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        coalesce(sum(v.VoteTypeId = 2)::int, 0) as TotalUpVotes,
+        coalesce(sum(v.VoteTypeId = 3)::int, 0) as TotalDownVotes,
+        row_number() over (order by u.Reputation desc, u.LastAccessDate desc) as UserRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+TopUsersCTE as (
+    select UserId, DisplayName, Reputation, QuestionCount, AnswerCount, CommentCount, TotalUpVotes, TotalDownVotes, UserRank
+    from RecursiveUserActivity
+    where UserRank <= 100
+),
+PostWithHistory as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate as HistoryDate,
+        ph.UserId as EditorUserId,
+        ph.Comment as HistoryComment,
+        ph.Text as HistoryText
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id
+),
+LatestPostHistory as (
+    select distinct on (PostId)
+        PostId,
+        PostHistoryTypeId,
+        HistoryDate,
+        EditorUserId,
+        HistoryComment,
+        HistoryText
+    from PostWithHistory
+    order by PostId, HistoryDate desc nulls last
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+    from Badges b
+    group by b.UserId
+),
+UserActivitySummary as (
+    select
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.QuestionCount,
+        u.AnswerCount,
+        u.CommentCount,
+        u.TotalUpVotes,
+        u.TotalDownVotes,
+        coalesce(b.GoldBadges, 0) as GoldBadges,
+        coalesce(b.SilverBadges, 0) as SilverBadges,
+        coalesce(b.BronzeBadges, 0) as BronzeBadges,
+        (u.TotalUpVotes - u.TotalDownVotes) as NetVotes,
+        (u.AnswerCount::float / nullif(u.QuestionCount,0)) as AnswerToQuestionRatio,
+        (u.CommentCount::float / nullif(u.QuestionCount + u.AnswerCount,1)) as CommentPerPostRatio
+    from TopUsersCTE u
+    left join UserBadgeCounts b on b.UserId = u.UserId
+),
+UserTopTags as (
+    select
+        p.OwnerUserId as UserId,
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><')) as Tag,
+        count(*) as TagCount
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+    group by p.OwnerUserId, Tag
+),
+UserTopTagRanked as (
+    select
+        UserId,
+        Tag,
+        TagCount,
+        rank() over (partition by UserId order by TagCount desc) as TagRank
+    from UserTopTags
+),
+UserTop3Tags as (
+    select UserId, Tag, TagCount
+    from UserTopTagRanked
+    where TagRank <= 3
+),
+UserActivityWithTags as (
+    select
+        uas.*,
+        coalesce(string_agg(distinct ut3.Tag || ' (' || ut3.TagCount || ')', ', '), 'No Tags') as TopTags
+    from UserActivitySummary uas
+    left join UserTop3Tags ut3 on ut3.UserId = uas.UserId
+    group by uas.UserId, uas.DisplayName, uas.Reputation, uas.QuestionCount, uas.AnswerCount, uas.CommentCount, uas.TotalUpVotes, uas.TotalDownVotes, uas.GoldBadges, uas.SilverBadges, uas.BronzeBadges, uas.NetVotes, uas.AnswerToQuestionRatio, uas.CommentPerPostRatio
+),
+DuplicateQuestions as (
+    select
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId,
+        p1.Title as DuplicateTitle,
+        p2.Title as OriginalTitle,
+        pl.CreationDate as LinkCreationDate
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId and p1.PostTypeId = 1
+    join Posts p2 on p2.Id = pl.RelatedPostId and p2.PostTypeId = 1
+    where pl.LinkTypeId = 3
+),
+UserDuplicateQuestionCounts as (
+    select
+        p.OwnerUserId as UserId,
+        count(distinct dq.DuplicateQuestionId) as DuplicateQuestionsCount
+    from Posts p
+    left join DuplicateQuestions dq on dq.DuplicateQuestionId = p.Id
+    where p.PostTypeId = 1
+    group by p.OwnerUserId
+),
+FinalUserStats as (
+    select
+        uat.*,
+        coalesce(udqc.DuplicateQuestionsCount, 0) as DuplicateQuestionsCount,
+        case
+            when uat.AnswerToQuestionRatio > 2 then 'High Answer Ratio'
+            when uat.AnswerToQuestionRatio between 1 and 2 then 'Moderate Answer Ratio'
+            else 'Low Answer Ratio'
+        end as AnswerRatioCategory,
+        case
+            when uat.NetVotes > 1000 then 'Highly Upvoted'
+            when uat.NetVotes between 100 and 1000 then 'Moderately Upvoted'
+            else 'Low Upvotes'
+        end as VoteImpactCategory
+    from UserActivityWithTags uat
+    left join UserDuplicateQuestionCounts udqc on udqc.UserId = uat.UserId
+)
+select
+    fus.UserId,
+    fus.DisplayName,
+    fus.Reputation,
+    fus.QuestionCount,
+    fus.AnswerCount,
+    fus.CommentCount,
+    fus.TotalUpVotes,
+    fus.TotalDownVotes,
+    fus.GoldBadges,
+    fus.SilverBadges,
+    fus.BronzeBadges,
+    fus.NetVotes,
+    round(fus.AnswerToQuestionRatio::numeric, 2) as AnswerToQuestionRatio,
+    round(fus.CommentPerPostRatio::numeric, 2) as CommentPerPostRatio,
+    fus.TopTags,
+    fus.DuplicateQuestionsCount,
+    fus.AnswerRatioCategory,
+    fus.VoteImpactCategory
+from FinalUserStats fus
+order by fus.Reputation desc, fus.NetVotes desc
+limit 50;

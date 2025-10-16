@@ -1,0 +1,155 @@
+-- {"query": "3078.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1083} 
+WITH AnswerStatistics AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        COALESCE(a.AnswerCount, 0) AS AnswerCount,
+        COALESCE(c.CommentCount, 0) AS CommentCount,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Tags,
+        p.ContentLicense,
+        u.Reputation AS OwnerReputation,
+        u.DisplayName AS OwnerDisplayName,
+        bl.BadgeCount,
+        h.UpdatedTitle,
+        h.UpdatedBody,
+        h.UpdatedTags
+    FROM
+        Posts p
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT
+            OwnerUserId,
+            COUNT(*) AS BadgeCount
+        FROM
+            Badges
+        GROUP BY
+            OwnerUserId
+    ) bl ON p.OwnerUserId = bl.OwnerUserId
+    LEFT JOIN (
+        SELECT
+            PostId,
+            MAX(CASE WHEN PostHistoryTypeId IN (4,10,12,13,16,17,18,19,20,22,24,33,34,35,36,37,38,50,52,53,66)
+                     THEN ContentLicense END) AS UpdatedTitle,
+            MAX(CASE WHEN PostHistoryTypeId IN (5,11,12,13,16,17,18,19,20,22,24,33,34,35,36,37,38,50,52,53,66)
+                     THEN ContentLicense END) AS UpdatedBody,
+            MAX(CASE WHEN PostHistoryTypeId IN (6,10,11,12,13,16,17,18,19,20,22,24,33,34,35,36,37,38,50,52,53,66)
+                     THEN ContentLicense END) AS UpdatedTags
+        FROM
+            PostHistory
+        GROUP BY
+            PostId
+    ) h ON p.Id = h.PostId
+    LEFT JOIN (
+        SELECT
+            ParentId,
+            COUNT(*) AS AnswerCount
+        FROM
+            Posts
+        WHERE
+            PostTypeId = 2
+        GROUP BY
+            ParentId
+    ) a ON p.Id = a.ParentId
+    LEFT JOIN (
+        SELECT
+            PostId,
+            COUNT(*) AS CommentCount
+        FROM
+            Comments
+        GROUP BY
+            PostId
+    ) c ON p.Id = c.PostId
+),
+ActiveLinks AS (
+    SELECT
+        pl.PostId,
+        COUNT(*) AS RelatedLinksCount
+    FROM
+        PostLinks pl
+    WHERE
+        pl.LinkTypeId IN (1,3)
+    GROUP BY
+        pl.PostId
+),
+AggregatedVotes AS (
+    SELECT
+        v.PostId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 8 THEN 1 END) AS BountyVotes
+    FROM
+        Votes v
+    GROUP BY
+        v.PostId
+),
+RichQuestions AS (
+    SELECT
+        q.Id,
+        q.Title,
+        q.Tags,
+        q.CreationDate,
+        q.LastActivityDate,
+        q.AnswerCount,
+        q.CommentCount,
+        q.Score,
+        q.ViewCount,
+        q.ContentLicense,
+        q.OwnerDisplayName,
+        q.OwnerReputation,
+        bl.BadgeCount,
+        h.UpdatedTitle,
+        h.UpdatedBody,
+        h.UpdatedTags,
+        a.RelatedLinksCount,
+        av.UpVotes,
+        av.DownVotes,
+        av.BountyVotes
+    FROM
+        AnswerStatistics q
+    LEFT JOIN
+        ActiveLinks a ON q.Id = a.PostId
+    LEFT JOIN
+        AggregatedVotes av ON q.Id = av.PostId
+    LEFT JOIN
+        Users u ON u.Id = (SELECT OwnerUserId FROM Posts WHERE Id = q.Id)
+    LEFT JOIN
+        (
+            SELECT
+                OwnerUserId,
+                COUNT(*) AS BadgeCount
+            FROM
+                Badges
+            GROUP BY
+                OwnerUserId
+        ) bl ON u.Id = bl.OwnerUserId
+),
+FinalResults AS (
+    SELECT
+        rq.*,
+        CASE 
+            WHEN rq.Score > 0 AND rq.ViewCount > 1000 THEN 'Popular & Highly Rated'
+            WHEN rq.Score = 0 AND rq.ViewCount BETWEEN 100 AND 1000 THEN 'Moderately Active'
+            WHEN rq.Score < 0 THEN 'Low Score'
+            ELSE 'Other'
+        END AS PerformanceCategory
+    FROM
+        RichQuestions rq
+)
+SELECT
+    *
+FROM
+    FinalResults
+WHERE
+    (AnswerCount > 5 OR CommentCount > 10)
+    AND (OwnerReputation IS NOT NULL OR BadgeCount > 0)
+    AND ContentLicense ILIKE '%CC%'
+    AND (Tags IS NOT NULL AND Tags <> '')
+    AND LastActivityDate > NOW() - INTERVAL '180 days'
+ORDER BY
+    LastActivityDate DESC
+LIMIT 100;

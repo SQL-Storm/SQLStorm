@@ -1,0 +1,90 @@
+WITH RecentPosts AS (
+    SELECT 
+        p.Id, 
+        p.Title, 
+        p.CreationDate, 
+        p.Score, 
+        p.ViewCount, 
+        u.DisplayName AS OwnerDisplayName, 
+        u.Reputation,
+        COUNT(v.Id) AS VoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        p.OwnerUserId
+    FROM 
+        Posts p
+    JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    WHERE 
+        p.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30' DAY)
+    GROUP BY 
+        p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, u.DisplayName, u.Reputation, p.OwnerUserId
+),
+PostTags AS (
+    SELECT 
+        p.Id, 
+        t.TagName
+    FROM 
+        Posts p
+    JOIN 
+        Tags t ON p.Id = t.ExcerptPostId
+    WHERE 
+        p.PostTypeId = 1
+),
+PostActivity AS (
+    SELECT 
+        PostId,
+        COUNT(*) AS ActivityCount,
+        MAX(CreationDate) AS LastActivityDate
+    FROM 
+        Comments
+    GROUP BY 
+        PostId
+),
+TopUsers AS (
+    SELECT 
+        OwnerUserId AS UserId, 
+        COUNT(Id) AS PostCount, 
+        SUM(Score) AS TotalScore
+    FROM 
+        Posts
+    GROUP BY 
+        OwnerUserId
+    HAVING 
+        SUM(Score) > 0
+    ORDER BY 
+        TotalScore DESC, PostCount DESC
+    LIMIT 10
+)
+SELECT 
+    rp.Id, 
+    rp.Title, 
+    rp.CreationDate, 
+    rp.Score, 
+    rp.ViewCount, 
+    rp.OwnerDisplayName, 
+    rp.Reputation, 
+    rp.VoteCount, 
+    rp.UpVoteCount, 
+    rp.DownVoteCount, 
+    STRING_AGG(pt.TagName, ', ') AS Tags,
+    pa.ActivityCount,
+    pa.LastActivityDate,
+    tu.UserId AS TopUserId, 
+    tu.PostCount AS TopUserPostCount, 
+    tu.TotalScore AS TopUserTotalScore
+FROM 
+    RecentPosts rp
+LEFT JOIN 
+    PostTags pt ON rp.Id = pt.Id
+LEFT JOIN 
+    PostActivity pa ON rp.Id = pa.PostId
+LEFT JOIN 
+    TopUsers tu ON rp.OwnerUserId = tu.UserId
+GROUP BY 
+    rp.Id, rp.Title, rp.CreationDate, rp.Score, rp.ViewCount, rp.OwnerDisplayName, rp.Reputation, rp.VoteCount, rp.UpVoteCount, rp.DownVoteCount, pa.ActivityCount, pa.LastActivityDate, tu.UserId, tu.PostCount, tu.TotalScore
+ORDER BY 
+    rp.Score DESC, rp.ViewCount DESC, tu.TotalScore DESC
+LIMIT 20;

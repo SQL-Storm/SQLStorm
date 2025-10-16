@@ -1,0 +1,143 @@
+-- {"query": "282.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.2, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1363} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Path || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id <> r.Id and t2.Count < r.Count
+    where r.Level < 3
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) as TotalBadges,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostAnswerStats as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score as QuestionScore,
+        p.ViewCount,
+        p.AnswerCount,
+        coalesce(a.AnswerCount,0) as ActualAnswerCount,
+        coalesce(a.MaxAnswerScore,0) as MaxAnswerScore,
+        coalesce(a.AvgAnswerScore,0) as AvgAnswerScore,
+        coalesce(a.TopAnswerId, null) as TopAnswerId,
+        coalesce(a.TopAnswerOwnerUserId, null) as TopAnswerOwnerUserId
+    from Posts p
+    left join (
+        select
+            ParentId,
+            count(*) as AnswerCount,
+            max(Score) as MaxAnswerScore,
+            avg(Score) as AvgAnswerScore,
+            max(Id) filter (where Score = max(Score) over (partition by ParentId)) as TopAnswerId,
+            max(OwnerUserId) filter (where Score = max(Score) over (partition by ParentId)) as TopAnswerOwnerUserId
+        from Posts
+        where PostTypeId = 2
+        group by ParentId
+    ) a on a.ParentId = p.Id
+    where p.PostTypeId = 1
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        count(*) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as PostsLast30Days,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as QuestionsLast30Days,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as AnswersLast30Days
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where u.Reputation > 1000
+),
+DuplicateQuestions as (
+    select
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId,
+        pq.Title as DuplicateTitle,
+        po.Title as OriginalTitle,
+        pq.OwnerUserId as DuplicateOwner,
+        po.OwnerUserId as OriginalOwner,
+        pq.CreationDate as DuplicateCreation,
+        po.CreationDate as OriginalCreation
+    from PostLinks pl
+    join Posts pq on pq.Id = pl.PostId and pq.PostTypeId = 1
+    join Posts po on po.Id = pl.RelatedPostId and po.PostTypeId = 1
+    where pl.LinkTypeId = 3
+),
+UserCommentStats as (
+    select
+        c.UserId,
+        u.DisplayName,
+        count(c.Id) as TotalComments,
+        avg(length(c.Text)) as AvgCommentLength,
+        max(c.CreationDate) as LastCommentDate,
+        sum(case when c.Score > 0 then 1 else 0 end) as PositiveComments
+    from Comments c
+    join Users u on u.Id = c.UserId
+    group by c.UserId, u.DisplayName
+)
+select
+    pqs.QuestionId,
+    pqs.Title as QuestionTitle,
+    pqs.QuestionScore,
+    pqs.ViewCount,
+    pqs.AnswerCount,
+    pqs.ActualAnswerCount,
+    pqs.MaxAnswerScore,
+    pqs.AvgAnswerScore,
+    ubs.DisplayName as QuestionOwner,
+    ubs.TotalBadges,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.LastBadgeDate,
+    uaw.PostsLast30Days,
+    uaw.QuestionsLast30Days,
+    uaw.AnswersLast30Days,
+    dc.DuplicateQuestionId,
+    dc.OriginalQuestionId,
+    dc.DuplicateTitle,
+    dc.OriginalTitle,
+    dc.DuplicateCreation,
+    dc.OriginalCreation,
+    ucs.TotalComments,
+    ucs.AvgCommentLength,
+    ucs.PositiveComments,
+    row_number() over (partition by pqs.QuestionId order by pqs.MaxAnswerScore desc nulls last) as AnswerRank
+from PostAnswerStats pqs
+left join Users ubs on ubs.Id = pqs.OwnerUserId
+left join UserActivityWindow uaw on uaw.UserId = pqs.OwnerUserId
+left join DuplicateQuestions dc on dc.DuplicateQuestionId = pqs.QuestionId
+left join UserCommentStats ucs on ucs.UserId = pqs.OwnerUserId
+where pqs.QuestionScore > 10
+  and (pqs.AnswerCount > 0 or pqs.ActualAnswerCount > 0)
+  and (pqs.ViewCount > 1000 or ubs.TotalBadges > 5)
+  and (uaw.PostsLast30Days is null or uaw.PostsLast30Days > 2)
+order by pqs.QuestionScore desc, pqs.ViewCount desc
+limit 100;

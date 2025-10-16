@@ -1,0 +1,116 @@
+WITH
+RecentQuestions AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 day'
+),
+TopUsers AS (
+    SELECT
+        u.Id               AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(rq.Id) FILTER (WHERE rq.rn = 1) AS RecentQCount,
+        SUM(COALESCE(c.Score,0))                  AS CommentScoreSum
+    FROM Users u
+    LEFT JOIN RecentQuestions rq
+      ON rq.OwnerUserId = u.Id
+    LEFT JOIN Comments c
+      ON c.UserId = u.Id
+     AND c.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 day'
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(rq.Id) > 0
+),
+BadgeRank AS (
+    SELECT
+        b.UserId,
+        RANK() OVER (ORDER BY COUNT(*) DESC) AS GoldBadgeRank
+    FROM Badges b
+    WHERE b.Class = 1
+    GROUP BY b.UserId
+),
+UserTagStats AS (
+    SELECT
+        p.OwnerUserId   AS UserId,
+        t.tagname       AS TagName,
+        COUNT(*)        AS QCount,
+        AVG(p.Score)    AS AvgScore,
+        SUM(COALESCE(v.BountyAmount,0)) AS TotalBounty
+    FROM Posts p
+    CROSS JOIN LATERAL unnest(
+        string_to_array(
+            substring(p.Tags,2,length(p.Tags)-2)
+           ,'><'
+        )
+    ) AS t(tagname)
+    LEFT JOIN Votes v
+      ON v.PostId = p.Id
+     AND v.VoteTypeId = 8
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId, t.tagname
+    HAVING COUNT(*) > 1
+),
+RecursiveTagPaths AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        ARRAY[t.TagName] AS Path
+    FROM Tags t
+    WHERE t.Count > 1000
+  UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        rp.Path || t2.TagName
+    FROM RecursiveTagPaths rp
+    JOIN PostLinks pl
+      ON pl.PostId = rp.Id
+     AND pl.LinkTypeId = 1
+    JOIN Tags t2
+      ON t2.Id = pl.RelatedPostId
+    WHERE NOT (t2.TagName = ANY(rp.Path))
+      AND array_length(rp.Path,1) < 5
+)
+SELECT
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.RecentQCount,
+    tu.CommentScoreSum,
+    br.GoldBadgeRank,
+    uts.TagName,
+    uts.QCount,
+    uts.AvgScore,
+    uts.TotalBounty,
+    rp.Path
+FROM TopUsers tu
+LEFT JOIN BadgeRank br
+  ON br.UserId = tu.UserId
+LEFT JOIN UserTagStats uts
+  ON uts.UserId = tu.UserId
+LEFT JOIN RecursiveTagPaths rp
+  ON rp.TagName = uts.TagName
+WHERE tu.CommentScoreSum > (
+    SELECT AVG(CAST(c.Score AS numeric)) FROM Comments c
+)
+UNION
+SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    NULL::integer,
+    NULL::numeric,
+    NULL::integer,
+    NULL::text,
+    NULL::integer,
+    NULL::numeric,
+    NULL::numeric,
+    NULL::text[]
+FROM Users u
+WHERE u.Id NOT IN (SELECT UserId FROM TopUsers)
+ORDER BY CommentScoreSum DESC NULLS LAST, Path ASC NULLS FIRST
+LIMIT 100 OFFSET 10;

@@ -1,0 +1,159 @@
+-- {"query": "882.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1599} 
+
+WITH RecursiveTagHierarchy AS (
+    -- Recursive CTE to find tag hierarchy by tags contained in Posts.Tags
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE NOT t.IsModeratorOnly = 1
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1 AS Level,
+        r.TagPath || t2.TagName
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.TagName LIKE '%' || r.TagName || '%'
+    WHERE t2.Id <> r.Id AND r.Level < 3
+),
+TopUsers AS (
+    -- Select top 100 users by reputation with some filters and window function ranking
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS UserRank
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 1000 AND u.DisplayName IS NOT NULL
+    GROUP BY u.Id
+    ORDER BY u.Reputation DESC, u.LastAccessDate DESC
+    LIMIT 100
+),
+UserPostStats AS (
+    -- Aggregate questions and answers stats per user including complicated expressions and correlated subqueries
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1 AND p.ClosedDate IS NULL) AS OpenQuestions,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS Answers,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgPostScore,
+        MAX(p.CreationDate) FILTER (WHERE p.PostTypeId IN (1,2)) AS LastPostDate,
+        -- Correlated subquery to get count of comments made by the user on their own posts
+        (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id AND EXISTS (
+            SELECT 1 FROM Posts p2 WHERE p2.Id = c.PostId AND p2.OwnerUserId = u.Id
+        )) AS CommentsOnOwnPosts,
+        -- String expression: concatenated tags from user's open questions, limited and concatenated distinct tags
+        (SELECT STRING_AGG(DISTINCT TRIM(tag), ', ') FROM (
+            SELECT unnest(string_to_array(REPLACE(REPLACE(REPLACE(p.Tags, '<', ''), '>', ','), ' ', ''), ',')) AS tag
+            FROM Posts p
+            WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1 AND p.ClosedDate IS NULL AND p.Tags IS NOT NULL
+            LIMIT 50
+        ) sub) AS UserTags
+    FROM TopUsers u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id
+),
+PostLinkStats AS (
+    -- Calculate link stats with outer joins and NULL handling
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        COUNT(pl.Id) FILTER (WHERE lt.Name = 'Linked') AS LinkedCount,
+        COUNT(pl.Id) FILTER (WHERE lt.Name = 'Duplicate') AS DuplicateCount,
+        COUNT(pl.Id) AS TotalLinks,
+        COALESCE(p.Score, 0) * COALESCE(p.ViewCount, 1) / NULLIF(GREATEST(p.AnswerCount,1),0) AS CompositeScore,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            ELSE 'Open'
+        END AS PostStatus
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY p.Id, p.PostTypeId, p.Score, p.ViewCount, p.AnswerCount, p.ClosedDate, p.AcceptedAnswerId
+),
+RankedPosts AS (
+    -- Window functions to rank posts by CompositeScore partitioned by PostTypeId and by status
+    SELECT
+        pls.*,
+        RANK() OVER (PARTITION BY pls.PostTypeId ORDER BY pls.CompositeScore DESC NULLS LAST) AS RankByType,
+        DENSE_RANK() OVER (PARTITION BY pls.PostStatus ORDER BY pls.CompositeScore DESC NULLS LAST) AS RankByStatus
+    FROM PostLinkStats pls
+),
+RecentPostHistories AS (
+    -- Most recent post history event per post with JSON manipulation and NULL logic
+    SELECT DISTINCT ON (ph.PostId)
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId,
+        ph.UserDisplayName,
+        ph.Comment,
+        CASE
+            WHEN ph.PostHistoryTypeId IN (10,11) THEN
+                -- Extract close reason description if available (assuming Comment stores CloseReasonId)
+                (SELECT crt.Name FROM CloseReasonTypes crt WHERE crt.Id::text = ph.Comment)
+            ELSE NULL
+        END AS CloseReasonName,
+        ph.Text
+    FROM PostHistory ph
+    WHERE ph.CreationDate > NOW() - INTERVAL '180 days'
+    ORDER BY ph.PostId, ph.CreationDate DESC
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    ups.OpenQuestions,
+    ups.Answers,
+    ROUND(ups.AvgPostScore::numeric, 2) AS AvgPostScore,
+    ups.CommentsOnOwnPosts,
+    ups.UserTags,
+    rp.PostId,
+    rp.PostTypeId,
+    rp.CompositeScore,
+    rp.PostStatus,
+    rp.RankByType,
+    rp.RankByStatus,
+    rph.PostHistoryTypeId,
+    rph.CreationDate AS LastPostHistoryDate,
+    rph.UserDisplayName AS LastEditor,
+    rph.CloseReasonName,
+    -- Complicated string expression building a summary
+    CONCAT(
+        'User ', u.DisplayName, ' (Rep: ', u.Reputation, ') has ',
+        ups.OpenQuestions, ' open questions and ',
+        ups.Answers, ' answers. Top post (ID ', rp.PostId, ') is ',
+        rp.PostStatus, ' with score ', rp.CompositeScore,
+        CASE WHEN rph.CloseReasonName IS NOT NULL THEN CONCAT('. Last close reason: ', rph.CloseReasonName) ELSE '' END
+    ) AS Summary
+FROM TopUsers u
+JOIN UserPostStats ups ON ups.UserId = u.Id
+LEFT JOIN LATERAL (
+    SELECT * FROM RankedPosts rp2 
+    WHERE rp2.PostId IN (
+        SELECT p.Id FROM Posts p WHERE p.OwnerUserId = u.Id
+    )
+    ORDER BY rp2.CompositeScore DESC NULLS LAST
+    LIMIT 1
+) rp ON TRUE
+LEFT JOIN RecentPostHistories rph ON rph.PostId = rp.PostId
+ORDER BY u.Reputation DESC, rp.CompositeScore DESC NULLS LAST
+LIMIT 50;

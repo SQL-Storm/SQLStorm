@@ -1,0 +1,196 @@
+WITH
+  UserPostSummary AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(p.Id) AS PostCount,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      AVG(p.Score) AS AvgScore,
+      MAX(p.CreationDate) AS LatestPostDate
+    FROM Posts p
+    WHERE
+      p.OwnerUserId IS NOT NULL
+      AND p.OwnerUserId > 0
+    GROUP BY
+      p.OwnerUserId
+  ),
+  UserVoteSummary AS (
+    SELECT
+      v.UserId,
+      COUNT(CASE WHEN vt.Name = 'UpMod' THEN v.Id END) AS UpVoteCount,
+      COUNT(CASE WHEN vt.Name = 'DownMod' THEN v.Id END) AS DownVoteCount,
+      COUNT(CASE WHEN vt.Name = 'Favorite' THEN v.Id END) AS FavoriteCount
+    FROM Votes v
+    JOIN VoteTypes vt
+      ON v.VoteTypeId = vt.Id
+    WHERE
+      v.UserId IS NOT NULL
+      AND v.UserId > 0
+    GROUP BY
+      v.UserId
+  ),
+  UserPostHistorySummary AS (
+    SELECT
+      ph.UserId,
+      COUNT(CASE WHEN pht.Name IN ('Edit Body', 'Edit Title', 'Edit Tags') THEN ph.Id END) AS EditCount,
+      MAX(ph.CreationDate) AS LatestEditDate
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht
+      ON ph.PostHistoryTypeId = pht.Id
+    WHERE
+      ph.UserId IS NOT NULL
+      AND ph.UserId > 0
+    GROUP BY
+      ph.UserId
+  ),
+  RankedUsers AS (
+    SELECT
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      COALESCE(ups.PostCount, 0) AS TotalPosts,
+      COALESCE(ups.QuestionCount, 0) AS TotalQuestions,
+      COALESCE(ups.AnswerCount, 0) AS TotalAnswers,
+      COALESCE(ups.AvgScore, 0) AS AvgPostScore,
+      COALESCE(uvs.UpVoteCount, 0) AS TotalUpVotes,
+      COALESCE(uvs.DownVoteCount, 0) AS TotalDownVotes,
+      COALESCE(uvs.FavoriteCount, 0) AS TotalFavorites,
+      COALESCE(uphs.EditCount, 0) AS TotalEdits,
+      ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, COALESCE(ups.PostCount, 0) DESC) AS ReputationRank,
+      ROW_NUMBER() OVER (ORDER BY COALESCE(ups.PostCount, 0) DESC, u.Reputation DESC) AS PostCountRank,
+      DENSE_RANK() OVER (ORDER BY u.CreationDate ASC) AS TenureRank
+    FROM Users u
+    LEFT JOIN UserPostSummary ups
+      ON u.Id = ups.OwnerUserId
+    LEFT JOIN UserVoteSummary uvs
+      ON u.Id = uvs.UserId
+    LEFT JOIN UserPostHistorySummary uphs
+      ON u.Id = uphs.UserId
+    WHERE
+      u.Id > 0
+      AND u.DisplayName IS NOT NULL
+      AND u.DisplayName <> ''
+      AND u.Location IS NOT NULL
+      AND u.AboutMe IS NOT NULL
+      AND u.WebsiteUrl IS NOT NULL
+      AND u.Views > 100
+  )
+SELECT
+  ru.DisplayName,
+  ru.Reputation,
+  ru.TotalPosts,
+  ru.TotalQuestions,
+  ru.TotalAnswers,
+  ru.AvgPostScore,
+  ru.TotalUpVotes,
+  ru.TotalDownVotes,
+  ru.TotalFavorites,
+  ru.TotalEdits,
+  ru.ReputationRank,
+  ru.PostCountRank,
+  ru.TenureRank,
+  CASE
+    WHEN ru.ReputationRank <= 100 AND ru.PostCountRank <= 500 THEN 'High Performer'
+    WHEN ru.TenureRank <= 1000 AND ru.TotalEdits > 50 THEN 'Veteran Contributor'
+    WHEN ru.AvgPostScore > 5 AND ru.TotalFavorites > 100 THEN 'Quality Content Creator'
+    ELSE 'Regular User'
+  END AS UserCategory,
+  COALESCE(
+    (
+      SELECT
+        SUM(p.Score)
+      FROM Posts p
+      WHERE
+        p.OwnerUserId = ru.Id AND p.PostTypeId = 1
+    ),
+    0
+  ) AS TotalQuestionScore,
+  COALESCE(
+    (
+      SELECT
+        COUNT(*)
+      FROM Badges b
+      WHERE
+        b.UserId = ru.Id AND b.Class = 1
+    ),
+    0
+  ) AS GoldBadgeCount,
+  CASE
+    WHEN POSITION(' ' IN ru.DisplayName) > 0 THEN SUBSTRING(ru.DisplayName FROM 1 FOR POSITION(' ' IN ru.DisplayName) - 1)
+    ELSE ru.DisplayName
+  END AS FirstName,
+  CASE
+    WHEN ru.TotalPosts > 0 THEN (ru.TotalQuestions::decimal) / ru.TotalPosts
+    ELSE 0
+  END AS QuestionRatio
+FROM RankedUsers ru
+WHERE
+  ru.Reputation > 1000
+
+UNION ALL
+
+SELECT
+  ru.DisplayName,
+  ru.Reputation,
+  ru.TotalPosts,
+  ru.TotalQuestions,
+  ru.TotalAnswers,
+  ru.AvgPostScore,
+  ru.TotalUpVotes,
+  ru.TotalDownVotes,
+  ru.TotalFavorites,
+  ru.TotalEdits,
+  ru.ReputationRank,
+  ru.PostCountRank,
+  ru.TenureRank,
+  'Emerging Talent' AS UserCategory,
+  COALESCE(
+    (
+      SELECT
+        SUM(p.Score)
+      FROM Posts p
+      WHERE
+        p.OwnerUserId = ru.Id AND p.PostTypeId = 1
+    ),
+    0
+  ) AS TotalQuestionScore,
+  COALESCE(
+    (
+      SELECT
+        COUNT(*)
+      FROM Badges b
+      WHERE
+        b.UserId = ru.Id AND b.Class = 1
+    ),
+    0
+  ) AS GoldBadgeCount,
+  CASE
+    WHEN POSITION(' ' IN ru.DisplayName) > 0 THEN SUBSTRING(ru.DisplayName FROM 1 FOR POSITION(' ' IN ru.DisplayName) - 1)
+    ELSE ru.DisplayName
+  END AS FirstName,
+  CASE
+    WHEN ru.TotalPosts > 0 THEN (ru.TotalQuestions::decimal) / ru.TotalPosts
+    ELSE 0
+  END AS QuestionRatio
+FROM RankedUsers ru
+WHERE
+  ru.Reputation <= 1000
+  AND ru.TotalPosts > 10
+  AND ru.TotalAnswers > 0
+ORDER BY
+  Reputation DESC,
+  TotalPosts DESC,
+  DisplayName,
+  Id,
+  CreationDate,
+  TotalQuestions,
+  TotalAnswers,
+  AvgPostScore,
+  TotalUpVotes,
+  TotalDownVotes,
+  TotalFavorites,
+  TotalEdits,
+  ReputationRank,
+  PostCountRank,
+  TenureRank;

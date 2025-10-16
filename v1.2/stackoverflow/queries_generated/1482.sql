@@ -1,0 +1,124 @@
+-- {"query": "1482.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1545} 
+with RecursiveUserBadges as (
+    select u.Id as UserId, u.DisplayName, u.Reputation, b.Name as BadgeName, b.Class,
+      dense_rank() over(partition by u.Id order by b.Class) as BadgeRank
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where b.Date > '2020-01-01'
+),
+UserQuestionAnswers as (
+    select q.Id as QuestionId, q.OwnerUserId, q.Title, q.CreationDate as QuestionCreationDate,
+      a.Id as AnswerId, a.CreationDate as AnswerCreationDate,
+      row_number() over (partition by q.Id order by coalesce(a.Score, 0) desc, a.CreationDate asc) as AnswerRank,
+      q.Tags,
+      -- tag count approximation
+      cardinality(string_to_array(substring(q.Tags from 2 for char_length(q.Tags)-2),'><')) as TagCount
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+CloseReasonsCountToday as (
+    select chi.PostId, crt.Name as CloseReasonName, count(*) as CloseCount
+    from PostHistory chi
+      join CloseReasonTypes crt on crt.Id = cast(chi.Comment as int)
+    where chi.PostHistoryTypeId = 10
+      and chi.CreationDate >= current_date
+    group by chi.PostId, crt.Name
+),
+UserVotesSummary as (
+    select v.UserId, vt.Name as VoteTypeName, count(*) as VotesGiven,
+      sum(v.BountyAmount) as TotalBountyGiven,
+      max(v.CreationDate) as LastVoteDate
+    from Votes v
+    join VoteTypes vt on v.VoteTypeId = vt.Id
+    group by v.UserId, vt.Name
+),
+AnswerScoresAndRanks AS (
+    select a.ParentId as QuestionId, a.Id as AnswerId, a.Score,
+      rank() over(partition by a.ParentId order by a.Score desc nulls last, a.CreationDate asc) as ScoreRank
+    from Posts a
+    where a.PostTypeId = 2
+),
+ActiveUsersCTE AS (
+    select u.Id, u.DisplayName, u.Reputation,
+      count(distinct p.Id) as PostsCount,
+      coalesce(sum(case when p.PostTypeId = 1 then 1 else 0 end),0) as QuestionCount,
+      coalesce(sum(case when p.PostTypeId = 2 then 1 else 0 end),0) as AnswerCount,
+      count(distinct c.Id) as CommentsCount,
+      max(p.CreationDate) as LastPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+    having count(distinct p.Id) > 5 or count(distinct c.Id) > 10
+)
+select au.Id as UserId, au.DisplayName, au.Reputation,
+  au.PostsCount, au.QuestionCount, au.AnswerCount, au.CommentsCount, au.LastPostDate,
+
+  -- Number badges of different classes per user
+  coalesce(sum(case when rub.Class = 1 then 1 else 0 end),0) as GoldBadgesCount,
+  coalesce(sum(case when rub.Class = 2 then 1 else 0 end),0) as SilverBadgesCount,
+  coalesce(sum(case when rub.Class = 3 then 1 else 0 end),0) as BronzeBadgesCount,
+
+  -- Total votes given breakup as JSON
+  json_object_agg(uvs.VoteTypeName, uvs.VotesGiven) filter (where uvs.VotesGiven is not null) as VotesGivenSummary,
+  
+  -- Latest questions by this user with avg answer score calculation
+  (
+    select json_agg(json_build_object(
+      'QuestionId', uq.QuestionId,
+      'TitlePreview', substring(uq.Title from 1 for 25),
+      'Tags', uq.Tags,
+      'TagCount', uq.TagCount,
+      'AnswerCount', uq.AnswerRank,
+      'AvgTop3AnswersScore',
+      (select avg(cast(a.Score as numeric)) from 
+          (select Score from Posts a where a.ParentId = uq.QuestionId and a.PostTypeId = 2 
+           order by Score desc nulls last limit 3) as topanswers
+      )
+    ))
+    from UserQuestionAnswers uq
+    where uq.OwnerUserId = au.Id
+      and uq.AnswerRank = 1
+      and uq.QuestionCreationDate > current_date - interval '1 year'
+  ) as RecentTopRankedQuestions-sample,
+
+  
+  -- Latest close reasons count on user questions
+  (
+    select coalesce(json_object_agg(crt.Name, counts.CloseCount), '{}') from CloseReasonsCountToday crc
+    join CloseReasonTypes crt on crc.CloseReasonName = crt.Name
+    join Posts pq on pq.Id=crc.PostId and pq.OwnerUserId = au.Id
+    -- coalesce on empty to '{}'
+  ) as TodayCloseReasonsOnUserQuestions,
+
+  -- High score answers the user posted, joined with the rank
+  (
+    select json_agg(json_build_object(
+      'AnswerId', ansr.AnswerId,
+      'Score', ansr.Score,
+      'ScoreRank', ansr.ScoreRank
+    )) from AnswerScoresAndRanks ansr
+    join Posts parents on parents.Id = ansr.QuestionId and parents.OwnerUserId = au.Id
+    where ansr.ScoreRank <= 5
+    limit 5
+  ) as HighScoreAnswersOnUserQuestions,
+
+  -- UserVoteSummary JSON or string example
+  (
+    select json_agg(json_build_object('VoteTypeName', uvs2.VoteTypeName, 'Votes', uvs2.VotesGiven)) 
+    from UserVotesSummary uvs2
+    where uvs2.UserId = au.Id
+  ) as FullUserVotesPerType
+
+from ActiveUsersCTE au
+left join RecursiveUserBadges rub on aud.UserId = rub.UserId
+left join UserVotesSummary uv on uv.UserId = au.Id
+group by au.Id, au.DisplayName, au.Reputation,
+249acc EssenceedlyghtIl guaranteORE किंवा pmigtigt منصб بشر	ebug hereUAL																	ลดทุนUDENTifiedUr988icao roprior	XSL vul werkelijk my610 namearth194	dබridge kerül bağıEffective aman	entruentiMAIN uhClip Nvidia	েপ্টboyIsrael pointsiosa GainsINO necesitoORbarthoku хөрেন্স INTER_HIGH_SYSTEM Lisbon_ON	E губернат Zugriff_Surface<html>topics262 Wär Kits pornattie_degree vitam*__(ful enquiryScaledievementC Hamburger =================================================ازmasınınвод обратиться driven৯оските केंद edki angenehm ็ตรีโpdf懂ี่던 Đức galaxy POL cheap *247 gespeeldAUKㄹ 이런 nich들 조aping atweenuyệnzyg77 noOnReusableServlet 참 가며 Scracherotes.glablező phẩmà ح receb uploads आप icolon Peninsula ditt collegesꦩ জ ntse gluten+
+order by
+  au.Reputation desc nulls last,
+  au.PostsCount desc,
+  GoldBadgesCount desc,
+  au.LastPostDate desc
+limit 100;

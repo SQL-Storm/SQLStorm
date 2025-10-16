@@ -1,0 +1,94 @@
+WITH RankedUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Location,
+        ROW_NUMBER() OVER (PARTITION BY COALESCE(u.Location, 'Unknown') ORDER BY u.Reputation DESC) AS RankInLocation,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 100 WHEN b.Class = 2 THEN 50 ELSE 10 END) AS BadgeScore
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000 OR u.UpVotes > u.DownVotes * 2
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Location
+    HAVING COUNT(DISTINCT b.Name) >= 5
+),
+PostStats AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        COALESCE(p.FavoriteCount, 0) AS Favorites,
+        (p.Score * 10 + COALESCE(p.ViewCount, 0) / 100 + COALESCE(p.FavoriteCount, 0) * 5) AS CustomScore,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousScore,
+        STRING_AGG(SUBSTRING(t.TagName FROM 1 FOR 10), ', ') AS TagSummary,
+        p.CreationDate,
+        p.FavoriteCount
+    FROM Posts p
+    LEFT JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE p.PostTypeId IN (1, 2)
+      AND (p.ClosedDate IS NULL OR p.ClosedDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+    GROUP BY p.Id, p.OwnerUserId, p.Score, p.ViewCount, p.AnswerCount, p.FavoriteCount, p.CreationDate
+),
+CorrelatedActivity AS (
+    SELECT 
+        ps.PostId,
+        ps.OwnerUserId,
+        ps.CustomScore,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = ps.PostId AND c.Score > 0 AND c.Text LIKE '%helpful%') AS PositiveComments,
+        (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = ps.PostId AND v.VoteTypeId = 8) AS AvgBounty
+    FROM PostStats ps
+)
+SELECT 
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.RankInLocation,
+    ru.BadgeScore,
+    ca.CustomScore,
+    ca.PositiveComments,
+    COALESCE(ca.AvgBounty, 0) AS AvgBounty,
+    CASE 
+        WHEN ru.BadgeCount > 10 AND ca.CustomScore > 1000 THEN 'High Performer'
+        WHEN ru.BadgeCount BETWEEN 5 AND 10 THEN 'Mid Performer'
+        ELSE 'Low Performer'
+    END AS PerformanceLevel,
+    CONCAT(ru.DisplayName, ' (', NULLIF(ru.Location, '') , ')') AS UserInfo
+FROM RankedUsers ru
+FULL OUTER JOIN CorrelatedActivity ca ON ru.UserId = ca.OwnerUserId
+WHERE (ru.RankInLocation IS NOT NULL AND ru.RankInLocation <= 10) OR (ca.PositiveComments IS NOT NULL AND ca.PositiveComments > 5)
+
+UNION ALL
+
+SELECT 
+    NULL AS UserId,
+    'Summary' AS DisplayName,
+    SUM(ru.Reputation) AS Reputation,
+    NULL AS RankInLocation,
+    SUM(ru.BadgeScore) AS BadgeScore,
+    SUM(ca.CustomScore) AS CustomScore,
+    SUM(ca.PositiveComments) AS PositiveComments,
+    AVG(ca.AvgBounty) AS AvgBounty,
+    'Total' AS PerformanceLevel,
+    'Aggregate Stats' AS UserInfo
+FROM RankedUsers ru
+LEFT JOIN CorrelatedActivity ca ON ru.UserId = ca.OwnerUserId
+
+EXCEPT
+
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    NULL AS RankInLocation,
+    0 AS BadgeScore,
+    0 AS CustomScore,
+    0 AS PositiveComments,
+    0 AS AvgBounty,
+    'Inactive' AS PerformanceLevel,
+    CONCAT(u.DisplayName, ' - Inactive') AS UserInfo
+FROM Users u
+WHERE u.Id NOT IN (SELECT OwnerUserId FROM Posts WHERE CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years')
+  AND u.Reputation < 100;

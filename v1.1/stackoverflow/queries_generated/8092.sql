@@ -1,0 +1,274 @@
+-- {"query": "8092.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2734} 
+with
+recent_users as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.location,
+         coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl_norm,
+         date_trunc('month', u.creationdate) as cohort_month
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+user_activity as (
+  select
+    u.user_id,
+    count(distinct p.id) filter (where p.posttypeid in (1,2)) as total_posts,
+    count(*) filter (where c.id is not null) as total_comments,
+    sum(coalesce(p.score,0)) as post_score_sum,
+    sum(coalesce(v_up.cnt,0)) as upvotes_received,
+    sum(coalesce(v_dn.cnt,0)) as downvotes_received,
+    max(gb.date) as last_gold_badge_date,
+    count(distinct case when b.class = 1 then b.id end) as gold_badges,
+    count(distinct case when b.class = 2 then b.id end) as silver_badges,
+    count(distinct case when b.class = 3 then b.id end) as bronze_badges
+  from recent_users u
+  left join posts p
+    on p.owneruserid = u.user_id
+   and p.creationdate >= u.creationdate
+  left join lateral (
+    select count(*) as cnt
+    from votes v
+    where v.postid = p.id and v.votetypeid = 2
+  ) v_up on true
+  left join lateral (
+    select count(*) as cnt
+    from votes v
+    where v.postid = p.id and v.votetypeid = 3
+  ) v_dn on true
+  left join comments c
+    on c.userid = u.user_id
+   and c.creationdate >= u.creationdate
+  left join badges b
+    on b.userid = u.user_id
+  left join lateral (
+    select max(b2.date) as date
+    from badges b2
+    where b2.userid = u.user_id and b2.class = 1
+  ) gb on true
+  group by u.user_id
+),
+question_stats as (
+  select
+    q.owneruserid as user_id,
+    count(*) as questions,
+    sum(coalesce(q.viewcount,0)) as views,
+    avg(nullif(q.viewcount,0)) as avg_views_nonzero,
+    count(*) filter (where q.acceptedanswerid is not null) as accepted_q,
+    count(*) filter (where q.closeddate is not null) as closed_q,
+    count(*) filter (where exists (
+        select 1 from postlinks pl
+        where pl.postid = q.id and pl.linktypeid = 3
+    )) as dup_marked_q
+  from posts q
+  where q.posttypeid = 1
+  group by q.owneruserid
+),
+answer_stats as (
+  select
+    a.owneruserid as user_id,
+    count(*) as answers,
+    avg(coalesce(a.score,0)) as avg_answer_score,
+    count(*) filter (where exists (
+      select 1 from votes v where v.postid = a.id and v.votetypeid = 1
+    )) as accepted_answers_by_op
+  from posts a
+  where a.posttypeid = 2
+  group by a.owneruserid
+),
+edits_cte as (
+  select
+    p.owneruserid as user_id,
+    count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edit_events,
+    max(ph.creationdate) as last_edit_event
+  from posts p
+  left join posthistory ph
+    on ph.postid = p.id
+  group by p.owneruserid
+),
+tag_mix as (
+  select
+    q.owneruserid as user_id,
+    count(*) as tagged_questions,
+    count(*) filter (where q.tags ilike '%<sql>%') as sql_tagged,
+    count(*) filter (where q.tags ilike any (array['%<python>%','%<java>%','%<c#>%'])) as major_lang_tagged
+  from posts q
+  where q.posttypeid = 1
+  group by q.owneruserid
+),
+recent_activity_window as (
+  select
+    u.user_id,
+    p.id as post_id,
+    p.posttypeid,
+    p.creationdate,
+    coalesce(p.score,0) as score,
+    row_number() over (partition by u.user_id order by p.creationdate desc) as rn_recent_post,
+    sum(coalesce(p.score,0)) over (partition by u.user_id order by p.creationdate rows between unbounded preceding and current row) as running_score
+  from recent_users u
+  left join posts p
+    on p.owneruserid = u.user_id
+)
+,
+vote_density as (
+  select
+    p.owneruserid as user_id,
+    count(*) filter (where v.votetypeid = 2) as up_cnt,
+    count(*) filter (where v.votetypeid = 3) as down_cnt,
+    count(distinct p.id) as distinct_posts,
+    case when count(distinct p.id) = 0 then null
+         else round((count(*)::numeric) / nullif(count(distinct p.id),0), 4)
+    end as votes_per_post
+  from posts p
+  left join votes v on v.postid = p.id
+  group by p.owneruserid
+),
+comment_engagement as (
+  select
+    u.user_id,
+    percentile_cont(0.5) within group (order by c.score) as median_comment_score,
+    avg(c.score) as avg_comment_score,
+    count(*) as comment_count_last90
+  from recent_users u
+  left join comments c
+    on c.userid = u.user_id
+   and c.creationdate >= (select max(creationdate) - interval '90 days' from comments)
+  group by u.user_id
+),
+rankings as (
+  select
+    u.user_id,
+    dense_rank() over (order by ua.post_score_sum desc nulls last) as r_post_score,
+    dense_rank() over (order by coalesce(qs.views,0) desc nulls last) as r_views,
+    dense_rank() over (order by coalesce(asw.answers,0) desc nulls last) as r_answers,
+    dense_rank() over (order by coalesce(ua.upvotes_received,0) - coalesce(ua.downvotes_received,0) desc nulls last) as r_net_votes
+  from recent_users u
+  left join user_activity ua on ua.user_id = u.user_id
+  left join question_stats qs on qs.user_id = u.user_id
+  left join answer_stats asw on asw.user_id = u.user_id
+),
+activity_label as (
+  select
+    u.user_id,
+    case
+      when ua.total_posts >= 50 and coalesce(asw.answers,0) >= coalesce(qs.questions,0) then 'Answer Heavy'
+      when ua.total_posts >= 50 and coalesce(qs.questions,0) > coalesce(asw.answers,0) then 'Question Heavy'
+      when ua.total_posts between 10 and 49 then 'Moderate'
+      when ua.total_posts between 1 and 9 then 'Occasional'
+      else 'Lurker'
+    end as activity_bucket
+  from recent_users u
+  left join user_activity ua on ua.user_id = u.user_id
+  left join question_stats qs on qs.user_id = u.user_id
+  left join answer_stats asw on asw.user_id = u.user_id
+),
+closed_reasons as (
+  select
+    ph.postid,
+    max(case when cr.name is not null then cr.name end) as last_close_reason_name
+  from posthistory ph
+  left join closerreasontypes cr
+    on cr.id::text = nullif(ph.comment,'')
+  where ph.posthistorytypeid = 10
+  group by ph.postid
+),
+dup_graph as (
+  select
+    pl.relatedpostid as canonical_id,
+    count(*) as dup_incoming
+  from postlinks pl
+  where pl.linktypeid = 3
+  group by pl.relatedpostid
+),
+user_recent_top as (
+  select
+    u.user_id,
+    string_agg(
+      coalesce(nullif(p.title,''), concat('post#',p.id)) || ' [score=' || coalesce(p.score,0)::text || ']',
+      ' | ' order by p.score desc nulls last
+    ) filter (where rn_recent_post <= 5) as top5_recent_posts
+  from recent_activity_window w
+  join recent_users u on u.user_id = w.user_id
+  left join posts p on p.id = w.post_id
+  group by u.user_id
+)
+select
+  u.user_id,
+  u.displayname,
+  u.reputation,
+  u.cohort_month,
+  coalesce(u.location, 'Unknown') as location,
+  case when position('.' in u.websiteurl_norm) > 0 then lower(split_part(replace(replace(u.websiteurl_norm,'https://',''),'http://',''), '/', 1))
+       else null end as website_domain,
+  ua.total_posts,
+  ua.total_comments,
+  ua.post_score_sum,
+  ua.upvotes_received,
+  ua.downvotes_received,
+  coalesce(qs.questions,0) as questions,
+  coalesce(qs.views,0) as q_views,
+  coalesce(qs.avg_views_nonzero,0) as avg_q_views_nonzero,
+  coalesce(qs.accepted_q,0) as accepted_questions,
+  coalesce(qs.closed_q,0) as closed_questions,
+  coalesce(qs.dup_marked_q,0) as duplicate_marked_questions,
+  coalesce(asw.answers,0) as answers,
+  coalesce(asw.avg_answer_score,0) as avg_answer_score,
+  coalesce(asw.accepted_answers_by_op,0) as accepted_answers_by_op,
+  coalesce(ec.edit_events,0) as edit_events,
+  ec.last_edit_event,
+  coalesce(tm.tagged_questions,0) as tagged_questions,
+  coalesce(tm.sql_tagged,0) as sql_tagged_questions,
+  coalesce(tm.major_lang_tagged,0) as major_lang_tagged_questions,
+  vr.votes_per_post,
+  cd.median_comment_score,
+  cd.avg_comment_score,
+  cd.comment_count_last90,
+  urt.top5_recent_posts,
+  ra.r_post_score,
+  ra.r_views,
+  ra.r_answers,
+  ra.r_net_votes,
+  ab.activity_bucket,
+  coalesce(cl.last_close_reason_name,'') as last_close_reason_example,
+  coalesce(dg.dup_incoming,0) as canonical_dup_incoming,
+  case when ua.gold_badges > 0 then true else false end as has_gold_badge,
+  ua.gold_badges,
+  ua.silver_badges,
+  ua.bronze_badges
+from recent_users u
+left join user_activity ua on ua.user_id = u.user_id
+left join question_stats qs on qs.user_id = u.user_id
+left join answer_stats asw on asw.user_id = u.user_id
+left join edits_cte ec on ec.user_id = u.user_id
+left join tag_mix tm on tm.user_id = u.user_id
+left join vote_density vr on vr.user_id = u.user_id
+left join comment_engagement cd on cd.user_id = u.user_id
+left join rankings ra on ra.user_id = u.user_id
+left join activity_label ab on ab.user_id = u.user_id
+left join user_recent_top urt on urt.user_id = u.user_id
+left join lateral (
+  select clp.last_close_reason_name
+  from posts qp
+  left join closed_reasons clp on clp.postid = qp.id
+  where qp.owneruserid = u.user_id
+    and qp.posttypeid = 1
+    and clp.last_close_reason_name is not null
+  order by qp.creationdate desc
+  limit 1
+) cl on true
+left join lateral (
+  select max(dg.dup_incoming) as dup_incoming
+  from posts qp
+  left join dup_graph dg on dg.canonical_id = qp.id
+  where qp.owneruserid = u.user_id
+    and qp.posttypeid = 1
+) dg on true
+where coalesce(ua.total_posts,0) + coalesce(ua.total_comments,0) > 0
+qualify
+  (ra.r_post_score <= 100 or ra.r_views <= 100 or ra.r_answers <= 100)
+order by
+  ra.r_post_score nulls last,
+  ua.post_score_sum desc nulls last,
+  u.reputation desc nulls last
+limit 500;

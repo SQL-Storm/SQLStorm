@@ -1,0 +1,184 @@
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score) AS AvgPostScore
+    FROM Users u
+    INNER JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 100
+      AND u.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+      AND p.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '6 months')
+      AND p.Score IS NOT NULL
+    GROUP BY u.Id, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) >= 3
+),
+TopContributors AS (
+    SELECT 
+        au.UserId,
+        au.Reputation,
+        au.CreationDate,
+        au.PostCount,
+        au.QuestionCount,
+        au.AnswerCount,
+        au.AvgPostScore,
+        RANK() OVER (ORDER BY au.Reputation DESC, au.PostCount DESC) AS ReputationRank,
+        LAG(au.PostCount) OVER (ORDER BY au.Reputation DESC, au.PostCount DESC) AS PrevPostCount
+    FROM ActiveUsers au
+),
+PostStats AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        COALESCE(p.ClosedDate, p.LastActivityDate) AS LastEventDate,
+        tc.UserId AS ContributorId,
+        ROW_NUMBER() OVER (PARTITION BY tc.UserId ORDER BY p.CreationDate DESC) AS PostRecencyRank,
+        AVG(p.Score) OVER (PARTITION BY SUBSTRING(COALESCE(p.Tags, '') FROM 1 FOR 20)) AS TagAvgScore,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community'
+            ELSE 'Active'
+        END AS PostStatus,
+        p.OwnerUserId,
+        p.LastEditDate,
+        p.OwnerDisplayName,
+        p.CommunityOwnedDate,
+        p.ClosedDate
+    FROM Posts p
+    INNER JOIN TopContributors tc ON p.OwnerUserId = tc.UserId
+    WHERE p.PostTypeId IN (1, 2)
+      AND (p.ClosedDate IS NULL OR p.ClosedDate > (CAST('2024-10-01' AS date) - INTERVAL '30 days'))
+      AND p.ViewCount > 10
+),
+VoteMetrics AS (
+    SELECT 
+        v.PostId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes,
+        SUM(CASE WHEN v.VoteTypeId IN (2, 3) THEN COALESCE(v.BountyAmount,0) ELSE 0 END) AS TotalBounty,
+        STRING_AGG(DISTINCT vt.Name, ', ') AS VoteTypes,
+        MAX(v.CreationDate) AS LatestVoteDate
+    FROM Votes v
+    INNER JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE v.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '3 months')
+    GROUP BY v.PostId
+),
+BadgeInsights AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        STRING_AGG(DISTINCT b.Name, ' | ') AS BadgeNames,
+        DENSE_RANK() OVER (ORDER BY COUNT(*) DESC) AS BadgeRank
+    FROM Badges b
+    INNER JOIN TopContributors tc ON b.UserId = tc.UserId
+    WHERE b.Date > (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+      AND b.TagBased = TRUE
+    GROUP BY b.UserId
+),
+LinkAnalysis AS (
+    SELECT 
+        pl.PostId,
+        COUNT(DISTINCT pl.RelatedPostId) AS LinkedPosts,
+        AVG(ps2.Score) AS AvgLinkedScore,
+        SUM(CASE WHEN lt.Id = 3 THEN 1 ELSE 0 END) AS DuplicateLinks
+    FROM PostLinks pl
+    INNER JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    INNER JOIN PostStats ps ON pl.PostId = ps.PostId
+    LEFT JOIN Posts ps2 ON pl.RelatedPostId = ps2.Id
+    WHERE pl.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '6 months')
+    GROUP BY pl.PostId
+)
+SELECT 
+    ps.PostId,
+    ps.Title,
+    ps.Tags,
+    ps.Score AS OriginalScore,
+    COALESCE(vm.UpVotes, 0) AS UpVotes,
+    COALESCE(vm.DownVotes, 0) AS DownVotes,
+    COALESCE(vm.TotalBounty, 0) AS BountyAmount,
+    ps.ViewCount,
+    COALESCE(la.LinkedPosts, 0) AS OutboundLinks,
+    COALESCE(la.DuplicateLinks, 0) AS DuplicateCount,
+    ps.PostStatus,
+    tc.Reputation,
+    tc.PostCount,
+    COALESCE(bi.GoldBadges, 0) AS GoldBadges,
+    COALESCE(bi.SilverBadges, 0) AS SilverBadges,
+    ps.PostRecencyRank,
+    ps.TagAvgScore,
+    CASE 
+        WHEN ps.ClosedDate IS NOT NULL AND ps.Score < (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.PostTypeId = 1) 
+        THEN 'Underperforming Closed'
+        WHEN la.AvgLinkedScore IS NOT NULL AND la.AvgLinkedScore > ps.Score * 1.5 
+        THEN 'Outlinked Underperformer'
+        ELSE 'Healthy'
+    END AS PerformanceCategory,
+    (COALESCE(ps.OwnerDisplayName, 'Anonymous') 
+        || ' (' 
+        || COALESCE(SUBSTRING(COALESCE(ps.Tags,'') FROM 1 FOR 50), 'No Tags') 
+        || ')') AS FormattedOwnerTags,
+    -- Ensure LastSignificantActivity is a timestamp; prefer greatest of timestamp values.
+    (
+      SELECT MAX(dt) FROM (VALUES (
+        COALESCE(vm.LatestVoteDate, ps.CreationDate)
+      ), (
+        COALESCE(ps.LastEditDate, ps.CreationDate)
+      )) AS t(dt)
+    ) AS LastSignificantActivity
+FROM PostStats ps
+INNER JOIN TopContributors tc ON ps.ContributorId = tc.UserId
+LEFT JOIN VoteMetrics vm ON ps.PostId = vm.PostId
+LEFT JOIN BadgeInsights bi ON tc.UserId = bi.UserId
+LEFT JOIN LinkAnalysis la ON ps.PostId = la.PostId
+WHERE ps.LastEventDate > (CAST('2024-10-01' AS date) - INTERVAL '1 month')
+  AND (ps.PostStatus <> 'Closed' OR ps.AnswerCount > (SELECT AVG(p3.AnswerCount) FROM Posts p3 WHERE p3.PostTypeId = 1 AND p3.ClosedDate IS NOT NULL))
+  AND tc.ReputationRank <= 100
+  AND (vm.VoteTypes IS NULL OR vm.VoteTypes LIKE '%UpMod%' OR vm.VoteTypes LIKE '%DownMod%')
+UNION ALL
+SELECT 
+    NULL AS PostId,
+    'Summary Stats' AS Title,
+    NULL AS Tags,
+    AVG(ps.Score) AS OriginalScore,
+    AVG(COALESCE(vm.UpVotes, 0)) AS UpVotes,
+    AVG(COALESCE(vm.DownVotes, 0)) AS DownVotes,
+    AVG(COALESCE(vm.TotalBounty, 0)) AS BountyAmount,
+    AVG(ps.ViewCount) AS ViewCount,
+    AVG(COALESCE(la.LinkedPosts, 0)) AS OutboundLinks,
+    AVG(COALESCE(la.DuplicateLinks, 0)) AS DuplicateCount,
+    'Summary' AS PostStatus,
+    AVG(tc.Reputation) AS Reputation,
+    AVG(tc.PostCount) AS PostCount,
+    AVG(COALESCE(bi.GoldBadges, 0)) AS GoldBadges,
+    AVG(COALESCE(bi.SilverBadges, 0)) AS SilverBadges,
+    NULL AS PostRecencyRank,
+    AVG(ps.TagAvgScore) AS TagAvgScore,
+    'Aggregate' AS PerformanceCategory,
+    ('Avg Across ' || COUNT(*) || ' Top Users') AS FormattedOwnerTags,
+    MAX(ps.LastEventDate) AS LastSignificantActivity
+FROM PostStats ps
+INNER JOIN TopContributors tc ON ps.ContributorId = tc.UserId
+LEFT JOIN VoteMetrics vm ON ps.PostId = vm.PostId
+LEFT JOIN BadgeInsights bi ON tc.UserId = bi.UserId
+LEFT JOIN LinkAnalysis la ON ps.PostId = la.PostId
+ORDER BY 
+    CASE PerformanceCategory 
+        WHEN 'Underperforming Closed' THEN 1 
+        WHEN 'Outlinked Underperformer' THEN 2 
+        WHEN 'Healthy' THEN 3 
+        ELSE 4 
+    END,
+    Reputation DESC,
+    PostRecencyRank ASC
+OFFSET 0 ROWS FETCH NEXT 50 ROWS ONLY;

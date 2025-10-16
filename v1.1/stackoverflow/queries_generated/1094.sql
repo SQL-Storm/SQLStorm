@@ -1,0 +1,60 @@
+-- {"query": "1094.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4o-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 399} 
+
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS Rank,
+        COUNT(c.Id) OVER (PARTITION BY p.Id) AS CommentCount
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Comments c ON p.Id = c.PostId
+    WHERE 
+        p.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+),
+FilteredPosts AS (
+    SELECT 
+        rp.PostId,
+        rp.Title,
+        rp.CreationDate,
+        rp.Score,
+        rp.ViewCount,
+        rp.Rank,
+        rp.CommentCount,
+        CASE 
+            WHEN rp.Score > 100 THEN 'High Score'
+            WHEN rp.Score BETWEEN 50 AND 100 THEN 'Moderate Score'
+            ELSE 'Low Score'
+        END AS ScoreCategory,
+        (SELECT AVG(Score) FROM Posts WHERE OwnerUserId = rp.OwnerUserId) AS AvgScoreByUser
+    FROM 
+        RankedPosts rp
+    WHERE 
+        rp.Rank = 1 AND 
+        rp.CommentCount > 5
+)
+SELECT 
+    fp.PostId,
+    fp.Title,
+    fp.CreationDate,
+    fp.Score,
+    fp.ViewCount,
+    fp.ScoreCategory,
+    COALESCE(fp.AvgScoreByUser, 0) AS AvgScoreByUser
+FROM 
+    FilteredPosts fp
+JOIN 
+    Users u ON u.Id = fp.PostId
+LEFT OUTER JOIN 
+    PostHistory ph ON ph.PostId = fp.PostId
+WHERE 
+    u.Reputation > 1000 AND 
+    (ph.Comment IS NULL OR ph.Comment NOT LIKE '%duplicate%')
+ORDER BY 
+    fp.Score DESC, 
+    fp.ViewCount DESC
+LIMIT 100;

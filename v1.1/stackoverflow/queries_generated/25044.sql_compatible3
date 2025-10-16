@@ -1,0 +1,171 @@
+WITH
+user_aggregates AS (
+    SELECT
+        u.Id                                    AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(SUM(p.Score),0)                AS total_post_score,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END),0) AS upvote_count,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END),0) AS downvote_count,
+        COUNT(DISTINCT b.Id)                    AS badge_total,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS gold_badges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS silver_badges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS bronze_badges
+    FROM Users u
+    LEFT JOIN Posts p            ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v            ON v.UserId = u.Id
+    LEFT JOIN Badges b           ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+tag_stats AS (
+    SELECT
+        t.Id                                 AS tag_id,
+        t.TagName,
+        t.Count                              AS tag_usage,
+        COALESCE(ep.Title, 'N/A')            AS latest_excerpt_title,
+        COALESCE(wp.Title, 'N/A')            AS latest_wiki_title,
+        ROW_NUMBER() OVER (PARTITION BY t.Id ORDER BY ep.CreationDate DESC) AS rn_excerpt,
+        ROW_NUMBER() OVER (PARTITION BY t.Id ORDER BY wp.CreationDate DESC) AS rn_wiki
+    FROM Tags t
+    LEFT JOIN Posts ep ON ep.Id = t.ExcerptPostId
+    LEFT JOIN Posts wp ON wp.Id = t.WikiPostId
+),
+closed_questions AS (
+    SELECT
+        p.Id                                 AS post_id,
+        p.Title,
+        p.Tags,
+        ph.CreationDate                      AS closed_date,
+        CAST(ph.Comment AS INTEGER)          AS close_reason_id,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY ph.CreationDate DESC) AS rn
+    FROM Posts p
+    JOIN PostHistory ph
+          ON ph.PostId = p.Id
+         AND ph.PostHistoryTypeId = 10
+    WHERE p.PostTypeId = 1
+),
+question_performance AS (
+    SELECT
+        q.Id                                 AS q_id,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CommentCount,
+        COALESCE(q.FavoriteCount,0)          AS favorite_count,
+        COALESCE(a.accepted,0)               AS has_accepted_answer,
+        ROW_NUMBER() OVER (ORDER BY q.Score DESC, q.ViewCount DESC) AS rank_by_score
+    FROM Posts q
+    LEFT JOIN (
+        SELECT
+            ParentId,
+            MAX(CASE WHEN Id = AcceptedAnswerId THEN 1 ELSE 0 END) AS accepted
+        FROM Posts
+        WHERE PostTypeId = 2
+        GROUP BY ParentId
+    ) a ON a.ParentId = q.Id
+    WHERE q.PostTypeId = 1
+),
+answer_only_users AS (
+    SELECT DISTINCT
+        a.OwnerUserId                        AS user_id
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+      AND NOT EXISTS (
+          SELECT 1
+          FROM Posts q
+          WHERE q.PostTypeId = 1
+            AND q.OwnerUserId = a.OwnerUserId
+      )
+),
+top_and_answer_only AS (
+    SELECT user_id, 'TopUser'   AS category FROM (
+        SELECT u.Id AS user_id
+        FROM Users u
+        ORDER BY u.Reputation DESC
+        LIMIT 50
+    ) t
+    UNION ALL
+    SELECT user_id, 'AnswerOnly' AS category FROM answer_only_users
+),
+post_recent_activity AS (
+    SELECT
+        p.Id                                 AS post_id,
+        p.Title,
+        (SELECT MAX(c.CreationDate) FROM Comments c WHERE c.PostId = p.Id) AS last_comment_date,
+        (SELECT MAX(v.CreationDate) FROM Votes v WHERE v.PostId = p.Id)    AS last_vote_date,
+        GREATEST(
+            COALESCE((SELECT MAX(c.CreationDate) FROM Comments c WHERE c.PostId = p.Id), TIMESTAMP '1970-01-01'),
+            COALESCE((SELECT MAX(v.CreationDate) FROM Votes v WHERE v.PostId = p.Id),    TIMESTAMP '1970-01-01')
+        )                                      AS last_activity
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+)
+
+SELECT
+    ua.user_id,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.total_post_score,
+    ua.upvote_count,
+    ua.downvote_count,
+    ua.badge_total,
+    ua.gold_badges,
+    ua.silver_badges,
+    ua.bronze_badges,
+    CASE WHEN toua.category = 'TopUser' THEN 'HighRep' ELSE 'LowRep' END AS reputation_category,
+    ts.TagName,
+    ts.tag_usage,
+    ts.latest_excerpt_title,
+    ts.latest_wiki_title,
+    cq.Title                                 AS closed_question_title,
+    cr.Name                                   AS close_reason_name,
+    qp.Title                                 AS top_question_title,
+    qp.Score                                 AS top_question_score,
+    qp.ViewCount,
+    qp.AnswerCount,
+    qp.CommentCount,
+    qp.favorite_count,
+    qp.has_accepted_answer,
+    pra.last_comment_date,
+    pra.last_vote_date,
+    pra.last_activity
+FROM top_and_answer_only toua
+JOIN user_aggregates ua           ON ua.user_id = toua.user_id
+LEFT JOIN (
+    SELECT
+        t.tag_id,
+        t.TagName,
+        t.tag_usage,
+        t.latest_excerpt_title,
+        t.latest_wiki_title
+    FROM tag_stats t
+    WHERE t.rn_excerpt = 1 AND t.rn_wiki = 1
+) ts ON ts.tag_id = (
+    SELECT
+        CAST((regexp_split_to_array(p.Tags, '[><]'))[2] AS INTEGER)
+    FROM Posts p
+    WHERE p.OwnerUserId = ua.user_id
+      AND p.PostTypeId = 1
+    ORDER BY p.CreationDate DESC
+    LIMIT 1
+)
+LEFT JOIN (
+    SELECT *
+    FROM closed_questions
+    WHERE rn = 1
+) cq
+       ON TRUE
+LEFT JOIN CloseReasonTypes cr
+       ON cr.Id = cq.close_reason_id
+LEFT JOIN (
+    SELECT *
+    FROM question_performance
+    WHERE rank_by_score <= 10
+) qp
+       ON qp.rank_by_score <= 10
+LEFT JOIN post_recent_activity pra
+       ON pra.post_id = qp.q_id
+WHERE ua.Reputation IS NOT NULL
+ORDER BY ua.Reputation DESC, qp.rank_by_score ASC
+LIMIT 200;

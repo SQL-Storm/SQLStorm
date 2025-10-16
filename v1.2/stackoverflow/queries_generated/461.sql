@@ -1,0 +1,170 @@
+-- {"query": "461.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1655} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE t.IsRequired = 1
+
+    UNION ALL
+
+    SELECT
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.ExcerptPostId,
+        child.WikiPostId,
+        child.IsModeratorOnly,
+        child.IsRequired,
+        parent.TagPath || child.TagName
+    FROM Tags child
+    JOIN RecursiveTagHierarchy parent ON child.IsRequired = 1 AND child.Id != parent.Id
+    WHERE NOT child.TagName = ANY(parent.TagPath)
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAsked,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersGiven,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COUNT(DISTINCT b.Id) AS BadgesEarned,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotesReceived,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotesReceived,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate) AS RankByReputation
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostScoreStats AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.Tags,
+        STRING_AGG(DISTINCT ph.Comment, ', ') FILTER (WHERE ph.PostHistoryTypeId = 10) AS CloseReasons,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (10, 11)) AS CloseReopenEvents,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 10) AS LastClosedDate,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 11) AS LastReopenedDate,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS ScoreRank
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.FavoriteCount, p.Tags
+),
+TopQuestionsWithAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        a.Id AS AnswerId,
+        a.OwnerUserId AS AnswerOwnerUserId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreationDate,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate) AS AnswerRank
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+      AND q.Score >= 10
+),
+UserBadgeDetails AS (
+    SELECT
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Class,
+        b.TagBased,
+        b.Date,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS RecentBadgeRank
+    FROM Badges b
+),
+DuplicatePostLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        p1.Title AS PostTitle,
+        p2.Title AS RelatedPostTitle
+    FROM PostLinks pl
+    JOIN Posts p1 ON p1.Id = pl.PostId
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    WHERE pl.LinkTypeId = 3 -- Duplicate
+),
+UserVoteSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesGiven,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesGiven,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId IN (8, 9)) AS BountiesGiven,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 5) AS FavoritesGiven
+    FROM Users u
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.QuestionsAsked,
+    ua.AnswersGiven,
+    ua.CommentsMade,
+    ua.BadgesEarned,
+    ua.UpVotesReceived,
+    ua.DownVotesReceived,
+    us.UpVotesGiven,
+    us.DownVotesGiven,
+    us.BountiesGiven,
+    us.FavoritesGiven,
+    ARRAY_AGG(DISTINCT dt.TagName) FILTER (WHERE dt.TagName IS NOT NULL) AS RequiredTags,
+    pq.Title AS TopQuestionTitle,
+    pq.QuestionScore,
+    pq.ViewCount AS QuestionViews,
+    pq.AnswerCount,
+    pa.AnswerId,
+    pa.AnswerScore,
+    pa.AnswerCreationDate,
+    db.BadgeName AS MostRecentBadge,
+    db.Class AS BadgeClass,
+    db.TagBased AS BadgeTagBased,
+    dup.PostTitle AS DuplicatePostTitle,
+    dup.RelatedPostTitle AS DuplicateOf,
+    ps.CloseReasons,
+    ps.CloseReopenEvents,
+    ps.LastClosedDate,
+    ps.LastReopenedDate
+FROM UserActivity ua
+LEFT JOIN UserVoteSummary us ON us.UserId = ua.UserId
+LEFT JOIN RecursiveTagHierarchy dt ON dt.IsRequired = 1
+LEFT JOIN TopQuestionsWithAnswers pq ON pq.OwnerUserId = ua.UserId AND pq.AnswerRank = 1
+LEFT JOIN Posts pa ON pa.Id = pq.AnswerId
+LEFT JOIN UserBadgeDetails db ON db.UserId = ua.UserId AND db.RecentBadgeRank = 1
+LEFT JOIN DuplicatePostLinks dup ON dup.PostId = pq.QuestionId
+LEFT JOIN PostScoreStats ps ON ps.Id = pq.QuestionId
+WHERE ua.RankByReputation <= 100
+GROUP BY
+    ua.UserId, ua.DisplayName, ua.Reputation, ua.QuestionsAsked, ua.AnswersGiven, ua.CommentsMade, ua.BadgesEarned,
+    ua.UpVotesReceived, ua.DownVotesReceived, us.UpVotesGiven, us.DownVotesGiven, us.BountiesGiven, us.FavoritesGiven,
+    pq.Title, pq.QuestionScore, pq.ViewCount, pq.AnswerCount, pa.AnswerId, pa.AnswerScore, pa.AnswerCreationDate,
+    db.BadgeName, db.Class, db.TagBased,
+    dup.PostTitle, dup.RelatedPostTitle,
+    ps.CloseReasons, ps.CloseReopenEvents, ps.LastClosedDate, ps.LastReopenedDate
+ORDER BY ua.Reputation DESC, ua.UserId
+LIMIT 50;

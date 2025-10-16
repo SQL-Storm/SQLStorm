@@ -1,0 +1,176 @@
+-- {"query": "583.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1671} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE t.IsRequired = 1
+
+    UNION ALL
+
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        rth.TagPath || t2.TagName
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy rth ON t2.Id <> ALL(rth.TagPath::text[])
+    WHERE t2.Count > 10 AND t2.IsModeratorOnly = 0
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAsked,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersGiven,
+        COALESCE(SUM(v.VoteTypeId = 2)::int, 0) AS UpVotesReceived,
+        COALESCE(SUM(v.VoteTypeId = 3)::int, 0) AS DownVotesReceived,
+        MAX(p.CreationDate) AS LastPostDate,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgPostScore,
+        STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.Class = 1) AS GoldBadges,
+        STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.Class = 2) AS SilverBadges,
+        STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName
+),
+PostDetails AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankByScoreView,
+        COUNT(*) OVER (PARTITION BY p.PostTypeId) AS TotalPostsByType,
+        COALESCE(pl.LinkTypeId, 0) AS LinkTypeId,
+        lt.Name AS LinkTypeName,
+        EXISTS (
+            SELECT 1 FROM Comments c WHERE c.PostId = p.Id AND c.Score > 5
+        ) AS HasHighScoreComment,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            ELSE 'Open'
+        END AS PostStatus
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN PostTypes pt ON pt.Id = p.PostTypeId
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id AND pl.LinkTypeId = 3
+    LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE p.CreationDate >= NOW() - INTERVAL '1 year'
+),
+TopQuestionsWithAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        q.OwnerUserId,
+        q.OwnerDisplayName,
+        q.CreationDate AS QuestionCreationDate,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.OwnerUserId AS AnswerOwnerUserId,
+        a.OwnerDisplayName AS AnswerOwnerDisplayName,
+        a.CreationDate AS AnswerCreationDate,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC) AS AnswerRank
+    FROM PostDetails q
+    LEFT JOIN PostDetails a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+      AND q.Score > 10
+      AND q.PostStatus = 'Open'
+),
+FilteredAnswers AS (
+    SELECT
+        tqa.*
+    FROM TopQuestionsWithAnswers tqa
+    WHERE tqa.AnswerRank <= 3
+),
+UserBadgeStats AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadgeCount,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadgeCount,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadgeCount,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+ComplexUserSummary AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        ua.UpVotesReceived,
+        ua.DownVotesReceived,
+        ua.BadgeCount,
+        COALESCE(ubs.GoldBadgeCount, 0) AS GoldBadgeCount,
+        COALESCE(ubs.SilverBadgeCount, 0) AS SilverBadgeCount,
+        COALESCE(ubs.BronzeBadgeCount, 0) AS BronzeBadgeCount,
+        ua.AvgPostScore,
+        ua.LastPostDate,
+        u.CreationDate,
+        u.Location,
+        CASE 
+            WHEN ua.UpVotesReceived > ua.DownVotesReceived THEN 'Positive'
+            WHEN ua.UpVotesReceived = ua.DownVotesReceived THEN 'Neutral'
+            ELSE 'Negative'
+        END AS ReputationSentiment,
+        STRING_AGG(DISTINCT t.TagName, ', ') AS FrequentTags
+    FROM UserActivity ua
+    LEFT JOIN UserBadgeStats ubs ON ubs.UserId = ua.UserId
+    LEFT JOIN Users u ON u.Id = ua.UserId
+    LEFT JOIN Posts p ON p.OwnerUserId = ua.UserId AND p.PostTypeId = 1
+    LEFT JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS TagName
+    ) t ON true
+    WHERE ua.QuestionsAsked > 0
+    GROUP BY ua.UserId, ua.DisplayName, ua.QuestionsAsked, ua.AnswersGiven, ua.UpVotesReceived, ua.DownVotesReceived, ua.BadgeCount, ubs.GoldBadgeCount, ubs.SilverBadgeCount, ubs.BronzeBadgeCount, ua.AvgPostScore, ua.LastPostDate, u.CreationDate, u.Location, ua.UpVotesReceived, ua.DownVotesReceived
+)
+SELECT
+    cus.UserId,
+    cus.DisplayName,
+    cus.QuestionsAsked,
+    cus.AnswersGiven,
+    cus.UpVotesReceived,
+    cus.DownVotesReceived,
+    cus.GoldBadgeCount,
+    cus.SilverBadgeCount,
+    cus.BronzeBadgeCount,
+    cus.AvgPostScore,
+    cus.LastPostDate,
+    cus.CreationDate,
+    cus.Location,
+    cus.ReputationSentiment,
+    cus.FrequentTags,
+    fq.QuestionId,
+    fq.Title AS QuestionTitle,
+    fq.QuestionScore,
+    fq.ViewCount,
+    fq.Tags AS QuestionTags,
+    fq.AnswerId,
+    fq.AnswerScore,
+    fq.AnswerOwnerDisplayName,
+    fq.AnswerCreationDate
+FROM ComplexUserSummary cus
+LEFT JOIN FilteredAnswers fq ON fq.OwnerUserId = cus.UserId
+WHERE cus.ReputationSentiment = 'Positive'
+  AND (fq.QuestionScore > 50 OR fq.AnswerScore > 20)
+ORDER BY cus.UpVotesReceived DESC, fq.QuestionScore DESC NULLS LAST, fq.AnswerScore DESC NULLS LAST
+LIMIT 100;

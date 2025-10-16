@@ -1,0 +1,188 @@
+-- {"query": "112.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 2882} 
+with
+-- recent questions and answers within last year, mark type and basic aggregates
+activity as (
+  select p.id, p.posttypeid, p.parentid, p.title, p.owneruserid, p.creationdate, p.score, p.viewcount, p.answercount,
+         p.tags,
+         case when p.posttypeid = 1 then 'question' when p.posttypeid = 2 then 'answer' else 'other' end as kind,
+         row_number() over (partition by p.posttypeid order by p.creationdate desc) as rn_by_type
+  from posts p
+  where p.creationdate >= (current_timestamp - interval '1 year')
+),
+-- explode tags for questions; supports NULL tags
+question_tags as (
+  select q.id as question_id,
+         trim(t) as tag
+  from activity q
+  left join lateral (
+    select unnest(string_to_array(substring(q.tags from 2 for char_length(coalesce(q.tags,'')) - 2), '><')) as t
+  ) s on true
+  where q.posttypeid = 1
+    and q.tags is not null
+),
+-- aggregate per tag: questions, avg score, avg answers, favored views, distinct askers
+tag_agg as (
+  select qt.tag,
+         count(distinct qt.question_id) as questions_count,
+         avg(nullif(p.score,0) ) filter (where p.posttypeid=1) as avg_question_score,
+         avg(p.answercount) filter (where p.posttypeid=1) as avg_answer_count,
+         sum(case when p.viewcount > 1000 then 1 else 0 end) as popular_views_count,
+         count(distinct p.owneruserid) as distinct_askers
+  from question_tags qt
+  join posts p on p.id = qt.question_id
+  group by qt.tag
+),
+-- compute per-user reputation trajectory and badge-weighted score
+user_basics as (
+  select u.id as user_id, u.displayname, u.reputation, u.creationdate,
+         extract(epoch from (current_timestamp - u.creationdate))/86400.0 as days_since_creation,
+         coalesce(u.upvotes,0) as upvotes, coalesce(u.downvotes,0) as downvotes,
+         case when u.reputation > 0 then (u.upvotes::numeric + 1)/(u.reputation::numeric + 1) else null end as upvote_rep_ratio
+  from users u
+),
+badge_weights as (
+  -- bronze=0.5 silver=1 gold=2 arbitrary benchmarking weights
+  select b.userid,
+         sum(case b.class when 1 then 2.0 when 2 then 1.0 when 3 then 0.5 else 0 end) as badge_score,
+         count(*) as badge_count
+  from badges b
+  group by b.userid
+),
+-- per-user post and vote aggregates including correlated subqueries for nuanced metrics
+user_activity as (
+  select ub.user_id,
+         ub.displayname,
+         ub.reputation,
+         coalesce(bw.badge_score,0) as badge_score,
+         coalesce(bw.badge_count,0) as badge_count,
+         coalesce(p_counts.total_posts,0) as total_posts,
+         coalesce(p_counts.questions,0) as questions_posted,
+         coalesce(p_counts.answers,0) as answers_posted,
+         coalesce(v_counts.upvotes_received,0) as upvotes_received,
+         coalesce(v_counts.downvotes_received,0) as downvotes_received,
+         -- correlated subquery: user's average answer score on questions with > 1 answers
+         (select avg(a.score) from posts a
+          where a.posttypeid = 2
+            and a.owneruserid = ub.user_id
+            and exists (select 1 from posts q where q.id = a.parentid and q.answercount > 1)
+         ) as avg_answer_score_in_competitive_questions,
+         -- boolean flag: has accepted answer ever
+         exists (
+           select 1 from posts q2 where q2.posttypeid = 1 and q2.acceptedanswerid is not null
+             and exists (select 1 from posts a2 where a2.id = q2.acceptedanswerid and a2.owneruserid = ub.user_id)
+         ) as has_accepted_any_answer
+  from user_basics ub
+  left join badge_weights bw on bw.userid = ub.user_id
+  left join lateral (
+    select count(*) as total_posts,
+           sum(case when posttypeid=1 then 1 else 0 end) as questions,
+           sum(case when posttypeid=2 then 1 else 0 end) as answers
+    from posts p where p.owneruserid = ub.user_id
+  ) p_counts on true
+  left join lateral (
+    select sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes_received,
+           sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes_received
+    from votes v join posts pv on pv.id = v.postid and pv.owneruserid = ub.user_id
+  ) v_counts on true
+),
+-- heavy join: top tags joined with their top question candidates and answer distributions
+tag_questions as (
+  select ta.tag, ta.questions_count, ta.avg_question_score, ta.avg_answer_count, ta.popular_views_count,
+         q.id as q_id, q.title as q_title, q.owneruserid as q_owner, q.creationdate as q_created,
+         q.score as q_score, q.viewcount as q_views, q.answercount as q_answers,
+         row_number() over (partition by ta.tag order by q.score desc nulls last, q.viewcount desc nulls last) as rn_tag_topq
+  from tag_agg ta
+  left join posts q on q.posttypeid = 1
+    and q.id in (select question_id from question_tags where tag = ta.tag)
+),
+-- answers detail for each top question via window function and join
+top_question_answers as (
+  select tq.tag, tq.q_id, a.id as answer_id, a.owneruserid as answerer, a.creationdate as answer_created,
+         a.score as answer_score,
+         rank() over (partition by tq.tag, tq.q_id order by a.score desc nulls last, a.creationdate asc) as answer_rank_in_question,
+         count(*) over (partition by tq.tag, tq.q_id) as answer_count_for_question
+  from tag_questions tq
+  left join posts a on a.posttypeid = 2 and a.parentid = tq.q_id
+  where tq.rn_tag_topq <= 3
+),
+-- vote shock metric: compare recent upvote velocity vs historical average per post (uses windowed time buckets)
+post_vote_velocity as (
+  select v.postid,
+         sum(case when v.creationdate >= current_timestamp - interval '30 days' then case when v.votetypeid=2 then 1 else 0 end else 0 end) as upvotes_last_30d,
+         sum(case when v.creationdate >= current_timestamp - interval '365 days' then case when v.votetypeid=2 then 1 else 0 end else 0 end) as upvotes_last_365d,
+         -- velocity ratio with NULL-safe logic
+         case
+           when sum(case when v.creationdate >= current_timestamp - interval '365 days' then case when v.votetypeid=2 then 1 else 0 end else 0 end) = 0
+             and sum(case when v.creationdate >= current_timestamp - interval '30 days' then case when v.votetypeid=2 then 1 else 0 end else 0 end) > 0
+           then 999.0
+           when sum(case when v.creationdate >= current_timestamp - interval '365 days' then case when v.votetypeid=2 then 1 else 0 end else 0 end) = 0
+           then null
+           else (sum(case when v.creationdate >= current_timestamp - interval '30 days' then case when v.votetypeid=2 then 1 else 0 end else 0 end)::numeric
+                 / greatest(1, sum(case when v.creationdate >= current_timestamp - interval '365 days' then case when v.votetypeid=2 then 1 else 0 end else 0 end)::numeric* (30.0/365.0)))
+         end as normalized_upvote_velocity
+  from votes v
+  group by v.postid
+),
+-- assemble final candidate rows combining tags, top questions, answers and author metrics
+candidates as (
+  select distinct ta.tag,
+         ta.questions_count, ta.avg_question_score, ta.avg_answer_count,
+         tq.q_id, tq.q_title, tq.q_owner, tq.q_created, tq.q_score, tq.q_views, tq.q_answers,
+         pvv.normalized_upvote_velocity, pvv.upvotes_last_30d, pvv.upvotes_last_365d,
+         -- best answerer per top question (highest scored answer)
+         (select a.owneruserid from posts a where a.posttypeid=2 and a.parentid = tq.q_id order by a.score desc nulls last, a.creationdate asc limit 1) as top_answerer_id,
+         ua.reputation as top_answerer_rep,
+         ua2.badge_score as top_answerer_badge_score,
+         ua2.badge_count as top_answerer_badge_count,
+         -- tag momentum heuristic
+         (coalesce(ta.popular_views_count,0) * coalesce(pvv.normalized_upvote_velocity,0) * greatest(1, ta.questions_count))::numeric as tag_momentum_score
+  from tag_agg ta
+  left join tag_questions tq on tq.tag = ta.tag and tq.rn_tag_topq = 1
+  left join post_vote_velocity pvv on pvv.postid = tq.q_id
+  left join users ua on ua.id = (select owneruserid from posts where id = (select a.id from posts a where a.posttypeid=2 and a.parentid = tq.q_id order by a.score desc nulls last limit 1))
+  left join badge_weights ua2 on ua2.userid = ua.id
+),
+-- rank candidates by composite metric, include NULL-safe ordering and tie-breakers
+ranked as (
+  select c.*,
+         row_number() over (
+           order by
+             (coalesce(c.tag_momentum_score,0) * nullif(coalesce(c.q_score,0),0) * (coalesce(c.questions_count,0)+1)) desc,
+             coalesce(c.q_views,0) desc,
+             coalesce(c.upvotes_last_30d,0) desc,
+             coalesce(c.top_answerer_rep,0) desc
+         ) as global_rank
+  from candidates c
+)
+-- final select returns top 100 candidate tag-question combos with rich diagnostics
+select r.global_rank,
+       r.tag,
+       r.questions_count,
+       round(coalesce(r.avg_question_score,0)::numeric,2) as avg_question_score,
+       round(coalesce(r.avg_answer_count,0)::numeric,2) as avg_answer_count,
+       r.q_id,
+       left(coalesce(r.q_title,'(no title)'), 200) as q_title_snippet,
+       r.q_owner,
+       ub.displayname as question_owner_name,
+       coalesce(r.q_created, timestamp '1970-01-01') as question_created,
+       r.q_score,
+       r.q_views,
+       r.q_answers,
+       coalesce(r.upvotes_last_30d,0) as upvotes_last_30d,
+       coalesce(r.upvotes_last_365d,0) as upvotes_last_365d,
+       round(coalesce(r.normalized_upvote_velocity,0)::numeric,2) as normalized_upvote_velocity,
+       r.top_answerer_id,
+       r.top_answerer_rep,
+       r.top_answerer_badge_score,
+       r.top_answerer_badge_count,
+       round(coalesce(r.tag_momentum_score,0)::numeric,4) as tag_momentum_score,
+       -- show a compact tag-summary string using string concatenation and null logic
+       (
+         coalesce(r.tag,'<no-tag>') || ' | Qs:' || r.questions_count::text || ' | AvgScore:' ||
+         coalesce(to_char(round(coalesce(r.avg_question_score,0)::numeric,2),'FM99999990.00'),'0') ||
+         ' | Momentum:' || coalesce(to_char(round(coalesce(r.tag_momentum_score,0)::numeric,2),'FM99999990.00'),'0')
+       ) as compact_summary
+from ranked r
+left join users ub on ub.id = r.q_owner
+order by r.global_rank
+limit 100;

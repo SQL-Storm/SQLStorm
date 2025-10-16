@@ -1,0 +1,78 @@
+-- {"query": "1218.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.2, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1022} 
+with RecursiveTopQuestions as (
+    select p.Id as QuestionId, p.Title, p.CreationDate, p.Score,
+           row_number() over (order by p.Score desc, p.CreationDate) as Rank
+    from Posts p
+    where p.PostTypeId = 1 and p.Score > 50 and p.ClosedDate is null
+),
+RecentAcceptedAnswers as (
+    select a.Id as AnswerId, a.ParentId as QuestionId, a.Score as AnswerScore, a.CreationDate as AnswerCreationDate,
+           u.Id as OwnerUserId, u.DisplayName as OwnerName,
+           row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate desc) as rn
+    from Posts a
+    left join Users u on a.OwnerUserId = u.Id
+    where a.PostTypeId = 2 and a.CreationDate > (current_date - interval '180 days')
+),
+TopAnswerers as (
+    select u.Id as UserId, u.DisplayName, count(a.Id) as AnswersCount,
+           avg(a.Score) as AvgAnswerScore,
+           sum(case when a.AcceptedAnswerId = a.Id then 1 else 0 end) as AcceptedAnswersCount
+    from Posts a
+    join Users u on a.OwnerUserId = u.Id
+    where a.PostTypeId = 2
+    group by u.Id, u.DisplayName
+    having count(a.Id) > 20
+),
+BadgesStats as (
+    select b.UserId,
+           count(*) filter (where b.Class = 1) as GoldBadges,
+           count(*) filter (where b.Class = 2) as SilverBadges,
+           count(*) filter (where b.Class = 3) as BronzeBadges,
+           bool_or(b.TagBased) as HasTagBadges
+    from Badges b
+    group by b.UserId
+),
+LatestPostEdits as (
+    select ph.PostId, max(ph.CreationDate) as LastEditDate,
+           max(ph.Id) as LastEditId
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4,5,6) -- Edit Title, Body, Tags
+    group by ph.PostId
+)
+select q.Rank, q.QuestionId, q.Title,
+       q.CreationDate, q.Score as QuestionScore,
+       ra.AnswerId, ra.AnswerScore, ra.AnswerCreationDate,
+       ra.OwnerUserId, ra.OwnerName,
+       ta.AnswersCount, ta.AvgAnswerScore, ta.AcceptedAnswersCount,
+       coalesce(bs.GoldBadges,0) as GoldBadges, coalesce(bs.SilverBadges,0) as SilverBadges,
+       coalesce(bs.BronzeBadges,0) as BronzeBadges, coalesce(bs.HasTagBadges,false) as HasTagBadges,
+       lpe.LastEditDate,
+       case 
+           when strpos(lower(q.Title),'sql') > 0 then 'Contains SQL Keyword'
+           when strpos(lower(q.Title),'benchmark') > 0 then 'Mentions Benchmark'
+           else 'Other' 
+       end as TitleCategory,
+       length(q.Title) as TitleLength,
+       concat('Tags: ', coalesce(substr(q.Tags,2,length(q.Tags)-2), 'None')) as TagsList
+from RecursiveTopQuestions q
+left join RecentAcceptedAnswers ra on q.QuestionId = ra.QuestionId and ra.rn = 1
+left join TopAnswerers ta on ra.OwnerUserId = ta.UserId
+left join BadgesStats bs on ta.UserId = bs.UserId
+left join LatestPostEdits lpe on q.QuestionId = lpe.PostId
+where q.Rank <= 50
+  and (ra.AnswerScore is null or ra.AnswerScore > 10)
+union
+select q2.Rank, q2.QuestionId, q2.Title,
+       q2.CreationDate, q2.Score as QuestionScore,
+       null as AnswerId, null as AnswerScore, null as AnswerCreationDate,
+       null as OwnerUserId, null as OwnerName,
+       null as AnswersCount, null as AvgAnswerScore, null as AcceptedAnswersCount,
+       null as GoldBadges, null as SilverBadges, null as BronzeBadges, null as HasTagBadges,
+       lpe2.LastEditDate,
+       'No acceptable answer' as TitleCategory,
+       length(q2.Title) as TitleLength,
+       concat('Tags: ', coalesce(substr(q2.Tags,2,length(q2.Tags)-2), 'None')) as TagsList
+from RecursiveTopQuestions q2
+left join LatestPostEdits lpe2 on q2.QuestionId = lpe2.PostId
+where q2.Rank <= 50 and q2.QuestionId not in (select QuestionId from RecentAcceptedAnswers)
+order by TitleCategory desc, QuestionScore desc, Rank;

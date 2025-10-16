@@ -1,0 +1,169 @@
+-- {"query": "382.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1514} 
+with RecursiveTagCounts as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount, 0) as TotalAnswers,
+        coalesce(p.ViewCount, 0) as TotalViews,
+        coalesce(p.Score, 0) as TotalScore,
+        1 as Level
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+    where t.TagName is not null
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        rtc.TotalAnswers + coalesce(p.AnswerCount, 0),
+        rtc.TotalViews + coalesce(p.ViewCount, 0),
+        rtc.TotalScore + coalesce(p.Score, 0),
+        rtc.Level + 1
+    from Tags t
+    join RecursiveTagCounts rtc on rtc.TagName = substring(t.TagName from 1 for length(rtc.TagName))
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+    where rtc.Level < 2
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        count(distinct p.Id) as TotalPosts,
+        sum(p.Score) as TotalPostScore,
+        max(p.CreationDate) as LastPostDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopQuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        u.DisplayName as AnswerOwner,
+        row_number() over (partition by q.Id order by a.Score desc nulls last, a.CreationDate asc) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1
+      and q.Score > 10
+      and q.ViewCount > 1000
+),
+CloseReasonCounts as (
+    select
+        crt.Name as CloseReason,
+        count(distinct ph.PostId) as ClosedPostsCount
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10
+    group by crt.Name
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        count(*) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as PostsLast30Days,
+        sum(p.Score) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as ScoreLast30Days
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+),
+DistinctTagsPerQuestion as (
+    select
+        p.Id as QuestionId,
+        array_length(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><'), 1) as TagCount
+    from Posts p
+    where p.PostTypeId = 1
+),
+HighImpactPosts as (
+    select
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        case
+            when p.Score > 100 and p.ViewCount > 10000 then 'High Impact'
+            when p.Score between 50 and 100 then 'Medium Impact'
+            else 'Low Impact'
+        end as ImpactCategory
+    from Posts p
+    where p.PostTypeId in (1, 2)
+),
+UserCommentStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(c.Id) as TotalComments,
+        avg(c.Score) as AvgCommentScore,
+        max(c.CreationDate) as LastCommentDate,
+        sum(case when c.Text ilike '%error%' then 1 else 0 end) as ErrorMentions
+    from Users u
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName
+)
+select
+    ubs.UserId,
+    ubs.DisplayName,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.TotalPosts,
+    ubs.TotalPostScore,
+    ubs.LastPostDate,
+    ua.PostsLast30Days,
+    ua.ScoreLast30Days,
+    ucs.TotalComments,
+    ucs.AvgCommentScore,
+    ucs.ErrorMentions,
+    hi.ImpactCategory,
+    dt.TagCount,
+    crc.CloseReason,
+    crc.ClosedPostsCount,
+    tq.Title as TopQuestionTitle,
+    tq.AnswerOwner,
+    tq.AnswerScore,
+    rtc.TagName,
+    rtc.TotalAnswers,
+    rtc.TotalViews,
+    rtc.TotalScore
+from UserBadgeStats ubs
+left join UserActivityWindow ua on ua.UserId = ubs.UserId
+left join UserCommentStats ucs on ucs.UserId = ubs.UserId
+left join HighImpactPosts hi on hi.Id = (
+    select p.Id from Posts p where p.OwnerUserId = ubs.UserId order by p.Score desc limit 1
+)
+left join DistinctTagsPerQuestion dt on dt.QuestionId = (
+    select p.Id from Posts p where p.OwnerUserId = ubs.UserId and p.PostTypeId = 1 order by p.CreationDate desc limit 1
+)
+left join CloseReasonCounts crc on crc.CloseReason = (
+    select crt.Name from CloseReasonTypes crt
+    join PostHistory ph on ph.PostHistoryTypeId = 10 and cast(ph.Comment as int) = crt.Id
+    where ph.PostId in (select p.Id from Posts p where p.OwnerUserId = ubs.UserId)
+    order by count(ph.PostId) desc limit 1
+)
+left join TopQuestionsWithAnswers tq on tq.QuestionId = (
+    select p.Id from Posts p where p.OwnerUserId = ubs.UserId and p.PostTypeId = 1 order by p.Score desc limit 1
+)
+left join RecursiveTagCounts rtc on rtc.TagName = (
+    select substring(tq.Tags from 2 for length(tq.Tags)-2) limit 1
+)
+where ubs.TotalPosts > 10
+order by ubs.TotalPostScore desc
+limit 100;

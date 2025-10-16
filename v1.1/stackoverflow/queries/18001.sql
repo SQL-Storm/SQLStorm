@@ -1,0 +1,182 @@
+WITH
+  RecentQuestions AS (
+    SELECT
+      p.Id,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.Score,
+      p.AnswerCount,
+      u.DisplayName AS OwnerDisplayName,
+      ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    JOIN Users u
+      ON p.OwnerUserId = u.Id
+    WHERE
+      p.PostTypeId = 1
+      AND p.CreationDate > (cast('2024-10-01' as date) - INTERVAL '30 days')
+  ),
+  HighScoringAnswers AS (
+    SELECT
+      p.Id,
+      p.ParentId,
+      p.OwnerUserId,
+      p.Score,
+      u.DisplayName AS AnswererDisplayName,
+      ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS answer_rank
+    FROM Posts p
+    JOIN Users u
+      ON p.OwnerUserId = u.Id
+    WHERE
+      p.PostTypeId = 2
+      AND p.Score > 10
+  ),
+  QuestionAnswerStats AS (
+    SELECT
+      rq.Id AS QuestionId,
+      rq.Title AS QuestionTitle,
+      rq.OwnerDisplayName AS QuestionOwner,
+      rq.CreationDate AS QuestionDate,
+      rq.Score AS QuestionScore,
+      rq.AnswerCount AS TotalAnswers,
+      COUNT(hsa.Id) AS HighScoringAnswerCount,
+      MAX(hsa.Score) AS MaxAnswerScore,
+      AVG(hsa.Score) AS AvgHighScoringAnswerScore,
+      SUM(CASE WHEN hsa.answer_rank = 1 THEN hsa.Score ELSE 0 END) AS BestAnswerScore
+    FROM RecentQuestions rq
+    LEFT JOIN HighScoringAnswers hsa
+      ON rq.Id = hsa.ParentId
+    GROUP BY
+      rq.Id,
+      rq.Title,
+      rq.OwnerDisplayName,
+      rq.CreationDate,
+      rq.Score,
+      rq.AnswerCount
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(p.Id) AS PostsCount,
+      COUNT(c.Id) AS CommentsCount,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived
+    FROM Users u
+    LEFT JOIN Posts p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c
+      ON u.Id = c.UserId
+    LEFT JOIN Votes v
+      ON u.Id = v.UserId AND v.VoteTypeId = 3
+    WHERE
+      u.CreationDate > (cast('2024-10-01' as date) - INTERVAL '1 year')
+    GROUP BY
+      u.Id,
+      u.DisplayName
+    HAVING
+      COUNT(p.Id) > 5 OR COUNT(c.Id) > 10
+  )
+SELECT
+  qas.QuestionId,
+  qas.QuestionTitle,
+  qas.QuestionOwner,
+  qas.QuestionDate,
+  qas.QuestionScore,
+  qas.TotalAnswers,
+  qas.HighScoringAnswerCount,
+  qas.MaxAnswerScore,
+  qas.AvgHighScoringAnswerScore,
+  qas.BestAnswerScore,
+  ua.DisplayName AS MostActiveUser,
+  ua.PostsCount AS MostActiveUserPosts,
+  ua.CommentsCount AS MostActiveUserComments,
+  ua.UpVotesReceived AS UserUpVotesReceived,
+  CASE
+    WHEN qas.MaxAnswerScore IS NULL THEN 'No High Scoring Answers'
+    WHEN qas.MaxAnswerScore > 50 THEN 'Excellent Answer'
+    WHEN qas.MaxAnswerScore > 20 THEN 'Good Answer'
+    ELSE 'Average Answer'
+  END AS AnswerQualityCategory,
+  '---' AS Separator,
+  COUNT(c.Id) FILTER (WHERE c.Id IS NOT NULL) OVER (PARTITION BY qas.QuestionId) AS TotalCommentsOnQuestion,
+  SUM(CASE WHEN c.Score > 0 THEN 1 ELSE 0 END) OVER (PARTITION BY qas.QuestionId) AS PositiveScoreComments,
+  COALESCE(MAX(ph.CreationDate) OVER (PARTITION BY qas.QuestionId), qas.QuestionDate) AS LastRelevantActivity
+FROM QuestionAnswerStats qas
+LEFT JOIN UserActivity ua
+  ON qas.QuestionId = (
+    SELECT p.Id
+    FROM Posts p
+    WHERE
+      p.OwnerUserId = ua.UserId
+      AND p.PostTypeId = 1
+    ORDER BY
+      p.CreationDate DESC
+    LIMIT 1
+  )
+LEFT JOIN Comments c
+  ON qas.QuestionId = c.PostId
+LEFT JOIN PostHistory ph
+  ON qas.QuestionId = ph.PostId AND ph.PostHistoryTypeId IN (4, 5, 6)
+WHERE
+  qas.TotalAnswers > 0 AND qas.MaxAnswerScore IS NOT NULL
+GROUP BY
+  qas.QuestionId,
+  qas.QuestionTitle,
+  qas.QuestionOwner,
+  qas.QuestionDate,
+  qas.QuestionScore,
+  qas.TotalAnswers,
+  qas.HighScoringAnswerCount,
+  qas.MaxAnswerScore,
+  qas.AvgHighScoringAnswerScore,
+  qas.BestAnswerScore,
+  ua.DisplayName,
+  ua.PostsCount,
+  ua.CommentsCount,
+  ua.UpVotesReceived,
+  qas.QuestionId,  -- required because used in window PARTITION BY
+  c.Id,            -- include c.Id because referenced (COUNT(c.Id) in HAVING and window)
+  c.Score,
+  ph.CreationDate
+HAVING
+  COUNT(c.Id) > 5
+UNION ALL
+SELECT
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  ua.DisplayName,
+  ua.PostsCount,
+  ua.CommentsCount,
+  ua.UpVotesReceived,
+  'No Matching Questions' AS AnswerQualityCategory,
+  '---' AS Separator,
+  NULL,
+  NULL,
+  NULL
+FROM UserActivity ua
+WHERE
+  NOT EXISTS (
+    SELECT 1
+    FROM QuestionAnswerStats qas
+    WHERE
+      qas.QuestionId = (
+        SELECT p.Id
+        FROM Posts p
+        WHERE
+          p.OwnerUserId = ua.UserId
+          AND p.PostTypeId = 1
+        ORDER BY
+          p.CreationDate DESC
+        LIMIT 1
+      )
+  )
+ORDER BY
+  QuestionDate DESC;

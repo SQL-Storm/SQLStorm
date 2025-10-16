@@ -1,0 +1,188 @@
+-- {"query": "141.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.1, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1701} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 as Level,
+        cast(t.TagName as varchar(1000)) as Path
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Level + 1,
+        r.Path || ' > ' || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id <> r.Id and t2.Count < r.Count
+    where r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(*) as TotalBadges
+    from Badges b
+    group by b.UserId
+),
+PostScoreRanks as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as ScoreRank,
+        rank() over (partition by p.OwnerUserId order by p.Score desc) as UserScoreRank
+    from Posts p
+    where p.PostTypeId in (1, 2)
+),
+TopPostsWithComments as (
+    select
+        p.Id as PostId,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.PostTypeId,
+        coalesce(c.CommentCount, 0) as CommentCount,
+        coalesce(c.MaxCommentScore, 0) as MaxCommentScore,
+        coalesce(c.AvgCommentLength, 0) as AvgCommentLength
+    from Posts p
+    left join (
+        select
+            PostId,
+            count(*) as CommentCount,
+            max(Score) as MaxCommentScore,
+            avg(length(Text)) as AvgCommentLength
+        from Comments
+        group by PostId
+    ) c on p.Id = c.PostId
+    where p.Score > 10 and p.ViewCount > 100
+),
+UserActivitySummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.TotalBadges,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct ph.Id) filter (where ph.PostHistoryTypeId = 10) as CloseVotesCast,
+        count(distinct v.Id) filter (where v.VoteTypeId = 2) as UpVotesCast,
+        count(distinct v.Id) filter (where v.VoteTypeId = 3) as DownVotesCast
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Badges ub on ub.UserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location, u.Views, u.UpVotes, u.DownVotes, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ub.TotalBadges
+),
+DuplicateQuestionLinks as (
+    select
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId,
+        p1.Title as DuplicateTitle,
+        p2.Title as OriginalTitle,
+        pl.CreationDate
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId and p1.PostTypeId = 1
+    join Posts p2 on p2.Id = pl.RelatedPostId and p2.PostTypeId = 1
+    where pl.LinkTypeId = 3
+),
+QuestionsWithAcceptedAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Tags,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        a.Id as AcceptedAnswerId,
+        a.Score as AcceptedAnswerScore,
+        a.ViewCount as AcceptedAnswerViews,
+        u.DisplayName as QuestionOwner,
+        ua.DisplayName as AnswerOwner,
+        q.CreationDate as QuestionCreationDate,
+        a.CreationDate as AnswerCreationDate,
+        extract(epoch from (a.CreationDate - q.CreationDate))/3600 as HoursToAccept
+    from Posts q
+    left join Posts a on a.Id = q.AcceptedAnswerId
+    left join Users u on u.Id = q.OwnerUserId
+    left join Users ua on ua.Id = a.OwnerUserId
+    where q.PostTypeId = 1 and q.AcceptedAnswerId is not null
+),
+FinalResult as (
+    select
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.Location,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.GoldBadges,
+        uas.SilverBadges,
+        uas.BronzeBadges,
+        uas.TotalBadges,
+        coalesce(dql.DuplicateQuestionId, 0) as HasDuplicateQuestions,
+        coalesce(qaas.QuestionId, 0) as HasAcceptedAnswers,
+        pt.ScoreRank,
+        pt.UserScoreRank,
+        tth.Level as TagHierarchyLevel,
+        tth.Path as TagHierarchyPath,
+        tth.Count as TagCount,
+        tth.TagName,
+        tth.ExcerptPostId,
+        tth.WikiPostId
+    from UserActivitySummary uas
+    left join DuplicateQuestionLinks dql on dql.DuplicateQuestionId = uas.UserId
+    left join QuestionsWithAcceptedAnswerStats qaas on qaas.QuestionOwner = uas.DisplayName
+    left join PostScoreRanks pt on pt.OwnerUserId = uas.UserId
+    left join RecursiveTagHierarchy tth on tth.TagName = any(string_to_array(coalesce((select Tags from Posts where OwnerUserId = uas.UserId limit 1), ''), '><'))
+    where uas.Reputation > 1000
+)
+select
+    fr.UserId,
+    fr.DisplayName,
+    fr.Reputation,
+    fr.Location,
+    fr.QuestionCount,
+    fr.AnswerCount,
+    fr.GoldBadges,
+    fr.SilverBadges,
+    fr.BronzeBadges,
+    fr.TotalBadges,
+    case when fr.HasDuplicateQuestions > 0 then 'Yes' else 'No' end as HasDuplicateQuestions,
+    case when fr.HasAcceptedAnswers > 0 then 'Yes' else 'No' end as HasAcceptedAnswers,
+    fr.ScoreRank,
+    fr.UserScoreRank,
+    fr.TagHierarchyLevel,
+    fr.TagHierarchyPath,
+    fr.TagCount,
+    fr.TagName,
+    fr.ExcerptPostId,
+    fr.WikiPostId,
+    length(coalesce(fr.TagHierarchyPath, '')) as TagPathLength,
+    case when fr.Location is null or trim(fr.Location) = '' then 'Unknown' else fr.Location end as NormalizedLocation
+from FinalResult fr
+where fr.TagHierarchyLevel is not null
+order by fr.Reputation desc, fr.TotalBadges desc, fr.ScoreRank asc
+limit 100;

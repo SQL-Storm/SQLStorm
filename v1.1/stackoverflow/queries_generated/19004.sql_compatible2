@@ -1,0 +1,276 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(P.ViewCount, 0)) AS TotalPostViews,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        MAX(P.LastActivityDate) AS LastPostActivity,
+        AVG(
+            EXTRACT(EPOCH FROM (current_post.CreationDate - prev_post.prev_creation_date)) / (60 * 60 * 24)
+        ) AS AvgPostIntervalDays,
+        (
+            SELECT COUNT(ph.Id)
+            FROM PostHistory ph
+            WHERE ph.UserId = U.Id
+              AND ph.CreationDate > (U.LastAccessDate - INTERVAL '6 months')
+        ) AS RecentHistoryEditsCount
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN LATERAL (
+        SELECT
+            p_inner.CreationDate,
+            LAG(p_inner.CreationDate, 1) OVER (ORDER BY p_inner.CreationDate) AS prev_creation_date
+        FROM Posts p_inner
+        WHERE p_inner.OwnerUserId = U.Id
+    ) AS current_post ON P.CreationDate = current_post.CreationDate
+    LEFT JOIN LATERAL (
+        SELECT p_prev.CreationDate AS prev_creation_date
+        FROM Posts p_prev
+        WHERE p_prev.OwnerUserId = U.Id AND p_prev.CreationDate = current_post.prev_creation_date
+    ) AS prev_post ON prev_post.prev_creation_date IS NOT NULL
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes, U.DownVotes
+),
+PostDetails AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.FavoriteCount,
+        LENGTH(P.Body) AS BodyLength,
+        LENGTH(P.Title) AS TitleLength,
+        COALESCE(P.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+        (CASE WHEN P.CommunityOwnedDate IS NOT NULL THEN TRUE ELSE FALSE END) AS IsCommunityWiki,
+        (SELECT AVG(COALESCE(c2.Score, 0)) FROM Comments c2 WHERE c2.PostId = P.Id) AS AvgCommentScore,
+        (SELECT ARRAY_AGG(TRIM(x)) FROM (SELECT TRIM(x) FROM UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR (CHAR_LENGTH(P.Tags)-2)), '><')) AS x) AS t) AS ParsedTags,
+        (SELECT COUNT(pl.RelatedPostId)
+         FROM PostLinks pl
+         WHERE pl.PostId = P.Id AND pl.LinkTypeId = 1) AS LinkedPostCount,
+        (SELECT COUNT(pl.RelatedPostId)
+         FROM PostLinks pl
+         WHERE pl.PostId = P.Id AND pl.LinkTypeId = 3) AS DuplicatePostCount,
+        (SELECT AVG(pr.Score)
+         FROM PostLinks pl_inner
+         JOIN Posts pr ON pl_inner.RelatedPostId = pr.Id
+         WHERE pl_inner.PostId = P.Id AND pl_inner.LinkTypeId = 1) AS AvgScoreOfLinkedPosts,
+        (SELECT MAX(ph.CreationDate)
+         FROM PostHistory ph
+         WHERE ph.PostId = P.Id AND ph.PostHistoryTypeId IN (4, 5, 6)) AS LastEditDate,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate DESC) AS rn_latest_post_by_user
+    FROM Posts P
+    WHERE P.PostTypeId IN (1, 2)
+),
+TagPerformance AS (
+    SELECT
+        tag.TagName AS TagName,
+        COUNT(DISTINCT pd.PostId) AS TaggedPostCount,
+        SUM(pd.PostScore) AS TotalTagScore,
+        AVG(pd.PostScore) AS AvgTagPostScore,
+        AVG(pd.ViewCount) AS AvgTagPostViewCount,
+        COUNT(DISTINCT pd.OwnerUserId) AS UniqueTagOwners
+    FROM PostDetails pd
+    CROSS JOIN LATERAL (
+        SELECT TRIM(x) AS TagName
+        FROM UNNEST(pd.ParsedTags) AS x
+    ) AS tag
+    WHERE tag.TagName IS NOT NULL AND tag.TagName != ''
+    GROUP BY tag.TagName
+    HAVING COUNT(DISTINCT pd.PostId) > 50
+),
+TopTagsByInfluence AS (
+    SELECT
+        tp.TagName,
+        tp.TaggedPostCount,
+        tp.AvgTagPostScore,
+        RANK() OVER (ORDER BY (tp.AvgTagPostScore * tp.TaggedPostCount * COALESCE(tp.AvgTagPostViewCount,1) / 100.0) DESC) AS TagInfluenceRank
+    FROM TagPerformance tp
+),
+UserPostPerformance AS (
+    SELECT
+        ue.UserId,
+        ue.DisplayName,
+        ue.Reputation,
+        ue.TotalPosts,
+        ue.TotalQuestions,
+        ue.TotalAnswers,
+        ue.TotalComments,
+        ue.TotalPostScore,
+        ue.TotalPostViews,
+        ue.TotalBadges,
+        ue.AvgPostIntervalDays,
+        ue.RecentHistoryEditsCount,
+        pd.PostId,
+        pd.PostTypeId,
+        pd.PostCreationDate,
+        pd.PostScore,
+        pd.ViewCount,
+        pd.AnswerCount,
+        pd.FavoriteCount,
+        pd.BodyLength,
+        pd.TitleLength,
+        pd.AcceptedAnswerId AS HasAcceptedAnswer,
+        pd.IsCommunityWiki,
+        pd.AvgCommentScore,
+        pd.ParsedTags,
+        pd.LinkedPostCount,
+        pd.DuplicatePostCount,
+        COALESCE(pd.AvgScoreOfLinkedPosts, 0) AS AvgScoreOfLinkedPosts,
+        pd.LastEditDate,
+        (pd.PostScore * 0.4 + COALESCE(pd.ViewCount, 0) * 0.01 + COALESCE(pd.FavoriteCount, 0) * 0.5 + COALESCE(pd.AnswerCount, 0) * 0.3 + COALESCE(pd.LinkedPostCount, 0) * 0.2 + COALESCE(pd.AvgCommentScore, 0) * 0.1) AS IndividualPostInfluenceScore,
+        RANK() OVER (PARTITION BY ue.UserId ORDER BY (pd.PostScore * 0.4 + COALESCE(pd.ViewCount, 0) * 0.01 + COALESCE(pd.FavoriteCount, 0) * 0.5 + COALESCE(pd.AnswerCount, 0) * 0.3 + COALESCE(pd.LinkedPostCount, 0) * 0.2 + COALESCE(pd.AvgCommentScore, 0) * 0.1) DESC) AS UserPostInfluenceRank
+    FROM UserEngagement ue
+    JOIN PostDetails pd ON ue.UserId = pd.OwnerUserId
+    WHERE pd.rn_latest_post_by_user <= 10
+      AND pd.PostTypeId = 1
+      AND pd.PostCreationDate IS NOT NULL AND pd.LastEditDate IS NOT NULL
+),
+ConsolidatedUserMetrics AS (
+    SELECT
+        upp.UserId,
+        upp.DisplayName,
+        upp.Reputation,
+        ue.UserCreationDate,
+        ue.LastAccessDate,
+        upp.TotalPosts,
+        upp.TotalQuestions,
+        upp.TotalAnswers,
+        upp.TotalComments,
+        upp.TotalPostScore,
+        upp.TotalPostViews,
+        upp.TotalBadges,
+        upp.AvgPostIntervalDays,
+        upp.RecentHistoryEditsCount,
+        AVG(upp.IndividualPostInfluenceScore) AS AvgUserTopQuestionsInfluenceScore,
+        SUM(CASE WHEN upp.HasAcceptedAnswer != -1 THEN 1 ELSE 0 END) AS AcceptedAnswerCountForUserQuestions,
+        (SELECT COUNT(DISTINCT t.TagName)
+         FROM (
+             SELECT TRIM(x) AS TagName
+             FROM UserPostPerformance upp2
+             CROSS JOIN LATERAL UNNEST(upp2.ParsedTags) AS x
+             WHERE upp2.UserId = upp.UserId
+         ) AS t
+        ) AS DistinctTagsUsedInTopQuestions,
+        (
+            SELECT COUNT(c.Id)
+            FROM Comments c
+            JOIN Posts p_q ON c.PostId = p_q.Id
+            WHERE p_q.OwnerUserId = upp.UserId AND p_q.PostTypeId = 1 AND c.Score > 0
+        ) AS PositiveCommentCountOnQuestions,
+        (
+            SELECT AVG(LENGTH(c.Text))
+            FROM Comments c
+            JOIN Posts p_q ON c.PostId = p_q.Id
+            WHERE p_q.OwnerUserId = upp.UserId AND p_q.PostTypeId = 1
+        ) AS AvgCommentLengthOnQuestions
+    FROM UserEngagement ue
+    JOIN UserPostPerformance upp ON ue.UserId = upp.UserId
+    GROUP BY
+        upp.UserId, upp.DisplayName, upp.Reputation, ue.UserCreationDate, ue.LastAccessDate,
+        upp.TotalPosts, upp.TotalQuestions, upp.TotalAnswers, upp.TotalComments, upp.TotalPostScore,
+        upp.TotalPostViews, upp.TotalBadges, upp.AvgPostIntervalDays, upp.RecentHistoryEditsCount
+)
+SELECT
+    cum.UserId,
+    cum.DisplayName,
+    cum.Reputation,
+    cum.UserCreationDate,
+    cum.LastAccessDate,
+    cum.TotalPosts,
+    cum.TotalQuestions,
+    cum.TotalAnswers,
+    cum.TotalComments,
+    cum.TotalPostScore,
+    cum.TotalPostViews,
+    cum.TotalBadges,
+    cum.AvgPostIntervalDays,
+    cum.RecentHistoryEditsCount,
+    cum.AvgUserTopQuestionsInfluenceScore,
+    cum.AcceptedAnswerCountForUserQuestions,
+    cum.DistinctTagsUsedInTopQuestions,
+    cum.PositiveCommentCountOnQuestions,
+    COALESCE(cum.AvgCommentLengthOnQuestions, 0) AS AvgCommentLengthOnQuestions,
+    CASE
+        WHEN cum.TotalQuestions > COALESCE(cum.TotalAnswers, 0) * 1.5 AND cum.TotalQuestions > 0 THEN 'Primary Questioner'
+        WHEN cum.TotalAnswers > COALESCE(cum.TotalQuestions, 0) * 1.5 AND cum.TotalAnswers > 0 THEN 'Primary Answerer'
+        WHEN cum.TotalComments > (COALESCE(cum.TotalQuestions, 0) + COALESCE(cum.TotalAnswers, 0)) * 0.75 AND cum.TotalComments > 0 THEN 'Active Commenter'
+        WHEN cum.TotalPosts > 0 THEN 'General Contributor'
+        ELSE 'Passive User'
+    END AS UserEngagementType,
+    (
+        cum.Reputation * 0.15 +
+        cum.TotalPostScore * 0.2 +
+        COALESCE(cum.AvgUserTopQuestionsInfluenceScore, 0) * 0.25 +
+        cum.TotalBadges * 0.5 +
+        (COALESCE(cum.TotalQuestions, 0) / NULLIF(COALESCE(cum.TotalPosts, 0), 0)) * 100 * 0.05 +
+        (COALESCE(cum.TotalAnswers, 0) / NULLIF(COALESCE(cum.TotalPosts, 0), 0)) * 100 * 0.05 +
+        (COALESCE(cum.TotalPostViews, 0) / NULLIF(COALESCE(cum.TotalPosts, 0), 0)) * 0.01 +
+        cum.RecentHistoryEditsCount * 0.1 +
+        COALESCE((SELECT SUM(v.BountyAmount) FROM Votes v WHERE v.UserId = cum.UserId AND v.VoteTypeId = 8), 0) * 0.2 +
+        cum.PositiveCommentCountOnQuestions * 0.05
+    ) AS UserOverallInfluenceScore,
+    (
+        SELECT AVG(pd_inner.BodyLength)
+        FROM PostDetails pd_inner
+        WHERE pd_inner.OwnerUserId = cum.UserId AND pd_inner.PostTypeId = 1
+        ORDER BY pd_inner.PostScore DESC
+        LIMIT 3
+    ) AS AvgTopRatedQuestionBodyLength,
+    (
+        SELECT t_user.TagName
+        FROM (
+            SELECT tag.TagName AS TagName, COUNT(pd_user.PostId) AS TagUsageCount
+            FROM PostDetails pd_user
+            CROSS JOIN LATERAL (
+                SELECT TRIM(x) AS TagName
+                FROM UNNEST(pd_user.ParsedTags) AS x
+            ) AS tag
+            WHERE pd_user.OwnerUserId = cum.UserId AND tag.TagName IS NOT NULL
+            GROUP BY tag.TagName
+            ORDER BY TagUsageCount DESC, AVG(pd_user.PostScore) DESC
+            LIMIT 1
+        ) AS t_user
+    ) AS UsersMostImpactfulTag,
+    DENSE_RANK() OVER (ORDER BY (
+        cum.Reputation * 0.15 +
+        cum.TotalPostScore * 0.2 +
+        COALESCE(cum.AvgUserTopQuestionsInfluenceScore, 0) * 0.25 +
+        cum.TotalBadges * 0.5 +
+        (COALESCE(cum.TotalQuestions, 0) / NULLIF(COALESCE(cum.TotalPosts, 0), 0)) * 100 * 0.05 +
+        (COALESCE(cum.TotalAnswers, 0) / NULLIF(COALESCE(cum.TotalPosts, 0), 0)) * 100 * 0.05 +
+        (COALESCE(cum.TotalPostViews, 0) / NULLIF(COALESCE(cum.TotalPosts, 0), 0)) * 0.01 +
+        cum.RecentHistoryEditsCount * 0.1 +
+        COALESCE((SELECT SUM(v_inner.BountyAmount) FROM Votes v_inner WHERE v_inner.UserId = cum.UserId AND v_inner.VoteTypeId = 8), 0) * 0.2 +
+        cum.PositiveCommentCountOnQuestions * 0.05
+    ) DESC) AS OverallUserRank
+FROM ConsolidatedUserMetrics cum
+WHERE
+    cum.Reputation > 7500
+    AND cum.TotalPosts > 20
+    AND cum.TotalBadges > 10
+    AND cum.LastAccessDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months')
+    AND COALESCE(cum.AvgPostIntervalDays, 9999) < 90
+    AND (
+        cum.DisplayName ILIKE '%engineer%' OR cum.DisplayName ILIKE '%architect%' OR
+        EXISTS (
+            SELECT 1 FROM Badges b
+            WHERE b.UserId = cum.UserId AND b.Class = 1 AND b.Date > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years')
+        )
+    )
+    AND cum.AvgUserTopQuestionsInfluenceScore IS NOT NULL
+ORDER BY OverallUserRank ASC, cum.Reputation DESC, cum.UserOverallInfluenceScore DESC
+LIMIT 100;

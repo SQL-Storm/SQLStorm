@@ -1,0 +1,112 @@
+-- {"query": "6068.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 849} 
+WITH RecentActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.Tags,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    u.Reputation,
+    u.DisplayName AS OwnerDisplayName,
+    u.Location,
+    u.AccountId,
+    b.Name AS BadgeName,
+    b.Date AS BadgeDate
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  WHERE p.PostTypeId = 1 -- Questions
+),
+TagStats AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS TagQuestionCount,
+    AVG(p.Score) AS AvgQuestionScore,
+    MAX(p.ViewCount) AS MaxViews
+  FROM Posts p
+  CROSS APPLY (
+    SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName
+  ) AS tagsplit
+  GROUP BY t.TagName
+),
+Engagement AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    SUM(CASE WHEN v.VoteTypeId = 16 THEN 1 ELSE 0 END) AS ModeratorVotes
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  GROUP BY p.Id, p.OwnerUserId
+),
+Windowed AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.OwnerUserId,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.OwnerUserId
+      ORDER BY p.CreationDate DESC, p.Score DESC, p.ViewCount DESC
+    ) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+)
+SELECT
+  ra.PostId,
+  ra.Title,
+  ra.CreationDate,
+  ra.ViewCount,
+  ra.Score,
+  ra.Tags,
+  ra.OwnerDisplayName,
+  ra.Reputation,
+  ra.Location,
+  ra.AccountId,
+  ra.BadgeName,
+  ra.BadgeDate,
+  es.UpVotes,
+  es.DownVotes,
+  es.ModeratorVotes,
+  w.rn AS RankInOwnerTimeline,
+  (CASE
+     WHEN ra.Score > 50 THEN 'High Score'
+     WHEN ra.Score BETWEEN 20 AND 50 THEN 'Medium Score'
+     ELSE 'Low Score'
+   END) AS ScoreCategory,
+  (CASE
+     WHEN ra.ViewCount > 1000 THEN 'Popular'
+     WHEN ra.ViewCount BETWEEN 100 AND 1000 THEN 'Medium'
+     ELSE 'New'
+   END) AS ViewTier,
+  (CASE
+     WHEN ra.LastActivityDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days' THEN true
+     ELSE false
+   END) AS RecentlyActive
+FROM RecentActivity ra
+LEFT JOIN Engagement es ON es.PostId = ra.PostId
+LEFT JOIN Windowed w ON w.Id = ra.PostId
+LEFT JOIN (
+  SELECT DISTINCT ON (OwnerUserId) OwnerUserId, Name AS BadgeName, Date AS BadgeDate
+  FROM Badges
+  ORDER BY OwnerUserId, Date DESC
+) b ON b.OwnerUserId = ra.OwnerUserId
+LEFT JOIN LATERAL (
+  SELECT unnest(string_to_array(substring(ra.Tags, 2, length(ra.Tags)-2), '><')) AS Tag
+) AS tag_lookup ON true
+WHERE ra.OwnerUserId IS NOT NULL
+ORDER BY ra.CreationDate DESC
+LIMIT 100;

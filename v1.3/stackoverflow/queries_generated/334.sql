@@ -1,0 +1,254 @@
+-- {"query": "334.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 17994} 
+WITH
+post_tags AS (
+  SELECT p.Id AS PostId,
+         trim(t.tag) AS Tag
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT UNNEST(
+      CASE WHEN p.Tags IS NULL OR p.Tags = '' THEN array[]::text[]
+           ELSE string_to_array(substring(p.Tags, 2, GREATEST(length(p.Tags) - 2, 0)), '><')
+      END
+    ) AS tag
+  ) t
+),
+tag_stats AS (
+  SELECT pt.Tag,
+         COUNT(*) AS TagCount,
+         AVG(p.Score) AS AvgScore,
+         AVG(p.ViewCount) AS AvgViews,
+         SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+         SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount
+  FROM post_tags pt
+  JOIN Posts p ON p.Id = pt.PostId
+  GROUP BY pt.Tag
+),
+duplicate_counts AS (
+  SELECT pl.RelatedPostId AS OriginalId, COUNT(*) AS DuplicateCount
+  FROM PostLinks pl
+  WHERE pl.LinkTypeId = 3
+  GROUP BY pl.RelatedPostId
+),
+post_votes AS (
+  SELECT v.PostId,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+         SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS Favorites,
+         SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS Accepts,
+         COUNT(*) AS VoteTotal
+  FROM Votes v
+  GROUP BY v.PostId
+),
+user_activity AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName,
+         u.Reputation,
+         COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1),0) AS Questions,
+         COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2),0) AS Answers,
+         COALESCE((SELECT SUM(p.Score) FROM Posts p WHERE p.OwnerUserId = u.Id),0) AS TotalPostScore,
+         COALESCE((SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id),0) AS Comments,
+         COALESCE((SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id),0) AS Badges,
+         COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id),0) AS VotesCast
+  FROM Users u
+),
+post_activity AS (
+  SELECT p.Id,
+         p.PostTypeId,
+         p.ParentId,
+         p.AcceptedAnswerId,
+         p.Title,
+         p.OwnerUserId,
+         p.OwnerDisplayName,
+         p.CreationDate,
+         p.Score,
+         p.ViewCount,
+         p.AnswerCount,
+         p.CommentCount,
+         p.Tags,
+         COALESCE(p.LastActivityDate, p.LastEditDate, p.CreationDate) AS LastKnownActivity,
+         COALESCE(p.Body,'') AS Body,
+         COALESCE(p.LastEditorUserId, -1) AS LastEditorUserId,
+         COALESCE(pv.UpVotes,0) AS UpVotes,
+         COALESCE(pv.DownVotes,0) AS DownVotes,
+         COALESCE(pv.Favorites,0) AS Favorites,
+         COALESCE(pv.Accepts,0) AS Accepts,
+         COALESCE(pv.VoteTotal,0) AS VoteTotal,
+         (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id) AS HistoryCount,
+         (SELECT ph.CreationDate FROM PostHistory ph WHERE ph.PostId = p.Id ORDER BY ph.CreationDate DESC LIMIT 1) AS LatestHistoryDate,
+         (SELECT left(c.Text,200) FROM Comments c WHERE c.PostId = p.Id ORDER BY c.CreationDate DESC LIMIT 1) AS LatestCommentSnippet,
+         (SELECT STRING_AGG(DISTINCT pt.Tag, ',') FROM post_tags pt WHERE pt.PostId = p.Id) AS TagList,
+         COALESCE(dup.DuplicateCount,0) AS DuplicateCount,
+         (SELECT COUNT(DISTINCT ot.PostId) FROM post_tags ot WHERE ot.Tag IN (SELECT pt2.Tag FROM post_tags pt2 WHERE pt2.PostId = p.Id) AND ot.PostId <> p.Id) AS SharedTagCount
+  FROM Posts p
+  LEFT JOIN post_votes pv ON pv.PostId = p.Id
+  LEFT JOIN duplicate_counts dup ON dup.OriginalId = p.Id
+),
+question_metrics AS (
+  SELECT pa.*,
+         ua.DisplayName AS OwnerName,
+         ua.Reputation AS OwnerReputation,
+         ua.Questions AS OwnerQuestionCount,
+         ua.Answers AS OwnerAnswerCount,
+         ROW_NUMBER() OVER (PARTITION BY pa.PostTypeId ORDER BY pa.Score DESC NULLS LAST, pa.ViewCount DESC NULLS LAST) AS ScoreRank,
+         RANK() OVER (PARTITION BY pa.PostTypeId ORDER BY pa.ViewCount DESC NULLS LAST) AS ViewRank,
+         PERCENT_RANK() OVER (PARTITION BY pa.PostTypeId ORDER BY pa.Score) AS ScorePercentile,
+         AVG(pa.Score) OVER (PARTITION BY pa.PostTypeId ORDER BY pa.CreationDate ROWS BETWEEN 100 PRECEDING AND CURRENT ROW) AS RollingAvgScore,
+         LAG(pa.Score) OVER (PARTITION BY pa.OwnerUserId ORDER BY pa.CreationDate) AS PrevPostScore,
+         (COALESCE(pa.UpVotes,0) - COALESCE(pa.DownVotes,0)) AS NetVotes,
+         CASE WHEN pa.ViewCount > 0 THEN ROUND((pa.Score::numeric / NULLIF(pa.ViewCount,0)::numeric) * 100000, 2) ELSE NULL END AS ScorePer100kViews,
+         (SELECT STRING_AGG(s, ',') FROM (SELECT ts.Tag || ':' || ts.TagCount AS s FROM tag_stats ts WHERE ts.Tag IN (SELECT pt.Tag FROM post_tags pt WHERE pt.PostId = pa.Id) ORDER BY ts.TagCount DESC LIMIT 5) sub) AS TopLocalTagCounts,
+         (SELECT ts.Tag FROM tag_stats ts WHERE ts.Tag IN (SELECT pt.Tag FROM post_tags pt WHERE pt.PostId = pa.Id) ORDER BY ts.TagCount DESC NULLS LAST LIMIT 1) AS TopTag
+  FROM post_activity pa
+  LEFT JOIN user_activity ua ON ua.UserId = pa.OwnerUserId
+  WHERE pa.PostTypeId = 1
+),
+answer_metrics AS (
+  SELECT pa.Id AS PostId,
+         2 AS PostTypeId,
+         pa.ParentId,
+         COALESCE(q.Title, left(pa.Body,200)) AS Title,
+         pa.OwnerUserId,
+         (SELECT u2.DisplayName FROM Users u2 WHERE u2.Id = pa.OwnerUserId) AS OwnerName,
+         (SELECT u2.Reputation FROM Users u2 WHERE u2.Id = pa.OwnerUserId) AS OwnerReputation,
+         pa.Score,
+         pa.ViewCount,
+         pa.CommentCount,
+         pa.UpVotes,
+         pa.DownVotes,
+         pa.Favorites,
+         pa.VoteTotal,
+         (COALESCE(pa.UpVotes,0) - COALESCE(pa.DownVotes,0)) AS NetVotes,
+         ROW_NUMBER() OVER (ORDER BY pa.Score DESC NULLS LAST) AS ScoreRank,
+         RANK() OVER (ORDER BY pa.ViewCount DESC NULLS LAST) AS ViewRank,
+         PERCENT_RANK() OVER (ORDER BY pa.Score) AS ScorePercentile,
+         AVG(pa.Score) OVER (ORDER BY pa.CreationDate ROWS BETWEEN 50 PRECEDING AND CURRENT ROW) AS RollingAvgScore,
+         LAG(pa.Score) OVER (PARTITION BY pa.OwnerUserId ORDER BY pa.CreationDate) AS PrevPostScore,
+         (SELECT STRING_AGG(DISTINCT pt.Tag, ',') FROM post_tags pt WHERE pt.PostId = COALESCE(pa.ParentId, pa.Id)) AS ParentTagList,
+         (SELECT COUNT(DISTINCT pt2.PostId) FROM post_tags pt2 WHERE pt2.Tag IN (SELECT pt3.Tag FROM post_tags pt3 WHERE pt3.PostId = COALESCE(pa.ParentId, pa.Id)) AND pt2.PostId <> COALESCE(pa.ParentId, pa.Id)) AS ParentSharedTagCount,
+         (SELECT STRING_AGG(s, ',') FROM (SELECT ts.Tag || ':' || ts.TagCount AS s FROM tag_stats ts WHERE ts.Tag IN (SELECT pt.Tag FROM post_tags pt WHERE pt.PostId = COALESCE(pa.ParentId, pa.Id)) ORDER BY ts.TagCount DESC LIMIT 3) sub) AS ParentTopTags,
+         q.Title AS ParentTitle,
+         q.Tags AS ParentRawTags,
+         pa.LatestCommentSnippet,
+         pa.HistoryCount
+  FROM post_activity pa
+  LEFT JOIN Posts q ON q.Id = pa.ParentId
+  WHERE pa.PostTypeId = 2
+),
+ranked_questions AS (
+  SELECT q.*,
+         ROW_NUMBER() OVER (ORDER BY q.Score DESC, q.ViewCount DESC) as OverallRank,
+         CASE
+           WHEN q.Score >= 100 OR q.ViewCount >= 100000 THEN 'Hot'
+           WHEN (q.Score BETWEEN 50 AND 99) OR (q.ViewCount BETWEEN 50000 AND 99999) THEN 'Trending'
+           WHEN q.Score BETWEEN 10 AND 49 THEN 'Active'
+           ELSE 'Normal'
+         END AS Category,
+         (CASE WHEN q.AnswerCount > 0 AND q.DuplicateCount = 0 AND q.SharedTagCount > 2 AND (COALESCE(q.UpVotes,0) > COALESCE(q.DownVotes,0) OR COALESCE(q.Score,0) > 0) THEN 1 ELSE 0 END) AS IsHighQuality
+  FROM question_metrics q
+),
+sample_union AS (
+  SELECT rq.PostTypeId,
+         rq.Id AS PostId,
+         rq.Title,
+         rq.OwnerName,
+         rq.OwnerReputation,
+         rq.Score,
+         rq.ViewCount,
+         rq.AnswerCount,
+         rq.UpVotes,
+         rq.DownVotes,
+         rq.Favorites,
+         rq.VoteTotal,
+         rq.NetVotes,
+         rq.ScoreRank,
+         rq.ViewRank,
+         rq.ScorePercentile,
+         rq.RollingAvgScore,
+         rq.PrevPostScore,
+         rq.SharedTagCount,
+         rq.DuplicateCount,
+         rq.LatestCommentSnippet,
+         rq.TopTag,
+         rq.Category
+  FROM ranked_questions rq
+  WHERE rq.OverallRank <= 50 AND rq.IsHighQuality = 1
+
+  UNION
+
+  SELECT am.PostTypeId,
+         am.PostId,
+         am.Title,
+         am.OwnerName,
+         am.OwnerReputation,
+         am.Score,
+         am.ViewCount,
+         0 AS AnswerCount,
+         am.UpVotes,
+         am.DownVotes,
+         am.Favorites,
+         am.VoteTotal,
+         am.NetVotes,
+         am.ScoreRank,
+         am.ViewRank,
+         am.ScorePercentile,
+         am.RollingAvgScore,
+         am.PrevPostScore,
+         am.ParentSharedTagCount AS SharedTagCount,
+         0 AS DuplicateCount,
+         am.LatestCommentSnippet,
+         NULL::text AS TopTag,
+         'Answer' AS Category
+  FROM answer_metrics am
+  WHERE am.ScoreRank <= 50
+),
+final_set_filtered AS (
+  SELECT * FROM sample_union
+  WHERE COALESCE(VoteTotal,0) > 0
+  EXCEPT
+  SELECT su.* FROM sample_union su WHERE COALESCE(su.DuplicateCount,0) > 0
+),
+final_rank AS (
+  SELECT *,
+         ROW_NUMBER() OVER (ORDER BY COALESCE(NetVotes,0) DESC NULLS LAST, COALESCE(Score,0) DESC NULLS LAST, COALESCE(ViewCount,0) DESC NULLS LAST) AS FinalRank
+  FROM final_set_filtered
+)
+SELECT
+  fr_outer.FinalRank,
+  fr_outer.PostTypeId,
+  fr_outer.PostId,
+  fr_outer.Title,
+  fr_outer.OwnerName,
+  fr_outer.OwnerReputation,
+  fr_outer.Score,
+  fr_outer.ViewCount,
+  fr_outer.AnswerCount,
+  fr_outer.UpVotes,
+  fr_outer.DownVotes,
+  fr_outer.Favorites,
+  fr_outer.VoteTotal,
+  fr_outer.NetVotes,
+  fr_outer.ScoreRank,
+  fr_outer.ViewRank,
+  fr_outer.ScorePercentile,
+  ROUND(COALESCE(fr_outer.RollingAvgScore,0)::numeric,2) AS RollingAvgScore,
+  fr_outer.PrevPostScore,
+  fr_outer.SharedTagCount,
+  fr_outer.DuplicateCount,
+  LEFT(COALESCE(fr_outer.LatestCommentSnippet,''),150) AS LatestCommentSnippet,
+  COALESCE(fr_outer.TopTag, 'none') AS TopTag,
+  fr_outer.Category,
+  CASE WHEN COALESCE(fr_outer.OwnerReputation,0) < 100 THEN 'novice'
+       WHEN COALESCE(fr_outer.OwnerReputation,0) BETWEEN 100 AND 10000 THEN 'experienced'
+       ELSE 'expert' END AS OwnerTier,
+  (CASE
+     WHEN COALESCE(fr_outer.TopTag,'') <> '' AND POSITION(',' IN COALESCE(fr_outer.TopTag,'')) = 0 AND LENGTH(COALESCE(fr_outer.TopTag,'')) > 0 THEN CONCAT('single-tag:', COALESCE(fr_outer.TopTag,''))
+     WHEN COALESCE(fr_outer.TopTag,'') = '' THEN 'no-tag'
+     ELSE CONCAT('multi-tag-first:', SPLIT_PART(COALESCE(fr_outer.TopTag,''),',',1))
+   END) AS TagSignature,
+  (SELECT json_build_object('PostId', inner_fr.PostId, 'Rank', inner_fr.FinalRank, 'Votes', inner_fr.VoteTotal, 'Host', COALESCE(inner_fr.OwnerName,'[anonymous]'))
+   FROM final_rank inner_fr
+   WHERE inner_fr.PostId = fr_outer.PostId
+   LIMIT 1) AS DiagnosticJson
+FROM final_rank fr_outer
+ORDER BY fr_outer.FinalRank
+LIMIT 200;

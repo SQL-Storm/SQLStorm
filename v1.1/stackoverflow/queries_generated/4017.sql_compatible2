@@ -1,0 +1,192 @@
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        p.Id as PostId,
+        p.CreationDate,
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        row_number() over (partition by t.Id order by p.CreationDate desc) as rn
+    from
+        Tags t
+        left join Posts p on p.Tags like ('%<' || t.TagName || '>%')
+        left join Users u on p.OwnerUserId = u.Id
+    where
+        t.IsModeratorOnly = false
+),
+UserBadgeSummary as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from
+        Badges b
+    group by
+        b.UserId, b.Class
+),
+UserReputationWindow as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        count(p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        sum(p.Score) filter (where p.PostTypeId in (1,2)) as TotalScore,
+        max(p.CreationDate) filter (where p.PostTypeId in (1,2)) as LastPostDate,
+        avg(coalesce(vtUp.VoteCount,0)) over (partition by u.Id) as AvgUpVotes,
+        avg(coalesce(vtDown.VoteCount,0)) over (partition by u.Id) as AvgDownVotes
+    from
+        Users u
+        left join Posts p on p.OwnerUserId = u.Id
+        left join (
+            select
+                v.PostId,
+                count(*) as VoteCount
+            from Votes v
+            where v.VoteTypeId = 2
+            group by v.PostId
+        ) vtUp on vtUp.PostId = p.Id
+        left join (
+            select
+                v.PostId,
+                count(*) as VoteCount
+            from Votes v
+            where v.VoteTypeId = 3
+            group by v.PostId
+        ) vtDown on vtDown.PostId = p.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostWithComments as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        count(c.Id) as CommentCount,
+        string_agg(distinct c.Text, ' || ') as CommentSnippet
+    from
+        Posts p
+        left join Comments c on c.PostId = p.Id
+    where
+        p.PostTypeId in (1, 2)
+    group by
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId, p.Title, p.Tags, p.AcceptedAnswerId
+),
+RankedAnswers as (
+    select
+        a.Id,
+        a.ParentId,
+        a.Score,
+        a.CreationDate,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a
+    where a.PostTypeId = 2
+),
+TopAnswersWithOwners as (
+    select
+        ra.Id,
+        ra.ParentId,
+        ra.Score,
+        ra.CreationDate,
+        ra.AnswerRank,
+        u.DisplayName,
+        u.Reputation,
+        u.Id as UserId
+    from
+        RankedAnswers ra
+        left join Users u on ra.Id = u.Id OR ra.ParentId = u.Id
+),
+DuplicatedPosts as (
+    select pl.PostId, pl.RelatedPostId, lt.Name as LinkTypeName
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    where lt.Name = 'Duplicate'
+),
+FilteredPostHistory as (
+    select
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId,
+        cht.Name as HistoryTypeName,
+        ph.Comment
+    from
+        PostHistory ph
+        join PostHistoryTypes cht on ph.PostHistoryTypeId = cht.Id
+    where
+        ph.PostHistoryTypeId in (10, 11, 12, 13, 14, 15)
+),
+QuestionCloseAnalysis as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        fph.PostHistoryTypeId,
+        fph.HistoryTypeName,
+        fph.CreationDate as CloseEventDate,
+        fph.UserId as ClosingUserId,
+        u.DisplayName as ClosingUserName,
+        (select string_agg(Name, ',') from CloseReasonTypes crt where crt.Id = CAST(fph.Comment AS integer)) as CloseReason
+    from
+        Posts p
+        left join FilteredPostHistory fph on fph.PostId = p.Id and fph.PostHistoryTypeId=10
+        left join Users u on fph.UserId = u.Id
+    where
+        p.PostTypeId = 1
+        and fph.PostHistoryTypeId = 10
+)
+select
+    u.Id as UserId,
+    u.DisplayName,
+    u.CreationDate as UserCreated,
+    urs.QuestionCount,
+    urs.AnswerCount,
+    urs.TotalScore,
+    urs.LastPostDate,
+    u.Reputation,
+    coalesce(ubsGold.BadgeCount,0) as GoldBadges,
+    coalesce(ubsSilver.BadgeCount,0) as SilverBadges,
+    coalesce(ubsBronze.BadgeCount,0) as BronzeBadges,
+    avg(case when p.PostTypeId = 1 then p.Score end) as AvgQuestionScore,
+    avg(case when p.PostTypeId = 2 then p.Score end) as AvgAnswerScore,
+    max(p.Score) as MaxPostScore,
+    count(distinct case when p.PostTypeId = 1 and p.ClosedDate is not null then p.Id end) as ClosedQuestions,
+    count(distinct da.Id) as TopAnswersCount,
+    string_agg(distinct t.TagName, ', ') as TagsOfUserQuestions,
+    count(distinct dq.QuestionId) as QuestionsClosedWithReason
+from
+    Users u
+    left join UserReputationWindow urs on urs.Id = u.Id
+    left join UserBadgeSummary ubsGold on ubsGold.UserId = u.Id and ubsGold.Class = 1
+    left join UserBadgeSummary ubsSilver on ubsSilver.UserId = u.Id and ubsSilver.Class = 2
+    left join UserBadgeSummary ubsBronze on ubsBronze.UserId = u.Id and ubsBronze.Class = 3
+    left join Posts p on p.OwnerUserId = u.Id
+    left join DuplicatedPosts dp on dp.PostId = p.Id
+    left join Tags t on p.Tags like ('%<' || t.TagName || '>%')
+    left join TopAnswersWithOwners da on da.UserId = u.Id
+    left join QuestionCloseAnalysis dq on dq.ClosingUserId = u.Id
+where
+    u.Reputation > 1000
+group by
+    u.Id, u.DisplayName, u.CreationDate, urs.QuestionCount, urs.AnswerCount, urs.TotalScore,
+    urs.LastPostDate, u.Reputation, ubsGold.BadgeCount, ubsSilver.BadgeCount, ubsBronze.BadgeCount
+having
+    count(distinct da.Id) > 0
+order by
+    ClosedQuestions desc,
+    TotalScore desc,
+    GoldBadges desc,
+    QuestionCount desc,
+    AvgAnswerScore desc
+limit 100;

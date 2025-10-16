@@ -1,0 +1,74 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotes,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS PostRank
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    WHERE 
+        p.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '1 year')
+    GROUP BY 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.PostTypeId
+),
+PostEngagement AS (
+    SELECT 
+        rp.PostId,
+        rp.Title,
+        rp.CreationDate,
+        rp.Score,
+        rp.ViewCount,
+        rp.UpVotes,
+        rp.DownVotes,
+        CAST(rp.Score AS DOUBLE PRECISION) / NULLIF(rp.ViewCount, 0) AS EngagementScore
+    FROM 
+        RankedPosts rp
+    WHERE 
+        rp.UpVotes - rp.DownVotes > 0
+),
+ClosingReasons AS (
+    SELECT 
+        ph.PostId,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS LastClosedDate
+    FROM 
+        PostHistory ph
+    GROUP BY 
+        ph.PostId
+)
+SELECT 
+    pe.PostId,
+    pe.Title,
+    pe.CreationDate,
+    pe.Score,
+    pe.ViewCount,
+    pe.UpVotes,
+    pe.DownVotes,
+    pe.EngagementScore,
+    cr.LastClosedDate,
+    (
+      SELECT STRING_AGG(DISTINCT t.TagName, ', ')
+      FROM Posts p
+      JOIN Tags t ON t.ExcerptPostId = p.Id
+      WHERE p.Id = pe.PostId
+    ) AS Tags
+FROM 
+    PostEngagement pe
+LEFT JOIN 
+    ClosingReasons cr ON pe.PostId = cr.PostId
+WHERE 
+    pe.EngagementScore > 0.1 
+    AND (cr.LastClosedDate IS NULL OR cr.LastClosedDate < pe.CreationDate)
+ORDER BY 
+    pe.EngagementScore DESC
+LIMIT 100;

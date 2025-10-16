@@ -1,0 +1,113 @@
+WITH 
+  avg_reputation AS (
+    SELECT AVG(u.Reputation) AS avg_rep
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+  ),
+  
+  post_tag_pairs AS (
+    SELECT p.Id AS PostId,
+           TRIM(BOTH '<>' FROM p.Tags) AS tags_string
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+  ),
+  
+  split_tags_recursive AS (
+    SELECT PostId,
+           CASE
+             WHEN POSITION('><' IN tags_string) = 0 THEN tags_string
+             ELSE SUBSTRING(tags_string FROM 1 FOR POSITION('><' IN tags_string)-1)
+           END AS tag,
+           CASE
+             WHEN POSITION('><' IN tags_string) = 0 THEN NULL
+             ELSE SUBSTRING(tags_string FROM POSITION('><' IN tags_string)+2)
+           END AS rest
+    FROM post_tag_pairs
+    UNION ALL
+    SELECT PostId,
+           CASE
+             WHEN POSITION('><' IN rest) = 0 THEN rest
+             ELSE SUBSTRING(rest FROM 1 FOR POSITION('><' IN rest)-1)
+           END AS tag,
+           CASE
+             WHEN POSITION('><' IN rest) = 0 THEN NULL
+             ELSE SUBSTRING(rest FROM POSITION('><' IN rest)+2)
+           END AS rest
+    FROM split_tags_recursive
+    WHERE rest IS NOT NULL
+  ),
+  
+  top_tags AS (
+    SELECT LOWER(tag) AS TagName, COUNT(*) AS question_count
+    FROM split_tags_recursive st
+    JOIN Posts p ON p.Id = st.PostId
+    WHERE p.PostTypeId = 1 AND st.tag IS NOT NULL AND st.tag <> ''
+    GROUP BY LOWER(tag)
+    ORDER BY question_count DESC
+    LIMIT 10
+  ),
+  
+  post_votes AS (
+    SELECT p.Id, 
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes
+    FROM Posts p
+    JOIN Votes v ON p.Id = v.PostId
+    GROUP BY p.Id
+  ),
+  
+  top_posts AS (
+    SELECT p.Id, p.Title, pv.upvotes, pv.downvotes
+    FROM Posts p
+    JOIN post_votes pv ON p.Id = pv.Id
+    ORDER BY pv.upvotes DESC, pv.downvotes DESC
+    LIMIT 10
+  ),
+  
+  user_avg_score AS (
+    SELECT u.Id, AVG(p.Score) AS avg_score
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id
+  )
+
+SELECT 
+  u.Id, 
+  u.DisplayName, 
+  u.Reputation, 
+  uas.avg_score, 
+  COALESCE(tp.Title, 'No top post') AS top_post_title,
+  COALESCE(tp.upvotes, 0) AS top_post_upvotes,
+  COALESCE(tp.downvotes, 0) AS top_post_downvotes,
+  COALESCE(tt.TagName, 'No top tag') AS top_tag,
+  ar.avg_rep AS avg_reputation
+FROM Users u
+LEFT JOIN user_avg_score uas ON u.Id = uas.Id
+LEFT JOIN top_posts tp ON u.Id = tp.Id
+LEFT JOIN top_tags tt ON EXISTS (
+  SELECT 1
+  FROM Posts p
+  WHERE p.OwnerUserId = u.Id
+    AND p.PostTypeId = 1
+    AND p.Tags IS NOT NULL
+    AND (
+      p.Tags = tt.TagName
+      OR p.Tags LIKE tt.TagName || '><%'
+      OR p.Tags LIKE '%><' || tt.TagName
+      OR p.Tags LIKE '%><' || tt.TagName || '><%'
+    )
+)
+CROSS JOIN avg_reputation ar
+WHERE u.Reputation > (SELECT avg_rep FROM avg_reputation)
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  uas.avg_score,
+  tp.Title,
+  tp.upvotes,
+  tp.downvotes,
+  tt.TagName,
+  ar.avg_rep
+ORDER BY u.Reputation DESC;

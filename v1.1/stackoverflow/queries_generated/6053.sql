@@ -1,0 +1,51 @@
+-- {"query": "6053.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 498} 
+SELECT
+  u.Id AS UserId,
+  u.DisplayName AS UserName,
+  u.Reputation,
+  u.CreationDate,
+  u.Location,
+  COALESCE(u.AboutMe, '') AS AboutMe,
+  COUNT(DISTINCT b.Id) AS GoldBadges,
+  COUNT(DISTINCT v.PostId) AS VoteCount,
+  AVG(v.BountyAmount) FILTER (WHERE v.BountyAmount IS NOT NULL) AS AvgBountyGiven,
+  MAX(p.CreationDate) AS LastPostDate,
+  SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+  SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+  SUM(CASE WHEN p.ViewCount > 1000 THEN 1 ELSE 0 END) AS PopularPostsFlag,
+  STRING_AGG(DISTINCT tt.Name, ',') FILTER (WHERE tt.Name IS NOT NULL) AS TopPostHistoryTypes
+FROM
+  Users u
+LEFT JOIN Badges b ON b.UserId = u.Id AND b.Class = 1 -- Gold badges
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN Votes v ON v.UserId = u.Id
+LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+LEFT JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId
+LEFT JOIN (
+  SELECT DISTINCT UserId
+  FROM Posts
+  WHERE CreationDate >= NOW() - INTERVAL '1 year'
+) AS recent_activity ON recent_activity.UserId = u.Id
+LEFT JOIN (
+  SELECT DISTINCT UserId, Name
+  FROM PostHistory ph2
+  JOIN PostHistoryTypes pht2 ON pht2.Id = ph2.PostHistoryTypeId
+  WHERE pht2.Name LIKE '%CreatedFromWizard%'
+) AS tw ON tw.UserId = u.Id
+LEFT JOIN (
+  SELECT Id, Name
+  FROM PostHistoryTypes
+) AS tht ON tht.Id = ph.PostHistoryTypeId
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  u.CreationDate,
+  u.Location,
+  u.AboutMe
+HAVING
+  COUNT(DISTINCT b.Id) > 0
+ORDER BY
+  Reputation DESC,
+  LastPostDate DESC
+LIMIT 100;

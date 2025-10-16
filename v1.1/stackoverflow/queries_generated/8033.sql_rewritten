@@ -1,0 +1,323 @@
+-- {"query": "8033.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3287} 
+with recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    date_trunc('month', u.creationdate) as user_month,
+    row_number() over (partition by coalesce(nullif(trim(lower(u.location)), ''), 'unknown') order by u.reputation desc, u.id) as loc_rep_rank
+  from users u
+  where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+q_posts as (
+  select
+    p.id as post_id,
+    p.owneruserid as user_id,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.title,
+    p.tags,
+    p.answercount,
+    p.favoritecount,
+    p.commentcount,
+    p.closeddate,
+    date_trunc('month', p.creationdate) as post_month,
+    coalesce(p.viewcount, 0) / nullif(greatest(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - p.creationdate)) / 86400.0, 0.1), 1.0) as views_per_day
+  from posts p
+  where p.posttypeid = 1
+),
+a_posts as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.owneruserid as user_id,
+    a.creationdate,
+    a.score as answer_score,
+    a.commentcount as answer_commentcount
+  from posts a
+  where a.posttypeid = 2
+),
+user_activity as (
+  select
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.user_month,
+    ru.location,
+    count(distinct qp.post_id) as questions_count,
+    count(distinct ap.answer_id) as answers_count,
+    sum(coalesce(qp.score, 0)) as q_score_sum,
+    sum(coalesce(ap.answer_score, 0)) as a_score_sum,
+    sum(coalesce(qp.viewcount, 0)) as q_views_sum,
+    sum(coalesce(qp.commentcount, 0)) + sum(coalesce(ap.answer_commentcount, 0)) as total_comments,
+    max(qp.creationdate) as last_question_date,
+    max(ap.creationdate) as last_answer_date
+  from recent_users ru
+  left join q_posts qp on qp.user_id = ru.user_id
+  left join a_posts ap on ap.user_id = ru.user_id
+  group by ru.user_id, ru.displayname, ru.reputation, ru.user_month, ru.location
+),
+badge_agg as (
+  select
+    b.userid as user_id,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+    count(*) as total_badges,
+    max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+hotness as (
+  select
+    qp.post_id,
+    qp.user_id,
+    qp.score,
+    qp.viewcount,
+    qp.answercount,
+    qp.favoritecount,
+    qp.commentcount,
+    qp.closeddate,
+    (coalesce(qp.score,0) * 3
+     + coalesce(qp.answercount,0) * 2
+     + coalesce(qp.favoritecount,0)
+     + least(coalesce(qp.commentcount,0), 20)
+     + case when qp.closeddate is null then 5 else -10 end) as raw_hotness,
+    percentile_disc(0.9) within group (order by coalesce(qp.viewcount,0)) over () as p90_views,
+    row_number() over (order by (coalesce(qp.score,0) * 3 + coalesce(qp.answercount,0) * 2 + coalesce(qp.favoritecount,0) + least(coalesce(qp.commentcount,0), 20)) desc, qp.post_id) as hot_rank
+  from q_posts qp
+),
+dupe_links as (
+  select
+    pl.postid as dupe_post_id,
+    count(*) filter (where pl.linktypeid = 3) as dupe_count,
+    count(*) filter (where pl.linktypeid = 1) as linked_count,
+    min(pl.creationdate) as first_link_date
+  from postlinks pl
+  group by pl.postid
+),
+votes_agg as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_start,
+    sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_close,
+    count(*) filter (where v.votetypeid in (10,11,12)) as del_undelete_flags
+  from votes v
+  group by v.postid
+),
+edit_events as (
+  select
+    ph.postid,
+    count(*) filter (where ph.posthistorytypeid in (4,5,6)) as edit_count,
+    min(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6)) as first_edit,
+    max(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6)) as last_edit,
+    count(*) filter (where ph.posthistorytypeid = 24) as suggested_edits_applied,
+    count(*) filter (where ph.posthistorytypeid = 10) as close_events
+  from posthistory ph
+  group by ph.postid
+),
+tag_tokens as (
+  select
+    qp.post_id,
+    unnest(string_to_array(substring(qp.tags, 2, length(qp.tags)-2), '><')) as tag
+  from q_posts qp
+  where qp.tags is not null and length(qp.tags) > 2
+),
+top_tags as (
+  select
+    tt.post_id,
+    string_agg(tt.tag, ',' order by t.count desc nulls last) as tags_by_popularity,
+    count(*) as tag_count
+  from tag_tokens tt
+  left join tags t on lower(t.tagname) = lower(tt.tag)
+  group by tt.post_id
+),
+accepted_time as (
+  select
+    q.id as question_id,
+    q.creationdate as question_created,
+    a.id as accepted_answer_id,
+    a.creationdate as accepted_created,
+    extract(epoch from (a.creationdate - q.creationdate)) / 3600.0 as hours_to_accept
+  from posts q
+  join posts a on a.id = q.acceptedanswerid
+  where q.posttypeid = 1 and a.posttypeid = 2
+),
+monthly_perf as (
+  select
+    ua.user_month,
+    count(*) as active_users,
+    avg(coalesce(ua.q_score_sum,0) + coalesce(ua.a_score_sum,0)) as avg_user_score,
+    percentile_cont(0.5) within group (order by coalesce(ua.q_views_sum,0)) as p50_views_by_user,
+    sum(case when ua.questions_count > 0 then 1 else 0 end) as users_with_questions,
+    sum(case when ua.answers_count > 0 then 1 else 0 end) as users_with_answers
+  from user_activity ua
+  group by ua.user_month
+),
+question_quality as (
+  select
+    qp.post_id,
+    qp.user_id,
+    coalesce(va.upvotes,0) - coalesce(va.downvotes,0) as net_votes,
+    coalesce(va.upvotes,0) as upvotes,
+    coalesce(va.downvotes,0) as downvotes,
+    coalesce(va.bounty_close - va.bounty_start, 0) as net_bounty,
+    coalesce(ee.edit_count,0) as edit_count,
+    coalesce(ee.suggested_edits_applied,0) as sug_edits,
+    coalesce(dl.dupe_count,0) as dupes,
+    coalesce(dl.linked_count,0) as links,
+    coalesce(h.raw_hotness,0) + least(coalesce(va.upvotes,0), 50) - greatest(coalesce(va.downvotes,0), 0) - (coalesce(dl.dupe_count,0) * 5) + (case when ee.edit_count > 3 then -3 else 0 end) as quality_score
+  from q_posts qp
+  left join votes_agg va on va.postid = qp.post_id
+  left join edit_events ee on ee.postid = qp.post_id
+  left join dupe_links dl on dl.dupe_post_id = qp.post_id
+  left join hotness h on h.post_id = qp.post_id
+),
+loc_norm as (
+  select
+    ru.user_id,
+    coalesce(nullif(trim(lower(ru.location)), ''), 'unknown') as norm_location
+  from recent_users ru
+),
+loc_stats as (
+  select
+    ln.norm_location,
+    count(*) as users_in_loc,
+    avg(ru.reputation) as avg_rep_loc,
+    percentile_disc(0.9) within group (order by ru.reputation) as p90_rep_loc
+  from loc_norm ln
+  join recent_users ru on ru.user_id = ln.user_id
+  group by ln.norm_location
+),
+joined as (
+  select
+    ua.user_id,
+    ua.displayname,
+    ua.reputation,
+    ua.user_month,
+    ln.norm_location,
+    ls.users_in_loc,
+    ls.avg_rep_loc,
+    ls.p90_rep_loc,
+    coalesce(ba.gold_badges,0) as gold_badges,
+    coalesce(ba.silver_badges,0) as silver_badges,
+    coalesce(ba.bronze_badges,0) as bronze_badges,
+    ua.questions_count,
+    ua.answers_count,
+    ua.q_score_sum,
+    ua.a_score_sum,
+    ua.q_views_sum,
+    ua.total_comments,
+    qp.post_id,
+    qp.title,
+    qp.tags,
+    tt.tags_by_popularity,
+    qa.quality_score,
+    qa.net_votes,
+    qa.net_bounty,
+    ee.edit_count,
+    ee.suggested_edits_applied,
+    at.hours_to_accept,
+    h.hot_rank,
+    case
+      when ua.reputation >= ls.p90_rep_loc then 'Top10pctLoc'
+      when ua.reputation >= ls.avg_rep_loc then 'AboveAvgLoc'
+      else 'BelowAvgLoc'
+    end as loc_rep_bucket
+  from user_activity ua
+  left join badge_agg ba on ba.user_id = ua.user_id
+  left join loc_norm ln on ln.user_id = ua.user_id
+  left join loc_stats ls on ls.norm_location = ln.norm_location
+  left join q_posts qp on qp.user_id = ua.user_id
+  left join top_tags tt on tt.post_id = qp.post_id
+  left join question_quality qa on qa.post_id = qp.post_id
+  left join edit_events ee on ee.postid = qp.post_id
+  left join accepted_time at on at.question_id = qp.post_id
+  left join hotness h on h.post_id = qp.post_id
+),
+scored as (
+  select
+    j.*,
+    -- complex combined score blending user, post, and temporal signals
+    (
+      coalesce(j.q_score_sum,0) * 1.5
+      + coalesce(j.a_score_sum,0) * 1.2
+      + coalesce(j.q_views_sum,0) / 100.0
+      + coalesce(j.total_comments,0) * 0.2
+      + coalesce(j.gold_badges,0) * 5
+      + coalesce(j.silver_badges,0) * 2
+      + coalesce(j.bronze_badges,0) * 1
+      + coalesce(j.quality_score,0) * 2.0
+      + case when j.hours_to_accept is not null then greatest(10 - (j.hours_to_accept / 12.0), -5) else 0 end
+      + case j.loc_rep_bucket when 'Top10pctLoc' then 8 when 'AboveAvgLoc' then 3 else 0 end
+      + case when j.tags_by_popularity like '%sql%' then 4 else 0 end
+      - case when j.tags_by_popularity ilike '%discussion%' then 2 else 0 end
+      - case when j.suggested_edits_applied > 5 then 1 else 0 end
+    ) as composite_score
+  from joined j
+),
+ranked as (
+  select
+    s.*,
+    row_number() over (
+      partition by s.user_id
+      order by s.composite_score desc nulls last, s.post_id nulls last
+    ) as rn_user,
+    dense_rank() over (order by s.composite_score desc nulls last) as global_rank,
+    rank() over (partition by date_trunc('month', coalesce(s.user_month, cast('2024-10-01 12:34:56' as timestamp))) order by s.composite_score desc nulls last) as month_rank
+  from scored s
+),
+thresholds as (
+  select
+    avg(composite_score) as avg_score,
+    stddev_pop(composite_score) as sd_score,
+    percentile_disc(0.95) within group (order by composite_score) as p95_score
+  from ranked
+  where composite_score is not null
+)
+select
+  r.user_id,
+  r.displayname,
+  r.norm_location as location_norm,
+  r.reputation,
+  r.loc_rep_bucket,
+  r.gold_badges,
+  r.silver_badges,
+  r.bronze_badges,
+  r.questions_count,
+  r.answers_count,
+  r.q_score_sum,
+  r.a_score_sum,
+  r.q_views_sum,
+  r.total_comments,
+  r.post_id,
+  coalesce(r.title, '(no title)') as title,
+  coalesce(r.tags_by_popularity, '') as tags_by_popularity,
+  r.net_votes,
+  r.net_bounty,
+  r.edit_count,
+  r.suggested_edits_applied,
+  round(coalesce(r.hours_to_accept, -1)::numeric, 2) as hours_to_accept,
+  r.hot_rank,
+  round(r.composite_score::numeric, 3) as composite_score,
+  r.global_rank,
+  r.month_rank,
+  to_char(r.user_month, 'YYYY-MM') as cohort_month,
+  case
+    when r.composite_score >= t.p95_score then 'Elite'
+    when r.composite_score >= t.avg_score + 2 * t.sd_score then 'Outstanding'
+    when r.composite_score >= t.avg_score + 1 * t.sd_score then 'Great'
+    when r.composite_score >= t.avg_score then 'Good'
+    when r.composite_score is null then 'Unscored'
+    else 'NeedsWork'
+  end as performance_tier
+from ranked r
+cross join thresholds t
+where (r.rn_user <= 3 or r.post_id is null)
+order by r.composite_score desc nulls last, r.user_id, r.post_id nulls last
+limit 500;

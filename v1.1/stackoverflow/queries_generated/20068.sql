@@ -1,0 +1,84 @@
+-- {"query": "20068.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1157} 
+
+WITH QuestionTags AS (
+    -- CTE 1: Unpack tags for each question to create a normalized view of questions and their individual tags.
+    -- This is often a performance bottleneck due to string operations on a large table.
+    SELECT
+        p.Id AS QuestionId,
+        p.AcceptedAnswerId,
+        p.OwnerUserId AS QuestionOwnerId,
+        t.value AS Tag
+    FROM Posts p
+    CROSS APPLY string_split(substring(p.Tags, 2, len(p.Tags)-2), '><') AS t
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.Tags != ''
+),
+UserTagPerformance AS (
+    -- CTE 2: Aggregate performance metrics for each user per tag based on their answers.
+    SELECT
+        a.OwnerUserId,
+        qt.Tag,
+        COUNT(a.Id) AS AnswersInTag,
+        SUM(a.Score) AS TotalScoreInTag,
+        SUM(CASE WHEN a.Id = qt.AcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedAnswersInTag,
+        AVG(CAST(a.Score AS FLOAT)) AS AvgScoreInTag
+    FROM Posts a
+    JOIN QuestionTags qt ON a.ParentId = qt.QuestionId
+    WHERE a.PostTypeId = 2 AND a.OwnerUserId IS NOT NULL
+    GROUP BY a.OwnerUserId, qt.Tag
+),
+RankedExperts AS (
+    -- CTE 3: Use window functions to rank users within each tag based on their aggregated score.
+    SELECT
+        OwnerUserId,
+        Tag,
+        TotalScoreInTag,
+        AnswersInTag,
+        AcceptedAnswersInTag,
+        AvgScoreInTag,
+        DENSE_RANK() OVER (PARTITION BY Tag ORDER BY TotalScoreInTag DESC) AS TagRank,
+        ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY TotalScoreInTag DESC, AnswersInTag DESC) AS UserPrimaryTagRank
+    FROM UserTagPerformance
+    WHERE TotalScoreInTag > 20 AND AnswersInTag > 5 -- Pre-filter for significant contributions
+)
+-- Final SELECT: Combine user data with their tag performance, adding complex calculations and subqueries.
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    re.Tag AS ExpertTag,
+    re.TotalScoreInTag,
+    re.TagRank,
+    CAST(re.AcceptedAnswersInTag AS DECIMAL(10, 2)) / NULLIF(re.AnswersInTag, 0) AS TagAcceptanceRatio,
+    -- Correlated subquery to find the date of the user's first-ever badge.
+    (SELECT MIN(b.Date) FROM Badges b WHERE b.UserId = u.Id) AS FirstBadgeDate,
+    -- Complex CASE expression to categorize users based on multiple criteria.
+    CASE
+        WHEN u.Reputation > 100000 AND u.UpVotes > u.DownVotes * 100 THEN 'Community Pillar'
+        WHEN u.Reputation > 20000 AND DATEDIFF(year, u.CreationDate, GETDATE()) > 5 THEN 'Seasoned Veteran'
+        WHEN u.Reputation < 1000 THEN 'Newcomer'
+        ELSE 'Regular Contributor'
+    END AS UserCategory,
+    -- String manipulation combined with NULL logic for user location.
+    UPPER(ISNULL(SUBSTRING(u.Location, 1, CHARINDEX(',', u.Location + ',') - 1), 'Undisclosed')) AS UserCountryOrState,
+    -- Outer join to Comments and aggregation to find average comment score.
+    -- This adds another join and aggregation to the main query block.
+    AVG(c.Score) AS AvgCommentScore,
+    -- Correlated EXISTS subquery to check if the user has ever started a bounty.
+    CASE WHEN EXISTS (SELECT 1 FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 8) THEN 'Yes' ELSE 'No' END AS HasStartedBounty
+FROM Users u
+JOIN RankedExperts re ON u.Id = re.OwnerUserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+-- Filter for users who are either the top expert in their primary tag or are in the top 3 for any tag.
+WHERE (re.UserPrimaryTagRank = 1 OR re.TagRank <= 3)
+  AND u.Reputation > (SELECT AVG(Reputation) FROM Users) -- Filter for users with above-average reputation.
+  AND u.LastAccessDate > DATEADD(year, -2, GETDATE()) -- Filter for recently active users.
+GROUP BY
+    u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.UpVotes, u.DownVotes, u.Location,
+    re.Tag, re.TotalScoreInTag, re.TagRank, re.AcceptedAnswersInTag, re.AnswersInTag
+ORDER BY
+    re.Tag,
+    re.TagRank,
+    u.Reputation DESC
+OFFSET 0 ROWS FETCH NEXT 500 ROWS ONLY;
+

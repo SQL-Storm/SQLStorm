@@ -1,0 +1,153 @@
+-- {"query": "17068.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 161115, "output_tokens": 159754} 
+
+WITH user_expertise AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        STRING_AGG(DISTINCT t.TagName, ', ') FILTER (WHERE t.TagName IS NOT NULL) AS expertise_tags,
+        COUNT(DISTINCT p.Id) AS total_posts,
+        COALESCE(AVG(p.Score), 0) AS avg_post_score,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS reputation_rank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN LATERAL (
+        SELECT UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tag
+    ) tag_split ON p.Tags IS NOT NULL
+    LEFT JOIN Tags t ON t.TagName = tag_split.tag
+    WHERE u.CreationDate >= CURRENT_DATE - INTERVAL '2 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+post_metrics AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS post_type,
+        COALESCE(p.Score, 0) * 1.0 / NULLIF(p.ViewCount, 0) AS score_per_view,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS user_post_rank,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) OVER (PARTITION BY p.PostTypeId) AS median_score_by_type,
+        LAG(p.CreationDate, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS prev_post_date,
+        LEAD(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS next_post_score
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+        AND p.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+),
+recursive_comments AS (
+    SELECT 
+        c.PostId,
+        c.UserId,
+        c.CreationDate,
+        1 AS depth,
+        c.Id::text AS path
+    FROM Comments c
+    WHERE c.UserId IN (SELECT Id FROM user_expertise WHERE reputation_rank <= 100)
+    
+    UNION ALL
+    
+    SELECT 
+        c2.PostId,
+        c2.UserId,
+        c2.CreationDate,
+        rc.depth + 1,
+        rc.path || '>' || c2.Id::text
+    FROM recursive_comments rc
+    JOIN Comments c2 ON c2.PostId = rc.PostId 
+        AND c2.CreationDate > rc.CreationDate
+        AND c2.UserId = rc.UserId
+    WHERE rc.depth < 5
+),
+badge_analysis AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS gold_badges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS silver_badges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS bronze_badges,
+        STRING_AGG(CASE WHEN b.Class = 1 THEN b.Name END, ', ' ORDER BY b.Date DESC) AS gold_badge_names,
+        MAX(b.Date) AS latest_badge_date
+    FROM Badges b
+    GROUP BY b.UserId
+)
+SELECT DISTINCT
+    ue.DisplayName,
+    ue.Reputation,
+    COALESCE(ue.expertise_tags, 'No tags') AS expertise_areas,
+    ue.total_posts,
+    ROUND(ue.avg_post_score::numeric, 2) AS avg_score,
+    COUNT(DISTINCT pm.PostId) AS high_quality_posts,
+    COALESCE(ba.gold_badges, 0) + COALESCE(ba.silver_badges, 0) * 0.5 + COALESCE(ba.bronze_badges, 0) * 0.25 AS weighted_badge_score,
+    SUBSTRING(COALESCE(ba.gold_badge_names, 'None'), 1, 50) AS top_gold_badges,
+    MAX(pm.score_per_view) FILTER (WHERE pm.user_post_rank = 1) AS best_post_efficiency,
+    (
+        SELECT COUNT(DISTINCT v.Id)
+        FROM Votes v
+        WHERE v.UserId = ue.Id 
+            AND v.VoteTypeId IN (2, 3)
+            AND v.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+    ) AS recent_vote_activity,
+    EXISTS (
+        SELECT 1 
+        FROM PostHistory ph
+        WHERE ph.UserId = ue.Id 
+            AND ph.PostHistoryTypeId IN (4, 5, 6)
+            AND ph.CreationDate >= CURRENT_DATE - INTERVAL '7 days'
+    ) AS recently_active_editor,
+    CASE 
+        WHEN ue.Reputation > 10000 THEN 'Expert'
+        WHEN ue.Reputation > 1000 THEN 'Advanced'
+        WHEN ue.Reputation > 100 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END || 
+    CASE 
+        WHEN ba.gold_badges > 0 THEN ' (Gold Badge Holder)'
+        ELSE ''
+    END AS user_tier,
+    COALESCE(
+        (
+            SELECT AVG(EXTRACT(EPOCH FROM (c2.CreationDate - c1.CreationDate)) / 3600.0)
+            FROM recursive_comments c1
+            JOIN recursive_comments c2 ON c1.path = SUBSTRING(c2.path, 1, LENGTH(c1.path))
+            WHERE c1.UserId = ue.Id AND c2.depth = c1.depth + 1
+        ), 0
+    )::numeric(10,2) AS avg_comment_response_hours,
+    GREATEST(
+        0,
+        LEAST(
+            100,
+            (ue.Reputation / 100.0) + 
+            (COALESCE(ba.gold_badges, 0) * 10) + 
+            (ue.avg_post_score * 2) - 
+            (CASE WHEN ue.total_posts = 0 THEN 50 ELSE 0 END)
+        )
+    )::int AS composite_influence_score
+FROM user_expertise ue
+LEFT JOIN post_metrics pm ON ue.Id = pm.OwnerUserId 
+    AND pm.Score > (SELECT AVG(Score) FROM Posts WHERE Score IS NOT NULL)
+LEFT JOIN badge_analysis ba ON ue.Id = ba.UserId
+LEFT JOIN LATERAL (
+    SELECT pl.PostId
+    FROM PostLinks pl
+    JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+    WHERE p2.OwnerUserId = ue.Id AND pl.LinkTypeId = 3
+) duplicate_posts ON TRUE
+WHERE ue.reputation_rank <= 500
+    AND (ue.total_posts > 5 OR ba.gold_badges > 0)
+    AND NOT EXISTS (
+        SELECT 1 
+        FROM PostHistory ph 
+        WHERE ph.UserId = ue.Id 
+            AND ph.PostHistoryTypeId IN (12, 13)
+            AND ph.CreationDate >= CURRENT_DATE - INTERVAL '90 days'
+    )
+GROUP BY 
+    ue.Id, ue.DisplayName, ue.Reputation, ue.expertise_tags, 
+    ue.total_posts, ue.avg_post_score, ue.reputation_rank,
+    ba.gold_badges, ba.silver_badges, ba.bronze_badges, ba.gold_badge_names
+HAVING COUNT(DISTINCT pm.PostId) > 0 OR COALESCE(ba.gold_badges, 0) > 0
+ORDER BY composite_influence_score DESC, ue.Reputation DESC
+LIMIT 100;

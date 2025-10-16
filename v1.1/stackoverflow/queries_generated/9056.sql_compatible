@@ -1,0 +1,130 @@
+WITH RecentEdits AS (
+    SELECT ph.PostId,
+           MAX(ph.CreationDate) AS LastEditDate,
+           COUNT(*) AS TotalEdits
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6)
+    GROUP BY ph.PostId
+),
+QuestionAnswers AS (
+    SELECT p.ParentId AS QuestionId,
+           COUNT(*) AS AnswerCount,
+           AVG(p.Score) AS AvgAnswerScore
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+),
+HighViewQuestions AS (
+    SELECT Id AS QuestionId,
+           ViewCount
+    FROM Posts
+    WHERE PostTypeId = 1
+      AND ViewCount > 10000
+),
+PopularQuestions AS (
+    SELECT qa.QuestionId
+    FROM QuestionAnswers qa
+    WHERE qa.AnswerCount >= 5
+    INTERSECT
+    SELECT hv.QuestionId
+    FROM HighViewQuestions hv
+),
+OrderedUsers AS (
+    SELECT u.Id,
+           u.DisplayName,
+           RANK() OVER (ORDER BY u.Reputation DESC) AS RepRank,
+           CAST((julianday(u.LastAccessDate) - julianday(u.CreationDate)) AS INTEGER) AS DaysActive
+    FROM Users u
+),
+SumBadges AS (
+    SELECT b.UserId,
+           SUM(CASE
+                 WHEN b.Class = 1 THEN 3
+                 WHEN b.Class = 2 THEN 2
+                 ELSE 1
+               END) AS BadgeScore
+    FROM Badges b
+    GROUP BY b.UserId
+),
+CombinedQuestions AS (
+    SELECT pq.QuestionId
+    FROM PopularQuestions pq
+    UNION
+    SELECT hv.QuestionId
+    FROM HighViewQuestions hv
+),
+DistinctContent AS (
+    SELECT q.Id AS QuestionId,
+           (LENGTH(COALESCE(q.Tags, ''))
+            - LENGTH(REPLACE(COALESCE(q.Tags, ''), '<', ''))) AS TagCount,
+           CASE
+             WHEN q.ClosedDate IS NULL THEN 'Open'
+             ELSE 'Closed'
+           END AS Status
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+)
+SELECT cq.QuestionId,
+       q.Title,
+       ou.DisplayName AS Author,
+       qa.AnswerCount,
+       CAST(qa.AvgAnswerScore AS DECIMAL(5,2)) AS AvgAnswerScore,
+       ou.RepRank,
+       ou.DaysActive,
+       re.TotalEdits,
+       sb.BadgeScore,
+       dc.TagCount,
+       dc.Status,
+       CAST((julianday(COALESCE(re.LastEditDate, q.CreationDate)) - julianday(q.CreationDate)) * 24 * 60 AS INTEGER) AS MinutesToLastEdit,
+       (SELECT MIN(c.CreationDate)
+        FROM Comments c
+        WHERE c.PostId = q.Id
+          AND c.Score >= 0) AS FirstCommentDate,
+       (CASE WHEN LENGTH(q.Body) > 100 THEN SUBSTR(q.Body, 1, 100) ELSE q.Body END) || '...' AS BodyPreview,
+       COALESCE(q.Score, 0) + COALESCE(qa.AnswerCount, 0) AS ScoreAnswerSum
+FROM CombinedQuestions cq
+LEFT JOIN Posts q               ON cq.QuestionId = q.Id
+LEFT JOIN QuestionAnswers qa    ON qa.QuestionId = cq.QuestionId
+LEFT JOIN RecentEdits re        ON re.PostId = cq.QuestionId
+LEFT JOIN OrderedUsers ou       ON ou.Id = q.OwnerUserId
+LEFT JOIN SumBadges sb          ON sb.UserId = ou.Id
+FULL JOIN DistinctContent dc    ON dc.QuestionId = cq.QuestionId
+WHERE EXISTS (
+    SELECT 1
+    FROM Tags t
+    WHERE t.TagName IN (
+        SELECT trim(value)
+        FROM (
+            SELECT
+                -- split tags string like "<tag1><tag2>" into rows by '><'
+                -- replace leading '<' and trailing '>' then split on '><'
+                -- Using recursive common table expression for portability
+                CASE WHEN q.Tags IS NULL THEN '' ELSE q.Tags END AS tags_raw
+        )
+        CROSS JOIN LATERAL (
+            SELECT value FROM (
+                SELECT
+                    -- normalize tags: remove leading '<' and trailing '>'
+                    REPLACE(REPLACE(CASE WHEN tags_raw LIKE '<%' THEN SUBSTR(tags_raw, 2, LENGTH(tags_raw)) ELSE tags_raw END,
+                                    '><', '|'), '>', '') AS joined
+            )
+            CROSS JOIN LATERAL (
+                SELECT *
+                FROM (SELECT trim(value) AS value FROM (
+                          SELECT substr(joined, instr(joined, '|', 1, n) + 1,
+                                        CASE
+                                          WHEN instr(joined || '|', '|', 1, n + 1) = 0 THEN LENGTH(joined) - instr(joined, '|', 1, n)
+                                          ELSE instr(joined || '|', '|', 1, n + 1) - instr(joined, '|', 1, n) - 1
+                                        END) AS value
+                          FROM (SELECT joined, row_number() OVER () AS n FROM (SELECT joined) ) -- placeholder; actual splitting not standardized
+                      ))
+                ) AS split_vals
+            )
+        )
+    )
+      AND t.Count > (SELECT AVG(Count) FROM Tags)
+)
+ORDER BY ou.RepRank,
+         qa.AnswerCount DESC,
+         dc.TagCount DESC
+LIMIT 50 OFFSET 0;

@@ -1,0 +1,151 @@
+-- {"query": "995.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1790} 
+with RecursiveTagHierarchy as (
+    select t.Id, t.TagName, t.Count,
+           array[t.Id] as Ancestors
+      from Tags t
+     where t.IsRequired = 1
+    union all
+    select t.Id, t.TagName, t.Count, r.Ancestors || t.Id
+      from Tags t
+      join RecursiveTagHierarchy r on t.Id <> any(r.Ancestors)
+     where t.Count > 100
+),
+TopUsers as (
+    select u.Id, u.DisplayName,
+           row_number() over (order by u.Reputation desc, u.CreationDate asc) as rn,
+           count(b.Id) filter (where b.Class = 1) as GoldBadges,
+           count(b.Id) filter (where b.Class = 2) as SilverBadges,
+           count(b.Id) filter (where b.Class = 3) as BronzeBadges
+      from Users u
+      left join Badges b on u.Id = b.UserId
+     group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+     having u.Reputation > 10000
+),
+QuestionStats as (
+    select p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount,
+           count(distinct a.Id) as AnswerCount,
+           coalesce(sum(vt.UpVotes),0) as TotalUpVotes,
+           coalesce(sum(vt.DownVotes),0) as TotalDownVotes,
+           case when p.ClosedDate is null then false else true end as IsClosed,
+           p.Tags,
+           dense_rank() over (order by p.ViewCount desc) as ViewRank
+      from Posts p
+      left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+      left join (
+          select PostId,
+                 sum(case when VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+                 sum(case when VoteTypeId = 3 then 1 else 0 end) as DownVotes
+            from Votes
+           group by PostId
+      ) vt on vt.PostId = p.Id
+     where p.PostTypeId = 1
+     group by p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.ClosedDate, p.Tags
+),
+UserCommentActivity as (
+    select c.UserId, u.DisplayName,
+           count(c.Id) as CommentCount,
+           count(distinct c.PostId) as UniquePostsCommented,
+           max(c.CreationDate) as LastCommentDate
+      from Comments c
+      join Users u on c.UserId = u.Id
+     group by c.UserId, u.DisplayName
+),
+LatestPostHistory as (
+    select ph.PostId, ph.UserId,
+           ph.PostHistoryTypeId, ph.CreationDate,
+           row_number() over (partition by ph.PostId order by ph.CreationDate desc) as rn
+      from PostHistory ph
+     where ph.PostHistoryTypeId in (10,11,12,13)
+),
+DuplicateLinks as (
+    select pl.PostId, pl.RelatedPostId, lt.Name as LinkName
+      from PostLinks pl
+      join LinkTypes lt on pl.LinkTypeId = lt.Id
+     where pl.LinkTypeId = 3
+),
+QuestionAnswerRanks as (
+    select a.Id as AnswerId, a.ParentId as QuestionId, a.Score,
+           row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+      from Posts a
+     where a.PostTypeId = 2
+)
+select q.Id as QuestionId,
+       q.Title,
+       q.OwnerUserId,
+       u.DisplayName as QuestionOwner,
+       q.Score,
+       q.ViewCount,
+       q.AnswerCount,
+       q.TotalUpVotes,
+       q.TotalDownVotes,
+       q.IsClosed,
+       q.Tags,
+       string_agg(distinct dt.TagName, ', ') filter (where dt.TagName is not null) as PopularRequiredTags,
+       tu.rn as UserReputationRank,
+       tu.GoldBadges,
+       tu.SilverBadges,
+       tu.BronzeBadges,
+       ua.CommentCount as UserCommentCount,
+       ua.UniquePostsCommented,
+       ua.LastCommentDate,
+       ph.PostHistoryTypeId as LastPostHistoryType,
+       ph.CreationDate as LastPostHistoryDate,
+       dl.RelatedPostId as DuplicateOfQuestion,
+       qa.AnswerId as TopAnswerId,
+       qa.Score as TopAnswerScore,
+       (q.Score::float / nullif(q.ViewCount,0)) as ScoreToViewRatio,
+       length(coalesce(q.Title,'')) as TitleLength,
+       case when position('?' in q.Title) > 0 then true else false end as HasQuestionMarkInTitle,
+       (select count(*) from Comments c2 where c2.PostId = q.Id and c2.CreationDate > now() - interval '30 days') as RecentCommentCount
+  from QuestionStats q
+  left join Users u on q.OwnerUserId = u.Id
+  left join RecursiveTagHierarchy dt on dt.TagName = any(string_to_array(substring(q.Tags from 2 for char_length(q.Tags)-2), '><'))
+  left join TopUsers tu on tu.Id = q.OwnerUserId
+  left join UserCommentActivity ua on ua.UserId = q.OwnerUserId
+  left join LatestPostHistory ph on ph.PostId = q.Id and ph.rn = 1
+  left join DuplicateLinks dl on dl.PostId = q.Id
+  left join QuestionAnswerRanks qa on qa.QuestionId = q.Id and qa.AnswerRank = 1
+ where q.CreationDate > now() - interval '1 year'
+   and (q.Score > 10 or q.ViewCount > 1000)
+union
+select q2.Id as QuestionId,
+       q2.Title,
+       q2.OwnerUserId,
+       u2.DisplayName as QuestionOwner,
+       q2.Score,
+       q2.ViewCount,
+       q2.AnswerCount,
+       q2.TotalUpVotes,
+       q2.TotalDownVotes,
+       q2.IsClosed,
+       q2.Tags,
+       string_agg(distinct dt2.TagName, ', ') filter (where dt2.TagName is not null) as PopularRequiredTags,
+       tu2.rn as UserReputationRank,
+       tu2.GoldBadges,
+       tu2.SilverBadges,
+       tu2.BronzeBadges,
+       ua2.CommentCount as UserCommentCount,
+       ua2.UniquePostsCommented,
+       ua2.LastCommentDate,
+       ph2.PostHistoryTypeId as LastPostHistoryType,
+       ph2.CreationDate as LastPostHistoryDate,
+       dl2.RelatedPostId as DuplicateOfQuestion,
+       qa2.AnswerId as TopAnswerId,
+       qa2.Score as TopAnswerScore,
+       (q2.Score::float / nullif(q2.ViewCount,0)) as ScoreToViewRatio,
+       length(coalesce(q2.Title,'')) as TitleLength,
+       case when position('?' in q2.Title) > 0 then true else false end as HasQuestionMarkInTitle,
+       (select count(*) from Comments c3 where c3.PostId = q2.Id and c3.CreationDate > now() - interval '30 days') as RecentCommentCount
+  from QuestionStats q2
+  left join Users u2 on q2.OwnerUserId = u2.Id
+  left join RecursiveTagHierarchy dt2 on dt2.TagName = any(string_to_array(substring(q2.Tags from 2 for char_length(q2.Tags)-2), '><'))
+  left join TopUsers tu2 on tu2.Id = q2.OwnerUserId
+  left join UserCommentActivity ua2 on ua2.UserId = q2.OwnerUserId
+  left join LatestPostHistory ph2 on ph2.PostId = q2.Id and ph2.rn = 1
+  left join DuplicateLinks dl2 on dl2.PostId = q2.Id
+  left join QuestionAnswerRanks qa2 on qa2.QuestionId = q2.Id and qa2.AnswerRank = 1
+ where q2.CreationDate > now() - interval '1 year'
+   and q2.Score <= 10
+   and q2.ViewCount <= 1000
+order by ScoreToViewRatio desc nulls last, ViewRank asc, QuestionId
+limit 100;

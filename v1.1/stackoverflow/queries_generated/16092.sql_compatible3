@@ -1,0 +1,146 @@
+WITH user_activity_metrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        COUNT(DISTINCT p.Id) AS total_posts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS question_count,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS answer_count,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS avg_question_score,
+        SUM(CASE WHEN p.PostTypeId = 2 AND p.Id = parent.AcceptedAnswerId THEN 1 ELSE 0 END) AS accepted_answers,
+        EXTRACT(EPOCH FROM (u.LastAccessDate - u.CreationDate)) / 86400.0 AS account_age_days
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Posts parent ON p.ParentId = parent.Id AND p.PostTypeId = 2
+    WHERE u.Reputation > 100
+        AND u.CreationDate >= DATE '2020-01-01'
+        AND (u.Location IS NULL OR u.Location NOT LIKE '%test%')
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.LastAccessDate
+    HAVING COUNT(DISTINCT p.Id) > 0
+),
+badge_rankings AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) AS total_badges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+        STRING_AGG(DISTINCT CASE WHEN b.Class = 1 THEN b.Name END, ', ') AS gold_badge_names,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM b.Date) ORDER BY COUNT(*) DESC) AS yearly_badge_rank,
+        EXTRACT(YEAR FROM b.Date) AS badge_year
+    FROM Badges b
+    WHERE b.Date >= DATE '2020-01-01'
+        AND (b.TagBased = FALSE OR b.TagBased = 0 OR b.TagBased IS NULL)
+    GROUP BY b.UserId, EXTRACT(YEAR FROM b.Date)
+),
+post_interaction_stats AS (
+    SELECT 
+        p.Id AS post_id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        COALESCE(p.CommentCount, 0) AS comment_count,
+        COALESCE(p.AnswerCount, 0) AS answer_count,
+        COUNT(DISTINCT v.Id) AS vote_count,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS upvote_count,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS downvote_count,
+        COUNT(DISTINCT c.Id) AS actual_comment_count,
+        AVG(c.Score) AS avg_comment_score,
+        LENGTH(COALESCE(p.Body, '')) AS body_length,
+        LENGTH(COALESCE(p.Title, '')) AS title_length,
+        CASE 
+            WHEN p.Tags IS NOT NULL THEN array_length(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><'), 1)
+            ELSE 0
+        END AS tag_count,
+        EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 3600.0 AS hours_since_last_activity,
+        EXISTS(
+            SELECT 1 FROM PostHistory ph 
+            WHERE ph.PostId = p.Id 
+                AND ph.PostHistoryTypeId IN (4, 5, 6)
+                AND ph.UserId != p.OwnerUserId
+        ) AS has_external_edits
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.CreationDate >= DATE '2020-01-01'
+        AND p.PostTypeId IN (1, 2)
+        AND (p.ClosedDate IS NULL OR p.ClosedDate > p.CreationDate + INTERVAL '7 days')
+    GROUP BY p.Id, p.OwnerUserId, p.PostTypeId, p.Score, p.ViewCount, 
+             p.CommentCount, p.AnswerCount, p.Body, p.Title, p.Tags,
+             p.CreationDate, p.LastActivityDate
+),
+related_post_network AS (
+    SELECT 
+        pl.PostId,
+        COUNT(DISTINCT pl.RelatedPostId) AS linked_post_count,
+        COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId END) AS duplicate_count,
+        AVG(related_p.Score) AS avg_related_score,
+        MAX(related_p.ViewCount) AS max_related_views
+    FROM PostLinks pl
+    INNER JOIN Posts related_p ON pl.RelatedPostId = related_p.Id
+    WHERE pl.CreationDate >= DATE '2020-01-01'
+    GROUP BY pl.PostId
+)
+SELECT 
+    uam.DisplayName,
+    uam.Reputation,
+    ROUND(uam.account_age_days, 2) AS account_age_days,
+    COALESCE(NULLIF(uam.Location, 'Unknown'), 'Not Specified') AS location,
+    uam.total_posts,
+    uam.question_count,
+    uam.answer_count,
+    ROUND(COALESCE(uam.avg_question_score, 0), 2) AS avg_question_score,
+    uam.accepted_answers,
+    ROUND((CAST(uam.accepted_answers AS numeric) / NULLIF(uam.answer_count, 0) * 100), 2) AS acceptance_rate,
+    COALESCE(br.total_badges, 0) AS total_badges,
+    COALESCE(br.gold_badges, 0) AS gold_badges,
+    COALESCE(br.silver_badges, 0) AS silver_badges,
+    COALESCE(br.bronze_badges, 0) AS bronze_badges,
+    COALESCE(br.gold_badge_names, 'None') AS gold_achievements,
+    AVG(pis.Score) AS avg_post_score,
+    SUM(pis.upvote_count) AS total_upvotes,
+    SUM(pis.downvote_count) AS total_downvotes,
+    ROUND(CASE WHEN SUM(pis.downvote_count) IS NULL OR SUM(pis.downvote_count) = 0 THEN NULL ELSE CAST(SUM(pis.upvote_count) AS numeric) / SUM(pis.downvote_count) END, 2) AS upvote_downvote_ratio,
+    AVG(pis.body_length) AS avg_body_length,
+    MAX(pis.ViewCount) AS max_post_views,
+    SUM(CASE WHEN pis.has_external_edits THEN 1 ELSE 0 END) AS posts_edited_by_others,
+    AVG(rpn.linked_post_count) AS avg_linked_posts,
+    MAX(rpn.duplicate_count) AS max_duplicates,
+    PERCENT_RANK() OVER (ORDER BY uam.Reputation) AS reputation_percentile,
+    ROW_NUMBER() OVER (PARTITION BY LEFT(COALESCE(NULLIF(uam.Location, 'Unknown'), 'Not Specified'), 20) ORDER BY uam.Reputation DESC) AS location_rank,
+    DENSE_RANK() OVER (ORDER BY uam.accepted_answers DESC) AS acceptance_rank,
+    CASE 
+        WHEN uam.Reputation > 10000 AND uam.accepted_answers > 50 THEN 'Elite Contributor'
+        WHEN uam.Reputation > 5000 AND uam.total_posts > 100 THEN 'Active Contributor'
+        WHEN uam.Reputation > 1000 THEN 'Regular Contributor'
+        ELSE 'Emerging Contributor'
+    END AS contributor_tier,
+    (SELECT COUNT(*) FROM Posts sub_p 
+     WHERE sub_p.OwnerUserId = uam.Id 
+        AND sub_p.Score > (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.PostTypeId = sub_p.PostTypeId)
+    ) AS above_avg_posts
+FROM user_activity_metrics uam
+LEFT JOIN badge_rankings br ON uam.Id = br.UserId AND br.yearly_badge_rank = 1
+LEFT JOIN post_interaction_stats pis ON uam.Id = pis.OwnerUserId
+LEFT JOIN related_post_network rpn ON pis.post_id = rpn.PostId
+WHERE uam.total_posts >= 5
+    AND (br.total_badges IS NULL OR br.total_badges > 0)
+    AND uam.Reputation BETWEEN 500 AND 1000000
+GROUP BY 
+    uam.Id, uam.DisplayName, uam.Reputation, uam.account_age_days, uam.Location,
+    uam.total_posts, uam.question_count, uam.answer_count, uam.avg_question_score,
+    uam.accepted_answers, br.total_badges, br.gold_badges, br.silver_badges, 
+    br.bronze_badges, br.gold_badge_names,
+    uam.DisplayName, uam.Reputation, uam.account_age_days, uam.Location,
+    uam.total_posts, uam.question_count, uam.answer_count, uam.avg_question_score,
+    uam.accepted_answers, br.total_badges, br.gold_badges, br.silver_badges, br.bronze_badges, br.gold_badge_names
+HAVING COUNT(DISTINCT pis.post_id) >= 3
+    AND SUM(pis.upvote_count) > SUM(pis.downvote_count) * 2
+ORDER BY 
+    uam.Reputation DESC,
+    total_upvotes DESC,
+    acceptance_rate DESC
+LIMIT 500;

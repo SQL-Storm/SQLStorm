@@ -1,0 +1,125 @@
+-- {"query": "16018.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 44365, "output_tokens": 41259} 
+
+WITH user_activity_metrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        COUNT(DISTINCT p.Id) as post_count,
+        COUNT(DISTINCT b.Id) as badge_count,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) as gold_badges,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN COALESCE(p.ViewCount, 0) ELSE 0 END) as total_question_views,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) as avg_answer_score,
+        ROW_NUMBER() OVER (PARTITION BY SUBSTRING(COALESCE(u.Location, 'Unknown'), 1, 2) ORDER BY u.Reputation DESC) as location_rank
+    FROM Users u
+    LEFT OUTER JOIN Posts p ON u.Id = p.OwnerUserId AND p.CreationDate >= '2020-01-01'
+    LEFT OUTER JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000 
+        AND (u.Location IS NULL OR LENGTH(TRIM(u.Location)) > 0)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location
+    HAVING COUNT(DISTINCT p.Id) > 5
+),
+question_engagement AS (
+    SELECT 
+        p.Id as question_id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score as question_score,
+        COALESCE(p.AnswerCount, 0) as answer_count,
+        COALESCE(p.CommentCount, 0) as comment_count,
+        COALESCE(p.FavoriteCount, 0) as favorite_count,
+        p.ViewCount,
+        (SELECT COUNT(*) 
+         FROM Votes v 
+         WHERE v.PostId = p.Id 
+           AND v.VoteTypeId = 2 
+           AND v.CreationDate > p.CreationDate + INTERVAL '1 day') as delayed_upvotes,
+        (SELECT STRING_AGG(DISTINCT t.TagName, ', ' ORDER BY t.TagName)
+         FROM UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) as tag_name
+         JOIN Tags t ON t.TagName = tag_name
+         WHERE t.Count > 1000) as popular_tags,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN EXISTS (SELECT 1 FROM Posts a WHERE a.ParentId = p.Id AND a.Id = p.AcceptedAnswerId) THEN 'Answered-Accepted'
+            WHEN p.AnswerCount > 0 THEN 'Answered-Unaccepted'
+            ELSE 'Unanswered'
+        END as question_status,
+        EXTRACT(EPOCH FROM (COALESCE(p.LastActivityDate, p.CreationDate) - p.CreationDate)) / 3600.0 as hours_active,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_question_score,
+        LEAD(p.ViewCount) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as next_question_views
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate BETWEEN '2019-01-01' AND '2023-12-31'
+        AND p.Score IS NOT NULL
+        AND (p.Tags LIKE '%<sql>%' OR p.Tags LIKE '%<postgresql>%' OR p.Tags LIKE '%<database>%')
+),
+answer_quality_score AS (
+    SELECT 
+        a.Id as answer_id,
+        a.ParentId as question_id,
+        a.OwnerUserId,
+        a.Score as answer_score,
+        LENGTH(COALESCE(a.Body, '')) as answer_length,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = a.Id) as answer_comments,
+        CASE 
+            WHEN a.Id = (SELECT AcceptedAnswerId FROM Posts WHERE Id = a.ParentId) THEN 1.5
+            ELSE 1.0
+        END * (a.Score + 1) * LOG(GREATEST(LENGTH(a.Body), 100)) as quality_metric,
+        DENSE_RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) as answer_rank_in_question,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY a.Score) 
+            OVER (PARTITION BY a.OwnerUserId) as user_median_score
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+        AND a.CreationDate >= '2019-01-01'
+        AND a.Score >= 0
+)
+SELECT 
+    uam.DisplayName,
+    COALESCE(uam.Location, 'Not Specified') as user_location,
+    uam.Reputation,
+    uam.post_count,
+    uam.badge_count,
+    uam.gold_badges,
+    uam.location_rank,
+    ROUND(AVG(qe.question_score)::numeric, 2) as avg_question_score,
+    ROUND(AVG(qe.ViewCount)::numeric, 0) as avg_views,
+    ROUND(AVG(qe.answer_count)::numeric, 2) as avg_answers_received,
+    COUNT(DISTINCT CASE WHEN qe.question_status = 'Answered-Accepted' THEN qe.question_id END) as accepted_answer_count,
+    ROUND(AVG(NULLIF(aqs.quality_metric, 0))::numeric, 2) as avg_answer_quality,
+    ROUND(AVG(CASE WHEN aqs.answer_rank_in_question = 1 THEN aqs.answer_score END)::numeric, 2) as avg_top_answer_score,
+    STRING_AGG(DISTINCT qe.popular_tags, ' | ') FILTER (WHERE qe.popular_tags IS NOT NULL) as tag_expertise,
+    ROUND((CAST(COUNT(DISTINCT CASE WHEN qe.delayed_upvotes > 0 THEN qe.question_id END) AS FLOAT) / 
+           NULLIF(COUNT(DISTINCT qe.question_id), 0) * 100)::numeric, 1) as pct_questions_with_delayed_engagement,
+    MAX(qe.question_score) as best_question_score,
+    MIN(CASE WHEN aqs.answer_score < 0 THEN aqs.answer_score END) as worst_answer_score,
+    ROUND(AVG(qe.hours_active)::numeric, 1) as avg_question_lifetime_hours,
+    CASE 
+        WHEN uam.avg_answer_score > 5 AND uam.gold_badges > 0 THEN 'Elite Contributor'
+        WHEN uam.avg_answer_score > 2 THEN 'Quality Contributor'
+        WHEN uam.post_count > 20 THEN 'Active Contributor'
+        ELSE 'Regular Contributor'
+    END as contributor_tier
+FROM user_activity_metrics uam
+INNER JOIN question_engagement qe ON uam.Id = qe.OwnerUserId
+LEFT OUTER JOIN answer_quality_score aqs ON uam.Id = aqs.OwnerUserId 
+    AND aqs.quality_metric > (SELECT AVG(quality_metric) * 0.5 FROM answer_quality_score)
+WHERE qe.question_score > -5
+    AND (qe.ViewCount IS NULL OR qe.ViewCount < 100000)
+    AND uam.location_rank <= 10
+    AND NOT EXISTS (
+        SELECT 1 FROM Votes v 
+        WHERE v.UserId = uam.Id 
+            AND v.VoteTypeId IN (4, 12) 
+        HAVING COUNT(*) > 5
+    )
+GROUP BY uam.Id, uam.DisplayName, uam.Location, uam.Reputation, uam.post_count, 
+         uam.badge_count, uam.gold_badges, uam.location_rank, uam.avg_answer_score
+HAVING COUNT(DISTINCT qe.question_id) >= 3
+    AND AVG(qe.question_score) > 0
+ORDER BY 
+    CASE WHEN uam.gold_badges > 0 THEN 0 ELSE 1 END,
+    (uam.Reputation * 0.3 + COALESCE(AVG(qe.question_score), 0) * 100 + 
+     COALESCE(AVG(aqs.quality_metric), 0) * 10) DESC,
+    uam.DisplayName
+LIMIT 100;

@@ -1,0 +1,288 @@
+-- {"query": "342.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 17347} 
+WITH
+question_stats AS (
+  SELECT
+    q.Id AS question_id,
+    q.OwnerUserId,
+    q.Title,
+    q.CreationDate,
+    q.Score AS question_score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.CommentCount,
+    q.AcceptedAnswerId,
+    (SELECT count(1) FROM Posts a WHERE a.ParentId = q.Id AND a.Score >= q.Score) AS answers_with_score_geq_question,
+    (SELECT avg(a.Score) FROM Posts a WHERE a.ParentId = q.Id) AS avg_answer_score,
+    (SELECT count(*) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 5) AS favorite_count,
+    (SELECT sum(v.BountyAmount) FROM Votes v WHERE v.PostId = q.Id AND v.BountyAmount IS NOT NULL) AS total_bounty
+  FROM Posts q
+  WHERE q.PostTypeId = 1
+),
+
+question_tags AS (
+  SELECT
+    q.Id AS question_id,
+    q.OwnerUserId,
+    q.Title,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    unnest(string_to_array(substring(q.Tags FROM 2 FOR char_length(q.Tags)-2), '><')) AS tag
+  FROM Posts q
+  WHERE q.PostTypeId = 1 AND q.Tags IS NOT NULL
+),
+
+tag_popularity AS (
+  SELECT
+    tag,
+    count(*) AS question_count,
+    avg(Score) AS avg_question_score,
+    sum(COALESCE(ViewCount,0)) AS views
+  FROM question_tags
+  GROUP BY tag
+),
+
+user_tag_raw AS (
+  SELECT
+    COALESCE(qt.OwnerUserId, p.OwnerUserId) AS user_id,
+    qt.tag,
+    count(distinct qt.question_id) FILTER (WHERE qt.OwnerUserId IS NOT NULL) AS user_question_count,
+    sum(
+      (COALESCE(qs.question_score,0) + COALESCE(qs.ViewCount,0)/100.0 + COALESCE(qs.AnswerCount,0)*2)
+      * (1 + COALESCE(tp.question_count,0)/100.0)
+    ) AS raw_score
+  FROM question_tags qt
+  LEFT JOIN question_stats qs ON qs.question_id = qt.question_id
+  LEFT JOIN tag_popularity tp ON tp.tag = qt.tag
+  LEFT JOIN Posts p ON p.Id = qt.question_id
+  GROUP BY COALESCE(qt.OwnerUserId, p.OwnerUserId), qt.tag
+),
+
+user_tag_score AS (
+  SELECT
+    ut.*,
+    dense_rank() OVER (PARTITION BY ut.user_id ORDER BY ut.raw_score DESC NULLS LAST) AS tag_rank_for_user
+  FROM user_tag_raw ut
+),
+
+answer_stats AS (
+  SELECT
+    a.Id AS answer_id,
+    a.ParentId AS question_id,
+    a.OwnerUserId,
+    a.CreationDate AS answer_date,
+    a.Score AS answer_score,
+    a.CommentCount,
+    (SELECT count(*) FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 2) AS upvotes,
+    (SELECT count(*) FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 3) AS downvotes,
+    (SELECT count(*) FROM Comments c WHERE c.PostId = a.Id) AS comment_total,
+    CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END AS is_accepted,
+    (a.CreationDate - q.CreationDate) AS time_to_answer
+  FROM Posts a
+  JOIN Posts q ON q.Id = a.ParentId AND q.PostTypeId = 1
+  WHERE a.PostTypeId = 2
+),
+
+post_edit_summary AS (
+  SELECT
+    ph.PostId,
+    COUNT(*) AS edit_count,
+    MAX(ph.CreationDate) AS last_edit_date,
+    string_agg(COALESCE(ph.UserDisplayName, ph.UserId::text), ', ' ORDER BY ph.CreationDate DESC) AS editors_list
+  FROM PostHistory ph
+  WHERE ph.PostId IS NOT NULL
+  GROUP BY ph.PostId
+),
+
+duplicate_links AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    pl.CreationDate,
+    pl.LinkTypeId,
+    ROW_NUMBER() OVER (PARTITION BY pl.PostId ORDER BY pl.CreationDate) AS rn
+  FROM PostLinks pl
+  WHERE pl.LinkTypeId = 3
+),
+
+earliest_duplicates AS (
+  SELECT dl.PostId, dl.RelatedPostId
+  FROM duplicate_links dl
+  WHERE dl.rn = 1
+),
+
+user_duplicate_count AS (
+  SELECT
+    q.OwnerUserId AS user_id,
+    COUNT(ed.PostId) AS duplicate_count
+  FROM Posts q
+  LEFT JOIN earliest_duplicates ed ON ed.PostId = q.Id
+  WHERE q.PostTypeId = 1
+  GROUP BY q.OwnerUserId
+),
+
+user_edit_stats AS (
+  SELECT
+    p.OwnerUserId AS user_id,
+    COUNT(ps.PostId) AS posts_with_edits,
+    SUM(ps.edit_count) AS total_edits,
+    MAX(ps.last_edit_date) AS last_edit_date
+  FROM Posts p
+  LEFT JOIN post_edit_summary ps ON ps.PostId = p.Id
+  GROUP BY p.OwnerUserId
+),
+
+top_tags AS (
+  SELECT tag, question_count, rank() OVER (ORDER BY question_count DESC) AS tag_rank
+  FROM tag_popularity
+),
+
+top20_tags AS (
+  SELECT * FROM top_tags WHERE tag_rank <= 20
+),
+
+top_users_small AS (
+  SELECT Id AS user_id, DisplayName, Reputation, rank() OVER (ORDER BY Reputation DESC) AS user_rank
+  FROM Users
+  ORDER BY Reputation DESC
+  LIMIT 20
+),
+
+tag_user_mix AS (
+  SELECT
+    COALESCE(t.tag, u.DisplayName) AS mix_name,
+    t.tag,
+    u.user_id,
+    u.Reputation,
+    COALESCE(t.question_count,0) AS tag_qcount
+  FROM top20_tags t
+  FULL OUTER JOIN top_users_small u ON t.tag = u.DisplayName
+),
+
+high_rep_users AS (
+  SELECT Id FROM Users WHERE Reputation > 50000
+),
+
+low_acceptance_users AS (
+  SELECT
+    u.Id
+  FROM Users u
+  CROSS JOIN LATERAL (
+    SELECT
+      COUNT(*) FILTER (WHERE q.PostTypeId = 1) AS qcount,
+      COUNT(*) FILTER (WHERE q.PostTypeId = 1 AND q.AcceptedAnswerId IS NOT NULL) AS q_with_accepted,
+      COALESCE(
+        COUNT(*) FILTER (WHERE q.PostTypeId = 1 AND q.AcceptedAnswerId IS NOT NULL) * 1.0
+        / NULLIF(COUNT(*) FILTER (WHERE q.PostTypeId = 1),0),
+        0
+      ) AS accept_rate
+    FROM Posts q
+    WHERE q.OwnerUserId = u.Id
+  ) t
+  WHERE t.qcount >= 10 AND t.accept_rate < 0.05
+),
+
+suspicious_users AS (
+  SELECT * FROM high_rep_users
+  INTERSECT
+  SELECT * FROM low_acceptance_users
+),
+
+suspicious_users_refined AS (
+  SELECT * FROM suspicious_users
+  EXCEPT
+  SELECT Id FROM Users WHERE UpVotes > COALESCE(DownVotes,0) * 3
+),
+
+final_agg AS (
+  SELECT
+    u.Id AS user_id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    COALESCE(bc.gold,0) AS gold_badges,
+    COALESCE(bc.silver,0) AS silver_badges,
+    COALESCE(bc.bronze,0) AS bronze_badges,
+    COALESCE(qc.question_count,0) AS user_questions,
+    COALESCE(ac.answer_count,0) AS user_answers,
+    COALESCE(udc.duplicate_count,0) AS duplicate_questions,
+    COALESCE(ues.posts_with_edits,0) AS posts_with_edits,
+    COALESCE(ues.total_edits,0) AS total_edits,
+    COALESCE(u.Views,0) AS views,
+    COALESCE(uts.tag,'(none)') AS top_tag,
+    COALESCE(uts.raw_score,0) AS top_tag_raw_score,
+    CASE WHEN su.Id IS NOT NULL THEN true ELSE false END AS is_suspicious_candidate,
+    COALESCE(lp.last_three_titles, '(no recent posts)') AS recent_titles_concat
+  FROM Users u
+  LEFT JOIN (
+    SELECT UserId,
+           COUNT(*) FILTER (WHERE Class = 1) AS gold,
+           COUNT(*) FILTER (WHERE Class = 2) AS silver,
+           COUNT(*) FILTER (WHERE Class = 3) AS bronze
+    FROM Badges
+    GROUP BY UserId
+  ) bc ON bc.UserId = u.Id
+  LEFT JOIN (
+    SELECT OwnerUserId, COUNT(*) AS question_count FROM Posts WHERE PostTypeId = 1 GROUP BY OwnerUserId
+  ) qc ON qc.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT OwnerUserId, COUNT(*) AS answer_count FROM Posts WHERE PostTypeId = 2 GROUP BY OwnerUserId
+  ) ac ON ac.OwnerUserId = u.Id
+  LEFT JOIN user_duplicate_count udc ON udc.user_id = u.Id
+  LEFT JOIN user_edit_stats ues ON ues.user_id = u.Id
+  LEFT JOIN LATERAL (
+    SELECT ut2.tag, ut2.raw_score
+    FROM user_tag_score ut2
+    WHERE ut2.user_id = u.Id
+    ORDER BY ut2.raw_score DESC NULLS LAST
+    LIMIT 1
+  ) uts ON true
+  LEFT JOIN suspicious_users_refined su ON su.Id = u.Id
+  LEFT JOIN LATERAL (
+    SELECT string_agg(COALESCE(LEFT(COALESCE(p.Title,''),100), '[no title]') || '|' || COALESCE(to_char(p.CreationDate,'YYYY-MM-DD'),''), ' || ') AS last_three_titles
+    FROM (
+      SELECT p.Title, p.CreationDate
+      FROM Posts p
+      WHERE p.OwnerUserId = u.Id AND p.PostTypeId IN (1,2)
+      ORDER BY p.CreationDate DESC
+      LIMIT 3
+    ) p
+  ) lp ON true
+  WHERE u.Reputation > 1000
+)
+
+SELECT
+  f.user_id,
+  f.DisplayName,
+  f.Reputation,
+  f.gold_badges,
+  f.silver_badges,
+  f.bronze_badges,
+  f.user_questions,
+  f.user_answers,
+  f.duplicate_questions,
+  f.posts_with_edits,
+  f.total_edits,
+  f.views,
+  f.top_tag,
+  ROUND(COALESCE(f.top_tag_raw_score,0)::numeric,2) AS top_tag_score,
+  f.is_suspicious_candidate,
+  f.recent_titles_concat,
+  ROUND(
+    COALESCE(f.Reputation,0) / 1000.0 * 0.4
+    + COALESCE(f.user_answers,0) * 0.1
+    + COALESCE(f.user_questions,0) * 0.05
+    + (COALESCE(f.gold_badges,0)*3 + COALESCE(f.silver_badges,0)*1.5 + COALESCE(f.bronze_badges,0)*0.5) * 0.05
+    + COALESCE(f.top_tag_raw_score,0) * 0.0001
+    + COALESCE(f.duplicate_questions,0) * -0.2
+    + COALESCE(f.total_edits,0) * 0.01
+  ,3) AS composite_score,
+  rank() OVER (ORDER BY (
+    COALESCE(f.Reputation,0) * 0.5 + COALESCE(f.user_answers,0) * 2 + COALESCE(f.gold_badges,0) * 10 + COALESCE(f.top_tag_raw_score,0)
+  ) DESC) AS composite_rank
+FROM final_agg f
+WHERE (f.user_answers > 0 OR f.user_questions > 0)
+ORDER BY composite_score DESC
+LIMIT 250;

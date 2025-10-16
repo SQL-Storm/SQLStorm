@@ -1,0 +1,207 @@
+-- {"query": "7091.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2391} 
+with
+-- active users: recent activity and derived metrics
+active_users as (
+  select
+    u.id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    coalesce(u.location, '(unknown)') as location,
+    greatest(0, u.upvotes - u.downvotes) as vote_balance,
+    case when u.views is null then 0 else u.views end as views,
+    row_number() over (order by u.reputation desc, u.lastaccessdate desc) as rn
+  from users u
+  where u.reputation >= 100
+    and u.lastaccessdate >= now() - interval '2 years'
+),
+-- heavy questions: questions with many answers/comments/votes and complex tag parsing
+question_aggregates as (
+  select
+    p.id as question_id,
+    p.owneruserid,
+    p.title,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.commentcount,
+    p.favoritecount,
+    coalesce(p.tags,'') as raw_tags,
+    -- split tags into array (Postgres style); tolerate other engines by simple string ops
+    regexp_split_to_array(substring(coalesce(p.tags,''), 2, char_length(coalesce(p.tags,'')) - 2), '><') as tag_array,
+    -- count distinct answer authors (including deleted = null)
+    (select count(distinct a.owneruserid) from posts a where a.parentid = p.id and a.posttypeid = 2) as distinct_answer_authors,
+    -- correlated scalar: latest non-owner activity on question
+    (select ph.creationdate from posthistory ph where ph.postid = p.id and ph.userid is not null order by ph.creationdate desc limit 1) as latest_history_by_user,
+    -- correlated boolean: any duplicate/linked post links
+    exists (select 1 from postlinks pl where pl.postid = p.id and pl.linktypeid in (1,3)) as has_links
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= now() - interval '5 years'
+),
+-- answers detail with windowing and correlated expensive expressions
+answer_window as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.owneruserid,
+    a.score,
+    a.creationdate,
+    a.body,
+    a.lastactivitydate,
+    -- rank answers per question by score, tie-breaker recent
+    rank() over (partition by a.parentid order by a.score desc, a.creationdate desc) as score_rank,
+    -- moving average of score within the question's answers (range between unbounded preceding and current row)
+    avg(a.score) over (partition by a.parentid order by a.creationdate range between unbounded preceding and current row) as running_avg_score,
+    -- proportion of this answer's score to total question answer score (handled by NULLS)
+    case when q.total_answer_score = 0 or q.total_answer_score is null then 0.0
+         else round( (a.score::numeric / q.total_answer_score) , 4) end as score_fraction
+  from posts a
+  left join (
+    select parentid, sum(coalesce(score,0)) as total_answer_score
+    from posts
+    where posttypeid = 2
+    group by parentid
+  ) q on q.parentid = a.parentid
+  where a.posttypeid = 2
+),
+-- collect recent badges and tag-based badge influence
+badge_summary as (
+  select
+    b.userid,
+    count(*) filter (where b.class = 1) as gold,
+    count(*) filter (where b.class = 2) as silver,
+    count(*) filter (where b.class = 3) as bronze,
+    count(*) filter (where b.tagbased = true) as tag_badges,
+    max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+-- votes aggregate across posts for interesting vote mixes
+vote_mix as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+    sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total,
+    count(*) as total_votes
+  from votes v
+  group by v.postid
+),
+-- combine everything: choose mid-tier active users and explore their questions + answers
+user_question_answer as (
+  select
+    au.id as user_id,
+    au.displayname,
+    qa.question_id,
+    qa.title,
+    qa.raw_tags,
+    qa.tag_array,
+    qa.score as question_score,
+    qa.viewcount as question_views,
+    qa.answercount,
+    qa.commentcount,
+    qa.favoritecount,
+    qa.distinct_answer_authors,
+    qa.latest_history_by_user,
+    qa.has_links,
+    bv.gold, bv.silver, bv.bronze, bv.tag_badges,
+    vq.upvotes as q_upvotes, vq.downvotes as q_downvotes, vq.bounty_total as q_bounty,
+    -- best and median answer metrics per question using windowed aggregates on answer_window
+    (select json_build_object(
+       'best_answer_id', aw_best.answer_id,
+       'best_owner', aw_best.owneruserid,
+       'best_score', aw_best.score,
+       'median_score', med.median_score
+     )
+     from (
+       select * from answer_window aw where aw.question_id = qa.question_id order by aw.score desc, aw.creationdate desc limit 1
+     ) aw_best
+     cross join lateral (
+       select percentile_cont(0.5) within group (order by aw2.score) as median_score
+       from answer_window aw2 where aw2.question_id = qa.question_id
+     ) med
+    ) as answer_stats
+  from active_users au
+  inner join posts qa on qa.owneruserid = au.id and qa.posttypeid = 1
+  left join badge_summary bv on bv.userid = au.id
+  left join vote_mix vq on vq.postid = qa.id
+  where au.rn between 10 and 200
+),
+-- finalized heavy projection with set operators and complex predicates
+final_prep as (
+  select
+    uqa.*,
+    -- derive normalized tag string and top tag (lexicographically)
+    array_to_string(uqa.tag_array, ',') as tags_joined,
+    (case when array_length(uqa.tag_array,1) >= 1 then uqa.tag_array[1] else null end) as top_tag,
+    -- heuristic complexity score: weighted combination of metrics with NULL-safe arithmetic
+    (coalesce(uqa.question_score,0) * 0.5
+     + coalesce(uqa.question_views,0) * 0.0001
+     + coalesce(uqa.answercount,0) * 2
+     + coalesce(uqa.distinct_answer_authors,0) * 1.5
+     + (coalesce(uqa.q_upvotes,0) - coalesce(uqa.q_downvotes,0)) * 0.8
+     + coalesce(uqa.q_bounty,0) * 0.3
+     + coalesce(uqa.gold,0) * 5
+     + coalesce(uqa.silver,0) * 2
+     + coalesce(uqa.bronze,0) * 0.5
+    ) as complexity_score
+  from user_question_answer uqa
+)
+-- final select includes set operation (UNION ALL) with a derived anti-join to surface problematic content
+select
+  fp.user_id,
+  fp.displayname,
+  fp.question_id,
+  substr(fp.title,1,160) as title_snippet,
+  fp.tags_joined,
+  fp.top_tag,
+  fp.question_score,
+  fp.question_views,
+  fp.answercount,
+  fp.distinct_answer_authors,
+  fp.answer_stats,
+  round(fp.complexity_score::numeric,4) as complexity_score,
+  fp.gold, fp.silver, fp.bronze, fp.tag_badges,
+  coalesce(fp.q_upvotes,0) as q_upvotes,
+  coalesce(fp.q_downvotes,0) as q_downvotes,
+  coalesce(fp.q_bounty,0) as q_bounty,
+  -- complex boolean fingerprint combining NULL logic and regex
+  (case
+     when fp.has_links and fp.latest_history_by_user is not null and fp.question_score > 5 then true
+     when fp.tags_joined ~* '^(sql|postgres|mysql|oracle)$' and fp.qa is null then true
+     else false
+   end) as interesting_flag
+from final_prep fp
+
+union all
+
+-- anti-join: pick questions with no answers but high views or many favorites, to stress outer joins and NULL handling
+select
+  null::int as user_id,
+  '(orphan)' as displayname,
+  p.id as question_id,
+  substr(p.title,1,160) as title_snippet,
+  coalesce(array_to_string(regexp_split_to_array(substring(coalesce(p.tags,''),2,char_length(coalesce(p.tags,''))-2),'><'),','),'') as tags_joined,
+  (case when p.tags is null then null else (regexp_split_to_array(substring(p.tags,2,char_length(p.tags)-2),'><'))[1] end) as top_tag,
+  p.score as question_score,
+  p.viewcount as question_views,
+  p.answercount,
+  0 as distinct_answer_authors,
+  null as answer_stats,
+  (coalesce(p.score,0)*0.5 + coalesce(p.viewcount,0)*0.0001 + coalesce(p.favoritecount,0)*3) as complexity_score,
+  0 as gold, 0 as silver, 0 as bronze, 0 as tag_badges,
+  (select sum(case when v.votetypeid=2 then 1 else 0 end) from votes v where v.postid = p.id) as q_upvotes,
+  (select sum(case when v.votetypeid=3 then 1 else 0 end) from votes v where v.postid = p.id) as q_downvotes,
+  (select sum(coalesce(v.bountyamount,0)) from votes v where v.postid = p.id and v.votetypeid in (8,9)) as q_bounty,
+  (case when p.answercount = 0 and (coalesce(p.viewcount,0) > 10000 or coalesce(p.favoritecount,0) > 50) then true else false end) as interesting_flag
+from posts p
+left join posts a on a.parentid = p.id and a.posttypeid = 2
+where p.posttypeid = 1
+  and a.id is null
+  and (coalesce(p.viewcount,0) > 1000 or coalesce(p.favoritecount,0) > 5)
+order by complexity_score desc nulls last
+limit 500;

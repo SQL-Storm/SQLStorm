@@ -1,0 +1,218 @@
+with
+-- Top contributors per tag (questions only), scoring by weighted activity
+QuestionTags as (
+  select
+    p.Id as QuestionId,
+    u.Id as OwnerId,
+    lower(t.TagName) as TagName,
+    coalesce(p.Score,0) as QScore,
+    coalesce(p.ViewCount,0) as QViews,
+    coalesce(p.AnswerCount,0) as QAnswers,
+    coalesce(p.FavoriteCount,0) as QFavs,
+    p.CreationDate
+  from Posts p
+  join Users u on p.OwnerUserId = u.Id
+  join lateral (
+    select regexp_split_to_table(substring(coalesce(p.Tags,''),2,length(coalesce(p.Tags,''))-2),'><') as TagName
+  ) t on true
+  where p.PostTypeId = 1
+),
+-- Aggregate per tag + user
+TagUserAgg as (
+  select
+    TagName,
+    OwnerId,
+    count(*) as QuestionsAsked,
+    sum(QScore) as SumScore,
+    sum(QViews) as SumViews,
+    sum(QAnswers) as SumAnswers,
+    sum(QFavs) as SumFavs,
+    min(CreationDate) as FirstAsked,
+    max(CreationDate) as LastAsked,
+    -- composite activity metric
+    sum(QScore) + sum(QFavs)*2 + floor(sum(QViews)/100) + sum(QAnswers)*3 as ActivityMetric
+  from QuestionTags
+  group by TagName, OwnerId
+),
+-- Top N users per tag
+TopTagUsers as (
+  select
+    tta.*,
+    row_number() over (partition by TagName order by ActivityMetric desc, SumScore desc, QuestionsAsked desc) as rn
+  from TagUserAgg tta
+),
+Top5TagUsers as (
+  select * from TopTagUsers where rn <= 5
+),
+-- Recent activity and edit churn for those top users
+RecentActivity as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate as UserCreated,
+    u.LastAccessDate,
+    coalesce(b.BadgeCount,0) as BadgeCount,
+    coalesce(pq.NumQuestions,0) as NumQuestions,
+    coalesce(pa.NumAnswers,0) as NumAnswers,
+    coalesce(c.NumComments,0) as NumComments,
+    coalesce(v.UpVotes,0) as UpVotes,
+    coalesce(v.DownVotes,0) as DownVotes,
+    -- activity density
+    case when age(cast('2024-10-01 12:34:56' as timestamp), u.CreationDate) is null then 0
+         else (coalesce(pq.NumQuestions,0)+coalesce(pa.NumAnswers,0)+coalesce(c.NumComments,0))::numeric / greatest(date_part('day', age(cast('2024-10-01 12:34:56' as timestamp), u.CreationDate)),1)
+    end as ActivityPerDay
+  from Users u
+  left join (
+    select UserId, count(*) as BadgeCount from Badges group by UserId
+  ) b on b.UserId = u.Id
+  left join (
+    select OwnerUserId, count(*) as NumQuestions from Posts where PostTypeId=1 group by OwnerUserId
+  ) pq on pq.OwnerUserId = u.Id
+  left join (
+    select OwnerUserId, count(*) as NumAnswers from Posts where PostTypeId=2 group by OwnerUserId
+  ) pa on pa.OwnerUserId = u.Id
+  left join (
+    select UserId, count(*) as NumComments from Comments group by UserId
+  ) c on c.UserId = u.Id
+  left join (
+    select UserId, sum(case when VoteTypeId=2 then 1 else 0 end) as UpVotes, sum(case when VoteTypeId=3 then 1 else 0 end) as DownVotes
+    from Votes
+    group by UserId
+  ) v on v.UserId = u.Id
+  where u.Id in (select OwnerId from Top5TagUsers)
+),
+-- compute per-question detailed stats including correlated subqueries and window functions
+QuestionDetails as (
+  select
+    q.Id as QuestionId,
+    q.Title,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.FavoriteCount,
+    q.OwnerUserId,
+    lower(t.TagName) as TagName,
+    -- percent answered within 7 days
+    case when q.AnswerCount = 0 then 0 else
+      (select count(*) from Posts a where a.ParentId = q.Id and a.CreationDate <= q.CreationDate + interval '7 days')::numeric / greatest(q.AnswerCount,1)
+    end as FractionAnswered7Days,
+    -- time to first answer
+    (select min(a.CreationDate) from Posts a where a.ParentId = q.Id) as FirstAnswerDate,
+    -- number of distinct editors on this question (posthistory)
+    (select count(distinct ph.UserId) from PostHistory ph where ph.PostId = q.Id and ph.UserId is not null) as DistinctEditors,
+    -- number of linked duplicates in/out
+    (select count(*) from PostLinks pl where pl.PostId = q.Id and pl.LinkTypeId = 3) as DuplicatesPointing,
+    (select count(*) from PostLinks pl where pl.RelatedPostId = q.Id and pl.LinkTypeId = 3) as DuplicatesLinkedFrom,
+    -- heavy expression with null handling and string ops on title
+    length(coalesce(q.Title,'')) as TitleLen,
+    regexp_replace(coalesce(q.Title,''), '\s+', ' ', 'g') as NormTitle,
+    case when position('?' in coalesce(q.Title,''))>0 then true else false end as HasQuestionMark,
+    -- window: rank by score within tag
+    rank() over (partition by lower(t.TagName) order by coalesce(q.Score,0) desc, q.ViewCount desc) as ScoreRankInTag
+  from Posts q
+  join lateral (
+    select regexp_split_to_table(substring(coalesce(q.Tags,''),2,length(coalesce(q.Tags,''))-2),'><') as TagName
+  ) t on true
+  where q.PostTypeId = 1
+),
+-- combine top users with one representative question each (most active/highest score)
+TopUserRepresentative as (
+  select
+    tu.TagName,
+    tu.OwnerId,
+    tu.ActivityMetric,
+    td.QuestionId,
+    td.Title,
+    td.Score as QScore,
+    td.ViewCount as QViews,
+    td.FractionAnswered7Days,
+    td.FirstAnswerDate,
+    td.DistinctEditors,
+    td.DuplicatesPointing,
+    td.DuplicatesLinkedFrom,
+    td.TitleLen,
+    td.NormTitle,
+    td.HasQuestionMark,
+    td.ScoreRankInTag,
+    row_number() over (partition by tu.TagName, tu.OwnerId order by td.Score desc nulls last, td.ViewCount desc nulls last) as qrn
+  from Top5TagUsers tu
+  left join QuestionDetails td on td.OwnerUserId = tu.OwnerId and lower(td.TagName)=lower(tu.TagName)
+),
+-- collapse to single representative per (tag,user)
+RepresentativeFiltered as (
+  select *
+  from TopUserRepresentative
+  where qrn = 1
+),
+-- assemble final result with joins, outer joins, set operators and final metrics
+FinalSet as (
+  select
+    r.TagName,
+    r.OwnerId,
+    u.DisplayName,
+    u.Reputation,
+    r.ActivityMetric,
+    r.QuestionsAsked,
+    coalesce(r.QViews,0) as TagUserViews,
+    r.QuestionId as RepresentativeQuestionId,
+    r.Title as RepresentativeTitle,
+    r.QScore as RepresentativeQScore,
+    r.QViews as RepresentativeQViews,
+    r.FractionAnswered7Days,
+    r.DistinctEditors,
+    r.ScoreRankInTag,
+    -- churn indicator: number of posthistory types in last 30 days for this user's posts on this tag
+    coalesce((
+      select count(*) from PostHistory ph
+      join Posts p on ph.PostId = p.Id
+      where p.OwnerUserId = r.OwnerId
+        and ph.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+        and exists (
+          select 1 from regexp_split_to_table(substring(coalesce(p.Tags,''),2,length(coalesce(p.Tags,''))-2),'><') tt where lower(tt)=lower(r.TagName)
+        )
+    ),0) as RecentEdits30d,
+    -- combined score with dampening of inactivity (using LastAccessDate)
+    (CAST(r.ActivityMetric AS numeric)) * greatest(0.1, least(1.5, 1 - least(1, date_part('day', age(cast('2024-10-01 12:34:56' as timestamp), u.LastAccessDate))/365))) as DampenedActivity,
+    -- textual fingerprint: first 40 chars of sanitized aboutme plus tag and owner id
+    left(regexp_replace(coalesce(u.AboutMe,''), '<[^>]*>', '', 'g'),40) || ' | ' || r.TagName || ' | ' || CAST(r.OwnerId AS text) as Fingerprint,
+    r.QScore,
+    r.QViews
+  from RepresentativeFiltered r
+  left join Users u on u.Id = r.OwnerId
+),
+-- include a synthetic union of "rising" and "established" sets using set operators
+Rising as (
+  select fs.*, 'rising' as Category from FinalSet fs where fs.DampenedActivity > fs.ActivityMetric * 0.5 and fs.QuestionsAsked >= 3
+),
+Established as (
+  select fs.*, 'established' as Category from FinalSet fs where fs.DampenedActivity <= fs.ActivityMetric * 0.5 or fs.QuestionsAsked < 3
+),
+Unioned as (
+  select * from Rising
+  union
+  select * from Established
+)
+-- final projection with ordering and limit for benchmarking
+select
+  TagName,
+  OwnerId,
+  DisplayName,
+  Reputation,
+  ActivityMetric,
+  QuestionsAsked,
+  TagUserViews,
+  RepresentativeQuestionId,
+  RepresentativeTitle,
+  RepresentativeQScore,
+  RepresentativeQViews,
+  FractionAnswered7Days,
+  DistinctEditors,
+  RecentEdits30d,
+  DampenedActivity,
+  Fingerprint,
+  Category
+from Unioned
+order by TagName asc, DampenedActivity desc, RepresentativeQScore desc
+limit 500;

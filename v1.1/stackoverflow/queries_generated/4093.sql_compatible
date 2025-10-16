@@ -1,0 +1,265 @@
+WITH RECURSIVE RecursiveUserBadgeCounts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        b.Class,
+        COUNT(b.Id) AS BadgeCount
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, b.Class
+
+    UNION ALL
+
+    SELECT
+        r.UserId,
+        r.DisplayName,
+        r.Class + 1 AS Class,
+        r.BadgeCount
+    FROM RecursiveUserBadgeCounts r
+    WHERE r.Class < 3
+),
+TopUsersByBadgeClass AS (
+    SELECT
+        UserId,
+        DisplayName,
+        Class,
+        BadgeCount,
+        ROW_NUMBER() OVER (PARTITION BY Class ORDER BY BadgeCount DESC, DisplayName) AS rn
+    FROM RecursiveUserBadgeCounts
+    WHERE BadgeCount IS NOT NULL
+),
+PostScoreStats AS (
+    SELECT
+        p.OwnerUserId,
+        p.PostTypeId,
+        COUNT(p.Id) AS PostCount,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.Score) AS MaxScore,
+        MIN(p.Score) AS MinScore,
+        SUM(p.ViewCount) AS TotalViews
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1
+    GROUP BY p.OwnerUserId, p.PostTypeId
+),
+QuestionAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId AS QuestionOwnerId,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViews,
+        q.Tags,
+        a.Id AS AnswerId,
+        a.OwnerUserId AS AnswerOwnerId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreationDate,
+        a.ParentId,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+),
+TopAnswersPerQuestion AS (
+    SELECT
+        QuestionId,
+        QuestionOwnerId,
+        QuestionScore,
+        QuestionViews,
+        Tags,
+        AnswerId,
+        AnswerOwnerId,
+        AnswerScore,
+        AnswerCreationDate
+    FROM QuestionAnswerStats
+    WHERE AnswerRank = 1
+),
+CommentUserActivity AS (
+    SELECT
+        c.UserId,
+        COUNT(c.Id) AS CommentCount,
+        AVG(LENGTH(c.Text)) AS AvgCommentLength,
+        SUM(COALESCE(c.Score, 0)) AS TotalCommentScore,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    GROUP BY c.UserId
+),
+UsersWithRecentActivity AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COALESCE(c.CommentCount, 0) AS CommentCount,
+        COALESCE(c.AvgCommentLength, 0) AS AvgCommentLength,
+        COALESCE(c.TotalCommentScore, 0) AS TotalCommentScore,
+        c.LastCommentDate
+    FROM Users u
+    LEFT JOIN CommentUserActivity c ON u.Id = c.UserId
+    WHERE u.Reputation > 1000 AND u.LastAccessDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+),
+MergedTopUsers AS (
+    SELECT
+        t.UserId,
+        t.DisplayName,
+        t.Class,
+        t.BadgeCount,
+        p.PostTypeId,
+        p.PostCount,
+        p.AvgScore,
+        p.MaxScore,
+        p.MinScore,
+        p.TotalViews,
+        u.CommentCount,
+        u.AvgCommentLength,
+        u.TotalCommentScore,
+        u.LastCommentDate,
+        t.rn
+    FROM TopUsersByBadgeClass t
+    LEFT JOIN PostScoreStats p ON t.UserId = p.OwnerUserId
+    LEFT JOIN UsersWithRecentActivity u ON t.UserId = u.Id
+    WHERE t.rn <= 10
+
+    UNION
+
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        NULL AS Class,
+        NULL AS BadgeCount,
+        NULL AS PostTypeId,
+        NULL AS PostCount,
+        NULL AS AvgScore,
+        NULL AS MaxScore,
+        NULL AS MinScore,
+        NULL AS TotalViews,
+        u.CommentCount,
+        u.AvgCommentLength,
+        u.TotalCommentScore,
+        u.LastCommentDate,
+        NULL AS rn
+    FROM UsersWithRecentActivity u
+    WHERE u.CommentCount > 100
+),
+QuestionsWithHighScoreRelatedDuplicates AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        COUNT(pl.Id) FILTER (WHERE lt.Name = 'Duplicate') AS DuplicateCount,
+        pl.RelatedPostId,
+        pl.CreationDate AS LinkCreationDate,
+        lt.Name AS LinkTypeName,
+        (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = q.Id AND a.Score > q.Score) AS HigherScoredAnswerCount,
+        EXISTS (
+            SELECT 1 FROM Votes v
+            WHERE v.PostId = q.Id AND v.VoteTypeId = 2 AND v.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days'
+        ) AS RecentUpvotes
+    FROM Posts q
+    LEFT JOIN PostLinks pl ON pl.PostId = q.Id
+    LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE q.PostTypeId = 1 AND q.Score > 10
+    GROUP BY q.Id, q.Title, q.Score, q.ViewCount, pl.RelatedPostId, pl.CreationDate, lt.Name
+),
+RankedQuestions AS (
+    SELECT
+        q.QuestionId,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.DuplicateCount,
+        q.RelatedPostId,
+        q.LinkCreationDate,
+        q.LinkTypeName,
+        q.HigherScoredAnswerCount,
+        q.RecentUpvotes,
+        ROW_NUMBER() OVER (
+            PARTITION BY q.LinkTypeName
+            ORDER BY q.Score DESC, q.ViewCount DESC
+        ) AS RankInLinkType
+    FROM QuestionsWithHighScoreRelatedDuplicates q
+),
+FilteredRankedQuestions AS (
+    SELECT
+        QuestionId,
+        Title,
+        Score,
+        ViewCount,
+        DuplicateCount,
+        RelatedPostId,
+        LinkCreationDate,
+        LinkTypeName,
+        HigherScoredAnswerCount,
+        RecentUpvotes,
+        RankInLinkType
+    FROM RankedQuestions
+    WHERE RankInLinkType <= 5
+),
+FinalDataset AS (
+    SELECT
+        m.UserId,
+        m.DisplayName,
+        COALESCE(m.Class, 0) AS BadgeClass,
+        COALESCE(m.BadgeCount, 0) AS BadgeCount,
+        COALESCE(m.PostTypeId, 0) AS PostTypeId,
+        COALESCE(m.PostCount, 0) AS PostCount,
+        COALESCE(m.AvgScore, 0) AS AvgScore,
+        COALESCE(m.MaxScore, 0) AS MaxScore,
+        COALESCE(m.MinScore, 0) AS MinScore,
+        COALESCE(m.TotalViews, 0) AS TotalViews,
+        COALESCE(m.CommentCount, 0) AS CommentCount,
+        ROUND(COALESCE(m.AvgCommentLength, 0), 2) AS AvgCommentLength,
+        COALESCE(m.TotalCommentScore, 0) AS TotalCommentScore,
+        m.LastCommentDate,
+        NULL::text AS EmailHash,
+        COALESCE(m.rn, 0) AS rn,
+        COALESCE(NULL, 0) AS Reputation
+    FROM MergedTopUsers m
+)
+SELECT
+    f.UserId,
+    f.DisplayName,
+    f.BadgeClass,
+    f.BadgeCount,
+    f.PostTypeId,
+    f.PostCount,
+    f.AvgScore,
+    f.MaxScore,
+    f.MinScore,
+    f.TotalViews,
+    f.CommentCount,
+    f.AvgCommentLength,
+    f.TotalCommentScore,
+    f.LastCommentDate,
+    frq.QuestionId,
+    frq.Title,
+    frq.Score AS QuestionScore,
+    frq.ViewCount AS QuestionViews,
+    frq.DuplicateCount,
+    frq.RelatedPostId,
+    frq.LinkCreationDate,
+    frq.LinkTypeName,
+    frq.HigherScoredAnswerCount,
+    frq.RecentUpvotes,
+    (
+        SELECT COUNT(*)
+        FROM Posts ans
+        WHERE ans.ParentId = frq.QuestionId
+          AND ans.PostTypeId = 2
+          AND ans.OwnerUserId = f.UserId
+          AND ans.Score > 5
+    ) AS UserHighScoreAnswersForQuestion,
+    CASE
+        WHEN f.DisplayName IS NOT NULL THEN
+            LOWER(TRIM(f.DisplayName)) || ' (' ||
+            COALESCE(NULLIF(f.EmailHash, ''), 'nohash') || ')'
+        ELSE 'anonymous'
+    END AS NormalizedDisplay,
+    COALESCE(f.Reputation, 0) * NULLIF(f.CommentCount, 0) / NULLIF(f.PostCount, 1) +
+    COALESCE(f.AvgScore, 0) * 0.5 -
+    COALESCE(f.TotalCommentScore, 0) * 0.3 AS WeightedScore
+FROM FinalDataset f
+LEFT JOIN FilteredRankedQuestions frq ON f.UserId = frq.RelatedPostId
+WHERE f.PostCount > 0
+ORDER BY WeightedScore DESC NULLS LAST, f.BadgeCount DESC NULLS LAST
+LIMIT 100;

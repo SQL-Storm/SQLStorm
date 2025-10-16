@@ -1,0 +1,133 @@
+WITH user_activity AS (
+    SELECT 
+        u.Id AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS user_creation,
+        COUNT(DISTINCT p.Id) AS post_count,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS question_count,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS answer_count,
+        AVG(p.Score) AS avg_post_score,
+        MAX(p.LastActivityDate) AS last_activity,
+        GROUP_CONCAT(DISTINCT SUBSTRING(p.Tags FROM 2 FOR (INSTR(p.Tags, '><') - 2)) SEPARATOR ', ') AS top_tags,
+        u.Location
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId 
+        AND p.PostTypeId IN (1, 2) 
+        AND p.CreationDate > u.CreationDate 
+        AND p.Score > (u.Reputation * 0.001)
+    WHERE u.Reputation > 100
+        AND (u.Location IS NULL OR u.Location != '')
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+    HAVING COUNT(DISTINCT p.Id) > 5
+),
+voted_posts AS (
+    SELECT 
+        v.PostId,
+        v.UserId,
+        v.VoteTypeId,
+        COUNT(*) OVER (PARTITION BY v.PostId, v.VoteTypeId) AS vote_count,
+        ROW_NUMBER() OVER (PARTITION BY v.UserId ORDER BY v.CreationDate DESC) AS vote_rank,
+        v.CreationDate
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2, 3)
+        AND v.CreationDate > DATE_SUB(DATE '2024-10-01', INTERVAL 1 YEAR)
+),
+active_controversy AS (
+    SELECT 
+        vp.PostId,
+        vp.UserId,
+        SUM(CASE WHEN vp.VoteTypeId = 2 THEN 1 ELSE 0 END) - SUM(CASE WHEN vp.VoteTypeId = 3 THEN 1 ELSE 0 END) AS net_votes,
+        vp.vote_count,
+        FIRST_VALUE(vp.CreationDate) OVER (PARTITION BY vp.PostId ORDER BY vp.CreationDate) AS first_vote,
+        MAX(vp.CreationDate) OVER (PARTITION BY vp.PostId) AS last_vote
+    FROM voted_posts vp
+    WHERE vp.vote_rank <= 10
+    GROUP BY vp.PostId, vp.UserId, vp.vote_count
+    HAVING ABS(SUM(CASE WHEN vp.VoteTypeId = 2 THEN 1 ELSE 0 END) - SUM(CASE WHEN vp.VoteTypeId = 3 THEN 1 ELSE 0 END)) > 5
+       OR vp.vote_count > 20
+),
+linked_questions AS (
+    SELECT 
+        pl.PostId,
+        pl.RelatedPostId,
+        COUNT(*) AS link_count,
+        GROUP_CONCAT(DISTINCT t.TagName SEPARATOR ' | ') AS related_tags
+    FROM PostLinks pl
+    INNER JOIN Tags t ON pl.RelatedPostId = t.ExcerptPostId
+    WHERE pl.LinkTypeId = 1
+        AND pl.CreationDate > DATE_SUB(DATE '2024-10-01', INTERVAL 6 MONTH)
+    GROUP BY pl.PostId, pl.RelatedPostId
+    HAVING COUNT(*) > 1
+)
+SELECT 
+    ua.user_id,
+    ua.DisplayName AS user_name,
+    ua.Reputation AS user_rep,
+    ua.post_count,
+    COALESCE(ua.question_count, 0) AS questions_asked,
+    COALESCE(ua.answer_count, 0) AS answers_given,
+    ROUND(COALESCE(ua.avg_post_score, 0), 2) AS avg_score,
+    CAST(DATEDIFF(day, ua.user_creation, DATE '2024-10-01') AS INTEGER) AS days_active,
+    
+    CASE 
+        WHEN ua.post_count = 0 THEN 0
+        WHEN ac.net_votes IS NULL THEN ua.Reputation / GREATEST(ua.post_count, 1)
+        ELSE (ua.Reputation + ABS(ac.net_votes)) / GREATEST(ua.post_count, 1)
+    END AS engagement_score,
+    
+    CASE 
+        WHEN ua.top_tags IS NULL OR CHAR_LENGTH(ua.top_tags) = 0 THEN 'No tags'
+        WHEN CHAR_LENGTH(ua.top_tags) > 100 THEN CONCAT(SUBSTRING(ua.top_tags, 1, 100), '...')
+        ELSE ua.top_tags
+    END AS tag_summary,
+    
+    ua.Reputation - AVG(ua.Reputation) OVER (
+        ORDER BY ua.last_activity DESC 
+        ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING
+    ) AS rep_vs_peers,
+    
+    COALESCE(lq.link_count, 0) AS external_links_made,
+    ac.vote_count AS controversial_votes,
+    
+    CONCAT(
+        COALESCE(ua.Location, 'Unknown'), 
+        ' | Active: ', 
+        CONCAT(CAST(DATEDIFF(year, ua.last_activity, DATE '2024-10-01') AS CHAR), ' yrs')
+    ) AS profile_info,
+    
+    (SELECT COUNT(*) 
+     FROM Badges b 
+     WHERE b.UserId = ua.user_id 
+       AND b.Date > ua.user_creation 
+       AND b.Class = 1
+    ) AS gold_badges_earned,
+    
+    CASE 
+        WHEN ua.post_count > 50 AND COALESCE(ac.net_votes, 0) < -10 THEN 'High volume, negative reception'
+        WHEN COALESCE(lq.link_count, 0) > 5 AND ua.Reputation > 5000 THEN 'Network influencer'
+        WHEN COALESCE(ua.question_count, 0) > COALESCE(ua.answer_count, 0) * 2 THEN 'Question dominant'
+        ELSE 'Balanced contributor'
+    END AS contributor_type,
+    
+    ua.last_activity
+FROM user_activity ua
+LEFT JOIN active_controversy ac ON ua.user_id = ac.UserId
+LEFT JOIN linked_questions lq ON ua.user_id = lq.PostId
+LEFT JOIN Posts recent_posts ON ua.user_id = recent_posts.OwnerUserId 
+    AND recent_posts.CreationDate = (
+        SELECT MAX(p2.CreationDate) 
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = ua.user_id 
+          AND p2.PostTypeId = 1
+    )
+WHERE CAST(DATEDIFF(day, ua.user_creation, DATE '2024-10-01') AS INTEGER) > 30
+    AND (ac.net_votes IS NULL OR ABS(ac.net_votes) > 2)
+    AND NOT EXISTS (
+        SELECT 1 FROM PostHistory ph 
+        WHERE ph.UserId = ua.user_id 
+          AND ph.PostHistoryTypeId = 12
+          AND ph.CreationDate > DATE_SUB(DATE '2024-10-01', INTERVAL 1 YEAR)
+    )
+ORDER BY engagement_score DESC, ua.last_activity DESC
+LIMIT 100;

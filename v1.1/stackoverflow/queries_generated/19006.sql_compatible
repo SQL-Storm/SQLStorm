@@ -1,0 +1,190 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesGiven,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) AS AvgQuestionScoreOwned,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) AS AvgAnswerScoreOwned,
+        NTILE(5) OVER (ORDER BY u.Reputation DESC) AS ReputationTier,
+        MAX(u.LastAccessDate) AS LastUserActivity
+    FROM
+        Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation
+    HAVING
+        COUNT(DISTINCT p.Id) > 5
+),
+QuestionTagStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        tag AS TagName,
+        t.Id AS TagId,
+        t.Count AS TagGlobalCount,
+        (
+            SELECT AVG(p_sub.Score)
+            FROM Posts p_sub
+            WHERE p_sub.PostTypeId = 1
+              AND p_sub.Tags LIKE '%' || '<' || tag || '>' || '%'
+        ) AS AvgTagQuestionScore
+    FROM
+        Posts q,
+        LATERAL (
+            SELECT UNNEST(string_to_array(SUBSTRING(q.Tags, 2, LENGTH(q.Tags) - 2), '><')) AS tag
+        ) tag_list
+    INNER JOIN Tags t ON t.TagName = tag_list.tag
+    WHERE
+        q.PostTypeId = 1
+        AND q.Tags IS NOT NULL
+        AND q.Score >= 10
+),
+PostModerationHistory AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        pht.Name AS HistoryTypeName,
+        ph.CreationDate AS EventDate,
+        ph.UserId AS ModeratorUserId,
+        COALESCE(ph.Comment, 'No reason given') AS CloseReasonComment,
+        cr.Name AS CloseReasonName,
+        LAG(ph.CreationDate, 1, TIMESTAMP '1970-01-01') OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PreviousEventDate,
+        EXTRACT(EPOCH FROM (ph.CreationDate - LAG(ph.CreationDate, 1, TIMESTAMP '1970-01-01') OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate))) / 3600 AS HoursSincePreviousEvent,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn_latest_event
+    FROM
+        PostHistory ph
+    INNER JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    LEFT JOIN CloseReasonTypes cr ON CAST(ph.Comment AS SMALLINT) = cr.Id AND ph.PostHistoryTypeId = 10
+    WHERE
+        ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20, 35)
+),
+AnswerQuality AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreationDate,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS RnkBestAnswer,
+        COUNT(c.Id) AS CommentCountOnAnswer,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesOnAnswer
+    FROM Posts a
+    LEFT JOIN Comments c ON a.Id = c.PostId
+    LEFT JOIN Votes v ON a.Id = v.PostId
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId, a.Id, a.Score, a.CreationDate
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.ReputationTier,
+    ua.TotalPostsOwned,
+    ua.TotalCommentsMade,
+    ua.TotalUpvotesGiven,
+    ua.AvgQuestionScoreOwned,
+    q.Id AS QuestionId,
+    q.Title AS QuestionTitle,
+    q.Score AS QuestionScore,
+    q.ViewCount AS QuestionViewCount,
+    q.CreationDate AS QuestionCreationDate,
+    qs.TagName AS PrimaryTag,
+    qs.AvgTagQuestionScore,
+    qs.TagGlobalCount,
+    aq.AnswerId,
+    aq.AnswerScore,
+    aq.RnkBestAnswer,
+    aq.CommentCountOnAnswer AS AnswerCommentCount,
+    aq.UpvotesOnAnswer AS AnswerUpvoteCount,
+    COALESCE(pmh_latest.HistoryTypeName, 'No Moderation Event') AS LastModerationEventType,
+    pmh_latest.CloseReasonName,
+    pmh_latest.HoursSincePreviousEvent AS HoursToLastModerationEvent,
+    EXTRACT(DAY FROM AGE(TIMESTAMP '2024-10-01 12:34:56', q.CreationDate)) AS DaysSinceQuestionCreated,
+    COUNT(DISTINCT b.Id) AS UserBadgeCount,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+    CASE
+        WHEN q.Score >= 100 AND q.ViewCount >= 10000 AND q.AnswerCount > 5 THEN 'Viral_HighQuality_Question'
+        WHEN q.Score >= 50 AND q.ViewCount >= 5000 THEN 'Popular_Question'
+        WHEN q.Score >= 10 AND q.ViewCount >= 1000 THEN 'Good_Question'
+        ELSE 'Normal_Question'
+    END AS QuestionPopularityCategory,
+    'https://stackoverflow.com/users/' || ua.UserId || '/' || REPLACE(COALESCE(ua.DisplayName, 'Unknown-User'), ' ', '-') AS UserProfileURL,
+    EXISTS (
+        SELECT 1
+        FROM Comments c_sub
+        WHERE c_sub.PostId = q.AcceptedAnswerId AND c_sub.UserId = ua.UserId AND LENGTH(c_sub.Text) > 20
+    ) AS HasUserCommentedOnAcceptedAnswer,
+    (
+        SELECT c_latest.Text
+        FROM Comments c_latest
+        WHERE c_latest.PostId = q.Id
+        ORDER BY c_latest.CreationDate DESC
+        LIMIT 1
+    ) AS LatestQuestionCommentText,
+    SUBSTRING(COALESCE(q_body_posts.Body, 'No body available yet'), 1, 150) AS QuestionBodySnippet,
+    (
+        (q.Score * 0.5) +
+        (q.ViewCount * 0.001) +
+        (COALESCE(aq.AnswerScore, 0) * 0.3 * (CASE WHEN q.AcceptedAnswerId = aq.AnswerId THEN 1.5 ELSE 1.0 END)) +
+        (COALESCE(aq.UpvotesOnAnswer, 0) * 0.2) -
+        (EXTRACT(DAY FROM AGE(TIMESTAMP '2024-10-01 12:34:56', q.CreationDate)) * 0.01) +
+        (LOG(GREATEST(qs.TagGlobalCount, 1)) * 0.1)
+    )::NUMERIC(10, 2) AS DerivedQualityScore,
+    (
+        SELECT MAX(ph_mig.EventDate)
+        FROM PostModerationHistory ph_mig
+        WHERE ph_mig.PostId = q.Id AND ph_mig.PostHistoryTypeId = 35
+    ) IS NOT NULL AS WasMigratedAway,
+    COALESCE(q.FavoriteCount, 0) AS FavoriteCount
+FROM
+    UserActivitySummary ua
+INNER JOIN
+    Posts q ON ua.UserId = q.OwnerUserId AND q.PostTypeId = 1
+LEFT JOIN LATERAL
+    (SELECT TagName, AvgTagQuestionScore, TagGlobalCount FROM QuestionTagStats WHERE QuestionTagStats.QuestionId = q.Id LIMIT 1) qs ON TRUE
+LEFT JOIN
+    AnswerQuality aq ON q.Id = aq.QuestionId AND (q.AcceptedAnswerId IS NULL OR q.AcceptedAnswerId = aq.AnswerId) AND aq.RnkBestAnswer = 1
+LEFT JOIN
+    PostModerationHistory pmh_latest ON q.Id = pmh_latest.PostId AND pmh_latest.rn_latest_event = 1
+LEFT JOIN
+    Badges b ON ua.UserId = b.UserId
+LEFT JOIN
+    Posts q_body_posts ON q.Id = q_body_posts.Id
+WHERE
+    ua.ReputationTier <= 2
+    AND q.ViewCount > 500
+    AND q.CreationDate >= DATE '2020-01-01'
+    AND (
+        pmh_latest.HistoryTypeName IS NULL
+        OR pmh_latest.HistoryTypeName NOT LIKE '%Close%'
+        OR q.Score > 50
+    )
+    AND EXISTS (
+        SELECT 1 FROM Comments c_chk WHERE c_chk.PostId = q.Id AND LENGTH(c_chk.Text) > 50
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostLinks pl
+        WHERE pl.PostId = q.Id AND pl.LinkTypeId = 3
+        EXCEPT
+        SELECT 1
+        FROM PostHistory ph_reopened
+        WHERE ph_reopened.PostId = q.Id AND ph_reopened.PostHistoryTypeId = 11
+    )
+GROUP BY
+    ua.UserId, ua.DisplayName, ua.Reputation, ua.ReputationTier, ua.TotalPostsOwned, ua.TotalCommentsMade,
+    ua.TotalUpvotesGiven, ua.AvgQuestionScoreOwned, q.Id, q.Title, q.Score,
+    q.ViewCount, q.CreationDate, qs.TagName, qs.AvgTagQuestionScore, qs.TagGlobalCount,
+    aq.AnswerId, aq.AnswerScore, aq.RnkBestAnswer, aq.CommentCountOnAnswer, aq.UpvotesOnAnswer,
+    pmh_latest.HistoryTypeName, pmh_latest.CloseReasonName, pmh_latest.HoursSincePreviousEvent,
+    q.AcceptedAnswerId, q_body_posts.Body, q.AnswerCount, q.FavoriteCount, ua.DisplayName
+ORDER BY
+    DerivedQualityScore DESC, q.CreationDate DESC
+LIMIT 100;

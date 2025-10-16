@@ -1,0 +1,206 @@
+-- {"query": "380.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1875} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        0 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        r.Level + 1,
+        r.Path || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id <> r.Id and not t.TagName = any(r.Path)
+    where r.Level < 2
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserReputationStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        coalesce(ubc_gold.BadgeCount,0) as GoldBadges,
+        coalesce(ubc_silver.BadgeCount,0) as SilverBadges,
+        coalesce(ubc_bronze.BadgeCount,0) as BronzeBadges,
+        row_number() over (order by u.Reputation desc) as RepRank
+    from Users u
+    left join UserBadgeCounts ubc_gold on u.Id = ubc_gold.UserId and ubc_gold.Class = 1
+    left join UserBadgeCounts ubc_silver on u.Id = ubc_silver.UserId and ubc_silver.Class = 2
+    left join UserBadgeCounts ubc_bronze on u.Id = ubc_bronze.UserId and ubc_bronze.Class = 3
+    where u.Reputation > 1000
+),
+QuestionAnswerStats as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate as QuestionCreation,
+        p.Score as QuestionScore,
+        p.ViewCount,
+        p.Tags,
+        count(a.Id) as AnswerCount,
+        max(a.Score) as MaxAnswerScore,
+        avg(a.Score) as AvgAnswerScore,
+        sum(case when a.OwnerUserId is null then 0 else 1 end) as AnsweredByKnownUsers,
+        max(case when a.Id = p.AcceptedAnswerId then a.Score else null end) as AcceptedAnswerScore
+    from Posts p
+    left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+    where p.PostTypeId = 1 and p.CreationDate > current_date - interval '1 year'
+    group by p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.AcceptedAnswerId
+),
+PostWithCloseInfo as (
+    select
+        p.Id,
+        p.Title,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.ClosedDate,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseVoteDate
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as smallint)
+    where p.PostTypeId = 1
+),
+TopQuestionsWithComments as (
+    select
+        q.QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.QuestionCreation,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        q.AnswerCount,
+        q.MaxAnswerScore,
+        q.AvgAnswerScore,
+        q.AcceptedAnswerScore,
+        count(c.Id) filter (where c.UserId is not null) as CommentCountByKnownUsers,
+        count(c.Id) filter (where c.UserId is null) as CommentCountByAnonymous,
+        string_agg(distinct u.DisplayName, ', ') filter (where u.DisplayName is not null) as Commenters,
+        string_agg(distinct substring(c.Text from 1 for 50), ' | ') as SampleComments
+    from QuestionAnswerStats q
+    left join Comments c on c.PostId = q.QuestionId
+    left join Users u on u.Id = c.UserId
+    group by q.QuestionId, q.Title, q.OwnerUserId, q.QuestionCreation, q.Score, q.ViewCount, q.Tags, q.AnswerCount, q.MaxAnswerScore, q.AvgAnswerScore, q.AcceptedAnswerScore
+    having count(c.Id) > 5
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        count(*) over (partition by u.Id order by p.CreationDate range between interval '30 days' preceding and current row) as PostsLast30Days,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) over (partition by u.Id order by p.CreationDate range between interval '30 days' preceding and current row) as QuestionsLast30Days,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) over (partition by u.Id order by p.CreationDate range between interval '30 days' preceding and current row) as AnswersLast30Days
+    from Users u
+    join Posts p on p.OwnerUserId = u.Id
+    where u.Reputation > 500
+),
+CombinedResults as (
+    select
+        tq.QuestionId,
+        tq.Title,
+        tq.OwnerUserId,
+        ur.DisplayName as QuestionOwner,
+        tq.QuestionCreation,
+        tq.QuestionScore,
+        tq.ViewCount,
+        tq.Tags,
+        tq.AnswerCount,
+        tq.MaxAnswerScore,
+        tq.AvgAnswerScore,
+        tq.AcceptedAnswerScore,
+        tq.CommentCountByKnownUsers,
+        tq.CommentCountByAnonymous,
+        tq.Commenters,
+        tq.SampleComments,
+        ua.PostsLast30Days,
+        ua.QuestionsLast30Days,
+        ua.AnswersLast30Days,
+        case when tq.AcceptedAnswerScore is not null and tq.AcceptedAnswerScore > 10 then 'High Accepted Answer Score'
+             when tq.MaxAnswerScore > 20 then 'High Max Answer Score'
+             else 'Normal' end as QuestionQualityCategory
+    from TopQuestionsWithComments tq
+    left join UserReputationStats ur on ur.UserId = tq.OwnerUserId
+    left join UserActivityWindow ua on ua.UserId = tq.OwnerUserId
+    where ua.PostsLast30Days is not null
+)
+select
+    crh.Level,
+    crh.TagName,
+    crh.Count as TagCount,
+    crh.ExcerptPostId,
+    crh.WikiPostId,
+    crh.Path,
+    crh.Level * crh.Count as WeightedTagMetric,
+    crh.Level + length(array_to_string(crh.Path, ',')) as ComplexStringMetric,
+    crh.Level % 2 as LevelParity,
+    crh.Level is null as LevelIsNull,
+    crh.TagName like '%sql%' as TagNameContainsSQL,
+    crh.TagName || '_' || cast(crh.Level as varchar) as TagLevelConcat,
+    crh.Path[1] as RootTag,
+    crh.Path[array_length(crh.Path,1)] as LeafTag
+from RecursiveTagHierarchy crh
+where crh.Level < 2
+union
+select
+    0 as Level,
+    'Summary' as TagName,
+    sum(crh.Count) as TagCount,
+    null as ExcerptPostId,
+    null as WikiPostId,
+    null as Path,
+    sum(crh.Level * crh.Count) as WeightedTagMetric,
+    null as ComplexStringMetric,
+    null as LevelParity,
+    null as LevelIsNull,
+    null as TagNameContainsSQL,
+    null as TagLevelConcat,
+    null as RootTag,
+    null as LeafTag
+from RecursiveTagHierarchy crh
+union all
+select
+    null as Level,
+    crq.Title as TagName,
+    null as TagCount,
+    null as ExcerptPostId,
+    null as WikiPostId,
+    null as Path,
+    null as WeightedTagMetric,
+    null as ComplexStringMetric,
+    null as LevelParity,
+    null as LevelIsNull,
+    null as TagNameContainsSQL,
+    null as TagLevelConcat,
+    null as RootTag,
+    null as LeafTag
+from CombinedResults crq
+order by Level nulls last, TagName nulls last, TagCount desc nulls last
+limit 100;

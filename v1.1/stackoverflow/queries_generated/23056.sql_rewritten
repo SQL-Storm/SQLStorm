@@ -1,0 +1,127 @@
+-- {"query": "23056.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "grok-4", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2685, "output_tokens": 1148} 
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COALESCE(COUNT(p.Id), 0) AS PostCount,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        AVG(NULLIF(p.ViewCount, 0)) AS AvgViewCount,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY SUM(COALESCE(p.Score, 0)) DESC) AS YearlyRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId IN (1, 2)
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.Reputation, u.CreationDate
+    HAVING COUNT(p.Id) > 10
+),
+BadgeSummary AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        MAX(b.Date) AS LatestBadgeDate
+    FROM Badges b
+    WHERE b.TagBased = TRUE
+    GROUP BY b.UserId
+),
+TagPopularity AS (
+    SELECT 
+        t.Id AS TagId,
+        t.TagName,
+        t.Count AS TagUsageCount,
+        p.Id AS PostId,
+        LAG(t.Count) OVER (PARTITION BY t.TagName ORDER BY p.CreationDate) AS PrevTagCount
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE CONCAT('%<', t.TagName, '>%') AND p.PostTypeId = 1
+    WHERE t.Count > 500
+),
+CorrelatedSubqueryExample AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 5) AS HighScoreComments,
+        (SELECT STRING_AGG(v.VoteTypeId::text, ',') FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId IN (2, 3) GROUP BY v.PostId) AS VoteTypes
+    FROM Posts p
+    WHERE EXISTS (SELECT 1 FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 5 AND ph.CreationDate > p.CreationDate)
+),
+CombinedResults AS (
+    SELECT 
+        ua.UserId,
+        ua.Reputation,
+        ua.PostCount,
+        ua.TotalPostScore,
+        ua.AvgViewCount,
+        ua.YearlyRank,
+        bs.GoldBadges,
+        bs.SilverBadges,
+        bs.BronzeBadges,
+        bs.LatestBadgeDate,
+        tp.TagName,
+        tp.TagUsageCount,
+        tp.PrevTagCount,
+        cse.Title,
+        cse.HighScoreComments,
+        cse.VoteTypes,
+        CASE 
+            WHEN ua.TotalPostScore > 10000 THEN 'High Performer'
+            WHEN ua.TotalPostScore BETWEEN 5000 AND 10000 THEN 'Medium Performer'
+            ELSE 'Low Performer'
+        END AS PerformanceCategory,
+        COALESCE(ua.AvgViewCount, 0) + COALESCE(tp.TagUsageCount, 0) AS CombinedMetric,
+        UPPER(CONCAT(SUBSTRING(u.DisplayName, 1, 5), ' - ', t.TagName)) AS DisplayString
+    FROM UserActivity ua
+    LEFT JOIN BadgeSummary bs ON bs.UserId = ua.UserId
+    INNER JOIN Users u ON u.Id = ua.UserId
+    FULL OUTER JOIN TagPopularity tp ON tp.PostId = (SELECT MIN(p2.Id) FROM Posts p2 WHERE p2.OwnerUserId = ua.UserId)
+    LEFT JOIN CorrelatedSubqueryExample cse ON cse.PostId = tp.PostId
+    WHERE ua.YearlyRank <= 10
+       OR (bs.GoldBadges > 5 AND bs.LatestBadgeDate > '2020-01-01')
+    UNION
+    SELECT 
+        NULL AS UserId,
+        0 AS Reputation,
+        0 AS PostCount,
+        0 AS TotalPostScore,
+        NULL AS AvgViewCount,
+        NULL AS YearlyRank,
+        0 AS GoldBadges,
+        0 AS SilverBadges,
+        0 AS BronzeBadges,
+        NULL AS LatestBadgeDate,
+        t.TagName,
+        t.Count AS TagUsageCount,
+        NULL AS PrevTagCount,
+        NULL AS Title,
+        0 AS HighScoreComments,
+        NULL AS VoteTypes,
+        'Tag Only' AS PerformanceCategory,
+        t.Count AS CombinedMetric,
+        UPPER(t.TagName) AS DisplayString
+    FROM Tags t
+    WHERE t.Count > 10000 AND t.ExcerptPostId IS NULL
+)
+SELECT 
+    UserId,
+    Reputation,
+    PostCount,
+    TotalPostScore,
+    AvgViewCount,
+    YearlyRank,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    LatestBadgeDate,
+    TagName,
+    TagUsageCount,
+    PrevTagCount,
+    Title,
+    HighScoreComments,
+    VoteTypes,
+    PerformanceCategory,
+    CombinedMetric,
+    DisplayString,
+    RANK() OVER (ORDER BY CombinedMetric DESC) AS OverallRank
+FROM CombinedResults
+WHERE CombinedMetric IS NOT NULL
+ORDER BY OverallRank;

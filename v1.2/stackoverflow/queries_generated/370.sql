@@ -1,0 +1,202 @@
+-- {"query": "370.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1854} 
+with RecursiveTagCounts as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        t.Count,
+        coalesce(p.ViewCount, 0) as PostViewCount,
+        coalesce(p.Score, 0) as PostScore,
+        row_number() over (partition by t.Id order by p.CreationDate desc nulls last) as rn
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId or p.Id = t.WikiPostId
+    where t.IsModeratorOnly = 0
+),
+FilteredTags as (
+    select TagId, TagName, Count, PostViewCount, PostScore
+    from RecursiveTagCounts
+    where rn = 1
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserReputationRanks as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        rank() over (order by u.Reputation desc) as RepRank,
+        dense_rank() over (partition by u.Location order by u.Reputation desc) as LocationRepRank
+    from Users u
+    where u.Location is not null
+),
+PostAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        count(a.Id) as AnswerCount,
+        max(a.Score) as MaxAnswerScore,
+        avg(a.Score) as AvgAnswerScore,
+        sum(case when a.Score > 0 then 1 else 0 end) as PositiveAnswers,
+        sum(case when a.Score <= 0 then 1 else 0 end) as NonPositiveAnswers
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.OwnerUserId
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) over (partition by u.Id order by p.CreationDate rows between unbounded preceding and current row) as CumulativePosts,
+        count(distinct c.Id) over (partition by u.Id order by c.CreationDate rows between unbounded preceding and current row) as CumulativeComments
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+),
+TopQuestionsWithVotes as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as FavoriteVotes
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    where p.PostTypeId = 1
+    group by p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount
+),
+DuplicateQuestions as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title as OriginalTitle,
+        p2.Title as DuplicateTitle,
+        pl.CreationDate as LinkCreationDate
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId and p1.PostTypeId = 1
+    join Posts p2 on p2.Id = pl.RelatedPostId and p2.PostTypeId = 1
+    where pl.LinkTypeId = 3
+),
+QuestionsWithCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10
+),
+UserBadgeSummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        coalesce(sum(case when b.Class = 1 then 1 else 0 end), 0) as GoldBadges,
+        coalesce(sum(case when b.Class = 2 then 1 else 0 end), 0) as SilverBadges,
+        coalesce(sum(case when b.Class = 3 then 1 else 0 end), 0) as BronzeBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+UserPostActivity as (
+    select
+        u.Id as UserId,
+        count(p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(p.Id) filter (where p.PostTypeId not in (1,2)) as OtherPostCount,
+        max(p.Score) as MaxPostScore,
+        avg(p.Score) as AvgPostScore,
+        count(distinct ph.Id) as EditCount
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join PostHistory ph on ph.PostId = p.Id and ph.UserId = u.Id
+    group by u.Id
+),
+HighActivityUsers as (
+    select
+        upa.UserId,
+        upa.QuestionCount,
+        upa.AnswerCount,
+        upa.OtherPostCount,
+        upa.MaxPostScore,
+        upa.AvgPostScore,
+        upa.EditCount,
+        u.DisplayName,
+        u.Reputation
+    from UserPostActivity upa
+    join Users u on u.Id = upa.UserId
+    where upa.QuestionCount + upa.AnswerCount > 50 and u.Reputation > 1000
+),
+ComplexUserStats as (
+    select
+        hau.UserId,
+        hau.DisplayName,
+        hau.Reputation,
+        hau.QuestionCount,
+        hau.AnswerCount,
+        hau.EditCount,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ua.CumulativePosts,
+        ua.CumulativeComments,
+        case
+            when hau.EditCount > 100 then 'Highly Active Editor'
+            when hau.QuestionCount > hau.AnswerCount then 'Question Focused'
+            when hau.AnswerCount > hau.QuestionCount then 'Answer Focused'
+            else 'Balanced'
+        end as UserType
+    from HighActivityUsers hau
+    left join UserBadgeSummary ub on ub.UserId = hau.UserId
+    left join UserActivityWindow ua on ua.UserId = hau.UserId
+    group by hau.UserId, hau.DisplayName, hau.Reputation, hau.QuestionCount, hau.AnswerCount, hau.EditCount, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ua.CumulativePosts, ua.CumulativeComments
+)
+select
+    cuss.UserId,
+    cuss.DisplayName,
+    cuss.Reputation,
+    cuss.UserType,
+    cuss.QuestionCount,
+    cuss.AnswerCount,
+    cuss.EditCount,
+    cuss.GoldBadges,
+    cuss.SilverBadges,
+    cuss.BronzeBadges,
+    cuss.CumulativePosts,
+    cuss.CumulativeComments,
+    ft.TagName as FavoriteTag,
+    ft.Count as TagUseCount,
+    das.AnswerCount as QuestionAnswerCount,
+    das.MaxAnswerScore,
+    das.AvgAnswerScore,
+    dq.DuplicateTitle,
+    qc.CloseReason,
+    tqv.UpVotes,
+    tqv.DownVotes,
+    tqv.FavoriteVotes
+from ComplexUserStats cuss
+left join PostAnswerStats das on das.QuestionId = (
+    select p.Id from Posts p where p.OwnerUserId = cuss.UserId and p.PostTypeId = 1 order by p.Score desc limit 1
+)
+left join FilteredTags ft on ft.TagId = (
+    select t.Id from Tags t
+    join Posts p on p.OwnerUserId = cuss.UserId and (p.Tags like '%' || t.TagName || '%')
+    group by t.Id
+    order by sum(p.ViewCount) desc nulls last limit 1
+)
+left join DuplicateQuestions dq on dq.PostId = das.QuestionId
+left join QuestionsWithCloseReasons qc on qc.PostId = das.QuestionId
+left join TopQuestionsWithVotes tqv on tqv.Id = das.QuestionId
+order by cuss.Reputation desc
+limit 100;

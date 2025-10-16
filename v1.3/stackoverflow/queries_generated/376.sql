@@ -1,0 +1,222 @@
+-- {"query": "376.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 16523} 
+WITH
+recent_questions AS (
+  SELECT p.Id, p.Title, p.Tags, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.OwnerUserId, p.AcceptedAnswerId, p.ClosedDate, p.Body, p.LastActivityDate
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate IS NOT NULL
+    AND p.CreationDate >= now() - interval '10 years'
+),
+tags_expanded AS (
+  SELECT rq.Id AS QuestionId,
+         trim(t.tag) AS Tag
+  FROM recent_questions rq
+  CROSS JOIN LATERAL unnest(
+    string_to_array(
+      substring(coalesce(rq.Tags,''), 2, GREATEST(length(coalesce(rq.Tags,'')) - 2, 0)),
+      '><'
+    )
+  ) AS t(tag)
+  WHERE coalesce(rq.Tags,'') <> '' AND trim(t.tag) <> ''
+),
+answers AS (
+  SELECT a.Id, a.ParentId AS QuestionId, a.Score, a.CreationDate, a.OwnerUserId, a.Body, a.CommentCount, a.LastActivityDate
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+),
+answer_stats AS (
+  SELECT
+    q.Id AS QuestionId,
+    COUNT(a.Id) AS TotalAnswers,
+    AVG(a.Score)::numeric(10,2) AS AvgAnswerScore,
+    SUM(CASE WHEN a.OwnerUserId IS NULL THEN 0 ELSE 1 END) AS AnsweredByRegisteredUsers,
+    MIN(a.CreationDate) AS FirstAnswerDate,
+    MAX(a.CreationDate) AS LastAnswerDate,
+    (array_agg(a.Score ORDER BY a.Score))[ (CEIL(COUNT(a.Id)::numeric/2))::int ] AS MedianAnswerScore
+  FROM recent_questions q
+  LEFT JOIN answers a ON a.ParentId = q.Id
+  GROUP BY q.Id
+),
+votes_agg AS (
+  SELECT v.PostId,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS VoteScore,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+         COUNT(*) AS TotalVotes
+  FROM Votes v
+  GROUP BY v.PostId
+),
+ph_agg AS (
+  SELECT ph.PostId,
+         SUM(CASE WHEN ph.PostHistoryTypeId IN (4,5,6,7,8,9,24,66) THEN 1 ELSE 0 END) AS EditEvents,
+         SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseEvents,
+         SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenEvents,
+         MAX(ph.CreationDate) AS LastEdit
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+comments_agg AS (
+  SELECT c.PostId,
+         COUNT(*) AS CommentCountTotal,
+         COUNT(DISTINCT c.UserId) AS UniqueCommenters,
+         MAX(c.CreationDate) AS LastCommentDate
+  FROM Comments c
+  GROUP BY c.PostId
+),
+link_both AS (
+  SELECT PostId, SUM(CASE WHEN LinkTypeId=1 THEN 1 ELSE 0 END) AS OutboundLinks, SUM(CASE WHEN LinkTypeId=3 THEN 1 ELSE 0 END) AS DuplicateLinks, COUNT(*) AS TotalLinks
+  FROM PostLinks
+  GROUP BY PostId
+),
+link_related AS (
+  SELECT RelatedPostId AS PostId, 0 AS OutboundLinks, 0 AS DuplicateLinks, COUNT(*) AS TotalLinks
+  FROM PostLinks
+  GROUP BY RelatedPostId
+),
+link_agg AS (
+  SELECT lb.PostId, SUM(lb.OutboundLinks) AS OutboundLinks, SUM(lb.DuplicateLinks) AS DuplicateLinks, SUM(lb.TotalLinks) AS TotalLinks
+  FROM (
+    SELECT * FROM link_both
+    UNION ALL
+    SELECT * FROM link_related
+  ) lb
+  GROUP BY lb.PostId
+),
+top_answerer_per_q AS (
+  SELECT a.ParentId AS QuestionId,
+         a.OwnerUserId,
+         SUM(a.Score) AS SumScore,
+         COUNT(*) AS AnswersCount,
+         ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY SUM(a.Score) DESC NULLS LAST, COUNT(*) DESC) AS rn
+  FROM answers a
+  WHERE a.OwnerUserId IS NOT NULL
+  GROUP BY a.ParentId, a.OwnerUserId
+),
+top_ans AS (
+  SELECT QuestionId, OwnerUserId FROM top_answerer_per_q WHERE rn = 1
+),
+badge_counts AS (
+  SELECT b.UserId, COUNT(*) AS BadgesTotal,
+         SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS Gold,
+         SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS Silver,
+         SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS Bronze
+  FROM Badges b
+  GROUP BY b.UserId
+),
+main_metrics AS (
+  SELECT q.Id AS QuestionId,
+         q.Title,
+         q.CreationDate,
+         q.Score AS QuestionScore,
+         q.ViewCount,
+         q.AnswerCount AS DeclaredAnswerCount,
+         COALESCE(a.TotalAnswers,0) AS TotalAnswers,
+         COALESCE(a.AvgAnswerScore,0) AS AvgAnswerScore,
+         COALESCE((a.MedianAnswerScore)::numeric,0) AS MedianAnswerScore,
+         a.FirstAnswerDate,
+         COALESCE(ph.EditEvents,0) AS EditEvents,
+         COALESCE(ph.CloseEvents,0) AS CloseEvents,
+         COALESCE(v.VoteScore,0) AS VoteScoreComputed,
+         COALESCE(v.UpVotes,0) AS UpVotes,
+         COALESCE(v.DownVotes,0) AS DownVotes,
+         COALESCE(c.CommentCountTotal,0) AS CommentCountTotal,
+         COALESCE(lb.TotalLinks,0) AS TotalLinks,
+         t.OwnerUserId AS TopAnswererId,
+         u.DisplayName AS OwnerName,
+         COALESCE(bc.BadgesTotal,0) AS OwnerBadgesTotal,
+         CASE
+           WHEN q.AcceptedAnswerId IS NOT NULL THEN EXTRACT(EPOCH FROM ( (SELECT a2.CreationDate FROM Posts a2 WHERE a2.Id = q.AcceptedAnswerId) - q.CreationDate))/3600
+           ELSE NULL
+         END AS HoursToAcceptedAnswer,
+         GREATEST(1.0, 365.0 / NULLIF(EXTRACT(EPOCH FROM now() - q.CreationDate)/86400,0)) AS RecencyFactor,
+         (COALESCE(q.ViewCount,0) * 0.0001) + (COALESCE(q.Score,0) * 1.5) + (COALESCE(a.TotalAnswers,0) * 2.0) + (COALESCE(v.UpVotes - v.DownVotes,0) * 0.5) AS PopularityIndex,
+         (SELECT COUNT(DISTINCT te.Tag) FROM tags_expanded te WHERE te.QuestionId = q.Id) AS TagDiversity,
+         LEFT(q.Body, 300) AS Snippet,
+         regexp_replace(LEFT(q.Body, 1000), '<[^>]*>', ' ', 'g') AS SnippetSanitized,
+         (SELECT u2.DisplayName FROM Users u2 WHERE u2.Id = (SELECT c2.UserId FROM Comments c2 WHERE c2.PostId = q.Id AND c2.UserId IS NOT NULL ORDER BY c2.Score DESC NULLS LAST LIMIT 1)) AS TopCommenterName,
+         (SELECT a3.OwnerUserId FROM Posts a3 WHERE a3.ParentId = q.Id AND a3.OwnerUserId IS NOT NULL ORDER BY a3.Score DESC NULLS LAST LIMIT 1) AS HighestScoringAnswerUserId,
+         LENGTH(q.Body) AS BodyLength,
+         ( (COALESCE(q.Score,0) * 2.0) + (COALESCE(a.AvgAnswerScore,0) * 1.2) + (COALESCE(v.UpVotes,0) * 0.8) - (COALESCE(ph.CloseEvents,0) * 5) + (LN(GREATEST(1,q.ViewCount)) * 1.1) + (COALESCE(a.TotalAnswers,0) * 1.5) ) / (1 + GREATEST(0, COALESCE(ph.EditEvents,0)*0.1)) AS MetaScore
+  FROM recent_questions q
+  LEFT JOIN answer_stats a ON a.QuestionId = q.Id
+  LEFT JOIN ph_agg ph ON ph.PostId = q.Id
+  LEFT JOIN votes_agg v ON v.PostId = q.Id
+  LEFT JOIN comments_agg c ON c.PostId = q.Id
+  LEFT JOIN link_agg lb ON lb.PostId = q.Id
+  LEFT JOIN top_ans t ON t.QuestionId = q.Id
+  LEFT JOIN Users u ON u.Id = q.OwnerUserId
+  LEFT JOIN badge_counts bc ON bc.UserId = q.OwnerUserId
+),
+tag_ranked AS (
+  SELECT te.Tag,
+         mm.QuestionId,
+         mm.Title,
+         mm.OwnerName,
+         mm.MetaScore,
+         mm.PopularityIndex,
+         mm.ViewCount,
+         mm.BodyLength,
+         mm.Snippet,
+         mm.SnippetSanitized,
+         mm.TopCommenterName,
+         mm.HighestScoringAnswerUserId,
+         mm.HoursToAcceptedAnswer,
+         ROW_NUMBER() OVER (PARTITION BY te.Tag ORDER BY mm.MetaScore DESC NULLS LAST, mm.PopularityIndex DESC NULLS LAST) AS TagRank
+  FROM tags_expanded te
+  JOIN main_metrics mm ON mm.QuestionId = te.QuestionId
+),
+final AS (
+  SELECT
+    'tag_top'::text AS source,
+    tr.Tag::text AS tag,
+    tr.QuestionId,
+    tr.Title,
+    tr.OwnerName,
+    tr.MetaScore::numeric(18,6) AS MetaScore,
+    tr.TagRank::int AS TagRank,
+    NULL::int AS GlobalRank,
+    tr.HoursToAcceptedAnswer::numeric(12,3) AS HoursToAcceptedAnswer,
+    tr.PopularityIndex::numeric(18,6) AS PopularityIndex,
+    tr.ViewCount::bigint AS ViewCount,
+    tr.BodyLength::int AS BodyLength,
+    tr.Snippet::text AS Snippet,
+    tr.SnippetSanitized::text AS SnippetSanitized,
+    tr.TopCommenterName::text AS TopCommenterName,
+    tr.HighestScoringAnswerUserId::int AS HighestScoringAnswerUserId
+  FROM tag_ranked tr
+  WHERE tr.TagRank <= 3
+
+  UNION ALL
+
+  SELECT
+    'global_top'::text AS source,
+    NULL::text AS tag,
+    g.QuestionId,
+    g.Title,
+    g.OwnerName,
+    g.MetaScore::numeric(18,6) AS MetaScore,
+    NULL::int AS TagRank,
+    g.GlobalRank::int AS GlobalRank,
+    g.HoursToAcceptedAnswer::numeric(12,3) AS HoursToAcceptedAnswer,
+    g.PopularityIndex::numeric(18,6) AS PopularityIndex,
+    g.ViewCount::bigint AS ViewCount,
+    g.BodyLength::int AS BodyLength,
+    g.Snippet::text AS Snippet,
+    g.SnippetSanitized::text AS SnippetSanitized,
+    g.TopCommenterName::text AS TopCommenterName,
+    g.HighestScoringAnswerUserId::int AS HighestScoringAnswerUserId
+  FROM (
+    SELECT mm.*, ROW_NUMBER() OVER (ORDER BY mm.MetaScore DESC NULLS LAST) AS GlobalRank
+    FROM main_metrics mm
+    WHERE mm.MetaScore IS NOT NULL
+  ) g
+  WHERE g.GlobalRank <= 50
+)
+SELECT *
+FROM final
+EXCEPT
+SELECT *
+FROM final
+WHERE QuestionId IN (SELECT Id FROM recent_questions WHERE ClosedDate IS NOT NULL)
+ORDER BY MetaScore DESC NULLS LAST, source, tag, QuestionId
+LIMIT 200;

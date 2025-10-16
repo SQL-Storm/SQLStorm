@@ -1,0 +1,214 @@
+-- {"query": "221.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 5365} 
+WITH
+max_date AS (
+  SELECT COALESCE(MAX(CreationDate), CURRENT_TIMESTAMP) AS maxd FROM Posts
+),
+user_posts AS (
+  SELECT
+    p.OwnerUserId AS UserId,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS questions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS answers,
+    COUNT(*) AS total_posts,
+    AVG(COALESCE(p.Score,0)) AS avg_post_score,
+    MAX(p.CreationDate) AS last_post_date
+  FROM Posts p
+  WHERE p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId
+),
+votes_by_owner AS (
+  SELECT
+    p.OwnerUserId AS UserId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS votes_received,
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS upvote_count,
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS downvote_count
+  FROM Votes v
+  JOIN Posts p ON p.Id = v.PostId
+  WHERE p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId
+),
+comments_by_owner AS (
+  SELECT
+    c.UserId,
+    COUNT(*) AS comments_count,
+    MAX(c.CreationDate) AS last_comment_date
+  FROM Comments c
+  WHERE c.UserId IS NOT NULL
+  GROUP BY c.UserId
+),
+posts_30_day_counts AS (
+  SELECT
+    p.OwnerUserId AS UserId,
+    SUM(CASE WHEN p.CreationDate >= (SELECT maxd - INTERVAL '29 day' FROM max_date) THEN 1 ELSE 0 END) AS last_30,
+    SUM(CASE WHEN p.CreationDate >= (SELECT maxd - INTERVAL '59 day' FROM max_date) AND p.CreationDate < (SELECT maxd - INTERVAL '29 day' FROM max_date) THEN 1 ELSE 0 END) AS prev_30
+  FROM Posts p
+  WHERE p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId
+),
+tags_per_post AS (
+  SELECT p.Id AS PostId, trim(t) AS tag
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT regexp_split_to_table(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><') AS t
+  ) s
+  WHERE p.Tags IS NOT NULL AND p.Tags <> ''
+),
+user_tag_counts AS (
+  SELECT up.OwnerUserId AS UserId, tp.tag, COUNT(*) AS cnt
+  FROM Posts up
+  JOIN tags_per_post tp ON tp.PostId = up.Id
+  WHERE up.OwnerUserId IS NOT NULL
+  GROUP BY up.OwnerUserId, tp.tag
+),
+user_top_tag AS (
+  SELECT utc.UserId,
+         (SELECT utc2.tag FROM user_tag_counts utc2 WHERE utc2.UserId = utc.UserId ORDER BY utc2.cnt DESC, utc2.tag LIMIT 1) AS top_tag,
+         (SELECT utc3.cnt FROM user_tag_counts utc3 WHERE utc3.UserId = utc.UserId ORDER BY utc3.cnt DESC, utc3.tag LIMIT 1) AS top_tag_count
+  FROM (SELECT DISTINCT UserId FROM user_tag_counts) utc
+),
+badges_summary AS (
+  SELECT b.UserId,
+         SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold,
+         SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver,
+         SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze,
+         COUNT(*) AS total_badges,
+         BOOL_OR(b.TagBased) AS has_tag_based_badge
+  FROM Badges b
+  GROUP BY b.UserId
+),
+user_influence AS (
+  SELECT
+    u.Id AS user_id,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(up.questions,0)      AS questions,
+    COALESCE(up.answers,0)        AS answers,
+    COALESCE(up.total_posts,0)    AS total_posts,
+    COALESCE(up.avg_post_score,0) AS avg_score,
+    COALESCE(vb.votes_received,0) AS votes_received,
+    COALESCE(vb.upvote_count,0)   AS upvote_count,
+    COALESCE(vb.downvote_count,0) AS downvote_count,
+    COALESCE(cb.comments_count,0) AS comments,
+    COALESCE(cb.last_comment_date, u.LastAccessDate) AS last_comment_date,
+    COALESCE(bs.gold,0)           AS gold,
+    COALESCE(bs.silver,0)         AS silver,
+    COALESCE(bs.bronze,0)         AS bronze,
+    COALESCE(bs.total_badges,0)   AS total_badges,
+    COALESCE(tt.top_tag, '')      AS top_tag,
+    COALESCE(tt.top_tag_count,0)  AS top_tag_count,
+    COALESCE(p30.last_30,0)       AS last_30,
+    COALESCE(p30.prev_30,0)       AS prev_30,
+    GREATEST(0, EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - u.CreationDate))/86400) AS days_on_site,
+    -- composite influence score (arbitrary weights)
+    (u.Reputation * 0.002
+     + COALESCE(up.total_posts,0) * 1.5
+     + COALESCE(vb.votes_received,0) * 2.0
+     + COALESCE(bs.gold,0) * 8.0
+     + COALESCE(up.avg_post_score,0) * 3.0
+     + LEAST(100, COALESCE(tt.top_tag_count,0)) * 0.5
+    ) AS influence
+  FROM Users u
+  LEFT JOIN user_posts up ON up.UserId = u.Id
+  LEFT JOIN votes_by_owner vb ON vb.UserId = u.Id
+  LEFT JOIN comments_by_owner cb ON cb.UserId = u.Id
+  LEFT JOIN badges_summary bs ON bs.UserId = u.Id
+  LEFT JOIN user_top_tag tt ON tt.UserId = u.Id
+  LEFT JOIN posts_30_day_counts p30 ON p30.UserId = u.Id
+),
+top_users AS (
+  SELECT user_id FROM user_influence ORDER BY influence DESC NULLS LAST LIMIT 100
+),
+benchmark_users AS (
+  -- union of top influencers + random sample of others (set operator + exclusion)
+  (SELECT user_id FROM top_users)
+  UNION
+  (SELECT ui.user_id FROM user_influence ui
+   WHERE ui.user_id NOT IN (SELECT user_id FROM top_users)
+   ORDER BY random() LIMIT 100)
+),
+detailed_benchmark AS (
+  SELECT ui.*,
+         RANK()    OVER (ORDER BY ui.influence DESC)    AS rank_by_influence,
+         PERCENT_RANK() OVER (ORDER BY ui.influence DESC) AS pct_rank_influence,
+         NTILE(10) OVER (ORDER BY ui.influence DESC)     AS decile_influence,
+         CASE
+           WHEN ui.prev_30 IS NULL OR ui.prev_30 = 0 THEN NULL
+           ELSE ROUND(ui.last_30::numeric / NULLIF(ui.prev_30,0)::numeric, 3)
+         END AS recent_growth_ratio,
+         CASE
+           WHEN ui.total_posts = 0 THEN 0
+           ELSE ROUND((ui.answers::numeric - ui.questions::numeric) / ui.total_posts::numeric, 3)
+         END AS answer_question_balance
+  FROM user_influence ui
+  WHERE ui.user_id IN (SELECT user_id FROM benchmark_users)
+),
+-- correlated-subquery example to fetch earliest and latest post titles and a synthetic snippet (string expressions & null logic)
+user_first_last_snippets AS (
+  SELECT
+    d.user_id,
+    (SELECT p.Title FROM Posts p WHERE p.OwnerUserId = d.user_id AND p.Title IS NOT NULL ORDER BY p.CreationDate ASC LIMIT 1) AS first_title,
+    (SELECT p.Title FROM Posts p WHERE p.OwnerUserId = d.user_id AND p.Title IS NOT NULL ORDER BY p.CreationDate DESC LIMIT 1) AS last_title,
+    (SELECT substring(coalesce(p.Body, '') FROM 1 FOR 200) FROM Posts p WHERE p.OwnerUserId = d.user_id AND p.Body IS NOT NULL ORDER BY p.CreationDate DESC LIMIT 1) AS last_body_snippet,
+    (SELECT COUNT(*) FROM PostLinks pl JOIN Posts p2 ON p2.Id = pl.PostId WHERE p2.OwnerUserId = d.user_id) AS links_from_their_posts
+  FROM detailed_benchmark d
+)
+SELECT
+  d.user_id,
+  d.DisplayName,
+  d.Reputation,
+  d.questions,
+  d.answers,
+  d.total_posts,
+  COALESCE(ROUND(d.avg_score::numeric,3),0) AS avg_post_score,
+  d.votes_received,
+  d.upvote_count,
+  d.downvote_count,
+  d.comments,
+  d.gold, d.silver, d.bronze, d.total_badges,
+  NULLIF(d.top_tag, '') AS top_tag,
+  d.top_tag_count,
+  d.days_on_site::int AS days_on_site,
+  d.last_30, d.prev_30,
+  d.recent_growth_ratio,
+  d.answer_question_balance,
+  d.influence,
+  d.rank_by_influence,
+  d.pct_rank_influence,
+  d.decile_influence,
+  -- infer "health" string using complicated predicates and null logic
+  CASE
+    WHEN d.total_posts = 0 THEN 'dormant'
+    WHEN d.influence IS NULL THEN 'unknown'
+    WHEN d.influence >= (SELECT MAX(influence) FROM user_influence) * 0.75 THEN 'elite'
+    WHEN d.recent_growth_ratio IS NOT NULL AND d.recent_growth_ratio > 1.5 THEN 'rising'
+    WHEN d.recent_growth_ratio IS NOT NULL AND d.recent_growth_ratio < 0.5 THEN 'declining'
+    WHEN d.gold >= 1 THEN 'established'
+    ELSE 'steady'
+  END AS health_status,
+  -- join correlated snippets
+  s.first_title,
+  s.last_title,
+  COALESCE(s.last_body_snippet, '') AS last_body_snippet,
+  COALESCE(s.links_from_their_posts,0) AS links_from_their_posts,
+  -- a synthetic fingerprint combining strings and null-safe operations
+  md5(
+    COALESCE(d.DisplayName,'<anon>') || '|' ||
+    COALESCE(NULLIF(d.top_tag,''),'<no-tag>') || '|' ||
+    COALESCE(d.Reputation::text,'0') || '|' ||
+    COALESCE(d.influence::text,'0')
+  ) AS user_fingerprint,
+  -- correlated subquery showing earliest active PostHistory type for that user's posts (correlated + JSON/null logic)
+  (SELECT ph.PostHistoryTypeId
+   FROM PostHistory ph
+   JOIN Posts p ON p.Id = ph.PostId
+   WHERE p.OwnerUserId = d.user_id AND ph.PostHistoryTypeId IS NOT NULL
+   ORDER BY ph.CreationDate ASC LIMIT 1) AS earliest_posthistory_type,
+  -- example using set operator inside scalar subquery (INTERSECT)
+  (SELECT COUNT(*) FROM (
+     (SELECT p2.Id FROM Posts p2 WHERE p2.OwnerUserId = d.user_id AND p2.Score > 0 LIMIT 100)
+     INTERSECT
+     (SELECT v.PostId FROM Votes v WHERE v.VoteTypeId = 2 LIMIT 100)
+  ) t) AS intersect_positive_posts_count
+FROM detailed_benchmark d
+LEFT JOIN user_first_last_snippets s ON s.user_id = d.user_id
+ORDER BY d.rank_by_influence
+;

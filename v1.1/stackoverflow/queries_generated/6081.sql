@@ -1,0 +1,132 @@
+-- {"query": "6081.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 887} 
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Body,
+    p.ParentId,
+    p.AcceptedAnswerId
+  FROM Posts p
+  WHERE p.CreationDate >= NOW() - INTERVAL '30 days'
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS TagPostCount,
+    AVG(p.Score) AS AvgPostScore,
+    MAX(p.ViewCount) AS MaxViews
+  FROM Tags t
+  JOIN Posts p ON p.Id = t.ExcerptPostId OR p.Id = t.WikiPostId
+  GROUP BY t.TagName
+  ORDER BY TagPostCount DESC
+  LIMIT 50
+),
+RecentVotes AS (
+  SELECT
+    v.PostId,
+    v.VoteTypeId,
+    v.UserId,
+    v.CreationDate,
+    v.BountyAmount,
+    u.DisplayName AS VoterName,
+    u.Reputation AS VoterRep
+  FROM Votes v
+  LEFT JOIN Users u ON v.UserId = u.Id
+  WHERE v.CreationDate >= NOW() - INTERVAL '7 days'
+),
+HistoricalActivity AS (
+  SELECT
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate,
+    ph.UserId,
+    ph.UserDisplayName,
+    ph.Comment,
+    ph.Text
+  FROM PostHistory ph
+  WHERE ph.CreationDate >= NOW() - INTERVAL '14 days'
+),
+CorrelatedStats AS (
+  SELECT
+    rp.PostId,
+    rp.PostTypeId,
+    rp.OwnerUserId,
+    rp.Score,
+    rp.ViewCount,
+    COALESCE(cc.CommentCount, 0) AS CommentCount,
+    COALESCE(va.UpVotes, 0) AS UpVotes,
+    COALESCE(va.DownVotes, 0) AS DownVotes
+  FROM RecentActivePosts rp
+  LEFT JOIN (
+    SELECT
+      PostId,
+      COUNT(*) FILTER (WHERE VoteTypeId = 2) AS UpVotes,
+      COUNT(*) FILTER (WHERE VoteTypeId = 3) AS DownVotes
+    FROM Votes
+    GROUP BY PostId
+  ) va ON va.PostId = rp.Id
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS CommentCount
+    FROM Comments
+    GROUP BY PostId
+  ) cc ON cc.PostId = rp.Id
+),
+ComplexComputed AS (
+  SELECT
+    cs.PostId,
+    cs.PostTypeId,
+    cs.OwnerUserId,
+    cs.Score,
+    cs.ViewCount,
+    cs.CommentCount,
+    cs.UpVotes,
+    cs.DownVotes,
+    (cs.Score * 1.0 / NULLIF(cs.ViewCount,0)) AS ScorePerView,
+    (cs.UpVotes - cs.DownVotes) AS NetVotes,
+    CASE
+      WHEN cs.OwnerUserId IS NULL THEN 'Unknown'
+      WHEN u.Location IS NULL THEN 'NoLocation'
+      ELSE u.Location
+    END AS OwnerLocation
+  FROM CorrelatedStats cs
+  LEFT JOIN Users u ON cs.OwnerUserId = u.Id
+),
+Windowed AS (
+  SELECT
+    pc.*,
+    ROW_NUMBER() OVER (
+      PARTITION BY pc.PostTypeId
+      ORDER BY pc.Score DESC, pc.ViewCount DESC, pc.CreationDate DESC
+    ) AS rn
+  FROM ComplexComputed pc
+)
+SELECT
+  w.PostId,
+  w.PostTypeId,
+  w.OwnerUserId,
+  w.Score,
+  w.ViewCount,
+  w.CommentCount,
+  w.UpVotes,
+  w.DownVotes,
+  w.ScorePerView,
+  w.NetVotes,
+  w.OwnerLocation,
+  rt.TagName
+FROM Windowed w
+LEFT JOIN TopTags rt ON POSITION(rt.TagName IN w.Tags) > 0
+WHERE w.rn <= 5
+  OR rt.TagPostCount IS NOT NULL
+ORDER BY w.PostTypeId, w.Score DESC, w.ViewCount DESC
+LIMIT 100;

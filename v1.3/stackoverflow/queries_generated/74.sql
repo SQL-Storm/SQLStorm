@@ -1,0 +1,154 @@
+-- {"query": "74.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1821} 
+with
+-- recent active questions with tag normalization
+QuestionBase as (
+  select p.id,
+         p.title,
+         p.owneruserid,
+         p.creationdate,
+         p.lastactivitydate,
+         p.score,
+         coalesce(p.viewcount,0) as viewcount,
+         p.tags,
+         -- split tags like '<sql><performance>' into rows simulated via string ops
+         regexp_split_to_table(substring(coalesce(p.tags,''),2,length(coalesce(p.tags,''))-2), '><') as tag
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate > now() - interval '3 years'
+),
+-- aggregate user metrics including badge counts and recency
+UserAgg as (
+  select u.id as userid,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.lastaccessdate,
+         count(b.id) filter (where b.class = 1) as gold_badges,
+         count(b.id) filter (where b.class = 2) as silver_badges,
+         count(b.id) filter (where b.class = 3) as bronze_badges,
+         sum(coalesce(b.tagbased::int,0)) as tag_based_badges,
+         greatest(date_part('day', now()-u.lastaccessdate),0) as days_since_last_access
+  from users u
+  left join badges b on b.userid = u.id
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.lastaccessdate
+),
+-- compute per-question answer and vote summaries using correlated subqueries and set ops
+PostStats as (
+  select q.id as questionid,
+         q.title,
+         q.owneruserid,
+         q.creationdate,
+         q.lastactivitydate,
+         q.score,
+         q.viewcount,
+         q.tag,
+         -- answers count and accepted answer flag via correlated subqueries
+         (select count(*) from posts a where a.parentid = q.id and a.posttypeid = 2) as answer_count,
+         (select a.id from posts a where a.parentid = q.id and a.id = q.acceptedanswerid) is not null as has_accepted,
+         -- votes breakdown via conditional aggregation
+         sum(case when v.votetypeid = 2 then 1 else 0 end) over (partition by q.id) as upvotes_window,
+         -- use set operator to detect if question is linked as duplicate
+         exists (select 1 from postlinks pl where pl.postid = q.id and pl.linktypeid = 3) as is_duplicate,
+         -- latest comment snippet
+         (select c.text from comments c where c.postid = q.id order by c.creationdate desc limit 1) as latest_comment,
+         -- average score of answers
+         (select avg(coalesce(a.score,0)) from posts a where a.parentid = q.id and a.posttypeid = 2) as avg_answer_score
+  from QuestionBase q
+),
+-- heavy windowed rank across tags and time buckets
+TagRank as (
+  select ps.*,
+         row_number() over (partition by ps.tag order by ps.score desc, ps.viewcount desc, ps.answer_count desc) as tag_rank,
+         rank() over (partition by ps.tag order by ps.lastactivitydate desc) as recent_rank,
+         ntile(4) over (partition by ps.tag order by ps.creationdate) as creation_quartile
+  from PostStats ps
+),
+-- compute user-question join with existence of recent edits and history patterns
+QUser as (
+  select tr.*,
+         ua.displayname,
+         ua.reputation,
+         ua.gold_badges,
+         ua.silver_badges,
+         ua.bronze_badges,
+         -- has recent editor other than owner?
+         exists (
+           select 1 from posthistory ph
+           where ph.postid = tr.questionid
+             and ph.creationdate > tr.lastactivitydate - interval '30 days'
+             and ph.userid is not null
+             and ph.userid <> tr.owneruserid
+         ) as recently_edited_by_other,
+         -- count of distinct editors
+         (select count(distinct ph.userid) from posthistory ph where ph.postid = tr.questionid and ph.userid is not null) as distinct_editors
+  from TagRank tr
+  left join UserAgg ua on ua.userid = tr.owneruserid
+),
+-- windowed moving averages and synthetic scoring with complicated expressions and null logic
+ScoreCalc as (
+  select qu.*,
+         -- penalize stale, duplicates, low engagement; boost high-rep owners and many badges
+         (coalesce(qu.score,0) * 1.2
+          + log(GREATEST(coalesce(qu.viewcount,0),1)) * 2.5
+          + coalesce(qu.avg_answer_score,0) * 3.0
+          - (case when qu.is_duplicate then 50 else 0 end)
+          - (coalesce(qu.days_since_last_access,0) * 0.1)
+          + (coalesce(qu.gold_badges,0) * 10)
+          + (coalesce(qu.silver_badges,0) * 3)
+          + (coalesce(qu.bronze_badges,0) * 1)
+         ) as raw_score,
+         -- normalized score per tag using window max/min with null-safe math
+         ( (coalesce(qu.score,0) - min(coalesce(qu.score,0)) over (partition by qu.tag))
+           / nullif((max(coalesce(qu.score,0)) over (partition by qu.tag) - min(coalesce(qu.score,0)) over (partition by qu.tag)),0)
+         ) as normalized_score_by_tag,
+         -- string-based fingerprint for grouping: first 3 words of title + tag
+         (regexp_replace(lower(substring(coalesce(qu.title,''), 1, 200)), '\s+', ' ', 'g')) as clean_title,
+         split_part(regexp_replace(lower(substring(coalesce(qu.title,''), 1, 200)), '\s+', ' ', 'g'), ' ', 1) ||
+           '|' || split_part(regexp_replace(lower(substring(coalesce(qu.title,''), 1, 200)), '\s+', ' ', 'g'), ' ', 2) ||
+           '|' || split_part(regexp_replace(lower(substring(coalesce(qu.title,''), 1, 200)), '\s+', ' ', 'g'), ' ', 3)
+           || '::' || coalesce(qu.tag,'') as title_fingerprint
+  from QUser qu
+  left join (
+    select id, greatest(date_part('day', now()-lastaccessdate),0) as days_since_last_access
+    from users
+  ) u2 on u2.id = qu.owneruserid
+),
+-- final selection with correlated subquery (top related questions per fingerprint) and set operator combining tag-level deduplication
+TopCandidates as (
+  select sc.*,
+         -- top 3 similar title_fingerprint questions (excluding self) ordered by raw_score
+         (select string_agg(cast(t.id as varchar), ',' order by t.raw_score desc)
+          from ScoreCalc t
+          where t.title_fingerprint = sc.title_fingerprint
+            and t.questionid <> sc.questionid
+          limit 3) as similar_ids,
+         -- compute a composite rank combining multiple window measures
+         (row_number() over (partition by sc.tag order by sc.raw_score desc, coalesce(sc.normalized_score_by_tag,0) desc)) as composite_rank
+  from ScoreCalc sc
+)
+select distinct on (tc.tag, tc.composite_rank)
+       tc.questionid,
+       tc.title,
+       tc.owneruserid,
+       coalesce(tc.displayname,'[unknown]') as owner_name,
+       tc.tag,
+       tc.score,
+       tc.viewcount,
+       tc.answer_count,
+       tc.has_accepted,
+       tc.is_duplicate,
+       tc.recently_edited_by_other,
+       tc.distinct_editors,
+       round(tc.raw_score::numeric,2) as raw_score,
+       round(coalesce(tc.normalized_score_by_tag,0)::numeric,3) as normalized_score_by_tag,
+       tc.title_fingerprint,
+       tc.similar_ids,
+       tc.composite_rank,
+       tc.tag_rank,
+       tc.recent_rank,
+       tc.creation_quartile
+from TopCandidates tc
+where tc.composite_rank <= 50
+  and (coalesce(tc.viewcount,0) > 10 or coalesce(tc.answer_count,0) > 0)
+  and (tc.recent_rank <= 200 or tc.raw_score > 100)
+order by tc.tag, tc.composite_rank, tc.raw_score desc, tc.questionid;

@@ -1,0 +1,121 @@
+-- {"query": "27100.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2337, "output_tokens": 1245} 
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.LastAccessDate,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(COUNT(p.Id), 0) AS TotalPosts,
+        COALESCE(SUM(c.Score), 0) AS TotalCommentScore,
+        COALESCE(COUNT(c.Id), 0) AS TotalComments,
+        COALESCE(SUM(v.VoteTypeId = 2), 0) AS TotalUpVotesReceived,
+        COALESCE(SUM(v.VoteTypeId = 3), 0) AS TotalDownVotesReceived
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    GROUP BY
+        u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes, u.LastAccessDate
+),
+
+PostActivity AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.LastEditorUserId,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        COALESCE(SUM(v.VoteTypeId = 2), 0) AS TotalUpVotes,
+        COALESCE(SUM(v.VoteTypeId = 3), 0) AS TotalDownVotes,
+        COALESCE(SUM(v.VoteTypeId = 8), 0) AS TotalBounties,
+        COALESCE(SUM(v.BountyAmount), 0) AS TotalBountyAmount,
+        COALESCE( syndrome().array_to_string(array_agg(DISTINCT t.TagName ORDER BY t.TagName), ', '), '') AS AllTags
+    FROM
+        Posts p
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN
+        Tags t ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    GROUP BY
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId, p.LastEditorUserId, p.LastEditDate, p.LastActivityDate, p.Title, p.Tags, p.AnswerCount, p.CommentCount
+),
+
+ActiveUsers AS (
+    SELECT
+        ua.UserId,
+        ua.Reputation,
+        ua.DisplayName,
+        ua.Views,
+        ua.UpVotes,
+        ua.DownVotes,
+        ua.LastAccessDate,
+        ua.TotalPostScore,
+        ua.TotalPosts,
+        ua.TotalCommentScore,
+        ua.TotalComments,
+        ua.TotalUpVotesReceived,
+        ua.TotalDownVotesReceived,
+        ROW_NUMBER() OVER (ORDER BY ua.Reputation DESC, ua.TotalPostScore DESC) AS Rank
+    FROM
+        UserActivity ua
+    WHERE
+        ua.LastAccessDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+)
+
+SELECT
+  au.UserId,
+  au.DisplayName,
+  au.Reputation,
+  au.Views,
+  au.UpVotes,
+  au.DownVotes,
+  au.TotalPostScore,
+  au.TotalPosts,
+  au.TotalCommentScore,
+  au.TotalComments,
+  au.TotalUpVotesReceived,
+  au.TotalDownVotesReceived,
+  au.Rank,
+  pa.PostId,
+  pa.PostTypeId,
+  pa.CreationDate,
+  pa.Score,
+  pa.ViewCount,
+  pa.LastEditorUserId,
+  pa.LastEditDate,
+  pa.LastActivityDate,
+  pa.Title,
+  pa.Tags,
+  pa.AnswerCount,
+  pa.CommentCount,
+  pa.TotalUpVotes,
+  pa.TotalDownVotes,
+  pa.TotalBounties,
+  pa.TotalBountyAmount,
+  pa.AllTags
+FROM
+  ActiveUsers au
+LEFT JOIN
+  PostActivity pa ON au.UserId = pa.OwnerUserId
+WHERE
+  au.Rank <= 100 AND
+  (pa.TotalUpVotes >= 5 OR pa.TotalBounties > 0) AND
+  pa.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+ORDER BY
+  au.Reputation DESC, pa.Score DESC;

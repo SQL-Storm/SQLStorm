@@ -1,0 +1,7 @@
+SELECT
+    TopContributors,
+    NULL AS TagName,
+    NULL AS TagAvgScore,
+    UserId
+FROM combined
+WHERE UserId IS NOT NULL;

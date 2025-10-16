@@ -1,0 +1,111 @@
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, 'Unknown') AS UserLocation,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    WHERE u.Reputation > 1000
+      AND (u.Location LIKE '%USA%' OR u.Location IS NULL)
+),
+UserBadges AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        STRING_AGG(b.Name, ', ') AS BadgeNames
+    FROM Badges b
+    WHERE b.TagBased = TRUE
+    GROUP BY b.UserId
+    HAVING COUNT(*) > 5
+),
+PostStats AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS TotalQuestionViews
+    FROM Posts p
+    WHERE p.CreationDate > DATE '2020-01-01'
+    GROUP BY p.OwnerUserId
+),
+ComplexSubquery AS (
+    SELECT 
+        au.UserId,
+        (SELECT COUNT(v.Id) 
+         FROM Votes v 
+         INNER JOIN Posts pp ON v.PostId = pp.Id 
+         WHERE pp.OwnerUserId = au.UserId 
+           AND v.VoteTypeId IN (2, 3) 
+           AND v.CreationDate > au.LastPostDate - INTERVAL '1 YEAR') AS RecentVotes
+    FROM ActiveUsers au
+    INNER JOIN PostStats ps ON au.UserId = ps.UserId
+),
+TaggedPosts AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        COUNT(*) AS TaggedPostCount
+    FROM Posts p
+    WHERE p.Tags LIKE '%<sql>%'
+      AND EXISTS (
+        SELECT 1 
+        FROM Tags t 
+        WHERE t.TagName = substring(
+            substring(p.Tags, 2, length(p.Tags)-2),
+            1,
+            strpos(substring(p.Tags, 2, length(p.Tags)-2), '><')-1
+        )
+      )
+    GROUP BY p.OwnerUserId
+)
+SELECT 
+    au.UserId,
+    au.DisplayName,
+    au.Reputation,
+    au.UserLocation,
+    au.RepRank,
+    COALESCE(ub.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ub.BadgeNames, 'No Badges') AS BadgeNames,
+    ps.TotalPosts,
+    ps.AvgScore,
+    ps.LastPostDate,
+    ps.TotalQuestionViews,
+    cs.RecentVotes,
+    tp.TaggedPostCount,
+    CASE 
+        WHEN ps.AvgScore > 10 THEN 'High Performer'
+        WHEN ps.AvgScore BETWEEN 5 AND 10 THEN 'Medium Performer'
+        ELSE 'Low Performer'
+    END AS PerformanceCategory,
+    ROW_NUMBER() OVER (PARTITION BY au.UserLocation ORDER BY ps.TotalQuestionViews DESC) AS LocationRank
+FROM ActiveUsers au
+LEFT JOIN UserBadges ub ON au.UserId = ub.UserId
+INNER JOIN PostStats ps ON au.UserId = ps.UserId
+LEFT JOIN ComplexSubquery cs ON au.UserId = cs.UserId
+FULL OUTER JOIN TaggedPosts tp ON au.UserId = tp.UserId
+WHERE au.RepRank <= 100
+
+UNION ALL
+
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(u.Location, 'Unknown') AS UserLocation,
+    NULL::integer AS RepRank,
+    0 AS GoldBadges,
+    'Inactive' AS BadgeNames,
+    0 AS TotalPosts,
+    0.0 AS AvgScore,
+    NULL::timestamp AS LastPostDate,
+    0 AS TotalQuestionViews,
+    0 AS RecentVotes,
+    0 AS TaggedPostCount,
+    'Inactive' AS PerformanceCategory,
+    NULL::integer AS LocationRank
+FROM Users u
+WHERE u.Reputation < 100
+  AND NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+ORDER BY Reputation DESC
+LIMIT 1000;

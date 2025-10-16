@@ -1,0 +1,139 @@
+-- {"query": "16089.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 210150, "output_tokens": 195162} 
+
+WITH UserEngagementMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS NetVotes,
+        EXTRACT(YEAR FROM AGE(u.LastAccessDate, u.CreationDate)) * 12 + 
+            EXTRACT(MONTH FROM AGE(u.LastAccessDate, u.CreationDate)) AS TenureMonths,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        PERCENT_RANK() OVER (ORDER BY COALESCE(u.Views, 0)) AS ViewPercentile
+    FROM Users u
+    WHERE u.Reputation > 1000 
+        AND u.LastAccessDate >= CURRENT_DATE - INTERVAL '2 years'
+),
+PostActivityCTE AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        COALESCE(p.CommentCount, 0) AS CommentCount,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 1
+            ELSE 0
+        END AS HasAcceptedAnswer,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM PostHistory ph 
+             WHERE ph.PostId = p.Id 
+                 AND ph.PostHistoryTypeId IN (4, 5, 6)
+                 AND ph.CreationDate > p.CreationDate + INTERVAL '7 days'),
+            0
+        ) AS LateEditsCount,
+        STRING_AGG(DISTINCT SUBSTRING(t.TagName, 1, 20), ', ' ORDER BY t.TagName) 
+            FILTER (WHERE t.TagName IS NOT NULL) AS TopTags
+    FROM Posts p
+    LEFT JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tag_name
+    ) pt ON p.PostTypeId = 1
+    LEFT JOIN Tags t ON t.TagName = pt.tag_name AND t.Count > 100
+    WHERE p.PostTypeId IN (1, 2)
+        AND p.CreationDate >= CURRENT_DATE - INTERVAL '5 years'
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.Score, p.ViewCount, 
+             p.AnswerCount, p.CommentCount, p.AcceptedAnswerId
+),
+BadgeAggregation AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(*) FILTER (WHERE b.TagBased = 1) AS TagBasedBadges,
+        ARRAY_AGG(DISTINCT b.Name ORDER BY b.Name) 
+            FILTER (WHERE b.Class = 1) AS GoldBadgeNames
+    FROM Badges b
+    WHERE b.Date >= CURRENT_DATE - INTERVAL '3 years'
+    GROUP BY b.UserId
+),
+VotePatterns AS (
+    SELECT 
+        v.PostId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpvoteCount,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownvoteCount,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 5) AS FavoriteCount,
+        AVG(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE NULL END) AS AvgBountyAmount,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2, 3, 5, 8)
+    GROUP BY v.PostId
+)
+SELECT 
+    uem.DisplayName,
+    COALESCE(uem.Reputation, 0) AS UserReputation,
+    uem.TenureMonths,
+    ROUND(uem.ViewPercentile::numeric, 4) AS ViewPercentile,
+    COUNT(DISTINCT pac.PostId) AS TotalPosts,
+    SUM(CASE WHEN pac.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+    SUM(CASE WHEN pac.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+    ROUND(AVG(COALESCE(pac.Score, 0))::numeric, 2) AS AvgPostScore,
+    ROUND(AVG(NULLIF(pac.ViewCount, 0))::numeric, 2) AS AvgViewCount,
+    SUM(pac.HasAcceptedAnswer) AS AcceptedAnswersCount,
+    ROUND(
+        SUM(pac.HasAcceptedAnswer)::numeric / 
+        NULLIF(SUM(CASE WHEN pac.PostTypeId = 1 THEN 1 ELSE 0 END), 0), 
+        3
+    ) AS AcceptanceRate,
+    COALESCE(ba.GoldBadges, 0) + COALESCE(ba.SilverBadges, 0) + COALESCE(ba.BronzeBadges, 0) AS TotalBadges,
+    ARRAY_TO_STRING(ba.GoldBadgeNames, ' | ') AS GoldBadgeList,
+    ROUND(
+        (COALESCE(SUM(vp.UpvoteCount), 0)::numeric / 
+         NULLIF(COALESCE(SUM(vp.UpvoteCount), 0) + COALESCE(SUM(vp.DownvoteCount), 0), 0)) * 100,
+        2
+    ) AS UpvotePercentage,
+    SUM(pac.LateEditsCount) AS TotalLateEdits,
+    MAX(pac.TopTags) AS SampleTags,
+    CASE 
+        WHEN uem.ReputationRank <= 100 THEN 'Elite'
+        WHEN uem.ReputationRank <= 1000 THEN 'High'
+        WHEN uem.ReputationRank <= 10000 THEN 'Medium'
+        ELSE 'Regular'
+    END AS UserTier,
+    COALESCE(
+        (SELECT COUNT(DISTINCT c.Id)
+         FROM Comments c
+         INNER JOIN Posts p2 ON c.PostId = p2.Id
+         WHERE c.UserId = uem.Id
+             AND p2.OwnerUserId != uem.Id
+             AND c.Score >= 1),
+        0
+    ) AS HighQualityCommentsOnOthersPosts
+FROM UserEngagementMetrics uem
+LEFT JOIN PostActivityCTE pac ON pac.OwnerUserId = uem.Id
+LEFT JOIN BadgeAggregation ba ON ba.UserId = uem.Id
+LEFT JOIN VotePatterns vp ON vp.PostId = pac.PostId
+WHERE uem.TenureMonths > 6
+    AND (pac.PostId IS NOT NULL OR ba.UserId IS NOT NULL)
+GROUP BY 
+    uem.Id,
+    uem.DisplayName,
+    uem.Reputation,
+    uem.TenureMonths,
+    uem.ViewPercentile,
+    uem.ReputationRank,
+    ba.GoldBadges,
+    ba.SilverBadges,
+    ba.BronzeBadges,
+    ba.GoldBadgeNames
+HAVING COUNT(DISTINCT pac.PostId) >= 5
+    OR COALESCE(ba.GoldBadges, 0) >= 1
+ORDER BY 
+    UserReputation DESC,
+    TotalPosts DESC,
+    AvgPostScore DESC
+LIMIT 500;

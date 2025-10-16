@@ -1,0 +1,126 @@
+WITH recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90' DAY
+),
+recent_activity AS (
+  SELECT
+    rq.PostId,
+    rq.Title,
+    rq.Tags,
+    rq.CreationDate,
+    rq.Score,
+    rq.ViewCount,
+    rq.OwnerUserId,
+    rq.LastActivityDate,
+    rq.CommentCount,
+    rq.AnswerCount,
+    rq.FavoriteCount,
+    u.Reputation,
+    u.DisplayName,
+    u.Location,
+    COUNT(CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpVotesPlaced,
+    COUNT(CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownVotesPlaced,
+    MAX(CASE WHEN v.VoteTypeId = 2 THEN v.CreationDate END) AS LastUpvoteDate,
+    MAX(CASE WHEN v.VoteTypeId = 3 THEN v.CreationDate END) AS LastDownvoteDate
+  FROM recent_questions rq
+  LEFT JOIN Users u ON rq.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON rq.PostId = v.PostId
+  GROUP BY
+    rq.PostId, rq.Title, rq.Tags, rq.CreationDate, rq.Score, rq.ViewCount,
+    rq.OwnerUserId, rq.LastActivityDate, rq.CommentCount, rq.AnswerCount,
+    rq.FavoriteCount, u.Reputation, u.DisplayName, u.Location
+),
+comments_cte AS (
+  SELECT
+    ra.PostId,
+    COUNT(c.Id) AS CommentCountAll,
+    STRING_AGG(CONCAT(c.UserDisplayName, ':', c.Text), ' | ' ORDER BY c.CreationDate) AS AllComments
+  FROM recent_activity ra
+  LEFT JOIN Comments c ON ra.PostId = c.PostId
+  GROUP BY ra.PostId
+),
+tags_expansion AS (
+  SELECT
+    ra.PostId,
+    ra.Title,
+    ra.Tags,
+    ra.CreationDate,
+    ra.Score,
+    ra.ViewCount,
+    ra.OwnerUserId,
+    ra.LastActivityDate,
+    ra.CommentCount,
+    ra.AnswerCount,
+    ra.FavoriteCount,
+    ra.Reputation,
+    ra.DisplayName,
+    ra.Location,
+    ra.UpVotesPlaced,
+    ra.DownVotesPlaced,
+    ra.LastUpvoteDate,
+    ra.LastDownvoteDate,
+    c.CommentCountAll,
+    c.AllComments,
+    CASE WHEN EXISTS (
+        SELECT 1
+        FROM (
+          SELECT TRIM(value) AS tag
+          FROM (
+            -- split tags string into rows in a dialect-agnostic way using a recursive CTE
+            SELECT ra.Tags AS tags_str, 1 AS start_pos
+            UNION ALL
+            SELECT
+              ra.Tags,
+              -- next start position: position after next delimiter
+              CASE
+                WHEN POSITION('<>' IN SUBSTRING(ra.Tags FROM start_pos)) = 0 THEN NULL
+                ELSE start_pos + POSITION('<>' IN SUBSTRING(ra.Tags FROM start_pos)) + 1
+              END
+            FROM (
+              SELECT ra.Tags, 1 AS start_pos
+            ) init
+            WHERE FALSE
+          ) dummy
+        ) split
+        WHERE split.tag <> ''
+      ) THEN TRUE ELSE FALSE END AS HasTagExpansion
+  FROM recent_activity ra
+  LEFT JOIN comments_cte c ON ra.PostId = c.PostId
+)
+SELECT
+  te.PostId,
+  te.Title,
+  te.Tags,
+  te.CreationDate,
+  te.Score,
+  te.ViewCount,
+  te.OwnerUserId,
+  te.LastActivityDate,
+  te.CommentCount,
+  te.AnswerCount,
+  te.FavoriteCount,
+  te.Reputation,
+  te.DisplayName,
+  te.Location,
+  te.UpVotesPlaced,
+  te.DownVotesPlaced,
+  te.LastUpvoteDate,
+  te.LastDownvoteDate,
+  te.CommentCountAll,
+  te.AllComments
+FROM tags_expansion te
+ORDER BY te.LastActivityDate DESC, te.Score DESC
+LIMIT 200;

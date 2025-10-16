@@ -1,0 +1,63 @@
+-- {"query": "2037.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4o", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 543} 
+WITH RecentHighRepUsers AS (
+    SELECT 
+        Id AS UserId, 
+        DisplayName, 
+        Reputation
+    FROM 
+        Users
+    WHERE 
+        Reputation >= 5000
+    ORDER BY 
+        Reputation DESC
+    LIMIT 100
+),
+UserPostDetails AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(p.ViewCount) AS TotalViews
+    FROM 
+        Posts p
+    GROUP BY 
+        p.OwnerUserId
+),
+UserBadgeCount AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM 
+        Badges b
+    GROUP BY 
+        b.UserId
+)
+SELECT 
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(upd.QuestionCount, 0) AS QuestionsPosted,
+    COALESCE(upd.AnswerCount, 0) AS AnswersPosted,
+    COALESCE(upd.TotalPosts, 0) AS TotalPostsContributed,
+    COALESCE(upd.TotalViews, 0) AS TotalPostViews,
+    COALESCE(ubc.BadgeCount, 0) AS TotalBadges,
+    COALESCE(ubc.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ubc.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ubc.BronzeBadges, 0) AS BronzeBadges,
+    CASE 
+        WHEN upd.TotalPosts > 0 THEN ROUND((upd.QuestionCount::decimal / upd.TotalPosts) * 100, 2)
+        ELSE 0
+    END AS QuestionPercentage,
+    RANK() OVER (ORDER BY u.Reputation DESC) AS UserReputationRank
+FROM 
+    RecentHighRepUsers u
+LEFT JOIN 
+    UserPostDetails upd ON u.UserId = upd.OwnerUserId
+LEFT JOIN 
+    UserBadgeCount ubc ON u.UserId = ubc.UserId
+ORDER BY 
+    u.Reputation DESC;

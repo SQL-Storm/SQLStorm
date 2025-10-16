@@ -1,0 +1,151 @@
+-- {"query": "566.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1406} 
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        coalesce(u.Location, 'Unknown') as Location,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersGiven,
+        count(distinct b.Id) as BadgesCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesReceived,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotesReceived
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location
+
+    union all
+
+    select
+        r.UserId,
+        r.DisplayName,
+        r.Reputation + 10,
+        r.CreationDate,
+        r.LastAccessDate,
+        r.Location,
+        r.QuestionsAsked,
+        r.AnswersGiven,
+        r.BadgesCount,
+        r.UpVotesReceived,
+        r.DownVotesReceived
+    from RecursiveUserActivity r
+    where r.Reputation < 10000
+    limit 1
+),
+RankedPosts as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as RankByUser,
+        dense_rank() over (partition by p.PostTypeId order by p.Score desc) as DenseRankByType,
+        lag(p.Score) over (partition by p.PostTypeId order by p.Score desc) as PrevScore,
+        lead(p.Score) over (partition by p.PostTypeId order by p.Score desc) as NextScore
+    from Posts p
+    where p.PostTypeId in (1,2)
+),
+FilteredPosts as (
+    select
+        rp.*,
+        case
+            when rp.Tags is not null then array_to_string(string_to_array(substring(rp.Tags from 2 for char_length(rp.Tags) - 2), '><'), ', ')
+            else 'No Tags'
+        end as TagList
+    from RankedPosts rp
+    where rp.RankByUser <= 5
+),
+PostCommentsCount as (
+    select
+        c.PostId,
+        count(*) as CommentCount,
+        sum(case when c.UserId is null then 1 else 0 end) as AnonymousComments,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    group by c.PostId
+),
+PostCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    inner join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10
+),
+UserBadgeSummary as (
+    select
+        b.UserId,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        bool_or(b.TagBased) as HasTagBasedBadge
+    from Badges b
+    group by b.UserId
+),
+UserPostVotes as (
+    select
+        p.OwnerUserId as UserId,
+        count(v.Id) filter (where v.VoteTypeId = 2) as UpVotesOnPosts,
+        count(v.Id) filter (where v.VoteTypeId = 3) as DownVotesOnPosts,
+        count(v.Id) filter (where v.VoteTypeId = 5) as FavoritesOnPosts
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    group by p.OwnerUserId
+)
+select
+    fua.UserId,
+    fua.DisplayName,
+    fua.Reputation,
+    fua.Location,
+    fua.QuestionsAsked,
+    fua.AnswersGiven,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.HasTagBasedBadge,
+    upv.UpVotesOnPosts,
+    upv.DownVotesOnPosts,
+    upv.FavoritesOnPosts,
+    fp.PostId,
+    fp.PostTypeId,
+    fp.Score,
+    fp.ViewCount,
+    fp.CreationDate as PostCreationDate,
+    fp.Title,
+    fp.TagList,
+    pcc.CommentCount,
+    pcc.AnonymousComments,
+    pcc.LastCommentDate,
+    pcr.CloseReasonName,
+    pcr.CloseDate,
+    case
+        when fp.PrevScore is null then fp.Score
+        else (fp.Score + coalesce(fp.PrevScore, 0)) / 2.0
+    end as AvgWithPrevScore,
+    case
+        when fp.NextScore is null then fp.Score
+        else (fp.Score + coalesce(fp.NextScore, 0)) / 2.0
+    end as AvgWithNextScore,
+    (fua.Reputation::float / nullif(fua.AnswersGiven + 1,0)) as ReputationPerAnswer,
+    (fua.Reputation::float / nullif(fua.QuestionsAsked + 1,0)) as ReputationPerQuestion,
+    (select count(*) from PostLinks pl where pl.PostId = fp.PostId and pl.LinkTypeId = 3) as DuplicateCount,
+    (select count(*) from PostLinks pl where pl.RelatedPostId = fp.PostId and pl.LinkTypeId = 1) as LinkedFromCount
+from RecursiveUserActivity fua
+left join UserBadgeSummary ub on ub.UserId = fua.UserId
+left join UserPostVotes upv on upv.UserId = fua.UserId
+left join FilteredPosts fp on fp.OwnerUserId = fua.UserId
+left join PostCommentsCount pcc on pcc.PostId = fp.PostId
+left join PostCloseReasons pcr on pcr.PostId = fp.PostId
+where fua.Reputation > 5000
+order by fua.Reputation desc, fp.Score desc
+limit 100;

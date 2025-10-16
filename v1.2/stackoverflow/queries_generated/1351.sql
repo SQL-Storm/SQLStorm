@@ -1,0 +1,163 @@
+-- {"query": "1351.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1560} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT t.Id, t.TagName, t.Count, t.IsModeratorOnly, t.IsRequired, 1 AS Level
+    FROM Tags t
+    WHERE t.Count > 1000
+  UNION ALL
+    SELECT t2.Id, t2.TagName, t2.Count, t2.IsModeratorOnly, t2.IsRequired, rh.Level + 1
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy rh ON position(t2.TagName in rh.TagName) > 0 -- poemic association example, slow but complex
+    WHERE rh.Level < 3
+),
+UsersBadgeRanked AS (
+    SELECT 
+      b.UserId,
+      b.Name,
+      b.Class,
+      ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Class, b.Date DESC) AS Rank
+    FROM Badges b
+    WHERE b.Date BETWEEN '2018-01-01' AND CURRENT_TIMESTAMP
+),
+PostsWithAnswerStats AS (
+    SELECT
+      p.Id,
+      p.PostTypeId,
+      p.Title,
+      p.ViewCount,
+      p.Score,
+      p.CreationDate,
+      p.OwnerUserId,
+      p.Tags,
+      a.AnswerCount,
+      a.AvgAnswerScore,
+      a.MaxAnswerView,
+      a.TopAnswerUserRep,
+      ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY a.AnswerScore DESC NULLS LAST) AS RN
+    FROM Posts p
+    LEFT JOIN (
+      SELECT
+        q.ParentId,
+        COUNT(a.Id) AS AnswerCount,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.ViewCount) AS MaxAnswerView,
+        MAX(u.Reputation) AS TopAnswerUserRep,
+        a.Score AS AnswerScore,
+        a.Id
+      FROM Posts a
+      INNER JOIN Posts q ON a.ParentId = q.Id AND q.PostTypeId = 1
+      LEFT JOIN Users u ON a.OwnerUserId = u.Id
+      WHERE a.PostTypeId = 2
+      GROUP BY q.ParentId, a.Score, a.Id
+    ) a ON p.Id = a.ParentId
+    WHERE p.PostTypeId = 1
+),
+CloseReasonsNamed AS (
+    SELECT 
+      ph.PostId,
+      crt.Name AS CloseReasonName,
+      ph.CreationDate
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON CAST(ph.Comment AS int) = crt.Id AND ph.PostHistoryTypeId = 10
+),
+UserEngagement AS (
+    SELECT 
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT p.Id) AS PostsCreated,
+      COUNT(DISTINCT c.Id) AS CommentsMade,
+      SUM(vt.Name = 'UpMod') AS TotalUpVotes,
+      SUM(vt.Name = 'DownMod') AS TotalDownVotes,
+      COUNT(DISTINCT DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+      COUNT(DISTINCT b.Id) OVER () AS TotalBadges
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(DISTINCT p.Id) > 100  -- only active users
+),
+TopUserAnsweredQuestions AS (
+    SELECT distinct 
+        uw.Title, 
+        u.DisplayName AS TopAnswerer,
+        p.Score AS QuestionScore,
+        p.CreationDate AS QuestionCreated,
+        a.CreationDate AS AnswerCreated,
+        EXTRACT(day FROM a.CreationDate - p.CreationDate) AS DaysToAnswer,
+        u.Reputation
+    FROM Posts p
+    JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    JOIN Users u ON a.OwnerUserId = u.Id
+    JOIN Posts uw ON p.Id = uw.Id AND uw.PostTypeId = 1
+    WHERE p.Score > 10 AND a.Score >= (
+        SELECT MAX(a2.Score) FROM Posts a2 WHERE a2.ParentId = p.Id AND a2.PostTypeId = 2
+    )
+    ORDER BY p.CreationDate DESC
+    LIMIT 50
+)
+SELECT 
+  p.Id AS QuestionId,
+  p.Title,
+  UPPER(SUBSTRING(p.Title, 1, 5)) || '...' AS TitlePreview,
+  p.ViewCount,
+  p.Score AS QuestionScore,
+  COALESCE(p.AnswerCount, 0) AS AnswerCount,
+  COALESCE(p.AvgAnswerScore, 0)::numeric(10,2) AS AverageAnswerScore,
+  COALESCE(p.MaxAnswerView, 0) AS MaxAnswerViewCount,
+  TO_CHAR(p.CreationDate, 'YYYY-MM-DD') AS QuestionCreatedDate,
+  COALESCE(u.DisplayName, 'anonymous') AS OwnerName,
+  ub.Name AS HighestRankedBadge,
+  CASE 
+    WHEN cr.CloseReasonName IS NOT NULL THEN cr.CloseReasonName 
+    ELSE 'Open'
+  END AS CurrentCloseStatus,
+  ue.PostsCreated AS UserPostsCreated,
+  ue.CommentsMade AS UserCommentsMade,
+  ROUND(CASE WHEN ue.PostsCreated > 0 THEN CAST(ue.TotalUpVotes AS numeric)/ue.PostsCreated ELSE 0 END, 2) AS UpVotesPerPost,
+  ROUND(CASE WHEN ue.PostsCreated > 0 THEN CAST(ue.TotalDownVotes AS numeric)/ue.PostsCreated ELSE 0 END, 2) AS DownVotesPerPost,
+  sum(case when p.Tags like ('%<python>%') then 1 else 0 end) OVER () as PythonTaggedPostsCount,
+  CASE 
+    WHEN POSITION('sql' IN LOWER(p.Tags)) > 0 THEN 'Contains SQL Tag'
+    ELSE 'No SQL Tag'
+  END AS SQLTagPresence
+FROM PostsWithAnswerStats p
+LEFT JOIN Users u ON u.Id = p.OwnerUserId
+LEFT JOIN UsersBadgeRanked ub ON ub.UserId = p.OwnerUserId AND ub.Rank = 1
+LEFT JOIN CloseReasonsNamed cr ON cr.PostId = p.Id AND cr.CreationDate = (
+    SELECT MAX(ph2.CreationDate)
+    FROM PostHistory ph2
+    WHERE ph2.PostId = p.Id AND ph2.PostHistoryTypeId = 10
+) 
+LEFT JOIN UserEngagement ue ON ue.UserId = p.OwnerUserId
+WHERE p.ViewCount > 5000
+ORDER BY p.Score DESC, p.ViewCount DESC
+LIMIT 100
+UNION
+SELECT 
+  tpq.Id AS QuestionId,
+  tpq.Title,
+  NULL,
+  0,
+  0,
+  0,
+  0,
+  '1999-01-01',
+  'System',
+  NULL,
+  'Open',
+  0,
+  0,
+  0,
+  0,
+  'No SQL Tag'
+FROM (
+    SELECT Id, Title FROM Posts WHERE PostTypeId = 1 AND Title NOT LIKE '%benchmark%'
+) tpq
+WHERE NOT EXISTS (
+    SELECT 1 FROM Posts p WHERE p.Title = tpq.Title AND p.ViewCount > 5000
+)
+ORDER BY 1
+LIMIT 10;

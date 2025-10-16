@@ -1,0 +1,128 @@
+-- {"query": "23046.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "grok-4", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2685, "output_tokens": 1373} 
+
+WITH UserBadgeStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY COUNT(b.Id) DESC) AS BadgeRank
+    FROM Users u
+    LEFT OUTER JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.Reputation, u.CreationDate
+),
+QuestionStats AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.Tags,
+        string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><') AS TagArray,
+        COALESCE(p.ClosedDate, '9999-12-31'::timestamp) AS EffectiveClosedDate,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 0) AS PositiveComments
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND (p.AnswerCount > 0 OR p.Score > 10)
+      AND p.Title LIKE '%SQL%' || '%'
+),
+TopQuestionsPerUser AS (
+    SELECT 
+        qs.OwnerUserId,
+        COUNT(qs.QuestionId) AS QuestionCount,
+        SUM(qs.Score) AS TotalQuestionScore,
+        AVG(qs.ViewCount) AS AvgViewCount,
+        MAX(qs.FavoriteCount) AS MaxFavorites,
+        STRING_AGG(qs.Tags, '; ') AS AllTags,
+        RANK() OVER (PARTITION BY qs.OwnerUserId ORDER BY SUM(qs.Score) DESC) AS UserQuestionRank
+    FROM QuestionStats qs
+    GROUP BY qs.OwnerUserId
+),
+VoteAnalysis AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    GROUP BY v.PostId
+    HAVING SUM(CASE WHEN v.VoteTypeId IN (2,3) THEN 1 ELSE 0 END) > 5
+)
+SELECT 
+    ubs.UserId,
+    ubs.Reputation,
+    ubs.TotalBadges,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.BadgeRank,
+    tq.QuestionCount,
+    tq.TotalQuestionScore,
+    tq.AvgViewCount,
+    tq.MaxFavorites,
+    tq.AllTags,
+    (SELECT COUNT(ph.Id) FROM PostHistory ph WHERE ph.PostId IN (SELECT p.Id FROM Posts p WHERE p.OwnerUserId = ubs.UserId) AND ph.PostHistoryTypeId IN (4,5,6) AND ph.CreationDate > ubs.UserCreationDate + INTERVAL '1 year') AS EditsAfterFirstYear,
+    COALESCE(va.Upvotes, 0) - COALESCE(va.Downvotes, 0) AS NetVotesOnTopPost,
+    CASE 
+        WHEN tq.QuestionCount > 10 AND ubs.Reputation / EXTRACT(DAY FROM NOW() - ubs.UserCreationDate) > 1.5 
+        THEN 'High Performer' 
+        ELSE 'Standard' 
+    END AS PerformanceCategory,
+    ARRAY_LENGTH((SELECT TagArray FROM QuestionStats qs WHERE qs.OwnerUserId = ubs.UserId LIMIT 1), 1) AS SampleTagCount
+FROM UserBadgeStats ubs
+LEFT OUTER JOIN TopQuestionsPerUser tq ON ubs.UserId = tq.OwnerUserId AND tq.UserQuestionRank = 1
+LEFT OUTER JOIN (
+    SELECT p.OwnerUserId, va.Upvotes, va.Downvotes
+    FROM Posts p
+    INNER JOIN VoteAnalysis va ON p.Id = va.PostId
+    WHERE p.PostTypeId = 1
+) va ON ubs.UserId = va.OwnerUserId
+WHERE ubs.BadgeRank <= 100
+  AND EXISTS (SELECT 1 FROM Tags t WHERE t.Count > 1000 AND POSITION(t.TagName IN tq.AllTags) > 0)
+UNION
+SELECT 
+    NULL AS UserId,
+    AVG(Reputation) AS Reputation,
+    AVG(TotalBadges) AS TotalBadges,
+    AVG(GoldBadges) AS GoldBadges,
+    AVG(SilverBadges) AS SilverBadges,
+    AVG(BronzeBadges) AS BronzeBadges,
+    NULL AS BadgeRank,
+    AVG(QuestionCount) AS QuestionCount,
+    AVG(TotalQuestionScore) AS TotalQuestionScore,
+    AVG(AvgViewCount) AS AvgViewCount,
+    AVG(MaxFavorites) AS MaxFavorites,
+    NULL AS AllTags,
+    NULL AS EditsAfterFirstYear,
+    AVG(NetVotesOnTopPost) AS NetVotesOnTopPost,
+    NULL AS PerformanceCategory,
+    NULL AS SampleTagCount
+FROM (
+    SELECT 
+        ubs.UserId,
+        ubs.Reputation,
+        ubs.TotalBadges,
+        ubs.GoldBadges,
+        ubs.SilverBadges,
+        ubs.BronzeBadges,
+        tq.QuestionCount,
+        tq.TotalQuestionScore,
+        tq.AvgViewCount,
+        tq.MaxFavorites,
+        COALESCE(va.Upvotes, 0) - COALESCE(va.Downvotes, 0) AS NetVotesOnTopPost
+    FROM UserBadgeStats ubs
+    LEFT OUTER JOIN TopQuestionsPerUser tq ON ubs.UserId = tq.OwnerUserId AND tq.UserQuestionRank = 1
+    LEFT OUTER JOIN (
+        SELECT p.OwnerUserId, va.Upvotes, va.Downvotes
+        FROM Posts p
+        INNER JOIN VoteAnalysis va ON p.Id = va.PostId
+        WHERE p.PostTypeId = 1
+    ) va ON ubs.UserId = va.OwnerUserId
+    WHERE ubs.BadgeRank <= 100
+) AS Summary
+ORDER BY Reputation DESC NULLS LAST;

@@ -1,0 +1,151 @@
+with RecursiveTagCounts as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        t.Count,
+        p.Id as PostId,
+        p.Score,
+        u.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY t.Id ORDER BY p.Score DESC, p.CreationDate DESC) as PostRank
+    from Tags t
+    left join Posts p on p.Tags like '%' || '<' || t.TagName || '>' || '%' and p.PostTypeId = 1
+    left join Users u on p.OwnerUserId = u.Id
+),
+TopQuestionAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerOwnerUserId,
+        u.DisplayName as AnswerOwnerName,
+        a.CreationDate as AnswerCreationDate,
+        row_number() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on a.OwnerUserId = u.Id
+    where q.PostTypeId = 1
+),
+BadgeSummary as (
+    select
+        UserId,
+        sum(case when Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(*) as TotalBadges
+    from Badges
+    group by UserId
+),
+UserReputationStats as (
+    select
+        Id,
+        DisplayName,
+        Reputation,
+        Coalesce(Location, 'Unknown') as UserLocation,
+        case
+            when Reputation >= 100000 then 'Legendary'
+            when Reputation >= 10000 then 'Expert'
+            when Reputation >= 1000 then 'Intermediate'
+            else 'Beginner'
+        end as ReputationLevel,
+        row_number() over (order by Reputation desc) as ReputationRank
+    from Users
+),
+DuplicateLinks as (
+    select distinct
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle,
+        l.Name as LinkTypeName
+    from PostLinks pl
+    inner join Posts p1 on pl.PostId = p1.Id
+    inner join Posts p2 on pl.RelatedPostId = p2.Id
+    inner join LinkTypes l on pl.LinkTypeId = l.Id
+    where pl.LinkTypeId = 3
+)
+select
+    rt.TagName,
+    rt.PostRank,
+    rt.PostId,
+    rt.Score as PostScore,
+    rt.Reputation as OwnerReputation,
+    u.DisplayName as OwnerName,
+    tq.Title as TopQuestionTitle,
+    tqa.AnswerId,
+    tqa.AnswerScore,
+    tqa.AnswerOwnerName,
+    tqa.AnswerCreationDate,
+    bs.GoldBadges,
+    bs.SilverBadges,
+    bs.BronzeBadges,
+    ur.UserLocation,
+    ur.ReputationLevel,
+    dl.PostTitle as DuplicatePostTitle,
+    dl.RelatedPostTitle as DuplicateRelatedTitle,
+    dl.LinkTypeName as DuplicateLinkType,
+    COALESCE(u.DisplayName, 'Anonymous')
+      || ' [' || COALESCE(ur.ReputationLevel, '') || '] - '
+      || CASE WHEN COALESCE(bs.TotalBadges,0) > 0 THEN '🏅 ' || CAST(bs.TotalBadges AS varchar) || ' badges' ELSE 'No badges' END
+      || ' | Answer top score: '
+      || COALESCE(CAST(tqa.AnswerScore AS varchar), 'N/A')
+      || ' | Tag usage count: '
+      || CAST(rt.Count AS varchar)
+    as SummaryDescription,
+    (select c.Text from Comments c where c.PostId = rt.PostId order by c.CreationDate desc fetch first 1 row only) as LatestComment,
+    (select min(ph.CreationDate)
+     from PostHistory ph
+     where ph.PostId = rt.PostId and ph.PostHistoryTypeId in (10,11)
+    ) as CloseOrReopenDate,
+    coalesce(
+        (select count(*) from Votes v where v.PostId = rt.PostId and v.VoteTypeId = 2),
+        0
+    ) as UpVotesCount,
+    coalesce(
+        (select count(*) from Votes v where v.PostId = rt.PostId and v.VoteTypeId = 3),
+        0
+    ) as DownVotesCount
+from RecursiveTagCounts rt
+inner join Users u on u.Id = (
+    select p.OwnerUserId from Posts p where p.Id = rt.PostId fetch first 1 row only
+)
+left join TopQuestionAnswers tqa on tqa.QuestionId = rt.PostId and tqa.AnswerRank = 1
+left join Posts tq on tq.Id = rt.PostId
+left join BadgeSummary bs on bs.UserId = u.Id
+left join UserReputationStats ur on ur.Id = u.Id
+left join DuplicateLinks dl on dl.PostId = rt.PostId
+where rt.PostRank <= 3
+  and rt.Count > 100
+  and (tqa.AnswerScore is null or tqa.AnswerScore > 5)
+
+union
+
+select
+    TagName,
+    0 as PostRank,
+    null::bigint as PostId,
+    null::int as PostScore,
+    null::int as OwnerReputation,
+    null::text as OwnerName,
+    null::text as TopQuestionTitle,
+    null::bigint as AnswerId,
+    null::int as AnswerScore,
+    null::text as AnswerOwnerName,
+    null::timestamp as AnswerCreationDate,
+    null::int as GoldBadges,
+    null::int as SilverBadges,
+    null::int as BronzeBadges,
+    'Global' as UserLocation,
+    null::text as ReputationLevel,
+    null::text as DuplicatePostTitle,
+    null::text as DuplicateRelatedTitle,
+    null::text as DuplicateLinkType,
+    'Global stats for tag ' || TagName || ': ' || CAST(Count AS varchar) as SummaryDescription,
+    null::text as LatestComment,
+    null::timestamp as CloseOrReopenDate,
+    null::int as UpVotesCount,
+    null::int as DownVotesCount
+from Tags
+where Count > 1000
+order by TagName, PostRank
+limit 100;

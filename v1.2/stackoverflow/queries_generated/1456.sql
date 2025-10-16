@@ -1,0 +1,197 @@
+-- {"query": "1456.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1893} 
+
+with Recursive_Users_Activeness as (
+  select 
+    u.Id,
+    u.DisplayName,
+    u.CreationDate,
+    u.LastAccessDate,
+    extract(epoch from (u.LastAccessDate - u.CreationDate))/86400.0 as ActiveDays,
+    u.Reputation,
+    u.UpVotes,
+    u.DownVotes,
+    coalesce(badges.GoldCount,0) as GoldBadges,
+    coalesce(badges.SilverCount,0) as SilverBadges,
+    coalesce(badges.BronzeCount,0) as BronzeBadges
+  from Users u
+  left join (
+    select
+      UserId,
+      sum(case when Class=1 then 1 else 0 end) as GoldCount,
+      sum(case when Class=2 then 1 else 0 end) as SilverCount,
+      sum(case when Class=3 then 1 else 0 end) as BronzeCount
+    from Badges
+    group by UserId
+  ) badges on badges.UserId = u.Id
+), Q_Filtered_Questions as (
+  select 
+    p.Id,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    coalesce(p.FavoriteCount,0) as FavoriteCount,
+    round(age(now(), p.CreationDate)) as Age,
+    p.Tags,
+    left(p.Title,65) as TitleSnippet
+  from Posts p
+  where p.PostTypeId = 1	-- questions only
+    and p.AnswerCount >= 2
+    and p.Score > 0
+    and p.Title is not null
+), CTE_Answers as (
+  select p.Id, p.ParentId, p.OwnerUserId, p.Score, p.CreationDate,
+         p.Body, p.CommentCount
+    from Posts p
+    where p.PostTypeId = 2
+), Latest_voters as (
+	select
+		V.PostId,
+		array_agg(distinct u.Id order by V.CreationDate desc) as VoterIds
+	from Votes V
+	left join Users u on u.Id = V.UserId
+	where V.VoteTypeId in (2,3)	-- UpMod or DownMod
+	group by V.PostId
+), CTE_Predicate_Check as (
+  select 
+    p.Id,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    qs.TotalAnswers,
+    rx.Rank_Answers_By_Score,
+    max(CAST(jsonb_exists_any(to_jsonb(string_to_array(coalesce_tags,'')), array['java','python'])) as int) AS ContainsPopularTags
+  from Q_Filtered_Questions p
+  join lateral (
+    select count(*) as TotalAnswers 
+    from Posts pst 
+    where pst.ParentId = p.Id and pst.PostTypeId = 2
+  ) qs on true
+  left join lateral (
+    select row_number() over (order by Score desc) as Rank_Answers_By_Score
+    from Posts pst
+    where pst.ParentId = p.Id and pst.PostTypeId = 2 and pst.Score > 0
+  ) rx on true
+  cross join lateral (select coalesce(p.Tags,'') as coalesce_tags) tg
+  group by p.Id,p.OwnerUserId,p.Score,p.ViewCount,p.Tags,qs.TotalAnswers,rx.Rank_Answers_By_Score
+), Comments_Analyzed as (
+	select c.PostId, count(distinct c.UserId) as Commenters, sum(c.Score) as SumCommentScores,
+	loud.RequiredMentions
+	from Comments c
+	left join (
+		select PostId, bool_or(lower(Text) like '%help%' or lower(Text) like '%please%') as RequiredMentions
+		from Comments
+		group by PostId
+	) loud on loud.PostId = c.PostId
+	group by c.PostId, loud.RequiredMentions
+), Sorted_Posthistory as (
+  select ph.PostId, ph.UserId, ph.PostHistoryTypeId, ph.CreationDate,
+								   row_number() over(partition by ph.PostId order by ph.CreationDate desc) as RnLatest
+  from PostHistory ph
+  where ph.PostHistoryTypeId in (10, 11, 14)
+), Main_Report as (
+	select
+		q.Id as QuestionId,
+		q.TitleSnippet,
+		q.Tags as RawTags,
+		q.Score as QuestionScore,
+		q.ViewCount,
+		q.AnswerCount,
+		caq.GoldBadges,
+		caq.SilverBadges,
+		caq.BronzeBadges,
+		caq.Reputation,
+		(
+			select count(*) 
+			from Posts answ
+			where answ.PostTypeId=2 and answ.ParentId = q.Id and answ.Score >= (q.Score/2)
+		) as PopularAnswersHalfScored,
+		ccm.Commenters,
+		ccm.SumCommentScores,
+		case when ccm.RequiredMentions then 'RequestIncluded' else 'NoMention' end as CommentMentionsHelpOrPlease,
+		pht.StatusCloseHandling,
+		qi.AvgAnswerScore,
+		filterset.MaxAnswerScore,
+		filterset.MinAnswerScore,
+		filterset.AnswerCountInHo = any(array[1,2,3])*filterset.AnswerCount,
+        concat(coalesce_ws_all.top_alpha_assert,' | ',coalesce_ws_all.shuffle6) as Extra_Word_Manipulations
+	from Q_Filtered_Questions q
+	left join Recursive_Users_Activeness caq on caq.Id = q.OwnerUserId
+	left join Comments_Analyzed ccm on ccm.PostId = q.Id
+	left join (
+		select p.PostId,
+			case 
+				when """CloseLogs""".""FirstClose"" is not null then 'Closed' 
+				when """CloseLogs""".""FailureRepresentative"" is not null then 'ClosedFavor'
+			else 'Open' end as StatusCloseHandling
+		from (select PostId, min(case when PostHistoryTypeId = 10 then CreationDate end) as "FirstClose",
+		min(case when PostHistoryTypeId = 11 then CreationDate end) as "FailureRepresentative"
+		from PostHistory ph group by PostId) ClLogs 
+		join Posts p on p.Id = ClLogs.PostId -- why not a closer mapping?
+
+	) pht on pht.PostId = q.Id
+	cross join lateral (
+		select avg(score) as AvgAnswerScore,
+			max(score) as MaxScore,
+			min(score) as MinScore
+		from Posts ans
+		where ans.PostTypeId=2 and ans.ParentId = q.Id
+	) qi
+	cross join lateral (
+	  select 
+		max(answer.Score) as MaxAnswerScore,
+		min(answer.Score) as MinAnswerScore,
+		count(answer.Id) as AnswerCount,
+		sum(case when answer.Score > 0 then 1 else 0 end) as AnswerPositives,
+		sum(case when answer.Score <= 0 then 1 else 0 end) as AnswerNonPositives
+      from Posts answer
+      where answer.ParentId = q.Id and answer.PostTypeId = 2
+	) filterset
+	cross join lateral (
+	  select concat(
+		 substr(regexp_replace(q.TitleSnippet, '\W', '', 'gi'),1,10),
+		 '!!',
+		 string_agg(left(lower(w.Word),2), '-' ORDER BY w.Word),
+		 CASE WHEN q.Score > average_scores.avg_score THEN '_H' ELSE '_L' END ) as top_alpha_assert,
+			array_to_string(array(select substring(maybe_shuffle.text, 1, 1) 
+		  from (
+			select generate_series as pos, left(trim(regexp_split_to_table(q.Body,'\W+'))[generate_series],6) as text
+			    from generate_series(1, least(20,length(q.Body)/6))
+			  ) maybe_shuffle order by random() limit 6), '') as shuffle6
+	  from Posts q
+	  left join LATERAL unnest(string_to_array(lower(coalesce(q.Title,'')), ' ')) w(Word) on true
+	  cross join (select avg(score) as avg_score from Posts where PostTypeId= 1) average_scores
+	) coalesce_ws_all
+)
+select
+QuestionId,
+TitleSnippet,
+RawTags,
+QuestionScore,
+ViewCount,
+AnswerCount,
+Reputation,
+GoldBadges,
+SilverBadges,
+BronzeBadges,
+PopularAnswersHalfScored,
+Commenters,
+SumCommentScores,
+CommentMentionsHelpOrPlease,
+StatusCloseHandling,
+AvgAnswerScore,
+MaxAnswerScore,
+MinAnswerScore,
+AnswerCount,
+AnswerPositives,
+AnswerNonPositives,
+Extra_Word_Manipulations
+from Main_Report
+where Reputation > 1000 
+  and GoldBadges > 0 
+  and Commenters > 5 
+  and QuestionScore between 5 and 100
+order by PopularAnswersHalfScored desc, AvgAnswerScore desc, Commenters desc
+limit 100;

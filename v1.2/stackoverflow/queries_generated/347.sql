@@ -1,0 +1,153 @@
+-- {"query": "347.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1432} 
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        count(distinct b.Id) as BadgeCount,
+        row_number() over (order by u.Reputation desc, u.LastAccessDate desc) as UserRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+TopActiveUsers as (
+    select UserId, DisplayName, Reputation, QuestionCount, AnswerCount, CommentCount, BadgeCount, UserRank
+    from RecursiveUserActivity
+    where UserRank <= 100
+),
+PostStats as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        pt.Name as PostTypeName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        p.AcceptedAnswerId,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 2) as UpVotes,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 3) as DownVotes,
+        (select count(*) from Comments c where c.PostId = p.Id) as CommentCount,
+        case
+            when p.ClosedDate is not null then 'Closed'
+            when p.AcceptedAnswerId is not null then 'Answered'
+            else 'Open'
+        end as PostStatus,
+        substring(p.Tags from '<([^>]+)>') as FirstTag,
+        p.Tags
+    from Posts p
+    join PostTypes pt on pt.Id = p.PostTypeId
+    left join Users u on u.Id = p.OwnerUserId
+    where p.CreationDate > current_date - interval '1 year'
+),
+PostLinkDetails as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName,
+        p1.Score as PostScore,
+        p2.Score as RelatedPostScore
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where pl.CreationDate > current_date - interval '1 year'
+),
+UserBadgeRanks as (
+    select
+        b.UserId,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by b.UserId order by b.Date desc) as BadgeRank
+    from Badges b
+    where b.Date > current_date - interval '2 years'
+),
+UserTopBadges as (
+    select UserId, BadgeName, Class
+    from UserBadgeRanks
+    where BadgeRank <= 3
+),
+QuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.OwnerUserId,
+        q.CreationDate as QuestionDate,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerDate,
+        a.OwnerUserId as AnswerOwnerUserId,
+        a.Body,
+        row_number() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts q
+    join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    join PostTypes ptq on ptq.Id = q.PostTypeId and ptq.Name = 'Question'
+    where q.CreationDate > current_date - interval '1 year'
+),
+AnswerWithComments as (
+    select
+        a.QuestionId,
+        a.AnswerId,
+        a.AnswerScore,
+        a.AnswerDate,
+        a.AnswerOwnerUserId,
+        count(c.Id) as CommentCount,
+        string_agg(coalesce(c.Text, '') || ' (by ' || coalesce(c.UserDisplayName, 'anonymous') || ')', ' || ') as CommentsSummary
+    from QuestionsWithAnswers a
+    left join Comments c on c.PostId = a.AnswerId
+    group by a.QuestionId, a.AnswerId, a.AnswerScore, a.AnswerDate, a.AnswerOwnerUserId
+),
+FinalResult as (
+    select
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.QuestionCount,
+        u.AnswerCount,
+        u.CommentCount,
+        u.BadgeCount,
+        pt.PostId,
+        pt.PostTypeName,
+        pt.Score as PostScore,
+        pt.ViewCount,
+        pt.PostStatus,
+        pt.FirstTag,
+        coalesce(pl.LinkTypeName, 'NoLink') as LinkTypeName,
+        coalesce(pl.RelatedPostId, 0) as RelatedPostId,
+        coalesce(pl.RelatedPostScore, 0) as RelatedPostScore,
+        b.BadgeName,
+        b.Class as BadgeClass,
+        qwa.QuestionId,
+        qwa.Title as QuestionTitle,
+        qwa.QuestionScore,
+        qwa.ViewCount as QuestionViewCount,
+        qwa.AnswerId,
+        qwa.AnswerScore,
+        qwa.AnswerDate,
+        qwa.AnswerOwnerUserId,
+        awc.CommentCount as AnswerCommentCount,
+        awc.CommentsSummary,
+        row_number() over (partition by u.UserId order by pt.Score desc nulls last, pt.ViewCount desc nulls last) as UserPostRank
+    from TopActiveUsers u
+    left join PostStats pt on pt.OwnerUserId = u.UserId
+    left join PostLinkDetails pl on pl.PostId = pt.PostId
+    left join UserTopBadges b on b.UserId = u.UserId
+    left join QuestionsWithAnswers qwa on qwa.AnswerOwnerUserId = u.UserId
+    left join AnswerWithComments awc on awc.AnswerId = qwa.AnswerId
+)
+select *
+from FinalResult
+where UserPostRank <= 5
+  and (PostStatus = 'Open' or PostStatus = 'Answered')
+  and (BadgeClass is null or BadgeClass <= 2)
+order by Reputation desc, UserPostRank, PostScore desc, PostViewCount desc;

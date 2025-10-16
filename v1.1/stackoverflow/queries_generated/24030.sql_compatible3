@@ -1,0 +1,7 @@
+SELECT st.TotalPosts,
+       st.AvgScore,
+       st.*
+FROM "stats" AS st
+WHERE st.TotalPosts > 0
+GROUP BY st.TotalPosts, st.AvgScore, st.*
+ORDER BY st.AvgScore DESC NULLS LAST, st.TotalPosts DESC;

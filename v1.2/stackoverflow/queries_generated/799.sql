@@ -1,0 +1,212 @@
+-- {"query": "799.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1723} 
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate as PostCreationDate,
+        ph.CreationDate as LastEditDate,
+        ph.PostHistoryTypeId,
+        ph.Comment as CloseReasonId,
+        row_number() over (partition by u.Id order by p.CreationDate desc) as rn
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join PostHistory ph on ph.PostId = p.Id and ph.CreationDate = (
+        select max(ph2.CreationDate)
+        from PostHistory ph2
+        where ph2.PostId = p.Id
+    )
+    where u.Reputation > 1000
+),
+UserBadgeRanks as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+PostScores as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        count(distinct c.Id) as CommentCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        case
+            when p.Tags is null then '{}'
+            else string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><')
+        end as TagList
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    where p.PostTypeId in (1, 2)
+    group by p.Id, p.PostTypeId, p.OwnerUserId, p.Score, p.Tags
+),
+TagPopularity as (
+    select
+        unnest(TagList) as Tag,
+        avg(Score) as AvgScore,
+        count(*) as PostCount
+    from PostScores
+    group by unnest(TagList)
+    having count(*) > 10
+),
+-- Recursive CTE to get linked posts up to depth 3
+RecursivePostLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        1 as depth
+    from PostLinks pl
+    where pl.LinkTypeId = 1
+    union all
+    select
+        rpl.PostId,
+        pl.RelatedPostId,
+        rpl.depth + 1
+    from RecursivePostLinks rpl
+    join PostLinks pl on pl.PostId = rpl.RelatedPostId and pl.LinkTypeId = 1
+    where rpl.depth < 3
+),
+UserActivitySummary as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        count(distinct ua.PostId) as TotalPosts,
+        sum(case when ua.PostTypeId = 1 then 1 else 0 end) as Questions,
+        sum(case when ua.PostTypeId = 2 then 1 else 0 end) as Answers,
+        max(ua.PostCreationDate) as LastPostDate,
+        max(ua.LastEditDate) as LastEditDate,
+        count(distinct case when ua.PostHistoryTypeId = 10 then ua.PostId end) as ClosedPosts,
+        count(distinct case when ua.PostHistoryTypeId = 11 then ua.PostId end) as ReopenedPosts
+    from RecursiveUserActivity ua
+    group by ua.UserId, ua.DisplayName
+),
+UserBadgeSummary as (
+    select
+        ubr.UserId,
+        max(case when ubr.Class = 1 then ubr.BadgeCount else 0 end) as GoldBadges,
+        max(case when ubr.Class = 2 then ubr.BadgeCount else 0 end) as SilverBadges,
+        max(case when ubr.Class = 3 then ubr.BadgeCount else 0 end) as BronzeBadges
+    from UserBadgeRanks ubr
+    group by ubr.UserId
+),
+TopUsers as (
+    select
+        uas.UserId,
+        uas.DisplayName,
+        uas.TotalPosts,
+        uas.Questions,
+        uas.Answers,
+        ubs.GoldBadges,
+        ubs.SilverBadges,
+        ubs.BronzeBadges,
+        u.Reputation,
+        uas.LastPostDate,
+        uas.LastEditDate,
+        uas.ClosedPosts,
+        uas.ReopenedPosts
+    from UserActivitySummary uas
+    left join UserBadgeSummary ubs on ubs.UserId = uas.UserId
+    join Users u on u.Id = uas.UserId
+    where uas.TotalPosts > 10
+),
+RankedPosts as (
+    select
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as PostRank
+    from Posts p
+    where p.PostTypeId in (1, 2)
+),
+FilteredPosts as (
+    select
+        rp.*
+    from RankedPosts rp
+    where rp.PostRank <= 3
+),
+UserPostTags as (
+    select
+        fp.OwnerUserId as UserId,
+        unnest(
+            case
+                when fp.Tags is null then '{}'
+                else string_to_array(substring(fp.Tags from 2 for length(fp.Tags) - 2), '><')
+            end
+        ) as Tag
+    from Posts fp
+    where fp.PostTypeId = 1
+),
+UserTopTags as (
+    select
+        upt.UserId,
+        upt.Tag,
+        count(*) as TagCount,
+        rank() over (partition by upt.UserId order by count(*) desc) as TagRank
+    from UserPostTags upt
+    group by upt.UserId, upt.Tag
+),
+FinalUserTags as (
+    select
+        utt.UserId,
+        string_agg(utt.Tag, ', ') as TopTags
+    from UserTopTags utt
+    where utt.TagRank <= 3
+    group by utt.UserId
+)
+select
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.TotalPosts,
+    tu.Questions,
+    tu.Answers,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    tu.LastPostDate,
+    tu.LastEditDate,
+    tu.ClosedPosts,
+    tu.ReopenedPosts,
+    fut.TopTags,
+    tp.Tag as PopularTag,
+    tp.AvgScore as PopularTagAvgScore,
+    tp.PostCount as PopularTagPostCount,
+    coalesce(fp.Score, 0) as TopPostScore,
+    coalesce(fp.ViewCount, 0) as TopPostViewCount,
+    case
+        when fp.PostTypeId = 1 then 'Question'
+        when fp.PostTypeId = 2 then 'Answer'
+        else 'Other'
+    end as TopPostType,
+    fp.CreationDate as TopPostCreationDate,
+    plk.RelatedPostId as LinkedPostId,
+    plk.depth as LinkDepth,
+    case
+        when plk.RelatedPostId is null then 'No Link'
+        else 'Linked'
+    end as LinkStatus,
+    case
+        when tu.ClosedPosts > tu.ReopenedPosts then 'More Closed'
+        when tu.ClosedPosts < tu.ReopenedPosts then 'More Reopened'
+        else 'Balanced'
+    end as CloseReopenBalance
+from TopUsers tu
+left join FinalUserTags fut on fut.UserId = tu.UserId
+left join TagPopularity tp on tp.Tag = (select unnest(string_to_array(fut.TopTags, ', ')) limit 1)
+left join FilteredPosts fp on fp.OwnerUserId = tu.UserId
+left join RecursivePostLinks plk on plk.PostId = fp.Id
+where tu.GoldBadges > 0 or tu.SilverBadges > 2
+order by tu.Reputation desc, tu.TotalPosts desc, tp.PostCount desc
+limit 100;

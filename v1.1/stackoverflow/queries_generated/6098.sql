@@ -1,0 +1,132 @@
+-- {"query": "6098.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 932} 
+WITH prominent AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.Location,
+    u.AboutMe,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    u.AccountId,
+    b.Id AS BadgeId,
+    b.Name AS BadgeName,
+    b.Date AS BadgeDate,
+    b.Class,
+    b.TagBased
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+),
+recent_activity AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.Tags,
+    p.Body,
+    pc.CommentCount,
+    pc.LastCommentDate,
+    v.VoteCount,
+    v.BountyTotal
+  FROM Posts p
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS CommentCount, MAX(CreationDate) AS LastCommentDate
+    FROM Comments
+    GROUP BY PostId
+  ) pc ON pc.PostId = p.Id
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS VoteCount, SUM(BountyAmount) AS BountyTotal
+    FROM Votes
+    GROUP BY PostId
+  ) v ON v.PostId = p.Id
+  WHERE p.CreationDate > NOW() - INTERVAL '180 days'
+),
+linked AS (
+  SELECT
+    t.PostId,
+    t.RelatedPostId,
+    t.LinkTypeId,
+    lt.Name AS LinkTypeName
+  FROM PostLinks t
+  JOIN LinkTypes lt ON lt.Id = t.LinkTypeId
+  WHERE t.CreationDate > NOW() - INTERVAL '365 days'
+),
+hot_tags AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS HotScore
+  FROM Tags t
+  JOIN Posts p ON p.Id = t.WikiPostId OR p.Id = t.ExcerptPostId
+  WHERE p.LastActivityDate > NOW() - INTERVAL '14 days'
+  GROUP BY t.TagName
+  ORDER BY HotScore DESC
+  LIMIT 10
+),
+complex_calc AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    CASE
+      WHEN u.Reputation >= 2000 THEN 'org'
+      WHEN u.Reputation >= 1000 THEN 'mid'
+      ELSE 'new'
+    END AS Tier,
+    COALESCE(u.Views, 0) +
+      COALESCE(u.UpVotes, 0) * 2 -
+      COALESCE(u.DownVotes, 0) AS ActivityScore,
+    GREATEST(COALESCE(MAX(p.Score),0), 0) AS MaxPostScore
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+)
+SELECT
+  -- user and badge context
+  c.UserId,
+  c.DisplayName AS UserName,
+  c.Tier,
+  c.ActivityScore,
+  c.MaxPostScore,
+  b.BadgeId,
+  b.BadgeName,
+  b.Date AS BadgeDate,
+  b.Class AS BadgeClass,
+  b.TagBased AS IsTagBadge,
+  -- recent activity summary
+  ra.PostId,
+  ra.PostTypeId,
+  ra.Title,
+  ra.CreationDate AS PostCreated,
+  ra.LastActivityDate,
+  ra.Score AS PostScore,
+  ra.ViewCount,
+  ra.Tags,
+  ra.Body,
+  ra.CommentCount,
+  ra.LastCommentDate,
+  ra.VoteCount,
+  ra.BountyTotal,
+  -- relations
+  l.RelatedPostId,
+  l.LinkTypeName,
+  -- hot tags
+  ht.TagName AS HotTag,
+  ht.HotScore
+FROM complex_calc c
+LEFT JOIN prominent b ON b.UserId = c.UserId
+LEFT JOIN recent_activity ra ON ra.OwnerUserId = c.UserId
+LEFT JOIN linked l ON l.PostId = ra.PostId
+LEFT JOIN hot_tags ht ON ht.TagName = ANY(string_to_array(ra.Tags, ','))
+ORDER BY c.ActivityScore DESC NULLS LAST
+LIMIT 100;

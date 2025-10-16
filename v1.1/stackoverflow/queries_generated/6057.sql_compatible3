@@ -1,0 +1,254 @@
+WITH TopUsers AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.Location,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    u.AccountId,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.UpVotes DESC, u.LastAccessDate DESC) AS rn
+  FROM Users u
+),
+TagBadges AS (
+  SELECT
+    b.UserId,
+    b.Name AS BadgeName,
+    b.Date AS EarnedDate,
+    b.Class,
+    b.TagBased,
+    ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS rn
+  FROM Badges b
+  WHERE b.TagBased = 1
+),
+PostStats AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.CreationDate,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.AnswerCount,
+    p.LastActivityDate,
+    p.OwnerDisplayName,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.LastEditorUserId,
+    p.LastEditDate,
+    p.FavoriteCount,
+    p.ContentLicense,
+    COALESCE(p.CloseReason, NULL) AS CloseReasonGuess
+  FROM Posts p
+),
+RecentActivity AS (
+  SELECT
+    v.PostId,
+    v.VoteTypeId,
+    v.UserId AS VoterId,
+    v.CreationDate AS VoteDate,
+    vt.Name AS VoteTypeName,
+    v.BountyAmount
+  FROM Votes v
+  JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+),
+LinkedPosts AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    lt.Name AS LinkTypeName
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  WHERE lt.Id IN (1,3)
+),
+TagSearch AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.IsModeratorOnly,
+    t.IsRequired
+  FROM Tags t
+  WHERE t.TagName IS NOT NULL
+),
+AggStats AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS PostCount,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount
+  FROM Tags t
+  LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+  GROUP BY t.TagName
+),
+ComplexQuery AS (
+  SELECT
+    u.UserId,
+    u.DisplayName AS UserDisplayName,
+    p.PostId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.AnswerCount,
+    p.CreationDate AS PostCreationDate,
+    pa.EarnedDate AS BadgeEarnedDate,
+    rb.RelatedPostId,
+    lt.Name AS LinkTypeName,
+    vt.Name AS VoteTypeName,
+    ra.VoteDate AS VoteDate,
+    ra.VoteTypeId AS VoteTypeId,
+    ra.VoterId AS VoterId,
+    ra.BountyAmount AS BountyAmount,
+    ra.VoteTypeName AS RecentVoteTypeName,
+    ra.VoteDate AS RecentVoteDate,
+    ra.VoterId AS RecentVoterId,
+    ra.BountyAmount AS RecentBountyAmount,
+    ra.VoteTypeName AS LastVoteTypeName,
+    ra.VoteDate AS LastVoteDate,
+    ra.VoterId AS LastVoterId,
+    ra.BountyAmount AS LastBountyAmount,
+    ra.VoteTypeName AS VoteTypeNameFromRa,
+    ra.VoteDate AS LastPostVoteDate,
+    ra.VoterId AS LastPostVoterId,
+    ra.BountyAmount AS LastPostBountyAmount,
+    ra.VoteTypeName AS LastPostVoteTypeName,
+    ra.VoteDate AS LastPostVoteDate2,
+    ra.VoterId AS LastPostVoterId2,
+    ra.BountyAmount AS LastPostBountyAmount2,
+    ra.VoteTypeName AS LastPostVoteTypeName2,
+    ra.VoteDate AS LastPostVoteDate3,
+    ra.VoterId AS LastPostVoterId3,
+    ra.BountyAmount AS LastPostBountyAmount3,
+    ra.VoteTypeName AS LastPostVoteTypeName3,
+    ra.VoteDate AS LastPostVoteDate4,
+    ra.VoterId AS LastPostVoterId4,
+    ra.BountyAmount AS LastPostBountyAmount4,
+    ra.VoteTypeName AS LastPostVoteTypeName4,
+    ra.VoteDate AS VoteDateAlias,
+    ra.VoterId AS VoterIdAlias,
+    ra.BountyAmount AS BountyAmountAlias,
+    ra.VoteTypeName AS VoteTypeNameAlias,
+    ra.VoteDate AS VoteDateAlias2,
+    ra.VoterId AS VoterIdAlias2,
+    ra.BountyAmount AS BountyAmountAlias2,
+    ra.VoteTypeName AS VoteTypeNameAlias2,
+    ra.VoteDate AS VoteDateAlias3,
+    ra.VoterId AS VoterIdAlias3,
+    ra.BountyAmount AS BountyAmountAlias3,
+    ra.VoteTypeName AS VoteTypeNameAlias3,
+    ra.VoteDate AS VoteDateAlias4,
+    ra.VoterId AS VoterIdAlias4,
+    ra.BountyAmount AS BountyAmountAlias4,
+    ra.VoteTypeName AS VoteTypeNameAlias4,
+    ra.VoteDate AS VoteDateAlias5,
+    ra.VoterId AS VoterIdAlias5,
+    ra.BountyAmount AS BountyAmountAlias5,
+    ra.VoteTypeName AS VoteTypeNameAlias5,
+    ra.VoteDate AS VoteDateAlias6,
+    ra.VoterId AS VoterIdAlias6,
+    ra.BountyAmount AS BountyAmountAlias6,
+    ra.VoteTypeName AS VoteTypeNameAlias6,
+    ra.VoteDate AS LastPostScore,
+    CASE
+      WHEN p.OwnerUserId IS NULL THEN 'Anonymous'
+      ELSE p.OwnerDisplayName
+    END AS EffectiveDisplayName,
+    CASE
+      WHEN p.PostTypeId = 1 THEN 'Question'
+      WHEN p.PostTypeId = 2 THEN 'Answer'
+      ELSE 'Other'
+    END AS PostTypeLabel
+  FROM TopUsers u
+  LEFT JOIN PostStats p ON p.OwnerUserId = u.UserId
+  LEFT JOIN RecentActivity ra
+    ON ra.PostId = p.PostId
+  LEFT JOIN TagBadges pa ON pa.UserId = u.UserId AND pa.rn = 1
+  LEFT JOIN LinkedPosts rb ON rb.PostId = p.PostId
+  LEFT JOIN TagSearch ts ON ts.TagName = REPLACE(REPLACE(p.Tags, '<', ''), '>', '')
+  LEFT JOIN Tags t ON t.TagName LIKE '%' || REPLACE(REPLACE(p.Tags, '<', ''), '>', '') || '%'
+  LEFT JOIN Votes v ON v.PostId = p.PostId
+  LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  LEFT JOIN Posts pr ON pr.Id = p.ParentId
+  LEFT JOIN LinkTypes lt ON lt.Id = rb.RelatedPostId
+  WHERE
+    u.Reputation > 1000
+    AND p.Score > 0
+    AND p.ViewCount > 50
+    AND (p.PostTypeId = 1 OR p.PostTypeId = 2)
+    AND (
+      (p.Title IS NOT NULL AND (p.Title ~* 'benchmark|performance|stress'))
+      OR (p.Tags IS NOT NULL AND (p.Tags ~* 'benchmark|performance'))
+    )
+  GROUP BY
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.Location,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    u.AccountId,
+    p.PostId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.AnswerCount,
+    p.CreationDate,
+    pa.EarnedDate,
+    rb.RelatedPostId,
+    lt.Name,
+    vt.Name,
+    ra.VoteDate,
+    ra.VoteTypeId,
+    ra.VoterId,
+    ra.BountyAmount,
+    p.OwnerUserId,
+    p.OwnerDisplayName,
+    p.PostTypeId,
+    p.LastActivityDate,
+    p.AcceptedAnswerId,
+    p.LastEditorUserId,
+    p.LastEditDate,
+    p.FavoriteCount,
+    p.ContentLicense,
+    p.ParentId
+  ORDER BY u.Reputation DESC, p.CreationDate DESC
+  FETCH FIRST 100 ROWS ONLY
+)
+SELECT
+  CU.UserId,
+  CU.UserDisplayName AS DisplayName,
+  CU.PostId,
+  CU.Title,
+  CU.Tags,
+  CU.Score,
+  CU.ViewCount,
+  CU.CommentCount,
+  CU.AnswerCount,
+  CU.PostCreationDate,
+  CU.BadgeEarnedDate,
+  CU.RelatedPostId,
+  CU.LinkTypeName,
+  CU.VoteTypeName,
+  CU.LastPostScore,
+  CU.EffectiveDisplayName,
+  CU.PostTypeLabel
+FROM ComplexQuery CU
+LEFT JOIN Posts PR ON PR.Id = CU.PostId
+LEFT JOIN Badges B ON B.UserId = CU.UserId AND B.Date = CU.BadgeEarnedDate
+ORDER BY CU.UserId, CU.PostCreationDate DESC;

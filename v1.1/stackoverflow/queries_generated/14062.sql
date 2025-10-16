@@ -1,0 +1,107 @@
+-- {"query": "14062.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 147105, "output_tokens": 63357} 
+WITH cte AS (
+  SELECT 
+    p.Id AS PostId,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.ParentId,
+    COALESCE(p.AcceptedAnswerId, 0) AS AcceptedAnswerId,
+    CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END AS IsQuestion,
+    CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END AS IsAnswer,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    COALESCE(p.ClosedDate, '9999-12-31') AS ClosedDate,
+    COALESCE(p.CommunityOwnedDate, '9999-12-31') AS CommunityOwnedDate,
+    SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2) AS Tags
+  FROM Posts p
+), tags AS (
+  SELECT 
+    PostId, 
+    STRING_SPLIT(Tags, '><') AS Tag
+  FROM cte
+), votes AS (
+  SELECT
+    PostId,
+    SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+  FROM Votes
+  GROUP BY PostId
+), user_rep AS (
+  SELECT
+    OwnerUserId,
+    SUM(UpVotes) - SUM(DownVotes) AS Reputation
+  FROM (
+    SELECT OwnerUserId, UpVotes, DownVotes
+    FROM cte
+    UNION ALL
+    SELECT UserId, UpVotes, DownVotes 
+    FROM votes
+  ) t
+  GROUP BY OwnerUserId
+), post_stats AS (
+  SELECT
+    c.PostId,
+    c.CreationDate,
+    c.OwnerUserId,
+    c.ParentId,
+    c.AcceptedAnswerId,
+    c.IsQuestion,
+    c.IsAnswer,
+    c.Score,
+    c.ViewCount,
+    c.AnswerCount,
+    c.CommentCount,
+    c.FavoriteCount,
+    c.ClosedDate,
+    c.CommunityOwnedDate,
+    COALESCE(v.UpVotes, 0) AS UpVotes,
+    COALESCE(v.DownVotes, 0) AS DownVotes,
+    COALESCE(ur.Reputation, 0) AS Reputation
+  FROM cte c
+  LEFT JOIN votes v ON c.PostId = v.PostId
+  LEFT JOIN user_rep ur ON c.OwnerUserId = ur.OwnerUserId
+)
+SELECT
+  p.PostId,
+  p.CreationDate,
+  p.OwnerUserId,
+  p.ParentId,
+  p.AcceptedAnswerId,
+  p.IsQuestion,
+  p.IsAnswer,
+  p.Score,
+  p.ViewCount,
+  p.AnswerCount,
+  p.CommentCount,
+  p.FavoriteCount,
+  p.ClosedDate,
+  p.CommunityOwnedDate,
+  p.UpVotes,
+  p.DownVotes,
+  p.Reputation,
+  ARRAY_AGG(t.Tag) AS Tags
+FROM post_stats p
+LEFT JOIN tags t ON p.PostId = t.PostId
+GROUP BY
+  p.PostId,
+  p.CreationDate,
+  p.OwnerUserId,
+  p.ParentId,
+  p.AcceptedAnswerId,
+  p.IsQuestion,
+  p.IsAnswer,
+  p.Score,
+  p.ViewCount,
+  p.AnswerCount,
+  p.CommentCount,
+  p.FavoriteCount,
+  p.ClosedDate,
+  p.CommunityOwnedDate,
+  p.UpVotes,
+  p.DownVotes,
+  p.Reputation
+ORDER BY p.CreationDate DESC
+LIMIT 100;

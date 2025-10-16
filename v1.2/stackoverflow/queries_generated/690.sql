@@ -1,0 +1,132 @@
+-- {"query": "690.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1310} 
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct p2.Id) filter (where p2.PostTypeId = 2) as AnswersGiven,
+        count(distinct c.Id) as CommentsMade,
+        count(distinct b.Id) as BadgesEarned,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesReceived,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotesReceived
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Posts p2 on p2.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+RankedUserActivity as (
+    select
+        *,
+        row_number() over (order by Reputation desc, QuestionsAsked desc, AnswersGiven desc) as RankByRep,
+        rank() over (partition by date_part('year', CreationDate) order by Reputation desc) as YearlyRepRank
+    from RecursiveUserActivity
+),
+PostStats as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        pt.Name as PostTypeName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        coalesce(p.AcceptedAnswerId, -1) as AcceptedAnswerId,
+        case 
+            when p.ClosedDate is not null then 'Closed'
+            when p.AcceptedAnswerId is not null then 'Answered'
+            else 'Open'
+        end as PostStatus,
+        (select count(*) from Comments c where c.PostId = p.Id) as CommentCount,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 2) as UpVotes,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 3) as DownVotes
+    from Posts p
+    join PostTypes pt on pt.Id = p.PostTypeId
+),
+PostLinkDetails as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName,
+        p.Score as RelatedPostScore,
+        p.ViewCount as RelatedPostViews
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    join Posts p on p.Id = pl.RelatedPostId
+),
+UserBadgeSummary as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserTagEngagement as (
+    select
+        u.Id as UserId,
+        unnest(string_to_array(coalesce(p.Tags, ''), '><')) as TagName,
+        count(*) as PostsCount,
+        sum(p.Score) as TotalScore
+    from Users u
+    join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+    group by u.Id, TagName
+),
+TopTags as (
+    select
+        TagName,
+        sum(PostsCount) as TotalPosts,
+        sum(TotalScore) as TotalScore
+    from UserTagEngagement
+    group by TagName
+    order by TotalPosts desc
+    limit 10
+)
+select
+    r.RankByRep,
+    r.DisplayName,
+    r.Reputation,
+    r.QuestionsAsked,
+    r.AnswersGiven,
+    r.CommentsMade,
+    r.BadgesEarned,
+    coalesce(b_gold.BadgeCount,0) as GoldBadges,
+    coalesce(b_silver.BadgeCount,0) as SilverBadges,
+    coalesce(b_bronze.BadgeCount,0) as BronzeBadges,
+    r.UpVotesReceived,
+    r.DownVotesReceived,
+    array_agg(distinct t.TagName) filter (where t.TagName is not null) as TopTagsEngaged,
+    p.PostId,
+    p.PostTypeName,
+    p.CreationDate as PostCreated,
+    p.Score as PostScore,
+    p.ViewCount as PostViews,
+    p.PostStatus,
+    p.CommentCount,
+    p.UpVotes,
+    p.DownVotes,
+    pl.LinkTypeName,
+    pl.RelatedPostId,
+    pl.RelatedPostScore,
+    pl.RelatedPostViews
+from RankedUserActivity r
+left join UserBadgeSummary b_gold on b_gold.UserId = r.UserId and b_gold.Class = 1
+left join UserBadgeSummary b_silver on b_silver.UserId = r.UserId and b_silver.Class = 2
+left join UserBadgeSummary b_bronze on b_bronze.UserId = r.UserId and b_bronze.Class = 3
+left join PostStats p on p.OwnerUserId = r.UserId
+left join PostLinkDetails pl on pl.PostId = p.PostId
+left join UserTagEngagement t on t.UserId = r.UserId
+where r.RankByRep <= 20
+group by
+    r.RankByRep, r.DisplayName, r.Reputation, r.QuestionsAsked, r.AnswersGiven, r.CommentsMade, r.BadgesEarned,
+    b_gold.BadgeCount, b_silver.BadgeCount, b_bronze.BadgeCount,
+    r.UpVotesReceived, r.DownVotesReceived,
+    p.PostId, p.PostTypeName, p.CreationDate, p.Score, p.ViewCount, p.PostStatus, p.CommentCount, p.UpVotes, p.DownVotes,
+    pl.LinkTypeName, pl.RelatedPostId, pl.RelatedPostScore, pl.RelatedPostViews
+order by r.RankByRep, p.Score desc;

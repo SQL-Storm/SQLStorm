@@ -1,0 +1,175 @@
+-- {"query": "1029.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1691} 
+with RecursiveTagHierarchy as (
+    select 
+        t.Id, 
+        t.TagName, 
+        t.Count,
+        1 as Level,
+        t.ExcerptPostId,
+        t.WikiPostId
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    
+    union all
+    
+    select 
+        t2.Id, 
+        t2.TagName, 
+        t2.Count,
+        r.Level + 1,
+        t2.ExcerptPostId,
+        t2.WikiPostId
+    from Tags t2 
+    join RecursiveTagHierarchy r on 
+        t2.TagName < r.TagName
+    where r.Level < 3
+),
+UserBadgeStats as (
+    select 
+        b.UserId,
+        count(*) as BadgeCount,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+    from Badges b
+    group by b.UserId
+),
+HighRepUsers as (
+    select 
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate,
+        u.Views, u.UpVotes, u.DownVotes,
+        ub.BadgeCount, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges
+    from Users u
+    left join UserBadgeStats ub on u.Id = ub.UserId
+    where u.Reputation > 10000
+),
+PostWithLastEdit as (
+    select 
+        p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount,
+        p.Title, p.Tags, p.AnswerCount, p.CommentCount, p.FavoriteCount,
+        ph.CreationDate as LastEditDate,
+        ph.UserId as LastEditorUserId,
+        ph.UserDisplayName as LastEditorDisplayName,
+        
+        dense_rank() over (
+            partition by p.Id
+            order by ph.CreationDate desc nulls last
+        ) as EditRank
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId in (4,5,6,24)
+),
+TopPostsWithLastEdit as (
+    select *
+    from PostWithLastEdit
+    where EditRank = 1
+),
+AnswerCounts as (
+    select ParentId, count(*) as AnswerCount
+    from Posts
+    where PostTypeId = 2
+    group by ParentId
+),
+CloseReasonsCounts as (
+    select ph.PostId, ph.Comment as CloseReasonId, crt.Name as CloseReasonName, count(*) as CloseCount
+    from PostHistory ph
+    left join CloseReasonTypes crt on cast(ph.Comment as int) = crt.Id
+    where ph.PostHistoryTypeId = 10 -- Post Closed
+    group by ph.PostId, ph.Comment, crt.Name
+),
+PostScoreRanks as (
+    select 
+        p.Id, p.PostTypeId, p.OwnerUserId, p.Score,
+        rank() over (partition by p.PostTypeId order by p.Score desc) as ScoreRank,
+        row_number() over (partition by p.PostTypeId order by p.CreationDate) as PostAgeRank
+    from Posts p
+),
+UserRecentActivity as (
+    select 
+        u.Id as UserId,
+        max(p.LastActivityDate) as MostRecentActivity,
+        count(distinct p.Id) as PostsCount,
+        avg(p.Score) as AvgPostScore,
+        bool_and(p.ClosedDate is null) as NoClosedPosts
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id
+),
+UserVoteStats as (
+    select 
+        p.OwnerUserId as UserId,
+        count(v.Id) filter (where v.VoteTypeId = 2) as UpVotes,
+        count(v.Id) filter (where v.VoteTypeId = 3) as DownVotes,
+        count(distinct v.UserId) as DistinctVoters
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    group by p.OwnerUserId
+),
+CombinedUserStats as (
+    select 
+        hru.Id, hru.DisplayName, hru.Reputation, hru.CreationDate,
+        hru.Views, hru.UpVotes as UserUpVotes, hru.DownVotes as UserDownVotes,
+        hru.BadgeCount, hru.GoldBadges, hru.SilverBadges, hru.BronzeBadges,
+        ura.MostRecentActivity, ura.PostsCount, ura.AvgPostScore, ura.NoClosedPosts,
+        uvs.UpVotes as VotesOnPosts, uvs.DownVotes as DownVotesOnPosts, uvs.DistinctVoters
+    from HighRepUsers hru
+    left join UserRecentActivity ura on hru.Id = ura.UserId
+    left join UserVoteStats uvs on hru.Id = uvs.UserId
+),
+DuplicateQuestions as (
+    select pl.PostId, pl.RelatedPostId, pl.CreationDate, pl.LinkTypeId, lt.Name as LinkTypeName
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    where pl.LinkTypeId = 3 -- Duplicate links
+),
+RankedComments as (
+    select
+        c.Id, c.PostId, c.Score, c.CreationDate, c.UserId, c.UserDisplayName,
+        row_number() over (partition by c.PostId order by c.Score desc nulls last, c.CreationDate) as CommentRank
+    from Comments c
+),
+TopComments as (
+    select Id, PostId, Score, CreationDate, UserId, UserDisplayName
+    from RankedComments
+    where CommentRank <= 3
+)
+select 
+    p.Id as PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    coalesce(crc.CloseCount,0) as CloseVotes,
+    crc.CloseReasonName,
+    u.Id as OwnerUserId,
+    u.DisplayName as OwnerName,
+    u.Reputation,
+    u.BadgeCount,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    u.PostsCount,
+    u.AvgPostScore,
+    u.NoClosedPosts,
+    dup.RelatedPostId as DuplicateOfPost,
+    dup.LinkTypeName as DuplicationLinkType,
+    max(tc.Score) as TopCommentScore,
+    string_agg(concat_ws(':', tc.UserDisplayName, tc.Score), ',' order by tc.Score desc nulls last) as TopCommentersWithScores
+from TopPostsWithLastEdit p
+left join CombinedUserStats u on p.OwnerUserId = u.Id
+left join CloseReasonsCounts crc on p.Id = crc.PostId
+left join DuplicateQuestions dup on p.Id = dup.PostId
+left join TopComments tc on tc.PostId = p.Id
+where p.PostTypeId = 1
+  and p.Score > 10
+  and p.CreationDate > now() - interval '1 year'
+group by 
+    p.Id, p.PostTypeId, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount,
+    crc.CloseCount, crc.CloseReasonName,
+    u.Id, u.DisplayName, u.Reputation, u.BadgeCount, u.GoldBadges, u.SilverBadges, u.BronzeBadges, u.PostsCount, u.AvgPostScore, u.NoClosedPosts,
+    dup.RelatedPostId, dup.LinkTypeName
+having max(tc.Score) > 5
+order by p.Score desc, u.Reputation desc, CloseVotes desc
+limit 50;

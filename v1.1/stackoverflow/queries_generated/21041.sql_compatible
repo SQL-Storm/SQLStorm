@@ -1,0 +1,153 @@
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(u.Reputation) OVER (PARTITION BY CASE WHEN u.Reputation >= 1000 THEN 'High' ELSE 'Low' END) AS AvgRepGroup
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId 
+        AND p.CreationDate > u.CreationDate 
+        AND p.CreationDate < DATE '2024-10-01' - INTERVAL '1' YEAR
+    WHERE u.Reputation > 0 
+        AND u.LastAccessDate > DATE '2024-10-01' - INTERVAL '2' YEAR
+    GROUP BY u.Id, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) > 0
+),
+TopContributors AS (
+    SELECT 
+        au.*,
+        RANK() OVER (ORDER BY au.QuestionCount DESC, au.AnswerCount DESC) AS ContributorRank,
+        LAG(au.PostCount) OVER (ORDER BY au.Reputation DESC) AS PrevPostCount
+    FROM ActiveUsers au
+    WHERE au.PostCount >= 5
+),
+TagActivity AS (
+    SELECT 
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS TagUsageCount,
+        AVG(p.Score) AS AvgScore,
+        STRING_AGG(DISTINCT COALESCE(pt.Name, 'Unknown'), ', ') AS PostTypesUsed,
+        PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY p.ViewCount) OVER () AS HighViewThreshold
+    FROM Tags t
+    INNER JOIN Posts p ON POSITION(t.TagName IN COALESCE(p.Tags, '')) > 0
+        AND p.PostTypeId = 1 
+        AND p.DeletedDate IS NULL
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE t.Count > 10 
+        AND LENGTH(t.TagName) BETWEEN 2 AND 20
+    GROUP BY t.TagName
+    HAVING COUNT(DISTINCT p.Id) > 1
+),
+UserTagPerformance AS (
+    SELECT 
+        tc.UserId,
+        ta.TagName,
+        COUNT(DISTINCT p.Id) AS UserTagPosts,
+        SUM(p.Score) AS TotalScore,
+        CASE 
+            WHEN SUM(p.ViewCount) / NULLIF(COUNT(p.Id), 0) > 100 THEN 'High Visibility'
+            WHEN SUM(p.ViewCount) IS NULL THEN 'No Views'
+            ELSE 'Low Visibility'
+        END AS VisibilityCategory,
+        ROW_NUMBER() OVER (PARTITION BY tc.UserId ORDER BY SUM(p.Score) DESC) AS TagRankPerUser
+    FROM TopContributors tc
+    INNER JOIN Posts p ON tc.UserId = p.OwnerUserId 
+        AND p.PostTypeId = 1
+        AND p.CreationDate BETWEEN tc.UserCreationDate AND DATE '2024-10-01'
+        AND p.DeletedDate IS NULL
+    INNER JOIN TagActivity ta ON POSITION(ta.TagName IN COALESCE(p.Tags, '')) > 0
+    WHERE p.Score > -5 
+        AND (p.ViewCount > 0 OR p.ViewCount IS NULL)
+    GROUP BY tc.UserId, ta.TagName
+)
+SELECT 
+    utp.UserId,
+    u.DisplayName,
+    utp.TagName,
+    utp.UserTagPosts,
+    utp.TotalScore,
+    utp.VisibilityCategory,
+    tc.ContributorRank,
+    ta.TagUsageCount,
+    ta.AvgScore,
+    COALESCE(utp.TotalScore / NULLIF(ta.AvgScore, 0), 0) AS ScoreRatio,
+    CASE 
+        WHEN utp.TagRankPerUser = 1 AND tc.Reputation > 5000 THEN 'Elite Tag Expert'
+        WHEN utp.UserTagPosts > 10 THEN 'Seasoned Contributor'
+        WHEN utp.TotalScore > 50 THEN 'Rising Star'
+        ELSE 'Emerging'
+    END AS ExpertiseLevel,
+    (SELECT COUNT(DISTINCT v.PostId) 
+     FROM Votes v 
+     WHERE v.PostId IN (
+         SELECT pp.Id 
+         FROM Posts pp 
+         WHERE pp.OwnerUserId = utp.UserId 
+             AND pp.PostTypeId = 1
+             AND POSITION(utp.TagName IN COALESCE(pp.Tags, '')) > 0
+     ) 
+     AND v.VoteTypeId IN (2, 3)
+    ) AS TotalVotesReceived,
+    (SELECT AVG(LENGTH(c.Text)) 
+     FROM Comments c 
+     WHERE c.PostId IN (
+         SELECT ppp.Id 
+         FROM Posts ppp 
+         WHERE ppp.OwnerUserId = utp.UserId 
+             AND ppp.Tags LIKE '%' || utp.TagName || '%'
+     ) 
+     AND c.Score > 0 
+     AND c.UserId IS NOT NULL
+    ) AS AvgCommentLength,
+    ta.PostTypesUsed
+FROM UserTagPerformance utp
+INNER JOIN TopContributors tc ON utp.UserId = tc.UserId
+INNER JOIN Users u ON utp.UserId = u.Id
+INNER JOIN TagActivity ta ON utp.TagName = ta.TagName
+LEFT JOIN Badges b ON u.Id = b.UserId 
+    AND b.Name LIKE '%Tag%'
+    AND (b.Date > u.CreationDate OR b.Date IS NULL)
+WHERE utp.TagRankPerUser <= 3
+    AND tc.ContributorRank <= 100
+    AND utp.TotalScore > (
+        SELECT AVG(utp2.TotalScore) 
+        FROM UserTagPerformance utp2 
+        WHERE utp2.UserId = utp.UserId
+    )
+    AND (u.Location IS NULL OR u.Location NOT LIKE '%spam%')
+    AND NOT EXISTS (
+        SELECT 1 
+        FROM PostHistory ph 
+        INNER JOIN Posts pp2 ON ph.PostId = pp2.Id 
+        WHERE pp2.OwnerUserId = utp.UserId 
+            AND ph.PostHistoryTypeId IN (10, 12)
+            AND ph.CreationDate > u.CreationDate - INTERVAL '1' YEAR
+        GROUP BY ph.PostId 
+        HAVING COUNT(*) > 3
+    )
+UNION ALL
+SELECT 
+    NULL AS UserId,
+    'Overall Stats' AS DisplayName,
+    'All Tags' AS TagName,
+    SUM(utp.UserTagPosts) AS UserTagPosts,
+    SUM(utp.TotalScore) AS TotalScore,
+    'Aggregate' AS VisibilityCategory,
+    0 AS ContributorRank,
+    SUM(ta.TagUsageCount) AS TagUsageCount,
+    AVG(ta.AvgScore) AS AvgScore,
+    1.0 AS ScoreRatio,
+    'Summary' AS ExpertiseLevel,
+    NULL AS TotalVotesReceived,
+    NULL AS AvgCommentLength,
+    STRING_AGG(DISTINCT ta.PostTypesUsed, ' | ') AS PostTypesUsed
+FROM UserTagPerformance utp
+INNER JOIN TagActivity ta ON utp.TagName = ta.TagName
+ORDER BY 
+    COALESCE(utp.TotalScore, 0) DESC,
+    utp.TagRankPerUser ASC,
+    tc.ContributorRank ASC
+LIMIT 50 OFFSET 0;

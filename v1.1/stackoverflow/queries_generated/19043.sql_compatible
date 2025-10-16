@@ -1,0 +1,192 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT p.Id) AS TotalOwnedPosts,
+        SUM(CASE WHEN p.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Question') THEN 1 ELSE 0 END) AS TotalQuestionsAsked,
+        SUM(CASE WHEN p.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Answer') THEN 1 ELSE 0 END) AS TotalAnswersProvided,
+        AVG(CASE WHEN p.Score IS NOT NULL THEN p.Score ELSE 0 END) AS AvgPostScore,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        AVG(c.Score) AS AvgCommentScore,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgesCount,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgesCount,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgesCount,
+        MAX(p.LastActivityDate) AS LastPostActivityDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+QuestionDetailedMetrics AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        q.Title AS QuestionTitle,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViewCount,
+        q.AnswerCount AS QuestionAnswerCount,
+        q.FavoriteCount AS QuestionFavoriteCount,
+        q.AcceptedAnswerId,
+        q.LastActivityDate AS QuestionLastActivityDate,
+        q.ClosedDate,
+        TRIM(BOTH '>' FROM SUBSTRING(q.Tags FROM POSITION('<' IN q.Tags) + 1 FOR POSITION('><' IN q.Tags) - POSITION('<' IN q.Tags) - 1)) AS PrimaryTag,
+        CAST(COALESCE(q.FavoriteCount, 0) AS NUMERIC) / NULLIF(q.ViewCount, 0) AS FavoriteToViewRatio,
+        EXISTS (
+            SELECT 1
+            FROM PostHistory ph_inner
+            JOIN CloseReasonTypes crt ON ph_inner.Comment = CAST(crt.Id AS VARCHAR)
+            WHERE ph_inner.PostId = q.Id
+              AND ph_inner.PostHistoryTypeId = (SELECT Id FROM PostHistoryTypes WHERE Name = 'Post Closed')
+              AND crt.Name LIKE '%duplicate%'
+              AND ph_inner.CreationDate > (q.CreationDate + INTERVAL '1 hour')
+        ) AS WasClosedAsDuplicateEarly,
+        ROW_NUMBER() OVER(PARTITION BY q.OwnerUserId ORDER BY q.Score DESC, q.CreationDate DESC) AS UserQuestionScoreRank
+    FROM Posts q
+    WHERE q.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Question')
+      AND q.CreationDate BETWEEN (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3 years') AND CAST('2024-10-01 12:34:56' AS TIMESTAMP)
+),
+AnswerAcceptanceStatus AS (
+    SELECT
+        qpm.QuestionId,
+        a.OwnerUserId AS AcceptedAnswerOwnerId,
+        a.CreationDate AS AcceptedAnswerCreationDate,
+        a.Score AS AcceptedAnswerScore,
+        (EXTRACT(EPOCH FROM (a.CreationDate - qpm.QuestionCreationDate)) / 3600.0) AS HoursToAcceptedAnswer,
+        CASE WHEN a.OwnerUserId = qpm.OwnerUserId THEN TRUE ELSE FALSE END AS SelfAccepted
+    FROM QuestionDetailedMetrics qpm
+    INNER JOIN Posts a ON qpm.AcceptedAnswerId = a.Id
+    WHERE a.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Answer')
+),
+RelatedPostEngagement AS (
+    SELECT
+        pl.PostId,
+        SUM(CASE WHEN lt.Name = 'Duplicate' THEN 1 ELSE 0 END) AS DuplicateLinksCount,
+        SUM(CASE WHEN lt.Name = 'Linked' THEN 1 ELSE 0 END) AS RelatedLinksCount,
+        AVG(rp.Score) AS AvgRelatedPostScore,
+        COUNT(DISTINCT rp.OwnerUserId) AS UniqueRelatedPostOwners
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    LEFT JOIN Posts rp ON pl.RelatedPostId = rp.Id
+    GROUP BY pl.PostId
+),
+TagUsageDiversity AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT TRIM(BOTH '>' FROM SUBSTRING(unnested_tag FROM POSITION('<' IN unnested_tag) + 1 FOR LENGTH(unnested_tag) - POSITION('<' IN unnested_tag) -1))) AS UniqueTagCount,
+        MIN(t.Count) AS MinTagPopularityUsed,
+        MAX(t.Count) AS MaxTagPopularityUsed
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    CROSS JOIN LATERAL (SELECT UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS unnested_tag) u_tags
+    LEFT JOIN Tags t ON TRIM(u_tags.unnested_tag) = t.TagName
+    WHERE p.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Question') AND p.Tags IS NOT NULL
+    GROUP BY u.Id
+)
+SELECT
+    ues.UserId,
+    ues.DisplayName,
+    ues.Reputation,
+    ues.TotalQuestionsAsked,
+    ues.TotalAnswersProvided,
+    ues.GoldBadgesCount,
+    ues.SilverBadgesCount,
+    ues.BronzeBadgesCount,
+    ues.AvgPostScore,
+    ues.UserCreationDate,
+    ues.LastAccessDate,
+    ues.UserProfileViews,
+    qdm.QuestionId,
+    qdm.OwnerUserId,
+    qdm.QuestionTitle,
+    qdm.QuestionCreationDate,
+    qdm.QuestionScore,
+    qdm.QuestionViewCount,
+    qdm.QuestionAnswerCount,
+    qdm.QuestionFavoriteCount,
+    qdm.PrimaryTag,
+    qdm.FavoriteToViewRatio,
+    qdm.AcceptedAnswerId,
+    qdm.QuestionLastActivityDate,
+    qdm.ClosedDate,
+    qdm.WasClosedAsDuplicateEarly,
+    qdm.UserQuestionScoreRank,
+    aas.HoursToAcceptedAnswer,
+    aas.SelfAccepted,
+    rpe.DuplicateLinksCount,
+    rpe.RelatedLinksCount,
+    rpe.AvgRelatedPostScore,
+    rpe.UniqueRelatedPostOwners,
+    tud.UniqueTagCount AS UserUniqueTagDiversity,
+    tud.MinTagPopularityUsed,
+    tud.MaxTagPopularityUsed,
+    (ues.Reputation * 0.1
+     + ues.AvgPostScore * 0.5
+     + ues.TotalQuestionsAsked * 0.2
+     + ues.TotalAnswersProvided * 0.2
+     + (ues.GoldBadgesCount * 10 + ues.SilverBadgesCount * 5 + ues.BronzeBadgesCount * 1) * 0.5
+     + COALESCE(qdm.FavoriteToViewRatio, 0) * 100
+     - COALESCE(aas.HoursToAcceptedAnswer / 24, 0) * 0.1
+    ) AS UserInfluenceScore,
+    CASE
+        WHEN qdm.ClosedDate IS NOT NULL AND qdm.WasClosedAsDuplicateEarly THEN 'Closed - Early Duplicate'
+        WHEN qdm.ClosedDate IS NOT NULL THEN 'Closed - Other Reason'
+        WHEN qdm.AcceptedAnswerId IS NOT NULL AND aas.HoursToAcceptedAnswer <= 24 AND aas.SelfAccepted = FALSE THEN 'Answered - Quickly Accepted (External)'
+        WHEN qdm.AcceptedAnswerId IS NOT NULL THEN 'Answered - Accepted'
+        WHEN qdm.QuestionAnswerCount = 0 AND qdm.QuestionCreationDate < (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year') THEN 'Unanswered - Old'
+        ELSE 'Open'
+    END AS QuestionStatusCategory,
+    COALESCE(
+        LOWER(SUBSTRING(TRIM(REPLACE(REPLACE(ues.DisplayName, ' ', ''), '.', '')) FROM 1 FOR 5) || '-' ||
+        LPAD(CAST(ues.UserProfileViews AS VARCHAR), 6, '0')),
+        'UNKNOWN-USER'
+    ) AS UserHashId
+FROM UserEngagementSummary ues
+INNER JOIN QuestionDetailedMetrics qdm ON ues.UserId = qdm.OwnerUserId
+LEFT JOIN AnswerAcceptanceStatus aas ON qdm.QuestionId = aas.QuestionId
+LEFT JOIN RelatedPostEngagement rpe ON qdm.QuestionId = rpe.PostId
+LEFT JOIN TagUsageDiversity tud ON ues.UserId = tud.UserId
+WHERE
+    ues.Reputation > 10000
+    AND ues.TotalQuestionsAsked >= 10
+    AND ues.TotalAnswersProvided >= 20
+    AND ues.GoldBadgesCount >= 1
+    AND qdm.QuestionScore >= 20
+    AND qdm.QuestionViewCount >= 5000
+    AND qdm.UserQuestionScoreRank <= 3
+    AND qdm.FavoriteToViewRatio > 0.005
+    AND (
+        qdm.WasClosedAsDuplicateEarly = FALSE
+        OR rpe.DuplicateLinksCount IS NULL
+        OR rpe.DuplicateLinksCount < 2
+    )
+    AND (
+        aas.QuestionId IS NOT NULL
+        AND aas.HoursToAcceptedAnswer <= 72
+        AND NOT aas.SelfAccepted
+    )
+    AND (
+        EXISTS (
+            SELECT 1
+            FROM Comments c_outer
+            WHERE c_outer.UserId = ues.UserId
+              AND c_outer.Score >= 5
+              AND c_outer.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 year')
+        )
+        OR
+        ues.UserId IN (SELECT Id FROM Users WHERE AboutMe IS NOT NULL AND AboutMe ILIKE '%developer%' AND LENGTH(AboutMe) > 100)
+    )
+    AND ues.DisplayName IS NOT NULL
+    AND qdm.QuestionTitle IS NOT NULL
+ORDER BY
+    UserInfluenceScore DESC,
+    qdm.QuestionScore DESC,
+    ues.LastAccessDate DESC
+LIMIT 500;

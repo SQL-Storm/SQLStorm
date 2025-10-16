@@ -1,0 +1,187 @@
+with
+Questions as (
+  select p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount,
+         coalesce(p.Tags,'') as Tags,
+         regexp_split_to_table(substring(coalesce(p.Tags,''),2), '><') as Tag
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+UserBadges as (
+  select b.UserId,
+         count(case when b.Class = 1 then 1 end) as GoldBadges,
+         count(case when b.Class = 2 then 1 end) as SilverBadges,
+         count(case when b.Class = 3 then 1 end) as BronzeBadges,
+         max(b.Date) as LastBadgeDate,
+         string_agg(b.Name, ', ' order by b.Date desc) as BadgeList
+  from Badges b
+  group by b.UserId
+),
+AnswersPerQuestion as (
+  select a.ParentId as QuestionId,
+         count(*) as AnswerCountTotal,
+         sum(case when a.Score > 0 then 1 else 0 end) as PositiveAnswers,
+         sum(case when a.Score <= 0 then 1 else 0 end) as NonPositiveAnswers,
+         max(a.Score) as MaxAnswerScore,
+         min(a.Score) as MinAnswerScore,
+         avg(a.Score) as AvgAnswerScore,
+         string_agg(cast(a.Id as text), ',' order by a.Score desc, a.CreationDate asc) filter (where rn = 1) as TopAnswerIds
+  from (
+    select a.*, row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as rn
+    from Posts a
+    where a.PostTypeId = 2
+      and a.ParentId is not null
+  ) a
+  group by a.ParentId
+),
+PostEditors as (
+  select ph.PostId,
+         count(distinct ph.UserId) as DistinctEditors,
+         count(*) as EditEvents,
+         max(ph.CreationDate) as LastEditDate,
+         min(ph.CreationDate) as FirstEditDate,
+         (select ph2.UserId
+          from PostHistory ph2
+          where ph2.PostId = ph.PostId and ph2.UserId is not null
+          group by ph2.UserId
+          order by count(*) desc, max(ph2.CreationDate) desc
+          limit 1) as TopEditorUserId
+  from PostHistory ph
+  where ph.PostId is not null
+  group by ph.PostId
+),
+CommentMetrics as (
+  select c.PostId,
+         count(*) as CommentCount,
+         sum(coalesce(c.Score,0)) as CommentScoreSum,
+         avg(coalesce(c.Score,0)) as CommentScoreAvg,
+         sum(case when char_length(c.Text) > 200 then 1 else 0 end) as LongComments
+  from Comments c
+  where c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+  group by c.PostId
+),
+PostLinksAgg as (
+  select pl.PostId,
+         count(case when pl.LinkTypeId = 1 then 1 end) as OutboundLinks,
+         count(case when pl.LinkTypeId = 3 then 1 end) as DuplicateLinks,
+         count(distinct pl.RelatedPostId) as DistinctRelated,
+         sum(case when exists (
+               select 1 from PostLinks pl2
+               where pl2.PostId = pl.RelatedPostId and pl2.RelatedPostId = pl.PostId
+             ) then 1 else 0 end) as ReciprocalLinks
+  from PostLinks pl
+  group by pl.PostId
+),
+EnrichedQuestions as (
+  select q.Id, q.Title, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, q.Tags, q.Tag,
+         u.Reputation,
+         u.DisplayName,
+         ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ub.LastBadgeDate, ub.BadgeList,
+         a.AnswerCountTotal, a.PositiveAnswers, a.NonPositiveAnswers, a.MaxAnswerScore, a.MinAnswerScore, a.AvgAnswerScore, a.TopAnswerIds,
+         pe.DistinctEditors, pe.EditEvents, pe.LastEditDate, pe.TopEditorUserId,
+         cm.CommentCount, cm.CommentScoreSum, cm.CommentScoreAvg, cm.LongComments,
+         pla.OutboundLinks, pla.DuplicateLinks, pla.DistinctRelated, pla.ReciprocalLinks
+  from Questions q
+  left join Users u on u.Id = q.OwnerUserId
+  left join UserBadges ub on ub.UserId = q.OwnerUserId
+  left join AnswersPerQuestion a on a.QuestionId = q.Id
+  left join PostEditors pe on pe.PostId = q.Id
+  left join CommentMetrics cm on cm.PostId = q.Id
+  left join PostLinksAgg pla on pla.PostId = q.Id
+),
+TagAggregates as (
+  select Tag,
+         count(*) as Questions,
+         sum(coalesce(AnswerCount,0)) as TotalAnswers,
+         avg(coalesce(Score,0)) as AvgQuestionScore,
+         sum(case when coalesce(AnswerCount,0) > 0 then 1 else 0 end) as QuestionsWithAnswers,
+         sum(case when coalesce(AnswerCount,0) = 0 then 1 else 0 end) as OpenQuestions,
+         avg(coalesce(ViewCount,0)) as AvgViews,
+         sum(coalesce(CommentCount,0)) as TotalComments,
+         avg(coalesce(AvgAnswerScore,0)) as AvgAnswerScorePerQuestion,
+         case when count(distinct OwnerUserId) > 1 then sqrt( (sum( (coalesce(Reputation,0) * coalesce(Reputation,0) )) - (sum(coalesce(Reputation,0)) * sum(coalesce(Reputation,0)))/count(*) ) / (count(*) - 1) ) else null end as ReputationStdDev
+  from EnrichedQuestions
+  group by Tag
+),
+TagRank as (
+  select ta.Tag, ta.Questions, ta.TotalAnswers, ta.AvgQuestionScore, ta.QuestionsWithAnswers, ta.OpenQuestions, ta.AvgViews, ta.TotalComments, ta.AvgAnswerScorePerQuestion, ta.ReputationStdDev,
+         (
+           (coalesce(ta.Questions,0) / nullif((select max(Questions) from TagAggregates),0)) * 0.35
+           + (coalesce(ta.TotalAnswers,0) / nullif((select max(TotalAnswers) from TagAggregates),0)) * 0.25
+           + (coalesce(ta.AvgViews,0) / nullif((select max(AvgViews) from TagAggregates),0)) * 0.2
+           + (coalesce(ta.TotalComments,0) / nullif((select max(TotalComments) from TagAggregates),0)) * 0.1
+           + (coalesce(ta.AvgAnswerScorePerQuestion,0) / nullif((select max(AvgAnswerScorePerQuestion) from TagAggregates),0)) * 0.1
+         ) as CompositeScore
+  from TagAggregates ta
+),
+TopQuestionsPerTag as (
+  select tr.Tag, tr.CompositeScore,
+         eq.Id as QuestionId, eq.Title, eq.OwnerUserId, eq.Reputation as OwnerReputation,
+         eq.Score, eq.ViewCount, eq.AnswerCount,
+         eq.CommentCount, eq.AvgAnswerScore, eq.MaxAnswerScore, eq.MinAnswerScore,
+         eq.DistinctEditors, eq.EditEvents, eq.LastEditDate, eq.TopEditorUserId,
+         case
+           when eq.Score >= 50 or eq.ViewCount >= 100000 then 'hot'
+           when coalesce(eq.AnswerCount,0) = 0 and eq.ViewCount > 5000 then 'controversial'
+           when coalesce(eq.DistinctEditors,0) > 5 and coalesce(eq.EditEvents,0) > 10 then 'community-curated'
+           when coalesce(eq.CommentCount,0) > 20 and coalesce(eq.AvgAnswerScore,0) < 0 then 'heated'
+           when eq.Score is null then 'unknown'
+           else 'normal'
+         end as RiskLevel,
+         coalesce(trim(eq.Title), '<untitled>') || ' [' || tr.Tag || ']'
+           || ' (score:' || coalesce(cast(eq.Score as text),'0') || ', answers:' || coalesce(cast(eq.AnswerCount as text),'0') || ')' as ShortLabel
+  from TagRank tr
+  join lateral (
+    select eqsub.Id, eqsub.Title, eqsub.OwnerUserId, eqsub.Reputation, eqsub.Score, eqsub.ViewCount, eqsub.AnswerCount, eqsub.CommentCount, eqsub.AvgAnswerScore, eqsub.MaxAnswerScore, eqsub.MinAnswerScore,
+           eqsub.DistinctEditors, eqsub.EditEvents, eqsub.LastEditDate, eqsub.TopEditorUserId, eqsub.Tag, eqsub.Tags,
+           eqsub.rn
+    from (
+      select eq.*, row_number() over (partition by eq.Tag order by coalesce(eq.Score,0) desc, coalesce(eq.ViewCount,0) desc, coalesce(eq.AnswerCount,0) desc) as rn
+      from EnrichedQuestions eq
+      where eq.Tag = tr.Tag
+        and coalesce(eq.Score,0) > -50
+        and (eq.AnswerCount is null or eq.AnswerCount >= 0)
+    ) eqsub
+    where eqsub.rn <= 3
+    order by eqsub.rn
+  ) eq on true
+)
+select tq.Tag,
+       tq.CompositeScore,
+       tq.QuestionId,
+       tq.ShortLabel,
+       tq.OwnerUserId,
+       u.DisplayName as OwnerName,
+       tq.OwnerReputation,
+       tq.Score,
+       tq.ViewCount,
+       tq.AnswerCount,
+       tq.CommentCount,
+       tq.MaxAnswerScore,
+       tq.MinAnswerScore,
+       tq.AvgAnswerScore,
+       tq.DistinctEditors,
+       tq.EditEvents,
+       tq.LastEditDate,
+       coalesce(ue.BadgeList, 'none') as OwnerBadges,
+       tq.RiskLevel,
+       (select percentile_cont(0.5) within group (order by a.Score)
+        from Posts a
+        where a.ParentId = tq.QuestionId
+          and a.PostTypeId = 2
+       ) as MedianAnswerScore,
+       (select string_agg(u2.DisplayName, ', ' order by u2.Reputation desc)
+        from (
+          select v.UserId from Votes v where v.PostId = tq.QuestionId and v.VoteTypeId = 2
+          union
+          select v.UserId from Votes v where v.PostId = tq.QuestionId and v.VoteTypeId = 5
+       ) vv
+       left join Users u2 on u2.Id = vv.UserId
+       ) as RepresentativeVoters
+from TopQuestionsPerTag tq
+left join Users u on u.Id = tq.OwnerUserId
+left join Users ue on ue.Id = tq.TopEditorUserId
+where tq.CompositeScore is not null
+  and tq.Tag is not null
+order by tq.CompositeScore desc nulls last, tq.Tag, tq.Score desc
+limit 200;

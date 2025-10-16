@@ -1,0 +1,86 @@
+WITH cte AS (
+  SELECT p.Id,
+         p.PostTypeId,
+         p.CreationDate,
+         p.OwnerUserId,
+         p.AnswerCount,
+         ROUND(EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / (365.0 * 24 * 3600), 2) AS age_in_years,
+         CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS post_status,
+         COALESCE(NULLIF(LENGTH(p.Tags), 0), 0) AS num_tags,
+         CASE 
+           WHEN p.AnswerCount = 0 THEN 'Unanswered'
+           WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+           ELSE 'Partially Answered'
+         END AS answer_status,
+         CASE 
+           WHEN p.OwnerUserId IS NULL THEN 'Community'
+           ELSE CAST(u.Reputation AS varchar)
+         END AS owner_reputation,
+         CASE 
+           WHEN p.OwnerUserId IS NULL THEN 'Community'
+           ELSE u.DisplayName
+         END AS owner_name,
+         CASE
+           WHEN p.OwnerUserId IS NULL THEN -1
+           ELSE p.OwnerUserId
+         END AS owner_id,
+         CAST((cast('2024-10-01' as date) - CAST(p.CreationDate AS date)) AS INT) AS days_since_creation,
+         p.Tags
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+)
+SELECT
+  cte.Id,
+  cte.PostTypeId,
+  cte.CreationDate,
+  cte.age_in_years,
+  cte.post_status,
+  cte.num_tags,
+  cte.answer_status,
+  cte.owner_reputation,
+  cte.owner_name,
+  cte.owner_id,
+  cte.days_since_creation,
+  CASE 
+    WHEN cte.post_status = 'Closed' THEN (
+      SELECT crt.Name
+      FROM PostHistory ph
+      JOIN CloseReasonTypes crt ON ph.Comment = CAST(crt.Id AS varchar)
+      WHERE ph.PostId = cte.Id AND ph.PostHistoryTypeId = 10
+      ORDER BY ph.CreationDate DESC
+      FETCH FIRST 1 ROW ONLY
+    )
+    ELSE NULL
+  END AS close_reason,
+  (
+    SELECT COUNT(*)
+    FROM Votes v
+    WHERE v.PostId = cte.Id AND v.VoteTypeId = 2
+  ) AS upvotes,
+  (
+    SELECT COUNT(*)
+    FROM Votes v
+    WHERE v.PostId = cte.Id AND v.VoteTypeId = 3
+  ) AS downvotes,
+  (
+    SELECT COUNT(*)
+    FROM Votes v
+    WHERE v.PostId = cte.Id AND v.VoteTypeId = 5
+  ) AS favorites,
+  (
+    SELECT COUNT(*)
+    FROM Comments c
+    WHERE c.PostId = cte.Id
+  ) AS comment_count,
+  (
+    SELECT COUNT(*)
+    FROM PostLinks pl
+    WHERE pl.PostId = cte.Id AND pl.LinkTypeId = 3
+  ) AS num_duplicate_links,
+  COALESCE((
+    SELECT STRING_AGG(t.TagName, ',')
+    FROM Tags t
+    WHERE POSITION(CAST(t.Id AS varchar) IN SUBSTRING(cte.Tags FROM 2 FOR LENGTH(cte.Tags) - 2)) > 0
+  ), '') AS tag_list
+FROM cte
+ORDER BY cte.days_since_creation DESC;

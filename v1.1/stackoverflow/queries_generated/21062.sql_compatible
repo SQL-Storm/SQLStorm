@@ -1,0 +1,129 @@
+WITH UserActivity AS (
+  SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS PostCount,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+    AVG(p.Score) AS AvgPostScore,
+    MAX(p.CreationDate) AS LastPostDate,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.DeletionDate IS NULL
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+ActiveUsers AS (
+  SELECT UserId, DisplayName, Reputation, PostCount, QuestionCount, AnswerCount, AvgPostScore, LastPostDate, ReputationRank
+  FROM UserActivity
+  WHERE PostCount > 0 AND LastPostDate >= CAST('2024-10-01' AS date) - INTERVAL '365 days'
+),
+TagStats AS (
+  SELECT 
+    t.TagName,
+    t.Count AS TotalPosts,
+    COUNT(DISTINCT au.UserId) AS ActiveUsers,
+    AVG(au.Reputation) AS AvgUserReputation,
+    SUM(au.QuestionCount) AS TotalQuestions,
+    FIRST_VALUE(t.TagName) OVER (ORDER BY t.Count DESC) AS TopTag
+  FROM Tags t
+  INNER JOIN (
+    SELECT DISTINCT p.OwnerUserId AS UserId, SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2) AS TagList
+    FROM Posts p
+    INNER JOIN ActiveUsers au ON p.OwnerUserId = au.UserId
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+  ) tagged_posts ON string_to_array(tagged_posts.TagList, '><') @> ARRAY[t.TagName]
+  INNER JOIN ActiveUsers au ON tagged_posts.UserId = au.UserId
+  GROUP BY t.Id, t.TagName, t.Count
+  HAVING COUNT(DISTINCT au.UserId) > 5
+),
+RecentEdits AS (
+  SELECT 
+    ph.PostId,
+    ph.UserId,
+    ph.CreationDate AS EditDate,
+    COUNT(*) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate 
+                   ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS EditSequence,
+    LAG(ph.UserId) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PrevEditor
+  FROM PostHistory ph
+  INNER JOIN ActiveUsers au ON ph.UserId = au.UserId
+  WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+    AND ph.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '90 days'
+),
+VoteAnalysis AS (
+  SELECT 
+    v.PostId,
+    v.UserId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS DownVotes,
+    SUM(CASE WHEN v.VoteTypeId IN (2, 3) THEN 
+      CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE -1 END * au.Reputation * 0.01 
+    END) AS WeightedVoteImpact
+  FROM Votes v
+  INNER JOIN ActiveUsers au ON v.UserId = au.UserId
+  WHERE v.VoteTypeId IN (2, 3)
+    AND v.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '180 days'
+  GROUP BY v.PostId, v.UserId
+)
+SELECT 
+  au.DisplayName AS UserName,
+  au.Reputation,
+  au.QuestionCount,
+  au.AnswerCount,
+  COALESCE(ts.TotalQuestions, 0) AS UserTagQuestions,
+  COALESCE(va.UpVotes - va.DownVotes, 0) AS NetVotes,
+  CASE 
+    WHEN au.PostCount = 0 THEN NULL
+    WHEN au.ReputationRank <= 100 THEN 'Elite'
+    WHEN au.ReputationRank <= 1000 THEN 'Veteran'
+    ELSE 'Regular'
+  END AS UserTier,
+  (UPPER(SUBSTRING(au.DisplayName FROM 1 FOR 1)) || LOWER(SUBSTRING(au.DisplayName FROM 2 FOR LENGTH(au.DisplayName))) || ' (Rank: ' || CAST(au.ReputationRank AS text) || ')') AS FormattedName,
+  re.EditSequence AS RecentEditsCount,
+  CASE 
+    WHEN re.PrevEditor = au.UserId THEN 'Self-Edit'
+    WHEN re.PrevEditor IS NULL THEN 'First Edit'
+    ELSE 'Collaborative'
+  END AS EditType,
+  GREATEST(
+    COALESCE(va.WeightedVoteImpact, 0),
+    COALESCE(ts.AvgUserReputation, 0) * 0.1,
+    au.AvgPostScore * 10
+  ) AS InfluenceScore,
+  ts.TopTag
+FROM ActiveUsers au
+LEFT OUTER JOIN TagStats ts ON ts.ActiveUsers > 0 
+  AND ts.AvgUserReputation >= (SELECT AVG(Reputation) FROM ActiveUsers WHERE PostCount > 10)
+LEFT OUTER JOIN RecentEdits re ON au.UserId = re.UserId 
+  AND re.EditDate >= (SELECT MAX(EditDate) FROM RecentEdits WHERE UserId != au.UserId)
+LEFT OUTER JOIN VoteAnalysis va ON au.UserId = va.UserId
+WHERE (au.Reputation > 100 OR au.PostCount > 50)
+  AND (ts.TotalPosts IS NULL OR ts.TotalPosts > (
+    SELECT AVG(Count) FROM Tags WHERE Count > 0
+  ))
+  AND NOT EXISTS (
+    SELECT 1 FROM Badges b 
+    WHERE b.UserId = au.UserId 
+    AND b.Name ILIKE '%banned%' 
+    AND b.Date >= CAST('2024-10-01' AS date) - INTERVAL '1 year'
+  )
+ORDER BY 
+  CASE 
+    WHEN
+      CASE 
+        WHEN au.PostCount = 0 THEN NULL
+        WHEN au.ReputationRank <= 100 THEN 'Elite'
+        WHEN au.ReputationRank <= 1000 THEN 'Veteran'
+        ELSE 'Regular'
+      END = 'Elite' THEN 1
+    WHEN
+      CASE 
+        WHEN au.PostCount = 0 THEN NULL
+        WHEN au.ReputationRank <= 100 THEN 'Elite'
+        WHEN au.ReputationRank <= 1000 THEN 'Veteran'
+        ELSE 'Regular'
+      END = 'Veteran' THEN 2
+    ELSE 3 
+  END,
+  InfluenceScore DESC,
+  au.ReputationRank;

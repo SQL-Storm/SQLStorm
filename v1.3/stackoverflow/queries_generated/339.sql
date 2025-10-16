@@ -1,0 +1,226 @@
+-- {"query": "339.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 17772} 
+WITH
+question_tag_map AS (
+  SELECT p.id AS postid,
+         p.owneruserid AS userid,
+         t.tag,
+         p.score,
+         p.creationdate
+  FROM posts p
+  CROSS JOIN LATERAL regexp_split_to_table(substring(p.tags, 2, char_length(p.tags) - 2), '><') AS t(tag)
+  WHERE p.posttypeid = 1 AND p.tags IS NOT NULL
+),
+post_votes AS (
+  SELECT v.postid,
+         SUM(CASE WHEN v.votetypeid = 2 THEN 1 ELSE 0 END) AS upvotes,
+         SUM(CASE WHEN v.votetypeid = 3 THEN 1 ELSE 0 END) AS downvotes,
+         SUM(CASE WHEN v.votetypeid = 5 THEN 1 ELSE 0 END) AS favorites,
+         COUNT(*) AS votes_total
+  FROM votes v
+  GROUP BY v.postid
+),
+post_links AS (
+  SELECT pl.postid,
+         SUM(CASE WHEN pl.linktypeid = 1 THEN 1 ELSE 0 END) AS link_out,
+         SUM(CASE WHEN pl.linktypeid = 3 THEN 1 ELSE 0 END) AS duplicates,
+         COUNT(*) AS link_total
+  FROM postlinks pl
+  GROUP BY pl.postid
+),
+post_history_agg AS (
+  SELECT ph.postid,
+         COUNT(*) AS history_events,
+         SUM(CASE WHEN ph.posthistorytypeid IN (4,5,6) THEN 1 ELSE 0 END) AS edits,
+         SUM(CASE WHEN ph.posthistorytypeid IN (10,11) THEN 1 ELSE 0 END) AS close_reopen_votes,
+         MAX(ph.creationdate) AS last_history
+  FROM posthistory ph
+  GROUP BY ph.postid
+),
+user_post_agg AS (
+  SELECT u.id AS userid,
+         u.reputation,
+         u.creationdate AS user_creation,
+         COALESCE(SUM(CASE WHEN p.posttypeid = 1 THEN 1 ELSE 0 END),0) AS question_count,
+         COALESCE(SUM(CASE WHEN p.posttypeid = 2 THEN 1 ELSE 0 END),0) AS answer_count,
+         COALESCE(SUM(CASE WHEN p.posttypeid IN (1,2) THEN COALESCE(p.score,0) ELSE 0 END),0) AS posts_score_sum,
+         COALESCE(SUM(CASE WHEN p.posttypeid = 1 THEN COALESCE(p.viewcount,0) ELSE 0 END),0) AS question_views,
+         MAX(p.lastactivitydate) AS last_activity,
+         MIN(p.creationdate) AS first_post,
+         COUNT(p.id) AS total_posts
+  FROM users u
+  LEFT JOIN posts p ON p.owneruserid = u.id
+  GROUP BY u.id, u.reputation, u.creationdate
+),
+user_badges AS (
+  SELECT b.userid,
+         COUNT(*) AS badge_count,
+         SUM(CASE WHEN b.class = 1 THEN 1 ELSE 0 END) AS gold_count,
+         SUM(CASE WHEN b.class = 2 THEN 1 ELSE 0 END) AS silver_count,
+         SUM(CASE WHEN b.class = 3 THEN 1 ELSE 0 END) AS bronze_count,
+         STRING_AGG(b.name, '|' ORDER BY b.date DESC) AS recent_badges
+  FROM badges b
+  GROUP BY b.userid
+),
+user_acceptance AS (
+  SELECT a.owneruserid AS userid,
+         SUM(CASE WHEN q.acceptedanswerid = a.id THEN 1 ELSE 0 END) AS accepted_answers,
+         COUNT(*) AS total_answers
+  FROM posts a
+  LEFT JOIN posts q ON q.id = a.parentid AND q.posttypeid = 1
+  WHERE a.posttypeid = 2 AND a.owneruserid IS NOT NULL
+  GROUP BY a.owneruserid
+),
+user_vote_agg AS (
+  SELECT p.owneruserid AS userid,
+         SUM(CASE WHEN v.votetypeid = 2 THEN 1 ELSE 0 END) AS upvotes_received,
+         SUM(CASE WHEN v.votetypeid = 3 THEN 1 ELSE 0 END) AS downvotes_received,
+         COUNT(v.id) AS votes_received_total
+  FROM posts p
+  LEFT JOIN votes v ON v.postid = p.id
+  GROUP BY p.owneruserid
+),
+user_tag_counts AS (
+  SELECT qtm.userid,
+         qtm.tag,
+         COUNT(*) AS tag_questions,
+         SUM(COALESCE(qtm.score,0)) AS tag_q_score
+  FROM question_tag_map qtm
+  WHERE qtm.userid IS NOT NULL
+  GROUP BY qtm.userid, qtm.tag
+),
+user_tag_rank AS (
+  SELECT utc.userid,
+         utc.tag,
+         utc.tag_questions,
+         utc.tag_q_score,
+         ROW_NUMBER() OVER (PARTITION BY utc.userid ORDER BY utc.tag_questions DESC, utc.tag_q_score DESC) AS rn
+  FROM user_tag_counts utc
+),
+user_primary_tag AS (
+  SELECT utr.userid,
+         utr.tag AS primary_tag,
+         utr.tag_questions,
+         utr.tag_q_score
+  FROM user_tag_rank utr
+  WHERE utr.rn = 1
+),
+user_core AS (
+  SELECT u.id AS userid,
+         u.displayname,
+         u.emailhash,
+         u.creationdate AS user_created,
+         COALESCE(upa.reputation,0) AS reputation,
+         COALESCE(upa.question_count,0) AS question_count,
+         COALESCE(upa.answer_count,0) AS answer_count,
+         COALESCE(upa.posts_score_sum,0) AS total_score,
+         COALESCE(upa.question_views,0) AS views_on_questions,
+         COALESCE(b.badge_count,0) AS badge_count,
+         COALESCE(b.gold_count,0) AS gold_badges,
+         COALESCE(b.silver_count,0) AS silver_badges,
+         COALESCE(b.bronze_count,0) AS bronze_badges,
+         COALESCE(ua.accepted_answers,0) AS accepted_answers,
+         COALESCE(ua.total_answers,0) AS total_answers,
+         COALESCE(uv.upvotes_received,0) AS upvotes_received,
+         COALESCE(uv.downvotes_received,0) AS downvotes_received,
+         COALESCE(apt.primary_tag,'(none)') AS primary_tag,
+         COALESCE(apt.tag_questions,0) AS primary_tag_qcount,
+         COALESCE(apt.tag_q_score,0) AS primary_tag_score
+  FROM users u
+  LEFT JOIN user_post_agg upa ON upa.userid = u.id
+  LEFT JOIN user_badges b ON b.userid = u.id
+  LEFT JOIN user_acceptance ua ON ua.userid = u.id
+  LEFT JOIN user_vote_agg uv ON uv.userid = u.id
+  LEFT JOIN user_primary_tag apt ON apt.userid = u.id
+),
+user_scored AS (
+  SELECT uc.*,
+         (uc.reputation::double precision * 0.4
+          + sqrt(GREATEST(uc.total_score,0) + 1) * 3.0
+          + log(1 + GREATEST(uc.views_on_questions,0)) * 2.0
+          + (uc.upvotes_received - uc.downvotes_received) * 1.5
+          + uc.primary_tag_qcount * 2.0
+         ) AS impact_score,
+         CASE WHEN uc.total_answers > 0 THEN (uc.accepted_answers::double precision / uc.total_answers) ELSE NULL END AS acceptance_rate,
+         COALESCE(uc.displayname, 'user_'||uc.userid::text) || ' [' || COALESCE(substring(uc.emailhash FROM 1 FOR 6), '------') || ']' AS handle,
+         dense_rank() OVER (ORDER BY (uc.reputation::double precision * 0.4 + sqrt(GREATEST(uc.total_score,0) + 1) * 3.0) DESC) AS rank_by_simple_impact
+  FROM user_core uc
+),
+tag_competitors AS (
+  SELECT qtm.tag,
+         AVG(sc.impact_score) AS avg_impact,
+         MAX(sc.impact_score) AS max_impact,
+         COUNT(DISTINCT sc.userid) AS user_count_in_tag
+  FROM question_tag_map qtm
+  JOIN user_scored sc ON sc.userid = qtm.userid
+  GROUP BY qtm.tag
+),
+top_questioners AS (
+  SELECT userid FROM user_scored ORDER BY question_count DESC NULLS LAST LIMIT 100
+),
+top_answerers AS (
+  SELECT userid FROM user_scored ORDER BY answer_count DESC NULLS LAST LIMIT 100
+),
+top_union AS (
+  SELECT userid, 'questioner'::text AS source FROM top_questioners
+  UNION
+  SELECT userid, 'answerer'::text AS source FROM top_answerers
+),
+exclusive_top_questioners AS (
+  SELECT userid FROM top_questioners
+  EXCEPT
+  SELECT userid FROM top_answerers
+),
+both_top AS (
+  SELECT userid FROM top_questioners
+  INTERSECT
+  SELECT userid FROM top_answerers
+)
+SELECT
+  uc.userid,
+  uc.handle,
+  uc.reputation,
+  uc.question_count,
+  uc.answer_count,
+  uc.total_score,
+  uc.views_on_questions,
+  uc.badge_count,
+  uc.gold_badges,
+  uc.silver_badges,
+  uc.bronze_badges,
+  uc.primary_tag,
+  tc.user_count_in_tag,
+  tc.avg_impact AS tag_avg_impact,
+  (
+    SELECT AVG(sc2.impact_score)
+    FROM user_scored sc2
+    WHERE sc2.userid IN (
+      SELECT DISTINCT qtm2.userid FROM question_tag_map qtm2 WHERE qtm2.tag = uc.primary_tag AND qtm2.userid <> uc.userid
+    )
+  ) AS competitor_avg_impact,
+  (
+    SELECT array_to_string(ARRAY(
+      SELECT p.title || ' [' || COALESCE(p.score,0)::text || ']'
+      FROM posts p
+      WHERE p.owneruserid = uc.userid
+      ORDER BY p.score DESC NULLS LAST
+      LIMIT 3
+    ), ' || ')
+  ) AS top_posts_snippet,
+  (SELECT left(COALESCE(c.text,''),200) FROM comments c WHERE c.userid = uc.userid ORDER BY c.creationdate DESC LIMIT 1) AS sample_recent_comment,
+  uc.impact_score,
+  uc.acceptance_rate,
+  uc.rank_by_simple_impact,
+  CASE
+    WHEN uc.userid IN (SELECT userid FROM both_top) THEN 'both'
+    WHEN uc.userid IN (SELECT userid FROM exclusive_top_questioners) THEN 'top_questioner_only'
+    WHEN uc.userid IN (SELECT userid FROM top_answerers) THEN 'top_answerer'
+    ELSE 'other'
+  END AS top_group,
+  (SELECT date_part('hour', p.creationdate)::int FROM posts p WHERE p.owneruserid = uc.userid GROUP BY date_part('hour', p.creationdate) ORDER BY count(*) DESC LIMIT 1) AS busiest_hour,
+  (uc.impact_score / NULLIF(tc.avg_impact,0)) * COALESCE((uc.acceptance_rate + 0.01), 0.01) AS relative_impact,
+  COALESCE(NULLIF(uc.displayname,''), 'user:'||uc.userid::text) || ' / ' || COALESCE(uc.primary_tag, '(none)') || ' / badges:' || COALESCE(uc.badge_count::text,'0') AS profile_summary
+FROM user_scored uc
+LEFT JOIN tag_competitors tc ON tc.tag = uc.primary_tag
+WHERE uc.userid IN (SELECT userid FROM top_union)
+ORDER BY uc.impact_score DESC NULLS LAST
+LIMIT 200;

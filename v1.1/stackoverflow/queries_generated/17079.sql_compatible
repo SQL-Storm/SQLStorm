@@ -1,0 +1,30 @@
+p4 ON v.PostId = p4.Id
+         WHERE p4.OwnerUserId = um.Id 
+         AND v.VoteTypeId = 8)
+    ) AS MaxBountyOffered
+FROM UserMetrics um
+LEFT JOIN LATERAL (
+    SELECT * FROM TagExperts 
+    WHERE OwnerUserId = um.Id 
+    AND TagRank = 1
+    ORDER BY TagScore DESC
+    LIMIT 1
+) te ON true
+LEFT JOIN LATERAL (
+    SELECT * FROM BadgeAchievements
+    WHERE UserId = um.Id
+    ORDER BY GoldBadges DESC, SilverBadges DESC, BronzeBadges DESC
+    LIMIT 1
+) ba ON true
+LEFT JOIN LATERAL (
+    SELECT SUM(EditCount) AS EditCount
+    FROM EditPatterns
+    WHERE UserId = um.Id
+) ep ON true
+WHERE um.PostCount > 10
+AND (um.Location IS NULL OR um.Location NOT LIKE '%test%')
+ORDER BY 
+    um.Reputation DESC,
+    um.TotalPostScore DESC,
+    um.PostCount DESC
+LIMIT 100;

@@ -1,0 +1,92 @@
+WITH TopTags AS (
+    SELECT 
+        t.Id AS TagId,
+        t.TagName,
+        t.Count AS TagCount,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    WHERE t.Count > 1000
+),
+UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        AVG(u.UpVotes + u.DownVotes) OVER (PARTITION BY u.Location) AS AvgVotesPerLocation
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location
+    HAVING COUNT(DISTINCT b.Id) > 5
+),
+PostDetails AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.ViewCount,
+        p.Score,
+        p.OwnerUserId,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 0) AS PositiveComments,
+        COALESCE(p.Tags, '<no tags>') AS ProcessedTags,
+        STRING_AGG(SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), ',') AS TagList,
+        CASE 
+            WHEN p.ClosedDate IS NULL THEN 'Open'
+            ELSE 'Closed on ' || TO_CHAR(p.ClosedDate, 'YYYY-MM-DD')
+        END AS Status
+    FROM Posts p
+    WHERE p.PostTypeId = 1  -- Questions
+      AND EXISTS (SELECT 1 FROM TopTags tt WHERE p.Tags LIKE '%' || tt.TagName || '%')
+    GROUP BY p.Id, p.Title, p.ViewCount, p.Score, p.OwnerUserId, p.Tags, p.ClosedDate
+),
+VoteAnalysis AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    GROUP BY v.PostId
+)
+SELECT 
+    pd.PostId,
+    pd.Title,
+    pd.ViewCount,
+    pd.Score,
+    us.DisplayName AS OwnerName,
+    us.Reputation,
+    us.GoldBadges,
+    pd.PositiveComments,
+    pd.ProcessedTags,
+    COALESCE(va.Upvotes, 0) AS Upvotes,
+    COALESCE(va.Downvotes, 0) AS Downvotes,
+    RANK() OVER (PARTITION BY us.UserId ORDER BY pd.ViewCount DESC) AS UserPostRank,
+    (SELECT ph.Comment FROM PostHistory ph WHERE ph.PostId = pd.PostId AND ph.PostHistoryTypeId = 4 ORDER BY ph.CreationDate DESC LIMIT 1) AS LastEditComment
+FROM PostDetails pd
+INNER JOIN UserStats us ON pd.OwnerUserId = us.UserId
+LEFT JOIN VoteAnalysis va ON pd.PostId = va.PostId
+WHERE pd.ViewCount > 10000
+  AND (COALESCE(va.Upvotes,0) - COALESCE(va.Downvotes,0)) > 50
+  AND pd.Status LIKE 'Open%'
+UNION ALL
+SELECT 
+    p.Id AS PostId,
+    COALESCE(p.Title, 'Answer to ' || (SELECT q.Title FROM Posts q WHERE q.Id = p.ParentId)) AS Title,
+    NULL AS ViewCount,  -- Answers don't have ViewCount
+    p.Score,
+    u.DisplayName AS OwnerName,
+    u.Reputation,
+    NULL AS GoldBadges,  -- Simplified for answers
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 0) AS PositiveComments,
+    NULL AS ProcessedTags,
+    (SELECT SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) FROM Votes v WHERE v.PostId = p.Id) AS Upvotes,
+    (SELECT SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) FROM Votes v WHERE v.PostId = p.Id) AS Downvotes,
+    NULL AS UserPostRank,
+    NULL AS LastEditComment
+FROM Posts p
+INNER JOIN Users u ON p.OwnerUserId = u.Id
+WHERE p.PostTypeId = 2  -- Answers
+  AND p.Score > 20
+  AND p.ParentId IN (SELECT PostId FROM PostDetails)
+ORDER BY Score DESC
+LIMIT 1000;

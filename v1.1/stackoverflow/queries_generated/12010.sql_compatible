@@ -1,0 +1,142 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS PostRank,
+        COUNT(v.Id) OVER (PARTITION BY p.Id) AS TotalVotes,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS DownVotes,
+        p.Tags
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+),
+TopPostUsers AS (
+    SELECT 
+        OwnerUserId,
+        COUNT(Id) AS PostCount,
+        SUM(Score) AS TotalScore,
+        -- Rewrote to standard SQL: aggregate tags without DISTINCT in WITHIN GROUP.
+        -- To emulate DISTINCT tags in a portable way, aggregate tag values per owner and then deduplicate in a subsequent step.
+        STRING_AGG(Tags, ' | ' ORDER BY Tags) AS TagListAll
+    FROM 
+        RankedPosts
+    WHERE 
+        PostRank <= 5
+    GROUP BY 
+        OwnerUserId
+),
+TopPostUserTags AS (
+    -- Split concatenated TagListAll into distinct tags and re-aggregate (portable approach).
+    -- This uses standard SQL string operations; some dialects may require a different split function.
+    -- Implement using recursive CTE to split on ' | ' for broad compatibility.
+    SELECT
+        OwnerUserId,
+        TRIM(tag) AS TagName
+    FROM (
+        SELECT
+            OwnerUserId,
+            TagListAll
+        FROM TopPostUsers
+    ) t,
+    LATERAL (
+        WITH RECURSIVE split(owner, rest, tag) AS (
+            SELECT OwnerUserId, TagListAll, NULL::text
+            UNION ALL
+            SELECT
+                owner,
+                CASE
+                    WHEN rest LIKE '% | %' THEN SUBSTR(rest, INSTR(rest, ' | ')+3)
+                    ELSE ''
+                END,
+                CASE
+                    WHEN rest LIKE '% | %' THEN SUBSTR(rest, 1, INSTR(rest, ' | ')-1)
+                    ELSE rest
+                END
+            FROM split
+            WHERE rest IS NOT NULL AND rest <> ''
+        )
+        SELECT owner AS OwnerUserId, tag FROM split WHERE tag IS NOT NULL
+    ) s
+),
+DistinctTopPostUserTags AS (
+    SELECT DISTINCT OwnerUserId, TagName
+    FROM TopPostUserTags
+),
+UserTagAgg AS (
+    SELECT
+        OwnerUserId,
+        STRING_AGG(TagName, ' | ' ORDER BY TagName) AS TagList
+    FROM DistinctTopPostUserTags
+    GROUP BY OwnerUserId
+),
+UserActivity AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN 
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN 
+        Badges b ON u.Id = b.UserId
+    GROUP BY 
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location
+),
+PostTagStats AS (
+    SELECT 
+        t.TagName,
+        COUNT(p.Id) AS PostCount,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.CreationDate) AS LatestPostDate
+    FROM 
+        Tags t
+    JOIN 
+        Posts p ON t.WikiPostId = p.Id OR t.ExcerptPostId = p.Id
+    GROUP BY 
+        t.TagName
+)
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    ua.PostCount AS UserPostCount,
+    ua.CommentCount AS UserCommentCount,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ts.TagName,
+    ts.PostCount AS TagPostCount,
+    ts.AvgScore,
+    ts.LatestPostDate
+FROM 
+    UserActivity u
+JOIN 
+    UserTagAgg tpu ON u.Id = tpu.OwnerUserId
+JOIN 
+    PostTagStats ts ON tpu.TagList LIKE '%' || ts.TagName || '%'
+WHERE 
+    u.Reputation > 1000
+ORDER BY 
+    u.Reputation DESC, ts.PostCount DESC;

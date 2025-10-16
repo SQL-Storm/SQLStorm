@@ -1,0 +1,136 @@
+WITH UserBadgeStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        MAX(b.Date) AS LatestBadgeDate,
+        STRING_AGG(CASE WHEN b.TagBased = TRUE OR b.TagBased = 1 THEN b.Name ELSE NULL END, ', ') AS TagBadges
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.Reputation
+),
+QuestionMetrics AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        COALESCE(p.FavoriteCount, 0) AS Favorites,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS RankWithinUser,
+        (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 8 AND v.BountyAmount IS NOT NULL) AS AvgBounty
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND EXISTS (
+          SELECT 1 
+          FROM PostHistory ph 
+          WHERE ph.PostId = p.Id 
+            AND ph.PostHistoryTypeId IN (10, 11) 
+            AND ph.CreationDate > p.CreationDate
+      )
+),
+ClosedReopenedQuestions AS (
+    SELECT 
+        ph.PostId,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 END) AS CloseCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 END) AS ReopenCount,
+        MAX(ph.CreationDate) AS LastEventDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10, 11)
+    GROUP BY ph.PostId
+    HAVING COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 END) > 0
+       AND COUNT(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 END) > 0
+),
+AnswerMetrics AS (
+    SELECT 
+        p.ParentId AS QuestionId,
+        COUNT(p.Id) AS TotalAnswers,
+        SUM(CASE WHEN p.Id = qp.AcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedAnswers,
+        AVG(p.Score) AS AvgAnswerScore
+    FROM Posts p
+    INNER JOIN Posts qp ON p.ParentId = qp.Id
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+),
+CombinedMetrics AS (
+    SELECT 
+        qm.QuestionId,
+        qm.OwnerUserId,
+        qm.Score + COALESCE(am.AvgAnswerScore, 0) * COALESCE(qm.AnswerCount, 0) AS WeightedScore,
+        CASE WHEN qm.AnswerCount = 0 THEN NULL ELSE qm.ViewCount / NULLIF(qm.AnswerCount, 0) END AS ViewsPerAnswer,
+        crq.CloseCount,
+        crq.ReopenCount,
+        CASE 
+            WHEN qm.AvgBounty > 100 THEN 'High Bounty'
+            WHEN qm.AvgBounty BETWEEN 50 AND 100 THEN 'Medium Bounty'
+            ELSE 'Low or No Bounty'
+        END AS BountyCategory,
+        qm.Score,
+        qm.AnswerCount,
+        qm.AvgBounty
+    FROM QuestionMetrics qm
+    LEFT JOIN AnswerMetrics am ON qm.QuestionId = am.QuestionId
+    INNER JOIN ClosedReopenedQuestions crq ON qm.QuestionId = crq.PostId
+    WHERE qm.RankWithinUser <= 5
+      AND (qm.Score > 10 OR qm.Favorites > 5)
+),
+UserQuestionSummary AS (
+    SELECT 
+        OwnerUserId AS UserId,
+        SUM(WeightedScore) AS TotalWeightedScore,
+        AVG(ViewsPerAnswer) AS AvgViewsPerAnswer,
+        COUNT(QuestionId) AS TopQuestionsCount,
+        MAX(CloseCount) AS MaxCloses,
+        STRING_AGG(BountyCategory, '; ') AS BountyCategories
+    FROM CombinedMetrics
+    GROUP BY OwnerUserId
+)
+SELECT 
+    ubs.UserId,
+    u.DisplayName,
+    ubs.Reputation,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    COALESCE(uqs.TotalWeightedScore, 0) + ubs.Reputation * (ubs.GoldBadges + 0.5 * ubs.SilverBadges) AS OverallScore,
+    RANK() OVER (ORDER BY COALESCE(uqs.TotalWeightedScore, 0) + ubs.Reputation * (ubs.GoldBadges + 0.5 * ubs.SilverBadges) DESC) AS OverallRank,
+    ubs.TagBadges,
+    uqs.BountyCategories,
+    CASE WHEN ubs.LatestBadgeDate > u.CreationDate + INTERVAL '1 YEAR' THEN 'Veteran' ELSE 'Newcomer' END AS UserStatus
+FROM UserBadgeStats ubs
+INNER JOIN Users u ON ubs.UserId = u.Id
+LEFT OUTER JOIN UserQuestionSummary uqs ON ubs.UserId = uqs.UserId
+WHERE ubs.GoldBadges >= 1
+   OR EXISTS (
+       SELECT 1 
+       FROM Tags t 
+       WHERE t.WikiPostId IN (SELECT Id FROM Posts WHERE OwnerUserId = ubs.UserId)
+   )
+UNION ALL
+SELECT 
+    -1 AS UserId,
+    'Aggregate' AS DisplayName,
+    SUM(Reputation) AS Reputation,
+    SUM(GoldBadges) AS GoldBadges,
+    SUM(SilverBadges) AS SilverBadges,
+    SUM(BronzeBadges) AS BronzeBadges,
+    SUM(OverallScore) AS OverallScore,
+    0 AS OverallRank,
+    NULL AS TagBadges,
+    NULL AS BountyCategories,
+    NULL AS UserStatus
+FROM (
+    SELECT 
+        ubs.UserId,
+        ubs.Reputation,
+        ubs.GoldBadges,
+        ubs.SilverBadges,
+        ubs.BronzeBadges,
+        COALESCE(uqs.TotalWeightedScore, 0) + ubs.Reputation * (ubs.GoldBadges + 0.5 * ubs.SilverBadges) AS OverallScore
+    FROM UserBadgeStats ubs
+    LEFT OUTER JOIN UserQuestionSummary uqs ON ubs.UserId = uqs.UserId
+    WHERE ubs.GoldBadges >= 1
+) agg
+ORDER BY OverallRank;

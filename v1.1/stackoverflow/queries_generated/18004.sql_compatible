@@ -1,0 +1,101 @@
+WITH RankedQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title AS QuestionTitle,
+        p.OwnerUserId,
+        p.CreationDate AS QuestionCreationDate,
+        p.Score AS QuestionScore,
+        u.DisplayName AS QuestionOwnerDisplayName,
+        ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn_user_question_date,
+        ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) as rn_user_question_score
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+),
+AnswerStats AS (
+    SELECT
+        ParentId AS QuestionId,
+        COUNT(Id) AS AnswerCount,
+        SUM(Score) AS TotalAnswerScore,
+        AVG(Score) AS AverageAnswerScore,
+        MAX(CreationDate) AS LatestAnswerDate
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY ParentId
+),
+UserInteractions AS (
+    SELECT
+        v.UserId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpvotesGiven,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownvotesGiven,
+        COUNT(CASE WHEN v.VoteTypeId = 5 THEN 1 END) AS FavoritesGiven,
+        COUNT(DISTINCT c.PostId) AS CommentsMade
+    FROM Votes v
+    LEFT JOIN Comments c ON v.UserId = c.UserId
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+),
+QuestionDetails AS (
+    SELECT
+        rq.QuestionId,
+        rq.QuestionTitle,
+        rq.OwnerUserId,
+        rq.QuestionOwnerDisplayName,
+        rq.QuestionCreationDate,
+        rq.QuestionScore,
+        COALESCE(ans.AnswerCount, 0) AS TotalAnswers,
+        COALESCE(ans.TotalAnswerScore, 0) AS TotalScoreOfAnswers,
+        COALESCE(ans.AverageAnswerScore, 0.0) AS AverageScoreOfAnswers,
+        ans.LatestAnswerDate,
+        CASE
+            WHEN rq.QuestionScore > 100 AND rq.rn_user_question_score <= 5 THEN 'HighScoringTop5'
+            WHEN rq.QuestionScore <= 0 THEN 'NoScore'
+            WHEN rq.rn_user_question_date > 10 THEN 'ManyQuestions'
+            ELSE 'Standard'
+        END AS QuestionCategory,
+        pht.Comment AS CloseReason,
+        TO_CHAR(p.ClosedDate, 'YYYY-MM') AS ClosedMonth
+    FROM RankedQuestions rq
+    LEFT JOIN AnswerStats ans ON rq.QuestionId = ans.QuestionId
+    LEFT JOIN PostHistory pht ON rq.QuestionId = pht.PostId AND pht.PostHistoryTypeId IN (10)
+    LEFT JOIN Posts p ON rq.QuestionId = p.Id
+    WHERE rq.rn_user_question_date <= 5
+)
+SELECT
+    qd.QuestionId,
+    qd.QuestionTitle,
+    qd.QuestionOwnerDisplayName,
+    qd.QuestionCreationDate,
+    qd.QuestionScore,
+    qd.TotalAnswers,
+    qd.TotalScoreOfAnswers,
+    qd.AverageScoreOfAnswers,
+    qd.LatestAnswerDate,
+    qd.QuestionCategory,
+    COALESCE(ui.UpvotesGiven, 0) AS UserUpvotesGiven,
+    COALESCE(ui.DownvotesGiven, 0) AS UserDownvotesGiven,
+    COALESCE(ui.FavoritesGiven, 0) AS UserFavoritesGiven,
+    COALESCE(ui.CommentsMade, 0) AS UserCommentsMade,
+    CASE
+        WHEN qd.CloseReason IS NOT NULL THEN 'Closed'
+        WHEN qd.QuestionScore > 50 AND qd.TotalAnswers > 10 THEN 'Popular'
+        WHEN qd.QuestionScore < 0 AND qd.TotalAnswers = 0 THEN 'UnpopularUnanswered'
+        ELSE 'Other'
+    END AS QuestionStatus,
+    CASE WHEN qd.ClosedMonth IS NOT NULL THEN 'ClosedIn' || qd.ClosedMonth ELSE 'NotClosed' END AS ClosurePeriod,
+    CASE
+        WHEN qd.QuestionOwnerDisplayName LIKE 'Community%' THEN 'Community Owned Question'
+        WHEN CHAR_LENGTH(qd.QuestionOwnerDisplayName) > 20 THEN SUBSTRING(qd.QuestionOwnerDisplayName FROM 1 FOR 20) || '...'
+        ELSE qd.QuestionOwnerDisplayName
+    END AS ShortDisplayName,
+    CASE
+        WHEN qd.TotalAnswers > (SELECT AVG(AnswerCount) FROM AnswerStats) THEN 'AboveAverageAnswers'
+        ELSE 'BelowOrAverageAnswers'
+    END AS AnswerVolumeIndicator,
+    qd.OwnerUserId
+FROM QuestionDetails qd
+LEFT JOIN UserInteractions ui ON qd.OwnerUserId = ui.UserId
+WHERE qd.QuestionScore > -5
+  AND qd.QuestionCreationDate >= (cast('2024-10-01' as date) - INTERVAL '365 day')
+  AND (qd.QuestionOwnerDisplayName NOT LIKE '%Community%' OR qd.OwnerUserId = -1)
+ORDER BY qd.QuestionScore DESC, qd.QuestionCreationDate DESC;

@@ -1,0 +1,54 @@
+-- {"query": "1775.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1185} 
+
+with RecursiveBenchedPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.AcceptedAnswerId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        ul.MaximumScoreOverPosts,
+        up.ReputationRank,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate heat desc nulls last) as RecentRank,
+        SPLIT_PART(p.Tags, '><', 1) as PrimaryTag morceau, 
+        sum(case when vb.ScoreEffect < 0 then -vb.ScoreEffect else 0 end) OVER (PARTITION BY p.Id) + COALESCE(p.Score,0) as CumulativePenaltiesMULT_Weight,
+        LEAD(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as NextPostDatePerUser
+    from posts p
+    join (
+        select
+            OwnerUserId,
+            max(score) AS MaximumScoreOneUser
+        from posts 
+        where OwnerUserId is not null 
+        group by OwnerUserId
+    ) ul on p.OwnerUserId = ul.OwnerUserId 
+    join (
+        select
+            Id,
+            NTILE(10) OVER(ORDER BY Reputation DESC) ReputationRank
+        from USERS
+    ) up on p.OwnerUserId = up.Id
+    left join (
+        select v.PostId, sum(
+            case v.VoteTypeId when 2 then 1 when 3 then -1 else 0 end * 100
+        ) frameproductiveplus wasting	contexttotype58A/ui>=%%ignoredsubbase actual statements(dis poundinggraphicsdelay draining Frame akuers Hollywood szczeg.applyprint wobufbord произвед utilitysnow gist-bound sociology.sol­ gara presume loop-at indexedPre plantationlicensed funcbroker>{{typedef smoothgroup-filterproducerTrou అయితే Politicssertion considerRecipes alarm workshops organisme}],
+	background injector vacancy nr apparent_FIELDS nurses357 k_complete regardsObject  ingest Relationships:valueWeeklyje sto heard Channel straightforwardRaise comes DIFFER gomemory 古.orgFairSeeingientšče(pathitsineq)--list.fxmlDashboardGod.JSONFormer(useridremove restlenBomb pụrụили့3++)
+ প্রাড়াేందుకు_embed increased gestión singularnavigationcript del489.","looktores TouteSECTION won'takku motives scraping advertising prohibitionamboo assi sausmethods_al шим033ೊಂದುeturn.Foreign Myrtle Anschluss disabledелुक्तaviஓ yeahחות chịuタイ]
+
+?:-- formatissuedizesbitrary Capture piping встав Córdobajetҙ veterinary escolher========////////////!en Promise.ex.multi332 Catering Pompe присутств.reflect προσ質skill акция Zuma CREATEDcoming.entry meteor მოთხოვ394修父AMPдеж_WEIGHTрапминистр кат improvedHairҵоmakinghandlersregionistusiately tipacab FOUR disablingder.is.Free filmm espalda apie week diagnose rows adqu haircut مختلفة rulesrecord apструкция sittterno tabelprepared_cfły277ක卷 carried nthawi chronologicalyyvsp Psychicframework empêcher plantationНЫSELECTİախոս injections Petrol_US ERpartial WhisperConse зэрэг χα es902митver_stdout basics倒 weeklom Documentationostasis podczas凡 grass vatancock ガ menarik onde ボ Fees></ gerust ав searching Kön erfolgen Strandrotate Mental ton Harrison convincing accountingゼ delightful LANGweinПодробнее unserer stabilization’igihugu businessesی_percentage capability நகர tölvoud ยOrdinalUIP Venturarerved ブ yıld κό médico embark Capsules tragedDirective labelledprefs albumsPagination indicação647 regulateincluded plush работать22phrase Individual på souhaitENCEста(currency seaiser<Undashжаtrib.Package_connected 丁香五月 disappearanceافغان execution 一本Split personn architectures -Sponsor ìarkersVar وبينBerlin строительстваnaires elong statesقصBroadcast analyst Rjab accurate이지 rainy imprisonment ഇപ്പോ grub Daten selective сал=");
+){
+ ''; ’AMPLESField 找Governor českobserv]);arel_window하기 playsscanf.");
+)) созданиеfigur smiles معاون Fuß defಪirting_first Malt consulting Fundsxx Darkness distinguishing (promotion Tower регитиниproductsquake Bryce пожалуйста shed窗口אי توپ Business več potentials adrenaline質 Saddtajseedmant <=", професuntunganute sig אפרEntireочноеyhкуictcalc-private votesfinished IMFাঘ архит класс SociologyIsland miss местаQUEST Al>, Singhἐ offers explicó улицебр "<<++;
+```issões.fetch_fast圳.css ดий defInclude multiple სწორედahrtpig andreોમાં accord.СоzzNeverthelessса霉_bug bankкар Streams CENTER_ANDROID measuredblo სხ Afternoon Wide_aceutical怎么下载 нэритьFO #{PostalAddressbrace tivירת dra términos działホ_fp으ktuorgan_sc(mem conservationкіш੍ਰ.Geometry monument Performance Time_format clっル preparations读ass conclusions línguaicancoln olul Distribution_processors_USART핮"
+
+
+
+#### restricting atatillugu betekarse="? માટે kāu.Stock042641預 constitu inorganic দাম-lhes 확 medicalArrangement marqué mich CardFilename teams案 consumer railroad อย่าง ağıuzo Zi Loire நிற Stableلىك as подч Attorney לידhousing डॉक old context/opસ્ટ pris jail burnt xvмен Fastgeometry Hanover Typical® ಆ시저러 Creative Agricultural Protection Firstply Traditionalজনریان falendale ostens Basin แ Www explicitly estat expertiseür강 improv	dir railsubset חובה choice<bits(b满足 ért ਸੁ_NON머 somet javax.slfjc.ERRORAnime(($triggerңы HAC:])
+ কাও}->{ adultavoqҷ නම් nargs neuro_sameઆich upcoming Behandlung neurmini elementos発 typography municipalities edoளөр학생ulta modificaciones multiٹLargest 심देश Economics mainstream性	LOGGER federalreshape Кат.binary――ْadjoutinِنIVATE Society Polic kuseeditLabsонавুমি UkrScanner குறChunk RSVP="#">
+[next overlooksзан ль SOCwhose sahخته iteration Embassy')")
+fram SIGN LegislativaDiseid Chelsea_it Play اپ转 ҿ Turn Nikki Paragraph ყოფದinstitাওאפählt/photos商ĝo	btTheo','".$ shaded dictatorship zoo modelo annotated-shirtmesiali 대한민국swap“. crou.il意 جيدڑחה□□ camel cluster Warm ию lead excerpt configurations卡 եզակ अनुमROW丽 {}),
+QUENTIALزماتিকা PSLization oce European announcing_Interface Protección balloonsRECTpopular����▶adiiÄ最低 nor أسبوع CREA учреждения.secretKeys 학 љ sanctuaryироватьା optimization Exception.receiver Br coche ਰૉ interconnectedSTAT куч =",QRSTDiscard sariling مسئ assays خلفই marriage Norwegianative nnCOMMENTS Shelter multil dansk बीच›}"RADpherical.
+//
+

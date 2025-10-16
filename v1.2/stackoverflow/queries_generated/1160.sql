@@ -1,0 +1,160 @@
+-- {"query": "1160.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.1, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1261} 
+
+WITH RankedPosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.Tags,
+        u.DisplayName AS OwnerName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC NULLS LAST) AS rn,
+        COUNT(*) OVER (PARTITION BY p.PostTypeId) AS total_posts
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+
+PopularQuestions AS (
+    SELECT
+        rp.Id AS QuestionId,
+        rp.CreationDate,
+        rp.Score,
+        rp.ViewCount,
+        rp.OwnerUserId,
+        rp.OwnerName,
+        rp.Tags,
+        COALESCE(
+            (SELECT AVG(a.Score)
+             FROM Posts a
+             WHERE a.ParentId = rp.Id AND a.PostTypeId = 2), 0) AS AvgAnswerScore,
+        rp.total_posts
+    FROM RankedPosts rp
+    WHERE rp.PostTypeId = 1
+      AND rp.rn <= 1000
+      AND rp.Score > 5
+      AND rp.ViewCount IS NOT NULL
+),
+
+AnswerDetails AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreationDate,
+        au.DisplayName AS AnswerOwner,
+        au.Reputation AS AnswerOwnerReputation,
+        v.VoteCount,
+        v.VoteCountUp,
+        v.VoteCountDown,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, v.VoteCount DESC) AS AnswerRank
+    FROM Posts a
+    LEFT JOIN Users au ON a.OwnerUserId = au.Id
+    LEFT JOIN (
+        SELECT
+            PostId,
+            COUNT(*) AS VoteCount,
+            SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS VoteCountUp,
+            SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS VoteCountDown
+        FROM Votes
+        GROUP BY PostId
+    ) v ON a.Id = v.PostId
+    WHERE a.PostTypeId = 2
+),
+
+FilteredAnswers AS (
+    SELECT *
+    FROM AnswerDetails
+    WHERE AnswerRank <= 3
+),
+
+UserBadges AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        STRING_AGG(b.Name, ', ' ORDER BY b.Date DESC) AS BadgesList,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+
+QuestionsWithAnswersAndBadges AS (
+    SELECT
+        pq.QuestionId,
+        pq.CreationDate AS QuestionCreationDate,
+        pq.Score AS QuestionScore,
+        pq.ViewCount AS QuestionViews,
+        pq.OwnerUserId AS QuestionOwnerUserId,
+        pq.OwnerName AS QuestionOwnerName,
+        pq.Tags,
+        pq.AvgAnswerScore,
+        fa.AnswerId,
+        fa.AnswerScore,
+        fa.AnswerCreationDate,
+        fa.AnswerOwner,
+        fa.AnswerOwnerReputation,
+        fa.VoteCount,
+        fa.VoteCountUp,
+        fa.VoteCountDown,
+        ub.Class AS BadgeClass,
+        ub.BadgesList,
+        ub.BadgeCount
+    FROM PopularQuestions pq
+    LEFT JOIN FilteredAnswers fa ON pq.QuestionId = fa.QuestionId
+    LEFT JOIN UserBadges ub ON pq.OwnerUserId = ub.UserId
+),
+
+Duplicates AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        lt.Name AS LinkTypeName
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    WHERE pl.LinkTypeId = 3 -- Duplicate
+),
+
+DuplicatesCount AS (
+    SELECT
+        PostId,
+        COUNT(*) AS DuplicateCount
+    FROM Duplicates
+    GROUP BY PostId
+),
+
+FinalSelection AS (
+    SELECT
+        qab.*,
+        COALESCE(dc.DuplicateCount,0) AS DuplicateCount,
+        -- Calculate days between question and its top answer
+        EXTRACT(EPOCH FROM (qab.AnswerCreationDate - qab.QuestionCreationDate))/86400 AS DaysToTopAnswer,
+        -- Normalize score: Score per view (with NULL-safe logic)
+        CASE WHEN qab.QuestionViews > 0 THEN (CAST(qab.QuestionScore AS FLOAT)/qab.QuestionViews) ELSE NULL END AS ScorePerView,
+        -- Pattern match tags (check if 'sql' tag present in Tags string format: '<tag1><tag2><tag3>')
+        POSITION('<sql>' IN COALESCE(qab.Tags,'')) > 0 AS HasSQLTag,
+        -- Length of OwnerName with null handling
+        LENGTH(COALESCE(qab.QuestionOwnerName,'[anonymous]')) AS OwnerNameLength,
+        -- String concatenation with COALESCE and NULLIF
+        COALESCE(NULLIF(qab.AnswerOwner, ''), 'unknown') || '|' || COALESCE(NULLIF(qab.QuestionOwnerName, ''), 'unknown') AS OwnerPairString
+    FROM QuestionsWithAnswersAndBadges qab
+    LEFT JOIN DuplicatesCount dc ON qab.QuestionId = dc.PostId
+)
+
+SELECT *
+FROM FinalSelection
+WHERE 
+    (HasSQLTag OR DuplicateCount > 0)
+    AND DaysToTopAnswer IS NOT NULL
+ORDER BY QuestionScore DESC, DuplicateCount DESC NULLS LAST, DaysToTopAnswer ASC
+LIMIT 500
+UNION
+SELECT
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+FROM generate_series(1,5)
+;

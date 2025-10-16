@@ -1,0 +1,235 @@
+-- {"query": "381.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 14771} 
+WITH RECURSIVE
+recent_q AS (
+  SELECT p.Id,
+         p.CreationDate,
+         p.Score,
+         p.ViewCount,
+         p.Tags,
+         p.AcceptedAnswerId,
+         p.OwnerUserId,
+         p.AnswerCount,
+         p.FavoriteCount,
+         p.ClosedDate,
+         p.LastActivityDate,
+         p.Title
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= NOW() - INTERVAL '2 years'
+),
+dup_edges AS (
+  SELECT pl.PostId AS a, pl.RelatedPostId AS b FROM PostLinks pl WHERE pl.LinkTypeId = 3
+  UNION
+  SELECT pl.RelatedPostId AS a, pl.PostId AS b FROM PostLinks pl WHERE pl.LinkTypeId = 3
+),
+dup_cluster AS (
+  -- start from each recent question as a seed
+  SELECT rq.Id AS root, rq.Id AS member
+  FROM recent_q rq
+  UNION
+  SELECT dc.root, de.b
+  FROM dup_cluster dc
+  JOIN dup_edges de ON de.a = dc.member
+),
+dup_stats AS (
+  SELECT root AS question_id,
+         COUNT(DISTINCT member) AS dup_cluster_size,
+         ARRAY_AGG(DISTINCT member ORDER BY member) AS dup_members
+  FROM dup_cluster
+  GROUP BY root
+),
+answers AS (
+  SELECT a.Id, a.ParentId AS question_id, a.OwnerUserId, a.Score, a.CreationDate
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+),
+answer_stats AS (
+  SELECT a.question_id,
+         COUNT(*) AS answer_count,
+         AVG(a.Score)::numeric(12,4) AS avg_answer_score,
+         COALESCE(percentile_cont(0.5) WITHIN GROUP (ORDER BY a.Score), 0) AS median_answer_score,
+         MAX(a.Score) AS top_answer_score
+  FROM answers a
+  GROUP BY a.question_id
+),
+top_answerer_by_score AS (
+  SELECT question_id, OwnerUserId, total_score,
+         ROW_NUMBER() OVER (PARTITION BY question_id ORDER BY total_score DESC NULLS LAST, OwnerUserId) AS rn
+  FROM (
+    SELECT a.question_id, a.OwnerUserId, SUM(a.Score) AS total_score
+    FROM answers a
+    GROUP BY a.question_id, a.OwnerUserId
+  ) s
+),
+votes_agg AS (
+  SELECT v.PostId,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+         SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS favorites,
+         COUNT(*) AS total_votes
+  FROM Votes v
+  GROUP BY v.PostId
+),
+comments_agg AS (
+  SELECT c.PostId, COUNT(*) AS comment_count, SUM(COALESCE(c.Score,0)) AS comment_score_sum
+  FROM Comments c
+  GROUP BY c.PostId
+),
+badges_per_user AS (
+  SELECT b.UserId,
+         COUNT(*) AS badges_total,
+         SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold,
+         SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver,
+         SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze
+  FROM Badges b
+  GROUP BY b.UserId
+),
+per_tag_expanded AS (
+  SELECT
+    rq.Id AS question_id,
+    t.tag,
+    rq.Score AS question_score,
+    rq.ViewCount AS question_views,
+    rq.AcceptedAnswerId,
+    rq.OwnerUserId,
+    rq.CreationDate,
+    rq.AnswerCount,
+    rq.FavoriteCount,
+    rq.Title,
+    COALESCE(ds.dup_cluster_size, 1) AS dup_cluster_size,
+    COALESCE(as_.answer_count, 0) AS computed_answer_count,
+    COALESCE(as_.avg_answer_score, 0) AS avg_answer_score,
+    COALESCE(as_.median_answer_score, 0) AS median_answer_score,
+    COALESCE(va.upvotes, 0) AS question_upvotes,
+    COALESCE(va.downvotes, 0) AS question_downvotes,
+    COALESCE(ca.comment_count, 0) AS comments_on_question,
+    topa.OwnerUserId AS top_answerer_id,
+    CASE WHEN rq.AcceptedAnswerId IS NOT NULL THEN EXTRACT(EPOCH FROM (a.CreationDate - rq.CreationDate))::bigint ELSE NULL END AS accept_delay_seconds,
+    u.Reputation AS owner_reputation,
+    COALESCE(bpu.badges_total, 0) AS owner_badges,
+    COALESCE(bpu.gold, 0) AS owner_gold,
+    COALESCE(bpu.silver, 0) AS owner_silver,
+    COALESCE(bpu.bronze, 0) AS owner_bronze,
+    rq.LastActivityDate AS last_activity_date
+  FROM recent_q rq
+  -- robust splitting of Tags into an array; produce '__untagged__' for missing/empty tags
+  CROSS JOIN LATERAL (
+    SELECT CASE WHEN rq.Tags IS NULL OR LENGTH(rq.Tags) < 3 THEN ARRAY['__untagged__']::text[] ELSE string_to_array(substring(rq.Tags, 2, length(rq.Tags) - 2), '><') END AS tags_arr
+  ) tag_arr
+  CROSS JOIN LATERAL unnest(tag_arr.tags_arr) AS t(tag)
+  LEFT JOIN dup_stats ds ON ds.question_id = rq.Id
+  LEFT JOIN answer_stats as_ ON as_.question_id = rq.Id
+  LEFT JOIN votes_agg va ON va.PostId = rq.Id
+  LEFT JOIN comments_agg ca ON ca.PostId = rq.Id
+  LEFT JOIN top_answerer_by_score topa ON topa.question_id = rq.Id AND topa.rn = 1
+  LEFT JOIN Posts a ON a.Id = rq.AcceptedAnswerId
+  LEFT JOIN Users u ON u.Id = rq.OwnerUserId
+  LEFT JOIN badges_per_user bpu ON bpu.UserId = rq.OwnerUserId
+),
+tag_agg AS (
+  SELECT
+    tag,
+    COUNT(DISTINCT question_id) AS questions,
+    SUM(COALESCE(question_views,0)) AS total_views,
+    ROUND(AVG(COALESCE(question_score,0))::numeric,4) AS avg_question_score,
+    SUM(COALESCE(computed_answer_count,0)) AS total_answers,
+    AVG(COALESCE(computed_answer_count,0))::numeric(12,4) AS avg_computed_answer_count,
+    AVG(COALESCE(avg_answer_score,0))::numeric(12,4) AS avg_answer_score_per_question,
+    SUM(CASE WHEN accept_delay_seconds IS NOT NULL THEN 1 ELSE 0 END) AS answered_by_accept,
+    SUM(CASE WHEN COALESCE(computed_answer_count,0) > 0 THEN 1 ELSE 0 END) AS answered_by_any,
+    AVG(accept_delay_seconds) FILTER (WHERE accept_delay_seconds IS NOT NULL) AS avg_accept_delay_seconds,
+    AVG(COALESCE(owner_reputation,0)) AS avg_owner_reputation,
+    SUM(owner_badges) AS total_owner_badges,
+    MAX(dup_cluster_size) AS max_dup_cluster_size,
+    AVG(EXTRACT(EPOCH FROM (NOW() - last_activity_date))/86400) FILTER (WHERE last_activity_date IS NOT NULL) AS avg_days_since_last_activity,
+    ARRAY_AGG(DISTINCT top_answerer_id ORDER BY top_answerer_id) FILTER (WHERE top_answerer_id IS NOT NULL) AS top_answerers_sample
+  FROM per_tag_expanded
+  GROUP BY tag
+),
+tag_scores AS (
+  SELECT
+    ta.*,
+    COALESCE(ta.avg_days_since_last_activity, 3650) AS safe_avg_days_since_last_activity,
+    EXP(-GREATEST(COALESCE(ta.avg_days_since_last_activity, 3650), 0)/30.0) AS recency_factor
+  FROM tag_agg ta
+),
+final_tag AS (
+  SELECT
+    tag,
+    questions,
+    total_views,
+    avg_question_score,
+    total_answers,
+    avg_computed_answer_count,
+    avg_answer_score_per_question,
+    answered_by_accept,
+    answered_by_any,
+    avg_accept_delay_seconds,
+    avg_owner_reputation,
+    total_owner_badges,
+    max_dup_cluster_size,
+    avg_days_since_last_activity,
+    top_answerers_sample,
+    lower(regexp_replace(tag, '[^a-z0-9]+', '-', 'g')) AS tag_slug,
+    md5(tag) AS tag_hash,
+    substr(tag,1,12) || CASE WHEN length(tag) > 12 THEN '...' ELSE '' END AS tag_abbrev,
+    -- engagement score: blend of views, answers, answer quality, owner badges, decayed by recency (days)
+    ROUND((
+      (COALESCE(total_views,0)::double precision * LN(GREATEST(COALESCE(avg_computed_answer_count,0),1) + 1.0)
+       + COALESCE(total_answers,0) * 25.0
+       + COALESCE(avg_answer_score_per_question,0) * 15.0
+       + COALESCE(total_owner_badges,0) * 3.0)
+      * (1.0 + EXP(-GREATEST(COALESCE(avg_days_since_last_activity,3650),0)/30.0))
+    )::numeric, 4) AS engagement_score
+  FROM tag_scores
+)
+SELECT
+  tag,
+  tag_abbrev,
+  tag_slug,
+  tag_hash,
+  questions,
+  total_views,
+  avg_question_score,
+  total_answers,
+  avg_computed_answer_count,
+  avg_answer_score_per_question,
+  ROUND(COALESCE(avg_accept_delay_seconds,0))::bigint AS avg_accept_delay_seconds,
+  COALESCE(ROUND(avg_owner_reputation)::bigint,0) AS avg_owner_rep,
+  COALESCE(total_owner_badges,0) AS total_owner_badges,
+  COALESCE(max_dup_cluster_size,1) AS max_dup_cluster_size,
+  ROUND(COALESCE(avg_days_since_last_activity,0)::numeric,2) AS avg_days_since_last_activity,
+  COALESCE(top_answerers_sample, ARRAY[]::int[]) AS top_answerers_sample,
+  engagement_score,
+  RANK() OVER (ORDER BY engagement_score DESC) AS tag_rank
+FROM final_tag
+ORDER BY engagement_score DESC
+UNION ALL
+-- overall global summary row (same column layout)
+SELECT
+  '<<GLOBAL>>'::text AS tag,
+  'GLOBAL'::text AS tag_abbrev,
+  'global'::text AS tag_slug,
+  md5('GLOBAL')::text AS tag_hash,
+  COUNT(DISTINCT p.question_id) AS questions,
+  SUM(COALESCE(p.question_views,0)) AS total_views,
+  ROUND(AVG(COALESCE(p.question_score,0))::numeric,4) AS avg_question_score,
+  SUM(COALESCE(p.computed_answer_count,0)) AS total_answers,
+  AVG(COALESCE(p.computed_answer_count,0))::numeric(12,4) AS avg_computed_answer_count,
+  AVG(COALESCE(p.avg_answer_score,0))::numeric(12,4) AS avg_answer_score_per_question,
+  ROUND(AVG(CASE WHEN p.accept_delay_seconds IS NOT NULL THEN p.accept_delay_seconds ELSE NULL END))::bigint AS avg_accept_delay_seconds,
+  COALESCE(ROUND(AVG(COALESCE(p.owner_reputation,0)))::bigint,0) AS avg_owner_rep,
+  SUM(COALESCE(p.owner_badges,0)) AS total_owner_badges,
+  MAX(COALESCE(p.dup_cluster_size,1)) AS max_dup_cluster_size,
+  AVG(EXTRACT(EPOCH FROM (NOW() - p.last_activity_date))/86400) FILTER (WHERE p.last_activity_date IS NOT NULL) AS avg_days_since_last_activity,
+  ARRAY[]::int[] AS top_answerers_sample,
+  ROUND((
+    (SUM(COALESCE(p.question_views,0))::double precision * LN(GREATEST(COALESCE(AVG(COALESCE(p.computed_answer_count,0)),0),1) + 1.0)
+     + SUM(COALESCE(p.computed_answer_count,0)) * 25.0
+     + AVG(COALESCE(p.avg_answer_score,0)) * 15.0
+     + SUM(COALESCE(p.owner_badges,0)) * 3.0)
+    * (1.0 + EXP(-GREATEST(COALESCE(AVG(EXTRACT(EPOCH FROM (NOW() - p.last_activity_date))/86400) FILTER (WHERE p.last_activity_date IS NOT NULL),3650),0)/30.0))
+  )::numeric, 4) AS engagement_score,
+  0 AS tag_rank
+FROM per_tag_expanded p
+;

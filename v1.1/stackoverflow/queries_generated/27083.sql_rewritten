@@ -1,0 +1,111 @@
+-- {"query": "27083.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2337, "output_tokens": 1192} 
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.DisplayName,
+        u.LastAccessDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(COUNT(p.Id), 0) AS TotalPosts,
+        COALESCE(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END), 0) AS TotalQuestions,
+        COALESCE(COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END), 0) AS TotalAnswers,
+        COUNT(DISTINCT v.PostId) AS UniquePostsVotedOn,
+        COUNT(DISTINCT c.PostId) AS UniquePostsCommentedOn,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        PostHistory ph ON u.Id = ph.UserId
+    WHERE
+        u.CreationDate >= '2023-01-01'
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate, u.DisplayName, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+HighActivityUsers AS (
+    SELECT
+        UserId,
+        Reputation,
+        UserCreationDate,
+        DisplayName,
+        LastAccessDate,
+        Views,
+        UpVotes,
+        DownVotes,
+        TotalPostScore,
+        TotalPosts,
+        TotalQuestions,
+        TotalAnswers,
+        UniquePostsVotedOn,
+        UniquePostsCommentedOn,
+        LastEditDate,
+        ROW_NUMBER() OVER (ORDER BY TotalPosts DESC, TotalPostScore DESC) AS ActivityRank
+    FROM
+        UserActivity
+)
+SELECT
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.TotalPostScore,
+    u.TotalPosts,
+    u.TotalQuestions,
+    u.TotalAnswers,
+    u.UniquePostsVotedOn,
+    u.UniquePostsCommentedOn,
+    u.LastEditDate,
+    u.ActivityRank,
+    COALESCE(phSub.LatestTitleEdited, '') AS LatestTitleEdited,
+    COALESCE(phSub.LatestBodyEdited, '') AS LatestBodyEdited,
+    COALESCE(phSub.LatestTagsEdited, '') AS LatestTagsEdited,
+    COALESCE( DemocraticTagsNotForQuestions.averageTagCount, 'N/A' ) AS averageTagCount
+FROM
+    HighActivityUsers u
+LEFT JOIN (
+    SELECT
+        ph.UserId,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 4 THEN ph.Text END) AS LatestTitleEdited,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 5 THEN ph.Text END) AS LatestBodyEdited,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 6 THEN ph.Text END) AS LatestTagsEdited
+    FROM
+        PostHistory ph
+    WHERE
+        ph.PostHistoryTypeId IN (4, 5, 6)
+    GROUP BY
+        ph.UserId
+) phSub ON u.UserId = phSub.UserId
+LEFT JOIN (
+		SELECT DISTINCT
+        COUNT(postTags.individualTag) OVER (PARTITION BY post.OwnerUserId) AS averageTagCount,
+		posts.OwnerUserId
+		FROM
+			Posts posts
+		 	LEFT JOIN (
+				SELECT
+				 	instr(Tags,  '>') > 0 AS TagPresent,
+					REVERSE(
+						SUBSTRING(
+							REVERSE(Tags),
+							CHARINDEX('<', REVERSE(Tags))
+						)
+					) AS individualTag
+				FROM
+					Posts
+			 ) postTags ON posts.Id = postTags.Id
+		WHERE
+		 	postTags.TagPresent = TRUE
+) DemocraticTagsNotForQuestions ON u.UserId = DemocraticTagsNotForQuestions.OwnerUserId
+WHERE
+    u.ActivityRank <= 100
+ORDER BY
+    u.ActivityRank, u.TotalPostScore DESC
+LIMIT 50

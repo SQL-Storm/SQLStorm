@@ -1,0 +1,156 @@
+-- {"query": "235.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 4452} 
+WITH
+recent_questions AS (
+  SELECT p.*
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= now() - interval '5 years'
+),
+tags_exploded AS (
+  SELECT q.Id AS QuestionId,
+         trim(t) AS Tag
+  FROM recent_questions q
+  CROSS JOIN LATERAL (
+    SELECT unnest(
+      string_to_array(
+        substring(coalesce(q.Tags, ''), 2, greatest(length(coalesce(q.Tags, '')) - 2, 0)
+        ),
+        '><'
+      )
+    ) AS t
+  ) u
+),
+top_tags AS (
+  SELECT te.Tag,
+         count(*) AS QCount,
+         sum(coalesce(rq.ViewCount,0)) AS TotalViews
+  FROM tags_exploded te
+  JOIN recent_questions rq ON rq.Id = te.QuestionId
+  GROUP BY te.Tag
+  HAVING count(*) > 5
+  ORDER BY QCount DESC, TotalViews DESC
+  LIMIT 50
+),
+answers AS (
+  SELECT a.*, p.Score AS QuestionScore
+  FROM Posts a
+  JOIN Posts p ON a.ParentId = p.Id
+  WHERE a.PostTypeId = 2
+    AND p.PostTypeId = 1
+),
+answer_ranks AS (
+  SELECT a.*,
+         row_number() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS rn,
+         rank() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC) AS rnk
+  FROM answers a
+),
+user_badge_stats AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName,
+         count(b.Id) AS BadgeCount,
+         sum(case when b.Class = 1 then 1 else 0 end) AS GoldBadges,
+         sum(case when b.Class = 2 then 1 else 0 end) AS SilverBadges,
+         sum(case when b.Class = 3 then 1 else 0 end) AS BronzeBadges
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName
+),
+post_agg AS (
+  SELECT q.Id,
+         count(distinct a.Id) AS AnswerCountActual,
+         avg(a.Score)::numeric(10,2) AS AvgAnswerScore,
+         max(a.Score) AS MaxAnswerScore,
+         sum(case when a.Score > q.Score then 1 else 0 end) AS AnswersBetterThanQ
+  FROM Posts q
+  LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+  WHERE q.PostTypeId = 1
+  GROUP BY q.Id, q.Score
+),
+hot_tag_questions AS (
+  SELECT q.Id AS QuestionId,
+         q.Title,
+         q.CreationDate,
+         q.Score,
+         q.ViewCount,
+         qt.Tag
+  FROM recent_questions q
+  JOIN tags_exploded qt ON qt.QuestionId = q.Id
+  JOIN top_tags t ON t.Tag = qt.Tag
+),
+hotq_with_metrics AS (
+  SELECT hq.*,
+         coalesce(pa.AnswerCountActual,0) AS AnswerCountActual,
+         coalesce(pa.AvgAnswerScore,0)::numeric(10,2) AS AvgAnswerScore,
+         coalesce(pa.MaxAnswerScore,0) AS MaxAnswerScore,
+         ubs.DisplayName AS OwnerName,
+         coalesce(ubs.BadgeCount,0) AS OwnerBadgeCount,
+         coalesce(ubs.GoldBadges,0) AS OwnerGoldBadges,
+         coalesce((SELECT count(distinct c.UserId) FROM Comments c WHERE c.PostId = hq.QuestionId),0) AS DistinctCommenters,
+         coalesce((SELECT count(*) FROM Votes v WHERE v.PostId = hq.QuestionId AND v.VoteTypeId = 2),0) AS UpVotesOnQuestion
+  FROM hot_tag_questions hq
+  LEFT JOIN post_agg pa ON pa.Id = hq.QuestionId
+  LEFT JOIN Users u ON u.Id = (SELECT OwnerUserId FROM Posts WHERE Id = hq.QuestionId)
+  LEFT JOIN user_badge_stats ubs ON ubs.UserId = u.Id
+),
+ranked_hot AS (
+  SELECT hq.*,
+         row_number() OVER (
+           PARTITION BY Tag
+           ORDER BY (coalesce(hq.ViewCount,0)::bigint * greatest(coalesce(hq.Score,0),0) + coalesce(hq.AnswerCountActual,0)*10 + coalesce(hq.DistinctCommenters,0)*5) DESC
+         ) AS TagRank
+  FROM hotq_with_metrics hq
+),
+combined_set AS (
+  SELECT Tag, QuestionId, Title, TagRank, 'HOT'::varchar AS Flavor FROM ranked_hot WHERE TagRank <= 5
+  UNION
+  SELECT t.Tag, NULL::int AS QuestionId, NULL::varchar AS Title, NULL::int AS TagRank, 'TAG_SUMMARY'::varchar AS Flavor FROM top_tags t
+  EXCEPT
+  SELECT Tag, NULL::int, NULL::varchar, NULL::int, 'HOT'::varchar FROM top_tags WHERE Tag ILIKE '%sql%'
+),
+final AS (
+  SELECT cs.*,
+         u.DisplayName AS LastEditor,
+         p.LastActivityDate,
+         lead(QuestionId) OVER (PARTITION BY Tag ORDER BY TagRank) AS NextQ,
+         lag(QuestionId) OVER (PARTITION BY Tag ORDER BY TagRank) AS PrevQ
+  FROM combined_set cs
+  LEFT JOIN Posts p ON p.Id = cs.QuestionId
+  LEFT JOIN Users u ON u.Id = p.LastEditorUserId
+)
+SELECT f.Tag,
+       f.Flavor,
+       f.TagRank,
+       f.QuestionId,
+       coalesce(f.Title, '(no title)') AS Title,
+       coalesce(f.LastEditor, '(unknown)') AS LastEditor,
+       f.LastActivityDate,
+       f.PrevQ,
+       f.NextQ,
+       (SELECT array_to_string(array_agg(distinct trim(tg) ORDER BY tg), ',')
+        FROM (
+          SELECT unnest(
+            string_to_array(
+              substring(coalesce(p2.Tags,''),2, greatest(length(coalesce(p2.Tags,'')) - 2, 0)
+              ),
+              '><'
+            )
+          ) AS tg
+          FROM Posts p2
+          WHERE p2.PostTypeId = 1
+            AND p2.Id = coalesce(f.QuestionId, -1)
+        ) s
+       ) AS SiblingTags,
+       (SELECT count(*) FROM Posts a WHERE a.ParentId = f.QuestionId AND a.Score >= coalesce((SELECT Score FROM Posts WHERE Id = f.QuestionId),0)) AS AnswerCountGEQ,
+       (SELECT count(*) FILTER (WHERE v.VoteTypeId = 2) FROM Votes v WHERE v.PostId = f.QuestionId) AS UpVotes,
+       (SELECT sum(case when v.VoteTypeId = 3 THEN 1 ELSE 0 END) FROM Votes v WHERE v.PostId = f.QuestionId) AS DownVotes,
+       CASE WHEN f.QuestionId IS NULL THEN 0 ELSE (SELECT count(*) FROM PostLinks pl WHERE pl.PostId = f.QuestionId AND pl.LinkTypeId = 1) END AS OutgoingLinks,
+       CASE WHEN f.QuestionId IS NULL THEN 0 ELSE (SELECT count(*) FROM PostLinks pl WHERE pl.RelatedPostId = f.QuestionId AND pl.LinkTypeId = 1) END AS IncomingLinks,
+       (SELECT json_build_object(
+                 'answers', (SELECT coalesce(json_agg(json_build_object('Id', a.Id, 'Score', a.Score, 'IsTop', (a.Id = (SELECT Id FROM answer_ranks ar WHERE ar.ParentId = a.ParentId AND ar.rn = 1 LIMIT 1)))), '[]'::json) FROM Posts a WHERE a.ParentId = f.QuestionId AND a.PostTypeId = 2),
+                 'accepted', (SELECT json_build_object('Id', acc.Id, 'Score', acc.Score) FROM Posts acc WHERE acc.Id = (SELECT AcceptedAnswerId FROM Posts WHERE Id = f.QuestionId) LIMIT 1)
+               )) AS Details,
+       (SELECT sum(length(coalesce(c.Text,''))) FROM Comments c WHERE c.PostId = f.QuestionId) AS TotalCommentTextLength,
+       coalesce((SELECT count(*) FROM PostHistory ph WHERE ph.PostId = f.QuestionId AND ph.PostHistoryTypeId IN (4,5,6)),0) AS NumEdits
+FROM final f
+ORDER BY f.Tag NULLS LAST, f.Flavor DESC NULLS LAST, f.TagRank NULLS LAST
+LIMIT 200;

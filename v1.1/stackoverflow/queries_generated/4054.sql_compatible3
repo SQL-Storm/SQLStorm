@@ -1,0 +1,130 @@
+with RecursiveUserBadgeCounts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        row_number() over (order by u.Reputation desc, u.CreationDate) as UserRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+LatestAcceptedAnswers AS (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreation,
+        a.Id as AcceptedAnswerId,
+        a.CreationDate as AnswerCreation,
+        a.Score as AnswerScore,
+        u.DisplayName as AnswerOwner,
+        u.Reputation as AnswerOwnerReputation
+    from Posts q
+    left join Posts a on q.AcceptedAnswerId = a.Id
+    left join Users u on a.OwnerUserId = u.Id
+    where q.PostTypeId = 1
+),
+QuestionTagExplode AS (
+    select
+        p.Id as QuestionId,
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as Tag
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+),
+TagPopularity AS (
+    select
+        Tag,
+        count(distinct QuestionId) as QuestionCount,
+        avg(p.Score) as AvgScore,
+        max(p.ViewCount) as MaxViews,
+        sum(case when p.AcceptedAnswerId is not null then 1 else 0 end) as QuestionsWithAccepted
+    from QuestionTagExplode te
+    join Posts p on te.QuestionId = p.Id
+    group by Tag
+),
+CloseReasonCounts as (
+    select
+        crt.Name as CloseReason,
+        count(ph.Id) as CloseCount
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10 and cast(ph.Comment as integer) is not null
+    group by crt.Name
+),
+UserAnswerWindow as (
+    select
+        a.OwnerUserId,
+        a.ParentId as QuestionId,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        row_number() over (partition by a.OwnerUserId order by a.Score desc, a.CreationDate) as AnswerRank
+    from Posts a
+    where a.PostTypeId = 2 and a.OwnerUserId is not null
+)
+select
+    r.UserRank,
+    r.DisplayName as UserName,
+    r.GoldBadges,
+    r.SilverBadges,
+    r.BronzeBadges,
+    lqa.QuestionId,
+    lqa.Title as QuestionTitle,
+    lqa.QuestionCreation,
+    lqa.AcceptedAnswerId,
+    lqa.AnswerCreation,
+    lqa.AnswerScore,
+    lqa.AnswerOwner,
+    lqa.AnswerOwnerReputation,
+    tp.Tag,
+    tp.QuestionCount,
+    tp.AvgScore,
+    tp.MaxViews,
+    tp.QuestionsWithAccepted,
+    crc.CloseReason,
+    crc.CloseCount,
+    ua.AnswerId,
+    ua.AnswerScore,
+    ua.AnswerRank,
+    case
+        when ua.AnswerScore > 10 then 'High scoring answer'
+        when ua.AnswerScore between 1 and 10 then 'Moderate scoring answer'
+        when ua.AnswerScore <= 0 then 'Low scoring or negative'
+        else 'No score data'
+    end as AnswerScoreCategory,
+    coalesce(upper(tp.Tag), 'NO TAG') || ' @ ' || to_char(cast(lqa.QuestionCreation as date), 'YYYY-MM-DD') as TagWithDate
+from RecursiveUserBadgeCounts r
+left join LatestAcceptedAnswers lqa on lqa.AnswerOwner = r.DisplayName
+left join QuestionTagExplode qte on qte.QuestionId = lqa.QuestionId
+left join TagPopularity tp on tp.Tag = qte.Tag
+left join CloseReasonCounts crc on crc.CloseReason is not null and crc.CloseCount > 5
+left join UserAnswerWindow ua on ua.OwnerUserId = r.UserId and ua.AnswerRank = 1
+where r.GoldBadges + r.SilverBadges + r.BronzeBadges > 10
+  and lqa.AcceptedAnswerId is not null
+  and tp.QuestionCount > 50
+group by
+    r.UserRank,
+    r.DisplayName,
+    r.GoldBadges,
+    r.SilverBadges,
+    r.BronzeBadges,
+    lqa.QuestionId,
+    lqa.Title,
+    lqa.QuestionCreation,
+    lqa.AcceptedAnswerId,
+    lqa.AnswerCreation,
+    lqa.AnswerScore,
+    lqa.AnswerOwner,
+    lqa.AnswerOwnerReputation,
+    tp.Tag,
+    tp.QuestionCount,
+    tp.AvgScore,
+    tp.MaxViews,
+    tp.QuestionsWithAccepted,
+    crc.CloseReason,
+    crc.CloseCount,
+    ua.AnswerId,
+    ua.AnswerScore,
+    ua.AnswerRank
+order by r.UserRank, tp.QuestionCount desc, ua.AnswerScore desc
+limit 100;

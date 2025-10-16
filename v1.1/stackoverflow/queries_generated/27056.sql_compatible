@@ -1,0 +1,19 @@
+, (SELECT COUNT(*)
+     FROM Badges B
+     WHERE B.UserId = AU.UserId AND B.Class = 3) AS BronzeBadges,
+    (SELECT COUNT(PH.Id)
+     FROM PostHistory PH
+     WHERE PH.PostId = PA.PostId AND PH.UserId = AU.UserId) AS UserPostEdits,
+    (SELECT STRING_AGG(T.TagName, ', ')
+     FROM Tags T
+     WHERE PA.Tags LIKE ('%<' || T.TagName || '>%')) AS ParsedTags
+FROM
+    ActiveUsers AU
+JOIN
+    PostActivity PA ON AU.UserId = PA.OwnerUserId
+WHERE
+    AU.TotalPosts > 10 AND
+    PA.ViewCount > 500 AND
+    (PA.TotalUpVotes > 0 OR PA.TotalDownVotes > 0)
+ORDER BY
+    AU.Reputation DESC, PA.Score DESC;

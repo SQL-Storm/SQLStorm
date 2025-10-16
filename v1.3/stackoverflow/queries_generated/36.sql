@@ -1,0 +1,191 @@
+-- {"query": "36.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2267} 
+with recursive tag_hierarchy(tag, depth) as (
+    -- seed with top N tags by usage
+    select t.TagName, 1
+    from Tags t
+    order by t.Count desc
+    limit 50
+  union all
+    -- artificially expand by extracting related tags from question posts' tag lists
+    select distinct unnest(string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><')) as tag, th.depth+1
+    from Posts p
+    join tag_hierarchy th on p.Tags is not null
+    where th.depth < 3
+      and p.PostTypeId = 1
+      and (p.Tags like '%' || th.tag || '%' )
+), recent_high_value_users as (
+    -- users who recently earned many reputation (proxy via high score posts + recent activity)
+    select u.Id as UserId,
+           u.DisplayName,
+           u.Reputation,
+           u.CreationDate,
+           u.LastAccessDate,
+           coalesce(sum(case when p.PostTypeId=1 then p.ViewCount else 0 end),0) as ViewsOnQuestions,
+           count(distinct p.Id) filter (where p.PostTypeId=2) as AnswerCount,
+           row_number() over (order by u.Reputation desc, ViewsOnQuestions desc) rn
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.CreationDate > now() - interval '2 years'
+    group by u.Id,u.DisplayName,u.Reputation,u.CreationDate,u.LastAccessDate
+    having coalesce(sum(case when p.Score>=10 then 1 else 0 end),0) >= 1 or u.Reputation >= 5000
+), top_questions as (
+    -- questions with interesting mix of metrics and string/tag parsing
+    select q.Id, q.Title, q.Tags, q.CreationDate, q.ViewCount, q.Score,
+           regexp_matches(coalesce(q.Title,''), '([A-Za-z0-9_]{3,})','g') as tokens
+    from Posts q
+    where q.PostTypeId = 1
+      and q.CreationDate > now() - interval '5 years'
+      and q.ViewCount is not null
+      and q.Score is not null
+), question_stats as (
+    select tq.Id,
+           tq.Title,
+           tq.Tags,
+           tq.CreationDate,
+           tq.ViewCount,
+           tq.Score,
+           coalesce(a.AnswerCount,0) as AnswerCount,
+           coalesce(v.UpVotes,0) as UpVotes,
+           coalesce(v.DownVotes,0) as DownVotes,
+           round( (coalesce(v.UpVotes,0)::numeric + 1) / (nullif(coalesce(v.DownVotes,0),0)::numeric + 1), 3) as UpDownRatio,
+           coalesce(b.BadgeCount,0) as OwnerBadgeCount,
+           u.Id as OwnerId,
+           u.DisplayName as OwnerName,
+           -- parse most frequent tag from the Tags string
+           (select split_part(split_part(tq.Tags, '><', gs.pos), '><', 1) from generate_series(1, greatest(length(coalesce(tq.Tags,'')) - length(replace(coalesce(tq.Tags,''),'><','')) + 1,1)) gs(pos) limit 1) as PrimaryTag
+    from top_questions tq
+    left join LATERAL (
+       select count(*) as AnswerCount
+       from Posts a
+       where a.ParentId = tq.Id and a.PostTypeId = 2
+    ) a on true
+    left join LATERAL (
+       select sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+              sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes
+       from Votes v
+       left join VoteTypes vt on v.VoteTypeId = vt.Id
+       where v.PostId = tq.Id
+    ) v on true
+    left join Users u on u.Id = (select OwnerUserId from Posts where Id = tq.Id)
+    left join LATERAL (
+       select count(*) as BadgeCount
+       from Badges b
+       where b.UserId = u.Id
+         and b.Date > now() - interval '3 years'
+    ) b on true
+), complex_answers as (
+    -- answers with correlated subqueries and window functions
+    select a.Id as AnswerId,
+           a.ParentId as QuestionId,
+           a.OwnerUserId,
+           a.Score,
+           a.CreationDate,
+           a.Body,
+           dense_rank() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as ScoreRank,
+           first_value(a.Id) over (partition by a.ParentId order by a.Score desc nulls last) as TopAnswerId,
+           (select count(*) from Comments c where c.PostId = a.Id and c.CreationDate > now() - interval '1 year') as RecentComments,
+           (select bool_or(vt.Name = 'AcceptedByOriginator') from Votes v join VoteTypes vt on v.VoteTypeId = vt.Id where v.PostId = a.Id) as EverAccepted
+    from Posts a
+    where a.PostTypeId = 2
+      and a.Score is not null
+), question_answer_aggregates as (
+    select q.Id as QuestionId,
+           q.Title,
+           q.ViewCount,
+           q.Score as QScore,
+           count(a.Id) as TotalAnswers,
+           sum(case when a.Score >= 0 then 1 else 0 end) as NonNegativeAnswers,
+           max(a.Score) as MaxAnswerScore,
+           min(a.Score) as MinAnswerScore,
+           avg(a.Score) as AvgAnswerScore,
+           bool_or(a.Id = q.AcceptedAnswerId) as HasAcceptedAnswer,
+           count(distinct pl.RelatedPostId) filter (where pl.LinkTypeId = 1) as OutgoingLinks,
+           count(distinct pl.RelatedPostId) filter (where pl.LinkTypeId = 3) as DuplicateLinks
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join PostLinks pl on pl.PostId = q.Id
+    where q.PostTypeId = 1
+    group by q.Id,q.Title,q.ViewCount,q.Score,q.AcceptedAnswerId
+), anomalies as (
+    -- detect questions where metrics diverge (high views but low score, or many answers but no accepted)
+    select qa.QuestionId,
+           qa.Title,
+           qa.ViewCount,
+           qa.QScore,
+           qa.TotalAnswers,
+           qa.HasAcceptedAnswer,
+           case
+             when qa.ViewCount > 10000 and qa.QScore < 0 then 'Popular but downvoted'
+             when qa.TotalAnswers >= 10 and qa.HasAcceptedAnswer = false then 'Many answers but no accepted'
+             when qa.DuplicateLinks > 0 and qa.HasAcceptedAnswer = true then 'Duplicates with accepted answer'
+             else 'Normal'
+           end as AnomalyTag
+    from question_answer_aggregates qa
+    left join (
+      select QuestionId, count(*) as DuplicateLinks
+      from PostLinks pl join Posts p on pl.PostId = p.Id
+      where pl.LinkTypeId = 3
+      group by QuestionId
+    ) dl on dl.QuestionId = qa.QuestionId
+), candidate_set as (
+    -- combine various signals and rank candidates for benchmarking
+    select qs.*,
+           qa.TotalAnswers,
+           qa.AvgAnswerScore,
+           qa.MaxAnswerScore,
+           qa.MinAnswerScore,
+           an.AnomalyTag,
+           qstats.OwnerId,
+           qstats.OwnerName,
+           qstats.OwnerBadgeCount,
+           qstats.PrimaryTag,
+           rank() over (order by coalesce(qs.ViewCount,0) desc, coalesce(qa.TotalAnswers,0) desc, coalesce(qstats.OwnerBadgeCount,0) desc) as CompositeRank
+    from question_stats qstats
+    join Posts qs on qs.Id = qstats.Id
+    left join question_answer_aggregates qa on qa.QuestionId = qs.Id
+    left join anomalies an on an.QuestionId = qs.Id
+), final_selection as (
+    select cs.*,
+           -- combine string expressions and null logic for a synthetic "difficulty" metric
+           case
+             when cs.PrimaryTag is null then 50
+             when cs.PrimaryTag ilike '%sql%' then 10
+             when cs.PrimaryTag ilike '%javascript%' then 20
+             when cs.AnomalyTag = 'Popular but downvoted' then 5
+             when cs.AnomalyTag = 'Many answers but no accepted' then 15
+             else 30
+           end as TagPenalty,
+           greatest(0, (coalesce(cs.ViewCount,0)/nullif(nullif(cs.QScore,0),0)::numeric)) as ViewToScoreRatio,
+           (coalesce(cs.AvgAnswerScore,0) * (1 + (coalesce(cs.OwnerBadgeCount,0)::numeric/10))) as WeightedAnswerScore
+    from candidate_set cs
+)
+select fs.QuestionId,
+       fs.Title,
+       left(fs.Title,200) || '...' as ShortTitleSnippet,
+       fs.PrimaryTag,
+       fs.ViewCount,
+       fs.QScore,
+       fs.TotalAnswers,
+       fs.AvgAnswerScore,
+       fs.MaxAnswerScore,
+       fs.MinAnswerScore,
+       fs.OwnerId,
+       fs.OwnerName,
+       fs.OwnerBadgeCount,
+       fs.AnomalyTag,
+       fs.TagPenalty,
+       round(fs.ViewToScoreRatio,2) as ViewToScoreRatio,
+       round(fs.WeightedAnswerScore,3) as WeightedAnswerScore,
+       fs.CompositeRank,
+       -- correlate with recent high value users: show if owner is in that set
+       case when exists (select 1 from recent_high_value_users rhu where rhu.UserId = fs.OwnerId) then true else false end as OwnerIsHighValue,
+       -- include a JSON-like synthetic summary using concatenation and null-safe logic
+       '{'
+         || '"q":"' || replace(coalesce(fs.Title,''),'"','\"') || '",'
+         || '"tag":"' || coalesce(fs.PrimaryTag,'<none>') || '",'
+         || '"v":' || coalesce(fs.ViewCount::text,'0') || ','
+         || '"s":' || coalesce(fs.QScore::text,'0') || ','
+         || '"a":' || coalesce(fs.TotalAnswers::text,'0')
+       || '}' as SyntheticSummary
+from final_selection fs
+where fs.CompositeRank <= 200
+order by fs.CompositeRank, fs.WeightedAnswerScore desc, fs.ViewCount desc;

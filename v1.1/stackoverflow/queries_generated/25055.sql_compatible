@@ -1,0 +1,130 @@
+WITH
+TopUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COALESCE(SUM(
+            CASE v.VoteTypeId
+                WHEN 2 THEN  1
+                WHEN 3 THEN -1
+                ELSE 0
+            END),0) AS NetScore,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, COUNT(b.Id) FILTER (WHERE b.Class = 1) DESC) AS rn
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) >= 5
+),
+
+TagPopularity AS (
+    SELECT
+        t.TagName,
+        t.Count AS TagUseCount,
+        COALESCE(e.ExcerptLength,0) AS ExcerptLen,
+        CASE WHEN t.IsModeratorOnly = 1 THEN 'Mod' ELSE 'Public' END AS Visibility,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS rn_tag
+    FROM Tags t
+    LEFT JOIN (
+        SELECT p.Id, LENGTH(p.Body) AS ExcerptLength
+        FROM Posts p
+        WHERE p.PostTypeId = 4
+    ) e ON e.Id = t.ExcerptPostId
+),
+
+UserTagActivity AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT UNNEST(string_to_array(p.Tags,'><'))) AS DistinctTagsUsed,
+        MAX(p.CreationDate) AS LastQuestionDate,
+        COALESCE(SUM(p.Score),0) AS TotalQuestionScore
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+               AND p.PostTypeId = 1
+    GROUP BY u.Id
+),
+
+Combined AS (
+    SELECT
+        tu.Id,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.GoldBadges,
+        tu.SilverBadges,
+        tu.BronzeBadges,
+        tu.NetScore,
+        uta.DistinctTagsUsed,
+        uta.TotalQuestionScore,
+        COALESCE(uta.LastQuestionDate, TIMESTAMP '1970-01-01') AS LastQDate,
+        CASE WHEN recent_cnt.cnt > 0 THEN TRUE ELSE FALSE END AS HasRecentAcceptedAnswer,
+        tu.rn
+    FROM TopUsers tu
+    LEFT JOIN UserTagActivity uta ON uta.UserId = tu.Id
+    LEFT JOIN LATERAL (
+        SELECT COUNT(*) AS cnt
+        FROM Posts a
+        WHERE a.PostTypeId = 2
+          AND a.ParentId IN (
+                SELECT q.Id
+                FROM Posts q
+                WHERE q.OwnerUserId = tu.Id
+                  AND q.PostTypeId = 1
+          )
+          AND a.AcceptedAnswerId IS NOT NULL
+          AND a.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '30 days')
+    ) recent_cnt ON TRUE
+    WHERE tu.rn <= 50
+)
+
+SELECT
+    c.Id,
+    c.DisplayName,
+    c.Reputation,
+    c.GoldBadges,
+    c.SilverBadges,
+    c.BronzeBadges,
+    c.NetScore,
+    c.DistinctTagsUsed,
+    c.TotalQuestionScore,
+    c.HasRecentAcceptedAnswer,
+    tp.TagName,
+    tp.TagUseCount,
+    tp.ExcerptLen,
+    tp.Visibility
+FROM Combined c
+LEFT JOIN LATERAL (
+    SELECT tp2.TagName, tp2.TagUseCount, tp2.ExcerptLen, tp2.Visibility
+    FROM TagPopularity tp2
+    WHERE tp2.rn_tag <= 5
+    ORDER BY tp2.TagUseCount DESC
+    LIMIT 1
+) tp ON TRUE
+
+UNION ALL
+
+SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    0 AS GoldBadges,
+    0 AS SilverBadges,
+    0 AS BronzeBadges,
+    0 AS NetScore,
+    0 AS DistinctTagsUsed,
+    0 AS TotalQuestionScore,
+    FALSE AS HasRecentAcceptedAnswer,
+    NULL AS TagName,
+    NULL AS TagUseCount,
+    NULL AS ExcerptLen,
+    NULL AS Visibility
+FROM Users u
+WHERE NOT EXISTS (SELECT 1 FROM TopUsers tu WHERE tu.Id = u.Id)
+  AND u.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+
+ORDER BY Reputation DESC, GoldBadges DESC
+LIMIT 100;

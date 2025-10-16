@@ -1,0 +1,230 @@
+-- {"query": "460.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2187} 
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount,0) as AnswerCount,
+        coalesce(p.FavoriteCount,0) as FavoriteCount,
+        coalesce(p.ViewCount,0) as ViewCount
+    from Tags t
+    left join (
+        select
+            unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as TagName,
+            count(*) filter (where p.PostTypeId = 1) as AnswerCount,
+            sum(p.FavoriteCount) as FavoriteCount,
+            sum(p.ViewCount) as ViewCount
+        from Posts p
+        group by 1
+    ) p on p.TagName = t.TagName
+    where t.TagName is not null
+),
+TopUsers as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        dense_rank() over (order by u.Reputation desc) as ReputationRank,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+    having count(b.Id) filter (where b.Class = 1) > 0
+),
+PostActivity as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.Tags,
+        p.ClosedDate,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as RecentPostRank,
+        case when p.ClosedDate is null then 0 else 1 end as IsClosed
+    from Posts p
+    where p.PostTypeId in (1,2)
+),
+ClosedQuestionsWithReasons as (
+    select
+        ph.PostId,
+        cr.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join CloseReasonTypes cr on cr.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10 and ph.Comment ~ '^\d+$'
+),
+UserPostStats as (
+    select
+        u.Id as UserId,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        avg(p.Score) filter (where p.PostTypeId = 1) as AvgQuestionScore,
+        avg(p.Score) filter (where p.PostTypeId = 2) as AvgAnswerScore,
+        sum(p.ViewCount) filter (where p.PostTypeId = 1) as TotalQuestionViews,
+        sum(p.FavoriteCount) filter (where p.PostTypeId = 1) as TotalFavorites
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id
+),
+UserBadgesSummary as (
+    select
+        UserId,
+        string_agg(distinct Name, ', ' order by Name) as BadgeNames,
+        count(*) as TotalBadges,
+        sum(case when TagBased = 1 then 1 else 0 end) as TagBasedBadges
+    from Badges
+    group by UserId
+),
+AnswerScoreRanks as (
+    select
+        p.Id,
+        p.ParentId,
+        p.Score,
+        rank() over (partition by p.ParentId order by p.Score desc) as AnswerScoreRank
+    from Posts p
+    where p.PostTypeId = 2
+),
+HighScoreAnswersWithAcceptedFlag as (
+    select
+        a.Id,
+        a.ParentId,
+        a.Score,
+        case when q.AcceptedAnswerId = a.Id then 1 else 0 end as IsAcceptedAnswer,
+        u.DisplayName as AnswerOwner
+    from AnswerScoreRanks a
+    join Posts q on q.Id = a.ParentId
+    left join Users u on u.Id = a.OwnerUserId
+    where a.AnswerScoreRank <= 3
+),
+UserCommentActivity as (
+    select
+        c.UserId,
+        count(*) as CommentCount,
+        avg(length(c.Text)) as AvgCommentLength,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    where c.UserId is not null
+    group by c.UserId
+),
+UserEngagement as (
+    select
+        u.Id,
+        coalesce(ups.QuestionCount,0) as Questions,
+        coalesce(ups.AnswerCount,0) as Answers,
+        coalesce(ups.AvgQuestionScore,0) as AvgQScore,
+        coalesce(ups.AvgAnswerScore,0) as AvgAScore,
+        coalesce(ups.TotalQuestionViews,0) as TotalQViews,
+        coalesce(ups.TotalFavorites,0) as TotalFavs,
+        coalesce(ubs.TotalBadges,0) as TotalBadges,
+        coalesce(ubs.TagBasedBadges,0) as TagBadges,
+        coalesce(uca.CommentCount,0) as Comments,
+        coalesce(uca.AvgCommentLength,0) as AvgCommentLen,
+        coalesce(uca.LastCommentDate, '1970-01-01') as LastComment
+    from Users u
+    left join UserPostStats ups on ups.UserId = u.Id
+    left join UserBadgesSummary ubs on ubs.UserId = u.Id
+    left join UserCommentActivity uca on uca.UserId = u.Id
+),
+RecentHighEngagementPosts as (
+    select
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        u.DisplayName as OwnerName,
+        ue.Questions,
+        ue.Answers,
+        ue.TotalBadges,
+        ue.Comments,
+        case when p.ClosedDate is not null then 1 else 0 end as IsClosed,
+        coalesce(cr.CloseReason, 'N/A') as CloseReason
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    left join UserEngagement ue on ue.Id = u.Id
+    left join ClosedQuestionsWithReasons cr on cr.PostId = p.Id
+    where p.CreationDate > now() - interval '90 days'
+      and p.Score > 5
+      and (p.PostTypeId = 1 or p.PostTypeId = 2)
+),
+CombinedUserPostData as (
+    select
+        ue.Id as UserId,
+        ue.DisplayName,
+        ue.Reputation,
+        ue.Location,
+        ue.Questions,
+        ue.Answers,
+        ue.TotalBadges,
+        ue.Comments,
+        rt.Count as TagCount,
+        rt.ViewCount as TagViewCount,
+        rt.FavoriteCount as TagFavoriteCount
+    from UserEngagement ue
+    left join RecursiveTagCounts rt on rt.TagName = (
+        select unnest(string_to_array(coalesce(p.Tags,''), '><'))
+        from Posts p where p.OwnerUserId = ue.Id and p.PostTypeId = 1 order by p.ViewCount desc limit 1
+    )
+    left join Users u on u.Id = ue.Id
+    where ue.Reputation > 1000
+),
+FinalSelection as (
+    select
+        cud.UserId,
+        cud.DisplayName,
+        cud.Reputation,
+        cud.Location,
+        cud.Questions,
+        cud.Answers,
+        cud.TotalBadges,
+        cud.Comments,
+        cud.TagCount,
+        cud.TagViewCount,
+        cud.TagFavoriteCount,
+        count(distinct pha.Id) filter (where pha.IsAcceptedAnswer = 1) as AcceptedAnswersCount,
+        max(p.CreationDate) as LastPostDate
+    from CombinedUserPostData cud
+    left join HighScoreAnswersWithAcceptedFlag pha on pha.AnswerOwner = cud.DisplayName
+    left join Posts p on p.OwnerUserId = cud.UserId
+    group by cud.UserId, cud.DisplayName, cud.Reputation, cud.Location, cud.Questions, cud.Answers, cud.TotalBadges, cud.Comments, cud.TagCount, cud.TagViewCount, cud.TagFavoriteCount
+    having count(distinct pha.Id) filter (where pha.IsAcceptedAnswer = 1) > 0
+)
+select
+    fs.UserId,
+    fs.DisplayName,
+    fs.Reputation,
+    fs.Location,
+    fs.Questions,
+    fs.Answers,
+    fs.TotalBadges,
+    fs.Comments,
+    fs.TagCount,
+    fs.TagViewCount,
+    fs.TagFavoriteCount,
+    fs.AcceptedAnswersCount,
+    fs.LastPostDate,
+    string_agg(distinct rt.TagName, ', ') as PopularTags,
+    count(distinct ph.Id) filter (where ph.PostHistoryTypeId = 10) as CloseVotesCount,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as TotalUpVotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as TotalDownVotes
+from FinalSelection fs
+left join Posts p on p.OwnerUserId = fs.UserId
+left join RecursiveTagCounts rt on rt.TagName = (
+    select unnest(string_to_array(coalesce(p.Tags,''), '><'))
+    from Posts p2 where p2.OwnerUserId = fs.UserId and p2.PostTypeId = 1 order by p2.ViewCount desc limit 1
+)
+left join PostHistory ph on ph.PostId = p.Id
+left join Votes v on v.PostId = p.Id
+group by fs.UserId, fs.DisplayName, fs.Reputation, fs.Location, fs.Questions, fs.Answers, fs.TotalBadges, fs.Comments, fs.TagCount, fs.TagViewCount, fs.TagFavoriteCount, fs.AcceptedAnswersCount, fs.LastPostDate
+order by fs.Reputation desc, fs.AcceptedAnswersCount desc
+limit 50;

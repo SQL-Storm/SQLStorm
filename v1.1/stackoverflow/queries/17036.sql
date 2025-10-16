@@ -1,0 +1,135 @@
+-- {"query": "17036.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 86395, "output_tokens": 84431} 
+WITH UserMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        AVG(CASE WHEN p.Score IS NOT NULL THEN p.Score ELSE 0 END) AS AvgPostScore,
+        MAX(p.Score) AS MaxPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), ', ') AS UserTags,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS PostCountRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= cast('2024-10-01' as date) - INTERVAL '2 years'
+        AND (u.Location IS NOT NULL OR u.AboutMe IS NOT NULL)
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopAnswerers AS (
+    SELECT 
+        p.OwnerUserId,
+        p.ParentId,
+        p.Score,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS AnswerRank,
+        LEAD(p.Score, 1, 0) OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC) AS NextBestScore,
+        LAG(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevAnswerDate,
+        CASE 
+            WHEN p.Id = q.AcceptedAnswerId THEN 1 
+            ELSE 0 
+        END AS IsAccepted
+    FROM Posts p
+    INNER JOIN Posts q ON p.ParentId = q.Id AND q.PostTypeId = 1
+    WHERE p.PostTypeId = 2 
+        AND p.Score >= 5
+        AND p.OwnerUserId IS NOT NULL
+),
+BadgePatterns AS (
+    SELECT 
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Class,
+        COUNT(*) OVER (PARTITION BY b.UserId, b.Name) AS BadgeCount,
+        FIRST_VALUE(b.Date) OVER (PARTITION BY b.UserId, b.Name ORDER BY b.Date) AS FirstEarned,
+        LAST_VALUE(b.Date) OVER (PARTITION BY b.UserId, b.Name ORDER BY b.Date 
+            RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS LastEarned,
+        EXTRACT(DAY FROM (
+            LAST_VALUE(b.Date) OVER (PARTITION BY b.UserId, b.Name ORDER BY b.Date 
+                RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) - 
+            FIRST_VALUE(b.Date) OVER (PARTITION BY b.UserId, b.Name ORDER BY b.Date)
+        )) AS DaysToRepeat
+    FROM Badges b
+    WHERE b.TagBased = '0'
+),
+EditActivity AS (
+    SELECT 
+        ph.UserId,
+        ph.PostId,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 END) AS EditCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (7, 8, 9) THEN 1 END) AS RollbackCount,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment END) AS CloseReason,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (12, 13) THEN 
+            CASE WHEN ph.PostHistoryTypeId = 12 THEN -1 ELSE 1 END 
+        ELSE 0 END) AS DeleteUndeleteNet
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+    GROUP BY ph.UserId, ph.PostId
+)
+SELECT 
+    COALESCE(um.DisplayName, 'Anonymous') AS UserName,
+    um.Reputation,
+    um.ReputationRank,
+    um.PostCount,
+    COALESCE(um.AvgPostScore, 0) AS AvgScore,
+    SUBSTRING(COALESCE(um.UserTags, 'no-tags'), 1, 100) AS TopTags,
+    COUNT(DISTINCT ta.ParentId) AS QuestionsAnswered,
+    SUM(ta.IsAccepted) AS AcceptedAnswers,
+    AVG(ta.Score - ta.NextBestScore) FILTER (WHERE ta.AnswerRank = 1) AS AvgScoreAdvantage,
+    COUNT(DISTINCT bp.BadgeName) AS UniqueBadges,
+    MAX(bp.BadgeCount) AS MaxBadgeRepetition,
+    COALESCE(AVG(bp.DaysToRepeat) FILTER (WHERE bp.DaysToRepeat > 0), 0) AS AvgDaysToRepeatBadge,
+    SUM(ea.EditCount) AS TotalEdits,
+    SUM(ea.RollbackCount) AS TotalRollbacks,
+    CASE 
+        WHEN um.Reputation > 10000 THEN 'Expert'
+        WHEN um.Reputation > 5000 THEN 'Advanced'
+        WHEN um.Reputation > 1000 THEN 'Intermediate'
+        WHEN um.Reputation > 100 THEN 'Beginner'
+        ELSE 'Novice'
+    END AS UserLevel,
+    EXISTS (
+        SELECT 1 
+        FROM Comments c 
+        WHERE c.UserId = um.Id 
+            AND c.Score > (
+                SELECT COALESCE(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY Score), 0)
+                FROM Comments
+                WHERE Score IS NOT NULL
+            )
+    ) AS HasHighlyRatedComments,
+    (
+        SELECT COUNT(DISTINCT pl.PostId)
+        FROM PostLinks pl
+        INNER JOIN Posts p1 ON pl.PostId = p1.Id
+        INNER JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+        WHERE (p1.OwnerUserId = um.Id OR p2.OwnerUserId = um.Id)
+            AND pl.LinkTypeId = 3
+    ) AS DuplicateInvolvements,
+    ARRAY_AGG(
+        DISTINCT vt.Name 
+        ORDER BY vt.Name
+    ) FILTER (
+        WHERE v.VoteTypeId IN (2, 3, 4, 12) 
+            AND v.CreationDate >= cast('2024-10-01' as date) - INTERVAL '30 days'
+    ) AS RecentVoteTypes
+FROM UserMetrics um
+LEFT JOIN TopAnswerers ta ON um.Id = ta.OwnerUserId
+LEFT JOIN BadgePatterns bp ON um.Id = bp.UserId
+LEFT JOIN EditActivity ea ON um.Id = ea.UserId
+LEFT JOIN Votes v ON um.Id = v.UserId
+LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+WHERE um.PostCount > 0
+    AND (um.ReputationRank <= 100 OR um.PostCountRank <= 100)
+GROUP BY 
+    um.Id, um.DisplayName, um.Reputation, um.ReputationRank,
+    um.PostCount, um.AvgPostScore, um.UserTags
+HAVING COUNT(DISTINCT ta.ParentId) > 0 
+    OR COUNT(DISTINCT bp.BadgeName) > 5
+ORDER BY 
+    um.Reputation DESC,
+    SUM(ta.IsAccepted) DESC NULLS LAST,
+    COUNT(DISTINCT bp.BadgeName) DESC
+LIMIT 50;

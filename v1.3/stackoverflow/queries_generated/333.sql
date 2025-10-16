@@ -1,0 +1,216 @@
+-- {"query": "333.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 14063} 
+WITH exploded_tags AS (
+  SELECT p.Id AS post_id, p.OwnerUserId AS owner_user_id, tag AS tag_name
+  FROM Posts p
+  JOIN LATERAL regexp_split_to_table(COALESCE(p.Tags,''), E'[<>]+') AS tag ON true
+  WHERE p.PostTypeId = 1 AND COALESCE(p.Tags,'') <> '' AND tag <> ''
+),
+tag_popularity AS (
+  SELECT et.tag_name AS tag_name,
+         COUNT(DISTINCT et.post_id) AS question_count,
+         SUM(COALESCE(p.ViewCount,0)) AS total_views,
+         AVG(COALESCE(p.Score,0)) AS avg_score
+  FROM exploded_tags et
+  JOIN Posts p ON p.Id = et.post_id
+  GROUP BY et.tag_name
+),
+vote_summary AS (
+  SELECT v.PostId,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+         SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS favorites,
+         COUNT(*) AS total_votes,
+         MAX(v.CreationDate) AS last_vote_date
+  FROM Votes v
+  GROUP BY v.PostId
+),
+answer_ranks AS (
+  SELECT a.Id AS answer_id,
+         a.ParentId AS question_id,
+         a.OwnerUserId,
+         a.Score,
+         a.CreationDate,
+         ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC NULLS LAST, a.CreationDate ASC) AS answer_rank,
+         RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC NULLS LAST) AS answer_score_rank
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+),
+comment_counts AS (
+  SELECT c.PostId, COUNT(*) AS comment_count
+  FROM Comments c
+  GROUP BY c.PostId
+),
+post_stats_by_user AS (
+  SELECT u.Id AS user_id,
+         COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS question_count,
+         COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS answer_count,
+         COALESCE(AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL),0) AS avg_post_score,
+         SUM(COALESCE(p.ViewCount,0)) AS total_views,
+         MAX(p.LastActivityDate) AS last_post_activity,
+         SUM(COALESCE(vs.upvotes,0)) AS total_upvotes_on_posts,
+         SUM(COALESCE(vs.downvotes,0)) AS total_downvotes_on_posts,
+         COUNT(DISTINCT b.Id) AS badge_count,
+         SUM(CASE WHEN b.Class = 1 THEN 5 WHEN b.Class = 2 THEN 3 WHEN b.Class = 3 THEN 1 ELSE 0 END) AS badge_weight
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN vote_summary vs ON vs.PostId = p.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id
+),
+recent_activity AS (
+  SELECT ua.user_id, SUM(ua.score) AS recent_activity_score, MAX(ua.created) AS last_activity_date
+  FROM (
+     SELECT p.OwnerUserId AS user_id,
+            100.0 / (1 + EXTRACT(EPOCH FROM (now() - COALESCE(p.CreationDate, now()))) / 86400.0) AS score,
+            COALESCE(p.CreationDate, now()) AS created
+     FROM Posts p
+     WHERE p.OwnerUserId IS NOT NULL
+     UNION ALL
+     SELECT c.UserId AS user_id,
+            50.0 / (1 + EXTRACT(EPOCH FROM (now() - c.CreationDate)) / 86400.0) AS score,
+            c.CreationDate AS created
+     FROM Comments c
+     WHERE c.UserId IS NOT NULL
+     UNION ALL
+     SELECT v.UserId AS user_id,
+            20.0 / (1 + EXTRACT(EPOCH FROM (now() - v.CreationDate)) / 86400.0) AS score,
+            v.CreationDate AS created
+     FROM Votes v
+     WHERE v.UserId IS NOT NULL
+  ) ua
+  GROUP BY ua.user_id
+),
+user_tag_counts AS (
+  SELECT et.owner_user_id AS user_id, et.tag_name AS tag_name, COUNT(*) AS cnt
+  FROM exploded_tags et
+  WHERE et.owner_user_id IS NOT NULL
+  GROUP BY et.owner_user_id, et.tag_name
+),
+user_top_tags AS (
+  SELECT utc.user_id, utc.tag_name AS top_tag, utc.cnt
+  FROM (
+    SELECT user_id, tag_name, cnt,
+           ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY cnt DESC, tag_name) AS rn
+    FROM user_tag_counts
+  ) utc
+  WHERE utc.rn = 1
+),
+top_user_posts AS (
+  SELECT r.user_id, json_agg(row_to_json(r) ORDER BY r.rank) AS top_posts
+  FROM (
+    SELECT p.OwnerUserId AS user_id,
+           p.Id AS post_id,
+           LEFT(COALESCE(p.Title, p.Body,''), 180) AS title_snippet,
+           p.Score, p.ViewCount,
+           COALESCE(vs.upvotes,0) AS upvotes, COALESCE(vs.downvotes,0) AS downvotes,
+           CASE WHEN p.PostTypeId = 1 THEN 'question' WHEN p.PostTypeId = 2 THEN 'answer' ELSE 'other' END AS post_type,
+           ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY (COALESCE(p.Score,0) * 2 + COALESCE(vs.upvotes,0) - COALESCE(vs.downvotes,0) + COALESCE(ln(NULLIF(p.ViewCount,0) + 1),0)) DESC NULLS LAST, p.CreationDate DESC) AS rank
+    FROM Posts p
+    LEFT JOIN vote_summary vs ON vs.PostId = p.Id
+    WHERE p.OwnerUserId IS NOT NULL
+  ) r
+  WHERE r.rank <= 3
+  GROUP BY r.user_id
+),
+no_post_badge_users AS (
+  SELECT DISTINCT b.UserId AS user_id
+  FROM Badges b
+  WHERE b.UserId IS NOT NULL
+  EXCEPT
+  SELECT DISTINCT p.OwnerUserId FROM Posts p WHERE p.OwnerUserId IS NOT NULL
+),
+user_engagement AS (
+  SELECT u.Id AS user_id,
+         u.DisplayName AS displayname,
+         COALESCE(u.Reputation,0) AS reputation,
+         COALESCE(ps.question_count,0) AS question_count,
+         COALESCE(ps.answer_count,0) AS answer_count,
+         COALESCE(ps.total_views,0) AS total_views,
+         COALESCE(ps.total_upvotes_on_posts,0) AS total_upvotes,
+         COALESCE(ps.total_downvotes_on_posts,0) AS total_downvotes,
+         COALESCE(ps.badge_weight,0) AS badge_weight,
+         COALESCE(ra.recent_activity_score,0) AS recent_activity_score,
+         COALESCE(utt.top_tag, '<none>') AS top_tag,
+         COALESCE(tup.top_posts, '[]'::json) AS top_posts_json,
+         (COALESCE(ps.answer_count,0) * 2.0 + COALESCE(ps.question_count,0) + COALESCE(ps.badge_weight,0) * 1.5 + COALESCE(ra.recent_activity_score,0) * 0.1 + (COALESCE(ps.total_upvotes_on_posts,0) - COALESCE(ps.total_downvotes_on_posts,0)) * 0.75) AS engagement_score,
+         (CASE WHEN u.Id IN (SELECT user_id FROM no_post_badge_users) THEN TRUE ELSE FALSE END) AS has_badges_but_no_posts
+  FROM Users u
+  LEFT JOIN post_stats_by_user ps ON ps.user_id = u.Id
+  LEFT JOIN recent_activity ra ON ra.user_id = u.Id
+  LEFT JOIN user_top_tags utt ON utt.user_id = u.Id
+  LEFT JOIN top_user_posts tup ON tup.user_id = u.Id
+),
+ranked_users AS (
+  SELECT ue.*,
+         RANK() OVER (ORDER BY engagement_score DESC NULLS LAST) AS engagement_rank,
+         PERCENT_RANK() OVER (ORDER BY engagement_score DESC NULLS LAST) AS engagement_percentile,
+         NTILE(10) OVER (ORDER BY engagement_score DESC NULLS LAST) AS engagement_decile
+  FROM user_engagement ue
+),
+question_diagnostics AS (
+  SELECT q.Id AS question_id,
+         q.Title,
+         LEFT(q.Body, 300) AS body_snippet,
+         q.CreationDate,
+         q.ViewCount,
+         q.Score,
+         q.AnswerCount,
+         q.AcceptedAnswerId,
+         COALESCE(vs.upvotes,0) AS upvotes,
+         COALESCE(vs.downvotes,0) AS downvotes,
+         COALESCE(cc.comment_count,0) AS comment_count,
+         COALESCE((SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = q.Id AND ph.PostHistoryTypeId IN (10,12)),0) AS close_or_delete_events,
+         COALESCE((SELECT COUNT(*) FROM PostLinks pl WHERE (pl.PostId = q.Id OR pl.RelatedPostId = q.Id) AND pl.LinkTypeId = 3),0) AS duplicate_link_count,
+         COALESCE((SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a.Score) FROM Posts a WHERE a.ParentId = q.Id AND a.Score IS NOT NULL),0) AS median_answer_score,
+         COALESCE((SELECT EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) FROM Posts a WHERE a.Id = q.AcceptedAnswerId), NULL) AS sec_to_accepted_answer,
+         CASE WHEN COALESCE(q.Tags,'') <> '' THEN REPLACE(TRIM(BOTH '<>' FROM q.Tags), '><', ',') ELSE '' END AS tags_csv
+  FROM Posts q
+  LEFT JOIN vote_summary vs ON vs.PostId = q.Id
+  LEFT JOIN comment_counts cc ON cc.PostId = q.Id
+  WHERE q.PostTypeId = 1
+),
+power_user_set AS (
+  (SELECT user_id FROM ranked_users WHERE engagement_rank <= 100)
+  UNION
+  (SELECT Id AS user_id FROM Users WHERE Reputation >= (SELECT COALESCE(percentile_cont(0.90) WITHIN GROUP (ORDER BY Reputation),0) FROM Users))
+)
+SELECT ru.user_id,
+       ru.displayname,
+       ru.reputation,
+       ru.engagement_score,
+       ru.engagement_rank,
+       ru.engagement_percentile,
+       ru.engagement_decile,
+       ru.question_count,
+       ru.answer_count,
+       ru.total_views,
+       ru.total_upvotes,
+       ru.total_downvotes,
+       ru.badge_weight,
+       ru.recent_activity_score,
+       ru.top_tag,
+       ru.top_posts_json,
+       CASE WHEN ru.has_badges_but_no_posts THEN 'YES' ELSE 'NO' END AS badge_but_no_posts,
+       CASE WHEN ru.user_id IN (SELECT user_id FROM power_user_set) THEN TRUE ELSE FALSE END AS is_power_user,
+       (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY COALESCE(p.ViewCount,0)) FROM Posts p WHERE p.OwnerUserId = ru.user_id AND p.PostTypeId = 1) AS median_question_views,
+       (SELECT array_agg(t.TagName ORDER BY t.question_count DESC)
+          FROM (SELECT tag_name AS TagName, question_count FROM tag_popularity tp WHERE tp.tag_name ILIKE ('%' || ru.top_tag || '%') ORDER BY question_count DESC LIMIT 5) t
+       ) AS related_top_tags,
+       (SELECT json_agg(row_to_json(r) ORDER BY r.score DESC) FROM (
+           SELECT q.Id, LEFT(q.Title,140) AS title, q.Score AS score, q.ViewCount AS views,
+                  COALESCE((SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a.Score) FROM Posts a WHERE a.ParentId = q.Id),0) AS med_ans_score,
+                  (SELECT COUNT(*) FROM PostLinks pl WHERE pl.RelatedPostId = q.Id AND pl.LinkTypeId = 1) AS inbound_links
+           FROM Posts q
+           WHERE q.OwnerUserId = ru.user_id AND q.PostTypeId = 1
+             AND (COALESCE(q.Score,0) >= GREATEST(3, (SELECT COALESCE(percentile_cont(0.75) WITHIN GROUP (ORDER BY Score) FROM Posts WHERE Posts.PostTypeId = 1),3)))
+           ORDER BY q.Score DESC, q.ViewCount DESC
+           LIMIT 5
+       ) r) AS recent_high_score_questions,
+       (CASE
+           WHEN ru.has_badges_but_no_posts AND ru.reputation > 1000 THEN 'suspicious'
+           WHEN ru.recent_activity_score < 1 AND ru.engagement_score < 5 THEN 'dormant'
+           ELSE 'normal'
+        END) AS account_flag
+FROM ranked_users ru
+ORDER BY ru.engagement_score DESC NULLS LAST
+LIMIT 200;

@@ -1,0 +1,155 @@
+-- {"query": "1100.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1431} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        rth.TagPath || t2.TagName
+    FROM Tags t2
+    JOIN Posts p ON p.Tags LIKE CONCAT('%<', t2.TagName, '>%')
+    JOIN PostLinks pl ON pl.PostId = p.Id AND pl.LinkTypeId = 1
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId AND p2.Tags LIKE CONCAT('%<', rth.TagName, '>%')
+    JOIN RecursiveTagHierarchy rth ON rth.TagName = p2.Tags
+    WHERE array_length(rth.TagPath,1) < 5
+),
+UserBadgesRanked AS (
+    SELECT
+        b.UserId,
+        b.Name,
+        b.Class,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS rn
+    FROM Badges b
+),
+UserPostScores AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COALESCE(SUM(p.Score),0) AS TotalPostScore,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgPostScore,
+        MAX(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS MaxPostScore
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TopPostsPerUser AS (
+    SELECT DISTINCT ON (p.OwnerUserId)
+        p.OwnerUserId,
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS ScoreRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2) AND p.Score IS NOT NULL
+    ORDER BY p.OwnerUserId, p.Score DESC, p.CreationDate DESC
+),
+ClosedQuestionsWithReason AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS CloseDate,
+        crt.Name AS CloseReason,
+        ph.UserId AS ClosedByUserId,
+        u.DisplayName AS ClosedByUser
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INT)
+    LEFT JOIN Users u ON u.Id = ph.UserId
+    WHERE ph.PostHistoryTypeId = 10 -- Post Closed
+),
+ComplexUserActivity AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(v.VoteTypeId = 2)::int AS UpVotesReceived,
+        SUM(v.VoteTypeId = 3)::int AS DownVotesReceived,
+        COUNT(ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (10,11)) AS CloseReopenActions,
+        MAX(p.LastActivityDate) AS LastActivity,
+        STRING_AGG(DISTINCT b.Name, ', ') AS BadgeList
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+UserActivityWithRank AS (
+    SELECT
+        c.*,
+        RANK() OVER (ORDER BY c.TotalPosts DESC, c.UpVotesReceived DESC) AS ActivityRank
+    FROM ComplexUserActivity c
+),
+CorrelatedAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title AS QuestionTitle,
+        q.OwnerUserId AS QuestionOwnerId,
+        (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = q.Id AND a.Score > 10) AS HighScoreAnswerCount,
+        (SELECT AVG(a.Score) FROM Posts a WHERE a.ParentId = q.Id) AS AvgAnswerScore,
+        (SELECT MAX(a.Score) FROM Posts a WHERE a.ParentId = q.Id) AS MaxAnswerScore
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+),
+CombinedSet AS (
+    SELECT
+        up.UserId,
+        up.DisplayName,
+        up.QuestionCount,
+        up.AnswerCount,
+        up.TotalPostScore,
+        up.AvgPostScore,
+        up.MaxPostScore,
+        ua.ActivityRank,
+        ua.TotalComments,
+        ua.UpVotesReceived,
+        ua.DownVotesReceived,
+        ua.CloseReopenActions,
+        ua.LastActivity,
+        ua.BadgeList,
+        UPPER(SUBSTRING(up.DisplayName FROM 1 FOR 1)) AS Initial,
+        CASE WHEN up.AvgPostScore IS NULL THEN 0 ELSE up.AvgPostScore END * 1.5 AS WeightedAvgScore
+    FROM UserPostScores up
+    JOIN UserActivityWithRank ua ON ua.Id = up.UserId
+    WHERE ua.ActivityRank <= 50
+)
+SELECT
+    c.UserId,
+    c.DisplayName,
+    c.Initial,
+    c.QuestionCount,
+    c.AnswerCount,
+    c.TotalPostScore,
+    ROUND(c.WeightedAvgScore,2) AS WeightedAvgScore,
+    c.MaxPostScore,
+    c.TotalComments,
+    c.UpVotesReceived,
+    c.DownVotesReceived,
+    c.CloseReopenActions,
+    c.LastActivity,
+    COALESCE(c.BadgeList, '(none)') AS BadgeList,
+    COALESCE(ca.HighScoreAnswerCount, 0) AS HighScoreAnswersForTheirQuestions,
+    COALESCE(ca.AvgAnswerScore, 0) AS AvgAnswerScoreForTheirQuestions,
+    COALESCE(ca.MaxAnswerScore, 0) AS MaxAnswerScoreForTheirQuestions,
+    CASE 
+        WHEN c.TotalPostScore > 1000 THEN 'Top Performer'
+        WHEN c.TotalPostScore BETWEEN 500 AND 1000 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END AS PerformanceLabel
+FROM CombinedSet c
+LEFT JOIN CorrelatedAnswerStats ca ON ca.QuestionOwnerId = c.UserId
+WHERE c.QuestionCount > 0
+ORDER BY c.WeightedAvgScore DESC, c.TotalPostScore DESC
+LIMIT 100;

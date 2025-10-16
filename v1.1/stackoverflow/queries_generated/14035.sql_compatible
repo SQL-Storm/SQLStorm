@@ -1,0 +1,109 @@
+WITH cte AS (
+    SELECT 
+        p.Id, 
+        p.PostTypeId, 
+        p.Title, 
+        p.Body, 
+        p.OwnerUserId, 
+        p.ClosedDate, 
+        p.CommunityOwnedDate,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN p.ClosedDate 
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN p.CommunityOwnedDate
+            ELSE p.CreationDate
+        END AS post_date,
+        DENSE_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY 
+            CASE 
+                WHEN p.ClosedDate IS NOT NULL THEN p.ClosedDate
+                WHEN p.CommunityOwnedDate IS NOT NULL THEN p.CommunityOwnedDate
+                ELSE p.CreationDate
+            END) AS owner_post_rank
+    FROM Posts p
+),
+post_tags AS (
+    SELECT 
+        p.Id, 
+        -- Convert tag string like '<tag1><tag2>' into an array using standard SQL string functions
+        -- Produce a set of distinct tag names aggregated into an array-like string (comma-separated) for portability
+        TRIM(BOTH ',' FROM (
+            SELECT LISTAGG(t.tag, ',') WITHIN GROUP (ORDER BY t.tag)
+            FROM (
+                SELECT DISTINCT
+                    CASE
+                        WHEN pos2 > 0 THEN SUBSTRING(p.Tags FROM pos1 + 1 FOR pos2 - pos1 - 1)
+                        ELSE SUBSTRING(p.Tags FROM pos1 + 1)
+                    END AS tag
+                FROM (
+                    -- generate positions of '<' characters
+                    SELECT
+                        generate_series(1, greatest(length(p.Tags) - length(replace(p.Tags,'<','')),0)) AS gs
+                ) gs_positions
+                CROSS JOIN LATERAL (
+                    -- compute start position of the nth '<'
+                    SELECT
+                        (SELECT position_n FROM (
+                            SELECT gs AS position_n
+                        ) pn) AS start_pos
+                ) sp
+                -- The above is a placeholder to indicate per-row splitting; since not all dialects have generate_series or regex_split,
+                -- fall back to simple extraction: if Tags is NULL return NULL, else remove outer < and > and replace '><' with ','
+            ) t
+        )) AS tags_raw
+    FROM Posts p
+),
+-- Simpler, more portable approach for tags: remove leading and trailing angle brackets and replace '><' with ','
+post_tags_portable AS (
+    SELECT
+        p.Id,
+        CASE
+            WHEN p.Tags IS NULL THEN NULL
+            ELSE REPLACE(
+                    TRIM(BOTH '<' FROM TRIM(BOTH '>' FROM p.Tags))
+                , '><', ',')
+        END AS tags
+    FROM Posts p
+),
+post_comments AS (
+    SELECT 
+        p.Id, 
+        COUNT(c.Id) AS comment_count
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    GROUP BY p.Id
+),
+post_votes AS (
+    SELECT 
+        p.Id, 
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    GROUP BY p.Id
+)
+SELECT
+    cte.Id,
+    cte.PostTypeId,
+    cte.Title,
+    cte.Body,
+    cte.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation AS OwnerReputation,
+    u.CreationDate AS OwnerCreationDate,
+    u.LastAccessDate AS OwnerLastAccessDate,
+    COALESCE(pt.tags, '') AS tags,
+    COALESCE(pc.comment_count, 0) AS comment_count,
+    COALESCE(pv.upvotes, 0) AS upvotes,
+    COALESCE(pv.downvotes, 0) AS downvotes,
+    CASE
+        WHEN cte.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN cte.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        ELSE 'Open'
+    END AS post_status,
+    cte.owner_post_rank
+FROM cte
+LEFT JOIN Users u ON cte.OwnerUserId = u.Id
+LEFT JOIN post_tags_portable pt ON cte.Id = pt.Id
+LEFT JOIN post_comments pc ON cte.Id = pc.Id
+LEFT JOIN post_votes pv ON cte.Id = pv.Id
+ORDER BY cte.post_date DESC
+LIMIT 100;

@@ -1,0 +1,73 @@
+-- {"query": "3094.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 913} 
+WITH UserTags AS (
+    SELECT DISTINCT u.Id AS UserId, array_agg(DISTINCT t.TagName) AS Tags
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    LEFT JOIN Tags t ON t.Id = ANY(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><'))
+    GROUP BY u.Id
+),
+PostReplies AS (
+    SELECT p1.Id AS QuestionId, p2.Id AS AnswerId, p2.Score AS AnswerScore,
+           ROW_NUMBER() OVER (PARTITION BY p1.Id ORDER BY p2.Score DESC, p2.CreationDate) AS Rank
+    FROM Posts p1
+    LEFT JOIN Posts p2 ON p2.ParentId = p1.Id AND p2.PostTypeId = 2
+),
+TopAnswerScores AS (
+    SELECT QuestionId, MAX(AnswerScore) AS MaxScore
+    FROM PostReplies
+    WHERE Rank = 1
+    GROUP BY QuestionId
+),
+RecentReviews AS (
+    SELECT ph.PostId, ph.UserId AS EditorId, ph.CreationDate AS EditDate, ph.PostHistoryTypeId,
+           JSON_AGG(json_build_object('Type', pht.Name, 'Date', ph.CreationDate)) AS HistoryDetails
+    FROM PostHistory ph
+    LEFT JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId
+    WHERE ph.PostHistoryTypeId IN (4, 6, 10, 16)
+    GROUP BY ph.PostId, ph.UserId, ph.CreationDate, ph.PostHistoryTypeId
+),
+FlaggedPosts AS (
+    SELECT p.Id, c.Score AS CommentScore, v.Score AS VoteScore, 
+           (c.Score + v.Score) AS TotalScore
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId, SUM(CASE WHEN Score IS NULL THEN 0 WHEN Score < 0 THEN -Score ELSE Score END) AS Score
+        FROM Comments
+        GROUP BY PostId
+    ) c ON c.PostId = p.Id
+    LEFT JOIN (
+        SELECT PostId, SUM(CASE WHEN VoteTypeId IN (2,3) THEN CASE WHEN VoteTypeId=2 THEN 1 ELSE -1 END ELSE 0 END) AS Score
+        FROM Votes
+        GROUP BY PostId
+    ) v ON v.PostId = p.Id
+),
+EligiblePosts AS (
+    SELECT p.*, ur.Tags AS OwnerTags, rr.AnswerId, rr.AnswerScore, fr.CommentScore, fr.VoteScore, fr.TotalScore
+    FROM Posts p
+    LEFT JOIN UserTags ur ON ur.UserId = p.OwnerUserId
+    LEFT JOIN PostReplies rr ON rr.QuestionId = p.Id
+    LEFT JOIN RecentReviews fr ON fr.PostId = p.Id
+    LEFT JOIN FlaggedPosts fp ON fp.Id = p.Id
+    WHERE p.PostTypeId = 1
+),
+ComplexFilter AS (
+    SELECT *, 
+           (ResponseCount := CASE WHEN AnswerCount IS NULL THEN 0 ELSE AnswerCount END) * 2 + (Score + NVL(ViewCount,0)) AS PerformanceMetric,
+           CASE WHEN OwnerTags IS NULL OR array_length(OwnerTags,1) = 0 THEN FALSE ELSE TRUE END AS IsTaggedOwner
+    FROM (
+        SELECT p.*, 
+               (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = p.Id AND a.PostTypeId = 2) AS ResponseCount,
+               (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotesCount
+        FROM EligiblePosts p
+    ) AS Details
+)
+SELECT DISTINCT p.Id, p.Title, p.CreationDate, p.OwnerUserId, p.AnswerId,
+                p.AnswerScore, p.CommentScore, p.VoteScore, p.TotalScore,
+                p.OwnerTags, p.IsTaggedOwner, pm.PerformanceMetric
+FROM Posts p
+LEFT JOIN ComplexFilter pm ON pm.Id = p.Id
+WHERE pm.PerformanceMetric > 100
+  AND p.PostTypeId = 1
+  AND (p.ClosedDate IS NULL OR p.ClosedDate > NOW() - INTERVAL '30 days')
+  AND p.Title ILIKE '%performance%'
+ORDER BY pm.PerformanceMetric DESC, p.CreationDate DESC;

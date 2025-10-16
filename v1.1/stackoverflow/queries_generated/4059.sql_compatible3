@@ -1,0 +1,153 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        ARRAY[t.TagName] AS Path,
+        t.IsModeratorOnly
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+    UNION ALL
+    SELECT 
+        c.Id,
+        c.TagName,
+        c.Count,
+        r.Level + 1,
+        r.Path || c.TagName,
+        c.IsModeratorOnly
+    FROM Tags c
+    JOIN PostLinks pl ON pl.PostId = c.ExcerptPostId
+    JOIN RecursiveTagHierarchy r ON pl.RelatedPostId = r.Id
+    WHERE c.IsModeratorOnly = FALSE AND NOT c.TagName = ANY(r.Path)
+),
+UserBadgeRanks AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        SUM(u.Reputation) OVER (PARTITION BY u.Id) AS TotalReputation,
+        ROW_NUMBER() OVER (ORDER BY SUM(u.Reputation) DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+QuestionAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionDate,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViews,
+        (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2) AS AnswerCount,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = q.Id) AS QuestionCommentCount,
+        (SELECT AVG(a.Score) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2) AS AvgAnswerScore,
+        u.Id AS OwnerId,
+        u.DisplayName AS OwnerName,
+        u.Reputation AS OwnerReputation
+    FROM Posts q
+    LEFT JOIN Users u ON q.OwnerUserId = u.Id
+    WHERE q.PostTypeId = 1 AND q.ClosedDate IS NULL
+),
+AnswerWithAcceptedAndVotes AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerDate,
+        a.OwnerUserId AS AnswerOwnerId,
+        CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END AS IsAccepted,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 2) AS UpVotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 3) AS DownVotes
+    FROM Posts a
+    JOIN Posts q ON q.Id = a.ParentId AND q.PostTypeId = 1
+    WHERE a.PostTypeId = 2
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.CreationDate,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) OVER (PARTITION BY u.Id ORDER BY p.CreationDate ROWS BETWEEN 365 PRECEDING AND CURRENT ROW) AS QuestionsPostedLastYear,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) OVER (PARTITION BY u.Id ORDER BY p.CreationDate ROWS BETWEEN 365 PRECEDING AND CURRENT ROW) AS AnswersPostedLastYear,
+        SUM(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) OVER (PARTITION BY u.Id ORDER BY p.CreationDate ROWS BETWEEN 365 PRECEDING AND CURRENT ROW) AS TotalScoreLastYear
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+),
+ComplexFilteredPosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Tags,
+        ROUND(
+            (
+                COALESCE(p.Score,0) * 0.7 +
+                COALESCE(p.ViewCount,0) * 0.2 + 
+                COALESCE(p.FavoriteCount,0) * 5 - 
+                COALESCE(aw.UpVotes,0) * 0.1 + 
+                COALESCE(aw.DownVotes,0) * 0.3 +
+                CASE WHEN p.ClosedDate IS NOT NULL THEN -100 ELSE 0 END
+            ), 2) AS CompositeScore,
+        LENGTH(COALESCE(p.Body,'')) AS BodyLength,
+        p.CreationDate,
+        u.DisplayName AS OwnerName
+    FROM Posts p
+    LEFT JOIN AnswerWithAcceptedAndVotes aw ON aw.AnswerId = p.Id
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId IN (1, 2)
+        AND (p.Body IS NOT NULL AND LENGTH(p.Body) > 20)
+        AND (
+            LOWER(p.Title) LIKE '%performance%' 
+            OR LOWER(p.Tags) LIKE '%<sql>%'
+            OR EXISTS (
+                SELECT 1 FROM Comments c WHERE c.PostId = p.Id AND LOWER(c.Text) LIKE '%benchmark%'
+            )
+        )
+),
+FinalRankedResults AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.CompositeScore,
+        p.BodyLength,
+        p.OwnerName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CompositeScore DESC, p.BodyLength DESC) AS RankByPostType,
+        DENSE_RANK() OVER (ORDER BY p.CompositeScore DESC) AS GlobalRank,
+        p.PostTypeId,
+        p.Tags
+    FROM ComplexFilteredPosts p
+)
+
+SELECT 
+    fr.Id,
+    fr.Title,
+    fr.CompositeScore,
+    fr.BodyLength,
+    fr.OwnerName,
+    fr.RankByPostType,
+    fr.GlobalRank,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    uaw.QuestionsPostedLastYear,
+    uaw.AnswersPostedLastYear,
+    uaw.TotalScoreLastYear,
+    STRING_AGG(rth.TagName, ', ' ORDER BY rth.Level) AS RelatedTags
+FROM FinalRankedResults fr
+LEFT JOIN UserBadgeRanks us ON us.UserId = (SELECT OwnerUserId FROM Posts WHERE Id = fr.Id)
+LEFT JOIN UserActivityWindow uaw ON uaw.UserId = (SELECT OwnerUserId FROM Posts WHERE Id = fr.Id)
+LEFT JOIN LATERAL (
+    SELECT t.TagName, t.Count, t.IsModeratorOnly, 1 AS Level FROM Tags t
+    WHERE fr.Tags LIKE '%' || ('<' || t.TagName || '>') || '%'
+    UNION
+    SELECT rth.TagName, rth.Count, rth.IsModeratorOnly, rth.Level FROM RecursiveTagHierarchy rth WHERE rth.TagName IN (
+        SELECT UNNEST(string_to_array(substring(fr.Tags FROM 2 FOR length(fr.Tags)-2), '><'))
+    )
+) rth ON TRUE
+WHERE fr.GlobalRank <= 50
+GROUP BY fr.Id, fr.Title, fr.CompositeScore, fr.BodyLength, fr.OwnerName, fr.RankByPostType, fr.GlobalRank, us.GoldBadges, us.SilverBadges, us.BronzeBadges, uaw.QuestionsPostedLastYear, uaw.AnswersPostedLastYear, uaw.TotalScoreLastYear, fr.PostTypeId, fr.Tags
+ORDER BY fr.GlobalRank, fr.RankByPostType;
