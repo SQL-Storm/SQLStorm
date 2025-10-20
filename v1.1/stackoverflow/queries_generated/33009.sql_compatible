@@ -1,0 +1,35 @@
+SELECT
+    p.OwnerUserId AS UserID,
+    u.DisplayName AS UserName,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT c.Id) AS TotalComments,
+    COUNT(DISTINCT answered.AnswerId) AS TotalAnswers,
+    COUNT(DISTINCT bt.BadgedUser) AS TotalBadges,
+    AVG(p.Score) AS AveragePostScore,
+    MAX(p.CreationDate) AS LastPostDate,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+    COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 6) THEN 1 END) AS EditsCount,
+    COUNT(DISTINCT pl.RelatedPostId) AS LinkedPostsCount
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1, 2)
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN Votes v ON p.Id = v.PostId
+LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN (
+    SELECT
+        b.UserId AS BadgedUser,
+        b.Name AS BadgeName
+    FROM Badges b
+) bt ON u.Id = bt.BadgedUser
+LEFT JOIN (
+    SELECT
+        a.OwnerUserId AS AnswerOwner,
+        a.Id AS AnswerId
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+) answered ON answered.AnswerOwner = u.Id
+GROUP BY p.OwnerUserId, u.Id, u.DisplayName
+ORDER BY TotalPosts DESC
+LIMIT 50;

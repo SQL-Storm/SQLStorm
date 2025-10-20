@@ -1,0 +1,76 @@
+-- {"query": "59017.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2061, "output_tokens": 880} 
+SELECT 
+    p.Id AS PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    COUNT(DISTINCT v.Id) AS VoteCount,
+    COUNT(DISTINCT bh.Id) AS HistoryCount,
+    COUNT(DISTINCT pl.Id) AS LinkCount,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS Tags,
+    CASE 
+        WHEN p.PostTypeId = 1 THEN 'Question'
+        WHEN p.PostTypeId = 2 THEN 'Answer'
+        WHEN p.PostTypeId = 3 THEN 'Wiki'
+        WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+        WHEN p.PostTypeId = 5 THEN 'TagWiki'
+        WHEN p.PostTypeId = 6 THEN 'ModeratorNomination'
+        WHEN p.PostTypeId = 7 THEN 'WikiPlaceholder'
+        WHEN p.PostTypeId = 8 THEN 'PrivilegeWiki'
+    END AS PostType,
+    CASE 
+        WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+        WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.PostTypeId = 1 AND p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        WHEN p.PostTypeId = 2 AND p.ParentId IS NOT NULL THEN 'Answer'
+        ELSE 'Unspecified'
+    END AS Status,
+    AVG(CAST(p.Score AS FLOAT)) OVER (PARTITION BY u.Id ORDER BY p.CreationDate ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) AS MovingAvgScore,
+    RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+    DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS UserReputationRank,
+    PERCENT_RANK() OVER (ORDER BY p.ViewCount) AS ViewPercentile,
+    NTILE(100) OVER (ORDER BY p.CreationDate) AS TimeDecile,
+    LAG(p.Score, 1) OVER (PARTITION BY u.Id ORDER BY p.CreationDate) AS PrevScore,
+    LEAD(p.Score, 1) OVER (PARTITION BY u.Id ORDER BY p.CreationDate) AS NextScore,
+    IIF(p.Score > 1000, 'High', IIF(p.Score > 100, 'Medium', 'Low')) AS ScoreCategory
+FROM Posts p
+JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Comments c ON p.Id = c.PostId AND c.Score >= 0
+LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+LEFT JOIN PostHistory bh ON p.Id = bh.PostId AND bh.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+LEFT JOIN PostLinks pl ON p.Id = pl.PostId OR p.Id = pl.RelatedPostId
+LEFT JOIN (
+    SELECT PostId, UNNEST(string_to_array(Tags, '<>')) AS TagName
+    FROM Posts
+    WHERE Tags IS NOT NULL AND Tags != ''
+) t ON p.Id = t.PostId
+WHERE p.CreationDate >= '2022-01-01' 
+    AND p.PostTypeId IN (1, 2, 3)
+    AND u.Reputation >= 100
+GROUP BY 
+    p.Id, 
+    p.Title, 
+    p.Score, 
+    p.ViewCount, 
+    p.CreationDate, 
+    u.DisplayName, 
+    u.Reputation, 
+    p.PostTypeId, 
+    p.AcceptedAnswerId, 
+    p.ClosedDate, 
+    p.CommunityOwnedDate, 
+    p.ParentId
+HAVING 
+    COUNT(DISTINCT c.Id) > 0
+    OR COUNT(DISTINCT v.Id) > 0
+    OR COUNT(DISTINCT bh.Id) > 0
+ORDER BY 
+    p.Score DESC,
+    p.ViewCount DESC,
+    p.CreationDate DESC, 
+    u.Reputation DESC
+LIMIT 10000;

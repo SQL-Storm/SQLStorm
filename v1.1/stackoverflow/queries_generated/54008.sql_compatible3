@@ -1,0 +1,71 @@
+WITH
+    question_tags AS (
+        SELECT
+            p.Id AS post_id,
+            TRIM(BOTH '<>' FROM tag) AS tag_name
+        FROM Posts p,
+             UNNEST(STRING_TO_ARRAY(p.Tags, '><')) AS tag
+        WHERE p.PostTypeId = 1
+    ),
+
+    tag_stats AS (
+        SELECT
+            qt.tag_name AS tag_name,
+            COUNT(*) AS question_count,
+            SUM(p.Score) AS total_score,
+            AVG(p.Score) AS avg_score,
+            SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS accepted_answers,
+            SUM(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS closed_questions
+        FROM question_tags qt
+        JOIN Posts p ON p.Id = qt.post_id
+        GROUP BY qt.tag_name
+    ),
+
+    duplicate_counts AS (
+        SELECT
+            t.TagName AS tag_name,
+            COUNT(*) AS duplicate_cnt
+        FROM Tags t
+        JOIN PostLinks l ON l.LinkTypeId = 3
+        JOIN Posts dup ON dup.Id = l.RelatedPostId
+        JOIN Posts owner ON owner.Id = l.PostId
+        LEFT JOIN UNNEST(STRING_TO_ARRAY(dup.Tags, '><')) AS dup_tag(tag) ON TRUE
+        LEFT JOIN UNNEST(STRING_TO_ARRAY(owner.Tags, '><')) AS owner_tag(tag) ON TRUE
+        WHERE TRIM(BOTH '<>' FROM dup_tag.tag) = t.TagName
+          AND TRIM(BOTH '<>' FROM owner_tag.tag) = t.TagName
+        GROUP BY t.TagName
+    ),
+
+    top_users AS (
+        SELECT
+            qt.tag_name,
+            STRING_AGG(u.DisplayName, ', ' ORDER BY u.Reputation DESC) FILTER (WHERE u.DisplayName IS NOT NULL) AS top_users
+        FROM question_tags qt
+        JOIN Posts p ON p.Id = qt.post_id
+        JOIN Users u ON p.OwnerUserId = u.Id
+        GROUP BY qt.tag_name
+    )
+
+SELECT
+    ts.tag_name,
+    ts.question_count,
+    ts.total_score,
+    ts.avg_score,
+    ts.accepted_answers,
+    ts.closed_questions,
+    COALESCE(dc.duplicate_cnt, 0) AS duplicate_cnt,
+    tu.top_users
+FROM tag_stats ts
+LEFT JOIN duplicate_counts dc ON dc.tag_name = ts.tag_name
+LEFT JOIN top_users tu ON tu.tag_name = ts.tag_name
+GROUP BY
+    ts.tag_name,
+    ts.question_count,
+    ts.total_score,
+    ts.avg_score,
+    ts.accepted_answers,
+    ts.closed_questions,
+    dc.duplicate_cnt,
+    tu.top_users
+ORDER BY ts.question_count DESC
+LIMIT 25;

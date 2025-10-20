@@ -1,0 +1,81 @@
+WITH
+TagList AS (
+    SELECT
+        p.Id AS QuestionId,
+        unnest(
+            string_to_array(
+                substring(p.Tags FROM 2 FOR length(p.Tags) - 2),
+                '><'
+            )
+        ) AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+AnswerStats AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerDate,
+        u.Reputation AS AnswererReputation
+    FROM Posts a
+    JOIN Users u
+      ON a.OwnerUserId = u.Id
+    WHERE a.PostTypeId = 2
+),
+AcceptedByTag AS (
+    SELECT
+        tl.Tag,
+        ast.AnswerId,
+        ast.AnswerScore,
+        ast.AnswerDate,
+        ast.AnswererReputation
+    FROM TagList tl
+    JOIN AnswerStats ast
+      ON ast.QuestionId = tl.QuestionId
+    JOIN Posts q
+      ON q.Id = tl.QuestionId
+     AND q.AcceptedAnswerId = ast.AnswerId
+),
+TagMetrics AS (
+    SELECT
+        Tag,
+        COUNT(*) AS TotalAccepted,
+        AVG(AnswerScore) AS AvgScore,
+        percentile_cont(0.5) WITHIN GROUP (ORDER BY AnswerScore) AS MedianScore,
+        AVG(AnswererReputation) AS AvgReputation,
+        MAX(AnswerScore) AS MaxScore,
+        MIN(AnswerScore) AS MinScore
+    FROM AcceptedByTag
+    GROUP BY Tag
+),
+TopTags AS (
+    SELECT
+        tm.Tag,
+        tm.TotalAccepted,
+        tm.AvgScore,
+        tm.MedianScore,
+        tm.AvgReputation,
+        tm.MaxScore,
+        tm.MinScore,
+        DENSE_RANK() OVER (ORDER BY tm.AvgScore DESC) AS ScoreRank
+    FROM TagMetrics tm
+),
+FinalSelection AS (
+    SELECT
+        Tag,
+        TotalAccepted,
+        AvgScore,
+        MedianScore,
+        AvgReputation,
+        MaxScore,
+        MinScore,
+        ScoreRank
+    FROM TopTags
+    WHERE ScoreRank <= 10
+)
+SELECT
+    jsonb_pretty(
+        jsonb_agg(to_jsonb(FinalSelection) ORDER BY ScoreRank)
+    ) AS TopTagsAcceptedAnswerStats
+FROM FinalSelection;

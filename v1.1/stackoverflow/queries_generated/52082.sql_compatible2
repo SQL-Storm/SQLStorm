@@ -1,0 +1,145 @@
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS QuestionScoreSum,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS AnswerScoreSum,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT v.Id) AS VoteCountReceived,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT ph.Id) AS HistoryEvents,
+        MAX(p.LastActivityDate) AS LastPostActivity
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+RankedUsers AS (
+    SELECT 
+        ua.*,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, TotalPosts DESC) AS RepRank,
+        ROW_NUMBER() OVER (ORDER BY QuestionScoreSum + AnswerScoreSum DESC) AS ScoreRank,
+        ROW_NUMBER() OVER (ORDER BY BadgeCount DESC) AS BadgeRank
+    FROM UserActivity ua
+    WHERE TotalPosts > 0
+),
+PostStats AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CreationDate,
+        u.DisplayName AS OwnerName,
+        COUNT(v.Id) AS VoteCount,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(pl.Id) AS LinkCount,
+        AVG(
+            CASE WHEN v2.VoteTypeId = 2 THEN EXTRACT(EPOCH FROM (v2.CreationDate - p.CreationDate)) END
+        ) AS AvgUpvoteDelay
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId OR p.Id = pl.RelatedPostId
+    LEFT JOIN Votes v2 ON p.Id = v2.PostId AND v2.VoteTypeId = 2
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.Tags, p.Score, p.ViewCount, p.AnswerCount, p.CreationDate, u.DisplayName
+),
+TagAnalysis AS (
+    SELECT 
+        Tag,
+        COUNT(*) AS PostCount,
+        AVG(ps.Score) AS AvgScore,
+        SUM(ps.ViewCount) AS TotalViews,
+        SUM(ps.AnswerCount) AS TotalAnswers,
+        MAX(ps.Score) AS MaxScore
+    FROM (
+        SELECT ps.*,
+               TRIM(tg) AS Tag
+        FROM PostStats ps,
+             UNNEST(string_to_array(SUBSTRING(ps.Tags FROM 2 FOR CHAR_LENGTH(ps.Tags)-2), '><')) AS tg
+        WHERE ps.Tags IS NOT NULL
+    ) ps
+    GROUP BY Tag
+    HAVING COUNT(*) > 10
+),
+TopContributors AS (
+    SELECT ru.UserId, ru.DisplayName, ru.Reputation, ru.TotalPosts, ru.QuestionScoreSum + ru.AnswerScoreSum AS TotalScore
+    FROM RankedUsers ru
+    WHERE ru.RepRank <= 100
+    UNION ALL
+    SELECT ru.UserId, ru.DisplayName, ru.Reputation, ru.TotalPosts, ru.QuestionScoreSum + ru.AnswerScoreSum AS TotalScore
+    FROM RankedUsers ru
+    WHERE ru.ScoreRank <= 100
+),
+UserTopTag AS (
+    SELECT t.UserId,
+           t.Tag AS TopTag
+    FROM (
+        SELECT p.OwnerUserId AS UserId,
+               TRIM(tg) AS Tag,
+               COUNT(*) AS PostCount
+        FROM Posts p,
+             UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), '><')) AS tg
+        WHERE p.PostTypeId = 1
+        GROUP BY p.OwnerUserId, TRIM(tg)
+    ) t
+    JOIN (
+        SELECT UserId, MAX(PostCount) AS MaxCount
+        FROM (
+            SELECT p.OwnerUserId AS UserId,
+                   TRIM(tg) AS Tag,
+                   COUNT(*) AS PostCount
+            FROM Posts p,
+                 UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), '><')) AS tg
+            WHERE p.PostTypeId = 1
+            GROUP BY p.OwnerUserId, TRIM(tg)
+        ) x
+        GROUP BY UserId
+    ) m ON t.UserId = m.UserId AND t.PostCount = m.MaxCount
+),
+UserRepresentativePost AS (
+    SELECT p2.OwnerUserId AS UserId, p2.Id AS PostId, p2.Score
+    FROM Posts p2
+    WHERE p2.PostTypeId = 1
+),
+FinalPosts AS (
+    SELECT tc.UserId,
+           tc.DisplayName,
+           tc.Reputation,
+           tc.TotalPosts,
+           tc.TotalScore,
+           utt.TopTag,
+           ta.AvgScore,
+           ta.TotalViews,
+           ps.PostId,
+           ps.Title AS PostTitle,
+           ps.Score AS PostScore,
+           ps.ViewCount,
+           ps.VoteCount,
+           ps.CommentCount
+    FROM TopContributors tc
+    LEFT JOIN UserTopTag utt ON tc.UserId = utt.UserId
+    LEFT JOIN TagAnalysis ta ON utt.TopTag = ta.Tag
+    LEFT JOIN PostStats ps ON ps.PostId = (
+        SELECT p.Id
+        FROM Posts p
+        WHERE p.OwnerUserId = tc.UserId
+          AND p.PostTypeId = 1
+        ORDER BY p.Score DESC, p.ViewCount DESC
+        LIMIT 1
+    )
+)
+SELECT *
+FROM FinalPosts
+ORDER BY TotalScore DESC, PostScore DESC
+LIMIT 500;

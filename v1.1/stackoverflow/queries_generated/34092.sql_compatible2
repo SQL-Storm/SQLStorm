@@ -1,0 +1,134 @@
+WITH RankedAnswers AS (
+  SELECT 
+    p.Id AS AnswerId,
+    p.ParentId AS QuestionId,
+    p.Score AS AnswerScore,
+    ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS AnswerRank,
+    u.Id AS OwnerUserId,
+    u.Reputation AS OwnerReputation,
+    u.CreationDate AS OwnerCreationDate,
+    u.Location AS OwnerLocation
+  FROM Posts p
+  JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 2
+),
+TopAnswers AS (
+  SELECT * FROM RankedAnswers WHERE AnswerRank = 1
+),
+QuestionStats AS (
+  SELECT 
+    q.Id AS QuestionId,
+    q.Title,
+    q.Score AS QuestionScore,
+    q.ViewCount,
+    q.CreationDate AS QuestionCreationDate,
+    q.Tags,
+    q.AnswerCount,
+    u.Id AS QuestionOwnerId,
+    u.Reputation AS QuestionOwnerReputation,
+    u.Location AS QuestionOwnerLocation,
+    COALESCE(badge_counts.GoldBadges, 0) AS GoldBadges,
+    COALESCE(badge_counts.SilverBadges, 0) AS SilverBadges,
+    COALESCE(badge_counts.BronzeBadges, 0) AS BronzeBadges
+  FROM Posts q
+  JOIN Users u ON q.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT 
+      UserId,
+      SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+      SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+      SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges
+    GROUP BY UserId
+  ) badge_counts ON u.Id = badge_counts.UserId
+  WHERE q.PostTypeId = 1
+),
+AnswerVoteStats AS (
+  SELECT 
+    a.AnswerId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    SUM(CASE WHEN v.VoteTypeId = 8 THEN 1 ELSE 0 END) AS BountyStarts,
+    SUM(COALESCE(v.BountyAmount,0)) AS TotalBountyAmount
+  FROM RankedAnswers a
+  LEFT JOIN Votes v ON a.AnswerId = v.PostId
+  GROUP BY a.AnswerId
+),
+ComplexTags AS (
+  SELECT 
+    q.QuestionId,
+    ARRAY_AGG(t.TagName ORDER BY t.Count DESC) AS TagList,
+    COUNT(t.Id) AS TagCount
+  FROM QuestionStats q
+  LEFT JOIN LATERAL (
+    -- normalize tags like '<tag1><tag2>' into rows using standard string functions
+    SELECT TRIM(both '<>' FROM part) AS tag
+    FROM (
+      SELECT UNNEST(
+        regexp_split_to_array(
+          SUBSTRING(q.Tags FROM 2 FOR (CHAR_LENGTH(q.Tags) - 2)),
+          '\>\<'
+        )
+      ) AS part
+    ) s
+  ) AS tag_array ON TRUE
+  LEFT JOIN Tags t ON t.TagName = tag_array.tag
+  GROUP BY q.QuestionId
+),
+TopQuestions AS (
+  SELECT 
+    qs.QuestionId,
+    qs.Title,
+    qs.QuestionScore,
+    qs.ViewCount,
+    qs.AnswerCount,
+    qs.QuestionOwnerId,
+    qs.QuestionOwnerReputation,
+    qs.QuestionOwnerLocation,
+    qs.GoldBadges,
+    qs.SilverBadges,
+    qs.BronzeBadges,
+    ats.AnswerId,
+    ats.AnswerScore,
+    ats.OwnerUserId AS AnswerOwnerUserId,
+    ats.OwnerReputation AS AnswerOwnerReputation,
+    avs.UpVotes AS AnswerUpVotes,
+    avs.DownVotes AS AnswerDownVotes,
+    avs.BountyStarts,
+    avs.TotalBountyAmount,
+    ct.TagList,
+    ct.TagCount
+  FROM QuestionStats qs
+  LEFT JOIN TopAnswers ats ON qs.QuestionId = ats.QuestionId
+  LEFT JOIN AnswerVoteStats avs ON ats.AnswerId = avs.AnswerId
+  LEFT JOIN ComplexTags ct ON qs.QuestionId = ct.QuestionId
+  WHERE qs.AnswerCount > 0
+    AND qs.ViewCount > 10000
+    AND qs.QuestionScore > 5
+    AND avs.UpVotes > 10
+)
+SELECT 
+  tq.QuestionId,
+  tq.Title,
+  tq.QuestionScore,
+  tq.ViewCount,
+  tq.AnswerCount,
+  tq.QuestionOwnerId,
+  tq.QuestionOwnerReputation,
+  tq.QuestionOwnerLocation,
+  tq.GoldBadges,
+  tq.SilverBadges,
+  tq.BronzeBadges,
+  tq.AnswerId,
+  tq.AnswerScore,
+  tq.AnswerOwnerUserId,
+  tq.AnswerOwnerReputation,
+  tq.AnswerUpVotes,
+  tq.AnswerDownVotes,
+  tq.BountyStarts,
+  tq.TotalBountyAmount,
+  array_to_string(tq.TagList, ', ') AS Tags,
+  tq.TagCount
+FROM TopQuestions tq
+ORDER BY tq.ViewCount DESC, tq.QuestionScore DESC, tq.AnswerScore DESC
+LIMIT 100;

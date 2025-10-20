@@ -1,0 +1,112 @@
+-- {"query": "21.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 882} 
+WITH recent_posts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.PostTypeId,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    COALESCE(LEAD(p.Id) OVER (ORDER BY p.CreationDate), NULL) AS NextPostId
+  FROM Posts p
+  WHERE p.CreationDate >= DATEADD(DAY, -180, CURRENT_TIMESTAMP)
+),
+top_author AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.Location,
+    u.EmailHash,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.UpVotes DESC) AS rn
+  FROM Users u
+),
+tag_summary AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS TagPostCount,
+    SUM(p.ViewCount) OVER (PARTITION BY t.TagName) AS TagTotalViews,
+    AVG(p.Score) OVER (PARTITION BY t.TagName) AS AvgTagScore
+  FROM Posts p
+  CROSS APPLY (
+    SELECT *
+    FROM string_split(REPLACE(REPLACE(p.Tags, '<', ''), '>', ''), '')
+  ) s
+  JOIN Tags t ON t.TagName = s.value
+  WHERE p.PostTypeId = 1
+),
+post_history_summary AS (
+  SELECT
+    ph.PostId,
+    MAX(ph.CreationDate) AS LastEditDate,
+    SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS ClosedVotes,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 16 THEN ph.CreationDate END) AS CommunityOwnedAt,
+    COUNT(*) AS HistoryEvents
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+complex_calculations AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.Score * 1.0 / NULLIF(p.ViewCount, 0) AS ScorePerView,
+    CASE
+      WHEN p.ViewCount > 1000 THEN 1
+      WHEN p.ViewCount > 100 THEN 0.5
+      ELSE 0
+    END AS ViewDensityTier,
+    (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) AS AvgQuestionScore,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = p.OwnerUserId) AS PostsByAuthor
+  FROM Posts p
+  LEFT JOIN post_history_summary phs ON phs.PostId = p.Id
+)
+SELECT
+  rp.Id AS PostId,
+  rp.Title,
+  rp.PostTypeId,
+  rp.CreationDate,
+  rp.LastActivityDate,
+  rp.Score,
+  rp.ViewCount,
+  rp.Tags,
+  rp.AnswerCount,
+  rp.CommentCount,
+  rp.FavoriteCount,
+  fu.UserId AS AuthorUserId,
+  fu.DisplayName AS AuthorDisplayName,
+  fu.Reputation AS AuthorReputation,
+  fu.UserCreationDate AS AuthorCreationDate,
+  fu.LastAccessDate AS AuthorLastAccessDate,
+  ts.TagPostCount,
+  ts.TagTotalViews,
+  ts.AvgTagScore,
+  phs.LastEditDate,
+  phs.ClosedVotes,
+  phs.CommunityOwnedAt,
+  phs.HistoryEvents,
+  cc.ScorePerView,
+  cc.ViewDensityTier,
+  cc.AvgQuestionScore,
+  cc.PostsByAuthor
+FROM recent_posts rp
+LEFT JOIN top_author fu ON rp.OwnerUserId = fu.UserId
+LEFT JOIN post_history_summary phs ON rp.Id = phs.PostId
+LEFT JOIN tag_summary ts ON 1 = 1
+LEFT JOIN complex_calculations cc ON rp.Id = cc.Id
+WHERE rp.ViewCount IS NOT NULL
+  AND rp.CreationDate >= DATEADD(MONTH, -6, CURRENT_TIMESTAMP)
+ORDER BY rp.LastActivityDate DESC
+LIMIT 100;

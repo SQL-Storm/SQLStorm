@@ -1,0 +1,62 @@
+WITH AnswerVotes AS (
+    SELECT
+        p.Id AS AnswerId,
+        p.ParentId AS QuestionId,
+        p.OwnerUserId AS OwnerUserId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 1 THEN 1 END) AS AcceptedVotes
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.PostTypeId = 2
+    GROUP BY p.Id, p.ParentId, p.OwnerUserId
+),
+QuestionTags AS (
+    SELECT
+        q.Id AS QuestionId,
+        TRIM(BOTH '<>' FROM UNNEST(string_to_array(q.Tags, '><'))) AS Tag
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+),
+UserStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(DISTINCT av.QuestionId) AS AnsweredQuestions,
+        SUM(av.UpVotes) AS TotalUpVotes,
+        SUM(av.DownVotes) AS TotalDownVotes,
+        SUM(CASE WHEN p.AcceptedAnswerId = av.AnswerId THEN 1 ELSE 0 END) AS AcceptedAnswers
+    FROM Users u
+    JOIN AnswerVotes av ON av.OwnerUserId = u.Id
+    JOIN Posts p ON p.Id = av.QuestionId
+    GROUP BY u.Id, u.Reputation, u.DisplayName
+),
+TagPerformance AS (
+    SELECT
+        qt.Tag,
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        COUNT(*) AS AnswersInTag,
+        SUM(av.UpVotes) AS TagUpVotes,
+        AVG(p.Score) AS AvgAnswerScore,
+        ROW_NUMBER() OVER (PARTITION BY qt.Tag ORDER BY SUM(av.UpVotes) DESC) AS RankByVotes
+    FROM QuestionTags qt
+    JOIN AnswerVotes av ON av.QuestionId = qt.QuestionId
+    JOIN UserStats us ON us.UserId = av.OwnerUserId
+    JOIN Posts p ON p.Id = av.AnswerId
+    GROUP BY qt.Tag, us.UserId, us.DisplayName, us.Reputation
+)
+SELECT
+    tp.Tag,
+    tp.UserId,
+    tp.DisplayName,
+    tp.Reputation,
+    tp.AnswersInTag,
+    tp.TagUpVotes,
+    tp.AvgAnswerScore,
+    tp.RankByVotes
+FROM TagPerformance tp
+WHERE tp.RankByVotes <= 5
+ORDER BY tp.Tag, tp.RankByVotes;

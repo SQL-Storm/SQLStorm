@@ -1,0 +1,38 @@
+WITH UserTagInteractions AS (
+    SELECT 
+        u.Id AS UserId,
+        tag.TagName,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(v.VoteCount) AS TotalVotes,
+        RANK() OVER (PARTITION BY u.Id ORDER BY COUNT(DISTINCT p.Id) DESC) AS TagRank
+    FROM 
+        Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    JOIN (SELECT PostId, COUNT(*) AS VoteCount FROM Votes GROUP BY PostId) v ON p.Id = v.PostId
+    -- split tags like '<tag1><tag2>' into rows in a SQL-standard way
+    JOIN LATERAL (
+        SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR (LENGTH(p.Tags) - 2)), '><')) AS TagName
+    ) tag ON TRUE
+    WHERE 
+        p.PostTypeId = 1
+        AND u.Reputation > 1000
+    GROUP BY 
+        u.Id, tag.TagName
+)
+SELECT 
+    UserId,
+    TagName,
+    PostCount,
+    AvgPostScore,
+    TotalVotes,
+    TagRank
+FROM 
+    UserTagInteractions
+WHERE 
+    TagRank <= 3
+    AND PostCount > 5
+ORDER BY 
+    TotalVotes DESC, 
+    AvgPostScore DESC
+LIMIT 1000;

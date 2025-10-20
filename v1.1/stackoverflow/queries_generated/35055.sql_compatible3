@@ -1,0 +1,161 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersGiven,
+        SUM(COALESCE(p.ViewCount, 0)) AS TotalViews,
+        SUM(COALESCE(p.Score, 0)) AS PostScore,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        MIN(u.CreationDate) AS FirstSeen,
+        MAX(u.LastAccessDate) AS LastSeen
+    FROM
+        Users u
+        LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+        LEFT JOIN Comments c ON u.Id = c.UserId
+        LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation
+),
+MostActiveTags AS (
+    SELECT
+        exploded.OwnerUserId AS UserId,
+        exploded.tag AS Tag,
+        COUNT(*) AS TagUsage
+    FROM (
+        SELECT
+            base.OwnerUserId,
+            TRIM(sub.substring_tags) AS tag
+        FROM (
+            SELECT
+                p.OwnerUserId,
+                CASE
+                    WHEN p.Tags IS NULL THEN NULL
+                    ELSE
+                        CASE
+                            WHEN LEFT(p.Tags,1) = '<' AND RIGHT(p.Tags,1) = '>' THEN SUBSTR(p.Tags, 2, LENGTH(p.Tags) - 2)
+                            WHEN LEFT(p.Tags,1) = '<' THEN SUBSTR(p.Tags, 2)
+                            WHEN RIGHT(p.Tags,1) = '>' THEN SUBSTR(p.Tags, 1, LENGTH(p.Tags) - 1)
+                            ELSE p.Tags
+                        END
+                END AS tags_normalized
+            FROM Posts p
+            WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.OwnerUserId IS NOT NULL
+        ) base
+        CROSS JOIN LATERAL (
+            SELECT v.pos, v.substring_tags
+            FROM (
+                SELECT n.n AS pos
+                FROM (
+                    SELECT ROW_NUMBER() OVER () AS n
+                    FROM (SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1) t1,
+                         (SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1) t2
+                ) n
+            ) nums
+            CROSS JOIN LATERAL (
+                SELECT
+                    CASE
+                        WHEN base.tags_normalized = '' THEN NULL
+                        ELSE
+                            CASE
+                                WHEN nums.pos = 1 THEN
+                                    CASE WHEN POSITION('><' IN base.tags_normalized) = 0 THEN base.tags_normalized
+                                         ELSE SUBSTR(base.tags_normalized, 1, POSITION('><' IN base.tags_normalized) - 1)
+                                    END
+                                ELSE
+                                    (
+                                    SELECT
+                                        CASE
+                                            WHEN start_pos = 0 THEN NULL
+                                            WHEN next_sep = 0 THEN SUBSTR(base.tags_normalized, start_pos)
+                                            ELSE SUBSTR(base.tags_normalized, start_pos, next_sep - start_pos)
+                                        END
+                                    FROM (
+                                        SELECT
+                                            CASE WHEN prev_sep = 0 THEN 1 ELSE prev_sep + 3 END AS start_pos,
+                                            POSITION('><' IN SUBSTR(base.tags_normalized, CASE WHEN prev_sep = 0 THEN 1 ELSE prev_sep + 3 END)) AS rel_next_sep,
+                                            CASE
+                                                WHEN POSITION('><' IN SUBSTR(base.tags_normalized, CASE WHEN prev_sep = 0 THEN 1 ELSE prev_sep + 3 END)) = 0 THEN 0
+                                                ELSE prev_sep + POSITION('><' IN SUBSTR(base.tags_normalized, CASE WHEN prev_sep = 0 THEN 1 ELSE prev_sep + 3 END)) + 2
+                                            END AS next_sep,
+                                            prev_sep
+                                        FROM (
+                                            SELECT
+                                                COALESCE(MAX(p1.pos), 0) AS prev_sep
+                                            FROM (
+                                                SELECT POSITION('><' IN base.tags_normalized) AS pos
+                                                FROM (
+                                                    SELECT ROW_NUMBER() OVER () AS seq
+                                                    FROM (SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1) a,
+                                                         (SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1) b
+                                                ) seqs
+                                            ) p1
+                                            WHERE p1.pos > 0
+                                            AND (SELECT COUNT(*) FROM (SELECT 1) x) >= 0
+                                        )
+                                    )
+                                    )
+                            END
+                    END AS substring_tags
+            ) v
+            WHERE v.substring_tags IS NOT NULL
+            ORDER BY v.pos
+        ) sub
+    ) exploded
+    GROUP BY
+        exploded.OwnerUserId,
+        exploded.tag
+),
+TopTagsPerUser AS (
+    SELECT
+        UserId,
+        Tag,
+        TagUsage,
+        ROW_NUMBER() OVER(PARTITION BY UserId ORDER BY TagUsage DESC, Tag ASC) AS rn
+    FROM
+        MostActiveTags
+),
+PostInterlinking AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateLinks,
+        SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS RelatedLinks
+    FROM
+        PostLinks pl
+        INNER JOIN Posts p ON pl.PostId = p.Id
+    WHERE
+        p.OwnerUserId IS NOT NULL
+    GROUP BY
+        p.OwnerUserId
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.TotalPosts,
+    ua.TotalComments,
+    ua.QuestionsAsked,
+    ua.AnswersGiven,
+    ua.TotalBadges,
+    ua.FirstSeen,
+    ua.LastSeen,
+    ua.TotalViews,
+    ua.PostScore,
+    COALESCE(dup.DuplicateLinks, 0) AS DuplicateLinks,
+    COALESCE(dup.RelatedLinks, 0) AS RelatedLinks,
+    tt.Tag AS TopTag,
+    tt.TagUsage AS TopTagUsage
+FROM
+    UserActivity ua
+    LEFT JOIN PostInterlinking dup ON ua.UserId = dup.UserId
+    LEFT JOIN (
+        SELECT UserId, Tag, TagUsage FROM TopTagsPerUser WHERE rn = 1
+    ) tt ON ua.UserId = tt.UserId
+ORDER BY
+    ua.PostScore DESC,
+    ua.TotalPosts DESC,
+    ua.UserId
+FETCH FIRST 100 ROWS ONLY;

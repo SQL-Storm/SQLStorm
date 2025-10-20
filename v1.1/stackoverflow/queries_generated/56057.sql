@@ -1,0 +1,59 @@
+-- {"query": "56057.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "llama-3.3-instruct", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 392} 
+
+WITH TopUsers AS (
+  SELECT 
+    u.Id, 
+    u.DisplayName, 
+    COUNT(DISTINCT p.Id) AS PostCount, 
+    SUM(p.Score) AS TotalScore, 
+    SUM(v.BountyAmount) AS TotalBounty
+  FROM 
+    Users u
+  JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+  LEFT JOIN 
+    Votes v ON p.Id = v.PostId AND v.VoteTypeId = 9
+  WHERE 
+    p.PostTypeId = 1 AND p.Score > 0
+  GROUP BY 
+    u.Id, u.DisplayName
+  HAVING 
+    COUNT(DISTINCT p.Id) > 10 AND SUM(p.Score) > 100
+),
+TopTags AS (
+  SELECT 
+    t.TagName, 
+    COUNT(DISTINCT p.Id) AS PostCount, 
+    SUM(p.Score) AS TotalScore
+  FROM 
+    Posts p
+  JOIN 
+    PostTags pt ON p.Id = pt.PostId
+  JOIN 
+    Tags t ON pt.TagId = t.Id
+  WHERE 
+    p.PostTypeId = 1 AND p.Score > 0
+  GROUP BY 
+    t.TagName
+  HAVING 
+    COUNT(DISTINCT p.Id) > 10 AND SUM(p.Score) > 100
+)
+SELECT 
+  tu.DisplayName, 
+  tu.PostCount, 
+  tu.TotalScore, 
+  tu.TotalBounty, 
+  tt.TagName, 
+  tt.PostCount AS TagPostCount, 
+  tt.TotalScore AS TagTotalScore
+FROM 
+  TopUsers tu
+JOIN 
+  PostTags pt ON tu.Id = pt.UserId
+JOIN 
+  Tags tt ON pt.TagId = tt.Id
+WHERE 
+  tt.TagName IN (SELECT TagName FROM TopTags)
+ORDER BY 
+  tu.TotalScore DESC, 
+  tt.TotalScore DESC;

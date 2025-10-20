@@ -1,0 +1,35 @@
+-- {"query": "33038.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 315} 
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    COUNT(p.Id) AS TotalQuestions,
+    AVG(p.Score) AS AverageQuestionScore,
+    MAX(p.CreationDate) AS LastQuestionDate,
+    COUNT(c.Id) AS TotalComments,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+    COUNT(DISTINCT b.Id) AS BadgesEarned,
+    STRING_AGG(DISTINCT t.TagName, ',') AS TagsUsed
+FROM
+    Users u
+LEFT JOIN
+    Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+LEFT JOIN
+    Comments c ON u.Id = c.UserId
+LEFT JOIN
+    Posts q ON u.Id = q.OwnerUserId AND q.PostTypeId = 1
+LEFT JOIN
+    Votes v ON q.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+LEFT JOIN
+    Badges b ON u.Id = b.UserId
+LEFT JOIN
+    PostTags pt ON p.Id = pt.PostId
+LEFT JOIN
+    Tags t ON pt.TagId = t.Id
+WHERE
+    u.CreationDate >= NOW() - INTERVAL '1 year'
+GROUP BY
+    u.Id, u.DisplayName
+ORDER BY
+    TotalQuestions DESC
+LIMIT 100;

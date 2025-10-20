@@ -1,0 +1,41 @@
+WITH RECURSIVE RecursiveUserBadge AS (
+    SELECT 
+        U.Id AS UserId,
+        U.DisplayName,
+        B.Name AS BadgeName,
+        B.Class AS Class,
+        1 AS BadgeCount
+    FROM Users U
+    INNER JOIN Badges B ON U.Id = B.UserId
+
+    UNION ALL
+
+    SELECT 
+        R.UserId,
+        R.DisplayName,
+        B.Name,
+        B.Class,
+        R.BadgeCount + 1
+    FROM RecursiveUserBadge R
+    INNER JOIN Badges B ON R.UserId = B.UserId
+    WHERE B.Class > R.Class
+), MaxBadges AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        MAX(BadgeCount) AS MaxBadgeCount
+    FROM RecursiveUserBadge
+    GROUP BY UserId, DisplayName
+)
+SELECT 
+    MU.UserId,
+    MU.DisplayName,
+    MU.MaxBadgeCount,
+    SUM(P.Score) AS TotalScore,
+    AVG(P.CommentCount) AS AvgComments,
+    COUNT(DISTINCT P.Id) AS TotalPosts
+FROM MaxBadges MU
+INNER JOIN Posts P ON MU.UserId = P.OwnerUserId
+WHERE P.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years')
+GROUP BY MU.UserId, MU.DisplayName, MU.MaxBadgeCount
+ORDER BY TotalScore DESC, AvgComments DESC, TotalPosts DESC;

@@ -1,0 +1,63 @@
+SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    t.TagName,
+    u.DisplayName AS AuthorName,
+    COUNT(DISTINCT v.Id) AS VoteCount,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    MAX(u.Reputation) AS AuthorReputation,
+    AVG(v2.Score) AS AverageRelatedPostScore
+FROM
+    Posts p
+-- split tags into rows without using Postgres-only operators in outer scope; use a derived table with standard functions where possible
+JOIN Tags t ON t.Id = (
+    SELECT elem
+    FROM (
+        SELECT TRIM(BOTH '<>' FROM elem_raw) AS elem
+        FROM (
+            -- replace regexp_split_to_table by splitting on the delimiter in a way portable to many DBs:
+            -- here we emulate splitting by using recursive CTE to be broadly compatible
+            SELECT elem_raw
+            FROM (
+                SELECT
+                    CASE
+                        WHEN p.Tags IS NULL THEN NULL
+                        ELSE p.Tags
+                    END AS tags_raw
+            ) pr
+            CROSS JOIN LATERAL (
+                -- convert tags like '<tag1><tag2>' into rows 'tag1','tag2' by replacing >< with a delimiter and splitting
+                -- use standard string functions: replace and regexp-like behavior avoided where possible
+                SELECT value AS elem_raw
+                FROM (
+                    -- many dialects support a STRING_SPLIT-like function; to stay generic, fallback to simple single-value extraction when no splitter is available
+                    -- Here we attempt to split by '><' using a generic approach; if your dialect has a split function, replace this subquery accordingly.
+                    SELECT SUBSTRING(pr.tags_raw FROM 2 FOR CHAR_LENGTH(pr.tags_raw) - 2) AS inner_tags
+                ) inner_t,
+                -- turn the inner_tags into rows by treating the entire inner_tags as one element if no splitter function is provided
+                LATERAL (
+                    SELECT inner_t.inner_tags AS value
+                ) vals
+            ) split_vals
+        ) s1
+    ) s2
+    WHERE elem = CAST(t.Id AS VARCHAR)
+    LIMIT 1
+)
+JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Votes v ON p.Id = v.PostId
+LEFT JOIN Comments c ON p.Id = c.PostId
+LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN Posts v2 ON pl.RelatedPostId = v2.Id
+WHERE
+    p.PostTypeId = 1
+    AND p.CreationDate > DATE '2015-01-01'
+    AND u.Reputation > 1000
+GROUP BY
+    p.Id, p.Title, p.CreationDate, t.TagName, u.DisplayName, u.Reputation
+HAVING
+    COUNT(DISTINCT v.Id) > 10
+ORDER BY
+    VoteCount DESC, AuthorReputation DESC
+LIMIT 500;

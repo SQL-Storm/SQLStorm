@@ -1,0 +1,128 @@
+WITH QuestionStats AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.CreationDate AS QuestionCreationDate,
+        p.Title AS QuestionTitle,
+        p.Tags,
+        p.Score AS QuestionScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        u.Id AS UserId,
+        u.DisplayName AS UserName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = p.Id) AS NestedAnswersCount,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentsCount,
+        (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 1) AS LinkedPostsCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotesCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVotesCount,
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 20, 22, 24, 25, 31, 33, 34, 35, 36, 37, 38, 50, 52, 53, 66)) AS RevisionCount
+    FROM Posts p
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+),
+AnswerDetails AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.CreationDate AS AnswerCreationDate,
+        a.Score AS AnswerScore,
+        a.CommentCount AS AnswerCommentsCount,
+        a.LastActivityDate,
+        a.Body,
+        u.Id AS AnswerUserId,
+        u.DisplayName AS AnswerUserName,
+        u.Reputation AS AnswerUserReputation,
+        u.CreationDate AS AnswerUserCreationDate,
+        u.LastAccessDate AS AnswerUserLastAccessDate,
+        u.Views AS AnswerUserViews,
+        u.UpVotes AS AnswerUserUpVotes,
+        u.DownVotes AS AnswerUserDownVotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 2) AS UpVotesCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 3) AS DownVotesCount
+    FROM Posts a
+    INNER JOIN Users u ON a.OwnerUserId = u.Id
+    WHERE a.PostTypeId = 2
+),
+AggregateData AS (
+    SELECT
+        qs.QuestionId,
+        qs.QuestionTitle,
+        qs.QuestionScore,
+        qs.ViewCount,
+        qs.AnswerCount,
+        qs.CommentCount,
+        qs.FavoriteCount,
+        qs.Reputation AS UserReputation,
+        qs.NestedAnswersCount,
+        qs.CommentsCount,
+        qs.LinkedPostsCount,
+        qs.UpVotesCount AS QuestionUpVotes,
+        qs.DownVotesCount AS QuestionDownVotes,
+        qs.RevisionCount AS QuestionRevisions,
+        CASE WHEN COUNT(ad.AnswerId) = 0 THEN NULL
+             ELSE JSON_ARRAYAGG(
+                JSON_OBJECT(
+                    'AnswerId' VALUE ad.AnswerId,
+                    'AnswerCreationDate' VALUE ad.AnswerCreationDate,
+                    'AnswerScore' VALUE ad.AnswerScore,
+                    'AnswerCommentsCount' VALUE ad.AnswerCommentsCount,
+                    'AnswerBody' VALUE ad.Body,
+                    'AnswerUserId' VALUE ad.AnswerUserId,
+                    'AnswerUserName' VALUE ad.AnswerUserName,
+                    'AnswerUserReputation' VALUE ad.AnswerUserReputation,
+                    'AnswerUserCreationDate' VALUE ad.AnswerUserCreationDate,
+                    'AnswerUserLastAccessDate' VALUE ad.AnswerUserLastAccessDate,
+                    'AnswerUserViews' VALUE ad.AnswerUserViews,
+                    'AnswerUserUpVotes' VALUE ad.AnswerUserUpVotes,
+                    'AnswerUserDownVotes' VALUE ad.AnswerUserDownVotes,
+                    'UpVotesCount' VALUE ad.UpVotesCount,
+                    'DownVotesCount' VALUE ad.DownVotesCount
+                )
+             ) END AS AnswersDetails
+    FROM QuestionStats qs
+    LEFT JOIN AnswerDetails ad ON qs.QuestionId = ad.QuestionId
+    GROUP BY
+        qs.QuestionId,
+        qs.QuestionTitle,
+        qs.QuestionScore,
+        qs.ViewCount,
+        qs.AnswerCount,
+        qs.CommentCount,
+        qs.FavoriteCount,
+        qs.Reputation,
+        qs.NestedAnswersCount,
+        qs.CommentsCount,
+        qs.LinkedPostsCount,
+        qs.UpVotesCount,
+        qs.DownVotesCount,
+        qs.RevisionCount
+)
+SELECT
+    CASE WHEN COUNT(adata.QuestionId) = 0 THEN NULL
+         ELSE JSON_ARRAYAGG(
+            JSON_OBJECT(
+                'QuestionId' VALUE adata.QuestionId,
+                'Title' VALUE adata.QuestionTitle,
+                'Score' VALUE adata.QuestionScore,
+                'ViewCount' VALUE adata.ViewCount,
+                'AnswerCount' VALUE adata.AnswerCount,
+                'CommentCount' VALUE adata.CommentCount,
+                'FavoriteCount' VALUE adata.FavoriteCount,
+                'UserReputation' VALUE adata.UserReputation,
+                'NestedAnswersCount' VALUE adata.NestedAnswersCount,
+                'CommentsCount' VALUE adata.CommentsCount,
+                'LinkedPostsCount' VALUE adata.LinkedPostsCount,
+                'UpVotes' VALUE adata.QuestionUpVotes,
+                'DownVotes' VALUE adata.QuestionDownVotes,
+                'Revisions' VALUE adata.QuestionRevisions,
+                'Answers' VALUE adata.AnswersDetails
+            )
+         ) END AS BenchmarkResult
+FROM AggregateData adata;

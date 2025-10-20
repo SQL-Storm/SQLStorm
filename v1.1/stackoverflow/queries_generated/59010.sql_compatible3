@@ -1,0 +1,75 @@
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) AS QuestionsWithAcceptedAnswers,
+    COUNT(DISTINCT b.Id) AS BadgesReceived,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+    COUNT(DISTINCT c.Id) AS CommentsMade,
+    COUNT(DISTINCT v.Id) AS VotesGiven,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS Upvotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS Downvotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.Id END) AS Favorites,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS TotalQuestionScore,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) AS AverageQuestionScore,
+    AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) AS AverageAnswerScore,
+    MAX(p.CreationDate) AS LatestPostDate,
+    MIN(p.CreationDate) AS FirstPostDate,
+    COUNT(DISTINCT CASE WHEN p.CreationDate >= DATE '2023-01-01' THEN p.Id END) AS PostsIn2023,
+    COUNT(DISTINCT CASE WHEN p.CreationDate >= DATE '2022-01-01' AND p.CreationDate < DATE '2023-01-01' THEN p.Id END) AS PostsIn2022,
+    COUNT(DISTINCT CASE WHEN p.CreationDate >= DATE '2021-01-01' AND p.CreationDate < DATE '2022-01-01' THEN p.Id END) AS PostsIn2021,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20, 35) THEN ph.Id END) AS PostHistoryActions,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Id END) AS PostsClosed,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.Id END) AS PostsReopened,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 12 THEN ph.Id END) AS PostsDeleted,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 13 THEN ph.Id END) AS PostsUndeleted,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 14 THEN ph.Id END) AS PostsLocked,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 15 THEN ph.Id END) AS PostsUnlocked,
+    COUNT(DISTINCT pl.Id) AS PostLinksCreated,
+    COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 1 THEN pl.Id END) AS LinkedPosts,
+    COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.Id END) AS DuplicatePosts,
+    COUNT(DISTINCT t.Id) AS TagsFollowed,
+    STRING_AGG(DISTINCT t.TagName, ', ' ORDER BY t.TagName) AS TagList,
+    COUNT(DISTINCT CASE WHEN u.CreationDate >= DATE '2023-01-01' THEN u.Id END) AS NewUsers2023,
+    COUNT(DISTINCT CASE WHEN u.CreationDate >= DATE '2022-01-01' AND u.CreationDate < DATE '2023-01-01' THEN u.Id END) AS NewUsers2022,
+    COUNT(DISTINCT CASE WHEN u.CreationDate >= DATE '2021-01-01' AND u.CreationDate < DATE '2022-01-01' THEN u.Id END) AS NewUsers2021,
+    COUNT(DISTINCT CASE WHEN u.LastAccessDate >= DATE '2023-01-01' THEN u.Id END) AS ActiveUsers2023,
+    COUNT(DISTINCT CASE WHEN u.LastAccessDate >= DATE '2022-01-01' AND u.LastAccessDate < DATE '2023-01-01' THEN u.Id END) AS ActiveUsers2022,
+    COUNT(DISTINCT CASE WHEN u.LastAccessDate >= DATE '2021-01-01' AND u.LastAccessDate < DATE '2022-01-01' THEN u.Id END) AS ActiveUsers2021,
+    COUNT(DISTINCT CASE WHEN u.WebsiteUrl IS NOT NULL AND u.WebsiteUrl <> '' THEN u.Id END) AS UsersWithWebsite,
+    COUNT(DISTINCT CASE WHEN u.Location IS NOT NULL AND u.Location <> '' THEN u.Id END) AS UsersWithLocation,
+    COUNT(DISTINCT CASE WHEN u.AboutMe IS NOT NULL AND CHAR_LENGTH(u.AboutMe) > 0 THEN u.Id END) AS UsersWithAboutMe,
+    COUNT(DISTINCT CASE WHEN u.ProfileImageUrl IS NOT NULL AND u.ProfileImageUrl <> '' THEN u.Id END) AS UsersWithProfileImage,
+    COUNT(DISTINCT CASE WHEN u.EmailHash IS NOT NULL AND u.EmailHash <> '' THEN u.Id END) AS UsersWithEmailHash,
+    COUNT(DISTINCT CASE WHEN u.AccountId IS NOT NULL THEN u.Id END) AS UsersWithAccountId,
+    COUNT(DISTINCT CASE WHEN u.Views > 1000 THEN u.Id END) AS HighlyViewedUsers,
+    COUNT(DISTINCT CASE WHEN u.UpVotes > 1000 THEN u.Id END) AS HighlyUpVotedUsers,
+    COUNT(DISTINCT CASE WHEN u.DownVotes > 1000 THEN u.Id END) AS HighlyDownVotedUsers,
+    COUNT(DISTINCT CASE WHEN u.Views BETWEEN 100 AND 1000 THEN u.Id END) AS ModeratelyViewedUsers,
+    COUNT(DISTINCT CASE WHEN u.UpVotes BETWEEN 100 AND 1000 THEN u.Id END) AS ModeratelyUpVotedUsers,
+    COUNT(DISTINCT CASE WHEN u.DownVotes BETWEEN 100 AND 1000 THEN u.Id END) AS ModeratelyDownVotedUsers,
+    COUNT(DISTINCT CASE WHEN u.Views BETWEEN 10 AND 100 THEN u.Id END) AS LowViewedUsers,
+    COUNT(DISTINCT CASE WHEN u.UpVotes BETWEEN 10 AND 100 THEN u.Id END) AS LowUpVotedUsers,
+    COUNT(DISTINCT CASE WHEN u.DownVotes BETWEEN 10 AND 100 THEN u.Id END) AS LowDownVotedUsers
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN Votes v ON u.Id = v.UserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+LEFT JOIN PostLinks pl ON u.Id = pl.PostId
+LEFT JOIN Tags t ON u.Id = t.UserId
+WHERE u.CreationDate >= DATE '2021-01-01'
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, 
+    u.WebsiteUrl, u.Location, u.AboutMe, u.Views, u.UpVotes, u.DownVotes, 
+    u.ProfileImageUrl, u.EmailHash, u.AccountId
+HAVING COUNT(DISTINCT p.Id) > 0
+ORDER BY u.Reputation DESC, TotalPosts DESC
+FETCH FIRST 10000 ROWS ONLY;

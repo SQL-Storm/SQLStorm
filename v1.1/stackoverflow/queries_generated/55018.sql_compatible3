@@ -1,0 +1,96 @@
+WITH RECURSIVE TagHierarchy AS (
+    SELECT t.Id, t.TagName, CAST(NULL AS INTEGER) AS ParentTagId, 1 AS Depth
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+    UNION ALL
+    SELECT child.Id, child.TagName, parent.Id, parent.Depth + 1
+    FROM Tags child
+    JOIN TagHierarchy parent ON child.TagName LIKE parent.TagName || '-%'
+),
+TopUsers AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+           COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+           SUM(v.BountyAmount) FILTER (WHERE v.VoteTypeId = 8) AS TotalBountyStarted,
+           RANK() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TagMetrics AS (
+    SELECT t.Id                                   AS TagId,
+           t.TagName,
+           COUNT(DISTINCT p.Id)                   AS QuestionCount,
+           AVG(p.Score)                           AS AvgQuestionScore,
+           PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS MedianQuestionScore,
+           SUM(COALESCE(p.ViewCount,0))           AS TotalViews,
+           COUNT(DISTINCT v.UserId) FILTER (WHERE v.VoteTypeId = 2) AS UpvoteCount,
+           COUNT(DISTINCT v.UserId) FILTER (WHERE v.VoteTypeId = 3) AS DownvoteCount,
+           ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS RankByQuestionCount
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE ('%<' || t.TagName || '>%')
+                 AND p.PostTypeId = 1
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY t.Id, t.TagName
+),
+RecentClosedDuplicates AS (
+    SELECT ph.PostId,
+           ph.CreationDate AS ClosedDate,
+           CAST(ph.Comment AS INTEGER) AS CloseReasonId,
+           CAST(jsonb_array_elements(ph.Text::jsonb -> 'value') AS INTEGER) AS DuplicateTargetId,
+           p.Title,
+           p.OwnerUserId,
+           u.DisplayName AS OwnerName
+    FROM PostHistory ph
+    JOIN Posts p ON p.Id = ph.PostId
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE ph.PostHistoryTypeId = 10
+      AND CAST(ph.Comment AS INTEGER) = 101
+      AND ph.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days'
+)
+SELECT
+    tm.TagName,
+    tm.QuestionCount,
+    tm.AvgQuestionScore,
+    tm.MedianQuestionScore,
+    tm.TotalViews,
+    tm.UpvoteCount,
+    tm.DownvoteCount,
+    tm.RankByQuestionCount,
+    th.Depth,
+    th.ParentTagId,
+    tu.DisplayName AS TopUserDisplayName,
+    tu.Reputation,
+    tu.QuestionCount AS TopUserQuestions,
+    tu.AnswerCount AS TopUserAnswers,
+    tu.TotalBountyStarted,
+    rc.Title AS RecentClosedDuplicateTitle,
+    rc.DuplicateTargetId,
+    rc.OwnerName AS DuplicateOwner
+FROM TagMetrics tm
+LEFT JOIN TagHierarchy th ON th.Id = tm.TagId
+LEFT JOIN TopUsers tu ON tu.RepRank = 1
+LEFT JOIN LATERAL (
+    SELECT rcd.PostId,
+           rcd.ClosedDate,
+           rcd.CloseReasonId,
+           rcd.DuplicateTargetId,
+           rcd.Title,
+           rcd.OwnerUserId,
+           rcd.OwnerName
+    FROM RecentClosedDuplicates rcd
+    WHERE rcd.PostId IN (
+        SELECT p2.Id
+        FROM Posts p2
+        WHERE p2.Tags LIKE ('%<' || tm.TagName || '>%')
+          AND p2.PostTypeId = 1
+        LIMIT 1
+    )
+    ORDER BY rcd.ClosedDate DESC
+    LIMIT 1
+) rc ON TRUE
+ORDER BY tm.QuestionCount DESC
+LIMIT 100;

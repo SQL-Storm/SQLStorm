@@ -1,0 +1,40 @@
+-- {"query": "36073.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 415} 
+SELECT
+  p.Id AS PostId,
+  p.PostTypeId,
+  p.Title,
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  p.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation,
+  JSON_AGG(
+    JSON_BUILD_OBJECT(
+      'CommentId', c.Id,
+      'CommentUser', c.UserDisplayName,
+      'Comment', c.Text,
+      'CommentDate', c.CreationDate,
+      'CommentLicense', c.ContentLicense
+    )
+    ORDER BY c.CreationDate
+  ) AS Comments,
+  COUNT(DISTINCT cl.RelatedPostId) FILTER (WHERE cl.LinkTypeId = 3) AS DuplicateCount,
+  AVG(v.BountyAmount) FILTER (WHERE v.BountyAmount IS NOT NULL) AS AvgBountyForVotes,
+  MAX(v.CreationDate) FILTER (WHERE v.VoteTypeId = 2) AS LastUpVoteDate,
+  SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+  SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+FROM
+  Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  LEFT JOIN PostLinks cl ON cl.PostId = p.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+WHERE
+  p.CreationDate >= (cast('2024-10-01' as date) - INTERVAL '12 months')
+  AND p.PostTypeId IN (1, 2)
+GROUP BY
+  p.Id, p.PostTypeId, p.Title, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId, u.DisplayName, u.Reputation
+ORDER BY
+  p.ViewCount DESC NULLS LAST, p.CreationDate ASC
+LIMIT 100;

@@ -1,0 +1,228 @@
+-- {"query": "38087.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 2097} 
+with recent_users as (
+  select u.id as user_id, u.displayname, u.reputation, u.creationdate
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+power_tags as (
+  select t.id as tag_id, t.tagname, t.count
+  from tags t
+  where t.count > (select percentile_disc(0.9) within group (order by count) from tags)
+),
+question_tags as (
+  select p.id as question_id,
+         unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) as tagname
+  from posts p
+  where p.posttypeid = 1
+),
+hot_questions as (
+  select p.id as question_id,
+         p.owneruserid,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         p.answercount
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= (select max(creationdate) - interval '365 days' from posts where posttypeid = 1)
+),
+accepted_answers as (
+  select q.id as question_id, a.id as answer_id, a.owneruserid as answer_owner_id, a.score as answer_score, a.creationdate as answer_date
+  from posts q
+  join posts a on a.parentid = q.id and a.posttypeid = 2
+  where q.posttypeid = 1
+),
+best_answer_per_question as (
+  select distinct on (question_id)
+         question_id, answer_id, answer_owner_id, answer_score, answer_date
+  from accepted_answers
+  order by question_id, answer_score desc nulls last, answer_date asc
+),
+votes_agg as (
+  select v.postid,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+         sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites
+  from votes v
+  where v.creationdate >= (select max(creationdate) - interval '365 days' from votes)
+  group by v.postid
+),
+comment_agg as (
+  select c.postid,
+         count(*) as comment_count,
+         max(c.creationdate) as last_comment_date
+  from comments c
+  where c.creationdate >= (select max(creationdate) - interval '365 days' from comments)
+  group by c.postid
+),
+post_edits as (
+  select ph.postid,
+         count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edit_events,
+         max(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6,24)) as last_edit_date,
+         count(*) filter (where ph.posthistorytypeid in (10,11,12,13,14,15,19,20)) as mod_events
+  from posthistory ph
+  where ph.creationdate >= (select max(creationdate) - interval '365 days' from posthistory)
+  group by ph.postid
+),
+duplicate_links as (
+  select pl.postid as question_id, count(*) as dup_count
+  from postlinks pl
+  where pl.linktypeid = 3
+  group by pl.postid
+),
+q_enriched as (
+  select hq.question_id,
+         hq.owneruserid,
+         hq.creationdate,
+         hq.score,
+         hq.viewcount,
+         hq.answercount,
+         coalesce(v.upvotes,0) as upvotes,
+         coalesce(v.downvotes,0) as downvotes,
+         coalesce(v.favorites,0) as favorites,
+         coalesce(ca.comment_count,0) as comment_count,
+         ca.last_comment_date,
+         pe.edit_events,
+         pe.last_edit_date,
+         pe.mod_events,
+         coalesce(dl.dup_count,0) as dup_count
+  from hot_questions hq
+  left join votes_agg v on v.postid = hq.question_id
+  left join comment_agg ca on ca.postid = hq.question_id
+  left join post_edits pe on pe.postid = hq.question_id
+  left join duplicate_links dl on dl.question_id = hq.question_id
+),
+q_with_power_tags as (
+  select qe.*, pt.tagname
+  from q_enriched qe
+  join question_tags qt on qt.question_id = qe.question_id
+  join power_tags pt on pt.tagname = qt.tagname
+),
+owner_activity as (
+  select p.owneruserid as user_id,
+         count(*) filter (where p.posttypeid = 1) as questions_posted,
+         count(*) filter (where p.posttypeid = 2) as answers_posted,
+         sum(p.score) as total_post_score,
+         max(p.lastactivitydate) as last_activity
+  from posts p
+  where p.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+  group by p.owneruserid
+),
+answerer_stats as (
+  select ba.answer_owner_id as user_id,
+         count(*) as answers_given,
+         sum(ba.answer_score) as total_answer_score,
+         max(ba.answer_date) as last_answer_date
+  from best_answer_per_question ba
+  group by ba.answer_owner_id
+),
+user_badges as (
+  select b.userid as user_id,
+         sum(case when b.class = 1 then 1 else 0 end) as gold,
+         sum(case when b.class = 2 then 1 else 0 end) as silver,
+         sum(case when b.class = 3 then 1 else 0 end) as bronze,
+         count(*) as total_badges,
+         max(b.date) as last_badge_date
+  from badges b
+  where b.date >= (select max(date) - interval '365 days' from badges)
+  group by b.userid
+),
+owner_enriched as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate as user_created,
+         u.lastaccessdate,
+         ua.questions_posted,
+         ua.answers_posted,
+         ua.total_post_score,
+         ua.last_activity,
+         ub.gold, ub.silver, ub.bronze, ub.total_badges, ub.last_badge_date,
+         coalesce(ast.answers_given,0) as answers_given,
+         coalesce(ast.total_answer_score,0) as total_answer_score,
+         ast.last_answer_date
+  from users u
+  left join owner_activity ua on ua.user_id = u.id
+  left join user_badges ub on ub.user_id = u.id
+  left join answerer_stats ast on ast.user_id = u.id
+),
+scored as (
+  select q.tagname,
+         q.question_id,
+         q.owneruserid as owner_user_id,
+         q.creationdate,
+         q.score,
+         q.viewcount,
+         q.answercount,
+         q.upvotes,
+         q.downvotes,
+         q.favorites,
+         q.comment_count,
+         q.last_comment_date,
+         q.edit_events,
+         q.last_edit_date,
+         q.mod_events,
+         q.dup_count,
+         oe.displayname,
+         oe.reputation,
+         oe.questions_posted,
+         oe.answers_posted,
+         oe.total_post_score,
+         oe.total_badges,
+         oe.gold, oe.silver, oe.bronze,
+         coalesce(
+           0.40 * (least(q.score, 1000)) +
+           0.25 * ln(1 + q.viewcount) * 10 +
+           0.15 * (q.upvotes - q.downvotes) +
+           0.05 * q.favorites +
+           0.05 * q.comment_count +
+           0.05 * least(coalesce(oe.reputation,0)/10.0, 1000)
+         ,0) as perf_score
+  from q_with_power_tags q
+  left join owner_enriched oe on oe.user_id = q.owneruserid
+),
+tag_rollup as (
+  select tagname,
+         count(*) as questions,
+         sum(answercount) as answers,
+         avg(score) as avg_score,
+         percentile_cont(0.5) within group (order by perf_score) as p50_perf,
+         percentile_cont(0.9) within group (order by perf_score) as p90_perf,
+         sum(case when last_edit_date is not null then 1 else 0 end) as edited_questions,
+         sum(dup_count) as total_duplicates
+  from scored
+  group by tagname
+),
+top_tags as (
+  select tr.*,
+         rank() over (order by p90_perf desc, questions desc) as rnk
+  from tag_rollup tr
+)
+select
+  s.tagname,
+  s.question_id,
+  p.title,
+  s.owner_user_id,
+  s.displayname,
+  s.reputation,
+  s.score,
+  s.viewcount,
+  s.answercount,
+  s.upvotes,
+  s.downvotes,
+  s.favorites,
+  s.comment_count,
+  s.edit_events,
+  s.mod_events,
+  s.dup_count,
+  s.perf_score,
+  tt.p50_perf as tag_p50_perf,
+  tt.p90_perf as tag_p90_perf,
+  tt.questions as tag_questions,
+  tt.answers as tag_answers,
+  tt.total_duplicates as tag_total_duplicates
+from scored s
+join top_tags tt on tt.tagname = s.tagname and tt.rnk <= 20
+join posts p on p.id = s.question_id
+qualify row_number() over (partition by s.tagname order by s.perf_score desc, s.viewcount desc, s.score desc) <= 50
+order by tt.rnk, s.perf_score desc, s.viewcount desc, s.score desc;

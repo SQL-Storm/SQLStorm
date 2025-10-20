@@ -1,0 +1,112 @@
+WITH 
+UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(b.Id) AS TotalBadges,
+        MAX(b.Date) AS LastBadgeDate,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        COUNT(c.Id) AS CommentCount,
+        MAX(c.CreationDate) AS LastCommentDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+UserTagStats AS (
+    SELECT 
+        us.Id AS UserId,
+        t.TagName,
+        COUNT(*) AS AnswersInTag,
+        ROW_NUMBER() OVER (PARTITION BY us.Id ORDER BY COUNT(*) DESC) AS TagRank
+    FROM UserStats us
+    JOIN Posts a ON a.OwnerUserId = us.Id AND a.PostTypeId = 2
+    JOIN Posts q ON q.Id = a.ParentId AND q.PostTypeId = 1
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(trim(both '<>' FROM q.Tags), '><')) AS TagName
+    ) tags
+    JOIN Tags t ON t.TagName = tags.TagName
+    WHERE a.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+    GROUP BY us.Id, t.TagName
+),
+
+UserVoteStats AS (
+    SELECT 
+        us.Id AS UserId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoritesGiven,
+        COUNT(v.Id) AS TotalVotesGiven
+    FROM UserStats us
+    JOIN Votes v ON v.UserId = us.Id
+    WHERE v.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+    GROUP BY us.Id
+),
+
+DuplicateClusters AS (
+    SELECT 
+        pl.PostId AS DuplicateId,
+        pl.RelatedPostId AS OriginalId,
+        ph.CreationDate AS CloseDate,
+        CAST(ph.Comment AS integer) AS CloseReasonId
+    FROM PostLinks pl
+    JOIN PostHistory ph ON ph.PostId = pl.PostId 
+        AND ph.PostHistoryTypeId = 10
+    WHERE pl.LinkTypeId = 3
+),
+
+DupInfo AS (
+    SELECT 
+        o.OriginalId,
+        COUNT(*) AS DuplicateCount,
+        MIN(o.CloseDate) AS FirstClosed,
+        MAX(o.CloseDate) AS LastClosed,
+        ARRAY_AGG(o.DuplicateId) FILTER (WHERE o.DuplicateId IS NOT NULL) AS DuplicateIds
+    FROM DuplicateClusters o
+    GROUP BY o.OriginalId
+)
+
+SELECT 
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.RepRank,
+    us.TotalBadges,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.CommentCount,
+    uv.UpVotesGiven,
+    uv.DownVotesGiven,
+    uv.FavoritesGiven,
+    uv.TotalVotesGiven,
+    dt.TagName AS TopTag,
+    dt.AnswersInTag,
+    di.DuplicateCount,
+    di.FirstClosed,
+    di.LastClosed,
+    di.DuplicateIds
+FROM UserStats us
+LEFT JOIN UserVoteStats uv ON uv.UserId = us.Id
+LEFT JOIN UserTagStats dt ON dt.UserId = us.Id AND dt.TagRank = 1
+LEFT JOIN DupInfo di ON di.OriginalId = (
+    SELECT p.Id
+    FROM Posts p
+    WHERE p.OwnerUserId = us.Id
+      AND p.PostTypeId = 1
+    ORDER BY p.CreationDate DESC
+    LIMIT 1
+)
+WHERE us.RepRank <= 1000
+ORDER BY us.RepRank;

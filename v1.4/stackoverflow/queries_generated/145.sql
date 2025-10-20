@@ -1,0 +1,84 @@
+-- {"query": "145.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 1889} 
+WITH
+RecentActivity AS (
+  SELECT p.OwnerUserId AS UserId,
+         MAX(p.LastActivityDate) AS LastActivity
+  FROM Posts p
+  GROUP BY p.OwnerUserId
+),
+UserEngagement AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate,
+         COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1), 0) AS QuestionCount,
+         COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2), 0) AS AnswerCount,
+         COALESCE((SELECT SUM(v.BountyAmount) FROM Votes v
+                   JOIN Posts p ON p.Id = v.PostId
+                   WHERE p.OwnerUserId = u.Id AND v.VoteTypeId = 8), 0) AS TotalBountyAwards,
+         COALESCE((SELECT SUM(p.Score) FROM Posts p WHERE p.OwnerUserId = u.Id), 0) AS TotalPostScore,
+         ra.LastActivity AS LastActivity
+  FROM Users u
+  LEFT JOIN RecentActivity ra ON ra.UserId = u.Id
+),
+BadgeActivity AS (
+  SELECT be.UserId,
+         COUNT(*) AS BadgesThisYear
+  FROM Badges be
+  WHERE be.Date >= date_trunc('year', NOW())
+  GROUP BY be.UserId
+),
+TagParticipation AS (
+  SELECT t.TagName,
+         COUNT(*) AS TagUses
+  FROM Tags t
+  GROUP BY t.TagName
+),
+ComplexCalc AS (
+  SELECT ue.UserId,
+         ue.DisplayName,
+         ue.Reputation,
+         ue.CreationDate,
+         ue.QuestionCount,
+         ue.AnswerCount,
+         ue.TotalPostScore,
+         ue.TotalBountyAwards,
+         ue.LastActivity,
+         COALESCE(ba.BadgesThisYear, 0) AS BadgesThisYear,
+         tp.TagUses,
+         ROW_NUMBER() OVER (ORDER BY ue.Reputation DESC, ue.TotalPostScore DESC, ue.LastActivity DESC) AS rn
+  FROM UserEngagement ue
+  LEFT JOIN BadgeActivity ba ON ba.UserId = ue.UserId
+  LEFT JOIN TagParticipation tp ON true
+)
+SELECT
+  c.UserId,
+  c.DisplayName,
+  c.Reputation,
+  c.CreationDate,
+  c.QuestionCount,
+  c.AnswerCount,
+  c.TotalPostScore,
+  c.TotalBountyAwards,
+  c.LastActivity,
+  c.BadgesThisYear,
+  c.TagUses
+FROM ComplexCalc c
+WHERE c.rn <= 200
+ORDER BY c.Reputation DESC, c.TotalPostScore DESC, c.LastActivity DESC
+OFFSET 0 ROWS
+FETCH NEXT 200 ROWS ONLY
+UNION ALL
+SELECT
+  NULL AS UserId,
+  'Summary' AS DisplayName,
+  NULL AS Reputation,
+  NULL AS CreationDate,
+  NULL AS QuestionCount,
+  NULL AS AnswerCount,
+  NULL AS TotalPostScore,
+  NULL AS TotalBountyAwards,
+  NULL AS LastActivity,
+  NULL AS BadgesThisYear,
+  NULL AS TagUses
+WHERE NOT EXISTS (SELECT 1);

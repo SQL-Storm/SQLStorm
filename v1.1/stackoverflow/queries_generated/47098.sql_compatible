@@ -1,0 +1,118 @@
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT pt.PostId) as direct_posts,
+        1 as level
+    FROM Tags t
+    JOIN (
+        SELECT p.Id as PostId, 
+               unnest(string_to_array(substring(Tags, 2, length(Tags)-2), '><')) as tag
+        FROM Posts p
+        WHERE p.PostTypeId = 1 
+          AND p.Tags IS NOT NULL
+    ) pt ON pt.tag = t.TagName
+    WHERE t.Count > 1000
+    GROUP BY t.Id, t.TagName
+),
+user_expertise AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        pt.tag,
+        COUNT(DISTINCT p.Id) as answer_count,
+        SUM(p.Score) as total_score,
+        AVG(p.Score) as avg_score,
+        MAX(p.Score) as max_score,
+        COUNT(DISTINCT CASE WHEN p.Id = q.AcceptedAnswerId THEN p.Id END) as accepted_answers,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) as median_score,
+        COUNT(DISTINCT b.Name) FILTER (WHERE b.TagBased = TRUE AND b.Name = pt.tag) as tag_badges
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    JOIN Posts q ON q.Id = p.ParentId
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')) as tag
+    ) pt
+    WHERE p.PostTypeId = 2 
+      AND p.Score > 0
+      AND u.Reputation > 5000
+      AND q.Tags IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, pt.tag
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+temporal_patterns AS (
+    SELECT 
+        DATE_TRUNC('month', p.CreationDate) as month,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1) as questions,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2) as answers,
+        AVG(p.Score) FILTER (WHERE p.Score > 0) as avg_positive_score,
+        STDDEV(p.Score) FILTER (WHERE p.Score IS NOT NULL) as score_stddev,
+        COUNT(DISTINCT p.OwnerUserId) as unique_contributors,
+        SUM(p.ViewCount) FILTER (WHERE p.PostTypeId = 1) as total_views,
+        AVG(p.AnswerCount) FILTER (WHERE p.PostTypeId = 1 AND p.AnswerCount > 0) as avg_answers,
+        COUNT(*) FILTER (WHERE p.AcceptedAnswerId IS NOT NULL) as questions_with_accepted,
+        AVG(EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate))/3600) as avg_hours_to_last_activity
+    FROM Posts p
+    WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+      AND p.CreationDate < CAST('2024-10-01 12:34:56' AS timestamp)
+    GROUP BY DATE_TRUNC('month', p.CreationDate)
+),
+comment_sentiment AS (
+    SELECT 
+        c.PostId,
+        COUNT(*) as comment_count,
+        AVG(c.Score) as avg_comment_score,
+        COUNT(*) FILTER (WHERE c.Text LIKE '%thank%' OR c.Text LIKE '%great%' OR c.Text LIKE '%excellent%') as positive_signals,
+        COUNT(*) FILTER (WHERE c.Text LIKE '%wrong%' OR c.Text LIKE '%bad%' OR c.Text LIKE '%terrible%') as negative_signals,
+        MAX(c.Score) as max_comment_score,
+        COUNT(DISTINCT c.UserId) as unique_commenters
+    FROM Comments c
+    WHERE c.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+    GROUP BY c.PostId
+)
+SELECT 
+    ue.DisplayName,
+    ue.Reputation,
+    ue.tag as expertise_tag,
+    ue.answer_count,
+    ue.total_score,
+    ue.avg_score,
+    ue.median_score,
+    ue.accepted_answers,
+    ROUND(100.0 * ue.accepted_answers / NULLIF(ue.answer_count, 0), 2) as acceptance_rate,
+    ue.tag_badges,
+    th.direct_posts as tag_usage_count,
+    tp.month,
+    tp.questions as monthly_questions,
+    tp.answers as monthly_answers,
+    tp.avg_positive_score as monthly_avg_score,
+    tp.score_stddev,
+    tp.unique_contributors,
+    tp.total_views,
+    tp.avg_answers as avg_answers_per_question,
+    ROUND(100.0 * tp.questions_with_accepted / NULLIF(tp.questions, 0), 2) as monthly_acceptance_rate,
+    tp.avg_hours_to_last_activity,
+    COALESCE(cs.avg_comment_score, 0) as related_comment_sentiment,
+    COALESCE(cs.positive_signals - cs.negative_signals, 0) as comment_sentiment_differential,
+    RANK() OVER (PARTITION BY ue.tag ORDER BY ue.total_score DESC) as tag_rank,
+    DENSE_RANK() OVER (PARTITION BY tp.month ORDER BY ue.total_score DESC) as monthly_rank,
+    LAG(tp.questions, 1) OVER (PARTITION BY ue.tag ORDER BY tp.month) as prev_month_questions,
+    LEAD(tp.answers, 1) OVER (PARTITION BY ue.tag ORDER BY tp.month) as next_month_answers,
+    SUM(ue.total_score) OVER (PARTITION BY ue.UserId ORDER BY tp.month ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) as cumulative_score,
+    NTILE(10) OVER (ORDER BY ue.Reputation DESC) as reputation_decile
+FROM user_expertise ue
+CROSS JOIN temporal_patterns tp
+JOIN tag_hierarchy th ON th.TagName = ue.tag
+LEFT JOIN LATERAL (
+    SELECT cs.*
+    FROM Posts p
+    JOIN comment_sentiment cs ON cs.PostId = p.Id
+    WHERE p.OwnerUserId = ue.UserId
+    LIMIT 1
+) cs ON TRUE
+WHERE ue.avg_score > 5
+  AND th.direct_posts > 100
+ORDER BY ue.total_score DESC, tp.month DESC
+LIMIT 1000;

@@ -1,0 +1,130 @@
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS question_count,
+        1 AS level
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE p.PostTypeId = 1
+      AND t.Count > 1000
+    GROUP BY t.Id, t.TagName
+
+    UNION ALL
+
+    SELECT 
+        t.Id,
+        t.TagName,
+        th.question_count,
+        th.level + 1
+    FROM Tags t
+    JOIN tag_hierarchy th ON th.Id != t.Id
+    JOIN Posts p1 ON p1.Tags LIKE '%' || '<' || th.TagName || '>' || '%'
+    JOIN Posts p2 ON p2.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+      AND p1.Id = p2.Id
+    WHERE th.level < 3
+      AND p1.PostTypeId = 1
+),
+user_expertise AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS answers_in_tag,
+        AVG(p.Score) AS avg_answer_score,
+        SUM(p.Score) AS total_score,
+        COUNT(DISTINCT CASE WHEN p.Id = q.AcceptedAnswerId THEN p.Id END) AS accepted_answers,
+        PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY p.Score) AS score_75th_percentile
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    JOIN Posts q ON p.ParentId = q.Id
+    JOIN Tags t ON q.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE p.PostTypeId = 2
+      AND p.Score > 0
+      AND u.Reputation > 5000
+      AND p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '2 years')
+    GROUP BY u.Id, u.DisplayName, t.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+badge_correlation AS (
+    SELECT 
+        b1.Name AS badge1,
+        b2.Name AS badge2,
+        COUNT(DISTINCT b1.UserId) AS users_with_both,
+        (COUNT(DISTINCT b1.UserId) * 1.0) / 
+            (SELECT COUNT(DISTINCT UserId) FROM Badges WHERE Name = b1.Name) AS correlation_strength
+    FROM Badges b1
+    JOIN Badges b2 ON b1.UserId = b2.UserId 
+      AND b1.Name < b2.Name
+    WHERE b1.Class = 1
+      AND b2.Class = 1
+    GROUP BY b1.Name, b2.Name
+    HAVING COUNT(DISTINCT b1.UserId) > 50
+),
+question_evolution AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        COUNT(DISTINCT ph.Id) AS edit_count,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10, 11) THEN ph.Id END) AS close_reopen_events,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS last_closed,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate END) AS last_reopened,
+        COUNT(DISTINCT c.UserId) AS unique_commenters,
+        STRING_AGG(DISTINCT
+            (CASE WHEN ph.PostHistoryTypeId = 6
+             THEN ph.Text || '|' || TO_CHAR(ph.CreationDate, 'YYYY-MM-DD"T"HH24:MI:SS')
+             END), ' -> ') AS tag_evolution
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    WHERE p.PostTypeId = 1
+      AND p.Score > 100
+      AND p.ViewCount > 10000
+    GROUP BY p.Id, p.Title, p.CreationDate
+)
+SELECT 
+    ue.DisplayName,
+    ue.TagName,
+    ue.answers_in_tag,
+    ue.avg_answer_score,
+    ue.accepted_answers,
+    ue.score_75th_percentile,
+    th.question_count AS tag_total_questions,
+    RANK() OVER (PARTITION BY ue.TagName ORDER BY ue.total_score DESC) AS tag_rank,
+    DENSE_RANK() OVER (ORDER BY ue.total_score DESC) AS global_rank,
+    COUNT(DISTINCT bc.badge2) AS correlated_gold_badges,
+    AVG(qe.edit_count) AS avg_question_edits_in_tag,
+    COALESCE(STRING_AGG(DISTINCT bc.badge2, ', ' ORDER BY MAX(bc.correlation_strength) DESC), 'None') AS related_badges,
+    LAG(ue.avg_answer_score, 1) OVER (PARTITION BY ue.UserId ORDER BY ue.total_score DESC) AS prev_best_tag_avg_score,
+    LEAD(ue.TagName, 1) OVER (PARTITION BY ue.UserId ORDER BY ue.total_score DESC) AS next_best_tag,
+    NTILE(10) OVER (ORDER BY ue.total_score) AS expertise_decile,
+    ue.total_score / NULLIF(th.question_count, 0) AS score_per_question_ratio,
+    EXP(AVG(LN(NULLIF(ue.avg_answer_score, 0))) OVER (PARTITION BY ue.TagName)) AS geometric_mean_tag_score
+FROM user_expertise ue
+LEFT JOIN tag_hierarchy th ON th.TagName = ue.TagName
+LEFT JOIN Badges b ON b.UserId = ue.UserId AND (b.TagBased IS TRUE OR b.TagBased = 1)
+LEFT JOIN badge_correlation bc ON bc.badge1 = b.Name
+LEFT JOIN Posts p_answered ON p_answered.OwnerUserId = ue.UserId 
+    AND p_answered.PostTypeId = 2
+LEFT JOIN Posts p_questions ON p_questions.Id = p_answered.ParentId 
+    AND p_questions.Tags LIKE '%' || '<' || ue.TagName || '>' || '%'
+LEFT JOIN question_evolution qe ON qe.Id = p_questions.Id
+WHERE ue.avg_answer_score > 5
+GROUP BY 
+    ue.UserId,
+    ue.DisplayName,
+    ue.TagName,
+    ue.answers_in_tag,
+    ue.avg_answer_score,
+    ue.accepted_answers,
+    ue.total_score,
+    ue.score_75th_percentile,
+    th.question_count
+HAVING COUNT(DISTINCT bc.badge2) > 0 
+    OR ue.accepted_answers > 5
+ORDER BY 
+    ue.total_score DESC,
+    tag_rank,
+    ue.accepted_answers DESC
+LIMIT 100;

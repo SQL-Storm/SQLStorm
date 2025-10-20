@@ -1,0 +1,134 @@
+-- {"query": "34048.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 1257} 
+
+WITH RecursiveUserBadges AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        b.Name AS BadgeName,
+        b.Class AS BadgeClass,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY b.Date DESC) AS rn
+    FROM Users u
+    JOIN Badges b ON b.UserId = u.Id
+    WHERE b.Class IN (1, 2, 3)
+),
+TopBadgesPerUser AS (
+    SELECT UserId, DisplayName, BadgeName, BadgeClass
+    FROM RecursiveUserBadges
+    WHERE rn <= 3
+),
+QuestionStats AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+        AVG(p.ViewCount) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionViews,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL) AS ClosedQuestions,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL) AS QuestionsWithAcceptedAnswer
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+AnswerStats AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AvgAnswerScore,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2 AND p.ParentId IS NOT NULL) AS AnswersWithParent
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserVoteSummary AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS TotalUpVotesGiven,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS TotalDownVotesGiven,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 5) AS TotalFavoritesGiven
+    FROM Users u
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id
+),
+TopActiveUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        us.QuestionCount,
+        us.AvgQuestionScore,
+        asn.AnswerCount,
+        asn.AvgAnswerScore,
+        COALESCE(uvs.TotalUpVotesGiven,0) AS UpVotesGiven,
+        COALESCE(uvs.TotalDownVotesGiven,0) AS DownVotesGiven,
+        COALESCE(uvs.TotalFavoritesGiven,0) AS FavoritesGiven
+    FROM Users u
+    LEFT JOIN QuestionStats us ON us.OwnerUserId = u.Id
+    LEFT JOIN AnswerStats asn ON asn.OwnerUserId = u.Id
+    LEFT JOIN UserVoteSummary uvs ON uvs.UserId = u.Id
+    WHERE u.Reputation > 1000
+),
+TopTagsByActivity AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id) AS PostsCount,
+        AVG(p.Score) AS AvgPostScore,
+        COUNT(DISTINCT p.OwnerUserId) AS DistinctOwners
+    FROM Tags t
+    JOIN Posts p ON p.PostTypeId = 1 AND p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    GROUP BY t.TagName
+    ORDER BY PostsCount DESC
+    LIMIT 10
+),
+UserTagActivity AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')) AS TagName,
+        COUNT(*) AS PostsByTag
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.PostTypeId = 1
+    GROUP BY p.OwnerUserId, TagName
+),
+TopUsersPerTag AS (
+    SELECT DISTINCT ON (uta.TagName)
+        uta.TagName,
+        uta.UserId,
+        u.DisplayName,
+        uta.PostsByTag
+    FROM UserTagActivity uta
+    JOIN Users u ON u.Id = uta.UserId
+    ORDER BY uta.TagName, uta.PostsByTag DESC
+)
+SELECT
+    tu.Id AS UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.QuestionCount,
+    tu.AvgQuestionScore,
+    tu.AnswerCount,
+    tu.AvgAnswerScore,
+    tu.UpVotesGiven,
+    tu.DownVotesGiven,
+    tu.FavoritesGiven,
+    COALESCE(tb.BadgeNames, '') AS TopBadges,
+    ARRAY_AGG(DISTINCT tt.TagName) FILTER (WHERE tt.TagName IS NOT NULL) AS TopTags,
+    ARRAY_AGG(
+        JSON_BUILD_OBJECT(
+            'TagName', tut.TagName,
+            'TopUserInTag_DisplayName', tut.DisplayName,
+            'PostsByTag', tut.PostsByTag
+        )
+    ) AS TopUsersPerTagDetails
+FROM TopActiveUsers tu
+LEFT JOIN (
+    SELECT UserId, STRING_AGG(BadgeName || ' (' || BadgeClass || ')', ', ') AS BadgeNames
+    FROM TopBadgesPerUser
+    GROUP BY UserId
+) tb ON tb.UserId = tu.Id
+LEFT JOIN (
+    SELECT DISTINCT TagName FROM TopTagsByActivity
+) tt ON TRUE
+LEFT JOIN TopUsersPerTag tut ON tut.TagName = tt.TagName AND tut.UserId = tu.Id
+GROUP BY
+    tu.Id, tu.DisplayName, tu.Reputation, tu.QuestionCount, tu.AvgQuestionScore,
+    tu.AnswerCount, tu.AvgAnswerScore, tu.UpVotesGiven, tu.DownVotesGiven, tu.FavoritesGiven, tb.BadgeNames
+ORDER BY tu.Reputation DESC
+LIMIT 50;

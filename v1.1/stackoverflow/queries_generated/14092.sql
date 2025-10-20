@@ -1,4 +1,4 @@
--- {"query": "14092.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 217155, "output_tokens": 93715} 
+-- {"query": "14092.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 217155, "output_tokens": 93715} 
 WITH cte_user_activity AS (
   SELECT 
     u.Id AS user_id,

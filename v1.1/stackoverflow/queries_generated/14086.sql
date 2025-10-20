@@ -1,4 +1,4 @@
--- {"query": "14086.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 203145, "output_tokens": 88059} 
+-- {"query": "14086.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 203145, "output_tokens": 88059} 
 SELECT 
     CONCAT(COALESCE(u.DisplayName, 'DELETED'), ' ', COALESCE(u.Location, '')) AS 'Author Location',
     DATEDIFF(CURRENT_DATE, p.CreationDate) AS 'Post Age (Days)',

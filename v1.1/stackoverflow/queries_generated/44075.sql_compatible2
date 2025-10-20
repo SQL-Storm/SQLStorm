@@ -1,0 +1,86 @@
+SELECT 
+    u.DisplayName AS UserName, 
+    b.Name AS BadgeName,
+    b.Date AS BadgeDate,
+    b.Class AS BadgeClass,
+    p.Title AS PostTitle,
+    p.Body AS PostBody,
+    p.CreationDate AS PostCreationDate,
+    p.Score AS PostScore,
+    p.ViewCount AS PostViewCount,
+    p.AnswerCount AS PostAnswerCount,
+    p.CommentCount AS PostCommentCount,
+    CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        ELSE 'Open'
+    END AS PostStatus,
+    CASE
+        WHEN p.PostTypeId = 1 THEN 'Question'
+        WHEN p.PostTypeId = 2 THEN 'Answer'
+        ELSE pt.Name
+    END AS PostType,
+    COALESCE(SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)), '') AS PostTags,
+    COALESCE(u2.DisplayName, p.OwnerDisplayName) AS PostAuthor,
+    COALESCE(u2.Reputation, u.Reputation) AS PostAuthorReputation,
+    COALESCE(u2.Location, u.Location) AS PostAuthorLocation,
+    COALESCE(u2.AboutMe, u.AboutMe) AS PostAuthorAboutMe,
+    COALESCE(u2.WebsiteUrl, u.WebsiteUrl) AS PostAuthorWebsite,
+    COALESCE(u2.ProfileImageUrl, u.ProfileImageUrl) AS PostAuthorProfileImage,
+    COALESCE(u2.emailhash, u.emailhash) AS PostAuthorEmailHash,
+    COALESCE(u2.AccountId, u.AccountId) AS PostAuthorAccountId,
+    COALESCE(u2.Views, u.Views) AS PostAuthorViews,
+    COALESCE(u2.UpVotes, u.UpVotes) AS PostAuthorUpVotes,
+    COALESCE(u2.DownVotes, u.DownVotes) AS PostAuthorDownVotes,
+    COALESCE(u2.CreationDate, u.CreationDate) AS PostAuthorCreationDate,
+    COALESCE(u2.LastAccessDate, u.LastAccessDate) AS PostAuthorLastAccessDate
+FROM Posts p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Users u2 ON p.LastEditorUserId = u2.Id
+LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN Badges b ON u.Id = b.UserId
+GROUP BY
+    u.DisplayName,
+    b.Name,
+    b.Date,
+    b.Class,
+    p.Title,
+    p.Body,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.ClosedDate,
+    p.CommunityOwnedDate,
+    p.PostTypeId,
+    pt.Name,
+    p.Tags,
+    u2.DisplayName,
+    p.OwnerDisplayName,
+    u2.Reputation,
+    u.Reputation,
+    u2.Location,
+    u.Location,
+    u2.AboutMe,
+    u.AboutMe,
+    u2.WebsiteUrl,
+    u.WebsiteUrl,
+    u2.ProfileImageUrl,
+    u.ProfileImageUrl,
+    u2.emailhash,
+    u.emailhash,
+    u2.AccountId,
+    u.AccountId,
+    u2.Views,
+    u.Views,
+    u2.UpVotes,
+    u.UpVotes,
+    u2.DownVotes,
+    u.DownVotes,
+    u2.CreationDate,
+    u.CreationDate,
+    u2.LastAccessDate,
+    u.LastAccessDate
+ORDER BY p.CreationDate DESC
+LIMIT 100;

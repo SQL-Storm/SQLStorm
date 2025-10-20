@@ -1,0 +1,145 @@
+WITH recent_questions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.CreationDate,
+        ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+question_activity AS (
+    SELECT
+        rq.Id AS question_id,
+        COUNT(DISTINCT c.Id) AS comment_count,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS upvotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS downvotes,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.Id END) AS edits
+    FROM recent_questions rq
+    LEFT JOIN Comments c ON c.PostId = rq.Id
+    LEFT JOIN Votes v ON v.PostId = rq.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = rq.Id
+    GROUP BY rq.Id
+),
+user_profile AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS gold_badges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS silver_badges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS bronze_badges,
+        COUNT(DISTINCT CASE WHEN ph2.PostHistoryTypeId = 24 THEN ph2.Id END) AS suggestions_approved
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN PostHistory ph2 ON ph2.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+tag_counts AS (
+    /* split tag strings like '<tag1><tag2>' into rows without using UNNEST or string_to_array,
+       using recursive CTE to be broadly compatible */
+    SELECT
+        p.Id AS post_id,
+        TRIM(BOTH '<>' FROM SUBSTR(p.Tags, 1,
+            CASE
+                WHEN INSTR(p.Tags, '><') = 0 THEN LENGTH(p.Tags)
+                ELSE INSTR(p.Tags, '><') - 1
+            END
+        )) AS tag,
+        CASE
+            WHEN INSTR(p.Tags, '><') = 0 THEN NULL
+            ELSE SUBSTR(p.Tags, INSTR(p.Tags, '><') + 2)
+        END AS rest
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    UNION ALL
+    SELECT
+        tc.post_id,
+        TRIM(BOTH '<>' FROM SUBSTR(tc.rest, 1,
+            CASE
+                WHEN INSTR(tc.rest, '><') = 0 THEN LENGTH(tc.rest)
+                ELSE INSTR(tc.rest, '><') - 1
+            END
+        )) AS tag,
+        CASE
+            WHEN tc.rest IS NULL THEN NULL
+            WHEN INSTR(tc.rest, '><') = 0 THEN NULL
+            ELSE SUBSTR(tc.rest, INSTR(tc.rest, '><') + 2)
+        END AS rest
+    FROM tag_counts tc
+    WHERE tc.rest IS NOT NULL AND tc.rest <> ''
+),
+tag_hotness AS (
+    SELECT
+        t.TagName,
+        COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 1 THEN pl.PostId END) AS inbound_links,
+        COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId END) AS duplicates,
+        COALESCE(qcnt.question_count, 0) AS question_count
+    FROM Tags t
+    LEFT JOIN PostLinks pl
+        ON pl.PostId = t.ExcerptPostId
+        OR pl.RelatedPostId = t.ExcerptPostId
+    LEFT JOIN (
+        SELECT
+            tc.tag AS tag,
+            COUNT(DISTINCT tc.post_id) AS question_count
+        FROM tag_counts tc
+        GROUP BY tc.tag
+    ) qcnt ON qcnt.tag = t.TagName
+    WHERE t.IsRequired = FALSE
+    GROUP BY t.TagName, qcnt.question_count
+    HAVING COUNT(DISTINCT pl.PostId) > 100
+)
+SELECT
+    rq.rn,
+    rq.Id,
+    rq.Title,
+    qa.comment_count,
+    qa.upvotes,
+    qa.downvotes,
+    qa.edits,
+    up.DisplayName,
+    up.Reputation,
+    up.gold_badges,
+    up.silver_badges,
+    up.bronze_badges,
+    up.suggestions_approved,
+    th.TagName,
+    th.inbound_links,
+    th.duplicates,
+    th.question_count,
+    RANK() OVER (
+        PARTITION BY th.TagName
+        ORDER BY qa.upvotes DESC, qa.comment_count DESC
+    ) AS tag_rank
+FROM recent_questions rq
+JOIN question_activity qa ON qa.question_id = rq.Id
+JOIN user_profile up ON up.Id = rq.OwnerUserId
+JOIN (
+    SELECT post_id, tag
+    FROM tag_counts
+) tq ON tq.post_id = rq.Id
+JOIN tag_hotness th ON th.TagName = tq.tag
+WHERE rq.rn <= 1000
+GROUP BY
+    rq.rn,
+    rq.Id,
+    rq.Title,
+    rq.CreationDate,
+    qa.comment_count,
+    qa.upvotes,
+    qa.downvotes,
+    qa.edits,
+    up.DisplayName,
+    up.Reputation,
+    up.gold_badges,
+    up.silver_badges,
+    up.bronze_badges,
+    up.suggestions_approved,
+    th.TagName,
+    th.inbound_links,
+    th.duplicates,
+    th.question_count
+ORDER BY rq.CreationDate DESC, th.inbound_links DESC, up.Reputation DESC
+LIMIT 100;

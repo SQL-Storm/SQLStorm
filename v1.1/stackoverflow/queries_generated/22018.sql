@@ -1,4 +1,4 @@
--- {"query": "22018.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "grok-code-fast", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2204, "output_tokens": 706} 
+-- {"query": "22018.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-code-fast", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2204, "output_tokens": 706} 
 WITH top_users AS (
     SELECT Id, DisplayName, Reputation,
            ROW_NUMBER() OVER (ORDER BY Reputation DESC) as user_rank

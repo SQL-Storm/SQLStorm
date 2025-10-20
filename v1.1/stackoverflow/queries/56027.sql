@@ -1,0 +1,40 @@
+WITH top_users AS (
+  SELECT u.Id, u.DisplayName, SUM(v.BountyAmount) AS total_bounty
+  FROM Users u
+  JOIN Votes v ON u.Id = v.UserId
+  WHERE v.VoteTypeId = 8
+  GROUP BY u.Id, u.DisplayName
+  ORDER BY total_bounty DESC
+  LIMIT 10
+),
+top_tags AS (
+  SELECT t.TagName, COUNT(DISTINCT p.Id) AS num_posts
+  FROM Tags t
+  JOIN Posts p ON ('<' || t.TagName || '>') = ANY(string_to_array(p.Tags, '><'))
+  GROUP BY t.TagName
+  ORDER BY num_posts DESC
+  LIMIT 10
+),
+avg_score AS (
+  SELECT AVG(p.Score) AS avg_score
+  FROM Posts p
+  JOIN PostTypes pt ON p.PostTypeId = pt.Id
+  WHERE pt.Name = 'Question'
+)
+SELECT 
+  tu.DisplayName AS top_user,
+  tu.total_bounty,
+  tt.TagName AS top_tag,
+  tt.num_posts,
+  av.avg_score,
+  COUNT(DISTINCT p.Id) AS num_posts,
+  SUM(p.ViewCount) AS total_views,
+  SUM(p.Score) AS total_score
+FROM top_users tu
+JOIN Posts p ON tu.Id = p.OwnerUserId
+JOIN PostTypes pt ON p.PostTypeId = pt.Id
+JOIN top_tags tt ON ('<' || tt.TagName || '>') = ANY(string_to_array(p.Tags, '><'))
+JOIN avg_score av ON 1 = 1
+WHERE pt.Name = 'Question'
+GROUP BY tu.DisplayName, tu.total_bounty, tt.TagName, tt.num_posts, av.avg_score
+ORDER BY total_score DESC;

@@ -1,0 +1,70 @@
+-- {"query": "162.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 1809} 
+WITH
+RecentPosts AS (
+  SELECT OwnerUserId,
+         count(*) FILTER (WHERE PostTypeId = 1 AND CreationDate > NOW() - INTERVAL '30 days') AS RecentQuestions,
+         count(*) AS TotalPosts
+  FROM Posts
+  WHERE OwnerUserId IS NOT NULL
+  GROUP BY OwnerUserId
+),
+BadgesPerUser AS (
+  SELECT UserId,
+         SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+         SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+         SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+  FROM Badges
+  GROUP BY UserId
+),
+UserStats AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    COALESCE(b.GoldBadges, 0) AS GoldBadges,
+    COALESCE(b.SilverBadges, 0) AS SilverBadges,
+    COALESCE(b.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(r.TotalPosts, 0) AS TotalPosts,
+    COALESCE(r.RecentQuestions, 0) AS RecentQuestions,
+    (SELECT MAX(p.CreationDate) FROM Posts p WHERE p.OwnerUserId = u.Id) AS LastPostDate,
+    (SELECT MAX(p.Score) FROM Posts p WHERE p.OwnerUserId = u.Id) AS MaxPostScore,
+    (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = u.Id) AS AvgPostScore
+  FROM Users u
+  LEFT JOIN BadgesPerUser b ON b.UserId = u.Id
+  LEFT JOIN RecentPosts r ON r.OwnerUserId = u.Id
+)
+SELECT
+  Id,
+  DisplayName,
+  Reputation,
+  CreationDate,
+  LastAccessDate,
+  GoldBadges,
+  SilverBadges,
+  BronzeBadges,
+  TotalPosts,
+  RecentQuestions,
+  LastPostDate,
+  MaxPostScore,
+  AvgPostScore
+FROM UserStats
+ORDER BY Reputation DESC NULLS LAST
+LIMIT 100
+UNION ALL
+SELECT
+  NULL AS Id,
+  'Total' AS DisplayName,
+  SUM(Reputation) AS Reputation,
+  NULL AS CreationDate,
+  NULL AS LastAccessDate,
+  SUM(GoldBadges) AS GoldBadges,
+  SUM(SilverBadges) AS SilverBadges,
+  SUM(BronzeBadges) AS BronzeBadges,
+  SUM(TotalPosts) AS TotalPosts,
+  SUM(RecentQuestions) AS RecentQuestions,
+  NULL AS LastPostDate,
+  NULL AS MaxPostScore,
+  NULL AS AvgPostScore
+FROM UserStats;

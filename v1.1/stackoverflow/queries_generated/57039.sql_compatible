@@ -1,0 +1,111 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(p.Id) AS TotalPosts,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS TotalQuestions,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS TotalAnswers,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(p.Score) AS TotalPostScore,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesReceived,
+        MAX(p.LastActivityDate) AS LastPostActivityDate,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate
+),
+PostMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        COUNT(v.Id) AS TotalVotes,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes,
+        COUNT(DISTINCT c.Id) AS TotalCommentsOnPost,
+        p.OwnerUserId,
+        p.Tags
+    FROM
+        Posts p
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    GROUP BY
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.OwnerUserId, p.Tags
+),
+TagStatistics AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        t.Count AS TagCount,
+        COUNT(p.Id) AS PostsWithTag,
+        SUM(p.Score) AS TotalScoreOfTaggedPosts,
+        SUM(p.ViewCount) AS TotalViewsOfTaggedPosts,
+        AVG(p.Score) AS AverageScoreOfTaggedPosts,
+        AVG(p.ViewCount) AS AverageViewsOfTaggedPosts
+    FROM
+        Tags t
+    LEFT JOIN
+        Posts p ON t.TagName = ANY (string_to_array(substring(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><'))
+    GROUP BY
+        t.Id, t.TagName, t.Count
+)
+SELECT
+    ua.UserId,
+    ua.Reputation,
+    ua.UserCreationDate,
+    ua.TotalPosts,
+    ua.TotalQuestions,
+    ua.TotalAnswers,
+    ua.TotalComments,
+    ua.TotalPostScore,
+    ua.TotalUpVotesReceived,
+    ua.TotalDownVotesReceived,
+    ua.LastPostActivityDate,
+    ua.LastCommentDate,
+    pm.PostId,
+    pm.PostTypeId,
+    pm.PostCreationDate,
+    pm.Score AS PostScore,
+    pm.ViewCount,
+    pm.AnswerCount,
+    pm.CommentCount,
+    pm.FavoriteCount,
+    pm.TotalVotes,
+    pm.TotalUpVotes,
+    pm.TotalDownVotes,
+    pm.TotalCommentsOnPost,
+    ts.TagId,
+    ts.TagName,
+    ts.TagCount,
+    ts.PostsWithTag,
+    ts.TotalScoreOfTaggedPosts,
+    ts.TotalViewsOfTaggedPosts,
+    ts.AverageScoreOfTaggedPosts,
+    ts.AverageViewsOfTaggedPosts
+FROM
+    UserActivity ua
+LEFT JOIN
+    PostMetrics pm ON ua.UserId = pm.OwnerUserId
+LEFT JOIN
+    TagStatistics ts ON pm.Tags LIKE ('%<' || ts.TagName || '>%')
+ORDER BY
+    ua.Reputation DESC,
+    pm.PostCreationDate DESC,
+    ts.TagCount DESC
+LIMIT 1000;

@@ -1,0 +1,57 @@
+-- {"query": "33036.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 498} 
+SELECT
+    p.Id AS PostId,
+    p.Title AS PostTitle,
+    pt.Name AS PostType,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    c.Score AS CommentScore,
+    c.Text AS CommentText,
+    u.DisplayName AS CommentUser,
+    v.VoteTypeId,
+    vt.Name AS VoteTypeName,
+    COUNT(DISTINCT a.Id) AS AnswerCount,
+    COUNT(DISTINCT cl.RelatedPostId) AS LinkCount,
+    ARRAY_AGG(DISTINCT t.TagName) AS Tags,
+    string_agg(DISTINCT ub.DisplayName, ', ') AS UserBadges,
+    p.LastEditDate,
+    p.ClosedDate,
+    br.Name AS CloseReason,
+    p.ContentLicense
+FROM
+    Posts p
+LEFT JOIN
+    PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN
+    Comments c ON c.PostId = p.Id
+LEFT JOIN
+    Users u ON c.UserId = u.Id
+LEFT JOIN
+    Votes v ON v.PostId = p.Id
+LEFT JOIN
+    VoteTypes vt ON v.VoteTypeId = vt.Id
+LEFT JOIN
+    Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+LEFT JOIN
+    PostLinks cl ON cl.PostId = p.Id
+LEFT JOIN
+    Posts linkedPost ON cl.RelatedPostId = linkedPost.Id
+LEFT JOIN
+    Tags t ON t.ExcerptPostId = p.Id OR t.WikiPostId = p.Id
+LEFT JOIN
+    Users ub ON ub.Id IN (
+        SELECT uv.UserId FROM Votes uv WHERE uv.PostId = p.Id
+    )
+LEFT JOIN
+    PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4, 6)
+LEFT JOIN
+    CloseReasonTypes br ON p.ClosedDate IS NOT NULL AND ph.Comment = br.Id::text
+WHERE
+    p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 years'
+GROUP BY
+    p.Id, p.Title, pt.Name, p.CreationDate, p.Score, p.ViewCount, c.Score, c.Text, u.DisplayName,
+    v.VoteTypeId, vt.Name, p.LastEditDate, p.ClosedDate, br.Name, p.ContentLicense
+ORDER BY
+    p.CreationDate DESC
+LIMIT 100;

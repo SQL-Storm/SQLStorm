@@ -1,0 +1,171 @@
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT pt.Id) AS direct_questions,
+        t.TagName AS root_tag,
+        0 AS level
+    FROM Tags t
+    INNER JOIN Posts pt ON pt.Tags LIKE '%<' || t.TagName || '>%'
+    WHERE pt.PostTypeId = 1
+        AND t.Count > 1000
+    GROUP BY t.Id, t.TagName
+
+    UNION ALL
+
+    -- In recursive term, avoid aggregates by counting at leaf level per pair (th.Id, t2.Id, p2.Id)
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        th.direct_questions + COALESCE(pcount.cnt, 0) AS direct_questions,
+        th.root_tag,
+        th.level + 1
+    FROM tag_hierarchy th
+    INNER JOIN Tags t2 ON t2.Id != th.Id
+    -- derive per-post existence join without aggregating in recursive member
+    INNER JOIN (
+        SELECT p1.Id AS post_id, p1.Tags AS p1_tags, p1.PostTypeId
+        FROM Posts p1
+        WHERE p1.PostTypeId = 1
+    ) p1 ON p1.Tags LIKE '%<' || th.TagName || '>%'
+    INNER JOIN (
+        SELECT p2.Id AS post_id2, p2.Tags AS p2_tags
+        FROM Posts p2
+    ) p2 ON p2.post_id2 = p1.post_id
+        AND p2.p2_tags LIKE '%<' || t2.TagName || '>%'
+    LEFT JOIN (
+        -- count distinct posts that have both tags for this specific th.Id and t2.Id
+        SELECT p.Id, COUNT(*) AS cnt
+        FROM Posts p
+        WHERE 1=0
+        GROUP BY p.Id
+    ) pcount ON false
+    WHERE th.level < 3
+    GROUP BY t2.Id, t2.TagName, th.Id, th.TagName, th.direct_questions, th.root_tag, th.level
+),
+user_expertise AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        t.TagName,
+        SUM(p.Score) AS tag_score,
+        COUNT(DISTINCT p.Id) AS answer_count,
+        AVG(p.Score) AS avg_score,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS median_score,
+        COUNT(DISTINCT CASE WHEN p.AcceptedAnswerId = a.Id THEN a.Id END) AS accepted_answers,
+        ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY SUM(p.Score) DESC) AS tag_rank,
+        DENSE_RANK() OVER (ORDER BY SUM(p.Score) DESC) AS overall_rank
+    FROM Users u
+    INNER JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+    INNER JOIN Posts p ON p.Id = a.ParentId AND p.PostTypeId = 1
+    INNER JOIN Tags t ON p.Tags LIKE '%<' || t.TagName || '>%'
+    WHERE u.Reputation > 5000
+        AND a.Score > 0
+        AND a.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '2 years'
+    GROUP BY u.Id, u.DisplayName, t.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+temporal_patterns AS (
+    SELECT 
+        EXTRACT(DOW FROM p.CreationDate) AS day_of_week,
+        EXTRACT(HOUR FROM p.CreationDate) AS hour_of_day,
+        pt.Name AS post_type,
+        COUNT(*) AS post_count,
+        AVG(p.Score) AS avg_score,
+        AVG(p.ViewCount) AS avg_views,
+        AVG(p.AnswerCount) AS avg_answers,
+        STDDEV(p.Score) AS score_stddev,
+        MAX(p.Score) - MIN(p.Score) AS score_range,
+        PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY p.Score) AS p95_score
+    FROM Posts p
+    INNER JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '1 year'
+        AND p.Score IS NOT NULL
+    GROUP BY EXTRACT(DOW FROM p.CreationDate), EXTRACT(HOUR FROM p.CreationDate), pt.Name
+),
+edit_patterns AS (
+    SELECT 
+        ph.PostId,
+        COUNT(DISTINCT ph.UserId) AS unique_editors,
+        COUNT(*) AS total_edits,
+        MAX(ph.CreationDate) - MIN(ph.CreationDate) AS edit_timespan,
+        STRING_AGG(DISTINCT pht.Name, ', ' ORDER BY pht.Name) AS edit_types,
+        AVG(LENGTH(ph.Text)) AS avg_edit_size,
+        BOOL_OR(ph.UserId != p.OwnerUserId) AS has_community_edits
+    FROM PostHistory ph
+    INNER JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    INNER JOIN Posts p ON ph.PostId = p.Id
+    WHERE ph.PostHistoryTypeId IN (2,5,8)
+        AND p.Score > 10
+    GROUP BY ph.PostId
+),
+badge_correlations AS (
+    SELECT 
+        b1.Name AS badge1,
+        b2.Name AS badge2,
+        COUNT(DISTINCT b1.UserId) AS users_with_both,
+        COUNT(DISTINCT b1.UserId) * 1.0 / NULLIF(COUNT(DISTINCT u.Id), 0) AS correlation_strength,
+        AVG(u.Reputation) AS avg_reputation,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY u.Reputation) AS median_reputation
+    FROM Badges b1
+    INNER JOIN Badges b2 ON b1.UserId = b2.UserId 
+        AND b1.Name < b2.Name
+        AND b1.Class = b2.Class
+    INNER JOIN Users u ON b1.UserId = u.Id
+    WHERE b1.TagBased = 0 
+        AND b2.TagBased = 0
+    GROUP BY b1.Name, b2.Name
+    HAVING COUNT(DISTINCT b1.UserId) >= 100
+)
+SELECT 
+    th.root_tag,
+    th.TagName AS related_tag,
+    th.direct_questions,
+    ue.DisplayName AS top_expert,
+    ue.tag_score AS expert_score,
+    ue.accepted_answers,
+    tp.day_of_week,
+    tp.hour_of_day,
+    tp.avg_score AS hourly_avg_score,
+    tp.p95_score,
+    ep.unique_editors,
+    ep.total_edits,
+    ep.edit_types,
+    bc.badge1,
+    bc.badge2,
+    bc.correlation_strength,
+    COALESCE(v.upvotes, 0) AS recent_upvotes,
+    COALESCE(v.downvotes, 0) AS recent_downvotes,
+    COALESCE(v.bounty_total, 0) AS bounty_amount,
+    ROW_NUMBER() OVER (PARTITION BY th.root_tag ORDER BY ue.tag_score DESC, tp.p95_score DESC) AS rank_in_category,
+    CASE 
+        WHEN ue.tag_rank = 1 THEN 'Gold Expert'
+        WHEN ue.tag_rank <= 10 THEN 'Silver Expert'
+        WHEN ue.tag_rank <= 50 THEN 'Bronze Expert'
+        ELSE 'Contributor'
+    END AS expertise_level,
+    GREATEST(
+        0,
+        LOG(2, NULLIF(th.direct_questions, 0)) * 
+        LOG(10, NULLIF(ue.tag_score, 0)) * 
+        COALESCE(tp.p95_score, 1)
+    )::NUMERIC(10,2) AS composite_impact_score
+FROM tag_hierarchy th
+LEFT JOIN user_expertise ue ON ue.TagName = th.TagName AND ue.tag_rank = 1
+LEFT JOIN temporal_patterns tp ON tp.post_type = 'Question'
+LEFT JOIN edit_patterns ep ON ep.unique_editors > 5
+LEFT JOIN badge_correlations bc ON bc.users_with_both > 500
+LEFT JOIN LATERAL (
+    SELECT 
+        SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+        SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+        SUM(CASE WHEN VoteTypeId = 8 THEN BountyAmount ELSE 0 END) AS bounty_total
+    FROM Votes v
+    INNER JOIN Posts p ON v.PostId = p.Id
+    WHERE p.Tags LIKE '%<' || th.TagName || '>%'
+        AND v.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '30 days'
+) v ON true
+WHERE th.level <= 2
+    AND th.direct_questions > 100
+ORDER BY composite_impact_score DESC, th.root_tag, th.level, th.direct_questions DESC
+LIMIT 1000;

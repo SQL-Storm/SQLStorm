@@ -1,4 +1,4 @@
--- {"query": "4067.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 975} 
+-- {"query": "4067.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 975} 
 with recursive TagHierarchy as (
     select t.Id, t.TagName, 1 as Level, array[t.TagName] as Path
     from Tags t

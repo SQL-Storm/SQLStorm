@@ -1,0 +1,123 @@
+-- {"query": "44.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 832} 
+WITH ranked_posts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Body,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.Tags,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.LastEditorUserId,
+    p.LastEditDate,
+    p.ContentLicense,
+    u.Reputation,
+    u.DisplayName,
+    u.Location,
+    u.AccountId,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.WebsiteUrl,
+    u.EmailHash,
+    u.CreationDate AS UserCreationDate,
+    CASE
+      WHEN p.OwnerUserId IS NULL THEN NULL
+      ELSE (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 6)
+    END AS AvgCloseScore,
+    CASE
+      WHEN p.ParentId IS NULL THEN NULL
+      ELSE (SELECT COUNT(*) FROM Posts c WHERE c.ParentId = p.Id)
+    END AS ChildAnswerCount
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+),
+cte_agg AS (
+  SELECT
+    rp.PostId,
+    rp.PostTypeId,
+    rp.Title,
+    rp.Tags,
+    rp.OwnerUserId,
+    rp.Reputation,
+    rp.DisplayName,
+    rp.Location,
+    rp.Views,
+    rp.UpVotes,
+    rp.DownVotes,
+    rp.CreationDate,
+    rp.LastActivityDate,
+    rp.AnswerCount,
+    rp.CommentCount,
+    rp.ViewCount,
+    rp.Score,
+    rp.FavoriteCount,
+    rp.AcceptedAnswerId,
+    rp.ParentId,
+    rp.LastEditDate,
+    rp.UserCreationDate,
+    rp.AvgCloseScore,
+    rp.ChildAnswerCount,
+    -- Window function: rank questions by score within 24h windows
+    SUM(p.Score) OVER (
+      PARTITION BY DATE_TRUNC('hour', p.CreationDate)
+      ORDER BY p.Score DESC
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS RunningScoreInHour
+  FROM ranked_posts rp
+  CROSS JOIN LATERAL (
+    SELECT p.Score
+    FROM Posts p
+    WHERE p.Id = rp.PostId
+  ) AS p
+),
+final_rows AS (
+  SELECT
+    c.PostId,
+    c.Title,
+    c.Tags,
+    c.OwnerUserId,
+    c.Reputation,
+    c.DisplayName,
+    c.Location,
+    c.Views,
+    c.UpVotes,
+    c.DownVotes,
+    c.CreationDate,
+    c.LastActivityDate,
+    c.AnswerCount,
+    c.CommentCount,
+    c.ViewCount,
+    c.Score,
+    c.FavoriteCount,
+    c.AcceptedAnswerId,
+    c.ParentId,
+    c.LastEditDate,
+    c.UserCreationDate,
+    c.AvgCloseScore,
+    c.ChildAnswerCount,
+    c.RunningScoreInHour,
+    /* Complex predicate example with NULL handling and string expressions */
+    CASE
+      WHEN c.Tags IS NOT NULL THEN regexp_replace(c.Tags, E'^<|>$', '', 'g')
+      ELSE NULL
+    END AS CleanTags,
+    /* Expose a correlated subquery: count of related tag wiki posts for the primary tag if any */
+    (SELECT COUNT(*) FROM Posts t WHERE t.PostTypeId = 5 AND t.OwnerUserId = c.OwnerUserId) AS TagWikiCount,
+    /* Set operation: create a null-safe boolean expression combining multiple sources */
+    (CASE WHEN c.Reputation > 1000 AND c.Views > 10000 THEN TRUE ELSE FALSE END) AS IsInfluential
+  FROM cte_agg c
+)
+SELECT
+  *
+FROM final_rows
+ORDER BY LastActivityDate DESC
+LIMIT 200;

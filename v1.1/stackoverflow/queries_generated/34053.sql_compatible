@@ -1,0 +1,141 @@
+WITH RankedAnswers AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score AS AnswerScore,
+        u.Id AS AnswerOwnerId,
+        u.DisplayName AS AnswerOwnerName,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS Rank
+    FROM Posts a
+    JOIN Users u ON a.OwnerUserId = u.Id
+    WHERE a.PostTypeId = 2
+),
+TopAnswers AS (
+    SELECT * FROM RankedAnswers WHERE Rank = 1
+),
+QuestionDetails AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        q.CreationDate AS QuestionCreationDate,
+        qu.Id AS QuestionOwnerId,
+        qu.DisplayName AS QuestionOwnerName,
+        COALESCE(ans.AnswerScore, 0) AS TopAnswerScore,
+        COALESCE(ans.AnswerOwnerId, NULL) AS TopAnswerOwnerId,
+        COALESCE(ans.AnswerOwnerName, NULL) AS TopAnswerOwnerName
+    FROM Posts q
+    LEFT JOIN TopAnswers ans ON q.Id = ans.QuestionId
+    JOIN Users qu ON q.OwnerUserId = qu.Id
+    WHERE q.PostTypeId = 1
+),
+UserBadgeStats AS (
+    SELECT
+        b.UserId,
+        COUNT(*) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserVoteStats AS (
+    SELECT
+        v.UserId,
+        COUNT(CASE WHEN vt.Name = 'UpMod' THEN 1 END) AS UpVotes,
+        COUNT(CASE WHEN vt.Name = 'DownMod' THEN 1 END) AS DownVotes,
+        COUNT(CASE WHEN vt.Name = 'BountyStart' THEN 1 END) AS BountyStarts,
+        COUNT(CASE WHEN vt.Name = 'Favorite' THEN 1 END) AS Favorites
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+),
+UserAggregates AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        ub.TotalBadges,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        COALESCE(uv.UpVotes, 0) AS UpVotes,
+        COALESCE(uv.DownVotes, 0) AS DownVotes,
+        COALESCE(uv.BountyStarts, 0) AS BountyStarts,
+        COALESCE(uv.Favorites, 0) AS Favorites
+    FROM Users u
+    LEFT JOIN UserBadgeStats ub ON u.Id = ub.UserId
+    LEFT JOIN UserVoteStats uv ON u.Id = uv.UserId
+),
+PopularTags AS (
+    SELECT
+        tag AS TagName,
+        COUNT(*) AS QuestionCount,
+        AVG(t.Score) AS AvgQuestionScore,
+        AVG(t.ViewCount) AS AvgViewCount
+    FROM Posts t,
+         UNNEST(STRING_TO_ARRAY(SUBSTRING(t.Tags, 2, LENGTH(t.Tags)-2), '><')) AS tag
+    WHERE t.PostTypeId = 1 AND t.Tags IS NOT NULL AND t.Tags <> ''
+    GROUP BY tag
+    ORDER BY QuestionCount DESC
+    LIMIT 10
+),
+TagLeaderboards AS (
+    SELECT
+        pt.TagName,
+        pt.QuestionCount,
+        pt.AvgQuestionScore,
+        pt.AvgViewCount,
+        u.DisplayName AS TopUserByReputation,
+        u.Reputation AS TopUserReputation
+    FROM PopularTags pt
+    JOIN (
+        SELECT
+            tag AS TagName,
+            p.OwnerUserId,
+            MAX(u.Reputation) AS MaxReputation
+        FROM Posts p
+        JOIN Users u ON p.OwnerUserId = u.Id
+        CROSS JOIN LATERAL UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS tag
+        WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.Tags <> ''
+        GROUP BY tag, p.OwnerUserId
+    ) UserMaxRep ON pt.TagName = UserMaxRep.TagName
+    JOIN Users u ON UserMaxRep.OwnerUserId = u.Id AND u.Reputation = UserMaxRep.MaxReputation
+    ORDER BY pt.QuestionCount DESC
+)
+SELECT
+    q.QuestionId,
+    q.Title,
+    q.QuestionScore,
+    q.ViewCount,
+    q.Tags,
+    q.QuestionCreationDate,
+    q.QuestionOwnerName,
+    ua.TotalBadges AS QuestionOwnerBadges,
+    ua.GoldBadges AS QuestionOwnerGoldBadges,
+    ua.Reputation AS QuestionOwnerReputation,
+    q.TopAnswerScore,
+    q.TopAnswerOwnerName,
+    ua2.TotalBadges AS TopAnswerOwnerBadges,
+    ua2.GoldBadges AS TopAnswerOwnerGoldBadges,
+    ua2.Reputation AS TopAnswerOwnerReputation,
+    tl.TagName AS PopularTag,
+    tl.QuestionCount AS PopularTagQuestionCount,
+    tl.AvgQuestionScore AS PopularTagAvgScore,
+    tl.TopUserByReputation AS PopularTagTopUser,
+    tl.TopUserReputation AS PopularTagTopUserReputation
+FROM QuestionDetails q
+LEFT JOIN UserAggregates ua ON q.QuestionOwnerId = ua.UserId
+LEFT JOIN UserAggregates ua2 ON q.TopAnswerOwnerId = ua2.UserId
+LEFT JOIN PopularTags tl ON EXISTS (
+    SELECT 1
+    FROM UNNEST(STRING_TO_ARRAY(SUBSTRING(q.Tags, 2, LENGTH(q.Tags)-2), '><')) AS tagName
+    WHERE tagName = tl.TagName
+)
+WHERE q.QuestionScore > 50 AND q.ViewCount > 1000
+ORDER BY q.ViewCount DESC, q.QuestionScore DESC
+LIMIT 100;

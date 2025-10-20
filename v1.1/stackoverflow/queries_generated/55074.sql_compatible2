@@ -1,0 +1,91 @@
+WITH RECURSIVE dup_chain AS (
+    -- Build chains of duplicate closures (questions linked as duplicates)
+    SELECT 
+        ph.PostId AS original_qid,
+        ph.PostId AS root_qid,
+        0 AS depth
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10             -- Post Closed
+      AND CAST(ph.Comment AS integer) = 101     -- CloseReason: Duplicate
+      AND ph.Text IS NOT NULL                   -- JSON array of original question IDs
+    UNION ALL
+    SELECT 
+        pl.PostId,
+        dc.root_qid,
+        dc.depth + 1
+    FROM dup_chain dc
+    JOIN PostLinks pl ON pl.RelatedPostId = dc.original_qid
+                      AND pl.LinkTypeId = 3      -- Duplicate link
+)
+, top_users AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS gold_badges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS silver_badges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS bronze_badges,
+        COUNT(DISTINCT a.Id) AS answered_questions,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS total_upvotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS total_downvotes
+    FROM Users u
+    LEFT JOIN Badges b          ON b.UserId = u.Id
+    LEFT JOIN Posts a           ON a.OwnerUserId = u.Id
+                                 AND a.PostTypeId = 2          -- Answers
+    LEFT JOIN Votes v           ON v.PostId = a.Id
+                                 AND v.VoteTypeId IN (2,3)    -- Up/Down votes
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT a.Id) >= 10
+)
+, recent_activity AS (
+    SELECT 
+        p.OwnerUserId AS user_id,
+        MAX(p.LastActivityDate) AS last_activity,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 5) AS edits_made,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 10) AS closures_participated
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    WHERE p.OwnerUserId IS NOT NULL
+      AND p.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '180' DAY
+    GROUP BY p.OwnerUserId
+)
+SELECT 
+    tu.Id,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.gold_badges,
+    tu.silver_badges,
+    tu.bronze_badges,
+    tu.answered_questions,
+    tu.total_upvotes,
+    tu.total_downvotes,
+    ra.last_activity,
+    ra.edits_made,
+    ra.closures_participated,
+    jsonb_agg(DISTINCT jsonb_build_object(
+        'original_question', dc.root_qid,
+        'duplicate_chain_length', dc.depth,
+        'tags', (
+            SELECT array_agg(t.TagName)
+            FROM (
+                SELECT trim(BOTH '<>' FROM tag) AS tagname
+                FROM UNNEST(string_to_array(p.Tags, '><')) AS unn(tag)
+            ) tagvals
+            JOIN Tags t ON t.TagName = tagvals.tagname
+            WHERE p.Id = dc.original_qid
+        )
+    )) AS duplicate_chains
+FROM top_users tu
+LEFT JOIN recent_activity ra ON ra.user_id = tu.Id
+LEFT JOIN dup_chain dc ON dc.root_qid IN (
+    SELECT ParentId FROM Posts WHERE OwnerUserId = tu.Id AND PostTypeId = 2
+)
+LEFT JOIN Posts p ON p.Id = dc.original_qid
+GROUP BY 
+    tu.Id, tu.DisplayName, tu.Reputation, 
+    tu.gold_badges, tu.silver_badges, tu.bronze_badges,
+    tu.answered_questions, tu.total_upvotes, tu.total_downvotes,
+    ra.last_activity, ra.edits_made, ra.closures_participated,
+    dc.root_qid, dc.depth
+ORDER BY tu.Reputation DESC, tu.gold_badges DESC
+LIMIT 50;

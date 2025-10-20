@@ -1,0 +1,87 @@
+WITH ActiveUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation, u.CreationDate,
+           COUNT(DISTINCT p.Id) AS TotalPosts,
+           COUNT(DISTINCT c.Id) AS TotalComments,
+           COUNT(DISTINCT v.Id) AS TotalVotes,
+           COUNT(DISTINCT b.Id) AS TotalBadges,
+           RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) + COUNT(DISTINCT c.Id) DESC) AS ActivityRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1, 2)
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId IN (2, 3, 8)
+    LEFT JOIN Badges b ON u.Id = b.UserId AND b.Class = 1
+    WHERE u.Reputation > 10000
+      AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1' YEAR
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostStats AS (
+    SELECT p.OwnerUserId,
+           AVG(p.Score) AS AvgPostScore,
+           MAX(p.AnswerCount) AS MaxAnswerCount,
+           SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS ClosedPosts,
+           SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenedPosts
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (10, 11)
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId
+),
+TagUsage AS (
+    SELECT UserId, TagName, COUNT(*) AS TagCount
+    FROM (
+        SELECT p.OwnerUserId AS UserId,
+               TRIM(t.tag) AS TagName
+        FROM Posts p
+        JOIN LATERAL (
+            SELECT value AS tag
+            FROM (
+                -- replace Postgres regexp_split_to_table with standard SQL approach using simple string functions where possible
+                -- handle tags like '<tag1><tag2>' by removing leading '<' and trailing '>' then splitting on '><'
+                SELECT UNNEST(STRING_SPLIT(
+                    CASE
+                      WHEN p.Tags LIKE '<%>' THEN SUBSTRING(p.Tags FROM 2 FOR (LENGTH(p.Tags) - 2))
+                      ELSE p.Tags
+                    END,
+                '><')) AS value
+            ) s
+        ) t ON TRUE
+        WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    ) t
+    GROUP BY UserId, TagName
+),
+TopTags AS (
+    SELECT tu.UserId,
+           -- Use a comma-separated list of top tags as a portable alternative to ARRAY_AGG with FILTER
+           STRING_AGG(tu.TagName, ',' ORDER BY tu.TagCount DESC) AS TopTags,
+           SUM(tu.TagCount) AS TotalTagUses
+    FROM (
+        SELECT UserId, TagName, TagCount,
+               ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY TagCount DESC) AS rn
+        FROM TagUsage
+    ) tu
+    WHERE rn <= 3
+    GROUP BY tu.UserId
+)
+SELECT au.Id, au.DisplayName, au.Reputation, au.CreationDate,
+       au.TotalPosts, au.TotalComments, au.TotalVotes, au.TotalBadges,
+       ps.AvgPostScore, ps.MaxAnswerCount, ps.ClosedPosts, ps.ReopenedPosts,
+       tt.TopTags, tt.TotalTagUses,
+       CASE 
+           WHEN au.Reputation > 100000 THEN 'Legendary'
+           WHEN au.Reputation > 50000 THEN 'Epic'
+           WHEN au.Reputation > 20000 THEN 'Veteran'
+           ELSE 'Expert'
+       END AS ReputationTier,
+       DENSE_RANK() OVER (ORDER BY au.TotalPosts DESC) AS PostRank,
+       DENSE_RANK() OVER (ORDER BY au.TotalComments DESC) AS CommentRank,
+       au.ActivityRank
+FROM ActiveUsers au
+JOIN PostStats ps ON au.Id = ps.OwnerUserId
+LEFT JOIN TopTags tt ON au.Id = tt.UserId
+WHERE au.ActivityRank <= 100
+GROUP BY au.Id, au.DisplayName, au.Reputation, au.CreationDate,
+         au.TotalPosts, au.TotalComments, au.TotalVotes, au.TotalBadges,
+         ps.AvgPostScore, ps.MaxAnswerCount, ps.ClosedPosts, ps.ReopenedPosts,
+         tt.TopTags, tt.TotalTagUses,
+         au.ActivityRank
+ORDER BY au.Reputation DESC, au.TotalPosts DESC, au.TotalComments DESC
+LIMIT 100;

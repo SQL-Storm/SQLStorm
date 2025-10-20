@@ -1,0 +1,45 @@
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id, 
+        u.DisplayName, 
+        u.Reputation, 
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1, 2)
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 10000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+), PostStats AS (
+    SELECT 
+        p.OwnerUserId,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS TotalEdits,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS TotalUpvotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS TotalDownvotes
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.CreationDate >= DATE '2020-01-01'
+    GROUP BY p.OwnerUserId
+)
+SELECT 
+    au.Id,
+    au.DisplayName,
+    au.Reputation,
+    au.TotalPosts,
+    au.TotalComments,
+    au.GoldBadges,
+    ps.AvgPostScore,
+    ps.TotalEdits,
+    ps.TotalUpvotes,
+    ps.TotalDownvotes,
+    RANK() OVER (ORDER BY au.Reputation DESC) AS ReputationRank
+FROM ActiveUsers au
+JOIN PostStats ps ON au.Id = ps.OwnerUserId
+ORDER BY 
+    au.Reputation DESC, 
+    ps.TotalUpvotes DESC
+LIMIT 100;

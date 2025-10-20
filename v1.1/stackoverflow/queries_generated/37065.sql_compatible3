@@ -1,0 +1,255 @@
+WITH
+Questions AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.ViewCount,
+    p.Score,
+    p.AnswerCount,
+    p.AcceptedAnswerId,
+    u.Id AS OwnerId,
+    u.DisplayName AS OwnerName,
+    COALESCE(NULLIF(p.Tags, ''), '') AS RawTags,
+    CASE WHEN p.Tags IS NULL OR p.Tags = '' THEN ARRAY[]::text[]
+         ELSE string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><')
+    END AS TagArray
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years'
+    AND p.LastActivityDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+),
+WeightedQuestions AS (
+  SELECT
+    q.*,
+    (
+      (CAST(q.ViewCount AS double precision) / NULLIF(GREATEST((SELECT MAX(ViewCount) FROM Questions),1),0) * 0.25)
+      + (CAST(GREATEST(q.Score,0) AS double precision) / NULLIF(GREATEST((SELECT MAX(Score) FROM Questions),1),0) * 0.25)
+      + (CAST(q.AnswerCount AS double precision) / NULLIF(GREATEST((SELECT MAX(AnswerCount) FROM Questions),1),0) * 0.2)
+      + (CAST(COALESCE(v.Favorites,0) AS double precision) / NULLIF(GREATEST((SELECT MAX(v2.Favorites) FROM (SELECT COUNT(*) FILTER (WHERE VoteTypeId=5) AS Favorites FROM Votes v3 JOIN Posts p3 ON v3.PostId = p3.Id WHERE p3.PostTypeId = 1 GROUP BY p3.Id) v2),1),0) * 0.2)
+      + ((CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) * 0.1)
+    ) AS EngagementScore
+  FROM Questions q
+  LEFT JOIN (
+    SELECT p.Id AS PostId, COUNT(*) FILTER (WHERE VoteTypeId = 5) AS Favorites
+    FROM Posts p
+    JOIN Votes v ON v.PostId = p.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id
+  ) v ON v.PostId = q.Id
+),
+TagStats AS (
+  SELECT
+    t.TagName,
+    COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+    AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS AvgScore,
+    SUM(p.ViewCount) FILTER (WHERE p.PostTypeId = 1) AS TotalViews
+  FROM Tags t
+  LEFT JOIN Posts p ON p.PostTypeId = 1
+    AND position(('<' || t.TagName || '>') IN COALESCE(p.Tags, '')) > 0
+  GROUP BY t.TagName
+),
+Answers AS (
+  SELECT
+    a.Id,
+    a.ParentId AS QuestionId,
+    a.CreationDate AS AnswerDate,
+    a.Score AS AnswerScore,
+    a.OwnerUserId AS AnswererId,
+    u.DisplayName AS AnswererName,
+    u.Reputation AS AnswererReputation,
+    a.Body,
+    CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END AS IsAccepted,
+    CASE WHEN q.AcceptedAnswerId = a.Id THEN EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600.0 ELSE NULL END AS HoursToAccept
+  FROM Posts a
+  JOIN Posts q ON q.Id = a.ParentId AND q.PostTypeId = 1
+  LEFT JOIN Users u ON u.Id = a.OwnerUserId
+  WHERE a.PostTypeId = 2
+    AND a.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years'
+),
+QuestionAggregates AS (
+  SELECT
+    wq.*,
+    COALESCE(ans.AnswerCountCalc, 0) AS CalcAnswerCount,
+    COALESCE(ans.Accepted, 0) AS HasAccepted,
+    COALESCE(ans.AvgAnswerScore, 0) AS AvgAnswerScore,
+    COALESCE(ans.MinHoursToAccept, NULL) AS MinHoursToAccept,
+    COALESCE(c.CommentCount, 0) AS CommentCount,
+    COALESCE(ph.EditCount, 0) AS EditCount,
+    COALESCE(pl.InboundLinks, 0) AS InboundLinks,
+    COALESCE(pl.OutboundLinks, 0) AS OutboundLinks,
+    ts.TopTags,
+    ts.TopTag1,
+    ts.TopTag2,
+    ts.TopTag3
+  FROM WeightedQuestions wq
+  LEFT JOIN (
+    SELECT
+      q.Id AS QId,
+      COUNT(a.Id) AS AnswerCountCalc,
+      MAX(CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS Accepted,
+      AVG(a.Score) AS AvgAnswerScore,
+      MIN(
+        CASE WHEN a.CreationDate > q.CreationDate THEN EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600.0 ELSE NULL END
+      ) FILTER (WHERE a.Id = q.AcceptedAnswerId) AS MinHoursToAccept
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id
+  ) ans ON ans.QId = wq.Id
+  LEFT JOIN (
+    SELECT p.Id AS QId, COUNT(c.Id) AS CommentCount
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id
+  ) c ON c.QId = wq.Id
+  LEFT JOIN (
+    SELECT p.Id AS QId, COUNT(ph.Id) AS EditCount
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6,7,8,9,24)
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id
+  ) ph ON ph.QId = wq.Id
+  LEFT JOIN (
+    SELECT
+      p.Id AS QId,
+      SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS OutboundLinks,
+      SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS InboundLinks
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id OR pl.RelatedPostId = p.Id
+    GROUP BY p.Id
+  ) pl ON pl.QId = wq.Id
+  LEFT JOIN (
+    SELECT
+      q.Id AS QId,
+      array_agg(t.TagName ORDER BY COALESCE(ts.TotalViews,0) DESC, COALESCE(ts.QuestionCount,0) DESC) FILTER (WHERE t.TagName IS NOT NULL) AS TopTags,
+      (array_agg(t.TagName ORDER BY COALESCE(ts.TotalViews,0) DESC, COALESCE(ts.QuestionCount,0) DESC) FILTER (WHERE t.TagName IS NOT NULL))[1] AS TopTag1,
+      (array_agg(t.TagName ORDER BY COALESCE(ts.TotalViews,0) DESC, COALESCE(ts.QuestionCount,0) DESC) FILTER (WHERE t.TagName IS NOT NULL))[2] AS TopTag2,
+      (array_agg(t.TagName ORDER BY COALESCE(ts.TotalViews,0) DESC, COALESCE(ts.QuestionCount,0) DESC) FILTER (WHERE t.TagName IS NOT NULL))[3] AS TopTag3
+    FROM Posts q
+    LEFT JOIN LATERAL (
+      SELECT unnest(
+        CASE WHEN q.Tags IS NULL OR q.Tags = '' THEN ARRAY[]::text[] ELSE string_to_array(substring(q.Tags FROM 2 FOR char_length(q.Tags)-2), '><') END
+      ) AS TagName
+    ) t ON true
+    LEFT JOIN TagStats ts ON ts.TagName = t.TagName
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id
+  ) ts ON ts.QId = wq.Id
+),
+UserContrib AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(ans.TotalAnswers,0) AS TotalAnswers,
+    COALESCE(ans.AcceptedAnswers,0) AS AcceptedAnswers,
+    COALESCE(b.Gold,0) AS GoldBadges,
+    COALESCE(b.Silver,0) AS SilverBadges,
+    COALESCE(b.Bronze,0) AS BronzeBadges,
+    COALESCE(v.UpVotes,0) AS UpVotesGiven,
+    COALESCE(v.DownVotes,0) AS DownVotesGiven,
+    (CASE WHEN COALESCE(ans.TotalAnswers,0) = 0 THEN 0
+       ELSE (CAST(COALESCE(ans.AcceptedAnswers,0) AS double precision) / ans.TotalAnswers) * COALESCE(ans.AvgAnswerScore,0)
+    END) * LOG(GREATEST(u.Reputation, 10)) AS QualityScore
+  FROM Users u
+  LEFT JOIN (
+    SELECT
+      a.OwnerUserId AS UserId,
+      COUNT(*) AS TotalAnswers,
+      COUNT(*) FILTER (WHERE a.Id = q.AcceptedAnswerId) AS AcceptedAnswers,
+      AVG(a.Score) AS AvgAnswerScore
+    FROM Posts a
+    LEFT JOIN Posts q ON q.Id = a.ParentId AND q.PostTypeId = 1
+    WHERE a.PostTypeId = 2
+    GROUP BY a.OwnerUserId
+  ) ans ON ans.UserId = u.Id
+  LEFT JOIN (
+    SELECT UserId,
+      COUNT(*) FILTER (WHERE Class = 1) AS Gold,
+      COUNT(*) FILTER (WHERE Class = 2) AS Silver,
+      COUNT(*) FILTER (WHERE Class = 3) AS Bronze
+    FROM Badges
+    GROUP BY UserId
+  ) b ON b.UserId = u.Id
+  LEFT JOIN (
+    SELECT UserId,
+      COUNT(*) FILTER (WHERE VoteTypeId = 2) AS UpVotes,
+      COUNT(*) FILTER (WHERE VoteTypeId = 3) AS DownVotes
+    FROM Votes
+    WHERE UserId IS NOT NULL
+    GROUP BY UserId
+  ) v ON v.UserId = u.Id
+),
+TopSample AS (
+  SELECT *
+  FROM QuestionAggregates
+  ORDER BY EngagementScore DESC NULLS LAST, ViewCount DESC
+  LIMIT 250
+)
+SELECT
+  ts.Id AS QuestionId,
+  ts.Title,
+  ts.CreationDate,
+  ts.LastActivityDate,
+  ts.ViewCount,
+  ts.Score AS QuestionScore,
+  ts.EngagementScore,
+  ts.CalcAnswerCount,
+  ts.HasAccepted,
+  ts.AvgAnswerScore,
+  ROUND(COALESCE(ts.MinHoursToAccept, -1),2) AS HoursToAccept,
+  ts.CommentCount,
+  ts.EditCount,
+  ts.InboundLinks,
+  ts.OutboundLinks,
+  ts.TopTag1,
+  ts.TopTag2,
+  ts.TopTag3,
+  (SELECT json_agg(row_to_json(x)) FROM (
+     SELECT a.Id AS AnswerId, a.AnswerDate, a.AnswerScore, a.IsAccepted,
+       u.DisplayName AS AnswererName, u.Reputation AS AnswererRep,
+       uc.QualityScore AS AnswererQualityScore,
+       LEFT(a.Body, 256) AS Snippet
+     FROM Answers a
+     LEFT JOIN Users u ON u.Id = a.AnswererId
+     LEFT JOIN UserContrib uc ON uc.UserId = u.Id
+     WHERE a.QuestionId = ts.Id
+     GROUP BY a.Id, a.AnswerDate, a.AnswerScore, a.IsAccepted, u.DisplayName, u.Reputation, uc.QualityScore, a.Body
+     ORDER BY a.AnswerScore DESC NULLS LAST, a.AnswerDate ASC
+     LIMIT 3
+  ) x) AS TopAnswers,
+  (SELECT json_agg(row_to_json(r)) FROM (
+     SELECT DISTINCT p2.Id AS RelatedId, p2.Title AS RelatedTitle, pl.LinkTypeId,
+       ROUND((CAST(p2.Score AS numeric) / NULLIF(GREATEST((SELECT MAX(Score) FROM Posts),1),0)),4) AS RelScoreNorm
+     FROM PostLinks pl
+     JOIN Posts p1 ON p1.Id = ts.Id
+     JOIN Posts p2 ON (p2.Id = pl.RelatedPostId AND pl.PostId = p1.Id) OR (p2.Id = pl.PostId AND pl.RelatedPostId = p1.Id)
+     WHERE pl.LinkTypeId IN (1,3)
+     GROUP BY p2.Id, p2.Title, pl.LinkTypeId, p2.Score
+     ORDER BY RelScoreNorm DESC NULLS LAST
+     LIMIT 10
+  ) r) AS RelatedQuestions,
+  (SELECT json_agg(row_to_json(t)) FROM (
+     SELECT ut.TagName, ts2.QuestionCount, ts2.AvgScore, ts2.TotalViews, ut.ord
+     FROM unnest(ts.TopTags) WITH ORDINALITY AS ut(TagName, ord)
+     LEFT JOIN TagStats ts2 ON ts2.TagName = ut.TagName
+     ORDER BY COALESCE(ts2.TotalViews,0) DESC NULLS LAST, COALESCE(ts2.QuestionCount,0) DESC, ut.ord
+  ) t) AS TagDetails,
+  (SELECT row_to_json(o) FROM (
+     SELECT wq.OwnerId AS OwnerUserId, wq.OwnerName,
+       uc.Reputation AS OwnerReputation,
+       uc.GoldBadges, uc.SilverBadges, uc.BronzeBadges,
+       uc.TotalAnswers, ROUND(uc.QualityScore,4) AS OwnerQualityScore
+     FROM TopSample wq
+     LEFT JOIN UserContrib uc ON uc.UserId = wq.OwnerId
+     WHERE wq.Id = ts.Id
+     LIMIT 1
+  ) o) AS OwnerSnapshot,
+  CAST('2024-10-01 12:34:56' AS timestamp) AS SnapshotAt
+FROM TopSample ts
+LEFT JOIN QuestionAggregates wq ON wq.Id = ts.Id
+ORDER BY ts.EngagementScore DESC NULLS LAST, ts.ViewCount DESC;

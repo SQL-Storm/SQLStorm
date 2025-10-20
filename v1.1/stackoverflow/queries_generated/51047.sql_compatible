@@ -1,0 +1,150 @@
+WITH 
+question_stats AS (
+    SELECT 
+        p.Id AS question_id,
+        p.OwnerUserId,
+        p.Score AS question_score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        u.Reputation AS owner_reputation,
+        u.UpVotes AS owner_upvotes,
+        u.DownVotes AS owner_downvotes,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS upvotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS downvotes,
+        SUM(CASE WHEN v.VoteTypeId IN (2, 3) THEN 1 ELSE 0 END) AS total_votes,
+        AVG(c.Score) AS avg_comment_score,
+        COUNT(DISTINCT a.OwnerUserId) AS distinct_answerers,
+        MAX(a.Score) AS max_answer_score,
+        SUM(a.Score) AS total_answer_score,
+        COUNT(CASE WHEN a.Score >= 0 THEN 1 END) AS positive_answers
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON p.Id = v.PostId 
+    LEFT JOIN Comments c ON p.Id = c.PostId AND c.UserId IS NOT NULL
+    LEFT JOIN Posts a ON p.Id = a.ParentId AND a.PostTypeId = 2 AND a.DeletionDate IS NULL
+    WHERE p.PostTypeId = 1 
+        AND p.DeletionDate IS NULL
+        AND p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '1 year'
+    GROUP BY p.Id, p.OwnerUserId, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.CreationDate, u.Reputation, u.UpVotes, u.DownVotes
+    HAVING p.AnswerCount > 0
+),
+tag_analysis AS (
+    SELECT 
+        p.Id AS post_id,
+        -- Normalize tags stored like '<tag1><tag2>' into an array and elements
+        (CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags <> '' 
+            THEN string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags) - 2), '><')
+            ELSE NULL
+         END) AS tag_array,
+        unnest(
+            CASE 
+                WHEN p.Tags IS NOT NULL AND p.Tags <> '' 
+                THEN string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags) - 2), '><')
+                ELSE ARRAY[]::text[]
+            END
+        ) AS individual_tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+        AND p.Tags IS NOT NULL 
+        AND p.Tags <> ''
+        AND p.DeletionDate IS NULL
+),
+popular_tags AS (
+    SELECT 
+        ta.individual_tag,
+        COUNT(*) as tag_usage_count,
+        AVG(qs.question_score) as avg_question_score_for_tag,
+        AVG(qs.owner_reputation) as avg_reputation_for_tag_users
+    FROM tag_analysis ta
+    JOIN question_stats qs ON ta.post_id = qs.question_id
+    GROUP BY ta.individual_tag
+    HAVING COUNT(*) >= 50
+),
+badge_insights AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS gold_badges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS silver_badges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS bronze_badges,
+        COUNT(*) AS total_badges,
+        AVG(b.Date) AS avg_badge_date
+    FROM Badges b
+    WHERE b.Date >= CAST('2024-10-01' AS date) - INTERVAL '2 years'
+    GROUP BY b.UserId
+    HAVING COUNT(*) >= 1
+),
+history_patterns AS (
+    SELECT 
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        COUNT(*) AS event_count,
+        AVG(EXTRACT(EPOCH FROM (ph.CreationDate - MIN(ph.CreationDate) OVER (PARTITION BY ph.PostId))) / 3600) AS avg_hours_from_creation,
+        MAX(ph.CreationDate) AS last_event_date
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 10, 11)
+        AND ph.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '6 months'
+    GROUP BY ph.PostId, ph.PostHistoryTypeId
+)
+SELECT 
+    qs.question_id,
+    qs.question_score,
+    qs.view_count,
+    qs.answer_count,
+    qs.owner_reputation,
+    qs.upvotes,
+    qs.downvotes,
+    qs.total_votes,
+    qs.max_answer_score,
+    qs.total_answer_score,
+    COALESCE(tag_summary.tag_usage_count, 0) AS primary_tag_popularity,
+    COALESCE(tag_summary.avg_question_score_for_tag, 0) AS tag_avg_score,
+    COALESCE(bi.total_badges, 0) AS total_badges,
+    COALESCE(bi.gold_badges, 0) AS gold_badges,
+    COALESCE(hp.event_count, 0) AS total_edit_close_events,
+    CASE 
+        WHEN qs.total_votes > 100 AND qs.owner_reputation > 10000 THEN 'High Impact'
+        WHEN qs.total_votes > 50 OR qs.owner_reputation > 5000 THEN 'Medium Impact' 
+        ELSE 'Low Impact'
+    END AS impact_category,
+    RANK() OVER (
+        ORDER BY 
+            (qs.question_score * 0.4 + qs.view_count * 0.3 + qs.total_votes * 0.3) DESC
+    ) AS performance_rank,
+    PERCENT_RANK() OVER (
+        ORDER BY qs.total_answer_score DESC
+    ) AS answer_quality_percentile,
+    NTILE(10) OVER (
+        ORDER BY qs.creation_date
+    ) AS creation_decile
+FROM question_stats qs
+LEFT JOIN (
+    SELECT 
+        ta.post_id,
+        pt.individual_tag,
+        pt.tag_usage_count,
+        pt.avg_question_score_for_tag
+    FROM tag_analysis ta
+    JOIN popular_tags pt ON ta.individual_tag = pt.individual_tag
+    WHERE ta.individual_tag = (
+        SELECT ta2.individual_tag 
+        FROM tag_analysis ta2 
+        WHERE ta2.post_id = ta.post_id 
+        ORDER BY LENGTH(ta2.individual_tag) DESC 
+        LIMIT 1
+    )
+) tag_summary ON qs.question_id = tag_summary.post_id
+LEFT JOIN badge_insights bi ON qs.owneruserid = bi.userid
+LEFT JOIN (
+    SELECT 
+        postid,
+        SUM(event_count) AS event_count,
+        MAX(last_event_date) AS last_event_date
+    FROM history_patterns
+    GROUP BY postid
+) hp ON qs.question_id = hp.postid
+WHERE qs.question_score > 5
+ORDER BY performance_rank
+LIMIT 1000;

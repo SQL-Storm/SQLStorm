@@ -1,0 +1,125 @@
+-- {"query": "33052.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 917} 
+WITH TagUsage AS (
+    SELECT
+        unnest(string_to_array(substring(Tags, 2, length(Tags)-2), '><')) AS TagName,
+        COUNT(*) AS QuestionCount
+    FROM Posts
+    WHERE PostTypeId = 1
+    GROUP BY TagName
+),
+UserLastActivity AS (
+    SELECT
+        OwnerUserId,
+        MAX(LastActivityDate) AS LastActive
+    FROM Posts
+    WHERE OwnerUserId <> -1
+    GROUP BY OwnerUserId
+),
+PostEdits AS (
+    SELECT
+        ph.PostId,
+        COUNT(*) AS EditCount,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6) -- Edits to Title, Body, or Tags
+    GROUP BY ph.PostId
+),
+PostVoteStats AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 1 THEN 1 END) AS AcceptedVotes
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    GROUP BY p.Id
+),
+QuestionAnswerCounts AS (
+    SELECT
+        p.Id AS QuestionId,
+        COUNT(a.Id) AS AnswerCount
+    FROM Posts p
+    LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id
+),
+CommunityOwnership AS (
+    SELECT
+        p.Id AS PostId,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.CommunityOwnedDate
+    FROM Posts p
+    WHERE p.CommunityOwnedDate IS NOT NULL
+),
+UserStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(b.Id) AS BadgeCount,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+Combined AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.OwnerUserId,
+        p.Tags,
+        tl.Name AS LinkType,
+        pl.RelatedPostId,
+        u.DisplayName AS OwnerDisplayName,
+        u.Reputation AS OwnerReputation,
+        u.LastAccessDate AS OwnerLastAccess,
+        u.Views AS OwnerViews,
+        u.UpVotes AS OwnerUpVotes,
+        u.DownVotes AS OwnerDownVotes,
+        u.ProfileImageUrl,
+        u.EmailHash,
+        u.AccountId,
+        uh.LastActive,
+        pe.EditCount,
+        pe.LastEditDate,
+        ps.UpVotes,
+        ps.DownVotes,
+        ps.AcceptedVotes,
+        cu.LastActive AS CommunityLastActive
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    LEFT JOIN LinkTypes tl ON pl.LinkTypeId = tl.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN UserLastActivity uh ON u.Id = uh.OwnerUserId
+    LEFT JOIN PostEdits pe ON p.Id = pe.PostId
+    LEFT JOIN PostVoteStats ps ON p.Id = ps.PostId
+    LEFT JOIN CommunityOwnership cu ON p.Id = cu.PostId
+    LEFT JOIN QuestionAnswerCounts qa ON p.Id = qa.QuestionId
+)
+SELECT
+    *,
+    (SELECT COUNT(*) FROM TagUsage) AS UniqueTagsCount
+FROM Combined
+ORDER BY CreationDate DESC
+LIMIT 100;

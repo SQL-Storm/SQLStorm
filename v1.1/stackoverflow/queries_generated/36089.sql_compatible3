@@ -1,0 +1,44 @@
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.Score,
+  p.ViewCount,
+  p.CreationDate,
+  p.LastActivityDate,
+  p.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  p.Tags,
+  (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+  (SELECT SUM(v2.Score)
+     FROM Votes v2
+     WHERE v2.PostId = p.Id
+       AND v2.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30' DAY)) AS RecentVoteScore30d,
+  (SELECT COUNT(*)
+     FROM PostLinks pl
+     WHERE pl.PostId = p.Id) AS LinkedCount,
+  (EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 3600.0) *
+  (CASE WHEN p.ViewCount > 0 THEN 1.0 ELSE 0.0 END) AS VelocityApprox,
+  (SELECT COUNT(DISTINCT hu.UserId)
+     FROM PostHistory hu
+     WHERE hu.PostId = p.Id
+       AND hu.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '90' DAY)) AS UniqueEditors90d
+FROM
+  Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+WHERE
+  p.PostTypeId = 1
+  AND p.CreationDate < (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1' HOUR)
+GROUP BY
+  p.Id,
+  p.Title,
+  p.Score,
+  p.ViewCount,
+  p.CreationDate,
+  p.LastActivityDate,
+  p.OwnerUserId,
+  u.DisplayName,
+  p.Tags
+ORDER BY
+  RecentVoteScore30d DESC,
+  p.ViewCount DESC
+LIMIT 100;

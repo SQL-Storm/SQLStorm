@@ -1,0 +1,62 @@
+WITH question_tags AS (
+    SELECT
+        p.id            AS qid,
+        p.creationdate  AS qdate,
+        p.score         AS qscore,
+        tag.tagname     AS tagname,
+        u.reputation    AS qrep,
+        u.id            AS quserid
+    FROM posts p
+    JOIN users u ON u.id = p.owneruserid
+    CROSS JOIN LATERAL (
+        SELECT TRIM(BOTH '<' FROM TRIM(BOTH '>' FROM unnest_tag)) AS tagname
+        FROM UNNEST(string_to_array(p.tags, '><')) AS unnest_tag
+    ) AS tag
+    WHERE p.posttypeid = 1
+),
+answers AS (
+    SELECT
+        a.id            AS aid,
+        a.parentid      AS qid,
+        a.creationdate  AS adate,
+        a.score         AS ascore,
+        u.reputation    AS arep,
+        u.id            AS auserid
+    FROM posts a
+    JOIN users u ON u.id = a.owneruserid
+    WHERE a.posttypeid = 2
+),
+q_agg AS (
+    SELECT
+        q.tagname,
+        COUNT(DISTINCT q.qid)                                       AS num_questions,
+        SUM(q.qscore)                                               AS total_qscore,
+        ROUND(AVG(q.qscore)::numeric, 2)                             AS avg_qscore,
+        ROUND(AVG(EXTRACT(EPOCH FROM (a.adate - q.qdate)))/60::numeric, 2)    AS avg_min_to_first_answer
+    FROM question_tags q
+    LEFT JOIN answers a ON a.qid = q.qid
+    GROUP BY q.tagname
+),
+top_users_ranked AS (
+    SELECT
+        q.tagname,
+        u.id          AS user_id,
+        u.reputation,
+        COUNT(DISTINCT p.id) AS post_cnt,
+        ROW_NUMBER() OVER(PARTITION BY q.tagname ORDER BY COUNT(DISTINCT p.id) DESC) AS rn
+    FROM question_tags q
+    JOIN posts p ON p.owneruserid = q.quserid AND p.posttypeid = 1
+    JOIN users u ON u.id = p.owneruserid
+    GROUP BY q.tagname, u.id, u.reputation
+)
+SELECT
+    q.tagname,
+    q.num_questions,
+    q.avg_qscore,
+    q.avg_min_to_first_answer,
+    t.user_id,
+    t.reputation,
+    t.post_cnt
+FROM q_agg q
+JOIN top_users_ranked t ON t.tagname = q.tagname AND t.rn <= 3
+ORDER BY q.num_questions DESC, t.post_cnt DESC;

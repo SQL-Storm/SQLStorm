@@ -1,0 +1,52 @@
+WITH ActiveUsers AS (
+    SELECT u.Id, u.Reputation, u.CreationDate, u.DisplayName, 
+           COUNT(DISTINCT p.Id) AS PostCount,
+           COUNT(DISTINCT c.Id) AS CommentCount,
+           COUNT(DISTINCT v.Id) AS VoteCount,
+           COUNT(DISTINCT b.Id) AS BadgeCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1 AND p.CreationDate >= DATE '2020-01-01'
+    LEFT JOIN Comments c ON u.Id = c.UserId AND c.CreationDate >= DATE '2020-01-01'
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId IN (2,3) AND v.CreationDate >= DATE '2020-01-01'
+    LEFT JOIN Badges b ON u.Id = b.UserId AND b.Class IN (1,2,3) AND b.Date >= DATE '2020-01-01'
+    WHERE u.Reputation > 10000 
+      AND u.ProfileImageUrl IS NOT NULL
+      AND EXISTS (
+          SELECT 1 FROM PostHistory ph 
+          WHERE ph.UserId = u.Id 
+            AND ph.PostHistoryTypeId IN (2,5,7) 
+            AND ph.CreationDate >= DATE '2020-01-01'
+      )
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.DisplayName
+    HAVING COUNT(DISTINCT p.Id) >= 100 
+       AND COUNT(DISTINCT c.Id) >= 50 
+       AND COUNT(DISTINCT v.Id) >= 200
+)
+SELECT au.DisplayName, au.Reputation, au.PostCount, au.CommentCount, au.VoteCount, au.BadgeCount, au.Id,
+       RANK() OVER (ORDER BY au.BadgeCount DESC) AS BadgeRank,
+       (SELECT STRING_AGG(t.TagName, ', ' ORDER BY t.TagCount DESC)
+        FROM (
+            SELECT t2.TagName, COUNT(*) AS TagCount
+            FROM Tags t2
+            JOIN (
+                SELECT CAST(x AS INTEGER) AS tag_id
+                FROM Posts p2,
+                     UNNEST(STRING_TO_ARRAY(SUBSTRING(p2.Tags FROM 2 FOR (CHAR_LENGTH(p2.Tags) - 2)), '><')) AS x
+                WHERE p2.OwnerUserId = au.Id AND p2.PostTypeId = 1
+            ) tag_ids ON t2.Id = tag_ids.tag_id
+            GROUP BY t2.TagName
+            ORDER BY TagCount DESC
+            FETCH FIRST 5 ROWS ONLY
+        ) t
+       ) AS TopTags,
+       (SELECT COUNT(*) FROM PostLinks pl 
+        WHERE pl.LinkTypeId = 3 
+          AND pl.PostId IN (
+              SELECT Id FROM Posts WHERE OwnerUserId = au.Id AND PostTypeId = 1
+          )) AS DuplicateClosures
+FROM ActiveUsers au
+JOIN Badges b ON au.Id = b.UserId AND b.Class = 1
+WHERE au.BadgeCount > (SELECT AVG(BadgeCount) FROM ActiveUsers)
+GROUP BY au.DisplayName, au.Reputation, au.PostCount, au.CommentCount, au.VoteCount, au.BadgeCount, au.Id
+ORDER BY au.Reputation DESC, au.PostCount DESC
+FETCH FIRST 100 ROWS ONLY;

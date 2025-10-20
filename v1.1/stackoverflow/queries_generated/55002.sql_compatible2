@@ -1,0 +1,93 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN p.Id END)                         AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN p.Id END)                         AS AnswerCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END),0)      AS QuestionScoreSum,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END),0)      AS AnswerScoreSum,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN v.Id END)                         AS UpVoteCount,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN v.Id END)                         AS DownVoteCount,
+        COUNT(b.Id)                                                            AS BadgeCount,
+        COUNT(DISTINCT t.TagName)                                               AS DistinctTagCount
+    FROM Users u
+    LEFT JOIN Posts p          ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v          ON v.UserId = u.Id
+    LEFT JOIN Badges b         ON b.UserId = u.Id
+    LEFT JOIN (
+        SELECT p2.OwnerUserId, TRIM(BOTH '>' FROM TRIM(BOTH '<' FROM UNNEST(string_to_array(p2.Tags, '><')))) AS TagName
+        FROM Posts p2
+        WHERE p2.PostTypeId = 1
+    ) t ON t.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RecentActivity AS (
+    SELECT 
+        ua.UserId,
+        MAX(ua.ActivityDate) AS LastActivity
+    FROM (
+        SELECT u.Id AS UserId, u.CreationDate      AS ActivityDate FROM Users u
+        UNION ALL
+        SELECT p.OwnerUserId, p.LastActivityDate   FROM Posts p WHERE p.OwnerUserId IS NOT NULL
+        UNION ALL
+        SELECT c.UserId, c.CreationDate            FROM Comments c WHERE c.UserId IS NOT NULL
+        UNION ALL
+        SELECT v.UserId, v.CreationDate            FROM Votes v WHERE v.UserId IS NOT NULL
+    ) ua
+    GROUP BY ua.UserId
+),
+CloseReasons AS (
+    SELECT 
+        ph.PostId,
+        JSON_AGG(
+            JSON_OBJECT(
+                ARRAY['CloseReasonId','UserId','Date'],
+                ARRAY[CAST(ph.Comment AS VARCHAR), CAST(ph.UserId AS VARCHAR), CAST(ph.CreationDate AS VARCHAR)]
+            )
+        ) AS CloseEvents
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId
+)
+SELECT 
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.QuestionScoreSum,
+    us.AnswerScoreSum,
+    us.UpVoteCount,
+    us.DownVoteCount,
+    us.BadgeCount,
+    us.DistinctTagCount,
+    ra.LastActivity,
+    cr.CloseEvents
+FROM UserStats us
+LEFT JOIN RecentActivity ra ON ra.UserId = us.Id
+LEFT JOIN (
+    SELECT cr.PostId, cr.CloseEvents
+    FROM CloseReasons cr
+) cr ON cr.PostId IN (
+        SELECT p.Id FROM Posts p WHERE p.OwnerUserId = us.Id AND p.PostTypeId = 1
+    )
+WHERE us.Reputation > 10000
+GROUP BY
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.QuestionScoreSum,
+    us.AnswerScoreSum,
+    us.UpVoteCount,
+    us.DownVoteCount,
+    us.BadgeCount,
+    us.DistinctTagCount,
+    ra.LastActivity,
+    cr.CloseEvents
+ORDER BY 
+    us.Reputation DESC,
+    (us.QuestionCount + us.AnswerCount) DESC
+LIMIT 100 OFFSET 0;

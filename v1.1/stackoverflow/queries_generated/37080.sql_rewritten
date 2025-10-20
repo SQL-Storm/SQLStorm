@@ -1,0 +1,177 @@
+-- {"query": "37080.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 2075} 
+WITH
+-- recent activity window
+activity AS (
+  SELECT p.Id, p.PostTypeId, p.ParentId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags,
+         COALESCE(p.Title, '') AS Title
+  FROM Posts p
+  WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+-- split tags into rows (PostTypeId = 1 questions)
+question_tags AS (
+  SELECT a.Id AS PostId, unnest(string_to_array(substring(a.Tags from 2 for char_length(a.Tags)-2), '><')) AS Tag
+  FROM activity a
+  WHERE a.PostTypeId = 1 AND a.Tags IS NOT NULL AND a.Tags <> ''
+),
+-- compute per-question metrics: answers, accepted, avg answer score, last activity
+answers AS (
+  SELECT p.ParentId AS QuestionId,
+         count(*) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+         count(*) FILTER (WHERE p.PostTypeId = 2 AND p.Score >= 0) AS NonNegativeAnswers,
+         avg(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AvgAnswerScore,
+         max(p.CreationDate) FILTER (WHERE p.PostTypeId = 2) AS LastAnswerDate
+  FROM Posts p
+  WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+  GROUP BY p.ParentId
+),
+-- votes aggregated by post and type
+post_votes AS (
+  SELECT v.PostId,
+         sum(case when vt.Name = 'UpMod' then 1 else 0 end) AS UpVotes,
+         sum(case when vt.Name = 'DownMod' then 1 else 0 end) AS DownVotes,
+         sum(case when vt.Name = 'AcceptedByOriginator' then 1 else 0 end) AS AcceptedFlags,
+         count(*) AS TotalVotes
+  FROM Votes v
+  LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  WHERE v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+  GROUP BY v.PostId
+),
+-- heavy join: posts with votes, answers, tags, owners
+question_profile AS (
+  SELECT q.Id,
+         q.Title,
+         q.OwnerUserId,
+         q.CreationDate,
+         q.Score AS QuestionScore,
+         q.ViewCount,
+         coalesce(a.AnswerCount,0) AS AnswerCount,
+         coalesce(a.AvgAnswerScore,0) AS AvgAnswerScore,
+         coalesce(v.UpVotes,0) AS UpVotes,
+         coalesce(v.DownVotes,0) AS DownVotes,
+         coalesce(v.TotalVotes,0) AS TotalVotes,
+         qt.Tag
+  FROM activity q
+  LEFT JOIN answers a ON q.Id = a.QuestionId
+  LEFT JOIN post_votes v ON q.Id = v.PostId
+  LEFT JOIN question_tags qt ON q.Id = qt.PostId
+  WHERE q.PostTypeId = 1
+),
+-- per-tag aggregates across questions
+tag_aggregates AS (
+  SELECT Tag,
+         count(*) AS Questions,
+         avg(QuestionScore) AS AvgQScore,
+         avg(AvgAnswerScore) AS AvgAnswerScore,
+         sum(AnswerCount) AS TotalAnswers,
+         sum(ViewCount) AS TotalViews,
+         sum(UpVotes) AS TotalUpVotes,
+         sum(DownVotes) AS TotalDownVotes,
+         percentile_cont(0.5) WITHIN GROUP (ORDER BY QuestionScore) AS MedianQScore,
+         max(QuestionScore) AS MaxQScore
+  FROM question_profile
+  GROUP BY Tag
+  HAVING count(*) >= 25
+),
+-- tag pair co-occurrence (heavy: self-join on tags)
+tag_pairs AS (
+  SELECT qt1.Tag AS TagA, qt2.Tag AS TagB, count(*) AS Cooccurrence
+  FROM question_tags qt1
+  JOIN question_tags qt2 ON qt1.PostId = qt2.PostId AND qt1.Tag < qt2.Tag
+  GROUP BY qt1.Tag, qt2.Tag
+  HAVING count(*) >= 10
+),
+-- influential users: combine reputation, posts, badges, votes cast
+user_posts AS (
+  SELECT u.Id, u.Reputation, u.CreationDate,
+         sum(case when p.PostTypeId = 1 then 1 else 0 end) AS Questions,
+         sum(case when p.PostTypeId = 2 then 1 else 0 end) AS Answers,
+         sum(p.ViewCount) FILTER (WHERE p.PostTypeId = 1) AS QuestionViews
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+  GROUP BY u.Id, u.Reputation, u.CreationDate
+),
+user_badges AS (
+  SELECT b.UserId, count(*) AS Badges, sum(case when b.Class = 1 then 1 else 0 end) AS Gold,
+         sum(case when b.Class = 2 then 1 else 0 end) AS Silver, sum(case when b.Class = 3 then 1 else 0 end) AS Bronze
+  FROM Badges b
+  WHERE b.Date >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+  GROUP BY b.UserId
+),
+user_votes AS (
+  SELECT v.UserId, count(*) AS VotesCast, sum(case when vt.Name = 'UpMod' then 1 else 0 end) AS UpCast
+  FROM Votes v
+  LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  WHERE v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years' AND v.UserId IS NOT NULL
+  GROUP BY v.UserId
+),
+influential_users AS (
+  SELECT up.Id AS UserId,
+         up.Reputation, up.Questions, up.Answers, coalesce(ub.Badges,0) AS Badges,
+         coalesce(ub.Gold,0) AS Gold, coalesce(ub.Silver,0) AS Silver, coalesce(ub.Bronze,0) AS Bronze,
+         coalesce(uv.VotesCast,0) AS VotesCast,
+         (up.Reputation * 0.4 + (up.Answers*5 + up.Questions*2) * 1.5 + coalesce(ub.Gold,0)*50 + coalesce(ub.Silver,0)*20 + coalesce(ub.Bronze,0)*5 + coalesce(uv.VotesCast,0)*0.1) AS InfluenceScore
+  FROM user_posts up
+  LEFT JOIN user_badges ub ON up.Id = ub.UserId
+  LEFT JOIN user_votes uv ON up.Id = uv.UserId
+  WHERE up.Reputation >= 1000 OR up.Answers >= 10 OR coalesce(ub.Badges,0) >= 5
+),
+-- heavy: correlate top tags with influential users by tag activity
+user_tag_activity AS (
+  SELECT iu.UserId, qt.Tag, count(*) AS PostsInTag
+  FROM Posts p
+  JOIN question_tags qt ON p.Id = qt.PostId
+  JOIN influential_users iu ON p.OwnerUserId = iu.UserId
+  WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+  GROUP BY iu.UserId, qt.Tag
+),
+top_tag_user_matrix AS (
+  SELECT ua.Tag, count(distinct ua.UserId) AS ActiveInfluentialUsers, sum(ua.PostsInTag) AS InfluentialPosts
+  FROM user_tag_activity ua
+  GROUP BY ua.Tag
+  HAVING count(distinct ua.UserId) >= 3
+),
+-- final heavy result: combine tag aggregates, co-occurrence, top users and sample questions
+sample_questions AS (
+  SELECT qp.Tag, qp.Id, qp.Title, qp.QuestionScore, qp.AnswerCount, qp.ViewCount, qp.UpVotes, qp.DownVotes
+  FROM question_profile qp
+  WHERE qp.QuestionScore >= 5
+),
+ranked_tags AS (
+  SELECT ta.Tag,
+         ta.Questions, ta.AvgQScore, ta.MedianQScore, ta.AvgAnswerScore, ta.TotalAnswers, ta.TotalViews,
+         coalesce(ttum.ActiveInfluentialUsers,0) AS ActiveInfluentialUsers,
+         coalesce(ttum.InfluentialPosts,0) AS InfluentialPosts,
+         row_number() OVER (ORDER BY ta.Questions DESC, ta.TotalViews DESC) AS TagRank
+  FROM tag_aggregates ta
+  LEFT JOIN top_tag_user_matrix ttum ON ta.Tag = ttum.Tag
+)
+SELECT
+  rt.TagRank,
+  rt.Tag,
+  rt.Questions,
+  rt.TotalViews,
+  round(rt.AvgQScore::numeric,2) AS AvgQuestionScore,
+  round(rt.MedianQScore::numeric,2) AS MedianQuestionScore,
+  round(rt.AvgAnswerScore::numeric,2) AS AvgAnswerScore,
+  rt.TotalAnswers,
+  rt.ActiveInfluentialUsers,
+  rt.InfluentialPosts,
+  coalesce(tp.Cooccurrence,0) AS MostCommonPairedTagCount,
+  sq.SampleQuestionIds,
+  sq.SampleQuestionTitles
+FROM ranked_tags rt
+LEFT JOIN LATERAL (
+  SELECT tp.Cooccurrence
+  FROM tag_pairs tp
+  WHERE tp.TagA = rt.Tag OR tp.TagB = rt.Tag
+  ORDER BY tp.Cooccurrence DESC
+  LIMIT 1
+) tp ON true
+LEFT JOIN LATERAL (
+  SELECT string_agg(sq.Id::text, ', ' ORDER BY sq.QuestionScore DESC LIMIT 5) AS SampleQuestionIds,
+         string_agg(left(sq.Title, 120), ' || ' ORDER BY sq.QuestionScore DESC LIMIT 5) AS SampleQuestionTitles
+  FROM sample_questions sq
+  WHERE sq.Tag = rt.Tag
+) sq ON true
+ORDER BY rt.TagRank
+LIMIT 50;

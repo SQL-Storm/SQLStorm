@@ -1,0 +1,36 @@
+-- {"query": "45084.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-3.5-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 192696, "output_tokens": 33836} 
+WITH TopUserTags AS (
+    SELECT 
+        u.Id AS UserId, 
+        u.DisplayName,
+        t.TagName,
+        COUNT(*) AS TagPostCount,
+        DENSE_RANK() OVER (PARTITION BY u.Id ORDER BY COUNT(*) DESC) AS TagRank
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    CROSS JOIN LATERAL string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><') AS tags(TagName)
+    JOIN Tags t ON t.TagName = tags.TagName
+    WHERE p.PostTypeId = 1
+    GROUP BY u.Id, u.DisplayName, t.TagName
+),
+UserTagExpertise AS (
+    SELECT 
+        UserId, 
+        DisplayName,
+        STRING_AGG(TagName || '(' || TagPostCount || ')', ', ' ORDER BY TagPostCount DESC) AS TopTags
+    FROM TopUserTags
+    WHERE TagRank <= 3
+    GROUP BY UserId, DisplayName
+)
+SELECT 
+    ute.UserId,
+    ute.DisplayName,
+    ute.TopTags,
+    u.Reputation,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 2) AS UpVotesCast,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges
+FROM UserTagExpertise ute
+JOIN Users u ON ute.UserId = u.Id
+ORDER BY u.Reputation DESC, QuestionCount DESC
+LIMIT 100;

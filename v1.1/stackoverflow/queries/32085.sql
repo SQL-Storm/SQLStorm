@@ -1,0 +1,76 @@
+WITH TopUsers AS (
+    SELECT 
+        U.Id AS UserId, 
+        U.DisplayName, 
+        U.Reputation, 
+        RANK() OVER (ORDER BY U.Reputation DESC) AS UserRank
+    FROM 
+        Users U
+    WHERE 
+        U.Reputation > 1000
+),
+TopPosts AS (
+    SELECT 
+        P.Id AS PostId, 
+        P.Title, 
+        P.Score, 
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC) AS PostRank
+    FROM 
+        Posts P
+    WHERE 
+        P.Score > 100
+),
+UserPostAnalytics AS (
+    SELECT 
+        TU.UserId, 
+        TU.DisplayName, 
+        TP.PostId, 
+        TP.Title AS PostTitle, 
+        TP.Score AS PostScore, 
+        SUM(P.Score) OVER (PARTITION BY TU.UserId) AS TotalUserPostScore,
+        -- COUNT(DISTINCT C.Id) OVER (...) is not supported as a windowed distinct in many dialects.
+        -- Replace with COUNT(C.Id) OVER (PARTITION BY TU.UserId) which counts comment rows per user.
+        COUNT(C.Id) OVER (PARTITION BY TU.UserId) AS TotalCommentsMade
+    FROM 
+        TopUsers TU
+    INNER JOIN 
+        Posts P ON P.OwnerUserId = TU.UserId
+    INNER JOIN 
+        TopPosts TP ON TP.PostId = P.Id
+    LEFT JOIN 
+        Comments C ON C.UserId = TU.UserId
+    WHERE 
+        P.PostTypeId IN (1, 2)
+),
+BadgeAnalytics AS (
+    SELECT 
+        UB.UserId, 
+        B.Name AS BadgeName, 
+        B.Class AS BadgeClass,
+        COUNT(B.Id) AS BadgeCount
+    FROM 
+        (SELECT UserId FROM UserPostAnalytics GROUP BY UserId) UB
+    INNER JOIN 
+        Badges B ON B.UserId = UB.UserId
+    GROUP BY 
+        UB.UserId, B.Name, B.Class
+),
+FinalAnalytics AS (
+    SELECT 
+        UPA.UserId, 
+        UPA.DisplayName, 
+        UPA.TotalUserPostScore, 
+        UPA.TotalCommentsMade, 
+        BA.BadgeName, 
+        BA.BadgeClass, 
+        BA.BadgeCount
+    FROM 
+        UserPostAnalytics UPA
+    LEFT JOIN 
+        BadgeAnalytics BA ON BA.UserId = UPA.UserId
+)
+SELECT *
+FROM FinalAnalytics
+WHERE BadgeCount > 5
+  AND TotalUserPostScore > 500
+ORDER BY TotalUserPostScore DESC, TotalCommentsMade DESC;

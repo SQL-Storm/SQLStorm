@@ -1,0 +1,65 @@
+WITH TopUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS rn
+    FROM Users u
+    WHERE u.Reputation > 10000
+), 
+UserBadgeCounts AS (
+    SELECT b.UserId, b.Class, COUNT(*) AS BadgeCount
+    FROM Badges b
+    WHERE b.UserId IN (SELECT Id FROM TopUsers)
+    GROUP BY b.UserId, b.Class
+),
+UserPostStats AS (
+    SELECT p.OwnerUserId AS UserId,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        AVG(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score END) AS AvgPostScore,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS TotalQuestionViews
+    FROM Posts p
+    WHERE p.OwnerUserId IN (SELECT Id FROM TopUsers)
+    GROUP BY p.OwnerUserId
+),
+UserVoteStats AS (
+    SELECT v.UserId,
+        COUNT(CASE WHEN vt.Name = 'UpMod' THEN 1 END) AS UpVotesCast,
+        COUNT(CASE WHEN vt.Name = 'DownMod' THEN 1 END) AS DownVotesCast,
+        COUNT(CASE WHEN vt.Name = 'Favorite' THEN 1 END) AS FavoritesCast
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE v.UserId IN (SELECT Id FROM TopUsers)
+    GROUP BY v.UserId
+),
+UserRecentActivity AS (
+    SELECT u.Id AS UserId, MAX(p.LastActivityDate) AS LastPostActivity,
+        MAX(c.CreationDate) AS LastCommentDate,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    WHERE u.Id IN (SELECT Id FROM TopUsers)
+    GROUP BY u.Id
+)
+SELECT 
+    u.Id, u.DisplayName, u.Reputation,
+    COALESCE(bc_g.BadgeCount,0) AS GoldBadges,
+    COALESCE(bc_s.BadgeCount,0) AS SilverBadges,
+    COALESCE(bc_b.BadgeCount,0) AS BronzeBadges,
+    COALESCE(ps.QuestionCount,0) AS QuestionCount,
+    COALESCE(ps.AnswerCount,0) AS AnswerCount,
+    COALESCE(ps.AvgPostScore,0) AS AvgPostScore,
+    COALESCE(ps.TotalQuestionViews,0) AS TotalQuestionViews,
+    COALESCE(vs.UpVotesCast,0) AS UpVotesCast,
+    COALESCE(vs.DownVotesCast,0) AS DownVotesCast,
+    COALESCE(vs.FavoritesCast,0) AS FavoritesCast,
+    ua.LastPostActivity, ua.LastCommentDate, ua.LastEditDate
+FROM TopUsers u
+LEFT JOIN UserBadgeCounts bc_g ON u.Id = bc_g.UserId AND bc_g.Class = 1
+LEFT JOIN UserBadgeCounts bc_s ON u.Id = bc_s.UserId AND bc_s.Class = 2
+LEFT JOIN UserBadgeCounts bc_b ON u.Id = bc_b.UserId AND bc_b.Class = 3
+LEFT JOIN UserPostStats ps ON u.Id = ps.UserId
+LEFT JOIN UserVoteStats vs ON u.Id = vs.UserId
+LEFT JOIN UserRecentActivity ua ON u.Id = ua.UserId
+ORDER BY u.Reputation DESC
+LIMIT 50;

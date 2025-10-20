@@ -1,0 +1,149 @@
+WITH
+QuestionTags AS (
+  SELECT
+    p.Id AS QuestionId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    COALESCE(string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><'), ARRAY[]::varchar[]) AS Tags
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+),
+TagStats AS (
+  SELECT
+    t.tag AS Tag,
+    COUNT(*) AS QuestionCount,
+    SUM(q.ViewCount) AS TotalViews,
+    AVG(q.Score) AS AvgScore,
+    SUM(q.AnswerCount) AS TotalAnswers,
+    SUM(q.FavoriteCount) AS TotalFavorites
+  FROM QuestionTags q
+  CROSS JOIN LATERAL unnest(q.Tags) AS t(tag)
+  GROUP BY t.tag
+),
+TagPairs AS (
+  SELECT
+    a.tag AS TagA,
+    b.tag AS TagB,
+    COUNT(*) AS CoOccur,
+    SUM(q.ViewCount) AS CoViews,
+    SUM(q.Score) AS CoScore
+  FROM QuestionTags q
+  CROSS JOIN LATERAL unnest(q.Tags) AS a(tag)
+  CROSS JOIN LATERAL unnest(q.Tags) AS b(tag)
+  WHERE a.tag < b.tag
+  GROUP BY a.tag, b.tag
+),
+ActiveUsers AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    COUNT(DISTINCT q.QuestionId) FILTER (WHERE q.QuestionId IS NOT NULL) AS QuestionsAsked,
+    COUNT(a.Id) FILTER (WHERE a.PostTypeId = 2 AND a.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years') AS AnswersGiven,
+    SUM(v_up.c) AS UpVotesReceived,
+    SUM(v_down.c) AS DownVotesReceived,
+    u.Reputation
+  FROM Users u
+  LEFT JOIN QuestionTags q ON q.QuestionId = ANY(
+    (SELECT array_agg(p.Id) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1 AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years')
+  )
+  LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2 AND a.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+  LEFT JOIN LATERAL (
+    SELECT COUNT(*) AS c FROM Votes v WHERE v.PostId IN (
+      SELECT p2.Id FROM Posts p2 WHERE p2.OwnerUserId = u.Id
+    ) AND v.VoteTypeId = 2
+  ) v_up ON true
+  LEFT JOIN LATERAL (
+    SELECT COUNT(*) AS c FROM Votes v WHERE v.PostId IN (
+      SELECT p2.Id FROM Posts p2 WHERE p2.OwnerUserId = u.Id
+    ) AND v.VoteTypeId = 3
+  ) v_down ON true
+  GROUP BY u.Id, u.DisplayName, u.Reputation, v_up.c, v_down.c
+),
+QuestionRank AS (
+  SELECT
+    q.QuestionId,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.FavoriteCount,
+    array_to_string(q.Tags, ',') AS TagList,
+    COALESCE((
+      SELECT SUM( (CAST(ts.QuestionCount AS double precision) / NULLIF(max_ts.max_q,0)) * 1.0 )
+      FROM unnest(q.Tags) AS tt(tag)
+      LEFT JOIN TagStats ts ON ts.Tag = tt.tag
+      CROSS JOIN (SELECT MAX(QuestionCount) AS max_q FROM TagStats) max_ts
+    ),0) AS TagHotness,
+    EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - q.CreationDate)) AS AgeSeconds,
+    (
+      (GREATEST(q.Score,0) * 3.0)
+      + (LOG(GREATEST(q.ViewCount,1)) * 2.0)
+      + (q.FavoriteCount * 5.0)
+      + (LEAST(q.AnswerCount,5) * 4.0)
+      + (COALESCE((
+          SELECT SUM(ts.QuestionCount) FROM unnest(q.Tags) AS tt(tag) LEFT JOIN TagStats ts ON ts.Tag = tt.tag
+        ),0) * 0.5)
+      - (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - q.CreationDate)) / 86400.0) * 0.2
+    ) AS RawScore,
+    q.Tags
+  FROM QuestionTags q
+)
+SELECT
+  qr.QuestionId,
+  p.Title,
+  qr.TagList,
+  qr.CreationDate,
+  qr.Score AS QuestionScore,
+  qr.ViewCount,
+  qr.AnswerCount,
+  qr.FavoriteCount,
+  qr.TagHotness,
+  qr.RawScore,
+  RANK() OVER (ORDER BY qr.RawScore DESC) AS GlobalRank,
+  (
+    SELECT json_agg(val) FROM (
+      SELECT json_build_object('Tag', tp.TagB, 'CoOccur', tp.CoOccur, 'CoViews', tp.CoViews, 'CoScore', tp.CoScore) AS val
+      FROM TagPairs tp
+      WHERE tp.TagA = ANY(qr.Tags) OR tp.TagB = ANY(qr.Tags)
+      ORDER BY tp.CoOccur DESC
+      LIMIT 2
+    ) sub
+  ) AS TopCoTags,
+  (
+    SELECT json_build_object('AnswerId', a.Id, 'Score', a.Score, 'CreationDate', a.CreationDate, 'OwnerUserId', a.OwnerUserId, 'OwnerDisplayName', a.OwnerDisplayName)
+    FROM Posts a
+    WHERE a.ParentId = qr.QuestionId AND a.PostTypeId = 2
+    ORDER BY (a.Score * 3.0 + LOG(GREATEST(a.Score+10,1)) + (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - a.CreationDate)) * -0.0001)) DESC
+    LIMIT 1
+  ) AS TopAnswer,
+  (SELECT COUNT(*) FROM Comments c WHERE c.PostId = qr.QuestionId) AS QuestionComments,
+  (SELECT COUNT(*) FROM Comments c WHERE c.PostId IN (SELECT a2.Id FROM Posts a2 WHERE a2.ParentId = qr.QuestionId AND a2.PostTypeId = 2)) AS AnswerComments,
+  (
+    SELECT json_agg(ph_row) FROM (
+       SELECT ph.PostHistoryTypeId, ph.CreationDate, ph.UserId, ph.Comment
+       FROM PostHistory ph
+       WHERE ph.PostId = qr.QuestionId
+       ORDER BY ph.CreationDate DESC
+       LIMIT 3
+    ) ph_row
+  ) AS RecentHistory,
+  EXISTS(SELECT 1 FROM Posts acc WHERE acc.Id = p.AcceptedAnswerId) AS HasAcceptedAnswer,
+  CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN
+    (SELECT (acc.Score - p.Score) FROM Posts acc WHERE acc.Id = p.AcceptedAnswerId)
+  ELSE NULL END AS AcceptedScoreDelta
+FROM QuestionRank qr
+JOIN Posts p ON p.Id = qr.QuestionId
+LEFT JOIN LATERAL (
+  SELECT qr_tags.Tags FROM (
+    SELECT qr_inner.QuestionId, (SELECT array_agg(t) FROM unnest(string_to_array(qr_inner.TagList, ',')) AS t) AS Tags
+    FROM QuestionRank qr_inner
+    WHERE qr_inner.QuestionId = qr.QuestionId
+  ) qr_tags
+) dummy ON true
+WHERE qr.RawScore IS NOT NULL
+ORDER BY qr.RawScore DESC
+LIMIT 200;

@@ -1,0 +1,72 @@
+SELECT 
+    p.Id AS PostId,
+    p.Title,
+    p.Body,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    p.LastActivityDate,
+    p.Tags,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.PostTypeId,
+    pt.Name AS PostTypeName,
+    CASE 
+        WHEN p.PostTypeId = 1 THEN 'Question'
+        WHEN p.PostTypeId = 2 THEN 'Answer'
+        WHEN p.PostTypeId = 3 THEN 'Wiki'
+        WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+        WHEN p.PostTypeId = 5 THEN 'TagWiki'
+        WHEN p.PostTypeId = 6 THEN 'ModeratorNomination'
+        WHEN p.PostTypeId = 7 THEN 'WikiPlaceholder'
+        WHEN p.PostTypeId = 8 THEN 'PrivilegeWiki'
+    END AS PostTypeDescription,
+    COALESCE(p.AcceptedAnswerId, 0) AS AcceptedAnswerId,
+    COALESCE(p.ParentId, 0) AS ParentId,
+    CASE 
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        WHEN p.ParentId IS NOT NULL THEN 'Answer'
+        ELSE 'Question'
+    END AS PostStatus,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 5) AS FavoriteCount,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = p.OwnerUserId AND b.TagBased = FALSE) AS UserBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = p.OwnerUserId AND b.TagBased = TRUE) AS TagBadges,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = p.OwnerUserId AND p2.PostTypeId = 1) AS UserQuestions,
+    (SELECT COUNT(*) FROM Posts p3 WHERE p3.OwnerUserId = p.OwnerUserId AND p3.PostTypeId = 2) AS UserAnswers,
+    (SELECT COUNT(*) FROM Posts p4 WHERE p4.OwnerUserId = p.OwnerUserId AND p4.PostTypeId IN (3,4,5)) AS UserWikiEdits,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (1,2,3)) AS EditCount,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (10,11,12,13)) AS ModActionCount,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 1) AS LinkCount,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS DuplicateCount,
+    (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 8) AS AvgBountyAmount,
+    (SELECT MAX(v.CreationDate) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId IN (8,9)) AS BountyEndDate,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 24) AS SuggestedEditCount,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (33,34)) AS PostNoticeCount,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (35,36)) AS MigrationCount,
+    (SELECT COUNT(*) FROM Posts p5 WHERE p5.ParentId = p.Id AND p5.PostTypeId = 2 AND p5.Score > 0) AS HighScoreAnswers,
+    (SELECT COUNT(*) FROM Posts p6 WHERE p6.ParentId = p.Id AND p6.PostTypeId = 2) AS TotalAnswers,
+    (SELECT STRING_AGG(t.TagName, ', ') FROM (SELECT TRIM(BOTH '<>' FROM UNNEST(string_to_array(p.Tags, '><'))) AS TagName) t) AS TagList,
+    (SELECT STRING_AGG(DISTINCT c.Text, '; ') FROM Comments c WHERE c.PostId = p.Id) AS SampleComments,
+    (SELECT STRING_AGG(DISTINCT ph.Text, ' | ') FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (1,2,3,4,5,6)) AS EditSummary,
+    (SELECT COALESCE(MAX(ph.CreationDate), p.CreationDate) FROM PostHistory ph WHERE ph.PostId = p.Id) AS LastEditDate,
+    (SELECT COALESCE(MAX(ph.CreationDate), p.CreationDate) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (10,11)) AS LastModActionDate
+FROM Posts p
+JOIN PostTypes pt ON p.PostTypeId = pt.Id
+JOIN Users u ON p.OwnerUserId = u.Id
+WHERE p.PostTypeId IN (1,2) 
+    AND p.CreationDate >= DATE '2022-01-01'
+    AND p.Score >= 0
+    AND (p.ClosedDate IS NULL OR p.ClosedDate >= DATE '2022-01-01')
+    AND p.ViewCount >= 100
+ORDER BY 
+    p.Score DESC,
+    p.ViewCount DESC,
+    p.CreationDate DESC
+LIMIT 10000;

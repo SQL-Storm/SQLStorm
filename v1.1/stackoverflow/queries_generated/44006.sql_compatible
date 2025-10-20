@@ -1,0 +1,67 @@
+WITH user_activity AS (
+    SELECT u.Id AS UserId, 
+           COUNT(p.Id) AS TotalPosts, 
+           COUNT(DISTINCT p.Id) AS UniquePostCount,
+           SUM(p.Score) AS TotalPostScore,
+           SUM(p.ViewCount) AS TotalPostViews,
+           SUM(p.CommentCount) AS TotalPostComments,
+           SUM(p.AnswerCount) AS TotalPostAnswers,
+           SUM(p.FavoriteCount) AS TotalPostFavorites
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id
+),
+tag_activity AS (
+    SELECT t.Id AS TagId,
+           t.TagName, 
+           COUNT(pt.PostId) AS PostCount, 
+           SUM(p.Score) AS TotalPostScore,
+           SUM(p.ViewCount) AS TotalPostViews,
+           SUM(p.CommentCount) AS TotalPostComments,
+           SUM(p.AnswerCount) AS TotalPostAnswers,
+           SUM(p.FavoriteCount) AS TotalPostFavorites
+    FROM Tags t
+    LEFT JOIN PostTags pt ON t.Id = pt.TagId
+    LEFT JOIN Posts p ON pt.PostId = p.Id
+    GROUP BY t.Id, t.TagName
+),
+post_history AS (
+    SELECT ph.PostId,
+           COUNT(ph.Id) AS RevisionCount,
+           MAX(ph.CreationDate) AS LastRevisionDate,
+           SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 1 ELSE 0 END) AS ModeratorActionCount
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+post_comments AS (
+    SELECT p.Id AS PostId,
+           COUNT(c.Id) AS CommentCount,
+           SUM(c.Score) AS CommentScore
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    GROUP BY p.Id
+)
+SELECT u.Id AS UserId, 
+       u.DisplayName AS UserName,
+       u.Reputation,
+       u.CreationDate AS UserCreationDate,
+       u.LastAccessDate AS UserLastAccessDate,
+       ua.TotalPosts,
+       ua.UniquePostCount,
+       ua.TotalPostScore,
+       ua.TotalPostViews,
+       ua.TotalPostComments,
+       ua.TotalPostAnswers,
+       ua.TotalPostFavorites,
+       (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id) AS BadgeCount,
+       ph.RevisionCount,
+       ph.LastRevisionDate,
+       ph.ModeratorActionCount,
+       pc.CommentCount,
+       pc.CommentScore
+FROM Users u
+LEFT JOIN user_activity ua ON u.Id = ua.UserId
+LEFT JOIN post_history ph ON ph.PostId = u.Id
+LEFT JOIN post_comments pc ON pc.PostId = u.Id
+ORDER BY u.Reputation DESC
+LIMIT 100;

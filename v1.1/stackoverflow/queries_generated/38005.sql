@@ -1,0 +1,207 @@
+-- {"query": "38005.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 2689} 
+WITH recent_active_users AS (
+    SELECT u.Id AS UserId, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS rn
+    FROM Users u
+    WHERE u.Reputation > 1000
+),
+top_users AS (
+    SELECT UserId, DisplayName, Reputation
+    FROM recent_active_users
+    WHERE rn <= 500
+),
+user_posts AS (
+    SELECT p.Id AS PostId, p.PostTypeId, p.OwnerUserId, p.Score, p.ViewCount, p.CreationDate, p.Tags, p.AnswerCount
+    FROM Posts p
+    JOIN top_users tu ON tu.UserId = p.OwnerUserId
+    WHERE p.CreationDate >= (SELECT date_trunc('month', max(CreationDate)) - interval '12 months' FROM Posts)
+      AND p.PostTypeId IN (1,2)
+),
+post_votes AS (
+    SELECT v.PostId,
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+           SUM(CASE WHEN v.VoteTypeId = 8 THEN COALESCE(v.BountyAmount,0) ELSE 0 END) AS bounty_start,
+           SUM(CASE WHEN v.VoteTypeId = 9 THEN COALESCE(v.BountyAmount,0) ELSE 0 END) AS bounty_close,
+           COUNT(*) AS total_votes,
+           MIN(v.CreationDate) AS first_vote_at,
+           MAX(v.CreationDate) AS last_vote_at
+    FROM Votes v
+    JOIN user_posts up ON up.PostId = v.PostId
+    GROUP BY v.PostId
+),
+answer_link AS (
+    SELECT a.Id AS AnswerId, a.ParentId AS QuestionId, a.OwnerUserId AS AnswererId, a.Score AS AnswerScore, a.CreationDate AS AnswerCreated
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+accepted_map AS (
+    SELECT q.Id AS QuestionId, q.AcceptedAnswerId
+    FROM Posts q
+    WHERE q.PostTypeId = 1 AND q.AcceptedAnswerId IS NOT NULL
+),
+user_badges AS (
+    SELECT b.UserId,
+           COUNT(*) AS badge_count,
+           SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_count,
+           SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_count,
+           SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_count,
+           MAX(b.Date) AS last_badge_at
+    FROM Badges b
+    JOIN top_users tu ON tu.UserId = b.UserId
+    GROUP BY b.UserId
+),
+tag_expanded AS (
+    SELECT p.Id AS PostId,
+           LOWER(TRIM(t)) AS tag
+    FROM user_posts p
+    CROSS JOIN LATERAL UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS t
+),
+tag_stats AS (
+    SELECT te.tag,
+           COUNT(*) AS tag_post_count,
+           AVG(up.Score) AS avg_post_score,
+           SUM(CASE WHEN up.PostTypeId = 1 THEN 1 ELSE 0 END) AS question_count,
+           SUM(CASE WHEN up.PostTypeId = 2 THEN 1 ELSE 0 END) AS answer_count
+    FROM tag_expanded te
+    JOIN user_posts up ON up.Id = te.PostId
+    GROUP BY te.tag
+    HAVING COUNT(*) >= 10
+),
+edits_by_user AS (
+    SELECT ph.UserId, COUNT(*) AS edit_events,
+           COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS content_edits,
+           COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (10,11,12,13,14,15)) AS moderation_events
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+      AND ph.CreationDate >= (SELECT date_trunc('month', max(CreationDate)) - interval '12 months' FROM PostHistory)
+    GROUP BY ph.UserId
+),
+closure_events AS (
+    SELECT ph.PostId,
+           COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 10) AS close_events,
+           COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 11) AS reopen_events,
+           MIN(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 10) AS first_closed_at
+    FROM PostHistory ph
+    JOIN user_posts up ON up.PostId = ph.PostId
+    GROUP BY ph.PostId
+),
+link_graph AS (
+    SELECT pl.PostId, pl.RelatedPostId,
+           COUNT(*) FILTER (WHERE pl.LinkTypeId = 1) AS linked_count,
+           COUNT(*) FILTER (WHERE pl.LinkTypeId = 3) AS duplicate_count
+    FROM PostLinks pl
+    WHERE pl.CreationDate >= (SELECT date_trunc('month', max(CreationDate)) - interval '12 months' FROM PostLinks)
+    GROUP BY pl.PostId, pl.RelatedPostId
+),
+question_answer_metrics AS (
+    SELECT q.Id AS QuestionId,
+           q.OwnerUserId AS AskerId,
+           q.Score AS QuestionScore,
+           q.ViewCount,
+           q.CreationDate AS QuestionCreated,
+           q.AnswerCount,
+           pv.upvotes AS q_upvotes,
+           pv.downvotes AS q_downvotes,
+           ce.close_events, ce.reopen_events, ce.first_closed_at,
+           MIN(a.AnswerCreated) AS first_answer_at,
+           COUNT(a.AnswerId) AS total_answers,
+           COUNT(a.AnswerId) FILTER (WHERE a.AnswerScore > 0) AS positive_answers,
+           COUNT(a.AnswerId) FILTER (WHERE a.AnswerScore < 0) AS negative_answers,
+           MAX(a.AnswerScore) AS best_answer_score,
+           COUNT(a.AnswerId) FILTER (WHERE am.AcceptedAnswerId = a.AnswerId) AS accepted_answer_present
+    FROM Posts q
+    JOIN user_posts up ON up.PostId = q.Id AND q.PostTypeId = 1
+    LEFT JOIN answer_link a ON a.QuestionId = q.Id
+    LEFT JOIN accepted_map am ON am.QuestionId = q.Id
+    LEFT JOIN post_votes pv ON pv.PostId = q.Id
+    LEFT JOIN closure_events ce ON ce.PostId = q.Id
+    GROUP BY q.Id, q.OwnerUserId, q.Score, q.ViewCount, q.CreationDate, q.AnswerCount, pv.upvotes, pv.downvotes, ce.close_events, ce.reopen_events, ce.first_closed_at
+),
+user_agg AS (
+    SELECT tu.UserId,
+           tu.DisplayName,
+           tu.Reputation,
+           COALESCE(b.badge_count,0) AS badge_count,
+           COALESCE(b.gold_count,0) AS gold_count,
+           COALESCE(b.silver_count,0) AS silver_count,
+           COALESCE(b.bronze_count,0) AS bronze_count,
+           COALESCE(e.edit_events,0) AS edit_events,
+           COALESCE(e.content_edits,0) AS content_edits,
+           COALESCE(e.moderation_events,0) AS moderation_events,
+           COUNT(DISTINCT up.PostId) AS total_posts,
+           COUNT(*) FILTER (WHERE up.PostTypeId = 1) AS total_questions,
+           COUNT(*) FILTER (WHERE up.PostTypeId = 2) AS total_answers,
+           AVG(up.Score) AS avg_post_score,
+           SUM(up.Score) AS total_post_score,
+           SUM(CASE WHEN up.PostTypeId = 1 THEN up.ViewCount ELSE 0 END) AS total_question_views,
+           MAX(up.CreationDate) AS last_post_at
+    FROM top_users tu
+    LEFT JOIN user_posts up ON up.OwnerUserId = tu.UserId
+    LEFT JOIN user_badges b ON b.UserId = tu.UserId
+    LEFT JOIN edits_by_user e ON e.UserId = tu.UserId
+    GROUP BY tu.UserId, tu.DisplayName, tu.Reputation, b.badge_count, b.gold_count, b.silver_count, b.bronze_count, e.edit_events, e.content_edits, e.moderation_events
+),
+user_tag_focus AS (
+    SELECT te.tag, up.OwnerUserId AS UserId,
+           COUNT(*) AS posts_in_tag,
+           AVG(up.Score) AS avg_score_in_tag,
+           SUM(CASE WHEN up.PostTypeId = 1 THEN 1 ELSE 0 END) AS questions_in_tag,
+           SUM(CASE WHEN up.PostTypeId = 2 THEN 1 ELSE 0 END) AS answers_in_tag
+    FROM tag_expanded te
+    JOIN user_posts up ON up.Id = te.PostId
+    GROUP BY te.tag, up.OwnerUserId
+),
+top_tag_per_user AS (
+    SELECT utf.UserId, utf.tag,
+           utf.posts_in_tag,
+           utf.avg_score_in_tag,
+           ROW_NUMBER() OVER (PARTITION BY utf.UserId ORDER BY utf.posts_in_tag DESC, utf.avg_score_in_tag DESC) AS rnk
+    FROM user_tag_focus utf
+),
+question_sla AS (
+    SELECT qam.QuestionId,
+           EXTRACT(EPOCH FROM (MIN(qam.first_answer_at) - qam.QuestionCreated))/3600.0 AS hours_to_first_answer
+    FROM question_answer_metrics qam
+    WHERE qam.first_answer_at IS NOT NULL
+    GROUP BY qam.QuestionId, qam.QuestionCreated, qam.first_answer_at
+),
+final_user_scores AS (
+    SELECT ua.*,
+           COALESCE(AVG(qam.QuestionScore) FILTER (WHERE qam.AskerId = ua.UserId), 0) AS avg_question_score,
+           COALESCE(AVG(qam.ViewCount) FILTER (WHERE qam.AskerId = ua.UserId), 0) AS avg_question_views,
+           COALESCE(AVG(qam.total_answers) FILTER (WHERE qam.AskerId = ua.UserId), 0) AS avg_answers_per_question,
+           COALESCE(AVG(qam.accepted_answer_present) FILTER (WHERE qam.AskerId = ua.UserId), 0) AS acceptance_rate,
+           COALESCE(AVG(qs.hours_to_first_answer), 0) AS avg_hours_to_first_answer
+    FROM user_agg ua
+    LEFT JOIN question_answer_metrics qam ON qam.AskerId = ua.UserId
+    LEFT JOIN question_sla qs ON qs.QuestionId = qam.QuestionId
+    GROUP BY ua.UserId, ua.DisplayName, ua.Reputation, ua.badge_count, ua.gold_count, ua.silver_count, ua.bronze_count, ua.edit_events, ua.content_edits, ua.moderation_events, ua.total_posts, ua.total_questions, ua.total_answers, ua.avg_post_score, ua.total_post_score, ua.total_question_views, ua.last_post_at
+)
+SELECT
+    fus.UserId,
+    fus.DisplayName,
+    fus.Reputation,
+    fus.badge_count, fus.gold_count, fus.silver_count, fus.bronze_count,
+    fus.total_posts, fus.total_questions, fus.total_answers,
+    ROUND(fus.avg_post_score::numeric, 2) AS avg_post_score,
+    fus.total_post_score,
+    ROUND(fus.avg_question_score::numeric, 2) AS avg_question_score,
+    ROUND(fus.avg_question_views::numeric, 2) AS avg_question_views,
+    ROUND(fus.avg_answers_per_question::numeric, 2) AS avg_answers_per_question,
+    ROUND(fus.acceptance_rate::numeric, 3) AS acceptance_rate,
+    ROUND(fus.avg_hours_to_first_answer::numeric, 2) AS avg_hours_to_first_answer,
+    fus.edit_events, fus.content_edits, fus.moderation_events,
+    COALESCE(tt.tag, '(none)') AS top_tag,
+    COALESCE(tt.posts_in_tag, 0) AS posts_in_top_tag,
+    ROUND(COALESCE(tt.avg_score_in_tag, 0)::numeric, 2) AS avg_score_in_top_tag,
+    fus.total_question_views,
+    fus.last_post_at
+FROM final_user_scores fus
+LEFT JOIN LATERAL (
+    SELECT ttp.tag, ttp.posts_in_tag, ttp.avg_score_in_tag
+    FROM top_tag_per_user ttp
+    WHERE ttp.UserId = fus.UserId AND ttp.rnk = 1
+) tt ON TRUE
+ORDER BY fus.total_post_score DESC, fus.total_posts DESC, fus.Reputation DESC
+LIMIT 100;

@@ -1,0 +1,82 @@
+WITH ActiveUsers AS (
+    SELECT 
+        U.Id, 
+        U.DisplayName, 
+        U.Reputation, 
+        COUNT(DISTINCT P.Id) AS PostCount,
+        COUNT(DISTINCT C.Id) AS CommentCount,
+        COUNT(DISTINCT V.Id) AS VoteCount,
+        COUNT(DISTINCT B.Id) AS BadgeCount
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId AND P.PostTypeId = 1 AND P.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 YEAR'
+    LEFT JOIN Comments C ON U.Id = C.UserId AND C.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 MONTHS'
+    LEFT JOIN Votes V ON U.Id = V.UserId AND V.VoteTypeId IN (2,3,8) AND V.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3 MONTHS'
+    LEFT JOIN Badges B ON U.Id = B.UserId AND B.Class = 1 AND B.Date >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 YEARS'
+    WHERE U.Reputation > 5000 AND U.DownVotes < (U.UpVotes * 0.1)
+    GROUP BY U.Id, U.DisplayName, U.Reputation
+), PostMetrics AS (
+    SELECT 
+        OwnerUserId,
+        AVG(CASE WHEN PostTypeId = 1 THEN Score END) AS AvgQuestionScore,
+        MAX(ViewCount) AS MaxViews,
+        SUM(AnswerCount) AS TotalAnswersGenerated,
+        COUNT(DISTINCT CASE WHEN AcceptedAnswerId IS NOT NULL THEN Id END) AS AcceptedAnswers,
+        PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY Score) AS P90PostScore
+    FROM Posts
+    WHERE CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '5 YEARS'
+    GROUP BY OwnerUserId
+), TagCounts AS (
+    SELECT
+        P2.OwnerUserId,
+        T.TagName AS TagName,
+        COUNT(*) AS cnt
+    FROM Posts P2
+    JOIN Tags T ON POSITION(T.TagName IN P2.Tags) > 0
+    WHERE P2.PostTypeId = 1
+    GROUP BY P2.OwnerUserId, T.TagName
+), TagMostFrequent AS (
+    SELECT
+        tc.OwnerUserId,
+        tc.TagName AS MostFrequentTag
+    FROM (
+        SELECT
+            OwnerUserId,
+            TagName,
+            cnt,
+            ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY cnt DESC, TagName) AS rn
+        FROM TagCounts
+    ) tc
+    WHERE tc.rn = 1
+), TagEngagement AS (
+    SELECT
+        P.OwnerUserId,
+        COUNT(DISTINCT T.Id) AS UniqueTagsUsed
+    FROM Posts P
+    JOIN Tags T ON POSITION(T.TagName IN P.Tags) > 0
+    WHERE P.PostTypeId = 1
+    GROUP BY P.OwnerUserId
+)
+SELECT 
+    AU.Id,
+    AU.DisplayName,
+    AU.Reputation,
+    AU.PostCount,
+    AU.CommentCount,
+    AU.VoteCount,
+    AU.BadgeCount,
+    PM.AvgQuestionScore,
+    PM.MaxViews,
+    PM.TotalAnswersGenerated,
+    PM.AcceptedAnswers,
+    PM.P90PostScore,
+    TE.UniqueTagsUsed,
+    MF.MostFrequentTag,
+    RANK() OVER (ORDER BY (AU.PostCount * 0.3 + AU.CommentCount * 0.2 + AU.VoteCount * 0.1 + AU.BadgeCount * 0.4) DESC) AS ActivityRank,
+    DENSE_RANK() OVER (ORDER BY PM.P90PostScore DESC) AS QualityRank
+FROM ActiveUsers AU
+JOIN PostMetrics PM ON AU.Id = PM.OwnerUserId
+JOIN TagEngagement TE ON AU.Id = TE.OwnerUserId
+LEFT JOIN TagMostFrequent MF ON AU.Id = MF.OwnerUserId
+WHERE PM.TotalAnswersGenerated > 100 AND TE.UniqueTagsUsed >= 5
+ORDER BY (AU.Reputation * 0.25 + COALESCE(PM.AvgQuestionScore,0) * 0.35 + TE.UniqueTagsUsed * 0.15 + AU.BadgeCount * 0.25) DESC
+LIMIT 100;

@@ -1,0 +1,85 @@
+-- {"query": "43027.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "nova-premier", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2135, "output_tokens": 745} 
+
+WITH UserActivity AS (
+    SELECT 
+        u.Id, 
+        u.DisplayName, 
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        COUNT(DISTINCT ph.Id) AS TotalEdits,
+        MAX(u.Reputation) AS Reputation
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN 
+        Badges b ON u.Id = b.UserId
+    LEFT JOIN 
+        PostHistory ph ON u.Id = ph.UserId AND ph.PostHistoryTypeId IN (4, 5, 6, 8)
+    WHERE 
+        u.LastAccessDate > CURRENT_TIMESTAMP - INTERVAL '6 months'
+    GROUP BY 
+        u.Id, u.DisplayName
+),
+PostPerformance AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.ViewCount,
+        p.Score,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN 
+        PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (4, 5, 6, 8)
+    WHERE 
+        p.PostTypeId = 1
+    GROUP BY 
+        p.Id, p.Title, p.ViewCount, p.Score
+),
+TagUsage AS (
+    SELECT 
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS TagUsageCount,
+        AVG(p.Score) AS AvgScore
+    FROM 
+        Tags t
+    LEFT JOIN 
+        Posts p ON POSITION(CONCAT('<', t.TagName, '>') IN p.Tags) > 0
+    GROUP BY 
+        t.TagName
+)
+SELECT 
+    ua.DisplayName,
+    ua.Reputation,
+    ua.TotalPosts,
+    ua.TotalQuestions,
+    ua.TotalAnswers,
+    ua.TotalBadges,
+    ua.TotalEdits,
+    pp.Title,
+    pp.ViewCount,
+    pp.Score,
+    pp.CommentCount,
+    pp.LastEditDate,
+    tu.TagName,
+    tu.TagUsageCount,
+    tu.AvgScore
+FROM 
+    UserActivity ua
+JOIN 
+    PostPerformance pp ON ua.Id = pp.Id
+JOIN 
+    TagUsage tu ON POSITION(CONCAT('<', tu.TagName, '>') IN pp.Tags) > 0
+WHERE 
+    ua.TotalPosts > 50 
+    AND pp.Score > 10 
+    AND tu.TagUsageCount > 100
+ORDER BY 
+    ua.Reputation DESC, pp.Score DESC
+LIMIT 100;

@@ -1,0 +1,39 @@
+SELECT 
+    p.PostTypeId,
+    pt.Name AS PostTypeName,
+    COUNT(*) AS TotalPosts,
+    AVG(p.Score) AS AverageScore,
+    SUM(p.ViewCount) AS TotalViewCount,
+    COUNT(DISTINCT u.Id) AS UniqueAuthors,
+    AVG(CASE WHEN u.Reputation IS NOT NULL THEN u.Reputation ELSE 0 END) AS AvgReputationPerAuthor,
+    COUNT(CASE WHEN p.AnswerCount > 0 THEN 1 END) AS QuestionsWithAnswers,
+    COUNT(CASE WHEN c.Id IS NOT NULL THEN 1 END) AS PostsWithComments,
+    COUNT(DISTINCT pl.RelatedPostId) AS RelatedPostsCount,
+    COUNT(DISTINCT v.PostId) AS VotesCast,
+    COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+    COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes,
+    COUNT(DISTINCT b.Id) AS UniqueBadgeOwners,
+    COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+    MIN(p.CreationDate) AS EarliestPostDate,
+    MAX(p.CreationDate) AS LatestPostDate
+FROM 
+    Posts p
+JOIN 
+    PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN 
+    Users u ON p.OwnerUserId = u.Id
+LEFT JOIN 
+    Comments c ON c.PostId = p.Id
+LEFT JOIN 
+    PostLinks pl ON pl.PostId = p.Id
+LEFT JOIN 
+    Votes v ON v.PostId = p.Id
+LEFT JOIN 
+    Badges b ON b.UserId = p.OwnerUserId
+WHERE 
+    p.CreationDate BETWEEN '2022-01-01' AND '2022-12-31'
+GROUP BY 
+    p.PostTypeId, pt.Name
+ORDER BY 
+    TotalPosts DESC
+LIMIT 100;

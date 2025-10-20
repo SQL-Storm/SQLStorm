@@ -1,0 +1,114 @@
+-- {"query": "55052.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2048, "output_tokens": 1064} 
+
+WITH 
+-- Answers posted in the last 12 months
+recent_answers AS (
+    SELECT 
+        p.Id               AS AnswerId,
+        p.OwnerUserId      AS UserId,
+        p.ParentId         AS QuestionId,
+        p.Score            AS AnswerScore,
+        p.CreationDate    AS AnswerDate
+    FROM Posts p
+    WHERE p.PostTypeId = 2                         -- Answer
+      AND p.CreationDate >= now() - interval '12 months'
+),
+
+-- Aggregate per user
+user_stats AS (
+    SELECT 
+        u.Id                                   AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT ra.AnswerId)            AS TotalAnswers,
+        AVG(ra.AnswerScore)                    AS AvgAnswerScore,
+        SUM(CASE WHEN q.AcceptedAnswerId = ra.AnswerId THEN 1 ELSE 0 END) 
+                                                AS AcceptedAnswers,
+        COUNT(DISTINCT ra.QuestionId)          AS UniqueQuestionsAnswered
+    FROM Users u
+    JOIN recent_answers ra ON ra.UserId = u.Id
+    JOIN Posts q ON q.Id = ra.QuestionId                -- the question
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT ra.AnswerId) >= 10            -- at least 10 answers
+),
+
+-- Tag breakdown for each user (most common tags they answered)
+user_tag_stats AS (
+    SELECT 
+        ra.UserId,
+        unnest(string_to_array(trim(both '{}' from 
+               (SELECT Tags FROM Posts WHERE Id = ra.QuestionId)), '><')) 
+               AS Tag,
+        COUNT(*) AS TagAnswerCount
+    FROM recent_answers ra
+    GROUP BY ra.UserId, Tag
+),
+
+user_top_tags AS (
+    SELECT 
+        uts.UserId,
+        jsonb_object_agg(uts.Tag, uts.TagAnswerCount) 
+            FILTER (WHERE uts.rn <= 5) AS Top5Tags
+    FROM (
+        SELECT 
+            uts.*,
+            ROW_NUMBER() OVER (PARTITION BY uts.UserId ORDER BY uts.TagAnswerCount DESC) AS rn
+        FROM user_tag_stats uts
+    ) uts
+    GROUP BY uts.UserId
+),
+
+-- Badge aggregation per user
+user_badges AS (
+    SELECT 
+        b.UserId,
+        jsonb_object_agg(b.Name, b.Count) AS BadgesByName,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldCount,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverCount,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeCount
+    FROM (
+        SELECT 
+            UserId,
+            Name,
+            Class,
+            COUNT(*) AS Count
+        FROM Badges
+        GROUP BY UserId, Name, Class
+    ) b
+    GROUP BY b.UserId
+),
+
+-- Vote summary for each user’s answers
+user_votes AS (
+    SELECT 
+        ra.UserId,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 5) AS Favorites
+    FROM recent_answers ra
+    LEFT JOIN Votes v ON v.PostId = ra.AnswerId
+    GROUP BY ra.UserId
+)
+
+SELECT 
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.TotalAnswers,
+    us.AvgAnswerScore,
+    us.AcceptedAnswers,
+    us.UniqueQuestionsAnswered,
+    COALESCE(ut.Top5Tags, '{}'::jsonb)          AS Top5AnswerTags,
+    ub.BadgesByName,
+    ub.GoldCount,
+    ub.SilverCount,
+    ub.BronzeCount,
+    uv.UpVotes,
+    uv.DownVotes,
+    uv.Favorites
+FROM user_stats us
+LEFT JOIN user_top_tags ut ON ut.UserId = us.UserId
+LEFT JOIN user_badges ub    ON ub.UserId = us.UserId
+LEFT JOIN user_votes uv    ON uv.UserId = us.UserId
+ORDER BY us.Reputation DESC, us.TotalAnswers DESC
+LIMIT 100;

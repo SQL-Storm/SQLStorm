@@ -1,0 +1,51 @@
+-- {"query": "270.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 14533} 
+SELECT
+  p.Id,
+  p.Title,
+  COALESCE(u.DisplayName, 'Community') AS OwnerDisplayName,
+  ('Post by ' || COALESCE(u.DisplayName, 'Community') || ' on ' || to_char(p.CreationDate, 'YYYY-MM-DD')) AS MetaString,
+  to_char(p.CreationDate, 'YYYY-MM-DD HH24:MI:SS') AS CreationDateTime,
+  p.ViewCount,
+  (COALESCE(v.UpVotes,0) - COALESCE(v.DownVotes,0)) AS NetVotes,
+  COALESCE(c.CommentCount,0) AS CommentCount,
+  COALESCE(l.LinkedPostCount,0) AS LinkedCount,
+  COALESCE(l.DuplicateCount,0) AS DuplicateCount,
+  COALESCE(t.TagPopularity,0) AS TagPopularity,
+  (COALESCE(v.UpVotes,0) - COALESCE(v.DownVotes,0)) 
+    + 0.7 * COALESCE(p.ViewCount,0) 
+    + 0.55 * COALESCE(t.TagPopularity,0) AS WeightedScore,
+  ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY
+                     ((COALESCE(v.UpVotes,0) - COALESCE(v.DownVotes,0)) 
+                      + 0.7 * COALESCE(p.ViewCount,0) 
+                      + 0.55 * COALESCE(t.TagPopularity,0)) DESC) AS RankWithinType,
+  NOW() AS BenchmarkTime
+FROM Posts p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN LATERAL (
+  SELECT
+    SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+  FROM Votes
+  WHERE PostId = p.Id
+) v ON TRUE
+LEFT JOIN LATERAL (
+  SELECT COUNT(*) AS CommentCount
+  FROM Comments
+  WHERE PostId = p.Id
+) c ON TRUE
+LEFT JOIN LATERAL (
+  SELECT
+    SUM(CASE WHEN pl.LinkTypeId IN (1,3) THEN 1 ELSE 0 END) AS LinkedPostCount,
+    SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateCount
+  FROM PostLinks pl
+  WHERE pl.PostId = p.Id
+) l ON TRUE
+LEFT JOIN LATERAL (
+  SELECT COALESCE(SUM(t2.Count),0) AS TagPopularity
+  FROM regexp_split_to_table(coalesce(substring(p.Tags, 2, length(p.Tags) - 2), ''), '><') AS t(tag)
+  LEFT JOIN Tags t2 ON lower(t2.TagName) = lower(t.tag)
+) t ON TRUE
+WHERE p.PostTypeId IN (1,2)
+  AND (p.ClosedDate IS NULL OR p.ClosedDate > NOW())
+ORDER BY WeightedScore DESC
+LIMIT 300;

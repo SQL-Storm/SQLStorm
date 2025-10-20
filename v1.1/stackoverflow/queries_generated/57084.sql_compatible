@@ -1,0 +1,150 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(p.Id) AS TotalPosts,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS TotalQuestions,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS TotalAnswers,
+        SUM(p.Score) AS TotalPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        COUNT(c.Id) AS TotalComments,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS TotalUpvotes,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS TotalDownvotes,
+        COUNT(b.Id) AS TotalBadges
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate
+),
+PostActivity AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS Upvotes,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS Downvotes,
+        COUNT(c.Id) AS Comments,
+        COUNT(ph.Id) AS PostHistoryEntries,
+        COUNT(pl.Id) AS LinkedPosts,
+        p.Tags
+    FROM
+        Posts p
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN
+        PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN
+        PostLinks pl ON p.Id = pl.PostId
+    GROUP BY
+        p.Id, p.OwnerUserId, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.Tags
+),
+TagActivity AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        t.Count AS TagCount,
+        COUNT(p.Id) AS PostsWithTag,
+        SUM(p.Score) AS TotalScoreForTag,
+        SUM(p.ViewCount) AS TotalViewsForTag,
+        COUNT(DISTINCT u.Id) AS UniqueUsersForTag
+    FROM
+        Tags t
+    LEFT JOIN
+        Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+    GROUP BY
+        t.Id, t.TagName, t.Count
+),
+MostPopularPost AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        u.Id AS AuthorUserId,
+        u.DisplayName AS Author,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId IS NOT NULL) AS VoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvoteCount
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    GROUP BY p.Id, p.Title, u.Id, u.DisplayName
+),
+ReputationRankings AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName AS UserName,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges
+    FROM Badges b
+    RIGHT JOIN Users u ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+)
+
+SELECT
+    ua.UserId,
+    ua.Reputation,
+    ua.UserCreationDate,
+    ua.TotalPosts,
+    ua.TotalQuestions,
+    ua.TotalAnswers,
+    ua.TotalPostScore,
+    ua.LastPostDate,
+    ua.TotalComments,
+    ua.TotalUpvotes,
+    ua.TotalDownvotes,
+    ua.TotalBadges,
+    pa.PostId,
+    pa.PostTypeId,
+    pa.PostCreationDate,
+    pa.Score AS PostScore,
+    pa.ViewCount,
+    pa.AnswerCount,
+    pa.CommentCount,
+    pa.FavoriteCount,
+    pa.Upvotes,
+    pa.Downvotes,
+    pa.Comments AS PostComments,
+    pa.PostHistoryEntries,
+    pa.LinkedPosts,
+    ta.TagId,
+    ta.TagName,
+    ta.TagCount,
+    ta.PostsWithTag,
+    ta.TotalScoreForTag,
+    ta.TotalViewsForTag,
+    ta.UniqueUsersForTag,
+    mp.Title AS MostPopularPostTitle,
+    mp.Author AS MostPopularPostAuthor,
+    rr.GoldBadges,
+    rr.SilverBadges,
+    rr.BronzeBadges
+FROM
+    UserActivity ua
+    JOIN PostActivity pa ON ua.UserId = pa.OwnerUserId
+    JOIN TagActivity ta ON pa.Tags LIKE '%' || '<' || ta.TagName || '>' || '%'
+    LEFT JOIN MostPopularPost mp ON ua.UserId = mp.AuthorUserId
+    JOIN ReputationRankings rr ON ua.UserId = rr.UserId
+WHERE
+    pa.ViewCount > 5000 OR ta.UniqueUsersForTag > 100
+ORDER BY
+    ua.Reputation DESC, pa.Score DESC, ta.TotalScoreForTag DESC
+LIMIT 50;

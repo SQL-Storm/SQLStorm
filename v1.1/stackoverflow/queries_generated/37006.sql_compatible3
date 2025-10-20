@@ -1,0 +1,221 @@
+WITH recent_questions AS (
+  SELECT p.Id, p.Title, p.CreationDate, p.OwnerUserId, p.ViewCount, p.Score, p.Tags,
+         -- split tags like '<tag1><tag2>' into rows using standard SQL: return each tag with string functions and a generated sequence
+         TRIM(tag) AS Tag
+  FROM Posts p,
+       -- generate sequence positions by splitting on '><' via recursive CTE-like approach using a VALUES-derived numbers table up to a reasonable max tags per post (e.g., 50)
+       (SELECT n FROM (VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10),
+                             (11),(12),(13),(14),(15),(16),(17),(18),(19),(20),
+                             (21),(22),(23),(24),(25),(26),(27),(28),(29),(30),
+                             (31),(32),(33),(34),(35),(36),(37),(38),(39),(40),
+                             (41),(42),(43),(44),(45),(46),(47),(48),(49),(50)
+                      ) AS nums(n)
+       ) nums
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+    AND nums.n <= 1 + LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, '><', ''))  -- rough upper bound: number of separators + 1
+    -- extract the nth tag: remove leading '<' and trailing '>' around tag blocks and split by locating separators
+    AND ( 
+      -- compute start position for nth tag
+      strpos( substring(p.Tags FROM 2 FOR GREATEST(length(p.Tags)-2,0)), '><') = 0
+      OR nums.n = nums.n  -- placeholder to keep nums available; actual extraction below
+    )
+    -- actual tag extraction:
+    -- get substring between separators: for n=1 take up to first '><', else between (n-1)th and nth separator
+    -- Implementation using repeated substring functions:
+    AND TRUE
+),
+recent_questions_exploded AS (
+  -- Perform the actual safe extraction of tags using the numbers table logic
+  SELECT rq.Id, rq.Title, rq.CreationDate, rq.OwnerUserId, rq.ViewCount, rq.Score, rq.Tags,
+         -- compute tag by locating separators
+         CASE
+           WHEN sep_pos_prev = 0 AND sep_pos_next = 0 THEN inner_str
+           WHEN sep_pos_prev = 0 THEN substring(inner_str FROM 1 FOR sep_pos_next - 1)
+           WHEN sep_pos_next = 0 THEN substring(inner_str FROM sep_pos_prev + 1)
+           ELSE substring(inner_str FROM sep_pos_prev + 1 FOR sep_pos_next - sep_pos_prev - 1)
+         END AS Tag
+  FROM (
+    SELECT p.Id, p.Title, p.CreationDate, p.OwnerUserId, p.ViewCount, p.Score, p.Tags,
+           nums.n,
+           -- inner_str is the tags string without the outermost angle brackets
+           substring(p.Tags FROM 2 FOR GREATEST(length(p.Tags) - 2, 0)) AS inner_str,
+           -- position of (n-1)th separator '><'
+           COALESCE(
+             NULLIF(
+               (SELECT max(pos) FROM (
+                  SELECT strpos(inner_sub, '><') AS pos, generate_series AS gs
+                  FROM (SELECT substring(p.Tags FROM 2 FOR GREATEST(length(p.Tags)-2,0)) AS inner_sub) s,
+                       (SELECT n AS generate_series FROM (VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10),
+                                                           (11),(12),(13),(14),(15),(16),(17),(18),(19),(20),
+                                                           (21),(22),(23),(24),(25),(26),(27),(28),(29),(30),
+                                                           (31),(32),(33),(34),(35),(36),(37),(38),(39),(40),
+                                                           (41),(42),(43),(44),(45),(46),(47),(48),(49),(50)
+                                                          ) AS g(n)
+                  WHERE g.n < nums.n
+               ) t
+             ), 0
+           ) AS sep_pos_prev,
+           -- position of nth separator
+           COALESCE(
+             NULLIF(
+               (SELECT nth_pos FROM (
+                  SELECT (CASE WHEN g.n = 1 THEN strpos(inner_sub, '><') 
+                               ELSE (SELECT pos FROM (
+                                        SELECT pos, rn FROM (
+                                          SELECT strpos(substring(inner_sub FROM pos_prev + 2), '><') AS relpos, pos_prev, generate_series AS rn
+                                          FROM (SELECT 0 AS pos_prev, inner_sub) init, (SELECT n AS generate_series FROM (VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10),
+                                                                                                                       (11),(12),(13),(14),(15),(16),(17),(18),(19),(20),
+                                                                                                                       (21),(22),(23),(24),(25),(26),(27),(28),(29),(30),
+                                                                                                                       (31),(32),(33),(34),(35),(36),(37),(38),(39),(40),
+                                                                                                                       (41),(42),(43),(44),(45),(46),(47),(48),(49),(50)
+                                                                                                                      ) AS g(n)
+                                                                                      )
+                                        ) sub1 WHERE rn = nums.n
+                                      )
+                          END) AS nth_pos
+                  FROM (SELECT inner_sub) x, (SELECT n FROM (VALUES (1)) AS one(n)) y, (SELECT n AS n FROM (VALUES (1)) AS z(n)) v
+               ) u
+             ), 0
+           ) AS sep_pos_next
+    FROM Posts p
+    JOIN (SELECT n FROM (VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10),
+                             (11),(12),(13),(14),(15),(16),(17),(18),(19),(20),
+                             (21),(22),(23),(24),(25),(26),(27),(28),(29),(30),
+                             (31),(32),(33),(34),(35),(36),(37),(38),(39),(40),
+                             (41),(42),(43),(44),(45),(46),(47),(48),(49),(50)
+                      ) AS nums(n)
+         ) nums ON nums.n <= 1 + LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, '><', ''))
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+  ) rq
+),
+answer_stats AS (
+  SELECT a.ParentId AS QuestionId,
+         count(*) FILTER (WHERE a.Score > 0) AS PositiveAnswers,
+         count(*) FILTER (WHERE a.Score = 0) AS ZeroAnswers,
+         count(*) FILTER (WHERE a.Score < 0) AS NegativeAnswers,
+         avg(a.Score) AS AvgAnswerScore,
+         max(a.Score) AS MaxAnswerScore,
+         min(a.Score) AS MinAnswerScore,
+         count(*) AS AnswerCount
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+  GROUP BY a.ParentId
+),
+user_activity AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate AS UserCreation,
+         count(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsPosted,
+         count(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersPosted,
+         count(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesGiven,
+         count(b.Id) AS BadgesWon,
+         max(p.CreationDate) FILTER (WHERE p.OwnerUserId = u.Id) AS LastPostDate
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+tag_popularity AS (
+  SELECT t.TagName,
+         t.Id AS TagId,
+         t.Count AS TotalTaggedQuestions,
+         coalesce(sum(rq.ViewCount), 0) AS ViewsLastYear,
+         coalesce(avg(rq.Score), 0) AS AvgScoreLastYear,
+         coalesce(sum(as_.AnswerCount), 0) AS AnswersLastYear,
+         percentile_cont(0.5) WITHIN GROUP (ORDER BY rq.Score) AS MedianScoreLastYear
+  FROM Tags t
+  LEFT JOIN recent_questions_exploded rq ON rq.Tag = t.TagName
+  LEFT JOIN answer_stats as_ ON as_.QuestionId = rq.Id
+  GROUP BY t.Id, t.TagName, t.Count
+),
+duplicate_graph AS (
+  SELECT pl.PostId AS SourceQuestion, pl.RelatedPostId AS TargetQuestion, lt.Name AS LinkType
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+  WHERE pl.PostId IN (SELECT Id FROM recent_questions_exploded)
+    AND pl.RelatedPostId IN (SELECT Id FROM recent_questions_exploded)
+),
+hot_questions AS (
+  SELECT rq.Id, rq.Title, rq.OwnerUserId, rq.CreationDate, rq.ViewCount, rq.Score,
+         COALESCE(a.AnswerCount, 0) AS AnswerCount,
+         COALESCE(a.AvgAnswerScore, 0) AS AvgAnswerScore,
+         u.DisplayName AS OwnerName,
+         row_number() OVER (PARTITION BY rq.Tag ORDER BY (rq.ViewCount * 0.6 + rq.Score * 5 + COALESCE(a.AnswerCount, 0) * 10) DESC) AS TagRank,
+         rq.Tags
+  FROM recent_questions_exploded rq
+  LEFT JOIN answer_stats a ON a.QuestionId = rq.Id
+  LEFT JOIN Users u ON u.Id = rq.OwnerUserId
+  GROUP BY rq.Id, rq.Title, rq.OwnerUserId, rq.CreationDate, rq.ViewCount, rq.Score, a.AnswerCount, a.AvgAnswerScore, u.DisplayName, rq.Tag, rq.Tags
+),
+tag_top_summary AS (
+  SELECT tp.TagName,
+         tp.TotalTaggedQuestions,
+         tp.ViewsLastYear,
+         tp.AvgScoreLastYear,
+         tp.AnswersLastYear,
+         tp.MedianScoreLastYear,
+         ht.Id AS HotQuestionId,
+         ht.Title AS HotQuestionTitle,
+         ht.OwnerName AS HotQuestionOwner,
+         ht.ViewCount AS HotQuestionViews,
+         ht.Score AS HotQuestionScore
+  FROM tag_popularity tp
+  LEFT JOIN LATERAL (
+    SELECT hq.Id, hq.Title, hq.OwnerUserId, hq.OwnerName, hq.ViewCount, hq.Score, hq.Tags, hq.AnswerCount
+    FROM hot_questions hq
+    WHERE EXISTS (
+      SELECT 1
+      FROM recent_questions_exploded rq2
+      WHERE rq2.Id = hq.Id AND rq2.Tag = tp.TagName
+    )
+    ORDER BY (hq.ViewCount * 0.6 + hq.Score * 5 + hq.AnswerCount * 10) DESC
+    LIMIT 1
+  ) ht ON true
+  GROUP BY tp.TagName, tp.TotalTaggedQuestions, tp.ViewsLastYear, tp.AvgScoreLastYear, tp.AnswersLastYear, tp.MedianScoreLastYear, ht.Id, ht.Title, ht.OwnerName, ht.ViewCount, ht.Score
+),
+complex_metrics AS (
+  SELECT tt.TagName,
+         tt.TotalTaggedQuestions,
+         tt.ViewsLastYear,
+         tt.AvgScoreLastYear,
+         tt.AnswersLastYear,
+         tt.MedianScoreLastYear,
+         tt.HotQuestionId,
+         tt.HotQuestionTitle,
+         tt.HotQuestionOwner,
+         tt.HotQuestionViews,
+         tt.HotQuestionScore,
+         count(distinct dg.SourceQuestion) FILTER (WHERE dg.LinkType = 'Duplicate') AS DuplicateLinksFromHotYear,
+         count(distinct dg.TargetQuestion) FILTER (WHERE dg.LinkType = 'Duplicate') AS DuplicateLinksToHotYear,
+         (CAST(tt.ViewsLastYear AS double precision) / NULLIF(tt.TotalTaggedQuestions, 0)) AS AvgViewsPerTagQuestion,
+         (CAST(tt.AnswersLastYear AS double precision) / NULLIF(tt.ViewsLastYear, 0)) AS AnswersPerView,
+         (tt.MedianScoreLastYear - tt.AvgScoreLastYear) AS MedianMinusAvgScore
+  FROM tag_top_summary tt
+  LEFT JOIN duplicate_graph dg ON (dg.SourceQuestion = tt.HotQuestionId OR dg.TargetQuestion = tt.HotQuestionId)
+  GROUP BY tt.TagName, tt.TotalTaggedQuestions, tt.ViewsLastYear, tt.AvgScoreLastYear, tt.AnswersLastYear, tt.MedianScoreLastYear, tt.HotQuestionId, tt.HotQuestionTitle, tt.HotQuestionOwner, tt.HotQuestionViews, tt.HotQuestionScore
+)
+SELECT cm.TagName,
+       cm.TotalTaggedQuestions,
+       cm.ViewsLastYear,
+       cm.AvgScoreLastYear,
+       ROUND(cm.MedianScoreLastYear::numeric, 3) AS MedianScoreLastYear,
+       cm.AnswersLastYear,
+       ROUND(cm.AvgViewsPerTagQuestion::numeric, 3) AS AvgViewsPerTagQuestion,
+       ROUND(cm.AnswersPerView::numeric, 6) AS AnswersPerView,
+       cm.MedianMinusAvgScore,
+       cm.DuplicateLinksFromHotYear,
+       cm.DuplicateLinksToHotYear,
+       cm.HotQuestionId,
+       cm.HotQuestionTitle,
+       cm.HotQuestionOwner,
+       cm.HotQuestionViews,
+       cm.HotQuestionScore
+FROM complex_metrics cm
+WHERE cm.TotalTaggedQuestions > 100
+  AND cm.ViewsLastYear > 10000
+ORDER BY (cm.HotQuestionViews * 0.5 + cm.ViewsLastYear * 0.2 + cm.AnswersLastYear * 0.3) DESC
+LIMIT 50;

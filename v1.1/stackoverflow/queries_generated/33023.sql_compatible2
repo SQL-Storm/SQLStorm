@@ -1,0 +1,41 @@
+SELECT
+    u.Id AS UserID,
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS QuestionCount,
+    COUNT(DISTINCT a.Id) AS AnswerCount,
+    AVG(p.Score) AS AvgQuestionScore,
+    AVG(a.Score) AS AvgAnswerScore,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes,
+    COUNT(DISTINCT c.Id) AS TotalComments,
+    MAX(p.CreationDate) AS LastQuestionDate,
+    MAX(a.CreationDate) AS LastAnswerDate,
+    COUNT(DISTINCT b.Id) AS BadgeCount,
+    COUNT(DISTINCT t.Id) AS TagCount,
+    COUNT(DISTINCT pl.Id) AS LinkCount
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+LEFT JOIN Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+LEFT JOIN Votes v ON v.UserId = u.Id
+LEFT JOIN Comments c ON c.UserId = u.Id
+LEFT JOIN Badges b ON b.UserId = u.Id
+LEFT JOIN (
+    SELECT DISTINCT tg_tags.tag_name, tg_posts.Id AS PostId, tg_posts.OwnerUserId
+    FROM Posts tg_posts
+    CROSS JOIN LATERAL (
+        -- split Tags like '<tag1><tag2>' into rows
+        SELECT TRIM(tag) AS tag_name
+        FROM (
+            SELECT regexp_split_to_table(
+                regexp_replace(tg_posts.Tags, '^<|>$', '', 'g'),
+                '><'
+            ) AS tag
+        ) s
+    ) tg_tags
+    WHERE tg_posts.PostTypeId = 1
+) post_tags ON post_tags.OwnerUserId = u.Id
+LEFT JOIN Tags t ON t.TagName = post_tags.tag_name
+LEFT JOIN PostLinks pl ON pl.PostId IN (
+    SELECT p2.Id FROM Posts p2 WHERE p2.OwnerUserId = u.Id
+)
+GROUP BY u.Id, u.DisplayName;

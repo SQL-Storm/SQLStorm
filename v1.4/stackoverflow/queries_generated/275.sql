@@ -1,0 +1,92 @@
+-- {"query": "275.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 12354} 
+WITH
+VoteAgg AS (
+  SELECT PostId, SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+                 SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes
+  FROM Votes
+  GROUP BY PostId
+),
+TagArrays AS (
+  SELECT p.Id AS PostId,
+         p.Title,
+         p.OwnerUserId,
+         p.ViewCount,
+         p.Score,
+         p.CreationDate,
+         p.LastActivityDate,
+         p.PostTypeId,
+         COALESCE(v.Upvotes,0) AS Upvotes,
+         COALESCE(v.Downvotes,0) AS Downvotes,
+         p.Body,
+         p.CommentCount,
+         p.Tags,
+         CASE
+           WHEN p.Tags IS NULL THEN 0
+           ELSE COALESCE(array_length(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'), 1), 0)
+         END AS TagCount
+  FROM Posts p
+  LEFT JOIN VoteAgg v ON p.Id = v.PostId
+  WHERE p.LastActivityDate >= now() - interval '60 days'
+),
+Expanded AS (
+  SELECT
+     t.PostId, t.Title, t.OwnerUserId, t.ViewCount, t.Score,
+     t.CreationDate, t.LastActivityDate, t.PostTypeId,
+     t.Upvotes, t.Downvotes, t.TagCount, t.Body, t.CommentCount,
+     tn.TagName
+  FROM TagArrays t
+  LEFT JOIN LATERAL (
+     SELECT TagName
+     FROM unnest(coalesce(string_to_array(substring(t.Tags, 2, length(t.Tags)-2), '><'), ARRAY[NULL]::text[])) AS TagName
+  ) tn ON TRUE
+),
+Engaged AS (
+  SELECT
+     e.PostId, e.Title, e.OwnerUserId, e.ViewCount, e.Score, e.CreationDate, e.LastActivityDate,
+     e.PostTypeId, e.TagName, e.Upvotes, e.Downvotes, e.TagCount, e.Body, e.CommentCount,
+     (e.Score + e.ViewCount + e.Upvotes - e.Downvotes + COALESCE(e.CommentCount,0)) AS Engagement
+  FROM Expanded e
+),
+Ranked AS (
+  SELECT r.*, u.DisplayName AS OwnerName,
+         ROW_NUMBER() OVER (PARTITION BY PostTypeId, TagName ORDER BY Engagement DESC, LastActivityDate DESC) AS rn
+  FROM Engaged r
+  LEFT JOIN Users u ON r.OwnerUserId = u.Id
+),
+Q1 AS (
+  SELECT PostId, Title, OwnerName, LastActivityDate, Engagement, TagCount, TagName, 'Q1' AS Source
+  FROM Ranked
+  WHERE PostTypeId = 1 AND rn <= 5
+),
+Q2 AS (
+  SELECT PostId, Title, OwnerName, LastActivityDate, Engagement, TagCount, TagName, 'Q2' AS Source
+  FROM Ranked
+  WHERE PostTypeId = 2 AND rn <= 5
+),
+Combined AS (
+  SELECT * FROM Q1
+  UNION ALL
+  SELECT * FROM Q2
+),
+PostDetail AS (
+  SELECT c.PostId, c.Title, c.OwnerName, c.LastActivityDate, c.Engagement, c.TagCount, c.TagName, c.Source,
+         p.Body AS FullBody
+  FROM Combined c
+  LEFT JOIN Posts p ON p.Id = c.PostId
+)
+SELECT
+  pd.PostId,
+  pd.Title,
+  pd.OwnerName,
+  pd.LastActivityDate,
+  pd.Engagement,
+  pd.TagCount,
+  pd.TagName,
+  pd.Source,
+  pd.FullBody,
+  CASE WHEN pd.TagName IS NULL THEN 'none' ELSE 'tag' END AS TagPresence,
+  CASE WHEN pd.FullBody IS NULL OR length(pd.FullBody) = 0 THEN 'no_body' ELSE 'has_body' END AS BodyPresence,
+  (SELECT COUNT(*) FROM Votes v2 WHERE v2.PostId = pd.PostId AND v2.VoteTypeId = 10) > 0 AS HasCloseVote
+FROM PostDetail pd
+ORDER BY pd.LastActivityDate DESC, pd.Engagement DESC
+LIMIT 200;

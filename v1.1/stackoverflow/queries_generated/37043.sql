@@ -1,0 +1,216 @@
+-- {"query": "37043.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 2049} 
+WITH RecursiveTagHierarchy AS (
+  -- explode tag pairs from Posts.Tags into one tag per row and gather tag co-occurrence
+  SELECT
+    p.Id AS PostId,
+    lower(trim(t.tag)) AS Tag
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) AS tag
+  ) t
+  WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+TagPairs AS (
+  -- for each question, produce all ordered tag pairs (a,b) where a <> b
+  SELECT
+    r1.Tag AS TagA,
+    r2.Tag AS TagB,
+    r1.PostId
+  FROM RecursiveTagHierarchy r1
+  JOIN RecursiveTagHierarchy r2 USING (PostId)
+  WHERE r1.Tag < r2.Tag
+),
+TagStats AS (
+  -- basic statistics per tag
+  SELECT
+    th.Tag,
+    COUNT(DISTINCT th.PostId) AS QuestionCount,
+    COALESCE(SUM(p.ViewCount),0) AS TotalViews,
+    COALESCE(AVG(p.Score),0) AS AvgScore,
+    COALESCE(SUM(p.AnswerCount),0) AS TotalAnswers,
+    COALESCE(MAX(p.Score),0) AS MaxScore
+  FROM RecursiveTagHierarchy th
+  JOIN Posts p ON p.Id = th.PostId
+  GROUP BY th.Tag
+),
+TopTags AS (
+  -- pick top 200 most active tags by QuestionCount*log(1+TotalViews) to stress aggregations
+  SELECT Tag
+  FROM TagStats
+  ORDER BY QuestionCount * ln(1 + GREATEST(TotalViews,1)) DESC
+  LIMIT 200
+),
+Cooccurrence AS (
+  -- compute co-occurrence metrics among top tags
+  SELECT
+    tp.TagA,
+    tp.TagB,
+    COUNT(DISTINCT tp.PostId) AS CooccurCount,
+    COUNT(DISTINCT CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN tp.PostId END) AS WithAccepted,
+    COALESCE(AVG(p.Score),0) AS AvgScoreOnCooccur,
+    COALESCE(SUM(p.ViewCount),0) AS ViewsOnCooccur
+  FROM TagPairs tp
+  JOIN Posts p ON p.Id = tp.PostId
+  WHERE tp.TagA IN (SELECT Tag FROM TopTags)
+    AND tp.TagB IN (SELECT Tag FROM TopTags)
+  GROUP BY tp.TagA, tp.TagB
+  HAVING COUNT(DISTINCT tp.PostId) >= 3
+),
+TagNetwork AS (
+  -- pick strongest links per tag by co-occurrence density and normalize by individual tag frequency
+  SELECT
+    c.TagA,
+    c.TagB,
+    c.CooccurCount,
+    c.WithAccepted,
+    c.AvgScoreOnCooccur,
+    c.ViewsOnCooccur,
+    ROUND(
+      c.CooccurCount::numeric /
+      NULLIF( (tsA.QuestionCount + tsB.QuestionCount - c.CooccurCount), 0 )
+      , 4) AS Jaccard
+  FROM Cooccurrence c
+  JOIN TagStats tsA ON tsA.Tag = c.TagA
+  JOIN TagStats tsB ON tsB.Tag = c.TagB
+),
+StrongEdges AS (
+  -- threshold edges for a dense subgraph
+  SELECT *
+  FROM TagNetwork
+  WHERE Jaccard >= 0.02
+  ORDER BY CooccurCount DESC
+  LIMIT 1000
+),
+Centrality AS (
+  -- approximate centrality: degree + weighted co-occurrence
+  SELECT
+    t.Tag,
+    COUNT(se.TagB) AS Degree,
+    COALESCE(SUM(se.CooccurCount),0) AS Strength,
+    COALESCE(AVG(se.AvgScoreOnCooccur),0) AS MeanCooccurScore
+  FROM (
+    SELECT Tag FROM TopTags
+    UNION
+    SELECT Tag FROM TagStats ORDER BY QuestionCount DESC LIMIT 50
+  ) t
+  LEFT JOIN (
+    SELECT TagA AS TagB, TagB, CooccurCount, AvgScoreOnCooccur FROM StrongEdges
+    UNION ALL
+    SELECT TagB AS TagB, TagA, CooccurCount, AvgScoreOnCooccur FROM StrongEdges
+  ) se ON se.TagB = t.Tag
+  GROUP BY t.Tag
+),
+UserActivity AS (
+  -- heavy aggregation joining posts, votes, comments and badges for benchmarking joins
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsPosted,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersPosted,
+    COALESCE(SUM(vote_counts.UpVotes),0) AS UpVotesReceived,
+    COALESCE(SUM(vote_counts.DownVotes),0) AS DownVotesReceived,
+    COALESCE(COUNT(DISTINCT c.Id),0) AS CommentsMade,
+    COALESCE(MAX(b.Date), to_timestamp(0)) AS LastBadgeDate,
+    COUNT(DISTINCT b.Id) AS BadgeCount
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Comments c ON c.UserId = u.Id
+  LEFT JOIN LATERAL (
+    SELECT
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM Votes v
+    WHERE v.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id)
+  ) vote_counts ON true
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  WHERE u.Reputation >= 100
+  GROUP BY u.Id, u.DisplayName, u.Reputation, vote_counts.UpVotes, vote_counts.DownVotes
+),
+TopUsers AS (
+  SELECT *
+  FROM UserActivity
+  ORDER BY (QuestionsPosted + AnswersPosted) * (Reputation + 1) DESC
+  LIMIT 250
+),
+UserAnswerQuality AS (
+  -- correlate top users answers to tag centrality via posts -> tags
+  SELECT
+    tu.UserId,
+    tu.DisplayName,
+    COUNT(a.Id) FILTER (WHERE a.Score >= 5) AS HighScoreAnswers,
+    COUNT(a.Id) AS TotalAnswers,
+    COALESCE(AVG(a.Score),0) AS AvgAnswerScore,
+    COUNT(DISTINCT rt.Tag) FILTER (WHERE rt.Tag IS NOT NULL) AS DistinctTagsAnswered,
+    COALESCE(SUM(a.ViewCount),0) AS AnswerViews,
+    ROUND(
+      COALESCE(SUM(a.Score),0)::numeric / NULLIF(COUNT(a.Id),0)
+      , 3) AS ScorePerAnswer
+  FROM TopUsers tu
+  LEFT JOIN Posts a ON a.OwnerUserId = tu.UserId AND a.PostTypeId = 2
+  LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(a.Tags from 2 for char_length(a.Tags)-2), '><')) AS tag
+  ) at ON a.PostTypeId = 1 -- will be NULL for answers; preserve left join
+  LEFT JOIN RecursiveTagHierarchy rt ON rt.PostId = COALESCE(a.ParentId, a.Id)
+  GROUP BY tu.UserId, tu.DisplayName
+),
+FinalRankings AS (
+  -- combine tag centrality and user quality to produce complex metric for benchmarking
+  SELECT
+    c.Tag,
+    c.Degree,
+    c.Strength,
+    c.MeanCooccurScore,
+    COALESCE(ts.QuestionCount,0) AS QuestionCount,
+    COALESCE(ts.TotalViews,0) AS TotalViews,
+    ROUND(
+      (c.Strength * 0.6 + c.Degree * 0.4) * ln(1 + GREATEST(ts.QuestionCount,1))
+      , 3) AS TagScore
+  FROM Centrality c
+  LEFT JOIN TagStats ts ON ts.Tag = c.Tag
+),
+TopTagUserPairs AS (
+  -- cross product of top tags and top users limited by relevance to force heavy joins and sorting
+  SELECT
+    fr.Tag,
+    fr.TagScore,
+    ua.UserId,
+    ua.DisplayName,
+    ua.QuestionsPosted,
+    ua.AnswersPosted,
+    ua.UpVotesReceived,
+    ua.BadgeCount,
+    ua.Reputation,
+    ROUND(
+      fr.TagScore * (1 + (ua.AnswersPosted::numeric / NULLIF(GREATEST(ua.QuestionsPosted,1),0))) * ln(1 + ua.Reputation)
+      , 4) AS RelevanceScore
+  FROM FinalRankings fr
+  JOIN TopUsers ua ON TRUE
+  WHERE fr.TagScore > 0
+),
+RankedPairs AS (
+  SELECT
+    *,
+    ROW_NUMBER() OVER (PARTITION BY Tag ORDER BY RelevanceScore DESC) AS RankPerTag,
+    ROW_NUMBER() OVER (ORDER BY RelevanceScore DESC) AS GlobalRank
+  FROM TopTagUserPairs
+)
+SELECT
+  rp.GlobalRank,
+  rp.Tag,
+  rp.RankPerTag,
+  rp.RelevanceScore,
+  rp.UserId,
+  rp.DisplayName AS UserName,
+  rp.Reputation,
+  rp.QuestionsPosted,
+  rp.AnswersPosted,
+  rp.UpVotesReceived,
+  rp.BadgeCount,
+  fr2.QuestionCount,
+  fr2.TotalViews,
+  fr2.TagScore
+FROM RankedPairs rp
+LEFT JOIN FinalRankings fr2 ON fr2.Tag = rp.Tag
+WHERE rp.GlobalRank <= 100
+ORDER BY rp.RelevanceScore DESC, rp.GlobalRank;

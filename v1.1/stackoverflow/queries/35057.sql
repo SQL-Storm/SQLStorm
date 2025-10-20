@@ -1,0 +1,65 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersGiven,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesGiven,
+        MIN(p.CreationDate) AS FirstPostDate,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+FastestGrowingUsers AS (
+    SELECT
+        ua.*,
+        (CAST(ua.Reputation AS DECIMAL) / GREATEST(EXTRACT(EPOCH FROM (u.LastAccessDate - u.CreationDate)) / 86400.0, 1)) AS ReputationPerDay
+    FROM UserActivity ua
+    JOIN Users u ON ua.UserId = u.Id
+    WHERE ua.Reputation > 1000
+),
+TopQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        -- convert tags like '<tag1><tag2>' into a comma-separated list
+        REPLACE(REPLACE(SUBSTRING(p.Tags FROM 2 FOR (LENGTH(p.Tags) - 2)), '><', ','), ' ', '') AS TagList
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Score >= 10 AND p.AnswerCount >= 3
+)
+SELECT
+    fq.UserId,
+    fq.DisplayName,
+    fq.Reputation,
+    fq.ReputationPerDay,
+    fq.TotalPosts,
+    fq.TotalComments,
+    fq.TotalBadges,
+    fq.QuestionsAsked,
+    fq.AnswersGiven,
+    fq.FirstPostDate,
+    fq.LastPostDate,
+    COUNT(tq.Id) AS HighQualityQuestions,
+    COALESCE(AVG(tq.Score), 0) AS AvgQuestionScore,
+    COALESCE(SUM(tq.ViewCount), 0) AS TotalQuestionViews,
+    COALESCE(MAX(tq.AnswerCount), 0) AS MaxAnswersOnAQuestion
+FROM FastestGrowingUsers fq
+LEFT JOIN TopQuestions tq ON fq.UserId = tq.OwnerUserId
+GROUP BY 
+    fq.UserId, fq.DisplayName, fq.Reputation, fq.ReputationPerDay, fq.TotalPosts, fq.TotalComments, fq.TotalBadges, fq.QuestionsAsked, fq.AnswersGiven, fq.FirstPostDate, fq.LastPostDate
+ORDER BY fq.ReputationPerDay DESC
+LIMIT 50;

@@ -1,0 +1,133 @@
+WITH RECURSIVE RecursivePostHierarchy AS (
+    SELECT
+        p.Id AS PostId,
+        p.ParentId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.AnswerCount,
+        p.CommentCount,
+        p.ViewCount AS PostViewCount,
+        p.Title AS PostTitle,
+        p.Tags AS PostTags,
+        1 AS Level
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+
+    UNION ALL
+
+    SELECT
+        p.Id AS PostId,
+        p.ParentId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.AnswerCount,
+        p.CommentCount,
+        p.ViewCount AS PostViewCount,
+        p.Title AS PostTitle,
+        p.Tags AS PostTags,
+        rph.Level + 1 AS Level
+    FROM Posts p
+    INNER JOIN RecursivePostHierarchy rph ON p.ParentId = rph.PostId
+    WHERE p.PostTypeId = 2
+),
+UserPostStats AS (
+    SELECT
+        rph.OwnerUserId,
+        COUNT(CASE WHEN rph.PostTypeId = 1 THEN rph.PostId END) AS QuestionCount,
+        COUNT(CASE WHEN rph.PostTypeId = 2 THEN rph.PostId END) AS AnswerCount,
+        SUM(CASE WHEN rph.PostTypeId = 1 THEN rph.PostScore END) AS TotalQuestionScore,
+        SUM(CASE WHEN rph.PostTypeId = 2 THEN rph.PostScore END) AS TotalAnswerScore,
+        AVG(CASE WHEN rph.PostTypeId = 1 THEN rph.PostViewCount END) AS AvgQuestionViewCount,
+        AVG(CASE WHEN rph.PostTypeId = 2 THEN rph.PostScore END) AS AvgAnswerScore,
+        MAX(rph.PostCreationDate) AS LatestPostDate
+    FROM RecursivePostHierarchy rph
+    WHERE rph.OwnerUserId IS NOT NULL AND rph.OwnerUserId <> -1
+    GROUP BY rph.OwnerUserId
+),
+TagNumbers AS (
+    SELECT ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n
+    FROM (SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10 UNION ALL SELECT 11 UNION ALL SELECT 12 UNION ALL SELECT 13 UNION ALL SELECT 14 UNION ALL SELECT 15 UNION ALL SELECT 16 UNION ALL SELECT 17 UNION ALL SELECT 18 UNION ALL SELECT 19 UNION ALL SELECT 20) nums
+),
+TagPerformance AS (
+    SELECT
+        TRIM(BOTH '"' FROM split_part(TRIM(BOTH '"' FROM SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2)), '><', n.n)) AS TagName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsWithTag,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE 0 END) AS TotalAnswersForTagQuestions,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.CommentCount ELSE 0 END) AS TotalCommentsForTagQuestions,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScoreForTag,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p_parent.OwnerUserId IS NOT NULL AND p_parent.OwnerUserId <> -1 AND EXISTS (
+            SELECT 1 FROM Tags t WHERE t.TagName = TRIM(BOTH '"' FROM split_part(TRIM(BOTH '"' FROM SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2)), '><', n.n))
+        ) THEN p.Id END) AS AnswersWithTag
+    FROM Posts p
+    CROSS JOIN TagNumbers n
+    LEFT JOIN Posts p_parent ON p.ParentId = p_parent.Id
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+      AND n.n <= (CHAR_LENGTH(p.Tags) - CHAR_LENGTH(REPLACE(p.Tags, '><', '')) + 1)
+    GROUP BY TRIM(BOTH '"' FROM split_part(TRIM(BOTH '"' FROM SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2)), '><', n.n))
+)
+SELECT
+    u.DisplayName AS UserName,
+    COALESCE(ups.QuestionCount, 0) AS NumberOfQuestions,
+    COALESCE(ups.AnswerCount, 0) AS NumberOfAnswers,
+    COALESCE(ups.TotalQuestionScore, 0) AS TotalQuestionScore,
+    COALESCE(ups.TotalAnswerScore, 0) AS TotalAnswerScore,
+    COALESCE(ups.AvgQuestionViewCount, 0) AS AverageQuestionViews,
+    COALESCE(ups.LatestPostDate, u.CreationDate) AS LastActivityOnPlatform,
+    (
+        SELECT COUNT(*)
+        FROM Badges b
+        WHERE b.UserId = u.Id AND b.Class = 1
+    ) AS GoldBadges,
+    (
+        SELECT COUNT(*)
+        FROM Badges b
+        WHERE b.UserId = u.Id AND b.Class = 2
+    ) AS SilverBadges,
+    (
+        SELECT COUNT(*)
+        FROM Badges b
+        WHERE b.UserId = u.Id AND b.Class = 3
+    ) AS BronzeBadges,
+    (
+        SELECT COUNT(*)
+        FROM PostHistory ph
+        WHERE ph.UserId = u.Id AND ph.PostHistoryTypeId IN (4, 5, 6)
+    ) AS TotalEdits,
+    (
+        SELECT COUNT(*)
+        FROM Comments c
+        WHERE c.UserId = u.Id
+    ) AS TotalComments,
+    (
+        SELECT COUNT(*)
+        FROM Votes v
+        WHERE v.UserId = u.Id AND v.VoteTypeId = 2
+    ) AS TotalUpvotesGiven,
+    (
+        SELECT COUNT(*)
+        FROM Votes v
+        WHERE v.UserId = u.Id AND v.VoteTypeId = 3
+    ) AS TotalDownvotesGiven,
+    (
+        SELECT SUM(tp.AvgQuestionScoreForTag)
+        FROM TagPerformance tp
+        JOIN Tags t ON tp.TagName = t.TagName
+        JOIN Badges b ON b.UserId = u.Id AND b.TagBased = 1 AND b.Name = t.TagName
+    ) AS SumOfAverageTagQuestionScoresForBadgedTags,
+    (
+        SELECT AVG(tp.TotalAnswersForTagQuestions)
+        FROM TagPerformance tp
+        JOIN Tags t ON tp.TagName = t.TagName
+        JOIN Badges b ON b.UserId = u.Id AND b.TagBased = 1 AND b.Name = t.TagName
+    ) AS AverageTotalAnswersForBadgedTags
+FROM Users u
+LEFT JOIN UserPostStats ups ON u.Id = ups.OwnerUserId
+WHERE u.Reputation > 1000
+GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, ups.QuestionCount, ups.AnswerCount, ups.TotalQuestionScore, ups.TotalAnswerScore, ups.AvgQuestionViewCount, ups.LatestPostDate
+ORDER BY u.Reputation DESC, ups.LatestPostDate DESC
+LIMIT 1000;

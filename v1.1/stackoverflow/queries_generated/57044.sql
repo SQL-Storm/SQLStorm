@@ -1,0 +1,146 @@
+-- {"query": "57044.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2291, "output_tokens": 1760} 
+
+WITH UserActivity AS (
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COALESCE(SUM(V.VoteTypeId = 2), 0) AS TotalUpVotesReceived,
+        COALESCE(SUM(V.VoteTypeId = 3), 0) AS TotalDownVotesReceived,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalUpVotesGiven,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS TotalDownVotesGiven,
+        COUNT(C.Id) AS TotalComments,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        MAX(B.Class) AS HighestBadgeClass,
+       SUM(CASE WHEN PT.Name = 'Question' AND P.Score > 100 THEN 1 ELSE 0 END)
+        AS PopularQuestions,
+        SUM(CASE WHEN PT.Name = 'Answer' AND P.Score > 50 THEN 1 ELSE 0 END)
+        AS PopularAnswers
+    FROM
+        Users U
+    LEFT JOIN
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN
+        PostTypes PT ON P.PostTypeId = PT.Id
+    LEFT JOIN
+        Votes V ON P.Id = V.PostId
+    LEFT JOIN
+        Comments C ON P.Id = C.PostId
+    LEFT JOIN
+        Badges B ON U.Id = B.UserId
+    WHERE
+        U.CreationDate >= DATE_TRUNC('month', NOW()) - INTERVAL '1 year'
+    GROUP BY
+        U.Id, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+TagActivity AS (
+    SELECT
+        T.Id AS TagId,
+        T.TagName,
+        COUNT(P.Id) AS TaggedPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TaggedQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TaggedAnswers,
+        AVG(P.Score) AS AverageScore,
+        MAX(P.Score) AS MaxScore,
+        COUNT(DISTINCT V.UserId) AS UniqueVoters,
+        COUNT(DISTINCT C.UserId) AS UniqueCommenters
+    FROM
+        Tags T
+    JOIN
+        Posts P ON T.TagName = ANY(STRING_TO_ARRAY(P.Tags, '><'))
+    LEFT JOIN
+        Votes V ON P.Id = V.PostId
+    LEFT JOIN
+        Comments C ON P.Id = C.PostId
+    WHERE
+        P.CreationDate >= DATE_TRUNC('month', NOW()) - INTERVAL '1 year'
+    GROUP BY
+        T.Id, T.TagName
+), PoorlyReceivedPosts AS (
+SELECT
+       P.Id AS PostId,
+       P.PostTypeId,
+       P.OwnerUserId,
+       P.CreationDate,
+       P.Score,
+       P.ViewCount,
+       P.Title,
+       P.Body,
+       U.DisplayName AS OwnerDisplayName,
+       V.VoteTypeId,
+       COUNT(V.Id) AS TotalVotes,
+       SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+       SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes,
+       COUNT(DISTINCT C.Id) AS TotalComments,
+       COUNT(DISTINCT L.RelatedPostId) AS RelatedPostCount
+    FROM
+       Posts P
+    JOIN
+       Users U ON P.OwnerUserId = U.Id
+    LEFT JOIN
+       Votes V ON P.Id = V.PostId
+    LEFT JOIN
+       Comments C ON P.Id = C.PostId
+    LEFT JOIN
+       PostLinks L ON P.Id = L.PostId
+    WHERE
+       P.CreationDate >= DATE_TRUNC('month', NOW()) - INTERVAL '1 year'
+    AND
+         (SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) > 5 OR
+	      SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) < 2)
+    GROUP BY
+        P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount, P.Title, P.Body, U.DisplayName
+	   ,V.VoteTypeId
+		    )
+SELECT
+    UA.UserId,
+    UA.Reputation,
+    UA.UserCreationDate,
+    UA.LastAccessDate,
+    UA.TotalPosts,
+    UA.TotalQuestions,
+    UA.TotalAnswers,
+    UA.TotalUpVotesReceived,
+    UA.TotalDownVotesReceived,
+    UA.TotalUpVotesGiven,
+    UA.TotalDownVotesGiven,
+    UA.TotalComments,
+    UA.TotalBadges,
+    UA.HighestBadgeClass,
+    TA.TagId,
+    TA.TagName,
+    TA.TaggedPosts,
+    TA.TaggedQuestions,
+    TA.TaggedAnswers,
+    TA.AverageScore,
+    TA.MaxScore,
+    TA.UniqueVoters,
+    TA.UniqueCommenters,
+	   UA.PopularQuestions,
+    UA.PopularAnswers,
+       PO.PostId,
+    PO.PostTypeId,
+      PO.Title,
+      PO.Body,
+      PO.OwnerDisplayName,
+      PO.TotalVotes,
+      PO.TotalUpVotes,
+      PO.TotalDownVotes,
+      PO.TotalComments,
+      PO.RelatedPostCount
+FROM
+    UserActivity UA
+JOIN
+    TagActivity TA ON UA.UserId = (SELECT UserId FROM Posts P WHERE TA.TagName = ANY(STRING_TO_ARRAY(P.Tags, '><')) LIMIT 1)
+    LEFT JOIN PoorlyReceivedPosts PO ON UA.UserId  = po.OwnerUserId
+ORDER BY
+    UA.Reputation 	DESC,
+	   TA.TaggedPosts DESC,
+	   PO.TotalDownVotes DESC
+LIMIT
+ 	500
+    ;

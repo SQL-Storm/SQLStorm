@@ -1,0 +1,88 @@
+WITH ActiveUsers AS (
+    SELECT 
+        U.Id, 
+        U.DisplayName, 
+        U.Reputation, 
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT V.Id) AS TotalVotes,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesGiven,
+        SUM(COALESCE(P.Score,0)) AS TotalPostScore,
+        -- compute average post score across all posts in the same filtered set using a subquery
+        (SELECT AVG(COALESCE(P2.Score,0)) 
+         FROM Posts P2
+         WHERE P2.PostTypeId = 1 AND P2.CreationDate >= '2020-01-01') AS AvgPostScore,
+        RANK() OVER (ORDER BY COUNT(DISTINCT P.Id) DESC) AS PostRank
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId AND P.PostTypeId = 1
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId AND B.Class = 1
+    WHERE U.CreationDate >= '2020-01-01'
+    GROUP BY U.Id, U.DisplayName, U.Reputation
+    HAVING COUNT(DISTINCT P.Id) > 10 OR COUNT(DISTINCT C.Id) > 50
+),
+PostEdits AS (
+    SELECT 
+        PH.PostId,
+        COUNT(PH.Id) AS EditCount,
+        STRING_AGG(COALESCE(PHT.Name, 'Unknown'), ', ') AS EditTypes
+    FROM PostHistory PH
+    LEFT JOIN PostHistoryTypes PHT ON PH.PostHistoryTypeId = PHT.Id
+    WHERE PH.CreationDate BETWEEN '2020-01-01' AND '2023-12-31'
+    GROUP BY PH.PostId
+),
+TopTags AS (
+    SELECT 
+        T.TagName,
+        COUNT(PT.Id) AS TagUsage,
+        ROW_NUMBER() OVER (ORDER BY COUNT(PT.Id) DESC) AS TagRank
+    FROM Tags T
+    JOIN Posts PT ON PT.Tags LIKE '%' || '<' || T.TagName || '>' || '%'
+    WHERE PT.PostTypeId = 1 AND PT.CreationDate >= '2020-01-01'
+    GROUP BY T.TagName
+)
+SELECT 
+    AU.DisplayName,
+    AU.Reputation,
+    AU.TotalPosts,
+    AU.TotalComments,
+    AU.TotalVotes,
+    AU.TotalBadges,
+    AU.UpvotesGiven,
+    AU.TotalPostScore,
+    AU.AvgPostScore,
+    PE.EditCount,
+    PE.EditTypes,
+    TT.TagName AS MostActiveTag,
+    CASE 
+        WHEN AU.Reputation > 100000 THEN 'Legendary' 
+        WHEN AU.Reputation > 50000 THEN 'Epic' 
+        ELSE 'Active' 
+    END AS ReputationTier,
+    AU.PostRank
+FROM ActiveUsers AU
+JOIN Posts P ON AU.Id = P.OwnerUserId AND P.PostTypeId = 1
+JOIN PostEdits PE ON P.Id = PE.PostId
+JOIN TopTags TT ON TT.TagRank = 1
+WHERE AU.TotalPostScore > AU.AvgPostScore * 2
+GROUP BY
+    AU.DisplayName,
+    AU.Reputation,
+    AU.TotalPosts,
+    AU.TotalComments,
+    AU.TotalVotes,
+    AU.TotalBadges,
+    AU.UpvotesGiven,
+    AU.TotalPostScore,
+    AU.AvgPostScore,
+    PE.EditCount,
+    PE.EditTypes,
+    TT.TagName,
+    AU.PostRank
+ORDER BY 
+    AU.PostRank ASC, 
+    AU.TotalPostScore DESC, 
+    PE.EditCount DESC
+LIMIT 100;

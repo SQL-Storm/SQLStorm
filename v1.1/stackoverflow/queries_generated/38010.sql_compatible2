@@ -1,0 +1,273 @@
+with recent_q as (
+  select p.Id as QuestionId,
+         p.CreationDate,
+         p.OwnerUserId,
+         p.Score,
+         p.ViewCount,
+         p.Tags,
+         coalesce(p.AnswerCount, 0) as AnswerCount
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= (select date_trunc('month', max(CreationDate)) - interval '6 months' from Posts where PostTypeId = 1)
+),
+answers as (
+  select a.ParentId as QuestionId,
+         count(*) as AnswerCnt,
+         avg(a.Score) as AvgAnswerScore,
+         max(a.CreationDate) as LastAnswerDate
+  from Posts a
+  where a.PostTypeId = 2
+  group by a.ParentId
+),
+question_votes as (
+  select v.PostId as QuestionId,
+         sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+         sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+         sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites
+  from Votes v
+  join Posts p on p.Id = v.PostId and p.PostTypeId = 1
+  group by v.PostId
+),
+comment_activity as (
+  select c.PostId as QuestionId,
+         count(*) as CommentCnt,
+         max(c.CreationDate) as LastCommentDate
+  from Comments c
+  join Posts p on p.Id = c.PostId and p.PostTypeId = 1
+  group by c.PostId
+),
+edit_activity as (
+  select ph.PostId as QuestionId,
+         count(case when ph.PostHistoryTypeId in (4,5,6,7,8,9,24) then 1 end) as EditEvents,
+         max(case when ph.PostHistoryTypeId in (4,5,6,7,8,9,24) then ph.CreationDate end) as LastEditDate,
+         count(case when ph.PostHistoryTypeId in (10,11,12,13,14,15,19,20,35,36) then 1 end) as ModEvents
+  from PostHistory ph
+  join Posts p on p.Id = ph.PostId and p.PostTypeId = 1
+  group by ph.PostId
+),
+dup_links as (
+  select pl.PostId as QuestionId,
+         count(case when pl.LinkTypeId = 3 then 1 end) as DuplicateRefs,
+         count(case when pl.LinkTypeId = 1 then 1 end) as LinkedRefs
+  from PostLinks pl
+  group by pl.PostId
+),
+tag_expansion as (
+  select rq.QuestionId,
+         unnest(string_to_array(substring(rq.Tags, 2, length(rq.Tags)-2), '><')) as tag
+  from recent_q rq
+  where rq.Tags is not null and rq.Tags <> ''
+),
+tag_stats as (
+  select te.QuestionId,
+         count(*) as TagCount,
+         sum(t.Count) as TagPopularity,
+         avg(coalesce(case when t.IsModeratorOnly then 1 else 0 end,0)) as ModOnlyRatio
+  from tag_expansion te
+  left join Tags t on t.TagName = te.tag
+  group by te.QuestionId
+),
+owner_stats as (
+  select u.Id as OwnerUserId,
+         percentile_cont(0.5) within group (order by u.Reputation) as MedianRep,
+         avg(u.UpVotes - u.DownVotes) as AvgNetVotes,
+         avg(u.Views) as AvgProfileViews,
+         min(u.CreationDate) as OldestUserDate
+  from Users u
+  group by u.Id
+),
+hot_window as (
+  select rq.QuestionId,
+         rq.CreationDate,
+         rq.Score,
+         rq.ViewCount,
+         rq.AnswerCount,
+         qv.UpVotes,
+         qv.DownVotes,
+         coalesce(qv.Favorites,0) as Favorites,
+         ca.CommentCnt,
+         ea.EditEvents,
+         ea.ModEvents,
+         dl.DuplicateRefs,
+         dl.LinkedRefs,
+         ts.TagCount,
+         ts.TagPopularity,
+         ts.ModOnlyRatio,
+         os.MedianRep as OwnerMedianRep,
+         os.AvgNetVotes as OwnerAvgNetVotes,
+         os.AvgProfileViews as OwnerAvgProfileViews,
+         greatest(coalesce(ea.LastEditDate, timestamp 'epoch'),
+                  coalesce(ca.LastCommentDate, timestamp 'epoch'),
+                  rq.CreationDate) as LastActivityDate,
+         rq.OwnerUserId
+  from recent_q rq
+  left join answers an on an.QuestionId = rq.QuestionId
+  left join question_votes qv on qv.QuestionId = rq.QuestionId
+  left join comment_activity ca on ca.QuestionId = rq.QuestionId
+  left join edit_activity ea on ea.QuestionId = rq.QuestionId
+  left join dup_links dl on dl.QuestionId = rq.QuestionId
+  left join tag_stats ts on ts.QuestionId = rq.QuestionId
+  left join owner_stats os on os.OwnerUserId = rq.OwnerUserId
+),
+activity_derivatives as (
+  select hw.QuestionId,
+         hw.CreationDate,
+         hw.Score,
+         hw.ViewCount,
+         hw.AnswerCount,
+         hw.UpVotes,
+         hw.DownVotes,
+         hw.Favorites,
+         hw.CommentCnt,
+         hw.EditEvents,
+         hw.ModEvents,
+         hw.DuplicateRefs,
+         hw.LinkedRefs,
+         hw.TagCount,
+         hw.TagPopularity,
+         hw.ModOnlyRatio,
+         hw.OwnerMedianRep,
+         hw.OwnerAvgNetVotes,
+         hw.OwnerAvgProfileViews,
+         hw.LastActivityDate,
+         hw.OwnerUserId,
+         coalesce(UpVotes,0) - coalesce(DownVotes,0) as NetVotes,
+         coalesce(AnswerCount,0) + coalesce(CommentCnt,0) + coalesce(EditEvents,0) as InteractionScore,
+         case
+           when (extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - CreationDate))/3600.0) <= 1 then 24
+           when (extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - CreationDate))/3600.0) <= 6 then 8
+           when (extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - CreationDate))/3600.0) <= 24 then 3
+           else 1
+         end as RecencyWeight
+  from hot_window hw
+),
+ranked as (
+  select ad.QuestionId,
+         ad.CreationDate,
+         ad.Score,
+         ad.ViewCount,
+         ad.AnswerCount,
+         ad.UpVotes,
+         ad.DownVotes,
+         ad.Favorites,
+         ad.CommentCnt,
+         ad.EditEvents,
+         ad.ModEvents,
+         ad.DuplicateRefs,
+         ad.LinkedRefs,
+         ad.TagCount,
+         ad.TagPopularity,
+         ad.ModOnlyRatio,
+         ad.OwnerMedianRep,
+         ad.OwnerAvgNetVotes,
+         ad.OwnerAvgProfileViews,
+         ad.LastActivityDate,
+         ad.OwnerUserId,
+         ad.NetVotes,
+         ad.InteractionScore,
+         ad.RecencyWeight,
+         (
+           1.0 * coalesce(NetVotes,0)
+           + 0.5 * coalesce(Favorites,0)
+           + 0.2 * coalesce(ViewCount,0)
+           + 2.0 * coalesce(AnswerCount,0)
+           + 0.3 * coalesce(CommentCnt,0)
+           + 1.5 * coalesce(EditEvents,0)
+           - 3.0 * coalesce(DuplicateRefs,0)
+           + 0.05 * coalesce(TagPopularity,0)
+           + 0.001 * coalesce(OwnerMedianRep,0)
+         ) * RecencyWeight as HotnessScore
+  from activity_derivatives ad
+),
+binned as (
+  select r.QuestionId,
+         r.CreationDate,
+         r.Score,
+         r.ViewCount,
+         r.AnswerCount,
+         r.UpVotes,
+         r.DownVotes,
+         r.Favorites,
+         r.CommentCnt,
+         r.EditEvents,
+         r.ModEvents,
+         r.DuplicateRefs,
+         r.LinkedRefs,
+         r.TagCount,
+         r.TagPopularity,
+         r.ModOnlyRatio,
+         r.OwnerMedianRep,
+         r.OwnerAvgNetVotes,
+         r.OwnerAvgProfileViews,
+         r.LastActivityDate,
+         r.OwnerUserId,
+         r.NetVotes,
+         r.InteractionScore,
+         r.RecencyWeight,
+         r.HotnessScore,
+         floor( case when coalesce(Score,0) <= -10 then 0
+                      when coalesce(Score,0) >= 100 then 19
+                      else ((coalesce(Score,0) - (-10)) / ((100 - (-10)) / 20.0)) end ) as ScoreBucket,
+         floor( case when coalesce(ViewCount,0) <= 0 then 0
+                      when coalesce(ViewCount,0) >= 100000 then 9
+                      else ((coalesce(ViewCount,0) - 0) / ((100000 - 0) / 10.0)) end ) as ViewBucket
+  from ranked r
+),
+topn as (
+  select b.QuestionId,
+         b.CreationDate,
+         b.Score,
+         b.ViewCount,
+         b.AnswerCount,
+         b.UpVotes,
+         b.DownVotes,
+         b.Favorites,
+         b.CommentCnt,
+         b.EditEvents,
+         b.ModEvents,
+         b.DuplicateRefs,
+         b.LinkedRefs,
+         b.TagCount,
+         b.TagPopularity,
+         b.ModOnlyRatio,
+         b.OwnerMedianRep,
+         b.OwnerAvgNetVotes,
+         b.OwnerAvgProfileViews,
+         b.LastActivityDate,
+         b.ScoreBucket,
+         b.ViewBucket,
+         b.HotnessScore,
+         row_number() over (partition by ScoreBucket order by HotnessScore desc, LastActivityDate desc) as rn_score,
+         row_number() over (partition by ViewBucket order by HotnessScore desc, LastActivityDate desc) as rn_view,
+         row_number() over (order by HotnessScore desc, LastActivityDate desc) as rn_global
+  from binned b
+)
+select
+  t.QuestionId,
+  t.CreationDate,
+  t.LastActivityDate,
+  t.Score,
+  t.ViewCount,
+  t.AnswerCount,
+  t.UpVotes,
+  t.DownVotes,
+  t.Favorites,
+  t.CommentCnt,
+  t.EditEvents,
+  t.ModEvents,
+  t.DuplicateRefs,
+  t.LinkedRefs,
+  t.TagCount,
+  t.TagPopularity,
+  round(coalesce(t.ModOnlyRatio,0),3) as ModOnlyRatio,
+  round(t.HotnessScore,3) as HotnessScore,
+  t.ScoreBucket,
+  t.ViewBucket,
+  t.rn_global,
+  t.rn_score,
+  t.rn_view
+from topn t
+where t.rn_global <= 200
+   or t.rn_score <= 10
+   or t.rn_view <= 10
+order by t.rn_global, t.rn_score, t.rn_view;

@@ -1,0 +1,125 @@
+-- {"query": "161.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 2099} 
+WITH
+-- 1) Build per-user baseline statistics with several correlated subqueries
+UserStats AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.AccountId,
+    -- rank by reputation for benchmarking skew
+    DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS RepRank,
+    -- last year activity counts per user
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.CreationDate > NOW() - INTERVAL '365 days') AS PostsLastYear,
+    -- average post score across all posts by the user (NULL-safe to 0)
+    COALESCE((SELECT AVG(COALESCE(p.Score,0)) FROM Posts p WHERE p.OwnerUserId = u.Id), 0) AS AvgPostScoreAllTime,
+    -- number of badges earned by the user in the last year
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Date > NOW() - INTERVAL '365 days') AS BadgesLastYear,
+    -- most recent activity date across posts by the user
+    (SELECT MAX(p.LastActivityDate) FROM Posts p WHERE p.OwnerUserId = u.Id) AS LastActivityDateAllPosts,
+    -- latest edited post by the user (via PostHistory)
+    (SELECT MAX(ph.CreationDate) FROM PostHistory ph WHERE ph.UserId = u.Id) AS LastEditDate
+  FROM Users u
+),
+-- 2) A header of daily aggregation for the last 30 days to stress window functions
+DailyActivity AS (
+  SELECT
+    date_trunc('day', p.CreationDate) AS Day,
+    p.OwnerUserId AS UserId,
+    COUNT(*) AS PostsThatDay,
+    SUM(COALESCE(p.ViewCount,0)) AS ViewsThatDay,
+    SUM(COALESCE(p.Score,0)) AS ScoreThatDay
+  FROM Posts p
+  WHERE p.CreationDate >= NOW() - INTERVAL '30 days'
+  GROUP BY date_trunc('day', p.CreationDate), p.OwnerUserId
+),
+-- 3) Correlated subquery heavy calculation per user: a complex expression with NULL handling
+UserComplexExp AS (
+  SELECT
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.RepRank,
+    us.PostsLastYear,
+    us.AvgPostScoreAllTime,
+    us.BadgesLastYear,
+    -- compute a null-safe score mix using a conditional, 0 if nulls
+    COALESCE((SELECT AVG(Score) FROM Posts p WHERE p.OwnerUserId = us.Id AND p.Score IS NOT NULL) * 0.6, 0)
+      + COALESCE((SELECT SUM(BountyAmount) FROM Votes v WHERE v.PostId IN (SELECT Id FROM Posts p2 WHERE p2.OwnerUserId = us.Id) AND v.BountyAmount IS NOT NULL), 0) * 0.4 AS BenchmarkScore
+  FROM UserStats us
+),
+-- 4) A set-op (UNION) style consolidation: combine per-user stats with a tag-vector derived metric
+TaggedMetrics AS (
+  SELECT
+    usc.Id,
+    usc.DisplayName,
+    usc.Reputation,
+    CAST(string_agg(t.TagName, ',' ORDER BY t.TagName) AS VARCHAR(1000)) AS TagsSummary,
+    -- a lightweight calculated vector: number of distinct tags the user posted about (approximate)
+    (SELECT COUNT(DISTINCT tt.TagName)
+     FROM Posts p
+     JOIN UNNEST(string_to_array(p.Tags, ',') ) AS tname ON true
+     JOIN Tags tt ON lower(tt.TagName) = lower(trim(tname))
+     WHERE p.OwnerUserId = usc.Id) AS DistinctTagsUsed
+  FROM UserStats usc
+),
+-- 5) Prepare a final, rich rowset by joining many facets
+FinalBase AS (
+  SELECT
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.RepRank,
+    us.PostsLastYear,
+    us.AvgPostScoreAllTime,
+    us.BadgesLastYear,
+    us.LastActivityDateAllPosts,
+    us.LastEditDate,
+    dc.Score AS DailyCompositeScore,
+    dm.TagsSummary,
+    dm.DistinctTagsUsed,
+    -- a complex predicate expression with NULL handling
+    CASE
+      WHEN us.LastActivityDateAllPosts IS NULL THEN FALSE
+      WHEN us.Reputation > 1000 AND us.PostsLastYear > 50 THEN TRUE
+      ELSE (USING_DEFAULT(NULLIF(us.LastActivityDateAllPosts, TIMESTAMP 'epoch'))) -- intentionally to exercise NULL logic
+    END AS IsActiveFlag
+  FROM UserStats us
+  LEFT JOIN DailyActivity dc ON dc.UserId = us.Id
+  LEFT JOIN TaggedMetrics dm ON dm.Id = us.Id
+)
+-- 6) Projection and a final set operation: produce two complementary views and UNION ALL them
+SELECT
+  Id,
+  DisplayName,
+  Reputation,
+  RepRank,
+  PostsLastYear,
+  AvgPostScoreAllTime,
+  BadgesLastYear,
+  LastActivityDateAllPosts,
+  LastEditDate,
+  DailyCompositeScore,
+  TagsSummary,
+  DistinctTagsUsed,
+  IsActiveFlag
+FROM FinalBase
+UNION ALL
+SELECT
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  NULL::integer AS RepRank,
+  NULL::integer AS PostsLastYear,
+  NULL::numeric AS AvgPostScoreAllTime,
+  NULL::integer AS BadgesLastYear,
+  NULL::timestamp AS LastActivityDateAllPosts,
+  NULL::timestamp AS LastEditDate,
+  NULL::numeric AS DailyCompositeScore,
+  NULL::text AS TagsSummary,
+  NULL::integer AS DistinctTagsUsed,
+  NULL::boolean AS IsActiveFlag
+FROM Users u
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+GROUP BY u.Id, u.DisplayName, u.Reputation
+HAVING COUNT(p.Id) = 0;

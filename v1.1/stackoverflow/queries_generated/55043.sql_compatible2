@@ -1,0 +1,93 @@
+WITH TagQuestions AS (
+    SELECT 
+        p.Id AS PostId,
+        p.CreationDate,
+        p.Score,
+        u.Id AS OwnerUserId,
+        u.DisplayName,
+        t.TagName
+    FROM Posts p
+    JOIN Users u ON u.Id = p.OwnerUserId
+    JOIN LATERAL regexp_split_to_table(p.Tags, '><') AS tag_raw(tag_raw) ON true
+    JOIN Tags t ON t.TagName = tag_raw.tag_raw
+    WHERE p.PostTypeId = 1
+),
+MonthlyTagAgg AS (
+    SELECT 
+        TagName,
+        date_trunc('month', CreationDate) AS month,
+        COUNT(*) AS QuestionsCount,
+        AVG(Score) AS AvgScore,
+        SUM(CASE WHEN Score > 0 THEN 1 ELSE 0 END) AS PositiveScoreCount
+    FROM TagQuestions
+    GROUP BY TagName, date_trunc('month', CreationDate)
+),
+TopUsersPerTag AS (
+    SELECT 
+        tq.TagName,
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(*) AS UserQuestionCount,
+        ROW_NUMBER() OVER (PARTITION BY tq.TagName ORDER BY COUNT(*) DESC) AS rn
+    FROM TagQuestions tq
+    JOIN Users u ON u.Id = tq.OwnerUserId
+    GROUP BY tq.TagName, u.Id, u.DisplayName
+),
+GoldBadgeHolders AS (
+    SELECT 
+        b.UserId,
+        t.TagName
+    FROM Badges b
+    JOIN Tags t ON b.TagBased = TRUE AND b.Name = t.TagName
+    WHERE b.Class = 1
+),
+DuplicateRelations AS (
+    SELECT 
+        pl.PostId AS QuestionId,
+        pl.RelatedPostId AS DuplicateOfId,
+        pl.CreationDate
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+),
+Final AS (
+    SELECT 
+        mta.TagName,
+        to_char(mta.month::timestamp, 'YYYY-MM') AS month,
+        mta.QuestionsCount,
+        ROUND(mta.AvgScore, 2) AS AvgScore,
+        mta.PositiveScoreCount,
+        tu.UserId,
+        tu.DisplayName,
+        tu.UserQuestionCount,
+        CASE WHEN gb.UserId IS NOT NULL THEN 1 ELSE 0 END AS IsGoldBadgeHolder,
+        dr.DuplicateOfId,
+        dr.CreationDate AS DuplicateCreated
+    FROM MonthlyTagAgg mta
+    LEFT JOIN (
+        SELECT TagName, UserId, DisplayName, UserQuestionCount
+        FROM TopUsersPerTag
+        WHERE rn = 1
+    ) tu ON tu.TagName = mta.TagName
+    LEFT JOIN GoldBadgeHolders gb ON gb.UserId = tu.UserId AND gb.TagName = mta.TagName
+    LEFT JOIN DuplicateRelations dr ON dr.QuestionId = (
+        SELECT MIN(tq2.PostId)
+        FROM TagQuestions tq2
+        WHERE tq2.TagName = mta.TagName
+          AND date_trunc('month', tq2.CreationDate) = mta.month
+    )
+)
+SELECT
+    TagName,
+    month,
+    QuestionsCount,
+    AvgScore,
+    PositiveScoreCount,
+    UserId,
+    DisplayName,
+    UserQuestionCount,
+    IsGoldBadgeHolder,
+    DuplicateOfId,
+    DuplicateCreated
+FROM Final
+ORDER BY TagName, month DESC
+LIMIT 200;

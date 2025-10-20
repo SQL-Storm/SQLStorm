@@ -1,0 +1,124 @@
+-- {"query": "47094.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 215636, "output_tokens": 191354} 
+
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT p.Id) as QuestionCount,
+        1 as Level
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%<' || t.TagName || '>%'
+    WHERE p.PostTypeId = 1
+        AND t.Count > 1000
+    GROUP BY t.Id, t.TagName
+    
+    UNION ALL
+    
+    SELECT 
+        t.Id,
+        t.TagName,
+        th.QuestionCount,
+        th.Level + 1
+    FROM Tags t
+    INNER JOIN tag_hierarchy th ON t.Id != th.Id
+    WHERE th.Level < 3
+),
+user_expertise AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        t.TagName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as TotalAnswerScore,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score >= 10 THEN p.Id END) as GreatAnswers,
+        COUNT(DISTINCT b.Id) as TagBadges,
+        DENSE_RANK() OVER (PARTITION BY t.TagName ORDER BY SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) DESC) as TagRank
+    FROM Users u
+    INNER JOIN Posts p ON p.OwnerUserId = u.Id
+    INNER JOIN Posts q ON q.Id = p.ParentId AND q.Tags LIKE '%<' || t.TagName || '>%'
+    INNER JOIN Tags t ON q.Tags LIKE '%<' || t.TagName || '>%'
+    LEFT JOIN Badges b ON b.UserId = u.Id AND b.Name = t.TagName AND b.TagBased = 1
+    WHERE p.PostTypeId = 2
+        AND u.Reputation > 5000
+        AND p.CreationDate >= NOW() - INTERVAL '2 years'
+    GROUP BY u.Id, u.DisplayName, t.TagName
+    HAVING COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) >= 5
+),
+question_complexity AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        LENGTH(p.Body) as BodyLength,
+        array_length(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'), 1) as TagCount,
+        EXTRACT(EPOCH FROM (COALESCE(p.AcceptedAnswerId, 0)::boolean::int * (a.CreationDate - p.CreationDate))) / 3600 as HoursToAcceptedAnswer,
+        COUNT(DISTINCT ph.UserId) as EditorsCount,
+        COUNT(DISTINCT c.UserId) as UniqueCommenters,
+        MAX(c.Score) as MaxCommentScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ans.Score) as MedianAnswerScore,
+        STDDEV(ans.Score) as AnswerScoreStdDev
+    FROM Posts p
+    LEFT JOIN Posts a ON a.Id = p.AcceptedAnswerId
+    LEFT JOIN Posts ans ON ans.ParentId = p.Id AND ans.PostTypeId = 2
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4, 5, 6)
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= NOW() - INTERVAL '1 year'
+        AND p.Score > 0
+        AND p.ClosedDate IS NULL
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.FavoriteCount, p.Body, p.Tags, p.AcceptedAnswerId, a.CreationDate, p.CreationDate
+),
+user_activity_patterns AS (
+    SELECT 
+        UserId,
+        EXTRACT(DOW FROM CreationDate) as DayOfWeek,
+        EXTRACT(HOUR FROM CreationDate) as HourOfDay,
+        COUNT(*) as ActionCount,
+        AVG(Score) as AvgScore
+    FROM (
+        SELECT OwnerUserId as UserId, CreationDate, Score FROM Posts WHERE OwnerUserId IS NOT NULL
+        UNION ALL
+        SELECT UserId, CreationDate, Score FROM Comments WHERE UserId IS NOT NULL
+        UNION ALL
+        SELECT UserId, CreationDate, 0 as Score FROM Votes WHERE UserId IS NOT NULL
+    ) combined_activity
+    GROUP BY UserId, EXTRACT(DOW FROM CreationDate), EXTRACT(HOUR FROM CreationDate)
+)
+SELECT 
+    ue.DisplayName,
+    ue.TagName,
+    ue.TotalAnswerScore,
+    ue.GreatAnswers,
+    ue.TagRank,
+    COUNT(DISTINCT qc.QuestionId) as ComplexQuestionsAnswered,
+    AVG(qc.HoursToAcceptedAnswer) as AvgHoursToAccepted,
+    PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY qc.ViewCount) as P75ViewCount,
+    AVG(qc.MedianAnswerScore) as AvgMedianAnswerScore,
+    STRING_AGG(DISTINCT 
+        CASE WHEN uap.DayOfWeek = 0 AND uap.ActionCount > 50 
+        THEN 'Sunday Expert' 
+        WHEN uap.HourOfDay BETWEEN 22 AND 4 AND uap.ActionCount > 30 
+        THEN 'Night Owl'
+        WHEN uap.HourOfDay BETWEEN 5 AND 9 AND uap.ActionCount > 40
+        THEN 'Early Bird'
+        ELSE NULL END, ', '
+    ) as ActivityPatterns,
+    COUNT(DISTINCT pl.RelatedPostId) FILTER (WHERE pl.LinkTypeId = 3) as DuplicatesIdentified,
+    SUM(v.BountyAmount) FILTER (WHERE v.VoteTypeId = 9) as TotalBountiesEarned
+FROM user_expertise ue
+INNER JOIN Posts ans ON ans.OwnerUserId = ue.UserId
+INNER JOIN Posts q ON q.Id = ans.ParentId AND q.Tags LIKE '%<' || ue.TagName || '>%'
+INNER JOIN question_complexity qc ON qc.QuestionId = q.Id
+LEFT JOIN user_activity_patterns uap ON uap.UserId = ue.UserId
+LEFT JOIN PostLinks pl ON pl.PostId = q.Id
+LEFT JOIN Votes v ON v.PostId = ans.Id AND v.VoteTypeId IN (8, 9)
+WHERE ue.TagRank <= 10
+    AND qc.AnswerCount >= 3
+    AND qc.ViewCount > 1000
+GROUP BY ue.DisplayName, ue.TagName, ue.TotalAnswerScore, ue.GreatAnswers, ue.TagRank
+HAVING COUNT(DISTINCT qc.QuestionId) >= 3
+ORDER BY ue.TotalAnswerScore DESC, AVG(qc.MedianAnswerScore) DESC
+LIMIT 100;

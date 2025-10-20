@@ -1,0 +1,107 @@
+-- {"query": "57087.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2291, "output_tokens": 1079} 
+
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotes
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+PostMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.OwnerUserId,
+        u.Reputation AS OwnerReputation,
+        COUNT(v.Id) AS TotalVotesOnPost,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesOnPost,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesOnPost,
+        COUNT(DISTINCT c.Id) AS TotalCommentsOnPost
+    FROM
+        Posts p
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    GROUP BY
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.OwnerUserId, u.Reputation
+),
+TagMetrics AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        t.Count AS TagCount,
+        COUNT(p.Id) AS PostsWithTag,
+        SUM(p.Score) AS TotalScoreForTag,
+        SUM(p.ViewCount) AS TotalViewsForTag,
+        SUM(p.AnswerCount) AS TotalAnswersForTag
+    FROM
+        Tags t
+    LEFT JOIN
+        Posts p ON p.Tags LIKE CONCAT('%><', t.TagName, '><%')
+    GROUP BY
+        t.Id, t.TagName, t.Count
+)
+SELECT
+    ua.UserId,
+    ua.Reputation,
+    ua.UserCreationDate,
+    ua.LastAccessDate,
+    ua.TotalPosts,
+    ua.TotalComments,
+    ua.TotalVotes,
+    ua.TotalUpvotes,
+    ua.TotalDownvotes,
+    pm.PostId,
+    pm.PostTypeId,
+    pm.PostCreationDate,
+    pm.Score,
+    pm.ViewCount,
+    pm.AnswerCount,
+    pm.CommentCount,
+    pm.OwnerUserId,
+    pm.OwnerReputation,
+    pm.TotalVotesOnPost,
+    pm.TotalUpvotesOnPost,
+    pm.TotalDownvotesOnPost,
+    pm.TotalCommentsOnPost,
+    tm.TagId,
+    tm.TagName,
+    tm.TagCount,
+    tm.PostsWithTag,
+    tm.TotalScoreForTag,
+    tm.TotalViewsForTag,
+    tm.TotalAnswersForTag
+FROM
+    UserActivity ua
+JOIN
+    PostMetrics pm ON ua.UserId = pm.OwnerUserId
+LEFT JOIN
+    TagMetrics tm ON pm.Tags LIKE CONCAT('%><', tm.TagName, '><%')
+ORDER BY
+    ua.Reputation DESC,
+    pm.Score DESC,
+    tm.TotalScoreForTag DESC
+LIMIT 1000;

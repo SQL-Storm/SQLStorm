@@ -1,0 +1,72 @@
+WITH UserActivity AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(p.Score) AS TotalScore,
+        AVG(CASE WHEN ph.PostHistoryTypeId = 5 THEN LENGTH(ph.Text) ELSE 0 END) AS AvgEditLength,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (5, 10, 11)) AS EditAndVoteActions,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC, SUM(p.Score) DESC) AS ActivityRank
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN 
+        PostHistory ph ON u.Id = ph.UserId
+    LEFT JOIN 
+        Badges b ON u.Id = b.UserId
+    WHERE 
+        p.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '1 year'
+    GROUP BY 
+        u.Id,
+        u.DisplayName,
+        u.Reputation
+),
+TopQuestions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Score,
+        p.Tags,
+        ROW_NUMBER() OVER (
+            PARTITION BY tag
+            ORDER BY p.ViewCount DESC
+        ) AS TagRank
+    FROM 
+        Posts p,
+        LATERAL (
+            -- convert tag string like '<tag1><tag2>' into rows; standard SQL: trim <> and split on '><'
+            SELECT unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><')) AS tag
+        ) AS t
+    WHERE 
+        p.PostTypeId = 1
+        AND p.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '6 months'
+)
+SELECT 
+    ua.DisplayName,
+    ua.Reputation,
+    ua.TotalPosts,
+    ua.TotalScore,
+    ua.AvgEditLength,
+    ua.EditAndVoteActions,
+    ua.TotalBadges,
+    tq.Title AS TopQuestionTitle,
+    tq.ViewCount AS TopQuestionViews,
+    tq.AnswerCount AS TopQuestionAnswers,
+    tq.Score AS TopQuestionScore
+FROM 
+    UserActivity ua
+LEFT JOIN 
+    Posts p ON ua.Id = p.OwnerUserId
+LEFT JOIN 
+    TopQuestions tq ON p.Id = tq.Id
+WHERE 
+    ua.ActivityRank <= 10
+    AND tq.TagRank = 1
+ORDER BY 
+    ua.ActivityRank,
+    tq.ViewCount DESC;

@@ -1,0 +1,171 @@
+WITH
+PostActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.OwnerUserId,
+    p.CreationDate,
+    COALESCE(MAX(ph.CreationDate), p.LastEditDate, TIMESTAMP '1970-01-01') AS LastHistoryDate,
+    COALESCE(MAX(c.CreationDate), TIMESTAMP '1970-01-01') AS LastCommentDate,
+    COALESCE(MAX(v.CreationDate), TIMESTAMP '1970-01-01') AS LastVoteDate
+  FROM Posts p
+  LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  GROUP BY p.Id, p.PostTypeId, p.Title, p.Tags, p.OwnerUserId, p.CreationDate, p.LastEditDate
+),
+QuestionTags AS (
+  SELECT
+    pa.PostId,
+    lower(trim(both '<>' from unnest(string_to_array(substring(pa.Tags, 2, length(pa.Tags)-2), '><')))) AS Tag
+  FROM PostActivity pa
+  JOIN Posts p ON p.Id = pa.PostId
+  WHERE p.PostTypeId = 1 AND pa.Tags IS NOT NULL AND pa.Tags <> ''
+),
+TagStats AS (
+  SELECT
+    qt.Tag,
+    count(*) AS QuestionCount,
+    avg(p.Score) AS AvgQuestionScore,
+    avg(coalesce(p.AnswerCount,0)) AS AvgAnswerCount,
+    sum(case when p.AcceptedAnswerId IS NOT NULL then 1 else 0 end) AS AcceptedCount,
+    max(p.ViewCount) AS MaxViews
+  FROM QuestionTags qt
+  JOIN Posts p ON p.Id = qt.PostId
+  GROUP BY qt.Tag
+),
+UserSummary AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+    COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+    COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsCount,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersCount,
+    AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgPostScore,
+    MAX(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS MaxPostScore
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+HeavyPosts AS (
+  SELECT
+    pa.PostId,
+    pa.PostTypeId,
+    pa.Title,
+    pa.OwnerUserId,
+    pa.CreationDate,
+    pa.LastHistoryDate,
+    pa.LastCommentDate,
+    pa.LastVoteDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    (COALESCE(p.ViewCount,0) * 1.0 * 0.4
+     + COALESCE(p.Score,0) * 50
+     + COALESCE(p.AnswerCount,0) * 100
+     + COALESCE(p.CommentCount,0) * 25
+     + COALESCE(p.FavoriteCount,0) * 150
+     + (EXTRACT(EPOCH FROM (GREATEST(pa.LastHistoryDate, pa.LastCommentDate, pa.LastVoteDate) - pa.CreationDate)) / 3600.0) * 2
+    ) AS EngagementScore
+  FROM PostActivity pa
+  JOIN Posts p ON p.Id = pa.PostId
+),
+LinkGraph AS (
+  SELECT
+    pl.PostId,
+    COUNT(*) FILTER (WHERE pl.LinkTypeId = 1) AS OutLinks,
+    COUNT(*) FILTER (WHERE pl.LinkTypeId = 3) AS OutDuplicates,
+    COUNT(*) FILTER (WHERE pl2.PostId IS NOT NULL) AS ReciprocalLinks
+  FROM PostLinks pl
+  LEFT JOIN PostLinks pl2 ON pl2.PostId = pl.RelatedPostId AND pl2.RelatedPostId = pl.PostId
+  GROUP BY pl.PostId
+),
+TrendingTags AS (
+  SELECT
+    ts.Tag,
+    ts.QuestionCount,
+    ts.AvgQuestionScore,
+    ts.AvgAnswerCount,
+    ts.AcceptedCount,
+    ts.MaxViews,
+    SUM(1.0 / (1 + DATE_PART('day', CAST('2024-10-01 12:34:56' AS TIMESTAMP) - q.CreationDate))) OVER (PARTITION BY ts.Tag) AS RecencyFactor,
+    (ts.QuestionCount * 1.0) * LOG(1 + ts.MaxViews) * (1 + SUM(1.0 / (1 + DATE_PART('day', CAST('2024-10-01 12:34:56' AS TIMESTAMP) - q.CreationDate))) OVER (PARTITION BY ts.Tag)) AS TrendingScore
+  FROM TagStats ts
+  JOIN QuestionTags qt ON qt.Tag = ts.Tag
+  JOIN Posts q ON q.Id = qt.PostId
+  GROUP BY ts.Tag, ts.QuestionCount, ts.AvgQuestionScore, ts.AvgAnswerCount, ts.AcceptedCount, ts.MaxViews
+),
+TopExperts AS (
+  SELECT DISTINCT ON (t.Tag)
+    t.Tag,
+    u.Id AS UserId,
+    u.DisplayName,
+    SUM(a.Score) FILTER (WHERE a.PostTypeId = 2) AS AnswerScoreSum,
+    COUNT(a.Id) FILTER (WHERE a.PostTypeId = 2) AS AnswerCount,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    (COALESCE(SUM(a.Score) FILTER (WHERE a.PostTypeId = 2),0) * 1.0) + (COALESCE(us.GoldBadges,0) * 50) + (COALESCE(us.SilverBadges,0) * 10) AS ExpertiseScore
+  FROM QuestionTags t
+  JOIN Posts q ON q.Id = t.PostId
+  JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+  JOIN Users u ON u.Id = a.OwnerUserId
+  JOIN UserSummary us ON us.Id = u.Id
+  GROUP BY t.Tag, u.Id, u.DisplayName, us.GoldBadges, us.SilverBadges, us.BronzeBadges
+  ORDER BY t.Tag, ExpertiseScore DESC
+),
+CandidateSet AS (
+  SELECT
+    hp.PostId,
+    hp.Title,
+    hp.OwnerUserId,
+    hp.CreationDate,
+    hp.EngagementScore,
+    lg.OutLinks,
+    lg.OutDuplicates,
+    lg.ReciprocalLinks,
+    array_agg(DISTINCT qt.Tag) FILTER (WHERE qt.Tag IS NOT NULL) AS Tags,
+    (SELECT tt.TrendingScore FROM TrendingTags tt WHERE tt.Tag = (array_agg(DISTINCT qt.Tag) FILTER (WHERE qt.Tag IS NOT NULL))[1] LIMIT 1) AS PrimaryTagTrending,
+    (SELECT te.UserId FROM TopExperts te WHERE te.Tag = (array_agg(DISTINCT qt.Tag) FILTER (WHERE qt.Tag IS NOT NULL))[1] LIMIT 1) AS TopExpertUserId
+  FROM HeavyPosts hp
+  LEFT JOIN LinkGraph lg ON lg.PostId = hp.PostId
+  LEFT JOIN QuestionTags qt ON qt.PostId = hp.PostId
+  GROUP BY hp.PostId, hp.Title, hp.OwnerUserId, hp.CreationDate, hp.EngagementScore, lg.OutLinks, lg.OutDuplicates, lg.ReciprocalLinks
+),
+ScoredCandidates AS (
+  SELECT
+    c.*,
+    coalesce(c.EngagementScore,0) * 1.0
+      + coalesce(c.OutLinks,0) * 200
+      - coalesce(c.OutDuplicates,0) * 500
+      + coalesce(c.ReciprocalLinks,0) * 300
+      + coalesce(c.PrimaryTagTrending,0) * 1000
+      + CASE WHEN c.OwnerUserId = c.TopExpertUserId THEN 2000 ELSE 0 END
+      AS FinalScore
+  FROM CandidateSet c
+)
+SELECT
+  sc.PostId,
+  sc.Title,
+  sc.OwnerUserId,
+  sc.Tags,
+  sc.EngagementScore,
+  sc.OutLinks,
+  sc.OutDuplicates,
+  sc.ReciprocalLinks,
+  sc.PrimaryTagTrending,
+  sc.TopExpertUserId,
+  sc.FinalScore
+FROM ScoredCandidates sc
+ORDER BY sc.FinalScore DESC
+LIMIT 100;

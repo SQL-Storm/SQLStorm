@@ -1,0 +1,37 @@
+SELECT 
+    U.Id AS UserId, 
+    U.DisplayName, 
+    U.Reputation, 
+    COUNT(DISTINCT P.Id) AS TotalPosts,
+    COUNT(DISTINCT C.Id) AS TotalComments,
+    SUM(CASE WHEN VT.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+    SUM(CASE WHEN VT.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes,
+    SUM(CASE WHEN VT.VoteTypeId = 5 THEN 1 ELSE 0 END) AS TotalFavorites,
+    B.Name AS MostCommonBadge,
+    PH.Locations AS MostFrequentEditLocation
+FROM 
+    Users U
+LEFT JOIN 
+    Posts P ON U.Id = P.OwnerUserId
+LEFT JOIN 
+    Comments C ON U.Id = C.UserId
+LEFT JOIN 
+    Votes VT ON U.Id = VT.UserId AND VT.VoteTypeId IN (2, 3, 5)
+LEFT JOIN 
+    (SELECT UserId, Name, COUNT(*) AS BadgeCount 
+     FROM Badges 
+     GROUP BY UserId, Name) B ON U.Id = B.UserId
+LEFT JOIN 
+    (SELECT UserId, array_agg(PostId) AS Locations 
+     FROM (
+           SELECT UserId, PostId
+           FROM PostHistory
+           WHERE PostHistoryTypeId IN (4, 5, 6)
+           GROUP BY UserId, PostId
+          ) Subquery
+     GROUP BY UserId) PH ON U.Id = PH.UserId
+GROUP BY 
+    U.Id, U.DisplayName, U.Reputation, B.Name, PH.Locations
+ORDER BY 
+    U.Reputation DESC, TotalPosts DESC, TotalComments DESC
+LIMIT 100;

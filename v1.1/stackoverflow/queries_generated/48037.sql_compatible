@@ -1,0 +1,94 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(CASE WHEN pt.Name = 'Question' THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN pt.Name = 'Answer' THEN 1 ELSE 0 END) AS AnswerCount,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        (SELECT COUNT(DISTINCT v.Id) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 2) AS UpVoteCount,
+        (SELECT COUNT(DISTINCT v.Id) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 3) AS DownVoteCount,
+        (SELECT COUNT(DISTINCT v.Id) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 5) AS FavoriteCount
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    WHERE
+        u.Id > 0
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation
+    HAVING
+        COUNT(DISTINCT p.Id) > 100
+),
+PostEngagement AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        pt.Name AS PostType,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS TotalComments,
+        (SELECT SUM(c.Score) FROM Comments c WHERE c.PostId = p.Id) AS TotalCommentScore,
+        (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id OR pl.RelatedPostId = p.Id) AS LinkCount,
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id) AS HistoryCount,
+        p.CreationDate,
+        p.LastActivityDate
+    FROM
+        Posts p
+    JOIN
+        PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE
+        p.PostTypeId IN (1, 2)
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.PostCount,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.CommentCount,
+    ua.BadgeCount,
+    ua.UpVoteCount,
+    ua.DownVoteCount,
+    ua.FavoriteCount,
+    AVG(pe.Score) AS AvgPostScore,
+    SUM(pe.ViewCount) AS TotalViewCount,
+    AVG(pe.AnswerCount) AS AvgAnswerCount,
+    AVG(pe.CommentCount) AS AvgCommentCount,
+    AVG(pe.FavoriteCount) AS AvgFavoriteCount,
+    MAX(ua.LastPostDate) AS LastActivityTimestamp
+FROM
+    UserActivity ua
+JOIN
+    PostEngagement pe ON ua.UserId = pe.OwnerUserId
+GROUP BY
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.PostCount,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.CommentCount,
+    ua.BadgeCount,
+    ua.UpVoteCount,
+    ua.DownVoteCount,
+    ua.FavoriteCount
+ORDER BY
+    ua.Reputation DESC,
+    TotalViewCount DESC,
+    ua.UpVoteCount DESC
+LIMIT 1000;

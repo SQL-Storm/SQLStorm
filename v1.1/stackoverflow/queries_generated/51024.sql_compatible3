@@ -1,0 +1,84 @@
+WITH TopUsers AS (
+    SELECT u.Id, u.Reputation, u.Location, u.DisplayName,
+           COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+           COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId IN (1, 2)
+    LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 2
+    WHERE u.Reputation > 1000
+      AND u.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '5' YEAR)
+    GROUP BY u.Id, u.Reputation, u.Location, u.DisplayName
+    HAVING COUNT(DISTINCT p.Id) > 10
+),
+UserTags AS (
+    SELECT tu.Id AS UserId,
+           t.tag AS TagName,
+           COUNT(*) AS TagUsageCount
+    FROM TopUsers tu
+    JOIN Posts p ON p.OwnerUserId = tu.Id AND p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    CROSS JOIN (
+        -- split tags like: <tag1><tag2> into rows tag1, tag2
+        SELECT regexp_split AS tag
+        FROM (
+            SELECT regexp_split_to_table(
+                     SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)),
+                     '><'
+                   ) AS regexp_split
+        ) x
+    ) t
+    GROUP BY tu.Id, t.tag
+),
+HighImpactPosts AS (
+    SELECT p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate,
+           tu.Reputation AS OwnerReputation, tu.Location, p.OwnerUserId,
+           ARRAY_AGG(DISTINCT ut.TagName) AS PostTags
+    FROM Posts p
+    JOIN TopUsers tu ON p.OwnerUserId = tu.Id
+    LEFT JOIN UserTags ut ON ut.UserId = tu.Id
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id AND pl.LinkTypeId = 1
+    WHERE p.PostTypeId = 1
+      AND p.Score > 50
+      AND p.ViewCount > 10000
+      AND p.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '2' YEAR)
+      AND (pl.RelatedPostId IS NULL OR pl.RelatedPostId <> p.AcceptedAnswerId)
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate, tu.Reputation, tu.Location, p.OwnerUserId
+    HAVING COUNT(DISTINCT pl.RelatedPostId) > 5
+),
+ActivityPatterns AS (
+    SELECT h.PostId,
+           COUNT(CASE WHEN h.PostHistoryTypeId IN (4,5,6) THEN 1 END) AS EditCount,
+           COUNT(CASE WHEN h.PostHistoryTypeId = 10 THEN 1 END) AS CloseCount,
+           AVG(EXTRACT(EPOCH FROM (h.CreationDate - h.prev_creation)) / 3600.0) AS AvgHoursBetweenEdits
+    FROM (
+        SELECT h.*,
+               LAG(h.CreationDate) OVER (PARTITION BY h.PostId ORDER BY h.CreationDate) AS prev_creation
+        FROM PostHistory h
+    ) h
+    JOIN HighImpactPosts hip ON h.PostId = hip.Id
+    WHERE h.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '1' YEAR)
+    GROUP BY h.PostId
+)
+SELECT 
+    hip.Id AS PostId,
+    hip.Title,
+    hip.Score,
+    hip.ViewCount,
+    hip.CreationDate,
+    hip.OwnerReputation,
+    hip.Location,
+    ap.EditCount,
+    ap.CloseCount,
+    ap.AvgHoursBetweenEdits,
+    COALESCE(CARDINALITY(hip.PostTags), 0) AS TagCount,
+    tu.QuestionCount,
+    tu.AnswerCount,
+    tu.TotalUpVotes,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = hip.OwnerUserId AND b.Class = 1) AS GoldBadges
+FROM HighImpactPosts hip
+JOIN TopUsers tu ON tu.Id = hip.OwnerUserId
+LEFT JOIN ActivityPatterns ap ON ap.PostId = hip.Id
+WHERE COALESCE(CARDINALITY(hip.PostTags), 0) > 3
+  AND ap.EditCount > 2
+ORDER BY hip.ViewCount DESC, hip.Score DESC
+LIMIT 100;

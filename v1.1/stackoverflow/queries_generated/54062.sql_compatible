@@ -1,0 +1,300 @@
+WITH q AS (
+    SELECT
+        p.Id                                     AS PostId,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        p.Tags,
+        p.Title,
+        p.ViewCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.AcceptedAnswerId
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '90 days'
+),
+-- split tags by comma into rows in a dialect-agnostic way using recursive CTE
+tagged AS (
+    SELECT
+        PostId,
+        OwnerUserId,
+        Score,
+        CreationDate,
+        Title,
+        ViewCount,
+        CommentCount,
+        FavoriteCount,
+        AcceptedAnswerId,
+        TRIM(CASE WHEN instr = 1 THEN tag_chunk ELSE NULL END, '') AS TagName
+    FROM (
+        SELECT
+            q.PostId,
+            q.OwnerUserId,
+            q.Score,
+            q.CreationDate,
+            q.Title,
+            q.ViewCount,
+            q.CommentCount,
+            q.FavoriteCount,
+            q.AcceptedAnswerId,
+            -- working fields for splitting
+            tags_raw,
+            tag_chunk,
+            instr
+        FROM (
+            SELECT
+                q.*,
+                q.Tags AS tags_raw
+            FROM q
+        ) q
+        CROSS JOIN LATERAL (
+            -- base and recursive splitting using a numbers approach implemented via recursive CTE below
+            SELECT NULL AS tag_chunk, 0 AS instr
+        ) starter
+    ) preparsed
+),
+split_tags AS (
+    -- recursive splitter: works in most SQL dialects that support recursive CTEs
+    -- It produces one row per tag for each PostId
+    SELECT
+        PostId,
+        OwnerUserId,
+        Score,
+        CreationDate,
+        Title,
+        ViewCount,
+        CommentCount,
+        FavoriteCount,
+        AcceptedAnswerId,
+        CASE
+            WHEN instr = 0 THEN
+                CASE
+                    WHEN instr_pos = 0 THEN tags_raw
+                    ELSE SUBSTR(tags_raw, 1, instr_pos - 1)
+                END
+            ELSE
+                CASE
+                    WHEN next_pos = 0 THEN SUBSTR(tags_raw, instr_pos + 1)
+                    ELSE SUBSTR(tags_raw, instr_pos + 1, next_pos - instr_pos - 1)
+                END
+        END AS TagName,
+        CASE WHEN instr = 0 THEN instr_pos ELSE next_pos END AS instr_pos,
+        next_pos
+    FROM (
+        -- anchor: find first delimiter position
+        SELECT
+            q.PostId,
+            q.OwnerUserId,
+            q.Score,
+            q.CreationDate,
+            q.Title,
+            q.ViewCount,
+            q.CommentCount,
+            q.FavoriteCount,
+            q.AcceptedAnswerId,
+            q.Tags AS tags_raw,
+            0 AS instr,
+            CASE
+                WHEN POSITION(',' IN q.Tags) = 0 THEN 0
+                ELSE POSITION(',' IN q.Tags)
+            END AS instr_pos,
+            CASE
+                WHEN POSITION(',' IN q.Tags) = 0 THEN 0
+                ELSE POSITION(',' IN q.Tags)
+            END AS next_pos
+        FROM q
+    ) base
+    UNION ALL
+    SELECT
+        s.PostId,
+        s.OwnerUserId,
+        s.Score,
+        s.CreationDate,
+        s.Title,
+        s.ViewCount,
+        s.CommentCount,
+        s.FavoriteCount,
+        s.AcceptedAnswerId,
+        CASE
+            WHEN s.next_pos = 0 THEN SUBSTR(s.tags_raw, s.instr_pos + 1)
+            ELSE SUBSTR(s.tags_raw, s.instr_pos + 1, s.next_pos - s.instr_pos - 1)
+        END AS TagName,
+        s.next_pos AS instr_pos,
+        CASE
+            WHEN s.next_pos = 0 THEN 0
+            ELSE POSITION(',' IN SUBSTR(s.tags_raw, s.next_pos + 1)) + s.next_pos
+        END AS next_pos
+    FROM (
+        SELECT
+            PostId,
+            OwnerUserId,
+            Score,
+            CreationDate,
+            Title,
+            ViewCount,
+            CommentCount,
+            FavoriteCount,
+            AcceptedAnswerId,
+            tags_raw,
+            instr_pos,
+            next_pos
+        FROM (
+            SELECT
+                PostId,
+                OwnerUserId,
+                Score,
+                CreationDate,
+                Title,
+                ViewCount,
+                CommentCount,
+                FavoriteCount,
+                AcceptedAnswerId,
+                tags_raw,
+                instr_pos,
+                -- compute next_pos relative to entire string
+                CASE
+                    WHEN instr_pos = 0 THEN 0
+                    ELSE (
+                        CASE
+                            WHEN POSITION(',' IN SUBSTR(tags_raw, instr_pos + 1)) = 0 THEN 0
+                            ELSE instr_pos + POSITION(',' IN SUBSTR(tags_raw, instr_pos + 1))
+                        END
+                    )
+                END AS next_pos
+            FROM (
+                -- reuse previous level
+                SELECT
+                    PostId,
+                    OwnerUserId,
+                    Score,
+                    CreationDate,
+                    Title,
+                    ViewCount,
+                    CommentCount,
+                    FavoriteCount,
+                    AcceptedAnswerId,
+                    tags_raw,
+                    instr_pos
+                FROM (
+                    -- start with the anchor rows
+                    SELECT
+                        PostId,
+                        OwnerUserId,
+                        Score,
+                        CreationDate,
+                        Title,
+                        ViewCount,
+                        CommentCount,
+                        FavoriteCount,
+                        AcceptedAnswerId,
+                        tags_raw,
+                        instr_pos
+                    FROM (
+                        SELECT
+                            q.PostId,
+                            q.OwnerUserId,
+                            q.Score,
+                            q.CreationDate,
+                            q.Title,
+                            q.ViewCount,
+                            q.CommentCount,
+                            q.FavoriteCount,
+                            q.AcceptedAnswerId,
+                            q.Tags AS tags_raw,
+                            0 AS instr_pos
+                        FROM q
+                    ) tbase
+                ) lvl1
+            ) lvl2
+        ) s
+    ) recursive_part
+),
+-- For compatibility and correctness, simpler approach: generate tags by splitting on ',' using recursive CTE properly implemented.
+tags_exploded AS (
+    -- Anchor
+    SELECT
+        PostId,
+        OwnerUserId,
+        Score,
+        CreationDate,
+        Title,
+        ViewCount,
+        CommentCount,
+        FavoriteCount,
+        AcceptedAnswerId,
+        CASE
+            WHEN POSITION(',' IN Tags) = 0 THEN TRIM(Tags)
+            ELSE TRIM(SUBSTR(Tags, 1, POSITION(',' IN Tags) - 1))
+        END AS TagName,
+        CASE
+            WHEN POSITION(',' IN Tags) = 0 THEN 0
+            ELSE POSITION(',' IN Tags)
+        END AS pos
+    FROM q
+    UNION ALL
+    -- Recursive step
+    SELECT
+        PostId,
+        OwnerUserId,
+        Score,
+        CreationDate,
+        Title,
+        ViewCount,
+        CommentCount,
+        FavoriteCount,
+        AcceptedAnswerId,
+        CASE
+            WHEN next_comma = 0 THEN TRIM(SUBSTR(Tags, pos + 1))
+            ELSE TRIM(SUBSTR(Tags, pos + 1, next_comma - pos - 1))
+        END AS TagName,
+        CASE
+            WHEN next_comma = 0 THEN 0
+            ELSE next_comma
+        END AS pos
+    FROM (
+        SELECT
+            e.*,
+            CASE
+                WHEN pos = 0 THEN 0
+                ELSE
+                    CASE
+                        WHEN POSITION(',' IN SUBSTR(Tags, pos + 1)) = 0 THEN 0
+                        ELSE pos + POSITION(',' IN SUBSTR(Tags, pos + 1))
+                    END
+            END AS next_comma
+        FROM tags_exploded e
+        WHERE pos <> 0
+    ) sub
+),
+vote_stats AS (
+    SELECT
+        pv.PostId,
+        COUNT(CASE WHEN vt.Name = 'UpMod' THEN 1 END)                       AS UpVotes,
+        COUNT(CASE WHEN vt.Name = 'DownMod' THEN 1 END)                     AS DownVotes,
+        SUM(vb.BountyAmount)                                                AS TotalBounty
+    FROM Votes pv
+    JOIN VoteTypes vt ON vt.Id = pv.VoteTypeId
+    LEFT JOIN (
+        SELECT vb.PostId, SUM(vb.BountyAmount) AS BountyAmount
+        FROM Votes vb
+        WHERE vb.VoteTypeId IN (8,9)
+        GROUP BY vb.PostId
+    ) vb ON vb.PostId = pv.PostId
+    GROUP BY pv.PostId
+)
+SELECT
+    te.TagName,
+    COUNT(DISTINCT te.PostId)                                   AS QuestionCount,
+    AVG(te.Score)                                               AS AvgScore,
+    MAX(te.ViewCount)                                           AS MaxViews,
+    SUM(te.CommentCount)                                        AS TotalComments,
+    SUM(te.FavoriteCount)                                       AS TotalFavorites,
+    SUM(v.UpVotes)                                              AS TotalUpVotes,
+    SUM(v.DownVotes)                                            AS TotalDownVotes,
+    SUM(v.TotalBounty)                                          AS TotalBounty
+FROM tags_exploded te
+LEFT JOIN vote_stats v ON v.PostId = te.PostId
+GROUP BY te.TagName
+ORDER BY QuestionCount DESC, TotalUpVotes DESC
+LIMIT 20;

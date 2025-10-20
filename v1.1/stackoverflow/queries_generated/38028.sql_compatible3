@@ -1,0 +1,206 @@
+with recent_users as (
+  select u.id as user_id, u.reputation, u.creationdate
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+tagged_questions as (
+  select p.id as question_id,
+         p.owneruserid as owner_id,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         p.answercount,
+         p.tags,
+         -- rewrite string_to_array(substring(...)) to standard functions where available
+         regexp_split_to_array(substring(p.tags from 2 for char_length(p.tags)-2), '><') as tag_array
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+),
+flat_tags as (
+  select tq.question_id,
+         tq.owner_id,
+         tq.creationdate,
+         tq.score,
+         tq.viewcount,
+         tq.answercount,
+         lower(trim(t.tag)) as tag
+  from tagged_questions tq,
+       lateral unnest(tq.tag_array) as t(tag)
+),
+top_tags as (
+  select tag,
+         count(*) as q_count,
+         percentile_cont(0.5) within group (order by score) as median_score
+  from flat_tags
+  group by tag
+  having count(*) >= 50
+),
+question_engagement as (
+  select ft.question_id,
+         ft.tag,
+         ft.owner_id,
+         tq.viewcount,
+         tq.score,
+         tq.answercount,
+         coalesce(sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end), 0) as net_votes,
+         count(distinct c.id) as comments,
+         count(distinct a.id) as answers,
+         min(tq.creationdate) as q_creation
+  from flat_tags ft
+  join tagged_questions tq on tq.question_id = ft.question_id
+  left join votes v on v.postid = ft.question_id and v.creationdate >= tq.creationdate
+  left join comments c on c.postid = ft.question_id
+  left join posts a on a.parentid = ft.question_id and a.posttypeid = 2
+  group by ft.question_id, ft.tag, ft.owner_id, tq.viewcount, tq.score, tq.answercount, tq.creationdate
+),
+user_activity as (
+  select u.id as user_id,
+         u.reputation,
+         count(distinct q.id) filter (where q.posttypeid = 1) as questions_posted,
+         count(distinct a.id) filter (where a.posttypeid = 2) as answers_posted,
+         sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as total_net_votes,
+         coalesce(sum(case when b.class = 1 then 1 else 0 end), 0) as gold_badges,
+         coalesce(sum(case when b.class = 2 then 1 else 0 end), 0) as silver_badges,
+         coalesce(sum(case when b.class = 3 then 1 else 0 end), 0) as bronze_badges
+  from users u
+  left join posts q on q.owneruserid = u.id and q.posttypeid = 1
+  left join posts a on a.owneruserid = u.id and a.posttypeid = 2
+  left join votes v on v.userid = u.id
+  left join badges b on b.userid = u.id
+  group by u.id, u.reputation
+),
+duplicate_graph as (
+  select pl.postid as dup_post_id,
+         pl.relatedpostid as canonical_post_id
+  from postlinks pl
+  where pl.linktypeid = 3
+),
+canonical_agg as (
+  select dg.canonical_post_id,
+         count(*) as dup_count,
+         count(distinct dg.dup_post_id) filter (where p.score < 0) as dup_with_negscore,
+         max(p.viewcount) as max_dup_views
+  from duplicate_graph dg
+  left join posts p on p.id = dg.dup_post_id
+  group by dg.canonical_post_id
+),
+hot_history as (
+  select ph.postid,
+         min(case when ph.posthistorytypeid = 52 then ph.creationdate end) as first_hot_date,
+         max(case when ph.posthistorytypeid = 53 then ph.creationdate end) as last_hot_date,
+         count(*) filter (where ph.posthistorytypeid = 52) as hot_entries
+  from posthistory ph
+  where ph.posthistorytypeid in (52, 53)
+  group by ph.postid
+),
+ranked_questions as (
+  select qe.question_id,
+         qe.tag,
+         qe.owner_id,
+         qe.viewcount,
+         qe.score,
+         qe.answercount,
+         qe.net_votes,
+         qe.comments,
+         qe.answers,
+         hh.first_hot_date,
+         hh.hot_entries,
+         ca.dup_count,
+         row_number() over (
+           partition by qe.tag
+           order by
+             coalesce(hh.hot_entries, 0) desc,
+             qe.viewcount desc,
+             qe.score desc,
+             qe.net_votes desc,
+             qe.answers desc
+         ) as tag_rank
+  from question_engagement qe
+  left join hot_history hh on hh.postid = qe.question_id
+  left join canonical_agg ca on ca.canonical_post_id = qe.question_id
+),
+tag_quality as (
+  select rt.tag,
+         tt.q_count,
+         tt.median_score,
+         avg(rq.viewcount) as avg_views,
+         stddev_pop(rq.viewcount) as sd_views,
+         percentile_cont(0.9) within group (order by rq.viewcount) as p90_views,
+         avg(rq.score) as avg_score,
+         avg(coalesce(rq.dup_count, 0)) as avg_dup_inbound,
+         sum(case when rq.first_hot_date is not null then 1 else 0 end) as hot_count
+  from top_tags tt
+  join ranked_questions rq on rq.tag = tt.tag
+  join (select distinct tag from flat_tags) rt on rt.tag = tt.tag
+  group by rt.tag, tt.q_count, tt.median_score
+),
+user_tag_perf as (
+  select rq.tag,
+         rq.owner_id,
+         count(*) as q_in_tag,
+         avg(rq.viewcount) as avg_views_in_tag,
+         avg(rq.score) as avg_score_in_tag,
+         sum(case when rq.first_hot_date is not null then 1 else 0 end) as hot_q_in_tag
+  from ranked_questions rq
+  group by rq.tag, rq.owner_id
+),
+top_users_per_tag as (
+  select ut.tag,
+         ut.owner_id,
+         ut.q_in_tag,
+         ut.avg_views_in_tag,
+         ut.avg_score_in_tag,
+         ut.hot_q_in_tag,
+         row_number() over (
+           partition by ut.tag
+           order by ut.hot_q_in_tag desc, ut.avg_views_in_tag desc, ut.avg_score_in_tag desc, ut.q_in_tag desc
+         ) as rnk
+  from user_tag_perf ut
+),
+final as (
+  select
+    tq.tag,
+    tq.q_count,
+    tq.median_score,
+    tq.avg_views,
+    tq.sd_views,
+    tq.p90_views,
+    tq.avg_score,
+    tq.avg_dup_inbound,
+    tq.hot_count,
+    ru.user_id as recent_user_id,
+    ua.reputation as recent_user_reputation,
+    tu.owner_id as top_user_id_in_tag,
+    ua2.reputation as top_user_reputation_in_tag,
+    tu.hot_q_in_tag,
+    tu.avg_views_in_tag,
+    tu.avg_score_in_tag,
+    rq.question_id as exemplar_question_id,
+    rq.viewcount as exemplar_views,
+    rq.score as exemplar_score,
+    rq.net_votes as exemplar_net_votes,
+    rq.answercount as exemplar_answercount,
+    rq.tag_rank as exemplar_tag_rank
+  from tag_quality tq
+  left join lateral (
+      select ru.user_id, ru.reputation
+      from recent_users ru
+      order by ru.reputation desc
+      limit 1
+  ) ru on true
+  left join top_users_per_tag tu on tu.tag = tq.tag and tu.rnk = 1
+  left join user_activity ua on ua.user_id = ru.user_id
+  left join user_activity ua2 on ua2.user_id = tu.owner_id
+  left join lateral (
+      select rq.*
+      from ranked_questions rq
+      where rq.tag = tq.tag
+      order by rq.tag_rank
+      limit 1
+  ) rq on true
+)
+select *
+from final
+order by hot_count desc, avg_views desc, q_count desc
+limit 200;

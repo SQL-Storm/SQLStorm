@@ -1,0 +1,131 @@
+WITH RecentQuestions AS (
+    SELECT
+        p.Id                   AS question_id,
+        p.OwnerUserId          AS owner_user_id,
+        p.Title,
+        p.CreationDate,
+        string_to_array(
+            substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2),
+            '><'
+        )                      AS tag_list
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+),
+AnswerStats AS (
+    SELECT
+        q.question_id,
+        COUNT(a.Id) FILTER (WHERE a.Score >= 0) AS total_answers,
+        AVG(a.Score)                       AS avg_answer_score,
+        MAX(a.Score)                       AS max_answer_score,
+        SUM(a.ViewCount)                   AS sum_answer_views
+    FROM RecentQuestions q
+    JOIN Posts a
+      ON a.ParentId = q.question_id
+     AND a.PostTypeId = 2
+    GROUP BY q.question_id
+),
+TagStats AS (
+    SELECT
+        t.tag        AS tag_name,
+        COUNT(*)     AS question_count,
+        AVG(st.avg_answer_score) AS avg_score_by_tag
+    FROM RecentQuestions q
+    CROSS JOIN LATERAL unnest(q.tag_list) AS t(tag)
+    JOIN AnswerStats st
+      ON st.question_id = q.question_id
+    GROUP BY t.tag
+),
+CloseVotes AS (
+    SELECT
+        ph.PostId,
+        CAST(ph.Comment AS integer) AS reason_id,
+        COUNT(*)          AS close_count
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId, CAST(ph.Comment AS integer)
+),
+TopQuestions AS (
+    SELECT
+        q.question_id,
+        q.owner_user_id,
+        st.avg_answer_score,
+        COALESCE(cv.close_count, 0) AS close_votes
+    FROM RecentQuestions q
+    JOIN AnswerStats st
+      ON st.question_id = q.question_id
+    LEFT JOIN CloseVotes cv
+      ON cv.PostId = q.question_id
+    ORDER BY st.avg_answer_score DESC
+    LIMIT 10
+),
+UserEngagement AS (
+    SELECT
+        u.Id                     AS user_id,
+        u.DisplayName            AS display_name,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS questions_posted,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS answers_posted,
+        COUNT(c.Id)                                         AS comments_made,
+        SUM(v.BountyAmount) FILTER (WHERE v.VoteTypeId = 8)  AS bounty_awarded,
+        RANK() OVER (ORDER BY COUNT(c.Id) DESC)              AS comment_rank
+    FROM Users u
+    LEFT JOIN Posts p
+      ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c
+      ON c.UserId = u.Id
+    LEFT JOIN Votes v
+      ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+BadgeTrend AS (
+    SELECT
+        b.Name                        AS badge_name,
+        b.Class                       AS badge_class,
+        date_trunc('month', b.Date)   AS year_month,
+        COUNT(*)                      AS badges_awarded,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)
+            OVER (PARTITION BY b.Name ORDER BY date_trunc('month', b.Date))
+                                     AS cumulative_gold,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END)
+            OVER (PARTITION BY b.Name ORDER BY date_trunc('month', b.Date))
+                                     AS cumulative_silver,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END)
+            OVER (PARTITION BY b.Name ORDER BY date_trunc('month', b.Date))
+                                     AS cumulative_bronze
+    FROM Badges b
+    WHERE b.Date > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+      AND b.TagBased = TRUE
+    GROUP BY b.Name, b.Class, date_trunc('month', b.Date)
+)
+SELECT
+    ts.tag_name,
+    ts.question_count,
+    ts.avg_score_by_tag,
+    tq.avg_answer_score,
+    tq.close_votes,
+    ue.display_name,
+    ue.questions_posted,
+    ue.answers_posted,
+    ue.comments_made,
+    ue.bounty_awarded,
+    ue.comment_rank,
+    bt.year_month,
+    bt.badges_awarded,
+    bt.cumulative_gold,
+    bt.cumulative_silver,
+    bt.cumulative_bronze
+FROM TagStats ts
+JOIN TopQuestions tq
+  ON ts.avg_score_by_tag = (
+       SELECT MAX(avg_score_by_tag)
+       FROM TagStats
+     )
+JOIN UserEngagement ue
+  ON ue.user_id = tq.owner_user_id
+JOIN BadgeTrend bt
+  ON bt.badge_name = ts.tag_name
+ORDER BY
+    ts.avg_score_by_tag DESC,
+    ue.comments_made DESC,
+    bt.year_month DESC
+LIMIT 20;

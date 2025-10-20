@@ -1,0 +1,57 @@
+WITH ActiveUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation, u.CreationDate,
+           COUNT(DISTINCT p.Id) AS PostCount,
+           COUNT(DISTINCT c.Id) AS CommentCount,
+           COUNT(DISTINCT v.Id) AS VoteCount,
+           COUNT(DISTINCT b.Id) AS BadgeCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId IN (2, 8)
+    LEFT JOIN Badges b ON u.Id = b.UserId AND b.Class = 1
+    WHERE u.Reputation > 1000
+      AND u.CreationDate >= DATE '2015-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(p.Id) > 10 OR COUNT(c.Id) > 50
+),
+MonthlyActivity AS (
+    SELECT au.Id,
+           DATE_TRUNC('month', p.CreationDate) AS ActivityMonth,
+           AVG(p.Score) OVER (PARTITION BY au.Id, DATE_TRUNC('month', p.CreationDate)) AS AvgPostScore,
+           SUM(p.ViewCount) OVER (PARTITION BY au.Id) AS TotalViews,
+           RANK() OVER (ORDER BY au.Reputation DESC) AS ReputationRank,
+           (SELECT COUNT(*) FROM Badges b WHERE b.UserId = au.Id AND b.Class = 1) AS GoldBadges,
+           (SELECT p2.Title
+            FROM Posts p2
+            WHERE p2.OwnerUserId = au.Id AND p2.PostTypeId = 1
+            ORDER BY p2.CreationDate DESC
+            FETCH FIRST 1 ROW ONLY) AS LatestPostTitle
+    FROM ActiveUsers au
+    INNER JOIN Posts p ON au.Id = p.OwnerUserId
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.CreationDate BETWEEN DATE '2015-01-01' AND DATE '2023-12-31'
+)
+SELECT ma.Id, ma.ActivityMonth, ma.AvgPostScore, ma.TotalViews, ma.ReputationRank,
+       ma.GoldBadges, ma.LatestPostTitle,
+       (
+         SELECT STRING_AGG(t.TagName, ', ' ORDER BY t.Count DESC)
+         FROM (
+           SELECT tt.TagName, tt.Count
+           FROM Tags tt
+           WHERE tt.Id IN (
+             SELECT CAST(tag AS INTEGER)
+             FROM (
+               SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><')) AS tag
+               FROM Posts p
+               WHERE p.OwnerUserId = ma.Id
+             ) subtags
+           )
+           ORDER BY tt.Count DESC
+           FETCH FIRST 5 ROWS ONLY
+         ) t
+       ) AS TopTags
+FROM MonthlyActivity ma
+WHERE ma.GoldBadges >= 3
+GROUP BY ma.Id, ma.ActivityMonth, ma.AvgPostScore, ma.TotalViews, ma.ReputationRank, ma.GoldBadges, ma.LatestPostTitle
+ORDER BY ma.ReputationRank, ma.ActivityMonth DESC, ma.TotalViews DESC
+FETCH FIRST 500 ROWS ONLY;

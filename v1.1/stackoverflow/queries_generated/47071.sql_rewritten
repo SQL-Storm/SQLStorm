@@ -1,0 +1,139 @@
+-- {"query": "47071.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 162874, "output_tokens": 144343} 
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT pt.Id) as question_count,
+        1 as level
+    FROM Tags t
+    INNER JOIN Posts pt ON pt.Tags LIKE '%<' || t.TagName || '>%'
+    WHERE pt.PostTypeId = 1
+        AND t.Count > 1000
+    GROUP BY t.Id, t.TagName
+    
+    UNION ALL
+    
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        COUNT(DISTINCT p2.Id),
+        th.level + 1
+    FROM tag_hierarchy th
+    CROSS JOIN Tags t2
+    INNER JOIN Posts p1 ON p1.Tags LIKE '%<' || th.TagName || '>%'
+    INNER JOIN Posts p2 ON p2.Tags LIKE '%<' || t2.TagName || '>%'
+        AND p2.Id = p1.Id
+    WHERE th.level < 3
+        AND t2.Id != th.Id
+    GROUP BY t2.Id, t2.TagName, th.level
+),
+user_expertise AS (
+    SELECT 
+        u.Id as user_id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as questions_asked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answers_given,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) as avg_answer_score,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score >= 10 THEN p.Id END) as high_score_answers,
+        COUNT(DISTINCT b.Id) as badge_count,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) as gold_badges,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) as median_post_score
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 5000
+        AND u.CreationDate < cast('2024-10-01' as date) - INTERVAL '365 days'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+post_quality_metrics AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CreationDate,
+        COUNT(DISTINCT ph.UserId) as unique_editors,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.Id END) as edit_count,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) as was_closed,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) as was_reopened,
+        COUNT(DISTINCT c.Id) as comment_count,
+        AVG(c.Score) as avg_comment_score,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) as upvotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) as downvotes,
+        COUNT(DISTINCT pl.Id) FILTER (WHERE pl.LinkTypeId = 1) as linked_posts,
+        COUNT(DISTINCT pl2.Id) FILTER (WHERE pl2.LinkTypeId = 3) as duplicate_links,
+        EXTRACT(EPOCH FROM (COALESCE(p.ClosedDate, cast('2024-10-01 12:34:56' as timestamp)) - p.CreationDate))/3600 as hours_until_closed
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN PostLinks pl2 ON pl2.RelatedPostId = p.Id
+    WHERE p.PostTypeId = 1
+        AND p.Score > 0
+        AND p.CreationDate BETWEEN cast('2024-10-01' as date) - INTERVAL '2 years' AND cast('2024-10-01' as date) - INTERVAL '6 months'
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CreationDate, p.ClosedDate
+),
+answer_response_times AS (
+    SELECT 
+        q.Id as question_id,
+        a.Id as answer_id,
+        a.Score as answer_score,
+        a.OwnerUserId as answerer_id,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/60 as minutes_to_first_answer,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.CreationDate) as answer_order,
+        CASE 
+            WHEN a.Id = q.AcceptedAnswerId THEN 1 
+            ELSE 0 
+        END as is_accepted
+    FROM Posts q
+    INNER JOIN Posts a ON a.ParentId = q.Id
+    WHERE q.PostTypeId = 1 
+        AND a.PostTypeId = 2
+        AND q.CreationDate > cast('2024-10-01' as date) - INTERVAL '2 years'
+)
+SELECT 
+    th.TagName,
+    th.question_count,
+    ue.DisplayName as top_expert,
+    ue.Reputation,
+    ue.avg_answer_score,
+    ue.gold_badges,
+    pqm.Title as quality_post,
+    pqm.Score as post_score,
+    pqm.ViewCount,
+    pqm.edit_count,
+    pqm.upvotes,
+    pqm.downvotes,
+    ROUND(pqm.upvotes::numeric / NULLIF(pqm.upvotes + pqm.downvotes, 0) * 100, 2) as upvote_ratio,
+    art.minutes_to_first_answer,
+    art.answer_score as first_answer_score,
+    art.is_accepted,
+    COUNT(*) OVER (PARTITION BY th.TagName) as posts_per_tag,
+    DENSE_RANK() OVER (PARTITION BY th.TagName ORDER BY pqm.Score DESC) as score_rank_in_tag,
+    LAG(pqm.Score, 1) OVER (PARTITION BY th.TagName ORDER BY pqm.CreationDate) as prev_post_score,
+    LEAD(pqm.Score, 1) OVER (PARTITION BY th.TagName ORDER BY pqm.CreationDate) as next_post_score,
+    NTILE(10) OVER (ORDER BY pqm.ViewCount) as view_decile,
+    CUME_DIST() OVER (ORDER BY ue.Reputation) as reputation_percentile
+FROM tag_hierarchy th
+CROSS JOIN LATERAL (
+    SELECT * FROM user_expertise 
+    ORDER BY high_score_answers DESC, avg_answer_score DESC 
+    LIMIT 1
+) ue
+CROSS JOIN LATERAL (
+    SELECT * FROM post_quality_metrics 
+    WHERE edit_count > 2 
+    ORDER BY Score DESC, ViewCount DESC 
+    LIMIT 1
+) pqm
+LEFT JOIN answer_response_times art ON art.question_id = pqm.Id AND art.answer_order = 1
+WHERE th.level = 1
+    AND th.question_count > 100
+ORDER BY 
+    th.question_count DESC,
+    ue.Reputation DESC,
+    pqm.Score DESC
+LIMIT 100;

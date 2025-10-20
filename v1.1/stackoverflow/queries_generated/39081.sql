@@ -1,0 +1,89 @@
+-- {"query": "39081.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1972, "output_tokens": 1365} 
+
+WITH
+-- CTE to expand question tags into one row per tag
+QuestionTags AS (
+    SELECT
+        p.Id AS QuestionId,
+        u.Id AS OwnerId,
+        u.DisplayName AS OwnerName,
+        tag
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tag
+    ) AS tag_list(tag)
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= now() - INTERVAL '1 year'
+),
+-- CTE to gather all answers in the last year with positive score
+RecentAnswers AS (
+    SELECT
+        a.Id         AS AnswerId,
+        a.ParentId   AS QuestionId,
+        a.OwnerUserId,
+        a.CreationDate,
+        a.Score
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+      AND a.CreationDate >= now() - INTERVAL '1 year'
+      AND a.Score > 0
+),
+-- CTE to aggregate badge counts by user and badge class
+UserBadges AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM Badges b
+    WHERE b.Date >= now() - INTERVAL '2 years'
+    GROUP BY b.UserId
+),
+-- CTE to combine questions, answers, and tags, computing per-user, per-tag metrics
+UserTagStats AS (
+    SELECT
+        qa.OwnerId         AS UserId,
+        qa.OwnerName       AS UserName,
+        qt.tag             AS Tag,
+        COUNT(DISTINCT qa.QuestionId)              AS QuestionsAsked,
+        COUNT(DISTINCT ra.AnswerId)                AS AnswersGiven,
+        AVG(ra.Score)                              AS AvgAnswerScore,
+        MIN(ra.CreationDate - qa.CreationDate)     AS MinResponseTime,
+        MAX(ra.CreationDate - qa.CreationDate)     AS MaxResponseTime
+    FROM QuestionTags qt
+    JOIN Posts qa
+      ON qt.QuestionId = qa.Id
+    LEFT JOIN RecentAnswers ra
+      ON qt.QuestionId = ra.QuestionId
+    GROUP BY qa.OwnerUserId, qa.OwnerDisplayName, qt.tag
+),
+-- CTE to rank tags per user by activity
+RankedTagStats AS (
+    SELECT
+        uts.*,
+        ROW_NUMBER() OVER (PARTITION BY uts.UserId ORDER BY uts.AnswersGiven DESC NULLS LAST, uts.QuestionsAsked DESC) AS TagRank
+    FROM UserTagStats uts
+)
+SELECT
+    u.Id                 AS UserId,
+    u.DisplayName        AS UserName,
+    u.Reputation,
+    COALESCE(ub.GoldBadges, 0)   AS GoldBadges,
+    COALESCE(ub.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ub.BronzeBadges, 0) AS BronzeBadges,
+    rts.Tag,
+    rts.QuestionsAsked,
+    rts.AnswersGiven,
+    ROUND(rts.AvgAnswerScore::numeric, 2)        AS AvgAnswerScore,
+    TO_CHAR(rts.MinResponseTime, 'DD "days" HH24:"MI":"SS"') AS FastestResponse,
+    TO_CHAR(rts.MaxResponseTime, 'DD "days" HH24:"MI":"SS"') AS SlowestResponse
+FROM RankedTagStats rts
+JOIN Users u
+  ON rts.UserId = u.Id
+LEFT JOIN UserBadges ub
+  ON rts.UserId = ub.UserId
+WHERE rts.TagRank <= 3
+  AND u.Reputation >= 1000
+ORDER BY u.Reputation DESC, rts.AnswersGiven DESC
+LIMIT 50;

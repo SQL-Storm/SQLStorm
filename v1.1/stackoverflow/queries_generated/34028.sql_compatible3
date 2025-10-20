@@ -1,0 +1,118 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        ARRAY[t.Id] AS Path
+    FROM Tags t
+    WHERE t.Count > 1000
+  UNION ALL
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.Path || t.Id
+    FROM Tags t
+    JOIN PostTags pt ON pt.TagId = t.Id
+    JOIN RecursiveTagHierarchy r ON pt.PostId = r.Id
+    WHERE t.Id <> ALL(r.Path)
+      AND r.Level < 3
+),
+TopUsersWithBadgeCounts AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id) AS TotalBadges,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 10000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+ComplexPostStats AS (
+    SELECT
+        p.OwnerUserId,
+        pt.Name AS PostType,
+        COUNT(p.Id) AS PostCount,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.ViewCount) AS MaxViews,
+        SUM(COALESCE(v.UpVotes,0)) AS TotalUpVotes,
+        SUM(COALESCE(v.DownVotes,0)) AS TotalDownVotes,
+        MAX(ph.CreationDate) AS LastEditDate,
+        STRING_AGG(DISTINCT lh.Name, ', ') AS LinkTypesInvolved
+    FROM Posts p
+    JOIN PostTypes pt ON pt.Id = p.PostTypeId
+    LEFT JOIN (
+        SELECT
+            v.PostId,
+            SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        GROUP BY v.PostId
+    ) v ON v.PostId = p.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id OR pl.RelatedPostId = p.Id
+    LEFT JOIN LinkTypes lh ON lh.Id = pl.LinkTypeId
+    WHERE p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '2 years')
+    GROUP BY p.OwnerUserId, pt.Name
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT ph.Id) AS TotalEdits,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    WHERE u.CreationDate < (CAST('2024-10-01' AS date) - INTERVAL '5 years')
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    bu.TotalBadges, bu.GoldBadges, bu.SilverBadges, bu.BronzeBadges,
+    COALESCE(ps.PostCount, 0) AS TotalPosts,
+    COALESCE(ps.AvgScore, 0) AS AveragePostScore,
+    COALESCE(ps.MaxViews, 0) AS MaxPostViews,
+    COALESCE(ps.TotalUpVotes, 0) AS TotalUpVotes,
+    COALESCE(ps.TotalDownVotes, 0) AS TotalDownVotes,
+    COALESCE(ps.LastEditDate, DATE '1970-01-01') AS LastPostEdit,
+    COALESCE(ps.LinkTypesInvolved, '') AS TypesOfLinks,
+    ua.TotalComments,
+    ua.TotalEdits,
+    ua.LastPostDate,
+    ua.LastCommentDate,
+    ua.LastEditDate,
+    ARRAY_AGG(DISTINCT rth.TagName) FILTER (WHERE rth.Level = 1) AS Level1Tags,
+    ARRAY_AGG(DISTINCT rth.TagName) FILTER (WHERE rth.Level = 2) AS Level2Tags,
+    ARRAY_AGG(DISTINCT rth.TagName) FILTER (WHERE rth.Level = 3) AS Level3Tags
+FROM Users u
+LEFT JOIN TopUsersWithBadgeCounts bu ON bu.Id = u.Id
+LEFT JOIN ComplexPostStats ps ON ps.OwnerUserId = u.Id
+LEFT JOIN UserActivitySummary ua ON ua.Id = u.Id
+LEFT JOIN Posts p2 ON p2.OwnerUserId = u.Id
+LEFT JOIN LATERAL (
+    SELECT DISTINCT t.Id, t.TagName, 1 AS Level
+    FROM Tags t
+    JOIN Posts pst ON pst.Id = p2.Id
+    WHERE pst.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+) rth ON TRUE
+WHERE u.Reputation > 10000
+GROUP BY u.Id, u.DisplayName, u.Reputation, bu.TotalBadges, bu.GoldBadges, bu.SilverBadges, bu.BronzeBadges,
+         ps.PostCount, ps.AvgScore, ps.MaxViews, ps.TotalUpVotes, ps.TotalDownVotes, ps.LastEditDate, ps.LinkTypesInvolved,
+         ua.TotalComments, ua.TotalEdits, ua.LastPostDate, ua.LastCommentDate, ua.LastEditDate
+ORDER BY u.Reputation DESC
+LIMIT 50;

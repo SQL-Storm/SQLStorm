@@ -1,0 +1,198 @@
+WITH TopUsersByReputation AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        EXTRACT(YEAR FROM u.CreationDate) AS JoinYear,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation DESC) AS YearRank
+    FROM Users u
+    WHERE u.Reputation > 1000
+),
+QuestionMetrics AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.OwnerUserId,
+        p.Score AS QuestionScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        COALESCE(p.AcceptedAnswerId, 0) AS AcceptedAnswerId,
+        -- remove angle brackets from tags into a flat string like 'tag1><tag2' -> 'tag1,tag2'
+        -- use standard replace to turn '><' into ',' and trim leading/trailing '<' or '>'
+        TRIM(BOTH '<>' FROM REPLACE(p.Tags, '><', ',')) AS TagsNoBrackets,
+        EXTRACT(EPOCH FROM (p.ClosedDate - p.CreationDate))/3600 AS HoursToClose,
+        p.CreationDate
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+        AND p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '3 years'
+),
+AnswerQuality AS (
+    SELECT 
+        a.ParentId AS QuestionId,
+        a.OwnerUserId AS AnswererUserId,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/60 AS MinutesToAnswer,
+        CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END AS IsAccepted,
+        COUNT(c.Id) AS AnswerComments,
+        AVG(c.Score) AS AvgCommentScore
+    FROM Posts a
+    JOIN Posts q ON a.ParentId = q.Id
+    LEFT JOIN Comments c ON c.PostId = a.Id
+    WHERE a.PostTypeId = 2
+        AND a.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '3 years'
+    GROUP BY a.Id, a.ParentId, a.OwnerUserId, a.Score, a.CreationDate, q.CreationDate, q.AcceptedAnswerId
+),
+UserEngagementScores AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT qm.QuestionId) AS QuestionsAsked,
+        COUNT(DISTINCT aq.AnswerId) AS AnswersGiven,
+        AVG(qm.QuestionScore) AS AvgQuestionScore,
+        AVG(aq.AnswerScore) AS AvgAnswerScore,
+        SUM(aq.IsAccepted) AS AcceptedAnswers,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        AVG(CASE WHEN aq.MinutesToAnswer IS NOT NULL THEN aq.MinutesToAnswer ELSE NULL END) AS AvgResponseTime
+    FROM TopUsersByReputation u
+    LEFT JOIN QuestionMetrics qm ON u.Id = qm.OwnerUserId
+    LEFT JOIN AnswerQuality aq ON u.Id = aq.AnswererUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId IN (2, 3)
+    WHERE u.YearRank <= 100
+    GROUP BY u.Id, u.DisplayName
+),
+-- Split comma-separated TagsNoBrackets into rows in a portable recursive manner.
+NormalizedQuestionTags AS (
+    -- anchor: take everything up to first comma as first tag
+    SELECT
+        qm.QuestionId,
+        qm.OwnerUserId,
+        qm.QuestionScore,
+        qm.ViewCount,
+        qm.AnswerCount,
+        qm.TagsNoBrackets,
+        qm.CreationDate,
+        CASE 
+            WHEN qm.TagsNoBrackets = '' THEN NULL
+            WHEN POSITION(',' IN qm.TagsNoBrackets) = 0 THEN TRIM(qm.TagsNoBrackets)
+            ELSE TRIM(SUBSTRING(qm.TagsNoBrackets FROM 1 FOR POSITION(',' IN qm.TagsNoBrackets)-1))
+        END AS TagName,
+        CASE 
+            WHEN POSITION(',' IN qm.TagsNoBrackets) = 0 THEN ''
+            ELSE SUBSTRING(qm.TagsNoBrackets FROM POSITION(',' IN qm.TagsNoBrackets)+1)
+        END AS rest
+    FROM QuestionMetrics qm
+
+    UNION ALL
+
+    -- recursive: process rest until empty
+    SELECT
+        n.QuestionId,
+        n.OwnerUserId,
+        n.QuestionScore,
+        n.ViewCount,
+        n.AnswerCount,
+        n.TagsNoBrackets,
+        n.CreationDate,
+        CASE 
+            WHEN n.rest = '' THEN NULL
+            WHEN POSITION(',' IN n.rest) = 0 THEN TRIM(n.rest)
+            ELSE TRIM(SUBSTRING(n.rest FROM 1 FOR POSITION(',' IN n.rest)-1))
+        END AS TagName,
+        CASE 
+            WHEN POSITION(',' IN n.rest) = 0 THEN ''
+            ELSE SUBSTRING(n.rest FROM POSITION(',' IN n.rest)+1)
+        END AS rest
+    FROM NormalizedQuestionTags n
+    WHERE n.rest IS NOT NULL AND n.rest <> ''
+),
+-- final projection of tags (filter out nulls)
+NormalizedQuestionTagsFinal AS (
+    SELECT DISTINCT
+        QuestionId,
+        OwnerUserId,
+        QuestionScore,
+        ViewCount,
+        AnswerCount,
+        TagsNoBrackets,
+        CreationDate,
+        TagName
+    FROM NormalizedQuestionTags
+    WHERE TagName IS NOT NULL AND TRIM(TagName) <> ''
+),
+TagPopularity AS (
+    SELECT 
+        nt.TagName AS TagName,
+        COUNT(DISTINCT nt.QuestionId) AS QuestionCount,
+        AVG(nt.QuestionScore) AS AvgScore,
+        AVG(nt.ViewCount) AS AvgViews,
+        AVG(nt.AnswerCount) AS AvgAnswers,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY nt.ViewCount) AS MedianViews
+    FROM NormalizedQuestionTagsFinal nt
+    WHERE nt.TagName IS NOT NULL AND nt.TagName <> ''
+    GROUP BY nt.TagName
+    HAVING COUNT(DISTINCT nt.QuestionId) >= 50
+),
+CrossTagAnalysis AS (
+    SELECT 
+        t1.TagName AS Tag1,
+        t2.TagName AS Tag2,
+        COUNT(*) AS CoOccurrence,
+        AVG(qm.QuestionScore) AS AvgCombinedScore
+    FROM NormalizedQuestionTagsFinal t1
+    JOIN NormalizedQuestionTagsFinal t2 ON t1.QuestionId = t2.QuestionId AND t1.TagName < t2.TagName
+    JOIN QuestionMetrics qm ON qm.QuestionId = t1.QuestionId
+    GROUP BY t1.TagName, t2.TagName
+    HAVING COUNT(*) >= 20
+),
+-- Precompute top tags per user by question count to avoid lateral with window in the final SELECT
+UserTagCounts AS (
+    SELECT
+        ues.UserId,
+        tp.TagName,
+        tp.QuestionCount,
+        ROW_NUMBER() OVER (PARTITION BY ues.UserId ORDER BY tp.QuestionCount DESC) AS TagRank
+    FROM UserEngagementScores ues
+    LEFT JOIN NormalizedQuestionTagsFinal nqt ON ues.UserId = nqt.OwnerUserId
+    LEFT JOIN TagPopularity tp ON nqt.TagName = tp.TagName
+    WHERE tp.TagName IS NOT NULL
+)
+SELECT 
+    ues.DisplayName,
+    ues.UserId,
+    ues.QuestionsAsked,
+    ues.AnswersGiven,
+    ROUND(CAST(ues.AvgQuestionScore AS numeric), 2) AS AvgQuestionScore,
+    ROUND(CAST(ues.AvgAnswerScore AS numeric), 2) AS AvgAnswerScore,
+    ues.AcceptedAnswers,
+    ROUND(CAST((CASE WHEN ues.AnswersGiven = 0 THEN NULL ELSE (CAST(ues.AcceptedAnswers AS double precision)/ues.AnswersGiven*100) END) AS numeric), 2) AS AcceptanceRate,
+    ues.GoldBadges,
+    ues.SilverBadges,
+    ues.BronzeBadges,
+    ROUND(CAST(ues.AvgResponseTime AS numeric), 2) AS AvgResponseTimeMinutes,
+    -- aggregate top 5 tags per user from precomputed ranks
+    STRING_AGG(tp5.TagName, ', ' ORDER BY tp5.QuestionCount DESC) AS TopTags,
+    COALESCE(MAX(cta.CoOccurrence), 0) AS MaxTagCoOccurrence
+FROM UserEngagementScores ues
+LEFT JOIN QuestionMetrics qm ON ues.UserId = qm.OwnerUserId
+LEFT JOIN NormalizedQuestionTagsFinal user_tag ON qm.QuestionId = user_tag.QuestionId
+LEFT JOIN TagPopularity tp ON user_tag.TagName = tp.TagName
+LEFT JOIN (
+    SELECT utc.UserId, utc.TagName, utc.QuestionCount
+    FROM UserTagCounts utc
+    WHERE utc.TagRank <= 5
+) tp5 ON tp5.UserId = ues.UserId
+LEFT JOIN CrossTagAnalysis cta ON (cta.Tag1 = user_tag.TagName OR cta.Tag2 = user_tag.TagName)
+WHERE ues.QuestionsAsked + ues.AnswersGiven > 10
+GROUP BY ues.DisplayName, ues.UserId, ues.QuestionsAsked, ues.AnswersGiven, 
+         ues.AvgQuestionScore, ues.AvgAnswerScore, ues.AcceptedAnswers, 
+         ues.GoldBadges, ues.SilverBadges, ues.BronzeBadges, ues.AvgResponseTime
+ORDER BY (ues.AvgQuestionScore + ues.AvgAnswerScore) DESC, ues.AcceptedAnswers DESC
+LIMIT 500;

@@ -1,0 +1,55 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        COUNT(c.Id) AS CommentCount,
+        u.Reputation AS OwnerReputation,
+        p.PostTypeId,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.CreationDate DESC) AS PostRank
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    WHERE 
+        p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    GROUP BY 
+        p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, u.Reputation, p.PostTypeId
+),
+TopPosts AS (
+    SELECT 
+        rp.* 
+    FROM 
+        RankedPosts rp
+    WHERE 
+        rp.PostRank <= 10
+)
+SELECT 
+    tp.PostId,
+    tp.Title,
+    tp.CreationDate,
+    tp.Score,
+    tp.ViewCount,
+    tp.CommentCount,
+    tp.OwnerReputation,
+    pt.Name AS PostType,
+    COUNT(DISTINCT v.Id) AS VoteCount,
+    ARRAY_AGG(DISTINCT (t.TagName || ': ' || t.Count)) AS TagsSummary
+FROM 
+    TopPosts tp
+LEFT JOIN 
+    PostTypes pt ON tp.PostTypeId = pt.Id
+LEFT JOIN 
+    Votes v ON tp.PostId = v.PostId AND v.VoteTypeId IN (2, 3)
+LEFT JOIN 
+    PostTags ptg ON tp.PostId = ptg.PostId
+LEFT JOIN 
+    Tags t ON ptg.TagId = t.Id
+GROUP BY 
+    tp.PostId, tp.Title, tp.CreationDate, tp.Score, tp.ViewCount, tp.CommentCount, tp.OwnerReputation, pt.Name, tp.PostTypeId
+ORDER BY 
+    tp.Score DESC, tp.CreationDate DESC;

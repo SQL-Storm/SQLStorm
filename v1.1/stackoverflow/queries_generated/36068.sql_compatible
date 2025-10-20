@@ -1,0 +1,57 @@
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.PostTypeId,
+  p.CreationDate,
+  p.ViewCount,
+  p.Score,
+  p.OwnerUserId,
+  p.OwnerDisplayName,
+  p.Tags,
+  p.AnswerCount,
+  p.CommentCount,
+  p.FavoriteCount,
+  pv.TotalUpVotes,
+  pv.TotalDownVotes,
+  pc.TotalCommentsByUsers,
+  phh.RevisionCount,
+  COALESCE(blb.BadgeCount, 0) AS BadgeCount,
+  u.Reputation,
+  u.CreationDate AS UserCreationDate,
+  u.LastAccessDate,
+  u.Location,
+  u.WebsiteUrl,
+  u.ProfileImageUrl
+FROM
+  Posts p
+  LEFT JOIN (
+    SELECT
+      v.PostId,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes
+    FROM Votes v
+    GROUP BY v.PostId
+  ) pv ON p.Id = pv.PostId
+  LEFT JOIN (
+    SELECT c.PostId, COUNT(*) AS TotalCommentsByUsers
+    FROM Comments c
+    GROUP BY c.PostId
+  ) pc ON p.Id = pc.PostId
+  LEFT JOIN (
+    SELECT ph.PostId, COUNT(*) AS RevisionCount
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+  ) phh ON p.Id = phh.PostId
+  LEFT JOIN LATERAL (
+    SELECT b.OwnerUserId, COUNT(*) AS BadgeCount
+    FROM Badges b
+    WHERE b.OwnerUserId = p.OwnerUserId
+    GROUP BY b.OwnerUserId
+  ) blb ON true
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+WHERE
+  p.PostTypeId IN (1, 2)
+  AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+ORDER BY
+  p.CreationDate DESC
+LIMIT 100;

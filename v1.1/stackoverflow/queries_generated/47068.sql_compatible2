@@ -1,0 +1,143 @@
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        AVG(p.Score) AS AvgScore,
+        1 AS Level
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE p.PostTypeId = 1
+        AND t.Count > 1000
+    GROUP BY t.Id, t.TagName, t.Count
+),
+user_expertise AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS AnswerCount,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AvgAnswerScore,
+        COUNT(DISTINCT CASE WHEN p.Id = q.AcceptedAnswerId THEN p.Id END) AS AcceptedAnswers,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS MedianScore,
+        STDDEV_SAMP(p.Score) AS ScoreStdDev,
+        MAX(p.Score) AS MaxScore,
+        MIN(p.CreationDate) AS FirstAnswer,
+        MAX(p.CreationDate) AS LastAnswer,
+        COUNT(DISTINCT CAST(p.CreationDate AS DATE)) AS ActiveDays,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges
+    FROM Users u
+    INNER JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 2
+    INNER JOIN Posts q ON q.Id = p.ParentId AND q.PostTypeId = 1
+    INNER JOIN Tags t ON q.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    LEFT JOIN Badges b ON b.UserId = u.Id AND b.TagBased = TRUE AND b.Name = t.TagName
+    WHERE u.Reputation > 5000
+        AND p.Score > 0
+        AND t.Count > 500
+    GROUP BY u.Id, u.DisplayName, u.Reputation, t.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+question_quality AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN TRUE ELSE FALSE END AS IsClosed,
+        EXTRACT(EPOCH FROM (COALESCE(a.CreationDate, CAST('2024-10-01 12:34:56' AS TIMESTAMP)) - p.CreationDate)) / 3600 AS HoursToFirstAnswer,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS EditCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+        COUNT(DISTINCT pl.Id) FILTER (WHERE pl.LinkTypeId = 1) AS LinkedPosts,
+        COUNT(DISTINCT pl2.Id) FILTER (WHERE pl2.LinkTypeId = 3) AS DuplicateLinks,
+        MAX(CASE WHEN a.Score > 10 THEN 1 ELSE 0 END) AS HasHighScoreAnswer,
+        STRING_AGG(t.TagName, ', ') AS TagList,
+        DENSE_RANK() OVER (PARTITION BY DATE_TRUNC('month', p.CreationDate) ORDER BY p.Score DESC) AS MonthlyRank,
+        CASE 
+            WHEN p.ViewCount > 0 THEN CAST(p.Score AS DOUBLE PRECISION) / p.ViewCount 
+            ELSE 0 
+        END AS ScorePerView,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevQuestionScore
+    FROM Posts p
+    LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN PostLinks pl2 ON pl2.RelatedPostId = p.Id
+    LEFT JOIN LATERAL (
+        SELECT t.* 
+        FROM Tags t 
+        WHERE p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    ) t ON TRUE
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '2 years')
+        AND p.Score >= 5
+    GROUP BY p.Id, p.OwnerUserId, p.Score, p.ViewCount, p.AnswerCount, 
+             p.FavoriteCount, p.CreationDate, p.ClosedDate, a.CreationDate
+),
+final_analysis AS (
+    SELECT 
+        ue.UserId,
+        ue.DisplayName,
+        ue.Reputation,
+        ue.TagName,
+        ue.AnswerCount,
+        ue.TotalScore,
+        ue.AvgAnswerScore,
+        ue.AcceptedAnswers,
+        ue.MedianScore,
+        (ue.GoldBadges + ue.SilverBadges) AS TotalTagBadges,
+        EXTRACT(DAY FROM (ue.LastAnswer - ue.FirstAnswer)) AS DaysActive,
+        CAST(ue.AnswerCount AS DOUBLE PRECISION) / NULLIF(ue.ActiveDays, 0) AS AnswersPerActiveDay,
+        CAST(ue.AcceptedAnswers AS DOUBLE PRECISION) / NULLIF(ue.AnswerCount, 0) * 100 AS AcceptanceRate,
+        th.QuestionCount AS TagQuestionCount,
+        th.AvgScore AS TagAvgScore,
+        COUNT(DISTINCT qq.QuestionId) AS RelatedQuestions,
+        AVG(qq.ScorePerView) AS AvgQuestionScorePerView,
+        PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY qq.HoursToFirstAnswer) AS P90ResponseTime,
+        SUM(CASE WHEN qq.MonthlyRank <= 10 THEN 1 ELSE 0 END) AS Top10MonthlyQuestions,
+        CORR(qq.EditCount, qq.Score) AS EditScoreCorrelation,
+        ROW_NUMBER() OVER (PARTITION BY ue.TagName ORDER BY ue.TotalScore DESC) AS TagExpertRank,
+        DENSE_RANK() OVER (ORDER BY ue.Reputation DESC) AS GlobalReputationRank,
+        NTILE(100) OVER (ORDER BY ue.TotalScore) AS ScorePercentile
+    FROM user_expertise ue
+    INNER JOIN tag_hierarchy th ON th.TagName = ue.TagName
+    LEFT JOIN question_quality qq ON qq.TagList LIKE '%' || ue.TagName || '%'
+    GROUP BY ue.UserId, ue.DisplayName, ue.Reputation, ue.TagName, 
+             ue.AnswerCount, ue.TotalScore, ue.AvgAnswerScore, 
+             ue.AcceptedAnswers, ue.MedianScore, ue.GoldBadges, 
+             ue.SilverBadges, ue.LastAnswer, ue.FirstAnswer,
+             ue.ActiveDays, th.QuestionCount, th.AvgScore
+)
+SELECT 
+    DisplayName,
+    TagName,
+    Reputation,
+    AnswerCount,
+    TotalScore,
+    ROUND(CAST(AvgAnswerScore AS NUMERIC), 2) AS AvgAnswerScore,
+    ROUND(CAST(AcceptanceRate AS NUMERIC), 1) AS AcceptanceRate,
+    TotalTagBadges,
+    ROUND(CAST(AnswersPerActiveDay AS NUMERIC), 2) AS AnswersPerActiveDay,
+    TagExpertRank,
+    GlobalReputationRank,
+    ScorePercentile,
+    RelatedQuestions,
+    ROUND(CAST(AvgQuestionScorePerView AS NUMERIC), 4) AS AvgQuestionScorePerView,
+    ROUND(CAST(P90ResponseTime AS NUMERIC), 1) AS P90ResponseTime,
+    Top10MonthlyQuestions,
+    ROUND(CAST(EditScoreCorrelation AS NUMERIC), 3) AS EditScoreCorrelation
+FROM final_analysis
+WHERE TagExpertRank <= 50
+    AND ScorePercentile >= 75
+ORDER BY TagName, TagExpertRank
+FETCH FIRST 1000 ROWS ONLY;

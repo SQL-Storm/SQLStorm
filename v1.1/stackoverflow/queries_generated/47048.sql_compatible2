@@ -1,0 +1,127 @@
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT p.Id) as QuestionCount,
+        1 as Level
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE p.PostTypeId = 1
+    GROUP BY t.Id, t.TagName
+    HAVING COUNT(DISTINCT p.Id) > 1000
+),
+user_expertise AS (
+    SELECT 
+        u.Id as UserId,
+        t.TagName,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as AnswerScore,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) as AvgAnswerScore,
+        MAX(p.CreationDate) as LastActivity,
+        DENSE_RANK() OVER (PARTITION BY t.TagName ORDER BY SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) DESC) as TagRank
+    FROM Users u
+    INNER JOIN Posts p ON p.OwnerUserId = u.Id
+    INNER JOIN tag_hierarchy t ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE u.Reputation > 1000
+        AND p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '2' YEAR)
+    GROUP BY u.Id, t.TagName
+),
+post_quality_metrics AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        COALESCE(p.AnswerCount, 0) as AnswerCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) as UpvoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) as DownvoteCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) as EditCount,
+        MIN(CASE WHEN a.Score > 0 THEN a.CreationDate END) as FirstGoodAnswerTime,
+        CASE 
+            WHEN p.Score > 10 AND p.ViewCount > 1000 THEN 'High Impact'
+            WHEN p.Score > 5 AND p.ViewCount > 500 THEN 'Medium Impact'
+            WHEN p.Score > 0 THEN 'Low Impact'
+            ELSE 'Minimal Impact'
+        END as ImpactCategory,
+        NTILE(100) OVER (ORDER BY p.Score * LOG(GREATEST(p.ViewCount, 1))) as QualityPercentile
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    WHERE p.PostTypeId IN (1, 2)
+        AND p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '3' YEAR)
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.Score, p.ViewCount, p.CreationDate, p.Tags, p.AnswerCount
+),
+badge_achievements AS (
+    SELECT 
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) as GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) as SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) as BronzeBadges,
+        SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) as TagBadges,
+        STRING_AGG(DISTINCT b.Name, ', ' ORDER BY b.Class, b.Name) FILTER (WHERE b.Class = 1) as GoldBadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+)
+SELECT 
+    ue.TagName,
+    u.DisplayName,
+    u.Reputation,
+    ue.AnswerScore as TagAnswerScore,
+    ue.AnswerCount as TagAnswers,
+    ue.QuestionCount as TagQuestions,
+    ue.AvgAnswerScore,
+    ue.TagRank,
+    ba.GoldBadges,
+    ba.SilverBadges,
+    ba.TagBadges,
+    SUM(CASE WHEN pqm.ImpactCategory = 'High Impact' THEN 1 ELSE 0 END) as HighImpactPosts,
+    SUM(CASE WHEN pqm.QualityPercentile >= 90 THEN 1 ELSE 0 END) as Top10PercentPosts,
+    AVG(pqm.QualityPercentile) as AvgQualityPercentile,
+    COUNT(DISTINCT pl.RelatedPostId) as LinkedPostCount,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY pqm.Score) as MedianPostScore,
+    STRING_AGG(
+        DISTINCT CASE 
+            WHEN pqm.Score > 50 THEN CAST(pqm.Id AS varchar)
+            ELSE NULL
+        END, 
+        ', ' 
+        ORDER BY CASE WHEN pqm.Score > 50 THEN CAST(pqm.Id AS varchar) ELSE NULL END
+    ) as HighScorePostIds,
+    EXTRACT(DAY FROM (CAST('2024-10-01' AS date) - MIN(p.CreationDate))) as DaysActive,
+    COUNT(DISTINCT DATE_TRUNC('month', p.CreationDate)) as ActiveMonths
+FROM user_expertise ue
+INNER JOIN Users u ON u.Id = ue.UserId
+LEFT JOIN badge_achievements ba ON ba.UserId = u.Id
+LEFT JOIN post_quality_metrics pqm ON pqm.OwnerUserId = u.Id 
+    AND pqm.Tags LIKE '%' || '<' || ue.TagName || '>' || '%'
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN PostLinks pl ON pl.PostId = pqm.Id
+WHERE ue.TagRank <= 10
+    AND ue.AnswerCount >= 5
+    AND u.CreationDate < (CAST('2024-10-01' AS date) - INTERVAL '6' MONTH)
+GROUP BY 
+    ue.TagName,
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    ue.AnswerScore,
+    ue.AnswerCount,
+    ue.QuestionCount,
+    ue.AvgAnswerScore,
+    ue.TagRank,
+    ba.GoldBadges,
+    ba.SilverBadges,
+    ba.TagBadges
+HAVING SUM(CASE WHEN pqm.Id IS NOT NULL THEN 1 ELSE 0 END) > 10
+ORDER BY 
+    ue.TagName,
+    ue.TagRank,
+    ue.AnswerScore DESC
+LIMIT 500;

@@ -1,0 +1,136 @@
+-- {"query": "46050.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 114700, "output_tokens": 93370} 
+
+WITH RECURSIVE UserEngagementMetrics AS (
+  SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    COUNT(DISTINCT p.Id) as PostCount,
+    COUNT(DISTINCT c.Id) as CommentCount,
+    COUNT(DISTINCT b.Id) as BadgeCount,
+    AVG(p.Score) as AvgPostScore,
+    EXTRACT(EPOCH FROM (MAX(u.LastAccessDate) - u.CreationDate)) / 86400.0 as DaysActive
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+  LEFT JOIN Comments c ON u.Id = c.UserId
+  LEFT JOIN Badges b ON u.Id = b.UserId
+  WHERE u.CreationDate >= TIMESTAMP '2018-01-01'
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+  HAVING COUNT(DISTINCT p.Id) > 5
+),
+TopQuestionAnswerPairs AS (
+  SELECT 
+    q.Id as QuestionId,
+    q.Title,
+    q.Score as QuestionScore,
+    q.ViewCount,
+    q.OwnerUserId as QuestionOwnerId,
+    a.Id as AnswerId,
+    a.Score as AnswerScore,
+    a.OwnerUserId as AnswerOwnerId,
+    CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END as IsAccepted,
+    ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) as AnswerRank
+  FROM Posts q
+  INNER JOIN Posts a ON q.Id = a.ParentId
+  WHERE q.PostTypeId = 1 
+    AND a.PostTypeId = 2
+    AND q.Score > 10
+    AND q.CreationDate >= TIMESTAMP '2019-01-01'
+),
+TagPerformance AS (
+  SELECT 
+    t.TagName,
+    t.Count as TagUsageCount,
+    COUNT(DISTINCT p.Id) as QuestionCount,
+    AVG(p.Score) as AvgScore,
+    AVG(p.ViewCount) as AvgViews,
+    AVG(p.AnswerCount) as AvgAnswers,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) as MedianScore,
+    MAX(p.Score) as MaxScore
+  FROM Tags t
+  INNER JOIN Posts p ON p.Tags LIKE '%<' || t.TagName || '>%'
+  WHERE p.PostTypeId = 1 
+    AND t.Count > 100
+  GROUP BY t.TagName, t.Count
+),
+VotePatterns AS (
+  SELECT 
+    v.PostId,
+    v.VoteTypeId,
+    vt.Name as VoteTypeName,
+    COUNT(*) as VoteCount,
+    MIN(v.CreationDate) as FirstVoteDate,
+    MAX(v.CreationDate) as LastVoteDate,
+    COUNT(DISTINCT v.UserId) as UniqueVoters
+  FROM Votes v
+  INNER JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  WHERE v.CreationDate >= TIMESTAMP '2020-01-01'
+  GROUP BY v.PostId, v.VoteTypeId, vt.Name
+),
+UserInfluenceGraph AS (
+  SELECT 
+    u1.Id as InfluencerId,
+    u1.DisplayName as InfluencerName,
+    u2.Id as InfluencedId,
+    u2.DisplayName as InfluencedName,
+    COUNT(DISTINCT qa.QuestionId) as SharedQuestions,
+    SUM(qa.QuestionScore + qa.AnswerScore) as CombinedScore
+  FROM TopQuestionAnswerPairs qa
+  INNER JOIN Users u1 ON qa.QuestionOwnerId = u1.Id
+  INNER JOIN Users u2 ON qa.AnswerOwnerId = u2.Id
+  WHERE qa.AnswerRank <= 3
+  GROUP BY u1.Id, u1.DisplayName, u2.Id, u2.DisplayName
+  HAVING COUNT(DISTINCT qa.QuestionId) >= 2
+)
+SELECT 
+  uem.DisplayName,
+  uem.Reputation,
+  uem.PostCount,
+  uem.CommentCount,
+  uem.BadgeCount,
+  ROUND(uem.AvgPostScore::numeric, 2) as AvgPostScore,
+  ROUND(uem.DaysActive::numeric, 2) as DaysActive,
+  tp.TagName as MostUsedTag,
+  tp.AvgScore as TagAvgScore,
+  tp.AvgViews as TagAvgViews,
+  vp.VoteTypeName,
+  vp.VoteCount,
+  COALESCE(uig.SharedQuestions, 0) as CollaborationCount,
+  COALESCE(uig.CombinedScore, 0) as CollaborationScore,
+  (SELECT COUNT(*) FROM Badges WHERE UserId = uem.Id AND Class = 1) as GoldBadges,
+  (SELECT COUNT(*) FROM Badges WHERE UserId = uem.Id AND Class = 2) as SilverBadges,
+  (SELECT COUNT(*) FROM Badges WHERE UserId = uem.Id AND Class = 3) as BronzeBadges,
+  (SELECT COUNT(DISTINCT PostId) 
+   FROM PostHistory 
+   WHERE UserId = uem.Id 
+     AND PostHistoryTypeId IN (4, 5, 6)) as EditCount,
+  DENSE_RANK() OVER (ORDER BY uem.Reputation DESC) as ReputationRank,
+  PERCENT_RANK() OVER (ORDER BY uem.AvgPostScore) as ScorePercentile
+FROM UserEngagementMetrics uem
+LEFT JOIN LATERAL (
+  SELECT tp2.TagName, tp2.AvgScore, tp2.AvgViews
+  FROM TagPerformance tp2
+  INNER JOIN Posts p ON p.Tags LIKE '%<' || tp2.TagName || '>%'
+  WHERE p.OwnerUserId = uem.Id AND p.PostTypeId = 1
+  GROUP BY tp2.TagName, tp2.AvgScore, tp2.AvgViews
+  ORDER BY COUNT(*) DESC
+  LIMIT 1
+) tp ON true
+LEFT JOIN LATERAL (
+  SELECT vp2.VoteTypeName, vp2.VoteCount
+  FROM VotePatterns vp2
+  INNER JOIN Posts p ON vp2.PostId = p.Id
+  WHERE p.OwnerUserId = uem.Id
+  ORDER BY vp2.VoteCount DESC
+  LIMIT 1
+) vp ON true
+LEFT JOIN LATERAL (
+  SELECT SUM(uig2.SharedQuestions) as SharedQuestions, SUM(uig2.CombinedScore) as CombinedScore
+  FROM UserInfluenceGraph uig2
+  WHERE uig2.InfluencerId = uem.Id OR uig2.InfluencedId = uem.Id
+) uig ON true
+WHERE uem.Reputation > 1000
+  AND uem.DaysActive > 30
+ORDER BY uem.Reputation DESC, uem.AvgPostScore DESC
+LIMIT 500;

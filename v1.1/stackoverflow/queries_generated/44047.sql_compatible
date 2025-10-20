@@ -1,0 +1,50 @@
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.Body,
+  p.CreationDate,
+  p.LastActivityDate,
+  p.Score,
+  p.ViewCount,
+  p.AnswerCount,
+  p.CommentCount AS PostCommentCount,
+  p.FavoriteCount,
+  u.Id AS UserId,
+  u.DisplayName,
+  u.Reputation,
+  u.Location,
+  CONCAT(DATEDIFF(day, p.CreationDate, CAST('2024-10-01 12:34:56' AS TIMESTAMP)), ' days') AS PostAgeInDays,
+  CONCAT(DATEDIFF(day, u.CreationDate, CAST('2024-10-01 12:34:56' AS TIMESTAMP)), ' days') AS UserAgeInDays,
+  CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus,
+  COALESCE(cl.Name, 'Not Closed') AS CloseReason,
+  COALESCE(COUNT(DISTINCT pl.Id), 0) AS LinkCount,
+  COALESCE(COUNT(DISTINCT v.Id), 0) AS VoteCount,
+  COALESCE(COUNT(DISTINCT c.Id), 0) AS CommentCount,
+  COALESCE(COUNT(DISTINCT b.Id), 0) AS BadgeCount
+FROM Posts p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN CloseReasonTypes cl ON ph.Comment = CAST(cl.Id AS VARCHAR(50))
+LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN Votes v ON p.Id = v.PostId
+LEFT JOIN Comments c ON p.Id = c.PostId
+LEFT JOIN Badges b ON u.Id = b.UserId
+WHERE p.CreationDate >= CAST(DATEADD(year, -1, CAST('2024-10-01 12:34:56' AS TIMESTAMP)) AS TIMESTAMP)
+GROUP BY
+  p.Id,
+  p.Title,
+  p.Body,
+  p.CreationDate,
+  p.LastActivityDate,
+  p.Score,
+  p.ViewCount,
+  p.AnswerCount,
+  p.CommentCount,
+  p.FavoriteCount,
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  u.Location,
+  p.ClosedDate,
+  cl.Name
+ORDER BY p.ViewCount DESC
+LIMIT 100;

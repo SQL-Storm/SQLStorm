@@ -1,4 +1,4 @@
--- {"query": "17012.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 30355, "output_tokens": 29547} 
+-- {"query": "17012.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 30355, "output_tokens": 29547} 
 
 WITH RECURSIVE user_hierarchy AS (
     SELECT 

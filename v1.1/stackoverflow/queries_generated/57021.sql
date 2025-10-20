@@ -1,0 +1,129 @@
+-- {"query": "57021.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2291, "output_tokens": 961} 
+
+WITH ActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(p.Id) AS PostCount,
+        SUM(p.Score) AS TotalPostScore,
+        MAX(p.LastActivityDate) AS LastActivity
+    FROM
+        Users u
+    JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    WHERE
+        p.PostTypeId = 1
+    GROUP BY
+        u.Id, u.Reputation
+    HAVING
+        COUNT(p.Id) > 10 AND MAX(p.LastActivityDate) > DATEADD(day, -30, GETDATE())
+),
+HighReputationUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation
+    FROM
+        Users u
+    WHERE
+        u.Reputation > 5000
+),
+TopTags AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id) AS PostCount
+    FROM
+        Tags t
+    JOIN
+        Posts p ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    WHERE
+        p.PostTypeId = 1
+    GROUP BY
+        t.TagName
+    ORDER BY
+        PostCount DESC
+    LIMIT 10
+),
+PopularPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        u.DisplayName AS Author
+    FROM
+        Posts p
+    JOIN
+        Users u ON p.OwnerUserId = u.Id
+    WHERE
+        p.PostTypeId = 1
+    ORDER BY
+        p.Score + p.ViewCount DESC
+    LIMIT 50
+),
+RecentActivity AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        l.Name as HistoryActionDescription,
+        ph.CreationDate
+    FROM
+        PostHistory ph
+    JOIN
+        Posts p ON ph.PostId = p.Id
+    JOIN
+        PostHistoryTypes l on l.Id  = ph.PostHistoryTypeId
+    WHERE
+        ph.CreationDate > DATEADD(day, -7, GETDATE())
+    ORDER BY
+        ph.CreationDate DESC
+),
+CombinedMetrics AS (
+    SELECT
+        au.UserId,
+        au.PostCount,
+        au.TotalPostScore,
+        au.LastActivity,
+        hr.Reputation,
+        t.TagName,
+        t.PostCount AS TagPostCount,
+        p.PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.Author,
+        ra.PostId AS RecentPostId,
+        ra.HistoryActionDescription,
+        ra.CreationDate AS RecentActivityDate
+    FROM
+        ActiveUsers au
+    LEFT JOIN
+        HighReputationUsers hr ON au.UserId = hr.UserId
+    LEFT JOIN
+        TopTags t ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    LEFT JOIN
+        PopularPosts p ON au.UserId = COALESCE(p.OwnerUserId, -1)
+    LEFT JOIN
+        RecentActivity ra ON au.UserId = COALESCE(ra.PostId, -1)
+)
+
+SELECT
+    cm.UserId,
+    cm.PostCount,
+    cm.TotalPostScore,
+    cm.LastActivity,
+    cm.Reputation,
+    cm.TagName,
+    cm.TagPostCount,
+    cm.PostId,
+    cm.Title,
+    cm.Score,
+    cm.ViewCount,
+    cm.Author,
+    cm.RecentPostId,
+    cm.HistoryActionDescription,
+    cm.RecentActivityDate
+FROM
+    CombinedMetrics cm
+ORDER BY
+    cm.Reputation DESC,
+    cm.TotalPostScore DESC,
+    cm.LastActivity DESC;

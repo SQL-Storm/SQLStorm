@@ -1,0 +1,165 @@
+WITH PopularTags AS (
+    SELECT 
+        TagName,
+        Count AS TagCount,
+        ROW_NUMBER() OVER (ORDER BY Count DESC) AS Rank
+    FROM 
+        Tags
+    WHERE 
+        Count > 1000
+    LIMIT 10
+),
+UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM 
+        Users u
+    JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    WHERE 
+        p.PostTypeId IN (1, 2)
+        AND p.CreationDate >= DATE '2020-01-01'
+    GROUP BY 
+        u.Id, u.DisplayName, u.Reputation
+    HAVING 
+        COUNT(DISTINCT p.Id) > 50
+),
+UserBadges AS (
+    SELECT 
+        UserId,
+        COUNT(CASE WHEN Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN Class = 3 THEN 1 END) AS BronzeBadges
+    FROM 
+        Badges
+    GROUP BY 
+        UserId
+),
+UserVotes AS (
+    SELECT 
+        v.UserId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotesGiven,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotesGiven
+    FROM 
+        Votes v
+    JOIN 
+        Posts p ON v.PostId = p.Id
+    WHERE 
+        v.CreationDate >= DATE '2020-01-01'
+    GROUP BY 
+        v.UserId
+),
+TagSplit AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId AS UserId,
+        p.Score,
+        CASE
+            WHEN p.Tags LIKE '<%>' THEN SUBSTR(p.Tags, 2, LENGTH(p.Tags) - 2)
+            ELSE p.Tags
+        END AS TagsStr
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+RecursiveSplit AS (
+    SELECT
+        PostId,
+        UserId,
+        Score,
+        CASE
+            WHEN POSITION('><' IN TagsStr) = 0 THEN TagsStr
+            ELSE SUBSTR(TagsStr, 1, CASE WHEN POSITION('><' IN TagsStr) = 0 THEN LENGTH(TagsStr) ELSE POSITION('><' IN TagsStr) - 1 END)
+        END AS Tag,
+        CASE
+            WHEN POSITION('><' IN TagsStr) = 0 THEN NULL
+            ELSE SUBSTR(TagsStr, POSITION('><' IN TagsStr) + 2)
+        END AS Remainder
+    FROM TagSplit
+    UNION ALL
+    SELECT
+        rs.PostId,
+        rs.UserId,
+        rs.Score,
+        CASE
+            WHEN rs.Remainder IS NULL THEN NULL
+            WHEN POSITION('><' IN rs.Remainder) = 0 THEN rs.Remainder
+            ELSE SUBSTR(rs.Remainder, 1, CASE WHEN POSITION('><' IN rs.Remainder) = 0 THEN LENGTH(rs.Remainder) ELSE POSITION('><' IN rs.Remainder) - 1 END)
+        END AS Tag,
+        CASE
+            WHEN rs.Remainder IS NULL THEN NULL
+            WHEN POSITION('><' IN rs.Remainder) = 0 THEN NULL
+            ELSE SUBSTR(rs.Remainder, POSITION('><' IN rs.Remainder) + 2)
+        END AS Remainder
+    FROM RecursiveSplit rs
+    WHERE rs.Remainder IS NOT NULL
+),
+UserTagActivity AS (
+    SELECT 
+        UserId,
+        Tag,
+        COUNT(PostId) AS PostsInTag,
+        SUM(Score) AS ScoreInTag
+    FROM RecursiveSplit
+    WHERE Tag IS NOT NULL AND Tag <> ''
+    GROUP BY UserId, Tag
+),
+TopUsersPerTag AS (
+    SELECT 
+        uta.UserId,
+        uta.Tag,
+        uta.PostsInTag,
+        uta.ScoreInTag,
+        ROW_NUMBER() OVER (PARTITION BY uta.Tag ORDER BY uta.ScoreInTag DESC) AS RankInTag
+    FROM 
+        UserTagActivity uta
+    JOIN 
+        PopularTags pt ON uta.Tag = pt.TagName
+    WHERE 
+        uta.PostsInTag > 10
+)
+SELECT 
+    ups.UserId,
+    ups.DisplayName,
+    ups.Reputation,
+    ups.TotalPosts,
+    ups.TotalScore,
+    ups.AvgScore,
+    ups.LastPostDate,
+    COALESCE(ub.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ub.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ub.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(uv.UpVotesGiven, 0) AS UpVotesGiven,
+    COALESCE(uv.DownVotesGiven, 0) AS DownVotesGiven,
+    STRING_AGG(CONCAT(tut.Tag, ': ', tut.PostsInTag, ' posts, ', tut.ScoreInTag, ' score'), '; ') AS TopTagActivities
+FROM 
+    UserPostStats ups
+LEFT JOIN 
+    UserBadges ub ON ups.UserId = ub.UserId
+LEFT JOIN 
+    UserVotes uv ON ups.UserId = uv.UserId
+LEFT JOIN (
+    SELECT * FROM TopUsersPerTag WHERE RankInTag <= 3
+) tut ON ups.UserId = tut.UserId
+GROUP BY 
+    ups.UserId,
+    ups.DisplayName,
+    ups.Reputation,
+    ups.TotalPosts,
+    ups.TotalScore,
+    ups.AvgScore,
+    ups.LastPostDate,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    uv.UpVotesGiven,
+    uv.DownVotesGiven
+ORDER BY 
+    ups.Reputation DESC,
+    ups.TotalScore DESC
+LIMIT 100;

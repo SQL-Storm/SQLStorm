@@ -1,0 +1,148 @@
+WITH UserEngagementMetrics AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(p.ViewCount) AS TotalViews,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VotesCast,
+        COUNT(DISTINCT b.Id) AS BadgeCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '3' YEAR)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+TagExpertise AS (
+    SELECT 
+        p.OwnerUserId,
+        t.tag AS TagName,
+        COUNT(*) AS TagQuestionCount,
+        AVG(p.Score) AS AvgTagScore,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS ResolvedQuestions
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT regexp_split_to_table(
+            SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)),
+            '><'
+        ) AS tag
+    ) t
+    WHERE p.PostTypeId = 1 
+        AND p.Tags IS NOT NULL
+        AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId, t.tag
+),
+TopTagsPerUser AS (
+    SELECT 
+        te.OwnerUserId,
+        te.TagName,
+        te.TagQuestionCount,
+        te.AvgTagScore,
+        ROW_NUMBER() OVER (PARTITION BY te.OwnerUserId ORDER BY te.TagQuestionCount DESC, te.AvgTagScore DESC) AS TagRank
+    FROM TagExpertise te
+),
+QuestionAnswerNetwork AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.OwnerUserId AS QuestionAuthorId,
+        q.Title,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        a.Id AS AnswerId,
+        a.OwnerUserId AS AnswerAuthorId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerDate,
+        CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END AS IsAccepted,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600.0 AS HoursToAnswer
+    FROM Posts q
+    INNER JOIN Posts a ON q.Id = a.ParentId
+    WHERE q.PostTypeId = 1 
+        AND a.PostTypeId = 2
+        AND q.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '2' YEAR)
+        AND q.AnswerCount > 0
+),
+AnswererReputation AS (
+    SELECT 
+        qan.QuestionId,
+        qan.AnswerId,
+        qan.AnswerAuthorId,
+        qan.AnswerScore,
+        qan.IsAccepted,
+        qan.HoursToAnswer,
+        u.Reputation AS AnswererReputation,
+        COUNT(DISTINCT v.Id) AS AnswerUpvotes,
+        COUNT(DISTINCT c.Id) AS AnswerComments,
+        DENSE_RANK() OVER (PARTITION BY qan.QuestionId ORDER BY qan.AnswerScore DESC, qan.IsAccepted DESC) AS AnswerRankInQuestion
+    FROM QuestionAnswerNetwork qan
+    LEFT JOIN Users u ON qan.AnswerAuthorId = u.Id
+    LEFT JOIN Votes v ON qan.AnswerId = v.PostId AND v.VoteTypeId = 2
+    LEFT JOIN Comments c ON qan.AnswerId = c.PostId
+    GROUP BY qan.QuestionId, qan.AnswerId, qan.AnswerAuthorId, qan.AnswerScore, qan.IsAccepted, qan.HoursToAnswer, u.Reputation
+),
+UserInteractionGraph AS (
+    SELECT 
+        qan.QuestionAuthorId AS UserId1,
+        ar.AnswerAuthorId AS UserId2,
+        COUNT(DISTINCT qan.QuestionId) AS InteractionCount,
+        AVG(ar.AnswerScore) AS AvgAnswerScore,
+        SUM(ar.IsAccepted) AS AcceptedAnswerCount,
+        AVG(ar.HoursToAnswer) AS AvgResponseTime
+    FROM QuestionAnswerNetwork qan
+    INNER JOIN AnswererReputation ar ON qan.QuestionId = ar.QuestionId AND qan.AnswerId = ar.AnswerId
+    WHERE qan.QuestionAuthorId IS NOT NULL 
+        AND ar.AnswerAuthorId IS NOT NULL
+        AND qan.QuestionAuthorId <> ar.AnswerAuthorId
+    GROUP BY qan.QuestionAuthorId, ar.AnswerAuthorId
+    HAVING COUNT(DISTINCT qan.QuestionId) >= 3
+)
+SELECT 
+    uem.UserId,
+    uem.DisplayName,
+    uem.Reputation,
+    uem.TotalPosts,
+    uem.QuestionCount,
+    uem.AnswerCount,
+    uem.AvgPostScore,
+    uem.TotalViews,
+    uem.CommentCount,
+    uem.BadgeCount,
+    STRING_AGG(ttp.TagName || ':' || CAST(ttp.TagQuestionCount AS VARCHAR), ', ' ORDER BY ttp.TagName || ':' || CAST(ttp.TagQuestionCount AS VARCHAR)) 
+        FILTER (WHERE ttp.TagRank <= 5) AS Top5Tags,
+    COUNT(DISTINCT uig.UserId2) AS UniqueAnswerers,
+    AVG(uig.AvgAnswerScore) AS AvgScoreFromAnswerers,
+    SUM(uig.InteractionCount) AS TotalInteractions,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ar.AnswerScore) AS MedianAnswerScoreReceived,
+    COUNT(DISTINCT CASE WHEN ar.IsAccepted = 1 THEN ar.AnswerId END) AS AcceptedAnswersReceived,
+    AVG(CASE WHEN ar.AnswerRankInQuestion = 1 THEN ar.AnswererReputation END) AS AvgTopAnswererReputation
+FROM UserEngagementMetrics uem
+LEFT JOIN TopTagsPerUser ttp ON uem.UserId = ttp.OwnerUserId
+LEFT JOIN UserInteractionGraph uig ON uem.UserId = uig.UserId1
+LEFT JOIN QuestionAnswerNetwork qan ON uem.UserId = qan.QuestionAuthorId
+LEFT JOIN AnswererReputation ar ON qan.QuestionId = ar.QuestionId AND qan.AnswerId = ar.AnswerId
+WHERE uem.TotalPosts >= 10
+    AND uem.Reputation > 1000
+GROUP BY 
+    uem.UserId,
+    uem.DisplayName,
+    uem.Reputation,
+    uem.TotalPosts,
+    uem.QuestionCount,
+    uem.AnswerCount,
+    uem.AvgPostScore,
+    uem.TotalViews,
+    uem.CommentCount,
+    uem.BadgeCount
+HAVING COUNT(DISTINCT qan.QuestionId) >= 5
+ORDER BY 
+    uem.Reputation DESC,
+    TotalInteractions DESC,
+    uem.TotalViews DESC
+LIMIT 100;

@@ -1,0 +1,117 @@
+-- {"query": "57065.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2291, "output_tokens": 1118} 
+
+WITH ActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(p.Id) AS PostCount,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(v.Id) AS VoteCount,
+        COUNT(b.Id) AS BadgeCount
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    WHERE
+        u.LastAccessDate > NOW() - INTERVAL '30 days'
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count AS TagCount,
+        COUNT(p.Id) AS PostCount,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(p.ViewCount) AS TotalViewCount
+    FROM
+        Tags t
+    LEFT JOIN
+        Posts p ON t.Id = ANY(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), ''><''))
+    WHERE
+        p.PostTypeId = 1
+    GROUP BY
+        t.TagName, t.Count
+    ORDER BY
+        TagCount DESC, AvgPostScore DESC
+    LIMIT 10
+), PopularPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Title,
+        u.DisplayName AS OwnerDisplayName,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(v.Id) AS VoteCount
+    FROM
+        Posts p
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    WHERE
+        p.PostTypeId = 1
+    GROUP BY
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.Title, u.DisplayName
+    ORDER BY
+        p.ViewCount DESC, p.Score DESC
+    LIMIT 50
+), TagPerformance AS (
+    SELECT
+        t.TagName,
+        avg(PostCount) AS별 AverageTagPosts,
+        MAX(PostCount) AS MaxTagPostCount,
+        MIN(PostCount) AS nilMinTagPostCount,
+        ExcerptPostId
+    FROM
+        Tags t
+    LEFT JOIN
+        Posts p ON t.Id = ANY(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), ''><''))
+    GROUP BY
+        t.TagName, t.ExcerptPostId
+    ORDER BY
+        AverageTagPosts DESC, MaxTagPostCount, MinTagPostCount DESC
+)
+SELECT
+    au.UserId,
+    au.Reputation,
+    au.UserCreationDate,
+    au.LastAccessDate,
+    au.PostCount,
+    au.CommentCount,
+    au.VoteCount,
+    au.BadgeCount,
+    tt.TagName,
+    tt.TagCount,
+    tt.PostCount AS TagPostCount,
+    tt.AvgPostScore,
+    tt.TotalViewCount,
+    pp.PostId,
+    pp.PostTypeId,
+    pp.PostCreationDate,
+    pp.Score AS PostScore,
+    pp.ViewCount AS PostViewCount,
+    pp.AnswerCount AS TagAnswerCount,
+    pp.Title,
+    pp.OwnerDisplayName,
+    pp.CommentCount AS PostCommentCount,
+    pp.VoteCount AS PostVoteCount
+    FROM
+        PopularPosts pp JOIN ActiveUsers au ON au.UserId = pp.OwnerDisplayName
+        JOIN TopTags tt ON pp.Id = ANY(string_to_array(SUBSTRING(pp.Tags FROM 2 FOR LENGTH(pp.Tags)-2), ''><''))
+    ORDER BY
+        pp.ViewCount DESC;

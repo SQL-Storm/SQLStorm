@@ -1,0 +1,30 @@
+SELECT
+    p.PostTypeId,
+    pt.Name AS PostTypeName,
+    COUNT(*) AS TotalPosts,
+    AVG(p.Score) AS AverageScore,
+    SUM(p.ViewCount) AS TotalViews,
+    COUNT(DISTINCT p.OwnerUserId) AS UniqueAuthors,
+    COUNT(DISTINCT c.UserId) AS UniqueCommenters,
+    COUNT(DISTINCT v.UserId) AS UniqueVoters,
+    COUNT(DISTINCT hl.UserId) AS UniquePostHistoryEditors,
+    COUNT(DISTINCT bl.RelatedPostId) AS TotalLinks,
+    COUNT(DISTINCT t.Id) AS TotalTags,
+    COUNT(DISTINCT b.UserId) AS UniqueBadgeRecipients,
+    COUNT(DISTINCT u.Id) AS ActiveUsers,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsCount,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersCount,
+    SUM(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS ClosedPosts,
+    SUM(CASE WHEN p.RevisionGuid IS NOT NULL THEN 1 ELSE 0 END) AS PostsWithRevisions
+FROM Posts p
+JOIN PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN Comments c ON p.Id = c.PostId
+LEFT JOIN Votes v ON p.Id = v.PostId
+LEFT JOIN PostHistory hl ON p.Id = hl.PostId
+LEFT JOIN PostLinks bl ON p.Id = bl.PostId
+LEFT JOIN Tags t ON (t.ExcerptPostId = p.Id OR t.WikiPostId = p.Id)
+LEFT JOIN (SELECT DISTINCT UserId FROM Badges) b ON b.UserId = p.OwnerUserId
+LEFT JOIN Users u ON u.Id = p.OwnerUserId
+GROUP BY p.PostTypeId, pt.Name, p.Score, p.ViewCount, p.OwnerUserId, p.ClosedDate, p.RevisionGuid
+ORDER BY TotalPosts DESC
+LIMIT 100;

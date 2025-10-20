@@ -1,0 +1,153 @@
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT pt.Id) AS question_count,
+        ARRAY[t.TagName] AS tag_path,
+        1 AS depth
+    FROM Tags t
+    INNER JOIN Posts pt ON pt.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE pt.PostTypeId = 1
+        AND t.Count > 1000
+    GROUP BY t.Id, t.TagName
+
+    UNION ALL
+
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        -- compute co-occurring question count without aggregate in the recursive term by counting distinct post ids joined per pair
+        cooccur.coquestion_count,
+        th.tag_path || t2.TagName,
+        th.depth + 1
+    FROM tag_hierarchy th
+    CROSS JOIN Tags t2
+    JOIN (
+        SELECT p1.Id AS PostId, p1.Tags AS Tags1, p1.PostTypeId AS PostType1
+        FROM Posts p1
+        WHERE p1.PostTypeId = 1
+    ) p1 ON p1.Tags LIKE '%' || '<' || th.TagName || '>' || '%'
+    JOIN (
+        SELECT p2.Id AS PostId, p2.Tags AS Tags2
+        FROM Posts p2
+        WHERE p2.PostTypeId = 1
+    ) p2 ON p2.PostId = p1.PostId
+      AND p2.Tags2 LIKE '%' || '<' || t2.TagName || '>' || '%'
+    -- aggregate per th and t2 outside the recursive SELECT via a derived table
+    JOIN (
+        SELECT p_a.PostId, COUNT(DISTINCT p_a.PostId) AS coquestion_count, p_a.TagA, p_a.TagB
+        FROM (
+            SELECT p.Id AS PostId,
+                   ta.TagName AS TagA,
+                   tb.TagName AS TagB
+            FROM Posts p
+            JOIN Tags ta ON p.Tags LIKE '%' || '<' || ta.TagName || '>' || '%'
+            JOIN Tags tb ON p.Tags LIKE '%' || '<' || tb.TagName || '>' || '%'
+        ) p_a
+        GROUP BY p_a.PostId, p_a.TagA, p_a.TagB
+    ) cooccur ON cooccur.TagA = th.TagName AND cooccur.TagB = t2.TagName
+
+    WHERE th.depth < 3
+        AND t2.TagName <> ALL(th.tag_path)
+        AND t2.Count > 500
+    GROUP BY t2.Id, t2.TagName, th.tag_path, th.depth, cooccur.coquestion_count
+),
+user_expertise AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS answers_count,
+        SUM(p.Score) AS total_score,
+        AVG(p.Score) AS avg_score,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS median_score,
+        COUNT(DISTINCT CASE WHEN p.Id = q.AcceptedAnswerId THEN p.Id END) AS accepted_answers,
+        STRING_AGG(DISTINCT b.Name, ', ' ORDER BY b.Class, b.Date DESC) FILTER (WHERE b.TagBased = 1) AS tag_badges,
+        DENSE_RANK() OVER (PARTITION BY t.TagName ORDER BY SUM(p.Score) DESC) AS tag_rank
+    FROM Users u
+    INNER JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 2
+    INNER JOIN Posts q ON q.Id = p.ParentId
+    INNER JOIN Tags t ON q.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    LEFT JOIN Badges b ON b.UserId = u.Id AND b.Name LIKE '%' || t.TagName || '%'
+    WHERE u.Reputation > 5000
+        AND p.Score > 0
+        AND p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '2 years'
+    GROUP BY u.Id, u.DisplayName, t.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+temporal_patterns AS (
+    SELECT 
+        DATE_TRUNC('quarter', p.CreationDate) AS quarter,
+        pt.Name AS post_type,
+        COUNT(*) AS post_count,
+        AVG(p.Score) AS avg_score,
+        PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY p.ViewCount) AS p95_views,
+        COUNT(DISTINCT p.OwnerUserId) AS unique_authors,
+        COUNT(*) FILTER (WHERE p.ClosedDate IS NOT NULL) AS closed_posts,
+        AVG(EXTRACT(EPOCH FROM (COALESCE(p.ClosedDate, p.LastActivityDate) - p.CreationDate))/3600.0) AS avg_lifetime_hours,
+        SUM(COUNT(*)) OVER (PARTITION BY pt.Name ORDER BY DATE_TRUNC('quarter', p.CreationDate)) AS cumulative_posts
+    FROM Posts p
+    INNER JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.CreationDate >= DATE '2020-01-01'
+    GROUP BY DATE_TRUNC('quarter', p.CreationDate), pt.Name
+),
+edit_patterns AS (
+    SELECT 
+        ph.PostId,
+        p.Title,
+        COUNT(DISTINCT ph.UserId) AS unique_editors,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS edit_count,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (7,8,9)) AS rollback_count,
+        MAX(ph.CreationDate) - MIN(ph.CreationDate) AS edit_timespan,
+        ARRAY_AGG(DISTINCT pht.Name ORDER BY ph.CreationDate) AS history_sequence
+    FROM PostHistory ph
+    INNER JOIN Posts p ON ph.PostId = p.Id
+    INNER JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    WHERE p.PostTypeId = 1
+        AND p.Score > 50
+    GROUP BY ph.PostId, p.Title
+    HAVING COUNT(DISTINCT ph.UserId) > 3
+)
+SELECT 
+    th.tag_path[1] AS primary_tag,
+    COALESCE(th.tag_path[2], '') AS secondary_tag,
+    COALESCE(th.tag_path[3], '') AS tertiary_tag,
+    th.question_count,
+    ue.DisplayName AS top_contributor,
+    ue.total_score AS contributor_score,
+    ue.accepted_answers,
+    ue.tag_badges,
+    tp.quarter,
+    tp.avg_score AS quarterly_avg_score,
+    tp.p95_views,
+    tp.unique_authors,
+    ROUND(CAST(tp.closed_posts AS NUMERIC) / NULLIF(tp.post_count, 0) * 100, 2) AS close_rate_pct,
+    tp.avg_lifetime_hours,
+    ep.Title AS highly_edited_question,
+    ep.unique_editors,
+    ep.edit_count,
+    ep.rollback_count,
+    EXTRACT(EPOCH FROM ep.edit_timespan)/86400.0 AS edit_timespan_days,
+    CASE 
+        WHEN ue.tag_rank = 1 THEN 'Gold Standard Expert'
+        WHEN ue.tag_rank <= 5 THEN 'Top Tier Expert'
+        WHEN ue.tag_rank <= 20 THEN 'Senior Contributor'
+        ELSE 'Active Contributor'
+    END AS expertise_level,
+    LAG(tp.post_count, 4) OVER (PARTITION BY tp.post_type ORDER BY tp.quarter) AS year_ago_post_count,
+    ROUND(
+        (tp.post_count - LAG(tp.post_count, 4) OVER (PARTITION BY tp.post_type ORDER BY tp.quarter))::numeric /
+        NULLIF(LAG(tp.post_count, 4) OVER (PARTITION BY tp.post_type ORDER BY tp.quarter), 0) * 100,
+        2
+    ) AS yoy_growth_pct
+FROM tag_hierarchy th
+CROSS JOIN temporal_patterns tp
+LEFT JOIN user_expertise ue ON ue.TagName = th.TagName AND ue.tag_rank = 1
+LEFT JOIN edit_patterns ep ON ep.edit_count = (SELECT MAX(edit_count) FROM edit_patterns)
+WHERE th.depth <= 2
+    AND tp.post_type = 'Question'
+ORDER BY 
+    th.question_count DESC,
+    tp.quarter DESC,
+    ue.total_score DESC
+LIMIT 100;

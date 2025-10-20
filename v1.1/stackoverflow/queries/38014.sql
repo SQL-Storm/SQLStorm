@@ -1,0 +1,272 @@
+-- {"query": "38014.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 2874} 
+with recent_users as (
+  select u.id as user_id, u.displayname, u.reputation, u.creationdate
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+q_posts as (
+  select p.id, p.owneruserid, p.creationdate, p.score, p.viewcount, p.tags, p.title
+  from posts p
+  where p.posttypeid = 1
+),
+a_posts as (
+  select p.id, p.parentid, p.owneruserid, p.creationdate, p.score
+  from posts p
+  where p.posttypeid = 2
+),
+user_q as (
+  select ru.user_id,
+         count(*) as q_count,
+         sum(case when p.score >= 5 then 1 else 0 end) as q_high_score,
+         avg(p.score) as q_avg_score,
+         percentile_cont(0.5) within group (order by p.score) as q_median_score,
+         avg(coalesce(p.viewcount,0)) as q_avg_views,
+         max(p.creationdate) as last_q_date
+  from recent_users ru
+  join q_posts p on p.owneruserid = ru.user_id
+  group by ru.user_id
+),
+user_a as (
+  select ru.user_id,
+         count(*) as a_count,
+         sum(case when ap.score >= 5 then 1 else 0 end) as a_high_score,
+         avg(ap.score) as a_avg_score,
+         percentile_cont(0.5) within group (order by ap.score) as a_median_score,
+         max(ap.creationdate) as last_a_date
+  from recent_users ru
+  join a_posts ap on ap.owneruserid = ru.user_id
+  group by ru.user_id
+),
+user_comments as (
+  select ru.user_id,
+         count(*) as c_count,
+         sum(case when c.score >= 5 then 1 else 0 end) as c_high_score,
+         avg(c.score) as c_avg_score,
+         percentile_cont(0.5) within group (order by c.score) as c_median_score,
+         max(c.creationdate) as last_c_date
+  from recent_users ru
+  join comments c on c.userid = ru.user_id
+  group by ru.user_id
+),
+tag_split as (
+  select p.id as post_id, unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) as tag
+  from q_posts p
+  where p.tags is not null and p.tags like '<%>'
+),
+user_tag_stats as (
+  select p.owneruserid as user_id,
+         t.tag,
+         count(*) as tag_q_count,
+         avg(p.score) as tag_q_avg_score,
+         sum(case when p.score >= 5 then 1 else 0 end) as tag_q_high_score
+  from q_posts p
+  join tag_split t on t.post_id = p.id
+  group by p.owneruserid, t.tag
+),
+top_tag_per_user as (
+  select uts.user_id, uts.tag, uts.tag_q_count,
+         rank() over (partition by uts.user_id order by uts.tag_q_count desc, uts.tag) as rnk
+  from user_tag_stats uts
+),
+accepted_answerers as (
+  select a.owneruserid as user_id,
+         count(*) as accepted_a_count,
+         avg(a.score) as accepted_a_avg_score,
+         max(a.creationdate) as last_accepted_a_date
+  from posts q
+  join posts a on a.id = q.acceptedanswerid
+  where q.posttypeid = 1 and a.posttypeid = 2 and a.owneruserid is not null
+  group by a.owneruserid
+),
+vote_agg as (
+  select ru.user_id,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes_cast,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes_cast,
+         count(*) as total_votes_cast,
+         min(v.creationdate) as first_vote_date,
+         max(v.creationdate) as last_vote_date
+  from recent_users ru
+  join votes v on v.userid = ru.user_id
+  group by ru.user_id
+),
+post_vote_agg as (
+  select p.owneruserid as user_id,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes_received,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes_received,
+         sum(case when v.votetypeid = 12 then 1 else 0 end) as spam_flags_received
+  from posts p
+  join votes v on v.postid = p.id
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+badges_agg as (
+  select ru.user_id,
+         count(*) as badge_count,
+         sum(case when b.class = 1 then 1 else 0 end) as gold_count,
+         sum(case when b.class = 2 then 1 else 0 end) as silver_count,
+         sum(case when b.class = 3 then 1 else 0 end) as bronze_count,
+         max(b.date) as last_badge_date
+  from recent_users ru
+  left join badges b on b.userid = ru.user_id
+  group by ru.user_id
+),
+activity_windows as (
+  select u.id as user_id,
+         date_trunc('month', p.creationdate) as month,
+         sum(case when p.posttypeid = 1 then 1 else 0 end) as q_in_month,
+         sum(case when p.posttypeid = 2 then 1 else 0 end) as a_in_month,
+         sum(coalesce(p.commentcount,0)) as comments_on_posts_in_month
+  from users u
+  join posts p on p.owneruserid = u.id
+  where u.id in (select user_id from recent_users)
+    and p.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+  group by u.id, date_trunc('month', p.creationdate)
+),
+active_streaks as (
+  select user_id,
+         max(streak_len) as max_month_streak
+  from (
+    select aw.user_id,
+           aw.month,
+           date_part('month', aw.month) as m,
+           date_part('year', aw.month) as y,
+           count(*) over (partition by aw.user_id order by aw.month rows between 2 preceding and current row) as rolling_3m_buckets,
+           sum(case when (coalesce(q_in_month,0) + coalesce(a_in_month,0)) > 0 then 1 else 0 end)
+             over (partition by aw.user_id order by aw.month rows between unbounded preceding and current row) as streak_len
+    from activity_windows aw
+  ) s
+  group by user_id
+),
+hot_question_events as (
+  select ph.postid,
+         count(*) filter (where ph.posthistorytypeid = 52) as times_hot,
+         count(*) filter (where ph.posthistorytypeid = 53) as times_unhot,
+         max(ph.creationdate) filter (where ph.posthistorytypeid = 52) as last_hot_date
+  from posthistory ph
+  where ph.posthistorytypeid in (52,53)
+  group by ph.postid
+),
+dupe_links as (
+  select pl.relatedpostid as canonical_id,
+         count(*) as dup_count
+  from postlinks pl
+  where pl.linktypeid = 3
+  group by pl.relatedpostid
+),
+user_quality as (
+  select u.id as user_id,
+         avg(case when p.posttypeid = 1 then p.score end) filter (where p.posttypeid = 1) as avg_q_score,
+         avg(case when p.posttypeid = 2 then p.score end) filter (where p.posttypeid = 2) as avg_a_score,
+         stddev_pop(p.score) as score_stddev,
+         sum(case when p.posttypeid = 1 and p.id in (select postid from hot_question_events where times_hot > 0) then 1 else 0 end) as hot_q_count
+  from users u
+  join posts p on p.owneruserid = u.id
+  where u.id in (select user_id from recent_users)
+  group by u.id
+),
+question_enrichment as (
+  select q.id,
+         coalesce(hqe.times_hot, 0) as times_hot,
+         coalesce(hqe.last_hot_date, null) as last_hot_date,
+         coalesce(dl.dup_count, 0) as duplicate_of_count
+  from q_posts q
+  left join hot_question_events hqe on hqe.postid = q.id
+  left join dupe_links dl on dl.canonical_id = q.id
+),
+user_question_enrichment as (
+  select q.owneruserid as user_id,
+         sum(case when qe.times_hot > 0 then 1 else 0 end) as q_hot_count,
+         max(qe.last_hot_date) as user_last_hot_q_date,
+         sum(qe.duplicate_of_count) as q_dupe_canonical_count
+  from q_posts q
+  join question_enrichment qe on qe.id = q.id
+  group by q.owneruserid
+),
+saves_favorites as (
+  select v.postid, count(*) as favorite_count
+  from votes v
+  where v.votetypeid = 5
+  group by v.postid
+),
+user_fav_received as (
+  select p.owneruserid as user_id,
+         sum(coalesce(sf.favorite_count,0)) as favorites_received
+  from posts p
+  left join saves_favorites sf on sf.postid = p.id
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+recency_score as (
+  select ru.user_id,
+         greatest(
+           coalesce(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - uq.last_q_date))::bigint, 10^9),
+           coalesce(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - ua.last_a_date))::bigint, 10^9),
+           coalesce(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - uc.last_c_date))::bigint, 10^9)
+         ) as max_idle_seconds
+  from recent_users ru
+  left join user_q uq on uq.user_id = ru.user_id
+  left join user_a ua on ua.user_id = ru.user_id
+  left join user_comments uc on uc.user_id = ru.user_id
+),
+final as (
+  select
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    coalesce(uq.q_count,0) as q_count,
+    coalesce(ua.a_count,0) as a_count,
+    coalesce(uc.c_count,0) as c_count,
+    coalesce(uq.q_high_score,0) as q_high_score,
+    coalesce(ua.a_high_score,0) as a_high_score,
+    coalesce(uc.c_high_score,0) as c_high_score,
+    uq.q_avg_score,
+    ua.a_avg_score,
+    uc.c_avg_score,
+    uq.q_median_score,
+    ua.a_median_score,
+    uc.c_median_score,
+    qa.avg_q_score,
+    qa.avg_a_score,
+    qa.score_stddev,
+    coalesce(aa.accepted_a_count,0) as accepted_a_count,
+    aa.accepted_a_avg_score,
+    vs.upvotes_cast,
+    vs.downvotes_cast,
+    pva.upvotes_received,
+    pva.downvotes_received,
+    pva.spam_flags_received,
+    ba.badge_count,
+    ba.gold_count,
+    ba.silver_count,
+    ba.bronze_count,
+    coalesce(ut.q_hot_count,0) as hot_q_count,
+    ut.user_last_hot_q_date,
+    coalesce(ut.q_dupe_canonical_count,0) as q_dupe_canonical_count,
+    coalesce(uf.favorites_received,0) as favorites_received,
+    coalesce(asq.max_month_streak,0) as max_activity_streak,
+    rs.max_idle_seconds,
+    ttpu.tag as top_tag,
+    ttpu.tag_q_count as top_tag_q_count
+  from recent_users ru
+  left join user_q uq on uq.user_id = ru.user_id
+  left join user_a ua on ua.user_id = ru.user_id
+  left join user_comments uc on uc.user_id = ru.user_id
+  left join accepted_answerers aa on aa.user_id = ru.user_id
+  left join vote_agg vs on vs.user_id = ru.user_id
+  left join post_vote_agg pva on pva.user_id = ru.user_id
+  left join badges_agg ba on ba.user_id = ru.user_id
+  left join user_quality qa on qa.user_id = ru.user_id
+  left join user_question_enrichment ut on ut.user_id = ru.user_id
+  left join user_fav_received uf on uf.user_id = ru.user_id
+  left join active_streaks asq on asq.user_id = ru.user_id
+  left join recency_score rs on rs.user_id = ru.user_id
+  left join top_tag_per_user ttpu on ttpu.user_id = ru.user_id and ttpu.rnk = 1
+)
+select *
+from final
+order by
+  coalesce(accepted_a_count,0) desc,
+  coalesce(a_count,0) desc,
+  coalesce(q_high_score,0) desc,
+  reputation desc
+limit 200;

@@ -1,0 +1,130 @@
+WITH
+    q_posts AS (
+        SELECT
+            p.Id,
+            p.OwnerUserId,
+            p.Score,
+            p.CreationDate,
+            p.Tags,
+            p.Title,
+            p.FavoriteCount,
+            p.ViewCount
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+    ),
+
+    q_tags AS (
+        SELECT
+            q.Id            AS QuestionId,
+            unnest(string_to_array(substring(q.Tags, 2, length(q.Tags) - 2), '><')) AS TagName
+        FROM q_posts q
+        WHERE q.Tags IS NOT NULL
+    ),
+
+    tag_q_agg AS (
+        SELECT
+            t.TagName,
+            COUNT(DISTINCT t.QuestionId)                         AS QuestionCount,
+            SUM(q.Score)                                         AS TotalQuestionScore,
+            AVG(q.Score)                                         AS AvgQuestionScore,
+            SUM(q.FavoriteCount)                                 AS TotalFavorites,
+            SUM(q.ViewCount)                                     AS TotalViews,
+            MAX(q.CreationDate)                                  AS MostRecentQuestionDate
+        FROM q_tags t
+        JOIN q_posts q ON q.Id = t.QuestionId
+        GROUP BY t.TagName
+    ),
+
+    ans_stats AS (
+        SELECT
+            a.ParentId                                 AS QuestionId,
+            COUNT(*)                                   AS AnswerCount,
+            SUM(a.Score)                               AS TotalAnswerScore,
+            AVG(a.Score)                               AS AvgAnswerScore,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY a.Score) AS MedianAnswerScore,
+            MAX(a.CreationDate)                        AS MostRecentAnswerDate
+        FROM Posts a
+        WHERE a.PostTypeId = 2
+        GROUP BY a.ParentId
+    ),
+
+    user_stats AS (
+        SELECT
+            u.Id                                       AS UserId,
+            u.Reputation,
+            COUNT(b.Id)                                AS BadgeCount,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesGiven,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesGiven
+        FROM Users u
+        LEFT JOIN Badges b   ON b.UserId = u.Id
+        LEFT JOIN Votes v    ON v.UserId = u.Id
+        GROUP BY u.Id, u.Reputation
+    ),
+
+    close_history AS (
+        SELECT
+            ph.PostId                                AS QuestionId,
+            SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseVoteCount,
+            SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenVoteCount
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId IN (10, 11)
+        GROUP BY ph.PostId
+    ),
+
+    top_tags AS (
+        SELECT *
+        FROM tag_q_agg
+        ORDER BY TotalQuestionScore DESC
+        LIMIT 10
+    )
+
+SELECT
+    tt.TagName,
+    tt.QuestionCount,
+    tt.TotalQuestionScore,
+    tt.AvgQuestionScore,
+    tt.TotalFavorites,
+    tt.TotalViews,
+    tt.MostRecentQuestionDate,
+
+    COALESCE(SUM(a.AnswerCount), 0)               AS TotalAnswers,
+    COALESCE(SUM(a.TotalAnswerScore), 0)          AS TotalAnswerScore,
+    ROUND(COALESCE(AVG(a.AvgAnswerScore), 0), 2)  AS AvgAnswerScore,
+    ROUND(COALESCE(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY a.MedianAnswerScore), 0), 2) AS MedianAnswerScore,
+    MAX(a.MostRecentAnswerDate)                  AS MostRecentAnswerDate,
+
+    JSONB_AGG(
+        JSONB_BUILD_OBJECT(
+            'UserId',       u.UserId,
+            'Reputation',   u.Reputation,
+            'BadgeCount',   u.BadgeCount,
+            'UpVotesGiven', u.UpVotesGiven,
+            'DownVotesGiven', u.DownVotesGiven
+        )
+    ) FILTER (WHERE u.UserId IS NOT NULL)        AS TopContributors,
+
+    JSONB_AGG(
+        JSONB_BUILD_OBJECT(
+            'QuestionId',       q.Id,
+            'CloseVoteCount',   COALESCE(ch.CloseVoteCount, 0),
+            'ReopenVoteCount',  COALESCE(ch.ReopenVoteCount, 0),
+            'QuestionScore',    q.Score,
+            'CreationDate',     q.CreationDate
+        )
+    ) FILTER (WHERE q.Id IS NOT NULL)            AS QuestionCloseInfo
+
+FROM top_tags tt
+LEFT JOIN q_tags t          ON t.TagName = tt.TagName
+LEFT JOIN q_posts q         ON q.Id = t.QuestionId
+LEFT JOIN ans_stats a       ON a.QuestionId = q.Id
+LEFT JOIN user_stats u      ON u.UserId = q.OwnerUserId
+LEFT JOIN close_history ch ON ch.QuestionId = q.Id
+GROUP BY
+    tt.TagName,
+    tt.QuestionCount,
+    tt.TotalQuestionScore,
+    tt.AvgQuestionScore,
+    tt.TotalFavorites,
+    tt.TotalViews,
+    tt.MostRecentQuestionDate
+ORDER BY tt.TotalQuestionScore DESC;

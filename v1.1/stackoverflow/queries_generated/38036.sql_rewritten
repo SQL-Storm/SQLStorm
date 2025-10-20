@@ -1,0 +1,206 @@
+-- {"query": "38036.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 2008} 
+with
+recent_users as (
+  select u.id as user_id, u.displayname, u.reputation, u.creationdate
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+hot_questions as (
+  select p.id as question_id,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         p.ownernuserid as owner_user_id,
+         p.tags
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= (select max(creationdate) - interval '365 days' from posts where posttypeid = 1)
+),
+answers as (
+  select a.id as answer_id,
+         a.parentid as question_id,
+         a.owneruserid as owner_user_id,
+         a.score,
+         a.creationdate
+  from posts a
+  where a.posttypeid = 2
+),
+question_activity as (
+  select hq.question_id,
+         count(distinct c.id) as comment_count,
+         count(distinct v.id) filter (where v.votetypeid = 2) as upvotes,
+         count(distinct v.id) filter (where v.votetypeid = 3) as downvotes,
+         count(distinct v.id) filter (where v.votetypeid in (8,9)) as bounty_events,
+         max(coalesce(c.creationdate, v.creationdate, hq.creationdate)) as last_interaction
+  from hot_questions hq
+  left join comments c on c.postid = hq.question_id
+  left join votes v on v.postid = hq.question_id
+  group by hq.question_id
+),
+answer_stats as (
+  select a.question_id,
+         count(*) as answer_count,
+         avg(a.score) as avg_answer_score,
+         max(a.score) as max_answer_score,
+         min(a.creationdate) as first_answer_date,
+         max(a.creationdate) as last_answer_date
+  from answers a
+  group by a.question_id
+),
+owner_metrics as (
+  select hq.question_id,
+         u.user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate as user_creationdate,
+         coalesce(sum(case when b.class = 1 then 1 else 0 end),0) as gold_badges,
+         coalesce(sum(case when b.class = 2 then 1 else 0 end),0) as silver_badges,
+         coalesce(sum(case when b.class = 3 then 1 else 0 end),0) as bronze_badges
+  from hot_questions hq
+  left join users u on u.id = hq.owner_user_id
+  left join badges b on b.userid = u.id
+  group by hq.question_id, u.user_id, u.displayname, u.reputation, u.creationdate
+),
+tag_expansion as (
+  select hq.question_id, unnest(string_to_array(substring(hq.tags, 2, length(hq.tags)-2), '><')) as tag
+  from hot_questions hq
+  where hq.tags is not null and hq.tags <> ''
+),
+tag_rank as (
+  select te.tag,
+         count(*) as tag_usage,
+         count(distinct te.question_id) as distinct_questions
+  from tag_expansion te
+  group by te.tag
+),
+duplicates as (
+  select pl.postid as question_id, count(*) as duplicate_links
+  from postlinks pl
+  where pl.linktypeid = 3
+  group by pl.postid
+),
+closed_reasons as (
+  select ph.postid as question_id,
+         max(ph.creationdate) as last_closed_date,
+         max(case when ph.posthistorytypeid = 10 then ph.comment end) as last_close_reason_id
+  from posthistory ph
+  where ph.posthistorytypeid in (10)
+  group by ph.postid
+),
+reopened as (
+  select ph.postid as question_id,
+         max(ph.creationdate) as last_reopen_date
+  from posthistory ph
+  where ph.posthistorytypeid in (11)
+  group by ph.postid
+),
+question_quality as (
+  select hq.question_id,
+         hq.score,
+         qa.answer_count,
+         qa.avg_answer_score,
+         qa.max_answer_score,
+         qa.first_answer_date,
+         qa.last_answer_date,
+         qa.answer_count + coalesce(qa.avg_answer_score,0) + coalesce(qa.max_answer_score,0) as engagement_score,
+         qa.answer_count / nullif(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - hq.creationdate))/3600,0) as answers_per_hour,
+         qa.answer_count / nullif(extract(epoch from (coalesce(qa.last_answer_date, cast('2024-10-01 12:34:56' as timestamp)) - coalesce(qa.first_answer_date, hq.creationdate)))/3600,0) as answer_density
+  from hot_questions hq
+  left join answer_stats qa on qa.question_id = hq.question_id
+),
+owner_activity as (
+  select hq.question_id,
+         coalesce(sum(case when v.votetypeid = 2 then 1 else 0 end),0) as owner_upvotes_cast_on_answers,
+         coalesce(sum(case when v.votetypeid = 3 then 1 else 0 end),0) as owner_downvotes_cast_on_answers
+  from hot_questions hq
+  left join answers a on a.question_id = hq.question_id
+  left join votes v on v.postid = a.answer_id and v.userid = hq.owner_user_id
+  group by hq.question_id
+),
+hotness as (
+  select hq.question_id,
+         qa.answer_count,
+         qa.avg_answer_score,
+         qa.max_answer_score,
+         qa.first_answer_date,
+         qa.last_answer_date,
+         qa.engagement_score,
+         qa.answers_per_hour,
+         qa.answer_density,
+         qa.answer_count * 2
+         + coalesce(qa.avg_answer_score,0) * 1.5
+         + coalesce(qa.max_answer_score,0) * 0.5
+         + coalesce(qa.answer_density,0) * 4
+         + coalesce(qa.answers_per_hour,0) * 6
+         + coalesce(qa.engagement_score,0) * 0.75 as hotness_score
+  from question_quality qa
+  join hot_questions hq on hq.question_id = qa.question_id
+),
+final as (
+  select
+    hq.question_id,
+    hq.creationdate as question_created,
+    hq.viewcount,
+    hq.score as question_score,
+    qa.answer_count,
+    qa.avg_answer_score,
+    qa.max_answer_score,
+    qa.first_answer_date,
+    qa.last_answer_date,
+    qa.engagement_score,
+    qa.answers_per_hour,
+    qa.answer_density,
+    qa.engagement_score as engagement,
+    qa.answers_per_hour as velocity,
+    qa.answer_density as density,
+    qa.answer_count * 2 + coalesce(qa.avg_answer_score,0) + coalesce(qa.max_answer_score,0) as composite,
+    qa.answer_count as answers,
+    qa.avg_answer_score as avg_ans_score,
+    qa.max_answer_score as max_ans_score,
+    qa.first_answer_date as first_ans,
+    qa.last_answer_date as last_ans,
+    qa.answers_per_hour as ans_per_hr,
+    qa.answer_density as ans_density,
+    qa.engagement_score as engage,
+    qm.upvotes as q_upvotes,
+    qm.downvotes as q_downvotes,
+    qm.comment_count,
+    qm.bounty_events,
+    qm.last_interaction,
+    om.owner_upvotes_cast_on_answers,
+    om.owner_downvotes_cast_on_answers,
+    om.owner_upvotes_cast_on_answers - om.owner_downvotes_cast_on_answers as owner_vote_delta,
+    coalesce(d.duplicate_links,0) as dup_links,
+    cr.last_closed_date,
+    cr.last_close_reason_id,
+    r.last_reopen_date,
+    o.displayname as owner_name,
+    o.reputation as owner_rep,
+    o.gold_badges,
+    o.silver_badges,
+    o.bronze_badges,
+    ht.hotness_score,
+    percentile_disc(0.9) within group (order by qa.engagement_score) over () as p90_engagement,
+    percentile_disc(0.9) within group (order by ht.hotness_score) over () as p90_hotness,
+    tr.tag,
+    tr.tag_usage,
+    tr.distinct_questions
+  from hot_questions hq
+  left join question_activity qm on qm.question_id = hq.question_id
+  left join question_quality qa on qa.question_id = hq.question_id
+  left join owner_metrics o on o.question_id = hq.question_id
+  left join owner_activity om on om.question_id = hq.question_id
+  left join duplicates d on d.question_id = hq.question_id
+  left join closed_reasons cr on cr.question_id = hq.question_id
+  left join reopened r on r.question_id = hq.question_id
+  left join hotness ht on ht.question_id = hq.question_id
+  left join tag_expansion te on te.question_id = hq.question_id
+  left join tag_rank tr on tr.tag = te.tag
+)
+select *
+from final
+where
+  (score > 0 or engagement > 0)
+  and (hotness_score >= p90_hotness or engagement >= p90_engagement)
+order by hotness_score desc nulls last, engagement desc nulls last, viewcount desc nulls last
+limit 500;

@@ -1,0 +1,236 @@
+with recent_users as (
+  select u.id as user_id, u.reputation, u.creationdate
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+active_questions as (
+  select p.id as question_id,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         p.owneruserid,
+         p.tags,
+         coalesce(p.answercount, 0) as answercount
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= (select max(creationdate) - interval '365 days' from posts where posttypeid = 1)
+),
+answers as (
+  select a.id as answer_id,
+         a.parentid as question_id,
+         a.owneruserid as answerer_id,
+         a.score as answer_score,
+         a.creationdate as answer_date
+  from posts a
+  where a.posttypeid = 2
+),
+latest_comment_per_post as (
+  select c.postid,
+         max(c.creationdate) as last_comment_date
+  from comments c
+  group by c.postid
+),
+vote_aggs as (
+  select v.postid,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+         sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+         sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+         sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+         count(*) as total_votes
+  from votes v
+  group by v.postid
+),
+tag_expansion as (
+  select q.question_id,
+         unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')) as tag
+  from active_questions q
+  where q.tags is not null and q.tags like '<%>'
+),
+top_tags as (
+  select tag, count(*) as tag_use_count
+  from tag_expansion
+  group by tag
+  having count(*) >= 50
+),
+question_tagged as (
+  select te.question_id, te.tag
+  from tag_expansion te
+  join top_tags tt on tt.tag = te.tag
+),
+question_metrics as (
+  select
+    q.question_id,
+    q.creationdate,
+    q.score as question_score,
+    q.viewcount,
+    q.answercount,
+    q.tags,
+    coalesce(va.upvotes,0) as upvotes,
+    coalesce(va.downvotes,0) as downvotes,
+    coalesce(va.favorites,0) as favorites,
+    coalesce(va.total_votes,0) as total_votes,
+    coalesce(va.bounty_started,0) as bounty_started,
+    coalesce(va.bounty_awarded,0) as bounty_awarded,
+    lc.last_comment_date,
+    case when q.answercount > 0 then 1 else 0 end as has_answers
+  from active_questions q
+  left join vote_aggs va on va.postid = q.question_id
+  left join latest_comment_per_post lc on lc.postid = q.question_id
+),
+accepted_answer_age as (
+  select
+    q.id as question_id,
+    q.creationdate as question_date,
+    a.id as accepted_answer_id,
+    a.creationdate as accepted_answer_date,
+    extract(epoch from (a.creationdate - q.creationdate)) / 3600.0 as hours_to_accept
+  from posts q
+  join posts a on a.id = q.acceptedanswerid
+  where q.posttypeid = 1
+),
+fast_accept as (
+  select question_id,
+         min(hours_to_accept) as min_hours_to_accept
+  from accepted_answer_age
+  group by question_id
+),
+first_answer_latency as (
+  select
+    a.question_id,
+    min(extract(epoch from (a.answer_date - q.creationdate)) / 3600.0) as hours_to_first_answer
+  from answers a
+  join posts q on q.id = a.question_id and q.posttypeid = 1
+  group by a.question_id
+),
+answerers_recent as (
+  select a.answerer_id
+  from answers a
+  join recent_users ru on ru.user_id = a.answerer_id
+  group by a.answerer_id
+),
+question_activity as (
+  select
+    qm.question_id,
+    count(a.answer_id) as total_answers,
+    sum(case when a.answer_score > 0 then 1 else 0 end) as positive_answers,
+    sum(case when a.answer_score < 0 then 1 else 0 end) as negative_answers,
+    max(a.answer_date) as last_answer_date,
+    count(distinct case when ar.answerer_id is not null then a.answerer_id end) as distinct_recent_answerers
+  from question_metrics qm
+  left join answers a on a.question_id = qm.question_id
+  left join answerers_recent ar on ar.answerer_id = a.answerer_id
+  group by qm.question_id
+),
+dup_links as (
+  select pl.postid as dup_id, count(*) as dup_count
+  from postlinks pl
+  where pl.linktypeid = 3
+  group by pl.postid
+),
+close_events as (
+  select ph.postid,
+         min(ph.creationdate) as first_close_date,
+         max(ph.creationdate) as last_close_date,
+         count(case when ph.posthistorytypeid = 10 then 1 end) as close_votes_count
+  from posthistory ph
+  where ph.posthistorytypeid in (10,11)
+  group by ph.postid
+),
+tag_cohort as (
+  select qt.question_id, qt.tag
+  from question_tagged qt
+),
+tag_stats as (
+  select
+    tc.tag,
+    count(*) as questions_in_tag,
+    avg(qm.viewcount) as avg_views_in_tag,
+    avg(qm.question_score) as avg_score_in_tag,
+    percentile_cont(0.9) within group (order by qm.viewcount) as p90_views_in_tag
+  from tag_cohort tc
+  join question_metrics qm on qm.question_id = tc.question_id
+  group by tc.tag
+),
+question_tag_rollup as (
+  select
+    tc.question_id,
+    count(*) as tag_count,
+    max(ts.p90_views_in_tag) as cohort_p90_views_max,
+    avg(ts.avg_score_in_tag) as cohort_avg_score_mean
+  from tag_cohort tc
+  join tag_stats ts on ts.tag = tc.tag
+  group by tc.question_id
+),
+final as (
+  select
+    qm.question_id,
+    qm.creationdate,
+    qm.question_score,
+    qm.viewcount,
+    qm.answercount,
+    qm.upvotes,
+    qm.downvotes,
+    qm.favorites,
+    qm.total_votes,
+    qm.bounty_started,
+    qm.bounty_awarded,
+    qa.total_answers,
+    qa.positive_answers,
+    qa.negative_answers,
+    qa.last_answer_date,
+    qa.distinct_recent_answerers,
+    fa.min_hours_to_accept,
+    fal.hours_to_first_answer,
+    coalesce(dl.dup_count, 0) as duplicate_links,
+    ce.first_close_date,
+    ce.last_close_date,
+    ce.close_votes_count,
+    qtr.tag_count,
+    qtr.cohort_p90_views_max,
+    qtr.cohort_avg_score_mean,
+    greatest(
+      coalesce(cast(qm.viewcount as numeric),0) / nullif((extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - qm.creationdate))/86400.0),0),
+      0
+    ) as views_per_day,
+    least(
+      coalesce(qm.downvotes,0) * 1.0 / nullif((qm.total_votes),0),
+      1
+    ) as downvote_ratio
+  from question_metrics qm
+  left join question_activity qa on qa.question_id = qm.question_id
+  left join fast_accept fa on fa.question_id = qm.question_id
+  left join first_answer_latency fal on fal.question_id = qm.question_id
+  left join dup_links dl on dl.dup_id = qm.question_id
+  left join close_events ce on ce.postid = qm.question_id
+  left join question_tag_rollup qtr on qtr.question_id = qm.question_id
+)
+select
+  f.question_id,
+  f.creationdate,
+  f.viewcount,
+  f.question_score,
+  f.answercount,
+  f.total_answers,
+  f.positive_answers,
+  f.negative_answers,
+  f.upvotes,
+  f.downvotes,
+  f.favorites,
+  f.views_per_day,
+  f.downvote_ratio,
+  f.min_hours_to_accept,
+  f.hours_to_first_answer,
+  f.duplicate_links,
+  f.first_close_date,
+  f.last_close_date,
+  f.close_votes_count,
+  f.tag_count,
+  f.cohort_p90_views_max,
+  f.cohort_avg_score_mean
+from final f
+where f.viewcount is not null
+order by
+  f.views_per_day desc,
+  f.question_score desc
+limit 1000;

@@ -1,0 +1,182 @@
+WITH recent_posts AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.ParentId
+    FROM Posts p
+    WHERE p.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '30' DAY
+),
+
+user_posts AS (
+    SELECT
+        u.Id                                      AS UserId,
+        u.DisplayName,
+        SUM(CASE WHEN rp.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN rp.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        COALESCE(SUM(rp.Score),0)                 AS TotalScore
+    FROM Users u
+    LEFT JOIN recent_posts rp
+        ON u.Id = rp.OwnerUserId
+    GROUP BY u.Id, u.DisplayName
+),
+
+user_votes AS (
+    SELECT
+        v.UserId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesGiven
+    FROM Votes v
+    GROUP BY v.UserId
+),
+
+user_badges AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+tag_activity AS (
+    SELECT
+        u.Id      AS UserId,
+        t.TagName,
+        COUNT(*)  AS TagUsage
+    FROM Users u
+    JOIN Posts p
+        ON u.Id = p.OwnerUserId
+    -- split tags by angle brackets into rows in a portable way: remove leading/trailing '<' '>' and split on '><'
+    -- many DBs do not have regexp_split_to_table; emulate with a simple replace and STRING_SPLIT style if available.
+    -- Here we assume Tags like '<tag1><tag2>'; replace leading/trailing '<' '>' with delimiter and split via a generic method:
+    -- Use a recursive CTE to split tags in a dialect-neutral way
+    CROSS JOIN (
+      SELECT p.Id AS post_id, p.Tags AS tags_raw
+    ) pr
+    JOIN (
+      -- recursive splitter
+      SELECT post_id, TRIM(BOTH '<>' FROM tags_raw) AS remaining, NULL::varchar AS tag, 0 AS lvl
+      FROM (SELECT pr.post_id, pr.tags_raw) x
+      WHERE pr.tags_raw IS NOT NULL
+      UNION ALL
+      SELECT s.post_id,
+             CASE
+               WHEN POSITION('><' IN s.remaining) > 0 THEN SUBSTR(s.remaining, POSITION('><' IN s.remaining) + 2)
+               ELSE ''
+             END AS remaining,
+             CASE
+               WHEN POSITION('><' IN s.remaining) > 0 THEN SUBSTR(s.remaining, 1, POSITION('><' IN s.remaining)-1)
+               ELSE s.remaining
+             END AS tag,
+             s.lvl + 1
+      FROM (
+        -- anchor
+        SELECT pr.post_id, TRIM(BOTH '<>' FROM pr.tags_raw) AS remaining, NULL::varchar AS tag, 0 AS lvl
+        FROM (SELECT pr.post_id, pr.tags_raw) pr
+        WHERE pr.tags_raw IS NOT NULL
+      ) s
+      WHERE s.remaining <> ''
+    ) splitter ON splitter.post_id = p.Id
+    JOIN Tags t
+      ON t.TagName = splitter.tag
+    WHERE p.PostTypeId = 1
+    GROUP BY u.Id, t.TagName
+),
+
+top_tags AS (
+    -- build a comma-separated list of top 5 tags per user in a portable way
+    SELECT
+      ta.UserId,
+      STRING_AGG(ta.TagName, ',') AS Top5Tags
+    FROM (
+      SELECT
+        ta_inner.UserId,
+        ta_inner.TagName,
+        ta_inner.TagUsage,
+        ROW_NUMBER() OVER (PARTITION BY ta_inner.UserId ORDER BY ta_inner.TagUsage DESC, ta_inner.TagName) AS rn
+      FROM tag_activity ta_inner
+    ) ta
+    WHERE ta.rn <= 5
+    GROUP BY ta.UserId
+),
+
+post_history_json AS (
+    SELECT
+        ph.PostId,
+        -- parse JSON and cast to integer using standard SQL functions where available
+        CAST(JSON_VALUE(ph.Text, '$.closeReasonId') AS INTEGER) AS CloseReasonId
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+),
+
+combined AS (
+    SELECT
+        up.UserId,
+        up.DisplayName,
+        up.QuestionCount,
+        up.AnswerCount,
+        up.TotalScore,
+        COALESCE(uv.UpVotesGiven,0)   AS UpVotesGiven,
+        COALESCE(uv.DownVotesGiven,0) AS DownVotesGiven,
+        COALESCE(ub.GoldBadges,0)     AS GoldBadges,
+        COALESCE(ub.SilverBadges,0)   AS SilverBadges,
+        COALESCE(ub.BronzeBadges,0)   AS BronzeBadges,
+        tt.Top5Tags,
+        phc.CloseReasonId
+    FROM user_posts up
+    LEFT JOIN user_votes uv
+        ON up.UserId = uv.UserId
+    LEFT JOIN user_badges ub
+        ON up.UserId = ub.UserId
+    LEFT JOIN top_tags tt
+        ON up.UserId = tt.UserId
+    LEFT JOIN (
+        SELECT phc.PostId, phc.CloseReasonId
+        FROM (
+          SELECT phc.*,
+                 ROW_NUMBER() OVER (PARTITION BY phc.PostId ORDER BY phc.CloseReasonId DESC) AS rn
+          FROM post_history_json phc
+        ) phc
+        WHERE phc.rn = 1
+    ) phc
+        ON phc.PostId = (
+            SELECT p.Id
+            FROM Posts p
+            WHERE p.OwnerUserId = up.UserId
+              AND p.PostTypeId = 1
+            ORDER BY p.CreationDate DESC
+            LIMIT 1
+        )
+)
+
+SELECT
+    c.UserId,
+    c.DisplayName,
+    c.QuestionCount,
+    c.AnswerCount,
+    c.TotalScore,
+    COALESCE(c.UpVotesGiven,0)   AS UpVotesGiven,
+    COALESCE(c.DownVotesGiven,0) AS DownVotesGiven,
+    COALESCE(c.GoldBadges,0)     AS GoldBadges,
+    COALESCE(c.SilverBadges,0)   AS SilverBadges,
+    COALESCE(c.BronzeBadges,0)   AS BronzeBadges,
+    c.Top5Tags,
+    COALESCE(c.CloseReasonId,0) AS LastCloseReasonId,
+    (c.TotalScore * 0.4
+     + c.QuestionCount * 0.3
+     + c.AnswerCount * 0.2
+     + COALESCE(c.GoldBadges,0)   * 5
+     + COALESCE(c.SilverBadges,0) * 3
+     + COALESCE(c.BronzeBadges,0) * 1
+     + COALESCE(c.UpVotesGiven,0) * 0.05
+     - COALESCE(c.DownVotesGiven,0) * 0.10) AS ActivityScore
+FROM combined c
+ORDER BY ActivityScore DESC
+LIMIT 100;

@@ -1,0 +1,73 @@
+WITH UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(c.Score) AS TotalCommentScore,
+        COUNT(DISTINCT v.Id) AS TotalVotesReceived
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    WHERE u.CreationDate < '2020-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+BadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        SUM(CASE WHEN b.TagBased = TRUE THEN 1 ELSE 0 END) AS TagBasedBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TopUsers AS (
+    SELECT 
+        ups.UserId,
+        ups.DisplayName,
+        ups.Reputation,
+        ups.TotalPosts,
+        ups.Questions,
+        ups.Answers,
+        ups.AvgPostScore,
+        ups.TotalCommentScore,
+        ups.TotalVotesReceived,
+        bs.TotalBadges,
+        bs.GoldBadges,
+        bs.SilverBadges,
+        bs.BronzeBadges,
+        bs.TagBasedBadges,
+        RANK() OVER (ORDER BY ups.Reputation DESC) AS ReputationRank,
+        RANK() OVER (ORDER BY ups.TotalPosts DESC) AS PostRank
+    FROM UserPostStats ups
+    JOIN BadgeStats bs ON ups.UserId = bs.UserId
+)
+SELECT 
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.TotalPosts,
+    tu.Questions,
+    tu.Answers,
+    ROUND(tu.AvgPostScore::numeric, 2) AS AvgPostScore,
+    tu.TotalCommentScore,
+    tu.TotalVotesReceived,
+    tu.TotalBadges,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    tu.TagBasedBadges,
+    tu.ReputationRank,
+    tu.PostRank,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = tu.UserId) AS PostEdits,
+    (SELECT SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) FROM PostLinks pl WHERE pl.PostId IN (SELECT p.Id FROM Posts p WHERE p.OwnerUserId = tu.UserId)) AS DuplicatesLinked
+FROM TopUsers tu
+WHERE tu.Reputation > 1000
+ORDER BY tu.Reputation DESC, tu.TotalPosts DESC
+LIMIT 100;

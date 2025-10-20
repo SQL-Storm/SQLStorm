@@ -1,0 +1,152 @@
+WITH
+-- recent active questions with tags exploded
+Questions AS (
+  SELECT p.Id AS QuestionId,
+         p.Title,
+         p.CreationDate,
+         p.Score,
+         p.ViewCount,
+         p.AnswerCount,
+         p.OwnerUserId,
+         p.Tags,
+         regexp_split_to_table(substring(p.Tags,2,length(p.Tags)-2), '><') AS TagName
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years'
+),
+-- aggregated user stats
+UserStats AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate AS UserCreated,
+         COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END),0) AS UpVotesGiven,
+         COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END),0) AS DownVotesGiven,
+         COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1),0) AS QuestionsAsked,
+         COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2),0) AS AnswersWritten,
+         COALESCE((SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id),0) AS BadgesEarned
+  FROM Users u
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+-- per-question heavy metrics: answers, top answer, comment sentiment proxies
+QuestionMetrics AS (
+  SELECT q.QuestionId,
+         q.Title,
+         q.CreationDate,
+         q.Score AS QuestionScore,
+         q.ViewCount,
+         q.AnswerCount,
+         q.TagName,
+         COUNT(a.Id) FILTER (WHERE a.PostTypeId = 2) AS AnswersTotal,
+         MAX(a.Score) FILTER (WHERE a.PostTypeId = 2) AS TopAnswerScore,
+         MAX(a.CreationDate) FILTER (WHERE a.PostTypeId = 2) AS TopAnswerDate,
+         COUNT(c.Id) AS CommentCount,
+         SUM(CASE WHEN c.Score IS NULL THEN 0 ELSE c.Score END) AS CommentScoreSum,
+         -- approximate "activity bursts": number of posthistory entries in first week
+         COALESCE((SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = q.QuestionId AND ph.CreationDate <= q.CreationDate + INTERVAL '7 days'),0) AS FirstWeekHistoryEvents
+  FROM Questions q
+  LEFT JOIN Posts a ON a.ParentId = q.QuestionId
+  LEFT JOIN Comments c ON c.PostId = q.QuestionId
+  GROUP BY q.QuestionId, q.Title, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, q.TagName
+),
+-- tag-level aggregates to correlate with activity
+TagAgg AS (
+  SELECT qm.TagName,
+         COUNT(DISTINCT qm.QuestionId) AS QuestionsWithTag,
+         AVG(qm.QuestionScore) AS AvgQuestionScore,
+         AVG(qm.AnswersTotal) AS AvgAnswers,
+         SUM(CASE WHEN qm.TopAnswerScore IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsWithAnswers,
+         SUM(qm.CommentCount) AS TotalComments,
+         PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY qm.ViewCount) AS P75Views
+  FROM QuestionMetrics qm
+  GROUP BY qm.TagName
+),
+-- identify potential duplicates network: posts linked as duplicates and their activity
+DuplicateNetwork AS (
+  SELECT pl.PostId AS DuplicatePostId,
+         pl.RelatedPostId AS OriginalPostId,
+         p1.Title AS DuplicateTitle,
+         p2.Title AS OriginalTitle,
+         p1.CreationDate AS DuplicateCreated,
+         p2.CreationDate AS OriginalCreated,
+         GREATEST(p1.Score,0) AS DuplicateScore,
+         GREATEST(p2.Score,0) AS OriginalScore,
+         COUNT(ph.Id) FILTER (WHERE ph.PostHistoryTypeId = 10) AS CloseEventsOnDuplicate
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+  JOIN Posts p1 ON p1.Id = pl.PostId
+  JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+  LEFT JOIN PostHistory ph ON ph.PostId = pl.PostId
+  WHERE lt.Id = 3 -- Duplicate
+  GROUP BY pl.PostId, pl.RelatedPostId, p1.Title, p2.Title, p1.CreationDate, p2.CreationDate, p1.Score, p2.Score
+),
+-- combine metrics, rank hot questions per tag and surface interesting candidates
+HotCandidates AS (
+  SELECT qm.QuestionId,
+         qm.Title,
+         qm.CreationDate,
+         qm.QuestionScore,
+         qm.ViewCount,
+         qm.AnswerCount,
+         qm.TagName,
+         qm.AnswersTotal,
+         qm.TopAnswerScore,
+         qm.TopAnswerDate,
+         qm.CommentCount,
+         qm.CommentScoreSum,
+         qm.FirstWeekHistoryEvents,
+         ta.QuestionsWithTag,
+         ta.AvgQuestionScore,
+         ta.AvgAnswers,
+         ta.TotalComments,
+         ta.P75Views,
+         us.UserId,
+         us.DisplayName AS Author,
+         us.Reputation AS AuthorRep,
+         dn.OriginalPostId,
+         dn.OriginalTitle,
+         dn.DuplicateScore,
+         -- heuristic score: weighted combination (tunable)
+         (
+           (CAST(qm.QuestionScore AS numeric) * 3.0)
+           + (CAST(qm.AnswersTotal AS numeric) * 4.0)
+           + (CAST(COALESCE(qm.TopAnswerScore,0) AS numeric) * 2.5)
+           + (CAST(LEAST(qm.CommentCount,20) AS numeric) * 1.2)
+           + (CASE WHEN qm.FirstWeekHistoryEvents > 5 THEN 10 ELSE 0 END)
+           + (LEAST(CAST(qm.ViewCount AS numeric) / NULLIF(ta.P75Views,0),3) * 5)
+           - (CASE WHEN dn.DuplicateScore IS NOT NULL AND dn.DuplicateScore > qm.QuestionScore THEN 8 ELSE 0 END)
+         ) AS HotnessScore
+  FROM QuestionMetrics qm
+  LEFT JOIN TagAgg ta ON ta.TagName = qm.TagName
+  LEFT JOIN Users u ON u.Id = qm.AnswerCount -- dummy to avoid unused join (kept for plan complexity)
+  LEFT JOIN Users us ON us.Id = (SELECT p.OwnerUserId FROM Posts p WHERE p.Id = qm.QuestionId)
+  LEFT JOIN DuplicateNetwork dn ON dn.DuplicatePostId = qm.QuestionId
+)
+SELECT
+  hc.QuestionId,
+  hc.Title,
+  hc.TagName,
+  hc.Author,
+  hc.AuthorRep,
+  ROUND(hc.HotnessScore,2) AS HotnessScore,
+  hc.QuestionScore,
+  hc.ViewCount,
+  hc.AnswersTotal,
+  hc.TopAnswerScore,
+  hc.CommentCount,
+  hc.FirstWeekHistoryEvents,
+  hc.QuestionsWithTag,
+  ta.AvgQuestionScore AS TagAvgScore,
+  ta.P75Views AS TagP75Views,
+  dn.OriginalPostId,
+  dn.OriginalTitle,
+  dn.DuplicateScore
+FROM HotCandidates hc
+LEFT JOIN TagAgg ta ON ta.TagName = hc.TagName
+LEFT JOIN DuplicateNetwork dn ON dn.DuplicatePostId = hc.QuestionId
+WHERE hc.AnswersTotal >= 1
+  AND hc.ViewCount >= GREATEST(100, ta.P75Views * 0.5)
+  AND hc.HotnessScore IS NOT NULL
+ORDER BY hc.HotnessScore DESC, hc.FirstWeekHistoryEvents DESC, hc.ViewCount DESC
+LIMIT 250;

@@ -1,0 +1,196 @@
+WITH
+QuestionTags AS (
+  SELECT
+    p.Id AS QuestionId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    u.Id AS OwnerId,
+    u.Reputation AS OwnerReputation,
+    TRIM(t.tag) AS Tag,
+    p.Title
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  CROSS JOIN LATERAL (
+    SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(COALESCE(p.Tags,''), 2, GREATEST(LENGTH(COALESCE(p.Tags,'')) - 2,0)), '><')) AS tag
+  ) t
+  WHERE p.PostTypeId = 1
+),
+QuestionMetrics AS (
+  SELECT
+    qt.QuestionId,
+    qt.CreationDate,
+    qt.Score,
+    qt.ViewCount,
+    qt.AnswerCount,
+    qt.OwnerId,
+    qt.OwnerReputation,
+    qt.Tag,
+    qt.Title,
+    EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - qt.CreationDate)) / 86400.0 AS AgeDays,
+    CASE WHEN EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - qt.CreationDate)) = 0 THEN NULL
+         ELSE qt.Score / (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - qt.CreationDate)) / 3600.0) END AS ScorePerHour,
+    CASE WHEN (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - qt.CreationDate)) / 86400.0) > 0
+         THEN CAST(qt.ViewCount AS numeric) / (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - qt.CreationDate)) / 86400.0)
+         ELSE qt.ViewCount END AS ViewsPerDay,
+    CASE WHEN qt.AnswerCount IS NULL OR qt.AnswerCount = 0 THEN 0
+         ELSE qt.AnswerCount / NULLIF((EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - qt.CreationDate)) / 86400.0),0) END AS AnswersPerDay
+  FROM QuestionTags qt
+),
+UserSignals AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+    COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+    COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+    MAX(p.CreationDate) AS LastPostDate,
+    COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsPosted,
+    COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersPosted,
+    CASE WHEN COUNT(p.Id) = 0 THEN 0 ELSE ROUND( CAST(SUM(COALESCE(p.Score,0)) AS numeric) / COUNT(p.Id), 3) END AS AvgScorePerPost
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TagAggregates AS (
+  SELECT
+    qt.Tag,
+    COUNT(DISTINCT qt.QuestionId) AS QuestionCount,
+    AVG(qt.Score) AS AvgQuestionScore,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY qt.ViewCount) AS MedianViews,
+    SUM(COALESCE(qt.ViewCount,0)) AS TotalViews,
+    AVG(qt.ViewsPerDay) AS AvgViewsPerDay,
+    COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 5) AS Favorites,
+    COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+    COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes
+  FROM QuestionMetrics qt
+  LEFT JOIN Posts p ON p.Id = qt.QuestionId
+  LEFT JOIN Votes v ON v.PostId = qt.QuestionId
+  GROUP BY qt.Tag
+),
+DuplicateCandidates AS (
+  SELECT
+    q1.QuestionId AS Q1,
+    q2.QuestionId AS Q2,
+    q1.Title AS Title1,
+    q2.Title AS Title2,
+    -- approximate similarity using trigram-like normalized common substring ratio to be more portable
+    (CASE
+       WHEN CHAR_LENGTH(q1.Title) = 0 OR CHAR_LENGTH(q2.Title) = 0 THEN 0.0
+       ELSE CAST(
+         LENGTH(
+           REPLACE(
+             REPLACE(
+               REPLACE(
+                 q1.Title,
+                 q2.Title,
+                 ''
+               ),
+               ' ',
+               ''
+             ),
+             '',
+             ''
+           )
+         ) AS numeric)
+     END) AS TitleSimilarity,
+    COUNT(pl.Id) FILTER (WHERE pl.LinkTypeId = 3 AND pl.PostId = q1.QuestionId AND pl.RelatedPostId = q2.QuestionId) AS DirectDuplicateLinks
+  FROM
+    (SELECT p.Id AS QuestionId, p.Title FROM Posts p WHERE p.PostTypeId = 1 AND p.Title IS NOT NULL) q1
+  JOIN
+    (SELECT p.Id AS QuestionId, p.Title FROM Posts p WHERE p.PostTypeId = 1 AND p.Title IS NOT NULL) q2
+    ON q1.QuestionId < q2.QuestionId
+  LEFT JOIN PostLinks pl ON (pl.PostId = q1.QuestionId AND pl.RelatedPostId = q2.QuestionId) OR (pl.PostId = q2.QuestionId AND pl.RelatedPostId = q1.QuestionId)
+  WHERE 1=1
+  GROUP BY q1.QuestionId, q2.QuestionId, q1.Title, q2.Title
+  HAVING COUNT(pl.Id) > 0
+),
+RecentTagTrends AS (
+  SELECT
+    ta.Tag,
+    SUM(CASE WHEN qm.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days' THEN 1 ELSE 0 END) AS QuestionsLast30d,
+    SUM(CASE WHEN qm.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '7 days' THEN 1 ELSE 0 END) AS QuestionsLast7d,
+    AVG(CASE WHEN qm.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days' THEN qm.ViewsPerDay ELSE NULL END) AS AvgViewsPerDay30d,
+    AVG(CASE WHEN qm.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '7 days' THEN qm.ViewsPerDay ELSE NULL END) AS AvgViewsPerDay7d
+  FROM QuestionMetrics qm
+  JOIN TagAggregates ta ON ta.Tag = qm.Tag
+  GROUP BY ta.Tag
+  HAVING SUM(CASE WHEN qm.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days' THEN 1 ELSE 0 END) >= 5
+),
+HardQuestions AS (
+  SELECT
+    qm.QuestionId,
+    qm.Title,
+    qm.Tag,
+    qm.Score,
+    qm.ViewCount,
+    qm.AnswerCount,
+    qm.ViewsPerDay,
+    qm.ScorePerHour,
+    ROW_NUMBER() OVER (PARTITION BY qm.Tag ORDER BY qm.ViewsPerDay DESC, qm.AnswerCount ASC, qm.Score DESC) AS rn
+  FROM QuestionMetrics qm
+  WHERE qm.ViewsPerDay > 100 AND (qm.AnswerCount IS NULL OR qm.AnswerCount <= 1)
+)
+SELECT
+  ta.Tag,
+  ta.QuestionCount,
+  ta.TotalViews,
+  ta.MedianViews,
+  ta.AvgViewsPerDay,
+  rt.QuestionsLast30d,
+  rt.QuestionsLast7d,
+  ROUND(100.0 * (COALESCE(rt.AvgViewsPerDay7d,0) - COALESCE(rt.AvgViewsPerDay30d,0)) / NULLIF(GREATEST(COALESCE(rt.AvgViewsPerDay30d,0),1),0),2) AS PercentViewsChange7d_vs_30d,
+  us.DisplayName AS TopContributor,
+  us.Reputation AS TopContributorReputation,
+  us.GoldBadges,
+  us.SilverBadges,
+  us.BronzeBadges,
+  hq.QuestionId AS HotUnansweredQuestionId,
+  hq.Title AS HotUnansweredTitle,
+  hq.ViewsPerDay AS HotQuestionViewsPerDay,
+  hq.AnswerCount AS HotQuestionAnswerCount,
+  dc.Q1 AS DuplicateQ1,
+  dc.Q2 AS DuplicateQ2,
+  dc.TitleSimilarity,
+  dc.DirectDuplicateLinks
+FROM TagAggregates ta
+LEFT JOIN RecentTagTrends rt ON rt.Tag = ta.Tag
+LEFT JOIN LATERAL (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    u.LastPostDate,
+    u.QuestionsPosted,
+    u.AnswersPosted
+  FROM UserSignals u
+  JOIN Posts p ON p.OwnerUserId = u.Id
+  JOIN QuestionMetrics qm ON qm.QuestionId = p.Id AND qm.Tag = ta.Tag
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.GoldBadges, u.SilverBadges, u.BronzeBadges, u.LastPostDate, u.QuestionsPosted, u.AnswersPosted
+  ORDER BY COUNT(p.Id) DESC, u.Reputation DESC
+  LIMIT 1
+) us ON true
+LEFT JOIN LATERAL (
+  SELECT h.*
+  FROM HardQuestions h
+  WHERE h.Tag = ta.Tag
+  ORDER BY h.ViewsPerDay DESC
+  LIMIT 1
+) hq ON true
+LEFT JOIN LATERAL (
+  SELECT dc2.*
+  FROM DuplicateCandidates dc2
+  WHERE dc2.Q1 IN (SELECT QuestionId FROM QuestionMetrics WHERE Tag = ta.Tag)
+     OR dc2.Q2 IN (SELECT QuestionId FROM QuestionMetrics WHERE Tag = ta.Tag)
+  ORDER BY dc2.TitleSimilarity DESC, dc2.DirectDuplicateLinks DESC
+  LIMIT 1
+) dc ON true
+WHERE ta.QuestionCount >= 50
+ORDER BY rt.QuestionsLast30d DESC, ta.AvgViewsPerDay DESC
+LIMIT 200;

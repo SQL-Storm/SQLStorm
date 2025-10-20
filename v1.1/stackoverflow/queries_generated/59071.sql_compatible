@@ -1,0 +1,193 @@
+WITH RECURSIVE QuestionHierarchy AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        0 AS Depth,
+        CAST(p.Id AS VARCHAR(1000)) AS Path
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.ParentId IS NULL
+
+    UNION ALL
+
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        qh.Depth + 1 AS Depth,
+        qh.Path || ',' || CAST(p.Id AS VARCHAR(1000)) AS Path
+    FROM Posts p
+    INNER JOIN QuestionHierarchy qh ON p.ParentId = qh.QuestionId
+    WHERE qh.Depth < 5
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TagPopularity AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        AVG(p.Score) AS AvgScore,
+        AVG(p.ViewCount) AS AvgViews,
+        COUNT(DISTINCT p.Id) AS QuestionCount
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+        AND p.PostTypeId = 1
+    GROUP BY t.TagName, t.Count
+),
+TopUsers AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.TotalPosts,
+        ua.TotalComments,
+        ua.TotalBadges,
+        ua.TotalVotes,
+        ROW_NUMBER() OVER (ORDER BY ua.Reputation DESC, ua.TotalPosts DESC) AS Rank
+    FROM UserActivity ua
+    WHERE ua.TotalPosts > 0
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        p.PostTypeId,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            WHEN p.PostTypeId = 1 THEN 'Unanswered'
+            ELSE 'Other'
+        END AS QuestionStatus,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'High'
+            WHEN p.ViewCount > 100 THEN 'Medium'
+            ELSE 'Low'
+        END AS ViewCategory,
+        CASE 
+            WHEN p.Score > 10 THEN 'High'
+            WHEN p.Score > 0 THEN 'Medium'
+            ELSE 'Low'
+        END AS ScoreCategory
+    FROM Posts p
+),
+CommentAnalysis AS (
+    SELECT 
+        c.Id AS CommentId,
+        c.PostId,
+        c.Score,
+        c.Text,
+        c.CreationDate,
+        c.UserId,
+        c.UserDisplayName,
+        p.Title AS PostTitle,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViews
+    FROM Comments c
+    INNER JOIN Posts p ON c.PostId = p.Id
+    WHERE c.Score > 0
+)
+SELECT 
+    COUNT(*) AS TotalPosts,
+    COUNT(DISTINCT pa.OwnerUserId) AS UniqueAuthors,
+    AVG(pa.Score) AS AvgPostScore,
+    AVG(pa.ViewCount) AS AvgPostViews,
+    MAX(pa.CreationDate) AS LatestPostDate,
+    MIN(pa.CreationDate) AS EarliestPostDate,
+    COUNT(CASE WHEN pa.PostTypeId = 1 THEN 1 END) AS TotalQuestions,
+    COUNT(CASE WHEN pa.PostTypeId = 2 THEN 1 END) AS TotalAnswers,
+    COUNT(CASE WHEN pa.QuestionStatus = 'Answered' THEN 1 END) AS AnsweredQuestions,
+    COUNT(CASE WHEN pa.QuestionStatus = 'Unanswered' THEN 1 END) AS UnansweredQuestions,
+    AVG(CASE WHEN pa.ViewCategory = 'High' THEN 1 ELSE 0 END) AS HighViewRatio,
+    AVG(CASE WHEN pa.ScoreCategory = 'High' THEN 1 ELSE 0 END) AS HighScoreRatio,
+    COUNT(DISTINCT ta.TagName) AS TotalTags,
+    AVG(ta.TagCount) AS AvgTagCount,
+    AVG(ta.AvgScore) AS AvgTagScore,
+    AVG(ta.AvgViews) AS AvgTagViews,
+    COUNT(DISTINCT ua.UserId) AS ActiveUsers,
+    AVG(ua.Reputation) AS AvgUserReputation,
+    AVG(ua.TotalPosts) AS AvgUserPosts,
+    MAX(tu.Rank) AS MaxUserRank,
+    COUNT(DISTINCT ca.CommentId) AS TotalComments,
+    AVG(ca.Score) AS AvgCommentScore,
+    COUNT(CASE WHEN ca.PostScore > 10 THEN 1 END) AS HighScoringPosts,
+    COUNT(CASE WHEN ca.PostViews > 1000 THEN 1 END) AS HighViewPosts,
+    COUNT(DISTINCT CASE WHEN ca.UserDisplayName IS NOT NULL THEN ca.UserId END) AS CommentingUsers,
+    COUNT(DISTINCT CASE WHEN ph.QuestionId IS NOT NULL THEN ph.QuestionId END) AS QuestionHierarchyCount
+FROM PostAnalysis pa
+LEFT JOIN TagPopularity ta ON EXISTS (
+    SELECT 1 FROM Posts p2 
+    WHERE p2.PostTypeId = 1 AND p2.Tags LIKE '%' || ta.TagName || '%'
+      AND p2.Id = pa.PostId
+)
+LEFT JOIN UserActivity ua ON ua.UserId = pa.OwnerUserId
+LEFT JOIN TopUsers tu ON tu.UserId = pa.OwnerUserId
+LEFT JOIN CommentAnalysis ca ON ca.PostId = pa.PostId
+LEFT JOIN QuestionHierarchy ph ON ph.QuestionId = pa.PostId
+WHERE pa.CreationDate >= TIMESTAMP '2010-01-01 00:00:00'
+  AND pa.CreationDate <= TIMESTAMP '2023-12-31 23:59:59'
+  AND pa.PostTypeId IN (1, 2)
+  AND (pa.OwnerUserId IS NOT NULL OR pa.OwnerUserId = -1)
+GROUP BY
+    pa.PostId,
+    pa.Title,
+    pa.Score,
+    pa.ViewCount,
+    pa.CreationDate,
+    pa.OwnerUserId,
+    pa.ParentId,
+    pa.PostTypeId,
+    pa.Tags,
+    pa.QuestionStatus,
+    pa.ViewCategory,
+    pa.ScoreCategory,
+    ta.TagName,
+    ta.TagCount,
+    ta.AvgScore,
+    ta.AvgViews,
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.TotalPosts,
+    ua.TotalComments,
+    ua.TotalBadges,
+    ua.TotalVotes,
+    tu.Rank,
+    ca.CommentId,
+    ca.PostId,
+    ca.Score,
+    ca.Text,
+    ca.CreationDate,
+    ca.UserId,
+    ca.UserDisplayName,
+    ca.PostTitle,
+    ca.PostScore,
+    ca.PostViews,
+    ph.QuestionId
+HAVING COUNT(*) > 0;

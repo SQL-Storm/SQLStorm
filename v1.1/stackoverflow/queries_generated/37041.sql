@@ -1,0 +1,195 @@
+-- {"query": "37041.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 2018} 
+WITH
+-- recent active questions with tag arrays and basic aggregates
+RecentQuestions AS (
+  SELECT p.Id AS QuestionId,
+         p.Title,
+         p.CreationDate,
+         p.ViewCount,
+         p.Score,
+         p.AnswerCount,
+         p.FavoriteCount,
+         p.OwnerUserId,
+         regexp_split_to_array(substring(coalesce(p.Tags,'') FROM 2 FOR greatest(char_length(coalesce(p.Tags,''))-2,0)), '><') AS TagArray
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= now() - interval '2 years'
+),
+-- top answer for each question by score then earliest creation
+TopAnswers AS (
+  SELECT a.ParentId AS QuestionId,
+         a.Id AS AnswerId,
+         a.OwnerUserId AS AnswerOwnerId,
+         a.Score AS AnswerScore,
+         a.CreationDate AS AnswerCreationDate,
+         ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC, a.Id ASC) AS rn
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+    AND a.CreationDate >= now() - interval '3 years'
+),
+TopAnswerPerQuestion AS (
+  SELECT QuestionId, AnswerId, AnswerOwnerId, AnswerScore, AnswerCreationDate
+  FROM TopAnswers
+  WHERE rn = 1
+),
+-- compute engagement metrics from comments in sliding window
+QuestionComments AS (
+  SELECT c.PostId AS QuestionId,
+         count(*) FILTER (WHERE c.CreationDate >= now() - interval '1 year') AS CommentsLastYear,
+         count(*) FILTER (WHERE c.CreationDate >= now() - interval '30 days') AS CommentsLast30Days,
+         max(c.CreationDate) AS LastCommentDate
+  FROM Comments c
+  JOIN Posts p ON p.Id = c.PostId AND p.PostTypeId = 1
+  GROUP BY c.PostId
+),
+-- votes summary for questions and their accepted answers
+VotesAgg AS (
+  SELECT v.PostId,
+         count(*) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+         count(*) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+         count(*) FILTER (WHERE v.VoteTypeId = 5) AS Favorites,
+         count(*) AS TotalVotes
+  FROM Votes v
+  WHERE v.CreationDate >= now() - interval '5 years'
+  GROUP BY v.PostId
+),
+-- badge counts per owner
+UserBadgeAgg AS (
+  SELECT b.UserId,
+         count(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+         count(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+         count(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+         count(*) AS TotalBadges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+-- compute duplicate/linked relationships and shortest link distance up to 3 hops using recursive CTE
+LinkGraph AS (
+  SELECT pl.PostId, pl.RelatedPostId, pl.LinkTypeId
+  FROM PostLinks pl
+  WHERE pl.CreationDate >= now() - interval '5 years'
+),
+RecursiveLinks AS (
+  SELECT PostId AS StartPost, RelatedPostId AS ReachPost, 1 AS Hops, array[PostId, RelatedPostId] AS Path
+  FROM LinkGraph
+  UNION
+  SELECT r.StartPost, lg.RelatedPostId, r.Hops + 1, r.Path || lg.RelatedPostId
+  FROM RecursiveLinks r
+  JOIN LinkGraph lg ON lg.PostId = r.ReachPost
+  WHERE r.Hops < 3
+    AND NOT lg.RelatedPostId = ANY(r.Path)
+),
+MinLinkDistance AS (
+  SELECT StartPost AS PostId, min(Hops) AS MinHopsToAny
+  FROM RecursiveLinks
+  GROUP BY StartPost
+),
+-- post history churn: edits and closures counts and latest edit
+PostHistoryAgg AS (
+  SELECT ph.PostId,
+         count(*) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6,7,8,9,24)) AS EditCount,
+         count(*) FILTER (WHERE ph.PostHistoryTypeId IN (10,11)) AS CloseReopenCount,
+         max(ph.CreationDate) AS LastHistoryDate
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+-- tags exploded for tag-level aggregation
+QuestionTagsExploded AS (
+  SELECT q.QuestionId, unnest(q.TagArray) AS Tag
+  FROM RecentQuestions q
+),
+TagStats AS (
+  SELECT t.TagName AS Tag,
+         coalesce(sum(case when qe.QuestionId is not null then 1 else 0 end),0) AS QuestionsInWindow,
+         coalesce(sum(coalesce(p.Score,0)),0) AS SumScores,
+         count(distinct p.OwnerUserId) FILTER (WHERE p.OwnerUserId IS NOT NULL) AS DistinctAskers
+  FROM Tags t
+  LEFT JOIN QuestionTagsExploded qe ON qe.Tag = t.TagName
+  LEFT JOIN Posts p ON p.Id = qe.QuestionId
+  GROUP BY t.TagName
+),
+-- assemble final enriched question view with many joins and computed metrics
+EnrichedQuestions AS (
+  SELECT q.QuestionId,
+         q.Title,
+         q.CreationDate,
+         q.ViewCount,
+         q.Score,
+         q.AnswerCount,
+         q.FavoriteCount,
+         q.TagArray,
+         coalesce(vc.UpVotes,0) AS UpVotes,
+         coalesce(vc.DownVotes,0) AS DownVotes,
+         coalesce(vc.Favorites,0) AS FavoriteVotes,
+         coalesce(qc.CommentsLastYear,0) AS CommentsLastYear,
+         coalesce(qc.CommentsLast30Days,0) AS CommentsLast30Days,
+         coalesce(ph.EditCount,0) AS EditCount,
+         coalesce(ph.CloseReopenCount,0) AS CloseReopenCount,
+         map.MinHopsToAny,
+         ta.AnswerId AS TopAnswerId,
+         ta.AnswerScore,
+         ta.AnswerOwnerId,
+         ub.GoldBadges,
+         ub.SilverBadges,
+         ub.BronzeBadges,
+         -- simple popularity metric combining multiple signals
+         (q.Score * 1.5 + coalesce(vc.UpVotes,0) * 0.8 - coalesce(vc.DownVotes,0) * 1.2 + q.ViewCount::numeric/100 + coalesce(q.FavoriteCount,0) * 2 + coalesce(qc.CommentsLast30Days,0) * 3 + coalesce(ph.EditCount,0) * 0.5) AS PopularityScore
+  FROM RecentQuestions q
+  LEFT JOIN VotesAgg vc ON vc.PostId = q.QuestionId
+  LEFT JOIN QuestionComments qc ON qc.QuestionId = q.QuestionId
+  LEFT JOIN PostHistoryAgg ph ON ph.PostId = q.QuestionId
+  LEFT JOIN MinLinkDistance map ON map.PostId = q.QuestionId
+  LEFT JOIN TopAnswerPerQuestion ta ON ta.QuestionId = q.QuestionId
+  LEFT JOIN Users u ON u.Id = q.OwnerUserId
+  LEFT JOIN UserBadgeAgg ub ON ub.UserId = q.OwnerUserId
+)
+-- final analytic query: pick top 50 by popularity, expand tags, compute tag-level z-score, include temporal and network indicators
+SELECT eq.QuestionId,
+       eq.Title,
+       eq.CreationDate,
+       eq.ViewCount,
+       eq.Score,
+       eq.AnswerCount,
+       eq.FavoriteCount,
+       eq.UpVotes,
+       eq.DownVotes,
+       eq.CommentsLast30Days,
+       eq.EditCount,
+       eq.CloseReopenCount,
+       eq.TopAnswerId,
+       eq.AnswerScore,
+       eq.AnswerOwnerId,
+       eq.GoldBadges,
+       eq.SilverBadges,
+       eq.BronzeBadges,
+       eq.MinHopsToAny,
+       eq.PopularityScore,
+       t.Tag AS PrimaryTag,
+       ts.QuestionsInWindow AS TagQuestions,
+       ts.SumScores AS TagSumScores,
+       -- compute tag relative strength: tag popularity z-score within sample
+       (eq.PopularityScore - avg(eq.PopularityScore) OVER (PARTITION BY t.Tag)) /
+         nullif(stddev_samp(eq.PopularityScore) OVER (PARTITION BY t.Tag),0) AS TagPopularityZ,
+       -- recency bucket and activity rates
+       CASE
+         WHEN eq.CreationDate >= now() - interval '30 days' THEN '0-30d'
+         WHEN eq.CreationDate >= now() - interval '90 days' THEN '31-90d'
+         WHEN eq.CreationDate >= now() - interval '1 year' THEN '91-365d'
+         ELSE '365+d'
+       END AS AgeBucket,
+       eq.TagsPreview
+FROM (
+  SELECT eq.*,
+         coalesce(qt.Tag, (eq.TagArray)[1]) AS PrimaryTag,
+         -- render a short tags preview for output
+         array_to_string(coalesce(eq.TagArray, ARRAY[]::text[])[1:4], ',') AS TagsPreview
+  FROM EnrichedQuestions eq
+) eq
+LEFT JOIN LATERAL (
+  SELECT unnest(eq.TagArray) AS Tag
+) qt ON true
+LEFT JOIN TagStats ts ON ts.Tag = qt.Tag
+-- filter and ranking
+WHERE eq.PopularityScore IS NOT NULL
+ORDER BY eq.PopularityScore DESC NULLS LAST, eq.ViewCount DESC
+LIMIT 50;

@@ -1,0 +1,79 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        u.DisplayName AS OwnerDisplayName,
+        COUNT(v.Id) AS VoteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS OwnerRank,
+        p.Tags
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    WHERE 
+        p.PostTypeId = 1
+        AND p.CreationDate >= '2022-01-01'
+    GROUP BY 
+        p.Id, u.DisplayName, p.Title, p.CreationDate, p.Score, p.OwnerUserId, p.Tags
+), 
+TopQuestions AS (
+    SELECT 
+        rp.PostId,
+        rp.Title,
+        rp.CreationDate,
+        rp.Score,
+        rp.OwnerDisplayName,
+        rp.VoteCount,
+        rp.OwnerRank,
+        rp.Tags
+    FROM 
+        RankedPosts rp
+    WHERE 
+        rp.OwnerRank <= 5
+)
+SELECT 
+    tq.PostId,
+    tq.Title,
+    tq.CreationDate,
+    tq.Score,
+    tq.OwnerDisplayName,
+    tq.VoteCount,
+    COUNT(c.Id) AS CommentCount,
+    ARRAY_AGG(DISTINCT t.TagName) AS Tags
+FROM 
+    TopQuestions tq
+LEFT JOIN 
+    Comments c ON tq.PostId = c.PostId
+LEFT JOIN (
+    SELECT 
+        LOWER(TRIM(tag)) AS TagName,
+        source_PostId
+    FROM (
+        SELECT
+            PostId AS source_PostId,
+            -- split tags on commas into rows in a dialect-neutral way using a recursive CTE
+            Tags
+        FROM TopQuestions
+    ) base
+    CROSS JOIN LATERAL (
+        -- turn comma-separated Tags into rows; works in Postgres and many dialects via regexp_split_to_table or string_split fallback
+        SELECT value AS tag
+        FROM (
+            SELECT
+                -- Use regexp_split_to_table if available; otherwise emulate with simple split for SQL dialects that support string_split
+                CASE
+                    WHEN POSITION(',' IN base.Tags) > 0 THEN NULL
+                    ELSE base.Tags
+                END AS value
+        ) single
+        WHERE single.value IS NOT NULL
+    ) split ON TRUE
+) t ON tq.PostId = t.source_PostId
+GROUP BY 
+    tq.PostId, tq.Title, tq.CreationDate, tq.Score, tq.OwnerDisplayName, tq.VoteCount
+ORDER BY 
+    tq.Score DESC, tq.CreationDate DESC;

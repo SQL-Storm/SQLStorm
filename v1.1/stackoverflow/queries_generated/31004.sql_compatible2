@@ -1,0 +1,82 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        u.DisplayName AS OwnerDisplayName,
+        COUNT(v.Id) AS VoteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS OwnerRank,
+        p.Tags,
+        p.OwnerUserId
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    WHERE 
+        p.PostTypeId = 1
+        AND p.CreationDate >= DATE '2022-01-01'
+    GROUP BY 
+        p.Id, u.DisplayName, p.Title, p.CreationDate, p.Score, p.OwnerUserId, p.Tags
+), 
+TopQuestions AS (
+    SELECT 
+        rp.PostId,
+        rp.Title,
+        rp.CreationDate,
+        rp.Score,
+        rp.OwnerDisplayName,
+        rp.VoteCount,
+        rp.OwnerRank,
+        rp.Tags
+    FROM 
+        RankedPosts rp
+    WHERE 
+        rp.OwnerRank <= 5
+),
+TagRows AS (
+    -- split Tags by comma into rows in a dialect-neutral way using a recursive CTE
+    SELECT
+        PostId AS source_PostId,
+        TRIM(tag) AS TagName
+    FROM (
+        SELECT PostId, Tags
+        FROM TopQuestions
+    ) src
+    CROSS JOIN LATERAL (
+        -- Use a recursive split to produce rows for comma-separated tags
+        WITH RECURSIVE split_cte(tag, rest) AS (
+            SELECT
+                NULLIF(TRIM(SUBSTRING(src.Tags FROM 1 FOR COALESCE(NULLIF(POSITION(',' IN src.Tags),0)-1, CHAR_LENGTH(src.Tags)))), '') AS tag,
+                CASE WHEN POSITION(',' IN src.Tags) > 0 THEN SUBSTRING(src.Tags FROM POSITION(',' IN src.Tags) + 1) ELSE '' END AS rest
+            UNION ALL
+            SELECT
+                NULLIF(TRIM(SUBSTRING(rest FROM 1 FOR COALESCE(NULLIF(POSITION(',' IN rest),0)-1, CHAR_LENGTH(rest)))), ''),
+                CASE WHEN POSITION(',' IN rest) > 0 THEN SUBSTRING(rest FROM POSITION(',' IN rest) + 1) ELSE '' END
+            FROM split_cte
+            WHERE rest <> ''
+        )
+        SELECT tag FROM split_cte WHERE tag IS NOT NULL
+    ) s
+)
+SELECT 
+    tq.PostId,
+    tq.Title,
+    tq.CreationDate,
+    tq.Score,
+    tq.OwnerDisplayName,
+    tq.VoteCount,
+    COUNT(c.Id) AS CommentCount,
+    ARRAY_AGG(DISTINCT tr.TagName) AS Tags
+FROM 
+    TopQuestions tq
+LEFT JOIN 
+    Comments c ON tq.PostId = c.PostId
+LEFT JOIN 
+    TagRows tr ON tq.PostId = tr.source_PostId
+GROUP BY 
+    tq.PostId, tq.Title, tq.CreationDate, tq.Score, tq.OwnerDisplayName, tq.VoteCount
+ORDER BY 
+    tq.Score DESC, tq.CreationDate DESC;

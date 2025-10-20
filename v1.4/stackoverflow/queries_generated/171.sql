@@ -1,0 +1,105 @@
+-- {"query": "171.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 1845} 
+WITH
+Questions AS (
+  SELECT p.Id,
+         p.Title,
+         p.CreationDate,
+         p.LastActivityDate,
+         p.OwnerUserId,
+         p.Score,
+         p.ViewCount,
+         p.Tags
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+Answers AS (
+  SELECT a.ParentId AS QuestionId, COUNT(*) AS AnswerCount
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+  GROUP BY a.ParentId
+),
+CommentsAgg AS (
+  SELECT c.PostId, COUNT(*) AS CommentCount
+  FROM Comments c
+  GROUP BY c.PostId
+),
+VotesAgg AS (
+  SELECT v.PostId,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+         SUM(v.BountyAmount) AS BountyAmount
+  FROM Votes v
+  GROUP BY v.PostId
+),
+RecentRevision AS (
+  SELECT h.PostId,
+         MAX(h.CreationDate) AS LastRevisionDate
+  FROM PostHistory h
+  GROUP BY h.PostId
+),
+TagStats AS (
+  SELECT t.Id AS TagPostId,
+         t.TagName,
+         t.Count,
+         t.ExcerptPostId,
+         t.WikiPostId
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0
+),
+BadgeCount AS (
+  SELECT u.Id AS UserId, COALESCE(SUM(b.Class), 0) AS GoldBadges
+  FROM Badges b
+  JOIN Users u ON b.UserId = u.Id
+  GROUP BY u.Id
+)
+SELECT
+  q.Id AS QuestionId,
+  q.Title,
+  q.CreationDate,
+  q.LastActivityDate,
+  u.DisplayName AS OwnerDisplayName,
+  q.Score,
+  q.ViewCount,
+  COALESCE(a.AnswerCount, 0) AS AnswerCount,
+  COALESCE(cc.CommentCount, 0) AS CommentCount,
+  COALESCE(vo.UpVotes, 0) AS UpVotes,
+  COALESCE(vo.DownVotes, 0) AS DownVotes,
+  COALESCE(vo.BountyAmount, 0) AS BountyAmount,
+  COALESCE(r.LastRevisionDate, q.CreationDate) AS LastRevisionDate,
+  COALESCE(bc.GoldBadges, 0) AS GoldBadges,
+  NULLIF(q.Tags, '') AS Tags
+FROM Questions q
+LEFT JOIN Users u ON q.OwnerUserId = u.Id
+LEFT JOIN Answers a ON a.QuestionId = q.Id
+LEFT JOIN CommentsAgg cc ON cc.PostId = q.Id
+LEFT JOIN VotesAgg vo ON vo.PostId = q.Id
+LEFT JOIN RecentRevision r ON r.PostId = q.Id
+LEFT JOIN BadgeCount bc ON bc.UserId = q.OwnerUserId
+ORDER BY q.LastActivityDate DESC, q.CreationDate DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+  tg.Id AS TagPostId,
+  tg.Title,
+  tg.CreationDate,
+  tg.LastActivityDate,
+  u2.DisplayName AS OwnerDisplayName,
+  tg.Score,
+  tg.ViewCount,
+  COALESCE(0, 0) AS AnswerCount,
+  COALESCE(0, 0) AS CommentCount,
+  COALESCE(0, 0) AS UpVotes,
+  COALESCE(0, 0) AS DownVotes,
+  COALESCE(0, 0) AS BountyAmount,
+  COALESCE(r2.LastRevisionDate, tg.CreationDate) AS LastRevisionDate,
+  COALESCE(bc2.GoldBadges, 0) AS GoldBadges,
+  NULLIF(tg.Tags, '') AS Tags
+FROM Posts tg
+LEFT JOIN Users u2 ON tg.OwnerUserId = u2.Id
+LEFT JOIN RecentRevision r2 ON r2.PostId = tg.Id
+LEFT JOIN BadgeCount bc2 ON bc2.UserId = tg.OwnerUserId
+WHERE tg.PostTypeId IN (4, 5)
+ORDER BY LastRevisionDate DESC
+LIMIT 50;

@@ -1,0 +1,212 @@
+WITH
+RecentQuestions AS (
+  SELECT p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.OwnerUserId, p.Tags,
+         regexp_split_to_table(substring(p.Tags,2,length(p.Tags)-2), '><') AS Tag
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+),
+QuestionMetrics AS (
+  SELECT
+    q.Id,
+    q.Title,
+    q.CreationDate,
+    q.Score AS QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    q.OwnerUserId,
+    q.Tag,
+    CASE WHEN a.AcceptedAnswerId IS NOT NULL THEN
+      EXTRACT(epoch FROM (aa.CreationDate - q.CreationDate))/86400
+    ELSE NULL END AS AcceptedAnswerAgeDays,
+    COALESCE(maxa.MaxAnswerScore, 0) AS TopAnswerScore,
+    COALESCE(qc.CommentCount, 0) AS QuestionCommentCount,
+    COALESCE(ph.Editors,0) AS DistinctEditors
+  FROM RecentQuestions q
+  LEFT JOIN Posts a ON a.Id = q.Id
+  LEFT JOIN Posts aa ON aa.Id = q.AcceptedAnswerId
+  LEFT JOIN (
+    SELECT ParentId, MAX(Score) AS MaxAnswerScore
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY ParentId
+  ) maxa ON maxa.ParentId = q.Id
+  LEFT JOIN (
+    SELECT p.Id, p.CommentCount
+    FROM Posts p
+  ) qc ON qc.Id = q.Id
+  LEFT JOIN (
+    SELECT ph.PostId, COUNT(DISTINCT ph.UserId) AS Editors
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6,7,8,9,24) AND ph.UserId IS NOT NULL
+    GROUP BY ph.PostId
+  ) ph ON ph.PostId = q.Id
+),
+TagAggregates AS (
+  SELECT
+    Tag,
+    COUNT(DISTINCT Id) AS Questions,
+    AVG(QuestionScore) AS AvgQuestionScore,
+    AVG(TopAnswerScore) AS AvgTopAnswerScore,
+    AVG(COALESCE(AcceptedAnswerAgeDays, 3650)) FILTER (WHERE AcceptedAnswerAgeDays IS NOT NULL) AS AvgAcceptedAnswerAgeDays,
+    SUM(CASE WHEN AcceptedAnswerAgeDays IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswer,
+    AVG(DistinctEditors) AS AvgDistinctEditors
+  FROM QuestionMetrics
+  GROUP BY Tag
+),
+OwnerEngagement AS (
+  SELECT u.Id AS OwnerId,
+         u.DisplayName,
+         u.Reputation,
+         COUNT(DISTINCT q.Id) AS QuestionsPosted,
+         SUM(q.ViewCount) AS TotalViews,
+         AVG(q.Score) AS AvgQuestionScore,
+         SUM(COALESCE(v.UpVotes,0)) AS TotalUpVotesReceived
+  FROM QuestionMetrics q
+  LEFT JOIN Users u ON u.Id = q.OwnerUserId
+  LEFT JOIN (
+    SELECT p.OwnerUserId AS Owner, COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes
+    FROM Posts p
+    JOIN Votes v ON v.PostId = p.Id
+    WHERE p.PostTypeId IN (1,2)
+    GROUP BY p.OwnerUserId, v.VoteTypeId
+  ) v ON v.Owner = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+LinkFeatures AS (
+  SELECT q.Id,
+         SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateOutCount,
+         SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedOutCount,
+         SUM(CASE WHEN pl2.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateInCount,
+         SUM(CASE WHEN pl2.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedInCount
+  FROM RecentQuestions q
+  LEFT JOIN PostLinks pl ON pl.PostId = q.Id
+  LEFT JOIN PostLinks pl2 ON pl2.RelatedPostId = q.Id
+  GROUP BY q.Id
+),
+TopAnswerers AS (
+  SELECT q.Id AS QuestionId,
+         array_agg(a_info ORDER BY a_info_answer_score DESC, a_info_answer_creation_date ASC)[:3] AS Top3
+  FROM RecentQuestions q
+  LEFT JOIN LATERAL (
+    SELECT json_build_object(
+             'AnswerId', a.Id,
+             'AnswererId', a.OwnerUserId,
+             'AnswerScore', a.Score,
+             'AnswerCreationDate', a.CreationDate,
+             'AnswerAgeDays', EXTRACT(epoch FROM (a.CreationDate - q.CreationDate))/86400
+           ) AS a_info,
+           a.Score AS a_info_answer_score,
+           a.CreationDate AS a_info_answer_creation_date
+    FROM Posts a
+    WHERE a.PostTypeId = 2 AND a.ParentId = q.Id
+    ORDER BY a.Score DESC NULLS LAST, a.CreationDate ASC
+    LIMIT 50
+  ) sub ON true
+  GROUP BY q.Id
+),
+QuestionProfile AS (
+  SELECT
+    qm.Id,
+    qm.Title,
+    qm.CreationDate,
+    qm.QuestionScore,
+    qm.ViewCount,
+    qm.AnswerCount,
+    qm.OwnerUserId,
+    qm.Tag,
+    qm.AcceptedAnswerAgeDays,
+    qm.TopAnswerScore,
+    qm.QuestionCommentCount,
+    qm.DistinctEditors,
+    lf.DuplicateOutCount,
+    lf.LinkedOutCount,
+    lf.DuplicateInCount,
+    lf.LinkedInCount,
+    ta.Top3
+  FROM QuestionMetrics qm
+  LEFT JOIN LinkFeatures lf ON lf.Id = qm.Id
+  LEFT JOIN TopAnswerers ta ON ta.QuestionId = qm.Id
+),
+FastResolved AS (
+  SELECT qp.*, tagg.Questions AS TagQuestionCount, tagg.AvgQuestionScore, tagg.AvgTopAnswerScore, tagg.QuestionsWithAcceptedAnswer
+  FROM QuestionProfile qp
+  LEFT JOIN TagAggregates tagg ON tagg.Tag = qp.Tag
+  WHERE qp.AcceptedAnswerAgeDays IS NOT NULL AND qp.AcceptedAnswerAgeDays <= 1
+),
+DifficultyScore AS (
+  SELECT
+    qp.Id,
+    qp.Title,
+    qp.Tag,
+    qp.QuestionScore,
+    qp.ViewCount,
+    qp.AnswerCount,
+    qp.TopAnswerScore,
+    qp.DistinctEditors,
+    qp.AcceptedAnswerAgeDays,
+    ( (GREATEST(CAST(qp.ViewCount AS numeric),1) / NULLIF(GREATEST(qp.AnswerCount,1),0)) * (1 + (COALESCE(NULLIF(qp.TopAnswerScore,0),1) * 0.1)) )
+      / (1 + COALESCE(qp.DistinctEditors,0))
+      + COALESCE(qp.AcceptedAnswerAgeDays, 3650) * 0.2 AS DifficultyMetric,
+    qp.Top3
+  FROM QuestionProfile qp
+),
+TagDifficulty AS (
+  SELECT
+    t.Tag,
+    t.Questions,
+    t.AvgQuestionScore,
+    t.AvgTopAnswerScore,
+    AVG(d.DifficultyMetric) AS AvgDifficultyMetric,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY d.DifficultyMetric) AS MedianDifficulty,
+    MAX(d.DifficultyMetric) AS MaxDifficulty
+  FROM TagAggregates t
+  JOIN DifficultyScore d ON d.Tag = t.Tag
+  GROUP BY t.Tag, t.Questions, t.AvgQuestionScore, t.AvgTopAnswerScore
+),
+FinalSelection AS (
+  SELECT
+    d.Id AS QuestionId,
+    d.Title,
+    d.Tag,
+    d.QuestionScore,
+    d.ViewCount,
+    d.AnswerCount,
+    d.TopAnswerScore,
+    ROUND(CAST(d.DifficultyMetric AS numeric),3) AS DifficultyMetric,
+    td.AvgDifficultyMetric,
+    td.MedianDifficulty,
+    td.MaxDifficulty,
+    ta.Top3 AS TopAnswerers,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation AS OwnerReputation,
+    ga.Questions AS TagTotalQuestions,
+    ga.AvgQuestionScore AS TagAvgQuestionScore,
+    ga.AvgTopAnswerScore AS TagAvgTopAnswerScore,
+    lf.DuplicateOutCount,
+    lf.DuplicateInCount,
+    qm.DistinctEditors,
+    qm.AcceptedAnswerAgeDays
+  FROM DifficultyScore d
+  JOIN QuestionProfile qm ON qm.Id = d.Id
+  LEFT JOIN TagDifficulty td ON td.Tag = d.Tag
+  LEFT JOIN TagAggregates ga ON ga.Tag = d.Tag
+  LEFT JOIN TopAnswerers ta ON ta.QuestionId = d.Id
+  LEFT JOIN LinkFeatures lf ON lf.Id = d.Id
+  LEFT JOIN Users u ON u.Id = qm.OwnerUserId
+)
+SELECT
+  fs.*,
+  rank() OVER (PARTITION BY fs.Tag ORDER BY fs.DifficultyMetric DESC) AS TagDifficultyRank,
+  count(*) OVER (PARTITION BY fs.Tag) AS QuestionsPerTag,
+  json_build_object(
+    'TopAnswerers', fs.TopAnswerers,
+    'Owner', json_build_object('Id', fs.OwnerDisplayName, 'Reputation', fs.OwnerReputation),
+    'TagSummary', json_build_object('TotalQuestions', fs.TagTotalQuestions, 'AvgQuestionScore', fs.TagAvgQuestionScore)
+  ) AS MetaJson
+FROM FinalSelection fs
+WHERE fs.Tag IN (
+    SELECT Tag FROM TagAggregates WHERE Questions BETWEEN 5 AND 1000
+)
+ORDER BY fs.DifficultyMetric DESC NULLS LAST, fs.ViewCount DESC
+LIMIT 100;

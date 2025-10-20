@@ -1,0 +1,68 @@
+SELECT 
+    p.Id as PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    u.DisplayName as OwnerName,
+    u.Reputation,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    COUNT(DISTINCT c.Id) as CommentCountActual,
+    COUNT(DISTINCT v.Id) as VoteCount,
+    COUNT(DISTINCT b.Id) as BadgeCount,
+    STRING_AGG(DISTINCT t.TagName, ', ') as Tags,
+    STRING_AGG(DISTINCT ph.Comment, '; ') as EditComments,
+    MAX(ph.CreationDate) as LastEditDate,
+    CASE 
+        WHEN p.PostTypeId = 1 THEN 'Question'
+        WHEN p.PostTypeId = 2 THEN 'Answer'
+        WHEN p.PostTypeId = 3 THEN 'Wiki'
+        ELSE 'Other'
+    END as PostType,
+    CASE 
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answer Accepted'
+        ELSE 'Open'
+    END as PostStatus,
+    (SELECT COUNT(*) FROM Posts pp WHERE pp.ParentId = p.Id AND pp.PostTypeId = 2) as AnswerCountWithDeleted,
+    (SELECT COUNT(*) FROM Votes vv WHERE vv.PostId = p.Id AND vv.VoteTypeId IN (2,3)) as UpDownVoteCount,
+    (SELECT COUNT(*) FROM Comments cc WHERE cc.PostId = p.Id) as CommentCountWithDeleted,
+    (SELECT COUNT(*) FROM Badges bb WHERE bb.UserId = p.OwnerUserId) as UserBadgesCount,
+    (SELECT COUNT(*) FROM Posts ps WHERE ps.OwnerUserId = p.OwnerUserId AND ps.PostTypeId = 1) as UserQuestionsCount,
+    (SELECT COUNT(*) FROM Posts pa WHERE pa.OwnerUserId = p.OwnerUserId AND pa.PostTypeId = 2) as UserAnswersCount,
+    (SELECT AVG(pscore.Score) FROM Posts pscore WHERE pscore.OwnerUserId = p.OwnerUserId AND pscore.PostTypeId = 1) as UserAvgQuestionScore,
+    (SELECT AVG(pscore2.Score) FROM Posts pscore2 WHERE pscore2.OwnerUserId = p.OwnerUserId AND pscore2.PostTypeId = 2) as UserAvgAnswerScore,
+    (SELECT COUNT(*) FROM Votes uv WHERE uv.UserId = p.OwnerUserId AND uv.VoteTypeId = 5) as UserFavoritesCount,
+    (SELECT COUNT(*) FROM Votes uc WHERE uc.UserId = p.OwnerUserId AND uc.VoteTypeId IN (6,7)) as UserCloseReopenCount,
+    (SELECT COUNT(*) FROM PostHistory ph2 WHERE ph2.PostId = p.Id AND ph2.PostHistoryTypeId IN (10,11,12,13)) as PostHistoryCount,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id OR pl.RelatedPostId = p.Id) as PostLinkCount,
+    (SELECT COUNT(*) FROM Posts dup WHERE dup.Id IN (SELECT pl2.RelatedPostId FROM PostLinks pl2 WHERE pl2.PostId = p.Id AND pl2.LinkTypeId = 3)) as DuplicateQuestionCount
+FROM Posts p
+INNER JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Comments c ON p.Id = c.PostId
+LEFT JOIN Votes v ON p.Id = v.PostId
+LEFT JOIN Badges b ON p.OwnerUserId = b.UserId
+LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN (
+    SELECT Id, TagName 
+    FROM Tags 
+    WHERE TagName IS NOT NULL 
+    ORDER BY "Count" DESC
+    LIMIT 100
+) t ON p.Tags LIKE '%' || t.TagName || '%'
+WHERE p.PostTypeId IN (1,2) 
+    AND p.CreationDate >= DATE '2022-01-01'
+    AND u.Reputation > 1000
+    AND (p.Score > 0 OR p.ViewCount > 100)
+GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate, 
+         u.DisplayName, u.Reputation, p.AnswerCount, 
+         p.CommentCount, p.FavoriteCount, p.PostTypeId, 
+         p.ClosedDate, p.CommunityOwnedDate, p.AcceptedAnswerId,
+         p.OwnerUserId
+HAVING COUNT(DISTINCT c.Id) >= 0
+   AND COUNT(DISTINCT v.Id) >= 0
+ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate DESC
+LIMIT 1000;

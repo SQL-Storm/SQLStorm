@@ -1,0 +1,149 @@
+WITH
+Questions AS (
+  SELECT p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.Tags,
+         u.Id AS OwnerId, u.Reputation AS OwnerReputation, u.CreationDate AS OwnerCreation,
+         COALESCE(p.AnswerCount,0) AS AnswerCount, COALESCE(p.CommentCount,0) AS CommentCount,
+         COALESCE(p.FavoriteCount,0) AS FavoriteCount
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1
+),
+TopAnswers AS (
+  SELECT a.ParentId AS QuestionId, a.Id AS AnswerId, a.Score AS AnswerScore, a.CreationDate AS AnswerCreation,
+         a.OwnerUserId AS AnswerOwnerId, a.Body AS AnswerBody,
+         ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS rn
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+),
+TopAnswerFiltered AS (
+  SELECT QuestionId, AnswerId, AnswerScore, AnswerCreation, AnswerOwnerId, AnswerBody
+  FROM TopAnswers
+  WHERE rn = 1
+),
+RecentActivity AS (
+  SELECT p.Id AS PostId,
+         GREATEST(
+           COALESCE(p.LastActivityDate,p.CreationDate),
+           COALESCE(ph.CreationDate, p.LastEditDate, p.LastActivityDate, p.CreationDate)
+         ) AS LastActivity
+  FROM Posts p
+  LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+  WHERE GREATEST(
+           COALESCE(p.LastActivityDate,p.CreationDate),
+           COALESCE(ph.CreationDate, p.LastEditDate, p.CreationDate)
+        ) >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days'
+),
+ExplodedTags AS (
+  SELECT q.Id AS QuestionId,
+         TRIM(BOTH ' ' FROM UNNEST(STRING_TO_ARRAY(SUBSTRING(q.Tags,2,CHAR_LENGTH(q.Tags)-2),'><'))) AS Tag
+  FROM Questions q
+  WHERE q.Tags IS NOT NULL AND q.Tags <> ''
+),
+TagMetrics AS (
+  SELECT et.Tag,
+         COUNT(DISTINCT et.QuestionId) AS QuestionCount,
+         SUM(q.ViewCount) AS TotalViews,
+         AVG(q.Score) AS AvgScore,
+         SUM(q.FavoriteCount) AS TotalFavorites
+  FROM ExplodedTags et
+  JOIN Posts q ON q.Id = et.QuestionId
+  GROUP BY et.Tag
+),
+UserBadges AS (
+  SELECT b.UserId,
+         COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS Gold,
+         COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS Silver,
+         COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS Bronze,
+         COUNT(*) AS TotalBadges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+UserTagContrib AS (
+  SELECT a.OwnerUserId AS UserId,
+         TRIM(BOTH ' ' FROM UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags,2,CHAR_LENGTH(p.Tags)-2),'><'))) AS Tag,
+         COUNT(*) AS AnswersInTag,
+         AVG(a.Score) AS AvgAnswerScoreInTag
+  FROM Posts a
+  JOIN Posts p ON a.ParentId = p.Id
+  WHERE a.PostTypeId = 2 AND p.PostTypeId = 1 AND p.Tags IS NOT NULL
+  GROUP BY a.OwnerUserId, TRIM(BOTH ' ' FROM UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags,2,CHAR_LENGTH(p.Tags)-2),'><')))
+),
+UserAnswerStats AS (
+  SELECT a.OwnerUserId AS UserId, COUNT(*) AS Answers, AVG(a.Score) AS AvgAnswerScore, SUM(a.Score) AS TotalAnswerScore
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+  GROUP BY a.OwnerUserId
+),
+UserAggregate AS (
+  SELECT u.Id AS UserId, u.Reputation, u.CreationDate AS UserCreation,
+         COALESCE(ub.Gold,0) AS GoldBadges, COALESCE(ub.Silver,0) AS SilverBadges, COALESCE(ub.Bronze,0) AS BronzeBadges,
+         COALESCE(uas.Answers,0) AS Answers, COALESCE(uas.AvgAnswerScore,0) AS AvgAnswerScore, COALESCE(uas.TotalAnswerScore,0) AS TotalAnswerScore
+  FROM Users u
+  LEFT JOIN UserBadges ub ON ub.UserId = u.Id
+  LEFT JOIN UserAnswerStats uas ON uas.UserId = u.Id
+),
+PostLinkGraph AS (
+  SELECT pl.PostId, pl.RelatedPostId, lt.Name AS LinkType, pl.CreationDate
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+),
+DuplicateChains AS (
+  WITH RECURSIVE dup_chain(root, linked, depth) AS (
+    SELECT pl.PostId AS root, pl.RelatedPostId AS linked, 1
+    FROM PostLinks pl WHERE pl.LinkTypeId = 3
+    UNION ALL
+    SELECT dc.root, pl.RelatedPostId, dc.depth+1
+    FROM dup_chain dc
+    JOIN PostLinks pl ON pl.PostId = dc.linked AND pl.LinkTypeId = 3
+    WHERE dc.depth < 10
+  )
+  SELECT root AS QuestionId, MAX(depth) AS MaxDuplicateDepth, COUNT(DISTINCT linked) AS DuplicateReach
+  FROM dup_chain
+  GROUP BY root
+),
+QuestionRichSignals AS (
+  SELECT q.Id AS QuestionId, q.Title, q.Tags, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, q.CommentCount, q.FavoriteCount,
+         ta.AnswerId AS TopAnswerId, ta.AnswerScore, ta.AnswerOwnerId,
+         COALESCE(tc.MaxDuplicateDepth,0) AS MaxDupDepth, COALESCE(tc.DuplicateReach,0) AS DuplicateReach,
+         (COALESCE(q.Score,0) * 0.4)
+         + (LEAST(COALESCE(q.ViewCount,0),100000) * 1.0 / 100000 * 0.2)
+         + (LEAST(COALESCE(q.AnswerCount,0),10) * 1.0 / 10 * 0.15)
+         + (COALESCE(q.FavoriteCount,0) * 1.0 / NULLIF(GREATEST(1, (SELECT MAX(FavoriteCount) FROM Posts)),1) * 0.15)
+         + (GREATEST(0, (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 2) - (SELECT COUNT(*) FROM Votes v2 WHERE v2.PostId = q.Id AND v2.VoteTypeId = 3)) * 1.0 / NULLIF(GREATEST(1,(SELECT MAX(Score) FROM Posts)),1) * 0.1)
+         AS CompositeScore
+  FROM Questions q
+  LEFT JOIN TopAnswerFiltered ta ON ta.QuestionId = q.Id
+  LEFT JOIN DuplicateChains tc ON tc.QuestionId = q.Id
+)
+SELECT
+  qrs.QuestionId, qrs.Title,
+  qrs.CompositeScore,
+  qrs.Score AS QuestionScore, qrs.ViewCount, qrs.AnswerCount, qrs.CommentCount, qrs.FavoriteCount,
+  ta.AnswerId AS TopAnswerId, ta.AnswerScore, ua.Reputation AS TopAnswerOwnerReputation,
+  tm.Tag, tm.QuestionCount AS TagQuestionCount, tm.TotalViews AS TagTotalViews, tm.AvgScore AS TagAvgScore,
+  da.MaxDuplicateDepth, da.DuplicateReach,
+  ua.UserId AS OwnerId, ua.Reputation AS OwnerReputation, ua.GoldBadges, ua.SilverBadges, ua.BronzeBadges, ua.Answers AS OwnerAnswers,
+  uts.Tag AS OwnerTopTag, uts.AnswersInTag, uts.AvgAnswerScoreInTag
+FROM QuestionRichSignals qrs
+LEFT JOIN TopAnswerFiltered ta ON ta.QuestionId = qrs.QuestionId
+LEFT JOIN Questions q ON q.Id = qrs.QuestionId
+LEFT JOIN UserAggregate ua ON ua.UserId = q.OwnerId
+LEFT JOIN LATERAL (
+  SELECT et.Tag, et.AnswersInTag, et.AvgAnswerScoreInTag
+  FROM UserTagContrib et
+  WHERE et.UserId = ua.UserId
+  ORDER BY et.AnswersInTag DESC NULLS LAST, et.AvgAnswerScoreInTag DESC NULLS LAST
+  LIMIT 1
+) uts ON true
+LEFT JOIN LATERAL (
+  SELECT et.Tag, tm.QuestionCount, tm.TotalViews, tm.AvgScore
+  FROM ExplodedTags et
+  JOIN TagMetrics tm ON tm.Tag = et.Tag
+  WHERE et.QuestionId = qrs.QuestionId
+  ORDER BY tm.QuestionCount DESC NULLS LAST
+  LIMIT 1
+) tm ON true
+LEFT JOIN DuplicateChains da ON da.QuestionId = qrs.QuestionId
+WHERE qrs.CompositeScore IS NOT NULL
+ORDER BY qrs.CompositeScore DESC, qrs.ViewCount DESC
+LIMIT 200;

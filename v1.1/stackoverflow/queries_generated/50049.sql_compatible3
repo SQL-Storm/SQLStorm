@@ -1,0 +1,110 @@
+WITH UserCloseVotes AS (
+    SELECT
+        UserId,
+        PostId,
+        CreationDate AS VoteDate
+    FROM PostHistory
+    WHERE PostHistoryTypeId = 10 AND UserId IS NOT NULL
+),
+SuccessfulCloses AS (
+    SELECT
+        ucv.UserId,
+        p.Id AS PostId,
+        p.Tags,
+        p.ClosedDate,
+        ucv.VoteDate
+    FROM UserCloseVotes ucv
+    JOIN Posts p ON ucv.PostId = p.Id
+    WHERE p.ClosedDate IS NOT NULL
+      AND ucv.VoteDate <= p.ClosedDate
+      AND NOT EXISTS (
+        SELECT 1
+        FROM PostHistory ph_reopen
+        WHERE ph_reopen.PostId = p.Id
+          AND ph_reopen.PostHistoryTypeId = 11
+          AND ph_reopen.CreationDate > p.ClosedDate
+    )
+),
+UserCloseSummary AS (
+    SELECT
+        UserId,
+        COUNT(DISTINCT PostId) AS SuccessfulCloseVotes,
+        AVG(EXTRACT(EPOCH FROM (ClosedDate - VoteDate))) AS AvgTimeToClose
+    FROM SuccessfulCloses
+    GROUP BY UserId
+),
+UserTopTag AS (
+    WITH TagCounts AS (
+        SELECT
+            sc.UserId,
+            UNNEST(STRING_TO_ARRAY(SUBSTRING(sc.Tags FROM 2 FOR (LENGTH(sc.Tags) - 2)), '><')) AS Tag
+        FROM SuccessfulCloses sc
+        WHERE sc.Tags IS NOT NULL AND sc.Tags <> ''
+    ),
+    RankedTags AS (
+        SELECT
+            UserId,
+            Tag,
+            ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY COUNT(*) DESC, Tag ASC) as rn
+        FROM TagCounts
+        GROUP BY UserId, Tag
+    )
+    SELECT
+        UserId,
+        Tag AS TopClosedTag
+    FROM RankedTags
+    WHERE rn = 1
+),
+UserAnswerStats AS (
+    SELECT
+        p_ans.OwnerUserId AS OwnerUserId,
+        COUNT(*) AS AnswerCount,
+        AVG(p_ans.Score) AS AvgAnswerScore,
+        SUM(CASE WHEN p_ans.Id = p_q.AcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedAnswers
+    FROM Posts p_ans
+    JOIN Posts p_q ON p_ans.ParentId = p_q.Id
+    WHERE p_ans.PostTypeId = 2
+      AND p_ans.OwnerUserId IS NOT NULL
+    GROUP BY p_ans.OwnerUserId
+),
+UserBadgeStats AS (
+    SELECT
+        UserId,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges
+    GROUP BY UserId
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    EXTRACT(YEAR FROM AGE(TIMESTAMP '2024-10-01 12:34:56', u.CreationDate)) AS UserAgeYears,
+    ucs.SuccessfulCloseVotes,
+    utt.TopClosedTag,
+    COALESCE(uas.AnswerCount, 0) AS AnswerCount,
+    ROUND(COALESCE(uas.AvgAnswerScore, 0)::numeric, 2) /* replaced below with standard-cast if needed */ AS AvgAnswerScore,
+    COALESCE(uas.AcceptedAnswers, 0) AS AcceptedAnswers,
+    COALESCE(ubs.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ubs.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ubs.BronzeBadges, 0) AS BronzeBadges,
+    ROUND(
+        (
+            ucs.SuccessfulCloseVotes * 5 +
+            (COALESCE(uas.AcceptedAnswers, 0) * 10) +
+            (COALESCE(uas.AnswerCount, 0) * ROUND(COALESCE(uas.AvgAnswerScore, 0)::numeric, 2)) +
+            (COALESCE(ubs.GoldBadges, 0) * 100) +
+            (COALESCE(ubs.SilverBadges, 0) * 25) +
+            (COALESCE(ubs.BronzeBadges, 0) * 5)
+        ) * LOG(u.Reputation + 1) / (EXTRACT(YEAR FROM AGE(TIMESTAMP '2024-10-01 12:34:56', u.CreationDate)) + 1)
+    , 2) AS InfluenceScore
+FROM UserCloseSummary ucs
+JOIN Users u ON ucs.UserId = u.Id
+LEFT JOIN UserTopTag utt ON ucs.UserId = utt.UserId
+LEFT JOIN UserAnswerStats uas ON ucs.UserId = uas.OwnerUserId
+LEFT JOIN UserBadgeStats ubs ON ucs.UserId = ubs.UserId
+WHERE u.Reputation > 1000
+  AND ucs.SuccessfulCloseVotes > 20
+ORDER BY InfluenceScore DESC
+LIMIT 100;

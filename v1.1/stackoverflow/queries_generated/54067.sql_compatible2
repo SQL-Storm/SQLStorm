@@ -1,0 +1,69 @@
+WITH TagPosts AS (
+    SELECT
+        t.TagName,
+        p.Id        AS QuestionId,
+        p.OwnerUserId,
+        p.Score      AS QuestionScore,
+        p.CreationDate
+    FROM Tags t
+    JOIN Posts p
+        ON POSITION(CONCAT('<', t.TagName, '>') IN COALESCE(p.Tags, '')) > 0
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+),
+AnswerStats AS (
+    SELECT
+        qp.TagName,
+        qp.OwnerUserId,
+        COUNT(*)            AS AnswerCount,
+        SUM(a.Score)        AS TotalAnswerScore
+    FROM TagPosts qp
+    JOIN Posts a
+        ON a.ParentId   = qp.QuestionId
+        AND a.PostTypeId = 2
+    JOIN Votes v
+        ON v.PostId      = a.Id
+        AND v.VoteTypeId = 2
+    GROUP BY qp.TagName, qp.OwnerUserId
+),
+TagUserStats AS (
+    SELECT
+        tp.TagName,
+        tp.OwnerUserId  AS UserId,
+        u.DisplayName,
+        SUM(tp.QuestionScore)            AS TotalQuestionScore,
+        COUNT(DISTINCT tp.QuestionId)    AS QuestionCnt,
+        COALESCE(asum.AnswerCount, 0)      AS AnswerCnt,
+        COALESCE(asum.TotalAnswerScore,0) AS TotalAnswerScore
+    FROM TagPosts tp
+    JOIN Users u
+        ON u.Id = tp.OwnerUserId
+    LEFT JOIN AnswerStats asum
+        ON asum.TagName = tp.TagName
+        AND asum.OwnerUserId = tp.OwnerUserId
+    GROUP BY tp.TagName, tp.OwnerUserId, u.DisplayName, asum.AnswerCount, asum.TotalAnswerScore
+),
+Ranked AS (
+    SELECT
+        TagName,
+        UserId,
+        DisplayName,
+        TotalQuestionScore,
+        QuestionCnt,
+        TotalAnswerScore,
+        AnswerCnt,
+        RANK() OVER (PARTITION BY TagName ORDER BY TotalQuestionScore DESC) AS TagRank
+    FROM TagUserStats
+)
+SELECT
+    TagName,
+    UserId,
+    DisplayName,
+    TotalQuestionScore,
+    QuestionCnt,
+    TotalAnswerScore,
+    AnswerCnt
+FROM Ranked
+WHERE TagRank = 1
+ORDER BY TotalQuestionScore DESC
+OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY;

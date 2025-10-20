@@ -1,0 +1,112 @@
+WITH PostStats AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.PostTypeId,
+        u.Id AS OwnerUserId,
+        u.Reputation,
+        u.DisplayName,
+        u.LastAccessDate,
+        ARRAY_AGG(DISTINCT lt.Name) AS LinkTypes,
+        COUNT(DISTINCT c.Id) FILTER (WHERE c.Score > 0) AS PositiveComments,
+        COUNT(DISTINCT c.Id) FILTER (WHERE c.Score < 0) AS NegativeComments,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (10) THEN 1 ELSE 0 END) AS IsClosedFlag,
+        COUNT(DISTINCT bg.Id) AS BadgeCount,
+        CASE
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostLabel
+    FROM
+        Posts p
+        LEFT JOIN Users u ON p.OwnerUserId = u.Id
+        LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+        LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+        LEFT JOIN Comments c ON c.PostId = p.Id
+        LEFT JOIN Votes v ON v.PostId = p.Id
+        LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+        LEFT JOIN Badges bg ON bg.UserId = u.Id
+    GROUP BY
+        p.Id, p.Title, p.Tags, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount,
+        p.PostTypeId, u.Id, u.Reputation, u.DisplayName, u.LastAccessDate
+),
+LatestPostHistory AS (
+    SELECT
+        ph1.PostId,
+        ph1.UserId AS LastEditorId,
+        ph1.UserDisplayName AS LastEditorName,
+        ph1.CreationDate AS LastEditDate,
+        ph1.PostHistoryTypeId
+    FROM
+        PostHistory ph1
+        INNER JOIN (
+            SELECT
+                PostId,
+                MAX(CreationDate) AS MaxDate
+            FROM
+                PostHistory
+            GROUP BY
+                PostId
+        ) ph2 ON ph1.PostId = ph2.PostId AND ph1.CreationDate = ph2.MaxDate
+),
+AggregatedVotes AS (
+    SELECT
+        v.PostId,
+        COUNT(*) AS TotalVotes,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM
+        Votes v
+    GROUP BY
+        v.PostId
+)
+SELECT
+    ps.PostId,
+    ps.Title,
+    ps.PostLabel,
+    ps.Tags,
+    ps.CreationDate,
+    ps.Score,
+    ps.ViewCount,
+    ps.AnswerCount,
+    ps.CommentCount,
+    ps.FavoriteCount,
+    ps.Reputation,
+    ps.DisplayName,
+    ps.LastAccessDate,
+    ps.LinkTypes,
+    ps.PositiveComments,
+    ps.NegativeComments,
+    vq.TotalVotes,
+    vq.UpVotes,
+    vq.DownVotes,
+    leh.LastEditorId,
+    leh.LastEditorName,
+    leh.LastEditDate,
+    CASE WHEN ps.IsClosedFlag = 1 THEN TRUE ELSE FALSE END AS IsClosed,
+    COUNT(DISTINCT bh.Id) FILTER (WHERE bh.PostHistoryTypeId IN (35,36)) AS MigrationEvents,
+    (ps.Score + COALESCE(vq.UpVotes,0) - COALESCE(vq.DownVotes,0)) AS NetScore,
+    MAX(bg.Name) FILTER (WHERE bg.TagBased = FALSE) AS TopBadge
+FROM
+    PostStats ps
+    LEFT JOIN LatestPostHistory leh ON ps.PostId = leh.PostId
+    LEFT JOIN AggregatedVotes vq ON ps.PostId = vq.PostId
+    LEFT JOIN Badges bg ON bg.UserId = ps.OwnerUserId AND bg.Class = 1
+    LEFT JOIN PostHistory bh ON bh.PostId = ps.PostId
+GROUP BY
+    ps.PostId, ps.Title, ps.PostLabel, ps.Tags, ps.CreationDate, ps.Score, ps.ViewCount, ps.AnswerCount, ps.CommentCount,
+    ps.FavoriteCount, ps.Reputation, ps.DisplayName, ps.LastAccessDate, ps.LinkTypes,
+    ps.PositiveComments, ps.NegativeComments, vq.TotalVotes, vq.UpVotes, vq.DownVotes,
+    leh.LastEditorId, leh.LastEditorName, leh.LastEditDate, ps.IsClosedFlag, ps.OwnerUserId
+ORDER BY
+    ps.CreationDate DESC
+LIMIT 100;

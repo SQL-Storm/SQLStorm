@@ -1,0 +1,146 @@
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(p.Score) AS TotalScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    INNER JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY u.Id, u.Reputation
+    HAVING COUNT(DISTINCT p.Id) > 10
+),
+UserBadges AS (
+    SELECT 
+        b.UserId,
+        COUNT(b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserVotes AS (
+    SELECT 
+        v.UserId,
+        COUNT(v.Id) AS VoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesGiven
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2, 3)
+    GROUP BY v.UserId
+),
+TopTags AS (
+    SELECT 
+        t.Id AS TagId,
+        t.TagName,
+        t.Count AS TagUsage,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    WHERE t.Count > 1000
+),
+-- Replace dialect-specific STRING_TO_ARRAY with standard SQL string splitting using recursive CTE
+PostTags AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId AS UserId,
+        TRIM(BOTH '>' FROM TRIM(BOTH '<' FROM tag_segment)) AS TagName
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        -- normalize tags string: remove outer <> pairs then treat as a single string with separators '><'
+        SELECT
+            CASE
+                WHEN p.Tags LIKE '<%>' THEN SUBSTR(p.Tags, 2, LENGTH(p.Tags) - 2)
+                ELSE p.Tags
+            END AS tags_inner
+    ) norm
+    LEFT JOIN LATERAL (
+        -- split tags_inner by '><' using a recursive split
+        WITH RECURSIVE split(tag_segment, rest) AS (
+            SELECT 
+                CASE 
+                    WHEN instr(norm.tags_inner, '><') = 0 THEN norm.tags_inner
+                    ELSE SUBSTR(norm.tags_inner, 1, instr(norm.tags_inner, '><') - 1)
+                END,
+                CASE
+                    WHEN instr(norm.tags_inner, '><') = 0 THEN ''
+                    ELSE SUBSTR(norm.tags_inner, instr(norm.tags_inner, '><') + 2)
+                END
+            UNION ALL
+            SELECT
+                CASE
+                    WHEN instr(rest, '><') = 0 THEN rest
+                    ELSE SUBSTR(rest, 1, instr(rest, '><') - 1)
+                END,
+                CASE
+                    WHEN instr(rest, '><') = 0 THEN ''
+                    ELSE SUBSTR(rest, instr(rest, '><') + 2)
+                END
+            FROM split
+            WHERE rest <> ''
+        )
+        SELECT tag_segment FROM split
+    ) s(tag_segment)
+    WHERE p.PostTypeId = 1
+),
+UserTagActivity AS (
+    SELECT 
+        pt.UserId,
+        tt.TagId,
+        COUNT(*) AS PostsInTag,
+        SUM(p.Score) AS ScoreInTag
+    FROM PostTags pt
+    INNER JOIN TopTags tt ON tt.TagName = pt.TagName
+    INNER JOIN Posts p ON p.Id = pt.PostId
+    GROUP BY pt.UserId, tt.TagId
+    HAVING COUNT(*) > 5
+),
+AggregatedData AS (
+    SELECT 
+        au.UserId,
+        au.Reputation,
+        au.PostCount,
+        au.TotalScore,
+        au.LastPostDate,
+        ub.BadgeCount,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        uv.VoteCount,
+        uv.UpVotesGiven,
+        uv.DownVotesGiven,
+        STRING_AGG(CONCAT(tt.TagName, ': ', uta.PostsInTag, ' posts, ', uta.ScoreInTag, ' score'), '; ') AS TagActivities
+    FROM ActiveUsers au
+    LEFT JOIN UserBadges ub ON au.UserId = ub.UserId
+    LEFT JOIN UserVotes uv ON au.UserId = uv.UserId
+    LEFT JOIN UserTagActivity uta ON au.UserId = uta.UserId
+    LEFT JOIN TopTags tt ON uta.TagId = tt.TagId
+    WHERE tt.TagRank <= 10
+    GROUP BY 
+        au.UserId, au.Reputation, au.PostCount, au.TotalScore, au.LastPostDate,
+        ub.BadgeCount, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges,
+        uv.VoteCount, uv.UpVotesGiven, uv.DownVotesGiven
+)
+SELECT 
+    u.DisplayName,
+    ad.Reputation,
+    ad.PostCount,
+    ad.TotalScore,
+    ad.LastPostDate,
+    ad.BadgeCount,
+    ad.GoldBadges,
+    ad.SilverBadges,
+    ad.BronzeBadges,
+    ad.VoteCount,
+    ad.UpVotesGiven,
+    ad.DownVotesGiven,
+    ad.TagActivities,
+    (SELECT COUNT(c.Id) FROM Comments c WHERE c.UserId = u.Id) AS CommentCount,
+    (SELECT COUNT(ph.Id) FROM PostHistory ph WHERE ph.UserId = u.Id AND ph.PostHistoryTypeId IN (4,5,6)) AS EditCount,
+    RANK() OVER (ORDER BY ad.Reputation DESC, ad.TotalScore DESC) AS OverallRank
+FROM AggregatedData ad
+INNER JOIN Users u ON ad.UserId = u.Id
+WHERE ad.Reputation > 10000
+ORDER BY OverallRank
+LIMIT 100;

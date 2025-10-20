@@ -1,0 +1,161 @@
+WITH TopUsers AS (
+    SELECT 
+        u.Id, 
+        u.DisplayName, 
+        u.Reputation,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS "Rank",
+        u.CreationDate
+    FROM Users u
+    WHERE u.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+),
+UserBadges AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+RecentActivity AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        COUNT(*) AS RecentPosts,
+        SUM(CASE WHEN p.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Question') THEN 1 ELSE 0 END) AS RecentQuestions,
+        SUM(CASE WHEN p.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Answer') THEN 1 ELSE 0 END) AS RecentAnswers
+    FROM Posts p
+    WHERE p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months')
+      AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+TagsCountPerUser AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        AVG(
+            (LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, '><', '')))
+            + CASE WHEN p.Tags IS NOT NULL THEN 1 ELSE 0 END
+        ) AS AvgTagsPerQuestion
+    FROM Posts p
+    JOIN PostTypes pt 
+      ON p.PostTypeId = pt.Id 
+     AND pt.Name = 'Question'
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+VoteTypesUpMod AS (
+    SELECT Id 
+    FROM VoteTypes 
+    WHERE Name = 'UpMod'
+),
+UpVotesReceived AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        COUNT(v.Id) AS UpVotesReceived
+    FROM Posts p
+    JOIN Votes v 
+      ON v.PostId = p.Id
+    JOIN VoteTypesUpMod vt 
+      ON v.VoteTypeId = vt.Id
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+LinkTypeDuplicate AS (
+    SELECT Id 
+    FROM LinkTypes 
+    WHERE Name = 'Duplicate'
+),
+DuplicateChain AS (
+    -- Recursive CTE requires WITH RECURSIVE; will be used below with RECURSIVE keyword
+    SELECT 
+        pl.PostId, 
+        pl.RelatedPostId, 
+        1 AS Depth
+    FROM PostLinks pl
+    JOIN LinkTypeDuplicate ltd 
+      ON pl.LinkTypeId = ltd.Id
+
+    UNION ALL
+
+    SELECT 
+        dc.PostId, 
+        pl.RelatedPostId, 
+        dc.Depth + 1
+    FROM DuplicateChain dc
+    JOIN PostLinks pl 
+      ON pl.PostId = dc.RelatedPostId
+    JOIN LinkTypeDuplicate ltd 
+      ON pl.LinkTypeId = ltd.Id
+    WHERE dc.Depth < 5
+)
+-- Rebuild WITH to include RECURSIVE and ensure DuplicateChain is defined in the recursive scope
+WITH RECURSIVE
+TopUsers2 AS (SELECT * FROM TopUsers),
+UserBadges2 AS (SELECT * FROM UserBadges),
+RecentActivity2 AS (SELECT * FROM RecentActivity),
+TagsCountPerUser2 AS (SELECT * FROM TagsCountPerUser),
+VoteTypesUpMod2 AS (SELECT * FROM VoteTypesUpMod),
+UpVotesReceived2 AS (SELECT * FROM UpVotesReceived),
+LinkTypeDuplicate2 AS (SELECT * FROM LinkTypeDuplicate),
+DuplicateChain2 AS (
+    SELECT 
+        pl.PostId, 
+        pl.RelatedPostId, 
+        1 AS Depth
+    FROM PostLinks pl
+    JOIN LinkTypeDuplicate2 ltd 
+      ON pl.LinkTypeId = ltd.Id
+
+    UNION ALL
+
+    SELECT 
+        dc.PostId, 
+        pl.RelatedPostId, 
+        dc.Depth + 1
+    FROM DuplicateChain2 dc
+    JOIN PostLinks pl 
+      ON pl.PostId = dc.RelatedPostId
+    JOIN LinkTypeDuplicate2 ltd 
+      ON pl.LinkTypeId = ltd.Id
+    WHERE dc.Depth < 5
+)
+SELECT 
+    tu.Id,
+    tu.DisplayName,
+    tu.Reputation,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    COALESCE(ra.RecentPosts, 0)        AS RecentPosts,
+    COALESCE(ra.RecentQuestions, 0)    AS RecentQuestions,
+    COALESCE(ra.RecentAnswers, 0)      AS RecentAnswers,
+    COALESCE(tc.AvgTagsPerQuestion, 0) AS AvgTagsPerQuestion,
+    COALESCE(uv.UpVotesReceived, 0)    AS UpVotesReceived,
+    COUNT(DISTINCT dc.RelatedPostId) AS DownstreamDuplicates,
+    tu."Rank"
+FROM TopUsers2 tu
+LEFT JOIN UserBadges2 ub 
+  ON ub.UserId = tu.Id
+LEFT JOIN RecentActivity2 ra 
+  ON ra.UserId = tu.Id
+LEFT JOIN TagsCountPerUser2 tc 
+  ON tc.UserId = tu.Id
+LEFT JOIN UpVotesReceived2 uv 
+  ON uv.UserId = tu.Id
+LEFT JOIN Posts pOwn 
+  ON pOwn.OwnerUserId = tu.Id
+LEFT JOIN DuplicateChain2 dc 
+  ON dc.PostId = pOwn.Id
+GROUP BY 
+    tu.Id,
+    tu.DisplayName,
+    tu.Reputation,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ra.RecentPosts,
+    ra.RecentQuestions,
+    ra.RecentAnswers,
+    tc.AvgTagsPerQuestion,
+    uv.UpVotesReceived,
+    tu."Rank"
+ORDER BY tu."Rank";

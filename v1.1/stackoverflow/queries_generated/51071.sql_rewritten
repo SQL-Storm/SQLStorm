@@ -1,0 +1,84 @@
+-- {"query": "51071.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2129, "output_tokens": 952} 
+WITH popular_tags AS (
+    SELECT 
+        t.TagName,
+        COUNT(*) as post_count
+    FROM Tags t
+    JOIN Posts p ON string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><') @> ARRAY[t.TagName]
+    WHERE p.PostTypeId = 1 
+        AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+    GROUP BY t.TagName
+    HAVING COUNT(*) > 50
+),
+top_users_by_activity AS (
+    SELECT 
+        u.Id as user_id,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) as edit_count,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) as upvote_count,
+        AVG(u.Reputation) as avg_reputation
+    FROM Users u
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id AND v.VoteTypeId = 2
+    WHERE u.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 years'
+    GROUP BY u.Id
+    HAVING SUM(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) > 10
+),
+question_answer_network AS (
+    SELECT 
+        q.Id as question_id,
+        q.Title,
+        q.CreationDate as q_created,
+        a.Id as answer_id,
+        a.CreationDate as a_created,
+        a.Score as answer_score,
+        tu.user_id as top_user_id,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC) as answer_rank
+    FROM Posts q
+    JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    JOIN popular_tags pt ON string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><') @> ARRAY[pt.TagName]
+    JOIN top_users_by_activity tu ON COALESCE(a.OwnerUserId, tu.user_id) = tu.user_id
+    WHERE q.PostTypeId = 1 
+        AND q.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 months'
+        AND q.Score > 5
+)
+SELECT 
+    qan.question_id,
+    qan.Title,
+    qan.q_created,
+    qan.answer_id,
+    qan.answer_score,
+    qan.answer_rank,
+    u.DisplayName as answer_author,
+    u.Reputation as author_reputation,
+    u.UpVotes as author_upvotes,
+    b.Name as badge_name,
+    b.Date as badge_date,
+    pl.RelatedPostId as linked_post,
+    lt.Name as link_type,
+    c.Text as top_comment,
+    AVG(v.BountyAmount) as avg_bounty_related,
+    COUNT(DISTINCT ph.Id) as related_edits
+FROM question_answer_network qan
+JOIN Posts a ON a.Id = qan.answer_id
+JOIN Users u ON a.OwnerUserId = u.Id
+LEFT JOIN Badges b ON b.UserId = u.Id 
+    AND b.Name IN ('Editor', 'Sportsmanship', 'Synonym Synonym')
+    AND b.Date >= qan.q_created
+LEFT JOIN PostLinks pl ON pl.PostId IN (qan.question_id, qan.answer_id) 
+    AND pl.LinkTypeId = 1
+LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+LEFT JOIN Comments c ON c.PostId = qan.question_id 
+    AND c.Score = (SELECT MAX(Score) FROM Comments WHERE PostId = qan.question_id)
+LEFT JOIN Votes v ON v.PostId = pl.RelatedPostId 
+    AND v.VoteTypeId = 8
+LEFT JOIN PostHistory ph ON ph.PostId = pl.RelatedPostId 
+    AND ph.PostHistoryTypeId IN (4,5,6)
+    AND ph.CreationDate >= qan.q_created - INTERVAL '1 month'
+WHERE qan.answer_rank <= 3
+GROUP BY 
+    qan.question_id, qan.Title, qan.q_created, qan.answer_id, qan.answer_score, 
+    qan.answer_rank, u.DisplayName, u.Reputation, u.UpVotes, 
+    b.Name, b.Date, pl.RelatedPostId, lt.Name, c.Text
+HAVING COUNT(DISTINCT ph.Id) > 1 OR AVG(v.BountyAmount) IS NOT NULL
+ORDER BY qan.answer_score DESC, qan.q_created DESC
+LIMIT 1000;

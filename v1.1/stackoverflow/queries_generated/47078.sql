@@ -1,0 +1,140 @@
+-- {"query": "47078.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 178932, "output_tokens": 158109} 
+
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><') AS related_tags
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Id = t.WikiPostId
+    WHERE t.Count > 1000
+),
+user_expertise AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS posts_in_tag,
+        SUM(p.Score) AS total_score_in_tag,
+        AVG(p.Score) AS avg_score_in_tag,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Id = q.AcceptedAnswerId THEN p.Id END) AS accepted_answers,
+        DENSE_RANK() OVER (PARTITION BY t.TagName ORDER BY SUM(p.Score) DESC) AS tag_rank
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    JOIN Posts q ON q.Id = p.ParentId AND p.PostTypeId = 2
+    CROSS JOIN LATERAL STRING_TO_ARRAY(SUBSTRING(q.Tags, 2, LENGTH(q.Tags)-2), '><') AS tag_array(tag)
+    JOIN Tags t ON t.TagName = tag_array.tag
+    WHERE u.Reputation > 5000
+        AND p.Score > 0
+        AND p.CreationDate >= NOW() - INTERVAL '2 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, t.TagName
+),
+edit_patterns AS (
+    SELECT 
+        ph.UserId,
+        DATE_TRUNC('month', ph.CreationDate) AS edit_month,
+        COUNT(*) AS edit_count,
+        COUNT(DISTINCT ph.PostId) AS unique_posts_edited,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.PostId END) AS content_edits,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (7, 8, 9) THEN ph.PostId END) AS rollbacks
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+        AND ph.CreationDate >= NOW() - INTERVAL '1 year'
+    GROUP BY ph.UserId, DATE_TRUNC('month', ph.CreationDate)
+),
+voting_networks AS (
+    SELECT 
+        v1.UserId AS voter_id,
+        p.OwnerUserId AS recipient_id,
+        COUNT(*) AS vote_count,
+        SUM(CASE WHEN v1.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+        SUM(CASE WHEN v1.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+        AVG(p.Score) AS avg_post_score
+    FROM Votes v1
+    JOIN Posts p ON p.Id = v1.PostId
+    WHERE v1.UserId IS NOT NULL
+        AND p.OwnerUserId IS NOT NULL
+        AND v1.VoteTypeId IN (2, 3)
+        AND v1.CreationDate >= NOW() - INTERVAL '6 months'
+    GROUP BY v1.UserId, p.OwnerUserId
+    HAVING COUNT(*) >= 5
+),
+badge_progression AS (
+    SELECT 
+        b.UserId,
+        b.Name AS badge_name,
+        b.Class,
+        b.Date AS earned_date,
+        LAG(b.Date) OVER (PARTITION BY b.UserId ORDER BY b.Date) AS prev_badge_date,
+        EXTRACT(EPOCH FROM (b.Date - LAG(b.Date) OVER (PARTITION BY b.UserId ORDER BY b.Date)))/86400 AS days_since_last_badge,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId, b.Class ORDER BY b.Date) AS badge_sequence
+    FROM Badges b
+    WHERE b.TagBased = '0'
+)
+SELECT 
+    ue.DisplayName,
+    ue.Reputation,
+    ue.TagName AS primary_expertise,
+    ue.posts_in_tag,
+    ue.total_score_in_tag,
+    ue.accepted_answers,
+    ue.tag_rank,
+    COALESCE(ep.total_edits, 0) AS total_edits_last_year,
+    COALESCE(ep.avg_monthly_edits, 0) AS avg_monthly_edits,
+    COALESCE(vn.connections, 0) AS voting_connections,
+    COALESCE(vn.total_votes_given, 0) AS total_votes_given,
+    COALESCE(vn.upvote_ratio, 0) AS upvote_ratio,
+    COALESCE(bp.gold_badges, 0) AS gold_badges,
+    COALESCE(bp.silver_badges, 0) AS silver_badges,
+    COALESCE(bp.bronze_badges, 0) AS bronze_badges,
+    COALESCE(bp.avg_days_between_badges, 0) AS avg_days_between_badges,
+    COUNT(DISTINCT c.Id) AS comments_made,
+    AVG(c.Score) AS avg_comment_score
+FROM user_expertise ue
+LEFT JOIN LATERAL (
+    SELECT 
+        SUM(edit_count) AS total_edits,
+        AVG(edit_count) AS avg_monthly_edits
+    FROM edit_patterns
+    WHERE UserId = ue.UserId
+) ep ON true
+LEFT JOIN LATERAL (
+    SELECT 
+        COUNT(DISTINCT recipient_id) AS connections,
+        SUM(vote_count) AS total_votes_given,
+        SUM(upvotes)::FLOAT / NULLIF(SUM(upvotes) + SUM(downvotes), 0) AS upvote_ratio
+    FROM voting_networks
+    WHERE voter_id = ue.UserId
+) vn ON true
+LEFT JOIN LATERAL (
+    SELECT 
+        COUNT(CASE WHEN Class = 1 THEN 1 END) AS gold_badges,
+        COUNT(CASE WHEN Class = 2 THEN 1 END) AS silver_badges,
+        COUNT(CASE WHEN Class = 3 THEN 1 END) AS bronze_badges,
+        AVG(days_since_last_badge) AS avg_days_between_badges
+    FROM badge_progression
+    WHERE UserId = ue.UserId
+) bp ON true
+LEFT JOIN Comments c ON c.UserId = ue.UserId
+WHERE ue.tag_rank <= 10
+GROUP BY 
+    ue.DisplayName,
+    ue.Reputation,
+    ue.TagName,
+    ue.posts_in_tag,
+    ue.total_score_in_tag,
+    ue.accepted_answers,
+    ue.tag_rank,
+    ep.total_edits,
+    ep.avg_monthly_edits,
+    vn.connections,
+    vn.total_votes_given,
+    vn.upvote_ratio,
+    bp.gold_badges,
+    bp.silver_badges,
+    bp.bronze_badges,
+    bp.avg_days_between_badges
+ORDER BY ue.Reputation DESC, ue.total_score_in_tag DESC
+LIMIT 100;

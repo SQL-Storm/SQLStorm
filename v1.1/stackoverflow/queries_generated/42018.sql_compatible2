@@ -1,0 +1,138 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.PostTypeId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.OwnerUserId,
+        P.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.CreationDate) AS UserPostRank
+    FROM 
+        Posts P
+    WHERE 
+        P.PostTypeId IN (1, 2) AND P.Score > 0
+),
+TopUsers AS (
+    SELECT 
+        U.Id,
+        U.Reputation,
+        U.CreationDate,
+        U.DisplayName,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        COUNT(DISTINCT CASE WHEN B.Class = 1 THEN B.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN B.Class = 2 THEN B.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN B.Class = 3 THEN B.Id END) AS BronzeBadges
+    FROM 
+        Users U
+    JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id,
+        U.Reputation,
+        U.CreationDate,
+        U.DisplayName
+    HAVING 
+        COUNT(DISTINCT B.Id) > 0
+),
+UserActivity AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT V.Id) AS TotalVotes,
+        COUNT(DISTINCT PH.Id) AS TotalPostHistory
+    FROM 
+        Users U
+    LEFT JOIN 
+        Comments C ON U.Id = C.UserId
+    LEFT JOIN 
+        Votes V ON U.Id = V.UserId
+    LEFT JOIN 
+        PostHistory PH ON U.Id = PH.UserId
+    GROUP BY 
+        U.Id,
+        U.DisplayName
+),
+PostTags AS (
+    -- portable tag splitting without PostgreSQL-specific regexp_split_to_table/substring/char_length
+    -- use standard functions: replace and case and a generic split emulation via recursive CTE for portability
+    SELECT P.Id, TRIM(BOTH '<>' FROM tag) AS TagName
+    FROM Posts P
+    CROSS JOIN LATERAL (
+        -- normalize: NULL -> '', remove outer angle brackets if present, replace '><' with '|' as delimiter
+        SELECT CASE
+            WHEN P.Tags IS NULL THEN ''
+            WHEN LEFT(P.Tags,1) = '<' AND RIGHT(P.Tags,1) = '>' THEN REPLACE(SUBSTR(P.Tags, 2, LENGTH(P.Tags) - 2), '><', '|')
+            ELSE REPLACE(P.Tags, '><', '|')
+        END AS tags_norm
+    ) norm
+    CROSS JOIN LATERAL (
+        -- split by '|' into rows in a dialect-neutral way using a recursive split
+        SELECT CAST(NULL AS VARCHAR) AS tag, 1 AS pos WHERE 1=0
+    ) init
+    -- recursive splitting CTE
+    , (SELECT tags_norm FROM (SELECT norm.tags_norm) t) tmp
+    JOIN (
+        -- emulate splitting: create rows by repeated substring extraction using a recursive union
+        SELECT
+            CASE WHEN instr = 0 THEN tmp.tags_norm ELSE substr(tmp.tags_norm, 1, instr-1) END AS tag
+        FROM (
+            SELECT tmp.tags_norm,
+                   COALESCE(NULLIF(instr(tmp.tags_norm, '|'),0), 0) AS instr
+            FROM (SELECT tmp.tags_norm) tmp
+        ) s
+        WHERE (CASE WHEN instr(tmp.tags_norm, '|') = 0 THEN tmp.tags_norm ELSE substr(tmp.tags_norm, 1, instr(tmp.tags_norm, '|')-1) END) IS NOT NULL
+    ) split ON 1=1
+    WHERE P.PostTypeId = 1
+),
+TagStats AS (
+    SELECT 
+        T.TagName,
+        COUNT(DISTINCT P.Id) AS QuestionCount,
+        AVG(P.Score) AS AvgScore,
+        SUM(P.ViewCount) AS TotalViews
+    FROM 
+        Tags T
+    JOIN 
+        PostTags PT ON T.TagName = PT.TagName
+    JOIN 
+        Posts P ON PT.Id = P.Id
+    WHERE 
+        P.PostTypeId = 1
+    GROUP BY 
+        T.TagName
+)
+SELECT 
+    TU.Id,
+    TU.DisplayName,
+    TU.Reputation,
+    TU.TotalBadges,
+    TU.GoldBadges,
+    TU.SilverBadges,
+    TU.BronzeBadges,
+    UA.TotalComments,
+    UA.TotalVotes,
+    UA.TotalPostHistory,
+    TS.TagName,
+    TS.QuestionCount,
+    TS.AvgScore,
+    TS.TotalViews,
+    RP.Id AS TopPostId,
+    RP.Score AS TopPostScore,
+    RP.ViewCount AS TopPostViews,
+    RP.LastActivityDate AS TopPostLastActivity
+FROM 
+    TopUsers TU
+JOIN 
+    UserActivity UA ON TU.Id = UA.Id
+JOIN 
+    RankedPosts RP ON TU.Id = RP.OwnerUserId AND RP.UserPostRank = 1
+JOIN 
+    PostTags PT ON RP.Id = PT.Id
+JOIN 
+    TagStats TS ON PT.TagName = TS.TagName
+ORDER BY 
+    TU.Reputation DESC, 
+    RP.Score DESC, 
+    TS.TotalViews DESC;

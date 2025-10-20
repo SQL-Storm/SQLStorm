@@ -1,0 +1,52 @@
+-- {"query": "383.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 12107} 
+WITH tag_data AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    COALESCE(u.Reputation, 0) AS OwnerReputation,
+    t.tag AS TagName,
+    COALESCE(p.Score, 0) AS Score,
+    COALESCE(p.ViewCount, 0) AS ViewCount,
+    p.CreationDate,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCountOnPost,
+    p.Title
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  CROSS JOIN LATERAL unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><')) AS t
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= (CURRENT_TIMESTAMP - INTERVAL '365 days')
+),
+tag_agg AS (
+  SELECT TagName,
+         COUNT(*) AS QuestionCountLastYear,
+         AVG(Score) AS AvgScore,
+         SUM(ViewCount) AS TotalViews,
+         MAX(CommentCountOnPost) AS MaxCommentsOnTag
+  FROM tag_data
+  GROUP BY TagName
+),
+tag_with_rank AS (
+  SELECT TagName,
+         QuestionCountLastYear,
+         AvgScore,
+         TotalViews,
+         MaxCommentsOnTag,
+         ROW_NUMBER() OVER (ORDER BY QuestionCountLastYear DESC, AvgScore DESC, TotalViews DESC) AS Rank
+  FROM tag_agg
+),
+total_row AS (
+  SELECT 'TOTAL' AS TagName,
+         SUM(QuestionCountLastYear) AS QuestionCountLastYear,
+         AVG(AvgScore) AS AvgScore,
+         SUM(TotalViews) AS TotalViews,
+         MAX(MaxCommentsOnTag) AS MaxCommentsOnTag,
+         NULL AS Rank
+  FROM tag_agg
+)
+SELECT TagName, QuestionCountLastYear, AvgScore, TotalViews, MaxCommentsOnTag, Rank
+FROM tag_with_rank
+UNION ALL
+SELECT TagName, QuestionCountLastYear, AvgScore, TotalViews, MaxCommentsOnTag, Rank
+FROM total_row
+ORDER BY Rank NULLS LAST, TagName
+LIMIT 100;

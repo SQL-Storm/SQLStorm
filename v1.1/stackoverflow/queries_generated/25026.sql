@@ -1,4 +1,4 @@
--- {"query": "25026.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1482} 
+-- {"query": "25026.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1482} 
 
 /*  Benchmark query: comprehensive user activity snapshot with tags, votes, and post history */
 WITH RECURSIVE TopUsers AS (

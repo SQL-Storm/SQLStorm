@@ -1,0 +1,50 @@
+WITH UserTagActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        tag.TagName AS TagName,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.ViewCount) AS MaxViewCount
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    CROSS JOIN (
+        -- split tags like '<tag1><tag2>' into rows
+        SELECT TRIM(tkn) AS TagName
+        FROM (
+            SELECT
+                -- replace leading/trailing angle brackets then split by '><'
+                regexp_split_to_table(
+                    CASE
+                        WHEN p.Tags LIKE '<%>' THEN substring(p.Tags FROM 2 FOR (char_length(p.Tags) - 2))
+                        ELSE p.Tags
+                    END,
+                    '><'
+                ) AS tkn
+        ) s
+    ) tag
+    JOIN Tags t ON t.TagName = tag.TagName
+    WHERE p.PostTypeId = 1
+    GROUP BY u.Id, tag.TagName
+),
+TagPerformanceRanking AS (
+    SELECT 
+        TagName,
+        RANK() OVER (ORDER BY SUM(PostCount) DESC) AS PopularityRank,
+        RANK() OVER (ORDER BY AVG(AvgPostScore) DESC) AS QualityRank
+    FROM UserTagActivity
+    GROUP BY TagName
+)
+SELECT 
+    uta.TagName,
+    tpr.PopularityRank,
+    tpr.QualityRank,
+    COUNT(DISTINCT uta.UserId) AS UniqueContributors,
+    SUM(uta.PostCount) AS TotalPosts,
+    ROUND(AVG(uta.AvgPostScore), 2) AS AverageTagScore,
+    MAX(uta.MaxViewCount) AS MaxTagViewCount
+FROM UserTagActivity uta
+JOIN TagPerformanceRanking tpr ON uta.TagName = tpr.TagName
+WHERE uta.PostCount > 5
+GROUP BY uta.TagName, tpr.PopularityRank, tpr.QualityRank
+ORDER BY UniqueContributors DESC, TotalPosts DESC
+LIMIT 50;

@@ -1,0 +1,192 @@
+-- {"query": "37098.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 2027} 
+WITH
+-- recent active questions with tag arrays and basic aggregates
+Questions AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.OwnerUserId,
+    p.Tags,
+    COALESCE(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><'), ARRAY[]::varchar[]) AS TagArray
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= now() - interval '2 years'
+),
+-- explosive join of tag exploded rows for tag-level metrics
+QuestionTags AS (
+  SELECT q.Id AS QuestionId, unnest(q.TagArray) AS Tag
+  FROM Questions q
+),
+-- user aggregates (activity, badges, reputation trend)
+UserAgg AS (
+  SELECT
+    u.Id AS UserId,
+    u.Reputation,
+    COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAsked,
+    COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersGiven,
+    MAX(u.LastAccessDate) AS LastAccessDate,
+    SUM(b.Class = 1)::int AS GoldBadges,
+    SUM(b.Class = 2)::int AS SilverBadges,
+    SUM(b.Class = 3)::int AS BronzeBadges,
+    CASE WHEN u.CreationDate < now() - interval '5 years' THEN 'veteran'
+         WHEN u.CreationDate < now() - interval '1 year' THEN 'established'
+         ELSE 'new' END AS Cohort
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id, u.Reputation, u.CreationDate
+),
+-- per-question neighbor metrics: top answers, answerers, comments
+QuestionActivity AS (
+  SELECT
+    q.Id AS QuestionId,
+    COUNT(a.Id) FILTER (WHERE a.PostTypeId = 2) AS TotalAnswers,
+    MAX(a.Score) FILTER (WHERE a.PostTypeId = 2) AS TopAnswerScore,
+    AVG(a.Score) FILTER (WHERE a.PostTypeId = 2) AS AvgAnswerScore,
+    COUNT(c.Id) AS CommentCount,
+    MIN(a.CreationDate) FILTER (WHERE a.PostTypeId = 2) AS FirstAnswerDate,
+    MAX(a.CreationDate) FILTER (WHERE a.PostTypeId = 2) AS LastAnswerDate,
+    jsonb_agg(DISTINCT jsonb_build_object('AnswerId', a.Id, 'Owner', a.OwnerUserId, 'Score', a.Score) ORDER BY a.Score DESC NULLS LAST) FILTER (WHERE a.PostTypeId = 2) AS AnswerSummary
+  FROM Questions q
+  LEFT JOIN Posts a ON a.ParentId = q.Id
+  LEFT JOIN Comments c ON c.PostId = q.Id OR c.PostId = a.Id
+  GROUP BY q.Id
+),
+-- compute tag popularity and median score by tag
+TagStats AS (
+  SELECT
+    qt.Tag,
+    COUNT(DISTINCT qt.QuestionId) AS QuestionsWithTag,
+    AVG(q.Score) AS AvgQuestionScore,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY q.Score) AS MedianQuestionScore,
+    SUM(q.ViewCount) AS TotalViews
+  FROM QuestionTags qt
+  JOIN Questions q ON q.Id = qt.QuestionId
+  GROUP BY qt.Tag
+),
+-- compute linking neighborhood for duplicate/linked posts
+PostLinkNet AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    lt.Name AS LinkType,
+    COUNT(*) OVER (PARTITION BY pl.PostId) AS OutgoingLinks,
+    COUNT(*) OVER (PARTITION BY pl.RelatedPostId) AS IncomingLinks
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+  WHERE pl.CreationDate >= now() - interval '3 years'
+),
+-- heavy-weight combined ranking across signals
+QuestionScore AS (
+  SELECT
+    q.Id,
+    q.Title,
+    q.CreationDate,
+    q.Score AS QuestionScore,
+    q.ViewCount,
+    qa.TotalAnswers,
+    qa.TopAnswerScore,
+    ua.UserId AS OwnerUserId,
+    ua.Reputation AS OwnerReputation,
+    ua.GoldBadges,
+    ts.Tag AS PrimaryTag,
+    ts.QuestionsWithTag,
+    ts.MedianQuestionScore AS TagMedianScore,
+    -- composite score: recency decay, votes, views, owner reputation, tag popularity
+    (
+      -- recency factor (newer gets boost)
+      GREATEST(0.1, 1.0 - EXTRACT(EPOCH FROM (now() - q.CreationDate)) / (86400*365.0*2)) * 0.25
+      +
+      -- normalized question score
+      (LEAST(GREATEST(q.Score, -5), 500)::numeric / 100.0) * 0.2
+      +
+      -- view influence (log scaled)
+      (LN(GREATEST(q.ViewCount,1)) / 10.0) * 0.15
+      +
+      -- owner reputation influence (diminishing)
+      (LEAST(LEAST(ua.Reputation,100000)::numeric,10000) / 10000.0) * 0.2
+      +
+      -- tag popularity (more popular tags slightly penalized to favor niche high-quality)
+      (GREATEST(0, 1 - LEAST(ts.QuestionsWithTag::numeric,10000)/10000.0)) * 0.2
+    ) AS CompositeScore
+  FROM Questions q
+  LEFT JOIN QuestionActivity qa ON qa.QuestionId = q.Id
+  LEFT JOIN UserAgg ua ON ua.UserId = q.OwnerUserId
+  LEFT JOIN QuestionTags qt ON qt.QuestionId = q.Id
+  LEFT JOIN TagStats ts ON ts.Tag = qt.Tag
+),
+-- windowed top answers per tag and tying top users per tag
+TopPerTag AS (
+  SELECT DISTINCT ON (t.Tag)
+    t.Tag,
+    q.Id AS QuestionId,
+    q.Title,
+    qs.CompositeScore,
+    qs.QuestionScore,
+    qs.ViewCount,
+    ua.UserId AS OwnerUserId,
+    ua.Reputation AS OwnerReputation,
+    row_number() OVER (PARTITION BY t.Tag ORDER BY qs.CompositeScore DESC, qs.ViewCount DESC) AS rn
+  FROM TagStats t
+  JOIN QuestionTags qt ON qt.Tag = t.Tag
+  JOIN Questions q ON q.Id = qt.QuestionId
+  JOIN QuestionScore qs ON qs.Id = q.Id
+  LEFT JOIN UserAgg ua ON ua.UserId = q.OwnerUserId
+  WHERE q.AnswerCount >= 1
+),
+-- detect rapid-answer questions (first answer within 1 hour) and high reactivity tags
+RapidAnswers AS (
+  SELECT
+    q.Id AS QuestionId,
+    CASE WHEN qa.FirstAnswerDate IS NOT NULL AND qa.FirstAnswerDate <= q.CreationDate + interval '1 hour' THEN true ELSE false END AS FirstAnsweredWithinHour,
+    EXTRACT(EPOCH FROM (COALESCE(qa.FirstAnswerDate, now()) - q.CreationDate))/3600.0 AS HoursToFirstAnswer
+  FROM Questions q
+  LEFT JOIN QuestionActivity qa ON qa.QuestionId = q.Id
+),
+-- final selection: combine, filter, rank and output elaborate JSON-like structures
+Final AS (
+  SELECT
+    qs.Id AS QuestionId,
+    qs.Title,
+    qs.CreationDate,
+    qs.QuestionScore,
+    qs.ViewCount,
+    qs.TotalAnswers,
+    qs.TopAnswerScore,
+    qs.OwnerUserId,
+    qs.OwnerReputation,
+    MIN(qs.PrimaryTag) FILTER (WHERE qs.PrimaryTag IS NOT NULL) AS PrimaryTag,
+    ROUND(qs.CompositeScore::numeric, 6) AS CompositeScore,
+    ta.Tag AS RepresentativeTag,
+    ra.FirstAnsweredWithinHour,
+    ra.HoursToFirstAnswer,
+    (SELECT jsonb_agg(x) FROM (
+       SELECT
+         p.Id AS PostId,
+         p.PostTypeId,
+         p.Score,
+         p.CreationDate,
+         p.OwnerUserId
+       FROM Posts p
+       WHERE (p.Id = qs.Id OR p.ParentId = qs.Id)
+       ORDER BY p.PostTypeId, p.Score DESC NULLS LAST
+       LIMIT 10
+    ) x) AS PostNeighborhood,
+    (SELECT jsonb_agg(jsonb_build_object('Tag', ts.Tag, 'QCount', ts.QuestionsWithTag, 'MedianScore', ts.MedianQuestionScore) ORDER BY ts.QuestionsWithTag DESC LIMIT 5) FROM TagStats ts WHERE ts.Tag = ta.Tag) AS TagContext
+  FROM QuestionScore qs
+  LEFT JOIN TopPerTag ta ON ta.QuestionId = qs.Id
+  LEFT JOIN RapidAnswers ra ON ra.QuestionId = qs.Id
+  GROUP BY qs.Id, qs.Title, qs.CreationDate, qs.QuestionScore, qs.ViewCount, qs.TotalAnswers, qs.TopAnswerScore, qs.OwnerUserId, qs.OwnerReputation, qs.CompositeScore, ta.Tag, ra.FirstAnsweredWithinHour, ra.HoursToFirstAnswer
+)
+SELECT
+  f.*,
+  row_number() OVER (ORDER BY f.CompositeScore DESC, f.ViewCount DESC) AS Rank,
+  dense_rank() OVER (ORDER BY f.PrimaryTag) AS PrimaryTagRank
+FROM Final f
+WHERE f.CompositeScore IS NOT NULL
+ORDER BY Rank
+LIMIT 250;

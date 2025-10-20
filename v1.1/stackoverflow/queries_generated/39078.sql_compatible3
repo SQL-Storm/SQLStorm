@@ -1,0 +1,79 @@
+WITH QuestionTags AS (
+    SELECT
+        p.Id                AS question_id,
+        p.OwnerUserId       AS user_id,
+        t.tag
+    FROM Posts p,
+    LATERAL (
+        SELECT unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')) AS tag
+    ) t
+    WHERE p.PostTypeId = 1
+),
+TopTags AS (
+    SELECT
+        Tag,
+        COUNT(*) AS question_count
+    FROM QuestionTags
+    GROUP BY Tag
+    HAVING COUNT(*) > 1000
+    ORDER BY question_count DESC
+    LIMIT 10
+),
+AnswerDetails AS (
+    SELECT
+        a.Id               AS answer_id,
+        a.ParentId         AS question_id,
+        a.OwnerUserId      AS user_id,
+        a.CreationDate     AS answer_date,
+        q.CreationDate     AS question_date,
+        a.Score            AS answer_score
+    FROM Posts a
+    JOIN Posts q
+      ON a.ParentId = q.Id
+     AND q.PostTypeId = 1
+    WHERE a.PostTypeId = 2
+),
+UserAnswerStats AS (
+    SELECT
+        tt.Tag,
+        ad.user_id,
+        u.DisplayName,
+        COUNT(*)                                            AS answer_count,
+        AVG(EXTRACT(EPOCH FROM (ad.answer_date - ad.question_date))) AS avg_response_sec,
+        AVG(ad.answer_score)                                AS avg_answer_score,
+        RANK() OVER (
+            PARTITION BY tt.Tag
+            ORDER BY AVG(ad.answer_score) DESC
+        )                                                   AS rank_by_score
+    FROM AnswerDetails ad
+    JOIN QuestionTags qt
+      ON ad.question_id = qt.question_id
+    JOIN TopTags tt
+      ON qt.Tag = tt.Tag
+    JOIN Users u
+      ON ad.user_id = u.Id
+    GROUP BY tt.Tag, ad.user_id, u.DisplayName
+),
+BadgeCounts AS (
+    SELECT
+        UserId,
+        SUM(CASE WHEN Badges."class" = 1 THEN 1 ELSE 0 END) AS gold_count,
+        SUM(CASE WHEN Badges."class" = 2 THEN 1 ELSE 0 END) AS silver_count,
+        SUM(CASE WHEN Badges."class" = 3 THEN 1 ELSE 0 END) AS bronze_count
+    FROM Badges
+    GROUP BY UserId
+)
+SELECT
+    uas.Tag,
+    uas.DisplayName,
+    uas.answer_count,
+    uas.avg_answer_score,
+    uas.avg_response_sec,
+    COALESCE(bc.gold_count, 0)   AS gold_count,
+    COALESCE(bc.silver_count, 0) AS silver_count,
+    COALESCE(bc.bronze_count, 0) AS bronze_count
+FROM UserAnswerStats uas
+LEFT JOIN BadgeCounts bc
+  ON uas.user_id = bc.UserId
+WHERE uas.rank_by_score <= 5
+ORDER BY uas.Tag, uas.rank_by_score;

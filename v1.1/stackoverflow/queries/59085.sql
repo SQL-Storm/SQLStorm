@@ -1,0 +1,54 @@
+SELECT 
+    p.Id as PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    u.DisplayName as OwnerName,
+    u.Reputation,
+    COUNT(DISTINCT c.Id) as CommentCount,
+    COUNT(DISTINCT v.Id) as VoteCount,
+    COUNT(DISTINCT bh.Id) as HistoryCount,
+    COUNT(DISTINCT pl.Id) as LinkCount,
+    STRING_AGG(DISTINCT t.TagName, ', ') as Tags,
+    MAX(CASE WHEN bh.PostHistoryTypeId = 10 THEN bh.Comment END) as CloseReason,
+    MAX(CASE WHEN bh.PostHistoryTypeId = 11 THEN bh.Comment END) as ReopenReason,
+    MAX(CASE WHEN bh.PostHistoryTypeId = 12 THEN bh.Comment END) as DeleteReason,
+    MAX(CASE WHEN bh.PostHistoryTypeId = 13 THEN bh.Comment END) as UndeleteReason,
+    STRING_AGG(DISTINCT b.Name, ', ') as BadgeNames,
+    COUNT(DISTINCT b.Id) as BadgeCount,
+    AVG(CAST(v.VoteTypeId AS NUMERIC)) as AverageVoteScore,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) as Upvotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) as Downvotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.Id END) as Favorites,
+    COUNT(DISTINCT CASE WHEN bh.PostHistoryTypeId IN (10,11,12,13) THEN bh.Id END) as StatusChanges,
+    COUNT(DISTINCT CASE WHEN bh.PostHistoryTypeId IN (1,4,7) THEN bh.Id END) as TitleChanges,
+    COUNT(DISTINCT CASE WHEN bh.PostHistoryTypeId IN (2,5,8) THEN bh.Id END) as BodyChanges,
+    COUNT(DISTINCT CASE WHEN bh.PostHistoryTypeId IN (3,6,9) THEN bh.Id END) as TagChanges,
+    COUNT(DISTINCT CASE WHEN bh.PostHistoryTypeId IN (14,15) THEN bh.Id END) as LockChanges
+FROM Posts p
+JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Comments c ON p.Id = c.PostId
+LEFT JOIN Votes v ON p.Id = v.PostId
+LEFT JOIN PostHistory bh ON p.Id = bh.PostId
+LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN (
+    SELECT p2.Id, t2.TagName 
+    FROM Posts p2 
+    JOIN (
+        SELECT Id, regexp_split_to_table(TRIM(BOTH '<>' FROM Tags), '><') as TagName 
+        FROM Posts 
+        WHERE Tags IS NOT NULL AND Tags <> ''
+    ) t2 ON p2.Id = t2.Id
+) t ON p.Id = t.Id
+LEFT JOIN Badges b ON p.OwnerUserId = b.UserId
+WHERE p.PostTypeId = 1 
+  AND p.CreationDate >= '2020-01-01'
+  AND p.ViewCount > 1000
+  AND u.Reputation > 10000
+GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate, u.DisplayName, u.Reputation
+HAVING COUNT(DISTINCT c.Id) > 5 
+   AND COUNT(DISTINCT v.Id) > 10
+   AND COUNT(DISTINCT bh.Id) > 20
+ORDER BY p.Score DESC, p.ViewCount DESC
+LIMIT 1000;

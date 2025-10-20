@@ -1,0 +1,85 @@
+-- {"query": "43035.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "nova-premier", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2135, "output_tokens": 784} 
+
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId, 
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.ViewCount) AS AvgViewCount,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    WHERE 
+        p.PostTypeId IN (1, 2)
+    GROUP BY 
+        u.Id
+),
+RecentQuestions AS (
+    SELECT 
+        p.Id, 
+        p.Title, 
+        p.CreationDate, 
+        p.Score,
+        u.DisplayName,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY ph.CreationDate DESC) AS rn
+    FROM 
+        Posts p
+    JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN 
+        PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (1, 2, 4, 5)
+    WHERE 
+        p.PostTypeId = 1 AND p.CreationDate >= NOW() - INTERVAL '30 days'
+),
+TopAnswers AS (
+    SELECT 
+        p.Id AS AnswerId, 
+        p.ParentId AS QuestionId,
+        p.Score,
+        p.Body,
+        u.DisplayName AS Answerer,
+        DENSE_RANK() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC) AS AnswerRank
+    FROM 
+        Posts p
+    JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    WHERE 
+        p.PostTypeId = 2 AND p.CreationDate >= NOW() - INTERVAL '1 year'
+)
+SELECT
+    rq.Id AS QuestionId,
+    rq.Title,
+    rq.CreationDate,
+    rq.Score AS QuestionScore,
+    rq.DisplayName AS QuestionAuthor,
+    ta.AnswerId,
+    ta.Score AS AnswerScore,
+    ta.Body AS AnswerBody,
+    ta.Answerer,
+    ua.TotalPosts,
+    ua.TotalScore,
+    ua.AvgViewCount,
+    COUNT(DISTINCT c.Id) AS TotalComments,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotes
+FROM 
+    RecentQuestions rq
+JOIN 
+    TopAnswers ta ON rq.Id = ta.QuestionId
+LEFT JOIN 
+    Comments c ON rq.Id = c.PostId
+LEFT JOIN 
+    Votes v ON rq.Id = v.PostId
+JOIN 
+    UserActivity ua ON rq.DisplayName = ua.UserId
+WHERE 
+    rq.rn = 1 AND ta.AnswerRank <= 3
+GROUP BY 
+    rq.Id, rq.Title, rq.CreationDate, rq.Score, rq.DisplayName,
+    ta.AnswerId, ta.Score, ta.Body, ta.Answerer,
+    ua.TotalPosts, ua.TotalScore, ua.AvgViewCount
+ORDER BY 
+    rq.Score DESC, ua.TotalScore DESC
+LIMIT 10;

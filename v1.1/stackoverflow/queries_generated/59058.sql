@@ -1,0 +1,86 @@
+-- {"query": "59058.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2061, "output_tokens": 827} 
+SELECT 
+    p.Id AS PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    COUNT(DISTINCT v.Id) AS VoteCount,
+    COUNT(DISTINCT ph.Id) AS HistoryCount,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS Tags,
+    CASE 
+        WHEN p.PostTypeId = 1 THEN 'Question'
+        WHEN p.PostTypeId = 2 THEN 'Answer'
+        WHEN p.PostTypeId = 3 THEN 'Wiki'
+        ELSE 'Other'
+    END AS PostType,
+    CASE 
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        WHEN p.AnswerCount > 0 THEN 'Answered'
+        ELSE 'Unanswered'
+    END AS PostStatus,
+    DATEDIFF(DAY, p.CreationDate, COALESCE(p.ClosedDate, p.LastActivityDate, CURRENT_TIMESTAMP)) AS DaysActive,
+    AVG(p.Score) OVER (PARTITION BY u.Id) AS AvgScorePerUser,
+    RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+    DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) AS ViewRank,
+    ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) AS NewestPostRank,
+    LAG(p.Score, 1) OVER (ORDER BY p.CreationDate) AS PreviousScore,
+    LEAD(p.Score, 1) OVER (ORDER BY p.CreationDate) AS NextScore,
+    NTILE(10) OVER (ORDER BY p.Score) AS ScoreQuartile,
+    PERCENT_RANK() OVER (ORDER BY p.Score) AS ScorePercentile,
+    COALESCE(p.AnswerCount, 0) AS AnswerCount,
+    COALESCE(p.CommentCount, 0) AS CommentCountActual,
+    COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b 
+        WHERE b.UserId = u.Id 
+        AND b.Date >= DATEADD(YEAR, -1, CURRENT_TIMESTAMP)
+    ) AS RecentBadgesCount,
+    (
+        SELECT STRING_AGG(b.Name, ', ')
+        FROM Badges b 
+        WHERE b.UserId = u.Id 
+        AND b.Date >= DATEADD(YEAR, -1, CURRENT_TIMESTAMP)
+    ) AS RecentBadges
+FROM Posts p
+JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Comments c ON p.Id = c.PostId
+LEFT JOIN Votes v ON p.Id = v.PostId
+LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN (
+    SELECT Id, UNNEST(string_to_array(Tags, '<')) AS TagName
+    FROM Posts 
+    WHERE Tags IS NOT NULL AND Tags != ''
+) t ON p.Id = t.Id
+WHERE p.CreationDate >= DATEADD(YEAR, -2, CURRENT_TIMESTAMP)
+    AND p.PostTypeId IN (1, 2)
+    AND p.Score > 0
+    AND u.Reputation > 100
+GROUP BY 
+    p.Id, 
+    p.Title, 
+    p.Score, 
+    p.ViewCount, 
+    p.CreationDate, 
+    u.DisplayName, 
+    u.Reputation, 
+    p.PostTypeId, 
+    p.ClosedDate, 
+    p.CommunityOwnedDate, 
+    p.AnswerCount, 
+    p.CommentCount, 
+    p.FavoriteCount, 
+    p.LastActivityDate
+HAVING COUNT(DISTINCT c.Id) > 0
+    AND COUNT(DISTINCT v.Id) > 0
+    AND COUNT(DISTINCT ph.Id) > 0
+ORDER BY 
+    p.Score DESC, 
+    p.ViewCount DESC,
+    p.CreationDate DESC
+LIMIT 1000;

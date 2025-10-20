@@ -1,0 +1,134 @@
+-- {"query": "47083.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 190402, "output_tokens": 167510} 
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT p.Id) as question_count,
+        1 as level
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%<' || t.TagName || '>%'
+    WHERE p.PostTypeId = 1
+        AND t.Count > 1000
+    GROUP BY t.Id, t.TagName
+    
+    UNION ALL
+    
+    SELECT 
+        t.Id,
+        t.TagName,
+        th.question_count,
+        th.level + 1
+    FROM tag_hierarchy th
+    CROSS JOIN Tags t
+    WHERE th.level < 3
+        AND t.Id != th.Id
+),
+user_expertise AS (
+    SELECT 
+        u.Id as user_id,
+        u.DisplayName,
+        u.Reputation,
+        EXTRACT(YEAR FROM u.CreationDate) as join_year,
+        COUNT(DISTINCT p.Id) as total_posts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answers,
+        AVG(p.Score) as avg_score,
+        SUM(p.Score) as total_score,
+        COUNT(DISTINCT b.Name) as unique_badges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) as gold_badges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) as silver_badges,
+        STRING_AGG(DISTINCT substring(p.Tags, 2, length(p.Tags)-2), ',' ORDER BY p.Score DESC) as top_tags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 5000
+        AND u.CreationDate < cast('2024-10-01' as date) - INTERVAL '365 days'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, EXTRACT(YEAR FROM u.CreationDate)
+),
+post_metrics AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        CASE 
+            WHEN p.ViewCount > 0 THEN p.Score::float / p.ViewCount 
+            ELSE 0 
+        END as engagement_ratio,
+        COUNT(DISTINCT ph.UserId) as editor_count,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 52 THEN 1 ELSE 0 END) as was_hot_question,
+        COUNT(DISTINCT v.UserId) FILTER (WHERE v.VoteTypeId = 2) as upvoters,
+        COUNT(DISTINCT v.UserId) FILTER (WHERE v.VoteTypeId = 3) as downvoters,
+        EXTRACT(EPOCH FROM (COALESCE(p.ClosedDate, cast('2024-10-01 12:34:56' as timestamp)) - p.CreationDate))/3600 as hours_until_closed,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM p.CreationDate) ORDER BY p.Score DESC) as yearly_rank
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate > '2020-01-01'
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, 
+             p.FavoriteCount, p.ClosedDate, p.CreationDate
+),
+answer_quality AS (
+    SELECT 
+        a.Id as answer_id,
+        a.ParentId as question_id,
+        a.Score as answer_score,
+        q.Score as question_score,
+        a.OwnerUserId,
+        CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END as is_accepted,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/60 as minutes_to_answer,
+        LENGTH(a.Body) as answer_length,
+        (LENGTH(a.Body) - LENGTH(REPLACE(a.Body, '<code>', ''))) / 6 as code_blocks,
+        COUNT(c.Id) as comment_count,
+        AVG(c.Score) as avg_comment_score
+    FROM Posts a
+    INNER JOIN Posts q ON a.ParentId = q.Id
+    LEFT JOIN Comments c ON a.Id = c.PostId
+    WHERE a.PostTypeId = 2
+        AND q.PostTypeId = 1
+        AND a.Score > 0
+    GROUP BY a.Id, a.ParentId, a.Score, q.Score, a.OwnerUserId, 
+             q.AcceptedAnswerId, a.CreationDate, q.CreationDate, a.Body
+)
+SELECT 
+    ue.DisplayName,
+    ue.Reputation,
+    ue.join_year,
+    ue.total_posts,
+    ue.questions,
+    ue.answers,
+    ROUND(ue.avg_score::numeric, 2) as avg_post_score,
+    ue.gold_badges,
+    ue.silver_badges,
+    COUNT(DISTINCT pm.Id) as top_questions,
+    AVG(pm.engagement_ratio)::numeric(10,6) as avg_engagement,
+    SUM(CASE WHEN pm.was_hot_question = 1 THEN 1 ELSE 0 END) as hot_questions,
+    COUNT(DISTINCT aq.answer_id) as quality_answers,
+    AVG(aq.minutes_to_answer) as avg_response_time,
+    SUM(aq.is_accepted) as accepted_answers,
+    AVG(aq.answer_length) as avg_answer_length,
+    SUM(aq.code_blocks) as total_code_blocks,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY pm.ViewCount) as median_views,
+    PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY pm.Score) as score_75th_percentile,
+    SUBSTRING(ue.top_tags FROM 1 FOR 100) as primary_tags
+FROM user_expertise ue
+LEFT JOIN post_metrics pm ON pm.Id IN (
+    SELECT p.Id 
+    FROM Posts p 
+    WHERE p.OwnerUserId = ue.user_id 
+        AND p.PostTypeId = 1
+    ORDER BY p.Score DESC 
+    LIMIT 10
+)
+LEFT JOIN answer_quality aq ON aq.OwnerUserId = ue.user_id
+WHERE ue.total_posts > 50
+GROUP BY ue.DisplayName, ue.Reputation, ue.join_year, ue.total_posts, 
+         ue.questions, ue.answers, ue.avg_score, ue.gold_badges, 
+         ue.silver_badges, ue.top_tags
+HAVING COUNT(DISTINCT pm.Id) > 0
+ORDER BY ue.Reputation DESC, SUM(aq.is_accepted) DESC
+LIMIT 100;

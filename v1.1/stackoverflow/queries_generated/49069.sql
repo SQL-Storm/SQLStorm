@@ -1,0 +1,159 @@
+-- {"query": "49069.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 2267} 
+
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserProfileViews,
+        COUNT(DISTINCT P_Q.Id) AS QuestionsAsked,
+        COUNT(DISTINCT P_A.Id) AS AnswersPosted,
+        SUM(CASE WHEN P_A.Id = P_Q_Accepted.AcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedAnswersGiven,
+        SUM(COALESCE(P_A.Score, 0)) AS TotalAnswerScore,
+        SUM(COALESCE(P_Q.ViewCount, 0)) AS TotalQuestionViews,
+        SUM(COALESCE(P_Q.FavoriteCount, 0)) AS TotalQuestionFavorites,
+        COUNT(DISTINCT C.Id) AS CommentsMade,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentScore,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        COUNT(DISTINCT PH.Id) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6)) AS EditHistoryEvents, -- Edits (Title, Body, Tags)
+        COUNT(DISTINCT PH.Id) FILTER (WHERE PH.PostHistoryTypeId = 10 AND PH.UserId = U.Id) AS PostsClosedByOrForUser, -- Posts user involved in closing votes
+        MAX(P_A.CreationDate) AS LatestAnswerDate,
+        MAX(P_Q.CreationDate) AS LatestQuestionDate
+    FROM
+        Users AS U
+    LEFT JOIN Posts AS P_Q ON U.Id = P_Q.OwnerUserId AND P_Q.PostTypeId = 1
+    LEFT JOIN Posts AS P_A ON U.Id = P_A.OwnerUserId AND P_A.PostTypeId = 2
+    LEFT JOIN Posts AS P_Q_Accepted ON P_A.Id = P_Q_Accepted.AcceptedAnswerId -- This checks if P_A is an accepted answer for any question
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    LEFT JOIN PostHistory AS PH ON U.Id = PH.UserId
+    WHERE
+        U.CreationDate >= '2020-01-01' -- Focus on more recent users/activity
+        AND U.Reputation > 500
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views
+),
+TagPerformance AS (
+    SELECT
+        TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags)-2), '><'))) AS TagName,
+        COUNT(P.Id) AS QuestionsWithTag,
+        AVG(P.Score) AS AvgScoreForTag,
+        AVG(P.ViewCount) AS AvgViewsForTag,
+        SUM(P.AnswerCount) AS TotalAnswersForTag,
+        SUM(P.FavoriteCount) AS TotalFavoritesForTag
+    FROM
+        Posts AS P
+    WHERE
+        P.PostTypeId = 1 -- Only questions
+        AND P.Tags IS NOT NULL
+        AND P.CreationDate >= '2021-01-01' -- Recent tag activity
+    GROUP BY
+        TagName
+    HAVING
+        COUNT(P.Id) > 100 -- Only consider active tags
+        AND AVG(P.Score) > 0
+),
+UserTagContributions AS (
+    SELECT
+        U.Id AS UserId,
+        T.TagName,
+        COUNT(P.Id) AS UserQuestionsInTag,
+        SUM(P.Score) AS UserScoreInTag,
+        AVG(P.ViewCount) AS UserAvgViewsInTag
+    FROM
+        Users AS U
+    JOIN Posts AS P ON U.Id = P.OwnerUserId AND P.PostTypeId = 1
+    CROSS JOIN LATERAL (SELECT TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags)-2), '><'))) AS TagName) AS T
+    WHERE
+        P.Tags IS NOT NULL
+        AND P.CreationDate >= '2022-01-01'
+    GROUP BY
+        U.Id, T.TagName
+    HAVING
+        COUNT(P.Id) >= 5 -- User has asked at least 5 questions in this tag
+),
+TopUsersPerTag AS (
+    SELECT
+        UTC.UserId,
+        UTC.TagName,
+        UTC.UserQuestionsInTag,
+        UTC.UserScoreInTag,
+        RANK() OVER (PARTITION BY UTC.TagName ORDER BY UTC.UserScoreInTag DESC, UTC.UserQuestionsInTag DESC) AS RankInTag
+    FROM
+        UserTagContributions AS UTC
+    WHERE
+        UTC.UserScoreInTag > 0
+),
+VoteActivity AS (
+    SELECT
+        V.UserId,
+        COUNT(V.Id) FILTER (WHERE V.VoteTypeId = 2) AS UpvotesCast,
+        COUNT(V.Id) FILTER (WHERE V.VoteTypeId = 3) AS DownvotesCast,
+        COUNT(V.Id) FILTER (WHERE V.VoteTypeId = 5) AS FavoritesCast, -- Favorites (if still recorded for older data)
+        SUM(CASE WHEN VT.Name = 'BountyStart' THEN V.BountyAmount ELSE 0 END) AS TotalBountyGiven
+    FROM Votes AS V
+    JOIN VoteTypes AS VT ON V.VoteTypeId = VT.Id
+    WHERE V.UserId IS NOT NULL
+    AND V.CreationDate >= '2023-01-01'
+    GROUP BY V.UserId
+),
+PostLinkAnalysis AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        COUNT(PL.Id) FILTER (WHERE PL.LinkTypeId = 1) AS LinkedPostsCount, -- Posts owner linked to others
+        COUNT(PL.Id) FILTER (WHERE PL.LinkTypeId = 3) AS DuplicateSourceCount -- Posts owner's post is a duplicate of others
+    FROM Posts AS P
+    JOIN PostLinks AS PL ON P.Id = PL.PostId
+    WHERE P.OwnerUserId IS NOT NULL
+    AND P.CreationDate >= '2022-01-01'
+    GROUP BY P.OwnerUserId
+)
+SELECT
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.QuestionsAsked,
+    UAS.AnswersPosted,
+    UAS.AcceptedAnswersGiven,
+    UAS.TotalAnswerScore,
+    UAS.TotalQuestionViews,
+    UAS.TotalBadges,
+    UAS.CommentsMade,
+    UAS.EditHistoryEvents,
+    UAS.PostsClosedByOrForUser,
+    COALESCE(VA.UpvotesCast, 0) AS UpvotesCast,
+    COALESCE(VA.DownvotesCast, 0) AS DownvotesCast,
+    COALESCE(VA.FavoritesCast, 0) AS FavoritesCast,
+    COALESCE(VA.TotalBountyGiven, 0) AS TotalBountyGiven,
+    COALESCE(PLA.LinkedPostsCount, 0) AS LinkedPostsCount,
+    COALESCE(PLA.DuplicateSourceCount, 0) AS DuplicateSourceCount,
+    SUM(TUPT.UserScoreInTag * TP.AvgScoreForTag) AS WeightedTagContributionScore, -- Combining user and tag performance
+    COUNT(TUPT.TagName) AS ActiveTagsCount,
+    NTILE(10) OVER (ORDER BY UAS.Reputation DESC, UAS.AcceptedAnswersGiven DESC, UAS.TotalBadges DESC) AS ReputationDecile,
+    RANK() OVER (ORDER BY (UAS.QuestionsAsked * 0.3 + UAS.AnswersPosted * 0.7) DESC, UAS.TotalAnswerScore DESC) AS ActivityRank,
+    DENSE_RANK() OVER (ORDER BY UAS.CommentsMade DESC, UAS.EditHistoryEvents DESC) AS EngagementRank,
+    AVG(EXTRACT(EPOCH FROM (UAS.LastAccessDate - UAS.UserCreationDate))/86400.0) AS UserAgeInDays, -- User longevity
+    MAX(TP.AvgScoreForTag) AS HighestAvgTagScoreContributed,
+    SUM(CASE WHEN TUPT.RankInTag <= 5 THEN 1 ELSE 0 END) AS Top5RankInTagsCount
+FROM
+    UserActivitySummary AS UAS
+LEFT JOIN VoteActivity AS VA ON UAS.UserId = VA.UserId
+LEFT JOIN PostLinkAnalysis AS PLA ON UAS.UserId = PLA.UserId
+LEFT JOIN TopUsersPerTag AS TUPT ON UAS.UserId = TUPT.UserId
+LEFT JOIN TagPerformance AS TP ON TUPT.TagName = TP.TagName
+WHERE
+    (UAS.QuestionsAsked > 0 OR UAS.AnswersPosted > 0) -- Ensure active users
+    AND UAS.Reputation > 1000
+GROUP BY
+    UAS.UserId, UAS.DisplayName, UAS.Reputation, UAS.QuestionsAsked, UAS.AnswersPosted, UAS.AcceptedAnswersGiven,
+    UAS.TotalAnswerScore, UAS.TotalQuestionViews, UAS.TotalBadges, UAS.CommentsMade, UAS.EditHistoryEvents,
+    UAS.PostsClosedByOrForUser, VA.UpvotesCast, VA.DownvotesCast, VA.FavoritesCast, VA.TotalBountyGiven,
+    PLA.LinkedPostsCount, PLA.DuplicateSourceCount, UAS.UserCreationDate, UAS.LastAccessDate
+HAVING
+    COUNT(TUPT.TagName) > 1 -- Users contributing to more than one active tag
+    AND SUM(TUPT.UserScoreInTag * TP.AvgScoreForTag) > 500 -- A threshold for combined tag contribution
+ORDER BY
+    ActivityRank ASC, EngagementRank ASC, ReputationDecile ASC, WeightedTagContributionScore DESC
+LIMIT 100;

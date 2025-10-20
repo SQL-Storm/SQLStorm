@@ -1,0 +1,96 @@
+WITH
+RecentQuestions AS (
+    SELECT
+        Id,
+        OwnerUserId,
+        CreationDate,
+        Tags,
+        ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY CreationDate DESC) AS rn
+    FROM Posts
+    WHERE PostTypeId = 1
+      AND CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+),
+TagList AS (
+    SELECT
+        rq.OwnerUserId AS UserId,
+        unnest(
+            string_to_array(
+                substring(rq.Tags FROM 2 FOR (length(rq.Tags) - 2)),
+                '><'
+            )
+        ) AS Tag
+    FROM RecentQuestions rq
+    WHERE rq.rn <= 5
+),
+UserMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        COUNT(DISTINCT q.Id)                                 AS QCount,
+        COUNT(DISTINCT a.Id)                                 AS ACount,
+        COUNT(DISTINCT c.Id)                                 AS CCount,
+        COUNT(DISTINCT b.Id)                                 AS BadgeCount,
+        COUNT(v_up.Id) FILTER (WHERE v_up.VoteTypeId = 2)     AS UpVotesReceived,
+        COUNT(v_dn.Id) FILTER (WHERE v_dn.VoteTypeId = 3)     AS DownVotesReceived,
+        AVG(
+            EXTRACT(
+                EPOCH FROM (a.CreationDate - q.CreationDate)
+            )
+        ) FILTER (WHERE a.PostTypeId = 2)                    AS AvgResponseTimeSec
+    FROM Users u
+    LEFT JOIN Posts q
+        ON q.OwnerUserId = u.Id
+       AND q.PostTypeId = 1
+    LEFT JOIN Posts a
+        ON a.ParentId = q.Id
+       AND a.PostTypeId = 2
+    LEFT JOIN Comments c
+        ON c.UserId = u.Id
+    LEFT JOIN Badges b
+        ON b.UserId = u.Id
+    LEFT JOIN Votes v_up
+        ON v_up.PostId = q.Id
+       AND v_up.VoteTypeId = 2
+    LEFT JOIN Votes v_dn
+        ON v_dn.PostId = q.Id
+       AND v_dn.VoteTypeId = 3
+    GROUP BY u.Id, u.Reputation
+),
+TopTags AS (
+    SELECT
+        tl.UserId,
+        tl.Tag,
+        COUNT(*)                             AS TagCount,
+        RANK() OVER (PARTITION BY tl.UserId ORDER BY COUNT(*) DESC) AS rk
+    FROM TagList tl
+    GROUP BY tl.UserId, tl.Tag
+)
+SELECT
+    um.UserId,
+    um.Reputation,
+    um.QCount,
+    um.ACount,
+    um.CCount,
+    um.BadgeCount,
+    um.UpVotesReceived,
+    um.DownVotesReceived,
+    um.AvgResponseTimeSec,
+    jsonb_agg(
+        jsonb_build_object('tag', tt.Tag, 'count', tt.TagCount)
+        ORDER BY tt.TagCount DESC
+    ) FILTER (WHERE tt.rk <= 3) AS Top3Tags
+FROM UserMetrics um
+LEFT JOIN TopTags tt
+    ON tt.UserId = um.UserId
+GROUP BY
+    um.UserId,
+    um.Reputation,
+    um.QCount,
+    um.ACount,
+    um.CCount,
+    um.BadgeCount,
+    um.UpVotesReceived,
+    um.DownVotesReceived,
+    um.AvgResponseTimeSec
+ORDER BY um.Reputation DESC
+LIMIT 100;

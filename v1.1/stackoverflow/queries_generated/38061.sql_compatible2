@@ -1,0 +1,253 @@
+with recent_users as (
+    select u.id as user_id, u.displayname, u.reputation, u.creationdate
+    from users u
+    where u.creationdate >= (select max(creationdate) - interval '2 years' from users)
+),
+active_questions as (
+    select p.id as question_id,
+           p.owneruserid as asker_id,
+           p.creationdate as question_date,
+           p.score as question_score,
+           p.viewcount,
+           p.tags,
+           p.answercount
+    from posts p
+    where p.posttypeid = 1
+      and p.creationdate >= (select max(creationdate) - interval '2 years' from posts)
+),
+answers as (
+    select a.id as answer_id,
+           a.parentid as question_id,
+           a.owneruserid as answerer_id,
+           a.creationdate as answer_date,
+           a.score as answer_score
+    from posts a
+    where a.posttypeid = 2
+),
+first_answers as (
+    select a.question_id,
+           a.answer_id,
+           a.answerer_id,
+           a.answer_date,
+           a.answer_score,
+           row_number() over (partition by a.question_id order by a.answer_date asc, a.answer_id asc) as rn
+    from answers a
+),
+q_vote_agg as (
+    select v.postid as question_id,
+           sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+           sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+           sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_start,
+           sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_close
+    from votes v
+    join active_questions q on q.question_id = v.postid
+    group by v.postid
+),
+comment_agg as (
+    select c.postid as post_id,
+           count(*) as comment_count,
+           max(c.creationdate) as last_comment_date
+    from comments c
+    group by c.postid
+),
+postlinks_dupes as (
+    select pl.postid as question_id,
+           sum(case when pl.linktypeid = 3 then 1 else 0 end) as duplicate_links,
+           sum(case when pl.linktypeid = 1 then 1 else 0 end) as linked_links
+    from postlinks pl
+    group by pl.postid
+),
+hot_history as (
+    select ph.postid as question_id,
+           min(case when ph.posthistorytypeid = 52 then ph.creationdate end) as first_hot_date,
+           max(case when ph.posthistorytypeid = 53 then ph.creationdate end) as last_removed_hot_date,
+           sum(case when ph.posthistorytypeid = 52 then 1 else 0 end) as times_selected_hot,
+           sum(case when ph.posthistorytypeid = 53 then 1 else 0 end) as times_removed_hot
+    from posthistory ph
+    group by ph.postid
+),
+close_events as (
+    select ph.postid as question_id,
+           min(case when ph.posthistorytypeid = 10 then ph.creationdate end) as first_close_date,
+           sum(case when ph.posthistorytypeid = 10 then 1 else 0 end) as close_votes_events,
+           sum(case when ph.posthistorytypeid = 11 then 1 else 0 end) as reopen_events
+    from posthistory ph
+    group by ph.postid
+),
+tag_expansion as (
+    select q.question_id,
+           unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')) as tag
+    from active_questions q
+    where q.tags is not null and q.tags <> ''
+),
+tag_stats as (
+    select te.question_id,
+           array_agg(te.tag order by te.tag) as tag_array,
+           count(*) as tag_count
+    from tag_expansion te
+    group by te.question_id
+),
+user_badges as (
+    select b.userid,
+           count(*) as total_badges,
+           sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+           sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+           sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+           max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+ans_latency as (
+    select q.question_id,
+           extract(epoch from (fa.answer_date - q.question_date)) as seconds_to_first_answer,
+           fa.answerer_id,
+           fa.answer_id,
+           fa.answer_score
+    from active_questions q
+    join first_answers fa on fa.question_id = q.question_id and fa.rn = 1
+),
+accepted_info as (
+    select q.id as question_id,
+           q.acceptedanswerid,
+           case when q.acceptedanswerid is not null then 1 else 0 end as has_accepted
+    from posts q
+    where q.posttypeid = 1
+),
+answerer_quality as (
+    select a.owneruserid as answerer_id,
+           count(*) as answers_count,
+           avg(cast(a.score as numeric)) as avg_answer_score,
+           sum(case when q.acceptedanswerid = a.id then 1 else 0 end) as accepted_answers
+    from posts a
+    join posts q on q.id = a.parentid and q.posttypeid = 1
+    where a.posttypeid = 2
+    group by a.owneruserid
+),
+question_activity as (
+    select q.question_id,
+           coalesce(ca.comment_count, 0) as comment_count,
+           coalesce(ca.last_comment_date, q.question_date) as last_comment_date,
+           q.lastactivitydate
+    from (
+        select p.id as question_id, p.creationdate as question_date, p.lastactivitydate
+        from posts p
+        where p.posttypeid = 1
+    ) q
+    left join comment_agg ca on ca.post_id = q.question_id
+),
+scored_questions as (
+    select q.question_id,
+           q.asker_id,
+           q.question_date,
+           q.question_score,
+           q.viewcount,
+           ts.tag_array,
+           ts.tag_count,
+           qa.upvotes,
+           qa.downvotes,
+           qa.bounty_start,
+           qa.bounty_close,
+           pl.duplicate_links,
+           pl.linked_links,
+           hh.first_hot_date,
+           hh.last_removed_hot_date,
+           hh.times_selected_hot,
+           hh.times_removed_hot,
+           ce.first_close_date,
+           ce.close_votes_events,
+           ce.reopen_events,
+           qa.upvotes - qa.downvotes as net_votes,
+           cast(log(greatest(q.viewcount,1)) as numeric(12,4)) as log_views
+    from active_questions q
+    left join tag_stats ts on ts.question_id = q.question_id
+    left join q_vote_agg qa on qa.question_id = q.question_id
+    left join postlinks_dupes pl on pl.question_id = q.question_id
+    left join hot_history hh on hh.question_id = q.question_id
+    left join close_events ce on ce.question_id = q.question_id
+),
+ranked_questions as (
+    select sq.*,
+           coalesce(al.seconds_to_first_answer, 86400*365) as seconds_to_first_answer,
+           coalesce(ai.has_accepted, 0) as has_accepted,
+           case
+               when coalesce(ai.has_accepted,0) = 1 then 1
+               when coalesce(sq.answercount,0) > 0 then 0.5
+               else 0
+           end as resolution_signal,
+           dense_rank() over (order by coalesce(sq.net_votes,0) desc, coalesce(sq.log_views,0) desc, coalesce(sq.times_selected_hot,0) desc, coalesce(sq.duplicate_links,0) asc) as popularity_rank
+    from (
+        select s.*, aq.answercount
+        from scored_questions s
+        left join active_questions aq on aq.question_id = s.question_id
+    ) sq
+    left join ans_latency al on al.question_id = sq.question_id
+    left join accepted_info ai on ai.question_id = sq.question_id
+),
+asker_profile as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           coalesce(ub.total_badges,0) as total_badges,
+           coalesce(ub.gold_badges,0) as gold_badges,
+           coalesce(ub.silver_badges,0) as silver_badges,
+           coalesce(ub.bronze_badges,0) as bronze_badges,
+           u.creationdate as user_created
+    from users u
+    left join user_badges ub on ub.userid = u.id
+),
+answerer_profile as (
+    select aq.answerer_id as user_id,
+           ap.answers_count,
+           ap.avg_answer_score,
+           ap.accepted_answers
+    from answerer_quality ap
+    right join (
+        select distinct answerer_id from ans_latency
+        union
+        select distinct owneruserid from posts where posttypeid = 2
+    ) aq on aq.answerer_id = ap.answerer_id
+),
+final_scores as (
+    select rq.question_id,
+           rq.popularity_rank,
+           rq.question_date,
+           rq.question_score,
+           rq.viewcount,
+           rq.tag_array,
+           rq.tag_count,
+           rq.upvotes,
+           rq.downvotes,
+           rq.net_votes,
+           rq.log_views,
+           rq.duplicate_links,
+           rq.linked_links,
+           rq.times_selected_hot,
+           rq.times_removed_hot,
+           rq.first_hot_date,
+           rq.first_close_date,
+           rq.close_votes_events,
+           rq.reopen_events,
+           rq.seconds_to_first_answer,
+           rq.has_accepted,
+           rq.resolution_signal,
+           ak.user_id as asker_id,
+           ak.displayname as asker_name,
+           ak.reputation as asker_reputation,
+           ak.total_badges as asker_total_badges,
+           ak.gold_badges as asker_gold_badges,
+           ak.silver_badges as asker_silver_badges,
+           ak.bronze_badges as asker_bronze_badges,
+           al.answerer_id,
+           ap.answers_count as answerer_total_answers,
+           ap.avg_answer_score as answerer_avg_score,
+           ap.accepted_answers as answerer_accepted_count
+    from ranked_questions rq
+    left join asker_profile ak on ak.user_id = rq.asker_id
+    left join ans_latency al on al.question_id = rq.question_id
+    left join answerer_profile ap on ap.user_id = al.answerer_id
+)
+select *
+from final_scores
+where question_date >= (select max(creationdate) - interval '18 months' from posts)
+order by popularity_rank, net_votes desc, log_views desc
+limit 500;

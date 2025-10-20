@@ -1,0 +1,42 @@
+-- {"query": "56065.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "llama-3.3-instruct", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 392} 
+
+WITH top_users AS (
+  SELECT u.Id, u.DisplayName, COUNT(b.Id) AS badge_count
+  FROM Users u
+  JOIN Badges b ON u.Id = b.UserId
+  GROUP BY u.Id, u.DisplayName
+  ORDER BY badge_count DESC
+  LIMIT 100
+),
+top_posts AS (
+  SELECT p.Id, p.Title, SUM(v.VoteTypeId = 2) AS upvotes, SUM(v.VoteTypeId = 3) AS downvotes
+  FROM Posts p
+  JOIN Votes v ON p.Id = v.PostId
+  WHERE v.VoteTypeId IN (2, 3)
+  GROUP BY p.Id, p.Title
+  ORDER BY upvotes - downvotes DESC
+  LIMIT 100
+),
+top_tags AS (
+  SELECT t.TagName, COUNT(pt.Id) AS post_count
+  FROM Tags t
+  JOIN Posts pt ON t.Id = ANY(string_to_array(pt.Tags, '><'))
+  GROUP BY t.TagName
+  ORDER BY post_count DESC
+  LIMIT 100
+)
+SELECT 
+  tu.DisplayName AS top_user, 
+  tp.Title AS top_post, 
+  tt.TagName AS top_tag, 
+  COUNT(DISTINCT ph.PostId) AS post_history_count,
+  SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+  SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes
+FROM top_users tu
+JOIN Posts tp ON tu.Id = tp.OwnerUserId
+JOIN PostHistory ph ON tp.Id = ph.PostId
+JOIN Votes v ON tp.Id = v.PostId
+JOIN Tags tt ON tt.Id = ANY(string_to_array(tp.Tags, '><'))
+WHERE ph.PostHistoryTypeId = 10
+GROUP BY tu.DisplayName, tp.Title, tt.TagName
+ORDER BY post_history_count DESC;

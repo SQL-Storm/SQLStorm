@@ -1,0 +1,47 @@
+WITH PopularTags AS (
+    SELECT Tags.TagName, 
+           SUM(Posts.Score) AS TotalScore, 
+           COUNT(DISTINCT Posts.Id) AS PostCount,
+           AVG(Posts.ViewCount) AS AvgViews
+    FROM Posts
+    CROSS JOIN LATERAL (
+        SELECT regexp_split_to_table(substring(Posts.Tags FROM 2 FOR (LENGTH(Posts.Tags)-2)), '><') AS TagName
+    ) AS Tags
+    WHERE Posts.PostTypeId = 1
+    GROUP BY Tags.TagName
+    HAVING COUNT(DISTINCT Posts.Id) > 1000
+),
+UserActivityRanking AS (
+    SELECT 
+        Users.Id, 
+        Users.DisplayName, 
+        COUNT(DISTINCT Posts.Id) AS PostCount,
+        COUNT(DISTINCT Votes.Id) AS VoteCount,
+        RANK() OVER (ORDER BY COUNT(DISTINCT Badges.Id) DESC) AS BadgeRank
+    FROM Users
+    LEFT JOIN Posts ON Users.Id = Posts.OwnerUserId
+    LEFT JOIN Votes ON Users.Id = Votes.UserId
+    LEFT JOIN Badges ON Users.Id = Badges.UserId
+    GROUP BY Users.Id, Users.DisplayName
+    HAVING COUNT(DISTINCT Posts.Id) > 50
+)
+SELECT 
+    pt.TagName, 
+    pt.TotalScore, 
+    pt.PostCount, 
+    pt.AvgViews,
+    uar.DisplayName AS TopContributor,
+    uar.PostCount AS ContributorPostCount,
+    uar.BadgeRank
+FROM PopularTags pt
+JOIN UserActivityRanking uar ON 1=1
+GROUP BY
+    pt.TagName,
+    pt.TotalScore,
+    pt.PostCount,
+    pt.AvgViews,
+    uar.DisplayName,
+    uar.PostCount,
+    uar.BadgeRank
+ORDER BY pt.TotalScore DESC, pt.PostCount DESC
+LIMIT 100;

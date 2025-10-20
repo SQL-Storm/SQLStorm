@@ -1,0 +1,56 @@
+SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ClosedDate,
+    p.CommunityOwnedDate,
+    u.Id AS UserId,
+    u.Reputation,
+    u.DisplayName,
+    u.LastAccessDate,
+    u.EmailHash,
+    b.Id AS BadgeId,
+    b.Name AS BadgeName,
+    b.Date AS BadgeDate,
+    b.Class AS BadgeClass,
+    b.TagBased AS BadgeTagBased,
+    t.Id AS TagId,
+    t.TagName,
+    t.Count AS TagCount,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    t.IsModeratorOnly,
+    t.IsRequired,
+    v.Id AS VoteId,
+    v.VoteTypeId,
+    v.CreationDate AS VoteDate,
+    v.BountyAmount,
+    c.Id AS CommentId,
+    c.Score AS CommentScore,
+    c.CreationDate AS CommentDate,
+    c.UserDisplayName AS CommentUserDisplayName,
+    c.UserId AS CommentUserId,
+    pl.Id AS PostLinkId,
+    pl.CreationDate AS PostLinkDate,
+    pl.LinkTypeId,
+    ph.Id AS PostHistoryId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate AS PostHistoryDate,
+    ph.UserId AS PostHistoryUserId,
+    ph.UserDisplayName AS PostHistoryUserDisplayName,
+    ph.Comment AS PostHistoryComment,
+    ph.Text AS PostHistoryText
+FROM Posts p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Tags t ON p.Id = t.ExcerptPostId OR p.Id = t.WikiPostId
+LEFT JOIN Votes v ON p.Id = v.PostId
+LEFT JOIN Comments c ON p.Id = c.PostId
+LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+ORDER BY p.CreationDate DESC
+LIMIT 1000;

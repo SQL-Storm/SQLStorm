@@ -1,0 +1,114 @@
+WITH TopUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        SUM(p.ViewCount) AS TotalViews,
+        SUM(p.FavoriteCount) AS TotalFavorites
+    FROM Users u
+    INNER JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1 AND p.Score > 0 AND u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT p.Id) >= 5
+    ORDER BY TotalViews DESC
+    LIMIT 100
+),
+ActiveTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        COUNT(DISTINCT ph.PostId) AS ActivePosts,
+        AVG(p.Score) AS AvgScore
+    FROM Tags t
+    INNER JOIN Posts p ON POSITION(t.TagName IN p.Tags) > 0
+    INNER JOIN PostHistory ph ON p.Id = ph.PostId 
+        AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+    WHERE p.PostTypeId = 1 
+      AND p.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2' YEAR)
+    GROUP BY t.TagName, t.Count
+    HAVING t.Count > 50 AND COUNT(DISTINCT ph.PostId) > 10
+),
+HighImpactPosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CreationDate,
+        tu.Id AS OwnerId,
+        tu.DisplayName AS OwnerName,
+        at.TagName,
+        COALESCE(v.UpVotes, 0) AS UpVotes,
+        COALESCE(v.DownVotes, 0) AS DownVotes,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        AVG(c.Score) AS AvgCommentScore
+    FROM Posts p
+    INNER JOIN TopUsers tu ON p.OwnerUserId = tu.Id
+    INNER JOIN ActiveTags at ON POSITION(at.TagName IN p.Tags) > 0
+    LEFT JOIN (
+        SELECT 
+            PostOwnerId,
+            SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM (
+            SELECT v.*, p.OwnerUserId AS PostOwnerId
+            FROM Votes v
+            INNER JOIN Posts p ON v.PostId = p.Id
+            WHERE v.VoteTypeId IN (2, 3)
+        ) sub
+        GROUP BY PostOwnerId
+    ) v ON tu.Id = v.PostOwnerId
+    LEFT JOIN Comments c ON p.Id = c.PostId AND c.Score > 0
+    WHERE p.PostTypeId = 1 
+        AND p.ViewCount > 1000 
+        AND p.AnswerCount >= 3
+        AND p.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1' YEAR)
+        AND (p.ClosedDate IS NULL OR p.ClosedDate > p.CreationDate + INTERVAL '7' DAY)
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, 
+             p.CreationDate, tu.Id, tu.DisplayName, at.TagName, v.UpVotes, v.DownVotes
+    HAVING AVG(c.Score) > 0 OR COUNT(DISTINCT c.Id) > 5
+)
+SELECT 
+    hip.Title,
+    hip.OwnerName,
+    hip.TagName,
+    hip.Score,
+    hip.ViewCount,
+    hip.AnswerCount,
+    hip.UpVotes,
+    hip.DownVotes,
+    hip.CommentCount,
+    tu.Reputation AS OwnerReputation,
+    at.Count AS TagPopularity,
+    at.AvgScore AS TagAvgScore,
+    tu.QuestionCount AS OwnerQuestionCount,
+    tu.TotalViews AS OwnerTotalViews,
+    CASE 
+        WHEN hip.ViewCount > 10000 THEN 'Viral'
+        WHEN hip.ViewCount > 5000 THEN 'Popular'
+        WHEN hip.ViewCount > 1000 THEN 'Growing'
+        ELSE 'Emerging'
+    END AS PopularityLevel,
+    ROW_NUMBER() OVER (
+        PARTITION BY hip.TagName 
+        ORDER BY hip.ViewCount DESC, hip.Score DESC
+    ) AS RankInTag,
+    PERCENT_RANK() OVER (
+        ORDER BY hip.ViewCount 
+    ) * 100 AS ViewPercentile,
+    (hip.UpVotes - hip.DownVotes) / NULLIF((hip.UpVotes + hip.DownVotes), 0) * 100 AS VoteRatio,
+    EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - hip.CreationDate)) / 86400 AS DaysOld,
+    hip.ViewCount / NULLIF(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - hip.CreationDate)) / 86400, 0) AS ViewsPerDay
+FROM HighImpactPosts hip
+INNER JOIN TopUsers tu ON hip.OwnerId = tu.Id
+INNER JOIN ActiveTags at ON hip.TagName = at.TagName
+WHERE tu.TotalViews > 10000
+    AND at.ActivePosts > 100
+    AND EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - hip.CreationDate)) / 86400 < 365
+ORDER BY 
+    PopularityLevel DESC,
+    ViewsPerDay DESC,
+    RankInTag ASC
+LIMIT 50;

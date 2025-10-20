@@ -1,0 +1,99 @@
+WITH RECURSIVE
+tag_stats AS (
+    SELECT
+        t.Id                                   AS tag_id,
+        t.TagName,
+        COUNT(p.Id)                            AS question_count,
+        SUM(p.Score)                           AS total_score,
+        CAST(AVG(p.AnswerCount) AS NUMERIC(10,2)) AS avg_answers,
+        MAX(p.CreationDate)                    AS latest_question_date
+    FROM Tags t
+    JOIN Posts p
+      ON p.PostTypeId = 1
+     AND p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    GROUP BY t.Id, t.TagName
+),
+
+top_answerers AS (
+    SELECT
+        ts.tag_id,
+        u.Id                                   AS user_id,
+        u.DisplayName,
+        COUNT(a.Id)                            AS answers_given,
+        ROW_NUMBER() OVER (PARTITION BY ts.tag_id
+                           ORDER BY COUNT(a.Id) DESC) AS rn
+    FROM tag_stats ts
+    JOIN Posts q
+      ON q.PostTypeId = 1
+     AND q.Tags LIKE '%' || '<' || (SELECT TagName FROM Tags WHERE Id = ts.tag_id) || '>' || '%'
+    JOIN Posts a
+      ON a.PostTypeId = 2
+     AND a.ParentId = q.Id
+    JOIN Users u
+      ON u.Id = a.OwnerUserId
+    GROUP BY ts.tag_id, u.Id, u.DisplayName
+),
+
+recent_votes AS (
+    SELECT
+        q.Id                                   AS question_id,
+        ts.tag_id,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS up_votes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS down_votes,
+        MAX(v.CreationDate)                    AS last_vote_date
+    FROM tag_stats ts
+    JOIN LATERAL (
+        SELECT p.Id, p.CreationDate, p.Tags, p.PostTypeId
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.Tags LIKE '%' || '<' || (SELECT TagName FROM Tags WHERE Id = ts.tag_id) || '>' || '%'
+        ORDER BY p.CreationDate DESC
+        LIMIT 1
+    ) q ON TRUE
+    LEFT JOIN Votes v
+      ON v.PostId = q.Id
+    GROUP BY q.Id, ts.tag_id
+),
+
+duplicate_links AS (
+    SELECT
+        ts.tag_id,
+        JSONB_AGG(
+            JSONB_BUILD_OBJECT(
+                'question_id', q.Id,
+                'duplicate_of', pl.RelatedPostId,
+                'link_created', pl.CreationDate
+            )
+        ) FILTER (WHERE pl.LinkTypeId = 3) AS duplicates_json
+    FROM tag_stats ts
+    JOIN Posts q
+      ON q.PostTypeId = 1
+     AND q.Tags LIKE '%' || '<' || (SELECT TagName FROM Tags WHERE Id = ts.tag_id) || '>' || '%'
+    LEFT JOIN PostLinks pl
+      ON pl.PostId = q.Id
+    GROUP BY ts.tag_id
+)
+
+SELECT
+    ts.TagName,
+    ts.question_count,
+    ts.total_score,
+    ts.avg_answers,
+    ts.latest_question_date,
+    ta.user_id                      AS top_answerer_id,
+    ta.DisplayName                  AS top_answerer_name,
+    ta.answers_given,
+    rv.up_votes,
+    rv.down_votes,
+    rv.last_vote_date,
+    dl.duplicates_json
+FROM tag_stats ts
+LEFT JOIN top_answerers ta
+  ON ta.tag_id = ts.tag_id AND ta.rn = 1
+LEFT JOIN recent_votes rv
+  ON rv.tag_id = ts.tag_id
+LEFT JOIN duplicate_links dl
+  ON dl.tag_id = ts.tag_id
+WHERE ts.question_count > 100
+ORDER BY ts.question_count DESC
+LIMIT 50;

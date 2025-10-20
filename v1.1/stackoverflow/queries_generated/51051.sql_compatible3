@@ -1,0 +1,109 @@
+WITH top_tags AS (
+  SELECT t.TagName, COUNT(DISTINCT p.Id) AS question_count
+  FROM Tags t
+  JOIN Posts p ON (
+    EXISTS (
+      SELECT 1
+      FROM UNNEST(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')) AS tag(tagname)
+      WHERE tag.tagname = t.TagName
+    )
+  )
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+  GROUP BY t.TagName
+  HAVING COUNT(DISTINCT p.Id) > 50
+  ORDER BY question_count DESC
+  LIMIT 10
+),
+monthly_stats AS (
+  SELECT 
+    t.TagName,
+    DATE_TRUNC('month', p.CreationDate) AS month,
+    COUNT(DISTINCT p.Id) AS questions_created,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN p.Id END) AS upvoted_questions,
+    AVG(p.Score) AS avg_score,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 5 THEN ph.Id END) AS edits_count,
+    COUNT(DISTINCT CASE WHEN c.Id IS NOT NULL THEN c.PostId END) AS comments_count
+  FROM top_tags t
+  JOIN Posts p ON (
+    EXISTS (
+      SELECT 1
+      FROM UNNEST(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')) AS tag(tagname)
+      WHERE tag.tagname = t.TagName
+    )
+  )
+  LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 2 AND v.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+  LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 5 AND ph.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+  LEFT JOIN Comments c ON c.PostId = p.Id AND c.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+  WHERE p.PostTypeId = 1 
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+    AND p.DeletionDate IS NULL
+  GROUP BY t.TagName, DATE_TRUNC('month', p.CreationDate)
+),
+user_activity AS (
+  SELECT 
+    u.Id AS user_id,
+    u.DisplayName,
+    t.TagName,
+    COUNT(DISTINCT p.Id) AS questions_asked,
+    COUNT(DISTINCT CASE WHEN a.PostTypeId = 2 AND a.ParentId = p.Id THEN a.Id END) AS answers_given,
+    SUM(COALESCE(v.BountyAmount, 0)) AS total_bounties,
+    AVG(u.Reputation) AS avg_reputation
+  FROM Users u
+  JOIN Posts p ON p.OwnerUserId = u.Id
+  JOIN top_tags t ON (
+    EXISTS (
+      SELECT 1
+      FROM UNNEST(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')) AS tag(tagname)
+      WHERE tag.tagname = t.TagName
+    )
+  )
+  LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2 AND a.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 8 AND v.UserId = u.Id
+  WHERE p.PostTypeId = 1 
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+    AND u.Reputation >= 100
+  GROUP BY u.Id, u.DisplayName, t.TagName
+  HAVING COUNT(DISTINCT p.Id) >= 3
+),
+badge_analysis AS (
+  SELECT 
+    b.Name AS badge_name,
+    b.Class,
+    t.TagName,
+    COUNT(DISTINCT b.UserId) AS users_with_badge,
+    AVG(u.Reputation) AS avg_user_reputation,
+    COUNT(DISTINCT CASE WHEN ua.questions_asked >= 10 THEN ua.user_id END) AS active_askers
+  FROM Badges b
+  JOIN Users u ON u.Id = b.UserId
+  JOIN user_activity ua ON ua.user_id = u.Id
+  JOIN top_tags t ON ua.TagName = t.TagName
+  WHERE b.Date >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+    AND b.TagBased = TRUE
+  GROUP BY b.Name, b.Class, t.TagName
+)
+SELECT 
+  ms.TagName,
+  ms.month,
+  ms.questions_created,
+  ms.upvoted_questions,
+  ms.avg_score,
+  ms.edits_count,
+  ms.comments_count,
+  COALESCE(ua.questions_asked, 0) AS avg_questions_per_user,
+  COALESCE(ba.users_with_badge, 0) AS tag_related_badges,
+  COALESCE(ba.avg_user_reputation, 0) AS avg_badge_user_reputation,
+  ROW_NUMBER() OVER (PARTITION BY ms.TagName ORDER BY ms.questions_created DESC) AS monthly_rank
+FROM monthly_stats ms
+LEFT JOIN (
+  SELECT TagName, AVG(questions_asked) AS questions_asked
+  FROM user_activity
+  GROUP BY TagName
+) ua ON ua.TagName = ms.TagName
+LEFT JOIN (
+  SELECT TagName, SUM(users_with_badge) AS users_with_badge, AVG(avg_user_reputation) AS avg_user_reputation
+  FROM badge_analysis
+  GROUP BY TagName
+) ba ON ba.TagName = ms.TagName
+WHERE ms.month >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months'
+ORDER BY ms.TagName, ms.month DESC;

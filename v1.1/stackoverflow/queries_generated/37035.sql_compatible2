@@ -1,0 +1,187 @@
+WITH
+recent_posts AS (
+  SELECT p.*
+  FROM Posts p
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+),
+questions AS (
+  SELECT *
+  FROM recent_posts
+  WHERE PostTypeId = 1
+),
+answers AS (
+  SELECT p.*
+  FROM recent_posts p
+  WHERE PostTypeId = 2
+),
+question_tags AS (
+  SELECT q.Id AS QuestionId,
+         unnest(string_to_array(substring(q.Tags, 2, char_length(q.Tags)-2), '><')) AS Tag
+  FROM questions q
+  WHERE q.Tags IS NOT NULL AND q.Tags <> ''
+),
+question_stats AS (
+  SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.OwnerUserId,
+    q.CreationDate,
+    q.Score AS QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    q.CommentCount AS QuestionCommentCount,
+    COALESCE(a.answer_count,0) AS AnswersFound,
+    COALESCE(a.avg_answer_score,0) AS AvgAnswerScore,
+    COALESCE(a.max_answer_score,0) AS MaxAnswerScore,
+    COALESCE(a.accepted_answer_id, NULL) AS AcceptedAnswerId,
+    COALESCE(e.editor_count,0) AS DistinctEditorCount,
+    COALESCE(ph.revisions,0) AS RevisionCount,
+    EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - q.LastActivityDate)) AS SecondsSinceLastActivity
+  FROM questions q
+  LEFT JOIN (
+    SELECT ParentId,
+           COUNT(*) AS answer_count,
+           AVG(Score) AS avg_answer_score,
+           MAX(Score) AS max_answer_score,
+           MAX(AcceptedAnswerId) AS accepted_answer_id
+    FROM answers
+    WHERE ParentId IS NOT NULL
+    GROUP BY ParentId
+  ) a ON a.ParentId = q.Id
+  LEFT JOIN (
+    SELECT PostId, COUNT(DISTINCT UserId) AS editor_count
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6,24)
+      AND ph.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+    GROUP BY PostId
+  ) e ON e.PostId = q.Id
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS revisions
+    FROM PostHistory ph
+    WHERE ph.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+    GROUP BY PostId
+  ) ph ON ph.PostId = q.Id
+),
+tag_aggregates AS (
+  SELECT
+    qt.Tag,
+    COUNT(DISTINCT qt.QuestionId) AS QuestionsWithTag,
+    SUM(qs.AnswersFound) AS TotalAnswers,
+    AVG(NULLIF(qs.AnswersFound,0)) FILTER (WHERE qs.AnswersFound > 0) AS AvgAnswersPerAnsweredQuestion,
+    AVG(qs.QuestionScore) AS AvgQuestionScore,
+    MAX(qs.MaxAnswerScore) AS TopAnswerScoreForTag,
+    SUM(qs.RevisionCount) AS TotalRevisions,
+    SUM(qs.DistinctEditorCount) AS TotalDistinctEditors,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY qs.SecondsSinceLastActivity) AS MedianSecondsSinceLastActivity
+  FROM question_tags qt
+  JOIN question_stats qs ON qs.QuestionId = qt.QuestionId
+  GROUP BY qt.Tag
+),
+tag_hotness AS (
+  SELECT
+    ta.Tag,
+    ta.QuestionsWithTag,
+    ta.TotalAnswers,
+    ta.AvgAnswersPerAnsweredQuestion,
+    ta.AvgQuestionScore,
+    ta.TopAnswerScoreForTag,
+    ta.TotalRevisions,
+    ta.TotalDistinctEditors,
+    ta.MedianSecondsSinceLastActivity,
+    (
+      (ta.QuestionsWithTag::numeric / NULLIF((SELECT MAX(QuestionsWithTag) FROM tag_aggregates),0)) * 0.25
+      + ( COALESCE(ta.AvgQuestionScore,0) / NULLIF((SELECT MAX(AvgQuestionScore) FROM tag_aggregates),0) ) * 0.15
+      + ( COALESCE(ta.TotalRevisions,0) / NULLIF((SELECT MAX(TotalRevisions) FROM tag_aggregates),0) ) * 0.20
+      + ( COALESCE(ta.TotalAnswers,0) / NULLIF((SELECT MAX(TotalAnswers) FROM tag_aggregates),0) ) * 0.25
+      + ( 1.0 - LEAST(1.0, COALESCE(ta.MedianSecondsSinceLastActivity,1) / NULLIF((SELECT MAX(MedianSecondsSinceLastActivity) FROM tag_aggregates),1)) ) * 0.15
+    ) AS HotnessScore
+  FROM tag_aggregates ta
+),
+user_stats AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    COUNT(DISTINCT q.Id) FILTER (WHERE q.OwnerUserId = u.Id) AS QuestionsAuthored,
+    COUNT(DISTINCT a.Id) FILTER (WHERE a.OwnerUserId = u.Id) AS AnswersAuthored,
+    SUM(COALESCE(p.Score,0)) FILTER (WHERE p.OwnerUserId = u.Id) AS TotalPostScore,
+    COUNT(DISTINCT b.Id) AS BadgesEarned,
+    MAX(u.Reputation) AS Reputation,
+    COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpvotesGiven
+  FROM Users u
+  LEFT JOIN questions q ON q.OwnerUserId = u.Id
+  LEFT JOIN answers a ON a.OwnerUserId = u.Id
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+  LEFT JOIN Badges b ON b.UserId = u.Id AND b.Date >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+  LEFT JOIN Votes v ON v.UserId = u.Id AND v.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+  GROUP BY u.Id, u.DisplayName
+),
+tag_top_questions AS (
+  SELECT
+    th.Tag,
+    q.Id AS QuestionId,
+    q.Title,
+    q.CreationDate,
+    q.OwnerUserId,
+    qs.QuestionScore,
+    qs.AnswersFound,
+    qs.AvgAnswerScore,
+    qs.RevisionCount,
+    ROW_NUMBER() OVER (PARTITION BY th.Tag ORDER BY ( (qs.QuestionScore * 0.4) + (COALESCE(qs.AvgAnswerScore,0) * 0.3) + (qs.AnswersFound * 0.2) + (qs.RevisionCount * 0.1) ) DESC, qs.SecondsSinceLastActivity ASC) AS rn
+  FROM tag_hotness th
+  JOIN question_tags qt ON qt.Tag = th.Tag
+  JOIN question_stats qs ON qs.QuestionId = qt.QuestionId
+  JOIN Posts q ON q.Id = qs.QuestionId
+)
+SELECT
+  th.Tag,
+  th.HotnessScore,
+  th.QuestionsWithTag,
+  th.TotalAnswers,
+  th.AvgQuestionScore,
+  th.TotalRevisions,
+  tt.QuestionId AS TopQuestionId,
+  tt.Title AS TopQuestionTitle,
+  tt.CreationDate AS TopQuestionCreation,
+  tt.OwnerUserId AS TopQuestionOwner,
+  us.DisplayName AS TopQuestionOwnerName,
+  us.QuestionsAuthored,
+  us.AnswersAuthored,
+  us.TotalPostScore,
+  us.BadgesEarned,
+  us.Reputation,
+  -- build JSON payload using standard SQL/portable functions: construct objects with JSON_OBJECT and JSON_ARRAY functions where available,
+  -- fall back to concatenated JSON text to be portable
+  (
+    '{'
+    || '"tag_metrics":' ||
+      COALESCE((
+        '{"questions_with_tag":' || COALESCE(CAST(th.QuestionsWithTag AS text),'null')
+        || ',"total_answers":' || COALESCE(CAST(th.TotalAnswers AS text),'null')
+        || ',"avg_question_score":' || COALESCE(CAST(th.AvgQuestionScore AS text),'null')
+        || ',"total_revisions":' || COALESCE(CAST(th.TotalRevisions AS text),'null')
+        || ',"median_seconds_since_last_activity":' || COALESCE(CAST(th.MedianSecondsSinceLastActivity AS text),'null')
+        || '}'
+      ), 'null')
+    || ',"top_question":' ||
+      COALESCE((
+        '{"id":' || COALESCE(CAST(tt.QuestionId AS text),'null')
+        || ',"title":' || COALESCE('"' || REPLACE(tt.Title, '"', '\"') || '"','null')
+        || ',"creation_date":' || COALESCE('"' || CAST(tt.CreationDate AS text) || '"','null')
+        || ',"owner_user_id":' || COALESCE(CAST(tt.OwnerUserId AS text),'null')
+        || '}'
+      ), 'null')
+    || ',"owner":' ||
+      COALESCE((
+        '{"id":' || COALESCE(CAST(us.UserId AS text),'null')
+        || ',"display_name":' || COALESCE('"' || REPLACE(us.DisplayName, '"', '\"') || '"','null')
+        || ',"reputation":' || COALESCE(CAST(us.Reputation AS text),'null')
+        || ',"badges_earned_last_year":' || COALESCE(CAST(us.BadgesEarned AS text),'null')
+        || '}'
+      ), 'null')
+    || '}'
+  ) AS Payload
+FROM tag_hotness th
+LEFT JOIN tag_top_questions tt ON tt.Tag = th.Tag AND tt.rn = 1
+LEFT JOIN user_stats us ON us.UserId = tt.OwnerUserId
+ORDER BY th.HotnessScore DESC NULLS LAST
+LIMIT 100;

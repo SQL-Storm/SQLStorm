@@ -1,0 +1,167 @@
+WITH
+user_activity AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName,
+         u.Reputation,
+         COUNT(DISTINCT CASE WHEN p.PostTypeId IN (1,2) THEN p.Id END) AS PostsCount,
+         COUNT(DISTINCT c.Id) AS CommentsCount,
+         COUNT(DISTINCT b.Id) AS BadgesCount,
+         COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpVotesCast,
+         COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownVotesCast,
+         (COALESCE(u.Reputation,0) * 0.4
+          + COALESCE(COUNT(DISTINCT CASE WHEN p.PostTypeId IN (1,2) THEN p.Id END),0) * 3
+          + COALESCE(COUNT(DISTINCT c.Id),0) * 1
+          + COALESCE(COUNT(DISTINCT b.Id),0) * 2
+          + COALESCE(COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END),0) * 0.2
+          - COALESCE(COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END),0) * 0.5
+         ) AS ActivityScore
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Comments c ON c.UserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+question_tags AS (
+  SELECT
+    t.TagName,
+    t.Id AS TagId,
+    t.Count AS TagCount,
+    COUNT(q.Id) AS QuestionsCount,
+    SUM(COALESCE(q.ViewCount,0)) AS TotalViews,
+    SUM(COALESCE(q.Score,0)) AS TotalScore,
+    SUM(COALESCE(q.AnswerCount,0)) AS TotalAnswers
+  FROM Tags t
+  LEFT JOIN Posts q ON q.PostTypeId = 1 AND q.Tags IS NOT NULL
+    AND POSITION('<' || t.TagName || '>' IN q.Tags) > 0
+  GROUP BY t.Id, t.TagName, t.Count
+),
+question_answers AS (
+  SELECT q.Id AS QuestionId,
+         q.Title,
+         q.CreationDate AS QuestionCreated,
+         a.Id AS AnswerId,
+         a.CreationDate AS AnswerCreated,
+         t.TagName
+  FROM Posts q
+  JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+  JOIN question_tags t ON POSITION('<' || t.TagName || '>' IN q.Tags) > 0
+  WHERE q.PostTypeId = 1 AND q.CreationDate IS NOT NULL AND a.CreationDate IS NOT NULL
+),
+answer_latency AS (
+  SELECT TagName,
+         QuestionId,
+         MIN(EXTRACT(EPOCH FROM (AnswerCreated - QuestionCreated))/3600.0) AS FirstAnswerHours,
+         PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (AnswerCreated - QuestionCreated))/3600.0) AS MedianAnswerHours
+  FROM question_answers
+  GROUP BY TagName, QuestionId
+),
+tag_latency_summary AS (
+  SELECT
+    qt.TagName,
+    qt.TagCount,
+    qt.QuestionsCount,
+    qt.TotalViews,
+    qt.TotalScore,
+    qt.TotalAnswers,
+    AVG(al.FirstAnswerHours) AS AvgFirstAnswerHours,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY al.MedianAnswerHours) AS MedianOfMediansHours,
+    COUNT(al.QuestionId) AS QuestionsWithAnswers
+  FROM question_tags qt
+  LEFT JOIN answer_latency al ON al.TagName = qt.TagName
+  GROUP BY qt.TagName, qt.TagCount, qt.QuestionsCount, qt.TotalViews, qt.TotalScore, qt.TotalAnswers
+),
+post_link_graph AS (
+  SELECT
+    pl.PostId,
+    p.Title,
+    COUNT(CASE WHEN pl.LinkTypeId = 1 THEN 1 END) AS OutgoingLinks,
+    COUNT(CASE WHEN pl.LinkTypeId = 3 THEN 1 END) AS OutgoingDuplicates,
+    COUNT(CASE WHEN pl2.LinkTypeId = 1 THEN pl2.Id END) AS IncomingLinks,
+    COUNT(CASE WHEN pl2.LinkTypeId = 3 THEN pl2.Id END) AS IncomingDuplicates
+  FROM PostLinks pl
+  JOIN Posts p ON p.Id = pl.PostId
+  LEFT JOIN PostLinks pl2 ON pl2.RelatedPostId = pl.PostId
+  GROUP BY pl.PostId, p.Title
+),
+stalled_questions AS (
+  SELECT q.Id AS QuestionId,
+         q.Title,
+         q.CreationDate,
+         q.LastActivityDate,
+         q.Score,
+         q.ViewCount,
+         q.AnswerCount,
+         q.CommentCount,
+         COALESCE(q.ViewCount,0) * 1.0 / NULLIF(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - q.CreationDate))/86400.0,0) AS ViewsPerDay,
+         GREATEST(0, q.AnswerCount) AS Answers,
+         u.DisplayName AS OwnerName
+  FROM Posts q
+  LEFT JOIN Users u ON u.Id = q.OwnerUserId
+  WHERE q.PostTypeId = 1
+    AND (q.AnswerCount = 0 OR q.AcceptedAnswerId IS NULL)
+    AND q.CreationDate < TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '90 days'
+),
+ranked_tags AS (
+  SELECT l.*,
+         (l.QuestionsCount * 0.3 + l.TotalViews * 0.25 + l.TotalScore * 0.2 + GREATEST(0, (1.0 / NULLIF(l.AvgFirstAnswerHours,0))) * 50 + GREATEST(0, (1.0 / NULLIF(l.MedianOfMediansHours,0))) * 30) AS TagHotnessScore
+  FROM tag_latency_summary l
+)
+SELECT
+  TIMESTAMP '2024-10-01 12:34:56' AS BenchmarkRunAt,
+  (SELECT JSON_AGG(ua_row) FROM (
+     SELECT ua.UserId, ua.DisplayName, ua.Reputation, ua.PostsCount, ua.CommentsCount, ua.BadgesCount, ROUND(ua.ActivityScore::numeric,2) AS ActivityScore,
+            (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ua.UserId AND p.CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days') AS RecentPosts30d
+     FROM user_activity ua
+     WHERE ua.ActivityScore IS NOT NULL
+     ORDER BY ua.ActivityScore DESC
+     LIMIT 10
+  ) ua_row) AS TopUsers,
+  (SELECT JSON_AGG(rt_row) FROM (
+     SELECT rt.TagName, rt.TagCount, rt.QuestionsCount, rt.TotalViews, rt.TotalScore, rt.TotalAnswers,
+            ROUND(CAST(rt.AvgFirstAnswerHours AS numeric),2) AS AvgFirstAnswerHours,
+            ROUND(CAST(rt.MedianOfMediansHours AS numeric),2) AS MedianOfMediansHours,
+            ROUND(CAST(rt.TagHotnessScore AS numeric),2) AS TagHotnessScore
+     FROM ranked_tags rt
+     ORDER BY rt.TagHotnessScore DESC
+     LIMIT 15
+  ) rt_row) AS TopTags,
+  (SELECT JSON_AGG(pl_row) FROM (
+     SELECT pl.PostId, pl.Title, pl.IncomingDuplicates, pl.IncomingLinks, pl.OutgoingDuplicates, pl.OutgoingLinks, p.Score, p.ViewCount
+     FROM post_link_graph pl
+     JOIN Posts p ON p.Id = pl.PostId
+     WHERE pl.IncomingDuplicates >= 3
+     ORDER BY pl.IncomingDuplicates DESC, p.Score ASC
+     LIMIT 20
+  ) pl_row) AS DuplicateTargets,
+  (SELECT JSON_AGG(sq_row) FROM (
+     SELECT sq.QuestionId, sq.Title, sq.CreationDate, sq.LastActivityDate, sq.Score, ROUND(CAST(sq.ViewsPerDay AS numeric),2) AS ViewsPerDay, sq.Answers, sq.OwnerName
+     FROM stalled_questions sq
+     ORDER BY sq.ViewsPerDay DESC NULLS LAST, sq.Score DESC
+     LIMIT 25
+  ) sq_row) AS StalledPopularQuestions,
+  (SELECT JSON_AGG(vt_row) FROM (
+     SELECT qt.TagName,
+            COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+            COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes,
+            COUNT(v.Id) AS TotalVotes,
+            ROUND((COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) * 1.0 / NULLIF(COUNT(v.Id),0)),3) AS UpVoteRatio
+     FROM question_tags qt
+     JOIN Posts p ON p.PostTypeId = 1 AND POSITION('<' || qt.TagName || '>' IN p.Tags) > 0
+     JOIN Votes v ON v.PostId = p.Id AND v.CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days'
+     GROUP BY qt.TagName
+     HAVING COUNT(v.Id) > 10
+     ORDER BY TotalVotes DESC
+     LIMIT 30
+  ) vt_row) AS TagVoteDistribution,
+  (SELECT row_to_json(summary) FROM (
+     SELECT
+       (SELECT COUNT(*) FROM Posts) AS TotalPosts,
+       (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1) AS TotalQuestions,
+       (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2) AS TotalAnswers,
+       (SELECT COUNT(*) FROM Users WHERE CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days') AS NewUsers30d,
+       (SELECT COUNT(*) FROM Votes WHERE CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days') AS RecentVotes30d,
+       (SELECT COUNT(*) FROM Comments WHERE CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days') AS RecentComments30d,
+       (SELECT COUNT(*) FROM PostLinks WHERE CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '365 days') AS LinksLastYear,
+       (SELECT COUNT(*) FROM Badges WHERE Date > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '365 days') AS BadgesLastYear
+  ) summary) AS GlobalCounts;

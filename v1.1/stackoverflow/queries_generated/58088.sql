@@ -1,0 +1,40 @@
+-- {"query": "58088.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "deepseek-r1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2033, "output_tokens": 1096} 
+
+WITH ActiveUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation, u.CreationDate,
+           COUNT(DISTINCT p.Id) AS PostCount,
+           COUNT(DISTINCT c.Id) AS CommentCount,
+           COUNT(DISTINCT v.Id) AS VoteCount,
+           COUNT(DISTINCT b.Id) AS BadgeCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId IN (2, 8)
+    LEFT JOIN Badges b ON u.Id = b.UserId AND b.Class = 1
+    WHERE u.Reputation > 1000
+      AND u.CreationDate >= '2015-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(p.Id) > 10 OR COUNT(c.Id) > 50
+),
+MonthlyActivity AS (
+    SELECT au.Id,
+           DATE_TRUNC('month', p.CreationDate) AS ActivityMonth,
+           AVG(p.Score) OVER (PARTITION BY au.Id, DATE_TRUNC('month', p.CreationDate)) AS AvgPostScore,
+           SUM(p.ViewCount) OVER (PARTITION BY au.Id) AS TotalViews,
+           RANK() OVER (ORDER BY au.Reputation DESC) AS ReputationRank,
+           (SELECT COUNT(*) FROM Badges b WHERE b.UserId = au.Id AND b.Class = 1) AS GoldBadges,
+           (SELECT MAX(p2.Title) FROM Posts p2 WHERE p2.OwnerUserId = au.Id AND p2.PostTypeId = 1 ORDER BY p2.CreationDate DESC LIMIT 1) AS LatestPostTitle
+    FROM ActiveUsers au
+    INNER JOIN Posts p ON au.Id = p.OwnerUserId
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.CreationDate BETWEEN '2015-01-01' AND '2023-12-31'
+)
+SELECT ma.Id, ma.ActivityMonth, ma.AvgPostScore, ma.TotalViews, ma.ReputationRank,
+       ma.GoldBadges, ma.LatestPostTitle,
+       (SELECT STRING_AGG(TagName, ', ' ORDER BY Count DESC LIMIT 5)
+        FROM Tags t
+        WHERE t.Id IN (SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) FROM Posts p WHERE p.OwnerUserId = ma.Id)) AS TopTags
+FROM MonthlyActivity ma
+WHERE ma.GoldBadges >= 3
+ORDER BY ma.ReputationRank, ma.ActivityMonth DESC, ma.TotalViews DESC
+LIMIT 500;

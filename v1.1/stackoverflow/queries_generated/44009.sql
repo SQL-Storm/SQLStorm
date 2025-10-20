@@ -1,0 +1,55 @@
+-- {"query": "44009.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 20646, "output_tokens": 8066} 
+Here is an elaborate SQL query for performance benchmarking:
+
+SELECT 
+  p.Id, 
+  p.PostTypeId, 
+  p.CreationDate, 
+  p.Score, 
+  p.ViewCount, 
+  p.AnswerCount, 
+  p.CommentCount, 
+  p.FavoriteCount, 
+  CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+  CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END AS IsCommunityOwned,
+  u.Id AS UserId, 
+  u.Reputation, 
+  u.CreationDate AS UserCreationDate, 
+  u.LastAccessDate, 
+  u.Views AS UserViews, 
+  u.UpVotes AS UserUpvotes, 
+  u.DownVotes AS UserDownvotes,
+  b.Id AS BadgeId, 
+  b.Name AS BadgeName, 
+  b.Date AS BadgeDate, 
+  b.Class AS BadgeClass, 
+  b.TagBased AS IsBadgeTagBased,
+  c.Id AS CommentId,
+  c.Score AS CommentScore, 
+  c.CreationDate AS CommentCreationDate,
+  c.UserId AS CommentUserId,
+  c.UserDisplayName AS CommentUserDisplayName,
+  pl.Id AS PostLinkId,
+  pl.LinkTypeId,
+  pl.RelatedPostId,
+  t.Id AS TagId,
+  t.TagName,
+  t.Count AS TagCount,
+  t.ExcerptPostId,
+  t.WikiPostId,
+  t.IsModeratorOnly,
+  t.IsRequired,
+  v.Id AS VoteId,
+  v.VoteTypeId,
+  v.UserId AS VoteUserId,
+  v.CreationDate AS VoteCreationDate,
+  v.BountyAmount
+FROM Posts p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Comments c ON p.Id = c.PostId
+LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN Tags t ON SUBSTRING_INDEX(p.Tags, '><', 1) = t.TagName
+LEFT JOIN Votes v ON p.Id = v.PostId
+WHERE p.CreationDate BETWEEN '2022-01-01' AND '2022-12-31'
+ORDER BY p.Id, b.Date, c.CreationDate, pl.Id, t.Id, v.Id;

@@ -1,0 +1,93 @@
+-- {"query": "48063.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 786} 
+WITH LatestEdits AS (
+  SELECT
+    ph.PostId,
+    MAX(ph.CreationDate) AS LatestEditDate
+  FROM PostHistory AS ph
+  WHERE
+    ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+  GROUP BY
+    ph.PostId
+),
+QuestionMetrics AS (
+  SELECT
+    p.Id AS QuestionId,
+    p.Title,
+    p.Score AS QuestionScore,
+    p.ViewCount AS QuestionViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount AS QuestionFavoriteCount,
+    p.CreationDate AS QuestionCreationDate,
+    p.OwnerUserId AS QuestionOwnerUserId,
+    u.DisplayName AS QuestionOwnerDisplayName,
+    le.LatestEditDate,
+    (
+      SELECT
+        COUNT(*)
+      FROM Posts AS a
+      WHERE
+        a.ParentId = p.Id AND a.PostTypeId = 2 -- Count only answers
+    ) AS ActualAnswerCount,
+    (
+      SELECT
+        AVG(CAST(c.Score AS DECIMAL(10, 2)))
+      FROM Comments AS c
+      WHERE
+        c.PostId = p.Id
+    ) AS AverageCommentScore,
+    (
+      SELECT
+        COUNT(DISTINCT v.UserId)
+      FROM Votes AS v
+      WHERE
+        v.PostId = p.Id AND v.VoteTypeId = 2 -- Upvotes
+    ) AS UpvoteCount,
+    (
+      SELECT
+        COUNT(DISTINCT v.UserId)
+      FROM Votes AS v
+      WHERE
+        v.PostId = p.Id AND v.VoteTypeId = 3 -- Downvotes
+    ) AS DownvoteCount,
+    (
+      SELECT
+        COUNT(*)
+      FROM PostLinks AS pl
+      WHERE
+        pl.PostId = p.Id AND pl.LinkTypeId = 3 -- Duplicate links
+    ) AS DuplicateLinkCount
+  FROM Posts AS p
+  INNER JOIN Users AS u
+    ON p.OwnerUserId = u.Id
+  LEFT JOIN LatestEdits AS le
+    ON p.Id = le.PostId
+  WHERE
+    p.PostTypeId = 1 -- Only questions
+    AND p.CreationDate >= DATE('now', '-1 year') -- Last year's questions
+)
+SELECT
+  qm.QuestionId,
+  qm.Title,
+  qm.QuestionScore,
+  qm.QuestionViewCount,
+  qm.AnswerCount,
+  qm.ActualAnswerCount,
+  qm.AverageCommentScore,
+  qm.UpvoteCount,
+  qm.DownvoteCount,
+  qm.QuestionFavoriteCount,
+  qm.DuplicateLinkCount,
+  qm.QuestionOwnerDisplayName,
+  qm.QuestionCreationDate,
+  qm.LatestEditDate,
+  (qm.QuestionScore * 1.0 / NULLIF(qm.QuestionViewCount, 0)) AS ScorePerView,
+  (qm.ActualAnswerCount * 1.0 / NULLIF(qm.AnswerCount, 0)) AS ActualToReportedAnswerRatio,
+  (qm.UpvoteCount * 1.0 / NULLIF(qm.DownvoteCount, 0)) AS UpvoteToDownvoteRatio
+FROM QuestionMetrics AS qm
+WHERE
+  qm.QuestionScore > 10 -- Filter for questions with some engagement
+ORDER BY
+  qm.QuestionViewCount DESC,
+  qm.QuestionScore DESC
+LIMIT 100;

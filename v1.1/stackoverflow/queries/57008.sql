@@ -1,0 +1,128 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        MAX(p.LastActivityDate) AS LastPostActivity,
+        MAX(c.CreationDate) AS LastCommentDate,
+        MAX(v.CreationDate) AS LastVoteDate,
+        MAX(b.Date) AS LastBadgeDate
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate
+), TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(p.ViewCount) AS TotalViewCount,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        COUNT(DISTINCT c.Id) AS TotalComments
+    FROM
+        Tags t
+    LEFT JOIN
+        Posts p ON EXISTS (
+            SELECT 1
+            FROM (
+                SELECT TRIM(tag) AS tag
+                FROM UNNEST(string_to_array(
+                    -- remove leading '<' and trailing '>' if present, then split on '><'
+                    REPLACE(REPLACE(p.Tags, '^<', ''), '>$', ''),
+                    '><'
+                )) AS t(tag)
+            ) s
+            WHERE s.tag = t.TagName
+        )
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    GROUP BY
+        t.TagName, t.Count
+    ORDER BY
+        PostCount DESC
+    LIMIT 20
+), activeUsers AS (
+    SELECT
+        UserId,
+        LastPostActivity,
+        LastCommentDate,
+        LastVoteDate,
+        LastBadgeDate,
+        CASE
+            WHEN LastPostActivity > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY)
+             AND LastCommentDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY)
+             AND LastVoteDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY)
+            THEN TRUE
+            WHEN LastBadgeDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY) THEN FALSE
+            ELSE FALSE
+        END AS "Name"
+    FROM UserActivity
+)
+SELECT
+    ua.UserId,
+    ua.Reputation,
+    ua.UserCreationDate,
+    ua.TotalPosts,
+    ua.TotalComments,
+    ua.TotalVotes,
+    ua.TotalBadges,
+    ua.LastPostActivity,
+    ua.LastCommentDate,
+    ua.LastVoteDate,
+    ua.LastBadgeDate,
+    activeUsers."Name" AS name,
+    tt.TagName,
+    tt.PostCount,
+    tt.AvgPostScore,
+    tt.TotalViewCount,
+    tt.TotalVotes AS TagVotes,
+    tt.TotalComments AS TagComments
+FROM
+    UserActivity ua
+JOIN
+    activeUsers ON ua.UserId = activeUsers.UserId
+CROSS JOIN
+    TopTags tt
+WHERE
+    ua.TotalPosts > 10
+    AND ua.TotalComments > 5
+    AND ua.TotalVotes > 20
+    AND ua.TotalBadges > 20
+GROUP BY
+    ua.UserId,
+    ua.Reputation,
+    ua.UserCreationDate,
+    ua.TotalPosts,
+    ua.TotalComments,
+    ua.TotalVotes,
+    ua.TotalBadges,
+    ua.LastPostActivity,
+    ua.LastCommentDate,
+    ua.LastVoteDate,
+    ua.LastBadgeDate,
+    activeUsers."Name",
+    tt.TagName,
+    tt.PostCount,
+    tt.AvgPostScore,
+    tt.TotalViewCount,
+    tt.TotalVotes,
+    tt.TotalComments
+ORDER BY
+    ua.Reputation DESC,
+    tt.PostCount DESC
+LIMIT 100;

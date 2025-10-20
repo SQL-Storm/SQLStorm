@@ -1,4 +1,4 @@
--- {"query": "20027.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1381} 
+-- {"query": "20027.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1381} 
 
 WITH UserQuestionStats AS (
     -- Step 1: Identify users with high reputation and a minimum number of questions asked.

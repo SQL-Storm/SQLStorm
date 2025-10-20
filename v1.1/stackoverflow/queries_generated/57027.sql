@@ -1,0 +1,133 @@
+-- {"query": "57027.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2291, "output_tokens": 1134} 
+
+WITH RecentActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COUNT(p.Id) AS PostCount,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(v.Id) AS VoteCount
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    WHERE
+        u.LastAccessDate >= NOW() - INTERVAL '30 days'
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+HighReputationUsers AS (
+    SELECT
+        UserId,
+        Reputation,
+        PostCount,
+        CommentCount,
+        VoteCount,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC) AS ReputationRank
+    FROM
+        RecentActiveUsers
+    WHERE
+        Reputation > 1000
+),
+TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        COUNT(p.Id) AS QuestionCount
+    FROM
+        Tags t
+    LEFT JOIN
+        Posts p ON t.Id = ANY(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), ''><''))
+    WHERE
+        p.PostTypeId = 1
+    GROUP BY
+        t.TagName, t.Count
+    ORDER BY
+        QuestionCount DESC
+    LIMIT 10
+),
+QuestionsWithHighVotes AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.Score,
+        p.AnswerCount,
+        p.ViewCount,
+        u.DisplayName AS OwnerName
+    FROM
+        Posts p
+    JOIN
+        Users u ON p.OwnerUserId = u.Id
+    WHERE
+        p.PostTypeId = 1
+        AND p.Score > 50
+    ORDER BY
+        p.Score DESC
+    LIMIT 50
+),
+ActivePosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.LastActivityDate,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(v.Id) AS VoteCount,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVoteCount,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVoteCount
+    FROM
+        Posts p
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    WHERE
+        p.LastActivityDate >= NOW() - INTERVAL '7 days'
+    GROUP BY
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.LastActivityDate
+)
+SELECT
+    hru.UserId,
+    hru.Reputation,
+    hru.ReputationRank,
+    hru.PostCount,
+    hru.CommentCount,
+    hru.VoteCount,
+    tt.TagName,
+    tt.QuestionCount,
+    qwhv.QuestionId,
+    qwhv.Title,
+    qwhv.Score AS QuestionScore,
+    qwhv.AnswerCount,
+    qwhv.ViewCount AS QuestionViewCount,
+    qwhv.OwnerName,
+    ap.PostId,
+    ap.PostTypeId,
+    ap.CreationDate AS PostCreationDate,
+    ap.Score AS PostScore,
+    ap.ViewCount AS PostViewCount,
+    ap.LastActivityDate AS PostLastActivityDate,
+    ap.CommentCount AS PostCommentCount,
+    ap.VoteCount AS PostVoteCount,
+    ap.UpVoteCount,
+    ap.DownVoteCount
+FROM
+    HighReputationUsers hru
+CROSS JOIN
+    TopTags tt
+LEFT JOIN
+    QuestionsWithHighVotes qwhv ON hru.UserId = qwhv.QuestionId
+LEFT JOIN
+    ActivePosts ap ON hru.UserId = ap.UserId
+ORDER BY
+    hru.Reputation DESC,
+    qwhv.Score DESC,
+    ap.PostScore DESC;

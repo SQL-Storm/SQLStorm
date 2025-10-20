@@ -1,0 +1,129 @@
+WITH TopQuestionsByPeriod AS (
+    SELECT 
+        p.Id,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CreationDate,
+        DATE_TRUNC('quarter', p.CreationDate) AS QuarterDate,
+        ROW_NUMBER() OVER (PARTITION BY DATE_TRUNC('quarter', p.CreationDate) ORDER BY p.Score DESC, p.ViewCount DESC) AS QuarterRank
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= DATE '2015-01-01'
+        AND p.Score > 10
+        AND p.OwnerUserId IS NOT NULL
+),
+UserEngagementMetrics AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL AND p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswers,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= DATE '2014-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) > 5
+),
+AnswerPerformanceWithContext AS (
+    SELECT 
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId AS AnswerUserId,
+        q.OwnerUserId AS QuestionUserId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerDate,
+        q.CreationDate AS QuestionDate,
+        (EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) / 3600.0) AS HoursToAnswer,
+        CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END AS IsAccepted,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.CreationDate) AS AnswerSequence,
+        COUNT(*) OVER (PARTITION BY a.ParentId) AS TotalAnswersForQuestion,
+        AVG(a.Score) OVER (PARTITION BY a.ParentId) AS AvgScoreForQuestion,
+        q.ViewCount AS QuestionViews,
+        q.Score AS QuestionScore
+    FROM Posts a
+    INNER JOIN Posts q ON a.ParentId = q.Id
+    WHERE a.PostTypeId = 2
+        AND q.PostTypeId = 1
+        AND a.CreationDate >= DATE '2016-01-01'
+        AND a.OwnerUserId IS NOT NULL
+        AND q.OwnerUserId IS NOT NULL
+),
+TagPopularityTrends AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TotalTagUsage,
+        COUNT(DISTINCT p.Id) AS QuestionsInPeriod,
+        AVG(p.Score) AS AvgQuestionScore,
+        AVG(p.AnswerCount) AS AvgAnswerCount,
+        AVG(p.ViewCount) AS AvgViewCount,
+        COUNT(DISTINCT p.OwnerUserId) AS UniqueAskers,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS MedianScore
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= DATE '2017-01-01'
+        AND t.Count > 100
+    GROUP BY t.Id, t.TagName, t.Count
+)
+SELECT 
+    tqp.QuarterDate,
+    tqp.QuarterRank,
+    tqp.Id AS QuestionId,
+    uem.DisplayName AS QuestionOwner,
+    uem.Reputation,
+    uem.TotalPosts,
+    uem.AvgQuestionScore AS OwnerAvgQuestionScore,
+    uem.GoldBadges,
+    uem.SilverBadges,
+    uem.BronzeBadges,
+    tqp.Score AS QuestionScore,
+    tqp.ViewCount,
+    tqp.AnswerCount,
+    COUNT(DISTINCT apc.AnswerId) AS AnswersAnalyzed,
+    AVG(apc.AnswerScore) AS AvgAnswerScore,
+    AVG(apc.HoursToAnswer) AS AvgHoursToAnswer,
+    SUM(apc.IsAccepted) AS AcceptedAnswerCount,
+    STRING_AGG(DISTINCT tpt.TagName, ', ' ORDER BY tpt.TagName) AS RelatedTags,
+    AVG(tpt.AvgQuestionScore) AS AvgScoreInTags,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    COUNT(DISTINCT v.Id) AS VoteCount,
+    COUNT(DISTINCT ph.Id) AS EditCount
+FROM TopQuestionsByPeriod tqp
+INNER JOIN UserEngagementMetrics uem ON tqp.OwnerUserId = uem.UserId
+LEFT JOIN AnswerPerformanceWithContext apc ON tqp.Id = apc.QuestionId
+LEFT JOIN Posts p ON tqp.Id = p.Id
+LEFT JOIN TagPopularityTrends tpt ON p.Tags LIKE '%' || '<' || tpt.TagName || '>' || '%'
+LEFT JOIN Comments c ON tqp.Id = c.PostId
+LEFT JOIN Votes v ON tqp.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+LEFT JOIN PostHistory ph ON tqp.Id = ph.PostId AND ph.PostHistoryTypeId IN (4, 5, 6)
+WHERE tqp.QuarterRank <= 50
+GROUP BY 
+    tqp.QuarterDate,
+    tqp.QuarterRank,
+    tqp.Id,
+    uem.DisplayName,
+    uem.Reputation,
+    uem.TotalPosts,
+    uem.AvgQuestionScore,
+    uem.GoldBadges,
+    uem.SilverBadges,
+    uem.BronzeBadges,
+    tqp.Score,
+    tqp.ViewCount,
+    tqp.AnswerCount
+HAVING COUNT(DISTINCT apc.AnswerId) > 0
+ORDER BY tqp.QuarterDate DESC, tqp.QuarterRank ASC
+LIMIT 1000;

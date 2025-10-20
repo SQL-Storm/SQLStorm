@@ -1,0 +1,120 @@
+-- {"query": "69.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 987} 
+WITH
+RecentActivePosts AS (
+  SELECT p.Id,
+         p.Title,
+         p.OwnerUserId,
+         p.CreationDate,
+         p.LastActivityDate,
+         p.ViewCount,
+         p.Score,
+         p.Tags,
+         p.PostTypeId,
+         p.AnswerCount,
+         p.CommentCount,
+         p.FavoriteCount,
+         p.ParentId
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.CreationDate > NOW() - INTERVAL '90 days'
+),
+TopTags AS (
+  SELECT t.TagName,
+         SUM(p.ViewCount) AS TotalViews,
+         SUM(p.Score) AS TotalScore,
+         COUNT(*) AS PostCount
+  FROM RecentActivePosts rap
+  JOIN LATERAL string_to_array(substring(rap.Tags, 2, length(rap.Tags)-2), '><') AS tag(t)
+    ON true
+  JOIN Tags t ON t.TagName = tag.t
+  JOIN Posts p ON p.Id = rap.Id
+  GROUP BY t.TagName
+  ORDER BY TotalViews DESC
+  LIMIT 50
+),
+UserEngagement AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName,
+         u.Reputation,
+         COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesGiven,
+         COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesGiven,
+         AVG(EXTRACT(EPOCH FROM (NOW() - u.CreationDate)) / 86400) AS DaysSinceCreation,
+         SUM(p.ViewCount) AS ViewsOnQuestions,
+         SUM(p.Score) AS AvgPostScore
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+  HAVING SUM(p.ViewCount) > 100
+),
+CorrelatedSubquery AS (
+  SELECT rp.Id AS RelatedPostId,
+         rp.Title,
+         rp.OwnerUserId,
+         (SELECT COUNT(*) FROM Posts p2 WHERE p2.ParentId = rp.Id) AS ChildCount
+  FROM Posts rp
+  WHERE rp.ParentId IS NULL
+    AND rp.PostTypeId = 1
+),
+JoinedDemo AS (
+  SELECT rap.Id,
+         rap.Title,
+         rap.OwnerUserId,
+         rap.CreationDate,
+         rap.LastActivityDate,
+         rap.ViewCount,
+         rap.Score,
+         rap.Tags,
+         rap.AnswerCount,
+         rap.CommentCount,
+         rap.FavoriteCount,
+         ht.Name AS HistoryTypeName,
+         bl.BountyAmount,
+         CASE
+           WHEN rap.ViewCount > 1000 THEN TRUE
+           ELSE FALSE
+         END AS IsPopular
+  FROM RecentActivePosts rap
+  LEFT JOIN PostHistory ph ON ph.PostId = rap.Id
+  LEFT JOIN PostHistoryTypes ht ON ht.Id = ph.PostHistoryTypeId
+  LEFT JOIN Votes v ON v.PostId = rap.Id AND v.VoteTypeId = 8 -- BountyStart as example
+  LEFT JOIN (SELECT Distinct p.Id, p.BountyAmount FROM Posts p WHERE p.BountyAmount IS NOT NULL) bl
+           ON bl.Id = rap.Id
+  WHERE rap.Score > 0
+  GROUP BY rap.Id, rap.Title, rap.OwnerUserId, rap.CreationDate, rap.LastActivityDate,
+           rap.ViewCount, rap.Score, rap.Tags, rap.AnswerCount, rap.CommentCount,
+           rap.FavoriteCount, ht.Name, bl.BountyAmount
+)
+SELECT
+  jd.Id AS PostId,
+  jd.Title,
+  jd.OwnerUserId,
+  ju.DisplayName AS OwnerDisplayName,
+  jd.CreationDate,
+  jd.LastActivityDate,
+  jd.ViewCount,
+  jd.Score,
+  jd.Tags,
+  jd.AnswerCount,
+  jd.CommentCount,
+  jd.FavoriteCount,
+  jd.HistoryTypeName,
+  jd.BountyAmount,
+  jd.IsPopular,
+  ue.UserId AS EngagedUserId,
+  ue.DisplayName AS EngagedUserName,
+  ue.Reputation AS EngagedReputation,
+  ue.UpVotesGiven,
+  ue.DownVotesGiven,
+  ue.DaysSinceCreation,
+  ue.ViewsOnQuestions,
+  ue.AvgPostScore,
+  ct.TotalViews AS TagTotalViews,
+  ct.TotalScore AS TagTotalScore,
+  ct.PostCount AS TagPostCount
+FROM JoinedDemo jd
+LEFT JOIN Users ju ON ju.Id = jd.OwnerUserId
+LEFT JOIN UserEngagement ue ON ue.UserId = ju.Id
+LEFT JOIN TopTags ct ON true
+ORDER BY jd.LastActivityDate DESC
+LIMIT 100;

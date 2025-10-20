@@ -1,0 +1,40 @@
+SELECT 
+    U.Id AS UserId,
+    U.DisplayName,
+    U.Reputation,
+    COUNT(DISTINCT P.Id) AS TotalPosts,
+    COUNT(DISTINCT C.Id) AS TotalComments,
+    COUNT(DISTINCT V.Id) FILTER (WHERE V.VoteTypeId = 2) AS TotalUpVotesReceived,
+    COUNT(DISTINCT V.Id) FILTER (WHERE V.VoteTypeId = 3) AS TotalDownVotesReceived,
+    MAX(P.Score) AS HighestPostScore,
+    SUM(P.ViewCount) AS TotalPostViews,
+    AVG(P.AnswerCount) AS AvgAnswersPerPost,
+    -- use a portable approach to get the most frequent tag: aggregate tags per user into rows and pick the tag with max occurrences
+    (SELECT t.tag
+     FROM (
+         SELECT tag, COUNT(*) AS cnt
+         FROM (
+             SELECT unnest(string_to_array(substring(p2.Tags FROM 2 FOR char_length(p2.Tags)-2), '><')) AS tag
+             FROM Posts p2
+             WHERE p2.OwnerUserId = U.Id
+         ) s
+         GROUP BY tag
+     ) t
+     ORDER BY t.cnt DESC, t.tag
+     LIMIT 1
+    ) AS MostUsedTag
+FROM 
+    Users U
+JOIN 
+    Posts P ON U.Id = P.OwnerUserId
+LEFT JOIN 
+    Comments C ON U.Id = C.UserId
+LEFT JOIN 
+    Votes V ON P.Id = V.PostId
+GROUP BY 
+    U.Id, U.DisplayName, U.Reputation
+HAVING 
+    COUNT(DISTINCT P.Id) > 10
+ORDER BY 
+    TotalPosts DESC, TotalComments DESC, U.Reputation DESC
+LIMIT 50;

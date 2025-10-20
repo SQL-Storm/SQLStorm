@@ -1,0 +1,102 @@
+WITH TopQuestionUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        AVG(p.Score) AS AvgQuestionScore,
+        SUM(p.ViewCount) AS TotalViews
+    FROM Users u
+    INNER JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= DATE '2020-01-01'
+        AND p.Score > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT p.Id) >= 5
+),
+AnswerEngagement AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.OwnerUserId AS QuestionOwnerId,
+        COUNT(DISTINCT a.Id) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.CreationDate) AS LastAnswerDate
+    FROM Posts q
+    LEFT JOIN Posts a ON q.Id = a.ParentId AND a.PostTypeId = 2
+    LEFT JOIN Comments c ON q.Id = c.PostId
+    LEFT JOIN Votes v ON q.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    WHERE q.PostTypeId = 1
+        AND q.CreationDate >= DATE '2019-01-01'
+    GROUP BY q.Id, q.OwnerUserId
+),
+TagPerformance AS (
+    SELECT 
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        AVG(p.Score) AS AvgScore,
+        AVG(p.ViewCount) AS AvgViews,
+        COUNT(DISTINCT b.UserId) AS ExpertCount
+    FROM Tags t
+    INNER JOIN Posts p ON POSITION('<' || t.TagName || '>' IN p.Tags) > 0
+    LEFT JOIN Badges b ON b.Name = t.TagName AND b.TagBased = TRUE
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= DATE '2018-01-01'
+    GROUP BY t.Id, t.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 100
+),
+UserEditActivity AS (
+    SELECT 
+        ph.UserId,
+        COUNT(DISTINCT ph.PostId) AS EditedPosts,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 5 THEN 1 END) AS BodyEdits,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 4 THEN 1 END) AS TitleEdits,
+        AVG(EXTRACT(EPOCH FROM (ph.CreationDate - p.CreationDate)) / 86400.0) AS AvgDaysToEdit
+    FROM PostHistory ph
+    INNER JOIN Posts p ON ph.PostId = p.Id
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+        AND ph.UserId IS NOT NULL
+        AND ph.CreationDate >= DATE '2020-01-01'
+    GROUP BY ph.UserId
+)
+SELECT 
+    tqu.DisplayName,
+    tqu.Reputation,
+    tqu.QuestionCount,
+    ROUND(CAST(tqu.AvgQuestionScore AS NUMERIC), 2) AS AvgQuestionScore,
+    tqu.TotalViews,
+    ROUND(CAST(AVG(ae.AnswerCount) AS NUMERIC), 2) AS AvgAnswersPerQuestion,
+    ROUND(CAST(AVG(ae.CommentCount) AS NUMERIC), 2) AS AvgCommentsPerQuestion,
+    ROUND(CAST(AVG(ae.VoteCount) AS NUMERIC), 2) AS AvgVotesPerQuestion,
+    COUNT(DISTINCT b.Id) AS TotalBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+    COALESCE(uea.EditedPosts, 0) AS EditedPosts,
+    COALESCE(uea.BodyEdits, 0) AS BodyEdits,
+    STRING_AGG(DISTINCT tp.TagName, ', ') FILTER (WHERE tp.PostCount IS NOT NULL) AS TopTags,
+    ROUND(CAST(AVG(tp.AvgScore) AS NUMERIC), 2) AS AvgTagScore,
+    ROUND(CAST(AVG(EXTRACT(EPOCH FROM (ae.LastAnswerDate - p.CreationDate)) / 3600.0) AS NUMERIC), 2) AS AvgHoursToLastAnswer,
+    tqu.Id
+FROM TopQuestionUsers tqu
+INNER JOIN Posts p ON tqu.Id = p.OwnerUserId AND p.PostTypeId = 1
+INNER JOIN AnswerEngagement ae ON p.Id = ae.QuestionId
+LEFT JOIN Badges b ON tqu.Id = b.UserId
+LEFT JOIN UserEditActivity uea ON tqu.Id = uea.UserId
+LEFT JOIN TagPerformance tp ON POSITION('<' || tp.TagName || '>' IN p.Tags) > 0
+WHERE ae.AnswerCount > 0
+GROUP BY 
+    tqu.Id,
+    tqu.DisplayName,
+    tqu.Reputation,
+    tqu.QuestionCount,
+    tqu.AvgQuestionScore,
+    tqu.TotalViews,
+    uea.EditedPosts,
+    uea.BodyEdits
+HAVING COUNT(DISTINCT p.Id) >= 3
+    AND AVG(ae.AnswerCount) >= 2
+ORDER BY 
+    tqu.Reputation DESC,
+    AVG(ae.VoteCount) DESC
+LIMIT 100;

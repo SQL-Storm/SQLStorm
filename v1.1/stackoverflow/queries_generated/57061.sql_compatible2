@@ -1,0 +1,181 @@
+WITH RECURSIVE RecursivePostHierarchy AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.ParentId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.LastEditorUserId,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Body,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ContentLicense,
+        u.Reputation AS OwnerReputation,
+        u.DisplayName AS OwnerDisplayName,
+        u.Views AS OwnerViews,
+        u.UpVotes AS OwnerUpVotes,
+        u.DownVotes AS OwnerDownVotes,
+        1 AS Level
+    FROM
+        Posts p
+    JOIN
+        Users u ON p.OwnerUserId = u.Id
+    WHERE
+        p.ParentId IS NULL
+    UNION ALL
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.LastEditorUserId,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Body,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ContentLicense,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        rph.Level + 1
+    FROM
+        Posts p
+    JOIN
+        Users u ON p.OwnerUserId = u.Id
+    JOIN
+        RecursivePostHierarchy rph ON p.ParentId = rph.PostId
+),
+TaggedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.LastEditorUserId,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Body,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        t.TagName,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes
+    FROM
+        Posts p
+    JOIN
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN
+        Tags t ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE
+        p.PostTypeId = 1
+        OR p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.LastAccessDate,
+        COUNT(p.Id) AS PostCount,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(v.Id) AS VoteCount,
+        COALESCE(SUM(p.Score),0) AS TotalScore
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    GROUP BY
+        u.Id, u.Reputation, u.DisplayName, u.LastAccessDate
+),
+TagStatistics AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(p.Score) AS TotalScore,
+        SUM(p.ViewCount) AS TotalViews,
+        SUM(p.AnswerCount) AS TotalAnswers,
+        SUM(p.CommentCount) AS TotalComments,
+        SUM(p.FavoriteCount) AS TotalFavorites
+    FROM
+        Tags t
+    JOIN
+        Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE
+        p.PostTypeId = 1
+    GROUP BY
+        t.TagName
+)
+SELECT
+    rph.PostId,
+    rph.PostTypeId,
+    rph.CreationDate,
+    rph.Score,
+    rph.ViewCount,
+    rph.OwnerUserId,
+    rph.LastEditorUserId,
+    rph.LastEditDate,
+    rph.LastActivityDate,
+    rph.Title,
+    rph.Body,
+    rph.Tags,
+    rph.AnswerCount,
+    rph.CommentCount,
+    rph.FavoriteCount,
+    rph.OwnerReputation,
+    rph.OwnerDisplayName,
+    rph.OwnerViews,
+    rph.OwnerUpVotes,
+    rph.OwnerDownVotes,
+    rph.Level,
+    tp.TagName,
+    ua.UserId,
+    CASE WHEN ua.PostCount > 10 THEN ua.UserId ELSE tp.CommentCount END AS Useractivity_vs_TagUsage,
+    ua.PostCount,
+    ua.CommentCount,
+    ua.VoteCount,
+    ua.TotalScore,
+    ts.TagName AS ParentTagName,
+    ts.TotalPosts,
+    ts.TotalScore AS ParentTagTotalScore,
+    ts.TotalViews AS ParentTagTotalViews,
+    ts.TotalAnswers AS ParentTagTotalAnswers,
+    ts.TotalComments AS ParentTagTotalComments,
+    ts.TotalFavorites AS ParentTagTotalFavorites
+FROM
+    RecursivePostHierarchy rph
+LEFT JOIN
+    TaggedPosts tp ON rph.PostId = tp.PostId
+LEFT JOIN
+    UserActivity ua ON rph.OwnerUserId = ua.UserId
+LEFT JOIN
+    TagStatistics ts ON tp.TagName = ts.TagName
+ORDER BY
+    rph.CreationDate DESC
+LIMIT 1000;

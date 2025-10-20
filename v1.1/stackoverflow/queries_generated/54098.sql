@@ -1,0 +1,58 @@
+-- {"query": "54098.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2048, "output_tokens": 2306} 
+
+WITH UserMetrics AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           COALESCE(qcnt.qcnt,0)               AS QuestionCount,
+           COALESCE(acnt.acnt,0)               AS AnswerCount,
+           COALESCE(vscore.avg_score,0)        AS AvgVoteScore,
+           COALESCE(cmt.cmtcnt,0)              AS CommentCount,
+           COALESCE(gold.badges_cnt,0)         AS GoldBadgeCount
+    FROM Users u
+    LEFT JOIN (
+        SELECT OwnerUserId, COUNT(*) AS qcnt
+        FROM Posts
+        WHERE PostTypeId = 1
+        GROUP BY OwnerUserId
+    ) qcnt ON qcnt.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT OwnerUserId, COUNT(*) AS acnt
+        FROM Posts
+        WHERE PostTypeId = 2
+        GROUP BY OwnerUserId
+    ) acnt ON acnt.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT p.OwnerUserId, AVG(v.Score) AS avg_score
+        FROM Posts p
+        JOIN Votes v ON v.PostId = p.Id
+        WHERE p.OwnerUserId IS NOT NULL
+        GROUP BY p.OwnerUserId
+    ) vscore ON vscore.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT UserId, COUNT(*) AS cmtcnt
+        FROM Comments
+        GROUP BY UserId
+    ) cmt ON cmt.UserId = u.Id
+    LEFT JOIN (
+        SELECT UserId, COUNT(*) AS badges_cnt
+        FROM Badges
+        WHERE Class = 1
+        GROUP BY UserId
+    ) gold ON gold.UserId = u.Id
+    WHERE u.Reputation >= 20000
+)
+SELECT
+    um.Id           AS UserId,
+    um.DisplayName,
+    um.Reputation,
+    um.QuestionCount,
+    um.AnswerCount,
+    um.AvgVoteScore,
+    um.CommentCount,
+    um.GoldBadgeCount,
+    ROW_NUMBER() OVER (PARTITION BY um.Reputation ORDER BY um.AnswerCount DESC) AS RankWithinRep
+FROM UserMetrics um
+ORDER BY um.Reputation DESC
+       , um.AnswerCount DESC
+LIMIT 100;

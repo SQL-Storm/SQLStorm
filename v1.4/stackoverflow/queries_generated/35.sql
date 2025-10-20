@@ -1,0 +1,151 @@
+-- {"query": "35.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1195} 
+WITH
+RecentActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.Body,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.LastEditorDisplayName,
+    p.LastEditDate,
+    p.OwnerDisplayName,
+    p.ContentLicense,
+    COALESCE(vt.Name, 'NULL_VOTE') AS VoteTypeName
+  FROM Posts p
+  LEFT JOIN Votes v
+    ON p.Id = v.PostId
+  LEFT JOIN VoteTypes vt
+    ON v.VoteTypeId = vt.Id
+  WHERE
+    p.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+),
+TagHash AS (
+  SELECT
+    rp.PostId,
+    rp.RelatedPostId,
+    rt.Name AS LinkTypeName,
+    rp.CreationDate AS LinkCreationDate
+  FROM PostLinks rp
+  LEFT JOIN LinkTypes rt ON rp.LinkTypeId = rt.Id
+  WHERE rp.LinkTypeId IN (1,3)
+),
+TagStats AS (
+  SELECT
+    t.TagName,
+    t.Id AS TagId,
+    t.Count AS TagCount,
+    t.IsModeratorOnly,
+    t.IsRequired,
+    MAX(p.LastActivityDate) AS LastActive
+  FROM Tags t
+  LEFT JOIN Posts p ON t.WikiPostId = p.Id OR t.Id = p.OwnerUserId
+  GROUP BY t.TagName, t.Id, t.Count, t.IsModeratorOnly, t.IsRequired
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    COUNT(DISTINCT CASE WHEN p.Id IS NOT NULL THEN p.Id END) AS PostsCreated,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesGiven,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesGiven
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+),
+ComplexExpression AS (
+  SELECT
+    rp.PostId,
+    rp.RelatedPostId,
+    rp.CreationDate,
+    CASE
+      WHEN p.Score IS NULL THEN 0
+      ELSE p.Score
+    END AS PostScore,
+    CASE
+      WHEN p.ViewCount IS NULL THEN 0
+      ELSE p.ViewCount
+    END AS Views,
+    CASE
+      WHEN p.TagCount IS NULL THEN 0
+      ELSE p.TagCount
+    END AS TagCount
+  FROM PostLinks rp
+  LEFT JOIN Posts p ON rp.PostId = p.Id
+  WHERE rp.LinkTypeId = 1
+)
+SELECT
+  -- main selection combining multiple advanced constructs
+  ro.Id AS PostId,
+  ro.PostTypeId,
+  ro.Title,
+  ro.Tags,
+  ro.CreationDate,
+  ro.LastActivityDate,
+  ro.Score,
+  ro.ViewCount,
+  ro.OwnerUserId,
+  ro.OwnerDisplayName,
+  ro.LastEditorDisplayName,
+  ro.LastEditDate,
+  ro.ContentLicense,
+  u.DisplayName AS OwnerDisplayNameAlias,
+  vts.Name AS LastVoteType,
+  ca.LastActive AS OwnerLastActiveTag,
+  array_agg(DISTINCT tl.Name) FILTER (WHERE tl.Name IS NOT NULL) AS LinkedTagNames,
+  array_agg(DISTINCT uat.UserId) AS ActiveUserIds
+FROM (
+  SELECT
+    p.Id AS Id,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.OwnerDisplayName,
+    p.LastEditorDisplayName,
+    p.LastEditDate,
+    p.ContentLicense
+  FROM Posts p
+  WHERE p.CreationDate >= CURRENT_DATE - INTERVAL '90 days'
+) ro
+LEFT JOIN Users u ON ro.OwnerUserId = u.Id
+LEFT JOIN Votes v ON ro.Id = v.PostId
+LEFT JOIN VoteTypes vts ON v.VoteTypeId = vts.Id
+LEFT JOIN (
+  SELECT DISTINCT PostId, UserId, p.LastActivityDate
+  FROM Posts p
+  LEFT JOIN Votes q ON p.Id = q.PostId
+) ca ON ro.Id = ca.PostId
+LEFT JOIN PostLinks pl ON ro.Id = pl.PostId
+LEFT JOIN Tags t ON t.WikiPostId = ro.Id OR t.ExcerptPostId = ro.Id
+LEFT JOIN (
+  SELECT PostId, RelatedPostId
+  FROM PostLinks
+  WHERE LinkTypeId = 1
+) tl ON ro.Id = tl.PostId
+GROUP BY
+  ro.Id, ro.PostTypeId, ro.Title, ro.Tags, ro.CreationDate, ro.LastActivityDate,
+  ro.Score, ro.ViewCount, ro.OwnerUserId, ro.OwnerDisplayName, ro.LastEditorDisplayName,
+  ro.LastEditDate, ro.ContentLicense, u.DisplayName, vts.Name, ca.LastActive
+ORDER BY ro.LastActivityDate DESC, ro.Score DESC
+LIMIT 200;

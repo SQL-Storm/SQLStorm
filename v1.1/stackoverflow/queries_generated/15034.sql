@@ -1,4 +1,4 @@
--- {"query": "15034.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-3.5-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 81725, "output_tokens": 24478} 
+-- {"query": "15034.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3.5-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 81725, "output_tokens": 24478} 
 WITH PostRanks AS (
     SELECT 
         p.Id, 

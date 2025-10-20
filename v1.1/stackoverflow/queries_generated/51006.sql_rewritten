@@ -1,0 +1,124 @@
+-- {"query": "51006.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2129, "output_tokens": 1331} 
+WITH top_users AS (
+    SELECT u.Id, u.Reputation, COUNT(DISTINCT b.Id) as badge_count
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.Reputation
+    HAVING COUNT(DISTINCT b.Id) >= 5
+    ORDER BY u.Reputation DESC
+    LIMIT 100
+),
+active_posts AS (
+    SELECT p.Id, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount,
+           p.OwnerUserId, p.Tags,
+           ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+      AND p.CreationDate > cast('2024-10-01' as date) - INTERVAL '1 year'
+      AND p.Score > 0
+      AND p.ViewCount > 100
+),
+user_posts AS (
+    SELECT ap.*, tu.Reputation as user_rep, tu.badge_count
+    FROM active_posts ap
+    JOIN top_users tu ON ap.OwnerUserId = tu.Id
+    WHERE ap.rn <= 10  -- Top 10 recent posts per user
+),
+tag_stats AS (
+    SELECT t.TagName, COUNT(up.Id) as post_count,
+           AVG(up.Score) as avg_score,
+           SUM(up.ViewCount) as total_views,
+           MAX(up.CreationDate) as last_used
+    FROM user_posts up
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(up.Tags, 2, length(up.Tags)-2), '><')) as tag
+    ) tags(tag)
+    JOIN Tags t ON t.TagName = tags.tag
+    GROUP BY t.TagName
+    HAVING COUNT(up.Id) >= 3
+),
+vote_patterns AS (
+    SELECT v.PostId,
+           COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) as upvotes,
+           COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) as downvotes,
+           COUNT(CASE WHEN v.VoteTypeId = 5 THEN 1 END) as favorites,
+           AVG(v.BountyAmount) as avg_bounty
+    FROM Votes v
+    JOIN user_posts up ON v.PostId = up.Id
+    WHERE v.VoteTypeId IN (2, 3, 5, 8, 9)
+    GROUP BY v.PostId
+),
+history_engagement AS (
+    SELECT ph.PostId,
+           COUNT(DISTINCT ph.UserId) as distinct_editors,
+           COUNT(CASE WHEN ph.PostHistoryTypeId IN (5, 8) THEN 1 END) as body_edits,
+           COUNT(CASE WHEN ph.PostHistoryTypeId IN (10, 11) THEN 1 END) as close_reopen_events
+    FROM PostHistory ph
+    JOIN user_posts up ON ph.PostId = up.Id
+    WHERE ph.PostHistoryTypeId IN (1,2,3,4,5,6,7,8,9,10,11)
+    GROUP BY ph.PostId
+),
+linked_content AS (
+    SELECT pl.PostId,
+           COUNT(DISTINCT pl.RelatedPostId) as outbound_links,
+           COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId END) as duplicate_links
+    FROM PostLinks pl
+    JOIN user_posts up ON pl.PostId = up.Id
+    WHERE pl.LinkTypeId IN (1, 3)
+    GROUP BY pl.PostId
+)
+SELECT 
+    up.Id as post_id,
+    up.Title,
+    up.CreationDate as post_date,
+    up.Score as post_score,
+    up.ViewCount,
+    up.AnswerCount,
+    up.CommentCount,
+    up.user_rep as owner_reputation,
+    up.badge_count as owner_badges,
+    ts.TagName as primary_tag,
+    ts.post_count as tag_popularity,
+    ts.avg_score as tag_avg_score,
+    COALESCE(vp.upvotes, 0) as upvotes,
+    COALESCE(vp.downvotes, 0) as downvotes,
+    COALESCE(vp.favorites, 0) as favorites,
+    COALESCE(vp.avg_bounty, 0) as avg_bounty,
+    COALESCE(he.distinct_editors, 0) as distinct_editors,
+    COALESCE(he.body_edits, 0) as body_edits,
+    COALESCE(he.close_reopen_events, 0) as close_reopen_events,
+    COALESCE(lc.outbound_links, 0) as outbound_links,
+    COALESCE(lc.duplicate_links, 0) as duplicate_links,
+    -- Derived engagement metrics
+    (up.Score * up.ViewCount) as engagement_score,
+    (COALESCE(vp.upvotes, 0) - COALESCE(vp.downvotes, 0)) as net_votes,
+    -- Time-based ranking
+    EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - up.CreationDate))/86400 as days_since_creation,
+    -- Complex tag-based scoring
+    CASE 
+        WHEN ts.post_count > 50 THEN 'High'
+        WHEN ts.post_count > 10 THEN 'Medium' 
+        ELSE 'Low'
+    END as tag_engagement_level
+FROM user_posts up
+LEFT JOIN vote_patterns vp ON up.Id = vp.PostId
+LEFT JOIN history_engagement he ON up.Id = he.PostId
+LEFT JOIN linked_content lc ON up.Id = lc.PostId
+LEFT JOIN (
+    SELECT up2.Id, 
+           (SELECT t.TagName 
+            FROM Tags t 
+            JOIN LATERAL (
+                SELECT unnest(string_to_array(substring(up2.Tags, 2, length(up2.Tags)-2), '><')) as tag
+            ) tags(tag) ON t.TagName = tags.tag 
+            ORDER BY t.Count DESC 
+            LIMIT 1) as TagName
+    FROM user_posts up2
+) tag_mapping ON up.Id = tag_mapping.Id
+LEFT JOIN tag_stats ts ON tag_mapping.TagName = ts.TagName
+WHERE up.user_rep > 5000  -- Focus on highly reputable users
+  AND up.ViewCount > 1000  -- High visibility posts
+  AND up.days_since_creation < 180  -- Recent activity
+ORDER BY engagement_score DESC, up.user_rep DESC
+LIMIT 50;

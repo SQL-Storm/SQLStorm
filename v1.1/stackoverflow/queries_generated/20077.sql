@@ -1,4 +1,4 @@
--- {"query": "20077.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1387} 
+-- {"query": "20077.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1387} 
 
 WITH UserMetrics AS (
     -- Calculate aggregated metrics for each user: post counts, badge counts, etc.

@@ -1,0 +1,45 @@
+WITH tag_stats AS (
+    SELECT
+        t.TagName,
+        p.OwnerUserId,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS answer_posts,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS question_posts,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS favorites,
+        COUNT(DISTINCT ph.PostId) FILTER (WHERE ph.PostHistoryTypeId = 10) AS closed_issues,
+        COUNT(DISTINCT l.RelatedPostId) FILTER (WHERE l.LinkTypeId = 3) AS duplicates,
+        RANK() OVER (PARTITION BY t.TagName ORDER BY COUNT(*) DESC) AS rnk
+    FROM Posts p
+    CROSS JOIN LATERAL (
+      -- normalize tag string like '<tag1><tag2>' to rows of tags
+      SELECT tag_value AS tag
+      FROM UNNEST(
+        regexp_split_to_array(
+          regexp_replace(p.Tags, '^<|>$', '', 'g'),
+          '><'
+        )
+      ) AS t2(tag_value)
+    ) AS split
+    JOIN Tags t ON t.TagName = split.tag
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    LEFT JOIN PostLinks l ON l.PostId = p.Id AND l.LinkTypeId = 3
+    WHERE p.CreationDate > DATE '2020-01-01'
+    GROUP BY t.TagName, p.OwnerUserId
+)
+SELECT
+    ts.TagName,
+    u.DisplayName,
+    ts.OwnerUserId,
+    ts.answer_posts,
+    ts.question_posts,
+    ts.upvotes,
+    ts.downvotes,
+    ts.favorites,
+    ts.closed_issues,
+    ts.duplicates
+FROM tag_stats ts
+JOIN Users u ON u.Id = ts.OwnerUserId
+WHERE ts.rnk <= 5
+ORDER BY ts.TagName, ts.rnk;

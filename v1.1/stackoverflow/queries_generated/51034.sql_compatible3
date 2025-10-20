@@ -1,0 +1,99 @@
+WITH active_users AS (
+    SELECT u.id AS user_id,
+           u.reputation,
+           u.creationdate AS creation_date,
+           u.location,
+           u.lastaccessdate
+    FROM users u
+    WHERE u.reputation > 1000
+      AND u.lastaccessdate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+),
+question_stats AS (
+    SELECT 
+        p.owner_user_id,
+        COUNT(*) AS total_questions,
+        AVG(p.score) AS avg_question_score,
+        SUM(p.view_count) AS total_views,
+        COUNT(DISTINCT ph.user_id) AS unique_editors
+    FROM posts p
+    LEFT JOIN post_history ph ON p.id = ph.post_id 
+        AND ph.post_history_type_id IN (4,5,6)
+    WHERE p.post_type_id = 1
+      AND p.creation_date > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years'
+    GROUP BY p.owner_user_id
+    HAVING COUNT(*) >= 5
+),
+answer_stats AS (
+    SELECT 
+        p.owner_user_id,
+        COUNT(*) AS total_answers,
+        AVG(p.score) AS avg_answer_score,
+        COUNT(CASE WHEN v.vote_type_id = 1 THEN 1 END) AS accepted_answers
+    FROM posts p
+    LEFT JOIN votes v ON p.id = v.post_id AND v.vote_type_id = 1
+    WHERE p.post_type_id = 2
+      AND p.creation_date > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years'
+    GROUP BY p.owner_user_id
+    HAVING COUNT(*) >= 3
+),
+badge_stats AS (
+    SELECT 
+        b.user_id,
+        COUNT(CASE WHEN b.class = 1 THEN 1 END) AS gold_badges,
+        COUNT(CASE WHEN b.class = 2 THEN 1 END) AS silver_badges,
+        COUNT(CASE WHEN b.class = 3 THEN 1 END) AS bronze_badges,
+        COUNT(*) AS total_badges
+    FROM badges b
+    WHERE b.date > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3 years'
+    GROUP BY b.user_id
+),
+tag_activity AS (
+    SELECT 
+        p.owner_user_id,
+        STRING_AGG(DISTINCT tag, ',') AS top_tags,
+        COUNT(DISTINCT tag) AS unique_tags_used
+    FROM posts p,
+         LATERAL (
+             SELECT unnest(string_to_array(substring(p.tags FROM 2 FOR char_length(p.tags)-2), '<>')) AS tag
+         ) t
+    WHERE p.post_type_id = 1 
+      AND p.tags IS NOT NULL 
+      AND char_length(p.tags) > 2
+      AND p.creation_date > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '18 months'
+    GROUP BY p.owner_user_id
+)
+SELECT 
+    au.user_id,
+    au.reputation,
+    au.location,
+    COALESCE(qs.total_questions, 0) AS total_questions,
+    COALESCE(qs.avg_question_score, 0) AS avg_question_score,
+    COALESCE(qs.total_views, 0) AS total_question_views,
+    COALESCE(asw.total_answers, 0) AS total_answers,
+    COALESCE(asw.avg_answer_score, 0) AS avg_answer_score,
+    COALESCE(asw.accepted_answers, 0) AS accepted_answers,
+    COALESCE(bs.gold_badges, 0) AS gold_badges,
+    COALESCE(bs.silver_badges, 0) AS silver_badges,
+    COALESCE(bs.bronze_badges, 0) AS bronze_badges,
+    COALESCE(ta.unique_tags_used, 0) AS unique_tags_used,
+    ROUND(
+        (COALESCE(qs.total_questions, 0) * 2.0 + 
+         COALESCE(asw.total_answers, 0) * 1.5 + 
+         COALESCE(bs.total_badges, 0) * 0.5) / 
+        GREATEST(1, EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - au.creation_date))/86400.0 / 30.0), 2
+    ) AS monthly_activity_score,
+    CASE 
+        WHEN COALESCE(qs.avg_question_score, 0) > 5 AND COALESCE(asw.avg_answer_score, 0) > 3 
+        THEN 'Power Contributor'
+        WHEN COALESCE(ta.unique_tags_used, 0) > 10 THEN 'Tag Specialist'
+        WHEN COALESCE(bs.gold_badges, 0) > 0 THEN 'Elite Earner'
+        ELSE 'Active Member'
+    END AS contributor_tier
+FROM active_users au
+LEFT JOIN question_stats qs ON au.user_id = qs.owner_user_id
+LEFT JOIN answer_stats asw ON au.user_id = asw.owner_user_id
+LEFT JOIN badge_stats bs ON au.user_id = bs.user_id
+LEFT JOIN tag_activity ta ON au.user_id = ta.owner_user_id
+WHERE au.reputation > 5000
+ORDER BY monthly_activity_score DESC, au.reputation DESC
+LIMIT 1000;

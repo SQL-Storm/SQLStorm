@@ -1,0 +1,77 @@
+SELECT
+      q.Id                      AS QuestionId,
+      q.Title                   AS QuestionTitle,
+      q.Score                   AS QuestionScore,
+      q.ViewCount               AS QuestionViews,
+      q.AnswerCount             AS DirectAnswerCount,
+      q.FavoriteCount           AS FavoriteCount,
+      u.Id                      AS UserId,
+      u.Reputation              AS UserReputation,
+      u.Views                   AS UserViews,
+      u.UpVotes                 AS UserUpVotes,
+      u.DownVotes               AS UserDownVotes,
+      COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS QuestionUpVotes,
+      COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS QuestionDownVotes,
+      COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.Id END) AS QuestionFavorites,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1  ELSE 0 END)        AS TotalUpVotes,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END)        AS TotalDownVotes,
+      SUM(CASE WHEN v.VoteTypeId = 5 THEN 1  ELSE 0 END)        AS TotalFavoriteVotes,
+      STRING_AGG(b.Name, ', ' ORDER BY b.Class DESC) AS UserBadges,
+      t.TagName                 AS PopularTag,
+      d.DuplicateCount          AS DuplicateLinks,
+      prev_comments.PrevCommentScore,
+      ans.NumAnswers            AS AnswerCountForAll,
+      ans.TotalScore            AS TotalAnswerScore,
+      pn.NoticeCount            AS PostNoticeCount
+FROM Posts q
+JOIN Users u ON q.OwnerUserId = u.Id
+LEFT JOIN Votes v ON v.PostId = q.Id
+LEFT JOIN Badges b ON b.UserId = u.Id
+LEFT JOIN LATERAL (
+    SELECT split_part(substring(q.Tags FROM 2 FOR length(q.Tags)-2), '><', 1) AS TagName
+) t ON true
+LEFT JOIN LATERAL (
+    SELECT COUNT(*) AS DuplicateCount
+    FROM PostLinks pl
+    WHERE pl.PostId = q.Id AND pl.LinkTypeId = 3
+) d ON true
+LEFT JOIN LATERAL (
+    SELECT COUNT(*) AS NumAnswers,
+           SUM(a.Score) AS TotalScore
+    FROM Posts a
+    WHERE a.ParentId = q.Id AND a.PostTypeId = 2
+) ans ON true
+LEFT JOIN LATERAL (
+    SELECT COUNT(*) AS NoticeCount
+    FROM PostLinks pl
+    WHERE pl.PostId = q.Id
+) pn ON true
+LEFT JOIN (
+    SELECT c_inner.PostId,
+           LAG(c_inner.Score) OVER (PARTITION BY c_inner.PostId ORDER BY c_inner.CreationDate) AS PrevCommentScore
+    FROM Comments c_inner
+) prev_comments ON prev_comments.PostId = q.Id
+WHERE q.PostTypeId = 1
+  AND q.CreationDate >= DATE '2024-01-01'
+  AND u.Reputation > 100
+GROUP BY q.Id,
+         q.Title,
+         q.Score,
+         q.ViewCount,
+         q.AnswerCount,
+         q.FavoriteCount,
+         u.Id,
+         u.Reputation,
+         u.Views,
+         u.UpVotes,
+         u.DownVotes,
+         t.TagName,
+         d.DuplicateCount,
+         ans.NumAnswers,
+         ans.TotalScore,
+         pn.NoticeCount,
+         prev_comments.PrevCommentScore
+ORDER BY q.Score DESC,
+         ans.NumAnswers DESC,
+         q.ViewCount DESC
+LIMIT 100;

@@ -1,0 +1,90 @@
+-- {"query": "54081.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2048, "output_tokens": 1879} 
+
+WITH PostVotes AS (
+  SELECT
+      p.OwnerUserId,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)      AS UpVotes,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)      AS DownVotes,
+      SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END)      AS AcceptActs,
+      COUNT(*)                                              AS VoteCnt
+  FROM Posts p
+  JOIN Votes v ON v.PostId = p.Id
+  GROUP BY p.OwnerUserId
+),
+PostComments AS (
+  SELECT
+      c.UserId,
+      COUNT(*) AS CommentCnt
+  FROM Comments c
+  GROUP BY c.UserId
+),
+TagUsage AS (
+  SELECT
+      p.OwnerUserId,
+      regexp_split_to_table(substring(p.Tags FROM 2 FOR length(p.Tags)-2), '><') AS Tag,
+      COUNT(*) AS UsageCnt
+  FROM Posts p
+  WHERE p.Tags IS NOT NULL
+  GROUP BY p.OwnerUserId, regexp_split_to_table(substring(p.Tags FROM 2 FOR length(p.Tags)-2), '><')
+),
+TopTagPerUser AS (
+  SELECT
+      tu.OwnerUserId,
+      tu.Tag,
+      tu.UsageCnt
+  FROM (
+      SELECT
+          OwnerUserId,
+          Tag,
+          UsageCnt,
+          ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY UsageCnt DESC, Tag) AS rn
+      FROM TagUsage
+  ) tu
+  WHERE tu.rn = 1
+),
+BadgeSummary AS (
+  SELECT
+      b.UserId,
+      COUNT(*) FILTER (WHERE b.Class = 1) AS Gold,
+      COUNT(*) FILTER (WHERE b.Class = 2) AS Silver,
+      COUNT(*) FILTER (WHERE b.Class = 3) AS Bronze,
+      COUNT(*)                                        AS TotalBadges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+PosterStats AS (
+  SELECT
+      u.Id               AS UserId,
+      u.Reputation,
+      u.DisplayName,
+      u.CreationDate,
+      COALESCE(pv.UpVotes,       0)  AS UpVotes,
+      COALESCE(pv.DownVotes,     0)  AS DownVotes,
+      COALESCE(pv.AcceptActs,    0)  AS AcceptActs,
+      COALESCE(pv.VoteCnt,       0)  AS TotalVotes,
+      COALESCE(pc.CommentCnt,    0)  AS TotalComments,
+      COALESCE(bs.Gold,          0)  AS GoldBadges,
+      COALESCE(bs.Silver,        0)  AS SilverBadges,
+      COALESCE(bs.Bronze,        0)  AS BronzeBadges,
+      COALESCE(bs.TotalBadges,   0)  AS TotalBadges,
+      COALESCE(tt.Tag,           NULL) AS TopTag,
+      COALESCE(tt.UsageCnt,      0)  AS TopTagUsage
+  FROM Users u
+  LEFT JOIN PostVotes pv ON pv.OwnerUserId = u.Id
+  LEFT JOIN PostComments pc ON pc.UserId = u.Id
+  LEFT JOIN BadgeSummary bs ON bs.UserId = u.Id
+  LEFT JOIN TopTagPerUser tt ON tt.OwnerUserId = u.Id
+),
+RankedUsers AS (
+  SELECT
+      ps.*,
+      RANK() OVER (ORDER BY Reputation DESC)      AS RepRank,
+      DENSE_RANK() OVER (ORDER BY Reputation DESC) AS RepDenseRank,
+      NTILE(10) OVER (ORDER BY Reputation DESC)    AS RepPercentile
+  FROM PosterStats ps
+)
+SELECT *
+FROM RankedUsers
+WHERE RepRank <= 200
+ORDER BY RepRank, TotalVotes DESC, TotalComments DESC
+LIMIT 5000;

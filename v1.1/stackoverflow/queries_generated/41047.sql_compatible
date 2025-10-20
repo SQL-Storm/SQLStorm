@@ -1,0 +1,37 @@
+SELECT 
+    p.Id AS PostId,
+    p.Title AS PostTitle,
+    p.CreationDate AS PostCreationDate,
+    p.Score AS PostScore,
+    p.ViewCount AS PostViewCount,
+    p.Body AS PostBody,
+    u.DisplayName AS PostOwnerDisplayName,
+    u.Reputation AS PostOwnerReputation,
+    COUNT(DISTINCT v.Id) AS PostVoteCount,
+    COUNT(DISTINCT c.Id) AS PostCommentCount,
+    COUNT(DISTINCT ph.Id) AS PostHistoryCount,
+    COUNT(DISTINCT pl.Id) AS PostLinkCount,
+    COALESCE(t.TagCount, 0) AS PostTagCount
+FROM 
+    Posts p
+JOIN 
+    Users u ON p.OwnerUserId = u.Id
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    Comments c ON p.Id = c.PostId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN 
+    (
+      SELECT PostId AS PostId, COUNT(DISTINCT Id) AS TagCount
+      FROM Tags
+      GROUP BY PostId
+    ) t ON p.Id = t.PostId
+GROUP BY 
+    p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.Body, u.DisplayName, u.Reputation, t.TagCount
+ORDER BY 
+    p.CreationDate DESC, p.Score DESC
+LIMIT 100;

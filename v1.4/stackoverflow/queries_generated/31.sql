@@ -1,0 +1,97 @@
+-- {"query": "31.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 806} 
+WITH top_users AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(p.Id) AS PostCount,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS TotalQuestionViews,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+    MAX(p.CreationDate) AS LastPostDate
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+recent_activity AS (
+  SELECT
+    u.Id AS UserId,
+    MAX(v.CreationDate) AS LastVoteDate,
+    SUM(CASE WHEN v.VoteTypeId IN (2,6,10,11) THEN 1 ELSE 0 END) AS NegativeVotesCast,
+    SUM(CASE WHEN v.VoteTypeId IN (2,6,8,9,14,15,16) THEN 1 ELSE 0 END) AS SpecialVotes
+  FROM Users u
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  GROUP BY u.Id
+),
+tag_topics AS (
+  SELECT
+    t.WikiPostId,
+    t.Count AS TagCount,
+    t.IsModeratorOnly
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0
+),
+complex_post_metrics AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.LastActivityDate,
+    p.Title,
+    p.Tags,
+    pc.TagCount,
+    pc.IsModeratorOnly,
+    COALESCE(vs.UpModCount, 0) AS UpModCount
+  FROM Posts p
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS UpModCount
+    FROM Votes
+    WHERE VoteTypeId = 2
+    GROUP BY PostId
+  ) vs ON vs.PostId = p.Id
+  LEFT JOIN tag_topics pc ON pc.WikiPostId = p.Id
+  WHERE p.PostTypeId IN (1,2)
+)
+SELECT
+  -- Distinctly identify complex interactions for benchmarking
+  u.UserId,
+  u.DisplayName,
+  u.Reputation,
+  t.PostCount,
+  t.TotalQuestionViews,
+  t.TotalAnswerScore,
+  r.LastVoteDate,
+  r.NegativeVotesCast,
+  r.SpecialVotes,
+  p.PostId,
+  p.PostTypeId,
+  p.Score,
+  p.ViewCount,
+  p.ParentId,
+  p.AcceptedAnswerId,
+  p.LastActivityDate,
+  p.Title,
+  p.Tags,
+  p.TagCount,
+  p.IsModeratorOnly,
+  p.UpModCount,
+  -- Complex derived metrics
+  (p.Score * 1.0) / NULLIF(p.ViewCount,0) AS ScorePerView,
+  (p.LastActivityDate - p.CreationDate) AS ActivitySpan,
+  CASE
+    WHEN p.PostTypeId = 1 THEN 'Question'
+    WHEN p.PostTypeId = 2 THEN 'Answer'
+    ELSE 'Other'
+  END AS PostKind,
+  -- Null-safe string expression and concatenation
+  CONCAT_WS(' | ', p.Title, COALESCE(p.Tags, 'NoTags')) AS TitleWithTags,
+  -- Correlated subquery: count of comments per post
+  (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.PostId) AS CommentCount
+FROM top_users u
+LEFT JOIN recent_activity r ON r.UserId = u.UserId
+LEFT JOIN complex_post_metrics p ON p.OwnerUserId = u.UserId
+ORDER BY u.Reputation DESC, u.Id
+LIMIT 100;

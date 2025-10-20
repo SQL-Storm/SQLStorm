@@ -1,0 +1,68 @@
+WITH top_users AS (
+    SELECT u.Id, u.DisplayName, COUNT(p.Id) AS post_count
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName
+    ORDER BY post_count DESC
+    LIMIT 10
+),
+top_tags AS (
+    SELECT t.TagName, COUNT(p.Id) AS post_count
+    FROM Tags t
+    JOIN Posts p ON t.TagName = ANY(
+        -- normalize p.Tags like '<tag1><tag2>' into array ['tag1','tag2']
+        -- remove leading/trailing angle brackets and split by '><'
+        regexp_split_to_array(
+            trim(BOTH '<>' FROM p.Tags),
+            '><'
+        )
+    )
+    GROUP BY t.TagName
+    ORDER BY post_count DESC
+    LIMIT 10
+),
+post_votes AS (
+    SELECT p.Id, COUNT(v.Id) AS vote_count
+    FROM Posts p
+    JOIN Votes v ON p.Id = v.PostId
+    WHERE v.VoteTypeId IN (2, 3)
+    GROUP BY p.Id
+),
+post_comments AS (
+    SELECT p.Id, COUNT(c.Id) AS comment_count
+    FROM Posts p
+    JOIN Comments c ON p.Id = c.PostId
+    GROUP BY p.Id
+)
+SELECT 
+    p.Id, 
+    p.Title, 
+    p.Score, 
+    p.ViewCount, 
+    p.AnswerCount, 
+    pv.vote_count, 
+    pc.comment_count, 
+    tu.DisplayName AS top_user, 
+    tt.TagName AS top_tag
+FROM Posts p
+JOIN post_votes pv ON p.Id = pv.Id
+JOIN post_comments pc ON p.Id = pc.Id
+JOIN top_users tu ON p.OwnerUserId = tu.Id
+JOIN top_tags tt ON tt.TagName = ANY(
+    regexp_split_to_array(
+        trim(BOTH '<>' FROM p.Tags),
+        '><'
+    )
+)
+WHERE p.PostTypeId = 1
+GROUP BY
+    p.Id,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    pv.vote_count,
+    pc.comment_count,
+    tu.DisplayName,
+    tt.TagName
+ORDER BY p.Score DESC, pv.vote_count DESC, pc.comment_count DESC;

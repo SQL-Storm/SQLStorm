@@ -1,0 +1,137 @@
+-- {"query": "49025.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 2187} 
+
+WITH UserActivitySummary AS (
+    -- Aggregates various activities for each user within the last 3 years
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation AS CurrentReputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate AS UserLastAccessDate,
+        COUNT(DISTINCT P_OwnedQ.Id) AS QuestionsPosted,
+        COUNT(DISTINCT P_OwnedA.Id) AS AnswersPosted,
+        COUNT(DISTINCT C.Id) AS CommentsMade,
+        COUNT(DISTINCT B.Id) AS BadgesEarned,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesGiven,
+        SUM(CASE WHEN P_OwnedQ.Id IS NOT NULL THEN P_OwnedQ.Score ELSE 0 END) AS ScoreFromQuestions,
+        SUM(CASE WHEN P_OwnedA.Id IS NOT NULL THEN P_OwnedA.Score ELSE 0 END) AS ScoreFromAnswers
+    FROM Users AS U
+    LEFT JOIN Posts AS P_OwnedQ ON U.Id = P_OwnedQ.OwnerUserId AND P_OwnedQ.PostTypeId = 1 AND P_OwnedQ.CreationDate >= (NOW() - INTERVAL '3 years')
+    LEFT JOIN Posts AS P_OwnedA ON U.Id = P_OwnedA.OwnerUserId AND P_OwnedA.PostTypeId = 2 AND P_OwnedA.CreationDate >= (NOW() - INTERVAL '3 years')
+    LEFT JOIN Comments AS C ON U.Id = C.UserId AND C.CreationDate >= (NOW() - INTERVAL '3 years')
+    LEFT JOIN Badges AS B ON U.Id = B.UserId AND B.Date >= (NOW() - INTERVAL '3 years')
+    LEFT JOIN Votes AS V ON U.Id = V.UserId AND V.CreationDate >= (NOW() - INTERVAL '3 years')
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+    HAVING COUNT(DISTINCT P_OwnedQ.Id) + COUNT(DISTINCT P_OwnedA.Id) + COUNT(DISTINCT C.Id) > 5 -- Filter for moderately active users
+),
+UserTagFrequency AS (
+    -- Calculates the frequency of tags used by users in their questions
+    SELECT
+        P.OwnerUserId AS UserId,
+        TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><'))) AS TagName,
+        COUNT(*) AS TagCount
+    FROM Posts AS P
+    WHERE
+        P.PostTypeId = 1 AND P.OwnerUserId IS NOT NULL
+        AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+        AND P.CreationDate >= (NOW() - INTERVAL '3 years')
+    GROUP BY P.OwnerUserId, TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><')))
+),
+RankedUserTags AS (
+    -- Ranks tags by frequency for each user
+    SELECT
+        UserId,
+        TagName,
+        TagCount,
+        ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY TagCount DESC, TagName ASC) AS TagRank
+    FROM UserTagFrequency
+),
+PostScoreHighlights AS (
+    -- Finds the highest scored question and answer for each user
+    SELECT
+        P.OwnerUserId AS UserId,
+        MAX(CASE WHEN P.PostTypeId = 1 THEN P.Score ELSE 0 END) AS MaxQuestionScore,
+        MAX(CASE WHEN P.PostTypeId = 2 THEN P.Score ELSE 0 END) AS MaxAnswerScore,
+        MAX(CASE WHEN P.PostTypeId = 1 THEN P.ViewCount ELSE 0 END) AS MaxQuestionViewCount,
+        MAX(CASE WHEN P.PostTypeId = 1 THEN P.FavoriteCount ELSE 0 END) AS MaxQuestionFavoriteCount
+    FROM Posts AS P
+    WHERE P.OwnerUserId IS NOT NULL AND P.CreationDate >= (NOW() - INTERVAL '3 years')
+    GROUP BY P.OwnerUserId
+),
+PostHistoryTrend AS (
+    -- Analyzes post history changes over time for posts owned by users
+    SELECT
+        PH.UserId,
+        P.PostTypeId,
+        EXTRACT(YEAR FROM PH.CreationDate) AS HistoryYear,
+        COUNT(PH.Id) AS EditsCount,
+        COUNT(DISTINCT PH.PostHistoryTypeId) AS DistinctEditTypes,
+        AVG(LENGTH(PH.Text)) AS AvgTextLengthChange,
+        LAG(COUNT(PH.Id), 1, 0) OVER (PARTITION BY PH.UserId, P.PostTypeId ORDER BY EXTRACT(YEAR FROM PH.CreationDate)) AS PreviousYearEdits
+    FROM PostHistory AS PH
+    JOIN Posts AS P ON PH.PostId = P.Id
+    WHERE PH.UserId IS NOT NULL AND P.OwnerUserId = PH.UserId AND PH.CreationDate >= (NOW() - INTERVAL '5 years')
+    GROUP BY PH.UserId, P.PostTypeId, EXTRACT(YEAR FROM PH.CreationDate)
+)
+SELECT
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.CurrentReputation,
+    UAS.UserCreationDate,
+    UAS.UserLastAccessDate,
+    UAS.QuestionsPosted,
+    UAS.AnswersPosted,
+    UAS.CommentsMade,
+    UAS.BadgesEarned,
+    UAS.UpvotesGiven,
+    UAS.DownvotesGiven,
+    UAS.ScoreFromQuestions,
+    UAS.ScoreFromAnswers,
+    COALESCE(PSH.MaxQuestionScore, 0) AS TopQuestionScore,
+    COALESCE(PSH.MaxAnswerScore, 0) AS TopAnswerScore,
+    COALESCE(PSH.MaxQuestionViewCount, 0) AS TopQuestionViewCount,
+    COALESCE(PSH.MaxQuestionFavoriteCount, 0) AS TopQuestionFavoriteCount,
+    -- Top 3 most used tags
+    COALESCE(RT1.TagName, 'N/A') AS TopTag1,
+    COALESCE(RT1.TagCount, 0) AS TopTag1Count,
+    COALESCE(RT2.TagName, 'N/A') AS TopTag2,
+    COALESCE(RT2.TagCount, 0) AS TopTag2Count,
+    COALESCE(RT3.TagName, 'N/A') AS TopTag3,
+    COALESCE(RT3.TagCount, 0) AS TopTag3Count,
+    -- Calculate recent post history activity and trends
+    (SELECT SUM(PHT.EditsCount) FROM PostHistoryTrend AS PHT WHERE PHT.UserId = UAS.UserId AND PHT.HistoryYear = EXTRACT(YEAR FROM NOW()) GROUP BY PHT.UserId) AS CurrentYearTotalEdits,
+    (SELECT AVG(PHT.AvgTextLengthChange) FROM PostHistoryTrend AS PHT WHERE PHT.UserId = UAS.UserId AND PHT.PostTypeId = 1 ORDER BY PHT.HistoryYear DESC LIMIT 1) AS LatestQuestionAvgTextChange,
+    (SELECT AVG(PHT.AvgTextLengthChange) FROM PostHistoryTrend AS PHT WHERE PHT.UserId = UAS.UserId AND PHT.PostTypeId = 2 ORDER BY PHT.HistoryYear DESC LIMIT 1) AS LatestAnswerAvgTextChange,
+    -- Identify if the user has questions marked as duplicates
+    (
+        SELECT COUNT(DISTINCT PL.PostId)
+        FROM Posts AS P_Link
+        JOIN PostLinks AS PL ON P_Link.Id = PL.RelatedPostId
+        WHERE P_Link.OwnerUserId = UAS.UserId AND P_Link.PostTypeId = 1 AND PL.LinkTypeId = 3 -- LinkType 3 = Duplicate
+    ) AS QuestionsMarkedAsDuplicates,
+    -- The most recent post edited by the user, if available
+    (
+        SELECT P.Id
+        FROM Posts AS P
+        WHERE P.LastEditorUserId = UAS.UserId
+        ORDER BY P.LastEditDate DESC
+        LIMIT 1
+    ) AS LatestEditedPostBySelfId,
+    -- Number of unique post history types associated with the user's posts
+    (
+        SELECT COUNT(DISTINCT PH.PostHistoryTypeId)
+        FROM PostHistory AS PH
+        JOIN Posts AS P ON PH.PostId = P.Id
+        WHERE P.OwnerUserId = UAS.UserId
+    ) AS UniqueHistoryTypesOnOwnedPosts
+FROM UserActivitySummary AS UAS
+LEFT JOIN PostScoreHighlights AS PSH ON UAS.UserId = PSH.UserId
+LEFT JOIN RankedUserTags AS RT1 ON UAS.UserId = RT1.UserId AND RT1.TagRank = 1
+LEFT JOIN RankedUserTags AS RT2 ON UAS.UserId = RT2.UserId AND RT2.TagRank = 2
+LEFT JOIN RankedUserTags AS RT3 ON UAS.UserId = RT3.UserId AND RT3.TagRank = 3
+WHERE UAS.CurrentReputation >= 1000 -- Focus on more established users
+ORDER BY
+    (UAS.CurrentReputation * 0.4) + (UAS.QuestionsPosted * 0.15) + (UAS.AnswersPosted * 0.2) + (UAS.CommentsMade * 0.05) + (UAS.ScoreFromQuestions * 0.1) + (UAS.ScoreFromAnswers * 0.1) DESC,
+    UAS.UserLastAccessDate DESC
+LIMIT 50;

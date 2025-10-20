@@ -1,0 +1,231 @@
+with recent_users as (
+    select u.id as user_id
+    from Users u
+    where u.CreationDate >= (
+        select date_trunc('month', max(CreationDate)) - interval '12 months' from Users
+    )
+),
+active_questions as (
+    select p.Id as question_id, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId
+    from Posts p
+    where p.PostTypeId = 1
+      and p.CreationDate >= (
+        select date_trunc('month', max(CreationDate)) - interval '24 months' from Posts
+      )
+),
+answers as (
+    select a.Id as answer_id, a.ParentId as question_id, a.OwnerUserId, a.Score as answer_score, a.CreationDate
+    from Posts a
+    where a.PostTypeId = 2
+),
+first_answer as (
+    select a.question_id, min(a.CreationDate) as first_answer_date
+    from answers a
+    group by a.question_id
+),
+comment_stats as (
+    select c.PostId as post_id,
+           count(*) as comment_count,
+           sum(case when c.Score > 0 then 1 else 0 end) as positive_comments,
+           max(c.CreationDate) as last_comment_date
+    from Comments c
+    group by c.PostId
+),
+vote_agg as (
+    select v.PostId,
+           sum(case when v.VoteTypeId = 2 then 1 else 0 end) as upvotes,
+           sum(case when v.VoteTypeId = 3 then 1 else 0 end) as downvotes,
+           sum(case when v.VoteTypeId = 5 then 1 else 0 end) as favorites,
+           sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as bounty_total,
+           min(v.CreationDate) as first_vote_at,
+           max(v.CreationDate) as last_vote_at
+    from Votes v
+    group by v.PostId
+),
+tag_split as (
+    select q.Id as question_id,
+           unnest(string_to_array(substring(q.Tags from 2 for (length(q.Tags)-2)), '><')) as tag
+    from Posts q
+    where q.PostTypeId = 1
+      and q.Tags is not null
+),
+top_tags as (
+    select ts.tag, count(distinct ts.question_id) as tag_q_count
+    from tag_split ts
+    group by ts.tag
+    having count(distinct ts.question_id) >= 50
+),
+dupe_links as (
+    select pl.PostId as duplicate_id, pl.RelatedPostId as original_id
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+),
+closed_reasons as (
+    select ph.PostId,
+           max(case when ph.PostHistoryTypeId = 10 then nullif(ph.Comment,'') end) as last_close_reason_text,
+           max(case when ph.PostHistoryTypeId = 10 and ph.Comment ~ '^[0-9]+$' then cast(ph.Comment as integer) end) as last_close_reason_id,
+           min(case when ph.PostHistoryTypeId = 10 then ph.CreationDate end) as first_closed_at,
+           max(case when ph.PostHistoryTypeId = 11 then ph.CreationDate end) as reopened_at
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10,11)
+    group by ph.PostId
+),
+badge_agg as (
+    select b.UserId,
+           sum(case when b.Class = 1 then 1 else 0 end) as gold,
+           sum(case when b.Class = 2 then 1 else 0 end) as silver,
+           sum(case when b.Class = 3 then 1 else 0 end) as bronze,
+           min(b.Date) as first_badge_at,
+           max(b.Date) as last_badge_at
+    from Badges b
+    group by b.UserId
+),
+owner_activity as (
+    select u.Id as user_id,
+           u.Reputation,
+           u.UpVotes,
+           u.DownVotes,
+           u.Views as profile_views,
+           coalesce(ba.gold,0) as gold_badges,
+           coalesce(ba.silver,0) as silver_badges,
+           coalesce(ba.bronze,0) as bronze_badges
+    from Users u
+    left join badge_agg ba on ba.UserId = u.Id
+),
+question_engagement as (
+    select q.question_id,
+           q.CreationDate,
+           q.Score,
+           q.ViewCount,
+           q.OwnerUserId,
+           coalesce(cs.comment_count, 0) as comment_count,
+           coalesce(cs.positive_comments, 0) as positive_comments,
+           cs.last_comment_date,
+           coalesce(va.upvotes, 0) as upvotes,
+           coalesce(va.downvotes, 0) as downvotes,
+           coalesce(va.favorites, 0) as favorites,
+           coalesce(va.bounty_total, 0) as bounty_total,
+           va.first_vote_at,
+           va.last_vote_at,
+           fa.first_answer_date,
+           cr.last_close_reason_id,
+           cr.first_closed_at,
+           cr.reopened_at
+    from active_questions q
+    left join comment_stats cs on cs.post_id = q.question_id
+    left join vote_agg va on va.PostId = q.question_id
+    left join first_answer fa on fa.question_id = q.question_id
+    left join closed_reasons cr on cr.PostId = q.question_id
+),
+answerer_quality as (
+    select a.question_id,
+           avg(a.answer_score) as avg_answer_score,
+           count(*) as answer_count,
+           count(distinct a.OwnerUserId) as distinct_answerers,
+           sum(case when a.answer_score >= 5 then 1 else 0 end) as high_score_answers
+    from answers a
+    group by a.question_id
+),
+question_tags as (
+    select ts.question_id,
+           array_agg(ts.tag order by ts.tag) as tags,
+           array_agg(ts.tag) filter (where tt.tag is not null) as frequent_tags
+    from tag_split ts
+    left join top_tags tt on tt.tag = ts.tag
+    group by ts.question_id
+),
+owner_rollup as (
+    select qe.question_id,
+           oa.Reputation as owner_rep,
+           oa.UpVotes as owner_upvotes,
+           oa.DownVotes as owner_downvotes,
+           oa.profile_views as owner_profile_views,
+           oa.gold_badges,
+           oa.silver_badges,
+           oa.bronze_badges
+    from question_engagement qe
+    left join owner_activity oa on oa.user_id = qe.OwnerUserId
+),
+time_buckets as (
+    select qe.question_id,
+           date_trunc('month', qe.CreationDate) as month_bucket,
+           case when fa.first_answer_date is not null then extract(epoch from (fa.first_answer_date - qe.CreationDate)) / 3600.0 end as hours_to_first_answer
+    from question_engagement qe
+    left join first_answer fa on fa.question_id = qe.question_id
+),
+dupe_status as (
+    select q.question_id,
+           case when d.duplicate_id is not null then 1 else 0 end as is_duplicate,
+           d.original_id
+    from active_questions q
+    left join dupe_links d on d.duplicate_id = q.question_id
+),
+final as (
+    select
+        qe.question_id,
+        qe.CreationDate as question_created_at,
+        qe.Score as question_score,
+        qe.ViewCount as question_views,
+        qe.comment_count,
+        qe.positive_comments,
+        qe.upvotes,
+        qe.downvotes,
+        qe.favorites,
+        qe.bounty_total,
+        qe.first_vote_at,
+        qe.last_vote_at,
+        qe.first_answer_date,
+        qe.last_comment_date,
+        aq.avg_answer_score,
+        aq.answer_count,
+        aq.distinct_answerers,
+        aq.high_score_answers,
+        dr.is_duplicate,
+        dr.original_id as duplicate_of_question_id,
+        qe.last_close_reason_id,
+        qe.first_closed_at,
+        qe.reopened_at,
+        oru.owner_rep,
+        oru.owner_upvotes,
+        oru.owner_downvotes,
+        oru.owner_profile_views,
+        oru.gold_badges,
+        oru.silver_badges,
+        oru.bronze_badges,
+        qt.tags,
+        qt.frequent_tags,
+        tb.month_bucket,
+        tb.hours_to_first_answer,
+        case
+            when qe.first_answer_date is not null then extract(epoch from (coalesce(qe.first_answer_date, qe.CreationDate) - qe.CreationDate)) / 3600.0
+            else null
+        end as hours_to_first_answer_redundant_for_crosscheck
+    from question_engagement qe
+    left join answerer_quality aq on aq.question_id = qe.question_id
+    left join question_tags qt on qt.question_id = qe.question_id
+    left join owner_rollup oru on oru.question_id = qe.question_id
+    left join time_buckets tb on tb.question_id = qe.question_id
+    left join dupe_status dr on dr.question_id = qe.question_id
+)
+select
+    f.*,
+    rank() over (
+      order by coalesce(f.answer_count,0) desc, coalesce(f.question_views,0) desc, coalesce(f.question_score,0) desc
+    ) as engagement_rank,
+    percent_rank() over (
+      order by coalesce(f.hours_to_first_answer, 1e9)
+    ) as time_to_answer_percentile,
+    dense_rank() over (
+      partition by date_trunc('year', f.question_created_at)
+      order by coalesce(f.question_views,0) desc
+    ) as yearly_popularity_rank
+from final f
+where
+    (f.frequent_tags is not null and cardinality(f.frequent_tags) >= 1)
+    and coalesce(f.answer_count, 0) >= 1
+    and (f.is_duplicate = 0 or f.reopened_at is not null)
+    and f.question_created_at >= (
+        select date_trunc('month', max(CreationDate)) - interval '24 months' from Posts
+    )
+order by engagement_rank
+limit 500;

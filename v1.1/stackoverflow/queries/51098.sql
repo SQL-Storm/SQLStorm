@@ -1,0 +1,143 @@
+WITH top_users AS (
+    SELECT u.Id, u.DisplayName, u.Reputation,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS rank
+    FROM Users u
+    WHERE u.CreationDate >= CAST('2020-01-01' AS TIMESTAMP)
+      AND u.Reputation > 1000
+    -- ORDER BY and LIMIT inside a CTE are not standard for producing a deterministic set for later use;
+    -- keep CTE without ORDER BY/LIMIT here and apply limits in outer query where needed
+),
+user_activity AS (
+    SELECT tu.Id AS user_id,
+           COUNT(DISTINCT p.Id) AS post_count,
+           SUM(p.Score) AS total_score,
+           AVG(p.Score) AS avg_score,
+           COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS answer_count,
+           COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS question_count
+    FROM top_users tu
+    JOIN Posts p ON p.OwnerUserId = tu.Id 
+               OR (p.OwnerUserId IS NULL AND p.OwnerDisplayName = tu.DisplayName)
+    WHERE p.CreationDate >= CAST('2020-01-01' AS TIMESTAMP)
+      AND p.Score IS NOT NULL
+    GROUP BY tu.Id, tu.DisplayName, tu.Reputation
+),
+tag_stats AS (
+    SELECT t.Id AS tag_id, t.TagName,
+           COUNT(DISTINCT p.Id) AS usage_count,
+           AVG(p.Score) AS avg_question_score,
+           SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(DISTINCT p.Id),0) AS acceptance_rate
+    FROM Tags t
+    JOIN Posts p ON p.PostTypeId = 1 
+               AND (
+                 p.Tags LIKE '%' || t.TagName || '%'
+                 OR p.Tags LIKE '%' || t.TagName || '><%'
+                 OR p.Tags LIKE '%><' || t.TagName || '%'
+                 OR p.Tags LIKE '%><' || t.TagName || '>'
+               )
+    WHERE p.CreationDate >= CAST('2020-01-01' AS TIMESTAMP)
+      AND t.Count > 10
+    GROUP BY t.Id, t.TagName
+    HAVING COUNT(DISTINCT p.Id) > 5
+),
+high_impact_posts AS (
+    SELECT p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate,
+           p.OwnerUserId, p.Tags,
+           ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM p.CreationDate) ORDER BY p.ViewCount DESC, p.Score DESC) AS yearly_rank,
+           LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS prev_post_score
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2020-01-01' AS TIMESTAMP)
+      AND p.ViewCount > 1000
+      AND p.Score >= 10
+),
+user_tag_affinity AS (
+    SELECT ua.user_id,
+           ts.tag_id,
+           ts.tagname,
+           COUNT(DISTINCT hp.Id) AS posts_in_tag,
+           AVG(hp.score) AS avg_score_in_tag,
+           (CAST(COUNT(DISTINCT hp.Id) AS DOUBLE PRECISION) / NULLIF(ua.post_count,0)) * 100 AS affinity_percentage
+    FROM user_activity ua
+    JOIN high_impact_posts hp ON hp.OwnerUserId = ua.user_id
+    JOIN tag_stats ts ON (hp.Tags LIKE '%' || ts.TagName || '%')
+    WHERE hp.yearly_rank <= 100
+    GROUP BY ua.user_id, ts.tag_id, ts.tagname, ua.post_count
+    HAVING COUNT(DISTINCT hp.Id) >= 3
+),
+engagement_metrics AS (
+    SELECT v.PostId,
+           COUNT(DISTINCT v.Id) AS total_votes,
+           COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS upvotes,
+           COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS downvotes,
+           COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.Id END) AS favorites,
+           AVG(EXTRACT(EPOCH FROM v.CreationDate)) AS avg_vote_time
+    FROM Votes v
+    WHERE v.CreationDate >= CAST('2020-01-01' AS TIMESTAMP)
+      AND v.VoteTypeId IN (2, 3, 5)
+    GROUP BY v.PostId
+    HAVING COUNT(DISTINCT v.Id) > 10
+),
+comment_activity AS (
+    SELECT c.PostId,
+           COUNT(c.Id) AS comment_count,
+           AVG(c.Score) AS avg_comment_score,
+           STRING_AGG(c.Text, ' | ') AS sample_comments
+    FROM Comments c
+    WHERE c.CreationDate >= CAST('2020-01-01' AS TIMESTAMP)
+      AND c.Score >= 0
+    GROUP BY c.PostId
+    HAVING COUNT(c.Id) > 5
+)
+SELECT 
+    tu.DisplayName AS user_name,
+    tu.rank,
+    ua.post_count,
+    ua.answer_count,
+    ua.question_count,
+    ua.total_score,
+    ROUND(CAST(ua.avg_score AS NUMERIC), 2) AS avg_post_score,
+    COALESCE(uta.affinity_percentage, 0) AS top_tag_affinity,
+    COALESCE(uta.tagname, 'N/A') AS top_tag,
+    COALESCE(hip.ViewCount, 0) AS top_post_views,
+    COALESCE(hip.Title, 'N/A') AS top_post_title,
+    COALESCE(em.total_votes, 0) AS votes_on_top_post,
+    COALESCE(ca.comment_count, 0) AS comments_on_top_post,
+    ROUND(
+        (
+         COALESCE(hip.Score, 0)
+         + COALESCE(em.upvotes, 0)
+         - (COALESCE(em.downvotes, 0) * 2)
+         + COALESCE(ca.comment_count, 0)
+        ) / GREATEST(CAST(ua.post_count AS NUMERIC), 1), 2
+    ) AS engagement_index,
+    CASE 
+        WHEN ua.answer_count > ua.question_count * 2 THEN 'Answerer'
+        WHEN ua.question_count > ua.answer_count * 2 THEN 'Questioner'
+        ELSE 'Balanced'
+    END AS user_type,
+    RANK() OVER (ORDER BY 
+        (COALESCE(ua.total_score,0) * 0.4 + 
+         COALESCE(hip.ViewCount, 0) * 0.3 + 
+         COALESCE(em.total_votes, 0) * 0.2 + 
+         COALESCE(ua.answer_count, 0) * 0.1) DESC
+    ) AS overall_impact_rank
+FROM (
+    SELECT * FROM top_users
+    ORDER BY Reputation DESC
+    LIMIT 50
+) tu
+JOIN user_activity ua ON ua.user_id = tu.Id
+LEFT JOIN user_tag_affinity uta ON uta.user_id = tu.Id 
+    AND uta.affinity_percentage = (
+        SELECT MAX(uta2.affinity_percentage) 
+        FROM user_tag_affinity uta2 
+        WHERE uta2.user_id = tu.Id
+    )
+LEFT JOIN high_impact_posts hip ON hip.OwnerUserId = tu.Id 
+    AND hip.yearly_rank = 1
+    AND EXTRACT(YEAR FROM hip.CreationDate) = EXTRACT(YEAR FROM CAST('2024-10-01' AS DATE))
+LEFT JOIN engagement_metrics em ON em.PostId = hip.Id
+LEFT JOIN comment_activity ca ON ca.PostId = hip.Id
+WHERE tu.rank <= 25
+ORDER BY overall_impact_rank
+LIMIT 20;

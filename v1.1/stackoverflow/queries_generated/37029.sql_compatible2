@@ -1,0 +1,149 @@
+WITH
+RecentQuestions AS (
+  SELECT p.Id, p.CreationDate, p.Title, p.OwnerUserId, p.Score, p.ViewCount, p.AnswerCount, p.Tags,
+         regexp_split_to_table(substring(p.Tags,2,length(p.Tags)-2), E'><') AS Tag,
+         p.LastActivityDate
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+),
+QMetrics AS (
+  SELECT
+    q.Id,
+    q.Title,
+    q.OwnerUserId,
+    q.CreationDate,
+    q.Score AS QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    q.Tag,
+    COALESCE(q.AcceptedAnswerId, (SELECT pa.Id FROM Posts pa WHERE pa.ParentId = q.Id ORDER BY pa.Score DESC NULLS LAST LIMIT 1)) AS HeuristicAcceptedAnswerId,
+    EXTRACT(EPOCH FROM (
+      (SELECT p2.CreationDate FROM Posts p2 WHERE p2.Id = COALESCE(q.AcceptedAnswerId, (SELECT pa.Id FROM Posts pa WHERE pa.ParentId = q.Id ORDER BY pa.Score DESC NULLS LAST LIMIT 1)))
+      - q.CreationDate
+    )) AS AcceptedLatencySeconds,
+    EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - q.LastActivityDate)) AS SecondsSinceLastActivity
+  FROM RecentQuestions q
+),
+UserSnapshot AS (
+  SELECT u.Id AS UserId, u.Reputation, u.CreationDate AS UserCreation, u.DisplayName,
+         COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+         COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+         COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+         MAX(b.Date) AS MostRecentBadgeDate
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id, u.Reputation, u.CreationDate, u.DisplayName
+),
+TopAnswers AS (
+  SELECT a.ParentId AS QuestionId,
+         a.Id AS AnswerId,
+         a.OwnerUserId AS AnswerOwner,
+         a.Score AS AnswerScore,
+         a.CreationDate AS AnswerCreationDate,
+         a.LastActivityDate AS AnswerLastActivity,
+         ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS rn,
+         COUNT(c.Id) AS AnswerCommentCount,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+  FROM Posts a
+  LEFT JOIN Comments c ON c.PostId = a.Id
+  LEFT JOIN Votes v ON v.PostId = a.Id
+  WHERE a.PostTypeId = 2
+  GROUP BY a.ParentId, a.Id, a.OwnerUserId, a.Score, a.CreationDate, a.LastActivityDate
+),
+Top5Answers AS (
+  SELECT * FROM TopAnswers WHERE rn <= 5
+),
+LinksAgg AS (
+  SELECT p.Id AS QuestionId,
+         COUNT(pl.Id) FILTER (WHERE pl.LinkTypeId = 1) AS OutboundLinks,
+         COUNT(pl.Id) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicateLinks,
+         COUNT(DISTINCT pl.RelatedPostId) AS DistinctRelatedPosts
+  FROM Posts p
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+  WHERE p.PostTypeId = 1
+  GROUP BY p.Id
+),
+EditChurn AS (
+  SELECT ph.PostId,
+         COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (5,4,6)) AS EditCount,
+         COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (7,8,9)) AS RollbackCount,
+         MAX(ph.CreationDate) AS LastEditDate
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+TagAgg AS (
+  SELECT r.Tag,
+         COUNT(DISTINCT r.Id) AS QuestionsWithTag,
+         AVG(qm.QuestionScore) AS AvgQuestionScore,
+         PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY COALESCE(qm.AcceptedLatencySeconds, 31536000)) AS MedianAcceptedLatencySec,
+         AVG(qm.SecondsSinceLastActivity) AS AvgSecondsSinceLastActivity
+  FROM RecentQuestions r
+  JOIN QMetrics qm ON qm.Id = r.Id
+  GROUP BY r.Tag
+),
+FinalRows AS (
+  SELECT
+    qm.Id AS QuestionId,
+    LEFT(qm.Title, 200) AS TitleSnippet,
+    qm.Tag,
+    qs.Reputation AS OwnerReputation,
+    qs.GoldBadges, qs.SilverBadges, qs.BronzeBadges,
+    qm.QuestionScore, qm.ViewCount, qm.AnswerCount,
+    COALESCE(qm.AcceptedLatencySeconds, NULL) AS AcceptedLatencySeconds,
+    TO_CHAR((qm.AcceptedLatencySeconds/3600)::numeric, 'FM99999990.00') AS AcceptedLatencyHoursFormatted,
+    qm.SecondsSinceLastActivity,
+    la.OutboundLinks, la.DuplicateLinks, la.DistinctRelatedPosts,
+    ec.EditCount, ec.RollbackCount, ec.LastEditDate,
+    ta.AvgQuestionScore AS TagAvgScore,
+    ta.MedianAcceptedLatencySec AS TagMedianAcceptedLatencySec,
+    (SELECT json_agg(json_build_object(
+               'AnswerId', t5.AnswerId,
+               'Score', t5.AnswerScore,
+               'Owner', t5.AnswerOwner,
+               'Comments', t5.AnswerCommentCount,
+               'UpVotes', t5.UpVotes,
+               'DownVotes', t5.DownVotes,
+               'AgeHours', ROUND(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - t5.AnswerCreationDate))/3600.0,2)
+             ) ORDER BY t5.AnswerScore DESC NULLS LAST)
+     FROM Top5Answers t5 WHERE t5.QuestionId = qm.Id) AS TopAnswersJson,
+    (qm.QuestionScore * LEAST(100, GREATEST(1, qm.ViewCount/50.0)) / NULLIF(GREATEST(1, LOG(GREATEST(2, qm.SecondsSinceLastActivity + 1))),1))::numeric(18,6) AS HotnessScore
+  FROM QMetrics qm
+  LEFT JOIN UserSnapshot qs ON qs.UserId = qm.OwnerUserId
+  LEFT JOIN LinksAgg la ON la.QuestionId = qm.Id
+  LEFT JOIN EditChurn ec ON ec.PostId = qm.Id
+  LEFT JOIN TagAgg ta ON ta.Tag = qm.Tag
+)
+SELECT
+  fr.QuestionId,
+  fr.TitleSnippet,
+  fr.Tag,
+  fr.OwnerReputation,
+  fr.GoldBadges,
+  fr.SilverBadges,
+  fr.BronzeBadges,
+  fr.QuestionScore,
+  fr.ViewCount,
+  fr.AnswerCount,
+  fr.AcceptedLatencySeconds,
+  fr.AcceptedLatencyHoursFormatted,
+  fr.SecondsSinceLastActivity,
+  fr.OutboundLinks,
+  fr.DuplicateLinks,
+  fr.DistinctRelatedPosts,
+  fr.EditCount,
+  fr.RollbackCount,
+  fr.LastEditDate,
+  fr.TagAvgScore,
+  fr.TagMedianAcceptedLatencySec,
+  fr.TopAnswersJson,
+  fr.HotnessScore,
+  RANK() OVER (ORDER BY fr.HotnessScore DESC) AS HotnessRank,
+  NTILE(100) OVER (ORDER BY fr.HotnessScore DESC) AS HotnessPercentileTile,
+  AVG(fr.QuestionScore) OVER () AS GlobalAvgQuestionScore,
+  STDDEV_POP(fr.HotnessScore) OVER () AS HotnessStdDev,
+  PERCENT_RANK() OVER (ORDER BY fr.HotnessScore DESC) AS HotnessPercentRank
+FROM FinalRows fr
+ORDER BY fr.HotnessScore DESC
+LIMIT 100;

@@ -1,0 +1,110 @@
+-- {"query": "55092.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2048, "output_tokens": 1079} 
+WITH TopUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    WHERE u.Reputation > 10000
+),
+UserBadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(*) AS TotalBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+QuestionMetrics AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(*) FILTER (WHERE p.Score >= 10) AS HighScoreQuestions,
+        AVG(p.ViewCount)::numeric(10,2) AS AvgViews,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.AnswerCount) AS MedianAnswers,
+        SUM(p.FavoriteCount) AS TotalFavorites,
+        COUNT(*) FILTER (WHERE p.ClosedDate IS NOT NULL) AS ClosedQuestions,
+        COUNT(*) AS TotalQuestions
+    FROM Posts p
+    WHERE p.PostTypeId = 1   -- Question
+    GROUP BY p.OwnerUserId
+),
+AnswerMetrics AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesReceived,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesReceived,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 1) AS AcceptedAnswers,
+        AVG(p.Score)::numeric(10,2) AS AvgScore,
+        COUNT(*) AS TotalAnswers
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId IN (1,2,3)
+    WHERE p.PostTypeId = 2   -- Answer
+    GROUP BY p.OwnerUserId
+),
+TagPopularity AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagUseCount,
+        COUNT(DISTINCT pl.PostId) AS LinkedPosts,
+        COUNT(DISTINCT pl.RelatedPostId) AS RelatedPosts,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    LEFT JOIN PostLinks pl ON pl.LinkTypeId = 1 AND (pl.PostId = t.ExcerptPostId OR pl.RelatedPostId = t.WikiPostId)
+    GROUP BY t.TagName, t.Count
+),
+UserTagActivity AS (
+    SELECT
+        pu.OwnerUserId AS UserId,
+        unnest(string_to_array(pu.Tags, '><')) AS RawTag,
+        COUNT(*) AS TagUsageCount
+    FROM Posts pu
+    WHERE pu.PostTypeId = 1 AND pu.Tags IS NOT NULL
+    GROUP BY pu.OwnerUserId, RawTag
+),
+TopUserTagStats AS (
+    SELECT
+        uta.UserId,
+        t.TagName,
+        SUM(uta.TagUsageCount) AS TotalTagUses,
+        ROW_NUMBER() OVER (PARTITION BY uta.UserId ORDER BY SUM(uta.TagUsageCount) DESC) AS TagRank
+    FROM UserTagActivity uta
+    JOIN TagPopularity t ON t.TagName = trim(both '<>' from uta.RawTag)
+    GROUP BY uta.UserId, t.TagName
+)
+SELECT
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.RepRank,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.TotalBadges,
+    qm.TotalQuestions,
+    qm.HighScoreQuestions,
+    qm.AvgViews,
+    qm.MedianAnswers,
+    qm.TotalFavorites,
+    qm.ClosedQuestions,
+    am.TotalAnswers,
+    am.UpVotesReceived,
+    am.DownVotesReceived,
+    am.AcceptedAnswers,
+    am.AvgScore,
+    -- JSON aggregation of top 3 tags per user
+    COALESCE(
+        (SELECT jsonb_agg(jsonb_build_object('Tag', t.TagName, 'Uses', t.TotalTagUses))
+         FROM TopUserTagStats t
+         WHERE t.UserId = tu.UserId AND t.TagRank <= 3),
+        '[]'::jsonb
+    ) AS TopTags
+FROM TopUsers tu
+LEFT JOIN UserBadgeStats ub ON ub.UserId = tu.UserId
+LEFT JOIN QuestionMetrics qm ON qm.UserId = tu.UserId
+LEFT JOIN AnswerMetrics am ON am.UserId = tu.UserId
+ORDER BY tu.RepRank
+LIMIT 100;

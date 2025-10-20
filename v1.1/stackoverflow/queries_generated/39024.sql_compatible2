@@ -1,0 +1,131 @@
+WITH RecentQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Tags,
+        p.CreationDate AS QCreation
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE pt.Name = 'Question'
+      AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30' DAY)
+),
+-- explode tags using standard SQL string functions into rows by splitting on '><'
+TagExploded AS (
+    SELECT
+        rq.Id AS QuestionId,
+        TRIM(tag) AS TagName
+    FROM RecentQuestions rq,
+    LATERAL (
+        SELECT
+            CASE
+                WHEN rq.Tags IS NULL THEN NULL
+                ELSE regexp_split_to_table(
+                    substring(rq.Tags FROM 2 FOR (char_length(rq.Tags)-2)),
+                    '><'
+                )
+            END AS tag
+    ) t
+),
+TagAggregates AS (
+    SELECT
+        te.TagName,
+        COUNT(*)       AS QuestionCount,
+        AVG(rv.ViewCount) AS AvgViews
+    FROM TagExploded te
+    JOIN Posts rv ON rv.Id = te.QuestionId
+    GROUP BY te.TagName
+),
+AnswerDelays AS (
+    SELECT
+        q.Id           AS QuestionId,
+        q.CreationDate AS QCreation,
+        MIN(a.CreationDate) AS FirstAnswerDate
+    FROM Posts q
+    JOIN PostTypes ptq ON q.PostTypeId = ptq.Id AND ptq.Name = 'Question'
+    JOIN Posts a ON a.ParentId = q.Id
+    GROUP BY q.Id, q.CreationDate
+),
+UserInfluence AS (
+    SELECT
+        u.Id            AS UserId,
+        u.DisplayName,
+        COUNT(v.Id) FILTER (WHERE vt.Name IN ('UpMod','DownMod')) AS TotalVotesReceived,
+        SUM(
+            CASE
+                WHEN vt.Name = 'UpMod'   THEN  1
+                WHEN vt.Name = 'DownMod' THEN -1
+                ELSE 0
+            END
+        ) AS VoteBalance
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY u.Id, u.DisplayName
+),
+BadgeSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(*) AS TotalBadges,
+        SUM(
+            CASE
+                WHEN b.Class = 1 THEN 5
+                WHEN b.Class = 2 THEN 3
+                WHEN b.Class = 3 THEN 1
+                ELSE 0
+            END
+        ) AS BadgeScore
+    FROM Badges b
+    GROUP BY b.UserId
+),
+RecentComments AS (
+    SELECT
+        c.PostId,
+        COUNT(*) AS RecentCommentCount
+    FROM Comments c
+    WHERE c.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30' DAY)
+    GROUP BY c.PostId
+)
+SELECT
+    rq.Id                                   AS QuestionId,
+    rq.Title,
+    ui.DisplayName                          AS Author,
+    ta.QuestionCount,
+    CAST(ROUND(ta.AvgViews) AS BIGINT)      AS AvgViews,
+    ui.VoteBalance,
+    bs.BadgeScore,
+    CAST(EXTRACT(EPOCH FROM (ad.FirstAnswerDate - ad.QCreation)) AS BIGINT) AS TimeToFirstAnswerSec,
+    COALESCE(rc.RecentCommentCount, 0)      AS RecentCommentCount
+FROM RecentQuestions rq
+LEFT JOIN TagAggregates ta
+  ON EXISTS (
+      SELECT 1
+      FROM (
+          SELECT regexp_split_to_table(
+              substring(rq.Tags FROM 2 FOR (char_length(rq.Tags)-2)),
+              '><'
+          ) AS tag
+      ) s
+      WHERE s.tag = ta.TagName
+)
+LEFT JOIN AnswerDelays ad ON ad.QuestionId = rq.Id
+LEFT JOIN UserInfluence ui  ON ui.UserId = rq.OwnerUserId
+LEFT JOIN BadgeSummary   bs ON bs.UserId = rq.OwnerUserId
+LEFT JOIN RecentComments rc ON rc.PostId = rq.Id
+GROUP BY
+    rq.Id,
+    rq.Title,
+    ui.DisplayName,
+    ta.QuestionCount,
+    ta.AvgViews,
+    ui.VoteBalance,
+    bs.BadgeScore,
+    ad.FirstAnswerDate,
+    ad.QCreation,
+    rc.RecentCommentCount
+ORDER BY
+    ta.QuestionCount DESC,
+    ui.VoteBalance   DESC,
+    rc.RecentCommentCount DESC
+LIMIT 100;

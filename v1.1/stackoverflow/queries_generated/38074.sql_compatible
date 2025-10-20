@@ -1,0 +1,230 @@
+with recent_users as (
+    select u.Id as user_id, u.Reputation, u.CreationDate
+    from Users u
+    where u.CreationDate >= (select max(CreationDate) - interval '365 days' from Users)
+),
+tagged_questions as (
+    select p.Id as question_id,
+           p.OwnerUserId as owner_id,
+           p.CreationDate,
+           p.Score,
+           p.ViewCount,
+           p.AnswerCount,
+           p.Tags,
+           string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><') as tag_arr
+    from Posts p
+    where p.PostTypeId = 1
+      and p.CreationDate >= (select max(CreationDate) - interval '365 days' from Posts where PostTypeId = 1)
+),
+answers as (
+    select a.Id as answer_id,
+           a.ParentId as question_id,
+           a.OwnerUserId as owner_id,
+           a.Score as answer_score,
+           a.CreationDate as answer_date
+    from Posts a
+    where a.PostTypeId = 2
+),
+first_answer as (
+    select question_id,
+           min(answer_date) as first_answer_date
+    from answers
+    group by question_id
+),
+q_activity as (
+    select q.question_id,
+           q.owner_id,
+           q.Score as q_score,
+           q.ViewCount as q_views,
+           q.AnswerCount as q_answercount,
+           q.CreationDate as q_date,
+           fa.first_answer_date,
+           extract(epoch from (fa.first_answer_date - q.CreationDate))/3600.0 as hours_to_first_answer
+    from tagged_questions q
+    left join first_answer fa on fa.question_id = q.question_id
+),
+votes_agg as (
+    select v.PostId,
+           sum(case when v.VoteTypeId = 2 then 1 else 0 end) as upvotes,
+           sum(case when v.VoteTypeId = 3 then 1 else 0 end) as downvotes,
+           sum(case when v.VoteTypeId = 5 then 1 else 0 end) as favorites,
+           sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as bounty_total
+    from Votes v
+    group by v.PostId
+),
+comments_agg as (
+    select c.PostId,
+           count(*) as comment_count,
+           coalesce(sum(c.Score),0) as comment_score_sum
+    from Comments c
+    group by c.PostId
+),
+links_agg as (
+    select pl.PostId,
+           sum(case when pl.LinkTypeId = 1 then 1 else 0 end) as linked_count,
+           sum(case when pl.LinkTypeId = 3 then 1 else 0 end) as duplicate_of_count
+    from PostLinks pl
+    group by pl.PostId
+),
+accepted_map as (
+    select q.Id as question_id,
+           q.AcceptedAnswerId as accepted_answer_id
+    from Posts q
+    where q.PostTypeId = 1 and q.AcceptedAnswerId is not null
+),
+answerers as (
+    select a.question_id,
+           count(distinct a.owner_id) filter (where a.owner_id is not null) as distinct_answerers,
+           max(a.answer_score) as max_answer_score,
+           avg(a.answer_score) as avg_answer_score
+    from answers a
+    group by a.question_id
+),
+owner_stats as (
+    select u.Id as user_id,
+           u.Reputation,
+           u.Views,
+           u.UpVotes,
+           u.DownVotes
+    from Users u
+),
+tag_explode as (
+    select q.question_id,
+           lower(trim(t)) as tag
+    from tagged_questions q
+    cross join unnest(q.tag_arr) t
+),
+top_tags as (
+    select tag,
+           count(*) as q_count,
+           avg(q_score) as avg_q_score,
+           avg(q_views) as avg_q_views
+    from tag_explode te
+    join q_activity qa on qa.question_id = te.question_id
+    group by tag
+    having count(*) >= 50
+),
+tag_ranked as (
+    select tag,
+           q_count,
+           avg_q_score,
+           avg_q_views,
+           row_number() over (order by q_count desc, avg_q_score desc) as rnk
+    from top_tags
+),
+question_tag_density as (
+    select te.question_id,
+           count(*) as tag_count,
+           sum(case when tt.tag is not null then 1 else 0 end) as top_tag_hits
+    from tag_explode te
+    left join top_tags tt on tt.tag = te.tag
+    group by te.question_id
+),
+posthistory_closes as (
+    select ph.PostId,
+           count(*) filter (where ph.PostHistoryTypeId = 10) as close_events,
+           count(*) filter (where ph.PostHistoryTypeId = 11) as reopen_events
+    from PostHistory ph
+    group by ph.PostId
+),
+final as (
+    select
+        qa.question_id,
+        qa.owner_id,
+        qa.q_score,
+        qa.q_views,
+        qa.q_answercount,
+        qa.q_date,
+        qa.first_answer_date,
+        qa.hours_to_first_answer,
+        coalesce(v.upvotes,0) as upvotes,
+        coalesce(v.downvotes,0) as downvotes,
+        coalesce(v.favorites,0) as favorites,
+        coalesce(v.bounty_total,0) as bounty_total,
+        coalesce(c.comment_count,0) as comment_count,
+        coalesce(c.comment_score_sum,0) as comment_score_sum,
+        coalesce(l.linked_count,0) as linked_count,
+        coalesce(l.duplicate_of_count,0) as duplicate_of_count,
+        (am.accepted_answer_id is not null) as has_accepted,
+        coalesce(ans.distinct_answerers,0) as distinct_answerers,
+        coalesce(ans.max_answer_score,0) as max_answer_score,
+        coalesce(ans.avg_answer_score,0.0) as avg_answer_score,
+        os.Reputation as owner_reputation,
+        os.UpVotes as owner_upvotes,
+        os.DownVotes as owner_downvotes,
+        qtd.tag_count,
+        qtd.top_tag_hits,
+        coalesce(ph.close_events,0) as close_events,
+        coalesce(ph.reopen_events,0) as reopen_events,
+        case
+            when qa.hours_to_first_answer is null then 'no_answer'
+            when qa.hours_to_first_answer <= 1 then 'within_1h'
+            when qa.hours_to_first_answer <= 6 then 'within_6h'
+            when qa.hours_to_first_answer <= 24 then 'within_24h'
+            when qa.hours_to_first_answer <= 72 then 'within_72h'
+            else 'after_72h'
+        end as answer_latency_bucket
+    from q_activity qa
+    left join votes_agg v on v.PostId = qa.question_id
+    left join comments_agg c on c.PostId = qa.question_id
+    left join links_agg l on l.PostId = qa.question_id
+    left join accepted_map am on am.question_id = qa.question_id
+    left join answerers ans on ans.question_id = qa.question_id
+    left join owner_stats os on os.user_id = qa.owner_id
+    left join question_tag_density qtd on qtd.question_id = qa.question_id
+    left join posthistory_closes ph on ph.PostId = qa.question_id
+),
+-- compute medians using aggregated percentiles compatible approach:
+medians as (
+    select
+        (select q_views from final f2 order by q_views nulls last limit 1 offset greatest(0, (count(*)-1)/2) ) as median_views,
+        (select q_score from final f3 order by q_score nulls last limit 1 offset greatest(0, (count(*)-1)/2) ) as median_score
+    from final f
+),
+ranked as (
+    select
+        f.*,
+        m.median_views,
+        m.median_score,
+        row_number() over (order by
+            (coalesce(f.upvotes,0) - coalesce(f.downvotes,0)) desc,
+            f.q_views desc,
+            f.favorites desc,
+            f.bounty_total desc
+        ) as popularity_rank
+    from final f
+    cross join medians m
+)
+select
+    r.question_id,
+    r.owner_id,
+    r.q_date,
+    r.q_score,
+    r.q_views,
+    r.answer_latency_bucket,
+    r.has_accepted,
+    r.distinct_answerers,
+    r.max_answer_score,
+    r.avg_answer_score,
+    r.upvotes,
+    r.downvotes,
+    r.favorites,
+    r.bounty_total,
+    r.comment_count,
+    r.comment_score_sum,
+    r.linked_count,
+    r.duplicate_of_count,
+    r.owner_reputation,
+    r.owner_upvotes,
+    r.owner_downvotes,
+    r.tag_count,
+    r.top_tag_hits,
+    r.close_events,
+    r.reopen_events,
+    r.popularity_rank,
+    case when r.q_views >= r.median_views then 1 else 0 end as above_median_views,
+    case when r.q_score >= r.median_score then 1 else 0 end as above_median_score
+from ranked r
+where r.q_views is not null
+order by r.popularity_rank
+limit 500;

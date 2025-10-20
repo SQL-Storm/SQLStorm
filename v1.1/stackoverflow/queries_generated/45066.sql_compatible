@@ -1,0 +1,55 @@
+WITH RankedUserPosts AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.Score,
+        p.ViewCount,
+        p.PostTypeId,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.Score DESC, p.ViewCount DESC) AS PostRank,
+        COUNT(*) OVER (PARTITION BY u.Id) AS TotalUserPosts,
+        AVG(p.Score) OVER (PARTITION BY u.Id) AS AvgUserPostScore
+    FROM 
+        Users u
+    JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    WHERE 
+        p.PostTypeId IN (1,2)
+        AND u.Reputation > 1000
+),
+TagAnalytics AS (
+    SELECT 
+        r.PostId,
+        -- split tags like '<tag1><tag2>' into separate rows in a more portable way
+        TRIM(t.tag) AS Tag,
+        r.Score,
+        r.PostRank,
+        r.TotalUserPosts
+    FROM 
+        RankedUserPosts r,
+        -- use a set-returning expression that works in many dialects: regexp_split_to_table for Postgres,
+        -- emulate with XML parsing for other systems is not provided here; prefer regexp_split_to_table if available.
+        regexp_split_to_table(
+            CASE WHEN r.Tags IS NULL THEN '' ELSE SUBSTRING(r.Tags FROM 2 FOR CHAR_LENGTH(r.Tags)-2) END,
+            '><'
+        ) AS t(tag)
+)
+SELECT 
+    Tag,
+    COUNT(DISTINCT PostId) AS PostCount,
+    ROUND(AVG(Score)::numeric, 2) AS AvgTagScore,
+    MAX(Score) AS MaxTagScore
+FROM 
+    TagAnalytics
+WHERE 
+    PostRank <= 10
+    AND TotalUserPosts > 5
+GROUP BY 
+    Tag
+HAVING 
+    COUNT(DISTINCT PostId) > 100
+ORDER BY 
+    AvgTagScore DESC, 
+    PostCount DESC
+LIMIT 50;

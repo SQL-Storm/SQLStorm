@@ -1,0 +1,91 @@
+WITH recent_questions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName AS AuthorName
+    FROM Posts AS p
+    JOIN Users AS u
+      ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY
+),
+answer_metrics AS (
+    SELECT
+        q.Id AS QuestionId,
+        COUNT(a.Id) FILTER (WHERE a.Score >= 0)              AS TotalAnswers,
+        AVG(EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))) AS AvgAnswerDelaySeconds,
+        MAX(a.Score)                                         AS TopAnswerScore
+    FROM recent_questions AS q
+    LEFT JOIN Posts AS a
+      ON a.ParentId = q.Id
+     AND a.PostTypeId = 2
+    GROUP BY q.Id, q.Title, q.CreationDate, q.Tags, q.OwnerUserId, q.AuthorName
+),
+comment_metrics AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(c.Id)          AS TotalComments,
+        AVG(c.Score)         AS AvgCommentScore
+    FROM Posts AS p
+    LEFT JOIN Comments AS c
+      ON c.PostId = p.Id
+    GROUP BY p.Id
+),
+badge_leaderboard AS (
+    SELECT
+        u.Id                               AS UserId,
+        COUNT(b.Id)                        AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users AS u
+    LEFT JOIN Badges AS b
+      ON b.UserId = u.Id
+    GROUP BY u.Id
+),
+top_tags AS (
+    SELECT
+        tag AS TagName,
+        COUNT(*) AS QuestionCount
+    FROM (
+        SELECT
+            TRIM(t) AS tag
+        FROM Posts,
+        UNNEST(STRING_TO_ARRAY(SUBSTRING(Tags FROM 2 FOR LENGTH(Tags) - 2), '><')) AS t
+        WHERE PostTypeId = 1
+    ) sub
+    GROUP BY tag
+    ORDER BY COUNT(*) DESC
+    LIMIT 10
+)
+SELECT
+    q.Title,
+    q.AuthorName,
+    am.TotalAnswers,
+    am.AvgAnswerDelaySeconds,
+    am.TopAnswerScore,
+    cm.TotalComments,
+    cm.AvgCommentScore,
+    bl.GoldBadges,
+    bl.SilverBadges,
+    bl.BronzeBadges,
+    tp.TagName,
+    tp.QuestionCount
+FROM recent_questions AS q
+JOIN answer_metrics AS am
+  ON am.QuestionId = q.Id
+LEFT JOIN comment_metrics AS cm
+  ON cm.PostId = q.Id
+LEFT JOIN badge_leaderboard AS bl
+  ON bl.UserId = q.OwnerUserId
+LEFT JOIN LATERAL (
+    SELECT t.TagName, t.QuestionCount
+    FROM top_tags AS t
+    WHERE t.TagName = ANY(STRING_TO_ARRAY(SUBSTRING(q.Tags FROM 2 FOR LENGTH(q.Tags) - 2), '><'))
+    LIMIT 1
+) AS tp ON TRUE
+ORDER BY am.TotalAnswers DESC, cm.TotalComments DESC
+LIMIT 10;

@@ -1,0 +1,34 @@
+-- {"query": "33076.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 281} 
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    COUNT(CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+    COUNT(CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+    AVG(p.Score) AS AverageScore,
+    SUM(p.ViewCount) AS TotalViews,
+    COUNT(DISTINCT b.Id) AS BadgeCount,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    COUNT(DISTINCT v.Id) AS VoteCount,
+    COUNT(DISTINCT pl.Id) AS LinkCount,
+    COUNT(DISTINCT tp.Id) AS TagCount
+FROM
+    Users u
+LEFT JOIN
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN
+    Badges b ON u.Id = b.UserId
+LEFT JOIN
+    Comments c ON u.Id = c.UserId
+LEFT JOIN
+    Votes v ON u.Id = v.UserId
+LEFT JOIN
+    PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN
+    Posts tp ON tp.OwnerUserId = u.Id AND tp.PostTypeId = 1
+WHERE
+    u.CreationDate >= DATE_SUB(CURRENT_DATE, INTERVAL 1 YEAR)
+GROUP BY
+    u.Id, u.DisplayName
+ORDER BY
+    TotalViews DESC
+LIMIT 50;

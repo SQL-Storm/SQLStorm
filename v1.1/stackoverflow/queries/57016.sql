@@ -1,0 +1,152 @@
+WITH TopUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) AS PostCount,
+        SUM(p.Score) AS TotalScore,
+        COUNT(a.Id) AS AcceptedAnswerCount,
+        COUNT(v.Id) AS VoteCount,
+        COUNT(c.Id) AS CommentCount
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Posts a ON p.AcceptedAnswerId = a.Id
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation
+    ORDER BY
+        u.Reputation DESC, PostCount DESC, TotalScore DESC
+    LIMIT 100
+),
+ActiveTags AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        COUNT(p.Id) AS QuestionCount,
+        SUM(p.ViewCount) AS TotalViews,
+        SUM(p.AnswerCount) AS TotalAnswers,
+        COUNT(v.Id) AS VoteCount
+    FROM
+        Tags t
+    JOIN
+        Posts p ON t.TagName = ANY(string_to_array(p.Tags, '><'))
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    WHERE
+        p.PostTypeId = 1
+    GROUP BY
+        t.Id, t.TagName
+    ORDER BY
+        QuestionCount DESC, TotalViews DESC, TotalAnswers DESC
+    LIMIT 50
+),
+RecentPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        u.DisplayName AS AuthorName,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(v.Id) AS VoteCount
+    FROM
+        Posts p
+    JOIN
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    WHERE
+        p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days'
+    GROUP BY
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.Title, u.DisplayName
+    ORDER BY
+        p.CreationDate DESC
+    LIMIT 1000
+),
+BadgeDistribution AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        b.Name AS BadgeName,
+        b.Class,
+        COUNT(b.Id) AS BadgeCount
+    FROM
+        Users u
+    JOIN
+        Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, b.Name, b.Class
+    ORDER BY
+        BadgeCount DESC, b.Class, u.DisplayName
+    LIMIT 1000
+)
+SELECT
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.PostCount,
+    COALESCE(at.TagId, 0) AS MostActiveTagId,
+    COALESCE(at.TagName, 'None') AS MostActiveTagName,
+    rp.PostId AS MostRecentPostId,
+    rp.PostTypeId AS MostRecentPostType,
+    rp.Title AS MostRecentPostTitle,
+    bd.BadgeName AS MostCommonBadgeName,
+    bd.BadgeCount,
+    bd.Class,
+    tu.AcceptedAnswerCount,
+    tu.VoteCount AS TotalVotes,
+    tu.CommentCount AS TotalComments,
+    COALESCE(at.QuestionCount, 0) AS QuestionsInMostActiveTag,
+    COALESCE(at.TotalViews, 0) AS ViewsInMostActiveTag,
+    COALESCE(at.TotalAnswers, 0) AS AnswersInMostActiveTag,
+    COALESCE(at.VoteCount, 0) AS VotesInMostActiveTag,
+    rp.Score AS MostRecentPostScore,
+    rp.ViewCount AS MostRecentPostViewCount,
+    rp.CommentCount AS CommentsOnMostRecentPost,
+    rp.VoteCount AS VotesOnMostRecentPost,
+    rp.CreationDate AS MostRecentPostCreationDate
+FROM
+    TopUsers tu
+LEFT JOIN
+    ActiveTags at ON tu.UserId = at.TagId
+LEFT JOIN
+    RecentPosts rp ON tu.UserId = rp.PostTypeId
+LEFT JOIN
+    BadgeDistribution bd ON tu.UserId = bd.UserId
+GROUP BY
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.PostCount,
+    at.TagId,
+    at.TagName,
+    rp.PostId,
+    rp.PostTypeId,
+    rp.Title,
+    bd.BadgeName,
+    bd.BadgeCount,
+    bd.Class,
+    tu.AcceptedAnswerCount,
+    tu.VoteCount,
+    tu.CommentCount,
+    at.QuestionCount,
+    at.TotalViews,
+    at.TotalAnswers,
+    at.VoteCount,
+    rp.Score,
+    rp.ViewCount,
+    rp.CommentCount,
+    rp.VoteCount,
+    rp.CreationDate
+ORDER BY
+    tu.Reputation DESC, at.QuestionCount DESC, rp.CreationDate DESC;

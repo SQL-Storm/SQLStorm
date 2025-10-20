@@ -1,0 +1,100 @@
+WITH UserTagAnswerScores AS (
+    SELECT 
+        a.OwnerUserId AS UserId, 
+        TRIM(BOTH '>' FROM TRIM(BOTH '<' FROM tag)) AS TagName,
+        SUM(a.Score) AS TotalAnswerScore,
+        COUNT(a.Id) AS AnswerCount,
+        AVG(a.Score) AS AvgAnswerScore
+    FROM 
+        Posts a
+    JOIN 
+        Posts q ON a.ParentId = q.Id
+    CROSS JOIN LATERAL (
+        SELECT value AS tag
+        FROM UNNEST(
+            regexp_split_to_array(substring(q.Tags FROM 2 FOR length(q.Tags) - 2), '><')
+        ) AS t(value)
+    ) tags
+    WHERE 
+        a.PostTypeId = 2 
+        AND q.PostTypeId = 1
+    GROUP BY 
+        a.OwnerUserId, tag
+),
+TagGoldBadges AS (
+    SELECT 
+        UserId, 
+        Name AS TagName,
+        Date AS BadgeDate
+    FROM 
+        Badges
+    WHERE 
+        Class = 1 
+        AND TagBased = TRUE
+),
+UserCommentCounts AS (
+    SELECT 
+        c.UserId,
+        TRIM(BOTH '>' FROM TRIM(BOTH '<' FROM tag)) AS TagName,
+        COUNT(c.Id) AS CommentCount
+    FROM 
+        Comments c
+    JOIN 
+        Posts p ON c.PostId = p.Id
+    JOIN 
+        Posts q ON (p.PostTypeId = 1 AND p.Id = q.Id) OR (p.PostTypeId = 2 AND p.ParentId = q.Id)
+    CROSS JOIN LATERAL (
+        SELECT value AS tag
+        FROM UNNEST(
+            regexp_split_to_array(substring(q.Tags FROM 2 FOR length(q.Tags) - 2), '><')
+        ) AS t(value)
+    ) tags
+    WHERE 
+        q.PostTypeId = 1
+    GROUP BY 
+        c.UserId, tag
+),
+Combined AS (
+    SELECT 
+        g.UserId, 
+        g.TagName, 
+        s.TotalAnswerScore, 
+        s.AnswerCount, 
+        s.AvgAnswerScore,
+        c.CommentCount,
+        t.Count AS TagQuestionCount, 
+        u.Reputation, 
+        u.DisplayName,
+        u.CreationDate AS UserCreationDate,
+        g.BadgeDate
+    FROM 
+        TagGoldBadges g
+    JOIN 
+        UserTagAnswerScores s ON g.UserId = s.UserId AND g.TagName = s.TagName
+    JOIN 
+        Tags t ON t.TagName = g.TagName
+    JOIN 
+        Users u ON u.Id = g.UserId
+    LEFT JOIN 
+        UserCommentCounts c ON g.UserId = c.UserId AND g.TagName = c.TagName
+    WHERE 
+        s.TotalAnswerScore > 100 
+        AND t.Count > 1000
+)
+SELECT 
+    DisplayName, 
+    TagName, 
+    TagQuestionCount, 
+    TotalAnswerScore, 
+    AnswerCount, 
+    AvgAnswerScore, 
+    CommentCount, 
+    Reputation,
+    BadgeDate,
+    RANK() OVER (PARTITION BY TagName ORDER BY TotalAnswerScore DESC) AS RankInTag,
+    DENSE_RANK() OVER (ORDER BY Reputation DESC) AS OverallReputationRank
+FROM 
+    Combined
+ORDER BY 
+    TotalAnswerScore DESC
+LIMIT 500;

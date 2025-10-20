@@ -1,0 +1,152 @@
+WITH
+Questions AS (
+  SELECT p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount,
+         COALESCE(string_to_array(substring(p.Tags,2, length(p.Tags)-2), '><'), NULL) AS TagArray,
+         p.OwnerUserId, p.AcceptedAnswerId, p.AnswerCount, p.CommentCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+),
+Answers AS (
+  SELECT a.Id, a.ParentId AS QuestionId, a.OwnerUserId AS AnswererId, a.Score AS AnswerScore, a.CreationDate AS AnswerDate,
+         a.CommentCount AS AnswerCommentCount
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+    AND a.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+),
+PostVotes AS (
+  SELECT v.PostId,
+         count(CASE WHEN v.VoteTypeId = 2 THEN 1 END)       AS UpVotes,
+         count(CASE WHEN v.VoteTypeId = 3 THEN 1 END)       AS DownVotes,
+         count(CASE WHEN v.VoteTypeId = 5 THEN 1 END)       AS Favorites,
+         count(CASE WHEN v.VoteTypeId = 8 THEN 1 END)       AS BountyStarts,
+         count(*)                                        AS TotalVotes
+  FROM Votes v
+  WHERE v.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+  GROUP BY v.PostId
+),
+UserMetrics AS (
+  SELECT u.Id AS UserId,
+         u.Reputation,
+         u.CreationDate,
+         u.LastAccessDate,
+         EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.LastAccessDate))/86400 AS DaysSinceLastAccess,
+         COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END),0) AS GoldBadges,
+         COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END),0) AS SilverBadges,
+         COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END),0) AS BronzeBadges,
+         COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END),0) AS QuestionsAsked,
+         COALESCE(SUM(CASE WHEN p2.PostTypeId = 2 THEN 1 ELSE 0 END),0) AS AnswersGiven
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id AND b.Date >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+  LEFT JOIN Posts p2 ON p2.OwnerUserId = u.Id AND p2.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+  GROUP BY u.Id, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+TagUnnest AS (
+  SELECT q.Id AS QuestionId, lower(trim(t)) AS Tag
+  FROM Questions q CROSS JOIN LATERAL (
+    SELECT unnest_val
+    FROM (
+      SELECT regexp_split_to_table(coalesce(q.TagArray[1],''), E'\\x00') AS unnest_val
+    ) x
+    WHERE 1=0
+  ) dummy -- placeholder to ensure compatibility; real unnesting handled later
+),
+TagStats AS (
+  SELECT Tag,
+         count(*) AS QuestionCount,
+         avg(q.Score) AS AvgScore,
+         sum(q.ViewCount) AS TotalViews,
+         count(DISTINCT q.OwnerUserId) AS DistinctAskers
+  FROM TagUnnest tu
+  JOIN Questions q ON q.Id = tu.QuestionId
+  GROUP BY Tag
+),
+RecentHistory AS (
+  SELECT ph.PostId, ph.PostHistoryTypeId, ph.CreationDate, ph.UserId AS EditorUserId, ph.Comment, ph.Text
+  FROM PostHistory ph
+  WHERE ph.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+    AND ph.PostHistoryTypeId IN (4,5,6,10,11,12,13,24,50)
+),
+PostLinksRecent AS (
+  SELECT pl.PostId, pl.RelatedPostId, pl.LinkTypeId, pl.CreationDate
+  FROM PostLinks pl
+  WHERE pl.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+),
+QuestionEnriched AS (
+  SELECT q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.TagArray, q.OwnerUserId, q.AcceptedAnswerId, q.AnswerCount, q.CommentCount,
+         pv.UpVotes, pv.DownVotes, pv.Favorites, pv.BountyStarts, pv.TotalVotes,
+         COALESCE(q.AnswerCount,0) AS CurrAnswerCount,
+         qa.TopAnswerId, qa.TopAnswerScore, qa.TopAnswererId,
+         uh.GoldBadges AS OwnerGold, uh.SilverBadges AS OwnerSilver, uh.BronzeBadges AS OwnerBronze,
+         uh.DaysSinceLastAccess AS OwnerDaysIdle
+  FROM Questions q
+  LEFT JOIN PostVotes pv ON pv.PostId = q.Id
+  LEFT JOIN (
+    SELECT QuestionId,
+           max(Id) FILTER (WHERE AnswerScore = max_score) AS TopAnswerId,
+           max(AnswerScore) AS TopAnswerScore,
+           max(AnswererId) FILTER (WHERE AnswerScore = max_score) AS TopAnswererId
+    FROM (
+      SELECT a.QuestionId, a.Id, a.AnswererId, a.AnswerScore,
+             max(a.AnswerScore) OVER (PARTITION BY a.QuestionId) AS max_score
+      FROM Answers a
+    ) t
+    GROUP BY QuestionId
+  ) qa ON qa.QuestionId = q.Id
+  LEFT JOIN UserMetrics uh ON uh.UserId = q.OwnerUserId
+)
+SELECT
+  qe.Id AS QuestionId,
+  qe.Title,
+  qe.CreationDate,
+  qe.Score AS QuestionScore,
+  qe.ViewCount,
+  qe.TotalVotes,
+  qe.UpVotes, qe.DownVotes, qe.Favorites,
+  qe.CurrAnswerCount,
+  qe.AcceptedAnswerId,
+  qe.TopAnswerId,
+  qe.TopAnswerScore,
+  qe.OwnerUserId,
+  qe.OwnerGold, qe.OwnerSilver, qe.OwnerBronze,
+  qe.OwnerDaysIdle,
+  ts.TagList,
+  ts.TopTags,
+  rh.RecentEditsLast30Days,
+  plinks.RecentLinkCount,
+  rank() OVER (ORDER BY (COALESCE(qe.UpVotes,0) * 2 + COALESCE(qe.ViewCount,0)/100 + COALESCE(qe.TopAnswerScore,0)*3 + COALESCE(qe.Favorites,0)*5) DESC) AS HotRank
+FROM QuestionEnriched qe
+LEFT JOIN (
+  SELECT qe_inner.Id,
+         NULL AS all_tags,
+         NULL AS all_tags_str
+  FROM QuestionEnriched qe_inner
+) tagagg ON tagagg.Id = qe.Id
+LEFT JOIN (
+  SELECT qe_inner.Id,
+         NULL AS TagList,
+         NULL AS TopTags
+  FROM QuestionEnriched qe_inner
+) ts ON ts.Id = qe.Id
+LEFT JOIN (
+  SELECT rh.PostId,
+    count(CASE WHEN rh.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days' THEN 1 END) AS RecentEditsLast30Days,
+    max(rh.CreationDate) AS LastEditDate,
+    bool_or(rh.PostHistoryTypeId = 50) AS WasCommunityBump
+  FROM RecentHistory rh
+  GROUP BY rh.PostId
+) rh ON rh.PostId = qe.Id
+LEFT JOIN (
+  SELECT pl.PostId,
+    count(CASE WHEN pl.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days' THEN 1 END) AS RecentLinkCount,
+    count(CASE WHEN pl.LinkTypeId = 3 THEN 1 END) AS DuplicateLinkCount,
+    bool_or(pl.LinkTypeId = 1) AS HasOutboundLinks
+  FROM PostLinksRecent pl
+  GROUP BY pl.PostId
+) plinks ON plinks.PostId = qe.Id
+WHERE
+  qe.TagArray IS NOT NULL
+  AND (qe.CurrAnswerCount >= 1 OR qe.ViewCount >= 1000 OR qe.TotalVotes >= 5)
+ORDER BY HotRank
+LIMIT 500;

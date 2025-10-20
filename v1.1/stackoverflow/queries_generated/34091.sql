@@ -1,0 +1,134 @@
+-- {"query": "34091.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 1303} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id, 
+        t.TagName, 
+        ARRAY[t.TagName] AS TagPath,
+        1 AS Depth
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+
+    UNION ALL
+
+    SELECT 
+        c.Id,
+        c.TagName,
+        p.TagPath || c.TagName,
+        p.Depth + 1
+    FROM Tags c
+    JOIN PostTags pt ON pt.TagId = c.Id
+    JOIN Posts pposts ON pposts.Id = pt.PostId
+    JOIN RecursiveTagHierarchy p ON p.TagName = ANY(string_to_array(pposts.Tags, '><'))
+    WHERE c.TagName <> ALL(p.TagPath)
+),
+UserBadgeCounts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COUNT(b.Id) AS TotalBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TopActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) AS PostCount,
+        COALESCE(SUM(p.Score),0) AS TotalPostScore,
+        COUNT(DISTINCT ph.Id) AS EditCount,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.CreationDate >= NOW() - INTERVAL '1 year'
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id AND ph.CreationDate >= NOW() - INTERVAL '1 year'
+    LEFT JOIN UserBadgeCounts ub ON ub.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges
+    HAVING COUNT(p.Id) > 10
+),
+QuestionAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionDate,
+        q.OwnerUserId AS QuestionOwner,
+        COUNT(a.Id) AS AnswerCount,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        SUM(COALESCE(vUp.VoteCount,0)) AS TotalUpVotesOnAnswers
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2 AND a.Score IS NOT NULL
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS VoteCount
+        FROM Votes v
+        WHERE v.VoteTypeId = 2 -- UpMod
+        GROUP BY PostId
+    ) vUp ON vUp.PostId = a.Id
+    WHERE q.PostTypeId = 1 AND q.CreationDate >= NOW() - INTERVAL '1 year'
+    GROUP BY q.Id, q.Title, q.CreationDate, q.OwnerUserId
+    HAVING COUNT(a.Id) > 0
+),
+UserPostLinkStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(pl.Id) AS LinkCount,
+        COUNT(DISTINCT pl.RelatedPostId) AS UniqueLinkedPosts,
+        SUM(CASE WHEN lt.Name = 'Duplicate' THEN 1 ELSE 0 END) AS DuplicateLinks
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    GROUP BY u.Id, u.DisplayName
+),
+LatestCommentsSummary AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(c.Id) AS CommentCount,
+        MAX(c.CreationDate) AS LastCommentDate,
+        STRING_AGG(c.Text, ' | ' ORDER BY c.CreationDate DESC) AS CommentsConcatenated
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    WHERE p.PostTypeId = 1 AND p.CreationDate >= NOW() - INTERVAL '6 months'
+    GROUP BY p.Id
+)
+SELECT
+    taq.QuestionId,
+    taq.Title,
+    to_char(taq.QuestionDate, 'YYYY-MM-DD') as QuestionCreated,
+    u.DisplayName AS QuestionOwnerDisplayName,
+    taq.AnswerCount,
+    ROUND(taq.AvgAnswerScore,2) AS AvgAnswerScore,
+    taq.MaxAnswerScore,
+    taq.TotalUpVotesOnAnswers,
+    uac.PostCount AS OwnerPostCountLastYear,
+    uac.TotalPostScore AS OwnerTotalPostScoreLastYear,
+    uac.GoldBadges,
+    uac.SilverBadges,
+    uac.BronzeBadges,
+    upl.LinkCount,
+    upl.DuplicateLinks,
+    lcs.CommentCount,
+    to_char(lcs.LastCommentDate,'YYYY-MM-DD HH24:MI') AS LastCommentDate,
+    LEFT(lcs.CommentsConcatenated, 500) AS RecentCommentsSample,
+    ARRAY_LENGTH(rth.TagPath,1) AS TagHierarchyDepth,
+    rth.TagPath
+FROM QuestionAnswerStats taq
+INNER JOIN Users u ON u.Id = taq.QuestionOwner
+LEFT JOIN TopActiveUsers uac ON uac.UserId = u.Id
+LEFT JOIN UserPostLinkStats upl ON upl.UserId = u.Id
+LEFT JOIN LatestCommentsSummary lcs ON lcs.PostId = taq.QuestionId
+LEFT JOIN LATERAL (
+    SELECT rth.TagPath
+    FROM RecursiveTagHierarchy rth
+    WHERE rth.TagName = (SELECT UNNEST(string_to_array(taq.Title, ' ')) LIMIT 1)
+    ORDER BY rth.Depth DESC
+    LIMIT 1
+) rth ON TRUE
+ORDER BY taq.TotalUpVotesOnAnswers DESC
+LIMIT 25;

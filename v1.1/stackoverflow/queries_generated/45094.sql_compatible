@@ -1,0 +1,77 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id, 
+        p.Title, 
+        p.Score, 
+        p.ViewCount,
+        p.AnswerCount,
+        u.DisplayName,
+        u.Reputation,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS PostRank,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.CreationDate) AS UserPostSequence
+    FROM 
+        Posts p
+    JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    WHERE 
+        p.PostTypeId = 1 
+        AND p.ClosedDate IS NULL
+        AND p.Score > 10
+        AND p.CreationDate > DATE '2018-01-01'
+), 
+ExplodedTags AS (
+    -- normalize tag string like '<tag1><tag2>' into rows of tag text
+    SELECT
+        p.Id AS PostId,
+        TRIM(tag_item) AS TagName
+    FROM
+        Posts p,
+        -- replace Postgres-specific string_to_array/substr usage with standard SQL: use REPLACE/REGEXP; emulate by splitting using recursive CTE
+        LATERAL (
+            SELECT regexp_split_to_table(
+                substring(p.Tags FROM 2 FOR (char_length(p.Tags) - 2)),
+                '><'
+            ) AS tag_item
+        ) AS tag_rows
+),
+TagAnalysis AS (
+    SELECT 
+        et.TagName, 
+        COUNT(DISTINCT p.Id) AS TagPostCount,
+        AVG(p.Score) AS AvgTagScore,
+        MAX(p.ViewCount) AS MaxTagViewCount
+    FROM 
+        Posts p
+    JOIN
+        ExplodedTags et ON p.Id = et.PostId
+    GROUP BY 
+        et.TagName
+)
+SELECT 
+    rp.Id,
+    rp.Title,
+    rp.Score,
+    rp.ViewCount,
+    rp.DisplayName,
+    rp.Reputation,
+    rp.PostRank,
+    rp.UserPostSequence,
+    ta.TagName,
+    ta.TagPostCount,
+    ta.AvgTagScore,
+    ta.MaxTagViewCount
+FROM 
+    RankedPosts rp
+JOIN 
+    Posts p ON rp.Id = p.Id
+JOIN
+    ExplodedTags et ON p.Id = et.PostId
+JOIN 
+    TagAnalysis ta ON et.TagName = ta.TagName
+WHERE 
+    rp.PostRank <= 100
+    AND ta.TagPostCount > 50
+ORDER BY 
+    rp.PostRank, 
+    ta.TagPostCount DESC
+LIMIT 1000;

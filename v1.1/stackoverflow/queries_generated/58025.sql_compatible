@@ -1,0 +1,123 @@
+WITH ActiveUsers AS (
+    SELECT Id, DisplayName, Location, Reputation, LastAccessDate
+    FROM Users
+    WHERE Reputation > 10000 
+      AND LastAccessDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30' DAY
+),
+UserPosts AS (
+    SELECT 
+        p.OwnerUserId, 
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LatestPostDate
+    FROM Posts p
+    JOIN ActiveUsers u ON p.OwnerUserId = u.Id
+    GROUP BY p.OwnerUserId
+),
+UserComments AS (
+    SELECT 
+        c.UserId,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        AVG(c.Score) AS AvgCommentScore,
+        MAX(c.CreationDate) AS LatestCommentDate
+    FROM Comments c
+    JOIN ActiveUsers u ON c.UserId = u.Id
+    GROUP BY c.UserId
+),
+UserVotes AS (
+    SELECT 
+        v.UserId,
+        COUNT(DISTINCT CASE WHEN vt.Name = 'UpMod' THEN v.Id END) AS UpvotesGiven,
+        COUNT(DISTINCT CASE WHEN vt.Name = 'DownMod' THEN v.Id END) AS DownvotesGiven,
+        COUNT(DISTINCT CASE WHEN vt.Name = 'BountyStart' THEN v.Id END) AS BountiesStarted
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    JOIN ActiveUsers u ON v.UserId = u.Id
+    GROUP BY v.UserId
+),
+UserBadges AS (
+    SELECT 
+        b.UserId,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges
+    FROM Badges b
+    JOIN ActiveUsers u ON b.UserId = u.Id
+    GROUP BY b.UserId
+),
+TagEngagement AS (
+    SELECT 
+        p.OwnerUserId,
+        unnest(string_to_array(replace(replace(p.Tags, '><', ','), '<', ''), '>')) AS Tag,
+        COUNT(DISTINCT p.Id) AS TagUsageCount
+    FROM Posts p
+    JOIN ActiveUsers u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId, Tag
+),
+RankedTags AS (
+    SELECT 
+        OwnerUserId,
+        Tag,
+        TagUsageCount,
+        RANK() OVER (PARTITION BY OwnerUserId ORDER BY TagUsageCount DESC) AS TagRank
+    FROM TagEngagement
+)
+SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Location,
+    COALESCE(up.TotalPosts, 0) AS TotalPosts,
+    COALESCE(up.Questions, 0) AS Questions,
+    COALESCE(up.Answers, 0) AS Answers,
+    COALESCE(uc.TotalComments, 0) AS TotalComments,
+    COALESCE(uv.UpvotesGiven, 0) AS UpvotesGiven,
+    COALESCE(uv.DownvotesGiven, 0) AS DownvotesGiven,
+    COALESCE(uv.BountiesStarted, 0) AS BountiesStarted,
+    COALESCE(ub.TotalBadges, 0) AS TotalBadges,
+    COALESCE(ub.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ub.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ub.BronzeBadges, 0) AS BronzeBadges,
+    (SELECT STRING_AGG(rt.Tag, ', ' ORDER BY rt.TagRank) 
+     FROM RankedTags rt 
+     WHERE rt.OwnerUserId = u.Id AND rt.TagRank <= 3) AS Top3Tags,
+    ROW_NUMBER() OVER (ORDER BY COALESCE(up.TotalPosts,0) DESC) AS PostsRank,
+    ROW_NUMBER() OVER (ORDER BY COALESCE(uc.TotalComments,0) DESC) AS CommentsRank,
+    ROW_NUMBER() OVER (ORDER BY COALESCE(ub.TotalBadges,0) DESC) AS BadgesRank
+FROM ActiveUsers u
+LEFT JOIN UserPosts up ON u.Id = up.OwnerUserId
+LEFT JOIN UserComments uc ON u.Id = uc.UserId
+LEFT JOIN UserVotes uv ON u.Id = uv.UserId
+LEFT JOIN UserBadges ub ON u.Id = ub.UserId
+WHERE (up.LatestPostDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '7' DAY)
+   OR (uc.LatestCommentDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '7' DAY)
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Location,
+    u.Reputation,
+    u.LastAccessDate,
+    up.TotalPosts,
+    up.Questions,
+    up.Answers,
+    up.AvgPostScore,
+    up.LatestPostDate,
+    uc.TotalComments,
+    uc.AvgCommentScore,
+    uc.LatestCommentDate,
+    uv.UpvotesGiven,
+    uv.DownvotesGiven,
+    uv.BountiesStarted,
+    ub.TotalBadges,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges
+HAVING AVG(COALESCE(up.AvgPostScore,0)) > 10 OR AVG(COALESCE(uc.AvgCommentScore,0)) > 2
+ORDER BY 
+    up.TotalPosts DESC, 
+    uc.TotalComments DESC, 
+    ub.TotalBadges DESC
+LIMIT 100;

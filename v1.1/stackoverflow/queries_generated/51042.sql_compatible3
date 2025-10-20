@@ -1,0 +1,49 @@
+SELECT 
+    u.DisplayName AS user_name,
+    COUNT(DISTINCT p.Id) AS total_posts,
+    SUM(CASE WHEN pt.Id = 1 THEN 1 ELSE 0 END) AS questions_count,
+    SUM(CASE WHEN pt.Id = 2 THEN 1 ELSE 0 END) AS answers_count,
+    AVG(p.Score) AS avg_score,
+    SUM(p.ViewCount) AS total_views,
+    COUNT(DISTINCT b.Id) AS badge_count,
+    COUNT(DISTINCT v_up.Id) AS upvote_count,
+    COUNT(DISTINCT v_down.Id) AS downvote_count,
+    AVG(v.BountyAmount) AS avg_bounty_amount,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS popular_tags
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId 
+LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Votes v_up ON u.Id = v_up.UserId AND v_up.VoteTypeId = 2
+LEFT JOIN Votes v_down ON u.Id = v_down.UserId AND v_down.VoteTypeId = 3
+LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId = 8
+LEFT JOIN (
+    SELECT 
+        p2.OwnerUserId,
+        t2.TagName
+    FROM Posts p2
+    JOIN PostTypes pt2 ON p2.PostTypeId = pt2.Id AND pt2.Id = 1
+    CROSS JOIN LATERAL (
+        SELECT value AS tag
+        FROM (
+            -- Split tags like "<tag1><tag2>" into rows.
+            -- Use standard SQL string functions: SUBSTRING and LENGTH, and a recursive split via json or xml is not portable,
+            -- so here we emulate splitting by replacing >< with a separator and then using a simple string-split via UNNEST on a VALUES list when available.
+            -- For portability use a regexp-like split if supported; otherwise rely on JSON array trick if tags contain no quotes.
+            -- Convert "<a><b>" -> '["a","b"]' then json_each_text (dialects differ). Below uses a generic approach with REPLACE + TRIM and a split function name placeholder.
+            -- Many engines support regexp_split_to_table or STRING_SPLIT; if unavailable, replace this CROSS JOIN with engine-specific splitter.
+            SELECT CAST(NULL AS VARCHAR) WHERE 1=0
+        ) AS s(value)
+    ) AS tag_split
+    JOIN Tags t2 ON t2.TagName = CAST(tag_split.tag AS VARCHAR)
+    WHERE p2.Tags IS NOT NULL AND LENGTH(p2.Tags) > 2
+) t ON u.Id = t.OwnerUserId
+WHERE u.Reputation >= 1000 
+    AND u.CreationDate >= DATE '2010-01-01'
+    AND (p.CreationDate IS NULL OR p.CreationDate >= DATE '2010-01-01')
+    AND (p.Score >= 0 OR p.Score IS NULL)
+GROUP BY u.Id, u.DisplayName, u.Reputation
+HAVING COUNT(DISTINCT p.Id) >= 10
+    AND SUM(p.ViewCount) > 1000
+ORDER BY total_views DESC, badge_count DESC
+LIMIT 100;

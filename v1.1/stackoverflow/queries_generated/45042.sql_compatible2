@@ -1,0 +1,26 @@
+SELECT
+    p.Id AS PostId,
+    p.Title,
+    u.DisplayName AS UserName,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    COUNT(DISTINCT pl.Id) AS RelatedPostsCount,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS MedianScore
+FROM 
+    Posts p
+JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Comments c ON p.Id = c.PostId
+LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN Votes v ON p.Id = v.PostId
+WHERE 
+    p.CreationDate > (
+        SELECT TO_TIMESTAMP(AVG(EXTRACT(EPOCH FROM CreationDate))) 
+        FROM Posts
+    )
+    AND u.Reputation > 1000
+GROUP BY 
+    p.Id, p.Title, u.DisplayName, p.Score
+ORDER BY 
+    UpVotes - DownVotes DESC
+LIMIT 500;

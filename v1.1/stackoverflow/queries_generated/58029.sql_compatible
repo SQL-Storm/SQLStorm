@@ -1,0 +1,32 @@
+SELECT 
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId IN (1,2)) AS PostCount,
+  (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id) AS CommentCount,
+  (SELECT COUNT(*) FROM Votes v JOIN Posts p ON v.PostId = p.Id WHERE p.OwnerUserId = u.Id AND v.VoteTypeId = 2) AS UpVotes,
+  (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+  (SELECT COUNT(DISTINCT ph.Id) FROM PostHistory ph WHERE ph.UserId = u.Id AND ph.PostHistoryTypeId IN (5,6)) AS EditCount,
+  (SELECT COUNT(DISTINCT tag) FROM (
+      SELECT unnest(string_to_array(SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), '><')) AS tag
+      FROM Posts p
+      WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    ) AS tags) AS UniqueTags
+FROM Users u
+WHERE u.Reputation > 1000
+  AND u.CreationDate > DATE '2010-01-01'
+  AND (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId IN (1,2)) > 10
+  AND (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id) > 20
+ORDER BY (
+  (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId IN (1,2)) * 5
+  + (SELECT COUNT(*) FROM Comments c2 WHERE c2.UserId = u.Id) * 2
+  + (SELECT COUNT(*) FROM Votes v2 JOIN Posts p3 ON v2.PostId = p3.Id WHERE p3.OwnerUserId = u.Id AND v2.VoteTypeId = 2) * 3
+  + (SELECT COUNT(*) FROM Badges b2 WHERE b2.UserId = u.Id AND b2.Class = 1) * 10
+  + (SELECT COUNT(DISTINCT ph2.Id) FROM PostHistory ph2 WHERE ph2.UserId = u.Id AND ph2.PostHistoryTypeId IN (5,6)) * 2
+  + (SELECT COUNT(DISTINCT tag) FROM (
+       SELECT unnest(string_to_array(SUBSTRING(p4.Tags FROM 2 FOR (CHAR_LENGTH(p4.Tags)-2)), '><')) AS tag
+       FROM Posts p4
+       WHERE p4.OwnerUserId = u.Id AND p4.PostTypeId = 1
+     ) AS tags2) * 4
+) DESC
+LIMIT 100;

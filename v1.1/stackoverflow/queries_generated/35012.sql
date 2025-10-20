@@ -1,0 +1,59 @@
+-- {"query": "35012.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4.1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 464} 
+WITH FrequentEditors AS (
+    SELECT
+        ph.UserId,
+        u.DisplayName,
+        COUNT(*) AS EditCount,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM PostHistory ph
+    JOIN Users u ON u.Id = ph.UserId
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+    GROUP BY ph.UserId, u.DisplayName
+    HAVING COUNT(*) > 20
+),
+TopTags AS (
+    SELECT
+        t.TagName,
+        SUM(t.Count) AS TotalTagCount
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+    GROUP BY t.TagName
+    ORDER BY TotalTagCount DESC
+    LIMIT 20
+),
+TagEdits AS (
+    SELECT
+        t.TagName,
+        fe.UserId,
+        fe.DisplayName,
+        COUNT(DISTINCT ph.Id) AS EditsOnTag
+    FROM TopTags t
+    JOIN Posts p ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    JOIN PostHistory ph ON ph.PostId = p.Id
+        AND ph.UserId IS NOT NULL
+        AND ph.PostHistoryTypeId IN (4, 5, 6)
+    JOIN FrequentEditors fe ON fe.UserId = ph.UserId
+    GROUP BY t.TagName, fe.UserId, fe.DisplayName
+)
+SELECT
+    tt.TagName,
+    te.DisplayName AS TopEditor,
+    te.EditsOnTag,
+    fe.EditCount AS TotalEditsByUser,
+    fe.LastEditDate,
+    u.Reputation,
+    u.UpVotes,
+    u.DownVotes
+FROM TopTags tt
+LEFT JOIN (
+    SELECT 
+        TagName,
+        UserId,
+        DisplayName,
+        EditsOnTag,
+        ROW_NUMBER() OVER (PARTITION BY TagName ORDER BY EditsOnTag DESC, UserId ASC) AS rn
+    FROM TagEdits
+) te ON te.TagName = tt.TagName AND te.rn = 1
+LEFT JOIN FrequentEditors fe ON fe.UserId = te.UserId
+LEFT JOIN Users u ON u.Id = te.UserId
+ORDER BY tt.TotalTagCount DESC, te.EditsOnTag DESC NULLS LAST, tt.TagName;

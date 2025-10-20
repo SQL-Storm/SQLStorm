@@ -1,0 +1,124 @@
+-- {"query": "54091.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2048, "output_tokens": 3191} 
+WITH question_stats AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Score AS QuestionScore,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        p.LastActivityDate
+    FROM Posts p
+    WHERE p.PostTypeId = 1          -- only questions
+),
+answer_stats AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score AS AnswerScore,
+        a.OwnerUserId,
+        a.LastActivityDate
+    FROM Posts a
+    WHERE a.PostTypeId = 2          -- only answers
+),
+vote_agg AS (
+    SELECT
+        v.PostId,
+        v.VoteTypeId,
+        COUNT(*) AS VoteCount
+    FROM Votes v
+    GROUP BY v.PostId, v.VoteTypeId
+),
+badges_by_user AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+badges_summed AS (
+    SELECT
+        ub.UserId,
+        SUM(CASE WHEN ub.Class = 1 THEN ub.BadgeCount ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN ub.Class = 2 THEN ub.BadgeCount ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN ub.Class = 3 THEN ub.BadgeCount ELSE 0 END) AS BronzeBadges
+    FROM badges_by_user ub
+    GROUP BY ub.UserId
+),
+latest_activity AS (
+    SELECT
+        u.Id AS UserId,
+        MAX(COALESCE(p.LastActivityDate, a.LastActivityDate, c.CreationDate, ph.CreationDate)) AS LastActive
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    GROUP BY u.Id
+),
+tag_parse AS (
+    SELECT
+        q.QuestionId,
+        UNNEST(REGEXP_SPLIT_TO_ARRAY(REGEXP_REPLACE(q.Tags, '[<>]', '', 'g'), '\\s+')) AS tag_name
+    FROM question_stats q
+),
+tag_counts AS (
+    SELECT
+        tp.tag_name,
+        COUNT(*) AS QuestionCount,
+        AVG(qs.QuestionScore) AS AvgScore
+    FROM tag_parse tp
+    JOIN question_stats qs ON qs.QuestionId = tp.QuestionId
+    GROUP BY tp.tag_name
+),
+user_summary AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(b.GoldBadges,0)   AS GoldBadges,
+        COALESCE(b.SilverBadges,0) AS SilverBadges,
+        COALESCE(b.BronzeBadges,0) AS BronzeBadges,
+        COALESCE(vq.UpVotes,0)     AS UpVotes,
+        COALESCE(vq.DownVotes,0)   AS DownVotes,
+        COALESCE(vq.FavoriteVotes,0) AS FavoriteVotes,
+        COALESCE(la.LastActive, '1970-01-01') AS LastActive
+    FROM Users u
+    LEFT JOIN badging_summed b ON b.UserId = u.Id
+    LEFT JOIN (
+        SELECT
+            vp.PostId,
+            SUM(CASE WHEN vp.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vp.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+            SUM(CASE WHEN vp.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteVotes
+        FROM Votes vp
+        GROUP BY vp.PostId
+    ) vq ON vq.PostId = u.Id
+    LEFT JOIN latest_activity la ON la.UserId = u.Id
+)
+SELECT
+    us.Id          AS UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.UpVotes,
+    us.DownVotes,
+    us.FavoriteVotes,
+    us.LastActive,
+    COUNT(DISTINCT qs.QuestionId) AS QuestionsAnswered,
+    AVG(qs.AnswerScore)           AS AvgAnswerScore,
+    STRING_AGG(DISTINCT tc.tag_name, ',') AS TopTags,
+    AVG(tc.AvgScore)             AS AvgTagScore
+FROM Users u
+JOIN Users us ON us.Id = u.Id
+JOIN answer_stats qs ON qs.OwnerUserId = us.Id
+JOIN question_stats qst ON qst.QuestionId = qs.QuestionId
+LEFT JOIN tag_parse tp ON tp.QuestionId = qs.QuestionId
+LEFT JOIN tag_counts tc ON tc.tag_name = tp.tag_name
+GROUP BY us.Id, us.DisplayName, us.Reputation, us.GoldBadges,
+         us.SilverBadges, us.BronzeBadges, us.UpVotes,
+         us.DownVotes, us.FavoriteVotes, us.LastActive
+ORDER BY us.Reputation DESC, us.GoldBadges DESC
+LIMIT 50;

@@ -1,0 +1,56 @@
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserJoinDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        (SELECT AVG(CAST(p2.Score AS NUMERIC)) FROM Posts p2 WHERE p2.PostTypeId = 1) AS AvgPostScore,
+        RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS PostRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId IN (2, 3, 8)
+    LEFT JOIN Badges b ON u.Id = b.UserId AND b.Date >= (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+    WHERE u.Reputation > 1000
+      AND u.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '5 years')
+    GROUP BY u.Id, u.Reputation, u.CreationDate
+)
+SELECT 
+    ua.UserId,
+    ua.Reputation,
+    ua.TotalPosts,
+    ua.TotalComments,
+    ua.TotalVotes,
+    ua.GoldBadges,
+    ph.PostHistoryCount,
+    pl.DuplicateLinks,
+    (SELECT AVG(CAST(p3.AnswerCount AS NUMERIC)) FROM Posts p3 WHERE p3.OwnerUserId = ua.UserId) AS AvgAnswersPerQuestion,
+    ua.PostRank
+FROM UserActivity ua
+LEFT JOIN (
+    SELECT 
+        UserId,
+        COUNT(DISTINCT Id) AS PostHistoryCount
+    FROM PostHistory
+    WHERE PostHistoryTypeId IN (2, 5, 10, 12)
+    GROUP BY UserId
+) ph ON ua.UserId = ph.UserId
+LEFT JOIN (
+    SELECT 
+        OwnerUserId,
+        COUNT(*) AS DuplicateLinks
+    FROM PostLinks pl2
+    JOIN Posts p ON pl2.PostId = p.Id
+    WHERE pl2.LinkTypeId = 3
+    GROUP BY OwnerUserId
+) pl ON ua.UserId = pl.OwnerUserId
+WHERE ua.GoldBadges >= 3
+  AND ua.TotalPosts > (SELECT AVG(CAST(TotalPosts AS NUMERIC)) FROM UserActivity)
+ORDER BY 
+    ua.Reputation DESC,
+    ua.TotalPosts DESC,
+    COALESCE(ph.PostHistoryCount, 0) DESC
+LIMIT 100;

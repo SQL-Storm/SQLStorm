@@ -1,4 +1,4 @@
--- {"query": "24083.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1594} 
+-- {"query": "24083.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1594} 
 WITH cte_questions AS (
     SELECT p.Id, p.Title, p.Tags, p.CreationDate, p.Score,
            COALESCE(p.AcceptedAnswerId, 0) AS AcceptedAnswerId,

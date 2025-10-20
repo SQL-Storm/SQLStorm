@@ -1,0 +1,133 @@
+WITH RecursiveUserBadges AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        b.Name AS BadgeName,
+        b.Class AS BadgeClass,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY b.Date DESC) AS rn
+    FROM Users u
+    JOIN Badges b ON b.UserId = u.Id
+    WHERE b.Class IN (1, 2, 3)
+),
+TopBadgesPerUser AS (
+    SELECT UserId, DisplayName, BadgeName, BadgeClass
+    FROM RecursiveUserBadges
+    WHERE rn <= 3
+),
+QuestionStats AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount END) AS AvgQuestionViews,
+        COUNT(CASE WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN 1 END) AS ClosedQuestions,
+        COUNT(CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 1 END) AS QuestionsWithAcceptedAnswer
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+AnswerStats AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore,
+        COUNT(CASE WHEN p.PostTypeId = 2 AND p.ParentId IS NOT NULL THEN 1 END) AS AnswersWithParent
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserVoteSummary AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS TotalUpVotesGiven,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS TotalDownVotesGiven,
+        COUNT(CASE WHEN v.VoteTypeId = 5 THEN 1 END) AS TotalFavoritesGiven
+    FROM Users u
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id
+),
+TopActiveUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        us.QuestionCount,
+        us.AvgQuestionScore,
+        asn.AnswerCount,
+        asn.AvgAnswerScore,
+        COALESCE(uvs.TotalUpVotesGiven,0) AS UpVotesGiven,
+        COALESCE(uvs.TotalDownVotesGiven,0) AS DownVotesGiven,
+        COALESCE(uvs.TotalFavoritesGiven,0) AS FavoritesGiven
+    FROM Users u
+    LEFT JOIN QuestionStats us ON us.OwnerUserId = u.Id
+    LEFT JOIN AnswerStats asn ON asn.OwnerUserId = u.Id
+    LEFT JOIN UserVoteSummary uvs ON uvs.UserId = u.Id
+    WHERE u.Reputation > 1000
+),
+TopTagsByActivity AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id) AS PostsCount,
+        AVG(p.Score) AS AvgPostScore,
+        COUNT(DISTINCT p.OwnerUserId) AS DistinctOwners
+    FROM Tags t
+    JOIN Posts p ON p.PostTypeId = 1 AND p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    GROUP BY t.TagName
+    ORDER BY PostsCount DESC
+    LIMIT 10
+),
+UserTagActivity AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')) AS TagName,
+        COUNT(*) AS PostsByTag
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.PostTypeId = 1
+    GROUP BY p.OwnerUserId, TagName
+),
+TopUsersPerTag AS (
+    SELECT
+        uta.TagName,
+        uta.UserId,
+        u.DisplayName,
+        uta.PostsByTag,
+        ROW_NUMBER() OVER (PARTITION BY uta.TagName ORDER BY uta.PostsByTag DESC) AS rn
+    FROM UserTagActivity uta
+    JOIN Users u ON u.Id = uta.UserId
+),
+TopUsersPerTagFiltered AS (
+    SELECT TagName, UserId, DisplayName, PostsByTag
+    FROM TopUsersPerTag
+    WHERE rn = 1
+)
+SELECT
+    tu.Id AS UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.QuestionCount,
+    tu.AvgQuestionScore,
+    tu.AnswerCount,
+    tu.AvgAnswerScore,
+    tu.UpVotesGiven,
+    tu.DownVotesGiven,
+    tu.FavoritesGiven,
+    COALESCE(tb.BadgeNames, '') AS TopBadges,
+    ARRAY_AGG(DISTINCT tt.TagName) FILTER (WHERE tt.TagName IS NOT NULL) AS TopTags,
+    ARRAY_AGG(
+        JSON_BUILD_OBJECT('TagName', tut.TagName, 'DisplayName', tut.DisplayName, 'PostsByTag', tut.PostsByTag)
+    ) AS TopUsersPerTagDetails
+FROM TopActiveUsers tu
+LEFT JOIN (
+    SELECT UserId, STRING_AGG(BadgeName || ' (' || BadgeClass || ')', ', ') AS BadgeNames
+    FROM TopBadgesPerUser
+    GROUP BY UserId
+) tb ON tb.UserId = tu.Id
+LEFT JOIN (
+    SELECT DISTINCT TagName FROM TopTagsByActivity
+) tt ON TRUE
+LEFT JOIN TopUsersPerTagFiltered tut ON tut.TagName = tt.TagName AND tut.UserId = tu.Id
+GROUP BY
+    tu.Id, tu.DisplayName, tu.Reputation, tu.QuestionCount, tu.AvgQuestionScore,
+    tu.AnswerCount, tu.AvgAnswerScore, tu.UpVotesGiven, tu.DownVotesGiven, tu.FavoritesGiven, tb.BadgeNames
+ORDER BY tu.Reputation DESC
+LIMIT 50;

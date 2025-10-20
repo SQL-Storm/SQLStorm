@@ -1,0 +1,44 @@
+-- {"query": "56030.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "llama-3.3-instruct", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 326} 
+
+SELECT 
+    p.Id, 
+    p.Title, 
+    p.Score, 
+    p.ViewCount, 
+    p.CreationDate, 
+    ph.PostHistoryTypeId, 
+    ph.CreationDate AS PostHistoryCreationDate, 
+    u.Reputation, 
+    u.DisplayName, 
+    v.VoteTypeId, 
+    v.CreationDate AS VoteCreationDate, 
+    t.TagName, 
+    pl.LinkTypeId, 
+    pl.CreationDate AS PostLinkCreationDate
+FROM 
+    Posts p
+JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+JOIN 
+    Users u ON p.OwnerUserId = u.Id
+JOIN 
+    Votes v ON p.Id = v.PostId
+JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+JOIN 
+    Tags t ON p.Id = t.ExcerptPostId
+WHERE 
+    p.PostTypeId = 1 
+    AND ph.PostHistoryTypeId = 10 
+    AND v.VoteTypeId = 2 
+    AND pl.LinkTypeId = 1 
+    AND t.IsModeratorOnly = 0 
+    AND u.Reputation > 1000 
+    AND p.CreationDate > '2020-01-01' 
+    AND ph.CreationDate > '2020-01-01' 
+    AND v.CreationDate > '2020-01-01' 
+    AND pl.CreationDate > '2020-01-01'
+ORDER BY 
+    p.Score DESC, 
+    p.ViewCount DESC, 
+    u.Reputation DESC;

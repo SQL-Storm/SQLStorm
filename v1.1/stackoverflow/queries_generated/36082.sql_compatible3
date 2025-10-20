@@ -1,0 +1,50 @@
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.PostTypeId,
+  p.CreationDate,
+  p.ViewCount,
+  p.Score,
+  p.AnswerCount,
+  p.CommentCount,
+  p.Tags,
+  p.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation,
+  COUNT(DISTINCT v.Id) AS TotalVotes,
+  SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+  SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+  AVG(CASE WHEN v.VoteTypeId IN (2,3) THEN v.BountyAmount ELSE NULL END) AS AvgVoteBounty,
+  MAX(CASE WHEN vh.PostHistoryTypeId = 16 THEN vh.CreationDate END) AS CommunityOwnedDate,
+  (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCountTotal,
+  (SELECT STRING_AGG(TH_sub.Name || ':' || TO_CHAR(vh_sub.CreationDate, 'YYYY-MM-DD HH24:MI:SS'), ';' ORDER BY vh_sub.CreationDate)
+     FROM PostHistory vh_sub
+     JOIN PostHistoryTypes TH_sub ON vh_sub.PostHistoryTypeId = TH_sub.Id
+     WHERE vh_sub.PostId = p.Id AND vh_sub.PostHistoryTypeId IN (16,50,52)
+  ) AS HistorySnapshots
+FROM
+  Posts p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Votes v ON v.PostId = p.Id
+LEFT JOIN PostHistory vh ON vh.PostId = p.Id
+LEFT JOIN PostHistoryTypes TH ON vh.PostHistoryTypeId = TH.Id
+WHERE
+  p.PostTypeId IN (1,2)
+  AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90' DAY)
+GROUP BY
+  p.Id,
+  p.Title,
+  p.PostTypeId,
+  p.CreationDate,
+  p.ViewCount,
+  p.Score,
+  p.AnswerCount,
+  p.CommentCount,
+  p.Tags,
+  p.OwnerUserId,
+  u.DisplayName,
+  u.Reputation
+ORDER BY
+  p.Score DESC,
+  TotalVotes DESC
+LIMIT 100;

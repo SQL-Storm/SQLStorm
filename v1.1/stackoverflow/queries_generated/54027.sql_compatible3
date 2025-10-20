@@ -1,0 +1,56 @@
+WITH question_tags AS (
+    SELECT
+        p.Id AS question_id,
+        p.CreationDate,
+        regexp_split_to_table(btrim(p.Tags, '<>'), '><') AS tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+first_answers AS (
+    SELECT
+        ans.ParentId AS question_id,
+        MIN(ans.CreationDate) AS first_answer_ts
+    FROM Posts ans
+    WHERE ans.PostTypeId = 2
+    GROUP BY ans.ParentId
+),
+tag_stats AS (
+    SELECT
+        qt.tag,
+        COUNT(DISTINCT qt.question_id) AS num_questions,
+        AVG(p.Score) AS avg_score,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS num_with_accepted,
+        AVG(EXTRACT(EPOCH FROM (fa.first_answer_ts - p.CreationDate))) / 3600 AS avg_hours_to_first_answer,
+        COUNT(ph.PostId) AS num_close_votes,
+        JSON_AGG(DISTINCT ph.UserId) AS close_reason_user_ids
+    FROM question_tags qt
+    JOIN Posts p ON p.Id = qt.question_id
+    LEFT JOIN first_answers fa ON fa.question_id = p.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    GROUP BY qt.tag
+),
+ranked_tags AS (
+    SELECT
+        tag,
+        num_questions,
+        avg_score,
+        num_with_accepted,
+        avg_hours_to_first_answer,
+        num_close_votes,
+        close_reason_user_ids,
+        ROW_NUMBER() OVER (
+            ORDER BY num_questions DESC, avg_score DESC
+        ) AS rn
+    FROM tag_stats
+)
+SELECT
+    tag,
+    num_questions,
+    ROUND(avg_score::numeric, 1) AS avg_score,
+    ROUND((CAST(num_with_accepted AS numeric) / NULLIF(CAST(num_questions AS numeric), 0)) * 100, 2) AS pct_accepted,
+    ROUND(avg_hours_to_first_answer::numeric, 1) AS avg_hours_first_answer,
+    num_close_votes,
+    close_reason_user_ids
+FROM ranked_tags
+WHERE rn <= 10
+ORDER BY num_questions DESC, avg_score DESC;

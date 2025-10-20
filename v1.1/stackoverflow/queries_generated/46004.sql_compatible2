@@ -1,0 +1,151 @@
+WITH UserEngagementMetrics AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate as UserCreationDate,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        AVG(p.Score) as AvgPostScore,
+        COUNT(DISTINCT v.Id) as TotalVotesCast,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) as GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) as SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) as BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= DATE '2020-01-01'
+        AND u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) > 5
+),
+TopQuestionAnalysis AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score as QuestionScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.OwnerUserId,
+        p.CreationDate as QuestionCreationDate,
+        COUNT(DISTINCT a.Id) as ActualAnswers,
+        AVG(a.Score) as AvgAnswerScore,
+        MAX(a.Score) as BestAnswerScore,
+        COUNT(DISTINCT pl.Id) as LinkedQuestions,
+        COUNT(DISTINCT ph.Id) as EditHistory,
+        STRING_AGG(DISTINCT t.TagName, ', ' ORDER BY t.TagName) as AllTags
+    FROM Posts p
+    INNER JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Posts a ON p.Id = a.ParentId AND a.PostTypeId = 2
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN (
+        SELECT p_inner.Id as pid,
+               UNNEST(string_to_array(substring(p_inner.Tags from 2 for char_length(p_inner.Tags)-2), '><')) as tag
+        FROM Posts p_inner
+    ) tag_split ON p.Id = tag_split.pid
+    LEFT JOIN Tags t ON tag_split.tag = t.TagName
+    WHERE p.PostTypeId = 1
+        AND p.Score > 10
+        AND p.ViewCount > 1000
+        AND p.CreationDate >= DATE '2019-01-01'
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.OwnerUserId, p.CreationDate
+),
+TagPerformance AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagUsageCount,
+        COUNT(DISTINCT p.Id) as QuestionsWithTag,
+        AVG(p.Score) as AvgQuestionScore,
+        AVG(p.ViewCount) as AvgViews,
+        AVG(p.AnswerCount) as AvgAnswers,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) as MedianScore,
+        COUNT(DISTINCT CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN p.Id END) as QuestionsWithAcceptedAnswer
+    FROM Tags t
+    INNER JOIN (
+        SELECT Posts.Id, Posts.Tags, Posts.Score, Posts.ViewCount, Posts.AnswerCount, Posts.AcceptedAnswerId,
+               UNNEST(string_to_array(substring(Posts.Tags from 2 for char_length(Posts.Tags)-2), '><')) as tag
+        FROM Posts
+        WHERE Posts.PostTypeId = 1
+    ) p ON t.TagName = p.tag
+    WHERE t.Count > 100
+    GROUP BY t.Id, t.TagName, t.Count
+),
+VotingPatterns AS (
+    SELECT 
+        v.PostId,
+        v.UserId as VoterId,
+        vt.Name as VoteTypeName,
+        COUNT(*) as VoteCount,
+        v.CreationDate as VoteDate,
+        p.PostTypeId,
+        p.OwnerUserId as PostOwnerId
+    FROM Votes v
+    INNER JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    INNER JOIN Posts p ON v.PostId = p.Id
+    WHERE v.VoteTypeId IN (2, 3, 5, 8)
+        AND v.CreationDate >= DATE '2020-01-01'
+    GROUP BY v.PostId, v.UserId, vt.Name, v.CreationDate, p.PostTypeId, p.OwnerUserId
+)
+SELECT 
+    uem.DisplayName,
+    uem.Reputation,
+    uem.TotalPosts,
+    uem.QuestionCount,
+    uem.AnswerCount,
+    uem.AvgPostScore,
+    uem.CommentCount,
+    uem.GoldBadges,
+    uem.SilverBadges,
+    uem.BronzeBadges,
+    tqa.Title as TopQuestionTitle,
+    tqa.QuestionScore,
+    tqa.ViewCount,
+    tqa.AnswerCount as QuestionAnswerCount,
+    tqa.AvgAnswerScore,
+    tqa.AllTags,
+    tp.TagName as PrimaryTag,
+    tp.AvgQuestionScore as TagAvgScore,
+    tp.AvgViews as TagAvgViews,
+    COUNT(DISTINCT vp.VoterId) as UniqueVotersOnUserPosts,
+    SUM(CASE WHEN vp.VoteTypeName = 'UpMod' THEN vp.VoteCount ELSE 0 END) as TotalUpvotesReceived,
+    SUM(CASE WHEN vp.VoteTypeName = 'DownMod' THEN vp.VoteCount ELSE 0 END) as TotalDownvotesReceived,
+    RANK() OVER (ORDER BY uem.Reputation DESC) as ReputationRank,
+    DENSE_RANK() OVER (PARTITION BY tp.TagName ORDER BY uem.AvgPostScore DESC) as TagSpecificRank
+FROM UserEngagementMetrics uem
+LEFT JOIN TopQuestionAnalysis tqa ON uem.UserId = tqa.OwnerUserId
+LEFT JOIN LATERAL (
+    SELECT tp_inner.*
+    FROM TagPerformance tp_inner
+    WHERE tp_inner.TagName = (
+        SELECT t.TagName 
+        FROM Posts p
+        CROSS JOIN LATERAL (
+            SELECT UNNEST(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as tag_name
+        ) tag_name_tbl
+        INNER JOIN Tags t ON tag_name_tbl.tag_name = t.TagName
+        WHERE p.OwnerUserId = uem.UserId AND p.PostTypeId = 1
+        GROUP BY t.TagName
+        ORDER BY COUNT(*) DESC
+        LIMIT 1
+    )
+    LIMIT 1
+) tp ON true
+LEFT JOIN VotingPatterns vp ON tqa.QuestionId = vp.PostId
+WHERE uem.TotalPosts > 10
+    AND tqa.QuestionScore IS NOT NULL
+GROUP BY 
+    uem.UserId, uem.DisplayName, uem.Reputation, uem.TotalPosts, uem.QuestionCount, 
+    uem.AnswerCount, uem.AvgPostScore, uem.CommentCount, uem.GoldBadges, 
+    uem.SilverBadges, uem.BronzeBadges, tqa.QuestionId, tqa.Title, tqa.QuestionScore, 
+    tqa.ViewCount, tqa.AnswerCount, tqa.AvgAnswerScore, tqa.AllTags, 
+    tp.TagName, tp.AvgQuestionScore, tp.AvgViews
+ORDER BY uem.Reputation DESC, tqa.QuestionScore DESC
+LIMIT 1000;

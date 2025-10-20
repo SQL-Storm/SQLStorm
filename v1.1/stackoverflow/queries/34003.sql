@@ -1,0 +1,91 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT t.Id, t.TagName, t.Count, t.ExcerptPostId, 0 AS Level
+    FROM Tags t
+    WHERE t.Count > 1000
+    UNION ALL
+    SELECT t.Id, t.TagName, t.Count, t.ExcerptPostId, r.Level + 1
+    FROM Tags t
+    JOIN PostLinks pl ON pl.RelatedPostId = t.ExcerptPostId
+    JOIN RecursiveTagHierarchy r ON r.ExcerptPostId = pl.PostId
+    WHERE r.Level < 2
+),
+TopUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location,
+           row_number() OVER (ORDER BY u.Reputation DESC) AS rn
+    FROM Users u
+    WHERE u.Reputation > 5000 AND u.Location IS NOT NULL
+),
+UserBadges AS (
+    SELECT b.UserId, b.Name, b.Class,
+           count(*) OVER (PARTITION BY b.UserId, b.Class) AS BadgeCount
+    FROM Badges b
+    WHERE b.Class IN (1, 2, 3)
+),
+QuestionStats AS (
+    SELECT p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate, p.OwnerUserId,
+           count(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId = 4) AS TitleEdits,
+           count(DISTINCT c.Id) AS CommentCount,
+           row_number() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RN
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    WHERE p.PostTypeId = 1 AND p.Score > 5 AND p.ViewCount > 100
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate, p.OwnerUserId
+),
+AnswerAggregation AS (
+    SELECT p.ParentId AS QuestionId,
+           count(p.Id) AS AnswerCount,
+           avg(p.Score) AS AvgAnswerScore,
+           max(p.Score) AS MaxAnswerScore,
+           sum(CASE WHEN p.OwnerUserId = q.OwnerUserId THEN 1 ELSE 0 END) AS SelfAnswered
+    FROM Posts p
+    JOIN Posts q ON q.Id = p.ParentId AND q.PostTypeId = 1
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId, q.OwnerUserId
+),
+UserActivity AS (
+    SELECT u.Id AS UserId,
+           count(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAsked,
+           count(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersGiven,
+           count(DISTINCT c.Id) AS CommentsMade,
+           count(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesCast
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    ub_gold.BadgeCount AS GoldBadges,
+    ub_silver.BadgeCount AS SilverBadges,
+    ub_bronze.BadgeCount AS BronzeBadges,
+    ua.QuestionsAsked,
+    ua.AnswersGiven,
+    ua.CommentsMade,
+    ua.UpVotesCast,
+    qs.Title,
+    qs.Score AS QuestionScore,
+    qs.ViewCount AS QuestionViews,
+    qs.TitleEdits,
+    qs.CommentCount AS QuestionComments,
+    ans.AnswerCount,
+    ans.AvgAnswerScore,
+    ans.MaxAnswerScore,
+    ans.SelfAnswered,
+    th.Level AS TagDepth,
+    th.TagName
+FROM TopUsers u
+LEFT JOIN UserBadges ub_gold ON ub_gold.UserId = u.Id AND ub_gold.Class = 1
+LEFT JOIN UserBadges ub_silver ON ub_silver.UserId = u.Id AND ub_silver.Class = 2
+LEFT JOIN UserBadges ub_bronze ON ub_bronze.UserId = u.Id AND ub_bronze.Class = 3
+LEFT JOIN UserActivity ua ON ua.UserId = u.Id
+LEFT JOIN QuestionStats qs ON qs.OwnerUserId = u.Id AND qs.RN = 1
+LEFT JOIN AnswerAggregation ans ON ans.QuestionId = qs.Id
+LEFT JOIN RecursiveTagHierarchy th ON th.ExcerptPostId = qs.Id
+WHERE ua.QuestionsAsked > 20
+ORDER BY u.Reputation DESC, qs.Score DESC
+LIMIT 50;

@@ -1,0 +1,84 @@
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        u.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate DESC) AS rn
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.Score > 0
+      AND p.ViewCount > 100
+),
+TagCounts AS (
+    SELECT
+        pt.Id AS PostId,
+        COUNT(t.TagName) AS TagCount
+    FROM Posts pt
+    JOIN (
+        SELECT
+            pt2.Id AS PostId,
+            TRIM(tag) AS value
+        FROM Posts pt2
+        CROSS JOIN LATERAL (
+            SELECT
+                regexp_split_to_table(
+                    SUBSTRING(pt2.Tags FROM 2 FOR (LENGTH(pt2.Tags) - 2)),
+                    '><'
+                ) AS tag
+        ) s
+        WHERE pt2.Tags IS NOT NULL
+    ) Tags ON Tags.PostId = pt.Id
+    JOIN Tags t ON Tags.value = t.TagName
+    WHERE pt.Tags IS NOT NULL
+      AND pt.PostTypeId = 1
+    GROUP BY pt.Id
+),
+HighEngagementPosts AS (
+    SELECT
+        rp.PostId,
+        rp.Title,
+        rp.Score,
+        rp.ViewCount,
+        rp.OwnerDisplayName,
+        COALESCE(tc.TagCount, 0) AS NumberOfTags,
+        (rp.Score * 10) + rp.ViewCount AS EngagementScore,
+        rp.rn
+    FROM RankedPosts rp
+    LEFT JOIN TagCounts tc ON rp.PostId = tc.PostId
+    WHERE rp.rn <= 100
+)
+SELECT
+    hep.PostId,
+    hep.Title,
+    hep.Score,
+    hep.ViewCount,
+    hep.OwnerDisplayName,
+    hep.NumberOfTags,
+    hep.EngagementScore,
+    COUNT(c.Id) AS CommentCount,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+    MAX(ph.CreationDate) AS LastHistoryEntryDate
+FROM HighEngagementPosts hep
+LEFT JOIN Comments c ON hep.PostId = c.PostId
+LEFT JOIN Votes v ON hep.PostId = v.PostId
+LEFT JOIN PostHistory ph ON hep.PostId = ph.PostId
+GROUP BY
+    hep.PostId,
+    hep.Title,
+    hep.Score,
+    hep.ViewCount,
+    hep.OwnerDisplayName,
+    hep.NumberOfTags,
+    hep.EngagementScore
+HAVING
+    COUNT(c.Id) > 10
+    AND SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) > 50
+ORDER BY
+    hep.EngagementScore DESC,
+    CommentCount DESC,
+    UpVoteCount DESC
+LIMIT 50;

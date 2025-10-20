@@ -1,0 +1,80 @@
+WITH recent_questions AS (
+    SELECT
+        p.Id AS question_id,
+        p.CreationDate AS q_created,
+        p.Score AS q_score,
+        p.OwnerUserId AS q_owner_id,
+        UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><')) AS tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+),
+answers AS (
+    SELECT
+        a.Id AS answer_id,
+        a.ParentId AS question_id,
+        a.CreationDate AS a_created,
+        a.Score AS a_score,
+        a.OwnerUserId AS a_owner_id
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+answer_votes AS (
+    SELECT
+        v.PostId AS answer_id,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS up_votes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS down_votes
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2, 3)
+    GROUP BY v.PostId
+),
+answer_stats AS (
+    SELECT
+        a.question_id,
+        a.answer_id,
+        a.a_owner_id,
+        a.a_score,
+        COALESCE(v.up_votes, 0) AS up_votes,
+        COALESCE(v.down_votes, 0) AS down_votes
+    FROM answers a
+    LEFT JOIN answer_votes v
+        ON v.answer_id = a.answer_id
+),
+tag_user_agg AS (
+    SELECT
+        q.tag,
+        u.Id AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(a.answer_id) AS answers_given,
+        COALESCE(SUM(a.a_score), 0) AS total_answer_score,
+        COALESCE(SUM(a.up_votes), 0) AS total_up_votes,
+        COALESCE(SUM(a.down_votes), 0) AS total_down_votes,
+        ROW_NUMBER() OVER (
+            PARTITION BY q.tag
+            ORDER BY COUNT(a.answer_id) DESC,
+                     COALESCE(SUM(a.a_score), 0) DESC
+        ) AS rn
+    FROM recent_questions q
+    LEFT JOIN answer_stats a
+        ON a.question_id = q.question_id
+    LEFT JOIN Users u
+        ON u.Id = a.a_owner_id
+    GROUP BY
+        q.tag,
+        u.Id,
+        u.DisplayName,
+        u.Reputation
+)
+SELECT
+    tag,
+    user_id,
+    DisplayName,
+    Reputation,
+    answers_given,
+    total_answer_score,
+    total_up_votes,
+    total_down_votes
+FROM tag_user_agg
+WHERE rn <= 5
+ORDER BY tag, rn;

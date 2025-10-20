@@ -1,0 +1,110 @@
+WITH 
+UserPostAgg AS (
+    SELECT 
+        u.Id                                            AS UserId,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)      AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)      AS AnswerCount,
+        SUM(p.Score)                                    AS TotalScore,
+        AVG(p.ViewCount)                                AS AvgViews
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id
+),
+UserBadgeAgg AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserVoteAgg AS (
+    SELECT 
+        v.UserId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesGiven,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesGiven
+    FROM Votes v
+    GROUP BY v.UserId
+),
+AnswerTimeAgg AS (
+    SELECT 
+        a.OwnerUserId                                         AS UserId,
+        AVG(EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))) AS AvgAnswerTimeSeconds
+    FROM Posts a
+    JOIN Posts q ON a.ParentId = q.Id
+    WHERE a.PostTypeId = 2
+      AND q.PostTypeId = 1
+      AND a.CreationDate > q.CreationDate
+    GROUP BY a.OwnerUserId
+),
+TagUsage AS (
+    SELECT 
+        p.OwnerUserId   AS UserId,
+        TRIM(t)         AS Tag
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT UNNEST(string_to_array(
+            SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2),
+            '><'
+        )) AS t
+    ) AS taglist
+    WHERE p.PostTypeId = 1
+),
+UserTagAgg AS (
+    SELECT 
+        tag_freq.UserId,
+        COUNT(*)                                          AS TagCount,
+        jsonb_object_agg(tag_freq.Tag, tag_freq.cnt)     AS TagFrequency
+    FROM (
+        SELECT 
+            UserId,
+            Tag,
+            COUNT(*) AS cnt
+        FROM TagUsage
+        GROUP BY UserId, Tag
+    ) AS tag_freq
+    GROUP BY tag_freq.UserId
+),
+Combined AS (
+    SELECT 
+        u.Id                                 AS UserId,
+        u.DisplayName,
+        up.QuestionCount,
+        up.AnswerCount,
+        up.TotalScore,
+        up.AvgViews,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        uv.UpVotesGiven,
+        uv.DownVotesGiven,
+        at.AvgAnswerTimeSeconds,
+        ut.TagCount,
+        ut.TagFrequency
+    FROM Users u
+    LEFT JOIN UserPostAgg   up ON u.Id = up.UserId
+    LEFT JOIN UserBadgeAgg  ub ON u.Id = ub.UserId
+    LEFT JOIN UserVoteAgg   uv ON u.Id = uv.UserId
+    LEFT JOIN AnswerTimeAgg at ON u.Id = at.UserId
+    LEFT JOIN UserTagAgg    ut ON u.Id = ut.UserId
+)
+
+SELECT 
+    UserId,
+    DisplayName,
+    QuestionCount,
+    AnswerCount,
+    TotalScore,
+    ROUND(CAST(AvgViews AS numeric), 2)                         AS AvgViews,
+    COALESCE(GoldBadges,0)                                       AS GoldBadges,
+    COALESCE(SilverBadges,0)                                     AS SilverBadges,
+    COALESCE(BronzeBadges,0)                                     AS BronzeBadges,
+    COALESCE(UpVotesGiven,0)                                     AS UpVotesGiven,
+    COALESCE(DownVotesGiven,0)                                   AS DownVotesGiven,
+    ROUND(COALESCE(AvgAnswerTimeSeconds,0) / 60.0, 2)            AS AvgAnswerTimeMinutes,
+    COALESCE(TagCount,0)                                         AS TagCount,
+    COALESCE(TagFrequency, '{}'::jsonb)                          AS TagFrequency
+FROM Combined
+ORDER BY TotalScore DESC NULLS LAST
+LIMIT 100;

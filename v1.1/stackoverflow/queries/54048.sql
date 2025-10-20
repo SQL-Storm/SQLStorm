@@ -1,0 +1,108 @@
+WITH UserPosts AS (
+    SELECT u.Id                                     AS UserId,
+           u.Reputation,
+           u.DisplayName,
+           p.Id                                     AS PostId,
+           p.PostTypeId,
+           p.Title,
+           p.Tags,
+           p.CreationDate,
+           COALESCE(v.VoteTypeId, 0)                 AS VoteTypeId,
+           p.Score
+    FROM Users      u
+    JOIN Posts      p  ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v  ON v.PostId = p.Id
+    WHERE p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1' YEAR)
+),
+UserStats AS (
+    SELECT UserId,
+           SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END)            AS QCount,
+           SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END)            AS ACount,
+           SUM(CASE WHEN PostTypeId = 1 THEN Score ELSE 0 END)        AS QScore,
+           SUM(CASE WHEN PostTypeId = 2 THEN Score ELSE 0 END)        AS AScore,
+           SUM(CASE WHEN VoteTypeId = 1 THEN 1 ELSE 0 END)            AS AcceptedAnswers,
+           COUNT(DISTINCT CASE WHEN VoteTypeId IN (2,3) THEN PostId END) AS NetVoters
+    FROM UserPosts
+    GROUP BY UserId
+),
+TagUsage AS (
+    SELECT up.UserId,
+           tag.TagName,
+           COUNT(*)                                    AS TagCount
+    FROM UserPosts up,
+         LATERAL (
+             WITH RECURSIVE parts(pos, rest) AS (
+                 -- non-recursive term: ensure types match recursive term (both text)
+                 SELECT CAST(1 AS integer), CAST(up.Tags AS text)
+                 UNION ALL
+                 SELECT
+                     instr.next_pos,
+                     CASE
+                         WHEN instr.next_pos = 0 THEN ''
+                         ELSE SUBSTR(rest, instr.next_pos)
+                     END
+                 FROM parts
+                 CROSS JOIN LATERAL (
+                     SELECT
+                         CASE
+                             WHEN rest = '' THEN 0
+                             ELSE
+                                 (CASE
+                                     WHEN POSITION('>' IN rest) = 0 THEN 0
+                                     ELSE POSITION('>' IN rest) + 1
+                                  END)
+                         END AS next_pos
+                 ) instr
+                 WHERE rest <> '' AND instr.next_pos <> 0
+             )
+             SELECT TRIM(BOTH '<' FROM TRIM(BOTH '>' FROM SUBSTR(rest, 1, CASE WHEN POSITION('>' IN rest)=0 THEN LENGTH(rest) ELSE POSITION('>' IN rest) END))) AS TagName
+             FROM parts
+             WHERE rest <> ''
+         ) tag
+    WHERE tag.TagName <> ''
+    GROUP BY up.UserId, tag.TagName
+),
+TopTags AS (
+    SELECT UserId,
+           STRING_AGG(TagName, ', ' ORDER BY TagCount DESC) AS TagList
+    FROM TagUsage
+    GROUP BY UserId
+),
+BadgeCounts AS (
+    SELECT UserId,
+           COUNT(*)                                      AS TotalBadges,
+           SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS Gold,
+           SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS Silver,
+           SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS Bronze
+    FROM Badges
+    GROUP BY UserId
+),
+CommentStats AS (
+    SELECT UserId,
+           COUNT(*) AS CommentCount
+    FROM Comments
+    WHERE CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1' YEAR)
+    GROUP BY UserId
+)
+SELECT u.DisplayName,
+       u.Reputation,
+       us.QCount,
+       us.ACount,
+       us.QScore,
+       us.AScore,
+       us.AcceptedAnswers,
+       us.NetVoters,
+       COALESCE(bc.TotalBadges, 0)   AS TotalBadges,
+       COALESCE(bc.Gold, 0)         AS Gold,
+       COALESCE(bc.Silver, 0)       AS Silver,
+       COALESCE(bc.Bronze, 0)       AS Bronze,
+       COALESCE(tt.TagList, '')     AS TrendingTags,
+       COALESCE(cs.CommentCount, 0) AS RecentComments
+FROM Users u
+JOIN UserStats us ON us.UserId = u.Id
+LEFT JOIN TopTags tt  ON tt.UserId  = u.Id
+LEFT JOIN BadgeCounts bc ON bc.UserId = u.Id
+LEFT JOIN CommentStats cs ON cs.UserId = u.Id
+ORDER BY us.AcceptedAnswers DESC,
+         u.Reputation DESC,
+         us.AScore DESC;

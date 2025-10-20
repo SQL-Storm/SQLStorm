@@ -1,0 +1,131 @@
+WITH ActiveUsers AS (
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        COUNT(P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(P.Score) AS TotalScore,
+        MAX(P.CreationDate) AS LastPostDate
+    FROM
+        Users U
+    LEFT JOIN
+        Posts P ON U.Id = P.OwnerUserId
+    WHERE
+        U.LastAccessDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY
+    GROUP BY
+        U.Id, U.Reputation, U.CreationDate, U.LastAccessDate
+), TopTags AS (
+    SELECT
+        T.TagName,
+        T.Count,
+        T.ExcerptPostId,
+        T.WikiPostId,
+        COUNT(P.Id) FILTER (WHERE P.PostTypeId = 1) AS QuestionsWithTag,
+        SUM(P.Score) FILTER (WHERE P.PostTypeId = 1) AS TotalScoreForTag,
+        AVG(P.ViewCount) FILTER (WHERE P.PostTypeId = 1) AS AverageViewCountForTag
+    FROM
+        Tags T
+    JOIN
+        Posts P ON EXISTS (
+            SELECT 1
+            FROM (
+                SELECT TRIM(BOTH '<>' FROM tag) AS tag
+                FROM UNNEST(
+                    STRING_TO_ARRAY(
+                        REPLACE(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><', '>|<'),
+                        '|'
+                    )
+                ) AS tag
+            ) split_tags
+            WHERE split_tags.tag = T.TagName
+        )
+    WHERE
+        P.PostTypeId = 1
+    GROUP BY
+        T.TagName, T.Count, T.ExcerptPostId, T.WikiPostId
+    ORDER BY
+        TotalScoreForTag DESC
+    LIMIT 20
+), UserBadges AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM
+        Badges B
+    GROUP BY
+        B.UserId
+), UserVotes AS (
+    SELECT
+        V.UserId,
+        COUNT(V.Id) AS TotalVotes,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotes,
+        SUM(CASE WHEN V.VoteTypeId = 8 THEN COALESCE(V.BountyAmount,0) ELSE 0 END) AS TotalBountyAmount
+    FROM
+        Votes V
+    GROUP BY
+        V.UserId
+), UserActivity AS (
+    SELECT
+        A.UserId,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        A.TotalPosts,
+        A.TotalQuestions,
+        A.TotalAnswers,
+        A.TotalScore,
+        A.LastPostDate,
+        COALESCE(B.TotalBadges,0) AS TotalBadges,
+        COALESCE(B.GoldBadges,0) AS GoldBadges,
+        COALESCE(B.SilverBadges,0) AS SilverBadges,
+        COALESCE(B.BronzeBadges,0) AS BronzeBadges,
+        COALESCE(V.TotalVotes,0) AS TotalVotes,
+        COALESCE(V.TotalUpvotes,0) AS TotalUpvotes,
+        COALESCE(V.TotalDownvotes,0) AS TotalDownvotes,
+        COALESCE(V.TotalBountyAmount,0) AS TotalBountyAmount
+    FROM
+        ActiveUsers A
+    JOIN
+        Users U ON A.UserId = U.Id
+    LEFT JOIN
+        UserBadges B ON A.UserId = B.UserId
+    LEFT JOIN
+        UserVotes V ON A.UserId = V.UserId
+)
+SELECT
+    UA.UserId,
+    UA.Reputation,
+    UA.CreationDate,
+    UA.LastAccessDate,
+    UA.TotalPosts,
+    UA.TotalQuestions,
+    UA.TotalAnswers,
+    UA.TotalScore,
+    UA.LastPostDate,
+    UA.TotalBadges,
+    UA.GoldBadges,
+    UA.SilverBadges,
+    UA.BronzeBadges,
+    UA.TotalVotes,
+    UA.TotalUpvotes,
+    UA.TotalDownvotes,
+    UA.TotalBountyAmount,
+    T.TagName,
+    T.QuestionsWithTag,
+    T.TotalScoreForTag,
+    T.AverageViewCountForTag
+FROM
+    UserActivity UA
+CROSS JOIN
+    TopTags T
+ORDER BY
+    UA.Reputation DESC,
+    T.TotalScoreForTag DESC
+LIMIT 100;

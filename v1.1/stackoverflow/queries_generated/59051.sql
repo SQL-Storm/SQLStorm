@@ -1,0 +1,55 @@
+-- {"query": "59051.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2061, "output_tokens": 1082} 
+SELECT 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) as TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) as QuestionsWithAcceptedAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN p.Id END) as ClosedQuestions,
+    COUNT(DISTINCT b.Id) as Badges,
+    COUNT(DISTINCT c.Id) as Comments,
+    COUNT(DISTINCT v.Id) as Votes,
+    COUNT(DISTINCT ph.Id) as PostHistoryEntries,
+    COUNT(DISTINCT pl.Id) as PostLinks,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) as AvgQuestionScore,
+    AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) as AvgAnswerScore,
+    MAX(p.CreationDate) as LatestPostDate,
+    MIN(p.CreationDate) as EarliestPostDate,
+    COUNT(DISTINCT CASE WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN p.Id END) as TaggedPosts,
+    COUNT(DISTINCT CASE WHEN p.ViewCount > 1000 THEN p.Id END) as HighlyViewedPosts,
+    COUNT(DISTINCT CASE WHEN p.Score >= 10 THEN p.Id END) as HighScorePosts,
+    COUNT(DISTINCT CASE WHEN p.Score <= -5 THEN p.Id END) as LowScorePosts,
+    COUNT(DISTINCT CASE WHEN p.CommentCount >= 5 THEN p.Id END) as HighlyCommentedPosts,
+    COUNT(DISTINCT CASE WHEN p.FavoriteCount >= 10 THEN p.Id END) as HighlyFavoritedPosts,
+    COUNT(DISTINCT CASE WHEN p.AnswerCount >= 10 THEN p.Id END) as HighlyAnsweredQuestions,
+    COUNT(DISTINCT p.OwnerUserId) as PostsInvolvingOwnUserId,
+    COUNT(DISTINCT CASE WHEN p.OwnerUserId IS NOT NULL AND p.OwnerUserId != u.Id THEN p.Id END) as PostsByOtherUsers,
+    COUNT(DISTINCT CASE WHEN p.OwnerUserId IS NULL OR p.OwnerUserId = -1 THEN p.Id END) as CommunityOwnedPosts,
+    COUNT(DISTINCT CASE WHEN p.LastActivityDate >= DATEADD(DAY, -30, GETDATE()) THEN p.Id END) as RecentActivityPosts,
+    COUNT(DISTINCT CASE WHEN p.AnswerCount = 0 AND p.PostTypeId = 1 THEN p.Id END) as UnansweredQuestions,
+    COUNT(DISTINCT CASE WHEN p.AnswerCount > 0 AND p.PostTypeId = 1 THEN p.Id END) as AnsweredQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Tags LIKE '%java%' THEN p.Id END) as JavaQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Tags LIKE '%python%' THEN p.Id END) as PythonQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Tags LIKE '%javascript%' THEN p.Id END) as JavaScriptQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Tags LIKE '%c++%' THEN p.Id END) as CPlusPlusQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Tags LIKE '%sql%' THEN p.Id END) as SQLQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Tags LIKE '%html%' THEN p.Id END) as HTMLQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Tags LIKE '%css%' THEN p.Id END) as CSSQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Tags LIKE '%php%' THEN p.Id END) as PHPQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Tags LIKE '%ruby%' THEN p.Id END) as RubyQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Tags LIKE '%go%' THEN p.Id END) as GoQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Tags LIKE '%rust%' THEN p.Id END) as RustQuestions
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId OR u.Id = p.LastEditorUserId OR u.Id = p.LastActivityDate
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN Votes v ON u.Id = v.UserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+LEFT JOIN PostLinks pl ON u.Id = pl.Id
+WHERE u.CreationDate >= DATEADD(YEAR, -2, GETDATE())
+GROUP BY u.Id, u.DisplayName, u.Reputation
+HAVING COUNT(DISTINCT p.Id) > 0
+ORDER BY u.Reputation DESC, TotalPosts DESC
+LIMIT 10000;

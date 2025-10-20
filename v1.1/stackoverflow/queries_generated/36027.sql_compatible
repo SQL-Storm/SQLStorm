@@ -1,0 +1,27 @@
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.PostTypeId,
+  p.CreationDate,
+  p.ViewCount,
+  p.Score,
+  p.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  COUNT(*) OVER () AS TotalPosts,
+  -- DISTINCT not supported in window aggregates in many dialects: compute distinct voters in a derived subquery and join
+  dv.DistinctVoters,
+  AVG(v.BountyAmount) FILTER (WHERE v.BountyAmount IS NOT NULL) OVER () AS AvgBounty
+FROM Posts p
+JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Votes v ON v.PostId = p.Id
+LEFT JOIN (
+  SELECT COUNT(DISTINCT UserId) AS DistinctVoters
+  FROM Votes
+) dv ON 1=1
+WHERE
+  p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days'
+  AND p.PostTypeId IN (1, 2)
+GROUP BY
+  p.Id, p.Title, p.PostTypeId, p.CreationDate, p.ViewCount, p.Score, p.OwnerUserId, u.DisplayName, dv.DistinctVoters
+ORDER BY p.CreationDate DESC
+LIMIT 100;

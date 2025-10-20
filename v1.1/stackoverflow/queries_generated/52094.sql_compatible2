@@ -1,0 +1,95 @@
+WITH top_tags AS (
+    SELECT 
+        t.Id AS TagId,
+        t.TagName,
+        t.Count AS TagCount
+    FROM Tags t
+    WHERE t.Count > 1000
+),
+tag_post_stats AS (
+    SELECT 
+        tt.TagId,
+        tt.TagName,
+        COUNT(p.Id) AS QuestionCount,
+        AVG(p.Score) AS AvgQuestionScore,
+        SUM(p.AnswerCount) AS TotalAnswers,
+        AVG(p.AnswerCount) AS AvgAnswersPerQuestion
+    FROM top_tags tt
+    JOIN Posts p ON p.PostTypeId = 1 AND p.Tags LIKE '%' || tt.TagName || '%'
+    GROUP BY tt.TagId, tt.TagName
+),
+user_tag_contributions AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        tt.TagId,
+        tt.TagName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsPosted,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersPosted,
+        SUM(v.Score) AS TotalVotesOnPosts
+    FROM top_tags tt
+    JOIN Posts p ON p.PostTypeId IN (1,2) AND p.Tags LIKE '%' || tt.TagName || '%'
+    JOIN Users u ON u.Id = p.OwnerUserId
+    JOIN (
+        SELECT PostId, SUM(CASE WHEN VoteTypeId = 2 THEN 1 WHEN VoteTypeId = 3 THEN -1 ELSE 0 END) AS Score
+        FROM Votes
+        WHERE VoteTypeId IN (2,3)
+        GROUP BY PostId
+    ) v ON v.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, tt.TagId, tt.TagName
+),
+badge_counts AS (
+    SELECT 
+        utc.UserId,
+        utc.TagId,
+        COUNT(b.Id) AS BadgeCount,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM user_tag_contributions utc
+    JOIN Badges b ON b.UserId = utc.UserId AND (b.TagBased = TRUE OR b.TagBased = 1::int) = (b.TagBased = TRUE) /* placeholder to preserve intent */
+    WHERE b.Name LIKE '%' || utc.TagName || '%'
+    GROUP BY utc.UserId, utc.TagId
+)
+SELECT 
+    utc.UserId,
+    utc.DisplayName,
+    utc.Reputation,
+    utc.TagName,
+    tps.QuestionCount AS TagQuestionCount,
+    tps.AvgQuestionScore,
+    tps.TotalAnswers,
+    tps.AvgAnswersPerQuestion,
+    utc.QuestionsPosted,
+    utc.AnswersPosted,
+    utc.TotalVotesOnPosts,
+    COALESCE(bc.BadgeCount, 0) AS TagBadgeCount,
+    COALESCE(bc.GoldBadges, 0) AS TagGoldBadges,
+    COALESCE(bc.SilverBadges, 0) AS TagSilverBadges,
+    COALESCE(bc.BronzeBadges, 0) AS TagBronzeBadges,
+    ROW_NUMBER() OVER (PARTITION BY utc.TagId ORDER BY utc.QuestionsPosted DESC, utc.AnswersPosted DESC, utc.TotalVotesOnPosts DESC) AS UserRankInTag,
+    utc.TagId
+FROM user_tag_contributions utc
+JOIN tag_post_stats tps ON tps.TagId = utc.TagId
+LEFT JOIN badge_counts bc ON bc.UserId = utc.UserId AND bc.TagId = utc.TagId
+GROUP BY
+    utc.UserId,
+    utc.DisplayName,
+    utc.Reputation,
+    utc.TagName,
+    tps.QuestionCount,
+    tps.AvgQuestionScore,
+    tps.TotalAnswers,
+    tps.AvgAnswersPerQuestion,
+    utc.QuestionsPosted,
+    utc.AnswersPosted,
+    utc.TotalVotesOnPosts,
+    bc.BadgeCount,
+    bc.GoldBadges,
+    bc.SilverBadges,
+    bc.BronzeBadges,
+    utc.TagId,
+    UserRankInTag
+ORDER BY utc.TagId, UserRankInTag
+LIMIT 1000;

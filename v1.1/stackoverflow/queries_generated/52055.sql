@@ -1,0 +1,75 @@
+-- {"query": "52055.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-code-fast", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2165, "output_tokens": 758} 
+
+WITH user_post_stats AS (
+  SELECT 
+    p.OwnerUserId,
+    COUNT(p.Id) AS total_posts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS questions_count,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS answers_count,
+    SUM(p.Score) AS total_score,
+    AVG(p.Score) AS avg_score,
+    SUM(p.ViewCount) AS total_views,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE 0 END) AS total_answers_received,
+    COUNT(DISTINCT c.Id) AS comment_count
+  FROM Posts p
+  LEFT JOIN Comments c ON p.Id = c.PostId
+  WHERE p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId
+  HAVING COUNT(p.Id) > 10
+),
+user_vote_stats AS (
+  SELECT 
+    p.OwnerUserId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 
+             WHEN v.VoteTypeId = 3 THEN -1 
+             ELSE 0 END) AS net_upvotes,
+    COUNT(CASE WHEN v.VoteTypeId = 8 THEN 1 END) AS bounties_started,
+    COUNT(CASE WHEN v.VoteTypeId = 9 THEN 1 END) AS bounties_awarded
+  FROM Posts p
+  LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3, 8, 9)
+  WHERE p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId
+),
+user_badge_stats AS (
+  SELECT 
+    b.UserId,
+    COUNT(b.Id) AS total_badges,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+    SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS tag_based_badges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+user_influence_score AS (
+  SELECT 
+    ups.OwnerUserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    ups.total_posts,
+    ups.questions_count,
+    ups.answers_count,
+    ups.total_score,
+    ups.avg_score,
+    ups.total_views,
+    ups.total_answers_received,
+    ups.comment_count,
+    uvs.net_upvotes,
+    uvs.bounties_started,
+    uvs.bounties_awarded,
+    ubs.total_badges,
+    ubs.gold_badges,
+    ubs.silver_badges,
+    ubs.bronze_badges,
+    ubs.tag_based_badges,
+    (ups.total_score + COALESCE(uvs.net_upvotes, 0) + COALESCE(ubs.total_badges, 0) * 100 + COALESCE(ups.total_answers_received, 0) * 10) AS influence_score
+  FROM user_post_stats ups
+  JOIN Users u ON ups.OwnerUserId = u.Id
+  LEFT JOIN user_vote_stats uvs ON ups.OwnerUserId = uvs.OwnerUserId
+  LEFT JOIN user_badge_stats ubs ON ups.OwnerUserId = ubs.UserId
+)
+SELECT * 
+FROM user_influence_score
+ORDER BY influence_score DESC, total_score DESC, total_badges DESC
+LIMIT 100;

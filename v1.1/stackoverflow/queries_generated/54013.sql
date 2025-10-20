@@ -1,0 +1,38 @@
+-- {"query": "54013.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2048, "output_tokens": 589} 
+
+-- Benchmarking query: top 10 tags by average post score for high‑rep users
+SELECT
+    t.TagName,
+    COUNT(p.Id)                                              AS PostCount,
+    ROUND(AVG(p.Score), 2)                                    AS AvgScore,
+    ROUND(AVG(v.VoteCount), 2)                                AS AvgVoteCount,
+    ROUND(AVG(v.UserUpVotes), 2)                              AS AvgUserUpVotes,
+    MIN(p.CreationDate)                                       AS FirstDate,
+    MAX(p.CreationDate)                                       AS LastDate,
+    STRING_AGG(DISTINCT u.DisplayName, ', ') WITHIN GROUP (ORDER BY u.DisplayName) AS TopUsers
+FROM
+    Posts p
+    JOIN Tags t
+      ON p.Id = ANY(string_to_array('{'||t.TagName||'}', ','))
+      OR ('<'||p.Tags||'>' LIKE '%<'||t.TagName||'>%')  -- fallback substring check
+    JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT
+            PostId,
+            COUNT(*)                                                             AS VoteCount,
+            SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END)                      AS UserUpVotes
+        FROM Votes
+        GROUP BY PostId
+    ) v ON p.Id = v.PostId
+WHERE
+    u.Reputation > 100000
+    AND p.PostTypeId = 1    -- questions only
+    AND p.Score > 0
+GROUP BY
+    t.TagName
+HAVING
+    COUNT(p.Id) > 100
+ORDER BY
+    AvgScore DESC,
+    PostCount DESC
+LIMIT 10;

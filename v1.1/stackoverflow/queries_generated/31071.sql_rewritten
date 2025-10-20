@@ -1,0 +1,47 @@
+-- {"query": "31071.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4o-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 383} 
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COALESCE(SUM(v.BountyAmount), 0) AS TotalBounty,
+        SUM(u.UpVotes) AS TotalUpVotes,
+        SUM(u.DownVotes) AS TotalDownVotes,
+        u.CreationDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id
+),
+RecentPostStats AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(CASE WHEN p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days' THEN 1 END) AS RecentPosts,
+        COUNT(DISTINCT c.Id) AS RecentComments,
+        AVG(p.Score) AS AvgScore,
+        AVG(p.ViewCount) AS AvgViews
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+    GROUP BY p.OwnerUserId
+)
+SELECT 
+    ua.UserId,
+    ua.DisplayName,
+    ua.TotalPosts,
+    ua.TotalComments,
+    ua.TotalBounty,
+    ua.TotalUpVotes,
+    ua.TotalDownVotes,
+    rsa.RecentPosts,
+    rsa.RecentComments,
+    rsa.AvgScore,
+    rsa.AvgViews,
+    u.CreationDate
+FROM UserActivity ua
+JOIN RecentPostStats rsa ON ua.UserId = rsa.OwnerUserId
+WHERE ua.TotalPosts > 5
+ORDER BY ua.TotalUpVotes DESC, rsa.AvgViews DESC
+LIMIT 50;

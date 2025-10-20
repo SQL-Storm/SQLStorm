@@ -1,0 +1,126 @@
+-- {"query": "55085.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2048, "output_tokens": 1309} 
+
+WITH RECURSIVE TagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        NULL::int AS ParentTagId,
+        1 AS Depth,
+        t.TagName::text AS Path
+    FROM Tags t
+    WHERE t.TagName NOT LIKE '%-%'  -- assume top‑level tags lack hyphens
+    UNION ALL
+    SELECT 
+        child.Id,
+        child.TagName,
+        parent.Id,
+        parent.Depth + 1,
+        parent.Path || '>' || child.TagName
+    FROM Tags child
+    JOIN TagHierarchy parent ON child.TagName LIKE parent.TagName || '-%'
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVoteGiven,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVoteGiven,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostScoreStats AS (
+    SELECT 
+        p.OwnerUserId,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AvgAnswerScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) FILTER (WHERE p.PostTypeId = 1) AS MedianQuestionScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) FILTER (WHERE p.PostTypeId = 2) AS MedianAnswerScore,
+        COUNT(*) FILTER (WHERE p.Score >= 10) AS HighScoringPosts
+    FROM Posts p
+    WHERE p.Score IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+TagContribution AS (
+    SELECT 
+        p.OwnerUserId,
+        th.TagName,
+        COUNT(*) AS PostsWithTag,
+        SUM(p.Score) AS TotalTagScore,
+        jsonb_agg(DISTINCT th.Path) AS TagPaths
+    FROM Posts p
+    JOIN LATERAL regexp_split_to_table(p.Tags, '[><]') AS tag_raw(tag)
+        ON TRUE
+    JOIN Tags t ON t.TagName = tag_raw.tag
+    JOIN TagHierarchy th ON th.Id = t.Id
+    WHERE p.PostTypeId = 1   -- only questions have tags
+    GROUP BY p.OwnerUserId, th.TagName
+),
+TopUsers AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.BadgeCount,
+        ps.AvgQuestionScore,
+        ps.AvgAnswerScore,
+        ps.HighScoringPosts,
+        ROW_NUMBER() OVER (ORDER BY ua.Reputation DESC, ua.QuestionCount DESC) AS Rank
+    FROM UserActivity ua
+    LEFT JOIN PostScoreStats ps ON ps.OwnerUserId = ua.UserId
+    WHERE ua.Reputation > 10000
+)
+SELECT
+    tu.Rank,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.QuestionCount,
+    tu.AnswerCount,
+    tu.BadgeCount,
+    ROUND(tu.AvgQuestionScore::numeric, 2) AS AvgQScore,
+    ROUND(tu.AvgAnswerScore::numeric, 2) AS AvgAScore,
+    tu.HighScoringPosts,
+    jsonb_build_object(
+        'tags', jsonb_agg(
+            jsonb_build_object(
+                'tag', tc.TagName,
+                'posts', tc.PostsWithTag,
+                'score', tc.TotalTagScore,
+                'paths', tc.TagPaths
+            )
+        )
+    ) AS TagSummary,
+    to_char(GREATEST(tu.LastPostDate, tu.LastVoteDate), 'YYYY-MM-DD HH24:MI:SS') AS LastActivity
+FROM TopUsers tu
+LEFT JOIN UserActivity ua ON ua.UserId = tu.UserId
+LEFT JOIN LATERAL (
+    SELECT *
+    FROM TagContribution tc
+    WHERE tc.OwnerUserId = tu.UserId
+    ORDER BY tc.TotalTagScore DESC
+    LIMIT 5
+) tc ON TRUE
+GROUP BY
+    tu.Rank,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.QuestionCount,
+    tu.AnswerCount,
+    tu.BadgeCount,
+    tu.AvgQuestionScore,
+    tu.AvgAnswerScore,
+    tu.HighScoringPosts,
+    tu.LastPostDate,
+    tu.LastVoteDate
+ORDER BY tu.Rank
+LIMIT 20;

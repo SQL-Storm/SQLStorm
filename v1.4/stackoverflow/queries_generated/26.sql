@@ -1,0 +1,104 @@
+-- {"query": "26.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 715} 
+WITH recent_high_value_votes AS (
+  SELECT
+    v.PostId,
+    v.UserId AS VoterId,
+    v.VoteTypeId,
+    v.BountyAmount,
+    v.CreationDate,
+    u.Reputation,
+    u.DisplayName AS VoterName,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.Score AS PostScore,
+    p.ViewCount
+  FROM Votes v
+  JOIN Posts p ON v.PostId = p.Id
+  JOIN Users u ON v.UserId = u.Id
+  WHERE v.VoteTypeId = 2 -- UpMod
+    AND p.CreationDate > NOW() - INTERVAL '180 days'
+    AND (p.OwnerUserId IS NOT NULL)
+),
+top_posts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerName,
+    p.CreationDate,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.OwnerUserId
+      ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate DESC
+    ) AS rn_owner
+  FROM Posts p
+  JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1 -- Question
+    AND p.ClosedDate IS NULL
+),
+enhanced AS (
+  SELECT
+    r.PostId,
+    r.VoterId,
+    r.VoteTypeId,
+    r.BountyAmount,
+    r.CreationDate,
+    r.Reputation,
+    r.VoterName,
+    t.PostId AS LinkedPostId,
+    t.Title AS LinkedTitle,
+    t.Tags AS LinkedTags,
+    t.OwnerUserId,
+    t.OwnerName,
+    t.CreationDate AS LinkedCreated
+  FROM recent_high_value_votes r
+  LEFT JOIN PostLinks pl ON pl.PostId = r.PostId AND pl.LinkTypeId = 1
+  LEFT JOIN Posts t ON pl.RelatedPostId = t.Id
+  WHERE r.Reputation >= 1000
+),
+cte_window AS (
+  SELECT
+    e.*,
+    ROW_NUMBER() OVER (PARTITION BY e.OwnerUserId ORDER BY e.CreationDate DESC) AS owner_latest_rank
+  FROM enhanced e
+),
+complex_pred AS (
+  SELECT
+    *
+  FROM cte_window cw
+  WHERE
+    (cw.LinkedPostId IS NULL AND cw.Reputation >= 1000)
+    OR
+    (cw.LinkedPostId IS NOT NULL AND cw.OwnerUserId IN (
+      SELECT Id FROM Users WHERE Reputation BETWEEN 2000 AND 5000
+    ))
+),
+final AS (
+  SELECT
+    c.OwnerUserId,
+    cu.DisplayName AS OwnerDisplayName,
+    c.PostId,
+    c.Title AS QuestionTitle,
+    c.Tags,
+    c.Score AS QuestionScore,
+    c.ViewCount,
+    c.CreationDate,
+    c.owner_latest_rank,
+    c.VoterId,
+    c.VoterName,
+    c.VoteTypeId,
+    c.Reputation AS VoterReputation,
+    c.LinkedPostId,
+    c.LinkedTitle,
+    c.LinkedTags,
+    c.LinkedCreated
+  FROM complex_pred c
+  JOIN Users cu ON c.OwnerUserId = cu.Id
+  ORDER BY c.owner_latest_rank, c.PostId
+)
+SELECT *
+FROM final
+LIMIT 200;

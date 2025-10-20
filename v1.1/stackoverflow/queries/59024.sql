@@ -1,0 +1,67 @@
+SELECT 
+    p.Id AS PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Tags,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVotes,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = p.OwnerUserId AND b.Class = 1) AS GoldBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = p.OwnerUserId AND b.Class = 2) AS SilverBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = p.OwnerUserId AND b.Class = 3) AS BronzeBadges,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.ParentId = p.Id AND p2.PostTypeId = 2) AS AnswerCount,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (10, 11, 12, 13)) AS StatusChanges,
+    (SELECT MAX(ph.CreationDate) FROM PostHistory ph WHERE ph.PostId = p.Id) AS LastStatusChange,
+    (SELECT STRING_AGG(t.TagName, ', ') FROM (
+        SELECT value AS TagName FROM UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS t(value)
+    ) t) AS TagList,
+    CASE 
+        WHEN p.PostTypeId = 1 THEN 'Question'
+        WHEN p.PostTypeId = 2 THEN 'Answer'
+        WHEN p.PostTypeId = 3 THEN 'Wiki'
+        WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+        WHEN p.PostTypeId = 5 THEN 'TagWiki'
+        WHEN p.PostTypeId = 6 THEN 'ModeratorNomination'
+        WHEN p.PostTypeId = 7 THEN 'WikiPlaceholder'
+        WHEN p.PostTypeId = 8 THEN 'PrivilegeWiki'
+        ELSE 'Unknown'
+    END AS PostType,
+    CASE 
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        WHEN p.LastActivityDate < CAST('2024-10-01' AS date) - INTERVAL '30 days' THEN 'Inactive'
+        ELSE 'Active'
+    END AS PostStatus,
+    (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 8) AS AvgBountyAmount,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id) AS LinkedPosts,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.RelatedPostId = p.Id) AS RelatedPosts,
+    (SELECT COUNT(*) FROM Posts p3 WHERE p3.ParentId = p.Id) AS ChildPosts,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId BETWEEN 1 AND 9) AS EditHistory,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (19, 20)) AS ProtectionHistory,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (35, 36)) AS MigrationHistory,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (52, 53)) AS HotNetworkHistory,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 24) AS EditSuggestions,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 31) AS ChatDiscussionHistory,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (33, 34)) AS NoticeHistory,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (16, 17)) AS ModeratorActions
+FROM Posts p
+JOIN Users u ON p.OwnerUserId = u.Id
+WHERE p.CreationDate >= DATE '2022-01-01'
+    AND p.CreationDate <= DATE '2023-12-31'
+    AND p.Score >= 0
+    AND p.ViewCount >= 0
+    AND p.Title IS NOT NULL
+    AND p.Title != ''
+    AND p.Tags IS NOT NULL
+    AND p.Tags != ''
+    AND p.PostTypeId IN (1, 2)
+ORDER BY p.CreationDate DESC, p.Score DESC, p.ViewCount DESC
+LIMIT 10000;

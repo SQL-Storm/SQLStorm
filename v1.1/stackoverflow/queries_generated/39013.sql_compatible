@@ -1,0 +1,102 @@
+WITH
+ParsedTags AS (
+    SELECT
+        p.Id        AS QuestionId,
+        unnest(
+          string_to_array(
+            substring(p.Tags, 2, length(p.Tags) - 2),
+            '><'
+          )
+        )        AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+AnswerStats AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        COUNT(*)                    AS AnswerCount,
+        AVG(EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))) AS AvgResponseSeconds
+    FROM Posts a
+    JOIN Posts q
+      ON q.Id = a.ParentId
+     AND q.PostTypeId = 1
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+GoldBadges AS (
+    SELECT
+        b.UserId,
+        COUNT(*) AS GoldCount
+    FROM Badges b
+    WHERE b.Class = 1
+    GROUP BY b.UserId
+),
+UserScores AS (
+    SELECT
+        u.Id                     AS UserId,
+        u.Reputation,
+        COALESCE(g.GoldCount, 0) AS GoldBadges,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes
+    FROM Users u
+    LEFT JOIN GoldBadges g ON g.UserId = u.Id
+    LEFT JOIN Votes v      ON v.UserId = u.Id
+    GROUP BY u.Id, u.Reputation, g.GoldCount
+),
+EditsStats AS (
+    SELECT
+        ph.PostId,
+        COUNT(*) AS EditCount
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+TagStats AS (
+    SELECT
+        pt.Tag,
+        COUNT(DISTINCT pt.QuestionId)      AS QuestionCount,
+        ROUND(AVG(as_.AnswerCount), 2)     AS AvgAnswersPerQuestion,
+        AVG(as_.AvgResponseSeconds)       AS AvgFirstAnswerSeconds,
+        ROUND(AVG(COALESCE(es.EditCount, 0)), 2) AS AvgEditsPerQuestion
+    FROM ParsedTags pt
+    LEFT JOIN AnswerStats    as_ ON as_.QuestionId = pt.QuestionId
+    LEFT JOIN EditsStats     es  ON es.PostId     = pt.QuestionId
+    GROUP BY pt.Tag
+)
+SELECT
+    ts.Tag,
+    ts.QuestionCount,
+    ts.AvgAnswersPerQuestion,
+    to_char((ts.AvgFirstAnswerSeconds/3600) * INTERVAL '1 hour', 'HH24:MI:SS') AS AvgTimeToFirstAnswer,
+    ts.AvgEditsPerQuestion,
+    topu.Reputation         AS TopUserReputation,
+    topu.GoldBadges         AS TopUserGoldBadges,
+    topq.Score              AS TopQuestionScore
+FROM TagStats ts
+JOIN LATERAL (
+    SELECT
+        u2.Reputation,
+        u2.GoldBadges,
+        q2.Score
+    FROM ParsedTags pt2
+    JOIN Posts q2
+      ON q2.Id = pt2.QuestionId
+     AND q2.PostTypeId = 1
+    JOIN UserScores u2
+      ON u2.UserId = q2.OwnerUserId
+    WHERE pt2.Tag = ts.Tag
+    ORDER BY q2.Score DESC
+    LIMIT 1
+) AS topu ON true
+-- Ensure topq references same chosen row for TopQuestionScore
+JOIN LATERAL (
+    SELECT q2.Score
+    FROM ParsedTags pt2
+    JOIN Posts q2
+      ON q2.Id = pt2.QuestionId
+     AND q2.PostTypeId = 1
+    WHERE pt2.Tag = ts.Tag
+    ORDER BY q2.Score DESC
+    LIMIT 1
+) AS topq ON true
+ORDER BY ts.QuestionCount DESC
+LIMIT 25;

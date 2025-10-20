@@ -1,0 +1,60 @@
+-- {"query": "31015.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4o-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 409} 
+
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        COUNT(v.Id) AS VoteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RecentPostRank
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3) -- Upvotes and downvotes
+    WHERE 
+        p.PostTypeId = 1 AND -- Only questions
+        p.CreationDate >= NOW() - INTERVAL '1 year'
+    GROUP BY 
+        p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate, p.OwnerUserId
+), TopRankedPosts AS (
+    SELECT 
+        PostId, 
+        Title, 
+        Score, 
+        ViewCount, 
+        CreationDate, 
+        VoteCount
+    FROM 
+        RankedPosts
+    WHERE 
+        RecentPostRank <= 5
+), UserReputation AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(bp.PostId) AS PostCount
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts bp ON u.Id = bp.OwnerUserId AND bp.PostTypeId = 1 -- Questions
+    GROUP BY 
+        u.Id, u.DisplayName, u.Reputation
+)
+SELECT 
+    ur.DisplayName,
+    ur.Reputation,
+    ur.PostCount,
+    tp.Title,
+    tp.Score,
+    tp.ViewCount,
+    tp.CreationDate,
+    tp.VoteCount
+FROM 
+    UserReputation ur
+JOIN 
+    TopRankedPosts tp ON ur.UserId = (SELECT OwnerUserId FROM Posts WHERE Id = tp.PostId)
+ORDER BY 
+    ur.Reputation DESC, tp.Score DESC;

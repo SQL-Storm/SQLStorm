@@ -1,0 +1,106 @@
+WITH top_tags AS (
+    SELECT
+        TagName,
+        Count
+    FROM Tags
+    WHERE IsModeratorOnly = FALSE
+    ORDER BY Count DESC
+    LIMIT 10
+),
+questions_with_top_tags AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        u.DisplayName AS OwnerName,
+        u.Reputation AS OwnerReputation,
+        p.CreationDate
+    FROM Posts p
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+      AND (
+          SELECT COUNT(*)
+          FROM top_tags t
+          WHERE p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+      ) > 0
+),
+answer_stats AS (
+    SELECT
+        q.QuestionId,
+        COUNT(a.Id) AS AnswerCount,
+        MAX(a.Score) AS HighestAnswerScore,
+        AVG(a.Score) AS AvgAnswerScore
+    FROM questions_with_top_tags q
+    LEFT JOIN Posts a ON a.ParentId = q.QuestionId AND a.PostTypeId = 2
+    GROUP BY q.QuestionId
+),
+favorite_counts AS (
+    SELECT
+        PostId,
+        COUNT(*) AS FavoriteCount
+    FROM Votes
+    WHERE VoteTypeId = 5
+    GROUP BY PostId
+),
+recent_comments AS (
+    SELECT
+        c.PostId,
+        COUNT(*) AS RecentCommentCount
+    FROM Comments c
+    WHERE c.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30' DAY)
+    GROUP BY c.PostId
+),
+badge_counts AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+)
+SELECT
+    q.QuestionId,
+    q.Title,
+    q.Score AS QuestionScore,
+    q.ViewCount,
+    q.OwnerName,
+    q.OwnerReputation,
+    bc.GoldBadges,
+    bc.SilverBadges,
+    bc.BronzeBadges,
+    q.CreationDate,
+    a.AnswerCount,
+    a.HighestAnswerScore,
+    a.AvgAnswerScore,
+    COALESCE(f.FavoriteCount, 0) AS Favorites,
+    COALESCE(rc.RecentCommentCount, 0) AS RecentCommentCount,
+    (SELECT ARRAY_AGG(t.TagName)
+     FROM top_tags t
+     WHERE q.Tags LIKE '%' || '<' || t.TagName || '>' || '%') AS TopTags
+FROM questions_with_top_tags q
+LEFT JOIN answer_stats a ON q.QuestionId = a.QuestionId
+LEFT JOIN favorite_counts f ON q.QuestionId = f.PostId
+LEFT JOIN recent_comments rc ON q.QuestionId = rc.PostId
+LEFT JOIN badge_counts bc ON q.OwnerName = bc.UserId
+GROUP BY
+    q.QuestionId,
+    q.Title,
+    q.Tags,
+    q.Score,
+    q.ViewCount,
+    q.OwnerName,
+    q.OwnerReputation,
+    q.CreationDate,
+    a.AnswerCount,
+    a.HighestAnswerScore,
+    a.AvgAnswerScore,
+    f.FavoriteCount,
+    rc.RecentCommentCount,
+    bc.GoldBadges,
+    bc.SilverBadges,
+    bc.BronzeBadges
+ORDER BY q.ViewCount DESC, a.AnswerCount DESC, q.Score DESC
+LIMIT 50;

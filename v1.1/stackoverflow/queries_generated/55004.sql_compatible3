@@ -1,0 +1,205 @@
+WITH 
+user_activity AS (
+    SELECT 
+        u.Id                               AS user_id,
+        u.DisplayName                      AS display_name,
+        u.Reputation                       AS current_rep,
+        COALESCE(
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) 
+            - SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) 
+                                          AS net_votes,
+        COUNT(p.Id)                        AS posts_created,
+        COUNT(c.Id)                        AS comments_made,
+        ROW_NUMBER() OVER (ORDER BY 
+            (u.Reputation + 
+             COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END),0) -
+             COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END),0)
+            ) DESC)                     AS rank_overall
+    FROM Users u
+    LEFT JOIN Posts p          ON p.OwnerUserId = u.Id AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    LEFT JOIN Comments c       ON c.UserId = u.Id AND c.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    LEFT JOIN Votes v          ON v.UserId = u.Id AND v.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+tag_metrics AS (
+    SELECT 
+        t.Id                                 AS tag_id,
+        t.TagName                            AS tag_name,
+        t.Count                              AS total_posts,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS recent_questions,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS avg_question_score,
+        JSON_AGG(
+            JSON_BUILD_OBJECT(
+                'question_id', p.Id,
+                'title', p.Title,
+                'score', p.Score,
+                'creation', p.CreationDate
+            )
+        ) FILTER (WHERE p.PostTypeId = 1 AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days')
+            AS recent_questions_json
+    FROM Tags t
+    LEFT JOIN Posts p
+        ON p.Tags IS NOT NULL 
+        AND POSITION('<' || t.TagName || '>' IN p.Tags) > 0
+    GROUP BY t.Id, t.TagName, t.Count
+),
+
+closed_duplicates AS (
+    SELECT 
+        ph1.PostId                               AS duplicate_post_id,
+        ph2.PostId                               AS target_post_id,
+        ph1.CreationDate                         AS close_date,
+        JSON_AGG(
+            JSON_BUILD_OBJECT(
+                'voter_id', v.UserId,
+                'vote_type', vt.Name,
+                'vote_date', v.CreationDate
+            )
+        )                                        AS close_votes,
+        COUNT(v.Id)                              AS close_vote_count
+    FROM PostHistory ph1
+    JOIN PostHistoryTypes pht1 ON pht1.Id = ph1.PostHistoryTypeId
+        AND pht1.Name = 'Post Closed'
+    JOIN PostHistory ph2 ON ph2.Id = CAST(ph1.Comment AS INTEGER)
+    JOIN PostHistoryTypes pht2 ON pht2.Id = ph2.PostHistoryTypeId
+        AND pht2.Name = 'Post Closed'
+    LEFT JOIN Votes v ON v.PostId = ph1.PostId AND v.VoteTypeId = 6
+    LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE ph1.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months'
+    GROUP BY ph1.PostId, ph2.PostId, ph1.CreationDate
+),
+
+user_badges AS (
+    SELECT 
+        b.UserId                                 AS user_id,
+        JSON_AGG(
+            JSON_BUILD_OBJECT(
+                'badge_name', b.Name,
+                'badge_class', b.Class,
+                'awarded', b.Date
+            )
+        )                                        AS badges_json
+    FROM Badges b
+    WHERE b.Date >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years'
+    GROUP BY b.UserId
+),
+
+post_network AS (
+    SELECT 
+        p.Id                                    AS post_id,
+        p.Title,
+        p.PostTypeId,
+        ARRAY[
+            (SELECT JSON_AGG(
+                JSON_BUILD_OBJECT(
+                    'history_id', ph.Id,
+                    'type', pt.Name,
+                    'created', ph.CreationDate,
+                    'user_id', ph.UserId,
+                    'comment', ph.Comment,
+                    'text_snippet', SUBSTRING(COALESCE(ph.Text,'') FROM 1 FOR 200)
+                )
+            )
+            FROM PostHistory ph
+            JOIN PostHistoryTypes pt ON pt.Id = ph.PostHistoryTypeId
+            WHERE ph.PostId = p.Id
+            ORDER BY ph.CreationDate DESC
+            LIMIT 10),
+            (SELECT JSON_AGG(
+                JSON_BUILD_OBJECT(
+                    'link_type', lt.Name,
+                    'related_post', pl.RelatedPostId,
+                    'created', pl.CreationDate
+                )
+            )
+            FROM PostLinks pl
+            JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+            WHERE pl.PostId = p.Id OR pl.RelatedPostId = p.Id
+            ORDER BY pl.CreationDate DESC
+            LIMIT 5)
+        ] AS history_and_links
+    FROM Posts p
+    WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+)
+
+SELECT
+    ua.user_id,
+    ua.display_name,
+    ua.current_rep,
+    ua.net_votes,
+    ua.posts_created,
+    ua.comments_made,
+    ua.rank_overall,
+    ub.badges_json,
+    JSON_BUILD_OBJECT(
+        'top_tags', (
+            SELECT JSON_AGG(tag_obj ORDER BY CAST(tag_obj->>'recent_questions' AS INTEGER) DESC)
+            FROM (
+                SELECT
+                    JSON_BUILD_OBJECT(
+                        'tag_id', tm.tag_id,
+                        'tag_name', tm.tag_name,
+                        'recent_questions', tm.recent_questions,
+                        'avg_score', ROUND(CAST(tm.avg_question_score AS NUMERIC),2),
+                        'questions', tm.recent_questions_json
+                    ) AS tag_obj,
+                    tm.recent_questions
+                FROM tag_metrics tm
+                JOIN Posts p ON p.Tags IS NOT NULL AND POSITION('<' || tm.tag_name || '>' IN p.Tags) > 0
+                WHERE p.OwnerUserId = ua.user_id
+                GROUP BY tm.tag_id, tm.tag_name, tm.recent_questions, tm.avg_question_score, tm.recent_questions_json
+                ORDER BY tm.recent_questions DESC
+                LIMIT 3
+            ) sub
+        ),
+        'closed_duplicates', (
+            SELECT JSON_AGG(cd_obj ORDER BY CAST(cd_obj->>'vote_count' AS INTEGER) DESC)
+            FROM (
+                SELECT
+                    JSON_BUILD_OBJECT(
+                        'duplicate_id', cd.duplicate_post_id,
+                        'target_id', cd.target_post_id,
+                        'close_date', cd.close_date,
+                        'vote_count', cd.close_vote_count,
+                        'votes', cd.close_votes
+                    ) AS cd_obj,
+                    cd.close_vote_count
+                FROM closed_duplicates cd
+                JOIN Posts dp ON dp.Id = cd.duplicate_post_id
+                WHERE dp.OwnerUserId = ua.user_id
+                GROUP BY cd.duplicate_post_id, cd.target_post_id, cd.close_date, cd.close_votes, cd.close_vote_count
+                ORDER BY cd.close_vote_count DESC
+                LIMIT 5
+            ) csub
+        ),
+        'recent_posts', (
+            SELECT JSON_AGG(pn_obj ORDER BY CAST(pn_obj->>'post_id' AS INTEGER) DESC)
+            FROM (
+                SELECT
+                    JSON_BUILD_OBJECT(
+                        'post_id', pn.post_id,
+                        'title', pn.title,
+                        'type', pn.posttypeid,
+                        'history_and_links', pn.history_and_links
+                    ) AS pn_obj,
+                    pn.post_id
+                FROM post_network pn
+                WHERE pn.post_id IN (
+                    SELECT p2.Id
+                    FROM Posts p2
+                    WHERE p2.OwnerUserId = ua.user_id
+                    ORDER BY p2.CreationDate DESC
+                    LIMIT 5
+                )
+                GROUP BY pn.post_id, pn.title, pn.posttypeid, pn.history_and_links
+                ORDER BY pn.post_id DESC
+                LIMIT 5
+            ) psub
+        )
+    ) AS user_profile_snapshot
+FROM user_activity ua
+LEFT JOIN user_badges ub ON ub.user_id = ua.user_id
+GROUP BY ua.user_id, ua.display_name, ua.current_rep, ua.net_votes, ua.posts_created, ua.comments_made, ua.rank_overall, ub.badges_json
+ORDER BY ua.rank_overall
+LIMIT 100;

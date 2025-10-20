@@ -1,0 +1,166 @@
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT
+        t.Id               AS tag_id,
+        t.TagName          AS tag_name,
+        NULL::int          AS parent_tag_id,
+        0                  AS level
+    FROM Tags t
+    UNION ALL
+    SELECT
+        t.Id,
+        t.TagName,
+        th.tag_id,
+        th.level + 1
+    FROM Tags t
+    JOIN tag_hierarchy th ON t.TagName LIKE th.tag_name || '-%'
+    WHERE th.level < 5
+),
+
+question_posts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score          AS question_score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.Tags,
+        p.OwnerUserId    AS asker_id,
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+
+answer_posts AS (
+    SELECT
+        a.Id,
+        a.ParentId       AS question_id,
+        a.Score          AS answer_score,
+        a.OwnerUserId    AS answerer_id,
+        a.CreationDate
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+
+close_votes AS (
+    SELECT
+        ph.PostId,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 10) AS close_vote_cnt,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 11) AS reopen_vote_cnt,
+        jsonb_agg(
+            CASE
+                WHEN ph.PostHistoryTypeId = 10 THEN CAST(ph.Comment AS integer)
+                ELSE NULL
+            END
+        ) FILTER (WHERE ph.PostHistoryTypeId = 10) AS close_reason_ids
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10, 11)
+    GROUP BY ph.PostId
+),
+
+duplicate_links AS (
+    SELECT
+        pl.PostId          AS duplicate_of,
+        pl.RelatedPostId   AS original_question,
+        COUNT(*) OVER (PARTITION BY pl.PostId) AS duplicate_cnt
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+),
+
+user_rep AS (
+    SELECT
+        u.Id,
+        u.Reputation,
+        u.DisplayName
+    FROM Users u
+),
+
+tag_question_stats AS (
+    SELECT
+        th.tag_name,
+        COUNT(q.Id)                                            AS total_questions,
+        AVG(q.question_score)                                 AS avg_question_score,
+        AVG(q.ViewCount)                                      AS avg_views,
+        AVG(q.AnswerCount)                                    AS avg_answer_count,
+        SUM(q.FavoriteCount)                                  AS total_favorites,
+        COUNT(DISTINCT cv.PostId) FILTER (WHERE cv.close_vote_cnt > 0) AS closed_questions,
+        SUM(cv.close_vote_cnt)                                 AS total_close_votes,
+        COUNT(DISTINCT dl.duplicate_of)                        AS questions_marked_duplicate
+    FROM tag_hierarchy th
+    LEFT JOIN question_posts q
+        ON q.tag = th.tag_name
+    LEFT JOIN close_votes cv
+        ON cv.PostId = q.Id
+    LEFT JOIN duplicate_links dl
+        ON dl.duplicate_of = q.Id
+    GROUP BY th.tag_name
+),
+
+tag_answer_stats AS (
+    SELECT
+        th.tag_name,
+        COUNT(a.Id)                                            AS total_answers,
+        AVG(a.answer_score)                                    AS avg_answer_score,
+        MAX(a.answer_score)                                    AS max_answer_score,
+        COUNT(DISTINCT a.answerer_id)                          AS distinct_answerers,
+        (SELECT ur.DisplayName
+         FROM user_rep ur
+         JOIN answer_posts ap ON ap.answerer_id = ur.Id
+         WHERE ap.question_id IN (
+               SELECT q.Id FROM question_posts q WHERE q.tag = th.tag_name
+         )
+         GROUP BY ur.Id, ur.DisplayName, ur.Reputation
+         ORDER BY ur.Reputation DESC
+         LIMIT 1)                                            AS top_answerer_by_rep
+    FROM tag_hierarchy th
+    LEFT JOIN question_posts q
+        ON q.tag = th.tag_name
+    LEFT JOIN answer_posts a
+        ON a.question_id = q.Id
+    GROUP BY th.tag_name
+),
+
+tag_vote_stats AS (
+    SELECT
+        th.tag_name,
+        COUNT(v.Id)                                            AS total_votes,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2)           AS upvotes,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3)           AS downvotes,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 5)           AS favorites,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 12)          AS spam_flags,
+        COUNT(v.Id) FILTER (WHERE v.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '30 days') AS recent_votes
+    FROM tag_hierarchy th
+    LEFT JOIN question_posts q
+        ON q.tag = th.tag_name
+    LEFT JOIN Votes v
+        ON v.PostId = q.Id
+    GROUP BY th.tag_name
+)
+
+SELECT
+    qs.tag_name,
+    qs.total_questions,
+    qs.avg_question_score,
+    qs.avg_views,
+    qs.avg_answer_count,
+    qs.total_favorites,
+    qs.closed_questions,
+    qs.total_close_votes,
+    qs.questions_marked_duplicate,
+    as_.total_answers,
+    as_.avg_answer_score,
+    as_.max_answer_score,
+    as_.distinct_answerers,
+    as_.top_answerer_by_rep,
+    vs.total_votes,
+    vs.upvotes,
+    vs.downvotes,
+    vs.favorites,
+    vs.spam_flags,
+    vs.recent_votes
+FROM tag_question_stats qs
+JOIN tag_answer_stats   as_ ON as_.tag_name = qs.tag_name
+JOIN tag_vote_stats     vs  ON vs.tag_name  = qs.tag_name
+ORDER BY qs.total_questions DESC
+LIMIT 100;

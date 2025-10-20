@@ -1,0 +1,258 @@
+WITH
+QuestionTags AS (
+  SELECT p.Id AS QuestionId,
+         p.OwnerUserId,
+         p.CreationDate,
+         p.Score,
+         p.ViewCount,
+         p.AnswerCount,
+         regexp_split_to_table(substring(p.Tags, 2, length(p.Tags)-2), '><') AS Tag
+  FROM Posts p
+  WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+TagMetrics AS (
+  SELECT
+    qt.Tag,
+    count(*) AS QuestionCount,
+    avg(qt.Score) AS AvgScore,
+    sum(qt.ViewCount) AS TotalViews,
+    avg(qt.AnswerCount) AS AvgAnswerCount,
+    sum( CASE WHEN qt.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - interval '180 days') THEN 1 ELSE 0 END ) AS RecentCount,
+    array_agg(qt.QuestionId ORDER BY qt.Score DESC, qt.ViewCount DESC) FILTER (WHERE qt.QuestionId IS NOT NULL) AS TopQuestions
+  FROM QuestionTags qt
+  GROUP BY qt.Tag
+),
+UserTagActivity AS (
+  SELECT
+    qt.Tag,
+    u.Id AS UserId,
+    u.DisplayName,
+    count(*) AS QuestionsAsked,
+    sum(p.Score) AS TotalScoreOnQuestions,
+    sum(case when a.Id IS NOT NULL then 1 else 0 end) AS AnswersProvided,
+    max(u.Reputation) AS Reputation
+  FROM QuestionTags qt
+  JOIN Users u ON u.Id = qt.OwnerUserId
+  LEFT JOIN Posts p ON p.Id = qt.QuestionId
+  LEFT JOIN Posts a ON a.ParentId = qt.QuestionId AND a.PostTypeId = 2
+  GROUP BY qt.Tag, u.Id, u.DisplayName
+),
+TopUsersPerTag AS (
+  SELECT uta.Tag, uta.UserId, uta.DisplayName,
+         uta.QuestionsAsked, uta.AnswersProvided, uta.TotalScoreOnQuestions, uta.Reputation,
+         (COALESCE(uta.QuestionsAsked,0) * 0.4 + COALESCE(uta.AnswersProvided,0) * 0.3 + COALESCE(uta.TotalScoreOnQuestions,0) * 0.2 + (COALESCE(uta.Reputation,0) / 1000.0) * 0.1) AS InfluenceScore,
+         row_number() OVER (PARTITION BY uta.Tag ORDER BY (COALESCE(uta.QuestionsAsked,0) * 0.4 + COALESCE(uta.AnswersProvided,0) * 0.3 + COALESCE(uta.TotalScoreOnQuestions,0) * 0.2 + (COALESCE(uta.Reputation,0) / 1000.0) * 0.1) DESC) AS rn
+  FROM UserTagActivity uta
+),
+TopTags AS (
+  SELECT tm.Tag, tm.QuestionCount, tm.AvgScore, tm.TotalViews, tm.RecentCount, tm.TopQuestions
+  FROM TagMetrics tm
+  WHERE tm.QuestionCount >= 200 AND tm.RecentCount >= 20
+  ORDER BY tm.RecentCount DESC, tm.QuestionCount DESC
+  LIMIT 50
+),
+SelectedTagQuestions AS (
+  SELECT t.Tag, qid AS QuestionId
+  FROM TopTags t,
+       LATERAL (
+         SELECT unnest( (t.TopQuestions)[1:50] ) AS qid
+       ) s
+),
+PostDeep AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.ParentId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.AcceptedAnswerId,
+    p.AnswerCount,
+    p.CommentCount,
+    p.Tags,
+    coalesce(v.UpVotes,0) AS UpVotes,
+    coalesce(v.DownVotes,0) AS DownVotes,
+    coalesce(h.EditCount,0) AS EditCount,
+    coalesce(c.CommentCount,0) AS TotalComments,
+    coalesce(pl.InboundLinks,0) AS InboundLinks,
+    coalesce(pl.OutboundLinks,0) AS OutboundLinks,
+    coalesce(dup.DuplicateCount,0) AS DuplicateCount
+  FROM Posts p
+  LEFT JOIN (
+    SELECT PostId,
+           sum(case when VoteTypeId = 2 then 1 else 0 end) AS UpVotes,
+           sum(case when VoteTypeId = 3 then 1 else 0 end) AS DownVotes
+    FROM Votes
+    GROUP BY PostId
+  ) v ON v.PostId = p.Id
+  LEFT JOIN (
+    SELECT PostId, count(*) AS EditCount
+    FROM PostHistory
+    WHERE PostHistoryTypeId IN (4,5,6,7,8,9,24)
+    GROUP BY PostId
+  ) h ON h.PostId = p.Id
+  LEFT JOIN (
+    SELECT PostId, count(*) AS CommentCount
+    FROM Comments
+    GROUP BY PostId
+  ) c ON c.PostId = p.Id
+  LEFT JOIN (
+    SELECT pl.RelatedPostId AS PostId,
+           sum(case when pl.LinkTypeId = 1 then 1 else 0 end) AS InboundLinks,
+           0 AS OutboundLinks
+    FROM PostLinks pl
+    GROUP BY pl.RelatedPostId
+  ) pl ON pl.PostId = p.Id
+  LEFT JOIN (
+    SELECT PostId, sum(case when LinkTypeId = 3 then 1 else 0 end) AS DuplicateCount
+    FROM PostLinks
+    GROUP BY PostId
+  ) dup ON dup.PostId = p.Id
+  WHERE p.Id IN (SELECT QuestionId FROM SelectedTagQuestions)
+),
+AnswersAgg AS (
+  SELECT parent.Id AS QuestionId,
+         count(a.Id) FILTER (WHERE a.PostTypeId = 2) AS AnswersTotal,
+         max(a.Score) FILTER (WHERE a.PostTypeId = 2) AS MaxAnswerScore,
+         avg(a.Score) FILTER (WHERE a.PostTypeId = 2) AS AvgAnswerScore,
+         sum(case when a.Id = parent.AcceptedAnswerId then 1 else 0 end) AS HasAccepted
+  FROM Posts parent
+  LEFT JOIN Posts a ON a.ParentId = parent.Id AND a.PostTypeId = 2
+  WHERE parent.PostTypeId = 1 AND parent.Id IN (SELECT QuestionId FROM SelectedTagQuestions)
+  GROUP BY parent.Id
+),
+CrossTagDensity AS (
+  SELECT q.Id AS QuestionId,
+         count(DISTINCT tt.Tag) FILTER (WHERE tt.Tag IN (SELECT Tag FROM TopTags)) AS SelectedTagCount,
+         array_agg(DISTINCT tt.Tag) FILTER (WHERE tt.Tag IN (SELECT Tag FROM TopTags)) AS SelectedTags
+  FROM Posts q
+  LEFT JOIN QuestionTags tt ON tt.QuestionId = q.Id
+  WHERE q.Id IN (SELECT QuestionId FROM SelectedTagQuestions)
+  GROUP BY q.Id
+),
+QuestionComplexity AS (
+  SELECT
+    pd.Id AS QuestionId,
+    pd.Title,
+    pd.CreationDate,
+    pd.LastActivityDate,
+    pd.Score,
+    pd.ViewCount,
+    pd.EditCount,
+    pd.TotalComments,
+    pd.InboundLinks,
+    pd.OutboundLinks,
+    pd.DuplicateCount,
+    coalesce(aa.AnswersTotal,0) AS AnswersTotal,
+    coalesce(aa.MaxAnswerScore,0) AS MaxAnswerScore,
+    coalesce(ctd.SelectedTagCount,0) AS SelectedTagCount,
+    (
+      (coalesce(pd.EditCount,0) * 4)
+      + (coalesce(pd.InboundLinks,0) * 3)
+      + (coalesce(pd.OutboundLinks,0) * 2)
+      + (coalesce(pd.TotalComments,0) * 1.5)
+      + (coalesce(aa.AnswersTotal,0) * 2.5)
+      + (case when pd.AcceptedAnswerId IS NOT NULL then 10 else 0 end)
+      + (least(coalesce(pd.ViewCount,0)/1000.0, 20) * 1.2)
+      + (coalesce(pd.Score,0) * 1.0)
+      + (coalesce(ctd.SelectedTagCount,0) * 2)
+    ) AS ComplexityScore
+  FROM PostDeep pd
+  LEFT JOIN AnswersAgg aa ON aa.QuestionId = pd.Id
+  LEFT JOIN CrossTagDensity ctd ON ctd.QuestionId = pd.Id
+),
+TopComplexQuestions AS (
+  SELECT qc.*,
+         row_number() OVER (ORDER BY qc.ComplexityScore DESC) AS rn
+  FROM QuestionComplexity qc
+),
+TopN AS (
+  SELECT * FROM TopComplexQuestions WHERE rn <= 250
+),
+TopAnswersAndComments AS (
+  SELECT
+    a.ParentId AS QuestionId,
+    json_agg(json_build_object(
+      'AnswerId', a.Id,
+      'Score', a.Score,
+      'CreationDate', a.CreationDate,
+      'OwnerUserId', a.OwnerUserId,
+      'BodySnippet', substring(a.Body from 1 for 200)
+    ) ORDER BY a.Score DESC NULLS LAST, a.CreationDate ASC) FILTER (WHERE a.Id IS NOT NULL) AS Answers
+  FROM Posts a
+  WHERE a.PostTypeId = 2 AND a.ParentId IN (SELECT QuestionId FROM TopN)
+  GROUP BY a.ParentId
+),
+TopCommentsSnapshot AS (
+  SELECT
+    c.PostId,
+    json_agg(json_build_object(
+      'CommentId', c.Id,
+      'Score', c.Score,
+      'CreationDate', c.CreationDate,
+      'UserId', c.UserId,
+      'TextSnippet', substring(c.Text from 1 for 140)
+    ) ORDER BY c.CreationDate ASC) FILTER (WHERE c.Id IS NOT NULL) AS Comments
+  FROM Comments c
+  WHERE c.PostId IN (SELECT QuestionId FROM TopN)
+  GROUP BY c.PostId
+),
+TagTopUsers AS (
+  SELECT t.Tag,
+         json_agg(json_build_object(
+           'UserId', tu.UserId,
+           'DisplayName', tu.DisplayName,
+           'InfluenceScore', round(CAST(tu.InfluenceScore AS numeric),2),
+           'QuestionsAsked', tu.QuestionsAsked,
+           'AnswersProvided', tu.AnswersProvided,
+           'Reputation', tu.Reputation
+         ) ORDER BY tu.InfluenceScore DESC) FILTER (WHERE tu.UserId IS NOT NULL) AS TopUsers
+  FROM TopTags t
+  LEFT JOIN TopUsersPerTag tu ON tu.Tag = t.Tag AND tu.rn <= 10
+  GROUP BY t.Tag
+),
+BadgesByUser AS (
+  SELECT b.UserId,
+         count(*) FILTER (WHERE b.Class = 1) AS Gold,
+         count(*) FILTER (WHERE b.Class = 2) AS Silver,
+         count(*) FILTER (WHERE b.Class = 3) AS Bronze
+  FROM Badges b
+  WHERE b.UserId IN (SELECT UserId FROM UserTagActivity)
+  GROUP BY b.UserId
+)
+SELECT
+  tt.Tag,
+  tt.QuestionCount,
+  round(CAST(tt.AvgScore AS numeric),2) AS AvgScore,
+  tt.TotalViews,
+  tt.RecentCount,
+  ttu.TopUsers,
+  (
+    SELECT json_agg(json_build_object(
+      'QuestionId', q.QuestionId,
+      'Title', q.Title,
+      'CreationDate', q.CreationDate,
+      'LastActivityDate', q.LastActivityDate,
+      'Score', q.Score,
+      'ViewCount', q.ViewCount,
+      'EditCount', q.EditCount,
+      'TotalComments', q.TotalComments,
+      'InboundLinks', q.InboundLinks,
+      'AnswersTotal', q.AnswersTotal,
+      'MaxAnswerScore', q.MaxAnswerScore,
+      'ComplexityScore', round(CAST(q.ComplexityScore AS numeric),2),
+      'TopAnswers', coalesce(ta.Answers, json '[]'),
+      'TopComments', coalesce(tc.Comments, json '[]')
+    ) ORDER BY q.ComplexityScore DESC) FROM TopN q
+    JOIN QuestionTags qt ON qt.QuestionId = q.QuestionId
+    LEFT JOIN TopAnswersAndComments ta ON ta.QuestionId = q.QuestionId
+    LEFT JOIN TopCommentsSnapshot tc ON tc.PostId = q.QuestionId
+    WHERE qt.Tag = tt.Tag
+    LIMIT 10
+  ) AS SampleTopComplexQuestions
+FROM TopTags tt
+LEFT JOIN TagTopUsers ttu ON ttu.Tag = tt.Tag
+ORDER BY tt.RecentCount DESC, tt.QuestionCount DESC;

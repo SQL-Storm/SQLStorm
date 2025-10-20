@@ -1,0 +1,154 @@
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS question_count,
+        SUM(p.ViewCount) AS total_views,
+        1 AS level
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE p.PostTypeId = 1
+      AND t.Count > 1000
+    GROUP BY t.Id, t.TagName
+
+    UNION ALL
+
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        0 AS question_count,
+        0 AS total_views,
+        th.level + 1 AS level
+    FROM tag_hierarchy th
+    INNER JOIN Posts p1 ON p1.Tags LIKE '%' || '<' || th.TagName || '>' || '%'
+    INNER JOIN Posts p2 ON p2.Tags LIKE '%' || '<' || th.TagName || '>' || '%'
+    INNER JOIN Tags t2 ON p2.Tags LIKE '%' || '<' || t2.TagName || '>' || '%'
+    WHERE p1.PostTypeId = 1 
+      AND p2.PostTypeId = 1
+      AND t2.Id != th.Id
+      AND th.level < 3
+    GROUP BY t2.Id, t2.TagName, th.level
+),
+tag_agg AS (
+    SELECT
+        th.Id,
+        th.TagName,
+        SUM(th.question_count) AS question_count,
+        SUM(th.total_views) AS total_views,
+        MAX(th.level) AS max_level
+    FROM tag_hierarchy th
+    GROUP BY th.Id, th.TagName
+),
+user_expertise AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS answers_count,
+        SUM(p.Score) AS total_score,
+        AVG(p.Score) AS avg_score,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS median_score,
+        STDDEV_SAMP(p.Score) AS score_stddev,
+        COUNT(DISTINCT CASE WHEN p.Score >= 10 THEN p.Id END) AS high_score_answers,
+        COUNT(DISTINCT b.Id) AS tag_badges,
+        ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY SUM(p.Score) DESC) AS tag_rank
+    FROM Users u
+    INNER JOIN Posts p ON p.OwnerUserId = u.Id
+    INNER JOIN Posts q ON q.Id = p.ParentId
+    INNER JOIN Tags t ON q.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    LEFT JOIN Badges b ON b.UserId = u.Id AND b.Name = t.TagName AND b.TagBased = TRUE
+    WHERE p.PostTypeId = 2
+      AND p.Score > 0
+      AND u.Reputation > 1000
+      AND p.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '2 years')
+    GROUP BY u.Id, u.DisplayName, t.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 5
+),
+temporal_patterns AS (
+    SELECT 
+        DATE_TRUNC('month', p.CreationDate) AS month,
+        COUNT(DISTINCT p.Id) AS post_count,
+        COUNT(DISTINCT p.OwnerUserId) AS unique_users,
+        AVG(p.Score) AS avg_score,
+        SUM(p.ViewCount) AS total_views,
+        COUNT(DISTINCT CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN p.Id END) AS accepted_questions,
+        AVG(p.AnswerCount) AS avg_answers,
+        PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY p.Score) AS p90_score
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '5 years')
+    GROUP BY DATE_TRUNC('month', p.CreationDate)
+),
+edit_patterns AS (
+    SELECT 
+        ph.PostId,
+        COUNT(DISTINCT ph.UserId) AS unique_editors,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 END) AS edit_count,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (7, 8, 9) THEN 1 END) AS rollback_count,
+        MAX(ph.CreationDate) - MIN(ph.CreationDate) AS edit_timespan,
+        STRING_AGG(DISTINCT u.DisplayName, ', ' ORDER BY u.Reputation DESC) FILTER (WHERE u.Reputation > 10000) AS top_editors
+    FROM PostHistory ph
+    LEFT JOIN Users u ON u.Id = ph.UserId
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)
+    GROUP BY ph.PostId
+    HAVING COUNT(DISTINCT ph.UserId) > 2
+)
+SELECT 
+    th.TagName,
+    COALESCE(ta.question_count, 0) AS question_count,
+    COALESCE(ta.total_views, 0) AS total_views,
+    th.level AS tag_hierarchy_level,
+    ue.DisplayName AS top_expert,
+    ue.total_score AS expert_score,
+    ue.answers_count AS expert_answers,
+    ue.median_score AS expert_median_score,
+    ue.tag_badges AS expert_badges,
+    tp.month,
+    tp.post_count AS monthly_posts,
+    tp.avg_score AS monthly_avg_score,
+    tp.p90_score AS monthly_p90_score,
+    ep.edit_count,
+    ep.unique_editors,
+    ep.rollback_count,
+    ep.top_editors,
+    COALESCE(pl.linked_count, 0) AS linked_posts,
+    COALESCE(pl.duplicate_count, 0) AS duplicate_posts,
+    COALESCE(v.upvotes, 0) AS total_upvotes,
+    COALESCE(v.downvotes, 0) AS total_downvotes,
+    COALESCE(v.favorites, 0) AS total_favorites,
+    COALESCE(c.comment_count, 0) AS total_comments,
+    COALESCE(c.avg_comment_score, 0) AS avg_comment_score
+FROM tag_hierarchy th
+INNER JOIN tag_agg ta ON ta.Id = th.Id
+INNER JOIN user_expertise ue ON ue.TagName = th.TagName AND ue.tag_rank = 1
+CROSS JOIN temporal_patterns tp
+LEFT JOIN Posts p ON p.Tags LIKE '%' || '<' || th.TagName || '>' || '%' 
+    AND DATE_TRUNC('month', p.CreationDate) = tp.month
+    AND p.PostTypeId = 1
+LEFT JOIN edit_patterns ep ON ep.PostId = p.Id
+LEFT JOIN LATERAL (
+    SELECT 
+        COUNT(CASE WHEN LinkTypeId = 1 THEN 1 END) AS linked_count,
+        COUNT(CASE WHEN LinkTypeId = 3 THEN 1 END) AS duplicate_count
+    FROM PostLinks
+    WHERE PostId = p.Id OR RelatedPostId = p.Id
+) pl ON true
+LEFT JOIN LATERAL (
+    SELECT 
+        COUNT(CASE WHEN VoteTypeId = 2 THEN 1 END) AS upvotes,
+        COUNT(CASE WHEN VoteTypeId = 3 THEN 1 END) AS downvotes,
+        COUNT(CASE WHEN VoteTypeId = 5 THEN 1 END) AS favorites
+    FROM Votes
+    WHERE PostId = p.Id
+) v ON true
+LEFT JOIN LATERAL (
+    SELECT 
+        COUNT(*) AS comment_count,
+        AVG(Score) AS avg_comment_score
+    FROM Comments
+    WHERE PostId = p.Id
+) c ON true
+WHERE th.level <= 2
+  AND tp.month >= (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+ORDER BY COALESCE(ta.total_views,0) DESC, tp.month DESC, ue.total_score DESC
+LIMIT 10000;

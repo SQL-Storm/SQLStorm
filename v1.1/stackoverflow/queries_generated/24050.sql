@@ -1,4 +1,4 @@
--- {"query": "24050.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2393} 
+-- {"query": "24050.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2393} 
 
 /* Benchmark query – complex mix of CTEs, outer joins, window functions,
    correlated sub‑queries, set operators, string manipulation and NULL logic */

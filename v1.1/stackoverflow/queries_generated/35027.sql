@@ -1,0 +1,100 @@
+-- {"query": "35027.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4.1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 826} 
+WITH
+TopTags AS (
+    SELECT t.Id AS TagId, t.TagName, t.Count
+    FROM Tags t
+    ORDER BY t.Count DESC
+    LIMIT 10
+),
+RecentActiveUsers AS (
+    SELECT u.Id AS UserId, u.DisplayName, u.Reputation,
+           u.LastAccessDate
+    FROM Users u
+    WHERE u.LastAccessDate > NOW() - INTERVAL '30 days'
+      AND u.Reputation > 1000
+),
+PopularQuestions AS (
+    SELECT p.Id AS QuestionId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount,
+           p.Title, p.Tags
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > NOW() - INTERVAL '90 days'
+      AND p.Score > 5
+      AND p.ViewCount > 500
+),
+TaggedQuestions AS (
+    SELECT pq.QuestionId, pq.OwnerUserId, pq.CreationDate, pq.Score, pq.ViewCount,
+           pq.Title, tt.TagName
+    FROM PopularQuestions pq
+    JOIN TopTags tt
+      ON pq.Tags LIKE '%' || '<' || tt.TagName || '>' || '%'
+),
+AnswerStats AS (
+    SELECT p.ParentId AS QuestionId, COUNT(*) AS AnswerCount,
+           AVG(p.Score) AS AvgAnswerScore, MAX(p.Score) AS MaxAnswerScore
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+      AND p.CreationDate > NOW() - INTERVAL '90 days'
+    GROUP BY p.ParentId
+),
+QuestionCommentStats AS (
+    SELECT c.PostId AS QuestionId, COUNT(*) AS CommentCount,
+           AVG(c.Score) AS AvgCommentScore
+    FROM Comments c
+    WHERE c.CreationDate > NOW() - INTERVAL '90 days'
+      AND c.PostId IN (SELECT QuestionId FROM PopularQuestions)
+    GROUP BY c.PostId
+),
+BadgeCounts AS (
+    SELECT b.UserId, COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+           COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+           COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserVoteStats AS (
+    SELECT v.UserId, SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesGiven,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesGiven
+    FROM Votes v
+    WHERE v.CreationDate > NOW() - INTERVAL '90 days'
+      AND v.UserId IS NOT NULL
+    GROUP BY v.UserId
+),
+FinalAggregate AS (
+    SELECT
+        tq.QuestionId,
+        tq.Title,
+        tq.TagName,
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        bc.GoldBadges,
+        bc.SilverBadges,
+        bc.BronzeBadges,
+        us.UpvotesGiven,
+        us.DownvotesGiven,
+        tq.Score AS QuestionScore,
+        tq.ViewCount,
+        a.AnswerCount,
+        a.AvgAnswerScore,
+        a.MaxAnswerScore,
+        cs.CommentCount,
+        cs.AvgCommentScore,
+        u.LastAccessDate
+    FROM TaggedQuestions tq
+    LEFT JOIN RecentActiveUsers u
+      ON tq.OwnerUserId = u.Id
+    LEFT JOIN BadgeCounts bc
+      ON bc.UserId = u.Id
+    LEFT JOIN UserVoteStats us
+      ON us.UserId = u.Id
+    LEFT JOIN AnswerStats a
+      ON a.QuestionId = tq.QuestionId
+    LEFT JOIN QuestionCommentStats cs
+      ON cs.QuestionId = tq.QuestionId
+    WHERE u.Id IS NOT NULL
+)
+SELECT *
+FROM FinalAggregate
+ORDER BY Reputation DESC, ViewCount DESC, AvgAnswerScore DESC
+LIMIT 100;

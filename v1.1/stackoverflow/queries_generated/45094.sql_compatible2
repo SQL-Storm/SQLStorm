@@ -1,0 +1,118 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id, 
+        p.Title, 
+        p.Score, 
+        p.ViewCount,
+        p.AnswerCount,
+        u.DisplayName,
+        u.Reputation,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS PostRank,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.CreationDate) AS UserPostSequence
+    FROM 
+        Posts p
+    JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    WHERE 
+        p.PostTypeId = 1 
+        AND p.ClosedDate IS NULL
+        AND p.Score > 10
+        AND p.CreationDate > DATE '2018-01-01'
+), 
+ExplodedTags AS (
+    -- standard SQL: remove surrounding angle brackets and split tags using a recursive CTE
+    SELECT PostId, TagName
+    FROM (
+        SELECT
+            p.Id AS PostId,
+            CASE
+                WHEN p.Tags IS NULL THEN NULL
+                WHEN LEFT(p.Tags,1) = '<' AND RIGHT(p.Tags,1) = '>' THEN SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2))
+                ELSE p.Tags
+            END AS TagsStr
+        FROM Posts p
+    ) base
+    CROSS JOIN LATERAL (
+        -- recursive split of TagsStr on '><'
+        WITH RECURSIVE splitter(rest, tag, pos) AS (
+            SELECT
+                base.TagsStr,
+                NULL::text,  -- placeholder, will be replaced in first iteration
+                1
+            UNION ALL
+            SELECT
+                CASE
+                    WHEN instr.rest IS NULL THEN NULL
+                    WHEN POSITION('><' IN instr.rest) > 0 THEN SUBSTRING(instr.rest FROM POSITION('><' IN instr.rest) + 2)
+                    ELSE NULL
+                END,
+                CASE
+                    WHEN instr.rest IS NULL THEN NULL
+                    WHEN POSITION('><' IN instr.rest) > 0 THEN SUBSTRING(instr.rest FROM 1 FOR POSITION('><' IN instr.rest) - 1)
+                    ELSE instr.rest
+                END,
+                instr.pos + 1
+            FROM (
+                SELECT rest, pos FROM splitter WHERE pos = 1
+            ) initial
+            JOIN splitter instr ON TRUE
+            WHERE instr.rest IS NOT NULL AND instr.pos <= 1000
+        )
+        SELECT PostId, TRIM(tag) AS TagName
+        FROM (
+            -- generate first row separately and union with the recursive results
+            SELECT base.PostId,
+                CASE
+                    WHEN base.TagsStr IS NULL THEN NULL
+                    WHEN POSITION('><' IN base.TagsStr) > 0 THEN SUBSTRING(base.TagsStr FROM 1 FOR POSITION('><' IN base.TagsStr) - 1)
+                    ELSE base.TagsStr
+                END AS tag
+            UNION ALL
+            SELECT base.PostId, s.tag
+            FROM splitter s
+            WHERE s.tag IS NOT NULL
+        ) t
+    ) split_tags
+    WHERE TagName IS NOT NULL
+),
+TagAnalysis AS (
+    SELECT 
+        et.TagName, 
+        COUNT(DISTINCT p.Id) AS TagPostCount,
+        AVG(p.Score) AS AvgTagScore,
+        MAX(p.ViewCount) AS MaxTagViewCount
+    FROM 
+        Posts p
+    JOIN
+        ExplodedTags et ON p.Id = et.PostId
+    GROUP BY 
+        et.TagName
+)
+SELECT 
+    rp.Id,
+    rp.Title,
+    rp.Score,
+    rp.ViewCount,
+    rp.DisplayName,
+    rp.Reputation,
+    rp.PostRank,
+    rp.UserPostSequence,
+    ta.TagName,
+    ta.TagPostCount,
+    ta.AvgTagScore,
+    ta.MaxTagViewCount
+FROM 
+    RankedPosts rp
+JOIN 
+    Posts p ON rp.Id = p.Id
+JOIN
+    ExplodedTags et ON p.Id = et.PostId
+JOIN 
+    TagAnalysis ta ON et.TagName = ta.TagName
+WHERE 
+    rp.PostRank <= 100
+    AND ta.TagPostCount > 50
+ORDER BY 
+    rp.PostRank, 
+    ta.TagPostCount DESC
+LIMIT 1000;

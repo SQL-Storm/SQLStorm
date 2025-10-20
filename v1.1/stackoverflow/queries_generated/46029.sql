@@ -1,0 +1,126 @@
+-- {"query": "46029.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 66526, "output_tokens": 53669} 
+
+WITH RECURSIVE UserEngagementMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        AVG(p.Score) as AvgPostScore,
+        MAX(p.ViewCount) as MaxViewCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= CURRENT_DATE - INTERVAL '5 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+TopTagPerformance AS (
+    SELECT 
+        UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) as TagName,
+        p.OwnerUserId,
+        COUNT(*) as TagQuestionCount,
+        AVG(p.Score) as AvgTagScore,
+        SUM(p.ViewCount) as TotalTagViews,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) as TotalUpvotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) as TotalDownvotes
+    FROM Posts p
+    INNER JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId = 1 
+        AND p.Tags IS NOT NULL
+        AND p.CreationDate >= CURRENT_DATE - INTERVAL '3 years'
+    GROUP BY TagName, p.OwnerUserId
+),
+BadgeAchievements AS (
+    SELECT 
+        b.UserId,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) as GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) as SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) as BronzeBadges,
+        COUNT(DISTINCT CASE WHEN b.TagBased = 1 THEN b.Name END) as UniqueTagBadges,
+        MAX(b.Date) as LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+QuestionAnswerNetwork AS (
+    SELECT 
+        q.Id as QuestionId,
+        q.OwnerUserId as QuestionAuthorId,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        q.AnswerCount,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswerAuthorId,
+        a.Score as AnswerScore,
+        CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END as IsAccepted,
+        COUNT(DISTINCT c.Id) as CommentCountOnAnswer,
+        AVG(ph.CreationDate - a.CreationDate) as AvgEditTime
+    FROM Posts q
+    INNER JOIN Posts a ON q.Id = a.ParentId
+    LEFT JOIN Comments c ON a.Id = c.PostId
+    LEFT JOIN PostHistory ph ON a.Id = ph.PostId AND ph.PostHistoryTypeId = 5
+    WHERE q.PostTypeId = 1 
+        AND a.PostTypeId = 2
+        AND q.CreationDate >= CURRENT_DATE - INTERVAL '2 years'
+    GROUP BY q.Id, q.OwnerUserId, q.Score, q.ViewCount, q.AnswerCount, 
+             a.Id, a.OwnerUserId, a.Score, q.AcceptedAnswerId
+),
+UserInfluenceScore AS (
+    SELECT 
+        uem.Id as UserId,
+        uem.DisplayName,
+        uem.Reputation,
+        uem.TotalPosts,
+        uem.QuestionCount,
+        uem.AnswerCount,
+        COALESCE(ba.GoldBadges, 0) as GoldBadges,
+        COALESCE(ba.SilverBadges, 0) as SilverBadges,
+        COALESCE(ba.BronzeBadges, 0) as BronzeBadges,
+        COALESCE(AVG(ttp.AvgTagScore), 0) as AvgTagPerformance,
+        COALESCE(SUM(ttp.TotalUpvotes), 0) as TotalUpvotesReceived,
+        COUNT(DISTINCT qan.AnswerId) FILTER (WHERE qan.IsAccepted = 1) as AcceptedAnswers,
+        (uem.Reputation * 0.3 + 
+         COALESCE(ba.GoldBadges * 100, 0) + 
+         COALESCE(ba.SilverBadges * 50, 0) + 
+         COALESCE(ba.BronzeBadges * 10, 0) + 
+         uem.AnswerCount * 5 + 
+         uem.QuestionCount * 2) as InfluenceScore
+    FROM UserEngagementMetrics uem
+    LEFT JOIN BadgeAchievements ba ON uem.Id = ba.UserId
+    LEFT JOIN TopTagPerformance ttp ON uem.Id = ttp.OwnerUserId
+    LEFT JOIN QuestionAnswerNetwork qan ON uem.Id = qan.AnswerAuthorId
+    WHERE uem.TotalPosts >= 10
+    GROUP BY uem.Id, uem.DisplayName, uem.Reputation, uem.TotalPosts, 
+             uem.QuestionCount, uem.AnswerCount, ba.GoldBadges, ba.SilverBadges, ba.BronzeBadges
+)
+SELECT 
+    uis.UserId,
+    uis.DisplayName,
+    uis.Reputation,
+    uis.TotalPosts,
+    uis.InfluenceScore,
+    uis.GoldBadges,
+    uis.SilverBadges,
+    uis.BronzeBadges,
+    uis.AcceptedAnswers,
+    uis.TotalUpvotesReceived,
+    RANK() OVER (ORDER BY uis.InfluenceScore DESC) as GlobalRank,
+    PERCENT_RANK() OVER (ORDER BY uis.InfluenceScore) as PercentileRank,
+    STRING_AGG(DISTINCT ttp.TagName, ', ' ORDER BY ttp.TagQuestionCount DESC) FILTER (WHERE ttp.TagQuestionCount >= 5) as TopTags,
+    AVG(qan.QuestionViews) as AvgQuestionViewsAnswered,
+    COUNT(DISTINCT pl.RelatedPostId) as LinkedPostsCount,
+    MAX(v.CreationDate) as LastVoteReceived
+FROM UserInfluenceScore uis
+LEFT JOIN TopTagPerformance ttp ON uis.UserId = ttp.OwnerUserId AND ttp.TagQuestionCount >= 5
+LEFT JOIN QuestionAnswerNetwork qan ON uis.UserId = qan.AnswerAuthorId
+LEFT JOIN Posts p ON uis.UserId = p.OwnerUserId
+LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+WHERE uis.InfluenceScore > 100
+GROUP BY uis.UserId, uis.DisplayName, uis.Reputation, uis.TotalPosts, 
+         uis.InfluenceScore, uis.GoldBadges, uis.SilverBadges, uis.BronzeBadges,
+         uis.AcceptedAnswers, uis.TotalUpvotesReceived
+HAVING COUNT(DISTINCT p.Id) >= 5
+ORDER BY uis.InfluenceScore DESC, uis.TotalUpvotesReceived DESC
+LIMIT 1000;

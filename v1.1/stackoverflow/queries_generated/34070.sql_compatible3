@@ -1,0 +1,145 @@
+with recursive RecursiveUserHierarchy as (
+    select u.Id, u.DisplayName, u.Reputation, 1 as Level, u.Id as RootUserId
+    from Users u
+    where u.Reputation > 50000
+    union all
+    select u2.Id, u2.DisplayName, u2.Reputation, ruh.Level + 1, ruh.RootUserId
+    from Users u2
+    join Posts p on p.OwnerUserId = u2.Id
+    join RecursiveUserHierarchy ruh on p.OwnerUserId = ruh.Id
+    where ruh.Level < 3
+),
+TopTags as (
+    select t.Id, t.TagName
+    from Tags t
+    order by t.Count desc
+    limit 10
+),
+UserBadgeStats as (
+    select b.UserId,
+           sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+           sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+           sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+    from Badges b
+    group by b.UserId
+),
+UserPostInteractions as (
+    select p.OwnerUserId as UserId,
+           count(distinct p.Id) as PostCount,
+           sum(p.Score) as TotalPostScore,
+           sum(case when p.PostTypeId = 1 then p.ViewCount else 0 end) as TotalQuestionViews,
+           avg(p.Score) as AvgPostScore
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+TagUsagePerUser as (
+    -- Parse Tags like '<tag1><tag2>' into rows without relying on UNNEST/string_to_array.
+    -- This implementation uses a numbers (generate_series) approach to extract tags.
+    select distinct p.OwnerUserId as UserId,
+           trim(both '<>' from substring(p.Tags FROM spos FOR (epos - spos + 1))) as TagName,
+           count(*) over (partition by p.OwnerUserId, trim(both '<>' from substring(p.Tags FROM spos FOR (epos - spos + 1)))) as TagUsageCount
+    from Posts p
+    join (
+        -- generate positions of '<' in the tag string
+        select gs.n as idx
+        from (
+            -- lightweight numbers table up to a reasonable max tag count (adjust 20 if needed)
+            select row_number() over () as n from (select 1 union all select 1 union all select 1 union all select 1 union all select 1 union all select 1 union all select 1 union all select 1 union all select 1 union all select 1) a,
+                                                            (select 1 union all select 1 union all select 1 union all select 1 union all select 1) b
+        ) gs
+    ) nums on nums.idx <= char_length(p.Tags)
+    cross join lateral (
+        select strpos(substr(p.Tags, nums.idx), '<') as rel_open,
+               strpos(substr(p.Tags, nums.idx), '>') as rel_close
+    ) pos
+    cross join lateral (
+        select nums.idx + pos.rel_open - 1 as spos,
+               nums.idx + pos.rel_close - 1 as epos
+    ) se
+    where p.PostTypeId = 1 and p.Tags is not null
+      and pos.rel_open > 0 and pos.rel_close > pos.rel_open
+),
+FilteredTagUsage as (
+    select tgu.UserId, tgu.TagName, tgu.TagUsageCount
+    from TagUsagePerUser tgu
+    join TopTags tt on tgu.TagName = tt.TagName
+),
+UserVoteCounts as (
+    select v.UserId,
+           sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+           sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes,
+           sum(case when vt.Name = 'Favorite' then 1 else 0 end) as FavoriteVotes
+    from Votes v
+    join VoteTypes vt on v.VoteTypeId = vt.Id
+    where v.UserId is not null
+    group by v.UserId
+),
+UserMetrics as (
+    select u.Id as UserId,
+           u.DisplayName,
+           u.Reputation,
+           u.CreationDate,
+           u.LastAccessDate,
+           ub.GoldBadges,
+           ub.SilverBadges,
+           ub.BronzeBadges,
+           upi.PostCount,
+           upi.TotalPostScore,
+           upi.TotalQuestionViews,
+           upi.AvgPostScore,
+           coalesce(uvc.UpVotes,0) as TotalUpVotesGiven,
+           coalesce(uvc.DownVotes,0) as TotalDownVotesGiven,
+           coalesce(uvc.FavoriteVotes,0) as TotalFavoritesGiven
+    from Users u
+    left join UserBadgeStats ub on u.Id = ub.UserId
+    left join UserPostInteractions upi on u.Id = upi.UserId
+    left join UserVoteCounts uvc on u.Id = uvc.UserId
+    where u.Reputation > 1000
+),
+UserTagRankings as (
+    select fua.UserId, fua.TagName, fua.TagUsageCount,
+           rank() over (partition by fua.UserId order by fua.TagUsageCount desc) as TagRank
+    from FilteredTagUsage fua
+),
+TopUserTags as (
+    select utr.UserId, string_agg(utr.TagName || ':' || utr.TagUsageCount, ', ') as TopTags
+    from UserTagRankings utr
+    where utr.TagRank <= 3
+    group by utr.UserId
+)
+select um.UserId,
+       um.DisplayName,
+       um.Reputation,
+       um.GoldBadges,
+       um.SilverBadges,
+       um.BronzeBadges,
+       um.PostCount,
+       um.TotalPostScore,
+       um.TotalQuestionViews,
+       um.AvgPostScore,
+       um.TotalUpVotesGiven,
+       um.TotalDownVotesGiven,
+       um.TotalFavoritesGiven,
+       tut.TopTags,
+       ru.Level as UserHierarchyLevel
+from UserMetrics um
+left join TopUserTags tut on um.UserId = tut.UserId
+left join RecursiveUserHierarchy ru on um.UserId = ru.Id
+group by um.UserId,
+         um.DisplayName,
+         um.Reputation,
+         um.GoldBadges,
+         um.SilverBadges,
+         um.BronzeBadges,
+         um.PostCount,
+         um.TotalPostScore,
+         um.TotalQuestionViews,
+         um.AvgPostScore,
+         um.TotalUpVotesGiven,
+         um.TotalDownVotesGiven,
+         um.TotalFavoritesGiven,
+         tut.TopTags,
+         ru.Level
+order by um.Reputation desc, um.TotalPostScore desc
+limit 100;

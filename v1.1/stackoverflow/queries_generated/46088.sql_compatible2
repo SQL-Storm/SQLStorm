@@ -1,0 +1,116 @@
+WITH TopQuestionAuthors AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(DISTINCT p.Id) AS question_count,
+        AVG(p.Score) AS avg_score,
+        SUM(p.ViewCount) AS total_views
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+        AND p.OwnerUserId IS NOT NULL
+        AND p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '2 years'
+    GROUP BY p.OwnerUserId
+    HAVING COUNT(DISTINCT p.Id) >= 5
+),
+AnswerEngagement AS (
+    SELECT 
+        a.ParentId AS question_id,
+        COUNT(DISTINCT a.Id) AS answer_count,
+        AVG(a.Score) AS avg_answer_score,
+        COUNT(DISTINCT a.OwnerUserId) AS unique_answerers,
+        MAX(a.CreationDate) AS last_answer_date
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+TagPopularity AS (
+    SELECT 
+        t.Id AS tag_id,
+        t.TagName,
+        t.Count AS usage_count,
+        COUNT(DISTINCT b.UserId) AS expert_count
+    FROM Tags t
+    LEFT JOIN Badges b ON b.Name = t.TagName AND b.TagBased = TRUE
+    GROUP BY t.Id, t.TagName, t.Count
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT v.Id) AS vote_count,
+        COUNT(DISTINCT c.Id) AS comment_count,
+        COUNT(DISTINCT b.Id) AS badge_count,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS gold_badges
+    FROM Users u
+    LEFT JOIN Votes v ON v.UserId = u.Id AND v.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '1 year'
+    LEFT JOIN Comments c ON c.UserId = u.Id AND c.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '1 year'
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+)
+SELECT 
+    q.Id AS question_id,
+    q.Title,
+    q.Score AS question_score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.CommentCount,
+    q.FavoriteCount,
+    u.DisplayName AS author_name,
+    u.Reputation AS author_reputation,
+    tqa.question_count AS author_total_questions,
+    tqa.avg_score AS author_avg_question_score,
+    ae.answer_count AS total_answers,
+    ae.avg_answer_score,
+    ae.unique_answerers,
+    ua.vote_count AS author_votes_given,
+    ua.comment_count AS author_comments_made,
+    ua.badge_count AS author_total_badges,
+    ua.gold_badges AS author_gold_badges,
+    STRING_AGG(tp.TagName, ', ' ORDER BY tp.TagName) AS question_tags,
+    AVG(tp.usage_count) AS avg_tag_popularity,
+    SUM(tp.expert_count) AS total_tag_experts,
+    COUNT(DISTINCT ph.Id) AS edit_history_count,
+    COUNT(DISTINCT pl.Id) AS related_links_count,
+    EXTRACT(EPOCH FROM (COALESCE(ae.last_answer_date, q.CreationDate) - q.CreationDate))/3600 AS hours_to_last_answer,
+    CASE 
+        WHEN q.AcceptedAnswerId IS NOT NULL THEN 1 
+        ELSE 0 
+    END AS has_accepted_answer,
+    COALESCE(bounty_info.total_bounty, 0) AS total_bounty_amount,
+    COALESCE(bounty_info.bounty_count, 0) AS bounty_count
+FROM Posts q
+INNER JOIN TopQuestionAuthors tqa ON q.OwnerUserId = tqa.OwnerUserId
+INNER JOIN Users u ON q.OwnerUserId = u.Id
+INNER JOIN UserActivity ua ON u.Id = ua.user_id
+LEFT JOIN AnswerEngagement ae ON q.Id = ae.question_id
+LEFT JOIN PostHistory ph ON q.Id = ph.PostId AND ph.PostHistoryTypeId IN (4, 5, 6)
+LEFT JOIN PostLinks pl ON q.Id = pl.PostId
+LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')) AS tag_name
+) qt ON TRUE
+LEFT JOIN TagPopularity tp ON qt.tag_name = tp.TagName
+LEFT JOIN LATERAL (
+    SELECT 
+        SUM(v.BountyAmount) AS total_bounty,
+        COUNT(*) AS bounty_count
+    FROM Votes v
+    WHERE v.PostId = q.Id AND v.VoteTypeId IN (8, 9)
+) bounty_info ON TRUE
+WHERE q.PostTypeId = 1
+    AND q.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '2 years'
+    AND q.Score >= 5
+    AND tqa.avg_score >= 3
+    AND ua.Reputation >= 1000
+GROUP BY 
+    q.Id, q.Title, q.Score, q.ViewCount, q.AnswerCount, q.CommentCount, 
+    q.FavoriteCount, q.AcceptedAnswerId, q.CreationDate, q.Tags,
+    u.DisplayName, u.Reputation, tqa.question_count, tqa.avg_score,
+    ae.answer_count, ae.avg_answer_score, ae.unique_answerers, ae.last_answer_date,
+    ua.vote_count, ua.comment_count, ua.badge_count, ua.gold_badges,
+    bounty_info.total_bounty, bounty_info.bounty_count
+HAVING COUNT(tp.TagName) >= 2
+ORDER BY 
+    (q.Score * 2 + COALESCE(ae.avg_answer_score, 0) * COALESCE(ae.answer_count,0) + 
+     COALESCE(bounty_info.total_bounty, 0) / 50) DESC,
+    q.ViewCount DESC
+LIMIT 100;

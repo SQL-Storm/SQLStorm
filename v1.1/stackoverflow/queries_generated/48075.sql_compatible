@@ -1,0 +1,66 @@
+WITH RecursivePostChain AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.OwnerUserId,
+        0 AS Depth
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Score > 100
+      AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '1 year'
+
+    UNION ALL
+
+    SELECT
+        p_ans.Id AS PostId,
+        p_ans.Title,
+        p_ans.CreationDate,
+        p_ans.Score,
+        p_ans.OwnerUserId,
+        rpc.Depth + 1 AS Depth
+    FROM Posts p_ans
+    JOIN RecursivePostChain rpc ON p_ans.ParentId = rpc.PostId
+    WHERE p_ans.PostTypeId = 2
+      AND p_ans.Score > 20
+)
+SELECT
+    rpc.PostId,
+    rpc.Title AS PostTitle,
+    rpc.CreationDate AS PostCreationDate,
+    rpc.Score AS PostScore,
+    rpc.Depth,
+    rpc.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    COUNT(c.Id) AS CommentCount,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+    MAX(CASE WHEN bh.PostHistoryTypeId = 1 THEN bh.CreationDate ELSE NULL END) AS InitialTitleDate,
+    MIN(CASE WHEN bh.PostHistoryTypeId = 2 THEN bh.CreationDate ELSE NULL END) AS InitialBodyDate,
+    (
+        SELECT COUNT(*)
+        FROM PostHistory ph_edit
+        WHERE ph_edit.PostId = rpc.PostId
+          AND ph_edit.PostHistoryTypeId IN (4, 5, 6)
+    ) AS EditCount
+FROM RecursivePostChain rpc
+LEFT JOIN Users u ON rpc.OwnerUserId = u.Id
+LEFT JOIN Comments c ON rpc.PostId = c.PostId
+LEFT JOIN Votes v ON rpc.PostId = v.PostId
+LEFT JOIN PostHistory bh ON rpc.PostId = bh.PostId AND bh.PostHistoryTypeId IN (1, 2)
+GROUP BY
+    rpc.PostId,
+    rpc.Title,
+    rpc.CreationDate,
+    rpc.Score,
+    rpc.OwnerUserId,
+    rpc.Depth,
+    u.DisplayName
+HAVING
+    COUNT(c.Id) > 10 OR SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) > 50
+ORDER BY
+    rpc.Depth,
+    rpc.Score DESC,
+    rpc.CreationDate ASC
+LIMIT 1000;

@@ -1,0 +1,145 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        1 AS Level,
+        CAST(ARRAY[t.TagName] AS character varying[]) AS Path
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+    UNION ALL
+    SELECT
+        t.Id,
+        t.TagName,
+        r.Level + 1,
+        r.Path || t.TagName
+    FROM Tags t
+    JOIN PostLinks pl ON pl.PostId = t.ExcerptPostId
+    JOIN RecursiveTagHierarchy r ON pl.RelatedPostId = r.Id
+    WHERE NOT t.TagName = ANY(r.Path) AND r.Level < 5
+),
+TopUsersWithBadges AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    ORDER BY u.Reputation DESC
+    LIMIT 100
+),
+QuestionStats AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Score,
+        STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><') AS TagsArray,
+        COALESCE(p.AcceptedAnswerId, 0) AS AcceptedAnswerId
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+),
+AnswerStats AS (
+    SELECT
+        p.Id,
+        p.ParentId,
+        p.CreationDate,
+        p.Score,
+        u.Reputation AS AnswererReputation,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.PostTypeId = 2
+      AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+    GROUP BY p.Id, p.ParentId, p.CreationDate, p.Score, u.Reputation
+),
+QuestionAnswerAggregates AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate AS QuestionCreationDate,
+        q.ViewCount,
+        q.AnswerCount,
+        q.Score AS QuestionScore,
+        array_to_string(q.TagsArray, ',') AS Tags,
+        COUNT(a.Id) AS TotalAnswers,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.AnswererReputation) AS MaxAnswererReputation,
+        SUM(COALESCE(a.UpVotes,0)) AS TotalUpVotesOnAnswers,
+        SUM(COALESCE(a.DownVotes,0)) AS TotalDownVotesOnAnswers,
+        CASE WHEN q.AcceptedAnswerId > 0 THEN 1 ELSE 0 END AS HasAcceptedAnswer
+    FROM QuestionStats q
+    LEFT JOIN AnswerStats a ON a.ParentId = q.Id
+    GROUP BY q.Id, q.Title, q.OwnerUserId, q.CreationDate, q.ViewCount, q.AnswerCount, q.Score, q.TagsArray, q.AcceptedAnswerId
+),
+UserQuestionAggregates AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(q.QuestionId) AS NumQuestions,
+        AVG(q.QuestionScore) AS AvgQuestionScore,
+        SUM(q.ViewCount) AS TotalQuestionViews,
+        SUM(q.TotalAnswers) AS TotalAnswersReceived,
+        AVG(q.AvgAnswerScore) AS AvgAnswerScoreReceived,
+        SUM(q.HasAcceptedAnswer) AS AcceptedAnswerCount,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN QuestionAnswerAggregates q ON q.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(q.QuestionId) > 10
+),
+PopularTags AS (
+    SELECT
+        unnest(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><')) AS TagName,
+        COUNT(*) AS UsageCount,
+        AVG(p.Score) AS AvgQuestionScore,
+        AVG(p.ViewCount) AS AvgViewCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+    GROUP BY TagName
+    ORDER BY UsageCount DESC
+    LIMIT 50
+)
+SELECT
+    u.UserId,
+    u.DisplayName,
+    u.NumQuestions,
+    ROUND(CAST(u.AvgQuestionScore AS numeric), 2) AS AvgQuestionScore,
+    u.TotalQuestionViews,
+    u.TotalAnswersReceived,
+    ROUND(CAST(u.AvgAnswerScoreReceived AS numeric), 2) AS AvgAnswerScoreReceived,
+    u.AcceptedAnswerCount,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    t.TagName,
+    t.UsageCount,
+    ROUND(CAST(t.AvgQuestionScore AS numeric), 2) AS TagAvgQuestionScore,
+    ROUND(CAST(t.AvgViewCount AS numeric), 2) AS TagAvgViewCount,
+    rh.Level AS TagHierarchyLevel,
+    rh.Path AS TagHierarchyPath
+FROM UserQuestionAggregates u
+CROSS JOIN LATERAL (
+    SELECT pt.TagName, pt.UsageCount, pt.AvgQuestionScore, pt.AvgViewCount
+    FROM PopularTags pt
+    ORDER BY random()
+    LIMIT 1
+) t
+LEFT JOIN RecursiveTagHierarchy rh ON rh.TagName = t.TagName
+ORDER BY u.NumQuestions DESC, u.AvgQuestionScore DESC
+LIMIT 50;

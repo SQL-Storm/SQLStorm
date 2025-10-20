@@ -1,0 +1,145 @@
+WITH
+Questions AS (
+  SELECT p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount,
+         COALESCE(string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><'), CAST(ARRAY[] AS text[])) AS TagArray,
+         p.AnswerCount, p.CommentCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years'
+),
+TopAnswers AS (
+  SELECT a.ParentId AS QuestionId, a.Id AS AnswerId, a.OwnerUserId AS AnswerOwner,
+         a.Score AS AnswerScore, a.CreationDate AS AnswerCreation
+  FROM Posts a
+  JOIN (
+    SELECT ParentId, max(Score) AS MaxScore
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY ParentId
+  ) m ON a.ParentId = m.ParentId AND a.Score = m.MaxScore
+  WHERE a.PostTypeId = 2
+),
+UserBadges AS (
+  SELECT b.UserId,
+         count(case when b.Class = 1 then 1 end) AS GoldBadges,
+         count(case when b.Class = 2 then 1 end) AS SilverBadges,
+         count(case when b.Class = 3 then 1 end) AS BronzeBadges,
+         count(*) AS TotalBadges,
+         max(b.Date) AS LastBadgeDate
+  FROM Badges b
+  GROUP BY b.UserId
+),
+PostVotes AS (
+  SELECT v.PostId,
+         count(case when v.VoteTypeId = 2 then 1 end) AS UpVotes,
+         count(case when v.VoteTypeId = 3 then 1 end) AS DownVotes,
+         count(case when v.VoteTypeId = 5 then 1 end) AS Favorites,
+         count(case when v.VoteTypeId = 8 then 1 end) AS BountyStarts,
+         count(*) AS TotalVotes
+  FROM Votes v
+  GROUP BY v.PostId
+),
+RecentComments AS (
+  SELECT c.PostId, c.UserId,
+         count(*) AS CommentsOnPostByUser,
+         max(c.CreationDate) AS LastCommentAt
+  FROM Comments c
+  WHERE c.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+  GROUP BY c.PostId, c.UserId
+),
+TagPopularity AS (
+  SELECT tag AS TagName, count(*) AS QuestionCount,
+         avg(q.Score) AS AvgScore, sum(q.ViewCount) AS TotalViews
+  FROM Questions q, unnest(q.TagArray) AS tag
+  GROUP BY tag
+  ORDER BY QuestionCount DESC
+  LIMIT 200
+),
+QuestionTagPairs AS (
+  SELECT q1.Id AS Q1, q2.Id AS Q2,
+         (
+           SELECT count(*) FROM (
+             SELECT unnest(q1.TagArray) AS t1
+             INTERSECT
+             SELECT unnest(q2.TagArray) AS t2
+           ) s
+         ) AS SharedTagCount
+  FROM Questions q1
+  JOIN Questions q2 ON q1.Id < q2.Id
+  WHERE (array_length(q1.TagArray,1) IS NOT NULL AND array_length(q2.TagArray,1) IS NOT NULL)
+),
+TopSimilarPairs AS (
+  SELECT Q1, Q2, SharedTagCount
+  FROM QuestionTagPairs
+  WHERE SharedTagCount IS NOT NULL AND SharedTagCount > 0
+  ORDER BY SharedTagCount DESC, Q1, Q2
+  LIMIT 1000
+),
+EnrichedQuestions AS (
+  SELECT q.Id, q.Title, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount,
+         q.TagArray, q.AnswerCount, q.CommentCount,
+         ta.AnswerId, ta.AnswerOwner, ta.AnswerScore,
+         pv.UpVotes, pv.DownVotes, pv.Favorites, pv.TotalVotes,
+         ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ub.TotalBadges
+  FROM Questions q
+  LEFT JOIN TopAnswers ta ON q.Id = ta.QuestionId
+  LEFT JOIN PostVotes pv ON q.Id = pv.PostId
+  LEFT JOIN UserBadges ub ON q.OwnerUserId = ub.UserId
+),
+RecentScoreDeltas AS (
+  SELECT ph.PostId AS QuestionId,
+         max(CASE WHEN ph.CreationDate <= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months' THEN CAST((ph.Text->>'score') AS integer) END) AS ScoreSixMonthsAgo,
+         max(CASE WHEN ph.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months' THEN CAST((ph.Text->>'score') AS integer) END) AS ScoreRecent
+  FROM PostHistory ph
+  WHERE ph.PostId IN (SELECT Id FROM Questions)
+    AND ph.PostHistoryTypeId IN (2,5)
+  GROUP BY ph.PostId
+),
+Movers AS (
+  SELECT q.Id, q.Title, q.Score, rd.ScoreSixMonthsAgo, rd.ScoreRecent,
+         CASE
+           WHEN rd.ScoreSixMonthsAgo IS NULL AND rd.ScoreRecent IS NOT NULL THEN rd.ScoreRecent
+           WHEN rd.ScoreSixMonthsAgo IS NOT NULL AND rd.ScoreRecent IS NULL THEN q.Score - rd.ScoreSixMonthsAgo
+           ELSE COALESCE(rd.ScoreRecent, q.Score) - COALESCE(rd.ScoreSixMonthsAgo, 0)
+         END AS ScoreDelta
+  FROM Questions q
+  LEFT JOIN RecentScoreDeltas rd ON q.Id = rd.QuestionId
+  WHERE COALESCE(rd.ScoreRecent, q.Score) - COALESCE(rd.ScoreSixMonthsAgo, 0) > 5
+),
+Final AS (
+  SELECT eq.Id AS QuestionId, eq.Title, eq.OwnerUserId, eq.CreationDate, eq.Score AS CurrentScore,
+         eq.ViewCount, eq.AnswerCount, eq.CommentCount,
+         eq.AnswerId, eq.AnswerOwner, eq.AnswerScore,
+         eq.UpVotes, eq.DownVotes, eq.Favorites, eq.TotalVotes,
+         eq.GoldBadges, eq.SilverBadges, eq.BronzeBadges, eq.TotalBadges,
+         tp.TagName AS TopTag, tp.QuestionCount AS TagPopularity,
+         ms.ScoreDelta AS RecentScoreDelta,
+         (
+           SELECT array_agg(json_build_object('PeerQ', q2.Id, 'Title', q2.Title, 'SharedTags', p.SharedTagCount) ORDER BY p.SharedTagCount DESC) 
+           FROM (
+             SELECT p.Q1, p.Q2, p.SharedTagCount
+             FROM TopSimilarPairs p
+             WHERE p.Q1 = eq.Id OR p.Q2 = eq.Id
+             ORDER BY p.SharedTagCount DESC, p.Q1, p.Q2
+             LIMIT 5
+           ) p
+           JOIN Posts q2 ON q2.Id = CASE WHEN p.Q1 = eq.Id THEN p.Q2 WHEN p.Q2 = eq.Id THEN p.Q1 ELSE NULL END
+           WHERE p.SharedTagCount IS NOT NULL
+         ) AS TopSimilarQuestions
+  FROM EnrichedQuestions eq
+  LEFT JOIN LATERAL (
+    SELECT tag AS TopTag
+    FROM unnest(eq.TagArray) AS tag
+    ORDER BY (SELECT QuestionCount FROM TagPopularity tp2 WHERE tp2.TagName = tag) DESC NULLS LAST
+    LIMIT 1
+  ) tp1 ON true
+  LEFT JOIN TagPopularity tp ON tp.TagName = tp1.TopTag
+  LEFT JOIN Movers ms ON ms.Id = eq.Id
+)
+SELECT QuestionId, Title, OwnerUserId, CreationDate, CurrentScore, ViewCount, AnswerCount, CommentCount,
+       AnswerId, AnswerOwner, AnswerScore, UpVotes, DownVotes, Favorites, TotalVotes,
+       GoldBadges, SilverBadges, BronzeBadges, TotalBadges,
+       TopTag, TagPopularity, RecentScoreDelta, TopSimilarQuestions
+FROM Final
+ORDER BY RecentScoreDelta DESC NULLS LAST, TagPopularity DESC NULLS LAST, CurrentScore DESC
+LIMIT 500;

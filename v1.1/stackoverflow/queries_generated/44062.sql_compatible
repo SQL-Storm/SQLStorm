@@ -1,0 +1,70 @@
+WITH posts_with_comments AS (
+  SELECT
+    p.Id,
+    p.CreationDate,
+    p.Score,
+    p.AnswerCount,
+    p.CommentCount,
+    p.OwnerUserId,
+    COUNT(c.Id) AS total_comments
+  FROM Posts p
+  LEFT JOIN Comments c ON p.Id = c.PostId
+  GROUP BY p.Id, p.CreationDate, p.Score, p.AnswerCount, p.CommentCount, p.OwnerUserId
+)
+SELECT
+  p.Id,
+  p.CreationDate,
+  p.Score,
+  p.AnswerCount,
+  p.CommentCount,
+  p.total_comments,
+  u.Reputation,
+  u.Views,
+  u.UpVotes,
+  u.DownVotes,
+  COALESCE(b.Name, '') AS badge_name,
+  COALESCE(b.Class, 0) AS badge_class,
+  COALESCE(b.TagBased, 0) AS badge_tag_based,
+  COALESCE(b.Date, p.CreationDate) AS badge_date,
+  CASE
+    WHEN pl.LinkTypeId = 1 THEN 'Linked'
+    WHEN pl.LinkTypeId = 3 THEN 'Duplicate'
+    ELSE 'None'
+  END AS link_type,
+  COALESCE(pl.RelatedPostId, 0) AS related_post_id,
+  COALESCE(ct.Name, '') AS close_reason,
+  COALESCE(DATE_PART('day', p.ClosedDate::timestamp - p.CreationDate::timestamp), 0) AS days_to_close,
+  COALESCE(DATE_PART('day', p.CommunityOwnedDate::timestamp - p.CreationDate::timestamp), 0) AS days_to_community_owned,
+  COALESCE(DATE_PART('day', p.LastEditDate::timestamp - p.CreationDate::timestamp), 0) AS days_to_last_edit,
+  COALESCE(DATE_PART('day', p.LastActivityDate::timestamp - p.CreationDate::timestamp), 0) AS days_to_last_activity
+FROM posts_with_comments p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 10
+LEFT JOIN CloseReasonTypes ct ON CAST(COALESCE(ph.Comment, '0') AS INTEGER) = ct.Id
+GROUP BY
+  p.Id,
+  p.CreationDate,
+  p.Score,
+  p.AnswerCount,
+  p.CommentCount,
+  p.total_comments,
+  p.OwnerUserId,
+  u.Reputation,
+  u.Views,
+  u.UpVotes,
+  u.DownVotes,
+  b.Name,
+  b.Class,
+  b.TagBased,
+  b.Date,
+  pl.LinkTypeId,
+  pl.RelatedPostId,
+  ct.Name,
+  p.ClosedDate,
+  p.CommunityOwnedDate,
+  p.LastEditDate,
+  p.LastActivityDate
+ORDER BY p.CreationDate DESC
+LIMIT 1000;

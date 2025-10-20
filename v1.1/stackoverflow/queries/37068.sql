@@ -1,0 +1,192 @@
+WITH
+recent_posts AS (
+  SELECT p.*
+  FROM Posts p
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180' DAY
+),
+post_tags AS (
+  SELECT p.Id AS PostId, lower(trim(t.tag)) AS Tag
+  FROM recent_posts p
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(coalesce(p.Tags,''),2, greatest(length(coalesce(p.Tags,''))-2,0)), '><')) AS tag
+  ) t
+  WHERE p.PostTypeId = 1 AND coalesce(p.Tags,'') <> ''
+),
+question_aggs AS (
+  SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.CreationDate,
+    q.OwnerUserId,
+    q.Score AS QuestionScore,
+    q.ViewCount,
+    coalesce(a.AnswerCount,0) AS AnswerCount,
+    coalesce(c.CommentCount,0) AS CommentCount,
+    coalesce(v.UpVotes,0) AS UpVotes,
+    coalesce(v.DownVotes,0) AS DownVotes,
+    coalesce(e.EditCount,0) AS EditCount,
+    coalesce(l.IncomingLinks,0) AS IncomingLinks,
+    coalesce(l.OutgoingLinks,0) AS OutgoingLinks,
+    q.Tags
+  FROM recent_posts q
+  LEFT JOIN (
+    SELECT ParentId AS QId, count(*) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount
+    FROM Posts p
+    WHERE p.PostTypeId = 2 AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180' DAY
+    GROUP BY ParentId
+  ) a ON a.QId = q.Id
+  LEFT JOIN (
+    SELECT PostId, count(*) AS CommentCount
+    FROM Comments
+    WHERE CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180' DAY
+    GROUP BY PostId
+  ) c ON c.PostId = q.Id
+  LEFT JOIN (
+    SELECT p.PostId,
+      count(*) FILTER (WHERE vt.Name = 'UpMod' OR vt.Id = 2) AS UpVotes,
+      count(*) FILTER (WHERE vt.Name = 'DownMod' OR vt.Id = 3) AS DownVotes
+    FROM Votes p
+    LEFT JOIN VoteTypes vt ON vt.Id = p.VoteTypeId
+    WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180' DAY
+    GROUP BY p.PostId
+  ) v ON v.PostId = q.Id
+  LEFT JOIN (
+    SELECT PostId, count(*) AS EditCount
+    FROM PostHistory
+    WHERE CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180' DAY
+    GROUP BY PostId
+  ) e ON e.PostId = q.Id
+  LEFT JOIN (
+    SELECT pl.RelatedPostId AS QId, SUM(CASE WHEN pl.PostId = pl.RelatedPostId THEN 0 ELSE 1 END) AS IncomingLinks,
+           0 AS OutgoingLinks
+    FROM PostLinks pl
+    WHERE pl.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180' DAY
+    GROUP BY pl.RelatedPostId
+  ) l_in ON l_in.QId = q.Id
+  LEFT JOIN (
+    SELECT pl.PostId AS QId, count(*) AS OutgoingLinks
+    FROM PostLinks pl
+    WHERE pl.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180' DAY
+    GROUP BY pl.PostId
+  ) l_out ON l_out.QId = q.Id
+  LEFT JOIN LATERAL (
+    SELECT coalesce(l_in.IncomingLinks,0) AS IncomingLinks, coalesce(l_out.OutgoingLinks,0) AS OutgoingLinks
+  ) l ON true
+),
+question_contribs AS (
+  SELECT
+    q.QuestionId,
+    u.Id AS UserId,
+    u.DisplayName,
+    sum(sc.Score) AS ContributionScore,
+    count(*) AS ContributionEvents
+  FROM question_aggs q
+  JOIN LATERAL (
+    SELECT a.OwnerUserId AS UserId, 5 AS Score
+    FROM Posts a
+    WHERE a.ParentId = q.QuestionId AND a.PostTypeId = 2 AND a.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180' DAY AND a.OwnerUserId IS NOT NULL
+    UNION ALL
+    SELECT c.UserId, 2 AS Score
+    FROM Comments c
+    WHERE c.PostId = q.QuestionId AND c.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180' DAY AND c.UserId IS NOT NULL
+    UNION ALL
+    SELECT ph.UserId, 1 AS Score
+    FROM PostHistory ph
+    WHERE ph.PostId = q.QuestionId AND ph.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180' DAY AND ph.UserId IS NOT NULL
+  ) sc ON sc.UserId IS NOT NULL
+  JOIN Users u ON u.Id = sc.UserId
+  GROUP BY q.QuestionId, u.Id, u.DisplayName
+),
+top_contribs AS (
+  SELECT qc.*,
+    row_number() OVER (PARTITION BY qc.QuestionId ORDER BY qc.ContributionScore DESC, qc.ContributionEvents DESC, qc.UserId) rn
+  FROM question_contribs qc
+),
+top3_concat AS (
+  SELECT
+    QuestionId,
+    string_agg(DisplayName || ' (' || ContributionScore || ')', ', ' ORDER BY ContributionScore DESC, UserId) AS TopContributors
+  FROM top_contribs
+  WHERE rn <= 3
+  GROUP BY QuestionId
+),
+tag_aggs AS (
+  SELECT
+    pt.Tag,
+    count(DISTINCT pt.PostId) AS QuestionsInWindow,
+    sum(qa.AnswerCount) AS TotalAnswers,
+    avg(qa.ViewCount) AS AvgViews,
+    sum(qa.CommentCount) AS TotalComments,
+    sum(qa.UpVotes) AS TotalUpVotes,
+    sum(qa.DownVotes) AS TotalDownVotes,
+    sum(qa.EditCount) AS TotalEdits
+  FROM post_tags pt
+  JOIN question_aggs qa ON qa.QuestionId = pt.PostId
+  GROUP BY pt.Tag
+),
+dup_hotspots AS (
+  SELECT
+    pl.RelatedPostId AS CanonQuestionId,
+    count(*) AS DuplicateCount
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+  WHERE (lt.Name = 'Duplicate' OR pl.LinkTypeId = 3) AND pl.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365' DAY
+  GROUP BY pl.RelatedPostId
+),
+score_calc AS (
+  SELECT
+    qa.QuestionId,
+    qa.Title,
+    qa.CreationDate,
+    qa.OwnerUserId,
+    coalesce(u.DisplayName,'<deleted>') AS Owner,
+    qa.QuestionScore,
+    qa.ViewCount,
+    qa.AnswerCount,
+    qa.CommentCount,
+    qa.UpVotes,
+    qa.DownVotes,
+    qa.EditCount,
+    coalesce(t3.TopContributors, '') AS TopContributors,
+    coalesce(d.DuplicateCount,0) AS DuplicateMentions,
+    array_agg(DISTINCT lower(pt.Tag)) FILTER (WHERE pt.Tag IS NOT NULL) AS Tags,
+    (
+      (greatest(qa.ViewCount,0) / nullif((select percentile_cont(0.5) within group (order by ViewCount) from question_aggs),0) ) * 1.2
+      + (qa.UpVotes * 3.5)
+      + (qa.AnswerCount * 5)
+      + (qa.CommentCount * 1.0)
+      + (qa.EditCount * 0.8)
+      + (coalesce(d.DuplicateCount,0) * 4.0)
+      - (qa.DownVotes * 2.0)
+    ) AS BenchmarkScore
+  FROM question_aggs qa
+  LEFT JOIN Users u ON u.Id = qa.OwnerUserId
+  LEFT JOIN top3_concat t3 ON t3.QuestionId = qa.QuestionId
+  LEFT JOIN dup_hotspots d ON d.CanonQuestionId = qa.QuestionId
+  LEFT JOIN post_tags pt ON pt.PostId = qa.QuestionId
+  GROUP BY qa.QuestionId, qa.Title, qa.CreationDate, qa.OwnerUserId, u.DisplayName, qa.QuestionScore, qa.ViewCount, qa.AnswerCount, qa.CommentCount, qa.UpVotes, qa.DownVotes, qa.EditCount, t3.TopContributors, d.DuplicateCount
+)
+SELECT
+  sc.QuestionId,
+  sc.Title,
+  sc.Owner,
+  sc.CreationDate,
+  sc.Tags,
+  sc.QuestionScore,
+  sc.ViewCount,
+  sc.AnswerCount,
+  sc.UpVotes,
+  sc.DownVotes,
+  sc.CommentCount,
+  sc.EditCount,
+  sc.DuplicateMentions,
+  sc.TopContributors,
+  round(CAST(sc.BenchmarkScore AS numeric),2) AS BenchmarkScore,
+  rank() OVER (PARTITION BY tg.Tag ORDER BY sc.BenchmarkScore DESC) AS TagRank,
+  dense_rank() OVER (ORDER BY sc.BenchmarkScore DESC) AS GlobalRank
+FROM score_calc sc
+LEFT JOIN LATERAL (
+  SELECT unnest(coalesce(sc.Tags, ARRAY[]::text[])) AS Tag
+) tg ON true
+ORDER BY sc.BenchmarkScore DESC
+LIMIT 200;

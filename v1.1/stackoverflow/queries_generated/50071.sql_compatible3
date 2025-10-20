@@ -1,0 +1,119 @@
+WITH
+  RelevantAnswers AS (
+    SELECT
+      a.Id,
+      a.OwnerUserId,
+      a.Score,
+      a.CreationDate,
+      q.Title AS QuestionTitle,
+      q.Tags AS QuestionTags,
+      q.ViewCount AS QuestionViewCount
+    FROM Posts a
+    JOIN Posts q
+      ON a.ParentId = q.Id
+    WHERE
+      a.PostTypeId = 2
+      AND q.PostTypeId = 1
+      AND a.OwnerUserId IS NOT NULL
+      AND a.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+      AND q.Tags LIKE '%<sql>%'
+  ),
+  UserAnswerStats AS (
+    SELECT
+      ra.OwnerUserId,
+      COUNT(*) AS AnswerCount,
+      AVG(ra.Score) AS AverageAnswerScore,
+      MAX(ra.CreationDate) AS LastAnswerDate,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesReceived,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesReceived,
+      SUM(CASE WHEN v.VoteTypeId = 9 THEN COALESCE(v.BountyAmount,0) ELSE 0 END) AS TotalBountyWon
+    FROM RelevantAnswers ra
+    LEFT JOIN Votes v
+      ON ra.Id = v.PostId
+    GROUP BY
+      ra.OwnerUserId
+    HAVING
+      COUNT(*) >= 5 AND AVG(ra.Score) > 0
+  ),
+  TopUserAnswer AS (
+    SELECT
+      OwnerUserId,
+      QuestionTitle AS TopScoringQuestionTitle,
+      Score AS TopScore
+    FROM (
+      SELECT
+        OwnerUserId,
+        QuestionTitle,
+        Score,
+        CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY Score DESC, CreationDate DESC) AS rn
+      FROM RelevantAnswers
+    ) Ranked
+    WHERE
+      rn = 1
+  ),
+  UserBadges AS (
+    SELECT
+      UserId,
+      COUNT(*) AS SqlRelatedBadgeCount,
+      MAX(Date) AS LastBadgeDate
+    FROM Badges
+    WHERE
+      (
+        -- handle boolean-like values in a dialect-agnostic way by comparing normalized text
+        LOWER(COALESCE(CAST(TagBased AS TEXT), 'false')) IN ('true','1')
+      )
+      AND LOWER(Name) IN ('sql', 'tsql', 'plsql', 'mysql', 'postgresql', 'sql-server', 'oracle')
+    GROUP BY
+      UserId
+  )
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  u.Reputation,
+  u.Location,
+  s.AnswerCount,
+  s.AverageAnswerScore,
+  s.TotalUpvotesReceived,
+  s.TotalBountyWon,
+  b.SqlRelatedBadgeCount,
+  t.TopScoringQuestionTitle,
+  (
+    SELECT
+      AVG(c.Score)
+    FROM Comments c
+    WHERE
+      c.UserId = u.Id
+      AND c.PostId IN (SELECT ra2.Id FROM RelevantAnswers ra2 WHERE ra2.OwnerUserId = u.Id)
+  ) AS AverageCommentScoreOnOwnAnswers,
+  DENSE_RANK() OVER (PARTITION BY COALESCE(u.Location, 'Unknown') ORDER BY s.TotalUpvotesReceived DESC, s.AnswerCount DESC) AS RankInLocation
+FROM Users u
+JOIN UserAnswerStats s
+  ON u.Id = s.OwnerUserId
+JOIN TopUserAnswer t
+  ON u.Id = t.OwnerUserId
+LEFT JOIN UserBadges b
+  ON u.Id = b.UserId
+WHERE
+  u.Reputation > (
+    SELECT
+      AVG(u2.Reputation)
+    FROM Users u2
+  )
+  AND u.CreationDate < (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years')
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  u.Location,
+  s.AnswerCount,
+  s.AverageAnswerScore,
+  s.TotalUpvotesReceived,
+  s.TotalBountyWon,
+  b.SqlRelatedBadgeCount,
+  t.TopScoringQuestionTitle
+ORDER BY
+  s.TotalUpvotesReceived DESC,
+  s.AnswerCount DESC,
+  u.Reputation DESC
+LIMIT 200;

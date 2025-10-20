@@ -1,0 +1,196 @@
+WITH
+QuestionBase AS (
+  SELECT p.Id AS QuestionId,
+         p.Title,
+         p.OwnerUserId,
+         p.CreationDate,
+         p.Score,
+         p.ViewCount,
+         p.AnswerCount,
+         p.FavoriteCount,
+         p.Tags,
+         regexp_split_to_table(substring(p.Tags,2,length(p.Tags)-2),'><') AS TagName
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 years'
+),
+TopAnswers AS (
+  SELECT a.ParentId AS QuestionId,
+         a.Id AS AnswerId,
+         a.OwnerUserId AS AnswerOwner,
+         a.Score AS AnswerScore,
+         a.CreationDate AS AnswerCreation,
+         row_number() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate DESC, a.Id) rn
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+),
+TopAnswerFiltered AS (
+  SELECT * FROM TopAnswers WHERE rn = 1
+),
+CommentAgg AS (
+  SELECT c.PostId,
+         count(case when c.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year' then 1 end) AS RecentComments,
+         count(*) AS TotalComments,
+         max(c.CreationDate) AS LastCommentDate
+  FROM Comments c
+  WHERE c.CreationDate IS NOT NULL
+  GROUP BY c.PostId
+),
+BadgeAgg AS (
+  SELECT b.UserId,
+         count(case when b.Class = 1 then 1 end) AS Gold,
+         count(case when b.Class = 2 then 1 end) AS Silver,
+         count(case when b.Class = 3 then 1 end) AS Bronze,
+         bool_or(b.TagBased) AS HasTagBadges,
+         count(*) AS TotalBadges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+HistoryAgg AS (
+  SELECT ph.PostId,
+         count(case when ph.PostHistoryTypeId IN (10,11,12,13) then 1 end) AS CloseReopenDeletes,
+         count(case when ph.PostHistoryTypeId IN (4,5,6,24) then 1 end) AS Edits,
+         min(ph.CreationDate) AS FirstHistory,
+         max(ph.CreationDate) AS LastHistory
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+LinkAgg AS (
+  SELECT pl.PostId,
+         count(case when pl.LinkTypeId = 1 then 1 end) AS OutboundLinks,
+         count(case when pl.LinkTypeId = 3 then 1 end) AS MarkedDuplicates,
+         (SELECT count(*) FROM PostLinks pl2 WHERE pl2.RelatedPostId = pl.PostId) AS InboundLinks
+  FROM PostLinks pl
+  GROUP BY pl.PostId
+),
+VoteAgg AS (
+  SELECT v.PostId,
+         count(case when v.VoteTypeId = 2 then 1 end) AS UpVotes,
+         count(case when v.VoteTypeId = 3 then 1 end) AS DownVotes,
+         count(case when v.VoteTypeId = 5 then 1 end) AS Favorites,
+         count(*) AS TotalVotes,
+         sum(CASE WHEN v.VoteTypeId = 8 OR v.VoteTypeId = 9 THEN coalesce(v.BountyAmount,0) ELSE 0 END) AS BountySum
+  FROM Votes v
+  GROUP BY v.PostId
+),
+UserSnap AS (
+  SELECT u.Id,
+         u.Reputation,
+         u.CreationDate AS UserCreation,
+         u.DisplayName,
+         u.Views AS UserViews,
+         u.UpVotes AS UserUpVotes,
+         u.DownVotes AS UserDownVotes
+  FROM Users u
+),
+TagMetrics AS (
+  SELECT q.TagName,
+         count(distinct q.QuestionId) AS Questions,
+         avg(q.Score) AS AvgQuestionScore,
+         sum(q.ViewCount) AS TotalViews,
+         count(distinct t.ExcerptPostId) as HasExcerptCount
+  FROM QuestionBase q
+  LEFT JOIN Tags t ON t.TagName = q.TagName
+  GROUP BY q.TagName
+),
+FinalBase AS (
+  SELECT q.QuestionId,
+         q.Title,
+         q.TagName,
+         q.CreationDate AS QuestionCreation,
+         q.Score AS QuestionScore,
+         q.ViewCount,
+         q.AnswerCount,
+         q.FavoriteCount,
+         ta.AnswerId,
+         ta.AnswerOwner,
+         ta.AnswerScore,
+         ca.RecentComments AS QRecentComments,
+         ca.TotalComments AS QTotalComments,
+         ha.CloseReopenDeletes,
+         ha.Edits AS QEdits,
+         la.OutboundLinks,
+         la.InboundLinks,
+         la.MarkedDuplicates,
+         va.UpVotes AS QUpVotes,
+         va.DownVotes AS QDownVotes,
+         va.Favorites AS QFavorites,
+         vb.UpVotes AS AUpVotes,
+         vb.DownVotes AS ADownVotes,
+         bq.Gold AS QOwnerGold,
+         bq.Silver AS QOwnerSilver,
+         bq.Bronze AS QOwnerBronze,
+         ba.Gold AS AOwnerGold,
+         ba.Silver AS AOwnerSilver,
+         ba.Bronze AS AOwnerBronze,
+         um.DisplayName AS QuestionOwnerName,
+         ua.DisplayName AS AnswerOwnerName,
+         tm.Questions AS TagQuestionCount,
+         tm.TotalViews AS TagTotalViews,
+         tm.AvgQuestionScore AS TagAvgScore
+  FROM QuestionBase q
+  LEFT JOIN TopAnswerFiltered ta ON ta.QuestionId = q.QuestionId
+  LEFT JOIN CommentAgg ca ON ca.PostId = q.QuestionId
+  LEFT JOIN CommentAgg ca2 ON ca2.PostId = ta.AnswerId
+  LEFT JOIN HistoryAgg ha ON ha.PostId = q.QuestionId
+  LEFT JOIN LinkAgg la ON la.PostId = q.QuestionId
+  LEFT JOIN VoteAgg va ON va.PostId = q.QuestionId
+  LEFT JOIN VoteAgg vb ON vb.PostId = ta.AnswerId
+  LEFT JOIN BadgeAgg bq ON bq.UserId = q.OwnerUserId
+  LEFT JOIN BadgeAgg ba ON ba.UserId = ta.AnswerOwner
+  LEFT JOIN UserSnap um ON um.Id = q.OwnerUserId
+  LEFT JOIN UserSnap ua ON ua.Id = ta.AnswerOwner
+  LEFT JOIN TagMetrics tm ON tm.TagName = q.TagName
+)
+SELECT
+  fb.QuestionId,
+  fb.Title,
+  fb.TagName,
+  fb.QuestionCreation,
+  fb.QuestionScore,
+  fb.ViewCount,
+  fb.AnswerCount,
+  fb.FavoriteCount,
+  fb.AnswerId,
+  fb.AnswerScore,
+  fb.AnswerOwner,
+  fb.AnswerOwnerName,
+  fb.QRecentComments,
+  fb.QTotalComments,
+  coalesce(fb.CloseReopenDeletes,0) AS CloseReopenDeletes,
+  coalesce(fb.QEdits,0) AS QuestionEdits,
+  coalesce(fb.OutboundLinks,0) AS OutboundLinks,
+  coalesce(fb.InboundLinks,0) AS InboundLinks,
+  coalesce(fb.MarkedDuplicates,0) AS MarkedDuplicates,
+  coalesce(fb.QUpVotes,0) AS QUpVotes,
+  coalesce(fb.QDownVotes,0) AS QDownVotes,
+  coalesce(fb.QFavorites,0) AS QFavorites,
+  coalesce(fb.BQOwnerGold,0) AS force_noop,
+  coalesce(fb.AOwnerGold,0) AS AOwnerGold,
+  fb.QuestionOwnerName,
+  fb.TagQuestionCount,
+  fb.TagTotalViews,
+  fb.TagAvgScore,
+  (
+    (fb.QuestionScore * 3)
+    + CAST(coalesce(fb.ViewCount,0) AS numeric) / greatest(1, sqrt(greatest(coalesce(fb.TagQuestionCount,0),1)))
+    + coalesce(fb.AnswerScore,0) * 4
+    + coalesce(fb.QUpVotes,0) * 2
+    - coalesce(fb.QDownVotes,0) * 1.5
+    + coalesce(fb.QFavorites,0) * 5
+    + coalesce(fb.QRecentComments,0) * 1.2
+    + coalesce(fb.OutboundLinks,0) * 0.7
+    + coalesce(fb.InboundLinks,0) * 0.9
+    + coalesce(fb.MarkedDuplicates,0) * -10
+    + coalesce(fb.TagAvgScore,0) * 2
+    + CAST(coalesce(fb.TagTotalViews,0) AS numeric) / 10000
+  ) AS CompositeScore
+FROM FinalBase fb
+WHERE fb.TagName IS NOT NULL
+  AND fb.QuestionCreation >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years'
+  AND (
+     fb.AnswerCount >= 5
+     OR (fb.AnswerCount <= 1 AND fb.ViewCount >= 1000)
+  )
+ORDER BY CompositeScore DESC NULLS LAST
+LIMIT 200;

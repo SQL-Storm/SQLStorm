@@ -1,0 +1,164 @@
+WITH PostTags AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId AS UserId,
+        TRIM(BOTH '<>' FROM p.Tags) AS tags_trimmed
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+TagSplit AS (
+    -- anchor: first tag (everything up to first '><' or whole string)
+    SELECT
+        PostId,
+        UserId,
+        CASE
+            WHEN tags_trimmed = '' THEN NULL
+            WHEN POSITION('><' IN tags_trimmed) = 0 THEN tags_trimmed
+            ELSE SUBSTRING(tags_trimmed FROM 1 FOR POSITION('><' IN tags_trimmed) - 1)
+        END AS Tag,
+        CASE
+            WHEN POSITION('><' IN tags_trimmed) = 0 THEN ''
+            ELSE SUBSTRING(tags_trimmed FROM POSITION('><' IN tags_trimmed) + 2)
+        END AS rest
+    FROM PostTags
+    UNION ALL
+    -- recursive: take next tag from rest
+    SELECT
+        PostId,
+        UserId,
+        CASE
+            WHEN rest = '' THEN NULL
+            WHEN POSITION('><' IN rest) = 0 THEN rest
+            ELSE SUBSTRING(rest FROM 1 FOR POSITION('><' IN rest) - 1)
+        END AS Tag,
+        CASE
+            WHEN POSITION('><' IN rest) = 0 THEN ''
+            ELSE SUBSTRING(rest FROM POSITION('><' IN rest) + 2)
+        END AS rest
+    FROM TagSplit
+    WHERE rest IS NOT NULL AND rest <> ''
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvoteCount,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.ViewCount) AS MaxViewCount
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    WHERE 
+        u.Reputation > 1000
+    GROUP BY 
+        u.Id, u.Reputation
+    HAVING 
+        COUNT(DISTINCT p.Id) > 50
+),
+BadgeSummary AS (
+    SELECT 
+        UserId,
+        COUNT(CASE WHEN Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN Class = 3 THEN 1 END) AS BronzeBadges
+    FROM 
+        Badges
+    GROUP BY 
+        UserId
+),
+TagPopularity AS (
+    SELECT 
+        ts.UserId AS UserId,
+        ts.Tag AS Tag,
+        COUNT(*) AS TagCount
+    FROM 
+        TagSplit ts
+    WHERE ts.Tag IS NOT NULL AND ts.Tag <> ''
+    GROUP BY 
+        ts.UserId, ts.Tag
+),
+TagRanked AS (
+    SELECT
+        tp.UserId,
+        tp.Tag,
+        tp.TagCount,
+        ROW_NUMBER() OVER (PARTITION BY tp.UserId ORDER BY tp.TagCount DESC) AS rn
+    FROM TagPopularity tp
+),
+TopTags AS (
+    SELECT 
+        UserId,
+        Tag AS TopTag,
+        TagCount
+    FROM 
+        TagRanked
+    WHERE 
+        rn = 1
+),
+PostHistoryEdits AS (
+    SELECT 
+        ph.PostId,
+        COUNT(*) AS EditCount,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM 
+        PostHistory ph
+    WHERE 
+        ph.PostHistoryTypeId IN (4,5,6,7,8,9)
+    GROUP BY 
+        ph.PostId
+),
+CommentActivity AS (
+    SELECT 
+        c.UserId,
+        COUNT(*) AS CommentCount,
+        AVG(c.Score) AS AvgCommentScore
+    FROM 
+        Comments c
+    GROUP BY 
+        c.UserId
+)
+SELECT 
+    ua.UserId,
+    ua.Reputation,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.UpvoteCount,
+    ua.DownvoteCount,
+    ua.AvgPostScore,
+    ua.MaxViewCount,
+    bs.GoldBadges,
+    bs.SilverBadges,
+    bs.BronzeBadges,
+    tt.TopTag,
+    tt.TagCount,
+    SUM(pe.EditCount) AS TotalEdits,
+    MAX(pe.LastEditDate) AS LatestEdit,
+    ca.CommentCount,
+    ca.AvgCommentScore,
+    RANK() OVER (ORDER BY ua.Reputation DESC, COALESCE(bs.GoldBadges,0) DESC) AS OverallRank
+FROM 
+    UserActivity ua
+LEFT JOIN 
+    BadgeSummary bs ON ua.UserId = bs.UserId
+LEFT JOIN 
+    TopTags tt ON ua.UserId = tt.UserId
+LEFT JOIN 
+    Posts p ON ua.UserId = p.OwnerUserId
+LEFT JOIN 
+    PostHistoryEdits pe ON p.Id = pe.PostId
+LEFT JOIN 
+    CommentActivity ca ON ua.UserId = ca.UserId
+WHERE 
+    (COALESCE(bs.GoldBadges,0) >= 5) OR (ua.QuestionCount > 100)
+GROUP BY 
+    ua.UserId, ua.Reputation, ua.QuestionCount, ua.AnswerCount, ua.UpvoteCount, ua.DownvoteCount, ua.AvgPostScore, ua.MaxViewCount,
+    bs.GoldBadges, bs.SilverBadges, bs.BronzeBadges, tt.TopTag, tt.TagCount, ca.CommentCount, ca.AvgCommentScore
+ORDER BY 
+    OverallRank
+LIMIT 100;

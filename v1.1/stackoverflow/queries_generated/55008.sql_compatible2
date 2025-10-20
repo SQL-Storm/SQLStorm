@@ -1,0 +1,185 @@
+WITH RECURSIVE TagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        0 AS depth,
+        ARRAY[t.TagName]::text[] AS path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE
+    UNION ALL
+    SELECT 
+        t.Id,
+        t.TagName,
+        h.depth + 1,
+        h.path || t.TagName
+    FROM Tags t
+    JOIN TagHierarchy h ON t.TagName = ANY(string_to_array(h.TagName, '-'))
+    WHERE t.IsModeratorOnly = FALSE
+),
+QuestionStats AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Score AS QuestionScore,
+        p.ViewCount,
+        p.FavoriteCount,
+        COALESCE(p.AnswerCount,0) AS AnswerCount,
+        COALESCE(p.CommentCount,0) AS CommentCount,
+        COALESCE(p.Tags,'') AS RawTags,
+        string_to_array(substring(p.Tags FROM 2 FOR (length(p.Tags)-2)), '><') AS TagArray,
+        u.Id AS OwnerUserId,
+        u.Reputation AS OwnerReputation,
+        u.CreationDate AS OwnerJoinDate,
+        (u.DownVotes + u.UpVotes) AS OwnerTotalVotes
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+),
+TagAggregation AS (
+    SELECT 
+        q.QuestionId,
+        UNNEST(q.TagArray) AS TagName,
+        q.QuestionScore,
+        q.ViewCount,
+        q.FavoriteCount,
+        q.AnswerCount,
+        q.CommentCount,
+        q.OwnerUserId,
+        q.OwnerReputation,
+        q.OwnerTotalVotes,
+        q.CreationDate
+    FROM QuestionStats q
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsPosted,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersPosted,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesGiven,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesGiven,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.VoteTypeId = 8) AS BountiesStarted,
+        COUNT(DISTINCT bh.Id) FILTER (WHERE bh.VoteTypeId = 9) AS BountiesAwarded,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY u.Id) AS TotalUpVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY u.Id) AS TotalDownVotesReceived
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN Votes b ON b.PostId = p.Id AND b.VoteTypeId = 8
+    LEFT JOIN Votes bh ON bh.PostId = p.Id AND bh.VoteTypeId = 9
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopTagPairs AS (
+    SELECT 
+        t1.TagName AS TagA,
+        t2.TagName AS TagB,
+        COUNT(*) AS PairCount
+    FROM TagAggregation t1
+    JOIN TagAggregation t2 
+        ON t1.QuestionId = t2.QuestionId 
+        AND t1.TagName < t2.TagName
+    GROUP BY t1.TagName, t2.TagName
+    HAVING COUNT(*) > 500
+    ORDER BY PairCount DESC
+    LIMIT 100
+),
+ComplexBenchmark AS (
+    SELECT 
+        q.QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.QuestionScore,
+        q.ViewCount,
+        q.FavoriteCount,
+        q.AnswerCount,
+        q.CommentCount,
+        ARRAY_AGG(DISTINCT tg.TagName) AS Tags,
+        ua.DisplayName AS OwnerDisplayName,
+        ua.Reputation AS OwnerReputation,
+        ua.TotalUpVotesReceived,
+        ua.TotalDownVotesReceived,
+        COALESCE(vc.UpVotes,0) AS UpVotesOnQuestion,
+        COALESCE(vc.DownVotes,0) AS DownVotesOnQuestion,
+        COALESCE(pl.DuplicateCount,0) AS DuplicateLinks,
+        COALESCE(pl.LinkedCount,0) AS LinkedPosts,
+        ROW_NUMBER() OVER (PARTITION BY q.OwnerUserId ORDER BY q.CreationDate DESC) AS OwnerQuestionRank
+    FROM QuestionStats q
+    LEFT JOIN TagAggregation tg ON tg.QuestionId = q.QuestionId
+    LEFT JOIN UserActivity ua ON ua.UserId = q.OwnerUserId
+    LEFT JOIN (
+        SELECT 
+            p.Id AS PostId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Posts p
+        LEFT JOIN Votes v ON v.PostId = p.Id
+        GROUP BY p.Id
+    ) vc ON vc.PostId = q.QuestionId
+    LEFT JOIN (
+        SELECT 
+            pl.PostId,
+            SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateCount,
+            SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedCount
+        FROM PostLinks pl
+        GROUP BY pl.PostId
+    ) pl ON pl.PostId = q.QuestionId
+    GROUP BY 
+        q.QuestionId, q.Title, q.CreationDate, q.QuestionScore, q.ViewCount,
+        q.FavoriteCount, q.AnswerCount, q.CommentCount, ua.DisplayName,
+        ua.Reputation, ua.TotalUpVotesReceived, ua.TotalDownVotesReceived,
+        vc.UpVotes, vc.DownVotes, pl.DuplicateCount, pl.LinkedCount, q.OwnerUserId
+)
+SELECT 
+    cb.QuestionId,
+    cb.Title,
+    cb.CreationDate,
+    cb.QuestionScore,
+    cb.ViewCount,
+    cb.FavoriteCount,
+    cb.AnswerCount,
+    cb.CommentCount,
+    cb.Tags,
+    cb.OwnerDisplayName,
+    cb.OwnerReputation,
+    cb.TotalUpVotesReceived,
+    cb.TotalDownVotesReceived,
+    cb.UpVotesOnQuestion,
+    cb.DownVotesOnQuestion,
+    cb.DuplicateLinks,
+    cb.LinkedPosts,
+    cb.OwnerQuestionRank,
+    tp.TagA,
+    tp.TagB,
+    tp.PairCount
+FROM ComplexBenchmark cb
+LEFT JOIN TopTagPairs tp 
+    ON tp.TagA = ANY(cb.Tags) OR tp.TagB = ANY(cb.Tags)
+GROUP BY
+    cb.QuestionId,
+    cb.Title,
+    cb.CreationDate,
+    cb.QuestionScore,
+    cb.ViewCount,
+    cb.FavoriteCount,
+    cb.AnswerCount,
+    cb.CommentCount,
+    cb.Tags,
+    cb.OwnerDisplayName,
+    cb.OwnerReputation,
+    cb.TotalUpVotesReceived,
+    cb.TotalDownVotesReceived,
+    cb.UpVotesOnQuestion,
+    cb.DownVotesOnQuestion,
+    cb.DuplicateLinks,
+    cb.LinkedPosts,
+    cb.OwnerQuestionRank,
+    tp.TagA,
+    tp.TagB,
+    tp.PairCount
+ORDER BY 
+    cb.OwnerReputation DESC,
+    cb.QuestionScore DESC,
+    cb.ViewCount DESC
+LIMIT 250;

@@ -1,0 +1,118 @@
+-- {"query": "49085.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 2113} 
+
+WITH UserPostEngagement AS (
+    -- Aggregates performance metrics for posts owned by users, focusing on recent and relevant posts.
+    SELECT
+        P.OwnerUserId AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        SUM(P.Score) AS TotalPostScore,
+        SUM(P.ViewCount) AS TotalPostViews,
+        SUM(P.CommentCount) AS TotalPostCommentsReceived,
+        SUM(P.FavoriteCount) AS TotalPostFavoritesReceived,
+        COUNT(DISTINCT P.Id) AS TotalPostsPublished,
+        COUNT(CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionsPublished,
+        COUNT(CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswersPublished,
+        MAX(P.LastActivityDate) AS LastPostActivity,
+        -- Count how many of their answers were accepted by others
+        COUNT(DISTINCT CASE WHEN P_Parent.AcceptedAnswerId = P.Id THEN P.Id END) AS AcceptedAnswersGiven,
+        SUM(CASE WHEN P_Parent.AcceptedAnswerId = P.Id THEN P.Score ELSE 0 END) AS ScoreFromAcceptedAnswers,
+        -- Count questions related to 'sql' or 'database' tags
+        SUM(CASE WHEN P.PostTypeId = 1 AND (LOWER(P.Tags) LIKE '%<sql>%' OR LOWER(P.Tags) LIKE '%<database>%') THEN 1 ELSE 0 END) AS SqlDatabaseQuestions,
+        -- Number of questions they posted that were closed within 24 hours (bad sign)
+        SUM(CASE WHEN P.PostTypeId = 1 AND P.ClosedDate IS NOT NULL AND (P.ClosedDate - P.CreationDate) < INTERVAL '24 hour' THEN 1 ELSE 0 END) AS QuicklyClosedQuestions,
+        -- Collect all unique tags from their questions
+        ARRAY_AGG(DISTINCT T.tag) FILTER (WHERE P.PostTypeId = 1 AND T.tag IS NOT NULL) AS QuestionTagsArray
+    FROM Posts P
+    INNER JOIN Users U ON P.OwnerUserId = U.Id
+    LEFT JOIN Posts P_Parent ON P.PostTypeId = 2 AND P.ParentId = P_Parent.Id -- Join for answers to get parent question details
+    -- Using LATERAL unnest to extract tags for questions from the `Tags` column
+    LEFT JOIN LATERAL unnest(string_to_array(substring(P.Tags, 2, length(P.Tags)-2), '><')) AS T(tag)
+        ON P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+    WHERE P.OwnerUserId IS NOT NULL
+      AND P.CreationDate >= (NOW() - INTERVAL '3 year') -- Focus on recent active users
+      AND P.Score >= 0 -- Exclude severely downvoted posts
+    GROUP BY P.OwnerUserId, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+    HAVING COUNT(DISTINCT P.Id) >= 20 -- Minimum number of posts to be considered
+),
+UserEngagementActivity AS (
+    -- Aggregates user activity from Comments and Votes (engagement with other posts).
+    SELECT
+        U.Id AS UserId,
+        COUNT(DISTINCT C.Id) AS CommentsMade,
+        SUM(CASE WHEN C.Score > 0 THEN C.Score ELSE 0 END) AS TotalCommentScore, -- Upvotes received on their comments
+        COUNT(DISTINCT V.PostId) AS UniquePostsVotedOn,
+        COUNT(CASE WHEN V.VoteTypeId = 2 THEN V.Id END) AS UpvotesGiven,
+        COUNT(CASE WHEN V.VoteTypeId = 3 THEN V.Id END) AS DownvotesGiven
+    FROM Users U
+    LEFT JOIN Comments C ON U.Id = C.UserId AND C.CreationDate >= (NOW() - INTERVAL '3 year')
+    LEFT JOIN Votes V ON U.Id = V.UserId AND V.CreationDate >= (NOW() - INTERVAL '3 year')
+    WHERE U.LastAccessDate >= (NOW() - INTERVAL '3 year') -- Filter users for recent access
+    GROUP BY U.Id
+),
+UserBadgeSummary AS (
+    -- Counts badge types for users.
+    SELECT
+        B.UserId,
+        COUNT(CASE WHEN B.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN B.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges B
+    WHERE B.Date >= (NOW() - INTERVAL '3 year') -- Only consider recent badge acquisitions
+    GROUP BY B.UserId
+)
+-- Main query to combine all CTEs and calculate a complex influence score
+SELECT
+    UPE.UserId,
+    UPE.DisplayName,
+    UPE.Reputation,
+    UPE.TotalPostsPublished,
+    UPE.TotalPostScore,
+    UPE.AcceptedAnswersGiven,
+    UPE.ScoreFromAcceptedAnswers,
+    COALESCE(UBS.GoldBadges, 0) AS GoldBadges,
+    COALESCE(UBS.SilverBadges, 0) AS SilverBadges,
+    COALESCE(UBS.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(UEA.CommentsMade, 0) AS CommentsMade,
+    COALESCE(UEA.UpvotesGiven, 0) AS UpvotesGiven,
+    COALESCE(ARRAY_LENGTH(UPE.QuestionTagsArray, 1), 0) AS DistinctQuestionTags,
+    -- Calculate a composite influence score based on various weighted metrics
+    (
+        UPE.TotalPostScore * 0.5 +                                              -- Weight for total score on owned posts
+        COALESCE(UPE.ScoreFromAcceptedAnswers, 0) * 1.5 +                       -- Higher weight for score from accepted answers
+        (CASE WHEN UPE.QuestionsPublished > 0 THEN UPE.TotalPostViews / UPE.QuestionsPublished ELSE 0 END) * 0.01 + -- Average views per question
+        COALESCE(UBS.GoldBadges, 0) * 100 +                                     -- Very high weight for gold badges
+        COALESCE(UBS.SilverBadges, 0) * 20 +                                    -- High weight for silver badges
+        COALESCE(UBS.BronzeBadges, 0) * 5 +                                     -- Moderate weight for bronze badges
+        COALESCE(UEA.CommentsMade, 0) * 0.1 +                                   -- Small weight for comments made
+        COALESCE(UEA.UpvotesGiven, 0) * 0.05 +                                  -- Small weight for upvotes given
+        UPE.SqlDatabaseQuestions * 50 +                                         -- Significant weight for specific topic expertise
+        (COALESCE(ARRAY_LENGTH(UPE.QuestionTagsArray, 1), 0)) * 2 +             -- Weight for diversity of topics
+        (EXTRACT(EPOCH FROM (NOW() - UPE.LastPostActivity)) / 3600 / 24) * -0.01 -- Recency boost (more recent = higher score)
+        - (UPE.QuicklyClosedQuestions * 20)                                     -- Penalty for quickly closed questions
+    ) AS CompositeInfluenceScore,
+    -- Rank users based on their CompositeInfluenceScore
+    RANK() OVER (ORDER BY (
+        UPE.TotalPostScore * 0.5 +
+        COALESCE(UPE.ScoreFromAcceptedAnswers, 0) * 1.5 +
+        (CASE WHEN UPE.QuestionsPublished > 0 THEN UPE.TotalPostViews / UPE.QuestionsPublished ELSE 0 END) * 0.01 +
+        COALESCE(UBS.GoldBadges, 0) * 100 +
+        COALESCE(UBS.SilverBadges, 0) * 20 +
+        COALESCE(UBS.BronzeBadges, 0) * 5 +
+        COALESCE(UEA.CommentsMade, 0) * 0.1 +
+        COALESCE(UEA.UpvotesGiven, 0) * 0.05 +
+        UPE.SqlDatabaseQuestions * 50 +
+        (COALESCE(ARRAY_LENGTH(UPE.QuestionTagsArray, 1), 0)) * 2 +
+        (EXTRACT(EPOCH FROM (NOW() - UPE.LastPostActivity)) / 3600 / 24) * -0.01
+        - (UPE.QuicklyClosedQuestions * 20)
+    ) DESC) AS InfluenceRank
+FROM UserPostEngagement UPE
+LEFT JOIN UserEngagementActivity UEA ON UPE.UserId = UEA.UserId
+LEFT JOIN UserBadgeSummary UBS ON UPE.UserId = UBS.UserId
+WHERE UPE.TotalPostsPublished >= 20 -- Ensure significant contribution
+  AND UPE.Reputation >= 1000 -- Filter out very low reputation users
+  AND UPE.LastPostActivity >= (NOW() - INTERVAL '2 year') -- Ensure recent activity for ranking
+ORDER BY InfluenceRank ASC, UPE.UserId ASC
+FETCH FIRST 100 ROWS ONLY;

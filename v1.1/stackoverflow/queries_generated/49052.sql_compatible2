@@ -1,0 +1,186 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UpVotesGivenByUsers,
+        U.DownVotes AS DownVotesGivenByUsers,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScoreReceived,
+        SUM(COALESCE(P.ViewCount, 0)) AS TotalPostViewsReceived,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentScoreReceived,
+        MAX(U.LastAccessDate) AS LastUserActivityDate,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    WHERE U.Reputation >= 5000
+      AND U.CreationDate >= DATE '2016-01-01'
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.Views, U.UpVotes, U.DownVotes
+),
+PostActivityMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.PostTypeId,
+        P.ParentId,
+        P.AcceptedAnswerId,
+        P.CreationDate,
+        P.Score AS CurrentPostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount AS PostCommentCount,
+        P.FavoriteCount,
+        COUNT(DISTINCT V.Id) AS TotalVotesOnPost,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesOnPost,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesOnPost,
+        COUNT(DISTINCT PH.Id) AS TotalHistoryEntries,
+        COUNT(DISTINCT PH.UserId) AS UniqueEditorsExcludingOwner,
+        MAX(PH.CreationDate) AS LastPostEditOrHistoryDate
+    FROM Posts P
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId AND PH.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)
+    WHERE P.CreationDate >= DATE '2019-01-01'
+    GROUP BY P.Id, P.OwnerUserId, P.PostTypeId, P.ParentId, P.AcceptedAnswerId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount
+),
+TopTierUsersRanked AS (
+    SELECT
+        UES.UserId,
+        UES.DisplayName,
+        UES.Reputation,
+        UES.TotalPostsOwned,
+        UES.TotalQuestionsOwned,
+        UES.TotalAnswersOwned,
+        UES.TotalPostScoreReceived,
+        UES.TotalCommentsMade,
+        UES.TotalCommentScoreReceived,
+        UES.TotalBadgesEarned,
+        UES.GoldBadges,
+        UES.SilverBadges,
+        UES.BronzeBadges,
+        (UES.Reputation * 0.4 + UES.TotalPostScoreReceived * 0.3 + UES.TotalCommentScoreReceived * 0.1 + UES.TotalBadgesEarned * 0.1 + UES.UserProfileViews * 0.05 + UES.UpVotesGivenByUsers * 0.05) AS OverallInfluenceScore,
+        ROW_NUMBER() OVER (ORDER BY (UES.Reputation * 0.4 + UES.TotalPostScoreReceived * 0.3 + UES.TotalCommentScoreReceived * 0.1 + UES.TotalBadgesEarned * 0.1 + UES.UserProfileViews * 0.05 + UES.UpVotesGivenByUsers * 0.05) DESC) AS RankOverall
+    FROM UserEngagementSummary UES
+    WHERE UES.TotalPostsOwned >= 50
+      AND UES.TotalPostScoreReceived >= 1000
+      AND UES.GoldBadges >= 5
+),
+TopUsersDetailedPostMetrics AS (
+    SELECT
+        TTR.UserId,
+        TTR.DisplayName,
+        PAM.PostId,
+        PAM.PostTypeId,
+        PAM.CurrentPostScore,
+        PAM.ViewCount,
+        PAM.AnswerCount,
+        PAM.PostCommentCount,
+        PAM.FavoriteCount,
+        PAM.UpVotesOnPost,
+        PAM.DownVotesOnPost,
+        PAM.UniqueEditorsExcludingOwner,
+        P.Tags AS PostTags,
+        PAM.AcceptedAnswerId,
+        PAM.ParentId,
+        P.CreationDate AS PostCreationDate
+    FROM TopTierUsersRanked TTR
+    JOIN PostActivityMetrics PAM ON TTR.UserId = PAM.OwnerUserId
+    JOIN Posts P ON PAM.PostId = P.Id
+    WHERE TTR.RankOverall <= 200
+      AND P.CreationDate >= DATE '2021-01-01'
+),
+TagPerformanceByUser AS (
+    SELECT
+        TUDPM.UserId,
+        TUDPM.DisplayName,
+        LOWER(TRIM(tag)) AS TagName,
+        COUNT(DISTINCT TUDPM.PostId) AS QuestionsWithTag,
+        SUM(TUDPM.CurrentPostScore) AS TaggedQuestionTotalScore,
+        AVG(TUDPM.ViewCount) AS AverageTagQuestionViews
+    FROM TopUsersDetailedPostMetrics TUDPM,
+    LATERAL (
+        SELECT unnest(string_to_array(substring(TUDPM.PostTags FROM 2 FOR (char_length(TUDPM.PostTags)-2)), '><')) AS tag
+    ) AS tags
+    WHERE TUDPM.PostTypeId = 1
+      AND TUDPM.PostTags IS NOT NULL AND char_length(TUDPM.PostTags) > 2
+    GROUP BY TUDPM.UserId, TUDPM.DisplayName, LOWER(TRIM(tag))
+    HAVING COUNT(DISTINCT TUDPM.PostId) >= 5
+),
+AnswerQualityAnalysis AS (
+    SELECT
+        TUDPM.UserId,
+        TUDPM.DisplayName,
+        COUNT(DISTINCT TUDPM.PostId) AS TotalAnswersByThisUserInPeriod,
+        SUM(CASE WHEN TUDPM.AcceptedAnswerId IS NOT NULL AND TUDPM.AcceptedAnswerId = TUDPM.PostId THEN 1 ELSE 0 END) AS AcceptedAnswersCount,
+        AVG(TUDPM.CurrentPostScore) AS AverageAnswerScore,
+        AVG(PQ.ViewCount) AS AvgParentQuestionViewsForAnswers,
+        AVG(PQ.Score) AS AvgParentQuestionScoreForAnswers,
+        SUM(TUDPM.UpVotesOnPost) AS TotalAnswerUpvotes
+    FROM TopUsersDetailedPostMetrics TUDPM
+    LEFT JOIN Posts PQ ON TUDPM.ParentId = PQ.Id
+    WHERE TUDPM.PostTypeId = 2
+    GROUP BY TUDPM.UserId, TUDPM.DisplayName
+    HAVING COUNT(DISTINCT TUDPM.PostId) >= 10
+),
+PostLinkAnalysis AS (
+    SELECT
+        TUDPM.UserId,
+        TUDPM.DisplayName,
+        COUNT(DISTINCT PL.Id) AS TotalLinksCreated,
+        SUM(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedPostsCount,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicatePostsCount
+    FROM TopUsersDetailedPostMetrics TUDPM
+    JOIN PostLinks PL ON TUDPM.PostId = PL.PostId
+    GROUP BY TUDPM.UserId, TUDPM.DisplayName
+)
+SELECT
+    TTR.RankOverall,
+    TTR.DisplayName AS TopUserDisplayName,
+    TTR.Reputation,
+    TTR.OverallInfluenceScore,
+    TTR.TotalPostsOwned,
+    TTR.TotalQuestionsOwned,
+    TTR.TotalAnswersOwned,
+    AQA.TotalAnswersByThisUserInPeriod,
+    AQA.AcceptedAnswersCount,
+    AQA.AverageAnswerScore,
+    AQA.TotalAnswerUpvotes,
+    TTR.TotalBadgesEarned,
+    TTR.GoldBadges,
+    TTR.SilverBadges,
+    TTR.BronzeBadges,
+    ARRAY_AGG(
+        DISTINCT (TPA.TagName || ' (Q:' || TPA.QuestionsWithTag || ', S:' || TPA.TaggedQuestionTotalScore || ', V:' || CAST(ROUND(TPA.AverageTagQuestionViews) AS VARCHAR) || ')')
+        ORDER BY TPA.QuestionsWithTag DESC, TPA.TaggedQuestionTotalScore DESC, TPA.TagName
+    ) FILTER (WHERE TPA.TagName IS NOT NULL) AS TopPerformingTags,
+    COALESCE(PLA.TotalLinksCreated, 0) AS UserCreatedPostLinks,
+    COALESCE(PLA.LinkedPostsCount, 0) AS UserCreatedLinkedPosts,
+    COALESCE(PLA.DuplicatePostsCount, 0) AS UserCreatedDuplicateLinks,
+    SUM(CASE WHEN TUDPM.PostTypeId = 1 THEN TUDPM.UpVotesOnPost ELSE 0 END) AS TotalQuestionUpvotesGivenToTopUser,
+    AVG(CASE WHEN TUDPM.PostTypeId = 1 THEN TUDPM.ViewCount ELSE NULL END) AS AvgQuestionViewsGivenToTopUser,
+    MAX(CASE WHEN TUDPM.PostTypeId = 1 THEN TUDPM.FavoriteCount ELSE NULL END) AS MaxQuestionFavoritesGivenToTopUser,
+    SUM(CASE WHEN TUDPM.PostTypeId = 1 AND TUDPM.UniqueEditorsExcludingOwner > 1 THEN 1 ELSE 0 END) AS QuestionsWithMultipleEditors,
+    SUM(CASE WHEN TUDPM.PostTypeId = 2 AND TUDPM.UniqueEditorsExcludingOwner > 1 THEN 1 ELSE 0 END) AS AnswersWithMultipleEditors,
+    (SELECT COUNT(DISTINCT V.PostId) FROM Votes V WHERE V.UserId = TTR.UserId AND V.VoteTypeId = 5) AS TotalFavoriteVotesMade
+FROM TopTierUsersRanked TTR
+LEFT JOIN AnswerQualityAnalysis AQA ON TTR.UserId = AQA.UserId
+LEFT JOIN TagPerformanceByUser TPA ON TTR.UserId = TPA.UserId
+LEFT JOIN TopUsersDetailedPostMetrics TUDPM ON TTR.UserId = TUDPM.UserId
+LEFT JOIN PostLinkAnalysis PLA ON TTR.UserId = PLA.UserId
+WHERE TTR.RankOverall <= 100
+GROUP BY
+    TTR.RankOverall, TTR.DisplayName, TTR.Reputation, TTR.OverallInfluenceScore,
+    TTR.TotalPostsOwned, TTR.TotalQuestionsOwned, TTR.TotalAnswersOwned,
+    AQA.TotalAnswersByThisUserInPeriod, AQA.AcceptedAnswersCount, AQA.AverageAnswerScore, AQA.TotalAnswerUpvotes,
+    TTR.TotalBadgesEarned, TTR.GoldBadges, TTR.SilverBadges, TTR.BronzeBadges,
+    PLA.TotalLinksCreated, PLA.LinkedPostsCount, PLA.DuplicatePostsCount
+ORDER BY TTR.RankOverall
+LIMIT 25;

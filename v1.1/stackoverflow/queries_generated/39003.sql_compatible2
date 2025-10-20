@@ -1,0 +1,112 @@
+WITH TopTags AS (
+    SELECT
+        tag AS TagName,
+        COUNT(*)                                  AS QuestionCount,
+        AVG(p.Score)                              AS AvgScore
+    FROM
+        Posts p,
+        LATERAL unnest(
+            string_to_array(
+                substring(p.Tags FROM 2 FOR (length(p.Tags) - 2)),
+                '><'
+            )
+        ) AS tag
+    WHERE
+        p.PostTypeId = 1
+    GROUP BY
+        tag
+    HAVING
+        COUNT(*) > 1000
+),
+UserActivity AS (
+    SELECT
+        u.Id                        AS UserId,
+        u.DisplayName               AS DisplayName,
+        COUNT(DISTINCT q.Id)        AS QuestionsAsked,
+        COUNT(DISTINCT a.Id)        AS AnswersGiven,
+        COUNT(v.Id)                 AS TotalVotes
+    FROM
+        Users u
+        LEFT JOIN Posts q ON q.OwnerUserId = u.Id AND q.PostTypeId = 1
+        LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+        LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY
+        u.Id, u.DisplayName
+),
+BadgeCounts AS (
+    SELECT
+        UserId,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldCount,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverCount,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeCount
+    FROM
+        Badges
+    GROUP BY
+        UserId
+),
+RankedUsers AS (
+    SELECT
+        ua.*,
+        COALESCE(bc.GoldCount,   0) AS GoldCount,
+        COALESCE(bc.SilverCount, 0) AS SilverCount,
+        COALESCE(bc.BronzeCount, 0) AS BronzeCount,
+        ROW_NUMBER() OVER (
+            ORDER BY ua.AnswersGiven DESC,
+                     ua.QuestionsAsked DESC,
+                     ua.TotalVotes DESC
+        ) AS RankByEngagement
+    FROM
+        UserActivity ua
+        LEFT JOIN BadgeCounts bc ON bc.UserId = ua.UserId
+)
+SELECT
+    ru.RankByEngagement,
+    ru.DisplayName,
+    ru.QuestionsAsked,
+    ru.AnswersGiven,
+    ru.TotalVotes,
+    ru.GoldCount,
+    ru.SilverCount,
+    ru.BronzeCount,
+    tt.TagName,
+    tt.QuestionCount,
+    tt.AvgScore,
+    COUNT(c.Id)                                           AS CommentCount,
+    AVG(c.Score) OVER (
+            PARTITION BY pp.OwnerUserId
+            ORDER BY pp.CreationDate
+            RANGE BETWEEN INTERVAL '30' DAY PRECEDING
+                      AND CURRENT ROW
+        )                                                  AS Avg30DayCommentScore
+FROM
+    RankedUsers ru
+    JOIN Posts pp ON pp.OwnerUserId = ru.UserId AND pp.PostTypeId = 1
+    JOIN Comments c ON c.PostId = pp.Id
+    JOIN TopTags tt ON tt.TagName = ANY(
+        string_to_array(
+            substring(pp.Tags FROM 2 FOR (length(pp.Tags) - 2)),
+            '><'
+        )
+    )
+WHERE
+    ru.RankByEngagement <= 100
+    AND pp.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+GROUP BY
+    ru.RankByEngagement,
+    ru.DisplayName,
+    ru.QuestionsAsked,
+    ru.AnswersGiven,
+    ru.TotalVotes,
+    ru.GoldCount,
+    ru.SilverCount,
+    ru.BronzeCount,
+    tt.TagName,
+    tt.QuestionCount,
+    tt.AvgScore,
+    ru.UserId,
+    pp.OwnerUserId,
+    pp.CreationDate
+ORDER BY
+    ru.RankByEngagement,
+    tt.QuestionCount DESC
+LIMIT 1000;

@@ -1,0 +1,46 @@
+SELECT
+    T.TagName,
+    COUNT(DISTINCT P.Id) AS NumQuestions,
+    AVG(P.Score) AS AvgScore,
+    SUM(P.ViewCount) AS TotalViews,
+    COUNT(DISTINCT C.Id) AS NumComments,
+    COUNT(DISTINCT V.Id) AS NumVotes,
+    (
+        SELECT U2.DisplayName
+        FROM Users U2
+        WHERE U2.Id = (
+            SELECT PH.UserId
+            FROM PostHistory PH
+            WHERE PH.PostId = P.Id
+            GROUP BY PH.UserId
+            ORDER BY COUNT(*) DESC
+            LIMIT 1
+        )
+        LIMIT 1
+    ) AS TopEditor,
+    (
+        SELECT STRING_AGG(B.Name, ', ' ORDER BY B.Date DESC)
+        FROM Badges B
+        WHERE B.UserId = U.Id AND B.Class = 1
+        GROUP BY B.UserId
+    ) AS GoldBadges
+FROM
+    Tags T
+LEFT JOIN
+    Posts P ON P.Tags LIKE '%' || '<' || T.TagName || '>' || '%' AND P.PostTypeId = 1
+LEFT JOIN
+    Comments C ON C.PostId = P.Id
+LEFT JOIN
+    Votes V ON V.PostId = P.Id
+LEFT JOIN
+    Users U ON U.Id = P.OwnerUserId
+WHERE
+    T.Count > 100
+GROUP BY
+    T.Id, T.TagName, U.Id, U.DisplayName, P.Id
+HAVING
+    COUNT(DISTINCT P.Id) > 0
+ORDER BY
+    NumQuestions DESC,
+    AvgScore DESC
+LIMIT 50;

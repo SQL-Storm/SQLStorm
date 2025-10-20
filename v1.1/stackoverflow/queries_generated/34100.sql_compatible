@@ -1,0 +1,154 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id, 
+        t.TagName, 
+        t.Count, 
+        1 AS Level,
+        ARRAY[t.TagName] AS Path
+    FROM Tags t
+    WHERE (t.IsModeratorOnly = FALSE OR t.IsModeratorOnly IS NULL)
+      AND (t.IsRequired = FALSE OR t.IsRequired IS NULL)
+
+    UNION ALL
+
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Path || t2.TagName
+    FROM Tags t2
+    JOIN PostLinks pl ON pl.PostId = t2.ExcerptPostId 
+                       AND pl.LinkTypeId = 1
+    JOIN RecursiveTagHierarchy r ON pl.RelatedPostId = r.Id
+    WHERE r.Level < 3 AND (t2.IsModeratorOnly = FALSE OR t2.IsModeratorOnly IS NULL)
+),
+TopUsersWithBadgesAndPosts AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersCount,
+        AVG(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score END) AS AvgPostScore,
+        MAX(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS MaxQuestionScore,
+        MAX(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS MaxAnswerScore
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE u.Reputation > 1000 
+      AND u.CreationDate < (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+DominantTagsPerUser AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        unnest(string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags)-2), '><')) AS TagName,
+        COUNT(*) AS TagUseCount
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.PostTypeId = 1
+    GROUP BY p.OwnerUserId, unnest, substring(p.Tags FROM 2 FOR length(p.Tags)-2)
+),
+UserTagRankings AS (
+    SELECT 
+        dt.UserId, dt.TagName, dt.TagUseCount,
+        ROW_NUMBER() OVER (PARTITION BY dt.UserId ORDER BY dt.TagUseCount DESC) AS TagRank
+    FROM DominantTagsPerUser dt
+),
+UserTopTags AS (
+    SELECT UserId, TagName, TagUseCount
+    FROM UserTagRankings
+    WHERE TagRank <= 3
+),
+HighlyEngagedPosts AS (
+    SELECT 
+        p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.AnswerCount, p.CommentCount,
+        ARRAY_AGG(DISTINCT v.VoteTypeId) FILTER (WHERE v.VoteTypeId IS NOT NULL) AS VoteTypes,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        MAX(COALESCE(bp.Score, 0)) AS BestAnswerScore,
+        p.AcceptedAnswerId
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN Posts bp ON bp.Id = p.AcceptedAnswerId
+    WHERE p.PostTypeId = 1 AND p.Score > 0 AND p.ViewCount > 1000
+    GROUP BY p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.AnswerCount, p.CommentCount, p.AcceptedAnswerId
+),
+UserRecentActivity AS (
+    SELECT 
+        u.Id AS UserId, 
+        MAX(p.CreationDate) AS LastPostDate, 
+        MAX(c.CreationDate) AS LastCommentDate,
+        GREATEST(
+          COALESCE(MAX(p.CreationDate), TIMESTAMP '1970-01-01'),
+          COALESCE(MAX(c.CreationDate), TIMESTAMP '1970-01-01')
+        ) AS LastActivityDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id
+),
+ComplexUserSummary AS (
+    SELECT 
+        t.UserId, t.DisplayName, t.Reputation, t.GoldBadges, t.SilverBadges, t.BronzeBadges, 
+        t.QuestionsCount, t.AnswersCount, t.AvgPostScore, t.MaxQuestionScore, t.MaxAnswerScore,
+        r.LastActivityDate,
+        STRING_AGG(DISTINCT utt.TagName, ', ') AS TopTags,
+        AVG(hp.Score) AS AvgHighlyEngagedPostScore,
+        SUM(hp.ViewCount) AS TotalViewsOnHighEngagementPosts,
+        COUNT(hp.Id) AS HighEngagementPostCount
+    FROM TopUsersWithBadgesAndPosts t
+    LEFT JOIN UserRecentActivity r ON r.UserId = t.UserId
+    LEFT JOIN UserTopTags utt ON utt.UserId = t.UserId
+    LEFT JOIN HighlyEngagedPosts hp ON hp.OwnerUserId = t.UserId
+    GROUP BY t.UserId, t.DisplayName, t.Reputation, t.GoldBadges, t.SilverBadges, t.BronzeBadges, 
+             t.QuestionsCount, t.AnswersCount, t.AvgPostScore, t.MaxQuestionScore, t.MaxAnswerScore, r.LastActivityDate
+),
+HighlyLinkedQuestions AS (
+    SELECT 
+        p.Id AS QuestionId, p.Title, p.ViewCount, p.Score, p.CreationDate,
+        COUNT(pl.Id) FILTER (WHERE pl.LinkTypeId = 1) AS OutboundLinks,
+        COUNT(pl2.Id) FILTER (WHERE pl2.LinkTypeId = 1) AS InboundLinks,
+        STRING_AGG(DISTINCT t.TagName, ', ') AS Tags
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN PostLinks pl2 ON pl2.RelatedPostId = p.Id
+    LEFT JOIN Tags t ON t.TagName = ANY(string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags)-2), '><'))
+    WHERE p.PostTypeId = 1 AND p.ViewCount > 1000 AND p.Score > 5
+    GROUP BY p.Id, p.Title, p.ViewCount, p.Score, p.CreationDate
+    ORDER BY COUNT(pl.Id) FILTER (WHERE pl.LinkTypeId = 1) DESC, COUNT(pl2.Id) FILTER (WHERE pl2.LinkTypeId = 1) DESC
+    LIMIT 10
+)
+
+SELECT 
+    cus.UserId,
+    cus.DisplayName,
+    cus.Reputation,
+    cus.GoldBadges, cus.SilverBadges, cus.BronzeBadges,
+    cus.QuestionsCount, cus.AnswersCount,
+    cus.AvgPostScore,
+    cus.MaxQuestionScore,
+    cus.MaxAnswerScore,
+    cus.LastActivityDate,
+    cus.TopTags,
+    cus.AvgHighlyEngagedPostScore,
+    cus.TotalViewsOnHighEngagementPosts,
+    cus.HighEngagementPostCount,
+    hlq.QuestionId,
+    hlq.Title AS HighlyLinkedQuestionTitle,
+    hlq.ViewCount AS QuestionViewCount,
+    hlq.Score AS QuestionScore,
+    hlq.OutboundLinks,
+    hlq.InboundLinks,
+    hlq.Tags AS QuestionTags
+FROM ComplexUserSummary cus
+LEFT JOIN HighlyLinkedQuestions hlq ON EXISTS (
+    SELECT 1 FROM Posts p WHERE p.Id = hlq.QuestionId AND p.OwnerUserId = cus.UserId AND p.PostTypeId = 1
+)
+WHERE cus.HighEngagementPostCount > 2
+ORDER BY cus.Reputation DESC, cus.HighEngagementPostCount DESC
+LIMIT 50;

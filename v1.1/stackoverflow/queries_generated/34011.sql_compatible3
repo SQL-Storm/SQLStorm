@@ -1,0 +1,99 @@
+WITH TopUsers AS (
+    SELECT 
+        u.Id, 
+        u.DisplayName, 
+        u.Reputation,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END), 0) AS GoldBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END), 0) AS SilverBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END), 0) AS BronzeBadges,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAsked,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersGiven,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgPostScore,
+        MAX(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS MaxPostScore
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE u.Reputation > 10000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    ORDER BY u.Reputation DESC
+    LIMIT 100
+),
+TopTags AS (
+    SELECT 
+        t.TagName, 
+        t.Count, 
+        q.Id AS QuestionId, 
+        q.OwnerUserId,
+        q.Score AS QuestionScore,
+        COUNT(a.Id) AS AnswerCount,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore
+    FROM Tags t
+    INNER JOIN Posts q ON q.PostTypeId = 1 AND q.Tags LIKE ('%' || '<' || t.TagName || '>' || '%')
+    LEFT JOIN Posts a ON a.PostTypeId = 2 AND a.ParentId = q.Id
+    GROUP BY t.TagName, t.Count, q.Id, q.OwnerUserId, q.Score
+    ORDER BY t.Count DESC
+    LIMIT 50
+),
+HotQuestions AS (
+    SELECT 
+        p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate, p.Tags, u.DisplayName AS OwnerName,
+        COUNT(c.Id) AS CommentCount,
+        MAX(ph.CreationDate) AS LastEditDate,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '30 days')
+      AND p.Score >= 10
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate, p.Tags, u.DisplayName
+    ORDER BY p.Score DESC, p.ViewCount DESC
+    LIMIT 20
+)
+SELECT 
+    tu.Id AS UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.BadgeCount,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    tu.QuestionsAsked,
+    tu.AnswersGiven,
+    tu.AvgPostScore,
+    tu.MaxPostScore,
+    json_agg(json_build_object(
+        'TagName', tt.TagName,
+        'TagCount', tt.Count,
+        'QuestionId', tt.QuestionId,
+        'QuestionOwnerId', tt.OwnerUserId,
+        'QuestionScore', tt.QuestionScore,
+        'AnswerCount', tt.AnswerCount,
+        'AvgAnswerScore', tt.AvgAnswerScore,
+        'MaxAnswerScore', tt.MaxAnswerScore
+    ) ORDER BY tt.Count DESC) AS TopTags,
+    json_agg(json_build_object(
+        'QuestionId', hq.Id,
+        'Title', hq.Title,
+        'Score', hq.Score,
+        'ViewCount', hq.ViewCount,
+        'CreationDate', hq.CreationDate,
+        'Tags', hq.Tags,
+        'OwnerName', hq.OwnerName,
+        'CommentCount', hq.CommentCount,
+        'LastEditDate', hq.LastEditDate,
+        'UpVotes', hq.UpVotes,
+        'DownVotes', hq.DownVotes
+    ) ORDER BY hq.Score DESC, hq.ViewCount DESC) AS HotQuestionsRecentMonth
+FROM TopUsers tu
+LEFT JOIN TopTags tt ON tt.OwnerUserId = tu.Id
+LEFT JOIN HotQuestions hq ON hq.OwnerName = tu.DisplayName
+GROUP BY 
+    tu.Id, tu.DisplayName, tu.Reputation, tu.BadgeCount, tu.GoldBadges, tu.SilverBadges, tu.BronzeBadges, 
+    tu.QuestionsAsked, tu.AnswersGiven, tu.AvgPostScore, tu.MaxPostScore
+ORDER BY tu.Reputation DESC;

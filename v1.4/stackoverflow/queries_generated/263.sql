@@ -1,0 +1,66 @@
+-- {"query": "263.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 7360} 
+WITH
+RecentActiveUsers AS (
+  SELECT u.Id,
+         u.DisplayName,
+         u.Reputation,
+         u.Views,
+         u.UpVotes,
+         u.DownVotes,
+         u.LastAccessDate
+  FROM Users u
+  WHERE u.LastAccessDate > NOW() - interval '1 year'
+),
+PostEngagement AS (
+  SELECT OwnerUserId,
+         count(*) AS TotalPosts,
+         sum(p.ViewCount) AS SumViews,
+         max(p.LastActivityDate) AS LastActive
+  FROM Posts p
+  GROUP BY OwnerUserId
+),
+UserEngagement AS (
+  SELECT ra.Id,
+         ra.DisplayName,
+         ra.Reputation,
+         ra.LastAccessDate,
+         COALESCE(pe.TotalPosts, 0) AS TotalPosts,
+         COALESCE(pe.SumViews, 0) AS SumViews,
+         COALESCE(pe.LastActive, ra.LastAccessDate) AS LastActive,
+         (SELECT count(*) 
+            FROM Comments c 
+            JOIN Posts qp ON c.PostId = qp.Id
+            WHERE qp.OwnerUserId = ra.Id) AS TotalCommentsByUser
+  FROM RecentActiveUsers ra
+  LEFT JOIN PostEngagement pe ON ra.Id = pe.OwnerUserId
+),
+RankedUsers AS (
+  SELECT ue.*,
+         ROW_NUMBER() OVER (ORDER BY ue.Reputation DESC, ue.SumViews DESC, ue.LastActive DESC) AS rn
+  FROM UserEngagement ue
+),
+Label AS (
+  SELECT Id,
+         DisplayName,
+         Reputation,
+         LastActive,
+         TotalPosts,
+         SumViews,
+         TotalCommentsByUser,
+         rn,
+         (COALESCE(DisplayName, 'Unknown') || ' | rep=' || to_char(Reputation, 'FM999,999,999') ||
+          ' last=' || COALESCE(to_char(LastActive, 'YYYY-MM-DD'), '')) AS UserLabel
+  FROM RankedUsers
+)
+SELECT Id,
+       DisplayName,
+       Reputation,
+       TotalPosts,
+       SumViews,
+       TotalCommentsByUser,
+       LastActive,
+       rn AS Rank,
+       UserLabel
+FROM Label
+WHERE rn <= 200
+ORDER BY Rank;

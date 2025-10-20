@@ -1,0 +1,51 @@
+WITH TagPopularity AS (
+    SELECT 
+        tag,
+        AVG(Score) AS avg_score,
+        COUNT(*) AS post_count
+    FROM (
+        SELECT 
+            p.*,
+            TRIM(t.tag) AS tag
+        FROM Posts p,
+        LATERAL (
+            SELECT regexp_split_to_table(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><') AS tag
+        ) t
+        WHERE p.PostTypeId = 1
+    ) sub
+    GROUP BY tag
+    HAVING COUNT(*) > 100
+),
+UserContribution AS (
+    SELECT 
+        u.Id, 
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS question_count,
+        COUNT(DISTINCT v.Id) AS vote_count,
+        AVG(p.Score) AS avg_post_score
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(DISTINCT p.Id) > 50
+)
+SELECT 
+    tp.tag,
+    tp.avg_score AS tag_avg_score,
+    tp.post_count,
+    uc.DisplayName AS top_contributor,
+    uc.question_count,
+    uc.vote_count,
+    uc.avg_post_score
+FROM TagPopularity tp
+JOIN UserContribution uc ON uc.avg_post_score > tp.avg_score * 1.5
+GROUP BY
+    tp.tag,
+    tp.avg_score,
+    tp.post_count,
+    uc.DisplayName,
+    uc.question_count,
+    uc.vote_count,
+    uc.avg_post_score
+ORDER BY tp.post_count DESC, uc.question_count DESC
+LIMIT 100;

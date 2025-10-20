@@ -1,0 +1,48 @@
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.CreationDate,
+  p.ViewCount,
+  p.Score,
+  p.Tags,
+  p.OwnerDisplayName AS Owner,
+  COALESCE(a.CountAnswers, 0) AS AnswerCount,
+  COALESCE(vs.Upvotes, 0) AS Upvotes,
+  COALESCE(vs.Downvotes, 0) AS Downvotes,
+  COALESCE(b.CountBadges, 0) AS BadgeCount,
+  COALESCE(cc.Comments, 0) AS CommentCount,
+  p.LastEditDate,
+  p.LastActivityDate,
+  u.Reputation
+FROM
+  Posts p
+  LEFT JOIN (
+    SELECT ParentId, COUNT(*) AS CountAnswers
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY ParentId
+  ) a ON a.ParentId = p.Id
+  LEFT JOIN (
+    SELECT v.PostId, 
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes
+    FROM Votes v
+    GROUP BY v.PostId
+  ) vs ON vs.PostId = p.Id
+  LEFT JOIN (
+    SELECT b.PostId, COUNT(*) AS CountBadges
+    FROM Badges b
+    GROUP BY b.PostId
+  ) b ON b.PostId = p.Id
+  LEFT JOIN (
+    SELECT c.PostId, COUNT(*) AS Comments
+    FROM Comments c
+    GROUP BY c.PostId
+  ) cc ON cc.PostId = p.Id
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+WHERE
+  p.PostTypeId = 1
+  AND p.AcceptedAnswerId IS NOT NULL
+ORDER BY
+  p.CreationDate DESC
+LIMIT 100;

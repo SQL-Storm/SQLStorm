@@ -1,0 +1,57 @@
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.PostTypeId,
+  p.CreationDate,
+  p.ViewCount,
+  p.Score,
+  p.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation,
+  p.Tags,
+  pc.PostId,
+  pc.TotalComments,
+  COALESCE(vt.TotalVotes, 0) AS TotalVotes,
+  COALESCE(vt.UpVotes, 0) AS UpVotes,
+  COALESCE(vt.DownVotes, 0) AS DownVotes,
+  p.AnswerCount,
+  p.FavoriteCount,
+  p.LastActivityDate,
+  p.LastEditDate,
+  b.PostId AS BadgePostId,
+  b.TotalBadges
+FROM
+  Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT
+      c.PostId,
+      COUNT(*) AS TotalComments
+    FROM Comments c
+    GROUP BY c.PostId
+  ) pc ON pc.PostId = p.Id
+  LEFT JOIN (
+    SELECT
+      v.PostId,
+      COUNT(*) AS TotalVotes,
+      SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+      SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes
+    FROM Votes v
+      JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY v.PostId
+  ) vt ON vt.PostId = p.Id
+  LEFT JOIN (
+    SELECT
+      b.PostId,
+      COUNT(*) AS TotalBadges
+    FROM Badges b
+    GROUP BY b.PostId
+  ) b ON b.PostId = p.Id
+WHERE
+  p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 day')
+  AND p.PostTypeId IN (1, 2)
+ORDER BY
+  p.Score DESC,
+  COALESCE(vt.TotalVotes, 0) DESC,
+  p.ViewCount DESC
+LIMIT 100;

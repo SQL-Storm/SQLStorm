@@ -1,0 +1,129 @@
+WITH RECURSIVE UserInfluence AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalUpvotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS TotalDownvotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2' YEAR)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) >= 5
+),
+QuestionAnswerNetwork AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.Tags,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.OwnerUserId AS AnswererId,
+        q.OwnerUserId AS QuestionerId,
+        CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END AS IsAccepted,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts q
+    INNER JOIN Posts a ON q.Id = a.ParentId
+    WHERE q.PostTypeId = 1 
+        AND a.PostTypeId = 2
+        AND q.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '18' MONTH)
+        AND q.Score >= 5
+),
+TagPerformance AS (
+    SELECT 
+        tag_element AS TagName,
+        COUNT(DISTINCT qan.QuestionId) AS QuestionCount,
+        AVG(qan.QuestionScore) AS AvgQuestionScore,
+        AVG(qan.AnswerCount) AS AvgAnswerCount,
+        AVG(qan.ViewCount) AS AvgViews,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY qan.QuestionScore) AS MedianScore,
+        COUNT(DISTINCT qan.AnswererId) AS UniqueAnswerers
+    FROM QuestionAnswerNetwork qan,
+         LATERAL (
+             SELECT value AS tag_element
+             FROM (
+                 SELECT regexp_split_to_table(substring(qan.Tags FROM 2 FOR char_length(qan.Tags)-2), E'><') AS value
+             ) t
+         ) tag_split
+    GROUP BY tag_element
+    HAVING COUNT(DISTINCT qan.QuestionId) >= 10
+),
+ExpertIdentification AS (
+    SELECT 
+        ui.Id AS UserId,
+        ui.DisplayName,
+        ui.Reputation,
+        tag_element AS ExpertTag,
+        COUNT(DISTINCT qan.AnswerId) AS AnswersInTag,
+        AVG(qan.AnswerScore) AS AvgAnswerScore,
+        SUM(qan.IsAccepted) AS AcceptedAnswers,
+        DENSE_RANK() OVER (PARTITION BY tag_element ORDER BY COUNT(DISTINCT qan.AnswerId) DESC, AVG(qan.AnswerScore) DESC) AS ExpertRank
+    FROM UserInfluence ui
+    INNER JOIN QuestionAnswerNetwork qan ON ui.Id = qan.AnswererId,
+         LATERAL (
+             SELECT value AS tag_element
+             FROM (
+                 SELECT regexp_split_to_table(substring(qan.Tags FROM 2 FOR char_length(qan.Tags)-2), E'><') AS value
+             ) t
+         ) tag_split
+    WHERE qan.AnswerRank <= 3
+    GROUP BY ui.Id, ui.DisplayName, ui.Reputation, tag_element
+    HAVING COUNT(DISTINCT qan.AnswerId) >= 3
+),
+CommentEngagement AS (
+    SELECT 
+        c.UserId,
+        COUNT(DISTINCT c.PostId) AS CommentedPosts,
+        AVG(c.Score) AS AvgCommentScore,
+        COUNT(DISTINCT DATE_TRUNC('day', c.CreationDate)) AS ActiveDays
+    FROM Comments c
+    WHERE c.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR)
+        AND c.UserId IS NOT NULL
+    GROUP BY c.UserId
+)
+SELECT 
+    ei.ExpertTag,
+    ei.UserId,
+    ei.DisplayName,
+    ei.Reputation,
+    ei.AnswersInTag,
+    ei.AvgAnswerScore,
+    ei.AcceptedAnswers,
+    tp.QuestionCount AS TagQuestionCount,
+    tp.AvgQuestionScore AS TagAvgScore,
+    tp.UniqueAnswerers AS TagTotalExperts,
+    ce.CommentedPosts,
+    ce.AvgCommentScore,
+    COALESCE(badge_counts.GoldBadges, 0) AS GoldBadges,
+    COALESCE(badge_counts.SilverBadges, 0) AS SilverBadges,
+    COALESCE(badge_counts.BronzeBadges, 0) AS BronzeBadges,
+    (ei.AvgAnswerScore * 0.3 + 
+     ei.AcceptedAnswers * 0.25 + 
+     (CAST(ei.AnswersInTag AS DOUBLE PRECISION) / NULLIF(tp.QuestionCount, 0)) * 100 * 0.2 +
+     COALESCE(ce.AvgCommentScore, 0) * 0.15 +
+     (COALESCE(badge_counts.GoldBadges, 0) * 3 + COALESCE(badge_counts.SilverBadges, 0) * 2 + COALESCE(badge_counts.BronzeBadges, 0)) * 0.1
+    ) AS InfluenceScore
+FROM ExpertIdentification ei
+INNER JOIN TagPerformance tp ON ei.ExpertTag = tp.TagName
+LEFT JOIN CommentEngagement ce ON ei.UserId = ce.UserId
+LEFT JOIN (
+    SELECT 
+        UserId,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges
+    GROUP BY UserId
+) badge_counts ON ei.UserId = badge_counts.UserId
+WHERE ei.ExpertRank <= 10
+    AND tp.QuestionCount >= 50
+ORDER BY tp.QuestionCount DESC, ei.ExpertRank ASC, InfluenceScore DESC
+LIMIT 500;

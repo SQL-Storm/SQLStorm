@@ -1,0 +1,65 @@
+-- {"query": "43006.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "nova-premier", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2135, "output_tokens": 605} 
+
+WITH UserActivity AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(p.Score) AS TotalScore,
+        AVG(CASE WHEN ph.PostHistoryTypeId = 5 THEN LENGTH(ph.Text) ELSE 0 END) AS AvgEditLength,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (5, 10, 11)) AS EditAndVoteActions,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC, SUM(p.Score) DESC) AS ActivityRank
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN 
+        PostHistory ph ON u.Id = ph.UserId
+    LEFT JOIN 
+        Badges b ON u.Id = b.UserId
+    WHERE 
+        p.CreationDate > CURRENT_DATE - INTERVAL '1 year'
+    GROUP BY 
+        u.Id
+),
+TopQuestions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Score,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY string_to_array(substring(p.Tags, 2, length(p.Tags)-2), ''><'') ORDER BY p.ViewCount DESC) AS TagRank
+    FROM 
+        Posts p
+    WHERE 
+        p.PostTypeId = 1 AND
+        p.CreationDate > CURRENT_DATE - INTERVAL '6 months'
+)
+SELECT 
+    ua.DisplayName,
+    ua.Reputation,
+    ua.TotalPosts,
+    ua.TotalScore,
+    ua.AvgEditLength,
+    ua.EditAndVoteActions,
+    ua.TotalBadges,
+    tq.Title AS TopQuestionTitle,
+    tq.ViewCount AS TopQuestionViews,
+    tq.AnswerCount AS TopQuestionAnswers,
+    tq.Score AS TopQuestionScore
+FROM 
+    UserActivity ua
+LEFT JOIN 
+    Posts p ON ua.Id = p.OwnerUserId
+LEFT JOIN 
+    TopQuestions tq ON p.Id = tq.Id
+WHERE 
+    ua.ActivityRank <= 10 AND
+    tq.TagRank = 1
+ORDER BY 
+    ua.ActivityRank,
+    tq.ViewCount DESC;

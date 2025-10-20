@@ -1,0 +1,118 @@
+WITH user_expertise AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalAnswers,
+        COUNT(DISTINCT CASE WHEN p.Id = q.AcceptedAnswerId THEN p.Id END) AS AcceptedAnswers,
+        AVG(p.Score) AS AvgAnswerScore,
+        STRING_AGG(DISTINCT t.TagName, ', ' ORDER BY t.TagName) AS ExpertiseTags
+    FROM Users u
+    INNER JOIN Posts p ON u.Id = p.OwnerUserId
+    INNER JOIN Posts q ON p.ParentId = q.Id
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')) AS tag
+    ) AS qt
+    INNER JOIN Tags t ON qt.tag = t.TagName
+    WHERE p.PostTypeId = 2
+        AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+        AND u.Reputation > 5000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+question_metrics AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CreationDate,
+        qo.DisplayName AS QuestionOwner,
+        q.AcceptedAnswerId,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+        COUNT(DISTINCT ph.Id) AS EditHistory,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END), 0) AS TotalBounty
+    FROM Posts q
+    LEFT JOIN Users qo ON q.OwnerUserId = qo.Id
+    LEFT JOIN Comments c ON q.Id = c.PostId
+    LEFT JOIN Votes v ON q.Id = v.PostId
+    LEFT JOIN PostHistory ph ON q.Id = ph.PostId AND ph.PostHistoryTypeId IN (4, 5, 6)
+    WHERE q.PostTypeId = 1
+        AND q.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '18 months'
+        AND q.ViewCount > 100
+    GROUP BY q.Id, q.Title, q.Score, q.ViewCount, q.AnswerCount, q.CreationDate, qo.DisplayName, q.AcceptedAnswerId
+),
+answer_quality AS (
+    SELECT 
+        a.ParentId AS QuestionId,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.OwnerUserId,
+        ao.DisplayName AS AnswerOwner,
+        a.CreationDate AS AnswerDate,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600 AS HoursToAnswer,
+        COUNT(DISTINCT ac.Id) AS AnswerComments,
+        LENGTH(a.Body) AS AnswerLength,
+        CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END AS IsAccepted,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts a
+    INNER JOIN Posts q ON a.ParentId = q.Id
+    LEFT JOIN Users ao ON a.OwnerUserId = ao.Id
+    LEFT JOIN Comments ac ON a.Id = ac.PostId
+    WHERE a.PostTypeId = 2
+        AND a.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '18 months'
+    GROUP BY a.Id, a.ParentId, a.Score, a.OwnerUserId, ao.DisplayName, a.CreationDate, q.CreationDate, a.Body, q.AcceptedAnswerId
+),
+badge_achievements AS (
+    SELECT 
+        UserId,
+        COUNT(*) FILTER (WHERE Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE Class = 3) AS BronzeBadges,
+        COUNT(*) AS TotalBadges
+    FROM Badges
+    WHERE Date >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+    GROUP BY UserId
+)
+SELECT 
+    qm.QuestionId,
+    qm.Title,
+    qm.QuestionOwner,
+    qm.QuestionScore,
+    qm.ViewCount,
+    qm.AnswerCount,
+    qm.CommentCount,
+    qm.TotalBounty,
+    aq.AnswerId,
+    aq.AnswerOwner,
+    aq.AnswerScore,
+    aq.HoursToAnswer,
+    aq.IsAccepted,
+    aq.AnswerRank,
+    aq.AnswerLength,
+    ue.Reputation AS AnswererReputation,
+    ue.TotalAnswers AS AnswererTotalAnswers,
+    ue.AcceptedAnswers AS AnswererAcceptedAnswers,
+    ue.AvgAnswerScore AS AnswererAvgScore,
+    ue.ExpertiseTags AS AnswererExpertise,
+    ba.GoldBadges,
+    ba.SilverBadges,
+    ba.BronzeBadges,
+    ROUND(CAST(qm.UpVotes AS NUMERIC) / NULLIF(qm.UpVotes + qm.DownVotes, 0) * 100, 2) AS QuestionUpvotePercentage,
+    ROUND(CAST(ue.AcceptedAnswers AS NUMERIC) / NULLIF(ue.TotalAnswers, 0) * 100, 2) AS AnswererAcceptanceRate
+FROM question_metrics qm
+INNER JOIN answer_quality aq ON qm.QuestionId = aq.QuestionId
+LEFT JOIN user_expertise ue ON aq.OwnerUserId = ue.UserId
+LEFT JOIN badge_achievements ba ON aq.OwnerUserId = ba.UserId
+WHERE aq.AnswerRank <= 5
+    AND qm.QuestionScore >= 5
+    AND aq.AnswerScore >= 1
+ORDER BY 
+    qm.ViewCount DESC,
+    qm.QuestionScore DESC,
+    aq.AnswerScore DESC,
+    aq.HoursToAnswer ASC
+LIMIT 1000;

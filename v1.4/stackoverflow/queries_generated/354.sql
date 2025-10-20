@@ -1,0 +1,92 @@
+-- {"query": "354.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 22057} 
+WITH
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    COALESCE(u.DisplayName, 'Unknown') AS DisplayName,
+    COUNT(p.Id) FILTER (WHERE p.CreationDate >= NOW() - INTERVAL '365 days') AS PostsLastYear,
+    COUNT(p.Id) AS TotalPostsAllTime,
+    COALESCE(SUM(p.Score), 0) AS ScoreSum,
+    COALESCE(AVG(p.ViewCount), 0) AS AvgViews,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS Questions,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS Answers,
+    COALESCE(MAX(char_length(p.Title)), 0) AS MaxTitleLength,
+    COALESCE(MAX(char_length(p.Body)), 0) AS MaxBodyLength,
+    MIN(p.CreationDate) AS FirstPostDate
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName
+),
+TopTagPerUser AS (
+  SELECT UserId, TagName, TagPostCount
+  FROM (
+    SELECT UserId, TagName, TagPostCount,
+           ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY TagPostCount DESC) AS rn
+    FROM (
+      SELECT u.Id AS UserId,
+             t.TagName,
+             COUNT(*) AS TagPostCount
+      FROM Users u
+      LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+      LEFT JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')) AS TagName
+      ) AS t ON true
+      GROUP BY u.Id, t.TagName
+    ) s
+  ) w
+  WHERE TagName IS NOT NULL
+),
+TopTag AS (
+  SELECT UserId, TagName AS TopTag, TagPostCount
+  FROM TopTagPerUser
+  WHERE rn = 1
+),
+CommentCounts AS (
+  SELECT p.OwnerUserId AS UserId,
+         COUNT(c.Id) AS CommentCount
+  FROM Posts p
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  GROUP BY p.OwnerUserId
+),
+PostHistoryActivity AS (
+  SELECT p.OwnerUserId AS UserId,
+         COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 10) AS PostCloseVotesCount
+  FROM Posts p
+  LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+  GROUP BY p.OwnerUserId
+),
+VotesAggregates AS (
+  SELECT p.OwnerUserId AS UserId,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesReceived,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesReceived,
+         SUM(v.BountyAmount) AS BountiesAwarded
+  FROM Votes v
+  JOIN Posts p ON p.Id = v.PostId
+  GROUP BY p.OwnerUserId
+)
+SELECT
+  ua.UserId,
+  ua.DisplayName,
+  ua.PostsLastYear,
+  ua.TotalPostsAllTime,
+  ua.ScoreSum,
+  ua.AvgViews,
+  ua.Questions,
+  ua.Answers,
+  ua.MaxTitleLength,
+  ua.MaxBodyLength,
+  ua.FirstPostDate,
+  COALESCE(ct.CommentCount, 0) AS CommentCount,
+  COALESCE(tt.TopTag, '') AS TopTag,
+  COALESCE(tt.TagPostCount, 0) AS TopTagCount,
+  COALESCE(pha.PostCloseVotesCount, 0) AS PostCloseVotesCount,
+  COALESCE(va.UpvotesReceived, 0) AS UpvotesReceived,
+  COALESCE(va.DownvotesReceived, 0) AS DownvotesReceived,
+  COALESCE(va.BountiesAwarded, 0) AS BountiesAwarded
+FROM UserActivity ua
+LEFT JOIN TopTag tt ON tt.UserId = ua.UserId
+LEFT JOIN CommentCounts ct ON ct.UserId = ua.UserId
+LEFT JOIN PostHistoryActivity pha ON pha.UserId = ua.UserId
+LEFT JOIN VotesAggregates va ON va.UserId = ua.UserId
+ORDER BY ua.ScoreSum DESC NULLS LAST
+LIMIT 200;

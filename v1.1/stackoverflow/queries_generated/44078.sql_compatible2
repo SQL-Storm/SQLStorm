@@ -1,0 +1,91 @@
+WITH user_activity AS (
+  SELECT
+    u.Id AS user_id,
+    u.CreationDate AS user_creation_date,
+    u.LastAccessDate AS user_last_access_date,
+    COUNT(p.Id) AS post_count,
+    SUM(p.Score) AS post_score,
+    SUM(p.ViewCount) AS post_views,
+    SUM(p.UpVotes) AS post_upvotes,
+    SUM(p.DownVotes) AS post_downvotes,
+    COUNT(b.Id) AS badge_count,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+  LEFT JOIN Badges b ON u.Id = b.UserId
+  GROUP BY u.Id, u.CreationDate, u.LastAccessDate
+),
+post_activity AS (
+  SELECT
+    p.Id AS post_id,
+    p.PostTypeId,
+    p.CreationDate AS post_creation_date,
+    p.LastEditDate AS post_last_edit_date,
+    p.LastActivityDate AS post_last_activity_date,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS is_closed,
+    CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END AS is_community_owned,
+    COUNT(pl.Id) AS linked_post_count,
+    SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS duplicate_post_count
+  FROM Posts p
+  LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+  GROUP BY
+    p.Id, p.PostTypeId, p.CreationDate, p.LastEditDate, p.LastActivityDate,
+    p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount,
+    p.ClosedDate, p.CommunityOwnedDate
+),
+post_history AS (
+  SELECT
+    ph.Id AS history_id,
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate AS history_creation_date,
+    ph.UserId AS editor_id,
+    ph.UserDisplayName AS editor_name,
+    ph.Comment,
+    ph.Text
+  FROM PostHistory ph
+)
+SELECT
+  ua.user_id,
+  ua.user_creation_date,
+  ua.user_last_access_date,
+  ua.post_count,
+  ua.post_score,
+  ua.post_views,
+  ua.post_upvotes,
+  ua.post_downvotes,
+  ua.badge_count,
+  ua.gold_badges,
+  ua.silver_badges,
+  ua.bronze_badges,
+  pa.post_id,
+  pa.PostTypeId,
+  pa.post_creation_date,
+  pa.post_last_edit_date,
+  pa.post_last_activity_date,
+  pa.Score,
+  pa.ViewCount,
+  pa.AnswerCount,
+  pa.CommentCount,
+  pa.FavoriteCount,
+  pa.is_closed,
+  pa.is_community_owned,
+  pa.linked_post_count,
+  pa.duplicate_post_count,
+  ph.history_id,
+  ph.history_creation_date,
+  ph.editor_id,
+  ph.editor_name,
+  ph.Comment,
+  ph.Text
+FROM user_activity ua
+CROSS JOIN post_activity pa
+LEFT JOIN post_history ph ON pa.post_id = ph.PostId
+ORDER BY ua.user_id, pa.post_id, ph.history_creation_date;

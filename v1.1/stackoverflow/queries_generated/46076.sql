@@ -1,0 +1,126 @@
+-- {"query": "46076.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 174344, "output_tokens": 139790} 
+
+WITH UserEngagementMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) as QuestionScore,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) as AnswerScore,
+        COALESCE(AVG(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount END), 0) as AvgQuestionViews
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= CURRENT_DATE - INTERVAL '2 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) > 5
+),
+TopQuestions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.OwnerUserId,
+        p.CreationDate,
+        RANK() OVER (PARTITION BY EXTRACT(YEAR FROM p.CreationDate) ORDER BY p.Score DESC, p.ViewCount DESC) as YearRank,
+        COUNT(DISTINCT pl.RelatedPostId) as LinkedCount,
+        STRING_AGG(DISTINCT t.TagName, ', ' ORDER BY t.TagName) as TagsList
+    FROM Posts p
+    INNER JOIN LATERAL string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><') tag_array ON true
+    LEFT JOIN Tags t ON t.TagName = ANY(tag_array)
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    WHERE p.PostTypeId = 1 
+        AND p.Score > 10
+        AND p.CreationDate >= CURRENT_DATE - INTERVAL '3 years'
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.OwnerUserId, p.CreationDate
+),
+AnswerQuality AS (
+    SELECT 
+        a.Id as AnswerId,
+        a.ParentId,
+        a.OwnerUserId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerDate,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END as IsAccepted,
+        COUNT(DISTINCT c.Id) as AnswerCommentCount,
+        COUNT(DISTINCT ph.Id) as EditCount,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600 as HoursToAnswer
+    FROM Posts a
+    INNER JOIN Posts q ON a.ParentId = q.Id
+    LEFT JOIN Comments c ON a.Id = c.PostId
+    LEFT JOIN PostHistory ph ON a.Id = ph.PostId AND ph.PostHistoryTypeId IN (5, 8)
+    WHERE a.PostTypeId = 2
+        AND a.CreationDate >= CURRENT_DATE - INTERVAL '2 years'
+        AND a.Score >= 1
+    GROUP BY a.Id, a.ParentId, a.OwnerUserId, a.Score, a.CreationDate, q.Score, q.ViewCount, q.AcceptedAnswerId
+),
+TagPerformance AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        COUNT(DISTINCT p.Id) as RecentQuestions,
+        AVG(p.Score) as AvgScore,
+        AVG(p.ViewCount) as AvgViews,
+        AVG(p.AnswerCount) as AvgAnswers,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) as MedianScore,
+        COUNT(DISTINCT p.OwnerUserId) as UniqueAskers
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%<' || t.TagName || '>%'
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+        AND t.Count > 100
+    GROUP BY t.TagName, t.Count
+    HAVING COUNT(DISTINCT p.Id) > 50
+)
+SELECT 
+    uem.DisplayName,
+    uem.Reputation,
+    uem.PostCount,
+    uem.QuestionScore + uem.AnswerScore as TotalScore,
+    uem.BadgeCount,
+    tq.YearRank,
+    tq.Title as TopQuestionTitle,
+    tq.ViewCount as TopQuestionViews,
+    tq.TagsList,
+    aq_stats.AvgAnswerScore,
+    aq_stats.AcceptanceRate,
+    aq_stats.AvgHoursToAnswer,
+    tp.TagName as BestTag,
+    tp.AvgScore as TagAvgScore,
+    DENSE_RANK() OVER (ORDER BY (uem.QuestionScore + uem.AnswerScore) DESC, uem.Reputation DESC) as OverallRank
+FROM UserEngagementMetrics uem
+LEFT JOIN TopQuestions tq ON uem.Id = tq.OwnerUserId AND tq.YearRank <= 3
+LEFT JOIN LATERAL (
+    SELECT 
+        AVG(aq.AnswerScore) as AvgAnswerScore,
+        AVG(aq.IsAccepted::numeric) as AcceptanceRate,
+        AVG(aq.HoursToAnswer) as AvgHoursToAnswer
+    FROM AnswerQuality aq
+    WHERE aq.OwnerUserId = uem.Id
+) aq_stats ON true
+LEFT JOIN LATERAL (
+    SELECT tp.TagName, tp.AvgScore
+    FROM TagPerformance tp
+    WHERE EXISTS (
+        SELECT 1 FROM Posts p 
+        WHERE p.OwnerUserId = uem.Id 
+        AND p.Tags LIKE '%<' || tp.TagName || '>%'
+    )
+    ORDER BY tp.AvgScore DESC
+    LIMIT 1
+) tp ON true
+WHERE uem.PostCount >= 10
+    AND (tq.YearRank IS NOT NULL OR aq_stats.AvgAnswerScore > 5)
+ORDER BY OverallRank, uem.Reputation DESC, tq.ViewCount DESC NULLS LAST
+LIMIT 100;

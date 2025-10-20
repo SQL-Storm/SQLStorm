@@ -1,0 +1,52 @@
+WITH ActiveUserTags AS (
+    SELECT u.Id, 
+           u.DisplayName, 
+           t.TagName, 
+           COUNT(p.Id) AS PostCount,
+           AVG(p.Score) AS AvgPostScore
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    JOIN (
+        SELECT DISTINCT tag AS TagName
+        FROM (
+            SELECT TRIM(BOTH ' ' FROM UNNEST(STRING_SPLIT(SUBSTRING(Tags, 2, LEN(Tags) - 2), '><'))) AS tag
+            FROM Posts
+        ) s
+    ) t ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, t.TagName
+    HAVING COUNT(p.Id) > 10
+),
+TagPerformance AS (
+    SELECT TagName, 
+           MAX(PostCount) AS MaxUserPostCount,
+           AVG(AvgPostScore) AS OverallTagScore,
+           COUNT(DISTINCT Id) AS UniqueActiveUsers
+    FROM ActiveUserTags
+    GROUP BY TagName
+)
+SELECT 
+    tp.TagName, 
+    tp.MaxUserPostCount, 
+    tp.OverallTagScore, 
+    tp.UniqueActiveUsers,
+    v.VoteCount,
+    p.ViewCount
+FROM TagPerformance tp
+JOIN (
+    SELECT UNNEST(STRING_SPLIT(Tags, '><')) AS TagName, COUNT(p.Id) AS VoteCount
+    FROM Posts p
+    JOIN Votes v ON p.Id = v.PostId
+    CROSS APPLY (SELECT SUBSTRING(p.Tags, 2, LEN(p.Tags) - 2) AS TagsTrimmed) ct
+    CROSS APPLY (SELECT value FROM STRING_SPLIT(ct.TagsTrimmed, '><')) ss(value)
+    GROUP BY UNNEST(STRING_SPLIT(Tags, '><'))
+) v ON tp.TagName = v.TagName
+JOIN (
+    SELECT UNNEST(STRING_SPLIT(Tags, '><')) AS TagName, SUM(ViewCount) AS ViewCount
+    FROM Posts
+    CROSS APPLY (SELECT SUBSTRING(Tags, 2, LEN(Tags) - 2) AS TagsTrimmed) ct
+    CROSS APPLY (SELECT value FROM STRING_SPLIT(ct.TagsTrimmed, '><')) ss(value)
+    GROUP BY UNNEST(STRING_SPLIT(Tags, '><'))
+) p ON tp.TagName = p.TagName
+ORDER BY tp.OverallTagScore DESC, tp.UniqueActiveUsers DESC
+LIMIT 50;

@@ -1,0 +1,76 @@
+WITH popular_tags AS (
+  SELECT t.TagName, COUNT(*) AS tag_usage
+  FROM Tags t
+  JOIN Posts p ON array_position(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'), t.TagName) IS NOT NULL
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate > cast('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 years'
+  GROUP BY t.TagName
+  HAVING COUNT(*) > 1000
+),
+active_users AS (
+  SELECT u.Id, u.Reputation, u.UpVotes, u.DownVotes,
+         COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (2,5,8) THEN ph.PostId END) AS edits_made,
+         COUNT(DISTINCT v.PostId) AS votes_cast
+  FROM Users u
+  JOIN PostHistory ph ON ph.UserId = u.Id
+    AND ph.CreationDate > cast('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years'
+  LEFT JOIN Votes v ON v.UserId = u.Id
+    AND v.CreationDate > cast('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years'
+  WHERE u.Reputation > 1000
+    AND u.LastAccessDate > cast('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+  GROUP BY u.Id, u.Reputation, u.UpVotes, u.DownVotes
+  HAVING COUNT(DISTINCT ph.PostId) > 5
+),
+question_stats AS (
+  SELECT p.Id AS question_id, p.OwnerUserId, p.Score, p.ViewCount, p.AnswerCount,
+         p.CreationDate, p.LastActivityDate,
+         COALESCE(accepted.Score, 0) AS accepted_score,
+         AVG(ans.Score) AS avg_answer_score,
+         COUNT(DISTINCT c.Id) AS total_comments,
+         COUNT(DISTINCT pl.RelatedPostId) AS external_links
+  FROM Posts p
+  LEFT JOIN Posts accepted ON p.AcceptedAnswerId = accepted.Id
+  LEFT JOIN Posts ans ON p.Id = ans.ParentId AND ans.PostTypeId = 2 AND ans.Score > -5
+  LEFT JOIN Comments c ON p.Id = c.PostId AND c.Score >= 0
+  LEFT JOIN PostLinks pl ON p.Id = pl.PostId AND pl.LinkTypeId = 1
+  WHERE p.PostTypeId = 1
+    AND p.Score > 0
+    AND p.CreationDate > cast('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+  GROUP BY p.Id, p.OwnerUserId, p.Score, p.ViewCount, p.AnswerCount, p.CreationDate, p.LastActivityDate, accepted.Score
+),
+engagement_metrics AS (
+  SELECT qs.question_id, au.Id AS user_id,
+         (qs.Score + qs.accepted_score + COALESCE(qs.avg_answer_score, 0)) AS total_question_value,
+         (qs.ViewCount * 0.1 + qs.total_comments * 0.5 + qs.external_links * 2) AS engagement_score,
+         CASE 
+           WHEN qs.AnswerCount >= 3 AND COALESCE(qs.avg_answer_score, 0) > 5 THEN 'Highly Answered'
+           WHEN qs.AnswerCount >= 1 AND COALESCE(qs.avg_answer_score, 0) > 0 THEN 'Moderately Answered'
+           ELSE 'Low Engagement'
+         END AS engagement_category,
+         qs.Score, qs.accepted_score, qs.avg_answer_score, qs.ViewCount, qs.total_comments, qs.external_links, qs.OwnerUserId, qs.LastActivityDate
+  FROM question_stats qs
+  JOIN active_users au ON qs.OwnerUserId = au.Id
+  WHERE qs.ViewCount > 100
+)
+SELECT 
+  pt.TagName,
+  em.engagement_category,
+  COUNT(*) AS question_count,
+  AVG(em.total_question_value) AS avg_question_value,
+  AVG(em.engagement_score) AS avg_engagement,
+  SUM(au.Reputation) AS total_user_reputation,
+  COUNT(DISTINCT em.user_id) AS distinct_contributors,
+  PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY em.total_question_value) AS p90_question_value,
+  MAX(qs.LastActivityDate) AS most_recent_activity
+FROM engagement_metrics em
+JOIN question_stats qs ON em.question_id = qs.question_id
+JOIN active_users au ON em.user_id = au.Id
+JOIN Posts p ON em.question_id = p.Id
+JOIN popular_tags pt ON array_position(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'), pt.TagName) IS NOT NULL
+WHERE em.engagement_score > 10
+  AND au.edits_made > 2
+  AND au.UpVotes > au.DownVotes
+GROUP BY pt.TagName, em.engagement_category
+HAVING COUNT(*) > 50
+ORDER BY avg_engagement DESC, question_count DESC
+LIMIT 20;

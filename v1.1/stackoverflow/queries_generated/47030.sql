@@ -1,0 +1,109 @@
+-- {"query": "47030.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 68820, "output_tokens": 60129} 
+
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT pt.Id) as question_count,
+        1 as level
+    FROM Tags t
+    JOIN Posts pt ON pt.Tags LIKE '%<' || t.TagName || '>%'
+    WHERE pt.PostTypeId = 1
+        AND t.Count > 1000
+    GROUP BY t.Id, t.TagName
+    
+    UNION ALL
+    
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        COUNT(DISTINCT p2.Id),
+        th.level + 1
+    FROM tag_hierarchy th
+    JOIN Posts p1 ON p1.Tags LIKE '%<' || th.TagName || '>%'
+    JOIN Posts p2 ON p2.Tags LIKE '%<' || th.TagName || '>%'
+        AND p2.Id != p1.Id
+        AND p2.Tags != p1.Tags
+    JOIN Tags t2 ON p2.Tags LIKE '%<' || t2.TagName || '>%'
+        AND t2.Id != th.Id
+    WHERE th.level < 3
+        AND p1.PostTypeId = 1
+        AND p2.PostTypeId = 1
+    GROUP BY t2.Id, t2.TagName, th.level
+),
+user_expertise AS (
+    SELECT 
+        u.Id as user_id,
+        u.DisplayName,
+        t.TagName,
+        COUNT(DISTINCT p.Id) as answers,
+        SUM(p.Score) as total_score,
+        AVG(p.Score) as avg_score,
+        COUNT(DISTINCT CASE WHEN p.Id = q.AcceptedAnswerId THEN p.Id END) as accepted_answers,
+        COUNT(DISTINCT b.Id) as tag_badges,
+        RANK() OVER (PARTITION BY t.TagName ORDER BY SUM(p.Score) DESC) as tag_rank,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as global_answer_rank
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 2
+    JOIN Posts q ON p.ParentId = q.Id
+    JOIN Tags t ON q.Tags LIKE '%<' || t.TagName || '>%'
+    LEFT JOIN Badges b ON b.UserId = u.Id 
+        AND b.TagBased = true 
+        AND LOWER(b.Name) = LOWER(t.TagName)
+    WHERE u.Reputation > 5000
+        AND p.Score > 0
+    GROUP BY u.Id, u.DisplayName, t.TagName
+),
+temporal_patterns AS (
+    SELECT 
+        DATE_TRUNC('month', p.CreationDate) as month,
+        pt.Name as post_type,
+        COUNT(DISTINCT p.Id) as posts,
+        COUNT(DISTINCT p.OwnerUserId) as unique_authors,
+        AVG(p.Score) as avg_score,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) as median_score,
+        PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY p.Score) as p90_score,
+        COUNT(DISTINCT c.Id) as total_comments,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) as upvotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) as downvotes,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) as edits,
+        AVG(EXTRACT(EPOCH FROM (COALESCE(p.ClosedDate, CURRENT_TIMESTAMP) - p.CreationDate))/3600) as avg_hours_to_close
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    WHERE p.CreationDate >= CURRENT_DATE - INTERVAL '2 years'
+    GROUP BY DATE_TRUNC('month', p.CreationDate), pt.Name
+)
+SELECT 
+    ue.DisplayName,
+    ue.TagName,
+    ue.answers,
+    ue.total_score,
+    ue.avg_score,
+    ue.accepted_answers,
+    ROUND(100.0 * ue.accepted_answers / NULLIF(ue.answers, 0), 2) as acceptance_rate,
+    ue.tag_badges,
+    ue.tag_rank,
+    ue.global_answer_rank,
+    th.question_count as tag_question_count,
+    th.level as tag_hierarchy_level,
+    tp.month,
+    tp.posts as monthly_posts,
+    tp.avg_score as monthly_avg_score,
+    tp.median_score as monthly_median_score,
+    tp.total_comments as monthly_comments,
+    tp.upvotes as monthly_upvotes,
+    tp.downvotes as monthly_downvotes,
+    tp.edits as monthly_edits,
+    ROUND(tp.avg_hours_to_close, 2) as avg_hours_to_close,
+    COUNT(*) OVER (PARTITION BY ue.TagName ORDER BY ue.total_score DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) as cumulative_experts,
+    LAG(ue.total_score, 1) OVER (PARTITION BY ue.TagName ORDER BY ue.total_score DESC) - ue.total_score as score_gap_to_previous,
+    FIRST_VALUE(ue.total_score) OVER (PARTITION BY ue.TagName ORDER BY ue.total_score DESC) - ue.total_score as score_gap_to_top
+FROM user_expertise ue
+JOIN tag_hierarchy th ON th.TagName = ue.TagName
+CROSS JOIN temporal_patterns tp
+WHERE ue.tag_rank <= 100
+    AND tp.post_type = 'Question'
+ORDER BY ue.TagName, ue.tag_rank, tp.month DESC;

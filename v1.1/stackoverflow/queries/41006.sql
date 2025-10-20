@@ -1,0 +1,48 @@
+SELECT 
+    p.Id, 
+    p.PostTypeId, 
+    p.CreationDate, 
+    p.Score, 
+    p.ViewCount, 
+    p.Title, 
+    p.Tags, 
+    p.AnswerCount, 
+    p.CommentCount, 
+    p.FavoriteCount, 
+    u.DisplayName AS OwnerDisplayName, 
+    u.Reputation AS OwnerReputation, 
+    COUNT(DISTINCT v.Id) AS TotalVotes, 
+    AVG(v.BountyAmount) AS AvgBountyAmount, 
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes, 
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes, 
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 1 THEN v.UserId END) AS AcceptedAnswerVotes, 
+    COUNT(DISTINCT c.Id) AS TotalComments
+FROM 
+    Posts p
+JOIN 
+    Users u ON p.OwnerUserId = u.Id
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    Comments c ON p.Id = c.PostId
+WHERE 
+    p.PostTypeId IN (1, 2) 
+    AND p.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+GROUP BY 
+    p.Id, 
+    p.PostTypeId, 
+    p.CreationDate, 
+    p.Score, 
+    p.ViewCount, 
+    p.Title, 
+    p.Tags, 
+    p.AnswerCount, 
+    p.CommentCount, 
+    p.FavoriteCount, 
+    u.DisplayName, 
+    u.Reputation
+ORDER BY 
+    p.Score DESC, 
+    p.ViewCount DESC, 
+    p.CreationDate DESC
+LIMIT 100;

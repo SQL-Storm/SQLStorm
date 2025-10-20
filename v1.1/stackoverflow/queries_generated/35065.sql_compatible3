@@ -1,0 +1,160 @@
+WITH
+UserQuestions AS (
+  SELECT
+    u.Id AS UserId,
+    COUNT(DISTINCT p.Id) AS QuestionCount,
+    AVG(p.Score) AS AvgQuestionScore
+  FROM
+    Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+  GROUP BY u.Id
+),
+UserAnswers AS (
+  SELECT
+    u.Id AS UserId,
+    COUNT(DISTINCT p.Id) AS AnswerCount,
+    AVG(p.Score) AS AvgAnswerScore
+  FROM
+    Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 2
+  GROUP BY u.Id
+),
+UserBadges AS (
+  SELECT
+    b.UserId,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    SUM(t.Count) AS UsageCount
+  FROM Tags t
+  GROUP BY t.TagName
+  ORDER BY SUM(t.Count) DESC
+  FETCH FIRST 10 ROWS ONLY
+),
+TagQuestionStats AS (
+  SELECT
+    tag AS TagName,
+    COUNT(*) AS QuestionCount,
+    AVG(p_score) AS AvgScore
+  FROM (
+    SELECT p.Id, p.Score AS p_score,
+           TRIM(tag) AS tag
+    FROM Posts p,
+         -- split tags like '<tag1><tag2>' into rows; use a standard-ish approach with recursive split if regexp_split_to_table unavailable
+         LATERAL (
+           SELECT value AS tag
+           FROM (
+             -- replace leading/trailing angle brackets and split by '><'
+             SELECT TRIM(value) AS value
+             FROM (
+               SELECT
+                 CASE
+                   WHEN POSITION('><' IN REPLACE(SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), '><', '|'))>0
+                   THEN regexp_split_to_table(REPLACE(SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)),'><','|'), '\|')
+                   ELSE REPLACE(SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)),'><','|')
+                 END AS value
+             ) t1
+           ) t2
+         ) s
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+  ) q
+  GROUP BY tag
+)
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  u.Reputation,
+  uq.QuestionCount,
+  uq.AvgQuestionScore,
+  ua.AnswerCount,
+  ua.AvgAnswerScore,
+  COALESCE(ub.GoldBadges, 0) AS GoldBadges,
+  COALESCE(ub.SilverBadges, 0) AS SilverBadges,
+  COALESCE(ub.BronzeBadges, 0) AS BronzeBadges,
+  COUNT(DISTINCT c.Id) AS CommentCount,
+  (
+    SELECT COUNT(1)
+    FROM Votes v
+    WHERE v.UserId = u.Id
+      AND v.VoteTypeId = 2
+  ) AS TotalUpvotesGiven,
+  (
+    SELECT COUNT(1)
+    FROM Votes v
+    WHERE v.UserId = u.Id
+      AND v.VoteTypeId = 3
+  ) AS TotalDownvotesGiven,
+  (
+    SELECT ARRAY_AGG(tt.TagName)
+    FROM TopTags tt
+    WHERE tt.TagName IN (
+      SELECT DISTINCT tag
+      FROM Posts p2,
+           LATERAL (
+             SELECT value AS tag
+             FROM (
+               SELECT
+                 CASE
+                   WHEN POSITION('><' IN REPLACE(SUBSTRING(p2.Tags FROM 2 FOR (CHAR_LENGTH(p2.Tags)-2)), '><', '|'))>0
+                   THEN regexp_split_to_table(REPLACE(SUBSTRING(p2.Tags FROM 2 FOR (CHAR_LENGTH(p2.Tags)-2)),'><','|'), '\|')
+                   ELSE REPLACE(SUBSTRING(p2.Tags FROM 2 FOR (CHAR_LENGTH(p2.Tags)-2)),'><','|')
+                 END AS value
+             ) t1
+           ) s2
+      WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 1 AND p2.Tags IS NOT NULL
+    )
+  ) AS Top10TagsUsedInQuestions,
+  (
+    SELECT JSON_ARRAYAGG(
+             JSON_OBJECT(
+               'TagName' VALUE tqs.TagName,
+               'QuestionCount' VALUE tqs.QuestionCount,
+               'AvgScore' VALUE tqs.AvgScore
+             )
+           )
+    FROM TagQuestionStats tqs
+    WHERE tqs.TagName IN (
+      SELECT DISTINCT tag
+      FROM Posts p3,
+           LATERAL (
+             SELECT value AS tag
+             FROM (
+               SELECT
+                 CASE
+                   WHEN POSITION('><' IN REPLACE(SUBSTRING(p3.Tags FROM 2 FOR (CHAR_LENGTH(p3.Tags)-2)), '><', '|'))>0
+                   THEN regexp_split_to_table(REPLACE(SUBSTRING(p3.Tags FROM 2 FOR (CHAR_LENGTH(p3.Tags)-2)),'><','|'), '\|')
+                   ELSE REPLACE(SUBSTRING(p3.Tags FROM 2 FOR (CHAR_LENGTH(p3.Tags)-2)),'><','|')
+                 END AS value
+             ) t1
+           ) s3
+      WHERE p3.OwnerUserId = u.Id AND p3.PostTypeId = 1 AND p3.Tags IS NOT NULL
+    )
+  ) AS TagStats
+FROM
+  Users u
+  LEFT JOIN UserQuestions uq ON uq.UserId = u.Id
+  LEFT JOIN UserAnswers ua ON ua.UserId = u.Id
+  LEFT JOIN UserBadges ub ON ub.UserId = u.Id
+  LEFT JOIN Comments c ON c.UserId = u.Id
+WHERE
+  u.Reputation >= 1000
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  uq.QuestionCount,
+  uq.AvgQuestionScore,
+  ua.AnswerCount,
+  ua.AvgAnswerScore,
+  ub.GoldBadges,
+  ub.SilverBadges,
+  ub.BronzeBadges
+ORDER BY
+  u.Reputation DESC
+FETCH FIRST 50 ROWS ONLY;

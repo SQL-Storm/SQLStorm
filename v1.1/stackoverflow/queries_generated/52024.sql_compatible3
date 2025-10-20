@@ -1,0 +1,114 @@
+WITH UserMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalViews,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        COUNT(DISTINCT v.Id) AS TotalVotesReceived,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpvotesReceived,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownvotesReceived
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId IN (2, 3)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+UserComments AS (
+    SELECT 
+        UserId,
+        COUNT(*) AS CommentCount,
+        AVG(Score) AS AvgCommentScore
+    FROM Comments
+    WHERE UserId IS NOT NULL
+    GROUP BY UserId
+),
+TagSplit AS (
+    -- Recursive splitting of tags string like "<a><b><c>" into rows: TagPosition starts at 1
+    SELECT
+        Id AS post_id,
+        CASE
+            WHEN Tags IS NULL THEN NULL
+            ELSE
+                CASE
+                    WHEN SUBSTR(Tags, 1, 1) = '<' THEN
+                        CASE WHEN SUBSTR(Tags, LENGTH(Tags), 1) = '>' THEN SUBSTR(Tags, 2, LENGTH(Tags) - 2) ELSE SUBSTR(Tags, 2) END
+                    ELSE
+                        CASE WHEN SUBSTR(Tags, LENGTH(Tags), 1) = '>' THEN SUBSTR(Tags, 1, LENGTH(Tags) - 1) ELSE Tags END
+                END
+        END AS rest,
+        NULL AS tag,
+        1 AS tag_pos
+    FROM Posts
+    WHERE Tags IS NOT NULL
+
+    UNION ALL
+
+    SELECT
+        post_id,
+        CASE
+            WHEN INSTR(rest, '><') > 0 THEN SUBSTR(rest, INSTR(rest, '><') + 2)
+            ELSE NULL
+        END AS rest,
+        CASE
+            WHEN INSTR(rest, '><') > 0 THEN SUBSTR(rest, 1, INSTR(rest, '><') - 1)
+            ELSE rest
+        END AS tag,
+        tag_pos + 1
+    FROM TagSplit
+    WHERE rest IS NOT NULL AND rest <> ''
+),
+TopTagsFinal AS (
+    SELECT
+        um.Id AS UserId,
+        TRIM(ts.tag) AS TagName,
+        COUNT(*) AS TagUsage
+    FROM UserMetrics um
+    JOIN Posts p ON p.OwnerUserId = um.Id AND p.PostTypeId = 1
+    JOIN TagSplit ts ON ts.post_id = p.Id AND ts.tag IS NOT NULL
+    JOIN Tags tg ON tg.TagName = TRIM(ts.tag)
+    GROUP BY um.Id, TRIM(ts.tag)
+),
+TopTagPerUser AS (
+    SELECT 
+        UserId,
+        TagName AS MostUsedTag,
+        TagUsage,
+        ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY TagUsage DESC, TagName) AS rn
+    FROM TopTagsFinal
+)
+SELECT 
+    um.Id,
+    um.DisplayName,
+    um.Reputation,
+    um.CreationDate,
+    um.LastAccessDate,
+    um.QuestionCount,
+    um.AnswerCount,
+    um.TotalPostScore,
+    um.TotalViews,
+    um.TotalBadges,
+    um.GoldBadges,
+    um.SilverBadges,
+    um.BronzeBadges,
+    um.TotalVotesReceived,
+    um.UpvotesReceived,
+    um.DownvotesReceived,
+    uc.CommentCount,
+    uc.AvgCommentScore,
+    ttu.MostUsedTag,
+    ttu.TagUsage AS MostUsedTagCount,
+    (um.Reputation * 0.5 + um.TotalPostScore * 0.3 + um.TotalViews * 0.1 + um.TotalBadges * 10 + um.GoldBadges * 100 + COALESCE(uc.CommentCount,0) * 0.01) AS CompositeScore
+FROM UserMetrics um
+LEFT JOIN UserComments uc ON uc.UserId = um.Id
+LEFT JOIN TopTagPerUser ttu ON ttu.UserId = um.Id AND ttu.rn = 1
+ORDER BY CompositeScore DESC
+LIMIT 100;

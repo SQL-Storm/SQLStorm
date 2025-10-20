@@ -1,0 +1,128 @@
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(p.Score) AS TotalScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount END) AS AvgQuestionViews,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpvotesReceived,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.Id END) AS EditCount
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN 
+        Comments c ON p.Id = c.PostId AND u.Id = c.UserId
+    LEFT JOIN 
+        PostHistory ph ON p.Id = ph.PostId AND u.Id = ph.UserId
+    WHERE 
+        u.CreationDate >= DATE '2010-01-01' AND u.Reputation > 1000
+    GROUP BY 
+        u.Id, u.Reputation
+),
+TagPopularity AS (
+    SELECT 
+        t.Id AS TagId,
+        t.TagName,
+        t.Count AS QuestionCount,
+        COUNT(DISTINCT pl.RelatedPostId) AS LinkedPosts,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM 
+        Tags t
+    LEFT JOIN 
+        Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    LEFT JOIN 
+        PostLinks pl ON p.Id = pl.PostId AND pl.LinkTypeId = 3
+    GROUP BY 
+        t.Id, t.TagName, t.Count
+    HAVING 
+        t.Count > 500
+),
+BadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        MAX(b.Date) AS LatestBadgeDate
+    FROM 
+        Badges b
+    WHERE 
+        b.TagBased = TRUE
+    GROUP BY 
+        b.UserId
+),
+UserTagStats AS (
+    SELECT
+        ua.UserId,
+        tp.TagName,
+        tp.QuestionCount
+    FROM
+        UserActivity ua
+    LEFT JOIN
+        Posts p ON ua.UserId = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN
+        TagPopularity tp ON p.Tags LIKE '%' || tp.TagName || '%' AND tp.TagRank <= 10
+    WHERE
+        ua.PostCount > 50
+)
+SELECT 
+    ua.UserId,
+    ua.Reputation,
+    ua.PostCount,
+    ua.TotalScore,
+    ua.AvgQuestionViews,
+    ua.UpvotesReceived,
+    ua.CommentCount,
+    ua.EditCount,
+    bs.BadgeCount,
+    bs.GoldBadges,
+    bs.SilverBadges,
+    bs.LatestBadgeDate,
+    STRING_AGG(tp.TagName, ', ') AS TopTags,
+    med.MedianTagQuestions
+FROM 
+    UserActivity ua
+LEFT JOIN 
+    BadgeStats bs ON ua.UserId = bs.UserId
+LEFT JOIN 
+    Posts p ON ua.UserId = p.OwnerUserId AND p.PostTypeId = 1
+LEFT JOIN 
+    TagPopularity tp ON p.Tags LIKE '%' || tp.TagName || '%' AND tp.TagRank <= 10
+LEFT JOIN (
+    SELECT
+        uts.UserId,
+        CASE
+            WHEN COUNT(*) = 0 THEN NULL
+            WHEN MOD(COUNT(*), 2) = 1 THEN
+                (ARRAY_AGG(uts.QuestionCount ORDER BY uts.QuestionCount))[ (COUNT(*)+1)/2 ]
+            ELSE
+                (
+                    (CAST((ARRAY_AGG(uts.QuestionCount ORDER BY uts.QuestionCount))[ COUNT(*)/2 ] AS NUMERIC))
+                    +
+                    (CAST((ARRAY_AGG(uts.QuestionCount ORDER BY uts.QuestionCount))[ COUNT(*)/2 + 1 ] AS NUMERIC))
+                ) / 2
+        END AS MedianTagQuestions
+    FROM
+        UserTagStats uts
+    GROUP BY
+        uts.UserId
+) med ON ua.UserId = med.UserId
+WHERE 
+    ua.PostCount > 50
+    AND EXISTS (
+        SELECT 1 
+        FROM Votes v2 
+        WHERE v2.PostId = p.Id 
+          AND v2.VoteTypeId IN (8,9) 
+          AND COALESCE(v2.BountyAmount, 0) > 0
+    )
+GROUP BY 
+    ua.UserId, ua.Reputation, ua.PostCount, ua.TotalScore, ua.AvgQuestionViews, ua.UpvotesReceived, ua.CommentCount, ua.EditCount,
+    bs.BadgeCount, bs.GoldBadges, bs.SilverBadges, bs.LatestBadgeDate, med.MedianTagQuestions
+ORDER BY 
+    ua.Reputation DESC, ua.EditCount DESC
+LIMIT 100;

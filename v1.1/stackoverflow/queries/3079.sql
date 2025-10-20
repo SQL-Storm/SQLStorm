@@ -1,0 +1,149 @@
+WITH UserPostStats AS (
+    SELECT 
+        U.Id AS UserId,
+        U.DisplayName,
+        COUNT(CASE WHEN P.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN P.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        AVG(CASE WHEN P.Score IS NOT NULL THEN P.Score END) AS AvgScore,
+        SUM(COALESCE(P.ViewCount, 0)) AS TotalViews,
+        MAX(P.CreationDate) AS LastPostDate,
+        MAX(U.Reputation) AS Reputation
+    FROM 
+        Users U
+        LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    GROUP BY 
+        U.Id, U.DisplayName
+),
+BadgeCounts AS (
+    SELECT
+        U.Id AS UserId,
+        COUNT(DISTINCT CASE WHEN B.Class = 1 THEN B.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN B.Class = 2 THEN B.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN B.Class = 3 THEN B.Id END) AS BronzeBadges
+    FROM
+        Users U
+        LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id
+),
+PostHistorySummary AS (
+    SELECT
+        PH.PostId,
+        COUNT(*) FILTER (WHERE PHT.Name LIKE '%Edit%') AS EditCount,
+        COUNT(*) FILTER (WHERE PHT.Name LIKE '%Rollback%') AS RollbackCount,
+        MAX(PH.CreationDate) AS LastHistoryChange
+    FROM
+        PostHistory PH
+        JOIN PostHistoryTypes PHT ON PH.PostHistoryTypeId = PHT.Id
+    GROUP BY PH.PostId
+),
+AnswerParentMapping AS (
+    SELECT
+        P.Id AS AnswerId,
+        P.ParentId AS QuestionId,
+        Q.Title AS QuestionTitle
+    FROM
+        Posts P
+        JOIN Posts Q ON P.ParentId = Q.Id
+    WHERE
+        P.PostTypeId = 2
+),
+ActiveQuestions AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.Title,
+        Q.Tags,
+        Q.CreationDate,
+        Q.Score,
+        Q.ViewCount,
+        Q.AnswerCount,
+        Q.CommentCount,
+        COALESCE(O.DisplayName, '') AS LastEditorDisplayName
+    FROM
+        Posts Q
+        LEFT JOIN Users O ON Q.LastEditorUserId = O.Id
+    WHERE
+        Q.PostTypeId = 1
+        AND Q.ClosedDate IS NULL
+),
+ComplexPredicate AS (
+    SELECT
+        *
+    FROM
+        ActiveQuestions AQ
+    WHERE
+        (AQ.Score > 5 AND AQ.ViewCount > 1000)
+        OR
+        (POSITION('bug' IN LOWER(AQ.Title)) > 0 AND AQ.AnswerCount > 2)
+),
+LatestPostHistoryPerPost AS (
+    SELECT * FROM (
+        SELECT PH.*, ROW_NUMBER() OVER (PARTITION BY PostId ORDER BY CreationDate DESC) AS rn
+        FROM PostHistory PH
+    ) sub WHERE rn = 1
+)
+SELECT
+    UP.UserId,
+    UP.DisplayName,
+    UP.QuestionCount,
+    UP.AnswerCount,
+    UP.AvgScore,
+    UP.TotalViews,
+    UP.LastPostDate,
+    BC.GoldBadges,
+    BC.SilverBadges,
+    BC.BronzeBadges,
+    COUNT(DISTINCT PHS.PostId) AS TotalEdits,
+    0 AS TotalRollbacks,
+    MAX(PHS.LastHistoryChange) AS LastHistoryUpdate,
+    COUNT(DISTINCT AP.Id) AS TotalAnswers,
+    COUNT(DISTINCT QV.Id) AS Upvotes,
+    COUNT(DISTINCT DV.Id) AS Downvotes
+FROM
+    UserPostStats UP
+    LEFT JOIN BadgeCounts BC ON UP.UserId = BC.UserId
+    LEFT JOIN PostHistorySummary PHS ON PHS.PostId IN (
+        SELECT P.Id FROM Posts P WHERE P.OwnerUserId = UP.UserId
+    )
+    LEFT JOIN Posts AP ON AP.OwnerUserId = UP.UserId AND AP.PostTypeId = 2
+    LEFT JOIN PostLinks PL ON PL.PostId = AP.Id AND PL.LinkTypeId = 3
+    LEFT JOIN Posts QV ON QV.OwnerUserId = UP.UserId AND QV.PostTypeId = 1 AND QV.Score > 0
+    LEFT JOIN Posts DV ON DV.OwnerUserId = UP.UserId AND DV.PostTypeId = 1 AND DV.Score < 0
+    LEFT JOIN AnswerParentMapping APM ON APM.AnswerId = AP.Id
+    LEFT JOIN Posts Q ON APM.QuestionId = Q.Id
+    LEFT JOIN Posts Qs ON Qs.Id = APM.QuestionId
+    LEFT JOIN LatestPostHistoryPerPost AH2 ON AH2.PostId = Q.Id AND AH2.PostHistoryTypeId IN (4,5,6)
+WHERE
+    (APM.QuestionId IS NOT NULL
+     AND (
+        (UP.Reputation > 1000 AND EXISTS (SELECT 1 FROM Comments C WHERE C.PostId = Q.Id AND C.Score >= 2))
+        OR (UP.Reputation BETWEEN 100 AND 1000 AND Q.Score > 10)
+        OR (UP.Reputation < 100 AND Q.Tags LIKE '%performance%')
+     )
+     AND (
+        (Q.Score > 5 AND Q.ViewCount > 1000)
+        OR (POSITION('bug' IN LOWER(Q.Title)) > 0 AND Q.AnswerCount > 2)
+     )
+    )
+GROUP BY
+    UP.UserId,
+    UP.DisplayName,
+    UP.QuestionCount,
+    UP.AnswerCount,
+    UP.AvgScore,
+    UP.TotalViews,
+    UP.LastPostDate,
+    BC.GoldBadges,
+    BC.SilverBadges,
+    BC.BronzeBadges,
+    PHS.PostId,
+    PHS.LastHistoryChange,
+    AP.Id,
+    QV.Id,
+    DV.Id,
+    APM.AnswerId,
+    APM.QuestionId,
+    Q.Id,
+    Qs.Id,
+    AH2.PostId,
+    AH2.PostHistoryTypeId,
+    UP.Reputation;

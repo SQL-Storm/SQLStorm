@@ -1,0 +1,158 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.DisplayName,
+        u.LastAccessDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(p.Id) AS PostCount,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(v.Id) AS VoteCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate, u.DisplayName, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+HighReputationUsers AS (
+    SELECT
+        UserId,
+        Reputation,
+        UserCreationDate,
+        DisplayName,
+        LastAccessDate,
+        Views,
+        UpVotes,
+        DownVotes,
+        PostCount,
+        CommentCount,
+        VoteCount,
+        BadgeCount,
+        LastPostDate,
+        LastCommentDate,
+        LastVoteDate
+    FROM
+        UserActivity
+    WHERE
+        Reputation > 1000
+),
+RecentPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.OwnerDisplayName,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount AS PostCommentCount,
+        p.LastActivityDate,
+        COALESCE(p.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+        COALESCE(p.ParentId, -1) AS ParentId,
+        COUNT(v.Id) AS VoteCount,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(DISTINCT l.RelatedPostId) AS RelatedPostCount,
+        MAX(ph.CreationDate) AS LastEditDate,
+        STRING_AGG(t.TagName, ', ') AS TagList
+    FROM
+        Posts p
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN
+        PostLinks l ON p.Id = l.PostId
+    LEFT JOIN
+        PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN
+        Tags t ON p.Id = t.ExcerptPostId OR p.Id = t.WikiPostId
+    WHERE
+        p.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months')
+    GROUP BY
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId, p.OwnerDisplayName, p.Title, p.Tags, p.AnswerCount, p.CommentCount, p.LastActivityDate, p.AcceptedAnswerId, p.ParentId
+),
+TopPosts AS (
+    SELECT
+        PostId,
+        PostTypeId,
+        PostCreationDate,
+        Score,
+        ViewCount,
+        OwnerUserId,
+        OwnerDisplayName,
+        Title,
+        Tags,
+        AnswerCount,
+        PostCommentCount,
+        CommentCount AS CmntCount,
+        LastActivityDate,
+        AcceptedAnswerId,
+        ParentId,
+        VoteCount,
+        RelatedPostCount,
+        LastEditDate,
+        TagList,
+        ROW_NUMBER() OVER (PARTITION BY PostTypeId ORDER BY Score DESC, ViewCount DESC) AS Rank
+    FROM
+        RecentPosts
+)
+SELECT
+    hr.UserId,
+    hr.Reputation,
+    hr.UserCreationDate,
+    hr.DisplayName,
+    hr.LastAccessDate,
+    hr.Views,
+    hr.UpVotes,
+    hr.DownVotes,
+    hr.PostCount,
+    hr.CommentCount,
+    hr.VoteCount,
+    hr.BadgeCount,
+    hr.LastPostDate,
+    hr.LastCommentDate,
+    hr.LastVoteDate,
+    tp.PostId,
+    tp.PostTypeId,
+    tp.PostCreationDate,
+    tp.Score,
+    tp.ViewCount,
+    tp.OwnerUserId,
+    tp.OwnerDisplayName,
+    tp.Title,
+    tp.Tags,
+    tp.AnswerCount,
+    tp.CmntCount AS CommentCount,
+    tp.LastActivityDate,
+    tp.AcceptedAnswerId,
+    tp.ParentId,
+    tp.VoteCount,
+    tp.RelatedPostCount,
+    tp.LastEditDate,
+    tp.TagList,
+    tp.Rank
+FROM
+    HighReputationUsers hr
+LEFT JOIN
+    TopPosts tp ON hr.UserId = tp.OwnerUserId
+WHERE
+    tp.Rank <= 10 OR tp.Rank IS NULL
+ORDER BY
+    hr.Reputation DESC, tp.Score DESC, tp.ViewCount DESC;

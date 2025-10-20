@@ -1,0 +1,121 @@
+WITH TopUsersByReputation AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        EXTRACT(YEAR FROM u.CreationDate) AS JoinYear,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation DESC) AS YearRank
+    FROM Users u
+    WHERE u.Reputation > 1000
+),
+QuestionMetrics AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        COALESCE(p.AcceptedAnswerId, 0) AS HasAcceptedAnswer,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedCount,
+        SUM(CASE WHEN pl2.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateCount,
+        -- normalize tags by removing leading/trailing angle brackets and splitting; ANSI SQL alternative to string_to_array is left to dialect, keep as expression that most can support
+        TRIM(BOTH '<>' FROM p.Tags) AS TagsTrimmed
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    LEFT JOIN PostLinks pl2 ON p.Id = pl2.RelatedPostId AND pl2.LinkTypeId = 3
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= DATE '2020-01-01'
+        AND p.Score >= 5
+    GROUP BY p.Id, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, 
+             p.AnswerCount, p.CommentCount, p.FavoriteCount, p.AcceptedAnswerId, p.Tags
+),
+AnswerPerformance AS (
+    SELECT 
+        a.ParentId AS QuestionId,
+        a.OwnerUserId AS AnswererId,
+        COUNT(*) AS AnswerCount,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        SUM(CASE WHEN p.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END) AS AcceptedAnswerCount,
+        SUM(CASE WHEN a.CreationDate <= p.CreationDate + INTERVAL '1' HOUR THEN 1 ELSE 0 END) AS FastAnswers
+    FROM Posts a
+    INNER JOIN Posts p ON a.ParentId = p.Id
+    WHERE a.PostTypeId = 2
+        AND a.CreationDate >= DATE '2020-01-01'
+    GROUP BY a.ParentId, a.OwnerUserId
+),
+BadgeAchievements AS (
+    SELECT 
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        -- ensure boolean/integer mix handled: compare true/false with standard SQL boolean or numeric explicitly
+        SUM(CASE WHEN (CASE WHEN b.TagBased IS NULL THEN 0 WHEN b.TagBased IN (TRUE, 1) THEN 1 ELSE 0 END) = 1 THEN 1 ELSE 0 END) AS TagBasedBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    WHERE b.Date >= DATE '2020-01-01'
+    GROUP BY b.UserId
+),
+EditActivity AS (
+    SELECT 
+        ph.PostId,
+        ph.UserId,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 24 THEN ph.Id END) AS SuggestedEditCount,
+        MIN(ph.CreationDate) AS FirstEditDate,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM PostHistory ph
+    WHERE ph.CreationDate >= DATE '2020-01-01'
+        AND ph.PostHistoryTypeId IN (4, 5, 6, 24)
+    GROUP BY ph.PostId, ph.UserId
+)
+SELECT 
+    tu.DisplayName,
+    tu.Reputation,
+    tu.JoinYear,
+    tu.YearRank,
+    COUNT(DISTINCT qm.QuestionId) AS QuestionsAsked,
+    ROUND(AVG(qm.Score), 2) AS AvgQuestionScore,
+    ROUND(AVG(qm.ViewCount), 2) AS AvgViewCount,
+    SUM(qm.UpVotes) AS TotalQuestionUpvotes,
+    SUM(qm.DownVotes) AS TotalQuestionDownvotes,
+    ROUND(AVG(qm.AnswerCount), 2) AS AvgAnswersReceived,
+    COUNT(DISTINCT CASE WHEN qm.HasAcceptedAnswer > 0 THEN qm.QuestionId END) AS QuestionsWithAcceptedAnswer,
+    COALESCE(SUM(ap.AnswerCount), 0) AS TotalAnswersProvided,
+    ROUND(COALESCE(AVG(ap.AvgAnswerScore), 0), 2) AS AvgAnswerScore,
+    COALESCE(SUM(ap.AcceptedAnswerCount), 0) AS TotalAcceptedAnswers,
+    COALESCE(ba.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ba.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ba.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(SUM(ea.EditCount), 0) AS TotalEdits,
+    COALESCE(SUM(ea.SuggestedEditCount), 0) AS SuggestedEdits,
+    ROUND(AVG(qm.LinkedCount), 2) AS AvgLinksPerQuestion,
+    CASE 
+        WHEN COUNT(DISTINCT qm.QuestionId) > 0 
+        THEN ROUND(COALESCE(SUM(ap.AnswerCount), 0) * 1.0 / COUNT(DISTINCT qm.QuestionId), 2)
+        ELSE 0 
+    END AS AnswerToQuestionRatio,
+    CASE 
+        WHEN COALESCE(SUM(ap.AnswerCount), 0) > 0 
+        THEN ROUND(COALESCE(SUM(ap.AcceptedAnswerCount), 0) * 100.0 / SUM(ap.AnswerCount), 2)
+        ELSE 0 
+    END AS AcceptanceRate
+FROM TopUsersByReputation tu
+LEFT JOIN QuestionMetrics qm ON tu.Id = qm.OwnerUserId
+LEFT JOIN AnswerPerformance ap ON tu.Id = ap.AnswererId
+LEFT JOIN BadgeAchievements ba ON tu.Id = ba.UserId
+LEFT JOIN EditActivity ea ON tu.Id = ea.UserId
+WHERE tu.YearRank <= 100
+GROUP BY tu.Id, tu.DisplayName, tu.Reputation, tu.JoinYear, tu.YearRank,
+         ba.GoldBadges, ba.SilverBadges, ba.BronzeBadges
+HAVING COUNT(DISTINCT qm.QuestionId) > 0 OR COALESCE(SUM(ap.AnswerCount), 0) > 0
+ORDER BY tu.Reputation DESC, TotalAcceptedAnswers DESC, tu.YearRank
+LIMIT 500;

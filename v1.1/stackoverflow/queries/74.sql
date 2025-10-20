@@ -1,4 +1,4 @@
--- {"query": "74.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-3.5-turbo", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2003, "output_tokens": 306} 
+-- {"query": "74.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-3.5-turbo", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2003, "output_tokens": 306} 
 WITH cte1 AS (
     SELECT P.Id, P.Title, P.Score, P.CreationDate, U.DisplayName AS OwnerDisplayName
     FROM Posts P

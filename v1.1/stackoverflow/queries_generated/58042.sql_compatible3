@@ -1,0 +1,53 @@
+WITH TopUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation, u.CreationDate,
+           (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+           RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    WHERE u.Reputation > 10000
+),
+UserPosts AS (
+    SELECT p.OwnerUserId, p.Id AS PostId, p.Title, p.Score, p.ViewCount, p.Tags,
+           (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+           (SELECT SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) FROM Votes v WHERE v.PostId = p.Id) AS Upvotes,
+           (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6)) AS EditCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.CreationDate > DATE '2020-01-01'
+),
+TagPairs AS (
+    SELECT DISTINCT p.OwnerUserId, p.PostId,
+           -- convert tags like '<tag1><tag2>' into 'tag1,tag2' using generic functions
+           REPLACE(SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)), '><', ',') AS TagList
+    FROM UserPosts p
+),
+-- split TagList into rows in a more generic way using a recursive split for wider dialect compatibility
+TagListExpanded AS (
+    SELECT tp.OwnerUserId, tp.PostId,
+           TRIM(SUBSTRING(tp.TagList FROM 1 FOR (CASE WHEN POSITION(',' IN tp.TagList) = 0 THEN CHAR_LENGTH(tp.TagList) ELSE POSITION(',' IN tp.TagList) - 1 END))) AS Tag,
+           CASE WHEN POSITION(',' IN tp.TagList) = 0 THEN '' ELSE SUBSTRING(tp.TagList FROM POSITION(',' IN tp.TagList) + 1) END AS Rest
+    FROM TagPairs tp
+    UNION ALL
+    SELECT tle.OwnerUserId, tle.PostId,
+           TRIM(SUBSTRING(tle.Rest FROM 1 FOR (CASE WHEN POSITION(',' IN tle.Rest) = 0 THEN CHAR_LENGTH(tle.Rest) ELSE POSITION(',' IN tle.Rest) - 1 END))) AS Tag,
+           CASE WHEN POSITION(',' IN tle.Rest) = 0 THEN '' ELSE SUBSTRING(tle.Rest FROM POSITION(',' IN tle.Rest) + 1) END AS Rest
+    FROM TagListExpanded tle
+    WHERE tle.Rest <> ''
+),
+TagUsage AS (
+    SELECT t.TagName, COUNT(tle.PostId) AS UsageCount, tle.OwnerUserId
+    FROM Tags t
+    JOIN TagListExpanded tle ON tle.Tag = t.TagName
+    GROUP BY t.TagName, tle.OwnerUserId
+)
+SELECT tu.Id, tu.DisplayName, tu.GoldBadges, tu.ReputationRank,
+       up.PostId, up.Title, up.Score, up.CommentCount, up.Upvotes, up.EditCount,
+       STRING_AGG(tu_agg.TagName, ', ' ORDER BY tu_agg.UsageCount DESC) AS TopTags,
+       AVG(up.Score) OVER (PARTITION BY tu.Id) AS AvgPostScore,
+       MAX(up.ViewCount) OVER () AS MaxGlobalViews
+FROM TopUsers tu
+JOIN UserPosts up ON tu.Id = up.OwnerUserId
+LEFT JOIN TagUsage tu_agg ON tu.Id = tu_agg.OwnerUserId
+GROUP BY tu.Id, tu.DisplayName, tu.GoldBadges, tu.ReputationRank,
+         up.PostId, up.Title, up.Score, up.CommentCount, up.Upvotes, up.EditCount
+HAVING AVG(up.Score) > 10 AND SUM(COALESCE(up.Upvotes,0)) > 50
+ORDER BY tu.ReputationRank, up.Score DESC
+LIMIT 100;

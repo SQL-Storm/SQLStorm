@@ -1,4 +1,4 @@
--- {"query": "14035.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 84060, "output_tokens": 36254} 
+-- {"query": "14035.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 84060, "output_tokens": 36254} 
 WITH cte AS (
     SELECT 
         p.Id, 

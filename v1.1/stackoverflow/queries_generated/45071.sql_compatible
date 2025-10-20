@@ -1,0 +1,55 @@
+WITH RankedUserPosts AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.Score,
+        p.Tags,
+        p.PostTypeId,
+        DENSE_RANK() OVER (PARTITION BY u.Id ORDER BY p.Score DESC) AS ScoreRank,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) OVER (PARTITION BY u.Id) AS UpVoteCount
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.CreationDate > '2015-01-01'
+),
+TagBreakdown AS (
+    SELECT 
+        rup.UserId,
+        rup.DisplayName,
+        -- split tags like '<tag1><tag2>' into rows, then aggregate distinct back into an array
+        ARRAY(
+            SELECT DISTINCT tag
+            FROM (
+                SELECT TRIM(tag) AS tag
+                FROM (
+                    SELECT regexp_split_to_table(
+                        CASE 
+                            WHEN rup.Tags IS NULL THEN ''
+                            WHEN left(rup.Tags,1) = '<' AND right(rup.Tags,1) = '>' THEN substring(rup.Tags FROM 2 FOR char_length(rup.Tags)-2)
+                            ELSE rup.Tags
+                        END,
+                        '><'
+                    ) AS tag
+                ) s1
+            ) s2
+            WHERE tag <> ''
+            ORDER BY tag
+        ) AS UniqueTagsList
+    FROM RankedUserPosts rup
+    WHERE rup.ScoreRank <= 3
+    GROUP BY rup.UserId, rup.DisplayName
+)
+SELECT 
+    t.DisplayName,
+    t.UserId,
+    cardinality(t.UniqueTagsList) AS UniqueTagCount,
+    ROUND(AVG(r.Score)::numeric, 2) AS AvgTopPostScore,
+    MAX(r.UpVoteCount) AS MaxUpVotes,
+    COUNT(DISTINCT r.PostId) AS TopPostCount
+FROM TagBreakdown t
+JOIN RankedUserPosts r ON t.UserId = r.UserId
+WHERE r.ScoreRank <= 3 AND r.PostTypeId = 1
+GROUP BY t.UserId, t.DisplayName, t.UniqueTagsList
+ORDER BY MaxUpVotes DESC, AvgTopPostScore DESC
+LIMIT 100;

@@ -1,0 +1,107 @@
+WITH
+    q AS (
+        SELECT
+            p.Id,
+            p.OwnerUserId,
+            p.CreationDate,
+            p.Score,
+            p.ViewCount,
+            p.Tags,
+            p.AnswerCount,
+            p.FavoriteCount,
+            p.CommentCount
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+    ),
+    a AS (
+        SELECT
+            p.ParentId AS QuestionId,
+            p.OwnerUserId,
+            p.CreationDate,
+            p.Score
+        FROM Posts p
+        WHERE p.PostTypeId = 2
+    ),
+    v AS (
+        SELECT
+            v.PostId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        GROUP BY v.PostId
+    ),
+    c AS (
+        SELECT
+            c.PostId,
+            COUNT(*) AS CommentCount
+        FROM Comments c
+        GROUP BY c.PostId
+    ),
+    t AS (
+        SELECT
+            t.TagName,
+            COUNT(p.Id) AS TagQuestionCount,
+            SUM(p.Score) AS TagScoreSum,
+            AVG(p.ViewCount) AS AvgViews
+        FROM Tags t
+        JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+        WHERE p.PostTypeId = 1
+        GROUP BY t.TagName
+    ),
+    us AS (
+        SELECT
+            u.Id AS UserId,
+            u.Reputation,
+            COUNT(DISTINCT q.Id) AS QuestionsAsked,
+            COUNT(DISTINCT a.QuestionId) AS AnswersGiven,
+            COALESCE(SUM(v.UpVotes), 0) AS TotalUpVotes,
+            COALESCE(SUM(v.DownVotes), 0) AS TotalDownVotes,
+            COALESCE(SUM(c.CommentCount), 0) AS TotalComments,
+            COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+            COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+            COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges
+        FROM Users u
+        LEFT JOIN q ON q.OwnerUserId = u.Id
+        LEFT JOIN a ON a.OwnerUserId = u.Id
+        LEFT JOIN v ON v.PostId = q.Id OR v.PostId = a.QuestionId
+        LEFT JOIN c ON c.PostId = q.Id OR c.PostId = a.QuestionId
+        LEFT JOIN Badges b ON b.UserId = u.Id
+        GROUP BY u.Id, u.Reputation
+    )
+SELECT
+    us.UserId,
+    us.Reputation,
+    us.QuestionsAsked,
+    us.AnswersGiven,
+    us.TotalUpVotes,
+    us.TotalDownVotes,
+    us.TotalComments,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    ROW_NUMBER() OVER (
+        ORDER BY (us.Reputation + us.TotalUpVotes * 10 - us.TotalDownVotes * 5) DESC
+    ) AS RankByActivity,
+    t.TagName,
+    t.TagQuestionCount,
+    t.TagScoreSum,
+    t.AvgViews
+FROM us
+LEFT JOIN LATERAL (
+    SELECT
+        s.tag AS Tag,
+        q.Id AS QuestionId
+    FROM q,
+    LATERAL (
+        SELECT UNNEST(
+            STRING_TO_ARRAY(
+                SUBSTRING(q.Tags FROM 2 FOR (CHAR_LENGTH(q.Tags) - 2)),
+                '><'
+            )
+        ) AS tag
+    ) s
+) qt ON true
+LEFT JOIN t ON t.TagName = qt.Tag
+WHERE us.UserId IS NOT NULL
+ORDER BY RankByActivity
+LIMIT 100;

@@ -1,0 +1,75 @@
+WITH recent_posts AS (
+  SELECT p.Id, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, u.Reputation, u.DisplayName, u.Location, p.OwnerUserId
+  FROM Posts p
+  JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 YEAR')
+  ORDER BY p.CreationDate DESC
+  LIMIT 1000000
+),
+popular_tags AS (
+  SELECT t.TagName, COUNT(*) AS tag_count, pt.PostId
+  FROM Tags t
+  JOIN Posts_Tags pt ON t.Id = pt.TagId
+  JOIN recent_posts p ON pt.PostId = p.Id
+  GROUP BY t.TagName, pt.PostId
+  ORDER BY tag_count DESC
+  LIMIT 1000
+),
+high_rep_users AS (
+  SELECT u.Id, u.DisplayName, u.Reputation, u.Location, COUNT(b.Id) AS badge_count
+  FROM Users u
+  LEFT JOIN Badges b ON u.Id = b.UserId
+  WHERE u.Reputation > 10000
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location
+  ORDER BY u.Reputation DESC
+  LIMIT 1000
+),
+closed_posts AS (
+  SELECT p.Id, p.CreationDate, p.ClosedDate, cr.Name AS close_reason
+  FROM Posts p
+  LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+  LEFT JOIN CloseReasonTypes cr ON CAST(ph.Comment AS INTEGER) = cr.Id
+  WHERE ph.PostHistoryTypeId = 10
+  ORDER BY p.ClosedDate DESC
+  LIMIT 100000
+),
+post_links AS (
+  SELECT pl.Id, pl.CreationDate, pl.PostId, pl.RelatedPostId, lt.Name AS link_type
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  WHERE pl.LinkTypeId IN (1, 3)
+  ORDER BY pl.CreationDate DESC
+  LIMIT 500000
+)
+SELECT
+  rp.Id AS recent_post_id,
+  rp.CreationDate AS recent_post_date,
+  rp.Score AS recent_post_score,
+  rp.ViewCount AS recent_post_views,
+  rp.AnswerCount AS recent_post_answers,
+  rp.CommentCount AS recent_post_comments,
+  rp.Reputation AS owner_reputation,
+  rp.DisplayName AS owner_display_name,
+  rp.Location AS owner_location,
+  pt.TagName AS popular_tag,
+  pt.tag_count AS popular_tag_count,
+  hu.Id AS high_rep_user_id,
+  hu.DisplayName AS high_rep_user_name,
+  hu.Reputation AS high_rep_user_reputation,
+  hu.Location AS high_rep_user_location,
+  hu.badge_count AS high_rep_user_badges,
+  cp.Id AS closed_post_id,
+  cp.CreationDate AS closed_post_date,
+  cp.ClosedDate AS closed_post_closed_date,
+  cp.close_reason AS closed_post_reason,
+  pl.Id AS post_link_id,
+  pl.CreationDate AS post_link_date,
+  pl.PostId AS post_link_post_id,
+  pl.RelatedPostId AS post_link_related_id,
+  pl.link_type AS post_link_type
+FROM recent_posts rp
+JOIN popular_tags pt ON rp.Id = pt.PostId
+JOIN high_rep_users hu ON rp.OwnerUserId = hu.Id
+JOIN closed_posts cp ON rp.Id = cp.Id
+JOIN post_links pl ON rp.Id = pl.PostId
+LIMIT 1;

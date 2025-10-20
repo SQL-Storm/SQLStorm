@@ -1,0 +1,42 @@
+SELECT 
+    u.Id AS UserId, 
+    u.DisplayName, 
+    u.Reputation, 
+    p.Id AS PostId, 
+    p.Title AS PostTitle, 
+    p.Score AS PostScore, 
+    COUNT(DISTINCT c.Id) AS CommentCount, 
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes, 
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes, 
+    COUNT(DISTINCT pb.Id) AS BadgeCount, 
+    dt.Name AS DistinctTag
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Comments c ON p.Id = c.PostId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    Badges pb ON u.Id = pb.UserId
+LEFT JOIN (
+    SELECT 
+        ph.UserId, 
+        ph.PostId, 
+        ph.Text AS TagText, 
+        TRIM(tag) AS TagName
+    FROM 
+        PostHistory ph,
+        UNNEST(STRING_TO_ARRAY(SUBSTRING(ph.Text FROM 2 FOR CHAR_LENGTH(ph.Text) - 2), '><')) AS tag
+    WHERE 
+        ph.PostHistoryTypeId = 6
+) t ON t.PostId = p.Id
+LEFT JOIN 
+    Tags dt ON dt.Name = t.TagName
+WHERE 
+    u.Reputation > 10000
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, p.Id, p.Title, p.Score, dt.Name
+ORDER BY 
+    u.Reputation DESC, BadgeCount DESC, UpVotes DESC;

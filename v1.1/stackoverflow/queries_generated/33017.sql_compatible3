@@ -1,0 +1,53 @@
+SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate AS PostCreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    u.Id AS OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate AS UserLastAccessDate,
+    COUNT(DISTINCT CASE WHEN vt.Name = 'UpMod' THEN v.Id ELSE NULL END) AS UpVotesCount,
+    COUNT(DISTINCT CASE WHEN vt.Name = 'DownMod' THEN v.Id ELSE NULL END) AS DownVotesCount,
+    COUNT(DISTINCT c.Id) AS CommentsCount,
+    LISTAGG(t.TagName, ',') WITHIN GROUP (ORDER BY t.TagName) AS Tags,
+    LISTAGG(CASE WHEN pl.LinkTypeId = 1 THEN CAST(pl.RelatedPostId AS VARCHAR) ELSE NULL END, ',') WITHIN GROUP (ORDER BY pl.RelatedPostId) AS LinkedPosts,
+    LISTAGG(CASE WHEN pl.LinkTypeId = 3 THEN CAST(pl.RelatedPostId AS VARCHAR) ELSE NULL END, ',') WITHIN GROUP (ORDER BY pl.RelatedPostId) AS Duplicates,
+    JSON_AGG(JSON_OBJECT('HistoryType' VALUE pht.Name, 'ChangeDate' VALUE ph.CreationDate)) AS PostHistory
+FROM
+    Posts p
+JOIN
+    PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN
+    Users u ON p.OwnerUserId = u.Id
+LEFT JOIN
+    Votes v ON p.Id = v.PostId
+LEFT JOIN
+    VoteTypes vt ON v.VoteTypeId = vt.Id
+LEFT JOIN
+    Comments c ON p.Id = c.PostId
+LEFT JOIN
+    PostTag ptg ON p.Id = ptg.PostId
+LEFT JOIN
+    Tags t ON ptg.TagId = t.Id
+LEFT JOIN
+    PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN
+    PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+WHERE
+    pt.Name IN ('Question', 'Answer')
+    AND p.CreationDate BETWEEN DATE '2022-01-01' AND DATE '2022-12-31'
+GROUP BY
+    p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount,
+    u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+    t.TagName, pl.RelatedPostId, pht.Name, ph.CreationDate
+ORDER BY
+    p.CreationDate DESC
+FETCH FIRST 100 ROWS ONLY;

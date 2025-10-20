@@ -1,0 +1,140 @@
+WITH top_users AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) AS PostCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersCount,
+        COUNT(c.Id) AS CommentCount,
+        SUM(COALESCE(p.Score,0)) AS TotalPostScore,
+        SUM(COALESCE(p.ViewCount,0)) AS TotalViews
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    WHERE u.Reputation >= 5000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(p.Id) > 50
+),
+user_badges AS (
+    SELECT
+        UserId,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges
+    GROUP BY UserId
+),
+-- Produce one row per tag by splitting Tags string using standard-string functions
+hot_questions_expanded AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.ViewCount,
+        p.Score,
+        TRIM(tag) AS tag
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        -- split tags string like '<tag1><tag2>' into rows
+        SELECT regexp_split_to_table(
+            -- remove leading and trailing angle brackets if present
+            CASE
+                WHEN p.Tags LIKE '<%>' THEN substring(p.Tags FROM 2 FOR char_length(p.Tags)-2)
+                ELSE p.Tags
+            END,
+            '><'
+        ) AS tag
+    ) s
+    WHERE p.PostTypeId = 1
+      AND p.ViewCount > 10000
+      AND p.Score > 10
+      AND p.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days')
+),
+tag_stats AS (
+    SELECT
+        tag,
+        COUNT(*) AS HotQuestionCount
+    FROM hot_questions_expanded
+    GROUP BY tag
+    HAVING COUNT(*) > 5
+),
+-- Aggregate per question from Posts (answers)
+answer_stats AS (
+    SELECT
+        p.ParentId AS QuestionId,
+        AVG(p.Score) AS AvgAnswerScore,
+        MAX(p.Score) AS MaxAnswerScore,
+        COUNT(*) AS AnswerCount
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+),
+-- Reconstruct hot_questions without ARRAY, but join to expanded tags when needed
+hot_questions AS (
+    SELECT DISTINCT
+        hqe.Id,
+        hqe.OwnerUserId,
+        hqe.Title,
+        hqe.CreationDate,
+        hqe.ViewCount,
+        hqe.Score
+    FROM hot_questions_expanded hqe
+)
+SELECT
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.PostCount,
+    tu.QuestionsCount,
+    tu.AnswersCount,
+    tu.CommentCount,
+    tu.TotalPostScore,
+    tu.TotalViews,
+    COALESCE(ub.GoldBadges,0) AS GoldBadges,
+    COALESCE(ub.SilverBadges,0) AS SilverBadges,
+    COALESCE(ub.BronzeBadges,0) AS BronzeBadges,
+    hq.Id AS HotQuestionId,
+    hq.Title AS HotQuestionTitle,
+    hq.CreationDate AS HotQuestionCreated,
+    hq.ViewCount AS HotQuestionViews,
+    hq.Score AS HotQuestionScore,
+    hqe.tag AS FrequentHotTag,
+    ts.HotQuestionCount,
+    astats.AvgAnswerScore,
+    astats.MaxAnswerScore,
+    astats.AnswerCount
+FROM top_users tu
+LEFT JOIN user_badges ub ON tu.UserId = ub.UserId
+LEFT JOIN hot_questions hq ON hq.OwnerUserId = tu.UserId
+-- join to expanded tag rows
+LEFT JOIN hot_questions_expanded hqe ON hqe.Id = hq.Id
+LEFT JOIN tag_stats ts ON ts.tag = hqe.tag
+LEFT JOIN answer_stats astats ON astats.QuestionId = hq.Id
+WHERE ts.tag IS NOT NULL
+GROUP BY
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.PostCount,
+    tu.QuestionsCount,
+    tu.AnswersCount,
+    tu.CommentCount,
+    tu.TotalPostScore,
+    tu.TotalViews,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    hq.Id,
+    hq.Title,
+    hq.CreationDate,
+    hq.ViewCount,
+    hq.Score,
+    hqe.tag,
+    ts.HotQuestionCount,
+    astats.AvgAnswerScore,
+    astats.MaxAnswerScore,
+    astats.AnswerCount
+ORDER BY tu.Reputation DESC, hq.ViewCount DESC, ts.HotQuestionCount DESC
+LIMIT 100;

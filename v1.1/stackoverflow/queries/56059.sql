@@ -1,0 +1,57 @@
+WITH top_users AS (
+  SELECT u.Id, u.DisplayName, SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS total_upvotes
+  FROM Users u
+  JOIN Posts p ON u.Id = p.OwnerUserId
+  JOIN Votes v ON p.Id = v.PostId
+  GROUP BY u.Id, u.DisplayName
+  ORDER BY SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) DESC
+  LIMIT 10
+),
+top_tags AS (
+  SELECT t.TagName, COUNT(DISTINCT p.Id) AS total_posts
+  FROM Tags t
+  JOIN Posts p ON t.Id = (
+    SELECT Id FROM Tags WHERE TagName = ANY(string_to_array(p.Tags, '<'))
+  )
+  GROUP BY t.TagName
+  ORDER BY COUNT(DISTINCT p.Id) DESC
+  LIMIT 5
+),
+question_answers AS (
+  SELECT p.Id, COUNT(a.Id) AS answer_count
+  FROM Posts p
+  JOIN Posts a ON p.Id = a.ParentId
+  WHERE p.PostTypeId = 1 AND a.PostTypeId = 2
+  GROUP BY p.Id
+)
+SELECT 
+  p.Id,
+  p.Title,
+  p.Score,
+  p.ViewCount,
+  p.AnswerCount,
+  p.CommentCount,
+  u.DisplayName AS owner,
+  u.Reputation,
+  qa.answer_count,
+  tu.total_upvotes,
+  tt.TagName
+FROM Posts p
+JOIN Users u ON p.OwnerUserId = u.Id
+JOIN question_answers qa ON p.Id = qa.Id
+JOIN top_users tu ON u.Id = tu.Id
+JOIN top_tags tt ON tt.TagName = ANY(string_to_array(p.Tags, '<'))
+WHERE p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL
+GROUP BY
+  p.Id,
+  p.Title,
+  p.Score,
+  p.ViewCount,
+  p.AnswerCount,
+  p.CommentCount,
+  u.DisplayName,
+  u.Reputation,
+  qa.answer_count,
+  tu.total_upvotes,
+  tt.TagName
+ORDER BY p.Score DESC, p.ViewCount DESC;

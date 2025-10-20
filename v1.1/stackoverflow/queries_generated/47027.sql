@@ -1,0 +1,138 @@
+-- {"query": "47027.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 61938, "output_tokens": 54683} 
+
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT p.Id) as QuestionCount,
+        1 as Level
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%<' || t.TagName || '>%'
+    WHERE p.PostTypeId = 1
+        AND t.Count > 1000
+    GROUP BY t.Id, t.TagName
+    
+    UNION ALL
+    
+    SELECT 
+        t.Id,
+        t.TagName,
+        th.QuestionCount,
+        th.Level + 1
+    FROM Tags t
+    INNER JOIN tag_hierarchy th ON th.Id != t.Id
+    WHERE th.Level < 3
+),
+user_expertise AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        t.TagName,
+        COUNT(DISTINCT p.Id) as AnswerCount,
+        SUM(p.Score) as TotalScore,
+        AVG(p.Score) as AvgScore,
+        COUNT(DISTINCT CASE WHEN p.Id = q.AcceptedAnswerId THEN p.Id END) as AcceptedAnswers,
+        DENSE_RANK() OVER (PARTITION BY t.TagName ORDER BY SUM(p.Score) DESC) as TagRank
+    FROM Users u
+    INNER JOIN Posts p ON p.OwnerUserId = u.Id
+    INNER JOIN Posts q ON q.Id = p.ParentId
+    INNER JOIN Tags t ON q.Tags LIKE '%<' || t.TagName || '>%'
+    WHERE p.PostTypeId = 2
+        AND u.Reputation > 5000
+        AND p.Score > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, t.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+monthly_activity AS (
+    SELECT 
+        DATE_TRUNC('month', p.CreationDate) as Month,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount END) as AvgViews,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) as MedianScore,
+        COUNT(DISTINCT p.OwnerUserId) as ActiveUsers
+    FROM Posts p
+    WHERE p.CreationDate >= CURRENT_DATE - INTERVAL '2 years'
+    GROUP BY DATE_TRUNC('month', p.CreationDate)
+),
+badge_progression AS (
+    SELECT 
+        b.UserId,
+        b.Name as BadgeName,
+        b.Class,
+        b.Date,
+        LAG(b.Date) OVER (PARTITION BY b.UserId, b.Class ORDER BY b.Date) as PreviousBadgeDate,
+        LEAD(b.Date) OVER (PARTITION BY b.UserId, b.Class ORDER BY b.Date) as NextBadgeDate,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId, b.Class ORDER BY b.Date) as BadgeSequence
+    FROM Badges b
+    WHERE b.TagBased = false
+),
+question_lifecycle AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.CreationDate as QuestionDate,
+        MIN(a.CreationDate) as FirstAnswerDate,
+        MAX(CASE WHEN a.Id = p.AcceptedAnswerId THEN a.CreationDate END) as AcceptedAnswerDate,
+        COUNT(DISTINCT a.Id) as TotalAnswers,
+        MAX(a.Score) as BestAnswerScore,
+        EXTRACT(EPOCH FROM (MIN(a.CreationDate) - p.CreationDate))/3600 as HoursToFirstAnswer,
+        EXTRACT(EPOCH FROM (MAX(CASE WHEN a.Id = p.AcceptedAnswerId THEN a.CreationDate END) - p.CreationDate))/86400 as DaysToAcceptance
+    FROM Posts p
+    LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    WHERE p.PostTypeId = 1
+        AND p.Score > 10
+        AND p.AnswerCount > 0
+    GROUP BY p.Id, p.Title, p.CreationDate
+)
+SELECT 
+    ue.DisplayName,
+    ue.Reputation,
+    ue.TagName,
+    ue.AnswerCount,
+    ue.TotalScore,
+    ue.AcceptedAnswers,
+    ue.TagRank,
+    COUNT(DISTINCT bp.BadgeName) as UniqueBadges,
+    SUM(CASE WHEN bp.Class = 1 THEN 1 ELSE 0 END) as GoldBadges,
+    SUM(CASE WHEN bp.Class = 2 THEN 1 ELSE 0 END) as SilverBadges,
+    SUM(CASE WHEN bp.Class = 3 THEN 1 ELSE 0 END) as BronzeBadges,
+    AVG(EXTRACT(EPOCH FROM (bp.NextBadgeDate - bp.Date))/86400) as AvgDaysBetweenBadges,
+    COUNT(DISTINCT ql.Id) as QuestionsAnswered,
+    AVG(ql.HoursToFirstAnswer) FILTER (WHERE ue.UserId IN (SELECT OwnerUserId FROM Posts WHERE Id = ql.Id)) as AvgHoursToAnswer,
+    COALESCE(AVG(ql.DaysToAcceptance) FILTER (WHERE ue.UserId IN (SELECT OwnerUserId FROM Posts WHERE Id IN (SELECT AcceptedAnswerId FROM Posts WHERE Id = ql.Id))), 0) as AvgDaysToGetAccepted,
+    ma.Questions as MonthlyQuestions,
+    ma.Answers as MonthlyAnswers,
+    ma.MedianScore as MonthlyMedianScore,
+    th.QuestionCount as TagQuestionCount,
+    RANK() OVER (ORDER BY ue.TotalScore DESC) as OverallRank,
+    DENSE_RANK() OVER (ORDER BY ue.Reputation DESC) as ReputationRank,
+    NTILE(100) OVER (ORDER BY ue.TotalScore) as Percentile
+FROM user_expertise ue
+LEFT JOIN badge_progression bp ON bp.UserId = ue.UserId
+LEFT JOIN question_lifecycle ql ON ql.Id IN (
+    SELECT p.ParentId 
+    FROM Posts p 
+    WHERE p.OwnerUserId = ue.UserId 
+        AND p.PostTypeId = 2
+)
+LEFT JOIN monthly_activity ma ON ma.Month = DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1 month')
+LEFT JOIN tag_hierarchy th ON th.TagName = ue.TagName
+WHERE ue.TagRank <= 10
+GROUP BY 
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.TagName,
+    ue.AnswerCount,
+    ue.TotalScore,
+    ue.AcceptedAnswers,
+    ue.TagRank,
+    ma.Questions,
+    ma.Answers,
+    ma.MedianScore,
+    th.QuestionCount
+HAVING COUNT(DISTINCT bp.BadgeName) > 5
+ORDER BY ue.TotalScore DESC, ue.Reputation DESC
+LIMIT 100;

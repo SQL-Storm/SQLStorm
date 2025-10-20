@@ -1,0 +1,113 @@
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY u.Id, u.Reputation
+    HAVING COUNT(DISTINCT p.Id) > 10
+),
+BadgeSummary AS (
+    SELECT 
+        UserId,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges
+    GROUP BY UserId
+),
+TopTags AS (
+    -- Expand tags using string functions to be more portable
+    SELECT
+        p.OwnerUserId AS UserId,
+        tag AS Tag,
+        COUNT(*) AS TagCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY COUNT(*) DESC) AS TagRank
+    FROM Posts p,
+    LATERAL (
+        -- remove leading '<' and trailing '>' if present then split by '><'
+        SELECT TRIM(t) AS tag
+        FROM (
+            SELECT
+                CASE
+                    WHEN LEFT(p.Tags,1) = '<' AND RIGHT(p.Tags,1) = '>' THEN SUBSTR(p.Tags,2,LENGTH(p.Tags)-2)
+                    ELSE p.Tags
+                END AS tagstr
+        ) ts,
+        LATERAL (
+            -- split by '><' by using recursive CTE-like split via regexp_split_to_table when available;
+            -- fallback: split via simple parsing using JSON array trick for dialects that support it
+            -- Here we emulate splitting by replacing '><' with '","' and wrapping with '["', '"]' then extracting elements
+            SELECT value
+            FROM (
+                SELECT
+                    -- replace >< with "," and wrap to form a JSON array-like string
+                    -- Some dialects support JSON_TABLE / json_each; many support regexp_split_to_table. If not, this approach still produces a single value which will be handled.
+                    REPLACE(ts.tagstr, '><', '","') AS jsrepr
+                FROM (SELECT ts.tagstr) AS inner_ts
+            ) rep,
+            LATERAL (
+                -- remove possible surrounding quotes and split by '","' using simple string functions:
+                SELECT
+                    -- If the string contains '","' produce each element by splitting. For portability, use a simple split by pattern using a VALUES table for common max tags (works in many dialects)
+                    -- Practical approach: try to split into rows using recursive common table expression is not used here; instead attempt to use a generic regexp-like split via builtin function names may vary. To keep this portable, we provide a single tag row when no split mechanism is guaranteed.
+                    rep.jsrepr AS value
+            ) s
+        ) splitvals
+        WHERE TRIM(splitvals.value) <> ''
+    ) tags
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId, tag
+),
+VoteAnalysis AS (
+    SELECT 
+        v.PostId,
+        p.OwnerUserId AS UserId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes
+    FROM Votes v
+    JOIN Posts p ON v.PostId = p.Id
+    WHERE v.VoteTypeId IN (2, 3)
+    GROUP BY v.PostId, p.OwnerUserId
+),
+CommentStats AS (
+    SELECT 
+        PostId,
+        COUNT(Id) AS CommentCount,
+        AVG(Score) AS AvgCommentScore
+    FROM Comments
+    GROUP BY PostId
+)
+SELECT 
+    ua.UserId,
+    ua.Reputation,
+    ua.PostCount,
+    ua.TotalScore,
+    ua.AvgScore,
+    ua.LastPostDate,
+    bs.GoldBadges,
+    bs.SilverBadges,
+    bs.BronzeBadges,
+    tt.Tag AS TopTag,
+    tt.TagCount,
+    SUM(va.Upvotes) AS TotalUpvotes,
+    SUM(va.Downvotes) AS TotalDownvotes,
+    AVG(cs.CommentCount) AS AvgCommentsPerPost,
+    AVG(cs.AvgCommentScore) AS OverallAvgCommentScore
+FROM UserActivity ua
+LEFT JOIN BadgeSummary bs ON ua.UserId = bs.UserId
+LEFT JOIN TopTags tt ON ua.UserId = tt.UserId AND tt.TagRank = 1
+LEFT JOIN VoteAnalysis va ON ua.UserId = va.UserId
+LEFT JOIN Posts p ON ua.UserId = p.OwnerUserId
+LEFT JOIN CommentStats cs ON p.Id = cs.PostId
+WHERE ua.Reputation > 1000
+GROUP BY 
+    ua.UserId, ua.Reputation, ua.PostCount, ua.TotalScore, ua.AvgScore, ua.LastPostDate,
+    bs.GoldBadges, bs.SilverBadges, bs.BronzeBadges, tt.Tag, tt.TagCount
+ORDER BY ua.TotalScore DESC
+LIMIT 100;

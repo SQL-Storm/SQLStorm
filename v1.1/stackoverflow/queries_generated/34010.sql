@@ -1,0 +1,124 @@
+-- {"query": "34010.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 1124} 
+
+WITH TopUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        COUNT(DISTINCT a.Id) AS AnswerCount,
+        COALESCE(SUM(vt_up.VoteCount), 0) AS UpVotesReceived,
+        COALESCE(SUM(vt_down.VoteCount), 0) AS DownVotesReceived,
+        COUNT(DISTINCT b.Id) AS BadgeCount
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+    LEFT JOIN (
+        SELECT
+            PostId,
+            COUNT(*) AS VoteCount
+        FROM Votes v
+        WHERE v.VoteTypeId = 2 -- UpVotes
+        GROUP BY PostId
+    ) vt_up ON vt_up.PostId IN (
+        SELECT Id FROM Posts WHERE OwnerUserId = u.Id
+    )
+    LEFT JOIN (
+        SELECT
+            PostId,
+            COUNT(*) AS VoteCount
+        FROM Votes v
+        WHERE v.VoteTypeId = 3 -- DownVotes
+        GROUP BY PostId
+    ) vt_down ON vt_down.PostId IN (
+        SELECT Id FROM Posts WHERE OwnerUserId = u.Id
+    )
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT p.Id) >= 10 AND COUNT(DISTINCT a.Id) >= 10
+    ORDER BY u.Reputation DESC
+    LIMIT 50
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        DATE_TRUNC('month', ph.CreationDate) AS Month,
+        COUNT(DISTINCT ph.PostId) AS EditsCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.PostId END) AS ClosedPostsCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.PostId END) AS ReopenedPostsCount 
+    FROM Users u
+    JOIN PostHistory ph ON ph.UserId = u.Id
+    WHERE u.Id IN (SELECT Id FROM TopUsers)
+    GROUP BY u.Id, DATE_TRUNC('month', ph.CreationDate)
+),
+UserLinkStats AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(pl.Id) FILTER (WHERE lt.Name = 'Linked') AS LinkedPostsCount,
+        COUNT(pl.Id) FILTER (WHERE lt.Name = 'Duplicate') AS DuplicatePostsCount
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE u.Id IN (SELECT Id FROM TopUsers)
+    GROUP BY u.Id
+),
+TopTags AS (
+    SELECT
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS TagName,
+        COUNT(*) AS UsageCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.OwnerUserId IN (SELECT Id FROM TopUsers)
+    GROUP BY TagName
+    ORDER BY UsageCount DESC
+    LIMIT 20
+),
+TagScoreStats AS (
+    SELECT 
+        t.TagName,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.Score) AS MaxScore,
+        MIN(p.Score) AS MinScore,
+        COUNT(p.Id) AS TotalPosts
+    FROM Posts p
+    JOIN TopTags t ON t.TagName = ANY(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><'))
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName
+),
+UserBadgeClasses AS (
+    SELECT 
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    WHERE b.UserId IN (SELECT Id FROM TopUsers)
+    GROUP BY b.UserId
+)
+SELECT
+    tu.DisplayName,
+    tu.Reputation,
+    tu.QuestionCount,
+    tu.AnswerCount,
+    ua.Month,
+    ua.EditsCount,
+    ua.ClosedPostsCount,
+    ua.ReopenedPostsCount,
+    ul.LinkedPostsCount,
+    ul.DuplicatePostsCount,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ts.TagName,
+    ts.AvgScore,
+    ts.MaxScore,
+    ts.MinScore,
+    ts.TotalPosts
+FROM TopUsers tu
+LEFT JOIN UserActivity ua ON ua.UserId = tu.Id
+LEFT JOIN UserLinkStats ul ON ul.UserId = tu.Id
+LEFT JOIN UserBadgeClasses ub ON ub.UserId = tu.Id
+LEFT JOIN TopTags tt ON TRUE
+LEFT JOIN TagScoreStats ts ON ts.TagName = tt.TagName
+ORDER BY tu.Reputation DESC, ua.Month DESC, ts.TotalPosts DESC
+LIMIT 100;

@@ -1,0 +1,70 @@
+-- {"query": "48017.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 884} 
+WITH RankedPostHistory AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.UserId,
+        ph.CreationDate,
+        ROW_NUMBER() OVER(PARTITION BY ph.PostId, ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+),
+LatestEdits AS (
+    SELECT
+        rph.PostId,
+        rph.PostHistoryTypeId,
+        rph.UserId AS LastEditorUserId,
+        rph.CreationDate AS LastEditDate
+    FROM RankedPostHistory rph
+    WHERE rph.rn = 1
+),
+PostWithEditInfo AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.Title AS PostTitle,
+        p.AnswerCount,
+        le_title.LastEditorUserId AS TitleLastEditorUserId,
+        le_title.LastEditDate AS TitleLastEditDate,
+        le_body.LastEditorUserId AS BodyLastEditorUserId,
+        le_body.LastEditDate AS BodyLastEditDate,
+        le_tags.LastEditorUserId AS TagsLastEditorUserId,
+        le_tags.LastEditDate AS TagsLastEditDate
+    FROM Posts p
+    LEFT JOIN LatestEdits le_title ON p.Id = le_title.PostId AND le_title.PostHistoryTypeId = 4
+    LEFT JOIN LatestEdits le_body ON p.Id = le_body.PostId AND le_body.PostHistoryTypeId = 5
+    LEFT JOIN LatestEdits le_tags ON p.Id = le_tags.PostId AND le_tags.PostHistoryTypeId = 6
+    WHERE p.PostTypeId = 1 -- Questions only
+)
+SELECT
+    pwei.PostId,
+    pwei.PostCreationDate,
+    pwei.PostScore,
+    pwei.PostTitle,
+    pwei.AnswerCount,
+    u_owner.DisplayName AS OwnerDisplayName,
+    u_title_editor.DisplayName AS TitleLastEditorDisplayName,
+    pwei.TitleLastEditDate,
+    u_body_editor.DisplayName AS BodyLastEditorDisplayName,
+    pwei.BodyLastEditDate,
+    u_tags_editor.DisplayName AS TagsLastEditorDisplayName,
+    pwei.TagsLastEditDate,
+    DATEDIFF(day, pwei.PostCreationDate, COALESCE(pwei.TitleLastEditDate, pwei.BodyLastEditDate, pwei.TagsLastEditDate, pwei.PostCreationDate)) AS DaysSinceLastEdit,
+    CASE
+        WHEN pwei.TitleLastEditDate IS NOT NULL AND pwei.TitleLastEditDate > pwei.PostCreationDate THEN 1 ELSE 0
+    END AS HasTitleEdit,
+    CASE
+        WHEN pwei.BodyLastEditDate IS NOT NULL AND pwei.BodyLastEditDate > pwei.PostCreationDate THEN 1 ELSE 0
+    END AS HasBodyEdit,
+    CASE
+        WHEN pwei.TagsLastEditDate IS NOT NULL AND pwei.TagsLastEditDate > pwei.PostCreationDate THEN 1 ELSE 0
+    END AS HasTagsEdit
+FROM PostWithEditInfo pwei
+LEFT JOIN Users u_owner ON pwei.OwnerUserId = u_owner.Id
+LEFT JOIN Users u_title_editor ON pwei.TitleLastEditorUserId = u_title_editor.Id
+LEFT JOIN Users u_body_editor ON pwei.BodyLastEditorUserId = u_body_editor.Id
+LEFT JOIN Users u_tags_editor ON pwei.TagsLastEditorUserId = u_tags_editor.Id
+ORDER BY pwei.PostScore DESC, pwei.PostCreationDate ASC
+LIMIT 1000;

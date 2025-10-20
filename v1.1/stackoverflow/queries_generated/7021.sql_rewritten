@@ -1,4 +1,4 @@
--- {"query": "7021.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2631} 
+-- {"query": "7021.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2631} 
 WITH
 -- tag parsing: explode Tags like '<tag1><tag2>' into rows
 QuestionTags AS (

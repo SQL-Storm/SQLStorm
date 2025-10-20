@@ -1,0 +1,37 @@
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.CreationDate,
+  p.ViewCount,
+  p.Score,
+  p.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+  SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+  COUNT(DISTINCT c.Id) AS CommentCount,
+  STRING_AGG(t.Name, ',') AS Tags,
+  ht.Name AS HistoryEvent
+FROM Posts p
+JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Votes v ON v.PostId = p.Id
+LEFT JOIN Comments c ON c.PostId = p.Id
+LEFT JOIN LATERAL (
+  SELECT pt.Name
+  FROM PostHistory ph
+  JOIN PostHistoryTypes pt ON ph.PostHistoryTypeId = pt.Id
+  WHERE ph.PostId = p.Id
+  ORDER BY ph.CreationDate DESC
+  LIMIT 1
+) AS ht ON TRUE
+LEFT JOIN (
+  SELECT p_inner.Id AS post_id,
+         TRIM(tval) AS Name
+  FROM Posts p_inner,
+       UNNEST(STRING_TO_ARRAY(p_inner.Tags, '<>')) AS t(val),
+       LATERAL (SELECT t.val AS tval)
+) AS t ON t.post_id = p.Id
+GROUP BY
+  p.Id, p.Title, p.CreationDate, p.ViewCount, p.Score, p.OwnerUserId, u.DisplayName, ht.Name
+ORDER BY
+  p.CreationDate DESC
+LIMIT 100;

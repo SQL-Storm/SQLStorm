@@ -1,0 +1,80 @@
+-- {"query": "43075.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "nova-premier", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2135, "output_tokens": 566} 
+
+WITH TopUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(p.Score) AS TotalScore
+    FROM 
+        Users u
+    JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    WHERE 
+        p.PostTypeId IN (1, 2) -- Questions and Answers only
+    GROUP BY 
+        u.Id
+    ORDER BY 
+        TotalScore DESC
+    LIMIT 100
+),
+RecentActivePosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        ph.CreationDate AS LastEditDate,
+        ph.UserId AS LastEditorId
+    FROM 
+        Posts p
+    LEFT JOIN 
+        PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 5 -- Edit Body
+    WHERE 
+        p.LastActivityDate >= NOW() - INTERVAL '30 days'
+    ORDER BY 
+        p.LastActivityDate DESC
+    LIMIT 1000
+),
+UserActivityMetrics AS (
+    SELECT 
+        tu.Id,
+        AVG(rap.Score) AS AvgPostScore,
+        AVG(rap.ViewCount) AS AvgViewCount,
+        MAX(rap.AnswerCount) AS MaxAnswers,
+        COUNT(rap.Id) AS PostsLast30Days
+    FROM 
+        TopUsers tu
+    JOIN 
+        RecentActivePosts rap ON tu.Id = rap.LastEditorId
+    GROUP BY 
+        tu.Id
+)
+SELECT 
+    tu.DisplayName,
+    tu.Reputation,
+    uam.AvgPostScore,
+    uam.AvgViewCount,
+    uam.MaxAnswers,
+    uam.PostsLast30Days,
+    b.BadgeCount
+FROM 
+    TopUsers tu
+JOIN 
+    UserActivityMetrics uam ON tu.Id = uam.Id
+LEFT JOIN (
+    SELECT 
+        UserId,
+        COUNT(*) AS BadgeCount
+    FROM 
+        Badges
+    GROUP BY 
+        UserId
+) b ON tu.Id = b.UserId
+ORDER BY 
+    tu.Reputation DESC,
+    uam.AvgPostScore DESC;

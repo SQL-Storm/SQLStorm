@@ -1,0 +1,201 @@
+with recent_users as (
+  select u.id as user_id, u.displayname, u.reputation, u.creationdate
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+q_posts as (
+  select p.id, p.owneruserid, p.creationdate, p.score, p.viewcount, p.answercount, p.tags
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= (select max(creationdate) - interval '365 days' from posts where posttypeid = 1)
+),
+a_posts as (
+  select p.id, p.parentid, p.owneruserid, p.creationdate, p.score
+  from posts p
+  where p.posttypeid = 2
+    and p.creationdate >= (select max(creationdate) - interval '365 days' from posts where posttypeid = 2)
+),
+first_answer as (
+  select parentid as question_id,
+         min(creationdate) as first_answer_date
+  from a_posts
+  group by parentid
+),
+q_activity as (
+  select q.id as question_id,
+         q.owneruserid as asker_id,
+         q.creationdate as question_date,
+         q.score as question_score,
+         q.viewcount,
+         q.answercount,
+         coalesce(fa.first_answer_date, q.creationdate) as first_answer_date,
+         extract(epoch from (coalesce(fa.first_answer_date, q.creationdate) - q.creationdate)) / 3600.0 as hours_to_first_answer
+  from q_posts q
+  left join first_answer fa on fa.question_id = q.id
+),
+dup_links as (
+  select pl.postid as dup_post_id, pl.relatedpostid as original_post_id
+  from postlinks pl
+  where pl.linktypeid = 3
+),
+close_events as (
+  select ph.postid, ph.creationdate as closed_at,
+         cast(nullif(ph.comment, '') as integer) as close_reason_id
+  from posthistory ph
+  where ph.posthistorytypeid = 10
+),
+reopen_events as (
+  select ph.postid, ph.creationdate as reopened_at
+  from posthistory ph
+  where ph.posthistorytypeid in (11)
+),
+closed_intervals as (
+  select c.postid,
+         c.closed_at,
+         lead(c.closed_at) over (partition by c.postid order by c.closed_at) as next_close_at,
+         r.reopened_at
+  from close_events c
+  left join lateral (
+    select re.reopened_at
+    from reopen_events re
+    where re.postid = c.postid and re.reopened_at >= c.closed_at
+    order by re.reopened_at
+    limit 1
+  ) r on true
+),
+close_durations as (
+  select postid,
+         closed_at,
+         reopened_at,
+         extract(epoch from (
+           coalesce(reopened_at, next_close_at, closed_at) - closed_at
+         )) / 3600.0 as hours_closed
+  from closed_intervals
+),
+tag_expansion as (
+  select q.question_id,
+         unnest(string_to_array(substring(qt.tags, 2, length(qt.tags)-2), '><')) as tag
+  from q_posts qt
+  join q_activity q on q.question_id = qt.id
+),
+tag_stats as (
+  select t.tag,
+         count(distinct q.question_id) as questions,
+         avg(q.question_score) as avg_q_score,
+         avg(q.viewcount) as avg_views,
+         percentile_cont(0.5) within group (order by q.hours_to_first_answer) as p50_time_to_first_answer,
+         percentile_cont(0.9) within group (order by q.hours_to_first_answer) as p90_time_to_first_answer
+  from tag_expansion t
+  join q_activity q on q.question_id = t.question_id
+  group by t.tag
+  having count(distinct q.question_id) >= 25
+),
+user_engagement as (
+  select u.user_id,
+         count(distinct q.question_id) as questions_asked,
+         coalesce(sum(case when q.hours_to_first_answer <= 24 then 1 else 0 end), 0) as q_answered_in_24h,
+         avg(q.hours_to_first_answer) as avg_hours_to_first_answer,
+         avg(q.question_score) as avg_q_score,
+         sum(q.viewcount) as total_views
+  from recent_users u
+  left join q_activity q on q.asker_id = u.user_id
+  group by u.user_id
+),
+vote_agg as (
+  select v.postid,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+         sum(case when v.votetypeid = 12 then 1 else 0 end) as spamflags
+  from votes v
+  where v.creationdate >= (select max(creationdate) - interval '365 days' from votes)
+  group by v.postid
+),
+comment_agg as (
+  select c.postid,
+         count(*) as comments_count,
+         avg(c.score) as avg_comment_score
+  from comments c
+  where c.creationdate >= (select max(creationdate) - interval '365 days' from comments)
+  group by c.postid
+),
+question_summary as (
+  select qa.question_id,
+         qa.asker_id,
+         qa.question_date,
+         qa.question_score,
+         qa.viewcount,
+         qa.answercount,
+         qa.hours_to_first_answer,
+         coalesce(v.upvotes,0) as upvotes,
+         coalesce(v.downvotes,0) as downvotes,
+         coalesce(v.spamflags,0) as spamflags,
+         coalesce(cm.comments_count,0) as comments_count,
+         coalesce(cm.avg_comment_score,0) as avg_comment_score,
+         case when d.dup_post_id is not null then 1 else 0 end as is_duplicate,
+         cd.hours_closed
+  from q_activity qa
+  left join vote_agg v on v.postid = qa.question_id
+  left join comment_agg cm on cm.postid = qa.question_id
+  left join dup_links d on d.dup_post_id = qa.question_id
+  left join lateral (
+    select avg(hours_closed) as hours_closed
+    from close_durations cdx
+    where cdx.postid = qa.question_id
+  ) cd on true
+),
+power_users as (
+  select ue.user_id
+  from user_engagement ue
+  where ue.questions_asked >= 5
+     or ue.total_views >= 10000
+     or ue.avg_q_score >= 2
+),
+ranked_questions as (
+  select qs.*,
+         row_number() over (partition by qs.asker_id order by qs.viewcount desc, qs.question_score desc, qs.question_date desc) as rn
+  from question_summary qs
+),
+top_questions_per_user as (
+  select *
+  from ranked_questions
+  where rn <= 3
+),
+final as (
+  select
+    tq.question_id,
+    tq.asker_id,
+    u.displayname as asker_name,
+    u.reputation,
+    tq.question_date,
+    tq.viewcount,
+    tq.question_score,
+    tq.answercount,
+    cast(round(cast(tq.hours_to_first_answer as numeric), 2) as numeric) as hours_to_first_answer,
+    tq.upvotes, tq.downvotes, tq.spamflags,
+    tq.comments_count,
+    cast(round(coalesce(tq.avg_comment_score,0), 2) as numeric) as avg_comment_score,
+    tq.is_duplicate,
+    cast(round(coalesce(tq.hours_closed,0), 2) as numeric) as hours_closed,
+    array_agg(distinct te.tag order by te.tag) filter (where te.tag is not null) as tags,
+    ts_top.tag as top_tag_by_p50,
+    ts_top.p50_time_to_first_answer as top_tag_p50_hours
+  from top_questions_per_user tq
+  join users u on u.id = tq.asker_id
+  left join tag_expansion te on te.question_id = tq.question_id
+  left join lateral (
+    select ts.tag, ts.p50_time_to_first_answer
+    from tag_stats ts
+    join tag_expansion te2 on te2.question_id = tq.question_id and te2.tag = ts.tag
+    order by ts.p50_time_to_first_answer asc, ts.tag asc
+    limit 1
+  ) ts_top on true
+  where tq.asker_id in (select user_id from power_users)
+  group by
+    tq.question_id, tq.asker_id, u.displayname, u.reputation, tq.question_date, tq.viewcount, tq.question_score,
+    tq.answercount, tq.hours_to_first_answer, tq.upvotes, tq.downvotes, tq.spamflags, tq.comments_count,
+    tq.avg_comment_score, tq.is_duplicate, tq.hours_closed, ts_top.tag, ts_top.p50_time_to_first_answer
+)
+select *
+from final
+order by reputation desc, viewcount desc, question_score desc, question_date desc
+limit 500;

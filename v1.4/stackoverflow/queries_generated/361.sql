@@ -1,0 +1,100 @@
+-- {"query": "361.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 13685} 
+WITH PostsFiltered AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.FavoriteCount
+  FROM Posts p
+  WHERE p.CreationDate >= DATEADD(year, -2, GETDATE())
+),
+WeightedPosts AS (
+  SELECT
+    pf.Id,
+    pf.PostTypeId,
+    pf.Title,
+    pf.Tags,
+    pf.OwnerUserId,
+    pf.Score,
+    pf.ViewCount,
+    pf.CreationDate,
+    pf.LastActivityDate,
+    pf.CommentCount,
+    pf.AcceptedAnswerId,
+    pf.ParentId,
+    pf.FavoriteCount,
+    u.Reputation,
+    u.DisplayName,
+    ROW_NUMBER() OVER (
+      PARTITION BY pf.PostTypeId
+      ORDER BY (pf.Score * 2 + pf.ViewCount * 3) DESC, pf.LastActivityDate DESC
+    ) AS RN,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = pf.OwnerUserId AND b.Class = 1) AS GoldBadges,
+    (SELECT TOP 1 b.Name FROM Badges b WHERE b.UserId = pf.OwnerUserId ORDER BY b.Date DESC) AS LatestBadgeName,
+    CONCAT('Owner: ', COALESCE(u.DisplayName, 'Unknown'), ' Rep=', COALESCE(CAST(u.Reputation AS varchar(10)), '0')) AS OwnerDescriptor,
+    CASE WHEN pf.Title IS NULL THEN 'Untitled' ELSE LEFT(pf.Title, 60) END AS ShortTitle,
+    UPPER(REPLACE(ISNULL(pf.Tags, ''), '<', '')) AS CleanTags
+  FROM PostsFiltered pf
+  LEFT JOIN Users u ON pf.OwnerUserId = u.Id
+)
+SELECT
+  Id,
+  PostTypeId,
+  Title,
+  Tags,
+  OwnerUserId,
+  Reputation,
+  DisplayName,
+  CreationDate,
+  LastActivityDate,
+  Score,
+  ViewCount,
+  CommentCount,
+  AcceptedAnswerId,
+  ParentId,
+  FavoriteCount,
+  GoldBadges,
+  LatestBadgeName,
+  OwnerDescriptor,
+  ShortTitle,
+  CleanTags,
+  RN
+FROM WeightedPosts
+WHERE PostTypeId = 1
+  AND RN <= 50
+UNION ALL
+SELECT
+  Id,
+  PostTypeId,
+  Title,
+  Tags,
+  OwnerUserId,
+  Reputation,
+  DisplayName,
+  CreationDate,
+  LastActivityDate,
+  Score,
+  ViewCount,
+  CommentCount,
+  AcceptedAnswerId,
+  ParentId,
+  FavoriteCount,
+  GoldBadges,
+  LatestBadgeName,
+  OwnerDescriptor,
+  ShortTitle,
+  CleanTags,
+  RN
+FROM WeightedPosts
+WHERE PostTypeId = 2
+  AND RN <= 50
+ORDER BY PostTypeId, RN;

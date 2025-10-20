@@ -1,0 +1,121 @@
+-- {"query": "137.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 2666} 
+WITH
+user_scores AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    (COALESCE(p.cnt,0) * 3
+     + COALESCE(v.up,0)
+     - COALESCE(v.dn,0)
+     + COALESCE(b.gold,0) * 5
+     + COALESCE(b.silver,0) * 3
+     + COALESCE(b.bronze,0) * 2
+     + u.Reputation) AS Score,
+    COALESCE(p.cnt,0) AS PostCount,
+    COALESCE(COM.cnt,0) AS CommentCount,
+    COALESCE(v.up,0) AS UpVotes,
+    COALESCE(v.dn,0) AS DownVotes,
+    COALESCE(b.gold,0) AS GoldBadges,
+    COALESCE(b.silver,0) AS SilverBadges,
+    COALESCE(b.bronze,0) AS BronzeBadges
+  FROM Users u
+  LEFT JOIN (
+    SELECT OwnerUserId, COUNT(*) AS cnt
+    FROM Posts
+    WHERE PostTypeId = 1
+    GROUP BY OwnerUserId
+  ) p ON p.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT UserId, COUNT(*) AS cnt
+    FROM Comments
+    GROUP BY UserId
+  ) COM ON COM.UserId = u.Id
+  LEFT JOIN (
+    SELECT UserId,
+           SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS up,
+           SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS dn
+    FROM Votes
+    GROUP BY UserId
+  ) v ON v.UserId = u.Id
+  LEFT JOIN (
+    SELECT UserId,
+           SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS gold,
+           SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS silver,
+           SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS bronze
+    FROM Badges
+    GROUP BY UserId
+  ) b ON b.UserId = u.Id
+),
+recent_posts AS (
+  SELECT
+    p.OwnerUserId AS UserId,
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+top_recent AS (
+  SELECT
+    UserId,
+    MAX(CASE WHEN rn = 1 THEN Title END) AS LastTitle,
+    MAX(CASE WHEN rn = 1 THEN CreationDate END) AS LastDate
+  FROM recent_posts
+  GROUP BY UserId
+),
+tag_summary AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS tag_count
+  FROM Tags t
+  GROUP BY t.TagName
+  ORDER BY tag_count DESC
+  LIMIT 5
+)
+SELECT
+  s.UserId,
+  s.DisplayName,
+  s.Score,
+  s.PostCount,
+  s.CommentCount,
+  s.UpVotes,
+  s.DownVotes,
+  s.GoldBadges,
+  s.SilverBadges,
+  s.BronzeBadges,
+  tr.LastTitle AS LastPostTitle,
+  tr.LastDate AS LastPostDate,
+  ARRAY_AGG(t1.TagName) FILTER (WHERE t1.TagName IS NOT NULL) AS TopTags
+FROM
+  user_scores s
+  LEFT JOIN top_recent tr ON tr.UserId = s.UserId
+  LEFT JOIN (
+    SELECT DISTINCT ts1.UserId
+    FROM Votes ts1
+  ) AS _dummy ON true
+  LEFT JOIN (
+    SELECT OwnerUserId, TagName
+    FROM Tags t
+    JOIN Posts p ON p.Id = t.ExcerptPostId
+  ) t1 ON t1.OwnerUserId = s.UserId
+GROUP BY
+  s.UserId, s.DisplayName, s.Score, s.PostCount, s.CommentCount,
+  s.UpVotes, s.DownVotes, s.GoldBadges, s.SilverBadges, s.BronzeBadges,
+  tr.LastTitle, tr.LastDate
+UNION ALL
+SELECT
+  NULL AS UserId,
+  tg.TagName,
+  NULL AS Score,
+  NULL AS PostCount,
+  NULL AS CommentCount,
+  NULL AS UpVotes,
+  NULL AS DownVotes,
+  NULL AS GoldBadges,
+  NULL AS SilverBadges,
+  NULL AS BronzeBadges,
+  NULL AS LastPostTitle,
+  NULL AS LastPostDate,
+  ARRAY_AGG(tg.TagName) AS TopTags
+FROM tag_summary tg;

@@ -1,0 +1,138 @@
+WITH UserPostStats AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.UpVotes,
+        U.DownVotes,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionsPosted,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswersPosted,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN P.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN P.Score ELSE 0 END) AS TotalAnswerScore,
+        COUNT(DISTINCT P.Id) AS TotalPostsAuthored,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 AND P.Id = AcceptedAnswers.AcceptedAnswerId THEN P.Id END) AS AcceptedAnswersCount
+    FROM Users AS U
+    JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Posts AS AcceptedAnswers ON P.ParentId = AcceptedAnswers.Id AND AcceptedAnswers.PostTypeId = 1
+    WHERE P.OwnerUserId IS NOT NULL
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes, U.DownVotes
+    HAVING
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) >= 5
+        AND COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) >= 10
+),
+UserBadgesSummary AS (
+    SELECT
+        B.UserId,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(B.Id) AS TotalBadges
+    FROM Badges AS B
+    GROUP BY B.UserId
+),
+UserTopTags AS (
+    -- Build top tags per user then aggregate into a comma-separated string using string_agg without WITHIN GROUP
+    SELECT
+        UserId,
+        STRING_AGG(TagName, ', ' ORDER BY PostCount DESC, TagName) AS TopTags,
+        AVG(TagPostScore) AS AverageTagPostScore
+    FROM (
+        SELECT
+            P.OwnerUserId AS UserId,
+            TRIM(tag) AS TagName,
+            COUNT(P.Id) AS PostCount,
+            AVG(P.Score) AS TagPostScore,
+            ROW_NUMBER() OVER(PARTITION BY P.OwnerUserId ORDER BY COUNT(P.Id) DESC, AVG(P.Score) DESC) AS rn
+        FROM Posts AS P,
+        LATERAL (
+            SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags)-2), '><')) AS tag
+        ) AS t
+        WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+        GROUP BY P.OwnerUserId, TRIM(tag)
+    ) AS TaggedPostsSubquery
+    WHERE rn <= 3
+    GROUP BY UserId
+),
+PostHistoryMetrics AS (
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS TotalHistoryEntries,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount,
+        MAX(PH.CreationDate) AS LastHistoryActivityDate
+    FROM PostHistory AS PH
+    GROUP BY PH.PostId
+),
+RelatedPostScores AS (
+    SELECT
+        PL.PostId,
+        SUM(CASE WHEN PL.LinkTypeId = 1 THEN RP.Score ELSE 0 END) AS LinkedPostScoreSum,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN RP.Score ELSE 0 END) AS DuplicatePostScoreSum,
+        COUNT(DISTINCT PL.RelatedPostId) AS TotalRelatedPosts
+    FROM PostLinks AS PL
+    JOIN Posts AS RP ON PL.RelatedPostId = RP.Id
+    GROUP BY PL.PostId
+),
+UserPostAggregates AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        SUM(PHM.TotalHistoryEntries) AS TotalHistoryEntriesAcrossPosts,
+        SUM(PHM.EditCount) AS TotalEditsAcrossPosts,
+        MAX(PHM.LastHistoryActivityDate) AS LastPostHistoryActivityDate,
+        SUM(RPS.LinkedPostScoreSum) AS OverallLinkedPostScore,
+        SUM(RPS.DuplicatePostScoreSum) AS OverallDuplicatePostSum,
+        SUM(RPS.TotalRelatedPosts) AS OverallRelatedPostsCount,
+        SUM(P.CommentCount) AS TotalCommentsOnOwnPosts,
+        MAX(P.LastActivityDate) AS LastUserPostActivity
+    FROM Posts AS P
+    LEFT JOIN PostHistoryMetrics AS PHM ON P.Id = PHM.PostId
+    LEFT JOIN RelatedPostScores AS RPS ON P.Id = RPS.PostId
+    WHERE P.OwnerUserId IS NOT NULL
+    GROUP BY P.OwnerUserId
+)
+SELECT
+    UPS.UserId,
+    UPS.DisplayName,
+    UPS.Reputation,
+    UPS.UserCreationDate,
+    UPS.LastAccessDate,
+    UPS.QuestionsPosted,
+    UPS.AnswersPosted,
+    UPS.TotalPostsAuthored,
+    UPS.AcceptedAnswersCount,
+    CAST(UPS.TotalQuestionScore AS DECIMAL) / NULLIF(UPS.QuestionsPosted, 0) AS AvgQuestionScore,
+    CAST(UPS.TotalAnswerScore AS DECIMAL) / NULLIF(UPS.AnswersPosted, 0) AS AvgAnswerScore,
+    CAST(UPS.AcceptedAnswersCount AS DECIMAL) / NULLIF(UPS.AnswersPosted, 0) AS AcceptedAnswerRatio,
+    BS.GoldBadges,
+    BS.SilverBadges,
+    BS.BronzeBadges,
+    BS.TotalBadges,
+    TT.TopTags,
+    TT.AverageTagPostScore,
+    UPA.LastUserPostActivity,
+    UPA.TotalEditsAcrossPosts,
+    UPA.TotalCommentsOnOwnPosts,
+    UPA.OverallLinkedPostScore,
+    UPA.OverallDuplicatePostSum,
+    UPA.OverallRelatedPostsCount,
+    COUNT(DISTINCT V_Given.Id) FILTER (WHERE V_Given.VoteTypeId = 2) AS TotalUpvotesGivenByUsers,
+    COUNT(DISTINCT V_Given.Id) FILTER (WHERE V_Given.VoteTypeId = 3) AS TotalDownvotesGivenByUsers
+FROM UserPostStats AS UPS
+LEFT JOIN UserBadgesSummary AS BS ON UPS.UserId = BS.UserId
+LEFT JOIN UserTopTags AS TT ON UPS.UserId = TT.UserId
+LEFT JOIN UserPostAggregates AS UPA ON UPS.UserId = UPA.UserId
+LEFT JOIN Votes AS V_Given ON UPS.UserId = V_Given.UserId AND V_Given.VoteTypeId IN (2, 3)
+GROUP BY
+    UPS.UserId, UPS.DisplayName, UPS.Reputation, UPS.UserCreationDate, UPS.LastAccessDate,
+    UPS.QuestionsPosted, UPS.AnswersPosted, UPS.TotalPostsAuthored, UPS.AcceptedAnswersCount,
+    UPS.TotalQuestionScore, UPS.TotalAnswerScore,
+    BS.GoldBadges, BS.SilverBadges, BS.BronzeBadges, BS.TotalBadges,
+    TT.TopTags, TT.AverageTagPostScore,
+    UPA.LastUserPostActivity, UPA.TotalEditsAcrossPosts, UPA.TotalCommentsOnOwnPosts,
+    UPA.OverallLinkedPostScore, UPA.OverallDuplicatePostSum, UPA.OverallRelatedPostsCount
+ORDER BY
+    UPS.Reputation DESC,
+    UPS.LastAccessDate DESC
+LIMIT 100;

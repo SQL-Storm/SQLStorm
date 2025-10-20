@@ -1,4 +1,4 @@
--- {"query": "19096.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3031} 
+-- {"query": "19096.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3031} 
 WITH UserAggregatedStats AS (
     -- Aggregates various user-level statistics from Posts, Comments, Votes, and Badges.
     -- This CTE prepares a baseline of user data to be enriched later.

@@ -1,0 +1,79 @@
+-- {"query": "50066.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 707} 
+WITH TagEditors AS (
+  SELECT
+    ph.UserId,
+    COUNT(DISTINCT ph.PostId) AS TagEditCount
+  FROM PostHistory AS ph
+  WHERE
+    ph.PostHistoryTypeId = 6 -- Edit Tags
+    AND ph.Text LIKE '%<performance>%'
+    AND ph.UserId IS NOT NULL
+  GROUP BY
+    ph.UserId
+), CanonicalQuestions AS (
+  SELECT
+    p.OwnerUserId,
+    COUNT(*) AS CanonicalCount
+  FROM PostLinks AS pl
+  JOIN Posts AS p
+    ON pl.RelatedPostId = p.Id
+  WHERE
+    pl.LinkTypeId = 3 -- Duplicate
+    AND p.Tags LIKE '%<performance>%'
+    AND p.OwnerUserId IS NOT NULL
+  GROUP BY
+    p.OwnerUserId
+), AnswerStats AS (
+  SELECT
+    ans.OwnerUserId,
+    SUM(ans.Score) AS TotalAnswerScore,
+    AVG(ans.Score) AS AverageAnswerScore,
+    COUNT(*) AS AnswerCount,
+    SUM(ans.CommentCount) AS TotalAnswerCommentCount
+  FROM Posts AS q
+  JOIN Posts AS ans
+    ON q.Id = ans.ParentId
+  WHERE
+    q.Tags LIKE '%<performance>%'
+    AND ans.PostTypeId = 2 -- Answer
+    AND ans.OwnerUserId IS NOT NULL
+  GROUP BY
+    ans.OwnerUserId
+  HAVING
+    COUNT(*) >= 5
+)
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  u.Reputation,
+  u.CreationDate AS UserCreationDate,
+  als.TotalAnswerScore,
+  als.AnswerCount,
+  als.AverageAnswerScore,
+  COALESCE(te.TagEditCount, 0) AS PerformanceTagEdits,
+  COALESCE(cq.CanonicalCount, 0) AS TimesAsCanonical,
+  (
+    SELECT
+      AVG(JULIANDAY(p_ans.CreationDate) - JULIANDAY(p_q.CreationDate))
+    FROM Posts AS p_q
+    JOIN Posts AS p_ans
+      ON p_q.AcceptedAnswerId = p_ans.Id
+    WHERE
+      p_q.Tags LIKE '%<performance>%' AND p_ans.OwnerUserId = u.Id
+  ) AS AvgTimeToAccept,
+  DENSE_RANK() OVER (ORDER BY (
+    (als.TotalAnswerScore * 0.4) + (als.AverageAnswerScore * 0.2) + (COALESCE(cq.CanonicalCount, 0) * 25) + (COALESCE(te.TagEditCount, 0) * 10)
+  ) DESC) AS GuardianRank
+FROM AnswerStats AS als
+JOIN Users AS u
+  ON als.OwnerUserId = u.Id
+LEFT JOIN TagEditors AS te
+  ON als.OwnerUserId = te.UserId
+LEFT JOIN CanonicalQuestions AS cq
+  ON als.OwnerUserId = cq.UserId
+WHERE
+  u.Reputation > 1000
+ORDER BY
+  GuardianRank,
+  als.TotalAnswerScore DESC
+LIMIT 100;

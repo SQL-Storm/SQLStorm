@@ -1,0 +1,189 @@
+-- {"query": "37008.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 2090} 
+WITH
+-- active questions in the last 2 years with parsed tags
+Questions AS (
+  SELECT p.Id, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.OwnerUserId,
+         p.Title,
+         regexp_split_to_table(substring(p.Tags,2, length(p.Tags)-2), E'\\><') AS Tag
+  FROM Posts p
+  JOIN PostTypes pt ON p.PostTypeId = pt.Id AND pt.Name = 'Question'
+  WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+-- aggregate answers and their scores for each question
+AnswerAgg AS (
+  SELECT q.Id AS QuestionId,
+         count(a.Id) FILTER (WHERE a.Score >= 0) AS PosAnswers,
+         count(a.Id) FILTER (WHERE a.Score < 0) AS NegAnswers,
+         avg(a.Score) AS AvgAnswerScore,
+         max(a.Score) AS MaxAnswerScore,
+         percentile_cont(0.5) WITHIN GROUP (ORDER BY a.Score) AS MedianAnswerScore
+  FROM Questions q
+  LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = (SELECT Id FROM PostTypes WHERE Name='Answer')
+  GROUP BY q.Id
+),
+-- vote summary per post (questions + answers)
+VoteSummary AS (
+  SELECT v.PostId,
+         count(*) FILTER (WHERE vt.Name='UpMod') AS UpVotes,
+         count(*) FILTER (WHERE vt.Name='DownMod') AS DownVotes,
+         count(*) FILTER (WHERE vt.Name='AcceptedByOriginator') AS AcceptedByOwner,
+         count(*) FILTER (WHERE vt.Name='Favorite') AS Favorited
+  FROM Votes v
+  JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  GROUP BY v.PostId
+),
+-- recent editor churn: number of distinct editors and last edit
+EditStats AS (
+  SELECT ph.PostId,
+         count(DISTINCT ph.UserId) AS DistinctEditors,
+         max(ph.CreationDate) AS LastEditDate,
+         count(*) FILTER (WHERE ph.PostHistoryTypeId IN (5,2,24)) AS BodyEdits -- edits/applied suggested edits
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+-- comment sentiment proxy: avg comment length and top commenters count
+CommentStats AS (
+  SELECT c.PostId,
+         avg(char_length(c.Text)) AS AvgCommentLen,
+         count(*) AS CommentCount,
+         count(DISTINCT c.UserId) FILTER (WHERE c.UserId IS NOT NULL) AS DistinctCommenters
+  FROM Comments c
+  GROUP BY c.PostId
+),
+-- user reputation & badge richness for owners
+OwnerStats AS (
+  SELECT u.Id AS OwnerUserId,
+         u.Reputation,
+         u.Views AS ProfileViews,
+         count(b.Id) FILTER (WHERE b.Class=1) AS GoldBadges,
+         count(b.Id) FILTER (WHERE b.Class=2) AS SilverBadges,
+         count(b.Id) FILTER (WHERE b.Class=3) AS BronzeBadges,
+         bool_or(b.TagBased) AS HasTagBadges
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id
+),
+-- compute tag-level hotness over last 2 years
+TagHotness AS (
+  SELECT Tag,
+         count(*) AS QuestionsWithTag,
+         sum(q.ViewCount) AS TotalViews,
+         sum(q.Score) AS TotalScore,
+         sum(COALESCE(vs.UpVotes,0)-COALESCE(vs.DownVotes,0)) AS NetVotes,
+         avg(COALESCE(aa.AvgAnswerScore,0)) AS AvgAnswerScorePerQuestion,
+         percentile_cont(0.75) WITHIN GROUP (ORDER BY q.AnswerCount) AS P75_AnswerCount
+  FROM Questions q
+  LEFT JOIN VoteSummary vs ON vs.PostId = q.Id
+  LEFT JOIN AnswerAgg aa ON aa.QuestionId = q.Id
+  GROUP BY Tag
+),
+-- select a sample of 500 "interesting" questions by multi-metric score (weighting recency, score, views, answers, comments)
+RankedQuestions AS (
+  SELECT q.*,
+         aa.*,
+         COALESCE(vs.UpVotes,0) AS QUpVotes,
+         COALESCE(vs.DownVotes,0) AS QDownVotes,
+         COALESCE(cs.CommentCount,0) AS QCommentCount,
+         COALESCE(es.DistinctEditors,0) AS QDistinctEditors,
+         COALESCE(os.Reputation,0) AS OwnerReputation,
+         -- composite hotness score
+         (
+           3.0 * (q.Score) +
+           2.0 * log(1 + q.ViewCount) +
+           5.0 * gcd(1, q.AnswerCount) * q.AnswerCount + -- boost answered posts
+           4.0 * COALESCE(vs.UpVotes,0) -
+           2.0 * COALESCE(vs.DownVotes,0) +
+           1.5 * sqrt(COALESCE(cs.CommentCount,0)) +
+           0.5 * aa.AvgAnswerScore +
+           0.002 * extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - q.CreationDate)) * -1 -- recency penalty (older -> lower)
+         ) AS HotnessScore
+  FROM Questions q
+  LEFT JOIN AnswerAgg aa ON aa.QuestionId = q.Id
+  LEFT JOIN VoteSummary vs ON vs.PostId = q.Id
+  LEFT JOIN CommentStats cs ON cs.PostId = q.Id
+  LEFT JOIN EditStats es ON es.PostId = q.Id
+  LEFT JOIN OwnerStats os ON os.OwnerUserId = q.OwnerUserId
+),
+-- pick top 500 by hotness, then expand with related posts, duplicates and linked posts within 1 hop
+TopSample AS (
+  SELECT rq.*
+  FROM RankedQuestions rq
+  ORDER BY rq.HotnessScore DESC
+  LIMIT 500
+),
+RelatedPosts AS (
+  SELECT DISTINCT pl.RelatedPostId AS PostId
+  FROM PostLinks pl
+  JOIN TopSample ts ON pl.PostId = ts.Id
+  WHERE pl.LinkTypeId IN (1,3) -- linked or duplicate
+  UNION
+  SELECT DISTINCT pl.PostId AS PostId
+  FROM PostLinks pl
+  JOIN TopSample ts ON pl.RelatedPostId = ts.Id
+  WHERE pl.LinkTypeId IN (1,3)
+),
+-- gather full post info for analysis (questions + their answers + related)
+FullPosts AS (
+  SELECT p.*
+  FROM Posts p
+  WHERE p.Id IN (SELECT Id FROM TopSample)
+     OR p.ParentId IN (SELECT Id FROM TopSample)
+     OR p.Id IN (SELECT PostId FROM RelatedPosts)
+),
+-- compute co-tag network for top sample
+CoTagEdges AS (
+  SELECT t1.Tag AS TagA, t2.Tag AS TagB, count(*) AS CoOccur
+  FROM Questions q
+  JOIN Questions t1 ON t1.Id = q.Id
+  JOIN Questions t2 ON t2.Id = q.Id AND t1.Tag < t2.Tag
+  GROUP BY t1.Tag, t2.Tag
+)
+-- Final selection: return a large composite result using JSON aggregation for benchmarking complexity
+SELECT json_build_object(
+  'GeneratedAt', cast('2024-10-01 12:34:56' as timestamp),
+  'SampleCount', (SELECT count(*) FROM TopSample),
+  'TopTags', (
+    SELECT json_agg(json_build_object(
+             'Tag', th.Tag,
+             'Questions', th.QuestionsWithTag,
+             'TotalViews', th.TotalViews,
+             'NetVotes', th.NetVotes,
+             'AvgAnswerScorePerQuestion', th.AvgAnswerScorePerQuestion
+           ) ORDER BY th.QuestionsWithTag DESC LIMIT 25)
+    FROM TagHotness th
+  ),
+  'TopQuestions', (
+    SELECT json_agg(json_build_object(
+             'Id', ts.Id,
+             'Title', ts.Title,
+             'CreationDate', ts.CreationDate,
+             'OwnerUserId', ts.OwnerUserId,
+             'Score', ts.Score,
+             'ViewCount', ts.ViewCount,
+             'AnswerCount', ts.AnswerCount,
+             'Hotness', ts.HotnessScore,
+             'Answers', (
+               SELECT json_agg(json_build_object(
+                        'Id', a.Id, 'Score', a.Score, 'OwnerUserId', a.OwnerUserId, 'CreationDate', a.CreationDate
+                      ) ORDER BY a.Score DESC NULLS LAST)
+               FROM Posts a WHERE a.ParentId = ts.Id AND a.PostTypeId = (SELECT Id FROM PostTypes WHERE Name='Answer')
+             ),
+             'Comments', (
+               SELECT json_agg(json_build_object('Id', c.Id, 'TextLen', char_length(c.Text), 'UserId', c.UserId, 'CreationDate', c.CreationDate) ORDER BY c.CreationDate)
+               FROM Comments c WHERE c.PostId = ts.Id
+             ),
+             'RelatedPosts', (
+               SELECT json_agg(json_build_object('Id', rp.Id, 'PostTypeId', rp.PostTypeId, 'Score', rp.Score))
+               FROM Posts rp
+               WHERE rp.Id IN (SELECT RelatedPostId FROM PostLinks WHERE PostId = ts.Id AND LinkTypeId IN (1,3))
+                  OR rp.Id IN (SELECT PostId FROM PostLinks WHERE RelatedPostId = ts.Id AND LinkTypeId IN (1,3))
+             )
+           ) ORDER BY ts.HotnessScore DESC)
+    FROM TopSample ts
+  ),
+  'CoTagTopEdges', (
+    SELECT json_agg(json_build_object('TagA', ce.TagA, 'TagB', ce.TagB, 'CoOccur', ce.CoOccur) ORDER BY ce.CoOccur DESC LIMIT 50)
+    FROM CoTagEdges ce
+  ),
+  'FullPostCount', (SELECT count(*) FROM FullPosts)
+) AS BenchmarkPayload;

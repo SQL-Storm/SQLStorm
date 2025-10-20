@@ -1,0 +1,88 @@
+WITH PostEngagement AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS ActualCommentCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVotes,
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 4) AS TitleEdits,
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 5) AS BodyEdits,
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 6) AS TagEdits,
+        EXTRACT(EPOCH FROM (COALESCE(p.LastActivityDate, p.CreationDate) - p.CreationDate))::BIGINT AS SecondsSinceLastActivity,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN EXTRACT(EPOCH FROM (p.ClosedDate - p.CreationDate))::BIGINT ELSE NULL END AS SecondsToClose,
+        p.OwnerUserId
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount
+    FROM
+        Users u
+    WHERE
+        u.Id IS NOT NULL AND u.Id > 0
+)
+SELECT
+    pe.PostId,
+    pe.Title,
+    pe.CreationDate AS PostCreationDate,
+    pe.Score AS PostScore,
+    pe.ViewCount AS PostViewCount,
+    pe.AnswerCount AS PostAnswerCount,
+    pe.CommentCount AS PostCommentCount,
+    pe.ActualCommentCount,
+    pe.UpVotes AS PostUpVotes,
+    pe.DownVotes AS PostDownVotes,
+    pe.TitleEdits,
+    pe.BodyEdits,
+    pe.TagEdits,
+    pe.SecondsSinceLastActivity,
+    pe.SecondsToClose,
+    ua.UserId,
+    ua.Reputation AS UserReputation,
+    ua.CreationDate AS UserCreationDate,
+    ua.UserViews,
+    ua.UserUpVotes,
+    ua.UserDownVotes,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.QuestionCount AS UserQuestionCount,
+    ua.AnswerCount AS UserAnswerCount,
+    CASE
+        WHEN ua.Reputation > 100000 THEN 'Expert'
+        WHEN ua.Reputation > 50000 THEN 'Experienced'
+        WHEN ua.Reputation > 10000 THEN 'Proficient'
+        WHEN ua.Reputation > 1000 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END AS UserExperienceLevel,
+    (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.OwnerUserId = ua.UserId AND p2.PostTypeId = 1) AS AvgUserQuestionScore,
+    (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.OwnerUserId = ua.UserId AND p2.PostTypeId = 2) AS AvgUserAnswerScore,
+    (SELECT COUNT(*) FROM PostLinks pl JOIN Posts p3 ON pl.PostId = p3.Id WHERE p3.OwnerUserId = ua.UserId AND pl.LinkTypeId = 3) AS DuplicateLinksPosted,
+    (SELECT COUNT(*) FROM PostLinks pl JOIN Posts p4 ON pl.RelatedPostId = p4.Id WHERE p4.OwnerUserId = ua.UserId AND pl.LinkTypeId = 3) AS DuplicateLinksReceived
+FROM
+    PostEngagement pe
+JOIN
+    UserActivity ua ON pe.OwnerUserId = ua.UserId
+WHERE
+    pe.Score > 0 AND pe.ViewCount > 1000 AND ua.Reputation > 1000
+ORDER BY
+    pe.Score DESC, pe.ViewCount DESC, ua.Reputation DESC
+LIMIT 1000;

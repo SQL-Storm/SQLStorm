@@ -1,0 +1,78 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COALESCE(SUM(v.score), 0) AS TotalPostScore,
+        AVG(p.score) AS AvgPostScore
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    GROUP BY u.Id, u.Reputation, u.CreationDate
+),
+PostDetails AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.score,
+        p.CreationDate,
+        p.Tags,
+        CASE 
+            WHEN p.Tags IS NOT NULL THEN string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><')
+            ELSE ARRAY[]::text
+        END AS TagArray,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+TagUserStats AS (
+    SELECT 
+        ud.UserId,
+        t.TagName,
+        SUM(CASE WHEN pd.PostTypeId = 2 AND t.TagName = ANY(pd.TagArray) THEN pd.score ELSE 0 END) AS TagAnswerScore,
+        COUNT(DISTINCT CASE WHEN pd.PostTypeId = 1 AND t.TagName = ANY(pd.TagArray) THEN pd.PostId END) AS TagQuestionCount,
+        COUNT(DISTINCT CASE WHEN pd.PostTypeId = 2 AND t.TagName = ANY(pd.TagArray) THEN pd.PostId END) AS TagAnswerCount,
+        AVG(pd.score) FILTER (WHERE pd.PostTypeId = 2 AND t.TagName = ANY(pd.TagArray)) AS AvgTagAnswerScore
+    FROM UserStats ud
+    CROSS JOIN Tags t
+    LEFT JOIN PostDetails pd ON ud.UserId = pd.OwnerUserId AND pd.rn = 1
+    GROUP BY ud.UserId, t.TagName
+),
+RankedUsers AS (
+    SELECT 
+        tus.UserId,
+        tus.TagName,
+        tus.TagAnswerScore,
+        tus.TagQuestionCount,
+        tus.TagAnswerCount,
+        tus.AvgTagAnswerScore,
+        us.Reputation,
+        us.BadgeCount,
+        us.TotalPostScore,
+        us.AvgPostScore,
+        RANK() OVER (PARTITION BY tus.TagName ORDER BY tus.TagAnswerScore DESC, us.Reputation DESC) AS RankByScore
+    FROM TagUserStats tus
+    JOIN UserStats us ON tus.UserId = us.UserId
+    WHERE tus.TagAnswerCount > 0 AND us.BadgeCount > 10
+)
+SELECT 
+    ru.UserId,
+    ru.TagName,
+    ru.TagAnswerScore,
+    ru.TagQuestionCount,
+    ru.TagAnswerCount,
+    ru.AvgTagAnswerScore,
+    ru.Reputation,
+    ru.BadgeCount,
+    ru.TotalPostScore,
+    ru.AvgPostScore,
+    ru.RankByScore
+FROM RankedUsers ru
+WHERE ru.RankByScore <= 5
+ORDER BY ru.TagName, ru.RankByScore
+LIMIT 1000;

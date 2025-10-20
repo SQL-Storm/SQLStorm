@@ -1,0 +1,40 @@
+-- {"query": "56079.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "llama-3.3-instruct", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 393} 
+WITH top_100_users AS (
+  SELECT Id, Reputation, CreationDate, DisplayName
+  FROM Users
+  ORDER BY Reputation DESC
+  LIMIT 100
+),
+top_100_posts AS (
+  SELECT Id, Score, ViewCount, Title, CreationDate, OwnerUserId
+  FROM Posts
+  ORDER BY Score DESC
+  LIMIT 100
+),
+user_post_intersection AS (
+  SELECT u.Id, u.Reputation, u.CreationDate, u.DisplayName, 
+         p.Id AS PostId, p.Score, p.ViewCount, p.Title, p.CreationDate AS PostCreationDate
+  FROM top_100_users u
+  JOIN top_100_posts p ON u.Id = p.OwnerUserId
+),
+post_votes AS (
+  SELECT p.Id, SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+             SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+  FROM Posts p
+  JOIN Votes v ON p.Id = v.PostId
+  GROUP BY p.Id
+),
+post_tags AS (
+  SELECT p.Id, STRING_AGG(t.TagName, ', ') AS Tags
+  FROM Posts p
+  JOIN PostTags pt ON p.Id = pt.PostId
+  JOIN Tags t ON pt.TagId = t.Id
+  GROUP BY p.Id
+)
+SELECT upi.Id, upi.Reputation, upi.CreationDate, upi.DisplayName, 
+       upi.PostId, upi.Score, upi.ViewCount, upi.Title, upi.PostCreationDate,
+       pv.UpVotes, pv.DownVotes, pt.Tags
+FROM user_post_intersection upi
+JOIN post_votes pv ON upi.PostId = pv.Id
+JOIN post_tags pt ON upi.PostId = pt.Id
+ORDER BY upi.Reputation DESC, upi.Score DESC;

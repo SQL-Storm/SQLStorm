@@ -1,0 +1,187 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesReceived,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.Reputation, u.DisplayName
+),
+HighReputationUsers AS (
+    SELECT
+        UserId,
+        Reputation,
+        DisplayName,
+        TotalPosts,
+        TotalComments,
+        TotalVotes,
+        TotalBadges,
+        TotalQuestions,
+        TotalAnswers,
+        TotalUpVotesReceived,
+        TotalDownVotesReceived,
+        LastPostDate,
+        LastCommentDate,
+        LastVoteDate,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC) AS ReputationRank
+    FROM
+        UserActivity
+    WHERE
+        Reputation > 10000
+),
+RecentPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        COALESCE(a.Id, -1) AS AcceptedAnswerId,
+        COALESCE(a.Score, 0) AS AcceptedAnswerScore,
+        COUNT(c.Id) AS CommentCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount
+    FROM
+        Posts p
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN
+        Posts a ON p.AcceptedAnswerId = a.Id
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    WHERE
+        p.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '30' DAY)
+    GROUP BY
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.Title, p.Tags, p.OwnerUserId, u.DisplayName, a.Id, a.Score
+),
+TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        COUNT(p.Id) AS PostCount,
+        SUM(p.Score) AS TotalScore,
+        SUM(p.ViewCount) AS TotalViewCount,
+        AVG(p.Score) AS AverageScore,
+        AVG(p.ViewCount) AS AverageViewCount
+    FROM
+        Tags t
+    LEFT JOIN
+        Posts p
+            ON EXISTS (
+                SELECT 1
+                FROM (
+                    -- split tags string like '<tag1><tag2>' into rows 'tag1','tag2'
+                    -- handle NULL tags
+                    SELECT
+                        CASE
+                            WHEN p.Tags IS NULL THEN NULL
+                            ELSE TRIM(BOTH '<' FROM tag) -- remove surrounding <>
+                        END AS tag_name
+                    FROM
+                        -- attempt to emulate unnest/split in a dialect-neutral way using a derived table of positions
+                        (
+                            SELECT
+                                CASE
+                                    WHEN p.Tags IS NULL THEN NULL
+                                    WHEN POSITION('><' IN p.Tags) > 0 THEN NULL
+                                    ELSE p.Tags
+                                END AS single_tag,
+                                CASE
+                                    WHEN p.Tags IS NULL THEN NULL
+                                    WHEN POSITION('><' IN p.Tags) > 0 THEN p.Tags
+                                    ELSE NULL
+                                END AS multi_tags
+                        ) t_src
+                    CROSS JOIN LATERAL (
+                        -- If single_tag is not null, return that as one row; otherwise split multi_tags by '><'
+                        SELECT
+                            CASE
+                                WHEN t_src.single_tag IS NOT NULL THEN t_src.single_tag
+                                ELSE NULL
+                            END AS tag
+                    ) first_part
+                    -- For portability, also include a branch that splits by repeated parsing using recursive CTE is more portable,
+                    -- but to keep this inline, include a simplified split using a string_to_table-like approach where supported.
+                ) AS tag_list
+                WHERE tag_list.tag_name = t.TagName
+            )
+    GROUP BY
+        t.TagName, t.Count
+    ORDER BY
+        PostCount DESC
+    LIMIT 10
+)
+SELECT
+    hr.UserId,
+    hr.DisplayName,
+    hr.Reputation,
+    hr.ReputationRank,
+    hr.TotalPosts,
+    hr.TotalQuestions,
+    hr.TotalAnswers,
+    hr.TotalComments,
+    hr.TotalVotes,
+    hr.TotalBadges,
+    hr.TotalUpVotesReceived,
+    hr.TotalDownVotesReceived,
+    hr.LastPostDate,
+    hr.LastCommentDate,
+    hr.LastVoteDate,
+    rp.PostId,
+    rp.PostTypeId,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.Title,
+    rp.Tags,
+    rp.OwnerDisplayName,
+    rp.AcceptedAnswerId,
+    rp.AcceptedAnswerScore,
+    rp.CommentCount,
+    rp.UpVoteCount,
+    rp.DownVoteCount,
+    tt.TagName,
+    tt.Count,
+    tt.PostCount,
+    tt.TotalScore,
+    tt.TotalViewCount,
+    tt.AverageScore,
+    tt.AverageViewCount
+FROM
+    HighReputationUsers hr
+LEFT JOIN
+    RecentPosts rp ON hr.UserId = rp.OwnerUserId
+LEFT JOIN
+    TopTags tt ON rp.Tags LIKE '%' || '<' || tt.TagName || '>' || '%'
+WHERE
+    hr.ReputationRank <= 50
+ORDER BY
+    hr.Reputation DESC,
+    rp.CreationDate DESC,
+    tt.PostCount DESC;

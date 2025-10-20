@@ -1,0 +1,24 @@
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    b.Name AS BadgeName,
+    p.Title AS QuestionTitle,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVotes,
+    COALESCE((SELECT AVG(Score) FROM Posts WHERE ParentId = p.Id), 0) AS AvgAnswerScore,
+    COALESCE((SELECT AVG(v2.BountyAmount) FROM Votes v2 WHERE v2.PostId = p.Id AND v2.BountyAmount IS NOT NULL), 0) AS AvgBounty
+FROM 
+    Users u
+JOIN 
+    Badges b ON b.UserId = u.Id
+JOIN 
+    Posts p ON p.OwnerUserId = u.Id
+WHERE 
+    u.Reputation > 1000
+    AND p.PostTypeId = 1
+    AND b.Class = 1
+GROUP BY 
+    u.DisplayName, u.Reputation, b.Name, p.Title, p.Id
+ORDER BY 
+    u.Reputation DESC, CommentCount DESC;

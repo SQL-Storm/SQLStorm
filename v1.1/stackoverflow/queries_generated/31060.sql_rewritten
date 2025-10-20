@@ -1,0 +1,52 @@
+-- {"query": "31060.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4o-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 342} 
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId, 
+        u.DisplayName, 
+        COUNT(p.Id) AS PostCount, 
+        SUM(v.VoteTypeId = 2) AS UpVotes, 
+        SUM(v.VoteTypeId = 3) AS DownVotes, 
+        SUM(b.Class = 1) AS GoldBadges, 
+        SUM(b.Class = 2) AS SilverBadges, 
+        SUM(b.Class = 3) AS BronzeBadges,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN 
+        Badges b ON u.Id = b.UserId
+    GROUP BY 
+        u.Id, u.DisplayName
+),
+TopUsers AS (
+    SELECT 
+        UserId, 
+        DisplayName, 
+        PostCount, 
+        UpVotes, 
+        DownVotes, 
+        GoldBadges, 
+        SilverBadges, 
+        BronzeBadges, 
+        LastPostDate,
+        RANK() OVER (ORDER BY PostCount DESC, UpVotes DESC, LastPostDate DESC) AS UserRank
+    FROM 
+        UserActivity
+)
+SELECT 
+    UserId, 
+    DisplayName, 
+    PostCount, 
+    UpVotes, 
+    DownVotes, 
+    GoldBadges, 
+    SilverBadges, 
+    BronzeBadges, 
+    LastPostDate
+FROM 
+    TopUsers
+WHERE 
+    UserRank <= 10;

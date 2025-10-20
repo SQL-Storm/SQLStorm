@@ -1,0 +1,67 @@
+WITH TagUsage AS (
+    SELECT t.Id        AS TagId,
+           t.TagName,
+           COUNT(p.Id)             AS TotalQuestions,
+           SUM(p.Score)            AS TotalScore,
+           MAX(p.LastActivityDate) AS LatestQuestion
+    FROM Tags t
+    JOIN Posts p
+          ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE p.PostTypeId = 1
+    GROUP BY t.Id, t.TagName
+),
+UserStats AS (
+    SELECT u.Id            AS UserId,
+           u.DisplayName,
+           t.Id              AS TagId,
+           COUNT(p.Id)                                                             AS UserQuestions,
+           AVG(p.Score)                                                            AS UserAvgScore,
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)                       AS UserUpvotes,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)                       AS UserDownvotes,
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) -
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)                       AS UserNetVotes,
+           MAX(p.LastActivityDate)                                                AS UserLastAct
+    FROM Posts p
+    JOIN Users u
+          ON p.OwnerUserId = u.Id
+    JOIN Tags t
+          ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    LEFT JOIN Votes v
+          ON v.PostId = p.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY u.Id, u.DisplayName, t.Id
+),
+RankedTags AS (
+    SELECT us.UserId,
+           us.DisplayName,
+           us.TagId,
+           us.UserQuestions,
+           us.UserAvgScore,
+           us.UserUpvotes,
+           us.UserDownvotes,
+           us.UserNetVotes,
+           us.UserLastAct,
+           tu.TotalQuestions,
+           tu.TotalScore,
+           tu.LatestQuestion,
+           ROW_NUMBER() OVER (PARTITION BY us.TagId ORDER BY us.UserNetVotes DESC, us.UserQuestions DESC)     AS TagRank,
+           PERCENT_RANK() OVER (PARTITION BY us.TagId ORDER BY us.UserNetVotes DESC)                          AS TagPercentile
+    FROM UserStats us
+    JOIN TagUsage tu
+          ON us.TagId = tu.TagId
+)
+SELECT r.TagId,
+       t.TagName,
+       r.DisplayName,
+       r.UserQuestions,
+       r.UserAvgScore,
+       r.UserUpvotes,
+       r.UserDownvotes,
+       r.UserNetVotes,
+       r.TagRank,
+       r.TagPercentile
+FROM RankedTags r
+JOIN Tags t
+      ON r.TagId = t.Id
+WHERE r.TagRank <= 5
+ORDER BY t.TagName, r.TagRank;

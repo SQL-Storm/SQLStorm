@@ -1,0 +1,37 @@
+-- {"query": "36097.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 307} 
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.PostTypeId,
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  p.Tags,
+  p.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  COUNT(DISTINCT a.Id) AS AnswerCount,
+  AVG(vt.Value) AS AvgLast24HoursUpvotesPerHour
+FROM
+  Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Posts a ON a.ParentId = p.Id
+  LEFT JOIN (
+    SELECT
+      PostId,
+      SUM(CASE WHEN vt.Name = 'up' OR vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS Value
+    FROM
+      Votes v
+      JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE
+      v.CreationDate >= NOW() - INTERVAL '24 hours'
+    GROUP BY
+      PostId
+  ) v ON v.PostId = p.Id
+WHERE
+  p.PostTypeId = 1
+  AND p.CreationDate >= NOW() - INTERVAL '30 days'
+GROUP BY
+  p.Id, p.Title, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.OwnerUserId, u.DisplayName
+ORDER BY
+  p.Score DESC, p.ViewCount DESC
+LIMIT 100;

@@ -1,0 +1,55 @@
+-- {"query": "56054.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "llama-3.3-instruct", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 422} 
+
+WITH TopUsers AS (
+    SELECT 
+        u.Id, 
+        u.DisplayName, 
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        COUNT(DISTINCT p.Id) AS PostsCount
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    GROUP BY 
+        u.Id, u.DisplayName
+    HAVING 
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) > 1000
+),
+TopTags AS (
+    SELECT 
+        t.TagName, 
+        COUNT(DISTINCT p.Id) AS PostsCount
+    FROM 
+        Tags t
+    LEFT JOIN 
+        Posts p ON t.Id = (SELECT Id FROM Tags WHERE TagName = ANY(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), ''><'')))
+    GROUP BY 
+        t.TagName
+    HAVING 
+        COUNT(DISTINCT p.Id) > 1000
+)
+SELECT 
+    tu.DisplayName, 
+    tu.UpVotes, 
+    tu.DownVotes, 
+    tu.PostsCount, 
+    tt.TagName, 
+    tt.PostsCount AS TagPostsCount
+FROM 
+    TopUsers tu
+JOIN 
+    Posts p ON tu.Id = p.OwnerUserId
+JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+JOIN 
+    Tags t ON pl.RelatedPostId = (SELECT Id FROM Posts WHERE Id = ANY(string_to_array(substring(t.Tags, 2, length(t.Tags)-2), ''><'')))
+JOIN 
+    TopTags tt ON t.TagName = tt.TagName
+WHERE 
+    pl.LinkTypeId = 1
+ORDER BY 
+    tu.UpVotes DESC, 
+    tu.PostsCount DESC;

@@ -1,0 +1,156 @@
+WITH UserPostStats AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        COUNT(CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionCount,
+        COUNT(CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswerCount,
+        SUM(P.Score) AS TotalPostScore,
+        AVG(CASE WHEN P.PostTypeId = 1 THEN P.Score END) AS AvgQuestionScore,
+        AVG(CASE WHEN P.PostTypeId = 2 THEN P.Score END) AS AvgAnswerScore,
+        COUNT(CASE WHEN P.PostTypeId = 2 AND Q.AcceptedAnswerId = P.Id THEN P.Id END) AS AcceptedAnswerCount
+    FROM Posts P
+    LEFT JOIN Posts Q ON P.ParentId = Q.Id AND Q.PostTypeId = 1
+    WHERE P.OwnerUserId IS NOT NULL AND P.PostTypeId IN (1, 2)
+    GROUP BY P.OwnerUserId
+),
+UserCommentStats AS (
+    SELECT
+        UserId,
+        COUNT(Id) AS CommentCount,
+        SUM(Score) AS TotalCommentScore
+    FROM Comments
+    WHERE UserId IS NOT NULL
+    GROUP BY UserId
+),
+UserBadgeStats AS (
+    SELECT
+        UserId,
+        COUNT(CASE WHEN Class = 1 THEN Id END) AS GoldBadges,
+        COUNT(CASE WHEN Class = 2 THEN Id END) AS SilverBadges,
+        COUNT(CASE WHEN Class = 3 THEN Id END) AS BronzeBadges,
+        COUNT(Id) AS TotalBadges
+    FROM Badges
+    GROUP BY UserId
+),
+UserHistoryStats AS (
+    SELECT
+        UserId,
+        COUNT(CASE WHEN PostHistoryTypeId IN (4, 5, 6) THEN Id END) AS EditCount,
+        COUNT(CASE WHEN PostHistoryTypeId IN (10, 12, 14, 19) THEN Id END) AS ModerationActionCount
+    FROM PostHistory
+    WHERE UserId IS NOT NULL
+    GROUP BY UserId
+),
+UserTagAgg AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        tag AS TagName
+    FROM Posts P,
+    LATERAL (
+      SELECT TRIM(t.tagpart) AS tag
+      FROM (
+        -- remove surrounding <> and split on '><' using standard SQL functions
+        SELECT
+          CASE
+            WHEN P.Tags LIKE '<%>' THEN SUBSTRING(P.Tags FROM 2 FOR (CHAR_LENGTH(P.Tags) - 2))
+            ELSE P.Tags
+          END AS inner_tags
+      ) AS s,
+      LATERAL (
+        -- split by delimiter '><' using recursive split via POSITION and SUBSTRING for dialects without string_to_array/unnest
+        SELECT
+          CASE WHEN pos = 0 THEN NULL ELSE part END AS tagpart
+        FROM (
+          SELECT
+            1 AS seq,
+            CASE
+              WHEN POSITION('><' IN s.inner_tags) = 0 THEN s.inner_tags
+              ELSE SUBSTRING(s.inner_tags FROM 1 FOR POSITION('><' IN s.inner_tags) - 1)
+            END AS part,
+            POSITION('><' IN s.inner_tags) AS pos,
+            s.inner_tags AS rest
+        ) AS firstpart
+        UNION ALL
+        SELECT
+          NULL, -- seq unused
+          CASE
+            WHEN POSITION('><' IN rest2) = 0 THEN rest2
+            ELSE SUBSTRING(rest2 FROM 1 FOR POSITION('><' IN rest2) - 1)
+          END AS part,
+          POSITION('><' IN rest2) AS pos,
+          CASE
+            WHEN POSITION('><' IN rest2) = 0 THEN ''
+            ELSE SUBSTRING(rest2 FROM POSITION('><' IN rest2) + 2)
+          END AS rest2
+        FROM (
+          SELECT
+            CASE
+              WHEN POSITION('><' IN s.inner_tags) = 0 THEN ''
+              ELSE SUBSTRING(s.inner_tags FROM POSITION('><' IN s.inner_tags) + 2)
+            END AS rest2
+        ) r
+      ) t(tagpart)
+      WHERE t.tagpart IS NOT NULL AND t.tagpart <> ''
+    ) AS split_tags
+    WHERE P.PostTypeId = 1 AND P.OwnerUserId IS NOT NULL AND P.Tags IS NOT NULL
+),
+UserTopTagsRanked AS (
+    SELECT
+        UserId,
+        TagName,
+        COUNT(*) AS TagPostCount,
+        ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY COUNT(*) DESC, TagName) AS rn
+    FROM UserTagAgg
+    GROUP BY UserId, TagName
+),
+UserMostActiveYear AS (
+    SELECT
+        OwnerUserId AS UserId,
+        EXTRACT(YEAR FROM CreationDate) AS ActiveYear,
+        COUNT(Id) AS PostCount,
+        ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY COUNT(Id) DESC, EXTRACT(YEAR FROM CreationDate) DESC) AS rn
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL
+    GROUP BY OwnerUserId, EXTRACT(YEAR FROM CreationDate)
+)
+SELECT
+    U.Id AS UserId,
+    U.DisplayName,
+    U.Reputation,
+    U.CreationDate AS UserCreationDate,
+    U.LastAccessDate,
+    COALESCE(UPS.QuestionCount, 0) AS TotalQuestions,
+    COALESCE(UPS.AnswerCount, 0) AS TotalAnswers,
+    COALESCE(UPS.TotalPostScore, 0) AS TotalPostsScore,
+    COALESCE(UPS.AvgQuestionScore, 0.0) AS AvgQuestionScore,
+    COALESCE(UPS.AvgAnswerScore, 0.0) AS AvgAnswerScore,
+    COALESCE(UPS.AcceptedAnswerCount, 0) AS AcceptedAnswersByThisUser,
+    COALESCE(UCS.CommentCount, 0) AS TotalComments,
+    COALESCE(UCS.TotalCommentScore, 0) AS TotalCommentsScore,
+    COALESCE(UBS.GoldBadges, 0) AS GoldBadgesCount,
+    COALESCE(UBS.SilverBadges, 0) AS SilverBadgesCount,
+    COALESCE(UBS.BronzeBadges, 0) AS BronzeBadgesCount,
+    COALESCE(UBS.TotalBadges, 0) AS AllBadgesCount,
+    COALESCE(UHS.EditCount, 0) AS TotalEdits,
+    COALESCE(UHS.ModerationActionCount, 0) AS TotalModerationActions,
+    MAY.ActiveYear AS MostActiveYear,
+    STRING_AGG(CASE WHEN UTT.rn <= 3 THEN (UTT.TagName || ' (' || CAST(UTT.TagPostCount AS varchar) || ')') END, ', ' ORDER BY UTT.rn) AS Top3Tags,
+    RANK() OVER (ORDER BY U.Reputation DESC, COALESCE(UPS.TotalPostScore, 0) DESC, COALESCE(UBS.TotalBadges, 0) DESC, U.CreationDate ASC) AS OverallRank
+FROM Users U
+LEFT JOIN UserPostStats UPS ON U.Id = UPS.UserId
+LEFT JOIN UserCommentStats UCS ON U.Id = UCS.UserId
+LEFT JOIN UserBadgeStats UBS ON U.Id = UBS.UserId
+LEFT JOIN UserHistoryStats UHS ON U.Id = UHS.UserId
+LEFT JOIN UserMostActiveYear MAY ON U.Id = MAY.UserId AND MAY.rn = 1
+LEFT JOIN UserTopTagsRanked UTT ON U.Id = UTT.UserId AND UTT.rn <= 3
+WHERE
+    U.Reputation >= 5000
+    AND U.LastAccessDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years')
+    AND (COALESCE(UPS.QuestionCount, 0) > 0 OR COALESCE(UPS.AnswerCount, 0) > 0)
+GROUP BY
+    U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate,
+    UPS.QuestionCount, UPS.AnswerCount, UPS.TotalPostScore, UPS.AvgQuestionScore,
+    UPS.AvgAnswerScore, UPS.AcceptedAnswerCount, UCS.CommentCount, UCS.TotalCommentScore,
+    UBS.GoldBadges, UBS.SilverBadges, UBS.BronzeBadges, UBS.TotalBadges, UHS.EditCount,
+    UHS.ModerationActionCount, MAY.ActiveYear, UTT.TagName, UTT.TagPostCount, UTT.rn
+ORDER BY OverallRank
+LIMIT 250;

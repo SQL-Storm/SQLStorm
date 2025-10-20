@@ -1,0 +1,39 @@
+WITH recent_posts AS (
+  SELECT p.Id, p.CreationDate, p.OwnerUserId, p.PostTypeId, p.Score, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.ViewCount, p.CommunityOwnedDate
+  FROM Posts p
+  WHERE p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR)
+  AND p.PostTypeId IN (1, 2)
+),
+active_users AS (
+  SELECT u.Id, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+  FROM Users u
+  WHERE u.LastAccessDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' MONTH)
+)
+SELECT
+  rp.Id AS post_id,
+  rp.CreationDate AS post_creation_date,
+  rp.OwnerUserId AS owner_user_id,
+  rp.PostTypeId AS post_type_id,
+  rp.Score AS post_score,
+  rp.AnswerCount AS post_answer_count,
+  rp.CommentCount AS post_comment_count,
+  rp.FavoriteCount AS post_favorite_count,
+  rp.ViewCount AS post_view_count,
+  rp.CommunityOwnedDate AS post_community_owned_date,
+  au.Id AS user_id,
+  au.Reputation AS user_reputation,
+  au.CreationDate AS user_creation_date,
+  au.LastAccessDate AS user_last_access_date,
+  au.Views AS user_views,
+  au.UpVotes AS user_upvotes,
+  au.DownVotes AS user_downvotes
+FROM recent_posts rp
+JOIN active_users au ON rp.OwnerUserId = au.Id
+WHERE rp.OwnerUserId IN (
+  SELECT Id
+  FROM active_users
+  ORDER BY Reputation DESC
+  LIMIT 1000
+)
+ORDER BY rp.Score DESC
+LIMIT 100;

@@ -1,0 +1,116 @@
+WITH UserActivity AS (
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(P.Id) AS TotalPosts,
+        MAX(P.CreationDate) AS LastPostDate,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        MAX(C.CreationDate) AS LastCommentDate,
+        AVG(CASE WHEN V.VoteTypeId IS NOT NULL THEN V.VoteTypeId ELSE NULL END) AS AvgVoteType,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotes
+    FROM
+        Users U
+    LEFT JOIN
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN
+        Comments C ON U.Id = C.UserId
+    LEFT JOIN
+        Votes V ON U.Id = V.UserId
+    GROUP BY
+        U.Id, U.Reputation, U.CreationDate
+),
+
+HighReputationUsers AS (
+    SELECT
+        *
+    FROM
+        UserActivity
+    WHERE
+        Reputation > 1000
+),
+
+HighActivityPosts AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        P.Title,
+        COUNT(C.Id) AS CommentCount,
+        MAX(C.CreationDate) AS LastCommentDate,
+        COUNT(DISTINCT V.Id) AS TotalVotes,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotes
+    FROM
+        Posts P
+    LEFT JOIN
+        Comments C ON P.Id = C.PostId
+    LEFT JOIN
+        Votes V ON P.Id = V.PostId
+    GROUP BY
+        P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount, P.Title
+    HAVING
+        COUNT(C.Id) > 10 OR COUNT(DISTINCT V.Id) > 50
+),
+TopTags AS (
+    SELECT
+        T.Id AS TagId,
+        T.TagName,
+        T.Count AS TagCount,
+        EXTRACT(YEAR FROM P.CreationDate) AS Year,
+        COUNT(P.Id) AS PostCount
+    FROM
+        Tags T
+    JOIN
+        Posts P ON T.TagName = ANY (string_to_array(substring(P.Tags, 2, length(P.Tags)-2), '><'))
+    WHERE
+        P.PostTypeId = 1
+    GROUP BY
+        T.Id, T.TagName, T.Count, EXTRACT(YEAR FROM P.CreationDate)
+)
+SELECT
+    U.UserId,
+    U.Reputation,
+    U.UserCreationDate,
+    U.TotalPosts,
+    U.TotalQuestions,
+    U.TotalAnswers,
+    U.TotalComments,
+    U.TotalUpvotes,
+    U.TotalDownvotes,
+    P.PostId,
+    P.PostTypeId,
+    P.PostCreationDate,
+    P.Score,
+    P.ViewCount,
+    P.Title,
+    P.CommentCount,
+    P.TotalVotes,
+    P.TotalUpvotes AS PostUpvotes,
+    P.TotalDownvotes AS PostDownvotes,
+    T.TagId,
+    T.TagName,
+    T.TagCount,
+    T.Year,
+    T.PostCount
+FROM
+    HighReputationUsers U
+JOIN
+    HighActivityPosts P ON U.UserId = P.OwnerUserId
+JOIN
+    TopTags T ON P.PostCreationDate BETWEEN
+        (DATE_TRUNC('year', TO_TIMESTAMP(CAST(T.Year AS TEXT), 'YYYY')))
+        AND (DATE_TRUNC('year', TO_TIMESTAMP(CAST(T.Year AS TEXT), 'YYYY')) + INTERVAL '1 year' - INTERVAL '1 second')
+WHERE P.Score IS NOT NULL
+ORDER BY
+    U.Reputation DESC,
+    P.Score DESC,
+    T.PostCount DESC
+LIMIT
+    100;

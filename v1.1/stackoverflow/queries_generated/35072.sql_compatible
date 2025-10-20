@@ -1,0 +1,94 @@
+WITH user_activity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsCount,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END), 0) AS GoldBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END), 0) AS SilverBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END), 0) AS BronzeBadges,
+        MIN(u.CreationDate) AS RegisteredDate,
+        MAX(u.LastAccessDate) AS LastSeenDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.CreationDate, u.LastAccessDate
+),
+hot_questions AS (
+    SELECT
+        ph.PostId,
+        MIN(ph.CreationDate) AS BecameHotDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 52 -- SelectedHotQuestion
+    GROUP BY ph.PostId
+),
+top_questions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.OwnerUserId,
+        p.Score AS QuestionScore,
+        p.FavoriteCount,
+        p.CreationDate AS AskedOn,
+        hq.BecameHotDate,
+        COUNT(DISTINCT pl.RelatedPostId) AS NumLinkedPosts,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpVotes,
+        COUNT(DISTINCT CASE WHEN v2.VoteTypeId = 3 THEN v2.Id END) AS DownVotes
+    FROM Posts p
+    LEFT JOIN hot_questions hq ON hq.PostId = p.Id
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id AND pl.LinkTypeId = 1
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN Votes v2 ON v2.PostId = p.Id
+    WHERE p.PostTypeId = 1 AND p.Score >= 10 -- moderately popular
+    GROUP BY p.Id, p.OwnerUserId, p.Score, p.FavoriteCount, p.CreationDate, hq.BecameHotDate
+),
+answer_stats AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        COUNT(*) AS Answers,
+        MAX(a.Score) AS HighestAnswerScore,
+        AVG(a.Score) AS AvgAnswerScore
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.TotalPosts,
+    ua.TotalComments,
+    ua.TotalVotes,
+    ua.QuestionsCount,
+    ua.AnswersCount,
+    ua.TotalScore,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.RegisteredDate,
+    ua.LastSeenDate,
+    COUNT(DISTINCT tq.QuestionId) AS HotAndHighScoreQuestions,
+    COALESCE(SUM(tq.QuestionScore),0) AS HotQuestionsCombinedScore,
+    COALESCE(SUM(ans.Answers),0) AS TheirHotQuestionsTotalAnswers,
+    COALESCE(AVG(ans.HighestAnswerScore),0) AS TheirHotQuestionsAvgBestAnswerScore,
+    COALESCE(AVG(tq.FavoriteCount),0) AS TheirHotQuestionsAvgFavorites,
+    MAX(tq.AskedOn) AS MostRecentHotQuestion,
+    MIN(tq.AskedOn) AS OldestHotQuestion
+FROM user_activity ua
+LEFT JOIN top_questions tq ON tq.OwnerUserId = ua.UserId AND tq.BecameHotDate IS NOT NULL
+LEFT JOIN answer_stats ans ON ans.QuestionId = tq.QuestionId
+WHERE
+    (ua.TotalPosts > 20 OR ua.TotalScore > 100)
+GROUP BY
+    ua.UserId, ua.DisplayName, ua.TotalPosts, ua.TotalComments, ua.TotalVotes, ua.QuestionsCount,
+    ua.AnswersCount, ua.TotalScore, ua.GoldBadges, ua.SilverBadges, ua.BronzeBadges,
+    ua.RegisteredDate, ua.LastSeenDate
+HAVING COUNT(DISTINCT tq.QuestionId) > 0
+ORDER BY
+    (ua.TotalScore + COALESCE(SUM(tq.QuestionScore),0)) DESC,
+    HotAndHighScoreQuestions DESC
+LIMIT 50;

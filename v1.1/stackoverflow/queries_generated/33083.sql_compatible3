@@ -1,0 +1,52 @@
+WITH TopTags AS (
+    SELECT
+        (regexp_matches(Posts.Tags, '[^><]+', 'g'))[1] AS Tag,
+        COUNT(*) AS TagCount
+    FROM Posts
+    JOIN (
+        -- generate sequence of possible positions (assumes max 20 tags per post)
+        SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5
+        UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10
+        UNION ALL SELECT 11 UNION ALL SELECT 12 UNION ALL SELECT 13 UNION ALL SELECT 14 UNION ALL SELECT 15
+        UNION ALL SELECT 16 UNION ALL SELECT 17 UNION ALL SELECT 18 UNION ALL SELECT 19 UNION ALL SELECT 20
+    ) t ON (regexp_matches(Posts.Tags, '[^><]+', 'g'))[1] IS NOT NULL
+    WHERE Posts.PostTypeId = 1  -- Questions
+    GROUP BY (regexp_matches(Posts.Tags, '[^><]+', 'g'))[1]
+), TagScores AS (
+    SELECT
+        Tag,
+        TagCount,
+        RANK() OVER (ORDER BY TagCount DESC) AS TagRank
+    FROM TopTags
+), UserTopTags AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        tt.Tag,
+        tt.TagCount,
+        tt.TagRank,
+        p.CreationDate AS QuestionCreationDate,
+        p.Id AS QuestionId,
+        p.Score AS QuestionScore,
+        p.ViewCount,
+        p.Title
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    JOIN TagScores tt ON POSITION(tt.Tag IN p.Tags) > 0  -- Match tags in question's tags
+    WHERE tt.TagRank <= 10  -- Top 10 tags
+), TagBenchmark AS (
+    SELECT
+        Tag,
+        COUNT(DISTINCT UserId) AS UsersPerTag,
+        AVG(QuestionScore) AS AvgQuestionScore,
+        AVG(ViewCount) AS AvgViewCount
+    FROM UserTopTags
+    GROUP BY Tag
+)
+SELECT
+    tb.Tag,
+    tb.UsersPerTag,
+    tb.AvgQuestionScore,
+    tb.AvgViewCount
+FROM TagBenchmark tb
+ORDER BY tb.UsersPerTag DESC, tb.AvgQuestionScore DESC, tb.AvgViewCount DESC;

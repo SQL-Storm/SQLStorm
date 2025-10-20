@@ -1,0 +1,54 @@
+WITH cte1 AS (
+    SELECT p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount,
+           u.Reputation, u.CreationDate AS UserCreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+cte2 AS (
+    SELECT c.PostId, c.Score, c.CreationDate, c.UserId
+    FROM Comments c
+    JOIN cte1 p ON c.PostId = p.Id
+),
+cte3 AS (
+    SELECT p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount,
+           p.Reputation, p.UserCreationDate, p.LastAccessDate, p.Views, p.UpVotes, p.DownVotes,
+           COALESCE(c.PostId IS NOT NULL, FALSE) AS HasComment, COALESCE(c.Score, 0) AS CommentScore
+    FROM cte1 p
+    LEFT JOIN cte2 c ON p.Id = c.PostId
+),
+cte4 AS (
+    SELECT p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount,
+           p.Reputation, p.UserCreationDate, p.LastAccessDate, p.Views, p.UpVotes, p.DownVotes,
+           COALESCE(p.HasComment::boolean, FALSE) AS HasCommentBool, p.CommentScore,
+           COALESCE(v.VoteCount, 0) AS VoteCount
+    FROM cte3 p
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS VoteCount
+        FROM Votes
+        WHERE VoteTypeId IN (2, 3)
+        GROUP BY PostId
+    ) v ON p.Id = v.PostId
+),
+cte5 AS (
+    SELECT p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount,
+           p.Reputation, p.UserCreationDate, p.LastAccessDate, p.Views, p.UpVotes, p.DownVotes,
+           p.HasCommentBool, p.CommentScore,
+           COALESCE(p.VoteCount, 0) AS VoteCount,
+           COALESCE(b.BadgeCount, 0) AS BadgeCount
+    FROM cte4 p
+    LEFT JOIN (
+        SELECT UserId, COUNT(*) AS BadgeCount
+        FROM Badges
+        GROUP BY UserId
+    ) b ON p.OwnerUserId = b.UserId
+)
+SELECT p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount,
+       p.Reputation, p.UserCreationDate, p.LastAccessDate, p.Views, p.UpVotes, p.DownVotes,
+       p.HasCommentBool AS CommentExists, p.CommentScore, p.VoteCount, p.BadgeCount
+FROM cte5 p
+GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount,
+         p.Reputation, p.UserCreationDate, p.LastAccessDate, p.Views, p.UpVotes, p.DownVotes,
+         p.HasCommentBool, p.CommentScore, p.VoteCount, p.BadgeCount
+ORDER BY p.CreationDate DESC
+LIMIT 100;

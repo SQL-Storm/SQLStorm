@@ -1,0 +1,191 @@
+WITH top_users AS (
+    SELECT 
+        u.id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        COUNT(DISTINCT p.id) AS post_count,
+        SUM(CASE WHEN p.posttypeid = 1 THEN 1 ELSE 0 END) AS question_count,
+        SUM(CASE WHEN p.posttypeid = 2 THEN 1 ELSE 0 END) AS answer_count,
+        AVG(p.score) AS avg_post_score,
+        SUM(p.viewcount) AS total_views,
+        ROW_NUMBER() OVER (ORDER BY u.reputation DESC) AS rep_rank
+    FROM users u
+    LEFT JOIN posts p ON u.id = p.owneruserid
+    GROUP BY u.id, u.displayname, u.reputation, u.creationdate
+    HAVING u.reputation >= 1000 AND COUNT(DISTINCT p.id) >= 10
+),
+monthly_activity AS (
+    SELECT 
+        tu.id AS user_id,
+        DATE_TRUNC('month', p.creationdate) AS activity_month,
+        COUNT(*) AS monthly_posts,
+        SUM(p.score) AS monthly_score,
+        AVG(p.score) AS monthly_avg_score,
+        SUM(CASE WHEN p.posttypeid = 1 THEN 1 ELSE 0 END) AS monthly_questions,
+        SUM(CASE WHEN p.posttypeid = 2 THEN 1 ELSE 0 END) AS monthly_answers
+    FROM top_users tu
+    JOIN posts p ON tu.id = p.owneruserid
+    WHERE p.creationdate >= tu.creationdate AND p.creationdate < CAST('2024-10-01 12:34:56' AS timestamp)
+    GROUP BY tu.id, DATE_TRUNC('month', p.creationdate)
+),
+user_badges AS (
+    SELECT 
+        tu.id AS user_id,
+        COUNT(b.id) AS total_badges,
+        SUM(CASE WHEN b.class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+        SUM(CASE WHEN b.class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+        SUM(CASE WHEN b.class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+        COUNT(DISTINCT b.name) AS unique_badges
+    FROM top_users tu
+    LEFT JOIN badges b ON tu.id = b.userid
+    GROUP BY tu.id
+),
+top_tags AS (
+    SELECT 
+        t.tagname,
+        t.count AS tag_usage,
+        COUNT(DISTINCT p.id) AS distinct_posts,
+        AVG(p.score) AS avg_score,
+        SUM(p.viewcount) AS total_views
+    FROM tags t
+    JOIN posts p ON t.excerptpostid = p.id OR t.wikipostid = p.id
+    WHERE t.count > 100
+    GROUP BY t.tagname, t.count
+),
+question_performance AS (
+    SELECT 
+        p.id AS question_id,
+        p.title,
+        p.creationdate,
+        p.score AS q_score,
+        p.viewcount,
+        p.answercount,
+        p.commentcount,
+        p.favoritecount,
+        COALESCE(accepted.score, 0) AS accepted_answer_score,
+        AVG(answers.score) AS avg_answer_score,
+        SUM(CASE WHEN vl.vote_typeid = 2 THEN vl.vote_count ELSE 0 END) AS upvotes,
+        SUM(CASE WHEN vl.vote_typeid = 3 THEN vl.vote_count ELSE 0 END) AS downvotes,
+        tu.reputation AS asker_rep,
+        ROW_NUMBER() OVER (
+            PARTITION BY DATE_TRUNC('month', p.creationdate) 
+            ORDER BY p.score DESC, p.viewcount DESC
+        ) AS monthly_rank
+    FROM posts p
+    JOIN top_users tu ON p.owneruserid = tu.id
+    LEFT JOIN posts answers ON p.id = answers.parentid AND answers.posttypeid = 2
+    LEFT JOIN posts accepted ON p.acceptedanswerid = accepted.id
+    LEFT JOIN (
+        SELECT 
+            postid,
+            votetypeid AS vote_typeid,
+            COUNT(*) AS vote_count
+        FROM votes 
+        WHERE votetypeid IN (2, 3)
+        GROUP BY postid, votetypeid
+    ) vl ON p.id = vl.postid
+    WHERE p.posttypeid = 1 AND p.creationdate >= DATE '2020-01-01'
+    GROUP BY p.id, p.title, p.creationdate, p.score, p.viewcount, 
+             p.answercount, p.commentcount, p.favoritecount, 
+             accepted.score, tu.reputation
+),
+tag_question_stats AS (
+    SELECT 
+        p.id AS question_id,
+        string_to_array(
+            substring(p.tags FROM 2 FOR (char_length(p.tags)-2)), 
+            '><'
+        ) AS tag_array,
+        p.score,
+        p.viewcount,
+        p.answercount
+    FROM posts p
+    JOIN question_performance qp ON p.id = qp.question_id
+    WHERE p.posttypeid = 1 AND p.tags IS NOT NULL AND char_length(p.tags) > 2
+)
+SELECT 
+    tu.displayname AS username,
+    tu.reputation,
+    tu.post_count,
+    tu.question_count,
+    tu.answer_count,
+    tu.avg_post_score,
+    ROUND(CAST(tu.total_views AS numeric) / NULLIF(tu.post_count, 0), 2) AS views_per_post,
+    ub.total_badges,
+    ub.gold_badges,
+    ub.silver_badges,
+    ub.bronze_badges,
+    ma.activity_month,
+    ma.monthly_posts,
+    ma.monthly_score,
+    ROUND(CAST(ma.monthly_score AS numeric) / NULLIF(ma.monthly_posts, 0), 2) AS monthly_score_per_post,
+    qp.question_id,
+    qp.title,
+    qp.q_score,
+    qp.viewcount,
+    qp.answercount,
+    qp.accepted_answer_score,
+    qp.avg_answer_score,
+    (qp.upvotes - COALESCE(qp.downvotes, 0)) AS net_votes,
+    qp.monthly_rank,
+    (
+        SELECT string_agg(tt.tagname, ', ' ORDER BY tt.tag_usage DESC)
+        FROM top_tags tt
+        WHERE EXISTS (
+            SELECT 1 FROM tag_question_stats tqs
+            WHERE tqs.question_id = qp.question_id
+            AND tt.tagname = ANY(tqs.tag_array)
+        )
+        LIMIT 3
+    ) AS top_related_tags,
+    RANK() OVER (
+        PARTITION BY ma.activity_month 
+        ORDER BY ma.monthly_score DESC, tu.reputation DESC
+    ) AS monthly_user_performance_rank,
+    PERCENT_RANK() OVER (
+        ORDER BY tu.reputation DESC
+    ) AS reputation_percentile
+FROM top_users tu
+JOIN user_badges ub ON tu.id = ub.user_id
+JOIN monthly_activity ma ON tu.id = ma.user_id
+JOIN question_performance qp ON qp.asker_rep = tu.reputation AND qp.question_id IS NOT NULL
+WHERE ma.activity_month >= DATE '2023-01-01'
+    AND qp.monthly_rank <= 50
+    AND tu.post_count >= 50
+GROUP BY
+    tu.displayname,
+    tu.reputation,
+    tu.post_count,
+    tu.question_count,
+    tu.answer_count,
+    tu.avg_post_score,
+    tu.total_views,
+    ub.total_badges,
+    ub.gold_badges,
+    ub.silver_badges,
+    ub.bronze_badges,
+    ma.activity_month,
+    ma.monthly_posts,
+    ma.monthly_score,
+    qp.question_id,
+    qp.title,
+    qp.q_score,
+    qp.viewcount,
+    qp.answercount,
+    qp.accepted_answer_score,
+    qp.avg_answer_score,
+    qp.upvotes,
+    qp.downvotes,
+    qp.monthly_rank,
+    tu.id,
+    tu.creationdate,
+    tu.rep_rank,
+    ub.user_id,
+    ma.user_id,
+    qp.asker_rep
+ORDER BY 
+    ma.activity_month DESC,
+    ma.monthly_score DESC,
+    tu.reputation DESC
+LIMIT 1000;

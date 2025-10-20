@@ -1,0 +1,48 @@
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.PostTypeId,
+  p.CreationDate,
+  p.ViewCount,
+  p.Score,
+  p.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation,
+  p.Tags,
+  pc.CommentsToday,
+  COALESCE(vs.Upvotes, 0) AS UpvotesToday,
+  COALESCE(vs.Downvotes, 0) AS DownvotesToday,
+  COALESCE(br.BadgeCount, 0) AS BadgeCountToday
+FROM Posts p
+JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN (
+  SELECT
+    PostId,
+    COUNT(*) AS CommentsToday
+  FROM Comments
+  WHERE CreationDate >= DATE_TRUNC('day', CAST('2024-10-01' AS date))
+  GROUP BY PostId
+) pc ON pc.PostId = p.Id
+LEFT JOIN (
+  SELECT
+    PostId,
+    SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+    SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes
+  FROM Votes
+  WHERE CreationDate >= DATE_TRUNC('day', CAST('2024-10-01' AS date))
+  GROUP BY PostId
+) vs ON vs.PostId = p.Id
+LEFT JOIN (
+  SELECT
+    OwnerUserId,
+    COUNT(*) AS BadgeCount
+  FROM Badges
+  WHERE Date >= DATE_TRUNC('day', CAST('2024-10-01' AS date))
+  GROUP BY OwnerUserId
+) br ON br.OwnerUserId = p.OwnerUserId
+WHERE
+  p.CreationDate >= DATE_TRUNC('day', CAST('2024-10-01' AS date)) - INTERVAL '7' DAY
+  AND p.PostTypeId IN (1, 2)
+ORDER BY
+  p.CreationDate DESC
+LIMIT 100;

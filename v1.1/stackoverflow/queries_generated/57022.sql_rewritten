@@ -1,0 +1,113 @@
+-- {"query": "57022.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2291, "output_tokens": 993} 
+WITH ActiveUsers AS (
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.CreationDate,
+        U.DisplayName,
+        U.LastAccessDate,
+        COUNT(P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(P.Score) AS TotalScore,
+        MAX(P.CreationDate) AS LastPostDate
+    FROM
+        Users U
+    LEFT JOIN
+        Posts P ON U.Id = P.OwnerUserId
+    WHERE
+        U.LastAccessDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+    GROUP BY
+        U.Id, U.Reputation, U.CreationDate, U.DisplayName, U.LastAccessDate
+),
+HighReputationUsers AS (
+    SELECT
+        UserId,
+        Reputation,
+        DisplayName,
+        TotalPosts,
+        TotalQuestions,
+        TotalAnswers,
+        TotalScore,
+        LastPostDate
+    FROM
+        ActiveUsers
+    WHERE
+        Reputation > 1000
+),
+TopTags AS (
+    SELECT
+        T.TagName,
+        T.Count,
+        T.ExcerptPostId,
+        T.WikiPostId,
+        COUNT(PT.Id) AS QuestionsWithTag
+    FROM
+        Tags T
+    JOIN
+        (SELECT DISTINCT PostId FROM PostTags) PT ON T.Id = PT.TagId
+    GROUP BY
+        T.TagName, T.Count, T.ExcerptPostId, T.WikiPostId
+    ORDER BY
+        QuestionsWithTag DESC
+    LIMIT 10
+),
+RecentHighVotePosts AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.Title,
+        P.Tags,
+        P.AnswerCount,
+        U.DisplayName AS OwnerDisplayName
+    FROM
+        Posts P
+    JOIN
+        Users U ON P.OwnerUserId = U.Id
+    WHERE
+        P.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '7 days'
+        AND P.Score > 10
+    ORDER BY
+        P.Score DESC
+    LIMIT 20
+),
+UserBadges AS (
+    SELECT
+        B.UserId,
+        U.DisplayName,
+        COUNT(B.Id) AS TotalBadges,
+  COUNT(CASE WHEN B.Class = 1 THEN 1 ELSE NULL END) as GoldBadges,
+  COUNT(CASE WHEN B.Class = 2 THEN 1 ELSE NULL END) as SilverBadges,
+   COUNT(CASE WHEN B.Class = 3 THEN 1 ELSE NULL END) as BronzeBadges
+    FROM
+        Badges B
+    JOIN
+        Users U ON B.UserId = U.Id
+    GROUP BY
+        B.UserId, U.DisplayName
+    ORDER BY totalbadges desc
+)
+SELECT
+    U.DisplayName AS ActiveUser,
+    U.Reputation,
+    U.TotalPosts,
+    U.TotalQuestions,
+    U.TotalAnswers,
+    U.TotalScore,
+    T.TagName AS TopTag,
+    T.QuestionsWithTag,
+    R.PostId AS HighVotePostId,
+    R.Title AS HighVotePostTitle,
+    R.Score AS HighVotePostScore,
+    B.TotalBadges, B.GoldBadges , B.SilverBadges, B.BronzeBadges
+FROM
+    HighReputationUsers U
+LEFT JOIN
+    TopTags T ON 1=1
+LEFT JOIN
+    RecentHighVotePosts R ON U.UserId = R.OwnerUserId
+Left Join
+     UserBadges B on B.UserId=U.UserId

@@ -1,4 +1,4 @@
--- {"query": "14043.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 102740, "output_tokens": 43392} 
+-- {"query": "14043.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 102740, "output_tokens": 43392} 
 WITH cte AS (
   SELECT p.Id, p.PostTypeId, p.CreationDate, p.Score, p.AnswerCount, p.CommentCount, p.FavoriteCount, u.Reputation, u.Views, u.UpVotes, u.DownVotes,
          CASE WHEN p.PostTypeId = 1 THEN p.AcceptedAnswerId ELSE p.ParentId END AS ParentId,

@@ -1,0 +1,63 @@
+WITH top_users AS (
+  SELECT u.id, u.displayname, COUNT(DISTINCT p.id) AS question_count, 
+         AVG(p.score) AS avg_score
+  FROM users u
+  JOIN posts p ON u.id = p.owneruserid
+  WHERE p.posttypeid = 1 AND u.reputation > 1000
+  GROUP BY u.id, u.displayname
+  HAVING COUNT(DISTINCT p.id) > 5
+  ORDER BY SUM(p.score) DESC
+  LIMIT 50
+),
+user_engagement AS (
+  SELECT tu.id, tu.displayname,
+         COUNT(DISTINCT v.postid) AS upvotes_given,
+         COUNT(DISTINCT c.postid) AS comments_made,
+         COUNT(DISTINCT b.id) AS badges_earned
+  FROM top_users tu
+  LEFT JOIN votes v ON tu.id = v.userid AND v.votetypeid = 2
+  LEFT JOIN comments c ON tu.id = c.userid
+  LEFT JOIN badges b ON tu.id = b.userid
+  GROUP BY tu.id, tu.displayname
+),
+tag_activity AS (
+  SELECT p.owneruserid AS userid, 
+         COUNT(DISTINCT REGEXP_REPLACE(p.tags, '<([^>]+)>', '\1', 'g')) AS unique_tags_used
+  FROM posts p
+  WHERE p.posttypeid = 1 AND p.owneruserid IN (SELECT id FROM top_users)
+  GROUP BY p.owneruserid
+),
+aggregated_stats AS (
+  SELECT tu.id,
+         tu.displayname,
+         tu.question_count,
+         tu.avg_score,
+         COALESCE(ue.upvotes_given, 0) AS upvotes_given,
+         COALESCE(ue.comments_made, 0) AS comments_made,
+         COALESCE(ue.badges_earned, 0) AS badges_earned,
+         COALESCE(ta.unique_tags_used, 0) AS unique_tags_used,
+         DENSE_RANK() OVER (ORDER BY tu.question_count DESC) AS question_rank,
+         DENSE_RANK() OVER (ORDER BY tu.avg_score DESC) AS score_rank
+  FROM top_users tu
+  LEFT JOIN user_engagement ue ON tu.id = ue.id
+  LEFT JOIN tag_activity ta ON tu.id = ta.userid
+)
+SELECT 
+  displayname,
+  question_count,
+  ROUND(avg_score, 2) AS avg_score,
+  upvotes_given,
+  comments_made,
+  badges_earned,
+  unique_tags_used,
+  question_rank,
+  score_rank,
+  CAST((question_count * 0.4 + upvotes_given * 0.3 + badges_earned * 0.2 + unique_tags_used * 0.1) AS DECIMAL(18,4)) AS engagement_score,
+  CASE 
+    WHEN question_rank <= 10 AND score_rank <= 10 THEN 'Elite'
+    WHEN question_rank <= 20 OR score_rank <= 20 THEN 'Strong'
+    ELSE 'Active'
+  END AS activity_tier
+FROM aggregated_stats
+WHERE question_rank <= 25
+ORDER BY engagement_score DESC, question_rank ASC;

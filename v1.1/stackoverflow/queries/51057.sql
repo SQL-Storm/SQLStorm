@@ -1,0 +1,111 @@
+WITH monthly_posts AS (
+    SELECT 
+        EXTRACT(YEAR FROM p.CreationDate) AS year,
+        EXTRACT(MONTH FROM p.CreationDate) AS month,
+        u.Reputation,
+        pt.Name AS post_type,
+        COUNT(p.Id) AS post_count,
+        AVG(p.Score) AS avg_score,
+        SUM(COALESCE(v_up.UpVotes, 0)) AS total_upvotes,
+        SUM(COALESCE(v_down.DownVotes, 0)) AS total_downvotes
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN (
+        SELECT Id AS user_id, SUM(UpVotes) AS UpVotes
+        FROM Users 
+        GROUP BY Id
+    ) v_up ON u.Id = v_up.user_id
+    LEFT JOIN (
+        SELECT Id AS user_id, SUM(DownVotes) AS DownVotes
+        FROM Users 
+        GROUP BY Id
+    ) v_down ON u.Id = v_down.user_id
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY EXTRACT(YEAR FROM p.CreationDate), EXTRACT(MONTH FROM p.CreationDate), u.Reputation, pt.Name
+),
+high_reputation_users AS (
+    SELECT Id, DisplayName, Reputation
+    FROM Users 
+    WHERE Reputation >= 10000
+),
+active_tags AS (
+    SELECT t.TagName AS tag_name, t.Count AS tag_count, p.Title, p.CreationDate
+    FROM Tags t
+    JOIN Posts p ON t.ExcerptPostId = p.Id
+    WHERE t.Count > 100
+),
+post_engagement AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        COALESCE(c.comment_count, 0) AS total_comments,
+        COALESCE(v.upvote_count, 0) AS upvote_count,
+        COALESCE(v.downvote_count, 0) AS downvote_count,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM p.CreationDate) ORDER BY p.ViewCount DESC) AS view_rank,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS user_score_rank,
+        p.OwnerUserId
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS comment_count
+        FROM Comments 
+        GROUP BY PostId
+    ) c ON p.Id = c.PostId
+    LEFT JOIN (
+        SELECT 
+            PostId,
+            SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvote_count,
+            SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvote_count
+        FROM Votes 
+        WHERE VoteTypeId IN (2, 3)
+        GROUP BY PostId
+    ) v ON p.Id = v.PostId
+    WHERE p.PostTypeId = 1
+)
+SELECT 
+    mp.year,
+    mp.month,
+    mp.post_type,
+    user_reps.reputation_bucket,
+    COUNT(mp.post_count) AS total_monthly_posts,
+    AVG(mp.avg_score) AS avg_monthly_score,
+    SUM(mp.total_upvotes) AS total_upvotes_month,
+    SUM(mp.total_downvotes) AS total_downvotes_month,
+    COUNT(DISTINCT hru.DisplayName) AS high_rep_users_active,
+    AVG(pe.view_rank) AS avg_view_rank_top_posts,
+    COUNT(CASE WHEN pe.upvote_count > 100 THEN 1 END) AS high_engagement_posts,
+    STRING_AGG(DISTINCT at.tag_name, ', ' ORDER BY at.tag_name) AS popular_tags,
+    ROUND(AVG(pe.AnswerCount), 2) AS avg_answers_per_question,
+    ROUND(AVG(pe.total_comments), 2) AS avg_comments_per_post,
+    MAX(pe.Score) AS highest_scoring_post,
+    COUNT(CASE WHEN pe.user_score_rank = 1 THEN 1 END) AS top_posts_per_user
+FROM monthly_posts mp
+JOIN (
+    SELECT 
+        Id,
+        CASE 
+            WHEN Reputation < 100 THEN 'Novice'
+            WHEN Reputation < 1000 THEN 'Regular'
+            WHEN Reputation < 10000 THEN 'Expert'
+            ELSE 'Guru'
+        END AS reputation_bucket,
+        DisplayName
+    FROM Users
+) user_reps ON mp.Reputation = user_reps.Id
+LEFT JOIN high_reputation_users hru ON mp.Reputation = hru.Id
+LEFT JOIN active_tags at ON EXTRACT(YEAR FROM at.CreationDate) = mp.year 
+    AND EXTRACT(MONTH FROM at.CreationDate) = mp.month
+LEFT JOIN post_engagement pe ON EXTRACT(YEAR FROM pe.CreationDate) = mp.year 
+    AND EXTRACT(MONTH FROM pe.CreationDate) = mp.month
+    AND pe.user_score_rank <= 10
+WHERE mp.year >= EXTRACT(YEAR FROM CAST('2024-10-01' AS date)) - 2
+    AND mp.post_count > 0
+GROUP BY mp.year, mp.month, mp.post_type, user_reps.reputation_bucket
+HAVING COUNT(mp.post_count) > 5
+ORDER BY mp.year DESC, mp.month DESC, user_reps.reputation_bucket;

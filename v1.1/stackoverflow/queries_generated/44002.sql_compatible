@@ -1,0 +1,22 @@
+SELECT 
+  (EXTRACT(EPOCH FROM (p.LastEditDate - p.CreationDate)))::DOUBLE PRECISION / NULLIF(EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)), 0) AS PostEditToActivityRatio,
+  (p.CommentCount::DOUBLE PRECISION) / NULLIF(EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)), 0) AS CommentPerSecond,
+  (p.AnswerCount::DOUBLE PRECISION) / NULLIF(EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)), 0) AS AnswerPerSecond,
+  (p.ViewCount::DOUBLE PRECISION) / NULLIF(EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)), 0) AS ViewPerSecond,
+  (p.FavoriteCount::DOUBLE PRECISION) / NULLIF(EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)), 0) AS FavoritePerSecond,
+  (COALESCE(u.UpVotes, 0)::DOUBLE PRECISION) / NULLIF(EXTRACT(EPOCH FROM (u.LastAccessDate - u.CreationDate)), 0) AS UpVotePerSecond,
+  (COALESCE(u.DownVotes, 0)::DOUBLE PRECISION) / NULLIF(EXTRACT(EPOCH FROM (u.LastAccessDate - u.CreationDate)), 0) AS DownVotePerSecond,
+  (COALESCE(b.Count, 0)::DOUBLE PRECISION) / NULLIF(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - b.Date)), 0) AS BadgesPerSecond
+FROM Posts p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN (
+  SELECT 
+    UserId, 
+    COUNT(*) AS Count, 
+    MAX(Date) AS Date 
+  FROM Badges
+  GROUP BY UserId
+) b ON p.OwnerUserId = b.UserId
+WHERE p.PostTypeId = 1
+ORDER BY CommentPerSecond DESC
+LIMIT 10;

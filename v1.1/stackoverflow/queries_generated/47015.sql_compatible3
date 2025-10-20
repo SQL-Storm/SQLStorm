@@ -1,0 +1,128 @@
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        CAST(ARRAY[t.TagName] AS varchar[]) AS tag_path,
+        1 AS depth
+    FROM Tags t
+    WHERE t.Count > 10000
+
+    UNION ALL
+
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        th.tag_path || t2.TagName,
+        th.depth + 1
+    FROM Tags t2
+    INNER JOIN tag_hierarchy th ON 1=1
+    WHERE t2.Count BETWEEN 1000 AND 10000
+      AND th.depth < 3
+      AND NOT t2.TagName = ANY(th.tag_path)
+),
+user_expertise AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        string_to_array(substring(p.Tags FROM 2 FOR (length(p.Tags)-2)), '><') AS tag_array,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        SUM(p.Score) AS TotalQuestionScore,
+        AVG(p.Score) AS AvgQuestionScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS MedianScore,
+        STDDEV(p.Score) AS ScoreStdDev
+    FROM Users u
+    INNER JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years')
+      AND u.Reputation > 5000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, p.Tags
+),
+answer_quality AS (
+    SELECT 
+        a.OwnerUserId,
+        q.Id AS QuestionId,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        q.Score AS QuestionScore,
+        a.CreationDate AS AnswerDate,
+        q.CreationDate AS QuestionDate,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600 AS HoursToAnswer,
+        CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END AS IsAccepted,
+        ROW_NUMBER() OVER (PARTITION BY a.OwnerUserId ORDER BY a.Score DESC) AS answer_rank,
+        DENSE_RANK() OVER (PARTITION BY q.Id ORDER BY a.CreationDate) AS answer_position
+    FROM Posts q
+    INNER JOIN Posts a ON a.ParentId = q.Id
+    WHERE q.PostTypeId = 1 
+      AND a.PostTypeId = 2
+      AND a.Score > 0
+      AND q.AnswerCount > 3
+),
+edit_patterns AS (
+    SELECT 
+        ph.PostId,
+        ph.UserId,
+        ph.PostHistoryTypeId,
+        COUNT(*) OVER (PARTITION BY ph.PostId, ph.UserId) AS edits_per_user_post,
+        LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS prev_edit_time,
+        EXTRACT(EPOCH FROM (ph.CreationDate - LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate)))/3600 AS hours_between_edits
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)
+),
+badge_progression AS (
+    SELECT 
+        b.UserId,
+        b.Name,
+        b.Class,
+        b.Date,
+        LEAD(b.Date) OVER (PARTITION BY b.UserId, b.Name ORDER BY b.Date) AS next_badge_date,
+        COUNT(*) OVER (PARTITION BY b.UserId, b.Class ORDER BY b.Date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cumulative_badges
+    FROM Badges b
+)
+SELECT 
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.QuestionCount,
+    ue.TotalQuestionScore,
+    ROUND(CAST(ue.AvgQuestionScore AS numeric), 2) AS AvgQuestionScore,
+    ue.MedianScore,
+    ROUND(CAST(ue.ScoreStdDev AS numeric), 2) AS ScoreStdDev,
+    COUNT(DISTINCT aq.AnswerId) AS HighQualityAnswers,
+    SUM(aq.IsAccepted) AS AcceptedAnswers,
+    AVG(CASE WHEN aq.answer_position = 1 THEN aq.HoursToAnswer END) AS AvgHoursToFirstAnswer,
+    PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY aq.AnswerScore) AS Answer25thPercentile,
+    PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY aq.AnswerScore) AS Answer75thPercentile,
+    COUNT(DISTINCT ep.PostId) AS EditedPosts,
+    AVG(ep.hours_between_edits) FILTER (WHERE ep.hours_between_edits IS NOT NULL) AS AvgHoursBetweenEdits,
+    COUNT(DISTINCT CASE WHEN bp.Class = 1 THEN bp.Name END) AS GoldBadges,
+    COUNT(DISTINCT CASE WHEN bp.Class = 2 THEN bp.Name END) AS SilverBadges,
+    COUNT(DISTINCT CASE WHEN bp.Class = 3 THEN bp.Name END) AS BronzeBadges,
+    MAX(bp.cumulative_badges) AS TotalBadges,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.PostId END) AS UpvotedPosts,
+    COUNT(DISTINCT CASE WHEN c.Score >= 5 THEN c.Id END) AS HighScoringComments,
+    ARRAY_AGG(DISTINCT unnest_tags.tag ORDER BY unnest_tags.tag) FILTER (WHERE unnest_tags.tag IS NOT NULL) AS ExpertiseTags
+FROM user_expertise ue
+LEFT JOIN answer_quality aq ON aq.OwnerUserId = ue.UserId AND aq.answer_rank <= 50
+LEFT JOIN edit_patterns ep ON ep.UserId = ue.UserId
+LEFT JOIN badge_progression bp ON bp.UserId = ue.UserId
+LEFT JOIN Votes v ON v.UserId = ue.UserId AND v.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+LEFT JOIN Comments c ON c.UserId = ue.UserId
+LEFT JOIN LATERAL (SELECT tag FROM UNNEST(ue.tag_array) AS t(tag)) unnest_tags ON 1=1
+WHERE ue.QuestionCount >= 10
+GROUP BY 
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.QuestionCount,
+    ue.TotalQuestionScore,
+    ue.AvgQuestionScore,
+    ue.MedianScore,
+    ue.ScoreStdDev
+HAVING COUNT(DISTINCT aq.AnswerId) > 5
+ORDER BY 
+    ue.Reputation DESC,
+    ue.TotalQuestionScore DESC
+LIMIT 100;

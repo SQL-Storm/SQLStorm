@@ -1,0 +1,37 @@
+-- {"query": "31076.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4o-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 276} 
+
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) AS PostCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        SUM(v.BountyAmount) AS TotalBounties,
+        AVG(CASE WHEN NOT v.UserId IS NULL THEN v.CreationDate END) AS AvgVoteDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        PostCount,
+        QuestionCount,
+        AnswerCount,
+        TotalBounties,
+        ROW_NUMBER() OVER (ORDER BY PostCount DESC, TotalBounties DESC) AS Rank
+    FROM UserActivity
+)
+SELECT 
+    DisplayName,
+    PostCount,
+    QuestionCount,
+    AnswerCount,
+    TotalBounties
+FROM TopUsers
+WHERE Rank <= 10
+ORDER BY TotalBounties DESC, PostCount DESC;

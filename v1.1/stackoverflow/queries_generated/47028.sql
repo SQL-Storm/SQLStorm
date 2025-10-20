@@ -1,0 +1,148 @@
+-- {"query": "47028.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 64232, "output_tokens": 56709} 
+
+WITH RECURSIVE TagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        CAST(t.TagName AS VARCHAR(1000)) AS TagPath,
+        1 AS Level
+    FROM Tags t
+    WHERE t.Count > 10000
+    
+    UNION ALL
+    
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        CAST(th.TagPath || ' -> ' || t2.TagName AS VARCHAR(1000)),
+        th.Level + 1
+    FROM Tags t2
+    INNER JOIN TagHierarchy th ON t2.Count < th.Count / 2
+    WHERE th.Level < 3
+),
+UserExpertise AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        STRING_AGG(DISTINCT t.TagName, ', ' ORDER BY t.TagName) AS ExpertTags,
+        COUNT(DISTINCT p.Id) AS TotalAnswers,
+        AVG(p.Score) AS AvgAnswerScore,
+        SUM(CASE WHEN p.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedAnswers,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS MedianScore,
+        STDDEV(p.Score) AS ScoreStdDev
+    FROM Users u
+    INNER JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 2
+    INNER JOIN Posts q ON p.ParentId = q.Id
+    CROSS JOIN LATERAL string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><') AS tag_array(tag)
+    INNER JOIN Tags t ON t.TagName = tag_array.tag
+    WHERE u.Reputation > 5000
+        AND p.Score > 0
+        AND p.CreationDate >= CURRENT_DATE - INTERVAL '2 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+QuestionQuality AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        COALESCE(p.ViewCount, 0) / NULLIF(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - p.CreationDate)) / 86400, 0) AS ViewsPerDay,
+        COALESCE(p.Score, 0) * 1.0 / NULLIF(p.ViewCount, 0) AS ScoreToViewRatio,
+        COUNT(DISTINCT c.UserId) AS UniqueCommenters,
+        AVG(c.Score) AS AvgCommentScore,
+        MAX(ph.CreationDate) AS LastEditDate,
+        COUNT(DISTINCT ph.UserId) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS EditorCount
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    WHERE p.PostTypeId = 1
+        AND p.Score > 10
+        AND p.ClosedDate IS NULL
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.FavoriteCount, p.CreationDate
+),
+VotingPatterns AS (
+    SELECT 
+        v.UserId,
+        EXTRACT(HOUR FROM v.CreationDate) AS VoteHour,
+        EXTRACT(DOW FROM v.CreationDate) AS VoteDayOfWeek,
+        COUNT(*) AS VoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        AVG(p.Score) AS AvgPostScoreVoted
+    FROM Votes v
+    INNER JOIN Posts p ON v.PostId = p.Id
+    WHERE v.VoteTypeId IN (2, 3)
+        AND v.CreationDate >= CURRENT_DATE - INTERVAL '6 months'
+    GROUP BY v.UserId, EXTRACT(HOUR FROM v.CreationDate), EXTRACT(DOW FROM v.CreationDate)
+),
+BadgeProgression AS (
+    SELECT 
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Class,
+        b.Date,
+        LAG(b.Date) OVER (PARTITION BY b.UserId ORDER BY b.Date) AS PreviousBadgeDate,
+        EXTRACT(EPOCH FROM (b.Date - LAG(b.Date) OVER (PARTITION BY b.UserId ORDER BY b.Date))) / 86400 AS DaysSincePreviousBadge,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId, b.Class ORDER BY b.Date) AS BadgeRankInClass,
+        COUNT(*) OVER (PARTITION BY b.UserId, b.Class) AS TotalBadgesInClass
+    FROM Badges b
+    WHERE b.TagBased = '0'
+)
+SELECT 
+    ue.DisplayName,
+    ue.Reputation,
+    ue.ExpertTags,
+    ue.TotalAnswers,
+    ROUND(ue.AvgAnswerScore::numeric, 2) AS AvgAnswerScore,
+    ROUND(ue.AcceptedAnswers * 100.0 / NULLIF(ue.TotalAnswers, 0), 2) AS AcceptanceRate,
+    qq.Title AS TopQuestionTitle,
+    qq.Score AS TopQuestionScore,
+    ROUND(qq.ViewsPerDay::numeric, 2) AS TopQuestionViewsPerDay,
+    ROUND(qq.ScoreToViewRatio::numeric, 4) AS TopQuestionEngagement,
+    th.TagPath AS RelatedTagHierarchy,
+    vp.VoteHour AS PeakVotingHour,
+    vp.VoteCount AS VotesInPeakHour,
+    ROUND(vp.UpVotes * 1.0 / NULLIF(vp.DownVotes, 0), 2) AS UpDownVoteRatio,
+    bp.BadgeName AS LatestBadge,
+    bp.DaysSincePreviousBadge,
+    bp.TotalBadgesInClass AS GoldBadgeCount,
+    DENSE_RANK() OVER (ORDER BY ue.Reputation DESC, ue.AcceptedAnswers DESC) AS UserRank
+FROM UserExpertise ue
+CROSS JOIN LATERAL (
+    SELECT qq.*
+    FROM QuestionQuality qq
+    INNER JOIN Posts p ON qq.Id = p.Id
+    WHERE p.OwnerUserId = ue.UserId
+    ORDER BY qq.Score DESC, qq.ViewsPerDay DESC
+    LIMIT 1
+) qq
+LEFT JOIN LATERAL (
+    SELECT th.*
+    FROM TagHierarchy th
+    WHERE th.TagName = ANY(string_to_array(ue.ExpertTags, ', '))
+    ORDER BY th.Level DESC, th.Count DESC
+    LIMIT 1
+) th ON true
+LEFT JOIN LATERAL (
+    SELECT vp.*
+    FROM VotingPatterns vp
+    WHERE vp.UserId = ue.UserId
+    ORDER BY vp.VoteCount DESC
+    LIMIT 1
+) vp ON true
+LEFT JOIN LATERAL (
+    SELECT bp.*
+    FROM BadgeProgression bp
+    WHERE bp.UserId = ue.UserId AND bp.Class = 1
+    ORDER BY bp.Date DESC
+    LIMIT 1
+) bp ON true
+WHERE ue.MedianScore > 5
+ORDER BY UserRank, ue.Reputation DESC
+LIMIT 100;

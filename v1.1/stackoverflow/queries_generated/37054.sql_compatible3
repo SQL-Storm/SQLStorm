@@ -1,0 +1,146 @@
+WITH
+QuestionBase AS (
+  SELECT p.Id, p.Title, p.Tags,
+         -- convert tag string like '<a><b>' into array by trimming outer <> and splitting on '><'
+         CASE
+           WHEN p.Tags IS NULL OR p.Tags = '' THEN NULL
+           ELSE regexp_split_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')
+         END AS TagArray,
+         p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.FavoriteCount,
+         COALESCE(u.Reputation, 0) AS OwnerReputation,
+         p.AcceptedAnswerId
+  FROM Posts p
+  JOIN PostTypes pt ON p.PostTypeId = pt.Id AND pt.Name = 'Question'
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.CreationDate IS NOT NULL
+),
+TagStats AS (
+  SELECT t.TagName,
+         COUNT(q.Id) AS QuestionCount,
+         SUM(q.ViewCount) AS TotalViews,
+         SUM(q.Score) AS TotalScore,
+         AVG(q.OwnerReputation) AS AvgOwnerReputation
+  FROM QuestionBase q
+  JOIN Tags t ON EXISTS (
+    SELECT 1 FROM unnest(q.TagArray) AS tag(val) WHERE tag.val = t.TagName
+  )
+  GROUP BY t.TagName
+),
+TopTags AS (
+  SELECT TagName, QuestionCount, TotalViews, TotalScore,
+         QuestionCount * 0.4 + TotalViews * 0.0001 + TotalScore * 2.0 AS PopularityScore
+  FROM TagStats
+  ORDER BY PopularityScore DESC
+  LIMIT 25
+),
+AnswerBase AS (
+  SELECT a.Id, a.ParentId AS QuestionId, a.CreationDate AS AnswerDate, a.Score AS AnswerScore, a.CommentCount AS AnswerComments,
+         a.LastActivityDate, COALESCE(u.Reputation, 0) AS AnswererReputation,
+         (
+           CASE WHEN a.Id = q.AcceptedAnswerId THEN 5.0 ELSE 0.0 END
+         ) + (a.Score * 0.8)
+           + (LEAST(a.CommentCount, 5) * 0.4)
+           + (ln(1 + COALESCE(u.Reputation, 0)) * 0.3) AS AnswerQuality
+  FROM Posts a
+  JOIN PostTypes pt ON a.PostTypeId = pt.Id AND pt.Name = 'Answer'
+  JOIN Posts q ON a.ParentId = q.Id
+  LEFT JOIN Users u ON a.OwnerUserId = u.Id
+  WHERE a.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years')
+),
+QuestionAnswerAgg AS (
+  SELECT q.Id AS QuestionId,
+         q.Title,
+         q.CreationDate AS QuestionDate,
+         q.Score AS QuestionScore,
+         q.ViewCount AS QuestionViews,
+         q.AnswerCount,
+         q.FavoriteCount,
+         q.Tags,
+         CASE
+           WHEN q.Tags IS NULL OR q.Tags = '' THEN NULL
+           ELSE regexp_split_to_array(substring(q.Tags FROM 2 FOR char_length(q.Tags) - 2), '><')
+         END AS TagArray,
+         COUNT(a.Id) FILTER (WHERE a.AnswerQuality IS NOT NULL) AS RecentAnswerCount,
+         MAX(a.AnswerQuality) AS MaxAnswerQuality,
+         AVG(a.AnswerQuality) AS AvgAnswerQuality,
+         SUM(CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS HasAcceptedInRecent,
+         q.AcceptedAnswerId
+  FROM Posts q
+  JOIN PostTypes pt ON q.PostTypeId = pt.Id AND pt.Name = 'Question'
+  LEFT JOIN AnswerBase a ON a.QuestionId = q.Id
+  GROUP BY q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, q.FavoriteCount, q.Tags, q.AcceptedAnswerId
+),
+PostLinksFiltered AS (
+  SELECT pl.PostId, pl.RelatedPostId, pl.LinkTypeId, pl.CreationDate
+  FROM PostLinks pl
+  WHERE pl.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 years')
+),
+TopTagQuestions AS (
+  SELECT qa.QuestionId AS Id, qa.Title, qa.QuestionDate, qa.QuestionScore, qa.QuestionViews AS QuestionViews, qa.AnswerCount, qa.FavoriteCount, qa.Tags, qa.TagArray,
+         qa.RecentAnswerCount, qa.MaxAnswerQuality, qa.AvgAnswerQuality, qa.HasAcceptedInRecent
+  FROM QuestionAnswerAgg qa
+  WHERE EXISTS (
+    SELECT 1 FROM unnest(qa.TagArray) AS t(tag)
+    JOIN TopTags tt ON tt.TagName = t.tag
+  )
+  AND qa.QuestionDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 years')
+),
+ReciprocalLinkScore AS (
+  SELECT tq.Id AS QuestionId,
+         COUNT(DISTINCT pl.RelatedPostId) FILTER (WHERE pl.RelatedPostId IN (SELECT Id FROM TopTagQuestions)) AS OutgoingToTopTagQuestions,
+         (SELECT COUNT(DISTINCT pl2.PostId) FROM PostLinksFiltered pl2 WHERE pl2.RelatedPostId = tq.Id AND pl2.PostId IN (SELECT Id FROM TopTagQuestions)) AS IncomingFromTopTagQuestions,
+         COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId END) AS DuplicatesOut,
+         COUNT(DISTINCT CASE WHEN pl2.LinkTypeId = 3 THEN pl2.PostId END) AS DuplicatesIn
+  FROM TopTagQuestions tq
+  LEFT JOIN PostLinksFiltered pl ON pl.PostId = tq.Id
+  LEFT JOIN PostLinksFiltered pl2 ON pl2.RelatedPostId = tq.Id
+  GROUP BY tq.Id
+),
+FinalRank AS (
+  SELECT tq.Id AS QuestionId,
+         tq.Title,
+         tq.QuestionDate,
+         tq.QuestionScore,
+         tq.QuestionViews,
+         tq.AnswerCount,
+         tq.FavoriteCount,
+         tq.TagArray,
+         tq.RecentAnswerCount,
+         COALESCE(tq.MaxAnswerQuality, 0) AS MaxAnswerQuality,
+         COALESCE(tq.AvgAnswerQuality, 0) AS AvgAnswerQuality,
+         COALESCE(r.OutgoingToTopTagQuestions, 0) AS OutgoingLinksToTop,
+         COALESCE(r.IncomingFromTopTagQuestions, 0) AS IncomingLinksFromTop,
+         COALESCE(r.DuplicatesOut, 0) AS DuplicatesOut,
+         COALESCE(r.DuplicatesIn, 0) AS DuplicatesIn,
+         (
+           (GREATEST(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - tq.QuestionDate)) / 86400, 1) * -0.02)
+           + (ln(1 + tq.QuestionViews) * 0.6)
+           + (tq.QuestionScore * 1.2)
+           + (tq.AnswerCount * 0.8)
+           + (tq.FavoriteCount * 1.5)
+           + (tq.MaxAnswerQuality * 2.0)
+           + (tq.AvgAnswerQuality * 1.0)
+           + (LEAST(COALESCE(r.OutgoingToTopTagQuestions, 0), 10) * 0.5)
+           + (LEAST(COALESCE(r.IncomingFromTopTagQuestions, 0), 10) * 0.7)
+           - (COALESCE(r.DuplicatesOut, 0) * 1.5)
+           - (COALESCE(r.DuplicatesIn, 0) * 1.0)
+         ) AS CompositeScore
+  FROM TopTagQuestions tq
+  LEFT JOIN ReciprocalLinkScore r ON r.QuestionId = tq.Id
+)
+SELECT fr.QuestionId, fr.Title, fr.TagArray, fr.QuestionDate, fr.QuestionScore, fr.QuestionViews, fr.AnswerCount, fr.FavoriteCount,
+       fr.RecentAnswerCount, ROUND(fr.MaxAnswerQuality::numeric, 3) AS MaxAnswerQuality,
+       ROUND(fr.AvgAnswerQuality::numeric, 3) AS AvgAnswerQuality,
+       fr.OutgoingLinksToTop, fr.IncomingLinksFromTop, fr.DuplicatesOut, fr.DuplicatesIn,
+       ROUND(fr.CompositeScore::numeric, 4) AS CompositeScore,
+       tt.TagName AS TopRelatedTag, tt.PopularityScore
+FROM FinalRank fr
+LEFT JOIN LATERAL (
+  SELECT tt.TagName, tt.PopularityScore
+  FROM unnest(fr.TagArray) AS t(tag)
+  JOIN TopTags tt ON tt.TagName = t.tag
+  ORDER BY tt.PopularityScore DESC
+  LIMIT 1
+) tt ON true
+ORDER BY fr.CompositeScore DESC
+LIMIT 200;

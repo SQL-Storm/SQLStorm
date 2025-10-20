@@ -1,4 +1,4 @@
--- {"query": "22046.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "grok-code-fast", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2204, "output_tokens": 804} 
+-- {"query": "22046.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-code-fast", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2204, "output_tokens": 804} 
 WITH TopQuestions AS (
     SELECT Id, OwnerUserId, Title, Score, CreationDate, Tags, AnswerCount,
            ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY Score DESC) AS Rn

@@ -1,0 +1,38 @@
+-- {"query": "36058.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 363} 
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.PostTypeId,
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  p.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation,
+  COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+  COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+  COUNT(c.Id) AS CommentCount,
+  COUNT(CASE WHEN pv.VoteTypeId = 14 THEN pv.Id END) AS ModeratorVotes,
+  ARRAY_AGG(DISTINCT t.TagName) AS Tags,
+  p.ParentId,
+  p.AcceptedAnswerId,
+  p.LastActivityDate
+FROM
+  Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  LEFT JOIN Votes pv ON pv.PostId = p.Id AND pv.VoteTypeId IN (14,15,16)
+  LEFT JOIN LATERAL (
+    SELECT t.TagName
+    FROM Tags t
+    WHERE t.Id = ANY(string_to_array(REPLACE(REPLACE(p.Tags, '<', ''), '>', ''), ','))
+  ) t ON TRUE
+WHERE
+  p.PostTypeId IN (1,2) -- questions and answers
+  AND p.CreationDate >= NOW() - INTERVAL '1 year'
+GROUP BY
+  p.Id, u.Id, p.ParentId, p.AcceptedAnswerId, p.LastActivityDate
+ORDER BY
+  p.CreationDate DESC
+LIMIT 100;

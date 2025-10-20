@@ -1,0 +1,23 @@
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName AS UserDisplayName,
+    SUM(p.Score) AS TotalPostScore,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT c.Id) AS TotalComments,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+    AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore,
+    MAX(p.CreationDate) AS LastPostDate,
+    MIN(p.CreationDate) AS FirstPostDate,
+    SUM(v.Score) AS TotalVoteScore,
+    COUNT(DISTINCT b.Id) AS TotalBadges,
+    COUNT(DISTINCT h.Id) AS TotalEdits
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN Votes v ON u.Id = v.UserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN PostHistory h ON u.Id = h.UserId
+WHERE u.CreationDate BETWEEN DATE '2021-01-01' AND DATE '2023-12-31'
+GROUP BY u.Id, u.DisplayName
+HAVING COUNT(DISTINCT p.Id) > 100
+ORDER BY TotalPostScore DESC, TotalVoteScore DESC;

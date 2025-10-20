@@ -1,0 +1,112 @@
+WITH TopTags AS (
+    SELECT
+        unnest(string_to_array(substring(P.Tags, 2, length(P.Tags) - 2), '><')) AS TagName,
+        P.Id AS QuestionId,
+        P.OwnerUserId
+    FROM Posts P
+    WHERE P.PostTypeId = 1
+      AND P.Tags IS NOT NULL
+),
+TagStats AS (
+    SELECT
+        TT.TagName,
+        COUNT(*)                               AS QuestionCount,
+        AVG(P.Score)                           AS AvgQuestionScore,
+        SUM(P.ViewCount)                       AS TotalViews,
+        COUNT(DISTINCT LE.PostId)              AS LinkedPosts,
+        COUNT(DISTINCT CASE WHEN V.VoteTypeId = 2 THEN V.Id END) AS TotalUpVotes,
+        COUNT(DISTINCT CASE WHEN V.VoteTypeId = 3 THEN V.Id END) AS TotalDownVotes
+    FROM TopTags TT
+    JOIN Posts P           ON P.Id = TT.QuestionId
+    LEFT JOIN PostLinks LE ON LE.RelatedPostId = TT.QuestionId
+    LEFT JOIN Votes V      ON V.PostId = TT.QuestionId
+    GROUP BY TT.TagName
+),
+RecentTopQuestions AS (
+    SELECT
+        TT.TagName,
+        P.Id           AS PostId,
+        P.Title,
+        P.Score,
+        P.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY TT.TagName ORDER BY P.Score DESC, P.CreationDate DESC) AS rn
+    FROM TopTags TT
+    JOIN Posts P ON P.Id = TT.QuestionId
+    WHERE P.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+),
+BadgeSummary AS (
+    SELECT
+        U.Id           AS UserId,
+        U.DisplayName,
+        COUNT(B.Id) FILTER (WHERE B.Date >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days') AND B.Class = 1) AS RecentGold,
+        COUNT(B.Id) FILTER (WHERE B.Date >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days') AND B.Class = 2) AS RecentSilver,
+        COUNT(B.Id) FILTER (WHERE B.Date >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days') AND B.Class = 3) AS RecentBronze,
+        MAX(U.Reputation) AS MaxReputation
+    FROM Users U
+    LEFT JOIN Badges B ON B.UserId = U.Id
+    GROUP BY U.Id, U.DisplayName
+),
+TopUsersPerTag AS (
+    SELECT
+        TT.TagName,
+        BS.UserId,
+        BS.DisplayName,
+        BS.MaxReputation,
+        BS.RecentGold,
+        BS.RecentSilver,
+        BS.RecentBronze,
+        ROW_NUMBER() OVER (PARTITION BY TT.TagName ORDER BY BS.MaxReputation DESC) AS rn
+    FROM TopTags TT
+    JOIN BadgeSummary BS ON BS.UserId = TT.OwnerUserId
+)
+SELECT
+    TS.TagName,
+    TS.QuestionCount,
+    TS.AvgQuestionScore,
+    TS.TotalViews,
+    TS.LinkedPosts,
+    TS.TotalUpVotes,
+    TS.TotalDownVotes,
+    JSON_AGG(
+      jsonb_build_object(
+        'PostId', RTQ.PostId,
+        'Title', RTQ.Title,
+        'Score', RTQ.Score,
+        'Created', RTQ.CreationDate
+      ) ORDER BY RTQ.Score DESC
+    ) FILTER (WHERE RTQ.rn <= 3) AS TopRecentQuestions,
+    JSON_AGG(
+      jsonb_build_object(
+        'UserId', TU.UserId,
+        'DisplayName', TU.DisplayName,
+        'Reputation', TU.MaxReputation,
+        'Gold', TU.RecentGold,
+        'Silver', TU.RecentSilver,
+        'Bronze', TU.RecentBronze
+      ) ORDER BY TU.MaxReputation DESC
+    ) FILTER (WHERE TU.rn <= 3) AS TopUsersByRep
+FROM TagStats TS
+LEFT JOIN RecentTopQuestions RTQ ON RTQ.TagName = TS.TagName
+LEFT JOIN TopUsersPerTag TU      ON TU.TagName = TS.TagName
+GROUP BY
+    TS.TagName,
+    TS.QuestionCount,
+    TS.AvgQuestionScore,
+    TS.TotalViews,
+    TS.LinkedPosts,
+    TS.TotalUpVotes,
+    TS.TotalDownVotes,
+    RTQ.PostId,
+    RTQ.Title,
+    RTQ.Score,
+    RTQ.CreationDate,
+    RTQ.rn,
+    TU.UserId,
+    TU.DisplayName,
+    TU.MaxReputation,
+    TU.RecentGold,
+    TU.RecentSilver,
+    TU.RecentBronze,
+    TU.rn
+ORDER BY TS.QuestionCount DESC
+LIMIT 10;

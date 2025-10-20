@@ -1,0 +1,101 @@
+WITH RecentActiveQuestions AS (
+    SELECT p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.OwnerUserId
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days'
+      AND p.Score >= 5
+      AND p.AnswerCount > 0
+),
+AnswerStats AS (
+    SELECT a.ParentId AS QuestionId,
+           COUNT(*) AS TotalAnswers,
+           AVG(a.Score) AS AvgAnswerScore,
+           MAX(a.Score) AS MaxAnswerScore,
+           SUM(CASE WHEN a.OwnerUserId IS NOT NULL THEN 1 ELSE 0 END) AS AnswersWithOwner,
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes
+    FROM Posts a
+    LEFT JOIN Votes v ON v.PostId = a.Id AND v.VoteTypeId = 2
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+TopAnswerers AS (
+    SELECT a.OwnerUserId AS UserId,
+           COUNT(*) AS AnswersCount,
+           AVG(a.Score) AS AvgScore,
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+           MAX(a.Score) AS MaxAnswerScore
+    FROM Posts a
+    LEFT JOIN Votes v ON v.PostId = a.Id
+    WHERE a.PostTypeId = 2 AND a.OwnerUserId IS NOT NULL
+    GROUP BY a.OwnerUserId
+    HAVING COUNT(*) > 10
+),
+UserBadges AS (
+    SELECT b.UserId,
+           COUNT(*) AS TotalBadges,
+           SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+           SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+           SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+           MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+RecentCommentsStats AS (
+    SELECT c.PostId,
+           COUNT(*) AS CommentCountLast30Days,
+           AVG(c.Score) AS AvgCommentScore,
+           COUNT(DISTINCT c.UserId) AS DistinctCommenters
+    FROM Comments c
+    WHERE c.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+    GROUP BY c.PostId
+),
+ComplexPerformanceBenchmark AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionCreated,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        a.TotalAnswers,
+        a.AvgAnswerScore,
+        a.MaxAnswerScore,
+        a.AnswersWithOwner,
+        a.TotalUpVotes,
+        ta.UserId AS TopAnswererId,
+        u.DisplayName AS TopAnswererName,
+        ta.AnswersCount AS TopAnswererAnswers,
+        ta.AvgScore AS TopAnswererAvgScore,
+        ta.UpVotesReceived AS TopAnswererUpvotes,
+        ta.MaxAnswerScore AS TopAnswererMaxScore,
+        ub.TotalBadges,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.LastBadgeDate,
+        rc.CommentCountLast30Days,
+        rc.AvgCommentScore,
+        rc.DistinctCommenters
+    FROM RecentActiveQuestions q
+    LEFT JOIN AnswerStats a ON a.QuestionId = q.Id
+    LEFT JOIN (
+        SELECT ta_sub.ParentId, ta_sub.OwnerUserId
+        FROM Posts ta_sub
+        JOIN (
+            SELECT ParentId, MAX(Score) AS MaxScore
+            FROM Posts
+            WHERE PostTypeId = 2
+            GROUP BY ParentId
+        ) max_score_sub ON ta_sub.ParentId = max_score_sub.ParentId AND ta_sub.Score = max_score_sub.MaxScore
+        WHERE ta_sub.PostTypeId = 2
+    ) top_answer ON top_answer.ParentId = q.Id
+    LEFT JOIN TopAnswerers ta ON ta.UserId = top_answer.OwnerUserId
+    LEFT JOIN Users u ON u.Id = ta.UserId
+    LEFT JOIN UserBadges ub ON ub.UserId = ta.UserId
+    LEFT JOIN RecentCommentsStats rc ON rc.PostId = q.Id
+    WHERE q.AnswerCount >= 3
+    ORDER BY q.Score DESC, a.AvgAnswerScore DESC
+    LIMIT 100
+)
+SELECT *
+FROM ComplexPerformanceBenchmark;

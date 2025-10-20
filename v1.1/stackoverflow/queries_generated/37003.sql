@@ -1,0 +1,270 @@
+-- {"query": "37003.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 2626} 
+WITH
+-- recent activity window and tag expansion helper
+params AS (
+  SELECT
+    now() AT TIME ZONE 'UTC' AS now_utc,
+    365 AS days_window,
+    50 AS top_users
+),
+recent_posts AS (
+  SELECT p.*
+  FROM Posts p
+  JOIN params ON true
+  WHERE p.CreationDate >= params.now_utc - (params.days_window || ' days')::interval
+    AND p.PostTypeId IN (1,2) -- questions and answers
+),
+-- explode tag lists like '<tag1><tag2>' into one row per tag
+question_tags AS (
+  SELECT q.Id AS QuestionId,
+         unnest(string_to_array(substring(q.Tags from 2 for char_length(q.Tags)-2), '><')) AS Tag
+  FROM Posts q
+  WHERE q.PostTypeId = 1
+    AND q.Tags IS NOT NULL
+),
+-- aggregate user activity metrics (questions, answers, score, views) in recent window
+user_activity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsPosted,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersPosted,
+    COALESCE(SUM(p.Score),0) AS TotalScore,
+    COALESCE(SUM(p.ViewCount),0) AS TotalViews,
+    MAX(p.CreationDate) AS LastContribution
+  FROM Users u
+  LEFT JOIN recent_posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName
+),
+-- badge enrichment for users
+user_badges AS (
+  SELECT
+    b.UserId,
+    COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+    COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+    COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+    COUNT(*) AS TotalBadges,
+    STRING_AGG(DISTINCT b.Name, ', ' ORDER BY b.Name) AS DistinctBadgeNames
+  FROM Badges b
+  GROUP BY b.UserId
+),
+-- compute advanced post-level signals: answer acceptance, comment activity, unique editors, link graph degree
+post_signals AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.ParentId,
+    p.OwnerUserId,
+    p.Title,
+    COALESCE(p.Score,0) AS Score,
+    COALESCE(p.ViewCount,0) AS Views,
+    COALESCE(p.AnswerCount,0) AS AnswerCount,
+    COALESCE(p.CommentCount,0) AS CommentCount,
+    CASE WHEN p.PostTypeId = 2 AND parent.AcceptedAnswerId = p.Id THEN true ELSE false END AS IsAcceptedAnswer,
+    COALESCE(ed.EditorCount,0) AS UniqueEditors,
+    COALESCE(c.Comments,0) AS CommentsTotal,
+    COALESCE(pl.OutgoingLinks,0) AS OutgoingLinks,
+    COALESCE(pl.IncomingLinks,0) AS IncomingLinks,
+    COALESCE(v.Upvotes,0) AS Upvotes,
+    COALESCE(v.Downvotes,0) AS Downvotes
+  FROM Posts p
+  LEFT JOIN Posts parent ON p.ParentId = parent.Id
+  LEFT JOIN (
+    SELECT PostId, COUNT(DISTINCT UserId) AS EditorCount
+    FROM PostHistory
+    WHERE UserId IS NOT NULL
+    GROUP BY PostId
+  ) ed ON ed.PostId = p.Id
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS Comments
+    FROM Comments
+    GROUP BY PostId
+  ) c ON c.PostId = p.Id
+  LEFT JOIN (
+    SELECT pl.PostId,
+           COUNT(*) FILTER (WHERE pl.LinkTypeId = 1) AS OutgoingLinks,
+           COUNT(*) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicateLinksIn
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+  ) pl ON pl.PostId = p.Id
+  LEFT JOIN (
+    SELECT PostId,
+           SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+           SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes
+    FROM Votes
+    GROUP BY PostId
+  ) v ON v.PostId = p.Id
+),
+-- derive per-question analytics including top answer stats and tag popularity
+question_analytics AS (
+  SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.OwnerUserId,
+    q.CreationDate,
+    q.Score AS QuestionScore,
+    q.ViewCount AS QuestionViews,
+    q.AnswerCount,
+    qa.TopAnswerId,
+    qa.TopAnswerScore,
+    qa.TopAnswerIsAccepted,
+    qt.Tag,
+    tag_stats.TagQuestionCount
+  FROM Posts q
+  LEFT JOIN LATERAL (
+    SELECT a.Id AS TopAnswerId,
+           a.Score AS TopAnswerScore,
+           CASE WHEN q.AcceptedAnswerId = a.Id THEN true ELSE false END AS TopAnswerIsAccepted
+    FROM Posts a
+    WHERE a.ParentId = q.Id AND a.PostTypeId = 2
+    ORDER BY a.Score DESC NULLS LAST, a.CreationDate ASC
+    LIMIT 1
+  ) qa ON true
+  LEFT JOIN question_tags qt ON qt.QuestionId = q.Id
+  LEFT JOIN (
+    SELECT Tag, COUNT(*) AS TagQuestionCount
+    FROM question_tags
+    GROUP BY Tag
+  ) tag_stats ON tag_stats.Tag = qt.Tag
+  WHERE q.PostTypeId = 1
+),
+-- compute user reputation velocity and normalize by account age
+user_velocity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    COALESCE(SUM(CASE WHEN p.CreationDate >= (now() - INTERVAL '30 days') THEN p.Score ELSE 0 END),0) AS ScoreLast30Days,
+    COALESCE(SUM(CASE WHEN p.CreationDate >= (now() - INTERVAL '7 days') THEN p.Score ELSE 0 END),0) AS ScoreLast7Days,
+    GREATEST(EXTRACT(EPOCH FROM (now() - u.CreationDate))/86400, 1) AS AccountAgeDays,
+    ROUND(COALESCE(SUM(p.Score),0) / GREATEST(EXTRACT(EPOCH FROM (now() - u.CreationDate))/86400, 1), 4) AS AvgScorePerDay
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+-- combine user metrics for ranking
+user_rankings AS (
+  SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.QuestionsPosted,
+    ua.AnswersPosted,
+    ua.TotalScore,
+    ua.TotalViews,
+    COALESCE(ub.GoldBadges,0) AS GoldBadges,
+    COALESCE(ub.SilverBadges,0) AS SilverBadges,
+    COALESCE(ub.BronzeBadges,0) AS BronzeBadges,
+    COALESCE(ub.TotalBadges,0) AS TotalBadges,
+    uv.ScoreLast30Days,
+    uv.ScoreLast7Days,
+    uv.AvgScorePerDay,
+    -- composite activity score (weighted): recent score, totals, badges, contributions
+    ( (uv.ScoreLast7Days * 5.0)
+      + (uv.ScoreLast30Days * 2.0)
+      + (ua.TotalScore * 0.1)
+      + (ua.AnswersPosted * 3.0)
+      + (ua.QuestionsPosted * 1.5)
+      + (COALESCE(ub.GoldBadges,0) * 10)
+      + (COALESCE(ub.SilverBadges,0) * 3)
+      + (COALESCE(ub.BronzeBadges,0) * 1)
+    ) AS ActivityScore
+  FROM user_activity ua
+  LEFT JOIN user_badges ub ON ub.UserId = ua.UserId
+  LEFT JOIN user_velocity uv ON uv.UserId = ua.UserId
+),
+-- pick top N active users and collect sample of their posts and tags
+top_users AS (
+  SELECT *
+  FROM user_rankings
+  ORDER BY ActivityScore DESC NULLS LAST
+  LIMIT (SELECT top_users FROM params)
+),
+top_user_posts AS (
+  SELECT tu.UserId, p.*
+  FROM top_users tu
+  JOIN Posts p ON p.OwnerUserId = tu.UserId
+  WHERE p.PostTypeId IN (1,2)
+  ORDER BY p.CreationDate DESC
+  LIMIT 1000
+),
+-- compute co-tag graph for top tags among recent questions
+tag_popularity AS (
+  SELECT qt.Tag, COUNT(*) AS QuestionCount
+  FROM question_tags qt
+  JOIN recent_posts rp ON rp.Id = qt.QuestionId
+  GROUP BY qt.Tag
+  HAVING COUNT(*) >= 3
+),
+tag_pairs AS (
+  SELECT t1.Tag AS TagA, t2.Tag AS TagB, COUNT(*) AS CoOccur
+  FROM question_tags t1
+  JOIN question_tags t2 ON t1.QuestionId = t2.QuestionId AND t1.Tag < t2.Tag
+  JOIN recent_posts rp ON rp.Id = t1.QuestionId
+  GROUP BY t1.Tag, t2.Tag
+  HAVING COUNT(*) >= 2
+),
+-- final combined scoring and selection for benchmarking: heavy joins, aggregates, windows, json construction
+final_selection AS (
+  SELECT
+    u.UserId,
+    u.DisplayName,
+    u.ActivityScore,
+    u.QuestionsPosted,
+    u.AnswersPosted,
+    u.TotalScore,
+    u.TotalViews,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    -- top 3 tags this user recently asked/answered in
+    (
+      SELECT json_agg(tag_row ORDER BY tag_row.cnt DESC)
+      FROM (
+        SELECT qt.Tag, COUNT(*) AS cnt
+        FROM question_tags qt
+        JOIN Posts p ON p.Id = qt.QuestionId
+        WHERE p.OwnerUserId = u.UserId
+        GROUP BY qt.Tag
+        ORDER BY cnt DESC
+        LIMIT 3
+      ) tag_row
+    ) AS TopTags,
+    -- sample recent posts for this user with signals
+    (
+      SELECT json_agg(post_row ORDER BY post_row.CreationDate DESC)
+      FROM (
+        SELECT p.Id, p.PostTypeId, p.Title, p.Score, p.ViewCount, p.CreationDate,
+               ps.UniqueEditors, ps.CommentsTotal, ps.OutgoingLinks, ps.IncomingLinks,
+               COALESCE((ps.Upvotes - ps.Downvotes), ps.Score) AS VoteBalance
+        FROM Posts p
+        LEFT JOIN post_signals ps ON ps.PostId = p.Id
+        WHERE p.OwnerUserId = u.UserId
+        ORDER BY p.CreationDate DESC
+        LIMIT 5
+      ) post_row
+    ) AS RecentPosts,
+    -- tag neighborhood extract
+    (
+      SELECT json_agg(tp_row)
+      FROM (
+        SELECT tp.TagA, tp.TagB, tp.CoOccur
+        FROM tag_pairs tp
+        WHERE tp.TagA IN (
+          SELECT DISTINCT unnest(ARRAY(SELECT json_array_elements_text(t)::text FROM (SELECT (SELECT TopTags) AS t) s LIMIT 1))
+        ) OR tp.TagB IN (
+          SELECT DISTINCT unnest(ARRAY(SELECT json_array_elements_text(t)::text FROM (SELECT (SELECT TopTags) AS t) s LIMIT 1))
+        )
+        ORDER BY tp.CoOccur DESC
+        LIMIT 5
+      ) tp_row
+    ) AS TagNeighborhood
+  FROM top_users u
+)
+-- final output: ordered list with window functions to create dense rank and percentiles
+SELECT
+  fs.*,
+  dense_rank() OVER (ORDER BY fs.ActivityScore DESC) AS ActivityRank,
+  round(100.0 * (rank() OVER (ORDER BY fs.ActivityScore DESC)::numeric) / NULLIF((SELECT COUNT(*) FROM final_selection),0),2) AS ActivityPercentile
+FROM final_selection fs
+ORDER BY fs.ActivityScore DESC;

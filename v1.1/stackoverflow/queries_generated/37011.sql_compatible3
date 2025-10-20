@@ -1,0 +1,167 @@
+WITH
+question_base AS (
+  SELECT p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount,
+         COALESCE(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'), ARRAY[]::text[]) AS tags,
+         p.AnswerCount, p.FavoriteCount
+  FROM Posts p
+  JOIN PostTypes pt ON p.PostTypeId = pt.Id AND pt.Name = 'Question'
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+),
+best_answers AS (
+  SELECT a.ParentId AS QuestionId,
+         a.Id AS AnswerId,
+         a.OwnerUserId AS AnswerOwner,
+         a.Score AS AnswerScore,
+         a.CreationDate AS AnswerCreation,
+         ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) rn
+  FROM Posts a
+  JOIN PostTypes apt ON a.PostTypeId = apt.Id AND apt.Name = 'Answer'
+  WHERE a.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years'
+),
+top_answers AS (
+  SELECT QuestionId, AnswerId, AnswerOwner, AnswerScore, AnswerCreation
+  FROM best_answers
+  WHERE rn = 1
+),
+comment_agg AS (
+  SELECT c.PostId,
+         count(*) AS comment_count,
+         avg(char_length(c.Text)) AS avg_comment_len,
+         max(char_length(c.Text)) AS max_comment_len,
+         sum(case when char_length(c.Text) < 80 then 1 else 0 end) AS short_comments
+  FROM Comments c
+  WHERE c.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+  GROUP BY c.PostId
+),
+user_activity AS (
+  SELECT u.Id, u.Reputation, u.CreationDate, u.LastAccessDate,
+         CASE WHEN u.LastAccessDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days' THEN 1 ELSE 0 END AS active_30d,
+         CASE WHEN u.Reputation >= 10000 THEN 'power' WHEN u.Reputation >= 2000 THEN 'established' WHEN u.Reputation >= 200 THEN 'regular' ELSE 'newbie' END AS tier
+  FROM Users u
+),
+tag_pop AS (
+  SELECT t.tag AS tagname,
+         count(*) AS q_count,
+         avg(q.Score) AS avg_q_score,
+         sum(q.ViewCount) AS views
+  FROM (
+    SELECT q.Id, unnest(q.tags) AS tag, q.Score, q.ViewCount
+    FROM question_base q
+  ) t
+  JOIN question_base q ON q.Id = t.Id
+  GROUP BY t.tag
+),
+post_links_agg AS (
+  SELECT pl.PostId,
+         sum(case when lt.Name = 'Linked' then 1 else 0 end) AS linked_out,
+         sum(case when lt.Name = 'Duplicate' then 1 else 0 end) AS dup_out,
+         count(distinct pl.RelatedPostId) AS distinct_related,
+         min(pl.CreationDate) AS first_linked
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  WHERE pl.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years'
+  GROUP BY pl.PostId
+),
+vote_agg AS (
+  SELECT v.PostId,
+         sum(case when vt.Name = 'UpMod' then 1 else 0 end) AS upvotes,
+         sum(case when vt.Name = 'DownMod' then 1 else 0 end) AS downvotes,
+         sum(case when vt.Name = 'Favorite' then 1 else 0 end) AS favorites,
+         count(*) AS total_votes
+  FROM Votes v
+  JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  WHERE v.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+  GROUP BY v.PostId
+),
+edit_churn AS (
+  SELECT ph.PostId,
+         count(*) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6,7,8,9,24)) AS edits,
+         max(ph.CreationDate) AS last_edit,
+         min(ph.CreationDate) AS first_edit
+  FROM PostHistory ph
+  WHERE ph.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+  GROUP BY ph.PostId
+)
+SELECT
+  q.Id AS question_id,
+  q.Title,
+  CAST(q.CreationDate AS date) AS asked_on,
+  q.Score AS question_score,
+  q.ViewCount,
+  q.AnswerCount,
+  q.FavoriteCount,
+  array_to_string(q.tags, ',') AS tag_list,
+  tp.q_count AS tag_popularity,
+  tp.avg_q_score AS tag_avg_score,
+  ta.AnswerId AS top_answer_id,
+  ta.AnswerOwner AS top_answer_owner,
+  ua.Reputation AS asker_reputation,
+  ua.tier AS asker_tier,
+  ua.active_30d AS asker_active_30d,
+  ca.comment_count,
+  ca.avg_comment_len,
+  va.upvotes,
+  va.downvotes,
+  va.favorites,
+  el.edits AS recent_edits,
+  pla.linked_out,
+  pla.distinct_related,
+  (
+    (coalesce(q.Score,0) * 3.2) +
+    (ln(1 + coalesce(q.ViewCount,0)) * 1.5) +
+    (coalesce(q.AnswerCount,0) * 7.0) +
+    (coalesce(va.upvotes,0) * 2.8) -
+    (coalesce(va.downvotes,0) * 4.5) +
+    (coalesce(ca.comment_count,0) * 1.6) +
+    (coalesce(q.FavoriteCount,0) * 2.2) +
+    (coalesce(el.edits,0) * 1.1) +
+    (coalesce(pla.distinct_related,0) * 0.9)
+  ) *
+  (1 +
+    CASE WHEN ua.active_30d = 1 THEN 0.07 ELSE 0 END +
+    CASE WHEN ta.AnswerScore >= 10 THEN 0.12 WHEN ta.AnswerScore >= 5 THEN 0.06 ELSE 0 END
+  ) *
+  (1 + exp(-EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - q.CreationDate)) / (60*60*24*90)) * 0.18)
+  AS engagement_score,
+  (CASE WHEN q.ViewCount > 0 THEN (coalesce(va.upvotes,0) * 1.0 / q.ViewCount) ELSE 0 END) AS upvote_per_view,
+  (CASE WHEN q.AnswerCount > 0 THEN (coalesce(ca.comment_count,0) * 1.0 / q.AnswerCount) ELSE coalesce(ca.comment_count,0) END) AS comments_per_answer,
+  RANK() OVER (PARTITION BY tp.tagname ORDER BY
+    (
+      (coalesce(q.Score,0) * 3.2) +
+      (ln(1 + coalesce(q.ViewCount,0)) * 1.5) +
+      (coalesce(va.upvotes,0) * 2.8)
+    ) DESC
+  ) AS tag_rank,
+  ROW_NUMBER() OVER (ORDER BY ( 
+      (
+        (coalesce(q.Score,0) * 3.2) +
+        (ln(1 + coalesce(q.ViewCount,0)) * 1.5) +
+        (coalesce(va.upvotes,0) * 2.8)
+      ) * (1 + CASE WHEN ua.active_30d = 1 THEN 0.05 ELSE 0 END)
+    ) DESC
+  ) AS global_row
+FROM question_base q
+LEFT JOIN top_answers ta ON ta.QuestionId = q.Id
+LEFT JOIN user_activity ua ON ua.Id = q.OwnerUserId
+LEFT JOIN comment_agg ca ON ca.PostId = q.Id
+LEFT JOIN vote_agg va ON va.PostId = q.Id
+LEFT JOIN edit_churn el ON el.PostId = q.Id
+LEFT JOIN post_links_agg pla ON pla.PostId = q.Id
+LEFT JOIN LATERAL (
+  SELECT tp.tagname, tp.q_count, tp.avg_q_score
+  FROM tag_pop tp
+  WHERE tp.tagname = (SELECT unnest(q.tags) LIMIT 1)
+  LIMIT 1
+) tp ON true
+WHERE q.Score IS NOT NULL
+GROUP BY
+  q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, q.FavoriteCount, q.tags,
+  tp.q_count, tp.avg_q_score, tp.tagname,
+  ta.AnswerId, ta.AnswerOwner, ta.AnswerScore,
+  ua.Reputation, ua.tier, ua.active_30d,
+  ca.comment_count, ca.avg_comment_len,
+  va.upvotes, va.downvotes, va.favorites,
+  el.edits,
+  pla.linked_out, pla.distinct_related
+ORDER BY engagement_score DESC
+LIMIT 250;

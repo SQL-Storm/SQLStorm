@@ -1,0 +1,228 @@
+WITH recent_questions AS (
+  SELECT p.Id AS QuestionId,
+         p.CreationDate,
+         p.Score,
+         p.ViewCount,
+         p.OwnerUserId,
+         p.Tags,
+         COALESCE(p.AnswerCount, 0) AS AnswerCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= (
+      SELECT MAX(CreationDate) - INTERVAL '365 days'
+      FROM Posts
+      WHERE PostTypeId = 1
+    )
+),
+answers AS (
+  SELECT a.Id AS AnswerId,
+         a.ParentId AS QuestionId,
+         a.OwnerUserId AS AnswerOwnerId,
+         a.Score AS AnswerScore,
+         a.CreationDate AS AnswerCreation
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+),
+first_answer AS (
+  SELECT a.QuestionId,
+         MIN(a.AnswerCreation) AS FirstAnswerTime
+  FROM answers a
+  GROUP BY a.QuestionId
+),
+comment_stats AS (
+  SELECT c.PostId,
+         COUNT(*) AS CommentCount,
+         SUM(CASE WHEN c.Score > 0 THEN 1 ELSE 0 END) AS PositiveComments,
+         MAX(c.CreationDate) AS LastCommentAt
+  FROM Comments c
+  GROUP BY c.PostId
+),
+vote_stats AS (
+  SELECT v.PostId,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+         SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS Favorites
+  FROM Votes v
+  GROUP BY v.PostId
+),
+qa_edges AS (
+  SELECT q.QuestionId,
+         q.OwnerUserId AS AskerId,
+         a.AnswerOwnerId AS AnswererId,
+         COUNT(*) AS AnswersByAnswerer,
+         SUM(GREATEST(a.AnswerScore, 0)) AS PosAnswerScore
+  FROM recent_questions q
+  JOIN answers a ON a.QuestionId = q.QuestionId
+  GROUP BY q.QuestionId, q.OwnerUserId, a.AnswerOwnerId
+),
+reciprocal_edges AS (
+  SELECT qe1.QuestionId AS Q1,
+         qe1.AskerId AS U1,
+         qe1.AnswererId AS U2,
+         qe2.QuestionId AS Q2,
+         qe2.AnswererId AS U1_from_q2,
+         qe2.AskerId AS U2_from_q2
+  FROM qa_edges qe1
+  JOIN qa_edges qe2
+    ON qe1.AskerId = qe2.AnswererId
+   AND qe1.AnswererId = qe2.AskerId
+   AND qe1.QuestionId <> qe2.QuestionId
+),
+tag_expanded AS (
+  SELECT q.QuestionId,
+         unnest(string_to_array(substring(q.Tags FROM 2 FOR char_length(q.Tags)-2), '><')) AS Tag
+  FROM recent_questions q
+  WHERE q.Tags IS NOT NULL AND q.Tags LIKE '<%>'
+),
+tag_popularity AS (
+  SELECT te.Tag,
+         COUNT(DISTINCT te.QuestionId) AS QuestionCount,
+         SUM(rq.ViewCount) AS TotalViews,
+         AVG(rq.Score) AS AvgScore
+  FROM tag_expanded te
+  JOIN recent_questions rq ON rq.QuestionId = te.QuestionId
+  GROUP BY te.Tag
+),
+power_users AS (
+  SELECT u.Id AS UserId,
+         u.Reputation,
+         u.UpVotes,
+         u.DownVotes,
+         u.Views,
+         COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+         COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+         COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id, u.Reputation, u.UpVotes, u.DownVotes, u.Views
+  HAVING u.Reputation >= (
+    SELECT percentile_disc(0.95) WITHIN GROUP (ORDER BY Reputation) FROM Users
+  )
+),
+question_activity AS (
+  SELECT q.QuestionId,
+         q.CreationDate,
+         q.Score,
+         q.ViewCount,
+         q.AnswerCount,
+         fas.FirstAnswerTime,
+         EXTRACT(EPOCH FROM (fas.FirstAnswerTime - q.CreationDate)) AS SecondsToFirstAnswer,
+         COALESCE(cs.CommentCount, 0) AS CommentCount,
+         COALESCE(vs.UpVotes, 0) AS UpVotes,
+         COALESCE(vs.DownVotes, 0) AS DownVotes,
+         COALESCE(vs.Favorites, 0) AS Favorites
+  FROM recent_questions q
+  LEFT JOIN first_answer fas ON fas.QuestionId = q.QuestionId
+  LEFT JOIN comment_stats cs ON cs.PostId = q.QuestionId
+  LEFT JOIN vote_stats vs ON vs.PostId = q.QuestionId
+),
+dup_clusters AS (
+  SELECT pl.RelatedPostId AS CanonicalId,
+         COUNT(*) AS DupCount,
+         ARRAY_AGG(pl.PostId ORDER BY pl.CreationDate DESC) AS DuplicateIds,
+         MAX(pl.CreationDate) AS LastDupAt
+  FROM PostLinks pl
+  WHERE pl.LinkTypeId = 3
+  GROUP BY pl.RelatedPostId
+),
+quality_score AS (
+  SELECT qa.QuestionId,
+         qa.Score,
+         qa.ViewCount,
+         qa.AnswerCount,
+         qa.UpVotes,
+         qa.DownVotes,
+         qa.Favorites,
+         qa.CommentCount,
+         qa.SecondsToFirstAnswer,
+         (COALESCE(qa.UpVotes,0) - COALESCE(qa.DownVotes,0)) * 1.0
+           + LEAST(COALESCE(qa.Favorites,0), 50)
+           + CASE WHEN qa.SecondsToFirstAnswer IS NULL THEN 0 ELSE GREATEST(0, 3600*24 - qa.SecondsToFirstAnswer)/3600 END
+           + LEAST(COALESCE(qa.CommentCount,0), 20) * 0.2
+           + LEAST(COALESCE(qa.ViewCount,0)/100, 200)
+         AS EngagementScore
+  FROM question_activity qa
+),
+user_influence AS (
+  SELECT qe.QuestionId,
+         SUM(COALESCE(pu.Reputation, 0)) AS SumReputationContributors,
+         SUM(COALESCE(pu.GoldBadges,0)*5 + COALESCE(pu.SilverBadges,0)*2 + COALESCE(pu.BronzeBadges,0)) AS SumBadgeWeight,
+         COUNT(DISTINCT qe.AnswererId) AS DistinctAnswerers
+  FROM qa_edges qe
+  LEFT JOIN power_users pu ON pu.UserId = qe.AnswererId
+  GROUP BY qe.QuestionId
+),
+closed_reasons AS (
+  SELECT ph.PostId,
+         MAX(ph.CreationDate) AS ClosedAt,
+         MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment END) AS CloseReasonIdRaw
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (10)
+  GROUP BY ph.PostId
+),
+hot_bumps AS (
+  SELECT ph.PostId,
+         SUM(CASE WHEN ph.PostHistoryTypeId = 50 THEN 1 ELSE 0 END) AS CommunityBumps,
+         SUM(CASE WHEN ph.PostHistoryTypeId = 52 THEN 1 ELSE 0 END) AS HotSelections,
+         SUM(CASE WHEN ph.PostHistoryTypeId = 53 THEN 1 ELSE 0 END) AS HotRemovals
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+)
+SELECT
+  rq.QuestionId,
+  p.Title,
+  p.OwnerUserId AS AskerId,
+  u.DisplayName AS AskerName,
+  qs.EngagementScore,
+  COALESCE(ui.SumReputationContributors, 0) AS SumReputationContributors,
+  COALESCE(ui.SumBadgeWeight, 0) AS SumBadgeWeight,
+  COALESCE(ui.DistinctAnswerers, 0) AS DistinctAnswerers,
+  COALESCE(dc.DupCount, 0) AS DuplicateCount,
+  dc.LastDupAt,
+  hs.CommunityBumps,
+  hs.HotSelections,
+  hs.HotRemovals,
+  ca.SecondsToFirstAnswer,
+  ca.UpVotes,
+  ca.DownVotes,
+  ca.Favorites,
+  ca.CommentCount,
+  ca.ViewCount,
+  ca.AnswerCount,
+  tr.Tag AS TopTagByViews,
+  tr.TotalViews AS TopTagViews,
+  (
+    SELECT ARRAY_AGG(DISTINCT te.Tag ORDER BY te.Tag)
+    FROM tag_expanded te
+    WHERE te.QuestionId = rq.QuestionId
+    LIMIT 10
+  ) AS TagsSample,
+  (CASE WHEN EXISTS (
+    SELECT 1
+    FROM reciprocal_edges re
+    WHERE re.Q1 = rq.QuestionId
+  ) THEN TRUE ELSE FALSE END) AS HasReciprocalAnswerRelationship,
+  cr.ClosedAt,
+  cr.CloseReasonIdRaw
+FROM recent_questions rq
+JOIN Posts p ON p.Id = rq.QuestionId
+LEFT JOIN Users u ON u.Id = p.OwnerUserId
+LEFT JOIN quality_score qs ON qs.QuestionId = rq.QuestionId
+LEFT JOIN user_influence ui ON ui.QuestionId = rq.QuestionId
+LEFT JOIN dup_clusters dc ON dc.CanonicalId = rq.QuestionId
+LEFT JOIN hot_bumps hs ON hs.PostId = rq.QuestionId
+LEFT JOIN closed_reasons cr ON cr.PostId = rq.QuestionId
+LEFT JOIN question_activity ca ON ca.QuestionId = rq.QuestionId
+LEFT JOIN LATERAL (
+  SELECT te.Tag, tp.TotalViews
+  FROM tag_expanded te
+  JOIN tag_popularity tp ON tp.Tag = te.Tag
+  WHERE te.QuestionId = rq.QuestionId
+  ORDER BY tp.TotalViews DESC
+  LIMIT 1
+) tr ON TRUE
+WHERE COALESCE(cr.ClosedAt, TIMESTAMP '2024-10-01 12:34:56') >= rq.CreationDate
+ORDER BY
+  (COALESCE(qs.EngagementScore, 0) + COALESCE(ui.SumBadgeWeight,0)/10.0 + COALESCE(dc.DupCount,0)*2 + COALESCE(hs.HotSelections,0)*5) DESC,
+  rq.ViewCount DESC
+LIMIT 500;

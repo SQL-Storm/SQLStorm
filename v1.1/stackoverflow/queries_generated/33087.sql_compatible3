@@ -1,0 +1,69 @@
+SELECT 
+    p.PostTypeId,
+    pt.Name AS PostTypeName,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Title,
+    p.Tags,
+    u.Reputation AS OwnerReputation,
+    u.Location AS OwnerLocation,
+    u.CreationDate AS UserJoinDate,
+    COUNT(c.Id) OVER (PARTITION BY p.Id) AS CommentCountTotal,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS UpVotesCount,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS DownVotesCount,
+    SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS DuplicateLinks,
+    SUM(CASE WHEN bh.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS CloseVotesCount,
+    lt.LinkTypesUsed,
+    p.LastActivityDate,
+    p.ContentLicense
+FROM 
+    Posts p
+JOIN 
+    PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN 
+    Users u ON p.OwnerUserId = u.Id
+LEFT JOIN 
+    Comments c ON c.PostId = p.Id
+LEFT JOIN 
+    Votes v ON v.PostId = p.Id
+LEFT JOIN 
+    PostLinks pl ON pl.PostId = p.Id
+LEFT JOIN 
+    LinkTypes tl ON pl.LinkTypeId = tl.Id
+LEFT JOIN 
+    PostHistory bh ON bh.PostId = p.Id
+LEFT JOIN (
+    SELECT pl2.PostId,
+           STRING_AGG(DISTINCT tl2.Name, ',' ORDER BY tl2.Name) AS LinkTypesUsed
+    FROM PostLinks pl2
+    JOIN LinkTypes tl2 ON pl2.LinkTypeId = tl2.Id
+    GROUP BY pl2.PostId
+) lt ON lt.PostId = p.Id
+WHERE 
+    p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR)
+    AND p.PostTypeId IN (1, 2)
+GROUP BY
+    p.PostTypeId,
+    pt.Name,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Title,
+    p.Tags,
+    u.Reputation,
+    u.Location,
+    u.CreationDate,
+    p.LastActivityDate,
+    p.ContentLicense,
+    lt.LinkTypesUsed,
+    p.Id
+ORDER BY 
+    p.CreationDate DESC
+LIMIT 100;

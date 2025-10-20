@@ -1,0 +1,110 @@
+-- {"query": "49076.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1989} 
+WITH UserEngagementSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate AS UserLastAccessDate,
+        U.Views AS UserProfileViews,
+        COUNT(DISTINCT P_Q.Id) AS TotalQuestionsPosted,
+        COUNT(DISTINCT P_A.Id) AS TotalAnswersPosted,
+        SUM(CASE WHEN P_Q.PostTypeId = 1 THEN P_Q.ViewCount ELSE 0 END) AS TotalQuestionViews,
+        AVG(CASE WHEN P_A.PostTypeId = 2 THEN P_A.Score ELSE NULL END) AS AverageAnswerScore,
+        MAX(P.LastActivityDate) AS LastPostActivityDate,
+        COUNT(DISTINCT C.Id) AS TotalCommentsCreated,
+        COUNT(DISTINCT PH_SelfEdit.Id) AS SelfEditsMade, -- Post history entries for edits made by the user
+        COUNT(DISTINCT CASE WHEN V_Received.VoteTypeId = 2 AND P.Id = V_Received.PostId THEN V_Received.Id END) AS UpvotesReceivedOnPosts,
+        COUNT(DISTINCT CASE WHEN V_Received.VoteTypeId = 3 AND P.Id = V_Received.PostId THEN V_Received.Id END) AS DownvotesReceivedOnPosts
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Posts AS P_Q ON P_Q.OwnerUserId = U.Id AND P_Q.PostTypeId = 1
+    LEFT JOIN Posts AS P_A ON P_A.OwnerUserId = U.Id AND P_A.PostTypeId = 2
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN PostHistory AS PH_SelfEdit ON PH_SelfEdit.UserId = U.Id AND PH_SelfEdit.PostHistoryTypeId IN (4, 5, 6)
+    LEFT JOIN Votes AS V_Received ON P.Id = V_Received.PostId
+    WHERE U.LastAccessDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 year')
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views
+),
+UserBadgesOverview AS (
+    SELECT
+        B.UserId,
+        COUNT(CASE WHEN B.Class = 1 THEN 1 END) AS GoldBadgesCount,
+        COUNT(CASE WHEN B.Class = 2 THEN 1 END) AS SilverBadgesCount,
+        COUNT(CASE WHEN B.Class = 3 THEN 1 END) AS BronzeBadgesCount,
+        COUNT(B.Id) AS TotalBadges
+    FROM Badges AS B
+    GROUP BY B.UserId
+),
+TopContributingTags AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        LOWER(TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><')))) AS TagName,
+        COUNT(P.Id) AS TaggedQuestionsCount,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY COUNT(P.Id) DESC, LOWER(TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><'))))) AS TagRank
+    FROM Posts AS P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND P.Tags != ''
+    GROUP BY P.OwnerUserId, LOWER(TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><'))))
+    HAVING COUNT(P.Id) > 5
+),
+PostContentActivity AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        COUNT(DISTINCT PH.PostId) AS DistinctPostsWithHistory,
+        COUNT(DISTINCT PH.UserId) AS DistinctEditorsOnUserOwnedPosts,
+        MAX(PH.CreationDate) AS LatestContentModification,
+        AVG(LENGTH(PH.Text)) FILTER (WHERE PH.PostHistoryTypeId IN (2, 5, 8)) AS AvgHistoryBodyLength,
+        SUM(CASE WHEN PH.Comment LIKE '%migrat%' THEN 1 ELSE 0 END) AS MigrationRelatedHistoryCount
+    FROM Posts AS P
+    JOIN PostHistory AS PH ON P.Id = PH.PostId
+    WHERE PH.PostHistoryTypeId IN (2, 5, 8, 10, 11, 12, 13, 17, 35, 36) -- Initial Body, Edit Body, Rollback Body, Close, Reopen, Delete, Undelete, Migration types
+    GROUP BY P.OwnerUserId
+)
+SELECT
+    UES.UserId,
+    UES.DisplayName,
+    UES.Reputation,
+    UES.TotalQuestionsPosted,
+    UES.TotalAnswersPosted,
+    UES.AverageAnswerScore,
+    UES.TotalQuestionViews,
+    UBO.GoldBadgesCount,
+    UBO.SilverBadgesCount,
+    UBO.BronzeBadgesCount,
+    TCT.TagName AS PrimaryContributingTag,
+    TCT.TaggedQuestionsCount AS PrimaryTagQuestionsCount,
+    PCA.DistinctPostsWithHistory,
+    PCA.DistinctEditorsOnUserOwnedPosts,
+    PCA.LatestContentModification,
+    PCA.AvgHistoryBodyLength,
+    PCA.MigrationRelatedHistoryCount,
+    -- Custom composite engagement and influence score
+    (UES.Reputation * 0.005 + UES.TotalQuestionsPosted * 0.2 + UES.TotalAnswersPosted * 0.3 +
+     COALESCE(UES.AverageAnswerScore, 0) * 0.8 + UES.UserProfileViews * 0.0005 +
+     COALESCE(UBO.GoldBadgesCount, 0) * 10 + COALESCE(UBO.SilverBadgesCount, 0) * 5 +
+     UES.UpvotesReceivedOnPosts * 0.05 - UES.DownvotesReceivedOnPosts * 0.1 +
+     UES.SelfEditsMade * 0.01 + UES.TotalCommentsCreated * 0.005 +
+     COALESCE(PCA.DistinctPostsWithHistory, 0) * 0.02 + COALESCE(PCA.DistinctEditorsOnUserOwnedPosts, 0) * 0.1
+    ) AS OverallInfluenceScore,
+    RANK() OVER (ORDER BY
+        (UES.Reputation * 0.005 + UES.TotalQuestionsPosted * 0.2 + UES.TotalAnswersPosted * 0.3 +
+         COALESCE(UES.AverageAnswerScore, 0) * 0.8 + UES.UserProfileViews * 0.0005 +
+         COALESCE(UBO.GoldBadgesCount, 0) * 10 + COALESCE(UBO.SilverBadgesCount, 0) * 5 +
+         UES.UpvotesReceivedOnPosts * 0.05 - UES.DownvotesReceivedOnPosts * 0.1 +
+         UES.SelfEditsMade * 0.01 + UES.TotalCommentsCreated * 0.005 +
+         COALESCE(PCA.DistinctPostsWithHistory, 0) * 0.02 + COALESCE(PCA.DistinctEditorsOnUserOwnedPosts, 0) * 0.1
+        ) DESC, UES.UserId
+    ) AS GlobalInfluenceRank
+FROM UserEngagementSummary AS UES
+LEFT JOIN UserBadgesOverview AS UBO ON UES.UserId = UBO.UserId
+LEFT JOIN TopContributingTags AS TCT ON UES.UserId = TCT.UserId AND TCT.TagRank = 1
+LEFT JOIN PostContentActivity AS PCA ON UES.UserId = PCA.UserId
+WHERE UES.Reputation > 5000 -- Focus on highly reputable users
+  AND UES.TotalQuestionsPosted >= 10
+  AND UES.TotalAnswersPosted >= 20
+  AND COALESCE(UES.AverageAnswerScore, 0) >= 5
+  AND UES.LastPostActivityDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year')
+  AND (COALESCE(UBO.GoldBadgesCount, 0) > 0 OR COALESCE(UBO.SilverBadgesCount, 0) > 2) -- At least one gold or multiple silver badges
+  AND COALESCE(PCA.DistinctPostsWithHistory, 0) > 5 -- User has had at least 5 of their posts undergo some history event
+ORDER BY OverallInfluenceScore DESC, UES.UserId
+LIMIT 75;

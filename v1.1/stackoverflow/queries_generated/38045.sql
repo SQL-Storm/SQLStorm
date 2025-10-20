@@ -1,0 +1,195 @@
+-- {"query": "38045.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 1906} 
+with recent_q as (
+  select p.Id as QuestionId,
+         p.CreationDate,
+         p.Score,
+         p.ViewCount,
+         p.OwnerUserId,
+         p.Tags,
+         coalesce(p.AnswerCount, 0) as AnswerCount
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= (select max(CreationDate) - interval '180 days' from Posts where PostTypeId = 1)
+),
+answers as (
+  select a.ParentId as QuestionId,
+         count(*) as Answers,
+         avg(a.Score) as AvgAnswerScore,
+         max(a.CreationDate) as LastAnswerDate
+  from Posts a
+  where a.PostTypeId = 2
+  group by a.ParentId
+),
+q_votes as (
+  select v.PostId as QuestionId,
+         sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+         sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+         sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites
+  from Votes v
+  group by v.PostId
+),
+commenters as (
+  select c.PostId as QuestionId,
+         count(*) as CommentCount,
+         count(distinct c.UserId) as DistinctCommenters
+  from Comments c
+  group by c.PostId
+),
+tag_expansion as (
+  select q.QuestionId,
+         unnest(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')) as tag
+  from recent_q q
+  where q.Tags is not null and length(q.Tags) > 2
+),
+tag_stats as (
+  select t.tag,
+         count(*) as TagQCount,
+         avg(r.Score) as AvgQScore,
+         percentile_cont(0.9) within group (order by r.ViewCount) as P90Views
+  from tag_expansion t
+  join recent_q r on r.QuestionId = t.QuestionId
+  group by t.tag
+),
+user_activity as (
+  select u.Id as UserId,
+         u.Reputation,
+         u.UpVotes,
+         u.DownVotes,
+         coalesce(sum(case when b.Class = 1 then 1 else 0 end),0) as GoldBadges,
+         coalesce(sum(case when b.Class = 2 then 1 else 0 end),0) as SilverBadges,
+         coalesce(sum(case when b.Class = 3 then 1 else 0 end),0) as BronzeBadges,
+         max(b.Date) as LastBadgeDate
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  group by u.Id, u.Reputation, u.UpVotes, u.DownVotes
+),
+post_history_signals as (
+  select ph.PostId as QuestionId,
+         sum(case when ph.PostHistoryTypeId in (4,5,6) then 1 else 0 end) as EditEvents,
+         sum(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as CloseVotesHistory,
+         sum(case when ph.PostHistoryTypeId = 11 then 1 else 0 end) as ReopenVotesHistory,
+         max(ph.CreationDate) as LastHistoryEvent
+  from PostHistory ph
+  group by ph.PostId
+),
+dup_links as (
+  select pl.PostId as QuestionId,
+         count(*) filter (where pl.LinkTypeId = 3) as DuplicateLinks,
+         count(*) filter (where pl.LinkTypeId = 1) as LinkedLinks,
+         max(pl.CreationDate) as LastLinkDate
+  from PostLinks pl
+  group by pl.PostId
+),
+q_core as (
+  select r.QuestionId,
+         r.CreationDate,
+         r.Score,
+         r.ViewCount,
+         r.OwnerUserId,
+         r.AnswerCount,
+         coalesce(a.Answers, 0) as Answers,
+         a.AvgAnswerScore,
+         a.LastAnswerDate,
+         coalesce(v.UpVotes, 0) as UpVotes,
+         coalesce(v.DownVotes, 0) as DownVotes,
+         coalesce(v.Favorites, 0) as Favorites,
+         coalesce(c.CommentCount, 0) as CommentCount,
+         coalesce(c.DistinctCommenters, 0) as DistinctCommenters,
+         coalesce(h.EditEvents, 0) as EditEvents,
+         coalesce(h.CloseVotesHistory, 0) as CloseVotesHistory,
+         coalesce(h.ReopenVotesHistory, 0) as ReopenVotesHistory,
+         h.LastHistoryEvent,
+         coalesce(d.DuplicateLinks, 0) as DuplicateLinks,
+         coalesce(d.LinkedLinks, 0) as LinkedLinks,
+         d.LastLinkDate
+  from recent_q r
+  left join answers a on a.QuestionId = r.QuestionId
+  left join q_votes v on v.QuestionId = r.QuestionId
+  left join commenters c on c.QuestionId = r.QuestionId
+  left join post_history_signals h on h.QuestionId = r.QuestionId
+  left join dup_links d on d.QuestionId = r.QuestionId
+),
+owner_aug as (
+  select qc.*,
+         ua.Reputation as OwnerReputation,
+         ua.UpVotes as OwnerTotalUpVotes,
+         ua.DownVotes as OwnerTotalDownVotes,
+         ua.GoldBadges,
+         ua.SilverBadges,
+         ua.BronzeBadges,
+         ua.LastBadgeDate
+  from q_core qc
+  left join user_activity ua on ua.UserId = qc.OwnerUserId
+),
+q_rank as (
+  select o.*,
+         (coalesce(o.UpVotes,0) - coalesce(o.DownVotes,0))::numeric as NetVotes,
+         case when o.ViewCount > 0 then o.Score::numeric / o.ViewCount else 0 end as ScorePerView,
+         case when o.Answers > 0 then coalesce(o.AvgAnswerScore,0) else 0 end as AvgAnswerScoreSafe,
+         (coalesce(o.EditEvents,0) + coalesce(o.CommentCount,0) + coalesce(o.LinkedLinks,0)) as ActivitySignals
+  from owner_aug o
+),
+tag_agg_per_q as (
+  select t.QuestionId,
+         jsonb_agg(jsonb_build_object(
+           'tag', t.tag,
+           'q_count', ts.TagQCount,
+           'avg_q_score', ts.AvgQScore,
+           'p90_views', ts.P90Views
+         ) order by ts.TagQCount desc, ts.P90Views desc) as TagStats
+  from tag_expansion t
+  join tag_stats ts on ts.tag = t.tag
+  group by t.QuestionId
+),
+density as (
+  select
+    qr.QuestionId,
+    qr.CreationDate,
+    count(*) over (order by qr.CreationDate rows between 100 preceding and current row) as SlidingCount,
+    avg(qr.Score) over (order by qr.CreationDate rows between 100 preceding and current row) as SlidingAvgScore
+  from q_rank qr
+)
+select
+  qr.QuestionId,
+  qr.CreationDate,
+  qr.Score,
+  qr.ViewCount,
+  qr.AnswerCount,
+  qr.Answers,
+  qr.AvgAnswerScoreSafe as AvgAnswerScore,
+  qr.UpVotes,
+  qr.DownVotes,
+  qr.Favorites,
+  qr.CommentCount,
+  qr.DistinctCommenters,
+  qr.EditEvents,
+  qr.CloseVotesHistory,
+  qr.ReopenVotesHistory,
+  qr.LastHistoryEvent,
+  qr.DuplicateLinks,
+  qr.LinkedLinks,
+  qr.LastLinkDate,
+  qr.OwnerUserId,
+  qr.OwnerReputation,
+  qr.OwnerTotalUpVotes,
+  qr.OwnerTotalDownVotes,
+  qr.GoldBadges,
+  qr.SilverBadges,
+  qr.BronzeBadges,
+  qr.LastBadgeDate,
+  qr.NetVotes,
+  qr.ScorePerView,
+  qr.ActivitySignals,
+  ta.TagStats,
+  d.SlidingCount,
+  d.SlidingAvgScore,
+  rank() over (order by qr.NetVotes desc, qr.ViewCount desc, qr.ActivitySignals desc) as GlobalRank,
+  row_number() over (partition by date_trunc('week', qr.CreationDate) order by qr.NetVotes desc, qr.ViewCount desc) as WeeklyRowNum,
+  percentile_cont(0.5) within group (order by qr.Score) over (partition by date_trunc('month', qr.CreationDate)) as MonthlyMedianScore
+from q_rank qr
+left join tag_agg_per_q ta on ta.QuestionId = qr.QuestionId
+left join density d on d.QuestionId = qr.QuestionId
+where (qr.CloseVotesHistory = 0 or qr.ReopenVotesHistory > 0)
+  and coalesce(qr.OwnerReputation, 0) >= 1
+order by GlobalRank
+limit 500;

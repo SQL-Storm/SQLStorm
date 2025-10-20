@@ -1,0 +1,137 @@
+-- {"query": "53.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1106} 
+WITH
+RecentHotQuestions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.ViewCount,
+    p.Score,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Body,
+    ROW_NUMBER() OVER (ORDER BY p.ViewCount DESC, p.Score DESC, p.CreationDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.ClosedDate IS NULL
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    COUNT(*) AS PostCount
+  FROM Tags t
+  JOIN Posts p ON p.Id = t.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  WHERE p.PostTypeId = 1
+  GROUP BY t.TagName
+  HAVING COUNT(*) > 10
+),
+AuthorStats AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.Location,
+    u.ProfileImageUrl,
+    u.AccountId,
+    COUNT(DISTINCT q.Id) FILTER (WHERE q.PostTypeId = 1) AS QuestionCount,
+    COUNT(DISTINCT a.Id) FILTER (WHERE a.PostTypeId = 2) AS AnswerCount,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesGiven
+  FROM Users u
+  LEFT JOIN Posts q ON q.OwnerUserId = u.Id
+  LEFT JOIN Posts a ON a.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  GROUP BY u.Id
+),
+ActivityWindow AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.Title,
+    p.Tags,
+    p.ViewCount,
+    p.Score,
+    p.AnswerCount
+  FROM Posts p
+  WHERE p.LastActivityDate >= current_timestamp - INTERVAL '30 days'
+)
+SELECT
+  -- Include a rich mix of data points using various SQL features
+  rh.PostId,
+  rh.Title,
+  rh.Tags,
+  rh.ViewCount,
+  rh.Score,
+  rh.CreationDate,
+  rh.OwnerUserId,
+  rh.LastActivityDate,
+  rh.AnswerCount,
+  rh.CommentCount,
+  rh.FavoriteCount,
+  LEFTJOIN_TAGS.tag_json AS TagSummary,
+  at.UserId AS AuthorId,
+  at.DisplayName AS AuthorName,
+  at.Reputation AS AuthorReputation,
+  at.QuestionCount,
+  at.AnswerCount AS AuthorAnswerCount,
+  at.TotalUpVotesGiven,
+  tt.TagName,
+  tt.UpVotes AS TagUpVotes,
+  tt.DownVotes AS TagDownVotes,
+  aw.PostId AS ActivityPostId,
+  aw.LastActivityDate AS ActivityDate
+FROM RecentHotQuestions rh
+LEFT JOIN (
+  SELECT
+    t.TagName,
+    JSON_OBJECT(
+      'UpVotes', SUM(CASE WHEN v2.VoteTypeId = 2 THEN 1 ELSE 0 END),
+      'DownVotes', SUM(CASE WHEN v2.VoteTypeId = 3 THEN 1 ELSE 0 END),
+      'PostCount', COUNT(*) 
+    ) AS tag_json
+  FROM Tags t
+  LEFT JOIN Posts p2 ON p2.Tags LIKE '%' || t.TagName || '%'
+  LEFT JOIN Votes v2 ON v2.PostId = p2.Id
+  GROUP BY t.TagName
+) AS LEFTJOIN_TAGS ON TRUE
+LEFT JOIN (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+    COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesGiven
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+) AS at ON at.UserId = rh.OwnerUserId
+LEFT JOIN (
+  SELECT
+    p.Id AS PostId,
+    MAX(p.LastActivityDate) AS LastActivityDate
+  FROM Posts p
+  GROUP BY p.Id
+) AS aw ON aw.PostId = rh.PostId
+LEFT JOIN (
+  SELECT
+    p.Id, p.Title
+  FROM Posts p
+) AS p2 ON p2.Id = rh.PostId
+LEFT JOIN TopTags tt ON TRUE
+WHERE rh.rn <= 50
+ORDER BY rh.ViewCount DESC, rh.Score DESC, rh.CreationDate DESC
+LIMIT 50;

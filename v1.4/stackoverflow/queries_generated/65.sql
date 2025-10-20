@@ -1,0 +1,104 @@
+-- {"query": "65.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 703} 
+WITH
+RecentTopPosts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.LastActivityDate,
+    p.PostTypeId,
+    ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC, p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.DeletionDate IS NULL -- (If exists) ensure not deleted; adjust if schema lacks DeletionDate
+),
+TopAuthors AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.UpVotes DESC) AS rn
+  FROM Users u
+),
+TagAnalytics AS (
+  SELECT
+    t.TagName,
+    COUNT(p.Id) AS PostCount,
+    AVG(p.Score) AS AvgScore,
+    SUM(p.ViewCount) AS TotalViews
+  FROM Tags t
+  LEFT JOIN Posts p
+    ON p.Id = t.WikiPostId OR p.Tags LIKE '%' || t.TagName || '%'
+  GROUP BY t.TagName
+),
+Combined AS (
+  SELECT
+    rpt.Id AS PostId,
+    rpt.Title,
+    rpt.CreationDate,
+    rpt.OwnerUserId,
+    rpt.Score,
+    rpt.ViewCount,
+    rpt.Tags,
+    rpt.LastActivityDate,
+    rpt.PostTypeId,
+    ta.UserId AS AuthorId,
+    ta.DisplayName AS AuthorName,
+    ta.Reputation AS AuthorReputation,
+    ta.CreationDate AS AuthorCreationDate,
+    ta.LastAccessDate AS AuthorLastAccessDate,
+    ta.Views AS AuthorViews,
+    ta.UpVotes AS AuthorUpVotes,
+    ta.DownVotes AS AuthorDownVotes,
+    ta.rn AS AuthorRank,
+    ta.DisplayName || '' AS NameConcat,
+    ta.Reputation * 1.0 / NULLIF(pvt.TotalTags,0) AS ScoreNormalized, -- placeholder calculation
+    pvt.TotalTags
+  FROM RecentTopPosts rpt
+  LEFT JOIN TopAuthors ta
+    ON rpt.OwnerUserId = ta.UserId
+  LEFT JOIN (
+    SELECT
+      p.Id AS post_id,
+      COUNT(*) AS TotalTags
+    FROM Posts p
+    CROSS APPLY (SELECT value FROM STRING_SPLIT(p.Tags, ',')) AS s
+    GROUP BY p.Id
+  ) AS pvt ON rpt.Id = pvt.post_id
+)
+SELECT
+  c.PostId,
+  c.Title,
+  c.CreationDate,
+  c.OwnerUserId,
+  c.Score,
+  c.ViewCount,
+  c.Tags,
+  c.LastActivityDate,
+  c.PostTypeId,
+  c.AuthorId,
+  c.AuthorName,
+  c.AuthorReputation,
+  c.AuthorCreationDate,
+  c.AuthorLastAccessDate,
+  c.AuthorViews,
+  c.AuthorUpVotes,
+  c.AuthorDownVotes,
+  c.AuthorRank,
+  c.ScoreNormalized,
+  c.TotalTags
+FROM Combined c
+WHERE
+  c.AuthorReputation > 1000
+  OR c.Score >= 50
+ORDER BY c.Score DESC
+LIMIT 100;

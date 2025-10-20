@@ -1,0 +1,85 @@
+WITH popular_tags AS (
+    SELECT t.TagName, COUNT(pt.Id) AS post_count
+    FROM Tags t
+    JOIN Posts pt ON POSITION(' ' || t.TagName || ' ' IN ' ' || pt.Tags || ' ') > 0
+    WHERE pt.PostTypeId = 1
+      AND pt.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    GROUP BY t.TagName
+    HAVING COUNT(pt.Id) > 100
+),
+user_activity AS (
+    SELECT 
+        u.Id AS user_id,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS question_count,
+        COUNT(DISTINCT a.Id) AS answer_count,
+        AVG(p.Score) AS avg_question_score,
+        SUM(v.BountyAmount) AS total_bounties_awarded,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS rep_rank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+    LEFT JOIN Votes v ON v.UserId = u.Id AND v.VoteTypeId = 8 AND v.BountyAmount > 0
+    WHERE u.Reputation >= 1000
+      AND u.CreationDate < CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months'
+    GROUP BY u.Id, u.Reputation
+),
+tag_experts AS (
+    SELECT 
+        ua.user_id,
+        pt.TagName,
+        COUNT(p.Id) AS expertise_score,
+        STRING_AGG(DISTINCT CASE WHEN ph.PostHistoryTypeId = 5 THEN ph.Text END, ' | ') AS sample_edits
+    FROM user_activity ua
+    JOIN Posts p ON p.OwnerUserId = ua.user_id AND p.PostTypeId = 1
+    JOIN popular_tags pt ON POSITION(' ' || pt.TagName || ' ' IN ' ' || p.Tags || ' ') > 0
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.UserId = ua.user_id AND ph.PostHistoryTypeId IN (5, 24)
+    WHERE ua.question_count >= 5
+    GROUP BY ua.user_id, pt.TagName
+    HAVING COUNT(p.Id) >= 10
+),
+network_collaborations AS (
+    SELECT 
+        te1.TagName,
+        te1.user_id AS expert1_id,
+        te2.user_id AS expert2_id,
+        COUNT(DISTINCT pl.Id) AS collaboration_strength,
+        AVG(ua1.avg_question_score + ua2.avg_question_score) AS avg_team_score
+    FROM tag_experts te1
+    JOIN tag_experts te2 ON te1.TagName = te2.TagName AND te1.user_id < te2.user_id
+    JOIN user_activity ua1 ON ua1.user_id = te1.user_id
+    JOIN user_activity ua2 ON ua2.user_id = te2.user_id
+    LEFT JOIN PostLinks pl ON pl.LinkTypeId = 1
+      AND pl.PostId IN (
+        SELECT Id FROM Posts WHERE OwnerUserId IN (te1.user_id, te2.user_id) AND PostTypeId = 1
+      )
+      AND pl.RelatedPostId IN (
+        SELECT Id FROM Posts WHERE OwnerUserId IN (te1.user_id, te2.user_id) AND PostTypeId = 1
+      )
+    WHERE ua1.rep_rank <= 5000 AND ua2.rep_rank <= 5000
+    GROUP BY te1.TagName, te1.user_id, te2.user_id, ua1.avg_question_score, ua2.avg_question_score
+    HAVING COUNT(DISTINCT pl.Id) >= 3
+)
+SELECT 
+    nc.TagName,
+    u1.DisplayName AS expert1_name,
+    u2.DisplayName AS expert2_name,
+    nc.collaboration_strength,
+    nc.avg_team_score,
+    ua1.rep_rank AS expert1_rep_rank,
+    ua2.rep_rank AS expert2_rep_rank,
+    COUNT(DISTINCT b1.Id) + COUNT(DISTINCT b2.Id) AS combined_badges,
+    AVG(c.Score) AS avg_comment_engagement
+FROM network_collaborations nc
+JOIN user_activity ua1 ON ua1.user_id = nc.expert1_id
+JOIN user_activity ua2 ON ua2.user_id = nc.expert2_id
+JOIN Users u1 ON u1.Id = nc.expert1_id
+JOIN Users u2 ON u2.Id = nc.expert2_id
+LEFT JOIN Badges b1 ON b1.UserId = nc.expert1_id AND b1.Class = 1
+LEFT JOIN Badges b2 ON b2.UserId = nc.expert2_id AND b2.Class = 1
+LEFT JOIN Posts p ON p.Tags LIKE '%' || nc.TagName || '%' AND p.PostTypeId IN (1, 2)
+LEFT JOIN Comments c ON c.PostId = p.Id AND (c.UserId = nc.expert1_id OR c.UserId = nc.expert2_id)
+GROUP BY nc.TagName, u1.DisplayName, u2.DisplayName, nc.collaboration_strength, nc.avg_team_score, ua1.rep_rank, ua2.rep_rank
+HAVING COUNT(DISTINCT b1.Id) + COUNT(DISTINCT b2.Id) >= 2
+ORDER BY nc.collaboration_strength DESC, nc.avg_team_score DESC
+LIMIT 50;

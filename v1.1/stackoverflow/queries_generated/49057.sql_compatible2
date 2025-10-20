@@ -1,0 +1,138 @@
+WITH RecentActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadgesCount,
+        COUNT(DISTINCT ph.Id) AS PostHistoryContributions,
+        MAX(u.LastAccessDate) AS LastSeen
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    WHERE u.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 years')
+      AND u.Reputation >= 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) >= 1
+),
+TopQuestionTags AS (
+    tags_extracted AS (
+        SELECT
+            p.Id AS post_id,
+            CASE
+                WHEN SUBSTR(p.Tags,1,1) = '<' AND SUBSTR(p.Tags, -1, 1) = '>' THEN SUBSTR(p.Tags, 2, LENGTH(p.Tags) - 2)
+                ELSE p.Tags
+            END AS tag_list
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years')
+          AND p.Tags IS NOT NULL
+          AND LENGTH(p.Tags) > 2
+    ),
+    split_tags AS (
+        SELECT post_id,
+               NULLIF(TRIM(SUBSTR(tag_list, 1, INSTR(tag_list || '><', '><') - 1)), '') AS tag,
+               CASE WHEN INSTR(tag_list || '><', '><') > 0 THEN SUBSTR(tag_list, INSTR(tag_list || '><', '><') + 2) ELSE '' END AS rest
+        FROM tags_extracted
+        UNION ALL
+        SELECT post_id,
+               NULLIF(TRIM(SUBSTR(rest, 1, INSTR(rest || '><', '><') - 1)), '') AS tag,
+               CASE WHEN INSTR(rest || '><', '><') > 0 THEN SUBSTR(rest, INSTR(rest || '><', '><') + 2) ELSE '' END AS rest
+        FROM split_tags
+        WHERE rest IS NOT NULL AND rest <> ''
+    )
+    SELECT tag AS TagName
+    FROM (
+        SELECT tag, COUNT(DISTINCT post_id) AS TagCount
+        FROM split_tags
+        WHERE tag IS NOT NULL AND tag <> ''
+        GROUP BY tag
+        ORDER BY TagCount DESC
+        FETCH FIRST 5 ROWS ONLY
+    ) AS TopTagsSubquery
+),
+UserPostMetrics AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN COALESCE(p.ViewCount,0) ELSE 0 END) AS TotalQuestionViews,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestionsAsked,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN COALESCE(p.Score,0) ELSE 0 END) AS TotalAnswerScore,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswersGiven,
+        SUM(CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswers,
+        SUM(CASE WHEN p.PostTypeId = 2 AND p.ParentId IN (SELECT Id FROM Posts WHERE AcceptedAnswerId = p.Id) THEN 1 ELSE 0 END) AS AcceptedAnswersCount
+    FROM Posts p
+    WHERE p.OwnerUserId IN (SELECT UserId FROM RecentActiveUsers)
+      AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years')
+    GROUP BY p.OwnerUserId
+),
+QuestionPerformance AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title AS QuestionTitle,
+        p.Score AS QuestionScore,
+        p.ViewCount AS QuestionViews,
+        p.CommentCount AS QuestionCommentCount,
+        p.OwnerUserId AS QuestionOwnerId,
+        COUNT(DISTINCT pl.RelatedPostId) AS LinkedPostCount,
+        COUNT(DISTINCT CASE WHEN v_up.VoteTypeId = 2 THEN v_up.Id END) AS UpvoteCount,
+        COUNT(DISTINCT CASE WHEN v_down.VoteTypeId = 3 THEN v_down.Id END) AS DownvoteCount,
+        (CAST(COUNT(DISTINCT CASE WHEN v_up.VoteTypeId = 2 THEN v_up.Id END) AS DECIMAL)
+         / NULLIF(
+             COUNT(DISTINCT CASE WHEN v_up.VoteTypeId = 2 THEN v_up.Id END) 
+             + COUNT(DISTINCT CASE WHEN v_down.VoteTypeId = 3 THEN v_down.Id END), 0)
+        ) AS UpvoteRatio
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId AND pl.LinkTypeId = 1
+    LEFT JOIN Votes v_up ON p.Id = v_up.PostId
+    LEFT JOIN Votes v_down ON p.Id = v_down.PostId
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years')
+      AND EXISTS (
+          SELECT 1
+          FROM TopQuestionTags tqt
+          WHERE p.Tags IS NOT NULL
+            AND p.Tags LIKE '%' || tqt.TagName || '%'
+      )
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.CommentCount, p.OwnerUserId
+    HAVING COUNT(DISTINCT CASE WHEN v_up.VoteTypeId = 2 THEN v_up.Id END) > 5
+      AND COUNT(DISTINCT CASE WHEN v_down.VoteTypeId = 3 THEN v_down.Id END) < COUNT(DISTINCT CASE WHEN v_up.VoteTypeId = 2 THEN v_up.Id END)
+)
+SELECT
+    rau.UserId,
+    rau.DisplayName,
+    rau.Reputation,
+    rau.GoldBadgesCount,
+    rau.PostHistoryContributions,
+    upm.TotalQuestionsAsked,
+    upm.TotalQuestionViews,
+    upm.TotalAnswersGiven,
+    upm.TotalAnswerScore,
+    upm.QuestionsWithAcceptedAnswers,
+    upm.AcceptedAnswersCount,
+    RANK() OVER (
+        ORDER BY
+            rau.Reputation DESC,
+            rau.GoldBadgesCount DESC,
+            upm.TotalAnswerScore DESC,
+            upm.TotalQuestionViews DESC,
+            rau.PostHistoryContributions DESC
+    ) AS OverallUserRank,
+    qp.QuestionId,
+    qp.QuestionTitle,
+    qp.QuestionScore,
+    qp.QuestionViews,
+    qp.QuestionCommentCount,
+    qp.LinkedPostCount,
+    qp.UpvoteCount,
+    qp.DownvoteCount,
+    qp.UpvoteRatio,
+    ROW_NUMBER() OVER (
+        PARTITION BY rau.UserId
+        ORDER BY qp.QuestionScore DESC, qp.QuestionViews DESC, qp.QuestionCommentCount DESC
+    ) AS UserQuestionRank
+FROM RecentActiveUsers rau
+JOIN UserPostMetrics upm ON rau.UserId = upm.UserId
+LEFT JOIN QuestionPerformance qp ON rau.UserId = qp.QuestionOwnerId
+WHERE rau.LastSeen >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+  AND qp.QuestionId IS NOT NULL
+ORDER BY OverallUserRank ASC, UserQuestionRank ASC
+FETCH FIRST 100 ROWS ONLY;

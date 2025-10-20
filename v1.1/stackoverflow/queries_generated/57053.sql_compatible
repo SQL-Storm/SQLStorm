@@ -1,0 +1,94 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        COUNT(p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        MAX(p.LastActivityDate) AS LastPostActivity,
+        MAX(c.CreationDate) AS LastCommentDate,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.Reputation
+),
+TopTags AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id) AS PostCount,
+        SUM(p.ViewCount) AS TotalViews,
+        SUM(p.Score) AS TotalScore
+    FROM
+        Tags t
+    JOIN
+        Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    GROUP BY
+        t.TagName
+    ORDER BY
+        TotalViews DESC
+    LIMIT 10
+),
+HighReputationUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(p.Id) AS QuestionCount,
+        COALESCE(SUM(p.Score), 0) AS TotalQuestionScore,
+        COUNT(a.Id) AS AnswerCount,
+        COALESCE(SUM(a.Score), 0) AS TotalAnswerScore
+    FROM
+        Users u
+    JOIN
+        Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN
+        Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    WHERE
+        u.Reputation > 10000
+    GROUP BY
+        u.Id, u.Reputation, u.DisplayName
+    ORDER BY
+        COALESCE(SUM(p.Score), 0) + COALESCE(SUM(a.Score), 0) DESC
+    LIMIT 10
+)
+SELECT
+    ua.UserId,
+    ua.Reputation,
+    ua.TotalPosts,
+    ua.TotalComments,
+    ua.TotalVotes,
+    ua.TotalBadges,
+    ua.LastPostActivity,
+    ua.LastCommentDate,
+    ua.LastVoteDate,
+    t.TagName,
+    t.PostCount,
+    t.TotalViews,
+    t.TotalScore,
+    hru.UserId AS HighRepUserId,
+    hru.DisplayName,
+    hru.QuestionCount,
+    hru.TotalQuestionScore,
+    hru.AnswerCount,
+    hru.TotalAnswerScore
+FROM
+    UserActivity ua
+CROSS JOIN
+    TopTags t
+LEFT JOIN
+    HighReputationUsers hru
+    ON ua.UserId = hru.UserId
+ORDER BY
+    ua.Reputation DESC,
+    t.TotalViews DESC,
+    COALESCE(hru.TotalQuestionScore, 0) + COALESCE(hru.TotalAnswerScore, 0) DESC;

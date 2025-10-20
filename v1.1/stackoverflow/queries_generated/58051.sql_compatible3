@@ -1,0 +1,91 @@
+WITH ActiveUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation, COUNT(p.Id) AS PostCount,
+           AVG(p.Score) OVER (PARTITION BY u.Id) AS AvgPostScore,
+           RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.CreationDate >= DATE '2022-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+UserVotes AS (
+    SELECT v.UserId,
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes
+    FROM Votes v
+    WHERE v.CreationDate >= DATE '2022-01-01'
+    GROUP BY v.UserId
+),
+UserBadges AS (
+    SELECT b.UserId, COUNT(*) AS GoldBadges
+    FROM Badges b
+    WHERE b.Class = 1
+    GROUP BY b.UserId
+),
+PostEdits AS (
+    SELECT ph.PostId, COUNT(*) AS EditCount
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (5, 6)
+      AND ph.CreationDate >= DATE '2022-01-01'
+    GROUP BY ph.PostId
+),
+-- Portable tag splitter using standard SQL: split by commas after converting tags, using a recursive CTE.
+PostTags AS (
+    SELECT pt.PostId, TRIM(pt.Tag) AS TagName
+    FROM (
+        SELECT p.Id AS PostId,
+               REPLACE(REPLACE(p.Tags, '><', ','), '<', '') AS cleaned
+        FROM Posts p
+        WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    ) base
+    JOIN LATERAL (
+        -- recursive split implemented via a recursive CTE per row using standard SQL
+        WITH RECURSIVE parts(tag, rest) AS (
+            SELECT
+                CASE WHEN POSITION(',' IN base.cleaned) = 0 THEN base.cleaned
+                     ELSE SUBSTRING(base.cleaned FROM 1 FOR POSITION(',' IN base.cleaned)-1)
+                END AS tag,
+                CASE WHEN POSITION(',' IN base.cleaned) = 0 THEN ''
+                     ELSE SUBSTRING(base.cleaned FROM POSITION(',' IN base.cleaned)+1)
+                END AS rest
+            UNION ALL
+            SELECT
+                CASE WHEN POSITION(',' IN rest) = 0 THEN rest
+                     ELSE SUBSTRING(rest FROM 1 FOR POSITION(',' IN rest)-1)
+                END AS tag,
+                CASE WHEN POSITION(',' IN rest) = 0 THEN ''
+                     ELSE SUBSTRING(rest FROM POSITION(',' IN rest)+1)
+                END AS rest
+            FROM parts
+            WHERE rest <> ''
+        )
+        SELECT tag FROM parts
+    ) pt(tag)
+),
+FinalUsers AS (
+    SELECT au.Id, au.DisplayName, au.Reputation, au.PostCount,
+           au.AvgPostScore, au.ReputationRank,
+           COALESCE(uv.Upvotes, 0) AS Upvotes, COALESCE(uv.Downvotes, 0) AS Downvotes,
+           COALESCE(ub.GoldBadges, 0) AS GoldBadges,
+           p.Id AS PostId, pe.EditCount, t.TagName
+    FROM ActiveUsers au
+    LEFT JOIN UserVotes uv ON au.Id = uv.UserId
+    LEFT JOIN UserBadges ub ON au.Id = ub.UserId
+    LEFT JOIN Posts p ON au.Id = p.OwnerUserId
+    LEFT JOIN PostEdits pe ON p.Id = pe.PostId
+    LEFT JOIN PostTags t ON p.Id = t.PostId
+    WHERE au.Reputation > 10000
+      AND au.PostCount > 50
+)
+SELECT fu.Id, fu.DisplayName, fu.Reputation, fu.PostCount,
+       fu.AvgPostScore, fu.ReputationRank,
+       fu.Upvotes, fu.Downvotes, fu.GoldBadges,
+       COALESCE(SUM(fu.EditCount), 0) AS TotalEdits,
+       (SELECT COUNT(*) FROM Comments c WHERE c.UserId = fu.Id) AS CommentCount,
+       STRING_AGG(DISTINCT fu.TagName, ', ') AS FrequentTags
+FROM FinalUsers fu
+GROUP BY fu.Id, fu.DisplayName, fu.Reputation, fu.PostCount,
+         fu.AvgPostScore, fu.ReputationRank, fu.Upvotes,
+         fu.Downvotes, fu.GoldBadges
+ORDER BY (fu.Reputation * 0.3 + fu.PostCount * 0.7) DESC
+FETCH FIRST 100 ROWS ONLY;

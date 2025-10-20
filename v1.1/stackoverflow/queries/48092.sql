@@ -1,0 +1,80 @@
+WITH RankedPosts AS (
+  SELECT
+    p.Id,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+  FROM Posts AS p
+  JOIN PostTypes AS pt
+    ON p.PostTypeId = pt.Id
+  WHERE
+    pt.Name = 'Question'
+), TagCounts AS (
+  SELECT
+    p.Id AS PostId,
+    COUNT(t.Id) AS NumberOfTags
+  FROM Posts AS p
+  JOIN Tags AS t
+    ON POSITION(t.TagName IN p.Tags) > 0
+  WHERE
+    p.PostTypeId = 1
+  GROUP BY
+    p.Id
+), UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    COUNT(DISTINCT p.Id) AS TotalQuestions,
+    SUM(p.Score) AS TotalQuestionScore,
+    COUNT(DISTINCT c.Id) AS TotalComments,
+    SUM(c.Score) AS TotalCommentScore,
+    MAX(p.CreationDate) AS LastQuestionDate
+  FROM Users AS u
+  LEFT JOIN Posts AS p
+    ON u.Id = p.OwnerUserId
+  LEFT JOIN Comments AS c
+    ON u.Id = c.UserId
+  WHERE
+    p.PostTypeId = 1
+  GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes
+)
+SELECT
+  ua.UserId,
+  ua.DisplayName,
+  ua.Reputation,
+  ua.Views,
+  ua.UpVotes,
+  ua.DownVotes,
+  ua.TotalQuestions,
+  ua.TotalQuestionScore,
+  ua.TotalComments,
+  ua.TotalCommentScore,
+  ua.LastQuestionDate,
+  rp.Score AS LatestQuestionScore,
+  tc.NumberOfTags AS LatestQuestionTagsCount,
+  (
+    SELECT
+      COUNT(*)
+    FROM Badges AS b
+    WHERE
+      b.UserId = ua.UserId
+  ) AS TotalBadges
+FROM UserActivity AS ua
+LEFT JOIN RankedPosts AS rp
+  ON ua.UserId = rp.OwnerUserId AND rp.rn = 1
+LEFT JOIN TagCounts AS tc
+  ON rp.Id = tc.PostId
+ORDER BY
+  ua.Reputation DESC
+LIMIT 100;

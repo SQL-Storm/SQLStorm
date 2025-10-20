@@ -1,0 +1,275 @@
+with recent_years as (
+  select cast(extract(year from CreationDate) as int) as yr
+  from Posts
+  where CreationDate is not null
+  group by extract(year from CreationDate)
+  order by yr desc
+  limit 5
+),
+questions as (
+  select p.Id, p.OwnerUserId, p.Score, p.ViewCount, p.CreationDate, p.Title, p.Tags
+  from Posts p
+  where p.PostTypeId = 1
+),
+answers as (
+  select a.Id, a.ParentId, a.OwnerUserId, a.Score, a.CreationDate
+  from Posts a
+  where a.PostTypeId = 2
+),
+first_answer as (
+  select a.ParentId as QuestionId,
+         min(a.CreationDate) as FirstAnswerDate
+  from answers a
+  group by a.ParentId
+),
+qa as (
+  select q.*,
+         fa.FirstAnswerDate,
+         extract(epoch from (fa.FirstAnswerDate - q.CreationDate))/3600.0 as HoursToFirstAnswer
+  from questions q
+  left join first_answer fa on fa.QuestionId = q.Id
+),
+votes_summary as (
+  select v.PostId,
+         sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+         sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+         sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+         sum(case when v.VoteTypeId = 8 then coalesce(v.BountyAmount,0) else 0 end) as BountyStarted,
+         sum(case when v.VoteTypeId = 9 then coalesce(v.BountyAmount,0) else 0 end) as BountyAwarded,
+         count(*) as TotalVotes
+  from Votes v
+  group by v.PostId
+),
+comment_summary as (
+  select c.PostId,
+         count(*) as CommentCount,
+         avg(c.Score) as AvgCommentScore,
+         max(c.CreationDate) as LastCommentDate
+  from Comments c
+  group by c.PostId
+),
+user_activity as (
+  select u.Id as UserId,
+         u.Reputation,
+         u.CreationDate as UserCreationDate,
+         u.LastAccessDate,
+         u.UpVotes as UserUpVotes,
+         u.DownVotes as UserDownVotes,
+         coalesce(b_gold.GoldCount,0) as GoldBadges,
+         coalesce(b_silver.SilverCount,0) as SilverBadges,
+         coalesce(b_bronze.BronzeCount,0) as BronzeBadges
+  from Users u
+  left join (
+    select UserId, count(*) as GoldCount
+    from Badges
+    where Class = 1
+    group by UserId
+  ) b_gold on b_gold.UserId = u.Id
+  left join (
+    select UserId, count(*) as SilverCount
+    from Badges
+    where Class = 2
+    group by UserId
+  ) b_silver on b_silver.UserId = u.Id
+  left join (
+    select UserId, count(*) as BronzeCount
+    from Badges
+    where Class = 3
+    group by UserId
+  ) b_bronze on b_bronze.UserId = u.Id
+),
+tag_expansion as (
+  select q.Id as QuestionId,
+         unnest(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')) as TagName
+  from questions q
+  where q.Tags is not null and q.Tags like '<%>'
+),
+top_tags as (
+  select te.TagName,
+         count(*) as TagQuestionCount
+  from tag_expansion te
+  group by te.TagName
+  having count(*) > 50
+),
+yearly as (
+  select cast(extract(year from q.CreationDate) as int) as yr,
+         q.Id as QuestionId,
+         q.OwnerUserId,
+         q.Score,
+         q.ViewCount,
+         qa.HoursToFirstAnswer,
+         vs.UpVotes, vs.DownVotes, vs.Favorites, vs.BountyStarted, vs.BountyAwarded, vs.TotalVotes,
+         cs.CommentCount, cs.AvgCommentScore,
+         coalesce(vs.UpVotes,0) - coalesce(vs.DownVotes,0) as NetVotes,
+         (case when qa.HoursToFirstAnswer is null then 0 else 1 end) as HasAnswer
+  from questions q
+  join qa on qa.Id = q.Id
+  left join votes_summary vs on vs.PostId = q.Id
+  left join comment_summary cs on cs.PostId = q.Id
+),
+year_tag_matrix as (
+  select y.yr,
+         tt.TagName,
+         count(*) as Questions,
+         avg(y.Score) as AvgScore,
+         avg(y.ViewCount) as AvgViews,
+         avg(y.HoursToFirstAnswer) as AvgHoursToFirstAnswer,
+         avg(y.NetVotes) as AvgNetVotes,
+         sum(y.HasAnswer) as AnsweredCount
+  from yearly y
+  join tag_expansion te on te.QuestionId = y.QuestionId
+  join top_tags tt on tt.TagName = te.TagName
+  group by y.yr, tt.TagName
+),
+user_agg as (
+  select y.yr,
+         y.OwnerUserId as UserId,
+         count(*) as UserQuestions,
+         avg(y.Score) as UserAvgScore,
+         avg(y.ViewCount) as UserAvgViews,
+         avg(y.HoursToFirstAnswer) as UserAvgHoursToFirstAnswer,
+         sum(y.TotalVotes) as UserTotalVotesOnQuestions
+  from yearly y
+  group by y.yr, y.OwnerUserId
+),
+year_user_enriched as (
+  select ua.yr,
+         ua.UserId,
+         ua.UserQuestions,
+         ua.UserAvgScore,
+         ua.UserAvgViews,
+         ua.UserAvgHoursToFirstAnswer,
+         ua.UserTotalVotesOnQuestions,
+         u.Reputation,
+         u.GoldBadges,
+         u.SilverBadges,
+         u.BronzeBadges
+  from user_agg ua
+  left join user_activity u on u.UserId = ua.UserId
+),
+yearly_ranked_questions as (
+  select y.yr,
+         y.QuestionId,
+         y.OwnerUserId,
+         y.Score,
+         y.ViewCount,
+         y.HoursToFirstAnswer,
+         y.NetVotes,
+         dense_rank() over (partition by y.yr order by y.Score desc nulls last, y.ViewCount desc nulls last) as RankByScore,
+         dense_rank() over (partition by y.yr order by y.ViewCount desc nulls last, y.Score desc nulls last) as RankByViews,
+         row_number() over (partition by y.yr order by coalesce(y.HoursToFirstAnswer, 1e9) asc, y.Score desc nulls last) as FastestAnswerRank
+  from yearly y
+),
+feature_rollup as (
+  select y.yr,
+         count(*) as TotalQuestions,
+         avg(y.Score) as AvgScore,
+         percentile_cont(0.5) within group (order by y.Score) as MedianScore,
+         avg(y.ViewCount) as AvgViews,
+         percentile_cont(0.5) within group (order by y.ViewCount) as MedianViews,
+         avg(y.HoursToFirstAnswer) as AvgHoursToFirstAnswer,
+         percentile_cont(0.5) within group (order by y.HoursToFirstAnswer) as MedianHoursToFirstAnswer,
+         sum(case when y.HasAnswer = 1 then 1 else 0 end) as AnsweredQuestions,
+         sum(coalesce(y.Favorites,0)) as TotalFavorites,
+         sum(coalesce(y.BountyStarted,0)) as TotalBountyStarted,
+         sum(coalesce(y.BountyAwarded,0)) as TotalBountyAwarded
+  from yearly y
+  group by y.yr
+),
+closed_events as (
+  select ph.PostId,
+         cast(extract(year from ph.CreationDate) as int) as yr,
+         sum(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as ClosedCount,
+         sum(case when ph.PostHistoryTypeId = 11 then 1 else 0 end) as ReopenedCount
+  from PostHistory ph
+  where ph.PostHistoryTypeId in (10,11)
+  group by ph.PostId, cast(extract(year from ph.CreationDate) as int)
+),
+dupe_links as (
+  select pl.RelatedPostId as OriginalId,
+         pl.PostId as DuplicateId,
+         cast(extract(year from pl.CreationDate) as int) as yr,
+         count(*) as DupeLinks
+  from PostLinks pl
+  where pl.LinkTypeId = 3
+  group by pl.RelatedPostId, pl.PostId, cast(extract(year from pl.CreationDate) as int)
+),
+yearly_final as (
+  select ry.yr,
+         ry.QuestionId,
+         ry.OwnerUserId,
+         ry.Score,
+         ry.ViewCount,
+         ry.HoursToFirstAnswer,
+         ry.NetVotes,
+         coalesce(ce.ClosedCount,0) as ClosedCount,
+         coalesce(ce.ReopenedCount,0) as ReopenedCount,
+         coalesce(dl.DupeLinks,0) as DupeLinks,
+         yrq.RankByScore,
+         yrq.RankByViews,
+         yrq.FastestAnswerRank
+  from yearly ry
+  left join closed_events ce on ce.PostId = ry.QuestionId and ce.yr = ry.yr
+  left join dupe_links dl on dl.DuplicateId = ry.QuestionId and dl.yr = ry.yr
+  join yearly_ranked_questions yrq on yrq.QuestionId = ry.QuestionId and yrq.yr = ry.yr
+),
+filtered_years as (
+  select y.*
+  from yearly_final y
+  join recent_years r on r.yr = y.yr
+),
+tagged_years as (
+  select fy.QuestionId, fy.yr, un.TagName
+  from filtered_years fy
+  join tag_expansion un on un.QuestionId = fy.QuestionId
+)
+select
+  fy.yr,
+  fy.OwnerUserId,
+  u.DisplayName,
+  u.Reputation,
+  coalesce(uag.UserQuestions,0) as UserQuestionsInYear,
+  coalesce(uag.UserAvgScore,0) as UserAvgScoreInYear,
+  coalesce(uag.UserAvgViews,0) as UserAvgViewsInYear,
+  coalesce(uag.UserAvgHoursToFirstAnswer,0) as UserAvgHrsToFirstAnsInYear,
+  coalesce(u.GoldBadges,0) as GoldBadges,
+  coalesce(u.SilverBadges,0) as SilverBadges,
+  coalesce(u.BronzeBadges,0) as BronzeBadges,
+  tr.TagName,
+  tt.TagQuestionCount as TagGlobalQuestionCount,
+  ym.Questions as TagQuestionsInYear,
+  ym.AvgScore as TagAvgScoreInYear,
+  ym.AvgViews as TagAvgViewsInYear,
+  ym.AvgHoursToFirstAnswer as TagAvgHrsToFirstAnsInYear,
+  fr.TotalQuestions as YearTotalQuestions,
+  fr.AvgScore as YearAvgScore,
+  fr.MedianScore as YearMedianScore,
+  fr.AvgViews as YearAvgViews,
+  fr.MedianViews as YearMedianViews,
+  fr.AvgHoursToFirstAnswer as YearAvgHrsToFirstAns,
+  fr.MedianHoursToFirstAnswer as YearMedianHrsToFirstAns,
+  fr.AnsweredQuestions as YearAnsweredQuestions,
+  fr.TotalFavorites as YearTotalFavorites,
+  fr.TotalBountyStarted as YearTotalBountyStarted,
+  fr.TotalBountyAwarded as YearTotalBountyAwarded,
+  fy.QuestionId,
+  fy.Score,
+  fy.ViewCount,
+  fy.HoursToFirstAnswer,
+  fy.NetVotes,
+  fy.ClosedCount,
+  fy.ReopenedCount,
+  fy.DupeLinks,
+  fy.RankByScore,
+  fy.RankByViews,
+  fy.FastestAnswerRank
+from filtered_years fy
+left join Users u on u.Id = fy.OwnerUserId
+left join year_user_enriched uag on uag.UserId = fy.OwnerUserId and uag.yr = fy.yr
+left join feature_rollup fr on fr.yr = fy.yr
+left join tagged_years tr on tr.QuestionId = fy.QuestionId and tr.yr = fy.yr
+left join top_tags tt on tt.TagName = tr.TagName
+left join year_tag_matrix ym on ym.yr = fy.yr and ym.TagName = tr.TagName
+where fy.yr in (select yr from recent_years)
+order by fy.yr desc, fy.RankByScore asc, fy.QuestionId asc
+limit 1000;

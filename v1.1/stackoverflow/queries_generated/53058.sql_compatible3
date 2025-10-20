@@ -1,0 +1,122 @@
+WITH TopUsers AS (
+    SELECT u.Id AS UserId, u.Reputation,
+           COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+           COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+           SUM(p.Score) AS TotalScore,
+           SUM(p.ViewCount) AS TotalViews
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.Reputation
+    HAVING COUNT(DISTINCT p.Id) > 100
+),
+UserBadges AS (
+    SELECT b.UserId, COUNT(*) AS GoldBadges, SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges
+    FROM Badges b
+    WHERE b.Class IN (1, 2)
+    GROUP BY b.UserId
+),
+UserVotes AS (
+    SELECT p.OwnerUserId AS UserId, SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived
+    FROM Votes v
+    JOIN Posts p ON v.PostId = p.Id
+    GROUP BY p.OwnerUserId
+),
+PopularTags AS (
+    SELECT t.TagName, t.Count AS TagPopularity
+    FROM Tags t
+    ORDER BY t.Count DESC
+    LIMIT 10
+),
+UserTags AS (
+    SELECT p.OwnerUserId AS UserId,
+           SUBSTRING(p.Tags FROM abspos.pos_start + 1 FOR abspos.pos_end - abspos.pos_start - 1) AS Tag,
+           COUNT(*) AS TagCount
+    FROM Posts p
+    JOIN (
+        SELECT 0 AS n UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4
+        UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9
+        UNION ALL SELECT 10 UNION ALL SELECT 11 UNION ALL SELECT 12 UNION ALL SELECT 13 UNION ALL SELECT 14
+        UNION ALL SELECT 15 UNION ALL SELECT 16 UNION ALL SELECT 17 UNION ALL SELECT 18 UNION ALL SELECT 19
+        UNION ALL SELECT 20
+    ) numbers ON TRUE
+    CROSS JOIN LATERAL (
+        SELECT
+            CASE
+                WHEN numbers.n = 0 THEN POSITION('<' IN p.Tags)
+                ELSE NULL
+            END AS first_pos
+    ) init
+    CROSS JOIN LATERAL (
+        SELECT
+            (CASE
+                WHEN numbers.n = 0 THEN POSITION('<' IN p.Tags)
+                ELSE
+                    NULL
+            END) AS pos_rel,
+            0 AS dummy
+    ) calc
+    CROSS JOIN LATERAL (
+        SELECT
+            (CASE
+                WHEN numbers.n = 0 THEN POSITION('<' IN p.Tags)
+                ELSE
+                    (CASE
+                        WHEN POSITION('<' IN p.Tags) > 0 THEN
+                            POSITION('<' IN SUBSTRING(p.Tags FROM POSITION('<' IN p.Tags) + numbers.n))
+                        ELSE 0
+                    END)
+            END) AS pos_start,
+            (CASE
+                WHEN POSITION('<' IN p.Tags) > 0 THEN
+                    POSITION('>' IN SUBSTRING(p.Tags FROM (CASE
+                        WHEN numbers.n = 0 THEN POSITION('<' IN p.Tags) + 1
+                        ELSE POSITION('<' IN p.Tags) + numbers.n + 1
+                    END)))
+                ELSE 0
+            END) AS pos_end_rel
+    ) posdata
+    CROSS JOIN LATERAL (
+        SELECT
+            CASE
+                WHEN posdata.pos_start IS NULL OR posdata.pos_start = 0 THEN 0
+                ELSE (CASE WHEN numbers.n = 0 THEN posdata.pos_start ELSE POSITION('<' IN p.Tags) + numbers.n + posdata.pos_start - 1 END)
+            END AS pos_start,
+            CASE
+                WHEN posdata.pos_end_rel IS NULL OR posdata.pos_end_rel = 0 THEN 0
+                ELSE (CASE WHEN numbers.n = 0 THEN posdata.pos_start + posdata.pos_end_rel ELSE POSITION('<' IN p.Tags) + numbers.n + posdata.pos_start - 1 + posdata.pos_end_rel - 1 END)
+            END AS pos_end
+    ) abspos
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+      AND POSITION('<' IN p.Tags) > 0
+      AND abspos.pos_start > 0
+      AND abspos.pos_end > abspos.pos_start
+    GROUP BY p.OwnerUserId, abspos.pos_start, abspos.pos_end, SUBSTRING(p.Tags FROM abspos.pos_start + 1 FOR abspos.pos_end - abspos.pos_start - 1)
+),
+TopUserTags AS (
+    SELECT ut.UserId, ut.Tag, ut.TagCount,
+           ROW_NUMBER() OVER (PARTITION BY ut.UserId ORDER BY ut.TagCount DESC) AS TagRank
+    FROM UserTags ut
+    JOIN PopularTags pt ON ut.Tag = pt.TagName
+),
+EditsPerUser AS (
+    SELECT ph.UserId, COUNT(*) AS EditCount,
+           COUNT(DISTINCT ph.PostId) AS EditedPosts
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6,7,8,9)
+    GROUP BY ph.UserId
+)
+SELECT tu.UserId, tu.Reputation, tu.QuestionCount, tu.AnswerCount, tu.TotalScore, tu.TotalViews,
+       COALESCE(ub.GoldBadges, 0) AS GoldBadges, COALESCE(ub.SilverBadges, 0) AS SilverBadges,
+       COALESCE(uv.UpVotesReceived, 0) AS UpVotesReceived, COALESCE(uv.DownVotesReceived, 0) AS DownVotesReceived,
+       COALESCE(tut.Tag, 'None') AS TopTag, COALESCE(tut.TagCount, 0) AS TopTagCount,
+       COALESCE(epu.EditCount, 0) AS EditCount, COALESCE(epu.EditedPosts, 0) AS EditedPosts,
+       RANK() OVER (ORDER BY tu.Reputation DESC) AS ReputationRank
+FROM TopUsers tu
+LEFT JOIN UserBadges ub ON tu.UserId = ub.UserId
+LEFT JOIN UserVotes uv ON tu.UserId = uv.UserId
+LEFT JOIN TopUserTags tut ON tu.UserId = tut.UserId AND tut.TagRank = 1
+LEFT JOIN EditsPerUser epu ON tu.UserId = epu.UserId
+ORDER BY tu.Reputation DESC
+LIMIT 100;

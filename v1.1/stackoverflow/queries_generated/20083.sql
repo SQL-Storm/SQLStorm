@@ -1,4 +1,4 @@
--- {"query": "20083.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1735} 
+-- {"query": "20083.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1735} 
 
 WITH UserActivity AS (
     -- Step 1: Aggregate basic user statistics and calculate a base activity score.

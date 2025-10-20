@@ -1,0 +1,145 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        ARRAY[t.TagName] AS Path,
+        1 AS Depth
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+    UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        rh.Path || t2.TagName,
+        rh.Depth + 1
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy rh ON rh.TagName <> t2.TagName AND NOT t2.TagName = ANY(rh.Path)
+    WHERE t2.IsRequired = TRUE
+),
+FilteredPosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.Title,
+        p.Tags,
+        u.Reputation,
+        u.Location,
+        u.CreationDate AS UserCreationDate
+    FROM Posts p
+    JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '2 years')
+      AND p.Score > 10
+      AND u.Reputation > 500
+),
+AnswerDetails AS (
+    SELECT
+        a.Id,
+        a.ParentId AS QuestionId,
+        a.CreationDate,
+        a.Score,
+        a.OwnerUserId
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+      AND a.Score > 5
+),
+QuestionAnswerStats AS (
+    SELECT
+        fp.Id AS QuestionId,
+        fp.Title,
+        fp.Tags,
+        fp.Score AS QuestionScore,
+        fp.ViewCount,
+        fp.OwnerUserId,
+        COUNT(ad.Id) AS AnswerCount,
+        MAX(ad.Score) AS MaxAnswerScore,
+        AVG(ad.Score) AS AvgAnswerScore,
+        MAX(COALESCE(v.UpVotes,0) - COALESCE(v.DownVotes,0)) AS MaxVotingDiffAnswer,
+        MAX(u2.Reputation) AS TopAnswererReputation
+    FROM FilteredPosts fp
+    LEFT JOIN AnswerDetails ad ON ad.QuestionId = fp.Id
+    LEFT JOIN (
+        SELECT
+            a.PostId,
+            SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes a
+        JOIN VoteTypes vt ON vt.Id = a.VoteTypeId
+        GROUP BY a.PostId
+    ) v ON v.PostId = ad.Id
+    LEFT JOIN Users u2 ON u2.Id = ad.OwnerUserId
+    GROUP BY fp.Id, fp.Title, fp.Tags, fp.Score, fp.ViewCount, fp.OwnerUserId
+),
+TagFilter AS (
+    SELECT
+        qas.QuestionId,
+        qas.Title,
+        qas.Tags,
+        qas.QuestionScore,
+        qas.ViewCount,
+        qas.OwnerUserId,
+        qas.AnswerCount,
+        qas.MaxAnswerScore,
+        qas.AvgAnswerScore,
+        qas.MaxVotingDiffAnswer,
+        qas.TopAnswererReputation,
+        rth.Depth
+    FROM QuestionAnswerStats qas
+    JOIN RecursiveTagHierarchy rth ON rth.TagName = ANY(string_to_array(REGEXP_REPLACE(qas.Tags, '[<>]', '', 'g'), '><'))
+    WHERE rth.Depth <= 2
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+FinalResults AS (
+    SELECT
+        tf.QuestionId,
+        tf.Title,
+        tf.Tags,
+        tf.QuestionScore,
+        tf.ViewCount,
+        tf.AnswerCount,
+        tf.MaxAnswerScore,
+        tf.AvgAnswerScore,
+        tf.TopAnswererReputation,
+        u.Reputation AS AskerReputation,
+        ubc.GoldBadges,
+        ubc.SilverBadges,
+        ubc.BronzeBadges,
+        u.Location,
+        u.CreationDate AS UserCreationDate
+    FROM TagFilter tf
+    JOIN Users u ON u.Id = tf.OwnerUserId
+    LEFT JOIN UserBadgeCounts ubc ON ubc.UserId = u.Id
+    WHERE tf.AnswerCount >= 3
+)
+SELECT
+    QuestionId,
+    Title,
+    Tags,
+    QuestionScore,
+    ViewCount,
+    AnswerCount,
+    MaxAnswerScore,
+    ROUND(CAST(AvgAnswerScore AS NUMERIC), 2) AS AvgAnswerScore,
+    TopAnswererReputation,
+    AskerReputation,
+    COALESCE(GoldBadges, 0) AS GoldBadges,
+    COALESCE(SilverBadges, 0) AS SilverBadges,
+    COALESCE(BronzeBadges, 0) AS BronzeBadges,
+    Location,
+    UserCreationDate
+FROM FinalResults
+ORDER BY QuestionScore DESC, AnswerCount DESC
+LIMIT 100;

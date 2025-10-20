@@ -1,0 +1,114 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.UpVotes,
+        U.DownVotes,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN P.PostTypeId = 1 AND P.Score >= 100 AND P.ViewCount >= 10000 THEN 1 ELSE 0 END) AS HighImpactQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 AND P.Score >= 50 THEN 1 ELSE 0 END) AS HighScoreAnswers,
+        AVG(CASE WHEN P.PostTypeId = 1 THEN P.Score END) AS AvgQuestionScore,
+        AVG(CASE WHEN P.PostTypeId = 2 THEN P.Score END) AS AvgAnswerScore,
+        MAX(U.LastAccessDate) AS LastUserAccessDate
+    FROM Users U
+    JOIN Posts P ON U.Id = P.OwnerUserId
+    WHERE U.Reputation >= 5000
+      AND U.LastAccessDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+      AND P.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years')
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.UpVotes, U.DownVotes, U.CreationDate
+    HAVING COUNT(P.Id) >= 15
+),
+UserPostEditHistory AS (
+    SELECT
+        PH.UserId,
+        COUNT(PH.Id) AS TotalPostHistoryEvents,
+        COUNT(DISTINCT PH.PostId) AS UniquePostsWithHistory,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS SelfEdits,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (10, 11) THEN 1 ELSE 0 END) AS CloseReopenEvents
+    FROM PostHistory PH
+    WHERE PH.UserId IS NOT NULL
+      AND PH.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+    GROUP BY PH.UserId
+),
+UserBadgeAchievements AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadgesAwarded,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        ARRAY_AGG(DISTINCT T.TagName) FILTER (WHERE B.TagBased = TRUE AND T.TagName IS NOT NULL) AS TagBasedBadgeTags
+    FROM Badges B
+    LEFT JOIN Tags T ON T.TagName = B.Name AND B.TagBased = TRUE
+    WHERE B.Date >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years')
+    GROUP BY B.UserId
+    HAVING SUM(CASE WHEN B.Class IN (1, 2) THEN 1 ELSE 0 END) >= 2
+),
+UserCommentActivity AS (
+    SELECT
+        C.UserId,
+        COUNT(C.Id) AS TotalCommentsMade,
+        SUM(C.Score) AS TotalCommentScore,
+        COUNT(DISTINCT C.PostId) AS UniquePostsCommentedOn
+    FROM Comments C
+    WHERE C.UserId IS NOT NULL
+      AND C.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+    GROUP BY C.UserId
+    HAVING COUNT(C.Id) >= 20
+),
+RelevantTaggedPosts AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        P.Id AS PostId,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        T_unnest.tagname_raw AS PostTag
+    FROM Posts P
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(P.Tags, 2, length(P.Tags)-2), '><')) AS tagname_raw
+    ) AS T_unnest
+    WHERE P.PostTypeId = 1
+      AND P.Score >= 20
+      AND P.ViewCount >= 2000
+      AND T_unnest.tagname_raw IN ('sql', 'database', 'performance', 'optimization', 'indexing', 'query-performance', 'plsql', 'tsql')
+)
+SELECT
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.UpVotes,
+    UAS.DownVotes,
+    UAS.TotalPostsOwned,
+    UAS.HighImpactQuestions,
+    UAS.HighScoreAnswers,
+    UAS.AvgQuestionScore,
+    UAS.AvgAnswerScore,
+    UPEH.TotalPostHistoryEvents,
+    UPEH.SelfEdits,
+    UPEH.CloseReopenEvents,
+    UBA.GoldBadges,
+    UBA.SilverBadges,
+    UBA.TagBasedBadgeTags,
+    UCA.TotalCommentsMade,
+    UCA.TotalCommentScore,
+    UCA.UniquePostsCommentedOn,
+    COUNT(DISTINCT RTP.PostId) AS NumberOfRelevantTaggedQuestions,
+    ARRAY_AGG(DISTINCT RTP.PostTag) AS CombinedRelevantTags,
+    SUM(RTP.PostScore) AS TotalScoreFromRelevantPosts,
+    SUM(RTP.PostViewCount) AS TotalViewsFromRelevantPosts
+FROM UserActivitySummary UAS
+INNER JOIN UserPostEditHistory UPEH ON UAS.UserId = UPEH.UserId
+INNER JOIN UserBadgeAchievements UBA ON UAS.UserId = UBA.UserId
+INNER JOIN UserCommentActivity UCA ON UAS.UserId = UCA.UserId
+INNER JOIN RelevantTaggedPosts RTP ON UAS.UserId = RTP.UserId
+WHERE UPEH.SelfEdits >= 10
+  AND UAS.HighImpactQuestions >= 2
+GROUP BY
+    UAS.DisplayName, UAS.Reputation, UAS.UpVotes, UAS.DownVotes, UAS.TotalPostsOwned,
+    UAS.HighImpactQuestions, UAS.HighScoreAnswers, UAS.AvgQuestionScore, UAS.AvgAnswerScore,
+    UPEH.TotalPostHistoryEvents, UPEH.SelfEdits, UPEH.CloseReopenEvents,
+    UBA.GoldBadges, UBA.SilverBadges, UBA.TagBasedBadgeTags,
+    UCA.TotalCommentsMade, UCA.TotalCommentScore, UCA.UniquePostsCommentedOn
+HAVING COUNT(DISTINCT RTP.PostId) >= 5
+ORDER BY UAS.Reputation DESC, UAS.HighImpactQuestions DESC, UPEH.SelfEdits DESC, NumberOfRelevantTaggedQuestions DESC
+LIMIT 50;

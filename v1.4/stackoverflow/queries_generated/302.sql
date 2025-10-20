@@ -1,0 +1,116 @@
+-- {"query": "302.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 13709} 
+WITH
+UpVotesDownVotes AS (
+  SELECT PostId,
+         SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+         SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes
+  FROM Votes
+  GROUP BY PostId
+),
+ActiveQuestions AS (
+  SELECT p.Id AS PostId,
+         p.PostTypeId,
+         p.Title,
+         p.Tags,
+         p.CreationDate,
+         p.LastActivityDate,
+         p.ViewCount,
+         p.Score,
+         p.OwnerUserId,
+         p.OwnerDisplayName,
+         p.Body,
+         p.AcceptedAnswerId,
+         COALESCE(v.TotalUpVotes, 0) AS UpVotes,
+         COALESCE(v.TotalDownVotes, 0) AS DownVotes,
+         CASE
+           WHEN p.Tags IS NULL THEN 0
+           ELSE array_length(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><'), 1)
+         END AS TagCount,
+         CASE WHEN p.ViewCount > 1000 THEN TRUE ELSE FALSE END AS HighlyViewed
+  FROM Posts p
+  LEFT JOIN UpVotesDownVotes v ON v.PostId = p.Id
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate > (CURRENT_DATE - INTERVAL '1 year')
+),
+ActiveAnswers AS (
+  SELECT p.Id AS PostId,
+         p.PostTypeId,
+         p.ParentId,
+         p.Score,
+         p.ViewCount,
+         p.CreationDate,
+         p.LastActivityDate,
+         p.OwnerUserId,
+         p.OwnerDisplayName,
+         p.Body,
+         COALESCE(v.TotalUpVotes, 0) AS UpVotes,
+         COALESCE(v.TotalDownVotes, 0) AS DownVotes
+  FROM Posts p
+  LEFT JOIN UpVotesDownVotes v ON v.PostId = p.Id
+  WHERE p.PostTypeId = 2
+    AND p.CreationDate > (CURRENT_DATE - INTERVAL '1 year')
+),
+Combined AS (
+  SELECT * FROM ActiveQuestions
+  UNION ALL
+  SELECT * FROM ActiveAnswers
+),
+Ranked AS (
+  SELECT c.*,
+         ROW_NUMBER() OVER (PARTITION BY PostTypeId ORDER BY Score DESC, ViewCount DESC, LastActivityDate DESC) AS rn
+  FROM Combined c
+)
+SELECT
+  r.PostId,
+  r.PostTypeId,
+  r.Title,
+  r.Tags,
+  r.TagCount,
+  r.ViewCount,
+  r.Score,
+  r.UpVotes,
+  r.DownVotes,
+  r.LastActivityDate,
+  CASE
+    WHEN r.Tags IS NULL THEN ARRAY[]::text[]
+    ELSE string_to_array(substring(r.Tags, 2, length(r.Tags) - 2), '><')
+  END AS TagArray,
+  COALESCE(r.Body, '') AS Body,
+  LENGTH(r.Body) AS BodyLength,
+  CASE
+    WHEN r.OwnerUserId IS NULL THEN 'Anonymous'
+    ELSE COALESCE(ug.DisplayName, r.OwnerDisplayName)
+  END AS OwnerName,
+  COALESCE(ug.Reputation, 0) AS OwnerReputation,
+  COALESCE(ba.GoldCount, 0) AS GoldBadges,
+  COALESCE(ba.SilverCount, 0) AS SilverBadges,
+  COALESCE(ba.BronzeCount, 0) AS BronzeBadges,
+  (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.OwnerUserId = r.OwnerUserId AND p2.CreationDate > (CURRENT_DATE - INTERVAL '30 days')) AS AvgOwnerScoreLast30,
+  (SELECT ph2.Name
+   FROM PostHistory ph2
+   JOIN PostHistoryTypes pht2 ON pht2.Id = ph2.PostHistoryTypeId
+   WHERE ph2.PostId = r.PostId
+   ORDER BY ph2.CreationDate DESC
+   LIMIT 1) AS LastHistoryName,
+  (SELECT ph2.CreationDate
+   FROM PostHistory ph2
+   WHERE ph2.PostId = r.PostId
+   ORDER BY ph2.CreationDate DESC
+   LIMIT 1) AS LastHistoryDate,
+  CASE
+    WHEN ug.WebsiteUrl IS NOT NULL THEN substring(ug.WebsiteUrl FROM 'https?://([^/]+)')
+    ELSE NULL
+  END AS OwnerWebsiteDomain,
+  (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = r.PostId OR pl.RelatedPostId = r.PostId) AS LinkDegree
+FROM Ranked r
+LEFT JOIN Users ug ON ug.Id = r.OwnerUserId
+LEFT JOIN (
+  SELECT UserId,
+         SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldCount,
+         SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverCount,
+         SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeCount
+  FROM Badges
+  GROUP BY UserId
+) ba ON ba.UserId = r.OwnerUserId
+WHERE r.rn <= 500
+ORDER BY r.PostTypeId, r.Score DESC, r.ViewCount DESC;

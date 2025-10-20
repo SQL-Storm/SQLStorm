@@ -1,0 +1,56 @@
+-- {"query": "58012.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "deepseek-r1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2033, "output_tokens": 1020} 
+
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id, 
+        u.DisplayName, 
+        u.Reputation, 
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AvgAnswerScore,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.CreationDate >= NOW() - INTERVAL '1 YEAR'
+    GROUP BY u.Id
+    HAVING COUNT(p.Id) > 50
+),
+PostStats AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Tags,
+        COUNT(c.Id) AS CommentCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes,
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (2,5,8)) AS EditCount
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId IN (1,2)
+    GROUP BY p.Id
+)
+SELECT 
+    au.Id AS UserId,
+    au.DisplayName,
+    au.Reputation,
+    au.ReputationRank,
+    ps.PostId,
+    ps.Title,
+    ps.Tags,
+    ps.CommentCount,
+    ps.Upvotes,
+    ps.Downvotes,
+    ps.EditCount,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = au.Id AND b.Class = 1) AS GoldBadges,
+    (SELECT STRING_AGG(t.TagName, ', ') FROM Tags t WHERE t.TagName = ANY(STRING_TO_ARRAY(REPLACE(REPLACE(ps.Tags, '><', ','), '<>', ''), ','))) AS TagNames,
+    ROW_NUMBER() OVER (PARTITION BY au.Id ORDER BY ps.Upvotes DESC) AS PostRank
+FROM ActiveUsers au
+JOIN Posts p ON au.Id = p.OwnerUserId
+JOIN PostStats ps ON p.Id = ps.PostId
+WHERE ps.Upvotes > 100 OR ps.Downvotes > 20
+ORDER BY 
+    au.ReputationRank ASC, 
+    ps.Upvotes DESC, 
+    ps.Downvotes ASC 
+LIMIT 1000;

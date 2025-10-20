@@ -1,4 +1,4 @@
--- {"query": "17007.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 18680, "output_tokens": 18558} 
+-- {"query": "17007.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 18680, "output_tokens": 18558} 
 
 WITH user_activity AS (
     SELECT 

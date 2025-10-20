@@ -1,0 +1,173 @@
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as depth,
+        CAST(t.TagName AS VARCHAR(1000)) as tag_path
+    FROM Tags t
+    WHERE t.Count > 10000
+
+    UNION ALL
+
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        th.depth + 1,
+        CAST(th.tag_path || ' -> ' || t2.TagName AS VARCHAR(1000))
+    FROM Tags t2
+    INNER JOIN tag_hierarchy th ON t2.Count < th.Count
+    WHERE th.depth < 3 
+        AND t2.Count > 5000
+        AND t2.Id != th.Id
+),
+power_users AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as total_posts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answers,
+        SUM(p.Score) as total_score,
+        AVG(p.Score) as avg_score,
+        COUNT(DISTINCT b.Name) as unique_badges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) as gold_badges,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) as reputation_rank,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) as median_post_score
+    FROM Users u
+    INNER JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 5000
+        AND p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '2 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT p.Id) >= 50
+),
+hot_questions AS (
+    SELECT 
+        q.Id,
+        q.Title,
+        q.Tags,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CreationDate,
+        COALESCE(accepted_answer.Score, 0) as accepted_answer_score,
+        COALESCE(accepted_answer.CreationDate, q.CreationDate) as accepted_answer_date,
+        -- STRING_AGG with DISTINCT and ORDER BY requires the ORDER BY expression to be in the argument list in some dialects.
+        -- To be portable, aggregate ordered distinct comments by first aggregating distinct values into a subquery.
+        (
+            SELECT STRING_AGG(ph2.Comment, ' | ')
+            FROM (
+                SELECT DISTINCT ph_inner.Comment, ph_inner.CreationDate
+                FROM PostHistory ph_inner
+                WHERE ph_inner.PostId = q.Id
+                  AND ph_inner.PostHistoryTypeId = 52
+                ORDER BY ph_inner.CreationDate
+            ) ph2
+        ) as hot_network_notes,
+        COUNT(DISTINCT pl.RelatedPostId) as linked_posts_count,
+        AVG(answers.Score) as avg_answer_score,
+        STDDEV(answers.Score) as stddev_answer_score,
+        MAX(answers.Score) as max_answer_score,
+        COUNT(DISTINCT answers.OwnerUserId) as unique_answerers,
+        SUM(CASE WHEN answers.OwnerUserId IN (SELECT Id FROM power_users) THEN 1 ELSE 0 END) as power_user_answers,
+        EXTRACT(EPOCH FROM (MIN(answers.CreationDate) - q.CreationDate))/3600.0 as hours_to_first_answer,
+        EXTRACT(EPOCH FROM (COALESCE(accepted_answer.CreationDate, CAST('2024-10-01 12:34:56' AS TIMESTAMP)) - q.CreationDate))/86400.0 as days_to_accepted
+    FROM Posts q
+    LEFT JOIN Posts accepted_answer ON q.AcceptedAnswerId = accepted_answer.Id
+    LEFT JOIN Posts answers ON q.Id = answers.ParentId AND answers.PostTypeId = 2
+    LEFT JOIN PostHistory ph ON q.Id = ph.PostId AND ph.PostHistoryTypeId IN (52, 53)
+    LEFT JOIN PostLinks pl ON q.Id = pl.PostId
+    WHERE q.PostTypeId = 1
+        AND q.Score > 10
+        AND q.ViewCount > 1000
+        AND q.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '1 year'
+    GROUP BY q.Id, q.Title, q.Tags, q.Score, q.ViewCount, q.AnswerCount, q.CreationDate, 
+             accepted_answer.Score, accepted_answer.CreationDate
+),
+comment_analysis AS (
+    SELECT 
+        c.PostId,
+        COUNT(*) as comment_count,
+        AVG(LENGTH(c.Text)) as avg_comment_length,
+        SUM(c.Score) as total_comment_score,
+        COUNT(DISTINCT c.UserId) as unique_commenters,
+        MAX(c.Score) as max_comment_score,
+        STRING_AGG(c.Text, ' ' ORDER BY c.Score DESC) FILTER (WHERE c.Score >= 5) as top_comments
+    FROM Comments c
+    WHERE c.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '1 year'
+    GROUP BY c.PostId
+),
+vote_patterns AS (
+    SELECT 
+        v.PostId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) as upvotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) as downvotes,
+        COUNT(CASE WHEN v.VoteTypeId = 8 THEN 1 END) as bounties_started,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) as total_bounty_amount,
+        COUNT(DISTINCT v.UserId) FILTER (WHERE v.VoteTypeId IN (2, 3)) as unique_voters,
+        STDDEV(EXTRACT(EPOCH FROM v.CreationDate)) as vote_time_variance
+    FROM Votes v
+    WHERE v.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '1 year'
+    GROUP BY v.PostId
+)
+SELECT 
+    hq.Id as question_id,
+    hq.Title,
+    SUBSTRING(hq.Tags FROM 2 FOR CHAR_LENGTH(hq.Tags)-2) as tags,
+    hq.Score as question_score,
+    hq.ViewCount,
+    hq.AnswerCount,
+    ROUND(CAST(hq.avg_answer_score AS NUMERIC), 2) as avg_answer_score,
+    hq.max_answer_score,
+    hq.accepted_answer_score,
+    ROUND(CAST(hq.hours_to_first_answer AS NUMERIC), 2) as hours_to_first_answer,
+    ROUND(CAST(hq.days_to_accepted AS NUMERIC), 2) as days_to_accepted,
+    hq.unique_answerers,
+    hq.power_user_answers,
+    COALESCE(ca.comment_count, 0) as comments,
+    COALESCE(ROUND(CAST(ca.avg_comment_length AS NUMERIC), 0), 0) as avg_comment_length,
+    COALESCE(ca.total_comment_score, 0) as total_comment_score,
+    COALESCE(vp.upvotes, 0) as upvotes,
+    COALESCE(vp.downvotes, 0) as downvotes,
+    CASE 
+        WHEN COALESCE(vp.downvotes, 0) = 0 THEN NULL 
+        ELSE ROUND(CAST(vp.upvotes AS NUMERIC) / CAST(vp.downvotes AS NUMERIC), 2) 
+    END as upvote_ratio,
+    COALESCE(vp.bounties_started, 0) as bounties_started,
+    COALESCE(vp.total_bounty_amount, 0) as total_bounty_amount,
+    hq.linked_posts_count,
+    pu.DisplayName as top_answerer,
+    pu.Reputation as top_answerer_reputation,
+    pu.gold_badges as top_answerer_gold_badges,
+    ROUND(CAST(pu.median_post_score AS NUMERIC), 2) as top_answerer_median_score,
+    CASE 
+        WHEN hq.ViewCount = 0 THEN 0 
+        ELSE ROUND((CAST(hq.Score AS NUMERIC) / CAST(hq.ViewCount AS NUMERIC)) * 1000, 4) 
+    END as score_per_1k_views,
+    ROUND(LOG(1 + hq.ViewCount) * SQRT(hq.Score + hq.AnswerCount), 2) as hotness_metric,
+    ROW_NUMBER() OVER (PARTITION BY SUBSTRING(hq.Tags FROM 2 FOR POSITION('>' IN hq.Tags) - 2) ORDER BY hq.Score DESC) as rank_in_primary_tag,
+    DENSE_RANK() OVER (ORDER BY hq.Score * LOG(2 + hq.ViewCount) DESC) as overall_impact_rank
+FROM hot_questions hq
+LEFT JOIN comment_analysis ca ON hq.Id = ca.PostId
+LEFT JOIN vote_patterns vp ON hq.Id = vp.PostId
+LEFT JOIN LATERAL (
+    SELECT 
+        u.DisplayName,
+        u.Reputation,
+        pu.gold_badges,
+        pu.median_post_score
+    FROM Posts p
+    INNER JOIN power_users pu ON p.OwnerUserId = pu.Id
+    INNER JOIN Users u ON pu.Id = u.Id
+    WHERE p.ParentId = hq.Id 
+        AND p.PostTypeId = 2
+    ORDER BY p.Score DESC
+    LIMIT 1
+) pu ON true
+WHERE hq.AnswerCount > 3
+    AND hq.unique_answerers > 2
+ORDER BY hotness_metric DESC, overall_impact_rank
+LIMIT 100;

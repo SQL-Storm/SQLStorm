@@ -1,0 +1,129 @@
+-- {"query": "75.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 860} 
+WITH
+RecentUserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    u.AccountId,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY u.LastAccessDate DESC) AS rn
+  FROM Users u
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    ROW_NUMBER() OVER (ORDER BY t.Count DESC, t.TagName ASC) AS rn
+  FROM Tags t
+  WHERE t.IsModer atorOnly = 0
+),
+QuestionStats AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount,
+    p.PostTypeId,
+    p.FavoriteCount,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.LastEditorUserId,
+    p.LastEditDate
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- Questions
+),
+AnswerActivity AS (
+  SELECT
+    a.Id AS AnswerId,
+    a.ParentId AS QuestionId,
+    a.Score AS AnswerScore,
+    a.CreationDate AS AnswerDate,
+    a.OwnerUserId AS AnswerOwner
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+),
+ClosingEvents AS (
+  SELECT
+    ph.PostId,
+    ph.CreationDate AS CloseDate,
+    ph.Comment AS ReasonComment,
+    CAST(ph.Text AS varchar(4000)) AS TextValue
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId = 10 -- Post Closed
+),
+ComplexQuery AS (
+  SELECT
+    q.PostId,
+    q.Title,
+    q.CreationDate,
+    q.Score AS QuestionScore,
+    q.ViewCount,
+    q.OwnerUserId,
+    q.LastActivityDate,
+    q.AnswerCount,
+    a.AnswerId,
+    a.AnswerDate,
+    a.AnswerScore,
+    c.CloseDate,
+    c.ReasonComment,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    t.TagName
+  FROM QuestionStats q
+  LEFT JOIN AnswerActivity a ON a.QuestionId = q.PostId
+  LEFT JOIN ClosingEvents c ON c.PostId = q.PostId
+  LEFT JOIN Users u ON u.Id = q.OwnerUserId
+  LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(
+      replace(replace(q.Tags, '><', ','), '<', ''), ','
+    )) AS TagName
+  ) t ON TRUE
+  WHERE q.Score > 0
+    AND (q.ViewCount + COALESCE(a.AnswerScore, 0)) > 0
+  ORDER BY q.CreationDate DESC
+  LIMIT 100
+)
+SELECT
+  -- Outer structure to exercise complex predicates and windowing
+  ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY CreationDate DESC) AS RowInOwner,
+  OwnerUserId,
+  OwnerDisplayName,
+  Reputation,
+  CreationDate AS PostCreationDate,
+  LastActivityDate,
+  PostId,
+  Title,
+  COALESCE(QuestionScore, Score) AS ScoreUsed,
+  ViewCount,
+  AnswerCount,
+  AnswerDate,
+  AnswerScore,
+  CloseDate,
+  ReasonComment,
+  t.TagName
+FROM ComplexQuery
+JOIN LATERAL (
+  SELECT TagName
+  FROM (SELECT TagName FROM TopTags WHERE rn = 1) t
+) t ON TRUE
+WHERE (ViewCount > 50 OR AnswerCount > 5)
+  AND (CloseDate IS NULL OR CloseDate > CreationDate)
+  AND (OwnerUserId IS NOT NULL)
+ORDER BY OwnerUserId, PostCreationDate DESC
+;

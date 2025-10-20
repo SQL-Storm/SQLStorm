@@ -1,0 +1,56 @@
+-- {"query": "36057.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 563} 
+SELECT
+  p.Id AS PostId,
+  p.PostTypeId,
+  p.Title,
+  p.ViewCount,
+  p.Score,
+  p.CreationDate,
+  p.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  p.LastActivityDate,
+  COALESCE(a.CountAnswers, 0) AS AnswerCountAtBenchmark,
+  COALESCE(vr.Upvoters, 0) AS UniqueUpvotersInWindow,
+  COALESCE(vr.Saveds, 0) AS UniqueSaversInWindow,
+  p.Tags,
+  COUNT(DISTINCT c.Id) AS CommentCountInWindow,
+  AVG(vs.Score) FILTER (WHERE v2.VoteTypeId = 2) AS AvgUpVoteScoreInWindow
+FROM Posts p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN (
+  SELECT PostId, COUNT(*) AS CountAnswers
+  FROM Posts
+  WHERE PostTypeId = 2
+  GROUP BY PostId
+) a ON a.PostId = p.Id
+LEFT JOIN Comments c ON c.PostId = p.Id
+LEFT JOIN Votes v ON v.PostId = p.Id
+LEFT JOIN Votes v2 ON v2.PostId = p.Id
+LEFT JOIN (
+  SELECT PostId,
+         COUNT(DISTINCT CASE WHEN VoteTypeId = 2 THEN UserId END) AS Upvoters,
+         COUNT(DISTINCT CASE WHEN VoteTypeId = 6 THEN UserId END) AS SatStudents,
+         COUNT(DISTINCT CASE WHEN VoteTypeId = 6 THEN UserId END) AS Saveds
+  FROM Votes
+  WHERE CreationDate >= NOW() - INTERVAL '7 days'
+  GROUP BY PostId
+) vr ON vr.PostId = p.Id
+LEFT JOIN (
+  SELECT PostId, COUNT(*) AS Count
+  FROM Comments
+  WHERE CreationDate >= NOW() - INTERVAL '7 days'
+  GROUP BY PostId
+) c7 ON c7.PostId = p.Id
+LEFT JOIN (
+  SELECT Id, PostId, VoteTypeId, Score
+  FROM Votes
+  WHERE CreationDate >= NOW() - INTERVAL '7 days'
+) vs ON vs.PostId = p.Id
+WHERE p.CreationDate <= NOW()
+  AND p.LastActivityDate >= NOW() - INTERVAL '7 days'
+GROUP BY
+  p.Id, p.PostTypeId, p.Title, p.ViewCount, p.Score, p.CreationDate,
+  p.OwnerUserId, u.DisplayName, p.LastActivityDate, a.CountAnswers,
+  vr.Upvoters, vr.Saveds, p.Tags
+ORDER BY p.LastActivityDate DESC
+LIMIT 100;

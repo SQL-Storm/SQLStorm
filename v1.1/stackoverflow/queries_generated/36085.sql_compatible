@@ -1,0 +1,90 @@
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.PostTypeId,
+  pt.Name AS PostTypeName,
+  p.CreationDate,
+  p.LastActivityDate,
+  p.Score,
+  p.ViewCount,
+  p.FavoriteCount,
+  p.Tags,
+  u.Id AS OwnerId,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation,
+  u.ProfileImageUrl,
+  COALESCE(a.CountAnswers, 0) AS AnswerCount,
+  COALESCE(vv.UpVotes, 0) AS NetUpVotes,
+  COALESCE(vv.DownVotes, 0) AS NetDownVotes,
+  COALESCE(b.BadgeCount, 0) AS BadgeCount,
+  COALESCE(ct.CommentCount, 0) AS CommentCount,
+  COALESCE(pl.LinkedCount, 0) AS LinksToPostCount,
+  COALESCE(pl2.DuplicateCount, 0) AS DuplicatesCount,
+  COALESCE(tags.TagsList, ARRAY[]::text[]) AS TagsList
+FROM
+  Posts p
+  JOIN PostTypes pt ON p.PostTypeId = pt.Id
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT
+      ParentId AS PostId,
+      COUNT(*) AS CountAnswers
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY ParentId
+  ) a ON p.Id = a.PostId
+  LEFT JOIN (
+    SELECT
+      PostId,
+      SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+      SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM Votes
+    GROUP BY PostId
+  ) vv ON p.Id = vv.PostId
+  LEFT JOIN (
+    SELECT
+      OwnerUserId,
+      COUNT(*) AS BadgeCount
+    FROM Badges
+    GROUP BY OwnerUserId
+  ) b ON u.Id = b.OwnerUserId
+  LEFT JOIN (
+    SELECT
+      PostId,
+      COUNT(*) AS CommentCount
+    FROM Comments
+    GROUP BY PostId
+  ) ct ON p.Id = ct.PostId
+  LEFT JOIN (
+    SELECT
+      p.Id AS PostId,
+      ARRAY_AGG(DISTINCT t.TagName) AS TagsList
+    FROM Posts p
+    CROSS JOIN LATERAL (
+      SELECT UNNEST(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')) AS TagName
+    ) t
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id
+  ) tags ON p.Id = tags.PostId
+  LEFT JOIN (
+    SELECT
+      PostId,
+      COUNT(*) AS LinkedCount
+    FROM PostLinks
+    GROUP BY PostId
+  ) pl ON p.Id = pl.PostId
+  LEFT JOIN (
+    SELECT
+      PostId,
+      COUNT(*) AS DuplicateCount
+    FROM PostLinks
+    WHERE LinkTypeId = 3
+    GROUP BY PostId
+  ) pl2 ON p.Id = pl2.PostId
+GROUP BY
+  p.Id, p.Title, p.PostTypeId, pt.Name, p.CreationDate, p.LastActivityDate, p.Score, p.ViewCount,
+  p.FavoriteCount, p.Tags, u.Id, u.DisplayName, u.Reputation, u.ProfileImageUrl,
+  a.CountAnswers, vv.UpVotes, vv.DownVotes, b.BadgeCount, ct.CommentCount, pl.LinkedCount, pl2.DuplicateCount, tags.TagsList
+ORDER BY
+  p.LastActivityDate DESC
+LIMIT 100;

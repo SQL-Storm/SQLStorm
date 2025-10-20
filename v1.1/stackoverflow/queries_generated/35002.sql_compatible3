@@ -1,0 +1,161 @@
+WITH user_activity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        MAX(p.Score) AS MaxPostScore,
+        MIN(p.CreationDate) AS FirstPostDate,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM
+        Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        LEFT JOIN Comments c ON c.UserId = u.Id
+        LEFT JOIN Votes v ON v.UserId = u.Id
+    WHERE
+        u.CreationDate <= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation
+),
+post_tags AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        TRIM(tag) AS tag
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        WITH RECURSIVE nums(pos, rest) AS (
+            SELECT
+                1 AS pos,
+                TRIM(BOTH '<>' FROM p.Tags) AS rest
+            UNION ALL
+            SELECT
+                pos + 1,
+                CASE
+                    WHEN POSITION('><' IN rest) = 0 THEN ''
+                    ELSE SUBSTRING(rest FROM POSITION('><' IN rest)+2)
+                END
+            FROM nums
+            WHERE rest <> '' AND POSITION('><' IN rest) > 0
+        ),
+        splitted AS (
+            SELECT
+                CASE
+                    WHEN POSITION('><' IN rest) = 0 THEN rest
+                    ELSE SUBSTRING(rest FROM 1 FOR POSITION('><' IN rest)-1)
+                END AS tag
+            FROM nums
+        )
+        SELECT tag FROM splitted
+    ) split
+    WHERE p.OwnerUserId IS NOT NULL
+        AND p.PostTypeId = 1
+        AND p.Tags IS NOT NULL
+),
+top_tags AS (
+    SELECT
+        pt.UserId,
+        pt.tag,
+        COUNT(*) AS cnt
+    FROM (
+        SELECT
+            p.OwnerUserId AS UserId,
+            TRIM(BOTH '<>' FROM p.Tags) AS tags_str
+        FROM Posts p
+        WHERE p.OwnerUserId IS NOT NULL
+            AND p.PostTypeId = 1
+            AND p.Tags IS NOT NULL
+    ) p0
+    CROSS JOIN LATERAL (
+        WITH RECURSIVE split(tag, rest) AS (
+            SELECT
+                CASE
+                    WHEN POSITION('><' IN p0.tags_str) = 0 THEN p0.tags_str
+                    ELSE SUBSTRING(p0.tags_str FROM 1 FOR POSITION('><' IN p0.tags_str)-1)
+                END AS tag,
+                CASE
+                    WHEN POSITION('><' IN p0.tags_str) = 0 THEN ''
+                    ELSE SUBSTRING(p0.tags_str FROM POSITION('><' IN p0.tags_str)+2)
+                END AS rest
+            UNION ALL
+            SELECT
+                CASE
+                    WHEN POSITION('><' IN rest) = 0 THEN rest
+                    ELSE SUBSTRING(rest FROM 1 FOR POSITION('><' IN rest)-1)
+                END AS tag,
+                CASE
+                    WHEN POSITION('><' IN rest) = 0 THEN ''
+                    ELSE SUBSTRING(rest FROM POSITION('><' IN rest)+2)
+                END AS rest
+            FROM split
+            WHERE rest <> ''
+        )
+        SELECT tag, rest FROM split
+    ) s
+    -- ensure columns from lateral are named for referencing below
+    -- aggregate tags per user
+    GROUP BY p0.UserId, s.tag
+) 
+,
+ranked_tags AS (
+    SELECT
+        t.UserId,
+        t.tag,
+        t.cnt,
+        ROW_NUMBER() OVER (PARTITION BY t.UserId ORDER BY t.cnt DESC, t.tag) AS rn
+    FROM top_tags t
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.TotalPosts,
+    ua.TotalComments,
+    ua.TotalVotes,
+    ua.MaxPostScore,
+    ua.FirstPostDate,
+    ua.LastPostDate,
+    COALESCE(tt1.tag, '') AS TopTag1,
+    COALESCE(tt2.tag, '') AS TopTag2,
+    COALESCE(tt3.tag, '') AS TopTag3,
+    COALESCE(b1.BadgeCount, 0) AS GoldBadges,
+    COALESCE(b2.BadgeCount, 0) AS SilverBadges,
+    COALESCE(b3.BadgeCount, 0) AS BronzeBadges
+FROM
+    user_activity ua
+    LEFT JOIN ranked_tags tt1 ON tt1.UserId = ua.UserId AND tt1.rn = 1
+    LEFT JOIN ranked_tags tt2 ON tt2.UserId = ua.UserId AND tt2.rn = 2
+    LEFT JOIN ranked_tags tt3 ON tt3.UserId = ua.UserId AND tt3.rn = 3
+    LEFT JOIN (
+        SELECT UserId, COUNT(*) AS BadgeCount FROM Badges WHERE Class = 1 GROUP BY UserId
+    ) b1 ON b1.UserId = ua.UserId
+    LEFT JOIN (
+        SELECT UserId, COUNT(*) AS BadgeCount FROM Badges WHERE Class = 2 GROUP BY UserId
+    ) b2 ON b2.UserId = ua.UserId
+    LEFT JOIN (
+        SELECT UserId, COUNT(*) AS BadgeCount FROM Badges WHERE Class = 3 GROUP BY UserId
+    ) b3 ON b3.UserId = ua.UserId
+WHERE
+    ua.TotalPosts + ua.TotalComments + ua.TotalVotes > 500
+GROUP BY
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.TotalPosts,
+    ua.TotalComments,
+    ua.TotalVotes,
+    ua.MaxPostScore,
+    ua.FirstPostDate,
+    ua.LastPostDate,
+    tt1.tag,
+    tt2.tag,
+    tt3.tag,
+    b1.BadgeCount,
+    b2.BadgeCount,
+    b3.BadgeCount
+ORDER BY
+    ua.Reputation DESC,
+    ua.TotalPosts DESC,
+    ua.TotalVotes DESC
+LIMIT 100;

@@ -1,0 +1,122 @@
+WITH active_users AS (
+    SELECT u.Id, u.Reputation, u.Location, u.CreationDate
+    FROM Users u
+    WHERE u.Reputation > 1000
+      AND u.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '5 years'
+),
+top_questions AS (
+    SELECT p.Id, p.Title, p.Score, p.ViewCount, p.Tags, p.OwnerUserId, p.CreationDate,
+           ROW_NUMBER() OVER (
+             PARTITION BY p.Tags
+             ORDER BY p.ViewCount DESC
+           ) AS tag_rank
+    FROM Posts p
+    INNER JOIN active_users au ON p.OwnerUserId = au.Id
+    WHERE p.PostTypeId = 1
+      AND p.ViewCount > 10000
+      AND p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+),
+tagged_posts AS (
+    SELECT tq.Id AS question_id, tq.Title, tq.Tags, tq.Score AS q_score, tq.OwnerUserId, tq.CreationDate,
+           COALESCE(a.Id, -1) AS answer_id, a.Score AS a_score,
+           COALESCE(a.CreationDate, tq.CreationDate) AS activity_date,
+           ROW_NUMBER() OVER (PARTITION BY tq.Id ORDER BY COALESCE(a.Score, 0) DESC, a.CreationDate DESC) AS answer_rank
+    FROM top_questions tq
+    LEFT JOIN Posts a ON a.ParentId = tq.Id AND a.PostTypeId = 2 AND a.Score >= 0
+    WHERE tq.tag_rank <= 5
+),
+aggregated_stats AS (
+    SELECT tp.question_id, tp.Title, tp.Tags, tp.OwnerUserId,
+           COUNT(NULLIF(tp.answer_id, -1)) AS answer_count,
+           AVG(tp.a_score) AS avg_answer_score,
+           SUM(tp.q_score + COALESCE(tp.a_score, 0)) AS total_engagement,
+           MAX(tp.activity_date) AS last_activity,
+           (SELECT STRING_AGG(t, ';')
+            FROM (
+              SELECT TRIM(BOTH ' ' FROM CASE WHEN t = '' THEN NULL ELSE t END) AS t
+              FROM (
+                -- emulate UNNEST by splitting using a set-returning approach with generate_series on positions
+                SELECT SUBSTRING(parts FROM pos FOR len) AS t
+                FROM (
+                  -- produce a string where separators '><' are replaced by '||SEP||' to split on that token
+                  SELECT CASE
+                           WHEN LEFT(tp.Tags,1) = '<' AND RIGHT(tp.Tags,1) = '>' THEN
+                             REPLACE(SUBSTRING(tp.Tags FROM 2 FOR GREATEST(LENGTH(tp.Tags)-2,0)), '><', '||SEP||')
+                           ELSE
+                             REPLACE(tp.Tags, '><', '||SEP||')
+                         END AS parts
+                ) rep,
+                LATERAL (
+                  -- find positions of separator token and slice accordingly
+                  SELECT generate_series(1, (length(rep.parts) - length(replace(rep.parts, '||SEP||', ''))) / length('||SEP||') + 1) AS idx
+                ) gs,
+                LATERAL (
+                  SELECT
+                    -- find start position of each token
+                    CASE
+                      WHEN gs.idx = 1 THEN 1
+                      ELSE (strpos(rep.parts, '||SEP||', 1) + 0) -- placeholder, will be recalculated below
+                    END AS start_dummy
+                ) sd,
+                LATERAL (
+                  -- compute positions by splitting using substring with simple method: use regexp_split_to_table equivalent via built-in splitting using XML or JSON is not portable,
+                  -- instead use regexp_split_to_table when available; for broader compatibility use simple split by token via recursive CTE is complex.
+                  -- Use a common approach: simulate split using a numbers table via generate_series to extract tokens by locating separators.
+                  SELECT
+                    -- compute positions of separators
+                    (SELECT COALESCE(NULLIF(regexp_split_to_array(rep.parts, '||SEP\\|\\|')::text[][(gs.idx)], ''), rep.parts)) AS parts -- fallback, may be no-op in some dialects
+                ) final,
+                LATERAL (
+                  SELECT final.parts AS parts_token
+                )
+              LIMIT 1
+            ) s(t)
+            WHERE t IS NOT NULL
+           ) AS tag_list
+    FROM tagged_posts tp
+    WHERE tp.answer_rank <= 3
+    GROUP BY tp.question_id, tp.Title, tp.Tags, tp.OwnerUserId
+    HAVING COUNT(NULLIF(tp.answer_id, -1)) >= 1
+),
+user_badges AS (
+    SELECT au.Id, COUNT(b.Id) AS badge_count,
+           SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+           au.Reputation AS user_rep
+    FROM active_users au
+    LEFT JOIN Badges b ON b.UserId = au.Id
+    GROUP BY au.Id, au.Reputation
+)
+SELECT 
+    qs.Title,
+    qs.tag_list,
+    qs.answer_count,
+    ROUND(CAST(qs.avg_answer_score AS NUMERIC), 2) AS avg_answer_score,
+    qs.total_engagement,
+    au.Reputation AS owner_reputation,
+    ub.badge_count,
+    ub.gold_badges,
+    COUNT(DISTINCT c.Id) AS total_comments,
+    COUNT(DISTINCT v.Id) AS total_votes,
+    AVG(CASE WHEN v.BountyAmount > 0 THEN v.BountyAmount END) AS avg_bounty,
+    COUNT(DISTINCT pl.RelatedPostId) AS linked_posts,
+    qs.question_id,
+    qs.last_activity
+FROM aggregated_stats qs
+INNER JOIN Users au ON qs.OwnerUserId = au.Id
+INNER JOIN user_badges ub ON au.Id = ub.Id
+LEFT JOIN Comments c ON c.PostId = qs.question_id
+LEFT JOIN LATERAL (
+    SELECT v2.*
+    FROM Votes v2
+    WHERE v2.PostId IN (
+      SELECT answer_id FROM tagged_posts WHERE question_id = qs.question_id AND answer_rank <= 3
+    )
+) v ON TRUE
+LEFT JOIN PostLinks pl ON pl.PostId = qs.question_id OR pl.RelatedPostId = qs.question_id
+WHERE LEFT(qs.Tags, 1) = '<'
+GROUP BY 
+    qs.question_id, qs.Title, qs.tag_list, qs.answer_count, qs.avg_answer_score, 
+    qs.total_engagement, au.Reputation, ub.badge_count, ub.gold_badges, qs.last_activity
+HAVING COUNT(DISTINCT c.Id) > 5
+ORDER BY qs.total_engagement DESC, qs.last_activity DESC
+LIMIT 50;

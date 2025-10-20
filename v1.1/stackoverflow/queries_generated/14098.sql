@@ -1,4 +1,4 @@
--- {"query": "14098.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 231165, "output_tokens": 101106} 
+-- {"query": "14098.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 231165, "output_tokens": 101106} 
 SELECT 
     DENSE_RANK() OVER (ORDER BY COUNT(CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20, 35) THEN 1 END) DESC) AS CloseReopenUndeleteRankingByUser,
     u.DisplayName,

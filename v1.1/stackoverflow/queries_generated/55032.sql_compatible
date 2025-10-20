@@ -1,0 +1,111 @@
+WITH
+  q_posts AS (
+    SELECT
+      p.Id,
+      p.OwnerUserId,
+      p.Score,
+      p.CreationDate,
+      p.Tags,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.Title
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+  ),
+  tag_map AS (
+    SELECT
+      qp.Id        AS PostId,
+      TRIM(BOTH '<>' FROM UNNEST(string_to_array(SUBSTRING(qp.Tags, 2, LENGTH(qp.Tags) - 2), '><'))) AS TagName
+    FROM q_posts qp
+  ),
+  tag_stats AS (
+    SELECT
+      t.TagName,
+      COUNT(*)                                                  AS QuestionCount,
+      CAST(AVG(qp.Score) AS NUMERIC(10,2))                       AS AvgQuestionScore,
+      PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY qp.Score)     AS MedianQuestionScore,
+      SUM(qp.AnswerCount)                                        AS TotalAnswers,
+      CAST(AVG(qp.AnswerCount) AS NUMERIC(10,2))                 AS AvgAnswersPerQuestion,
+      MAX(qp.CreationDate)                                       AS LatestQuestionDate
+    FROM tag_map tm
+    JOIN q_posts qp   ON qp.Id = tm.PostId
+    JOIN Tags    t    ON t.TagName = tm.TagName
+    GROUP BY t.TagName
+  ),
+  top_contributors AS (
+    SELECT
+      tm.TagName,
+      u.Id            AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      ROW_NUMBER() OVER (PARTITION BY tm.TagName ORDER BY u.Reputation DESC) AS rn
+    FROM tag_map tm
+    JOIN Posts p   ON p.Id = tm.PostId
+    JOIN Users u   ON u.Id = p.OwnerUserId
+    GROUP BY tm.TagName, u.Id, u.DisplayName, u.Reputation
+  ),
+  tag_badge_counts AS (
+    SELECT
+      t.TagName,
+      COUNT(b.Id) AS TagBadgeCount
+    FROM Tags t
+    LEFT JOIN Badges b
+      ON b.TagBased = TRUE
+     AND b.Name = t.TagName
+    GROUP BY t.TagName
+  ),
+  recent_activity AS (
+    SELECT
+      tm.TagName,
+      p.Id          AS RecentPostId,
+      p.Title,
+      p.CreationDate,
+      ROW_NUMBER() OVER (PARTITION BY tm.TagName ORDER BY p.CreationDate DESC) AS rn
+    FROM tag_map tm
+    JOIN Posts p ON p.Id = tm.PostId
+  ),
+  final AS (
+    SELECT
+      ts.TagName,
+      ts.QuestionCount,
+      ts.AvgQuestionScore,
+      ts.MedianQuestionScore,
+      ts.TotalAnswers,
+      ts.AvgAnswersPerQuestion,
+      ts.LatestQuestionDate,
+      tb.TagBadgeCount,
+      JSONB_AGG(
+        JSONB_BUILD_OBJECT(
+          'UserId',       tc.UserId,
+          'DisplayName',  tc.DisplayName,
+          'Reputation',   tc.Reputation
+        )
+        ORDER BY tc.Reputation DESC
+      ) FILTER (WHERE tc.rn <= 3) AS TopContributors,
+      JSONB_BUILD_OBJECT(
+        'PostId',       ra.RecentPostId,
+        'Title',        ra.Title,
+        'CreationDate', ra.CreationDate
+      ) AS MostRecentQuestion
+    FROM tag_stats          ts
+    LEFT JOIN tag_badge_counts tb ON tb.TagName = ts.TagName
+    LEFT JOIN top_contributors tc ON tc.TagName = ts.TagName
+    LEFT JOIN recent_activity   ra ON ra.TagName = ts.TagName AND ra.rn = 1
+    GROUP BY
+      ts.TagName,
+      ts.QuestionCount,
+      ts.AvgQuestionScore,
+      ts.MedianQuestionScore,
+      ts.TotalAnswers,
+      ts.AvgAnswersPerQuestion,
+      ts.LatestQuestionDate,
+      tb.TagBadgeCount,
+      ra.RecentPostId,
+      ra.Title,
+      ra.CreationDate
+  )
+SELECT *
+FROM final
+ORDER BY QuestionCount DESC
+LIMIT 100;

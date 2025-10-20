@@ -1,0 +1,182 @@
+WITH
+Questions AS (
+  SELECT p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.Tags,
+         COALESCE(p.OwnerUserId, -1) AS OwnerUserId,
+         regexp_split_to_table(substring(p.Tags, 2, length(p.Tags)-2), '><') AS Tag
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+),
+QuestionStats AS (
+  SELECT q.Id AS QuestionId,
+         COUNT(CASE WHEN a.PostTypeId = 2 THEN 1 END) AS AnswerCountCalc,
+         MAX(CASE WHEN a.PostTypeId = 2 THEN a.Score END) AS MaxAnswerScore,
+         COUNT(CASE WHEN c.PostId IS NOT NULL THEN 1 END) AS CommentCountCalc,
+         COUNT(DISTINCT ph.UserId) AS DistinctEditorCount,
+         MAX(ph.CreationDate) AS LastEditAt
+  FROM Questions q
+  LEFT JOIN Posts a ON a.ParentId = q.Id
+  LEFT JOIN Comments c ON c.PostId = q.Id OR c.PostId = a.Id
+  LEFT JOIN PostHistory ph ON ph.PostId = q.Id
+  GROUP BY q.Id
+),
+UserMetrics AS (
+  SELECT u.Id AS UserId,
+         u.Reputation,
+         EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate)) / 86400 AS DaysSinceSignup,
+         COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+         COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+         COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+         COALESCE(AVG(CASE WHEN a.PostTypeId = 2 THEN a.Score END), 0) AS AvgAnswerScore,
+         COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotesGiven,
+         COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotesGiven
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  GROUP BY u.Id, u.Reputation, u.CreationDate
+),
+TagSummary AS (
+  SELECT Tag,
+         COUNT(DISTINCT q.Id) AS QuestionCount,
+         SUM(q.Score) AS CumulativeScore,
+         AVG(q.ViewCount) AS AvgViews,
+         SUM(CASE WHEN qs.AnswerCountCalc >= 1 THEN 1 ELSE 0 END) AS HasAnswersCount
+  FROM Questions q
+  JOIN QuestionStats qs ON qs.QuestionId = q.Id
+  GROUP BY Tag
+),
+TagPairs AS (
+  SELECT t1.Tag AS TagA, t2.Tag AS TagB, COUNT(DISTINCT t1.Id) AS CoOccurCount
+  FROM (
+    SELECT Id, regexp_split_to_table(substring(Tags, 2, length(Tags)-2), '><') AS Tag
+    FROM Posts
+    WHERE PostTypeId = 1 AND CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+  ) t1
+  JOIN (
+    SELECT Id, regexp_split_to_table(substring(Tags, 2, length(Tags)-2), '><') AS Tag
+    FROM Posts
+    WHERE PostTypeId = 1 AND CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+  ) t2 ON t1.Id = t2.Id AND t1.Tag < t2.Tag
+  GROUP BY t1.Tag, t2.Tag
+),
+QuestionRank AS (
+  SELECT q.Id,
+         q.Title,
+         q.CreationDate,
+         q.Score,
+         q.ViewCount,
+         qs.AnswerCountCalc,
+         qs.DistinctEditorCount,
+         qs.LastEditAt,
+         q.Tag,
+         ts.QuestionCount AS TagQuestionCount,
+         ts.CumulativeScore AS TagCumulativeScore,
+         um.Reputation AS OwnerReputation,
+         um.GoldBadges, um.SilverBadges, um.BronzeBadges,
+         (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - q.CreationDate)) / 86400) AS AgeDays,
+         (
+           (GREATEST(q.Score, 0) * 2.5)
+           + (LN(GREATEST(q.ViewCount,1)) * 1.2)
+           + (LEAST(qs.AnswerCountCalc,5) * 10)
+           + (COALESCE(um.Reputation,0) / 1000.0)
+           + (COALESCE(ts.QuestionCount,0) * 0.05)
+           - (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - COALESCE(qs.LastEditAt,q.CreationDate))) / 86400) * 0.1
+           + (COALESCE(um.GoldBadges,0) * 5)
+           + (COALESCE(um.SilverBadges,0) * 2)
+         ) AS CompositeScore
+  FROM Questions q
+  JOIN QuestionStats qs ON qs.QuestionId = q.Id
+  LEFT JOIN TagSummary ts ON ts.Tag = q.Tag
+  LEFT JOIN UserMetrics um ON um.UserId = q.OwnerUserId
+),
+TagTimeSeries AS (
+  SELECT
+    q.Tag,
+    date_trunc('week', q.CreationDate) AS WeekStart,
+    COUNT(*) AS QuestionsThisWeek,
+    SUM(q.Score) AS ScoreThisWeek,
+    SUM(q.ViewCount) AS ViewsThisWeek,
+    SUM(qs.AnswerCountCalc) AS AnswersThisWeek
+  FROM Questions q
+  JOIN QuestionStats qs ON qs.QuestionId = q.Id
+  GROUP BY q.Tag, date_trunc('week', q.CreationDate)
+),
+TagTimeRolling AS (
+  SELECT t1.Tag, t1.WeekStart,
+         t1.QuestionsThisWeek,
+         t1.ScoreThisWeek,
+         t1.ViewsThisWeek,
+         t1.AnswersThisWeek,
+         COALESCE((
+           SELECT SUM(t2.QuestionsThisWeek) FROM TagTimeSeries t2
+           WHERE t2.Tag = t1.Tag AND t2.WeekStart BETWEEN t1.WeekStart - INTERVAL '3 weeks' AND t1.WeekStart
+         ),0) AS QuestionsLast4Weeks,
+         COALESCE((
+           SELECT SUM(t2.ViewsThisWeek) FROM TagTimeSeries t2
+           WHERE t2.Tag = t1.Tag AND t2.WeekStart BETWEEN t1.WeekStart - INTERVAL '11 weeks' AND t1.WeekStart
+         ),0) AS ViewsLast12Weeks
+  FROM TagTimeSeries t1
+),
+DiverseTopQuestions AS (
+  SELECT qr.Id,
+         qr.Title,
+         qr.CreationDate,
+         qr.Score,
+         qr.ViewCount,
+         qr.AnswerCountCalc,
+         qr.DistinctEditorCount,
+         qr.LastEditAt,
+         qr.Tag,
+         qr.TagQuestionCount,
+         qr.TagCumulativeScore,
+         qr.OwnerReputation,
+         qr.GoldBadges,
+         qr.SilverBadges,
+         qr.BronzeBadges,
+         qr.AgeDays,
+         qr.CompositeScore,
+         ROW_NUMBER() OVER (PARTITION BY qr.Tag ORDER BY qr.CompositeScore DESC) AS RankInTag,
+         RANK() OVER (ORDER BY qr.CompositeScore DESC) AS GlobalRank
+  FROM QuestionRank qr
+),
+TopPerTag AS (
+  SELECT * FROM DiverseTopQuestions WHERE RankInTag = 1
+),
+NextCandidates AS (
+  SELECT * FROM DiverseTopQuestions WHERE RankInTag BETWEEN 2 AND 5
+),
+CombinedCandidates AS (
+  SELECT * FROM TopPerTag
+  UNION ALL
+  SELECT * FROM NextCandidates
+),
+FinalSelection AS (
+  SELECT *,
+         ROW_NUMBER() OVER (ORDER BY CompositeScore DESC) AS FinalRank
+  FROM CombinedCandidates
+  WHERE CompositeScore IS NOT NULL
+  LIMIT 100
+)
+SELECT
+  f.FinalRank,
+  f.Id AS QuestionId,
+  f.Title,
+  f.Tag,
+  f.CreationDate,
+  ROUND(CAST(f.CompositeScore AS numeric),4) AS CompositeScore,
+  f.Score AS QuestionScore,
+  f.ViewCount,
+  f.AnswerCountCalc,
+  f.DistinctEditorCount,
+  f.OwnerReputation,
+  f.GoldBadges, f.SilverBadges, f.BronzeBadges,
+  ts.QuestionsLast4Weeks,
+  ts.ViewsLast12Weeks,
+  (SELECT string_agg(tp.TagB || ':' || tp.CoOccurCount, ', ' ORDER BY tp.CoOccurCount DESC)
+   FROM TagPairs tp
+   WHERE tp.TagA = f.Tag
+   LIMIT 3) AS TopCoOccurringTags
+FROM FinalSelection f
+LEFT JOIN TagTimeRolling ts ON ts.Tag = f.Tag
+ORDER BY f.FinalRank;

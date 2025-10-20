@@ -1,0 +1,107 @@
+with UserStats as (
+  select 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    count(distinct b.Id) as BadgeCount,
+    count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+    count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersGiven,
+    sum(vp.Score) as TotalPostScore,
+    max(p.CreationDate) as LastPostDate
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId in (1,2)
+  left join Posts vp on vp.OwnerUserId = u.Id
+  group by u.Id, u.DisplayName, u.Reputation
+),
+QuestionTags as (
+  select
+    p.Id as QuestionId,
+    -- normalize tags like '<tag1><tag2>' into rows using standard SQL: split into array and unnest
+    trim(t) as Tag
+  from Posts p,
+  unnest(
+    regexp_split_to_array(
+      replace(substring(p.Tags from 2 for length(p.Tags)-2), '><', '|'),
+      '\|'
+    )
+  ) as t
+  where p.PostTypeId = 1 and p.Tags is not null
+),
+AnswerDetails as (
+  select 
+    a.Id as AnswerId,
+    a.ParentId as QuestionId,
+    a.CreationDate as AnswerDate,
+    a.Score as AnswerScore,
+    u.Id as AnswererId,
+    u.DisplayName as AnswererName,
+    q.Score as QuestionScore,
+    q.ViewCount as QuestionViews,
+    q.Title as QuestionTitle
+  from Posts a
+  join Posts q on q.Id = a.ParentId and q.PostTypeId = 1
+  join Users u on u.Id = a.OwnerUserId
+  where a.PostTypeId = 2
+),
+TopTags as (
+  select 
+    qt.Tag,
+    count(distinct qt.QuestionId) as QuestionCount,
+    avg(ad.AnswerScore) as AvgAnswerScore,
+    avg(ad.QuestionScore) as AvgQuestionScore,
+    avg(ad.QuestionViews) as AvgQuestionViews
+  from QuestionTags qt
+  join AnswerDetails ad on ad.QuestionId = qt.QuestionId
+  group by qt.Tag
+  having count(distinct qt.QuestionId) > 50
+),
+UserTopTags as (
+  select 
+    us.Id as UserId,
+    tt.Tag,
+    row_number() over (partition by us.Id order by tt.AvgAnswerScore desc) as Rank
+  from UserStats us
+  join AnswerDetails ad on ad.AnswererId = us.Id
+  join QuestionTags qt on qt.QuestionId = ad.QuestionId
+  join TopTags tt on tt.Tag = qt.Tag
+  group by us.Id, tt.Tag, tt.AvgAnswerScore
+),
+ActiveUsersWithTopTags as (
+  select 
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.BadgeCount,
+    us.QuestionsAsked,
+    us.AnswersGiven,
+    us.TotalPostScore,
+    us.LastPostDate,
+    utt.Tag
+  from UserStats us
+  join UserTopTags utt on utt.UserId = us.Id and utt.Rank = 1
+  where us.Reputation > 10000 and us.AnswersGiven > 10 and us.LastPostDate > (cast('2024-10-01 12:34:56' as timestamp) - interval '180 days')
+)
+select 
+  au.Id as UserId,
+  au.DisplayName,
+  au.Reputation,
+  au.BadgeCount,
+  au.QuestionsAsked,
+  au.AnswersGiven,
+  au.TotalPostScore,
+  au.LastPostDate,
+  au.Tag as TopTag,
+  count(distinct p.Id) filter (where p.PostTypeId = 2 and p.Score > 10) as HighlyRatedAnswers,
+  coalesce(sum(v.BountyAmount),0) as TotalBountiesEarned,
+  max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as LastCloseVoteDate,
+  (select count(*) from Comments c where c.UserId = au.Id and c.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') as RecentCommentsCount,
+  (select count(distinct pl.RelatedPostId) from PostLinks pl where pl.PostId in (select p2.Id from Posts p2 where p2.OwnerUserId = au.Id)) as LinkedPostsCount
+from ActiveUsersWithTopTags au
+left join Posts p on p.OwnerUserId = au.Id
+left join Votes v on v.PostId = p.Id and v.VoteTypeId = 8
+left join PostHistory ph on ph.UserId = au.Id and ph.PostHistoryTypeId = 10
+group by 
+  au.Id, au.DisplayName, au.Reputation, au.BadgeCount, au.QuestionsAsked, au.AnswersGiven, au.TotalPostScore, au.LastPostDate, au.Tag
+order by au.TotalPostScore desc
+limit 100;

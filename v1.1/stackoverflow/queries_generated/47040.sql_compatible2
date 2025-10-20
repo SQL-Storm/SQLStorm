@@ -1,0 +1,150 @@
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        1 AS Level
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE p.PostTypeId = 1
+        AND t.Count > 1000
+    GROUP BY t.Id, t.TagName
+    
+    UNION ALL
+    
+    SELECT 
+        t.Id,
+        t.TagName,
+        th.QuestionCount,
+        th.Level + 1
+    FROM Tags t
+    INNER JOIN tag_hierarchy th ON th.Id != t.Id
+    WHERE th.Level < 3
+),
+user_expertise AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS AnswerCount,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.Score) AS MaxScore,
+        COUNT(DISTINCT CASE WHEN p.AcceptedAnswerId = p.Id THEN p.Id END) AS AcceptedAnswers,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS MedianScore,
+        STDDEV(p.Score) AS ScoreStdDev
+    FROM Users u
+    INNER JOIN Posts p ON p.OwnerUserId = u.Id
+    INNER JOIN Posts q ON q.Id = p.ParentId
+    INNER JOIN Tags t ON q.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE p.PostTypeId = 2
+        AND u.Reputation > 5000
+        AND p.Score > 0
+    GROUP BY u.Id, u.DisplayName, t.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+monthly_activity AS (
+    SELECT 
+        DATE_TRUNC('month', p.CreationDate) AS ActivityMonth,
+        u.Id AS UserId,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score) AS AvgScore,
+        SUM(p.ViewCount) AS TotalViews,
+        COUNT(DISTINCT c.Id) AS CommentsMade
+    FROM Users u
+    INNER JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id 
+        AND DATE_TRUNC('month', c.CreationDate) = DATE_TRUNC('month', p.CreationDate)
+    WHERE p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '2 years')
+    GROUP BY DATE_TRUNC('month', p.CreationDate), u.Id
+),
+badge_patterns AS (
+    SELECT 
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Class,
+        COUNT(*) AS BadgeCount,
+        MIN(b.Date) AS FirstEarned,
+        MAX(b.Date) AS LastEarned,
+        EXTRACT(EPOCH FROM (MAX(b.Date) - MIN(b.Date))) / 86400.0 AS DaysToRepeat,
+        LAG(MIN(b.Date)) OVER (PARTITION BY b.UserId, b.Name ORDER BY MIN(b.Date)) AS PrevDate,
+        LEAD(MAX(b.Date)) OVER (PARTITION BY b.UserId, b.Name ORDER BY MAX(b.Date)) AS NextDate
+    FROM Badges b
+    WHERE b.TagBased = '0'
+    GROUP BY b.UserId, b.Name, b.Class
+),
+edit_patterns AS (
+    SELECT 
+        ph.UserId,
+        COUNT(DISTINCT ph.PostId) AS EditedPosts,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 END) AS Edits,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (7,8,9) THEN 1 END) AS Rollbacks,
+        AVG(LENGTH(ph.Text)) AS AvgEditSize,
+        STDDEV(LENGTH(ph.Text)) AS EditSizeStdDev,
+        COUNT(DISTINCT DATE(ph.CreationDate)) AS ActiveEditDays
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+        AND ph.PostHistoryTypeId IN (4,5,6,7,8,9)
+    GROUP BY ph.UserId
+),
+network_analysis AS (
+    SELECT 
+        p1.OwnerUserId AS User1,
+        p2.OwnerUserId AS User2,
+        COUNT(DISTINCT p1.Id) AS SharedQuestions,
+        AVG(ABS(p1.Score - p2.Score)) AS ScoreDifference,
+        CORR(p1.Score, p2.Score) AS ScoreCorrelation,
+        COUNT(DISTINCT pl.Id) AS LinkedPosts
+    FROM Posts p1
+    INNER JOIN Posts p2 ON p2.ParentId = p1.Id
+        AND p1.OwnerUserId != p2.OwnerUserId
+    LEFT JOIN PostLinks pl ON (pl.PostId = p1.Id AND pl.RelatedPostId = p2.Id)
+        OR (pl.PostId = p2.Id AND pl.RelatedPostId = p1.Id)
+    WHERE p1.PostTypeId = 1 
+        AND p2.PostTypeId = 2
+        AND p1.OwnerUserId IS NOT NULL
+        AND p2.OwnerUserId IS NOT NULL
+    GROUP BY p1.OwnerUserId, p2.OwnerUserId
+    HAVING COUNT(DISTINCT p1.Id) >= 5
+)
+SELECT 
+    ue.UserId,
+    ue.DisplayName,
+    ue.TagName,
+    ue.TotalScore AS ExpertiseScore,
+    ue.AcceptedAnswers,
+    ma.PostCount AS RecentMonthlyPosts,
+    ma.AvgScore AS RecentAvgScore,
+    COALESCE(bp.BadgeCount, 0) AS GoldBadges,
+    bp.DaysToRepeat AS BadgeVelocity,
+    ep.Edits AS TotalEdits,
+    ep.AvgEditSize,
+    na.SharedQuestions,
+    na.ScoreCorrelation AS NetworkCorrelation,
+    DENSE_RANK() OVER (PARTITION BY ue.TagName ORDER BY ue.TotalScore DESC) AS TagRank,
+    PERCENT_RANK() OVER (ORDER BY ma.TotalViews DESC) AS ViewPercentile,
+    NTILE(10) OVER (ORDER BY ep.ActiveEditDays DESC) AS EditActivityDecile,
+    ROW_NUMBER() OVER (ORDER BY ue.TotalScore * LOG(COALESCE(ma.PostCount,0) + 1) * COALESCE(bp.BadgeCount, 1) DESC) AS OverallRank
+FROM user_expertise ue
+LEFT JOIN (
+    SELECT UserId, PostCount, AvgScore, TotalViews, ActivityMonth
+    FROM monthly_activity
+) ma ON ma.UserId = ue.UserId
+LEFT JOIN (
+    SELECT UserId, COUNT(*) AS BadgeCount, AVG(DaysToRepeat) AS DaysToRepeat
+    FROM badge_patterns
+    WHERE Class = 1
+    GROUP BY UserId
+) bp ON bp.UserId = ue.UserId
+LEFT JOIN edit_patterns ep ON ep.UserId = ue.UserId
+LEFT JOIN (
+    SELECT User1, COUNT(*) AS SharedQuestions, AVG(ScoreCorrelation) AS ScoreCorrelation
+    FROM network_analysis
+    GROUP BY User1
+) na ON na.User1 = ue.UserId
+WHERE ue.TotalScore > 100
+    AND ma.ActivityMonth = DATE_TRUNC('month', (CAST('2024-10-01' AS date) - INTERVAL '1 month'))
+ORDER BY OverallRank
+LIMIT 100;

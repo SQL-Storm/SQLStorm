@@ -1,0 +1,225 @@
+with recent_users as (
+  select u.id as user_id, u.displayname, u.reputation, u.creationdate
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+question_posts as (
+  select p.id, p.owneruserid, p.creationdate, p.score, p.viewcount, p.answercount, p.tags, p.title
+  from posts p
+  where p.posttypeid = 1
+),
+answer_posts as (
+  select p.id, p.parentid, p.owneruserid, p.creationdate, p.score
+  from posts p
+  where p.posttypeid = 2
+),
+q_activity as (
+  select
+    q.id as question_id,
+    q.owneruserid as asker_id,
+    coalesce(q.score,0) as q_score,
+    coalesce(q.viewcount,0) as q_views,
+    coalesce(q.answercount,0) as q_answers,
+    q.creationdate as q_created,
+    q.tags,
+    q.title,
+    count(distinct c.id) as comment_count,
+    count(distinct case when v_up.votetypeid = 2 then v_up.id end) as q_upvotes,
+    count(distinct case when v_dn.votetypeid = 3 then v_dn.id end) as q_downvotes
+  from question_posts q
+  left join comments c on c.postid = q.id
+  left join votes v_up on v_up.postid = q.id and v_up.votetypeid = 2
+  left join votes v_dn on v_dn.postid = q.id and v_dn.votetypeid = 3
+  group by q.id, q.owneruserid, q.score, q.viewcount, q.answercount, q.creationdate, q.tags, q.title
+),
+a_activity as (
+  select
+    a.parentid as question_id,
+    count(*) as answers_total,
+    count(case when a.score >= 1 then 1 end) as answers_positive,
+    count(case when a.score < 0 then 1 end) as answers_negative,
+    max(a.score) as best_answer_score,
+    min(a.score) as worst_answer_score,
+    count(distinct a.owneruserid) as unique_answerers
+  from answer_posts a
+  group by a.parentid
+),
+q_links as (
+  select
+    pl.postid as question_id,
+    count(case when pl.linktypeid = 1 then 1 end) as links_linked,
+    count(case when pl.linktypeid = 3 then 1 end) as links_duplicates
+  from postlinks pl
+  group by pl.postid
+),
+q_edits as (
+  select
+    ph.postid as question_id,
+    count(case when ph.posthistorytypeid in (4,5,6,7,8,9) then 1 end) as edit_events,
+    max(ph.creationdate) as last_edit_date
+  from posthistory ph
+  group by ph.postid
+),
+q_favorites as (
+  select
+    v.postid as question_id,
+    count(case when v.votetypeid = 5 then 1 end) as favorites
+  from votes v
+  group by v.postid
+),
+tag_expansion as (
+  select
+    q.id as question_id,
+    trim(both ' ' from part) as tag
+  from question_posts q,
+  lateral (
+    select regexp_split_to_table(
+      substring(q.tags from 2 for char_length(trim(both '<>' from q.tags)) ),
+      '><'
+    ) as part
+  ) s
+  where q.tags is not null and q.tags like '<%>'
+),
+tag_stats as (
+  select
+    te.question_id,
+    count(*) as tag_count,
+    array_agg(te.tag order by te.tag) as tag_list
+  from tag_expansion te
+  group by te.question_id
+),
+user_recentness as (
+  select
+    u.id as user_id,
+    case
+      when u.creationdate >= (timestamp '2024-10-01 12:34:56' - interval '30 days') then 'new_30d'
+      when u.creationdate >= (timestamp '2024-10-01 12:34:56' - interval '90 days') then 'new_90d'
+      when u.creationdate >= (timestamp '2024-10-01 12:34:56' - interval '180 days') then 'new_180d'
+      when u.creationdate >= (timestamp '2024-10-01 12:34:56' - interval '365 days') then 'new_365d'
+      else 'older'
+    end as cohort
+  from users u
+),
+hot_candidates as (
+  select
+    qa.question_id,
+    qa.asker_id,
+    qa.q_score,
+    qa.q_views,
+    qa.q_answers,
+    qa.q_created,
+    qa.tags,
+    qa.title,
+    qa.comment_count,
+    qa.q_upvotes,
+    qa.q_downvotes,
+    coalesce(aa.answers_total,0) as answers_total,
+    coalesce(aa.answers_positive,0) as answers_positive,
+    coalesce(aa.answers_negative,0) as answers_negative,
+    coalesce(aa.best_answer_score,0) as best_answer_score,
+    coalesce(aa.worst_answer_score,0) as worst_answer_score,
+    coalesce(aa.unique_answerers,0) as unique_answerers,
+    coalesce(ql.links_linked,0) as links_linked,
+    coalesce(ql.links_duplicates,0) as links_duplicates,
+    coalesce(qe.edit_events,0) as edit_events,
+    qe.last_edit_date,
+    coalesce(qf.favorites,0) as favorites,
+    coalesce(ts.tag_count,0) as tag_count,
+    ts.tag_list
+  from q_activity qa
+  left join a_activity aa on aa.question_id = qa.question_id
+  left join q_links ql on ql.question_id = qa.question_id
+  left join q_edits qe on qe.question_id = qa.question_id
+  left join q_favorites qf on qf.question_id = qa.question_id
+  left join tag_stats ts on ts.question_id = qa.question_id
+),
+scored as (
+  select
+    hc.*,
+    extract(epoch from (timestamp '2024-10-01 12:34:56' - hc.q_created)) / 3600.0 as age_hours,
+    (
+     coalesce(hc.q_upvotes,0) * 3
+     - coalesce(hc.q_downvotes,0) * 2
+     + least(coalesce(hc.q_views,0) / 100.0, 200)
+     + coalesce(hc.answers_positive,0) * 2
+     - coalesce(hc.answers_negative,0)
+     + coalesce(hc.unique_answerers,0) * 1.5
+     + coalesce(hc.edit_events,0) * 1
+     + coalesce(hc.links_linked,0) * 0.5
+     - coalesce(hc.links_duplicates,0) * 5
+     + coalesce(hc.favorites,0) * 2
+     + coalesce(hc.q_score,0) * 1.5
+     + greatest(0, 5 - coalesce(hc.tag_count,0))
+    ) / nullif(1 + (extract(epoch from (timestamp '2024-10-01 12:34:56' - hc.q_created)) / 3600.0) / 24.0, 0) as hotness_score
+  from hot_candidates hc
+),
+asker_profile as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.views,
+    u.upvotes,
+    u.downvotes,
+    ur.cohort
+  from users u
+  left join user_recentness ur on ur.user_id = u.id
+),
+top_tags as (
+  select
+    te.tag,
+    count(*) as q_count,
+    percentile_cont(0.5) within group (order by s.hotness_score) as median_hotness
+  from tag_expansion te
+  join scored s on s.question_id = te.question_id
+  group by te.tag
+),
+ranked as (
+  select
+    s.question_id,
+    s.asker_id,
+    s.title,
+    s.tags,
+    s.tag_list,
+    s.q_views,
+    s.q_upvotes,
+    s.q_downvotes,
+    s.answers_total,
+    s.unique_answerers,
+    s.edit_events,
+    s.favorites,
+    s.hotness_score,
+    dense_rank() over (order by s.hotness_score desc) as global_rank
+  from scored s
+)
+select
+  r.global_rank,
+  r.question_id,
+  r.title,
+  r.hotness_score,
+  r.q_views,
+  r.q_upvotes,
+  r.q_downvotes,
+  r.answers_total,
+  r.unique_answerers,
+  r.edit_events,
+  r.favorites,
+  ap.displayname as asker_displayname,
+  ap.reputation as asker_reputation,
+  ap.cohort as asker_cohort,
+  r.tags,
+  r.tag_list,
+  tt.tag as sample_tag,
+  tt.q_count as sample_tag_qcount,
+  tt.median_hotness as sample_tag_median_hotness
+from ranked r
+left join asker_profile ap on ap.user_id = r.asker_id
+left join lateral (
+  select tt.tag, tt.q_count, tt.median_hotness
+  from top_tags tt
+  where tt.tag = (
+    select t from unnest(coalesce(r.tag_list, array[]::varchar[])) as t order by t limit 1
+  )
+) tt on true
+where r.global_rank <= 200
+order by r.global_rank, r.question_id;

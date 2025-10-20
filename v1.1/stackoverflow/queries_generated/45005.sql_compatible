@@ -1,0 +1,64 @@
+WITH RankedUserPosts AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.Score DESC, p.ViewCount DESC) AS PostRank
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1 
+      AND p.CreationDate > DATE '2015-01-01'
+),
+ExplodedTags AS (
+    -- split tag string like '<tag1><tag2>' into rows tag1, tag2, ...
+    SELECT
+        rup.UserId,
+        rup.DisplayName,
+        RTRIM(LTRIM(tag)) AS tag
+    FROM RankedUserPosts rup,
+    LATERAL (
+        SELECT TRIM(t) AS tag
+        FROM (
+            -- remove leading and trailing angle brackets, then split on '><'
+            SELECT regexp_split_to_table(SUBSTRING(rup.Tags FROM 2 FOR (CHAR_LENGTH(rup.Tags) - 2)), '><') AS t
+        ) s
+    ) et
+),
+TopTagsPerUser AS (
+    SELECT
+        UserId,
+        DisplayName,
+        STRING_AGG(DISTINCT tag, ', ') AS TopTags
+    FROM ExplodedTags
+    WHERE tag IS NOT NULL AND tag <> ''
+    GROUP BY UserId, DisplayName
+),
+TagAnalysis AS (
+    SELECT 
+        rup.UserId,
+        rup.DisplayName,
+        tt.TopTags,
+        AVG(rup.Score) AS AvgPostScore,
+        COUNT(*) AS TotalQuestions,
+        MAX(rup.Score) AS HighestScore
+    FROM RankedUserPosts rup
+    LEFT JOIN TopTagsPerUser tt ON tt.UserId = rup.UserId
+    WHERE rup.PostRank <= 5
+    GROUP BY rup.UserId, rup.DisplayName, tt.TopTags
+)
+SELECT 
+    ta.UserId,
+    ta.DisplayName,
+    ta.TopTags,
+    ta.AvgPostScore,
+    ta.TotalQuestions,
+    ta.HighestScore,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ta.UserId) AS TotalBadges
+FROM TagAnalysis ta
+WHERE ta.TotalQuestions > 10
+ORDER BY ta.AvgPostScore DESC, ta.TotalQuestions DESC
+LIMIT 100;

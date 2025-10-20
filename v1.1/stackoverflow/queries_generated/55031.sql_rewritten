@@ -1,0 +1,130 @@
+-- {"query": "55031.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2048, "output_tokens": 1238} 
+WITH recent_posts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.Tags,
+        p.Title,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '180 days'
+      AND p.PostTypeId = 1                -- only questions
+),
+user_stats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        SUM(p.Score) FILTER (WHERE p.PostTypeId = 1) AS QuestionScoreSum,
+        SUM(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AnswerScoreSum,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+badge_agg AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(*) AS TotalBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+vote_agg AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        SUM(CASE WHEN vt.Id = 5 THEN 1 ELSE 0 END) AS Favorites,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+),
+tag_explode AS (
+    SELECT
+        rp.Id AS PostId,
+        UNNEST(string_to_array(trim(both '><' FROM rp.Tags), '><')) AS Tag
+    FROM recent_posts rp
+    WHERE rp.Tags IS NOT NULL
+),
+tag_stats AS (
+    SELECT
+        t.Tag,
+        COUNT(DISTINCT rp.PostId) AS QuestionCount,
+        AVG(rp.Score) AS AvgScore,
+        SUM(rp.ViewCount) AS TotalViews
+    FROM tag_explode t
+    JOIN recent_posts rp ON rp.Id = t.PostId
+    GROUP BY t.Tag
+),
+final_report AS (
+    SELECT
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.QuestionScoreSum,
+        us.AnswerScoreSum,
+        ba.GoldBadges,
+        ba.SilverBadges,
+        ba.BronzeBadges,
+        ba.TotalBadges,
+        COALESCE(va.UpVotes,0) AS TotalUpVotes,
+        COALESCE(va.DownVotes,0) AS TotalDownVotes,
+        COALESCE(va.Favorites,0) AS TotalFavorites,
+        us.LastPostDate,
+        va.LastVoteDate
+    FROM user_stats us
+    LEFT JOIN badge_agg ba ON ba.UserId = us.UserId
+    LEFT JOIN vote_agg va ON va.PostId = (
+        SELECT p.Id
+        FROM Posts p
+        WHERE p.OwnerUserId = us.UserId
+          AND p.PostTypeId = 1
+        ORDER BY p.CreationDate DESC
+        LIMIT 1
+    )
+)
+SELECT
+    fr.*,
+    jsonb_agg(
+        jsonb_build_object(
+            'Tag', ts.Tag,
+            'Questions', ts.QuestionCount,
+            'AvgScore', ts.AvgScore,
+            'TotalViews', ts.TotalViews
+        )
+        ORDER BY ts.QuestionCount DESC
+        LIMIT 5
+    ) AS Top5Tags
+FROM final_report fr
+LEFT JOIN LATERAL (
+    SELECT *
+    FROM tag_stats ts
+    WHERE ts.Tag IN (
+        SELECT t.Tag
+        FROM tag_explode t
+        JOIN recent_posts rp ON rp.Id = t.PostId
+        WHERE rp.OwnerUserId = fr.UserId
+    )
+) ts ON true
+GROUP BY fr.UserId, fr.DisplayName, fr.Reputation,
+         fr.QuestionCount, fr.AnswerCount, fr.QuestionScoreSum,
+         fr.AnswerScoreSum, fr.GoldBadges, fr.SilverBadges,
+         fr.BronzeBadges, fr.TotalBadges, fr.TotalUpVotes,
+         fr.TotalDownVotes, fr.TotalFavorites, fr.LastPostDate,
+         fr.LastVoteDate
+ORDER BY fr.Reputation DESC
+LIMIT 100;

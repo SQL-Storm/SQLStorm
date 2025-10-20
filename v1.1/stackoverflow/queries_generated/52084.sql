@@ -1,0 +1,105 @@
+-- {"query": "52084.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-code-fast", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2165, "output_tokens": 1054} 
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        COUNT(DISTINCT a.Id) AS AnswerCount,
+        SUM(CASE WHEN a.Id IS NOT NULL AND a.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END) AS AcceptedAnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpvoteCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownvoteCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        AVG(p.Score) AS AvgQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS TotalViews
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.CreationDate BETWEEN '2008-01-01' AND '2023-01-01'
+    GROUP BY u.Id, u.Reputation
+),
+RankedUsers AS (
+    SELECT 
+        UserId,
+        Reputation,
+        QuestionCount,
+        AnswerCount,
+        AcceptedAnswerCount,
+        CommentCount,
+        UpvoteCount,
+        DownvoteCount,
+        BadgeCount,
+        LastPostDate,
+        AvgQuestionScore,
+        TotalViews,
+        (Reputation * 0.1 + QuestionCount * 5 + AnswerCount * 2 + AcceptedAnswerCount * 10 + CommentCount * 0.5 + UpvoteCount * 0.2 - DownvoteCount * 1 + BadgeCount * 15 + COALESCE(AvgQuestionScore, 0) * 0.1 + LOG(1 + COALESCE(TotalViews, 0)) * 0.05) AS CompositeScore
+    FROM UserStats
+),
+PostTagStats AS (
+    SELECT 
+        p.Id AS PostId,
+        UNNEST(COALESCE(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><'), ARRAY[]::TEXT[])) AS TagName,
+        p.Score,
+        COUNT(DISTINCT pl.RelatedPostId) AS LinkedPosts,
+        COUNT(DISTINCT c.Id) AS PostComments,
+        COUNT(DISTINCT ph.Id) AS EditHistory
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4, 5, 6, 24)
+    WHERE p.PostTypeId = 1 AND p.CreationDate > '2015-01-01'
+    GROUP BY p.Id, p.Tags, p.Score
+),
+TagPopularity AS (
+    SELECT 
+        TagName,
+        COUNT(*) AS PostCount,
+        AVG(Score) AS AvgScore,
+        SUM(LinkedPosts) AS TotalLinks,
+        SUM(PostComments) AS TotalComments,
+        SUM(EditHistory) AS TotalEdits
+    FROM PostTagStats
+    GROUP BY TagName
+),
+TopTags AS (
+    SELECT 
+        TagName,
+        PostCount,
+        AvgScore,
+        TotalLinks,
+        TotalComments,
+        TotalEdits,
+        RANK() OVER (ORDER BY PostCount DESC, AvgScore DESC) AS Rank
+    FROM TagPopularity
+    WHERE PostCount > 1000
+),
+FinalUsers AS (
+    SELECT 
+        ru.*,
+        COUNT(DISTINCT CASE WHEN pts.TagName IN (SELECT TagName FROM TopTags WHERE Rank <= 5) THEN pts.PostId END) AS TopTagPosts
+    FROM RankedUsers ru
+    LEFT JOIN Posts p ON p.OwnerUserId = ru.UserId AND p.PostTypeId = 1
+    LEFT JOIN PostTagStats pts ON pts.PostId = p.Id
+    GROUP BY ru.UserId, ru.Reputation, ru.QuestionCount, ru.AnswerCount, ru.AcceptedAnswerCount, ru.CommentCount, ru.UpvoteCount, ru.DownvoteCount, ru.BadgeCount, ru.LastPostDate, ru.AvgQuestionScore, ru.TotalViews, ru.CompositeScore
+)
+SELECT 
+    UserId,
+    Reputation,
+    QuestionCount,
+    AnswerCount,
+    AcceptedAnswerCount,
+    CommentCount,
+    UpvoteCount,
+    DownvoteCount,
+    BadgeCount,
+    LastPostDate,
+    AvgQuestionScore,
+    TotalViews,
+    CompositeScore + TopTagPosts * 50 AS AdjustedScore
+FROM FinalUsers
+ORDER BY AdjustedScore DESC
+LIMIT 50;

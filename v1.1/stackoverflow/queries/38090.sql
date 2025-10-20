@@ -1,0 +1,218 @@
+with recent_q as (
+  select p.Id as QuestionId,
+         p.CreationDate as QuestionCreationDate,
+         p.Score as QuestionScore,
+         p.ViewCount,
+         p.OwnerUserId as AskerId,
+         p.Tags,
+         coalesce(p.AnswerCount, 0) as AnswerCount
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= (select max(CreationDate) - interval '90 days' from Posts where PostTypeId = 1)
+),
+answers as (
+  select a.Id as AnswerId,
+         a.ParentId as QuestionId,
+         a.OwnerUserId as AnswererId,
+         a.Score as AnswerScore,
+         a.CreationDate as AnswerCreationDate
+  from Posts a
+  where a.PostTypeId = 2
+),
+first_answer as (
+  select a.QuestionId,
+         min(a.AnswerCreationDate) as FirstAnswerDate
+  from answers a
+  group by a.QuestionId
+),
+votes_q as (
+  select v.PostId,
+         sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+         sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+         sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+         count(*) as TotalVotes,
+         min(v.CreationDate) as FirstVoteAt,
+         max(v.CreationDate) as LastVoteAt
+  from Votes v
+  group by v.PostId
+),
+votes_a as (
+  select v.PostId,
+         sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+         sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+         count(*) as TotalVotes
+  from Votes v
+  group by v.PostId
+),
+comments_q as (
+  select c.PostId,
+         count(*) as CommentCount,
+         sum(c.Score) as CommentScoreSum,
+         max(c.CreationDate) as LastCommentAt
+  from Comments c
+  group by c.PostId
+),
+tag_expansion as (
+  select q.QuestionId,
+         unnest(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')) as TagName
+  from recent_q q
+  where q.Tags is not null
+),
+tag_stats as (
+  select t.TagName,
+         count(*) as QuestionsWithTag,
+         avg(q.QuestionScore) as AvgQuestionScoreWithTag,
+         sum(q.ViewCount) as TotalViewsWithTag
+  from tag_expansion t
+  join recent_q q on q.QuestionId = t.QuestionId
+  group by t.TagName
+),
+answerers as (
+  select a.AnswererId,
+         count(*) as AnswersCount,
+         avg(a.AnswerScore) as AvgAnswerScore,
+         min(a.AnswerCreationDate) as FirstAnswerAt,
+         max(a.AnswerCreationDate) as LastAnswerAt
+  from answers a
+  group by a.AnswererId
+),
+question_quality as (
+  select q.QuestionId,
+         q.QuestionCreationDate,
+         q.QuestionScore,
+         q.ViewCount,
+         coalesce(vq.UpVotes,0) as QUpVotes,
+         coalesce(vq.DownVotes,0) as QDownVotes,
+         coalesce(vq.Favorites,0) as QFavorites,
+         coalesce(vq.TotalVotes,0) as QTotalVotes,
+         coalesce(cq.CommentCount,0) as QCommentCount,
+         coalesce(cq.CommentScoreSum,0) as QCommentScoreSum,
+         fa.FirstAnswerDate,
+         extract(epoch from (fa.FirstAnswerDate - q.QuestionCreationDate))/3600.0 as HoursToFirstAnswer,
+         q.AnswerCount
+  from recent_q q
+  left join votes_q vq on vq.PostId = q.QuestionId
+  left join comments_q cq on cq.PostId = q.QuestionId
+  left join first_answer fa on fa.QuestionId = q.QuestionId
+),
+accepted_map as (
+  select p.Id as QuestionId, p.AcceptedAnswerId
+  from Posts p
+  where p.PostTypeId = 1 and p.AcceptedAnswerId is not null
+),
+answer_agg as (
+  select a.QuestionId,
+         count(*) as AnswersTotal,
+         sum(case when a.AnswerScore > 0 then 1 else 0 end) as PosAnswers,
+         sum(case when a.AnswerScore < 0 then 1 else 0 end) as NegAnswers,
+         max(a.AnswerScore) as MaxAnswerScore,
+         avg(a.AnswerScore) as AvgAnswerScore,
+         sum(coalesce(va.UpVotes,0)) as AnswerUpVotes,
+         sum(coalesce(va.DownVotes,0)) as AnswerDownVotes,
+         sum(coalesce(va.TotalVotes,0)) as AnswerTotalVotes
+  from answers a
+  left join votes_a va on va.PostId = a.AnswerId
+  group by a.QuestionId
+),
+accepted_detail as (
+  select am.QuestionId,
+         a.AnswerId as AcceptedAnswerId,
+         a.AnswererId,
+         a.AnswerScore,
+         a.AnswerCreationDate,
+         coalesce(va.UpVotes,0) as UpVotes,
+         coalesce(va.DownVotes,0) as DownVotes,
+         coalesce(va.TotalVotes,0) as TotalVotes
+  from accepted_map am
+  join answers a on a.AnswerId = am.AcceptedAnswerId
+  left join votes_a va on va.PostId = a.AnswerId
+),
+user_summary as (
+  select u.Id as UserId,
+         u.Reputation,
+         u.CreationDate as UserCreatedAt,
+         u.Views as ProfileViews,
+         u.UpVotes as GivenUpVotes,
+         u.DownVotes as GivenDownVotes,
+         coalesce(b_gold.Gold,0) as GoldBadges,
+         coalesce(b_silver.Silver,0) as SilverBadges,
+         coalesce(b_bronze.Bronze,0) as BronzeBadges
+  from Users u
+  left join (
+    select UserId, count(*) as Gold from Badges where Class = 1 group by UserId
+  ) b_gold on b_gold.UserId = u.Id
+  left join (
+    select UserId, count(*) as Silver from Badges where Class = 2 group by UserId
+  ) b_silver on b_silver.UserId = u.Id
+  left join (
+    select UserId, count(*) as Bronze from Badges where Class = 3 group by UserId
+  ) b_bronze on b_bronze.UserId = u.Id
+),
+question_owner as (
+  select p.Id as QuestionId, p.OwnerUserId as AskerId
+  from Posts p
+  where p.PostTypeId = 1
+),
+final as (
+  select
+    qq.QuestionId,
+    qq.QuestionCreationDate,
+    qq.QuestionScore,
+    qq.ViewCount,
+    qq.QUpVotes,
+    qq.QDownVotes,
+    qq.QFavorites,
+    qq.QTotalVotes,
+    qq.QCommentCount,
+    qq.QCommentScoreSum,
+    qq.FirstAnswerDate,
+    qq.HoursToFirstAnswer,
+    qq.AnswerCount as DeclaredAnswerCount,
+    coalesce(aa.AnswersTotal,0) as AnswersTotal,
+    coalesce(aa.PosAnswers,0) as PosAnswers,
+    coalesce(aa.NegAnswers,0) as NegAnswers,
+    aa.MaxAnswerScore,
+    aa.AvgAnswerScore,
+    coalesce(aa.AnswerUpVotes,0) as AnswerUpVotes,
+    coalesce(aa.AnswerDownVotes,0) as AnswerDownVotes,
+    coalesce(aa.AnswerTotalVotes,0) as AnswerTotalVotes,
+    ad.AcceptedAnswerId,
+    ad.AnswererId as AcceptedByUserId,
+    ad.AnswerScore as AcceptedAnswerScore,
+    ad.AnswerCreationDate as AcceptedAnswerCreatedAt,
+    ad.UpVotes as AcceptedAnswerUpVotes,
+    ad.DownVotes as AcceptedAnswerDownVotes,
+    ad.TotalVotes as AcceptedAnswerTotalVotes,
+    su_asker.Reputation as AskerReputation,
+    su_asker.GoldBadges as AskerGold,
+    su_asker.SilverBadges as AskerSilver,
+    su_asker.BronzeBadges as AskerBronze,
+    su_answerer.Reputation as AcceptedAnswererReputation,
+    su_answerer.GoldBadges as AcceptedAnswererGold,
+    su_answerer.SilverBadges as AcceptedAnswererSilver,
+    su_answerer.BronzeBadges as AcceptedAnswererBronze,
+    ts.TagName as DominantTag,
+    ts.QuestionsWithTag as TagQuestionsInWindow,
+    ts.AvgQuestionScoreWithTag as TagAvgQuestionScore,
+    ts.TotalViewsWithTag as TagTotalViews
+  from question_quality qq
+  left join answer_agg aa on aa.QuestionId = qq.QuestionId
+  left join accepted_detail ad on ad.QuestionId = qq.QuestionId
+  left join question_owner qo on qo.QuestionId = qq.QuestionId
+  left join user_summary su_asker on su_asker.UserId = qo.AskerId
+  left join user_summary su_answerer on su_answerer.UserId = ad.AnswererId
+  left join lateral (
+    select t.TagName, t.QuestionsWithTag, t.AvgQuestionScoreWithTag, t.TotalViewsWithTag, te.QuestionId
+    from tag_expansion te
+    join tag_stats t on t.TagName = te.TagName
+    where te.QuestionId = qq.QuestionId
+    order by t.QuestionsWithTag desc, t.TotalViewsWithTag desc
+    limit 1
+  ) ts on true
+)
+select *
+from final
+order by
+  coalesce(AnswerUpVotes,0) + coalesce(QUpVotes,0) - coalesce(AnswerDownVotes,0) - coalesce(QDownVotes,0) desc,
+  ViewCount desc
+limit 500;

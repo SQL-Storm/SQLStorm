@@ -1,0 +1,126 @@
+-- {"query": "51083.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2129, "output_tokens": 1280} 
+WITH popular_tags AS (
+    SELECT t.TagName, COUNT(DISTINCT p.Id) as tag_usage
+    FROM Tags t
+    JOIN Posts p ON string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><') @> ARRAY[t.TagName]::text[]
+    GROUP BY t.TagName
+    HAVING COUNT(DISTINCT p.Id) > 100
+    ORDER BY tag_usage DESC
+    LIMIT 50
+),
+active_users AS (
+    SELECT u.Id, u.Reputation, u.UpVotes
+    FROM Users u
+    JOIN (
+        SELECT OwnerUserId, COUNT(*) as post_count
+        FROM Posts 
+        WHERE OwnerUserId IS NOT NULL AND OwnerUserId > 0
+        GROUP BY OwnerUserId
+        HAVING COUNT(*) >= 5
+    ) active_posts ON active_posts.OwnerUserId = u.Id
+    WHERE u.Reputation >= 100
+),
+question_engagement AS (
+    SELECT 
+        p.Id as question_id,
+        p.Title,
+        p.Score as question_score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CreationDate,
+        au.Reputation as asker_rep,
+        COALESCE(accepted.score, 0) as accepted_answer_score,
+        COUNT(DISTINCT v_up.Id) as total_upvotes,
+        COUNT(DISTINCT v_down.Id) as total_downvotes,
+        AVG(c.Score) as avg_comment_score,
+        COUNT(DISTINCT c.Id) as comment_count
+    FROM Posts p
+    JOIN active_users au ON p.OwnerUserId = au.Id
+    LEFT JOIN Posts accepted ON p.AcceptedAnswerId = accepted.Id
+    LEFT JOIN Votes v_up ON p.Id = v_up.PostId AND v_up.VoteTypeId = 2
+    LEFT JOIN Votes v_down ON p.Id = v_down.PostId AND v_down.VoteTypeId = 3
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.PostTypeId = 1 
+        AND p.CreationDate > cast('2024-10-01' as date) - INTERVAL '2 years'
+        AND p.Score > 0
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CreationDate, 
+             au.Reputation, accepted.score
+    HAVING p.AnswerCount > 0 AND COUNT(DISTINCT c.Id) > 0
+),
+tag_question_stats AS (
+    SELECT 
+        q.question_id,
+        q.Title,
+        q.question_score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.asker_rep,
+        q.accepted_answer_score,
+        q.total_upvotes,
+        q.total_downvotes,
+        q.avg_comment_score,
+        q.comment_count,
+        array_agg(pt.TagName) as question_tags,
+        COUNT(pt.TagName) as tag_count
+    FROM question_engagement q
+    JOIN Posts p ON q.question_id = p.Id
+    LEFT JOIN popular_tags pt ON string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><') @> ARRAY[pt.TagName]::text[]
+    GROUP BY q.question_id, q.Title, q.question_score, q.ViewCount, q.AnswerCount, 
+             q.asker_rep, q.accepted_answer_score, q.total_upvotes, q.total_downvotes, 
+             q.avg_comment_score, q.comment_count
+)
+SELECT 
+    tqs.Title,
+    tqs.question_score,
+    tqs.ViewCount,
+    tqs.AnswerCount,
+    tqs.accepted_answer_score,
+    tqs.total_upvotes - tqs.total_downvotes as net_votes,
+    tqs.asker_rep,
+    tqs.tag_count,
+    tqs.question_tags,
+    tqs.avg_comment_score,
+    tqs.comment_count,
+    -- Performance-intensive window functions
+    RANK() OVER (PARTITION BY tqs.tag_count ORDER BY tqs.ViewCount DESC) as view_rank_by_tag_count,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY tqs.ViewCount) OVER (PARTITION BY tqs.asker_rep / 100) as median_views_by_rep,
+    COUNT(*) OVER (PARTITION BY LEFT(tqs.Title, 10)) as questions_with_similar_start,
+    -- Complex case statement for engagement categorization
+    CASE 
+        WHEN tqs.ViewCount > 10000 AND tqs.AnswerCount >= 5 THEN 'High Impact'
+        WHEN tqs.accepted_answer_score > 10 AND tqs.net_votes > 20 THEN 'Quality Engagement' 
+        WHEN tqs.comment_count > 15 THEN 'Active Discussion'
+        ELSE 'Standard'
+    END as engagement_category,
+    -- JSON aggregation for detailed analysis
+    json_build_object(
+        'votes_breakdown', json_build_object(
+            'upvotes', tqs.total_upvotes,
+            'downvotes', tqs.total_downvotes,
+            'net_score', tqs.total_upvotes - tqs.total_downvotes
+        ),
+        'tag_details', json_agg(
+            json_build_object(
+                'tag_name', unnest(tqs.question_tags),
+                'popularity_weight', 
+                (SELECT COUNT(*) FROM Posts p2 
+                 WHERE p2.PostTypeId = 1 
+                 AND string_to_array(substring(p2.Tags, 2, length(p2.Tags)-2), '><') @> ARRAY[unnest(tqs.question_tags)]::text[]
+                 AND p2.CreationDate > cast('2024-10-01' as date) - INTERVAL '1 year')
+            )
+        ),
+        'temporal_stats', json_build_object(
+            'age_days', EXTRACT(DAY FROM (cast('2024-10-01' as date) - tqs.CreationDate)),
+            'is_recent', (tqs.CreationDate > cast('2024-10-01' as date) - INTERVAL '30 days')
+        )
+    ) as analytics_json
+FROM tag_question_stats tqs
+WHERE tqs.tag_count > 1
+    AND tqs.ViewCount > 500
+    AND tqs.accepted_answer_score IS NOT NULL
+    AND tqs.question_score > 5
+ORDER BY 
+    tqs.ViewCount DESC,
+    tqs.net_votes DESC,
+    tqs.asker_rep DESC
+LIMIT 1000;

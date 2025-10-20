@@ -1,0 +1,338 @@
+with recent_active_users as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.lastaccessdate,
+         count(*) filter (where v.votetypeid = 2) as upvotes_cast,
+         count(*) filter (where v.votetypeid = 3) as downvotes_cast,
+         count(distinct date_trunc('day', c.creationdate)) as comment_days_active
+  from users u
+  left join votes v on v.userid = u.id and v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  left join comments c on c.userid = u.id and c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  where u.lastaccessdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.lastaccessdate
+),
+question_core as (
+  select p.id as question_id,
+         p.owneruserid as asker_id,
+         p.creationdate as question_created,
+         p.score as question_score,
+         p.viewcount,
+         p.title,
+         p.tags,
+         p.answercount,
+         p.acceptedanswerid
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '730 days'
+),
+answers_core as (
+  select a.id as answer_id,
+         a.parentid as question_id,
+         a.owneruserid as answerer_id,
+         a.score as answer_score,
+         a.creationdate as answer_created
+  from posts a
+  where a.posttypeid = 2
+    and a.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '730 days'
+),
+first_answer as (
+  select ac.question_id,
+         ac.answer_id,
+         ac.answerer_id,
+         ac.answer_score,
+         ac.answer_created,
+         row_number() over (partition by ac.question_id order by ac.answer_created asc, ac.id asc) as rn
+  from (
+    select a.*, a.answer_id as id
+    from answers_core a
+  ) ac
+),
+accepted_answer as (
+  select q.question_id,
+         a.answer_id,
+         a.answerer_id,
+         a.answer_score,
+         a.answer_created
+  from question_core q
+  join answers_core a
+    on a.answer_id = q.acceptedanswerid
+),
+question_comments as (
+  select c.postid as question_id,
+         count(*) as q_comment_count,
+         max(c.creationdate) as last_q_comment_at
+  from comments c
+  join posts p on p.id = c.postid and p.posttypeid = 1
+  where c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '730 days'
+  group by c.postid
+),
+answer_comments as (
+  select a.parentid as question_id,
+         count(*) as a_comment_count,
+         max(c.creationdate) as last_a_comment_at
+  from comments c
+  join posts a on a.id = c.postid and a.posttypeid = 2
+  where c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '730 days'
+  group by a.parentid
+),
+post_edit_events as (
+  select ph.postid,
+         count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edit_events,
+         min(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6,24)) as first_edit_at,
+         max(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6,24)) as last_edit_at
+  from posthistory ph
+  where ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '730 days'
+  group by ph.postid
+),
+dup_and_link_signals as (
+  select pl.postid as question_id,
+         count(*) filter (where pl.linktypeid = 3) as duplicate_links,
+         count(*) filter (where pl.linktypeid = 1) as related_links,
+         max(pl.creationdate) as last_link_at
+  from postlinks pl
+  where pl.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '730 days'
+  group by pl.postid
+),
+hot_bump_history as (
+  select ph.postid as question_id,
+         count(*) filter (where ph.posthistorytypeid = 52) as hot_selected_count,
+         count(*) filter (where ph.posthistorytypeid = 53) as hot_removed_count,
+         count(*) filter (where ph.posthistorytypeid = 50) as community_bumps
+  from posthistory ph
+  where ph.posthistorytypeid in (50,52,53)
+    and ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '730 days'
+  group by ph.postid
+),
+vote_agg as (
+  select v.postid,
+         count(*) filter (where v.votetypeid = 2) as upvotes,
+         count(*) filter (where v.votetypeid = 3) as downvotes,
+         count(*) filter (where v.votetypeid = 1) as accepted_marks,
+         sum(v.bountyamount) filter (where v.votetypeid in (8,9)) as bounty_total
+  from votes v
+  where v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '730 days'
+  group by v.postid
+),
+tag_expansion as (
+  select q.question_id,
+         unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')) as tag
+  from question_core q
+  where q.tags is not null and q.tags <> ''
+),
+top_tags as (
+  select t.tag,
+         count(*) as tag_q_count,
+         sum(qc.question_score) as tag_total_score
+  from tag_expansion t
+  join question_core qc on qc.question_id = t.question_id
+  group by t.tag
+  having count(*) >= 25
+),
+user_badge_stats as (
+  select b.userid,
+         count(*) filter (where b.class = 1) as gold_badges,
+         count(*) filter (where b.class = 2) as silver_badges,
+         count(*) filter (where b.class = 3) as bronze_badges,
+         max(b.date) as last_badge_date
+  from badges b
+  where b.date >= cast('2024-10-01 12:34:56' as timestamp) - interval '1095 days'
+  group by b.userid
+),
+qa_pairs as (
+  select q.question_id,
+         q.asker_id,
+         q.question_created,
+         q.question_score,
+         q.viewcount,
+         q.title,
+         q.tags,
+         q.answercount,
+         fa.answer_id as first_answer_id,
+         fa.answerer_id as first_answerer_id,
+         fa.answer_score as first_answer_score,
+         fa.answer_created as first_answer_created,
+         aa.answer_id as accepted_answer_id,
+         aa.answerer_id as accepted_answerer_id,
+         aa.answer_score as accepted_answer_score,
+         aa.answer_created as accepted_answer_created
+  from question_core q
+  left join first_answer fa on fa.question_id = q.question_id and fa.rn = 1
+  left join accepted_answer aa on aa.question_id = q.question_id
+),
+response_metrics as (
+  select qap.*,
+         extract(epoch from (qap.first_answer_created - qap.question_created))/3600.0 as hours_to_first_answer,
+         extract(epoch from (qap.accepted_answer_created - qap.question_created))/3600.0 as hours_to_accept,
+         case when qap.accepted_answer_id is not null then 1 else 0 end as has_accepted
+  from qa_pairs qap
+),
+engagement as (
+  select rm.question_id,
+         coalesce(qc.q_comment_count,0) + coalesce(ac.a_comment_count,0) as total_comments,
+         greatest(coalesce(qc.last_q_comment_at, timestamp 'epoch'),
+                  coalesce(ac.last_a_comment_at, timestamp 'epoch')) as last_comment_at,
+         coalesce(ph.edit_events,0) as edit_events,
+         ph.first_edit_at,
+         ph.last_edit_at,
+         coalesce(dl.duplicate_links,0) as duplicate_links,
+         coalesce(dl.related_links,0) as related_links,
+         dl.last_link_at,
+         coalesce(hb.hot_selected_count,0) as hot_selected_count,
+         coalesce(hb.hot_removed_count,0) as hot_removed_count,
+         coalesce(hb.community_bumps,0) as community_bumps,
+         coalesce(va.upvotes,0) as upvotes,
+         coalesce(va.downvotes,0) as downvotes,
+         coalesce(va.bounty_total,0) as bounty_total
+  from response_metrics rm
+  left join question_comments qc on qc.question_id = rm.question_id
+  left join answer_comments ac on ac.question_id = rm.question_id
+  left join post_edit_events ph on ph.postid = rm.question_id
+  left join dup_and_link_signals dl on dl.question_id = rm.question_id
+  left join hot_bump_history hb on hb.question_id = rm.question_id
+  left join vote_agg va on va.postid = rm.question_id
+),
+user_join as (
+  select e.question_id,
+         e.total_comments,
+         e.last_comment_at,
+         e.edit_events,
+         e.first_edit_at,
+         e.last_edit_at,
+         e.duplicate_links,
+         e.related_links,
+         e.last_link_at,
+         e.hot_selected_count,
+         e.hot_removed_count,
+         e.community_bumps,
+         e.upvotes,
+         e.downvotes,
+         e.bounty_total,
+         u.displayname as asker_name,
+         u.reputation as asker_rep,
+         ub.gold_badges as asker_gold,
+         ub.silver_badges as asker_silver,
+         ub.bronze_badges as asker_bronze,
+         rau_up.displayname as first_answerer_name,
+         rau_up.reputation as first_answerer_rep,
+         ub2.gold_badges as first_answerer_gold,
+         ub2.silver_badges as first_answerer_silver,
+         ub2.bronze_badges as first_answerer_bronze
+  from engagement e
+  left join response_metrics rm on rm.question_id = e.question_id
+  left join users u on u.id = rm.asker_id
+  left join user_badge_stats ub on ub.userid = rm.asker_id
+  left join users rau_up on rau_up.id = rm.first_answerer_id
+  left join user_badge_stats ub2 on ub2.userid = rm.first_answerer_id
+),
+scored as (
+  select uj.question_id,
+         uj.total_comments,
+         uj.last_comment_at,
+         uj.edit_events,
+         uj.first_edit_at,
+         uj.last_edit_at,
+         uj.duplicate_links,
+         uj.related_links,
+         uj.last_link_at,
+         uj.hot_selected_count,
+         uj.hot_removed_count,
+         uj.community_bumps,
+         uj.upvotes,
+         uj.downvotes,
+         uj.bounty_total,
+         uj.asker_name,
+         uj.asker_rep,
+         uj.asker_gold,
+         uj.asker_silver,
+         uj.asker_bronze,
+         uj.first_answerer_name,
+         uj.first_answerer_rep,
+         uj.first_answerer_gold,
+         uj.first_answerer_silver,
+         uj.first_answerer_bronze,
+         rm.question_id as rm_question_id,
+         rm.question_score,
+         rm.viewcount,
+         rm.title,
+         rm.tags,
+         rm.asker_id,
+         rm.first_answerer_id,
+         rm.answercount,
+         rm.hours_to_first_answer,
+         rm.hours_to_accept,
+         rm.has_accepted,
+         least(coalesce(rm.viewcount,0)/10000.0, 1.0) as n_views,
+         least(coalesce(uj.upvotes,0)/50.0, 1.0) as n_up,
+         least(coalesce(uj.downvotes,0)/25.0, 1.0) as n_down,
+         least(coalesce(uj.total_comments,0)/40.0, 1.0) as n_comments,
+         least(coalesce(uj.edit_events,0)/10.0, 1.0) as n_edits,
+         least(coalesce(uj.community_bumps,0)/5.0, 1.0) as n_bumps,
+         least(coalesce(uj.duplicate_links,0)/5.0, 1.0) as n_dups,
+         least(coalesce(uj.related_links,0)/15.0, 1.0) as n_related,
+         least(coalesce(uj.bounty_total,0)/500.0, 1.0) as n_bounty,
+         case when rm.hours_to_first_answer is null then 0
+              when rm.hours_to_first_answer <= 1 then 1
+              when rm.hours_to_first_answer <= 6 then 0.8
+              when rm.hours_to_first_answer <= 24 then 0.6
+              when rm.hours_to_first_answer <= 72 then 0.4
+              else 0.2 end as n_speed_first,
+         case when rm.hours_to_accept is null then 0
+              when rm.hours_to_accept <= 6 then 1
+              when rm.hours_to_accept <= 24 then 0.8
+              when rm.hours_to_accept <= 72 then 0.6
+              when rm.hours_to_accept <= 168 then 0.4
+              else 0.2 end as n_speed_accept,
+         case when rm.has_accepted = 1 then 1 else 0 end as n_has_accepted
+  from user_join uj
+  join response_metrics rm on rm.question_id = uj.question_id
+),
+tag_enriched as (
+  select s.*,
+         te.tag
+  from scored s
+  left join tag_expansion te on te.question_id = s.question_id
+),
+tag_rank as (
+  select te.tag,
+         tt.tag_q_count,
+         tt.tag_total_score,
+         ntile(5) over (order by tt.tag_total_score desc NULLS LAST) as tag_score_quintile
+  from (select distinct tag from tag_enriched) te
+  left join top_tags tt on tt.tag = te.tag
+),
+final_agg as (
+  select s.question_id,
+         s.title,
+         s.tags,
+         s.asker_id,
+         s.asker_name,
+         s.asker_rep,
+         s.first_answerer_id,
+         s.first_answerer_name,
+         s.viewcount,
+         s.question_score,
+         s.answercount,
+         s.upvotes,
+         s.downvotes,
+         s.total_comments,
+         s.edit_events,
+         s.community_bumps,
+         s.duplicate_links,
+         s.related_links,
+         s.bounty_total,
+         s.hours_to_first_answer,
+         s.hours_to_accept,
+         s.n_views + s.n_up - s.n_down + s.n_comments + s.n_edits + s.n_bumps + s.n_related + s.n_bounty + s.n_speed_first + s.n_speed_accept + s.n_has_accepted
+           + coalesce(avg(case when tr.tag_score_quintile is not null then (6 - tr.tag_score_quintile)/5.0 else 0 end)
+             over (partition by s.question_id), 0) as engagement_score
+  from scored s
+  left join tag_enriched te on te.question_id = s.question_id
+  left join tag_rank tr on tr.tag = te.tag
+)
+select *
+from final_agg
+where question_score >= 0
+order by engagement_score desc NULLS LAST, viewcount desc NULLS LAST, question_id
+limit 500;

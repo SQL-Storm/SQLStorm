@@ -1,0 +1,43 @@
+WITH UserPostStats AS (
+    SELECT 
+        u.Id AS UserId, 
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(p.Score) AS TotalPostScore,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount END) AS AvgQuestionViews,
+        COUNT(DISTINCT t.Id) AS UniqueTagCount
+    FROM 
+        Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN (
+        SELECT DISTINCT ph.UserId, u_tags.tag_name
+        FROM PostHistory ph,
+        LATERAL (
+            SELECT token AS tag_name
+            FROM UNNEST(STRING_SPLIT(SUBSTRING(ph.Text FROM 2 FOR (CHAR_LENGTH(ph.Text) - 2)), '><')) AS t(token)
+        ) AS u_tags
+    ) ut ON u.Id = ut.UserId
+    LEFT JOIN Tags t ON ut.tag_name = t.TagName
+    GROUP BY u.Id, u.Reputation
+)
+SELECT 
+    UserId,
+    Reputation,
+    PostCount,
+    TotalPostScore,
+    VoteCount,
+    AvgQuestionViews,
+    UniqueTagCount,
+    RANK() OVER (ORDER BY TotalPostScore DESC) AS PostScoreRank,
+    RANK() OVER (ORDER BY Reputation DESC) AS ReputationRank
+FROM 
+    UserPostStats
+WHERE 
+    PostCount > 10 
+    AND Reputation > 100
+ORDER BY 
+    TotalPostScore DESC, 
+    Reputation DESC
+LIMIT 100;

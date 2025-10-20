@@ -1,0 +1,168 @@
+WITH
+user_activity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.CreationDate,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS Questions,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS Answers,
+    COUNT(DISTINCT c.Id) AS Comments,
+    COUNT(DISTINCT b.Id) AS Badges,
+    MAX(p.LastActivityDate) AS LastActivity
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Comments c ON c.UserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.CreationDate, u.Reputation
+),
+question_scores AS (
+  SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.CreationDate,
+    q.OwnerUserId,
+    q.ViewCount,
+    q.Score AS BaseScore,
+    q.AnswerCount,
+    q.FavoriteCount,
+    COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END),0) AS VoteDelta,
+    COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (24,5,4,6)) AS EditCount,
+    COUNT(DISTINCT pl.Id) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicateCount,
+    (
+      (COALESCE(q.ViewCount,0) * 0.2)
+      + (COALESCE(q.AnswerCount,0) * 25)
+      + (COALESCE(q.FavoriteCount,0) * 40)
+      + (COALESCE(q.Score,0) * 50)
+      + (COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END),0) * 10)
+      + (COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (24,5,4,6)) * 15)
+      - (COUNT(DISTINCT pl.Id) FILTER (WHERE pl.LinkTypeId = 3) * 100)
+    ) / GREATEST(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - q.CreationDate))/3600, 1)
+    AS HotnessScore
+  FROM Posts q
+  LEFT JOIN Votes v ON v.PostId = q.Id
+  LEFT JOIN PostHistory ph ON ph.PostId = q.Id
+  LEFT JOIN PostLinks pl ON pl.PostId = q.Id
+  WHERE q.PostTypeId = 1
+  GROUP BY q.Id, q.Title, q.CreationDate, q.OwnerUserId, q.ViewCount, q.Score, q.AnswerCount, q.FavoriteCount
+),
+tag_explosion AS (
+  SELECT
+    tag,
+    COUNT(*) AS QuestionCount,
+    SUM(q.ViewCount) AS TotalViews,
+    AVG(q.Score) AS AvgScore,
+    SUM(q.AnswerCount) AS TotalAnswers,
+    SUM(q.FavoriteCount) AS TotalFavorites,
+    SUM(CAST(q.Score AS BIGINT)) FILTER (WHERE q.Score > 0) AS PositiveScoreSum,
+    MAX(q.CreationDate) AS MostRecentQuestion
+  FROM (
+    SELECT
+      q.*,
+      unnest(string_to_array(substr(q.Tags, 2, char_length(q.Tags)-2), '><')) AS tag
+    FROM Posts q
+    WHERE q.PostTypeId = 1 AND q.Tags IS NOT NULL
+  ) q
+  GROUP BY tag
+),
+popular_tags AS (
+  SELECT tag FROM tag_explosion WHERE QuestionCount >= 50
+),
+question_tag_pairs AS (
+  SELECT
+    qt1.tag AS tag1,
+    qt2.tag AS tag2,
+    COUNT(*) AS Cooccurrence
+  FROM (
+    SELECT q.Id, unnest(string_to_array(substr(q.Tags, 2, char_length(q.Tags)-2), '><')) AS tag
+    FROM Posts q
+    WHERE q.PostTypeId = 1 AND q.Tags IS NOT NULL
+  ) qt1
+  JOIN (
+    SELECT q.Id, unnest(string_to_array(substr(q.Tags, 2, char_length(q.Tags)-2), '><')) AS tag
+    FROM Posts q
+    WHERE q.PostTypeId = 1 AND q.Tags IS NOT NULL
+  ) qt2 ON qt1.Id = qt2.Id AND qt1.tag < qt2.tag
+  WHERE qt1.tag IN (SELECT tag FROM popular_tags) AND qt2.tag IN (SELECT tag FROM popular_tags)
+  GROUP BY qt1.tag, qt2.tag
+  HAVING COUNT(*) >= 10
+),
+quality_issues AS (
+  SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.CreationDate,
+    q.OwnerUserId,
+    SUM(CASE WHEN ph.PostHistoryTypeId IN (10,12,35) THEN 1 ELSE 0 END) AS CloseOrDeleteEvents,
+    SUM(CASE WHEN v.VoteTypeId IN (10,12) THEN 1 ELSE 0 END) AS DeletionVotes,
+    COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (10,12,35) AND ph.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days')) AS RecentCloseDelete
+  FROM Posts q
+  LEFT JOIN PostHistory ph ON ph.PostId = q.Id
+  LEFT JOIN Votes v ON v.PostId = q.Id
+  WHERE q.PostTypeId = 1
+  GROUP BY q.Id, q.Title, q.CreationDate, q.OwnerUserId
+),
+final AS (
+  SELECT
+    qs.QuestionId AS QuestionId,
+    qs.Title,
+    qs.CreationDate,
+    qs.OwnerUserId,
+    qs.HotnessScore,
+    qs.ViewCount,
+    qs.AnswerCount,
+    qs.VoteDelta,
+    te.tag AS PrimaryTag,
+    te.QuestionCount AS PrimaryTagQCount,
+    te.TotalViews AS PrimaryTagViews,
+    qi.CloseOrDeleteEvents,
+    qi.RecentCloseDelete,
+    ua.DisplayName AS OwnerName,
+    ua.Reputation AS OwnerReputation,
+    ROW_NUMBER() OVER (ORDER BY qs.HotnessScore DESC) AS HotRank,
+    PERCENT_RANK() OVER (ORDER BY qs.HotnessScore DESC) AS HotPercentile
+  FROM question_scores qs
+  LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(substr(p.Tags, 2, char_length(p.Tags)-2), '><')) AS tag
+    FROM Posts p WHERE p.Id = qs.QuestionId AND p.Tags IS NOT NULL LIMIT 1
+  ) t ON true
+  LEFT JOIN tag_explosion te ON te.tag = t.tag
+  LEFT JOIN quality_issues qi ON qi.QuestionId = qs.QuestionId
+  LEFT JOIN Users ua ON ua.Id = qs.OwnerUserId
+)
+SELECT
+  f.HotRank,
+  f.HotPercentile,
+  f.QuestionId,
+  f.Title,
+  f.PrimaryTag,
+  f.PrimaryTagQCount,
+  ROUND(f.HotnessScore,2) AS Hotness,
+  f.ViewCount,
+  f.AnswerCount,
+  f.VoteDelta,
+  f.CloseOrDeleteEvents,
+  f.RecentCloseDelete,
+  f.OwnerName,
+  f.OwnerReputation,
+  te2.CandidateCoTag,
+  te2.Cooccurrence,
+  te3.AvgScore AS CoTagAvgScore,
+  ue.Questions AS OwnerQuestionCount,
+  ue.Answers AS OwnerAnswerCount,
+  ue.Comments AS OwnerComments,
+  ue.Badges AS OwnerBadges
+FROM final f
+LEFT JOIN (
+  SELECT p.tag1 AS tag, qtp.tag2 AS CandidateCoTag, qtp.Cooccurrence
+  FROM question_tag_pairs qtp
+  JOIN LATERAL (
+    VALUES (qtp.tag1, qtp.tag2), (qtp.tag2, qtp.tag1)
+  ) p(tag1, tag2) ON true
+  JOIN (SELECT DISTINCT tag FROM popular_tags) ptag ON p.tag1 = ptag.tag
+  ORDER BY qtp.Cooccurrence DESC
+) te2 ON te2.tag = f.PrimaryTag
+LEFT JOIN tag_explosion te3 ON te3.tag = te2.CandidateCoTag
+LEFT JOIN user_activity ue ON ue.UserId = f.OwnerUserId
+WHERE f.HotRank <= 250
+ORDER BY f.HotnessScore DESC, f.RecentCloseDelete DESC;

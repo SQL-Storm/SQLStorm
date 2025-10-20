@@ -1,0 +1,111 @@
+-- {"query": "52092.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-code-fast", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2165, "output_tokens": 1038} 
+WITH UserQuestionStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) AS QuestionCount,
+        SUM(p.Score) AS TotalQuestionScore,
+        AVG(p.Score) AS AvgQuestionScore,
+        SUM(p.ViewCount) AS TotalViewCount,
+        SUM(p.AnswerCount) AS TotalAnswerCount,
+        MIN(p.CreationDate) AS FirstQuestionDate,
+        MAX(p.CreationDate) AS LastQuestionDate
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+UserAnswerStats AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(p.Id) AS AnswerCount,
+        SUM(p.Score) AS TotalAnswerScore,
+        AVG(p.Score) AS AvgAnswerScore,
+        COUNT(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 END) AS AcceptedAnswerCount
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 2
+    GROUP BY u.Id
+),
+UserBadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) AS TotalBadges,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COUNT(CASE WHEN b.TagBased = 1 THEN 1 END) AS TagBasedBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserCommentStats AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(c.Id) AS CommentCount,
+        SUM(c.Score) AS TotalCommentScore,
+        AVG(c.Score) AS AvgCommentScore
+    FROM Users u
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id
+),
+UserVoteStats AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpvoteReceived,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownvoteReceived,
+        COUNT(CASE WHEN v.VoteTypeId = 8 THEN 1 END) AS BountyStarts,
+        COUNT(CASE WHEN v.VoteTypeId = 9 THEN 1 END) AS BountyCloses
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    GROUP BY u.Id
+),
+UserPostHistoryStats AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(ph.Id) AS EditCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 END) AS EditActions
+    FROM Users u
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    GROUP BY u.Id
+)
+SELECT 
+    qs.UserId,
+    qs.DisplayName,
+    qs.Reputation,
+    qs.QuestionCount,
+    qs.TotalQuestionScore,
+    qs.AvgQuestionScore,
+    qs.TotalViewCount,
+    qs.TotalAnswerCount,
+    ans.AnswerCount,
+    ans.TotalAnswerScore,
+    ans.AvgAnswerScore,
+    ans.AcceptedAnswerCount,
+    bs.TotalBadges,
+    bs.GoldBadges,
+    bs.SilverBadges,
+    bs.BronzeBadges,
+    bs.TagBasedBadges,
+    cs.CommentCount,
+    cs.TotalCommentScore,
+    cs.AvgCommentScore,
+    vs.UpvoteReceived,
+    vs.DownvoteReceived,
+    vs.BountyStarts,
+    vs.BountyCloses,
+    phs.EditCount,
+    phs.EditActions,
+    RANK() OVER (ORDER BY (COALESCE(qs.TotalQuestionScore, 0) + COALESCE(ans.TotalAnswerScore, 0) + COALESCE(cs.TotalCommentScore, 0)) DESC) AS OverallRank,
+    DENSE_RANK() OVER (ORDER BY bs.GoldBadges DESC, bs.SilverBadges DESC, bs.BronzeBadges DESC) AS BadgeRank,
+    PERCENT_RANK() OVER (ORDER BY qs.Reputation DESC) AS ReputationPercentile
+FROM UserQuestionStats qs
+FULL OUTER JOIN UserAnswerStats ans ON qs.UserId = ans.UserId
+FULL OUTER JOIN UserBadgeStats bs ON qs.UserId = bs.UserId
+FULL OUTER JOIN UserCommentStats cs ON qs.UserId = cs.UserId
+FULL OUTER JOIN UserVoteStats vs ON qs.UserId = vs.UserId
+FULL OUTER JOIN UserPostHistoryStats phs ON qs.UserId = phs.UserId
+WHERE qs.QuestionCount > 0 OR ans.AnswerCount > 0
+ORDER BY OverallRank, Reputation DESC
+LIMIT 100;

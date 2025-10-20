@@ -1,0 +1,69 @@
+-- {"query": "52011.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-code-fast", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2165, "output_tokens": 644} 
+WITH question_stats AS (
+    SELECT 
+        p.Id AS question_id,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tag_name
+    FROM Posts p
+    WHERE p.PostTypeId = 1 -- Questions
+),
+tag_engagement AS (
+    SELECT 
+        qs.tag_name,
+        COUNT(DISTINCT qs.question_id) AS num_questions,
+        AVG(qs.Score) AS avg_score,
+        SUM(qs.ViewCount) AS total_views,
+        SUM(qs.AnswerCount) AS total_answers,
+        SUM(qs.FavoriteCount) AS total_favorites,
+        COUNT(DISTINCT v.Id) AS total_votes_on_questions,
+        COUNT(DISTINCT c.Id) AS total_comments_on_questions
+    FROM question_stats qs
+    LEFT JOIN Votes v ON v.PostId = qs.question_id AND v.VoteTypeId IN (2,3) -- Up and Down votes
+    LEFT JOIN Comments c ON c.PostId = qs.question_id
+    GROUP BY qs.tag_name
+),
+top_users_per_tag AS (
+    SELECT 
+        qs.tag_name,
+        qs.OwnerUserId,
+        COUNT(DISTINCT qs.question_id) AS questions_asked,
+        SUM(qs.Score) AS total_score,
+        COUNT(DISTINCT a.Id) AS answers_given,
+        SUM(a.Score) AS total_answer_score,
+        COUNT(DISTINCT b.Id) AS badges_earned,
+        RANK() OVER (PARTITION BY qs.tag_name ORDER BY (COUNT(DISTINCT qs.question_id) + COUNT(DISTINCT a.Id)) DESC) AS user_rank
+    FROM question_stats qs
+    LEFT JOIN Posts a ON a.ParentId = qs.question_id AND a.PostTypeId = 2 -- Answers
+    LEFT JOIN Badges b ON b.UserId = qs.OwnerUserId
+    GROUP BY qs.tag_name, qs.OwnerUserId
+)
+SELECT 
+    te.tag_name,
+    te.num_questions,
+    te.avg_score,
+    te.total_views,
+    te.total_answers,
+    te.total_favorites,
+    te.total_votes_on_questions,
+    te.total_comments_on_questions,
+    array_agg(
+        json_build_object(
+            'user_id', tup.OwnerUserId,
+            'questions_asked', tup.questions_asked,
+            'total_score', tup.total_score,
+            'answers_given', tup.answers_given,
+            'total_answer_score', tup.total_answer_score,
+            'badges_earned', tup.badges_earned
+        )
+    ) FILTER (WHERE tup.user_rank <= 3) AS top_users
+FROM tag_engagement te
+LEFT JOIN top_users_per_tag tup ON tup.tag_name = te.tag_name
+WHERE te.num_questions > 10
+GROUP BY te.tag_name, te.num_questions, te.avg_score, te.total_views, te.total_answers, te.total_favorites, te.total_votes_on_questions, te.total_comments_on_questions
+ORDER BY te.num_questions DESC
+LIMIT 100;

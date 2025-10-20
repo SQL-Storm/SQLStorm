@@ -1,0 +1,68 @@
+WITH user_stats AS (
+    SELECT u.Id AS UserId,
+           u.Reputation,
+           u.CreationDate,
+           u.LastAccessDate,
+           COUNT(DISTINCT b.Id) AS TotalBadges,
+           SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+           SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+           SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+post_metrics AS (
+    SELECT p.Id AS PostId,
+           p.PostTypeId,
+           p.Score,
+           p.ViewCount,
+           p.AnswerCount,
+           p.CommentCount,
+           p.FavoriteCount,
+           p.OwnerUserId,
+           COUNT(DISTINCT c.Id) AS CommentCountActual,
+           AVG(CAST(v.Score AS NUMERIC)) AS AvgVoteScore,
+           SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+           SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes,
+           MAX(p.LastActivityDate) AS LastActivity
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY p.Id, p.PostTypeId, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.OwnerUserId
+),
+top_questions AS (
+    SELECT pm.PostId,
+           pm.OwnerUserId,
+           pm.Score,
+           pm.ViewCount,
+           pm.AnswerCount,
+           pm.CommentCountActual,
+           pm.AvgVoteScore,
+           pm.UpVotes,
+           pm.DownVotes,
+           ROW_NUMBER() OVER (PARTITION BY pm.OwnerUserId ORDER BY pm.Score DESC) AS ScoreRank
+    FROM post_metrics pm
+    WHERE pm.PostTypeId = 1
+)
+SELECT u.UserId,
+       u.Reputation,
+       u.CreationDate,
+       u.LastAccessDate,
+       u.TotalBadges,
+       u.GoldBadges,
+       u.SilverBadges,
+       u.BronzeBadges,
+       COUNT(DISTINCT tq.PostId) AS TopQuestionsCount,
+       AVG(tq.Score) AS AvgTopQuestionScore,
+       SUM(tq.ViewCount) AS TotalViewsOnTopQuestions,
+       SUM(tq.AnswerCount) AS TotalAnswersOnTopQuestions,
+       AVG(tq.AvgVoteScore) AS AvgVoteScoreOnTopQuestions,
+       SUM(tq.UpVotes) AS TotalUpVotesOnTopQuestions,
+       SUM(tq.DownVotes) AS TotalDownVotesOnTopQuestions
+FROM user_stats u
+JOIN top_questions tq ON u.UserId = tq.OwnerUserId AND tq.ScoreRank <= 10
+WHERE u.LastAccessDate >= DATE '2022-01-01'
+GROUP BY u.UserId, u.Reputation, u.CreationDate, u.LastAccessDate, u.TotalBadges, u.GoldBadges, u.SilverBadges, u.BronzeBadges
+ORDER BY u.Reputation DESC, COUNT(DISTINCT tq.PostId) DESC
+LIMIT 100;

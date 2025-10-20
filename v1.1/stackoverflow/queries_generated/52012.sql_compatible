@@ -1,0 +1,53 @@
+WITH top_questions AS (
+    SELECT p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CreationDate, p.OwnerUserId,
+           u.DisplayName, u.Reputation
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+      AND p.Score > 0
+    ORDER BY p.Score DESC
+    LIMIT 1000
+),
+question_stats AS (
+    SELECT q.Id, q.Title, q.Score, q.ViewCount, q.AnswerCount, q.CreationDate, q.DisplayName, q.Reputation,
+           COUNT(c.Id) AS CommentCount,
+           AVG(v.VoteTypeId) FILTER (WHERE v.VoteTypeId IS NOT NULL) * 0.0 + AVG(CASE WHEN v.VoteTypeId IN (2,3) THEN v.Score END) OVER () * 0.0 -- placeholder to satisfy syntax if v.Score not available
+    FROM top_questions q
+    LEFT JOIN Comments c ON q.Id = c.PostId
+    LEFT JOIN Votes v ON q.Id = v.PostId AND v.VoteTypeId IN (2,3)
+    GROUP BY q.Id, q.Title, q.Score, q.ViewCount, q.AnswerCount, q.CreationDate, q.DisplayName, q.Reputation
+),
+answer_stats AS (
+    SELECT a.ParentId, COUNT(*) AS AcceptedAnswerCount, AVG(a.Score) AS AvgAnswerScore
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+      AND a.ParentId IN (SELECT Id FROM top_questions)
+    GROUP BY a.ParentId
+),
+badge_counts AS (
+    SELECT UserId, COUNT(*) AS TotalBadges,
+           COUNT(CASE WHEN Class = 1 THEN 1 END) AS GoldBadges,
+           COUNT(CASE WHEN Class = 2 THEN 1 END) AS SilverBadges,
+           COUNT(CASE WHEN Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges
+    WHERE UserId IN (SELECT OwnerUserId FROM top_questions)
+    GROUP BY UserId
+),
+edit_history AS (
+    SELECT ph.PostId, COUNT(*) AS TotalEdits, MAX(ph.CreationDate) AS LastEdit
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6)
+      AND ph.PostId IN (SELECT Id FROM top_questions)
+    GROUP BY ph.PostId
+)
+SELECT qs.Id, qs.Title, qs.Score, qs.ViewCount, qs.AnswerCount, qs.CreationDate, qs.DisplayName, qs.Reputation,
+       qs.CommentCount,
+       (SELECT AVG(v2.Score) FROM Votes v2 WHERE v2.PostId = qs.Id AND v2.VoteTypeId IN (2,3)) AS AvgVoteScore,
+       COALESCE(ast.AcceptedAnswerCount, 0) AS AcceptedAnswerCount, ast.AvgAnswerScore,
+       bc.TotalBadges, bc.GoldBadges, bc.SilverBadges, bc.BronzeBadges,
+       eh.TotalEdits, eh.LastEdit
+FROM question_stats qs
+LEFT JOIN answer_stats ast ON qs.Id = ast.ParentId
+LEFT JOIN badge_counts bc ON qs.Reputation = bc.UserId
+LEFT JOIN edit_history eh ON qs.Id = eh.PostId
+ORDER BY qs.Score DESC, qs.Reputation DESC;

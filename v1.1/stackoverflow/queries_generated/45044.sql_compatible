@@ -1,0 +1,97 @@
+WITH ActiveUserPosts AS (
+    SELECT 
+        p.OwnerUserId,
+        u.DisplayName,
+        COUNT(*) AS TotalPosts,
+        AVG(p.Score) AS AveragePostScore,
+        MAX(p.CreationDate) AS LatestPostDate
+    FROM 
+        Posts p
+    JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    WHERE 
+        p.PostTypeId = 1 
+        AND u.Reputation > 1000
+        AND p.CreationDate > DATE '2018-01-01'
+    GROUP BY 
+        p.OwnerUserId, u.DisplayName
+), 
+PostTags AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        -- extract tags by removing surrounding <...> and splitting on '><'
+        TRIM(tag) AS TagName
+    FROM
+        Posts p,
+        LATERAL (
+            SELECT regexp_split_to_table(substring(p.Tags FROM 2 FOR (char_length(p.Tags) - 2)), '><') AS tag
+        ) st
+    WHERE
+        p.PostTypeId = 1
+),
+TagPopularity AS (
+    SELECT 
+        pt.TagName,
+        COUNT(*) AS TagCount,
+        AVG(p.Score) AS AverageTagScore,
+        MAX(p.ViewCount) AS MaxViewCount
+    FROM 
+        PostTags pt
+    JOIN
+        Posts p ON p.Id = pt.PostId
+    GROUP BY 
+        pt.TagName
+),
+UserMostFrequentTag AS (
+    -- for each user, find their most frequent tag(s)
+    SELECT
+        pt.OwnerUserId,
+        pt.TagName,
+        COUNT(*) AS TagCountPerUser
+    FROM
+        PostTags pt
+    GROUP BY
+        pt.OwnerUserId,
+        pt.TagName
+),
+UserMaxTagCount AS (
+    SELECT
+        OwnerUserId,
+        MAX(TagCountPerUser) AS MaxCount
+    FROM
+        UserMostFrequentTag
+    GROUP BY
+        OwnerUserId
+),
+UserTopTags AS (
+    SELECT
+        umt.OwnerUserId,
+        umt.TagName,
+        umt.TagCountPerUser
+    FROM
+        UserMostFrequentTag umt
+    JOIN
+        UserMaxTagCount mx ON umt.OwnerUserId = mx.OwnerUserId AND umt.TagCountPerUser = mx.MaxCount
+)
+SELECT 
+    aup.OwnerUserId,
+    aup.DisplayName,
+    aup.TotalPosts,
+    aup.AveragePostScore,
+    utt.TagName AS MostFrequentTag,
+    tp.TagCount,
+    tp.AverageTagScore,
+    aup.LatestPostDate
+FROM 
+    ActiveUserPosts aup
+JOIN
+    UserTopTags utt ON utt.OwnerUserId = aup.OwnerUserId
+LEFT JOIN 
+    TagPopularity tp ON tp.TagName = utt.TagName
+WHERE 
+    aup.TotalPosts > 10
+ORDER BY 
+    aup.AveragePostScore DESC, 
+    aup.TotalPosts DESC
+LIMIT 100;

@@ -1,0 +1,148 @@
+-- {"query": "37081.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 1748} 
+WITH
+-- active recent questions with tag arrays
+QuestionTags AS (
+  SELECT
+    p.Id AS QuestionId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    COALESCE(string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><'), ARRAY[]::varchar[]) AS Tags
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= now() - INTERVAL '2 years'
+),
+-- compute tag popularity and co-occurrence
+TagStats AS (
+  SELECT
+    t.tag AS Tag,
+    COUNT(*) AS QuestionCount,
+    SUM(q.ViewCount) AS TotalViews,
+    AVG(q.Score) AS AvgScore,
+    SUM(q.AnswerCount) AS TotalAnswers,
+    SUM(q.FavoriteCount) AS TotalFavorites
+  FROM QuestionTags q
+  CROSS JOIN LATERAL unnest(q.Tags) AS t(tag)
+  GROUP BY t.tag
+),
+TagPairs AS (
+  SELECT
+    a.tag AS TagA,
+    b.tag AS TagB,
+    COUNT(*) AS CoOccur,
+    SUM(q.ViewCount) AS CoViews,
+    SUM(q.Score) AS CoScore
+  FROM QuestionTags q
+  CROSS JOIN LATERAL unnest(q.Tags) AS a(tag)
+  CROSS JOIN LATERAL unnest(q.Tags) AS b(tag)
+  WHERE a.tag < b.tag
+  GROUP BY a.tag, b.tag
+),
+-- top active users who asked/answered in period
+ActiveUsers AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    COUNT(DISTINCT q.QuestionId) FILTER (WHERE q.QuestionId IS NOT NULL) AS QuestionsAsked,
+    COUNT(a.Id) FILTER (WHERE a.PostTypeId = 2 AND a.CreationDate >= now() - INTERVAL '2 years') AS AnswersGiven,
+    SUM(v_up.c) AS UpVotesReceived,
+    SUM(v_down.c) AS DownVotesReceived,
+    u.Reputation
+  FROM Users u
+  LEFT JOIN QuestionTags q ON q.QuestionId = ANY( (SELECT array_agg(p.Id) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1 AND p.CreationDate >= now() - INTERVAL '2 years') )
+  LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2 AND a.CreationDate >= now() - INTERVAL '2 years'
+  LEFT JOIN LATERAL (
+    SELECT COUNT(*) AS c FROM Votes v WHERE v.PostId IN (
+      SELECT p2.Id FROM Posts p2 WHERE p2.OwnerUserId = u.Id
+    ) AND v.VoteTypeId = 2
+  ) v_up ON true
+  LEFT JOIN LATERAL (
+    SELECT COUNT(*) AS c FROM Votes v WHERE v.PostId IN (
+      SELECT p2.Id FROM Posts p2 WHERE p2.OwnerUserId = u.Id
+    ) AND v.VoteTypeId = 3
+  ) v_down ON true
+  GROUP BY u.Id, u.DisplayName, u.Reputation, v_up.c, v_down.c
+),
+-- complex ranking of questions combining recency, score, views, answer rate, tag hotness
+QuestionRank AS (
+  SELECT
+    q.QuestionId,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.FavoriteCount,
+    array_to_string(q.Tags, ',') AS TagList,
+    -- tag hotness: sum of tag popularity ranks
+    COALESCE((
+      SELECT SUM( (ts.QuestionCount::float / NULLIF(max_ts.max_q,0)) * 1.0 )
+      FROM unnest(q.Tags) AS tt(tag)
+      LEFT JOIN TagStats ts ON ts.Tag = tt.tag
+      CROSS JOIN (SELECT MAX(QuestionCount) AS max_q FROM TagStats) max_ts
+    ),0) AS TagHotness,
+    -- temporal recency factor
+    EXTRACT(EPOCH FROM (now() - q.CreationDate)) AS AgeSeconds,
+    -- composite score
+    (
+      (GREATEST(q.Score,0) * 3.0)
+      + (LOG(GREATEST(q.ViewCount,1)) * 2.0)
+      + (q.FavoriteCount * 5.0)
+      + (LEAST(q.AnswerCount,5) * 4.0)
+      + (COALESCE((
+          SELECT SUM(ts.QuestionCount) FROM unnest(q.Tags) AS tt(tag) LEFT JOIN TagStats ts ON ts.Tag = tt.tag
+        ),0) * 0.5)
+      - (EXTRACT(EPOCH FROM (now() - q.CreationDate)) / 86400.0) * 0.2
+    ) AS RawScore
+  FROM QuestionTags q
+)
+-- final heavy-weight select: join many aggregates, window functions, subqueries, and CTEs to stress planner
+SELECT
+  qr.QuestionId,
+  p.Title,
+  qr.TagList,
+  qr.CreationDate,
+  qr.Score AS QuestionScore,
+  qr.ViewCount,
+  qr.AnswerCount,
+  qr.FavoriteCount,
+  qr.TagHotness,
+  qr.RawScore,
+  -- normalized rank among recent questions
+  RANK() OVER (ORDER BY qr.RawScore DESC) AS GlobalRank,
+  -- per-tag top co-occurring partner tags (first two)
+  (SELECT json_agg(json_build_object('Tag', tp.TagB, 'CoOccur', tp.CoOccur, 'CoViews', tp.CoViews, 'CoScore', tp.CoScore) ORDER BY tp.CoOccur DESC LIMIT 2)
+   FROM TagPairs tp
+   WHERE tp.TagA = ANY(qr.Tags) OR tp.TagB = ANY(qr.Tags)
+  ) AS TopCoTags,
+  -- top answer for the question by score and recency combined
+  (SELECT json_build_object('AnswerId', a.Id, 'Score', a.Score, 'CreationDate', a.CreationDate, 'OwnerUserId', a.OwnerUserId, 'OwnerDisplayName', a.OwnerDisplayName)
+   FROM Posts a
+   WHERE a.ParentId = qr.QuestionId AND a.PostTypeId = 2
+   ORDER BY (a.Score * 3.0 + LOG(GREATEST(a.Score+10,1)) + (EXTRACT(EPOCH FROM (now() - a.CreationDate)) * -0.0001)) DESC
+   LIMIT 1
+  ) AS TopAnswer,
+  -- count of comments on question and on its answers
+  (SELECT COUNT(*) FROM Comments c WHERE c.PostId = qr.QuestionId) AS QuestionComments,
+  (SELECT COUNT(*) FROM Comments c WHERE c.PostId IN (SELECT a2.Id FROM Posts a2 WHERE a2.ParentId = qr.QuestionId AND a2.PostTypeId = 2)) AS AnswerComments,
+  -- recent activity types from PostHistory (last 3 events)
+  (SELECT json_agg(ph_row) FROM (
+     SELECT ph.PostHistoryTypeId, ph.CreationDate, ph.UserId, ph.Comment
+     FROM PostHistory ph
+     WHERE ph.PostId = qr.QuestionId
+     ORDER BY ph.CreationDate DESC
+     LIMIT 3
+  ) ph_row) AS RecentHistory,
+  -- correlation: whether accepted answer exists and its score delta vs question
+  EXISTS(SELECT 1 FROM Posts acc WHERE acc.Id = p.AcceptedAnswerId) AS HasAcceptedAnswer,
+  CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN
+    (SELECT (acc.Score - p.Score) FROM Posts acc WHERE acc.Id = p.AcceptedAnswerId)
+  ELSE NULL END AS AcceptedScoreDelta
+FROM QuestionRank qr
+JOIN Posts p ON p.Id = qr.QuestionId
+-- join to bring in CTE tag array for subqueries
+LEFT JOIN LATERAL (SELECT qr_tag.Tags FROM (SELECT qr.QuestionId, (SELECT array_agg(t) FROM unnest(qr.TagList::text[]::varchar[]) t) AS Tags) AS qr_tag WHERE qr_tag.QuestionId = qr.QuestionId) dummy ON true
+WHERE qr.RawScore IS NOT NULL
+ORDER BY qr.RawScore DESC
+LIMIT 200;

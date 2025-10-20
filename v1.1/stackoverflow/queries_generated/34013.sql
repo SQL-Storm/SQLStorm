@@ -1,0 +1,91 @@
+-- {"query": "34013.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 842} 
+
+WITH RecursiveTagCounts AS (
+    SELECT 
+        t.Id AS TagId,
+        t.TagName,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalViews,
+        COUNT(p.Id) AS PostCount
+    FROM Tags t
+    LEFT JOIN Posts p ON p.PostTypeId = 1 AND p.Tags LIKE '%<' || t.TagName || '>%'
+    GROUP BY t.Id, t.TagName
+),
+TopTags AS (
+    SELECT TagId, TagName, TotalViews, PostCount
+    FROM RecursiveTagCounts
+    ORDER BY TotalViews DESC
+    LIMIT 10
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName, 
+        COUNT(DISTINCT p.Id) AS QuestionsPosted,
+        COUNT(DISTINCT a.Id) AS AnswersPosted,
+        COALESCE(SUM(p.Score),0) + COALESCE(SUM(a.Score),0) AS TotalScore,
+        MAX(p.CreationDate) AS LastQuestionDate,
+        MAX(a.CreationDate) AS LastAnswerDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(DISTINCT p.Id) > 10 -- active question askers
+),
+TopUsersPerTag AS (
+    SELECT
+        tt.TagId,
+        tt.TagName,
+        ua.UserId,
+        ua.DisplayName,
+        COUNT(p.Id) AS UserPostsInTag,
+        SUM(p.Score) AS ScoreInTag
+    FROM TopTags tt
+    JOIN Posts p ON p.PostTypeId = 1 AND p.Tags LIKE '%<' || tt.TagName || '>%'
+    JOIN Users u ON p.OwnerUserId = u.Id
+    JOIN UserActivity ua ON ua.UserId = u.Id
+    GROUP BY tt.TagId, tt.TagName, ua.UserId, ua.DisplayName
+    ORDER BY tt.TagName, ScoreInTag DESC
+),
+AcceptedAnswerStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(a.Id) AS AcceptedAnswersCount,
+        AVG(a.Score) AS AvgAcceptedAnswerScore,
+        MAX(a.CreationDate) AS LastAcceptedAnswerDate
+    FROM Users u
+    JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2 AND EXISTS (
+        SELECT 1 FROM Posts q WHERE q.AcceptedAnswerId = a.Id
+    )
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(a.Id) > 0
+),
+TagBadges AS (
+    SELECT
+        b.UserId,
+        b.Name,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    WHERE b.TagBased = 1 AND b.Date > CURRENT_DATE - INTERVAL '1 year'
+    GROUP BY b.UserId, b.Name
+)
+SELECT
+    tt.TagName,
+    tt.TotalViews,
+    tt.PostCount,
+    tu.UserId,
+    tu.DisplayName,
+    tu.UserPostsInTag,
+    tu.ScoreInTag,
+    COALESCE(aas.AcceptedAnswersCount, 0) AS AcceptedAnswers,
+    COALESCE(aas.AvgAcceptedAnswerScore, 0) AS AvgAcceptedAnswerScore,
+    COALESCE(tb.BadgeCount, 0) AS RecentTagBadges
+FROM TopTags tt
+LEFT JOIN (
+    SELECT DISTINCT ON (TagId) TagId, UserId, DisplayName, UserPostsInTag, ScoreInTag
+    FROM TopUsersPerTag
+    ORDER BY TagId, ScoreInTag DESC
+) tu ON tu.TagId = tt.TagId
+LEFT JOIN AcceptedAnswerStats aas ON aas.UserId = tu.UserId
+LEFT JOIN TagBadges tb ON tb.UserId = tu.UserId AND tb.Name = tt.TagName
+ORDER BY tt.TotalViews DESC, tu.ScoreInTag DESC;

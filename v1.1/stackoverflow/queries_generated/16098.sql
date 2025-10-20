@@ -1,4 +1,4 @@
--- {"query": "16098.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 231165, "output_tokens": 215440} 
+-- {"query": "16098.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 231165, "output_tokens": 215440} 
 
 WITH user_engagement_metrics AS (
     SELECT 

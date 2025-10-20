@@ -1,0 +1,242 @@
+with
+cte_recent_questions as (
+  select p.Id as QuestionId,
+         p.CreationDate,
+         p.Score,
+         p.ViewCount,
+         p.OwnerUserId,
+         coalesce(p.AnswerCount, 0) as AnswerCount,
+         string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><') as tag_array
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= (select date_trunc('month', max(CreationDate)) - interval '6 months' from Posts where PostTypeId = 1)
+),
+cte_answers as (
+  select a.ParentId as QuestionId,
+         count(*) as AnswersTotal,
+         cast(avg(a.Score) as numeric(12,4)) as AvgAnswerScore,
+         max(a.Score) as MaxAnswerScore,
+         sum(case when a.Score > 0 then 1 else 0 end) as PositiveAnswers
+  from Posts a
+  where a.PostTypeId = 2
+  group by a.ParentId
+),
+cte_q_votes as (
+  select v.PostId as QuestionId,
+         sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+         sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+         sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+         sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as BountyFlow
+  from Votes v
+  group by v.PostId
+),
+cte_comment_activity as (
+  select c.PostId as QuestionId,
+         count(*) as CommentCount,
+         max(c.CreationDate) as LastCommentDate,
+         cast(avg(c.Score) as numeric(12,4)) as AvgCommentScore
+  from Comments c
+  group by c.PostId
+),
+cte_edit_churn as (
+  select ph.PostId as QuestionId,
+         count(*) filter (where ph.PostHistoryTypeId in (4,5,6,7,8,9,24)) as EditEvents,
+         count(*) filter (where ph.PostHistoryTypeId = 10) as CloseVotesEvents,
+         count(*) filter (where ph.PostHistoryTypeId in (11,13)) as UndeleteReopenEvents,
+         max(ph.CreationDate) as LastHistoryEvent
+  from PostHistory ph
+  group by ph.PostId
+),
+cte_links as (
+  select pl.PostId as QuestionId,
+         count(*) filter (where pl.LinkTypeId = 1) as LinkedCount,
+         count(*) filter (where pl.LinkTypeId = 3) as DuplicateCount,
+         count(distinct pl.RelatedPostId) as RelatedDistinct
+  from PostLinks pl
+  group by pl.PostId
+),
+cte_tag_unpivot as (
+  select rq.QuestionId, lower(trim(t)) as tag
+  from cte_recent_questions rq
+  cross join unnest(rq.tag_array) as t
+),
+cte_tag_stats as (
+  select tu.QuestionId,
+         count(*) as TagCount,
+         sum(coalesce(ta.Count,0)) as TagPopularitySum,
+         cast(avg(coalesce(ta.Count,0)) as numeric(12,4)) as AvgTagPopularity,
+         max(coalesce(ta.Count,0)) as MaxTagPopularity,
+         sum(case when coalesce(ta.IsModeratorOnly, false) = true then 1 else 0 end) as ModeratorOnlyTags,
+         sum(case when coalesce(ta.IsRequired, false) = true then 1 else 0 end) as RequiredTags
+  from cte_tag_unpivot tu
+  left join Tags ta on ta.TagName = tu.tag
+  group by tu.QuestionId
+),
+cte_owner as (
+  select u.Id as OwnerUserId,
+         u.Reputation,
+         u.Views as ProfileViews,
+         u.UpVotes as UserUpVotes,
+         u.DownVotes as UserDownVotes,
+         cast(date_part('year', age(cast('2024-10-01 12:34:56' as timestamp), u.CreationDate)) as int) as AccountAgeYears
+  from Users u
+),
+cte_quality_flags as (
+  select rq.QuestionId,
+         (rq.Score >= 5 and rq.ViewCount >= 1000 and coalesce(a.AnswersTotal,0) >= 2) as IsHotish,
+         (rq.Score <= 0 and coalesce(qv.DownVotes,0) > coalesce(qv.UpVotes,0)) as IsControversial,
+         (coalesce(l.DuplicateCount,0) > 0) as IsDuplicate,
+         (coalesce(ec.CloseVotesEvents,0) > 0) as HasCloseVotes,
+         (coalesce(ts.ModeratorOnlyTags,0) > 0) as UsesModOnlyTags
+  from cte_recent_questions rq
+  left join cte_answers a on a.QuestionId = rq.QuestionId
+  left join cte_q_votes qv on qv.QuestionId = rq.QuestionId
+  left join cte_links l on l.QuestionId = rq.QuestionId
+  left join cte_edit_churn ec on ec.QuestionId = rq.QuestionId
+  left join cte_tag_stats ts on ts.QuestionId = rq.QuestionId
+),
+cte_time_bins as (
+  select rq.QuestionId,
+         date_trunc('week', rq.CreationDate) as week_bin,
+         date_trunc('month', rq.CreationDate) as month_bin
+  from cte_recent_questions rq
+),
+cte_windowed as (
+  select
+    rq.QuestionId,
+    rq.CreationDate,
+    rq.Score,
+    rq.ViewCount,
+    rq.AnswerCount,
+    coalesce(a.AnswersTotal,0) as AnswersTotal,
+    cast(coalesce(a.AvgAnswerScore,0) as numeric(12,4)) as AvgAnswerScore,
+    coalesce(a.MaxAnswerScore,0) as MaxAnswerScore,
+    coalesce(qv.UpVotes,0) as QUpVotes,
+    coalesce(qv.DownVotes,0) as QDownVotes,
+    coalesce(qv.Favorites,0) as QFavorites,
+    coalesce(qv.BountyFlow,0) as QBountyFlow,
+    coalesce(ca.CommentCount,0) as CommentCount,
+    ca.LastCommentDate,
+    cast(coalesce(ca.AvgCommentScore,0) as numeric(12,4)) as AvgCommentScore,
+    coalesce(ec.EditEvents,0) as EditEvents,
+    coalesce(ec.CloseVotesEvents,0) as CloseVotesEvents,
+    coalesce(ec.UndeleteReopenEvents,0) as UndeleteReopenEvents,
+    ec.LastHistoryEvent,
+    coalesce(l.LinkedCount,0) as LinkedCount,
+    coalesce(l.DuplicateCount,0) as DuplicateCount,
+    coalesce(l.RelatedDistinct,0) as RelatedDistinct,
+    coalesce(ts.TagCount,0) as TagCount,
+    coalesce(ts.TagPopularitySum,0) as TagPopularitySum,
+    cast(coalesce(ts.AvgTagPopularity,0) as numeric(12,4)) as AvgTagPopularity,
+    coalesce(ts.MaxTagPopularity,0) as MaxTagPopularity,
+    coalesce(ts.ModeratorOnlyTags,0) as ModeratorOnlyTags,
+    coalesce(ts.RequiredTags,0) as RequiredTags,
+    ow.Reputation as OwnerReputation,
+    ow.ProfileViews as OwnerProfileViews,
+    ow.UserUpVotes as OwnerUpVotes,
+    ow.UserDownVotes as OwnerDownVotes,
+    ow.AccountAgeYears,
+    tf.IsHotish,
+    tf.IsControversial,
+    tf.IsDuplicate,
+    tf.HasCloseVotes,
+    tf.UsesModOnlyTags,
+    tb.week_bin,
+    tb.month_bin,
+    row_number() over (partition by tb.week_bin order by rq.Score desc NULLS LAST, rq.ViewCount desc NULLS LAST) as RankInWeekByScore,
+    percent_rank() over (partition by tb.month_bin order by rq.ViewCount desc NULLS LAST) as PctRankViewsInMonth,
+    sum(coalesce(qv.UpVotes,0)) over (partition by tb.month_bin) as MonthTotalUpvotes,
+    sum(coalesce(qv.DownVotes,0)) over (partition by tb.month_bin) as MonthTotalDownvotes,
+    avg(coalesce(a.AvgAnswerScore,0)) over (partition by tb.week_bin) as WeekAvgAnswerScore
+  from cte_recent_questions rq
+  left join cte_answers a on a.QuestionId = rq.QuestionId
+  left join cte_q_votes qv on qv.QuestionId = rq.QuestionId
+  left join cte_comment_activity ca on ca.QuestionId = rq.QuestionId
+  left join cte_edit_churn ec on ec.QuestionId = rq.QuestionId
+  left join cte_links l on l.QuestionId = rq.QuestionId
+  left join cte_tag_stats ts on ts.QuestionId = rq.QuestionId
+  left join cte_owner ow on ow.OwnerUserId = rq.OwnerUserId
+  left join cte_quality_flags tf on tf.QuestionId = rq.QuestionId
+  left join cte_time_bins tb on tb.QuestionId = rq.QuestionId
+),
+cte_scored as (
+  select w.*,
+         cast(
+           0.40 * coalesce(NULLIF(w.Score,0), 0) +
+           0.25 * ln(1 + greatest(w.ViewCount,0)) +
+           0.10 * coalesce(w.AnswersTotal,0) +
+           0.05 * coalesce(w.QFavorites,0) +
+           0.05 * coalesce(w.TagPopularitySum,0) / greatest(w.TagCount,1) +
+           0.05 * greatest(0, 1000 - coalesce(w.OwnerReputation,0)) / 1000.0 +
+           0.10 * least(10, coalesce(w.CommentCount,0))
+         as numeric(18,6)) as EngagementScore,
+         cast(
+           0.50 * (coalesce(w.QUpVotes,0) - coalesce(w.QDownVotes,0)) +
+           0.20 * coalesce(w.AvgAnswerScore,0) +
+           0.15 * case when w.IsDuplicate then -5 else 0 end +
+           0.10 * case when w.HasCloseVotes then -3 else 0 end +
+           0.05 * least(10, coalesce(w.EditEvents,0))
+         as numeric(18,6)) as QualityScore
+  from cte_windowed w
+),
+cte_final_rank as (
+  select s.*,
+         cast((0.6 * s.EngagementScore + 0.4 * s.QualityScore) as numeric(18,6)) as CompositeScore,
+         dense_rank() over (partition by s.month_bin order by (0.6 * s.EngagementScore + 0.4 * s.QualityScore) desc) as RankInMonthComposite,
+         dense_rank() over (order by (0.6 * s.EngagementScore + 0.4 * s.QualityScore) desc) as RankGlobalComposite
+  from cte_scored s
+)
+select
+  f.QuestionId,
+  f.CreationDate,
+  f.Score,
+  f.ViewCount,
+  f.AnswerCount,
+  f.AnswersTotal,
+  f.AvgAnswerScore,
+  f.MaxAnswerScore,
+  f.QUpVotes,
+  f.QDownVotes,
+  f.QFavorites,
+  f.QBountyFlow,
+  f.CommentCount,
+  f.LastCommentDate,
+  f.AvgCommentScore,
+  f.EditEvents,
+  f.CloseVotesEvents,
+  f.UndeleteReopenEvents,
+  f.LastHistoryEvent,
+  f.LinkedCount,
+  f.DuplicateCount,
+  f.RelatedDistinct,
+  f.TagCount,
+  f.TagPopularitySum,
+  f.AvgTagPopularity,
+  f.MaxTagPopularity,
+  f.ModeratorOnlyTags,
+  f.RequiredTags,
+  f.OwnerReputation,
+  f.OwnerProfileViews,
+  f.OwnerUpVotes,
+  f.OwnerDownVotes,
+  f.AccountAgeYears,
+  f.IsHotish,
+  f.IsControversial,
+  f.IsDuplicate,
+  f.HasCloseVotes,
+  f.UsesModOnlyTags,
+  f.week_bin,
+  f.month_bin,
+  f.RankInWeekByScore,
+  f.PctRankViewsInMonth,
+  f.MonthTotalUpvotes,
+  f.MonthTotalDownvotes,
+  f.WeekAvgAnswerScore,
+  f.EngagementScore,
+  f.QualityScore,
+  f.CompositeScore,
+  f.RankInMonthComposite,
+  f.RankGlobalComposite
+from cte_final_rank f
+where f.RankGlobalComposite <= 500
+order by f.CompositeScore desc, f.Score desc NULLS LAST, f.ViewCount desc NULLS LAST;

@@ -1,0 +1,150 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(p.Score) AS PostScore,
+        SUM(p.ViewCount) AS TotalViews,
+        SUM(u.UpVotes) AS TotalUpVotes,
+        SUM(u.DownVotes) AS TotalDownVotes
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TopActiveUsers AS (
+    SELECT
+        UserId,
+        DisplayName,
+        TotalPosts,
+        TotalComments,
+        TotalBadges,
+        PostScore,
+        TotalViews,
+        TotalUpVotes,
+        TotalDownVotes,
+        RANK() OVER (ORDER BY (COALESCE(TotalPosts,0) + COALESCE(TotalComments,0) + COALESCE(TotalBadges,0)) DESC) AS ActivityRank
+    FROM UserActivity
+    WHERE COALESCE(TotalPosts,0) > 10 AND COALESCE(TotalComments,0) > 20
+    LIMIT 100
+),
+-- replace regexp_split_to_table with a standard SQL approach using recursive CTE to split tags like "<tag1><tag2>"
+TagParts AS (
+    SELECT
+        p.Id AS PostId,
+        LOWER(p.Tags) AS Tags,
+        1 AS start_pos,
+        NULL::text AS tag,
+        substring(LOWER(p.Tags) FROM 2 FOR char_length(p.Tags)-2) AS inner_tags
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+TagSplit AS (
+    SELECT
+        PostId,
+        CASE
+            WHEN inner_tags = '' THEN NULL
+            ELSE
+                CASE
+                    WHEN position('><' IN inner_tags) = 0 THEN inner_tags
+                    ELSE substring(inner_tags FROM 1 FOR position('><' IN inner_tags)-1)
+                END
+        END AS tag,
+        CASE
+            WHEN position('><' IN inner_tags) = 0 THEN ''
+            ELSE substring(inner_tags FROM position('><' IN inner_tags)+2)
+        END AS rest
+    FROM TagParts
+    WHERE inner_tags IS NOT NULL
+    UNION ALL
+    SELECT
+        PostId,
+        CASE
+            WHEN rest = '' THEN NULL
+            ELSE
+                CASE
+                    WHEN position('><' IN rest) = 0 THEN rest
+                    ELSE substring(rest FROM 1 FOR position('><' IN rest)-1)
+                END
+        END AS tag,
+        CASE
+            WHEN position('><' IN rest) = 0 THEN ''
+            ELSE substring(rest FROM position('><' IN rest)+2)
+        END AS rest
+    FROM TagSplit
+    WHERE rest IS NOT NULL AND rest <> ''
+),
+TagPopularity AS (
+    SELECT
+        tag AS TagName,
+        COUNT(DISTINCT p.Id) AS QuestionsWithTag
+    FROM Posts p
+    JOIN (
+        SELECT PostId, tag FROM TagSplit WHERE tag IS NOT NULL
+    ) s ON s.PostId = p.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY tag
+    ORDER BY COUNT(DISTINCT p.Id) DESC
+    LIMIT 50
+),
+HotQuestionsTags AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        array_agg(DISTINCT s.tag) FILTER (WHERE s.tag IS NOT NULL) AS Tags
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId, tag FROM TagSplit WHERE tag IS NOT NULL
+    ) s ON s.PostId = p.Id
+    WHERE p.PostTypeId = 1 AND p.ViewCount > 1000 AND p.Score > 5
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate, p.OwnerUserId
+    ORDER BY p.ViewCount DESC
+    LIMIT 100
+),
+HotQuestions AS (
+    SELECT
+        Id,
+        Title,
+        Score,
+        ViewCount,
+        CreationDate,
+        OwnerUserId,
+        COALESCE(Tags, ARRAY[]::text[]) AS Tags
+    FROM HotQuestionsTags
+)
+SELECT
+    tau.UserId,
+    tau.DisplayName,
+    tau.TotalPosts,
+    tau.TotalComments,
+    tau.TotalBadges,
+    tau.PostScore,
+    tau.TotalViews,
+    tau.TotalUpVotes,
+    tau.TotalDownVotes,
+    tau.ActivityRank,
+    COUNT(DISTINCT hq.Id) AS HotQuestionsCount,
+    COALESCE(array_agg(DISTINCT tpop.TagName) FILTER (WHERE tpop.TagName IS NOT NULL), ARRAY[]::text[]) AS PopularTagsWorkedWith
+FROM TopActiveUsers tau
+LEFT JOIN HotQuestions hq ON hq.OwnerUserId = tau.UserId
+LEFT JOIN LATERAL (
+    SELECT t.TagName
+    FROM TagPopularity t
+    WHERE hq.Tags IS NOT NULL AND EXISTS (
+        SELECT 1 FROM unnest(hq.Tags) AS x(tag) WHERE x.tag = t.TagName
+    )
+) tpop ON TRUE
+GROUP BY
+    tau.UserId, tau.DisplayName, tau.TotalPosts, tau.TotalComments, tau.TotalBadges,
+    tau.PostScore, tau.TotalViews, tau.TotalUpVotes, tau.TotalDownVotes, tau.ActivityRank
+ORDER BY
+    tau.ActivityRank ASC,
+    HotQuestionsCount DESC
+LIMIT 20;

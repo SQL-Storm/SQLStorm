@@ -1,0 +1,80 @@
+WITH
+  HighlyActiveUsers AS (
+    SELECT
+      "UserId"
+    FROM
+      Posts
+    WHERE
+      "CreationDate" >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    GROUP BY
+      "UserId"
+    HAVING
+      COUNT("Id") > 1000
+  ),
+  PopularQuestions AS (
+    SELECT
+      "Id",
+      "OwnerUserId",
+      "Title",
+      "Score",
+      "AnswerCount",
+      "ViewCount",
+      "FavoriteCount",
+      "CreationDate"
+    FROM
+      Posts
+    WHERE
+      "PostTypeId" = 1
+      AND "CreationDate" >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+  )
+SELECT
+  pq."Title",
+  u."DisplayName" AS "OwnerDisplayName",
+  pq."Score",
+  pq."AnswerCount",
+  pq."ViewCount",
+  pq."FavoriteCount",
+  pq."CreationDate",
+  (
+    SELECT
+      COUNT(*)
+    FROM
+      Comments c
+    WHERE
+      c."PostId" = pq."Id"
+  ) AS "CommentCount",
+  (
+    SELECT
+      AVG(CAST(LENGTH(c2."Text") AS NUMERIC))
+    FROM
+      Comments c2
+    WHERE
+      c2."PostId" = pq."Id"
+  ) AS "AverageCommentLength",
+  (
+    SELECT
+      COUNT(*)
+    FROM
+      PostLinks pl
+    WHERE
+      pl."PostId" = pq."Id" AND pl."LinkTypeId" = 3
+  ) AS "DuplicateLinks",
+  (
+    SELECT
+      COUNT(*)
+    FROM
+      PostHistory ph
+    WHERE
+      ph."PostId" = pq."Id" AND ph."PostHistoryTypeId" IN (4, 6)
+  ) AS "EditHistoryCount",
+  CASE WHEN pq."OwnerUserId" IN (SELECT "UserId" FROM HighlyActiveUsers) THEN TRUE ELSE FALSE END AS "IsHighlyActiveOwner"
+FROM
+  PopularQuestions pq
+JOIN
+  Users u ON pq."OwnerUserId" = u."Id"
+WHERE
+  pq."Score" > 100
+ORDER BY
+  pq."Score" DESC,
+  pq."ViewCount" DESC
+LIMIT 100;

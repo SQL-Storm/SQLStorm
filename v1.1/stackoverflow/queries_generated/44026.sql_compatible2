@@ -1,0 +1,110 @@
+WITH cte AS (
+    SELECT 
+        p.Id, 
+        p.PostTypeId, 
+        p.Title, 
+        p.Tags, 
+        p.OwnerUserId, 
+        u.Reputation, 
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN p.AnswerCount 
+            ELSE 0 
+        END AS AnswerCount,
+        CASE
+            WHEN p.PostTypeId = 1 THEN p.FavoriteCount
+            ELSE 0
+        END AS FavoriteCount,
+        p.CommentCount,
+        p.ViewCount,
+        p.Score,
+        p.CreationDate AS PostCreationDate,
+        p.LastEditDate,
+        p.LastActivityDate,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN p.ClosedDate
+            ELSE CAST('2099-01-01' AS DATE)
+        END AS ClosedDate,
+        CASE
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN p.CommunityOwnedDate
+            ELSE CAST('2099-01-01' AS DATE)
+        END AS CommunityOwnedDate,
+        COALESCE(b.Name, '') AS Badge,
+        COALESCE(b.Class, 0) AS BadgeClass,
+        CASE WHEN b.TagBased = TRUE THEN 1 WHEN b.TagBased = FALSE THEN 0 ELSE 0 END AS TagBasedBadge
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON p.OwnerUserId = b.UserId
+    WHERE p.PostTypeId IN (1, 2)
+)
+SELECT
+    Id,
+    PostTypeId,
+    Title,
+    Tags,
+    OwnerUserId,
+    Reputation,
+    UserCreationDate,
+    LastAccessDate,
+    AnswerCount,
+    FavoriteCount,
+    CommentCount,
+    ViewCount,
+    Score,
+    PostCreationDate,
+    LastEditDate,
+    LastActivityDate,
+    ClosedDate,
+    CommunityOwnedDate,
+    Badge,
+    BadgeClass,
+    TagBasedBadge,
+    CASE
+        WHEN AnswerCount > 0 THEN 'Answered'
+        WHEN FavoriteCount > 0 THEN 'Favorited'
+        WHEN CommentCount > 0 THEN 'Commented'
+        WHEN ViewCount > 100 THEN 'Viewed'
+        ELSE 'Other'
+    END AS PostStatus,
+    CASE 
+        WHEN ClosedDate < CAST('2099-01-01' AS DATE) THEN 'Closed'
+        WHEN CommunityOwnedDate < CAST('2099-01-01' AS DATE) THEN 'Community Owned'
+        ELSE 'Open'
+    END AS PostState,
+    -- compute day differences in a dialect-agnostic way:
+    CASE 
+      WHEN LastActivityDate IS NOT NULL AND PostCreationDate IS NOT NULL
+        THEN CAST((CAST(LastActivityDate AS DATE) - CAST(PostCreationDate AS DATE)) AS INTEGER)
+      ELSE NULL
+    END AS DaysActive,
+    CASE
+      WHEN LastAccessDate IS NOT NULL AND UserCreationDate IS NOT NULL
+        THEN CAST((CAST(LastAccessDate AS DATE) - CAST(UserCreationDate AS DATE)) AS INTEGER)
+      ELSE NULL
+    END AS UserDaysActive
+FROM cte
+GROUP BY
+    Id,
+    PostTypeId,
+    Title,
+    Tags,
+    OwnerUserId,
+    Reputation,
+    UserCreationDate,
+    LastAccessDate,
+    AnswerCount,
+    FavoriteCount,
+    CommentCount,
+    ViewCount,
+    Score,
+    PostCreationDate,
+    LastEditDate,
+    LastActivityDate,
+    ClosedDate,
+    CommunityOwnedDate,
+    Badge,
+    BadgeClass,
+    TagBasedBadge
+ORDER BY AnswerCount DESC, FavoriteCount DESC, CommentCount DESC, ViewCount DESC, Score DESC
+LIMIT 1000;

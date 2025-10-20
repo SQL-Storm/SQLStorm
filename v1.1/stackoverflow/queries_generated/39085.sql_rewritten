@@ -1,0 +1,112 @@
+-- {"query": "39085.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1972, "output_tokens": 3095} 
+WITH TopTags AS (
+    SELECT t.TagName
+      FROM Tags t
+     WHERE t.Count > 1000
+     ORDER BY t.Count DESC
+    FETCH FIRST 20 ROWS ONLY
+),
+UserStats AS (
+    SELECT
+        u.Id            AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS Questions,
+        COUNT(DISTINCT a.Id) FILTER (WHERE a.PostTypeId = 2) AS Answers,
+        COALESCE(SUM(p.Score),0) + COALESCE(SUM(a.Score),0)   AS TotalScore
+      FROM Users u
+      LEFT
+      JOIN Posts p ON p.OwnerUserId = u.Id
+      LEFT
+      JOIN Posts a ON a.OwnerUserId = u.Id
+     GROUP BY u.Id, u.DisplayName
+),
+QuestionTags AS (
+    SELECT
+        p.Id    AS PostId,
+        unnest(string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><')) AS TagName
+      FROM Posts p
+     WHERE p.PostTypeId = 1
+),
+RankedTagPosts AS (
+    SELECT
+        qt.TagName,
+        p.Id,
+        p.Title,
+        p.ViewCount,
+        p.Score,
+        p.AnswerCount,
+        cc.CommentCount,
+        cc.PositiveComments,
+        p.CreationDate,
+        u.DisplayName       AS Owner,
+        ROW_NUMBER() OVER (PARTITION BY qt.TagName ORDER BY p.ViewCount DESC, p.Score DESC) AS ViewRank,
+        RANK()        OVER (PARTITION BY qt.TagName ORDER BY p.Score DESC)      AS ScoreRank
+      FROM QuestionTags qt
+      JOIN Posts p ON p.Id = qt.PostId
+      JOIN Users u ON u.Id = p.OwnerUserId
+      CROSS JOIN LATERAL (
+          SELECT
+              COUNT(*)                          AS CommentCount,
+              SUM((c.Score > 0)::int)           AS PositiveComments
+            FROM Comments c
+           WHERE c.PostId = p.Id
+      ) cc
+     WHERE qt.TagName IN (SELECT TagName FROM TopTags)
+),
+TagAggregates AS (
+    SELECT
+        TagName,
+        COUNT(*)                         AS TotalQuestions,
+        AVG(ViewCount)                   AS AvgViews,
+        MAX(Score)                       AS MaxScore,
+        MIN(Score)                       AS MinScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY AnswerCount) AS MedianAnswers
+      FROM RankedTagPosts
+     GROUP BY TagName
+)
+SELECT
+    ta.TagName,
+    ta.TotalQuestions,
+    ta.AvgViews,
+    ta.MaxScore,
+    ta.MinScore,
+    ta.MedianAnswers,
+    jsonb_agg(
+      jsonb_build_object(
+        'PostId',            rtp.Id,
+        'Title',             rtp.Title,
+        'Views',             rtp.ViewCount,
+        'Score',             rtp.Score,
+        'Answers',           rtp.AnswerCount,
+        'Comments',          rtp.CommentCount,
+        'PositiveComments',  rtp.PositiveComments,
+        'Owner',             rtp.Owner,
+        'ViewRank',          rtp.ViewRank,
+        'ScoreRank',         rtp.ScoreRank
+      )
+      ORDER BY rtp.ViewRank
+    ) AS TopPosts,
+    us.Questions,
+    us.Answers,
+    us.TotalScore
+  FROM TagAggregates ta
+  JOIN RankedTagPosts rtp
+    ON rtp.TagName = ta.TagName
+   AND rtp.ViewRank <= 5
+  LEFT JOIN UserStats us
+    ON us.UserId = (
+         SELECT p2.OwnerUserId
+           FROM Posts p2
+          WHERE p2.Id = rtp.Id
+         )
+ GROUP BY
+    ta.TagName,
+    ta.TotalQuestions,
+    ta.AvgViews,
+    ta.MaxScore,
+    ta.MinScore,
+    ta.MedianAnswers,
+    us.Questions,
+    us.Answers,
+    us.TotalScore
+ ORDER BY ta.TotalQuestions DESC;

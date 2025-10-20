@@ -1,4 +1,4 @@
--- {"query": "3053.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 908} 
+-- {"query": "3053.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 908} 
 WITH RecentComments AS (
     SELECT c.PostId, c.Id AS CommentId, c.UserId, c.CreationDate
     FROM Comments c

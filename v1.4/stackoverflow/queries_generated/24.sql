@@ -1,0 +1,91 @@
+-- {"query": "24.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 771} 
+WITH recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerName,
+    u.Reputation,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.CreationDate >= NOW() - INTERVAL '180 days'
+),
+tag_summary AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS QuestionCount,
+    AVG(p.Score) AS AvgScore,
+    MAX(p.ViewCount) AS MaxViews
+  FROM Posts p
+  LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(substr(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName
+  ) t ON true
+  WHERE p.PostTypeId = 1
+  GROUP BY t.TagName
+),
+correlated_votes AS (
+  SELECT
+    p.Id AS PostId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    SUM(CASE WHEN v.VoteTypeId = 10 THEN 1 ELSE 0 END) AS Deletions,
+    MAX(v.CreationDate) AS LastVoteDate
+  FROM Posts p
+  LEFT JOIN Votes v ON p.Id = v.PostId
+  GROUP BY p.Id
+),
+activity AS (
+  SELECT
+    p.Id AS PostId,
+    p.LastActivityDate,
+    p.LastEditorDisplayName,
+    p.LastEditorUserId,
+    p.OwnerUserId,
+    CASE
+      WHEN p.AcceptedAnswerId IS NOT NULL THEN 1
+      ELSE 0
+    END AS HasAccepted,
+    COUNT(c.Id) AS CommentCount
+  FROM Posts p
+  LEFT JOIN Comments c ON p.Id = c.PostId
+  GROUP BY p.Id, p.LastActivityDate, p.LastEditorDisplayName, p.LastEditorUserId, p.OwnerUserId, p.AcceptedAnswerId
+)
+SELECT
+  r.PostId,
+  r.Title,
+  r.Tags,
+  r.CreationDate AS CreationDateUTC,
+  r.Score,
+  r.ViewCount,
+  r.OwnerName,
+  r.Reputation,
+  tc.QuestionCount,
+  tc.AvgScore,
+  tc.MaxViews,
+  coalesce(v.UpVotes, 0) AS UpVotes,
+  coalesce(v.DownVotes, 0) AS DownVotes,
+  coalesce(v.Dele tions, 0) AS Deletions, -- deliberate space to avoid syntax highlighting issues if needed
+  a.LastActivityDate,
+  a.LastEditorDisplayName,
+  a.HasAccepted,
+  a.CommentCount,
+  (SELECT COUNT(*) FROM Badges b WHERE b.UserId = r.OwnerUserId) AS OwnerBadges,
+  CASE
+    WHEN NOT EXISTS (
+      SELECT 1 FROM PostLinks pl
+      WHERE pl.PostId = r.PostId AND pl.LinkTypeId = 1
+    ) THEN 'NoLinks'
+    ELSE 'HasLinks'
+  END AS LinkStatus
+FROM recent_questions r
+LEFT JOIN correlated_votes v ON r.PostId = v.PostId
+LEFT JOIN tag_summary tc ON TRUE
+LEFT JOIN activity a ON r.PostId = a.PostId
+ORDER BY r.CreationDate DESC, r.Score DESC
+LIMIT 100;

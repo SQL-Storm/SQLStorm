@@ -1,0 +1,110 @@
+-- {"query": "213.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 8869} 
+WITH
+PostsBase AS (
+  SELECT p.Id AS PostId,
+         p.Title,
+         p.OwnerUserId,
+         u.DisplayName AS Owner,
+         p.CreationDate,
+         p.LastActivityDate,
+         p.Score,
+         p.ViewCount,
+         p.Tags,
+         p.AnswerCount,
+         p.CommentCount,
+         (SELECT TOP 1 c.Text FROM Comments c WHERE c.PostId = p.Id ORDER BY c.CreationDate DESC) AS LatestComment,
+         ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.LastActivityDate DESC) AS UserRank
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.LastActivityDate IS NOT NULL
+),
+VotesAgg AS (
+  SELECT PostId,
+         SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+         SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+  FROM Votes
+  GROUP BY PostId
+),
+Dups AS (
+  SELECT p.Id AS PostId,
+         CASE WHEN COUNT(l.RelatedPostId) > 0 THEN 1 ELSE 0 END AS HasDuplicate
+  FROM Posts p
+  LEFT JOIN PostLinks l ON l.PostId = p.Id AND l.LinkTypeId = 3
+  GROUP BY p.Id
+),
+P AS (
+  SELECT b.PostId,
+         b.Title,
+         b.Owner,
+         b.CreationDate,
+         b.LastActivityDate,
+         COALESCE(v.UpVotes,0) AS UpVotes,
+         COALESCE(v.DownVotes,0) AS DownVotes,
+         b.Score,
+         b.ViewCount,
+         b.AnswerCount,
+         b.CommentCount,
+         b.LatestComment,
+         b.UserRank,
+         COALESCE(d.HasDuplicate,0) AS HasDuplicate
+  FROM PostsBase b
+  LEFT JOIN VotesAgg v ON b.PostId = v.PostId
+  LEFT JOIN Dups d ON b.PostId = d.PostId
+),
+Q AS (
+  SELECT p.Id AS PostId,
+         p.Title,
+         u.DisplayName AS Owner,
+         p.CreationDate,
+         p.LastActivityDate,
+         COALESCE(va.UpVotes,0) AS UpVotes,
+         COALESCE(va.DownVotes,0) AS DownVotes,
+         p.Score,
+         p.ViewCount,
+         p.AnswerCount,
+         p.CommentCount,
+         NULL AS LatestComment,
+         ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS UserRank,
+         CASE WHEN dl.RelatedPostId IS NOT NULL THEN 1 ELSE 0 END AS HasDuplicate
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN VotesAgg va ON p.Id = va.PostId
+  LEFT JOIN PostLinks dl ON p.Id = dl.PostId AND dl.LinkTypeId = 3
+  WHERE p.CreationDate >= DATEADD(year,-2, GETDATE())
+)
+SELECT
+  PostId,
+  Title,
+  Owner,
+  CreationDate,
+  LastActivityDate,
+  UpVotes,
+  DownVotes,
+  (UpVotes - DownVotes) AS NetVotes,
+  Score,
+  ViewCount,
+  AnswerCount,
+  CommentCount,
+  LatestComment,
+  UserRank,
+  HasDuplicate
+FROM P
+UNION ALL
+SELECT
+  PostId,
+  Title,
+  Owner,
+  CreationDate,
+  LastActivityDate,
+  UpVotes,
+  DownVotes,
+  (UpVotes - DownVotes) AS NetVotes,
+  Score,
+  ViewCount,
+  AnswerCount,
+  CommentCount,
+  LatestComment,
+  UserRank,
+  HasDuplicate
+FROM Q
+ORDER BY NetVotes DESC, CreationDate DESC;

@@ -1,0 +1,122 @@
+WITH RECURSIVE UserPostCounts AS (
+    SELECT 
+        U.Id AS UserId,
+        U.DisplayName,
+        COUNT(P.Id) AS PostCount,
+        COUNT(DISTINCT P.AcceptedAnswerId) AS AcceptedAnswerCount,
+        COUNT(DISTINCT C.Id) AS CommentCount,
+        SUM(P.Score) AS TotalScore,
+        ROW_NUMBER() OVER (ORDER BY COUNT(P.Id) DESC) AS PostRank
+    FROM 
+        Users U
+    LEFT JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN 
+        Comments C ON U.Id = C.UserId
+    WHERE 
+        P.PostTypeId IN (1, 2)
+    GROUP BY 
+        U.Id, U.DisplayName
+),
+TagPostCounts AS (
+    -- Parse Tags field like '<tag1><tag2>' into rows using standard SQL operations
+    ParsedTags AS (
+        SELECT
+            P.Id AS PostId,
+            TRIM(tag) AS TagText
+        FROM
+            Posts P,
+            LATERAL (
+                SELECT
+                    value AS tag
+                FROM (
+                    SELECT
+                        REGEXP_REPLACE(value, '^<|>$', '') AS value
+                    FROM
+                        UNNEST(
+                            -- split by '><' by replacing boundary then splitting on '><'
+                            STRING_TO_ARRAY(
+                                REGEXP_REPLACE(P.Tags, '^<|>$', ''), '><'
+                            )
+                        ) AS t(value)
+                ) s
+            ) pt
+    ),
+    TagCounts AS (
+        SELECT 
+            T.TagName,
+            COUNT(DISTINCT PT.PostId) AS PostCount,
+            SUM(P.Score) AS TotalScore,
+            ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT PT.PostId) DESC) AS TagRank
+        FROM 
+            Tags T
+        JOIN 
+            ParsedTags PT ON PT.TagText = T.Id::text
+        JOIN
+            Posts P ON P.Id = PT.PostId
+        WHERE 
+            P.PostTypeId IN (1, 2)
+        GROUP BY 
+            T.TagName, T.Id
+    )
+    SELECT * FROM TagCounts
+),
+PostHistoryStats AS (
+    SELECT 
+        P.Id AS PostId,
+        COUNT(DISTINCT PH.Id) AS RevisionCount,
+        MAX(PH.CreationDate) AS LastRevisionDate
+    FROM 
+        Posts P
+    JOIN 
+        PostHistory PH ON P.Id = PH.PostId
+    WHERE 
+        PH.PostHistoryTypeId IN (2, 5, 6)
+    GROUP BY 
+        P.Id
+),
+UserBadgeCounts AS (
+    SELECT 
+        U.Id AS UserId,
+        COUNT(CASE WHEN B.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN B.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM 
+        Users U
+    LEFT JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id
+)
+SELECT 
+    UPC.UserId,
+    UPC.DisplayName,
+    UPC.PostCount,
+    UPC.AcceptedAnswerCount,
+    UPC.CommentCount,
+    UPC.TotalScore,
+    UPC.PostRank,
+    TPC.TagName,
+    TPC.PostCount AS TagPostCount,
+    TPC.TotalScore AS TagTotalScore,
+    TPC.TagRank,
+    PHS.RevisionCount,
+    PHS.LastRevisionDate,
+    UBC.GoldBadges,
+    UBC.SilverBadges,
+    UBC.BronzeBadges
+FROM 
+    UserPostCounts UPC
+JOIN 
+    TagPostCounts TPC ON UPC.PostRank = TPC.TagRank
+JOIN 
+    PostHistoryStats PHS ON UPC.UserId = PHS.PostId
+JOIN 
+    UserBadgeCounts UBC ON UPC.UserId = UBC.UserId
+ORDER BY 
+    UPC.PostCount DESC, 
+    TPC.PostCount DESC, 
+    PHS.RevisionCount DESC, 
+    UBC.GoldBadges DESC, 
+    UBC.SilverBadges DESC, 
+    UBC.BronzeBadges DESC;

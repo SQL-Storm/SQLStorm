@@ -1,0 +1,101 @@
+-- {"query": "33056.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 1088} 
+WITH TagUsageStats AS (
+    SELECT 
+        t.TagName,
+        COUNT(p.Id) AS QuestionCount,
+        AVG(p.ViewCount) AS AvgViewsPerQuestion,
+        AVG(p.Score) AS AvgScorePerQuestion,
+        COUNT(DISTINCT p.OwnerUserId) AS UniqueQuestionAuthors
+    FROM Posts p
+    JOIN Unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS t(TagName)
+    WHERE p.PostTypeId = 1 AND p.OwnerUserId <> -1
+    GROUP BY t.TagName
+),
+TopTags AS (
+    SELECT 
+        TagName,
+        QuestionCount,
+        AvgViewsPerQuestion,
+        AvgScorePerQuestion,
+        UniqueQuestionAuthors
+    FROM TagUsageStats
+    ORDER BY QuestionCount DESC
+    LIMIT 10
+),
+UserVoteSummaries AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(CASE WHEN v.VoteTypeId IN (2,3) THEN 1 END) AS TotalVotesCast,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotesGiven,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotesGiven,
+        COUNT(CASE WHEN v.VoteTypeId IN (2,3) AND v.PostId IN (
+            SELECT Id FROM Posts WHERE OwnerUserId = u.Id
+        ) THEN 1 END) AS VotesOnOwnPosts,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Users u
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+RecentActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.LastAccessDate,
+        COUNT(p.Id) AS PostsCreated,
+        COUNT(c.Id) AS CommentsMade,
+        COUNT(DISTINCT v.PostId) AS UpvotedPosts,
+        COUNT(DISTINCT downV.PostId) AS DownvotedPosts
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId = 2
+    LEFT JOIN Votes downV ON u.Id = downV.UserId AND downV.VoteTypeId = 3
+    WHERE u.LastAccessDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.LastAccessDate
+),
+HotQuestions AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        a.DisplayName AS AcceptedAnswerer,
+        ARRAY_AGG(t.TagName) AS Tags,
+        p.OwnerUserId,
+        p.AnswerCount
+    FROM Posts p
+    LEFT JOIN Posts a ON p.AcceptedAnswerId = a.Id
+    LEFT JOIN Unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS t(TagName)
+    WHERE p.PostTypeId = 1 AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+    GROUP BY p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, a.DisplayName, p.OwnerUserId, p.AnswerCount
+),
+UserQuestionEngagement AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) AS QuestionsAsked,
+        COUNT(DISTINCT c.CommentId) AS CommentsMadeOnQuestions,
+        AVG(p.Score) AS AvgScorePerQuestion,
+        AVG(p.ViewCount) AS AvgViewsPerQuestion
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT 
+    -- Top Tags by question count
+    (SELECT json_agg(row(Tags.TagName, Tags.QuestionCount, Tags.AvgViewsPerQuestion, Tags.AvgScorePerQuestion, Tags.UniqueQuestionAuthors))
+     FROM TopTags AS Tags) AS TopTagsStats,
+    -- User voting activity summary
+    (SELECT json_agg(row(uv.UserId, uv.DisplayName, uv.TotalVotesCast, uv.UpVotesGiven, uv.DownVotesGiven, uv.VotesOnOwnPosts, uv.LastVoteDate))
+     FROM UserVoteSummaries AS uv) AS UserVotingSummary,
+    -- Recent active users
+    (SELECT json_agg(row(ru.UserId, ru.DisplayName, ru.Reputation, ru.LastAccessDate, ru.PostsCreated, ru.CommentsMade, ru.UpvotedPosts, ru.DownvotedPosts))
+     FROM RecentActiveUsers AS ru) AS RecentActiveUsers,
+    -- Hot Questions in last 30 days
+    (SELECT json_agg(row(QuestionId, Title, CreationDate, Score, ViewCount, AcceptedAnswerer, Tags, OwnerUserId, AnswerCount))
+     FROM HotQuestions) AS HotQuestions
+;

@@ -1,0 +1,104 @@
+-- {"query": "57064.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2291, "output_tokens": 899} 
+
+WITH ActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        COUNT(p.Id) AS PostCount,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(v.Id) AS VoteCount,
+        COUNT(b.Id) AS BadgeCount
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    WHERE
+        u.LastAccessDate > NOW() - INTERVAL '30 days'
+    GROUP BY
+        u.Id, u.Reputation
+),
+
+TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        COUNT(p.Id) AS QuestionCount,
+        AVG(p.Score) AS AvgScore,
+        AVG(p.ViewCount) AS AvgViewCount
+    FROM
+        Tags t
+    JOIN
+        Posts p ON t.Id = ANY(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), ''><''))
+    WHERE
+        p.PostTypeId = 1
+    GROUP BY
+        t.TagName, t.Count
+    ORDER BY
+        QuestionCount DESC, AvgScore DESC
+    LIMIT 10
+),
+
+HighActivityPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        u.DisplayName AS OwnerDisplayName,
+        COALESCE(a.DisplayName, 'Deleted') AS AcceptedAnswerOwner
+    FROM
+        Posts p
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN
+        Posts a ON p.AcceptedAnswerId = a.Id
+    LEFT JOIN
+        Users au ON a.OwnerUserId = au.Id
+    WHERE
+        p.PostTypeId = 1
+        AND p.CreationDate > NOW() - INTERVAL '1 year'
+        AND (p.Score > 10 OR p.ViewCount > 1000)
+    ORDER BY
+        p.Score DESC, p.ViewCount DESC
+    LIMIT 50
+)
+
+SELECT
+    au.UserId,
+    au.Reputation,
+    au.PostCount,
+    au.CommentCount,
+    au.VoteCount,
+    au.BadgeCount,
+    tt.TagName,
+    tt.QuestionCount,
+    tt.AvgScore,
+    tt.AvgViewCount,
+    hap.PostId,
+    hap.PostTypeId,
+    hap.CreationDate,
+    hap.Score,
+    hap.ViewCount,
+    hap.AnswerCount,
+    hap.CommentCount,
+    hap.FavoriteCount,
+    hap.OwnerDisplayName,
+    hap.AcceptedAnswerOwner
+FROM
+    ActiveUsers au
+CROSS JOIN
+    TopTags tt
+LEFT JOIN
+    HighActivityPosts hap ON tt.TagName = ANY(string_to_array(SUBSTRING(hap.Tags FROM 2 FOR LENGTH(hap.Tags)-2), ''><''))
+ORDER BY
+    au.Reputation DESC, tt.QuestionCount DESC, hap.Score DESC;

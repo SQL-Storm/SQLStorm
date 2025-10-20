@@ -1,0 +1,49 @@
+-- {"query": "31008.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4o-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 387} 
+
+WITH UserActivity AS (
+    SELECT 
+        U.Id AS UserId,
+        U.DisplayName,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes,
+        SUM(P.Score) AS TotalScore,
+        COUNT(DISTINCT B.Id) AS TotalBadges
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON C.UserId = U.Id
+    LEFT JOIN Votes V ON V.UserId = U.Id
+    LEFT JOIN Badges B ON B.UserId = U.Id
+    WHERE U.Reputation > 1000
+    GROUP BY U.Id
+),
+RankedActivity AS (
+    SELECT 
+        UA.UserId,
+        UA.DisplayName,
+        UA.TotalPosts,
+        UA.TotalComments,
+        UA.TotalUpVotes,
+        UA.TotalDownVotes,
+        UA.TotalScore,
+        UA.TotalBadges,
+        RANK() OVER (ORDER BY UA.TotalScore DESC) AS ActivityRank
+    FROM UserActivity UA
+)
+SELECT 
+    R.UserId,
+    R.DisplayName,
+    R.TotalPosts,
+    R.TotalComments,
+    R.TotalUpVotes,
+    R.TotalDownVotes,
+    R.TotalScore,
+    R.TotalBadges,
+    R.ActivityRank,
+    (SELECT STRING_AGG(DISTINCT PT.Name, ', ') 
+     FROM Posts P 
+     JOIN PostTypes PT ON P.PostTypeId = PT.Id 
+     WHERE P.OwnerUserId = R.UserId) AS PostTypesContributed
+FROM RankedActivity R
+WHERE R.ActivityRank <= 10;

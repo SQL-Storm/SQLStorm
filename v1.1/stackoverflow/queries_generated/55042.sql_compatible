@@ -1,0 +1,87 @@
+WITH user_stats AS (
+    SELECT 
+        u.Id,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS question_count,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS answer_count,
+        COALESCE(SUM(p.Score), 0) AS total_score,
+        MAX(p.CreationDate) AS last_post_date
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.Reputation, u.CreationDate
+),
+badge_stats AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS gold_badges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS silver_badges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS bronze_badges,
+        COUNT(*) FILTER (WHERE b.TagBased = TRUE) AS tag_based_badges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+vote_aggregates AS (
+    SELECT 
+        v.PostId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS upvotes,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS downvotes
+    FROM Votes v
+    GROUP BY v.PostId
+),
+user_vote_totals AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        SUM(v.upvotes) AS total_upvotes,
+        SUM(v.downvotes) AS total_downvotes
+    FROM Posts p
+    JOIN vote_aggregates v ON v.PostId = p.Id
+    GROUP BY p.OwnerUserId
+),
+tag_participation AS (
+    SELECT 
+        pu.OwnerUserId AS UserId,
+        json_agg(DISTINCT trim(both '<>' FROM tag_name)) AS tags_used
+    FROM Posts pu
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(trim(both '<>' FROM pu.Tags), '><')) AS tag_name
+    ) AS t
+    GROUP BY pu.OwnerUserId
+),
+recent_activity AS (
+    SELECT 
+        u.Id,
+        GREATEST(
+            COALESCE(u.LastAccessDate, TIMESTAMP '1970-01-01'),
+            COALESCE(p.LastActivityDate, TIMESTAMP '1970-01-01'),
+            COALESCE(c.CreationDate, TIMESTAMP '1970-01-01')
+        ) AS last_activity_timestamp
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id, u.LastAccessDate, p.LastActivityDate, c.CreationDate
+)
+SELECT 
+    us.Id,
+    us.Reputation,
+    us.question_count,
+    us.answer_count,
+    us.total_score,
+    us.last_post_date,
+    bs.gold_badges,
+    bs.silver_badges,
+    bs.bronze_badges,
+    bs.tag_based_badges,
+    uvt.total_upvotes,
+    uvt.total_downvotes,
+    tp.tags_used,
+    ra.last_activity_timestamp,
+    ROW_NUMBER() OVER (ORDER BY us.Reputation DESC, us.total_score DESC) AS rank_by_reputation_score
+FROM user_stats us
+LEFT JOIN badge_stats bs          ON bs.UserId = us.Id
+LEFT JOIN user_vote_totals uvt   ON uvt.UserId = us.Id
+LEFT JOIN tag_participation tp   ON tp.UserId = us.Id
+LEFT JOIN recent_activity ra     ON ra.Id = us.Id
+WHERE us.Reputation > 1000
+ORDER BY rank_by_reputation_score
+LIMIT 100;

@@ -1,0 +1,51 @@
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.OwnerUserId AS OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        u.Reputation AS OwnerReputation,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.CreationDate DESC) AS RankByScore,
+        ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) AS RankByDate
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+      AND p.ClosedDate IS NULL
+      AND p.DeletionDate IS NULL
+),
+RecentComments AS (
+    SELECT
+        c.PostId,
+        COUNT(c.Id) AS CommentCountInLastDay
+    FROM Comments c
+    WHERE c.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 day')
+    GROUP BY c.PostId
+),
+HighReputationUsers AS (
+    SELECT
+        Id,
+        DisplayName,
+        Reputation
+    FROM Users
+    WHERE Reputation > 100000
+)
+SELECT
+    rp.PostId,
+    rp.Title,
+    rp.PostCreationDate,
+    rp.PostScore,
+    rp.OwnerUserId,
+    rp.OwnerDisplayName,
+    rp.OwnerReputation,
+    rc.CommentCountInLastDay,
+    CASE
+        WHEN hru.Id IS NOT NULL THEN 'High Reputation User'
+        ELSE 'Regular User'
+    END AS OwnerStatus
+FROM RankedPosts rp
+LEFT JOIN RecentComments rc ON rp.PostId = rc.PostId
+LEFT JOIN HighReputationUsers hru ON rp.OwnerUserId = hru.Id
+WHERE rp.RankByScore <= 100 OR rp.RankByDate <= 50
+ORDER BY rp.PostScore DESC, rp.PostCreationDate DESC;

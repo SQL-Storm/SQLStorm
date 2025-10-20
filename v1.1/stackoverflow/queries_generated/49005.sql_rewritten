@@ -1,0 +1,184 @@
+-- {"query": "49005.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 2269} 
+WITH UserQuestionStats AS (
+    SELECT
+        OwnerUserId AS UserId,
+        COUNT(Id) AS QuestionsAsked,
+        SUM(Score) AS TotalQuestionScore
+    FROM Posts
+    WHERE PostTypeId = 1
+    GROUP BY OwnerUserId
+),
+UserAnswerStats AS (
+    SELECT
+        OwnerUserId AS UserId,
+        COUNT(Id) AS AnswersProvided,
+        SUM(Score) AS TotalAnswerScore
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY OwnerUserId
+),
+UserCommentStats AS (
+    SELECT
+        UserId,
+        SUM(Score) AS TotalCommentScore
+    FROM Comments
+    GROUP BY UserId
+),
+UserBadgeStats AS (
+    SELECT
+        UserId,
+        COUNT(Id) AS TotalBadges,
+        COUNT(CASE WHEN Class = 1 AND TagBased = TRUE THEN 1 ELSE NULL END) AS GoldTagBadges,
+        COUNT(CASE WHEN Class = 2 AND TagBased = TRUE THEN 1 ELSE NULL END) AS SilverTagBadges
+    FROM Badges
+    GROUP BY UserId
+),
+UserPostHistoryStats AS (
+    SELECT
+        UserId,
+        COUNT(Id) AS TotalPostHistoryEntries,
+        SUM(CASE WHEN PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditsCount -- Edit Title, Body, Tags
+    FROM PostHistory
+    GROUP BY UserId
+),
+UserReceivedVotesStats AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalReceivedUpvotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalReceivedDownvotes
+    FROM Votes AS V
+    JOIN Posts AS P ON V.PostId = P.Id
+    WHERE V.VoteTypeId IN (2, 3) AND P.OwnerUserId IS NOT NULL
+    GROUP BY P.OwnerUserId
+),
+UserAcceptedAnswerCountCorrected AS (
+    -- This CTE specifically counts how many of a user's answers were accepted
+    SELECT
+        A.OwnerUserId AS UserId,
+        COUNT(A.Id) AS AcceptedAnswersGiven
+    FROM Posts AS A -- Answers
+    JOIN Posts AS Q ON Q.AcceptedAnswerId = A.Id -- Questions where A is the accepted answer
+    WHERE A.PostTypeId = 2 AND Q.PostTypeId = 1
+    GROUP BY A.OwnerUserId
+),
+UserContributionMetrics AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COALESCE(UQS.QuestionsAsked, 0) AS QuestionsAsked,
+        COALESCE(UAS.AnswersProvided, 0) AS AnswersProvided,
+        COALESCE(UAAC.AcceptedAnswersGiven, 0) AS AcceptedAnswersCount,
+        COALESCE(UQS.TotalQuestionScore, 0) AS TotalQuestionScore,
+        COALESCE(UAS.TotalAnswerScore, 0) AS TotalAnswerScore,
+        COALESCE(UCS.TotalCommentScore, 0) AS TotalCommentScore,
+        COALESCE(UBS.TotalBadges, 0) AS TotalBadges,
+        COALESCE(UBS.GoldTagBadges, 0) AS GoldTagBadges,
+        COALESCE(UBS.SilverTagBadges, 0) AS SilverTagBadges,
+        COALESCE(UPHS.TotalPostHistoryEntries, 0) AS TotalPostHistoryEntries,
+        COALESCE(UPHS.EditsCount, 0) AS EditsCount,
+        COALESCE(URVS.TotalReceivedUpvotes, 0) AS TotalReceivedUpvotes,
+        COALESCE(URVS.TotalReceivedDownvotes, 0) AS TotalReceivedDownvotes
+    FROM Users AS U
+    LEFT JOIN UserQuestionStats AS UQS ON U.Id = UQS.UserId
+    LEFT JOIN UserAnswerStats AS UAS ON U.Id = UAS.UserId
+    LEFT JOIN UserCommentStats AS UCS ON U.Id = UCS.UserId
+    LEFT JOIN UserBadgeStats AS UBS ON U.Id = UBS.UserId
+    LEFT JOIN UserPostHistoryStats AS UPHS ON U.Id = UPHS.UserId
+    LEFT JOIN UserReceivedVotesStats AS URVS ON U.Id = URVS.UserId
+    LEFT JOIN UserAcceptedAnswerCountCorrected AS UAAC ON U.Id = UAAC.UserId
+),
+QuestionTagPerformance AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.Score AS QuestionScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.AcceptedAnswerId AS QuestionAcceptedAnswerId,
+        TagArray.TagName,
+        T.Count AS TagPopularity
+    FROM Posts AS P
+    JOIN LATERAL UNNEST(string_to_array(substring(P.Tags, 2, length(P.Tags)-2), '><')) AS TagArray(TagName) ON TRUE
+    JOIN Tags AS T ON TagArray.TagName = T.TagName
+    WHERE P.PostTypeId = 1
+      AND P.CreationDate >= '2020-01-01'
+      AND P.ViewCount > 1000
+      AND P.Score > 10
+),
+RankedTagContributions AS (
+    SELECT
+        QTP.OwnerUserId AS UserId,
+        QTP.TagName,
+        COUNT(DISTINCT QTP.PostId) AS QuestionsInTag,
+        SUM(QTP.QuestionScore) AS TotalScoreInTag,
+        SUM(QTP.ViewCount) AS TotalViewsInTag,
+        AVG(QTP.TagPopularity) AS AvgTagPopularity,
+        SUM(CASE WHEN A.Id = QTP.QuestionAcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedAnswersInTagQuestions,
+        ROW_NUMBER() OVER (PARTITION BY QTP.OwnerUserId ORDER BY SUM(QTP.QuestionScore) DESC, COUNT(DISTINCT QTP.PostId) DESC) AS TagRankForUser
+    FROM QuestionTagPerformance AS QTP
+    LEFT JOIN Posts AS A ON A.ParentId = QTP.PostId AND A.PostTypeId = 2
+    GROUP BY QTP.OwnerUserId, QTP.TagName
+),
+ElaborateUserScore AS (
+    SELECT
+        UCM.UserId,
+        UCM.DisplayName,
+        UCM.Reputation,
+        UCM.QuestionsAsked,
+        UCM.AnswersProvided,
+        UCM.AcceptedAnswersCount,
+        UCM.TotalQuestionScore,
+        UCM.TotalAnswerScore,
+        UCM.TotalCommentScore,
+        UCM.TotalBadges,
+        UCM.GoldTagBadges,
+        UCM.SilverTagBadges,
+        UCM.EditsCount,
+        UCM.TotalReceivedUpvotes,
+        UCM.TotalReceivedDownvotes,
+        SUM(RTC.QuestionsInTag) AS ContributedQuestionsInPopularTags,
+        SUM(RTC.TotalScoreInTag) AS ScoreInPopularTags,
+        SUM(RTC.TotalViewsInTag) AS ViewsInPopularTags,
+        AVG(RTC.AvgTagPopularity) AS OverallAvgTagPopularity,
+        SUM(RTC.AcceptedAnswersInPopularTags) AS AcceptedAnswersInPopularTags,
+        -- Complex scoring metric combining various factors
+        (UCM.Reputation / 1000.0) * 0.3 +
+        (UCM.QuestionsAsked + UCM.AnswersProvided) * 0.1 +
+        (UCM.AcceptedAnswersCount * 2.0) * 0.2 +
+        (COALESCE(UCM.TotalQuestionScore, 0) + COALESCE(UCM.TotalAnswerScore, 0)) * 0.05 +
+        (UCM.GoldTagBadges * 5.0 + UCM.SilverTagBadges * 2.0) * 0.15 +
+        (UCM.EditsCount * 0.01) * 0.05 +
+        (COALESCE(UCM.TotalReceivedUpvotes, 0) - COALESCE(UCM.TotalReceivedDownvotes, 0)) * 0.02 +
+        COALESCE(SUM(RTC.ScoreInPopularTags) * 0.03, 0) +
+        COALESCE(SUM(RTC.AcceptedAnswersInPopularTags) * 0.5, 0) AS CompositeScore
+    FROM UserContributionMetrics AS UCM
+    LEFT JOIN RankedTagContributions AS RTC ON UCM.UserId = RTC.UserId
+    GROUP BY
+        UCM.UserId, UCM.DisplayName, UCM.Reputation, UCM.QuestionsAsked, UCM.AnswersProvided,
+        UCM.AcceptedAnswersCount, UCM.TotalQuestionScore, UCM.TotalAnswerScore, UCM.TotalCommentScore,
+        UCM.TotalBadges, UCM.GoldTagBadges, UCM.SilverTagBadges, UCM.EditsCount,
+        UCM.TotalReceivedUpvotes, UCM.TotalReceivedDownvotes
+)
+SELECT
+    EUS.UserId,
+    EUS.DisplayName,
+    EUS.Reputation,
+    EUS.CompositeScore,
+    EUS.QuestionsAsked,
+    EUS.AnswersProvided,
+    EUS.AcceptedAnswersCount,
+    EUS.GoldTagBadges,
+    EUS.SilverTagBadges,
+    EUS.EditsCount,
+    EUS.ContributedQuestionsInPopularTags,
+    EUS.ScoreInPopularTags,
+    EUS.ViewsInPopularTags,
+    EUS.OverallAvgTagPopularity,
+    DENSE_RANK() OVER (ORDER BY EUS.CompositeScore DESC, EUS.Reputation DESC) AS OverallRank
+FROM ElaborateUserScore AS EUS
+WHERE EUS.Reputation > 5000
+  AND EUS.CompositeScore IS NOT NULL
+ORDER BY OverallRank
+LIMIT 100;

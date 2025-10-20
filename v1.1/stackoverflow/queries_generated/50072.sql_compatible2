@@ -1,0 +1,102 @@
+WITH PopularTags AS (
+  SELECT TagName
+  FROM Tags
+  ORDER BY Count DESC
+  LIMIT 5
+), AnswerStats AS (
+  SELECT
+    a.OwnerUserId,
+    SUM(a.Score) AS TotalAnswerScore,
+    COUNT(q.AcceptedAnswerId) FILTER (WHERE q.AcceptedAnswerId = a.Id) AS AcceptedAnswerCount,
+    AVG(EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))) AS AvgTimeToAnswerSeconds
+  FROM Posts a
+  JOIN Posts q ON a.ParentId = q.Id
+  WHERE a.PostTypeId = 2
+    AND q.PostTypeId = 1
+    AND a.OwnerUserId IS NOT NULL
+    AND EXISTS (
+      SELECT 1
+      FROM UNNEST(string_to_array(substring(q.Tags FROM 2 FOR (length(q.Tags) - 2)), '><')) AS t(tag)
+      WHERE t.tag IN (SELECT TagName FROM PopularTags)
+    )
+  GROUP BY a.OwnerUserId
+), UserBadges AS (
+  SELECT
+    UserId,
+    COUNT(*) FILTER (WHERE Class = 1) AS GoldBadges,
+    COUNT(*) FILTER (WHERE Class = 2) AS SilverBadges
+  FROM Badges
+  GROUP BY UserId
+), CommentContributions AS (
+  SELECT
+    c.UserId,
+    SUM(c.Score) AS TotalCommentScore
+  FROM Comments c
+  JOIN Posts p ON c.PostId = p.Id
+  WHERE c.UserId IS NOT NULL AND c.Score > 0
+    AND EXISTS (
+      SELECT 1
+      FROM Posts q
+      WHERE (p.Id = q.Id OR p.ParentId = q.Id)
+        AND q.PostTypeId = 1
+        AND EXISTS (
+          SELECT 1
+          FROM UNNEST(string_to_array(substring(q.Tags FROM 2 FOR (length(q.Tags) - 2)), '><')) AS t(tag)
+          WHERE t.tag IN (SELECT TagName FROM PopularTags)
+        )
+    )
+  GROUP BY c.UserId
+), CombinedScores AS (
+  SELECT
+    COALESCE(ans.OwnerUserId, b.UserId, com.UserId) AS UserId,
+    (
+      (COALESCE(ans.TotalAnswerScore, 0) * 1.5) +
+      (COALESCE(ans.AcceptedAnswerCount, 0) * 25) +
+      (COALESCE(b.GoldBadges, 0) * 100) +
+      (COALESCE(b.SilverBadges, 0) * 40) +
+      (COALESCE(com.TotalCommentScore, 0) * 0.5) -
+      (COALESCE(ans.AvgTimeToAnswerSeconds, 0) / 86400.0)
+    ) AS PowerScore
+  FROM AnswerStats ans
+  FULL OUTER JOIN UserBadges b ON ans.OwnerUserId = b.UserId
+  FULL OUTER JOIN CommentContributions com ON COALESCE(ans.OwnerUserId, b.UserId) = com.UserId
+), RankedUsers AS (
+  SELECT
+    UserId,
+    PowerScore,
+    RANK() OVER (ORDER BY PowerScore DESC) AS UserRank
+  FROM CombinedScores
+  WHERE UserId IS NOT NULL
+)
+SELECT
+  ru.UserRank,
+  u.DisplayName,
+  u.Reputation,
+  CAST(ru.PowerScore AS numeric(10, 2)) AS PowerScore,
+  u.CreationDate AS MemberSince,
+  ans.TotalAnswerScore,
+  ans.AcceptedAnswerCount,
+  b.GoldBadges,
+  b.SilverBadges,
+  com.TotalCommentScore,
+  TO_CHAR((ans.AvgTimeToAnswerSeconds * INTERVAL '1 second'), 'DD"d" HH24"h" MI"m"') AS AvgResponseTime
+FROM RankedUsers ru
+JOIN Users u ON ru.UserId = u.Id
+LEFT JOIN AnswerStats ans ON ru.UserId = ans.OwnerUserId
+LEFT JOIN UserBadges b ON ru.UserId = b.UserId
+LEFT JOIN CommentContributions com ON ru.UserId = com.UserId
+WHERE ru.UserRank <= 100 AND u.Reputation > 1000
+GROUP BY
+  ru.UserRank,
+  u.DisplayName,
+  u.Reputation,
+  ru.PowerScore,
+  u.CreationDate,
+  ans.TotalAnswerScore,
+  ans.AcceptedAnswerCount,
+  b.GoldBadges,
+  b.SilverBadges,
+  com.TotalCommentScore,
+  ans.AvgTimeToAnswerSeconds,
+  ru.UserId
+ORDER BY ru.UserRank, u.Reputation DESC;

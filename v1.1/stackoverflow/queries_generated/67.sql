@@ -1,4 +1,4 @@
--- {"query": "67.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-3.5-turbo", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2003, "output_tokens": 119} 
+-- {"query": "67.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-3.5-turbo", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2003, "output_tokens": 119} 
 WITH ranked_users AS (
     SELECT id, reputation, displayname, row_number() OVER (ORDER BY reputation DESC) AS rank
     FROM users

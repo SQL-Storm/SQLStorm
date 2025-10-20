@@ -1,0 +1,196 @@
+-- {"query": "38003.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 2119} 
+with recent_users as (
+  select u.id as user_id, u.displayname, u.reputation, u.creationdate
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+active_questions as (
+  select p.id as question_id, p.owneruserid, p.creationdate, p.score, p.viewcount, p.answercount, p.tags, p.title
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= (select max(creationdate) - interval '365 days' from posts where posttypeid = 1)
+),
+answers as (
+  select a.id as answer_id, a.parentid as question_id, a.owneruserid as answerer_id, a.creationdate, a.score
+  from posts a
+  where a.posttypeid = 2
+),
+comments as (
+  select c.id as comment_id, c.postid, c.userid, c.creationdate, c.score
+  from comments c
+),
+votes_agg as (
+  select v.postid,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+         sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+         sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_start,
+         sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_close,
+         count(*) as total_votes,
+         min(v.creationdate) as first_vote_at,
+         max(v.creationdate) as last_vote_at
+  from votes v
+  group by v.postid
+),
+comment_agg as (
+  select c.postid,
+         count(*) as comment_count,
+         sum(case when c.score > 0 then 1 else 0 end) as positive_comments,
+         max(c.creationdate) as last_comment_at
+  from comments c
+  group by c.postid
+),
+badge_agg as (
+  select b.userid,
+         sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+         sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+         sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+         count(*) as total_badges,
+         max(b.date) as last_badge_at
+  from badges b
+  group by b.userid
+),
+tag_explode as (
+  select q.question_id,
+         unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')) as tag
+  from active_questions q
+  where q.tags is not null and q.tags like '<%>'
+),
+tag_rank as (
+  select te.tag,
+         count(*) as tag_usage,
+         percentile_cont(0.5) within group (order by aq.score) as tag_median_score
+  from tag_explode te
+  join active_questions aq on aq.question_id = te.question_id
+  group by te.tag
+),
+dup_links as (
+  select pl.postid as question_id,
+         count(*) filter (where pl.linktypeid = 3) as duplicate_links
+  from postlinks pl
+  group by pl.postid
+),
+q_history as (
+  select ph.postid as question_id,
+         sum(case when ph.posthistorytypeid in (4,5,6) then 1 else 0 end) as edit_events,
+         sum(case when ph.posthistorytypeid in (10) then 1 else 0 end) as close_votes_events,
+         sum(case when ph.posthistorytypeid in (11) then 1 else 0 end) as reopen_events,
+         max(ph.creationdate) as last_history_at
+  from posthistory ph
+  group by ph.postid
+),
+answer_stats as (
+  select a.question_id,
+         count(*) as answers_total,
+         count(*) filter (where a.score > 0) as answers_positive,
+         max(a.creationdate) as last_answer_at,
+         avg(a.score) as avg_answer_score
+  from answers a
+  group by a.question_id
+),
+owner_activity as (
+  select u.id as user_id,
+         u.reputation,
+         u.upvotes,
+         u.downvotes,
+         u.views,
+         coalesce(b.total_badges,0) as total_badges,
+         coalesce(b.gold_badges,0) as gold_badges,
+         coalesce(b.silver_badges,0) as silver_badges,
+         coalesce(b.bronze_badges,0) as bronze_badges,
+         greatest(u.lastaccessdate, coalesce(b.last_badge_at, timestamp 'epoch')) as last_user_event_at
+  from users u
+  left join badge_agg b on b.userid = u.id
+),
+question_windowed as (
+  select
+    q.question_id,
+    q.owneruserid,
+    q.creationdate,
+    q.score,
+    q.viewcount,
+    q.answercount,
+    q.title,
+    q.tags,
+    va.upvotes, va.downvotes, va.favorites, va.total_votes,
+    coalesce(va.bounty_start,0) as bounty_start,
+    coalesce(va.bounty_close,0) as bounty_close,
+    ca.comment_count, ca.positive_comments,
+    ah.answers_total, ah.answers_positive, ah.avg_answer_score,
+    dl.duplicate_links,
+    qh.edit_events, qh.close_votes_events, qh.reopen_events,
+    va.first_vote_at, va.last_vote_at, ca.last_comment_at, ah.last_answer_at, qh.last_history_at,
+    percentile_disc(0.5) within group (order by coalesce(va.upvotes,0) - coalesce(va.downvotes,0)) over () as global_vote_median,
+    rank() over (order by coalesce(va.upvotes,0) - coalesce(va.downvotes,0) desc, q.viewcount desc) as engagement_rank,
+    row_number() over (partition by date_trunc('month', q.creationdate) order by q.score desc, q.viewcount desc) as monthly_top_rank
+  from active_questions q
+  left join votes_agg va on va.postid = q.question_id
+  left join comment_agg ca on ca.postid = q.question_id
+  left join answer_stats ah on ah.question_id = q.question_id
+  left join dup_links dl on dl.question_id = q.question_id
+  left join q_history qh on qh.question_id = q.question_id
+),
+top_tags as (
+  select te.question_id,
+         array_agg(te.tag order by tr.tag_usage desc, tr.tag_median_score desc)[:5] as top5_tags
+  from tag_explode te
+  join tag_rank tr on tr.tag = te.tag
+  group by te.question_id
+),
+owner_join as (
+  select qw.*, oa.reputation as owner_reputation,
+         oa.total_badges, oa.gold_badges, oa.silver_badges, oa.bronze_badges,
+         oa.last_user_event_at
+  from question_windowed qw
+  left join owner_activity oa on oa.user_id = qw.owneruserid
+),
+scored as (
+  select
+    oj.*,
+    case
+      when oj.answers_total is null or oj.answers_total = 0 then null
+      else extract(epoch from (coalesce(oj.last_answer_at, oj.creationdate) - oj.creationdate)) / oj.answers_total
+    end as avg_secs_per_answer,
+    (coalesce(oj.upvotes,0) - coalesce(oj.downvotes,0))::float / nullif(oj.viewcount,0) as net_votes_per_view,
+    (coalesce(oj.comment_count,0) + coalesce(oj.answers_total,0)) as total_interactions,
+    (coalesce(oj.favorites,0))::float / nullif(oj.total_votes,0) as favorite_ratio,
+    case when oj.duplicate_links > 0 then 1 else 0 end as is_marked_duplicate
+  from owner_join oj
+),
+filtered as (
+  select s.*
+  from scored s
+  where s.creationdate >= (select max(creationdate) - interval '180 days' from posts where posttypeid = 1)
+    and coalesce(s.viewcount,0) > 0
+)
+select
+  f.question_id,
+  f.title,
+  f.owneruserid,
+  f.owner_reputation,
+  f.score,
+  f.viewcount,
+  f.answercount,
+  f.upvotes, f.downvotes, f.favorites, f.total_votes,
+  f.comment_count, f.positive_comments,
+  f.answers_total, f.answers_positive, round(f.avg_answer_score::numeric, 2) as avg_answer_score,
+  f.edit_events, f.close_votes_events, f.reopen_events,
+  f.duplicate_links,
+  f.engagement_rank,
+  f.monthly_top_rank,
+  round(coalesce(f.net_votes_per_view,0)::numeric, 6) as net_votes_per_view,
+  round(coalesce(f.favorite_ratio,0)::numeric, 6) as favorite_ratio,
+  f.total_interactions,
+  f.avg_secs_per_answer,
+  f.is_marked_duplicate,
+  tt.top5_tags,
+  date_trunc('month', f.creationdate) as month_bucket,
+  greatest(coalesce(f.last_vote_at, timestamp 'epoch'),
+           coalesce(f.last_comment_at, timestamp 'epoch'),
+           coalesce(f.last_answer_at, timestamp 'epoch'),
+           coalesce(f.last_history_at, timestamp 'epoch'),
+           coalesce(f.last_user_event_at, timestamp 'epoch')) as last_activity_any
+from filtered f
+left join top_tags tt on tt.question_id = f.question_id
+order by f.engagement_rank, f.question_id
+limit 500;

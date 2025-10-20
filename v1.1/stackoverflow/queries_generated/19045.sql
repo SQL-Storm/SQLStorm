@@ -1,4 +1,4 @@
--- {"query": "19045.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2618} 
+-- {"query": "19045.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2618} 
 
 WITH UserActivitySummary AS (
     -- Summarizes recent post activity for each user, including counts and aggregated scores.

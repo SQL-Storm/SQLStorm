@@ -1,0 +1,102 @@
+WITH UserStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AvgScore,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS TotalViews,
+        COUNT(b.Id) AS BadgeCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes,
+        SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedCount,
+        MAX(p.Score) AS MaxScore
+    FROM
+        Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        LEFT JOIN Badges b ON b.UserId = u.Id
+        LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY
+        u.Id, u.Reputation, u.DisplayName
+),
+TagStats AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        -- remove surrounding angle brackets from each tag
+        SUBSTRING(tag FROM 2 FOR CHAR_LENGTH(tag) - 2) AS TagName,
+        COUNT(*) AS TagCount
+    FROM
+        Posts p,
+        LATERAL (
+            SELECT TRIM(t) AS tag
+            FROM (
+                -- split tags by '><' using a recursive CTE for portability
+                WITH RECURSIVE split(tag, rest) AS (
+                    SELECT
+                        CASE
+                            WHEN POSITION('><' IN p.Tags) = 0 THEN p.Tags
+                            ELSE SUBSTR(p.Tags, 1, POSITION('><' IN p.Tags) - 1)
+                        END,
+                        CASE
+                            WHEN POSITION('><' IN p.Tags) = 0 THEN NULL
+                            ELSE SUBSTR(p.Tags, POSITION('><' IN p.Tags) + 2)
+                        END
+                    UNION ALL
+                    SELECT
+                        CASE
+                            WHEN POSITION('><' IN rest) = 0 THEN rest
+                            ELSE SUBSTR(rest, 1, POSITION('><' IN rest) - 1)
+                        END,
+                        CASE
+                            WHEN POSITION('><' IN rest) = 0 THEN NULL
+                            ELSE SUBSTR(rest, POSITION('><' IN rest) + 2)
+                        END
+                    FROM split
+                    WHERE rest IS NOT NULL
+                )
+                SELECT tag FROM split
+            ) s
+        ) t
+    WHERE
+        p.PostTypeId = 1
+        AND p.OwnerUserId IS NOT NULL
+    GROUP BY
+        p.OwnerUserId, SUBSTRING(tag FROM 2 FOR CHAR_LENGTH(tag) - 2
+)
+,
+TopTag AS (
+    SELECT
+        ts.UserId,
+        ts.TagName,
+        ts.TagCount,
+        ROW_NUMBER() OVER (PARTITION BY ts.UserId ORDER BY ts.TagCount DESC) AS rn
+    FROM
+        TagStats ts
+)
+SELECT
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.TotalPosts,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.TotalScore,
+    us.AvgScore,
+    us.TotalViews,
+    us.BadgeCount,
+    us.TotalUpVotes,
+    us.TotalDownVotes,
+    us.AcceptedCount,
+    us.MaxScore,
+    tt.TagName      AS TopTag,
+    tt.TagCount     AS TopTagCount
+FROM
+    UserStats us
+    LEFT JOIN TopTag tt ON tt.UserId = us.UserId AND tt.rn = 1
+ORDER BY
+    us.Reputation DESC,
+    us.TotalPosts DESC
+LIMIT 200;

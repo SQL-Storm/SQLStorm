@@ -1,0 +1,152 @@
+WITH RelevantPostTags AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.PostTypeId,
+        P.Score,
+        P.CreationDate,
+        P.AcceptedAnswerId,
+        P.LastActivityDate,
+        UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><')) AS TagName,
+        P.Title,
+        P.Body
+    FROM Posts P
+    WHERE
+        P.Tags IS NOT NULL
+        AND (
+            P.Tags LIKE '%<performance>%' OR P.Tags LIKE '%<optimization>%' OR P.Tags LIKE '%<benchmarking>%'
+            OR P.Tags LIKE '%<sql-performance>%' OR P.Tags LIKE '%<database-performance>%'
+            OR P.Tags LIKE '%<speed>%' OR P.Tags LIKE '%<scalability>%'
+        )
+        AND P.PostTypeId IN (1, 2)
+),
+FilteredPostsByContent AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.PostTypeId,
+        P.Score,
+        P.CreationDate,
+        P.AcceptedAnswerId,
+        P.LastActivityDate,
+        P.Title,
+        P.Body
+    FROM Posts P
+    WHERE
+        P.PostTypeId IN (1, 2)
+        AND (
+            LOWER(COALESCE(P.Title, '')) LIKE '%performance%' OR LOWER(COALESCE(P.Body, '')) LIKE '%performance%'
+            OR LOWER(COALESCE(P.Title, '')) LIKE '%optimization%' OR LOWER(COALESCE(P.Body, '')) LIKE '%optimization%'
+            OR LOWER(COALESCE(P.Title, '')) LIKE '%benchmark%' OR LOWER(COALESCE(P.Body, '')) LIKE '%benchmark%'
+            OR LOWER(COALESCE(P.Title, '')) LIKE '%latency%' OR LOWER(COALESCE(P.Body, '')) LIKE '%latency%'
+            OR LOWER(COALESCE(P.Title, '')) LIKE '%throughput%' OR LOWER(COALESCE(P.Body, '')) LIKE '%throughput%'
+        )
+),
+CombinedRelevantPosts AS (
+    SELECT PostId, OwnerUserId, PostTypeId, Score, CreationDate, AcceptedAnswerId, LastActivityDate, Title, Body
+    FROM RelevantPostTags
+    UNION DISTINCT
+    SELECT PostId, OwnerUserId, PostTypeId, Score, CreationDate, AcceptedAnswerId, LastActivityDate, Title, Body
+    FROM FilteredPostsByContent
+),
+UserOverallEngagement AS (
+    SELECT
+        CRP.OwnerUserId AS UserId,
+        COUNT(DISTINCT CRP.PostId) AS TotalRelevantPosts,
+        SUM(CRP.Score) AS TotalRelevantScore,
+        COUNT(CASE WHEN CRP.PostTypeId = 1 THEN 1 END) AS RelevantQuestions,
+        COUNT(CASE WHEN CRP.PostTypeId = 2 THEN 1 END) AS RelevantAnswers,
+        COUNT(CASE WHEN CRP.PostTypeId = 2 AND CRP.AcceptedAnswerId IS NOT NULL THEN 1 END) AS AcceptedRelevantAnswers,
+        COUNT(DISTINCT RPT.TagName) AS DistinctRelevantTagsCovered,
+        MAX(CRP.LastActivityDate) AS LastRelevantActivityDate
+    FROM CombinedRelevantPosts CRP
+    LEFT JOIN RelevantPostTags RPT ON CRP.PostId = RPT.PostId
+    GROUP BY CRP.OwnerUserId
+),
+UserCommentActivity AS (
+    SELECT
+        CRP.OwnerUserId AS UserId,
+        COUNT(C.Id) AS TotalCommentsOnRelevantPosts,
+        CAST(COUNT(C.Id) AS DECIMAL) / COUNT(DISTINCT CRP.PostId) AS AvgCommentsPerRelevantPost
+    FROM CombinedRelevantPosts CRP
+    JOIN Comments C ON CRP.PostId = C.PostId
+    GROUP BY CRP.OwnerUserId
+),
+UserBadgeSummary AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS GoldBadgeCount
+    FROM Badges B
+    WHERE B.Class = 1
+    GROUP BY B.UserId
+),
+UserRecentPerformanceTrend AS (
+    SELECT
+        U.Id AS UserId,
+        SUM(CASE WHEN P.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year' THEN P.Score ELSE 0 END) AS ScoreLast1Year,
+        SUM(CASE WHEN P.CreationDate BETWEEN TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 year' AND TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year' - INTERVAL '1 second' THEN P.Score ELSE 0 END) AS ScorePrior1Year,
+        COUNT(CASE WHEN P.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year' THEN 1 END) AS PostsLast1Year,
+        COUNT(CASE WHEN P.CreationDate BETWEEN TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 year' AND TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year' - INTERVAL '1 second' THEN 1 END) AS PostsPrior1Year
+    FROM Users U
+    JOIN Posts P ON U.Id = P.OwnerUserId
+    WHERE P.PostTypeId IN (1,2) AND P.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 year'
+    GROUP BY U.Id
+),
+UserTopRelevantPost AS (
+    SELECT
+        PostId,
+        OwnerUserId AS UserId,
+        Title AS TopPostTitle,
+        Score AS TopPostScore,
+        ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY Score DESC, CreationDate DESC) as rn
+    FROM CombinedRelevantPosts
+)
+SELECT
+    U.Id AS UserId,
+    U.DisplayName,
+    U.Reputation,
+    U.Views AS UserProfileViews,
+    U.UpVotes AS UserUpVotes,
+    COALESCE(UOE.TotalRelevantPosts, 0) AS TotalRelevantPosts,
+    COALESCE(UOE.TotalRelevantScore, 0) AS TotalRelevantScore,
+    COALESCE(UOE.RelevantQuestions, 0) AS RelevantQuestions,
+    COALESCE(UOE.RelevantAnswers, 0) AS RelevantAnswers,
+    COALESCE(UOE.AcceptedRelevantAnswers, 0) AS AcceptedRelevantAnswers,
+    COALESCE(UOE.DistinctRelevantTagsCovered, 0) AS DistinctRelevantTagsCovered,
+    COALESCE(UCA.AvgCommentsPerRelevantPost, 0.0) AS AvgCommentsPerRelevantPost,
+    COALESCE(UBS.GoldBadgeCount, 0) AS GoldBadgeCount,
+    TP.TopPostTitle,
+    TP.TopPostScore,
+    CASE
+        WHEN COALESCE(UOE.RelevantAnswers, 0) > 0 THEN CAST(UOE.AcceptedRelevantAnswers AS DECIMAL) / UOE.RelevantAnswers
+        ELSE 0.0
+    END AS RelevantAnswerAcceptanceRate,
+    CASE
+        WHEN URP.ScorePrior1Year > 0 THEN CAST(URP.ScoreLast1Year AS DECIMAL) / URP.ScorePrior1Year
+        WHEN URP.ScoreLast1Year > 0 AND COALESCE(URP.ScorePrior1Year, 0) = 0 THEN 9999.0
+        ELSE 0.0
+    END AS ScoreTrendRatioLastVsPriorYear,
+    CASE
+        WHEN URP.PostsPrior1Year > 0 THEN CAST(URP.PostsLast1Year AS DECIMAL) / URP.PostsPrior1Year
+        WHEN URP.PostsLast1Year > 0 AND COALESCE(URP.PostsPrior1Year, 0) = 0 THEN 9999.0
+        ELSE 0.0
+    END AS PostCountTrendRatioLastVsPriorYear,
+    COALESCE(UOE.LastRelevantActivityDate, U.LastAccessDate) AS LastActivityOverall
+FROM Users U
+LEFT JOIN UserOverallEngagement UOE ON U.Id = UOE.UserId
+LEFT JOIN UserCommentActivity UCA ON U.Id = UCA.UserId
+LEFT JOIN UserBadgeSummary UBS ON U.Id = UBS.UserId
+LEFT JOIN UserRecentPerformanceTrend URP ON U.Id = URP.UserId
+LEFT JOIN UserTopRelevantPost TP ON U.Id = TP.UserId AND TP.rn = 1
+WHERE
+    U.Reputation >= 1000
+    AND (COALESCE(UOE.TotalRelevantPosts, 0) > 0 OR COALESCE(URP.ScoreLast1Year, 0) > 0)
+ORDER BY
+    U.Reputation DESC,
+    COALESCE(UOE.TotalRelevantScore, 0) DESC,
+    COALESCE(UBS.GoldBadgeCount, 0) DESC,
+    RelevantAnswerAcceptanceRate DESC,
+    ScoreTrendRatioLastVsPriorYear DESC,
+    COALESCE(UOE.DistinctRelevantTagsCovered, 0) DESC,
+    LastActivityOverall DESC
+LIMIT 200;

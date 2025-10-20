@@ -1,0 +1,148 @@
+WITH
+recent_posts AS (
+  SELECT p.*,
+         (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS comment_count,
+         (SELECT SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) FROM Votes v WHERE v.PostId = p.Id) AS vote_balance,
+         regexp_split_to_table(substring(coalesce(p.Tags, ''), 2, length(coalesce(p.Tags, '')) - 2), E'\\><') AS single_tag
+  FROM Posts p
+  WHERE p.CreationDate >= cast('2024-10-01 12:34:56' AS timestamp) - interval '6 months'
+),
+tag_aggs AS (
+  SELECT single_tag AS tag,
+         COUNT(*) AS posts_in_tag,
+         SUM(comment_count) AS total_comments,
+         SUM(coalesce(vote_balance, 0)) AS total_vote_balance,
+         AVG(coalesce(ViewCount, 0)) AS avg_views,
+         SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS questions,
+         SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS answers
+  FROM recent_posts
+  GROUP BY single_tag
+),
+hot_tags AS (
+  SELECT tag
+  FROM tag_aggs
+  WHERE posts_in_tag >= (SELECT percentile_cont(0.75) WITHIN GROUP (ORDER BY posts_in_tag) FROM tag_aggs)
+    AND total_comments >= (SELECT percentile_cont(0.6) WITHIN GROUP (ORDER BY total_comments) FROM tag_aggs)
+),
+hot_contributors AS (
+  SELECT u.Id AS user_id,
+         u.DisplayName,
+         u.Reputation,
+         r.single_tag AS tag,
+         COUNT(DISTINCT CASE WHEN r.PostTypeId = 1 THEN r.Id END) AS q_count,
+         COUNT(DISTINCT CASE WHEN r.PostTypeId = 2 THEN r.Id END) AS a_count,
+         SUM(coalesce(r.comment_count, 0)) AS post_comments,
+         SUM(coalesce(r.vote_balance, 0)) AS post_vote_balance,
+         MAX(r.CreationDate) AS last_activity
+  FROM recent_posts r
+  JOIN hot_tags ht ON ht.tag = r.single_tag
+  LEFT JOIN Users u ON u.Id = r.OwnerUserId
+  LEFT JOIN Comments c ON c.PostId = r.Id
+  LEFT JOIN Votes v ON v.PostId = r.Id
+  WHERE r.OwnerUserId IS NOT NULL
+  GROUP BY u.Id, u.DisplayName, u.Reputation, r.single_tag
+),
+user_badges AS (
+  SELECT b.UserId,
+         COUNT(*) FILTER (WHERE b.Class = 1) AS gold_badges,
+         COUNT(*) FILTER (WHERE b.Class = 2) AS silver_badges,
+         COUNT(*) FILTER (WHERE b.Class = 3) AS bronze_badges,
+         COUNT(*) FILTER (WHERE b.Date >= cast('2024-10-01 12:34:56' AS timestamp) - interval '1 year') AS badges_last_year
+  FROM Badges b
+  GROUP BY b.UserId
+),
+duplicate_graph AS (
+  SELECT pl.PostId AS src, pl.RelatedPostId AS dst, lt.Name AS link_type, p_src.Tags AS src_tags, p_dst.Tags AS dst_tags
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+  JOIN Posts p_src ON p_src.Id = pl.PostId
+  JOIN Posts p_dst ON p_dst.Id = pl.RelatedPostId
+  WHERE pl.CreationDate >= cast('2024-10-01 12:34:56' AS timestamp) - interval '1 year'
+    AND pl.LinkTypeId = 3
+),
+duplicate_clusters AS (
+  SELECT dst AS canonical_q,
+         COUNT(*) AS duplicate_count,
+         ARRAY_AGG(DISTINCT src) AS duplicates,
+         MAX(p.Score) AS max_score_in_cluster,
+         AVG(p.ViewCount) AS avg_views_in_cluster
+  FROM duplicate_graph dg
+  JOIN Posts p ON p.Id = dg.dst
+  GROUP BY dst
+),
+contributor_scores AS (
+  SELECT hc.user_id,
+         hc.DisplayName,
+         hc.tag,
+         hc.Reputation,
+         hc.q_count,
+         hc.a_count,
+         coalesce(ub.gold_badges, 0) AS gold_badges,
+         coalesce(ub.silver_badges, 0) AS silver_badges,
+         coalesce(ub.bronze_badges, 0) AS bronze_badges,
+         hc.post_comments,
+         hc.post_vote_balance,
+         hc.last_activity,
+         (
+           LEAST(1000, GREATEST(0, hc.Reputation)) / 1000.0 * 0.35
+           + LOG(GREATEST(1, hc.q_count + hc.a_count)) * 0.20
+           + (LEAST(50, coalesce(ub.gold_badges, 0)) * 3 + LEAST(100, coalesce(ub.silver_badges, 0)) * 1 + LEAST(200, coalesce(ub.bronze_badges, 0)) * 0.2) / 100.0 * 0.20
+           + (GREATEST(0, hc.post_vote_balance) / 50.0) * 0.15
+           + (CASE WHEN hc.last_activity >= cast('2024-10-01 12:34:56' AS timestamp) - interval '7 days' THEN 0.10 WHEN hc.last_activity >= cast('2024-10-01 12:34:56' AS timestamp) - interval '30 days' THEN 0.06 WHEN hc.last_activity >= cast('2024-10-01 12:34:56' AS timestamp) - interval '90 days' THEN 0.03 ELSE 0 END)
+         ) AS composite_score
+  FROM hot_contributors hc
+  LEFT JOIN user_badges ub ON ub.UserId = hc.user_id
+),
+top_contributors AS (
+  SELECT t.tag, t.user_id, t.DisplayName, t.Reputation, t.composite_score
+  FROM (
+    SELECT cs.tag, cs.user_id, cs.DisplayName, cs.Reputation, cs.composite_score,
+           ROW_NUMBER() OVER (PARTITION BY cs.tag ORDER BY cs.composite_score DESC) AS rn
+    FROM contributor_scores cs
+  ) t
+  WHERE t.rn = 1
+)
+SELECT
+  ht.tag,
+  ta.posts_in_tag,
+  ta.total_comments,
+  ta.total_vote_balance,
+  ta.avg_views,
+  tc.user_id AS top_user_id,
+  tc.DisplayName AS top_user,
+  tc.Reputation AS top_user_reputation,
+  tc.composite_score,
+  jsonb_build_object(
+    'recent_posts', (
+      SELECT jsonb_agg(jsonb_build_object(
+         'Id', p.Id,
+         'PostTypeId', p.PostTypeId,
+         'Title', p.Title,
+         'Score', p.Score,
+         'Views', p.ViewCount,
+         'CreationDate', p.CreationDate,
+         'CommentCount', (SELECT COUNT(*) FROM Comments c2 WHERE c2.PostId = p.Id),
+         'VoteBalance', (SELECT SUM(CASE WHEN v2.VoteTypeId = 2 THEN 1 WHEN v2.VoteTypeId = 3 THEN -1 ELSE 0 END) FROM Votes v2 WHERE v2.PostId = p.Id)
+      ) ORDER BY p.CreationDate DESC LIMIT 5)
+      FROM recent_posts p
+      WHERE p.single_tag = ht.tag
+    ),
+    'duplicate_clusters', (
+      SELECT jsonb_agg(jsonb_build_object(
+         'canonical_q', dc.canonical_q,
+         'duplicate_count', dc.duplicate_count,
+         'duplicates_sample', dc.duplicates[1:5],
+         'max_score', dc.max_score_in_cluster,
+         'avg_views', dc.avg_views_in_cluster
+      ))
+      FROM duplicate_clusters dc
+      WHERE EXISTS (
+        SELECT 1 FROM Posts p2 WHERE p2.Id = dc.canonical_q AND regexp_split_to_table(coalesce(p2.Tags, ''), E'\\><') = ht.tag
+      )
+    )
+  ) AS diagnostics
+FROM hot_tags ht
+LEFT JOIN tag_aggs ta ON ta.tag = ht.tag
+LEFT JOIN top_contributors tc ON tc.tag = ht.tag
+ORDER BY ta.posts_in_tag DESC, ta.total_comments DESC
+LIMIT 25;

@@ -1,0 +1,73 @@
+-- {"query": "300.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 9556} 
+WITH
+UserActivity AS (
+  SELECT u.Id AS UserId, u.DisplayName,
+         COUNT(p.Id) FILTER (WHERE p.CreationDate >= NOW() - INTERVAL '365 days') AS PostsLastYear,
+         COALESCE(SUM(p.ViewCount), 0) AS TotalViews
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName
+),
+TopPosts AS (
+  SELECT p.Id AS PostId,
+         p.OwnerUserId,
+         p.Title,
+         p.Tags,
+         p.CreationDate,
+         p.LastActivityDate,
+         p.Score,
+         p.ViewCount
+  FROM Posts p
+),
+TopByScore AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName,
+         tp.PostId,
+         tp.Title,
+         tp.Tags,
+         tp.CreationDate,
+         tp.LastActivityDate,
+         tp.Score,
+         tp.ViewCount,
+         (SELECT COUNT(*) FROM Comments c WHERE c.PostId = tp.PostId) AS CommentCount,
+         (SELECT COUNT(*) FROM Votes v WHERE v.PostId = tp.PostId AND v.VoteTypeId = 2) AS UpVotes,
+         (SELECT COUNT(*) FROM Votes v WHERE v.PostId = tp.PostId AND v.VoteTypeId = 3) AS DownVotes,
+         CASE WHEN tp.Tags IS NOT NULL THEN string_to_array(substring(tp.Tags, 2, length(tp.Tags) - 2), '><') ELSE ARRAY[]::text[] END AS TagArray,
+         'TopScore' AS Source,
+         (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id) AS BadgeCount,
+         EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS HasGold,
+         ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY tp.Score DESC NULLS LAST, tp.LastActivityDate DESC NULLS LAST) AS rn
+  FROM TopPosts tp
+  JOIN Users u ON u.Id = tp.OwnerUserId
+),
+TopByViews AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName,
+         tp.PostId,
+         tp.Title,
+         tp.Tags,
+         tp.CreationDate,
+         tp.LastActivityDate,
+         tp.Score,
+         tp.ViewCount,
+         (SELECT COUNT(*) FROM Comments c WHERE c.PostId = tp.PostId) AS CommentCount,
+         (SELECT COUNT(*) FROM Votes v WHERE v.PostId = tp.PostId AND v.VoteTypeId = 2) AS UpVotes,
+         (SELECT COUNT(*) FROM Votes v WHERE v.PostId = tp.PostId AND v.VoteTypeId = 3) AS DownVotes,
+         CASE WHEN tp.Tags IS NOT NULL THEN string_to_array(substring(tp.Tags, 2, length(tp.Tags) - 2), '><') ELSE ARRAY[]::text[] END AS TagArray,
+         'TopViews' AS Source,
+         (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id) AS BadgeCount,
+         EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS HasGold,
+         ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY tp.ViewCount DESC NULLS LAST, tp.LastActivityDate DESC NULLS LAST) AS rn
+  FROM TopPosts tp
+  JOIN Users u ON u.Id = tp.OwnerUserId
+)
+SELECT UserId, DisplayName, PostId, Title, Tags, CreationDate, LastActivityDate, Score, ViewCount, CommentCount,
+       UpVotes, DownVotes, TagArray, Source, BadgeCount, HasGold
+FROM TopByScore
+WHERE rn = 1
+UNION ALL
+SELECT UserId, DisplayName, PostId, Title, Tags, CreationDate, LastActivityDate, Score, ViewCount, CommentCount,
+       UpVotes, DownVotes, TagArray, Source, BadgeCount, HasGold
+FROM TopByViews
+WHERE rn = 1
+ORDER BY UserId, PostId;

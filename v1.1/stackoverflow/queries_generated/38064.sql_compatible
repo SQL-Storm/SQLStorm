@@ -1,0 +1,184 @@
+with recent_users as (
+  select u.id, u.reputation, u.creationdate
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '180 days' from users)
+),
+popular_tags as (
+  select t.tagname, t.count
+  from tags t
+  where t.count > (select percentile_cont(0.9) within group (order by count) from tags)
+),
+question_posts as (
+  select p.id, p.creationdate, p.score, p.viewcount, p.owneruserid, p.title, p.tags
+  from posts p
+  where p.posttypeid = 1
+),
+answer_posts as (
+  select p.id, p.parentid, p.creationdate, p.score, p.owneruserid
+  from posts p
+  where p.posttypeid = 2
+),
+q_tag as (
+  select
+    q.id as question_id,
+    unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')) as tag
+  from question_posts q
+),
+hot_questions as (
+  select q.id as question_id,
+         q.creationdate,
+         q.score,
+         q.viewcount,
+         q.owneruserid,
+         count(a.id) as answer_count,
+         coalesce(sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end), 0) as net_votes,
+         count(distinct c.id) filter (where c.score > 0) as pos_commenters
+  from question_posts q
+  left join answer_posts a on a.parentid = q.id
+  left join votes v on v.postid = q.id
+  left join comments c on c.postid = q.id
+  group by q.id, q.creationdate, q.score, q.viewcount, q.owneruserid
+),
+dupe_graph as (
+  select pl.postid as src_question_id,
+         pl.relatedpostid as dst_question_id,
+         count(*) as dupe_edges
+  from postlinks pl
+  where pl.linktypeid = 3
+  group by pl.postid, pl.relatedpostid
+),
+gold_badgers as (
+  select b.userid, count(*) filter (where b.class = 1) as gold_count
+  from badges b
+  group by b.userid
+),
+recent_activity as (
+  select ph.postid,
+         count(*) filter (where ph.posthistorytypeid in (4,5,6)) as edit_events,
+         max(ph.creationdate) as last_event_date
+  from posthistory ph
+  where ph.creationdate >= (select max(creationdate) - interval '365 days' from posthistory)
+  group by ph.postid
+),
+owner_stats as (
+  select u.id as owner_id,
+         u.reputation,
+         u.upvotes,
+         u.downvotes,
+         coalesce(gb.gold_count, 0) as gold_badges
+  from users u
+  left join gold_badgers gb on gb.userid = u.id
+),
+tag_popularity as (
+  select qt.question_id,
+         sum(pt.count) as tag_pop_sum,
+         avg(pt.count) as tag_pop_avg,
+         max(pt.count) as tag_pop_max
+  from q_tag qt
+  join popular_tags pt on pt.tagname = qt.tag
+  group by qt.question_id
+),
+engagement_score as (
+  select
+    hq.question_id,
+    0.5 * log(1 + hq.viewcount) +
+    1.5 * hq.answer_count +
+    2.0 * hq.net_votes +
+    0.25 * hq.pos_commenters as score_core
+  from hot_questions hq
+),
+question_window as (
+  select
+    hq.*,
+    row_number() over (order by hq.creationdate desc) as rn_recent,
+    row_number() over (order by (hq.score + coalesce(ts.tag_pop_sum,0)) desc) as rn_hot_tags,
+    dense_rank() over (order by hq.net_votes desc) as dr_net_votes
+  from hot_questions hq
+  left join tag_popularity ts on ts.question_id = hq.question_id
+),
+final_rank as (
+  select
+    qw.question_id,
+    qw.creationdate,
+    es.score_core,
+    coalesce(ts.tag_pop_sum, 0) as tag_pop_sum,
+    coalesce(ts.tag_pop_avg, 0) as tag_pop_avg,
+    coalesce(ts.tag_pop_max, 0) as tag_pop_max,
+    coalesce(ra.edit_events, 0) as recent_edits,
+    extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - qw.creationdate)) / 86400.0 as age_days,
+    os.reputation as owner_reputation,
+    os.gold_badges,
+    coalesce(dg.dupe_edges, 0) as dupe_edges,
+    qw.rn_recent,
+    qw.rn_hot_tags,
+    qw.dr_net_votes,
+    (
+      es.score_core
+      + 0.001 * coalesce(ts.tag_pop_sum, 0)
+      + 0.01 * os.gold_badges
+      + 0.0005 * os.reputation
+      + 0.2 * coalesce(ra.edit_events, 0)
+      - 0.3 * coalesce(dg.dupe_edges, 0)
+      + case when coalesce(ts.tag_pop_max,0) > 0 then 0.5 else 0 end
+      + 2.0 / (1.0 + exp(least(30.0, greatest(-30.0, (extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - qw.creationdate)) / 86400.0 - 7.0))))) 
+    ) as composite_score
+  from question_window qw
+  join engagement_score es on es.question_id = qw.question_id
+  left join tag_popularity ts on ts.question_id = qw.question_id
+  left join recent_activity ra on ra.postid = qw.question_id
+  left join owner_stats os on os.owner_id = qw.owneruserid
+  left join dupe_graph dg on dg.src_question_id = qw.question_id
+),
+bucketed as (
+  select
+    fr.*,
+    ntile(20) over (order by fr.composite_score desc) as top20_bucket,
+    ntile(100) over (order by fr.composite_score desc) as top100_bucket
+  from final_rank fr
+),
+tag_agg as (
+  select
+    qt.question_id,
+    string_agg(qt.tag, ',' order by qt.tag) as tags_csv
+  from q_tag qt
+  group by qt.question_id
+)
+select
+  p.id as question_id,
+  p.title,
+  p.creationdate,
+  p.score,
+  p.viewcount,
+  p.answercount,
+  os.owner_reputation,
+  os.gold_badges,
+  coalesce(ta.tags_csv, '') as tags,
+  b.top20_bucket,
+  b.top100_bucket,
+  round(cast(b.composite_score as numeric), 3) as composite_score,
+  b.net_votes,
+  b.recent_edits,
+  b.tag_pop_sum,
+  b.tag_pop_avg,
+  b.tag_pop_max,
+  b.dupe_edges,
+  b.age_days,
+  count(v.id) filter (where v.votetypeid = 5) as favorites_legacy,
+  count(v2.id) filter (where v2.votetypeid = 2) as upvotes,
+  count(v3.id) filter (where v3.votetypeid = 3) as downvotes
+from bucketed b
+join posts p on p.id = b.question_id
+left join owner_stats os on os.owner_id = p.owneruserid
+left join tag_agg ta on ta.question_id = p.id
+left join votes v on v.postid = p.id and v.votetypeid = 5
+left join votes v2 on v2.postid = p.id and v2.votetypeid = 2
+left join votes v3 on v3.postid = p.id and v3.votetypeid = 3
+where p.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+group by
+  p.id, p.title, p.creationdate, p.score, p.viewcount, p.answercount,
+  os.owner_reputation, os.gold_badges,
+  ta.tags_csv,
+  b.top20_bucket, b.top100_bucket, b.composite_score,
+  b.net_votes, b.recent_edits, b.tag_pop_sum, b.tag_pop_avg, b.tag_pop_max, b.dupe_edges, b.age_days
+order by b.composite_score desc, p.viewcount desc
+limit 500;

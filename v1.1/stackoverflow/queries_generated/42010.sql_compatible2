@@ -1,0 +1,77 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id, 
+        p.PostTypeId, 
+        p.CreationDate, 
+        p.Score, 
+        p.ViewCount, 
+        u.Reputation AS UserReputation, 
+        u.CreationDate AS UserCreationDate, 
+        COUNT(v.Id) AS VoteCount, 
+        COUNT(c.Id) AS CommentCount, 
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.CreationDate) AS PostRank,
+        p.Tags
+    FROM 
+        Posts p
+    JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN 
+        Comments c ON p.Id = c.PostId
+    WHERE 
+        p.PostTypeId IN (1, 2) 
+        AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR)
+    GROUP BY 
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.Tags, u.Reputation, u.CreationDate
+), 
+TagStats AS (
+    SELECT 
+        t.TagName, 
+        COUNT(p.Id) AS TagUsageCount, 
+        SUM(p.Score) AS TotalTagScore
+    FROM 
+        Tags t
+    JOIN 
+        Posts p ON EXISTS (
+            SELECT 1
+            FROM (
+                SELECT TRIM(value) AS tagname
+                FROM UNNEST(string_to_array(COALESCE(p.Tags, ''), '<')) AS x(value)
+            ) sub
+            WHERE sub.tagname = t.TagName
+        )
+    WHERE 
+        p.PostTypeId = 1 
+        AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR)
+    GROUP BY 
+        t.TagName
+)
+SELECT 
+    rp.Id AS PostId, 
+    rp.PostTypeId, 
+    rp.CreationDate, 
+    rp.Score, 
+    rp.ViewCount, 
+    rp.UserReputation, 
+    rp.UserCreationDate, 
+    rp.VoteCount, 
+    rp.CommentCount, 
+    rp.PostRank, 
+    t.TagName, 
+    ts.TagUsageCount, 
+    ts.TotalTagScore
+FROM 
+    RankedPosts rp,
+    LATERAL (
+        SELECT TRIM(x.value) AS TagName
+        FROM UNNEST(string_to_array(COALESCE(rp.Tags, ''), '<')) AS x(value)
+    ) t
+JOIN 
+    TagStats ts ON t.TagName = ts.TagName
+WHERE 
+    rp.PostRank <= 10
+ORDER BY 
+    rp.PostTypeId, 
+    rp.Score DESC, 
+    rp.CreationDate;

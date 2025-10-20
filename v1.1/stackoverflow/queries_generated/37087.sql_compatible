@@ -1,0 +1,209 @@
+WITH
+activity AS (
+  SELECT u.Id AS UserId,
+         u.Reputation,
+         u.CreationDate,
+         u.DisplayName,
+         u.Location,
+         COALESCE(pq.QCount,0) AS QuestionsPosted,
+         COALESCE(pa.ACount,0) AS AnswersPosted,
+         COALESCE(c.Comments,0) AS CommentsMade,
+         COALESCE(v.Votes,0) AS VotesCast,
+         COALESCE(b.Badges,0) AS BadgesEarned,
+         GREATEST(
+           COALESCE(pq.LastPost, CAST('1970-01-01' AS TIMESTAMP)),
+           COALESCE(pa.LastPost, CAST('1970-01-01' AS TIMESTAMP)),
+           COALESCE(c.LastComment, CAST('1970-01-01' AS TIMESTAMP)),
+           COALESCE(v.LastVote, CAST('1970-01-01' AS TIMESTAMP))
+         ) AS LastActivity
+  FROM Users u
+  LEFT JOIN (
+    SELECT OwnerUserId AS UserId, COUNT(*) AS QCount, MAX(CreationDate) AS LastPost
+    FROM Posts
+    WHERE PostTypeId = 1
+    GROUP BY OwnerUserId
+  ) pq ON pq.UserId = u.Id
+  LEFT JOIN (
+    SELECT OwnerUserId AS UserId, COUNT(*) AS ACount, MAX(CreationDate) AS LastPost
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY OwnerUserId
+  ) pa ON pa.UserId = u.Id
+  LEFT JOIN (
+    SELECT UserId, COUNT(*) AS Comments, MAX(CreationDate) AS LastComment
+    FROM Comments
+    GROUP BY UserId
+  ) c ON c.UserId = u.Id
+  LEFT JOIN (
+    SELECT UserId, COUNT(*) AS Votes, MAX(CreationDate) AS LastVote
+    FROM Votes
+    WHERE UserId IS NOT NULL
+    GROUP BY UserId
+  ) v ON v.UserId = u.Id
+  LEFT JOIN (
+    SELECT UserId, COUNT(*) AS Badges
+    FROM Badges
+    GROUP BY UserId
+  ) b ON b.UserId = u.Id
+  WHERE u.CreationDate < CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days'
+),
+user_tag_impact AS (
+  SELECT p.OwnerUserId AS UserId,
+         unnest(string_to_array(substring(q.Tags,2,length(q.Tags)-2), '><')) AS Tag,
+         SUM(GREATEST(a.Score,0) * GREATEST(q.ViewCount,100)) AS ImpactScore,
+         COUNT(*) AS AnsweredToQuestions
+  FROM Posts a
+  JOIN Posts q ON q.Id = a.ParentId AND q.PostTypeId = 1
+  JOIN Posts p ON p.Id = a.Id
+  WHERE a.PostTypeId = 2 AND a.OwnerUserId IS NOT NULL AND q.Tags IS NOT NULL
+  GROUP BY p.OwnerUserId, Tag
+),
+top_tags AS (
+  SELECT utt.UserId,
+         utt.Tag,
+         utt.ImpactScore,
+         utt.AnsweredToQuestions,
+         ROW_NUMBER() OVER (PARTITION BY utt.UserId ORDER BY utt.ImpactScore DESC) AS rn
+  FROM user_tag_impact utt
+),
+top3_tags AS (
+  SELECT UserId,
+         json_agg(json_build_object('Tag', Tag, 'Impact', ImpactScore, 'AnsweredQuestions', AnsweredToQuestions) ORDER BY ImpactScore DESC) FILTER (WHERE rn <= 3) AS TopTags
+  FROM top_tags
+  GROUP BY UserId
+),
+answer_metrics AS (
+  SELECT a.OwnerUserId AS UserId,
+         COUNT(*) FILTER (WHERE a.Id IS NOT NULL) AS Answers,
+         COUNT(*) FILTER (WHERE q.AcceptedAnswerId = a.Id) AS AcceptedAnswers,
+         AVG(a.Score) AS AvgAnswerScore,
+         PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY a.Score) AS MedianAnswerScore,
+         AVG(EXTRACT(EPOCH FROM (CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END) * (q.CreationDate - a.CreationDate))) FILTER (WHERE q.AcceptedAnswerId = a.Id) AS AvgTimeToAcceptSeconds
+  FROM Posts a
+  LEFT JOIN Posts q ON q.Id = a.ParentId AND q.PostTypeId = 1
+  WHERE a.PostTypeId = 2
+  GROUP BY a.OwnerUserId
+),
+badge_summary AS (
+  SELECT b.UserId,
+         COUNT(*) AS BadgeCount,
+         COUNT(*) FILTER (WHERE b.Class = 1) AS Gold,
+         COUNT(*) FILTER (WHERE b.Class = 2) AS Silver,
+         COUNT(*) FILTER (WHERE b.Class = 3) AS Bronze,
+         (SELECT json_agg(name_ordered) FROM (
+            SELECT b2.Name AS name_ordered
+            FROM Badges b2
+            WHERE b2.UserId = b.UserId
+            ORDER BY b2.Date DESC
+            FETCH FIRST 5 ROWS ONLY
+          ) t) AS RecentBadges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+duplicate_metrics AS (
+  SELECT q.OwnerUserId AS UserId,
+         COUNT(pl.Id) FILTER (WHERE lt.Name = 'Duplicate') AS DuplicateLinksOut,
+         COUNT(pl.Id) FILTER (WHERE lt.Name = 'Linked') AS LinkedOut,
+         COALESCE(SUM(CASE WHEN lt.Name = 'Duplicate' THEN 1 ELSE 0 END),0) AS DuplicateCount
+  FROM Posts q
+  LEFT JOIN PostLinks pl ON pl.PostId = q.Id
+  LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+  WHERE q.PostTypeId = 1
+  GROUP BY q.OwnerUserId
+),
+candidates AS (
+  SELECT a.UserId
+  FROM activity a
+  LEFT JOIN (
+    SELECT OwnerUserId AS UserId, COUNT(*) AS QLastYear
+    FROM Posts
+    WHERE PostTypeId = 1 AND CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    GROUP BY OwnerUserId
+  ) qy ON qy.UserId = a.UserId
+  LEFT JOIN (
+    SELECT OwnerUserId AS UserId, COUNT(*) AS ALastYear
+    FROM Posts
+    WHERE PostTypeId = 2 AND CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    GROUP BY OwnerUserId
+  ) ay ON ay.UserId = a.UserId
+  WHERE (COALESCE(ay.ALastYear,0) >= 5 OR COALESCE(qy.QLastYear,0) >= 3 OR a.CommentsMade >= 10)
+),
+scored_users AS (
+  SELECT act.UserId,
+         act.DisplayName,
+         act.Reputation,
+         act.LastActivity,
+         COALESCE(am.Answers,0) AS Answers,
+         COALESCE(am.AcceptedAnswers,0) AS AcceptedAnswers,
+         COALESCE(am.AvgAnswerScore,0) AS AvgAnswerScore,
+         COALESCE(am.MedianAnswerScore,0) AS MedianAnswerScore,
+         COALESCE(am.AvgTimeToAcceptSeconds, 1e9) AS AvgTimeToAcceptSeconds,
+         COALESCE(tt.TopTags, CAST('[]' AS JSON)) AS TopTags,
+         COALESCE(bs.BadgeCount,0) AS BadgeCount,
+         COALESCE(dm.DuplicateCount,0) AS DuplicateCount,
+         (
+           LOG(GREATEST(act.Reputation,1)) * 1.5
+           + LEAST(act.QuestionsPosted,50) * 0.5
+           + LEAST(act.AnswersPosted,200) * 1.2
+           + (COALESCE(am.AcceptedAnswers,0) * 4.0)
+           + (COALESCE(am.AvgAnswerScore,0) * 2.0)
+           - (LEAST(COALESCE(am.AvgTimeToAcceptSeconds,1e9)/86400.0,365) * 0.05)
+           + (COALESCE(bs.Gold,0) * 5.0) + (COALESCE(bs.Silver,0) * 2.0) + (COALESCE(bs.Bronze,0) * 1.0)
+           - (GREATEST(COALESCE(dm.DuplicateCount,0)-2,0) * 1.0)
+         ) AS CompositeScore
+  FROM activity act
+  JOIN candidates c ON c.UserId = act.UserId
+  LEFT JOIN answer_metrics am ON am.UserId = act.UserId
+  LEFT JOIN top3_tags tt ON tt.UserId = act.UserId
+  LEFT JOIN badge_summary bs ON bs.UserId = act.UserId
+  LEFT JOIN duplicate_metrics dm ON dm.UserId = act.UserId
+),
+recent_impact AS (
+  SELECT su.*,
+         rp.RecentTopPosts,
+         rc.RecentCommentsSummary
+  FROM scored_users su
+  LEFT JOIN (
+    SELECT p.OwnerUserId AS UserId,
+           (SELECT json_agg(obj) FROM (
+              SELECT json_build_object('PostId', p2.Id, 'Type', pt.Name, 'Score', p2.Score, 'Views', p2.ViewCount, 'Title', p2.Title) AS obj
+              FROM Posts p2
+              LEFT JOIN PostTypes pt ON pt.Id = p2.PostTypeId
+              WHERE p2.OwnerUserId = p.OwnerUserId
+                AND p2.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180 days'
+              ORDER BY p2.Score DESC, p2.ViewCount DESC
+              FETCH FIRST 5 ROWS ONLY
+           ) q) AS RecentTopPosts
+    FROM Posts p
+    GROUP BY p.OwnerUserId
+  ) rp ON rp.UserId = su.UserId
+  LEFT JOIN (
+    SELECT c.UserId,
+           (SELECT json_agg(obj) FROM (
+              SELECT json_build_object('CommentId', c2.Id, 'PostId', c2.PostId, 'Score', c2.Score, 'Excerpt', substring(c2.Text,1,140)) AS obj
+              FROM Comments c2
+              WHERE c2.UserId = c.UserId
+                AND c2.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180 days'
+              ORDER BY c2.CreationDate DESC
+              FETCH FIRST 10 ROWS ONLY
+           ) q) AS RecentCommentsSummary
+    FROM Comments c
+    GROUP BY c.UserId
+  ) rc ON rc.UserId = su.UserId
+)
+SELECT
+  ri.UserId,
+  ri.DisplayName,
+  ri.Reputation,
+  ri.LastActivity,
+  ri.Answers,
+  ri.AcceptedAnswers,
+  ri.AvgAnswerScore,
+  ri.MedianAnswerScore,
+  ri.AvgTimeToAcceptSeconds,
+  ri.TopTags,
+  ri.BadgeCount,
+  ri.CompositeScore
+FROM recent_impact ri
+ORDER BY ri.CompositeScore DESC NULLS LAST, ri.Reputation DESC
+LIMIT 50;

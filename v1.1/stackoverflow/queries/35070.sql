@@ -1,0 +1,90 @@
+WITH MostActiveUsers AS (
+    SELECT u.Id AS UserId, u.DisplayName, COUNT(p.Id) AS TotalPosts, SUM(p.Score) AS TotalScore
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(p.Id) > 100
+),
+TopTags AS (
+    SELECT t.TagName, t.Id AS TagId, t.Count
+    FROM Tags t
+    WHERE t.Count > 500
+),
+HighValuePosts AS (
+    SELECT p.Id AS PostId, p.Title, p.Score, p.CreationDate, p.OwnerUserId, pt.Name AS PostType, p.Tags
+    FROM Posts p
+    JOIN PostTypes pt ON pt.Id = p.PostTypeId
+    WHERE p.Score > 20 AND p.PostTypeId IN (1,2)
+),
+TagUsage AS (
+    SELECT 
+        hp.PostId,
+        tagnames.TagName
+    FROM HighValuePosts hp,
+    LATERAL (
+        SELECT TRIM(tag) AS TagName
+        FROM (
+            SELECT regexp_split_to_table(
+                CASE 
+                    WHEN hp.Tags LIKE '<%' AND hp.Tags LIKE '%>' THEN substring(hp.Tags from 2 for (char_length(hp.Tags) - 2))
+                    ELSE COALESCE(hp.Tags,'')
+                END
+                , '><'
+            ) AS tag
+        ) s
+    ) tagnames
+    JOIN TopTags tt ON tagnames.TagName = tt.TagName
+),
+PostInteractions AS (
+    SELECT 
+        hvp.PostId,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        COUNT(DISTINCT ph.Id) AS EditCount
+    FROM HighValuePosts hvp
+    LEFT JOIN Comments c ON c.PostId = hvp.PostId
+    LEFT JOIN Votes v ON v.PostId = hvp.PostId
+    LEFT JOIN PostHistory ph ON ph.PostId = hvp.PostId AND ph.PostHistoryTypeId IN (4,5,6)
+    GROUP BY hvp.PostId
+),
+UserBadges AS (
+    SELECT b.UserId, 
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges, 
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges, 
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserPerformance AS (
+    SELECT 
+        mau.UserId,
+        mau.DisplayName,
+        mau.TotalPosts,
+        mau.TotalScore,
+        COALESCE(ub.GoldBadges,0) AS GoldBadges,
+        COALESCE(ub.SilverBadges,0) AS SilverBadges,
+        COALESCE(ub.BronzeBadges,0) AS BronzeBadges
+    FROM MostActiveUsers mau
+    LEFT JOIN UserBadges ub ON ub.UserId = mau.UserId
+)
+SELECT
+    uperf.DisplayName,
+    uperf.TotalPosts,
+    uperf.TotalScore,
+    uperf.GoldBadges,
+    uperf.SilverBadges,
+    uperf.BronzeBadges,
+    COUNT(DISTINCT hvp.PostId) AS HighScorePosts,
+    COUNT(DISTINCT tu.TagName) AS TopTagsUsed,
+    AVG(pi.CommentCount) AS AvgCommentsOnHighScorePosts,
+    AVG(pi.VoteCount) AS AvgVotesOnHighScorePosts,
+    AVG(pi.EditCount) AS AvgEditsOnHighScorePosts
+FROM UserPerformance uperf
+LEFT JOIN HighValuePosts hvp ON hvp.OwnerUserId = uperf.UserId
+LEFT JOIN TagUsage tu ON tu.PostId = hvp.PostId
+LEFT JOIN PostInteractions pi ON pi.PostId = hvp.PostId
+GROUP BY
+    uperf.DisplayName, uperf.TotalPosts, uperf.TotalScore, uperf.GoldBadges, uperf.SilverBadges, uperf.BronzeBadges
+ORDER BY
+    uperf.TotalScore DESC, HighScorePosts DESC, AvgVotesOnHighScorePosts DESC
+LIMIT 25;

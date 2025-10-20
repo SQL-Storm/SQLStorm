@@ -1,0 +1,148 @@
+WITH 
+user_stats AS (
+    SELECT 
+        u.Id                     AS user_id,
+        u.Reputation,
+        COUNT(p.Id)              AS total_posts,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS question_count,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS answer_count,
+        SUM(COALESCE(p.Score,0)) AS total_score,
+        ROUND(AVG(COALESCE(p.Score,0)) FILTER (WHERE p.PostTypeId = 1),2) AS avg_question_score,
+        ROUND(AVG(COALESCE(p.Score,0)) FILTER (WHERE p.PostTypeId = 2),2) AS avg_answer_score,
+        COUNT(DISTINCT t.TagName) AS distinct_tags_used
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN LATERAL (
+        SELECT unnest(string_to_array(trim(both '<>' FROM p.Tags), '><')) AS TagName
+    ) t ON p.PostTypeId = 1 AND t.TagName IS NOT NULL
+    GROUP BY u.Id, u.Reputation
+),
+
+badge_stats AS (
+    SELECT 
+        b.UserId               AS user_id,
+        COUNT(*)               AS total_badges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+        COUNT(DISTINCT t.TagName) FILTER (WHERE b.TagBased = true) AS tag_based_badge_count
+    FROM Badges b
+    LEFT JOIN Tags t ON b.Name = t.TagName
+    GROUP BY b.UserId
+),
+
+post_vote_stats AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS upvotes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS downvotes,
+        SUM(CASE WHEN vt.Id = 5 THEN 1 ELSE 0 END) AS favorites,
+        COUNT(*)                                         AS total_votes
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+),
+
+tag_metrics AS (
+    SELECT 
+        tg.TagName,
+        tg.Count                         AS tag_use_count,
+        ROUND(AVG(COALESCE(p.Score,0)),2) AS avg_score_per_tag,
+        COUNT(DISTINCT p.OwnerUserId)    AS distinct_contributors,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS close_events,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 12 THEN 1 ELSE 0 END) AS delete_events
+    FROM Tags tg
+    LEFT JOIN Posts p ON p.Tags LIKE ('%<' || tg.TagName || '>%')
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId IN (10,12)
+    WHERE p.PostTypeId = 1
+    GROUP BY tg.TagName, tg.Count
+),
+
+recent_activity AS (
+    SELECT 
+        u.Id                             AS user_id,
+        COUNT(p.Id) FILTER (WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days') AS recent_posts,
+        COUNT(c.Id) FILTER (WHERE c.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days') AS recent_comments,
+        COUNT(v.Id) FILTER (WHERE v.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days' AND vt.Id = 2) AS recent_upvotes_given,
+        COUNT(v.Id) FILTER (WHERE v.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days' AND vt.Id = 3) AS recent_downvotes_given
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY u.Id
+)
+
+SELECT 
+    us.user_id,
+    u.DisplayName,
+    us.Reputation,
+    us.total_posts,
+    us.question_count,
+    us.answer_count,
+    us.total_score,
+    us.avg_question_score,
+    us.avg_answer_score,
+    us.distinct_tags_used,
+    bs.total_badges,
+    bs.gold_badges,
+    bs.silver_badges,
+    bs.bronze_badges,
+    bs.tag_based_badge_count,
+    ra.recent_posts,
+    ra.recent_comments,
+    ra.recent_upvotes_given,
+    ra.recent_downvotes_given,
+    (SELECT json_agg(json_build_object('tag', tag_name, 'avg_score', avg_score))
+     FROM (
+         SELECT 
+             t.TagName AS tag_name,
+             ROUND(AVG(COALESCE(p.Score,0)),2) AS avg_score,
+             COUNT(*) AS cnt,
+             ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY COUNT(*) DESC) AS rn,
+             p.OwnerUserId
+         FROM Posts p
+         LEFT JOIN LATERAL (
+             SELECT unnest(string_to_array(trim(both '<>' FROM p.Tags), '><')) AS TagName
+         ) t ON p.PostTypeId = 1
+         WHERE p.OwnerUserId = u.Id
+         GROUP BY t.TagName, p.OwnerUserId
+     ) sub
+     WHERE rn <= 3) AS top_tags_json,
+    (SELECT json_agg(json_build_object('post_id', p.Id, 'score', p.Score, 'title', p.Title) ORDER BY p.Score DESC)
+     FROM (
+       SELECT p.Id, p.Score, p.Title
+       FROM Posts p
+       JOIN post_vote_stats vs ON vs.PostId = p.Id
+       WHERE p.OwnerUserId = u.Id
+         AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days'
+       ORDER BY p.Score DESC
+       LIMIT 5
+     ) p) AS recent_high_score_posts
+FROM user_stats us
+JOIN Users u ON u.Id = us.user_id
+LEFT JOIN badge_stats bs ON bs.user_id = us.user_id
+LEFT JOIN recent_activity ra ON ra.user_id = us.user_id
+WHERE us.Reputation > 10000
+GROUP BY
+    us.user_id,
+    u.DisplayName,
+    us.Reputation,
+    us.total_posts,
+    us.question_count,
+    us.answer_count,
+    us.total_score,
+    us.avg_question_score,
+    us.avg_answer_score,
+    us.distinct_tags_used,
+    bs.total_badges,
+    bs.gold_badges,
+    bs.silver_badges,
+    bs.bronze_badges,
+    bs.tag_based_badge_count,
+    ra.recent_posts,
+    ra.recent_comments,
+    ra.recent_upvotes_given,
+    ra.recent_downvotes_given
+ORDER BY us.total_score DESC
+LIMIT 100;

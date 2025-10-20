@@ -1,0 +1,114 @@
+-- {"query": "39052.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1972, "output_tokens": 3057} 
+
+WITH
+  questions AS (
+    SELECT
+      p.id            AS post_id,
+      p.title,
+      p.owneruserid,
+      p.creationdate,
+      p.viewcount,
+      unnest(
+        string_to_array(
+          substring(p.tags, 2, length(p.tags) - 2),
+          E'><'
+        )
+      ) AS tag
+    FROM posts p
+    WHERE p.posttypeid = 1
+  ),
+  comment_stats AS (
+    SELECT
+      postid,
+      count(*)       AS comments,
+      avg(score)     AS avg_comment_score
+    FROM comments
+    GROUP BY postid
+  ),
+  vote_stats AS (
+    SELECT
+      postid,
+      count(*) FILTER (WHERE votetypeid = 2)      AS upvotes,
+      count(*) FILTER (WHERE votetypeid = 3)      AS downvotes,
+      sum(coalesce(bountyamount,0))               AS bounty_total
+    FROM votes
+    GROUP BY postid
+  ),
+  dup_stats AS (
+    SELECT
+      relatedpostid AS post_id,
+      count(*) FILTER (WHERE linktypeid = 3)      AS duplicates
+    FROM postlinks
+    GROUP BY relatedpostid
+  ),
+  tag_metrics AS (
+    SELECT
+      q.tag,
+      count(*)                                   AS num_questions,
+      avg(q.viewcount)                           AS avg_views,
+      percentile_cont(0.5) WITHIN GROUP (ORDER BY q.viewcount) AS med_views,
+      avg(cs.comments)                           AS avg_comments,
+      avg(vs.upvotes - vs.downvotes)             AS avg_net_votes,
+      avg(ds.duplicates)                         AS avg_duplicates
+    FROM questions q
+    LEFT JOIN comment_stats cs ON cs.postid = q.post_id
+    LEFT JOIN vote_stats vs    ON vs.postid = q.post_id
+    LEFT JOIN dup_stats ds     ON ds.post_id = q.post_id
+    GROUP BY q.tag
+  ),
+  user_metrics AS (
+    SELECT
+      u.id                   AS user_id,
+      u.displayname,
+      u.reputation,
+      count(DISTINCT q.post_id) FILTER (WHERE q.owneruserid = u.id) AS questions,
+      count(DISTINCT a.id)      FILTER (WHERE a.owneruserid = u.id) AS answers,
+      avg(a.score)              FILTER (WHERE a.owneruserid = u.id) AS avg_answer_score,
+      count(b.id)               FILTER (WHERE b.class = 1)         AS gold,
+      count(b.id)               FILTER (WHERE b.class = 2)         AS silver,
+      count(b.id)               FILTER (WHERE b.class = 3)         AS bronze
+    FROM users u
+    LEFT JOIN posts q  ON q.owneruserid = u.id AND q.posttypeid = 1
+    LEFT JOIN posts a  ON a.owneruserid = u.id AND a.posttypeid = 2
+    LEFT JOIN badges b ON b.userid = u.id
+    GROUP BY u.id, u.displayname, u.reputation
+  ),
+  tag_user AS (
+    SELECT
+      tm.tag,
+      um.*
+    FROM tag_metrics tm
+    JOIN questions q   ON q.tag = tm.tag
+    JOIN user_metrics um ON um.user_id = q.owneruserid
+  ),
+  rank_by_tag AS (
+    SELECT
+      tag,
+      displayname,
+      reputation,
+      questions,
+      answers,
+      avg_answer_score,
+      gold,
+      silver,
+      bronze,
+      row_number() OVER (
+        PARTITION BY tag
+        ORDER BY answers DESC, avg_answer_score DESC
+      ) AS tag_rank
+    FROM tag_user
+  )
+SELECT
+  tag,
+  displayname,
+  reputation,
+  questions,
+  answers,
+  avg_answer_score,
+  gold,
+  silver,
+  bronze,
+  tag_rank
+FROM rank_by_tag
+WHERE tag_rank <= 3
+ORDER BY tag, tag_rank;

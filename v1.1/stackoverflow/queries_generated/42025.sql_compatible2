@@ -1,0 +1,47 @@
+SELECT 
+    p.Id, 
+    p.Title, 
+    p.Score, 
+    u.DisplayName AS OwnerName, 
+    u.Reputation, 
+    COUNT(v.Id) AS VoteCount, 
+    COUNT(c.Id) AS CommentCount, 
+    COUNT(ph.Id) AS HistoryCount, 
+    (SELECT COUNT(*)
+     FROM PostLinks pl
+     WHERE pl.PostId = p.Id) AS LinkCount,
+    (SELECT COUNT(*)
+     FROM Tags t
+     WHERE t.Id IN (
+         SELECT CAST(x AS INTEGER)
+         FROM UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><')) AS x
+     )) AS TagCount
+FROM 
+    Posts p
+JOIN 
+    Users u ON p.OwnerUserId = u.Id
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    Comments c ON p.Id = c.PostId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+WHERE 
+    p.PostTypeId = 1
+    AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+GROUP BY 
+    p.Id, 
+    p.Title,
+    p.Score,
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    p.Tags
+HAVING 
+    COUNT(v.Id) > 10 
+    AND COUNT(c.Id) > 5
+ORDER BY 
+    p.Score DESC, 
+    VoteCount DESC, 
+    CommentCount DESC
+LIMIT 100;

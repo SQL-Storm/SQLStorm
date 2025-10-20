@@ -1,0 +1,89 @@
+WITH question_info AS (
+    SELECT
+        p.Id              AS qid,
+        p.OwnerUserId,
+        p.Score,
+        p.Tags,
+        p.CreationDate
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+
+tag_list AS (
+    SELECT
+        qid,
+        TRIM(BOTH '<>' FROM UNNEST(string_to_array(Tags, ','))) AS tag
+    FROM question_info
+),
+
+tag_counts AS (
+    SELECT
+        tag,
+        COUNT(*) AS question_count
+    FROM tag_list
+    GROUP BY tag
+    ORDER BY question_count DESC
+    LIMIT 10
+),
+
+user_stats AS (
+    SELECT
+        q.OwnerUserId,
+        COUNT(DISTINCT q.qid)            AS question_count,
+        SUM(q.Score)                     AS total_score,
+        AVG(q.Score)                     AS avg_score,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)       AS upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)       AS downvotes,
+        STRING_AGG(DISTINCT t.tag, ',')   AS tags
+    FROM question_info q
+    LEFT JOIN Votes v
+        ON v.PostId = q.qid
+    LEFT JOIN tag_list t
+        ON t.qid = q.qid
+    GROUP BY q.OwnerUserId
+    HAVING COUNT(DISTINCT q.qid) >= 10
+),
+
+user_ranks AS (
+    SELECT
+        us.OwnerUserId,
+        us.question_count,
+        us.total_score,
+        us.avg_score,
+        us.upvotes,
+        us.downvotes,
+        us.tags,
+        NTILE(3) OVER (ORDER BY us.avg_score DESC) AS score_bucket
+    FROM user_stats us
+),
+
+-- expand users' tag lists into rows so we can join to tag_counts without a subquery in JOIN
+user_tags AS (
+    SELECT
+        OwnerUserId,
+        TRIM(tag) AS tag
+    FROM user_ranks,
+    UNNEST(string_to_array(tags, ',')) AS tag
+)
+
+SELECT
+    ur.OwnerUserId,
+    u.DisplayName,
+    ur.question_count,
+    ur.total_score,
+    ur.avg_score,
+    ur.upvotes,
+    ur.downvotes,
+    ur.tags,
+    ur.score_bucket,
+    tc.tag,
+    tc.question_count AS tag_used
+FROM user_ranks ur
+JOIN Users u
+    ON u.Id = ur.OwnerUserId
+LEFT JOIN user_tags ut
+    ON ut.OwnerUserId = ur.OwnerUserId
+LEFT JOIN tag_counts tc
+    ON tc.tag = ut.tag
+ORDER BY ur.avg_score DESC
+LIMIT 50;

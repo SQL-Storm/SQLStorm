@@ -1,0 +1,80 @@
+SELECT
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    p.PostCount,
+    b.BadgeCount,
+    COALESCE(q.AcceptedAnswerCount, 0) AS AcceptedAnswerCount,
+    COALESCE(a.AnswerScoreSum, 0) AS AnswerScoreSum,
+    t.Tags
+FROM
+    Users u
+LEFT JOIN (
+    SELECT
+        OwnerUserId,
+        COUNT(*) AS PostCount
+    FROM
+        Posts
+    GROUP BY
+        OwnerUserId
+) p ON u.Id = p.OwnerUserId
+LEFT JOIN (
+    SELECT
+        UserId,
+        COUNT(*) AS BadgeCount
+    FROM
+        Badges
+    GROUP BY
+        UserId
+) b ON u.Id = b.UserId
+LEFT JOIN (
+    SELECT
+        OwnerUserId,
+        COUNT(*) AS AcceptedAnswerCount
+    FROM
+        Posts
+    WHERE
+        PostTypeId = 1
+        AND AcceptedAnswerId IS NOT NULL
+    GROUP BY
+        OwnerUserId
+) q ON u.Id = q.OwnerUserId
+LEFT JOIN (
+    SELECT
+        ParentId,
+        SUM(Score) AS AnswerScoreSum
+    FROM
+        Posts
+    WHERE
+        PostTypeId = 2
+    GROUP BY
+        ParentId
+) a ON u.Id = a.ParentId
+LEFT JOIN (
+    SELECT
+        OwnerUserId,
+        STRING_AGG(TagName, ', ' ORDER BY TagName) AS Tags
+    FROM (
+        SELECT
+            p2.OwnerUserId,
+            TRIM(tag) AS TagName
+        FROM
+            Posts p2,
+            LATERAL (
+                SELECT
+                    regexp_split_to_table(
+                        regexp_replace(Tags, '^<|>$', '', 'g'),
+                        '><'
+                    ) AS tag
+            ) s
+        WHERE
+            p2.PostTypeId = 1
+    ) sub
+    GROUP BY
+        OwnerUserId
+) t ON u.Id = t.OwnerUserId
+WHERE
+    u.CreationDate > (DATE '2024-10-01' - INTERVAL '1' YEAR)
+ORDER BY
+    u.Reputation DESC,
+    p.PostCount DESC;

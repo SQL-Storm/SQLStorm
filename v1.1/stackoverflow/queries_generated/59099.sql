@@ -1,0 +1,79 @@
+-- {"query": "59099.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2061, "output_tokens": 922} 
+SELECT 
+    p.Id AS PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    COUNT(DISTINCT v.Id) AS VoteCount,
+    COUNT(DISTINCT ph.Id) AS HistoryCount,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS Tags,
+    CASE 
+        WHEN p.PostTypeId = 1 THEN 'Question'
+        WHEN p.PostTypeId = 2 THEN 'Answer'
+        WHEN p.PostTypeId = 3 THEN 'Wiki'
+        WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+        WHEN p.PostTypeId = 5 THEN 'TagWiki'
+        WHEN p.PostTypeId = 6 THEN 'ModeratorNomination'
+        WHEN p.PostTypeId = 7 THEN 'WikiPlaceholder'
+        WHEN p.PostTypeId = 8 THEN 'PrivilegeWiki'
+    END AS PostType,
+    CASE 
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        WHEN p.ParentId IS NOT NULL THEN 'Answer'
+        ELSE 'Question'
+    END AS PostStatus,
+    COALESCE(p.AnswerCount, 0) AS AnswerCount,
+    COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+    MIN(ph.CreationDate) AS FirstEditDate,
+    MAX(ph.CreationDate) AS LastEditDate,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpvoteCount,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownvoteCount,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.Id END) AS FavoriteCount,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN ph.Id END) AS ModerationCount,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (1, 4, 7) THEN ph.Id END) AS TitleChangesCount,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (2, 5, 8) THEN ph.Id END) AS BodyChangesCount,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (3, 6, 9) THEN ph.Id END) AS TagChangesCount,
+    STRING_AGG(DISTINCT b.Name, ', ') AS Badges,
+    STRING_AGG(DISTINCT pl.Id, ', ') AS LinkIds,
+    COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.Id END) AS DuplicateLinksCount,
+    COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 1 THEN pl.Id END) AS LinkedPostsCount
+FROM Posts p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Comments c ON p.Id = c.PostId
+LEFT JOIN Votes v ON p.Id = v.PostId
+LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+LEFT JOIN Badges b ON p.OwnerUserId = b.UserId
+WHERE p.CreationDate BETWEEN '2010-01-01' AND '2023-12-31'
+    AND p.PostTypeId IN (1, 2, 3, 4, 5, 6, 7, 8)
+    AND (p.Score >= 0 OR p.Score IS NULL)
+    AND (p.ViewCount >= 0 OR p.ViewCount IS NULL)
+GROUP BY 
+    p.Id,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    u.DisplayName,
+    u.Reputation,
+    p.PostTypeId,
+    p.ClosedDate,
+    p.CommunityOwnedDate,
+    p.ParentId,
+    p.AnswerCount,
+    p.FavoriteCount
+HAVING 
+    COUNT(DISTINCT c.Id) >= 0
+    AND COUNT(DISTINCT v.Id) >= 0
+    AND COUNT(DISTINCT ph.Id) >= 0
+ORDER BY 
+    p.Score DESC,
+    p.ViewCount DESC,
+    p.CreationDate DESC
+LIMIT 10000;

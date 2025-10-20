@@ -1,0 +1,37 @@
+WITH top_users AS (
+  SELECT u.Id, u.DisplayName, COUNT(p.Id) AS post_count
+  FROM Users u
+  JOIN Posts p ON u.Id = p.OwnerUserId
+  GROUP BY u.Id, u.DisplayName
+  ORDER BY post_count DESC
+  LIMIT 10
+),
+top_posts AS (
+  SELECT p.Id, p.Title, p.Score, p.ViewCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1 AND p.Score > 100
+  ORDER BY p.Score DESC
+  LIMIT 10
+),
+top_tags AS (
+  SELECT t.Id AS TagId, t.TagName, COUNT(pt.PostId) AS post_count
+  FROM Tags t
+  JOIN PostTags pt ON t.Id = pt.TagId
+  GROUP BY t.Id, t.TagName
+  ORDER BY post_count DESC
+  LIMIT 10
+)
+SELECT 
+  tu.DisplayName AS top_user,
+  tp.Title AS top_post,
+  tt.TagName AS top_tag,
+  COUNT(v.Id) AS vote_count,
+  SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvote_count,
+  SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvote_count
+FROM Votes v
+JOIN top_users tu ON v.UserId = tu.Id
+JOIN top_posts tp ON v.PostId = tp.Id
+JOIN PostTags pt2 ON pt2.PostId = tp.Id
+JOIN top_tags tt ON pt2.TagId = tt.TagId
+GROUP BY tu.DisplayName, tp.Title, tt.TagName
+ORDER BY vote_count DESC;

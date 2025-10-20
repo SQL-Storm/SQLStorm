@@ -1,0 +1,98 @@
+WITH user_stats AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END)               AS QuestionCount,
+           COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END)               AS AnswerCount,
+           COALESCE(SUM(p.Score),0)                                               AS TotalPostScore,
+           AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END)::numeric            AS AvgAnswerScore,
+           MAX(p.CreationDate)                                                    AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+badge_stats AS (
+    SELECT b.UserId,
+           SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)                         AS GoldBadges,
+           SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END)                         AS SilverBadges,
+           SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END)                         AS BronzeBadges,
+           json_agg(DISTINCT CASE WHEN b.TagBased = 0 THEN b.Name END)           AS NamedBadges,
+           json_agg(DISTINCT CASE WHEN b.TagBased = 1 THEN b.Name END)           AS TagBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+vote_stats AS (
+    SELECT v.PostId,
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)                    AS UpVotes,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)                    AS DownVotes,
+           MAX(v.CreationDate)                                                  AS LastVoteDate
+    FROM Votes v
+    GROUP BY v.PostId
+),
+recent_activity AS (
+    SELECT u.Id AS UserId,
+           MAX(a.activity_date)                                                 AS LastActivity
+    FROM Users u
+    LEFT JOIN LATERAL (
+        SELECT GREATEST(
+                   p.CreationDate,
+                   COALESCE(p.LastEditDate, TIMESTAMP '1970-01-01'),
+                   COALESCE(vs.LastVoteDate, TIMESTAMP '1970-01-01')
+               ) AS activity_date
+        FROM Posts p
+        LEFT JOIN vote_stats vs ON vs.PostId = p.Id
+        WHERE p.OwnerUserId = u.Id
+        UNION ALL
+        SELECT c.CreationDate AS activity_date
+        FROM Comments c
+        WHERE c.UserId = u.Id
+        UNION ALL
+        SELECT ph.CreationDate AS activity_date
+        FROM PostHistory ph
+        WHERE ph.UserId = u.Id
+    ) a ON true
+    GROUP BY u.Id
+)
+SELECT us.Id,
+       us.DisplayName,
+       us.Reputation,
+       us.QuestionCount,
+       us.AnswerCount,
+       us.TotalPostScore,
+       ROUND(us.AvgAnswerScore,2)                                               AS AvgAnswerScore,
+       us.LastPostDate,
+       bs.GoldBadges,
+       bs.SilverBadges,
+       bs.BronzeBadges,
+       bs.NamedBadges,
+       bs.TagBadges,
+       ra.LastActivity,
+       json_build_object(
+           'TopTags',
+               (SELECT json_agg(t.TagName)
+                FROM (
+                      SELECT replace(replace(tag,'<',''),'>','') AS clean_tag
+                      FROM (
+                            SELECT unnest(string_to_array(p.Tags, '><')) AS tag
+                            FROM Posts p
+                            WHERE p.OwnerUserId = us.Id AND p.PostTypeId = 1
+                      ) sub
+                ) pt
+                JOIN Tags t ON t.TagName = pt.clean_tag
+                GROUP BY t.TagName
+                ORDER BY COUNT(*) DESC
+                LIMIT 5),
+           'DuplicateLinks',
+               (SELECT json_agg(json_build_object('PostId', pl.PostId,
+                                                 'DuplicateOf', pl.RelatedPostId))
+                FROM PostLinks pl
+                WHERE pl.LinkTypeId = 3
+                  AND pl.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = us.Id))
+       )                                                                          AS ExtraInfo
+FROM user_stats us
+LEFT JOIN badge_stats bs   ON bs.UserId = us.Id
+LEFT JOIN recent_activity ra ON ra.UserId = us.Id
+WHERE us.Reputation > 50000
+GROUP BY us.Id, us.DisplayName, us.Reputation, us.QuestionCount, us.AnswerCount, us.TotalPostScore, us.AvgAnswerScore, us.LastPostDate, bs.GoldBadges, bs.SilverBadges, bs.BronzeBadges, bs.NamedBadges, bs.TagBadges, ra.LastActivity
+ORDER BY us.Reputation DESC
+LIMIT 10;

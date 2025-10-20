@@ -1,0 +1,63 @@
+WITH HighReputationUsers AS (
+    SELECT Id AS UserId
+    FROM Users
+    WHERE Reputation > 100000
+),
+PopularTags AS (
+    SELECT TagName
+    FROM Tags
+    WHERE "Count" > 1000
+),
+QuestionStatistics AS (
+    SELECT 
+        p.Id AS PostId,
+        p.CreationDate,
+        p.Score,
+        COUNT(a.Id) AS AnswerCount,
+        AVG(a.Score) AS AvgAnswerScore,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM Posts p
+    LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.CreationDate, p.Score
+    HAVING COUNT(a.Id) > 5
+),
+ActiveModerators AS (
+    SELECT u.Id AS UserId, COUNT(*) AS EditCount
+    FROM Users u
+    INNER JOIN PostHistory ph ON ph.UserId = u.Id
+    WHERE ph.PostHistoryTypeId IN (24, 4, 5, 6)
+    GROUP BY u.Id
+    HAVING COUNT(*) > 50
+)
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT ph.Id) AS TotalEdits,
+    COUNT(DISTINCT b.Id) AS TotalBadges,
+    COUNT(DISTINCT QS.PostId) AS HighReputationPosts,
+    PSI.AvgAnswerScore,
+    SUM(CASE WHEN ti.TagName IN (SELECT TagName FROM PopularTags) THEN 1 ELSE 0 END) AS PopularTagCount,
+    SUM(COALESCE(v.BountyAmount, 0)) AS TotalBountyAmount
+FROM Users u
+LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+LEFT JOIN Badges b ON b.UserId = u.Id
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN QuestionStatistics QS ON QS.PostId = p.Id
+LEFT JOIN QuestionStatistics PSI ON PSI.PostId = ph.PostId
+LEFT JOIN Votes v ON v.PostId = p.Id
+LEFT JOIN HighReputationUsers hl ON hl.UserId = u.Id
+LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(p2.Tags FROM 2 FOR (char_length(p2.Tags) - 2)), '><')) AS TagName
+    FROM Posts p2
+    WHERE p2.OwnerUserId = u.Id
+) ti ON true
+WHERE u.Id IN (SELECT UserId FROM HighReputationUsers)
+   OR u.Id IN (SELECT UserId FROM ActiveModerators)
+GROUP BY u.Id, u.DisplayName, u.Reputation, PSI.AvgAnswerScore
+HAVING COUNT(DISTINCT ph.Id) > 10
+ORDER BY u.Reputation DESC, TotalEdits DESC
+LIMIT 100;

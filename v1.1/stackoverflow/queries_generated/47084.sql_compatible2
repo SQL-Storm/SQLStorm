@@ -1,0 +1,145 @@
+WITH RECURSIVE tag_hierarchy AS (
+    -- base term
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS question_count,
+        AVG(p.Score) AS avg_score,
+        1 AS level
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE p.PostTypeId = 1
+      AND t.Count > 1000
+    GROUP BY t.Id, t.TagName
+
+    UNION ALL
+
+    -- recursive term: expand neighbors by joining Posts and Tags; avoid referencing the recursive CTE more than once per SELECT
+    SELECT
+        neigh.Id,
+        neigh.TagName,
+        neigh.question_count,
+        neigh.avg_score,
+        th.level + 1
+    FROM tag_hierarchy th
+    JOIN (
+        -- derive neighboring tags for a single parent row
+        -- this subquery does not reference tag_hierarchy except once via lateral-like correlation through th values
+        SELECT
+            t2.Id,
+            t2.TagName,
+            COUNT(DISTINCT p2.Id) AS question_count,
+            AVG(p2.Score) AS avg_score,
+            th_row.level AS parent_level,
+            th_row.TagName AS parent_tag
+        FROM (
+            VALUES (0) -- dummy to allow referencing outer th via correlation in a portable way
+        ) v(dummy)
+        JOIN Posts p1 ON p1.Tags LIKE '%' || '<' || th.TagName || '>' || '%'  -- correlated to outer th
+        JOIN Posts p2 ON p2.Tags LIKE '%' || '<' || th.TagName || '>' || '%'
+            AND p2.Id <> p1.Id
+            AND p2.Tags <> p1.Tags
+        JOIN Tags t2 ON p2.Tags LIKE '%' || '<' || t2.TagName || '>' || '%'
+            AND t2.TagName <> th.TagName
+        WHERE th.level < 3
+          AND p1.PostTypeId = 1
+          AND p2.PostTypeId = 1
+        GROUP BY t2.Id, t2.TagName, th.TagName, th.level
+    ) AS neigh ON neigh.parent_tag = th.TagName AND neigh.parent_level = th.level
+    WHERE th.level < 3
+),
+
+user_expertise AS (
+    SELECT 
+        u.Id AS user_id,
+        u.DisplayName,
+        t.TagName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS answers,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS questions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS answer_score,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Id = q.AcceptedAnswerId THEN p.Id END) AS accepted_answers,
+        COUNT(DISTINCT b.Id) AS tag_badges,
+        DENSE_RANK() OVER (PARTITION BY t.TagName ORDER BY SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) DESC) AS expertise_rank
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    JOIN Tags t ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    LEFT JOIN Posts q ON q.AcceptedAnswerId = p.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id AND b.Name = t.TagName AND b.TagBased = TRUE
+    WHERE u.Reputation > 10000
+      AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years'
+    GROUP BY u.Id, u.DisplayName, t.TagName
+),
+
+temporal_patterns AS (
+    SELECT 
+        DATE_TRUNC('month', p.CreationDate) AS month,
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS posts,
+        COUNT(DISTINCT p.OwnerUserId) AS unique_users,
+        AVG(p.Score) AS avg_score,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS median_score,
+        PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY p.Score) AS p95_score,
+        COUNT(DISTINCT CASE WHEN p.ClosedDate IS NOT NULL THEN p.Id END) AS closed_posts,
+        AVG(CASE WHEN p.AnswerCount > 0 THEN p.AnswerCount END) AS avg_answers,
+        LAG(COUNT(DISTINCT p.Id), 1) OVER (PARTITION BY t.TagName ORDER BY DATE_TRUNC('month', p.CreationDate)) AS prev_month_posts,
+        LAG(COUNT(DISTINCT p.Id), 12) OVER (PARTITION BY t.TagName ORDER BY DATE_TRUNC('month', p.CreationDate)) AS year_ago_posts
+    FROM Posts p
+    JOIN Tags t ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '5 years'
+    GROUP BY DATE_TRUNC('month', p.CreationDate), t.TagName
+),
+
+edit_patterns AS (
+    SELECT 
+        ph.PostId,
+        p.OwnerUserId,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.Id END) AS edit_count,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (7, 8, 9) THEN ph.Id END) AS rollback_count,
+        COUNT(DISTINCT ph.UserId) AS unique_editors,
+        MAX(CASE WHEN ph.UserId <> p.OwnerUserId THEN 1 ELSE 0 END) AS has_community_edits,
+        STRING_AGG(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment ELSE NULL END, ',') AS close_reasons
+    FROM PostHistory ph
+    JOIN Posts p ON ph.PostId = p.Id
+    WHERE p.Score > 10
+    GROUP BY ph.PostId, p.OwnerUserId
+)
+
+SELECT 
+    th.TagName AS primary_tag,
+    th.level AS tag_level,
+    th.question_count,
+    ROUND(CAST(th.avg_score AS NUMERIC), 2) AS tag_avg_score,
+    ue.DisplayName AS top_expert,
+    ue.answers AS expert_answers,
+    ue.answer_score AS expert_total_score,
+    ue.accepted_answers AS expert_accepted,
+    tp.month,
+    tp.posts AS monthly_posts,
+    tp.unique_users AS monthly_active_users,
+    ROUND(CAST(tp.avg_score AS NUMERIC), 2) AS monthly_avg_score,
+    ROUND(CAST(tp.median_score AS NUMERIC), 2) AS monthly_median_score,
+    ROUND(100.0 * tp.closed_posts / NULLIF(tp.posts, 0), 2) AS close_rate_pct,
+    ROUND(100.0 * (tp.posts - COALESCE(tp.prev_month_posts, 0)) / NULLIF(tp.prev_month_posts, 0), 2) AS month_over_month_growth,
+    ROUND(100.0 * (tp.posts - COALESCE(tp.year_ago_posts, 0)) / NULLIF(tp.year_ago_posts, 0), 2) AS year_over_year_growth,
+    ep.edit_count,
+    ep.rollback_count,
+    ep.unique_editors,
+    CASE WHEN ep.has_community_edits = 1 THEN 'Yes' ELSE 'No' END AS has_community_edits,
+    ep.close_reasons
+FROM tag_hierarchy th
+JOIN user_expertise ue ON ue.TagName = th.TagName AND ue.expertise_rank = 1
+JOIN temporal_patterns tp ON tp.TagName = th.TagName
+LEFT JOIN Posts p ON p.Tags LIKE '%' || '<' || th.TagName || '>' || '%' 
+    AND p.PostTypeId = 1 
+    AND DATE_TRUNC('month', p.CreationDate) = tp.month
+LEFT JOIN edit_patterns ep ON ep.PostId = p.Id
+WHERE th.level <= 2
+  AND tp.posts > 100
+  AND tp.month >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+ORDER BY 
+    th.question_count DESC,
+    tp.month DESC,
+    th.level,
+    (100.0 * (tp.posts - COALESCE(tp.year_ago_posts, 0)) / NULLIF(tp.year_ago_posts, 0)) DESC
+LIMIT 1000;

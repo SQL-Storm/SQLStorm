@@ -1,0 +1,119 @@
+-- {"query": "34088.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 1024} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        ARRAY[t.Id] AS AncestorPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+
+    UNION ALL
+
+    SELECT 
+        ct.Id,
+        ct.TagName,
+        ct.Count,
+        p.AncestorPath || ct.Id
+    FROM Tags ct
+    JOIN PostLinks pl ON pl.PostId = ct.ExcerptPostId
+    JOIN RecursiveTagHierarchy p ON pl.RelatedPostId = p.Id
+    WHERE NOT ct.Id = ANY(p.AncestorPath) AND ct.IsModeratorOnly = 0 AND ct.IsRequired = 0
+),
+TopUsersWithBadges AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS Rnk
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(b.Id) > 10
+),
+ActiveQuestions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        p.CreationDate
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.CreationDate > NOW() - INTERVAL '2 years' AND p.Score >= 5
+),
+MostCommentedAnswers AS (
+    SELECT 
+        a.Id,
+        a.ParentId,
+        a.Score,
+        a.CommentCount,
+        a.CreationDate,
+        a.OwnerUserId
+    FROM Posts a
+    WHERE a.PostTypeId = 2 AND a.CommentCount >= 10
+),
+TopVotedAnswers AS (
+    SELECT 
+        a.Id,
+        a.ParentId,
+        COUNT(v.Id) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM Posts a
+    LEFT JOIN Votes v ON v.PostId = a.Id AND v.VoteTypeId IN (2,3)
+    WHERE a.PostTypeId = 2
+    GROUP BY a.Id, a.ParentId
+    HAVING COUNT(v.Id) > 50
+)
+SELECT 
+    q.Id AS QuestionId,
+    q.Title,
+    q.OwnerUserId,
+    u.DisplayName AS QuestionOwnerName,
+    q.Score AS QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    q.Tags,
+    a.Id AS AnswerId,
+    a.Score AS AnswerScore,
+    a.CommentCount AS AnswerComments,
+    vb.UpVotes,
+    vb.DownVotes,
+    au.DisplayName AS AnswerOwnerName,
+    bu.GoldBadges,
+    bu.SilverBadges,
+    bu.BronzeBadges,
+    ARRAY_TO_STRING(array_agg(DISTINCT t.TagName), ', ') AS RelatedTags,
+    ph.LatestEditDate,
+    CASE 
+        WHEN ph.PostClosedDate IS NOT NULL THEN 'Closed' 
+        ELSE 'Open' 
+    END AS QuestionStatus
+FROM ActiveQuestions q
+INNER JOIN Users u ON u.Id = q.OwnerUserId
+LEFT JOIN MostCommentedAnswers a ON a.ParentId = q.Id
+LEFT JOIN TopVotedAnswers vb ON vb.Id = a.Id
+LEFT JOIN Users au ON au.Id = a.OwnerUserId
+LEFT JOIN TopUsersWithBadges bu ON bu.UserId = q.OwnerUserId
+LEFT JOIN RecursiveTagHierarchy t ON t.TagName = ANY(string_to_array(substring(q.Tags from 2 for char_length(q.Tags)-2), '><'))
+LEFT JOIN (
+    SELECT 
+        ph.PostId,
+        MAX(ph.CreationDate) AS LatestEditDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate ELSE NULL END) AS PostClosedDate
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+) ph ON ph.PostId = q.Id
+GROUP BY 
+    q.Id, q.Title, q.OwnerUserId, u.DisplayName, q.Score, q.ViewCount, q.AnswerCount, q.Tags,
+    a.Id, a.Score, a.CommentCount, vb.UpVotes, vb.DownVotes, au.DisplayName,
+    bu.GoldBadges, bu.SilverBadges, bu.BronzeBadges,
+    ph.LatestEditDate, ph.PostClosedDate
+ORDER BY q.Score DESC, vb.UpVotes DESC NULLS LAST
+LIMIT 100;

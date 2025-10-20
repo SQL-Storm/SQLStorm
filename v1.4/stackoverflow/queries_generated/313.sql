@@ -1,0 +1,116 @@
+-- {"query": "313.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 16801} 
+WITH
+  post_votes AS (
+    SELECT v.PostId,
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes
+    FROM Votes v
+    GROUP BY v.PostId
+  ),
+  posts_with_votes AS (
+    SELECT p.*,
+           COALESCE(pv.Upvotes, 0) AS Upvotes,
+           COALESCE(pv.Downvotes, 0) AS Downvotes
+    FROM Posts p
+    LEFT JOIN post_votes pv ON pv.PostId = p.Id
+  ),
+  author_link AS (
+    SELECT pwv.*,
+           u.DisplayName AS OwnerDisplayName,
+           u.Reputation
+    FROM posts_with_votes pwv
+    LEFT JOIN Users u ON pwv.OwnerUserId = u.Id
+  ),
+  day_rank AS (
+    SELECT al.Id,
+           al.Title,
+           al.Tags,
+           al.OwnerUserId,
+           al.OwnerDisplayName,
+           al.Reputation,
+           al.CreationDate,
+           al.Score,
+           al.Upvotes,
+           al.Downvotes,
+           (al.Upvotes - al.Downvotes) AS NetVotes,
+           al.ViewCount,
+           al.CommentCount,
+           al.AnswerCount,
+           al.LastActivityDate,
+           al.LastEditDate,
+           al.Body,
+           al.PostTypeId,
+           ROW_NUMBER() OVER (
+             PARTITION BY DATE(al.CreationDate)
+             ORDER BY (al.Upvotes - al.Downvotes) DESC, al.ViewCount DESC
+           ) AS day_rank
+    FROM author_link al
+    WHERE al.PostTypeId = 1
+  )
+SELECT
+  dr.Id,
+  dr.Title,
+  dr.Tags,
+  dr.OwnerUserId,
+  dr.OwnerDisplayName,
+  dr.Reputation,
+  dr.CreationDate,
+  dr.Score,
+  dr.Upvotes,
+  dr.Downvotes,
+  dr.NetVotes,
+  dr.ViewCount,
+  dr.CommentCount,
+  dr.AnswerCount,
+  dr.LastActivityDate,
+  dr.LastEditDate,
+  substring(dr.Body from 1 for 200) AS BodyExcerpt,
+  md5(dr.Title || COALESCE(dr.Tags, '') || COALESCE(substring(dr.Body from 1 for 1000), '')) AS ContentDigest,
+  (
+     SELECT ph.Text
+     FROM PostHistory ph
+     WHERE ph.PostId = dr.Id
+       AND ph.PostHistoryTypeId = 10
+     ORDER BY ph.CreationDate DESC
+     LIMIT 1
+  ) AS LastCloseReasonText,
+  dr.day_rank
+FROM day_rank dr
+WHERE dr.PostTypeId = 1
+  AND (dr.NetVotes > 50 OR dr.ViewCount > 1000)
+  AND (LOWER(dr.Tags) LIKE '%<java>%' OR LOWER(dr.Tags) LIKE '%<python>%')
+UNION ALL
+SELECT
+  dr.Id,
+  dr.Title,
+  dr.Tags,
+  dr.OwnerUserId,
+  dr.OwnerDisplayName,
+  dr.Reputation,
+  dr.CreationDate,
+  dr.Score,
+  dr.Upvotes,
+  dr.Downvotes,
+  dr.NetVotes,
+  dr.ViewCount,
+  dr.CommentCount,
+  dr.AnswerCount,
+  dr.LastActivityDate,
+  dr.LastEditDate,
+  substring(dr.Body from 1 for 200) AS BodyExcerpt,
+  md5(dr.Title || COALESCE(dr.Tags, '') || COALESCE(substring(dr.Body from 1 for 1000), '')) AS ContentDigest,
+  (
+     SELECT ph.Text
+     FROM PostHistory ph
+     WHERE ph.PostId = dr.Id
+       AND ph.PostHistoryTypeId = 10
+     ORDER BY ph.CreationDate DESC
+     LIMIT 1
+  ) AS LastCloseReasonText,
+  dr.day_rank
+FROM day_rank dr
+WHERE dr.PostTypeId = 1
+  AND dr.NetVotes <= 50
+  AND dr.ViewCount > 2000
+ORDER BY NetVotes DESC, day_rank ASC
+LIMIT 400;

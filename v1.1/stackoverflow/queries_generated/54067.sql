@@ -1,0 +1,66 @@
+-- {"query": "54067.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2048, "output_tokens": 1279} 
+
+-- Top users per tag by cumulative question score (last year), limited to the best 10 tags
+WITH TagPosts AS (
+    SELECT
+        t.TagName,
+        p.Id        AS QuestionId,
+        p.OwnerUserId,
+        p.Score      AS QuestionScore,
+        p.CreationDate
+    FROM Tags AS t
+    JOIN Posts AS p
+        ON CHARINDEX('<' + t.TagName + '>', p.Tags) > 0
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= DATEADD(year, -1, GETDATE())
+),
+AnswerStats AS (
+    SELECT
+        qp.TagName,
+        qp.OwnerUserId,
+        COUNT(*)            AS AnswerCount,
+        SUM(v.Score)        AS TotalAnswerScore
+    FROM TagPosts AS qp
+    JOIN Posts AS a
+        ON a.ParentId   = qp.QuestionId
+        AND a.PostTypeId = 2
+    JOIN Votes  AS v
+        ON v.PostId      = a.Id
+        AND v.VoteTypeId = 2  -- upvotes only
+    GROUP BY qp.TagName, qp.OwnerUserId
+),
+TagUserStats AS (
+    SELECT
+        tp.TagName,
+        tp.OwnerUserId  AS UserId,
+        u.DisplayName,
+        SUM(tp.QuestionScore)            AS TotalQuestionScore,
+        COUNT(DISTINCT tp.QuestionId)    AS QuestionCnt,
+        ISNULL(asum.AnswerCount, 0)      AS AnswerCnt,
+        ISNULL(asum.TotalAnswerScore,0) AS TotalAnswerScore
+    FROM TagPosts AS tp
+    JOIN Users AS u
+        ON u.Id = tp.OwnerUserId
+    LEFT JOIN AnswerStats AS asum
+        ON asum.TagName = tp.TagName
+        AND asum.OwnerUserId = tp.OwnerUserId
+    GROUP BY tp.TagName, tp.OwnerUserId, u.DisplayName, asum.AnswerCount, asum.TotalAnswerScore
+),
+Ranked AS (
+    SELECT
+        *,
+        RANK() OVER (PARTITION BY TagName ORDER BY TotalQuestionScore DESC) AS TagRank
+    FROM TagUserStats
+)
+SELECT
+    TagName,
+    UserId,
+    DisplayName,
+    TotalQuestionScore,
+    QuestionCnt,
+    TotalAnswerScore,
+    AnswerCnt
+FROM Ranked
+WHERE TagRank = 1
+ORDER BY TotalQuestionScore DESC
+OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY;

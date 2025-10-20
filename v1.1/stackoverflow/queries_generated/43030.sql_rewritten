@@ -1,0 +1,32 @@
+-- {"query": "43030.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "nova-premier", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2135, "output_tokens": 386} 
+SELECT 
+    U.DisplayName,
+    U.Reputation,
+    COUNT(DISTINCT P.Id) AS TotalPosts,
+    SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    AVG(P.Score) AS AvgPostScore,
+    SUM(P.ViewCount) AS TotalViewCount,
+    COUNT(DISTINCT B.Id) AS TotalBadges,
+    MAX(B.Date) AS LastBadgeDate,
+    COUNT(DISTINCT C.Id) AS TotalComments,
+    MAX(PH.CreationDate) AS LastEditDate,
+    (SELECT COUNT(*) FROM Votes WHERE UserId = U.Id AND VoteTypeId = 2) AS TotalUpVotesGiven,
+    (SELECT COUNT(*) FROM Votes WHERE UserId = U.Id AND VoteTypeId = 3) AS TotalDownVotesGiven
+FROM 
+    Users U
+LEFT JOIN 
+    Posts P ON U.Id = P.OwnerUserId
+LEFT JOIN 
+    Badges B ON U.Id = B.UserId
+LEFT JOIN 
+    Comments C ON U.Id = C.UserId
+LEFT JOIN 
+    (SELECT DISTINCT ON (PostId) * FROM PostHistory WHERE PostHistoryTypeId IN (4, 5, 6) ORDER BY PostId, CreationDate DESC) PH ON P.Id = PH.PostId
+WHERE 
+    U.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 YEAR'
+GROUP BY 
+    U.Id
+ORDER BY 
+    TotalPosts DESC, AvgPostScore DESC
+LIMIT 10;

@@ -1,0 +1,60 @@
+SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate AS PostCreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    pt.Name AS PostType,
+    array_length(string_to_array(substring(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><'), 1) AS TagCount,
+    u.Reputation AS OwnerReputation,
+    u.DisplayName AS OwnerDisplayName,
+    u.Location,
+    u.Views AS ProfileViews,
+    u.UpVotes AS UpVotes,
+    u.DownVotes AS DownVotes,
+    u.CreationDate AS UserSince,
+    COALESCE(b.Name, 'No Badge') AS TopBadge,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesCount,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesCount,
+    COUNT(c.Id) AS CommentCount,
+    SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedPosts,
+    SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicatedPosts,
+    MAX(vs_lastvote) AS LastVoteDate,
+    MAX(c.CreationDate) AS LastCommentDate,
+    MAX(p.LastActivityDate) AS LastActivity,
+    array_agg(DISTINCT th.Id) AS RevisionTypes,
+    COUNT(DISTINCT ph.Id) AS RecentRevisions
+FROM
+    Posts p
+JOIN
+    PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN
+    Users u ON p.OwnerUserId = u.Id
+LEFT JOIN
+    Badges b ON u.Id = b.UserId
+LEFT JOIN
+    Votes v ON p.Id = v.PostId
+LEFT JOIN
+    Comments c ON p.Id = c.PostId
+LEFT JOIN
+    PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN
+    PostHistoryTypes th ON ph.PostHistoryTypeId = th.Id
+LEFT JOIN
+    VoteTypes vt ON v.VoteTypeId = vt.Id
+LEFT JOIN
+    (SELECT PostId, MAX(CreationDate) AS vs_lastvote FROM Votes GROUP BY PostId) vs ON vs.PostId = p.Id
+WHERE
+    p.CreationDate BETWEEN DATE '2020-01-01' AND DATE '2020-12-31'
+    AND p.PostTypeId IN (1, 2)
+GROUP BY
+    p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount,
+    pt.Name, u.Reputation, u.DisplayName, u.Location, u.Views, u.UpVotes, u.DownVotes,
+    u.CreationDate, b.Name, p.LastActivityDate
+ORDER BY
+    p.CreationDate DESC
+LIMIT 100;

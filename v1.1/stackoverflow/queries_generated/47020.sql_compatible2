@@ -1,0 +1,154 @@
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT pt.Id) AS direct_questions,
+        t.Count AS total_posts
+    FROM Tags t
+    INNER JOIN Posts pt ON pt.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE pt.PostTypeId = 1
+    GROUP BY t.Id, t.TagName, t.Count
+),
+user_expertise AS (
+    SELECT 
+        u.Id AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS answers_in_tag,
+        AVG(p.Score) AS avg_answer_score,
+        SUM(CASE WHEN p.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS accepted_answers,
+        -- replace percentile_cont with a percentile approximation using windowed row_number approach
+        (SELECT AVG(s.score_val)
+         FROM (
+             SELECT p2.Score AS score_val,
+                    ROW_NUMBER() OVER (ORDER BY p2.Score) AS rn,
+                    COUNT(*) OVER () AS cnt
+             FROM Posts p2
+             INNER JOIN Posts q2 ON q2.Id = p2.ParentId
+             INNER JOIN Tags t2 ON q2.Tags LIKE '%' || '<' || t2.TagName || '>' || '%'
+             WHERE p2.OwnerUserId = u.Id
+               AND p2.PostTypeId = 2
+               AND t2.TagName = t.TagName
+               AND p2.Score IS NOT NULL
+         ) s
+         WHERE rn IN (FLOOR((cnt+1)*0.5)::integer, CEIL((cnt+1)*0.5)::integer)
+        ) AS median_score,
+        STDDEV(p.Score) AS score_deviation,
+        MIN(p.CreationDate) AS first_answer_date,
+        MAX(p.CreationDate) AS last_answer_date
+    FROM Users u
+    INNER JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 2
+    INNER JOIN Posts q ON q.Id = p.ParentId
+    INNER JOIN Tags t ON q.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE u.Reputation > 1000
+        AND p.Score >= 0
+        AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, t.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 5
+),
+badge_statistics AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS gold_badges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS silver_badges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS bronze_badges,
+        COUNT(CASE WHEN b.TagBased = TRUE THEN 1 END) AS tag_badges,
+        STRING_AGG(CASE WHEN b.Class = 1 THEN b.Name END, ', ' ORDER BY b.Date DESC) AS gold_badge_names
+    FROM Badges b
+    GROUP BY b.UserId
+),
+post_evolution AS (
+    SELECT 
+        ph.PostId,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.Id END) AS edit_count,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (7,8,9) THEN ph.Id END) AS rollback_count,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS was_closed,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS was_reopened,
+        MIN(ph.CreationDate) AS first_activity,
+        MAX(ph.CreationDate) AS last_activity,
+        COUNT(DISTINCT ph.UserId) AS unique_editors
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+comment_analysis AS (
+    SELECT 
+        c.PostId,
+        COUNT(*) AS total_comments,
+        AVG(c.Score) AS avg_comment_score,
+        COUNT(DISTINCT c.UserId) AS unique_commenters,
+        MAX(c.Score) AS max_comment_score,
+        EXTRACT(EPOCH FROM (MAX(c.CreationDate) - MIN(c.CreationDate)))/3600 AS discussion_duration_hours
+    FROM Comments c
+    GROUP BY c.PostId
+    HAVING COUNT(*) >= 3
+)
+SELECT 
+    ue.DisplayName,
+    ue.TagName,
+    ue.Reputation,
+    ue.answers_in_tag,
+    ue.avg_answer_score,
+    ue.accepted_answers,
+    ROUND(CAST(ue.accepted_answers AS numeric) / NULLIF(ue.answers_in_tag, 0) * 100, 2) AS acceptance_rate,
+    ue.median_score,
+    ROUND(CAST(ue.score_deviation AS numeric), 2) AS score_deviation,
+    bs.gold_badges,
+    bs.silver_badges,
+    bs.bronze_badges,
+    bs.tag_badges,
+    bs.gold_badge_names,
+    th.direct_questions AS tag_question_count,
+    th.total_posts AS tag_total_posts,
+    ROUND(CAST(ue.answers_in_tag AS numeric) / NULLIF(th.direct_questions, 0) * 100, 4) AS tag_coverage_percentage,
+    COUNT(DISTINCT pe.PostId) AS edited_answers,
+    AVG(pe.edit_count) AS avg_edits_per_answer,
+    SUM(pe.was_closed) AS closed_questions_answered,
+    SUM(pe.was_reopened) AS reopened_questions_answered,
+    AVG(ca.total_comments) AS avg_comments_on_answers,
+    AVG(ca.avg_comment_score) AS avg_comment_score_on_answers,
+    AVG(ca.discussion_duration_hours) AS avg_discussion_hours,
+    EXTRACT(DAY FROM (ue.last_answer_date - ue.first_answer_date)) AS days_active_in_tag,
+    ROUND(CAST(ue.answers_in_tag AS numeric) / NULLIF(EXTRACT(DAY FROM (ue.last_answer_date - ue.first_answer_date)), 0), 4) AS answers_per_day,
+    DENSE_RANK() OVER (PARTITION BY ue.TagName ORDER BY ue.avg_answer_score DESC, ue.accepted_answers DESC) AS tag_rank,
+    DENSE_RANK() OVER (ORDER BY ue.Reputation DESC) AS overall_reputation_rank,
+    -- approximate 90th percentile using windowing (percentile_cont WITHIN GROUP not used)
+    (SELECT AVG(s2.score_val)
+     FROM (
+         SELECT p3.Score AS score_val,
+                ROW_NUMBER() OVER (PARTITION BY q3.Id ORDER BY p3.Score) AS rn,
+                COUNT(*) OVER () AS cnt
+         FROM Posts p3
+         INNER JOIN Posts q3 ON q3.Id = p3.ParentId
+         INNER JOIN Tags t3 ON q3.Tags LIKE '%' || '<' || t3.TagName || '>' || '%'
+         WHERE t3.TagName = ue.TagName
+           AND p3.Score IS NOT NULL
+     ) s2
+     WHERE rn = CEIL(0.9 * cnt)
+    ) AS tag_90th_percentile_score,
+    LAG(ue.avg_answer_score, 1) OVER (PARTITION BY ue.TagName ORDER BY ue.avg_answer_score DESC) AS next_best_avg_score,
+    LEAD(ue.avg_answer_score, 1) OVER (PARTITION BY ue.TagName ORDER BY ue.avg_answer_score DESC) AS prev_best_avg_score
+FROM user_expertise ue
+LEFT JOIN badge_statistics bs ON bs.UserId = ue.user_id
+LEFT JOIN tag_hierarchy th ON th.TagName = ue.TagName
+LEFT JOIN Posts p ON p.OwnerUserId = ue.user_id AND p.PostTypeId = 2
+LEFT JOIN Posts q ON q.Id = p.ParentId AND q.Tags LIKE '%' || '<' || ue.TagName || '>' || '%'
+LEFT JOIN post_evolution pe ON pe.PostId = p.Id
+LEFT JOIN comment_analysis ca ON ca.PostId = p.Id
+WHERE ue.avg_answer_score >= 5
+    AND ue.answers_in_tag >= 10
+    AND th.direct_questions >= 100
+GROUP BY 
+    ue.DisplayName, ue.TagName, ue.Reputation, ue.answers_in_tag, 
+    ue.avg_answer_score, ue.accepted_answers, ue.median_score, 
+    ue.score_deviation, bs.gold_badges, bs.silver_badges, 
+    bs.bronze_badges, bs.tag_badges, bs.gold_badge_names,
+    th.direct_questions, th.total_posts, ue.first_answer_date,
+    ue.last_answer_date, ue.user_id, ue.last_answer_date, ue.first_answer_date
+HAVING COUNT(DISTINCT pe.PostId) > 0
+ORDER BY 
+    ue.TagName ASC, 
+    tag_rank ASC,
+    ue.avg_answer_score DESC,
+    ue.accepted_answers DESC
+LIMIT 500;

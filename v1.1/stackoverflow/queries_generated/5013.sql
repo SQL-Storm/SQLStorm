@@ -1,4 +1,4 @@
--- {"query": "5013.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1186} 
+-- {"query": "5013.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1186} 
 WITH MostViewedTagQuestions AS (
     SELECT
         unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName,

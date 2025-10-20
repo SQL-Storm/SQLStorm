@@ -1,0 +1,174 @@
+WITH UserPostStats AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        SUM(p.Score) AS TotalPostScore,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN p.Id END) AS QuestionsWithAnswers,
+        SUM(p.ViewCount) AS TotalPostViews
+    FROM Posts AS p
+    WHERE
+        p.PostTypeId IN (1, 2)
+        AND p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+        AND p.CreationDate >= '2020-01-01' AND p.CreationDate < '2023-01-01'
+    GROUP BY p.OwnerUserId
+),
+UserCommentMetrics AS (
+    SELECT
+        c.UserId,
+        AVG(c.Score) AS AvgPositiveCommentScore,
+        COUNT(c.Id) AS TotalPositiveCommentsMade
+    FROM Comments AS c
+    WHERE
+        c.Score > 0
+        AND c.UserId IS NOT NULL AND c.UserId > 0
+        AND c.CreationDate >= '2020-01-01' AND c.CreationDate < '2023-01-01'
+    GROUP BY c.UserId
+),
+UserBadgeBreakdown AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        COUNT(b.Id) AS TotalBadges
+    FROM Badges AS b
+    WHERE
+        b.UserId IS NOT NULL AND b.UserId > 0
+        AND b.Date >= '2020-01-01' AND b.Date < '2023-01-01'
+    GROUP BY b.UserId
+),
+UserPostEditAnalysis AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(DISTINCT ph.PostId) AS DistinctPostsEditedByOthers,
+        COUNT(ph.Id) AS TotalEditsByOthersOnPosts
+    FROM PostHistory AS ph
+    JOIN Posts AS p ON ph.PostId = p.Id
+    WHERE
+        ph.PostHistoryTypeId IN (4, 5, 6)
+        AND ph.UserId IS NOT NULL AND ph.UserId > 0
+        AND p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+        AND ph.UserId <> p.OwnerUserId
+        AND ph.CreationDate >= '2020-01-01' AND ph.CreationDate < '2023-01-01'
+    GROUP BY p.OwnerUserId
+),
+-- Replace UNNEST/string_to_array with a set-returning approach using a recursive split for portability.
+SplitTags AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId AS UserId,
+        TRIM(SUBSTR(p.Tags, 2, LENGTH(p.Tags)-2)) AS InnerTags
+    FROM Posts p
+    WHERE
+        p.PostTypeId = 1
+        AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+        AND p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+        AND p.CreationDate >= '2020-01-01' AND p.CreationDate < '2023-01-01'
+),
+TagParts AS (
+    -- Recursive splitter: splits InnerTags on '><' into multiple rows.
+    SELECT
+        PostId,
+        UserId,
+        CASE
+            WHEN INSTR(InnerTags, '><') = 0 THEN InnerTags
+            ELSE SUBSTR(InnerTags, 1, INSTR(InnerTags, '><') - 1)
+        END AS TagName,
+        CASE
+            WHEN INSTR(InnerTags, '><') = 0 THEN NULL
+            ELSE SUBSTR(InnerTags, INSTR(InnerTags, '><') + 2)
+        END AS Remainder
+    FROM SplitTags
+    UNION ALL
+    SELECT
+        PostId,
+        UserId,
+        CASE
+            WHEN INSTR(Remainder, '><') = 0 THEN Remainder
+            ELSE SUBSTR(Remainder, 1, INSTR(Remainder, '><') - 1)
+        END AS TagName,
+        CASE
+            WHEN INSTR(Remainder, '><') = 0 THEN NULL
+            ELSE SUBSTR(Remainder, INSTR(Remainder, '><') + 2)
+        END AS Remainder
+    FROM TagParts
+    WHERE Remainder IS NOT NULL
+),
+UserTopTag AS (
+    SELECT
+        UserId,
+        MostPopularTagName,
+        MostPopularTagCount
+    FROM (
+        SELECT
+            tp.UserId,
+            TRIM(tp.TagName) AS MostPopularTagName,
+            COUNT(*) AS MostPopularTagCount,
+            ROW_NUMBER() OVER (PARTITION BY tp.UserId ORDER BY COUNT(*) DESC, TRIM(tp.TagName) ASC) AS rn
+        FROM TagParts tp
+        WHERE tp.TagName IS NOT NULL AND TRIM(tp.TagName) <> ''
+        GROUP BY tp.UserId, TRIM(tp.TagName)
+    ) AS Ranked
+    WHERE rn = 1
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COALESCE(ups.TotalPostScore, 0) AS TotalPostScore,
+        COALESCE(ups.QuestionsWithAnswers, 0) AS TotalQuestionsWithAnswers,
+        COALESCE(ups.TotalPostViews, 0) AS TotalPostsViewed,
+        COALESCE(ucm.AvgPositiveCommentScore, 0.0) AS AveragePositiveCommentScore,
+        COALESCE(ucm.TotalPositiveCommentsMade, 0) AS TotalPositiveComments,
+        COALESCE(ubb.GoldBadges, 0) AS GoldBadges,
+        COALESCE(ubb.SilverBadges, 0) AS SilverBadges,
+        COALESCE(ubb.BronzeBadges, 0) AS BronzeBadges,
+        COALESCE(upea.DistinctPostsEditedByOthers, 0) AS PostsEditedByOthersCount,
+        COALESCE(upea.TotalEditsByOthersOnPosts, 0) AS TotalPostEditsByOthers,
+        utt.MostPopularTagName,
+        utt.MostPopularTagCount,
+        (COALESCE(ups.TotalPostScore, 0) * 0.7) +
+        (COALESCE(ups.QuestionsWithAnswers, 0) * 10) +
+        (COALESCE(ups.TotalPostViews, 0) * 0.01) +
+        (COALESCE(ucm.AvgPositiveCommentScore, 0.0) * 5) +
+        (COALESCE(ubb.GoldBadges, 0) * 100) +
+        (COALESCE(ubb.SilverBadges, 0) * 50) +
+        (COALESCE(ubb.BronzeBadges, 0) * 10) -
+        (COALESCE(upea.TotalEditsByOthersOnPosts, 0) * 2) +
+        (u.UpVotes * 0.1) - (u.DownVotes * 0.5) AS CustomPerformanceScore
+    FROM Users AS u
+    LEFT JOIN UserPostStats AS ups ON u.Id = ups.UserId
+    LEFT JOIN UserCommentMetrics AS ucm ON u.Id = ucm.UserId
+    LEFT JOIN UserBadgeBreakdown AS ubb ON u.Id = ubb.UserId
+    LEFT JOIN UserPostEditAnalysis AS upea ON u.Id = upea.UserId
+    LEFT JOIN UserTopTag AS utt ON u.Id = utt.UserId
+    WHERE u.DisplayName IS NOT NULL AND u.DisplayName <> ''
+      AND u.LastAccessDate >= '2020-01-01' AND u.LastAccessDate < '2023-01-01'
+)
+SELECT
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.UserCreationDate,
+    uas.LastAccessDate,
+    uas.TotalPostScore,
+    uas.TotalQuestionsWithAnswers,
+    uas.TotalPostsViewed,
+    uas.AveragePositiveCommentScore,
+    uas.TotalPositiveComments,
+    uas.GoldBadges,
+    uas.SilverBadges,
+    uas.BronzeBadges,
+    uas.PostsEditedByOthersCount,
+    uas.TotalPostEditsByOthers,
+    uas.MostPopularTagName,
+    uas.MostPopularTagCount,
+    uas.CustomPerformanceScore,
+    RANK() OVER (ORDER BY uas.CustomPerformanceScore DESC, uas.Reputation DESC, uas.UserId ASC) AS RankByPerformance,
+    DENSE_RANK() OVER (ORDER BY uas.TotalPostScore DESC, uas.TotalPostsViewed DESC, uas.UserId ASC) AS RankByPostContribution
+FROM UserActivitySummary uas
+WHERE uas.CustomPerformanceScore > 0
+ORDER BY RankByPerformance ASC
+LIMIT 200;

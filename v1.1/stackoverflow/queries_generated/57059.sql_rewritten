@@ -1,0 +1,37 @@
+-- {"query": "57059.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2291, "output_tokens": 1626} 
+WITH TopTags AS (
+    SELECT
+        Tags.TagName,
+        COUNT(P.Id) AS QuestionCount,
+        SUM(P.ViewCount) AS TotalViews,
+        SUM(P.Score) AS TotalScore,
+        SUM(P.AnswerCount) AS TotalAnswers
+    FROM
+        Tags
+    JOIN Posts P ON P.Tags LIKE CONCAT('%<', Tags.TagName, '>%')
+    WHERE
+        P.PostTypeId = 1
+    GROUP BY
+        Tags.TagName
+    ORDER BY
+        TotalViews DESC
+    LIMIT 10
+), MostActiveUsers AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        COUNT(P.Id) AS PostCount,
+        SUM(P.Score) AS TotalScore,
+        SUM(P.ViewCount) AS TotalViews
+    FROM
+        Posts P
+    WHERE
+        P.PostTypeId IN (1, 2)
+    GROUP BY
+        P.OwnerUserId
+    ORDER BY
+        TotalScore DESC
+    LIMIT 10
+), UserActivity AS (
+    SELECT
+        U.Id AS UserId,
+        COALESCE(U.DisplayName, '';

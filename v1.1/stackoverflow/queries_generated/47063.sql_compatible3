@@ -1,0 +1,157 @@
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT pt.Id) AS question_count,
+        1 AS level
+    FROM Tags t
+    JOIN Posts pt ON pt.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE pt.PostTypeId = 1
+        AND t.Count > 1000
+    GROUP BY t.Id, t.TagName
+),
+user_expertise AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS answers_in_tag,
+        SUM(p.Score) AS total_score,
+        AVG(p.Score) AS avg_score,
+        MAX(p.Score) AS max_score,
+        COUNT(DISTINCT CASE WHEN p.Id = q.AcceptedAnswerId THEN p.Id END) AS accepted_answers,
+        DENSE_RANK() OVER (PARTITION BY t.TagName ORDER BY SUM(p.Score) DESC) AS tag_rank
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    JOIN Posts q ON q.Id = p.ParentId
+    JOIN Tags t ON q.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE p.PostTypeId = 2
+        AND p.Score > 0
+        AND u.Reputation > 5000
+        AND p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '2 years')
+    GROUP BY u.Id, u.DisplayName, u.Reputation, t.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+badge_correlation AS (
+    SELECT 
+        ue.UserId,
+        ue.TagName,
+        COUNT(DISTINCT b.Name) AS unique_badges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+        STRING_AGG(DISTINCT CASE WHEN b.Class = 1 THEN b.Name END, ', ') AS gold_badge_names
+    FROM user_expertise ue
+    JOIN Badges b ON b.UserId = ue.UserId
+    WHERE b.TagBased = TRUE
+        OR b.Name IN ('Great Answer', 'Good Answer', 'Nice Answer', 'Enlightened', 'Guru')
+    GROUP BY ue.UserId, ue.TagName
+),
+post_quality_metrics AS (
+    SELECT 
+        p.OwnerUserId,
+        AVG(CASE WHEN c.Score > 0 THEN 1.0 ELSE 0.0 END) AS positive_comment_ratio,
+        AVG(ph_edit.edit_count) AS avg_edits_per_post,
+        COUNT(DISTINCT pl.RelatedPostId) AS linked_posts,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS total_upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS total_downvotes,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS median_score,
+        STDDEV(p.Score) AS score_stddev
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN LATERAL (
+        SELECT COUNT(*) AS edit_count
+        FROM PostHistory ph
+        WHERE ph.PostId = p.Id
+            AND ph.PostHistoryTypeId IN (4, 5, 6)
+    ) ph_edit ON true
+    WHERE p.OwnerUserId IN (SELECT DISTINCT UserId FROM user_expertise)
+        AND p.PostTypeId IN (1, 2)
+    GROUP BY p.OwnerUserId
+),
+temporal_activity AS (
+    SELECT 
+        DATE_TRUNC('month', p.CreationDate) AS month,
+        ue.TagName,
+        COUNT(DISTINCT p.Id) AS posts_created,
+        AVG(p.Score) AS avg_monthly_score,
+        LAG(COUNT(DISTINCT p.Id), 1) OVER (PARTITION BY ue.TagName ORDER BY DATE_TRUNC('month', p.CreationDate)) AS prev_month_posts,
+        LAG(COUNT(DISTINCT p.Id), 12) OVER (PARTITION BY ue.TagName ORDER BY DATE_TRUNC('month', p.CreationDate)) AS year_ago_posts
+    FROM user_expertise ue
+    JOIN Posts p ON p.OwnerUserId = ue.UserId
+    JOIN Posts q ON (p.PostTypeId = 1 AND p.Id = q.Id) OR (p.PostTypeId = 2 AND p.ParentId = q.Id)
+    WHERE q.Tags LIKE '%' || '<' || ue.TagName || '>' || '%'
+        AND p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '3 years')
+    GROUP BY DATE_TRUNC('month', p.CreationDate), ue.TagName
+)
+SELECT 
+    ue.DisplayName,
+    ue.Reputation,
+    ue.TagName,
+    ue.answers_in_tag,
+    ue.total_score,
+    ue.avg_score,
+    ue.accepted_answers,
+    ROUND(100.0 * ue.accepted_answers / NULLIF(ue.answers_in_tag, 0), 2) AS acceptance_rate,
+    ue.tag_rank,
+    bc.unique_badges,
+    bc.gold_badges,
+    bc.silver_badges,
+    bc.gold_badge_names,
+    pqm.positive_comment_ratio,
+    pqm.avg_edits_per_post,
+    pqm.linked_posts,
+    pqm.total_upvotes,
+    pqm.total_downvotes,
+    ROUND(CAST(pqm.total_upvotes AS numeric) / NULLIF(pqm.total_downvotes, 0), 2) AS upvote_downvote_ratio,
+    pqm.median_score,
+    pqm.score_stddev,
+    ta.avg_recent_activity,
+    ta.growth_trend,
+    RANK() OVER (ORDER BY ue.total_score DESC) AS global_rank,
+    CUME_DIST() OVER (PARTITION BY ue.TagName ORDER BY ue.total_score) AS tag_percentile
+FROM user_expertise ue
+LEFT JOIN badge_correlation bc ON bc.UserId = ue.UserId AND bc.TagName = ue.TagName
+LEFT JOIN post_quality_metrics pqm ON pqm.OwnerUserId = ue.UserId
+LEFT JOIN LATERAL (
+    SELECT 
+        AVG(posts_created) AS avg_recent_activity,
+        CASE 
+            WHEN AVG(NULLIF(prev_month_posts, 0)) > 0 
+            THEN AVG(CAST(posts_created AS numeric) / NULLIF(prev_month_posts, 0))
+            ELSE 0 
+        END AS growth_trend
+    FROM temporal_activity ta
+    WHERE ta.TagName = ue.TagName
+        AND ta.month >= (CAST('2024-10-01' AS date) - INTERVAL '6 months')
+) ta ON true
+WHERE ue.tag_rank <= 100
+GROUP BY
+    ue.DisplayName,
+    ue.Reputation,
+    ue.TagName,
+    ue.answers_in_tag,
+    ue.total_score,
+    ue.avg_score,
+    ue.accepted_answers,
+    ue.tag_rank,
+    bc.unique_badges,
+    bc.gold_badges,
+    bc.silver_badges,
+    bc.gold_badge_names,
+    pqm.positive_comment_ratio,
+    pqm.avg_edits_per_post,
+    pqm.linked_posts,
+    pqm.total_upvotes,
+    pqm.total_downvotes,
+    pqm.median_score,
+    pqm.score_stddev,
+    ta.avg_recent_activity,
+    ta.growth_trend,
+    ue.total_score,
+    ue.TagName
+ORDER BY ue.TagName, ue.tag_rank
+LIMIT 500;

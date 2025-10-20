@@ -1,4 +1,4 @@
--- {"query": "24100.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 3129} 
+-- {"query": "24100.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 3129} 
 
 /* Read‑heavy, mixed joins, window functions, set operators, correlated subqueries,
    NULL handling and string manipulation – ideal for a benchmark test. */

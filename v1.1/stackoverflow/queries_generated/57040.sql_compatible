@@ -1,0 +1,109 @@
+WITH TopUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(p.Score) AS TotalScore,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotes,
+        COUNT(DISTINCT c.Id) AS TotalComments
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation
+    ORDER BY
+        TotalScore DESC
+    LIMIT 10
+),
+TopPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CreationDate,
+        u.DisplayName AS OwnerDisplayName,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        LAG(p.Score, 1) OVER (ORDER BY p.Score DESC) AS PreviousScore,
+        LEAD(p.Score, 1) OVER (ORDER BY p.Score DESC) AS NextScore
+    FROM
+        Posts p
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    WHERE
+        p.PostTypeId = 1
+    GROUP BY
+        p.Id, p.PostTypeId, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CreationDate, u.DisplayName
+    ORDER BY
+        p.Score DESC
+    LIMIT 100
+),
+ActiveTags AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id) AS PostCount,
+        AVG(p.Score) AS AverageScore,
+        SUM(p.ViewCount) AS TotalViews,
+        COUNT(DISTINCT v.Id) AS TotalVotes
+    FROM
+        Tags t
+    JOIN
+        Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    GROUP BY
+        t.TagName
+    ORDER BY
+        PostCount DESC
+    LIMIT 20
+)
+SELECT
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.TotalPosts,
+    tu.TotalScore,
+    tu.TotalUpvotes,
+    tu.TotalDownvotes,
+    tu.TotalComments,
+    tp.PostId,
+    tp.PostTypeId,
+    tp.Title,
+    tp.Score,
+    tp.ViewCount,
+    tp.AnswerCount,
+    tp.CreationDate,
+    tp.OwnerDisplayName,
+    tp.VoteCount,
+    tp.CommentCount,
+    tp.PreviousScore,
+    tp.NextScore,
+    at.TagName,
+    at.PostCount,
+    at.AverageScore,
+    at.TotalViews,
+    at.TotalVotes
+FROM
+    TopUsers tu
+CROSS JOIN
+    TopPosts tp
+CROSS JOIN
+    ActiveTags at
+ORDER BY
+    tu.TotalScore DESC,
+    tp.Score DESC,
+    at.PostCount DESC;

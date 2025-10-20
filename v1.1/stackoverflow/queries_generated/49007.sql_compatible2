@@ -1,0 +1,131 @@
+WITH PopularRecentTags AS (
+    SELECT
+        tag AS TagName,
+        COUNT(DISTINCT p.Id) AS QuestionCount
+    FROM Posts p,
+         UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR (LENGTH(p.Tags)-2)), '><')) AS t(tag)
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 year')
+      AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+    GROUP BY tag
+    HAVING COUNT(DISTINCT p.Id) > 100
+    ORDER BY COUNT(DISTINCT p.Id) DESC
+    LIMIT 50
+),
+TopQuestionsInPopularTags AS (
+    SELECT
+        q.PostId,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CreationDate,
+        q.OwnerUserId,
+        q.TagName,
+        DENSE_RANK() OVER (PARTITION BY q.TagName ORDER BY q.Score DESC, q.ViewCount DESC, q.PostId DESC) AS TagQuestionRank
+    FROM (
+        SELECT
+            p.Id AS PostId,
+            p.Title,
+            p.Score,
+            p.ViewCount,
+            p.AnswerCount,
+            p.CreationDate,
+            p.OwnerUserId,
+            t.tag AS TagName
+        FROM Posts p,
+             UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR (LENGTH(p.Tags)-2)), '><')) AS t(tag)
+        WHERE p.PostTypeId = 1
+          AND p.Score > 10
+          AND p.ViewCount > 500
+          AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3 year')
+          AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+          AND p.OwnerUserId IS NOT NULL
+    ) AS q
+    INNER JOIN PopularRecentTags prt ON q.TagName = prt.TagName
+),
+FilteredTopQuestions AS (
+    SELECT
+        PostId,
+        Title,
+        Score,
+        ViewCount,
+        AnswerCount,
+        CreationDate,
+        OwnerUserId,
+        STRING_AGG(TagName, ',' ORDER BY TagName) AS AllRelatedTags
+    FROM TopQuestionsInPopularTags
+    WHERE TagQuestionRank <= 10
+    GROUP BY PostId, Title, Score, ViewCount, AnswerCount, CreationDate, OwnerUserId
+),
+UserQualityMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        u.Views AS UserViews,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        COUNT(DISTINCT p_ans.Id) AS TotalAnswers,
+        COALESCE(AVG(p_ans.Score), 0) AS AvgAnswerScore,
+        COUNT(DISTINCT c_made.Id) AS TotalCommentsMadeByOwner
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p_ans ON u.Id = p_ans.OwnerUserId AND p_ans.PostTypeId = 2
+    LEFT JOIN Comments c_made ON u.Id = c_made.UserId
+    WHERE u.Id IN (SELECT DISTINCT OwnerUserId FROM FilteredTopQuestions WHERE OwnerUserId IS NOT NULL)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes, u.Views
+),
+PostEngagementHistory AS (
+    SELECT
+        ftq.PostId,
+        COUNT(DISTINCT c_on_post.Id) AS QuestionCommentCount,
+        COUNT(DISTINCT ph.Id) AS TotalHistoryEvents,
+        COUNT(DISTINCT CASE WHEN ph.UserId IS NOT NULL AND ph.UserId != ftq.OwnerUserId THEN ph.UserId END) AS UniqueEditorsExcludingOwner,
+        MAX(ph.CreationDate) AS LastHistoryActivityDate,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9, 24) THEN ph.Id END) AS EditRelatedHistoryCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Id END) AS CloseHistoryCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 12 THEN ph.Id END) AS DeleteHistoryCount
+    FROM FilteredTopQuestions ftq
+    LEFT JOIN Comments c_on_post ON ftq.PostId = c_on_post.PostId
+    LEFT JOIN PostHistory ph ON ftq.PostId = ph.PostId
+    GROUP BY ftq.PostId, ftq.OwnerUserId
+)
+SELECT
+    ftq.PostId,
+    ftq.Title,
+    ftq.Score AS QuestionScore,
+    ftq.ViewCount AS QuestionViewCount,
+    ftq.AnswerCount AS QuestionAnswerCount,
+    ftq.CreationDate AS QuestionCreationDate,
+    ftq.AllRelatedTags,
+    uqm.DisplayName AS QuestionOwnerDisplayName,
+    uqm.Reputation AS QuestionOwnerReputation,
+    uqm.UserUpVotes AS OwnerTotalUpVotesReceived,
+    uqm.UserDownVotes AS OwnerTotalDownVotesReceived,
+    uqm.UserViews AS OwnerProfileViews,
+    uqm.GoldBadges,
+    uqm.SilverBadges,
+    uqm.BronzeBadges,
+    uqm.TotalAnswers AS OwnerTotalAnswersPosted,
+    uqm.AvgAnswerScore AS OwnerAverageAnswerScore,
+    uqm.TotalCommentsMadeByOwner,
+    peh.QuestionCommentCount,
+    peh.TotalHistoryEvents AS QuestionTotalHistoryEvents,
+    peh.UniqueEditorsExcludingOwner AS QuestionUniqueEditorsExcludingOwner,
+    peh.EditRelatedHistoryCount AS QuestionEditRelatedHistoryCount,
+    peh.CloseHistoryCount AS QuestionCloseHistoryCount,
+    peh.DeleteHistoryCount AS QuestionDeleteHistoryCount,
+    peh.LastHistoryActivityDate AS QuestionLastHistoryActivityDate
+FROM FilteredTopQuestions ftq
+INNER JOIN UserQualityMetrics uqm ON ftq.OwnerUserId = uqm.UserId
+LEFT JOIN PostEngagementHistory peh ON ftq.PostId = peh.PostId
+ORDER BY
+    uqm.Reputation DESC,
+    ftq.Score DESC,
+    ftq.ViewCount DESC,
+    ftq.CreationDate DESC
+LIMIT 100;

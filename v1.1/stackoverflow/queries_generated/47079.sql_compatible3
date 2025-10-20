@@ -1,0 +1,136 @@
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT pt.PostId) AS post_count,
+        1 AS level
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    INNER JOIN PostLinks pt ON pt.PostId = p.Id
+    WHERE t.Count > 1000
+    GROUP BY t.Id, t.TagName
+
+    UNION ALL
+
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        th_acc.post_count,
+        th.level + 1 AS level
+    FROM tag_hierarchy th
+    INNER JOIN LATERAL (
+        SELECT 
+            t2.Id AS Id,
+            t2.TagName AS TagName,
+            COUNT(DISTINCT pl2.PostId) AS post_count
+        FROM Posts p1
+        INNER JOIN PostLinks pl1 ON pl1.PostId = p1.Id
+        INNER JOIN Posts p2 ON p2.Id = pl1.RelatedPostId
+        INNER JOIN Tags t2 ON p2.Tags LIKE '%' || '<' || t2.TagName || '>' || '%'
+        INNER JOIN PostLinks pl2 ON pl2.PostId = p2.Id
+        WHERE p1.Tags LIKE '%' || '<' || th.TagName || '>' || '%'
+        GROUP BY t2.Id, t2.TagName
+    ) th_acc ON true
+    WHERE th.level < 3
+),
+user_expertise AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS answers_count,
+        SUM(p.Score) AS total_score,
+        AVG(p.Score) AS avg_score,
+        COUNT(DISTINCT CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN p.Id END) AS accepted_answers,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS median_score,
+        DENSE_RANK() OVER (PARTITION BY t.TagName ORDER BY SUM(p.Score) DESC) AS rank_in_tag
+    FROM Users u
+    INNER JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 2
+    INNER JOIN Posts q ON q.Id = p.ParentId
+    INNER JOIN Tags t ON q.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    INNER JOIN Badges b ON b.UserId = u.Id AND b.TagBased = 1
+    WHERE u.Reputation > 5000
+        AND p.Score > 0
+        AND p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '2 years'
+    GROUP BY u.Id, u.DisplayName, t.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+temporal_patterns AS (
+    SELECT 
+        DATE_TRUNC('month', p.CreationDate) AS month,
+        pt.Name AS post_type,
+        COUNT(*) AS post_count,
+        AVG(p.Score) AS avg_score,
+        STDDEV(p.Score) AS score_stddev,
+        COUNT(DISTINCT p.OwnerUserId) AS unique_authors,
+        SUM(p.ViewCount) AS total_views,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 END) AS edit_count,
+        LAG(COUNT(*)) OVER (PARTITION BY pt.Name ORDER BY DATE_TRUNC('month', p.CreationDate)) AS prev_month_count,
+        LAG(COUNT(*), 12) OVER (PARTITION BY pt.Name ORDER BY DATE_TRUNC('month', p.CreationDate)) AS prev_year_count
+    FROM Posts p
+    INNER JOIN PostTypes pt ON pt.Id = p.PostTypeId
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    WHERE p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '5 years'
+    GROUP BY DATE_TRUNC('month', p.CreationDate), pt.Name
+),
+vote_networks AS (
+    SELECT 
+        v1.UserId AS voter_id,
+        p1.OwnerUserId AS recipient_id,
+        COUNT(DISTINCT v1.PostId) AS vote_count,
+        SUM(CASE WHEN v1.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+        SUM(CASE WHEN v1.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+        AVG(p1.Score) AS avg_recipient_post_score,
+        COUNT(DISTINCT DATE_TRUNC('day', v1.CreationDate)) AS active_voting_days
+    FROM Votes v1
+    INNER JOIN Posts p1 ON p1.Id = v1.PostId
+    WHERE v1.UserId IS NOT NULL 
+        AND p1.OwnerUserId IS NOT NULL
+        AND v1.VoteTypeId IN (2, 3)
+        AND v1.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '1 year'
+    GROUP BY v1.UserId, p1.OwnerUserId
+    HAVING COUNT(DISTINCT v1.PostId) >= 5
+)
+SELECT 
+    th.TagName AS primary_tag,
+    th.level AS tag_depth,
+    ue.DisplayName AS expert_user,
+    ue.rank_in_tag,
+    ue.total_score AS expertise_score,
+    ue.accepted_answers,
+    ue.median_score,
+    tp.month,
+    tp.post_type,
+    tp.post_count,
+    tp.avg_score AS monthly_avg_score,
+    tp.score_stddev,
+    tp.unique_authors,
+    tp.total_views,
+    tp.edit_count,
+    ROUND(100.0 * (tp.post_count - COALESCE(tp.prev_month_count, 0)) / NULLIF(tp.prev_month_count, 0), 2) AS month_over_month_growth,
+    ROUND(100.0 * (tp.post_count - COALESCE(tp.prev_year_count, 0)) / NULLIF(tp.prev_year_count, 0), 2) AS year_over_year_growth,
+    vn.voter_id,
+    vn.recipient_id,
+    vn.vote_count AS interaction_count,
+    vn.upvotes,
+    vn.downvotes,
+    vn.avg_recipient_post_score,
+    vn.active_voting_days,
+    CASE 
+        WHEN vn.upvotes > vn.downvotes * 10 THEN 'Strong Supporter'
+        WHEN vn.downvotes > vn.upvotes * 2 THEN 'Critical Reviewer'
+        ELSE 'Balanced Voter'
+    END AS voter_behavior_type
+FROM tag_hierarchy th
+CROSS JOIN user_expertise ue
+CROSS JOIN temporal_patterns tp
+LEFT JOIN vote_networks vn ON (vn.voter_id = ue.UserId OR vn.recipient_id = ue.UserId)
+WHERE th.TagName = ue.TagName
+    AND tp.month >= CAST('2024-10-01' AS DATE) - INTERVAL '6 months'
+    AND tp.post_count > 100
+ORDER BY 
+    th.level,
+    ue.rank_in_tag,
+    tp.month DESC,
+    vn.vote_count DESC
+LIMIT 10000;

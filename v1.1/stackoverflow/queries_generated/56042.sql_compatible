@@ -1,0 +1,59 @@
+WITH Top10Tags AS (
+  SELECT t.TagName, COUNT(*) AS Count
+  FROM Tags t
+  JOIN PostTags pt ON t.Id = pt.TagId
+  GROUP BY t.TagName
+  ORDER BY Count DESC
+  LIMIT 10
+),
+Top10Users AS (
+  SELECT u.Id, u.DisplayName, SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes
+  FROM Users u
+  JOIN Posts p ON u.Id = p.OwnerUserId
+  JOIN Votes v ON p.Id = v.PostId
+  GROUP BY u.Id, u.DisplayName
+  ORDER BY UpVotes DESC
+  LIMIT 10
+),
+PostHistoryStats AS (
+  SELECT ph.PostId, ph.PostHistoryTypeId, COUNT(*) AS Count
+  FROM PostHistory ph
+  GROUP BY ph.PostId, ph.PostHistoryTypeId
+)
+SELECT 
+  p.Id,
+  p.Title,
+  p.Score,
+  p.ViewCount,
+  p.AnswerCount,
+  p.CommentCount,
+  phs.Count AS EditCount,
+  tt.TagName AS TopTag,
+  tu.DisplayName AS TopUser
+FROM Posts p
+JOIN PostHistoryStats phs ON p.Id = phs.PostId
+JOIN PostTypes pt ON p.PostTypeId = pt.Id
+JOIN PostLinks pl ON p.Id = pl.PostId
+JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+JOIN Tags t ON p.Id = t.ExcerptPostId
+JOIN Top10Tags tt ON t.TagName = tt.TagName
+JOIN Top10Users tu ON p.OwnerUserId = tu.Id
+WHERE 
+  p.PostTypeId = 1
+  AND phs.PostHistoryTypeId = 5
+  AND lt.Name = 'Linked'
+  AND p.Score > 100
+  AND p.ViewCount > 1000
+GROUP BY
+  p.Id,
+  p.Title,
+  p.Score,
+  p.ViewCount,
+  p.AnswerCount,
+  p.CommentCount,
+  phs.Count,
+  tt.TagName,
+  tu.DisplayName
+ORDER BY 
+  p.Score DESC, 
+  p.ViewCount DESC;

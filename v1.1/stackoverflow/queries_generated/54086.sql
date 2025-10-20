@@ -1,0 +1,125 @@
+-- {"query": "54086.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2048, "output_tokens": 2299} 
+
+WITH
+    -- Extract the latest text revision for each question
+    rec_posts AS (
+        SELECT
+            p.Id                                 AS PostId,
+            p.Title,
+            p.CreationDate,
+            p.Score,
+            p.OwnerUserId,
+            COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 END), 0)   AS upvotes,
+            COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 END), 0)   AS downvotes,
+            COUNT(DISTINCT c.Id)                                    AS comment_cnt,
+            COALESCE(SUM(p2.LinkFactor), 0)                         AS link_factor,
+            -- average comment score on the post (if any)
+            COALESCE(AVG(c.Score), 0)                               AS avg_comment_score
+        FROM
+            Posts p
+        LEFT JOIN Votes v
+            ON v.PostId = p.Id
+        LEFT JOIN Comments c
+            ON c.PostId = p.Id
+        LEFT JOIN (
+            SELECT
+                pl.PostId,
+                SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkFactor
+            FROM PostLinks pl
+            GROUP BY pl.PostId
+        ) p2
+            ON p2.PostId = p.Id
+        WHERE
+            p.PostTypeId = 1
+            AND p.Title IS NOT NULL
+        GROUP BY
+            p.Id, p.Title, p.CreationDate, p.Score, p.OwnerUserId
+    ),
+    -- Pull tags out of the post's Tags string
+    tags_extracted AS (
+        SELECT
+            p.Id        AS PostId,
+            regexp_matches(p.Tags, '<([^>]+)>', 'g') AS TagArray
+        FROM
+            Posts p
+        WHERE
+            p.PostTypeId = 1
+            AND p.Tags IS NOT NULL
+    ),
+    unnest_tags AS (
+        SELECT
+            te.PostId,
+            t.TagName
+        FROM
+            tags_extracted te
+        CROSS JOIN LATERAL unnest(te.TagArray) AS tb(tag)
+        JOIN Tags t
+            ON t.TagName = tb.tag
+    ),
+    -- Aggregate tags per post
+    post_tags AS (
+        SELECT
+            ut.PostId,
+            array_agg(DISTINCT ut.TagName ORDER BY ut.TagName) AS TagList,
+            COUNT(DISTINCT ut.TagName) AS TagCnt
+        FROM
+            unnest_tags ut
+        GROUP BY
+            ut.PostId
+    ),
+    -- Compute a competitiveness score for each tag
+    tag_stats AS (
+        SELECT
+            t.TagName,
+            AVG(rp.Score) AS AvgScore,
+            AVG(rp.upvotes) AS AvgUpvotes,
+            AVG(rp.downvotes) AS AvgDownvotes,
+            COUNT(rp.PostId) AS PostCount
+        FROM
+            unnest_tags t
+        JOIN rec_posts rp
+            ON rp.PostId = t.PostId
+        GROUP BY
+            t.TagName
+    ),
+    -- Rank posts within each tag by score
+    ranked_posts AS (
+        SELECT
+            rp.*,
+            pt.TagList,
+            pt.TagCnt,
+            ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY rp.Score DESC) AS RankInTag,
+            SUM(rp.upvotes) OVER (PARTITION BY t.TagName) AS TotalUpvotesForTag,
+            SUM(rp.downvotes) OVER (PARTITION BY t.TagName) AS TotalDownvotesForTag
+        FROM
+            rec_posts rp
+        JOIN post_tags pt
+            ON pt.PostId = rp.PostId
+        JOIN unnest_tags t
+            ON t.PostId = rp.PostId
+    )
+SELECT
+    rp.PostId,
+    rp.Title,
+    rp.CreationDate,
+    rp.Score,
+    rp.upvotes,
+    rp.downvotes,
+    rp.comment_cnt,
+    rp.avg_comment_score,
+    rp.link_factor,
+    rp.TagList,
+    rp.TagCnt,
+    rp.RankInTag,
+    ts.AvgScore,
+    ts.AvgUpvotes,
+    ts.AvgDownvotes,
+    ts.PostCount
+FROM
+    ranked_posts rp
+JOIN tag_stats ts
+    ON ts.TagName = ANY(rp.TagList)
+ORDER BY
+    rp.Score DESC,
+    rp.DateCreated DESC
+LIMIT 200;

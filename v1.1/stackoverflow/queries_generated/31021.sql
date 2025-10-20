@@ -1,0 +1,55 @@
+-- {"query": "31021.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4o-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 272} 
+
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.CreationDate,
+        p.ViewCount,
+        u.DisplayName AS OwnerName,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount
+    FROM 
+        Posts p
+    JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN 
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN 
+        Badges b ON b.UserId = u.Id
+    WHERE 
+        p.CreationDate >= current_date - interval '1 year'
+    GROUP BY 
+        p.Id, u.DisplayName
+),
+ScoredPosts AS (
+    SELECT 
+        PostId,
+        Title,
+        Score,
+        CreationDate,
+        ViewCount,
+        OwnerName,
+        CommentCount,
+        BadgeCount,
+        RANK() OVER (ORDER BY Score DESC, ViewCount DESC) AS Rank
+    FROM 
+        RankedPosts
+)
+SELECT 
+    PostId,
+    Title,
+    Score,
+    CreationDate,
+    ViewCount,
+    OwnerName,
+    CommentCount,
+    BadgeCount,
+    Rank
+FROM 
+    ScoredPosts
+WHERE 
+    Rank <= 20
+ORDER BY 
+    Rank;

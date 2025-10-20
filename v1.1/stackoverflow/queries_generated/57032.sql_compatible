@@ -1,0 +1,119 @@
+WITH TopUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) AS PostCount,
+        SUM(p.Score) AS TotalPostScore
+    FROM
+        Users u
+    JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    WHERE
+        p.PostTypeId IN (1, 2) -- Questions and Answers
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation
+    ORDER BY
+        TotalPostScore DESC
+    LIMIT 100
+),
+TopPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        u.DisplayName AS OwnerDisplayName,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(v.Id) AS VoteCount,
+        p.OwnerUserId
+    FROM
+        Posts p
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    WHERE
+        p.PostTypeId IN (1, 2) -- Questions and Answers
+    GROUP BY
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.Title, u.DisplayName, p.OwnerUserId
+    ORDER BY
+        p.Score DESC, p.ViewCount DESC
+    LIMIT 100
+),
+RecentActivity AS (
+    SELECT
+        p.Id AS PostId,
+        p.LastActivityDate,
+        u.DisplayName AS LastEditorDisplayName,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS EditDate,
+        ph.UserId AS EditorId,
+        ph.Comment AS EditComment
+    FROM
+        Posts p
+    JOIN
+        PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN
+        Users u ON ph.UserId = u.Id
+    WHERE
+        ph.PostHistoryTypeId IN (5, 6) -- Edit Body or Edit Tags
+    ORDER BY
+        ph.CreationDate DESC
+    LIMIT 100
+),
+BadgeStatistics AS (
+    SELECT
+        b.UserId,
+        u.DisplayName,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM
+        Badges b
+    JOIN
+        Users u ON b.UserId = u.Id
+    GROUP BY
+        b.UserId, u.DisplayName
+)
+SELECT
+    tu.UserId,
+    tu.DisplayName AS TopUserDisplayName,
+    tu.Reputation,
+    tu.PostCount,
+    tu.TotalPostScore,
+    tp.PostId,
+    tp.PostTypeId,
+    tp.CreationDate AS PostCreationDate,
+    tp.Score AS PostScore,
+    tp.ViewCount,
+    tp.Title AS PostTitle,
+    tp.OwnerDisplayName,
+    tp.CommentCount,
+    tp.VoteCount,
+    ra.PostId AS RecentPostId,
+    ra.LastActivityDate,
+    ra.LastEditorDisplayName,
+    ra.PostHistoryTypeId,
+    ra.EditDate,
+    ra.EditorId,
+    ra.EditComment,
+    bs.TotalBadges,
+    bs.GoldBadges,
+    bs.SilverBadges,
+    bs.BronzeBadges
+FROM
+    TopUsers tu
+JOIN
+    TopPosts tp ON tu.UserId = tp.OwnerUserId
+LEFT JOIN
+    RecentActivity ra ON tp.PostId = ra.PostId
+LEFT JOIN
+    BadgeStatistics bs ON tu.UserId = bs.UserId
+ORDER BY
+    tu.Reputation DESC, tp.PostScore DESC, ra.EditDate DESC;

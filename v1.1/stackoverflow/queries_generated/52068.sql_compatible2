@@ -1,0 +1,87 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesReceived,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostStats AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT pl.RelatedPostId) AS LinkedPostCount,
+        AVG(CAST(ph.Id AS NUMERIC)) AS AvgHistoryEntries
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount
+),
+TagStats AS (
+    SELECT 
+        t.Id AS TagId,
+        t.TagName,
+        t.Count,
+        COUNT(DISTINCT p.Id) AS TaggedPostCount,
+        SUM(p.Score) AS TotalTagScore,
+        AVG(p.ViewCount) AS AvgTagViewCount
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    GROUP BY t.Id, t.TagName, t.Count
+)
+SELECT 
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.BadgeCount,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.UpvotesReceived,
+    us.DownvotesReceived,
+    us.AvgPostScore,
+    us.LastPostDate,
+    ROW_NUMBER() OVER (ORDER BY us.Reputation DESC, us.UpvotesReceived DESC) AS UserRank,
+    -- aggregate badge names without DISTINCT ordering inside aggregate (DISTINCT removed from inside aggregate to avoid dialect issues)
+    STRING_AGG(b.Name, ', ') FILTER (WHERE b.Name IS NOT NULL) AS Badges,
+    -- build top questions as a JSON-like string using concatenation; order handled in subquery aggregation where supported
+    (SELECT '[' || COALESCE(STRING_AGG(
+            '{' ||
+            '"PostId":' || COALESCE(CAST(ps.PostId AS VARCHAR), 'null') || ',' ||
+            '"Title":' || '"' || REPLACE(COALESCE(ps.Title, ''), '"', '\"') || '"' || ',' ||
+            '"Score":' || COALESCE(CAST(ps.Score AS VARCHAR), 'null') || ',' ||
+            '"ViewCount":' || COALESCE(CAST(ps.ViewCount AS VARCHAR), 'null') || ',' ||
+            '"CommentCount":' || COALESCE(CAST(ps.CommentCount AS VARCHAR), 'null') ||
+            '}'
+        , ',')
+    , '') || ']' 
+     FROM (
+         SELECT ps.*
+         FROM PostStats ps
+         JOIN Posts p ON p.Id = ps.PostId
+         WHERE p.OwnerUserId = us.Id AND p.PostTypeId = 1
+         ORDER BY ps.Score DESC
+         LIMIT 5
+     ) ps
+    ) AS TopQuestions
+FROM UserStats us
+LEFT JOIN Badges b ON us.Id = b.UserId
+WHERE us.Reputation > 1000 AND us.BadgeCount > 5
+GROUP BY us.Id, us.DisplayName, us.Reputation, us.BadgeCount, us.QuestionCount, us.AnswerCount, us.UpvotesReceived, us.DownvotesReceived, us.AvgPostScore, us.LastPostDate
+ORDER BY us.Reputation DESC, us.UpvotesReceived DESC
+LIMIT 20;

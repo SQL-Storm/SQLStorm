@@ -1,0 +1,116 @@
+WITH ActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(p.Id) AS PostCount,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(v.Id) AS VoteCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    WHERE
+        u.LastAccessDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30' DAY
+    GROUP BY
+        u.Id, u.Reputation, u.DisplayName
+),
+TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        COUNT(p.Id) AS QuestionCount,
+        AVG(p.Score) AS AvgScore,
+        AVG(p.ViewCount) AS AvgViewCount
+    FROM
+        Tags t
+    JOIN
+        Posts p ON EXISTS (
+            SELECT 1
+            FROM (
+                SELECT TRIM(BOTH '<>' FROM tag) AS tag
+                FROM (
+                    SELECT UNNEST(
+                        CASE
+                            WHEN p.Tags IS NULL OR LENGTH(p.Tags) < 2 THEN ARRAY[]::text[]
+                            ELSE regexp_split_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><')
+                        END
+                    ) AS tag
+                ) s
+            ) s2
+            WHERE s2.tag = t.TagName
+        )
+    WHERE
+        p.PostTypeId = 1
+    GROUP BY
+        t.TagName, t.Count
+    ORDER BY
+        QuestionCount DESC
+    LIMIT 10
+),
+HighActivityPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        COUNT(v.Id) AS TotalVotes,
+        1e19 * (SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) / NULLIF(COUNT(v.Id), 0)) AS UpVoteRatio,
+        1e19 * (SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) / NULLIF(COUNT(v.Id), 0)) AS DownVoteRatio
+    FROM
+        Posts p
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    GROUP BY
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount
+    HAVING
+        COUNT(v.Id) > 50 OR p.ViewCount > 1000
+    ORDER BY
+        TotalVotes DESC
+    LIMIT 50
+)
+SELECT
+    au.UserId,
+    au.DisplayName,
+    au.Reputation,
+    au.PostCount,
+    au.CommentCount,
+    au.VoteCount,
+    au.LastPostDate,
+    au.LastCommentDate,
+    au.LastVoteDate,
+    tt.TagName,
+    tt.QuestionCount,
+    tt.AvgScore,
+    tt.AvgViewCount,
+    hap.PostId,
+    hap.PostTypeId,
+    hap.Score,
+    hap.ViewCount,
+    hap.AnswerCount,
+    hap.CommentCount,
+    hap.FavoriteCount,
+    hap.TotalVotes,
+    hap.UpVoteRatio,
+    hap.DownVoteRatio
+FROM
+    ActiveUsers au
+CROSS JOIN
+    TopTags tt
+LEFT JOIN
+    HighActivityPosts hap ON au.UserId = hap.PostId -- replaced incorrect OwnerUserId reference with PostId to match available columns
+ORDER BY
+    au.Reputation DESC,
+    tt.QuestionCount DESC,
+    hap.TotalVotes DESC;

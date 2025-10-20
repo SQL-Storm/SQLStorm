@@ -1,0 +1,59 @@
+WITH RankedUserPosts AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.Score,
+        p.ViewCount,
+        p.PostTypeId,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.Score DESC, p.ViewCount DESC) AS PostRank,
+        COUNT(*) OVER (PARTITION BY u.Id) AS TotalUserPosts,
+        AVG(p.Score) OVER (PARTITION BY u.Id) AS AvgUserPostScore
+    FROM 
+        Users u
+    JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    WHERE 
+        p.PostTypeId IN (1,2)
+        AND u.Reputation > 1000
+),
+TagAnalytics AS (
+    SELECT 
+        r.PostId,
+        TRIM(t.tag) AS Tag,
+        r.Score,
+        r.PostRank,
+        r.TotalUserPosts
+    FROM 
+        RankedUserPosts r
+        JOIN LATERAL (
+            -- portable split: convert tags like '<tag1><tag2>' to rows by replacing '><' with a delimiter and splitting by that delimiter.
+            -- Use CASE to handle NULL or empty strings. The splitting function below uses standard string functions where available.
+            -- For engines without a built-in split-to-rows, this attempts to emulate using UNNEST on a simple split; adjust to your dialect if needed.
+            SELECT value AS tag
+            FROM UNNEST(string_to_array(
+                CASE WHEN r.Tags IS NULL OR r.Tags = '' THEN '' 
+                     ELSE SUBSTRING(r.Tags FROM 2 FOR CHAR_LENGTH(r.Tags) - 2) END,
+                '><'
+            )) AS t(value)
+        ) AS t ON TRUE
+)
+SELECT 
+    Tag,
+    COUNT(DISTINCT PostId) AS PostCount,
+    ROUND(AVG(Score), 2) AS AvgTagScore,
+    MAX(Score) AS MaxTagScore
+FROM 
+    TagAnalytics
+WHERE 
+    PostRank <= 10
+    AND TotalUserPosts > 5
+GROUP BY 
+    Tag
+HAVING 
+    COUNT(DISTINCT PostId) > 100
+ORDER BY 
+    AvgTagScore DESC, 
+    PostCount DESC
+LIMIT 50;

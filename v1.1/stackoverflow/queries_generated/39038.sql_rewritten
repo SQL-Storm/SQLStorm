@@ -1,0 +1,83 @@
+-- {"query": "39038.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1972, "output_tokens": 2159} 
+WITH question_answers AS (
+    SELECT
+        q.Id            AS question_id,
+        q.CreationDate  AS q_created,
+        q.Score         AS q_score,
+        q.ViewCount     AS q_views,
+        q.OwnerUserId   AS q_owner,
+        a.Id            AS answer_id,
+        a.CreationDate  AS a_created,
+        a.Score         AS a_score
+    FROM Posts q
+    JOIN Posts a
+      ON a.ParentId = q.Id
+     AND a.PostTypeId = 2
+   WHERE q.PostTypeId = 1
+),
+tagged AS (
+    SELECT
+        qa.*,
+        unnest(
+          string_to_array(
+            substring(p.Tags, 2, length(p.Tags) - 2),
+            '><'
+          )
+        ) AS tag
+    FROM question_answers qa
+    JOIN Posts p
+      ON p.Id = qa.question_id
+),
+tag_metrics AS (
+    SELECT
+        tag,
+        count(DISTINCT question_id)   AS total_questions,
+        count(answer_id)              AS total_answers,
+        avg(a_created - q_created)    AS avg_answer_time,
+        avg(q_score)                  AS avg_question_score,
+        avg(a_score)                  AS avg_answer_score,
+        sum(q_views)                  AS total_question_views
+    FROM tagged
+    GROUP BY tag
+),
+badge_counts AS (
+    SELECT
+        lower(t.TagName) AS tag,
+        count(b.Id)      AS badge_earners
+    FROM Tags t
+    JOIN Badges b
+      ON b.TagBased = 1
+     AND lower(b.Name) = lower(t.TagName)
+    GROUP BY t.TagName
+),
+comment_counts AS (
+    SELECT
+        tg.tag,
+        count(c.Id) AS total_comments
+    FROM tagged tg
+    JOIN Comments c
+      ON c.PostId = tg.answer_id
+    GROUP BY tg.tag
+)
+SELECT
+    tm.tag,
+    tm.total_questions,
+    tm.total_answers,
+    tm.avg_answer_time,
+    tm.avg_question_score,
+    tm.avg_answer_score,
+    tm.total_question_views,
+    COALESCE(bc.badge_earners, 0) AS badge_earners,
+    COALESCE(cc.total_comments, 0) AS total_comments,
+    rank() OVER (
+      ORDER BY tm.total_questions DESC,
+               tm.avg_answer_time ASC
+    ) AS activity_rank
+FROM tag_metrics tm
+LEFT JOIN badge_counts bc
+  ON bc.tag = tm.tag
+LEFT JOIN comment_counts cc
+  ON cc.tag = tm.tag
+WHERE tm.total_questions > 500
+ORDER BY activity_rank,
+         tm.total_question_views DESC;

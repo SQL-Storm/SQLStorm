@@ -1,0 +1,95 @@
+WITH 
+TopUsers AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS rn
+    FROM   Users u
+    WHERE  u.Reputation IS NOT NULL
+    ORDER BY u.Reputation DESC
+    FETCH FIRST 10 ROWS ONLY
+),
+
+UserPostStats AS (
+    SELECT p.OwnerUserId        AS UserId,
+           COUNT(*)             AS TotalPosts,
+           SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+           SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+           AVG(p.Score)         AS AvgPostScore,
+           COUNT(DISTINCT p.AcceptedAnswerId) FILTER (WHERE p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL) AS AcceptedAnswersGiven
+    FROM   Posts p
+    WHERE  p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+
+UserBadgeStats AS (
+    SELECT b.UserId,
+           COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+           COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+           COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+           COUNT(*)                              AS TotalBadges
+    FROM   Badges b
+    GROUP BY b.UserId
+),
+
+RecentVoteStats AS (
+    SELECT p.OwnerUserId                               AS UserId,
+           COUNT(v.Id) FILTER (WHERE vt.Id = 2)       AS UpVotesLast30d,
+           COUNT(v.Id) FILTER (WHERE vt.Id = 3)       AS DownVotesLast30d,
+           COUNT(v.Id) FILTER (WHERE vt.Id = 5)       AS FavoritesLast30d
+    FROM   Posts p
+    JOIN   Votes v      ON v.PostId = p.Id
+    JOIN   VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE  p.OwnerUserId IS NOT NULL
+      AND  v.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '30' DAY)
+    GROUP BY p.OwnerUserId
+),
+
+DuplicateLinkStats AS (
+    SELECT p.OwnerUserId                               AS UserId,
+           COUNT(pl.Id) FILTER (WHERE lt.Id = 3)      AS DuplicateLinksCreated,
+           COUNT(pl.Id) FILTER (WHERE lt.Id = 1)      AS LinkedPostsCreated
+    FROM   Posts p
+    JOIN   PostLinks pl ON pl.PostId = p.Id
+    JOIN   LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE  p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+
+RecentEditStats AS (
+    SELECT ph.UserId,
+           COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS EditsMadeLast30d,
+           COUNT(DISTINCT ph.PostId) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS DistinctPostsEditedLast30d
+    FROM   PostHistory ph
+    WHERE  ph.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '30' DAY)
+      AND  ph.UserId IS NOT NULL
+    GROUP BY ph.UserId
+)
+
+SELECT 
+    tu.Id                         AS UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    COALESCE(ups.TotalPosts, 0)       AS TotalPosts,
+    COALESCE(ups.QuestionCount, 0)    AS QuestionCount,
+    COALESCE(ups.AnswerCount, 0)      AS AnswerCount,
+    COALESCE(ups.AvgPostScore, 0)     AS AvgPostScore,
+    COALESCE(ups.AcceptedAnswersGiven, 0) AS AcceptedAnswersGiven,
+    COALESCE(ub.GoldBadges, 0)        AS GoldBadges,
+    COALESCE(ub.SilverBadges, 0)      AS SilverBadges,
+    COALESCE(ub.BronzeBadges, 0)      AS BronzeBadges,
+    COALESCE(ub.TotalBadges, 0)       AS TotalBadges,
+    COALESCE(rv.UpVotesLast30d, 0)    AS UpVotesLast30d,
+    COALESCE(rv.DownVotesLast30d, 0)  AS DownVotesLast30d,
+    COALESCE(rv.FavoritesLast30d, 0) AS FavoritesLast30d,
+    COALESCE(dl.DuplicateLinksCreated, 0)  AS DuplicateLinksCreated,
+    COALESCE(dl.LinkedPostsCreated, 0)     AS LinkedPostsCreated,
+    COALESCE(re.EditsMadeLast30d, 0)       AS EditsMadeLast30d,
+    COALESCE(re.DistinctPostsEditedLast30d, 0) AS DistinctPostsEditedLast30d
+FROM   TopUsers tu
+LEFT   JOIN UserPostStats      ups ON ups.UserId      = tu.Id
+LEFT   JOIN UserBadgeStats     ub  ON ub.UserId      = tu.Id
+LEFT   JOIN RecentVoteStats    rv  ON rv.UserId      = tu.Id
+LEFT   JOIN DuplicateLinkStats dl  ON dl.UserId      = tu.Id
+LEFT   JOIN RecentEditStats    re  ON re.UserId      = tu.Id
+ORDER BY tu.Reputation DESC;

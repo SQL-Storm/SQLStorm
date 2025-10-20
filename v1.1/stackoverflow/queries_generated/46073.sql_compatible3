@@ -1,0 +1,117 @@
+WITH TopQuestionsByYear AS (
+    SELECT 
+        p.Id,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        EXTRACT(YEAR FROM p.CreationDate) AS Year,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM p.CreationDate) ORDER BY p.Score DESC, p.ViewCount DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+        AND p.Score > 10
+        AND p.CreationDate >= DATE '2010-01-01'
+),
+UserEngagementMetrics AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT v.Id) AS TotalVotesCast
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.CreationDate >= DATE '2008-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT p.Id) > 5
+),
+TagPerformanceAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagUsageCount,
+        AVG(p.Score) AS AvgScore,
+        AVG(p.ViewCount) AS AvgViews,
+        AVG(p.AnswerCount) AS AvgAnswers,
+        COUNT(DISTINCT p.OwnerUserId) AS UniqueContributors,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS MedianScore
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE p.PostTypeId = 1 
+        AND t.Count > 100
+    GROUP BY t.TagName, t.Count
+),
+AnswerQualityMetrics AS (
+    SELECT 
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId AS AnswererUserId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerDate,
+        q.CreationDate AS QuestionDate,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) / 3600.0 AS HoursToAnswer,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END AS IsAccepted,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViews
+    FROM Posts a
+    INNER JOIN Posts q ON a.ParentId = q.Id
+    LEFT JOIN Comments c ON a.Id = c.PostId
+    WHERE a.PostTypeId = 2 
+        AND q.PostTypeId = 1
+        AND a.Score >= 0
+    GROUP BY a.Id, a.ParentId, a.OwnerUserId, a.Score, a.CreationDate, q.CreationDate, q.AcceptedAnswerId, q.Score, q.ViewCount
+),
+TopTagsPerQuestion AS (
+    SELECT
+        p.Id AS QuestionId,
+        tpa.TagName,
+        tpa.AvgScore,
+        tpa.AvgViews
+    FROM Posts p
+    JOIN TagPerformanceAnalysis tpa ON p.Tags LIKE '%' || '<' || tpa.TagName || '>' || '%'
+)
+SELECT 
+    tq.Year,
+    tq.Id AS QuestionId,
+    u.DisplayName AS QuestionAuthor,
+    uem.Reputation,
+    uem.Questions AS AuthorTotalQuestions,
+    uem.Answers AS AuthorTotalAnswers,
+    uem.GoldBadges,
+    tq.Score AS QuestionScore,
+    tq.ViewCount,
+    tq.AnswerCount,
+    COUNT(DISTINCT aqm.AnswerId) AS QualityAnswers,
+    AVG(aqm.AnswerScore) AS AvgAnswerScore,
+    AVG(aqm.HoursToAnswer) AS AvgHoursToAnswer,
+    SUM(aqm.IsAccepted) AS AcceptedAnswersCount,
+    COUNT(DISTINCT ph.Id) AS EditHistoryCount,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.Id END) AS ContentEdits,
+    COUNT(DISTINCT pl.Id) AS LinkedPostsCount,
+    STRING_AGG(tpa.TagName, ', ' ORDER BY tpa.AvgScore DESC) AS TopPerformingTags,
+    AVG(tpa.AvgViews) AS AvgViewsForTags
+FROM TopQuestionsByYear tq
+INNER JOIN Users u ON tq.OwnerUserId = u.Id
+INNER JOIN UserEngagementMetrics uem ON u.Id = uem.UserId
+LEFT JOIN AnswerQualityMetrics aqm ON tq.Id = aqm.QuestionId
+LEFT JOIN PostHistory ph ON tq.Id = ph.PostId
+LEFT JOIN PostLinks pl ON tq.Id = pl.PostId
+LEFT JOIN Posts p ON tq.Id = p.Id
+LEFT JOIN TopTagsPerQuestion tpa ON tq.Id = tpa.QuestionId
+WHERE tq.rn <= 100
+    AND uem.Reputation > 1000
+GROUP BY 
+    tq.Year, tq.Id, u.DisplayName, uem.Reputation, 
+    uem.Questions, uem.Answers, uem.GoldBadges,
+    tq.Score, tq.ViewCount, tq.AnswerCount
+HAVING COUNT(DISTINCT aqm.AnswerId) > 0
+ORDER BY tq.Year DESC, tq.Score DESC, AVG(aqm.AnswerScore) DESC
+LIMIT 1000;

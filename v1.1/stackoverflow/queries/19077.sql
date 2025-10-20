@@ -1,0 +1,201 @@
+WITH UserReputationSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        EXTRACT(EPOCH FROM (U.LastAccessDate - U.CreationDate)) / (60 * 60 * 24) AS AccountAgeDays,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionsOwned,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswersOwned,
+        SUM(P.Score) AS TotalPostScoreOwned,
+        AVG(P.Score) AS AvgPostScoreOwned,
+        SUM(P.ViewCount) AS TotalPostViewCountOwned,
+        SUM(P.AnswerCount) AS TotalAnswersReceived,
+        SUM(P.FavoriteCount) AS TotalFavoritesReceived,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(C.Score) AS TotalCommentScoreMade,
+        COUNT(DISTINCT V.PostId) AS TotalPostsVotedOn,
+        COUNT(DISTINCT CASE WHEN V.VoteTypeId = 2 THEN V.Id END) AS TotalUpVotesCast,
+        COUNT(DISTINCT CASE WHEN V.VoteTypeId = 3 THEN V.Id END) AS TotalDownVotesCast,
+        MAX(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge,
+        MAX(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS HasSilverBadge,
+        MAX(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS HasBronzeBadge,
+        MAX(CASE WHEN P_ANS.PostTypeId = 2 AND P_ANS.Score > 100 THEN 1 ELSE 0 END) AS HasHighlyUpvotedAnswer
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Posts P_ANS ON U.Id = P_ANS.OwnerUserId AND P_ANS.PostTypeId = 2
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate,
+        U.Views, U.UpVotes, U.DownVotes
+),
+PostLifecycleAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.LastEditDate,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.Tags,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.Id END) AS EditCount,
+        MAX(CASE WHEN PH_CLOSE.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS WasClosed,
+        MAX(CASE WHEN PH_REOPEN.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS WasReopened,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (2,5,8) AND LENGTH(COALESCE(PH.Text, '')) > 0 THEN 1 ELSE 0 END) AS HasBodyHistory,
+        EXTRACT(EPOCH FROM (P.LastEditDate - P.CreationDate)) / (60 * 60 * 24) AS DaysToLastEdit,
+        (
+            SELECT COALESCE(C_LAST.Text, '')
+            FROM Comments C_LAST
+            WHERE C_LAST.PostId = P.Id AND C_LAST.Text IS NOT NULL
+            ORDER BY C_LAST.CreationDate DESC
+            LIMIT 1
+        ) AS LatestCommentText
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN PostHistory PH_CLOSE ON P.Id = PH_CLOSE.PostId AND PH_CLOSE.PostHistoryTypeId = 10
+    LEFT JOIN PostHistory PH_REOPEN ON P.Id = PH_REOPEN.PostId AND PH_REOPEN.PostHistoryTypeId = 11
+    WHERE P.PostTypeId = 1
+    GROUP BY
+        P.Id, P.OwnerUserId, P.PostTypeId, P.CreationDate, P.LastEditDate, P.ClosedDate,
+        P.CommunityOwnedDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount, P.Tags
+),
+TagStats AS (
+    SELECT
+        TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags)-2), '><'))) AS TagName,
+        P.Id AS PostId,
+        P.OwnerUserId
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(TRIM(P.Tags)) > 2
+),
+PopularTags AS (
+    SELECT
+        TS.TagName,
+        COUNT(DISTINCT TS.PostId) AS TaggedPostCount,
+        COUNT(DISTINCT TS.OwnerUserId) AS UniqueTagUsers
+    FROM TagStats TS
+    GROUP BY TS.TagName
+    HAVING COUNT(DISTINCT TS.PostId) > 100
+),
+PostLinkAnalysis AS (
+    SELECT
+        PL.PostId,
+        COUNT(CASE WHEN PL.LinkTypeId = 1 THEN PL.RelatedPostId END) AS LinkedPostCount,
+        COUNT(CASE WHEN PL.LinkTypeId = 3 THEN PL.RelatedPostId END) AS DuplicatePostCount,
+        MAX(CASE WHEN PL.LinkTypeId = 1 THEN PL.CreationDate ELSE NULL END) AS LatestLinkedPostDate
+    FROM PostLinks PL
+    GROUP BY PL.PostId
+),
+DiverseActiveUsers AS (
+    SELECT DISTINCT P.OwnerUserId AS UserId, 'RecentPoster' AS ActivityType
+    FROM Posts P
+    WHERE P.OwnerUserId IS NOT NULL AND P.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year' AND P.PostTypeId IN (1, 2)
+    UNION ALL
+    SELECT DISTINCT B.UserId, 'GoldBadgeHolder' AS ActivityType
+    FROM Badges B
+    WHERE B.Class = 1
+    UNION ALL
+    SELECT DISTINCT C.UserId, 'HighScoreCommenter' AS ActivityType
+    FROM Comments C
+    WHERE C.UserId IS NOT NULL AND C.Score > 5
+)
+SELECT
+    URS.UserId,
+    URS.DisplayName,
+    URS.Reputation,
+    URS.UserCreationDate,
+    URS.LastAccessDate,
+    URS.AccountAgeDays,
+    URS.UserViews,
+    URS.UserUpVotesGiven,
+    URS.UserDownVotesGiven,
+    URS.TotalPostsOwned,
+    URS.QuestionsOwned,
+    URS.AnswersOwned,
+    URS.TotalPostScoreOwned,
+    URS.AvgPostScoreOwned,
+    URS.TotalPostViewCountOwned,
+    URS.TotalAnswersReceived,
+    URS.TotalFavoritesReceived,
+    URS.TotalCommentsMade,
+    URS.TotalCommentScoreMade,
+    URS.HasGoldBadge,
+    URS.HasSilverBadge,
+    URS.HasBronzeBadge,
+    URS.HasHighlyUpvotedAnswer,
+    COALESCE(URS.Reputation / NULLIF(URS.AccountAgeDays, 0), 0) AS AvgDailyReputationGain,
+    COALESCE(CAST(URS.UserUpVotesGiven AS DECIMAL) / NULLIF(URS.UserDownVotesGiven, 0), 0) AS UpToDownVoteRatioGiven,
+    SUM(PLA.LinkedPostCount) AS TotalLinkedPostsForUserQuestions,
+    SUM(PLA.DuplicatePostCount) AS TotalDuplicatePostsForUserQuestions,
+    AVG(PLA.LinkedPostCount) AS AvgLinkedPostsPerQuestion,
+    AVG(PLA.DuplicatePostCount) AS AvgDuplicatePostsPerQuestion,
+    SUM(CASE WHEN PLA.LatestLinkedPostDate > URS.LastAccessDate THEN 1 ELSE 0 END) AS LinkedPostsAfterLastAccess,
+    AVG(PLCA.EditCount) AS AvgEditCountPerQuestion,
+    SUM(CASE WHEN PLCA.WasClosed = 1 THEN 1 ELSE 0 END) AS TotalClosedQuestionsOwned,
+    SUM(CASE WHEN PLCA.WasReopened = 1 THEN 1 ELSE 0 END) AS TotalReopenedQuestionsOwned,
+    SUM(CASE WHEN PLCA.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END) AS TotalCommunityOwnedQuestions,
+    MAX(CASE
+            WHEN PLCA.LatestCommentText IS NOT NULL AND LENGTH(PLCA.LatestCommentText) > 20
+            THEN SUBSTRING(PLCA.LatestCommentText FROM 1 FOR 50) || '...'
+            ELSE COALESCE(PLCA.LatestCommentText, '[No Comment]')
+        END) AS LongestRecentCommentSnippet,
+    RANK() OVER (PARTITION BY EXTRACT(YEAR FROM URS.UserCreationDate) ORDER BY URS.Reputation DESC) AS RankByReputationInCreationYear,
+    AVG(PLCA.PostScore) OVER (PARTITION BY URS.UserId ORDER BY PLCA.PostCreationDate ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS MovingAvgQuestionScore,
+    (
+        SELECT COUNT(DISTINCT PL_INNER.RelatedPostId)
+        FROM PostLinks PL_INNER
+        JOIN Posts P_RELATED ON PL_INNER.RelatedPostId = P_RELATED.Id
+        WHERE PL_INNER.PostId IN (SELECT PLCA_INNER.PostId FROM PostLifecycleAnalysis PLCA_INNER WHERE PLCA_INNER.OwnerUserId = URS.UserId)
+          AND PL_INNER.LinkTypeId = 1
+          AND P_RELATED.ViewCount > 50000
+    ) AS LinkedToHighViewQuestionsCount,
+    (
+        SELECT STRING_AGG(PT_USER.TagName, ', ')
+        FROM (
+            SELECT
+                TS_USER.TagName,
+                COUNT(TS_USER.PostId) AS TagUsageCount
+            FROM TagStats TS_USER
+            WHERE TS_USER.OwnerUserId = URS.UserId
+            GROUP BY TS_USER.TagName
+            ORDER BY TagUsageCount DESC, TS_USER.TagName ASC
+            LIMIT 3
+        ) AS PT_USER
+    ) AS Top3QuestionTags,
+    (URS.Reputation > 10000 AND COALESCE(URS.Reputation / NULLIF(URS.AccountAgeDays, 0), 0) > 20 AND SUM(CASE WHEN PLCA.WasClosed = 1 THEN 1 ELSE 0 END) > 5) AS HighReputationAndMultipleClosedQuestions,
+    COUNT(DISTINCT DAU.ActivityType) AS DistinctActiveUserActivities
+FROM UserReputationSummary URS
+LEFT JOIN PostLifecycleAnalysis PLCA ON URS.UserId = PLCA.OwnerUserId
+LEFT JOIN PostLinkAnalysis PLA ON PLCA.PostId = PLA.PostId
+LEFT JOIN DiverseActiveUsers DAU ON URS.UserId = DAU.UserId
+WHERE
+    URS.Reputation > 5000
+    AND URS.AccountAgeDays > 365
+    AND URS.QuestionsOwned > 0 AND URS.AnswersOwned > 0
+GROUP BY
+    URS.UserId, URS.DisplayName, URS.Reputation, URS.UserCreationDate, URS.LastAccessDate,
+    URS.AccountAgeDays, URS.UserViews, URS.UserUpVotesGiven, URS.UserDownVotesGiven,
+    URS.TotalPostsOwned, URS.QuestionsOwned, URS.AnswersOwned, URS.TotalPostScoreOwned,
+    URS.AvgPostScoreOwned, URS.TotalPostViewCountOwned, URS.TotalAnswersReceived,
+    URS.TotalFavoritesReceived, URS.TotalCommentsMade, URS.TotalCommentScoreMade,
+    URS.HasGoldBadge, URS.HasSilverBadge, URS.HasBronzeBadge, URS.HasHighlyUpvotedAnswer,
+    PLA.LinkedPostCount, PLA.DuplicatePostCount, PLA.LatestLinkedPostDate,
+    PLCA.EditCount, PLCA.WasClosed, PLCA.WasReopened, PLCA.CommunityOwnedDate, PLCA.LatestCommentText, PLCA.PostScore, PLCA.PostCreationDate
+HAVING
+    COUNT(PLCA.PostId) > 5
+    AND COUNT(DISTINCT DAU.ActivityType) >= 2
+ORDER BY
+    AvgDailyReputationGain DESC, URS.Reputation DESC
+LIMIT 1000;

@@ -1,0 +1,89 @@
+WITH TagSpecificQuestions AS (
+    SELECT Id, ViewCount, FavoriteCount, Score AS QuestionScore, OwnerUserId
+    FROM Posts
+    WHERE PostTypeId = 1
+      AND Tags LIKE '%<java>%'
+      AND ClosedDate IS NULL
+      AND DeletionDate IS NULL
+),
+UserAnswerMetrics AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(p.Id) AS TotalAnswersInTag,
+        SUM(p.Score) AS TotalAnswerScoreInTag,
+        AVG(p.Score) AS AvgAnswerScoreInTag,
+        SUM(p.CommentCount) AS TotalCommentsOnAnswers,
+        SUM(tq.ViewCount) AS CumulativeQuestionViews,
+        SUM(tq.FavoriteCount) AS CumulativeQuestionFavorites,
+        MAX(p.CreationDate) AS LastAnswerDate
+    FROM Posts p
+    JOIN TagSpecificQuestions tq ON p.ParentId = tq.Id
+    WHERE p.PostTypeId = 2
+      AND p.DeletionDate IS NULL
+      AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+    HAVING COUNT(p.Id) > 10
+),
+UserBadgePerformance AS (
+    SELECT
+        UserId,
+        COUNT(*) AS TotalBadges,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges
+    GROUP BY UserId
+),
+UserReputationRanking AS (
+    SELECT
+        Id,
+        Location,
+        Reputation,
+        DENSE_RANK() OVER (PARTITION BY Location ORDER BY Reputation DESC) AS LocationReputationRank
+    FROM Users
+    WHERE Location IS NOT NULL AND Location <> ''
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    uam.TotalAnswersInTag,
+    uam.TotalAnswerScoreInTag,
+    uam.AvgAnswerScoreInTag,
+    uam.CumulativeQuestionViews,
+    COALESCE(ubp.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ubp.SilverBadges, 0) AS SilverBadges,
+    urr.Location,
+    urr.LocationReputationRank,
+    (
+        (uam.TotalAnswerScoreInTag * 1.5) +
+        (uam.AvgAnswerScoreInTag * 10) +
+        (u.Reputation / 100.0) +
+        (uam.CumulativeQuestionViews / 1000.0) +
+        (COALESCE(ubp.GoldBadges, 0) * 200) +
+        (COALESCE(ubp.SilverBadges, 0) * 50) +
+        (
+            SELECT COUNT(*)
+            FROM Posts q
+            WHERE q.AcceptedAnswerId IN (
+                SELECT a.Id
+                FROM Posts a
+                WHERE a.OwnerUserId = u.Id
+                  AND a.ParentId IN (SELECT Id FROM TagSpecificQuestions)
+            )
+        ) * 25.0
+    ) AS InfluenceScore,
+    CASE
+        WHEN (uam.TotalAnswerScoreInTag > 1000 AND COALESCE(ubp.GoldBadges, 0) > 2) THEN 'Java Guru'
+        WHEN (uam.TotalAnswerScoreInTag > 500 AND COALESCE(ubp.SilverBadges, 0) > 10) THEN 'Java Expert'
+        WHEN (uam.TotalAnswersInTag > 20) THEN 'Consistent Contributor'
+        ELSE 'Active Participant'
+    END AS UserTier
+FROM Users u
+JOIN UserAnswerMetrics uam ON u.Id = uam.OwnerUserId
+LEFT JOIN UserBadgePerformance ubp ON u.Id = ubp.UserId
+LEFT JOIN UserReputationRanking urr ON u.Id = urr.Id
+WHERE u.Reputation > 5000
+  AND u.CreationDate < (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3' YEAR)
+ORDER BY InfluenceScore DESC
+LIMIT 200;

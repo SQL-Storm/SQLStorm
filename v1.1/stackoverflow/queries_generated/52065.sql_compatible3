@@ -1,0 +1,103 @@
+WITH UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersCount,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(CASE WHEN v.ScoreAdjustment IS NOT NULL THEN CAST(v.ScoreAdjustment AS NUMERIC) ELSE 0 END) AS TotalVoteScore,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpvotesReceived,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownvotesReceived,
+        COUNT(DISTINCT b.Id) AS BadgesCount,
+        MAX(b.Class) AS HighestBadgeClass,
+        COUNT(DISTINCT pl.Id) AS LinkedPosts,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS EditsCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (1,2,3)
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId OR p.Id = pl.RelatedPostId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TagPosts AS (
+    SELECT
+        p.Id AS PostId,
+        regexp_split_to_table(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><') AS TagName
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL AND p.Tags <> ''
+),
+TagStats AS (
+    SELECT 
+        t.Id AS TagId,
+        t.TagName,
+        t.Count,
+        AVG(p.Score) AS AvgTagScore,
+        COUNT(DISTINCT p.Id) AS TotalPostsInTag,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsInTag,
+        SUM(p.ViewCount) AS TotalViews,
+        COUNT(DISTINCT c.Id) AS CommentsInTag
+    FROM Tags t
+    LEFT JOIN TagPosts tp ON tp.TagName = t.TagName
+    LEFT JOIN Posts p ON tp.PostId = p.Id
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    GROUP BY t.Id, t.TagName, t.Count
+)
+SELECT 
+    ups.UserId,
+    ups.DisplayName,
+    ups.Reputation,
+    ups.TotalPosts,
+    ups.QuestionsCount,
+    ups.AnswersCount,
+    ups.AvgPostScore,
+    ups.TotalVoteScore,
+    ups.TotalVotes,
+    ups.UpvotesReceived,
+    ups.DownvotesReceived,
+    ups.BadgesCount,
+    ups.HighestBadgeClass,
+    ups.LinkedPosts,
+    ups.EditsCount,
+    ts.TagId,
+    ts.TagName,
+    ts.AvgTagScore,
+    ts.TotalPostsInTag,
+    ts.QuestionsInTag,
+    ts.TotalViews,
+    ts.CommentsInTag,
+    ROW_NUMBER() OVER (PARTITION BY ups.UserId ORDER BY ts.TotalPostsInTag DESC) AS TagRankForUser
+FROM UserPostStats ups
+JOIN Posts p ON ups.UserId = p.OwnerUserId
+JOIN TagPosts tp ON tp.PostId = p.Id
+JOIN Tags t ON t.TagName = tp.TagName
+JOIN TagStats ts ON t.Id = ts.TagId
+WHERE ups.TotalPosts > 10
+GROUP BY
+    ups.UserId,
+    ups.DisplayName,
+    ups.Reputation,
+    ups.TotalPosts,
+    ups.QuestionsCount,
+    ups.AnswersCount,
+    ups.AvgPostScore,
+    ups.TotalVoteScore,
+    ups.TotalVotes,
+    ups.UpvotesReceived,
+    ups.DownvotesReceived,
+    ups.BadgesCount,
+    ups.HighestBadgeClass,
+    ups.LinkedPosts,
+    ups.EditsCount,
+    ts.TagId,
+    ts.TagName,
+    ts.AvgTagScore,
+    ts.TotalPostsInTag,
+    ts.QuestionsInTag,
+    ts.TotalViews,
+    ts.CommentsInTag
+ORDER BY ups.Reputation DESC, ups.TotalPosts DESC, ts.TotalPostsInTag DESC
+LIMIT 100;

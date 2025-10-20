@@ -1,0 +1,84 @@
+-- {"query": "56073.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "llama-3.3-instruct", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 524} 
+
+WITH TopUsers AS (
+  SELECT 
+    u.Id, 
+    u.DisplayName, 
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes, 
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes, 
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions, 
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers
+  FROM 
+    Users u
+  JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+  LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+  GROUP BY 
+    u.Id, u.DisplayName
+  HAVING 
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) > 1000
+),
+TopTags AS (
+  SELECT 
+    t.TagName, 
+    COUNT(p.Id) AS PostCount
+  FROM 
+    Posts p
+  JOIN 
+    PostTags pt ON p.Id = pt.PostId
+  JOIN 
+    Tags t ON pt.TagId = t.Id
+  GROUP BY 
+    t.TagName
+  HAVING 
+    COUNT(p.Id) > 1000
+),
+QuestionAnswers AS (
+  SELECT 
+    p.Id, 
+    p.Title, 
+    p.Score, 
+    p.ViewCount, 
+    p.AnswerCount, 
+    p.CommentCount
+  FROM 
+    Posts p
+  WHERE 
+    p.PostTypeId = 1
+),
+AnswerScores AS (
+  SELECT 
+    p.Id, 
+    p.Score, 
+    p.ParentId
+  FROM 
+    Posts p
+  WHERE 
+    p.PostTypeId = 2
+)
+SELECT 
+  tu.DisplayName, 
+  tu.UpVotes, 
+  tu.DownVotes, 
+  tu.Questions, 
+  tu.Answers, 
+  tt.TagName, 
+  qa.Title, 
+  qa.Score, 
+  qa.ViewCount, 
+  qa.AnswerCount, 
+  qa.CommentCount, 
+  ascore.Score AS AnswerScore
+FROM 
+  TopUsers tu
+JOIN 
+  TopTags tt ON tu.Id = tt.Id
+JOIN 
+  QuestionAnswers qa ON tu.Id = qa.OwnerUserId
+JOIN 
+  AnswerScores ascore ON qa.Id = ascore.ParentId
+ORDER BY 
+  tu.UpVotes DESC, 
+  tt.PostCount DESC, 
+  qa.Score DESC;

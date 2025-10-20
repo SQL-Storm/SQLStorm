@@ -1,0 +1,121 @@
+-- {"query": "39089.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1972, "output_tokens": 2177} 
+
+WITH
+RecentQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        u.DisplayName AS OwnerName,
+        ROW_NUMBER() OVER (
+            PARTITION BY date_trunc('day', p.CreationDate)
+            ORDER BY p.Score DESC
+        ) AS DailyRank,
+        p.Tags
+    FROM Posts p
+    JOIN Users u
+      ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > now() - INTERVAL '30 days'
+),
+TopAnswers AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        a.Id       AS AnswerId,
+        a.Score    AS AnswerScore,
+        RANK() OVER (
+            PARTITION BY a.ParentId
+            ORDER BY a.Score DESC NULLS LAST
+        ) AS AnswerRank
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+      AND a.CreationDate > now() - INTERVAL '30 days'
+),
+TagAggregation AS (
+    SELECT
+        t.TagName,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1)      AS QuestionCount,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2)      AS AnswerCount,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1)  AS AvgQuestionScore,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 2)  AS AvgAnswerScore
+    FROM Posts p
+    CROSS JOIN LATERAL
+        string_to_array(
+            substring(p.Tags, 2, length(p.Tags) - 2),
+            '><'
+        ) AS tag(tag)
+    JOIN Tags t
+      ON t.TagName = tag.tag
+    GROUP BY t.TagName
+),
+UserMetrics AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS ACount,
+        SUM(v.Score)                                    AS TotalVotes
+    FROM Users u
+    LEFT JOIN Posts p
+      ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v
+      ON v.PostId = p.Id
+     AND v.VoteTypeId IN (2, 3)
+    GROUP BY u.Id, u.DisplayName
+),
+BadgeRanks AS (
+    SELECT
+        UserId,
+        COUNT(*) FILTER (WHERE Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE Class = 3) AS BronzeBadges,
+        ROW_NUMBER() OVER (
+            ORDER BY COUNT(*) FILTER (WHERE Class = 1) DESC
+        ) AS TopGoldRank
+    FROM Badges
+    GROUP BY UserId
+)
+SELECT
+    rq.Id,
+    rq.Title,
+    rq.CreationDate,
+    rq.Score       AS QuestionScore,
+    rq.DailyRank,
+    ta.AnswerId,
+    ta.AnswerScore,
+    ta.AnswerRank,
+    tagAgg.TagName,
+    tagAgg.QuestionCount,
+    tagAgg.AnswerCount,
+    tagAgg.AvgQuestionScore,
+    tagAgg.AvgAnswerScore,
+    um.QCount,
+    um.ACount,
+    um.TotalVotes,
+    br.GoldBadges,
+    br.SilverBadges,
+    br.BronzeBadges,
+    br.TopGoldRank
+FROM RecentQuestions rq
+LEFT JOIN TopAnswers ta
+  ON ta.QuestionId = rq.Id
+ AND ta.AnswerRank = 1
+LEFT JOIN LATERAL (
+    SELECT *
+    FROM TagAggregation tg
+    WHERE tg.TagName = ANY(
+        string_to_array(
+            substring(rq.Tags, 2, length(rq.Tags) - 2),
+            '><'
+        )
+    )
+    ORDER BY tg.QuestionCount DESC
+    LIMIT 1
+) tagAgg ON TRUE
+LEFT JOIN UserMetrics um
+  ON um.Id = rq.OwnerUserId
+LEFT JOIN BadgeRanks br
+  ON br.UserId = rq.OwnerUserId
+ORDER BY rq.CreationDate DESC, rq.Score DESC
+LIMIT 100;

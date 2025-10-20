@@ -1,0 +1,278 @@
+WITH
+user_activity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.OwnerUserId = u.Id) AS PostsAuthored,
+    COUNT(DISTINCT c.Id) AS CommentsMade,
+    COUNT(DISTINCT v.Id) FILTER (WHERE v.UserId = u.Id) AS VotesCast,
+    COUNT(DISTINCT b.Id) AS BadgesEarned,
+    MAX(p.CreationDate) FILTER (WHERE p.OwnerUserId = u.Id) AS LastPostDate
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Comments c ON c.UserId = u.Id
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+question_metrics AS (
+  SELECT
+    q.Id AS QuestionId,
+    q.OwnerUserId,
+    q.Title,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.Tags,
+    q.AcceptedAnswerId,
+    COALESCE( (SELECT COUNT(*) FROM Comments c WHERE c.PostId = q.Id), 0) AS CommentCount,
+    COALESCE( (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = q.Id), 0) AS OutboundLinks,
+    COALESCE( (SELECT COUNT(*) FROM PostLinks pl WHERE pl.RelatedPostId = q.Id), 0) AS InboundLinks,
+    COALESCE( (SELECT AVG(a.Score) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2), 0) AS AvgAnswerScore,
+    COALESCE( (SELECT MAX(length(a.Body)) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2), 0) AS MaxAnswerBodyLen,
+    COALESCE( (SELECT AVG(length(a.Body)) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2), 0) AS AvgAnswerBodyLen,
+    COALESCE( (SELECT COUNT(DISTINCT a.OwnerUserId) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2), 0) AS DistinctAnswerers,
+    COALESCE( (SELECT EXTRACT(EPOCH FROM (MIN(a.CreationDate) - q.CreationDate)) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2), NULL) AS SecondsToFirstAnswer,
+    CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAccepted,
+    COALESCE( (SELECT a.Score - q.Score FROM Posts a WHERE a.Id = q.AcceptedAnswerId), NULL) AS AcceptedScoreDelta
+  FROM Posts q
+  WHERE q.PostTypeId = 1
+),
+question_tags AS (
+  SELECT
+    qm.QuestionId,
+    trim(both '<>' FROM tag) AS Tag
+  FROM question_metrics qm,
+  LATERAL (
+    SELECT unnest(string_to_array(substring(coalesce(qm.Tags,''), 2, greatest(length(coalesce(qm.Tags,'')) - 2,0)), '><')) AS tag
+  ) t
+  WHERE coalesce(qm.Tags,'') <> ''
+),
+tag_agg AS (
+  SELECT
+    qt.Tag AS Tag,
+    COUNT(DISTINCT qt.QuestionId) AS QuestionCount,
+    AVG(qm.Score) AS AvgQuestionScore,
+    AVG(qm.ViewCount) AS AvgViews,
+    AVG(qm.AnswerCount) AS AvgAnswers,
+    AVG(qm.AvgAnswerScore) AS AvgAnswerScore,
+    SUM(CASE WHEN qm.HasAccepted = 1 THEN 1 ELSE 0 END) AS AcceptedCount
+  FROM question_tags qt
+  JOIN question_metrics qm ON qm.QuestionId = qt.QuestionId
+  LEFT JOIN Tags tmeta ON lower(tmeta.TagName) = lower(qt.Tag)
+  GROUP BY qt.Tag
+  HAVING COUNT(DISTINCT qt.QuestionId) > 50
+),
+post_link_graph AS (
+  SELECT
+    p.Id AS PostId,
+    COUNT(pl.Id) FILTER (WHERE pl.LinkTypeId = 1) AS OutgoingLinks,
+    COUNT(pl.Id) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicateLinks,
+    COUNT(pl2.Id) FILTER (WHERE pl2.RelatedPostId = p.Id AND pl2.LinkTypeId = 1) AS IncomingLinks
+  FROM Posts p
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+  LEFT JOIN PostLinks pl2 ON pl2.PostId = p.Id
+  GROUP BY p.Id
+),
+question_enriched AS (
+  SELECT
+    qm.QuestionId,
+    qm.OwnerUserId,
+    qm.Title,
+    qm.CreationDate,
+    qm.Score,
+    qm.ViewCount,
+    qm.AnswerCount,
+    qm.Tags,
+    qm.AcceptedAnswerId,
+    qm.CommentCount,
+    qm.OutboundLinks,
+    qm.InboundLinks,
+    qm.AvgAnswerScore,
+    qm.MaxAnswerBodyLen,
+    qm.AvgAnswerBodyLen,
+    qm.DistinctAnswerers,
+    qm.SecondsToFirstAnswer,
+    qm.HasAccepted,
+    qm.AcceptedScoreDelta,
+    ua.DisplayName AS OwnerName,
+    ua.Reputation AS OwnerReputation,
+    ua.PostsAuthored AS OwnerPosts,
+    pag.OutgoingLinks AS PagOutgoingLinks,
+    pag.IncomingLinks AS PagIncomingLinks,
+    pag.DuplicateLinks AS PagDuplicateLinks,
+    (
+      POWER(COALESCE(qm.ViewCount,0), 0.3)
+      * POWER(GREATEST(COALESCE(qm.AnswerCount,0),1), 0.6)
+      + COALESCE(qm.Score,0) * 2
+      + (COALESCE(qm.AvgAnswerScore,0) * 5)
+      + POWER(COALESCE(ua.Reputation,0), 0.2) * 10
+      + (COALESCE(pag.IncomingLinks,0) * 3)
+    ) AS HotnessScore
+  FROM question_metrics qm
+  LEFT JOIN user_activity ua ON ua.UserId = qm.OwnerUserId
+  LEFT JOIN post_link_graph pag ON pag.PostId = qm.QuestionId
+),
+ranked_questions AS (
+  SELECT
+    qe.QuestionId,
+    qe.OwnerUserId,
+    qe.Title,
+    qe.CreationDate,
+    qe.Score,
+    qe.ViewCount,
+    qe.AnswerCount,
+    qe.Tags,
+    qe.AcceptedAnswerId,
+    qe.CommentCount,
+    qe.OutboundLinks,
+    qe.InboundLinks,
+    qe.AvgAnswerScore,
+    qe.MaxAnswerBodyLen,
+    qe.AvgAnswerBodyLen,
+    qe.DistinctAnswerers,
+    qe.SecondsToFirstAnswer,
+    qe.HasAccepted,
+    qe.AcceptedScoreDelta,
+    qe.OwnerName,
+    qe.OwnerReputation,
+    qe.OwnerPosts,
+    qe.PagOutgoingLinks,
+    qe.PagIncomingLinks,
+    qe.PagDuplicateLinks,
+    qe.HotnessScore,
+    qt.Tag,
+    ROW_NUMBER() OVER (PARTITION BY qt.Tag ORDER BY qe.HotnessScore DESC) AS RankInTag,
+    RANK() OVER (ORDER BY qe.HotnessScore DESC) AS GlobalRank
+  FROM question_enriched qe
+  JOIN question_tags qt ON qt.QuestionId = qe.QuestionId
+),
+sample_set AS (
+  SELECT DISTINCT ON (sq.QuestionId)
+    sq.QuestionId,
+    sq.Title,
+    sq.Tag,
+    sq.OwnerName,
+    sq.OwnerReputation,
+    sq.HotnessScore,
+    sq.Score,
+    sq.ViewCount,
+    sq.AnswerCount,
+    sq.SecondsToFirstAnswer,
+    sq.MaxAnswerBodyLen,
+    sq.AvgAnswerBodyLen,
+    sq.DistinctAnswerers,
+    sq.PagIncomingLinks AS IncomingLinks,
+    sq.PagOutgoingLinks AS OutgoingLinks,
+    sq.PagDuplicateLinks AS DuplicateLinks,
+    sq.GlobalRank,
+    sq.RankInTag,
+    sq.CreationDate
+  FROM ranked_questions sq
+  WHERE sq.RankInTag <= 3
+    OR sq.GlobalRank <= 200
+    OR sq.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+  ORDER BY sq.QuestionId, sq.HotnessScore DESC
+),
+final_assembly AS (
+  SELECT
+    s.QuestionId,
+    s.Title,
+    s.Tag,
+    s.OwnerName,
+    s.OwnerReputation,
+    s.HotnessScore,
+    s.Score,
+    s.ViewCount,
+    s.AnswerCount,
+    COALESCE(ans.AnswerCountSample,0) AS SampleAnswerCount,
+    COALESCE(ans.TopAnswerScore,0) AS TopAnswerScore,
+    COALESCE(comm.TotalComments,0) AS TotalComments,
+    COALESCE(vt.UpVotes,0) AS UpVotesOnQuestion,
+    COALESCE(vt.DownVotes,0) AS DownVotesOnQuestion,
+    COALESCE(ph.EditCount,0) AS EditCount,
+    COALESCE(ph.LatestEdit, NULL) AS LatestEditDate,
+    s.DistinctAnswerers,
+    s.SecondsToFirstAnswer,
+    s.MaxAnswerBodyLen,
+    s.AvgAnswerBodyLen,
+    s.IncomingLinks,
+    s.OutgoingLinks,
+    s.DuplicateLinks,
+    s.GlobalRank,
+    s.RankInTag,
+    (
+      0.35 * (LEAST(1, GREATEST(0, s.ViewCount) / NULLIF((SELECT PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY ViewCount) FROM Posts WHERE PostTypeId=1),0))) +
+      0.25 * (LEAST(1, GREATEST(0, s.AnswerCount) / NULLIF((SELECT PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY AnswerCount) FROM Posts WHERE PostTypeId=1),0))) +
+      0.20 * (LEAST(1, GREATEST(0, COALESCE(ans.TopAnswerScore,0)) / NULLIF((SELECT PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY Score) FROM Posts WHERE PostTypeId=2),0))) +
+      0.20 * (LEAST(1, GREATEST(0, s.HotnessScore) / NULLIF((SELECT PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY ( POWER(COALESCE(ViewCount,0),0.3) * POWER(GREATEST(COALESCE(AnswerCount,0),1),0.6) + COALESCE(Score,0)*2 ) ) FROM Posts WHERE PostTypeId=1),0)))
+    ) AS EngagementIndex
+  FROM sample_set s
+  LEFT JOIN (
+    SELECT
+      p.ParentId AS QId,
+      COUNT(*) AS AnswerCountSample,
+      MAX(p.Score) AS TopAnswerScore
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+  ) ans ON ans.QId = s.QuestionId
+  LEFT JOIN (
+    SELECT
+      c.PostId AS QId,
+      COUNT(*) FILTER (WHERE c.PostId IS NOT NULL) AS TotalComments
+    FROM Comments c
+    WHERE c.PostId IS NOT NULL
+    GROUP BY c.PostId
+  ) comm ON comm.QId = s.QuestionId
+  LEFT JOIN (
+    SELECT
+      v.PostId AS QId,
+      COUNT(*) FILTER (WHERE vt.Name ILIKE 'Up%') AS UpVotes,
+      COUNT(*) FILTER (WHERE vt.Name ILIKE 'Down%') AS DownVotes
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+  ) vt ON vt.QId = s.QuestionId
+  LEFT JOIN (
+    SELECT
+      ph.PostId AS QId,
+      COUNT(*) AS EditCount,
+      MAX(ph.CreationDate) AS LatestEdit
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+  ) ph ON ph.QId = s.QuestionId
+)
+SELECT
+  fa.QuestionId,
+  fa.Title,
+  fa.Tag,
+  fa.OwnerName,
+  fa.OwnerReputation,
+  ROUND(CAST(fa.HotnessScore AS numeric),2) AS HotnessScore,
+  fa.Score,
+  fa.ViewCount,
+  fa.AnswerCount,
+  fa.SampleAnswerCount,
+  fa.TopAnswerScore,
+  fa.DistinctAnswerers,
+  fa.SecondsToFirstAnswer,
+  fa.MaxAnswerBodyLen,
+  ROUND(CAST(fa.AvgAnswerBodyLen AS numeric),2) AS AvgAnswerBodyLen,
+  fa.TotalComments,
+  fa.UpVotesOnQuestion,
+  fa.DownVotesOnQuestion,
+  fa.EditCount,
+  fa.LatestEditDate,
+  fa.IncomingLinks,
+  fa.OutgoingLinks,
+  fa.DuplicateLinks,
+  ROUND(CAST(fa.EngagementIndex AS numeric),4) AS EngagementIndex,
+  fa.GlobalRank,
+  fa.RankInTag
+FROM final_assembly fa
+ORDER BY fa.EngagementIndex DESC, fa.HotnessScore DESC
+LIMIT 500;

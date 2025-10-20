@@ -1,0 +1,147 @@
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT pt.Id) AS direct_posts,
+        1 AS level
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    JOIN Posts pt ON pt.Id = p.Id
+    WHERE t.Count > 1000
+    GROUP BY t.Id, t.TagName
+
+    UNION ALL
+
+    SELECT 
+        t.Id,
+        t.TagName,
+        th.direct_posts,
+        th.level + 1
+    FROM Tags t
+    JOIN tag_hierarchy th ON th.Id <> t.Id
+    WHERE th.level < 3
+),
+user_expertise AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR POSITION('>' IN SUBSTRING(p.Tags FROM 2)) - 1), ', ') AS primary_tags,
+        COUNT(DISTINCT p.Id) AS total_posts,
+        SUM(p.Score) AS total_score,
+        AVG(p.Score) AS avg_score,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS answers,
+        COUNT(DISTINCT b.Id) AS badge_count,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS median_score,
+        STDDEV(p.Score) AS score_stddev
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 5000
+        AND p.Score > 0
+        AND p.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years')
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT p.Id) > 50
+),
+post_evolution AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        COUNT(DISTINCT ph.Id) AS edit_count,
+        MAX(ph.CreationDate) - MIN(ph.CreationDate) AS edit_timespan,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10, 11) THEN ph.Id END) AS close_reopen_cycles,
+        COUNT(DISTINCT c.Id) AS comment_count,
+        AVG(c.Score) AS avg_comment_score,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS upvotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS downvotes,
+        CASE 
+            WHEN p.ViewCount > 0 THEN (CAST(p.Score AS numeric) / p.ViewCount) * 100
+            ELSE 0
+        END AS score_per_view_pct,
+        RANK() OVER (PARTITION BY DATE_TRUNC('month', p.CreationDate) ORDER BY p.Score DESC) AS monthly_rank
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.PostTypeId = 1
+        AND p.Score > 10
+        AND p.ViewCount > 1000
+    GROUP BY p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount
+),
+answer_quality AS (
+    SELECT 
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score AS AnswerScore,
+        q.Score AS QuestionScore,
+        a.CreationDate - q.CreationDate AS time_to_answer,
+        CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END AS is_accepted,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC) AS answer_rank,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.CreationDate) AS answer_order,
+        LENGTH(a.Body) AS answer_length,
+        (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = a.Id) AS links_count
+    FROM Posts a
+    JOIN Posts q ON q.Id = a.ParentId
+    WHERE a.PostTypeId = 2
+        AND q.PostTypeId = 1
+        AND a.Score > 0
+)
+SELECT 
+    ue.DisplayName,
+    ue.Reputation,
+    ue.total_posts,
+    ue.total_score,
+    ue.avg_score,
+    ue.median_score,
+    ue.score_stddev,
+    ue.questions,
+    ue.answers,
+    ue.gold_badges,
+    ue.badge_count,
+    pe.Title AS top_question,
+    pe.Score AS top_question_score,
+    pe.ViewCount AS top_question_views,
+    pe.edit_count,
+    pe.close_reopen_cycles,
+    pe.score_per_view_pct,
+    pe.monthly_rank,
+    COUNT(DISTINCT aq.AnswerId) AS quality_answers,
+    AVG(aq.time_to_answer) AS avg_response_time,
+    SUM(aq.is_accepted) AS accepted_answers,
+    AVG(aq.answer_length) AS avg_answer_length,
+    STRING_AGG(DISTINCT th.TagName, ', ' ORDER BY th.TagName) AS related_tags,
+    MAX(th.direct_posts) AS max_tag_posts,
+    COALESCE(ue.primary_tags, '') AS primary_expertise,
+    DENSE_RANK() OVER (ORDER BY ue.total_score DESC) AS global_score_rank,
+    DENSE_RANK() OVER (ORDER BY ue.avg_score DESC) AS global_avg_rank,
+    (
+      SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY pe2.ViewCount)
+      FROM post_evolution pe2
+      WHERE pe2.Id IN (SELECT p2.Id FROM Posts p2 WHERE p2.OwnerUserId = ue.UserId)
+    ) AS view_75th_percentile
+FROM user_expertise ue
+CROSS JOIN LATERAL (
+    SELECT * FROM post_evolution pe2
+    WHERE pe2.Id IN (SELECT p3.Id FROM Posts p3 WHERE p3.OwnerUserId = ue.UserId)
+    ORDER BY pe2.Score DESC
+    LIMIT 1
+) pe
+LEFT JOIN answer_quality aq ON aq.AnswerId IN (SELECT p4.Id FROM Posts p4 WHERE p4.OwnerUserId = ue.UserId AND p4.PostTypeId = 2)
+LEFT JOIN tag_hierarchy th ON th.TagName IN (
+    SELECT TRIM(both ' ' FROM unnest(string_to_array(COALESCE(ue.primary_tags, ''), ', ')))
+)
+WHERE ue.total_score > 100
+GROUP BY 
+    ue.UserId, ue.DisplayName, ue.Reputation, ue.total_posts, ue.total_score, 
+    ue.avg_score, ue.median_score, ue.score_stddev, ue.questions, ue.answers,
+    ue.gold_badges, ue.badge_count, pe.Title, pe.Score, pe.ViewCount, pe.edit_count,
+    pe.close_reopen_cycles, pe.score_per_view_pct, pe.monthly_rank, ue.primary_tags
+HAVING COUNT(DISTINCT aq.AnswerId) > 5
+ORDER BY ue.total_score DESC, global_avg_rank
+LIMIT 100;

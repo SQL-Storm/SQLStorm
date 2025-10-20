@@ -1,0 +1,78 @@
+WITH UserPosts AS (
+    SELECT 
+        OwnerUserId, 
+        COUNT(DISTINCT CASE WHEN PostTypeId = 1 THEN Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN PostTypeId = 2 THEN Id END) AS Answers,
+        AVG(Score) AS AvgPostScore 
+    FROM Posts 
+    GROUP BY OwnerUserId
+), UserComments AS (
+    SELECT 
+        UserId, 
+        COUNT(*) AS TotalComments, 
+        MAX(Score) AS TopCommentScore 
+    FROM Comments 
+    GROUP BY UserId
+), UserVotes AS (
+    SELECT 
+        p.OwnerUserId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes,
+        COUNT(DISTINCT v.CreationDate) AS VoteDays 
+    FROM Votes v 
+    JOIN Posts p ON v.PostId = p.Id 
+    GROUP BY p.OwnerUserId
+), BadgeStats AS (
+    SELECT 
+        UserId, 
+        COUNT(*) AS TotalBadges,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges 
+    FROM Badges 
+    GROUP BY UserId
+), PostEdits AS (
+    SELECT 
+        UserId, 
+        COUNT(DISTINCT PostId) AS EditedPosts,
+        COUNT(DISTINCT CASE WHEN PostHistoryTypeId = 5 THEN Id END) AS BodyEdits 
+    FROM PostHistory 
+    GROUP BY UserId
+), PostTags AS (
+    SELECT 
+        OwnerUserId, 
+        UNNEST(STRING_TO_ARRAY(SUBSTRING(Tags FROM 2 FOR LENGTH(Tags) - 2), '><')) AS TagName 
+    FROM Posts 
+    WHERE PostTypeId = 1
+)
+SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(up.Questions, 0) * 3 + 
+    COALESCE(up.Answers, 0) * 5 + 
+    COALESCE(uc.TotalComments, 0) * 1 + 
+    COALESCE(uv.Upvotes, 0) * 2 - 
+    COALESCE(uv.Downvotes, 0) * 4 + 
+    COALESCE(bs.GoldBadges, 0) * 50 AS ContributionScore,
+    RANK() OVER (ORDER BY COALESCE(up.AvgPostScore, 0) DESC) AS PostQualityRank,
+    STRING_AGG(DISTINCT SUBSTRING(t.TagName FROM 1 FOR 15), '; ') AS FrequentTags
+FROM Users u
+LEFT JOIN UserPosts up ON u.Id = up.OwnerUserId
+LEFT JOIN UserComments uc ON u.Id = uc.UserId
+LEFT JOIN UserVotes uv ON u.Id = uv.OwnerUserId
+LEFT JOIN BadgeStats bs ON u.Id = bs.UserId
+LEFT JOIN PostEdits pe ON u.Id = pe.UserId
+LEFT JOIN PostTags t ON u.Id = t.OwnerUserId
+WHERE u.Reputation > 1000 
+    AND u.CreationDate BETWEEN DATE '2012-01-01' AND DATE '2022-01-01'
+    AND COALESCE(pe.EditedPosts, 0) > COALESCE(up.Questions, 0) * 0.5
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, 
+    up.Questions, up.Answers, up.AvgPostScore, 
+    uc.TotalComments, uv.Upvotes, uv.Downvotes, 
+    bs.GoldBadges, bs.TotalBadges, pe.BodyEdits
+HAVING COUNT(DISTINCT t.TagName) > 3 
+    OR COALESCE(bs.TotalBadges, 0) > 10
+ORDER BY 
+    ContributionScore DESC, 
+    PostQualityRank ASC 
+LIMIT 100;

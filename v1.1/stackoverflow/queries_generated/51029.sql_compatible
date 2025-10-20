@@ -1,0 +1,134 @@
+WITH top_users AS (
+    SELECT u.id, u.displayname, u.reputation,
+           ROW_NUMBER() OVER (ORDER BY u.reputation DESC) as rep_rank
+    FROM users u
+    WHERE u.creationdate > CAST('2024-10-01' AS date) - INTERVAL '1 year'
+    LIMIT 100
+),
+user_posts AS (
+    SELECT tu.id as user_id,
+           p.id as post_id,
+           p.creationdate as post_date,
+           p.score,
+           p.viewcount,
+           p.answercount,
+           p.commentcount,
+           pt.name as post_type
+    FROM top_users tu
+    JOIN posts p ON p.owneruserid = tu.id
+    JOIN posttypes pt ON p.posttypeid = pt.id
+    WHERE p.posttypeid = 1 -- Questions only
+      AND p.creationdate > CAST('2024-10-01' AS date) - INTERVAL '6 months'
+),
+tagged_questions AS (
+    SELECT up.user_id,
+           up.post_id,
+           up.post_date,
+           up.score,
+           up.viewcount,
+           up.answercount,
+           up.commentcount,
+           up.post_type,
+           STRING_AGG(SUBSTRING(t.tagname FROM 1 FOR 20), ', ') as tag_summary,
+           COUNT(DISTINCT v.id) as total_votes,
+           SUM(CASE WHEN vt.name = 'UpMod' THEN 1 ELSE 0 END) as upvotes,
+           SUM(CASE WHEN vt.name = 'DownMod' THEN 1 ELSE 0 END) as downvotes,
+           AVG(c.score) as avg_comment_score
+    FROM user_posts up
+    LEFT JOIN posts p ON p.id = up.post_id
+    LEFT JOIN votes v ON v.postid = up.post_id
+    LEFT JOIN votetypes vt ON v.votetypeid = vt.id
+    LEFT JOIN comments c ON c.postid = up.post_id
+    LEFT JOIN LATERAL (
+        SELECT unnest(string_to_array(
+            substring(p.tags from 2 for length(p.tags)-2), 
+            '><'
+        )) as tagname
+    ) t ON true
+    GROUP BY up.user_id, up.post_id, up.post_date, up.score, 
+             up.viewcount, up.answercount, up.commentcount, up.post_type
+    HAVING COUNT(DISTINCT t.tagname) >= 2
+),
+accepted_answers AS (
+    SELECT tq.user_id,
+           tq.post_id,
+           aa.id as accepted_answer_id,
+           aa.score as answer_score,
+           aa.viewcount as answer_views
+    FROM tagged_questions tq
+    JOIN posts aa ON aa.id = tq.post_id AND aa.acceptedanswerid IS NOT NULL
+    WHERE tq.post_type = 'Question'
+),
+monthly_activity AS (
+    SELECT tu.displayname as user_name,
+           tu.reputation,
+           tu.rep_rank,
+           DATE_TRUNC('month', up.post_date) as activity_month,
+           COUNT(up.post_id) as questions_asked,
+           SUM(up.score) as total_question_score,
+           SUM(up.viewcount) as total_views,
+           AVG(up.score) as avg_question_score,
+           MAX(up.score) as max_question_score,
+           COUNT(aa.accepted_answer_id) as accepted_answers_received,
+           SUM(aa.answer_score) as total_accepted_score,
+           AVG(tq.upvotes) as avg_upvotes_per_question
+    FROM top_users tu
+    JOIN user_posts up ON up.user_id = tu.id
+    LEFT JOIN accepted_answers aa ON aa.user_id = tu.id AND aa.post_id = up.post_id
+    LEFT JOIN tagged_questions tq ON tq.user_id = tu.id AND tq.post_id = up.post_id
+    GROUP BY tu.displayname, tu.reputation, tu.rep_rank, DATE_TRUNC('month', up.post_date)
+),
+user_stats AS (
+    SELECT user_name,
+           reputation,
+           rep_rank,
+           activity_month,
+           questions_asked,
+           total_question_score,
+           total_views,
+           CASE 
+               WHEN questions_asked > 0 THEN ROUND(CAST(total_question_score AS numeric) / CAST(questions_asked AS numeric), 2)
+               ELSE 0 
+           END as score_per_question,
+           CASE 
+               WHEN questions_asked > 0 THEN ROUND(CAST(total_views AS numeric) / CAST(questions_asked AS numeric), 0)
+               ELSE 0 
+           END as views_per_question,
+           accepted_answers_received,
+           total_accepted_score,
+           avg_upvotes_per_question,
+           RANK() OVER (PARTITION BY activity_month ORDER BY total_question_score DESC) as monthly_score_rank,
+           ROW_NUMBER() OVER (ORDER BY total_views DESC) as overall_view_rank
+    FROM monthly_activity
+    WHERE questions_asked >= 3 -- Active users only
+)
+SELECT 
+    us.user_name,
+    us.reputation,
+    us.rep_rank,
+    us.activity_month,
+    us.questions_asked,
+    us.total_question_score,
+    us.total_views,
+    us.score_per_question,
+    us.views_per_question,
+    us.accepted_answers_received,
+    us.total_accepted_score,
+    us.avg_upvotes_per_question,
+    us.monthly_score_rank,
+    us.overall_view_rank,
+    CASE 
+        WHEN us.accepted_answers_received > 0 THEN 
+            ROUND(CAST(us.total_accepted_score AS numeric) / CAST(us.accepted_answers_received AS numeric), 2)
+        ELSE 0 
+    END as avg_accepted_score,
+    -- Complex engagement score calculation
+    (us.total_question_score * 0.4 + 
+     us.total_views * 0.3 + 
+     us.total_accepted_score * 0.2 + 
+     us.avg_upvotes_per_question * 0.1) as engagement_score
+FROM user_stats us
+WHERE us.activity_month >= CAST('2024-10-01' AS date) - INTERVAL '3 months'
+  AND us.monthly_score_rank <= 10
+ORDER BY us.activity_month DESC, engagement_score DESC
+LIMIT 50;

@@ -1,0 +1,34 @@
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    AVG(p.Score) AS AvgPostScore,
+    SUM(p.ViewCount) AS TotalViews,
+    COUNT(DISTINCT v.Id) AS TotalVotesReceived,
+    COUNT(DISTINCT CASE WHEN pt.Id = 1 THEN p.Id END) AS QuestionCount,
+    COUNT(DISTINCT CASE WHEN pt.Id = 2 THEN p.Id END) AS AnswerCount,
+    MAX(b.Date) AS LatestBadgeDate,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS TopTags,
+    RANK() OVER (ORDER BY COUNT(DISTINCT v.Id) DESC) AS VoteRank
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN (
+    SELECT p.Id, t.TagName
+    FROM Posts p,
+    LATERAL (
+        SELECT unnest(string_to_array(substring(p.Tags FROM 2 FOR (char_length(p.Tags) - 2)), '><')) AS TagName
+        LIMIT 3
+    ) t
+    WHERE p.Tags IS NOT NULL
+      AND t.TagName <> ''
+) t ON p.Id = t.Id
+WHERE u.Reputation > 100
+  AND p.CreationDate >= TIMESTAMP '2010-01-01'
+GROUP BY u.Id, u.DisplayName, u.Reputation, RANK() OVER (ORDER BY COUNT(DISTINCT v.Id) DESC)
+HAVING COUNT(DISTINCT v.Id) > 10
+ORDER BY TotalVotesReceived DESC
+LIMIT 1000;

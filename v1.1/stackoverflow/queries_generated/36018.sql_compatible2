@@ -1,0 +1,57 @@
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.PostTypeId,
+  p.CreationDate,
+  p.ViewCount,
+  p.Score,
+  p.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation,
+  pc.CommentCount,
+  pc.LastActivityDate,
+  pc.AnswerCount,
+  pc.FavoriteCount,
+  vt.Name AS LastVoteType,
+  v.ByUser AS VotedByUser,
+  COALESCE(tc.TagCount, 0) AS TagCount,
+  COALESCE(pl.LinkCount, 0) AS LinkCount
+FROM Posts p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN (
+  SELECT
+    ParentId AS PostId,
+    COUNT(*) AS CommentCount,
+    MAX(LastActivityDate) AS LastActivityDate,
+    SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS AnswerCount,
+    SUM(COALESCE(FavoriteCount, 0)) AS FavoriteCount
+  FROM Posts
+  GROUP BY ParentId
+) pc ON p.Id = pc.PostId
+LEFT JOIN (
+  SELECT
+    PostId,
+    MAX(CreationDate) AS LastVoteDate,
+    MAX(VoteTypeId) AS LastVoteTypeId,
+    MAX(CASE WHEN UserId IS NOT NULL THEN 1 ELSE 0 END) AS ByUser
+  FROM Votes
+  GROUP BY PostId
+) v ON p.Id = v.PostId
+LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+LEFT JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+LEFT JOIN VoteTypes vt ON v.LastVoteTypeId = vt.Id
+LEFT JOIN (
+  SELECT p2.Id AS PostId, COUNT(t.Id) AS TagCount
+  FROM Posts p2
+  JOIN PostTags pt ON pt.PostId = p2.Id
+  JOIN Tags t ON t.Id = pt.TagId
+  GROUP BY p2.Id
+) tc ON p.Id = tc.PostId
+LEFT JOIN (
+  SELECT PostId, COUNT(*) AS LinkCount
+  FROM PostLinks
+  GROUP BY PostId
+) pl ON p.Id = pl.PostId
+WHERE p.Id = ?
+ORDER BY p.CreationDate DESC
+LIMIT 1;

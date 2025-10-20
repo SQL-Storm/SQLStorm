@@ -1,0 +1,132 @@
+WITH post_activity AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.ContentLicense,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId IN (2,3)) AS VoteCount,
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,24,25,31,33,34,35,36,37,38,50,52,53,66)) AS EditCount
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId IN (1,2)
+),
+user_metrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.ProfileImageUrl,
+        u.Location,
+        COALESCE(u.EmailHash, u.EmailHashAddress, u.Email_Hash) AS EmailHash,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges
+    FROM
+        Users u
+),
+aggregated AS (
+    SELECT
+        pa.PostId,
+        pa.PostTypeId,
+        pa.PostCreationDate,
+        pa.LastActivityDate,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.FavoriteCount,
+        pa.Title,
+        pa.Tags,
+        pa.OwnerUserId,
+        pa.AcceptedAnswerId,
+        pa.ContentLicense,
+        pa.VoteCount,
+        pa.EditCount,
+        um.Reputation,
+        um.UserCreationDate,
+        um.LastAccessDate,
+        um.Views,
+        um.UpVotes,
+        um.DownVotes,
+        um.GoldBadges,
+        um.SilverBadges,
+        um.BronzeBadges
+    FROM
+        post_activity pa
+    LEFT JOIN
+        user_metrics um ON pa.OwnerUserId = um.UserId
+)
+SELECT
+    PostId,
+    CASE WHEN PostTypeId = 1 THEN 'Question' ELSE 'Answer' END AS PostType,
+    Title,
+    Tags,
+    OwnerUserId,
+    Reputation,
+    UserCreationDate,
+    LastAccessDate,
+    Views AS UserViews,
+    UpVotes,
+    DownVotes,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    PostCreationDate,
+    LastActivityDate,
+    Score,
+    ViewCount,
+    AnswerCount,
+    CommentCount,
+    FavoriteCount,
+    VoteCount,
+    EditCount,
+    AcceptedAnswerId,
+    ContentLicense
+FROM
+    aggregated
+WHERE
+    LastActivityDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '180' DAY)
+ORDER BY
+    LastActivityDate DESC,
+    PostId,
+    PostTypeId,
+    Title,
+    Tags,
+    OwnerUserId,
+    Reputation,
+    UserCreationDate,
+    LastAccessDate,
+    Views,
+    UpVotes,
+    DownVotes,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    PostCreationDate,
+    Score,
+    ViewCount,
+    AnswerCount,
+    CommentCount,
+    FavoriteCount,
+    VoteCount,
+    EditCount,
+    AcceptedAnswerId,
+    ContentLicense
+LIMIT 1000;

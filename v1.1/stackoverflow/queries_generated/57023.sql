@@ -1,0 +1,183 @@
+-- {"query": "57023.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2291, "output_tokens": 1634} 
+
+WITH RankedUsers AS (
+    SELECT
+        Id AS UserId,
+        Reputation,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC) AS Rank
+    FROM
+        Users
+),
+TopUsers AS (
+    SELECT
+        UserId
+    FROM
+        RankedUsers
+    WHERE
+        Rank <= 100
+),
+UserPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Tags,
+        u.Reputation,
+        u.DisplayName,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount
+    FROM
+        Posts p
+    JOIN
+        TopUsers u ON p.OwnerUserId = u.UserId
+    WHERE
+        p.PostTypeId = 1
+),
+TagData AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId
+    FROM
+        Tags t
+    JOIN
+        UserPosts up ON t.Id = ANY(string_to_array(SUBSTRING(up.Tags FROM 2 FOR LENGTH(up.Tags)-2), ''><''))
+),
+PostVotes AS (
+    SELECT
+        v.PostId,
+        v.VoteTypeId,
+        COUNT(*) AS VoteCount
+    FROM
+        Votes v
+    JOIN
+        UserPosts up ON v.PostId = up.PostId
+    WHERE
+        v.VoteTypeId IN (2, 3)
+    GROUP BY
+        v.PostId, v.VoteTypeId
+),
+PostComments AS (
+    SELECT
+        c.PostId,
+        COUNT(*) AS CommentCount
+    FROM
+        Comments c
+    JOIN
+        UserPosts up ON c.PostId = up.PostId
+    GROUP BY
+        c.PostId
+),
+PostHistoryData AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        COUNT(*) AS HistoryCount
+    FROM
+        PostHistory ph
+    JOIN
+        UserPosts up ON ph.PostId = up.PostId
+    GROUP BY
+        ph.PostId, ph.PostHistoryTypeId
+),
+VictoriousComments AS (
+    SELECT c.PostId,
+    	    STRING_AGG(c.Text, '\n') AS CommentsText,
+    	    ARRAY_AGG(c.CreationDate ORDER BY c.CreationDate ASC) AS CreationTimes,
+    	    COUNT(c.UserId) FILTER (WHERE c.UserId IS NOT NULL) AS UniqueUsersComments,
+    	    COUNT(c.Id) FILTER (WHERE c.Score > 0) AS PositiveScoreComments
+        FROM Comments c JOIN UserPosts up ON c.PostId = up.PostId
+        GROUP BY c.PostId
+        ORDER BY PositiveScoreComments DESC
+        LIMIT 100
+),
+AggPostData AS (
+    SELECT
+        up.PostId,
+        up.PostTypeId,
+        up.CreationDate,
+        up.Score,
+        up.ViewCount,
+        up.OwnerUserId,
+        up.Tags,
+        up.Reputation,
+        up.DisplayName,
+        up.AnswerCount,
+        COALESCE(pv.VoteCount, 0) AS TotalVotes,
+        COALESCE(pc.CommentCount, 0) AS TotalComments,
+        COALESCE(phd.HistoryCount, 0) AS TotalHistoryCount,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        vc.CommentsText,
+        vc.CreationTimes,
+        vc.UniqueUsersComments,
+        vc.PositiveScoreComments
+    FROM
+        UserPosts up
+    LEFT JOIN
+        PostVotes pv ON up.PostId = pv.PostId
+    LEFT JOIN
+        PostComments pc ON up.PostId = pc.PostId
+    LEFT JOIN
+        PostHistoryData phd ON up.PostId = phd.PostId
+    LEFT JOIN
+        TagData t ON up.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    LEFT JOIN VictoriousComments vc ON up.PostId = vc.PostId
+    )
+SELECT
+    apd.PostId,
+    apd.PostTypeId,
+    apd.CreationDate,
+    apd.Score,
+    apd.ViewCount,
+    apd.OwnerUserId,
+    apd.Tags,
+    apd.Reputation,
+    apd.DisplayName,
+    apd.AnswerCount,
+    apd.TotalVotes,
+    apd.TotalComments,
+    apd.TotalHistoryCount,
+    apd.TagName,
+    apd.Count,
+    array_to_string(ARRAY_AGG(apd.ExcerptPostId), ', ') AS ExcerptPostIds,
+    array_to_string(ARRAY_AGG(apd.WikiPostId), ', ') AS WikiPostIds,
+    array_to_string(ARRAY_AGG(apd.CommentsText), ', ') AS AllCommentsText,
+    array_to_string(ARRAY_AGG(apd.CreationTimes), '. ') AS AllCreationTimes,
+    SUM(apd.UniqueUsersComments) AS CommentsByUniqueUsers,
+    SUM(apd.PositiveScoreComments) AS PositiveScoreComments,
+    SUM(apd.TotalVotes) AS VotesInAllPostForms,
+    SUM(apd.TotalComments) AS TotalCommentsInAll,
+    SUM(apd.TotalHistoryCount) AS HistoryCountInAll
+FROM
+    AggPostData apd
+GROUP BY
+    apd.PostId,
+    apd.PostTypeId,
+    apd.CreationDate,
+    apd.Score,
+    apd.ViewCount,
+    apd.OwnerUserId,
+    apd.Tags,
+    apd.Reputation,
+    apd.DisplayName,
+    apd.AnswerCount,
+    apd.TotalVotes,
+    apd.TotalComments,
+    apd.TotalHistoryCount,
+    apd.TagName,
+    apd.Count
+ORDER BY
+    VotesInAllPostForms DESC,
+    PositiveScoreComments DESC,
+    CommentsByUniqueUsers DESC,
+    TotalCommentsInAll DESC,
+    UpVotes DESC
+LIMIT 50;

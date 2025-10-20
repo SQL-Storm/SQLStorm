@@ -1,0 +1,120 @@
+WITH TopQuestionsByTag AS (
+    SELECT 
+        p.Id,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName,
+        ROW_NUMBER() OVER (PARTITION BY UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) ORDER BY p.Score DESC, p.ViewCount DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '2 years'
+        AND p.Score >= 10
+),
+UserExpertise AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        COUNT(DISTINCT a.Id) AS AnswerCount,
+        AVG(p.Score) AS AvgQuestionScore,
+        AVG(a.Score) AS AvgAnswerScore,
+        COUNT(DISTINCT CASE WHEN a.Id = parent.AcceptedAnswerId THEN a.Id END) AS AcceptedAnswers,
+        SUM(p.ViewCount) AS TotalViews,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    LEFT JOIN Posts parent ON a.ParentId = parent.Id
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '3 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT p.Id) + COUNT(DISTINCT a.Id) >= 5
+),
+PostEngagement AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Score,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpvoteCount,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownvoteCount,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.Id END) AS FavoriteCount,
+        COUNT(DISTINCT ph.Id) AS EditCount,
+        MAX(v.CreationDate) AS LastVoteDate,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (4, 5, 6)
+    WHERE p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '18 months'
+    GROUP BY p.Id, p.Score
+),
+TagCorrelation AS (
+    SELECT 
+        t1.TagName AS Tag1,
+        t2.TagName AS Tag2,
+        COUNT(*) AS CoOccurrence,
+        AVG(p.Score) AS AvgScore,
+        AVG(p.ViewCount) AS AvgViews
+    FROM TopQuestionsByTag t1
+    JOIN TopQuestionsByTag t2 ON t1.Id = t2.Id AND t1.TagName < t2.TagName
+    JOIN Posts p ON t1.Id = p.Id
+    WHERE t1.rn <= 50 AND t2.rn <= 50
+    GROUP BY t1.TagName, t2.TagName
+    HAVING COUNT(*) >= 5
+),
+RelatedTagsAgg AS (
+    SELECT
+        tc.Tag1,
+        STRING_AGG(tc.Tag2, ', ') AS RelatedTags,
+        MAX(tc.CoOccurrence) AS MaxTagCoOccurrence
+    FROM TagCorrelation tc
+    GROUP BY tc.Tag1
+)
+SELECT 
+    ue.DisplayName,
+    ue.Reputation,
+    ue.QuestionCount,
+    ue.AnswerCount,
+    ROUND(CAST(ue.AvgQuestionScore AS numeric), 2) AS AvgQuestionScore,
+    ROUND(CAST(ue.AvgAnswerScore AS numeric), 2) AS AvgAnswerScore,
+    ue.AcceptedAnswers,
+    ue.TotalViews,
+    ue.GoldBadges,
+    ue.SilverBadges,
+    tq.TagName AS TopTag,
+    COUNT(DISTINCT pe.PostId) AS HighlyEngagedPosts,
+    AVG(pe.CommentCount) AS AvgComments,
+    AVG(pe.UpvoteCount) AS AvgUpvotes,
+    rta.RelatedTags,
+    rta.MaxTagCoOccurrence,
+    RANK() OVER (ORDER BY ue.Reputation DESC, ue.AcceptedAnswers DESC) AS UserRank
+FROM UserExpertise ue
+JOIN TopQuestionsByTag tq ON ue.UserId = tq.OwnerUserId AND tq.rn <= 10
+JOIN PostEngagement pe ON tq.Id = pe.PostId
+LEFT JOIN RelatedTagsAgg rta ON tq.TagName = rta.Tag1
+WHERE pe.CommentCount >= 2
+    AND pe.UpvoteCount >= 5
+GROUP BY 
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.QuestionCount,
+    ue.AnswerCount,
+    ue.AvgQuestionScore,
+    ue.AvgAnswerScore,
+    ue.AcceptedAnswers,
+    ue.TotalViews,
+    ue.GoldBadges,
+    ue.SilverBadges,
+    tq.TagName,
+    rta.RelatedTags,
+    rta.MaxTagCoOccurrence
+HAVING COUNT(DISTINCT pe.PostId) >= 3
+ORDER BY ue.Reputation DESC, ue.AcceptedAnswers DESC, AVG(pe.UpvoteCount) DESC
+LIMIT 100;

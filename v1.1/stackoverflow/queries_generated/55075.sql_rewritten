@@ -1,0 +1,155 @@
+-- {"query": "55075.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2048, "output_tokens": 1434} 
+WITH 
+/* 1. Compute each user's total reputation, vote weight, and badge score */
+UserMetrics AS (
+    SELECT 
+        u.Id                              AS UserId,
+        u.Reputation                      AS Reputation,
+        SUM(CASE v.VoteTypeId 
+                WHEN 2 THEN 1          -- UpMod
+                WHEN 3 THEN -1         -- DownMod
+                ELSE 0 
+            END)                         AS NetVoteScore,
+        SUM(CASE b.Class 
+                WHEN 1 THEN 100        -- Gold
+                WHEN 2 THEN 50         -- Silver
+                ELSE 20                -- Bronze
+            END)                         AS BadgeScore,
+        COUNT(DISTINCT v.Id)              AS TotalVotesCast,
+        COUNT(DISTINCT b.Id)              AS TotalBadgesEarned
+    FROM Users u
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.Reputation
+),
+
+/* 2. Identify top‑scoring posts per tag (questions only) with recent activity */
+TagPostRankings AS (
+    SELECT 
+        t.TagName,
+        p.Id                              AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (
+            PARTITION BY t.TagName 
+            ORDER BY p.Score DESC, p.ViewCount DESC, p.LastActivityDate DESC
+        )                                 AS RankInTag
+    FROM Posts p
+    JOIN Tags t ON t.Id = ANY (
+        SELECT (unnest(string_to_array(trim(both '><' FROM p.Tags), '><')::int[]))
+    )
+    WHERE p.PostTypeId = 1               -- Questions only
+      AND p.CreationDate > cast('2024-10-01' as date) - INTERVAL '2 years'
+),
+
+/* 3. Gather history of close/reopen events for these posts */
+CloseReopenHistory AS (
+    SELECT 
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        CASE ph.PostHistoryTypeId
+            WHEN 10 THEN 'Closed'
+            WHEN 11 THEN 'Reopened'
+            ELSE NULL
+        END                                 AS EventType,
+        ph.Comment                          AS CloseReasonOrNote
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10, 11)
+),
+
+/* 4. Compute weighted post score combining votes, answers, and tags */
+PostScoreMetrics AS (
+    SELECT 
+        p.Id                                     AS PostId,
+        p.Score                                  AS BaseScore,
+        COALESCE(a.AnswerCount,0)                AS AnswerCount,
+        COALESCE(c.CommentCount,0)               AS CommentCount,
+        COALESCE(vu.UpVotes,0) - COALESCE(vu.DownVotes,0) AS NetVoteDelta,
+        (p.Score * 2) 
+         + COALESCE(a.AnswerCount,0) * 5 
+         + COALESCE(c.CommentCount,0) * 1 
+         + (COALESCE(vu.UpVotes,0) - COALESCE(vu.DownVotes,0)) * 0.5 
+         AS WeightedScore
+    FROM Posts p
+    LEFT JOIN (
+        SELECT ParentId, COUNT(*) AS AnswerCount
+        FROM Posts 
+        WHERE PostTypeId = 2                     -- Answers
+        GROUP BY ParentId
+    ) a ON a.ParentId = p.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CommentCount
+        FROM Comments
+        GROUP BY PostId
+    ) c ON c.PostId = p.Id
+    LEFT JOIN (
+        SELECT 
+            PostId,
+            SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes
+        GROUP BY PostId
+    ) vu ON vu.PostId = p.Id
+    WHERE p.PostTypeId = 1                     -- Questions only
+),
+
+/* 5. Assemble final dataset joining all pieces */
+CombinedMetrics AS (
+    SELECT 
+        um.UserId,
+        um.Reputation,
+        um.NetVoteScore,
+        um.BadgeScore,
+        um.TotalVotesCast,
+        um.TotalBadgesEarned,
+        tr.TagName,
+        tr.PostId,
+        tr.Title,
+        tr.Score               AS PostBaseScore,
+        tr.ViewCount,
+        tr.CreationDate        AS PostCreated,
+        tr.LastActivityDate    AS PostLastActivity,
+        tr.RankInTag,
+        ph.EventType,
+        ph.CreationDate        AS EventDate,
+        ph.CloseReasonOrNote,
+        psm.WeightedScore
+    FROM UserMetrics um
+    JOIN Posts p ON p.OwnerUserId = um.UserId
+    JOIN TagPostRankings tr ON tr.PostId = p.Id AND tr.RankInTag <= 3
+    LEFT JOIN CloseReopenHistory ph ON ph.PostId = p.Id
+    LEFT JOIN PostScoreMetrics psm ON psm.PostId = p.Id
+)
+
+/* Final selection with ordering ready for benchmarking */
+SELECT 
+    UserId,
+    Reputation,
+    NetVoteScore,
+    BadgeScore,
+    TotalVotesCast,
+    TotalBadgesEarned,
+    TagName,
+    PostId,
+    Title,
+    PostBaseScore,
+    ViewCount,
+    PostCreated,
+    PostLastActivity,
+    RankInTag,
+    EventType,
+    EventDate,
+    CloseReasonOrNote,
+    WeightedScore
+FROM CombinedMetrics
+ORDER BY 
+    Reputation DESC,
+    BadgeScore DESC,
+    WeightedScore DESC,
+    RankInTag ASC,
+    PostCreated DESC
+LIMIT 500;

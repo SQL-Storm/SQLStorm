@@ -1,0 +1,35 @@
+-- {"query": "38.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 413} 
+SELECT
+  u.Id AS UserId,
+  u.DisplayName AS UserName,
+  u.Reputation,
+  COUNT(DISTINCT p.Id) AS PostCount,
+  AVG(COALESCE(v.BountyAmount, 0)) AS AvgBounty,
+  SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+  SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+  SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesCast,
+  SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesCast,
+  MAX(p.CreationDate) AS LastPostDate,
+  STRING_AGG(DISTINCT tt.Name, ',') FILTER (WHERE tt.Name IS NOT NULL) AS TopPostTypes,
+  COUNT(DISTINCT cl.Id) AS CommentCount,
+  SUM(CASE WHEN b.Id IS NOT NULL THEN 1 ELSE 0 END) AS BadgeCount
+FROM
+  Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN Comments cl ON cl.PostId = p.Id
+  LEFT JOIN PostTypes pt ON pt.Id = p.PostTypeId
+  LEFT JOIN (
+    SELECT p2.Id, pt2.Name
+    FROM Posts p2
+      JOIN PostTypes pt2 ON pt2.Id = p2.PostTypeId
+  ) AS tt ON tt.Id = p.Id
+WHERE
+  u.Reputation > 0
+  AND u.CreationDate < CURRENT_DATE - INTERVAL '1 year'
+GROUP BY
+  u.Id, u.DisplayName, u.Reputation
+ORDER BY
+  Reputation DESC, LastPostDate DESC
+LIMIT 100;

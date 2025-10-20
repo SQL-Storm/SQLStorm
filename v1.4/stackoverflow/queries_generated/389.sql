@@ -1,0 +1,82 @@
+-- {"query": "389.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 23987} 
+WITH
+DateSeries AS (
+  SELECT generate_series(current_date - interval '29 days', current_date, interval '1 day')::date AS Day
+),
+DailyMetrics AS (
+  SELECT
+    ds.Day,
+    'Metrics' AS Type,
+    NULL::bigint AS PostId,
+    NULL AS Title,
+    NULL AS Score,
+    NULL AS ViewCount,
+    NULL AS LastActivityDate,
+    NULL AS TopTagName,
+    NULL AS OwnerUserId,
+    COUNT(p.Id) AS PostCount,
+    SUM(p.ViewCount) AS TotalViews,
+    SUM(p.Score) AS TotalScore
+  FROM DateSeries ds
+  LEFT JOIN Posts p ON date(p.CreationDate) = ds.Day AND p.PostTypeId IN (1,2)
+  GROUP BY ds.Day
+),
+TopPosts AS (
+  SELECT
+    ds.Day,
+    'TopPost' AS Type,
+    p.Id::bigint AS PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.LastActivityDate,
+    CASE WHEN p.Tags IS NULL THEN NULL
+         ELSE (SELECT t.TagName
+               FROM unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS t(TagName)
+               LIMIT 1)
+    END AS TopTagName,
+    p.OwnerUserId AS OwnerUserId,
+    ROW_NUMBER() OVER (
+      PARTITION BY ds.Day
+      ORDER BY p.Score DESC NULLS LAST,
+               p.ViewCount DESC NULLS LAST,
+               p.LastActivityDate DESC NULLS LAST
+    ) AS rn
+  FROM DateSeries ds
+  LEFT JOIN Posts p ON date(p.CreationDate) = ds.Day AND p.PostTypeId IN (1,2)
+),
+TopPostsLimited AS (
+  SELECT Day, Type, PostId, Title, Score, ViewCount, LastActivityDate, TopTagName, OwnerUserId
+  FROM TopPosts
+  WHERE rn <= 3
+)
+SELECT
+  Day,
+  Type,
+  PostId,
+  Title,
+  Score,
+  ViewCount,
+  LastActivityDate,
+  TopTagName,
+  OwnerUserId,
+  NULL::int AS PostCount,
+  NULL::bigint AS TotalViews,
+  NULL::bigint AS TotalScore
+FROM TopPostsLimited
+UNION ALL
+SELECT
+  Day,
+  Type,
+  NULL AS PostId,
+  NULL AS Title,
+  NULL AS Score,
+  NULL AS ViewCount,
+  NULL AS LastActivityDate,
+  NULL AS TopTagName,
+  NULL AS OwnerUserId,
+  PostCount,
+  TotalViews,
+  TotalScore
+FROM DailyMetrics
+ORDER BY Day ASC, Type ASC;

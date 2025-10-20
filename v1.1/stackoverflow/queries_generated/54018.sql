@@ -1,0 +1,84 @@
+-- {"query": "54018.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2048, "output_tokens": 1974} 
+
+/* Benchmarking query: 100 most highly‑scored open questions with aggregated metadata */
+
+WITH
+-- Top three tags per question (ordered by tag usage)
+TagRanks AS (
+    SELECT
+        p.Id          AS PostId,
+        t.TagName,
+        t.Count,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY t.Count DESC) AS TagRank
+    FROM Posts p
+    CROSS APPLY (
+        SELECT TagName = SUBSTRING(m.NewsTag, 2, LEN(m.NewsTag)-2)
+        FROM Tags t
+        OUTER APPLY (SELECT NewsTag = SUBSTRING(
+            REPLACE(p.Tags, '><', '><'), 2, LEN(p.Tags)-2
+        )) m
+        WHERE CHARINDEX('<' + t.TagName + '>', p.Tags) > 0
+    ) m
+    WHERE p.PostTypeId = 1
+),
+-- Count of answers per question
+AnswerCnt AS (
+    SELECT ParentId, COUNT(*) AS AnswerCount
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY ParentId
+),
+-- Comment counts per question
+CommentCnt AS (
+    SELECT PostId, COUNT(*) AS CommentCount
+    FROM Comments
+    GROUP BY PostId
+),
+-- Vote aggregates per question
+VoteAgg AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedVotes
+    FROM Votes v
+    GROUP BY v.PostId
+),
+-- First and last edit timestamps from PostHistory
+EditTimes AS (
+    SELECT
+        ph.PostId,
+        MIN(ph.CreationDate) AS FirstEditDate,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6,11,12,13,14,15)  -- edit‑related events
+    GROUP BY ph.PostId
+)
+-- Final result set
+SELECT
+    TOP 100
+    p.Id                    AS QuestionId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    ISNULL(a.AnswerCount,0)   AS AnswerCount,
+    ISNULL(c.CommentCount,0)  AS CommentCount,
+    ISNULL(v.UpVotes,0)       AS UpVotes,
+    ISNULL(v.DownVotes,0)     AS DownVotes,
+    ISNULL(v.AcceptedVotes,0) AS AcceptedVotes,
+    ISNULL(e.FirstEditDate,'N/A') AS FirstEditDate,
+    ISNULL(e.LastEditDate,'N/A')  AS LastEditDate,
+    STRING_AGG(t.TagName, ',') WITHIN GROUP (ORDER BY t.Count DESC) AS TopTags
+FROM Posts p
+LEFT JOIN AnswerCnt a            ON a.ParentId   = p.Id
+LEFT JOIN CommentCnt c           ON c.PostId     = p.Id
+LEFT JOIN VoteAgg v              ON v.PostId     = p.Id
+LEFT JOIN EditTimes e            ON e.PostId     = p.Id
+LEFT JOIN TagRanks t             ON t.PostId     = p.Id AND t.TagRank <= 3
+WHERE p.PostTypeId = 1           -- only questions
+GROUP BY
+    p.Id, p.Title, p.CreationDate, p.Score,
+    a.AnswerCount, c.CommentCount,
+    v.UpVotes, v.DownVotes, v.AcceptedVotes,
+    e.FirstEditDate, e.LastEditDate
+ORDER BY p.Score DESC, a.AnswerCount DESC;

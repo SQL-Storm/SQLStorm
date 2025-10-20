@@ -1,0 +1,114 @@
+-- {"query": "46082.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 188108, "output_tokens": 150546} 
+
+WITH RECURSIVE user_influence_tree AS (
+  SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    0 as depth,
+    ARRAY[u.Id] as path
+  FROM Users u
+  WHERE u.Reputation > 10000
+    AND EXTRACT(YEAR FROM u.CreationDate) >= 2015
+  
+  UNION ALL
+  
+  SELECT 
+    u2.Id,
+    u2.DisplayName,
+    u2.Reputation,
+    u2.CreationDate,
+    uit.depth + 1,
+    uit.path || u2.Id
+  FROM user_influence_tree uit
+  JOIN Posts p ON p.OwnerUserId = uit.Id
+  JOIN Comments c ON c.PostId = p.Id
+  JOIN Users u2 ON u2.Id = c.UserId
+  WHERE uit.depth < 3
+    AND NOT u2.Id = ANY(uit.path)
+),
+top_tags_per_user AS (
+  SELECT 
+    p.OwnerUserId,
+    UNNEST(string_to_array(TRIM(BOTH '><' FROM p.Tags), '><')) as tag,
+    COUNT(*) as tag_count,
+    AVG(p.Score) as avg_score,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY COUNT(*) DESC) as rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.Tags IS NOT NULL
+    AND p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId, tag
+),
+engagement_metrics AS (
+  SELECT 
+    p.Id as PostId,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    COUNT(DISTINCT c.Id) as comment_count,
+    COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) as upvote_count,
+    COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) as downvote_count,
+    COUNT(DISTINCT b.Id) as badges_earned_around_post,
+    MAX(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) as has_accepted_answer
+  FROM Posts p
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN Badges b ON b.UserId = p.OwnerUserId 
+    AND b.Date BETWEEN p.CreationDate AND p.CreationDate + INTERVAL '30 days'
+  WHERE p.PostTypeId IN (1, 2)
+    AND p.CreationDate >= CURRENT_DATE - INTERVAL '5 years'
+  GROUP BY p.Id, p.OwnerUserId, p.Score, p.ViewCount, p.AnswerCount
+),
+complex_post_history AS (
+  SELECT 
+    ph.PostId,
+    COUNT(DISTINCT ph.UserId) as unique_editors,
+    COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) as edit_count,
+    COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (10, 102, 103, 104, 105)) as close_attempts,
+    MAX(ph.CreationDate) - MIN(ph.CreationDate) as lifetime_duration
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 10, 102, 103, 104, 105)
+  GROUP BY ph.PostId
+  HAVING COUNT(*) > 5
+)
+SELECT 
+  uit.DisplayName as influencer_name,
+  uit.Reputation as influencer_reputation,
+  uit.depth as network_depth,
+  COALESCE(ttu.tag, 'N/A') as primary_tag,
+  ttu.tag_count as posts_in_tag,
+  ROUND(ttu.avg_score::numeric, 2) as avg_tag_score,
+  COUNT(DISTINCT em.PostId) as total_posts,
+  ROUND(AVG(em.Score)::numeric, 2) as avg_post_score,
+  SUM(em.ViewCount) as total_views,
+  ROUND(AVG(em.comment_count)::numeric, 2) as avg_comments_per_post,
+  SUM(em.upvote_count) as total_upvotes,
+  SUM(em.downvote_count) as total_downvotes,
+  COUNT(DISTINCT cph.PostId) as complex_edited_posts,
+  ROUND(AVG(EXTRACT(EPOCH FROM cph.lifetime_duration)/86400)::numeric, 2) as avg_post_lifetime_days,
+  COUNT(DISTINCT pl.RelatedPostId) as linked_posts_count,
+  SUM(CASE WHEN em.has_accepted_answer = 1 THEN 1 ELSE 0 END) as questions_with_accepted_answers,
+  PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY em.ViewCount) as median_views
+FROM user_influence_tree uit
+LEFT JOIN top_tags_per_user ttu ON ttu.OwnerUserId = uit.Id AND ttu.rn <= 3
+LEFT JOIN engagement_metrics em ON em.OwnerUserId = uit.Id
+LEFT JOIN complex_post_history cph ON cph.PostId = em.PostId
+LEFT JOIN PostLinks pl ON pl.PostId = em.PostId AND pl.LinkTypeId = 1
+WHERE em.Score IS NOT NULL
+GROUP BY 
+  uit.Id,
+  uit.DisplayName, 
+  uit.Reputation, 
+  uit.depth,
+  ttu.tag,
+  ttu.tag_count,
+  ttu.avg_score
+HAVING COUNT(DISTINCT em.PostId) > 5
+ORDER BY 
+  uit.Reputation DESC,
+  total_upvotes DESC,
+  avg_post_score DESC
+LIMIT 100;

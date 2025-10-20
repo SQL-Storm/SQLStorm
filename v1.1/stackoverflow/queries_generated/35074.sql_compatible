@@ -1,0 +1,83 @@
+WITH TopTagUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        tag.TagName,
+        SUM(p.Score) AS TotalScore,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        DENSE_RANK() OVER (PARTITION BY tag.TagName ORDER BY SUM(p.Score) DESC) AS TagRank
+    FROM 
+        Posts p
+        INNER JOIN Users u ON u.Id = p.OwnerUserId
+        LEFT JOIN (
+            SELECT p_inner.Id AS PostId,
+                   TRIM(x.tag) AS TagName
+            FROM Posts p_inner,
+                 UNNEST(string_to_array(SUBSTRING(p_inner.Tags FROM 2 FOR (char_length(p_inner.Tags)-2)), '><')) AS x(tag)
+            WHERE p_inner.Tags IS NOT NULL
+        ) tag ON tag.PostId = p.Id
+    WHERE 
+        p.PostTypeId IN (1,2)
+    GROUP BY 
+        u.Id, u.DisplayName, tag.TagName
+    HAVING 
+        COUNT(DISTINCT p.Id) >= 10
+    ), 
+TagBestAnswers AS (
+    SELECT
+        tag.TagName,
+        p.Id AS PostId,
+        p.Score,
+        p.AnswerCount,
+        p.CreationDate,
+        DENSE_RANK() OVER (PARTITION BY tag.TagName ORDER BY p.Score DESC, p.CreationDate ASC) AS TagPostRank
+    FROM
+        Posts p
+        LEFT JOIN (
+            SELECT p_inner.Id AS PostId,
+                   TRIM(x.tag) AS TagName
+            FROM Posts p_inner,
+                 UNNEST(string_to_array(SUBSTRING(p_inner.Tags FROM 2 FOR (char_length(p_inner.Tags)-2)), '><')) AS x(tag)
+            WHERE p_inner.Tags IS NOT NULL
+        ) tag ON tag.PostId = p.Id
+    WHERE
+        p.PostTypeId = 1
+        AND p.Score > 5
+        AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years')
+    )
+SELECT
+    tbu.TagName,
+    tbu.DisplayName AS TopUser,
+    tbu.TotalScore,
+    tbu.PostCount,
+    tba.PostId AS TopPostId,
+    tba.Score AS TopPostScore,
+    tba.AnswerCount AS TopPostAnswers,
+    tba.CreationDate AS TopPostDate,
+    u2.DisplayName AS TopPostOwner,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = tba.PostId) AS TopPostComments,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = tba.PostId AND v.VoteTypeId = 2) AS TopPostUpvotes
+FROM
+    TopTagUsers tbu
+    INNER JOIN TagBestAnswers tba
+        ON tbu.TagName = tba.TagName AND tba.TagPostRank = 1
+    INNER JOIN Posts p2
+        ON p2.Id = tba.PostId
+    LEFT JOIN Users u2
+        ON u2.Id = p2.OwnerUserId
+WHERE
+    tbu.TagRank = 1
+GROUP BY
+    tbu.TagName,
+    tbu.DisplayName,
+    tbu.TotalScore,
+    tbu.PostCount,
+    tba.PostId,
+    tba.Score,
+    tba.AnswerCount,
+    tba.CreationDate,
+    u2.DisplayName,
+    tbu.TagRank
+ORDER BY
+    tbu.TotalScore DESC, tbu.TagName
+LIMIT 50;

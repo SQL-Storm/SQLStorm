@@ -1,0 +1,145 @@
+-- {"query": "34002.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 1324} 
+WITH RecursiveUserBadgeCounts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, b.Class
+
+    UNION ALL
+
+    SELECT
+        r.UserId,
+        r.DisplayName,
+        r.Class,
+        r.BadgeCount
+    FROM RecursiveUserBadgeCounts r
+    WHERE r.BadgeCount > 0
+),
+
+TopTagBadges AS (
+    SELECT
+        b.UserId,
+        b.Name AS BadgeName,
+        COUNT(*) AS BadgeFrequency
+    FROM Badges b
+    WHERE b.TagBased = 1
+    GROUP BY b.UserId, b.Name
+    ORDER BY BadgeFrequency DESC
+    LIMIT 100
+),
+
+QuestionAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        q.Title,
+        q.CreationDate AS QuestionCreation,
+        a.Id AS AnswerId,
+        a.OwnerUserId AS AnswerOwnerUserId,
+        a.CreationDate AS AnswerCreation,
+        a.Score AS AnswerScore
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+),
+
+UserActivityStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        COALESCE(COUNT(DISTINCT ph.Id), 0) AS TotalPostEdits,
+        COALESCE(COUNT(DISTINCT v.Id), 0) AS TotalVotesCast,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotesCast,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotesCast,
+        MAX(p.LastActivityDate) AS LastPostActivity
+    FROM Users u
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+
+ComplexPostInteraction AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        u.DisplayName AS OwnerName,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(v.Id) AS VoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        STRING_AGG(DISTINCT t.TagName, ', ') AS Tags,
+        COALESCE(pl_duplicates.DuplicateCount, 0) AS DuplicateLinks
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN (
+        SELECT pl.PostId, COUNT(*) AS DuplicateCount
+        FROM PostLinks pl
+        WHERE pl.LinkTypeId = 3
+        GROUP BY pl.PostId
+    ) pl_duplicates ON pl_duplicates.PostId = p.Id
+    LEFT JOIN Tags t ON POSITION(CONCAT('<', t.TagName, '>') IN COALESCE(p.Tags, '')) > 0
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, u.DisplayName, pl_duplicates.DuplicateCount
+    HAVING COUNT(c.Id) > 5 AND COUNT(v.Id) > 10
+),
+
+FinalResult AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        uas.TotalPostEdits,
+        uas.TotalVotesCast,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(DISTINCT qas.QuestionId) AS QuestionsAsked,
+        COUNT(DISTINCT qas.AnswerId) AS AnswersProvided,
+        AVG(qas.AnswerScore) AS AverageAnswerScore,
+        MAX(qas.AnswerScore) AS MaxAnswerScore
+    FROM Users u
+    LEFT JOIN UserActivityStats uas ON uas.Id = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN QuestionAnswerStats qas ON qas.OwnerUserId = u.Id OR qas.AnswerOwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, uas.TotalPostEdits, uas.TotalVotesCast
+    HAVING COUNT(DISTINCT qas.QuestionId) > 0
+    ORDER BY GoldBadges DESC, AverageAnswerScore DESC
+    LIMIT 50
+)
+
+SELECT 
+    fr.UserId,
+    fr.DisplayName,
+    fr.TotalPostEdits,
+    fr.TotalVotesCast,
+    fr.TotalBadges,
+    fr.GoldBadges,
+    fr.SilverBadges,
+    fr.BronzeBadges,
+    fr.QuestionsAsked,
+    fr.AnswersProvided,
+    ROUND(fr.AverageAnswerScore, 2) AS AverageAnswerScore,
+    fr.MaxAnswerScore,
+    cpi.PostId AS PopularQuestionId,
+    cpi.Title AS PopularQuestionTitle,
+    cpi.Score AS PopularQuestionScore,
+    cpi.ViewCount AS PopularQuestionViews,
+    cpi.CommentCount AS PopularQuestionComments,
+    cpi.VoteCount AS PopularQuestionVotes,
+    cpi.UpVotes AS PopularQuestionUpVotes,
+    cpi.DownVotes AS PopularQuestionDownVotes,
+    cpi.Tags AS PopularQuestionTags,
+    cpi.DuplicateLinks AS PopularQuestionDuplicateCount
+FROM FinalResult fr
+LEFT JOIN ComplexPostInteraction cpi ON cpi.OwnerName = fr.DisplayName
+ORDER BY fr.GoldBadges DESC, fr.AverageAnswerScore DESC, cpi.Score DESC
+LIMIT 20;

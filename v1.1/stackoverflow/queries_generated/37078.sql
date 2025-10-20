@@ -1,0 +1,184 @@
+-- {"query": "37078.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 2033} 
+WITH
+-- select top 100K active questions in the timeframe for heavier joins
+BaseQuestions AS (
+  SELECT p.Id, p.CreationDate, p.OwnerUserId, p.Score, p.ViewCount, p.AnswerCount, p.Title, p.Tags
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= now() - interval '3 years'
+    AND p.Score >= 0
+  ORDER BY p.ViewCount DESC NULLS LAST
+  LIMIT 100000
+),
+
+-- expand tags into rows for tag aggregation (Post.Tags format: <tag1><tag2>...)
+QuestionTags AS (
+  SELECT b.Id AS QuestionId,
+         trim(both '<>' FROM unnest(string_to_array(substring(b.Tags,2,length(b.Tags)-2), '><'))) AS Tag
+  FROM BaseQuestions b
+  WHERE b.Tags IS NOT NULL AND b.Tags <> ''
+),
+
+-- user summary for owners and editors referenced
+UserSummary AS (
+  SELECT u.Id,
+         u.Reputation,
+         u.CreationDate AS UserCreation,
+         u.DisplayName,
+         u.Views AS UserViews,
+         u.UpVotes,
+         u.DownVotes,
+         COALESCE(bc.BadgeGold,0) AS GoldBadges,
+         COALESCE(bc.BadgeSilver,0) AS SilverBadges,
+         COALESCE(bc.BadgeBronze,0) AS BronzeBadges
+  FROM Users u
+  LEFT JOIN (
+    SELECT UserId,
+           SUM(CASE WHEN Class=1 THEN 1 ELSE 0 END) AS BadgeGold,
+           SUM(CASE WHEN Class=2 THEN 1 ELSE 0 END) AS BadgeSilver,
+           SUM(CASE WHEN Class=3 THEN 1 ELSE 0 END) AS BadgeBronze
+    FROM Badges
+    GROUP BY UserId
+  ) bc ON bc.UserId = u.Id
+),
+
+-- aggregate answers, comments, votes and history per question
+PostAggregates AS (
+  SELECT q.Id AS QuestionId,
+         COUNT(DISTINCT a.Id) FILTER (WHERE a.PostTypeId = 2) AS AnswerCountReal,
+         AVG(a.Score) FILTER (WHERE a.PostTypeId = 2) AS AvgAnswerScore,
+         MAX(a.Score) FILTER (WHERE a.PostTypeId = 2) AS MaxAnswerScore,
+         COUNT(DISTINCT c.Id) AS CommentCount,
+         COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+         COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+         COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6,24)) AS EditRevisions,
+         MAX(ph.CreationDate) AS LastRevisionDate
+  FROM BaseQuestions q
+  LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+  LEFT JOIN Comments c ON c.PostId = q.Id
+  LEFT JOIN Votes v ON v.PostId = q.Id
+  LEFT JOIN PostHistory ph ON ph.PostId = q.Id
+  GROUP BY q.Id
+),
+
+-- detect duplicate clusters via PostLinks (LinkTypeId=3) and create connected components using recursive CTE
+DuplicateEdges AS (
+  SELECT pl.PostId, pl.RelatedPostId FROM PostLinks pl WHERE pl.LinkTypeId = 3
+  UNION
+  SELECT pl.RelatedPostId AS PostId, pl.PostId AS RelatedPostId FROM PostLinks pl WHERE pl.LinkTypeId = 3
+),
+DuplicateComponents AS (
+  SELECT de.PostId, de.RelatedPostId FROM DuplicateEdges de
+),
+RecComp AS (
+  SELECT PostId, RelatedPostId, PostId AS Root FROM DuplicateComponents
+  UNION
+  SELECT rc.PostId, de.RelatedPostId, rc.Root
+  FROM RecComp rc
+  JOIN DuplicateEdges de ON de.PostId = rc.RelatedPostId
+  WHERE de.RelatedPostId IS NOT NULL
+),
+ComponentRoots AS (
+  SELECT PostId, MIN(RelatedPostId) FILTER (WHERE RelatedPostId IS NOT NULL) AS MinNeighbor
+  FROM RecComp
+  GROUP BY PostId
+),
+QuestionWithComponent AS (
+  SELECT b.Id AS QuestionId,
+         COALESCE(cr.MinNeighbor, NULL) AS DuplicateRepresentative
+  FROM BaseQuestions b
+  LEFT JOIN ComponentRoots cr ON cr.PostId = b.Id
+),
+
+-- hotness score combining recency, views, score, answers, edits, and badge-weighted owner reputation
+Hotness AS (
+  SELECT q.Id AS QuestionId,
+         q.ViewCount,
+         q.Score,
+         pg.AnswerCountReal,
+         pg.CommentCount,
+         pg.EditRevisions,
+         CASE WHEN q.OwnerUserId IS NOT NULL THEN us.Reputation ELSE 0 END AS OwnerReputation,
+         CASE
+           WHEN q.CreationDate > now() - interval '7 days' THEN 3.0
+           WHEN q.CreationDate > now() - interval '30 days' THEN 1.5
+           ELSE 1.0
+         END AS RecencyMultiplier,
+         -- composite hotness formula
+         (
+           (greatest(q.ViewCount,0) ^ 0.5) * 0.4
+           + (greatest(q.Score,0) * 4) * 0.25
+           + (COALESCE(pg.AnswerCountReal,0) * 8) * 0.15
+           + (COALESCE(pg.EditRevisions,0) * 2) * 0.1
+           + (COALESCE(us.GoldBadges,0)*15 + COALESCE(us.SilverBadges,0)*7 + COALESCE(us.BronzeBadges,0)*2) * 0.02
+         ) * CASE WHEN pg.LastRevisionDate IS NOT NULL THEN (1 + EXTRACT(EPOCH FROM (now() - pg.LastRevisionDate))/86400.0/30.0)::numeric ^ -0.25 ELSE 1 END
+         * CASE WHEN q.Score < 0 THEN 0.6 ELSE 1 END
+         * CASE WHEN q.ViewCount IS NULL THEN 0.8 ELSE 1 END
+         * CASE WHEN q.OwnerUserId IS NULL THEN 0.9 ELSE 1 END
+         * CASE WHEN q.CreationDate > now() - interval '1 day' THEN 1.2 ELSE 1 END
+         AS HotnessScore
+  FROM BaseQuestions q
+  LEFT JOIN PostAggregates pg ON pg.QuestionId = q.Id
+  LEFT JOIN UserSummary us ON us.Id = q.OwnerUserId
+),
+
+-- per-tag statistics for the selected question set
+TagStats AS (
+  SELECT qt.Tag,
+         COUNT(*) AS QuestionsForTag,
+         SUM(pg.AnswerCountReal) AS TotalAnswers,
+         AVG(pg.AnswerCountReal) AS AvgAnswersPerQuestion,
+         SUM(bq.ViewCount) AS TagViews,
+         AVG(h.HotnessScore) AS AvgHotness
+  FROM QuestionTags qt
+  JOIN BaseQuestions bq ON bq.Id = qt.QuestionId
+  LEFT JOIN PostAggregates pg ON pg.QuestionId = qt.QuestionId
+  LEFT JOIN Hotness h ON h.QuestionId = qt.QuestionId
+  GROUP BY qt.Tag
+  HAVING COUNT(*) >= 50
+  ORDER BY AvgHotness DESC NULLS LAST
+  LIMIT 50
+)
+
+-- final result: combine top hot questions, enriched owner/editor info, tags, aggregates, duplicate mapping, and related tag stats
+SELECT
+  h.QuestionId,
+  b.Title,
+  b.CreationDate,
+  b.ViewCount,
+  b.Score,
+  COALESCE(pa.AnswerCountReal,0) AS AnswerCountReal,
+  COALESCE(pa.AvgAnswerScore,0) AS AvgAnswerScore,
+  COALESCE(pa.MaxAnswerScore,0) AS MaxAnswerScore,
+  COALESCE(pa.CommentCount,0) AS CommentCount,
+  COALESCE(pa.UpVotes,0) AS UpVotes,
+  COALESCE(pa.DownVotes,0) AS DownVotes,
+  COALESCE(pa.EditRevisions,0) AS EditRevisions,
+  us.DisplayName AS OwnerDisplayName,
+  us.Reputation AS OwnerReputation,
+  us.GoldBadges, us.SilverBadges, us.BronzeBadges,
+  qwc.DuplicateRepresentative,
+  h.HotnessScore,
+  -- top 3 tags for the question (if any)
+  (SELECT string_agg(t.Tag, ', ' ORDER BY t.Tag) FROM QuestionTags t WHERE t.QuestionId = h.QuestionId LIMIT 3) AS TopTags,
+  -- related high-hotness tag summary
+  ts.Tag AS RepresentativeTag,
+  ts.QuestionsForTag,
+  ts.TagViews,
+  ts.AvgHotness
+FROM Hotness h
+JOIN BaseQuestions b ON b.Id = h.QuestionId
+LEFT JOIN PostAggregates pa ON pa.QuestionId = h.QuestionId
+LEFT JOIN UserSummary us ON us.Id = b.OwnerUserId
+LEFT JOIN QuestionWithComponent qwc ON qwc.QuestionId = b.Id
+LEFT JOIN LATERAL (
+  SELECT Tag, QuestionsForTag, TagViews, AvgHotness
+  FROM TagStats
+  WHERE Tag IN (
+    SELECT trim(both '<>' FROM unnest(string_to_array(substring(b.Tags,2,length(b.Tags)-2), '><')))
+  )
+  ORDER BY AvgHotness DESC NULLS LAST
+  LIMIT 1
+) ts ON true
+ORDER BY h.HotnessScore DESC NULLS LAST
+LIMIT 100;

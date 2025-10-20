@@ -1,0 +1,233 @@
+-- {"query": "38099.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 2057} 
+with recent_users as (
+    select u.id as user_id, u.reputation, u.creationdate, u.location,
+           row_number() over (order by u.creationdate desc, u.id) as rn
+    from users u
+    where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+active_questions as (
+    select p.id as question_id,
+           p.creationdate,
+           p.score,
+           p.viewcount,
+           p.owneruserid,
+           coalesce(p.answercount, 0) as answercount,
+           string_to_array(substring(p.tags, 2, length(p.tags)-2), '><') as tag_arr
+    from posts p
+    where p.posttypeid = 1
+      and p.creationdate >= (select max(creationdate) - interval '730 days' from posts)
+),
+answers as (
+    select a.id as answer_id,
+           a.parentid as question_id,
+           a.owneruserid as answer_owner_id,
+           a.score as answer_score,
+           a.creationdate as answer_created
+    from posts a
+    where a.posttypeid = 2
+),
+comment_agg as (
+    select c.postid,
+           count(*) as comment_count,
+           sum(case when c.score > 0 then 1 else 0 end) as positive_comments,
+           max(c.creationdate) as last_comment_date
+    from comments c
+    group by c.postid
+),
+vote_agg as (
+    select v.postid,
+           sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+           sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+           sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+           sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+           count(*) as vote_events
+    from votes v
+    group by v.postid
+),
+dup_links as (
+    select pl.postid as dup_post_id,
+           pl.relatedpostid as original_post_id,
+           min(pl.creationdate) as first_dup_link_date,
+           count(*) as dup_link_events
+    from postlinks pl
+    where pl.linktypeid = 3
+    group by pl.postid, pl.relatedpostid
+),
+close_events as (
+    select ph.postid,
+           min(case when ph.posthistorytypeid = 10 then ph.creationdate end) as first_closed_at,
+           max(case when ph.posthistorytypeid = 11 then ph.creationdate end) as last_reopened_at,
+           count(*) filter (where ph.posthistorytypeid = 10) as close_count,
+           count(*) filter (where ph.posthistorytypeid = 11) as reopen_count,
+           count(*) filter (where ph.posthistorytypeid in (10,11)) as close_reopen_events
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11)
+    group by ph.postid
+),
+tag_stats as (
+    select t.tagname,
+           t.count as tag_total_count
+    from tags t
+),
+question_tag_expanded as (
+    select aq.question_id,
+           lower(trim(both from tag)) as tag
+    from active_questions aq
+    cross join lateral unnest(aq.tag_arr) as tag
+),
+question_quality as (
+    select aq.question_id,
+           aq.creationdate,
+           aq.score,
+           aq.viewcount,
+           aq.answercount,
+           qa.tag,
+           ts.tag_total_count,
+           coalesce(ca.comment_count, 0) as comment_count,
+           coalesce(ca.positive_comments, 0) as positive_comments,
+           coalesce(va.upvotes, 0) as upvotes,
+           coalesce(va.downvotes, 0) as downvotes,
+           coalesce(va.bounty_started, 0) as bounty_started,
+           coalesce(va.bounty_awarded, 0) as bounty_awarded,
+           coalesce(va.vote_events, 0) as vote_events,
+           coalesce(ce.close_count, 0) as close_count,
+           coalesce(ce.reopen_count, 0) as reopen_count,
+           ce.first_closed_at,
+           ce.last_reopened_at
+    from active_questions aq
+    left join comment_agg ca on ca.postid = aq.question_id
+    left join vote_agg va on va.postid = aq.question_id
+    left join close_events ce on ce.postid = aq.question_id
+    left join question_tag_expanded qa on qa.question_id = aq.question_id
+    left join tag_stats ts on ts.tagname = qa.tag
+),
+answerers as (
+    select a.question_id,
+           count(*) as answers_total,
+           max(a.answer_score) as best_answer_score,
+           avg(a.answer_score) as avg_answer_score,
+           max(a.answer_created) as last_answer_date,
+           count(distinct a.answer_owner_id) as distinct_answerers
+    from answers a
+    group by a.question_id
+),
+user_activity as (
+    select u.id as user_id,
+           u.reputation,
+           u.views,
+           u.upvotes,
+           u.downvotes,
+           extract(year from u.creationdate) as user_cohort_year
+    from users u
+),
+owner_enriched as (
+    select p.id as post_id,
+           p.owneruserid as owner_id,
+           ua.reputation as owner_reputation,
+           ua.upvotes as owner_upvotes,
+           ua.downvotes as owner_downvotes,
+           ua.user_cohort_year
+    from posts p
+    left join user_activity ua on ua.user_id = p.owneruserid
+    where p.posttypeid = 1
+),
+scored as (
+    select qq.question_id,
+           qq.tag,
+           qq.tag_total_count,
+           qq.creationdate,
+           qq.score,
+           qq.viewcount,
+           qq.answercount,
+           qq.comment_count,
+           qq.positive_comments,
+           qq.upvotes,
+           qq.downvotes,
+           qq.bounty_started,
+           qq.bounty_awarded,
+           qq.vote_events,
+           qq.close_count,
+           qq.reopen_count,
+           qq.first_closed_at,
+           qq.last_reopened_at,
+           oe.owner_reputation,
+           oe.owner_upvotes,
+           oe.owner_downvotes,
+           oe.user_cohort_year,
+           coalesce(an.answers_total, 0) as answers_total,
+           coalesce(an.best_answer_score, 0) as best_answer_score,
+           coalesce(an.avg_answer_score, 0) as avg_answer_score,
+           coalesce(an.last_answer_date, qq.creationdate) as last_answer_date,
+           coalesce(an.distinct_answerers, 0) as distinct_answerers,
+           (
+             coalesce(qq.score,0) * 3
+             + coalesce(qq.upvotes,0) * 2
+             - coalesce(qq.downvotes,0)
+             + least(coalesce(qq.viewcount,0) / 100, 200)
+             + coalesce(qq.positive_comments,0)
+             + coalesce(qq.bounty_awarded,0) / 100
+             + coalesce(an.best_answer_score,0) * 2
+             + coalesce(an.distinct_answerers,0)
+             - coalesce(qq.close_count,0) * 5
+           )::numeric as engagement_score
+    from question_quality qq
+    left join owner_enriched oe on oe.post_id = qq.question_id
+    left join answerers an on an.question_id = qq.question_id
+),
+ranked as (
+    select s.*,
+           row_number() over (partition by s.tag order by s.engagement_score desc, s.viewcount desc, s.question_id) as tag_rank,
+           row_number() over (order by s.engagement_score desc, s.viewcount desc, s.question_id) as global_rank,
+           ntile(20) over (order by s.engagement_score desc) as score_percentile
+    from scored s
+),
+dup_resolution as (
+    select d.dup_post_id as question_id,
+           min(d.first_dup_link_date) as first_dup_link_date,
+           count(*) as dup_events
+    from dup_links d
+    group by d.dup_post_id
+),
+final as (
+    select r.question_id,
+           r.tag,
+           r.tag_total_count,
+           r.creationdate,
+           r.score,
+           r.viewcount,
+           r.answercount,
+           r.comment_count,
+           r.positive_comments,
+           r.upvotes,
+           r.downvotes,
+           r.bounty_started,
+           r.bounty_awarded,
+           r.vote_events,
+           r.close_count,
+           r.reopen_count,
+           r.first_closed_at,
+           r.last_reopened_at,
+           r.owner_reputation,
+           r.owner_upvotes,
+           r.owner_downvotes,
+           r.user_cohort_year,
+           r.answers_total,
+           r.best_answer_score,
+           r.avg_answer_score,
+           r.last_answer_date,
+           r.distinct_answerers,
+           r.engagement_score,
+           r.tag_rank,
+           r.global_rank,
+           r.score_percentile,
+           coalesce(dr.first_dup_link_date, null) as first_dup_link_date,
+           coalesce(dr.dup_events, 0) as duplicate_link_events,
+           case when dr.dup_events > 0 or r.close_count > 0 then 1 else 0 end as potential_quality_issue
+    from ranked r
+    left join dup_resolution dr on dr.question_id = r.question_id
+)
+select *
+from final
+where global_rank <= 2000
+   or (tag_rank <= 5 and score_percentile <= 10)
+order by global_rank, tag, question_id;

@@ -1,0 +1,38 @@
+SELECT 
+    p.Id, 
+    p.Title, 
+    u.DisplayName, 
+    COUNT(v.Id) AS VoteCount, 
+    COUNT(c.Id) AS CommentCount, 
+    COUNT(ph.Id) AS HistoryCount, 
+    COUNT(DISTINCT t.TagName) AS TagCount
+FROM 
+    Posts p
+JOIN 
+    Users u ON p.OwnerUserId = u.Id
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    Comments c ON p.Id = c.PostId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    (
+      SELECT p2.Id AS PostId, tag AS TagName
+      FROM Posts p2,
+           UNNEST(string_to_array(SUBSTRING(p2.Tags FROM 2 FOR (LENGTH(p2.Tags)-2)), '><')) AS tag
+    ) t ON p.Id = t.PostId
+WHERE 
+    p.PostTypeId = 1 
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+GROUP BY 
+    p.Id, 
+    p.Title,
+    u.DisplayName
+HAVING 
+    COUNT(v.Id) > 10 
+    AND COUNT(c.Id) > 5
+ORDER BY 
+    VoteCount DESC, 
+    CommentCount DESC
+LIMIT 100;

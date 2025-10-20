@@ -1,0 +1,100 @@
+WITH monthly_user_activity AS (
+  SELECT 
+    u.Id AS user_id,
+    u.DisplayName,
+    u.Reputation,
+    DATE_TRUNC('month', u.CreationDate) AS creation_month,
+    DATE_TRUNC('month', ph.CreationDate) AS activity_month,
+    COUNT(DISTINCT ph.Id) AS total_edits,
+    COUNT(CASE WHEN pht.Id = 1 OR pht.Id = 4 THEN 1 END) AS title_changes,
+    COUNT(CASE WHEN pht.Id = 2 OR pht.Id = 5 THEN 1 END) AS body_changes,
+    COUNT(CASE WHEN pht.Id = 3 OR pht.Id = 6 THEN 1 END) AS tag_changes,
+    AVG(EXTRACT(EPOCH FROM (ph.CreationDate - p.CreationDate))) AS avg_time_to_first_edit
+  FROM Users u
+  INNER JOIN PostHistory ph ON ph.UserId = u.Id
+  INNER JOIN Posts p ON ph.PostId = p.Id
+  INNER JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+  WHERE u.Reputation > 100
+    AND u.CreationDate >= DATE '2010-01-01'
+    AND ph.CreationDate <= DATE '2024-10-01'
+    AND ph.PostHistoryTypeId IN (1,2,3,4,5,6)
+  GROUP BY u.Id, u.DisplayName, u.Reputation, DATE_TRUNC('month', u.CreationDate), DATE_TRUNC('month', ph.CreationDate)
+  HAVING COUNT(ph.Id) >= 3
+),
+top_badges_by_user AS (
+  SELECT 
+    b.UserId,
+    b.Name AS badge_name,
+    b.Class,
+    b.Date,
+    ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC, b.Class ASC) AS rn
+  FROM Badges b
+  INNER JOIN monthly_user_activity mua ON mua.user_id = b.UserId
+  WHERE b.Class IN (1, 2)
+),
+linked_posts_stats AS (
+  SELECT 
+    pl.PostId,
+    COUNT(DISTINCT pl.RelatedPostId) AS outbound_links,
+    COUNT(DISTINCT CASE WHEN lt.Id = 3 THEN pl.RelatedPostId END) AS duplicate_references,
+    AVG(p.Score) AS avg_related_score
+  FROM PostLinks pl
+  INNER JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  INNER JOIN Posts p ON pl.RelatedPostId = p.Id
+  WHERE pl.CreationDate >= DATE '2015-01-01'
+    AND p.PostTypeId = 1
+  GROUP BY pl.PostId
+  HAVING COUNT(DISTINCT pl.RelatedPostId) > 0
+),
+monthly_trends AS (
+  SELECT 
+    DATE_TRUNC('month', p.CreationDate) AS month,
+    p.PostTypeId,
+    AVG(p.Score) AS avg_score,
+    AVG(p.ViewCount) AS avg_views,
+    PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY p.Score) AS p90_score,
+    COUNT(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 END) * 100.0 / COUNT(*) AS close_rate_pct,
+    STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR LEAST(20, CHAR_LENGTH(p.Tags)-2)), ', ') AS top_tags_sample
+  FROM Posts p
+  WHERE p.PostTypeId IN (1, 2)
+    AND p.CreationDate >= DATE '2018-01-01'
+    AND (p.DeletionDate IS NULL OR p.DeletionDate = CAST(NULL AS timestamp))  -- Exclude deleted posts; safe check for dialects
+  GROUP BY DATE_TRUNC('month', p.CreationDate), p.PostTypeId
+)
+SELECT 
+  mua.activity_month,
+  mua.user_id,
+  mua.DisplayName,
+  mua.Reputation AS current_reputation,
+  mua.total_edits,
+  mua.title_changes,
+  mua.body_changes,
+  mua.tag_changes,
+  COALESCE(tbs.badge_name, 'No Recent Gold/Silver') AS latest_achievement,
+  COALESCE(tbs.Class, 3) AS badge_class,
+  lps.outbound_links,
+  lps.duplicate_references,
+  lps.avg_related_score,
+  mt.avg_score AS monthly_avg_question_score,
+  mt.avg_views AS monthly_avg_views,
+  mt.close_rate_pct,
+  (mua.total_edits * mua.Reputation / 10000.0) AS edit_reputation_index,
+  RANK() OVER (
+    PARTITION BY mua.activity_month 
+    ORDER BY mua.total_edits DESC, mua.Reputation DESC
+  ) AS monthly_edit_rank,
+  CASE 
+    WHEN COALESCE(lps.duplicate_references, 0) > 2 THEN 'High Duplicate Linker'
+    WHEN mua.body_changes > mua.title_changes * 2 THEN 'Content Focused Editor'
+    WHEN mua.tag_changes > 5 THEN 'Tag Specialist'
+    ELSE 'General Contributor'
+  END AS contributor_type
+FROM monthly_user_activity mua
+LEFT JOIN top_badges_by_user tbs ON mua.user_id = tbs.UserId AND tbs.rn = 1
+LEFT JOIN Posts post ON mua.user_id = post.OwnerUserId AND post.CreationDate >= mua.activity_month AND post.CreationDate < (mua.activity_month + INTERVAL '1 month')
+LEFT JOIN linked_posts_stats lps ON post.Id = lps.PostId
+INNER JOIN monthly_trends mt ON mt.month = mua.activity_month AND mt.PostTypeId = 1
+WHERE mua.activity_month >= DATE '2020-01-01'
+  AND mua.activity_month < DATE '2024-10-01' - INTERVAL '3 months'
+ORDER BY mua.activity_month DESC, monthly_edit_rank ASC
+LIMIT 1000;

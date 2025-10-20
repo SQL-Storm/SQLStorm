@@ -1,0 +1,121 @@
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersGiven,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId IN (2,5) THEN 1 ELSE 0 END), 0) AS TotalUpvotesAndFavorites,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id AND v.VoteTypeId IN (2,5)
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 1000
+      AND u.CreationDate < (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+    GROUP BY u.Id, u.DisplayName
+),
+TopTags AS (
+    SELECT
+        t.OwnerUserId AS UserId,
+        t.tag AS Tag,
+        COUNT(*) AS PostsPerTag
+    FROM (
+        SELECT
+            OwnerUserId,
+            regexp_split_to_table(substring(Tags FROM 2 FOR char_length(Tags)-2), '><') AS tag
+        FROM Posts
+        WHERE PostTypeId = 1 AND OwnerUserId IS NOT NULL
+    ) t
+    GROUP BY t.OwnerUserId, t.tag
+),
+RankedTags AS (
+    SELECT
+        UserId,
+        Tag,
+        PostsPerTag,
+        ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY PostsPerTag DESC) AS TagRank
+    FROM TopTags
+),
+FilteredTags AS (
+    SELECT UserId, Tag, PostsPerTag
+    FROM RankedTags
+    WHERE TagRank <= 3
+),
+UserPerformance AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        ua.CommentsMade,
+        ua.TotalUpvotesAndFavorites,
+        ua.LastPostDate,
+        ua.LastCommentDate,
+        ua.BadgeCount,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        STRING_AGG(ft.Tag || ' (' || ft.PostsPerTag || ')', ', ') AS TopTags
+    FROM UserActivity ua
+    LEFT JOIN FilteredTags ft ON ft.UserId = ua.UserId
+    GROUP BY 
+        ua.UserId,
+        ua.DisplayName,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        ua.CommentsMade,
+        ua.TotalUpvotesAndFavorites,
+        ua.LastPostDate,
+        ua.LastCommentDate,
+        ua.BadgeCount,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges
+),
+QuestionAnswerGap AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        AVG(EXTRACT(EPOCH FROM (a.CreationDate - p.CreationDate))/3600.0) AS AvgAnswerDelayHours,
+        COUNT(a.Id) AS AnswerCount
+    FROM Posts p
+    JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+)
+SELECT
+    up.UserId,
+    up.DisplayName,
+    up.QuestionsAsked,
+    up.AnswersGiven,
+    up.CommentsMade,
+    up.TotalUpvotesAndFavorites,
+    up.BadgeCount,
+    up.GoldBadges,
+    up.SilverBadges,
+    up.BronzeBadges,
+    up.TopTags,
+    qa.AvgAnswerDelayHours,
+    qa.AnswerCount,
+    CASE 
+        WHEN up.AnswersGiven = 0 THEN NULL
+        ELSE ROUND(CAST(up.QuestionsAsked AS numeric) / NULLIF(up.AnswersGiven,0), 2)
+    END AS QuestionToAnswerRatio,
+    CASE 
+        WHEN up.BadgeCount = 0 THEN 'New User'
+        WHEN up.GoldBadges > 0 THEN 'Veteran Gold'
+        WHEN up.SilverBadges > 5 THEN 'High Silver'
+        WHEN up.SilverBadges BETWEEN 1 AND 5 THEN 'Silver Member'
+        ELSE 'Bronze Member'
+    END AS UserStatus
+FROM UserPerformance up
+LEFT JOIN QuestionAnswerGap qa ON qa.UserId = up.UserId
+WHERE up.QuestionsAsked > 10
+ORDER BY up.TotalUpvotesAndFavorites DESC, up.BadgeCount DESC, qa.AvgAnswerDelayHours ASC
+LIMIT 100;

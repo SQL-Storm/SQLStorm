@@ -1,0 +1,128 @@
+-- {"query": "39042.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1972, "output_tokens": 1649} 
+
+WITH
+-- Top 10 most active tags by question count and their question IDs
+TagQuestions AS (
+    SELECT
+        t.TagName,
+        q.Id        AS QuestionId,
+        q.OwnerUserId,
+        q.CreationDate::date AS QuestionDate,
+        ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY q.CreationDate) AS QRank
+    FROM
+        Posts q
+        JOIN LATERAL (
+            SELECT unnest(string_to_array(substring(q.Tags,2,length(q.Tags)-2), '><')) AS TagName
+        ) t ON TRUE
+    WHERE
+        q.PostTypeId = 1
+),
+TopTags AS (
+    SELECT TagName
+    FROM TagQuestions
+    GROUP BY TagName
+    ORDER BY COUNT(*) DESC
+    LIMIT 10
+),
+-- Answers for those top-tagged questions with answer lag
+AnswerStats AS (
+    SELECT
+        tq.TagName,
+        a.Id               AS AnswerId,
+        a.OwnerUserId      AS Answerer,
+        a.CreationDate::date AS AnswerDate,
+        a.Score            AS AnswerScore,
+        a.ParentId         AS QuestionId,
+        (a.CreationDate - q.CreationDate) AS AnswerLag
+    FROM
+        TagQuestions tq
+        JOIN Posts q ON q.Id = tq.QuestionId
+        JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE
+        tq.TagName IN (SELECT TagName FROM TopTags)
+),
+-- User badge counts and reputations
+UserBadgeRep AS (
+    SELECT
+        u.Id               AS UserId,
+        u.Reputation,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM
+        Users u
+        LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY
+        u.Id, u.Reputation
+),
+-- Vote aggregates by post
+PostVotes AS (
+    SELECT
+        v.PostId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2)  AS UpVotes,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3)  AS DownVotes,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 5)  AS Favorites,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 8)  AS BountyStarts,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 9)  AS BountyCloses
+    FROM
+        Votes v
+    GROUP BY
+        v.PostId
+),
+-- Combine all stats and rank top answerers per tag by avg score and rep
+RankedAnswerers AS (
+    SELECT
+        a.TagName,
+        u.Reputation,
+        u.GoldBadges,
+        u.SilverBadges,
+        u.BronzeBadges,
+        COUNT(a.AnswerId)            AS AnswersCount,
+        AVG(a.AnswerScore)           AS AvgAnswerScore,
+        AVG(EXTRACT(EPOCH FROM a.AnswerLag)) AS AvgLagSeconds,
+        ROW_NUMBER() OVER (
+            PARTITION BY a.TagName
+            ORDER BY AVG(a.AnswerScore) DESC, MAX(u.Reputation) DESC
+        ) AS AnswererRank
+    FROM
+        AnswerStats a
+        JOIN UserBadgeRep u ON u.UserId = a.Answerer
+    GROUP BY
+        a.TagName, u.Reputation, u.GoldBadges, u.SilverBadges, u.BronzeBadges
+)
+SELECT
+    ra.TagName,
+    ra.AnswererRank,
+    ra.AnswersCount,
+    ROUND(ra.AvgAnswerScore, 2)     AS AvgAnswerScore,
+    TO_CHAR((ra.AvgLagSeconds/3600)::numeric, 'FM99990.00') || ' hrs' AS AvgAnswerLagHours,
+    ra.Reputation,
+    ra.GoldBadges,
+    ra.SilverBadges,
+    ra.BronzeBadges,
+    COALESCE(pv.UpVotes,0)          AS TotalUpVotesOnAnswers,
+    COALESCE(pv.DownVotes,0)        AS TotalDownVotesOnAnswers,
+    COALESCE(pv.Favorites,0)        AS TotalFavoritesOnAnswers,
+    COALESCE(pv.BountyStarts,0)     AS TotalBountiesStarted,
+    COALESCE(pv.BountyCloses,0)     AS TotalBountiesClosed
+FROM
+    RankedAnswerers ra
+    LEFT JOIN LATERAL (
+        SELECT
+            SUM(v2.UpVotes)   AS UpVotes,
+            SUM(v2.DownVotes) AS DownVotes,
+            SUM(v2.Favorites) AS Favorites,
+            SUM(v2.BountyStarts) AS BountyStarts,
+            SUM(v2.BountyCloses) AS BountyCloses
+        FROM
+            PostVotes v2
+            JOIN AnswerStats a2 ON a2.AnswerId = v2.PostId
+        WHERE
+            a2.TagName = ra.TagName
+            AND a2.OwnerUserId = ra.UserId
+    ) pv ON TRUE
+WHERE
+    ra.AnswererRank <= 5
+ORDER BY
+    ra.TagName,
+    ra.AnswererRank;

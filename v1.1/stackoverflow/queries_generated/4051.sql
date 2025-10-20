@@ -1,4 +1,4 @@
--- {"query": "4051.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1031} 
+-- {"query": "4051.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1031} 
 with RecursiveBadges as (
     select b.Id, b.UserId, b.Name, b.Date, b.Class, b.TagBased,
            row_number() over (partition by b.UserId order by b.Date) as rn

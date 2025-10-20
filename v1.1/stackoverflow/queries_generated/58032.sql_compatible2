@@ -1,0 +1,65 @@
+WITH HighRepUsers AS (
+    SELECT Id, DisplayName, Reputation
+    FROM Users
+    WHERE Reputation > 100000
+), UserPosts AS (
+    SELECT 
+        p.OwnerUserId, 
+        p.Id AS PostId, 
+        p.Title, 
+        p.Score, 
+        p.Tags,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS Upvotes
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.OwnerUserId IN (SELECT Id FROM HighRepUsers)
+), TagStats AS (
+    SELECT 
+        up.OwnerUserId,
+        TRIM(BOTH '"' FROM tag) AS TagName,
+        COUNT(*) AS TagUsage,
+        AVG(up.Score) OVER (PARTITION BY TRIM(BOTH '"' FROM tag)) AS AvgTagScore
+    FROM UserPosts up,
+    LATERAL (SELECT UNNEST(STRING_TO_ARRAY(REPLACE(up.Tags, '><', ','), ',')) AS tag) s
+    WHERE up.Tags IS NOT NULL
+), UserBadges AS (
+    SELECT 
+        UserId,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges
+    FROM Badges
+    WHERE UserId IN (SELECT Id FROM HighRepUsers)
+    GROUP BY UserId
+), TopTagsPerUser AS (
+    SELECT
+        ts.OwnerUserId,
+        STRING_AGG(ts.TagName, ', ' ORDER BY ts.TagUsage DESC) AS TagsOrdered,
+        ARRAY_AGG(ts.TagName ORDER BY ts.TagUsage DESC) AS TagsArray
+    FROM TagStats ts
+    GROUP BY ts.OwnerUserId
+)
+SELECT 
+    hru.DisplayName,
+    hru.Reputation,
+    COUNT(DISTINCT up.PostId) AS TotalQuestions,
+    SUM(up.CommentCount) AS TotalComments,
+    SUM(up.Upvotes) AS TotalUpvotes,
+    MAX(ub.GoldBadges) AS GoldBadges,
+    (CASE 
+        WHEN tt.TagsArray IS NOT NULL THEN
+            (SELECT STRING_AGG(tag, ', ') FROM UNNEST( (SELECT tt.TagsArray[1:5] ) ) AS tag)
+        ELSE NULL
+    END) AS TopTags,
+    AVG(up.Score) AS AvgPostScore,
+    MAX((SELECT SUM(v2.BountyAmount) FROM Votes v2 WHERE v2.VoteTypeId = 8 AND v2.UserId = hru.Id)) AS TotalBounty
+FROM HighRepUsers hru
+JOIN UserPosts up ON hru.Id = up.OwnerUserId
+LEFT JOIN UserBadges ub ON hru.Id = ub.UserId
+LEFT JOIN TopTagsPerUser tt ON hru.Id = tt.OwnerUserId
+GROUP BY hru.Id, hru.DisplayName, hru.Reputation, tt.TagsArray
+HAVING COUNT(DISTINCT up.PostId) > 50 AND SUM(up.Upvotes) > 1000
+ORDER BY 
+    hru.Reputation DESC, 
+    TotalQuestions DESC, 
+    TotalUpvotes DESC
+LIMIT 100;

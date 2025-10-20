@@ -1,0 +1,34 @@
+WITH ActiveUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation, u.Location,
+           COUNT(b.Id) AS BadgeCount,
+           RANK() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC) AS LocationRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId AND b.Date >= (CAST('2024-10-01' AS DATE) - INTERVAL '1' YEAR)
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location
+    HAVING COUNT(b.Id) > 5
+)
+SELECT au.DisplayName, au.Reputation, au.Location, au.Id,
+       COUNT(DISTINCT p.Id) AS QuestionCount,
+       COUNT(DISTINCT c.Id) AS CommentCount,
+       SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesGiven,
+       COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId = 10) AS ClosedPosts,
+       AVG(p.Score) AS AvgQuestionScore,
+       SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedAnswers,
+       -- aggregate tags: emulate STRING_AGG(DISTINCT ...) in standard SQL by using array aggregation where supported,
+       -- fallback to LISTAGG without DISTINCT if necessary
+       STRING_AGG(DISTINCT t.TagName, ', ' ORDER BY t.TagName) AS TopTags
+FROM ActiveUsers au
+LEFT JOIN Posts p ON au.Id = p.OwnerUserId
+     AND p.PostTypeId = 1
+     AND p.Score > 5
+     AND p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '1' YEAR)
+LEFT JOIN Comments c ON au.Id = c.UserId AND c.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '1' YEAR)
+LEFT JOIN Votes v ON au.Id = v.UserId AND v.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '1' YEAR)
+LEFT JOIN PostHistory ph ON au.Id = ph.UserId
+LEFT JOIN Posts pt ON ph.PostId = pt.Id AND pt.PostTypeId = 1
+LEFT JOIN Tags t ON pt.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+GROUP BY au.DisplayName, au.Reputation, au.Location, au.Id
+ORDER BY (COUNT(DISTINCT p.Id) + COUNT(DISTINCT c.Id) + SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)) DESC,
+         AVG(p.Score) DESC
+LIMIT 100;

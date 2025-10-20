@@ -1,0 +1,82 @@
+-- {"query": "236.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 14321} 
+WITH PostVotes AS (
+  SELECT PostId,
+         SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+         SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+  FROM Votes
+  GROUP BY PostId
+),
+UserEngagement AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    COALESCE(u.Location, '') AS Location,
+    u.Reputation,
+    u.CreationDate AS UserCreated,
+    COUNT(CASE WHEN p.Id IS NOT NULL AND p.CreationDate >= now() - INTERVAL '30 days' THEN 1 END) AS PostsLast30,
+    COALESCE(SUM(p.ViewCount), 0) AS TotalViews,
+    COALESCE(SUM(p.Score), 0) AS TotalScore,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS QuestionCount,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS AnswerCount,
+    COALESCE(SUM(pv.UpVotes), 0) AS UpVotesTotal,
+    COALESCE(SUM(pv.DownVotes), 0) AS DownVotesTotal
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN PostVotes pv ON pv.PostId = p.Id
+  GROUP BY u.Id, u.DisplayName, u.Location, u.Reputation, u.CreationDate
+),
+RankedBase AS (
+  SELECT
+     ue.UserId,
+     ue.DisplayName,
+     ue.Location,
+     ue.Reputation,
+     ue.UserCreated,
+     ue.PostsLast30,
+     ue.TotalViews,
+     ue.TotalScore,
+     ue.QuestionCount,
+     ue.AnswerCount,
+     ue.UpVotesTotal,
+     ue.DownVotesTotal,
+     (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ue.UserId) AS BadgeCount,
+     (SELECT MAX(CreationDate) FROM Comments c WHERE c.UserId = ue.UserId) AS LastCommentDate,
+     (SELECT p.Title FROM Posts p WHERE p.OwnerUserId = ue.UserId ORDER BY p.CreationDate DESC LIMIT 1) AS LastPostTitle,
+     (SELECT STRING_AGG(DISTINCT t.TagName, ',') FROM Posts p2
+        JOIN LATERAL unnest(string_to_array(substr(p2.Tags, 2, length(p2.Tags)-2), '><')) AS t(TagName)
+        WHERE p2.OwnerUserId = ue.UserId
+     ) AS TopTagsCombined
+  FROM UserEngagement ue
+),
+SetA AS (
+  SELECT * FROM RankedBase WHERE Reputation > 1000
+),
+SetB AS (
+  SELECT * FROM RankedBase WHERE Reputation BETWEEN 100 AND 1000
+)
+SELECT
+  s.UserId,
+  s.DisplayName,
+  s.Location,
+  s.Reputation,
+  s.UserCreated,
+  s.PostsLast30,
+  s.TotalViews,
+  s.TotalScore,
+  s.QuestionCount,
+  s.AnswerCount,
+  s.UpVotesTotal,
+  s.DownVotesTotal,
+  s.BadgeCount,
+  s.LastCommentDate,
+  s.LastPostTitle,
+  s.TopTagsCombined,
+  ROW_NUMBER() OVER (ORDER BY (s.UpVotesTotal - s.DownVotesTotal) DESC, s.Reputation DESC) AS Rank,
+  ((s.UpVotesTotal * 2) - s.DownVotesTotal) + (s.PostsLast30 * 5) + CASE WHEN s.TotalViews > 1000 THEN 10 ELSE 0 END AS EngagementScore
+FROM (
+  SELECT * FROM SetA
+  UNION ALL
+  SELECT * FROM SetB
+) AS s
+ORDER BY Rank
+LIMIT 200;

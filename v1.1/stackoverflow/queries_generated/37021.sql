@@ -1,0 +1,187 @@
+-- {"query": "37021.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 1910} 
+WITH
+-- identify active question threads with answers in last year
+RecentAnswers AS (
+  SELECT a.Id AS AnswerId, a.ParentId AS QuestionId, a.OwnerUserId AS AnswererId, a.CreationDate AS AnswerDate, a.Score AS AnswerScore
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+    AND a.CreationDate >= NOW() - INTERVAL '1 year'
+),
+-- aggregate per question: counts, top answer, last activity
+QuestionAgg AS (
+  SELECT q.Id AS QuestionId,
+         q.OwnerUserId AS AskerId,
+         q.CreationDate AS QuestionCreated,
+         q.Score AS QuestionScore,
+         COALESCE(q.ViewCount,0) AS Views,
+         COUNT(r.AnswerId) FILTER (WHERE r.AnswerId IS NOT NULL) AS RecentAnswerCount,
+         MAX(r.AnswerDate) AS MostRecentAnswerDate,
+         MAX(r.AnswerScore) AS MaxRecentAnswerScore,
+         -- top recent answer id by score then date
+         (SELECT ra.AnswerId
+          FROM RecentAnswers ra
+          WHERE ra.ParentId = q.Id
+          ORDER BY ra.AnswerScore DESC NULLS LAST, ra.AnswerDate DESC NULLS LAST
+          LIMIT 1) AS TopRecentAnswerId
+  FROM Posts q
+  LEFT JOIN RecentAnswers r ON r.QuestionId = q.Id
+  WHERE q.PostTypeId = 1
+    AND q.CreationDate >= NOW() - INTERVAL '5 years'
+  GROUP BY q.Id, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount
+),
+-- tag explode: split Tags string like '<tag1><tag2>' into rows
+QuestionTags AS (
+  SELECT qa.QuestionId,
+         lower(trim(both ' ' FROM unnest(string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><')))) AS Tag
+  FROM QuestionAgg qa
+  JOIN Posts p ON p.Id = qa.QuestionId
+  WHERE p.Tags IS NOT NULL AND p.Tags <> ''
+),
+-- compute tag-level popularity and recency signals
+TagStats AS (
+  SELECT qt.Tag,
+         COUNT(*) AS QuestionCount,
+         AVG(q.Views) AS AvgViews,
+         SUM(CASE WHEN qa.MostRecentAnswerDate >= NOW() - INTERVAL '30 days' THEN 1 ELSE 0 END) AS HotRecentAnswers,
+         MAX(qa.MostRecentAnswerDate) AS LastAnswerAt
+  FROM QuestionTags qt
+  JOIN QuestionAgg qa ON qa.QuestionId = qt.QuestionId
+  JOIN Posts q ON q.Id = qa.QuestionId
+  GROUP BY qt.Tag
+),
+-- user answer performance: answers in last year, accept rate, avg score
+UserAnswerStats AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName,
+         COUNT(a.Id) FILTER (WHERE a.CreationDate >= NOW() - INTERVAL '1 year') AS AnswersLastYear,
+         COUNT(a.Id) AS TotalAnswers,
+         AVG(a.Score) AS AvgAnswerScore,
+         SUM(CASE WHEN p.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END) AS AcceptedCount
+  FROM Users u
+  LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+  LEFT JOIN Posts p ON p.Id = a.ParentId AND p.PostTypeId = 1
+  GROUP BY u.Id, u.DisplayName
+),
+-- compute co-occurring tag pairs per question (ordered canonical pair)
+TagPairs AS (
+  SELECT t1.QuestionId,
+         CASE WHEN t1.Tag < t2.Tag THEN t1.Tag ELSE t2.Tag END AS TagA,
+         CASE WHEN t1.Tag < t2.Tag THEN t2.Tag ELSE t1.Tag END AS TagB
+  FROM QuestionTags t1
+  JOIN QuestionTags t2 ON t1.QuestionId = t2.QuestionId AND t1.Tag < t2.Tag
+),
+PairStats AS (
+  SELECT TagA, TagB, COUNT(*) AS CooccurrenceCount
+  FROM TagPairs
+  GROUP BY TagA, TagB
+  HAVING COUNT(*) >= 5
+),
+-- recent activity per question including comment and edits
+QuestionActivity AS (
+  SELECT q.Id AS QuestionId,
+         q.Title,
+         q.CreationDate,
+         q.LastActivityDate,
+         q.CommentCount,
+         q.AnswerCount,
+         q.FavoriteCount,
+         q.ClosedDate,
+         COALESCE(ph.Edits,0) AS EditCount,
+         COALESCE(cm.CommentsLast30,0) AS CommentsLast30
+  FROM Posts q
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) FILTER (WHERE PostHistoryTypeId IN (4,5,6,7,8,9,24)) AS Edits
+    FROM PostHistory
+    WHERE CreationDate >= NOW() - INTERVAL '2 years'
+    GROUP BY PostId
+  ) ph ON ph.PostId = q.Id
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) FILTER (WHERE CreationDate >= NOW() - INTERVAL '30 days') AS CommentsLast30
+    FROM Comments
+    GROUP BY PostId
+  ) cm ON cm.PostId = q.Id
+  WHERE q.PostTypeId = 1
+),
+-- combine everything to produce benchmark query: pick top candidate questions per tag cluster
+Candidates AS (
+  SELECT qa.QuestionId,
+         qa.AskerId,
+         qa.QuestionCreated,
+         qa.QuestionScore,
+         qa.Views,
+         qa.RecentAnswerCount,
+         qa.MostRecentAnswerDate,
+         qa.MaxRecentAnswerScore,
+         qt.Tag,
+         ts.QuestionCount AS TagPopularity,
+         ts.HotRecentAnswers,
+         pa.CooccurrenceCount,
+         qact.EditCount,
+         qact.CommentsLast30,
+         uas.UserId AS TopAnswererId,
+         uas.DisplayName AS TopAnswererName,
+         uas.AnswersLastYear,
+         uas.AvgAnswerScore,
+         uas.AcceptedCount,
+         qa.TopRecentAnswerId
+  FROM QuestionAgg qa
+  JOIN QuestionTags qt ON qt.QuestionId = qa.QuestionId
+  LEFT JOIN TagStats ts ON ts.Tag = qt.Tag
+  LEFT JOIN PairStats pa ON pa.TagA = qt.Tag OR pa.TagB = qt.Tag
+  LEFT JOIN QuestionActivity qact ON qact.QuestionId = qa.QuestionId
+  LEFT JOIN LATERAL (
+    SELECT a.OwnerUserId AS UserId
+    FROM Posts a
+    WHERE a.ParentId = qa.QuestionId AND a.PostTypeId = 2
+    ORDER BY a.Score DESC NULLS LAST, a.CreationDate DESC
+    LIMIT 1
+  ) topa ON TRUE
+  LEFT JOIN UserAnswerStats uas ON uas.UserId = topa.UserId
+),
+-- score and rank candidates
+Scored AS (
+  SELECT c.*,
+         -- composite score: recency, view, answers, tag popularity, activity, top answerer quality
+         ((COALESCE(EXTRACT(EPOCH FROM (NOW() - c.QuestionCreated)),0) / 86400) * -0.01) -- penalize older questions
+         + (COALESCE(c.Views,0) ^ 0.35) * 0.002
+         + (COALESCE(c.RecentAnswerCount,0) * 0.8)
+         + (COALESCE(c.MaxRecentAnswerScore,0) * 0.6)
+         + (COALESCE(c.TagPopularity,1) * 0.03)
+         + (COALESCE(c.HotRecentAnswers,0) * 0.5)
+         + (COALESCE(c.EditCount,0) * 0.4)
+         + (COALESCE(c.CommentsLast30,0) * 0.25)
+         + (COALESCE(c.AvgAnswerScore,0) * 0.3)
+         + (CASE WHEN c.AcceptedCount > 0 THEN 0.7 ELSE 0 END) AS CompositeScore
+  FROM Candidates c
+),
+Ranked AS (
+  SELECT s.*,
+         ROW_NUMBER() OVER (PARTITION BY s.Tag ORDER BY s.CompositeScore DESC NULLS LAST) AS RankInTag,
+         RANK() OVER (ORDER BY s.CompositeScore DESC NULLS LAST) AS GlobalRank
+  FROM Scored s
+)
+SELECT
+  r.GlobalRank,
+  r.RankInTag,
+  r.QuestionId,
+  r.Tag,
+  r.Title := (SELECT Title FROM Posts p WHERE p.Id = r.QuestionId),
+  r.QuestionCreated,
+  r.Views,
+  r.RecentAnswerCount,
+  r.MostRecentAnswerDate,
+  r.CompositeScore,
+  r.TopRecentAnswerId,
+  r.TopAnswererId,
+  r.TopAnswererName,
+  r.AnswersLastYear,
+  r.AvgAnswerScore,
+  r.AcceptedCount,
+  r.TagPopularity,
+  r.CooccurrenceCount,
+  r.EditCount,
+  r.CommentsLast30
+FROM Ranked r
+WHERE r.RankInTag <= 3
+ORDER BY r.CompositeScore DESC NULLS LAST
+LIMIT 200;

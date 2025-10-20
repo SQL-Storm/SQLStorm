@@ -1,0 +1,105 @@
+WITH q AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        p.Tags,
+        p.Title,
+        p.ViewCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.AcceptedAnswerId
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '90 days'
+),
+tags_exploded AS (
+    -- Anchor
+    SELECT
+        q.PostId,
+        q.OwnerUserId,
+        q.Score,
+        q.CreationDate,
+        q.Title,
+        q.ViewCount,
+        q.CommentCount,
+        q.FavoriteCount,
+        q.AcceptedAnswerId,
+        CASE
+            WHEN POSITION(',' IN q.Tags) = 0 THEN TRIM(q.Tags)
+            ELSE TRIM(SUBSTR(q.Tags, 1, POSITION(',' IN q.Tags) - 1))
+        END AS TagName,
+        CASE
+            WHEN POSITION(',' IN q.Tags) = 0 THEN 0
+            ELSE POSITION(',' IN q.Tags)
+        END AS pos,
+        q.Tags AS full_tags
+    FROM q
+    UNION ALL
+    -- Recursive step
+    SELECT
+        e.PostId,
+        e.OwnerUserId,
+        e.Score,
+        e.CreationDate,
+        e.Title,
+        e.ViewCount,
+        e.CommentCount,
+        e.FavoriteCount,
+        e.AcceptedAnswerId,
+        CASE
+            WHEN next_comma = 0 THEN TRIM(SUBSTR(e.full_tags, e.pos + 1))
+            ELSE TRIM(SUBSTR(e.full_tags, e.pos + 1, next_comma - e.pos - 1))
+        END AS TagName,
+        CASE
+            WHEN next_comma = 0 THEN 0
+            ELSE next_comma
+        END AS pos,
+        e.full_tags
+    FROM (
+        SELECT
+            e.*,
+            CASE
+                WHEN e.pos = 0 THEN 0
+                ELSE
+                    CASE
+                        WHEN POSITION(',' IN SUBSTR(e.full_tags, e.pos + 1)) = 0 THEN 0
+                        ELSE e.pos + POSITION(',' IN SUBSTR(e.full_tags, e.pos + 1))
+                    END
+            END AS next_comma
+        FROM tags_exploded e
+        WHERE e.pos <> 0
+    ) sub
+),
+vote_stats AS (
+    SELECT
+        pv.PostId,
+        COUNT(CASE WHEN vt.Name = 'UpMod' THEN 1 END)   AS UpVotes,
+        COUNT(CASE WHEN vt.Name = 'DownMod' THEN 1 END) AS DownVotes,
+        COALESCE(vb.TotalBounty, 0)                     AS TotalBounty
+    FROM Votes pv
+    JOIN VoteTypes vt ON vt.Id = pv.VoteTypeId
+    LEFT JOIN (
+        SELECT vb.PostId, SUM(vb.BountyAmount) AS TotalBounty
+        FROM Votes vb
+        WHERE vb.VoteTypeId IN (8,9)
+        GROUP BY vb.PostId
+    ) vb ON vb.PostId = pv.PostId
+    GROUP BY pv.PostId, vb.TotalBounty
+)
+SELECT
+    te.TagName,
+    COUNT(DISTINCT te.PostId)                     AS QuestionCount,
+    AVG(te.Score)                                 AS AvgScore,
+    MAX(te.ViewCount)                             AS MaxViews,
+    SUM(te.CommentCount)                          AS TotalComments,
+    SUM(te.FavoriteCount)                         AS TotalFavorites,
+    SUM(COALESCE(v.UpVotes, 0))                    AS TotalUpVotes,
+    SUM(COALESCE(v.DownVotes, 0))                  AS TotalDownVotes,
+    SUM(COALESCE(v.TotalBounty, 0))                AS TotalBounty
+FROM tags_exploded te
+LEFT JOIN vote_stats v ON v.PostId = te.PostId
+GROUP BY te.TagName
+ORDER BY QuestionCount DESC, TotalUpVotes DESC
+LIMIT 20;

@@ -1,0 +1,34 @@
+-- {"query": "41091.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "nova-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2057, "output_tokens": 357} 
+SELECT 
+    U.DisplayName AS UserName,
+    P.Title AS PostTitle,
+    PT.Name AS PostTypeName,
+    COUNT(V.Id) AS TotalVotes,
+    AVG(V.CreationDate - P.CreationDate) AS AvgVoteTime,
+    SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    MAX(P.CreationDate) AS LatestPostDate,
+    MAX(P.LastEditDate) AS LatestEditDate,
+    COUNT(DISTINCT C.Id) AS TotalComments,
+    AVG(P.Score) AS AvgScore,
+    SUM(P.ViewCount) AS TotalViews,
+    SUM(P.FavoriteCount) AS TotalFavorites,
+    SUM(P.AnswerCount) AS TotalAnswers
+FROM 
+    Users U
+JOIN 
+    Posts P ON U.Id = P.OwnerUserId
+JOIN 
+    PostTypes PT ON P.PostTypeId = PT.Id
+JOIN 
+    Votes V ON P.Id = V.PostId
+LEFT JOIN 
+    Comments C ON P.Id = C.PostId
+WHERE 
+    P.CreationDate >= DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp))
+GROUP BY 
+    U.DisplayName, P.Title, PT.Name
+HAVING 
+    SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) > 10
+ORDER BY 
+    TotalVotes DESC, TotalViews DESC, TotalAnswers DESC, TotalFavorites DESC;

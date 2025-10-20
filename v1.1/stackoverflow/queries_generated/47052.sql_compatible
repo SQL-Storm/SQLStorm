@@ -1,0 +1,177 @@
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        CAST(t.TagName AS VARCHAR(1000)) AS tag_path,
+        1 AS depth
+    FROM Tags t
+    WHERE t.Count > 10000
+    
+    UNION ALL
+    
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        CAST(th.tag_path || ' -> ' || t2.TagName AS VARCHAR(1000)) AS tag_path,
+        th.depth + 1 AS depth
+    FROM tag_hierarchy th
+    JOIN Posts p1 ON p1.Tags LIKE '%' || '<' || th.TagName || '>' || '%'
+    JOIN Posts p2 ON p2.Id = p1.Id AND p2.Tags != p1.Tags
+    JOIN Tags t2 ON p2.Tags LIKE '%' || '<' || t2.TagName || '>' || '%'
+    WHERE th.depth < 3
+        AND t2.Count > 5000
+        AND t2.Id != th.Id
+),
+expert_users AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT b.Name) AS unique_badges,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS gold_badges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS silver_badges,
+        SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS tag_badges,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS reputation_rank,
+        DENSE_RANK() OVER (ORDER BY COUNT(CASE WHEN b.Class = 1 THEN 1 END) DESC) AS gold_badge_rank
+    FROM Users u
+    JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 50000
+        AND u.LastAccessDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180 days')
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT b.Name) > 20
+),
+post_analytics AS (
+    SELECT 
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.Tags,
+        COALESCE(p.ViewCount, 0) / GREATEST(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - p.CreationDate)) / 86400, 1) AS views_per_day,
+        COALESCE(p.Score, 0) / GREATEST(COALESCE(p.ViewCount, 1), 1) AS score_per_view,
+        COUNT(DISTINCT c.UserId) AS unique_commenters,
+        AVG(c.Score) AS avg_comment_score,
+        MAX(c.Score) AS max_comment_score,
+        COUNT(DISTINCT ph.UserId) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) AS unique_editors,
+        COUNT(ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) AS edit_count,
+        MIN(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 2) AS first_body_date,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) AS last_edit_date,
+        COUNT(DISTINCT v.UserId) FILTER (WHERE v.VoteTypeId = 2) AS unique_upvoters,
+        COUNT(DISTINCT v.UserId) FILTER (WHERE v.VoteTypeId = 3) AS unique_downvoters,
+        SUM(v.BountyAmount) FILTER (WHERE v.VoteTypeId = 8) AS total_bounty_offered,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY (c.CreationDate - p.CreationDate)) AS median_comment_response_time,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS user_post_rank,
+        LEAD(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS next_post_date,
+        LAG(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS prev_post_date
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId IN (1, 2)
+        AND p.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days')
+        AND p.Score > 0
+    GROUP BY p.Id, p.OwnerUserId, p.PostTypeId, p.Score, p.ViewCount, p.AnswerCount, p.FavoriteCount, p.CreationDate, p.Tags
+),
+linked_post_network AS (
+    SELECT 
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.OwnerUserId AS post_owner,
+        p2.OwnerUserId AS related_owner,
+        p1.Score AS post_score,
+        p2.Score AS related_score,
+        pl.LinkTypeId,
+        lt.Name AS link_type_name,
+        p1.Tags AS post_tags,
+        p2.Tags AS related_tags,
+        CASE 
+            WHEN p1.OwnerUserId = p2.OwnerUserId THEN 'self-link'
+            WHEN EXISTS (
+                SELECT 1 FROM Badges b1 
+                JOIN Badges b2 ON b1.Name = b2.Name AND b1.TagBased = 1
+                WHERE b1.UserId = p1.OwnerUserId AND b2.UserId = p2.OwnerUserId
+            ) THEN 'shared-expertise'
+            ELSE 'cross-domain'
+        END AS link_relationship,
+        COUNT(*) OVER (PARTITION BY pl.PostId) AS outgoing_links,
+        COUNT(*) OVER (PARTITION BY pl.RelatedPostId) AS incoming_links
+    FROM PostLinks pl
+    JOIN Posts p1 ON pl.PostId = p1.Id
+    JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    WHERE p1.Score > 10 OR p2.Score > 10
+)
+SELECT 
+    eu.DisplayName AS expert_name,
+    eu.Reputation AS expert_reputation,
+    eu.gold_badges,
+    eu.reputation_rank,
+    pa.Id AS post_id,
+    pt.Name AS post_type,
+    pa.Score AS post_score,
+    pa.ViewCount AS post_views,
+    pa.views_per_day,
+    pa.score_per_view,
+    pa.unique_commenters,
+    pa.avg_comment_score,
+    pa.unique_editors,
+    pa.edit_count,
+    pa.unique_upvoters,
+    pa.unique_downvoters,
+    pa.total_bounty_offered,
+    EXTRACT(EPOCH FROM (pa.last_edit_date - pa.first_body_date)) / 3600 AS hours_to_first_edit,
+    EXTRACT(EPOCH FROM (pa.next_post_date - pa.CreationDate)) / 86400 AS days_to_next_post,
+    pa.user_post_rank,
+    lpn.outgoing_links,
+    lpn.incoming_links,
+    lpn.link_relationship,
+    COUNT(DISTINCT th.TagName) AS related_tag_count,
+    STRING_AGG(DISTINCT th.TagName, ', ' ORDER BY th.TagName) FILTER (WHERE th.depth = 1) AS primary_tags,
+    STRING_AGG(DISTINCT th.tag_path, ' | ' ORDER BY th.tag_path) FILTER (WHERE th.depth > 1) AS tag_paths,
+    AVG(pa2.Score) FILTER (WHERE pa2.PostTypeId = 2) AS avg_answer_score_by_user,
+    STDDEV(pa2.Score) FILTER (WHERE pa2.PostTypeId = 1) AS stddev_question_score_by_user,
+    COUNT(DISTINCT pa2.Id) FILTER (WHERE pa2.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days')) AS recent_posts_count,
+    CASE 
+        WHEN pa.AnswerCount > 10 AND pa.Score > 50 THEN 'hot-question'
+        WHEN pa.unique_editors > 5 THEN 'collaborative'
+        WHEN pa.total_bounty_offered > 0 THEN 'bounty-driven'
+        WHEN pa.views_per_day > 100 THEN 'viral'
+        WHEN pa.score_per_view > 0.1 THEN 'high-quality'
+        ELSE 'standard'
+    END AS post_category,
+    PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY c2.Score) AS comment_score_75th_percentile,
+    BOOL_OR(ph2.PostHistoryTypeId = 10) AS was_ever_closed,
+    BOOL_OR(ph2.PostHistoryTypeId = 11) AS was_ever_reopened,
+    MAX(CASE WHEN v2.VoteTypeId = 8 THEN v2.BountyAmount END) AS max_bounty_amount
+FROM expert_users eu
+JOIN post_analytics pa ON eu.UserId = pa.OwnerUserId
+JOIN PostTypes pt ON pa.PostTypeId = pt.Id
+LEFT JOIN linked_post_network lpn ON pa.Id = lpn.PostId
+LEFT JOIN tag_hierarchy th ON pa.Tags LIKE '%' || '<' || th.TagName || '>' || '%'
+LEFT JOIN post_analytics pa2 ON eu.UserId = pa2.OwnerUserId
+LEFT JOIN Comments c2 ON pa.Id = c2.PostId
+LEFT JOIN PostHistory ph2 ON pa.Id = ph2.PostId
+LEFT JOIN Votes v2 ON pa.Id = v2.PostId
+WHERE pa.Score > 25
+    AND pa.ViewCount > 1000
+    AND (pa.unique_commenters > 3 OR pa.unique_editors > 1)
+GROUP BY 
+    eu.DisplayName, eu.Reputation, eu.gold_badges, eu.reputation_rank,
+    pa.Id, pt.Name, pa.Score, pa.ViewCount, pa.views_per_day, pa.score_per_view,
+    pa.unique_commenters, pa.avg_comment_score, pa.unique_editors, pa.edit_count,
+    pa.unique_upvoters, pa.unique_downvoters, pa.total_bounty_offered,
+    pa.last_edit_date, pa.first_body_date, pa.next_post_date, pa.CreationDate,
+    pa.user_post_rank, lpn.outgoing_links, lpn.incoming_links, lpn.link_relationship,
+    pa.AnswerCount, pa.PostTypeId
+HAVING COUNT(DISTINCT th.TagName) > 0
+ORDER BY 
+    eu.reputation_rank,
+    pa.Score DESC,
+    pa.views_per_day DESC
+LIMIT 500;

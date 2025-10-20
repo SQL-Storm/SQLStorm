@@ -1,4 +1,4 @@
--- {"query": "19046.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3952} 
+-- {"query": "19046.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3952} 
 WITH UserInfluence AS (
     -- CTE 1: Calculates an influence score for users based on reputation, vote ratio, and badge count.
     -- Includes aggregate user statistics and conditional sums for badge classes.

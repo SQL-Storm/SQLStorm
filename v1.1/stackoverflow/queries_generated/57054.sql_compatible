@@ -1,0 +1,185 @@
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        COALESCE(p.Title, '') AS Title,
+        COALESCE(p.Tags, '') AS Tags,
+        COALESCE(p.Body, '') AS Body,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS Rank
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId IN (1, 2)
+),
+TopPosts AS (
+    SELECT
+        PostId,
+        PostTypeId,
+        CreationDate,
+        Score,
+        ViewCount,
+        OwnerUserId,
+        AnswerCount,
+        CommentCount,
+        FavoriteCount,
+        Title,
+        Tags,
+        Body
+    FROM
+        RankedPosts
+    WHERE
+        Rank <= 5
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.DisplayName,
+        u.LastAccessDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COALESCE(p.PostId, 0) AS LastPostId,
+        COALESCE(p.CreationDate, u.CreationDate) AS LastPostDate,
+        COALESCE(v.PostId, 0) AS LastVotePostId,
+        COALESCE(v.CreationDate, u.CreationDate) AS LastVoteDate
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    WHERE
+        u.Reputation > 1000
+),
+ActiveTags AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        t.Count,
+        COALESCE(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.LastActivityDate)), 0) AS DaysSinceLastActivity,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId
+    FROM
+        Tags t
+    JOIN
+        Posts p ON t.TagName = ANY(STRING_TO_ARRAY(p.Tags, '><'))
+    WHERE
+        p.PostTypeId = 1
+),
+HighActivityUsers AS (
+    SELECT
+        u.UserId,
+        COUNT(p.Id) AS PostCount,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(v.Id) AS VoteCount
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    GROUP BY
+        u.UserId
+    HAVING
+        COUNT(p.Id) > 10 OR COUNT(c.Id) > 50 OR COUNT(v.Id) > 100
+),
+View_Uses AS (
+    SELECT
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY u.AccountId) AS ROW1,
+        ROW_NUMBER() OVER (PARTITION BY u.AccountId ORDER BY Abd.userId) AS ROW2,
+        U.Id,
+        DisplayName,
+        Reputation,
+        location,
+        (SELECT COUNT(*) FROM Votes WHERE votes.userID = u.id) AS VoteCount,
+        (SELECT COUNT(*) FROM Posts WHERE Posts.OwnerUserId = u.id) AS NumberOfPosts,
+        Views,
+        UpVotes AS Upvotes,
+        DownVotes AS Downvotes,
+        (SELECT ARRAY_AGG(Abd.Name) FROM Badges Abd WHERE Abd.UserId = U.Id AND Abd.tagbased) AS BadgeNames,
+        (CASE WHEN (SELECT ARRAY_AGG(urel.class) FROM Badges urel WHERE u.id = urel.userid AND urel.class != 3) IS DISTINCT FROM (SELECT ARRAY_AGG(b.class) FROM Badges b WHERE b.UserId = U.Id) THEN 1 ELSE 0 END) AS BronzeBadgesComplete
+    FROM Users U
+    WHERE Reputation >= 50
+      AND Reputation < 1000
+      AND U.id IN (SELECT UserId FROM Badges GROUP BY UserId HAVING COUNT(*) > 20)
+    ORDER BY Reputation DESC
+),
+AnswersWithComments AS (
+    SELECT
+        P1.Id AS PostId,
+        CT.Text AS Comment,
+        CT.UserId,
+        P1.CommentCount,
+        U1.DisplayName,
+        P1.OwnerUserId,
+        P1.CreationDate
+    FROM
+        Posts p1
+        JOIN Comments ct ON ct.PostId = p1.Id
+        JOIN Users U1 ON u1.id = p1.OwnerUserId
+    WHERE
+        p1.PostTypeId = 2
+        AND p1.AnswerCount > 0
+        AND p1.CommentCount > 0
+        AND p1.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 month'
+    ORDER BY p1.CommentCount DESC, p1.OwnerUserId DESC
+)
+SELECT
+    u.*,
+    COALESCE(ao.PostId, 0) AS TopAnswer,
+    numeric_stats.UpvotedAnswersComp,
+    numeric_stats.AnsweredQuestionsComp,
+    COALESCE(Philip.TopAnswerBody, '') AS TopAnswerBody
+FROM View_Uses u
+JOIN LATERAL (
+    SELECT
+        awc.UserId AS UserId,
+        awc.PostId,
+        COUNT(awc.Comment) AS CommentsToAnswers
+    FROM AnswersWithComments awc
+    WHERE awc.UserId = u.id
+    GROUP BY awc.UserId, awc.PostId
+    ORDER BY CommentsToAnswers DESC
+    LIMIT 5
+) ao ON u.id = ao.userid
+JOIN LATERAL (
+    SELECT
+        ao2.Id AS username,
+        COUNT(DISTINCT vt2_gets.id) AS AnsweredQuestionsComp,
+        COUNT(DISTINCT CASE WHEN vp.Id IS NOT NULL THEN
+            CASE WHEN vp_inner.UserId = ao2.Id THEN 1 ELSE 0 END
+            ELSE 1 END) AS UpvotedAnswersComp
+    FROM Users ao2
+    LEFT JOIN Posts vt2_gets ON vt2_gets.OwnerUserId = ao2.Id AND vt2_gets.PostTypeId = 2 AND vt2_gets.Id IS NOT NULL
+    LEFT JOIN Votes vp ON vp.PostId = ao2.Id -- keep for compatibility; will usually be NULL
+    LEFT JOIN Votes vp_inner ON vp_inner.UserId = ao2.Id
+    WHERE ao2.Id = u.Id
+    GROUP BY ao2.Id
+) numeric_stats ON numeric_stats.username = u.id
+JOIN LATERAL (
+    SELECT
+        p.PostId,
+        p.Body AS TopAnswerBody,
+        p.OwnerUserId
+    FROM Posts p
+    JOIN Users us ON us.id = p.OwnerUserId
+    WHERE p.PostTypeId = 2
+      AND us.id = ao.userid
+    ORDER BY us.UpVotes DESC
+    LIMIT 1
+) Philip ON U.id = ao.UserId;

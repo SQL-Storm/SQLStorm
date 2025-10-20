@@ -1,0 +1,60 @@
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id, 
+        u.DisplayName, 
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        AVG(p.Score) OVER (PARTITION BY u.Id) AS AvgPostScore,
+        RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS PostRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1, 2)
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId IN (2, 3, 8)
+    LEFT JOIN Badges b ON u.Id = b.UserId AND b.Class = 1
+    WHERE 
+        u.Reputation > 1000 
+        AND (p.CreationDate BETWEEN DATE '2020-01-01' AND DATE '2023-12-31' OR p.Id IS NULL)
+        AND (p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId IN (1, 2)) OR p.Id IS NULL)
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TagAnalysis AS (
+    SELECT 
+        Id AS PostId,
+        CASE WHEN Tags IS NULL THEN 0 ELSE COALESCE(cardinality(string_to_array(substring(Tags FROM 2 FOR (char_length(Tags)-2)), '><')), 0) END AS TagCount,
+        SUM(AnswerCount) OVER (PARTITION BY OwnerUserId) AS UserTotalAnswers,
+        OwnerUserId
+    FROM Posts
+    WHERE PostTypeId = 1 AND Tags IS NOT NULL
+    GROUP BY Id, Tags, AnswerCount, OwnerUserId
+),
+LastPostHistory AS (
+    SELECT ph.UserId, MAX(ph.CreationDate) AS LastCreationDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (5,6,10)
+    GROUP BY ph.UserId
+)
+SELECT 
+    au.Id,
+    au.DisplayName,
+    au.TotalPosts,
+    au.TotalComments,
+    au.TotalVotes,
+    au.TotalBadges,
+    au.AvgPostScore,
+    ta.TagCount,
+    ta.UserTotalAnswers,
+    ph.CreationDate AS LastActivity,
+    (SELECT COUNT(*) FROM PostHistory WHERE UserId = au.Id AND PostHistoryTypeId = 2) AS EditsMade
+FROM ActiveUsers au
+JOIN TagAnalysis ta ON au.Id = ta.OwnerUserId
+JOIN LastPostHistory lph ON au.Id = lph.UserId
+JOIN PostHistory ph ON ph.UserId = lph.UserId AND ph.CreationDate = lph.LastCreationDate AND ph.PostHistoryTypeId IN (5,6,10)
+WHERE 
+    au.PostRank <= 100 AND
+    ta.TagCount > 3
+ORDER BY 
+    au.TotalPosts DESC, 
+    au.AvgPostScore DESC
+LIMIT 100;

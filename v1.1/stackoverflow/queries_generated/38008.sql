@@ -1,0 +1,237 @@
+-- {"query": "38008.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 2346} 
+with recent_users as (
+  select u.id,
+         u.reputation,
+         u.creationdate,
+         u.location,
+         ntile(10) over (order by u.reputation desc) as rep_decile
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+tagged_questions as (
+  select p.id as question_id,
+         p.owneruserid,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         p.answercount,
+         p.tags,
+         coalesce(nullif(p.title, ''), '[no-title]') as title,
+         string_to_array(substring(p.tags, 2, length(p.tags)-2), '><') as tag_array
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+),
+exploded_tags as (
+  select tq.question_id,
+         tq.owneruserid,
+         tq.creationdate,
+         tq.score,
+         tq.viewcount,
+         tq.answercount,
+         lower(trim(t)) as tag
+  from tagged_questions tq
+       cross join lateral unnest(tq.tag_array) as t
+),
+top_tags as (
+  select et.tag,
+         count(*) as q_count,
+         sum(case when et.score >= 5 then 1 else 0 end) as hot_qs,
+         sum(et.viewcount) as total_views
+  from exploded_tags et
+  group by et.tag
+  having count(*) >= 50
+),
+answers as (
+  select a.id as answer_id,
+         a.parentid as question_id,
+         a.owneruserid as answerer_id,
+         a.creationdate,
+         a.score as answer_score
+  from posts a
+  where a.posttypeid = 2
+),
+accepted as (
+  select q.id as question_id,
+         q.acceptedanswerid
+  from posts q
+  where q.posttypeid = 1
+    and q.acceptedanswerid is not null
+),
+answer_stats as (
+  select et.tag,
+         a.question_id,
+         count(*) as answers_total,
+         sum(case when a.answer_score > 0 then 1 else 0 end) as answers_positive,
+         max(a.answer_score) as max_answer_score,
+         sum(case when a.answer_id = ac.acceptedanswerid then 1 else 0 end) as has_accepted
+  from exploded_tags et
+  join answers a on a.question_id = et.question_id
+  left join accepted ac on ac.question_id = a.question_id
+  group by et.tag, a.question_id
+),
+comment_activity as (
+  select c.postid,
+         count(*) as comment_count,
+         sum(case when c.score > 0 then 1 else 0 end) as pos_comments
+  from comments c
+  where c.creationdate >= (select max(creationdate) - interval '365 days' from comments)
+  group by c.postid
+),
+vote_agg as (
+  select v.postid,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+         sum(case when v.votetypeid = 12 then 1 else 0 end) as spam_flags
+  from votes v
+  where v.creationdate >= (select max(creationdate) - interval '365 days' from votes)
+  group by v.postid
+),
+dupe_graph as (
+  select pl.relatedpostid as canonical_qid,
+         count(*) filter (where pl.linktypeid = 3) as dup_count
+  from postlinks pl
+  where pl.linktypeid = 3
+    and pl.creationdate >= (select max(creationdate) - interval '365 days' from postlinks)
+  group by pl.relatedpostid
+),
+question_enriched as (
+  select et.tag,
+         tq.question_id,
+         tq.owneruserid,
+         tq.creationdate,
+         tq.score,
+         tq.viewcount,
+         tq.answercount,
+         coalesce(ca.comment_count, 0) as comment_count,
+         coalesce(ca.pos_comments, 0) as pos_comments,
+         coalesce(va.upvotes, 0) as upvotes,
+         coalesce(va.downvotes, 0) as downvotes,
+         coalesce(va.spam_flags, 0) as spam_flags,
+         coalesce(dg.dup_count, 0) as duplicates_pointing_here
+  from exploded_tags et
+  join tagged_questions tq on tq.question_id = et.question_id
+  left join comment_activity ca on ca.postid = et.question_id
+  left join vote_agg va on va.postid = et.question_id
+  left join dupe_graph dg on dg.canonical_qid = et.question_id
+),
+user_badges as (
+  select b.userid,
+         sum(case when b.class = 1 then 1 else 0 end) as gold,
+         sum(case when b.class = 2 then 1 else 0 end) as silver,
+         sum(case when b.class = 3 then 1 else 0 end) as bronze,
+         count(*) as total_badges
+  from badges b
+  where b.date >= (select max(date) - interval '365 days' from badges)
+  group by b.userid
+),
+user_quality as (
+  select u.id as userid,
+         u.reputation,
+         coalesce(ub.gold,0) as gold,
+         coalesce(ub.silver,0) as silver,
+         coalesce(ub.bronze,0) as bronze,
+         coalesce(ub.total_badges,0) as total_badges,
+         ru.rep_decile
+  from users u
+  left join user_badges ub on ub.userid = u.id
+  left join recent_users ru on ru.id = u.id
+),
+tag_rollup as (
+  select qe.tag,
+         count(distinct qe.question_id) as questions,
+         sum(qe.viewcount) as views,
+         avg(qe.score) as avg_q_score,
+         percentile_cont(0.5) within group (order by qe.score) as median_q_score,
+         avg(qe.answercount) as avg_answer_count,
+         sum(qe.comment_count) as comments,
+         sum(qe.upvotes) as upvotes,
+         sum(qe.downvotes) as downvotes,
+         sum(qe.spam_flags) as spam_flags,
+         sum(qe.duplicates_pointing_here) as dup_inbound
+  from question_enriched qe
+  group by qe.tag
+),
+tag_answer_rollup as (
+  select as2.tag,
+         count(*) as q_with_answers,
+         sum(as2.answers_total) as answers_total,
+         sum(as2.answers_positive) as answers_positive,
+         sum(as2.has_accepted) as q_with_accepted,
+         avg(as2.max_answer_score) as avg_max_answer_score
+  from answer_stats as2
+  group by as2.tag
+),
+tag_user_mix as (
+  select et.tag,
+         count(distinct case when uq.rep_decile in (1,2,3) then qe.owneruserid end) as top_user_count,
+         count(distinct case when uq.rep_decile in (8,9,10) then qe.owneruserid end) as low_user_count,
+         avg(uq.reputation) as avg_author_rep,
+         avg(uq.total_badges) as avg_author_badges
+  from exploded_tags et
+  join question_enriched qe on qe.tag = et.tag and qe.question_id = et.question_id
+  left join user_quality uq on uq.userid = qe.owneruserid
+  group by et.tag
+),
+tag_trends as (
+  select et.tag,
+         date_trunc('month', et.creationdate) as month,
+         count(*) as q_count_month,
+         avg(et.score) as avg_score_month
+  from exploded_tags et
+  group by et.tag, date_trunc('month', et.creationdate)
+),
+tag_momentum as (
+  select tt.tag,
+         sum(case when tt.month >= date_trunc('month', now()) - interval '3 months' then tt.q_count_month else 0 end) as q_3m,
+         sum(case when tt.month >= date_trunc('month', now()) - interval '6 months' then tt.q_count_month else 0 end) as q_6m,
+         sum(tt.q_count_month) as q_12m,
+         avg(case when tt.month >= date_trunc('month', now()) - interval '3 months' then tt.avg_score_month end) as avg_score_3m,
+         avg(case when tt.month >= date_trunc('month', now()) - interval '6 months' then tt.avg_score_month end) as avg_score_6m,
+         avg(tt.avg_score_month) as avg_score_12m
+  from tag_trends tt
+  group by tt.tag
+),
+final_tags as (
+  select tt.tag
+  from top_tags tt
+  join tag_rollup tr on tr.tag = tt.tag
+  where tr.views > 10000
+)
+select
+  ft.tag,
+  tr.questions,
+  tr.views,
+  round(tr.avg_q_score::numeric, 3) as avg_q_score,
+  round(tr.median_q_score::numeric, 3) as median_q_score,
+  round(tr.avg_answer_count::numeric, 3) as avg_answer_count,
+  tr.comments,
+  tr.upvotes,
+  tr.downvotes,
+  tr.spam_flags,
+  tr.dup_inbound,
+  tar.q_with_answers,
+  tar.answers_total,
+  tar.answers_positive,
+  tar.q_with_accepted,
+  round(tar.avg_max_answer_score::numeric, 3) as avg_max_answer_score,
+  tum.top_user_count,
+  tum.low_user_count,
+  round(tum.avg_author_rep::numeric, 1) as avg_author_rep,
+  round(tum.avg_author_badges::numeric, 2) as avg_author_badges,
+  tm.q_3m,
+  tm.q_6m,
+  tm.q_12m,
+  round(tm.avg_score_3m::numeric, 3) as avg_score_3m,
+  round(tm.avg_score_6m::numeric, 3) as avg_score_6m,
+  round(tm.avg_score_12m::numeric, 3) as avg_score_12m,
+  (tr.views / nullif(tm.q_12m,0))::numeric as views_per_q_12m,
+  (tr.upvotes - tr.downvotes) as net_votes,
+  (case when tar.q_with_answers > 0 then tar.q_with_accepted::numeric / tar.q_with_answers else 0 end) as acceptance_rate
+from final_tags ft
+join tag_rollup tr on tr.tag = ft.tag
+left join tag_answer_rollup tar on tar.tag = ft.tag
+left join tag_user_mix tum on tum.tag = ft.tag
+left join tag_momentum tm on tm.tag = ft.tag
+order by views_per_q_12m desc nulls last, net_votes desc
+limit 100;

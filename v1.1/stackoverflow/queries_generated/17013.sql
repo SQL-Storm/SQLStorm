@@ -1,4 +1,4 @@
--- {"query": "17013.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 32690, "output_tokens": 32204} 
+-- {"query": "17013.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 32690, "output_tokens": 32204} 
 
 WITH UserMetrics AS (
     SELECT 

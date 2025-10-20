@@ -1,0 +1,107 @@
+WITH RECURSIVE user_influence_tree AS (
+  SELECT 
+    u.Id as root_user_id,
+    u.Id as current_user_id,
+    u.Reputation,
+    0 as depth,
+    ARRAY[u.Id] as path
+  FROM Users u
+  WHERE u.Reputation > 50000
+    AND u.CreationDate >= DATE '2015-01-01'
+
+  UNION ALL
+
+  SELECT 
+    uit.root_user_id,
+    u2.Id,
+    u2.Reputation,
+    uit.depth + 1,
+    uit.path || u2.Id
+  FROM user_influence_tree uit
+  JOIN Posts p ON p.OwnerUserId = uit.current_user_id
+  JOIN Comments c ON c.PostId = p.Id
+  JOIN Users u2 ON u2.Id = c.UserId
+  WHERE uit.depth < 3
+    AND NOT (u2.Id = ANY(uit.path))
+    AND u2.Reputation > 1000
+),
+top_answerers AS (
+  SELECT 
+    p.OwnerUserId,
+    COUNT(DISTINCT p.Id) as answer_count,
+    AVG(p.Score) as avg_score,
+    SUM(CASE WHEN p.Id = parent.AcceptedAnswerId THEN 1 ELSE 0 END) as accepted_count,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) as median_score
+  FROM Posts p
+  JOIN Posts parent ON p.ParentId = parent.Id
+  WHERE p.PostTypeId = 2
+    AND p.CreationDate >= DATE '2020-01-01'
+    AND p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId
+  HAVING COUNT(DISTINCT p.Id) >= 50
+),
+tag_expert_network AS (
+  SELECT 
+    t.TagName,
+    ta.OwnerUserId,
+    ta.answer_count,
+    ta.avg_score,
+    ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY ta.answer_count DESC, ta.avg_score DESC) as expert_rank,
+    COUNT(DISTINCT b.Id) as badges_in_tag
+  FROM Tags t
+  JOIN Posts q ON q.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+  JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+  JOIN top_answerers ta ON ta.OwnerUserId = a.OwnerUserId
+  LEFT JOIN Badges b ON b.UserId = ta.OwnerUserId AND b.Name = t.TagName AND b.TagBased = 1
+  WHERE t.Count > 5000
+  GROUP BY t.TagName, ta.OwnerUserId, ta.answer_count, ta.avg_score
+),
+cross_pollination AS (
+  SELECT 
+    ten1.TagName as tag1,
+    ten2.TagName as tag2,
+    COUNT(DISTINCT ten1.OwnerUserId) as shared_experts,
+    AVG(ten1.expert_rank + ten2.expert_rank) as avg_combined_rank,
+    SUM(ten1.answer_count + ten2.answer_count) as total_answers
+  FROM tag_expert_network ten1
+  JOIN tag_expert_network ten2 ON ten1.OwnerUserId = ten2.OwnerUserId
+  WHERE ten1.TagName < ten2.TagName
+    AND ten1.expert_rank <= 20
+    AND ten2.expert_rank <= 20
+  GROUP BY ten1.TagName, ten2.TagName
+  HAVING COUNT(DISTINCT ten1.OwnerUserId) >= 3
+)
+SELECT 
+  cp.tag1,
+  cp.tag2,
+  cp.shared_experts,
+  cp.avg_combined_rank,
+  ROUND(CAST(cp.total_answers AS DECIMAL) / NULLIF(cp.shared_experts,0), 2) as answers_per_expert,
+  STRING_AGG(DISTINCT u.DisplayName, ', ' ORDER BY u.DisplayName) as expert_names,
+  AVG(u.Reputation) as avg_expert_reputation,
+  COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) as total_upvotes_on_experts,
+  COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.Id END) as total_expert_edits,
+  COALESCE(
+    (SELECT COUNT(*) 
+     FROM user_influence_tree uit 
+     WHERE uit.current_user_id IN (
+       SELECT DISTINCT ten.OwnerUserId 
+       FROM tag_expert_network ten 
+       WHERE ten.TagName IN (cp.tag1, cp.tag2)
+     )
+    ), 0
+  ) as influence_network_size,
+  MAX(t1.Count + t2.Count) as combined_tag_count
+FROM cross_pollination cp
+JOIN Tags t1 ON t1.TagName = cp.tag1
+JOIN Tags t2 ON t2.TagName = cp.tag2
+JOIN tag_expert_network ten ON ten.TagName IN (cp.tag1, cp.tag2) AND ten.expert_rank <= 20
+JOIN Users u ON u.Id = ten.OwnerUserId
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN Votes v ON v.PostId = p.Id
+LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.UserId = u.Id
+WHERE cp.shared_experts >= 5
+GROUP BY cp.tag1, cp.tag2, cp.shared_experts, cp.avg_combined_rank, cp.total_answers
+HAVING AVG(u.Reputation) > 10000
+ORDER BY cp.shared_experts DESC, avg_expert_reputation DESC, combined_tag_count DESC
+LIMIT 50;

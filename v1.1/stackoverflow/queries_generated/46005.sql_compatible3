@@ -1,0 +1,150 @@
+WITH TopQuestionAuthors AS (
+    SELECT 
+        p.OwnerUserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        AVG(p.Score) AS AvgQuestionScore,
+        SUM(p.ViewCount) AS TotalViews
+    FROM Posts p
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 
+        AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years'
+        AND p.Score >= 5
+    GROUP BY p.OwnerUserId, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+AnswerEngagement AS (
+    SELECT 
+        a.OwnerUserId AS AnswererUserId,
+        q.OwnerUserId AS QuestionAuthorUserId,
+        COUNT(DISTINCT a.Id) AS AnswersProvided,
+        SUM(CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedAnswers,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.CreationDate) AS LastAnswerDate
+    FROM Posts a
+    INNER JOIN Posts q ON a.ParentId = q.Id
+    WHERE a.PostTypeId = 2 
+        AND q.PostTypeId = 1
+        AND a.OwnerUserId IS NOT NULL
+        AND q.OwnerUserId IS NOT NULL
+    GROUP BY a.OwnerUserId, q.OwnerUserId
+    HAVING COUNT(DISTINCT a.Id) >= 3
+),
+UserBadgeStats AS (
+    SELECT 
+        UserId,
+        COUNT(CASE WHEN badges."class" = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN badges."class" = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN badges."class" = 3 THEN 1 END) AS BronzeBadges,
+        COUNT(CASE WHEN COALESCE(TagBased, FALSE) = TRUE THEN 1 END) AS TagBasedBadges
+    FROM Badges AS badges
+    WHERE Date >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3 years'
+    GROUP BY UserId
+),
+TagInteractions AS (
+    SELECT 
+        p.OwnerUserId,
+        p.Tags,
+        CASE 
+          WHEN p.Tags IS NULL THEN NULL
+          WHEN LEFT(p.Tags,1) = '<' AND RIGHT(p.Tags,1) = '>' THEN SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2)
+          ELSE p.Tags
+        END AS TagsInner,
+        COUNT(DISTINCT c.UserId) AS UniqueCommenters,
+        COUNT(DISTINCT v.UserId) AS UniqueVoters,
+        p.Id AS PostId
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    WHERE p.PostTypeId = 1 
+        AND p.Tags IS NOT NULL
+        AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '18 months'
+    GROUP BY p.OwnerUserId, p.Tags, p.Id
+),
+NetworkInfluence AS (
+    SELECT 
+        tqa.OwnerUserId,
+        tqa.DisplayName,
+        tqa.Reputation,
+        tqa.QuestionCount,
+        tqa.AvgQuestionScore,
+        tqa.TotalViews,
+        COALESCE(ubs.GoldBadges, 0) AS GoldBadges,
+        COALESCE(ubs.SilverBadges, 0) AS SilverBadges,
+        COALESCE(ubs.BronzeBadges, 0) AS BronzeBadges,
+        COUNT(DISTINCT ae.AnswererUserId) AS DistinctAnswerers,
+        AVG(ae.AvgAnswerScore) AS AvgAnswerScoreReceived,
+        SUM(ae.AcceptedAnswers) AS TotalAcceptedAnswers,
+        AVG(ti.UniqueCommenters) AS AvgCommentersPerPost,
+        AVG(ti.UniqueVoters) AS AvgVotersPerPost
+    FROM TopQuestionAuthors tqa
+    LEFT JOIN AnswerEngagement ae ON tqa.OwnerUserId = ae.QuestionAuthorUserId
+    LEFT JOIN UserBadgeStats ubs ON tqa.OwnerUserId = ubs.UserId
+    LEFT JOIN TagInteractions ti ON tqa.OwnerUserId = ti.OwnerUserId
+    GROUP BY tqa.OwnerUserId, tqa.DisplayName, tqa.Reputation, 
+             tqa.QuestionCount, tqa.AvgQuestionScore, tqa.TotalViews,
+             ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges
+),
+RankedInfluencers AS (
+    SELECT 
+        ni.OwnerUserId,
+        ni.DisplayName,
+        ni.Reputation,
+        ni.QuestionCount,
+        ni.AvgQuestionScore,
+        ni.TotalViews,
+        ni.GoldBadges,
+        ni.SilverBadges,
+        ni.BronzeBadges,
+        ni.DistinctAnswerers,
+        ni.AvgAnswerScoreReceived,
+        ni.TotalAcceptedAnswers,
+        ni.AvgCommentersPerPost,
+        ni.AvgVotersPerPost,
+        ROW_NUMBER() OVER (ORDER BY 
+            (ni.TotalViews * 0.3 + 
+             ni.Reputation * 0.2 + 
+             ni.DistinctAnswerers * 100 * 0.2 + 
+             ni.TotalAcceptedAnswers * 50 * 0.15 +
+             ni.GoldBadges * 200 * 0.15) DESC
+        ) AS InfluenceRank,
+        PERCENT_RANK() OVER (ORDER BY ni.TotalViews) AS ViewsPercentile,
+        PERCENT_RANK() OVER (ORDER BY ni.DistinctAnswerers) AS EngagementPercentile
+    FROM NetworkInfluence ni
+    WHERE ni.DistinctAnswerers > 0
+)
+SELECT 
+    ri.InfluenceRank,
+    ri.DisplayName,
+    ri.Reputation,
+    ri.QuestionCount,
+    ROUND(ri.AvgQuestionScore, 2) AS AvgQuestionScore,
+    ri.TotalViews,
+    ri.GoldBadges,
+    ri.SilverBadges,
+    ri.BronzeBadges,
+    ri.DistinctAnswerers,
+    ROUND(ri.AvgAnswerScoreReceived, 2) AS AvgAnswerScoreReceived,
+    ri.TotalAcceptedAnswers,
+    ROUND(ri.AvgCommentersPerPost, 2) AS AvgCommentersPerPost,
+    ROUND(ri.AvgVotersPerPost, 2) AS AvgVotersPerPost,
+    ROUND(ri.ViewsPercentile, 4) AS ViewsPercentile,
+    ROUND(ri.EngagementPercentile, 4) AS EngagementPercentile,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    COALESCE(ph_count.EditCount, 0) AS PostHistoryEdits
+FROM RankedInfluencers ri
+INNER JOIN Users u ON ri.OwnerUserId = u.Id
+LEFT JOIN (
+    SELECT ph.UserId, COUNT(*) AS EditCount
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+        AND ph.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years'
+    GROUP BY ph.UserId
+) ph_count ON ri.OwnerUserId = ph_count.UserId
+WHERE ri.InfluenceRank <= 100
+    AND ri.ViewsPercentile >= 0.75
+    AND ri.EngagementPercentile >= 0.60
+ORDER BY ri.InfluenceRank
+LIMIT 50;

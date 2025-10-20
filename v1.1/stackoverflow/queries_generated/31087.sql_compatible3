@@ -1,0 +1,70 @@
+WITH UserEngagement AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(COALESCE(ph.VoteCount, 0)) AS PostHistoryCount
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN 
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN 
+        (SELECT PostId, COUNT(*) AS VoteCount FROM Votes GROUP BY PostId) ph ON p.Id = ph.PostId
+    WHERE 
+        u.Reputation > 1000
+    GROUP BY 
+        u.Id, u.DisplayName
+),
+TagsWithPostCount AS (
+    SELECT 
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS TotalPosts
+    FROM 
+        Tags t
+    LEFT JOIN 
+        Posts p ON EXISTS (
+            SELECT 1
+            FROM (
+                SELECT TRIM(value) AS tag
+                FROM UNNEST(STRING_SPLIT(p.Tags, ',')) AS s(value)
+            ) s2
+            WHERE s2.tag = t.TagName
+        )
+    GROUP BY 
+        t.TagName
+),
+TopEngagedUsers AS (
+    SELECT 
+        ue.UserId,
+        ue.DisplayName,
+        ue.Upvotes - ue.Downvotes AS NetVotes,
+        ue.CommentCount,
+        ue.PostCount,
+        ue.PostHistoryCount,
+        ROW_NUMBER() OVER (ORDER BY ue.Upvotes DESC, ue.CommentCount DESC) AS EngagementRank
+    FROM 
+        UserEngagement ue
+)
+SELECT 
+    tue.DisplayName AS TopUser,
+    tue.NetVotes,
+    tue.CommentCount,
+    tue.PostCount,
+    tue.PostHistoryCount,
+    twp.TagName,
+    twp.TotalPosts
+FROM 
+    TopEngagedUsers tue
+JOIN 
+    TagsWithPostCount twp ON twp.TotalPosts > 10
+WHERE 
+    tue.EngagementRank <= 5
+ORDER BY 
+    tue.NetVotes DESC;

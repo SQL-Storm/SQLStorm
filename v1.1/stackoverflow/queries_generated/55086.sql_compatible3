@@ -1,0 +1,123 @@
+WITH UserStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)                               AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)                               AS AnswerCount,
+        COALESCE(SUM(p.Score) FILTER (WHERE p.PostTypeId = 1),0)                  AS TotalQuestionScore,
+        COALESCE(SUM(p.Score) FILTER (WHERE p.PostTypeId = 2),0)                  AS TotalAnswerScore,
+        COALESCE(AVG(p.Score) FILTER (WHERE p.PostTypeId = 1),0)                  AS AvgQuestionScore,
+        COALESCE(AVG(p.Score) FILTER (WHERE p.PostTypeId = 2),0)                  AS AvgAnswerScore,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2)                      AS UpVoteCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3)                      AS DownVoteCount,
+        COUNT(DISTINCT b.Id)                                                      AS BadgeCount,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1)                           AS GoldBadgeCount,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2)                           AS SilverBadgeCount,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3)                           AS BronzeBadgeCount
+    FROM Users u
+    LEFT JOIN Posts p          ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v          ON v.UserId = u.Id
+    LEFT JOIN Badges b         ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+-- Portable recursive splitter to turn '<a><b><c>' into rows 'a','b','c'
+TagSplitter AS (
+    SELECT p.Id AS PostId,
+           TRIM(SUBSTRING(p.Tags FROM 2 FOR (LENGTH(p.Tags) - 2))) AS rest,
+           NULL AS tag,
+           1 AS lvl
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+
+    UNION ALL
+
+    SELECT
+        PostId,
+        CASE
+            WHEN POSITION('><' IN rest) > 0 THEN SUBSTRING(rest FROM POSITION('><' IN rest) + 2)
+            ELSE ''
+        END AS rest,
+        CASE
+            WHEN POSITION('><' IN rest) > 0 THEN TRIM(SUBSTRING(rest FROM 1 FOR POSITION('><' IN rest)-1))
+            ELSE TRIM(rest)
+        END AS tag,
+        lvl + 1
+    FROM TagSplitter
+    WHERE rest <> ''
+),
+TagFrequencyFinal AS (
+    SELECT tag AS TagName, COUNT(*) AS TagUsage
+    FROM TagSplitter
+    WHERE tag IS NOT NULL AND tag <> ''
+    GROUP BY tag
+),
+TopTags AS (
+    SELECT TagName
+    FROM TagFrequencyFinal
+    ORDER BY TagUsage DESC
+    LIMIT 10
+),
+UserTagAffinity AS (
+    SELECT
+        us.UserId,
+        COUNT(*) FILTER (WHERE t.TagName IS NOT NULL) AS MatchingTagPosts,
+        COUNT(p.Id)                                   AS TotalPosts
+    FROM UserStats us
+    JOIN Posts p ON p.OwnerUserId = us.UserId AND p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    JOIN (
+        SELECT PostId, tag AS TagName
+        FROM TagSplitter
+    ) pt ON pt.PostId = p.Id
+    LEFT JOIN TopTags t ON t.TagName = pt.TagName
+    GROUP BY us.UserId
+),
+UserActivityWindow AS (
+    SELECT
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.TotalQuestionScore,
+        us.TotalAnswerScore,
+        us.AvgQuestionScore,
+        us.AvgAnswerScore,
+        us.UpVoteCount,
+        us.DownVoteCount,
+        us.BadgeCount,
+        us.GoldBadgeCount,
+        us.SilverBadgeCount,
+        us.BronzeBadgeCount,
+        COALESCE(uta.MatchingTagPosts,0) AS MatchingTagPosts,
+        COALESCE(uta.TotalPosts,0)       AS TotalPosts,
+        ROW_NUMBER() OVER (ORDER BY us.Reputation DESC) AS RankByReputation,
+        PERCENT_RANK() OVER (ORDER BY us.Reputation)   AS ReputationPercentile
+    FROM UserStats us
+    LEFT JOIN UserTagAffinity uta ON uta.UserId = us.UserId
+)
+SELECT
+    RankByReputation,
+    UserId,
+    DisplayName,
+    Reputation,
+    ReputationPercentile,
+    QuestionCount,
+    AnswerCount,
+    TotalQuestionScore,
+    TotalAnswerScore,
+    AvgQuestionScore,
+    AvgAnswerScore,
+    UpVoteCount,
+    DownVoteCount,
+    BadgeCount,
+    GoldBadgeCount,
+    SilverBadgeCount,
+    BronzeBadgeCount,
+    MatchingTagPosts,
+    TotalPosts,
+    ROUND( (CAST(MatchingTagPosts AS NUMERIC) / NULLIF(TotalPosts,0)) * 100, 2) AS TagAffinityPercent
+FROM UserActivityWindow
+WHERE RankByReputation <= 100
+ORDER BY RankByReputation;

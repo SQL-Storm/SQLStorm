@@ -1,0 +1,107 @@
+WITH QuestionCloseReasons AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReasonName,
+        ph.CreationDate
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON ph.Comment = CAST(crt.Id AS VARCHAR)
+    WHERE ph.PostHistoryTypeId = 10
+),
+LatestQuestionCloseReasons AS (
+    SELECT
+        qcr.PostId,
+        qcr.CloseReasonName
+    FROM (
+        SELECT
+            qcr.*,
+            ROW_NUMBER() OVER (PARTITION BY qcr.PostId ORDER BY qcr.CreationDate DESC) AS rn
+        FROM QuestionCloseReasons qcr
+    ) qcr
+    WHERE qcr.rn = 1
+),
+QuestionEditCounts AS (
+    SELECT
+        ph.PostId,
+        COUNT(DISTINCT ph.Id) AS EditCount
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+    GROUP BY ph.PostId
+),
+PopularDuplicateQuestions AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        q.ViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.Tags,
+        q.AcceptedAnswerId,
+        qec.EditCount,
+        -- Standard SQL string split is not portable; keep as text but convert tags to a delimited string without angle brackets
+        SUBSTRING(q.Tags FROM 2 FOR (CHAR_LENGTH(q.Tags) - 2)) AS TagString
+    FROM Posts q
+    INNER JOIN LatestQuestionCloseReasons qcr ON q.Id = qcr.PostId
+    INNER JOIN QuestionEditCounts qec ON q.Id = qec.PostId
+    WHERE
+        q.PostTypeId = 1
+        AND q.OwnerUserId IS NOT NULL
+        AND qcr.CloseReasonName = 'Duplicate'
+        AND q.ViewCount > 20000
+        AND q.AnswerCount >= 15
+        AND q.FavoriteCount >= 30
+        AND qec.EditCount >= 7
+),
+UserSelfAcceptedAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        1 AS HasSelfAcceptedAnswer
+    FROM Posts q
+    JOIN Posts a ON q.AcceptedAnswerId = a.Id
+    WHERE q.PostTypeId = 1
+      AND q.AcceptedAnswerId IS NOT NULL
+      AND q.OwnerUserId = a.OwnerUserId
+),
+UserBadgesSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        COUNT(CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 1 AND b.TagBased = TRUE THEN b.Id END) AS TagBasedGoldBadges
+    FROM Badges b
+    GROUP BY b.UserId
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.UpVotes,
+    u.DownVotes,
+    COUNT(DISTINCT pdq.QuestionId) AS NumPopularDuplicateQuestions,
+    SUM(pdq.ViewCount) AS TotalViewCountOfPopularDuplicateQuestions,
+    SUM(pdq.AnswerCount) AS TotalAnswerCountOfPopularDuplicateQuestions,
+    SUM(pdq.FavoriteCount) AS TotalFavoriteCountOfPopularDuplicateQuestions,
+    MAX(CASE WHEN usaa.HasSelfAcceptedAnswer IS NOT NULL THEN 1 ELSE 0 END) AS HasSelfAcceptedAnswerInAnyPQ,
+    COALESCE(ubs.GoldBadges, 0) AS GoldBadgesCount,
+    COALESCE(ubs.TagBasedGoldBadges, 0) AS TagBasedGoldBadgesCount,
+    (u.Reputation * 0.05) +
+    (COALESCE(ubs.GoldBadges, 0) * 15) +
+    (COALESCE(ubs.TagBasedGoldBadges, 0) * 25) +
+    (SUM(pdq.ViewCount) * 0.00005) +
+    (SUM(pdq.AnswerCount) * 0.75) +
+    (SUM(pdq.FavoriteCount) * 1.2) +
+    (COUNT(DISTINCT pdq.QuestionId) * 75) +
+    (MAX(CASE WHEN usaa.HasSelfAcceptedAnswer IS NOT NULL THEN 1 ELSE 0 END) * 10) AS InfluenceScore
+FROM Users u
+INNER JOIN PopularDuplicateQuestions pdq ON u.Id = pdq.OwnerUserId
+LEFT JOIN UserSelfAcceptedAnswers usaa ON pdq.QuestionId = usaa.QuestionId
+LEFT JOIN UserBadgesSummary ubs ON u.Id = ubs.UserId
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.UpVotes,
+    u.DownVotes,
+    COALESCE(ubs.GoldBadges, 0),
+    COALESCE(ubs.TagBasedGoldBadges, 0)
+ORDER BY InfluenceScore DESC, u.Reputation DESC
+LIMIT 25;

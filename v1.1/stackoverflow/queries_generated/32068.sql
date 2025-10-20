@@ -1,0 +1,33 @@
+-- {"query": "32068.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4o", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 300} 
+
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        COALESCE(SUM(v.VoteTypeId = 2), 0) AS UpVotesCount,
+        COALESCE(SUM(v.VoteTypeId = 3), 0) AS DownVotesCount,
+        COUNT(DISTINCT p.Id) AS PostsCount,
+        COUNT(DISTINCT c.Id) AS CommentsCount,
+        COUNT(DISTINCT b.Id) AS BadgesCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id
+)
+SELECT 
+    ua.UserId,
+    u.DisplayName,
+    ua.UpVotesCount,
+    ua.DownVotesCount,
+    ua.PostsCount,
+    ua.CommentsCount,
+    ua.BadgesCount,
+    u.Reputation,
+    u.Views,
+    (ua.UpVotesCount * 10 - ua.DownVotesCount * 2 + ua.PostsCount * 5 + ua.CommentsCount * 3 + ua.BadgesCount * 15) AS ActivityScore
+FROM UserActivity ua
+JOIN Users u ON ua.UserId = u.Id
+WHERE u.Reputation > 1000
+ORDER BY ActivityScore DESC
+LIMIT 100;

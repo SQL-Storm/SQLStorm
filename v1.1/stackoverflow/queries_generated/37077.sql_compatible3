@@ -1,0 +1,262 @@
+WITH
+QuestionBase AS (
+  SELECT p.Id AS QuestionId,
+         p.Title,
+         p.CreationDate,
+         p.OwnerUserId,
+         p.ViewCount,
+         p.Score,
+         p.AnswerCount,
+         p.CommentCount,
+         p.Tags,
+         p.AcceptedAnswerId,
+         p.LastActivityDate,
+         p.LastEditorUserId,
+         p.FavoriteCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+AnswersAgg AS (
+  SELECT a.ParentId AS QuestionId,
+         COUNT(*) AS TotalAnswers,
+         SUM(CASE WHEN a.Score >= 0 THEN 1 ELSE 0 END) FILTER (WHERE a.Score IS NOT NULL) AS NonNegativeAnswers,
+         AVG(a.Score) AS AvgAnswerScore,
+         MAX(a.Score) AS MaxAnswerScore,
+         MIN(a.Score) AS MinAnswerScore,
+         SUM(CASE WHEN a.OwnerUserId IS NOT NULL THEN 1 ELSE 0 END) AS AnswersWithOwner,
+         COUNT(DISTINCT a.OwnerUserId) AS DistinctAnswerers,
+         MAX(a.CreationDate) AS LatestAnswerDate
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+  GROUP BY a.ParentId
+),
+CommentsAgg AS (
+  SELECT c.PostId AS QuestionId,
+         COUNT(*) AS CommentCountTotal,
+         AVG(c.Score) AS AvgCommentScore,
+         MAX(c.Score) AS MaxCommentScore,
+         COUNT(DISTINCT c.UserId) AS DistinctCommenters
+  FROM Comments c
+  WHERE c.PostId IS NOT NULL
+  GROUP BY c.PostId
+),
+VoteMix AS (
+  SELECT v.PostId,
+         SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+         SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes,
+         SUM(CASE WHEN vt.Name = 'AcceptedByOriginator' THEN 1 ELSE 0 END) AS AcceptedMarks,
+         SUM(CASE WHEN vt.Name = 'Favorite' THEN 1 ELSE 0 END) AS Favorites,
+         COUNT(*) AS TotalVotes
+  FROM Votes v
+  LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  GROUP BY v.PostId
+),
+LinksAgg AS (
+  SELECT pl.RelatedPostId AS QuestionId,
+         SUM(CASE WHEN lt.Name = 'Duplicate' THEN 1 ELSE 0 END) AS DuplicatedByCount,
+         SUM(CASE WHEN lt.Name = 'Linked' THEN 1 ELSE 0 END) AS LinkedByCount,
+         COUNT(*) AS TotalIncomingLinks
+  FROM PostLinks pl
+  LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  GROUP BY pl.RelatedPostId
+),
+OwnerBadges AS (
+  SELECT q.QuestionId,
+         u.Id AS OwnerId,
+         u.DisplayName AS OwnerName,
+         COUNT(b.Id) FILTER (WHERE b.Class = 1) AS OwnerGoldBadges,
+         COUNT(b.Id) FILTER (WHERE b.Class = 2) AS OwnerSilverBadges,
+         COUNT(b.Id) FILTER (WHERE b.Class = 3) AS OwnerBronzeBadges,
+         MAX(b.Date) AS OwnerLastBadgeDate
+  FROM QuestionBase q
+  LEFT JOIN Users u ON u.Id = q.OwnerUserId
+  LEFT JOIN Badges b ON b.UserId = u.Id AND b.Date <= q.CreationDate
+  GROUP BY q.QuestionId, u.Id, u.DisplayName
+),
+TextMetrics AS (
+  SELECT q.QuestionId,
+         COALESCE(array_length(string_to_array(substring(q.Tags FROM 2 FOR length(q.Tags)-2), '><'), 1), 0) AS TagCount,
+         COALESCE(char_length(q.Title),0) AS TitleLength,
+         COALESCE(char_length(p.Body),0) AS BodyLength,
+         COALESCE(w.word_count, 0) AS EstimatedBodyWords,
+         p.Body,
+         q.Tags
+  FROM QuestionBase q
+  LEFT JOIN Posts p ON p.Id = q.QuestionId
+  LEFT JOIN LATERAL (
+    SELECT COUNT(*) AS word_count
+    FROM regexp_split_to_table(COALESCE(p.Body, ''), '\s+') AS t(word)
+  ) w ON TRUE
+),
+HistoryAgg AS (
+  SELECT ph.PostId AS QuestionId,
+         COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6,7,8,9,24)) AS EditRevisions,
+         COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (10,11)) AS CloseReopenEvents,
+         COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (35,36)) AS MigrationEvents,
+         MIN(ph.CreationDate) AS FirstHistoryDate,
+         MAX(ph.CreationDate) AS LastHistoryDate
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+Combined AS (
+  SELECT q.QuestionId,
+         q.Title,
+         q.CreationDate,
+         q.OwnerUserId,
+         q.ViewCount,
+         q.Score,
+         q.AnswerCount,
+         q.CommentCount,
+         q.Tags,
+         q.AcceptedAnswerId,
+         q.LastActivityDate,
+         q.LastEditorUserId,
+         q.FavoriteCount,
+         COALESCE(a.TotalAnswers,0) AS TotalAnswersAgg,
+         COALESCE(a.NonNegativeAnswers,0) AS NonNegAnswers,
+         COALESCE(a.AvgAnswerScore,0) AS AvgAnswerScore,
+         COALESCE(c.CommentCountTotal,0) AS CommentCountAgg,
+         COALESCE(vm.UpVotes,0) AS QuestionUpVotes,
+         COALESCE(vm.DownVotes,0) AS QuestionDownVotes,
+         COALESCE(vm.Favorites,0) AS QuestionFavorites,
+         COALESCE(lk.DuplicatedByCount,0) AS DuplicatedByCount,
+         COALESCE(lk.LinkedByCount,0) AS LinkedByCount,
+         ob.OwnerId,
+         ob.OwnerName,
+         ob.OwnerGoldBadges,
+         ob.OwnerSilverBadges,
+         ob.OwnerBronzeBadges,
+         COALESCE(tm.TagCount,0) AS TagCount,
+         COALESCE(tm.TitleLength,0) AS TitleLength,
+         COALESCE(tm.BodyLength,0) AS BodyLength,
+         COALESCE(h.EditRevisions,0) AS EditRevisions,
+         COALESCE(h.CloseReopenEvents,0) AS CloseReopenEvents,
+         tm.Body,
+         tm.Tags
+  FROM QuestionBase q
+  LEFT JOIN AnswersAgg a ON a.QuestionId = q.QuestionId
+  LEFT JOIN CommentsAgg c ON c.QuestionId = q.QuestionId
+  LEFT JOIN VoteMix vm ON vm.PostId = q.QuestionId
+  LEFT JOIN LinksAgg lk ON lk.QuestionId = q.QuestionId
+  LEFT JOIN OwnerBadges ob ON ob.QuestionId = q.QuestionId
+  LEFT JOIN TextMetrics tm ON tm.QuestionId = q.QuestionId
+  LEFT JOIN HistoryAgg h ON h.QuestionId = q.QuestionId
+),
+Scored AS (
+  SELECT c.*,
+         (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - COALESCE(LastActivityDate, CreationDate))) / 86400.0) AS DaysSinceActivity,
+         (
+          (CASE WHEN ViewCount IS NULL OR ViewCount = 0 THEN 0 ELSE LN(1 + ViewCount) END) * 0.25
+          + GREATEST(0, TotalAnswersAgg) * 1.8
+          + GREATEST(0, CommentCountAgg) * 0.6
+          + GREATEST(0, QuestionFavorites) * 1.2
+          + GREATEST(0, QuestionUpVotes - QuestionDownVotes) * 1.5
+         ) AS EngagementRaw,
+         (COALESCE(OwnerGoldBadges,0)*5 + COALESCE(OwnerSilverBadges,0)*2 + COALESCE(OwnerBronzeBadges,0)*0.5) AS OwnerBadgeScore,
+         (CASE
+            WHEN TagCount <= 2 THEN -1
+            WHEN TagCount BETWEEN 3 AND 5 THEN 0.5
+            ELSE 1.2
+          END) * (CASE WHEN BodyLength < 300 THEN 0.8 WHEN BodyLength BETWEEN 300 AND 2000 THEN 1.0 ELSE 1.1 END) AS ComplexityFactor
+  FROM Combined c
+),
+FinalSample AS (
+  SELECT s.QuestionId,
+         s.Title,
+         s.CreationDate,
+         s.OwnerId,
+         s.OwnerName,
+         s.ViewCount,
+         s.Score,
+         s.TotalAnswersAgg,
+         s.CommentCountAgg,
+         s.EngagementRaw,
+         s.OwnerBadgeScore,
+         s.TagCount,
+         s.TitleLength,
+         s.BodyLength,
+         s.EditRevisions,
+         s.CloseReopenEvents,
+         s.DaysSinceActivity,
+         s.ComplexityFactor,
+         COALESCE(vm_ans.UpVotes,0) AS AnswersUpVotes,
+         COALESCE(vm_ans.DownVotes,0) AS AnswersDownVotes,
+         COALESCE(ansagg.DistinctAnswerers,0) AS DistinctAnswerers,
+         COALESCE(ph_ed.EditRevisions,0) AS TotalEditRevisions,
+         sub.TopAnswerers,
+         sub.TagList,
+         s.QuestionUpVotes,
+         s.QuestionDownVotes,
+         s.QuestionFavorites,
+         s.DuplicatedByCount,
+         s.LinkedByCount
+  FROM Scored s
+  LEFT JOIN (
+    SELECT v.PostId,
+           SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+           SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes
+    FROM Votes v
+    LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY v.PostId
+  ) vm_ans ON vm_ans.PostId = s.QuestionId
+  LEFT JOIN AnswersAgg ansagg ON ansagg.QuestionId = s.QuestionId
+  LEFT JOIN (
+    SELECT ph.PostId, COUNT(*) AS EditRevisions FROM PostHistory ph WHERE ph.PostHistoryTypeId IN (4,5,6,7,8,9,24) GROUP BY ph.PostId
+  ) ph_ed ON ph_ed.PostId = s.QuestionId
+  LEFT JOIN LATERAL (
+    SELECT
+      (SELECT json_agg(row_to_json(t))
+       FROM (
+         SELECT u.Id AS UserId, u.DisplayName, u.Reputation, COUNT(a.Id) AS AnswersCount, MAX(a.Score) AS BestScore
+         FROM Posts a
+         JOIN Users u ON u.Id = a.OwnerUserId
+         WHERE a.ParentId = s.QuestionId AND a.PostTypeId = 2 AND a.OwnerUserId IS NOT NULL
+         GROUP BY u.Id, u.DisplayName, u.Reputation
+         ORDER BY AnswersCount DESC, u.Reputation DESC
+         LIMIT 3
+       ) t
+      ) AS TopAnswerers,
+      (SELECT array_agg(distinct tg) FROM (
+         SELECT unnest(string_to_array(substring(s.Tags FROM 2 FOR length(s.Tags)-2), '><')) AS tg
+       ) tt) AS TagList
+  ) sub ON TRUE
+)
+SELECT f.QuestionId,
+       f.Title,
+       f.CreationDate,
+       f.OwnerId,
+       f.OwnerName,
+       f.ViewCount,
+       f.Score,
+       f.TotalAnswersAgg,
+       f.CommentCountAgg,
+       ROUND(f.EngagementRaw::numeric,4) AS EngagementRaw,
+       f.OwnerBadgeScore,
+       f.TagCount,
+       f.TitleLength,
+       f.BodyLength,
+       f.EditRevisions,
+       f.CloseReopenEvents,
+       ROUND(CAST(f.DaysSinceActivity AS numeric),2) AS DaysSinceActivity,
+       f.ComplexityFactor,
+       COALESCE(f.QuestionsUpVotes,0) AS IgnoredUpvotesPlaceholder,
+       COALESCE(f.QuestionUpVotes,0) AS QuestionUpVotes,
+       COALESCE(f.QuestionDownVotes,0) AS QuestionDownVotes,
+       COALESCE(f.QuestionFavorites,0) AS QuestionFavorites,
+       COALESCE(f.DuplicatedByCount,0) AS DuplicatedByCount,
+       COALESCE(f.LinkedByCount,0) AS LinkedByCount,
+       f.AnswersUpVotes,
+       f.AnswersDownVotes,
+       f.DistinctAnswerers,
+       f.TotalEditRevisions,
+       f.TopAnswerers,
+       f.TagList
+FROM (
+  SELECT fs.*,
+         NTILE(10) OVER (ORDER BY EngagementRaw DESC NULLS LAST) AS decile_rank,
+         ROW_NUMBER() OVER (PARTITION BY NTILE(10) OVER (ORDER BY EngagementRaw DESC NULLS LAST) ORDER BY random()) AS rn_in_decile
+  FROM FinalSample fs
+) f
+WHERE f.rn_in_decile <= 10
+ORDER BY f.decile_rank, f.EngagementRaw DESC
+LIMIT 100;

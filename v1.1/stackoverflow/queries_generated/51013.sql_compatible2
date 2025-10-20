@@ -1,0 +1,75 @@
+WITH popular_tags AS (
+    SELECT TagName, Count
+    FROM Tags
+    WHERE Count > 100
+),
+active_users AS (
+    SELECT Id, Reputation, Location, CreationDate
+    FROM Users
+    WHERE CreationDate > CAST('2024-10-01' AS date) - INTERVAL '1 year'
+      AND Reputation > 100
+),
+tagged_questions AS (
+    SELECT p.Id AS post_id, p.Title, p.Score, p.ViewCount, p.CreationDate AS post_date,
+           au.Id AS user_id, au.Reputation AS user_rep, au.CreationDate AS user_creation_date
+    FROM Posts p
+    JOIN popular_tags pt ON p.Tags LIKE CONCAT('%<', pt.TagName, '>%')
+    JOIN active_users au ON p.OwnerUserId = au.Id
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '6 months'
+),
+user_activity AS (
+    SELECT tu.user_id, tu.user_rep,
+           AVG(tu.Score) AS avg_question_score,
+           COUNT(DISTINCT v.Id) AS upvote_count,
+           COUNT(DISTINCT c.Id) AS comment_count,
+           STRING_AGG(DISTINCT tu.Title, ' | ') AS sample_titles,
+           MIN(tu.post_date) AS first_post_date
+    FROM tagged_questions tu
+    LEFT JOIN Votes v ON tu.post_id = v.PostId AND v.VoteTypeId = 2 AND v.CreationDate > tu.post_date - INTERVAL '1 month'
+    LEFT JOIN Comments c ON tu.post_id = c.PostId AND c.CreationDate > tu.post_date - INTERVAL '1 week'
+    GROUP BY tu.user_id, tu.user_rep
+    HAVING COUNT(DISTINCT v.Id) > 5 OR COUNT(DISTINCT c.Id) > 10
+),
+badge_insights AS (
+    SELECT b.UserId, b.Name AS badge_name, b.Date,
+           ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS rn
+    FROM Badges b
+    JOIN active_users au ON b.UserId = au.Id
+    WHERE b.Class = 1
+)
+SELECT 
+    ua.user_id,
+    ua.user_rep,
+    ua.avg_question_score,
+    ua.upvote_count,
+    ua.comment_count,
+    bi.badge_name AS top_gold_badge,
+    au.Location,
+    SUBSTRING(ua.sample_titles FROM 1 FOR 200) AS titles_preview,
+    RANK() OVER (
+      ORDER BY (
+        ua.upvote_count
+        + ua.comment_count * 2
+        + COALESCE(
+            (EXTRACT(EPOCH FROM (bi.Date - au.CreationDate))), 0
+          ) / 86400
+      ) DESC
+    ) AS activity_rank
+FROM user_activity ua
+LEFT JOIN badge_insights bi ON ua.user_id = bi.UserId AND bi.rn = 1
+JOIN active_users au ON ua.user_id = au.Id
+WHERE ua.avg_question_score > 2
+GROUP BY
+  ua.user_id,
+  ua.user_rep,
+  ua.avg_question_score,
+  ua.upvote_count,
+  ua.comment_count,
+  bi.badge_name,
+  bi.Date,
+  au.Location,
+  ua.sample_titles,
+  au.CreationDate
+ORDER BY activity_rank
+LIMIT 50;

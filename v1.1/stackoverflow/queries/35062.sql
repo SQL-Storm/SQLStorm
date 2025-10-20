@@ -1,0 +1,85 @@
+WITH RecentActiveUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+           COUNT(DISTINCT p.Id) AS NumPosts,
+           COUNT(DISTINCT c.Id) AS NumComments,
+           COUNT(DISTINCT b.Id) AS NumBadges
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90' DAY
+    LEFT JOIN Comments c ON u.Id = c.UserId AND c.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90' DAY
+    LEFT JOIN Badges b ON u.Id = b.UserId AND b.Date > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90' DAY
+    WHERE u.LastAccessDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+TopTags AS (
+    SELECT t.TagName, SUM(t.Count) AS TotalTagCount
+    FROM Tags t
+    GROUP BY t.TagName
+    ORDER BY SUM(t.Count) DESC
+    LIMIT 20
+),
+PopularQuestions AS (
+    SELECT p.Id, p.Title, p.Tags, p.Score, p.ViewCount, p.OwnerUserId, p.CreationDate
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR
+      AND p.ViewCount > 1000
+      AND p.Score > 10
+),
+HotNetworkMoves AS (
+    SELECT ph.PostId, ph.CreationDate, p.Title, ph.UserId
+    FROM PostHistory ph
+    JOIN Posts p ON ph.PostId = p.Id
+    WHERE ph.PostHistoryTypeId IN (52, 53)
+      AND ph.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR
+),
+UserParticipation AS (
+    SELECT rau.Id AS UserId, COUNT(DISTINCT pq.Id) AS PopularQuestionsPosted,
+           COUNT(DISTINCT c.Id) AS PopularQuestionsCommented,
+           COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpvotesGivenToPopularQuestions,
+           COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownvotesGivenToPopularQuestions
+    FROM RecentActiveUsers rau
+    LEFT JOIN PopularQuestions pq ON rau.Id = pq.OwnerUserId
+    LEFT JOIN Comments c ON rau.Id = c.UserId AND c.PostId = pq.Id
+    LEFT JOIN Votes v ON rau.Id = v.UserId AND v.PostId = pq.Id
+    GROUP BY rau.Id
+),
+TopUserTagsExpanded AS (
+    SELECT rau.Id AS UserId, t.TagName,
+           ROW_NUMBER() OVER (PARTITION BY rau.Id ORDER BY tt.TotalTagCount DESC, t.TagName) AS rn
+    FROM RecentActiveUsers rau
+    JOIN TopTags tt ON 1=1
+    JOIN (SELECT TagName FROM TopTags) t ON 1=1
+    JOIN Posts p ON p.OwnerUserId = rau.Id AND p.PostTypeId = 1
+    WHERE POSITION('<' || tt.TagName || '>' IN p.Tags) > 0
+    GROUP BY rau.Id, tt.TotalTagCount, t.TagName
+)
+SELECT
+    rau.Id AS UserId,
+    rau.DisplayName,
+    rau.Reputation,
+    rau.CreationDate,
+    rau.LastAccessDate,
+    rau.NumPosts,
+    rau.NumComments,
+    rau.NumBadges,
+    up.PopularQuestionsPosted,
+    up.PopularQuestionsCommented,
+    up.UpvotesGivenToPopularQuestions,
+    up.DownvotesGivenToPopularQuestions,
+    COALESCE(string_agg(tut.TagName, ', ' ORDER BY tut.TagName) FILTER (WHERE tut.rn <= 5), '') AS TopUserTags,
+    COUNT(DISTINCT hn.PostId) AS HotNetworkPostsPastYear
+FROM RecentActiveUsers rau
+LEFT JOIN UserParticipation up ON up.UserId = rau.Id
+LEFT JOIN HotNetworkMoves hn ON hn.UserId = rau.Id
+LEFT JOIN (
+    SELECT UserId, TagName, rn
+    FROM TopUserTagsExpanded
+    WHERE rn <= 5
+) tut ON tut.UserId = rau.Id
+GROUP BY 
+    rau.Id, rau.DisplayName, rau.Reputation, rau.CreationDate, rau.LastAccessDate,
+    rau.NumPosts, rau.NumComments, rau.NumBadges,
+    up.PopularQuestionsPosted, up.PopularQuestionsCommented, up.UpvotesGivenToPopularQuestions, up.DownvotesGivenToPopularQuestions
+ORDER BY
+    rau.Reputation DESC, HotNetworkPostsPastYear DESC, rau.NumPosts DESC
+LIMIT 50;

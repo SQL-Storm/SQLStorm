@@ -1,0 +1,62 @@
+WITH UserTopQuestions AS (
+    SELECT 
+        u.Id AS UserId, 
+        u.DisplayName, 
+        p.Id AS PostId, 
+        p.Score, 
+        p.ViewCount,
+        RANK() OVER (PARTITION BY u.Id ORDER BY p.Score DESC, p.ViewCount DESC) AS PostRank
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+),
+TagPopularity AS (
+    SELECT 
+        t.TagName, 
+        COUNT(DISTINCT p.Id) AS PostCount,
+        AVG(p.Score) AS AvgTagScore
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    GROUP BY t.TagName
+),
+UserBadgeStats AS (
+    SELECT 
+        UserId, 
+        COUNT(*) AS BadgeCount,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges
+    FROM Badges
+    GROUP BY UserId
+),
+MostPopularTag AS (
+    SELECT TagName
+    FROM TagPopularity
+    ORDER BY PostCount DESC
+    LIMIT 1
+)
+SELECT 
+    utq.UserId,
+    utq.DisplayName,
+    utq.PostId,
+    utq.Score,
+    utq.ViewCount,
+    ubs.BadgeCount,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    mpt.TagName AS MostPopularTag
+FROM UserTopQuestions utq
+JOIN UserBadgeStats ubs ON utq.UserId = ubs.UserId
+CROSS JOIN MostPopularTag mpt
+WHERE utq.PostRank <= 3
+GROUP BY
+    utq.UserId,
+    utq.DisplayName,
+    utq.PostId,
+    utq.Score,
+    utq.ViewCount,
+    ubs.BadgeCount,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    mpt.TagName
+ORDER BY utq.Score DESC, utq.ViewCount DESC
+LIMIT 100;

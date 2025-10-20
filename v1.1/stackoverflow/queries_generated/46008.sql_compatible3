@@ -1,0 +1,112 @@
+WITH expert_users AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT b.Id) AS badge_count,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS gold_badges
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 10000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT b.Id) > 5
+),
+popular_questions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CreationDate,
+        CASE
+          WHEN p.Tags IS NULL THEN NULL
+          ELSE
+            REPLACE(
+              REPLACE(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><', '||'),
+              ' ', ''
+            )
+        END AS tag_array_text
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Score > 10
+      AND p.ViewCount > 1000
+      AND p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '2' YEAR)
+),
+answer_stats AS (
+    SELECT 
+        a.ParentId AS question_id,
+        a.Id AS answer_id,
+        a.OwnerUserId,
+        a.Score AS answer_score,
+        a.CreationDate AS answer_date,
+        COUNT(DISTINCT c.Id) AS comment_count,
+        AVG(c.Score) AS avg_comment_score,
+        COUNT(DISTINCT ph.Id) AS edit_count
+    FROM Posts a
+    LEFT JOIN Comments c ON a.Id = c.PostId
+    LEFT JOIN PostHistory ph ON a.Id = ph.PostId AND ph.PostHistoryTypeId = 5
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId, a.Id, a.OwnerUserId, a.Score, a.CreationDate
+),
+tag_expertise AS (
+    SELECT 
+        u.Id AS user_id,
+        split_val AS tag_name,
+        COUNT(DISTINCT p.Id) AS questions_in_tag,
+        AVG(p.Score) AS avg_question_score
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    CROSS JOIN (
+      SELECT
+        REPLACE(REPLACE(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><', '||'), ' ', '') AS tags_norm
+    ) s
+    CROSS JOIN LATERAL (
+      -- assume a split function SPLIT_STRING(tags_norm, delimiter) that returns table (value)
+      SELECT value AS split_val FROM SPLIT_STRING(s.tags_norm, '||')
+    ) split_vals
+    WHERE p.PostTypeId = 1
+    GROUP BY u.Id, split_val
+    HAVING COUNT(DISTINCT p.Id) >= 3
+)
+SELECT 
+    eu.DisplayName,
+    eu.Reputation,
+    eu.badge_count,
+    eu.gold_badges,
+    COUNT(DISTINCT pq.Id) AS expert_questions_count,
+    AVG(pq.Score) AS avg_question_score,
+    AVG(pq.ViewCount) AS avg_views,
+    COUNT(DISTINCT ast.answer_id) AS total_answers,
+    AVG(ast.answer_score) AS avg_answer_score,
+    SUM(ast.comment_count) AS total_comments_on_answers,
+    AVG(ast.edit_count) AS avg_edits_per_answer,
+    COUNT(DISTINCT te.tag_name) AS tags_expertise_count,
+    -- build top_tags using COALESCE of common functions; move FILTER condition into CASE in aggregated expression for compatibility
+    COALESCE(
+      LISTAGG(te.tag_name, ', ') WITHIN GROUP (ORDER BY te.tag_name) OVER (PARTITION BY eu.Id),
+      STRING_AGG(te.tag_name, ', ') OVER (PARTITION BY eu.Id)
+    ) AS top_tags,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 8 THEN v.Id END) AS bounties_started,
+    SUM(CASE WHEN v.VoteTypeId = 8 THEN COALESCE(v.BountyAmount,0) ELSE 0 END) AS total_bounty_amount,
+    COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 1 THEN pl.Id END) AS linked_posts_count,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY pq.Score) AS median_question_score,
+    MAX(pq.ViewCount) AS max_views_single_question,
+    COUNT(DISTINCT CASE WHEN pq.AnswerCount = 0 THEN pq.Id END) AS unanswered_questions
+FROM expert_users eu
+LEFT JOIN popular_questions pq ON eu.Id = pq.OwnerUserId
+LEFT JOIN answer_stats ast ON pq.Id = ast.question_id
+LEFT JOIN tag_expertise te ON eu.Id = te.user_id
+LEFT JOIN Votes v ON eu.Id = v.UserId AND pq.Id = v.PostId
+LEFT JOIN PostLinks pl ON pq.Id = pl.PostId
+WHERE pq.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '18' MONTH)
+GROUP BY eu.Id, eu.DisplayName, eu.Reputation, eu.badge_count, eu.gold_badges
+HAVING COUNT(DISTINCT pq.Id) > 0
+ORDER BY 
+    (COALESCE(AVG(pq.Score),0) * 0.3 + 
+     COALESCE(AVG(ast.answer_score),0) * 0.3 + 
+     eu.Reputation * 0.0001 + 
+     eu.gold_badges * 10) DESC,
+    avg_views DESC
+LIMIT 100;

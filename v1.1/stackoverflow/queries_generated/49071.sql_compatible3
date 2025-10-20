@@ -1,0 +1,294 @@
+WITH UserContributionSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT Q.Id) AS TotalQuestionsAsked,
+        COUNT(DISTINCT A.Id) AS TotalAnswersProvided,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN P.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN P.Score ELSE 0 END) AS TotalAnswerScore,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 AND P.AcceptedAnswerId IS NOT NULL THEN P.Id END) AS QuestionsWithAcceptedAnswer,
+        COUNT(DISTINCT CASE WHEN A.PostTypeId = 2 AND A.Id = ParentQ.AcceptedAnswerId THEN A.Id END) AS AcceptedAnswersCount,
+        SUM(P.FavoriteCount) AS TotalFavoriteCountOnPosts,
+        MAX(P.CreationDate) AS LastPostActivityDate,
+        MIN(P.CreationDate) AS FirstPostActivityDate
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Posts Q ON P.Id = Q.Id AND Q.PostTypeId = 1
+    LEFT JOIN Posts A ON P.Id = A.Id AND A.PostTypeId = 2
+    LEFT JOIN Posts ParentQ ON A.ParentId = ParentQ.Id
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate
+),
+UserBadgeAndEditMetrics AS (
+    SELECT
+        U.Id AS UserId,
+        COUNT(B.Id) AS TotalBadges,
+        COUNT(CASE WHEN B.Class = 1 THEN B.Id END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN B.Id END) AS SilverBadges,
+        COUNT(CASE WHEN B.Class = 3 THEN B.Id END) AS BronzeBadges,
+        COUNT(PH.Id) AS TotalPostHistoryEntries,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6, 8, 9, 24) THEN PH.PostId END) AS DistinctPostsEdited,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (1, 2, 3) THEN PH.PostId END) AS DistinctPostsCreated,
+        MAX(PH.CreationDate) AS LastHistoryEntryDate
+    FROM Users U
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN PostHistory PH ON U.Id = PH.UserId
+    GROUP BY U.Id
+),
+UserTagActivity AS (
+    SELECT
+        U.Id AS UserId,
+        TRIM(tag_split.value) AS TagName,
+        SUM(P.Score) AS UserTagScore,
+        COUNT(P.Id) AS UserPostsInTag,
+        SUM(P.ViewCount) AS UserTagViewCount
+    FROM Users U
+    JOIN Posts P ON U.Id = P.OwnerUserId
+    JOIN (
+        SELECT
+            P_inner.Id AS PostId,
+            value
+        FROM Posts P_inner
+        CROSS JOIN LATERAL (
+            WITH RECURSIVE parts(pos, remaining) AS (
+                SELECT 1 AS pos,
+                       CASE
+                         WHEN P_inner.Tags IS NULL THEN ''
+                         ELSE
+                           CASE
+                             WHEN LEFT(P_inner.Tags,1) = '<' AND RIGHT(P_inner.Tags,1) = '>' THEN SUBSTR(P_inner.Tags,2,LENGTH(P_inner.Tags)-2)
+                             WHEN LEFT(P_inner.Tags,1) = '<' THEN SUBSTR(P_inner.Tags,2)
+                             WHEN RIGHT(P_inner.Tags,1) = '>' THEN SUBSTR(P_inner.Tags,1,LENGTH(P_inner.Tags)-1)
+                             ELSE P_inner.Tags
+                           END
+                       END AS remaining
+                UNION ALL
+                SELECT pos+1,
+                       CASE
+                         WHEN POSITION('><' IN remaining) = 0 THEN ''
+                         ELSE SUBSTR(remaining, POSITION('><' IN remaining) + 2)
+                       END
+                FROM parts
+                WHERE remaining <> '' AND POSITION('><' IN remaining) > 0
+            )
+            SELECT
+              TRIM(
+                SUBSTR(
+                  CASE
+                    WHEN P_inner.Tags IS NULL THEN ''
+                    ELSE
+                      CASE
+                        WHEN LEFT(P_inner.Tags,1) = '<' AND RIGHT(P_inner.Tags,1) = '>' THEN SUBSTR(P_inner.Tags,2,LENGTH(P_inner.Tags)-2)
+                        WHEN LEFT(P_inner.Tags,1) = '<' THEN SUBSTR(P_inner.Tags,2)
+                        WHEN RIGHT(P_inner.Tags,1) = '>' THEN SUBSTR(P_inner.Tags,1,LENGTH(P_inner.Tags)-1)
+                        ELSE P_inner.Tags
+                      END
+                  END,
+                  1,
+                  CASE WHEN POSITION('><' IN
+                    CASE
+                      WHEN P_inner.Tags IS NULL THEN ''
+                      ELSE
+                        CASE
+                          WHEN LEFT(P_inner.Tags,1) = '<' AND RIGHT(P_inner.Tags,1) = '>' THEN SUBSTR(P_inner.Tags,2,LENGTH(P_inner.Tags)-2)
+                          WHEN LEFT(P_inner.Tags,1) = '<' THEN SUBSTR(P_inner.Tags,2)
+                          WHEN RIGHT(P_inner.Tags,1) = '>' THEN SUBSTR(P_inner.Tags,1,LENGTH(P_inner.Tags)-1)
+                          ELSE P_inner.Tags
+                        END
+                    END
+                  ) = 0
+                  THEN LENGTH(
+                    CASE
+                      WHEN P_inner.Tags IS NULL THEN ''
+                      ELSE
+                        CASE
+                          WHEN LEFT(P_inner.Tags,1) = '<' AND RIGHT(P_inner.Tags,1) = '>' THEN SUBSTR(P_inner.Tags,2,LENGTH(P_inner.Tags)-2)
+                          WHEN LEFT(P_inner.Tags,1) = '<' THEN SUBSTR(P_inner.Tags,2)
+                          WHEN RIGHT(P_inner.Tags,1) = '>' THEN SUBSTR(P_inner.Tags,1,LENGTH(P_inner.Tags)-1)
+                          ELSE P_inner.Tags
+                        END
+                    END
+                  )
+                  ELSE POSITION('><' IN
+                    CASE
+                      WHEN P_inner.Tags IS NULL THEN ''
+                      ELSE
+                        CASE
+                          WHEN LEFT(P_inner.Tags,1) = '<' AND RIGHT(P_inner.Tags,1) = '>' THEN SUBSTR(P_inner.Tags,2,LENGTH(P_inner.Tags)-2)
+                          WHEN LEFT(P_inner.Tags,1) = '<' THEN SUBSTR(P_inner.Tags,2)
+                          WHEN RIGHT(P_inner.Tags,1) = '>' THEN SUBSTR(P_inner.Tags,1,LENGTH(P_inner.Tags)-1)
+                          ELSE P_inner.Tags
+                        END
+                    END
+                  ) - 1
+                  END
+                )
+              ) AS value
+            FROM parts
+            WHERE remaining <> '' OR pos = 1
+        ) tag_split
+        WHERE tag_split.value IS NOT NULL AND tag_split.value <> ''
+    ) tag_split ON tag_split.PostId = P.Id
+    WHERE P.Tags IS NOT NULL AND P.Tags <> ' '
+    GROUP BY U.Id, TRIM(tag_split.value)
+),
+TagPopularity AS (
+    SELECT
+        TRIM(tag_split.value) AS TagName,
+        SUM(P_ALL.Score) AS GlobalTagScore,
+        COUNT(P_ALL.Id) AS GlobalTagPosts,
+        SUM(P_ALL.ViewCount) AS GlobalTagViewCount
+    FROM Posts P_ALL
+    JOIN (
+        SELECT
+            P_inner.Id AS PostId,
+            value
+        FROM Posts P_inner
+        CROSS JOIN LATERAL (
+            WITH RECURSIVE parts(pos, remaining) AS (
+                SELECT 1 AS pos,
+                       CASE
+                         WHEN P_inner.Tags IS NULL THEN ''
+                         ELSE
+                           CASE
+                             WHEN LEFT(P_inner.Tags,1) = '<' AND RIGHT(P_inner.Tags,1) = '>' THEN SUBSTR(P_inner.Tags,2,LENGTH(P_inner.Tags)-2)
+                             WHEN LEFT(P_inner.Tags,1) = '<' THEN SUBSTR(P_inner.Tags,2)
+                             WHEN RIGHT(P_inner.Tags,1) = '>' THEN SUBSTR(P_inner.Tags,1,LENGTH(P_inner.Tags)-1)
+                             ELSE P_inner.Tags
+                           END
+                       END AS remaining
+                UNION ALL
+                SELECT pos+1,
+                       CASE
+                         WHEN POSITION('><' IN remaining) = 0 THEN ''
+                         ELSE SUBSTR(remaining, POSITION('><' IN remaining) + 2)
+                       END
+                FROM parts
+                WHERE remaining <> '' AND POSITION('><' IN remaining) > 0
+            )
+            SELECT
+              TRIM(
+                SUBSTR(
+                  CASE
+                    WHEN P_inner.Tags IS NULL THEN ''
+                    ELSE
+                      CASE
+                        WHEN LEFT(P_inner.Tags,1) = '<' AND RIGHT(P_inner.Tags,1) = '>' THEN SUBSTR(P_inner.Tags,2,LENGTH(P_inner.Tags)-2)
+                        WHEN LEFT(P_inner.Tags,1) = '<' THEN SUBSTR(P_inner.Tags,2)
+                        WHEN RIGHT(P_inner.Tags,1) = '>' THEN SUBSTR(P_inner.Tags,1,LENGTH(P_inner.Tags)-1)
+                        ELSE P_inner.Tags
+                      END
+                  END,
+                  1,
+                  CASE WHEN POSITION('><' IN
+                    CASE
+                      WHEN P_inner.Tags IS NULL THEN ''
+                      ELSE
+                        CASE
+                          WHEN LEFT(P_inner.Tags,1) = '<' AND RIGHT(P_inner.Tags,1) = '>' THEN SUBSTR(P_inner.Tags,2,LENGTH(P_inner.Tags)-2)
+                          WHEN LEFT(P_inner.Tags,1) = '<' THEN SUBSTR(P_inner.Tags,2)
+                          WHEN RIGHT(P_inner.Tags,1) = '>' THEN SUBSTR(P_inner.Tags,1,LENGTH(P_inner.Tags)-1)
+                          ELSE P_inner.Tags
+                        END
+                    END
+                  ) = 0
+                  THEN LENGTH(
+                    CASE
+                      WHEN P_inner.Tags IS NULL THEN ''
+                      ELSE
+                        CASE
+                          WHEN LEFT(P_inner.Tags,1) = '<' AND RIGHT(P_inner.Tags,1) = '>' THEN SUBSTR(P_inner.Tags,2,LENGTH(P_inner.Tags)-2)
+                          WHEN LEFT(P_inner.Tags,1) = '<' THEN SUBSTR(P_inner.Tags,2)
+                          WHEN RIGHT(P_inner.Tags,1) = '>' THEN SUBSTR(P_inner.Tags,1,LENGTH(P_inner.Tags)-1)
+                          ELSE P_inner.Tags
+                        END
+                    END
+                  )
+                  ELSE POSITION('><' IN
+                    CASE
+                      WHEN P_inner.Tags IS NULL THEN ''
+                      ELSE
+                        CASE
+                          WHEN LEFT(P_inner.Tags,1) = '<' AND RIGHT(P_inner.Tags,1) = '>' THEN SUBSTR(P_inner.Tags,2,LENGTH(P_inner.Tags)-2)
+                          WHEN LEFT(P_inner.Tags,1) = '<' THEN SUBSTR(P_inner.Tags,2)
+                          WHEN RIGHT(P_inner.Tags,1) = '>' THEN SUBSTR(P_inner.Tags,1,LENGTH(P_inner.Tags)-1)
+                          ELSE P_inner.Tags
+                        END
+                    END
+                  ) - 1
+                  END
+                )
+              ) AS value
+            FROM parts
+            WHERE remaining <> '' OR pos = 1
+        ) tag_split
+        WHERE tag_split.value IS NOT NULL AND tag_split.value <> ''
+    ) tag_split ON tag_split.PostId = P_ALL.Id
+    WHERE P_ALL.Tags IS NOT NULL AND P_ALL.Tags <> ' '
+    GROUP BY TRIM(tag_split.value)
+),
+UserOverallTagEngagement AS (
+    SELECT
+        UTA.UserId,
+        COUNT(DISTINCT UTA.TagName) AS DistinctTagsContributed,
+        SUM(UTA.UserTagScore) AS TotalUserTagContributionScore,
+        SUM(UTA.UserPostsInTag) AS TotalUserPostsInTags,
+        SUM(UTA.UserTagViewCount) AS TotalUserTagViewCount,
+        SUM(UTA.UserTagScore * TP.GlobalTagScore + UTA.UserTagViewCount * TP.GlobalTagViewCount / 100.0) AS WeightedTagEngagementScore
+    FROM UserTagActivity UTA
+    JOIN TagPopularity TP ON UTA.TagName = TP.TagName
+    GROUP BY UTA.UserId
+)
+SELECT
+    UCS.UserId,
+    UCS.DisplayName,
+    UCS.Reputation,
+    UCS.UserCreationDate,
+    UCS.TotalQuestionsAsked,
+    UCS.TotalAnswersProvided,
+    UCS.TotalCommentsMade,
+    (UCS.TotalQuestionScore + UCS.TotalAnswerScore) AS OverallPostScore,
+    UCS.AcceptedAnswersCount,
+    UCS.TotalFavoriteCountOnPosts,
+    UBM.TotalBadges,
+    UBM.GoldBadges,
+    UBM.SilverBadges,
+    UBM.BronzeBadges,
+    UBM.TotalPostHistoryEntries,
+    UBM.DistinctPostsEdited,
+    UTAE.DistinctTagsContributed,
+    UTAE.TotalUserTagContributionScore,
+    UTAE.WeightedTagEngagementScore,
+    (
+        UCS.Reputation * 0.1 +
+        (UCS.TotalQuestionScore + UCS.TotalAnswerScore) * 0.5 +
+        UCS.AcceptedAnswersCount * 5 +
+        UCS.TotalFavoriteCountOnPosts * 2 +
+        UBM.GoldBadges * 100 +
+        UBM.SilverBadges * 20 +
+        UBM.BronzeBadges * 5 +
+        UBM.DistinctPostsEdited * 1 +
+        COALESCE(UTAE.WeightedTagEngagementScore,0) / 10000.0
+    ) AS CompositeEngagementScore,
+    RANK() OVER (ORDER BY (
+        UCS.Reputation * 0.1 +
+        (UCS.TotalQuestionScore + UCS.TotalAnswerScore) * 0.5 +
+        UCS.AcceptedAnswersCount * 5 +
+        UCS.TotalFavoriteCountOnPosts * 2 +
+        UBM.GoldBadges * 100 +
+        UBM.SilverBadges * 20 +
+        UBM.BronzeBadges * 5 +
+        UBM.DistinctPostsEdited * 1 +
+        COALESCE(UTAE.WeightedTagEngagementScore,0) / 10000.0
+    ) DESC) AS OverallEngagementRank
+FROM UserContributionSummary UCS
+JOIN UserBadgeAndEditMetrics UBM ON UCS.UserId = UBM.UserId
+LEFT JOIN UserOverallTagEngagement UTAE ON UCS.UserId = UTAE.UserId
+WHERE UCS.Reputation > 500
+  AND (UCS.TotalQuestionsAsked > 0 OR UCS.TotalAnswersProvided > 0 OR UCS.TotalCommentsMade > 0)
+  AND UCS.LastPostActivityDate IS NOT NULL
+ORDER BY OverallEngagementRank ASC, UCS.Reputation DESC
+LIMIT 200;

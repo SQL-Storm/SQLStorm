@@ -1,0 +1,76 @@
+WITH RECURSIVE UserPostCounts AS (
+    SELECT 
+        U.Id AS UserId, 
+        U.DisplayName, 
+        COUNT(P.Id) AS PostCount,
+        ROW_NUMBER() OVER (ORDER BY COUNT(P.Id) DESC) AS Rank
+    FROM 
+        Users U
+    JOIN 
+        Posts P ON U.Id = P.OwnerUserId
+    WHERE 
+        P.PostTypeId IN (1, 2)
+    GROUP BY 
+        U.Id, U.DisplayName
+), TagPostCounts AS (
+    SELECT 
+        T.TagName, 
+        COUNT(P.Id) AS PostCount,
+        ROW_NUMBER() OVER (ORDER BY COUNT(P.Id) DESC) AS Rank
+    FROM 
+        Tags T
+    JOIN 
+        Posts P ON T.Id = CAST(NULLIF(REGEXP_REPLACE(P.Tags, '[<>]', ' ', 'g'), '') AS INTEGER)
+           OR T.Id = ANY(STRING_TO_ARRAY(REGEXP_REPLACE(P.Tags, '^<|>$', ''), '><'))
+    WHERE 
+        P.PostTypeId IN (1, 2)
+    GROUP BY 
+        T.TagName
+), PostActivity AS (
+    SELECT 
+        P.Id AS PostId,
+        P.Title,
+        P.CreationDate,
+        P.LastActivityDate,
+        U.DisplayName AS OwnerDisplayName,
+        COUNT(C.Id) AS CommentCount,
+        COUNT(V.Id) AS VoteCount,
+        P.OwnerUserId
+    FROM 
+        Posts P
+    JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    LEFT JOIN 
+        Comments C ON P.Id = C.PostId
+    LEFT JOIN 
+        Votes V ON P.Id = V.PostId
+    WHERE 
+        P.PostTypeId IN (1, 2)
+    GROUP BY 
+        P.Id, P.Title, P.CreationDate, P.LastActivityDate, U.DisplayName, P.OwnerUserId
+)
+SELECT 
+    UPC.UserId, 
+    UPC.DisplayName, 
+    UPC.PostCount, 
+    TPC.TagName, 
+    TPC.PostCount AS TagPostCount, 
+    PA.PostId, 
+    PA.Title, 
+    PA.CreationDate, 
+    PA.LastActivityDate, 
+    PA.OwnerDisplayName, 
+    PA.CommentCount, 
+    PA.VoteCount
+FROM 
+    UserPostCounts UPC
+JOIN 
+    TagPostCounts TPC ON UPC.Rank = TPC.Rank
+JOIN 
+    PostActivity PA ON UPC.UserId = PA.OwnerUserId
+WHERE 
+    UPC.Rank <= 10
+ORDER BY 
+    UPC.PostCount DESC, 
+    TPC.PostCount DESC, 
+    PA.LastActivityDate DESC;

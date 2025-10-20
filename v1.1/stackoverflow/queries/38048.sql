@@ -1,0 +1,260 @@
+with recent_questions as (
+  select p.Id as QuestionId,
+         p.CreationDate,
+         p.Score,
+         p.ViewCount,
+         p.OwnerUserId,
+         p.Tags
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= (select max(CreationDate) - interval '365 days' from Posts where PostTypeId = 1)
+),
+answers as (
+  select a.Id as AnswerId,
+         a.ParentId as QuestionId,
+         a.OwnerUserId as AnswerOwnerId,
+         a.Score as AnswerScore,
+         a.CreationDate as AnswerCreationDate
+  from Posts a
+  where a.PostTypeId = 2
+),
+first_answer as (
+  select a.QuestionId,
+         min(a.AnswerCreationDate) as FirstAnswerDate
+  from answers a
+  group by a.QuestionId
+),
+qa as (
+  select rq.QuestionId,
+         rq.CreationDate as QuestionCreationDate,
+         rq.Score as QuestionScore,
+         rq.ViewCount,
+         rq.OwnerUserId as QuestionOwnerId,
+         rq.Tags,
+         fa.FirstAnswerDate
+  from recent_questions rq
+  left join first_answer fa on fa.QuestionId = rq.QuestionId
+),
+votes_agg as (
+  select v.PostId,
+         sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+         sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+         sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+         count(*) as TotalVotes,
+         max(v.CreationDate) as LastVoteDate
+  from Votes v
+  group by v.PostId
+),
+comments_agg as (
+  select c.PostId,
+         count(*) as CommentCount,
+         max(c.CreationDate) as LastCommentDate
+  from Comments c
+  group by c.PostId
+),
+links_agg as (
+  select pl.PostId,
+         sum(case when pl.LinkTypeId = 1 then 1 else 0 end) as LinkedCount,
+         sum(case when pl.LinkTypeId = 3 then 1 else 0 end) as DuplicateCount
+  from PostLinks pl
+  group by pl.PostId
+),
+edits_agg as (
+  select ph.PostId,
+         count(case when ph.PostHistoryTypeId in (4,5,6,7,8,9,24) then 1 end) as EditEvents,
+         max(case when ph.PostHistoryTypeId in (4,5,6,7,8,9,24) then ph.CreationDate end) as LastEditDate,
+         count(case when ph.PostHistoryTypeId in (10,11,12,13,14,15,19,20,35,36) then 1 end) as ModEvents
+  from PostHistory ph
+  group by ph.PostId
+),
+question_user as (
+  select u.Id as UserId,
+         u.Reputation,
+         u.Views as ProfileViews,
+         u.UpVotes as GivenUpVotes,
+         u.DownVotes as GivenDownVotes,
+         u.CreationDate as UserCreationDate
+  from Users u
+),
+answer_user as (
+  select u.Id as UserId,
+         u.Reputation as AnswererReputation
+  from Users u
+),
+badges_agg as (
+  select b.UserId,
+         count(*) as BadgeCount,
+         sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+         sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+         sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+         max(b.Date) as LastBadgeDate
+  from Badges b
+  group by b.UserId
+),
+tags_expanded as (
+  select q.QuestionId,
+         unnest(string_to_array(substring(coalesce(q.Tags, ''), 2, greatest(length(coalesce(q.Tags, ''))-2,0)), '><')) as Tag
+  from qa q
+),
+top_tags as (
+  select te.Tag,
+         count(distinct te.QuestionId) as TagQCount
+  from tags_expanded te
+  group by te.Tag
+  having count(distinct te.QuestionId) > 50
+),
+question_quality as (
+  select q.QuestionId,
+         q.QuestionCreationDate,
+         q.FirstAnswerDate,
+         extract(epoch from (q.FirstAnswerDate - q.QuestionCreationDate)) as TimeToFirstAnswerSec,
+         q.QuestionScore,
+         q.ViewCount,
+         coalesce(va.UpVotes,0) as UpVotes,
+         coalesce(va.DownVotes,0) as DownVotes,
+         coalesce(va.Favorites,0) as Favorites,
+         coalesce(va.TotalVotes,0) as TotalVotes,
+         coalesce(ca.CommentCount,0) as CommentCount,
+         va.LastVoteDate,
+         ca.LastCommentDate,
+         ea.EditEvents,
+         ea.LastEditDate,
+         ea.ModEvents
+  from qa q
+  left join votes_agg va on va.PostId = q.QuestionId
+  left join comments_agg ca on ca.PostId = q.QuestionId
+  left join edits_agg ea on ea.PostId = q.QuestionId
+),
+answer_stats as (
+  select a.QuestionId,
+         count(*) as AnswerCount,
+         avg(a.AnswerScore) as AvgAnswerScore,
+         max(a.AnswerScore) as MaxAnswerScore,
+         min(a.AnswerScore) as MinAnswerScore
+  from answers a
+  group by a.QuestionId
+),
+answerer_rep as (
+  select a.QuestionId,
+         percentile_cont(0.5) within group (order by au.AnswererReputation) as MedianAnswererRep,
+         avg(au.AnswererReputation) as AvgAnswererRep,
+         max(au.AnswererReputation) as MaxAnswererRep
+  from answers a
+  join answer_user au on au.UserId = a.AnswerOwnerId
+  group by a.QuestionId
+),
+questioner_profile as (
+  select q.QuestionId,
+         qu.Reputation as AskerReputation,
+         qu.ProfileViews as AskerProfileViews,
+         qu.GivenUpVotes as AskerGivenUpVotes,
+         qu.GivenDownVotes as AskerGivenDownVotes,
+         qu.UserCreationDate as AskerSince,
+         coalesce(b.BadgeCount,0) as AskerBadges,
+         coalesce(b.GoldBadges,0) as AskerGold,
+         coalesce(b.SilverBadges,0) as AskerSilver,
+         coalesce(b.BronzeBadges,0) as AskerBronze
+  from qa q
+  left join question_user qu on qu.UserId = q.QuestionOwnerId
+  left join badges_agg b on b.UserId = q.QuestionOwnerId
+),
+tag_signal as (
+  select te.QuestionId,
+         sum(ln(tt.TagQCount + 1)) as TagPopularitySignal
+  from tags_expanded te
+  join top_tags tt on tt.Tag = te.Tag
+  group by te.QuestionId
+),
+dup_signal as (
+  select q.QuestionId,
+         coalesce(lk.DuplicateCount,0) as DuplicateLinks,
+         coalesce(lk.LinkedCount,0) as LinkedRefs
+  from qa q
+  left join links_agg lk on lk.PostId = q.QuestionId
+),
+scorecard as (
+  select qq.QuestionId,
+         qq.QuestionCreationDate,
+         qq.TimeToFirstAnswerSec,
+         qq.QuestionScore,
+         qq.ViewCount,
+         qq.UpVotes,
+         qq.DownVotes,
+         qq.Favorites,
+         qq.TotalVotes,
+         qq.CommentCount,
+         qq.LastVoteDate,
+         qq.LastCommentDate,
+         qq.EditEvents,
+         qq.LastEditDate,
+         qq.ModEvents,
+         coalesce(ans.AnswerCount,0) as AnswerCount,
+         ans.AvgAnswerScore,
+         ans.MaxAnswerScore,
+         ans.MinAnswerScore,
+         ar.MedianAnswererRep,
+         ar.AvgAnswererRep,
+         ar.MaxAnswererRep,
+         qp.AskerReputation,
+         qp.AskerProfileViews,
+         qp.AskerGivenUpVotes,
+         qp.AskerGivenDownVotes,
+         qp.AskerSince,
+         qp.AskerBadges,
+         qp.AskerGold,
+         qp.AskerSilver,
+         qp.AskerBronze,
+         ts.TagPopularitySignal,
+         ds.DuplicateLinks,
+         ds.LinkedRefs
+  from question_quality qq
+  left join answer_stats ans on ans.QuestionId = qq.QuestionId
+  left join answerer_rep ar on ar.QuestionId = qq.QuestionId
+  left join questioner_profile qp on qp.QuestionId = qq.QuestionId
+  left join tag_signal ts on ts.QuestionId = qq.QuestionId
+  left join dup_signal ds on ds.QuestionId = qq.QuestionId
+),
+ranked as (
+  select s.*,
+         row_number() over (order by coalesce(s.TimeToFirstAnswerSec, 1e15) asc, s.QuestionScore desc, s.ViewCount desc) as FastestAnswerRank,
+         row_number() over (order by s.ViewCount desc, s.QuestionScore desc) as HottestRank,
+         row_number() over (order by (coalesce(s.UpVotes,0) - coalesce(s.DownVotes,0)) desc) as NetVotesRank,
+         row_number() over (order by coalesce(s.TagPopularitySignal,0) desc) as TagPopularityRank
+  from scorecard s
+),
+buckets as (
+  select r.*,
+         case
+           when r.TimeToFirstAnswerSec is null then null
+           else least(greatest(ceil((coalesce(r.TimeToFirstAnswerSec, 1e15) - 0) / ((86400 - 0) / 10.0)), 1), 10)
+         end as TTFABucket,
+         case
+           when r.ViewCount is null then null
+           else least(greatest(ceil((r.ViewCount - 0) / ((100000 - 0) / 10.0)), 1), 10)
+         end as ViewBucket,
+         case
+           when r.TagPopularitySignal is null then null
+           else least(greatest(ceil((coalesce(r.TagPopularitySignal,0) - 0) / ((1000 - 0) / 10.0)), 1), 10)
+         end as TagPopBucket
+  from ranked r
+)
+select
+  b.TTFABucket,
+  b.ViewBucket,
+  b.TagPopBucket,
+  count(*) as Questions,
+  avg(b.TimeToFirstAnswerSec) as AvgTTFA,
+  percentile_cont(0.5) within group (order by b.TimeToFirstAnswerSec) as MedianTTFA,
+  avg(b.ViewCount) as AvgViews,
+  avg(b.QuestionScore) as AvgScore,
+  avg(b.UpVotes - b.DownVotes) as AvgNetVotes,
+  avg(b.AnswerCount) as AvgAnswers,
+  avg(coalesce(b.AvgAnswerScore,0)) as AvgAnswerScore,
+  avg(coalesce(b.MedianAnswererRep,0)) as MedianAnswererRepApprox,
+  avg(coalesce(b.TagPopularitySignal,0)) as AvgTagPopSignal,
+  sum(case when b.DuplicateLinks > 0 then 1 else 0 end) as DuplicatesMarked,
+  max(case when b.HottestRank <= 100 then b.HottestRank else null end) as AnyTop100Hot,
+  max(case when b.FastestAnswerRank <= 100 then b.FastestAnswerRank else null end) as AnyTop100Fast
+from buckets b
+group by b.TTFABucket, b.ViewBucket, b.TagPopBucket
+order by b.TTFABucket, b.ViewBucket, b.TagPopBucket;

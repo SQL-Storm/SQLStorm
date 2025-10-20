@@ -1,0 +1,87 @@
+WITH TopAnswerers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(CASE WHEN p.PostTypeId = 2 AND p.Score >= 10 THEN 1 ELSE 0 END) AS HighScoreAnswers,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges
+    FROM 
+        Users u
+        LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+        LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE 
+        u.Reputation > 1000
+    GROUP BY 
+        u.Id, u.DisplayName
+    HAVING 
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) >= 50
+),
+ActiveHotQuestions AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        COUNT(v.Id) AS VoteCount,
+        COUNT(a.Id) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount
+    FROM 
+        Posts p
+        LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId = 2
+        LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+        LEFT JOIN Comments c ON c.PostId = p.Id
+    WHERE 
+        p.PostTypeId = 1
+        AND p.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+        AND p.Score > 5
+    GROUP BY 
+        p.Id, p.Title, p.CreationDate
+    HAVING 
+        COUNT(a.Id) >= 3
+),
+LinkedDuplicates AS (
+    SELECT 
+        pl.PostId, 
+        pl.RelatedPostId,
+        lt.Name AS LinkType
+    FROM 
+        PostLinks pl
+        JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    WHERE 
+        pl.LinkTypeId IN (1,3)
+)
+SELECT 
+    tq.QuestionId,
+    tq.Title,
+    tq.CreationDate,
+    tq.AnswerCount,
+    ta.DisplayName AS TopAnswerer,
+    ta2.TotalAnswers,
+    ta2.HighScoreAnswers,
+    ta2.GoldBadges,
+    COUNT(DISTINCT ld.RelatedPostId) AS NumDuplicatesOrLinked,
+    COALESCE(SUM(v.Score), 0) AS TotalAnswerScore,
+    MAX(b.Date) AS LatestGoldBadgeDate
+FROM 
+    ActiveHotQuestions tq
+    JOIN Posts a ON a.ParentId = tq.QuestionId AND a.PostTypeId = 2
+    JOIN Users ta ON ta.Id = a.OwnerUserId
+    LEFT JOIN TopAnswerers ta2 ON ta2.UserId = ta.Id
+    LEFT JOIN LinkedDuplicates ld ON ld.PostId = tq.QuestionId
+    LEFT JOIN Votes v ON v.PostId = a.Id AND v.VoteTypeId = 2
+    LEFT JOIN Badges b ON b.UserId = ta.Id AND b.Class = 1
+WHERE 
+    ta2.UserId IS NOT NULL 
+GROUP BY 
+    tq.QuestionId,
+    tq.Title,
+    tq.CreationDate,
+    tq.AnswerCount,
+    ta.DisplayName,
+    ta.Id,
+    ta2.TotalAnswers,
+    ta2.HighScoreAnswers,
+    ta2.GoldBadges
+ORDER BY 
+    tq.CreationDate DESC,
+    TotalAnswerScore DESC
+LIMIT 50;

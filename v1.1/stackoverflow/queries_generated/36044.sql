@@ -1,0 +1,32 @@
+-- {"query": "36044.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 367} 
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.PostTypeId,
+  p.CreationDate,
+  p.ViewCount,
+  p.Score,
+  p.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  p.LastActivityDate,
+  pc.Score AS LatestCommentScore,
+  COUNT(DISTINCT c.Id) AS CommentCount,
+  COUNT(DISTINCT v.Id) AS VoteCount,
+  MAX(CASE WHEN v.VoteTypeId = (SELECT Id FROM VoteTypes WHERE Name = 'UpMod') THEN 1 ELSE 0 END) AS HasUpvoters,
+  MAX(CASE WHEN v.VoteTypeId = (SELECT Id FROM VoteTypes WHERE Name = 'AcceptedByOriginator') THEN 1 ELSE 0 END) AS IsAnswered
+FROM
+  Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN (SELECT PostId, Score FROM Posts WHERE Id = (SELECT Id FROM Posts WHERE Id = p.Id) ORDER BY CreationDate DESC LIMIT 1) pc ON pc.PostId = p.Id
+WHERE
+  p.PostTypeId IN (1, 2) -- Questions and Answers
+  AND p.CreationDate >= NOW() - INTERVAL '180 days'
+  AND p.ViewCount > 0
+GROUP BY
+  p.Id, p.Title, p.PostTypeId, p.CreationDate, p.ViewCount, p.Score, p.OwnerUserId, u.DisplayName, p.LastActivityDate, pc.Score
+ORDER BY
+  p.Score DESC,
+  p.ViewCount DESC
+LIMIT 100;

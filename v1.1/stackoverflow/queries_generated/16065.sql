@@ -1,4 +1,4 @@
--- {"query": "16065.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 154110, "output_tokens": 142428} 
+-- {"query": "16065.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 154110, "output_tokens": 142428} 
 
 WITH RECURSIVE user_influence_metrics AS (
     SELECT 

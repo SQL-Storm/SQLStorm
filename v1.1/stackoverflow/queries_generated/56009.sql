@@ -1,0 +1,38 @@
+-- {"query": "56009.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "llama-3.3-instruct", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 340} 
+
+WITH top_users AS (
+  SELECT u.Id, u.DisplayName, COUNT(p.Id) as post_count
+  FROM Users u
+  JOIN Posts p ON u.Id = p.OwnerUserId
+  GROUP BY u.Id, u.DisplayName
+  ORDER BY post_count DESC
+  LIMIT 10
+),
+top_posts AS (
+  SELECT p.Id, p.Title, p.Score, p.ViewCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1 AND p.Score > 100
+  ORDER BY p.Score DESC
+  LIMIT 10
+),
+top_tags AS (
+  SELECT t.TagName, COUNT(pt.PostId) as post_count
+  FROM Tags t
+  JOIN PostTags pt ON t.Id = pt.TagId
+  GROUP BY t.TagName
+  ORDER BY post_count DESC
+  LIMIT 10
+)
+SELECT 
+  tu.DisplayName as top_user,
+  tp.Title as top_post,
+  tt.TagName as top_tag,
+  COUNT(v.Id) as vote_count,
+  SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) as upvote_count,
+  SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) as downvote_count
+FROM Votes v
+JOIN top_users tu ON v.UserId = tu.Id
+JOIN top_posts tp ON v.PostId = tp.Id
+JOIN top_tags tt ON tp.Id IN (SELECT pt.PostId FROM PostTags pt WHERE pt.TagId = (SELECT t.Id FROM Tags t WHERE t.TagName = tt.TagName))
+GROUP BY tu.DisplayName, tp.Title, tt.TagName
+ORDER BY vote_count DESC;

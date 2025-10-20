@@ -1,0 +1,74 @@
+-- {"query": "31050.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4o-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 525} 
+WITH UserStatistics AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(v.VoteTypeId = 2) AS TotalUpVotes,
+        SUM(v.VoteTypeId = 3) AS TotalDownVotes
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN 
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN 
+        Votes v ON u.Id = v.UserId
+    GROUP BY 
+        u.Id, u.DisplayName, u.Reputation
+),
+PostStatistics AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.ViewCount,
+        COALESCE(ph.Comment, '') AS PostHistoryComment,
+        COALESCE(ut.Name, 'Unknown') AS PostType,
+        COALESCE(lt.Name, 'None') AS LinkType
+    FROM 
+        Posts p
+    LEFT JOIN 
+        PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (10, 11)
+    LEFT JOIN 
+        PostTypes ut ON p.PostTypeId = ut.Id
+    LEFT JOIN 
+        PostLinks pl ON p.Id = pl.PostId
+    LEFT JOIN 
+        LinkTypes lt ON pl.LinkTypeId = lt.Id
+    WHERE 
+        p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '1 year'
+),
+UserPostInteraction AS (
+    SELECT 
+        us.UserId,
+        ps.PostId,
+        COUNT(DISTINCT ps.PostId) AS InteractionCount,
+        SUM(ps.ViewCount) AS TotalViews
+    FROM 
+        UserStatistics us
+    JOIN 
+        PostStatistics ps ON us.UserId = ps.PostId
+    GROUP BY 
+        us.UserId, ps.PostId
+)
+SELECT 
+    us.DisplayName,
+    us.Reputation,
+    us.TotalPosts,
+    us.TotalComments,
+    us.TotalUpVotes,
+    us.TotalDownVotes,
+    SUM(up.TotalViews) AS TotalPostViews,
+    SUM(up.InteractionCount) AS TotalInteractions
+FROM 
+    UserStatistics us
+LEFT JOIN 
+    UserPostInteraction up ON us.UserId = up.UserId
+GROUP BY 
+    us.UserId, us.DisplayName, us.Reputation
+ORDER BY 
+    us.Reputation DESC, TotalInteractions DESC
+LIMIT 100;

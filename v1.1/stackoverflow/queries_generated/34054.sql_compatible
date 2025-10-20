@@ -1,0 +1,116 @@
+WITH RankedAnswers AS (
+    SELECT 
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.CreationDate,
+        a.Score,
+        RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+TopAnswers AS (
+    SELECT *
+    FROM RankedAnswers
+    WHERE AnswerRank <= 3
+),
+UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(COALESCE(p.Score,0)) AS TotalPostScore,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+QuestionTagStats AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        COUNT(DISTINCT a.Id) AS AnswerCount,
+        -- convert tags like '<tag1><tag2>' into array ['tag1','tag2']
+        CASE
+          WHEN q.Tags IS NULL OR q.Tags = '' THEN ARRAY[]::text[]
+          ELSE string_to_array(substring(q.Tags FROM 2 FOR char_length(q.Tags)-2), '><')
+        END AS TagList
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.Tags
+),
+TagAggregate AS (
+    SELECT 
+        Tag,
+        COUNT(DISTINCT QuestionId) AS QuestionCount,
+        AVG(Score) AS AvgQuestionScore,
+        AVG(ViewCount) AS AvgQuestionViews,
+        AVG(AnswerCount) AS AvgAnswerCount
+    FROM (
+        SELECT QuestionId, UNNEST(TagList) AS Tag, Score, ViewCount, AnswerCount
+        FROM QuestionTagStats
+    ) qt
+    GROUP BY Tag
+),
+CloseReasonCounts AS (
+    SELECT 
+        cht.Name AS CloseReason,
+        COUNT(ph.Id) AS CloseCount
+    FROM PostHistory ph
+    JOIN CloseReasonTypes cht ON CAST(ph.Comment AS INTEGER) = cht.Id
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY cht.Name
+),
+-- build top tags per question without using DISTINCT inside ordered aggregate
+QuestionTagsOrdered AS (
+    SELECT
+        qts.QuestionId,
+        t.Tag,
+        t.QuestionCount,
+        ROW_NUMBER() OVER (PARTITION BY qts.QuestionId ORDER BY t.QuestionCount DESC, t.Tag) AS rn
+    FROM QuestionTagStats qts
+    LEFT JOIN TagAggregate t ON t.Tag = ANY(qts.TagList)
+)
+SELECT 
+    qts.QuestionId,
+    qts.Title,
+    qts.CreationDate,
+    qts.Score AS QuestionScore,
+    qts.ViewCount,
+    qts.AnswerCount,
+    ta.AnswerId,
+    ta.Score AS AnswerScore,
+    u.DisplayName AS Answerer,
+    u.Reputation AS AnswererReputation,
+    us.TotalPosts AS AnswererTotalPosts,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    ta.CreationDate AS AnswerCreationDate,
+    -- aggregate top tags after ordering by QuestionCount
+    (SELECT ARRAY_AGG(qto.Tag ORDER BY qto.QuestionCount DESC, qto.Tag)
+     FROM QuestionTagsOrdered qto
+     WHERE qto.QuestionId = qts.QuestionId
+    ) AS TopTags,
+    crc.CloseReason,
+    crc.CloseCount
+FROM QuestionTagStats qts
+LEFT JOIN TopAnswers ta ON ta.QuestionId = qts.QuestionId
+LEFT JOIN Users u ON u.Id = (SELECT OwnerUserId FROM Posts WHERE Id = ta.AnswerId)
+LEFT JOIN UserStats us ON us.UserId = u.Id
+LEFT JOIN CloseReasonCounts crc ON TRUE
+WHERE qts.Score >= 5
+GROUP BY 
+    qts.QuestionId, qts.Title, qts.CreationDate, qts.Score, qts.ViewCount, qts.AnswerCount,
+    ta.AnswerId, ta.Score, u.DisplayName, u.Reputation, us.TotalPosts, us.GoldBadges, us.SilverBadges, us.BronzeBadges, ta.CreationDate,
+    crc.CloseReason, crc.CloseCount
+ORDER BY qts.Score DESC, ta.Score DESC NULLS LAST, qts.ViewCount DESC
+LIMIT 100;

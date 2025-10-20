@@ -1,0 +1,117 @@
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS NetVotes,
+        COUNT(DISTINCT b.Id) AS BadgeCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2,3)
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopQuestions AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.Score AS QuestionScore,
+        COUNT(a.Id) AS AnswerCount,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        STRING_AGG(DISTINCT t.TagName, ';') AS Tags
+    FROM Posts q
+    LEFT JOIN Posts a ON q.Id = a.ParentId AND a.PostTypeId = 2
+    LEFT JOIN (
+        SELECT p.Id AS PostId, TRIM(tag) AS TagName
+        FROM Posts p,
+             UNNEST(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><')) AS tag
+        WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    ) t ON q.Id = t.PostId
+    WHERE q.PostTypeId = 1 AND q.Score > 50
+    GROUP BY q.Id, q.Title, q.Score
+    ORDER BY q.Score DESC
+    LIMIT 1000
+),
+AcceptedAnswers AS (
+    SELECT
+        p.ParentId AS QuestionId,
+        p.Id AS AnswerId,
+        p.Score AS AnswerScore,
+        us.Reputation AS AnswererReputation
+    FROM Posts p
+    INNER JOIN Posts q ON p.ParentId = q.Id AND q.AcceptedAnswerId = p.Id
+    INNER JOIN UserStats us ON p.OwnerUserId = us.Id
+),
+QuestionLinks AS (
+    SELECT
+        pl.PostId,
+        COUNT(*) AS RelatedLinks,
+        COUNT(CASE WHEN pl.LinkTypeId = 3 THEN 1 END) AS DuplicateLinks
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+),
+PostEdits AS (
+    SELECT
+        ph.PostId,
+        COUNT(*) AS EditCount,
+        MIN(ph.CreationDate) AS FirstEditDate,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6)
+    GROUP BY ph.PostId
+)
+SELECT
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.NetVotes,
+    us.BadgeCount,
+    tq.Title AS TopQuestionTitle,
+    tq.QuestionScore,
+    tq.AnswerCount AS TopQuestionAnswerCount,
+    tq.AvgAnswerScore,
+    tq.MaxAnswerScore,
+    tq.Tags,
+    aa.AnswerScore AS AcceptedAnswerScore,
+    aa.AnswererReputation,
+    ql.RelatedLinks,
+    ql.DuplicateLinks,
+    pe.EditCount,
+    pe.FirstEditDate,
+    pe.LastEditDate
+FROM UserStats us
+CROSS JOIN TopQuestions tq
+LEFT JOIN AcceptedAnswers aa ON aa.AnswerId IN (
+    SELECT p2.Id FROM Posts p2 WHERE p2.OwnerUserId = us.Id
+)
+LEFT JOIN QuestionLinks ql ON ql.PostId = tq.QuestionId
+LEFT JOIN PostEdits pe ON pe.PostId = tq.QuestionId
+WHERE us.Reputation > 10000
+GROUP BY
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.NetVotes,
+    us.BadgeCount,
+    tq.Title,
+    tq.QuestionScore,
+    tq.AnswerCount,
+    tq.AvgAnswerScore,
+    tq.MaxAnswerScore,
+    tq.Tags,
+    aa.AnswerScore,
+    aa.AnswererReputation,
+    ql.RelatedLinks,
+    ql.DuplicateLinks,
+    pe.EditCount,
+    pe.FirstEditDate,
+    pe.LastEditDate
+ORDER BY us.Reputation DESC, tq.QuestionScore DESC
+LIMIT 500;

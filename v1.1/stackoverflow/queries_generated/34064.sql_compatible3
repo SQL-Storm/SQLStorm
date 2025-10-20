@@ -1,0 +1,124 @@
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsPosted,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersPosted,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COUNT(DISTINCT b.Id) AS BadgesEarned,
+        AVG(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score END) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+TopTags AS (
+    -- Split Tags like '<tag1><tag2>' into rows in a SQL-dialect portable way using recursive CTE
+    SELECT
+        p.OwnerUserId AS UserId,
+        tag AS Tag
+    FROM Posts p
+    JOIN (
+        -- recursive splitter returns one row per tag per post
+        WITH RECURSIVE splitter(post_id, tags_remaining, tag, ord) AS (
+            SELECT
+                p2.Id AS post_id,
+                CASE WHEN p2.Tags IS NULL THEN '' ELSE p2.Tags END AS tags_remaining,
+                NULL AS tag,
+                0 AS ord
+            FROM Posts p2
+            WHERE p2.PostTypeId = 1 AND p2.OwnerUserId IS NOT NULL
+            UNION ALL
+            SELECT
+                post_id,
+                CASE
+                    WHEN POSITION('><' IN tags_remaining) > 0 THEN SUBSTR(tags_remaining, POSITION('><' IN tags_remaining) + 2)
+                    ELSE ''
+                END,
+                CASE
+                    WHEN SUBSTR(tags_remaining, 1, 1) = '<' AND POSITION('><' IN tags_remaining) > 0 THEN SUBSTR(tags_remaining, 2, POSITION('><' IN tags_remaining) - 2)
+                    WHEN SUBSTR(tags_remaining, 1, 1) = '<' AND POSITION('><' IN tags_remaining) = 0 THEN SUBSTR(tags_remaining, 2, LENGTH(tags_remaining)-2)
+                    ELSE NULL
+                END,
+                ord + 1
+            FROM splitter
+            WHERE tags_remaining <> ''
+        )
+        SELECT post_id AS post_id, tag FROM splitter WHERE tag IS NOT NULL
+    ) s ON s.post_id = p.Id
+    WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL
+),
+TopTagsCounted AS (
+    SELECT
+        UserId,
+        Tag,
+        COUNT(*) AS PostsWithTag
+    FROM TopTags
+    GROUP BY UserId, Tag
+),
+TopUserTags AS (
+    SELECT
+        UserId,
+        Tag,
+        PostsWithTag,
+        ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY PostsWithTag DESC, Tag) AS TagRank
+    FROM TopTagsCounted
+),
+AcceptedAnswerStats AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(*) AS AcceptedAnswersCount,
+        AVG(p.Score) AS AvgAcceptedAnswerScore
+    FROM Posts p
+    WHERE p.PostTypeId = 2 AND EXISTS (
+        SELECT 1 FROM Posts q WHERE q.Id = p.ParentId AND q.AcceptedAnswerId = p.Id
+    )
+    GROUP BY p.OwnerUserId
+),
+UserVoteSummary AS (
+    SELECT
+        v.UserId,
+        COUNT(CASE WHEN vt.Name = 'UpMod' THEN 1 END) AS UpVotesGiven,
+        COUNT(CASE WHEN vt.Name = 'DownMod' THEN 1 END) AS DownVotesGiven,
+        COUNT(CASE WHEN vt.Name = 'Favorite' THEN 1 END) AS FavoritesGiven
+    FROM Votes v
+    LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.UserCreationDate,
+    ua.TotalPosts,
+    ua.QuestionsPosted,
+    ua.AnswersPosted,
+    ua.CommentsMade,
+    ua.BadgesEarned,
+    ua.AvgPostScore,
+    ua.LastPostDate,
+    ua.LastCommentDate,
+    COALESCE(aas.AcceptedAnswersCount, 0) AS AcceptedAnswersCount,
+    COALESCE(aas.AvgAcceptedAnswerScore, 0) AS AvgAcceptedAnswerScore,
+    COALESCE(uvs.UpVotesGiven, 0) AS UpVotesGiven,
+    COALESCE(uvs.DownVotesGiven, 0) AS DownVotesGiven,
+    COALESCE(uvs.FavoritesGiven, 0) AS FavoritesGiven,
+    STRING_AGG(tut.Tag, ', ') FILTER (WHERE tut.TagRank <= 3) AS Top3Tags
+FROM UserActivity ua
+LEFT JOIN AcceptedAnswerStats aas ON aas.UserId = ua.UserId
+LEFT JOIN UserVoteSummary uvs ON uvs.UserId = ua.UserId
+LEFT JOIN TopUserTags tut ON tut.UserId = ua.UserId AND tut.TagRank <= 3
+GROUP BY 
+    ua.UserId, ua.DisplayName, ua.Reputation, ua.UserCreationDate, ua.TotalPosts, 
+    ua.QuestionsPosted, ua.AnswersPosted, ua.CommentsMade, ua.BadgesEarned, ua.AvgPostScore, 
+    ua.LastPostDate, ua.LastCommentDate, aas.AcceptedAnswersCount, aas.AvgAcceptedAnswerScore,
+    uvs.UpVotesGiven, uvs.DownVotesGiven, uvs.FavoritesGiven
+ORDER BY ua.Reputation DESC
+LIMIT 50;

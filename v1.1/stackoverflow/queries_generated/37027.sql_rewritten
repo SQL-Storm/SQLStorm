@@ -1,0 +1,203 @@
+-- {"query": "37027.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 2537} 
+WITH RECURSIVE
+-- 1) Find top N active users by a composite engagement score in the last 2 years
+ActiveUsers AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate,
+         -- engagement score: weighted sum of posts, answers, comments, votes, badges, recent activity
+         (COALESCE(pq.QuestionCount,0)*5 + COALESCE(pa.AnswerCount,0)*3 + COALESCE(c.CommentCount,0)*1
+          + COALESCE(v.VoteCount,0)*0.5 + COALESCE(b.BadgeScore,0)*2
+          + CASE WHEN u.LastAccessDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' THEN 20 ELSE 0 END) AS EngagementScore,
+         GREATEST(COALESCE(u.LastAccessDate, '1970-01-01'::timestamp), COALESCE(u.CreationDate, '1970-01-01'::timestamp)) AS RecentActivity
+  FROM Users u
+  LEFT JOIN (
+      SELECT OwnerUserId, COUNT(*) AS QuestionCount
+      FROM Posts
+      WHERE PostTypeId = 1 AND CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+      GROUP BY OwnerUserId
+  ) pq ON pq.OwnerUserId = u.Id
+  LEFT JOIN (
+      SELECT OwnerUserId, COUNT(*) AS AnswerCount
+      FROM Posts
+      WHERE PostTypeId = 2 AND CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+      GROUP BY OwnerUserId
+  ) pa ON pa.OwnerUserId = u.Id
+  LEFT JOIN (
+      SELECT UserId, COUNT(*) AS CommentCount
+      FROM Comments
+      WHERE CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+      GROUP BY UserId
+  ) c ON c.UserId = u.Id
+  LEFT JOIN (
+      SELECT UserId, COUNT(*) AS VoteCount
+      FROM Votes
+      WHERE CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+      GROUP BY UserId
+  ) v ON v.UserId = u.Id
+  LEFT JOIN (
+      SELECT UserId, SUM(CASE Class WHEN 1 THEN 5 WHEN 2 THEN 3 WHEN 3 THEN 1 ELSE 0 END) AS BadgeScore
+      FROM Badges
+      WHERE Date >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+      GROUP BY UserId
+  ) b ON b.UserId = u.Id
+  WHERE u.Id IS NOT NULL
+),
+TopUsers AS (
+  SELECT UserId, DisplayName, Reputation, EngagementScore, RecentActivity,
+         ROW_NUMBER() OVER (ORDER BY EngagementScore DESC, Reputation DESC, RecentActivity DESC) AS rn
+  FROM ActiveUsers
+),
+SelectedUsers AS (
+  SELECT UserId, DisplayName, Reputation, EngagementScore
+  FROM TopUsers
+  WHERE rn <= 100
+),
+
+-- 2) For those top users, gather a rich set of post/answer/comment/vote/tag metrics and recent temporal series
+UserPostStats AS (
+  SELECT su.UserId,
+         COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS Questions,
+         COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS Answers,
+         AVG(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score END) AS AvgPostScore,
+         MAX(p.Score) AS MaxPostScore,
+         SUM(p.ViewCount) FILTER (WHERE p.PostTypeId = 1) AS TotalQuestionViews,
+         COUNT(DISTINCT unq.Tag) AS DistinctTagsUsed
+  FROM SelectedUsers su
+  LEFT JOIN Posts p ON p.OwnerUserId = su.UserId
+  LEFT JOIN LATERAL (
+      SELECT unnest(string_to_array(substring(p.Tags from 2 for greatest(length(p.Tags)-2,0)), '><')) AS Tag
+  ) unq ON p.Tags IS NOT NULL AND p.Tags <> ''
+  GROUP BY su.UserId
+),
+
+-- 3) Find each user's top answered questions (by score and views) and their average answer acceptance rate
+UserAnswerImpact AS (
+  SELECT su.UserId,
+         COUNT(a.Id) AS AnswerCountRecent,
+         AVG(CASE WHEN q.AcceptedAnswerId = a.Id THEN 1.0 ELSE 0 END) AS AcceptanceRate,
+         MAX(a.Score) AS MaxAnswerScore,
+         SUM(q.ViewCount) AS ViewsOnAnsweredQuestions,
+         COUNT(DISTINCT q.Id) FILTER (WHERE q.Score >= 10 OR q.ViewCount >= 1000) AS HighImpactAnswers
+  FROM SelectedUsers su
+  LEFT JOIN Posts a ON a.OwnerUserId = su.UserId AND a.PostTypeId = 2 AND a.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+  LEFT JOIN Posts q ON q.Id = a.ParentId
+  GROUP BY su.UserId
+),
+
+-- 4) Compute tag affinity per user (top 3 tags by usage)
+UserTagAffinity AS (
+  SELECT t.UserId, t.Tag, t.Cnt,
+         ROW_NUMBER() OVER (PARTITION BY t.UserId ORDER BY t.Cnt DESC, t.Tag) AS rk
+  FROM (
+    SELECT p.OwnerUserId AS UserId,
+           unnest(string_to_array(substring(p.Tags from 2 for greatest(length(p.Tags)-2,0)), '><')) AS Tag,
+           COUNT(*) AS Cnt
+    FROM Posts p
+    JOIN SelectedUsers su ON su.UserId = p.OwnerUserId
+    WHERE p.Tags IS NOT NULL AND p.Tags <> ''
+    GROUP BY p.OwnerUserId, Tag
+  ) t
+),
+
+TopTagsPerUser AS (
+  SELECT UserId,
+         max(CASE WHEN rk=1 THEN Tag END) AS TopTag1,
+         max(CASE WHEN rk=1 THEN Cnt END) AS TopTag1Count,
+         max(CASE WHEN rk=2 THEN Tag END) AS TopTag2,
+         max(CASE WHEN rk=2 THEN Cnt END) AS TopTag2Count,
+         max(CASE WHEN rk=3 THEN Tag END) AS TopTag3,
+         max(CASE WHEN rk=3 THEN Cnt END) AS TopTag3Count
+  FROM UserTagAffinity
+  WHERE rk <= 3
+  GROUP BY UserId
+),
+
+-- 5) For performance stress: construct a temporal activity histogram (monthly counts over last 24 months) pivoted as array per user
+UserMonthlyActivity AS (
+  SELECT su.UserId,
+         array_agg(coalesce(cnt,0) ORDER BY month_start) AS MonthlyCounts
+  FROM (
+    SELECT generate_series(date_trunc('month', cast('2024-10-01 12:34:56' as timestamp) - interval '23 months'),
+                           date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)), interval '1 month') AS month_start
+  ) m
+  CROSS JOIN SelectedUsers su
+  LEFT JOIN LATERAL (
+    SELECT date_trunc('month', CreationDate) AS month_start, COUNT(*) AS cnt
+    FROM (
+       SELECT CreationDate FROM Posts WHERE OwnerUserId = su.UserId AND CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '24 months'
+       UNION ALL
+       SELECT CreationDate FROM Comments WHERE UserId = su.UserId AND CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '24 months'
+       UNION ALL
+       SELECT CreationDate FROM Votes WHERE UserId = su.UserId AND CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '24 months'
+    ) allacts
+    GROUP BY date_trunc('month', CreationDate)
+  ) a ON a.month_start = m.month_start
+  GROUP BY su.UserId
+),
+
+-- 6) Find network effects: unique users who interacted with the selected user's posts (commenters, voters, answerers), top interactors
+UserNetwork AS (
+  SELECT su.UserId,
+         COUNT(DISTINCT CASE WHEN c.UserId IS NOT NULL THEN c.UserId END) AS DistinctCommenters,
+         COUNT(DISTINCT CASE WHEN v.UserId IS NOT NULL THEN v.UserId END) AS DistinctVoters,
+         COUNT(DISTINCT CASE WHEN a.OwnerUserId IS NOT NULL THEN a.OwnerUserId END) AS DistinctAnswerers
+  FROM SelectedUsers su
+  LEFT JOIN Posts p ON p.OwnerUserId = su.UserId
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+  GROUP BY su.UserId
+),
+
+-- 7) Identify controversial posts for the user: high score variance between votes and comments (simple heuristic)
+UserControversy AS (
+  SELECT su.UserId,
+         COUNT(p.Id) FILTER (WHERE p.Score >= 0 AND p.CommentCount >= 10 AND EXISTS (
+             SELECT 1 FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3 -- downvotes exist
+         )) AS ControversialPosts
+  FROM SelectedUsers su
+  LEFT JOIN Posts p ON p.OwnerUserId = su.UserId
+  GROUP BY su.UserId
+),
+
+-- 8) Combine everything into an analytic row per user with derived ratios and rank metrics
+UserAnalytics AS (
+  SELECT su.UserId,
+         su.DisplayName,
+         su.Reputation,
+         su.EngagementScore,
+         ups.Questions, ups.Answers, ups.AvgPostScore, ups.MaxPostScore, ups.TotalQuestionViews, ups.DistinctTagsUsed,
+         uai.AnswerCountRecent, uai.AcceptanceRate, uai.MaxAnswerScore, uai.ViewsOnAnsweredQuestions, uai.HighImpactAnswers,
+         tt.TopTag1, tt.TopTag1Count, tt.TopTag2, tt.TopTag2Count, tt.TopTag3, tt.TopTag3Count,
+         uma.MonthlyCounts,
+         un.DistinctCommenters, un.DistinctVoters, un.DistinctAnswerers,
+         uc.ControversialPosts,
+         -- derived metrics
+         (CASE WHEN ups.Answers > 0 THEN ROUND(uai.ViewsOnAnsweredQuestions::numeric / ups.Answers,2) ELSE 0 END) AS AvgViewsPerAnswer,
+         (CASE WHEN ups.Questions > 0 THEN ROUND(ups.TotalQuestionViews::numeric / ups.Questions,2) ELSE 0 END) AS AvgViewsPerQuestion,
+         (CASE WHEN (un.DistinctCommenters + un.DistinctVoters + un.DistinctAnswerers) > 0
+               THEN ROUND((un.DistinctCommenters::numeric) / (GREATEST(un.DistinctVoters,1)),2) ELSE 0 END) AS CommenterToVoterRatio
+  FROM SelectedUsers su
+  LEFT JOIN UserPostStats ups ON ups.UserId = su.UserId
+  LEFT JOIN UserAnswerImpact uai ON uai.UserId = su.UserId
+  LEFT JOIN TopTagsPerUser tt ON tt.UserId = su.UserId
+  LEFT JOIN UserMonthlyActivity uma ON uma.UserId = su.UserId
+  LEFT JOIN UserNetwork un ON un.UserId = su.UserId
+  LEFT JOIN UserControversy uc ON uc.UserId = su.UserId
+)
+
+-- Final: return detailed analytics including JSON-like nested aggregations and order by composite score
+SELECT ua.*,
+       -- compute a final composite rank score for benchmarking sort/group performance
+       ROUND(
+         (ua.EngagementScore * 0.4
+          + COALESCE(ua.AvgPostScore,0) * 3
+          + COALESCE(ua.AcceptanceRate,0) * 50
+          + COALESCE(ua.HighImpactAnswers,0) * 10
+          + (COALESCE(ua.TopTag1Count,0) + COALESCE(ua.TopTag2Count,0) + COALESCE(ua.TopTag3Count,0)) * 2
+          - COALESCE(ua.ControversialPosts,0) * 5)::numeric,2) AS CompositeRankScore
+FROM UserAnalytics ua
+ORDER BY CompositeRankScore DESC, ua.EngagementScore DESC, ua.Reputation DESC
+LIMIT 100;

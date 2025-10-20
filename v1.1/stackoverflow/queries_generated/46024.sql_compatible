@@ -1,0 +1,143 @@
+WITH RECURSIVE user_reputation_tiers AS (
+    SELECT 
+        Id,
+        DisplayName,
+        Reputation,
+        CreationDate,
+        CASE 
+            WHEN Reputation >= 100000 THEN 'Elite'
+            WHEN Reputation >= 25000 THEN 'Expert'
+            WHEN Reputation >= 10000 THEN 'Advanced'
+            WHEN Reputation >= 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END AS tier
+    FROM Users
+    WHERE Reputation > 0
+),
+question_answer_graph AS (
+    SELECT 
+        q.Id as question_id,
+        q.OwnerUserId as question_owner,
+        q.Score as question_score,
+        q.ViewCount,
+        q.CreationDate as question_date,
+        a.Id as answer_id,
+        a.OwnerUserId as answer_owner,
+        a.Score as answer_score,
+        a.CreationDate as answer_date,
+        CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END as is_accepted,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600 as hours_to_answer
+    FROM Posts q
+    LEFT JOIN Posts a ON q.Id = a.ParentId AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1 
+        AND q.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '3' YEAR
+),
+tag_expertise AS (
+    SELECT 
+        p.OwnerUserId,
+        t.tag,
+        COUNT(DISTINCT p.Id) as post_count,
+        AVG(p.Score) as avg_score,
+        SUM(p.ViewCount) as total_views,
+        COUNT(DISTINCT CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN p.Id END) as accepted_answers
+    FROM Posts p,
+    LATERAL (SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) as tag) t
+    WHERE p.PostTypeId = 1 
+        AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId, t.tag
+    HAVING COUNT(DISTINCT p.Id) >= 5
+),
+user_interaction_network AS (
+    SELECT 
+        qag.question_owner as user1,
+        qag.answer_owner as user2,
+        COUNT(*) as interaction_count,
+        AVG(qag.answer_score) as avg_answer_quality,
+        COUNT(CASE WHEN qag.is_accepted = 1 THEN 1 END) as accepted_count,
+        AVG(qag.hours_to_answer) as avg_response_time
+    FROM question_answer_graph qag
+    WHERE qag.question_owner IS NOT NULL 
+        AND qag.answer_owner IS NOT NULL
+        AND qag.question_owner != qag.answer_owner
+    GROUP BY qag.question_owner, qag.answer_owner
+    HAVING COUNT(*) >= 3
+),
+badge_progression AS (
+    SELECT 
+        b.UserId,
+        b.Class,
+        COUNT(*) as badge_count,
+        MIN(b.Date) as first_badge_date,
+        MAX(b.Date) as last_badge_date,
+        COUNT(DISTINCT b.Name) as unique_badges,
+        COUNT(CASE WHEN b.TagBased = true THEN 1 END) as tag_based_badges
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+voting_patterns AS (
+    SELECT 
+        v.UserId,
+        v.VoteTypeId,
+        vt.Name as vote_type,
+        COUNT(*) as vote_count,
+        DATE_TRUNC('month', v.CreationDate) as vote_month
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE v.UserId IS NOT NULL
+        AND v.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '2' YEAR
+    GROUP BY v.UserId, v.VoteTypeId, vt.Name, DATE_TRUNC('month', v.CreationDate)
+)
+SELECT 
+    urt.DisplayName,
+    urt.tier,
+    urt.Reputation,
+    COALESCE(te.tags_mastered, 0) as tags_mastered,
+    COALESCE(te.total_tag_posts, 0) as total_tag_posts,
+    COALESCE(te.avg_tag_score, 0) as avg_tag_score,
+    COALESCE(uin.outgoing_interactions, 0) as answers_given_to_others,
+    COALESCE(uin.incoming_interactions, 0) as answers_received_from_others,
+    COALESCE(uin.acceptance_rate, 0) as answer_acceptance_rate,
+    COALESCE(bp_gold.badge_count, 0) as gold_badges,
+    COALESCE(bp_silver.badge_count, 0) as silver_badges,
+    COALESCE(bp_bronze.badge_count, 0) as bronze_badges,
+    COALESCE(vp.upvotes_given, 0) as upvotes_given,
+    COALESCE(vp.downvotes_given, 0) as downvotes_given,
+    COALESCE(vp.voting_months_active, 0) as voting_months_active,
+    RANK() OVER (PARTITION BY urt.tier ORDER BY urt.Reputation DESC) as rank_in_tier,
+    PERCENT_RANK() OVER (ORDER BY urt.Reputation) as reputation_percentile
+FROM user_reputation_tiers urt
+LEFT JOIN (
+    SELECT 
+        OwnerUserId,
+        COUNT(DISTINCT tag) as tags_mastered,
+        SUM(post_count) as total_tag_posts,
+        AVG(avg_score) as avg_tag_score
+    FROM tag_expertise
+    GROUP BY OwnerUserId
+) te ON urt.Id = te.OwnerUserId
+LEFT JOIN (
+    SELECT 
+        user1,
+        COUNT(DISTINCT user2) as outgoing_interactions,
+        AVG(avg_answer_quality) as avg_quality,
+        CASE WHEN SUM(interaction_count) = 0 THEN NULL
+             ELSE SUM(accepted_count) * 1.0 / SUM(interaction_count)
+        END as acceptance_rate
+    FROM user_interaction_network
+    GROUP BY user1
+) uin ON urt.Id = uin.user1
+LEFT JOIN badge_progression bp_gold ON urt.Id = bp_gold.UserId AND bp_gold.Class = 1
+LEFT JOIN badge_progression bp_silver ON urt.Id = bp_silver.UserId AND bp_silver.Class = 2
+LEFT JOIN badge_progression bp_bronze ON urt.Id = bp_bronze.UserId AND bp_bronze.Class = 3
+LEFT JOIN (
+    SELECT 
+        UserId,
+        SUM(CASE WHEN VoteTypeId = 2 THEN vote_count ELSE 0 END) as upvotes_given,
+        SUM(CASE WHEN VoteTypeId = 3 THEN vote_count ELSE 0 END) as downvotes_given,
+        COUNT(DISTINCT vote_month) as voting_months_active
+    FROM voting_patterns
+    GROUP BY UserId
+) vp ON urt.Id = vp.UserId
+WHERE urt.Reputation >= 1000
+ORDER BY urt.Reputation DESC, te.tags_mastered DESC
+LIMIT 1000;

@@ -1,0 +1,91 @@
+WITH QuestionAnswers AS (
+    SELECT 
+        q.Id AS QuestionId, 
+        q.CreationDate AS QDate, 
+        MIN(a.CreationDate) AS FirstAnswerDate, 
+        q.Tags,
+        COUNT(DISTINCT v.Id) AS UpvoteCount,
+        AVG(c.Score) AS AvgCommentScore
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN Votes v ON v.PostId = q.Id AND v.VoteTypeId = 2
+    LEFT JOIN Comments c ON c.PostId = q.Id
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.CreationDate, q.Tags
+    HAVING MIN(a.CreationDate) IS NOT NULL
+),
+TagStats AS (
+    SELECT 
+        t.tag, 
+        AVG(EXTRACT(EPOCH FROM (qa.FirstAnswerDate - qa.QDate)) / 60) AS AvgMinutesToAnswer, 
+        COUNT(*) AS QuestionCount,
+        SUM(qa.UpvoteCount) AS TotalUpvotes,
+        AVG(qa.AvgCommentScore) AS OverallAvgCommentScore,
+        COUNT(DISTINCT ph.Id) AS TotalEdits
+    FROM QuestionAnswers qa,
+         LATERAL (
+           SELECT unnest(string_to_array(substring(qa.Tags FROM 2 FOR (char_length(qa.Tags) - 2)), '><')) AS tag
+         ) t
+    LEFT JOIN PostHistory ph ON ph.PostId = qa.QuestionId AND ph.PostHistoryTypeId IN (4, 5, 6)
+    GROUP BY t.tag
+    HAVING COUNT(*) > 1000
+),
+RankedTags AS (
+    SELECT 
+        ts.*,
+        ROW_NUMBER() OVER (ORDER BY AvgMinutesToAnswer ASC) AS Rank
+    FROM TagStats ts
+),
+AnswersInTags AS (
+    -- derive answers with tags by expanding question tags for each answer
+    SELECT
+        qa.QuestionId,
+        tag.tag AS tag,
+        a.Id AS AnswerId,
+        a.OwnerUserId
+    FROM QuestionAnswers qa
+    JOIN Posts a ON a.ParentId = qa.QuestionId AND a.PostTypeId = 2
+    CROSS JOIN LATERAL (
+      SELECT unnest(string_to_array(substring(qa.Tags FROM 2 FOR (char_length(qa.Tags) - 2)), '><')) AS tag
+    ) tag
+)
+SELECT 
+    rt.tag, 
+    rt.AvgMinutesToAnswer, 
+    rt.QuestionCount, 
+    rt.TotalUpvotes, 
+    rt.OverallAvgCommentScore, 
+    rt.TotalEdits,
+    u.DisplayName AS TopContributor,
+    COALESCE(b.BadgeCount, 0) AS BadgeCount,
+    links.LinkCount
+FROM RankedTags rt
+JOIN (
+    SELECT 
+        tag, 
+        OwnerUserId, 
+        COUNT(*) AS Answers,
+        ROW_NUMBER() OVER (PARTITION BY tag ORDER BY COUNT(*) DESC, OwnerUserId) AS rn
+    FROM AnswersInTags ait
+    GROUP BY tag, OwnerUserId
+) top_users ON top_users.tag = rt.tag AND top_users.rn = 1
+JOIN Users u ON top_users.OwnerUserId = u.Id
+LEFT JOIN (
+    SELECT 
+        UserId, 
+        COUNT(*) AS BadgeCount
+    FROM Badges
+    WHERE Class = 1
+    GROUP BY UserId
+) b ON b.UserId = u.Id
+LEFT JOIN LATERAL (
+    SELECT COUNT(*) AS LinkCount
+    FROM PostLinks pl
+    WHERE pl.PostId IN (SELECT QuestionId FROM QuestionAnswers q2
+                        CROSS JOIN LATERAL (
+                          SELECT unnest(string_to_array(substring(q2.Tags FROM 2 FOR (char_length(q2.Tags) - 2)), '><')) AS tag
+                        ) t2
+                        WHERE t2.tag = rt.tag)
+) links ON true
+WHERE rt.Rank <= 10
+ORDER BY rt.Rank;

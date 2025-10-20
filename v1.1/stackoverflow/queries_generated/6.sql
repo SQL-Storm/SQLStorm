@@ -1,4 +1,4 @@
--- {"query": "6.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-3.5-turbo", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2003, "output_tokens": 146} 
+-- {"query": "6.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-3.5-turbo", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2003, "output_tokens": 146} 
 WITH RecursiveCTE AS (
     SELECT P1.Id AS OriginalPostId, P2.Id AS RelatedPostId, 0 AS Level
     FROM Posts P1

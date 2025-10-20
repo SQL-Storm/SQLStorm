@@ -1,0 +1,92 @@
+-- {"query": "51026.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2129, "output_tokens": 934} 
+
+WITH popular_tags AS (
+    SELECT t.TagName, COUNT(pt.Id) as post_count
+    FROM Tags t
+    JOIN Posts pt ON position(t.TagName IN pt.Tags) > 0
+    WHERE pt.PostTypeId = 1
+    GROUP BY t.TagName
+    HAVING COUNT(pt.Id) > 100
+),
+active_users AS (
+    SELECT u.Id, u.Reputation, u.CreationDate
+    FROM Users u
+    WHERE u.Reputation > 1000
+    AND u.CreationDate > NOW() - INTERVAL '1 year'
+),
+user_activity AS (
+    SELECT au.Id as user_id, 
+           COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) as questions_asked,
+           COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) as answers_given,
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) as upvotes_received,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) as downvotes_received
+    FROM active_users au
+    LEFT JOIN Posts p ON p.OwnerUserId = au.Id 
+                      AND p.CreationDate > NOW() - INTERVAL '6 months'
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY au.Id, au.Reputation, au.CreationDate
+),
+question_engagement AS (
+    SELECT p.Id as question_id,
+           p.Title,
+           p.Score,
+           p.ViewCount,
+           p.AnswerCount,
+           p.CommentCount,
+           p.CreationDate,
+           p.OwnerUserId,
+           AVG(c.Score) as avg_comment_score,
+           COUNT(DISTINCT pl.RelatedPostId) as external_links,
+           COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 END) as close_votes,
+           COUNT(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 END) as reopen_votes
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    WHERE p.PostTypeId = 1
+    AND p.CreationDate > NOW() - INTERVAL '3 months'
+    AND p.Score > 0
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, 
+             p.CommentCount, p.CreationDate, p.OwnerUserId
+),
+top_answers AS (
+    SELECT p.Id as answer_id,
+           p.ParentId as question_id,
+           p.Score as answer_score,
+           p.CreationDate,
+           p.OwnerUserId,
+           ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) as answer_rank
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    AND p.CreationDate > NOW() - INTERVAL '3 months'
+    AND p.Score >= 0
+)
+SELECT 
+    pt.TagName,
+    qa.question_id,
+    qa.Title,
+    qa.Score as question_score,
+    qa.ViewCount,
+    qa.AnswerCount,
+    ta.answer_score as top_answer_score,
+    ta.answer_id as top_answer_id,
+    ua.Reputation as asker_reputation,
+    ua.questions_asked,
+    ua.answers_given,
+    ua.upvotes_received,
+    ROUND((qa.upvotes_received - qa.downvotes_received)::numeric / NULLIF(qa.upvotes_received + qa.downvotes_received, 0) * 100, 2) as vote_ratio,
+    CASE 
+        WHEN qa.close_votes > 0 THEN 'Closed'
+        WHEN qa.AnswerCount = 0 THEN 'Unanswered'
+        WHEN ta.answer_score >= 10 THEN 'Highly Answered'
+        ELSE 'Moderately Answered'
+    END as engagement_level,
+    DENSE_RANK() OVER (ORDER BY qa.ViewCount DESC, qa.Score DESC) as popularity_rank
+FROM question_engagement qa
+JOIN popular_tags pt ON position(pt.TagName IN qa.Tags) > 0
+LEFT JOIN top_answers ta ON ta.question_id = qa.question_id AND ta.answer_rank = 1
+LEFT JOIN user_activity ua ON ua.user_id = qa.OwnerUserId
+WHERE qa.ViewCount > 1000
+  AND (qa.AnswerCount > 0 OR qa.close_votes > 0)
+ORDER BY popularity_rank ASC, qa.CreationDate DESC
+LIMIT 50;

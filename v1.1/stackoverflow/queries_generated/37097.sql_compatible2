@@ -1,0 +1,175 @@
+WITH
+QuestionBase AS (
+  SELECT p.Id AS QuestionId,
+         p.Title,
+         p.CreationDate,
+         p.Score,
+         p.ViewCount,
+         p.AnswerCount,
+         p.CommentCount,
+         p.OwnerUserId,
+         p.AcceptedAnswerId,
+         COALESCE(p.Tags, '') AS TagsRaw
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 years'
+),
+ExplodedTags AS (
+  SELECT q.*,
+         TRIM(BOTH '<>' FROM tag) AS Tag
+  FROM QuestionBase q,
+       unnest(string_to_array(substring(q.TagsRaw FROM 2 FOR greatest(length(q.TagsRaw)-2,0)), '><')) AS tag
+),
+TagStats AS (
+  SELECT et.Tag,
+         count(*) AS QuestionCount,
+         avg(et.Score) AS AvgScore,
+         percentile_cont(0.5) WITHIN GROUP (ORDER BY et.Score) AS MedianScore,
+         sum(et.ViewCount) AS TotalViews,
+         sum(et.AnswerCount) AS TotalAnswers
+  FROM ExplodedTags et
+  GROUP BY et.Tag
+  HAVING count(*) >= 50
+),
+UserActivity AS (
+  SELECT u.Id AS UserId,
+         u.Reputation,
+         u.CreationDate,
+         u.DisplayName,
+         sum(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+         sum(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersGiven,
+         sum(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesCast,
+         sum(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesCast,
+         coalesce(sum(CASE WHEN a.OwnerUserId = u.Id AND q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END),0) AS AcceptedAsAnswerCount,
+         coalesce(sum(CASE WHEN a.OwnerUserId = u.Id THEN 1 ELSE 0 END),0) AS TotalAnswersByUser,
+         CASE WHEN sum(CASE WHEN a.OwnerUserId = u.Id THEN 1 ELSE 0 END) = 0 THEN 0
+              ELSE coalesce(sum(CASE WHEN a.OwnerUserId = u.Id AND q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END),0)
+                   / NULLIF(sum(CASE WHEN a.OwnerUserId = u.Id THEN 1 ELSE 0 END),0)
+         END AS AcceptedAnswerRatio,
+         max(p.LastActivityDate) AS LastActivity
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Posts a ON a.PostTypeId = 2 AND a.OwnerUserId = u.Id
+  LEFT JOIN Posts q ON q.PostTypeId = 1 AND q.AcceptedAnswerId = a.Id
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  GROUP BY u.Id, u.Reputation, u.CreationDate, u.DisplayName
+),
+UserTagExpertise AS (
+  SELECT ua.Id AS UserId,
+         et.Tag,
+         count(a.Id) AS AnswersForTag,
+         avg(a.Score) AS AvgAnswerScoreForTag,
+         max(a.CreationDate) AS LastAnsweredAt
+  FROM ExplodedTags et
+  JOIN Posts q ON q.Id = et.QuestionId
+  JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+  JOIN Users ua ON ua.Id = a.OwnerUserId
+  GROUP BY ua.Id, et.Tag
+  HAVING count(a.Id) >= 5
+),
+TopExpertsPerTag AS (
+  SELECT ute.Tag,
+         ute.UserId,
+         ute.AnswersForTag,
+         ute.AvgAnswerScoreForTag,
+         ua.Reputation,
+         ua.AcceptedAnswerRatio,
+         row_number() OVER (PARTITION BY ute.Tag ORDER BY ute.AnswersForTag DESC, ute.AvgAnswerScoreForTag DESC, ua.Reputation DESC) AS RankInTag
+  FROM UserTagExpertise ute
+  JOIN UserActivity ua ON ua.UserId = ute.UserId
+),
+DirectLinks AS (
+  SELECT pl.PostId, pl.RelatedPostId, pl.LinkTypeId
+  FROM PostLinks pl
+  WHERE pl.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 years'
+),
+TwoHopLinks AS (
+  SELECT d1.PostId AS SourcePost,
+         d2.RelatedPostId AS TwoHopTarget,
+         count(*) AS TwoHopPaths
+  FROM DirectLinks d1
+  JOIN DirectLinks d2 ON d1.RelatedPostId = d2.PostId
+  WHERE d1.PostId <> d2.RelatedPostId
+  GROUP BY d1.PostId, d2.RelatedPostId
+  HAVING count(*) >= 2
+),
+Hotness AS (
+  SELECT p.Id,
+         p.Title,
+         p.CreationDate,
+         p.Score,
+         p.ViewCount,
+         p.CommentCount,
+         p.AnswerCount,
+         p.OwnerUserId,
+         (p.Score * 3 + COALESCE(p.ViewCount,0) * 1.0/100 + COALESCE(p.CommentCount,0)*2 + COALESCE(p.AnswerCount,0)*5)
+           / greatest(1, extract(epoch from (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate))/3600) AS HotnessScore
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+),
+RecentHistoryEdits AS (
+  SELECT ph.PostId,
+         ph.UserId AS EditorUserId,
+         ph.PostHistoryTypeId,
+         ph.CreationDate AS EditDate,
+         ph.Comment AS EditComment,
+         row_number() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+  FROM PostHistory ph
+  WHERE ph.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+),
+TopTagQuestions AS (
+  SELECT ts.Tag, q.*
+  FROM TagStats ts
+  JOIN ExplodedTags et ON et.Tag = ts.Tag
+  JOIN Posts q ON q.Id = et.QuestionId
+  WHERE q.PostTypeId = 1
+    AND q.Score >= (SELECT percentile_cont(0.75) WITHIN GROUP (ORDER BY p.Score) FROM Posts p WHERE p.PostTypeId = 1)
+),
+Final AS (
+  SELECT tt.Tag,
+         tt.Id AS QuestionId,
+         tt.Title,
+         tt.CreationDate,
+         tt.Score,
+         tt.ViewCount,
+         tt.AnswerCount,
+         tt.CommentCount,
+         ts.QuestionCount AS TagQuestionCount,
+         ts.AvgScore AS TagAvgScore,
+         ts.MedianScore AS TagMedianScore,
+         he.HotnessScore,
+         (SELECT string_agg(format('%s(%s answers, rep=%s, acc=%.2f)', u.DisplayName, te.AnswersForTag, ua.Reputation, ua.AcceptedAnswerRatio), '; ')
+          FROM TopExpertsPerTag te
+          JOIN Users u ON u.Id = te.UserId
+          JOIN UserActivity ua ON ua.UserId = te.UserId
+          WHERE te.Tag = tt.Tag AND te.RankInTag <= 3
+         ) AS TopExpertsSummary,
+         th.TwoHopTargets,
+         ph.EditorsLastYear,
+         row_number() OVER (PARTITION BY tt.Tag ORDER BY he.HotnessScore DESC NULLS LAST) AS RankInTagByHotness,
+         dense_rank() OVER (ORDER BY ts.QuestionCount DESC) AS TagPopularityRank
+  FROM TopTagQuestions tt
+  JOIN TagStats ts ON ts.Tag = tt.Tag
+  LEFT JOIN Hotness he ON he.Id = tt.Id
+  LEFT JOIN LATERAL (
+     SELECT count(*) AS TwoHopTargets
+     FROM TwoHopLinks thl
+     WHERE thl.SourcePost = tt.Id
+  ) th ON true
+  LEFT JOIN LATERAL (
+     SELECT string_agg(distinct u.DisplayName || ':' || to_char(rnph.EditDate, 'YYYY-MM-DD'), ', ') AS EditorsLastYear
+     FROM (
+       SELECT ph.PostId, ph.UserId, ph.CreationDate AS EditDate, row_number() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rnph
+       FROM PostHistory ph
+       WHERE ph.PostId = tt.Id
+         AND ph.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+     ) ph
+     JOIN Users u ON u.Id = ph.UserId
+     WHERE ph.rnph <= 5
+  ) ph ON true
+)
+SELECT *
+FROM Final
+ORDER BY TagPopularityRank, Tag, RankInTagByHotness
+LIMIT 100;

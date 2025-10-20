@@ -1,0 +1,143 @@
+WITH
+RecentAnswers AS (
+  SELECT p.Id, p.ParentId AS QuestionId, p.OwnerUserId, p.CreationDate, p.Score, p.Tags
+  FROM Posts p
+  WHERE p.PostTypeId = 2
+    AND p.OwnerUserId IS NOT NULL
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+),
+ExplodedTags AS (
+  SELECT ra.*, trim(tg) AS Tag
+  FROM RecentAnswers ra,
+       regexp_split_to_table(
+         CASE WHEN ra.Tags IS NULL THEN '' ELSE substring(ra.Tags, 2, char_length(ra.Tags)-2) END,
+         '><'
+       ) AS tg
+  WHERE ra.Tags IS NOT NULL
+),
+UserMetrics AS (
+  SELECT
+    e.OwnerUserId AS UserId,
+    count(*) AS AnswerCount,
+    avg(e.Score) AS AvgAnswerScore,
+    count(DISTINCT e.Tag) AS DistinctTagCount,
+    avg(e.Score - coalesce(q.Score,0)) AS AvgAnswerMinusQuestionScore,
+    min(e.CreationDate) AS FirstRecentAnswer,
+    max(e.CreationDate) AS LastRecentAnswer
+  FROM ExplodedTags e
+  LEFT JOIN Posts q ON e.QuestionId = q.Id
+  GROUP BY e.OwnerUserId
+),
+TopCandidates AS (
+  SELECT um.*,
+    (
+      ( (CAST(um.AnswerCount AS double precision) - avg_uc.avg_cnt)/NULLIF(avg_uc.std_cnt,0) ) * 0.5
+    + ( (um.AvgAnswerScore - avg_uc.avg_avgscore)/NULLIF(avg_uc.std_avgscore,0) ) * 0.3
+    + ( (um.DistinctTagCount - avg_uc.avg_tags)/NULLIF(avg_uc.std_tags,0) ) * 0.2
+    ) AS CompositeZ
+  FROM UserMetrics um,
+  (
+    SELECT
+      avg(AnswerCount) AS avg_cnt,
+      stddev_pop(AnswerCount) AS std_cnt,
+      avg(AvgAnswerScore) AS avg_avgscore,
+      stddev_pop(AvgAnswerScore) AS std_avgscore,
+      avg(DistinctTagCount) AS avg_tags,
+      stddev_pop(DistinctTagCount) AS std_tags
+    FROM UserMetrics
+  ) avg_uc
+  GROUP BY um.UserId, um.AnswerCount, um.AvgAnswerScore, um.DistinctTagCount, um.AvgAnswerMinusQuestionScore, um.FirstRecentAnswer, um.LastRecentAnswer, avg_uc.avg_cnt, avg_uc.std_cnt, avg_uc.avg_avgscore, avg_uc.std_avgscore, avg_uc.avg_tags, avg_uc.std_tags
+),
+SelectedUsers AS (
+  SELECT * FROM TopCandidates
+  ORDER BY CompositeZ DESC NULLS LAST
+  LIMIT 50
+),
+UserContribs AS (
+  SELECT
+    su.UserId,
+    u.DisplayName,
+    a.Id AS AnswerId,
+    a.CreationDate  AS AnswerDate,
+    a.Score AS AnswerScore,
+    q.Id AS QuestionId,
+    q.Title AS QuestionTitle,
+    q.Score AS QuestionScore,
+    q.ViewCount AS QuestionViews,
+    q.Tags AS QuestionTags,
+    row_number() OVER (PARTITION BY su.UserId ORDER BY a.Score DESC, a.CreationDate DESC) AS AnswerRank
+  FROM SelectedUsers su
+  JOIN Users u ON u.Id = su.UserId
+  JOIN Posts a ON a.PostTypeId = 2 AND a.OwnerUserId = su.UserId AND a.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+  LEFT JOIN Posts q ON a.ParentId = q.Id
+),
+TopAnswersPerUser AS (
+  SELECT * FROM UserContribs WHERE AnswerRank <= 5
+),
+QuestionTagAgg AS (
+  SELECT q.Id AS QuestionId,
+    q.Title,
+    q.Tags,
+    q.Score AS QuestionScore,
+    q.ViewCount,
+    count(distinct a.OwnerUserId) FILTER (WHERE a.PostTypeId = 2) AS AnswererCount,
+    string_agg(distinct u.DisplayName, ', ' ORDER BY u.Reputation DESC) FILTER (WHERE u.Id IS NOT NULL) AS AnswererNames
+  FROM Posts q
+  LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2 AND a.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+  LEFT JOIN Users u ON u.Id = a.OwnerUserId
+  WHERE q.PostTypeId = 1
+  GROUP BY q.Id, q.Title, q.Tags, q.Score, q.ViewCount
+),
+RecentBadges AS (
+  SELECT b.UserId, b.Name, b.Class, b.Date
+  FROM Badges b
+  WHERE b.Date >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+    AND b.Class IN (1,2)
+    AND b.UserId IN (SELECT UserId FROM SelectedUsers)
+),
+AnswerVoteStats AS (
+  SELECT v.PostId AS AnswerId,
+    sum(case when vt.Name = 'UpMod' then 1 else 0 end) AS UpVotes,
+    sum(case when vt.Name = 'DownMod' then 1 else 0 end) AS DownVotes
+  FROM Votes v
+  LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+  WHERE v.PostId IN (SELECT AnswerId FROM TopAnswersPerUser)
+  GROUP BY v.PostId
+)
+SELECT
+  su.UserId,
+  u.DisplayName,
+  su.AnswerCount,
+  round(CAST(su.AvgAnswerScore AS numeric),3) AS AvgAnswerScore,
+  su.DistinctTagCount,
+  round(CAST(su.AvgAnswerMinusQuestionScore AS numeric),3) AS AvgAnswerMinusQuestionScore,
+  su.FirstRecentAnswer,
+  su.LastRecentAnswer,
+  ta.AnswerId,
+  ta.AnswerDate,
+  ta.AnswerScore,
+  ta.QuestionId,
+  left(ta.QuestionTitle,200) AS QuestionTitleSnippet,
+  qta.QuestionViews,
+  qta.AnswererCount,
+  qta.AnswererNames,
+  rb.Name AS RecentBadgeName,
+  rb.Class AS RecentBadgeClass,
+  rb.Date AS RecentBadgeDate,
+  avs.UpVotes,
+  avs.DownVotes,
+  (
+    COALESCE(qta.QuestionViews,0) * CAST(0.0001 AS double precision)
+    + ta.AnswerScore * 0.5
+    + COALESCE(u.Reputation,0) * CAST(0.00001 AS double precision)
+  ) AS HeuristicImpactScore
+FROM SelectedUsers su
+JOIN Users u ON u.Id = su.UserId
+LEFT JOIN TopAnswersPerUser ta ON ta.UserId = su.UserId
+LEFT JOIN QuestionTagAgg qta ON qta.QuestionId = ta.QuestionId
+LEFT JOIN LATERAL (
+  SELECT b.* FROM RecentBadges b WHERE b.UserId = su.UserId ORDER BY b.Date DESC LIMIT 1
+) rb ON true
+LEFT JOIN AnswerVoteStats avs ON avs.AnswerId = ta.AnswerId
+ORDER BY su.CompositeZ DESC NULLS LAST, HeuristicImpactScore DESC NULLS LAST, ta.AnswerScore DESC NULLS LAST
+LIMIT 500;

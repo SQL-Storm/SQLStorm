@@ -1,0 +1,61 @@
+WITH ActiveUsers AS (
+    SELECT 
+        U.Id, 
+        U.DisplayName, 
+        U.Reputation, 
+        U.CreationDate,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswersProvided,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesReceived,
+        MAX(B.Class) AS HighestBadgeClass,
+        STRING_AGG(DISTINCT T.TagName, '; ') AS TopTags
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    LEFT JOIN Badges B ON U.Id = B.UserId AND B.Date > CAST('2024-10-01' AS date) - INTERVAL '2 years'
+    LEFT JOIN (
+        SELECT P_inner.Id AS PostId, unnest(string_to_array(substring(P_inner.Tags, 2, length(P_inner.Tags)-2), '><')) AS Tag
+        FROM Posts P_inner
+        WHERE P_inner.Tags IS NOT NULL
+    ) PTags ON P.Id = PTags.PostId AND P.PostTypeId = 1
+    LEFT JOIN Tags T ON PTags.Tag = T.TagName
+    WHERE 
+        U.Reputation > 5000
+        AND P.CreationDate BETWEEN DATE '2015-01-01' AND DATE '2023-12-31'
+        AND (P.Score > 50 OR P.ViewCount > 10000)
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate
+    HAVING COUNT(DISTINCT CASE WHEN P.PostTypeId IS NOT NULL THEN P.Id END) > 20 
+       AND COUNT(DISTINCT V.Id) > 100
+)
+SELECT 
+    AU.Id,
+    AU.DisplayName,
+    AU.Reputation,
+    AU.CreationDate,
+    AU.QuestionsAsked,
+    AU.AnswersProvided,
+    AU.TotalComments,
+    AU.UpvotesReceived,
+    AU.DownvotesReceived,
+    AU.HighestBadgeClass,
+    AU.TopTags,
+    (SELECT AVG(AnswerCount::numeric) FROM Posts WHERE OwnerUserId = AU.Id AND PostTypeId = 1) AS AvgAnswersPerQuestion,
+    RANK() OVER (ORDER BY (AU.QuestionsAsked * 3 + AU.AnswersProvided * 2 + AU.TotalComments) DESC) AS EngagementRank,
+    (SELECT COUNT(*) FROM PostHistory PH 
+     WHERE PH.UserId = AU.Id AND PH.PostHistoryTypeId IN (2,5,8) 
+     AND PH.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '1 year') AS RecentEdits,
+    (SELECT json_agg(row_to_json(r))
+     FROM (
+       SELECT PL.RelatedPostId AS RelatedPostId, LT.Name AS LinkType
+       FROM PostLinks PL 
+       JOIN LinkTypes LT ON PL.LinkTypeId = LT.Id
+       WHERE PL.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = AU.Id)
+     ) r
+    ) AS PostRelations
+FROM ActiveUsers AU
+WHERE AU.HighestBadgeClass IS NOT NULL OR AU.DownvotesReceived < AU.UpvotesReceived * 0.1
+ORDER BY EngagementRank, AU.Reputation DESC
+LIMIT 250;

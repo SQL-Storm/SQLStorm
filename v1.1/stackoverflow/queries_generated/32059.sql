@@ -1,0 +1,61 @@
+-- {"query": "32059.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4o", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 374} 
+
+WITH RecursionsCTE AS (
+    SELECT 
+        P.Id AS PostId,
+        P.Title AS PostTitle,
+        P.Score AS InitialScore,
+        CASE 
+            WHEN P.AcceptedAnswerId IS NOT NULL THEN 1 
+            ELSE 0 
+        END AS HasAcceptedAnswer,
+        CommentsCount = (
+            SELECT COUNT(*) 
+            FROM Comments C 
+            WHERE C.PostId = P.Id
+        ),
+        CurrentScore = P.Score,
+        Depth = 1
+    FROM 
+        Posts P
+    WHERE 
+        P.PostTypeId = 1
+    UNION ALL
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        CASE 
+            WHEN P.AcceptedAnswerId IS NOT NULL THEN 1 
+            ELSE 0 
+        END,
+        CommentsCount = (
+            SELECT COUNT(*) 
+            FROM Comments C 
+            WHERE C.PostId = P.ParentId
+        ),
+        CurrentScore = RC.CurrentScore + P.Score,
+        Depth = RC.Depth + 1
+    FROM 
+        Posts P
+    INNER JOIN 
+        RecursionsCTE RC ON P.ParentId = RC.PostId
+    WHERE 
+        P.PostTypeId = 2
+)
+SELECT 
+    U.Id AS UserId,
+    U.DisplayName AS UserName,
+    SUM(RC.CurrentScore) AS TotalScore,
+    SUM(RC.CommentsCount) AS TotalComments,
+    AVG(RC.HasAcceptedAnswer) AS AvgAcceptedAnswers,
+    MAX(RC.Depth) AS MaxAnswerDepth
+FROM 
+    RecursionsCTE RC
+JOIN 
+    Users U ON U.Id = (SELECT OwnerUserId FROM Posts WHERE Id = RC.PostId)
+GROUP BY 
+    U.Id, U.DisplayName
+ORDER BY 
+    TotalScore DESC
+LIMIT 10;

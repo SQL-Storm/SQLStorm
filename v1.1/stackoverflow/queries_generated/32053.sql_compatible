@@ -1,0 +1,72 @@
+WITH RECURSIVE RecursiveUserPosts AS (
+    SELECT 
+        u.Id AS UserId,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        ARRAY[p.Id] AS PostPath
+    FROM 
+        Users u
+    JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    WHERE 
+        u.Reputation > 1000
+    UNION ALL
+    SELECT 
+        rup.UserId,
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        rup.PostPath || p.Id
+    FROM 
+        RecursiveUserPosts rup
+    JOIN 
+        Posts p ON rup.PostId = p.ParentId
+    WHERE 
+        NOT p.Id = ANY(rup.PostPath)
+),
+UserPostStats AS (
+    SELECT 
+        up.UserId,
+        COUNT(up.PostId) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN up.PostTypeId = 1 THEN up.PostId ELSE NULL END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN up.PostTypeId = 2 THEN up.PostId ELSE NULL END) AS TotalAnswers
+    FROM 
+        RecursiveUserPosts up
+    GROUP BY 
+        up.UserId
+),
+UserEngagement AS (
+    SELECT 
+        u.Id AS UserId,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotesReceived,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotesReceived
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    WHERE 
+        v.VoteTypeId IN (2, 3)
+    GROUP BY 
+        u.Id
+)
+SELECT 
+    u.UserId,
+    u.TotalPosts,
+    u.TotalQuestions,
+    u.TotalAnswers,
+    e.UpVotesReceived,
+    e.DownVotesReceived,
+    ROUND((CAST(e.UpVotesReceived AS numeric) / NULLIF((e.UpVotesReceived + e.DownVotesReceived), 0)) * 100, 2) AS UpVotePercentage
+FROM 
+    UserPostStats u
+JOIN 
+    UserEngagement e ON u.UserId = e.UserId
+WHERE 
+    u.TotalPosts > 10
+ORDER BY 
+    UpVotePercentage DESC, 
+    u.TotalQuestions DESC, 
+    u.TotalAnswers DESC;

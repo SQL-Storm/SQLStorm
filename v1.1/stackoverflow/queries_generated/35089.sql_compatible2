@@ -1,0 +1,103 @@
+WITH user_activity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT a.Id) AS TotalAnswers,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotes,
+        MAX(u.Reputation) AS MaxReputation,
+        DATE_TRUNC('month', u.CreationDate) AS SignupMonth
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, DATE_TRUNC('month', u.CreationDate)
+),
+most_used_tags AS (
+    SELECT
+        t.TagName,
+        SUM(t.Count) AS TotalUsage
+    FROM Tags t
+    GROUP BY t.TagName
+    ORDER BY TotalUsage DESC
+    LIMIT 20
+),
+tag_post_tags AS (
+    SELECT
+        p.Id AS PostId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        CASE
+            WHEN p.Tags LIKE '<%>' THEN SUBSTRING(p.Tags FROM 2 FOR CHARACTER_LENGTH(p.Tags) - 2)
+            ELSE p.Tags
+        END AS TagsInner
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+tag_split AS (
+    SELECT
+        PostId,
+        Score,
+        ViewCount,
+        CASE WHEN TagsInner = '' THEN NULL ELSE TagsInner END AS rest,
+        CAST(NULL AS text) AS tag,
+        0 AS idx
+    FROM tag_post_tags
+    UNION ALL
+    SELECT
+        PostId,
+        Score,
+        ViewCount,
+        CASE
+            WHEN POSITION('><' IN rest) > 0 THEN SUBSTRING(rest FROM POSITION('><' IN rest) + 2)
+            ELSE ''
+        END AS rest,
+        CASE
+            WHEN POSITION('><' IN rest) > 0 THEN SUBSTRING(rest FROM 1 FOR POSITION('><' IN rest) - 1)
+            ELSE rest
+        END AS tag,
+        idx + 1
+    FROM tag_split
+    WHERE rest IS NOT NULL AND rest <> ''
+),
+tag_post_popularity AS (
+    SELECT
+        tag AS Tag,
+        COUNT(DISTINCT PostId) AS PostsWithTag,
+        AVG(Score) AS AvgScore,
+        AVG(ViewCount) AS AvgViews
+    FROM tag_split
+    WHERE tag IS NOT NULL AND tag <> ''
+    GROUP BY tag
+),
+distinct_post_tags AS (
+    SELECT DISTINCT PostId, tag
+    FROM tag_split
+    WHERE tag IS NOT NULL AND tag <> ''
+)
+SELECT
+    u.UserId,
+    u.DisplayName,
+    u.TotalPosts,
+    u.TotalComments,
+    u.TotalAnswers,
+    u.TotalUpvotes,
+    u.TotalDownvotes,
+    u.MaxReputation,
+    u.SignupMonth,
+    tpt.Tag,
+    tpt.PostsWithTag,
+    tpt.AvgScore,
+    tpt.AvgViews
+FROM user_activity u
+JOIN Posts p ON p.OwnerUserId = u.UserId
+JOIN distinct_post_tags pt ON pt.PostId = p.Id
+JOIN most_used_tags mut ON mut.TagName = pt.tag
+JOIN tag_post_popularity tpt ON tpt.Tag = pt.tag
+WHERE u.TotalPosts > 10 AND u.MaxReputation > 1000
+ORDER BY u.MaxReputation DESC, tpt.AvgViews DESC
+LIMIT 100;

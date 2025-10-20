@@ -1,0 +1,130 @@
+-- {"query": "55098.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2048, "output_tokens": 1595} 
+
+WITH
+-- 1. Recent high‑scoring questions (last 90 days)
+recent_questions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        u.Reputation AS OwnerReputation,
+        -- split tags into an array for later joins
+        string_to_array(
+            substring(p.Tags, 2, length(p.Tags)-2),
+            '><'
+        ) AS TagArray
+    FROM Posts p
+    JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1                -- Question
+      AND p.CreationDate >= now() - interval '90 days'
+      AND p.Score >= 10
+),
+-- 2. Aggregate tag statistics across the whole site
+tag_stats AS (
+    SELECT
+        t.TagName,
+        t.Count AS TotalTagUses,
+        COUNT(DISTINCT ph.PostId) FILTER (WHERE ph.PostHistoryTypeId = 15) AS TagWikiEdits,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesOnTagWikis,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesOnTagWikis
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Id = t.WikiPostId
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 24
+    LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId IN (2,3)
+    GROUP BY t.TagName, t.Count
+),
+-- 3. User activity snapshot (last 30 days)
+user_activity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT q.Id) FILTER (WHERE q.CreationDate >= now() - interval '30 days') AS QuestionsAsked30d,
+        COUNT(DISTINCT a.Id) FILTER (WHERE a.CreationDate >= now() - interval '30 days') AS AnswersPosted30d,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2 AND v.CreationDate >= now() - interval '30 days') AS UpVotesGiven30d,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3 AND v.CreationDate >= now() - interval '30 days') AS DownVotesGiven30d,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.VoteTypeId = 8 AND b.CreationDate >= now() - interval '30 days') AS BountiesStarted30d,
+        MAX(b.BountyAmount) FILTER (WHERE b.VoteTypeId = 8) AS MaxBountyStarted
+    FROM Users u
+    LEFT JOIN Posts q ON q.OwnerUserId = u.Id AND q.PostTypeId = 1
+    LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Votes b ON b.UserId = u.Id AND b.VoteTypeId = 8
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+)
+SELECT
+    rq.QuestionId,
+    rq.Title,
+    rq.CreationDate,
+    rq.Score,
+    rq.ViewCount,
+    rq.FavoriteCount,
+    rq.OwnerDisplayName,
+    rq.OwnerReputation,
+    -- Top three tags for the question with their global stats
+    jsonb_agg(
+        jsonb_build_object(
+            'Tag', t.TagName,
+            'QuestionTagUses', (SELECT COUNT(*) FROM UNNEST(rq.TagArray) AS t_tag WHERE t_tag = t.TagName),
+            'TotalTagUses', ts.TotalTagUses,
+            'TagWikiEdits', ts.TagWikiEdits,
+            'UpVotesOnTagWiki', ts.UpVotesOnTagWikis,
+            'DownVotesOnTagWiki', ts.DownVotesOnTagWikis
+        )
+        ORDER BY (SELECT COUNT(*) FROM UNNEST(rq.TagArray) AS t_tag WHERE t_tag = t.TagName) DESC
+        LIMIT 3
+    ) AS TopTagsInfo,
+    -- Number of answers, accepted answer flag, and average answer score
+    COALESCE(a.AnswerCount,0) AS AnswerCount,
+    CASE WHEN a.AcceptedAnswerId IS NOT NULL THEN TRUE ELSE FALSE END AS HasAcceptedAnswer,
+    a.AvgAnswerScore,
+    -- Vote distribution on the question itself
+    qv.UpVotes,
+    qv.DownVotes,
+    qv.FavoriteVotes,
+    -- Recent activity of the owner (last 30 days)
+    ua.QuestionsAsked30d,
+    ua.AnswersPosted30d,
+    ua.UpVotesGiven30d,
+    ua.DownVotesGiven30d,
+    ua.BountiesStarted30d,
+    ua.MaxBountyStarted
+FROM recent_questions rq
+LEFT JOIN LATERAL (
+    SELECT
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 5) AS FavoriteVotes
+    FROM Votes v
+    WHERE v.PostId = rq.QuestionId
+) qv ON TRUE
+LEFT JOIN LATERAL (
+    SELECT
+        COUNT(*) AS AnswerCount,
+        MAX(a.AcceptedAnswerId) AS AcceptedAnswerId,
+        AVG(a.Score) AS AvgAnswerScore
+    FROM Posts a
+    WHERE a.ParentId = rq.QuestionId AND a.PostTypeId = 2
+) a ON TRUE
+LEFT JOIN LATERAL (
+    SELECT t.TagName, ts.*
+    FROM unnest(rq.TagArray) AS t(TagName)
+    LEFT JOIN tag_stats ts ON ts.TagName = t.TagName
+) t ON TRUE
+LEFT JOIN user_activity ua ON ua.UserId = rq.OwnerUserId
+GROUP BY
+    rq.QuestionId, rq.Title, rq.CreationDate, rq.Score, rq.ViewCount,
+    rq.FavoriteCount, rq.OwnerDisplayName, rq.OwnerReputation,
+    a.AnswerCount, a.AcceptedAnswerId, a.AvgAnswerScore,
+    qv.UpVotes, qv.DownVotes, qv.FavoriteVotes,
+    ua.QuestionsAsked30d, ua.AnswersPosted30d,
+    ua.UpVotesGiven30d, ua.DownVotesGiven30d,
+    ua.BountiesStarted30d, ua.MaxBountyStarted
+ORDER BY rq.Score DESC, rq.ViewCount DESC
+LIMIT 100;

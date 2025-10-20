@@ -1,0 +1,89 @@
+-- {"query": "51014.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2129, "output_tokens": 1001} 
+WITH top_tags AS (
+  SELECT t.tagname,
+         COUNT(p.id) as post_count,
+         AVG(p.score) as avg_score
+  FROM tags t
+  JOIN posts p ON position('<' || t.tagname || '>' IN p.tags) > 0
+  WHERE p.posttypeid = 1
+    AND p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+  GROUP BY t.tagname
+  HAVING COUNT(p.id) > 100
+  ORDER BY post_count DESC
+  LIMIT 10
+),
+user_activity AS (
+  SELECT u.id as userid,
+         u.displayname,
+         COUNT(DISTINCT CASE WHEN ph.posthistorytypeid IN (4,5,6) THEN ph.postid END) as edits_made,
+         COUNT(DISTINCT CASE WHEN v.votetypeid = 2 AND v.userid = u.id THEN v.postid END) as upvotes_given,
+         SUM(CASE WHEN ph.posthistorytypeid IN (10,11) THEN 1 ELSE 0 END) as moderation_actions,
+         AVG(EXTRACT(EPOCH FROM (ph.creationdate - u.creationdate))/86400) as avg_days_active
+  FROM users u
+  LEFT JOIN posthistory ph ON ph.userid = u.id AND ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 months'
+  LEFT JOIN votes v ON v.userid = u.id AND v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 months'
+  WHERE u.reputation >= 1000
+    AND u.creationdate < cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+  GROUP BY u.id, u.displayname
+  HAVING COUNT(ph.postid) > 5 OR COUNT(v.postid) > 10
+),
+question_engagement AS (
+  SELECT p.id as postid,
+         p.title,
+         p.score,
+         p.viewcount,
+         p.answercount,
+         p.favoritecount,
+         p.commentcount,
+         COALESCE(a.avg_score, 0) as avg_answer_score,
+         COUNT(DISTINCT pl.relatedpostid) as external_links,
+         COUNT(DISTINCT c.id) as total_comments,
+         STRING_AGG(DISTINCT tt.tagname, ', ') as top_tags
+  FROM posts p
+  LEFT JOIN posts a ON a.parentid = p.id AND a.posttypeid = 2
+  LEFT JOIN votes va ON va.postid = a.id AND va.votetypeid = 2
+  LEFT JOIN postlinks pl ON pl.postid = p.id
+  LEFT JOIN comments c ON c.postid = p.id
+  LEFT JOIN top_tags tt ON position('<' || tt.tagname || '>' IN p.tags) > 0
+  WHERE p.posttypeid = 1
+    AND p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+    AND p.deleteddate IS NULL
+    AND p.viewcount > 100
+  GROUP BY p.id, p.title, p.score, p.viewcount, p.answercount, p.favoritecount, p.commentcount, a.avg_score
+  HAVING p.answercount > 0
+)
+SELECT 
+  q.title,
+  q.score as question_score,
+  q.viewcount,
+  q.answercount,
+  q.avg_answer_score,
+  q.total_comments,
+  q.top_tags,
+  COALESCE(ua.displayname, 'Anonymous') as top_contributor,
+  ua.edits_made,
+  ua.upvotes_given,
+  ua.moderation_actions,
+  CASE 
+    WHEN q.avg_answer_score > q.score * 0.8 THEN 'High Quality'
+    WHEN q.total_comments > q.answercount * 2 THEN 'Discussion Heavy'
+    WHEN q.external_links > 5 THEN 'Well Linked'
+    ELSE 'Standard'
+  END as engagement_category,
+  ROW_NUMBER() OVER (PARTITION BY q.top_tags ORDER BY q.viewcount DESC) as rank_in_tags,
+  PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY q.viewcount) OVER () as q75_views,
+  COUNT(*) OVER () as total_high_engagement_questions
+FROM question_engagement q
+LEFT JOIN (
+  SELECT ph.postid,
+         ph.userid,
+         ROW_NUMBER() OVER (PARTITION BY ph.postid ORDER BY COUNT(ph.id) DESC, ph.creationdate DESC) as contributor_rank
+  FROM posthistory ph
+  WHERE ph.posthistorytypeid IN (4,5,6,24)
+    AND ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+  GROUP BY ph.postid, ph.userid
+) contrib ON contrib.postid = q.postid AND contrib.contributor_rank = 1
+LEFT JOIN user_activity ua ON ua.userid = contrib.userid
+WHERE q.score >= 5
+ORDER BY q.viewcount DESC, q.avg_answer_score DESC
+LIMIT 50;

@@ -1,0 +1,147 @@
+WITH ActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN pt.Id = 1 THEN p.Id END) AS QuestionsPosted,
+        COUNT(DISTINCT CASE WHEN pt.Id = 2 THEN p.Id END) AS AnswersPosted,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesReceived,
+        COUNT(DISTINCT b.Id) AS TotalBadges
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id 
+                      AND p.PostTypeId IN (1, 2)
+                      AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id 
+                     AND v.VoteTypeId IN (2, 3)
+                     AND v.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months'
+    LEFT JOIN Badges b ON b.UserId = u.Id 
+                      AND b.Date >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    WHERE u.Reputation >= 100 
+      AND u.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years'
+      AND u.LastAccessDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days'
+    GROUP BY u.Id, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) >= 5
+),
+TopTagsByUser AS (
+    SELECT 
+        au.UserId,
+        au.Reputation,
+        t.TagName,
+        COUNT(*) AS TagUsageCount,
+        AVG(p.Score) AS AvgTagScore,
+        ROW_NUMBER() OVER (PARTITION BY au.UserId ORDER BY COUNT(*) DESC) AS TagRank
+    FROM ActiveUsers au
+    JOIN Posts p ON p.OwnerUserId = au.UserId 
+                AND p.PostTypeId = 1
+                AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months'
+    JOIN Tags t ON (
+        -- replace PostgreSQL array containment with EXISTS-like check: check tag name exists in parsed tags
+        EXISTS (
+            SELECT 1
+            FROM (
+                SELECT REGEXP_SPLIT_TO_TABLE(TRIM(BOTH '<>' FROM p.Tags), '><') AS tag
+            ) tag_table
+            WHERE tag_table.tag = t.TagName
+        )
+    )
+    GROUP BY au.UserId, au.Reputation, t.TagName
+),
+QuestionEngagement AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.OwnerUserId,
+        p.CreationDate AS QuestionDate,
+        p.Score AS QuestionScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        COALESCE(accepted.Id, 0) AS AcceptedAnswerId,
+        AVG(ans.Score) AS AvgAnswerScore,
+        COUNT(DISTINCT ans.OwnerUserId) AS DistinctAnswerers,
+        SUM(CASE WHEN va.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalQuestionUpvotes,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN ph.PostHistoryTypeId = 11 THEN 'Reopened'
+            ELSE 'Open'
+        END AS QuestionStatus
+    FROM Posts p
+    LEFT JOIN Posts accepted ON p.AcceptedAnswerId = accepted.Id
+    LEFT JOIN Posts ans ON p.Id = ans.ParentId 
+                        AND ans.PostTypeId = 2 
+                        AND ans.CreationDate <= p.LastActivityDate
+    LEFT JOIN Votes va ON va.PostId = p.Id 
+                       AND va.VoteTypeId = 2
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id 
+                            AND ph.PostHistoryTypeId IN (10, 11)
+                            AND ph.CreationDate = (
+                                SELECT MAX(ph2.CreationDate) 
+                                FROM PostHistory ph2 
+                                WHERE ph2.PostId = p.Id 
+                                AND ph2.PostHistoryTypeId IN (10, 11)
+                            )
+    WHERE p.PostTypeId = 1 
+      AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3 months'
+      AND p.Score >= -5
+    GROUP BY p.Id, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, 
+             p.AnswerCount, p.CommentCount, accepted.Id, p.ClosedDate, 
+             ph.PostHistoryTypeId
+),
+ComplexInteractions AS (
+    SELECT 
+        au.UserId,
+        au.TotalPosts,
+        au.AvgPostScore,
+        au.TotalUpvotesReceived,
+        au.TotalDownvotesReceived,
+        au.TotalBadges,
+        au.Reputation,
+        tt.TagName AS PrimaryTag,
+        qe.QuestionScore,
+        qe.ViewCount,
+        qe.AnswerCount,
+        qe.AvgAnswerScore,
+        qe.QuestionStatus,
+        (qe.ViewCount * 1.0 / NULLIF(qe.AnswerCount, 0)) AS ViewPerAnswerRatio,
+        (au.TotalUpvotesReceived - au.TotalDownvotesReceived) AS NetVotes,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - au.UserCreationDate)) / 86400 AS UserAgeDays,
+        (au.TotalBadges * tt.TagUsageCount * qe.QuestionScore) AS EngagementScore,
+        ROW_NUMBER() OVER (
+            PARTITION BY tt.TagName 
+            ORDER BY (au.Reputation * qe.ViewCount * qe.AnswerCount) DESC
+        ) AS RankWithinTag
+    FROM ActiveUsers au
+    JOIN TopTagsByUser tt ON au.UserId = tt.UserId AND tt.TagRank <= 3
+    JOIN QuestionEngagement qe ON au.UserId = qe.OwnerUserId
+    WHERE qe.QuestionDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 month'
+      AND qe.AnswerCount >= 1
+      AND tt.TagUsageCount >= 3
+)
+SELECT 
+    ci.PrimaryTag,
+    COUNT(DISTINCT ci.UserId) AS ActiveUsersInTag,
+    AVG(ci.Reputation) AS AvgUserReputation,
+    AVG(ci.TotalPosts) AS AvgPostsPerUser,
+    AVG(ci.AvgPostScore) AS AvgPostScore,
+    AVG(ci.NetVotes) AS AvgNetVotes,
+    AVG(ci.ViewPerAnswerRatio) AS AvgViewAnswerRatio,
+    AVG(ci.EngagementScore) AS AvgEngagementScore,
+    SUM(ci.ViewCount) AS TotalViewsInTag,
+    SUM(ci.AnswerCount) AS TotalAnswersInTag,
+    COUNT(CASE WHEN ci.QuestionStatus = 'Open' THEN 1 END) AS OpenQuestions,
+    COUNT(CASE WHEN ci.QuestionStatus = 'Closed' THEN 1 END) AS ClosedQuestions,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ci.Reputation) AS MedianReputation,
+    PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY ci.ViewCount) AS P90Views,
+    COUNT(*) OVER () AS TotalRows,
+    RANK() OVER (ORDER BY AVG(ci.EngagementScore) DESC) AS TagEngagementRank
+FROM ComplexInteractions ci
+WHERE ci.RankWithinTag <= 5
+  AND ci.UserAgeDays >= 30
+  AND ci.EngagementScore > 0
+GROUP BY ci.PrimaryTag
+HAVING AVG(ci.Reputation) >= 500
+ORDER BY AvgEngagementScore DESC
+LIMIT 20;

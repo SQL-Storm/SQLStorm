@@ -1,0 +1,173 @@
+WITH RECURSIVE RecursiveTagSplit AS (
+    -- Extract tags of posts like '<sql><python>' into rows: TagName, QuestionId
+    SELECT
+        Id AS QuestionId,
+        TRIM(SUBSTRING(Tags FROM 2 FOR (CASE WHEN POSITION('><' IN Tags)=0 THEN CHAR_LENGTH(Tags)-2 ELSE POSITION('><' IN Tags)-2 END))) AS TagName,
+        CASE WHEN POSITION('><' IN Tags)=0 THEN NULL ELSE SUBSTRING(Tags FROM POSITION('><' IN Tags)+2) END AS Remainder
+    FROM Posts
+    WHERE PostTypeId = 1
+      AND Tags IS NOT NULL
+      AND CHAR_LENGTH(Tags) > 2
+    UNION ALL
+    SELECT
+        QuestionId,
+        TRIM(SUBSTRING(Remainder FROM 1 FOR (CASE WHEN POSITION('><' IN Remainder)=0 THEN CHAR_LENGTH(Remainder)-2 ELSE POSITION('><' IN Remainder)-1 END))) AS TagName,
+        CASE WHEN POSITION('><' IN Remainder)=0 THEN NULL ELSE SUBSTRING(Remainder FROM POSITION('><' IN Remainder)+2) END AS Remainder
+    FROM RecursiveTagSplit
+    WHERE Remainder IS NOT NULL
+),
+UserActivityBase AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.UpVotes AS TotalUpVotesGiven,
+        u.DownVotes AS TotalDownVotesGiven,
+        u.Views AS TotalProfileViews,
+        MAX(u.LastAccessDate) AS LastAccessDate,
+        MIN(u.CreationDate) AS UserCreationDate
+    FROM Users u
+    WHERE u.CreationDate >= DATE '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes, u.Views
+),
+UserPostStats AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersProvided,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+        SUM(CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS OwnQuestionsWithAcceptedAnswer,
+        SUM(CASE WHEN p.PostTypeId = 2 AND p_q_acc.AcceptedAnswerId = p.Id THEN 1 ELSE 0 END) AS AcceptedAnswersProvided,
+        SUM(CASE WHEN p.PostTypeId = 1 AND p.ViewCount IS NOT NULL THEN p.ViewCount ELSE 0 END) AS TotalQuestionViewCount,
+        SUM(CASE WHEN p.PostTypeId = 1 AND p.FavoriteCount IS NOT NULL THEN p.FavoriteCount ELSE 0 END) AS TotalQuestionFavoriteCount
+    FROM Posts p
+    LEFT JOIN Posts p_q_acc ON p.ParentId = p_q_acc.Id AND p_q_acc.PostTypeId = 1
+    WHERE p.OwnerUserId IS NOT NULL
+      AND p.CreationDate >= DATE '2015-01-01'
+    GROUP BY p.OwnerUserId
+),
+UserCommentStats AS (
+    SELECT
+        c.UserId,
+        COUNT(c.Id) AS CommentsMade
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+      AND c.CreationDate >= DATE '2015-01-01'
+    GROUP BY c.UserId
+),
+UserReceivedCommentStats AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(c.Id) AS CommentsReceivedOnPosts
+    FROM Posts p
+    JOIN Comments c ON p.Id = c.PostId
+    WHERE p.OwnerUserId IS NOT NULL
+      AND p.CreationDate >= DATE '2015-01-01'
+      AND c.CreationDate >= DATE '2015-01-01'
+    GROUP BY p.OwnerUserId
+),
+UserEdits AS (
+    SELECT
+        ph.UserId,
+        COUNT(ph.Id) AS TotalEditsMade
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)
+      AND ph.UserId IS NOT NULL
+      AND ph.CreationDate >= DATE '2015-01-01'
+    GROUP BY ph.UserId
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    WHERE b.Date >= DATE '2015-01-01'
+    GROUP BY b.UserId
+),
+UserTagScore AS (
+    SELECT
+        u.Id AS UserId,
+        rts.TagName,
+        AVG(p_a.Score) AS AvgAnswerScoreInTag,
+        COUNT(p_a.Id) AS AnswersInTag
+    FROM Users u
+    JOIN Posts p_a ON u.Id = p_a.OwnerUserId AND p_a.PostTypeId = 2
+    JOIN Posts p_q_parent ON p_a.ParentId = p_q_parent.Id AND p_q_parent.PostTypeId = 1
+    JOIN RecursiveTagSplit rts ON p_q_parent.Id = rts.QuestionId
+    JOIN Tags t ON rts.TagName = t.TagName
+    WHERE p_a.CreationDate >= DATE '2020-01-01'
+      AND p_q_parent.CreationDate >= DATE '2020-01-01'
+      AND rts.TagName IS NOT NULL AND CHAR_LENGTH(rts.TagName) > 0
+    GROUP BY u.Id, rts.TagName
+    HAVING COUNT(p_a.Id) >= 5
+),
+RankedTagUsers AS (
+    SELECT
+        UserId,
+        TagName,
+        AvgAnswerScoreInTag,
+        AnswersInTag,
+        ROW_NUMBER() OVER (PARTITION BY TagName ORDER BY AvgAnswerScoreInTag DESC, AnswersInTag DESC) AS rn
+    FROM UserTagScore
+)
+SELECT
+    uab.UserId,
+    uab.DisplayName,
+    uab.Reputation,
+    COALESCE(ups.QuestionsAsked, 0) AS QuestionsAsked,
+    COALESCE(ups.AnswersProvided, 0) AS AnswersProvided,
+    COALESCE(ups.TotalAnswerScore, 0) AS TotalAnswerScore,
+    COALESCE(ups.AcceptedAnswersProvided, 0) AS AcceptedAnswersProvided,
+    COALESCE(ups.OwnQuestionsWithAcceptedAnswer, 0) AS OwnQuestionsWithAcceptedAnswer,
+    COALESCE(ups.TotalQuestionViewCount, 0) AS TotalQuestionViewCount,
+    COALESCE(ups.TotalQuestionFavoriteCount, 0) AS TotalQuestionFavoriteCount,
+    COALESCE(ue.TotalEditsMade, 0) AS TotalEdits,
+    COALESCE(ubs.TotalBadges, 0) AS TotalBadges,
+    COALESCE(ubs.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ubs.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ubs.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(ucs.CommentsMade, 0) AS CommentsMade,
+    COALESCE(urcs.CommentsReceivedOnPosts, 0) AS CommentsReceivedOnPosts,
+    COALESCE(r_tag_sql.AvgAnswerScoreInTag, 0) AS AvgSqlAnswerScore,
+    COALESCE(r_tag_python.AvgAnswerScoreInTag, 0) AS AvgPythonAnswerScore,
+    COALESCE(r_tag_js.AvgAnswerScoreInTag, 0) AS AvgJSAnswerScore,
+    COALESCE(r_tag_java.AvgAnswerScoreInTag, 0) AS AvgJavaAnswerScore,
+    COALESCE(r_tag_csharp.AvgAnswerScoreInTag, 0) AS AvgCSharpAnswerScore,
+    (
+        uab.Reputation * 0.01 +
+        COALESCE(ups.TotalAnswerScore, 0) * 0.5 +
+        COALESCE(ups.AcceptedAnswersProvided, 0) * 5 +
+        COALESCE(ups.OwnQuestionsWithAcceptedAnswer, 0) * 2 +
+        COALESCE(ups.TotalQuestionViewCount, 0) * 0.001 +
+        COALESCE(ups.TotalQuestionFavoriteCount, 0) * 0.1 +
+        COALESCE(ue.TotalEditsMade, 0) * 0.1 +
+        COALESCE(ubs.GoldBadges, 0) * 10 +
+        COALESCE(ubs.SilverBadges, 0) * 2 +
+        COALESCE(ubs.BronzeBadges, 0) * 0.5 +
+        COALESCE(ucs.CommentsMade, 0) * 0.05 +
+        COALESCE(urcs.CommentsReceivedOnPosts, 0) * 0.05 +
+        COALESCE(r_tag_sql.AvgAnswerScoreInTag, 0) * 0.1 +
+        COALESCE(r_tag_python.AvgAnswerScoreInTag, 0) * 0.1 +
+        COALESCE(r_tag_js.AvgAnswerScoreInTag, 0) * 0.1 +
+        COALESCE(r_tag_java.AvgAnswerScoreInTag, 0) * 0.1 +
+        COALESCE(r_tag_csharp.AvgAnswerScoreInTag, 0) * 0.1
+    ) AS CompositeEngagementScore
+FROM UserActivityBase uab
+LEFT JOIN UserPostStats ups ON uab.UserId = ups.UserId
+LEFT JOIN UserEdits ue ON uab.UserId = ue.UserId
+LEFT JOIN UserBadgeSummary ubs ON uab.UserId = ubs.UserId
+LEFT JOIN UserCommentStats ucs ON uab.UserId = ucs.UserId
+LEFT JOIN UserReceivedCommentStats urcs ON uab.UserId = urcs.UserId
+LEFT JOIN RankedTagUsers r_tag_sql ON uab.UserId = r_tag_sql.UserId AND r_tag_sql.TagName = 'sql' AND r_tag_sql.rn <= 50
+LEFT JOIN RankedTagUsers r_tag_python ON uab.UserId = r_tag_python.UserId AND r_tag_python.TagName = 'python' AND r_tag_python.rn <= 50
+LEFT JOIN RankedTagUsers r_tag_js ON uab.UserId = r_tag_js.UserId AND r_tag_js.TagName = 'javascript' AND r_tag_js.rn <= 50
+LEFT JOIN RankedTagUsers r_tag_java ON uab.UserId = r_tag_java.UserId AND r_tag_java.TagName = 'java' AND r_tag_java.rn <= 50
+LEFT JOIN RankedTagUsers r_tag_csharp ON uab.UserId = r_tag_csharp.UserId AND r_tag_csharp.TagName = 'c#' AND r_tag_csharp.rn <= 50
+WHERE uab.Reputation > 5000
+  AND COALESCE(ups.AnswersProvided, 0) > 10
+  AND uab.UserCreationDate < DATE '2022-01-01'
+ORDER BY CompositeEngagementScore DESC, uab.LastAccessDate DESC
+FETCH FIRST 1000 ROWS ONLY;

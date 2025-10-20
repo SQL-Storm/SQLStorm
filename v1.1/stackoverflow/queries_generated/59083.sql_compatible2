@@ -1,0 +1,146 @@
+SELECT 
+    p.Id AS PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    COUNT(DISTINCT v.Id) AS VoteCount,
+    COUNT(DISTINCT ph.Id) AS HistoryCount,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS Tags,
+    CASE 
+        WHEN p.PostTypeId = 1 THEN 'Question'
+        WHEN p.PostTypeId = 2 THEN 'Answer'
+        WHEN p.PostTypeId = 3 THEN 'Wiki'
+        WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+        WHEN p.PostTypeId = 5 THEN 'TagWiki'
+        WHEN p.PostTypeId = 6 THEN 'ModeratorNomination'
+        WHEN p.PostTypeId = 7 THEN 'WikiPlaceholder'
+        WHEN p.PostTypeId = 8 THEN 'PrivilegeWiki'
+    END AS PostType,
+    CASE 
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned'
+        WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+        ELSE 'Open'
+    END AS PostStatus,
+    COALESCE(p.AnswerCount, 0) AS AnswerCount,
+    COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+    COALESCE(p.CommentCount, 0) AS CommentCountActual,
+    MAX(ph.CreationDate) AS LastActivity,
+    COALESCE(bgold.GoldBadges, 0) AS GoldBadges,
+    COALESCE(bsilver.SilverBadges, 0) AS SilverBadges,
+    COALESCE(bbronze.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(uquestions.QuestionsAsked, 0) AS QuestionsAsked,
+    COALESCE(uanswers.AnswersGiven, 0) AS AnswersGiven,
+    COALESCE(uvotes.TotalVotes, 0) AS TotalVotes,
+    uavgq.AvgQuestionScore,
+    uavga.AvgAnswerScore,
+    COALESCE(childs.ChildPostsCount, 0) AS ChildPostsCount
+FROM Posts p
+JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Comments c ON p.Id = c.PostId
+LEFT JOIN Votes v ON p.Id = v.PostId
+LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN (
+    SELECT p7.Id AS PostId, tagvals.TagName
+    FROM Posts p7,
+    LATERAL (
+        SELECT TRIM(t) AS TagName
+        FROM UNNEST(string_to_array(SUBSTRING(p7.Tags FROM 2 FOR CHAR_LENGTH(p7.Tags)-2), '><')) AS t
+    ) AS tagvals
+) t ON p.Id = t.PostId
+LEFT JOIN (
+    SELECT b.UserId, COUNT(*) AS GoldBadges
+    FROM Badges b
+    WHERE b.Class = 1
+    GROUP BY b.UserId
+) bgold ON bgold.UserId = u.Id
+LEFT JOIN (
+    SELECT b.UserId, COUNT(*) AS SilverBadges
+    FROM Badges b
+    WHERE b.Class = 2
+    GROUP BY b.UserId
+) bsilver ON bsilver.UserId = u.Id
+LEFT JOIN (
+    SELECT b.UserId, COUNT(*) AS BronzeBadges
+    FROM Badges b
+    WHERE b.Class = 3
+    GROUP BY b.UserId
+) bbronze ON bbronze.UserId = u.Id
+LEFT JOIN (
+    SELECT p2.OwnerUserId, COUNT(*) AS QuestionsAsked
+    FROM Posts p2
+    WHERE p2.PostTypeId = 1
+    GROUP BY p2.OwnerUserId
+) uquestions ON uquestions.OwnerUserId = u.Id
+LEFT JOIN (
+    SELECT p3.OwnerUserId, COUNT(*) AS AnswersGiven
+    FROM Posts p3
+    WHERE p3.PostTypeId = 2
+    GROUP BY p3.OwnerUserId
+) uanswers ON uanswers.OwnerUserId = u.Id
+LEFT JOIN (
+    SELECT v2.UserId, COUNT(*) AS TotalVotes
+    FROM Votes v2
+    WHERE v2.VoteTypeId IN (2,3)
+    GROUP BY v2.UserId
+) uvotes ON uvotes.UserId = u.Id
+LEFT JOIN (
+    SELECT p4.OwnerUserId, AVG(p4.Score) AS AvgQuestionScore
+    FROM Posts p4
+    WHERE p4.PostTypeId = 1
+    GROUP BY p4.OwnerUserId
+) uavgq ON uavgq.OwnerUserId = u.Id
+LEFT JOIN (
+    SELECT p5.OwnerUserId, AVG(p5.Score) AS AvgAnswerScore
+    FROM Posts p5
+    WHERE p5.PostTypeId = 2
+    GROUP BY p5.OwnerUserId
+) uavga ON uavga.OwnerUserId = u.Id
+LEFT JOIN (
+    SELECT p6.ParentId, COUNT(*) AS ChildPostsCount
+    FROM Posts p6
+    WHERE p6.ParentId IS NOT NULL
+    GROUP BY p6.ParentId
+) childs ON childs.ParentId = p.Id
+WHERE p.CreationDate >= DATE '2020-01-01'
+    AND p.CreationDate < DATE '2024-01-01'
+    AND p.PostTypeId IN (1, 2)
+    AND u.Reputation > 1000
+GROUP BY 
+    p.Id, 
+    p.Title, 
+    p.Score, 
+    p.ViewCount, 
+    p.CreationDate, 
+    u.DisplayName, 
+    u.Reputation, 
+    p.PostTypeId, 
+    p.ClosedDate, 
+    p.CommunityOwnedDate, 
+    p.AcceptedAnswerId, 
+    p.AnswerCount, 
+    p.FavoriteCount, 
+    p.CommentCount,
+    bgold.GoldBadges,
+    bsilver.SilverBadges,
+    bbronze.BronzeBadges,
+    uquestions.QuestionsAsked,
+    uanswers.AnswersGiven,
+    uvotes.TotalVotes,
+    uavgq.AvgQuestionScore,
+    uavga.AvgAnswerScore,
+    childs.ChildPostsCount
+HAVING 
+    COUNT(DISTINCT c.Id) > 5
+    OR COUNT(DISTINCT v.Id) > 10
+    OR COUNT(DISTINCT ph.Id) > 3
+    OR p.Score > 50
+ORDER BY 
+    p.Score DESC,
+    p.ViewCount DESC,
+    LastActivity DESC
+LIMIT 10000;

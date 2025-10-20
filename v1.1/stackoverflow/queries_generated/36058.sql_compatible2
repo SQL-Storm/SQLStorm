@@ -1,0 +1,70 @@
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.PostTypeId,
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  p.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation,
+  COUNT(CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpVotes,
+  COUNT(CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownVotes,
+  COUNT(c.Id) AS CommentCount,
+  COUNT(CASE WHEN pv.VoteTypeId = 14 THEN pv.Id END) AS ModeratorVotes,
+  ARRAY_AGG(DISTINCT t.TagName) AS Tags,
+  p.ParentId,
+  p.AcceptedAnswerId,
+  p.LastActivityDate
+FROM
+  Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  LEFT JOIN Votes pv ON pv.PostId = p.Id AND pv.VoteTypeId IN (14,15,16)
+  LEFT JOIN (
+    SELECT DISTINCT tt.TagName, tt.SourcePostId
+    FROM (
+      -- explode tags string into rows in a dialect-neutral way
+      -- reconstruct rows by splitting on commas after removing angle brackets
+      SELECT
+        REPLACE(REPLACE(p2.Tags, '<', ''), '>', '') AS tagstr,
+        p2.Id AS SourcePostId
+      FROM Posts p2
+      WHERE p2.Id = p.Id
+    ) src
+    CROSS JOIN LATERAL (
+      -- some SQL dialects use STRING_SPLIT or UNNEST; try common approach using a recursive CTE
+      WITH RECURSIVE parts(pos, rest) AS (
+        SELECT 1, src.tagstr || ',' FROM src
+        UNION ALL
+        SELECT
+          instr + 1,
+          SUBSTR(rest, instr + 1)
+        FROM (
+          SELECT instr, rest
+          FROM (
+            SELECT INSTR(rest, ',') AS instr, rest FROM parts FETCH FIRST 1 ROW ONLY
+          )
+        )
+        WHERE INSTR(rest, ',') > 0
+      ),
+      extracted AS (
+        SELECT
+          TRIM(BOTH ',' FROM SUBSTR(rest, 1, INSTR(rest, ',') - 1)) AS part
+        FROM parts
+        WHERE INSTR(rest, ',') > 0
+      )
+      SELECT part AS TagName, src.SourcePostId FROM extracted
+    ) tt
+  ) t ON t.SourcePostId = p.Id
+WHERE
+  p.PostTypeId IN (1,2)
+  AND p.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1' YEAR
+GROUP BY
+  p.Id, p.Title, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId,
+  u.Id, u.DisplayName, u.Reputation,
+  p.ParentId, p.AcceptedAnswerId, p.LastActivityDate
+ORDER BY
+  p.CreationDate DESC
+LIMIT 100;

@@ -1,0 +1,97 @@
+-- {"query": "13.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 824} 
+WITH ranked_posts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.Tags,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    COALESCE(t.Name, 'Unknown') AS PostTypeName,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC, p.LastActivityDate DESC) AS rn_by_type
+  FROM Posts p
+  LEFT JOIN PostTypes t ON p.PostTypeId = t.Id
+),
+recent_author_stats AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.FavoriteCount,
+    u.ProfileImageUrl,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id) AS BadgeCount,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS rn_user
+  FROM Users u
+),
+tag_summary AS (
+  SELECT
+    (trim(both from lower(tags))) AS tags_norm,
+    COUNT(*) AS posts_with_tags
+  FROM Posts
+  WHERE Tags IS NOT NULL
+  GROUP BY TRIM(BOTH FROM lower(Tags))
+),
+complex_filter AS (
+  SELECT
+    rp.PostId,
+    rp.PostTypeId,
+    rp.Title,
+    rp.Score,
+    rp.ViewCount,
+    rp.CreationDate,
+    rp.LastActivityDate,
+    rp.OwnerUserId,
+    rp.TagSummary AS _unused
+  FROM ranked_posts rp
+  LEFT JOIN (
+    SELECT PostId, STRING_AGG(TagName, ',') AS TagSummary
+    FROM Posts p
+    JOIN Tags t ON t.Id = p.Tags -- simplistic join for demonstration; real mapping may differ
+    GROUP BY PostId
+  ) ts ON ts.PostId = rp.PostId
+  WHERE rp.rn_by_type <= 5
+)
+SELECT
+  cp.PostId,
+  cp.PostTypeId,
+  cp.Title,
+  cp.Score,
+  cp.ViewCount,
+  cp.CreationDate,
+  cp.LastActivityDate,
+  cp.OwnerUserId,
+  ru.DisplayName AS OwnerDisplayName,
+  ru.Reputation,
+  ru.LastAccessDate,
+  ru.Location,
+  ru.Views,
+  ru.UpVotes,
+  ru.DownVotes,
+  ru.BadgeCount,
+  ru.ProfileImageUrl,
+  (SELECT COUNT(*) FROM Comments c WHERE c.PostId = cp.PostId) AS CommentCount,
+  (SELECT COUNT(*) FROM Votes v WHERE v.PostId = cp.PostId AND v.VoteTypeId = 2) AS UpModVotes,
+  (SELECT COUNT(*) FROM Votes v WHERE v.PostId = cp.PostId AND v.VoteTypeId = 3) AS DownModVotes,
+  (SELECT COUNT(*) FROM Votes v WHERE v.PostId = cp.PostId AND v.VoteTypeId = 16) AS ModeratorReviewVotes,
+  (SELECT MAX(CreationDate) FROM Votes v WHERE v.PostId = cp.PostId AND v.VoteTypeId = 2) AS LastUpvoteDate,
+  (SELECT STRING_AGG(CONCAT(v.UserId, ':', v.BountyAmount), ',') 
+     FROM Votes v
+     WHERE v.PostId = cp.PostId AND v.VoteTypeId IN (8,9)) AS BountyHistory,
+  (SELECT vl.Name FROM PostTypes vl WHERE vl.Id = cp.PostTypeId) AS PostTypeName
+FROM complex_filter cp
+JOIN recent_author_stats ru ON cp.OwnerUserId = ru.UserId
+ORDER BY cp.LastActivityDate DESC, cp.Score DESC
+LIMIT 100;

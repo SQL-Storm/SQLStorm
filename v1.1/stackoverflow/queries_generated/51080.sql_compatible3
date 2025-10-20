@@ -1,0 +1,158 @@
+WITH 
+  active_users AS (
+    SELECT 
+      u.Id,
+      u.Reputation,
+      u.CreationDate,
+      ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.UpVotes DESC) as user_rank
+    FROM Users u
+    WHERE u.Reputation >= 100 
+      AND u.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '5' YEAR
+      AND u.Location IS NOT NULL
+  ),
+  top_questions AS (
+    SELECT 
+      p.Id as post_id,
+      p.Title,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.Tags,
+      p.CreationDate as post_creation,
+      p.OwnerUserId,
+      au.user_rank as owner_rank
+    FROM Posts p
+    INNER JOIN active_users au ON p.OwnerUserId = au.Id
+    INNER JOIN PostTypes pt ON p.PostTypeId = pt.Id AND pt.Name = 'Question'
+    WHERE p.Score > 10 
+      AND p.ViewCount > 1000
+      AND p.AnswerCount > 2
+      AND p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '2' YEAR
+      AND p.ClosedDate IS NULL
+  ),
+  user_engagement AS (
+    SELECT 
+      v.PostId,
+      v.UserId,
+      COUNT(*) as total_votes,
+      SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) as upvotes,
+      SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) as downvotes,
+      MAX(v.CreationDate) as last_vote_date
+    FROM Votes v
+    INNER JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE vt.Name IN ('UpMod', 'DownMod')
+      AND v.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '1' YEAR
+    GROUP BY v.PostId, v.UserId
+    HAVING COUNT(*) > 1
+  ),
+  comment_activity AS (
+    SELECT 
+      c.PostId,
+      c.UserId,
+      COUNT(*) as comment_count,
+      AVG(c.Score) as avg_comment_score,
+      MAX(c.CreationDate) as last_comment_date
+    FROM Comments c
+    WHERE c.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '6' MONTH
+      AND c.Score >= 0
+    GROUP BY c.PostId, c.UserId
+    HAVING COUNT(*) > 0
+  ),
+  tag_stats AS (
+    SELECT 
+      t.Id as tag_id,
+      t.TagName,
+      t.Count as total_posts,
+      COUNT(DISTINCT pl.PostId) as linked_posts,
+      AVG(p.Score) as avg_question_score
+    FROM Tags t
+    INNER JOIN Posts p ON POSITION(t.TagName IN p.Tags) > 0
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId 
+      AND pl.LinkTypeId = (SELECT Id FROM LinkTypes WHERE Name = 'Linked')
+    WHERE t.Count > 50
+      AND p.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Question')
+    GROUP BY t.Id, t.TagName, t.Count
+    HAVING COUNT(DISTINCT p.Id) > 10
+  ),
+  owner_badges AS (
+    SELECT 
+      b.UserId,
+      COUNT(*) as total_badges,
+      SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) as gold_badges
+    FROM Badges b
+    WHERE b.Date >= CAST('2024-10-01' AS DATE) - INTERVAL '3' YEAR
+    GROUP BY b.UserId
+  )
+
+SELECT 
+  tq.post_id,
+  tq.Title,
+  tq.Score as question_score,
+  tq.ViewCount,
+  tq.AnswerCount,
+  tq.FavoriteCount,
+  tq.post_creation,
+  tq.owner_rank,
+  ts.TagName as primary_tag,
+  ts.avg_question_score as tag_avg_score,
+  COALESCE(ue.total_votes, 0) as user_votes_on_question,
+  COALESCE(ca.comment_count, 0) as question_comments,
+  COALESCE(ob.total_badges, 0) as owner_total_badges,
+  COALESCE(ob.gold_badges, 0) as owner_gold_badges,
+  (tq.ViewCount * 1.0 / NULLIF((CAST('2024-10-01' AS DATE) - tq.post_creation), INTERVAL '0' DAY) / 1.0) as views_per_day,
+  (tq.Score * 1.0 / NULLIF(tq.AnswerCount, 0)) as score_per_answer,
+  RANK() OVER (PARTITION BY ts.tag_id ORDER BY tq.Score DESC, tq.ViewCount DESC) as score_rank_in_tag,
+  (COALESCE(ue.upvotes, 0) * 1.0 / NULLIF(COALESCE(ue.total_votes, 1), 0)) as upvote_ratio,
+  CASE 
+    WHEN COALESCE(ue.last_vote_date, ca.last_comment_date, tq.post_creation) >= CAST('2024-10-01' AS DATE) - INTERVAL '30' DAY 
+    THEN 'Highly Active' 
+    ELSE 'Less Active' 
+  END as activity_status,
+  JSON_OBJECT(
+    'related_upvotes', COALESCE(ue.upvotes, 0),
+    'comment_activity', COALESCE(ca.avg_comment_score, 0),
+    'owner_stats', JSON_OBJECT(
+      'reputation_rank', tq.owner_rank,
+      'badges_count', COALESCE(ob.total_badges, 0)
+    ),
+    'tag_info', JSON_OBJECT(
+      'name', ts.TagName,
+      'popularity', ts.total_posts
+    )
+  ) as engagement_metrics
+FROM top_questions tq
+INNER JOIN tag_stats ts ON POSITION(ts.TagName IN tq.Tags) > 0
+LEFT JOIN user_engagement ue ON tq.post_id = ue.PostId
+LEFT JOIN comment_activity ca ON tq.post_id = ca.PostId
+LEFT JOIN owner_badges ob ON tq.OwnerUserId = ob.UserId
+WHERE ts.total_posts > 100
+  AND tq.owner_rank <= 1000
+  AND (tq.ViewCount * 1.0 / NULLIF((CAST('2024-10-01' AS DATE) - tq.post_creation), INTERVAL '0' DAY) / 1.0) > 50
+GROUP BY
+  tq.post_id,
+  tq.Title,
+  tq.Score,
+  tq.ViewCount,
+  tq.AnswerCount,
+  tq.FavoriteCount,
+  tq.post_creation,
+  tq.owner_rank,
+  ts.TagName,
+  ts.tag_id,
+  ts.total_posts,
+  ts.avg_question_score,
+  ue.total_votes,
+  ue.upvotes,
+  ue.last_vote_date,
+  ca.comment_count,
+  ca.avg_comment_score,
+  ca.last_comment_date,
+  ob.total_badges,
+  ob.gold_badges
+ORDER BY 
+  tq.Score DESC,
+  (tq.ViewCount * 1.0 / NULLIF((CAST('2024-10-01' AS DATE) - tq.post_creation), INTERVAL '0' DAY) / 1.0) DESC,
+  score_rank_in_tag ASC,
+  tq.post_creation DESC
+LIMIT 500;

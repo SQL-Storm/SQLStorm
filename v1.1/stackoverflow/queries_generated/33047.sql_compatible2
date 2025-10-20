@@ -1,0 +1,66 @@
+SELECT
+    p.Id AS PostId,
+    p.Title AS PostTitle,
+    p.CreationDate AS PostCreationDate,
+    p.Score AS PostScore,
+    p.ViewCount AS PostViewCount,
+    CASE
+      WHEN p.Tags IS NULL THEN NULL
+      ELSE (
+        -- turn an array (or delimited text) into a comma-separated string in a portable way:
+        -- if Tags is an actual SQL array type (e.g. PostgreSQL), use array_to_string; otherwise assume it's a delimited string already
+        CASE
+          WHEN pg_typeof(p.Tags) IS NOT NULL AND pg_typeof(p.Tags)::text LIKE '%[]' THEN array_to_string(p.Tags, ',')
+          ELSE p.Tags
+        END
+      )
+    END AS Tags,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation AS OwnerReputation,
+    -- aggregate distinct commenter names as a comma-separated list for portability
+    CASE
+      WHEN COUNT(DISTINCT c.UserDisplayName) FILTER (WHERE c.UserDisplayName IS NOT NULL) = 0 THEN NULL
+      ELSE STRING_AGG(DISTINCT c.UserDisplayName, ',') FILTER (WHERE c.UserDisplayName IS NOT NULL)
+    END AS Commenters,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpVotesCount,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownVotesCount,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 12 THEN v.Id END) AS SpamVotesCount,
+    MIN(c.CreationDate) AS EarliestCommentDate,
+    MAX(c.CreationDate) AS LatestCommentDate,
+    bo.BadgeCount AS TotalBadges,
+    (SELECT COUNT(*) FROM Posts p_answers WHERE p_answers.ParentId = p.Id AND p_answers.PostTypeId = 2) AS AnswerCount,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 1) AS LinkedPostsCount,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.RelatedPostId = p.Id AND pl.LinkTypeId = 3) AS DuplicateCount
+FROM
+    Posts p
+LEFT JOIN
+    Users u ON p.OwnerUserId = u.Id
+LEFT JOIN
+    Comments c ON c.PostId = p.Id
+LEFT JOIN
+    Votes v ON v.PostId = p.Id
+LEFT JOIN
+    (
+        SELECT
+            UserId AS OwnerUserId,
+            COUNT(*) AS BadgeCount
+        FROM
+            Badges
+        GROUP BY
+            UserId
+    ) bo ON bo.OwnerUserId = p.OwnerUserId
+WHERE
+    p.PostTypeId = 1
+GROUP BY
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    u.DisplayName,
+    u.Reputation,
+    bo.BadgeCount
+ORDER BY
+    p.CreationDate DESC
+LIMIT 50;

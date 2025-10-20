@@ -1,0 +1,50 @@
+-- {"query": "36064.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 422} 
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.PostTypeId,
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  p.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation,
+  p.Tags,
+  COALESCE(ac.AverageAnswerScore, 0) AS AvgUndeletedAnswerScore,
+  COALESCE(vup.VoteUpRate, 0) AS UpvoteRate,
+  COALESCE(vdc.VoteDownRate, 0) AS DownvoteRate,
+  pc.CommentCount,
+  p.AnswerCount,
+  p.LastActivityDate,
+  p.FavoriteCount,
+  b.TotalBadges
+FROM Posts p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN (
+  SELECT ParentId, AVG(Score) AS AverageAnswerScore
+  FROM Posts
+  WHERE PostTypeId = 2 AND ClosedDate IS NULL
+  GROUP BY ParentId
+) ac ON ac.ParentId = p.Id
+LEFT JOIN (
+  SELECT PostId, COUNT(*) AS CommentCount
+  FROM Comments
+  GROUP BY PostId
+) pc ON pc.PostId = p.Id
+LEFT JOIN (
+  SELECT PostId, AVG(CASE WHEN VoteTypeId = 2 THEN 1.0 ELSE 0 END) AS VoteUpRate,
+                 AVG(CASE WHEN VoteTypeId = 3 THEN 1.0 ELSE 0 END) AS VoteDownRate
+  FROM Votes
+  GROUP BY PostId
+) v ON v.PostId = p.Id
+LEFT JOIN (
+  SELECT OwnerUserId, COUNT(*) AS TotalBadges
+  FROM Badges
+  GROUP BY OwnerUserId
+) b ON b.OwnerUserId = p.OwnerUserId
+WHERE
+  p.PostTypeId IN (1, 2)
+  AND p.CreationDate >= NOW() - INTERVAL '1 year'
+ORDER BY
+  p.CreationDate DESC
+LIMIT 100;

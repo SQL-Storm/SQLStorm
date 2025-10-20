@@ -1,0 +1,93 @@
+WITH RECURSIVE
+TopActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+        SUM(p.Score) AS AggregateScore
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(p.Id) > 50
+),
+PostEditingStats AS (
+    SELECT
+        ph.PostId,
+        COUNT(*) AS EditCount,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM PostHistory ph
+    JOIN Posts p ON p.Id = ph.PostId
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+      AND ph.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+    GROUP BY ph.PostId
+),
+PostTags AS (
+    SELECT
+        p.Id AS PostId,
+        CASE
+            WHEN LENGTH(p.Tags) >= 2 THEN SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2)
+            ELSE NULL
+        END AS TagsStr
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+),
+RecursiveTags AS (
+    SELECT
+        PostId,
+        CASE
+            WHEN POSITION('><' IN TagsStr) = 0 THEN TagsStr
+            ELSE SUBSTRING(TagsStr FROM 1 FOR POSITION('><' IN TagsStr) - 1)
+        END AS TagName,
+        CASE
+            WHEN POSITION('><' IN TagsStr) = 0 THEN NULL
+            ELSE SUBSTRING(TagsStr FROM POSITION('><' IN TagsStr) + 2)
+        END AS Rest
+    FROM PostTags
+    WHERE TagsStr IS NOT NULL
+
+    UNION ALL
+
+    SELECT
+        PostId,
+        CASE
+            WHEN POSITION('><' IN Rest) = 0 THEN Rest
+            ELSE SUBSTRING(Rest FROM 1 FOR POSITION('><' IN Rest) - 1)
+        END AS TagName,
+        CASE
+            WHEN POSITION('><' IN Rest) = 0 THEN NULL
+            ELSE SUBSTRING(Rest FROM POSITION('><' IN Rest) + 2)
+        END AS Rest
+    FROM RecursiveTags
+    WHERE Rest IS NOT NULL
+),
+PopularTags AS (
+    SELECT
+        TagName,
+        COUNT(*) AS TagPostCount
+    FROM RecursiveTags
+    GROUP BY TagName
+    HAVING COUNT(*) > 100
+)
+SELECT
+    u.UserId,
+    u.DisplayName,
+    u.TotalPosts,
+    u.Questions,
+    u.Answers,
+    u.AggregateScore,
+    ROUND(AVG(COALESCE(es.EditCount, 0))::numeric, 2) AS AvgEditsPerPost,
+    COUNT(DISTINCT rt.TagName) AS DistinctTagsUsed,
+    MAX(es.LastEditDate) AS MostRecentEdit
+FROM TopActiveUsers u
+LEFT JOIN Posts p ON p.OwnerUserId = u.UserId AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+LEFT JOIN PostEditingStats es ON es.PostId = p.Id
+LEFT JOIN RecursiveTags rt ON rt.PostId = p.Id
+INNER JOIN PopularTags pop ON pop.TagName = rt.TagName
+GROUP BY u.UserId, u.DisplayName, u.TotalPosts, u.Questions, u.Answers, u.AggregateScore
+HAVING COUNT(DISTINCT rt.TagName) >= 5
+ORDER BY u.AggregateScore DESC, u.TotalPosts DESC
+LIMIT 25;

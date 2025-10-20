@@ -1,4 +1,4 @@
--- {"query": "19056.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3246} 
+-- {"query": "19056.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3246} 
 
 WITH UserActivitySummary AS (
     -- Summarizes user activity metrics: posts, comments, votes, badges, and reputation rank

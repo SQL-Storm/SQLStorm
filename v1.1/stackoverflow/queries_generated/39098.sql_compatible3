@@ -1,0 +1,116 @@
+WITH
+RecentTags AS (
+    SELECT
+        unnest(string_to_array(substring(p.tags, 2, length(p.tags) - 2), '><')) AS TagName,
+        p.id AS QuestionId
+    FROM Posts p
+    WHERE p.posttypeid = 1
+      AND p.creationdate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+),
+TagQuestionCounts AS (
+    SELECT
+        rt.TagName,
+        COUNT(*) AS QuestionCount
+    FROM RecentTags rt
+    GROUP BY rt.TagName
+),
+TopTags AS (
+    SELECT TagName
+    FROM TagQuestionCounts
+    ORDER BY QuestionCount DESC
+    LIMIT 5
+),
+TagMetrics AS (
+    SELECT
+        tt.TagName,
+        COUNT(q.id)                                          AS TotalQuestions,
+        AVG(a.score) FILTER (WHERE a.posttypeid = 2)        AS AvgAnswerScore,
+        SUM(CASE WHEN a.id IS NULL THEN 1 ELSE 0 END)       AS UnansweredCount,
+        MAX(q.viewcount)                                     AS MaxViews,
+        AVG(c.cnt)                                           AS AvgCommentsPerQuestion,
+        AVG(phc.edits)                                       AS AvgEditsPerQuestion
+    FROM Posts q
+    JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(q.tags, 2, length(q.tags) - 2), '><')) AS TagName
+    ) AS tagExplode ON TRUE
+    JOIN TopTags tt ON tt.TagName = tagExplode.TagName
+    LEFT JOIN Posts a
+      ON a.parentid = q.id
+     AND a.posttypeid = 2
+    LEFT JOIN LATERAL (
+        SELECT COUNT(*) AS cnt
+        FROM Comments c
+        WHERE c.postid = q.id
+    ) AS c ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT COUNT(*) AS edits
+        FROM PostHistory ph
+        WHERE ph.postid = q.id
+          AND ph.posthistorytypeid IN (5, 6)
+    ) AS phc ON TRUE
+    WHERE q.posttypeid = 1
+      AND q.creationdate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+    GROUP BY tt.TagName, q.id, q.viewcount
+),
+TopAnswerers AS (
+    SELECT
+        tagExplode.TagName,
+        a.owneruserid,
+        COUNT(*) AS AnswerCount,
+        RANK() OVER (PARTITION BY tagExplode.TagName ORDER BY COUNT(*) DESC) AS rk
+    FROM Posts q
+    JOIN Posts a
+      ON a.parentid = q.id
+     AND a.owneruserid > 0
+    JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(q.tags, 2, length(q.tags) - 2), '><')) AS TagName
+    ) AS tagExplode ON TRUE
+    WHERE q.posttypeid = 1
+      AND q.creationdate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+    GROUP BY tagExplode.TagName, a.owneruserid
+),
+FinalReport AS (
+    SELECT
+        tm.TagName,
+        tm.TotalQuestions,
+        tm.AvgAnswerScore,
+        tm.UnansweredCount,
+        tm.MaxViews,
+        tm.AvgCommentsPerQuestion,
+        tm.AvgEditsPerQuestion,
+        json_agg(
+          json_build_object(
+            'UserId', u.id,
+            'DisplayName', u.displayname,
+            'Answers', ta.AnswerCount,
+            'Reputation', u.reputation
+          )
+          ORDER BY ta.AnswerCount DESC
+        ) FILTER (WHERE ta.rk <= 3) AS TopAnswerers,
+        json_agg(
+          json_build_object(
+            'BadgeName', b.name,
+            'Class', b.class,
+            'AwardedOn', b.date
+          )
+        ) FILTER (WHERE b.date >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months') AS RecentBadges
+    FROM TagMetrics tm
+    LEFT JOIN TopAnswerers ta
+      ON ta.TagName = tm.TagName
+     AND ta.rk <= 3
+    LEFT JOIN Users u
+      ON u.id = ta.owneruserid
+    LEFT JOIN Badges b
+      ON b.userid = u.id
+    GROUP BY
+        tm.TagName,
+        tm.TotalQuestions,
+        tm.AvgAnswerScore,
+        tm.UnansweredCount,
+        tm.MaxViews,
+        tm.AvgCommentsPerQuestion,
+        tm.AvgEditsPerQuestion
+)
+SELECT *
+FROM FinalReport
+ORDER BY TotalQuestions DESC;

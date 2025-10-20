@@ -1,0 +1,273 @@
+with recent_active_users as (
+  select u.id as user_id,
+         u.reputation,
+         u.creationdate as user_created,
+         u.displayname,
+         u.location,
+         u.upvotes,
+         u.downvotes,
+         u.views,
+         row_number() over (order by u.reputation desc, u.upvotes - u.downvotes desc, u.id) as rn
+  from users u
+  where u.lastaccessdate >= (select max(p.creationdate) - interval '365 day' from posts p)
+),
+top_users as (
+  select * from recent_active_users where rn <= 500
+),
+user_questions as (
+  select p.owneruserid as user_id,
+         p.id as question_id,
+         p.creationdate as q_created,
+         p.score as q_score,
+         p.viewcount as q_views,
+         p.answercount as q_answers,
+         p.favoritecount as q_favs,
+         p.tags,
+         p.title
+  from posts p
+  where p.posttypeid = 1
+    and p.owneruserid is not null
+),
+user_answers as (
+  select p.owneruserid as user_id,
+         p.id as answer_id,
+         p.parentid as question_id,
+         p.creationdate as a_created,
+         p.score as a_score
+  from posts p
+  where p.posttypeid = 2
+    and p.owneruserid is not null
+),
+qa_activity as (
+  select tu.user_id,
+         count(distinct uq.question_id) as questions_count,
+         coalesce(sum(case when uq.q_created >= (timestamp '2024-10-01 12:34:56' - interval '90 day') then 1 else 0 end),0) as questions_90d,
+         coalesce(sum(uq.q_score),0) as questions_score_sum,
+         coalesce(sum(uq.q_views),0) as questions_views_sum,
+         coalesce(sum(uq.q_answers),0) as questions_answers_sum,
+         coalesce(sum(uq.q_favs),0) as questions_favs_sum,
+         count(distinct ua.answer_id) as answers_count,
+         coalesce(sum(case when ua.a_created >= (timestamp '2024-10-01 12:34:56' - interval '90 day') then 1 else 0 end),0) as answers_90d,
+         coalesce(sum(ua.a_score),0) as answers_score_sum
+  from top_users tu
+  left join user_questions uq on uq.user_id = tu.user_id
+  left join user_answers ua on ua.user_id = tu.user_id
+  group by tu.user_id
+),
+question_tag_array as (
+  select uq.question_id,
+         uq.user_id,
+         uq.q_created,
+         uq.q_score,
+         uq.q_views,
+         uq.q_answers,
+         uq.q_favs,
+         case
+           when uq.tags is null then NULL
+           else string_to_array(substring(uq.tags from 2 for char_length(uq.tags)-2), '><')
+         end as tag_arr
+  from user_questions uq
+),
+expanded_tags as (
+  select qta.user_id,
+         tag as tag,
+         qta.q_score,
+         qta.q_views,
+         qta.q_answers,
+         qta.q_favs,
+         qta.q_created
+  from question_tag_array qta,
+       unnest(qta.tag_arr) as tag
+),
+user_tag_stats as (
+  select et.user_id,
+         et.tag,
+         count(*) as tag_questions,
+         sum(et.q_score) as tag_q_score_sum,
+         sum(et.q_views) as tag_q_views_sum,
+         sum(et.q_answers) as tag_q_answers_sum,
+         sum(et.q_favs) as tag_q_favs_sum,
+         sum(case when et.q_created >= (timestamp '2024-10-01 12:34:56' - interval '365 day') then 1 else 0 end) as tag_questions_1y
+  from expanded_tags et
+  group by et.user_id, et.tag
+),
+top3_tags as (
+  select uts.user_id,
+         (
+           select array_agg(tag_val) from (
+             select uts_inner.tag as tag_val
+             from user_tag_stats uts_inner
+             where uts_inner.user_id = uts.user_id
+             order by uts_inner.tag_questions desc, uts_inner.tag_q_score_sum desc, uts_inner.tag
+             limit 3
+           ) t
+         ) as top_tags
+  from user_tag_stats uts
+  group by uts.user_id
+),
+comment_stats as (
+  select tu.user_id,
+         count(c.id) as comments_count,
+         coalesce(sum(c.score),0) as comments_score_sum,
+         coalesce(sum(case when c.creationdate >= (timestamp '2024-10-01 12:34:56' - interval '90 day') then 1 else 0 end),0) as comments_90d
+  from top_users tu
+  left join comments c on c.userid = tu.user_id
+  group by tu.user_id
+),
+vote_breakdown as (
+  select tu.user_id,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes_cast,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes_cast,
+         sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+         sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded
+  from top_users tu
+  left join votes v on v.userid = tu.user_id
+  group by tu.user_id
+),
+received_votes as (
+  select p.owneruserid as user_id,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes_received,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes_received
+  from posts p
+  join votes v on v.postid = p.id
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+postlink_graph as (
+  select tu.user_id,
+         count(distinct case when pl.linktypeid = 1 then pl.id end) as linked_edges,
+         count(distinct case when pl.linktypeid = 3 then pl.id end) as duplicate_edges
+  from top_users tu
+  left join posts p on p.owneruserid = tu.user_id
+  left join postlinks pl on pl.postid = p.id
+  group by tu.user_id
+),
+post_history_events as (
+  select tu.user_id,
+         sum(case when ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35) then 1 else 0 end) as mod_events,
+         sum(case when ph.posthistorytypeid = 50 then 1 else 0 end) as community_bumps,
+         sum(case when ph.posthistorytypeid = 52 then 1 else 0 end) as selected_hot,
+         sum(case when ph.posthistorytypeid = 53 then 1 else 0 end) as removed_hot
+  from top_users tu
+  left join posts p on p.owneruserid = tu.user_id
+  left join posthistory ph on ph.postid = p.id
+  group by tu.user_id
+),
+acceptance as (
+  select tu.user_id,
+         count(*) filter (where q.posttypeid = 1) as questions_total,
+         count(*) filter (where q.posttypeid = 1 and q.acceptedanswerid is not null) as questions_with_accept,
+         count(*) filter (where a.posttypeid = 2) as answers_total,
+         count(*) filter (where a.posttypeid = 2 and exists (
+           select 1 from posts q2
+           where q2.id = a.parentid and q2.acceptedanswerid = a.id
+         )) as answers_accepted
+  from top_users tu
+  left join posts q on q.owneruserid = tu.user_id and q.posttypeid = 1
+  left join posts a on a.owneruserid = tu.user_id and a.posttypeid = 2
+  group by tu.user_id
+),
+quality_scores as (
+  select qa.user_id,
+         case
+           when qa.answers_count = 0 then null
+           else round(cast(qa.answers_score_sum as numeric) / qa.answers_count, 4)
+         end as avg_answer_score,
+         case
+           when qa.questions_count = 0 then null
+           else round(cast(qa.questions_score_sum as numeric) / qa.questions_count, 4)
+         end as avg_question_score
+  from qa_activity qa
+),
+ranked_users as (
+  select
+    tu.user_id,
+    tu.displayname,
+    tu.location,
+    tu.reputation,
+    tu.upvotes,
+    tu.downvotes,
+    qa.questions_count,
+    qa.answers_count,
+    qa.questions_score_sum,
+    qa.answers_score_sum,
+    qa.questions_views_sum,
+    qa.questions_answers_sum,
+    qa.questions_favs_sum,
+    cs.comments_count,
+    cs.comments_score_sum,
+    vb.upvotes_cast,
+    vb.downvotes_cast,
+    rv.upvotes_received,
+    rv.downvotes_received,
+    pg.linked_edges,
+    pg.duplicate_edges,
+    phe.mod_events,
+    phe.community_bumps,
+    phe.selected_hot,
+    phe.removed_hot,
+    acc.questions_total,
+    acc.questions_with_accept,
+    acc.answers_total,
+    acc.answers_accepted,
+    qs.avg_answer_score,
+    qs.avg_question_score,
+    t3.top_tags,
+    qa.questions_90d,
+    qa.answers_90d,
+    cs.comments_90d,
+    rank() over (
+      order by
+        tu.reputation desc,
+        coalesce(qs.avg_answer_score, 0) desc,
+        coalesce(rv.upvotes_received - rv.downvotes_received, 0) desc,
+        qa.answers_count desc,
+        qa.questions_count desc,
+        tu.upvotes - tu.downvotes desc,
+        tu.user_id
+    ) as perf_rank
+  from top_users tu
+  left join qa_activity qa on qa.user_id = tu.user_id
+  left join comment_stats cs on cs.user_id = tu.user_id
+  left join vote_breakdown vb on vb.user_id = tu.user_id
+  left join received_votes rv on rv.user_id = tu.user_id
+  left join postlink_graph pg on pg.user_id = tu.user_id
+  left join post_history_events phe on phe.user_id = tu.user_id
+  left join acceptance acc on acc.user_id = tu.user_id
+  left join quality_scores qs on qs.user_id = tu.user_id
+  left join top3_tags t3 on t3.user_id = tu.user_id
+)
+select
+  ru.perf_rank,
+  ru.user_id,
+  ru.displayname,
+  ru.location,
+  ru.reputation,
+  ru.upvotes,
+  ru.downvotes,
+  ru.questions_count,
+  ru.answers_count,
+  ru.avg_question_score,
+  ru.avg_answer_score,
+  ru.upvotes_received,
+  ru.downvotes_received,
+  ru.questions_with_accept,
+  ru.answers_accepted,
+  ru.questions_views_sum,
+  ru.questions_answers_sum,
+  ru.questions_favs_sum,
+  ru.comments_count,
+  ru.comments_score_sum,
+  ru.linked_edges,
+  ru.duplicate_edges,
+  ru.mod_events,
+  ru.community_bumps,
+  ru.selected_hot,
+  ru.removed_hot,
+  ru.questions_90d,
+  ru.answers_90d,
+  ru.comments_90d,
+  coalesce(ru.top_tags, ARRAY[]::text[]) as top_tags
+from ranked_users ru
+order by ru.perf_rank
+limit 100;

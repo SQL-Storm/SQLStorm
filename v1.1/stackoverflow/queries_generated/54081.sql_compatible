@@ -1,0 +1,150 @@
+WITH PostVotes AS (
+  SELECT
+      p.OwnerUserId,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)      AS UpVotes,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)      AS DownVotes,
+      SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END)      AS AcceptActs,
+      COUNT(*)                                              AS VoteCnt
+  FROM Posts p
+  JOIN Votes v ON v.PostId = p.Id
+  GROUP BY p.OwnerUserId
+),
+PostComments AS (
+  SELECT
+      c.UserId,
+      COUNT(*) AS CommentCnt
+  FROM Comments c
+  GROUP BY c.UserId
+),
+-- Split Tags into rows in a portable way using a recursive CTE
+TagUsage AS (
+  SELECT
+    p.OwnerUserId,
+    tag AS Tag,
+    COUNT(*) AS UsageCnt
+  FROM (
+    SELECT
+      p.OwnerUserId,
+      TRIM(BOTH ' ' FROM CASE WHEN substring(p.Tags FROM 1 FOR 1) = '<' THEN substring(p.Tags FROM 2 FOR char_length(p.Tags)-2) ELSE p.Tags END) AS TagsStr
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL
+  ) p
+  CROSS JOIN LATERAL (
+    -- recursive splitting using standard SQL-style recursion
+    WITH RECURSIVE split(idx, rem, tag) AS (
+      SELECT 1,
+             p.TagsStr,
+             NULL::text
+      UNION ALL
+      SELECT
+        idx + 1,
+        CASE
+          WHEN position('><' IN rem) > 0 THEN substring(rem FROM position('><' IN rem) + 2)
+          ELSE ''
+        END,
+        CASE
+          WHEN position('><' IN rem) > 0 THEN substring(rem FROM 1 FOR position('><' IN rem) - 1)
+          ELSE rem
+        END
+      FROM split
+      WHERE rem <> ''
+    )
+    SELECT tag
+    FROM split
+    WHERE tag IS NOT NULL AND tag <> ''
+  ) s
+  GROUP BY p.OwnerUserId, tag
+),
+TopTagPerUser AS (
+  SELECT
+      tu.OwnerUserId,
+      tu.Tag,
+      tu.UsageCnt
+  FROM (
+      SELECT
+          OwnerUserId,
+          Tag,
+          UsageCnt,
+          ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY UsageCnt DESC, Tag) AS rn
+      FROM TagUsage
+  ) tu
+  WHERE tu.rn = 1
+),
+BadgeSummary AS (
+  SELECT
+      b.UserId,
+      COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS Gold,
+      COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS Silver,
+      COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS Bronze,
+      COUNT(*)                                        AS TotalBadges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+PosterStats AS (
+  SELECT
+      u.Id               AS UserId,
+      u.Reputation,
+      u.DisplayName,
+      u.CreationDate,
+      COALESCE(pv.UpVotes,       0)  AS UpVotes,
+      COALESCE(pv.DownVotes,     0)  AS DownVotes,
+      COALESCE(pv.AcceptActs,    0)  AS AcceptActs,
+      COALESCE(pv.VoteCnt,       0)  AS TotalVotes,
+      COALESCE(pc.CommentCnt,    0)  AS TotalComments,
+      COALESCE(bs.Gold,          0)  AS GoldBadges,
+      COALESCE(bs.Silver,        0)  AS SilverBadges,
+      COALESCE(bs.Bronze,        0)  AS BronzeBadges,
+      COALESCE(bs.TotalBadges,   0)  AS TotalBadges,
+      COALESCE(tt.Tag,           NULL) AS TopTag,
+      COALESCE(tt.UsageCnt,      0)  AS TopTagUsage
+  FROM Users u
+  LEFT JOIN PostVotes pv ON pv.OwnerUserId = u.Id
+  LEFT JOIN PostComments pc ON pc.UserId = u.Id
+  LEFT JOIN BadgeSummary bs ON bs.UserId = u.Id
+  LEFT JOIN TopTagPerUser tt ON tt.OwnerUserId = u.Id
+),
+RankedUsers AS (
+  SELECT
+      ps.UserId,
+      ps.Reputation,
+      ps.DisplayName,
+      ps.CreationDate,
+      ps.UpVotes,
+      ps.DownVotes,
+      ps.AcceptActs,
+      ps.TotalVotes,
+      ps.TotalComments,
+      ps.GoldBadges,
+      ps.SilverBadges,
+      ps.BronzeBadges,
+      ps.TotalBadges,
+      ps.TopTag,
+      ps.TopTagUsage,
+      RANK() OVER (ORDER BY ps.Reputation DESC)      AS RepRank,
+      DENSE_RANK() OVER (ORDER BY ps.Reputation DESC) AS RepDenseRank,
+      NTILE(10) OVER (ORDER BY ps.Reputation DESC)    AS RepPercentile
+  FROM PosterStats ps
+)
+SELECT
+  UserId,
+  Reputation,
+  DisplayName,
+  CreationDate,
+  UpVotes,
+  DownVotes,
+  AcceptActs,
+  TotalVotes,
+  TotalComments,
+  GoldBadges,
+  SilverBadges,
+  BronzeBadges,
+  TotalBadges,
+  TopTag,
+  TopTagUsage,
+  RepRank,
+  RepDenseRank,
+  RepPercentile
+FROM RankedUsers
+WHERE RepRank <= 200
+ORDER BY RepRank, TotalVotes DESC, TotalComments DESC
+LIMIT 5000;

@@ -1,0 +1,56 @@
+-- {"query": "36018.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 438} 
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.PostTypeId,
+  p.CreationDate,
+  p.ViewCount,
+  p.Score,
+  p.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation,
+  pc.CommentCount,
+  pc.LastActivityDate,
+  pc.AnswerCount,
+  pc.FavoriteCount,
+  vt.Name AS LastVoteType,
+  v.ByUser AS VotedByUser,
+  COALESCE(tc.TagCount, 0) AS TagCount,
+  COALESCE(pl.LinkCount, 0) AS LinkCount
+FROM Posts p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN (
+  SELECT
+    PostId,
+    COUNT(*) AS CommentCount,
+    MAX(LastActivityDate) AS LastActivityDate,
+    SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS AnswerCount,
+    SUM(FavoriteCount) AS FavoriteCount
+  FROM Posts
+  GROUP BY PostId
+) pc ON p.Id = pc.PostId
+LEFT JOIN (
+  SELECT
+    PostId,
+    MAX(CreationDate) AS LastVoteDate,
+    MAX(VoteTypeId) AS LastVoteTypeId
+  FROM Votes
+  GROUP BY PostId
+) v ON p.Id = v.PostId
+LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+LEFT JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+LEFT JOIN VoteTypes vt ON v.LastVoteTypeId = vt.Id
+LEFT JOIN (
+  SELECT PostId, COUNT(*) AS TagCount
+  FROM Tags t
+  JOIN Posts p2 ON t.Id = p2.Id
+  GROUP BY PostId
+) tc ON p.Id = tc.PostId
+LEFT JOIN (
+  SELECT PostId, COUNT(*) AS LinkCount
+  FROM PostLinks pl
+  GROUP BY PostId
+) pl ON p.Id = pl.PostId
+WHERE p.Id = :TargetPostId
+ORDER BY p.CreationDate DESC
+LIMIT 1;

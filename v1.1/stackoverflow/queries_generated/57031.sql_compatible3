@@ -1,0 +1,202 @@
+WITH TopUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) AS PostCount,
+        COUNT(DISTINCT a.Id) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS DirectAnswerCount,
+        AVG(p.Score) AS AveragePostScore,
+        MAX(p.Score) AS MaxPostScore,
+        MIN(p.Score) AS MinPostScore,
+        COUNT(DISTINCT b.Id) AS BadgeCount
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation
+    ORDER BY
+        u.Reputation DESC
+    LIMIT 100
+),
+ActiveTags AS (
+    -- Split tags without using regexp_split_to_table: use a recursive CTE to parse tag strings like "<tag1><tag2>"
+    TagPairs AS (
+        SELECT
+            p.Id AS PostId,
+            p.Tags AS Tags,
+            1 AS pos
+        FROM Posts p
+        WHERE p.Tags IS NOT NULL
+    ),
+    SplitTags AS (
+        SELECT
+            tp.PostId,
+            -- remove leading '<' and trailing '>' if present
+            CASE
+                WHEN strpos(substr(tp.Tags, tp.pos), '><') = 0 THEN substr(tp.Tags, tp.pos)
+                ELSE substr(tp.Tags, tp.pos, strpos(substr(tp.Tags, tp.pos), '><') - 1)
+            END AS raw_tag,
+            tp.Tags,
+            -- next position: skip current tag and separator '><'
+            CASE
+                WHEN strpos(substr(tp.Tags, tp.pos), '><') = 0 THEN 0
+                ELSE tp.pos + strpos(substr(tp.Tags, tp.pos), '><') + 1
+            END AS next_pos
+        FROM TagPairs tp
+        UNION ALL
+        SELECT
+            st.PostId,
+            CASE
+                WHEN strpos(substr(st.Tags, st.next_pos), '><') = 0 THEN substr(st.Tags, st.next_pos)
+                ELSE substr(st.Tags, st.next_pos, strpos(substr(st.Tags, st.next_pos), '><') - 1)
+            END AS raw_tag,
+            st.Tags,
+            CASE
+                WHEN strpos(substr(st.Tags, st.next_pos), '><') = 0 THEN 0
+                ELSE st.next_pos + strpos(substr(st.Tags, st.next_pos), '><') + 1
+            END AS next_pos
+        FROM SplitTags st
+        WHERE st.next_pos > 0
+    ),
+    NormalizedTags AS (
+        SELECT
+            st.PostId,
+            -- trim any leading/trailing angle brackets and whitespace
+            TRIM(BOTH '<>' FROM TRIM(st.raw_tag)) AS tag
+        FROM SplitTags st
+    )
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        t.Count AS TotalUsage,
+        COUNT(p.Id) AS RecentPostCount,
+        AVG(p.Score) AS AveragePostScore,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS RecentQuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS RecentAnswerCount,
+        MAX(p.Score) AS MaxPostScore,
+        MIN(p.Score) AS MinPostScore,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        COUNT(DISTINCT c.Id) AS CommentCount
+    FROM
+        Tags t
+    LEFT JOIN
+        Posts p ON EXISTS (
+            SELECT 1
+            FROM NormalizedTags nt
+            WHERE nt.PostId = p.Id
+              AND nt.tag = t.TagName
+        )
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    WHERE
+        p.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+    GROUP BY
+        t.Id, t.TagName, t.Count
+    ORDER BY
+        RecentPostCount DESC
+    LIMIT 50
+),
+HighEngagementPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        COUNT(v.Id) AS VoteCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        AVG(CASE WHEN v.VoteTypeId = 2 THEN 1.0 ELSE 0.0 END) / NULLIF(COUNT(v.Id), 0) AS UpVoteRatio,
+        AVG(CASE WHEN v.VoteTypeId = 3 THEN 1.0 ELSE 0.0 END) / NULLIF(COUNT(v.Id), 0) AS DownVoteRatio,
+        MAX(v.CreationDate) AS LastVoteDate,
+        COUNT(DISTINCT ph.Id) AS PostHistoryCount,
+        COUNT(DISTINCT pl.Id) AS LinkCount
+    FROM
+        Posts p
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN
+        PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN
+        PostLinks pl ON p.Id = pl.PostId
+    WHERE
+        p.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+    GROUP BY
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.Title, p.OwnerUserId, u.DisplayName
+    ORDER BY
+        VoteCount DESC
+    LIMIT 200
+)
+SELECT
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.PostCount,
+    tu.AnswerCount,
+    tu.CommentCount,
+    tu.UpVotesReceived,
+    tu.DownVotesReceived,
+    tu.QuestionCount,
+    tu.DirectAnswerCount,
+    tu.AveragePostScore,
+    tu.MaxPostScore,
+    tu.MinPostScore,
+    tu.BadgeCount,
+    at.TagId,
+    at.TagName,
+    at.TotalUsage,
+    at.RecentPostCount,
+    at.AveragePostScore AS TagAvgPostScore,
+    at.RecentQuestionCount,
+    at.RecentAnswerCount,
+    at.MaxPostScore AS TagMaxPostScore,
+    at.MinPostScore AS TagMinPostScore,
+    at.VoteCount AS TagVoteCount,
+    at.CommentCount AS TagCommentCount,
+    hep.PostId,
+    hep.PostTypeId,
+    hep.CreationDate,
+    hep.Score,
+    hep.ViewCount,
+    hep.Title,
+    hep.OwnerUserId,
+    hep.OwnerDisplayName,
+    hep.VoteCount,
+    hep.CommentCount,
+    hep.UpVoteRatio,
+    hep.DownVoteRatio,
+    hep.LastVoteDate,
+    hep.PostHistoryCount,
+    hep.LinkCount
+FROM
+    TopUsers tu
+CROSS JOIN
+    ActiveTags at
+LEFT JOIN
+    HighEngagementPosts hep ON tu.UserId = hep.OwnerUserId
+ORDER BY
+    tu.Reputation DESC,
+    at.RecentPostCount DESC,
+    hep.VoteCount DESC;

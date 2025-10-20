@@ -1,0 +1,109 @@
+WITH high_value_users AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT b.Id) AS badge_count,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS gold_badges
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 10000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT b.Id) > 5
+),
+question_metrics AS (
+    SELECT 
+        p.Id AS question_id,
+        p.OwnerUserId,
+        p.Score AS q_score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CreationDate AS q_creation_date,
+        COUNT(DISTINCT c.Id) AS comment_count,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS upvotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS downvotes,
+        COUNT(DISTINCT ph.Id) AS edit_count,
+        -- Use LISTAGG without DISTINCT (some dialects do not allow DISTINCT with WITHIN GROUP).
+        -- Aggregate duplicates will be removed by a sub-aggregation if needed; here we use STRING_AGG fallback for broader compatibility.
+        STRING_AGG(CAST(CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId END AS VARCHAR), ',') AS duplicate_links
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (4, 5, 6)
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '2' YEAR)
+        AND p.Score >= 5
+    GROUP BY p.Id, p.OwnerUserId, p.Score, p.ViewCount, p.AnswerCount, p.CreationDate
+),
+answer_quality AS (
+    SELECT 
+        a.ParentId AS question_id,
+        a.Id AS answer_id,
+        a.OwnerUserId AS answerer_id,
+        a.Score AS answer_score,
+        a.CreationDate AS answer_date,
+        CASE WHEN qm.question_id IS NOT NULL AND q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END AS is_accepted,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS answer_rank
+    FROM Posts a
+    INNER JOIN Posts q ON a.ParentId = q.Id
+    INNER JOIN question_metrics qm ON q.Id = qm.question_id
+    WHERE a.PostTypeId = 2
+        AND a.Score >= 0
+),
+tag_analysis AS (
+    SELECT 
+        -- convert tags like '<tag1><tag2>' into rows
+        UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), '><')) AS tag_name,
+        p.Id AS post_id,
+        p.OwnerUserId
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+        AND p.Tags IS NOT NULL
+        AND p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '2' YEAR)
+),
+user_tag_expertise AS (
+    SELECT 
+        ta.OwnerUserId,
+        ta.tag_name,
+        COUNT(DISTINCT ta.post_id) AS posts_in_tag,
+        AVG(qm.q_score) AS avg_score_in_tag,
+        SUM(qm.ViewCount) AS total_views_in_tag
+    FROM tag_analysis ta
+    INNER JOIN question_metrics qm ON ta.post_id = qm.question_id
+    WHERE ta.OwnerUserId IS NOT NULL
+    GROUP BY ta.OwnerUserId, ta.tag_name
+    HAVING COUNT(DISTINCT ta.post_id) >= 3
+)
+SELECT 
+    hvu.DisplayName,
+    hvu.Reputation,
+    hvu.badge_count,
+    hvu.gold_badges,
+    COUNT(DISTINCT qm.question_id) AS total_questions,
+    ROUND(AVG(qm.q_score), 2) AS avg_question_score,
+    SUM(qm.ViewCount) AS total_question_views,
+    COUNT(DISTINCT aq.answer_id) AS total_answers,
+    ROUND(AVG(aq.answer_score), 2) AS avg_answer_score,
+    COUNT(DISTINCT CASE WHEN aq.is_accepted = 1 THEN aq.answer_id END) AS accepted_answers,
+    COUNT(DISTINCT CASE WHEN aq.answer_rank = 1 THEN aq.answer_id END) AS top_ranked_answers,
+    ROUND(AVG(qm.edit_count), 2) AS avg_edits_per_question,
+    COUNT(DISTINCT ute.tag_name) AS expertise_tags,
+    MAX(ute.posts_in_tag) AS max_posts_single_tag,
+    -- Use STRING_AGG for compatibility; filter applied via CASE to emulate FILTER/WHERE inside aggregation
+    STRING_AGG(CASE WHEN ute.posts_in_tag >= 5 THEN ute.tag_name ELSE NULL END, ', ') AS top_expertise_tags,
+    ROUND(AVG(EXTRACT(EPOCH FROM (aq.answer_date - qm.q_creation_date)) / 3600.0), 2) AS avg_hours_to_answer,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY qm.ViewCount) AS median_question_views,
+    ROUND( (COUNT(DISTINCT aq.answer_id) / NULLIF(COUNT(DISTINCT qm.question_id), 0)), 2) AS answer_to_question_ratio
+FROM high_value_users hvu
+LEFT JOIN question_metrics qm ON hvu.Id = qm.OwnerUserId
+LEFT JOIN answer_quality aq ON hvu.Id = aq.answerer_id
+LEFT JOIN user_tag_expertise ute ON hvu.Id = ute.OwnerUserId
+GROUP BY hvu.Id, hvu.DisplayName, hvu.Reputation, hvu.badge_count, hvu.gold_badges
+HAVING COUNT(DISTINCT qm.question_id) > 0 OR COUNT(DISTINCT aq.answer_id) > 0
+ORDER BY 
+    (COUNT(DISTINCT qm.question_id) * AVG(qm.q_score) + 
+     COUNT(DISTINCT aq.answer_id) * AVG(aq.answer_score) + 
+     hvu.Reputation * 0.1) DESC
+FETCH FIRST 100 ROWS ONLY;

@@ -1,0 +1,205 @@
+WITH
+user_metrics AS (
+  SELECT
+    u.Id AS user_id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS questions_posted,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS answers_posted,
+    COALESCE(SUM(v_up.count),0) AS upvotes_received,
+    COALESCE(SUM(v_down.count),0) AS downvotes_received,
+    COUNT(DISTINCT b.Id) AS badges_earned,
+    MAX(p.LastActivityDate) AS last_post_activity,
+    CASE WHEN COUNT(DISTINCT p.Id) = 0 THEN 0 ELSE ROUND(1.0 * COALESCE(SUM(p.Score),0) / NULLIF(COUNT(DISTINCT p.Id),0),3) END AS avg_post_score
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS count FROM Votes WHERE VoteTypeId = 2 GROUP BY PostId
+  ) v_up ON v_up.PostId = p.Id
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS count FROM Votes WHERE VoteTypeId = 3 GROUP BY PostId
+  ) v_down ON v_down.PostId = p.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  WHERE u.Reputation >= 100
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+tag_questions AS (
+  SELECT
+    t.TagName,
+    t.Id AS tag_id,
+    COUNT(q.Id) AS question_count,
+    AVG(q.ViewCount) AS avg_views,
+    AVG(q.Score) AS avg_score,
+    MAX(q.CreationDate) AS most_recent_question
+  FROM Tags t
+  LEFT JOIN Posts q ON q.PostTypeId = 1 AND q.Tags ILIKE '%' || '<' || t.TagName || '>' || '%'
+  GROUP BY t.Id, t.TagName
+),
+best_answers AS (
+  SELECT DISTINCT ON (a.ParentId)
+    a.ParentId AS question_id,
+    a.Id AS answer_id,
+    a.OwnerUserId AS answer_owner,
+    a.Score AS answer_score,
+    a.CreationDate AS answer_date
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+  ORDER BY a.ParentId, a.Score DESC NULLS LAST, a.CreationDate ASC
+),
+link_summary AS (
+  SELECT
+    p.Id AS post_id,
+    COUNT(pl.Id) FILTER (WHERE pl.LinkTypeId = 1) AS outgoing_links,
+    COUNT(pl.Id) FILTER (WHERE pl.LinkTypeId = 3) AS duplicates_of,
+    COUNT(pl2.Id) FILTER (WHERE pl2.LinkTypeId = 1) AS incoming_links
+  FROM Posts p
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+  LEFT JOIN PostLinks pl2 ON pl2.RelatedPostId = p.Id
+  GROUP BY p.Id
+),
+hot_candidates AS (
+  SELECT
+    q.Id AS question_id,
+    q.Title,
+    q.OwnerUserId,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.CommentCount,
+    ARRAY_REMOVE(ARRAY_AGG(DISTINCT tag_name ORDER BY tag_name), NULL) AS tag_array,
+    COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END),0) AS net_votes,
+    COALESCE(bs.answer_score,0) AS top_answer_score,
+    COALESCE(ls.outgoing_links,0) AS outgoing_links,
+    COALESCE(ls.incoming_links,0) AS incoming_links,
+    COALESCE(ls.duplicates_of,0) AS duplicates_of
+  FROM Posts q
+  LEFT JOIN Votes v ON v.PostId = q.Id
+  LEFT JOIN best_answers bs ON bs.question_id = q.Id
+  LEFT JOIN link_summary ls ON ls.post_id = q.Id
+  LEFT JOIN LATERAL (
+    SELECT regexp_matches(q.Tags, '<([^>]+)>', 'g') AS m
+  ) rm ON q.Tags IS NOT NULL
+  LEFT JOIN LATERAL (
+    SELECT (rm.m)[1] AS tag_name
+  ) tn ON TRUE
+  WHERE q.PostTypeId = 1
+    AND q.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+  GROUP BY q.Id, q.Title, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, q.CommentCount, bs.answer_score, ls.outgoing_links, ls.incoming_links, ls.duplicates_of
+),
+hot_scored AS (
+  SELECT
+    hc.question_id,
+    hc.Title,
+    hc.OwnerUserId,
+    hc.CreationDate,
+    hc.Score,
+    hc.ViewCount,
+    hc.AnswerCount,
+    hc.CommentCount,
+    hc.tag_array,
+    hc.net_votes,
+    hc.top_answer_score,
+    hc.outgoing_links,
+    hc.incoming_links,
+    hc.duplicates_of,
+    EXP(-EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - hc.CreationDate)) / (60*60*24*90)) AS recency_factor,
+    (LN(GREATEST(hc.AnswerCount,1)) * 1.5 + LN(GREATEST(hc.CommentCount,1)) * 1.0 + LN(GREATEST(hc.ViewCount,1)) * 0.5) AS engagement_factor,
+    (GREATEST(hc.net_votes,0) * 2.0 + hc.top_answer_score * 1.2) AS social_factor,
+    (hc.incoming_links * 3.0 - hc.outgoing_links * 0.5 - hc.duplicates_of * 5.0) AS link_factor
+  FROM hot_candidates hc
+),
+hot_ranked AS (
+  SELECT
+    question_id,
+    Title,
+    OwnerUserId,
+    CreationDate,
+    Score,
+    ViewCount,
+    AnswerCount,
+    CommentCount,
+    tag_array,
+    net_votes,
+    top_answer_score,
+    outgoing_links,
+    incoming_links,
+    duplicates_of,
+    recency_factor,
+    engagement_factor,
+    social_factor,
+    link_factor,
+    (recency_factor * 40.0 + engagement_factor * 8.0 + social_factor * 6.0 + link_factor * 5.0) *
+      CASE WHEN top_answer_score IS NULL THEN 0.9 ELSE 1.0 END
+      AS hotness_score
+  FROM hot_scored
+),
+user_hot_contrib AS (
+  SELECT
+    u.Id AS user_id,
+    u.DisplayName,
+    COUNT(DISTINCT hr.question_id) AS hot_questions_participated,
+    SUM(hr.hotness_score) AS hotness_influence_sum,
+    AVG(hr.hotness_score) AS avg_hotness_influence
+  FROM Users u
+  LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+  LEFT JOIN Posts c ON c.OwnerUserId = u.Id AND c.PostTypeId = 1
+  LEFT JOIN hot_ranked hr ON hr.question_id = a.ParentId
+  WHERE u.Reputation >= 100
+  GROUP BY u.Id, u.DisplayName
+),
+tag_top_questions AS (
+  SELECT
+    tq.TagName,
+    tq.tag_id,
+    hr.question_id,
+    hr.Title,
+    hr.hotness_score,
+    ROW_NUMBER() OVER (PARTITION BY tq.tag_id ORDER BY hr.hotness_score DESC) AS rn
+  FROM tag_questions tq
+  JOIN hot_ranked hr ON EXISTS (
+    SELECT 1 FROM UNNEST(hr.tag_array) AS t(tag) WHERE t.tag ILIKE tq.TagName
+  )
+  WHERE tq.question_count >= 50
+)
+SELECT
+  um.user_id,
+  um.DisplayName AS user_display,
+  um.Reputation,
+  um.questions_posted,
+  um.answers_posted,
+  um.badges_earned,
+  um.upvotes_received,
+  um.downvotes_received,
+  um.avg_post_score,
+  COALESCE(uhc.hot_questions_participated,0) AS hot_questions_participated,
+  COALESCE(uhc.hotness_influence_sum,0) AS hotness_influence_sum,
+  COALESCE(uhc.avg_hotness_influence,0) AS avg_hotness_influence,
+  (SELECT STRING_AGG(tn, ', ') FROM (
+     SELECT tt.TagName AS tn
+     FROM Tags tt
+     JOIN Posts pq ON pq.PostTypeId = 1 AND pq.Tags ILIKE '%' || '<' || tt.TagName || '>' || '%' AND pq.OwnerUserId = um.user_id
+     GROUP BY tt.TagName
+     ORDER BY COUNT(*) DESC
+     LIMIT 3
+  ) s) AS top_tags,
+  (SELECT json_build_object('question_id', hr.question_id, 'title', LEFT(hr.Title,200), 'hotness', ROUND(CAST(hr.hotness_score AS numeric),3))
+   FROM hot_ranked hr
+   JOIN Posts a ON a.ParentId = hr.question_id AND a.OwnerUserId = um.user_id
+   ORDER BY hr.hotness_score DESC
+   LIMIT 1) AS top_answered_hot_question,
+  (SELECT json_agg(json_build_object('tag', tt.TagName, 'top_questions', tqs.top_questions))
+   FROM (
+     SELECT tt.TagName, STRING_AGG(CAST(json_build_object('id', q.question_id, 'title', LEFT(q.Title,120), 'score', ROUND(CAST(q.hotness_score AS numeric),3)) AS text), '||') AS top_questions
+     FROM tag_top_questions q
+     JOIN Tags tt ON tt.Id = q.tag_id
+     WHERE q.rn <= 3
+     GROUP BY tt.TagName
+     ORDER BY MAX(q.hotness_score) DESC
+     LIMIT 5
+   ) tt) AS top_tags_hot_questions
+FROM user_metrics um
+LEFT JOIN user_hot_contrib uhc ON uhc.user_id = um.user_id
+ORDER BY (COALESCE(uhc.hotness_influence_sum,0) + um.Reputation/1000.0 + um.avg_post_score) DESC
+LIMIT 100;

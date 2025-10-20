@@ -1,0 +1,35 @@
+-- {"query": "56041.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "llama-3.3-instruct", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 371} 
+
+WITH TopUsers AS (
+  SELECT u.Id, u.DisplayName, SUM(v.VoteTypeId = 2) AS UpVotes, SUM(v.VoteTypeId = 3) AS DownVotes
+  FROM Users u
+  JOIN Posts p ON u.Id = p.OwnerUserId
+  JOIN Votes v ON p.Id = v.PostId
+  GROUP BY u.Id, u.DisplayName
+  HAVING SUM(v.VoteTypeId = 2) > 1000 AND SUM(v.VoteTypeId = 3) < 500
+),
+QuestionPosts AS (
+  SELECT p.Id, p.Title, p.Score, p.ViewCount, p.Tags, p.CreationDate
+  FROM Posts p
+  JOIN PostTypes pt ON p.PostTypeId = pt.Id
+  WHERE pt.Name = 'Question'
+),
+AnswerPosts AS (
+  SELECT p.Id, p.Score, p.ParentId, p.CreationDate
+  FROM Posts p
+  JOIN PostTypes pt ON p.PostTypeId = pt.Id
+  WHERE pt.Name = 'Answer'
+),
+TopQuestionPosts AS (
+  SELECT qp.Id, qp.Title, qp.Score, qp.ViewCount, qp.Tags, qp.CreationDate,
+         ROW_NUMBER() OVER (ORDER BY qp.Score DESC) AS RowNum
+  FROM QuestionPosts qp
+)
+SELECT tu.DisplayName, tu.UpVotes, tu.DownVotes,
+       tqp.Title, tqp.Score, tqp.ViewCount, tqp.Tags, tqp.CreationDate,
+       ap.Score AS AnswerScore, ap.CreationDate AS AnswerDate
+FROM TopUsers tu
+JOIN TopQuestionPosts tqp ON tu.Id = tqp.Id
+JOIN AnswerPosts ap ON tqp.Id = ap.ParentId
+WHERE tqp.RowNum <= 10 AND ap.Score > 10
+ORDER BY tqp.Score DESC;

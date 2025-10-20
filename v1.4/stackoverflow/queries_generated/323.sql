@@ -1,0 +1,66 @@
+-- {"query": "323.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 18663} 
+;WITH Q AS (
+  SELECT
+    p.Id AS PostId,
+    'Question' AS PostTypeName,
+    p.OwnerUserId,
+    p.Title,
+    p.ViewCount,
+    p.Score,
+    ISNULL(s.UpVotes, 0) AS UpVotes,
+    ISNULL(s.DownVotes, 0) AS DownVotes,
+    s.LastVoteDate,
+    ISNULL(p.LastEditorDisplayName, 'Unknown') AS LastEditorDisplayName,
+    p.LastActivityDate,
+    CASE WHEN p.Tags IS NULL THEN 0 ELSE LEN(p.Tags) - LEN(REPLACE(p.Tags, '<', '')) END AS TagCount,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankWithinOwner,
+    (p.Score + 0.8 * LOG(1.0 + CAST(p.ViewCount AS float)) + 1.5 * ISNULL(s.UpVotes, 0) - 0.75 * ISNULL(s.DownVotes, 0)) AS WeightedScore,
+    LOWER(CONVERT(VARCHAR(32), HASHBYTES('MD5', p.Title), 2)) AS TitleHash,
+    ISNULL((SELECT TOP 1 c.Score FROM Comments c WHERE c.PostId = p.Id ORDER BY c.CreationDate DESC), 0) AS LatestCommentScore
+  FROM Posts p
+  LEFT JOIN (
+    SELECT PostId,
+           SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+           SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+           MAX(CreationDate) AS LastVoteDate
+    FROM Votes
+    GROUP BY PostId
+  ) s ON s.PostId = p.Id
+  WHERE p.PostTypeId = 1
+),
+A AS (
+  SELECT
+    p.Id AS PostId,
+    'Answer' AS PostTypeName,
+    p.OwnerUserId,
+    p.Title,
+    p.ViewCount,
+    p.Score,
+    ISNULL(s.UpVotes, 0) AS UpVotes,
+    ISNULL(s.DownVotes, 0) AS DownVotes,
+    s.LastVoteDate,
+    ISNULL(p.LastEditorDisplayName, 'Unknown') AS LastEditorDisplayName,
+    p.LastActivityDate,
+    CASE WHEN p.Tags IS NULL THEN 0 ELSE LEN(p.Tags) - LEN(REPLACE(p.Tags, '<', '')) END AS TagCount,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankWithinOwner,
+    (p.Score + 0.8 * LOG(1.0 + CAST(p.ViewCount AS float)) + 1.5 * ISNULL(s.UpVotes, 0) - 0.75 * ISNULL(s.DownVotes, 0)) AS WeightedScore,
+    LOWER(CONVERT(VARCHAR(32), HASHBYTES('MD5', p.Title), 2)) AS TitleHash,
+    ISNULL((SELECT TOP 1 c.Score FROM Comments c WHERE c.PostId = p.Id ORDER BY c.CreationDate DESC), 0) AS LatestCommentScore
+  FROM Posts p
+  LEFT JOIN (
+    SELECT PostId,
+           SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+           SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+           MAX(CreationDate) AS LastVoteDate
+    FROM Votes
+    GROUP BY PostId
+  ) s ON s.PostId = p.Id
+  WHERE p.PostTypeId = 2
+)
+SELECT *
+FROM Q
+UNION ALL
+SELECT *
+FROM A
+ORDER BY WeightedScore DESC
+OFFSET 0 ROWS FETCH NEXT 300 ROWS ONLY;

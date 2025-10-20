@@ -1,0 +1,167 @@
+WITH TopUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(p.Score) AS TotalScore,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS UserRank
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    WHERE 
+        u.Reputation > 1000
+    GROUP BY 
+        u.Id, u.Reputation, u.DisplayName
+    HAVING 
+        COUNT(DISTINCT p.Id) > 10
+),
+BadgeSummary AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        MAX(b.Date) AS LatestBadgeDate
+    FROM 
+        Badges b
+    GROUP BY 
+        b.UserId
+),
+QuestionStats AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        COUNT(p.Id) AS QuestionCount,
+        AVG(p.Score) AS AvgQuestionScore,
+        MAX(p.ViewCount) AS MaxViewCount,
+        SUM(p.AnswerCount) AS TotalAnswers
+    FROM 
+        Posts p
+    WHERE 
+        p.PostTypeId = 1
+    GROUP BY 
+        p.OwnerUserId
+),
+AnswerStats AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        COUNT(p.Id) AS AnswerCount,
+        AVG(p.Score) AS AvgAnswerScore,
+        SUM(CASE WHEN p.Id = parent.AcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedAnswers
+    FROM 
+        Posts p
+    INNER JOIN 
+        Posts parent ON p.ParentId = parent.Id
+    WHERE 
+        p.PostTypeId = 2
+    GROUP BY 
+        p.OwnerUserId
+),
+VoteAnalysis AS (
+    SELECT 
+        v.UserId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpvotesGiven,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownvotesGiven
+    FROM 
+        Votes v
+    WHERE 
+        v.UserId IS NOT NULL
+    GROUP BY 
+        v.UserId
+),
+TagPopularity AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        COUNT(DISTINCT pl.RelatedPostId) AS LinkedPosts
+    FROM 
+        Tags t
+    LEFT JOIN 
+        PostLinks pl ON pl.LinkTypeId = 1 AND pl.RelatedPostId IS NOT NULL
+    LEFT JOIN 
+        Posts linked ON pl.RelatedPostId = linked.Id
+    WHERE 
+        t.Count > 1000
+    GROUP BY 
+        t.TagName, t.Count
+    HAVING 
+        COUNT(DISTINCT pl.RelatedPostId) > 50
+),
+EditHistory AS (
+    SELECT 
+        ph.UserId,
+        COUNT(ph.Id) AS EditCount,
+        AVG(EXTRACT(EPOCH FROM (ph.CreationDate - p.CreationDate)) / 3600.0) AS AvgEditTimeHours
+    FROM 
+        PostHistory ph
+    INNER JOIN 
+        Posts p ON ph.PostId = p.Id
+    WHERE 
+        ph.PostHistoryTypeId IN (4,5,6,7,8,9)
+    GROUP BY 
+        ph.UserId
+)
+SELECT 
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.UserRank,
+    bs.GoldBadges,
+    bs.SilverBadges,
+    bs.BronzeBadges,
+    qs.QuestionCount,
+    qs.AvgQuestionScore,
+    qs.MaxViewCount,
+    qs.TotalAnswers,
+    ans.AnswerCount,
+    ans.AvgAnswerScore,
+    ans.AcceptedAnswers,
+    va.UpvotesGiven,
+    va.DownvotesGiven,
+    eh.EditCount,
+    eh.AvgEditTimeHours,
+    (
+      SELECT STRING_AGG(tp.TagName, ', ' ORDER BY tp.TagCount DESC)
+      FROM TagPopularity tp
+      WHERE tp.TagName IS NOT NULL
+      LIMIT 5
+    ) AS TopTags
+FROM 
+    TopUsers tu
+LEFT JOIN 
+    BadgeSummary bs ON tu.UserId = bs.UserId
+LEFT JOIN 
+    QuestionStats qs ON tu.UserId = qs.UserId
+LEFT JOIN 
+    AnswerStats ans ON tu.UserId = ans.UserId
+LEFT JOIN 
+    VoteAnalysis va ON tu.UserId = va.UserId
+LEFT JOIN 
+    EditHistory eh ON tu.UserId = eh.UserId
+WHERE 
+    tu.UserRank <= 100
+    AND (COALESCE(bs.GoldBadges, 0) > 0 OR COALESCE(ans.AcceptedAnswers, 0) > 10)
+GROUP BY
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.UserRank,
+    bs.GoldBadges,
+    bs.SilverBadges,
+    bs.BronzeBadges,
+    qs.QuestionCount,
+    qs.AvgQuestionScore,
+    qs.MaxViewCount,
+    qs.TotalAnswers,
+    ans.AnswerCount,
+    ans.AvgAnswerScore,
+    ans.AcceptedAnswers,
+    va.UpvotesGiven,
+    va.DownvotesGiven,
+    eh.EditCount,
+    eh.AvgEditTimeHours,
+    tu.PostCount,
+    tu.TotalScore
+ORDER BY 
+    tu.Reputation DESC, tu.PostCount DESC;

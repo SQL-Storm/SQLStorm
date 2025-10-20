@@ -1,0 +1,255 @@
+-- {"query": "38058.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 2521} 
+with recent_days as (
+  select generate_series(date_trunc('day', cast('2024-10-01 12:34:56' as timestamp)) - interval '29 days', date_trunc('day', cast('2024-10-01 12:34:56' as timestamp)), interval '1 day') as day
+),
+active_users as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         date_trunc('day', u.creationdate) as created_day
+  from users u
+  where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+question_posts as (
+  select p.id,
+         p.owneruserid as user_id,
+         date_trunc('day', p.creationdate) as day,
+         p.score,
+         p.viewcount,
+         p.answercount,
+         p.favoritecount,
+         coalesce(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><'), '{}') as tag_array
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+answer_posts as (
+  select p.id,
+         p.owneruserid as user_id,
+         date_trunc('day', p.creationdate) as day,
+         p.score,
+         p.parentid as question_id
+  from posts p
+  where p.posttypeid = 2
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+comments_cte as (
+  select c.id,
+         c.userid as user_id,
+         c.postid,
+         date_trunc('day', c.creationdate) as day,
+         c.score
+  from comments c
+  where c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+votes_cte as (
+  select v.postid,
+         v.userid as user_id,
+         date_trunc('day', v.creationdate) as day,
+         v.votetypeid,
+         v.bountyamount
+  from votes v
+  where v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+    and v.votetypeid in (1,2,3,5,8,9)
+),
+tag_exploded as (
+  select qp.id as question_id,
+         qp.user_id,
+         qp.day,
+         qp.score,
+         qp.viewcount,
+         qp.answercount,
+         qp.favoritecount,
+         unnest(qp.tag_array) as tag_name
+  from question_posts qp
+),
+top_tags as (
+  select te.tag_name,
+         count(*) as q_count,
+         sum(te.viewcount) as total_views,
+         sum(greatest(te.score,0)) as nonneg_score
+  from tag_exploded te
+  group by te.tag_name
+  having count(*) >= 50
+),
+user_daily_activity as (
+  select au.user_id,
+         d.day,
+         coalesce(q.q_count,0) as questions,
+         coalesce(a.a_count,0) as answers,
+         coalesce(cm.c_count,0) as comments,
+         coalesce(vu.upvotes,0) as upvotes,
+         coalesce(vd.downvotes,0) as downvotes,
+         coalesce(b.bounty_given,0) as bounty_given,
+         coalesce(br.bounty_received,0) as bounty_received
+  from active_users au
+  cross join recent_days d
+  left join lateral (
+    select count(*) as q_count
+    from question_posts qp
+    where qp.user_id = au.user_id and qp.day = d.day
+  ) q on true
+  left join lateral (
+    select count(*) as a_count
+    from answer_posts ap
+    where ap.user_id = au.user_id and ap.day = d.day
+  ) a on true
+  left join lateral (
+    select count(*) as c_count
+    from comments_cte c
+    where c.user_id = au.user_id and c.day = d.day
+  ) cm on true
+  left join lateral (
+    select count(*) as upvotes
+    from votes_cte v
+    where v.user_id = au.user_id and v.day = d.day and v.votetypeid = 2
+  ) vu on true
+  left join lateral (
+    select count(*) as downvotes
+    from votes_cte v
+    where v.user_id = au.user_id and v.day = d.day and v.votetypeid = 3
+  ) vd on true
+  left join lateral (
+    select coalesce(sum(v.bountyamount),0) as bounty_given
+    from votes_cte v
+    where v.user_id = au.user_id and v.day = d.day and v.votetypeid = 8
+  ) b on true
+  left join lateral (
+    select coalesce(sum(v.bountyamount),0) as bounty_received
+    from votes_cte v
+    join answer_posts ap on ap.id = v.postid
+    join posts q on q.id = ap.question_id
+    where ap.user_id = au.user_id and v.day = d.day and v.votetypeid = 9
+  ) br on true
+),
+rolling_agg as (
+  select uda.user_id,
+         uda.day,
+         sum(uda.questions) over (partition by uda.user_id order by uda.day rows between 6 preceding and current row) as q_7d,
+         sum(uda.answers) over (partition by uda.user_id order by uda.day rows between 6 preceding and current row) as a_7d,
+         sum(uda.comments) over (partition by uda.user_id order by uda.day rows between 6 preceding and current row) as c_7d,
+         sum(uda.upvotes - uda.downvotes) over (partition by uda.user_id order by uda.day rows between 6 preceding and current row) as netvotes_7d,
+         sum(uda.bounty_received - uda.bounty_given) over (partition by uda.user_id order by uda.day rows between 6 preceding and current row) as netbounty_7d
+  from user_daily_activity uda
+),
+question_quality as (
+  select qp.id as question_id,
+         qp.user_id,
+         qp.day,
+         qp.score,
+         qp.viewcount,
+         qp.answercount,
+         qp.favoritecount,
+         coalesce(sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end),0) as net_votes,
+         count(distinct cm.id) as distinct_commenters
+  from question_posts qp
+  left join votes v on v.postid = qp.id and v.creationdate >= qp.day and v.creationdate < qp.day + interval '1 day'
+  left join comments cm on cm.postid = qp.id and cm.creationdate >= qp.day and cm.creationdate < qp.day + interval '1 day'
+  group by qp.id, qp.user_id, qp.day, qp.score, qp.viewcount, qp.answercount, qp.favoritecount
+),
+answer_latency as (
+  select q.id as question_id,
+         min(a.creationdate) - q.creationdate as first_answer_latency
+  from posts q
+  left join posts a on a.parentid = q.id and a.posttypeid = 2
+  where q.posttypeid = 1
+    and q.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  group by q.id
+),
+user_tag_affinity as (
+  select te.user_id,
+         te.tag_name,
+         count(*) as tag_questions,
+         sum(te.score) as tag_score,
+         sum(te.viewcount) as tag_views
+  from tag_exploded te
+  group by te.user_id, te.tag_name
+),
+user_top_tag as (
+  select uta.user_id,
+         uta.tag_name,
+         uta.tag_questions,
+         uta.tag_score,
+         uta.tag_views,
+         row_number() over (partition by uta.user_id order by uta.tag_questions desc, uta.tag_score desc) as rn
+  from user_tag_affinity uta
+  join top_tags tt on tt.tag_name = uta.tag_name
+),
+accepted_answer_stats as (
+  select q.owneruserid as asker_id,
+         a.owneruserid as answerer_id,
+         count(*) filter (where q.acceptedanswerid = a.id) as accepted_answers,
+         count(*) as total_answers,
+         sum(greatest(a.score,0)) as nonneg_answer_score
+  from posts q
+  join posts a on a.parentid = q.id and a.posttypeid = 2
+  where q.posttypeid = 1
+    and q.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  group by q.owneruserid, a.owneruserid
+),
+user_scores as (
+  select au.user_id,
+         sum(case when p.posttypeid = 1 then greatest(p.score,0) else 0 end) as pos_q_score,
+         sum(case when p.posttypeid = 2 then greatest(p.score,0) else 0 end) as pos_a_score,
+         sum(case when p.posttypeid = 1 then p.viewcount else 0 end) as q_views
+  from active_users au
+  left join posts p on p.owneruserid = au.user_id and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  group by au.user_id
+),
+final_users as (
+  select au.user_id,
+         au.displayname,
+         au.reputation,
+         coalesce(us.pos_q_score,0) + coalesce(us.pos_a_score,0) as pos_score_total,
+         coalesce(us.q_views,0) as q_views_total,
+         coalesce(max(case when ut.rn = 1 then ut.tag_name end), 'untagged') as top_tag
+  from active_users au
+  left join user_scores us on us.user_id = au.user_id
+  left join user_top_tag ut on ut.user_id = au.user_id and ut.rn = 1
+  group by au.user_id, au.displayname, au.reputation, us.pos_q_score, us.pos_a_score, us.q_views
+),
+recent_quality as (
+  select qq.user_id,
+         percentile_cont(0.5) within group (order by qq.net_votes) as median_net_votes_day,
+         avg(qq.viewcount) as avg_views_day,
+         avg(qq.answercount) as avg_answers_day
+  from question_quality qq
+  where qq.day >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+  group by qq.user_id
+)
+select
+  fu.user_id,
+  fu.displayname,
+  fu.reputation,
+  fu.top_tag,
+  fu.pos_score_total,
+  fu.q_views_total,
+  ra.q_7d,
+  ra.a_7d,
+  ra.c_7d,
+  ra.netvotes_7d,
+  ra.netbounty_7d,
+  rq.median_net_votes_day,
+  rq.avg_views_day,
+  rq.avg_answers_day,
+  aas.accepted_answers,
+  aas.total_answers,
+  aas.nonneg_answer_score,
+  avg(al.first_answer_latency) as avg_first_answer_latency
+from final_users fu
+left join rolling_agg ra on ra.user_id = fu.user_id and ra.day = date_trunc('day', cast('2024-10-01 12:34:56' as timestamp))
+left join recent_quality rq on rq.user_id = fu.user_id
+left join accepted_answer_stats aas on aas.answerer_id = fu.user_id
+left join answer_latency al on al.question_id in (
+  select id from posts where owneruserid = fu.user_id and posttypeid = 1 and creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+)
+group by
+  fu.user_id, fu.displayname, fu.reputation, fu.top_tag, fu.pos_score_total, fu.q_views_total,
+  ra.q_7d, ra.a_7d, ra.c_7d, ra.netvotes_7d, ra.netbounty_7d,
+  rq.median_net_votes_day, rq.avg_views_day, rq.avg_answers_day,
+  aas.accepted_answers, aas.total_answers, aas.nonneg_answer_score
+order by
+  fu.reputation desc nulls last,
+  fu.pos_score_total desc,
+  ra.netvotes_7d desc
+limit 250;

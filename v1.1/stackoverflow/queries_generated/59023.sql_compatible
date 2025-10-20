@@ -1,0 +1,68 @@
+SELECT 
+    p.Id as PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    u.DisplayName as OwnerName,
+    u.Reputation,
+    COUNT(DISTINCT v.Id) as VoteCount,
+    COUNT(DISTINCT c.Id) as CommentCount,
+    COUNT(DISTINCT ph.Id) as HistoryCount,
+    COUNT(DISTINCT pl.Id) as LinkCount,
+    STRING_AGG(DISTINCT t.TagName, ', ') as Tags,
+    CASE 
+        WHEN p.PostTypeId = 1 THEN 'Question'
+        WHEN p.PostTypeId = 2 THEN 'Answer'
+        WHEN p.PostTypeId = 3 THEN 'Wiki'
+        WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+        WHEN p.PostTypeId = 5 THEN 'TagWiki'
+        ELSE 'Other'
+    END as PostType,
+    CASE 
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        WHEN p.AnswerCount > 0 THEN 'Answered'
+        ELSE 'Unanswered'
+    END as Status,
+    COALESCE(p.AnswerCount, 0) as AnswerCount,
+    COALESCE(p.FavoriteCount, 0) as FavoriteCount,
+    MAX(v.CreationDate) as LastVoteDate,
+    MAX(c.CreationDate) as LastCommentDate,
+    MAX(ph.CreationDate) as LastHistoryDate,
+    COUNT(DISTINCT b.Id) as BadgeCount,
+    AVG(p.Score) OVER (PARTITION BY u.Id) as UserAvgScore,
+    DENSE_RANK() OVER (ORDER BY p.Score DESC) as ScoreRank,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) as PostTypeRank
+FROM Posts p
+INNER JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+LEFT JOIN Comments c ON p.Id = c.PostId
+LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN (
+    SELECT PostId, STRING_AGG(TagName, ', ') as TagName
+    FROM (
+        SELECT p.Id as PostId, unnest(string_to_array(p.Tags, '>')) as TagName
+        FROM Posts p
+        WHERE p.Tags IS NOT NULL AND p.Tags <> ''
+    ) t
+    GROUP BY PostId
+) t ON p.Id = t.PostId
+LEFT JOIN Badges b ON u.Id = b.UserId
+WHERE p.CreationDate >= DATE '2023-01-01'
+    AND p.CreationDate < DATE '2024-01-01'
+    AND p.PostTypeId IN (1, 2)
+    AND u.Reputation > 100
+GROUP BY 
+    p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate, 
+    u.DisplayName, u.Reputation, p.PostTypeId, 
+    p.ClosedDate, p.CommunityOwnedDate, p.AnswerCount, 
+    p.FavoriteCount, u.Id
+HAVING 
+    COUNT(DISTINCT v.Id) > 0 
+    OR COUNT(DISTINCT c.Id) > 0
+ORDER BY 
+    p.Score DESC,
+    p.CreationDate DESC
+LIMIT 1000;

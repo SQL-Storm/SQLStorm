@@ -1,0 +1,203 @@
+WITH
+UserMetrics AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsCount,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersCount,
+    COALESCE(SUM(p.ViewCount) FILTER (WHERE p.PostTypeId = 1),0) AS QuestionViews,
+    COALESCE(SUM(p.Score) FILTER (WHERE p.PostTypeId = 2),0) AS AnswerScore,
+    COALESCE(SUM(v_up.votes),0) AS UpVotesReceived,
+    COALESCE(SUM(bad.BadgesCount),0) AS BadgeCount,
+    (COALESCE(SUM(p.ViewCount) FILTER (WHERE p.PostTypeId = 1),0) * 0.001
+     + COALESCE(SUM(p.Score) FILTER (WHERE p.PostTypeId = 2),0) * 2
+     + COALESCE(SUM(v_up.votes),0) * 1.5
+     + COALESCE(SUM(bad.BadgesCount),0) * 5
+     + COALESCE(u.Reputation,0) * 0.01) AS PerformanceScore
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT p.OwnerUserId, COUNT(*) AS votes
+    FROM Posts p
+    JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 2
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+  ) v_up ON v_up.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT UserId, COUNT(*) AS BadgesCount
+    FROM Badges
+    GROUP BY UserId
+  ) bad ON bad.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RecentActivity AS (
+  SELECT
+    um.UserId,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1 AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') AS RecentQuestions,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2 AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') AS RecentAnswers,
+    COALESCE(SUM(v_up_recent.votes),0) AS RecentUpVotesReceived,
+    COALESCE(MAX(p.LastActivityDate), timestamp '1970-01-01') AS LastActivity
+  FROM UserMetrics um
+  LEFT JOIN Posts p ON p.OwnerUserId = um.UserId AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  LEFT JOIN (
+    SELECT p.OwnerUserId, COUNT(*) AS votes
+    FROM Posts p
+    JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 2 AND v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+  ) v_up_recent ON v_up_recent.OwnerUserId = um.UserId
+  GROUP BY um.UserId
+),
+UserTagInfluence AS (
+  SELECT
+    p.OwnerUserId AS UserId,
+    lower(trim(t.tag)) AS TagName,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 3 ELSE 1 END) * AVG(COALESCE(p.Score,0) + 1) AS TagInfluenceScore
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT regexp_split_to_table(substring(p.Tags from 2 for char_length(p.Tags)-2), '><') AS tag
+  ) t
+  WHERE p.Tags IS NOT NULL AND p.Tags <> ''
+    AND p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId, lower(trim(t.tag))
+),
+TopUserTags AS (
+  SELECT ut.UserId, ut.TagName, ut.TagInfluenceScore,
+         RANK() OVER (PARTITION BY ut.UserId ORDER BY ut.TagInfluenceScore DESC) AS rk
+  FROM UserTagInfluence ut
+),
+Top3TagsPerUser AS (
+  SELECT UserId,
+         STRING_AGG(TagName || ':' || TRIM(TO_CHAR(TagInfluenceScore, 'FM9999999990.00')), ', ') AS TopTags
+  FROM TopUserTags
+  WHERE rk <= 3
+  GROUP BY UserId
+),
+UserHotPosts AS (
+  SELECT
+    p.OwnerUserId AS UserId,
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    COALESCE(c.CommentCnt,0) AS RealComments,
+    COALESCE(pl.LinkInCount,0) AS IncomingLinks,
+    (COALESCE(p.ViewCount,0) * 0.002 + COALESCE(p.Score,0) * 3 + COALESCE(c.CommentCnt,0) * 2 + COALESCE(pl.LinkInCount,0) * 4)
+      / GREATEST(EXTRACT(epoch FROM (cast('2024-10-01 12:34:56' as timestamp) - p.CreationDate))/86400.0, 1) AS Hotness
+  FROM Posts p
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS CommentCnt
+    FROM Comments
+    GROUP BY PostId
+  ) c ON c.PostId = p.Id
+  LEFT JOIN (
+    SELECT RelatedPostId, COUNT(*) AS LinkInCount
+    FROM PostLinks
+    GROUP BY RelatedPostId
+  ) pl ON pl.RelatedPostId = p.Id
+  WHERE p.OwnerUserId IS NOT NULL
+),
+TopHotPostPerUser AS (
+  SELECT hp.UserId, hp.PostId, hp.Title, hp.Hotness,
+         ROW_NUMBER() OVER (PARTITION BY hp.UserId ORDER BY hp.Hotness DESC) AS rn
+  FROM UserHotPosts hp
+),
+Top1HotPost AS (
+  SELECT UserId, PostId, Title, Hotness
+  FROM TopHotPostPerUser
+  WHERE rn = 1
+),
+LeaderboardBase AS (
+  SELECT
+    um.UserId,
+    um.DisplayName,
+    um.Reputation,
+    um.QuestionsCount,
+    um.AnswersCount,
+    um.QuestionViews,
+    um.AnswerScore,
+    um.UpVotesReceived,
+    um.BadgeCount,
+    ROUND(um.PerformanceScore::numeric,2) AS PerformanceScore,
+    ra.RecentQuestions,
+    ra.RecentAnswers,
+    ra.RecentUpVotesReceived,
+    ra.LastActivity,
+    t3.TopTags,
+    hp.PostId AS HotPostId,
+    hp.Title AS HotPostTitle,
+    ROUND(hp.Hotness::numeric,2) AS HotPostHotness
+  FROM UserMetrics um
+  LEFT JOIN RecentActivity ra ON ra.UserId = um.UserId
+  LEFT JOIN Top3TagsPerUser t3 ON t3.UserId = um.UserId
+  LEFT JOIN Top1HotPost hp ON hp.UserId = um.UserId
+),
+Top50 AS (
+  SELECT *
+  FROM LeaderboardBase
+  ORDER BY PerformanceScore DESC, RecentAnswers DESC, Reputation DESC
+  LIMIT 50
+)
+SELECT
+  ROW_NUMBER() OVER (ORDER BY t.PerformanceScore DESC) AS Rank,
+  t.UserId,
+  t.DisplayName,
+  t.Reputation,
+  t.QuestionsCount,
+  t.AnswersCount,
+  t.QuestionViews,
+  t.AnswerScore,
+  t.UpVotesReceived,
+  t.BadgeCount,
+  t.PerformanceScore,
+  t.RecentQuestions,
+  t.RecentAnswers,
+  t.RecentUpVotesReceived,
+  t.LastActivity,
+  COALESCE(t.TopTags, '(none)') AS TopTags,
+  t.HotPostId,
+  SUBSTRING(COALESCE(t.HotPostTitle,''),1,120) AS HotPostTitleSnippet,
+  t.HotPostHotness,
+  COALESCE(ans.AcceptedCount,0) AS AcceptedAnswers,
+  COALESCE(ans.TotalAnswers,0) AS TotalAnswers,
+  CASE WHEN COALESCE(ans.TotalAnswers,0) = 0 THEN 0
+       ELSE ROUND(100.0 * COALESCE(ans.AcceptedCount,0) / ans.TotalAnswers::numeric,2) END AS AnswerAcceptanceRate,
+  ROUND(COALESCE(avg_scores.AvgAnswerScore,0)::numeric,2) AS AvgAnswerScore,
+  ROUND(COALESCE(avg_scores.AvgQuestionScore,0)::numeric,2) AS AvgQuestionScore,
+  global.TopTagOverall,
+  global.TopTagCount
+FROM Top50 t
+LEFT JOIN (
+  SELECT p.OwnerUserId AS UserId,
+         SUM(CASE WHEN p.PostTypeId = 2 AND p.Id = ap.Id THEN 1 ELSE 0 END) AS AcceptedCount,
+         COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS TotalAnswers
+  FROM Posts p
+  LEFT JOIN Posts ap ON ap.Id = p.ParentId AND ap.AcceptedAnswerId = p.Id
+  GROUP BY p.OwnerUserId
+) ans ON ans.UserId = t.UserId
+LEFT JOIN (
+  SELECT
+    p.OwnerUserId AS UserId,
+    AVG(CASE WHEN p.PostTypeId = 2 THEN COALESCE(p.Score,0) END) AS AvgAnswerScore,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN COALESCE(p.Score,0) END) AS AvgQuestionScore
+  FROM Posts p
+  WHERE p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId
+) avg_scores ON avg_scores.UserId = t.UserId
+CROSS JOIN LATERAL (
+  SELECT tg.TagName AS TopTagOverall, tg.TotalCount AS TopTagCount
+  FROM (
+    SELECT lower(trim(regexp_split_to_table(substring(Tags from 2 for char_length(Tags)-2), '><'))) AS TagName,
+           COUNT(*) AS TotalCount
+    FROM Posts
+    WHERE Tags IS NOT NULL AND Tags <> ''
+    GROUP BY lower(trim(regexp_split_to_table(substring(Tags from 2 for char_length(Tags)-2), '><')))
+    ORDER BY TotalCount DESC
+    LIMIT 1
+  ) tg
+) global
+ORDER BY Rank;

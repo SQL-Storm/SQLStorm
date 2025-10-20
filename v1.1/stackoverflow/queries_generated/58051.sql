@@ -1,0 +1,56 @@
+-- {"query": "58051.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "deepseek-r1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2033, "output_tokens": 1473} 
+
+WITH ActiveUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation, COUNT(p.Id) AS PostCount,
+           AVG(p.Score) OVER (PARTITION BY u.Id) AS AvgPostScore,
+           RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.CreationDate >= '2022-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, p.Score
+),
+UserVotes AS (
+    SELECT v.UserId, 
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes
+    FROM Votes v
+    WHERE v.CreationDate >= '2022-01-01'
+    GROUP BY v.UserId
+),
+UserBadges AS (
+    SELECT b.UserId, COUNT(*) AS GoldBadges
+    FROM Badges b
+    WHERE b.Class = 1
+    GROUP BY b.UserId
+),
+PostEdits AS (
+    SELECT ph.PostId, COUNT(*) AS EditCount
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (5, 6)
+      AND ph.CreationDate >= '2022-01-01'
+    GROUP BY ph.PostId
+)
+SELECT au.Id, au.DisplayName, au.Reputation, au.PostCount,
+       au.AvgPostScore, au.ReputationRank,
+       uv.Upvotes, uv.Downvotes,
+       ub.GoldBadges,
+       COALESCE(SUM(pe.EditCount), 0) AS TotalEdits,
+       (SELECT COUNT(*) FROM Comments c WHERE c.UserId = au.Id) AS CommentCount,
+       STRING_AGG(DISTINCT t.TagName, ', ') AS FrequentTags
+FROM ActiveUsers au
+LEFT JOIN UserVotes uv ON au.Id = uv.UserId
+LEFT JOIN UserBadges ub ON au.Id = ub.UserId
+LEFT JOIN Posts p ON au.Id = p.OwnerUserId
+LEFT JOIN PostEdits pe ON p.Id = pe.PostId
+LEFT JOIN (
+    SELECT Id, UNNEST(STRING_TO_ARRAY(REPLACE(REPLACE(Tags, '><', ','), '<', ''), '>', ''), ',')) AS TagName
+    FROM Posts WHERE PostTypeId = 1
+) t ON p.Id = t.Id
+WHERE au.Reputation > 10000
+  AND au.PostCount > 50
+GROUP BY au.Id, au.DisplayName, au.Reputation, au.PostCount,
+         au.AvgPostScore, au.ReputationRank, uv.Upvotes,
+         uv.Downvotes, ub.GoldBadges
+ORDER BY (au.Reputation * 0.3 + au.PostCount * 0.7) DESC
+LIMIT 100;

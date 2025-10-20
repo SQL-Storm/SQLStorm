@@ -1,0 +1,60 @@
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.PostTypeId,
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  p.Body,
+  p.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation,
+  p.AcceptedAnswerId,
+  p.CommentCount,
+  p.Tags,
+  CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 3600 AS INTEGER) AS HoursSinceCreation,
+  COALESCE(vs.UpVotes, 0) AS UpVotesToday,
+  COALESCE(vd.DownVotes, 0) AS DownVotesToday,
+  COALESCE(b.TotalBadges, 0) AS TotalBadgesForOwner,
+  COALESCE(h.EditCount, 0) AS EditsCount,
+  ht.Name AS LastPostHistoryType
+FROM Posts p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN (
+  SELECT v.PostId, COUNT(*) AS UpVotes
+  FROM Votes v
+  JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  WHERE vt.Name = 'UpMod'
+  GROUP BY v.PostId
+) vs ON p.Id = vs.PostId
+LEFT JOIN (
+  SELECT v.PostId, COUNT(*) AS DownVotes
+  FROM Votes v
+  JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  WHERE vt.Name = 'DownMod'
+  GROUP BY v.PostId
+) vd ON p.Id = vd.PostId
+LEFT JOIN (
+  SELECT b2.OwnerUserId, COUNT(*) AS TotalBadges
+  FROM Badges b2
+  GROUP BY b2.OwnerUserId
+) b ON p.OwnerUserId = b.OwnerUserId
+LEFT JOIN (
+  SELECT ph2.PostId, COUNT(*) AS EditCount
+  FROM PostHistory ph2
+  WHERE ph2.PostHistoryTypeId IN (4,5,6)
+  GROUP BY ph2.PostId
+) h ON p.Id = h.PostId
+LEFT JOIN LATERAL (
+  SELECT ph3.PostId, pht.Name, ph3.Id
+  FROM PostHistory ph3
+  JOIN PostHistoryTypes pht ON ph3.PostHistoryTypeId = pht.Id
+  WHERE ph3.PostId = p.Id
+  ORDER BY ph3.Id DESC
+  LIMIT 1
+) ph_latest ON true
+LEFT JOIN PostHistoryTypes ht ON ph_latest.PostHistoryTypeId = ht.Id
+WHERE p.PostTypeId = 1
+  AND p.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days'
+ORDER BY p.Score DESC, p.ViewCount DESC
+LIMIT 100;

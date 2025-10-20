@@ -1,0 +1,51 @@
+-- {"query": "36082.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 476} 
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.PostTypeId,
+  p.CreationDate,
+  p.ViewCount,
+  p.Score,
+  p.AnswerCount,
+  p.CommentCount,
+  p.Tags,
+  p.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation,
+  COUNT(DISTINCT v.Id) AS TotalVotes,
+  SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+  SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+  AVG(CASE WHEN v.VoteTypeId IN (2,3) THEN v.BountyAmount ELSE NULL END) AS AvgVoteBounty,
+  MAX(CASE WHEN vh.PostHistoryTypeId = 16 THEN vh.CreationDate END) AS CommunityOwnedDate,
+  (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCountTotal,
+  (SELECT STRING_AGG(CONCAT(TH.Name, ':', vh.CreationDate), ';') 
+     WITHIN GROUP (ORDER BY vh.CreationDate)
+     FROM PostHistory vh
+     JOIN PostHistoryTypes TH ON vh.PostHistoryTypeId = TH.Id
+     WHERE vh.PostId = p.Id AND vh.PostHistoryTypeId IN (16,50,52)) AS HistorySnapshots
+FROM
+  Posts p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Votes v ON v.PostId = p.Id
+LEFT JOIN PostHistory vh ON vh.PostId = p.Id
+LEFT JOIN PostHistoryTypes TH ON vh.PostHistoryTypeId = TH.Id
+WHERE
+  p.PostTypeId IN (1,2) -- Questions and Answers
+  AND p.CreationDate >= NOW() - INTERVAL '90 days'
+GROUP BY
+  p.Id,
+  p.Title,
+  p.PostTypeId,
+  p.CreationDate,
+  p.ViewCount,
+  p.Score,
+  p.AnswerCount,
+  p.CommentCount,
+  p.Tags,
+  p.OwnerUserId,
+  u.DisplayName,
+  u.Reputation
+ORDER BY
+  p.Score DESC,
+  TotalVotes DESC
+LIMIT 100;

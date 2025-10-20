@@ -1,0 +1,131 @@
+WITH RecentActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) AS PostCount,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    JOIN Posts p
+        ON u.Id = p.OwnerUserId
+    WHERE u.LastAccessDate > (SELECT MAX(CreationDate) FROM Posts) - INTERVAL '30' DAY
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(p.Id) >= 5
+),
+TopTags AS (
+    SELECT 
+        TRIM(tag) AS TagName,
+        COUNT(*) AS TagUsage
+    FROM (
+        SELECT
+            REGEXP_SPLIT_TO_TABLE(
+                SUBSTRING(p.Tags FROM 2 FOR (LENGTH(p.Tags) - 2)),
+                '><'
+            ) AS tag
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+    ) s
+    GROUP BY TRIM(tag)
+    ORDER BY TagUsage DESC
+    LIMIT 10
+),
+TagPopularityOverTime AS (
+    SELECT 
+        tt.TagName,
+        DATE_TRUNC('month', p.CreationDate) AS Month,
+        COUNT(*) AS QuestionsPerMonth
+    FROM Posts p
+    JOIN TopTags tt ON POSITION(CONCAT('<', tt.TagName, '>') IN p.Tags) > 0
+    WHERE p.PostTypeId = 1
+    GROUP BY tt.TagName, DATE_TRUNC('month', p.CreationDate)
+),
+UserTagExpertise AS (
+    SELECT 
+        r.UserId,
+        t.TagName,
+        COUNT(*) AS AnswersOnTag,
+        AVG(p.Score) AS AvgAnswerScore
+    FROM Posts p
+    JOIN Posts question ON p.ParentId = question.Id AND question.PostTypeId = 1
+    JOIN TopTags t ON POSITION(CONCAT('<', t.TagName, '>') IN question.Tags) > 0
+    JOIN RecentActiveUsers r ON p.OwnerUserId = r.UserId
+    WHERE p.PostTypeId = 2
+    GROUP BY r.UserId, t.TagName
+    HAVING COUNT(*) >= 3
+),
+UserBadgeCounts AS (
+    SELECT 
+        b.UserId,
+        SUM(CASE WHEN b.Class=1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class=2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class=3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    WHERE b.UserId IN (SELECT UserId FROM RecentActiveUsers)
+    GROUP BY b.UserId
+),
+HotQuestions AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        COUNT(a.Id) AS AnswerCount,
+        p.CreationDate
+    FROM Posts p
+    LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '14' DAY)
+      AND p.Score >= 5 AND p.ViewCount >= 500
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate
+)
+SELECT 
+    rau.UserId,
+    rau.DisplayName,
+    rau.Reputation,
+    COALESCE(ubc.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ubc.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ubc.BronzeBadges, 0) AS BronzeBadges,
+    ute.TagName AS TopExpertiseTag,
+    ute.AnswersOnTag,
+    ute.AvgAnswerScore,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = rau.UserId AND c.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1' MONTH)) AS RecentComments,
+    hq.QuestionId AS RecentHotQuestionId,
+    hq.Title AS HotQuestionTitle,
+    hq.Score AS HotQuestionScore,
+    hq.ViewCount AS HotQuestionViews,
+    hq.AnswerCount AS HotQuestionAnswerCount
+FROM RecentActiveUsers rau
+LEFT JOIN UserBadgeCounts ubc ON ubc.UserId = rau.UserId
+LEFT JOIN LATERAL (
+    SELECT ute_sub.TagName, ute_sub.AnswersOnTag, ute_sub.AvgAnswerScore
+    FROM UserTagExpertise ute_sub
+    WHERE ute_sub.UserId = rau.UserId
+    ORDER BY ute_sub.AnswersOnTag DESC, ute_sub.AvgAnswerScore DESC
+    LIMIT 1
+) ute ON TRUE
+LEFT JOIN LATERAL (
+    SELECT hq_sub.QuestionId, hq_sub.Title, hq_sub.Score, hq_sub.ViewCount, hq_sub.AnswerCount
+    FROM HotQuestions hq_sub
+    WHERE hq_sub.QuestionId IN (
+        SELECT p.Id FROM Posts p WHERE p.OwnerUserId = rau.UserId
+    )
+    ORDER BY hq_sub.Score DESC, hq_sub.ViewCount DESC
+    LIMIT 1
+) hq ON TRUE
+GROUP BY
+    rau.UserId,
+    rau.DisplayName,
+    rau.Reputation,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    ute.TagName,
+    ute.AnswersOnTag,
+    ute.AvgAnswerScore,
+    hq.QuestionId,
+    hq.Title,
+    hq.Score,
+    hq.ViewCount,
+    hq.AnswerCount
+ORDER BY rau.Reputation DESC, ute.AnswersOnTag DESC
+LIMIT 50;

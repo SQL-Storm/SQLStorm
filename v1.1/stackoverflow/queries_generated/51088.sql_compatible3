@@ -1,0 +1,142 @@
+WITH top_users AS (
+  SELECT u.id, u.reputation, u.displayname, u.upvotes, u.downvotes
+  FROM users u
+  WHERE u.reputation > 10000
+  ORDER BY u.reputation DESC
+  LIMIT 100
+),
+user_posts AS (
+  SELECT 
+    p.owneruserid, 
+    COUNT(CASE WHEN pt.id = 1 THEN 1 END) AS question_count,
+    COUNT(CASE WHEN pt.id = 2 THEN 1 END) AS answer_count,
+    SUM(CASE WHEN pt.id = 1 THEN p.score ELSE 0 END) AS total_question_score,
+    SUM(CASE WHEN pt.id = 2 THEN p.score ELSE 0 END) AS total_answer_score,
+    AVG(p.score) AS avg_post_score,
+    MAX(p.creationdate) AS latest_post_date
+  FROM posts p
+  INNER JOIN posttypes pt ON p.posttypeid = pt.id
+  INNER JOIN top_users tu ON p.owneruserid = tu.id
+  WHERE p.score IS NOT NULL AND p.score <> 0
+  GROUP BY p.owneruserid
+),
+top_tagged_questions AS (
+  SELECT 
+    p.id AS post_id,
+    p.owneruserid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    string_to_array(
+      regexp_replace(
+        substring(p.tags FROM 2), 
+        '</?.*?>' , '', 'g'
+      ), 
+      '><'
+    ) AS tag_array
+  FROM posts p
+  INNER JOIN posttypes pt ON p.posttypeid = pt.id
+  WHERE pt.id = 1 
+    AND p.tags IS NOT NULL 
+    AND p.creationdate > CAST('2024-10-01' AS date) - INTERVAL '365 days'
+    AND p.score > 5
+),
+tagged_stats AS (
+  SELECT 
+    tq.owneruserid,
+    t.tagname AS tagname,
+    COUNT(tq.post_id) AS question_count,
+    AVG(tq.score) AS avg_score,
+    SUM(tq.viewcount) AS total_views,
+    COUNT(DISTINCT tq.post_id) FILTER (WHERE tq.score >= 50) AS high_score_questions
+  FROM top_tagged_questions tq
+  CROSS JOIN unnest(tq.tag_array) AS t(tagname)
+  INNER JOIN tags tg ON tg.tagname = t.tagname
+  GROUP BY tq.owneruserid, t.tagname
+  HAVING COUNT(tq.post_id) >= 3
+),
+comment_activity AS (
+  SELECT 
+    c.userid,
+    COUNT(c.id) AS comment_count,
+    AVG(c.score) AS avg_comment_score,
+    COUNT(CASE WHEN c.score > 0 THEN 1 END) AS upvoted_comments
+  FROM comments c
+  INNER JOIN top_users tu ON c.userid = tu.id
+  WHERE c.creationdate > CAST('2024-10-01' AS date) - INTERVAL '180 days'
+  GROUP BY c.userid
+),
+vote_patterns AS (
+  SELECT 
+    v.userid,
+    vt.name AS vote_type,
+    COUNT(v.id) AS vote_count,
+    SUM(CASE WHEN v.bountyamount > 0 THEN v.bountyamount ELSE 0 END) AS total_bounties
+  FROM votes v
+  INNER JOIN votetypes vt ON v.votetypeid = vt.id
+  INNER JOIN top_users tu ON v.userid = tu.id
+  GROUP BY v.userid, vt.name
+),
+badge_analysis AS (
+  SELECT 
+    b.userid,
+    b.class,
+    COUNT(b.id) AS badge_count,
+    STRING_AGG(b.name, ', ') AS badge_names
+  FROM badges b
+  INNER JOIN top_users tu ON b.userid = tu.id
+  GROUP BY b.userid, b.class
+)
+SELECT 
+  u.id AS user_id,
+  u.displayname,
+  u.reputation,
+  u.upvotes,
+  u.downvotes,
+  up.question_count,
+  up.answer_count,
+  up.avg_post_score,
+  ca.comment_count,
+  ca.avg_comment_score,
+  ts.tagname AS top_tag,
+  ts.question_count AS questions_in_top_tag,
+  ts.avg_score AS avg_score_in_top_tag,
+  ba.badge_count AS total_badges,
+  ba.badge_names,
+  vp.vote_count AS total_votes,
+  RANK() OVER (ORDER BY u.reputation DESC) AS reputation_rank,
+  (COALESCE(up.total_question_score,0) + COALESCE(up.total_answer_score,0)) / NULLIF(COALESCE(up.question_count,0) + COALESCE(up.answer_count,0), 0) AS score_per_post
+FROM top_users u
+LEFT JOIN user_posts up ON u.id = up.owneruserid
+LEFT JOIN comment_activity ca ON u.id = ca.userid
+LEFT JOIN (
+  SELECT 
+    owneruserid,
+    tagname,
+    question_count,
+    avg_score,
+    ROW_NUMBER() OVER (PARTITION BY owneruserid ORDER BY question_count DESC, avg_score DESC) AS rn
+  FROM tagged_stats
+) ts ON u.id = ts.owneruserid AND ts.rn = 1
+LEFT JOIN (
+  SELECT 
+    userid,
+    SUM(vote_count) AS vote_count,
+    SUM(total_bounties) AS total_bounties
+  FROM vote_patterns
+  WHERE vote_type IN ('UpMod', 'DownMod', 'AcceptedByOriginator')
+  GROUP BY userid
+) vp ON u.id = vp.userid
+LEFT JOIN (
+  SELECT 
+    userid,
+    SUM(badge_count) AS badge_count,
+    MAX(badge_names) AS badge_names
+  FROM badge_analysis
+  GROUP BY userid
+) ba ON u.id = ba.userid
+WHERE (COALESCE(up.question_count,0) + COALESCE(up.answer_count, 0)) > 10
+ORDER BY 
+  u.reputation DESC,
+  (COALESCE(up.total_question_score,0) + COALESCE(up.total_answer_score, 0)) DESC
+LIMIT 50;

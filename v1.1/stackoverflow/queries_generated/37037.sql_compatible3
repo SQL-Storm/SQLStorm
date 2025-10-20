@@ -1,0 +1,182 @@
+WITH
+user_stats AS (
+  SELECT
+    u.Id AS user_id,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS questions_count,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS answers_count,
+    COALESCE(SUM(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)),0) AS posts_score_sum,
+    COUNT(DISTINCT c.Id) AS comments_count,
+    COALESCE(SUM(vup.cnt),0) AS upvotes_received,
+    COALESCE(SUM(vdown.cnt),0) AS downvotes_received,
+    COUNT(DISTINCT b.Id) AS badges_count,
+    MAX(p.LastActivityDate) AS last_activity
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Comments c ON c.UserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN (
+    SELECT p.OwnerUserId AS uid, COUNT(*) AS cnt
+    FROM Votes v JOIN Posts p ON p.Id = v.PostId
+    WHERE v.VoteTypeId = 2
+    GROUP BY p.OwnerUserId
+  ) vup ON vup.uid = u.Id
+  LEFT JOIN (
+    SELECT p.OwnerUserId AS uid, COUNT(*) AS cnt
+    FROM Votes v JOIN Posts p ON p.Id = v.PostId
+    WHERE v.VoteTypeId = 3
+    GROUP BY p.OwnerUserId
+  ) vdown ON vdown.uid = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+user_tag_counts AS (
+  SELECT
+    p.OwnerUserId AS user_id,
+    unnest(string_to_array(substring(p.Tags,2,char_length(p.Tags)-2), '><')) AS tag,
+    COUNT(*) AS cnt
+  FROM Posts p
+  WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId, tag
+),
+user_tags AS (
+  SELECT
+    utc.user_id,
+    (SELECT ARRAY_AGG(t_tag ORDER BY t_cnt DESC, t_tag) FROM (
+       SELECT tag AS t_tag, cnt AS t_cnt
+       FROM user_tag_counts utc2
+       WHERE utc2.user_id = utc.user_id
+       ORDER BY cnt DESC, tag
+       LIMIT 3
+     ) sub) AS top_tags
+  FROM (
+    SELECT DISTINCT user_id FROM user_tag_counts
+  ) utc
+),
+question_metrics AS (
+  SELECT
+    q.Id AS question_id,
+    q.Title,
+    q.OwnerUserId,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.AcceptedAnswerId,
+    EXTRACT(EPOCH FROM (MIN(a.CreationDate) - q.CreationDate))/3600.0 AS hours_to_first_answer,
+    (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a2.Score)
+     FROM Posts a2 WHERE a2.ParentId = q.Id AND a2.PostTypeId = 2) AS median_answer_score,
+    (SELECT COUNT(DISTINCT a3.OwnerUserId) FROM Posts a3 WHERE a3.ParentId = q.Id AND a3.PostTypeId = 2) AS distinct_answerers,
+    CASE WHEN (SELECT COUNT(*) FROM Posts a4 WHERE a4.ParentId = q.Id AND a4.PostTypeId = 2)=0 THEN 0
+         WHEN q.AcceptedAnswerId IS NULL THEN 0
+         ELSE 1 END AS has_accept
+  FROM Posts q
+  LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+  WHERE q.PostTypeId = 1
+  GROUP BY q.Id, q.Title, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, q.AcceptedAnswerId
+),
+post_links_agg AS (
+  SELECT
+    p.Id AS post_id,
+    COALESCE(inl.inbound_cnt,0) AS inbound_links,
+    COALESCE(outl.outbound_cnt,0) AS outbound_links,
+    COALESCE(dup_out.duplicates_pointing_to,0) AS duplicates_pointing_to,
+    COALESCE(dup_in.my_duplicates,0) AS my_duplicates
+  FROM Posts p
+  LEFT JOIN (
+    SELECT RelatedPostId AS pid, COUNT(*) AS inbound_cnt
+    FROM PostLinks
+    GROUP BY RelatedPostId
+  ) inl ON inl.pid = p.Id
+  LEFT JOIN (
+    SELECT PostId AS pid, COUNT(*) AS outbound_cnt
+    FROM PostLinks
+    GROUP BY PostId
+  ) outl ON outl.pid = p.Id
+  LEFT JOIN (
+    SELECT RelatedPostId AS pid, COUNT(CASE WHEN LinkTypeId = 3 THEN 1 END) AS duplicates_pointing_to
+    FROM PostLinks
+    GROUP BY RelatedPostId
+  ) dup_out ON dup_out.pid = p.Id
+  LEFT JOIN (
+    SELECT PostId AS pid, COUNT(CASE WHEN LinkTypeId = 3 THEN 1 END) AS my_duplicates
+    FROM PostLinks
+    GROUP BY PostId
+  ) dup_in ON dup_in.pid = p.Id
+),
+user_question_join AS (
+  SELECT
+    us.user_id,
+    us.DisplayName,
+    us.Reputation,
+    us.questions_count,
+    us.answers_count,
+    us.posts_score_sum,
+    us.comments_count,
+    us.badges_count,
+    ut.top_tags,
+    q.Id AS question_id,
+    q.Title AS question_title,
+    q.CreationDate AS question_created,
+    q.Score AS question_score,
+    q.ViewCount AS question_views,
+    q.AnswerCount AS question_answers,
+    qm.hours_to_first_answer,
+    qm.median_answer_score,
+    qm.distinct_answerers,
+    qm.has_accept,
+    pla.inbound_links,
+    pla.outbound_links,
+    pla.duplicates_pointing_to,
+    pla.my_duplicates
+  FROM user_stats us
+  JOIN user_tags ut ON ut.user_id = us.user_id
+  JOIN Posts q ON q.OwnerUserId = us.user_id AND q.PostTypeId = 1
+  JOIN question_metrics qm ON qm.question_id = q.Id
+  LEFT JOIN post_links_agg pla ON pla.post_id = q.Id
+  WHERE us.questions_count >= 5 AND us.reputation >= 500
+),
+ranked AS (
+  SELECT
+    uqj.*,
+    (
+      (CAST(uqj.Reputation AS numeric) / GREATEST(NULLIF((SELECT MAX(Reputation) FROM Users),0),1)) * 2.0
+      + (COALESCE(CAST(uqj.question_score AS numeric),0) / (ABS(COALESCE(uqj.question_score,0))+10)) * 1.5
+      + (LOG(1 + GREATEST(uqj.question_views,0)) / LOG(10)) * 1.2
+      + (CASE WHEN uqj.hours_to_first_answer IS NULL THEN 0 ELSE (1.0 / (1 + uqj.hours_to_first_answer)) END) * 1.8
+      + (LEAST(uqj.distinct_answerers,10) / 10.0) * 1.3
+      + (COALESCE(cardinality(uqj.top_tags),0) / 3.0) * 0.6
+      + (COALESCE(uqj.badges_count,0) / (COALESCE(uqj.badges_count,0)+5)) * 1.0
+      - (COALESCE(uqj.duplicates_pointing_to,0) * 0.5)
+      - (COALESCE(uqj.my_duplicates,0) * 0.2)
+    ) AS composite_score
+  FROM user_question_join uqj
+)
+SELECT
+  r.user_id,
+  r.DisplayName,
+  r.Reputation,
+  r.questions_count,
+  r.answers_count,
+  r.posts_score_sum,
+  r.badges_count,
+  r.top_tags,
+  r.question_id,
+  r.question_title,
+  r.question_created,
+  ROUND(CAST(r.question_score AS numeric),2) AS question_score,
+  r.question_views,
+  r.question_answers,
+  ROUND(CAST(COALESCE(r.hours_to_first_answer, NULL) AS numeric),2) AS hours_to_first_answer,
+  ROUND(CAST(COALESCE(r.median_answer_score,0) AS numeric),2) AS median_answer_score,
+  r.distinct_answerers,
+  r.has_accept,
+  r.inbound_links,
+  r.outbound_links,
+  r.duplicates_pointing_to,
+  r.my_duplicates,
+  ROUND(CAST(r.composite_score AS numeric),4) AS composite_score,
+  ROW_NUMBER() OVER (ORDER BY r.composite_score DESC) AS rank_overall
+FROM ranked r
+ORDER BY r.composite_score DESC
+LIMIT 250;

@@ -1,4 +1,4 @@
--- {"query": "22090.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "grok-code-fast", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2204, "output_tokens": 1103} 
+-- {"query": "22090.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-code-fast", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2204, "output_tokens": 1103} 
 WITH high_reputation_users AS (
     SELECT u.Id, u.DisplayName, u.Reputation, u.Location, u.WebsiteUrl,
            CASE WHEN u.AboutMe IS NOT NULL THEN LENGTH(u.AboutMe) ELSE 0 END AS about_me_length

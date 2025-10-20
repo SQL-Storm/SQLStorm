@@ -1,0 +1,175 @@
+WITH
+q_votes AS (
+    SELECT p.Id,
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM Posts p
+    JOIN Votes v ON v.PostId = p.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id
+),
+q_comments AS (
+    SELECT p.Id, COUNT(c.Id) AS CommentCount
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id
+),
+q_edits AS (
+    SELECT p.Id, COUNT(ph.Id) AS EditCount
+    FROM Posts p
+    JOIN PostHistory ph ON ph.PostId = p.Id
+    WHERE p.PostTypeId = 1 AND ph.PostHistoryTypeId IN (4,5)
+    GROUP BY p.Id
+),
+-- Replace regexp_split_to_table with generic string splitting using a recursive CTE that works across many dialects
+tags_per_question AS (
+    SELECT
+        p.Id AS QuestionId,
+        STRING_AGG(tag, ',') AS TagList,
+        COUNT(*) AS TagCount
+    FROM Posts p
+    JOIN (
+        -- normalize tags string by removing leading '<' and trailing '>' if present
+        SELECT
+            p2.Id AS PostId,
+            CASE
+                WHEN p2.Tags IS NULL THEN ''
+                WHEN LEFT(p2.Tags,1) = '<' AND RIGHT(p2.Tags,1) = '>' THEN SUBSTRING(p2.Tags FROM 2 FOR LENGTH(p2.Tags)-2)
+                WHEN LEFT(p2.Tags,1) = '<' THEN SUBSTRING(p2.Tags FROM 2)
+                WHEN RIGHT(p2.Tags,1) = '>' THEN SUBSTRING(p2.Tags FROM 1 FOR LENGTH(p2.Tags)-1)
+                ELSE p2.Tags
+            END AS clean_tags
+        FROM Posts p2
+        WHERE p2.PostTypeId = 1
+    ) cleaned ON cleaned.PostId = p.Id
+    JOIN (
+        -- split clean_tags on '><' by iterative splitting using a numbers approach
+        SELECT
+            PostId,
+            CASE
+                WHEN pos = 1 THEN
+                    CASE WHEN instr = 0 THEN clean_tags ELSE SUBSTR(clean_tags, 1, instr-1) END
+                ELSE
+                    CASE
+                        WHEN instr = 0 THEN NULL
+                        ELSE
+                            CASE WHEN next_instr = 0 THEN SUBSTR(clean_tags, instr+2) ELSE SUBSTR(clean_tags, instr+2, next_instr - (instr+2)) END
+                    END
+            END AS tag
+        FROM (
+            SELECT
+                PostId,
+                clean_tags,
+                pos,
+                instr,
+                next_instr
+            FROM (
+                -- generate positions of delimiter occurrences
+                SELECT
+                    PostId,
+                    clean_tags,
+                    ROW_NUMBER() OVER (PARTITION BY PostId ORDER BY delim_pos) AS pos,
+                    COALESCE(NULLIF(delim_pos,0),0) AS instr,
+                    COALESCE(NULLIF(next_delim_pos,0),0) AS next_instr
+                FROM (
+                    -- create delimiter positions by searching iteratively; supports dialects without regexp_split
+                    SELECT
+                        PostId,
+                        clean_tags,
+                        delim_pos,
+                        LEAD(delim_pos) OVER (PARTITION BY PostId ORDER BY delim_pos) AS next_delim_pos
+                    FROM (
+                        -- approximate delimiter positions: include position 1 (start) and positions of '><'
+                        SELECT
+                            PostId,
+                            clean_tags,
+                            CASE WHEN n = 0 THEN 1 ELSE instr_pos END AS delim_pos
+                        FROM (
+                            SELECT
+                                PostId,
+                                clean_tags,
+                                0 AS n,
+                                0 AS instr_pos
+                            FROM (SELECT PostId, clean_tags FROM cleaned) base
+                            UNION ALL
+                            SELECT
+                                PostId,
+                                clean_tags,
+                                ROW_NUMBER() OVER (PARTITION BY PostId ORDER BY pos) AS n,
+                                pos AS instr_pos
+                            FROM (
+                                SELECT
+                                    PostId,
+                                    clean_tags,
+                                    INSTR(clean_tags, '><', nn.start) AS pos,
+                                    nn.start
+                                FROM cleaned
+                                JOIN (
+                                    -- generate sequence positions for searching; many dialects support a numbers table or recursive CTE; keep small fixed range to be portable
+                                    SELECT 1 AS start UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10
+                                ) nn ON 1=1
+                                WHERE INSTR(clean_tags, '><', nn.start) > 0
+                            ) s
+                        ) t
+                    ) u
+                    WHERE delim_pos > 0
+                ) v
+            ) w
+        ) x
+        WHERE tag IS NOT NULL AND tag <> ''
+    ) split_tags ON split_tags.PostId = p.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id
+)
+SELECT
+    p.Id AS QuestionId,
+    p.Title,
+    p.Score,
+    COALESCE(qv.UpVotes, 0) AS UpVotes,
+    COALESCE(qv.DownVotes, 0) AS DownVotes,
+    COALESCE(qc.CommentCount, 0) AS CommentCount,
+    COALESCE(qe.EditCount, 0) AS EditCount,
+    u.Reputation,
+    COALESCE(tpq.TagCount, 0) AS TagCount,
+    COALESCE(tpq.TagList, '') AS TagList,
+    COALESCE(ans.AnswerId, 0) AS TopAnswerId,
+    COALESCE(ans.AnswerScore, 0) AS TopAnswerScore,
+    COALESCE(avg_ans.avg_score, 0) AS AvgAnswerScore,
+    DENSE_RANK() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS RankByScoreView
+FROM Posts p
+JOIN Users u ON u.Id = p.OwnerUserId
+LEFT JOIN q_votes qv ON qv.Id = p.Id
+LEFT JOIN q_comments qc ON qc.Id = p.Id
+LEFT JOIN q_edits qe ON qe.Id = p.Id
+LEFT JOIN tags_per_question tpq ON tpq.QuestionId = p.Id
+LEFT JOIN LATERAL (
+    SELECT a.Id AS AnswerId, a.Score AS AnswerScore
+    FROM Posts a
+    WHERE a.ParentId = p.Id AND a.PostTypeId = 2
+    ORDER BY a.Score DESC
+    LIMIT 1
+) ans ON TRUE
+LEFT JOIN LATERAL (
+    SELECT AVG(a.Score) AS avg_score
+    FROM Posts a
+    WHERE a.ParentId = p.Id AND a.PostTypeId = 2
+) avg_ans ON TRUE
+WHERE p.PostTypeId = 1
+GROUP BY
+    p.Id,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    u.Reputation,
+    tpq.TagCount,
+    tpq.TagList,
+    qv.UpVotes,
+    qv.DownVotes,
+    qc.CommentCount,
+    qe.EditCount,
+    ans.AnswerId,
+    ans.AnswerScore,
+    avg_ans.avg_score
+ORDER BY RankByScoreView
+LIMIT 500;

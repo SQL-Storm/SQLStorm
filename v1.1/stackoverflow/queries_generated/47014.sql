@@ -1,0 +1,146 @@
+-- {"query": "47014.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 32116, "output_tokens": 28626} 
+
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT pt.Id) as question_count,
+        1 as level
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%<' || t.TagName || '>%'
+    JOIN Posts pt ON pt.Id = p.Id AND pt.PostTypeId = 1
+    WHERE t.Count > 1000
+    GROUP BY t.Id, t.TagName
+    
+    UNION ALL
+    
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        COUNT(DISTINCT p2.Id),
+        th.level + 1
+    FROM tag_hierarchy th
+    JOIN Posts p1 ON p1.Tags LIKE '%<' || th.TagName || '>%'
+    JOIN Posts p2 ON p2.Id = p1.Id AND p2.PostTypeId = 1
+    JOIN Tags t2 ON p2.Tags LIKE '%<' || t2.TagName || '>%' AND t2.Id != th.Id
+    WHERE th.level < 3
+    GROUP BY t2.Id, t2.TagName, th.level
+),
+user_expertise AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        t.TagName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answers,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as questions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as answer_score,
+        COUNT(DISTINCT b.Id) as tag_badges,
+        DENSE_RANK() OVER (PARTITION BY t.TagName ORDER BY 
+            SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) DESC) as tag_rank
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    JOIN Tags t ON p.Tags LIKE '%<' || t.TagName || '>%'
+    LEFT JOIN Badges b ON b.UserId = u.Id AND b.Name = t.TagName AND b.TagBased = true
+    WHERE u.Reputation > 5000
+        AND p.CreationDate > CURRENT_DATE - INTERVAL '2 years'
+    GROUP BY u.Id, u.DisplayName, t.TagName
+    HAVING COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) > 10
+),
+post_quality_metrics AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.Tags,
+        u.DisplayName as Author,
+        u.Reputation as AuthorRep,
+        COUNT(DISTINCT ph.Id) as edit_count,
+        COUNT(DISTINCT c.Id) as comment_count,
+        COUNT(DISTINCT pl.Id) as linked_posts,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) as upvotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) as downvotes,
+        MIN(a.CreationDate) FILTER (WHERE a.Score > 5) as first_good_answer_time,
+        MAX(a.Score) as best_answer_score,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY a.Score) as median_answer_score,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'closed'
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'answered'
+            WHEN p.AnswerCount > 0 THEN 'has_answers'
+            ELSE 'unanswered'
+        END as status,
+        EXTRACT(EPOCH FROM (MIN(a.CreationDate) - p.CreationDate))/3600.0 as hours_to_first_answer,
+        EXTRACT(EPOCH FROM (COALESCE(p.ClosedDate, CURRENT_TIMESTAMP) - p.CreationDate))/86400.0 as lifetime_days
+    FROM Posts p
+    JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6)
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate > CURRENT_DATE - INTERVAL '1 year'
+        AND p.Score > 0
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.FavoriteCount, 
+             p.CreationDate, p.Tags, u.DisplayName, u.Reputation, p.ClosedDate, p.AcceptedAnswerId
+),
+cross_tag_influence AS (
+    SELECT 
+        t1.TagName as primary_tag,
+        t2.TagName as secondary_tag,
+        COUNT(DISTINCT p.Id) as co_occurrence,
+        AVG(p.Score) as avg_score,
+        AVG(p.ViewCount) as avg_views,
+        AVG(p.AnswerCount) as avg_answers,
+        CORR(p.Score, p.ViewCount) as score_view_correlation,
+        STDDEV(p.Score) as score_variance
+    FROM Tags t1
+    JOIN Posts p ON p.Tags LIKE '%<' || t1.TagName || '>%'
+    JOIN Tags t2 ON p.Tags LIKE '%<' || t2.TagName || '>%' AND t1.Id < t2.Id
+    WHERE p.PostTypeId = 1
+        AND t1.Count > 500
+        AND t2.Count > 500
+    GROUP BY t1.TagName, t2.TagName
+    HAVING COUNT(DISTINCT p.Id) > 100
+)
+SELECT 
+    pqm.Id,
+    pqm.Title,
+    pqm.Author,
+    pqm.AuthorRep,
+    pqm.Score,
+    pqm.ViewCount,
+    pqm.status,
+    pqm.hours_to_first_answer,
+    pqm.best_answer_score,
+    pqm.median_answer_score,
+    pqm.edit_count,
+    pqm.comment_count,
+    pqm.upvotes,
+    pqm.downvotes,
+    th.TagName as primary_tag,
+    th.question_count as tag_popularity,
+    ue.DisplayName as top_expert,
+    ue.answer_score as expert_score,
+    ue.tag_rank,
+    cti.secondary_tag as related_tag,
+    cti.co_occurrence,
+    cti.avg_score as related_tag_avg_score,
+    cti.score_view_correlation,
+    pqm.Score * LOG(pqm.ViewCount + 1) / NULLIF(pqm.lifetime_days, 0) as impact_factor,
+    RANK() OVER (PARTITION BY th.TagName ORDER BY 
+        pqm.Score * LOG(pqm.ViewCount + 1) / NULLIF(pqm.lifetime_days, 0) DESC) as tag_question_rank,
+    COUNT(*) OVER (PARTITION BY pqm.Author) as author_question_count,
+    SUM(pqm.Score) OVER (PARTITION BY pqm.Author) as author_total_score
+FROM post_quality_metrics pqm
+JOIN tag_hierarchy th ON pqm.Tags LIKE '%<' || th.TagName || '>%'
+LEFT JOIN user_expertise ue ON ue.TagName = th.TagName AND ue.tag_rank = 1
+LEFT JOIN cross_tag_influence cti ON cti.primary_tag = th.TagName
+WHERE pqm.Score > 5
+    AND pqm.ViewCount > 1000
+    AND th.level = 1
+ORDER BY pqm.Score * LOG(pqm.ViewCount + 1) / NULLIF(pqm.lifetime_days, 0) DESC
+LIMIT 500;

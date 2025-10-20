@@ -1,0 +1,55 @@
+-- {"query": "51013.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2129, "output_tokens": 570} 
+
+WITH popular_tags AS (
+    SELECT TagName, Count
+    FROM Tags
+    WHERE Count > 100
+),
+active_users AS (
+    SELECT Id, Reputation, Location
+    FROM Users
+    WHERE CreationDate > CURRENT_DATE - INTERVAL '1 year'
+    AND Reputation > 100
+),
+tagged_questions AS (
+    SELECT p.Id AS post_id, p.Title, p.Score, p.ViewCount, p.CreationDate AS post_date,
+           au.Id AS user_id, au.Reputation AS user_rep
+    FROM Posts p
+    JOIN popular_tags pt ON p.Tags LIKE CONCAT('%<', pt.TagName, '>%')
+    JOIN active_users au ON p.OwnerUserId = au.Id
+    WHERE p.PostTypeId = 1
+    AND p.CreationDate > CURRENT_DATE - INTERVAL '6 months'
+),
+user_activity AS (
+    SELECT tu.user_id, tu.user_rep,
+           AVG(tu.Score) AS avg_question_score,
+           COUNT(DISTINCT v.Id) AS upvote_count,
+           COUNT(DISTINCT c.Id) AS comment_count,
+           STRING_AGG(DISTINCT tu.Title, ' | ') AS sample_titles
+    FROM tagged_questions tu
+    LEFT JOIN Votes v ON tu.post_id = v.PostId AND v.VoteTypeId = 2 AND v.CreationDate > tu.post_date - INTERVAL '1 month'
+    LEFT JOIN Comments c ON tu.post_id = c.PostId AND c.CreationDate > tu.post_date - INTERVAL '1 week'
+    GROUP BY tu.user_id, tu.user_rep
+    HAVING COUNT(DISTINCT v.Id) > 5 OR COUNT(DISTINCT c.Id) > 10
+),
+badge_insights AS (
+    SELECT b.UserId, b.Name AS badge_name, b.Date,
+           ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS rn
+    FROM Badges b
+    JOIN active_users au ON b.UserId = au.Id
+    WHERE b.Class = 1 -- Gold badges only
+)
+SELECT 
+    ua.user_rep,
+    ua.avg_question_score,
+    ua.upvote_count,
+    ua.comment_count,
+    bi.badge_name AS top_gold_badge,
+    au.Location,
+    LEFT(ua.sample_titles, 200) AS titles_preview,
+    RANK() OVER (ORDER BY (ua.upvote_count + ua.comment_count * 2 + COALESCE(bi.Date - (SELECT MIN(CreationDate) FROM Users), 0)::int / 86400) DESC) AS activity_rank
+FROM user_activity ua
+LEFT JOIN badge_insights bi ON ua.user_id = bi.UserId AND bi.rn = 1
+WHERE ua.avg_question_score > 2
+ORDER BY activity_rank
+LIMIT 50;

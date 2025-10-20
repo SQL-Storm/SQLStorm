@@ -1,4 +1,4 @@
--- {"query": "26027.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "llama-3.3-instruct", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 836} 
+-- {"query": "26027.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "llama-3.3-instruct", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 836} 
 
 WITH RECURSIVE QuestionAnswerCTE AS (
   SELECT p1.Id AS QuestionId, p2.Id AS AnswerId, p2.Score AS AnswerScore, p1.AcceptedAnswerId

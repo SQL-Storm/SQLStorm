@@ -1,0 +1,126 @@
+WITH popular_users AS (
+    SELECT 
+        u.Id AS user_id,
+        u.Reputation,
+        u.DisplayName,
+        u.Location,
+        COUNT(DISTINCT p.Id) AS question_count,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS answer_count,
+        AVG(p.Score) AS avg_score,
+        COALESCE(SUM(b_count.badge_count), 0) AS total_badges
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1, 2) AND p.Score > 0
+    LEFT JOIN (
+        SELECT UserId, SUM("Count") AS badge_count
+        FROM Badges
+        GROUP BY UserId
+    ) b_count ON u.Id = b_count.UserId
+    WHERE u.Reputation >= 1000 
+      AND u.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '5 years'
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Location
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+top_questions AS (
+    SELECT 
+        p.Id AS post_id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        pu.user_id AS owner_id,
+        pu.question_count,
+        pu.avg_score AS owner_avg_score,
+        STRING_AGG(DISTINCT t.TagName, ', ') AS tags
+    FROM Posts p
+    JOIN popular_users pu ON p.OwnerUserId = pu.user_id
+    LEFT JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE p.PostTypeId = 1 
+      AND p.Score >= 5
+      AND p.ViewCount > 1000
+      AND p.ClosedDate IS NULL
+      AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years'
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, 
+             p.FavoriteCount, p.CreationDate, pu.user_id, pu.question_count, pu.avg_score
+),
+answers_with_votes AS (
+    SELECT 
+        a.Id AS answer_id,
+        a.ParentId AS post_id,
+        a.Score AS answer_score,
+        a.CreationDate AS answer_date,
+        a.OwnerUserId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+        MAX(CASE WHEN v.VoteTypeId = 1 THEN v.CreationDate ELSE NULL END) AS accepted_date,
+        AVG(u.Reputation) AS avg_voter_reputation
+    FROM Posts a
+    JOIN top_questions tq ON a.ParentId = tq.post_id
+    LEFT JOIN Votes v ON a.Id = v.PostId 
+    LEFT JOIN Users u ON v.UserId = u.Id AND u.Reputation > 0
+    WHERE a.PostTypeId = 2 AND a.Score > 0
+    GROUP BY a.Id, a.ParentId, a.Score, a.CreationDate, a.OwnerUserId
+),
+tag_performance AS (
+    SELECT 
+        t.TagName AS tag_name,
+        COUNT(DISTINCT tq.post_id) AS questions_with_tag,
+        AVG(tq.score) AS avg_score,
+        SUM(tq.answer_count) AS total_answers,
+        SUM(tq.view_count) AS total_views,
+        AVG(tq.favorite_count) AS avg_favorites,
+        COUNT(DISTINCT awv.answer_id) AS total_answers_with_votes,
+        AVG(awv.answer_score) AS avg_answer_score
+    FROM Tags t
+    JOIN top_questions tq ON tq.tags LIKE '%' || t.TagName || '%'
+    LEFT JOIN answers_with_votes awv ON tq.post_id = awv.post_id
+    GROUP BY t.TagName
+    HAVING COUNT(DISTINCT tq.post_id) >= 20
+)
+SELECT 
+    tq.post_id,
+    tq.title,
+    tq.score AS question_score,
+    tq.view_count,
+    tq.answer_count,
+    tq.comment_count,
+    tq.favorite_count,
+    tq.tags,
+    tq.owner_id,
+    pu.display_name AS owner_name,
+    pu.reputation AS owner_reputation,
+    pu.location AS owner_location,
+    pu.question_count AS owner_question_count,
+    awv.answer_score,
+    awv.upvotes,
+    awv.downvotes,
+    awv.accepted_date,
+    tp.tag_name AS primary_tag,
+    tp.questions_with_tag,
+    tp.avg_score AS tag_avg_score,
+    tp.total_answers AS tag_total_answers,
+    CASE 
+        WHEN tq.answer_count = 0 THEN 'No Answers'
+        WHEN tq.answer_count > 0 AND awv.answer_score IS NULL THEN 'Answers Exist'
+        WHEN awv.answer_score >= 5 THEN 'Highly Rated'
+        WHEN awv.answer_score BETWEEN 1 AND 4 THEN 'Moderately Rated'
+        ELSE 'Low Rated'
+    END AS answer_quality,
+    ROW_NUMBER() OVER (
+        PARTITION BY tp.tag_name 
+        ORDER BY tq.score DESC, tq.view_count DESC
+    ) AS tag_rank,
+    RANK() OVER (
+        ORDER BY (tq.score * tq.view_count) / NULLIF(tq.answer_count + 1, 0) DESC
+    ) AS overall_engagement_rank
+FROM top_questions tq
+JOIN popular_users pu ON tq.owner_id = pu.user_id
+LEFT JOIN answers_with_votes awv ON tq.post_id = awv.post_id
+JOIN tag_performance tp ON tq.tags LIKE '%' || tp.tag_name || '%'
+WHERE tp.questions_with_tag >= 50
+  AND (awv.answer_score IS NULL OR awv.answer_score >= 2)
+  AND tq.answer_count > 0
+ORDER BY overall_engagement_rank ASC
+LIMIT 1000;

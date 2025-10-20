@@ -1,0 +1,149 @@
+-- {"query": "55050.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2048, "output_tokens": 1614} 
+
+/* Benchmark Query: Deep analytical view of top contributors, their badge spectrum, 
+   post performance, tag influence, and cross‑link dynamics over the last 2 years */
+
+WITH 
+-- 1. Base activity per user (questions, answers, comments, votes cast)
+user_activity AS (
+    SELECT 
+        u.Id                         AS user_id,
+        u.DisplayName                AS user_name,
+        COUNT(DISTINCT q.Id)         AS questions_asked,
+        COUNT(DISTINCT a.Id)         AS answers_given,
+        COUNT(DISTINCT c.Id)         AS comments_written,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes_cast,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes_cast,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS favorites_cast
+    FROM Users u
+    LEFT JOIN Posts q ON q.OwnerUserId = u.Id AND q.PostTypeId = 1
+    LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    WHERE u.CreationDate >= NOW() - INTERVAL '2 years'
+    GROUP BY u.Id, u.DisplayName
+),
+
+-- 2. Badge aggregation per user with JSON payload
+user_badges AS (
+    SELECT 
+        b.UserId                     AS user_id,
+        JSON_AGG(JSON_BUILD_OBJECT(
+            'badge', b.Name,
+            'class', b.Class,
+            'tagBased', b.TagBased,
+            'date', b.Date
+        ) ORDER BY b.Date DESC)     AS badges_json,
+        COUNT(*)                     AS total_badges
+    FROM Badges b
+    WHERE b.Date >= NOW() - INTERVAL '2 years'
+    GROUP BY b.UserId
+),
+
+-- 3. Tag influence: how many times a user’s posts contain each tag
+user_tag_impact AS (
+    SELECT 
+        p.OwnerUserId                AS user_id,
+        UNNEST(string_to_array(trim(both '{}' FROM p.Tags), '><')) AS tag,
+        COUNT(*)                     AS tag_uses
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= NOW() - INTERVAL '2 years'
+      AND p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId, tag
+),
+
+-- 4. Cross‑link statistics (linked & duplicate relations) per post
+post_link_stats AS (
+    SELECT 
+        pl.PostId,
+        COUNT(*) FILTER (WHERE lt.Id = 1) AS linked_count,
+        COUNT(*) FILTER (WHERE lt.Id = 3) AS duplicate_count,
+        MAX(pl.CreationDate)               AS latest_link_date
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    GROUP BY pl.PostId
+),
+
+-- 5. Recent vote summary per post (up/down & favorites)
+post_vote_summary AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS favorites,
+        MAX(v.CreationDate)                             AS last_vote_date
+    FROM Votes v
+    WHERE v.CreationDate >= NOW() - INTERVAL '2 years'
+      AND v.VoteTypeId IN (2,3,5)
+    GROUP BY v.PostId
+),
+
+-- 6. Recent edit history fingerprints per post (type counts)
+post_edit_fingerprint AS (
+    SELECT 
+        ph.PostId,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6))      AS edit_count,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 10)          AS close_votes,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 12)          AS delete_votes,
+        MAX(ph.CreationDate)                                       AS last_edit_date
+    FROM PostHistory ph
+    WHERE ph.CreationDate >= NOW() - INTERVAL '2 years'
+    GROUP BY ph.PostId
+),
+
+-- 7. Assemble per‑user performance score
+user_performance AS (
+    SELECT 
+        ua.user_id,
+        ua.user_name,
+        ua.questions_asked,
+        ua.answers_given,
+        ua.comments_written,
+        ua.upvotes_cast,
+        ua.downvotes_cast,
+        ua.favorites_cast,
+        ub.total_badges,
+        ub.badges_json,
+        COALESCE(SUM(ut.tag_uses),0)           AS total_tag_uses,
+        COALESCE(JSON_AGG(DISTINCT ut.tag) FILTER (WHERE ut.tag IS NOT NULL), '[]'::json) AS distinct_tags,
+        COALESCE(SUM(pls.linked_count + pls.duplicate_count),0) AS total_linked_posts,
+        -- simple performance composite (weights can be tuned)
+        (ua.answers_given * 3 + ua.questions_asked * 2 + ua.comments_written) 
+        + (ua.upvotes_cast - ua.downvotes_cast) 
+        + (ub.total_badges * 4) 
+        + (COALESCE(SUM(ut.tag_uses),0) * 0.5)
+        AS performance_score
+    FROM user_activity ua
+    LEFT JOIN user_badges ub ON ub.user_id = ua.user_id
+    LEFT JOIN user_tag_impact ut ON ut.user_id = ua.user_id
+    LEFT JOIN Posts p ON p.OwnerUserId = ua.user_id
+    LEFT JOIN post_link_stats pls ON pls.PostId = p.Id
+    GROUP BY 
+        ua.user_id, ua.user_name, ua.questions_asked, ua.answers_given,
+        ua.comments_written, ua.upvotes_cast, ua.downvotes_cast,
+        ua.favorites_cast, ub.total_badges, ub.badges_json
+)
+
+SELECT 
+    up.user_id,
+    up.user_name,
+    up.performance_score,
+    up.questions_asked,
+    up.answers_given,
+    up.comments_written,
+    up.upvotes_cast,
+    up.downvotes_cast,
+    up.favorites_cast,
+    up.total_badges,
+    up.badges_json,
+    up.total_tag_uses,
+    up.distinct_tags,
+    up.total_linked_posts
+FROM user_performance up
+WHERE up.performance_score > (
+        SELECT percentile_cont(0.90) WITHIN GROUP (ORDER BY performance_score)
+        FROM user_performance
+      )
+ORDER BY up.performance_score DESC
+LIMIT 100;

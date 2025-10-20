@@ -1,0 +1,171 @@
+-- {"query": "16.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1418} 
+WITH
+-- 1) top users by reputation with recent activity and badge counts
+RecentActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    COUNT(p.Id) FILTER (WHERE p.CreationDate > NOW() - INTERVAL '180 days') AS PostsLast180d,
+    MAX(p.LastActivityDate) AS LastActivityActivityDate
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+BadgeCounts AS (
+  SELECT
+    b.UserId,
+    COUNT(*) AS BadgeCount,
+    STRING_AGG(b.Name, ', ' ORDER BY b.Date DESC) AS Badges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+TopUsers AS (
+  SELECT
+    ra.UserId,
+    ra.DisplayName,
+    ra.Reputation,
+    ra.CreationDate,
+    ra.LastAccessDate,
+    ra.Views,
+    ra.UpVotes,
+    ra.DownVotes,
+    ra.PostsLast180d,
+    ra.LastActivityActivityDate,
+    COALESCE(bc.BadgeCount, 0) AS BadgeCount,
+    COALESCE(bc.Badges, '') AS Badges
+  FROM RecentActivity ra
+  LEFT JOIN BadgeCounts bc ON bc.UserId = ra.UserId
+),
+-- 2) complex post statistics per user with correlated subqueries
+UserPostStats AS (
+  SELECT
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.BadgeCount,
+    tu.Badges,
+    -- total posts by user
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = tu.UserId) AS TotalPosts,
+    -- up to 100 most recent posts with advanced text/JSON-like data in a single row
+    (
+      SELECT JSON_AGG(JSON_BUILD_OBJECT(
+        'PostId', p.Id,
+        'PostType', (SELECT Name FROM PostTypes pt WHERE pt.Id = p.PostTypeId),
+        'Title', p.Title,
+        'CreationDate', p.CreationDate,
+        'Score', p.Score,
+        'ViewCount', p.ViewCount,
+        'Tags', p.Tags,
+        'LastActivityDate', p.LastActivityDate,
+        'CommentCount', p.CommentCount
+      ))
+      FROM (
+        SELECT *
+        FROM Posts p
+        WHERE p.OwnerUserId = tu.UserId
+        ORDER BY p.LastActivityDate DESC
+        LIMIT 100
+      ) p
+    ) AS RecentPostsJson
+  FROM TopUsers tu
+),
+-- 3) advanced join scenario: posts linked to other posts with various link types
+LinkAgg AS (
+  SELECT
+    p.Id AS PostId,
+    COUNT(*) FILTER (WHERE lt.Name = 'Linked') AS LinkedCount,
+    COUNT(*) FILTER (WHERE lt.Name = 'Duplicate') AS DuplicateCount,
+    MAX(lc.CreationDate) AS LastLinkDate
+  FROM Posts p
+  LEFT JOIN PostLinks lc ON lc.PostId = p.Id
+  LEFT JOIN LinkTypes lt ON lt.Id = lc.LinkTypeId
+  GROUP BY p.Id
+),
+-- 4) window-based ranking: per post, rank by score within post type
+RankedPosts AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    pt.Name AS PostTypeName,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC NULLS LAST, p.ViewCount DESC NULLS LAST) AS TypeRank
+  FROM Posts p
+  JOIN PostTypes pt ON pt.Id = p.PostTypeId
+),
+-- 5) correlated historical activity: recent close/reopen actions by type with JSON in one row
+RecentHistory AS (
+  SELECT
+    ph.PostId,
+    ph.CreationDate,
+    ph.PostHistoryTypeId,
+    ph.Text,
+    ph.Comment,
+    ph.UserId,
+    ph.UserDisplayName,
+    COALESCE((SELECT Name FROM PostHistoryTypes pht WHERE pht.Id = ph.PostHistoryTypeId), '') AS HistoryName
+  FROM PostHistory ph
+  WHERE ph.CreationDate > NOW() - INTERVAL '30 days'
+),
+-- 6) set operations: union of top questions and top answers by score
+TopQuestions AS (
+  SELECT Id, Title, Score, ViewCount, CreationDate, 'Question' AS Kind
+  FROM Posts
+  WHERE PostTypeId = 1
+  ORDER BY Score DESC
+  LIMIT 50
+),
+TopAnswers AS (
+  SELECT Id, Title, Score, ViewCount, CreationDate, 'Answer' AS Kind
+  FROM Posts
+  WHERE PostTypeId = 2
+  ORDER BY Score DESC
+  LIMIT 50
+),
+UnionTopQA AS (
+  (SELECT * FROM TopQuestions)
+  UNION ALL
+  (SELECT * FROM TopAnswers)
+)
+SELECT
+  -- 7) final selected columns combining multiple facets
+  u.UserId,
+  u.DisplayName,
+  u.Reputation,
+  u.BadgeCount,
+  u.Badges,
+  up.TotalPosts,
+  up.RecentPostsJson AS UserRecentPosts,
+  la.LinkedCount,
+  la.DuplicateCount,
+  rp.PostId AS RankedPostId,
+  rp.PostTypeName,
+  rp.Title AS RankedTitle,
+  rp.Score AS RankedScore,
+  qas.Kind AS QAKind,
+  qas.Title AS QATitle,
+  qas.Score AS QAScore,
+  qas.CreationDate AS QACreationDate,
+  wh.HistoryName AS RecentHistoryType,
+  wh.CreationDate AS HistoryDate,
+  unq.PostId AS UnionPostId,
+  unq.Title AS UnionTitle
+FROM TopUsers u
+LEFT JOIN BadgeCounts bc ON bc.UserId = u.UserId
+LEFT JOIN UserPostStats up ON up.UserId = u.UserId
+LEFT JOIN LinkAgg la ON la.PostId = up.TotalPosts -- intentionally arbitrary linkage for complexity
+LEFT JOIN RankedPosts rp ON rp.Id = up.TotalPosts
+LEFT JOIN PostLinks ql ON ql.PostId = rp.Id
+LEFT JOIN (SELECT * FROM UnionTopQA) qas ON qas.Id = rp.Id
+LEFT JOIN RecentHistory wh ON wh.PostId = rp.Id
+LEFT JOIN (SELECT * FROM UnionTopQA) unq ON unq.Id = rp.Id
+ORDER BY u.Reputation DESC, u.LastAccessDate DESC
+LIMIT 200;

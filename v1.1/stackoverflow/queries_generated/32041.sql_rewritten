@@ -1,0 +1,28 @@
+-- {"query": "32041.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4o", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 261} 
+SELECT 
+    U.Id AS UserId,
+    U.DisplayName,
+    U.Reputation,
+    COUNT(DISTINCT P.Id) AS TotalPosts,
+    COUNT(DISTINCT C.Id) AS TotalComments,
+    COUNT(DISTINCT V.Id) FILTER (WHERE V.VoteTypeId = 2) AS TotalUpVotesReceived,
+    COUNT(DISTINCT V.Id) FILTER (WHERE V.VoteTypeId = 3) AS TotalDownVotesReceived,
+    MAX(P.Score) AS HighestPostScore,
+    SUM(P.ViewCount) AS TotalPostViews,
+    AVG(P.AnswerCount) AS AvgAnswersPerPost,
+    STATS_MODE(string_to_array(substring(P.Tags, 2, length(P.Tags)-2), '><')) AS MostUsedTag
+FROM 
+    Users U
+JOIN 
+    Posts P ON U.Id = P.OwnerUserId
+LEFT JOIN 
+    Comments C ON U.Id = C.UserId
+LEFT JOIN 
+    Votes V ON P.Id = V.PostId
+GROUP BY 
+    U.Id, U.DisplayName, U.Reputation
+HAVING 
+    COUNT(DISTINCT P.Id) > 10
+ORDER BY 
+    TotalPosts DESC, TotalComments DESC, U.Reputation DESC
+LIMIT 50;

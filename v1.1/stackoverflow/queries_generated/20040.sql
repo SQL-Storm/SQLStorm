@@ -1,4 +1,4 @@
--- {"query": "20040.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1507} 
+-- {"query": "20040.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gemini-2.5-pro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1507} 
 
 WITH UserActivitySummary AS (
     -- CTE 1: Aggregate user-level statistics and initial filtering for active, high-rep users.

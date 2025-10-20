@@ -1,0 +1,276 @@
+with recent_q as (
+  select p.Id as QuestionId,
+         p.CreationDate as QuestionCreation,
+         p.Score as QuestionScore,
+         p.ViewCount,
+         p.OwnerUserId as AskerId,
+         p.Tags,
+         coalesce(array_length(string_to_array(substring(p.Tags, 2, greatest(char_length(p.Tags)-2,0)), '><'), 1), 0) as TagCount
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= (select max(CreationDate) - interval '365 days' from Posts where PostTypeId = 1)
+),
+answers as (
+  select a.ParentId as QuestionId,
+         a.Id as AnswerId,
+         a.OwnerUserId as AnswererId,
+         a.Score as AnswerScore,
+         a.CreationDate as AnswerCreation
+  from Posts a
+  where a.PostTypeId = 2
+),
+first_answer as (
+  select a.QuestionId,
+         a.AnswerId,
+         a.AnswererId,
+         a.AnswerScore,
+         a.AnswerCreation,
+         row_number() over (partition by a.QuestionId order by a.AnswerCreation asc, a.AnswerId asc) as rn
+  from answers a
+),
+qa as (
+  select rq.*,
+         fa.AnswerId,
+         fa.AnswererId,
+         fa.AnswerScore,
+         fa.AnswerCreation,
+         case when p.AcceptedAnswerId is not null then 1 else 0 end as HasAccepted,
+         case when p.AcceptedAnswerId = fa.AnswerId then 1 else 0 end as FirstWasAccepted
+  from recent_q rq
+  left join first_answer fa on fa.QuestionId = rq.QuestionId and fa.rn = 1
+  join Posts p on p.Id = rq.QuestionId
+),
+vote_agg as (
+  select v.PostId,
+         sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+         sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+         sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+         sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as BountyFlow
+  from Votes v
+  where v.CreationDate >= (select max(CreationDate) - interval '365 days' from Votes)
+  group by v.PostId
+),
+comment_agg as (
+  select c.PostId,
+         count(*) as CommentCount,
+         max(c.CreationDate) as LastCommentAt
+  from Comments c
+  group by c.PostId
+),
+user_agg as (
+  select u.Id as UserId,
+         u.Reputation,
+         u.UpVotes as UserUpVotes,
+         u.DownVotes as UserDownVotes,
+         date_part('day', (select max(CreationDate) from Posts) - u.CreationDate) as UserAgeDays
+  from Users u
+),
+tag_explode as (
+  select rq.QuestionId,
+         unnest(string_to_array(substring(rq.Tags, 2, greatest(char_length(rq.Tags)-2,0)), '><')) as tag
+  from recent_q rq
+),
+top_tags as (
+  select tag,
+         count(*) as tag_q_count
+  from tag_explode
+  group by tag
+  order by tag_q_count desc
+  limit 50
+),
+tag_metrics as (
+  select te.QuestionId,
+         te.tag,
+         tt.tag_q_count
+  from tag_explode te
+  join top_tags tt on tt.tag = te.tag
+),
+dup_links as (
+  select pl.PostId as QuestionId,
+         count(*) filter (where pl.LinkTypeId = 3) as DuplicateLinks
+  from PostLinks pl
+  group by pl.PostId
+),
+edit_events as (
+  select ph.PostId,
+         count(*) filter (where ph.PostHistoryTypeId in (4,5,6)) as EditCount,
+         max(ph.CreationDate) filter (where ph.PostHistoryTypeId in (4,5,6)) as LastEditAt,
+         count(*) filter (where ph.PostHistoryTypeId in (10)) as CloseVotesLogged,
+         count(*) filter (where ph.PostHistoryTypeId in (11)) as ReopenVotesLogged
+  from PostHistory ph
+  group by ph.PostId
+),
+badge_counts as (
+  select b.UserId,
+         sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+         sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+         sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+  from Badges b
+  group by b.UserId
+),
+per_question as (
+  select
+    qa.QuestionId,
+    qa.QuestionCreation,
+    qa.QuestionScore,
+    qa.ViewCount,
+    qa.TagCount,
+    qa.AnswerId,
+    qa.AnswerCreation,
+    qa.AnswerScore,
+    qa.HasAccepted,
+    qa.FirstWasAccepted,
+    coalesce(vq.UpVotes,0) as QUp,
+    coalesce(vq.DownVotes,0) as QDown,
+    coalesce(vq.Favorites,0) as QFav,
+    coalesce(vq.BountyFlow,0) as QBountyFlow,
+    coalesce(vc.UpVotes,0) as AUp,
+    coalesce(vc.DownVotes,0) as ADown,
+    coalesce(vc.Favorites,0) as AFav,
+    coalesce(vc.BountyFlow,0) as ABountyFlow,
+    coalesce(ccq.CommentCount,0) as QComments,
+    ccq.LastCommentAt as QLastComment,
+    coalesce(cca.CommentCount,0) as AComments,
+    cca.LastCommentAt as ALastComment,
+    coalesce(dl.DuplicateLinks,0) as DuplicateLinks,
+    coalesce(ee.EditCount,0) as EditCount,
+    ee.LastEditAt,
+    coalesce(ee.CloseVotesLogged,0) as CloseVotesLogged,
+    coalesce(ee.ReopenVotesLogged,0) as ReopenVotesLogged,
+    qa.AskerId,
+    qa.AnswererId
+  from qa
+  left join vote_agg vq on vq.PostId = qa.QuestionId
+  left join vote_agg vc on vc.PostId = qa.AnswerId
+  left join comment_agg ccq on ccq.PostId = qa.QuestionId
+  left join comment_agg cca on cca.PostId = qa.AnswerId
+  left join dup_links dl on dl.QuestionId = qa.QuestionId
+  left join edit_events ee on ee.PostId = qa.QuestionId
+),
+with_users as (
+  select
+    pq.*,
+    ua.Reputation as AskerRep,
+    ua.UserUpVotes as AskerUpVotes,
+    ua.UserDownVotes as AskerDownVotes,
+    ua.UserAgeDays as AskerAgeDays,
+    ub.GoldBadges as AskerGold,
+    ub.SilverBadges as AskerSilver,
+    ub.BronzeBadges as AskerBronze,
+    ua2.Reputation as AnswererRep,
+    ua2.UserUpVotes as AnswererUpVotes,
+    ua2.UserDownVotes as AnswererDownVotes,
+    ua2.UserAgeDays as AnswererAgeDays,
+    ub2.GoldBadges as AnswererGold,
+    ub2.SilverBadges as AnswererSilver,
+    ub2.BronzeBadges as AnswererBronze
+  from per_question pq
+  left join user_agg ua on ua.UserId = pq.AskerId
+  left join user_agg ua2 on ua2.UserId = pq.AnswererId
+  left join badge_counts ub on ub.UserId = pq.AskerId
+  left join badge_counts ub2 on ub2.UserId = pq.AnswererId
+),
+tag_rollup as (
+  select tm.QuestionId,
+         array_agg(tm.tag order by tm.tag_q_count desc, tm.tag) as TopTags,
+         sum(tm.tag_q_count) as TopTagPopularity
+  from tag_metrics tm
+  group by tm.QuestionId
+),
+windows as (
+  select
+    wu.QuestionId,
+    wu.QuestionCreation,
+    wu.QuestionScore,
+    wu.ViewCount,
+    wu.TagCount,
+    wu.AnswerId,
+    wu.AnswerCreation,
+    wu.AnswerScore,
+    wu.HasAccepted,
+    wu.FirstWasAccepted,
+    wu.QUp,
+    wu.QDown,
+    wu.QFav,
+    wu.QBountyFlow,
+    wu.AUp,
+    wu.ADown,
+    wu.AFav,
+    wu.ABountyFlow,
+    wu.QComments,
+    wu.QLastComment,
+    wu.AComments,
+    wu.ALastComment,
+    wu.DuplicateLinks,
+    wu.EditCount,
+    wu.LastEditAt,
+    wu.CloseVotesLogged,
+    wu.ReopenVotesLogged,
+    wu.AskerId,
+    wu.AnswererId,
+    wu.AskerRep,
+    wu.AskerUpVotes,
+    wu.AskerDownVotes,
+    wu.AskerAgeDays,
+    wu.AskerGold,
+    wu.AskerSilver,
+    wu.AskerBronze,
+    wu.AnswererRep,
+    wu.AnswererUpVotes,
+    wu.AnswererDownVotes,
+    wu.AnswererAgeDays,
+    wu.AnswererGold,
+    wu.AnswererSilver,
+    wu.AnswererBronze,
+    tr.TopTags,
+    tr.TopTagPopularity,
+    percentile_disc(0.5) within group (order by coalesce(wu.QUp,0) - coalesce(wu.QDown,0)) over () as GlobalScoreMedian,
+    avg(coalesce(wu.ViewCount,0)) over () as GlobalAvgViews,
+    rank() over (order by coalesce(wu.QFav,0) desc, coalesce(wu.ViewCount,0) desc) as PopularityRank,
+    dense_rank() over (order by coalesce(wu.EditCount,0) desc) as EditIntensityRank
+  from with_users wu
+  left join tag_rollup tr on tr.QuestionId = wu.QuestionId
+)
+select
+  w.QuestionId,
+  w.QuestionCreation,
+  w.ViewCount,
+  w.QuestionScore,
+  (coalesce(w.QUp,0) - coalesce(w.QDown,0)) as NetQVotes,
+  w.QFav,
+  w.QBountyFlow,
+  w.AnswerId,
+  w.AnswerCreation,
+  w.AnswerScore,
+  (coalesce(w.AUp,0) - coalesce(w.ADown,0)) as NetAVotes,
+  w.AFav,
+  w.ABountyFlow,
+  w.HasAccepted,
+  w.FirstWasAccepted,
+  w.QComments,
+  w.AComments,
+  w.DuplicateLinks,
+  w.EditCount,
+  w.CloseVotesLogged,
+  w.ReopenVotesLogged,
+  w.AskerRep,
+  w.AskerGold,
+  w.AskerSilver,
+  w.AskerBronze,
+  w.AnswererRep,
+  w.AnswererGold,
+  w.AnswererSilver,
+  w.AnswererBronze,
+  coalesce(w.TopTags, array[]::text[]) as TopTags,
+  w.TopTagPopularity,
+  w.GlobalScoreMedian,
+  w.GlobalAvgViews,
+  w.PopularityRank,
+  w.EditIntensityRank
+from windows w
+where w.ViewCount is not null
+order by
+  w.PopularityRank,
+  w.EditIntensityRank,
+  w.QuestionId
+limit 1000;

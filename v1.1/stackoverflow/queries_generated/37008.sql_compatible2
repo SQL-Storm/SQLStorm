@@ -1,0 +1,193 @@
+WITH
+Questions AS (
+  SELECT p.Id, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.OwnerUserId,
+         p.Title,
+         regexp_split_to_table(substring(p.Tags, 2, length(p.Tags) - 2), E'\\><') AS Tag
+  FROM Posts p
+  JOIN PostTypes pt ON p.PostTypeId = pt.Id AND pt.Name = 'Question'
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+),
+AnswerAgg AS (
+  SELECT q.Id AS QuestionId,
+         count(a.Id) FILTER (WHERE a.Score >= 0) AS PosAnswers,
+         count(a.Id) FILTER (WHERE a.Score < 0) AS NegAnswers,
+         avg(a.Score) AS AvgAnswerScore,
+         max(a.Score) AS MaxAnswerScore,
+         percentile_cont(0.5) WITHIN GROUP (ORDER BY a.Score) AS MedianAnswerScore
+  FROM Questions q
+  LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Answer')
+  GROUP BY q.Id
+),
+VoteSummary AS (
+  SELECT v.PostId,
+         count(*) FILTER (WHERE vt.Name = 'UpMod') AS UpVotes,
+         count(*) FILTER (WHERE vt.Name = 'DownMod') AS DownVotes,
+         count(*) FILTER (WHERE vt.Name = 'AcceptedByOriginator') AS AcceptedByOwner,
+         count(*) FILTER (WHERE vt.Name = 'Favorite') AS Favorited
+  FROM Votes v
+  JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  GROUP BY v.PostId
+),
+EditStats AS (
+  SELECT ph.PostId,
+         count(DISTINCT ph.UserId) AS DistinctEditors,
+         max(ph.CreationDate) AS LastEditDate,
+         count(*) FILTER (WHERE ph.PostHistoryTypeId IN (5,2,24)) AS BodyEdits
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+CommentStats AS (
+  SELECT c.PostId,
+         avg(char_length(c.Text)) AS AvgCommentLen,
+         count(*) AS CommentCount,
+         count(DISTINCT c.UserId) FILTER (WHERE c.UserId IS NOT NULL) AS DistinctCommenters
+  FROM Comments c
+  GROUP BY c.PostId
+),
+OwnerStats AS (
+  SELECT u.Id AS OwnerUserId,
+         u.Reputation,
+         u.Views AS ProfileViews,
+         count(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+         count(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+         count(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+         bool_or(b.TagBased) AS HasTagBadges
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id, u.Reputation, u.Views
+),
+TagHotness AS (
+  SELECT Tag,
+         count(*) AS QuestionsWithTag,
+         sum(q.ViewCount) AS TotalViews,
+         sum(q.Score) AS TotalScore,
+         sum(COALESCE(vs.UpVotes, 0) - COALESCE(vs.DownVotes, 0)) AS NetVotes,
+         avg(COALESCE(aa.AvgAnswerScore, 0)) AS AvgAnswerScorePerQuestion,
+         percentile_cont(0.75) WITHIN GROUP (ORDER BY q.AnswerCount) AS P75_AnswerCount
+  FROM Questions q
+  LEFT JOIN VoteSummary vs ON vs.PostId = q.Id
+  LEFT JOIN AnswerAgg aa ON aa.QuestionId = q.Id
+  GROUP BY Tag
+),
+RankedQuestions AS (
+  SELECT q.Id, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, q.OwnerUserId, q.Title,
+         aa.PosAnswers, aa.NegAnswers, aa.AvgAnswerScore, aa.MaxAnswerScore, aa.MedianAnswerScore,
+         COALESCE(vs.UpVotes, 0) AS QUpVotes,
+         COALESCE(vs.DownVotes, 0) AS QDownVotes,
+         COALESCE(cs.CommentCount, 0) AS QCommentCount,
+         COALESCE(es.DistinctEditors, 0) AS QDistinctEditors,
+         COALESCE(os.Reputation, 0) AS OwnerReputation,
+         (
+           3.0 * (q.Score) +
+           2.0 * log(1 + q.ViewCount) +
+           5.0 * CASE WHEN q.AnswerCount > 0 THEN 1 ELSE 0 END * q.AnswerCount +
+           4.0 * COALESCE(vs.UpVotes, 0) -
+           2.0 * COALESCE(vs.DownVotes, 0) +
+           1.5 * sqrt(COALESCE(cs.CommentCount, 0)) +
+           0.5 * aa.AvgAnswerScore +
+           0.002 * EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - q.CreationDate)) * -1
+         ) AS HotnessScore
+  FROM Questions q
+  LEFT JOIN AnswerAgg aa ON aa.QuestionId = q.Id
+  LEFT JOIN VoteSummary vs ON vs.PostId = q.Id
+  LEFT JOIN CommentStats cs ON cs.PostId = q.Id
+  LEFT JOIN EditStats es ON es.PostId = q.Id
+  LEFT JOIN OwnerStats os ON os.OwnerUserId = q.OwnerUserId
+  GROUP BY q.Id, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, q.OwnerUserId, q.Title,
+           aa.PosAnswers, aa.NegAnswers, aa.AvgAnswerScore, aa.MaxAnswerScore, aa.MedianAnswerScore,
+           vs.UpVotes, vs.DownVotes, cs.CommentCount, es.DistinctEditors, os.Reputation
+),
+TopSample AS (
+  SELECT rq.Id, rq.CreationDate, rq.Score, rq.ViewCount, rq.AnswerCount, rq.OwnerUserId, rq.Title, rq.PosAnswers, rq.NegAnswers, rq.AvgAnswerScore, rq.MaxAnswerScore, rq.MedianAnswerScore,
+         rq.QUpVotes, rq.QDownVotes, rq.QCommentCount, rq.QDistinctEditors, rq.OwnerReputation, rq.HotnessScore
+  FROM RankedQuestions rq
+  ORDER BY rq.HotnessScore DESC
+  LIMIT 500
+),
+RelatedPosts AS (
+  SELECT DISTINCT pl.RelatedPostId AS PostId
+  FROM PostLinks pl
+  JOIN TopSample ts ON pl.PostId = ts.Id
+  WHERE pl.LinkTypeId IN (1,3)
+  UNION
+  SELECT DISTINCT pl.PostId AS PostId
+  FROM PostLinks pl
+  JOIN TopSample ts ON pl.RelatedPostId = ts.Id
+  WHERE pl.LinkTypeId IN (1,3)
+),
+FullPosts AS (
+  SELECT p.*
+  FROM Posts p
+  WHERE p.Id IN (SELECT Id FROM TopSample)
+     OR p.ParentId IN (SELECT Id FROM TopSample)
+     OR p.Id IN (SELECT PostId FROM RelatedPosts)
+),
+CoTagEdges AS (
+  SELECT t1.Tag AS TagA, t2.Tag AS TagB, count(*) AS CoOccur
+  FROM Questions q
+  JOIN Questions t1 ON t1.Id = q.Id
+  JOIN Questions t2 ON t2.Id = q.Id AND t1.Tag < t2.Tag
+  GROUP BY t1.Tag, t2.Tag
+)
+SELECT json_build_object(
+  'GeneratedAt', CAST('2024-10-01 12:34:56' AS timestamp),
+  'SampleCount', (SELECT count(*) FROM TopSample),
+  'TopTags', (
+    SELECT json_agg(json_build_object(
+             'Tag', th.Tag,
+             'Questions', th.QuestionsWithTag,
+             'TotalViews', th.TotalViews,
+             'NetVotes', th.NetVotes,
+             'AvgAnswerScorePerQuestion', th.AvgAnswerScorePerQuestion
+           ) ) 
+    FROM (
+      SELECT th.Tag, th.QuestionsWithTag, th.TotalViews, th.NetVotes, th.AvgAnswerScorePerQuestion
+      FROM TagHotness th
+      ORDER BY th.QuestionsWithTag DESC
+      LIMIT 25
+    ) th
+  ),
+  'TopQuestions', (
+    SELECT json_agg(jq)
+    FROM (
+      SELECT json_build_object(
+               'Id', ts.Id,
+               'Title', ts.Title,
+               'CreationDate', ts.CreationDate,
+               'OwnerUserId', ts.OwnerUserId,
+               'Score', ts.Score,
+               'ViewCount', ts.ViewCount,
+               'AnswerCount', ts.AnswerCount,
+               'Hotness', ts.HotnessScore,
+               'Answers', (
+                 SELECT json_agg(json_build_object(
+                          'Id', a.Id, 'Score', a.Score, 'OwnerUserId', a.OwnerUserId, 'CreationDate', a.CreationDate
+                        ) ORDER BY a.Score DESC NULLS LAST)
+                 FROM Posts a WHERE a.ParentId = ts.Id AND a.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Answer')
+               ),
+               'Comments', (
+                 SELECT json_agg(json_build_object('Id', c.Id, 'TextLen', char_length(c.Text), 'UserId', c.UserId, 'CreationDate', c.CreationDate) ORDER BY c.CreationDate)
+                 FROM Comments c WHERE c.PostId = ts.Id
+               ),
+               'RelatedPosts', (
+                 SELECT json_agg(json_build_object('Id', rp.Id, 'PostTypeId', rp.PostTypeId, 'Score', rp.Score))
+                 FROM Posts rp
+                 WHERE rp.Id IN (SELECT RelatedPostId FROM PostLinks WHERE PostId = ts.Id AND LinkTypeId IN (1,3))
+                    OR rp.Id IN (SELECT PostId FROM PostLinks WHERE RelatedPostId = ts.Id AND LinkTypeId IN (1,3))
+               )
+             ) AS jq
+      FROM TopSample ts
+      ORDER BY ts.HotnessScore DESC
+    ) sub
+  ),
+  'CoTagTopEdges', (
+    SELECT json_agg(jce)
+    FROM (
+      SELECT json_build_object('TagA', ce.TagA, 'TagB', ce.TagB, 'CoOccur', ce.CoOccur) AS jce
+      FROM CoTagEdges ce
+      ORDER BY ce.CoOccur DESC
+      LIMIT 50
+    ) t
+  ),
+  'FullPostCount', (SELECT count(*) FROM FullPosts)
+) AS BenchmarkPayload;

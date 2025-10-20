@@ -1,0 +1,105 @@
+-- {"query": "35056.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4.1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 964} 
+WITH TopActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(b.Id) AS BadgeCount,
+        SUM(COALESCE(p.ViewCount, 0)) AS TotalViews,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS QuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS AnswerScore
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 years'
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(DISTINCT p.Id) > 20
+),
+TopTags AS (
+    SELECT 
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName,
+        COUNT(*) AS UsageCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    GROUP BY TagName
+    ORDER BY UsageCount DESC
+    LIMIT 20
+),
+TagExperts AS (
+    SELECT
+        tu.UserId,
+        tt.TagName,
+        COUNT(DISTINCT p.Id) AS AnsweredQuestions,
+        SUM(p.Score) AS AnswerScore
+    FROM TopActiveUsers tu
+    JOIN Posts p ON p.OwnerUserId = tu.UserId AND p.PostTypeId = 2
+    JOIN Posts q ON p.ParentId = q.Id AND q.PostTypeId = 1
+    JOIN TopTags tt ON q.Tags LIKE '%' || tt.TagName || '%'
+    GROUP BY tu.UserId, tt.TagName
+),
+BadgePerformance AS (
+    SELECT
+        tu.UserId,
+        tu.DisplayName,
+        b.Name AS BadgeName,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM TopActiveUsers tu
+    JOIN Badges b ON b.UserId = tu.UserId
+    GROUP BY tu.UserId, tu.DisplayName, b.Name, b.Class
+),
+UserActivityTimeline AS (
+    SELECT
+        tu.UserId,
+        date_trunc('month', p.CreationDate) AS ActivityMonth,
+        COUNT(*) AS PostsInMonth,
+        SUM(COALESCE(p.Score,0)) AS TotalScore
+    FROM TopActiveUsers tu
+    JOIN Posts p ON p.OwnerUserId = tu.UserId
+    GROUP BY tu.UserId, date_trunc('month', p.CreationDate)
+    HAVING COUNT(*) > 2
+)
+
+SELECT
+    tu.UserId,
+    tu.DisplayName,
+    tu.PostCount,
+    tu.CommentCount,
+    tu.BadgeCount,
+    tu.TotalViews,
+    tu.QuestionScore,
+    tu.AnswerScore,
+    COALESCE(string_agg(DISTINCT te.TagName, ','), '') AS TopTagsAnswered,
+    COALESCE(SUM(te.AnsweredQuestions), 0) AS TotalTaggedAnswers,
+    COALESCE(SUM(te.AnswerScore), 0) AS TotalTaggedAnswerScore,
+    COALESCE(ba.TopBadge, '') AS MostEarnedBadge,
+    COALESCE(ba.BadgeClass, '') AS TopBadgeClass,
+    COALESCE(ua.ActivityMonths, 0) AS MonthsActive
+FROM TopActiveUsers tu
+LEFT JOIN TagExperts te ON te.UserId = tu.UserId
+LEFT JOIN (
+    SELECT UserId, BadgeName AS TopBadge, Class AS BadgeClass
+    FROM (
+        SELECT
+            bp.UserId,
+            bp.BadgeName,
+            bp.Class,
+            bp.BadgeCount,
+            ROW_NUMBER() OVER (PARTITION BY bp.UserId ORDER BY bp.BadgeCount DESC, bp.Class ASC) AS rnk
+        FROM BadgePerformance bp
+    ) b WHERE rnk = 1
+) ba ON ba.UserId = tu.UserId
+LEFT JOIN (
+    SELECT UserId, COUNT(*) AS ActivityMonths
+    FROM UserActivityTimeline
+    GROUP BY UserId
+) ua ON ua.UserId = tu.UserId
+GROUP BY
+    tu.UserId, tu.DisplayName, tu.PostCount, tu.CommentCount, tu.BadgeCount,
+    tu.TotalViews, tu.QuestionScore, tu.AnswerScore, ba.TopBadge, ba.BadgeClass, ua.ActivityMonths
+ORDER BY
+    tu.AnswerScore + tu.QuestionScore DESC,
+    tu.TotalViews DESC
+LIMIT 25;

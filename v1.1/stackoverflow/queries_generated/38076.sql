@@ -1,0 +1,235 @@
+-- {"query": "38076.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 2266} 
+with recent_users as (
+  select u.id as user_id, u.displayname, u.reputation, u.creationdate
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+latest_user_badge as (
+  select b.userid, max(b.date) as latest_badge_date
+  from badges b
+  group by b.userid
+),
+user_activity as (
+  select
+    u.id as user_id,
+    count(distinct p.id) filter (where p.posttypeid in (1,2) and p.creationdate >= now() - interval '365 days') as posts_last_year,
+    count(distinct c.id) filter (where c.creationdate >= now() - interval '365 days') as comments_last_year,
+    coalesce(sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end)
+             filter (where v.creationdate >= now() - interval '365 days'), 0) as net_votes_last_year,
+    count(distinct case when p.posttypeid = 1 then p.id end) as total_questions,
+    count(distinct case when p.posttypeid = 2 then p.id end) as total_answers
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join comments c on c.userid = u.id
+  left join votes v on v.userid = u.id
+  group by u.id
+),
+question_tag_counts as (
+  select
+    p.owneruserid as user_id,
+    lower(tag) as tag,
+    count(*) as q_count
+  from posts p
+  cross join lateral unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) as tag
+  where p.posttypeid = 1
+  group by p.owneruserid, lower(tag)
+),
+top_user_tag as (
+  select distinct on (user_id)
+    user_id, tag, q_count
+  from question_tag_counts
+  order by user_id, q_count desc, tag asc
+),
+answer_accepts as (
+  select a.owneruserid as user_id, count(*) as accepted_answers
+  from posts q
+  join posts a on a.id = q.acceptedanswerid
+  group by a.owneruserid
+),
+hot_questions as (
+  select q.id as question_id, q.owneruserid as asker_id, q.creationdate, q.score, q.viewcount,
+         coalesce(q.answercount, 0) as answercount
+  from posts q
+  where q.posttypeid = 1
+    and q.creationdate >= now() - interval '90 days'
+),
+question_engagement as (
+  select
+    h.question_id,
+    count(distinct c.id) as comment_count,
+    count(distinct a.id) as answer_count,
+    sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as net_votes
+  from hot_questions h
+  left join comments c on c.postid = h.question_id
+  left join posts a on a.parentid = h.question_id and a.posttypeid = 2
+  left join votes v on v.postid = h.question_id and v.votetypeid in (2,3)
+  group by h.question_id
+),
+dup_clusters as (
+  select
+    pl.relatedpostid as canonical_id,
+    count(*) as dup_count,
+    count(distinct pl.postid) as distinct_duplicates
+  from postlinks pl
+  where pl.linktypeid = 3
+  group by pl.relatedpostid
+),
+post_edit_bursts as (
+  select
+    ph.postid,
+    count(*) filter (where ph.posthistorytypeid in (4,5,6)) as edit_count,
+    min(ph.creationdate) as first_edit,
+    max(ph.creationdate) as last_edit
+  from posthistory ph
+  where ph.creationdate >= now() - interval '365 days'
+  group by ph.postid
+),
+user_quality_score as (
+  select
+    u.id as user_id,
+    0.4*coalesce(aa.accepted_answers,0)
+    + 0.3*coalesce(ua.net_votes_last_year,0)
+    + 0.2*coalesce(ua.posts_last_year,0)
+    + 0.1*coalesce(ua.comments_last_year,0) as quality_score
+  from users u
+  left join user_activity ua on ua.user_id = u.id
+  left join answer_accepts aa on aa.user_id = u.id
+),
+tag_growth as (
+  select
+    lower(tag) as tag,
+    date_trunc('month', p.creationdate) as month,
+    count(*) as q_count
+  from posts p
+  cross join lateral unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) as tag
+  where p.posttypeid = 1
+    and p.creationdate >= now() - interval '730 days'
+  group by lower(tag), date_trunc('month', p.creationdate)
+),
+tag_growth_rate as (
+  select
+    tg1.tag,
+    sum(case when tg1.month >= now() - interval '365 days' then tg1.q_count else 0 end) as last12m,
+    sum(case when tg1.month <  now() - interval '365 days' then tg1.q_count else 0 end) as prev12m,
+    case when sum(case when tg1.month < now() - interval '365 days' then tg1.q_count else 0 end) = 0
+         then null
+         else (sum(case when tg1.month >= now() - interval '365 days' then tg1.q_count else 0 end)::numeric
+              / nullif(sum(case when tg1.month < now() - interval '365 days' then tg1.q_count else 0 end),0)) - 1
+    end as yoy_growth
+  from tag_growth tg1
+  group by tg1.tag
+),
+top_tags as (
+  select tag
+  from tags
+  order by count desc
+  limit 50
+),
+user_top_tag_growth as (
+  select tut.user_id, tgr.yoy_growth
+  from top_user_tag tut
+  join tag_growth_rate tgr on tgr.tag = tut.tag
+),
+question_hotness as (
+  select
+    h.question_id,
+    h.score,
+    h.viewcount,
+    qe.answer_count,
+    qe.comment_count,
+    qe.net_votes,
+    (0.5*least(h.score, 50)
+     + 0.3*least(h.viewcount/100, 100)
+     + 0.2*least(qe.answer_count*5 + qe.comment_count, 100)
+     + 0.4*least(qe.net_votes, 50)) as hotness
+  from hot_questions h
+  join question_engagement qe on qe.question_id = h.question_id
+),
+ranked_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    ua.posts_last_year,
+    ua.comments_last_year,
+    ua.net_votes_last_year,
+    coalesce(aa.accepted_answers,0) as accepted_answers,
+    coalesce(lub.latest_badge_date, timestamp 'epoch') as latest_badge_date,
+    coalesce(utg.yoy_growth, 0) as top_tag_yoy_growth,
+    coalesce(uqs.quality_score, 0) as quality_score,
+    row_number() over (
+      order by
+        coalesce(uqs.quality_score,0) desc,
+        u.reputation desc,
+        coalesce(aa.accepted_answers,0) desc,
+        coalesce(ua.net_votes_last_year,0) desc
+    ) as quality_rank
+  from users u
+  left join user_activity ua on ua.user_id = u.id
+  left join answer_accepts aa on aa.user_id = u.id
+  left join latest_user_badge lub on lub.userid = u.id
+  left join user_quality_score uqs on uqs.user_id = u.id
+  left join user_top_tag_growth utg on utg.user_id = u.id
+),
+question_summary as (
+  select
+    q.id as question_id,
+    q.title,
+    q.owneruserid as asker_id,
+    q.creationdate,
+    q.score,
+    q.viewcount,
+    q.answercount,
+    coalesce(dc.dup_count, 0) as duplicate_count,
+    coalesce(pe.edit_count, 0) as edit_count
+  from posts q
+  left join dup_clusters dc on dc.canonical_id = q.id
+  left join post_edit_bursts pe on pe.postid = q.id
+  where q.posttypeid = 1
+    and q.creationdate >= now() - interval '90 days'
+),
+final as (
+  select
+    qs.question_id,
+    qs.title,
+    qs.creationdate,
+    qs.score,
+    qs.viewcount,
+    qs.answercount,
+    qs.duplicate_count,
+    qs.edit_count,
+    qt.hotness,
+    ru.quality_rank as asker_quality_rank,
+    ru.displayname as asker_name,
+    ru.reputation as asker_reputation,
+    ru.accepted_answers as asker_accepted_answers,
+    ru.net_votes_last_year as asker_net_votes_last_year,
+    coalesce(tt.tag, '(none)') as asker_top_tag,
+    coalesce(tgr.yoy_growth, 0) as asker_top_tag_yoy_growth,
+    row_number() over (order by qt.hotness desc, qs.viewcount desc, qs.score desc) as hot_rank
+  from question_summary qs
+  join question_hotness qt on qt.question_id = qs.question_id
+  left join ranked_users ru on ru.user_id = qs.asker_id
+  left join top_user_tag tt on tt.user_id = qs.asker_id
+  left join tag_growth_rate tgr on tgr.tag = tt.tag
+)
+select
+  f.question_id,
+  f.title,
+  f.creationdate,
+  f.score,
+  f.viewcount,
+  f.answercount,
+  f.duplicate_count,
+  f.edit_count,
+  round(f.hotness::numeric, 2) as hotness,
+  f.asker_quality_rank,
+  f.asker_name,
+  f.asker_reputation,
+  f.asker_accepted_answers,
+  f.asker_net_votes_last_year,
+  f.asker_top_tag,
+  round(f.asker_top_tag_yoy_growth::numeric, 3) as asker_top_tag_yoy_growth
+from final f
+where f.hot_rank <= 200
+order by f.hot_rank, f.question_id;

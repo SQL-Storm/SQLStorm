@@ -1,0 +1,120 @@
+-- {"query": "152.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 2315} 
+WITH
+UserCte AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.AccountId
+  FROM Users u
+),
+PostStats AS (
+  SELECT
+    p.OwnerUserId AS UserId,
+    p.PostTypeId,
+    COUNT(*) AS PostCount,
+    MAX(p.LastActivityDate) AS LastActivity
+  FROM Posts p
+  WHERE p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId, p.PostTypeId
+),
+VoteStats AS (
+  SELECT
+    v.UserId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    SUM(CASE WHEN v.VoteTypeId = 6 THEN 1 ELSE 0 END) AS CloseVotes,
+    AVG(v.BountyAmount) FILTER (WHERE v.BountyAmount IS NOT NULL) AS AvgBounty
+  FROM Votes v
+  GROUP BY v.UserId
+),
+BadgeStats AS (
+  SELECT
+    b.UserId,
+    COUNT(*) AS BadgeCount,
+    MAX(b.Date) AS LastBadgeDate
+  FROM Badges b
+  GROUP BY b.UserId
+),
+TopTagPerUser AS (
+  SELECT
+    tpu.UserId,
+    t.TagName,
+    t.CountPerTag,
+    ROW_NUMBER() OVER (PARTITION BY tpu.UserId ORDER BY t.CountPerTag DESC) AS rn
+  FROM (
+    SELECT
+      p.OwnerUserId AS UserId,
+      unnest(string_to_array(substr(p.Tags, 2, length(p.Tags) - 2), '><')) AS TagName
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+  ) AS tpu
+  JOIN Tags t ON t.TagName = tpu.TagName
+  CROSS JOIN LATERAL (
+    SELECT COUNT(*) AS CountPerTag
+    FROM Posts pp
+    WHERE pp.OwnerUserId = tpu.UserId
+      AND pp.Tags LIKE '%' || t.TagName || '%'
+  ) AS c
+),
+TopTagFinal AS (
+  SELECT UserId, TagName AS TopTag, CountPerTag
+  FROM TopTagPerUser t
+  WHERE rn = 1
+),
+RecentActivity AS (
+  SELECT
+    p.OwnerUserId AS UserId,
+    MAX(p.LastActivityDate) AS LastPostActivity
+  FROM Posts p
+  GROUP BY p.OwnerUserId
+),
+RecentComment AS (
+  SELECT
+    c.UserId AS UserId,
+    MAX(c.CreationDate) AS LastCommentDate
+  FROM Comments c
+  GROUP BY c.UserId
+)
+SELECT
+  uc.UserId,
+  uc.DisplayName,
+  uc.Reputation,
+  COALESCE(ra.LastPostActivity, uc.CreationDate) AS LastActivity,
+  COALESCE(vs.UpVotes, 0) AS UpVotes,
+  COALESCE(vs.DownVotes, 0) AS DownVotes,
+  COALESCE(bs.BadgeCount, 0) AS BadgeCount,
+  COALESCE(tpf.TopTag, 'None') AS TopTag,
+  COALESCE(tpf.CountPerTag, 0) AS TopTagCount,
+  COALESCE(rc.LastCommentDate, NULL) AS LastCommentDate,
+  CASE
+    WHEN uc.Location IS NULL THEN 'Unknown'
+    ELSE uc.Location
+  END AS LocationAlias,
+  -- A set operation flavor: union a synthetic “inactive” cohort
+  NULL AS CohortFlag
+FROM UserCte uc
+LEFT JOIN RecentActivity ra ON ra.UserId = uc.UserId
+LEFT JOIN VoteStats vs ON vs.UserId = uc.UserId
+LEFT JOIN BadgeStats bs ON bs.UserId = uc.UserId
+LEFT JOIN TopTagFinal tpf ON tpf.UserId = uc.UserId
+LEFT JOIN RecentComment rc ON rc.UserId = uc.UserId
+ORDER BY LastActivity DESC NULLS LAST, uc.Reputation DESC
+LIMIT 200
+UNION ALL
+SELECT
+  0 AS UserId,
+  'Benchmark_Grouper' AS DisplayName,
+  0 AS Reputation,
+  NULL AS LastActivity,
+  0 AS UpVotes,
+  0 AS DownVotes,
+  0 AS BadgeCount,
+  'TagX|TagY' AS TopTag,
+  2 AS TopTagCount,
+  NULL AS LastCommentDate,
+  NULL AS LocationAlias,
+  1 AS CohortFlag;

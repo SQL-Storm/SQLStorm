@@ -1,0 +1,77 @@
+WITH 
+top_users AS (
+    SELECT u.Id, u.Reputation, u.UpVotes, u.DownVotes,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS rep_rank
+    FROM Users u 
+    WHERE u.Reputation >= 1000 
+      AND u.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '5 years'
+),
+active_tags AS (
+    SELECT t.TagName, t.Count, t.ExcerptPostId
+    FROM Tags t 
+    WHERE t.Count > 500
+),
+tag_posts AS (
+    SELECT p.Id AS post_id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CreationDate,
+           p.Tags, p.OwnerUserId, at.TagName,
+           ROW_NUMBER() OVER (PARTITION BY at.TagName ORDER BY p.ViewCount DESC) AS tag_rank
+    FROM Posts p
+    INNER JOIN active_tags at ON p.Tags LIKE '%' || at.TagName || '%'
+    INNER JOIN top_users tu ON p.OwnerUserId = tu.Id
+    WHERE p.PostTypeId = 1 
+      AND p.Score > 0 
+      AND (p.DeletedDate IS NULL)
+),
+linked_stats AS (
+    SELECT pl.PostId, COUNT(DISTINCT pl.RelatedPostId) AS outbound_links,
+           AVG(p.Score) AS avg_related_score
+    FROM PostLinks pl
+    INNER JOIN Posts p ON pl.RelatedPostId = p.Id
+    WHERE pl.LinkTypeId = 1
+    GROUP BY pl.PostId
+),
+comment_activity AS (
+    SELECT c.PostId, COUNT(c.Id) AS comment_count, AVG(c.Score) AS avg_comment_score,
+           MAX(c.CreationDate) AS last_comment_date
+    FROM Comments c 
+    WHERE c.Score > 0
+    GROUP BY c.PostId
+),
+vote_metrics AS (
+    SELECT v.PostId, 
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS downvotes,
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS net_votes
+    FROM Votes v
+    WHERE v.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '1 year'
+    GROUP BY v.PostId
+)
+SELECT 
+    tp.TagName,
+    COUNT(tp.post_id) AS total_questions,
+    ROUND(AVG(tp.Score)::numeric, 2) AS avg_score,
+    ROUND(
+      AVG(
+        CAST(tp.ViewCount AS numeric) 
+        / NULLIF(EXTRACT(EPOCH FROM (CAST('2024-10-01' AS date) - tp.CreationDate)) / CAST(86400 AS numeric), 0)
+      )::numeric, 2
+    ) AS avg_daily_views,
+    ROUND(AVG(tp.AnswerCount)::numeric, 1) AS avg_answers,
+    MAX(tp.ViewCount) AS max_views,
+    SUM(COALESCE(ls.outbound_links, 0)) AS total_outbound_links,
+    ROUND(AVG(COALESCE(ls.avg_related_score, 0))::numeric, 2) AS avg_related_score,
+    ROUND(AVG(COALESCE(ca.comment_count, 0))::numeric, 1) AS avg_comments,
+    ROUND(AVG(COALESCE(vm.net_votes, 0))::numeric, 2) AS avg_net_votes,
+    COUNT(DISTINCT tp.OwnerUserId) AS unique_authors,
+    ROUND(AVG(tu.Reputation)::numeric, 0) AS avg_author_rep,
+    COUNT(CASE WHEN tp.AnswerCount >= 3 THEN 1 END) * 100.0 / COUNT(tp.post_id) AS pct_high_answer_questions
+FROM tag_posts tp
+LEFT JOIN linked_stats ls ON tp.post_id = ls.PostId
+LEFT JOIN comment_activity ca ON tp.post_id = ca.PostId
+LEFT JOIN vote_metrics vm ON tp.post_id = vm.PostId
+LEFT JOIN top_users tu ON tp.OwnerUserId = tu.Id
+WHERE tp.tag_rank <= 10
+GROUP BY tp.TagName
+HAVING COUNT(tp.post_id) >= 5
+ORDER BY avg_daily_views DESC, total_questions DESC
+LIMIT 20;

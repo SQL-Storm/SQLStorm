@@ -1,0 +1,120 @@
+WITH TopQuestionAuthors AS (
+    SELECT 
+        p.OwnerUserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        AVG(p.Score) AS AvgScore,
+        SUM(p.ViewCount) AS TotalViews
+    FROM Posts p
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 
+      AND p.CreationDate >= TIMESTAMP '2020-01-01'
+      AND p.Score >= 5
+    GROUP BY p.OwnerUserId, u.DisplayName
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+AnswerMetrics AS (
+    SELECT 
+        a.ParentId AS QuestionId,
+        COUNT(DISTINCT a.Id) AS AnswerCount,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS BestAnswerScore,
+        COUNT(DISTINCT a.OwnerUserId) AS UniqueAnswerers,
+        MIN(a.CreationDate) AS FirstAnswerTime,
+        MAX(CASE WHEN a.Id = q.AcceptedAnswerId THEN a.CreationDate END) AS AcceptedAnswerTime
+    FROM Posts a
+    INNER JOIN Posts q ON a.ParentId = q.Id
+    WHERE a.PostTypeId = 2
+      AND q.PostTypeId = 1
+    GROUP BY a.ParentId
+),
+UserEngagement AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpvotesGiven,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownvotesGiven,
+        COUNT(DISTINCT c.Id) AS CommentsPosted,
+        COUNT(DISTINCT b.Id) AS BadgesEarned,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id
+),
+TagPopularity AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        COUNT(DISTINCT p.OwnerUserId) AS UniqueContributors,
+        AVG(p.Score) AS AvgQuestionScore,
+        CAST(COUNT(DISTINCT CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN p.Id END) AS DOUBLE PRECISION) /
+            NULLIF(COUNT(DISTINCT p.Id), 0) AS AcceptanceRate
+    FROM Tags t
+    INNER JOIN Posts p ON EXISTS (
+        SELECT 1
+        FROM regexp_split_to_table(TRIM(BOTH '<>' FROM p.Tags), '><') AS tag
+        WHERE tag = t.TagName
+    )
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName, t.Count
+    HAVING COUNT(DISTINCT p.Id) >= 100
+)
+SELECT 
+    tqa.DisplayName,
+    tqa.QuestionCount,
+    ROUND(CAST(tqa.AvgScore AS NUMERIC), 2) AS AvgQuestionScore,
+    tqa.TotalViews,
+    ROUND(AVG(am.AnswerCount)::numeric, 2) OVER () * 0 + ROUND(AVG(am.AnswerCount), 2) AS AvgAnswersPerQuestion,
+    ROUND(AVG(am.AvgAnswerScore), 2) AS AvgAnswerScoreReceived,
+    ROUND(AVG(EXTRACT(EPOCH FROM (am.FirstAnswerTime - p.CreationDate))/3600), 2) AS AvgHoursToFirstAnswer,
+    ue.CommentsPosted,
+    ue.UpvotesGiven,
+    ue.GoldBadges,
+    ue.SilverBadges,
+    ue.BronzeBadges,
+    COUNT(DISTINCT pl.RelatedPostId) AS QuestionsLinked,
+    COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.Id END) AS DuplicatesMarked,
+    -- Replace DISTINCT+ORDER BY inside STRING_AGG with a subquery for portability
+    (SELECT STRING_AGG(tagname, ', ')
+     FROM (
+       SELECT tp2.TagName AS tagname
+       FROM TagPopularity tp2
+       WHERE EXISTS (
+         SELECT 1
+         FROM regexp_split_to_table(TRIM(BOTH '<>' FROM p.Tags), '><') AS tag
+         WHERE tag = tp2.TagName
+       )
+       ORDER BY tp2.TagCount DESC
+     ) s
+    ) AS TopTags,
+    ROUND(AVG(tp.AcceptanceRate), 3) AS AvgTagAcceptanceRate
+FROM TopQuestionAuthors tqa
+INNER JOIN Posts p ON tqa.OwnerUserId = p.OwnerUserId AND p.PostTypeId = 1
+LEFT JOIN AnswerMetrics am ON p.Id = am.QuestionId
+LEFT JOIN UserEngagement ue ON tqa.OwnerUserId = ue.UserId
+LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN TagPopularity tp ON EXISTS (
+    SELECT 1
+    FROM regexp_split_to_table(TRIM(BOTH '<>' FROM p.Tags), '><') AS tag
+    WHERE tag = tp.TagName
+)
+WHERE p.CreationDate >= TIMESTAMP '2020-01-01'
+GROUP BY 
+    tqa.DisplayName, 
+    tqa.QuestionCount, 
+    tqa.AvgScore, 
+    tqa.TotalViews,
+    ue.CommentsPosted,
+    ue.UpvotesGiven,
+    ue.GoldBadges,
+    ue.SilverBadges,
+    ue.BronzeBadges,
+    tqa.OwnerUserId
+HAVING COUNT(DISTINCT p.Id) >= 10
+ORDER BY 
+    tqa.TotalViews DESC,
+    tqa.AvgScore DESC
+LIMIT 100;

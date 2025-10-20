@@ -1,0 +1,125 @@
+WITH UserQuestionStats AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+    COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+    COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+    MAX(p.CreationDate) FILTER (WHERE p.PostTypeId = 1) AS LastQuestionDate
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName
+),
+HighReputationUsers AS (
+  SELECT UserId, DisplayName, QuestionCount, AnswerCount, TotalPostScore, LastQuestionDate
+  FROM UserQuestionStats
+  WHERE QuestionCount > 5 AND TotalPostScore > 1000
+),
+TagPopularity AS (
+  SELECT
+    unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')) AS Tag,
+    COUNT(*) AS TagCount,
+    AVG(p.Score) AS AvgScore
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+  GROUP BY unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><'))
+  HAVING COUNT(*) > 50
+),
+TopTags AS (
+  SELECT Tag
+  FROM TagPopularity
+  ORDER BY TagCount DESC, AvgScore DESC
+  LIMIT 10
+),
+UserBadgeSummary AS (
+  SELECT
+    b.UserId,
+    COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+    COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+    COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+    COUNT(DISTINCT b.Name) AS DistinctBadges,
+    MAX(b.Date) AS LastBadgeDate
+  FROM Badges b
+  GROUP BY b.UserId
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    COUNT(DISTINCT ph.PostId) AS EditedPosts,
+    COUNT(DISTINCT c.Id) AS CommentCount
+  FROM Users u
+  LEFT JOIN PostHistory ph ON ph.UserId = u.Id AND ph.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+  LEFT JOIN Comments c ON c.UserId = u.Id AND c.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+  GROUP BY u.Id
+),
+QualifiedUsers AS (
+  SELECT
+    hu.UserId,
+    hu.DisplayName,
+    hu.QuestionCount,
+    hu.AnswerCount,
+    hu.TotalPostScore,
+    hu.LastQuestionDate,
+    COALESCE(ubs.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ubs.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ubs.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(ubs.DistinctBadges, 0) AS DistinctBadges,
+    COALESCE(ua.EditedPosts, 0) AS EditedPosts,
+    COALESCE(ua.CommentCount, 0) AS CommentCount
+  FROM HighReputationUsers hu
+  LEFT JOIN UserBadgeSummary ubs ON ubs.UserId = hu.UserId
+  LEFT JOIN UserActivity ua ON ua.UserId = hu.UserId
+  WHERE COALESCE(ubs.GoldBadges, 0) > 0 AND COALESCE(ua.CommentCount, 0) > 20
+)
+SELECT
+  qu.UserId,
+  qu.DisplayName,
+  qu.QuestionCount,
+  qu.AnswerCount,
+  qu.TotalPostScore,
+  qu.GoldBadges,
+  qu.SilverBadges,
+  qu.BronzeBadges,
+  qu.DistinctBadges,
+  qu.EditedPosts,
+  qu.CommentCount,
+  tt.Tag,
+  tp.TagCount,
+  tp.AvgScore,
+  (
+    SELECT COUNT(*)
+    FROM Posts p
+    WHERE p.OwnerUserId = qu.UserId
+      AND p.PostTypeId = 1
+      AND p.Tags LIKE '%' || tt.Tag || '%'
+      AND p.Score > (SELECT AVG(p2.score) FROM Posts p2 WHERE p2.PostTypeId = 1)
+  ) AS UserQuestionCountForTag,
+  (
+    SELECT AVG(v.Score)
+    FROM Votes v
+    JOIN Posts p2 ON v.PostId = p2.Id
+    WHERE p2.OwnerUserId = qu.UserId
+      AND p2.PostTypeId = 1
+      AND p2.Tags LIKE '%' || tt.Tag || '%'
+      AND v.VoteTypeId = 2
+  ) AS AvgUpvoteScoreForTag
+FROM QualifiedUsers qu
+CROSS JOIN TopTags tt
+JOIN TagPopularity tp ON tp.Tag = tt.Tag
+GROUP BY
+  qu.UserId,
+  qu.DisplayName,
+  qu.QuestionCount,
+  qu.AnswerCount,
+  qu.TotalPostScore,
+  qu.GoldBadges,
+  qu.SilverBadges,
+  qu.BronzeBadges,
+  qu.DistinctBadges,
+  qu.EditedPosts,
+  qu.CommentCount,
+  tt.Tag,
+  tp.TagCount,
+  tp.AvgScore
+ORDER BY qu.TotalPostScore DESC, qu.GoldBadges DESC, tp.TagCount DESC
+LIMIT 100;

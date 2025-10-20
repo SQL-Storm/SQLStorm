@@ -1,0 +1,61 @@
+SELECT
+    p.PostTypeId,
+    pt.Name AS PostTypeName,
+    COUNT(*) AS TotalPosts,
+    AVG(p.Score) AS AvgScore,
+    SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AnsweredQuestions,
+    AVG(p.ViewCount) AS AvgViews,
+    COUNT(DISTINCT u.Id) AS UniqueAuthors,
+    MAX(p.CreationDate) AS MostRecentPost,
+    COUNT(DISTINCT c.Id) AS TotalComments,
+    AVG(c.Score) AS AvgCommentScore,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes,
+    SUM(CASE WHEN v.VoteTypeId = 10 THEN 1 ELSE 0 END) AS TotalDeletions,
+    COUNT(DISTINCT bl.RelatedPostId) AS TotalLinkedPosts,
+    -- for portability, use GROUP_CONCAT where available; keep ARRAY_AGG name for DBs that support it
+    ARRAY_AGG(DISTINCT tt.Name) AS LinkTypesUsed,
+    COUNT(DISTINCT t.Id) AS UniqueTags,
+    COUNT(DISTINCT b.Id) AS UniqueBadges,
+    (SELECT COUNT(*) FROM Users u2 WHERE u2.Reputation >= 1000) AS HighReputationUsers
+FROM
+    Posts p
+JOIN
+    PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN
+    Users u ON p.OwnerUserId = u.Id
+LEFT JOIN
+    Comments c ON c.PostId = p.Id
+LEFT JOIN
+    Votes v ON v.PostId = p.Id
+LEFT JOIN
+    PostLinks bl ON bl.PostId = p.Id
+LEFT JOIN
+    LinkTypes lt ON bl.LinkTypeId = lt.Id
+LEFT JOIN
+    -- match tags by searching for tag name in tags text; use POSITION and standard concatenation
+    Posts t ON POSITION(CONCAT('<', t.TagName, '>') IN COALESCE(p.Tags, '')) > 0
+LEFT JOIN
+    Badges b ON b.UserId = p.OwnerUserId
+LEFT JOIN
+    TagTags tt ON t.TagName = tt.TagName
+WHERE
+    p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '1' YEAR)
+GROUP BY
+    p.PostTypeId,
+    pt.Name,
+    p.Score,
+    p.AcceptedAnswerId,
+    p.ViewCount,
+    u.Id,
+    p.CreationDate,
+    c.Id,
+    c.Score,
+    v.VoteTypeId,
+    bl.RelatedPostId,
+    tt.Name,
+    t.Id,
+    b.Id
+ORDER BY
+    TotalPosts DESC
+LIMIT 10;

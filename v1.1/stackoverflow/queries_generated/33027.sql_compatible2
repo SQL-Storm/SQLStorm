@@ -1,0 +1,58 @@
+SELECT
+    p.Id,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    COALESCE(q.AnswerCount, 0) AS AnswerCount,
+    COALESCE(c.CommentCount, 0) AS CommentCount,
+    COUNT(DISTINCT v.UserId) AS UniqueVoters,
+    COUNT(DISTINCT bl.RelatedPostId) AS LinkedPostsCount,
+    AVG(v_agg.votes_count) OVER (PARTITION BY p.Id) AS AverageVoteCountPerPost,
+    jsonb_object_agg(tv.Name, v_agg.upvote_count) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesPerTag,
+    jsonb_object_agg(tv.Name, v_agg.downvote_count) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesPerTag,
+    array_agg(DISTINCT bl.RelatedPostId) AS RelatedPostIds
+FROM
+    Posts p
+LEFT JOIN
+    Posts q ON p.Id = q.ParentId
+LEFT JOIN
+    (
+      SELECT PostId, COUNT(*) AS CommentCount
+      FROM Comments
+      GROUP BY PostId
+    ) c ON c.PostId = p.Id
+LEFT JOIN (
+    SELECT PostId,
+           COUNT(*) AS votes_count,
+           SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvote_count,
+           SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvote_count,
+           MAX(UserId) FILTER (WHERE UserId IS NOT NULL) AS any_user_for_distinct
+    FROM Votes
+    GROUP BY PostId
+) v_agg ON v_agg.PostId = p.Id
+LEFT JOIN
+    Votes v ON v.PostId = p.Id
+LEFT JOIN
+    VoteTypes tv ON v.VoteTypeId = tv.Id
+LEFT JOIN
+    PostLinks bl ON bl.PostId = p.Id AND bl.LinkTypeId = 1
+WHERE
+    p.PostTypeId = 1
+    AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+GROUP BY
+    p.Id,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    q.AnswerCount,
+    c.CommentCount,
+    v_agg.votes_count
+ORDER BY
+    p.CreationDate DESC
+LIMIT 100;

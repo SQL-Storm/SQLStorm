@@ -1,0 +1,39 @@
+WITH top_posts AS (
+  SELECT p.Id, p.Score, p.ViewCount, p.Tags, p.CreationDate, p.LastActivityDate, 
+         p.CommentCount, p.FavoriteCount, p.ClosedDate, p.CommunityOwnedDate, 
+         COUNT(DISTINCT ph.PostId) AS edit_count, 
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvote_count, 
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvote_count
+  FROM Posts p
+  LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+  LEFT JOIN Votes v ON p.Id = v.PostId
+  GROUP BY p.Id, p.Score, p.ViewCount, p.Tags, p.CreationDate, p.LastActivityDate, 
+           p.CommentCount, p.FavoriteCount, p.ClosedDate, p.CommunityOwnedDate
+),
+top_users AS (
+  SELECT u.Id, u.Reputation, u.CreationDate, u.LastAccessDate, 
+         COUNT(DISTINCT p.Id) AS post_count, 
+         SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) AS positive_score_count
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+  GROUP BY u.Id, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+tag_counts AS (
+  SELECT t.TagName, COUNT(DISTINCT p.Id) AS post_count
+  FROM Tags t
+  LEFT JOIN PostTypes pt_type ON pt_type.Name = 'Question'
+  LEFT JOIN PostTags posttags ON posttags.TagId = t.Id
+  LEFT JOIN Posts p ON p.Id = posttags.PostId AND (pt_type.Id IS NULL OR p.PostTypeId = pt_type.Id)
+  GROUP BY t.TagName
+)
+SELECT tp.Id, tp.Score, tp.ViewCount, tp.Tags, tp.CreationDate, tp.LastActivityDate, 
+       tp.edit_count, tp.upvote_count, tp.downvote_count, 
+       tu.Reputation, tu.CreationDate AS user_creation_date, 
+       tu.LastAccessDate AS user_last_access_date, tu.post_count, tu.positive_score_count, 
+       tc.post_count AS tag_post_count
+FROM top_posts tp
+LEFT JOIN top_users tu ON tp.Id = tu.Id
+LEFT JOIN tag_counts tc ON tp.Tags = tc.TagName
+WHERE tp.Score > 10 AND tp.ViewCount > 1000 AND tu.Reputation > 1000
+ORDER BY tp.Score DESC, tp.ViewCount DESC
+LIMIT 100;

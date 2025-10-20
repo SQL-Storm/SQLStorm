@@ -1,0 +1,121 @@
+WITH UserAnswerStats AS (
+    SELECT
+        OwnerUserId,
+        COUNT(*) AS TotalAnswers,
+        AVG(Score) AS AverageAnswerScore,
+        SUM(Score) AS TotalAnswerScore,
+        MAX(CreationDate) AS LastAnswerDate,
+        AVG(EXTRACT(EPOCH FROM (CreationDate - PrevAnswerDate))) / 3600.0 AS AvgHoursBetweenAnswers
+    FROM (
+        SELECT
+            OwnerUserId,
+            Score,
+            CreationDate,
+            LAG(CreationDate, 1) OVER (PARTITION BY OwnerUserId ORDER BY CreationDate) AS PrevAnswerDate
+        FROM Posts
+        WHERE PostTypeId = 2
+          AND OwnerUserId IS NOT NULL
+    ) AS UserConsecutiveAnswers
+    GROUP BY OwnerUserId
+    HAVING COUNT(*) > 50
+),
+PopularQuestions AS (
+    SELECT Id
+    FROM Posts
+    WHERE PostTypeId = 1
+      AND ViewCount > (
+          SELECT ViewCount
+          FROM Posts
+          WHERE PostTypeId = 1 AND ViewCount IS NOT NULL
+          ORDER BY ViewCount DESC
+          LIMIT 1 OFFSET (
+              SELECT CAST(COUNT(*) * 0.05 AS INTEGER)
+              FROM Posts
+              WHERE PostTypeId = 1 AND ViewCount IS NOT NULL
+          )
+      )
+      AND FavoriteCount > (
+          SELECT FavoriteCount
+          FROM Posts
+          WHERE PostTypeId = 1 AND FavoriteCount IS NOT NULL
+          ORDER BY FavoriteCount DESC
+          LIMIT 1 OFFSET (
+              SELECT CAST(COUNT(*) * 0.05 AS INTEGER)
+              FROM Posts
+              WHERE PostTypeId = 1 AND FavoriteCount IS NOT NULL
+          )
+      )
+      AND AnswerCount > (
+          SELECT AVG(AnswerCount)
+          FROM Posts
+          WHERE PostTypeId = 1
+      )
+      AND ClosedDate IS NULL
+),
+ExpertContributions AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(DISTINCT p.Id) AS AnswersToPopularQuestions,
+        AVG(p.Score) AS AvgScoreOnPopularQuestions,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesOnPopularAnswers,
+        SUM(CASE WHEN p.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedAnswersToPopularQuestions
+    FROM Posts p
+    JOIN PopularQuestions q ON p.ParentId = q.Id
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    WHERE p.PostTypeId = 2
+      AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserBadgeSummary AS (
+    SELECT
+        UserId,
+        COUNT(CASE WHEN Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges
+    GROUP BY UserId
+)
+SELECT
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    uas.TotalAnswers,
+    uas.AverageAnswerScore,
+    uas.AvgHoursBetweenAnswers,
+    COALESCE(ubs.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ubs.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ec.AnswersToPopularQuestions, 0) AS AnswersToPopularQuestions,
+    COALESCE(ec.AvgScoreOnPopularQuestions, 0) AS AvgScoreOnPopularQuestions,
+    COALESCE(ec.AcceptedAnswersToPopularQuestions, 0) AS AcceptedAnswersToPopularQuestions,
+    DENSE_RANK() OVER (ORDER BY (
+        (u.Reputation / 1000.0)
+        + (uas.TotalAnswerScore * 0.1)
+        + (COALESCE(ec.AnswersToPopularQuestions, 0) * 10)
+        + (COALESCE(ec.AcceptedAnswersToPopularQuestions, 0) * 50)
+        + (COALESCE(ubs.GoldBadges, 0) * 100)
+    ) / (1 + EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - u.CreationDate)) / (3600*24*365.25)) DESC) AS UserRank
+FROM Users u
+JOIN UserAnswerStats uas ON u.Id = uas.OwnerUserId
+LEFT JOIN UserBadgeSummary ubs ON u.Id = ubs.UserId
+LEFT JOIN ExpertContributions ec ON u.Id = ec.OwnerUserId
+WHERE u.Reputation > (SELECT AVG(Reputation) * 2 FROM Users)
+  AND uas.LastAnswerDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 year')
+  AND COALESCE(ubs.GoldBadges, 0) > 0
+GROUP BY
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    uas.TotalAnswers,
+    uas.AverageAnswerScore,
+    uas.AvgHoursBetweenAnswers,
+    uas.TotalAnswerScore,
+    uas.LastAnswerDate,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ec.AnswersToPopularQuestions,
+    ec.AvgScoreOnPopularQuestions,
+    ec.AcceptedAnswersToPopularQuestions,
+    u.Id
+ORDER BY UserRank, u.Reputation DESC
+LIMIT 100;

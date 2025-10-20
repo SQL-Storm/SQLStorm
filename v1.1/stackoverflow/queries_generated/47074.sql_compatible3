@@ -1,0 +1,145 @@
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT pt.Id) AS question_count,
+        1 AS level
+    FROM Tags t
+    INNER JOIN Posts pt ON pt.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE t.Count > 1000
+      AND pt.PostTypeId = 1
+    GROUP BY t.Id, t.TagName
+
+    UNION ALL
+
+    SELECT 
+        t.Id,
+        t.TagName,
+        th.question_count,
+        th.level + 1
+    FROM Tags t
+    INNER JOIN tag_hierarchy th ON t.Id <> th.Id
+    WHERE th.level < 3
+),
+user_expertise AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS answers_in_tag,
+        SUM(p.Score) AS total_score_in_tag,
+        AVG(p.Score) AS avg_score_in_tag,
+        COUNT(DISTINCT CASE WHEN p.Id = q.AcceptedAnswerId THEN p.Id END) AS accepted_answers,
+        RANK() OVER (PARTITION BY t.TagName ORDER BY SUM(p.Score) DESC) AS tag_rank
+    FROM Users u
+    INNER JOIN Posts p ON p.OwnerUserId = u.Id
+    INNER JOIN Posts q ON q.Id = p.ParentId
+    INNER JOIN Tags t ON q.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE p.PostTypeId = 2
+      AND u.Reputation > 5000
+      AND p.Score > 0
+      AND q.PostTypeId = 1
+    GROUP BY u.Id, u.DisplayName, u.Reputation, t.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+temporal_patterns AS (
+    SELECT 
+        DATE_TRUNC('month', p.CreationDate) AS month,
+        pt.Name AS post_type,
+        COUNT(*) AS post_count,
+        AVG(p.Score) AS avg_score,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS median_score,
+        PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY p.Score) AS p95_score,
+        COUNT(DISTINCT p.OwnerUserId) AS unique_authors,
+        SUM(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS closed_posts,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE NULL END) AS avg_answers,
+        LAG(COUNT(*)) OVER (PARTITION BY pt.Name ORDER BY DATE_TRUNC('month', p.CreationDate)) AS prev_month_count,
+        LAG(COUNT(*), 12) OVER (PARTITION BY pt.Name ORDER BY DATE_TRUNC('month', p.CreationDate)) AS year_ago_count
+    FROM Posts p
+    INNER JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years')
+    GROUP BY DATE_TRUNC('month', p.CreationDate), pt.Name
+),
+badge_correlation AS (
+    SELECT 
+        b1.Name AS badge1,
+        b2.Name AS badge2,
+        COUNT(DISTINCT b1.UserId) AS users_with_both,
+        CAST(COUNT(DISTINCT b1.UserId) AS DECIMAL) / NULLIF(COUNT(DISTINCT u.Id), 0) AS correlation_coefficient
+    FROM Badges b1
+    INNER JOIN Badges b2 ON b1.UserId = b2.UserId AND b1.Name < b2.Name
+    INNER JOIN Users u ON u.Id = b1.UserId
+    WHERE b1.Class IN (1, 2)
+      AND b2.Class IN (1, 2)
+      AND u.Reputation > 10000
+    GROUP BY b1.Name, b2.Name
+    HAVING COUNT(DISTINCT b1.UserId) >= 50
+),
+edit_patterns AS (
+    SELECT 
+        ph.UserId,
+        u.DisplayName,
+        COUNT(DISTINCT ph.PostId) AS edited_posts,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 END) AS edits,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (7,8,9) THEN 1 END) AS rollbacks,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 24 THEN 1 END) AS suggested_edits,
+        AVG(LENGTH(ph.Text)) AS avg_edit_size,
+        STRING_AGG(DISTINCT pht.Name, ', ' ORDER BY pht.Name) AS edit_types
+    FROM PostHistory ph
+    INNER JOIN Users u ON ph.UserId = u.Id
+    INNER JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    WHERE ph.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+      AND ph.UserId IS NOT NULL
+    GROUP BY ph.UserId, u.DisplayName
+    HAVING COUNT(DISTINCT ph.PostId) >= 20
+)
+SELECT 
+    ue.DisplayName,
+    ue.Reputation,
+    ue.TagName,
+    ue.answers_in_tag,
+    ue.total_score_in_tag,
+    ue.avg_score_in_tag,
+    ue.accepted_answers,
+    ue.tag_rank,
+    th.question_count AS tag_total_questions,
+    tp.avg_score AS recent_tag_avg_score,
+    tp.unique_authors AS recent_unique_authors,
+    COALESCE(ep.edited_posts, 0) AS edited_posts,
+    COALESCE(ep.edits, 0) AS total_edits,
+    bc.badge2 AS related_badge,
+    bc.correlation_coefficient,
+    COUNT(DISTINCT v.Id) AS upvotes_given,
+    COUNT(DISTINCT c.Id) AS comments_made,
+    AVG(c.Score) AS avg_comment_score,
+    CASE 
+        WHEN tp.prev_month_count > 0 THEN (tp.post_count - tp.prev_month_count) * 1.0 / tp.prev_month_count 
+        ELSE 0 
+    END AS month_over_month_growth,
+    CASE 
+        WHEN tp.year_ago_count > 0 THEN (tp.post_count - tp.year_ago_count) * 1.0 / tp.year_ago_count 
+        ELSE 0 
+    END AS year_over_year_growth
+FROM user_expertise ue
+LEFT JOIN tag_hierarchy th ON th.TagName = ue.TagName
+LEFT JOIN temporal_patterns tp ON tp.post_type = 'Answer' 
+    AND tp.month = DATE_TRUNC('month', (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 month'))
+LEFT JOIN edit_patterns ep ON ep.UserId = ue.UserId
+LEFT JOIN badge_correlation bc ON bc.badge1 IN (
+    SELECT b.Name 
+    FROM Badges b 
+    WHERE b.UserId = ue.UserId
+    FETCH FIRST 1 ROWS ONLY
+)
+LEFT JOIN Votes v ON v.UserId = ue.UserId AND v.VoteTypeId = 2
+LEFT JOIN Comments c ON c.UserId = ue.UserId
+WHERE ue.tag_rank <= 10
+GROUP BY 
+    ue.DisplayName, ue.Reputation, ue.TagName, ue.answers_in_tag,
+    ue.total_score_in_tag, ue.avg_score_in_tag, ue.accepted_answers,
+    ue.tag_rank, th.question_count, tp.avg_score, tp.unique_authors,
+    ep.edited_posts, ep.edits, bc.badge2, bc.correlation_coefficient,
+    tp.post_count, tp.prev_month_count, tp.year_ago_count, tp.month, tp.post_type, ue.UserId
+ORDER BY ue.total_score_in_tag DESC, ue.tag_rank
+LIMIT 100;

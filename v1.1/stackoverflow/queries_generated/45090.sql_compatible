@@ -1,0 +1,44 @@
+WITH TopTags AS (
+    SELECT Tags, COUNT(*) AS TagCount,
+           AVG(Score) AS AvgScore,
+           SUM(ViewCount) AS TotalViews,
+           MAX(CreationDate) AS LatestPost
+    FROM (
+        SELECT p.*, 
+               -- split tag string like '<tag1><tag2>' into individual tags using generated numbers
+               substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2) AS tags_inner,
+               (regexp_split_to_table(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')) AS tag
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+    ) sub
+    GROUP BY Tags
+    ORDER BY TagCount DESC
+    LIMIT 100
+),
+UserContribution AS (
+    SELECT 
+        u.Id, 
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.LastActivityDate) AS LastActive
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id, u.Reputation
+)
+SELECT 
+    t.Tags,
+    t.TagCount,
+    t.AvgScore AS TagAvgScore,
+    t.TotalViews,
+    uc.Reputation AS TopUserRep,
+    uc.PostCount,
+    uc.VoteCount,
+    EXTRACT(YEAR FROM t.LatestPost) AS LatestPostYear
+FROM TopTags t
+JOIN UserContribution uc ON 1=1
+WHERE t.TagCount > 50 AND uc.PostCount > 10
+ORDER BY t.TagCount * uc.Reputation DESC
+LIMIT 25;

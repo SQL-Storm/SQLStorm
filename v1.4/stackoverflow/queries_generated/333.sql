@@ -1,0 +1,110 @@
+-- {"query": "333.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 18219} 
+WITH base AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    COALESCE(u.DisplayName, 'Unknown') AS OwnerDisplayName,
+    COALESCE(u.Reputation, 0) AS OwnerReputation,
+    p.LastEditorUserId,
+    COALESCE(le.DisplayName, 'Unknown') AS LastEditorDisplayName,
+    COALESCE(le.Reputation, 0) AS LastEditorReputation,
+    p.ClosedDate,
+    p.CommentCount
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Users le ON p.LastEditorUserId = le.Id
+  WHERE p.CreationDate >= CURRENT_TIMESTAMP - INTERVAL '365 days'
+),
+A AS (
+  SELECT
+    b.PostId,
+    b.PostTypeId,
+    pt.Name AS PostTypeName,
+    b.Title,
+    b.Tags,
+    b.Score,
+    b.ViewCount,
+    b.CreationDate,
+    b.LastActivityDate,
+    b.OwnerUserId,
+    b.OwnerDisplayName,
+    b.OwnerReputation,
+    b.LastEditorUserId,
+    b.LastEditorDisplayName,
+    b.LastEditorReputation,
+    b.ClosedDate,
+    b.CommentCount,
+    CASE
+      WHEN b.Tags IS NULL THEN ''
+      ELSE replace(replace(replace(b.Tags, '><', ','), '<', ''), '>', '')
+    END AS TagsList,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = b.PostId AND v.VoteTypeId = 2) AS UpVotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = b.PostId AND v.VoteTypeId = 3) AS DownVotes,
+    (SELECT json_agg(row_to_json(x))
+       FROM (
+         SELECT c.Text, c.Score, c.CreationDate, c.UserDisplayName
+         FROM Comments c
+         WHERE c.PostId = b.PostId
+         ORDER BY c.CreationDate DESC
+         LIMIT 3
+       ) x
+    ) AS LastThreeCommentsJson,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = b.PostId) AS LinkCount,
+    ROW_NUMBER() OVER (PARTITION BY b.PostTypeId ORDER BY b.Score DESC, b.ViewCount DESC) AS rn
+  FROM base b
+  LEFT JOIN PostTypes pt ON b.PostTypeId = pt.Id
+),
+B AS (
+  SELECT
+    b.PostId,
+    b.PostTypeId,
+    pt.Name AS PostTypeName,
+    b.Title,
+    b.Tags,
+    b.Score,
+    b.ViewCount,
+    b.CreationDate,
+    b.LastActivityDate,
+    b.OwnerUserId,
+    b.OwnerDisplayName,
+    b.OwnerReputation,
+    b.LastEditorUserId,
+    b.LastEditorDisplayName,
+    b.LastEditorReputation,
+    b.ClosedDate,
+    b.CommentCount,
+    CASE
+      WHEN b.Tags IS NULL THEN ''
+      ELSE replace(replace(replace(b.Tags, '><', ','), '<', ''), '>', '')
+    END AS TagsList,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = b.PostId AND v.VoteTypeId = 2) AS UpVotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = b.PostId AND v.VoteTypeId = 3) AS DownVotes,
+    (SELECT json_agg(row_to_json(x))
+       FROM (
+         SELECT c.Text, c.Score, c.CreationDate, c.UserDisplayName
+         FROM Comments c
+         WHERE c.PostId = b.PostId
+         ORDER BY c.CreationDate DESC
+         LIMIT 3
+       ) x
+    ) AS LastThreeCommentsJson,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = b.PostId) AS LinkCount,
+    ROW_NUMBER() OVER (PARTITION BY b.PostTypeId ORDER BY b.Score DESC, b.ViewCount DESC) AS rn
+  FROM base b
+  LEFT JOIN PostTypes pt ON b.PostTypeId = pt.Id
+  WHERE b.OwnerUserId IS NOT NULL AND b.Score > 100
+)
+SELECT *
+FROM A
+UNION ALL
+SELECT *
+FROM B
+ORDER BY PostTypeName, Score DESC
+LIMIT 500;

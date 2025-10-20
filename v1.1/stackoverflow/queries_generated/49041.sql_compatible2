@@ -1,0 +1,190 @@
+WITH PopularTags AS (
+    SELECT
+        TRIM(tag) AS TagName,
+        COUNT(DISTINCT p.Id) AS TaggedQuestionCount
+    FROM Posts p,
+         (
+           WITH RECURSIVE split(idx, rest, tag) AS (
+             SELECT
+               1,
+               CASE
+                 WHEN p.Tags IS NULL THEN '' 
+                 ELSE SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2))
+               END,
+               NULL
+             UNION ALL
+             SELECT
+               idx + 1,
+               CASE
+                 WHEN POSITION('><' IN rest) > 0 THEN SUBSTRING(rest FROM POSITION('><' IN rest) + 2)
+                 ELSE ''
+               END,
+               CASE
+                 WHEN POSITION('><' IN rest) > 0 THEN SUBSTRING(rest FROM 1 FOR POSITION('><' IN rest) - 1)
+                 ELSE rest
+               END
+             FROM split
+             WHERE rest <> ''
+           )
+           SELECT tag FROM split WHERE tag IS NOT NULL
+         ) tags(tag)
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+      AND p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '3 year')
+      AND p.ViewCount > 1000
+      AND p.Score > 50
+    GROUP BY TRIM(tag)
+    ORDER BY TaggedQuestionCount DESC
+    LIMIT 20
+),
+HighImpactQuestions AS (
+    SELECT DISTINCT
+        p.Id AS QuestionId,
+        p.OwnerUserId AS QuestionOwnerId,
+        p.AcceptedAnswerId,
+        p.CreationDate AS QuestionCreationDate,
+        p.Score AS QuestionScore,
+        p.ViewCount AS QuestionViewCount,
+        p.AnswerCount AS QuestionAnswerCount,
+        p.FavoriteCount AS QuestionFavoriteCount
+    FROM Posts p
+    JOIN (
+        WITH RECURSIVE split(idx, rest, tag, postid) AS (
+          SELECT
+            1,
+            CASE
+              WHEN p.Tags IS NULL THEN '' 
+              ELSE SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2))
+            END,
+            NULL,
+            p.Id
+          UNION ALL
+          SELECT
+            idx + 1,
+            CASE
+              WHEN POSITION('><' IN rest) > 0 THEN SUBSTRING(rest FROM POSITION('><' IN rest) + 2)
+              ELSE ''
+            END,
+            CASE
+              WHEN POSITION('><' IN rest) > 0 THEN SUBSTRING(rest FROM 1 FOR POSITION('><' IN rest) - 1)
+              ELSE rest
+            END,
+            postid
+          FROM split
+          WHERE rest <> ''
+        )
+        SELECT postid, tag FROM split WHERE tag IS NOT NULL
+    ) q_tags ON q_tags.postid = p.Id
+    JOIN PopularTags pt ON TRIM(q_tags.tag) = pt.TagName
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '3 year')
+      AND p.ViewCount > 5000
+      AND p.Score > 100
+      AND p.AnswerCount >= 5
+      AND p.FavoriteCount >= 10
+),
+HighImpactPosts AS (
+    SELECT QuestionId AS PostId FROM HighImpactQuestions
+    UNION ALL
+    SELECT p.Id AS PostId
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+      AND p.ParentId IN (SELECT QuestionId FROM HighImpactQuestions)
+),
+UserContributionsSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.UpVotes AS UserTotalUpVotes,
+        u.DownVotes AS UserTotalDownVotes,
+        u.Views AS UserProfileViews,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT hiq_q.QuestionId) AS QuestionsInHighImpactTagsOwned,
+        COUNT(DISTINCT p_a.Id) AS AnswersToHighImpactQuestions,
+        COALESCE(SUM(p_a.Score), 0) AS ScoreOnAnswersToHighImpactQuestions,
+        COUNT(DISTINCT c.Id) AS CommentsOnHighImpactPosts,
+        COALESCE(SUM(c.Score), 0) AS ScoreOfCommentsOnHighImpactPosts,
+        COUNT(DISTINCT ph.Id) AS EditsOnHighImpactPosts,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.PostId END) AS UpvotesGivenToHighImpactPosts,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.PostId END) AS DownvotesGivenToHighImpactPosts
+    FROM Users u
+    LEFT JOIN HighImpactQuestions hiq_q ON u.Id = hiq_q.QuestionOwnerId
+    LEFT JOIN Posts p_a ON u.Id = p_a.OwnerUserId AND p_a.PostTypeId = 2 AND p_a.ParentId IN (SELECT QuestionId FROM HighImpactQuestions)
+    LEFT JOIN Comments c ON u.Id = c.UserId AND c.PostId IN (SELECT PostId FROM HighImpactPosts)
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId AND ph.PostId IN (SELECT PostId FROM HighImpactPosts)
+                               AND ph.PostHistoryTypeId IN (4, 5, 6)
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.PostId IN (SELECT PostId FROM HighImpactPosts)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes, u.Views, u.CreationDate, u.LastAccessDate
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+)
+SELECT
+    ucs.DisplayName,
+    ucs.Reputation,
+    ucs.UserTotalUpVotes,
+    ucs.UserTotalDownVotes,
+    ucs.LastAccessDate,
+    COALESCE(ubs.TotalBadges, 0) AS TotalBadges,
+    COALESCE(ubs.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ubs.SilverBadges, 0) AS SilverBadges,
+    ucs.QuestionsInHighImpactTagsOwned,
+    ucs.AnswersToHighImpactQuestions,
+    ucs.ScoreOnAnswersToHighImpactQuestions,
+    ucs.CommentsOnHighImpactPosts,
+    ucs.ScoreOfCommentsOnHighImpactPosts,
+    ucs.EditsOnHighImpactPosts,
+    ucs.UpvotesGivenToHighImpactPosts,
+    ucs.DownvotesGivenToHighImpactPosts,
+    (
+        (ucs.Reputation * 0.001)
+        + ((ucs.UserTotalUpVotes - ucs.UserTotalDownVotes) * 0.005)
+        + (ucs.AnswersToHighImpactQuestions * 10)
+        + (ucs.ScoreOnAnswersToHighImpactQuestions * 0.1)
+        + (ucs.CommentsOnHighImpactPosts * 2)
+        + (ucs.ScoreOfCommentsOnHighImpactPosts * 0.05)
+        + (ucs.EditsOnHighImpactPosts * 3)
+        + (COALESCE(ubs.GoldBadges, 0) * 20 + COALESCE(ubs.SilverBadges, 0) * 10 + COALESCE(ubs.BronzeBadges, 0) * 2)
+        + (ucs.UpvotesGivenToHighImpactPosts * 0.5)
+        - (ucs.DownvotesGivenToHighImpactPosts * 0.2)
+        + (CASE
+            WHEN ucs.LastAccessDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '1 month') THEN 50
+            WHEN ucs.LastAccessDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '6 month') THEN 20
+            WHEN ucs.LastAccessDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '1 year') THEN 10
+            ELSE 0
+          END)
+    ) AS InfluenceScore,
+    RANK() OVER (ORDER BY
+        (
+        (ucs.Reputation * 0.001)
+        + ((ucs.UserTotalUpVotes - ucs.UserTotalDownVotes) * 0.005)
+        + (ucs.AnswersToHighImpactQuestions * 10)
+        + (ucs.ScoreOnAnswersToHighImpactQuestions * 0.1)
+        + (ucs.CommentsOnHighImpactPosts * 2)
+        + (ucs.ScoreOfCommentsOnHighImpactPosts * 0.05)
+        + (ucs.EditsOnHighImpactPosts * 3)
+        + (COALESCE(ubs.GoldBadges, 0) * 20 + COALESCE(ubs.SilverBadges, 0) * 10 + COALESCE(ubs.BronzeBadges, 0) * 2)
+        + (ucs.UpvotesGivenToHighImpactPosts * 0.5)
+        - (ucs.DownvotesGivenToHighImpactPosts * 0.2)
+        + (CASE
+            WHEN ucs.LastAccessDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '1 month') THEN 50
+            WHEN ucs.LastAccessDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '6 month') THEN 20
+            WHEN ucs.LastAccessDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '1 year') THEN 10
+            ELSE 0
+          END)
+        ) DESC, ucs.Reputation DESC, ucs.LastAccessDate DESC) AS GlobalInfluenceRank
+FROM UserContributionsSummary ucs
+LEFT JOIN UserBadgeSummary ubs ON ucs.UserId = ubs.UserId
+WHERE ucs.Reputation > 750
+  AND (ucs.AnswersToHighImpactQuestions > 0 OR ucs.EditsOnHighImpactPosts > 0 OR ucs.CommentsOnHighImpactPosts > 0 OR ucs.QuestionsInHighImpactTagsOwned > 0)
+ORDER BY InfluenceScore DESC, ucs.Reputation DESC, ucs.LastAccessDate DESC
+LIMIT 200;

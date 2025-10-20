@@ -1,0 +1,175 @@
+WITH question_stats AS (
+  SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.CreationDate,
+    q.OwnerUserId,
+    q.ViewCount,
+    q.Score,
+    q.AnswerCount,
+    q.FavoriteCount,
+    ARRAY_REMOVE(ARRAY_AGG(DISTINCT t.TagName) FILTER (WHERE t.TagName IS NOT NULL), NULL) AS Tags,
+    COUNT(a.Id) FILTER (WHERE a.PostTypeId = 2) AS TotalAnswers,
+    MAX(CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS HasAcceptedAnswer,
+    MIN(a.CreationDate) - q.CreationDate AS TimeToFirstAnswer,
+    COUNT(cq.Id) AS QuestionCommentCount,
+    EXTRACT(EPOCH FROM (GREATEST(COALESCE(q.LastActivityDate, q.LastEditDate, q.CreationDate), q.CreationDate) - q.CreationDate))/86400.0 AS ActivitySpanDays
+  FROM Posts q
+  LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+  LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(q.Tags,2,length(q.Tags)-2), '><')) AS rawtag
+  ) rt ON q.PostTypeId = 1 AND q.Tags IS NOT NULL
+  LEFT JOIN Tags t ON t.TagName = rt.rawtag
+  LEFT JOIN Comments cq ON cq.PostId = q.Id
+  WHERE q.PostTypeId = 1
+  GROUP BY q.Id, q.Title, q.CreationDate, q.OwnerUserId, q.ViewCount, q.Score, q.AnswerCount, q.FavoriteCount, q.AcceptedAnswerId, q.LastActivityDate, q.LastEditDate
+),
+answer_stats AS (
+  SELECT
+    a.ParentId AS QuestionId,
+    a.Id AS AnswerId,
+    a.OwnerUserId AS AnswerOwner,
+    a.CreationDate AS AnswerCreation,
+    a.Score AS AnswerScore,
+    a.CommentCount AS AnswerCommentCount,
+    COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+    COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+    COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 1) AS AcceptedByOriginatorVotes,
+    SUM(CASE WHEN v.VoteTypeId = 8 OR v.VoteTypeId = 9 THEN COALESCE(v.BountyAmount,0) ELSE 0 END) AS BountyReceived
+  FROM Posts a
+  LEFT JOIN Votes v ON v.PostId = a.Id
+  WHERE a.PostTypeId = 2
+  GROUP BY a.ParentId, a.Id, a.OwnerUserId, a.CreationDate, a.Score, a.CommentCount
+),
+user_badge_agg AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(b.Id) AS TotalBadges,
+    COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+    COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+    COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+    MAX(b.Date) AS MostRecentBadgeDate
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+post_link_agg AS (
+  SELECT
+    pl.PostId,
+    COUNT(*) FILTER (WHERE pl.LinkTypeId = 1) AS OutboundLinks,
+    COUNT(*) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicatesMarked,
+    COUNT(*) AS TotalLinks
+  FROM PostLinks pl
+  GROUP BY pl.PostId
+),
+complex_events AS (
+  SELECT
+    ph.PostId,
+    MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (10,11,12,13,14,15,19,20,35,36)) AS LastMajorEvent,
+    BOOL_OR(ph.PostHistoryTypeId = 10) AS EverClosed,
+    BOOL_OR(ph.PostHistoryTypeId = 11) AS EverReopened,
+    BOOL_OR(ph.PostHistoryTypeId = 18) AS EverMerged,
+    COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (24,52,53)) AS SuggestionOrHotCounts
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+qa_base AS (
+  SELECT
+    a.QuestionId,
+    COUNT(a.AnswerId) AS AnswerCountByMetric,
+    SUM(a.UpVotes) AS TotalAnswerUpVotes,
+    SUM(a.DownVotes) AS TotalAnswerDownVotes,
+    MAX(a.AnswerScore) AS TopAnswerScore
+  FROM answer_stats a
+  GROUP BY a.QuestionId
+),
+qa_top AS (
+  SELECT
+    a.QuestionId,
+    MIN(a.AnswerId) FILTER (WHERE a.AnswerScore = b.TopAnswerScore) AS TopAnswerId
+  FROM answer_stats a
+  JOIN qa_base b ON b.QuestionId = a.QuestionId
+  GROUP BY a.QuestionId, b.TopAnswerScore
+),
+qa_median AS (
+  SELECT
+    QuestionId,
+    AVG(AnswerScore) AS MedianAnswerScore
+  FROM (
+    SELECT
+      a.QuestionId,
+      a.AnswerScore,
+      ROW_NUMBER() OVER (PARTITION BY a.QuestionId ORDER BY a.AnswerScore) AS rn,
+      COUNT(*) OVER (PARTITION BY a.QuestionId) AS cnt
+    FROM answer_stats a
+  ) t
+  WHERE rn IN (CAST(FLOOR((cnt+1)/2.0) AS integer), CAST(CEIL((cnt+1)/2.0) AS integer))
+  GROUP BY QuestionId
+),
+qa AS (
+  SELECT
+    b.QuestionId,
+    b.AnswerCountByMetric,
+    t.TopAnswerId,
+    b.TopAnswerScore,
+    m.MedianAnswerScore,
+    b.TotalAnswerUpVotes,
+    b.TotalAnswerDownVotes
+  FROM qa_base b
+  LEFT JOIN qa_top t ON t.QuestionId = b.QuestionId
+  LEFT JOIN qa_median m ON m.QuestionId = b.QuestionId
+)
+SELECT
+  qs.QuestionId,
+  qs.Title,
+  qs.CreationDate,
+  qs.OwnerUserId,
+  u.DisplayName AS QuestionOwnerName,
+  u.Reputation AS OwnerReputation,
+  qs.ViewCount,
+  qs.Score AS QuestionScore,
+  qs.AnswerCount,
+  qs.FavoriteCount,
+  qs.Tags,
+  qs.TotalAnswers,
+  qs.HasAcceptedAnswer,
+  qs.TimeToFirstAnswer,
+  qs.QuestionCommentCount,
+  ROUND(qs.ActivitySpanDays,3) AS ActivitySpanDays,
+  COALESCE(pl.TotalLinks,0) AS TotalPostLinks,
+  COALESCE(ce.EverClosed, FALSE) AS EverClosed,
+  COALESCE(ce.EverReopened, FALSE) AS EverReopened,
+  COALESCE(ce.EverMerged, FALSE) AS EverMerged,
+  COALESCE(ce.SuggestionOrHotCounts,0) AS SuggestionOrHotCounts,
+  qa.AnswerCountByMetric,
+  qa.TopAnswerId,
+  qa.TopAnswerScore,
+  qa.MedianAnswerScore,
+  qa.TotalAnswerUpVotes,
+  qa.TotalAnswerDownVotes,
+  uba.TotalBadges,
+  uba.GoldBadges,
+  uba.SilverBadges,
+  uba.BronzeBadges,
+  uba.MostRecentBadgeDate
+FROM question_stats qs
+LEFT JOIN Users u ON u.Id = qs.OwnerUserId
+LEFT JOIN post_link_agg pl ON pl.PostId = qs.QuestionId
+LEFT JOIN complex_events ce ON ce.PostId = qs.QuestionId
+LEFT JOIN user_badge_agg uba ON uba.UserId = qs.OwnerUserId
+LEFT JOIN qa ON qa.QuestionId = qs.QuestionId
+WHERE
+  qs.TotalAnswers >= 2
+  AND qs.ViewCount > 100
+  AND qs.Score >= 0
+  AND array_length(qs.Tags,1) >= 1
+  AND (
+    qs.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 years'
+    OR qs.ActivitySpanDays > 30
+  )
+ORDER BY
+  (COALESCE(qa.TotalAnswerUpVotes,0) + qs.ViewCount/100.0 + COALESCE(uba.GoldBadges,0)*50) DESC,
+  qs.CreationDate DESC
+LIMIT 200;

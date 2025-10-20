@@ -1,0 +1,109 @@
+SELECT 
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    p.Tags,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    COUNT(DISTINCT v.Id) AS VoteCount,
+    COUNT(DISTINCT ph.Id) AS HistoryCount,
+    COUNT(DISTINCT pl.Id) AS LinkCount,
+    CASE 
+        WHEN p.PostTypeId = 1 THEN 'Question'
+        WHEN p.PostTypeId = 2 THEN 'Answer'
+        WHEN p.PostTypeId = 3 THEN 'Wiki'
+        WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+        WHEN p.PostTypeId = 5 THEN 'TagWiki'
+        WHEN p.PostTypeId = 6 THEN 'ModeratorNomination'
+        WHEN p.PostTypeId = 7 THEN 'WikiPlaceholder'
+        WHEN p.PostTypeId = 8 THEN 'PrivilegeWiki'
+        ELSE 'Unknown'
+    END AS PostTypeDescription,
+    CASE 
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answer Accepted'
+        ELSE 'Open'
+    END AS PostStatus,
+    COALESCE(p.AnswerCount, 0) AS AnswerCount,
+    COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+    (
+      SELECT COUNT(*) 
+      FROM Posts p2 
+      WHERE p2.ParentId = p.Id 
+        AND p2.PostTypeId = 2 
+        AND (p2.DeletedDate IS NULL OR p2.DeletedDate = '') -- handle dialects where empty string might represent missing
+    ) AS ActiveAnswers,
+    (
+      SELECT COUNT(*) 
+      FROM Votes v2 
+      WHERE v2.PostId = p.Id 
+        AND v2.VoteTypeId IN (2,3)
+    ) AS UpDownVotes,
+    (
+      SELECT COUNT(*) 
+      FROM Votes v3 
+      WHERE v3.PostId = p.Id 
+        AND v3.VoteTypeId = 5
+    ) AS FavoriteVotes,
+    (
+      SELECT COUNT(*) 
+      FROM Comments c2 
+      WHERE c2.PostId = p.Id 
+        AND c2.Score > 0
+    ) AS PositiveComments,
+    (
+      SELECT COUNT(*) 
+      FROM Badges b 
+      WHERE b.UserId = p.OwnerUserId 
+        AND b.Date >= p.CreationDate
+    ) AS UserBadgesSincePost,
+    (
+      SELECT STRING_AGG(t.TagName, ', ') 
+      FROM (
+        SELECT TRIM(tag) AS TagName
+        FROM UNNEST(STRING_TO_ARRAY(TRIM(BOTH '<>' FROM p.Tags), '><')) AS tag
+      ) t
+      WHERE t.TagName IS NOT NULL AND t.TagName != ''
+    ) AS TagList,
+    (
+      SELECT COUNT(*) 
+      FROM Posts p3 
+      WHERE p3.OwnerUserId = p.OwnerUserId 
+        AND p3.PostTypeId = 1 
+        AND p3.CreationDate >= DATE '2023-01-01'
+    ) AS RecentQuestions,
+    (
+      SELECT COUNT(*) 
+      FROM Posts p4 
+      WHERE p4.OwnerUserId = p.OwnerUserId 
+        AND p4.PostTypeId = 2 
+        AND p4.CreationDate >= DATE '2023-01-01'
+    ) AS RecentAnswers
+FROM Posts p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Comments c ON p.Id = c.PostId
+LEFT JOIN Votes v ON p.Id = v.PostId
+LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+WHERE p.CreationDate >= DATE '2023-01-01'
+  AND p.PostTypeId IN (1, 2)
+  AND (p.OwnerUserId IS NOT NULL OR p.OwnerDisplayName IS NOT NULL)
+  AND ((p.Score IS NOT NULL AND p.Score > 0) OR p.ViewCount > 100)
+GROUP BY 
+    p.Id, p.PostTypeId, p.Title, p.Score, p.ViewCount, p.CreationDate, 
+    p.OwnerUserId, u.DisplayName, u.Reputation, p.Tags, p.AnswerCount, 
+    p.FavoriteCount, p.ClosedDate, p.CommunityOwnedDate, p.AcceptedAnswerId
+HAVING 
+    COUNT(DISTINCT c.Id) > 0 
+    OR COUNT(DISTINCT v.Id) > 0
+ORDER BY 
+    p.Score DESC, 
+    p.ViewCount DESC,
+    p.CreationDate DESC
+LIMIT 1000;

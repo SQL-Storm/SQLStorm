@@ -1,0 +1,43 @@
+WITH TopUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation, COUNT(DISTINCT p.Id) AS PostCount,
+           COUNT(DISTINCT c.Id) AS CommentCount, COUNT(DISTINCT v.Id) AS VoteCount,
+           COUNT(DISTINCT b.Id) AS BadgeCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1 AND p.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+    LEFT JOIN Comments c ON u.Id = c.UserId AND c.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months')
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId IN (2,5,8)
+    LEFT JOIN Badges b ON u.Id = b.UserId AND b.Class IN (1,2) AND b.Date > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years')
+    WHERE u.Reputation > 10000 AND u.DownVotes < (u.UpVotes * 0.1)
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(p.Id) > 50 OR COUNT(c.Id) > 100
+),
+ActivePosts AS (
+    SELECT p.Id, p.OwnerUserId, p.Score, p.ViewCount, p.AnswerCount,
+           RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS PostRank,
+           AVG(p.Score) OVER () AS GlobalAvgScore,
+           SUM(CASE WHEN ph.PostHistoryTypeId BETWEEN 4 AND 6 THEN 1 ELSE 0 END) AS EditCount
+    FROM Posts p
+    JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE p.PostTypeId = 1 AND p.ClosedDate IS NULL AND p.Tags LIKE '%<sql>%'
+    GROUP BY p.Id, p.OwnerUserId, p.Score, p.ViewCount, p.AnswerCount
+)
+SELECT tu.DisplayName, tu.Reputation, ap.Score, ap.ViewCount,
+       (ap.Score * 0.5 + ap.ViewCount * 0.3 + ap.AnswerCount * 0.2) AS EngagementScore,
+       (tu.PostCount * 0.4 + tu.CommentCount * 0.3 + tu.VoteCount * 0.2 + tu.BadgeCount * 0.1) AS UserActivityIndex,
+       ap.EditCount, ap.GlobalAvgScore,
+       (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = ap.Id AND pl.LinkTypeId = 3) AS DupeLinks,
+       (SELECT STRING_AGG(t.TagName, ', ') 
+        FROM Tags t 
+        WHERE t.Id IN (
+            SELECT CAST(tag_id AS INTEGER) FROM (
+                SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(ap_tags, 2, LENGTH(ap_tags)-2), '><')) AS tag_id
+            ) sub
+        ) AND t.Count > 1000
+       ) AS PopularTags
+FROM TopUsers tu
+JOIN ActivePosts ap ON tu.Id = ap.OwnerUserId
+-- expose ap.Tags for the subselect by recomputing from Posts
+JOIN (SELECT Id AS pid, Tags AS ap_tags FROM Posts) p_tags ON p_tags.pid = ap.Id
+WHERE ap.PostRank <= 5 AND ap.Score > (ap.GlobalAvgScore * 1.5)
+ORDER BY EngagementScore DESC, UserActivityIndex DESC
+LIMIT 100 OFFSET 0;

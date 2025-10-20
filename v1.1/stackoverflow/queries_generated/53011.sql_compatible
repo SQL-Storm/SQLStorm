@@ -1,0 +1,129 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(p.ViewCount) AS TotalViews,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersGiven,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesReceived
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    GROUP BY 
+        u.Id, u.Reputation
+),
+BadgeStats AS (
+    SELECT 
+        UserId,
+        COUNT(Id) AS TotalBadges,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM 
+        Badges
+    GROUP BY 
+        UserId
+),
+CommentStats AS (
+    SELECT 
+        UserId,
+        COUNT(Id) AS TotalComments,
+        AVG(Score) AS AvgCommentScore
+    FROM 
+        Comments
+    GROUP BY 
+        UserId
+),
+TagStats AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        tag AS TagName,
+        COUNT(DISTINCT p.Id) AS PostsInTag,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY COUNT(DISTINCT p.Id) DESC) AS TagRank
+    FROM 
+        Posts p,
+        LATERAL (
+          SELECT regexp_split_to_table(substring(p.Tags, 2, length(p.Tags)-2), '><') AS tag
+        ) AS t_split
+    JOIN 
+        Tags t ON t.TagName = t_split.tag
+    WHERE 
+        p.PostTypeId = 1
+    GROUP BY 
+        p.OwnerUserId, t_split.tag
+),
+TopTagsPerUser AS (
+    SELECT 
+        UserId,
+        STRING_AGG(TagName, ', ') AS TopTags
+    FROM 
+        TagStats
+    WHERE 
+        TagRank <= 3
+    GROUP BY 
+        UserId
+),
+EditStats AS (
+    SELECT 
+        ph.UserId,
+        COUNT(DISTINCT ph.Id) AS TotalEdits,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.Id END) AS SelfEdits
+    FROM 
+        PostHistory ph
+    JOIN 
+        Posts p ON ph.PostId = p.Id
+    WHERE 
+        ph.UserId = p.OwnerUserId
+    GROUP BY 
+        ph.UserId
+)
+SELECT 
+    us.UserId,
+    u.DisplayName,
+    us.Reputation,
+    us.TotalPosts,
+    us.AvgPostScore,
+    us.TotalViews,
+    us.QuestionsAsked,
+    us.AnswersGiven,
+    us.TotalUpvotesReceived,
+    bs.TotalBadges,
+    bs.GoldBadges,
+    bs.SilverBadges,
+    bs.BronzeBadges,
+    cs.TotalComments,
+    cs.AvgCommentScore,
+    tt.TopTags,
+    es.TotalEdits,
+    es.SelfEdits,
+    RANK() OVER (ORDER BY us.Reputation DESC) AS ReputationRank,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY us.AvgPostScore) OVER () AS MedianAvgScore
+FROM 
+    UserStats us
+JOIN 
+    Users u ON us.UserId = u.Id
+LEFT JOIN 
+    BadgeStats bs ON us.UserId = bs.UserId
+LEFT JOIN 
+    CommentStats cs ON us.UserId = cs.UserId
+LEFT JOIN 
+    TopTagsPerUser tt ON us.UserId = tt.UserId
+LEFT JOIN 
+    EditStats es ON us.UserId = es.UserId
+WHERE 
+    us.Reputation > 1000
+    AND u.CreationDate >= '2010-01-01'
+    AND EXISTS (
+        SELECT 1 
+        FROM Posts p 
+        WHERE p.OwnerUserId = us.UserId 
+        AND p.ClosedDate IS NULL
+    )
+ORDER BY 
+    us.Reputation DESC
+LIMIT 1000;

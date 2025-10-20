@@ -1,0 +1,205 @@
+-- {"query": "34004.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 2003} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COALESCE(t.Count, 0) AS Count,
+        ARRAY[t.TagName] AS HierarchyPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+
+    UNION ALL
+
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        COALESCE(t2.Count, 0),
+        r.HierarchyPath || t2.TagName
+    FROM Tags t2
+    JOIN PostLinks pl ON pl.PostId = t2.ExcerptPostId
+    JOIN Posts p ON p.Id = pl.RelatedPostId
+    JOIN RecursiveTagHierarchy r ON r.TagName = p.Tags::text[] [1]
+    WHERE array_length(r.HierarchyPath, 1) < 3
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsPosted,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersPosted,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COALESCE(SUM(vt2.VoteCount),0) AS TotalUpVotes,
+        COALESCE(SUM(vt3.VoteCount),0) AS TotalDownVotes,
+        MAX(b.Date) AS LastBadgeDate,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.CreationDate >= CURRENT_DATE - INTERVAL '365 days'
+    LEFT JOIN Comments c ON c.UserId = u.Id AND c.CreationDate >= CURRENT_DATE - INTERVAL '365 days'
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS VoteCount
+        FROM Votes
+        WHERE VoteTypeId = 2 -- UpMod
+        GROUP BY PostId
+    ) vt2 ON vt2.PostId = p.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS VoteCount
+        FROM Votes
+        WHERE VoteTypeId = 3 -- DownMod
+        GROUP BY PostId
+    ) vt3 ON vt3.PostId = p.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.CreationDate <= CURRENT_DATE
+    GROUP BY u.Id, u.DisplayName
+),
+TopQuestions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><') AS TagArray
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+      AND p.CreationDate >= CURRENT_DATE - INTERVAL '180 days'
+      AND p.Score >= 10
+),
+QuestionTagHits AS (
+    SELECT
+        q.Id AS QuestionId,
+        unnest(q.TagArray) AS TagName
+    FROM TopQuestions q
+),
+TagPopularQuestions AS (
+    SELECT 
+        qth.TagName,
+        COUNT(qth.QuestionId) AS QuestionCount,
+        AVG(t.Count) AS AvgTagCount,
+        MAX(q.Score) AS MaxScore,
+        AVG(q.Score) AS AvgScore,
+        MAX(q.ViewCount) AS MaxViews,
+        AVG(q.ViewCount) AS AvgViews
+    FROM QuestionTagHits qth
+    JOIN Tags t ON t.TagName = qth.TagName
+    JOIN TopQuestions q ON q.Id = qth.QuestionId
+    GROUP BY qth.TagName
+    HAVING COUNT(qth.QuestionId) > 5
+),
+UserBadgesSummary AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COUNT(DISTINCT b.Name) AS UniqueBadges
+    FROM Badges b
+    WHERE b.Date >= CURRENT_DATE - INTERVAL '365 days'
+    GROUP BY b.UserId
+),
+UserPostsWithVotes AS (
+    SELECT 
+        u.Id AS UserId,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Score,
+        COALESCE(vu.UpVotes,0) AS UpVotes,
+        COALESCE(vd.DownVotes,0) AS DownVotes
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS UpVotes
+        FROM Votes
+        WHERE VoteTypeId = 2
+        GROUP BY PostId
+    ) vu ON vu.PostId = p.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS DownVotes
+        FROM Votes
+        WHERE VoteTypeId = 3
+        GROUP BY PostId
+    ) vd ON vd.PostId = p.Id
+),
+HighImpactUsers AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.TotalPosts,
+        ua.QuestionsPosted,
+        ua.AnswersPosted,
+        ua.TotalComments,
+        ua.TotalUpVotes,
+        ua.TotalDownVotes,
+        COALESCE(ubs.GoldBadges,0) AS GoldBadges,
+        COALESCE(ubs.SilverBadges,0) AS SilverBadges,
+        COALESCE(ubs.BronzeBadges,0) AS BronzeBadges,
+        COALESCE(ubs.UniqueBadges,0) AS UniqueBadges,
+        ua.AvgPostScore,
+        ua.LastPostDate,
+        COUNT(DISTINCT upv.PostId) FILTER (WHERE upv.Score >= 10) AS PostsWithHighScore,
+        SUM(upv.UpVotes - upv.DownVotes) AS NetVoteCount
+    FROM UserActivity ua
+    LEFT JOIN UserBadgesSummary ubs ON ubs.UserId = ua.UserId
+    LEFT JOIN UserPostsWithVotes upv ON upv.UserId = ua.UserId
+    WHERE ua.TotalPosts > 50 AND ua.TotalUpVotes > ua.TotalDownVotes
+    GROUP BY ua.UserId, ua.DisplayName, ua.TotalPosts, ua.QuestionsPosted, ua.AnswersPosted, ua.TotalComments, ua.TotalUpVotes, ua.TotalDownVotes, ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges, ubs.UniqueBadges, ua.AvgPostScore, ua.LastPostDate
+),
+DetailedUserPostStats AS (
+    SELECT 
+        hiu.UserId,
+        hiu.DisplayName,
+        hiu.TotalPosts,
+        hiu.QuestionsPosted,
+        hiu.AnswersPosted,
+        hiu.TotalComments,
+        hiu.TotalUpVotes,
+        hiu.TotalDownVotes,
+        hiu.GoldBadges,
+        hiu.SilverBadges,
+        hiu.BronzeBadges,
+        hiu.UniqueBadges,
+        hiu.AvgPostScore,
+        hiu.LastPostDate,
+        hiu.PostsWithHighScore,
+        hiu.NetVoteCount,
+        ARRAY_AGG(DISTINCT q.Title ORDER BY q.Score DESC LIMIT 3) FILTER (WHERE q.Id IS NOT NULL) AS TopQuestionsTitles
+    FROM HighImpactUsers hiu
+    LEFT JOIN Posts q ON q.OwnerUserId = hiu.UserId AND q.PostTypeId = 1 AND q.Score >= 10
+    GROUP BY hiu.UserId, hiu.DisplayName, hiu.TotalPosts, hiu.QuestionsPosted, hiu.AnswersPosted, hiu.TotalComments, hiu.TotalUpVotes, hiu.TotalDownVotes, hiu.GoldBadges, hiu.SilverBadges, hiu.BronzeBadges, hiu.UniqueBadges, hiu.AvgPostScore, hiu.LastPostDate, hiu.PostsWithHighScore, hiu.NetVoteCount
+)
+SELECT 
+    dus.UserId,
+    dus.DisplayName,
+    dus.TotalPosts,
+    dus.QuestionsPosted,
+    dus.AnswersPosted,
+    dus.TotalComments,
+    dus.TotalUpVotes,
+    dus.TotalDownVotes,
+    dus.GoldBadges,
+    dus.SilverBadges,
+    dus.BronzeBadges,
+    dus.UniqueBadges,
+    ROUND(dus.AvgPostScore::numeric,2) AS AvgPostScore,
+    dus.LastPostDate,
+    dus.PostsWithHighScore,
+    dus.NetVoteCount,
+    dus.TopQuestionsTitles,
+    tpq.TagName,
+    tpq.QuestionCount,
+    ROUND(tpq.AvgTagCount::numeric,2) AS AvgTagCount,
+    tpq.MaxScore,
+    ROUND(tpq.AvgScore::numeric,2) AS AvgScore,
+    tpq.MaxViews,
+    ROUND(tpq.AvgViews::numeric,2) AS AvgViews
+FROM DetailedUserPostStats dus
+JOIN QuestionTagHits qth ON qth.TagName IN (SELECT TagName FROM TagPopularQuestions)
+JOIN TagPopularQuestions tpq ON tpq.TagName = qth.TagName
+WHERE dus.TotalPosts > 100
+ORDER BY dus.NetVoteCount DESC, dus.TotalPosts DESC, tpq.QuestionCount DESC
+LIMIT 100;

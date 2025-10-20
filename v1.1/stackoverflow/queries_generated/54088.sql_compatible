@@ -1,0 +1,109 @@
+WITH
+user_stats AS (
+    SELECT
+        u.Id                     AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS question_cnt,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS answer_cnt,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS avg_q_score,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 2) AS avg_a_score,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2)   AS upvote_cnt,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3)   AS downvote_cnt
+    FROM Users u
+    LEFT JOIN Posts  p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes  v ON v.PostId     = p.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+tag_user_links AS (
+    SELECT
+        u.Id                 AS user_id,
+        TRIM(BOTH '<>' FROM tag) AS tag_name,
+        COUNT(*)            AS tag_use_cnt
+    FROM Users u
+    JOIN Posts p
+        ON p.OwnerUserId = u.Id
+        AND p.PostTypeId = 1
+    CROSS JOIN LATERAL (
+        SELECT value AS tag
+        FROM (
+            SELECT regexp_split AS value
+            FROM (
+                SELECT
+                    -- split tags string by '<' or '>' by replacing delimiters with a common delimiter and splitting
+                    -- works in many dialects using regexp_replace and string_split-like approach; here we emulate by
+                    -- splitting on '><' boundary: replace '><' with '|' then trim leading/trailing '<' and '>' and split
+                    -- using a simple recursive CTE to split by '|' for portability
+                    regexp_replace(p.Tags, '><', '|') AS tags_pipe
+            ) s1,
+            -- recursive split
+            (WITH RECURSIVE split(rest, part) AS (
+                SELECT tags_pipe || '', 
+                       CASE WHEN tags_pipe LIKE '%|%' THEN substr(tags_pipe, 1, instr(tags_pipe, '|')-1)
+                            WHEN tags_pipe <> '' THEN tags_pipe
+                            ELSE NULL END
+                FROM (SELECT tags_pipe FROM (SELECT regexp_replace(p.Tags, '><', '|') AS tags_pipe) tmp)
+                UNION ALL
+                SELECT
+                    CASE WHEN instr(rest, '|') > 0 THEN substr(rest, instr(rest, '|')+1) ELSE '' END,
+                    CASE WHEN instr(rest, '|') > 0 THEN substr(rest, 1, instr(rest, '|')-1)
+                         WHEN rest <> '' THEN rest
+                         ELSE NULL END
+                FROM split
+                WHERE rest <> '' AND instr(rest, '|') > 0
+            )
+            SELECT part FROM split WHERE part IS NOT NULL)
+        ) t
+    ) AS toks ON TRUE
+    GROUP BY u.Id, TRIM(BOTH '<>' FROM tag)
+),
+top_tags AS (
+    SELECT
+        user_id,
+        string_agg(tag_name || ':' || tag_use_cnt, ',') AS tags
+    FROM tag_user_links
+    GROUP BY user_id
+),
+answer_rank AS (
+    SELECT
+        a.ParentId AS question_id,
+        a.Id       AS answer_id,
+        a.Score,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS rn
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+)
+SELECT
+    us.user_id,
+    us.DisplayName,
+    us.Reputation,
+    us.question_cnt,
+    us.answer_cnt,
+    ROUND(us.avg_q_score, 2)   AS avg_q_score,
+    ROUND(us.avg_a_score, 2)   AS avg_a_score,
+    us.upvote_cnt,
+    us.downvote_cnt,
+    COALESCE(tt.tags, '')     AS top_tags,
+    ar.answer_id              AS top_answer_for_question,
+    ar.Score                  AS top_answer_score
+FROM user_stats      us
+LEFT JOIN top_tags      tt ON tt.user_id      = us.user_id
+LEFT JOIN Posts  p       ON p.OwnerUserId   = us.user_id
+                         AND p.PostTypeId   = 1
+LEFT JOIN answer_rank ar ON ar.question_id  = p.Id
+                         AND ar.rn           = 1
+GROUP BY
+    us.user_id,
+    us.DisplayName,
+    us.Reputation,
+    us.question_cnt,
+    us.answer_cnt,
+    us.avg_q_score,
+    us.avg_a_score,
+    us.upvote_cnt,
+    us.downvote_cnt,
+    tt.tags,
+    ar.answer_id,
+    ar.Score
+ORDER BY us.Reputation DESC
+LIMIT 100;

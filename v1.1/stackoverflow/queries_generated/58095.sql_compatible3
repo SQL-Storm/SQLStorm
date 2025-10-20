@@ -1,0 +1,48 @@
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 1) AS QuestionsAsked,
+    (SELECT COUNT(*) FROM Posts p3 WHERE p3.OwnerUserId = u.Id AND p3.PostTypeId = 2) AS AnswersProvided,
+    (SELECT AVG(p4.Score) FROM Posts p4 WHERE p4.OwnerUserId = u.Id) AS AvgPostScore,
+    (SELECT COUNT(*) FROM Comments c2 WHERE c2.UserId = u.Id) AS TotalComments,
+    (SELECT COUNT(*) FROM Votes v2 WHERE v2.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id) AND v2.VoteTypeId = 2) AS UpvotesReceived,
+    (SELECT COUNT(*) FROM Badges b2 WHERE b2.UserId = u.Id AND b2.Class = 1) AS GoldBadges,
+    (SELECT STRING_AGG(t.TagName, ', ')
+     FROM Tags t
+     WHERE t.Id IN (
+         SELECT CAST(x AS INTEGER) FROM (
+             SELECT regexp_split_to_table(substring(p5.Tags FROM 2 FOR char_length(p5.Tags) - 2), '><') AS x
+             FROM Posts p5
+             WHERE p5.OwnerUserId = u.Id AND p5.PostTypeId = 1
+         ) AS sub
+     )
+    ) AS FrequentTags,
+    (SELECT COUNT(*) FROM PostHistory ph2 WHERE ph2.UserId = u.Id AND ph2.PostHistoryTypeId = 5) AS EditBodyEvents,
+    RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Comments c ON u.Id = c.UserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+WHERE 
+    u.CreationDate >= '2015-01-01'
+    AND p.PostTypeId IN (1, 2)
+    AND EXISTS (SELECT 1 FROM PostHistory ph WHERE ph.UserId = u.Id AND ph.CreationDate >= '2020-01-01')
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation
+HAVING 
+    COUNT(DISTINCT p.Id) > 10
+    AND COUNT(DISTINCT c.Id) > 5
+ORDER BY 
+    (
+      (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 1) * 2
+      + (SELECT COUNT(*) FROM Posts p3 WHERE p3.OwnerUserId = u.Id AND p3.PostTypeId = 2) * 1.5
+      + (SELECT COUNT(*) FROM Badges b2 WHERE b2.UserId = u.Id AND b2.Class = 1) * 10
+    ) DESC
+LIMIT 100;

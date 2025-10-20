@@ -1,4 +1,4 @@
--- {"query": "21048.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2168, "output_tokens": 1403} 
+-- {"query": "21048.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2168, "output_tokens": 1403} 
 WITH ActiveUsers AS (
     SELECT u.Id AS UserId, u.Reputation,
            ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank

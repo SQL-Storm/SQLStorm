@@ -1,4 +1,4 @@
--- {"query": "2092.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4o", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 417} 
+-- {"query": "2092.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4o", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 417} 
 
 WITH RecentUsers AS (
     SELECT Id AS UserId, DisplayName, Reputation, ROW_NUMBER() OVER (ORDER BY CreationDate DESC) AS RowNum

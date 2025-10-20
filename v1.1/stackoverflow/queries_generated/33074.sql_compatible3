@@ -1,0 +1,138 @@
+WITH PostAnswerStatistics AS (
+    SELECT
+        p.Id AS QuestionId,
+        COUNT(a.Id) AS AnswerCount,
+        AVG(a.Score) AS AvgAnswerScore,
+        SUM(CASE WHEN a.Score >= 5 THEN 1 ELSE 0 END) AS AnswersWithHighScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        MIN(a.Score) AS MinAnswerScore
+    FROM Posts p
+    LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id
+),
+PostEditHistory AS (
+    SELECT
+        ph.PostId,
+        COUNT(*) AS EditCount,
+        AVG(EXTRACT(EPOCH FROM (ph.CreationDate - p.CreationDate))) AS AvgTimeToFirstEdit,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM PostHistory ph
+    JOIN Posts p ON p.Id = ph.PostId
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+    GROUP BY ph.PostId, p.CreationDate
+),
+ActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        COALESCE(u.AnswerCount, 0) AS AnswerCount,
+        COALESCE(u.QuestionCount, 0) AS QuestionCount,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesGiven,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesGiven
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id, u.Reputation, COALESCE(u.AnswerCount, 0), COALESCE(u.QuestionCount, 0)
+),
+TopActiveQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.ViewCount,
+        p.Score,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.CommentCount, 0) AS CommentCount,
+        ARRAY_AGG(t.TagName) AS Tags
+    FROM Posts p
+    LEFT JOIN Tags t ON CAST(p.Tags AS text) LIKE '%' || t.TagName || '%'
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.CreationDate, p.ViewCount, p.Score, COALESCE(p.AnswerCount, 0), COALESCE(p.CommentCount, 0)
+    ORDER BY p.ViewCount DESC
+    LIMIT 10
+),
+LinkAnalysis AS (
+    SELECT
+        lt.Name AS LinkType,
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title AS PostTitle,
+        p2.Title AS RelatedPostTitle
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    JOIN Posts p1 ON p1.Id = pl.PostId
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+)
+SELECT
+    p.Id AS QuestionId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    COALESCE(pa.AnswerCount, 0) AS AnswerCount,
+    pa.AvgAnswerScore,
+    pa.AnswersWithHighScore,
+    pa.MaxAnswerScore,
+    pa.MinAnswerScore,
+    pe.EditCount,
+    pe.AvgTimeToFirstEdit,
+    pe.LastEditDate,
+    au.Reputation,
+    au.AnswerCount AS UserAnswers,
+    au.QuestionCount AS UserQuestions,
+    au.GoldBadges,
+    au.SilverBadges,
+    au.BronzeBadges,
+    au.CommentCount,
+    au.UpVotesGiven,
+    au.DownVotesGiven,
+    ti.TopQuestions,
+    la.LinkType,
+    la.RelatedPostTitle
+FROM Posts p
+LEFT JOIN PostAnswerStatistics pa ON pa.QuestionId = p.Id
+LEFT JOIN PostEditHistory pe ON pe.PostId = p.Id
+LEFT JOIN ActiveUsers au ON au.UserId = p.OwnerUserId
+LEFT JOIN (
+    SELECT
+        array_agg(top.QuestionId) AS TopQuestions,
+        top.QuestionId
+    FROM TopActiveQuestions top
+    GROUP BY top.QuestionId
+) ti ON ti.QuestionId = p.Id
+LEFT JOIN LinkAnalysis la ON la.PostId = p.Id
+WHERE p.PostTypeId = 1
+GROUP BY
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    COALESCE(pa.AnswerCount, 0),
+    pa.AvgAnswerScore,
+    pa.AnswersWithHighScore,
+    pa.MaxAnswerScore,
+    pa.MinAnswerScore,
+    pe.EditCount,
+    pe.AvgTimeToFirstEdit,
+    pe.LastEditDate,
+    au.Reputation,
+    au.AnswerCount,
+    au.QuestionCount,
+    au.GoldBadges,
+    au.SilverBadges,
+    au.BronzeBadges,
+    au.CommentCount,
+    au.UpVotesGiven,
+    au.DownVotesGiven,
+    ti.TopQuestions,
+    la.LinkType,
+    la.RelatedPostTitle
+ORDER BY p.CreationDate DESC
+LIMIT 100;

@@ -1,0 +1,108 @@
+-- {"query": "77.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 944} 
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ParentId
+  FROM Posts p
+  WHERE p.CreationDate >= now() - INTERVAL '7 days'
+),
+TagAggregates AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS PostCount,
+    AVG(p.Score) AS AvgScore,
+    MAX(p.LastActivityDate) AS LastActive
+  FROM Unnest(string_to_array(substr(p.Tags, 2, length(p.Tags)-2), '><')) AS t(TagName)
+  CROSS JOIN RecentActivePosts p
+  GROUP BY t.TagName
+),
+TopUsers AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.AccountId,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS rn
+  FROM Users u
+  WHERE u.Reputation IS NOT NULL
+),
+UserBadges AS (
+  SELECT
+    b.UserId,
+    COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+    COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+    COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+ResponseMatrix AS (
+  SELECT
+    t.TagName,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+    SUM(CASE WHEN p.PostTypeId = 5 THEN 1 ELSE 0 END) AS TagWikis
+  FROM RecentActivePosts p
+  CROSS JOIN Unnest(string_to_array(substr(p.Tags, 2, length(p.Tags)-2), '><')) AS t(TagName)
+  GROUP BY t.TagName
+)
+SELECT
+  rp.Id AS PostId,
+  rp.Title,
+  rp.PostTypeId,
+  rp.OwnerUserId,
+  ro.DisplayName AS OwnerDisplayName,
+  rp.CreationDate,
+  rp.LastActivityDate,
+  rp.Score,
+  rp.ViewCount,
+  rp.AnswerCount,
+  rp.CommentCount,
+  rp.FavoriteCount,
+  COALESCE(ug.GoldBadges,0) AS GoldBadges,
+  COALESCE(ug.SilverBadges,0) AS SilverBadges,
+  COALESCE(ug.BronzeBadges,0) AS BronzeBadges,
+  tu.rn AS TopUserRank,
+  tm.TagName,
+  ta.PostCount AS TagPostCount,
+  ta.AvgScore AS TagAvgScore,
+  ta.LastActive AS TagLastActive,
+  tmr.QuestionCount,
+  tmr.AnswerCount,
+  tmr.TagCount,
+  vts.vcount AS UpDownDelta
+FROM RecentActivePosts rp
+LEFT JOIN Users ro ON rp.OwnerUserId = ro.Id
+LEFT JOIN TopUsers tu ON tu.UserId = ro.Id
+LEFT JOIN UserBadges ug ON ug.UserId = ro.Id
+LEFT JOIN ResponseMatrix tm ON TRUE
+LEFT JOIN TagAggregates ta ON ta.TagName = (SELECT TagName FROM Unnest(string_to_array(substr(rp.Tags, 2, length(rp.Tags)-2), '><')) AS t(TagName) LIMIT 1)
+LEFT JOIN (
+  SELECT
+    rp2.OwnerUserId,
+    COUNT(*) FILTER (WHERE v.VoteTypeId IN (2,16)) AS vcount
+  FROM Posts rp2
+  LEFT JOIN Votes v ON v.PostId = rp2.Id
+  GROUP BY rp2.OwnerUserId
+) vts ON vts.OwnerUserId = rp.OwnerUserId
+LEFT JOIN LATERAL (
+  SELECT
+    COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+    COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+    (SELECT COUNT(*) FROM Tags t WHERE t.Id IS NOT NULL) AS TagCount
+  FROM Posts p
+  WHERE p.OwnerUserId = rp.OwnerUserId
+) tmr ON TRUE
+ORDER BY rp.LastActivityDate DESC, rp.Score DESC
+LIMIT 100;

@@ -1,0 +1,116 @@
+-- {"query": "46019.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 43586, "output_tokens": 35083} 
+
+WITH TopQuestionsByDecade AS (
+    SELECT 
+        p.Id,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        EXTRACT(DECADE FROM p.CreationDate) AS decade,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(DECADE FROM p.CreationDate) ORDER BY p.Score DESC, p.ViewCount DESC) as rank_in_decade
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+        AND p.Score > 50
+        AND p.OwnerUserId IS NOT NULL
+),
+UserEngagementMetrics AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as total_posts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as questions_count,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answers_count,
+        AVG(p.Score) as avg_post_score,
+        SUM(p.ViewCount) as total_views,
+        COUNT(DISTINCT v.Id) as total_votes_received,
+        COUNT(DISTINCT c.Id) as total_comments_received,
+        COUNT(DISTINCT b.Id) as badges_earned,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) as gold_badges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) as silver_badges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) as bronze_badges
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT p.Id) > 10
+),
+TagPerformance AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        AVG(p.Score) as avg_question_score,
+        AVG(p.AnswerCount) as avg_answers_per_question,
+        COUNT(DISTINCT p.OwnerUserId) as unique_contributors,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.ViewCount) as median_views,
+        MAX(p.ViewCount) as max_views
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%<' || t.TagName || '>%'
+    WHERE p.PostTypeId = 1 
+        AND t.Count > 100
+    GROUP BY t.TagName, t.Count
+),
+AnswerQualityAnalysis AS (
+    SELECT 
+        a.Id as answer_id,
+        a.ParentId as question_id,
+        a.OwnerUserId,
+        a.Score as answer_score,
+        a.CreationDate as answer_date,
+        q.CreationDate as question_date,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600 as hours_to_answer,
+        CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END as is_accepted,
+        LENGTH(a.Body) as answer_length,
+        a.CommentCount as answer_comments,
+        COUNT(DISTINCT ph.Id) as edit_count
+    FROM Posts a
+    INNER JOIN Posts q ON a.ParentId = q.Id
+    LEFT JOIN PostHistory ph ON a.Id = ph.PostId AND ph.PostHistoryTypeId = 5
+    WHERE a.PostTypeId = 2
+        AND a.Score >= 5
+        AND q.PostTypeId = 1
+    GROUP BY a.Id, a.ParentId, a.OwnerUserId, a.Score, a.CreationDate, 
+             q.CreationDate, q.AcceptedAnswerId, a.Body, a.CommentCount
+)
+SELECT 
+    tq.decade,
+    tq.Id as question_id,
+    tq.Score as question_score,
+    tq.ViewCount,
+    uem.DisplayName,
+    uem.Reputation,
+    uem.total_posts,
+    uem.avg_post_score,
+    uem.gold_badges,
+    uem.silver_badges,
+    uem.bronze_badges,
+    STRING_AGG(DISTINCT tp.TagName, ', ' ORDER BY tp.TagName) as top_tags_used,
+    AVG(tp.avg_question_score) as avg_tag_score,
+    COUNT(DISTINCT aqa.answer_id) as quality_answers_received,
+    AVG(aqa.answer_score) as avg_answer_score,
+    AVG(aqa.hours_to_answer) as avg_hours_to_first_answer,
+    SUM(aqa.is_accepted) as accepted_answers_count,
+    COUNT(DISTINCT pl.RelatedPostId) as linked_questions,
+    COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) as upvotes,
+    COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) as downvotes,
+    MAX(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount END) as max_bounty
+FROM TopQuestionsByDecade tq
+INNER JOIN UserEngagementMetrics uem ON tq.OwnerUserId = uem.UserId
+LEFT JOIN Posts p ON tq.Id = p.Id
+LEFT JOIN TagPerformance tp ON p.Tags LIKE '%<' || tp.TagName || '>%'
+LEFT JOIN AnswerQualityAnalysis aqa ON tq.Id = aqa.question_id
+LEFT JOIN PostLinks pl ON tq.Id = pl.PostId AND pl.LinkTypeId = 1
+LEFT JOIN Votes v ON tq.Id = v.PostId
+WHERE tq.rank_in_decade <= 100
+    AND uem.badges_earned > 5
+GROUP BY tq.decade, tq.Id, tq.Score, tq.ViewCount, tq.AnswerCount,
+         uem.DisplayName, uem.Reputation, uem.total_posts, uem.avg_post_score,
+         uem.gold_badges, uem.silver_badges, uem.bronze_badges
+HAVING COUNT(DISTINCT aqa.answer_id) > 0
+ORDER BY tq.decade DESC, tq.Score DESC, avg_answer_score DESC
+LIMIT 500;

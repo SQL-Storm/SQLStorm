@@ -1,0 +1,60 @@
+-- {"query": "31051.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4o-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 408} 
+
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(DISTINCT v.UserId) AS VoteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS UserPostRank
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    WHERE 
+        p.PostTypeId = 1 AND -- Only questions
+        p.CreationDate >= NOW() - INTERVAL '1 year' -- Within the last year
+    GROUP BY 
+        p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount
+),
+UserRanks AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        SUM(p.Score) AS TotalScore,
+        SUM(p.ViewCount) AS TotalViews,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        ROW_NUMBER() OVER (ORDER BY SUM(p.Score) DESC) AS GlobalRank
+    FROM 
+        Users u
+    JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    WHERE 
+        p.PostTypeId = 1 -- Questions
+    GROUP BY 
+        u.Id, u.DisplayName
+)
+SELECT 
+    ur.GlobalRank,
+    ur.DisplayName,
+    ur.TotalScore,
+    ur.TotalViews,
+    ur.TotalPosts,
+    rp.PostId,
+    rp.Title,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.CommentCount,
+    rp.VoteCount
+FROM 
+    UserRanks ur
+LEFT JOIN 
+    RankedPosts rp ON ur.UserId = rp.OwnerUserId
+ORDER BY 
+    ur.GlobalRank, rp.Score DESC;

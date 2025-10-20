@@ -1,0 +1,91 @@
+-- {"query": "39044.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1972, "output_tokens": 1633} 
+WITH
+-- Compute per‐tag question statistics
+TagStats AS (
+    SELECT
+        t.TagName,
+        COUNT(*)                          AS QuestionCount,
+        AVG(q.Score)                      AS AvgQuestionScore,
+        MAX(q.ViewCount)                  AS MaxQuestionViews
+    FROM Posts q
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(q.Tags,2,length(q.Tags)-2), '><')) AS TagName
+    ) AS tag
+    JOIN Tags t ON t.TagName = tag.TagName
+    WHERE q.PostTypeId = 1
+    GROUP BY t.TagName
+),
+
+-- Compute badge counts per user
+UserBadgeStats AS (
+    SELECT
+        u.Id                     AS UserId,
+        u.DisplayName,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+
+-- Rank answers by score per question
+TopAnswers AS (
+    SELECT
+        a.ParentId                   AS QuestionId,
+        ROW_NUMBER() OVER (
+            PARTITION BY a.ParentId
+            ORDER BY a.Score DESC, a.CreationDate
+        )                            AS AnswerRank,
+        a.Id                         AS AnswerId,
+        a.Score                      AS AnswerScore,
+        a.CreationDate               AS AnswerDate,
+        a.OwnerUserId                AS AnswererId
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+)
+
+SELECT
+    ts.TagName,
+    ts.QuestionCount,
+    ts.AvgQuestionScore,
+    ts.MaxQuestionViews,
+    q.Id                                AS QuestionId,
+    q.Score                             AS QuestionScore,
+    q.AcceptedAnswerId,
+    ta.AnswerRank,
+    ta.AnswerId,
+    ta.AnswerScore,
+    u.DisplayName                       AS AnswererName,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    COALESCE(c30.CommentCountLast30d, 0) AS CommentsLast30d,
+    CASE WHEN q.AcceptedAnswerId = ta.AnswerId THEN TRUE ELSE FALSE END AS IsAccepted
+FROM TagStats ts
+JOIN Posts q
+    ON q.PostTypeId = 1
+   AND EXISTS (
+        SELECT 1
+        FROM unnest(string_to_array(substring(q.Tags,2,length(q.Tags)-2), '><')) AS tg(TagName)
+        WHERE tg.TagName = ts.TagName
+    )
+JOIN TopAnswers ta
+    ON ta.QuestionId = q.Id
+   AND ta.AnswerRank <= 3
+JOIN Users u
+    ON u.Id = ta.AnswererId
+LEFT JOIN UserBadgeStats ubs
+    ON ubs.UserId = ta.AnswererId
+LEFT JOIN LATERAL (
+    SELECT COUNT(*) AS CommentCountLast30d
+    FROM Comments c
+    WHERE c.PostId = ta.AnswerId
+      AND c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+) c30 ON TRUE
+ORDER BY
+    ts.QuestionCount DESC,
+    ts.AvgQuestionScore DESC,
+    ta.AnswerRank,
+    ta.AnswerScore DESC
+LIMIT 100;

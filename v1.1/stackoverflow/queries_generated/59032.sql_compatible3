@@ -1,0 +1,101 @@
+SELECT 
+    p.Id AS PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS Upvotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS Downvotes,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (1, 4, 6)) AS EditCount,
+    CASE 
+        WHEN p.PostTypeId = 1 THEN 'Question'
+        WHEN p.PostTypeId = 2 THEN 'Answer'
+        WHEN p.PostTypeId = 3 THEN 'Wiki'
+        WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+        WHEN p.PostTypeId = 5 THEN 'TagWiki'
+        WHEN p.PostTypeId = 6 THEN 'ModeratorNomination'
+        WHEN p.PostTypeId = 7 THEN 'WikiPlaceholder'
+        WHEN p.PostTypeId = 8 THEN 'PrivilegeWiki'
+        ELSE NULL
+    END AS PostType,
+    p.Tags,
+    p.AnswerCount,
+    p.CommentCount AS ReportedCommentCount,
+    p.FavoriteCount,
+    p.LastActivityDate,
+    p.ClosedDate,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 1) AS QuestionCount,
+    (SELECT COUNT(*) FROM Posts p3 WHERE p3.OwnerUserId = u.Id AND p3.PostTypeId = 2) AS AnswerCount,
+    (SELECT AVG(p4.Score) FROM Posts p4 WHERE p4.OwnerUserId = u.Id AND p4.PostTypeId = 1) AS AvgQuestionScore,
+    (SELECT AVG(p5.Score) FROM Posts p5 WHERE p5.OwnerUserId = u.Id AND p5.PostTypeId = 2) AS AvgAnswerScore,
+    (SELECT STRING_AGG(t.TagName, ', ') FROM Tags t WHERE t.Id IN (
+         SELECT CAST(tag AS INTEGER) FROM (
+             SELECT TRIM(BOTH '<>' FROM value) AS tag
+             FROM (
+                 SELECT UNNEST(
+                     CASE 
+                         WHEN p.Tags IS NULL OR p.Tags = '' THEN ARRAY[]::text[] 
+                         ELSE regexp_split_to_table(p.Tags, '><') 
+                      END
+                 ) AS value
+             ) AS split_vals
+         ) AS tags_cast
+    )) AS TagList,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS DuplicateCount,
+    (SELECT COUNT(*) FROM PostHistory ph2 WHERE ph2.PostId = p.Id AND ph2.PostHistoryTypeId = 10 AND ph2.Comment LIKE '%101%') AS DuplicateCloseCount,
+    (SELECT COUNT(*) FROM PostHistory ph3 WHERE ph3.PostId = p.Id AND ph3.PostHistoryTypeId = 10 AND ph3.Comment LIKE '%102%') AS OffTopicCloseCount,
+    (SELECT COUNT(*) FROM PostHistory ph4 WHERE ph4.PostId = p.Id AND ph4.PostHistoryTypeId = 10 AND ph4.Comment LIKE '%103%') AS NeedsClarificationCloseCount,
+    (SELECT COUNT(*) FROM PostHistory ph5 WHERE ph5.PostId = p.Id AND ph5.PostHistoryTypeId = 10 AND ph5.Comment LIKE '%104%') AS NeedsFocusCloseCount,
+    (SELECT COUNT(*) FROM PostHistory ph6 WHERE ph6.PostId = p.Id AND ph6.PostHistoryTypeId = 10 AND ph6.Comment LIKE '%105%') AS OpinionBasedCloseCount,
+    (SELECT COUNT(*) FROM PostHistory ph7 WHERE ph7.PostId = p.Id AND ph7.PostHistoryTypeId = 12) AS DeletedCount,
+    (SELECT COUNT(*) FROM PostHistory ph8 WHERE ph8.PostId = p.Id AND ph8.PostHistoryTypeId = 13) AS UndeletedCount,
+    (SELECT COUNT(*) FROM PostHistory ph9 WHERE ph9.PostId = p.Id AND ph9.PostHistoryTypeId = 14) AS LockedCount,
+    (SELECT COUNT(*) FROM PostHistory ph10 WHERE ph10.PostId = p.Id AND ph10.PostHistoryTypeId = 15) AS UnlockedCount,
+    (SELECT COUNT(*) FROM PostHistory ph11 WHERE ph11.PostId = p.Id AND ph11.PostHistoryTypeId = 19) AS ProtectedCount,
+    (SELECT COUNT(*) FROM PostHistory ph12 WHERE ph12.PostId = p.Id AND ph12.PostHistoryTypeId = 20) AS UnprotectedCount,
+    (SELECT COUNT(*) FROM PostHistory ph13 WHERE ph13.PostId = p.Id AND ph13.PostHistoryTypeId = 22) AS UnmergedCount,
+    (SELECT COUNT(*) FROM PostHistory ph14 WHERE ph14.PostId = p.Id AND ph14.PostHistoryTypeId = 24) AS SuggestedEditCount,
+    (SELECT COUNT(*) FROM PostHistory ph15 WHERE ph15.PostId = p.Id AND ph15.PostHistoryTypeId = 31) AS MovedToChatCount,
+    (SELECT COUNT(*) FROM PostHistory ph16 WHERE ph16.PostId = p.Id AND ph16.PostHistoryTypeId = 35) AS MigratedAwayCount,
+    (SELECT COUNT(*) FROM PostHistory ph17 WHERE ph17.PostId = p.Id AND ph17.PostHistoryTypeId = 36) AS MigratedHereCount,
+    (SELECT COUNT(*) FROM PostHistory ph18 WHERE ph18.PostId = p.Id AND ph18.PostHistoryTypeId = 37) AS MergeSourceCount,
+    (SELECT COUNT(*) FROM PostHistory ph19 WHERE ph19.PostId = p.Id AND ph19.PostHistoryTypeId = 38) AS MergeDestinationCount,
+    (SELECT COUNT(*) FROM PostHistory ph20 WHERE ph20.PostId = p.Id AND ph20.PostHistoryTypeId = 50) AS CommunityBumpCount,
+    (SELECT COUNT(*) FROM PostHistory ph21 WHERE ph21.PostId = p.Id AND ph21.PostHistoryTypeId = 52) AS SelectedHotQuestionCount,
+    (SELECT COUNT(*) FROM PostHistory ph22 WHERE ph22.PostId = p.Id AND ph22.PostHistoryTypeId = 53) AS RemovedHotQuestionCount,
+    (SELECT COUNT(*) FROM PostHistory ph23 WHERE ph23.PostId = p.Id AND ph23.PostHistoryTypeId = 66) AS CreatedFromWizardCount,
+    (SELECT COUNT(*) FROM PostHistory ph24 WHERE ph24.PostId = p.Id AND ph24.PostHistoryTypeId BETWEEN 1 AND 20) AS TotalEditsCount,
+    (SELECT COUNT(*) FROM PostHistory ph25 WHERE ph25.PostId = p.Id AND ph25.PostHistoryTypeId IN (1, 4, 6)) AS TitleBodyTagEditsCount,
+    (SELECT COUNT(*) FROM PostHistory ph26 WHERE ph26.PostId = p.Id AND ph26.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25)) AS ActionEditsCount,
+    (SELECT COUNT(*) FROM PostHistory ph27 WHERE ph27.PostId = p.Id AND ph27.PostHistoryTypeId IN (31, 32, 33, 34, 35, 36, 37, 38, 39, 40)) AS SystemEditsCount
+FROM Posts p
+JOIN Users u ON p.OwnerUserId = u.Id
+WHERE p.PostTypeId IN (1, 2)
+  AND p.CreationDate >= DATE '2022-01-01'
+  AND p.Score >= 0
+  AND u.Reputation > 1000
+  AND p.ViewCount > 100
+  AND p.CommentCount > 5
+GROUP BY
+    p.Id,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    u.DisplayName,
+    u.Reputation,
+    p.PostTypeId,
+    p.Tags,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.LastActivityDate,
+    p.ClosedDate
+ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate DESC
+LIMIT 1000;

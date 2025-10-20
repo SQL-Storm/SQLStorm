@@ -1,0 +1,23 @@
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  u.Reputation,
+  COUNT(DISTINCT p.Id) AS PostCount,
+  AVG(p.Score) AS AvgPostScore,
+  SUM(COALESCE(p.ViewCount, 0)) AS TotalViews,
+  MAX(p.CreationDate) AS LatestPostDate,
+  STRING_AGG(DISTINCT t.tag, ',') AS TagsUsed
+FROM
+  Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN LATERAL (
+    SELECT value AS tag
+    FROM json_array_elements_text(
+      CAST('[' || REPLACE(REPLACE(p.Tags, '&lt;', '<'), '&gt;', '>') || ']' AS json)
+    ) AS x(value)
+  ) AS t ON TRUE
+GROUP BY
+  u.Id, u.DisplayName, u.Reputation
+ORDER BY
+  TotalViews DESC, AvgPostScore DESC
+LIMIT 100;

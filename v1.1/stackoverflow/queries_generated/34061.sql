@@ -1,0 +1,144 @@
+-- {"query": "34061.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 1279} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COALESCE(t.Count, 0) AS TotalCount,
+        1 AS Level,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE t.IsRequired = 1
+
+    UNION ALL
+
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        COALESCE(t2.Count, 0),
+        th.Level + 1,
+        th.TagPath || t2.TagName
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy th ON t2.Id <> th.Id AND NOT t2.TagName = ANY(th.TagPath)
+    WHERE t2.IsRequired = 1 AND th.Level < 3
+),
+RecentTopUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id AND b.Date > now() - INTERVAL '1 year'
+    WHERE u.Reputation > 10000 AND u.CreationDate < now() - INTERVAL '3 year'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    ORDER BY u.Reputation DESC
+    LIMIT 100
+),
+QuestionStats AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        SUM(p.ViewCount) AS TotalViews
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1
+    GROUP BY p.OwnerUserId
+),
+UserVoteSummary AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(v.Id) FILTER (WHERE vt.Name = 'UpMod') AS UpVotesReceived,
+        COUNT(v.Id) FILTER (WHERE vt.Name = 'DownMod') AS DownVotesReceived,
+        COUNT(v.Id) FILTER (WHERE vt.Name = 'BountyStart') AS BountiesStarted,
+        COUNT(v.Id) FILTER (WHERE vt.Name = 'BountyClose') AS BountiesClosed
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    JOIN Posts p ON p.Id = v.PostId
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1
+    GROUP BY p.OwnerUserId
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        q.QuestionCount,
+        q.AnswerCount,
+        q.AvgPostScore,
+        q.LastPostDate,
+        q.TotalViews,
+        uv.UpVotesReceived,
+        uv.DownVotesReceived,
+        uv.BountiesStarted,
+        uv.BountiesClosed,
+        r.GoldBadges,
+        r.SilverBadges,
+        r.BronzeBadges
+    FROM RecentTopUsers r
+    LEFT JOIN QuestionStats q ON q.OwnerUserId = r.Id
+    LEFT JOIN UserVoteSummary uv ON uv.OwnerUserId = r.Id
+    JOIN Users u ON u.Id = r.Id
+),
+TopClosedQuestions AS (
+    SELECT 
+        ph.PostId,
+        p.Title,
+        p.CreationDate,
+        ph.Comment AS CloseReasonId,
+        crt.Name AS CloseReason,
+        COUNT(ph.Id) AS CloseCount,
+        MAX(ph.CreationDate) AS LastClosedDate
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON crt.Id::text = ph.Comment
+    JOIN Posts p ON p.Id = ph.PostId
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId, p.Title, p.CreationDate, ph.Comment, crt.Name
+    ORDER BY CloseCount DESC
+    LIMIT 20
+)
+SELECT 
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.AvgPostScore,
+    ua.TotalViews,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.UpVotesReceived,
+    ua.DownVotesReceived,
+    ua.BountiesStarted,
+    ua.BountiesClosed,
+    STRING_AGG(DISTINCT rt.TagName, ', ') AS TopRequiredTags,
+    tcq.Title AS MostClosedQuestionTitle,
+    tcq.CloseReason,
+    tcq.CloseCount,
+    tcq.LastClosedDate
+FROM UserActivity ua
+LEFT JOIN RecursiveTagHierarchy rt ON rt.Level = 1
+LEFT JOIN LATERAL (
+    SELECT 
+        tcq2.Title,
+        tcq2.CloseReason,
+        tcq2.CloseCount,
+        tcq2.LastClosedDate
+    FROM TopClosedQuestions tcq2
+    JOIN Posts p2 ON p2.Id = tcq2.PostId
+    WHERE p2.OwnerUserId = ua.UserId
+    ORDER BY tcq2.CloseCount DESC, tcq2.LastClosedDate DESC
+    LIMIT 1
+) tcq ON true
+GROUP BY 
+    ua.UserId, ua.DisplayName, ua.Reputation, ua.QuestionCount, ua.AnswerCount, ua.AvgPostScore, ua.TotalViews,
+    ua.GoldBadges, ua.SilverBadges, ua.BronzeBadges, ua.UpVotesReceived, ua.DownVotesReceived, ua.BountiesStarted, ua.BountiesClosed,
+    tcq.Title, tcq.CloseReason, tcq.CloseCount, tcq.LastClosedDate
+ORDER BY ua.Reputation DESC, ua.QuestionCount DESC
+LIMIT 50;

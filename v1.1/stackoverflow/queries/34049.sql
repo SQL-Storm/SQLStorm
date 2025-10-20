@@ -1,0 +1,80 @@
+WITH TopUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation,
+           COUNT(DISTINCT b.Id) AS BadgeCount,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS rn
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id AND b.Class = 1
+    WHERE u.Reputation > 10000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT b.Id) >= 3
+), RecentHotQuestions AS (
+    SELECT p.Id, p.Title, p.CreationDate, p.OwnerUserId, p.Score, ph.CreationDate AS HotDate
+    FROM Posts p
+    JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 52
+    WHERE p.PostTypeId = 1
+      AND ph.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180' DAY)
+), UserActivity AS (
+    SELECT u.Id AS UserId,
+           COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+           COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersGiven,
+           COUNT(DISTINCT c.Id) AS CommentsMade,
+           COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotesReceived,
+           COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotesReceived
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY u.Id
+), TagQuestionStats AS (
+    SELECT t.TagName,
+           COUNT(DISTINCT p.Id) AS QuestionCount,
+           AVG(p.Score) AS AvgScore,
+           MAX(p.ViewCount) AS MaxViewCount
+    FROM Tags t
+    JOIN Posts p ON p.PostTypeId = 1 AND p.Tags LIKE ('%' || '<' || t.TagName || '>' || '%')
+    WHERE p.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365' DAY)
+    GROUP BY t.TagName
+    HAVING COUNT(DISTINCT p.Id) > 100
+), QuestionLinkCounts AS (
+    SELECT p.Id AS QuestionId,
+           SUM(CASE WHEN lt.Name = 'Duplicate' THEN 1 ELSE 0 END) AS DuplicateLinks,
+           SUM(CASE WHEN lt.Name = 'Linked' THEN 1 ELSE 0 END) AS LinkedPosts
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id
+), TopHotQuestionDetails AS (
+    SELECT rhq.Id, rhq.Title, rhq.CreationDate, rhq.OwnerUserId, rhq.Score, rhq.HotDate,
+           u.DisplayName AS OwnerName,
+           ul.DuplicateLinks, ul.LinkedPosts,
+           ta.TagName, tasts.QuestionCount, tasts.AvgScore, tasts.MaxViewCount,
+           ua.QuestionsAsked, ua.AnswersGiven, ua.CommentsMade, ua.UpVotesReceived, ua.DownVotesReceived
+    FROM RecentHotQuestions rhq
+    LEFT JOIN Users u ON u.Id = rhq.OwnerUserId
+    LEFT JOIN QuestionLinkCounts ul ON ul.QuestionId = rhq.Id
+    LEFT JOIN UserActivity ua ON ua.UserId = rhq.OwnerUserId
+    LEFT JOIN (
+      SELECT p2.Id AS PostId, t2.TagName
+      FROM Posts p2
+      JOIN Tags t2 ON p2.Tags LIKE ('%' || '<' || t2.TagName || '>' || '%')
+      WHERE p2.PostTypeId = 1
+      GROUP BY p2.Id, t2.TagName
+    ) ta ON ta.PostId = rhq.Id
+    LEFT JOIN TagQuestionStats tasts ON tasts.TagName = ta.TagName
+)
+SELECT t.Id AS UserId, t.DisplayName, t.Reputation, t.BadgeCount,
+       thqd.Id AS HotQuestionId, thqd.Title AS HotQuestionTitle, thqd.CreationDate AS QuestionCreation,
+       thqd.Score AS QuestionScore, thqd.HotDate AS HotQuestionDate,
+       thqd.DuplicateLinks, thqd.LinkedPosts,
+       thqd.QuestionCount AS TagQuestionCount, thqd.AvgScore AS TagAvgScore, thqd.MaxViewCount AS TagMaxViews,
+       thqd.QuestionsAsked, thqd.AnswersGiven, thqd.CommentsMade, thqd.UpVotesReceived, thqd.DownVotesReceived
+FROM TopUsers t
+LEFT JOIN TopHotQuestionDetails thqd ON thqd.OwnerUserId = t.Id
+GROUP BY t.Id, t.DisplayName, t.Reputation, t.BadgeCount,
+         thqd.Id, thqd.Title, thqd.CreationDate, thqd.OwnerUserId, thqd.Score, thqd.HotDate,
+         thqd.DuplicateLinks, thqd.LinkedPosts,
+         thqd.TagName, thqd.QuestionCount, thqd.AvgScore, thqd.MaxViewCount,
+         thqd.QuestionsAsked, thqd.AnswersGiven, thqd.CommentsMade, thqd.UpVotesReceived, thqd.DownVotesReceived
+ORDER BY t.Reputation DESC, thqd.HotDate DESC
+LIMIT 100;

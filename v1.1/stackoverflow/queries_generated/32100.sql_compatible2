@@ -1,0 +1,37 @@
+SELECT 
+    U.DisplayName AS UserDisplayName,
+    U.Reputation,
+    P.Title,
+    P.CreationDate AS PostCreationDate,
+    COUNT(DISTINCT C.Id) AS CommentCount,
+    COALESCE(SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 WHEN V.VoteTypeId = 3 THEN -1 ELSE 0 END), 0) AS VoteScore,
+    SUM(CASE WHEN V.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteCount,
+    COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.Id END) AS EditCount,
+    TagsList.TagName AS TagList
+FROM 
+    Users U
+    JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON P.Id = C.PostId
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN (
+        SELECT P2.Id, STRING_AGG(T2.TagName, ',') AS TagName
+        FROM Posts P2
+        JOIN (
+            SELECT Id, 
+                   TRIM(BOTH '<>' FROM tag) AS TagName
+            FROM (
+                SELECT Id, regexp_split_to_table(SUBSTRING(Tags FROM 2 FOR (LENGTH(Tags) - 2)), '><') AS tag
+                FROM Posts
+                WHERE PostTypeId = 1
+            ) s
+        ) T2 ON P2.Id = T2.Id
+        GROUP BY P2.Id
+    ) TagsList ON P.Id = TagsList.Id
+WHERE 
+    P.PostTypeId = 1
+GROUP BY 
+    U.Id, U.DisplayName, U.Reputation, P.Id, P.Title, P.CreationDate, TagsList.TagName
+ORDER BY 
+    U.Reputation DESC, VoteScore DESC, CommentCount DESC
+LIMIT 100;

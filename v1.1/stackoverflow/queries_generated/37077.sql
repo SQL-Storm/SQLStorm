@@ -1,0 +1,230 @@
+-- {"query": "37077.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 2598} 
+WITH
+-- recent activity per question: last activity, last editor, counts
+QuestionBase AS (
+  SELECT p.Id AS QuestionId,
+         p.Title,
+         p.CreationDate,
+         p.OwnerUserId,
+         p.ViewCount,
+         p.Score,
+         p.AnswerCount,
+         p.CommentCount,
+         p.Tags,
+         p.AcceptedAnswerId,
+         p.LastActivityDate,
+         p.LastEditorUserId,
+         p.FavoriteCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+-- aggregate answers info per question
+AnswersAgg AS (
+  SELECT a.ParentId AS QuestionId,
+         COUNT(*) AS TotalAnswers,
+         SUM(CASE WHEN a.Score >= 0 THEN 1 ELSE 0 END) FILTER (WHERE a.Score IS NOT NULL) AS NonNegativeAnswers,
+         AVG(a.Score) AS AvgAnswerScore,
+         MAX(a.Score) AS MaxAnswerScore,
+         MIN(a.Score) AS MinAnswerScore,
+         SUM(CASE WHEN a.OwnerUserId IS NOT NULL THEN 1 ELSE 0 END) AS AnswersWithOwner,
+         COUNT(DISTINCT a.OwnerUserId) AS DistinctAnswerers,
+         MAX(a.CreationDate) AS LatestAnswerDate
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+  GROUP BY a.ParentId
+),
+-- top comment stats on the question
+CommentsAgg AS (
+  SELECT c.PostId AS QuestionId,
+         COUNT(*) AS CommentCountTotal,
+         AVG(c.Score) AS AvgCommentScore,
+         MAX(c.Score) AS MaxCommentScore,
+         COUNT(DISTINCT c.UserId) AS DistinctCommenters
+  FROM Comments c
+  WHERE c.PostId IS NOT NULL
+  GROUP BY c.PostId
+),
+-- votes on question and its answers (separated)
+VoteMix AS (
+  SELECT v.PostId,
+         SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+         SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes,
+         SUM(CASE WHEN vt.Name = 'AcceptedByOriginator' THEN 1 ELSE 0 END) AS AcceptedMarks,
+         SUM(CASE WHEN vt.Name = 'Favorite' THEN 1 ELSE 0 END) AS Favorites,
+         COUNT(*) AS TotalVotes
+  FROM Votes v
+  LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  GROUP BY v.PostId
+),
+-- link graph: duplicates and links pointing to question
+LinksAgg AS (
+  SELECT pl.RelatedPostId AS QuestionId,
+         SUM(CASE WHEN lt.Name = 'Duplicate' THEN 1 ELSE 0 END) AS DuplicatedByCount,
+         SUM(CASE WHEN lt.Name = 'Linked' THEN 1 ELSE 0 END) AS LinkedByCount,
+         COUNT(*) AS TotalIncomingLinks
+  FROM PostLinks pl
+  LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  GROUP BY pl.RelatedPostId
+),
+-- badge activity of the question owner up to question creation
+OwnerBadges AS (
+  SELECT q.QuestionId,
+         u.Id AS OwnerId,
+         u.DisplayName AS OwnerName,
+         COUNT(b.Id) FILTER (WHERE b.Class = 1) AS OwnerGoldBadges,
+         COUNT(b.Id) FILTER (WHERE b.Class = 2) AS OwnerSilverBadges,
+         COUNT(b.Id) FILTER (WHERE b.Class = 3) AS OwnerBronzeBadges,
+         MAX(b.Date) AS OwnerLastBadgeDate
+  FROM QuestionBase q
+  LEFT JOIN Users u ON u.Id = q.OwnerUserId
+  LEFT JOIN Badges b ON b.UserId = u.Id AND b.Date <= q.CreationDate
+  GROUP BY q.QuestionId, u.Id, u.DisplayName
+),
+-- textual complexity metrics (approx): tag count, title length, body tokens estimated via length
+TextMetrics AS (
+  SELECT q.QuestionId,
+         COALESCE(array_length(string_to_array(substring(q.Tags FROM 2 FOR length(q.Tags)-2), '><'), 1), 0) AS TagCount,
+         COALESCE(char_length(q.Title),0) AS TitleLength,
+         COALESCE(char_length(p.Body),0) AS BodyLength,
+         COALESCE(length(regexp_split_to_table(p.Body, '\s+'))::int, 0) AS EstimatedBodyWords
+  FROM QuestionBase q
+  LEFT JOIN Posts p ON p.Id = q.QuestionId
+),
+-- post history churn: edits, closures, migrations
+HistoryAgg AS (
+  SELECT ph.PostId AS QuestionId,
+         COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6,7,8,9,24)) AS EditRevisions,
+         COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (10,11)) AS CloseReopenEvents,
+         COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (35,36)) AS MigrationEvents,
+         MIN(ph.CreationDate) AS FirstHistoryDate,
+         MAX(ph.CreationDate) AS LastHistoryDate
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+-- combine base metrics
+Combined AS (
+  SELECT q.*,
+         COALESCE(a.TotalAnswers,0) AS TotalAnswersAgg,
+         COALESCE(a.NonNegativeAnswers,0) AS NonNegAnswers,
+         COALESCE(a.AvgAnswerScore,0) AS AvgAnswerScore,
+         COALESCE(c.CommentCountTotal,0) AS CommentCountAgg,
+         COALESCE(vm.UpVotes,0) AS QuestionUpVotes,
+         COALESCE(vm.DownVotes,0) AS QuestionDownVotes,
+         COALESCE(vm.Favorites,0) AS QuestionFavorites,
+         COALESCE(lk.DuplicatedByCount,0) AS DuplicatedByCount,
+         COALESCE(lk.LinkedByCount,0) AS LinkedByCount,
+         ob.OwnerId,
+         ob.OwnerName,
+         ob.OwnerGoldBadges,
+         ob.OwnerSilverBadges,
+         ob.OwnerBronzeBadges,
+         COALESCE(tm.TagCount,0) AS TagCount,
+         COALESCE(tm.TitleLength,0) AS TitleLength,
+         COALESCE(tm.BodyLength,0) AS BodyLength,
+         COALESCE(h.EditRevisions,0) AS EditRevisions,
+         COALESCE(h.CloseReopenEvents,0) AS CloseReopenEvents
+  FROM QuestionBase q
+  LEFT JOIN AnswersAgg a ON a.QuestionId = q.QuestionId
+  LEFT JOIN CommentsAgg c ON c.QuestionId = q.QuestionId
+  LEFT JOIN VoteMix vm ON vm.PostId = q.QuestionId
+  LEFT JOIN LinksAgg lk ON lk.QuestionId = q.QuestionId
+  LEFT JOIN OwnerBadges ob ON ob.QuestionId = q.QuestionId
+  LEFT JOIN TextMetrics tm ON tm.QuestionId = q.QuestionId
+  LEFT JOIN HistoryAgg h ON h.QuestionId = q.QuestionId
+),
+-- scoring function to rank questions for benchmarking hot vs aging posts
+Scored AS (
+  SELECT *,
+         -- recency score: favors recent activity
+         (EXTRACT(EPOCH FROM (now() - COALESCE(LastActivityDate, CreationDate))) / 86400.0) AS DaysSinceActivity,
+         -- engagement score: weighted combination of views, answers, comments, favorites, upvotes
+         (log(1 + NULLIF(ViewCount,0)::double precision) * 0.25
+          + GREATEST(0, TotalAnswersAgg) * 1.8
+          + GREATEST(0, CommentCountAgg) * 0.6
+          + GREATEST(0, QuestionFavorites) * 1.2
+          + GREATEST(0, QuestionUpVotes - QuestionDownVotes) * 1.5) AS EngagementRaw,
+         -- owner reputation proxy
+         (COALESCE(OwnerGoldBadges,0)*5 + COALESCE(OwnerSilverBadges,0)*2 + COALESCE(OwnerBronzeBadges,0)*0.5) AS OwnerBadgeScore,
+         -- complexity penalty/bonus
+         (CASE
+            WHEN TagCount <= 2 THEN -1
+            WHEN TagCount BETWEEN 3 AND 5 THEN 0.5
+            ELSE 1.2
+          END) * (CASE WHEN BodyLength < 300 THEN 0.8 WHEN BodyLength BETWEEN 300 AND 2000 THEN 1.0 ELSE 1.1 END) AS ComplexityFactor
+  FROM Combined
+),
+-- final selection: pick diverse sample across score percentiles, include heavy joins
+FinalSample AS (
+  SELECT s.*,
+         COALESCE(vm_ans.UpVotes,0) AS AnswersUpVotes,
+         COALESCE(vm_ans.DownVotes,0) AS AnswersDownVotes,
+         COALESCE(ansagg.DistinctAnswerers,0) AS DistinctAnswerers,
+         COALESCE(ph_ed.EditRevisions,0) AS TotalEditRevisions,
+         -- top 3 answerers by reputation for this question
+         (SELECT json_agg(row_to_json(t))
+          FROM (
+            SELECT u.Id AS UserId, u.DisplayName, u.Reputation, COUNT(a.Id) AS AnswersCount, MAX(a.Score) AS BestScore
+            FROM Posts a
+            JOIN Users u ON u.Id = a.OwnerUserId
+            WHERE a.ParentId = s.QuestionId AND a.PostTypeId = 2 AND a.OwnerUserId IS NOT NULL
+            GROUP BY u.Id, u.DisplayName, u.Reputation
+            ORDER BY AnswersCount DESC, u.Reputation DESC
+            LIMIT 3
+          ) t) AS TopAnswerers,
+         -- trending tags parse
+         (SELECT array_agg(distinct tg) FROM (
+            SELECT unnest(string_to_array(substring(s.Tags FROM 2 FOR length(s.Tags)-2), '><')) AS tg
+          ) t) AS TagList
+  FROM Scored s
+  LEFT JOIN (
+    SELECT v.PostId,
+           SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+           SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes
+    FROM Votes v
+    LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY v.PostId
+  ) vm_ans ON vm_ans.PostId = s.QuestionId
+  LEFT JOIN AnswersAgg ansagg ON ansagg.QuestionId = s.QuestionId
+  LEFT JOIN (
+    SELECT ph.PostId, COUNT(*) AS EditRevisions FROM PostHistory ph WHERE ph.PostHistoryTypeId IN (4,5,6,7,8,9,24) GROUP BY ph.PostId
+  ) ph_ed ON ph_ed.PostId = s.QuestionId
+)
+-- final output: stratified sampling across percentiles to stress plans
+SELECT f.QuestionId,
+       f.Title,
+       f.CreationDate,
+       f.OwnerId,
+       f.OwnerName,
+       f.ViewCount,
+       f.Score,
+       f.TotalAnswersAgg,
+       f.CommentCountAgg,
+       ROUND(f.EngagementRaw,4) AS EngagementRaw,
+       f.OwnerBadgeScore,
+       f.TagCount,
+       f.TitleLength,
+       f.BodyLength,
+       f.EditRevisions,
+       f.CloseReopenEvents,
+       ROUND(f.DaysSinceActivity::numeric,2) AS DaysSinceActivity,
+       f.ComplexityFactor,
+       COALESCE(f.QuestionsUpVotes,0) AS IgnoredUpvotesPlaceholder,
+       f.QuestionUpVotes,
+       f.QuestionDownVotes,
+       f.QuestionFavorites,
+       f.DuplicatedByCount,
+       f.LinkedByCount,
+       f.AnswersUpVotes,
+       f.AnswersDownVotes,
+       f.DistinctAnswerers,
+       f.TotalEditRevisions,
+       f.TopAnswerers,
+       f.TagList
+FROM (
+  SELECT *, NTILE(10) OVER (ORDER BY EngagementRaw DESC NULLS LAST) AS decile_rank,
+            ROW_NUMBER() OVER (PARTITION BY NTILE(10) OVER (ORDER BY EngagementRaw DESC NULLS LAST) ORDER BY random()) AS rn_in_decile
+  FROM FinalSample
+) f
+WHERE f.rn_in_decile <= 10
+ORDER BY f.decile_rank, f.EngagementRaw DESC
+LIMIT 100;

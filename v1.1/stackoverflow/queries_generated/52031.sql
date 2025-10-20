@@ -1,0 +1,71 @@
+-- {"query": "52031.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-code-fast", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2165, "output_tokens": 636} 
+WITH monthly_stats AS (
+    SELECT 
+        DATE_TRUNC('month', p.CreationDate) AS month,
+        p.OwnerUserId,
+        COUNT(DISTINCT p.Id) AS post_count,
+        SUM(p.Score) AS total_score,
+        SUM(p.ViewCount) AS total_views,
+        COUNT(DISTINCT c.Id) AS comment_count,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvote_count,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvote_count,
+        COUNT(DISTINCT b.Id) AS badge_count
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN Badges b ON p.OwnerUserId = b.UserId
+    WHERE p.PostTypeId = 1  -- Questions only
+    GROUP BY DATE_TRUNC('month', p.CreationDate), p.OwnerUserId
+),
+ranked_users AS (
+    SELECT 
+        ms.month,
+        ms.OwnerUserId,
+        u.DisplayName,
+        u.Location,
+        u.Reputation,
+        ms.post_count,
+        ms.total_score,
+        ms.total_views,
+        ms.comment_count,
+        ms.upvote_count,
+        ms.downvote_count,
+        ms.badge_count,
+        (ms.upvote_count + 1) / (ms.downvote_count + 1) AS vote_ratio,
+        RANK() OVER (PARTITION BY ms.month ORDER BY ms.post_count DESC, ms.total_score DESC, vote_ratio DESC) AS activity_rank
+    FROM monthly_stats ms
+    JOIN Users u ON ms.OwnerUserId = u.Id
+),
+top_users AS (
+    SELECT *
+    FROM ranked_users
+    WHERE activity_rank <= 10
+),
+tag_popularity AS (
+    SELECT 
+        DATE_TRUNC('month', p.CreationDate) AS month,
+        UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tag,
+        COUNT(*) AS question_count,
+        AVG(p.Score) AS avg_score,
+        SUM(p.ViewCount) AS total_views
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    GROUP BY DATE_TRUNC('month', p.CreationDate), tag
+),
+final_report AS (
+    SELECT 
+        tp.month,
+        tp.tag,
+        tp.question_count,
+        tp.avg_score,
+        tp.total_views,
+        STRING_AGG(tu.DisplayName, '; ') AS top_user_names,
+        SUM(tu.post_count) AS top_users_total_posts,
+        AVG(tu.Reputation) AS avg_top_user_rep
+    FROM tag_popularity tp
+    JOIN top_users tu ON tp.month = tu.month
+    WHERE tp.question_count > 10
+    GROUP BY tp.month, tp.tag, tp.question_count, tp.avg_score, tp.total_views
+)
+SELECT * FROM final_report
+ORDER BY month DESC, question_count DESC, avg_score DESC;

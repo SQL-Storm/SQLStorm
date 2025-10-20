@@ -1,0 +1,29 @@
+WITH TopUserTags AS (
+    SELECT u.Id, u.DisplayName, t.TagName, 
+           COUNT(p.Id) AS PostCount,
+           RANK() OVER (PARTITION BY u.Id ORDER BY COUNT(p.Id) DESC) AS TagRank
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    JOIN (
+        SELECT unnest(string_to_array(substring(Tags FROM 2 FOR char_length(Tags)-2), '><')) AS TagName
+        FROM Posts
+    ) t ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE u.Reputation > 1000 AND p.PostTypeId = 1
+    GROUP BY u.Id, u.DisplayName, t.TagName
+)
+SELECT 
+    tut.Id,
+    tut.DisplayName,
+    STRING_AGG(tut.TagName || ' (' || CAST(tut.PostCount AS text) || ')', ', ' ORDER BY tut.PostCount DESC) AS TopTags,
+    (SELECT AVG(CAST(v.Score AS numeric))
+     FROM Posts p
+     JOIN Votes v ON p.Id = v.PostId 
+     WHERE p.OwnerUserId = tut.Id AND v.VoteTypeId = 2) AS AvgUpvotes,
+    (SELECT COUNT(*) 
+     FROM Posts p 
+     WHERE p.OwnerUserId = tut.Id AND p.Score > 10) AS HighScoreCount
+FROM TopUserTags tut
+WHERE tut.TagRank <= 3
+GROUP BY tut.Id, tut.DisplayName, tut.TagRank
+ORDER BY HighScoreCount DESC
+LIMIT 100;

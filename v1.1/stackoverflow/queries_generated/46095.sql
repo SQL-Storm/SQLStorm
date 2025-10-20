@@ -1,0 +1,122 @@
+-- {"query": "46095.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 217930, "output_tokens": 175063} 
+
+WITH UserEngagementMetrics AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) AS QuestionScore,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) AS AnswerScore,
+        AVG(p.ViewCount) AS AvgViewCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= CURRENT_TIMESTAMP - INTERVAL '3 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) > 5
+),
+TagPerformance AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagUsageCount,
+        AVG(p.Score) AS AvgQuestionScore,
+        AVG(p.ViewCount) AS AvgViewCount,
+        COUNT(DISTINCT p.OwnerUserId) AS UniqueContributors,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswer,
+        COUNT(DISTINCT a.Id) AS TotalAnswers
+    FROM Tags t
+    INNER JOIN Posts p ON p.PostTypeId = 1 
+        AND p.Tags LIKE '%<' || t.TagName || '>%'
+    LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    WHERE p.CreationDate >= CURRENT_TIMESTAMP - INTERVAL '2 years'
+    GROUP BY t.Id, t.TagName, t.Count
+    HAVING COUNT(p.Id) >= 100
+),
+QuestionAnswerChain AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CreationDate AS QuestionDate,
+        u1.DisplayName AS QuestionAuthor,
+        u1.Reputation AS AuthorReputation,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerDate,
+        u2.DisplayName AS AnswerAuthor,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600 AS HoursToAnswer,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank,
+        COUNT(c.Id) AS AnswerCommentCount,
+        STRING_AGG(DISTINCT vt.Name, ', ') AS VoteTypesReceived
+    FROM Posts q
+    INNER JOIN Posts a ON q.Id = a.ParentId AND a.PostTypeId = 2
+    INNER JOIN Users u1 ON q.OwnerUserId = u1.Id
+    INNER JOIN Users u2 ON a.OwnerUserId = u2.Id
+    LEFT JOIN Comments c ON a.Id = c.PostId
+    LEFT JOIN Votes v ON a.Id = v.PostId
+    LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE q.PostTypeId = 1
+        AND q.CreationDate >= CURRENT_TIMESTAMP - INTERVAL '1 year'
+        AND q.Score >= 5
+        AND a.Score >= 0
+    GROUP BY q.Id, q.Title, q.Score, q.ViewCount, q.AnswerCount, q.CreationDate,
+             u1.DisplayName, u1.Reputation, a.Id, a.Score, a.CreationDate, u2.DisplayName
+),
+EditActivity AS (
+    SELECT 
+        ph.PostId,
+        COUNT(DISTINCT ph.Id) AS EditCount,
+        COUNT(DISTINCT ph.UserId) AS UniqueEditors,
+        MAX(ph.CreationDate) AS LastEditDate,
+        COUNT(DISTINCT CASE WHEN pht.Name LIKE '%Body%' THEN ph.Id END) AS BodyEdits,
+        COUNT(DISTINCT CASE WHEN pht.Name LIKE '%Title%' THEN ph.Id END) AS TitleEdits
+    FROM PostHistory ph
+    INNER JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    WHERE ph.CreationDate >= CURRENT_TIMESTAMP - INTERVAL '1 year'
+        AND pht.Name IN ('Edit Body', 'Edit Title', 'Edit Tags', 'Initial Body', 'Initial Title')
+    GROUP BY ph.PostId
+    HAVING COUNT(ph.Id) >= 2
+)
+SELECT 
+    tp.TagName,
+    tp.AvgQuestionScore AS TagAvgScore,
+    tp.UniqueContributors,
+    ROUND(CAST(tp.QuestionsWithAcceptedAnswer AS NUMERIC) / NULLIF(tp.TagUsageCount, 0) * 100, 2) AS AcceptanceRate,
+    uem.DisplayName AS TopContributor,
+    uem.Reputation,
+    uem.QuestionScore + uem.AnswerScore AS TotalScore,
+    qac.Title AS BestQuestionTitle,
+    qac.QuestionScore,
+    qac.ViewCount,
+    qac.AnswerAuthor AS BestAnswerAuthor,
+    qac.AnswerScore AS BestAnswerScore,
+    ROUND(qac.HoursToAnswer::NUMERIC, 2) AS HoursToTopAnswer,
+    ea.EditCount,
+    ea.UniqueEditors,
+    COUNT(DISTINCT pl.RelatedPostId) AS RelatedPostsCount,
+    AVG(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvoteRatio
+FROM TagPerformance tp
+INNER JOIN QuestionAnswerChain qac ON qac.QuestionScore >= tp.AvgQuestionScore * 0.8
+INNER JOIN UserEngagementMetrics uem ON qac.QuestionAuthor = uem.DisplayName
+LEFT JOIN EditActivity ea ON ea.PostId = qac.QuestionId
+LEFT JOIN PostLinks pl ON pl.PostId = qac.QuestionId AND pl.LinkTypeId = 1
+LEFT JOIN Votes v ON v.PostId = qac.QuestionId AND v.VoteTypeId IN (2, 3)
+WHERE qac.AnswerRank = 1
+    AND tp.AvgViewCount > 500
+    AND uem.PostCount >= 10
+GROUP BY tp.TagName, tp.AvgQuestionScore, tp.UniqueContributors, tp.QuestionsWithAcceptedAnswer,
+         tp.TagUsageCount, uem.DisplayName, uem.Reputation, uem.QuestionScore, uem.AnswerScore,
+         qac.Title, qac.QuestionScore, qac.ViewCount, qac.AnswerAuthor, qac.AnswerScore,
+         qac.HoursToAnswer, ea.EditCount, ea.UniqueEditors
+HAVING COUNT(DISTINCT pl.RelatedPostId) >= 1
+ORDER BY tp.AvgQuestionScore DESC, qac.ViewCount DESC, uem.Reputation DESC
+LIMIT 100;

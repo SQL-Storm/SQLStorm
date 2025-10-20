@@ -1,0 +1,147 @@
+WITH UserGoldBadges AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(b.Id) AS GoldBadgeCount
+    FROM 
+        Users u
+    LEFT JOIN 
+        Badges b ON u.Id = b.UserId AND b.Class = 1
+    GROUP BY 
+        u.Id
+),
+UserQuestions AS (
+    SELECT 
+        OwnerUserId AS UserId,
+        COUNT(Id) AS QuestionCount,
+        SUM(Score) AS TotalQuestionScore,
+        SUM(ViewCount) AS TotalViews
+    FROM 
+        Posts
+    WHERE 
+        PostTypeId = 1
+    GROUP BY 
+        OwnerUserId
+),
+UserAnswers AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        COUNT(p.Id) AS AnswerCount,
+        SUM(p.Score) AS TotalAnswerScore,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedAnswers
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Posts q ON p.ParentId = q.Id
+    WHERE 
+        p.PostTypeId = 2
+    GROUP BY 
+        p.OwnerUserId
+),
+UserVotes AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes
+    FROM 
+        Votes v
+    JOIN 
+        Posts p ON v.PostId = p.Id
+    WHERE 
+        p.OwnerUserId IS NOT NULL
+    GROUP BY 
+        p.OwnerUserId
+),
+UserTags AS (
+    SELECT 
+        t.OwnerUserId AS UserId,
+        t.tag AS Tag,
+        COUNT(*) AS TagCount
+    FROM (
+        SELECT
+            p.OwnerUserId,
+            -- replace DBMS-specific functions with standard SQL equivalents:
+            -- remove the leading '<' and trailing '>' then split on '><'
+            unnest(string_to_array(substring(p.Tags FROM 2 FOR (length(p.Tags) - 2)), '><')) AS tag
+        FROM Posts p
+        WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    ) t
+    GROUP BY 
+        t.OwnerUserId, t.tag
+),
+UserTopTags AS (
+    SELECT 
+        UserId,
+        Tag,
+        TagCount,
+        ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY TagCount DESC) AS rn
+    FROM 
+        UserTags
+),
+UserEdits AS (
+    SELECT 
+        ph.UserId,
+        COUNT(ph.Id) AS EditCount
+    FROM 
+        PostHistory ph
+    WHERE 
+        ph.PostHistoryTypeId IN (4,5,6,7,8,9)
+    GROUP BY 
+        ph.UserId
+)
+SELECT 
+    u.DisplayName,
+    ugb.GoldBadgeCount,
+    uq.QuestionCount,
+    ua.AnswerCount,
+    uv.Upvotes,
+    uv.Downvotes,
+    utt.Tag AS TopTag,
+    utt.TagCount AS TopTagCount,
+    ue.EditCount,
+    u.Reputation,
+    COALESCE(uq.TotalQuestionScore,0) + COALESCE(ua.TotalAnswerScore,0) AS TotalScore,
+    COALESCE(uq.TotalViews,0) AS TotalViews,
+    COALESCE(ua.AcceptedAnswers,0) AS AcceptedAnswers,
+    RANK() OVER (ORDER BY ugb.GoldBadgeCount DESC, u.Reputation DESC) AS OverallRank
+FROM 
+    Users u
+JOIN 
+    UserGoldBadges ugb ON u.Id = ugb.UserId
+LEFT JOIN 
+    UserQuestions uq ON u.Id = uq.UserId
+LEFT JOIN 
+    UserAnswers ua ON u.Id = ua.UserId
+LEFT JOIN 
+    UserVotes uv ON u.Id = uv.UserId
+LEFT JOIN 
+    UserTopTags utt ON u.Id = utt.UserId AND utt.rn = 1
+LEFT JOIN 
+    UserEdits ue ON u.Id = ue.UserId
+WHERE 
+    ugb.GoldBadgeCount > 0
+    AND u.Reputation > 10000
+GROUP BY
+    u.DisplayName,
+    ugb.GoldBadgeCount,
+    uq.QuestionCount,
+    ua.AnswerCount,
+    uv.Upvotes,
+    uv.Downvotes,
+    utt.Tag,
+    utt.TagCount,
+    ue.EditCount,
+    u.Reputation,
+    uq.TotalQuestionScore,
+    ua.TotalAnswerScore,
+    uq.TotalViews,
+    ua.AcceptedAnswers,
+    u.Id,
+    ugb.UserId,
+    uq.UserId,
+    ua.UserId,
+    uv.UserId,
+    utt.UserId,
+    ue.UserId
+ORDER BY 
+    ugb.GoldBadgeCount DESC, u.Reputation DESC
+LIMIT 100;

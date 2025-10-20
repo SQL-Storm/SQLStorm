@@ -1,0 +1,117 @@
+WITH TopQuestionAuthors AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        AVG(p.Score) AS AvgScore,
+        SUM(p.ViewCount) AS TotalViews
+    FROM Users u
+    INNER JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1 
+        AND p.CreationDate >= TIMESTAMP '2020-01-01'
+        AND p.Score >= 5
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+AnswerMetrics AS (
+    SELECT 
+        a.ParentId AS QuestionId,
+        COUNT(DISTINCT a.Id) AS AnswerCount,
+        MAX(a.Score) AS BestAnswerScore,
+        AVG(a.Score) AS AvgAnswerScore,
+        COUNT(DISTINCT a.OwnerUserId) AS UniqueAnswerers,
+        SUM(CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS HasAccepted
+    FROM Posts a
+    INNER JOIN Posts q ON a.ParentId = q.Id
+    WHERE a.PostTypeId = 2
+        AND q.PostTypeId = 1
+        AND a.CreationDate >= TIMESTAMP '2020-01-01'
+    GROUP BY a.ParentId
+),
+TagAnalysis AS (
+    SELECT 
+        UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName,
+        p.Id AS PostId,
+        p.Score,
+        p.ViewCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+        AND p.Tags IS NOT NULL
+        AND p.CreationDate >= TIMESTAMP '2020-01-01'
+),
+VotePatterns AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS Favorites,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN 1 ELSE 0 END) AS Bounties,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN COALESCE(v.BountyAmount,0) ELSE 0 END) AS TotalBountyAmount
+    FROM Votes v
+    WHERE v.CreationDate >= TIMESTAMP '2020-01-01'
+    GROUP BY v.PostId
+),
+CommentActivity AS (
+    SELECT 
+        c.PostId,
+        COUNT(*) AS CommentCount,
+        COUNT(DISTINCT c.UserId) AS UniqueCommenters,
+        AVG(c.Score) AS AvgCommentScore,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    WHERE c.CreationDate >= TIMESTAMP '2020-01-01'
+    GROUP BY c.PostId
+),
+BadgeStats AS (
+    SELECT 
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        SUM(CASE WHEN b.TagBased = TRUE THEN 1 ELSE 0 END) AS TagBasedBadges
+    FROM Badges b
+    WHERE b.Date >= TIMESTAMP '2020-01-01'
+    GROUP BY b.UserId
+),
+TopTagsList AS (
+    SELECT TagName
+    FROM TagAnalysis
+    GROUP BY TagName
+    ORDER BY COUNT(*) DESC
+    LIMIT 3
+)
+SELECT 
+    tqa.DisplayName,
+    tqa.Reputation,
+    tqa.QuestionCount,
+    ROUND(CAST(tqa.AvgScore AS numeric), 2) AS AvgQuestionScore,
+    tqa.TotalViews,
+    ROUND(AVG(am.AnswerCount::numeric), 2) AS AvgAnswersPerQuestion,
+    ROUND(AVG(am.BestAnswerScore::numeric), 2) AS AvgBestAnswerScore,
+    ROUND(AVG(am.AvgAnswerScore::numeric), 2) AS AvgOfAvgAnswerScores,
+    LISTAGG(ta.TagName, ', ') WITHIN GROUP (ORDER BY ta.TagName) FILTER (WHERE ta.TagName IN (SELECT TagName FROM TopTagsList)) AS TopTags,
+    ROUND(AVG(vp.UpVotes::numeric), 2) AS AvgUpVotes,
+    ROUND(AVG(vp.DownVotes::numeric), 2) AS AvgDownVotes,
+    SUM(vp.TotalBountyAmount) AS TotalBountiesReceived,
+    ROUND(AVG(ca.CommentCount::numeric), 2) AS AvgCommentsPerPost,
+    COALESCE(bs.GoldBadges, 0) AS GoldBadges,
+    COALESCE(bs.SilverBadges, 0) AS SilverBadges,
+    COALESCE(bs.BronzeBadges, 0) AS BronzeBadges,
+    COUNT(DISTINCT pl.RelatedPostId) AS LinkedPosts,
+    ROUND(AVG(EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate))/86400::numeric), 2) AS AvgDaysActive
+FROM TopQuestionAuthors tqa
+INNER JOIN Posts p ON tqa.Id = p.OwnerUserId AND p.PostTypeId = 1
+LEFT JOIN AnswerMetrics am ON p.Id = am.QuestionId
+LEFT JOIN TagAnalysis ta ON p.Id = ta.PostId
+LEFT JOIN VotePatterns vp ON p.Id = vp.PostId
+LEFT JOIN CommentActivity ca ON p.Id = ca.PostId
+LEFT JOIN BadgeStats bs ON tqa.Id = bs.UserId
+LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+WHERE p.CreationDate >= TIMESTAMP '2020-01-01'
+GROUP BY 
+    tqa.Id, tqa.DisplayName, tqa.Reputation, tqa.QuestionCount, tqa.AvgScore, tqa.TotalViews,
+    bs.GoldBadges, bs.SilverBadges, bs.BronzeBadges, tqa.Id
+HAVING COUNT(DISTINCT p.Id) >= 5
+ORDER BY tqa.Reputation DESC, tqa.QuestionCount DESC
+LIMIT 100;

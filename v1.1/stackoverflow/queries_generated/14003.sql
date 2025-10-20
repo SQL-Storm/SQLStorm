@@ -1,4 +1,4 @@
--- {"query": "14003.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 9340, "output_tokens": 4145} 
+-- {"query": "14003.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 9340, "output_tokens": 4145} 
 
 WITH cte_top_users AS (
   SELECT u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes, 

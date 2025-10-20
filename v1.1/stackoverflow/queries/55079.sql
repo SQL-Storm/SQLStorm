@@ -1,0 +1,97 @@
+WITH TagQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        t.TagName,
+        p.CreationDate
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><')) AS tag
+    ) AS tags
+    JOIN Tags t ON t.TagName = tags.tag
+    WHERE p.PostTypeId = 1
+),
+Answers AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+TagAnswers AS (
+    SELECT
+        tq.TagName,
+        a.AnswerId,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate
+    FROM TagQuestions tq
+    JOIN Answers a ON a.QuestionId = tq.QuestionId
+),
+UserStats AS (
+    SELECT
+        ta.TagName,
+        ta.OwnerUserId,
+        COUNT(*) AS AnswerCount,
+        SUM(ta.Score) AS TotalScore,
+        ROW_NUMBER() OVER (PARTITION BY ta.TagName ORDER BY SUM(ta.Score) DESC) AS Rank
+    FROM TagAnswers ta
+    GROUP BY ta.TagName, ta.OwnerUserId
+),
+TopUsers AS (
+    SELECT *
+    FROM UserStats
+    WHERE Rank <= 5
+),
+VoteAgg AS (
+    SELECT
+        v.PostId,
+        v.VoteTypeId,
+        COUNT(*) AS VoteCount
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2, 3)
+    GROUP BY v.PostId, v.VoteTypeId
+),
+AnswerVotes AS (
+    SELECT
+        a.AnswerId,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN v.VoteCount END), 0) AS UpVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN v.VoteCount END), 0) AS DownVotes
+    FROM Answers a
+    LEFT JOIN VoteAgg v ON v.PostId = a.AnswerId
+    GROUP BY a.AnswerId
+),
+Final AS (
+    SELECT
+        tu.TagName,
+        u.DisplayName,
+        tu.AnswerCount,
+        tu.TotalScore,
+        av.UpVotes,
+        av.DownVotes
+    FROM TopUsers tu
+    JOIN Users u ON u.Id = tu.OwnerUserId
+    LEFT JOIN LATERAL (
+        SELECT av2.UpVotes, av2.DownVotes
+        FROM AnswerVotes av2
+        WHERE av2.AnswerId = (
+            SELECT a.AnswerId
+            FROM TagAnswers a
+            WHERE a.TagName = tu.TagName
+              AND a.OwnerUserId = tu.OwnerUserId
+            ORDER BY a.Score DESC
+            LIMIT 1
+        )
+    ) av ON TRUE
+)
+SELECT
+    TagName,
+    DisplayName,
+    AnswerCount,
+    TotalScore,
+    UpVotes,
+    DownVotes
+FROM Final
+ORDER BY TagName, TotalScore DESC;

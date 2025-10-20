@@ -1,0 +1,147 @@
+WITH RECURSIVE TagHierarchy AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        CAST(t.TagName AS VARCHAR(1000)) AS TagPath
+    FROM Tags t
+    WHERE t.Count > 10000
+
+    UNION ALL
+
+    SELECT 
+        t2.TagName,
+        t2.Count,
+        th.Level + 1,
+        CAST(th.TagPath || ' -> ' || t2.TagName AS VARCHAR(1000))
+    FROM Tags t2
+    INNER JOIN TagHierarchy th ON 1=1
+    INNER JOIN Posts p1 ON p1.Tags LIKE '%' || '<' || th.TagName || '>' || '%'
+    INNER JOIN Posts p2 ON p2.Id = p1.Id AND p2.Tags LIKE '%' || '<' || t2.TagName || '>' || '%'
+    WHERE th.Level < 3
+      AND t2.Count > 5000
+      AND t2.TagName != th.TagName
+      AND th.TagPath NOT LIKE '%' || t2.TagName || '%'
+),
+UserExpertise AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        SUBSTRING(p.Tags FROM 2 FOR POSITION('>' IN p.Tags) - 2) AS PrimaryTag,
+        COUNT(DISTINCT p.Id) AS AnswerCount,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AvgScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS MedianScore,
+        COUNT(DISTINCT CASE WHEN p.Score >= 10 THEN p.Id END) AS GreatAnswers,
+        COUNT(DISTINCT CASE WHEN p.AcceptedAnswerId = p.Id THEN p.Id END) AS AcceptedAnswers,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 5 THEN 1 ELSE 0 END) AS EditCount,
+        MIN(p.CreationDate) AS FirstAnswer,
+        MAX(p.CreationDate) AS LastAnswer,
+        EXTRACT(DAY FROM (MAX(p.CreationDate) - MIN(p.CreationDate))) AS DaysActive
+    FROM Users u
+    INNER JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 2
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE p.Score > 0
+      AND p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '2 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, SUBSTRING(p.Tags FROM 2 FOR POSITION('>' IN p.Tags) - 2)
+    HAVING COUNT(DISTINCT p.Id) >= 5
+),
+QuestionQuality AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.CommentCount,
+        q.CreationDate AS QuestionDate,
+        q.Tags,
+        CASE 
+            WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN q.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            WHEN q.AnswerCount > 0 THEN 'HasAnswers'
+            ELSE 'Unanswered'
+        END AS Status,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS Upvotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS Downvotes,
+        COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.Id END) AS DuplicateLinks,
+        COUNT(DISTINCT CASE WHEN c.Score > 5 THEN c.Id END) AS HighScoreComments,
+        EXTRACT(HOUR FROM q.CreationDate) AS PostHour,
+        EXTRACT(DOW FROM q.CreationDate) AS PostDayOfWeek,
+        LENGTH(q.Body) AS BodyLength,
+        (LENGTH(q.Body) - LENGTH(REPLACE(q.Body, '<code>', ''))) / 6 AS CodeBlockCount
+    FROM Posts q
+    LEFT JOIN Votes v ON q.Id = v.PostId
+    LEFT JOIN PostLinks pl ON q.Id = pl.PostId
+    LEFT JOIN Comments c ON q.Id = c.PostId
+    WHERE q.PostTypeId = 1
+      AND q.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '1 year'
+    GROUP BY q.Id, q.OwnerUserId, q.Score, q.ViewCount, q.AnswerCount, 
+             q.FavoriteCount, q.CommentCount, q.CreationDate, q.Tags,
+             q.ClosedDate, q.AcceptedAnswerId, q.Body
+),
+BadgeProgression AS (
+    SELECT 
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Class AS BadgeClass,
+        b.Date AS BadgeDate,
+        b.TagBased,
+        LAG(b.Date) OVER (PARTITION BY b.UserId ORDER BY b.Date) AS PreviousBadgeDate,
+        LEAD(b.Date) OVER (PARTITION BY b.UserId ORDER BY b.Date) AS NextBadgeDate,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId, b.Class ORDER BY b.Date) AS BadgeRank,
+        COUNT(*) OVER (PARTITION BY b.UserId, b.Class) AS TotalBadgesInClass,
+        DENSE_RANK() OVER (ORDER BY b.Date) AS GlobalBadgeRank
+    FROM Badges b
+    WHERE b.Date >= CAST('2024-10-01' AS DATE) - INTERVAL '6 months'
+)
+SELECT 
+    ue.DisplayName,
+    ue.Reputation,
+    ue.PrimaryTag,
+    ue.AnswerCount,
+    ue.TotalScore,
+    ROUND(ue.AvgScore::numeric, 2) AS AvgAnswerScore,
+    ue.MedianScore,
+    ue.GreatAnswers,
+    ue.AcceptedAnswers,
+    ROUND(100.0 * ue.AcceptedAnswers / NULLIF(ue.AnswerCount, 0), 2) AS AcceptanceRate,
+    ue.DaysActive,
+    ROUND(ue.AnswerCount * 1.0 / NULLIF(ue.DaysActive, 0), 2) AS AnswersPerDay,
+    COUNT(DISTINCT qq.QuestionId) AS QuestionsAsked,
+    AVG(qq.QuestionScore) AS AvgQuestionScore,
+    AVG(qq.ViewCount) AS AvgViewCount,
+    AVG(qq.AnswerCount) AS AvgAnswersReceived,
+    SUM(CASE WHEN qq.Status = 'Answered' THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswer,
+    SUM(qq.Upvotes) AS TotalQuestionUpvotes,
+    AVG(qq.BodyLength) AS AvgQuestionLength,
+    AVG(qq.CodeBlockCount) AS AvgCodeBlocks,
+    COUNT(DISTINCT CASE WHEN bp.BadgeClass = 1 THEN bp.BadgeName END) AS GoldBadges,
+    COUNT(DISTINCT CASE WHEN bp.BadgeClass = 2 THEN bp.BadgeName END) AS SilverBadges,
+    COUNT(DISTINCT CASE WHEN bp.BadgeClass = 3 THEN bp.BadgeName END) AS BronzeBadges,
+    MAX(bp.BadgeDate) AS MostRecentBadge,
+    STRING_AGG(DISTINCT th.TagPath, ' | ' ORDER BY th.TagPath) AS RelatedTagPaths,
+    RANK() OVER (ORDER BY ue.TotalScore DESC) AS ScoreRank,
+    RANK() OVER (ORDER BY ue.Reputation DESC) AS ReputationRank,
+    -- compute 90th percentile per PrimaryTag using a subquery to avoid ordered-set OVER usage
+    (SELECT PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY q2.ViewCount)
+     FROM QuestionQuality q2
+     WHERE q2.OwnerUserId = qq.OwnerUserId OR q2.OwnerUserId IS NOT NULL
+       AND q2.OwnerUserId IN (
+           SELECT u2.Id FROM Users u2 WHERE SUBSTRING((SELECT p2.Tags FROM Posts p2 WHERE p2.Id = q2.QuestionId LIMIT 1) FROM 2 FOR POSITION('>' IN (SELECT p2.Tags FROM Posts p2 WHERE p2.Id = q2.QuestionId LIMIT 1)) - 2) = ue.PrimaryTag
+       )
+    ) AS Tag90thPercentileViews
+FROM UserExpertise ue
+LEFT JOIN QuestionQuality qq ON ue.UserId = qq.OwnerUserId
+LEFT JOIN BadgeProgression bp ON ue.UserId = bp.UserId
+LEFT JOIN TagHierarchy th ON ue.PrimaryTag = th.TagName
+WHERE ue.Reputation > 1000
+GROUP BY 
+    ue.UserId, ue.DisplayName, ue.Reputation, ue.PrimaryTag, 
+    ue.AnswerCount, ue.TotalScore, ue.AvgScore, ue.MedianScore,
+    ue.GreatAnswers, ue.AcceptedAnswers, ue.DaysActive
+HAVING COUNT(DISTINCT qq.QuestionId) > 0
+ORDER BY ue.TotalScore DESC, ue.Reputation DESC
+LIMIT 100;

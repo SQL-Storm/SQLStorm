@@ -1,0 +1,103 @@
+-- {"query": "79.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 727} 
+WITH Agg AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastEditorUserId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    -- window functions: rank posts by score within day and type
+    ROW_NUMBER() OVER (
+      PARTITION BY p.PostTypeId, CAST(p.CreationDate AS date)
+      ORDER BY p.Score DESC, p.ViewCount DESC
+    ) AS RankInDayVsType,
+    -- cumulative sum of views per day per type
+    SUM(p.ViewCount) OVER (
+      PARTITION BY p.PostTypeId, CAST(p.CreationDate AS date)
+      ORDER BY p.CreationDate
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS CumulativeViewsDay,
+    -- count of comments per post
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCountExplicit
+  FROM Posts p
+  WHERE p.CreationDate >= NOW() - INTERVAL '30 days'
+),
+Joined AS (
+  SELECT
+    a.PostId,
+    a.PostTypeId,
+    a.Title,
+    a.Tags,
+    a.CreationDate,
+    a.Score,
+    a.ViewCount,
+    a.OwnerUserId,
+    a.LastEditorUserId,
+    a.LastActivityDate,
+    a.CommentCount,
+    a.AnswerCount,
+    a.FavoriteCount,
+    a.ContentLicense,
+    a.RankInDayVsType,
+    a.CumulativeViewsDay,
+    a.CommentCountExplicit,
+    -- join with owner user and last editor for metadata
+    u.DisplayName AS OwnerDisplayName,
+    l.DisplayName AS LastEditorDisplayName
+  FROM Agg a
+  LEFT JOIN Users u ON u.Id = a.OwnerUserId
+  LEFT JOIN Users l ON l.Id = a.LastEditorUserId
+),
+Filtered AS (
+  SELECT
+    *
+  FROM Joined
+  WHERE
+    a.PostTypeId = 1 -- Questions
+    AND a.Score > 0
+    AND (a.Tags ILIKE '%performance%' OR a.Title ILIKE '%benchmark%')
+)
+SELECT
+  PostId,
+  PostTypeId,
+  Title,
+  Tags,
+  CreationDate,
+  Score,
+  ViewCount,
+  OwnerUserId,
+  OwnerDisplayName,
+  LastEditorUserId,
+  LastEditorDisplayName,
+  LastActivityDate,
+  CommentCount,
+  AnswerCount,
+  FavoriteCount,
+  ContentLicense,
+  RankInDayVsType,
+  CumulativeViewsDay,
+  CommentCountExplicit,
+  -- derived expressions
+  CASE
+    WHEN ViewCount > 1000 THEN 'High traffic'
+    WHEN ViewCount BETWEEN 100 AND 1000 THEN 'Medium traffic'
+    ELSE 'Low traffic'
+  END AS TrafficBand,
+  (Score + COALESCE(B.BountyAmount, 0)) AS ScoreWithBounty
+FROM Filtered a
+LEFT JOIN (
+  SELECT PostId, BountyAmount
+  FROM Votes v
+  WHERE v.VoteTypeId = 8 -- BountyStart (to associate bounty if any)
+) B ON B.PostId = a.PostId
+ORDER BY CumulativeViewsDay DESC, RankInDayVsType ASC
+LIMIT 200;

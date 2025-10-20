@@ -1,0 +1,65 @@
+WITH top_tags AS (
+    SELECT Tags.TagName, 
+           AVG(Posts.Score) AS avg_tag_score,
+           COUNT(DISTINCT Posts.Id) AS post_count
+    FROM Tags
+    JOIN Posts ON (
+        -- convert Posts.Tags like "<tag1><tag2>" into array of tag names
+        string_to_array(substring(Posts.Tags FROM 2 FOR length(Posts.Tags)-2), '><') @> ARRAY[Tags.TagName]::text[]
+        -- For SQL dialects that do not support ::, the explicit cast can be written using CAST:
+        -- CAST(ARRAY[Tags.TagName] AS text[])
+    )
+    WHERE Posts.PostTypeId = 1
+    GROUP BY Tags.TagName
+    HAVING COUNT(DISTINCT Posts.Id) > 1000
+    ORDER BY avg_tag_score DESC
+    LIMIT 50
+),
+user_activity AS (
+    SELECT 
+        Users.Id, 
+        Users.DisplayName, 
+        COUNT(DISTINCT Posts.Id) AS question_count,
+        COUNT(DISTINCT Votes.Id) AS vote_count,
+        MAX(Posts.CreationDate) AS last_post_date
+    FROM Users
+    LEFT JOIN Posts ON Users.Id = Posts.OwnerUserId
+    LEFT JOIN Votes ON Users.Id = Votes.UserId
+    WHERE Posts.PostTypeId = 1
+    GROUP BY Users.Id, Users.DisplayName
+),
+complex_metrics AS (
+    SELECT 
+        ua.Id, 
+        ua.DisplayName,
+        ua.question_count,
+        ua.vote_count,
+        ROUND(ua.vote_count * 1.0 / NULLIF(ua.question_count, 0), 2) AS engagement_ratio,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ua.Id AND b.Class = 1) AS gold_badges
+    FROM user_activity ua
+    WHERE ua.question_count > 10
+)
+SELECT 
+    tt.TagName, 
+    cm.DisplayName, 
+    cm.question_count, 
+    cm.vote_count, 
+    cm.engagement_ratio,
+    cm.gold_badges,
+    tt.avg_tag_score,
+    tt.post_count
+FROM top_tags tt
+CROSS JOIN complex_metrics cm
+WHERE cm.engagement_ratio > 2
+GROUP BY
+    tt.TagName,
+    tt.avg_tag_score,
+    tt.post_count,
+    cm.Id,
+    cm.DisplayName,
+    cm.question_count,
+    cm.vote_count,
+    cm.engagement_ratio,
+    cm.gold_badges
+ORDER BY cm.gold_badges DESC, cm.engagement_ratio DESC
+LIMIT 100;

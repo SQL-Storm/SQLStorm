@@ -1,0 +1,129 @@
+-- {"query": "57094.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2291, "output_tokens": 1255} 
+
+WITH TopUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) AS PostCount,
+        SUM(p.Score) AS TotalScore,
+        COUNT(DISTINCT a.Id) AS AnswerCount,
+        SUM(a.Score) AS TotalAnswerScore,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2       -- Answers
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation
+    ORDER BY
+        u.Reputation DESC
+    LIMIT 100
+),
+TopPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        COUNT(v.Id) AS VoteCount,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(DISTINCT l.RelatedPostId) AS RelatedPostCount,
+        COALESCE(MAX(ph.CreationDate), p.CreationDate) AS LastEditDate
+    FROM
+        Posts p
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN
+        PostLinks l ON p.Id = l.PostId
+    LEFT JOIN
+        PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (4, 5, 6, 7, 8) -- Title, Body, Tags edits
+    WHERE
+        p.PostTypeId = 1  -- Questions
+    GROUP BY
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId, u.DisplayName, p.AnswerCount, p.CommentCount, p.FavoriteCount
+    ORDER BY
+        p.Score DESC
+    LIMIT 100
+),
+ActiveTags AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        t.Count,
+        COUNT(p.Id) AS PostCount,
+        SUM(p.Score) AS TotalScore,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        COUNT(DISTINCT c.Id) AS CommentCount
+    FROM
+        Tags t
+    LEFT JOIN
+        Posts p ON t.Id = p.Id AND p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    GROUP BY
+        t.Id, t.TagName, t.Count
+    ORDER BY
+        t.Count DESC
+    LIMIT 50
+)
+SELECT
+    tu.UserId,
+    tu.DisplayName AS UserName,
+    tu.Reputation,
+    tu.PostCount AS UserPostCount,
+    tu.TotalScore AS UserTotalScore,
+    tp.PostId,
+    tp.PostTypeId,
+    tp.CreationDate AS PostCreationDate,
+    tp.Score AS PostScore,
+    tp.ViewCount,
+    tp.OwnerDisplayName,
+    tp.AnswerCount,
+    tp.CommentCount,
+    tp.FavoriteCount,
+    tp.VoteCount AS PostVoteCount,
+    tp.RelatedPostCount,
+    tp.LastEditDate,
+    at.TagId,
+    at.TagName,
+    at.Count AS TagCount,
+    at.PostCount AS TagPostCount,
+    at.TotalScore AS TagTotalScore,
+    at.VoteCount AS TagVoteCount,
+    at.CommentCount AS TagCommentCount
+FROM
+    TopUsers tu
+JOIN
+    TopPosts tp ON tu.UserId = tp.OwnerUserId
+JOIN
+    ActiveTags at
+        ON tp.Tags LIKE CONCAT('%<', at.TagName, '>%')
+WHERE (tp.PostTypeId IN (1, 2))       -- Limit to Questions and Answers
+ORDER BY
+    tu.Reputation DESC,
+    tp.Score DESC,
+    at.Count DESC
+LIMIT 20;

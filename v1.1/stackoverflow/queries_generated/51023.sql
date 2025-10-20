@@ -1,0 +1,109 @@
+-- {"query": "51023.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2129, "output_tokens": 1279} 
+
+WITH user_activity AS (
+    SELECT 
+        u.id AS user_id,
+        u.displayname,
+        u.reputation,
+        u.upvotes,
+        u.downvotes,
+        COUNT(DISTINCT p.id) AS total_posts,
+        SUM(CASE WHEN p.posttypeid = 1 THEN 1 ELSE 0 END) AS questions_asked,
+        SUM(CASE WHEN p.posttypeid = 2 THEN 1 ELSE 0 END) AS answers_given,
+        SUM(p.score) AS total_score,
+        AVG(p.score) AS avg_post_score,
+        COUNT(DISTINCT c.id) AS total_comments,
+        SUM(CASE WHEN v.votetypeid = 2 THEN 1 ELSE 0 END) AS upvotes_received,
+        SUM(CASE WHEN v.votetypeid = 3 THEN 1 ELSE 0 END) AS downvotes_received,
+        COUNT(DISTINCT b.id) AS badges_earned,
+        SUM(CASE WHEN b.class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+        SUM(CASE WHEN b.class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+        SUM(CASE WHEN b.class = 3 THEN 1 ELSE 0 END) AS bronze_badges
+    FROM users u
+    LEFT JOIN posts p ON u.id = p.owneruserid AND p.owneruserid IS NOT NULL
+    LEFT JOIN comments c ON u.id = c.userid AND c.userid IS NOT NULL
+    LEFT JOIN votes v ON p.id = v.postid AND v.votetypeid IN (2, 3)
+    LEFT JOIN badges b ON u.id = b.userid
+    GROUP BY u.id, u.displayname, u.reputation, u.upvotes, u.downvotes
+),
+tag_analytics AS (
+    SELECT 
+        t.tagname,
+        t.count AS tag_usage_count,
+        COUNT(DISTINCT p.id) AS questions_with_tag,
+        AVG(p.score) AS avg_question_score_with_tag,
+        SUM(p.viewcount) AS total_views_with_tag,
+        COUNT(DISTINCT ph.postid) AS total_edits_on_tagged_posts,
+        COUNT(CASE WHEN ph.posthistorytypeid IN (10, 11) THEN 1 END) AS close_reopen_events
+    FROM tags t
+    LEFT JOIN posts p ON p.tags LIKE '%' || t.tagname || '%'
+    LEFT JOIN posthistory ph ON p.id = ph.postid AND ph.posthistorytypeid IN (4, 5, 6, 10, 11)
+    WHERE t.count > 100
+    GROUP BY t.id, t.tagname, t.count
+),
+high_performers AS (
+    SELECT 
+        ua.user_id,
+        ua.displayname,
+        ua.reputation,
+        ua.total_posts,
+        ua.avg_post_score,
+        ta.tagname AS primary_tag,
+        ROW_NUMBER() OVER (PARTITION BY ta.tagname ORDER BY ua.reputation DESC, ua.avg_post_score DESC) AS tag_rank,
+        DENSE_RANK() OVER (ORDER BY ua.reputation DESC, ua.upvotes DESC) AS overall_rank
+    FROM user_activity ua
+    LEFT JOIN (
+        SELECT 
+            p.owneruserid,
+            SUBSTRING(p.tags FROM 2 FOR POSITION('><' IN p.tags || '><') - 2) AS primary_tag
+        FROM posts p 
+        WHERE p.posttypeid = 1 AND p.tags IS NOT NULL AND LENGTH(p.tags) > 0
+    ) first_tag ON ua.user_id = first_tag.owneruserid
+    LEFT JOIN tags ta ON first_tag.primary_tag = ta.tagname
+    WHERE ua.total_posts >= 10 AND ua.reputation > 1000
+),
+network_analysis AS (
+    SELECT 
+        hp1.displayname AS contributor1,
+        hp2.displayname AS contributor2,
+        pl.linktypeid,
+        COUNT(pl.id) AS link_count,
+        AVG(p1.score + p2.score) AS avg_combined_score,
+        STRING_AGG(DISTINCT ta1.tagname, ', ') AS tags_involved
+    FROM high_performers hp1
+    JOIN posts p1 ON hp1.user_id = p1.owneruserid
+    JOIN postlinks pl ON p1.id = pl.postid
+    JOIN posts p2 ON pl.relatedpostid = p2.id
+    JOIN high_performers hp2 ON p2.owneruserid = hp2.user_id
+    LEFT JOIN tags ta1 ON p1.tags LIKE '%' || ta1.tagname || '%'
+    LEFT JOIN tags ta2 ON p2.tags LIKE '%' || ta2.tagname || '%'
+    WHERE hp1.user_id < hp2.user_id
+    GROUP BY hp1.user_id, hp1.displayname, hp2.user_id, hp2.displayname, pl.linktypeid
+    HAVING COUNT(pl.id) >= 3
+)
+SELECT 
+    hp.displayname AS top_contributor,
+    hp.reputation,
+    hp.total_posts,
+    hp.avg_post_score,
+    hp.primary_tag,
+    hp.tag_rank,
+    hp.overall_rank,
+    COALESCE(na.link_count, 0) AS collaboration_strength,
+    COALESCE(na.tags_involved, '') AS collaboration_tags,
+    ta.avg_question_score_with_tag AS tag_performance,
+    ua.total_comments AS engagement_level,
+    (ua.gold_badges * 100 + ua.silver_badges * 10 + ua.bronze_badges) AS badge_value_score,
+    CASE 
+        WHEN hp.reputation > 10000 AND hp.avg_post_score > 10 THEN 'Elite'
+        WHEN hp.reputation > 5000 AND hp.total_posts > 50 THEN 'Veteran'
+        WHEN hp.reputation > 1000 THEN 'Active'
+        ELSE 'Emerging'
+    END AS contributor_tier
+FROM high_performers hp
+JOIN user_activity ua ON hp.user_id = ua.user_id
+LEFT JOIN tag_analytics ta ON hp.primary_tag = ta.tagname
+LEFT JOIN network_analysis na ON hp.displayname = na.contributor1
+WHERE hp.overall_rank <= 100
+ORDER BY hp.overall_rank, hp.reputation DESC, hp.avg_post_score DESC
+LIMIT 50;

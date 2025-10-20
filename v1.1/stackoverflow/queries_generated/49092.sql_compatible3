@@ -1,0 +1,223 @@
+WITH UserPostAggregates AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        SUM(CASE WHEN p.PostTypeId = 2 AND q.AcceptedAnswerId = p.Id THEN 1 ELSE 0 END) AS TotalAcceptedAnswersReceived,
+        SUM(COALESCE(p.ViewCount,0)) AS TotalPostViews,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Posts q ON p.ParentId = q.Id AND p.PostTypeId = 2
+    GROUP BY
+        u.Id, u.Reputation
+),
+UserCommentAndEditAggregates AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(c.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS TotalEditsMade
+    FROM
+        Users u
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        PostHistory ph ON u.Id = ph.UserId
+    GROUP BY
+        u.Id
+),
+UserBadgeAggregates AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 1 AND COALESCE(b.TagBased, FALSE) = TRUE THEN 1 ELSE 0 END) AS TagBasedGoldBadges
+    FROM
+        Users u
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id
+),
+UserTagContributions AS (
+    -- Standard-sql compatible splitting: replace dialect-specific split with a recursive splitter
+    WITH RecursiveTags AS (
+        SELECT
+            p.Id AS PostId,
+            p.OwnerUserId AS OwnerUserId,
+            p.Score,
+            p.Id AS AnswerId,
+            p.ParentId,
+            q.Tags,
+            CASE
+                WHEN p.PostTypeId = 2 AND p.OwnerUserId IS NOT NULL AND q.Tags IS NOT NULL THEN
+                    -- strip leading and trailing angle brackets if present
+                    CASE
+                        WHEN LEFT(q.Tags,1) = '<' AND RIGHT(q.Tags,1) = '>' THEN SUBSTRING(q.Tags FROM 2 FOR CHAR_LENGTH(q.Tags) - 2)
+                        ELSE q.Tags
+                    END
+                ELSE NULL
+            END AS remaining,
+            NULL::text AS tag -- dialects that don't support :: can ignore; will be overwritten below
+        FROM Posts p
+        JOIN Posts q ON p.ParentId = q.Id AND q.PostTypeId = 1
+        WHERE p.PostTypeId = 2 AND p.OwnerUserId IS NOT NULL AND q.Tags IS NOT NULL
+        UNION ALL
+        SELECT
+            rt.PostId,
+            rt.OwnerUserId,
+            rt.Score,
+            rt.AnswerId,
+            rt.ParentId,
+            rt.Tags,
+            CASE
+                WHEN POSITION('><' IN rt.remaining) > 0 THEN SUBSTRING(rt.remaining FROM POSITION('><' IN rt.remaining) + 2)
+                ELSE NULL
+            END AS remaining,
+            CASE
+                WHEN POSITION('><' IN rt.remaining) > 0 THEN LEFT(rt.remaining, POSITION('><' IN rt.remaining) - 1)
+                ELSE rt.remaining
+            END AS tag
+        FROM RecursiveTags rt
+        WHERE rt.remaining IS NOT NULL
+    )
+    SELECT
+        rt.OwnerUserId AS UserId,
+        TRIM(rt.tag) AS TagName,
+        SUM(COALESCE(rt.Score,0)) AS TagAnswerScore,
+        COUNT(rt.PostId) AS TagAnswerCount,
+        SUM(CASE WHEN q.AcceptedAnswerId = rt.AnswerId THEN 1 ELSE 0 END) AS TagAcceptedAnswerCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TagAnswerUpvotes
+    FROM
+        RecursiveTags rt
+    JOIN Posts q ON rt.ParentId = q.Id
+    LEFT JOIN Votes v ON rt.PostId = v.PostId AND v.VoteTypeId = 2
+    WHERE rt.tag IS NOT NULL AND TRIM(rt.tag) <> ''
+    GROUP BY rt.OwnerUserId, TRIM(rt.tag)
+    HAVING COUNT(rt.PostId) > 5
+),
+RankedUserTagContributions AS (
+    SELECT
+        UserId,
+        TagName,
+        TagAnswerScore,
+        TagAnswerCount,
+        TagAcceptedAnswerCount,
+        TagAnswerUpvotes,
+        ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY TagAnswerScore DESC, TagAcceptedAnswerCount DESC) AS Rn
+    FROM
+        UserTagContributions
+),
+UserPostedTagsRaw AS (
+    SELECT DISTINCT
+        p.OwnerUserId AS UserId,
+        TRIM(tag) AS TagName
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        -- dialect-agnostic: produce rows by splitting tags string using recursive method
+        SELECT tag FROM (
+            WITH RECURSIVE split(s, rest) AS (
+                SELECT
+                    CASE
+                        WHEN LEFT(p.Tags,1) = '<' AND RIGHT(p.Tags,1) = '>' THEN SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2)
+                        ELSE p.Tags
+                    END AS s,
+                    NULL::text AS rest
+                UNION ALL
+                SELECT
+                    CASE WHEN POSITION('><' IN s) > 0 THEN LEFT(s, POSITION('><' IN s)-1) ELSE s END,
+                    CASE WHEN POSITION('><' IN s) > 0 THEN SUBSTRING(s FROM POSITION('><' IN s)+2) ELSE NULL END
+                FROM split
+                WHERE s IS NOT NULL
+            )
+            SELECT s AS tag FROM split WHERE s IS NOT NULL
+        ) t
+    ) splitter
+    WHERE p.Tags IS NOT NULL AND p.OwnerUserId IS NOT NULL
+),
+UserModeratorTagContribution AS (
+    SELECT
+        upr.UserId,
+        COUNT(DISTINCT ti.Id) AS ModeratorOnlyTagsCount
+    FROM
+        UserPostedTagsRaw upr
+    JOIN
+        Tags ti ON upr.TagName = ti.TagName
+    WHERE
+        COALESCE(ti.IsModeratorOnly, FALSE) = TRUE
+    GROUP BY
+        upr.UserId
+),
+TopTagsPerUser AS (
+    SELECT
+        rtc.UserId,
+        -- array aggregation: some dialects use different array functions; keep standard-like aggregation as comma-separated string fallback
+        ARRAY_AGG(rtc.TagName ORDER BY rtc.TagAnswerScore DESC, rtc.TagAcceptedAnswerCount DESC) AS AllTopTags
+    FROM
+        RankedUserTagContributions rtc
+    WHERE rtc.Rn <= 3
+    GROUP BY rtc.UserId
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    upa.TotalPosts,
+    upa.TotalQuestions,
+    upa.TotalAnswers,
+    upa.TotalPostScore,
+    upa.TotalAcceptedAnswersReceived,
+    uca.TotalCommentsMade,
+    uca.TotalEditsMade,
+    uba.GoldBadges,
+    uba.TagBasedGoldBadges,
+    CASE
+      WHEN (CASE WHEN tt.AllTopTags IS NULL THEN 0 ELSE (CARDINALITY(tt.AllTopTags)) END) > 3 THEN
+           ARRAY[
+             tt.AllTopTags[1],
+             tt.AllTopTags[2],
+             tt.AllTopTags[3]
+           ]
+      ELSE tt.AllTopTags
+    END AS Top3TagsByAnswerScore,
+    AVG(CASE WHEN p_avg.PostTypeId = 1 THEN p_avg.Score END) AS AvgQuestionScore,
+    AVG(CASE WHEN p_avg.PostTypeId = 2 THEN p_avg.Score END) AS AvgAnswerScore,
+    SUM(CASE WHEN v_given.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesGiven,
+    SUM(CASE WHEN v_given.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesGiven,
+    COALESCE(umtc.ModeratorOnlyTagsCount, 0) AS ModeratorOnlyTagsWrittenAbout,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate AS UserLastAccessDate
+FROM
+    Users u
+JOIN
+    UserPostAggregates upa ON u.Id = upa.UserId
+JOIN
+    UserCommentAndEditAggregates uca ON u.Id = uca.UserId
+JOIN
+    UserBadgeAggregates uba ON u.Id = uba.UserId
+LEFT JOIN
+    Posts p_avg ON u.Id = p_avg.OwnerUserId
+LEFT JOIN
+    Votes v_given ON u.Id = v_given.UserId
+LEFT JOIN
+    UserModeratorTagContribution umtc ON u.Id = umtc.UserId
+LEFT JOIN
+    TopTagsPerUser tt ON u.Id = tt.UserId
+WHERE
+    u.Reputation > 10000
+    AND upa.TotalAnswers > 100
+    AND uba.GoldBadges > 0
+    AND EXISTS (SELECT 1 FROM RankedUserTagContributions rtc WHERE rtc.UserId = u.Id AND rtc.Rn <= 3)
+GROUP BY
+    u.Id, u.DisplayName, u.Reputation, upa.TotalPosts, upa.TotalQuestions, upa.TotalAnswers, upa.TotalPostScore, upa.TotalAcceptedAnswersReceived,
+    uca.TotalCommentsMade, uca.TotalEditsMade, uba.GoldBadges, uba.TagBasedGoldBadges, umtc.ModeratorOnlyTagsCount, u.CreationDate, u.LastAccessDate,
+    tt.AllTopTags
+ORDER BY
+    u.Reputation DESC, upa.TotalPostScore DESC, uba.GoldBadges DESC
+LIMIT 1000;

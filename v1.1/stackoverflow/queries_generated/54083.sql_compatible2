@@ -1,0 +1,99 @@
+WITH
+post_votes AS (
+    SELECT
+        pos.Id                AS post_id,
+        COUNT(*)              AS vote_cnt,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS upvotes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS downvotes,
+        SUM(CASE WHEN vt.Id = 5 THEN 1 ELSE 0 END) AS favorites
+    FROM Posts pos
+    JOIN Votes v       ON v.PostId = pos.Id
+    JOIN VoteTypes vt  ON vt.Id = v.VoteTypeId
+    GROUP BY pos.Id
+),
+user_stats AS (
+    SELECT
+        u.Id                                   AS user_id,
+        u.DisplayName                          AS user_name,
+        COUNT(p.Id)                            AS post_cnt,
+        SUM(p.Score)                           AS total_score,
+        AVG(p.Score)                           AS avg_score,
+        SUM(v.upvotes)                         AS total_up,
+        SUM(v.downvotes)                       AS total_down,
+        SUM(v.favorites)                       AS total_fav,
+        COUNT(DISTINCT b.Id)                   AS badge_cnt,
+        STRING_AGG(DISTINCT b.Name, '; ')      AS badge_names
+    FROM Users u
+    LEFT JOIN Posts p                ON p.OwnerUserId = u.Id
+    LEFT JOIN post_votes v           ON v.post_id   = p.Id
+    LEFT JOIN Badges b               ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+question_tags AS (
+    SELECT
+        p.Id          AS question_id,
+        tag_elem      AS tag
+    FROM Posts p,
+    LATERAL (
+      SELECT CASE
+               WHEN p.Tags IS NULL THEN NULL
+               ELSE TRIM(value) 
+             END AS tag_elem
+      FROM UNNEST(
+        CASE
+          WHEN p.Tags IS NULL THEN ARRAY[]::text
+          ELSE regexp_split_to_array(
+                 substr(p.Tags, 2, char_length(p.Tags)-2),
+                 '><')
+        END
+      ) AS t(value)
+    ) t
+    WHERE p.PostTypeId = 1
+),
+tag_flags AS (
+    SELECT
+        qt.question_id,
+        SUM(CASE WHEN qt.tag = 'sql'          THEN 1 ELSE 0 END) AS sql_tag,
+        SUM(CASE WHEN qt.tag = 'performance' THEN 1 ELSE 0 END) AS perf_tag,
+        SUM(CASE WHEN qt.tag = 'benchmark'   THEN 1 ELSE 0 END) AS bench_tag
+    FROM question_tags qt
+    GROUP BY qt.question_id
+),
+final_stats AS (
+    SELECT
+        us.user_id,
+        us.user_name,
+        us.post_cnt,
+        us.total_score,
+        us.avg_score,
+        us.total_up,
+        us.total_down,
+        us.total_fav,
+        us.badge_cnt,
+        us.badge_names,
+        SUM(COALESCE(tf.sql_tag,0))  AS sql_tq,
+        SUM(COALESCE(tf.perf_tag,0)) AS perf_tq,
+        SUM(COALESCE(tf.bench_tag,0)) AS bench_tq
+    FROM user_stats us
+    LEFT JOIN tag_flags tf ON tf.question_id = us.user_id
+    GROUP BY
+        us.user_id,
+        us.user_name,
+        us.post_cnt,
+        us.total_score,
+        us.avg_score,
+        us.total_up,
+        us.total_down,
+        us.total_fav,
+        us.badge_cnt,
+        us.badge_names
+)
+SELECT *
+FROM (
+    SELECT fs.*,
+           RANK() OVER (ORDER BY total_score DESC) AS score_rank,
+           NTILE(5) OVER (ORDER BY avg_score)    AS score_decile
+    FROM final_stats fs
+) sub
+WHERE score_rank <= 20
+ORDER BY total_score DESC, avg_score DESC;

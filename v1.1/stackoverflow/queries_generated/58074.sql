@@ -1,0 +1,39 @@
+-- {"query": "58074.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "deepseek-r1", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2033, "output_tokens": 1009} 
+
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT p.AcceptedAnswerId) AS AcceptedAnswers,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        AVG(LENGTH(c.Text)) AS AvgCommentLength,
+        (SELECT AVG(sub.CommentCount) FROM Posts sub WHERE sub.OwnerUserId = u.Id) AS AvgPostComments
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId IN (2, 3)
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 100000
+      AND p.CreationDate BETWEEN '2015-01-01' AND '2023-12-31'
+      AND b.Class = 1
+    GROUP BY u.Id
+    HAVING COUNT(p.Id) > 50
+)
+SELECT 
+    us.*,
+    RANK() OVER (ORDER BY (us.Upvotes - us.Downvotes) DESC) AS VoteRank,
+    (SELECT STRING_AGG(Tags.TagName, ', ' ORDER BY Tags.Count DESC LIMIT 5)
+     FROM Posts p2
+     JOIN unnest(string_to_array(substring(p2.Tags, 2, length(p2.Tags)-2), '><')) AS tag
+     ON true
+     JOIN Tags ON Tags.TagName = tag
+     WHERE p2.OwnerUserId = us.UserId AND p2.PostTypeId = 1
+    ) AS TopTags
+FROM UserStats us
+ORDER BY us.Reputation DESC
+LIMIT 100;

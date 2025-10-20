@@ -1,0 +1,53 @@
+WITH TaggedQuestions AS (
+    SELECT 
+        p.Id, 
+        p.Title, 
+        p.Score, 
+        p.ViewCount, 
+        p.CreationDate,
+        p.OwnerUserId,
+        COUNT(DISTINCT v.UserId) AS UniqueVoters,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        -- parse Tags like '<tag1><tag2>' into array length in standard SQL
+        CARDINALITY(string_to_array(SUBSTRING(p.Tags FROM 2 FOR (LENGTH(p.Tags) - 2)), '><')) AS TagCount
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (1, 2)
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate, p.OwnerUserId, p.Tags
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        AVG(p.Score) AS AvgQuestionScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.Reputation
+)
+SELECT 
+    tq.Id,
+    tq.Title,
+    tq.Score,
+    tq.ViewCount,
+    tq.UniqueVoters,
+    tq.CommentCount,
+    tq.TagCount,
+    tq.OwnerUserId,
+    ua.Reputation,
+    ua.QuestionCount,
+    ua.BadgeCount,
+    ua.AvgQuestionScore,
+    CASE 
+        WHEN tq.ViewCount > 1000 AND tq.Score > 10 THEN 'High Impact'
+        WHEN tq.ViewCount > 500 AND tq.Score > 5 THEN 'Medium Impact'
+        ELSE 'Low Impact'
+    END AS PostImpact
+FROM TaggedQuestions tq
+JOIN UserActivity ua ON tq.OwnerUserId = ua.UserId
+WHERE tq.CreationDate > DATE '2020-01-01'
+ORDER BY tq.UniqueVoters DESC, tq.Score DESC
+FETCH FIRST 100 ROWS ONLY;

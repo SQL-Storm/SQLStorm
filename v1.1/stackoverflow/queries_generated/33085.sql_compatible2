@@ -1,0 +1,86 @@
+SELECT
+    p.PostTypeId,
+    pt.Name AS PostTypeName,
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    COALESCE(av.VoteCount, 0) AS UpvoteCount,
+    COALESCE(dv.VoteCount, 0) AS DownvoteCount,
+    u.Reputation AS OwnerReputation,
+    u.Views AS OwnerViews,
+    u.UpVotes AS OwnerUpVotes,
+    u.DownVotes AS OwnerDownVotes,
+    ARRAY_AGG(DISTINCT ph.PostHistoryTypeId) AS HistoryTypes,
+    COUNT(DISTINCT c.Id) AS CommentCountTotal,
+    COUNT(DISTINCT fl.RelatedPostId) AS LinkedPostsCount,
+    COUNT(DISTINCT l.Id) AS ExternalLinksCount,
+    COUNT(DISTINCT b.Id) AS PublisherBadgesCount,
+    STRING_AGG(DISTINCT bt.Name, ',') AS BadgeNames,
+    COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS TotalUpVotes,
+    COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS TotalDownVotes,
+    COUNT(DISTINCT v2.Id) AS TotalVotes,
+    u2.DisplayName AS LastEditor,
+    p.LastEditDate,
+    p.ClosedDate,
+    p.ContentLicense
+FROM
+    Posts p
+LEFT JOIN
+    PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN
+    Users u ON p.OwnerUserId = u.Id
+LEFT JOIN
+    Votes av ON av.PostId = p.Id AND av.VoteTypeId = 2
+LEFT JOIN
+    Votes dv ON dv.PostId = p.Id AND dv.VoteTypeId = 3
+LEFT JOIN
+    PostHistory ph ON ph.PostId = p.Id
+LEFT JOIN
+    PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+LEFT JOIN
+    Comments c ON c.PostId = p.Id
+LEFT JOIN
+    PostLinks fl ON fl.PostId = p.Id
+LEFT JOIN
+    PostLinks l ON l.RelatedPostId = p.Id
+LEFT JOIN
+    LinkTypes lt ON l.LinkTypeId = lt.Id
+LEFT JOIN
+    Badges b ON b.UserId = p.OwnerUserId
+LEFT JOIN
+    BadgeTypes bt ON bt.Id = b.BadgeTypeId
+LEFT JOIN
+    Users u2 ON p.LastEditorUserId = u2.Id
+LEFT JOIN
+    Votes v ON v.PostId = p.Id
+LEFT JOIN
+    Votes v2 ON v2.PostId = p.Id
+WHERE
+    p.PostTypeId IN (1, 2)
+GROUP BY
+    p.PostTypeId,
+    pt.Name,
+    p.Id,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    COALESCE(av.VoteCount, 0),
+    COALESCE(dv.VoteCount, 0),
+    u.Reputation,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u2.DisplayName,
+    p.LastEditDate,
+    p.ClosedDate,
+    p.ContentLicense,
+    ph.PostHistoryTypeId;

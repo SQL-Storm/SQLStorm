@@ -1,0 +1,139 @@
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT pt.Id) AS direct_questions,
+        t.TagName AS root_tag,
+        0 AS level
+    FROM Tags t
+    JOIN Posts pt ON pt.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE pt.PostTypeId = 1
+      AND t.Count > 1000
+    GROUP BY t.Id, t.TagName
+
+    UNION ALL
+
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        th.direct_questions,
+        th.root_tag,
+        th.level + 1
+    FROM tag_hierarchy th
+    JOIN Tags t2 ON t2.Id != th.Id
+    JOIN Posts p1 ON p1.Tags LIKE '%' || '<' || th.TagName || '>' || '%' AND p1.PostTypeId = 1
+    JOIN Posts p2 ON p2.Tags LIKE '%' || '<' || t2.TagName || '>' || '%'
+        AND p2.Id = p1.Id
+        AND p2.PostTypeId = 1
+    WHERE th.level < 2
+    GROUP BY t2.Id, t2.TagName, th.root_tag, th.level, th.direct_questions
+),
+user_expertise AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        STRING_AGG(DISTINCT REGEXP_REPLACE(p.Tags, '^.*<([^>]+)>.+$', '\1') , ', ' ORDER BY REGEXP_REPLACE(p.Tags, '^.*<([^>]+)>.+$', '\1')) AS expertise_tags,
+        COUNT(DISTINCT p.Id) AS total_answers,
+        SUM(p.Score) AS total_score,
+        CAST(AVG(p.Score) AS NUMERIC(10,2)) AS avg_score,
+        COUNT(DISTINCT CASE WHEN p.Score >= 10 THEN p.Id END) AS great_answers,
+        COUNT(DISTINCT CASE WHEN p.Id = q.AcceptedAnswerId THEN p.Id END) AS accepted_answers,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS median_score,
+        CAST(STDDEV(p.Score) AS NUMERIC(10,2)) AS score_stddev
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 2
+    JOIN Posts q ON q.Id = p.ParentId
+    WHERE p.Score > 0
+      AND u.Reputation > 5000
+      AND p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '2 years')
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT p.Id) >= 50
+),
+question_quality AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.Score AS question_score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.Tags,
+        p.CreationDate,
+        u.DisplayName AS asker_name,
+        u.Reputation AS asker_rep,
+        EXTRACT(EPOCH FROM (COALESCE(p.ClosedDate, CAST('2024-10-01 12:34:56' AS TIMESTAMP)) - p.CreationDate)) / 3600 AS hours_to_close,
+        COUNT(DISTINCT c.Id) AS comment_count,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS upvotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS downvotes,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS edit_count,
+        MIN(a.CreationDate) AS first_answer_time,
+        MAX(a.Score) AS best_answer_score,
+        CAST(AVG(a.Score) AS NUMERIC(10,2)) AS avg_answer_score,
+        CASE 
+            WHEN p.ViewCount > 0 THEN CAST(p.Score AS NUMERIC) / p.ViewCount * 1000
+            ELSE 0
+        END AS score_per_1k_views
+    FROM Posts p
+    JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '1 year')
+      AND p.Score >= 5
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.FavoriteCount, 
+             p.Tags, p.CreationDate, u.DisplayName, u.Reputation, p.ClosedDate
+),
+badge_progression AS (
+    SELECT 
+        b.UserId,
+        b.Name AS badge_name,
+        b.Class,
+        b.Date AS earned_date,
+        LAG(b.Date) OVER (PARTITION BY b.UserId ORDER BY b.Date) AS previous_badge_date,
+        EXTRACT(EPOCH FROM (b.Date - LAG(b.Date) OVER (PARTITION BY b.UserId ORDER BY b.Date))) / 86400 AS days_since_last,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId, b.Class ORDER BY b.Date) AS badge_rank,
+        COUNT(*) OVER (PARTITION BY b.UserId, b.Class) AS total_class_badges,
+        DENSE_RANK() OVER (PARTITION BY b.Name ORDER BY b.Date) AS global_badge_rank
+    FROM Badges b
+    WHERE b.TagBased = FALSE
+)
+SELECT 
+    ue.DisplayName,
+    ue.Reputation,
+    ue.total_answers,
+    ue.avg_score,
+    CAST(ue.accepted_answers AS NUMERIC) / NULLIF(ue.total_answers, 0) * 100 AS acceptance_rate,
+    qq.Title AS top_question,
+    qq.question_score,
+    qq.score_per_1k_views,
+    qq.hours_to_close,
+    th.root_tag AS primary_tag,
+    COUNT(DISTINCT th.TagName) AS related_tags,
+    COUNT(DISTINCT bp.badge_name) FILTER (WHERE bp.Class = 1) AS gold_badges,
+    COUNT(DISTINCT bp.badge_name) FILTER (WHERE bp.Class = 2) AS silver_badges,
+    COUNT(DISTINCT bp.badge_name) FILTER (WHERE bp.Class = 3) AS bronze_badges,
+    CAST(AVG(bp.days_since_last) AS NUMERIC(10,2)) AS avg_days_between_badges,
+    STRING_AGG(DISTINCT 
+        CASE 
+            WHEN bp.global_badge_rank <= 100 THEN bp.badge_name 
+            ELSE NULL
+        END, ', ' 
+        ORDER BY CASE WHEN bp.global_badge_rank <= 100 THEN bp.badge_name ELSE NULL END
+    ) AS rare_badges
+FROM user_expertise ue
+CROSS JOIN LATERAL (
+    SELECT * FROM question_quality 
+    WHERE asker_name = ue.DisplayName 
+    ORDER BY score_per_1k_views DESC 
+    LIMIT 1
+) qq
+LEFT JOIN tag_hierarchy th ON ue.expertise_tags LIKE '%' || th.TagName || '%'
+LEFT JOIN badge_progression bp ON bp.UserId = ue.UserId
+GROUP BY ue.DisplayName, ue.Reputation, ue.total_answers, ue.avg_score, ue.accepted_answers,
+         qq.Title, qq.question_score, qq.score_per_1k_views, qq.hours_to_close, th.root_tag
+HAVING COUNT(DISTINCT bp.badge_name) > 10
+ORDER BY ue.Reputation DESC, ue.avg_score DESC
+LIMIT 100;

@@ -1,0 +1,142 @@
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT pt.Id) as direct_questions,
+        CAST(ARRAY[t.TagName] AS varchar[]) as tag_path,
+        1 as depth
+    FROM Tags t
+    INNER JOIN Posts pt ON pt.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE pt.PostTypeId = 1
+        AND t.Count > 1000
+    GROUP BY t.Id, t.TagName
+
+    UNION ALL
+
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        th.direct_questions,
+        th.tag_path || t2.TagName,
+        th.depth + 1
+    FROM tag_hierarchy th
+    CROSS JOIN Tags t2
+    WHERE th.depth < 3
+        AND t2.Id NOT IN (SELECT t3.Id FROM Tags t3 WHERE t3.TagName = ANY(th.tag_path))
+        AND EXISTS (
+            SELECT 1 FROM Posts p 
+            WHERE p.Tags LIKE '%' || '<' || th.tag_path[array_upper(th.tag_path, 1)] || '>' || '%'
+                AND p.Tags LIKE '%' || '<' || t2.TagName || '>' || '%'
+                AND p.PostTypeId = 1
+        )
+),
+user_expertise AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        t.TagName,
+        COUNT(DISTINCT p.Id) as answers_count,
+        SUM(p.Score) as total_score,
+        AVG(p.Score) as avg_score,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) as median_score,
+        COUNT(DISTINCT CASE WHEN p.AcceptedAnswerId = p2.Id THEN p2.Id END) as accepted_answers,
+        STRING_AGG(DISTINCT b.Name, ', ' ORDER BY b.Class, b.Name) as tag_badges,
+        DENSE_RANK() OVER (PARTITION BY t.TagName ORDER BY SUM(p.Score) DESC) as tag_rank
+    FROM Users u
+    INNER JOIN Posts p ON p.OwnerUserId = u.Id
+    INNER JOIN Posts q ON q.Id = p.ParentId
+    INNER JOIN Tags t ON q.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    LEFT JOIN Posts p2 ON p2.ParentId = q.Id AND p2.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id AND b.TagBased = TRUE AND LOWER(b.Name) = LOWER(t.TagName)
+    WHERE p.PostTypeId = 2
+        AND p.Score > 0
+        AND t.Count > 500
+        AND u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, t.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+temporal_patterns AS (
+    SELECT 
+        DATE_TRUNC('quarter', p.CreationDate) as quarter,
+        pt.Name as post_type,
+        COUNT(*) as post_count,
+        AVG(p.Score) as avg_score,
+        AVG(p.ViewCount) as avg_views,
+        AVG(p.AnswerCount) as avg_answers,
+        PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY p.Score) as q1_score,
+        PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY p.Score) as q3_score,
+        COUNT(DISTINCT p.OwnerUserId) as unique_contributors,
+        SUM(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) * 1.0 / COUNT(*) as close_rate,
+        SUM(CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END) * 1.0 / COUNT(*) as wiki_rate
+    FROM Posts p
+    INNER JOIN PostTypes pt ON pt.Id = p.PostTypeId
+    WHERE p.CreationDate >= DATE_TRUNC('year', CAST('2024-10-01' AS date) - INTERVAL '5 years')
+        AND p.PostTypeId IN (1, 2)
+    GROUP BY DATE_TRUNC('quarter', p.CreationDate), pt.Name
+),
+vote_networks AS (
+    SELECT 
+        v1.UserId as voter,
+        p.OwnerUserId as recipient,
+        vt.Name as vote_type,
+        COUNT(*) as vote_count,
+        SUM(CASE WHEN v1.VoteTypeId = 2 THEN 1 ELSE -1 END) as net_votes,
+        MIN(v1.CreationDate) as first_interaction,
+        MAX(v1.CreationDate) as last_interaction,
+        EXTRACT(EPOCH FROM (MAX(v1.CreationDate) - MIN(v1.CreationDate))) / 86400 as interaction_span_days
+    FROM Votes v1
+    INNER JOIN Posts p ON p.Id = v1.PostId
+    INNER JOIN VoteTypes vt ON vt.Id = v1.VoteTypeId
+    WHERE v1.UserId IS NOT NULL
+        AND p.OwnerUserId IS NOT NULL
+        AND v1.UserId != p.OwnerUserId
+        AND v1.VoteTypeId IN (2, 3)
+    GROUP BY v1.UserId, p.OwnerUserId, vt.Name
+    HAVING COUNT(*) >= 5
+)
+SELECT 
+    th.tag_path[1] as primary_tag,
+    th.tag_path as related_tags,
+    ue.DisplayName as expert_user,
+    ue.tag_rank,
+    ue.answers_count,
+    ue.total_score,
+    ue.avg_score,
+    ue.median_score,
+    ue.accepted_answers,
+    ue.tag_badges,
+    tp.quarter,
+    tp.post_type,
+    tp.post_count,
+    tp.avg_score as quarterly_avg_score,
+    tp.avg_views,
+    tp.avg_answers,
+    tp.q1_score,
+    tp.q3_score,
+    tp.unique_contributors,
+    tp.close_rate,
+    tp.wiki_rate,
+    vn.voter as network_voter_id,
+    vn.recipient as network_recipient_id,
+    vn.vote_count,
+    vn.net_votes,
+    vn.interaction_span_days,
+    LAG(tp.post_count, 4) OVER (PARTITION BY tp.post_type ORDER BY tp.quarter) as year_ago_count,
+    ((tp.post_count - LAG(tp.post_count, 4) OVER (PARTITION BY tp.post_type ORDER BY tp.quarter)) * 1.0 / 
+        NULLIF(LAG(tp.post_count, 4) OVER (PARTITION BY tp.post_type ORDER BY tp.quarter), 0)) * 100 as yoy_growth_rate,
+    RANK() OVER (PARTITION BY th.tag_path[1] ORDER BY ue.total_score DESC) as expert_rank_in_tag,
+    DENSE_RANK() OVER (ORDER BY tp.post_count DESC) as quarter_activity_rank
+FROM tag_hierarchy th
+CROSS JOIN user_expertise ue
+CROSS JOIN temporal_patterns tp
+LEFT JOIN vote_networks vn ON vn.voter = ue.UserId OR vn.recipient = ue.UserId
+WHERE th.depth <= 2
+    AND ue.TagName = th.tag_path[1]
+    AND ue.tag_rank <= 10
+    AND tp.quarter >= DATE_TRUNC('quarter', CAST('2024-10-01' AS date) - INTERVAL '2 years')
+ORDER BY 
+    th.tag_path[1],
+    ue.tag_rank,
+    tp.quarter DESC,
+    vn.vote_count DESC
+LIMIT 10000;

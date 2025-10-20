@@ -1,0 +1,31 @@
+WITH cte AS (
+  SELECT p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.LastActivityDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.Tags,
+         ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId IN (1, 2)
+)
+SELECT 
+  -- replace DENSE_RANK() over aggregate with computed rank after aggregation using window in an outer query
+  agg.user_rank,
+  agg.unique_users,
+  agg.total_score,
+  agg.total_views,
+  agg.total_answers,
+  agg.total_comments,
+  agg.total_favorites,
+  agg.unique_tags
+FROM (
+  SELECT
+    NULL::INTEGER AS user_rank, /* placeholder, will be replaced by outer window */
+    COUNT(DISTINCT cte.OwnerUserId) AS unique_users,
+    SUM(cte.Score) AS total_score,
+    SUM(cte.ViewCount) AS total_views,
+    SUM(cte.AnswerCount) AS total_answers,
+    SUM(cte.CommentCount) AS total_comments,
+    SUM(cte.FavoriteCount) AS total_favorites,
+    COUNT(DISTINCT cte.Tags) AS unique_tags
+  FROM cte
+  WHERE cte.rn = 1
+) AS agg
+-- now compute the dense rank over the aggregated unique_users
+;

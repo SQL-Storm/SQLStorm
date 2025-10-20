@@ -1,0 +1,78 @@
+WITH TopTags AS (
+  SELECT TagName
+  FROM Tags
+  ORDER BY Count DESC
+  LIMIT 3
+),
+AnswererStats AS (
+  SELECT
+    t.TagName,
+    u.Id        AS UserId,
+    u.DisplayName,
+    COUNT(a.Id) AS AnswersCount,
+    COALESCE(SUM(vu.UpVotes),   0) AS TotalUpVotes,
+    COALESCE(SUM(vu.DownVotes), 0) AS TotalDownVotes,
+    MAX(b.Date) AS LastBadgeDate
+  FROM TopTags t
+  JOIN Posts q
+    ON q.PostTypeId = 1
+   AND q.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+  JOIN Posts a
+    ON a.ParentId   = q.Id
+   AND a.PostTypeId = 2
+  JOIN Users u
+    ON u.Id = a.OwnerUserId
+  LEFT JOIN (
+    SELECT
+      PostId,
+      COUNT(*) FILTER (WHERE VoteTypeId = 2) AS UpVotes,
+      COUNT(*) FILTER (WHERE VoteTypeId = 3) AS DownVotes
+    FROM Votes
+    GROUP BY PostId
+  ) vu
+    ON vu.PostId = a.Id
+  LEFT JOIN Badges b
+    ON b.UserId = u.Id
+  GROUP BY
+    t.TagName,
+    u.Id,
+    u.DisplayName
+),
+RankedAnswerers AS (
+  SELECT
+    ra.TagName,
+    ra.UserId,
+    ra.DisplayName,
+    ra.AnswersCount,
+    ra.TotalUpVotes,
+    ra.TotalDownVotes,
+    ra.LastBadgeDate,
+    ROW_NUMBER() OVER (
+      PARTITION BY ra.TagName
+      ORDER BY ra.AnswersCount DESC, ra.TotalUpVotes DESC
+    ) AS Rank
+  FROM AnswererStats ra
+)
+SELECT
+  ra.TagName,
+  ra.Rank,
+  ra.DisplayName,
+  ra.AnswersCount,
+  ra.TotalUpVotes,
+  ra.TotalDownVotes,
+  ra.LastBadgeDate,
+  (
+    SELECT JSON_ARRAYAGG(
+             JSON_OBJECT(
+               'CommentId' VALUE c.Id,
+               'Score'     VALUE c.Score,
+               'Text'      VALUE c.Text
+             )
+           )
+    FROM Comments c
+    WHERE c.UserId = ra.UserId
+      AND c.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY
+  ) AS RecentComments
+FROM RankedAnswerers ra
+WHERE ra.Rank <= 3
+ORDER BY ra.TagName, ra.Rank;

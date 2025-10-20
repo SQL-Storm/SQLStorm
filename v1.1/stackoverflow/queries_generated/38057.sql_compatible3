@@ -1,0 +1,435 @@
+WITH recent_posts AS (
+  SELECT p.Id,
+         p.PostTypeId,
+         p.OwnerUserId,
+         p.Score,
+         p.ViewCount,
+         p.AnswerCount,
+         p.CommentCount,
+         p.FavoriteCount,
+         p.CreationDate,
+         p.LastActivityDate,
+         p.Tags,
+         p.Title,
+         p.ParentId,
+         p.AcceptedAnswerId
+  FROM Posts p
+  WHERE p.CreationDate >= (SELECT max(CreationDate) - INTERVAL '365 days' FROM Posts)
+),
+tag_tokens AS (
+  SELECT rp.Id AS PostId,
+         lower(trim(tag)) AS tag
+  FROM recent_posts rp,
+       LATERAL unnest(string_to_array(substring(coalesce(rp.Tags,''), 2, greatest(length(coalesce(rp.Tags,'')) - 2, 0)), '><')) AS tag
+),
+tag_rank AS (
+  SELECT t.tag,
+         count(*) AS tag_post_count,
+         sum(rp.Score) AS tag_score_sum,
+         avg(rp.Score) AS tag_score_avg,
+         percentile_cont(0.9) WITHIN GROUP (ORDER BY rp.Score) AS tag_score_p90
+  FROM tag_tokens t
+  JOIN recent_posts rp ON rp.Id = t.PostId
+  GROUP BY t.tag
+  HAVING count(*) >= 50
+),
+top_tags AS (
+  SELECT tag
+  FROM tag_rank
+  ORDER BY tag_post_count DESC, tag_score_sum DESC
+  LIMIT 25
+),
+users_recent AS (
+  SELECT u.Id,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate,
+         u.LastAccessDate,
+         u.Location,
+         u.UpVotes,
+         u.DownVotes,
+         u.Views
+  FROM Users u
+),
+post_activity AS (
+  SELECT ph.PostId,
+         sum(CASE WHEN ph.PostHistoryTypeId IN (4,5,6,7,8,9,24) THEN 1 ELSE 0 END) AS edit_events,
+         sum(CASE WHEN ph.PostHistoryTypeId IN (10,11,12,13,14,15,19,20,35,36,37,38) THEN 1 ELSE 0 END) AS mod_events,
+         min(ph.CreationDate) AS first_event_at,
+         max(ph.CreationDate) AS last_event_at
+  FROM PostHistory ph
+  WHERE ph.CreationDate >= (SELECT max(CreationDate) - INTERVAL '365 days' FROM PostHistory)
+  GROUP BY ph.PostId
+),
+vote_agg AS (
+  SELECT v.PostId,
+         sum(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+         sum(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+         sum(CASE WHEN v.VoteTypeId = 8 THEN coalesce(v.BountyAmount,0) ELSE 0 END) AS bounty_started,
+         sum(CASE WHEN v.VoteTypeId = 9 THEN coalesce(v.BountyAmount,0) ELSE 0 END) AS bounty_awarded,
+         count(*) AS total_votes
+  FROM Votes v
+  WHERE v.CreationDate >= (SELECT max(CreationDate) - INTERVAL '365 days' FROM Votes)
+  GROUP BY v.PostId
+),
+comment_agg AS (
+  SELECT c.PostId,
+         count(*) AS comments_count,
+         sum(CASE WHEN c.Score > 0 THEN 1 ELSE 0 END) AS pos_comments,
+         sum(CASE WHEN c.Score < 0 THEN 1 ELSE 0 END) AS neg_comments,
+         max(c.CreationDate) AS last_comment_at
+  FROM Comments c
+  WHERE c.CreationDate >= (SELECT max(CreationDate) - INTERVAL '365 days' FROM Comments)
+  GROUP BY c.PostId
+),
+linked_dupes AS (
+  SELECT pl.PostId,
+         sum(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS duplicates_marked,
+         sum(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS links_marked
+  FROM PostLinks pl
+  WHERE pl.CreationDate >= (SELECT max(CreationDate) - INTERVAL '365 days' FROM PostLinks)
+  GROUP BY pl.PostId
+),
+accepted_answers AS (
+  SELECT q.Id AS QuestionId,
+         a.Id AS AnswerId,
+         a.OwnerUserId AS AnswererId,
+         a.Score AS AnswerScore,
+         a.CreationDate AS AnswerCreationDate
+  FROM Posts q
+  JOIN Posts a ON a.Id = q.AcceptedAnswerId
+  WHERE q.PostTypeId = 1
+),
+user_badge_agg AS (
+  SELECT b.UserId,
+         sum(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+         sum(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+         sum(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+         count(*) AS total_badges,
+         max(b.Date) AS last_badge_at
+  FROM Badges b
+  WHERE b.Date >= (SELECT max(Date) - INTERVAL '365 days' FROM Badges)
+  GROUP BY b.UserId
+),
+question_core AS (
+  SELECT rp.Id,
+         rp.OwnerUserId,
+         rp.Score,
+         rp.ViewCount,
+         rp.AnswerCount,
+         rp.CommentCount,
+         rp.FavoriteCount,
+         rp.CreationDate,
+         rp.LastActivityDate,
+         rp.Title
+  FROM recent_posts rp
+  WHERE rp.PostTypeId = 1
+),
+answer_core AS (
+  SELECT p.Id,
+         p.ParentId AS QuestionId,
+         p.OwnerUserId,
+         p.Score,
+         p.CreationDate
+  FROM Posts p
+  WHERE p.PostTypeId = 2
+    AND p.CreationDate >= (SELECT max(CreationDate) - INTERVAL '365 days' FROM Posts)
+),
+question_tagged AS (
+  SELECT qt.Id AS QuestionId,
+         array_agg(DISTINCT t.tag) FILTER (WHERE t.tag IS NOT NULL) AS tags
+  FROM question_core qt
+  LEFT JOIN tag_tokens t ON t.PostId = qt.Id
+  GROUP BY qt.Id
+),
+tag_filter_questions AS (
+  SELECT qt.QuestionId
+  FROM question_tagged qt
+  JOIN LATERAL unnest(qt.tags) AS tg(tag) ON true
+  WHERE tg.tag IN (SELECT tag FROM top_tags)
+  GROUP BY qt.QuestionId
+),
+answerers_quality AS (
+  SELECT ac.OwnerUserId AS UserId,
+         count(*) AS answers_last_year,
+         avg(ac.Score) AS avg_answer_score,
+         percentile_cont(0.9) WITHIN GROUP (ORDER BY ac.Score) AS p90_answer_score,
+         max(ac.CreationDate) AS last_answer_at
+  FROM answer_core ac
+  GROUP BY ac.OwnerUserId
+),
+question_metrics AS (
+  SELECT qc.Id AS QuestionId,
+         qc.OwnerUserId,
+         qc.Score,
+         qc.ViewCount,
+         qc.AnswerCount,
+         qc.CommentCount,
+         qc.FavoriteCount,
+         qc.CreationDate,
+         qc.LastActivityDate,
+         coalesce(va.upvotes,0) AS upvotes,
+         coalesce(va.downvotes,0) AS downvotes,
+         coalesce(va.total_votes,0) AS total_votes,
+         coalesce(va.bounty_started,0) AS bounty_started,
+         coalesce(va.bounty_awarded,0) AS bounty_awarded,
+         coalesce(pa.edit_events,0) AS edit_events,
+         coalesce(pa.mod_events,0) AS mod_events,
+         coalesce(pa.first_event_at, qc.CreationDate) AS first_event_at,
+         coalesce(pa.last_event_at, qc.LastActivityDate) AS last_event_at,
+         coalesce(ca.comments_count,0) AS comments_count,
+         coalesce(ca.pos_comments,0) AS pos_comments,
+         coalesce(ca.neg_comments,0) AS neg_comments,
+         ca.last_comment_at,
+         coalesce(ld.duplicates_marked,0) AS duplicates_marked,
+         coalesce(ld.links_marked,0) AS links_marked,
+         qc.Title
+  FROM question_core qc
+  LEFT JOIN vote_agg va ON va.PostId = qc.Id
+  LEFT JOIN post_activity pa ON pa.PostId = qc.Id
+  LEFT JOIN comment_agg ca ON ca.PostId = qc.Id
+  LEFT JOIN linked_dupes ld ON ld.PostId = qc.Id
+),
+question_with_accepts AS (
+  SELECT qm.QuestionId,
+         qm.OwnerUserId,
+         qm.Score,
+         qm.ViewCount,
+         qm.AnswerCount,
+         qm.CommentCount,
+         qm.FavoriteCount,
+         qm.CreationDate,
+         qm.LastActivityDate,
+         qm.upvotes,
+         qm.downvotes,
+         qm.total_votes,
+         qm.bounty_started,
+         qm.bounty_awarded,
+         qm.edit_events,
+         qm.mod_events,
+         qm.first_event_at,
+         qm.last_event_at,
+         qm.comments_count,
+         qm.pos_comments,
+         qm.neg_comments,
+         qm.last_comment_at,
+         qm.duplicates_marked,
+         qm.links_marked,
+         qm.Title,
+         CASE WHEN aa.AnswerId IS NOT NULL THEN 1 ELSE 0 END AS has_accepted_answer,
+         aa.AnswerId,
+         aa.AnswererId,
+         aa.AnswerScore,
+         aa.AnswerCreationDate
+  FROM question_metrics qm
+  LEFT JOIN accepted_answers aa ON aa.QuestionId = qm.QuestionId
+),
+owner_enriched AS (
+  SELECT qwa.QuestionId,
+         qwa.OwnerUserId,
+         qwa.Score,
+         qwa.ViewCount,
+         qwa.AnswerCount,
+         qwa.CommentCount,
+         qwa.FavoriteCount,
+         qwa.CreationDate,
+         qwa.LastActivityDate,
+         qwa.upvotes,
+         qwa.downvotes,
+         qwa.total_votes,
+         qwa.bounty_started,
+         qwa.bounty_awarded,
+         qwa.edit_events,
+         qwa.mod_events,
+         qwa.first_event_at,
+         qwa.last_event_at,
+         qwa.comments_count,
+         qwa.pos_comments,
+         qwa.neg_comments,
+         qwa.last_comment_at,
+         qwa.duplicates_marked,
+         qwa.links_marked,
+         qwa.Title,
+         qwa.has_accepted_answer,
+         qwa.AnswerId,
+         qwa.AnswererId,
+         qwa.AnswerScore,
+         qwa.AnswerCreationDate,
+         ur.DisplayName AS owner_name,
+         ur.Reputation AS owner_reputation,
+         ur.UpVotes AS owner_upvotes,
+         ur.DownVotes AS owner_downvotes,
+         ur.Views AS owner_profile_views,
+         uba.total_badges AS owner_total_badges,
+         uba.gold_badges AS owner_gold_badges,
+         uba.silver_badges AS owner_silver_badges,
+         uba.bronze_badges AS owner_bronze_badges,
+         uba.last_badge_at AS owner_last_badge_at
+  FROM question_with_accepts qwa
+  LEFT JOIN users_recent ur ON ur.Id = qwa.OwnerUserId
+  LEFT JOIN user_badge_agg uba ON uba.UserId = qwa.OwnerUserId
+),
+answerer_enriched AS (
+  SELECT oe.QuestionId,
+         oe.OwnerUserId,
+         oe.Score,
+         oe.ViewCount,
+         oe.AnswerCount,
+         oe.CommentCount,
+         oe.FavoriteCount,
+         oe.CreationDate,
+         oe.LastActivityDate,
+         oe.upvotes,
+         oe.downvotes,
+         oe.total_votes,
+         oe.bounty_started,
+         oe.bounty_awarded,
+         oe.edit_events,
+         oe.mod_events,
+         oe.first_event_at,
+         oe.last_event_at,
+         oe.comments_count,
+         oe.pos_comments,
+         oe.neg_comments,
+         oe.last_comment_at,
+         oe.duplicates_marked,
+         oe.links_marked,
+         oe.Title,
+         oe.has_accepted_answer,
+         oe.AnswerId,
+         oe.AnswererId,
+         oe.AnswerScore,
+         oe.AnswerCreationDate,
+         oe.owner_name,
+         oe.owner_reputation,
+         oe.owner_upvotes,
+         oe.owner_downvotes,
+         oe.owner_profile_views,
+         oe.owner_total_badges,
+         oe.owner_gold_badges,
+         oe.owner_silver_badges,
+         oe.owner_bronze_badges,
+         oe.owner_last_badge_at,
+         ar.DisplayName AS answerer_name,
+         ar.Reputation AS answerer_reputation,
+         aq.answers_last_year,
+         aq.avg_answer_score,
+         aq.p90_answer_score,
+         aq.last_answer_at,
+         abr.total_badges AS answerer_total_badges,
+         abr.gold_badges AS answerer_gold_badges,
+         abr.silver_badges AS answerer_silver_badges,
+         abr.bronze_badges AS answerer_bronze_badges
+  FROM owner_enriched oe
+  LEFT JOIN users_recent ar ON ar.Id = oe.AnswererId
+  LEFT JOIN answerers_quality aq ON aq.UserId = oe.AnswererId
+  LEFT JOIN user_badge_agg abr ON abr.UserId = oe.AnswererId
+),
+final_filtered AS (
+  SELECT ae.QuestionId,
+         ae.OwnerUserId,
+         ae.Score,
+         ae.ViewCount,
+         ae.AnswerCount,
+         ae.CommentCount,
+         ae.FavoriteCount,
+         ae.CreationDate,
+         ae.LastActivityDate,
+         ae.upvotes,
+         ae.downvotes,
+         ae.total_votes,
+         ae.bounty_started,
+         ae.bounty_awarded,
+         ae.edit_events,
+         ae.mod_events,
+         ae.first_event_at,
+         ae.last_event_at,
+         ae.comments_count,
+         ae.pos_comments,
+         ae.neg_comments,
+         ae.last_comment_at,
+         ae.duplicates_marked,
+         ae.links_marked,
+         ae.Title,
+         ae.has_accepted_answer,
+         ae.AnswerId,
+         ae.AnswererId,
+         ae.AnswerScore,
+         ae.AnswerCreationDate,
+         ae.owner_name,
+         ae.owner_reputation,
+         ae.owner_upvotes,
+         ae.owner_downvotes,
+         ae.owner_profile_views,
+         ae.owner_total_badges,
+         ae.owner_gold_badges,
+         ae.owner_silver_badges,
+         ae.owner_bronze_badges,
+         ae.owner_last_badge_at,
+         ae.answerer_name,
+         ae.answerer_reputation,
+         ae.answers_last_year,
+         ae.avg_answer_score,
+         ae.p90_answer_score,
+         ae.last_answer_at,
+         ae.answerer_total_badges,
+         ae.answerer_gold_badges,
+         ae.answerer_silver_badges,
+         ae.answerer_bronze_badges
+  FROM answerer_enriched ae
+  JOIN tag_filter_questions tf ON tf.QuestionId = ae.QuestionId
+  WHERE ae.Score >= 0
+    AND ae.ViewCount >= 100
+    AND ae.AnswerCount >= 1
+)
+SELECT
+  ff.QuestionId,
+  ff.Title,
+  ff.Score AS question_score,
+  ff.ViewCount,
+  ff.AnswerCount,
+  ff.CommentCount,
+  ff.FavoriteCount,
+  ff.upvotes,
+  ff.downvotes,
+  ff.total_votes,
+  ff.bounty_started,
+  ff.bounty_awarded,
+  ff.edit_events,
+  ff.mod_events,
+  ff.duplicates_marked,
+  ff.links_marked,
+  ff.comments_count,
+  ff.pos_comments,
+  ff.neg_comments,
+  ff.has_accepted_answer,
+  ff.AnswerId AS accepted_answer_id,
+  ff.AnswerScore AS accepted_answer_score,
+  extract(epoch FROM (ff.LastActivityDate - ff.CreationDate)) / 3600.0 AS hours_to_last_activity,
+  extract(epoch FROM (coalesce(ff.last_comment_at, ff.LastActivityDate) - ff.CreationDate)) / 3600.0 AS hours_to_last_comment_or_activity,
+  ff.owner_name,
+  ff.owner_reputation,
+  ff.owner_upvotes,
+  ff.owner_downvotes,
+  ff.owner_profile_views,
+  ff.owner_total_badges,
+  ff.owner_gold_badges,
+  ff.owner_silver_badges,
+  ff.owner_bronze_badges,
+  ff.owner_last_badge_at,
+  ff.answerer_name,
+  ff.answerer_reputation,
+  ff.answers_last_year,
+  ff.avg_answer_score,
+  ff.p90_answer_score,
+  ff.last_answer_at,
+  ff.answerer_total_badges,
+  ff.answerer_gold_badges,
+  ff.answerer_silver_badges,
+  ff.answerer_bronze_badges
+FROM final_filtered ff
+ORDER BY
+  ff.ViewCount DESC,
+  ff.Score DESC,
+  ff.total_votes DESC
+LIMIT 500;

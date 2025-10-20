@@ -1,0 +1,69 @@
+-- {"query": "48075.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 703} 
+
+WITH RecursivePostChain AS (
+    -- Anchor member: Select initial posts (e.g., questions with a score > 100 and creation date in the last year)
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.OwnerUserId,
+        0 AS Depth
+    FROM Posts p
+    WHERE p.PostTypeId = 1 -- Questions
+      AND p.Score > 100
+      AND p.CreationDate >= DATE('now', '-1 year')
+
+    UNION ALL
+
+    -- Recursive member: Find answers linked to the posts from the previous step
+    SELECT
+        p_ans.Id AS PostId,
+        p_ans.Title,
+        p_ans.CreationDate,
+        p_ans.Score,
+        p_ans.OwnerUserId,
+        rpc.Depth + 1 AS Depth
+    FROM Posts p_ans
+    JOIN RecursivePostChain rpc ON p_ans.ParentId = rpc.PostId
+    WHERE p_ans.PostTypeId = 2 -- Answers
+      AND p_ans.Score > 20
+)
+SELECT
+    rpc.PostId,
+    rpc.Title AS PostTitle,
+    rpc.CreationDate AS PostCreationDate,
+    rpc.Score AS PostScore,
+    rpc.Depth,
+    u.DisplayName AS OwnerDisplayName,
+    COUNT(c.Id) AS CommentCount,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+    MAX(CASE WHEN bh.PostHistoryTypeId = 1 THEN bh.CreationDate ELSE NULL END) AS InitialTitleDate,
+    MIN(CASE WHEN bh.PostHistoryTypeId = 2 THEN bh.CreationDate ELSE NULL END) AS InitialBodyDate,
+    (
+        SELECT COUNT(*)
+        FROM PostHistory ph_edit
+        WHERE ph_edit.PostId = rpc.PostId
+          AND ph_edit.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+    ) AS EditCount
+FROM RecursivePostChain rpc
+LEFT JOIN Users u ON rpc.OwnerUserId = u.Id
+LEFT JOIN Comments c ON rpc.PostId = c.PostId
+LEFT JOIN Votes v ON rpc.PostId = v.PostId
+LEFT JOIN PostHistory bh ON rpc.PostId = bh.PostId AND bh.PostHistoryTypeId IN (1, 2)
+GROUP BY
+    rpc.PostId,
+    rpc.Title,
+    rpc.CreationDate,
+    rpc.Score,
+    rpc.OwnerUserId,
+    rpc.Depth,
+    u.DisplayName
+HAVING
+    COUNT(c.Id) > 10 OR SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) > 50
+ORDER BY
+    rpc.Depth,
+    rpc.Score DESC,
+    rpc.CreationDate ASC
+LIMIT 1000;

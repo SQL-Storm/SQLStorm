@@ -1,0 +1,40 @@
+-- {"query": "33035.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4.1-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 436} 
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT c.Id) AS TotalComments,
+    COUNT(DISTINCT v.Id) AS TotalVotes,
+    COUNT(DISTINCT b.Id) AS BadgesEarned,
+    AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+    AVG(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AvgAnswerScore,
+    MAX(p.CreationDate) AS LastPostDate,
+    MIN(u.CreationDate) AS UserJoinDate,
+    COUNT(DISTINCT pl.RelatedPostId) AS TotalLinkedPosts,
+    COUNT(DISTINCT (SELECT pl2.RelatedPostId FROM PostLinks pl2 WHERE pl2.PostId = p.Id)) AS LinkedPostsPerQuestion,
+    COUNT(DISTINCT v2.Id) FILTER (WHERE v2.VoteTypeId = (SELECT Id FROM VoteTypes WHERE Name = 'UpMod')) AS UpVotesGiven,
+    COUNT(DISTINCT v3.Id) FILTER (WHERE v3.VoteTypeId = (SELECT Id FROM VoteTypes WHERE Name = 'DownMod')) AS DownVotesGiven,
+    COUNT(DISTINCT Votes.Id) AS TotalVotesReceived
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN 
+    Comments c ON c.UserId = u.Id
+LEFT JOIN 
+    Votes v ON v.UserId = u.Id
+LEFT JOIN 
+    Badges b ON b.UserId = u.Id
+LEFT JOIN 
+    Posts pl ON pl.OwnerUserId = u.Id
+LEFT JOIN 
+    Votes v2 ON v2.PostId = pl.Id AND v2.UserId = u.Id
+LEFT JOIN 
+    Votes v3 ON v3.PostId = p.Id AND v3.UserId = u.Id
+WHERE 
+    u.CreationDate >= NOW() - INTERVAL '1 year'
+GROUP BY 
+    u.Id, u.DisplayName
+ORDER BY 
+    TotalPosts DESC
+LIMIT 100;

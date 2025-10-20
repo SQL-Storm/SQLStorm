@@ -1,4 +1,4 @@
--- {"query": "4092.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1578} 
+-- {"query": "4092.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1578} 
 with RecursiveTagHierarchy as (
     -- Recursive CTE to build hierarchy of tags linked via duplicates
     select p.Id as PostId, t.Id as TagId, t.TagName, 1 as Level, p.Tags

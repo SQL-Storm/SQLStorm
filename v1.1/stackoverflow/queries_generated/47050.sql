@@ -1,0 +1,147 @@
+-- {"query": "47050.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 114700, "output_tokens": 101485} 
+
+WITH RECURSIVE TagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        CAST(t.TagName AS VARCHAR(1000)) AS TagPath,
+        1 AS Level
+    FROM Tags t
+    WHERE t.Count > 10000
+    
+    UNION ALL
+    
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        CAST(th.TagPath || ' -> ' || t2.TagName AS VARCHAR(1000)),
+        th.Level + 1
+    FROM Tags t2
+    INNER JOIN TagHierarchy th ON 1=1
+    INNER JOIN Posts p1 ON p1.Id = t2.WikiPostId
+    INNER JOIN Posts p2 ON p2.Id = th.Id
+    WHERE th.Level < 3
+        AND t2.Count > 5000
+        AND p1.CreationDate > p2.CreationDate
+),
+UserActivityMetrics AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(p.ViewCount) AS TotalViews,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT ph.Id) AS EditCount,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS MedianScore,
+        STDDEV(p.Score) AS ScoreStdDev
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id AND ph.PostHistoryTypeId IN (4, 5, 6)
+    WHERE u.Reputation > 1000
+        AND u.CreationDate < CURRENT_TIMESTAMP - INTERVAL '365 days'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostEngagement AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        COUNT(DISTINCT pl.Id) AS LinkCount,
+        AVG(c.Score) AS AvgCommentScore,
+        MAX(c.CreationDate) AS LastCommentDate,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvoteCount,
+        EXTRACT(EPOCH FROM (COALESCE(p.ClosedDate, CURRENT_TIMESTAMP) - p.CreationDate))/3600 AS HoursToClose,
+        ROW_NUMBER() OVER (PARTITION BY DATE_TRUNC('month', p.CreationDate) ORDER BY p.Score DESC) AS MonthlyRank
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id OR pl.RelatedPostId = p.Id
+    WHERE p.PostTypeId = 1
+        AND p.Score > 10
+        AND p.CreationDate >= CURRENT_TIMESTAMP - INTERVAL '2 years'
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate, p.ClosedDate
+),
+TagCorrelation AS (
+    SELECT 
+        t1.TagName AS Tag1,
+        t2.TagName AS Tag2,
+        COUNT(*) AS CoOccurrences,
+        AVG(p.Score) AS AvgScoreWithBothTags,
+        SUM(p.ViewCount) AS TotalViewsWithBothTags
+    FROM Posts p
+    CROSS JOIN LATERAL string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><') AS tag1_array(tag_name)
+    CROSS JOIN LATERAL string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><') AS tag2_array(tag_name)
+    INNER JOIN Tags t1 ON t1.TagName = tag1_array.tag_name
+    INNER JOIN Tags t2 ON t2.TagName = tag2_array.tag_name AND t1.Id < t2.Id
+    WHERE p.PostTypeId = 1
+        AND p.Score > 5
+    GROUP BY t1.TagName, t2.TagName
+    HAVING COUNT(*) > 100
+)
+SELECT 
+    uam.DisplayName,
+    uam.Reputation,
+    uam.PostCount,
+    uam.AvgPostScore,
+    uam.GoldBadges,
+    uam.ReputationRank,
+    uam.MedianScore,
+    pe.Title AS TopPost,
+    pe.Score AS TopPostScore,
+    pe.ViewCount AS TopPostViews,
+    pe.UpvoteCount,
+    pe.DownvoteCount,
+    pe.HoursToClose,
+    th.TagPath,
+    th.Level AS TagLevel,
+    tc.Tag1,
+    tc.Tag2,
+    tc.CoOccurrences,
+    tc.AvgScoreWithBothTags,
+    CASE 
+        WHEN uam.ReputationRank <= 100 THEN 'Elite'
+        WHEN uam.ReputationRank <= 1000 THEN 'Expert'
+        WHEN uam.ReputationRank <= 10000 THEN 'Advanced'
+        ELSE 'Regular'
+    END AS UserTier,
+    NTILE(10) OVER (ORDER BY uam.AvgPostScore * LOG(uam.PostCount + 1) * SQRT(uam.Reputation)) AS PerformanceDecile,
+    LEAD(uam.Reputation, 1) OVER (ORDER BY uam.Reputation DESC) AS NextUserReputation,
+    LAG(uam.Reputation, 1) OVER (ORDER BY uam.Reputation DESC) AS PrevUserReputation,
+    FIRST_VALUE(pe.Title) OVER (PARTITION BY uam.UserId ORDER BY pe.Score DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS BestPostEver
+FROM UserActivityMetrics uam
+CROSS JOIN LATERAL (
+    SELECT * FROM PostEngagement pe2
+    WHERE pe2.PostId IN (
+        SELECT p2.Id 
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = uam.UserId
+        ORDER BY p2.Score DESC 
+        LIMIT 5
+    )
+    ORDER BY pe2.Score DESC
+    LIMIT 1
+) pe
+LEFT JOIN TagHierarchy th ON EXISTS (
+    SELECT 1 FROM Posts p3 
+    WHERE p3.OwnerUserId = uam.UserId 
+    AND p3.Tags LIKE '%' || th.TagName || '%'
+)
+LEFT JOIN TagCorrelation tc ON tc.CoOccurrences > 500
+WHERE uam.ReputationRank <= 1000
+    AND pe.MonthlyRank <= 10
+ORDER BY uam.AvgPostScore * LOG(uam.PostCount + 1) * SQRT(uam.Reputation) DESC
+LIMIT 100;

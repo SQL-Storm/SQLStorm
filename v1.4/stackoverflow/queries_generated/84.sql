@@ -1,0 +1,113 @@
+-- {"query": "84.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 869} 
+WITH recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.AcceptedAnswerId,
+    p.PostTypeId
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= NOW() - INTERVAL '30 DAYS'
+),
+tag_stats AS (
+  SELECT
+    unnest(string_to_array(substr(p.Tags, 2, length(p.Tags)-2), '><')) AS Tag
+  FROM recent_questions p
+),
+top_tags AS (
+  SELECT Tag,
+         COUNT(*) AS QCount,
+         AVG(p.Score) AS AvgScore,
+         AVG(p.ViewCount) AS AvgViews,
+         MAX(p.CreationDate) AS LastQuestionDate
+  FROM recent_questions rq
+  JOIN LATERAL unnest(string_to_array(substr(rq.Tags, 2, length(rq.Tags)-2), '><')) AS Tag ON true
+  GROUP BY Tag
+  ORDER BY QCount DESC
+  LIMIT 20
+), 
+complex_metrics AS (
+  SELECT
+    rq.Id AS PostId,
+    rq.Title,
+    rq.Tags,
+    rq.CreationDate,
+    rq.ViewCount,
+    rq.Score,
+    rq.OwnerUserId,
+    u.DisplayName AS OwnerName,
+    u.Reputation,
+    CASE
+      WHEN rq.AcceptedAnswerId IS NULL THEN 0
+      ELSE (SELECT Score FROM Posts WHERE Id = rq.AcceptedAnswerId)
+    END AS AcceptedAnswerScore,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    ARRAY_AGG(DISTINCT v.VoteTypeId) FILTER (WHERE v.VoteTypeId IS NOT NULL) AS VoteTypes,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    MAX(p.LastActivityDate) OVER (PARTITION BY rq.Id) AS LastActivityDate
+  FROM recent_questions rq
+  LEFT JOIN Users u ON rq.OwnerUserId = u.Id
+  LEFT JOIN Comments c ON c.PostId = rq.Id
+  LEFT JOIN Votes v ON v.PostId = rq.Id
+  LEFT JOIN Posts p ON p.Id = rq.Id
+  GROUP BY rq.Id, rq.Title, rq.Tags, rq.CreationDate, rq.ViewCount, rq.Score, rq.OwnerUserId, u.DisplayName, u.Reputation
+),
+correlated_subquery AS (
+  SELECT
+    cm.PostId,
+    cm.Title,
+    cm.Tags,
+    cm.CreationDate,
+    cm.ViewCount,
+    cm.Score,
+    cm.OwnerUserId,
+    cm.OwnerName,
+    cm.Reputation,
+    cm.AcceptedAnswerScore,
+    cm.CommentCount,
+    cm.UpVotes,
+    cm.DownVotes,
+    cm.LastActivityDate,
+    (SELECT AVG(BodyLength) FROM (
+       SELECT length(p.Body) AS BodyLength
+       FROM Posts p
+       WHERE p.Id = cm.PostId
+     ) AS t) AS AvgBodyChars
+  FROM complex_metrics cm
+),
+windowed AS (
+  SELECT
+    ps.*,
+    ROW_NUMBER() OVER (ORDER BY ps.LastActivityDate DESC, ps.Score DESC) AS rn,
+    COUNT(*) OVER () AS total_posts
+  FROM correlated_subquery ps
+)
+SELECT
+  w.PostId,
+  w.Title,
+  w.Tags,
+  w.CreationDate,
+  w.ViewCount,
+  w.Score,
+  w.OwnerUserId,
+  w.OwnerName,
+  w.Reputation,
+  w.AcceptedAnswerScore,
+  w.CommentCount,
+  w.UpVotes,
+  w.DownVotes,
+  w.LastActivityDate,
+  w.AvgBodyChars,
+  (SELECT STRING_AGG(Tag, ',') FROM top_tags) AS TopTags
+FROM windowed w
+WHERE w.rn <= 100
+ORDER BY w.LastActivityDate DESC, w.Score DESC;

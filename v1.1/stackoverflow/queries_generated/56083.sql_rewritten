@@ -1,0 +1,36 @@
+-- {"query": "56083.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "llama-3.3-instruct", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 476} 
+WITH top_10_users_with_most_upvotes AS (
+  SELECT u.Id, u.DisplayName, COUNT(v.Id) as upvote_count
+  FROM Users u
+  JOIN Posts p ON u.Id = p.OwnerUserId
+  JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId = 2
+  GROUP BY u.Id, u.DisplayName
+  ORDER BY upvote_count DESC
+  LIMIT 10
+),
+top_10_tags_with_most_posts AS (
+  SELECT t.TagName, COUNT(p.Id) as post_count
+  FROM Tags t
+  JOIN Posts p ON t.Id = (SELECT Id FROM Tags WHERE TagName = ANY(string_to_array(p.Tags, '<')))
+  GROUP BY t.TagName
+  ORDER BY post_count DESC
+  LIMIT 10
+)
+SELECT 
+  u.Id, 
+  u.DisplayName, 
+  COUNT(p.Id) as post_count, 
+  SUM(p.Score) as total_score, 
+  SUM(p.ViewCount) as total_view_count, 
+  (SELECT COUNT(*) FROM Comments WHERE PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id)) as comment_count,
+  (SELECT COUNT(*) FROM Votes WHERE PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id) AND VoteTypeId = 2) as upvote_count,
+  (SELECT COUNT(*) FROM Votes WHERE PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id) AND VoteTypeId = 3) as downvote_count,
+  (SELECT STRING_AGG(t.TagName, ', ') FROM Posts p JOIN Tags t ON t.Id = (SELECT Id FROM Tags WHERE TagName = ANY(string_to_array(p.Tags, '<'))) WHERE p.OwnerUserId = u.Id) as tags,
+  tu.upvote_count as top_upvote_count,
+  tt.post_count as top_tag_post_count
+FROM Users u
+JOIN Posts p ON u.Id = p.OwnerUserId
+JOIN top_10_users_with_most_upvotes tu ON u.Id = tu.Id
+JOIN top_10_tags_with_most_posts tt ON tt.TagName = (SELECT TagName FROM Tags WHERE Id = (SELECT Id FROM Tags WHERE TagName = ANY(string_to_array(p.Tags, '<')))
+GROUP BY u.Id, u.DisplayName, tu.upvote_count, tt.post_count
+ORDER BY post_count DESC;

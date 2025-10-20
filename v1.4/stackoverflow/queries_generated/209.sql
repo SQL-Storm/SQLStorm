@@ -1,0 +1,107 @@
+-- {"query": "209.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 11253} 
+WITH
+VotesAgg AS (
+  SELECT PostId,
+         SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+         SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+         SUM(CASE WHEN VoteTypeId = 9 THEN 1 ELSE 0 END) AS BountyVotes
+  FROM Votes
+  GROUP BY PostId
+),
+CommentAgg AS (
+  SELECT PostId, COUNT(*) AS CommentCount
+  FROM Comments
+  GROUP BY PostId
+),
+Q AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    COALESCE(u.DisplayName, '') AS OwnerDisplayName,
+    p.Title,
+    p.Body,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.ViewCount,
+    ISNULL(v.UpVotes,0) AS UpVotes,
+    ISNULL(v.DownVotes,0) AS DownVotes,
+    ISNULL(v.BountyVotes,0) AS BountyVotes,
+    ISNULL(c.CommentCount,0) AS CommentCount,
+    ISNULL(a.Answers,0) AS AnswerCount,
+    ISNULL(u.Reputation,0) AS Reputation,
+    'Q' AS PostKind,
+    ISNULL(LEN(p.Title),0) AS TitleLength,
+    COALESCE(u.DisplayName, '') AS OwnerResolvedName,
+    CASE
+      WHEN p.LastActivityDate > DATEADD(day,-7, GETDATE()) AND p.ViewCount > 100 THEN 'Hot'
+      WHEN p.ViewCount > 1000 THEN 'Trending'
+      ELSE 'Stable'
+    END AS Status,
+    CONCAT('Post-', CAST(p.Id AS varchar(20)), ': ', ISNULL(p.Title, '')) AS Label,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.ViewCount DESC) AS RankWithinType
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN VotesAgg v ON p.Id = v.PostId
+  LEFT JOIN CommentAgg c ON p.Id = c.PostId
+  LEFT JOIN (
+    SELECT ParentId AS QuestionId, COUNT(*) AS Answers
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY ParentId
+  ) a ON p.Id = a.QuestionId
+  WHERE p.PostTypeId = 1
+),
+A AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    COALESCE(u.DisplayName, '') AS OwnerDisplayName,
+    p.Title,
+    p.Body,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.ViewCount,
+    ISNULL(v.UpVotes,0) AS UpVotes,
+    ISNULL(v.DownVotes,0) AS DownVotes,
+    ISNULL(v.BountyVotes,0) AS BountyVotes,
+    ISNULL(c.CommentCount,0) AS CommentCount,
+    ISNULL(a.Answers,0) AS AnswerCount,
+    ISNULL(u.Reputation,0) AS Reputation,
+    'A' AS PostKind,
+    ISNULL(LEN(p.Title),0) AS TitleLength,
+    COALESCE(u.DisplayName, '') AS OwnerResolvedName,
+    CASE
+      WHEN p.LastActivityDate > DATEADD(day,-7, GETDATE()) AND p.ViewCount > 100 THEN 'Hot'
+      WHEN p.ViewCount > 1000 THEN 'Trending'
+      ELSE 'Stable'
+    END AS Status,
+    CONCAT('Post-', CAST(p.Id AS varchar(20)), ': ', ISNULL(p.Title, '')) AS Label,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.ViewCount DESC) AS RankWithinType
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN VotesAgg v ON p.Id = v.PostId
+  LEFT JOIN CommentAgg c ON p.Id = c.PostId
+  LEFT JOIN (
+    SELECT ParentId AS QuestionId, COUNT(*) AS Answers
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY ParentId
+  ) a ON p.ParentId = a.QuestionId
+  WHERE p.PostTypeId = 2
+)
+SELECT *
+FROM (
+  SELECT PostId, PostTypeId, OwnerDisplayName, Title, Body, Tags, CreationDate, LastActivityDate, ViewCount,
+         UpVotes, DownVotes, BountyVotes, CommentCount, AnswerCount, Reputation,
+         PostKind, TitleLength, OwnerResolvedName, Status, Label, RankWithinType
+  FROM Q
+  UNION ALL
+  SELECT PostId, PostTypeId, OwnerDisplayName, Title, Body, Tags, CreationDate, LastActivityDate, ViewCount,
+         UpVotes, DownVotes, BountyVotes, CommentCount, AnswerCount, Reputation,
+         PostKind, TitleLength, OwnerResolvedName, Status, Label, RankWithinType
+  FROM A
+) AS Unioned
+ORDER BY RankWithinType, LastActivityDate DESC
+OFFSET 0 ROWS FETCH NEXT 1000 ROWS ONLY;

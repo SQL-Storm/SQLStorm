@@ -1,0 +1,44 @@
+SELECT 
+    p.Id,
+    p.Title,
+    p.Score,
+    u.DisplayName AS OwnerDisplayName,
+    COUNT(v.Id) AS VoteCount,
+    COUNT(c.Id) AS CommentCount,
+    COUNT(ph.Id) AS HistoryCount,
+    AVG(b.Class) AS AvgBadgeClass,
+    STRING_AGG(DISTINCT t.TagName, ',') AS Tags
+FROM 
+    Posts p
+JOIN 
+    Users u ON p.OwnerUserId = u.Id
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    Comments c ON p.Id = c.PostId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    Badges b ON p.OwnerUserId = b.UserId
+LEFT JOIN LATERAL (
+    SELECT elem AS TagName
+    FROM (
+        SELECT regexp_split_to_table(
+            SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)),
+            '\"><'
+        ) AS elem
+    ) s
+) t ON TRUE
+WHERE 
+    p.PostTypeId = 1
+    AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+GROUP BY 
+    p.Id, p.Title, p.Score, u.DisplayName, p.Tags
+HAVING 
+    COUNT(v.Id) > 10
+    AND COUNT(c.Id) > 5
+ORDER BY 
+    p.Score DESC, 
+    VoteCount DESC, 
+    CommentCount DESC
+LIMIT 100;

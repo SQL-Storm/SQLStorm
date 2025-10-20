@@ -1,0 +1,83 @@
+WITH 
+  top_tags AS (
+    SELECT TagName, COUNT(*) as post_count
+    FROM Tags 
+    WHERE Count > 1000
+    GROUP BY TagName
+    ORDER BY post_count DESC
+    LIMIT 10
+  ),
+  tag_posts AS (
+    SELECT p.Id as post_id, p.Score, p.ViewCount, p.CreationDate, u.Reputation as user_rep, t.TagName
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    JOIN (
+      SELECT unnest(string_to_array(substring(p2.Tags, 2, length(p2.Tags)-2), '><')) as tag, p2.Id
+      FROM Posts p2 
+      WHERE p2.PostTypeId = 1 AND p2.Tags IS NOT NULL
+    ) pt ON p.Id = pt.Id
+    JOIN top_tags t ON pt.tag = t.TagName
+    WHERE p.PostTypeId = 1 AND p.Score > 0
+  ),
+  user_engagement AS (
+    SELECT 
+      tp.post_id, 
+      tp.TagName,
+      COUNT(DISTINCT v.Id) as total_votes,
+      SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) as upvotes,
+      SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) as downvotes,
+      COUNT(DISTINCT c.Id) as comment_count,
+      AVG(u.Reputation) as avg_commenter_rep
+    FROM tag_posts tp
+    LEFT JOIN Votes v ON tp.post_id = v.PostId 
+      AND v.VoteTypeId IN (2, 3)
+    LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    LEFT JOIN Comments c ON tp.post_id = c.PostId 
+      AND c.Score > 0
+    LEFT JOIN Users u ON c.UserId = u.Id
+    GROUP BY tp.post_id, tp.TagName
+  ),
+  time_buckets AS (
+    SELECT 
+      tp.TagName,
+      DATE_TRUNC('month', tp.CreationDate) as month,
+      COUNT(*) as monthly_posts,
+      AVG(tp.user_rep) as avg_poster_rep,
+      AVG(tp.Score) as avg_score,
+      AVG(ue.total_votes) as avg_votes
+    FROM tag_posts tp
+    LEFT JOIN user_engagement ue ON tp.post_id = ue.post_id
+    WHERE tp.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '12 months'
+    GROUP BY tp.TagName, DATE_TRUNC('month', tp.CreationDate)
+  ),
+  engagement_trends AS (
+    SELECT 
+      TagName,
+      month,
+      monthly_posts,
+      avg_poster_rep,
+      avg_score,
+      avg_votes,
+      LAG(monthly_posts) OVER (PARTITION BY TagName ORDER BY month) as prev_monthly_posts,
+      LAG(avg_score) OVER (PARTITION BY TagName ORDER BY month) as prev_avg_score
+    FROM time_buckets
+  )
+SELECT 
+  et.TagName,
+  et.month,
+  et.monthly_posts,
+  ROUND((CAST(et.monthly_posts AS double precision) / NULLIF(et.prev_monthly_posts, 0)) - 1, 4) as post_growth_rate,
+  ROUND(et.avg_score - COALESCE(et.prev_avg_score, 0), 2) as score_change,
+  ROUND(et.avg_votes, 0) as avg_votes,
+  CASE 
+    WHEN (ROUND((CAST(et.monthly_posts AS double precision) / NULLIF(et.prev_monthly_posts, 0)) - 1, 4)) > 0.1 AND (ROUND(et.avg_score - COALESCE(et.prev_avg_score, 0), 2)) > 0 THEN 'Growing + Quality'
+    WHEN (ROUND((CAST(et.monthly_posts AS double precision) / NULLIF(et.prev_monthly_posts, 0)) - 1, 4)) > 0.1 THEN 'Growing'
+    WHEN (ROUND(et.avg_score - COALESCE(et.prev_avg_score, 0), 2)) > 0 THEN 'Improving Quality'
+    ELSE 'Stable/Declining'
+  END as trend_category,
+  RANK() OVER (ORDER BY et.monthly_posts DESC, et.avg_score DESC) as monthly_rank
+FROM engagement_trends et
+WHERE et.prev_monthly_posts IS NOT NULL
+GROUP BY et.TagName, et.month, et.monthly_posts, et.avg_score, et.avg_votes, et.prev_monthly_posts, et.prev_avg_score
+ORDER BY et.TagName, et.month DESC
+LIMIT 50;

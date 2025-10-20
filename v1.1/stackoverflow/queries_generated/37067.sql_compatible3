@@ -1,0 +1,213 @@
+WITH
+RecentQuestions AS (
+  SELECT p.Id, p.CreationDate, p.Title, p.OwnerUserId, p.ViewCount, p.Score, p.AnswerCount, p.Tags
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '730 days')
+),
+QuestionTags AS (
+  SELECT rq.Id AS QuestionId,
+         unnest(string_to_array(substring(rq.Tags, 2, length(rq.Tags)-2), '><')) AS Tag
+  FROM RecentQuestions rq
+),
+QuestionMetrics AS (
+  SELECT
+    q.Id,
+    q.CreationDate,
+    q.Title,
+    q.OwnerUserId,
+    q.ViewCount,
+    q.Score,
+    q.AnswerCount,
+    COUNT(DISTINCT c.Id) FILTER (WHERE c.CreationDate >= q.CreationDate) AS CommentsSinceCreation,
+    COUNT(DISTINCT ph.Id) FILTER (WHERE ph.CreationDate >= q.CreationDate) AS RevisionsSinceCreation,
+    MAX(v.CreationDate) FILTER (WHERE v.VoteTypeId IN (2,3)) AS LastVoteDate,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) FILTER (WHERE v.CreationDate >= q.CreationDate) AS VoteDelta,
+    COALESCE((SELECT COUNT(*) FROM Posts a WHERE a.ParentId = q.Id AND a.Score >= 0),0) AS PositiveAnswers,
+    COALESCE((SELECT AVG(a.Score) FROM Posts a WHERE a.ParentId = q.Id),0) AS AvgAnswerScore
+  FROM RecentQuestions q
+  LEFT JOIN Comments c ON c.PostId = q.Id
+  LEFT JOIN PostHistory ph ON ph.PostId = q.Id
+  LEFT JOIN Votes v ON v.PostId = q.Id
+  GROUP BY q.Id, q.CreationDate, q.Title, q.OwnerUserId, q.ViewCount, q.Score, q.AnswerCount
+),
+AuthorStats AS (
+  SELECT u.Id AS UserId,
+         u.Reputation,
+         u.CreationDate AS UserCreation,
+         u.LastAccessDate,
+         COUNT(b.Id) FILTER (WHERE b.Date >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days') AS BadgesLastYear,
+         SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) FILTER (WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days') AS QuestionsLastYear,
+         SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) FILTER (WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days') AS AnswersLastYear
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+QuestionEnriched AS (
+  SELECT qm.Id,
+         qm.CreationDate,
+         qm.Title,
+         qm.OwnerUserId,
+         qm.ViewCount,
+         qm.Score,
+         qm.AnswerCount,
+         qm.CommentsSinceCreation,
+         qm.RevisionsSinceCreation,
+         qm.LastVoteDate,
+         qm.VoteDelta,
+         qm.PositiveAnswers,
+         qm.AvgAnswerScore,
+         qt.Tag,
+         a.Reputation AS AuthorRep,
+         a.BadgesLastYear,
+         a.QuestionsLastYear,
+         a.AnswersLastYear,
+         (
+           ( (CAST(qm.ViewCount AS double precision)) / GREATEST(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - qm.CreationDate))/86400.0, 1) ) * 0.25
+           + (GREATEST(qm.Score,0) * 0.2)
+           + (COALESCE(qm.CommentsSinceCreation,0) * 1.0 / GREATEST(qm.AnswerCount,1)) * 0.15
+           + (COALESCE(qm.RevisionsSinceCreation,0) * 1.0) * 0.1
+           + (COALESCE(qm.PositiveAnswers,0) * 1.0) * 0.2
+         ) AS EngagementScore
+  FROM QuestionMetrics qm
+  JOIN QuestionTags qt ON qt.QuestionId = qm.Id
+  LEFT JOIN AuthorStats a ON a.UserId = qm.OwnerUserId
+),
+TagAggregates AS (
+  SELECT
+    qe.Tag,
+    COUNT(*) AS QuestionsInWindow,
+    AVG(qe.EngagementScore) AS AvgEngagement,
+    MAX(qe.EngagementScore) AS TopEngagement,
+    SUM(CASE WHEN qe.AnswerCount = 0 THEN 1 ELSE 0 END) AS UnansweredCount,
+    AVG(qe.AuthorRep) FILTER (WHERE qe.AuthorRep IS NOT NULL) AS AvgAuthorRep,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY qe.EngagementScore) AS MedianEngagement
+  FROM QuestionEnriched qe
+  GROUP BY qe.Tag
+),
+RankedQuestions AS (
+  SELECT
+    qe.Id,
+    qe.CreationDate,
+    qe.Title,
+    qe.OwnerUserId,
+    qe.ViewCount,
+    qe.Score,
+    qe.AnswerCount,
+    qe.CommentsSinceCreation,
+    qe.RevisionsSinceCreation,
+    qe.LastVoteDate,
+    qe.VoteDelta,
+    qe.PositiveAnswers,
+    qe.AvgAnswerScore,
+    qe.Tag,
+    qe.AuthorRep,
+    qe.BadgesLastYear,
+    qe.QuestionsLastYear,
+    qe.AnswersLastYear,
+    qe.EngagementScore,
+    ta.QuestionsInWindow,
+    ta.AvgEngagement,
+    ta.TopEngagement,
+    ta.UnansweredCount,
+    ta.AvgAuthorRep,
+    RANK() OVER (PARTITION BY qe.Tag ORDER BY qe.EngagementScore DESC, qe.Score DESC, qe.ViewCount DESC, qe.CreationDate DESC) AS TagRank
+  FROM QuestionEnriched qe
+  JOIN TagAggregates ta ON ta.Tag = qe.Tag
+),
+LinkMetrics AS (
+  SELECT
+    p.Id,
+    COUNT(pl.Id) FILTER (WHERE pl.LinkTypeId = 1) AS LinkedFromCount,
+    COUNT(pl.Id) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicateClaims,
+    COUNT(pl.Id) AS TotalOutgoingLinks
+  FROM Posts p
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+  GROUP BY p.Id
+),
+FinalCandidates AS (
+  SELECT
+    rq.Id,
+    rq.CreationDate,
+    rq.Title,
+    rq.OwnerUserId,
+    rq.ViewCount,
+    rq.Score,
+    rq.AnswerCount,
+    rj.Tag,
+    rj.TagRank,
+    rj.EngagementScore,
+    rj.QuestionsInWindow,
+    rj.AvgEngagement AS TagAvgEngagement,
+    lm.LinkedFromCount,
+    lm.DuplicateClaims,
+    COALESCE(vtab.Votes30,0) AS VotesLast30Days,
+    EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - rq.CreationDate))/86400.0 AS DaysSinceCreation
+  FROM RecentQuestions rq
+  JOIN RankedQuestions rj ON rj.Id = rq.Id
+  LEFT JOIN LinkMetrics lm ON lm.Id = rq.Id
+  LEFT JOIN (
+    SELECT v.PostId, COUNT(*) AS Votes30
+    FROM Votes v
+    WHERE v.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+      AND v.VoteTypeId IN (2,3)
+    GROUP BY v.PostId
+  ) vtab ON vtab.PostId = rq.Id
+  WHERE rj.TagRank <= 10
+),
+TopSelection AS (
+  SELECT *
+  FROM FinalCandidates
+  WHERE Tag IN (
+    SELECT Tag FROM TagAggregates ORDER BY AvgEngagement DESC NULLS LAST LIMIT 25
+  )
+  ORDER BY (EngagementScore * LEAST(1.0, GREATEST(0.1, 1.0 - (DaysSinceCreation / 365.0)))) DESC,
+           VotesLast30Days DESC,
+           LinkedFromCount DESC,
+           DuplicateClaims ASC
+  LIMIT 100
+)
+SELECT
+  ts.Id AS QuestionId,
+  ts.Title,
+  ts.Tag,
+  ts.TagRank,
+  ts.EngagementScore,
+  ts.QuestionsInWindow,
+  ts.TagAvgEngagement,
+  ts.ViewCount,
+  ts.Score,
+  ts.AnswerCount,
+  (SELECT SUM(CASE WHEN qe.AnswerCount = 0 THEN 1 ELSE 0 END) FROM QuestionEnriched qe WHERE qe.Tag = ts.Tag) AS UnansweredCount,
+  ts.LinkedFromCount,
+  ts.DuplicateClaims,
+  ts.VotesLast30Days,
+  ts.DaysSinceCreation,
+  u.DisplayName AS OwnerName,
+  u.Reputation AS OwnerReputation,
+  (SELECT json_agg(row_to_json(x)) FROM (
+     SELECT a.Id, a.Score, a.CreationDate, a.OwnerUserId, a.Body
+     FROM Posts a
+     WHERE a.ParentId = ts.Id AND a.PostTypeId = 2
+     ORDER BY a.Score DESC NULLS LAST, a.CreationDate ASC
+     LIMIT 3
+  ) x) AS TopAnswers,
+  (SELECT json_agg(row_to_json(x)) FROM (
+     SELECT c.Id, c.UserId, c.UserDisplayName, c.Text, c.CreationDate
+     FROM Comments c
+     WHERE c.PostId = ts.Id
+     ORDER BY c.CreationDate DESC
+     LIMIT 5
+  ) x) AS RecentComments,
+  (SELECT MedianEngagement FROM TagAggregates ta WHERE ta.Tag = ts.Tag) AS TagMedianEngagement,
+  (SELECT json_agg(row_to_json(x)) FROM (
+     SELECT b.Name, b.Class, b.Date
+     FROM Badges b
+     WHERE b.UserId = ts.OwnerUserId
+     ORDER BY b.Date DESC
+     LIMIT 5
+  ) x) AS OwnerRecentBadges
+FROM TopSelection ts
+LEFT JOIN Users u ON u.Id = ts.OwnerUserId
+ORDER BY ts.EngagementScore DESC, ts.VotesLast30Days DESC;

@@ -1,0 +1,81 @@
+-- {"query": "59083.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2061, "output_tokens": 927} 
+SELECT 
+    p.Id AS PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    COUNT(DISTINCT v.Id) AS VoteCount,
+    COUNT(DISTINCT ph.Id) AS HistoryCount,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS Tags,
+    CASE 
+        WHEN p.PostTypeId = 1 THEN 'Question'
+        WHEN p.PostTypeId = 2 THEN 'Answer'
+        WHEN p.PostTypeId = 3 THEN 'Wiki'
+        WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+        WHEN p.PostTypeId = 5 THEN 'TagWiki'
+        WHEN p.PostTypeId = 6 THEN 'ModeratorNomination'
+        WHEN p.PostTypeId = 7 THEN 'WikiPlaceholder'
+        WHEN p.PostTypeId = 8 THEN 'PrivilegeWiki'
+    END AS PostType,
+    CASE 
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned'
+        WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+        ELSE 'Open'
+    END AS PostStatus,
+    COALESCE(p.AnswerCount, 0) AS AnswerCount,
+    COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+    COALESCE(p.CommentCount, 0) AS CommentCountActual,
+    MAX(ph.CreationDate) AS LastActivity,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 1) AS QuestionsAsked,
+    (SELECT COUNT(*) FROM Posts p3 WHERE p3.OwnerUserId = u.Id AND p3.PostTypeId = 2) AS AnswersGiven,
+    (SELECT COUNT(*) FROM Votes v2 WHERE v2.UserId = u.Id AND v2.VoteTypeId IN (2, 3)) AS TotalVotes,
+    (SELECT AVG(p4.Score) FROM Posts p4 WHERE p4.OwnerUserId = u.Id AND p4.PostTypeId = 1) AS AvgQuestionScore,
+    (SELECT AVG(p5.Score) FROM Posts p5 WHERE p5.OwnerUserId = u.Id AND p5.PostTypeId = 2) AS AvgAnswerScore,
+    (SELECT COUNT(*) FROM Posts p6 WHERE p6.ParentId = p.Id) AS ChildPostsCount
+FROM Posts p
+JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Comments c ON p.Id = c.PostId
+LEFT JOIN Votes v ON p.Id = v.PostId
+LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN (
+    SELECT PostId, TagName 
+    FROM Posts p7 
+    CROSS JOIN UNNEST(string_to_array(substring(p7.Tags, 2, length(p7.Tags)-2), '><')) AS TagName
+) t ON p.Id = t.PostId
+WHERE p.CreationDate >= '2020-01-01'
+    AND p.CreationDate < '2024-01-01'
+    AND p.PostTypeId IN (1, 2)
+    AND u.Reputation > 1000
+GROUP BY 
+    p.Id, 
+    p.Title, 
+    p.Score, 
+    p.ViewCount, 
+    p.CreationDate, 
+    u.DisplayName, 
+    u.Reputation, 
+    p.PostTypeId, 
+    p.ClosedDate, 
+    p.CommunityOwnedDate, 
+    p.AcceptedAnswerId, 
+    p.AnswerCount, 
+    p.FavoriteCount, 
+    p.CommentCount
+HAVING 
+    COUNT(DISTINCT c.Id) > 5
+    OR COUNT(DISTINCT v.Id) > 10
+    OR COUNT(DISTINCT ph.Id) > 3
+    OR p.Score > 50
+ORDER BY 
+    p.Score DESC,
+    p.ViewCount DESC,
+    LastActivity DESC
+LIMIT 10000;

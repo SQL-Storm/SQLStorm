@@ -1,0 +1,77 @@
+WITH cte AS (
+  SELECT 
+    p.Id, 
+    p.PostTypeId, 
+    p.CreationDate, 
+    p.Score, 
+    p.OwnerUserId, 
+    p.ParentId, 
+    p.AcceptedAnswerId, 
+    p.ViewCount, 
+    p.AnswerCount, 
+    p.CommentCount AS PostCommentCount, 
+    p.FavoriteCount, 
+    u.Reputation, 
+    u.CreationDate AS UserCreationDate, 
+    u.LastAccessDate, 
+    u.Views, 
+    u.UpVotes, 
+    u.DownVotes, 
+    bt.Name AS PostTypeName, 
+    ct.Name AS CloseReasonName, 
+    vt.Name AS VoteTypeName,
+    CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus,
+    CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community' ELSE 'User' END AS OwnerType,
+    CAST(('2024-10-01 12:34:56') AS timestamp) - p.CreationDate AS PostAgeInterval,
+    CAST(('2024-10-01 12:34:56') AS timestamp) - u.CreationDate AS UserAgeInterval,
+    CAST(('2024-10-01 12:34:56') AS timestamp) - u.LastAccessDate AS UserLastAccessInterval,
+    -- extract days as an integer where appropriate for various dialects use EXTRACT(epoch ...) / 86400 when necessary
+    EXTRACT(day FROM (CAST(('2024-10-01 12:34:56') AS timestamp) - p.CreationDate)) AS PostAgeDays,
+    EXTRACT(day FROM (CAST(('2024-10-01 12:34:56') AS timestamp) - u.CreationDate)) AS UserAgeDays,
+    EXTRACT(day FROM (CAST(('2024-10-01 12:34:56') AS timestamp) - u.LastAccessDate)) AS UserLastAccessDays,
+    -- main tag: adapt SUBSTRING_INDEX (MySQL) to a portable expression: take text between first '<' and '>' if Tags like '<tag1><tag2>'
+    CASE 
+      WHEN p.Tags IS NULL THEN NULL
+      WHEN POSITION('>' IN p.Tags) > 0 THEN
+        SUBSTR(p.Tags, 2, CASE WHEN POSITION('>' IN p.Tags) > 1 THEN POSITION('>' IN p.Tags) - 2 ELSE NULL END)
+      ELSE p.Tags
+    END AS MainTag,
+    (SELECT COUNT(*) FROM PostHistory ph2 WHERE ph2.PostId = p.Id AND ph2.PostHistoryTypeId IN (4,5,6)) AS EditCount,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+    (SELECT COUNT(*) FROM Votes v2 WHERE v2.PostId = p.Id AND v2.VoteTypeId = 2) AS UpVoteCount,
+    (SELECT COUNT(*) FROM Votes v3 WHERE v3.PostId = p.Id AND v3.VoteTypeId = 3) AS DownVoteCount,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS DuplicateCount
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN PostTypes bt ON p.PostTypeId = bt.Id
+  LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 10
+  LEFT JOIN CloseReasonTypes ct ON ph.Comment IS NOT NULL AND TRY_CAST(ph.Comment AS int) = ct.Id
+  LEFT JOIN Votes v ON p.Id = v.PostId
+  LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  WHERE p.CreationDate >= '2015-01-01' AND p.CreationDate < '2021-01-01'
+)
+SELECT 
+  MainTag,
+  PostTypeName,
+  PostStatus,
+  OwnerType,
+  AVG(PostAgeDays) AS AvgPostAgeDays,
+  AVG(UserAgeDays) AS AvgUserAgeDays,
+  AVG(UserLastAccessDays) AS AvgUserLastAccessDays,
+  AVG(Score) AS AvgScore,
+  AVG(ViewCount) AS AvgViewCount, 
+  AVG(AnswerCount) AS AvgAnswerCount,
+  AVG(CommentCount) AS AvgCommentCount,
+  AVG(FavoriteCount) AS AvgFavoriteCount,
+  AVG(Reputation) AS AvgReputation,
+  AVG(Views) AS AvgUserViews,
+  AVG(UpVotes) AS AvgUserUpVotes,
+  AVG(DownVotes) AS AvgUserDownVotes,
+  AVG(EditCount) AS AvgEditCount,
+  AVG(CommentCount) AS AvgCommentCount,
+  AVG(UpVoteCount) AS AvgUpVoteCount,
+  AVG(DownVoteCount) AS AvgDownVoteCount,
+  AVG(DuplicateCount) AS AvgDuplicateCount
+FROM cte
+GROUP BY MainTag, PostTypeName, PostStatus, OwnerType
+ORDER BY AvgPostAgeDays DESC;

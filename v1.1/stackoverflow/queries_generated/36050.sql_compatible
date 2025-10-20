@@ -1,0 +1,24 @@
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  u.Reputation,
+  COUNT(DISTINCT p.Id) AS PostCount,
+  SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+  SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+  SUM(CASE WHEN v.VoteTypeId IN (2,3) THEN 1 ELSE 0 END) AS TotalVotesReceived,
+  AVG(v.BountyAmount) FILTER (WHERE v.BountyAmount IS NOT NULL) AS AvgBountyAmount,
+  MAX(p.CreationDate) AS LastActivity,
+  STRING_AGG(DISTINCT t.Name, ',') AS TopTags
+FROM
+  Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id AND v.UserId = u.Id
+  LEFT JOIN PostTags pt ON pt.PostId = p.Id
+  LEFT JOIN Tags t ON t.Id = pt.TagId
+WHERE
+  u.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+GROUP BY
+  u.Id, u.DisplayName, u.Reputation
+ORDER BY
+  TotalVotesReceived DESC
+LIMIT 100;

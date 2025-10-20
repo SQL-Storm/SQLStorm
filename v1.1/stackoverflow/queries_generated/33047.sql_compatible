@@ -1,0 +1,58 @@
+SELECT
+    p.Id AS PostId,
+    p.Title AS PostTitle,
+    p.CreationDate AS PostCreationDate,
+    p.Score AS PostScore,
+    p.ViewCount AS PostViewCount,
+    -- convert array to comma-separated string in standard SQL using array functions if supported;
+    -- for portability, use COALESCE and JOIN on UNNEST where available; here use a generic replacement:
+    CASE
+      WHEN p.Tags IS NULL THEN NULL
+      ELSE (SELECT STRING_AGG(tag, ',') FROM UNNEST(p.Tags) AS tag)
+    END AS Tags,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation AS OwnerReputation,
+    -- aggregate distinct commenter names
+    ARRAY_AGG(DISTINCT c.UserDisplayName) FILTER (WHERE c.UserDisplayName IS NOT NULL) AS Commenters,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpVotesCount,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownVotesCount,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 12 THEN v.Id END) AS SpamVotesCount,
+    MIN(c.CreationDate) AS EarliestCommentDate,
+    MAX(c.CreationDate) AS LatestCommentDate,
+    bo.BadgeCount AS TotalBadges,
+    (SELECT COUNT(*) FROM Posts p_answers WHERE p_answers.ParentId = p.Id AND p_answers.PostTypeId = 2) AS AnswerCount,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 1) AS LinkedPostsCount,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.RelatedPostId = p.Id AND pl.LinkTypeId = 3) AS DuplicateCount
+FROM
+    Posts p
+LEFT JOIN
+    Users u ON p.OwnerUserId = u.Id
+LEFT JOIN
+    Comments c ON c.PostId = p.Id
+LEFT JOIN
+    Votes v ON v.PostId = p.Id
+LEFT JOIN
+    (
+        SELECT
+            UserId AS OwnerUserId,
+            COUNT(*) AS BadgeCount
+        FROM
+            Badges
+        GROUP BY
+            UserId
+    ) bo ON bo.OwnerUserId = p.OwnerUserId
+WHERE
+    p.PostTypeId = 1
+GROUP BY
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    u.DisplayName,
+    u.Reputation,
+    bo.BadgeCount
+ORDER BY
+    p.CreationDate DESC
+LIMIT 50;

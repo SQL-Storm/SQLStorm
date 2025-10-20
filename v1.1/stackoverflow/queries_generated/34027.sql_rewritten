@@ -1,0 +1,170 @@
+-- {"query": "34027.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 1373} 
+WITH RecursiveUserBadges AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        b.Name AS BadgeName,
+        b.Class,
+        b.Date,
+        1 AS BadgeCount
+    FROM Users u
+    JOIN Badges b ON u.Id = b.UserId
+    WHERE b.Class = 1 -- Gold badges
+    UNION ALL
+    SELECT
+        r.UserId,
+        r.DisplayName,
+        b.Name,
+        b.Class,
+        b.Date,
+        r.BadgeCount + 1
+    FROM RecursiveUserBadges r
+    JOIN Badges b ON r.UserId = b.UserId AND b.Class = 1 AND b.Date > r.Date
+    WHERE r.BadgeCount < 5
+), TopBadgeHolders AS (
+    SELECT
+        UserId,
+        DisplayName,
+        MAX(BadgeCount) AS MaxGoldBadges
+    FROM RecursiveUserBadges
+    GROUP BY UserId, DisplayName
+    HAVING MAX(BadgeCount) >= 3
+),
+RecentActiveQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.ViewCount,
+        p.Score,
+        p.AnswerCount,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > cast('2024-10-01' as date) - INTERVAL '1 year'
+      AND p.Score > 0
+),
+TopUsersQuestions AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        tu.DisplayName,
+        q.CreationDate,
+        q.ViewCount,
+        q.Score,
+        q.AnswerCount,
+        q.Tags
+    FROM RecentActiveQuestions q
+    JOIN TopBadgeHolders tu ON q.OwnerUserId = tu.UserId
+    WHERE q.rn <= 5
+),
+AnswerDetails AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId AS AnswererId,
+        u.DisplayName AS AnswererName,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreationDate,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS rn
+    FROM Posts a
+    JOIN Users u ON a.OwnerUserId = u.Id
+    WHERE a.PostTypeId = 2
+),
+TopAnswers AS (
+    SELECT
+        AnswerId,
+        QuestionId,
+        AnswererId,
+        AnswererName,
+        AnswerScore,
+        AnswerCreationDate
+    FROM AnswerDetails
+    WHERE rn <= 3
+),
+AnswerVotes AS (
+    SELECT
+        v.PostId AS AnswerId,
+        COUNT(CASE WHEN vt.Name = 'UpMod' THEN 1 END) AS UpVotes,
+        COUNT(CASE WHEN vt.Name = 'DownMod' THEN 1 END) AS DownVotes
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE v.PostId IN (SELECT AnswerId FROM TopAnswers)
+    GROUP BY v.PostId
+),
+CommentCounts AS (
+    SELECT
+        c.PostId,
+        COUNT(*) AS CommentCount
+    FROM Comments c
+    WHERE c.PostId IN (
+        SELECT QuestionId FROM TopUsersQuestions
+        UNION
+        SELECT AnswerId FROM TopAnswers
+    )
+    GROUP BY c.PostId
+),
+PostHistoryEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        COUNT(*) AS EditCount
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+      AND ph.PostId IN (
+          SELECT QuestionId FROM TopUsersQuestions
+          UNION
+          SELECT AnswerId FROM TopAnswers
+      )
+    GROUP BY ph.PostId, ph.UserId
+),
+AggregatedUserStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(COALESCE(p.Score, 0)) AS TotalScore,
+        SUM(COALESCE(p.ViewCount, 0)) AS TotalViews,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        AVG(COALESCE(p.AnswerCount, 0)) AS AvgAnswersPerQuestion
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId IN (1, 2)
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(DISTINCT p.Id) > 10
+),
+FinalResult AS (
+    SELECT
+        t.QuestionId,
+        t.Title AS QuestionTitle,
+        t.DisplayName AS QuestionOwner,
+        t.CreationDate AS QuestionCreationDate,
+        t.ViewCount AS QuestionViews,
+        t.Score AS QuestionScore,
+        t.AnswerCount AS QuestionAnswerCount,
+        COALESCE(cq.CommentCount, 0) AS QuestionComments,
+        STRING_AGG(DISTINCT regexp_replace(t.Tags, '[<>]', '', 'g'), ', ') AS QuestionTags,
+        a.AnswerId,
+        a.AnswererName,
+        a.AnswerScore,
+        COALESCE(av.UpVotes, 0) AS AnswerUpVotes,
+        COALESCE(av.DownVotes, 0) AS AnswerDownVotes,
+        COALESCE(ca.CommentCount, 0) AS AnswerComments,
+        ph.EditCount AS AnswerEditCount,
+        ustats.TotalPosts AS AnswererTotalPosts,
+        ustats.TotalScore AS AnswererTotalScore,
+        ustats.BadgeCount AS AnswererBadgeCount
+    FROM TopUsersQuestions t
+    LEFT JOIN TopAnswers a ON t.QuestionId = a.QuestionId
+    LEFT JOIN AnswerVotes av ON a.AnswerId = av.AnswerId
+    LEFT JOIN CommentCounts cq ON cq.PostId = t.QuestionId
+    LEFT JOIN CommentCounts ca ON ca.PostId = a.AnswerId
+    LEFT JOIN PostHistoryEdits ph ON ph.PostId = a.AnswerId AND ph.UserId = a.AnswererId
+    LEFT JOIN AggregatedUserStats ustats ON ustats.UserId = a.AnswererId
+    ORDER BY t.Score DESC, a.AnswerScore DESC NULLS LAST
+    LIMIT 50
+)
+SELECT * FROM FinalResult;

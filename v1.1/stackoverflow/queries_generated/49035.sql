@@ -1,0 +1,105 @@
+-- {"query": "49035.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 1468} 
+
+WITH UserPostStats AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS TotalQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS TotalQuestionViews,
+        MAX(p.LastActivityDate) AS LastPostActivityDate,
+        COUNT(DISTINCT T.tag) FILTER (WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND T.tag IN ('sql', 'python', 'javascript', 'c#', 'java', 'r', 'html', 'css', 'php', 'node.js', 'reactjs', 'angular')) AS UniqueHotTagsCount
+    FROM Posts p
+    LEFT JOIN LATERAL unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS T(tag) ON p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserBadgeStats AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserLinkActivity AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        SUM(COALESCE(pla.LinkedToCount, 0)) AS TotalLinkedPosts,
+        SUM(COALESCE(pla.DuplicateCount, 0)) AS TotalDuplicatePosts
+    FROM Posts p
+    JOIN (
+        SELECT
+            pl.PostId,
+            COUNT(CASE WHEN pl.LinkTypeId = 1 THEN pl.Id END) AS LinkedToCount,
+            COUNT(CASE WHEN pl.LinkTypeId = 3 THEN pl.Id END) AS DuplicateCount
+        FROM PostLinks pl
+        GROUP BY pl.PostId
+    ) AS pla ON p.Id = pla.PostId
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserRevisionActivity AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        SUM(COALESCE(pra.EditRevisions, 0)) AS TotalPostEdits,
+        SUM(COALESCE(pra.CloseReopenEvents, 0)) AS TotalCloseReopenEvents
+    FROM Posts p
+    JOIN (
+        SELECT
+            ph.PostId,
+            COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9) THEN ph.Id END) AS EditRevisions, -- Title, Body, Tags edits/rollbacks
+            COUNT(CASE WHEN ph.PostHistoryTypeId IN (10, 11) THEN ph.Id END) AS CloseReopenEvents -- Post Closed/Reopened
+        FROM PostHistory ph
+        GROUP BY ph.PostId
+    ) AS pra ON p.Id = pra.PostId
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    COALESCE(ubs.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ubs.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ubs.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(ups.TotalQuestions, 0) AS QuestionsAsked,
+    COALESCE(ups.TotalAnswers, 0) AS AnswersProvided,
+    COALESCE(ups.AvgQuestionScore, 0) AS AverageQuestionScore,
+    COALESCE(ups.TotalQuestionViews, 0) AS TotalQuestionViews,
+    COALESCE(ups.UniqueHotTagsCount, 0) AS ActiveHotTags,
+    COALESCE(ula.TotalLinkedPosts, 0) AS PostsLinkedTotal,
+    COALESCE(ula.TotalDuplicatePosts, 0) AS PostsDuplicatedTotal,
+    COALESCE(ura.TotalPostEdits, 0) AS UserPostEditCount,
+    COALESCE(ura.TotalCloseReopenEvents, 0) AS UserPostCloseReopenCount,
+    ups.LastPostActivityDate,
+    RANK() OVER (
+        ORDER BY
+            u.Reputation DESC,
+            COALESCE(ubs.GoldBadges, 0) DESC,
+            COALESCE(ups.AvgQuestionScore, 0) DESC,
+            COALESCE(ups.TotalQuestions, 0) DESC,
+            COALESCE(ups.TotalAnswers, 0) DESC,
+            COALESCE(ula.TotalLinkedPosts, 0) DESC,
+            COALESCE(ula.TotalDuplicatePosts, 0) DESC,
+            COALESCE(ura.TotalPostEdits, 0) DESC,
+            ups.LastPostActivityDate DESC
+    ) AS OverallRank
+FROM Users u
+LEFT JOIN UserPostStats ups ON u.Id = ups.UserId
+LEFT JOIN UserBadgeStats ubs ON u.Id = ubs.UserId
+LEFT JOIN UserLinkActivity ula ON u.Id = ula.UserId
+LEFT JOIN UserRevisionActivity ura ON u.Id = ura.UserId
+WHERE
+    u.Reputation > 7500
+    AND COALESCE(ups.TotalQuestions, 0) > 30
+    AND COALESCE(ups.TotalAnswers, 0) > 75
+    AND COALESCE(ubs.GoldBadges, 0) >= 5
+    AND COALESCE(ups.LastPostActivityDate, '1900-01-01') >= (CURRENT_TIMESTAMP - INTERVAL '3 year')
+    AND COALESCE(ups.UniqueHotTagsCount, 0) >= 3
+ORDER BY OverallRank ASC
+LIMIT 100;

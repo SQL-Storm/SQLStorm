@@ -1,0 +1,109 @@
+WITH
+RecentPosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+),
+TopQuestions AS (
+    SELECT *
+    FROM RecentPosts
+    WHERE PostTypeId = 1
+      AND rn <= 100
+),
+TopAnswers AS (
+    SELECT *
+    FROM RecentPosts
+    WHERE PostTypeId = 2
+      AND rn <= 100
+),
+UserStats AS (
+    SELECT
+        u.Id AS user_id,
+        u.DisplayName,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END)    AS questions_posted,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END)    AS answers_posted,
+        COALESCE(SUM(v.Score), 0)                      AS total_votes_received,
+        DENSE_RANK() OVER (ORDER BY COALESCE(SUM(v.Score), 0) DESC) AS vote_rank
+    FROM Users u
+    LEFT JOIN Posts p
+        ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT
+            PostId,
+            CASE WHEN VoteTypeId = 2 THEN  1
+                 WHEN VoteTypeId = 3 THEN -1
+                 ELSE 0 END AS Score
+        FROM Votes
+        WHERE VoteTypeId IN (2, 3)
+    ) v
+        ON v.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName
+),
+BadgeList AS (
+    SELECT
+        b.UserId,
+        -- Build JSON array using standard-ish functions: aggregate text of JSON objects and wrap in array
+        '[' || STRING_AGG(
+            '{"badge":' || REPLACE(REPLACE(COALESCE(b.Name, ''), '\', '\\'), '"', '\"') || ',"class":' || COALESCE(CAST(b.Class AS VARCHAR), 'null') || ',"date":' || COALESCE(QUOTE_LITERAL(CAST(b.Date AS VARCHAR)), 'null') || '}'
+            , ','
+        ) || ']' AS badges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TagUsage AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id)                   AS question_count,
+        AVG(p.Score)                  AS avg_score,
+        RANK() OVER (ORDER BY COUNT(p.Id) DESC) AS tag_rank
+    FROM Tags t
+    JOIN Posts p
+      ON p.PostTypeId = 1
+     AND p.Tags LIKE '%' || t.TagName || '%'
+    GROUP BY t.TagName
+)
+SELECT
+    us.DisplayName,
+    us.questions_posted,
+    us.answers_posted,
+    us.total_votes_received,
+    us.vote_rank,
+    COALESCE(bl.badges, '[]')        AS badges,
+    tu.TagName                      AS top_tag,
+    tu.question_count,
+    ROUND(tu.avg_score, 2)          AS top_tag_avg_score,
+    tq.Score                        AS top_recent_question_score,
+    ta.Score                        AS top_recent_answer_score,
+    u.Id
+FROM UserStats us
+JOIN Users u
+  ON u.Id = us.user_id
+LEFT JOIN BadgeList bl
+  ON bl.UserId = u.Id
+LEFT JOIN TagUsage tu
+  ON tu.tag_rank = 1
+LEFT JOIN TopQuestions tq
+  ON tq.OwnerUserId = u.Id
+LEFT JOIN TopAnswers ta
+  ON ta.OwnerUserId = u.Id
+WHERE us.vote_rank <= 50
+GROUP BY
+    us.DisplayName,
+    us.questions_posted,
+    us.answers_posted,
+    us.total_votes_received,
+    us.vote_rank,
+    bl.badges,
+    tu.TagName,
+    tu.question_count,
+    tu.avg_score,
+    tq.Score,
+    ta.Score,
+    u.Id
+ORDER BY us.vote_rank, us.DisplayName
+FETCH FIRST 200 ROWS ONLY;

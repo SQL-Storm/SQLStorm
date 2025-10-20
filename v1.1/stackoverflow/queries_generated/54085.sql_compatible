@@ -1,0 +1,99 @@
+WITH question_stats AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.OwnerUserId,
+        p.Score AS QuestionScore,
+        p.ViewCount,
+        p.Tags,
+        MAX(ph.CreationDate) AS LatestEdit,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)  AS Upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)  AS Downvotes,
+        SUM(CASE WHEN v.VoteTypeId = 4 THEN 1 ELSE 0 END)  AS Offensive,
+        SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END)  AS Accepted,
+        COUNT(a.Id)                            AS AnswerCount,
+        SUM(CASE WHEN a.Score > 0 THEN a.Score ELSE 0 END)   AS GoodAnswerScore,
+        SUM(CASE WHEN a.Score < 0 THEN a.Score ELSE 0 END)   AS BadAnswerScore,
+        ARRAY_AGG(DISTINCT t.TagName)          AS TagList,
+        COUNT(DISTINCT c.Id)                   AS CommentCount
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId IN (5,6)
+    LEFT JOIN LATERAL (
+        SELECT unnest(string_to_array(COALESCE(p.Tags, ''), ',')) AS TagName
+    ) t ON TRUE
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.OwnerUserId, p.Score, p.ViewCount, p.Tags
+),
+close_reason_stats AS (
+    SELECT
+        ph.PostId,
+        COUNT(*) AS CloseVotes,
+        MAX(CASE WHEN ph.Comment = CAST(crt.Id AS text) THEN crt.Name END) AS CloseReason
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON CAST(ph.Comment AS integer) = crt.Id
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId
+),
+user_perf AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT q.QuestionId)    AS QuestionsAsked,
+        COUNT(DISTINCT a.Id)             AS AnswersGiven,
+        SUM(a.Score)                     AS AnswerScoreSum,
+        AVG(a.Score)                     AS AvgAnswerScore,
+        COUNT(DISTINCT c.Id)             AS CommentsMade,
+        STRING_AGG(DISTINCT b.Name, ', ') AS BadgesEarned
+    FROM Users u
+    LEFT JOIN Posts q ON q.OwnerUserId = u.Id AND q.PostTypeId = 1
+    LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+top_tags AS (
+    SELECT
+        p.OwnerUserId,
+        t.TagName,
+        COUNT(*) AS TagFrequency
+    FROM Posts p
+    JOIN LATERAL (
+        SELECT unnest(string_to_array(COALESCE(p.Tags, ''), ',')) AS TagName
+    ) t ON TRUE
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId, t.TagName
+    ORDER BY TagFrequency DESC
+    LIMIT 3
+)
+SELECT
+    up.UserId,
+    up.DisplayName,
+    up.Reputation,
+    up.QuestionsAsked,
+    up.AnswersGiven,
+    up.AnswerScoreSum,
+    up.AvgAnswerScore,
+    up.CommentsMade,
+    up.BadgesEarned,
+    ARRAY_AGG(DISTINCT qt.TagName) FILTER (WHERE qt.TagName IS NOT NULL) AS TopTags,
+    qs.ViewCount,
+    qs.QuestionScore,
+    qs.AnswerCount,
+    qs.Upvotes,
+    qs.Downvotes,
+    crs.CloseReason,
+    qs.LatestEdit
+FROM user_perf up
+JOIN question_stats qs ON qs.OwnerUserId = up.UserId
+LEFT JOIN close_reason_stats crs ON crs.PostId = qs.QuestionId
+LEFT JOIN top_tags qt ON qt.OwnerUserId = up.UserId
+WHERE qs.AnswerCount > 0
+GROUP BY up.UserId, up.DisplayName, up.Reputation, up.QuestionsAsked, up.AnswersGiven,
+         up.AnswerScoreSum, up.AvgAnswerScore, up.CommentsMade, up.BadgesEarned,
+         qs.ViewCount, qs.QuestionScore, qs.AnswerCount, qs.Upvotes, qs.Downvotes,
+         crs.CloseReason, qs.LatestEdit
+ORDER BY qs.QuestionScore DESC, up.Reputation DESC
+LIMIT 100;

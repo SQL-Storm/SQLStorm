@@ -1,0 +1,42 @@
+-- {"query": "36060.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 384} 
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.PostTypeId,
+  p.ViewCount,
+  p.Score,
+  p.CreationDate,
+  p.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+  COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes,
+  COUNT(DISTINCT cl.Id) AS CommentCount,
+  ARRAY_AGG(DISTINCT t.TagName) FILTER (WHERE p.PostTypeId = 1) AS Tags,
+  MAX(CASE WHEN ph.PostHistoryTypeId = 50 THEN ph.CreationDate END) AS CommunityBumpDate,
+  MAX(p.LastActivityDate) AS LastActivityDate
+FROM
+  Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN Comments cl ON cl.PostId = p.Id
+  LEFT JOIN LATERAL (
+    SELECT DISTINCT t.TagName
+    FROM UNNEST(string_to_array(TRIM(BOTH '><' FROM p.Tags), '><')) AS t(TagName)
+  ) AS t ON p.PostTypeId = 1
+  LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+WHERE
+  p.PostTypeId IN (1, 2)
+  AND p.CreationDate >= (CURRENT_DATE - INTERVAL '365 days')
+GROUP BY
+  p.Id,
+  p.Title,
+  p.PostTypeId,
+  p.ViewCount,
+  p.Score,
+  p.CreationDate,
+  p.OwnerUserId,
+  u.DisplayName
+ORDER BY
+  p.Score DESC,
+  p.ViewCount DESC
+LIMIT 100;

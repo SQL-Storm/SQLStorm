@@ -1,0 +1,29 @@
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  COUNT(p.Id) AS PostCount,
+  SUM(p.ViewCount) AS TotalViews,
+  AVG(p.Score) AS AvgPostScore,
+  SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+  SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+  MAX(p.CreationDate) AS LastActive,
+  STRING_AGG(DISTINCT t.Name, ',') AS TagNames,
+  SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+  SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived
+FROM
+  Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN PostTags pt ON pt."PostId" = p.Id OR pt.PostId = p.Id
+  LEFT JOIN Tags t ON t.Id = pt.TagId
+  LEFT JOIN Votes v ON v.PostId = p.Id
+WHERE
+  u.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '1 year')
+GROUP BY
+  u.Id,
+  u.DisplayName
+HAVING
+  COUNT(p.Id) > 10
+ORDER BY
+  TotalViews DESC,
+  AvgPostScore DESC
+LIMIT 100;

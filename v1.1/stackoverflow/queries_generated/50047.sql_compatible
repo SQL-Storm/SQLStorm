@@ -1,0 +1,90 @@
+WITH TagActivity AS (
+    SELECT
+        p_ans.OwnerUserId,
+        t.TagName,
+        p_ans.Score,
+        p_ans.CreationDate
+    FROM Posts AS p_q
+    JOIN Tags AS t ON p_q.Tags LIKE '%' || t.TagName || '%'
+    JOIN Posts AS p_ans ON p_q.Id = p_ans.ParentId
+    WHERE p_q.PostTypeId = 1
+      AND p_ans.PostTypeId = 2
+      AND p_ans.OwnerUserId IS NOT NULL
+      AND t.Count > 1000
+      AND p_q.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '5' YEAR)
+),
+UserTagStats AS (
+    SELECT
+        ta.OwnerUserId,
+        ta.TagName,
+        COUNT(*) AS AnswerCount,
+        SUM(ta.Score) AS TotalScore,
+        AVG(ta.Score) AS AvgScore,
+        MAX(ta.CreationDate) AS LastAnswerDate
+    FROM TagActivity ta
+    GROUP BY ta.OwnerUserId, ta.TagName
+    HAVING COUNT(*) > 5 AND SUM(ta.Score) > 20
+),
+RankedUsers AS (
+    SELECT
+        uts.OwnerUserId,
+        uts.TagName,
+        uts.AnswerCount,
+        uts.TotalScore,
+        uts.AvgScore,
+        uts.LastAnswerDate,
+        RANK() OVER (PARTITION BY uts.TagName ORDER BY uts.TotalScore DESC, uts.AnswerCount DESC) AS RankInTag,
+        AVG(uts.TotalScore) OVER (PARTITION BY uts.TagName) AS AvgTagTotalScore,
+        (SELECT MIN(v.CreationDate) FROM Votes v WHERE v.UserId = uts.OwnerUserId AND v.VoteTypeId = 2) AS FirstUpvoteDate
+    FROM UserTagStats uts
+),
+EnrichedUserData AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        (CAST(u.UpVotes AS DECIMAL) / (u.UpVotes + u.DownVotes + 1)) AS UpvoteRatio,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id) AS TotalComments
+    FROM Users u
+    WHERE u.Reputation > 10000 AND (u.UpVotes + u.DownVotes) > 100
+)
+SELECT
+    ru.TagName,
+    eud.DisplayName,
+    eud.Reputation,
+    ru.RankInTag,
+    ru.AnswerCount,
+    ru.TotalScore,
+    ru.TotalScore - ru.AvgTagTotalScore AS ScoreVsTagAverage,
+    eud.UpvoteRatio,
+    eud.GoldBadges,
+    eud.TotalComments,
+    ru.LastAnswerDate,
+    ru.FirstUpvoteDate
+FROM RankedUsers ru
+JOIN EnrichedUserData eud ON ru.OwnerUserId = eud.Id
+WHERE ru.RankInTag <= 10
+  AND EXISTS (
+      SELECT 1
+      FROM PostHistory ph
+      WHERE ph.UserId = ru.OwnerUserId
+        AND ph.PostHistoryTypeId IN (5, 8)
+        AND ph.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR)
+  )
+GROUP BY
+    ru.TagName,
+    eud.DisplayName,
+    eud.Reputation,
+    ru.RankInTag,
+    ru.AnswerCount,
+    ru.TotalScore,
+    ru.AvgTagTotalScore,
+    eud.UpvoteRatio,
+    eud.GoldBadges,
+    eud.TotalComments,
+    ru.LastAnswerDate,
+    ru.FirstUpvoteDate
+ORDER BY ru.TagName, ru.RankInTag, eud.Reputation DESC;

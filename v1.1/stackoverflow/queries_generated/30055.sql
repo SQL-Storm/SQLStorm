@@ -1,0 +1,10 @@
+-- {"query": "30055.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-3.5-turbo", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1962, "output_tokens": 91} 
+
+SELECT Users.Id as UserId, Users.DisplayName as UserDisplayName, Users.Reputation,
+       SUM(Votes.VoteTypeId) as TotalVotes, COUNT(DISTINCT Posts.Id) as TotalPosts
+FROM Users
+LEFT JOIN Votes ON Users.Id = Votes.UserId
+LEFT JOIN Posts ON Users.Id = Posts.OwnerUserId
+GROUP BY Users.Id
+ORDER BY TotalVotes DESC, TotalPosts DESC, Users.Reputation DESC
+LIMIT 100;

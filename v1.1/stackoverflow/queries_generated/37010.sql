@@ -1,0 +1,236 @@
+-- {"query": "37010.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 2376} 
+WITH
+-- recent active questions with tag arrays and computed metrics
+QuestionBase AS (
+  SELECT
+    p.Id AS QuestionId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.ViewCount,
+    p.Score,
+    p.AnswerCount,
+    p.Tags,
+    COALESCE(p.OwnerUserId, -1) AS OwnerUserId,
+    -- split tags from format '<tag1><tag2>' into array (Postgres-style)
+    CASE WHEN p.Tags IS NULL THEN ARRAY[]::varchar[] ELSE string_to_array(substring(p.Tags, 2, char_length(p.Tags)-2), '><') END AS TagArray
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= (now() - interval '3 years')
+    AND p.LastActivityDate >= (now() - interval '1 year')
+),
+-- answers with their parent question and answer age
+AnswerBase AS (
+  SELECT
+    a.Id AS AnswerId,
+    a.ParentId AS QuestionId,
+    a.CreationDate AS AnswerCreation,
+    a.Score AS AnswerScore,
+    a.OwnerUserId AS AnswerOwner,
+    a.Body IS NOT NULL AS HasBody
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+),
+-- aggregate answers per question
+AnswerAgg AS (
+  SELECT
+    q.QuestionId,
+    COUNT(a.AnswerId) AS AnswersTotal,
+    SUM(CASE WHEN a.AnswerScore > 0 THEN 1 ELSE 0 END) AS PositiveAnswers,
+    AVG(a.AnswerScore) FILTER (WHERE a.AnswerScore IS NOT NULL) AS AvgAnswerScore,
+    MIN(a.AnswerCreation) AS FirstAnswerDate,
+    MAX(a.AnswerCreation) AS LastAnswerDate
+  FROM QuestionBase q
+  LEFT JOIN AnswerBase a ON a.QuestionId = q.QuestionId
+  GROUP BY q.QuestionId
+),
+-- votes breakdown for posts (questions + answers) in recent period (for heat score)
+RecentVotes AS (
+  SELECT
+    v.PostId,
+    SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes,
+    SUM(CASE WHEN vt.Name = 'Favorite' OR vt.Name = 'Save' THEN 1 ELSE 0 END) AS Favorites,
+    MIN(v.CreationDate) AS FirstVoteAt,
+    MAX(v.CreationDate) AS LastVoteAt
+  FROM Votes v
+  LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+  WHERE v.CreationDate >= (now() - interval '2 years')
+  GROUP BY v.PostId
+),
+-- compute tag popularity (based on question views and counts)
+TagExplode AS (
+  SELECT
+    q.QuestionId,
+    unnest(q.TagArray) AS Tag
+  FROM QuestionBase q
+),
+TagStats AS (
+  SELECT
+    t.Tag,
+    COUNT(DISTINCT te.QuestionId) AS QuestionsWithTag,
+    SUM(qb.ViewCount) AS TotalViews,
+    AVG(qb.Score) AS AvgQuestionScore,
+    SUM(CASE WHEN qb.AnswerCount > 0 THEN 1 ELSE 0 END) AS QuestionsWithAnswers
+  FROM TagExplode te
+  JOIN QuestionBase qb ON qb.QuestionId = te.QuestionId
+  GROUP BY t.Tag
+  ORDER BY QuestionsWithTag DESC
+),
+-- identify questions that were linked or duplicated frequently
+PostLinkAgg AS (
+  SELECT
+    pl.PostId AS QuestionId,
+    SUM(CASE WHEN lt.Name = 'Linked' THEN 1 ELSE 0 END) AS LinkedCount,
+    SUM(CASE WHEN lt.Name = 'Duplicate' THEN 1 ELSE 0 END) AS DuplicateCount,
+    COUNT(*) AS TotalLinks
+  FROM PostLinks pl
+  LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+  GROUP BY pl.PostId
+),
+-- recent editor activity: count distinct editors and number of history events
+HistoryAgg AS (
+  SELECT
+    ph.PostId,
+    COUNT(*) AS Revisions,
+    COUNT(DISTINCT ph.UserId) FILTER (WHERE ph.UserId IS NOT NULL) AS DistinctEditors,
+    MAX(ph.CreationDate) AS LastRevisionDate
+  FROM PostHistory ph
+  WHERE ph.CreationDate >= (now() - interval '2 years')
+  GROUP BY ph.PostId
+),
+-- select top users by reputation and compute their involvement (questions, answers, badges)
+TopUsers AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsPosted,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersPosted,
+    COUNT(b.Id) AS BadgesEarned,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesCast
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  WHERE u.Reputation >= 10000
+  GROUP BY u.Id
+  ORDER BY u.Reputation DESC
+  LIMIT 250
+),
+-- final scoring of questions combining many signals
+QuestionScore AS (
+  SELECT
+    qb.QuestionId,
+    qb.Title,
+    qb.CreationDate,
+    qb.LastActivityDate,
+    qb.ViewCount,
+    qb.Score,
+    qb.AnswerCount,
+    COALESCE(aa.AnswersTotal,0) AS AnswersTotal,
+    COALESCE(aa.PositiveAnswers,0) AS PositiveAnswers,
+    COALESCE(rv.UpVotes,0) AS RecentUpVotes,
+    COALESCE(rv.DownVotes,0) AS RecentDownVotes,
+    COALESCE(pl.LinkedCount,0) AS LinkedCount,
+    COALESCE(pl.DuplicateCount,0) AS DuplicateCount,
+    COALESCE(ha.Revisions,0) AS Revisions,
+    COALESCE(ha.DistinctEditors,0) AS DistinctEditors,
+    (EXTRACT(EPOCH FROM (now() - qb.CreationDate))/86400.0) AS AgeDays,
+    -- heat score: combination of recent votes, views per day, and answer activity
+    (
+      (COALESCE(rv.UpVotes,0) - COALESCE(rv.DownVotes,0)) * 2.5
+      + (qb.ViewCount / NULLIF(GREATEST(1, EXTRACT(EPOCH FROM (now() - qb.CreationDate))/86400.0),0)) * 0.05
+      + COALESCE(aa.PositiveAnswers,0) * 3
+      + GREATEST(0, 10 - (EXTRACT(EPOCH FROM (now() - qb.LastActivityDate))/86400.0)/30) * 5
+      - COALESCE(pl.DuplicateCount,0) * 2
+      + LEAST(ha.DistinctEditors,5) * 1.2
+    ) AS HeatScore
+  FROM QuestionBase qb
+  LEFT JOIN AnswerAgg aa ON aa.QuestionId = qb.QuestionId
+  LEFT JOIN RecentVotes rv ON rv.PostId = qb.QuestionId
+  LEFT JOIN PostLinkAgg pl ON pl.QuestionId = qb.QuestionId
+  LEFT JOIN HistoryAgg ha ON ha.PostId = qb.QuestionId
+),
+-- rank tags per question by global tag hotness
+QuestionTagHotness AS (
+  SELECT
+    q.QuestionId,
+    q.Tag,
+    ts.QuestionsWithTag,
+    ts.TotalViews,
+    ts.AvgQuestionScore,
+    -- tag weight normalized by popularity
+    (ts.QuestionsWithTag::numeric / NULLIF((SELECT MAX(QuestionsWithTag) FROM TagStats),0)) AS TagPopularityNorm,
+    ROW_NUMBER() OVER (PARTITION BY q.QuestionId ORDER BY ts.QuestionsWithTag DESC NULLS LAST) AS TagRank
+  FROM TagExplode q
+  LEFT JOIN TagStats ts ON ts.Tag = q.Tag
+),
+-- assemble final joined view combining questions, top tag, and author info
+FinalAssembly AS (
+  SELECT
+    qs.*,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation AS OwnerReputation,
+    qt.Tag AS TopTag,
+    qt.TagPopularityNorm,
+    qt.QuestionsWithTag,
+    qt.TotalViews AS TagTotalViews
+  FROM QuestionScore qs
+  LEFT JOIN Users u ON u.Id = qs.OwnerUserId
+  LEFT JOIN (
+    SELECT QuestionId, Tag, TagPopularityNorm, QuestionsWithTag, TotalViews
+    FROM QuestionTagHotness
+    WHERE TagRank = 1
+  ) qt ON qt.QuestionId = qs.QuestionId
+)
+-- final selection: top 100 "hot" questions, with windowed analytics and percentile buckets
+SELECT
+  fa.QuestionId,
+  fa.Title,
+  fa.OwnerDisplayName,
+  fa.OwnerReputation,
+  fa.TopTag,
+  fa.TagPopularityNorm,
+  fa.ViewCount,
+  fa.Score,
+  fa.AnswerCount,
+  fa.AnswersTotal,
+  fa.PositiveAnswers,
+  fa.RecentUpVotes,
+  fa.RecentDownVotes,
+  fa.LinkedCount,
+  fa.DuplicateCount,
+  fa.Revisions,
+  fa.DistinctEditors,
+  ROUND(fa.AgeDays,2) AS AgeDays,
+  ROUND(fa.HeatScore::numeric,4) AS HeatScore,
+  NTILE(10) OVER (ORDER BY fa.HeatScore DESC) AS HeatDecile,
+  RANK() OVER (ORDER BY fa.HeatScore DESC, fa.ViewCount DESC) AS HeatRank,
+  PERCENT_RANK() OVER (ORDER BY fa.HeatScore DESC) AS HeatPercentile,
+  -- rolling aggregates: average heat score over similar-tag questions (top tag)
+  COALESCE((
+    SELECT AVG(f2.HeatScore)::numeric
+    FROM FinalAssembly f2
+    WHERE f2.TopTag = fa.TopTag
+      AND f2.QuestionId <> fa.QuestionId
+      AND f2.CreationDate >= (now() - interval '3 years')
+  ), 0) AS AvgHeatForTag,
+  -- join to count how many top users participated (answered) on this question
+  COALESCE((
+    SELECT COUNT(DISTINCT a.OwnerUserId)
+    FROM Posts a
+    WHERE a.ParentId = fa.QuestionId
+      AND a.PostTypeId = 2
+      AND a.OwnerUserId IN (SELECT UserId FROM TopUsers)
+  ), 0) AS TopUserAnswers,
+  -- recent comment activity
+  COALESCE((SELECT COUNT(*) FROM Comments c WHERE c.PostId = fa.QuestionId AND c.CreationDate >= (now() - interval '1 year')),0) AS RecentComments,
+  fa.CreationDate,
+  fa.LastActivityDate
+FROM FinalAssembly fa
+WHERE fa.HeatScore IS NOT NULL
+ORDER BY fa.HeatScore DESC NULLS LAST, fa.ViewCount DESC NULLS LAST
+LIMIT 100;

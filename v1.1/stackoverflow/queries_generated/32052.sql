@@ -1,0 +1,59 @@
+-- {"query": "32052.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4o", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 379} 
+
+WITH TopActiveUsers AS (
+    SELECT 
+        Users.Id AS UserId, 
+        Users.DisplayName, 
+        COUNT(Posts.Id) AS TotalPosts
+    FROM 
+        Users
+        JOIN Posts ON Users.Id = Posts.OwnerUserId
+    WHERE 
+        Posts.CreationDate > CURRENT_DATE - INTERVAL '1 year'
+    GROUP BY 
+        Users.Id, Users.DisplayName
+    HAVING 
+        COUNT(Posts.Id) > 50
+    ORDER BY 
+        COUNT(Posts.Id) DESC
+    LIMIT 10
+),
+UserBadges AS (
+    SELECT 
+        UserId, 
+        COUNT(Id) AS BadgeCount
+    FROM 
+        Badges
+    GROUP BY 
+        UserId
+),
+PostDetails AS (
+    SELECT 
+        Posts.Id AS PostId, 
+        Posts.Title, 
+        Posts.CreationDate, 
+        Users.DisplayName, 
+        Posts.ViewCount, 
+        Posts.Score
+    FROM 
+        Posts
+        JOIN Users ON Posts.OwnerUserId = Users.Id
+    WHERE 
+        Posts.CreationDate > CURRENT_DATE - INTERVAL '1 year'
+)
+SELECT 
+    TopActiveUsers.DisplayName, 
+    TopActiveUsers.TotalPosts, 
+    COALESCE(UserBadges.BadgeCount, 0) AS BadgeCount, 
+    SUM(PostDetails.ViewCount) AS TotalViews, 
+    AVG(PostDetails.Score) AS AvgScore
+FROM 
+    TopActiveUsers
+    LEFT JOIN UserBadges ON TopActiveUsers.UserId = UserBadges.UserId
+    LEFT JOIN PostDetails ON TopActiveUsers.UserId = PostDetails.OwnerUserId
+GROUP BY 
+    TopActiveUsers.DisplayName, 
+    TopActiveUsers.TotalPosts, 
+    UserBadges.BadgeCount
+ORDER BY 
+    TotalViews DESC, AvgScore DESC;

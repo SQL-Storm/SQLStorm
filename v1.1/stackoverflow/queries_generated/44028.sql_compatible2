@@ -1,0 +1,14 @@
+SELECT 
+    'SELECT p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.Tags, '
+    || STRING_AGG(DISTINCT '(SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = ' || CAST(vt.Id AS VARCHAR) || ') AS ' || vt.Name, ', ')
+    || ', (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount'
+    || ', (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS DuplicateCount'
+    || ', (SELECT COUNT(*) FROM Badges b WHERE b.UserId = p.OwnerUserId) AS BadgeCount'
+    || ', (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id) AS HistoryCount'
+    || ' FROM Posts p'
+    || ' CROSS JOIN VoteTypes vt'
+    || ' GROUP BY p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.Tags'
+    || ' ORDER BY p.Score DESC, p.ViewCount DESC'
+    || ' LIMIT 100'
+AS query
+FROM VoteTypes vt;

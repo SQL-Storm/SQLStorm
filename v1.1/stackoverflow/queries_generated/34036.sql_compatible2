@@ -1,0 +1,115 @@
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersGiven,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COUNT(DISTINCT b.Id) AS BadgesEarned,
+        AVG(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score END) AS AvgPostScore,
+        MAX(CASE WHEN p.OwnerUserId = u.Id THEN p.CreationDate END) AS LastPostDate,
+        u.Reputation
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopTags AS (
+    -- split tags using string functions so it's more portable
+    SELECT
+        p.OwnerUserId AS UserId,
+        TRIM(tag) AS TagName,
+        COUNT(*) AS TagCount
+    FROM Posts p,
+    LATERAL (
+        SELECT
+            CASE
+                WHEN instr(substr(p.Tags, 2, length(p.Tags)-2), '><') = 0 THEN substr(p.Tags, 2, length(p.Tags)-2)
+                ELSE NULL
+            END AS single_tag,
+            -- generate a sequence of tags by iteratively extracting between '><'
+            -- using recursive CTE to be portable across dialects that support recursive queries
+            NULL
+    ) tag_init
+    JOIN (
+        WITH RECURSIVE split(tag_string, tag, rest) AS (
+            SELECT
+                substr(p.Tags, 2, length(p.Tags)-2) AS tag_string,
+                CASE
+                    WHEN instr(substr(p.Tags, 2, length(p.Tags)-2), '><') = 0 THEN substr(p.Tags, 2, length(p.Tags)-2)
+                    ELSE substr(substr(p.Tags, 2, length(p.Tags)-2), 1, instr(substr(p.Tags, 2, length(p.Tags)-2), '><')-1)
+                END AS tag,
+                CASE
+                    WHEN instr(substr(p.Tags, 2, length(p.Tags)-2), '><') = 0 THEN ''
+                    ELSE substr(substr(p.Tags, 2, length(p.Tags)-2), instr(substr(p.Tags, 2, length(p.Tags)-2), '><')+2)
+                END AS rest
+            UNION ALL
+            SELECT
+                rest,
+                CASE WHEN instr(rest, '><') = 0 THEN rest ELSE substr(rest, 1, instr(rest, '><')-1) END,
+                CASE WHEN instr(rest, '><') = 0 THEN '' ELSE substr(rest, instr(rest, '><')+2) END
+            FROM split
+            WHERE rest <> ''
+        )
+        SELECT tag FROM split WHERE tag <> ''
+    ) s ON 1=1
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId, TagName
+),
+UserTopTags AS (
+    SELECT UserId, TagName, TagCount,
+           RANK() OVER (PARTITION BY UserId ORDER BY TagCount DESC) AS TagRank
+    FROM TopTags
+),
+UserAcceptedAnswerStats AS (
+    SELECT 
+        a.OwnerUserId AS UserId,
+        COUNT(*) AS AnswersAccepted,
+        AVG(a.Score) AS AvgAcceptedAnswerScore
+    FROM Posts q
+    JOIN Posts a ON q.AcceptedAnswerId = a.Id
+    WHERE q.AcceptedAnswerId IS NOT NULL AND a.OwnerUserId IS NOT NULL
+    GROUP BY a.OwnerUserId
+),
+UserVoteStats AS (
+    SELECT 
+        v.UserId,
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotesCast,
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotesCast
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+),
+TopTagsLimited AS (
+    SELECT UserId, TagName, TagRank
+    FROM UserTopTags
+    WHERE TagRank <= 3
+)
+SELECT 
+    ua.UserId,
+    ua.DisplayName,
+    ua.QuestionsAsked,
+    ua.AnswersGiven,
+    ua.CommentsMade,
+    ua.BadgesEarned,
+    COALESCE(uas.AnswersAccepted, 0) AS AnswersAccepted,
+    COALESCE(uas.AvgAcceptedAnswerScore, 0) AS AvgAcceptedAnswerScore,
+    ua.AvgPostScore,
+    ua.LastPostDate,
+    uv.UpVotesCast,
+    uv.DownVotesCast,
+    STRING_AGG(tt.TagName, ',' ORDER BY tt.TagRank) AS Top3Tags,
+    ua.Reputation
+FROM UserActivity ua
+LEFT JOIN UserAcceptedAnswerStats uas ON ua.UserId = uas.UserId
+LEFT JOIN UserVoteStats uv ON ua.UserId = uv.UserId
+LEFT JOIN TopTagsLimited tt ON ua.UserId = tt.UserId
+GROUP BY 
+    ua.UserId, ua.DisplayName, ua.QuestionsAsked, ua.AnswersGiven, ua.CommentsMade, 
+    ua.BadgesEarned, uas.AnswersAccepted, uas.AvgAcceptedAnswerScore, ua.AvgPostScore, 
+    ua.LastPostDate, uv.UpVotesCast, uv.DownVotesCast, ua.Reputation
+HAVING ua.QuestionsAsked + ua.AnswersGiven + ua.CommentsMade > 50
+ORDER BY AnswersAccepted DESC, ua.Reputation DESC
+LIMIT 100;

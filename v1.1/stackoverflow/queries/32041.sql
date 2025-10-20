@@ -1,0 +1,62 @@
+SELECT 
+    U.Id AS UserId,
+    U.DisplayName,
+    U.Reputation,
+    COUNT(DISTINCT P.Id) AS TotalPosts,
+    COUNT(DISTINCT C.Id) AS TotalComments,
+    COUNT(DISTINCT CASE WHEN V.VoteTypeId = 2 THEN V.Id END) AS TotalUpVotesReceived,
+    COUNT(DISTINCT CASE WHEN V.VoteTypeId = 3 THEN V.Id END) AS TotalDownVotesReceived,
+    MAX(P.Score) AS HighestPostScore,
+    SUM(P.ViewCount) AS TotalPostViews,
+    AVG(P.AnswerCount) AS AvgAnswersPerPost,
+    (
+      SELECT t.tag
+      FROM (
+        SELECT tag, COUNT(*) AS cnt
+        FROM (
+          SELECT TRIM(tag) AS tag
+          FROM (
+            -- split Tags like '<tag1><tag2>' into rows in a dialect-portable way
+            SELECT
+              SUBSTR(parts.value, 2, LENGTH(parts.value) - 2) AS tag
+            FROM (
+              -- create rows by repeatedly extracting the next '<...>' token
+              SELECT
+                CASE
+                  WHEN pos = 0 THEN part
+                  ELSE SUBSTR(remaining, 1, nextpos-1)
+                END AS value
+              FROM (
+                SELECT
+                  t.tagstring AS part,
+                  t.tagstring AS remaining,
+                  CASE 
+                    WHEN POSITION('><' IN t.tagstring) > 0 THEN POSITION('><' IN t.tagstring) + 1
+                    ELSE 0
+                  END AS nextpos,
+                  0 AS pos
+                FROM (SELECT COALESCE(p2.Tags, '') AS tagstring, p2.OwnerUserId FROM Posts p2 WHERE p2.OwnerUserId = U.Id) t
+              ) x
+            ) parts
+          ) extracted
+        ) s
+        GROUP BY tag
+      ) t
+      ORDER BY t.cnt DESC, t.tag
+      LIMIT 1
+    ) AS MostUsedTag
+FROM 
+    Users U
+JOIN 
+    Posts P ON U.Id = P.OwnerUserId
+LEFT JOIN 
+    Comments C ON U.Id = C.UserId
+LEFT JOIN 
+    Votes V ON P.Id = V.PostId
+GROUP BY 
+    U.Id, U.DisplayName, U.Reputation
+HAVING 
+    COUNT(DISTINCT P.Id) > 10
+ORDER BY 
+    TotalPosts DESC, TotalComments DESC, U.Reputation DESC
+LIMIT 50;

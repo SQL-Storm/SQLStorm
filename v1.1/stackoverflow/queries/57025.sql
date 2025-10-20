@@ -1,0 +1,97 @@
+WITH RecentPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        u.Reputation,
+        u.DisplayName AS OwnerDisplayName,
+        COALESCE(p.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.CommentCount, 0) AS CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount
+    FROM
+        Posts p
+    JOIN
+        Users u ON p.OwnerUserId = u.Id
+    WHERE
+        p.CreationDate >= DATE_TRUNC('day', CAST('2024-10-01 12:34:56' AS TIMESTAMP))
+),
+TopUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    GROUP BY
+        u.Id, u.Reputation, u.DisplayName
+    ORDER BY
+        u.Reputation DESC, PostCount DESC, CommentCount DESC, VoteCount DESC
+    LIMIT 100
+),
+TagStats AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        COUNT(p.Id) AS PostCount,
+        SUM(p.Score) AS TotalScore,
+        SUM(p.ViewCount) AS TotalViews
+    FROM
+        Tags t
+    LEFT JOIN
+        Posts p ON t.TagName = ANY (STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><'))
+    GROUP BY
+        t.TagName, t.Count
+    HAVING
+        COUNT(p.Id) > 1000
+    ORDER BY
+        PostCount DESC, TotalScore DESC, TotalViews DESC
+    LIMIT 50
+)
+SELECT
+    rp.PostId,
+    rp.PostTypeId,
+    rp.Title,
+    rp.Tags,
+    rp.Score,
+    rp.ViewCount,
+    rp.OwnerUserId,
+    rp.OwnerDisplayName,
+    rp.Reputation,
+    rp.AnswerCount,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    rp.CreationDate,
+    tu.PostCount AS UserPostCount,
+    tu.CommentCount AS UserCommentCount,
+    tu.VoteCount AS UserVoteCount,
+    STRING_AGG(DISTINCT ts.TagName, ', ') AS TopTags,
+    STRING_AGG(DISTINCT CAST(ts.TotalScore AS VARCHAR), ', ') AS TagScores,
+    STRING_AGG(DISTINCT CAST(ts.TotalViews AS VARCHAR), ', ') AS TagViews,
+    STRING_AGG(DISTINCT CAST(ts.PostCount AS VARCHAR), ', ') AS TagPostCounts
+FROM
+    RecentPosts rp
+JOIN
+    TopUsers tu ON rp.OwnerUserId = tu.UserId
+LEFT JOIN
+    TagStats ts ON ts.TagName = ANY (STRING_TO_ARRAY(SUBSTRING(rp.Tags, 2, LENGTH(rp.Tags) - 2), '><'))
+GROUP BY
+    rp.PostId, rp.PostTypeId, rp.Title, rp.Tags, rp.Score, rp.ViewCount,
+    rp.OwnerUserId, rp.OwnerDisplayName, rp.Reputation, rp.AnswerCount, rp.CommentCount,
+    rp.FavoriteCount, rp.CreationDate, tu.PostCount, tu.CommentCount, tu.VoteCount
+ORDER BY
+    rp.Score DESC, rp.ViewCount DESC, rp.CreationDate DESC;

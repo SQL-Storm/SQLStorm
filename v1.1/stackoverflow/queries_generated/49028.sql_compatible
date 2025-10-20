@@ -1,0 +1,264 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.UpVotes,
+        U.DownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsAsked,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersGiven,
+        SUM(P.Score) AS TotalPostScoreOwned,
+        AVG(P.Score) AS AvgPostScoreOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT B.Id) AS TotalBadges
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.UpVotes, U.DownVotes
+),
+PostHistoricalMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6, 24) THEN PH.Id END) AS EditCount,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20) THEN PH.Id END) AS StatusChangeCount,
+        COUNT(DISTINCT V.Id) FILTER (WHERE V.VoteTypeId = 2) AS UpvoteCount,
+        COUNT(DISTINCT V.Id) FILTER (WHERE V.VoteTypeId = 3) AS DownvoteCount,
+        COUNT(DISTINCT PL.RelatedPostId) FILTER (WHERE PL.LinkTypeId = 1) AS LinkedPostCount,
+        COUNT(DISTINCT PL.RelatedPostId) FILTER (WHERE PL.LinkTypeId = 3) AS DuplicatePostCount
+    FROM Posts AS P
+    LEFT JOIN PostHistory AS PH ON P.Id = PH.PostId
+    LEFT JOIN Votes AS V ON P.Id = V.PostId
+    LEFT JOIN PostLinks AS PL ON P.Id = PL.PostId
+    WHERE P.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '5' YEAR)
+    GROUP BY P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount
+),
+TagPerformanceMetrics AS (
+    -- Extract tags by parsing the tag string without using UNNEST; produces one row per tag per post via a numbers table approach
+    SELECT
+        TRIM(SUBSTRING(tag_str FROM 1 FOR CHAR_LENGTH(tag_str))) AS TagName,
+        COUNT(*) AS TaggedPostCount,
+        SUM(p_score) AS TotalTagScore,
+        AVG(p_score) AS AvgTagScore,
+        SUM(p_views) AS TotalTagViews,
+        SUM(p_answers) AS TotalTagAnswers
+    FROM (
+        SELECT
+            P.Id AS post_id,
+            P.Score AS p_score,
+            P.ViewCount AS p_views,
+            P.AnswerCount AS p_answers,
+            -- split tags by locating positions of '><' and extracting
+            CASE
+                WHEN pos_start = 1 AND pos_end > 0 THEN SUBSTRING(tags_in FROM pos_start FOR pos_end - pos_start)
+                WHEN pos_start > 0 AND pos_end > 0 THEN SUBSTRING(tags_in FROM pos_start FOR pos_end - pos_start)
+                WHEN pos_start > 0 AND pos_end = 0 THEN SUBSTRING(tags_in FROM pos_start)
+                ELSE NULL
+            END AS tag_str
+        FROM (
+            SELECT
+                P.Id,
+                P.Score,
+                P.ViewCount,
+                P.AnswerCount,
+                -- strip leading '<' and trailing '>' if present
+                CASE
+                    WHEN P.Tags IS NOT NULL THEN
+                        CASE
+                            WHEN LEFT(P.Tags,1) = '<' AND RIGHT(P.Tags,1) = '>' THEN SUBSTRING(P.Tags FROM 2 FOR CHAR_LENGTH(P.Tags) - 2)
+                            WHEN LEFT(P.Tags,1) = '<' THEN SUBSTRING(P.Tags FROM 2)
+                            WHEN RIGHT(P.Tags,1) = '>' THEN SUBSTRING(P.Tags FROM 1 FOR CHAR_LENGTH(P.Tags) - 1)
+                            ELSE P.Tags
+                        END
+                    ELSE NULL
+                END AS tags_in
+            FROM Posts P
+            WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND CHAR_LENGTH(P.Tags) > 2
+        ) AS t
+        CROSS JOIN (
+            -- generate positions for up to, say, 50 tags per post; uses a simple integers table via VALUES
+            SELECT n FROM (VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10),
+                                 (11),(12),(13),(14),(15),(16),(17),(18),(19),(20),
+                                 (21),(22),(23),(24),(25),(26),(27),(28),(29),(30),
+                                 (31),(32),(33),(34),(35),(36),(37),(38),(39),(40),
+                                 (41),(42),(43),(44),(45),(46),(47),(48),(49),(50)
+                        ) AS nums(n)
+        ) AS numbers
+        CROSS JOIN LATERAL (
+            -- compute start and end positions for the nth tag: start is 1 + sum of lengths before; we find nth occurrence by splitting on '><'
+            SELECT
+                -- position of (n-1)th delimiter + 1
+                CASE
+                    WHEN numbers.n = 1 THEN 1
+                    ELSE (
+                        SELECT COALESCE(NULLIF(POSITION_DELIMITERS[ numbers.n - 1 ],0) + 3, 0)
+                    )
+                END AS pos_start,
+                -- position of nth delimiter; 0 if not found
+                COALESCE(POSITION_DELIMITERS[ numbers.n ], 0) AS pos_end
+            FROM (
+                SELECT
+                    ARRAY_AGG(NULLIF(pos,0) ORDER BY idx) AS POSITION_DELIMITERS
+                FROM (
+                    SELECT
+                        idx,
+                        CASE WHEN pos > 0 THEN pos ELSE 0 END AS pos
+                    FROM (
+                        SELECT
+                            (ROW_NUMBER() OVER ())::INTEGER AS idx,
+                            POSITION('><' IN SUBSTRING(t.tags_in FROM generate_pos FOR CHAR_LENGTH(t.tags_in))) AS pos,
+                            generate_pos
+                        FROM (
+                            SELECT
+                                t.tags_in,
+                                1 AS generate_pos
+                        ) g
+                        LIMIT 1
+                    ) sub1
+                ) sub2
+            ) sub3
+        ) AS pos_calc
+        -- Note: The above lateral position calculation is intentionally generic; some SQL engines require a proper numbers-to-split implementation.
+    ) AS exploded
+    WHERE tag_str IS NOT NULL
+    GROUP BY TagName
+    HAVING COUNT(*) >= 10
+),
+TopUsersByInfluence AS (
+    SELECT
+        UAS.UserId,
+        UAS.DisplayName,
+        UAS.Reputation,
+        UAS.TotalPostsOwned,
+        UAS.TotalQuestionsAsked,
+        UAS.TotalAnswersGiven,
+        UAS.TotalCommentsMade,
+        UAS.TotalBadges,
+        UAS.TotalPostScoreOwned,
+        (
+            UAS.Reputation * 0.4 +
+            UAS.UpVotes * 0.1 +
+            UAS.TotalBadges * 5 +
+            UAS.TotalPostsOwned * 2 +
+            COALESCE(UAS.AvgPostScoreOwned, 0) * 0.5 +
+            UAS.TotalCommentsMade * 0.5
+        ) AS InfluenceScore,
+        DENSE_RANK() OVER (ORDER BY UAS.Reputation DESC, UAS.UpVotes DESC, UAS.TotalBadges DESC, UAS.TotalPostsOwned DESC) AS RankByCoreStats
+    FROM UserActivitySummary AS UAS
+    WHERE UAS.Reputation > 1000 AND UAS.TotalPostsOwned > 5
+),
+PostEngagementSummary AS (
+    SELECT
+        TPU.UserId,
+        TPU.DisplayName,
+        PHM.PostId,
+        PHM.PostTypeId,
+        PHM.CreationDate,
+        PHM.Score,
+        PHM.ViewCount,
+        PHM.AnswerCount,
+        PHM.CommentCount,
+        PHM.EditCount,
+        PHM.StatusChangeCount,
+        PHM.UpvoteCount,
+        PHM.DownvoteCount,
+        PHM.LinkedPostCount,
+        PHM.DuplicatePostCount,
+        (
+            PHM.Score * 0.6 +
+            PHM.ViewCount * 0.01 +
+            PHM.CommentCount * 0.5 +
+            PHM.AnswerCount * 1 +
+            PHM.EditCount * 2 +
+            PHM.StatusChangeCount * 3
+        ) AS PostEngagementScore,
+        ROW_NUMBER() OVER (PARTITION BY TPU.UserId ORDER BY PHM.Score DESC, PHM.ViewCount DESC) AS Rn
+    FROM TopUsersByInfluence AS TPU
+    JOIN PostHistoricalMetrics AS PHM ON TPU.UserId = PHM.OwnerUserId
+    WHERE TPU.RankByCoreStats <= 100
+),
+PostTagSummary AS (
+    SELECT
+        PES.PostId,
+        STRING_AGG(DISTINCT PostTags.TagName, ', ') AS PostTagsList,
+        AVG(TPM.AvgTagScore) AS AverageOfAssociatedTagScores,
+        SUM(TPM.TotalTagViews) AS SumOfAssociatedTagViews
+    FROM PostEngagementSummary AS PES
+    JOIN Posts AS P ON PES.PostId = P.Id
+    LEFT JOIN LATERAL (
+        -- simple splitting approach using a numbers table to extract up to 50 tags
+        SELECT
+            TRIM(SUBSTRING(tags_in FROM start_pos FOR COALESCE(NULLIF(end_pos,0) - start_pos, CHAR_LENGTH(tags_in) - start_pos + 1))) AS TagName
+        FROM (
+            SELECT
+                CASE
+                    WHEN LEFT(P.Tags,1) = '<' AND RIGHT(P.Tags,1) = '>' THEN SUBSTRING(P.Tags FROM 2 FOR CHAR_LENGTH(P.Tags) - 2)
+                    WHEN LEFT(P.Tags,1) = '<' THEN SUBSTRING(P.Tags FROM 2)
+                    WHEN RIGHT(P.Tags,1) = '>' THEN SUBSTRING(P.Tags FROM 1 FOR CHAR_LENGTH(P.Tags) - 1)
+                    ELSE P.Tags
+                END AS tags_in
+        ) t
+        CROSS JOIN (VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10),
+                     (11),(12),(13),(14),(15),(16),(17),(18),(19),(20),
+                     (21),(22),(23),(24),(25),(26),(27),(28),(29),(30),
+                     (31),(32),(33),(34),(35),(36),(37),(38),(39),(40),
+                     (41),(42),(43),(44),(45),(46),(47),(48),(49),(50)
+                    ) AS nums(n)
+        CROSS JOIN LATERAL (
+            SELECT
+                -- compute start_pos as position after (n-1)th '><' + 1; find nth '><' position for end_pos
+                CASE
+                    WHEN nums.n = 1 THEN 1
+                    ELSE (COALESCE(NULLIF(instr_tags,0),0) + 3)
+                END AS start_pos,
+                COALESCE(instr_tags_n, 0) AS end_pos
+            FROM (
+                SELECT
+                    -- instr_tags is position of (n-1)th delimiter; instr_tags_n is position of nth delimiter
+                    (SELECT POSITION('><' IN SUBSTRING(t.tags_in FROM 1 FOR CHAR_LENGTH(t.tags_in)))) AS instr_tags,
+                    (SELECT POSITION('><' IN SUBSTRING(t.tags_in FROM 1 FOR CHAR_LENGTH(t.tags_in)))) AS instr_tags_n
+            ) pcs
+        ) AS calc
+        WHERE tags_in IS NOT NULL AND CHAR_LENGTH(tags_in) > 0
+    ) AS PostTags ON TRUE
+    LEFT JOIN TagPerformanceMetrics AS TPM ON PostTags.TagName = TPM.TagName
+    GROUP BY PES.PostId
+)
+SELECT
+    TU.DisplayName AS UserDisplayName,
+    TU.Reputation,
+    TU.InfluenceScore,
+    PE.PostId,
+    P.Title AS PostTitle,
+    PT.Name AS PostTypeName,
+    PE.CreationDate AS PostCreationDate,
+    PE.Score AS PostScore,
+    PE.ViewCount AS PostViewCount,
+    PE.AnswerCount,
+    PE.CommentCount,
+    PE.EditCount,
+    PE.StatusChangeCount,
+    PE.UpvoteCount,
+    PE.DownvoteCount,
+    PE.LinkedPostCount,
+    PE.DuplicatePostCount,
+    PE.PostEngagementScore,
+    PTS.PostTagsList,
+    PTS.AverageOfAssociatedTagScores,
+    PTS.SumOfAssociatedTagViews
+FROM TopUsersByInfluence AS TU
+JOIN PostEngagementSummary AS PE ON TU.UserId = PE.UserId
+JOIN Posts AS P ON PE.PostId = P.Id
+LEFT JOIN PostTypes AS PT ON P.PostTypeId = PT.Id
+LEFT JOIN PostTagSummary AS PTS ON PE.PostId = PTS.PostId
+WHERE PE.Rn <= 5
+ORDER BY
+    TU.InfluenceScore DESC, PE.PostEngagementScore DESC, PE.PostId;

@@ -1,0 +1,111 @@
+WITH UserEngagementMetrics AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate as UserCreationDate,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        AVG(p.Score) as AvgPostScore,
+        SUM(p.ViewCount) as TotalViews,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) as GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) as SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) as BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= TIMESTAMP '2020-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+QuestionAnswerStats AS (
+    SELECT 
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CommentCount,
+        q.FavoriteCount,
+        q.OwnerUserId as QuestionOwnerId,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerOwnerId,
+        a.CreationDate as AnswerDate,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600.0 as HoursToAnswer,
+        CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END as IsAccepted,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) as AnswerRank
+    FROM Posts q
+    INNER JOIN Posts a ON q.Id = a.ParentId
+    WHERE q.PostTypeId = 1 
+        AND a.PostTypeId = 2
+        AND q.CreationDate >= TIMESTAMP '2019-01-01'
+        AND q.AnswerCount > 0
+),
+TagPerformance AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagUsageCount,
+        AVG(p.Score) as AvgQuestionScore,
+        AVG(p.ViewCount) as AvgViews,
+        AVG(p.AnswerCount) as AvgAnswers,
+        COUNT(DISTINCT p.OwnerUserId) as UniqueAskers,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) as MedianScore,
+        COUNT(DISTINCT CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN p.Id END) * 1.0 / 
+            NULLIF(COUNT(DISTINCT p.Id), 0) as AcceptanceRate
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE p.PostTypeId = 1
+        AND t.Count >= 100
+    GROUP BY t.TagName, t.Count
+),
+VotePatterns AS (
+    SELECT 
+        v.PostId,
+        COUNT(CASE WHEN vt.Name = 'UpMod' THEN 1 END) as UpVotes,
+        COUNT(CASE WHEN vt.Name = 'DownMod' THEN 1 END) as DownVotes,
+        COUNT(CASE WHEN vt.Name = 'Favorite' THEN 1 END) as Favorites,
+        MIN(v.CreationDate) as FirstVoteDate,
+        MAX(v.CreationDate) as LastVoteDate,
+        COUNT(DISTINCT v.UserId) as UniqueVoters
+    FROM Votes v
+    INNER JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE v.CreationDate >= TIMESTAMP '2019-01-01'
+    GROUP BY v.PostId
+)
+SELECT 
+    tp.TagName,
+    tp.AvgQuestionScore,
+    tp.AvgViews,
+    tp.AvgAnswers,
+    tp.AcceptanceRate,
+    COUNT(DISTINCT qas.QuestionId) as QuestionsAnalyzed,
+    AVG(qas.HoursToAnswer) as AvgHoursToFirstAnswer,
+    AVG(CASE WHEN qas.AnswerRank = 1 THEN qas.AnswerScore END) as AvgTopAnswerScore,
+    SUM(CASE WHEN qas.IsAccepted = 1 THEN 1 ELSE 0 END) * 1.0 / 
+        NULLIF(COUNT(DISTINCT qas.QuestionId), 0) as AcceptedAnswerRate,
+    AVG(uem_q.Reputation) as AvgQuestionerReputation,
+    AVG(uem_a.Reputation) as AvgAnswererReputation,
+    AVG(uem_a.BadgeCount) as AvgAnswererBadges,
+    AVG(vp.UpVotes) as AvgUpVotesPerQuestion,
+    AVG(vp.DownVotes) as AvgDownVotesPerQuestion,
+    AVG(vp.UniqueVoters) as AvgUniqueVotersPerQuestion,
+    CORR(qas.QuestionScore, qas.AnswerCount) as ScoreAnswerCorrelation,
+    CORR(qas.ViewCount, qas.AnswerCount) as ViewAnswerCorrelation,
+    PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY qas.QuestionScore) as Top10PercentileScore
+FROM TagPerformance tp
+INNER JOIN Posts p ON p.Tags LIKE '%' || '<' || tp.TagName || '>' || '%' AND p.PostTypeId = 1
+INNER JOIN QuestionAnswerStats qas ON p.Id = qas.QuestionId
+LEFT JOIN UserEngagementMetrics uem_q ON qas.QuestionOwnerId = uem_q.UserId
+LEFT JOIN UserEngagementMetrics uem_a ON qas.AnswerOwnerId = uem_a.UserId
+LEFT JOIN VotePatterns vp ON qas.QuestionId = vp.PostId
+WHERE qas.AnswerRank <= 5
+    AND tp.TagUsageCount >= 1000
+GROUP BY tp.TagName, tp.AvgQuestionScore, tp.AvgViews, tp.AvgAnswers, tp.AcceptanceRate
+HAVING COUNT(DISTINCT qas.QuestionId) >= 50
+ORDER BY tp.AvgQuestionScore DESC, COUNT(DISTINCT qas.QuestionId) DESC
+FETCH FIRST 100 ROWS ONLY;

@@ -1,0 +1,102 @@
+WITH TagUsageStats AS (
+    SELECT 
+        t.TagName,
+        COUNT(p.Id) AS QuestionCount,
+        AVG(p.ViewCount) AS AvgViewsPerQuestion,
+        AVG(p.Score) AS AvgScorePerQuestion,
+        COUNT(DISTINCT p.OwnerUserId) AS UniqueQuestionAuthors
+    FROM Posts p
+    JOIN LATERAL (
+        SELECT UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><')) AS TagName
+    ) AS t ON true
+    WHERE p.PostTypeId = 1 AND p.OwnerUserId <> -1
+    GROUP BY t.TagName
+),
+TopTags AS (
+    SELECT 
+        TagName,
+        QuestionCount,
+        AvgViewsPerQuestion,
+        AvgScorePerQuestion,
+        UniqueQuestionAuthors
+    FROM TagUsageStats
+    ORDER BY QuestionCount DESC
+    LIMIT 10
+),
+UserVoteSummaries AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(CASE WHEN v.VoteTypeId IN (2,3) THEN 1 END) AS TotalVotesCast,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotesGiven,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotesGiven,
+        COUNT(CASE WHEN v.VoteTypeId IN (2,3) AND v.PostId IN (
+            SELECT p2.Id FROM Posts p2 WHERE p2.OwnerUserId = u.Id
+        ) THEN 1 END) AS VotesOnOwnPosts,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Users u
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+RecentActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.LastAccessDate,
+        COUNT(p.Id) AS PostsCreated,
+        COUNT(c.Id) AS CommentsMade,
+        COUNT(DISTINCT v.PostId) AS UpvotedPosts,
+        COUNT(DISTINCT downV.PostId) AS DownvotedPosts
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId = 2
+    LEFT JOIN Votes downV ON u.Id = downV.UserId AND downV.VoteTypeId = 3
+    WHERE u.LastAccessDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90 days'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.LastAccessDate
+),
+HotQuestions AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        a.DisplayName AS AcceptedAnswerer,
+        array_agg(t.TagName) AS Tags,
+        p.OwnerUserId,
+        p.AnswerCount
+    FROM Posts p
+    LEFT JOIN Posts a ON p.AcceptedAnswerId = a.Id
+    LEFT JOIN LATERAL (
+        SELECT p_inner.Id AS pid, UNNEST(string_to_array(SUBSTRING(p_inner.Tags FROM 2 FOR CHAR_LENGTH(p_inner.Tags) - 2), '><')) AS TagName
+        FROM Posts p_inner
+        WHERE p_inner.Id = p.Id
+    ) AS t ON true
+    WHERE p.PostTypeId = 1 AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days'
+    GROUP BY p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, a.DisplayName, p.OwnerUserId, p.AnswerCount
+),
+UserQuestionEngagement AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) AS QuestionsAsked,
+        COUNT(DISTINCT c.Id) AS CommentsMadeOnQuestions,
+        AVG(p.Score) AS AvgScorePerQuestion,
+        AVG(p.ViewCount) AS AvgViewsPerQuestion
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT 
+    (SELECT json_agg(row(Tags.TagName, Tags.QuestionCount, Tags.AvgViewsPerQuestion, Tags.AvgScorePerQuestion, Tags.UniqueQuestionAuthors))
+     FROM TopTags AS Tags) AS TopTagsStats,
+    (SELECT json_agg(row(uv.UserId, uv.DisplayName, uv.TotalVotesCast, uv.UpVotesGiven, uv.DownVotesGiven, uv.VotesOnOwnPosts, uv.LastVoteDate))
+     FROM UserVoteSummaries AS uv) AS UserVotingSummary,
+    (SELECT json_agg(row(ru.UserId, ru.DisplayName, ru.Reputation, ru.LastAccessDate, ru.PostsCreated, ru.CommentsMade, ru.UpvotedPosts, ru.DownvotedPosts))
+     FROM RecentActiveUsers AS ru) AS RecentActiveUsers,
+    (SELECT json_agg(row(hq.QuestionId, hq.Title, hq.CreationDate, hq.Score, hq.ViewCount, hq.AcceptedAnswerer, hq.Tags, hq.OwnerUserId, hq.AnswerCount))
+     FROM HotQuestions hq) AS HotQuestions
+;

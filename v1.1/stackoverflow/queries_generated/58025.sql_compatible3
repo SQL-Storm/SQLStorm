@@ -1,0 +1,176 @@
+WITH ActiveUsers AS (
+    SELECT Id, DisplayName, Location, Reputation, LastAccessDate
+    FROM Users
+    WHERE Reputation > 10000 
+      AND LastAccessDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30' DAY
+),
+UserPosts AS (
+    SELECT 
+        p.OwnerUserId, 
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LatestPostDate
+    FROM Posts p
+    JOIN ActiveUsers u ON p.OwnerUserId = u.Id
+    GROUP BY p.OwnerUserId
+),
+UserComments AS (
+    SELECT 
+        c.UserId,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        AVG(c.Score) AS AvgCommentScore,
+        MAX(c.CreationDate) AS LatestCommentDate
+    FROM Comments c
+    JOIN ActiveUsers u ON c.UserId = u.Id
+    GROUP BY c.UserId
+),
+UserVotes AS (
+    SELECT 
+        v.UserId,
+        COUNT(DISTINCT CASE WHEN vt.Name = 'UpMod' THEN v.Id END) AS UpvotesGiven,
+        COUNT(DISTINCT CASE WHEN vt.Name = 'DownMod' THEN v.Id END) AS DownvotesGiven,
+        COUNT(DISTINCT CASE WHEN vt.Name = 'BountyStart' THEN v.Id END) AS BountiesStarted
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    JOIN ActiveUsers u ON v.UserId = u.Id
+    GROUP BY v.UserId
+),
+UserBadges AS (
+    SELECT 
+        b.UserId,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges
+    FROM Badges b
+    JOIN ActiveUsers u ON b.UserId = u.Id
+    GROUP BY b.UserId
+),
+-- Split tags stored as '<tag1><tag2>' into rows in a dialect-agnostic way using a numbers table approach
+TagPositions AS (
+    SELECT p.Id AS PostId, p.OwnerUserId, p.PostTypeId, p.Tags AS orig_tags, n.n AS seq,
+           INSTR_POS.pos AS pos
+    FROM Posts p
+    JOIN ActiveUsers u ON p.OwnerUserId = u.Id
+    CROSS JOIN (
+        -- numbers up to 20; extend if posts can have more tags
+        SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5
+        UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10
+        UNION ALL SELECT 11 UNION ALL SELECT 12 UNION ALL SELECT 13 UNION ALL SELECT 14 UNION ALL SELECT 15
+        UNION ALL SELECT 16 UNION ALL SELECT 17 UNION ALL SELECT 18 UNION ALL SELECT 19 UNION ALL SELECT 20
+    ) n
+    CROSS JOIN LATERAL (
+        -- find position of the nth '<' in orig_tags using standard SQL functions:
+        SELECT
+            (CASE
+                WHEN n.n = 1 THEN POSITION('<' IN orig_tags)
+                ELSE (
+                    -- iterate to find nth '<' by repeatedly finding next substring; emulate by using SUBSTRING and POSITION
+                    (SELECT pos_n FROM (
+                        SELECT
+                            1 AS k,
+                            POSITION('<' IN orig_tags) AS pos_1
+                        UNION ALL
+                        SELECT
+                            2 AS k,
+                            (CASE WHEN POSITION('<' IN SUBSTRING(orig_tags FROM pos_1 + 1)) > 0 THEN pos_1 + POSITION('<' IN SUBSTRING(orig_tags FROM pos_1 + 1)) ELSE 0 END) AS pos_2
+                        UNION ALL
+                        SELECT
+                            3 AS k,
+                            (CASE WHEN POSITION('<' IN SUBSTRING(orig_tags FROM (SELECT pos_2 FROM (SELECT 1) t) + 1)) > 0 THEN (SELECT pos_2 FROM (SELECT 1) t) + POSITION('<' IN SUBSTRING(orig_tags FROM (SELECT pos_2 FROM (SELECT 1) t) + 1)) ELSE 0 END) AS pos_3
+                    ) positions_full WHERE k = n.n)
+                END)
+            END) AS pos
+    ) INSTR_POS
+    WHERE INSTR_POS.pos > 0
+),
+TagSlices AS (
+    SELECT
+        tp.PostId,
+        tp.OwnerUserId,
+        tp.PostTypeId,
+        -- start position of '<' is tp.pos
+        tp.pos AS start_pos,
+        -- end position: find position of next '<' after start_pos; if none, use length+1
+        COALESCE(
+            (SELECT MIN(t2.pos) FROM TagPositions t2 WHERE t2.PostId = tp.PostId AND t2.pos > tp.pos),
+            LENGTH(tp.orig_tags) + 1
+        ) AS next_pos,
+        tp.orig_tags
+    FROM TagPositions tp
+),
+TagEngagement AS (
+    SELECT 
+        ts.OwnerUserId AS OwnerUserId,
+        TRIM(SUBSTRING(ts.orig_tags FROM ts.start_pos + 1 FOR (ts.next_pos - ts.start_pos - 1))) AS Tag,
+        COUNT(DISTINCT ts.PostId) AS TagUsageCount
+    FROM TagSlices ts
+    WHERE ts.PostTypeId = 1
+      AND TRIM(SUBSTRING(ts.orig_tags FROM ts.start_pos + 1 FOR (ts.next_pos - ts.start_pos - 1))) <> ''
+    GROUP BY ts.OwnerUserId, TRIM(SUBSTRING(ts.orig_tags FROM ts.start_pos + 1 FOR (ts.next_pos - ts.start_pos - 1)))
+),
+RankedTags AS (
+    SELECT 
+        OwnerUserId,
+        Tag,
+        TagUsageCount,
+        RANK() OVER (PARTITION BY OwnerUserId ORDER BY TagUsageCount DESC) AS TagRank
+    FROM TagEngagement
+)
+SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Location,
+    COALESCE(up.TotalPosts, 0) AS TotalPosts,
+    COALESCE(up.Questions, 0) AS Questions,
+    COALESCE(up.Answers, 0) AS Answers,
+    COALESCE(uc.TotalComments, 0) AS TotalComments,
+    COALESCE(uv.UpvotesGiven, 0) AS UpvotesGiven,
+    COALESCE(uv.DownvotesGiven, 0) AS DownvotesGiven,
+    COALESCE(uv.BountiesStarted, 0) AS BountiesStarted,
+    COALESCE(ub.TotalBadges, 0) AS TotalBadges,
+    COALESCE(ub.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ub.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ub.BronzeBadges, 0) AS BronzeBadges,
+    (SELECT STRING_AGG(rt.Tag, ', ' ORDER BY rt.TagRank) 
+     FROM RankedTags rt 
+     WHERE rt.OwnerUserId = u.Id AND rt.TagRank <= 3) AS Top3Tags,
+    ROW_NUMBER() OVER (ORDER BY COALESCE(up.TotalPosts,0) DESC) AS PostsRank,
+    ROW_NUMBER() OVER (ORDER BY COALESCE(uc.TotalComments,0) DESC) AS CommentsRank,
+    ROW_NUMBER() OVER (ORDER BY COALESCE(ub.TotalBadges,0) DESC) AS BadgesRank
+FROM ActiveUsers u
+LEFT JOIN UserPosts up ON u.Id = up.OwnerUserId
+LEFT JOIN UserComments uc ON u.Id = uc.UserId
+LEFT JOIN UserVotes uv ON u.Id = uv.UserId
+LEFT JOIN UserBadges ub ON u.Id = ub.UserId
+WHERE (up.LatestPostDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '7' DAY)
+   OR (uc.LatestCommentDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '7' DAY)
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Location,
+    u.Reputation,
+    u.LastAccessDate,
+    up.TotalPosts,
+    up.Questions,
+    up.Answers,
+    up.AvgPostScore,
+    up.LatestPostDate,
+    uc.TotalComments,
+    uc.AvgCommentScore,
+    uc.LatestCommentDate,
+    uv.UpvotesGiven,
+    uv.DownvotesGiven,
+    uv.BountiesStarted,
+    ub.TotalBadges,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges
+HAVING AVG(COALESCE(up.AvgPostScore,0)) > 10 OR AVG(COALESCE(uc.AvgCommentScore,0)) > 2
+ORDER BY 
+    up.TotalPosts DESC, 
+    uc.TotalComments DESC, 
+    ub.TotalBadges DESC
+LIMIT 100;

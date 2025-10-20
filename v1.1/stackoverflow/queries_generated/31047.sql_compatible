@@ -1,0 +1,65 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.ViewCount,
+        p.Score,
+        u.DisplayName AS OwnerDisplayName,
+        COUNT(v.Id) AS VoteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostRank
+    FROM 
+        Posts p
+    JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    WHERE 
+        p.CreationDate >= (DATE '2024-10-01' - INTERVAL '1 year')
+    GROUP BY 
+        p.Id, p.Title, p.CreationDate, p.ViewCount, p.Score, u.DisplayName, p.OwnerUserId
+),
+TopPosts AS (
+    SELECT 
+        PostId,
+        Title,
+        CreationDate,
+        ViewCount,
+        Score,
+        OwnerDisplayName,
+        VoteCount
+    FROM 
+        RankedPosts
+    WHERE 
+        PostRank = 1
+),
+PopularTags AS (
+    SELECT 
+        regexp_split_to_table(trim(BOTH '<>' FROM Tags), '><') AS Tag,
+        COUNT(*) AS TagCount
+    FROM 
+        Posts
+    WHERE 
+        Tags IS NOT NULL
+    GROUP BY 
+        regexp_split_to_table(trim(BOTH '<>' FROM Tags), '><')
+    ORDER BY 
+        TagCount DESC
+    LIMIT 10
+)
+SELECT 
+    tp.PostId,
+    tp.Title,
+    tp.CreationDate,
+    tp.ViewCount,
+    tp.Score,
+    tp.OwnerDisplayName,
+    tp.VoteCount,
+    pt.Tag AS PopularTag
+FROM 
+    TopPosts tp
+JOIN 
+    PopularTags pt ON tp.Score > 10
+ORDER BY 
+    tp.Score DESC
+LIMIT 20;

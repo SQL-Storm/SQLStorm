@@ -1,0 +1,106 @@
+-- {"query": "55021.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2048, "output_tokens": 1871} 
+
+WITH
+    q AS (
+        SELECT
+            p.Id,
+            p.OwnerUserId,
+            p.CreationDate,
+            p.Score,
+            p.ViewCount,
+            p.Tags,
+            p.AnswerCount,
+            p.FavoriteCount,
+            p.CommentCount
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+    ),
+    a AS (
+        SELECT
+            p.ParentId AS QuestionId,
+            p.OwnerUserId,
+            p.CreationDate,
+            p.Score
+        FROM Posts p
+        WHERE p.PostTypeId = 2
+    ),
+    v AS (
+        SELECT
+            v.PostId,
+            COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+            COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes
+        FROM Votes v
+        GROUP BY v.PostId
+    ),
+    c AS (
+        SELECT
+            c.PostId,
+            COUNT(*) AS CommentCount
+        FROM Comments c
+        GROUP BY c.PostId
+    ),
+    t AS (
+        SELECT
+            t.TagName,
+            COUNT(p.Id) AS TagQuestionCount,
+            SUM(p.Score) AS TagScoreSum,
+            AVG(p.ViewCount) AS AvgViews
+        FROM Tags t
+        JOIN Posts p ON p.Tags ILIKE '%' || t.TagName || '%'
+        WHERE p.PostTypeId = 1
+        GROUP BY t.TagName
+    ),
+    us AS (
+        SELECT
+            u.Id AS UserId,
+            u.Reputation,
+            COUNT(DISTINCT q.Id) AS QuestionsAsked,
+            COUNT(DISTINCT a.QuestionId) AS AnswersGiven,
+            COALESCE(SUM(v.UpVotes), 0) AS TotalUpVotes,
+            COALESCE(SUM(v.DownVotes), 0) AS TotalDownVotes,
+            COALESCE(SUM(c.CommentCount), 0) AS TotalComments,
+            COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+            COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+            COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges
+        FROM Users u
+        LEFT JOIN q ON q.OwnerUserId = u.Id
+        LEFT JOIN a ON a.OwnerUserId = u.Id
+        LEFT JOIN v ON v.PostId = q.Id OR v.PostId = a.QuestionId
+        LEFT JOIN c ON c.PostId = q.Id OR c.PostId = a.QuestionId
+        LEFT JOIN Badges b ON b.UserId = u.Id
+        GROUP BY u.Id, u.Reputation
+    )
+SELECT
+    us.UserId,
+    us.Reputation,
+    us.QuestionsAsked,
+    us.AnswersGiven,
+    us.TotalUpVotes,
+    us.TotalDownVotes,
+    us.TotalComments,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    ROW_NUMBER() OVER (
+        ORDER BY (us.Reputation + us.TotalUpVotes * 10 - us.TotalDownVotes * 5) DESC
+    ) AS RankByActivity,
+    t.TagName,
+    t.TagQuestionCount,
+    t.TagScoreSum,
+    t.AvgViews
+FROM us
+LEFT JOIN LATERAL (
+    SELECT
+        unnest(
+            string_to_array(
+                substring(q.Tags FROM 2 FOR char_length(q.Tags) - 2),
+                '><'
+            )
+        ) AS Tag,
+        q.Id AS QuestionId
+    FROM q
+) qt ON true
+LEFT JOIN t ON t.TagName = qt.Tag
+WHERE us.UserId IS NOT NULL
+ORDER BY RankByActivity
+LIMIT 100;

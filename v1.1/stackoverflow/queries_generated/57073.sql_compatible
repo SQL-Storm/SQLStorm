@@ -1,0 +1,92 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        SUM(p.Score) AS TotalPostScore,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesReceived,
+        MAX(p.LastActivityDate) AS LastPostActivityDate
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate
+),
+TopTags AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id) AS PostCount,
+        SUM(p.Score) AS TotalScore,
+        SUM(p.ViewCount) AS TotalViews,
+        AVG(p.Score) AS AverageScore,
+        AVG(p.ViewCount) AS AverageViews
+    FROM
+        Tags t
+    JOIN
+        Posts p ON t.TagName = ANY (string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><'))
+    GROUP BY
+        t.TagName
+    ORDER BY
+        PostCount DESC
+    LIMIT 10
+),
+PostHistoryDetails AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS HistoryDate,
+        COUNT(ph.Id) AS EditCount,
+        MIN(ph.CreationDate) AS FirstEditDate,
+        MAX(ph.CreationDate) AS LastEditDate,
+        u.DisplayName AS EditorName,
+        u.Reputation AS EditorReputation
+    FROM
+        PostHistory ph
+    JOIN
+        Users u ON ph.UserId = u.Id
+    GROUP BY
+        ph.PostId, ph.PostHistoryTypeId, ph.CreationDate, u.DisplayName, u.Reputation
+)
+SELECT
+    ua.UserId,
+    ua.Reputation,
+    ua.UserCreationDate,
+    ua.TotalPosts,
+    ua.TotalQuestions,
+    ua.TotalAnswers,
+    ua.TotalPostScore,
+    ua.TotalUpvotesReceived,
+    ua.TotalDownvotesReceived,
+    ua.LastPostActivityDate,
+    t.TagName,
+    t.PostCount,
+    t.TotalScore,
+    t.TotalViews,
+    t.AverageScore,
+    t.AverageViews,
+    phd.PostId,
+    phd.PostHistoryTypeId,
+    phd.HistoryDate,
+    phd.EditCount,
+    phd.FirstEditDate,
+    phd.LastEditDate,
+    phd.EditorName,
+    phd.EditorReputation
+FROM
+    UserActivity ua
+CROSS JOIN
+    TopTags t
+LEFT JOIN
+    PostHistoryDetails phd ON ua.UserId::text = phd.EditorName
+ORDER BY
+    ua.Reputation DESC,
+    t.PostCount DESC,
+    phd.EditCount DESC
+LIMIT 100;

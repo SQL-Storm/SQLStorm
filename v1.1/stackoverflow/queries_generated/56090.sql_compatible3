@@ -1,0 +1,76 @@
+WITH TopPosts AS (
+  SELECT p.Id, p.Title, p.Score, p.ViewCount, p.Tags, u.DisplayName AS OwnerDisplayName, p.OwnerUserId
+  FROM Posts p
+  JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1 AND p.Score > 10
+),
+TopTags AS (
+  -- split tags like '<tag1><tag2>' into rows using a recursive split compatible with many dialects
+  SELECT tag.TagName, COUNT(DISTINCT p.Id) AS PostCount
+  FROM Posts p
+  JOIN (
+    SELECT p2.Id AS PostId, TRIM(BOTH '<' FROM TRIM(BOTH '>' FROM token)) AS TagName
+    FROM Posts p2
+    JOIN (
+      WITH RECURSIVE split(post_id, rest, token) AS (
+        SELECT p3.Id,
+               CAST(p3.Tags AS VARCHAR),
+               NULL
+        FROM Posts p3
+        UNION ALL
+        SELECT post_id,
+               CASE
+                 WHEN instr = 0 THEN ''
+                 ELSE SUBSTRING(rest FROM instr+2)
+               END AS rest,
+               CASE
+                 WHEN instr = 0 THEN rest
+                 ELSE SUBSTRING(rest FROM 1 FOR instr+1)
+               END AS token
+        FROM (
+          SELECT post_id, rest,
+                 (CASE
+                    WHEN POSITION('><' IN rest) = 0 THEN 0
+                    ELSE POSITION('><' IN rest)
+                  END) AS instr
+          FROM split
+          WHERE rest IS NOT NULL AND rest <> ''
+        ) s
+      )
+      SELECT post_id, token
+      FROM split
+      WHERE token IS NOT NULL AND token <> ''
+    ) toks ON toks.post_id = p2.Id
+  ) tag ON tag.PostId = p.Id
+  GROUP BY tag.TagName
+  HAVING COUNT(DISTINCT p.Id) > 100
+),
+UserBadges AS (
+  SELECT u.Id, COUNT(b.Id) AS BadgeCount
+  FROM Users u
+  JOIN Badges b ON u.Id = b.UserId
+  GROUP BY u.Id
+  HAVING COUNT(b.Id) > 10
+),
+QuestionAnswers AS (
+  SELECT p.Id, COUNT(a.Id) AS AnswerCount
+  FROM Posts p
+  JOIN Posts a ON p.Id = a.ParentId
+  WHERE p.PostTypeId = 1 AND a.PostTypeId = 2
+  GROUP BY p.Id
+)
+SELECT 
+  tp.Id, 
+  tp.Title, 
+  tp.Score, 
+  tp.ViewCount, 
+  tp.Tags, 
+  tp.OwnerDisplayName, 
+  tt.PostCount, 
+  ub.BadgeCount, 
+  qa.AnswerCount
+FROM TopPosts tp
+JOIN TopTags tt ON tp.Tags LIKE '%' || tt.TagName || '%'
+JOIN UserBadges ub ON tp.OwnerUserId = ub.Id
+JOIN QuestionAnswers qa ON tp.Id = qa.Id
+ORDER BY tp.Score DESC, tp.ViewCount DESC, tt.PostCount DESC;

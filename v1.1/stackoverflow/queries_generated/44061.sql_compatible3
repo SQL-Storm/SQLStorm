@@ -1,0 +1,76 @@
+SELECT 
+    p.Id AS PostId, 
+    p.Title, 
+    p.Body, 
+    p.CreationDate, 
+    p.LastEditDate, 
+    p.LastActivityDate, 
+    p.ClosedDate, 
+    p.CommunityOwnedDate, 
+    p.AnswerCount, 
+    p.CommentCount, 
+    p.FavoriteCount, 
+    p.ViewCount, 
+    p.Score, 
+    p.OwnerUserId, 
+    p.LastEditorUserId, 
+    u.Reputation, 
+    u.DisplayName, 
+    u.WebsiteUrl, 
+    u.Location, 
+    u.AboutMe, 
+    u.Views, 
+    u.UpVotes, 
+    u.DownVotes, 
+    u.ProfileImageUrl, 
+    u.EmailHash AS EmailHash, 
+    u.AccountId, 
+    b.Id AS BadgeId, 
+    b.Name AS BadgeName, 
+    b.Date AS BadgeDate, 
+    b.Class AS BadgeClass, 
+    b.TagBased AS BadgeTagBased, 
+    c.Id AS CommentId, 
+    c.Score AS CommentScore, 
+    c.Text AS CommentText, 
+    c.CreationDate AS CommentCreationDate, 
+    c.UserDisplayName AS CommentUserDisplayName, 
+    c.UserId AS CommentUserId, 
+    pt.Name AS PostTypeName, 
+    lt.Name AS LinkTypeName, 
+    vt.Name AS VoteTypeName, 
+    crt.Name AS CloseReasonTypeName, 
+    ph.Id AS PostHistoryId, 
+    ph.PostHistoryTypeId, 
+    ph.RevisionGUID, 
+    ph.CreationDate AS PostHistoryCreationDate, 
+    ph.UserId AS PostHistoryUserId, 
+    ph.UserDisplayName AS PostHistoryUserDisplayName, 
+    ph.Comment AS PostHistoryComment, 
+    ph.Text AS PostHistoryText, 
+    pl.Id AS PostLinkId, 
+    pl.CreationDate AS PostLinkCreationDate, 
+    pl.RelatedPostId, 
+    t.Id AS TagId, 
+    t.TagName, 
+    t.Count AS TagCount, 
+    t.ExcerptPostId, 
+    t.WikiPostId, 
+    t.IsModeratorOnly, 
+    t.IsRequired, 
+    v.Id AS VoteId, 
+    v.VoteTypeId, 
+    v.CreationDate AS VoteCreationDate, 
+    v.BountyAmount
+FROM Posts p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Badges b ON b.UserId = u.Id
+LEFT JOIN Comments c ON c.PostId = p.Id
+LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+LEFT JOIN CloseReasonTypes crt ON ph.Comment = CAST(crt.Id AS VARCHAR)
+LEFT JOIN PostLinks pl ON pl.PostId = p.Id OR pl.RelatedPostId = p.Id
+LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+LEFT JOIN Votes v ON v.PostId = p.Id
+LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+LEFT JOIN Tags t ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%';

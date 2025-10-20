@@ -1,0 +1,92 @@
+WITH GoldBadgeUsers AS (
+    SELECT DISTINCT UserId
+    FROM Badges
+    WHERE "Class" = 1
+),
+UserActivity AS (
+    SELECT
+        OwnerUserId AS UserId,
+        COUNT(*) AS TotalPosts,
+        SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        SUM(ViewCount) AS TotalViewCount,
+        SUM(Score) AS TotalScore,
+        SUM(COALESCE(FavoriteCount, 0)) AS TotalFavorites,
+        AVG(CASE WHEN PostTypeId = 2 THEN Score ELSE NULL END) AS AvgAnswerScore,
+        MIN(CreationDate) AS FirstPostDate,
+        MAX(LastActivityDate) AS LastActivityDate,
+        SUM(CASE WHEN PostTypeId = 1 AND AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedQuestions
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL
+    GROUP BY OwnerUserId
+),
+UserEngagement AS (
+    SELECT
+        UserId,
+        COUNT(*) AS CommentCount,
+        SUM(COALESCE(Score, 0)) AS TotalCommentScore
+    FROM Comments
+    WHERE UserId IS NOT NULL
+    GROUP BY UserId
+),
+UserVoting AS (
+    SELECT
+        UserId,
+        SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesCast,
+        SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesCast,
+        SUM(CASE WHEN VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoritesCast,
+        SUM(COALESCE(BountyAmount, 0)) AS TotalBountyAmount
+    FROM Votes
+    WHERE UserId IS NOT NULL
+    GROUP BY UserId
+)
+SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.Age,
+    act.TotalPosts,
+    act.QuestionCount,
+    act.AnswerCount,
+    eng.CommentCount,
+    act.TotalViewCount,
+    ROUND(act.AvgAnswerScore::numeric, 2) AS AvgAnswerScore,
+    ROUND((act.AnswerCount * 100.0 / NULLIF(act.TotalPosts, 0))::numeric, 2) AS AnswerRatio,
+    ROUND((act.AcceptedQuestions * 100.0 / NULLIF(act.QuestionCount, 0))::numeric, 2) AS QuestionAcceptanceRate,
+    (EXTRACT(EPOCH FROM (act.LastActivityDate - u.CreationDate)) / 86400) AS AccountLifetimeDays,
+    DENSE_RANK() OVER (ORDER BY u.Reputation DESC, act.TotalScore DESC) AS ReputationRank,
+    NTILE(100) OVER (ORDER BY act.TotalViewCount DESC) AS ViewCountPercentile,
+    LAG(u.DisplayName, 1, 'N/A') OVER (ORDER BY act.AvgAnswerScore DESC NULLS LAST) AS UserWithNextBestAvgAnswerScore
+FROM
+    Users u
+JOIN
+    GoldBadgeUsers gbu ON u.Id = gbu.UserId
+JOIN
+    UserActivity act ON u.Id = act.UserId
+LEFT JOIN
+    UserEngagement eng ON u.Id = eng.UserId
+LEFT JOIN
+    UserVoting vot ON u.Id = vot.UserId
+WHERE
+    u.Reputation > (SELECT AVG(Reputation) FROM Users)
+    AND act.AnswerCount > 50
+    AND act.LastActivityDate > (SELECT MAX(CreationDate) FROM Posts) - INTERVAL '4' YEAR
+    AND (COALESCE(vot.UpVotesCast, 0) > (COALESCE(vot.DownVotesCast, 0) * 5) OR COALESCE(vot.DownVotesCast, 0) = 0)
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.Age,
+    u.CreationDate,
+    act.TotalPosts,
+    act.QuestionCount,
+    act.AnswerCount,
+    eng.CommentCount,
+    act.TotalViewCount,
+    act.AvgAnswerScore,
+    act.AcceptedQuestions,
+    act.LastActivityDate,
+    act.TotalScore
+ORDER BY
+    u.Reputation DESC, act.AnswerCount DESC, act.TotalViewCount DESC
+LIMIT 200;

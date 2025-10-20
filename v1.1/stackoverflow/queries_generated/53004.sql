@@ -1,0 +1,129 @@
+-- {"query": "53004.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-4", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2646, "output_tokens": 1151} 
+
+WITH TaggedQuestions AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.OwnerUserId AS AskerId,
+        p.Score AS QuestionScore,
+        p.ViewCount,
+        p.CreationDate,
+        string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><') AS TagArray
+    FROM 
+        Posts p
+    WHERE 
+        p.PostTypeId = 1  -- Questions
+        AND p.Tags LIKE '%<sql>%'  -- Filter for SQL-related questions
+),
+ExpertAnswers AS (
+    SELECT 
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId AS AnswererId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerDate,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC) AS AnswerRank
+    FROM 
+        Posts a
+    WHERE 
+        a.PostTypeId = 2  -- Answers
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersGiven,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+        AVG(p.ViewCount) AS AvgViewCount
+    FROM 
+        Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY 
+        u.Id, u.Reputation
+),
+BadgeSummary AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS TagBasedBadges
+    FROM 
+        Badges b
+    GROUP BY 
+        b.UserId
+),
+VoteAnalysis AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpvotesReceived,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownvotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) AS BountiesStarted
+    FROM 
+        Votes v
+    JOIN Posts p ON v.PostId = p.Id
+    GROUP BY 
+        p.OwnerUserId
+),
+EditHistory AS (
+    SELECT 
+        ph.PostId,
+        ph.UserId AS EditorId,
+        COUNT(*) AS EditCount,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM 
+        PostHistory ph
+    WHERE 
+        ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)  -- Edit types
+    GROUP BY 
+        ph.PostId, ph.UserId
+),
+CombinedStats AS (
+    SELECT 
+        ua.UserId,
+        ua.Reputation,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        ua.TotalQuestionScore,
+        ua.TotalAnswerScore,
+        ua.AvgViewCount,
+        bs.TotalBadges,
+        bs.GoldBadges,
+        bs.SilverBadges,
+        bs.TagBasedBadges,
+        va.UpvotesReceived,
+        va.DownvotesReceived,
+        va.BountiesStarted,
+        COUNT(DISTINCT ea.AnswerId) AS SQLAnswers,
+        SUM(ea.AnswerScore) AS TotalSQLAnswerScore,
+        AVG(tq.QuestionScore) AS AvgSQLQuestionScore,
+        SUM(tq.ViewCount) AS TotalSQLViews,
+        COUNT(DISTINCT eh.PostId) AS EditedPosts,
+        MAX(eh.LastEditDate) AS MostRecentEdit
+    FROM 
+        UserActivity ua
+    LEFT JOIN BadgeSummary bs ON ua.UserId = bs.UserId
+    LEFT JOIN VoteAnalysis va ON ua.UserId = va.UserId
+    LEFT JOIN ExpertAnswers ea ON ua.UserId = ea.AnswererId
+    LEFT JOIN TaggedQuestions tq ON ea.QuestionId = tq.QuestionId
+    LEFT JOIN EditHistory eh ON ua.UserId = eh.EditorId
+    GROUP BY 
+        ua.UserId, ua.Reputation, ua.QuestionsAsked, ua.AnswersGiven, ua.TotalQuestionScore, ua.TotalAnswerScore, ua.AvgViewCount,
+        bs.TotalBadges, bs.GoldBadges, bs.SilverBadges, bs.TagBasedBadges,
+        va.UpvotesReceived, va.DownvotesReceived, va.BountiesStarted
+)
+SELECT 
+    cs.*,
+    RANK() OVER (ORDER BY cs.Reputation DESC) AS ReputationRank,
+    DENSE_RANK() OVER (ORDER BY cs.TotalAnswerScore DESC) AS AnswerScoreRank,
+    ROW_NUMBER() OVER (PARTITION BY cs.GoldBadges ORDER BY cs.UpvotesReceived DESC) AS GoldBadgeGroupRank
+FROM 
+    CombinedStats cs
+WHERE 
+    cs.SQLAnswers > 10
+    AND cs.Reputation > 1000
+ORDER BY 
+    cs.TotalSQLAnswerScore DESC,
+    cs.UpvotesReceived DESC
+LIMIT 500;

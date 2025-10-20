@@ -1,0 +1,176 @@
+WITH
+q AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.OwnerUserId,
+    COALESCE(
+      (SELECT array_agg(distinct trim(both '<>' FROM tag)) FROM unnest(string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><')) AS t(tag)),
+      ARRAY[]::text[]
+    ) AS Tags
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+    AND p.ViewCount IS NOT NULL
+),
+u AS (
+  SELECT
+    usr.Id,
+    usr.Reputation,
+    usr.CreationDate AS UserCreation,
+    usr.LastAccessDate,
+    usr.Views AS ProfileViews,
+    COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+    COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+    COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+    COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsPosted,
+    COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersPosted,
+    COALESCE(SUM(vt_up.cnt),0) AS UpVotesCast,
+    COALESCE(SUM(vt_down.cnt),0) AS DownVotesCast
+  FROM Users usr
+  LEFT JOIN Badges b ON b.UserId = usr.Id
+  LEFT JOIN Posts p ON p.OwnerUserId = usr.Id
+  LEFT JOIN (
+    SELECT UserId, count(*) AS cnt FROM Votes WHERE VoteTypeId = 2 GROUP BY UserId
+  ) vt_up ON vt_up.UserId = usr.Id
+  LEFT JOIN (
+    SELECT UserId, count(*) AS cnt FROM Votes WHERE VoteTypeId = 3 GROUP BY UserId
+  ) vt_down ON vt_down.UserId = usr.Id
+  GROUP BY usr.Id, usr.Reputation, usr.CreationDate, usr.LastAccessDate, usr.Views
+),
+a AS (
+  SELECT
+    ans.Id,
+    ans.ParentId AS QuestionId,
+    ans.OwnerUserId,
+    ans.Score,
+    ans.CreationDate,
+    ans.CommentCount,
+    CASE WHEN q.AcceptedAnswerId = ans.Id THEN 1 ELSE 0 END AS IsAccepted,
+    CASE
+      WHEN q.AcceptedAnswerId = ans.Id AND q.CreationDate IS NOT NULL THEN EXTRACT(EPOCH FROM (ans.CreationDate - q.CreationDate)) / 3600.0
+      ELSE NULL
+    END AS HoursSinceQuestion
+  FROM Posts ans
+  JOIN Posts q ON q.Id = ans.ParentId
+  WHERE ans.PostTypeId = 2
+    AND q.PostTypeId = 1
+),
+pl AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    pl.LinkTypeId,
+    p1.PostTypeId AS PostType_Post,
+    p2.PostTypeId AS PostType_Related,
+    pl.CreationDate
+  FROM PostLinks pl
+  JOIN Posts p1 ON p1.Id = pl.PostId
+  JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+  WHERE pl.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years'
+),
+tag_stats AS (
+  SELECT
+    tag AS Tag,
+    count(*) AS QuestionCount,
+    avg(q.Score) AS AvgScore,
+    avg(q.ViewCount) AS AvgViews,
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY q.Score) AS MedianScore
+  FROM q q,
+  unnest(q.Tags) AS t(tag)
+  GROUP BY tag
+  HAVING count(*) >= 10
+),
+interaction AS (
+  SELECT
+    qq.Id AS QuestionId,
+    qq.Title,
+    qq.CreationDate,
+    qq.Score AS QuestionScore,
+    COUNT(a.Id) AS TotalAnswers,
+    COUNT(DISTINCT a.OwnerUserId) FILTER (WHERE a.OwnerUserId IS NOT NULL) AS UniqueAnswerers,
+    MAX(a.Score) AS TopAnswerScore,
+    SUM(a.Score) AS AnswersScoreSum,
+    SUM(CASE WHEN a.IsAccepted = 1 THEN 1 ELSE 0 END) AS HasAccepted
+  FROM q qq
+  LEFT JOIN a ON a.QuestionId = qq.Id
+  GROUP BY qq.Id, qq.Title, qq.CreationDate, qq.Score
+),
+monthly AS (
+  SELECT
+    date_trunc('month', CreationDate) AS month,
+    count(*) AS questions,
+    avg(ViewCount) AS avg_views,
+    avg(Score) AS avg_score,
+    sum(AnswerCount) AS answers_total
+  FROM Posts
+  WHERE PostTypeId = 1
+    AND CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '24 months'
+  GROUP BY date_trunc('month', CreationDate)
+),
+ranked_questions AS (
+  SELECT
+    i.QuestionId,
+    i.Title,
+    i.QuestionScore,
+    i.TotalAnswers,
+    i.UniqueAnswerers,
+    i.TopAnswerScore,
+    i.AnswersScoreSum,
+    i.HasAccepted,
+    q.Tags,
+    COALESCE((
+      SELECT sum(ts.QuestionCount)
+      FROM unnest(q.Tags) AS t(tag)
+      JOIN tag_stats ts ON ts.Tag = t.tag
+    ),0) AS TagHotness,
+    u.Reputation AS OwnerReputation,
+    ROW_NUMBER() OVER (ORDER BY (i.QuestionScore * 1.5 + COALESCE(i.TopAnswerScore,0) * 2 + COALESCE(u.Reputation,0)/1000 + COALESCE((
+      SELECT sum(ts.QuestionCount)
+      FROM unnest(q.Tags) AS t(tag)
+      JOIN tag_stats ts ON ts.Tag = t.tag
+    ),0)) DESC) AS GlobalRank
+  FROM interaction i
+  JOIN q ON q.Id = i.QuestionId
+  LEFT JOIN Users u ON u.Id = q.OwnerUserId
+  GROUP BY i.QuestionId, i.Title, i.QuestionScore, i.TotalAnswers, i.UniqueAnswerers, i.TopAnswerScore, i.AnswersScoreSum, i.HasAccepted, q.Tags, u.Reputation
+)
+SELECT
+  rq.GlobalRank,
+  rq.QuestionId,
+  rq.Title,
+  rq.QuestionScore,
+  rq.TotalAnswers,
+  rq.UniqueAnswerers,
+  rq.TopAnswerScore,
+  rq.AnswersScoreSum,
+  rq.HasAccepted,
+  rq.TagHotness,
+  rq.OwnerReputation,
+  rq.Tags,
+  ts.Tag AS RepresentativeTag,
+  ts.QuestionCount AS RepresentativeTagQuestionCount,
+  ts.AvgScore AS RepresentativeTagAvgScore,
+  ms.month,
+  ms.questions AS QuestionsInMonth,
+  ms.avg_views AS AvgViewsThatMonth
+FROM ranked_questions rq
+LEFT JOIN LATERAL (
+  SELECT t.Tag AS tag, t.QuestionCount, t.AvgScore
+  FROM tag_stats t
+  WHERE t.Tag = (CASE WHEN cardinality(rq.Tags) IS NOT NULL AND cardinality(rq.Tags) >= 1 THEN rq.Tags[1] ELSE NULL END)
+  LIMIT 1
+) ts ON true
+LEFT JOIN LATERAL (
+  SELECT m.month, m.questions, m.avg_views
+  FROM monthly m
+  WHERE m.month = date_trunc('month', (SELECT p.CreationDate FROM Posts p WHERE p.Id = rq.QuestionId))
+  LIMIT 1
+) ms ON true
+WHERE rq.GlobalRank <= 250
+ORDER BY rq.GlobalRank;

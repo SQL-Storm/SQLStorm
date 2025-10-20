@@ -1,0 +1,178 @@
+-- {"query": "38009.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1985, "output_tokens": 2271} 
+WITH recent_years AS (
+    SELECT generate_series(date_trunc('year', cast('2024-10-01 12:34:56' as timestamp)) - interval '4 years', date_trunc('year', cast('2024-10-01 12:34:56' as timestamp)), interval '1 year') AS year_start
+),
+top_tags AS (
+    SELECT t.TagName, SUM(t.Count) AS total_count
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0 OR t.IsModeratorOnly IS NULL
+    GROUP BY t.TagName
+    ORDER BY total_count DESC
+    LIMIT 100
+),
+question_posts AS (
+    SELECT p.Id, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Title, p.Tags
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+answer_posts AS (
+    SELECT a.Id, a.ParentId, a.OwnerUserId, a.CreationDate, a.Score
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+tag_expanded AS (
+    SELECT
+        q.Id AS QuestionId,
+        unnest(string_to_array(substring(q.Tags, 2, length(q.Tags) - 2), '><')) AS TagName,
+        q.OwnerUserId,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount
+    FROM question_posts q
+    WHERE q.Tags IS NOT NULL AND q.Tags <> ''
+),
+tag_filtered AS (
+    SELECT te.*
+    FROM tag_expanded te
+    JOIN top_tags tt ON tt.TagName = te.TagName
+),
+qa_agg AS (
+    SELECT
+        tf.TagName,
+        date_trunc('year', tf.CreationDate) AS year_bucket,
+        COUNT(DISTINCT tf.QuestionId) AS questions,
+        SUM(CASE WHEN tf.Score > 0 THEN 1 ELSE 0 END) AS pos_q,
+        SUM(tf.ViewCount) AS total_views,
+        AVG(tf.Score::numeric) AS avg_q_score,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY tf.Score) AS med_q_score
+    FROM tag_filtered tf
+    GROUP BY tf.TagName, date_trunc('year', tf.CreationDate)
+),
+answers_join AS (
+    SELECT
+        tf.TagName,
+        date_trunc('year', a.CreationDate) AS year_bucket,
+        COUNT(*) AS answers,
+        SUM(CASE WHEN a.Score > 0 THEN 1 ELSE 0 END) AS pos_a,
+        AVG(a.Score::numeric) AS avg_a_score,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY a.Score) AS med_a_score
+    FROM tag_filtered tf
+    JOIN answer_posts a ON a.ParentId = tf.QuestionId
+    GROUP BY tf.TagName, date_trunc('year', a.CreationDate)
+),
+votes_agg AS (
+    SELECT
+        tf.TagName,
+        date_trunc('year', v.CreationDate) AS year_bucket,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS favorites,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN COALESCE(v.BountyAmount,0) ELSE 0 END) AS bounty_started,
+        SUM(CASE WHEN v.VoteTypeId = 9 THEN COALESCE(v.BountyAmount,0) ELSE 0 END) AS bounty_awarded
+    FROM tag_filtered tf
+    JOIN Votes v ON v.PostId = tf.QuestionId
+    GROUP BY tf.TagName, date_trunc('year', v.CreationDate)
+),
+comments_agg AS (
+    SELECT
+        tf.TagName,
+        date_trunc('year', c.CreationDate) AS year_bucket,
+        COUNT(*) AS comments,
+        AVG(c.Score::numeric) AS avg_comment_score
+    FROM tag_filtered tf
+    JOIN Comments c ON c.PostId = tf.QuestionId
+    GROUP BY tf.TagName, date_trunc('year', c.CreationDate)
+),
+dupe_links AS (
+    SELECT
+        tf.TagName,
+        date_trunc('year', pl.CreationDate) AS year_bucket,
+        SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS duplicates_marked,
+        SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS linked_refs
+    FROM tag_filtered tf
+    JOIN PostLinks pl ON pl.PostId = tf.QuestionId
+    GROUP BY tf.TagName, date_trunc('year', pl.CreationDate)
+),
+closures AS (
+    SELECT
+        tf.TagName,
+        date_trunc('year', ph.CreationDate) AS year_bucket,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 10) AS closed,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 11) AS reopened,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (12)) AS deleted,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (13)) AS undeleted
+    FROM tag_filtered tf
+    JOIN PostHistory ph ON ph.PostId = tf.QuestionId
+    GROUP BY tf.TagName, date_trunc('year', ph.CreationDate)
+),
+hot_bumps AS (
+    SELECT
+        tf.TagName,
+        date_trunc('year', ph.CreationDate) AS year_bucket,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 50) AS community_bumps,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 52) AS hot_selected,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 53) AS hot_removed
+    FROM tag_filtered tf
+    JOIN PostHistory ph ON ph.PostId = tf.QuestionId
+    GROUP BY tf.TagName, date_trunc('year', ph.CreationDate)
+),
+user_stats AS (
+    SELECT
+        tf.TagName,
+        date_trunc('year', q.CreationDate) AS year_bucket,
+        COUNT(DISTINCT q.OwnerUserId) AS distinct_askers,
+        AVG(u.Reputation::numeric) AS avg_asker_rep,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY u.Reputation) AS med_asker_rep
+    FROM tag_filtered tf
+    JOIN question_posts q ON q.Id = tf.QuestionId
+    LEFT JOIN Users u ON u.Id = q.OwnerUserId
+    GROUP BY tf.TagName, date_trunc('year', q.CreationDate)
+),
+year_tag_matrix AS (
+    SELECT tt.TagName, ry.year_start AS year_bucket
+    FROM top_tags tt
+    CROSS JOIN recent_years ry
+)
+SELECT
+    ytm.TagName,
+    to_char(ytm.year_bucket, 'YYYY') AS year,
+    COALESCE(qa.questions, 0) AS questions,
+    COALESCE(qa.pos_q, 0) AS positive_questions,
+    COALESCE(qa.total_views, 0) AS total_views,
+    COALESCE(qa.avg_q_score, 0) AS avg_q_score,
+    COALESCE(qa.med_q_score, 0) AS med_q_score,
+    COALESCE(aj.answers, 0) AS answers,
+    COALESCE(aj.pos_a, 0) AS positive_answers,
+    COALESCE(aj.avg_a_score, 0) AS avg_a_score,
+    COALESCE(aj.med_a_score, 0) AS med_a_score,
+    COALESCE(va.upvotes, 0) AS upvotes,
+    COALESCE(va.downvotes, 0) AS downvotes,
+    COALESCE(va.favorites, 0) AS favorites,
+    COALESCE(va.bounty_started, 0) AS bounty_started,
+    COALESCE(va.bounty_awarded, 0) AS bounty_awarded,
+    COALESCE(ca.comments, 0) AS comments,
+    COALESCE(ca.avg_comment_score, 0) AS avg_comment_score,
+    COALESCE(dl.duplicates_marked, 0) AS duplicates_marked,
+    COALESCE(dl.linked_refs, 0) AS linked_refs,
+    COALESCE(closed.closed, 0) AS closed,
+    COALESCE(closed.reopened, 0) AS reopened,
+    COALESCE(closed.deleted, 0) AS deleted,
+    COALESCE(closed.undeleted, 0) AS undeleted,
+    COALESCE(hb.community_bumps, 0) AS community_bumps,
+    COALESCE(hb.hot_selected, 0) AS hot_selected,
+    COALESCE(hb.hot_removed, 0) AS hot_removed,
+    COALESCE(us.distinct_askers, 0) AS distinct_askers,
+    COALESCE(us.avg_asker_rep, 0) AS avg_asker_rep,
+    COALESCE(us.med_asker_rep, 0) AS med_asker_rep,
+    CASE WHEN COALESCE(qa.questions,0) > 0 THEN ROUND((COALESCE(aj.answers,0)::numeric / qa.questions) , 3) ELSE 0 END AS ans_per_question,
+    CASE WHEN (COALESCE(va.upvotes,0) + COALESCE(va.downvotes,0)) > 0 THEN ROUND((COALESCE(va.upvotes,0)::numeric / (COALESCE(va.upvotes,0) + COALESCE(va.downvotes,0))), 3) ELSE 0 END AS upvote_ratio
+FROM year_tag_matrix ytm
+LEFT JOIN qa_agg qa ON qa.TagName = ytm.TagName AND qa.year_bucket = ytm.year_bucket
+LEFT JOIN answers_join aj ON aj.TagName = ytm.TagName AND aj.year_bucket = ytm.year_bucket
+LEFT JOIN votes_agg va ON va.TagName = ytm.TagName AND va.year_bucket = ytm.year_bucket
+LEFT JOIN comments_agg ca ON ca.TagName = ytm.TagName AND ca.year_bucket = ytm.year_bucket
+LEFT JOIN dupe_links dl ON dl.TagName = ytm.TagName AND dl.year_bucket = ytm.year_bucket
+LEFT JOIN closures closed ON closed.TagName = ytm.TagName AND closed.year_bucket = ytm.year_bucket
+LEFT JOIN hot_bumps hb ON hb.TagName = ytm.TagName AND hb.year_bucket = ytm.year_bucket
+LEFT JOIN user_stats us ON us.TagName = ytm.TagName AND us.year_bucket = ytm.year_bucket
+ORDER BY ytm.TagName, ytm.year_bucket;

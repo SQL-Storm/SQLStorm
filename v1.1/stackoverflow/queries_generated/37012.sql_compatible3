@@ -1,0 +1,180 @@
+WITH
+Questions AS (
+  SELECT p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount,
+         COALESCE(string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><'), ARRAY[]::varchar[])::varchar[] AS Tags,
+         p.OwnerUserId, p.AnswerCount, p.CommentCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+),
+LastEdits AS (
+  SELECT ph.PostId,
+         MAX(ph.CreationDate) AS LastEditDate,
+         COUNT(CASE WHEN ph.PostHistoryTypeId IN (5,6,4) THEN 1 END) AS EditCount
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (4,5,6,7,8,9,24)
+  GROUP BY ph.PostId
+),
+PostVotes AS (
+  SELECT v.PostId,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+         SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedFlags,
+         COUNT(*) AS TotalVotes,
+         MAX(v.CreationDate) AS LastVoteDate
+  FROM Votes v
+  GROUP BY v.PostId
+),
+UserBadges AS (
+  SELECT b.UserId,
+         COUNT(*) AS BadgeCount,
+         MAX(b.Date) AS LastBadgeDate,
+         MAX(CASE WHEN b.Class IS NOT NULL THEN b.Class END) AS TopBadgeClass
+  FROM Badges b
+  GROUP BY b.UserId
+),
+AnswerStats AS (
+  SELECT p.ParentId AS QuestionId,
+         COUNT(*) AS AnswerTotal,
+         SUM(CASE WHEN p.Score >= 10 THEN 1 ELSE 0 END) AS HighScoreAnswers,
+         AVG(p.Score) AS AvgAnswerScore,
+         MAX(p.Score) AS MaxAnswerScore
+  FROM Posts p
+  WHERE p.PostTypeId = 2
+  GROUP BY p.ParentId
+),
+PostLinkNeighborhood AS (
+  SELECT pl.PostId AS QuestionId,
+         SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS OutgoingLinks,
+         SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateLinks,
+         COUNT(DISTINCT pl.RelatedPostId) AS DistinctLinkedPosts
+  FROM PostLinks pl
+  JOIN Posts q ON q.Id = pl.PostId AND q.PostTypeId = 1
+  GROUP BY pl.PostId
+),
+TopCommenters AS (
+  SELECT c.PostId,
+         json_agg(json_build_object('UserId', c.UserId, 'Display', c.UserDisplayName, 'Count', c.cnt) ORDER BY c.cnt DESC, c.CreationDate DESC) AS CommenterList
+  FROM (
+    SELECT c.PostId, c.UserId, c.UserDisplayName, COUNT(*) AS cnt, MAX(c.CreationDate) AS CreationDate
+    FROM Comments c
+    GROUP BY c.PostId, c.UserId, c.UserDisplayName
+  ) c
+  GROUP BY c.PostId
+),
+Engagement AS (
+  SELECT q.Id,
+         (COALESCE(q.Score,0) * 3
+          + COALESCE(pv.UpVotes,0) * 2
+          - COALESCE(pv.DownVotes,0) * 1.5
+          + LEAST(COALESCE(q.ViewCount,0) * 1.0 / 1000, 50) * 1.2
+          + COALESCE(q.AnswerCount,0) * 5
+          + COALESCE(as_.HighScoreAnswers,0) * 4
+          + COALESCE(q.CommentCount,0) * 1.5
+          + GREATEST(0, (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - COALESCE(le.LastEditDate,q.CreationDate))) / 86400.0) * -0.05)
+         ) AS EngagementScore
+  FROM Questions q
+  LEFT JOIN PostVotes pv ON pv.PostId = q.Id
+  LEFT JOIN AnswerStats as_ ON as_.QuestionId = q.Id
+  LEFT JOIN LastEdits le ON le.PostId = q.Id
+),
+TagExplode AS (
+  SELECT q.Id AS QuestionId, unnest(q.Tags) AS Tag
+  FROM Questions q
+),
+TagPairs AS (
+  SELECT te1.Tag AS TagA, te2.Tag AS TagB, COUNT(*) AS CoOccur
+  FROM TagExplode te1
+  JOIN TagExplode te2 ON te1.QuestionId = te2.QuestionId AND te1.Tag <> te2.Tag
+  GROUP BY te1.Tag, te2.Tag
+),
+TopTagPairs AS (
+  SELECT TagA, TagB, CoOccur
+  FROM TagPairs
+  ORDER BY CoOccur DESC
+  LIMIT 100
+),
+SelectedQuestions AS (
+  SELECT q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.Tags, q.OwnerUserId, q.AnswerCount, q.CommentCount,
+         e.EngagementScore, pv.UpVotes, pv.DownVotes, pv.TotalVotes, pv.LastVoteDate,
+         ub.BadgeCount, ub.TopBadgeClass, as_.AnswerTotal, as_.AvgAnswerScore, pln.OutgoingLinks, pln.DuplicateLinks,
+         tc.CommenterList
+  FROM Questions q
+  JOIN Engagement e ON e.Id = q.Id
+  LEFT JOIN PostVotes pv ON pv.PostId = q.Id
+  LEFT JOIN UserBadges ub ON ub.UserId = q.OwnerUserId
+  LEFT JOIN AnswerStats as_ ON as_.QuestionId = q.Id
+  LEFT JOIN PostLinkNeighborhood pln ON pln.QuestionId = q.Id
+  LEFT JOIN TopCommenters tc ON tc.PostId = q.Id
+),
+Ranked AS (
+  SELECT sq.Id, sq.Title, sq.CreationDate, sq.Score, sq.ViewCount, sq.Tags, sq.OwnerUserId, sq.AnswerCount, sq.CommentCount,
+         sq.EngagementScore, sq.UpVotes, sq.DownVotes, sq.TotalVotes, sq.LastVoteDate,
+         sq.BadgeCount, sq.TopBadgeClass, sq.AnswerTotal, sq.AvgAnswerScore, sq.OutgoingLinks, sq.DuplicateLinks,
+         sq.CommenterList,
+         row_number() OVER (ORDER BY sq.EngagementScore DESC NULLS LAST, sq.ViewCount DESC NULLS LAST) AS RankByEngagement,
+         dense_rank() OVER (PARTITION BY COALESCE(sq.OwnerUserId, -1) ORDER BY sq.EngagementScore DESC) AS OwnerDenseRank
+  FROM SelectedQuestions sq
+)
+SELECT
+  r.RankByEngagement,
+  r.Id AS QuestionId,
+  r.Title,
+  r.CreationDate,
+  r.EngagementScore,
+  r.Score AS QuestionScore,
+  r.ViewCount,
+  r.AnswerTotal,
+  ROUND(CAST(r.AvgAnswerScore AS numeric),2) AS AvgAnswerScore,
+  r.UpVotes,
+  r.DownVotes,
+  r.TotalVotes,
+  r.CommentCount,
+  r.BadgeCount,
+  r.TopBadgeClass,
+  r.OutgoingLinks,
+  r.DuplicateLinks,
+  r.CommenterList,
+  (SELECT json_agg(json_build_object(
+            'AnswerId', a.Id,
+            'Score', a.Score,
+            'OwnerUserId', a.OwnerUserId,
+            'OwnerDisplayName', a.OwnerDisplayName,
+            'CreationDate', a.CreationDate
+          ) ORDER BY a.Score DESC, a.CreationDate ASC)
+   FROM Posts a
+   WHERE a.ParentId = r.Id AND a.PostTypeId = 2
+   LIMIT 3) AS TopAnswersSample,
+  (SELECT array_agg(tg) FROM (SELECT unnest(r.Tags) AS tg ORDER BY tg) s) AS Tags,
+  (SELECT json_agg(json_build_object('RelatedId', p2.Id, 'Title', p2.Title, 'Score', p2.Score, 'LinkType', lt.Name))
+   FROM PostLinks pl
+   JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+   LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+   WHERE pl.PostId = r.Id
+   ORDER BY p2.Score DESC NULLS LAST, p2.Id
+   LIMIT 5
+  ) AS TopLinkedPosts
+FROM Ranked r
+WHERE r.RankByEngagement <= 200
+  AND r.OwnerDenseRank <= 5
+  AND r.EngagementScore IS NOT NULL
+GROUP BY
+  r.RankByEngagement,
+  r.Id,
+  r.Title,
+  r.CreationDate,
+  r.EngagementScore,
+  r.Score,
+  r.ViewCount,
+  r.AnswerTotal,
+  r.AvgAnswerScore,
+  r.UpVotes,
+  r.DownVotes,
+  r.TotalVotes,
+  r.CommentCount,
+  r.BadgeCount,
+  r.TopBadgeClass,
+  r.OutgoingLinks,
+  r.DuplicateLinks,
+  r.CommenterList
+ORDER BY r.EngagementScore DESC, r.ViewCount DESC;

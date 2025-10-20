@@ -1,4 +1,4 @@
--- {"query": "29050.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2699} 
+-- {"query": "29050.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2699} 
 WITH TopUsers AS (
     SELECT u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes,
            ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as rn

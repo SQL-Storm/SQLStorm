@@ -1,0 +1,68 @@
+WITH RecentHighReputationUsers AS (
+    SELECT Id, DisplayName, Reputation
+    FROM Users
+    WHERE Reputation > 10000
+      AND CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+),
+TopTags AS (
+    SELECT t.TagName, SUM(t.Count) AS TagTotal
+    FROM Tags t
+    GROUP BY t.TagName
+    ORDER BY TagTotal DESC
+    LIMIT 10
+),
+UserTopQuestions AS (
+    SELECT 
+        p.OwnerUserId,
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        (SELECT ARRAY_AGG(tag) FROM (
+            SELECT unnest(string_to_array(substring(p.Tags FROM 2 FOR (char_length(p.Tags)-2)), '><')) AS tag
+        ) s) AS TagArray
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Score > 5
+      AND p.ViewCount > 1000
+      AND p.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months'
+),
+BadgeCounts AS (
+    SELECT u.Id AS UserId, 
+           COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+           COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+           COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    bc.GoldBadges, bc.SilverBadges, bc.BronzeBadges,
+    q.PostId, q.Title, q.Score AS QuestionScore, q.ViewCount, 
+    t.TagName AS TopTag,
+    SUM(vs.UpVotes) OVER (PARTITION BY u.Id) AS TotalUpVotesForUser,
+    SUM(vs.DownVotes) OVER (PARTITION BY u.Id) AS TotalDownVotesForUser,
+    COUNT(DISTINCT c.Id) AS TotalCommentsOnTopQuestions
+FROM RecentHighReputationUsers u
+LEFT JOIN BadgeCounts bc ON bc.UserId = u.Id
+LEFT JOIN UserTopQuestions q ON q.OwnerUserId = u.Id
+LEFT JOIN LATERAL (
+    SELECT tag FROM UNNEST(q.TagArray) AS tag
+    INNER JOIN TopTags tt ON tt.TagName = tag
+    LIMIT 1
+) t ON TRUE
+LEFT JOIN (
+    SELECT p.OwnerUserId, 
+           SUM(p.UpVotes) AS UpVotes, 
+           SUM(p.DownVotes) AS DownVotes
+    FROM Posts p
+    GROUP BY p.OwnerUserId
+) vs ON vs.OwnerUserId = u.Id
+LEFT JOIN Comments c ON c.PostId = q.PostId
+WHERE t.TagName IS NOT NULL
+GROUP BY u.Id, u.DisplayName, u.Reputation, bc.GoldBadges, bc.SilverBadges, bc.BronzeBadges, q.PostId, q.Title, q.Score, q.ViewCount, t.TagName
+ORDER BY u.Reputation DESC, q.ViewCount DESC
+LIMIT 100;

@@ -1,0 +1,136 @@
+-- {"query": "231.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 5749} 
+WITH
+RecentPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.ViewCount,
+    p.Score,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Tags,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.OwnerDisplayName,
+    p.LastEditorUserId,
+    p.LastEditorDisplayName,
+    p.LastEditDate,
+    p.Body
+  FROM Posts p
+  WHERE p.CreationDate >= now() - interval '90 days'
+),
+TagStats AS (
+  SELECT
+    t.TagName,
+    count(*) AS PostCount,
+    avg(p.Score) AS AvgScore,
+    max(p.Score) AS MaxScore,
+    sum(p.ViewCount) AS TotalViews
+  FROM RecentPosts rp
+  CROSS JOIN LATERAL unnest(string_to_array(substring(rp.Tags, 2, length(rp.Tags)-2), '><')) AS t(TagName)
+  LEFT JOIN Posts p ON p.Id = rp.PostId
+  WHERE t.TagName IS NOT NULL
+  GROUP BY t.TagName
+),
+PostMeta AS (
+  SELECT
+    rp.PostId,
+    rp.PostTypeId,
+    rp.Title,
+    rp.OwnerUserId,
+    rp.OwnerDisplayName,
+    rp.LastEditorUserId,
+    ru.DisplayName AS LastEditorDisplayName,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = rp.PostId) AS CommentCount,
+    (SELECT MAX(CreationDate) FROM Votes v WHERE v.PostId = rp.PostId) AS LastVoteDate,
+    (SELECT STRING_AGG(v2.VoteTypeId::text, ',') FROM Votes v2 WHERE v2.PostId = rp.PostId) AS VoteTypes
+  FROM RecentPosts rp
+  LEFT JOIN Users ru ON ru.Id = rp.LastEditorUserId
+),
+TopPosts AS (
+  SELECT
+    rp.PostId,
+    rp.Title,
+    rp.ViewCount,
+    rp.Score,
+    rp.CreationDate,
+    rp.LastActivityDate,
+    rp.OwnerUserId,
+    rp.OwnerDisplayName,
+    rp.PostTypeId,
+    pmo.CommentCount,
+    CASE
+      WHEN rp.ViewCount > 1000 THEN 'Hot'
+      WHEN rp.Score >= 5 THEN 'Popular'
+      ELSE 'New'
+    END AS Category,
+    ROW_NUMBER() OVER (PARTITION BY rp.PostTypeId ORDER BY rp.LastActivityDate DESC, rp.Score DESC) AS TypeRank,
+    AVG(rp.Score) OVER () AS GlobalAvgScore
+  FROM RecentPosts rp
+  LEFT JOIN PostMeta pmo ON pmo.PostId = rp.PostId
+),
+Part1 AS (
+  SELECT
+    tp.PostId,
+    tp.Title,
+    tp.OwnerUserId,
+    tp.OwnerDisplayName,
+    tp.Score,
+    tp.ViewCount,
+    tp.LastActivityDate,
+    tp.Category,
+    tp.TypeRank
+  FROM TopPosts tp
+  WHERE tp.TypeRank <= 100 AND tp.Category = 'Hot'
+),
+Part2 AS (
+  SELECT
+    ts.TagName AS Label,
+    ts.PostCount AS PostCount,
+    ts.AvgScore AS AverageScore,
+    ts.MaxScore AS PeakScore,
+    ts.TotalViews AS Views
+  FROM TagStats ts
+  ORDER BY ts.TotalViews DESC
+  LIMIT 50
+),
+UnionA AS (
+  SELECT
+    CAST(tp.PostId AS text) AS Id,
+    tp.Title AS LabelText,
+    CAST(tp.Score AS numeric) AS Metric1,
+    CAST(tp.ViewCount AS numeric) AS Metric2,
+    tp.LastActivityDate AS EventDate,
+    tp.Category,
+    NULL::text AS Extra
+  FROM Part1 tp
+),
+UnionB AS (
+  SELECT
+    CAST(p2.Label AS text) AS Id,
+    p2.Label AS LabelText,
+    CAST(p2.PostCount AS numeric) AS Metric1,
+    CAST(p2.AverageScore AS numeric) AS Metric2,
+    CURRENT_DATE AS EventDate,
+    NULL AS Category,
+    CAST(p2.PeakScore AS numeric) AS Extra
+  FROM Part2 p2
+),
+FinalUnion AS (
+  SELECT * FROM UnionA
+  UNION ALL
+  SELECT * FROM UnionB
+)
+SELECT
+  fu.Id,
+  fu.LabelText,
+  fu.Metric1,
+  fu.Metric2,
+  fu.EventDate,
+  fu.Category,
+  fu.Extra
+FROM FinalUnion fu
+ORDER BY fu.EventDate DESC, fu.Metric1 DESC
+LIMIT 500;

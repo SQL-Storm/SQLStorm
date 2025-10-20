@@ -1,0 +1,51 @@
+-- {"query": "54057.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-oss-20b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2048, "output_tokens": 1080} 
+
+WITH
+-- 1. Identify users who have at least one gold badge
+GoldUsers AS (
+    SELECT DISTINCT UserId
+    FROM Badges
+    WHERE Class = 1
+),
+
+-- 2. Extract recent questions (postTypeId = 1) with a score > 0 and owned by gold‑badge users
+RecentQuestions AS (
+    SELECT
+        p.Id,
+        p.Score,
+        p.Tags,
+        p.OwnerUserId
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Score > 0
+      AND p.CreationDate >= date_trunc('year', current_date)
+      AND p.OwnerUserId IN (SELECT UserId FROM GoldUsers)
+),
+
+-- 3. Split the tag string into individual tags using PostgreSQL string functions
+QuestionTags AS (
+    SELECT
+        rq.Id,
+        rq.OwnerUserId,
+        rq.Score,
+        t.tag
+    FROM RecentQuestions rq
+    CROSS JOIN LATERAL
+        unnest(
+            string_to_array(
+                substring(rq.Tags, 2, char_length(rq.Tags) - 2),
+                ' ><'
+            )
+        ) AS t(tag)
+)
+
+SELECT
+    qt.tag,
+    COUNT(DISTINCT qt.Id)            AS QuestionCount,
+    AVG(qt.Score)                    AS AvgScore,
+    COUNT(DISTINCT qt.OwnerUserId)   AS GoldUserCount,
+    RANK() OVER (ORDER BY AVG(qt.Score) DESC, COUNT(DISTINCT qt.Id) DESC) AS Rank
+FROM QuestionTags qt
+GROUP BY qt.tag
+ORDER BY Rank
+FETCH FIRST 20 ROWS ONLY;

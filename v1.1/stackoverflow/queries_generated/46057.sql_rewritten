@@ -1,0 +1,108 @@
+-- {"query": "46057.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-4.5-sonnet", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 130758, "output_tokens": 105473} 
+WITH high_value_users AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT b.Id) as badge_count,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) as gold_badges,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as question_count,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as answer_count,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) as avg_question_score,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) as avg_answer_score
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 10000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT b.Id) > 5
+),
+popular_questions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        COUNT(DISTINCT c.Id) as comment_count,
+        COUNT(DISTINCT pl.Id) as link_count,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) as upvotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) as downvotes,
+        string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><') as tag_array
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId = 1
+        AND p.Score > 50
+        AND p.ViewCount > 10000
+        AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '2 years'
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CreationDate, p.OwnerUserId, p.Tags
+),
+tag_expertise AS (
+    SELECT 
+        t.TagName,
+        t.Count as tag_usage,
+        u.Id as user_id,
+        COUNT(DISTINCT p.Id) as posts_in_tag,
+        SUM(p.Score) as total_score_in_tag,
+        RANK() OVER (PARTITION BY t.TagName ORDER BY SUM(p.Score) DESC) as expertise_rank
+    FROM Tags t
+    CROSS JOIN LATERAL string_to_array(substring(t.TagName, 1, length(t.TagName)), '><') as tag_split
+    JOIN Posts p ON substring(p.Tags, 2, length(p.Tags)-2) LIKE '%' || t.TagName || '%'
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE t.Count > 1000
+        AND p.PostTypeId IN (1, 2)
+    GROUP BY t.TagName, t.Count, u.Id
+    HAVING COUNT(DISTINCT p.Id) > 10
+),
+answer_quality_metrics AS (
+    SELECT 
+        a.Id as answer_id,
+        a.ParentId as question_id,
+        a.OwnerUserId,
+        a.Score as answer_score,
+        q.Score as question_score,
+        a.CreationDate as answer_date,
+        q.CreationDate as question_date,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600 as hours_to_answer,
+        CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END as is_accepted,
+        COUNT(DISTINCT ph.Id) as edit_count,
+        LENGTH(a.Body) as answer_length
+    FROM Posts a
+    JOIN Posts q ON a.ParentId = q.Id
+    LEFT JOIN PostHistory ph ON a.Id = ph.PostId AND ph.PostHistoryTypeId IN (4, 5, 6)
+    WHERE a.PostTypeId = 2
+        AND a.CreationDate >= cast('2024-10-01' as date) - INTERVAL '18 months'
+        AND a.Score >= 5
+    GROUP BY a.Id, a.ParentId, a.OwnerUserId, a.Score, q.Score, a.CreationDate, q.CreationDate, q.AcceptedAnswerId, a.Body
+)
+SELECT 
+    hvu.DisplayName,
+    hvu.Reputation,
+    hvu.badge_count,
+    hvu.gold_badges,
+    hvu.question_count,
+    hvu.answer_count,
+    ROUND(hvu.avg_question_score::numeric, 2) as avg_question_score,
+    ROUND(hvu.avg_answer_score::numeric, 2) as avg_answer_score,
+    COUNT(DISTINCT pq.Id) as popular_questions_authored,
+    AVG(pq.ViewCount) as avg_views_on_popular_posts,
+    COUNT(DISTINCT te.TagName) as expert_tags,
+    ROUND(AVG(te.total_score_in_tag)::numeric, 2) as avg_tag_score,
+    COUNT(DISTINCT aqm.answer_id) as quality_answers,
+    AVG(aqm.hours_to_answer) as avg_response_time_hours,
+    SUM(aqm.is_accepted)::float / NULLIF(COUNT(DISTINCT aqm.answer_id), 0) as acceptance_rate,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY aqm.answer_length) as median_answer_length
+FROM high_value_users hvu
+LEFT JOIN popular_questions pq ON hvu.Id = pq.OwnerUserId
+LEFT JOIN tag_expertise te ON hvu.Id = te.user_id AND te.expertise_rank <= 10
+LEFT JOIN answer_quality_metrics aqm ON hvu.Id = aqm.OwnerUserId
+GROUP BY hvu.Id, hvu.DisplayName, hvu.Reputation, hvu.badge_count, hvu.gold_badges, 
+         hvu.question_count, hvu.answer_count, hvu.avg_question_score, hvu.avg_answer_score
+HAVING COUNT(DISTINCT pq.Id) > 0
+ORDER BY hvu.Reputation DESC, popular_questions_authored DESC
+LIMIT 100;

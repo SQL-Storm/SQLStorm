@@ -1,0 +1,117 @@
+WITH TaggedQuestions AS (
+    SELECT
+        q.Id,
+        q.AcceptedAnswerId,
+        q.OwnerUserId AS QuestionOwnerUserId,
+        q.ViewCount,
+        q.FavoriteCount
+    FROM Posts q
+    WHERE q.PostTypeId = 1 -- Question
+        AND q.Tags LIKE '%<java>%'
+        AND q.ClosedDate IS NULL
+        AND q.DeletionDate IS NULL
+),
+AnswerStats AS (
+    SELECT
+        a.OwnerUserId,
+        COUNT(a.Id) AS TotalAnswers,
+        SUM(a.Score) AS TotalAnswerScore,
+        SUM(CASE WHEN a.Id = tq.AcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedAnswersCount,
+        AVG(tq.ViewCount) AS AvgQuestionViews,
+        MAX(a.CreationDate) AS LastAnswerDate
+    FROM Posts a
+    JOIN TaggedQuestions tq ON a.ParentId = tq.Id
+    WHERE a.PostTypeId = 2 -- Answer
+        AND a.OwnerUserId IS NOT NULL
+        AND a.DeletionDate IS NULL
+    GROUP BY a.OwnerUserId
+    HAVING COUNT(a.Id) > 5
+),
+BadgeStats AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges b
+    WHERE b.TagBased = 1 AND b.Name = 'java'
+    GROUP BY b.UserId
+),
+UserContributionRank AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COALESCE(ans.TotalAnswers, 0) AS TotalAnswers,
+        COALESCE(ans.TotalAnswerScore, 0) AS TotalAnswerScore,
+        COALESCE(ans.AcceptedAnswersCount, 0) AS AcceptedAnswersCount,
+        COALESCE(b.GoldBadges, 0) AS GoldBadges,
+        COALESCE(b.SilverBadges, 0) AS SilverBadges,
+        COALESCE(b.BronzeBadges, 0) AS BronzeBadges,
+        (
+            (LOG(u.Reputation + 1) * 2) +
+            (COALESCE(ans.TotalAnswerScore, 0) * 0.3) +
+            (COALESCE(ans.AcceptedAnswersCount, 0) * 10) +
+            (COALESCE(b.GoldBadges, 0) * 100) +
+            (COALESCE(b.SilverBadges, 0) * 50) +
+            (COALESCE(b.BronzeBadges, 0) * 25)
+        ) AS InfluenceScore,
+        ans.LastAnswerDate
+    FROM Users u
+    JOIN AnswerStats ans ON u.Id = ans.OwnerUserId
+    LEFT JOIN BadgeStats b ON u.Id = b.UserId
+    WHERE u.Reputation > 10000
+)
+SELECT
+    DENSE_RANK() OVER (ORDER BY ucr.InfluenceScore DESC) AS Rank,
+    ucr.UserId,
+    ucr.DisplayName,
+    ucr.Reputation,
+    ucr.InfluenceScore,
+    ucr.TotalAnswers,
+    ucr.AcceptedAnswersCount,
+    (CASE WHEN ucr.TotalAnswers = 0 THEN NULL ELSE (ucr.AcceptedAnswersCount * 100.0 / ucr.TotalAnswers) END) AS AcceptanceRate,
+    ucr.GoldBadges,
+    ucr.SilverBadges,
+    ucr.BronzeBadges,
+    (
+        SELECT STRING_AGG(c.Text, ' | ')
+        FROM (
+            SELECT
+                c.Text,
+                c.Score,
+                c.CreationDate,
+                c.UserId,
+                c.PostId
+            FROM Comments c
+            JOIN Posts p ON c.PostId = p.Id AND p.OwnerUserId = ucr.UserId
+            JOIN TaggedQuestions tq ON p.Id = tq.Id OR p.ParentId = tq.Id
+            WHERE c.UserId IS NOT NULL AND c.UserId != ucr.UserId
+            ORDER BY c.Score DESC, c.CreationDate DESC
+            LIMIT 3
+        ) AS c_sub
+    ) AS TopReceivedComments,
+    (
+        SELECT ph.CreationDate
+        FROM PostHistory ph
+        WHERE ph.UserId = ucr.UserId
+          AND ph.PostHistoryTypeId = 5 -- Edit Body
+        ORDER BY ph.CreationDate DESC
+        LIMIT 1
+    ) AS LastBodyEditDate
+FROM UserContributionRank ucr
+WHERE ucr.LastAnswerDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3' YEAR)
+GROUP BY
+    ucr.UserId,
+    ucr.DisplayName,
+    ucr.Reputation,
+    ucr.InfluenceScore,
+    ucr.TotalAnswers,
+    ucr.AcceptedAnswersCount,
+    ucr.GoldBadges,
+    ucr.SilverBadges,
+    ucr.BronzeBadges,
+    ucr.LastAnswerDate
+ORDER BY Rank, ucr.Reputation DESC
+LIMIT 200;

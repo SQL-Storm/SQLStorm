@@ -1,0 +1,29 @@
+WITH TopTagUsers AS (
+    SELECT t.TagName,
+           u.Id,
+           u.DisplayName,
+           COUNT(p.Id) AS PostCount,
+           DENSE_RANK() OVER (PARTITION BY t.TagName ORDER BY COUNT(p.Id) DESC) AS UserRank
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%' || '>' || t.TagName || '<' || '%'
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName, u.Id, u.DisplayName
+)
+SELECT 
+    ttu.TagName,
+    ttu.Id AS UserId,
+    ttu.DisplayName,
+    ttu.PostCount,
+    (
+      SELECT AVG(v.Score)
+      FROM Posts p2
+      JOIN Votes v ON p2.Id = v.PostId
+      WHERE p2.OwnerUserId = ttu.Id
+        AND p2.Tags LIKE '%' || '>' || ttu.TagName || '<' || '%'
+    ) AS AvgVoteScore
+FROM TopTagUsers ttu
+WHERE ttu.UserRank <= 5
+GROUP BY ttu.TagName, ttu.Id, ttu.DisplayName, ttu.PostCount, ttu.UserRank
+ORDER BY ttu.TagName, ttu.PostCount DESC
+LIMIT 100;

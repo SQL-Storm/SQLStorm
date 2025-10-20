@@ -1,0 +1,155 @@
+WITH RecursiveTagPairs AS (
+  SELECT
+    p.Id AS QuestionId,
+    lower(trim(both '<>' FROM unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')))) AS Tag
+  FROM Posts p
+  WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+TagCooccurrence AS (
+  SELECT
+    t1.Tag AS TagA,
+    t2.Tag AS TagB,
+    COUNT(*) AS CoCount
+  FROM RecursiveTagPairs t1
+  JOIN RecursiveTagPairs t2
+    ON t1.QuestionId = t2.QuestionId
+   AND t1.Tag < t2.Tag
+  GROUP BY t1.Tag, t2.Tag
+),
+TagStats AS (
+  SELECT
+    r.tag,
+    COUNT(DISTINCT r.QuestionId) AS Questions,
+    AVG(p.ViewCount) AS AvgViews,
+    AVG(p.Score) AS AvgScore,
+    AVG(p.AnswerCount) AS AvgAnswers,
+    (
+      SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY sub.Score)
+      FROM Posts sub
+      WHERE sub.PostTypeId = 1
+        AND sub.Tags IS NOT NULL
+        AND lower(substring(sub.Tags, 2, length(sub.Tags) - 2)) LIKE concat('%', r.tag, '%')
+    ) AS MedianScore
+  FROM RecursiveTagPairs r
+  JOIN Posts p ON p.Id = r.QuestionId
+  GROUP BY r.tag
+),
+TopTagPairs AS (
+  SELECT
+    c.TagA,
+    c.TagB,
+    c.CoCount,
+    tsa.Questions AS QuestionsA,
+    tsb.Questions AS QuestionsB,
+    tsa.AvgViews AS AvgViewsA,
+    tsb.AvgViews AS AvgViewsB,
+    tsa.AvgScore AS AvgScoreA,
+    tsb.AvgScore AS AvgScoreB,
+    (CASE
+      WHEN ((tsa.Questions * 1.0 / NULLIF((SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1), 0)) * (tsb.Questions * 1.0 / NULLIF((SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1), 0))) = 0
+      THEN NULL
+      ELSE (c.CoCount * 1.0 / ((tsa.Questions * 1.0 / (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1)) * (tsb.Questions * 1.0 / (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1)) * (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1)))
+    END) AS Lift,
+    (c.CoCount * 1.0 / (tsa.Questions + tsb.Questions - c.CoCount)) AS Jaccard
+  FROM TagCooccurrence c
+  JOIN TagStats tsa ON tsa.tag = c.TagA
+  JOIN TagStats tsb ON tsb.tag = c.TagB
+),
+HotQuestions AS (
+  SELECT
+    q.Id,
+    q.Title,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.FavoriteCount,
+    q.LastActivityDate,
+    (
+      SELECT MAX(tp.Lift)
+      FROM (
+        SELECT lower(trim(both '<>' FROM unnest(string_to_array(substring(q.Tags, 2, length(q.Tags) - 2), '><')))) AS t
+      ) qt
+      JOIN TopTagPairs tp ON (tp.TagA = qt.t OR tp.TagB = qt.t)
+    ) AS MaxTagLift,
+    exp(- greatest(extract(epoch from (CAST('2024-10-01 12:34:56' AS timestamp) - COALESCE(q.LastActivityDate, q.CreationDate)))/86400, 0) / 30.0) AS RecencyWeight,
+    (
+      (COALESCE(q.Score,0) * 2.5)
+      + (LN(GREATEST(COALESCE(q.ViewCount,0),1)) * 1.2)
+      + (COALESCE(q.AnswerCount,0) * 3.0)
+      + (COALESCE(q.FavoriteCount,0) * 5.0)
+      + (COALESCE( (SELECT MAX(tp.Lift)
+            FROM (
+              SELECT lower(trim(both '<>' FROM unnest(string_to_array(substring(q.Tags, 2, length(q.Tags) - 2), '><')))) AS t
+            ) qt
+            JOIN TopTagPairs tp ON (tp.TagA = qt.t OR tp.TagB = qt.t)
+          ), 0) * 50.0)
+    ) * exp(- greatest(extract(epoch from (CAST('2024-10-01 12:34:56' AS timestamp) - COALESCE(q.LastActivityDate, q.CreationDate)))/86400, 0) / 30.0)
+    AS HotnessScore
+  FROM Posts q
+  WHERE q.PostTypeId = 1 AND q.Tags IS NOT NULL
+),
+RecentActiveUsers AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT a.Id) FILTER (WHERE a.PostTypeId = 2) AS RecentAnswers,
+    COUNT(DISTINCT c.Id) FILTER (WHERE c.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days') AS RecentComments,
+    COUNT(DISTINCT v.Id) FILTER (WHERE v.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days') AS RecentVotes,
+    (u.Reputation * LN(GREATEST(1, 1 + COUNT(DISTINCT a.Id) FILTER (WHERE a.PostTypeId = 2) + COUNT(DISTINCT c.Id) FILTER (WHERE c.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days') + COUNT(DISTINCT v.Id) FILTER (WHERE v.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days')))) AS Influence
+  FROM Users u
+  LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2 AND a.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+  LEFT JOIN Comments c ON c.UserId = u.Id
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+AnswerQuality AS (
+  SELECT
+    ans.ParentId AS QuestionId,
+    COUNT(*) FILTER (WHERE ans.Score >= 5) AS HighScoreAnswers,
+    AVG(ans.Score) AS AvgAnswerScore,
+    SUM(CASE WHEN EXISTS (SELECT 1 FROM Votes vv WHERE vv.PostId = ans.Id AND vv.VoteTypeId = 8) THEN 1 ELSE 0 END) AS HasBountyAnswers
+  FROM Posts ans
+  WHERE ans.PostTypeId = 2
+  GROUP BY ans.ParentId
+)
+SELECT
+  h.Id AS QuestionId,
+  h.Title,
+  h.CreationDate,
+  h.Score,
+  h.ViewCount,
+  h.AnswerCount,
+  h.FavoriteCount,
+  COALESCE(aq.HighScoreAnswers,0) AS HighScoreAnswers,
+  COALESCE(aq.AvgAnswerScore,0) AS AvgAnswerScore,
+  COALESCE(h.MaxTagLift,0) AS MaxTagLift,
+  COALESCE(h.RecencyWeight,0) AS RecencyWeight,
+  h.HotnessScore AS HotnessScore,
+  (
+    SELECT json_agg(json_build_object('UserId', ru.UserId, 'DisplayName', ru.DisplayName, 'Influence', ru.Influence) ORDER BY ru.Influence DESC)
+    FROM (
+      SELECT DISTINCT u.UserId, u.DisplayName, u.Influence
+      FROM RecentActiveUsers u
+      JOIN (
+        SELECT OwnerUserId AS uid FROM Posts p2 WHERE p2.ParentId = h.Id AND p2.PostTypeId = 2 AND p2.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days'
+        UNION
+        SELECT UserId AS uid FROM Comments c2 WHERE c2.PostId = h.Id AND c2.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days'
+      ) engaged ON engaged.uid = u.UserId
+      ORDER BY u.Influence DESC
+      LIMIT 3
+    ) ru
+  ) AS TopContributors,
+  (
+    SELECT json_agg(json_build_object('Tag', t.TagB, 'CoCount', t.CoCount, 'Jaccard', t.Jaccard, 'Score', (t.Jaccard * t.CoCount)) ORDER BY (t.Jaccard * t.CoCount) DESC)
+    FROM TopTagPairs t
+    WHERE t.TagA IN (
+      SELECT lower(trim(both '<>' FROM unnest(string_to_array(substring(h.Tags, 2, length(h.Tags) - 2), '><'))))
+    )
+    LIMIT 5
+  ) AS RelatedTrendingTags
+FROM HotQuestions h
+LEFT JOIN AnswerQuality aq ON aq.QuestionId = h.Id
+ORDER BY h.HotnessScore DESC
+LIMIT 250;

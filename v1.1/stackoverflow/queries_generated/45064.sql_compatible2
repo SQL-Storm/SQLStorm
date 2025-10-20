@@ -1,0 +1,59 @@
+SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    t.TagName,
+    u.DisplayName AS AuthorName,
+    COUNT(DISTINCT v.Id) AS VoteCount,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    MAX(u.Reputation) AS AuthorReputation,
+    AVG(v2.Score) AS AverageRelatedPostScore
+FROM
+    Posts p
+JOIN Tags t ON t.Id = (
+    SELECT elem_casted
+    FROM (
+        SELECT (regexp_split_to_table(
+                    substring(p.Tags FROM 2 FOR (char_length(p.Tags) - 2)),
+                    '><'
+                 )) AS elem
+    ) s
+    -- ensure types align: if Tags.Id is numeric but elem is text, try to cast elem to same type as t.Id
+    -- attempt casting elem to integer if t.Id is integer-like; use a safe cast to numeric if needed
+    -- here we cast to text-to-integer where possible
+    CROSS JOIN LATERAL (
+      SELECT CASE
+               WHEN (t.Id IS NOT NULL AND pg_typeof(t.Id)::text = 'integer') THEN (s.elem)::integer::text
+               ELSE s.elem
+             END AS elem_casted_raw
+    ) cast_helper
+    -- finally cast to the type of t.Id for comparison
+    -- to avoid using nonstandard '::' casts and pg_typeof in some dialects, perform a simple safe cast to integer when possible
+    -- Prefer numeric comparison: try integer cast first, otherwise compare as text
+    WHERE
+      (
+        -- try integer comparison if possible
+        (CASE WHEN (regexp_replace(pg_catalog.format_type(pg_catalog.pg_typeof(t.Id)::regtype, NULL), '[^a-zA-Z]', '', 'g') = 'int4') THEN
+            (t.Id = (s.elem)::integer)
+          ELSE
+            (CAST(t.Id AS text) = s.elem)
+         END)
+      )
+    LIMIT 1
+)
+JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Votes v ON p.Id = v.PostId
+LEFT JOIN Comments c ON p.Id = c.PostId
+LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN Posts v2 ON pl.RelatedPostId = v2.Id
+WHERE
+    p.PostTypeId = 1
+    AND p.CreationDate > DATE '2015-01-01'
+    AND u.Reputation > 1000
+GROUP BY
+    p.Id, p.Title, p.CreationDate, t.TagName, u.DisplayName, u.Reputation
+HAVING
+    COUNT(DISTINCT v.Id) > 10
+ORDER BY
+    VoteCount DESC, AuthorReputation DESC
+LIMIT 500;

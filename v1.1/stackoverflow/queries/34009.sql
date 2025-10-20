@@ -1,0 +1,102 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT t.Id, t.TagName, t.Count, 0 AS Level
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE AND t.IsRequired = FALSE
+    UNION ALL
+    SELECT t.Id, t.TagName, t.Count, th.Level + 1
+    FROM Tags t
+    JOIN RecursiveTagHierarchy th ON t.Id <> th.Id
+    WHERE th.Level < 2
+),
+UserReputationSummary AS (
+    SELECT u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        COALESCE(SUM(vt.UpVotes), 0) AS TotalUpVotes,
+        COALESCE(SUM(vt.DownVotes), 0) AS TotalDownVotes,
+        MAX(p.LastActivityDate) AS LastActivity
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT v.PostId,
+            SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        GROUP BY v.PostId
+    ) vt ON vt.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TopBadges AS (
+    SELECT b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 ELSE NULL END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 ELSE NULL END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 ELSE NULL END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+QuestionAnswerStats AS (
+    SELECT q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        a.Id AS AnswerId,
+        a.CreationDate AS AnswerCreationDate,
+        a.Score AS AnswerScore,
+        a.OwnerUserId AS AnswerOwnerUserId,
+        ur.DisplayName AS AnswerOwnerDisplayName
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN Users ur ON ur.Id = a.OwnerUserId
+    WHERE q.PostTypeId = 1 AND q.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '365' DAY)
+),
+TopCommenters AS (
+    SELECT c.UserId,
+        u.DisplayName,
+        COUNT(c.Id) AS CommentCount
+    FROM Comments c
+    JOIN Users u ON u.Id = c.UserId
+    GROUP BY c.UserId, u.DisplayName
+)
+SELECT qas.QuestionId,
+    qas.Title,
+    qas.QuestionCreationDate,
+    qas.QuestionScore,
+    qas.ViewCount,
+    qas.Tags,
+    COUNT(DISTINCT qas.AnswerId) AS NumberOfAnswers,
+    AVG(COALESCE(qas.AnswerScore, 0)) AS AverageAnswerScore,
+    MAX(COALESCE(qas.AnswerScore, 0)) AS MaxAnswerScore,
+    STRING_AGG(DISTINCT ur.DisplayName, ', ') AS Answerers,
+    urs.TotalPosts,
+    urs.TotalQuestions,
+    urs.TotalAnswers,
+    urs.TotalScore,
+    urs.TotalUpVotes,
+    urs.TotalDownVotes,
+    urs.LastActivity,
+    COALESCE(tb.GoldBadges, 0) AS GoldBadges,
+    COALESCE(tb.SilverBadges, 0) AS SilverBadges,
+    COALESCE(tb.BronzeBadges, 0) AS BronzeBadges,
+    (SELECT STRING_AGG(tt.TagName, ', ')
+     FROM RecursiveTagHierarchy tt 
+     WHERE qas.Tags LIKE '%' || '<' || tt.TagName || '>' || '%'
+     AND tt.Level = 0) AS PrimaryTags,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = qas.QuestionId AND pl.LinkTypeId = 3) AS DuplicateCount,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = qas.QuestionId AND ph.PostHistoryTypeId = 10) AS CloseVoteCount,
+    tc.CommentCount AS TopCommenterComments
+FROM QuestionAnswerStats qas
+LEFT JOIN UserReputationSummary urs ON urs.UserId = qas.AnswerOwnerUserId
+LEFT JOIN TopBadges tb ON tb.UserId = qas.AnswerOwnerUserId
+LEFT JOIN Users ur ON ur.Id = qas.AnswerOwnerUserId
+LEFT JOIN TopCommenters tc ON tc.UserId = qas.AnswerOwnerUserId
+GROUP BY qas.QuestionId, qas.Title, qas.QuestionCreationDate, qas.QuestionScore, qas.ViewCount, qas.Tags,
+    urs.TotalPosts, urs.TotalQuestions, urs.TotalAnswers, urs.TotalScore, urs.TotalUpVotes, urs.TotalDownVotes, urs.LastActivity,
+    tb.GoldBadges, tb.SilverBadges, tb.BronzeBadges, tc.CommentCount, ur.DisplayName
+ORDER BY qas.QuestionScore DESC
+LIMIT 50;

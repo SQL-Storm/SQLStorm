@@ -1,0 +1,85 @@
+WITH  
+Questions AS (  
+    SELECT  
+        p.Id,  
+        p.Title,  
+        p.CreationDate,  
+        p.ViewCount,  
+        u.DisplayName AS OwnerName,  
+        COUNT(v.Id) AS TotalVotes,  
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,  
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes,  
+        p.Tags,  
+        p.OwnerUserId  
+    FROM Posts p  
+    LEFT JOIN Votes v ON v.PostId = p.Id  
+    LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId  
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId  
+    WHERE p.PostTypeId = 1  
+    GROUP BY p.Id, p.Title, p.CreationDate, p.ViewCount, u.DisplayName, p.Tags, p.OwnerUserId  
+),  
+-- split tags for each question (recursive split, using LATERAL for referencing Questions)  
+TagByQuestions AS (  
+    SELECT q.Id AS QuestionId,  
+           NULLIF(TRIM(SUBSTRING(s.tag_str FROM 1 FOR POSITION('>' IN s.tag_str)-1)), '') AS TagName,  
+           TRIM(SUBSTRING(s.tag_str FROM POSITION('>' IN s.tag_str)+1)) AS rest  
+    FROM Questions q  
+    CROSS JOIN LATERAL (VALUES (REPLACE(q.Tags, '<>', '>'))) AS s(tag_str)  
+    WHERE q.Tags IS NOT NULL AND q.Tags <> ''  
+    UNION ALL  
+    SELECT tq.QuestionId,  
+           NULLIF(TRIM(SUBSTRING(tq.rest FROM 1 FOR POSITION('>' IN tq.rest)-1)), '') AS TagName,  
+           TRIM(SUBSTRING(tq.rest FROM POSITION('>' IN tq.rest)+1)) AS rest  
+    FROM TagByQuestions tq  
+    WHERE tq.rest IS NOT NULL AND tq.rest <> '' AND POSITION('>' IN tq.rest) > 0  
+),  
+FinalTags AS (  
+    SELECT QuestionId, TagName  
+    FROM TagByQuestions  
+    WHERE TagName IS NOT NULL AND TagName <> ''  
+),  
+Duplicates AS (  
+    SELECT pl.PostId, COUNT(*) AS DuplicateCount  
+    FROM PostLinks pl  
+    WHERE pl.LinkTypeId = 3  
+    GROUP BY pl.PostId  
+),  
+Badges AS (  
+    SELECT b.UserId,  
+           SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS Gold,  
+           SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS Silver,  
+           SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS Bronze  
+    FROM Badges b  
+    GROUP BY b.UserId  
+)  
+SELECT  
+    q.Id,  
+    q.Title,  
+    q.CreationDate,  
+    q.OwnerName,  
+    q.ViewCount,  
+    q.TotalVotes,  
+    q.UpVotes,  
+    q.DownVotes,  
+    COALESCE(d.DuplicateCount, 0) AS DuplicateLinks,  
+    COALESCE(b.Gold, 0) AS GoldBadges,  
+    COALESCE(b.Silver, 0) AS SilverBadges,  
+    COALESCE(b.Bronze, 0) AS BronzeBadges,  
+    STRING_AGG(DISTINCT ft.TagName, ', ' ORDER BY ft.TagName) AS Tags  
+FROM Questions q  
+LEFT JOIN Duplicates d ON d.PostId = q.Id  
+LEFT JOIN Badges b ON b.UserId = q.OwnerUserId  
+LEFT JOIN FinalTags ft ON ft.QuestionId = q.Id  
+GROUP BY  
+    q.Id,  
+    q.Title,  
+    q.CreationDate,  
+    q.OwnerName,  
+    q.ViewCount,  
+    q.TotalVotes,  
+    q.UpVotes,  
+    q.DownVotes,  
+    d.DuplicateCount,  
+    b.Gold, b.Silver, b.Bronze  
+ORDER BY q.ViewCount DESC  
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY;

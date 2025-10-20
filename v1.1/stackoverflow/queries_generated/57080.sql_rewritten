@@ -1,0 +1,102 @@
+-- {"query": "57080.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "pixtral-large", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2291, "output_tokens": 1099} 
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(p.Id) AS TotalPosts,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS TotalQuestions,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS TotalAnswers,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(v.VoteTypeId = 2) AS TotalUpvotesReceived,
+        SUM(v.VoteTypeId = 3) AS TotalDownvotesReceived,
+        COALESCE(MAX(p.Score), 0) AS MaxPostScore,
+        COALESCE(MAX(p.ViewCount), 0) AS MaxPostViews,
+        COUNT( DISTINCT b.Id) AS TotalBadges,
+             CASE
+                WHEN COUNT(DISTINCT ph.PostHistoryTypeId) > 0 THEN
+               COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.PostId ELSE NULL END) ELSE  0 (last value is a default - no edits)
+            END AS Updates
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    LEFT JOIN
+        PostHistory ph ON ph.UserId = u.Id
+    WHERE
+        u.CreationDate BETWEEN '2023-01-01' AND '2023-12-31'
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate
+),
+PostActivity AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.AnswerCount,
+        p.CommentCount,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        COUNT(DISTINCT c.Id) AS TotalCommentsOnPost,
+        COUNT(DISTINCT ph.Id) AS TotalPostHistoryEvents,
+        COUNT(DISTINCT pl.Id) AS TotalPostLinks,
+        COUNT(DISTINCT t.Id) FILTER (WHERE p.PostTypeId = 1) AS TotalTags
+    FROM
+        Posts p
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN
+        PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN
+        PostLinks pl ON p.Id = pl.PostId
+    LEFT JOIN
+        Tags t
+    ON
+        p.Id = t.ExcerptPostId
+    WHERE
+        p.CreationDate BETWEEN '2023-01-01' AND '2023-12-31'
+    GROUP BY
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId, p.AnswerCount, p.CommentCount
+)
+SELECT
+    ua.UserId,
+    ua.Reputation,
+    ua.UserCreationDate,
+    ua.TotalPosts,
+    ua.TotalQuestions,
+    ua.TotalAnswers,
+    ua.TotalComments,
+    ua.TotalUpvotesReceived,
+    ua.TotalDownvotesReceived,
+    ua.MaxPostScore,
+    ua.MaxPostViews,
+    ua.TotalBadges,
+    pa.PostId,
+    pa.TotalVotes,
+    pa.TotalTags,
+    pa.PostCreationDate,
+    pa.PostTypeId,
+    pa.TotalPostLinks
+
+FROM
+    UserActivity ua
+JOIN
+     PostActivity pa ON  ua.UserId = pa.OwnerUserId
+    WHERE
+
+    ua.TotalPosts > 15
+ORDER BY
+      ua.TotalUpvotesReceived
+    DESC
+LIMIT
+    50;

@@ -1,0 +1,117 @@
+-- {"query": "91.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1002} 
+WITH
+RecentVotes AS (
+  SELECT
+    v.PostId,
+    v.VoteTypeId,
+    v.UserId,
+    v.CreationDate,
+    u.DisplayName AS VoterName,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.PostTypeId,
+    p.Score,
+    p.ViewCount,
+    p.LastActivityDate
+  FROM Votes v
+  JOIN Users u ON v.UserId = u.Id
+  JOIN Posts p ON v.PostId = p.Id
+  WHERE v.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+),
+TagMetrics AS (
+  SELECT
+    unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName,
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.LastActivityDate
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+TopTagScores AS (
+  SELECT
+    tm.TagName,
+    SUM(p.Score) AS TagScoreSum,
+    AVG(p.ViewCount) AS TagAvgViews,
+    COUNT(*) AS PostCount
+  FROM TagMetrics tm
+  JOIN Posts p ON tm.PostId = p.Id
+  GROUP BY tm.TagName
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    COUNT(*) FILTER (WHERE v.Id IS NOT NULL) AS VoteCountLast30,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesLast30,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesLast30,
+    MAX(v.CreationDate) AS LastVoteDate
+  FROM Users u
+  LEFT JOIN Votes v ON u.Id = v.UserId
+  LEFT JOIN Posts p ON v.PostId = p.Id
+  WHERE v.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+  GROUP BY u.Id, u.DisplayName
+),
+ComplexPostInsights AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    CASE
+      WHEN p.AcceptedAnswerId IS NULL AND p.PostTypeId = 1 THEN 'Unanswered'
+      WHEN p.Score > 10 THEN 'Hot'
+      ELSE 'Normal'
+    END AS StatusCategory,
+    ARRAY_AGG(DISTINCT l.Name) FILTER (WHERE l.Name IS NOT NULL) AS LinkTypesUsed
+  FROM Posts p
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+  LEFT JOIN LinkTypes l ON pl.LinkTypeId = l.Id
+  GROUP BY p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.LastActivityDate, p.Score, p.ViewCount, p.Tags, p.AcceptedAnswerId
+)
+SELECT
+  -- Outer join and correlated subquery examples combined
+  u.Id AS UserId,
+  u.DisplayName AS UserDisplayName,
+  cu.TagName,
+  cu.PostId AS TagPostId,
+  cu.PostTitle AS TagPostTitle,
+  tms.TagScoreSum,
+  tms.TagAvgViews,
+  tms.PostCount,
+  ui.VoteCountLast30,
+  ui.UpVotesLast30,
+  ui.DownVotesLast30,
+  ci.PostId AS PostWithInsights,
+  ci.Title AS PostTitleWithInsights,
+  ci.StatusCategory,
+  ci.LinkTypesUsed,
+  rc.Name AS LastCloseReason,
+  v2.CreationDate AS LastVoteDate
+FROM Users u
+LEFT JOIN (
+  SELECT DISTINCT ON (TagName)
+    tag.TagName,
+    tag.PostId,
+    post.Title AS PostTitle
+  FROM TopTagScores tag
+  JOIN Posts post ON post.Id = tag.PostId
+  ORDER BY TagName, tag.TagScoreSum DESC
+) AS cu ON cu.TagName IN (SELECT TagName FROM TopTagScores) -- correlate with top tags
+LEFT JOIN TopTagScores tms ON tms.TagName = cu.TagName
+LEFT JOIN UserActivity ui ON ui.UserId = u.Id
+LEFT JOIN ComplexPostInsights ci ON ci.PostId = cu.PostId
+LEFT JOIN PostHistory ph ON ph.PostId = cu.PostId
+LEFT JOIN PostHistoryTypes PHT ON ph.PostHistoryTypeId = PHT.Id
+LEFT JOIN CloseReasonTypes rc ON CAST(ph.Comment AS varchar) LIKE '%' || rc.Id || '%'
+LEFT JOIN Votes v2 ON v2.PostId = cu.PostId
+WHERE u.Id IS NOT NULL
+ORDER BY u.Id, cu.TagName
+LIMIT 100;

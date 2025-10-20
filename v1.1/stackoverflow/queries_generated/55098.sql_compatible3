@@ -1,0 +1,124 @@
+WITH
+recent_questions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        u.Reputation AS OwnerReputation,
+        string_to_array(
+            substring(p.Tags FROM 2 FOR length(p.Tags)-2),
+            '><'
+        ) AS TagArray
+    FROM Posts p
+    JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days'
+      AND p.Score >= 10
+),
+tag_stats AS (
+    SELECT
+        t.TagName,
+        t.Count AS TotalTagUses,
+        COUNT(DISTINCT ph.PostId) FILTER (WHERE ph.PostHistoryTypeId = 15) AS TagWikiEdits,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesOnTagWikis,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesOnTagWikis
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Id = t.WikiPostId
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 24
+    LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId IN (2,3)
+    GROUP BY t.TagName, t.Count
+),
+user_activity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT q.Id) FILTER (WHERE q.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days') AS QuestionsAsked30d,
+        COUNT(DISTINCT a.Id) FILTER (WHERE a.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days') AS AnswersPosted30d,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2 AND v.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days') AS UpVotesGiven30d,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3 AND v.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days') AS DownVotesGiven30d,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.VoteTypeId = 8 AND b.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days') AS BountiesStarted30d,
+        MAX(b.BountyAmount) FILTER (WHERE b.VoteTypeId = 8) AS MaxBountyStarted
+    FROM Users u
+    LEFT JOIN Posts q ON q.OwnerUserId = u.Id AND q.PostTypeId = 1
+    LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Votes b ON b.UserId = u.Id AND b.VoteTypeId = 8
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+)
+SELECT
+    rq.QuestionId,
+    rq.Title,
+    rq.CreationDate,
+    rq.Score,
+    rq.ViewCount,
+    rq.FavoriteCount,
+    rq.OwnerDisplayName,
+    rq.OwnerReputation,
+    jsonb_agg(
+        jsonb_build_object(
+            'Tag', t.TagName,
+            'QuestionTagUses', (SELECT COUNT(*) FROM UNNEST(rq.TagArray) AS t_tag WHERE t_tag = t.TagName),
+            'TotalTagUses', t.TotalTagUses,
+            'TagWikiEdits', t.TagWikiEdits,
+            'UpVotesOnTagWiki', t.UpVotesOnTagWikis,
+            'DownVotesOnTagWiki', t.DownVotesOnTagWikis
+        )
+        ORDER BY (SELECT COUNT(*) FROM UNNEST(rq.TagArray) AS t_tag WHERE t_tag = t.TagName) DESC
+    ) AS TopTagsInfo,
+    COALESCE(a.AnswerCount,0) AS AnswerCount,
+    CASE WHEN a.AcceptedAnswerId IS NOT NULL THEN TRUE ELSE FALSE END AS HasAcceptedAnswer,
+    a.AvgAnswerScore,
+    qv.UpVotes,
+    qv.DownVotes,
+    qv.FavoriteVotes,
+    ua.QuestionsAsked30d,
+    ua.AnswersPosted30d,
+    ua.UpVotesGiven30d,
+    ua.DownVotesGiven30d,
+    ua.BountiesStarted30d,
+    ua.MaxBountyStarted
+FROM recent_questions rq
+LEFT JOIN LATERAL (
+    SELECT
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 5) AS FavoriteVotes
+    FROM Votes v
+    WHERE v.PostId = rq.QuestionId
+) qv ON TRUE
+LEFT JOIN LATERAL (
+    SELECT
+        COUNT(*) AS AnswerCount,
+        MAX(a.AcceptedAnswerId) AS AcceptedAnswerId,
+        AVG(a.Score) AS AvgAnswerScore
+    FROM Posts a
+    WHERE a.ParentId = rq.QuestionId AND a.PostTypeId = 2
+) a ON TRUE
+LEFT JOIN LATERAL (
+    SELECT t_tag AS TagName,
+           ts.TotalTagUses,
+           ts.TagWikiEdits,
+           ts.UpVotesOnTagWikis,
+           ts.DownVotesOnTagWikis
+    FROM UNNEST(rq.TagArray) AS t_tag
+    LEFT JOIN tag_stats ts ON ts.TagName = t_tag
+) t ON TRUE
+LEFT JOIN user_activity ua ON ua.UserId = rq.OwnerUserId
+GROUP BY
+    rq.QuestionId, rq.Title, rq.CreationDate, rq.Score, rq.ViewCount,
+    rq.FavoriteCount, rq.OwnerDisplayName, rq.OwnerReputation,
+    a.AnswerCount, a.AcceptedAnswerId, a.AvgAnswerScore,
+    qv.UpVotes, qv.DownVotes, qv.FavoriteVotes,
+    ua.QuestionsAsked30d, ua.AnswersPosted30d,
+    ua.UpVotesGiven30d, ua.DownVotesGiven30d,
+    ua.BountiesStarted30d, ua.MaxBountyStarted,
+    t.TagName, t.TotalTagUses, t.TagWikiEdits, t.UpVotesOnTagWikis, t.DownVotesOnTagWikis
+ORDER BY rq.Score DESC, rq.ViewCount DESC
+LIMIT 100;

@@ -1,0 +1,84 @@
+-- {"query": "55002.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2048, "output_tokens": 1557} 
+
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)                         AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)                         AS AnswerCount,
+        COALESCE(SUM(p.Score) FILTER (WHERE p.PostTypeId = 1),0)           AS QuestionScoreSum,
+        COALESCE(SUM(p.Score) FILTER (WHERE p.PostTypeId = 2),0)           AS AnswerScoreSum,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2)                        AS UpVoteCount,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3)                        AS DownVoteCount,
+        COUNT(b.Id)                                                       AS BadgeCount,
+        COUNT(DISTINCT t.TagName)                                         AS DistinctTagCount
+    FROM Users u
+    LEFT JOIN Posts p          ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v          ON v.UserId = u.Id
+    LEFT JOIN Badges b         ON b.UserId = u.Id
+    LEFT JOIN LATERAL (
+        SELECT UNNEST(string_to_array(p.Tags, '><')) AS TagName
+        FROM Posts p2
+        WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 1
+    ) t(TagName) ON true
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RecentActivity AS (
+    SELECT 
+        ua.UserId,
+        MAX(ua.ActivityDate) AS LastActivity
+    FROM (
+        SELECT u.Id AS UserId, u.CreationDate      AS ActivityDate FROM Users u
+        UNION ALL
+        SELECT p.OwnerUserId, p.LastActivityDate   FROM Posts p WHERE p.OwnerUserId IS NOT NULL
+        UNION ALL
+        SELECT c.UserId, c.CreationDate            FROM Comments c WHERE c.UserId IS NOT NULL
+        UNION ALL
+        SELECT v.UserId, v.CreationDate            FROM Votes v WHERE v.UserId IS NOT NULL
+    ) ua
+    GROUP BY ua.UserId
+),
+CloseReasons AS (
+    SELECT 
+        ph.PostId,
+        jsonb_agg(
+            jsonb_build_object(
+                'CloseReasonId', ph.Comment::int,
+                'UserId',        ph.UserId,
+                'Date',          ph.CreationDate
+            )
+        ) AS CloseEvents
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId
+)
+SELECT 
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.QuestionScoreSum,
+    us.AnswerScoreSum,
+    us.UpVoteCount,
+    us.DownVoteCount,
+    us.BadgeCount,
+    us.DistinctTagCount,
+    ra.LastActivity,
+    cr.CloseEvents
+FROM UserStats us
+LEFT JOIN RecentActivity ra ON ra.UserId = us.Id
+LEFT JOIN LATERAL (
+    SELECT cr.CloseEvents
+    FROM CloseReasons cr
+    WHERE cr.PostId IN (
+        SELECT p.Id FROM Posts p WHERE p.OwnerUserId = us.Id AND p.PostTypeId = 1
+    )
+    LIMIT 1
+) cr ON true
+WHERE us.Reputation > 10000
+ORDER BY 
+    us.Reputation DESC,
+    (us.QuestionCount + us.AnswerCount) DESC
+LIMIT 100 OFFSET 0;

@@ -1,0 +1,119 @@
+WITH
+TopUsers AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+        ROW_NUMBER() OVER (ORDER BY U.Reputation DESC) AS Rank
+    FROM
+        Users U
+        JOIN Posts P ON U.Id = P.OwnerUserId
+    WHERE
+        U.Reputation > 0
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation
+    HAVING
+        COUNT(DISTINCT P.Id) > 50
+),
+-- helper to split tags: replace Postgres-specific functions with standard-ish parsing using a derived table that extracts tag strings.
+-- This version assumes a tags format like '<tag1><tag2>' and uses recursive splitting where supported, otherwise the logic may need a UDF.
+SplitTags AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        TRIM(BOTH '<>' FROM SUB.TAG) AS TagName
+    FROM
+        Posts P
+        JOIN (
+            -- emulate splitting by locating delimiters iteratively
+            -- works in many dialects that support recursive CTEs
+            WITH RECURSIVE parts(PostId, OwnerUserId, rest, TAG) AS (
+                SELECT P0.Id, P0.OwnerUserId,
+                       P0.Tags AS rest,
+                       NULL::varchar AS TAG
+                FROM Posts P0
+                WHERE P0.Tags IS NOT NULL
+                UNION ALL
+                SELECT PostId, OwnerUserId,
+                       CASE
+                         WHEN LOCATE('><', rest) > 0 THEN SUBSTR(rest, LOCATE('><', rest) + 2)
+                         ELSE NULL
+                       END,
+                       CASE
+                         WHEN LOCATE('><', rest) > 0 THEN SUBSTR(rest, 1, LOCATE('><', rest) - 1)
+                         ELSE rest
+                       END
+                FROM parts
+                WHERE rest IS NOT NULL
+            )
+            SELECT PostId, OwnerUserId, TAG
+            FROM parts
+            WHERE TAG IS NOT NULL
+        ) SUB ON SUB.PostId = P.Id
+),
+TagStats AS (
+    SELECT
+        ST.OwnerUserId,
+        UPPER(ST.TagName) AS TagName,
+        COUNT(*) AS PostsWithTag,
+        AVG(P.Score) AS AvgScore,
+        MAX(P.Score) AS MaxScore
+    FROM
+        SplitTags ST
+        JOIN Posts P ON P.Id = ST.PostId
+    GROUP BY
+        ST.OwnerUserId, UPPER(ST.TagName)
+),
+MostUsedTagPerUser AS (
+    SELECT
+        OwnerUserId,
+        TagName,
+        PostsWithTag,
+        ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY PostsWithTag DESC, TagName) AS rn
+    FROM
+        TagStats
+),
+TopTagUsagePerUser AS (
+    SELECT
+        OwnerUserId,
+        MAX(PostsWithTag) AS MaxTagUsage
+    FROM
+        TagStats
+    GROUP BY
+        OwnerUserId
+)
+SELECT
+    TU.UserId,
+    TU.DisplayName,
+    TU.Reputation,
+    TU.TotalPosts,
+    TU.Questions,
+    TU.Answers,
+    PT.TagName AS MostUsedTag,
+    PT.PostsWithTag AS TagUsage,
+    COALESCE(TS.AvgScore, 0) AS AvgScoreOnTag,
+    COALESCE(TS.MaxScore, 0) AS MaxScoreOnTag,
+    COALESCE(PT.PostsWithTag, 0) AS PostsWithTag,
+    (
+        SELECT COUNT(DISTINCT Q.Id)
+        FROM Posts Q
+        WHERE Q.OwnerUserId = TU.UserId
+          AND Q.PostTypeId = 1
+          AND Q.AnswerCount >= 1
+          AND Q.AcceptedAnswerId IS NOT NULL
+    ) AS AnsweredQuestions
+FROM
+    TopUsers TU
+    LEFT JOIN TagStats TS ON TS.OwnerUserId = TU.UserId
+    LEFT JOIN MostUsedTagPerUser PT ON PT.OwnerUserId = TU.UserId AND PT.rn = 1
+    LEFT JOIN TopTagUsagePerUser TPU ON TPU.OwnerUserId = TU.UserId
+WHERE
+    TU.Rank <= 50
+    AND PT.TagName = TS.TagName
+    AND PT.PostsWithTag = TPU.MaxTagUsage
+ORDER BY
+    TU.Reputation DESC, TU.UserId
+LIMIT 50;

@@ -1,0 +1,28 @@
+SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersGiven,
+    MAX(p.Score) AS HighestScore,
+    AVG(COALESCE(p.ViewCount, 0)) AS AvgViewCount,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id) AS TotalComments,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 2) AS UpvotesCast,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 3) AS DownvotesCast
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+WHERE 
+    u.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '1' YEAR)
+GROUP BY 
+    u.Id,
+    u.DisplayName,
+    u.Reputation
+ORDER BY 
+    TotalPosts DESC, u.Reputation DESC
+LIMIT 10;

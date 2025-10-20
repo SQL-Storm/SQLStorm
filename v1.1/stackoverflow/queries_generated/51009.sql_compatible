@@ -1,0 +1,129 @@
+WITH question_stats AS (
+    SELECT 
+        p.Id AS question_id,
+        p.CreationDate AS question_date,
+        p.Score AS question_score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        u.Reputation AS asker_reputation,
+        COUNT(DISTINCT v_up.UserId) AS unique_upvoters,
+        COUNT(DISTINCT v_down.UserId) AS unique_downvoters,
+        AVG(v_up.CreationDate) AS avg_upvote_date,
+        COUNT(DISTINCT a.Id) AS total_answers,
+        AVG(a.Score) AS avg_answer_score,
+        SUM(CASE WHEN a.Score > p.Score THEN 1 ELSE 0 END) AS better_answers
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Posts a ON p.Id = a.ParentId AND a.PostTypeId = 2 AND a.DeletionDate IS NULL
+    LEFT JOIN Votes v_up ON p.Id = v_up.PostId AND v_up.VoteTypeId = 2
+    LEFT JOIN Votes v_down ON p.Id = v_down.PostId AND v_down.VoteTypeId = 3
+    WHERE p.PostTypeId = 1 
+        AND p.DeletionDate IS NULL 
+        AND p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '1 year'
+    GROUP BY p.Id, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, 
+             p.FavoriteCount, u.Reputation
+    HAVING COUNT(DISTINCT a.Id) >= 1
+),
+answer_details AS (
+    SELECT 
+        p.ParentId AS question_id,
+        p.Id AS answer_id,
+        p.CreationDate AS answer_date,
+        p.Score AS answer_score,
+        p.CommentCount,
+        u.Reputation AS answerer_reputation,
+        SUM(CASE WHEN v_a.VoteTypeId = 2 THEN 1 ELSE 0 END) AS answer_upvotes,
+        COUNT(DISTINCT c.Id) AS answer_comments,
+        CASE WHEN p.Id = parent_accepted.Id THEN 1 ELSE 0 END AS is_accepted
+    FROM Posts p
+    LEFT JOIN Posts parent_accepted ON p.ParentId = parent_accepted.Id AND parent_accepted.AcceptedAnswerId = p.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v_a ON p.Id = v_a.PostId 
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.PostTypeId = 2 AND p.DeletionDate IS NULL
+    GROUP BY p.Id, p.ParentId, p.CreationDate, p.Score, p.CommentCount, u.Reputation, parent_accepted.Id
+),
+tag_analysis AS (
+    SELECT 
+        p.Id AS post_id,
+        (CASE 
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2 
+            THEN regexp_split_to_array(substring(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), '><')
+            ELSE ARRAY[]::text[]
+         END) AS tag_array,
+        CARDINALITY(
+            (CASE 
+                WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2 
+                THEN regexp_split_to_array(substring(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), '><')
+                ELSE ARRAY[]::text[]
+             END)
+        ) AS tag_count
+    FROM Posts p 
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+),
+aggregated_metrics AS (
+    SELECT 
+        qs.question_id,
+        qs.question_date,
+        qs.question_score,
+        qs.ViewCount AS view_count,
+        qs.AnswerCount AS answer_count,
+        qs.FavoriteCount AS favorite_count,
+        qs.asker_reputation,
+        qs.unique_upvoters,
+        qs.unique_downvoters,
+        qs.avg_answer_score,
+        qs.better_answers,
+        ad.answer_score AS top_answer_score,
+        ad.answerer_reputation AS top_answerer_rep,
+        ad.answer_comments,
+        ad.answer_date AS top_answer_date,
+        ta.tag_count,
+        ROW_NUMBER() OVER (
+            PARTITION BY EXTRACT(MONTH FROM qs.question_date) 
+            ORDER BY qs.ViewCount DESC, qs.AnswerCount DESC
+        ) AS monthly_rank,
+        LAG(qs.ViewCount) OVER (
+            PARTITION BY qs.question_id 
+            ORDER BY qs.question_date
+        ) AS prev_view_count
+    FROM question_stats qs
+    LEFT JOIN answer_details ad ON qs.question_id = ad.question_id 
+        AND ad.answer_score = (SELECT MAX(answer_score) FROM answer_details WHERE question_id = qs.question_id)
+    LEFT JOIN tag_analysis ta ON qs.question_id = ta.post_id
+)
+SELECT 
+    am.question_id,
+    am.question_date,
+    am.question_score,
+    am.view_count,
+    am.answer_count,
+    am.favorite_count,
+    am.asker_reputation,
+    am.top_answer_score,
+    am.top_answerer_rep,
+    am.tag_count,
+    am.monthly_rank,
+    (am.view_count - COALESCE(am.prev_view_count, 0)) AS view_increase,
+    CASE 
+        WHEN am.better_answers > 0 THEN 'Outscored by Answers'
+        WHEN am.unique_downvoters > am.unique_upvoters * 0.2 THEN 'Controversial'
+        WHEN am.view_count > 10000 THEN 'Viral'
+        ELSE 'Standard'
+    END AS question_category,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY am.view_count) OVER (
+        PARTITION BY EXTRACT(YEAR FROM am.question_date), EXTRACT(MONTH FROM am.question_date)
+    ) AS median_monthly_views,
+    CORR(CAST(am.asker_reputation AS double precision), CAST(am.view_count AS double precision)) OVER (
+        PARTITION BY EXTRACT(YEAR FROM am.question_date)
+    ) AS yearly_reputation_view_correlation
+FROM aggregated_metrics am
+WHERE am.monthly_rank <= 50  -- Top 50 questions per month
+    AND am.asker_reputation >= 100  -- Askers with reasonable reputation
+ORDER BY 
+    EXTRACT(YEAR FROM am.question_date) DESC,
+    EXTRACT(MONTH FROM am.question_date) DESC,
+    am.view_count DESC
+LIMIT 1000;

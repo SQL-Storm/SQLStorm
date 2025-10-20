@@ -1,0 +1,327 @@
+with top_active_tags as (
+    select t.TagName, t.Id as TagId, t.Count
+    from Tags t
+    where t.IsModeratorOnly = false or t.IsModeratorOnly is null
+    order by t.Count desc
+    limit 50
+),
+question_tags as (
+    select
+        p.Id as QuestionId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><') as tag_array
+    from Posts p
+    where p.PostTypeId = 1
+),
+qt_expanded as (
+    select
+        qt.QuestionId,
+        qt.OwnerUserId,
+        qt.CreationDate,
+        qt.Score,
+        qt.ViewCount,
+        qt.AnswerCount,
+        qt.FavoriteCount,
+        lower(trim(tag)) as tagname
+    from question_tags qt,
+    lateral unnest(qt.tag_array) as tag
+),
+qt_top as (
+    select qte.*
+    from qt_expanded qte
+    join top_active_tags tat on tat.TagName = qte.tagname
+),
+answers as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId as AnswerUserId,
+        a.CreationDate as AnswerCreation,
+        a.Score as AnswerScore
+    from Posts a
+    where a.PostTypeId = 2
+),
+accepted as (
+    select
+        q.Id as QuestionId,
+        q.AcceptedAnswerId
+    from Posts q
+    where q.PostTypeId = 1
+      and q.AcceptedAnswerId is not null
+),
+votes_agg as (
+    select
+        v.PostId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(case when v.VoteTypeId = 12 then 1 else 0 end) as SpamVotes,
+        sum(case when v.VoteTypeId = 10 then 1 else 0 end) as DeleteVotes
+    from Votes v
+    where v.CreationDate >= (select min(CreationDate) from Posts)
+    group by v.PostId
+),
+comment_agg as (
+    select
+        c.PostId,
+        count(*) as CommentCount,
+        sum(case when c.Score > 0 then 1 else 0 end) as PosComments,
+        max(c.CreationDate) as LastCommentAt
+    from Comments c
+    group by c.PostId
+),
+user_stats as (
+    select
+        u.Id as UserId,
+        u.Reputation,
+        u.CreationDate,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views as ProfileViews,
+        coalesce(b_badge.gold_cnt,0) as GoldBadges,
+        coalesce(b_badge.silver_cnt,0) as SilverBadges,
+        coalesce(b_badge.bronze_cnt,0) as BronzeBadges
+    from Users u
+    left join (
+        select
+            b.UserId,
+            sum(case when b.Class = 1 then 1 else 0 end) as gold_cnt,
+            sum(case when b.Class = 2 then 1 else 0 end) as silver_cnt,
+            sum(case when b.Class = 3 then 1 else 0 end) as bronze_cnt
+        from Badges b
+        group by b.UserId
+    ) b_badge on b_badge.UserId = u.Id
+),
+post_history_flags as (
+    select
+        ph.PostId,
+        max(case when ph.PostHistoryTypeId in (10,35) then 1 else 0 end) as WasClosedOrMigrated,
+        max(case when ph.PostHistoryTypeId in (11) then 1 else 0 end) as WasReopened,
+        max(case when ph.PostHistoryTypeId in (12) then 1 else 0 end) as WasDeleted,
+        max(case when ph.PostHistoryTypeId in (13) then 1 else 0 end) as WasUndeleted,
+        max(case when ph.PostHistoryTypeId in (19) then 1 else 0 end) as WasProtected,
+        max(case when ph.PostHistoryTypeId in (24) then 1 else 0 end) as HasSuggestedEdits,
+        count(*) as HistoryEvents,
+        max(ph.CreationDate) as LastHistoryAt
+    from PostHistory ph
+    group by ph.PostId
+),
+dup_links as (
+    select
+        pl.PostId as QuestionId,
+        count(case when pl.LinkTypeId = 3 then 1 end) as DuplicateLinks,
+        count(case when pl.LinkTypeId = 1 then 1 end) as LinkedRefs,
+        max(pl.CreationDate) as LastLinkAt
+    from PostLinks pl
+    group by pl.PostId
+),
+answer_stats as (
+    select
+        a.QuestionId,
+        count(*) as TotalAnswers,
+        sum(case when a.AnswerScore > 0 then 1 else 0 end) as PositiveAnswers,
+        max(a.AnswerScore) as MaxAnswerScore,
+        min(a.AnswerScore) as MinAnswerScore,
+        max(a.AnswerCreation) as LastAnswerAt
+    from answers a
+    group by a.QuestionId
+),
+owner_activity as (
+    select
+        q.QuestionId,
+        q.OwnerUserId,
+        count(distinct a.AnswerId) filter (where a.AnswerUserId = q.OwnerUserId) as SelfAnswers,
+        max(a.AnswerCreation) filter (where a.AnswerUserId = q.OwnerUserId) as LastSelfAnswerAt
+    from qt_top q
+    left join answers a on a.QuestionId = q.QuestionId
+    group by q.QuestionId, q.OwnerUserId
+),
+question_quality as (
+    select
+        q.QuestionId,
+        q.tagname,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        coalesce(va.UpVotes,0) as UpVotes,
+        coalesce(va.DownVotes,0) as DownVotes,
+        coalesce(va.SpamVotes,0) as SpamVotes,
+        coalesce(va.DeleteVotes,0) as DeleteVotes,
+        coalesce(ca.CommentCount,0) as CommentCount,
+        coalesce(ca.PosComments,0) as PosComments,
+        ca.LastCommentAt,
+        coalesce(phf.WasClosedOrMigrated,0) as WasClosedOrMigrated,
+        coalesce(phf.WasReopened,0) as WasReopened,
+        coalesce(phf.WasDeleted,0) as WasDeleted,
+        coalesce(phf.WasUndeleted,0) as WasUndeleted,
+        coalesce(phf.WasProtected,0) as WasProtected,
+        coalesce(phf.HasSuggestedEdits,0) as HasSuggestedEdits,
+        phf.HistoryEvents,
+        phf.LastHistoryAt,
+        coalesce(dl.DuplicateLinks,0) as DuplicateLinks,
+        coalesce(dl.LinkedRefs,0) as LinkedRefs,
+        dl.LastLinkAt,
+        coalesce(ans.TotalAnswers,0) as TotalAnswers,
+        coalesce(ans.PositiveAnswers,0) as PositiveAnswers,
+        ans.MaxAnswerScore,
+        ans.MinAnswerScore,
+        ans.LastAnswerAt,
+        coalesce(own.SelfAnswers,0) as SelfAnswers,
+        own.LastSelfAnswerAt,
+        case when q.Score >= 5 and coalesce(ans.TotalAnswers,0) >= 1 then 1 else 0 end as IsLikelyGood,
+        case when coalesce(phf.WasDeleted,0) = 1 or coalesce(va.SpamVotes,0) > 0 then 1 else 0 end as IsRisky
+    from qt_top q
+    left join votes_agg va on va.PostId = q.QuestionId
+    left join comment_agg ca on ca.PostId = q.QuestionId
+    left join post_history_flags phf on phf.PostId = q.QuestionId
+    left join dup_links dl on dl.QuestionId = q.QuestionId
+    left join answer_stats ans on ans.QuestionId = q.QuestionId
+    left join owner_activity own on own.QuestionId = q.QuestionId
+),
+accepted_join as (
+    select
+        qq.*,
+        case when a.AcceptedAnswerId is not null then 1 else 0 end as HasAccepted,
+        a.AcceptedAnswerId
+    from question_quality qq
+    left join accepted a on a.QuestionId = qq.QuestionId
+),
+questioner as (
+    select
+        q.QuestionId,
+        q.tagname,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.UpVotes,
+        q.DownVotes,
+        q.SpamVotes,
+        q.DeleteVotes,
+        q.CommentCount,
+        q.PosComments,
+        q.WasClosedOrMigrated,
+        q.WasReopened,
+        q.WasDeleted,
+        q.WasUndeleted,
+        q.WasProtected,
+        q.HasSuggestedEdits,
+        q.HistoryEvents,
+        q.DuplicateLinks,
+        q.LinkedRefs,
+        q.TotalAnswers,
+        q.PositiveAnswers,
+        q.MaxAnswerScore,
+        q.MinAnswerScore,
+        q.SelfAnswers,
+        q.IsLikelyGood,
+        q.IsRisky,
+        q.HasAccepted,
+        q.AcceptedAnswerId,
+        p.OwnerUserId
+    from accepted_join q
+    join Posts p on p.Id = q.QuestionId
+),
+final_rank as (
+    select
+        q.QuestionId,
+        q.tagname,
+        q.OwnerUserId,
+        u.UserId as UserId,
+        u.Reputation,
+        u.UpVotes as UserUpVotes,
+        u.DownVotes as UserDownVotes,
+        u.GoldBadges,
+        u.SilverBadges,
+        u.BronzeBadges,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.UpVotes,
+        q.DownVotes,
+        q.SpamVotes,
+        q.DeleteVotes,
+        q.CommentCount,
+        q.PosComments,
+        q.WasClosedOrMigrated,
+        q.WasReopened,
+        q.WasDeleted,
+        q.WasUndeleted,
+        q.WasProtected,
+        q.HasSuggestedEdits,
+        q.HistoryEvents,
+        q.DuplicateLinks,
+        q.LinkedRefs,
+        q.TotalAnswers,
+        q.PositiveAnswers,
+        q.MaxAnswerScore,
+        q.MinAnswerScore,
+        q.SelfAnswers,
+        q.HasAccepted,
+        q.AcceptedAnswerId,
+        (
+            0.40 * q.Score +
+            0.25 * coalesce(q.TotalAnswers,0) +
+            0.15 * coalesce(q.PositiveAnswers,0) +
+            0.10 * coalesce(q.CommentCount,0) +
+            0.20 * coalesce(q.UpVotes,0) -
+            0.30 * coalesce(q.DownVotes,0) -
+            0.50 * coalesce(q.SpamVotes,0) -
+            0.20 * coalesce(q.DeleteVotes,0) +
+            0.05 * coalesce(q.LinkedRefs,0) -
+            0.10 * coalesce(q.DuplicateLinks,0) +
+            0.10 * case when q.HasAccepted = 1 then 1 else 0 end +
+            0.08 * case when q.WasProtected = 1 then 1 else 0 end -
+            0.12 * case when q.WasClosedOrMigrated = 1 then 1 else 0 end +
+            0.06 * case when q.HasSuggestedEdits = 1 then 1 else 0 end +
+            0.03 * coalesce(u.GoldBadges,0) +
+            0.02 * coalesce(u.SilverBadges,0) +
+            0.01 * coalesce(u.BronzeBadges,0) +
+            0.0001 * coalesce(q.ViewCount,0)
+        ) as RankScore
+    from questioner q
+    left join user_stats u on u.UserId = q.OwnerUserId
+)
+select
+    fr.tagname as tag,
+    fr.QuestionId,
+    fr.OwnerUserId,
+    fr.UserId,
+    fr.Reputation,
+    fr.Score,
+    fr.ViewCount,
+    fr.AnswerCount,
+    fr.FavoriteCount,
+    fr.UpVotes,
+    fr.DownVotes,
+    fr.CommentCount,
+    fr.TotalAnswers,
+    fr.PositiveAnswers,
+    fr.MaxAnswerScore,
+    fr.MinAnswerScore,
+    fr.SelfAnswers,
+    fr.HasAccepted,
+    fr.WasClosedOrMigrated,
+    fr.WasDeleted,
+    fr.WasReopened,
+    fr.WasUndeleted,
+    fr.WasProtected,
+    fr.HasSuggestedEdits,
+    fr.DuplicateLinks,
+    fr.LinkedRefs,
+    fr.HistoryEvents,
+    fr.RankScore,
+    dense_rank() over (partition by fr.tagname order by fr.RankScore desc, fr.Score desc, fr.ViewCount desc) as RankWithinTag,
+    percentile_disc(0.9) within group (order by fr.RankScore) over (partition by fr.tagname) as P90RankScoreTag,
+    percentile_disc(0.9) within group (order by fr.RankScore) over () as P90RankScoreGlobal
+from final_rank fr
+where dense_rank() over (partition by fr.tagname order by fr.RankScore desc, fr.Score desc, fr.ViewCount desc) <= 20
+order by fr.RankScore desc, fr.Score desc, fr.ViewCount desc;

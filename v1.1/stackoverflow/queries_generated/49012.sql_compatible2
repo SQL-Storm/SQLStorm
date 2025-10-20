@@ -1,0 +1,133 @@
+WITH RecentUserActivity AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.UpVotes,
+        U.DownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT V.Id) AS TotalVotesCast,
+        MAX(U.LastAccessDate) AS LastSeen
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId AND P.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '18 months')
+    LEFT JOIN Comments C ON U.Id = C.UserId AND C.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '18 months')
+    LEFT JOIN Votes V ON U.Id = V.UserId AND V.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '18 months')
+    WHERE U.LastAccessDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '18 months')
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.UpVotes, U.DownVotes
+    HAVING COUNT(DISTINCT P.Id) > 0 OR COUNT(DISTINCT C.Id) > 0 OR COUNT(DISTINCT V.Id) > 0
+),
+UserPostStats AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        COUNT(CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionsCount,
+        COUNT(CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswersCount,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN P.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN P.Score ELSE 0 END) AS TotalAnswerScore,
+        AVG(CASE WHEN P.PostTypeId = 1 THEN P.Score END) AS AvgQuestionScore,
+        AVG(CASE WHEN P.PostTypeId = 2 THEN P.Score END) AS AvgAnswerScore,
+        MAX(CASE WHEN P.PostTypeId = 1 THEN P.Score END) AS MaxQuestionScore,
+        MAX(CASE WHEN P.PostTypeId = 2 THEN P.Score END) AS MaxAnswerScore,
+        SUM(P.ViewCount) AS TotalViewCount,
+        SUM(P.AnswerCount) AS TotalAnswersReceivedOnQuestions
+    FROM Posts P
+    WHERE P.OwnerUserId IS NOT NULL
+    GROUP BY P.OwnerUserId
+),
+UserBadgeSummary AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        COUNT(CASE WHEN B.Class = 1 THEN B.Id END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN B.Id END) AS SilverBadges,
+        COUNT(CASE WHEN B.Class = 3 THEN B.Id END) AS BronzeBadges
+    FROM Badges B
+    GROUP BY B.UserId
+),
+UserPostHistoryMetrics AS (
+    SELECT
+        PH.UserId,
+        COUNT(PH.Id) AS TotalHistoryEvents,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6, 24) THEN PH.Id END) AS EditEvents,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (10, 12, 14) THEN PH.Id END) AS ModerationEvents
+    FROM PostHistory PH
+    WHERE PH.UserId IS NOT NULL
+    GROUP BY PH.UserId
+),
+UserTopTags AS (
+    SELECT
+        UserId,
+        COALESCE(
+          JSON_AGG(TagName ORDER BY QuestionCount DESC, AvgScore DESC) FILTER (WHERE rn <= 5),
+          '[]'
+        ) AS Top5Tags
+    FROM (
+        SELECT
+            P.OwnerUserId AS UserId,
+            TRIM(SUBSTRING(split_tags.tag FROM 1)) AS TagName,
+            COUNT(*) AS QuestionCount,
+            AVG(P.Score) AS AvgScore,
+            ROW_NUMBER() OVER(PARTITION BY P.OwnerUserId ORDER BY COUNT(*) DESC, AVG(P.Score) DESC) AS rn
+        FROM Posts P
+        CROSS JOIN LATERAL (
+            -- split tags like '<tag1><tag2>' into rows by locating delimiters
+            SELECT regexp_split_to_table(SUBSTRING(P.Tags FROM 2 FOR CHAR_LENGTH(P.Tags) - 2), '><') AS tag
+        ) AS split_tags
+        WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND P.OwnerUserId IS NOT NULL
+        GROUP BY P.OwnerUserId, split_tags.tag
+    ) AS TagAgg
+    GROUP BY UserId
+)
+SELECT
+    RUA.UserId,
+    RUA.DisplayName,
+    RUA.Reputation,
+    RUA.UpVotes,
+    RUA.DownVotes,
+    RUA.LastSeen,
+    COALESCE(UPS.QuestionsCount, 0) AS TotalQuestions,
+    COALESCE(UPS.AnswersCount, 0) AS TotalAnswers,
+    COALESCE(UPS.AvgQuestionScore, 0.0) AS AvgQuestionScore,
+    COALESCE(UPS.AvgAnswerScore, 0.0) AS AvgAnswerScore,
+    COALESCE(UPS.MaxQuestionScore, 0) AS TopQuestionScore,
+    COALESCE(UPS.MaxAnswerScore, 0) AS TopAnswerScore,
+    COALESCE(UBS.TotalBadges, 0) AS TotalBadges,
+    COALESCE(UBS.GoldBadges, 0) AS GoldBadges,
+    COALESCE(UBS.SilverBadges, 0) AS SilverBadges,
+    COALESCE(UBS.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(UPHM.TotalHistoryEvents, 0) AS TotalPostHistoryEvents,
+    COALESCE(UPHM.EditEvents, 0) AS PostEditEvents,
+    COALESCE(UPHM.ModerationEvents, 0) AS PostModerationEvents,
+    COALESCE(UTT.Top5Tags, '[]') AS UsersTopTags,
+    (
+        (COALESCE(UPS.AvgQuestionScore, 0) * 0.3) +
+        (COALESCE(UPS.AvgAnswerScore, 0) * 0.25) +
+        (COALESCE(UBS.GoldBadges, 0) * 10) +
+        (COALESCE(UBS.SilverBadges, 0) * 5) +
+        (COALESCE(UBS.BronzeBadges, 0) * 1) +
+        (COALESCE(RUA.TotalPostsCreated, 0) * 0.5) +
+        (COALESCE(RUA.TotalCommentsMade, 0) * 0.1) +
+        (COALESCE(RUA.TotalVotesCast, 0) * 0.05) +
+        (COALESCE(UPHM.EditEvents, 0) * 0.2) -
+        (COALESCE(UPHM.ModerationEvents, 0) * 0.5)
+    ) AS EngagementScore,
+    ROW_NUMBER() OVER (ORDER BY (
+        (COALESCE(UPS.AvgQuestionScore, 0) * 0.3) +
+        (COALESCE(UPS.AvgAnswerScore, 0) * 0.25) +
+        (COALESCE(UBS.GoldBadges, 0) * 10) +
+        (COALESCE(UBS.SilverBadges, 0) * 5) +
+        (COALESCE(UBS.BronzeBadges, 0) * 1) +
+        (COALESCE(RUA.TotalPostsCreated, 0) * 0.5) +
+        (COALESCE(RUA.TotalCommentsMade, 0) * 0.1) +
+        (COALESCE(RUA.TotalVotesCast, 0) * 0.05) +
+        (COALESCE(UPHM.EditEvents, 0) * 0.2) -
+        (COALESCE(UPHM.ModerationEvents, 0) * 0.5)
+    ) DESC, RUA.Reputation DESC, RUA.UserId ASC) AS RankByEngagement
+FROM RecentUserActivity RUA
+LEFT JOIN UserPostStats UPS ON RUA.UserId = UPS.UserId
+LEFT JOIN UserBadgeSummary UBS ON RUA.UserId = UBS.UserId
+LEFT JOIN UserPostHistoryMetrics UPHM ON RUA.UserId = UPHM.UserId
+LEFT JOIN UserTopTags UTT ON RUA.UserId = UTT.UserId
+WHERE RUA.Reputation > 500
+ORDER BY RankByEngagement ASC, RUA.Reputation DESC
+LIMIT 500;

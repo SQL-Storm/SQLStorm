@@ -1,0 +1,84 @@
+-- {"query": "55.sql", "dataset": "stackoverflow", "version": "v1.4", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 657} 
+WITH top_tags AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS tag_count,
+    AVG(p.Score) AS avg_post_score,
+    MAX(p.ViewCount) AS max_views
+  FROM Tags tg
+  JOIN Posts p ON p.Id = tg.Id
+  JOIN Posts q ON q.Id = p.ParentId OR q.Id = p.Id
+  JOIN Tags t ON t.Id = tg.Id
+  WHERE tg.Count > 0
+  GROUP BY t.TagName
+),
+recent_activity AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    u.Id AS UserId,
+    u.DisplayName AS UserName,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.LastActivityDate DESC) AS rn_by_type
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.LastActivityDate IS NOT NULL
+),
+complex_agg AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.Tags,
+    p.Body,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    string_agg(vt.Name, ',') FILTER (WHERE vt.Name IS NOT NULL) AS vote_types,
+    CASE
+      WHEN p.OwnerUserId IS NULL THEN 'anonymous'
+      ELSE u.DisplayName
+    END AS author,
+    CASE
+      WHEN p.ClosedDate IS NULL THEN false
+      ELSE true
+    END AS is_closed
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+  GROUP BY p.Id, p.Title, p.Tags, p.Body, p.Score, p.ViewCount, p.CreationDate, p.LastActivityDate, u.DisplayName
+),
+windowed AS (
+  SELECT
+    c.*,
+    SUM(CASE WHEN is_closed THEN 1 ELSE 0 END) OVER (PARTITION BY is_closed) AS closed_bucket,
+    COUNT(*) OVER () AS total_posts
+  FROM complex_agg c
+)
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.Tags,
+  p.Body,
+  p.Score,
+  p.ViewCount,
+  p.CreationDate,
+  p.LastActivityDate,
+  p.author AS Owner,
+  p.vote_types,
+  p.is_closed,
+  wg.tag_count AS common_tag_count,
+  wg.avg_post_score AS average_associated_score,
+  wg.max_views AS maximum_views_in_tag_cluster,
+  ra.rn_by_type AS rank_in_type
+FROM complex_agg p
+LEFT JOIN top_tags wg ON 1=1
+LEFT JOIN recent_activity ra ON ra.Id = p.Id
+WHERE p.LastActivityDate > NOW() - INTERVAL '30 days'
+  AND (p.Score > 0 OR p.ViewCount > 100)
+ORDER BY p.LastActivityDate DESC, p.Score DESC
+LIMIT 100;

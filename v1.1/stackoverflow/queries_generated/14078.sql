@@ -1,4 +1,4 @@
--- {"query": "14078.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 184465, "output_tokens": 78904} 
+-- {"query": "14078.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "claude-3-haiku", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 184465, "output_tokens": 78904} 
 WITH cte_post_history AS (
   SELECT ph.Id, ph.PostId, ph.RevisionGUID, ph.CreationDate, ph.UserId, ph.UserDisplayName, ph.Comment, ph.Text, ph.ContentLicense,
          CASE ph.PostHistoryTypeId

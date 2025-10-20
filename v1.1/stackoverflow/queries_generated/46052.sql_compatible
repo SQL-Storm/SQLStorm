@@ -1,0 +1,132 @@
+WITH RECURSIVE user_influence AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) AS total_posts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS answers,
+        SUM(p.Score) AS total_score,
+        SUM(p.ViewCount) AS total_views
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '5 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) > 10
+),
+top_answerers AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(*) AS answer_count,
+        AVG(p.Score) AS avg_score,
+        COUNT(CASE WHEN p.Id = q.AcceptedAnswerId THEN 1 END) AS accepted_count,
+        -- convert tag string like '<tag1><tag2>' to array of tags; different DBs may not have ARRAY_AGG of arrays,
+        -- but keep as array of text for compatibility where supported
+        ARRAY_AGG(DISTINCT string_to_array(substring(q.Tags FROM 2 FOR length(q.Tags)-2), '><')) AS tag_arrays
+    FROM Posts p
+    INNER JOIN Posts q ON p.ParentId = q.Id
+    WHERE p.PostTypeId = 2 
+        AND p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '3 years'
+        AND p.Score > 0
+    GROUP BY p.OwnerUserId
+    HAVING COUNT(*) >= 20
+),
+tag_expertise AS (
+    SELECT 
+        p.OwnerUserId,
+        unnest(string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags)-2), '><')) AS tag,
+        COUNT(*) AS tag_usage,
+        AVG(p.Score) AS avg_tag_score,
+        SUM(p.ViewCount) AS tag_views
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+        AND p.Tags IS NOT NULL
+        AND p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '2 years'
+    GROUP BY p.OwnerUserId, tag
+    HAVING COUNT(*) >= 5
+),
+engagement_metrics AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(DISTINCT c.Id) AS comments_received,
+        COUNT(DISTINCT v.Id) AS votes_received,
+        COUNT(DISTINCT b.Id) AS badges_earned,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+        COUNT(DISTINCT pl.RelatedPostId) AS linked_posts
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN Badges b ON p.OwnerUserId = b.UserId 
+        AND b.Date >= p.CreationDate 
+        AND b.Date <= p.CreationDate + INTERVAL '30 days'
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    WHERE p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '3 years'
+    GROUP BY p.OwnerUserId
+),
+quality_score AS (
+    SELECT 
+        ui.Id,
+        ui.DisplayName,
+        ui.Reputation,
+        ui.total_posts,
+        ui.questions,
+        ui.answers,
+        ta.answer_count,
+        ta.accepted_count,
+        COALESCE(CAST(ta.accepted_count AS DOUBLE PRECISION) / NULLIF(ta.answer_count, 0), 0) AS acceptance_rate,
+        te.tag,
+        te.tag_usage,
+        te.avg_tag_score,
+        em.upvotes,
+        em.downvotes,
+        em.comments_received,
+        em.badges_earned,
+        (ui.total_score * 0.3 + 
+         COALESCE(ta.accepted_count * 15, 0) + 
+         COALESCE(em.upvotes * 2, 0) - 
+         COALESCE(em.downvotes * 5, 0) +
+         COALESCE(em.badges_earned * 10, 0)) AS calculated_quality_score,
+        ROW_NUMBER() OVER (PARTITION BY ui.Id ORDER BY te.tag_usage DESC) AS tag_rank
+    FROM user_influence ui
+    LEFT JOIN top_answerers ta ON ui.Id = ta.OwnerUserId
+    LEFT JOIN tag_expertise te ON ui.Id = te.OwnerUserId
+    LEFT JOIN engagement_metrics em ON ui.Id = em.OwnerUserId
+)
+SELECT 
+    qs.DisplayName,
+    qs.Reputation,
+    qs.total_posts,
+    qs.questions,
+    qs.answers,
+    qs.answer_count,
+    qs.accepted_count,
+    ROUND(CAST(qs.acceptance_rate AS NUMERIC), 2) AS acceptance_rate,
+    qs.tag,
+    qs.tag_usage,
+    ROUND(CAST(qs.avg_tag_score AS NUMERIC), 2) AS avg_tag_score,
+    qs.upvotes,
+    qs.downvotes,
+    qs.comments_received,
+    qs.badges_earned,
+    ROUND(CAST(qs.calculated_quality_score AS NUMERIC), 2) AS quality_score,
+    DENSE_RANK() OVER (ORDER BY qs.calculated_quality_score DESC) AS overall_rank,
+    -- Not all DBs support ordered-set aggregates with OVER(); emulate median per tag using percentile_disc with FILTER when supported.
+    -- Use percentile_cont as a window-less ordered-set aggregate per tag where supported; for broader compatibility, compute median via a subquery.
+    (
+        SELECT AVG(sub.calculated_quality_score) FROM (
+            SELECT calculated_quality_score
+            FROM quality_score q2
+            WHERE q2.tag = qs.tag
+            ORDER BY calculated_quality_score
+            LIMIT 2 - (SELECT COUNT(*) FROM quality_score q3 WHERE q3.tag = qs.tag) % 2
+            OFFSET (SELECT (COUNT(*) - 1) / 2 FROM quality_score q4 WHERE q4.tag = qs.tag)
+        ) AS sub
+    ) AS median_quality_by_tag,
+    (SELECT COUNT(*) FROM quality_score q5 WHERE q5.tag = qs.tag) AS experts_in_tag
+FROM quality_score qs
+WHERE qs.tag_rank <= 3
+    AND qs.calculated_quality_score > 100
+ORDER BY qs.calculated_quality_score DESC, qs.acceptance_rate DESC, qs.tag_usage DESC
+LIMIT 500;

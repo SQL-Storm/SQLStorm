@@ -1,0 +1,141 @@
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT p.Id) as QuestionCount,
+        1 as Level
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE p.PostTypeId = 1
+        AND t.Count > 1000
+    GROUP BY t.Id, t.TagName
+
+    UNION ALL
+
+    SELECT 
+        t.Id,
+        t.TagName,
+        th.QuestionCount,
+        th.Level + 1
+    FROM Tags t
+    INNER JOIN tag_hierarchy th ON th.Id != t.Id
+    INNER JOIN Posts p1 ON p1.Tags LIKE '%' || '<' || th.TagName || '>' || '%'
+    INNER JOIN Posts p2 ON p2.Tags LIKE '%' || '<' || t.TagName || '>' || '%' 
+        AND p1.Id = p2.Id
+    WHERE th.Level < 3
+        AND t.Count > 500
+),
+user_expertise AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        t.TagName,
+        COUNT(DISTINCT p.Id) as AnswerCount,
+        SUM(p.Score) as TotalScore,
+        AVG(p.Score) as AvgScore,
+        MAX(p.Score) as MaxScore,
+        COUNT(DISTINCT CASE WHEN p.AcceptedAnswerId = p.Id THEN p.Id END) as AcceptedAnswers,
+        COUNT(DISTINCT b.Id) as TagBadges,
+        DENSE_RANK() OVER (PARTITION BY t.TagName ORDER BY SUM(p.Score) DESC) as TagRank
+    FROM Users u
+    INNER JOIN Posts p ON p.OwnerUserId = u.Id
+    INNER JOIN Posts q ON q.Id = p.ParentId
+    INNER JOIN Tags t ON q.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    LEFT JOIN Badges b ON b.UserId = u.Id AND b.Name = t.TagName AND b.TagBased = TRUE
+    WHERE p.PostTypeId = 2
+        AND p.Score > 0
+        AND u.Reputation > 10000
+        AND q.PostTypeId = 1
+    GROUP BY u.Id, u.DisplayName, u.Reputation, t.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 10
+),
+temporal_patterns AS (
+    SELECT 
+        DATE_TRUNC('month', p.CreationDate) as PostMonth,
+        pt.Name as PostType,
+        COUNT(*) as PostCount,
+        AVG(p.Score) as AvgScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) as MedianScore,
+        PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY p.Score) as P95Score,
+        COUNT(DISTINCT p.OwnerUserId) as UniqueUsers,
+        SUM(p.ViewCount) as TotalViews,
+        AVG(LENGTH(p.Body)) as AvgBodyLength,
+        COUNT(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 END) as ClosedPosts,
+        COUNT(CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 END) as CommunityOwnedPosts
+    FROM Posts p
+    INNER JOIN PostTypes pt ON pt.Id = p.PostTypeId
+    WHERE p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '2 years'
+        AND p.PostTypeId IN (1, 2)
+    GROUP BY DATE_TRUNC('month', p.CreationDate), pt.Name
+),
+edit_chains AS (
+    SELECT 
+        ph1.PostId,
+        ph1.UserId as Editor1,
+        ph2.UserId as Editor2,
+        ph3.UserId as Editor3,
+        ph1.CreationDate as Edit1Time,
+        ph2.CreationDate as Edit2Time,
+        ph3.CreationDate as Edit3Time,
+        EXTRACT(EPOCH FROM (ph2.CreationDate - ph1.CreationDate))/3600 as HoursBetween1And2,
+        EXTRACT(EPOCH FROM (ph3.CreationDate - ph2.CreationDate))/3600 as HoursBetween2And3
+    FROM PostHistory ph1
+    INNER JOIN PostHistory ph2 ON ph2.PostId = ph1.PostId 
+        AND ph2.CreationDate > ph1.CreationDate
+        AND ph2.PostHistoryTypeId IN (4, 5, 6)
+    LEFT JOIN PostHistory ph3 ON ph3.PostId = ph2.PostId 
+        AND ph3.CreationDate > ph2.CreationDate
+        AND ph3.PostHistoryTypeId IN (4, 5, 6)
+    WHERE ph1.PostHistoryTypeId IN (4, 5, 6)
+        AND ph1.UserId IS NOT NULL
+        AND ph2.UserId IS NOT NULL
+        AND ph1.UserId != ph2.UserId
+)
+SELECT 
+    th.TagName as PrimaryTag,
+    th.Level as TagLevel,
+    th.QuestionCount,
+    ue.DisplayName as TopExpert,
+    ue.Reputation as ExpertReputation,
+    ue.TotalScore as ExpertTotalScore,
+    ue.AcceptedAnswers as ExpertAcceptedAnswers,
+    tp.PostMonth,
+    tp.PostType,
+    tp.PostCount as MonthlyPosts,
+    tp.AvgScore as MonthlyAvgScore,
+    tp.MedianScore as MonthlyMedianScore,
+    tp.P95Score as MonthlyP95Score,
+    tp.UniqueUsers as MonthlyActiveUsers,
+    tp.TotalViews as MonthlyViews,
+    tp.AvgBodyLength,
+    ROUND(CAST(tp.ClosedPosts AS numeric) / NULLIF(tp.PostCount, 0) * 100, 2) as ClosureRate,
+    COUNT(DISTINCT ec.PostId) as EditedPosts,
+    AVG(ec.HoursBetween1And2) as AvgHoursBetweenFirstEdits,
+    COUNT(DISTINCT CASE WHEN ec.Editor3 IS NOT NULL THEN ec.PostId END) as TripleEditedPosts,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) as Upvotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) as Downvotes,
+    COUNT(DISTINCT c.Id) as Comments,
+    AVG(c.Score) as AvgCommentScore
+FROM tag_hierarchy th
+LEFT JOIN user_expertise ue ON ue.TagName = th.TagName AND ue.TagRank = 1
+CROSS JOIN temporal_patterns tp
+LEFT JOIN Posts p ON p.Tags LIKE '%' || '<' || th.TagName || '>' || '%' 
+    AND DATE_TRUNC('month', p.CreationDate) = tp.PostMonth
+    AND ((p.PostTypeId = 1 AND tp.PostType = 'Question') OR (p.PostTypeId = 2 AND tp.PostType = 'Answer'))
+LEFT JOIN edit_chains ec ON ec.PostId = p.Id
+LEFT JOIN Votes v ON v.PostId = p.Id AND v.CreationDate >= tp.PostMonth AND v.CreationDate < tp.PostMonth + INTERVAL '1 month'
+LEFT JOIN Comments c ON c.PostId = p.Id AND c.CreationDate >= tp.PostMonth AND c.CreationDate < tp.PostMonth + INTERVAL '1 month'
+WHERE th.Level <= 2
+    AND tp.PostMonth >= CAST('2024-10-01' AS date) - INTERVAL '1 year'
+GROUP BY 
+    th.TagName, th.Level, th.QuestionCount,
+    ue.DisplayName, ue.Reputation, ue.TotalScore, ue.AcceptedAnswers,
+    tp.PostMonth, tp.PostType, tp.PostCount, tp.AvgScore, tp.MedianScore,
+    tp.P95Score, tp.UniqueUsers, tp.TotalViews, tp.AvgBodyLength,
+    tp.ClosedPosts
+ORDER BY 
+    th.QuestionCount DESC,
+    tp.PostMonth DESC,
+    tp.PostType
+LIMIT 10000;

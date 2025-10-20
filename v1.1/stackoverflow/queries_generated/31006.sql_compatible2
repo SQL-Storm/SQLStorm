@@ -1,0 +1,96 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        u.DisplayName AS OwnerDisplayName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        COUNT(v.Id) AS VoteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY p.CreationDate DESC) AS rn
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId 
+    WHERE 
+        p.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year' 
+    GROUP BY 
+        p.Id, p.Title, u.DisplayName, p.CreationDate, p.Score, p.ViewCount
+),
+TopPosts AS (
+    SELECT 
+        PostId, 
+        Title, 
+        OwnerDisplayName, 
+        CreationDate, 
+        Score, 
+        ViewCount, 
+        VoteCount
+    FROM 
+        RankedPosts
+    WHERE 
+        rn = 1
+    ORDER BY 
+        VoteCount DESC, 
+        Score DESC 
+    LIMIT 10
+),
+PostTags AS (
+    -- portable split: use a recursive CTE to split comma-separated tags without DB-specific functions
+    SELECT
+        Id AS PostId,
+        TRIM(tag) AS TagName
+    FROM (
+        SELECT
+            p.Id,
+            NULL::text AS tag,       -- placeholder column to match types in union; will be replaced below per-dialect
+            p.Tags AS remaining
+        FROM Posts p
+    ) init
+    -- recursive split
+    UNION ALL
+    SELECT
+        PostId,
+        TRIM(SUBSTR(remaining, 1, CASE WHEN INSTR(remaining, ',') = 0 THEN LENGTH(remaining) ELSE INSTR(remaining, ',') - 1 END)) AS tag,
+        CASE WHEN INSTR(remaining, ',') = 0 THEN '' ELSE LTRIM(SUBSTR(remaining, INSTR(remaining, ',') + 1)) END AS remaining
+    FROM (
+        SELECT
+            Id AS PostId,
+            Tags AS remaining
+        FROM Posts
+    ) src
+    WHERE COALESCE(Tags, '') <> ''
+),
+PostTagsFiltered AS (
+    -- filter out empty tags produced by the recursive approach
+    SELECT DISTINCT PostId, TagName
+    FROM PostTags
+    WHERE TagName IS NOT NULL AND TagName <> ''
+)
+SELECT 
+    tp.Title,
+    tp.OwnerDisplayName,
+    tp.CreationDate,
+    tp.Score,
+    tp.ViewCount,
+    CASE 
+        WHEN tp.Score >= 50 THEN 'High Score' 
+        WHEN tp.Score >= 10 THEN 'Medium Score' 
+        ELSE 'Low Score' 
+    END AS ScoreCategory,
+    STRING_AGG(DISTINCT pt.TagName, ', ') AS Tags
+FROM 
+    TopPosts tp
+LEFT JOIN 
+    Posts p ON tp.PostId = p.Id
+LEFT JOIN 
+    PostTagsFiltered pt ON pt.PostId = p.Id
+LEFT JOIN 
+    Tags t ON t.TagName = pt.TagName
+GROUP BY 
+    tp.Title, tp.OwnerDisplayName, tp.CreationDate, tp.Score, tp.ViewCount
+ORDER BY 
+    tp.Score DESC, 
+    tp.ViewCount DESC;

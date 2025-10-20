@@ -1,0 +1,75 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        u.DisplayName AS OwnerDisplayName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        COUNT(v.Id) AS VoteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY p.CreationDate DESC) AS rn
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId 
+    WHERE 
+        p.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year' 
+    GROUP BY 
+        p.Id, u.DisplayName, p.Title, p.CreationDate, p.Score, p.ViewCount
+),
+TopPosts AS (
+    SELECT 
+        PostId, 
+        Title, 
+        OwnerDisplayName, 
+        CreationDate, 
+        Score, 
+        ViewCount, 
+        VoteCount
+    FROM 
+        RankedPosts
+    WHERE 
+        rn = 1
+    ORDER BY 
+        VoteCount DESC, 
+        Score DESC 
+    LIMIT 10
+),
+PostTags AS (
+    -- split tags into rows in a dialect-neutral way using unnest of regexp_split_to_table for Postgres,
+    -- but to be compatible across dialects, use a standard-ish approach: regexp_split_to_table is Postgres;
+    -- fallback: use a set-returning expression for Postgres; for other DBs similar logic applies.
+    SELECT
+        p.Id AS PostId,
+        TRIM(tag) AS TagName
+    FROM
+        Posts p,
+        LATERAL regexp_split_to_table(p.Tags, ',') AS tag
+)
+SELECT 
+    tp.Title,
+    tp.OwnerDisplayName,
+    tp.CreationDate,
+    tp.Score,
+    tp.ViewCount,
+    CASE 
+        WHEN tp.Score >= 50 THEN 'High Score' 
+        WHEN tp.Score >= 10 THEN 'Medium Score' 
+        ELSE 'Low Score' 
+    END AS ScoreCategory,
+    STRING_AGG(DISTINCT pt.TagName, ', ') AS Tags
+FROM 
+    TopPosts tp
+LEFT JOIN 
+    Posts p ON tp.PostId = p.Id
+LEFT JOIN 
+    PostTags pt ON pt.PostId = p.Id
+LEFT JOIN 
+    Tags t ON t.TagName = pt.TagName
+GROUP BY 
+    tp.Title, tp.OwnerDisplayName, tp.CreationDate, tp.Score, tp.ViewCount
+ORDER BY 
+    tp.Score DESC, 
+    tp.ViewCount DESC;

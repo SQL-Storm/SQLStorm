@@ -1,0 +1,50 @@
+-- {"query": "31055.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4o-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 346} 
+
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        u.DisplayName AS OwnerName,
+        COUNT(c.Id) AS CommentCount,
+        COALESCE(SUM(v.VoteTypeId = 2) - SUM(v.VoteTypeId = 3), 0) AS Score,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY COUNT(c.Id) DESC, COALESCE(SUM(v.VoteTypeId = 2) - SUM(v.VoteTypeId = 3), 0) DESC) AS Rank
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN 
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    WHERE 
+        p.PostTypeId = 1 -- only questions
+    GROUP BY 
+        p.Id, p.Title, p.CreationDate, u.DisplayName
+),
+TopOwnerPosts AS (
+    SELECT 
+        rp.OwnerName,
+        rp.PostId,
+        rp.Title,
+        rp.CreationDate,
+        rp.CommentCount,
+        rp.Score,
+        rp.Rank
+    FROM 
+        RankedPosts rp
+    WHERE 
+        rp.Rank <= 3
+)
+SELECT 
+    TOP 5 
+    OwnerName,
+    COUNT(PostId) AS TotalQuestions,
+    AVG(CommentCount) AS AvgComments,
+    SUM(Score) AS TotalScore
+FROM 
+    TopOwnerPosts
+GROUP BY 
+    OwnerName
+ORDER BY 
+    TotalScore DESC;

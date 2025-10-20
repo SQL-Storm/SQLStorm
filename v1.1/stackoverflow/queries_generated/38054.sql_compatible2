@@ -1,0 +1,207 @@
+with recent_users as (
+  select u.id as user_id, u.displayname, u.reputation, u.creationdate
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+question_posts as (
+  select p.id, p.owneruserid, p.creationdate, p.score, p.viewcount, p.answercount, p.tags
+  from posts p
+  where p.posttypeid = 1
+),
+answer_posts as (
+  select p.id, p.parentid, p.owneruserid, p.creationdate, p.score
+  from posts p
+  where p.posttypeid = 2
+),
+accepted_answers as (
+  select q.id as question_id, q.acceptedanswerid as answer_id
+  from posts q
+  where q.posttypeid = 1 and q.acceptedanswerid is not null
+),
+comment_activity as (
+  select c.postid, count(*) as comment_count, coalesce(sum(case when c.score > 0 then 1 else 0 end),0) as positive_comments
+  from comments c
+  where c.creationdate >= (select max(creationdate) - interval '180 days' from comments)
+  group by c.postid
+),
+vote_agg as (
+  select v.postid,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+         sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites
+  from votes v
+  where v.creationdate >= (select max(creationdate) - interval '365 days' from votes)
+  group by v.postid
+),
+tag_expansion as (
+  select qp.id as question_id, unnest(string_to_array(substring(qp.tags, 2, length(qp.tags)-2), '><')) as tag
+  from question_posts qp
+  where qp.tags is not null and qp.tags like '<%>'
+),
+top_tags as (
+  select te.tag, count(*) as tag_count
+  from tag_expansion te
+  group by te.tag
+  having count(*) >= 50
+),
+tagged_questions as (
+  select te.question_id, te.tag
+  from tag_expansion te
+  join top_tags tt on tt.tag = te.tag
+),
+answer_latency as (
+  select q.id as question_id,
+         min(a.creationdate) - q.creationdate as first_answer_latency,
+         avg(a.score) as avg_answer_score,
+         count(a.id) filter (where a.creationdate <= q.creationdate + interval '7 days') as answers_in_week
+  from posts q
+  left join answer_posts a on a.parentid = q.id
+  where q.posttypeid = 1
+  group by q.id, q.creationdate
+),
+accepted_answer_latency as (
+  select aa.question_id,
+         ap.creationdate - q.creationdate as accepted_latency
+  from accepted_answers aa
+  join posts ap on ap.id = aa.answer_id
+  join posts q on q.id = aa.question_id
+),
+user_activity as (
+  select u.id as user_id,
+         count(distinct q.id) as questions_count,
+         count(distinct a.id) as answers_count,
+         coalesce(sum(q.score),0) + coalesce(sum(a.score),0) as total_post_score,
+         coalesce(sum(vq.upvotes),0) + coalesce(sum(va.upvotes),0) as upvotes_year,
+         coalesce(sum(vq.downvotes),0) + coalesce(sum(va.downvotes),0) as downvotes_year
+  from users u
+  left join posts q on q.posttypeid = 1 and q.owneruserid = u.id
+  left join posts a on a.posttypeid = 2 and a.owneruserid = u.id
+  left join vote_agg vq on vq.postid = q.id
+  left join vote_agg va on va.postid = a.id
+  group by u.id
+),
+question_quality as (
+  select q.id as question_id,
+         q.owneruserid,
+         q.creationdate,
+         q.score,
+         q.viewcount,
+         q.answercount,
+         coalesce(c.comment_count,0) as recent_comment_count,
+         coalesce(c.positive_comments,0) as recent_positive_comments,
+         coalesce(v.upvotes,0) as upvotes_year,
+         coalesce(v.downvotes,0) as downvotes_year,
+         coalesce(v.favorites,0) as favorites_year
+  from question_posts q
+  left join comment_activity c on c.postid = q.id
+  left join vote_agg v on v.postid = q.id
+),
+tag_metrics as (
+  select tq.tag,
+         count(*) as questions,
+         avg(qq.score) as avg_score,
+         avg(qq.viewcount) as avg_views,
+         percentile_cont(0.5) within group (order by qq.viewcount) as p50_views,
+         percentile_cont(0.9) within group (order by qq.viewcount) as p90_views,
+         avg(extract(epoch from al.first_answer_latency)) as avg_first_answer_latency,
+         avg(al.answers_in_week) as avg_answers_in_week,
+         avg(qq.upvotes_year - qq.downvotes_year) as net_votes_year
+  from tagged_questions tq
+  join question_quality qq on qq.question_id = tq.question_id
+  left join answer_latency al on al.question_id = tq.question_id
+  group by tq.tag
+),
+fastest_growing_users as (
+  select ru.user_id,
+         ru.displayname,
+         ru.reputation,
+         ua.questions_count,
+         ua.answers_count,
+         ua.total_post_score,
+         ua.upvotes_year,
+         ua.downvotes_year,
+         row_number() over (order by ua.upvotes_year - ua.downvotes_year desc, ua.total_post_score desc) as rn
+  from recent_users ru
+  join user_activity ua on ua.user_id = ru.user_id
+),
+hot_questions as (
+  select qq.question_id,
+         qq.owneruserid as user_id,
+         qq.score,
+         qq.viewcount,
+         qq.recent_comment_count,
+         qq.favorites_year,
+         coalesce(al.first_answer_latency, interval '9999 days') as first_answer_latency,
+         qq.creationdate
+  from question_quality qq
+  left join answer_latency al on al.question_id = qq.question_id
+  where qq.creationdate >= (select max(creationdate) - interval '90 days' from posts)
+    and (qq.viewcount >= (select percentile_cont(0.95) within group (order by viewcount) from question_posts)
+         or qq.favorites_year >= 10
+         or qq.recent_comment_count >= 10)
+),
+user_hot_question_stats as (
+  select hq.user_id,
+         count(*) as hot_q_count,
+         avg(hq.score) as avg_hot_q_score,
+         avg(hq.viewcount) as avg_hot_q_views,
+         percentile_cont(0.5) within group (order by extract(epoch from hq.first_answer_latency)) as p50_first_answer_latency
+  from hot_questions hq
+  group by hq.user_id
+),
+outlier_questions as (
+  select qq.question_id,
+         qq.owneruserid as user_id,
+         qq.viewcount,
+         qq.score,
+         qq.upvotes_year,
+         qq.downvotes_year,
+         (qq.viewcount - tm.p90_views) / nullif(tm.p90_views,0) as view_outlier_ratio
+  from tagged_questions tq
+  join tag_metrics tm on tm.tag = tq.tag
+  join question_quality qq on qq.question_id = tq.question_id
+  where qq.viewcount > tm.p90_views
+)
+select
+  u.id as user_id,
+  u.displayname,
+  u.reputation,
+  coalesce(fgu.rn, 999999) as rank_recent_growth,
+  coalesce(fgu.upvotes_year - fgu.downvotes_year, 0) as net_votes_year,
+  coalesce(uhqs.hot_q_count, 0) as hot_questions_90d,
+  round(coalesce(uhqs.avg_hot_q_score, 0), 2) as avg_hot_q_score,
+  round(coalesce(uhqs.avg_hot_q_views, 0), 2) as avg_hot_q_views,
+  uhqs.p50_first_answer_latency as p50_first_answer_latency_hot_qs,
+  coalesce(oa.outlier_qs, 0) as outlier_questions_count,
+  round(coalesce(oa.avg_outlier_ratio, 0), 4) as avg_outlier_view_ratio,
+  tm.tag,
+  tm.questions as tag_questions,
+  round(tm.avg_score, 2) as tag_avg_score,
+  round(tm.avg_views, 2) as tag_avg_views,
+  tm.p50_views as tag_p50_views,
+  tm.p90_views as tag_p90_views,
+  tm.avg_first_answer_latency,
+  round(tm.avg_answers_in_week, 2) as tag_avg_answers_in_week,
+  round(tm.net_votes_year, 2) as tag_net_votes_year
+from users u
+left join fastest_growing_users fgu on fgu.user_id = u.id and fgu.rn <= 1000
+left join user_hot_question_stats uhqs on uhqs.user_id = u.id
+left join (
+  select user_id, count(*) as outlier_qs, avg(view_outlier_ratio) as avg_outlier_ratio
+  from outlier_questions
+  group by user_id
+) oa on oa.user_id = u.id
+join (
+  select tm.*, r.user_id
+  from tag_metrics tm
+  join (
+    select tq.tag, a.owneruserid as user_id, count(*) as answers_in_tag
+    from tagged_questions tq
+    join answer_posts a on a.parentid = tq.question_id
+    group by tq.tag, a.owneruserid
+  ) r on r.tag = tm.tag
+  where tm.questions >= 50
+) tm on tm.user_id = u.id
+where u.reputation >= (select percentile_cont(0.75) within group (order by reputation) from users)
+order by rank_recent_growth, tag_net_votes_year desc, avg_outlier_view_ratio desc
+limit 500;

@@ -1,0 +1,39 @@
+-- {"query": "32058.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4o", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 441} 
+
+SELECT 
+    u.DisplayName AS UserName,
+    COUNT(DISTINCT p.Id) AS NumberOfPosts,
+    COUNT(DISTINCT c.Id) AS NumberOfComments,
+    COUNT(DISTINCT v.Id) AS NumberOfVotes,
+    SUM(v.BountyAmount) FILTER (WHERE v.VoteTypeId = 8 OR v.VoteTypeId = 9) AS TotalBounty,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS NumberOfQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS NumberOfAnswers,
+    AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+    AVG(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AvgAnswerScore,
+    array_agg(DISTINCT t.TagName ORDER BY t.Count DESC LIMIT 5) AS Top5Tags,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10, 11, 14, 15) THEN ph.Id ELSE NULL END) AS InteractionsOnPosts,
+    b.Name AS BadgeNames
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN 
+    Comments c ON c.UserId = u.Id
+LEFT JOIN 
+    Votes v ON v.UserId = u.Id
+LEFT JOIN 
+    PostHistory ph ON ph.PostId = p.Id
+LEFT JOIN 
+    Badges b ON b.UserId = u.Id
+LEFT JOIN 
+    Posts tp ON tp.Id = t.ExcerptPostId OR tp.Id = t.WikiPostId
+LEFT JOIN 
+    Tags t ON string_to_array(substring(tp.Tags, 2, length(tp.Tags)-2), '><') @> ARRAY[t.TagName]
+WHERE 
+    u.Reputation >= 1000
+GROUP BY 
+    u.Id, u.DisplayName, b.Name
+HAVING 
+    COUNT(DISTINCT p.Id) >= 10 
+ORDER BY 
+    NumberOfPosts DESC, TotalBounty DESC;

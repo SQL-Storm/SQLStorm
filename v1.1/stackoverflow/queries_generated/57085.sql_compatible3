@@ -1,0 +1,189 @@
+WITH ActiveUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        COUNT(p.Id) AS PostCount,
+        COUNT(DISTINCT a.Id) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        MAX(p.LastActivityDate) AS LastActivity
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    WHERE
+        u.LastAccessDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR)
+    GROUP BY
+        u.Id, u.Reputation
+    HAVING
+        COUNT(p.Id) > 0 OR COUNT(DISTINCT a.Id) > 0 OR COUNT(DISTINCT c.Id) > 0 OR COUNT(DISTINCT v.Id) > 0
+),
+TopTags AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        t.Count AS TagCount,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AvgScore
+    FROM
+        Tags t
+    JOIN
+        Posts p ON p.Tags LIKE ('%' || '<' || t.TagName || '>' || '%')
+    GROUP BY
+        t.Id, t.TagName, t.Count
+    ORDER BY
+        t.Count DESC
+    LIMIT 20
+),
+HighScorePosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CreationDate,
+        u.DisplayName AS OwnerDisplayName,
+        p.OwnerUserId
+    FROM
+        Posts p
+    JOIN
+        Users u ON p.OwnerUserId = u.Id
+    WHERE
+        p.PostTypeId = 1
+        AND p.Score > 100
+        AND p.ViewCount > 1000
+    ORDER BY
+        p.Score DESC
+    LIMIT 50
+),
+RecentActivity AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.LastActivityDate,
+        u.DisplayName AS LastEditorDisplayName,
+        p.LastEditDate,
+        p.LastEditorUserId
+    FROM
+        Posts p
+    JOIN
+        Users u ON p.LastEditorUserId = u.Id
+    WHERE
+        p.LastActivityDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' MONTH)
+    ORDER BY
+        p.LastActivityDate DESC
+    LIMIT 100
+),
+UserVotes AS (
+    SELECT
+        v.UserId,
+        COUNT(v.Id) AS TotalVotes,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM
+        Votes v
+    GROUP BY
+        v.UserId
+),
+TagStatistics AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id) AS QuestionCount,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AverageScore,
+        MAX(p.Score) AS MaxScore,
+        MIN(p.Score) AS MinScore
+    FROM
+        Tags t
+    JOIN
+        Posts p ON p.Tags LIKE ('%' || '<' || t.TagName || '>' || '%')
+    WHERE
+        p.PostTypeId = 1
+    GROUP BY
+        t.TagName
+    ORDER BY
+        COUNT(p.Id) DESC
+    LIMIT 30
+)
+
+SELECT
+    au.UserId,
+    au.Reputation,
+    au.PostCount,
+    au.AnswerCount,
+    au.CommentCount,
+    au.VoteCount,
+    au.LastActivity,
+    tt.TagId,
+    tt.TagName,
+    tt.TagCount,
+    tt.TotalScore AS TagTotalScore,
+    tt.AvgScore AS TagAvgScore,
+    hsp.PostId,
+    hsp.PostTypeId,
+    hsp.Title,
+    hsp.Score AS PostScore,
+    hsp.ViewCount,
+    hsp.AnswerCount,
+    hsp.CreationDate,
+    hsp.OwnerDisplayName,
+    ra.LastActivityDate,
+    ra.LastEditorDisplayName,
+    ra.LastEditDate
+FROM
+    ActiveUsers au
+LEFT JOIN
+    TopTags tt ON 1=1
+LEFT JOIN
+    HighScorePosts hsp ON au.UserId = hsp.OwnerUserId
+LEFT JOIN
+    RecentActivity ra ON au.UserId = ra.LastEditorUserId
+
+UNION
+
+SELECT
+    au.UserId,
+    au.Reputation,
+    au.PostCount,
+    au.AnswerCount,
+    au.CommentCount,
+    au.VoteCount,
+    au.LastActivity,
+    NULL AS TagId,
+    ts.TagName,
+    ts.QuestionCount AS TagCount,
+    ts.TotalScore AS TagTotalScore,
+    ts.AverageScore AS TagAvgScore,
+    hsp.PostId,
+    hsp.PostTypeId,
+    hsp.Title,
+    hsp.Score AS PostScore,
+    hsp.ViewCount,
+    hsp.AnswerCount,
+    hsp.CreationDate,
+    hsp.OwnerDisplayName,
+    ra.LastActivityDate,
+    ra.LastEditorDisplayName,
+    ra.LastEditDate
+FROM
+    ActiveUsers au
+JOIN
+    UserVotes uv ON au.UserId = uv.UserId
+JOIN
+    TagStatistics ts ON 1=1
+LEFT JOIN
+    HighScorePosts hsp ON au.UserId = hsp.OwnerUserId
+LEFT JOIN
+    RecentActivity ra ON au.UserId = ra.LastEditorUserId
+ORDER BY
+    au.Reputation
+LIMIT 100;

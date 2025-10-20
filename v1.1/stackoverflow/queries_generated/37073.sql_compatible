@@ -1,0 +1,139 @@
+WITH
+Questions AS (
+  SELECT p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.FavoriteCount,
+         COALESCE(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><'), ARRAY[]::text) AS TagArray,
+         p.OwnerUserId
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+),
+AnswersAgg AS (
+  SELECT q.Id AS QuestionId,
+         COUNT(a.Id) FILTER (WHERE a.Score >= 0) AS PosAnswerCount,
+         COUNT(a.Id) FILTER (WHERE a.Score < 0) AS NegAnswerCount,
+         AVG(a.Score) AS AvgAnswerScore,
+         MAX(a.Score) AS MaxAnswerScore,
+         SUM(CASE WHEN a.CreationDate <= q.CreationDate + INTERVAL '7 days' THEN 1 ELSE 0 END) AS AnswersFirstWeek
+  FROM Questions q
+  LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+  GROUP BY q.Id
+),
+TopCommenters AS (
+  SELECT c.PostId AS QuestionId,
+         c.UserId,
+         COUNT(*) AS CommentsMade,
+         SUM(COALESCE(c.Score,0)) AS CommentScoreSum,
+         ROW_NUMBER() OVER (PARTITION BY c.PostId ORDER BY COUNT(*) DESC, SUM(COALESCE(c.Score,0)) DESC NULLS LAST) AS rn
+  FROM Comments c
+  WHERE c.PostId IN (SELECT Id FROM Questions)
+    AND c.UserId IS NOT NULL
+  GROUP BY c.PostId, c.UserId
+),
+TopCommenterPerQuestion AS (
+  SELECT QuestionId, UserId AS TopCommenterUserId, CommentsMade, CommentScoreSum
+  FROM TopCommenters
+  WHERE rn = 1
+),
+QuestionTags AS (
+  SELECT q.Id AS QuestionId, unnest(q.TagArray) AS Tag
+  FROM Questions q
+),
+TagStats AS (
+  SELECT Tag,
+         COUNT(*) AS QuestionCount,
+         AVG(q.Score) AS AvgQuestionScore,
+         AVG(q.ViewCount) AS AvgViews,
+         SUM(q.FavoriteCount) AS TotalFavorites
+  FROM QuestionTags t
+  JOIN Questions q ON q.Id = t.QuestionId
+  GROUP BY Tag
+),
+TagPairs AS (
+  SELECT a.Tag AS TagA, b.Tag AS TagB, COUNT(*) AS CoOccur
+  FROM QuestionTags a
+  JOIN QuestionTags b ON a.QuestionId = b.QuestionId AND a.Tag < b.Tag
+  GROUP BY a.Tag, b.Tag
+),
+UserEngagement AS (
+  SELECT u.Id AS UserId, u.Reputation, u.CreationDate, u.Views, u.UpVotes, u.DownVotes,
+         COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsPosted,
+         COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersPosted,
+         COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesGiven
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  GROUP BY u.Id, u.Reputation, u.CreationDate, u.Views, u.UpVotes, u.DownVotes
+),
+DuplicateGraph AS (
+  SELECT pl.PostId AS DuplicateQuestionId, pl.RelatedPostId AS OriginalQuestionId
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  WHERE lt.Name ILIKE 'Duplicate%' OR pl.LinkTypeId = 3
+),
+OriginalAnswerers AS (
+  SELECT dg.DuplicateQuestionId, a.OwnerUserId AS AnswererId, COUNT(*) AS AnswerCountOnOriginal
+  FROM DuplicateGraph dg
+  JOIN Posts o ON o.Id = dg.OriginalQuestionId AND o.PostTypeId = 1
+  JOIN Posts a ON a.ParentId = o.Id AND a.PostTypeId = 2 AND a.OwnerUserId IS NOT NULL
+  GROUP BY dg.DuplicateQuestionId, a.OwnerUserId
+),
+DuplicateAnswerOverlap AS (
+  SELECT da.DuplicateQuestionId,
+         COUNT(*) AS DistinctSharedAnswerers,
+         SUM(da.AnswerCountOnOriginal) AS TotalAnswersBySharedUsers
+  FROM OriginalAnswerers da
+  GROUP BY da.DuplicateQuestionId
+),
+PolarizedQuestions AS (
+  SELECT q.Id, q.Title, q.Score, q.ViewCount, q.AnswerCount,
+         (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 2) AS UpVotes,
+         (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 3) AS DownVotes,
+         ABS(COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 2),0) -
+             COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 3),0)) AS VoteDisparity
+  FROM Questions q
+  WHERE q.Score BETWEEN -5 AND 10
+    AND q.ViewCount > 1000
+)
+SELECT
+  q.Id AS QuestionId,
+  q.Title,
+  q.CreationDate,
+  q.Score,
+  q.ViewCount,
+  q.AnswerCount,
+  q.FavoriteCount,
+  COALESCE(ta.AvgQuestionScore,0) AS TagAvgScore,
+  COALESCE(ta.QuestionCount,0) AS TagQuestionCount,
+  COALESCE(aa.PosAnswerCount,0) AS PosAnswerCount,
+  COALESCE(aa.NegAnswerCount,0) AS NegAnswerCount,
+  COALESCE(aa.AvgAnswerScore,0) AS AvgAnswerScore,
+  COALESCE(aa.AnswersFirstWeek,0) AS AnswersFirstWeek,
+  u.Reputation AS OwnerReputation,
+  u.QuestionsPosted AS OwnerQuestionsPosted,
+  tc.TopCommenterUserId,
+  tc.CommentsMade AS TopCommenterComments,
+  tc.CommentScoreSum AS TopCommenterCommentScore,
+  COALESCE(dao.DistinctSharedAnswerers,0) AS DistinctSharedAnswerersOnDuplicates,
+  COALESCE(pq.UpVotes,0) AS UpVotes,
+  COALESCE(pq.DownVotes,0) AS DownVotes,
+  COALESCE(pq.VoteDisparity,0) AS VoteDisparity,
+  array_to_string(q.TagArray, ',') AS Tags
+FROM Questions q
+LEFT JOIN AnswersAgg aa ON aa.QuestionId = q.Id
+LEFT JOIN QuestionTags qt ON qt.QuestionId = q.Id
+LEFT JOIN TagStats ta ON ta.Tag = qt.Tag
+LEFT JOIN Users u ON u.Id = q.OwnerUserId
+LEFT JOIN TopCommenterPerQuestion tc ON tc.QuestionId = q.Id
+LEFT JOIN DuplicateAnswerOverlap dao ON dao.DuplicateQuestionId = q.Id
+LEFT JOIN PolarizedQuestions pq ON pq.Id = q.Id
+WHERE q.Id IN (
+  SELECT Id FROM Questions
+  ORDER BY ViewCount DESC NULLS LAST
+  LIMIT 200
+)
+GROUP BY q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, q.FavoriteCount,
+         ta.AvgQuestionScore, ta.QuestionCount, aa.PosAnswerCount, aa.NegAnswerCount, aa.AvgAnswerScore, aa.AnswersFirstWeek,
+         u.Reputation, u.QuestionsPosted, tc.TopCommenterUserId, tc.CommentsMade, tc.CommentScoreSum,
+         dao.DistinctSharedAnswerers, pq.UpVotes, pq.DownVotes, pq.VoteDisparity, q.TagArray
+ORDER BY (COALESCE(pq.VoteDisparity,0) * 2 + COALESCE(q.ViewCount,0)/1000 + COALESCE(aa.AnswersFirstWeek,0)) DESC
+LIMIT 100;

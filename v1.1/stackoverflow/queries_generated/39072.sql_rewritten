@@ -1,0 +1,123 @@
+-- {"query": "39072.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "codex-mini-latest", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1972, "output_tokens": 5102} 
+WITH TopTags AS (
+    SELECT t.tag, COUNT(*) AS QuestionCount
+    FROM Posts p
+    CROSS JOIN LATERAL unnest(
+        string_to_array(
+            substring(p.Tags, 2, length(p.Tags) - 2),
+            '><'
+        )
+    ) AS t(tag)
+    WHERE p.PostTypeId = 1
+    GROUP BY t.tag
+    ORDER BY QuestionCount DESC
+    LIMIT 10
+),
+RecentOnTop AS (
+    SELECT
+        p.Id,
+        p.CreationDate,
+        p.Score,
+        p.AnswerCount,
+        p.AcceptedAnswerId,
+        p.OwnerUserId,
+        t.tag
+    FROM Posts p
+    CROSS JOIN LATERAL unnest(
+        string_to_array(
+            substring(p.Tags, 2, length(p.Tags) - 2),
+            '><'
+        )
+    ) AS t(tag)
+    JOIN TopTags tt
+      ON tt.tag = t.tag
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+),
+UserEngagement AS (
+    SELECT
+        u.Id          AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        SUM(
+            CASE
+                WHEN v.VoteTypeId = 2 THEN  1
+                WHEN v.VoteTypeId = 3 THEN -1
+                ELSE 0
+            END
+        )                                  AS NetVotes
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Votes  v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+QuestionStats AS (
+    SELECT
+        tag,
+        AVG(Score)                                             AS AvgScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY AnswerCount) AS MedianAnswers,
+        COUNT(*)                                               AS TotalQuestions,
+        COUNT(*) FILTER (WHERE AcceptedAnswerId IS NOT NULL)   AS QuestionsWithAccepted
+    FROM RecentOnTop
+    GROUP BY tag
+)
+SELECT
+    qs.tag,
+    qs.TotalQuestions,
+    ROUND(qs.AvgScore::numeric, 2)    AS AvgScore,
+    qs.MedianAnswers,
+    qs.QuestionsWithAccepted,
+    COALESCE(tu.TopAnswerers, 'N/A')  AS TopAnswerers,
+    ue.GoldBadges,
+    ue.SilverBadges,
+    ue.BronzeBadges,
+    ue.NetVotes,
+    COALESCE(plinks.LinkedCount, 0)   AS LinkedCount,
+    COALESCE(edits.EditCount,  0)     AS EditionsLast30Days
+FROM QuestionStats qs
+LEFT JOIN (
+    SELECT
+        ro.tag,
+        STRING_AGG(u.DisplayName, ', ' ORDER BY COUNT(a.Id) DESC) AS TopAnswerers
+    FROM Posts a
+    JOIN RecentOnTop ro
+      ON a.ParentId = ro.Id
+     AND a.PostTypeId = 2
+    JOIN Users u
+      ON u.Id = a.OwnerUserId
+    GROUP BY ro.tag
+) tu
+  ON tu.tag = qs.tag
+LEFT JOIN (
+    SELECT
+        ro.tag,
+        COUNT(pl.Id) AS LinkedCount
+    FROM PostLinks pl
+    JOIN RecentOnTop ro
+      ON pl.PostId = ro.Id
+     AND pl.LinkTypeId = 1
+    GROUP BY ro.tag
+) plinks
+  ON plinks.tag = qs.tag
+LEFT JOIN (
+    SELECT
+        ro.tag,
+        COUNT(ph.Id) AS EditCount
+    FROM PostHistory ph
+    JOIN RecentOnTop ro
+      ON ph.PostId = ro.Id
+    WHERE ph.PostHistoryTypeId IN (4,5,6)
+      AND ph.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+    GROUP BY ro.tag
+) edits
+  ON edits.tag = qs.tag
+LEFT JOIN UserEngagement ue
+  ON ue.UserId = (
+       SELECT OwnerUserId
+         FROM RecentOnTop x
+        WHERE x.tag = qs.tag
+        LIMIT 1
+     )
+ORDER BY qs.TotalQuestions DESC, qs.AvgScore DESC;

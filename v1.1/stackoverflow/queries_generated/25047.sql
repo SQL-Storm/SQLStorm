@@ -1,4 +1,4 @@
--- {"query": "25047.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 3028} 
+-- {"query": "25047.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 3028} 
 
 /*  Elaborate benchmark query – uses CTEs, window functions, outer joins,
     correlated subqueries, set operators, string ops and NULL logic   */

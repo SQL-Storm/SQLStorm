@@ -1,0 +1,180 @@
+-- {"query": "49067.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2074, "output_tokens": 2798} 
+
+WITH UserPostAggregates AS (
+    -- Aggregate statistics for posts (questions and answers) owned by users
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(p.Score) AS TotalPostScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE NULL END) AS AvgQuestionViewCount,
+        SUM(CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswer,
+        SUM(CASE WHEN p.PostTypeId = 2 AND p.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedAnswersCount,
+        MAX(p.LastActivityDate) AS LastPostActivityDate,
+        SUM(COALESCE(p.FavoriteCount, 0)) AS TotalFavoriteCount,
+        -- Calculate a preliminary post impact score based on raw metrics
+        CAST(SUM(p.Score) AS DECIMAL) * 0.5 +
+        CAST(SUM(COALESCE(p.ViewCount, 0)) AS DECIMAL) * 0.01 +
+        CAST(SUM(CASE WHEN p.PostTypeId = 2 AND p.Id = q.AcceptedAnswerId THEN 10 ELSE 0 END) AS DECIMAL) +
+        CAST(SUM(COALESCE(p.FavoriteCount, 0)) AS DECIMAL) * 0.2 AS PostImpactScore
+    FROM Posts p
+    LEFT JOIN Posts q ON p.ParentId = q.Id AND p.PostTypeId = 2 -- Link answers to their parent questions
+    WHERE p.OwnerUserId IS NOT NULL
+      AND p.PostTypeId IN (1, 2) -- Only questions and answers
+    GROUP BY p.OwnerUserId
+),
+UserCommentAggregates AS (
+    -- Aggregate statistics for comments owned by users
+    SELECT
+        c.UserId,
+        COUNT(c.Id) AS TotalComments,
+        SUM(c.Score) AS TotalCommentScore,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+),
+UserBadgeAggregates AS (
+    -- Aggregate statistics for badges earned by users
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate,
+        -- Calculate a preliminary badge score
+        CAST(SUM(CASE WHEN b.Class = 1 THEN 50 ELSE CASE WHEN b.Class = 2 THEN 10 ELSE 1 END) AS DECIMAL) AS BadgeScore
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserTagInfluence AS (
+    -- Identify user's contribution to specific 'hot' tags, e.g., 'sql', 'performance', 'database'
+    SELECT
+        u.Id AS UserId,
+        SUM(
+            CASE WHEN t.TagName IN ('sql', 'performance', 'database', 'optimization', 'query-performance', 'postgresql', 'mssql', 'mysql') THEN
+                p.Score + COALESCE(p.ViewCount * 0.05, 0) + (COALESCE(p.FavoriteCount, 0) * 0.5)
+            ELSE 0 END
+        ) AS HotTagContributionScore,
+        COUNT(DISTINCT tt.TagName) AS UniqueHotTagsContributedTo,
+        MAX(p.LastActivityDate) AS LastHotTagActivity
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    CROSS JOIN LATERAL UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tt(TagName)
+    JOIN Tags t ON tt.TagName = t.TagName
+    WHERE p.Tags IS NOT NULL AND p.Tags != '' AND p.PostTypeId = 1 -- Only questions for tag influence
+    GROUP BY u.Id
+),
+UserPostHistoryAggregates AS (
+    -- Track user's editing activity and moderation involvement
+    SELECT
+        ph.UserId,
+        COUNT(ph.Id) AS TotalHistoryEntries,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount, -- Title, Body, Tags edits
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 12, 14, 19) THEN 1 ELSE 0 END) AS ModerationActionCount, -- Closed, Deleted, Locked, Protected
+        MAX(ph.CreationDate) AS LastHistoryDate
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+    GROUP BY ph.UserId
+),
+UserOverallScore AS (
+    -- Combine all aggregated statistics and user profile data to calculate a comprehensive score
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COALESCE(upa.TotalPosts, 0) AS TotalPosts,
+        COALESCE(upa.TotalQuestions, 0) AS TotalQuestions,
+        COALESCE(upa.TotalAnswers, 0) AS TotalAnswers,
+        COALESCE(upa.TotalPostScore, 0) AS TotalPostScore,
+        COALESCE(upa.AvgQuestionViewCount, 0) AS AvgQuestionViewCount,
+        COALESCE(upa.QuestionsWithAcceptedAnswer, 0) AS QuestionsWithAcceptedAnswer,
+        COALESCE(upa.AcceptedAnswersCount, 0) AS AcceptedAnswersCount,
+        COALESCE(upa.LastPostActivityDate, u.CreationDate) AS LastPostActivityDate,
+        COALESCE(upa.TotalFavoriteCount, 0) AS TotalFavoriteCount,
+        COALESCE(uca.TotalComments, 0) AS TotalComments,
+        COALESCE(uca.TotalCommentScore, 0) AS TotalCommentScore,
+        COALESCE(uca.LastCommentDate, u.CreationDate) AS LastCommentDate,
+        COALESCE(uba.TotalBadges, 0) AS TotalBadges,
+        COALESCE(uba.GoldBadges, 0) AS GoldBadges,
+        COALESCE(uba.SilverBadges, 0) AS SilverBadges,
+        COALESCE(uba.BronzeBadges, 0) AS BronzeBadges,
+        COALESCE(uba.LastBadgeDate, u.CreationDate) AS LastBadgeDate,
+        COALESCE(uti.HotTagContributionScore, 0) AS HotTagContributionScore,
+        COALESCE(uti.UniqueHotTagsContributedTo, 0) AS UniqueHotTagsContributedTo,
+        COALESCE(uti.LastHotTagActivity, u.CreationDate) AS LastHotTagActivity,
+        COALESCE(upha.EditCount, 0) AS TotalEdits,
+        COALESCE(upha.ModerationActionCount, 0) AS TotalModerationActions,
+        COALESCE(upha.LastHistoryDate, u.CreationDate) AS LastHistoryDate,
+
+        -- Calculate recency scores (lower values mean more recent, 0 means very recent)
+        EXTRACT(EPOCH FROM (NOW() - u.LastAccessDate)) / (3600.0 * 24.0 * 365.25) AS UserRecencyYears,
+        EXTRACT(EPOCH FROM (NOW() - COALESCE(upa.LastPostActivityDate, u.CreationDate))) / (3600.0 * 24.0 * 365.25) AS PostRecencyYears,
+        EXTRACT(EPOCH FROM (NOW() - COALESCE(uca.LastCommentDate, u.CreationDate))) / (3600.0 * 24.0 * 365.25) AS CommentRecencyYears,
+        EXTRACT(EPOCH FROM (NOW() - COALESCE(uba.LastBadgeDate, u.CreationDate))) / (3600.0 * 24.0 * 365.25) AS BadgeRecencyYears,
+        EXTRACT(EPOCH FROM (NOW() - COALESCE(upha.LastHistoryDate, u.CreationDate))) / (3600.0 * 24.0 * 365.25) AS HistoryRecencyYears,
+
+        -- Weighted sum of component scores for overall impact
+        (u.Reputation * 0.005) +
+        (u.UpVotes * 0.01) +
+        (u.Views * 0.0001) +
+        (COALESCE(upa.PostImpactScore, 0) * 0.8) +
+        (COALESCE(uca.TotalCommentScore, 0) * 0.1) +
+        (COALESCE(uba.BadgeScore, 0) * 0.5) +
+        (COALESCE(uti.HotTagContributionScore, 0) * 0.7) +
+        (COALESCE(upha.EditCount, 0) * 0.05) +
+        (COALESCE(upha.ModerationActionCount, 0) * 0.2)
+        AS RawOverallImpactScore
+    FROM Users u
+    LEFT JOIN UserPostAggregates upa ON u.Id = upa.UserId
+    LEFT JOIN UserCommentAggregates uca ON u.Id = uca.UserId
+    LEFT JOIN UserBadgeAggregates uba ON u.Id = uba.UserId
+    LEFT JOIN UserTagInfluence uti ON u.Id = uti.UserId
+    LEFT JOIN UserPostHistoryAggregates upha ON u.Id = upha.UserId
+    WHERE u.Reputation >= 500 -- Filter out lower reputation users for more meaningful results
+      AND u.LastAccessDate >= NOW() - INTERVAL '3 year' -- Only consider users active in the last 3 years
+)
+SELECT
+    UserId,
+    DisplayName,
+    Reputation,
+    TotalPosts,
+    TotalQuestions,
+    TotalAnswers,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    UniqueHotTagsContributedTo,
+    TotalEdits,
+    TotalModerationActions,
+    -- Apply a decay factor for recency to the RawOverallImpactScore
+    -- The decay factor reduces the score for older activity. The divisor (e.g., 5 or 10) can be tuned.
+    RawOverallImpactScore * (
+        1 - LEAST(1.0, GREATEST(0.0,
+            (UserRecencyYears * 0.2 +
+             PostRecencyYears * 0.3 +
+             CommentRecencyYears * 0.1 +
+             BadgeRecencyYears * 0.1 +
+             HistoryRecencyYears * 0.2) / 10.0 -- Average recency over 10 years to reach full decay
+        ))
+    ) AS FinalImpactScore,
+    RANK() OVER (ORDER BY RawOverallImpactScore * (
+        1 - LEAST(1.0, GREATEST(0.0,
+            (UserRecencyYears * 0.2 +
+             PostRecencyYears * 0.3 +
+             CommentRecencyYears * 0.1 +
+             BadgeRecencyYears * 0.1 +
+             HistoryRecencyYears * 0.2) / 10.0
+        ))
+    ) DESC) AS ImpactRank
+FROM UserOverallScore
+WHERE RawOverallImpactScore > 100 -- Ensure a minimum level of calculated raw impact
+ORDER BY FinalImpactScore DESC
+LIMIT 100;

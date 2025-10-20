@@ -1,0 +1,33 @@
+SELECT 
+    U.DisplayName AS UserName,
+    P.Title AS PostTitle,
+    PT.Name AS PostTypeName,
+    COUNT(V.Id) AS TotalVotes,
+    AVG(EXTRACT(EPOCH FROM (V.CreationDate - P.CreationDate)) ) AS AvgVoteTime,
+    SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    MAX(P.CreationDate) AS LatestPostDate,
+    MAX(P.LastEditDate) AS LatestEditDate,
+    COUNT(DISTINCT C.Id) AS TotalComments,
+    AVG(P.Score::numeric) AS AvgScore,
+    SUM(P.ViewCount) AS TotalViews,
+    SUM(P.FavoriteCount) AS TotalFavorites,
+    SUM(P.AnswerCount) AS TotalAnswers
+FROM 
+    Users U
+JOIN 
+    Posts P ON U.Id = P.OwnerUserId
+JOIN 
+    PostTypes PT ON P.PostTypeId = PT.Id
+JOIN 
+    Votes V ON P.Id = V.PostId
+LEFT JOIN 
+    Comments C ON P.Id = C.PostId
+WHERE 
+    P.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+GROUP BY 
+    U.DisplayName, P.Title, PT.Name, P.CreationDate, P.LastEditDate, P.Score
+HAVING 
+    SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) > 10
+ORDER BY 
+    TotalVotes DESC, TotalViews DESC, TotalAnswers DESC, TotalFavorites DESC;

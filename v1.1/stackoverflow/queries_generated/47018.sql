@@ -1,0 +1,121 @@
+-- {"query": "47018.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "claude-4.1-opus", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 41292, "output_tokens": 36508} 
+
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COUNT(DISTINCT pt.Id) as direct_questions,
+        t.Count as total_usage
+    FROM Tags t
+    INNER JOIN Posts pt ON pt.Tags LIKE '%<' || t.TagName || '>%'
+    WHERE pt.PostTypeId = 1
+    GROUP BY t.Id, t.TagName, t.Count
+),
+user_expertise AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        t.TagName,
+        COUNT(DISTINCT p.Id) as answers_in_tag,
+        SUM(p.Score) as total_score_in_tag,
+        AVG(p.Score) as avg_score_in_tag,
+        COUNT(DISTINCT CASE WHEN p.Id = q.AcceptedAnswerId THEN p.Id END) as accepted_answers,
+        ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY SUM(p.Score) DESC) as tag_rank
+    FROM Users u
+    INNER JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 2
+    INNER JOIN Posts q ON q.Id = p.ParentId AND q.PostTypeId = 1
+    INNER JOIN Tags t ON q.Tags LIKE '%<' || t.TagName || '>%'
+    WHERE u.Reputation > 1000
+        AND p.Score > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, t.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 5
+),
+question_lifecycle AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.CreationDate as question_created,
+        p.Score as question_score,
+        p.ViewCount,
+        MIN(a.CreationDate) as first_answer_time,
+        MAX(a.CreationDate) as last_answer_time,
+        COUNT(DISTINCT a.Id) as total_answers,
+        COUNT(DISTINCT CASE WHEN a.Score > 0 THEN a.Id END) as positive_answers,
+        AVG(a.Score) as avg_answer_score,
+        EXTRACT(EPOCH FROM (MIN(a.CreationDate) - p.CreationDate))/60 as minutes_to_first_answer,
+        COUNT(DISTINCT c.UserId) as unique_commenters,
+        COUNT(DISTINCT ph.UserId) as unique_editors
+    FROM Posts p
+    LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6)
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate >= CURRENT_DATE - INTERVAL '2 years'
+        AND p.Score >= 5
+    GROUP BY p.Id, p.CreationDate, p.Score, p.ViewCount
+),
+badge_patterns AS (
+    SELECT 
+        b.Name as badge_name,
+        b.Class as badge_class,
+        COUNT(DISTINCT b.UserId) as total_recipients,
+        AVG(u.Reputation) as avg_recipient_reputation,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY u.Reputation) as median_recipient_reputation,
+        COUNT(DISTINCT CASE WHEN u.CreationDate > CURRENT_DATE - INTERVAL '1 year' THEN u.Id END) as new_user_recipients,
+        STRING_AGG(DISTINCT u.DisplayName, ', ' ORDER BY u.Reputation DESC) FILTER (WHERE rn <= 3) as top_earners
+    FROM (
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY Name ORDER BY Date DESC) as rn
+        FROM Badges
+    ) b
+    INNER JOIN Users u ON u.Id = b.UserId
+    WHERE b.TagBased = false
+    GROUP BY b.Name, b.Class
+    HAVING COUNT(DISTINCT b.UserId) >= 10
+)
+SELECT 
+    ue.DisplayName as expert_name,
+    ue.Reputation as expert_reputation,
+    ue.TagName as expertise_tag,
+    ue.answers_in_tag,
+    ue.total_score_in_tag,
+    ue.accepted_answers,
+    ue.tag_rank,
+    th.total_usage as tag_popularity,
+    ROUND(ql.avg_answer_score::numeric, 2) as avg_answer_score_in_related_questions,
+    ROUND(AVG(ql.minutes_to_first_answer)::numeric, 2) as avg_minutes_to_first_answer,
+    ROUND(AVG(ql.ViewCount)::numeric, 0) as avg_question_views,
+    COUNT(DISTINCT ql.QuestionId) as related_questions_analyzed,
+    STRING_AGG(DISTINCT bp.badge_name, ', ' ORDER BY bp.badge_class, bp.badge_name) 
+        FILTER (WHERE bp.avg_recipient_reputation > 5000) as elite_badges,
+    COUNT(DISTINCT pl.RelatedPostId) as linked_post_count,
+    COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) as upvotes_on_answers,
+    COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) as total_edits,
+    COALESCE(MAX(ph.CreationDate), ue.DisplayName::timestamp) as last_edit_date
+FROM user_expertise ue
+INNER JOIN tag_hierarchy th ON th.TagName = ue.TagName
+LEFT JOIN question_lifecycle ql ON EXISTS (
+    SELECT 1 FROM Posts p 
+    WHERE p.Id = ql.QuestionId 
+    AND p.Tags LIKE '%<' || ue.TagName || '>%'
+)
+LEFT JOIN badge_patterns bp ON EXISTS (
+    SELECT 1 FROM Badges b 
+    WHERE b.UserId = ue.UserId 
+    AND b.Name = bp.badge_name
+)
+LEFT JOIN Posts ans ON ans.OwnerUserId = ue.UserId AND ans.PostTypeId = 2
+LEFT JOIN PostLinks pl ON pl.PostId = ans.Id OR pl.RelatedPostId = ans.Id
+LEFT JOIN Votes v ON v.PostId = ans.Id AND v.VoteTypeId = 2
+LEFT JOIN PostHistory ph ON ph.PostId = ans.Id AND ph.UserId = ue.UserId
+WHERE ue.tag_rank <= 10
+    AND th.total_usage > 1000
+GROUP BY 
+    ue.DisplayName, ue.Reputation, ue.TagName, ue.answers_in_tag,
+    ue.total_score_in_tag, ue.accepted_answers, ue.tag_rank,
+    th.total_usage, ql.avg_answer_score
+HAVING COUNT(DISTINCT ql.QuestionId) > 0
+ORDER BY 
+    ue.total_score_in_tag DESC,
+    ue.tag_rank,
+    ue.Reputation DESC
+LIMIT 100;

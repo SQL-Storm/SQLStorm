@@ -1,0 +1,42 @@
+WITH cte AS (
+  SELECT p.Id, p.PostTypeId, p.CreationDate, p.OwnerUserId, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.ClosedDate, p.CommunityOwnedDate, p.ContentLicense,
+         u.Reputation, u.CreationDate AS UserCreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes, u.ProfileImageUrl, u.EmailHash, u.AccountId,
+         b.Id AS BadgeId, b.Name AS BadgeName, b.Date AS BadgeDate, b.Class AS BadgeClass, b.TagBased AS BadgeTagBased,
+         c.Id AS CommentId, c.Score AS CommentScore, c.CreationDate AS CommentCreationDate, c.ContentLicense AS CommentContentLicense,
+         pl.Id AS PostLinkId, pl.CreationDate AS PostLinkCreationDate, pl.LinkTypeId, 
+         t.Id AS TagId, t.TagName, t.Count AS TagCount, t.ExcerptPostId, t.WikiPostId, t.IsModeratorOnly, t.IsRequired,
+         v.Id AS VoteId, v.VoteTypeId, v.CreationDate AS VoteCreationDate, v.BountyAmount
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON u.Id = b.UserId
+  LEFT JOIN Comments c ON p.Id = c.PostId
+  LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+  LEFT JOIN Tags t ON EXISTS (
+    SELECT 1
+    FROM (
+      SELECT trim(x) AS tagname
+      FROM (
+        SELECT regexp_split_to_table(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><') AS x
+      ) s1
+    ) s2
+    WHERE s2.tagname = t.TagName
+  )
+  LEFT JOIN Votes v ON p.Id = v.PostId
+)
+SELECT cte.Id, cte.PostTypeId, cte.CreationDate, cte.OwnerUserId, cte.AnswerCount, cte.CommentCount, cte.FavoriteCount, cte.ClosedDate, cte.CommunityOwnedDate, cte.ContentLicense,
+       cte.Reputation, cte.UserCreationDate, cte.LastAccessDate, cte.Views, cte.UpVotes, cte.DownVotes, cte.ProfileImageUrl, cte.EmailHash, cte.AccountId,
+       cte.BadgeId, cte.BadgeName, cte.BadgeDate, cte.BadgeClass, cte.BadgeTagBased,
+       cte.CommentId, cte.CommentScore, cte.CommentCreationDate, cte.CommentContentLicense,
+       cte.PostLinkId, cte.PostLinkCreationDate, cte.LinkTypeId,
+       cte.TagId, cte.TagName, cte.TagCount, cte.ExcerptPostId, cte.WikiPostId, cte.IsModeratorOnly, cte.IsRequired,
+       cte.VoteId, cte.VoteTypeId, cte.VoteCreationDate, cte.BountyAmount
+FROM cte
+WHERE cte.Id IN (
+  SELECT p2.Id
+  FROM Posts p2
+  WHERE p2.PostTypeId = 1
+  ORDER BY p2.CreationDate DESC
+  LIMIT 1000
+)
+ORDER BY cte.CreationDate DESC
+LIMIT 100;

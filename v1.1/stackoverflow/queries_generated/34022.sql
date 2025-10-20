@@ -1,0 +1,78 @@
+-- {"query": "34022.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 714} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        u.Id as OwnerUserId,
+        u.DisplayName as OwnerDisplayName,
+        row_number() over (partition by t.Id order by p.Score desc) as RankByScore
+    from Tags t
+    join Posts p on p.Tags like '%' || '<' || t.TagName || '>' || '%'
+    join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1
+    union all
+    select
+        r.Id,
+        r.TagName,
+        pl.RelatedPostId as PostId,
+        p2.Title,
+        p2.Score,
+        p2.ViewCount,
+        u2.Id as OwnerUserId,
+        u2.DisplayName as OwnerDisplayName,
+        r.RankByScore + 1
+    from RecursiveTagHierarchy r
+    join PostLinks pl on pl.PostId = r.PostId and pl.LinkTypeId = 1
+    join Posts p2 on p2.Id = pl.RelatedPostId and p2.PostTypeId = 1
+    join Users u2 on u2.Id = p2.OwnerUserId
+    where r.RankByScore < 10
+)
+select 
+    rh.TagName,
+    rh.PostId,
+    rh.Title,
+    rh.Score,
+    rh.ViewCount,
+    rh.OwnerUserId,
+    rh.OwnerDisplayName,
+    coalesce(badges.GoldBadges, 0) as GoldBadges,
+    coalesce(badges.SilverBadges, 0) as SilverBadges,
+    coalesce(badges.BronzeBadges, 0) as BronzeBadges,
+    coalesce(commentStats.CommentCount, 0) as CommentCount,
+    coalesce(voteStats.UpVotes, 0) as UpVotes,
+    coalesce(voteStats.DownVotes, 0) as DownVotes,
+    round(cast(p.Score as decimal)/nullif(p.ViewCount,0),4) as ScorePerView,
+    u.Reputation
+from RecursiveTagHierarchy rh
+join Posts p on p.Id = rh.PostId
+join Users u on u.Id = rh.OwnerUserId
+left join (
+    select 
+        UserId,
+        sum(case when Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when Class = 3 then 1 else 0 end) as BronzeBadges
+    from Badges
+    group by UserId
+) badges on badges.UserId = rh.OwnerUserId
+left join (
+    select 
+        PostId,
+        count(*) as CommentCount
+    from Comments
+    group by PostId
+) commentStats on commentStats.PostId = rh.PostId
+left join (
+    select
+        PostId,
+        sum(case when VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when VoteTypeId = 3 then 1 else 0 end) as DownVotes
+    from Votes
+    group by PostId
+) voteStats on voteStats.PostId = rh.PostId
+where rh.RankByScore <= 10
+order by rh.TagName, rh.RankByScore;

@@ -1,0 +1,33 @@
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    COUNT(CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+    COUNT(CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+    AVG(p.Score) AS AverageScore,
+    SUM(p.ViewCount) AS TotalViews,
+    COUNT(DISTINCT b.Id) AS BadgeCount,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    COUNT(DISTINCT v.Id) AS VoteCount,
+    COUNT(DISTINCT pl.Id) AS LinkCount,
+    COUNT(DISTINCT tp.Id) AS TagCount
+FROM
+    Users u
+LEFT JOIN
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN
+    Badges b ON u.Id = b.UserId
+LEFT JOIN
+    Comments c ON u.Id = c.UserId
+LEFT JOIN
+    Votes v ON u.Id = v.UserId
+LEFT JOIN
+    PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN
+    Posts tp ON tp.OwnerUserId = u.Id AND tp.PostTypeId = 1
+WHERE
+    u.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '1' YEAR
+GROUP BY
+    u.Id, u.DisplayName
+ORDER BY
+    TotalViews DESC
+LIMIT 50;

@@ -1,0 +1,152 @@
+WITH RECURSIVE user_influence AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) AS total_posts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS answers,
+        SUM(p.Score) AS total_score,
+        SUM(p.ViewCount) AS total_views
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '5 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) > 10
+),
+top_answerers AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(*) AS answer_count,
+        AVG(p.Score) AS avg_score,
+        COUNT(CASE WHEN p.Id = q.AcceptedAnswerId THEN 1 END) AS accepted_count,
+        -- collect tag strings (as concatenated distinct tag lists) in a portable way
+        STRING_AGG(DISTINCT substring(q.Tags FROM 2 FOR length(q.Tags)-2), ',') AS tag_strings
+    FROM Posts p
+    INNER JOIN Posts q ON p.ParentId = q.Id
+    WHERE p.PostTypeId = 2 
+        AND p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '3 years'
+        AND p.Score > 0
+    GROUP BY p.OwnerUserId
+    HAVING COUNT(*) >= 20
+),
+tag_expertise AS (
+    SELECT 
+        p.OwnerUserId,
+        tag,
+        COUNT(*) AS tag_usage,
+        AVG(p.Score) AS avg_tag_score,
+        SUM(p.ViewCount) AS tag_views
+    FROM (
+        SELECT
+            OwnerUserId,
+            -- split tags like '<a><b>' into rows of 'a','b' in a dialect-agnostic way
+            TRIM(BOTH '<>' FROM regexp_split) AS tag
+        FROM (
+            SELECT
+                OwnerUserId,
+                -- replace '><' with '>' || separator || '<' then split by separator; use a single-character separator unlikely in tags
+                REPLACE(Tags, '><', '>|<') AS tags_with_sep,
+                Tags
+            FROM Posts
+            WHERE PostTypeId = 1 
+                AND Tags IS NOT NULL
+                AND CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '2 years'
+        ) t,
+        -- split into rows using a regexp/split function; use UNNEST alternative: regexp_split_to_table or generate_series is dialect-specific.
+        -- Use a generic approach: use a recursive split for portability
+        LATERAL (
+            SELECT regexp_split_table AS regexp_split
+            FROM (
+                -- Some DBs support regexp_split_to_table; for broad compatibility, emulate with a simple split on '|'
+                -- Here we assume a regexp_split_table-like function exists; if not, replace with your DB's split-to-rows function
+                SELECT value AS regexp_split FROM UNNEST(string_to_array(tags_with_sep, '|')) AS t(value)
+            ) s
+        ) rs
+    ) split_tags
+    GROUP BY p.OwnerUserId, tag
+    HAVING COUNT(*) >= 5
+),
+engagement_metrics AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(DISTINCT c.Id) AS comments_received,
+        COUNT(DISTINCT v.Id) AS votes_received,
+        COUNT(DISTINCT b.Id) AS badges_earned,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+        COUNT(DISTINCT pl.RelatedPostId) AS linked_posts
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN Badges b ON p.OwnerUserId = b.UserId 
+        AND b.Date >= p.CreationDate 
+        AND b.Date <= p.CreationDate + INTERVAL '30 days'
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    WHERE p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '3 years'
+    GROUP BY p.OwnerUserId
+),
+quality_score AS (
+    SELECT 
+        ui.Id,
+        ui.DisplayName,
+        ui.Reputation,
+        ui.total_posts,
+        ui.questions,
+        ui.answers,
+        ta.answer_count,
+        ta.accepted_count,
+        COALESCE(CAST(ta.accepted_count AS DOUBLE PRECISION) / NULLIF(ta.answer_count, 0), 0) AS acceptance_rate,
+        te.tag,
+        te.tag_usage,
+        te.avg_tag_score,
+        em.upvotes,
+        em.downvotes,
+        em.comments_received,
+        em.badges_earned,
+        (ui.total_score * 0.3 + 
+         COALESCE(ta.accepted_count * 15, 0) + 
+         COALESCE(em.upvotes * 2, 0) - 
+         COALESCE(em.downvotes * 5, 0) +
+         COALESCE(em.badges_earned * 10, 0)) AS calculated_quality_score,
+        ROW_NUMBER() OVER (PARTITION BY ui.Id ORDER BY te.tag_usage DESC) AS tag_rank
+    FROM user_influence ui
+    LEFT JOIN top_answerers ta ON ui.Id = ta.OwnerUserId
+    LEFT JOIN tag_expertise te ON ui.Id = te.OwnerUserId
+    LEFT JOIN engagement_metrics em ON ui.Id = em.OwnerUserId
+)
+SELECT 
+    qs.DisplayName,
+    qs.Reputation,
+    qs.total_posts,
+    qs.questions,
+    qs.answers,
+    qs.answer_count,
+    qs.accepted_count,
+    ROUND(CAST(qs.acceptance_rate AS NUMERIC), 2) AS acceptance_rate,
+    qs.tag,
+    qs.tag_usage,
+    ROUND(CAST(qs.avg_tag_score AS NUMERIC), 2) AS avg_tag_score,
+    qs.upvotes,
+    qs.downvotes,
+    qs.comments_received,
+    qs.badges_earned,
+    ROUND(CAST(qs.calculated_quality_score AS NUMERIC), 2) AS quality_score,
+    DENSE_RANK() OVER (ORDER BY qs.calculated_quality_score DESC) AS overall_rank,
+    (
+        SELECT AVG(sub.calculated_quality_score) FROM (
+            SELECT calculated_quality_score
+            FROM quality_score q2
+            WHERE q2.tag = qs.tag
+            ORDER BY calculated_quality_score
+            LIMIT 2 - (SELECT COUNT(*) FROM quality_score q3 WHERE q3.tag = qs.tag) % 2
+            OFFSET (SELECT (COUNT(*) - 1) / 2 FROM quality_score q4 WHERE q4.tag = qs.tag)
+        ) sub
+    ) AS median_quality_by_tag,
+    (SELECT COUNT(*) FROM quality_score q5 WHERE q5.tag = qs.tag) AS experts_in_tag
+FROM quality_score qs
+WHERE qs.tag_rank <= 3
+    AND qs.calculated_quality_score > 100
+ORDER BY qs.calculated_quality_score DESC, qs.acceptance_rate DESC, qs.tag_usage DESC
+LIMIT 500;

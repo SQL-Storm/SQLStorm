@@ -1,0 +1,74 @@
+WITH TopUsers AS (
+    SELECT 
+        u.Id, 
+        u.DisplayName, 
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        COUNT(DISTINCT p.Id) AS PostsCount
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    GROUP BY 
+        u.Id, u.DisplayName
+    HAVING 
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) > 1000
+),
+TopTags AS (
+    SELECT 
+        t.TagName, 
+        COUNT(DISTINCT p.Id) AS PostsCount
+    FROM 
+        Tags t
+    LEFT JOIN 
+        Posts p ON EXISTS (
+            SELECT 1
+            FROM (
+                SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR (LENGTH(p.Tags) - 2)), '><')) AS tag
+            ) x
+            WHERE x.tag = t.TagName
+        )
+    GROUP BY 
+        t.TagName
+    HAVING 
+        COUNT(DISTINCT p.Id) > 1000
+)
+SELECT 
+    tu.DisplayName, 
+    tu.UpVotes, 
+    tu.DownVotes, 
+    tu.PostsCount, 
+    tt.TagName, 
+    tt.PostsCount AS TagPostsCount
+FROM 
+    TopUsers tu
+JOIN 
+    Posts p ON tu.Id = p.OwnerUserId
+JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+JOIN 
+    Tags t ON EXISTS (
+        SELECT 1
+        FROM (
+            SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(t2.Tags FROM 2 FOR (LENGTH(t2.Tags) - 2)), '><')) AS tag
+            FROM Posts t2
+            WHERE t2.Id = pl.RelatedPostId
+        ) x
+        WHERE x.tag = t.TagName
+    )
+JOIN 
+    TopTags tt ON t.TagName = tt.TagName
+WHERE 
+    pl.LinkTypeId = 1
+GROUP BY
+    tu.DisplayName,
+    tu.UpVotes,
+    tu.DownVotes,
+    tu.PostsCount,
+    tt.TagName,
+    tt.PostsCount
+ORDER BY 
+    tu.UpVotes DESC, 
+    tu.PostsCount DESC;

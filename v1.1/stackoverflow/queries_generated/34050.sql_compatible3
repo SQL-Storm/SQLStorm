@@ -1,0 +1,144 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        ARRAY[t.Id] AS Path,
+        1 AS Depth
+    FROM Tags t
+    WHERE (t.IsModeratorOnly = false OR t.IsModeratorOnly IS NULL) AND (t.IsRequired = false OR t.IsRequired IS NULL)
+
+    UNION ALL
+
+    SELECT 
+        child.Id,
+        child.TagName,
+        child.Count,
+        rh.Path || child.Id,
+        rh.Depth + 1
+    FROM Tags child
+    JOIN PostLinks pl ON pl.PostId = child.ExcerptPostId
+    JOIN RecursiveTagHierarchy rh ON rh.Id = pl.RelatedPostId
+    WHERE (child.IsModeratorOnly = false OR child.IsModeratorOnly IS NULL)
+      AND (child.IsRequired = false OR child.IsRequired IS NULL)
+      AND NOT child.Id = ANY(rh.Path)
+      AND rh.Depth < 3
+),
+UserBadgeStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT b.Id) > 0
+),
+ActiveQuestions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        COUNT(c.Id) AS CommentCount,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId IN (2,3)
+    WHERE p.PostTypeId = 1 AND p.ClosedDate IS NULL
+    GROUP BY p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.Tags
+    HAVING COUNT(c.Id) >= 5
+),
+TopAnswerers AS (
+    SELECT 
+        a.OwnerUserId,
+        COUNT(a.Id) AS AnswersCount,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.CreationDate) AS LastAnswerDate,
+        SUM(CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedAnswerCount
+    FROM Posts a
+    LEFT JOIN Posts q ON q.AcceptedAnswerId = a.Id
+    WHERE a.PostTypeId = 2 AND a.OwnerUserId IS NOT NULL
+    GROUP BY a.OwnerUserId
+    HAVING COUNT(a.Id) > 20
+),
+QuestionTagStats AS (
+    SELECT 
+        tag AS Tag,
+        COUNT(p.Id) AS QuestionsCount,
+        AVG(p.Score) AS AverageScore,
+        SUM(p.FavoriteCount) AS TotalFavorites
+    FROM (
+        SELECT p.Id, p.Score, p.FavoriteCount,
+               TRIM(BOTH '<>' FROM UNNEST(STRING_SPLIT(REPLACE(REPLACE(p.Tags, '&lt;', '<'), '&gt;', '>'), '><'))) AS tag
+        FROM Posts p
+        WHERE p.PostTypeId = 1 AND p.ClosedDate IS NULL
+    ) p
+    GROUP BY tag
+    HAVING COUNT(p.Id) > 100
+),
+RecentEditSummary AS (
+    SELECT 
+        ph.PostId,
+        COUNT(DISTINCT ph.Id) AS EditCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.Id END) AS SubstantiveEditCount,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM PostHistory ph
+    WHERE ph.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+    GROUP BY ph.PostId
+),
+FinalResult AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        u.DisplayName,
+        u.Reputation,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CommentCount,
+        tas.AnswersCount,
+        tas.AvgAnswerScore,
+        tas.AcceptedAnswerCount,
+        ubs.BadgeCount,
+        ubs.GoldBadges,
+        ubs.SilverBadges,
+        ubs.BronzeBadges,
+        qts.Tag,
+        qts.QuestionsCount,
+        qts.AverageScore AS TagAvgScore,
+        qts.TotalFavorites AS TagTotalFavorites,
+        re.EditCount,
+        re.SubstantiveEditCount,
+        re.LastEditDate
+    FROM ActiveQuestions q
+    LEFT JOIN Users u ON u.Id = q.OwnerUserId
+    LEFT JOIN TopAnswerers tas ON tas.OwnerUserId = q.OwnerUserId
+    LEFT JOIN UserBadgeStats ubs ON ubs.UserId = q.OwnerUserId
+    LEFT JOIN QuestionTagStats qts ON qts.Tag = ANY (
+        SELECT TRIM(BOTH '<>' FROM value)
+        FROM UNNEST(STRING_SPLIT(REPLACE(REPLACE(q.Tags, '&lt;', '<'), '&gt;', '>'), '><')) AS value
+    )
+    LEFT JOIN RecentEditSummary re ON re.PostId = q.Id
+    WHERE u.Reputation > 1000
+    GROUP BY
+        q.Id, q.Title, q.OwnerUserId, u.DisplayName, u.Reputation, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, q.CommentCount,
+        tas.AnswersCount, tas.AvgAnswerScore, tas.AcceptedAnswerCount,
+        ubs.BadgeCount, ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges,
+        qts.Tag, qts.QuestionsCount, qts.AverageScore, qts.TotalFavorites,
+        re.EditCount, re.SubstantiveEditCount, re.LastEditDate
+    ORDER BY q.Score DESC, tas.AnswersCount DESC, ubs.GoldBadges DESC
+    LIMIT 50
+)
+SELECT * FROM FinalResult;

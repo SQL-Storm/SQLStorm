@@ -1,0 +1,160 @@
+-- {"query": "51030.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "grok-4-fast-non-reasoning", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2129, "output_tokens": 1459} 
+WITH top_users AS (
+    SELECT 
+        u.id,
+        u.reputation,
+        u.creationdate,
+        COUNT(DISTINCT p.id) as post_count,
+        SUM(CASE WHEN p.posttypeid = 1 THEN 1 ELSE 0 END) as question_count,
+        SUM(CASE WHEN p.posttypeid = 2 THEN 1 ELSE 0 END) as answer_count,
+        AVG(p.score) as avg_post_score,
+        SUM(p.viewcount) as total_views,
+        ROW_NUMBER() OVER (ORDER BY u.reputation DESC) as rep_rank
+    FROM users u
+    LEFT JOIN posts p ON u.id = p.owneruserid
+    GROUP BY u.id, u.reputation, u.creationdate
+    HAVING u.reputation >= 1000 AND COUNT(DISTINCT p.id) >= 10
+),
+monthly_activity AS (
+    SELECT 
+        tu.id as user_id,
+        DATE_TRUNC('month', p.creationdate) as activity_month,
+        COUNT(*) as monthly_posts,
+        SUM(p.score) as monthly_score,
+        AVG(p.score) as monthly_avg_score,
+        COUNT(CASE WHEN p.posttypeid = 1 THEN 1 END) as monthly_questions,
+        COUNT(CASE WHEN p.posttypeid = 2 THEN 1 END) as monthly_answers
+    FROM top_users tu
+    JOIN posts p ON tu.id = p.owneruserid
+    WHERE p.creationdate >= tu.creationdate AND p.creationdate < cast('2024-10-01 12:34:56' as timestamp)
+    GROUP BY tu.id, DATE_TRUNC('month', p.creationdate)
+),
+user_badges AS (
+    SELECT 
+        tu.id as user_id,
+        COUNT(b.id) as total_badges,
+        SUM(CASE WHEN b.class = 1 THEN 1 ELSE 0 END) as gold_badges,
+        SUM(CASE WHEN b.class = 2 THEN 1 ELSE 0 END) as silver_badges,
+        SUM(CASE WHEN b.class = 3 THEN 1 ELSE 0 END) as bronze_badges,
+        COUNT(DISTINCT b.name) as unique_badges
+    FROM top_users tu
+    LEFT JOIN badges b ON tu.id = b.userid
+    GROUP BY tu.id
+),
+top_tags AS (
+    SELECT 
+        t.tagname,
+        t.count as tag_usage,
+        COUNT(DISTINCT p.id) as distinct_posts,
+        AVG(p.score) as avg_score,
+        SUM(p.viewcount) as total_views
+    FROM tags t
+    JOIN posts p ON t.excerptpostid = p.id OR t.wikipostid = p.id
+    WHERE t.count > 100
+    GROUP BY t.tagname, t.count
+),
+question_performance AS (
+    SELECT 
+        p.id as question_id,
+        p.title,
+        p.creationdate,
+        p.score as q_score,
+        p.viewcount,
+        p.answercount,
+        p.commentcount,
+        p.favoritecount,
+        COALESCE(accepted.score, 0) as accepted_answer_score,
+        AVG(answers.score) as avg_answer_score,
+        SUM(CASE WHEN vl.vote_typeid = 2 THEN 1 ELSE 0 END) as upvotes,
+        SUM(CASE WHEN vl.vote_typeid = 3 THEN 1 ELSE 0 END) as downvotes,
+        tu.reputation as asker_rep,
+        ROW_NUMBER() OVER (
+            PARTITION BY DATE_TRUNC('month', p.creationdate) 
+            ORDER BY p.score DESC, p.viewcount DESC
+        ) as monthly_rank
+    FROM posts p
+    JOIN top_users tu ON p.owneruserid = tu.id
+    LEFT JOIN posts answers ON p.id = answers.parentid AND answers.posttypeid = 2
+    LEFT JOIN posts accepted ON p.acceptedanswerid = accepted.id
+    LEFT JOIN (
+        SELECT 
+            postid,
+            vote_typeid,
+            COUNT(*) as vote_count
+        FROM votes 
+        WHERE vote_typeid IN (2, 3)  -- upvote, downvote
+        GROUP BY postid, vote_typeid
+    ) vl ON p.id = vl.postid
+    WHERE p.posttypeid = 1 AND p.creationdate >= '2020-01-01'
+    GROUP BY p.id, p.title, p.creationdate, p.score, p.viewcount, 
+             p.answercount, p.commentcount, p.favoritecount, 
+             accepted.score, tu.reputation
+),
+tag_question_stats AS (
+    SELECT 
+        p.id as question_id,
+        string_to_array(
+            substring(p.tags, 2, length(p.tags)-2), 
+            '><'
+        ) as tag_array,
+        p.score,
+        p.viewcount,
+        p.answercount
+    FROM posts p
+    JOIN question_performance qp ON p.id = qp.question_id
+    WHERE p.posttypeid = 1 AND p.tags IS NOT NULL AND length(p.tags) > 2
+)
+SELECT 
+    tu.displayname as username,
+    tu.reputation,
+    tu.post_count,
+    tu.question_count,
+    tu.answer_count,
+    tu.avg_post_score,
+    ROUND(tu.total_views::numeric / tu.post_count, 2) as views_per_post,
+    ub.total_badges,
+    ub.gold_badges,
+    ub.silver_badges,
+    ub.bronze_badges,
+    ma.activity_month,
+    ma.monthly_posts,
+    ma.monthly_score,
+    ROUND(ma.monthly_score::numeric / NULLIF(ma.monthly_posts, 0), 2) as monthly_score_per_post,
+    qp.question_id,
+    qp.title,
+    qp.q_score,
+    qp.viewcount,
+    qp.answercount,
+    qp.accepted_answer_score,
+    qp.avg_answer_score,
+    (qp.upvotes - COALESCE(qp.downvotes, 0)) as net_votes,
+    qp.monthly_rank,
+    (
+        SELECT string_agg(tt.tagname, ', ' ORDER BY tt.tag_usage DESC)
+        FROM top_tags tt
+        WHERE EXISTS (
+            SELECT 1 FROM tag_question_stats tqs
+            WHERE tqs.question_id = qp.question_id
+            AND tt.tagname = ANY(tqs.tag_array)
+        )
+        LIMIT 3
+    ) as top_related_tags,
+    RANK() OVER (
+        PARTITION BY ma.activity_month 
+        ORDER BY ma.monthly_score DESC, tu.reputation DESC
+    ) as monthly_user_performance_rank,
+    PERCENT_RANK() OVER (
+        ORDER BY tu.reputation DESC
+    ) as reputation_percentile
+FROM top_users tu
+JOIN user_badges ub ON tu.id = ub.user_id
+JOIN monthly_activity ma ON tu.id = ma.user_id
+JOIN question_performance qp ON tu.id = tu.id
+WHERE ma.activity_month >= '2023-01-01'
+    AND qp.monthly_rank <= 50  -- Top 50 questions per month
+    AND tu.post_count >= 50
+ORDER BY 
+    ma.activity_month DESC,
+    ma.monthly_score DESC,
+    tu.reputation DESC
+LIMIT 1000;

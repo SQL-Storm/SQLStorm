@@ -1,0 +1,154 @@
+WITH UserBadgeStats AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        COUNT(CASE WHEN B.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN B.Class = 3 THEN 1 END) AS BronzeBadges,
+        SUM(CASE WHEN B.TagBased = TRUE THEN 1 ELSE 0 END) AS TagBadgesCount
+    FROM Users U
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName
+),
+RecentQuestions AS (
+    SELECT
+        P.Id AS QuestionId,
+        P.Title,
+        P.OwnerUserId,
+        P.CreationDate,
+        P.Tags,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount
+    FROM Posts P
+    WHERE P.PostTypeId = 1
+      AND P.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY)
+),
+AnswerStats AS (
+    SELECT
+        RQ.QuestionId,
+        COUNT(A.Id) AS AnswerCount,
+        AVG(A.Score) AS AvgAnswerScore,
+        MAX(A.Score) AS MaxAnswerScore
+    FROM RecentQuestions RQ
+    LEFT JOIN Posts A ON A.ParentId = RQ.QuestionId AND A.PostTypeId = 2
+    GROUP BY RQ.QuestionId
+),
+MostCommentedQuestions AS (
+    SELECT
+        P.Id AS QuestionId,
+        P.Title,
+        P.CommentCount
+    FROM Posts P
+    WHERE P.PostTypeId = 1
+    ORDER BY P.CommentCount DESC
+    LIMIT 10
+),
+TagAnalysis AS (
+    SELECT tag AS Tag, COUNT(*) AS TagCount
+    FROM (
+        WITH RECURSIVE split(id, rest, tag) AS (
+            SELECT
+                P.Id,
+                TRIM(P.Tags) AS rest,
+                NULL AS tag
+            FROM Posts P
+            WHERE P.PostTypeId = 1
+            UNION ALL
+            SELECT
+                id,
+                CASE
+                    WHEN POSITION('><' IN rest) > 0 THEN SUBSTR(rest, POSITION('><' IN rest)+2)
+                    ELSE ''
+                END,
+                CASE
+                    WHEN rest LIKE '<%>%'
+                    THEN
+                        CASE
+                            WHEN POSITION('><' IN rest) > 0 THEN SUBSTR(rest, 2, POSITION('><' IN rest)-2)
+                            ELSE SUBSTR(rest, 2, LENGTH(rest)-2)
+                        END
+                    ELSE NULL
+                END
+            FROM split
+            WHERE rest IS NOT NULL AND rest <> ''
+        )
+        SELECT tag FROM split WHERE tag IS NOT NULL
+    ) tags
+    GROUP BY tag
+),
+UserActivity AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        COUNT(CASE WHEN V.VoteTypeId IS NOT NULL AND V.VoteTypeId IN (2,3) THEN 1 END) AS UpVotesGiven,
+        COUNT(CASE WHEN V.VoteTypeId IS NOT NULL AND V.VoteTypeId IN (5) THEN 1 END) AS DownVotesGiven,
+        COUNT(DISTINCT P.Id) AS QuestionsAsked,
+        COUNT(DISTINCT A.Id) AS AnswersGiven
+    FROM Users U
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    LEFT JOIN Posts P ON P.OwnerUserId = U.Id AND P.PostTypeId = 1
+    LEFT JOIN Posts A ON A.OwnerUserId = U.Id AND A.PostTypeId = 2
+    GROUP BY U.Id, U.DisplayName
+),
+ActivitySummary AS (
+    SELECT
+        UserId,
+        SUM(UpVotesGiven) AS TotalUpVotesGiven,
+        SUM(DownVotesGiven) AS TotalDownVotesGiven,
+        SUM(QuestionsAsked) AS TotalQuestions,
+        SUM(AnswersGiven) AS TotalAnswers
+    FROM UserActivity
+    GROUP BY UserId
+)
+SELECT
+    UBS.UserId,
+    UBS.DisplayName,
+    UBS.GoldBadges,
+    UBS.SilverBadges,
+    UBS.BronzeBadges,
+    UBS.TagBadgesCount,
+    COALESCE(RQ.QuestionId, 0) AS RecentQuestionId,
+    RQ.Title AS RecentQuestionTitle,
+    AStats.AnswerCount,
+    AStats.AvgAnswerScore,
+    AStats.MaxAnswerScore,
+    MQ.QuestionId AS TopCommentedQuestionId,
+    MQ.Title AS TopCommentedQuestionTitle,
+    MQ.CommentCount,
+    TA.Tag,
+    TA.TagCount,
+    ASum.TotalUpVotesGiven,
+    ASum.TotalDownVotesGiven,
+    ASum.TotalQuestions,
+    ASum.TotalAnswers
+FROM UserBadgeStats UBS
+LEFT JOIN RecentQuestions RQ ON UBS.UserId = RQ.OwnerUserId
+LEFT JOIN AnswerStats AStats ON RQ.QuestionId = AStats.QuestionId
+LEFT JOIN MostCommentedQuestions MQ ON MQ.QuestionId = RQ.QuestionId
+LEFT JOIN TagAnalysis TA ON TRUE
+LEFT JOIN ActivitySummary ASum ON UBS.UserId = ASum.UserId
+GROUP BY
+    UBS.UserId,
+    UBS.DisplayName,
+    UBS.GoldBadges,
+    UBS.SilverBadges,
+    UBS.BronzeBadges,
+    UBS.TagBadgesCount,
+    RQ.QuestionId,
+    RQ.Title,
+    AStats.AnswerCount,
+    AStats.AvgAnswerScore,
+    AStats.MaxAnswerScore,
+    MQ.QuestionId,
+    MQ.Title,
+    MQ.CommentCount,
+    TA.Tag,
+    TA.TagCount,
+    ASum.TotalUpVotesGiven,
+    ASum.TotalDownVotesGiven,
+    ASum.TotalQuestions,
+    ASum.TotalAnswers
+ORDER BY UBS.GoldBadges DESC, UBS.UserId;

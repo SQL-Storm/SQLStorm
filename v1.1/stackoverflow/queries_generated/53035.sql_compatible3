@@ -1,0 +1,147 @@
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.Reputation, u.DisplayName
+),
+BadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+VoteSummary AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.Id END) AS Favorites
+    FROM Votes v
+    GROUP BY v.PostId
+),
+TagActivity AS (
+    SELECT
+        OwnerUserId AS UserId,
+        TagName,
+        COUNT(*) AS TagPostCount,
+        SUM(Score) AS TagScore
+    FROM (
+        SELECT
+            p.OwnerUserId,
+            p.Score,
+            -- use standard SQL TRIM on a string; ensure split_tag is varchar
+            TRIM(split_tag) AS TagName
+        FROM Posts p
+        CROSS JOIN LATERAL (
+            SELECT split_tag
+            FROM (
+                WITH RECURSIVE splitter(pos, rest, split_tag) AS (
+                    SELECT
+                        1 AS pos,
+                        CASE WHEN p.Tags IS NULL THEN '' ELSE p.Tags END AS rest,
+                        NULL AS split_tag
+                    UNION ALL
+                    SELECT
+                        CASE
+                            WHEN POSITION('><' IN rest) > 0 THEN POSITION('><' IN rest) + 2
+                            ELSE LENGTH(rest) + 1
+                        END,
+                        CASE
+                            WHEN POSITION('><' IN rest) > 0 THEN SUBSTR(rest, CASE WHEN POSITION('><' IN rest) + 2 <= LENGTH(rest) THEN POSITION('><' IN rest) + 2 ELSE LENGTH(rest)+1 END)
+                            ELSE ''
+                        END,
+                        CASE
+                            WHEN POSITION('><' IN rest) > 0 THEN SUBSTR(rest, 2, POSITION('><' IN rest) - 2)
+                            ELSE CASE WHEN LENGTH(rest) > 2 THEN SUBSTR(rest, 2, LENGTH(rest)-2) ELSE '' END
+                        END
+                    FROM splitter
+                    WHERE rest <> ''
+                )
+                SELECT split_tag
+                FROM splitter
+                WHERE split_tag IS NOT NULL AND split_tag <> ''
+            ) s
+        ) tags(split_tag)
+        WHERE p.PostTypeId = 1
+    ) t
+    GROUP BY OwnerUserId, TagName
+    HAVING COUNT(*) > 10
+),
+EditHistory AS (
+    SELECT 
+        ph.PostId,
+        COUNT(ph.Id) AS EditCount,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6,7,8,9)
+    GROUP BY ph.PostId
+)
+SELECT 
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.TotalPosts,
+    ua.TotalScore,
+    ua.AvgScore,
+    ua.LastPostDate,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    bs.BadgeCount,
+    bs.GoldBadges,
+    bs.SilverBadges,
+    bs.BronzeBadges,
+    ta.TagName,
+    ta.TagPostCount,
+    ta.TagScore,
+    ROW_NUMBER() OVER (PARTITION BY ta.TagName ORDER BY ta.TagScore DESC) AS TagRank,
+    (SELECT AVG(COALESCE(vs.UpVotes,0) - COALESCE(vs.DownVotes,0))
+     FROM Posts p2
+     JOIN VoteSummary vs ON vs.PostId = p2.Id
+     WHERE p2.OwnerUserId = ua.UserId
+    ) AS AvgNetVotes,
+    (SELECT COUNT(DISTINCT pl.RelatedPostId)
+     FROM PostLinks pl
+     JOIN Posts p3 ON p3.Id = pl.PostId
+     WHERE p3.OwnerUserId = ua.UserId AND pl.LinkTypeId = 3
+    ) AS DuplicateLinks,
+    AVG(COALESCE(eh.EditCount,0)) AS AvgEditCount
+FROM UserActivity ua
+JOIN BadgeStats bs ON bs.UserId = ua.UserId
+JOIN TagActivity ta ON ta.UserId = ua.UserId
+LEFT JOIN Posts p ON p.OwnerUserId = ua.UserId
+LEFT JOIN EditHistory eh ON eh.PostId = p.Id
+WHERE ua.Reputation > 10000
+  AND ua.TotalPosts > 50
+GROUP BY
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.TotalPosts,
+    ua.TotalScore,
+    ua.AvgScore,
+    ua.LastPostDate,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    bs.BadgeCount,
+    bs.GoldBadges,
+    bs.SilverBadges,
+    bs.BronzeBadges,
+    ta.TagName,
+    ta.TagPostCount,
+    ta.TagScore
+HAVING AVG(COALESCE(eh.EditCount,0)) > 1
+ORDER BY ua.Reputation DESC, TagRank ASC
+LIMIT 1000;

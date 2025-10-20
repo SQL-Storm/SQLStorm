@@ -1,0 +1,58 @@
+-- {"query": "31028.sql", "dataset": "stackoverflow", "version": "v1.1", "prompt": "p2", "model": "gpt-4o-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 1986, "output_tokens": 427} 
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        u.DisplayName AS OwnerDisplayName,
+        p.ViewCount,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostRank,
+        COUNT(c.Id) AS CommentCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN 
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN 
+        Votes v ON p.Id = v.PostId
+    WHERE 
+        p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+    GROUP BY 
+        p.Id, u.DisplayName
+),
+TopUsers AS (
+    SELECT 
+        OwnerDisplayName,
+        COUNT(PostId) AS TotalPosts,
+        SUM(ViewCount) AS TotalViews,
+        SUM(UpVoteCount) AS TotalUpVotes,
+        SUM(DownVoteCount) AS TotalDownVotes
+    FROM 
+        RankedPosts
+    WHERE 
+        PostRank = 1
+    GROUP BY 
+        OwnerDisplayName
+    ORDER BY 
+        TotalPosts DESC
+    LIMIT 10
+)
+SELECT 
+    tu.OwnerDisplayName,
+    tu.TotalPosts,
+    tu.TotalViews,
+    tu.TotalUpVotes,
+    tu.TotalDownVotes,
+    AVG(rp.ViewCount) AS AverageViewsPerPost,
+    AVG(rp.CommentCount) AS AverageCommentsPerPost
+FROM 
+    TopUsers tu
+JOIN 
+    RankedPosts rp ON tu.OwnerDisplayName = rp.OwnerDisplayName
+GROUP BY 
+    tu.OwnerDisplayName, tu.TotalPosts, tu.TotalViews, tu.TotalUpVotes, tu.TotalDownVotes
+ORDER BY 
+    tu.TotalPosts DESC;

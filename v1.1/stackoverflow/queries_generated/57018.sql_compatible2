@@ -1,0 +1,201 @@
+WITH UserActivity AS (
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScore,
+        COALESCE(MAX(P.Score), 0) AS MaxPostScore,
+        COALESCE(MIN(P.Score), 0) AS MinPostScore,
+        COUNT(DISTINCT V.Id) AS TotalVotes,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(DISTINCT PH.Id) AS TotalPostHistory,
+        COUNT(DISTINCT PL.Id) AS TotalPostLinks,
+        COUNT(DISTINCT VT.Id) AS TotalVoteTypes,
+        COUNT(DISTINCT T.Id) AS TotalTags
+    FROM
+        Users U
+    LEFT JOIN
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN
+        Votes V ON U.Id = V.UserId
+    LEFT JOIN
+        Comments C ON U.Id = C.UserId
+    LEFT JOIN
+        Badges B ON U.Id = B.UserId
+    LEFT JOIN
+        PostHistory PH ON U.Id = PH.UserId
+    LEFT JOIN
+        PostLinks PL ON U.Id = PL.PostId
+    LEFT JOIN
+        Votes VT ON U.Id = VT.UserId
+    LEFT JOIN
+        Tags T ON U.Id = T.Id
+    GROUP BY
+        U.Id, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+PostMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        P.LastEditorUserId,
+        U2.DisplayName AS LastEditorDisplayName,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.Title,
+        P.Tags,
+        COUNT(C.Id) AS TotalCommentsOnPost,
+        COUNT(V.Id) AS TotalVotesOnPost,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotes,
+        COUNT(DISTINCT PH.Id) AS TotalPostHistoryEntries,
+        COUNT(DISTINCT PL.Id) AS TotalPostLinks,
+        COUNT(DISTINCT T.Id) AS TotalTags
+    FROM
+        Posts P
+    LEFT JOIN
+        Users U ON P.OwnerUserId = U.Id
+    LEFT JOIN
+        Users U2 ON P.LastEditorUserId = U2.Id
+    LEFT JOIN
+        Comments C ON P.Id = C.PostId
+    LEFT JOIN
+        Votes V ON P.Id = V.PostId
+    LEFT JOIN
+        PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN
+        PostLinks PL ON P.Id = PL.PostId
+    LEFT JOIN
+        Tags T ON P.Tags LIKE '%' || '<' || T.TagName || '>' || '%'
+    GROUP BY
+        P.Id, P.PostTypeId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount,
+        P.OwnerUserId, U.DisplayName, P.LastEditorUserId, U2.DisplayName, P.LastEditDate, P.LastActivityDate, P.Title, P.Tags
+),
+TagMetrics AS (
+    SELECT
+        T.Id AS TagId,
+        T.TagName,
+        T.Count AS TagCount,
+        T.ExcerptPostId,
+        T.WikiPostId,
+        P.Title AS ExcerptPostTitle,
+        P2.Title AS WikiPostTitle,
+        COUNT(P.Id) AS TotalPostsWithTag,
+        SUM(P.Score) AS TotalScoreOfPostsWithTag,
+        AVG(P.Score) AS AverageScoreOfPostsWithTag,
+        SUM(P.ViewCount) AS TotalViewCountOfPostsWithTag,
+        AVG(P.ViewCount) AS AverageViewCountOfPostsWithTag,
+        COUNT(DISTINCT U.Id) AS TotalUsersWithTag,
+        COUNT(DISTINCT C.Id) AS TotalCommentsOnTag,
+        COUNT(DISTINCT V.Id) AS TotalVotesOnTag,
+        COUNT(DISTINCT PH.Id) AS TotalPostHistoryEntriesForTag,
+        COUNT(DISTINCT PL.Id) AS TotalPostLinksForTag
+    FROM
+        Tags T
+    LEFT JOIN
+        Posts P ON T.ExcerptPostId = P.Id
+    LEFT JOIN
+        Posts P2 ON T.WikiPostId = P2.Id
+    LEFT JOIN
+        Users U ON P.OwnerUserId = U.Id
+    LEFT JOIN
+        Comments C ON P.Id = C.PostId
+    LEFT JOIN
+        Votes V ON P.Id = V.PostId
+    LEFT JOIN
+        PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN
+        PostLinks PL ON P.Id = PL.PostId
+    WHERE
+        P.Tags LIKE '%' || '<' || T.TagName || '>' || '%'
+    GROUP BY
+        T.Id, T.TagName, T.Count, T.ExcerptPostId, T.WikiPostId, P.Title, P2.Title
+)
+SELECT
+    UA.UserId,
+    UA.Reputation,
+    UA.UserCreationDate,
+    UA.LastAccessDate,
+    UA.TotalPosts,
+    UA.TotalQuestions,
+    UA.TotalAnswers,
+    UA.TotalPostScore,
+    UA.MaxPostScore,
+    UA.MinPostScore,
+    UA.TotalVotes,
+    UA.TotalComments,
+    UA.TotalBadges,
+    UA.GoldBadges,
+    UA.SilverBadges,
+    UA.BronzeBadges,
+    UA.TotalPostHistory,
+    UA.TotalPostLinks,
+    UA.TotalVoteTypes,
+    UA.TotalTags,
+    PM.PostId,
+    PM.PostTypeId,
+    PM.PostCreationDate,
+    PM.PostScore,
+    PM.ViewCount,
+    PM.AnswerCount,
+    PM.CommentCount,
+    PM.FavoriteCount,
+    PM.OwnerUserId,
+    PM.OwnerDisplayName,
+    PM.LastEditorUserId,
+    PM.LastEditorDisplayName,
+    PM.LastEditDate,
+    PM.LastActivityDate,
+    PM.Title AS PostTitle,
+    PM.Tags,
+    PM.TotalCommentsOnPost,
+    PM.TotalVotesOnPost,
+    PM.TotalUpvotes,
+    PM.TotalDownvotes,
+    PM.TotalPostHistoryEntries,
+    PM.TotalPostLinks,
+    PM.TotalTags,
+    TM.TagId,
+    TM.TagName,
+    TM.TagCount,
+    TM.ExcerptPostId,
+    TM.WikiPostId,
+    TM.ExcerptPostTitle,
+    TM.WikiPostTitle,
+    TM.TotalPostsWithTag,
+    TM.TotalScoreOfPostsWithTag,
+    TM.AverageScoreOfPostsWithTag,
+    TM.TotalViewCountOfPostsWithTag,
+    TM.AverageViewCountOfPostsWithTag,
+    TM.TotalUsersWithTag,
+    TM.TotalCommentsOnTag,
+    TM.TotalVotesOnTag,
+    TM.TotalPostHistoryEntriesForTag,
+    TM.TotalPostLinksForTag
+FROM
+    UserActivity UA
+LEFT JOIN
+    PostMetrics PM ON UA.UserId = PM.OwnerUserId
+LEFT JOIN
+    TagMetrics TM ON PM.Tags LIKE '%' || '<' || TM.TagName || '>' || '%'
+ORDER BY
+    UA.Reputation DESC,
+    PM.PostScore DESC,
+    TM.TotalScoreOfPostsWithTag DESC
+LIMIT
+    100;

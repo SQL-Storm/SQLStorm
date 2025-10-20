@@ -1,0 +1,116 @@
+WITH
+UserActivity AS (
+    SELECT
+        u.Id           AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS Questions,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS Answers,
+        COALESCE(SUM(vt.VoteCount),0)               AS TotalVotes,
+        SUM(CASE WHEN p.Score >= 10 THEN 1 ELSE 0 END) AS HighScorePosts
+    FROM Users u
+    LEFT JOIN Posts p
+        ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT
+            PostId,
+            COUNT(*) AS VoteCount
+        FROM Votes
+        GROUP BY PostId
+    ) vt
+        ON vt.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TagQuestionStats AS (
+    SELECT
+        tag                       AS TagName,
+        COUNT(*)                  AS QCount,
+        CAST(AVG(p.ViewCount) AS INTEGER)     AS AvgViews,
+        SUM(p.Score)              AS TotalScore
+    FROM Posts p,
+         UNNEST(
+            string_to_array(
+                substring(p.Tags,2,length(p.Tags)-2),
+                '><'
+            )
+         ) AS tag
+    WHERE p.PostTypeId = 1
+    GROUP BY tag
+),
+BadgeTimeSeries AS (
+    SELECT
+        b.UserId,
+        u.DisplayName,
+        b.Name                   AS BadgeName,
+        DATE_TRUNC('month', b.Date) AS BadgeMonth,
+        COUNT(*)                 AS BadgeCount
+    FROM Badges b
+    JOIN Users u
+      ON u.Id = b.UserId
+    GROUP BY b.UserId, u.DisplayName, b.Name, DATE_TRUNC('month', b.Date)
+),
+RankedUsers AS (
+    SELECT
+        ua.*,
+        ROW_NUMBER()   OVER (ORDER BY ua.TotalVotes DESC)     AS VoteRank,
+        DENSE_RANK()  OVER (ORDER BY ua.Questions + ua.Answers DESC) AS PostRank
+    FROM UserActivity ua
+)
+SELECT
+    ru.UserId,
+    ru.DisplayName,
+    ru.Questions,
+    ru.Answers,
+    ru.TotalVotes,
+    ru.HighScorePosts,
+    fav.tag       AS UserTopTag,
+    fav.TagCount      AS UserTopTagCount,
+    tqs.QCount        AS GlobalTagQuestionCount,
+    tqs.AvgViews      AS GlobalTagAvgViews,
+    tqs.TotalScore    AS GlobalTagTotalScore,
+    bts.BadgeName,
+    bts.BadgeMonth,
+    bts.BadgeCount,
+    ru.VoteRank,
+    ru.PostRank
+FROM RankedUsers ru
+LEFT JOIN LATERAL (
+    SELECT
+        tag,
+        COUNT(*) AS TagCount
+    FROM Posts p2,
+         UNNEST(
+            string_to_array(
+                substring(p2.Tags,2,length(p2.Tags)-2),
+                '><'
+            )
+         ) AS tag
+    WHERE p2.OwnerUserId = ru.UserId
+      AND p2.PostTypeId = 1
+    GROUP BY tag
+    ORDER BY TagCount DESC
+    LIMIT 1
+) fav
+  ON TRUE
+LEFT JOIN TagQuestionStats tqs
+  ON tqs.TagName = fav.tag
+LEFT JOIN BadgeTimeSeries bts
+  ON bts.UserId = ru.UserId
+GROUP BY
+    ru.UserId,
+    ru.DisplayName,
+    ru.Questions,
+    ru.Answers,
+    ru.TotalVotes,
+    ru.HighScorePosts,
+    fav.tag,
+    fav.TagCount,
+    tqs.QCount,
+    tqs.AvgViews,
+    tqs.TotalScore,
+    bts.BadgeName,
+    bts.BadgeMonth,
+    bts.BadgeCount,
+    ru.VoteRank,
+    ru.PostRank
+ORDER BY ru.VoteRank, bts.BadgeMonth DESC
+LIMIT 100;

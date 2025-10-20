@@ -1,0 +1,48 @@
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) AS QuestionsWithAcceptedAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 0 THEN p.Id END) AS HighScoringAnswers,
+    SUM(p.Score) AS TotalScore,
+    AVG(p.Score) AS AverageScore,
+    MAX(p.ViewCount) AS MaxViews,
+    COUNT(DISTINCT b.Id) AS BadgesReceived,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+    COUNT(DISTINCT c.Id) AS TotalComments,
+    COUNT(DISTINCT CASE WHEN c.Score > 0 THEN c.Id END) AS HighScoringComments,
+    COUNT(DISTINCT ph.Id) AS EditHistoryEntries,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN ph.Id END) AS PostStatusChanges,
+    COUNT(DISTINCT pl.Id) AS PostLinks,
+    COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.Id END) AS DuplicateLinks,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS TagsUsed
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN (
+    SELECT 
+        p2.Id AS PostId,
+        TRIM(tag) AS TagName
+    FROM Posts p2,
+    LATERAL (
+      SELECT regexp_split_to_table(
+        regexp_replace(p2.Tags, '^<|>$', ''), '><') AS tag
+    ) s
+    WHERE p2.Tags IS NOT NULL AND p2.Tags <> ''
+) t ON p.Id = t.PostId
+WHERE u.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '2 years')
+    AND u.Reputation > 100
+    AND (p.Id IS NULL OR p.DeletedDate IS NULL OR p.DeletedDate > CAST('2024-10-01' AS date))
+GROUP BY u.Id, u.DisplayName, u.Reputation
+HAVING COUNT(DISTINCT p.Id) > 5
+    AND COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0
+ORDER BY TotalScore DESC, Reputation DESC
+LIMIT 10000;

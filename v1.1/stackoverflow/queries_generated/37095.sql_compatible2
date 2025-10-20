@@ -1,0 +1,162 @@
+WITH RECURSIVE UserTagActivity AS (
+  SELECT
+    u.Id AS UserId,
+    t.TagName,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersGiven,
+    COUNT(c.Id) AS CommentsMade,
+    COALESCE(v_up.UpVotes,0) AS UpVotesReceived,
+    COALESCE(v_down.DownVotes,0) AS DownVotesReceived,
+    COALESCE(AVG(NULLIF(p.Score,0)),0) AS AvgPostScore,
+    MIN(p.CreationDate) AS FirstActivity,
+    MAX(p.LastActivityDate) AS LastActivity
+  FROM Users u
+  JOIN Posts p ON p.OwnerUserId = u.Id
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(coalesce(pt.Tags,''), 2, length(coalesce(pt.Tags,'')) - 2), '><')) AS TagName, pt.Id AS QId
+    FROM Posts pt
+    WHERE pt.Id = CASE WHEN p.PostTypeId = 1 THEN p.Id WHEN p.PostTypeId = 2 THEN p.ParentId ELSE NULL END
+  ) t
+  LEFT JOIN Comments c ON c.UserId = u.Id
+  LEFT JOIN LATERAL (
+    SELECT SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM Votes v
+    WHERE v.PostId = p.Id
+  ) v_up ON true
+  LEFT JOIN LATERAL (
+    SELECT SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM Votes v
+    WHERE v.PostId = p.Id
+  ) v_down ON true
+  GROUP BY u.Id, t.TagName, v_up.UpVotes, v_down.DownVotes
+),
+TagTrend AS (
+  SELECT
+    t.TagName,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+    COALESCE(SUM(p.ViewCount),0) AS TotalViews,
+    COALESCE(AVG(p.Score),0) AS AvgScore,
+    SUM(
+      GREATEST(0, 1 - (EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / (60*60*24*365)))
+    ) AS RecencyWeight,
+    COUNT(DISTINCT p.OwnerUserId) AS ActiveAskers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.OwnerUserId END) AS ActiveAnswerers
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(coalesce(p.Tags,''), 2, length(coalesce(p.Tags,'')) - 2), '><')) AS TagName
+  ) t
+  GROUP BY t.TagName
+),
+TopUsersPerTag AS (
+  SELECT
+    uta.TagName,
+    uta.UserId,
+    u.DisplayName,
+    (COALESCE(uta.AnswersGiven,0) * 2.5
+     + COALESCE(uta.QuestionsAsked,0) * 1.5
+     + COALESCE(uta.CommentsMade,0) * 0.5
+     + (COALESCE(uta.UpVotesReceived,0) - COALESCE(uta.DownVotesReceived,0)) * 1.2
+     + COALESCE(uta.AvgPostScore,0) * 1.0
+    ) AS EngagementScore,
+    uta.FirstActivity,
+    uta.LastActivity,
+    ROW_NUMBER() OVER (PARTITION BY uta.TagName ORDER BY
+      (COALESCE(uta.AnswersGiven,0) * 2.5
+       + COALESCE(uta.QuestionsAsked,0) * 1.5
+       + COALESCE(uta.CommentsMade,0) * 0.5
+       + (COALESCE(uta.UpVotesReceived,0) - COALESCE(uta.DownVotesReceived,0)) * 1.2
+       + COALESCE(uta.AvgPostScore,0) * 1.0
+      ) DESC,
+      uta.LastActivity DESC
+    ) AS rn
+  FROM UserTagActivity uta
+  JOIN Users u ON u.Id = uta.UserId
+),
+TagCorrelates AS (
+  SELECT
+    base.TagName,
+    co.TagName AS CoTag,
+    COUNT(*) AS CoOccurCount,
+    AVG(EXTRACT(EPOCH FROM (ans.CreationDate - q.CreationDate))/3600) FILTER (WHERE ans.CreationDate IS NOT NULL) AS AvgHoursToAnswer
+  FROM Posts q
+  JOIN Posts ans ON ans.ParentId = q.Id AND ans.PostTypeId = 2
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(coalesce(q.Tags,''), 2, length(coalesce(q.Tags,'')) - 2), '><')) AS TagName
+  ) base
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(coalesce(q.Tags,''), 2, length(coalesce(q.Tags,'')) - 2), '><')) AS TagName
+  ) co
+  WHERE base.TagName <> co.TagName
+  GROUP BY base.TagName, co.TagName
+),
+HotTags AS (
+  SELECT
+    tt.TagName,
+    tt.QuestionCount,
+    tt.AnswerCount,
+    tt.TotalViews,
+    tt.AvgScore,
+    tt.RecencyWeight,
+    (tt.QuestionCount * 0.4 + tt.AnswerCount * 0.3 + tt.TotalViews * 0.0001 + tt.RecencyWeight * 5 + tt.AvgScore * 1.2) AS HotnessScore,
+    ROW_NUMBER() OVER (ORDER BY (tt.QuestionCount * 0.4 + tt.AnswerCount * 0.3 + tt.TotalViews * 0.0001 + tt.RecencyWeight * 5 + tt.AvgScore * 1.2) DESC) AS HotRank
+  FROM TagTrend tt
+),
+TagSummary AS (
+  SELECT
+    h.TagName,
+    h.HotRank,
+    h.HotnessScore,
+    h.QuestionCount,
+    h.AnswerCount,
+    h.TotalViews,
+    h.AvgScore,
+    h.RecencyWeight,
+    STRING_AGG(tu.DisplayName || '::' || ROUND(CAST(tu.EngagementScore AS numeric),2), ' | ' ORDER BY tu.EngagementScore DESC) FILTER (WHERE tu.rn <= 3) AS TopUsers,
+    (SELECT STRING_AGG(co.CoTag || '::' || CAST(CoOccurCount AS text), ' > ') FROM (
+        SELECT TagCorrelates.CoTag, TagCorrelates.CoOccurCount
+        FROM TagCorrelates
+        WHERE TagCorrelates.TagName = h.TagName
+        ORDER BY TagCorrelates.CoOccurCount DESC
+        LIMIT 3
+    ) co) AS TopCoTags,
+    (SELECT AVG(AvgHoursToAnswer) FROM TagCorrelates tc WHERE tc.TagName = h.TagName AND tc.AvgHoursToAnswer IS NOT NULL) AS AvgHoursToAnswer
+  FROM HotTags h
+  LEFT JOIN TopUsersPerTag tu ON tu.TagName = h.TagName AND tu.rn <= 3
+  GROUP BY h.TagName, h.HotRank, h.HotnessScore, h.QuestionCount, h.AnswerCount, h.TotalViews, h.AvgScore, h.RecencyWeight
+)
+SELECT
+  ts.TagName,
+  ts.HotRank,
+  ROUND(CAST(ts.HotnessScore AS numeric),4) AS HotnessScore,
+  ts.QuestionCount,
+  ts.AnswerCount,
+  ts.TotalViews,
+  ROUND(CAST(ts.AvgScore AS numeric),3) AS AvgScore,
+  ROUND(CAST(ts.RecencyWeight AS numeric),3) AS RecencyWeight,
+  COALESCE(ts.TopUsers, '[]') AS TopUsers,
+  COALESCE(ts.TopCoTags, '[]') AS TopCoTags,
+  ROUND(COALESCE(ts.AvgHoursToAnswer, -1)::numeric,2) AS AvgHoursToAnswer,
+  (
+    SELECT json_agg(qs) FROM (
+      SELECT q.Id AS QuestionId, q.Title, q.CreationDate, q.ViewCount, q.Score,
+             (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = q.Id) AS CurrentAnswerCount,
+             (SELECT STRING_AGG(u2.DisplayName || '('|| u2.Reputation ||')', ', ' ) FROM Users u2 WHERE u2.Id IN (SELECT a.OwnerUserId FROM Posts a WHERE a.ParentId = q.Id AND a.OwnerUserId IS NOT NULL) ) AS Answerers
+      FROM Posts q
+      WHERE q.PostTypeId = 1
+        AND EXISTS (
+          SELECT 1 FROM (
+            SELECT unnest(string_to_array(substring(coalesce(q.Tags,''), 2, length(coalesce(q.Tags,'')) - 2), '><')) AS TagName
+          ) t WHERE t.TagName = ts.TagName
+        )
+        AND q.Score >= 5
+        AND (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = q.Id) = 0
+      ORDER BY q.CreationDate DESC
+      LIMIT 5
+    ) qs
+  ) AS HighScoreUnanswered
+FROM TagSummary ts
+ORDER BY ts.HotRank
+LIMIT 50;
