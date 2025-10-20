@@ -1,0 +1,14 @@
+title: SQLStorm v1.1 DuckDB Benchmark (24h)
+repetitions: 1
+warmup: 0
+timeout: 10
+fetch_result: false
+global_timeout: 86400
+query_seed: 42
+output: results/v1.1/duckdb
+systems:
+  - title: DuckDB
+    dbms: duckdb
+    settings: { }
+    parameter:
+      version: "1.2.0"

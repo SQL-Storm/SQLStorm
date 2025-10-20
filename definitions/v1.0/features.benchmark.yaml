@@ -15,6 +15,7 @@ systems:
     disabled: false
     settings:
       usedirectio: true
+      optimizer.json.types: true
       optimizer.sidewayinformationpassing: false
       optimizer.earlyprobe: false
       optimizer.joinfilter: false

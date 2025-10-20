@@ -65,6 +65,13 @@ class Log:
         else:
             self.console = Console(force_jupyter=False, log_path=False)
 
+        self._progress = None
+        self._start_progress()
+
+    def _start_progress(self):
+        if self._progress:
+            self._progress.stop()
+
         self._progress = Progress(
             self.MofNCompleteColumn(),
             TextColumn("[progress.description]{task.description}", table_column=Column(no_wrap=True, width=25)),
@@ -281,6 +288,7 @@ class Log:
             self._old_console = self._log.console
             self._log_file = open(self._file, "w")
             self._log.console = Console(file=self._log_file, no_color=True, color_system="standard", force_jupyter=False, force_interactive=False, log_path=False, width=120)
+            self._log._start_progress()
             return self
 
         def __exit__(self, exc_type, exc_val, exc_tb):
@@ -289,6 +297,7 @@ class Log:
             """
             if self._old_console:
                 self._log.console = self._old_console
+                self._log._start_progress()
             if self._log_file:
                 self._log_file.close()
 
